@@ -18,6 +18,7 @@ No single existing product covers the full ePHPm feature set. The closest compet
 | [laravel-octane.md](laravel-octane.md) | Laravel Octane — adapter layer, not a server, backend comparison |
 | [ephpm-architecture.md](ephpm-architecture.md) | ePHPm architecture decisions — build options, recommended stack, key libraries |
 | [popularity.md](popularity.md) | GitHub stars, Docker pulls, Packagist downloads, business adoption, estimated MAU |
+| [monetization.md](monetization.md) | Competitor revenue models, monetization strategy options for ePHPm |
 
 ---
 
