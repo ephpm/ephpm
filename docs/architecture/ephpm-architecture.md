@@ -51,43 +51,171 @@ Import CertMagic as a library. Build ePHPm's own HTTP server with Go's `net/http
 
 ## Recommended Architecture
 
+### Serving Node (`ephpm serve`)
+
+Every ePHPm node runs as a serving node. The Node API is always present — it's the internal interface that Prometheus scrapes, the admin connects to, and OTLP exports through.
+
 ```
 ┌──────────────────────────────────────────────────────┐
-│                    ePHPm Binary                      │
-│                      (Rust)                          │
+│              ePHPm Serving Node                      │
+│           ephpm serve (Rust binary)                  │
 ├─────────────┬───────────────┬────────────────────────┤
-│  HTTP Layer │  Admin UI     │  OTLP Receiver         │
-│  (hyper /   │  (embedded)   │  (gRPC :4317 /         │
-│   tokio)    │               │   HTTP :4318)          │
-│  + HTTP/2   │               │                        │
-│  + QUIC     │               │                        │
-├─────────────┼───────────────┼────────────────────────┤
-│  ACME TLS   │  DB Proxy     │  Clustered KV          │
-│ (rustls-    │  (MySQL/PG)   │  (gossip + hash        │
-│  acme)      │  + query      │   ring)                │
-│             │    digest     │                        │
-│             │  + slow query │                        │
+│  HTTP Layer │  DB Proxy     │  OTLP Receiver         │
+│  (hyper /   │  (MySQL/PG)   │  (gRPC :4317 /         │
+│   tokio)    │  + query      │   HTTP :4318)          │
+│  + HTTP/2   │    digest     │                        │
+│  + QUIC     │  + slow query │                        │
 │             │    analysis   │                        │
+├─────────────┼───────────────┼────────────────────────┤
+│  ACME TLS   │  Clustered KV │  Node API :9090        │
+│ (rustls-    │  (gossip +    │  ├─ /health            │
+│  acme)      │   hash ring)  │  ├─ /metrics (prom)    │
+│             │               │  ├─ /api/workers       │
+│             │               │  ├─ /api/db/digests    │
+│             │               │  ├─ /api/db/slow       │
+│             │               │  ├─ /api/kv/stats      │
+│             │               │  ├─ /api/traces        │
+│             │               │  ├─ /api/profiling     │
+│             │               │  └─ /api/config        │
 ├─────────────┴───────────────┴────────────────────────┤
 │               PHP Embedding Layer                    │
 │        (Rust FFI + libphp + custom SAPI)             │
-│     Reference: FrankenPHP's SAPI implementation      │
-│     Reference: Pasir's ext-php-rs integration        │
 ├──────────────────────────────────────────────────────┤
 │             Observability Pipeline                   │
 │  ┌─────────────┐  ┌──────────────┐  ┌─────────────┐ │
 │  │ Auto-       │  │ In-Memory    │  │ OTLP Export  │ │
 │  │ Instrument  │→ │ Trace/Metric │→ │ (optional)   │ │
 │  │ (HTTP, DB,  │  │ Ring Buffer  │  │ → Jaeger     │ │
-│  │  KV, PHP)   │  │ (admin UI)   │  │ → Datadog    │ │
-│  └─────────────┘  └──────────────┘  │ → Grafana    │ │
-│                                     └─────────────┘ │
+│  │  KV, PHP)   │  │              │  │ → Datadog    │ │
+│  └─────────────┘  └──────────────┘  └─────────────┘ │
 ├──────────────────────────────────────────────────────┤
 │               Debug / Profiling                      │
 │  (token-gated Xdebug, cachegrind, request            │
-│   capture — surfaced via Admin UI)                   │
+│   capture — surfaced via Node API)                   │
 └──────────────────────────────────────────────────────┘
 ```
+
+### Admin UI (`ephpm admin`)
+
+The admin UI is a **separate mode**, not an embedded feature of the serving node. It runs either standalone (connecting to remote nodes) or embedded in a serving node for dev convenience. Same binary, different subcommand.
+
+```
+# Dev / single node — embedded admin, zero config
+ephpm serve --admin
+
+# Production — admin runs separately, connects to nodes
+ephpm admin --nodes 10.0.1.1:9090,10.0.1.2:9090,10.0.1.3:9090
+```
+
+```
+┌──────────────────────────────────────────────────────┐
+│              ePHPm Admin Instance                    │
+│           ephpm admin (same Rust binary)             │
+├──────────────────────────────────────────────────────┤
+│  Admin Web UI :8080                                  │
+│  ├─ Cluster overview (all nodes)                     │
+│  ├─ Worker pool status (per-node, aggregate)         │
+│  ├─ Query digest dashboard (aggregated)              │
+│  ├─ Slow query log + EXPLAIN viewer                  │
+│  ├─ Trace viewer (distributed traces across nodes)   │
+│  ├─ KV cluster health (ring, membership, memory)     │
+│  ├─ Profiling results (cachegrind viewer)             │
+│  ├─ Request debug capture viewer                     │
+│  └─ Live config viewer (per-node)                    │
+├──────────────────────────────────────────────────────┤
+│  Node Connector                                      │
+│  ├─ Polls/streams Node API from each node            │
+│  ├─ Aggregates metrics across nodes                  │
+│  ├─ Merges query digests (same digest from N nodes)  │
+│  └─ Auth: shared secret / mTLS to Node API           │
+└──────────────────────────────────────────────────────┘
+       │              │              │
+       ▼              ▼              ▼
+   Node 1 :9090   Node 2 :9090   Node 3 :9090
+```
+
+### Production Cluster Layout
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Production Cluster                       │
+│                                                             │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐         │
+│  │  Node 1     │  │  Node 2     │  │  Node 3     │         │
+│  │  ephpm serve│  │  ephpm serve│  │  ephpm serve│         │
+│  │             │  │             │  │             │         │
+│  │  PHP :443   │  │  PHP :443   │  │  PHP :443   │         │
+│  │  DB Proxy   │  │  DB Proxy   │  │  DB Proxy   │         │
+│  │  KV Store   │  │  KV Store   │  │  KV Store   │         │
+│  │  OTLP :4318 │  │  OTLP :4318 │  │  OTLP :4318 │         │
+│  │  Node API   │  │  Node API   │  │  Node API   │         │
+│  │   :9090     │  │   :9090     │  │   :9090     │         │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘         │
+│         │                │                │                 │
+│         │       ┌────────┴────────┐       │                 │
+│         └───────┤  Admin Instance ├───────┘                 │
+│                 │  ephpm admin    │                          │
+│                 │  :8080          │                          │
+│                 │  (small box /   │                          │
+│                 │   container)    │                          │
+│                 └─────────────────┘                          │
+│                                                             │
+│  Also scraped by:                                           │
+│  ├─ Prometheus → :9090/metrics (each node)                  │
+│  └─ Grafana → via Prometheus                                │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Node API Specification
+
+Every serving node exposes the Node API on a configurable port (default `:9090`). This is a lightweight HTTP/gRPC API — not a web UI. It consumes negligible resources.
+
+| Endpoint | Method | Data |
+|---|---|---|
+| `/health` | GET | Liveness + readiness status |
+| `/metrics` | GET | Prometheus/OpenMetrics scrape endpoint |
+| `/api/workers` | GET | Worker pool: busy/idle/total, queue depth, restarts, memory per worker |
+| `/api/db/digests` | GET | Query digest table: digest hash, normalized SQL, count, sum/min/max/avg time, rows |
+| `/api/db/slow` | GET | Slow query log: recent slow queries with EXPLAIN output |
+| `/api/db/pool` | GET | Connection pool stats: active/idle/total connections, wait time, timeouts |
+| `/api/kv/stats` | GET | KV store: memory usage, key count, hit/miss rate, evictions |
+| `/api/kv/cluster` | GET | Cluster membership: nodes, ring state, replication status |
+| `/api/traces` | GET/SSE | Recent traces from ring buffer. SSE for live streaming |
+| `/api/profiling` | GET | Cached profiling results (cachegrind, debug captures) |
+| `/api/config` | GET | Running configuration (read-only, secrets redacted) |
+
+**Authentication:** Node API requires a shared secret (bearer token) or mTLS. Configurable in `ephpm.toml`:
+
+```toml
+[node_api]
+listen = "0.0.0.0:9090"
+secret = "your-shared-secret"       # bearer token auth
+# tls_cert = "/path/to/cert.pem"   # or mTLS
+# tls_key = "/path/to/key.pem"
+```
+
+**`--admin` flag behavior:** When `ephpm serve --admin` is used, the serving node starts the admin web UI on a separate port (`:8080`) alongside the Node API. The embedded admin connects to its own Node API on `localhost:9090` — same code path as remote admin, just local. In `ephpm.toml`:
+
+```toml
+[admin]
+enabled = true                        # or use --admin flag
+listen = "0.0.0.0:8080"
+nodes = ["localhost:9090"]            # auto-configured when embedded
+# nodes = ["10.0.1.1:9090", "..."]   # explicit for multi-node from config
+username = "admin"
+password = "changeme"                 # admin UI auth (separate from node API auth)
+```
+
+### Why This Design
+
+| Concern | Solution |
+|---|---|
+| **Resource isolation** | Admin UI serves static assets, holds websocket connections for live updates, aggregates traces across nodes. None of this runs on serving nodes in production. |
+| **Single-node dev** | `ephpm serve --admin` gives the full experience with zero extra setup. |
+| **Multi-node production** | Admin runs on a small dedicated box/container. Consumes ~50-100MB RAM, minimal CPU. |
+| **Prometheus coexistence** | Node API `/metrics` works regardless of admin. Teams already using Grafana keep their setup and optionally add the admin UI. |
+| **Security boundary** | Node API auth (shared secret / mTLS) is separate from admin UI auth (username/password, SSO in enterprise). Internal API never exposed to the internet. |
+| **Same binary** | No separate build artifact. `ephpm serve` and `ephpm admin` are subcommands via `clap`. Simpler CI, simpler distribution. |
 
 ---
 
@@ -1270,3 +1398,183 @@ Key benchmarks to publish:
 3. **DB proxy latency** — added latency per proxied query vs direct connection
 4. **Memory per connection** — HTTP + DB proxy connections at scale
 5. **Requests/sec** — head-to-head with FrankenPHP on identical PHP workloads
+
+---
+
+## Repository Structure
+
+Cargo workspace with virtual manifest and `crates/` directory:
+
+```
+ephpm/
+├── Cargo.toml                  # Virtual manifest ([workspace] only)
+├── Cargo.lock
+├── rust-toolchain.toml
+├── rustfmt.toml
+├── clippy.toml
+├── deny.toml
+├── ephpm.toml                  # Example config file
+├── .github/
+│   └── workflows/
+│       ├── ci.yml              # Lint, test, deny
+│       └── release.yml         # Build matrix (PHP 8.3/8.4 × linux/mac)
+├── crates/
+│   ├── ephpm/                  # Binary crate (main entry point)
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       └── main.rs         # CLI (clap), config loading, server boot
+│   ├── ephpm-server/           # HTTP server crate
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── router.rs       # Route .php to PHP, else static files
+│   │       └── static_files.rs # Static file serving
+│   ├── ephpm-php/              # PHP embedding crate
+│   │   ├── Cargo.toml
+│   │   ├── build.rs            # bindgen + link libphp.a
+│   │   ├── wrapper.h           # C header includes for bindgen
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── sapi.rs         # Custom SAPI implementation
+│   │       ├── request.rs      # HTTP request → PHP request mapping
+│   │       └── response.rs     # PHP output → HTTP response mapping
+│   └── ephpm-config/           # Configuration crate
+│       ├── Cargo.toml
+│       └── src/
+│           └── lib.rs          # Config structs + figment loading
+├── benches/
+│   └── throughput.rs           # Criterion benchmarks
+├── tests/
+│   └── integration/
+│       └── wordpress.rs        # WordPress smoke test
+└── docs/
+    ├── analysis/               # Competitive analysis
+    └── architecture/           # Architecture docs
+```
+
+---
+
+## MVP Specification
+
+### Goal
+
+A single Rust binary that reads a TOML config, boots an HTTP server, embeds PHP via libphp, and serves a WordPress site.
+
+### What the MVP Includes
+
+1. **`ephpm` binary** — single Rust binary with PHP statically linked
+2. **TOML config** — `ephpm.toml` with `[server]` and `[php]` sections
+3. **HTTP server** — hyper-based, HTTP/1.1 + HTTP/2
+4. **PHP execution** — custom SAPI, NTS mode, Mutex-guarded
+5. **Static file serving** — CSS/JS/images served directly (not through PHP)
+6. **WordPress demo** — documented setup
+
+### What the MVP Does NOT Include
+
+- TLS / ACME
+- DB proxy / connection pooling
+- KV store
+- Clustering
+- Observability / admin UI
+- Worker mode (persistent PHP processes)
+- ZTS / multi-threaded PHP
+
+### MVP Request Flow
+
+```
+Client ──HTTP──► hyper (tokio)
+                    │
+                    ▼
+                Router
+                    │
+            ┌───────┴───────┐
+            │ .php request? │
+            └───┬───────┬───┘
+            no  │       │ yes
+                ▼       ▼
+          static file   spawn_blocking
+          serving           │
+                            ▼
+                     Mutex<PhpRuntime>
+                            │
+                     1. Set SAPI request info
+                     2. php_request_startup()
+                     3. php_execute_script(index.php)
+                        ├── ub_write() → buffer body
+                        ├── send_header() → capture headers
+                        ├── read_post() → provide POST data
+                        └── read_cookies() → provide cookies
+                     4. php_request_shutdown()
+                     5. Return (status, headers, body)
+                            │
+                            ▼
+                Build hyper::Response
+                            │
+Client ◄──HTTP──────────────┘
+```
+
+---
+
+## Tooling & CI
+
+| Tool | Purpose |
+|------|---------|
+| `rustfmt` | Code formatting |
+| `clippy` | Linting |
+| `cargo-deny` | License audit, advisory DB, duplicate crate detection |
+| `cargo-nextest` | Faster test runner |
+| `cargo-llvm-cov` | Code coverage |
+| `criterion` | Benchmarking |
+| `bindgen` | Generate Rust FFI bindings from PHP C headers |
+
+### CI Matrix
+
+One binary per PHP version (static linking). CI matrix builds for PHP 8.3 and 8.4 on Linux and macOS.
+
+Release artifacts named: `ephpm-php8.4-linux-x86_64`, `ephpm-php8.3-macos-aarch64`, etc.
+
+---
+
+## PHP Embedding Strategy
+
+### Thread Safety: NTS for MVP, ZTS for v1
+
+- **MVP:** NTS (Non-Thread-Safe) PHP with `Mutex` + `tokio::task::spawn_blocking`. One PHP execution at a time per process. Simple, provably correct.
+- **v1:** ZTS (Thread-Safe) PHP with thread-per-request model. Required for production throughput.
+
+### Building libphp.a
+
+Use `static-php-cli` to build a static `libphp.a`:
+
+```bash
+bin/spc download --with-php=8.4 --for-extensions="bcmath,curl,dom,exif,fileinfo,filter,gd,hash,iconv,json,mbstring,mysqli,openssl,pcre,session,simplexml,sodium,xml,xmlreader,zip,zlib"
+bin/spc build "bcmath,curl,dom,exif,fileinfo,filter,gd,hash,iconv,json,mbstring,mysqli,openssl,pcre,session,simplexml,sodium,xml,xmlreader,zip,zlib" --build-embed
+```
+
+### FFI Approach
+
+Custom `build.rs` using `bindgen` to generate FFI bindings from PHP's C headers. Link against `libphp.a` statically. The SAPI implementation is custom (not using `ripht-php-sapi` or `ext-php-rs` — those are references, not dependencies).
+
+### SAPI Callbacks Required for WordPress
+
+| Callback | Purpose |
+|----------|---------|
+| `ub_write` | Capture PHP output (echo, print, templates) |
+| `send_headers` / `send_header` | Capture HTTP response headers |
+| `read_post` | Provide POST body to PHP |
+| `read_cookies` | Provide cookie string to PHP |
+| `register_server_variables` | Populate `$_SERVER` |
+| `startup` / `shutdown` | PHP lifecycle (MINIT/MSHUTDOWN) |
+| `activate` / `deactivate` | Per-request lifecycle (RINIT/RSHUTDOWN) |
+| `flush` | Flush output buffer |
+| `log_message` | PHP error logging → tracing |
+
+### $_SERVER Variables WordPress Needs
+
+```
+REQUEST_URI, REQUEST_METHOD, SCRIPT_FILENAME, SCRIPT_NAME,
+DOCUMENT_ROOT, SERVER_NAME, SERVER_PORT, SERVER_SOFTWARE,
+SERVER_PROTOCOL, HTTPS, HTTP_HOST, HTTP_COOKIE,
+CONTENT_TYPE, CONTENT_LENGTH, QUERY_STRING, PATH_INFO,
+PHP_SELF, REMOTE_ADDR, REMOTE_PORT
+```

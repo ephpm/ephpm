@@ -184,6 +184,100 @@ None of these invest in PHP-specific tooling (queue UIs, artisan runners, connec
 
 ---
 
+## Multi-Language Expansion Analysis
+
+### Could This Work for Other Languages?
+
+ePHPm's value proposition is rooted in solving problems **unique to PHP's execution model**. Before considering multi-language expansion, it's worth understanding why each language does or doesn't need this.
+
+### Why PHP is Uniquely Suited
+
+No other major language has ALL of these simultaneously:
+
+1. **Share-nothing, die-after-every-request execution model** — every request bootstraps from scratch
+2. **Requires a separate process manager** (php-fpm) — PHP can't listen on a port by itself
+3. **Requires a separate web server** (nginx/Apache) — php-fpm doesn't speak HTTP
+4. **No built-in connection pooling** — every request opens and closes DB connections
+5. **No built-in in-memory state** — sessions, cache, and shared data all require external Redis/Memcached
+6. **Fragmented production stack** — nginx + php-fpm + Redis + external DB = 4+ separate processes to manage
+
+This is exactly what ePHPm collapses into a single binary. The pitch writes itself.
+
+### Ruby on Rails — Closest Fit, But Weaker
+
+Rails shares *some* of PHP's pain:
+
+| Problem | PHP | Ruby on Rails |
+|---|---|---|
+| Fragmented production stack | nginx + php-fpm + Redis + Sidekiq + DB | nginx + Puma + Redis + Sidekiq + DB |
+| External Redis dependency | Sessions, cache | Action Cable, caching, sessions, Sidekiq, Turbo Streams |
+| Connection pooling problem | No pooling at all — open/close per request | Per-process pools (20 Puma workers × 5 conns = 100 DB connections) |
+| Requires separate web server | Yes (nginx in front of php-fpm) | Yes (nginx in front of Puma, in production) |
+| Built-in observability | No | No (punts to New Relic, Datadog, Scout APM) |
+| Process persistence | **No** — dies after every request | **Yes** — Puma workers are long-lived |
+
+**What's similar:** Fragmented stack, Redis dependency, connection scaling, no observability.
+
+**What's different:** Rails processes are persistent — the app stays in memory between requests. The most critical ePHPm innovation (worker model, keep-alive) doesn't apply. ActiveRecord has connection pooling, just not shared/external pooling.
+
+**Engineering challenge:** Embedding Ruby (MRI/CRuby) via FFI is possible but MRI doesn't have a clean embedding interface like PHP's SAPI. No equivalent of `php_embed_init()`. Significant engineering effort for a smaller community.
+
+**Community size:** Ruby web developer population is ~5-10x smaller than PHP. Rails market share has been declining since ~2016 (Python/JavaScript growth).
+
+**Verdict:** Possible but weaker value proposition. The pitch becomes "we consolidate your stack" rather than "we fix your broken execution model." Not worth pursuing until PHP market is captured.
+
+### Python (Flask, Django, FastAPI) — Not a Fit
+
+- Apps run as **persistent processes** (Gunicorn, uvicorn) — already in memory
+- **SQLAlchemy has built-in connection pooling** — solved at the library level
+- **asyncio** provides native concurrent I/O
+- Single process can serve HTTP directly — no separate web server required (though nginx is common in production)
+- **OpenTelemetry Python SDK** is mature — observability is well-served
+- Deployment already works well on generic PaaS (Railway, Render, Fly.io)
+
+**Verdict:** No. Python doesn't have PHP's fundamental problems.
+
+### Java (Spring Boot), Go, .NET, Node.js, Rust — Not a Fit
+
+All have "single process, everything included" models:
+
+| Language | Built-in Server | Connection Pooling | In-Memory State | Single Artifact |
+|---|---|---|---|---|
+| Java (Spring Boot) | Embedded Tomcat/Jetty | HikariCP (best-in-class) | Yes | JAR file |
+| Go | `net/http` IS the server | `database/sql` pool | Yes | Single binary |
+| .NET | Kestrel | Built-in | Yes | Single binary |
+| Node.js | `http` module / Express | pg-pool, etc. | Yes | `node app.js` |
+| Rust | Axum / Actix | Built-in | Yes | Single binary |
+
+These languages solved the "everything in one process" problem a decade ago. An ePHPm-style product adds no value.
+
+### The Real Expansion Play: PHP's Breadth
+
+Instead of chasing other languages, the opportunity is in **PHP's massive footprint:**
+
+| PHP Segment | Market Size | Current Best Option | ePHPm Opportunity |
+|---|---|---|---|
+| **WordPress** | 43% of all websites | WP Engine, Kinsta ($1B+ market) | Single-binary WP hosting, built-in object cache replacing Redis |
+| **Laravel** | Fastest-growing PHP framework | Laravel Cloud ($57M funded) | Framework-agnostic alternative, free observability |
+| **Symfony** | Enterprise PHP standard | Generic hosting, Forge/Ploi | First dedicated Symfony-optimized runtime |
+| **Drupal** | Enterprise CMS | Acquia (acquired for $1B) | Self-hosted alternative with built-in caching |
+| **Magento** | E-commerce | Adobe Commerce (expensive) | Connection pooling for catalog-heavy queries |
+| **MediaWiki** | Wikipedia's engine | Custom ops | Single-binary deployment |
+| **Moodle** | Education LMS | Self-hosted with LAMP | Simplified deployment, built-in observability |
+
+PHP powers **77% of websites** with known server-side languages. The addressable market within PHP alone is enormous. "The best PHP runtime on the planet" is a stronger position than "a pretty good runtime for several languages."
+
+### Strategic Recommendation
+
+**Focus exclusively on PHP.** Do not pursue multi-language support.
+
+1. **The value proposition is PHP-specific.** Diluting it weakens the pitch
+2. **Engineering focus matters.** Embedding one language's interpreter well is hard enough. Embedding two is twice the surface area for bugs, security issues, and maintenance
+3. **The PHP market is underserved and massive.** 77% of websites, with no modern all-in-one runtime. Capture this before expanding
+4. **If Ruby demand materializes,** it can be evaluated post-v1 as a separate product ("eRBm"?) rather than bolted onto ePHPm. But this is a v2+ consideration at earliest
+
+---
+
 ## Recommended Strategy for ePHPm
 
 ### Phase 1: Open Source Adoption (Launch → Product-Market Fit)

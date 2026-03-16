@@ -40,33 +40,36 @@ PHP embedding is trivial in C but only ~10% of the project. The other 90% (HTTP 
 
 ## High-Level Architecture
 
+### Serving Node (`ephpm serve`)
+
 ```
-┌─────────────────────────────────────────────────┐
-│                  ePHPm Binary                   │
-│                    (Rust)                        │
-├─────────────┬───────────────┬───────────────────┤
-│  HTTP Layer │  Admin UI     │  StatsD Server    │
-│  (hyper /   │  (embedded)   │  (UDP listener)   │
-│   tokio)    │               │                   │
-│  + HTTP/2   │               │                   │
-│  + QUIC     │               │                   │
-├─────────────┼───────────────┼───────────────────┤
-│  ACME TLS   │  DB Proxy     │  Clustered KV     │
-│ (rustls-    │  (MySQL/PG)   │  (gossip + hash   │
-│  acme)      │  + query      │   ring)            │
-│             │    digest     │                   │
-│             │  + slow query │                   │
-│             │    analysis   │                   │
-├─────────────┴───────────────┴───────────────────┤
-│              PHP Embedding Layer                │
-│       (Rust FFI + libphp + custom SAPI)         │
-│    Reference: FrankenPHP's SAPI, Pasir's        │
-│    ext-php-rs integration                       │
-├─────────────────────────────────────────────────┤
-│              Debug / Profiling                  │
-│  (token-gated Xdebug, cachegrind, request       │
-│   capture — surfaced via Admin UI)              │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│              ePHPm Serving Node                      │
+├─────────────┬───────────────┬────────────────────────┤
+│  HTTP Layer │  DB Proxy     │  OTLP Receiver         │
+│  (hyper /   │  (MySQL/PG)   │  (gRPC :4317 /         │
+│   tokio)    │  + query      │   HTTP :4318)          │
+│  + HTTP/2   │    digest     │                        │
+│  + QUIC     │  + slow query │                        │
+├─────────────┼───────────────┼────────────────────────┤
+│  ACME TLS   │  Clustered KV │  Node API :9090        │
+│ (rustls-    │  (gossip +    │  (metrics, traces,     │
+│  acme)      │   hash ring)  │   status, config)      │
+├─────────────┴───────────────┴────────────────────────┤
+│  PHP Embedding (Rust FFI + libphp + custom SAPI)     │
+├──────────────────────────────────────────────────────┤
+│  Observability Pipeline + Debug / Profiling          │
+└──────────────────────────────────────────────────────┘
+```
+
+### Admin UI (`ephpm admin` — separate mode)
+
+```
+ephpm admin --nodes 10.0.1.1:9090,10.0.1.2:9090
+  ├── Web UI :8080 (cluster overview, traces, queries, KV, profiling)
+  └── Aggregates data from all Node APIs
+
+# Or embedded for dev: ephpm serve --admin
 ```
 
 ## Core Subsystems
@@ -101,18 +104,20 @@ PHP embedding is trivial in C but only ~10% of the project. The other 90% (HTTP 
 - Consistent hashing via `hashring` crate for key distribution
 - Replaces external Redis for sessions, cache, and cert sharing
 
-### 6. Admin Dashboard
-- Embedded web UI for observability
-- Prometheus metrics display
-- Query analysis (digests, slow queries, EXPLAIN plans)
-- Request debug capture viewer
-- Profiling results (cachegrind) viewer
-- Worker pool status, KV cluster health
+### 6. Node API (always present on every serving node)
+- Lightweight HTTP/gRPC API on `:9090` (configurable)
+- Exposes: `/health`, `/metrics` (Prometheus), `/api/workers`, `/api/db/digests`, `/api/db/slow`, `/api/db/pool`, `/api/kv/stats`, `/api/kv/cluster`, `/api/traces`, `/api/profiling`, `/api/config`
+- Auth: shared secret (bearer token) or mTLS
+- Consumes negligible resources — this is NOT the admin UI, just a data API
+- Prometheus scrapes this. Admin UI consumes this. OTLP exports through this.
 
-### 7. StatsD Server
-- Built-in UDP StatsD listener
-- Aggregates application metrics
-- Surfaces data in the admin dashboard
+### 7. Admin UI (separate mode, not embedded)
+- Runs as `ephpm admin --nodes 10.0.1.1:9090,...` (standalone) or `ephpm serve --admin` (embedded for dev)
+- Same binary, different subcommand — no separate build artifact
+- Connects to Node API on each serving node, aggregates data across the cluster
+- Displays: cluster overview, worker pools, query digests, slow query log, trace viewer, KV cluster health, profiling results, debug captures, live config
+- In production: runs on a small dedicated box/container, not on serving nodes
+- Auth: username/password (separate from Node API auth), SSO in enterprise tier
 
 ### 8. Debug / Profiling
 - Token-gated: send a secret header with your HTTP request to enable profiling for that request only
@@ -168,7 +173,24 @@ The critical adoption advantage: **existing PHP apps work without code changes**
 
 ## Project Status
 
-The project is in the early design/documentation phase. No Go code has been written yet.
+The project has a scaffolded Cargo workspace with four crates. The code compiles (stub mode — no libphp linked yet). The next step is to build `libphp.a` via `static-php-cli` and wire up the FFI bindings in `ephpm-php`.
+
+## Repository Structure
+
+```
+crates/
+├── ephpm/           # Binary crate — CLI (clap), config loading, server boot
+├── ephpm-config/    # Config structs + figment TOML loading
+├── ephpm-php/       # PHP embedding — SAPI callbacks, request/response mapping
+└── ephpm-server/    # HTTP server — hyper + router + static file serving
+```
+
+Key files:
+- `Cargo.toml` — Virtual workspace manifest
+- `ephpm.toml` — Example configuration file
+- `rust-toolchain.toml`, `rustfmt.toml`, `clippy.toml`, `deny.toml` — Tooling config
+- `.github/workflows/ci.yml` — Lint, test, deny checks
+- `.github/workflows/release.yml` — Build matrix (PHP 8.3/8.4 × linux/mac)
 
 ## Documentation
 
@@ -176,7 +198,8 @@ The project is in the early design/documentation phase. No Go code has been writ
 
 | File | What It Covers |
 |---|---|
-| `ephpm-architecture.md` | Build options A-D, recommended stack (Option B), key Go libraries, strategic considerations |
+| `ephpm-architecture.md` | Language decision, PHP embedding strategy, SAPI callbacks, MVP specification, repository structure, full architecture |
+| `implementation.md` | Implementation details and subsystem design |
 
 ### `docs/analysis/` — Competitive research
 
@@ -196,4 +219,5 @@ The project is in the early design/documentation phase. No Go code has been writ
 2. **The project is written in Rust.** Standalone binary with `rustls-acme` for automatic TLS. Do not build on Caddy or any Go framework.
 3. **Superglobal compatibility is non-negotiable.** The SAPI must populate `$_GET`, `$_POST`, `$_SERVER`, etc. This is the #1 adoption advantage over RoadRunner and Swoole.
 4. **Zero-cost FFI to libphp is the key differentiator.** This is the core competitive advantage over FrankenPHP's CGO approach. Every design decision should preserve this.
-5. **No code exists yet.** You may be asked to scaffold the project, implement a subsystem, or continue the design work.
+5. **Code exists in stub mode.** The Cargo workspace compiles without libphp. The SAPI callbacks in `crates/ephpm-php/src/sapi.rs` need to be converted to `extern "C"` functions and registered with PHP when libphp is linked.
+6. **Next milestone:** Build `libphp.a` using `static-php-cli`, configure `build.rs` to run `bindgen` against PHP headers, and replace the stub `PhpRuntime::execute()` with real FFI calls.
