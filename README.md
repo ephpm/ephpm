@@ -202,16 +202,22 @@ cargo +nightly fmt --all
 cargo deny check
 ```
 
-### Build tooling (xtask)
+### Build & test tooling (xtask)
 
-The project uses [cargo-xtask](https://github.com/matklad/cargo-xtask) for PHP SDK and release builds:
+The project uses [cargo-xtask](https://github.com/matklad/cargo-xtask) for build automation and E2E testing:
 
 ```bash
-cargo xtask php-sdk     # Build only the static PHP SDK (~15 min first time)
 cargo xtask release     # Build PHP SDK + ephpm binary (release mode)
+cargo xtask php-sdk     # Build only the static PHP SDK (~15 min first time)
+cargo xtask e2e-install # Download kind, tilt, kubectl to ./bin (no global install)
+cargo xtask e2e         # Run E2E tests (creates Kind cluster, builds images, tilt ci)
+cargo xtask e2e-up      # Start E2E dev env (tilt dashboard at localhost:10350)
+cargo xtask e2e-down    # Tear down Kind cluster
 ```
 
-On Windows, both commands auto-detect the platform and re-invoke themselves inside WSL. The PHP SDK is cached at `php-sdk/static-php-cli/buildroot/` — delete that directory to force a rebuild.
+On Windows, `release` and `php-sdk` auto-detect the platform and re-invoke themselves inside WSL. The PHP SDK is cached at `php-sdk/static-php-cli/buildroot/` — delete that directory to force a rebuild.
+
+E2E commands require Podman or Docker. Run `cargo xtask e2e-install` to download kind/tilt/kubectl to `./bin/` — no global install needed. See [docs/developer/testing.md](docs/developer/testing.md) for details.
 
 ### Code conventions
 
@@ -222,9 +228,11 @@ On Windows, both commands auto-detect the platform and re-invoke themselves insi
 - **Unsafe code**: Safety comment (`// SAFETY:`) before every `unsafe` block explaining invariants.
 - **Documentation**: `///` on public items, `//!` at module level.
 
-## Architecture Docs
+## Docs
 
-- [Architecture decisions](docs/architecture/architecture.md) — Language choice, crate design, PHP embedding strategy
+- [Getting started](docs/developer/getting-started.md) — Prerequisites, building, IDE setup
+- [Testing strategy](docs/developer/testing.md) — Unit tests, Tilt + Kind E2E, database testing
+- [Architecture decisions](docs/architecture/architecture.md) — Language choice, crate design, PHP execution modes
 - [Implementation guide](docs/architecture/implementation.md) — Build system, CI, MVP spec
 - [CLI design](docs/architecture/cli.md) — Command structure, UX principles
 - [Security model](docs/architecture/security.md) — Threat model, FFI safety, trust boundaries

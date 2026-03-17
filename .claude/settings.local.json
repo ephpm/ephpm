@@ -29,7 +29,12 @@
       "Bash(cat:*)",
       "Bash(wsl:*)",
       "Bash(git:*)",
-      "Bash(test:*)"
+      "Bash(test:*)",
+      "WebFetch(domain:caddyserver.com)",
+      "WebFetch(domain:mod-rewrite-cheatsheet.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:madewithlove.com)"
     ]
   }
 }

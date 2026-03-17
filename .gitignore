@@ -4,10 +4,16 @@
 # PHP SDK (built by cargo xtask via static-php-cli)
 /php-sdk/
 
+# Local tool binaries (downloaded by cargo xtask e2e-install)
+/bin/
+
 # IDE
 .idea/
 .vscode/
 *.swp
+
+# Tilt state
+.tilt-dev/
 
 # OS
 .DS_Store

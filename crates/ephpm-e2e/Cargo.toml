@@ -1,0 +1,12 @@
+[package]
+name = "ephpm-e2e"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# This crate is excluded from the workspace — it has different deps and
+# is only built inside the E2E test runner container.
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false }
+tokio = { version = "1", features = ["rt", "macros"] }

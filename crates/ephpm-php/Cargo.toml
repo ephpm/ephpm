@@ -1,0 +1,24 @@
+[package]
+name = "ephpm-php"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PHP embedding via libphp FFI for ePHPm"
+build = "build.rs"
+
+[dependencies]
+tracing.workspace = true
+thiserror.workspace = true
+http.workspace = true
+
+[build-dependencies]
+bindgen = "0.71"
+cc = "1"
+
+[dev-dependencies]
+serial_test.workspace = true
+
+[lints]
+workspace = true

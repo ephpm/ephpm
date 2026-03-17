@@ -1,0 +1,19 @@
+# E2E test runner job — runs the ephpm-e2e test suite against the ephpm service.
+# EXPECTED_PHP_VERSION is patched by the Tiltfile at deploy time.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ephpm-e2e
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: e2e
+          image: ephpm-e2e:dev
+          env:
+            - name: EPHPM_URL
+              value: "http://ephpm:8080"
+            - name: EXPECTED_PHP_VERSION
+              value: "__EXPECTED_PHP_VERSION__"

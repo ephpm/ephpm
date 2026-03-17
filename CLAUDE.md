@@ -34,7 +34,7 @@ IMPORTANT: Run single tests when possible, not the full suite. Use `cargo nextes
 | `ephpm-server` | HTTP server (hyper + tokio + tower) — routing, static file serving |
 | `ephpm-php` | PHP embedding via FFI — SAPI implementation, request/response mapping |
 | `ephpm-config` | Configuration (figment) — TOML + env var overrides (`EPHPM_` prefix) |
-| `xtask` | Build tooling — `cargo xtask release` builds PHP SDK + release binary |
+| `xtask` | Build & test tooling — `release`, `php-sdk`, `e2e`, `e2e-up`, `e2e-down` |
 
 ## Critical Conventions
 

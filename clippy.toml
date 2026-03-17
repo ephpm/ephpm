@@ -1,0 +1,3 @@
+# Clippy configuration
+# Most lint configuration is in workspace Cargo.toml [workspace.lints.clippy]
+msrv = "1.85"

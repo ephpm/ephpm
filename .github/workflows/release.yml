@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build (PHP ${{ matrix.php }}, linux-x86_64)
+    runs-on: ubuntu-latest
+    container: ghcr.io/${{ github.repository }}/ephpm-ci:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4", "8.5"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ephpm
+        run: cargo xtask release ${{ matrix.php }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-php${{ matrix.php }}-linux-x86_64
+          path: target/release/ephpm
+
+  build-macos:
+    name: Build (PHP ${{ matrix.php }}, ${{ matrix.artifact_suffix }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4", "8.5"]
+        include:
+          - os: macos-latest
+            artifact_suffix: macos-aarch64
+          - os: macos-13
+            artifact_suffix: macos-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+
+      - name: Install system dependencies
+        run: |
+          brew install autoconf automake bison cmake flex libtool \
+            make pkg-config re2c
+
+      - name: Build ephpm
+        run: cargo xtask release ${{ matrix.php }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-php${{ matrix.php }}-${{ matrix.artifact_suffix }}
+          path: target/release/ephpm
+
+  release:
+    name: Create Release
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
