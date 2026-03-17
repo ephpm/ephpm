@@ -2,7 +2,34 @@
   "permissions": {
     "allow": [
       "WebSearch",
-      "WebFetch(domain:raw.githubusercontent.com)"
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(export:*)",
+      "Bash(podman build:*)",
+      "Bash(podman run:*)",
+      "Bash(CONTAINER_ENGINE=podman bash:*)",
+      "Bash(curl:*)",
+      "Bash(podman inspect:*)",
+      "Bash(podman rm:*)",
+      "Bash(cargo check:*)",
+      "Bash(podman logs:*)",
+      "Bash(podman:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(rustup show:*)",
+      "Bash(rustup toolchain:*)",
+      "Bash(cargo +nightly:*)",
+      "Bash(cargo install:*)",
+      "Bash(cargo clippy)",
+      "Bash(cargo deny:*)",
+      "Bash(docker build:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo nextest:*)",
+      "Bash(make:*)",
+      "Bash(cargo xtask:*)",
+      "Bash(cat:*)",
+      "Bash(wsl:*)",
+      "Bash(git:*)",
+      "Bash(test:*)"
     ]
   }
 }

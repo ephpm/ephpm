@@ -1,5 +1,33 @@
 # ePHPm Architecture Decisions
 
+## Feature Status
+
+This document describes the full vision for ePHPm. The matrix below tracks what is actually implemented today.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| HTTP/1.1 | **Implemented** | hyper server, async accept loop |
+| HTTP/2 | Planned | Dependency present, no code yet |
+| TLS / ACME | Planned | No code or dependencies yet |
+| PHP embedding (NTS) | **Implemented** | Full SAPI, mutex-serialized `spawn_blocking` |
+| PHP embedding (ZTS) | Planned | v1 goal — thread-per-request model |
+| Static file serving | **Implemented** | MIME detection, path traversal protection |
+| Request routing | **Implemented** | `.php` → PHP, pretty permalinks → `index.php`, else static |
+| Configuration | **Implemented** | Figment — TOML + `EPHPM_` env var overrides |
+| CLI | Partial | `--config` flag only; no subcommands yet |
+| Graceful shutdown | Partial | Stops accepting; does not drain in-flight connections |
+| Signal handling | Partial | Ctrl+C only; no SIGHUP reload |
+| Observability | Partial | `tracing` crate logging; no OTLP export |
+| DB proxy | Planned | MySQL/Postgres wire protocol — not started |
+| KV store | Planned | Clustered key-value cache — not started |
+| Clustering / gossip | Planned | Multi-node coordination — not started |
+| Admin UI / API | Planned | Management interface — not started |
+| External PHP mode | Planned | Spawn external PHP workers over pipes — use any PHP binary |
+| `ephpm doctor` | Planned | System diagnostics command — not started |
+| Extension suites | Planned | Curated extension bundles — not started |
+
+---
+
 ## Language Decision: Rust
 
 ePHPm is written in **Rust**. This decision was made after evaluating Go (with CGO), Rust, and C.
@@ -522,27 +550,127 @@ This lets existing apps using `predis/predis` or `phpredis` point at `localhost:
 
 For local keys, ePHPm's KV is **1,000-10,000x faster than Redis** because there's no TCP, no serialization, no context switch. For remote keys (clustered), it's comparable to Redis since the network hop dominates.
 
-### CertMagic / ACME Storage Integration
+### TLS Certificate Management in a Cluster
 
-The clustered KV store also backs ePHPm's TLS certificate storage. The `certmagic::Storage` interface (or its Rust equivalent for ACME automation) is implemented against the KV store, so certificates issued on one node are automatically available to all nodes:
+The clustered KV store backs ePHPm's TLS certificate storage, locking, and ACME challenge coordination. This solves three HA problems that naive auto-TLS implementations get wrong.
+
+#### Problem 1: Cert Issuance Race Condition
+
+Without coordination, multiple nodes all detect that no cert exists for `example.com` and simultaneously request one from Let's Encrypt. This wastes ACME quota (50 certs/domain/week rate limit) and may trigger rate-limiting bans.
+
+**Solution: Distributed lock via KV store.**
+
+Before any node initiates an ACME order, it acquires a lock in the KV store:
 
 ```
-Node A issues cert for example.com
-       │
-       ▼
-   KvStore.set("certs:example.com", cert_data)
-       │
-       ├──► replicated to Node B
-       └──► replicated to Node C
+Node A: KvStore.lock("acme:lock:example.com", node_id="A", ttl=300s)
+  → Lock acquired. Node A proceeds with ACME flow.
 
-Node B receives HTTPS request for example.com
+Node B: KvStore.lock("acme:lock:example.com", node_id="B", ttl=300s)
+  → Lock held by Node A. Node B waits.
+
+Node A completes issuance:
+  KvStore.set("certs:example.com:cert", cert_pem)
+  KvStore.set("certs:example.com:key", key_pem)
+  KvStore.unlock("acme:lock:example.com")
        │
-       ▼
-   KvStore.get("certs:example.com") → found locally (replica)
-   → serves request with valid cert
+       ├──► replicated to Node B (gossip)
+       └──► replicated to Node C (gossip)
+
+Node B: lock released, checks KvStore → cert exists → done, no issuance needed.
 ```
 
-No external cert store (Redis, S3, etcd) needed. Zero-config clustered HTTPS.
+The lock has a TTL (default 5 minutes) to prevent deadlock if a node crashes mid-issuance. If the lock holder dies, another node acquires the lock after TTL expiry and retries.
+
+#### Problem 2: ACME Challenge Routing
+
+Let's Encrypt validates domain ownership by making an HTTP request to `http://example.com/.well-known/acme-challenge/<token>`. In a multi-node setup behind a load balancer, the challenge request may hit any node — not necessarily the one that initiated the ACME order.
+
+**Solution: Challenge token propagation via KV store.**
+
+When Node A creates an ACME order, it stores the challenge token in the KV store. All nodes serve `/.well-known/acme-challenge/*` by reading from the KV store:
+
+```
+Node A initiates ACME order for example.com
+       │
+       ▼
+   Let's Encrypt returns challenge: token=abc123, response=xyz789
+       │
+       ▼
+   KvStore.set("acme:challenge:abc123", "xyz789", ttl=600s)
+       │
+       ├──► replicated to Node B (gossip, ~100ms)
+       └──► replicated to Node C (gossip, ~100ms)
+
+Let's Encrypt requests: GET http://example.com/.well-known/acme-challenge/abc123
+       │
+       ▼ (load balancer routes to Node B)
+   Node B: KvStore.get("acme:challenge:abc123") → "xyz789"
+   Node B: responds with 200 OK, body: "xyz789"
+       │
+       ▼
+   Let's Encrypt: challenge passed ✓
+```
+
+This works for HTTP-01 challenges. For TLS-ALPN-01 challenges, the same approach applies — the challenge certificate is stored in the KV store and any node can present it during the TLS handshake.
+
+**Timing:** Gossip replication typically completes in ~100-200ms. The ACME protocol has a built-in delay between creating the challenge and checking it (the server tells the client to poll for status), so propagation latency is not an issue.
+
+#### Problem 3: Renewal Stampede
+
+All nodes notice the cert for `example.com` expires in 29 days. Without coordination, all nodes attempt renewal simultaneously.
+
+**Solution: Leader election for cert renewal.**
+
+One node is responsible for certificate renewals at any given time. Election uses the KV store:
+
+```
+KvStore.set("acme:leader", node_id="A", ttl=60s)
+  → Node A is the cert renewal leader
+  → Node A refreshes the TTL every 30s (heartbeat)
+  → Node A checks all certs, renews any expiring within 30 days
+
+If Node A dies:
+  → TTL expires after 60s
+  → Node B or C acquires leadership
+  → New leader picks up renewal duties
+```
+
+Only the leader initiates renewals. All other nodes receive the renewed certs via KV replication. This reduces ACME requests to the minimum necessary (one request per cert, regardless of cluster size).
+
+#### Full Cert Lifecycle
+
+```
+1. First HTTPS request arrives for example.com
+       │
+       ▼
+2. Node checks KvStore for "certs:example.com:cert"
+   ├── Found → use it, serve request with TLS
+   └── Not found ↓
+       │
+3. Acquire lock: KvStore.lock("acme:lock:example.com")
+   ├── Lock held by another node → wait, then goto 2
+   └── Lock acquired ↓
+       │
+4. Create ACME order (Let's Encrypt)
+       │
+5. Store challenge token: KvStore.set("acme:challenge:<token>", response)
+       │ (replicated to all nodes via gossip)
+       │
+6. Tell Let's Encrypt to verify → challenge request hits any node → passes
+       │
+7. Download issued cert
+       │
+8. Store cert: KvStore.set("certs:example.com:cert", cert_pem)
+   Store key:  KvStore.set("certs:example.com:key", key_pem)
+       │ (replicated to all nodes via gossip)
+       │
+9. Release lock: KvStore.unlock("acme:lock:example.com")
+       │
+10. All nodes now have the cert locally (replica) → zero-latency TLS handshakes
+```
+
+No external cert store (Redis, S3, etcd) needed. No external lock service (etcd, Consul) needed. Zero-config clustered HTTPS using ePHPm's built-in KV store and gossip protocol.
 
 ---
 
@@ -1417,7 +1545,7 @@ ephpm/
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml              # Lint, test, deny
-│       └── release.yml         # Build matrix (PHP 8.3/8.4 × linux/mac)
+│       └── release.yml         # Build matrix (PHP 8.3/8.4 × linux/mac/windows)
 ├── crates/
 │   ├── ephpm/                  # Binary crate (main entry point)
 │   │   ├── Cargo.toml
@@ -1529,15 +1657,83 @@ Client ◄──HTTP──────────────┘
 
 ### CI Matrix
 
-One binary per PHP version (static linking). CI matrix builds for PHP 8.3 and 8.4 on Linux and macOS.
+One binary per PHP version per platform (static linking). CI matrix builds for PHP 8.3 and 8.4 across all supported platforms.
 
-Release artifacts named: `ephpm-php8.4-linux-x86_64`, `ephpm-php8.3-macos-aarch64`, etc.
+**Platform matrix:**
+
+| Platform | Target | Use Case |
+|---|---|---|
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | Production servers, CI, WSL2 |
+| Linux aarch64 | `aarch64-unknown-linux-gnu` | ARM servers (Graviton, Ampere) |
+| macOS Apple Silicon | `aarch64-apple-darwin` | Developer machines (M1–M4) |
+| macOS Intel | `x86_64-apple-darwin` | Older Macs, CI runners |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | Developer machines (native Windows dev) |
+
+Release artifacts: `ephpm-0.1.0-php8.4-linux-x86_64`, `ephpm-0.1.0-php8.4-windows-x86_64.exe`, etc. Linux is the primary production target. macOS and Windows builds enable native local development without Docker/WSL.
 
 ---
 
-## PHP Embedding Strategy
+## PHP Execution Modes
 
-### Thread Safety: NTS for MVP, ZTS for v1
+ePHPm supports two PHP execution modes, controlled by `php.mode` in config:
+
+### Embedded mode (default)
+
+PHP is statically linked into the binary via FFI. Zero IPC overhead — Rust calls PHP C functions directly through the SAPI.
+
+| Variant | Concurrency | Status |
+|---------|-------------|--------|
+| NTS (MVP) | `Mutex` + `spawn_blocking` — one PHP execution at a time | **Implemented** |
+| ZTS (v1) | Thread-per-request via TSRM — true parallelism | Planned |
+
+**When to use:** Production deployments where performance matters and the bundled PHP extensions are sufficient.
+
+```toml
+[php]
+mode = "embedded"   # default, no need to specify
+```
+
+### External mode
+
+ePHPm spawns PHP worker processes and communicates over stdin/stdout pipes using a binary protocol. The user provides their own PHP binary — any version, any extensions, any custom patches.
+
+```toml
+[php]
+mode = "external"
+binary = "/usr/bin/php"
+workers = 4
+worker_script = "vendor/ephpm/worker.php"
+```
+
+**How it works:**
+
+1. ePHPm spawns N long-lived PHP worker processes (`php worker.php`)
+2. Each worker runs a loop: read request from stdin → execute → write response to stdout
+3. ePHPm routes incoming HTTP requests to available workers
+4. If a worker crashes, ePHPm restarts it automatically
+
+**When to use:**
+- Custom PHP builds with proprietary or uncommon extensions
+- PHP versions not yet supported by static-php-cli
+- Environments where rebuilding the binary isn't practical
+- Teams that already manage their own PHP installations
+
+**Tradeoffs vs embedded:**
+
+| | Embedded | External |
+|---|---|---|
+| Overhead per request | ~0 (native C call) | ~50-200μs (IPC) |
+| Concurrency | Mutex (NTS) or threads (ZTS) | Multiple worker processes |
+| Crash isolation | PHP crash = process crash | Worker crash → auto-restart |
+| PHP version | Built into binary | User's own binary |
+| Custom extensions | Rebuild SDK | Install normally |
+| Zero-config drop-in | Yes | Requires `worker.php` package |
+
+**PHP worker side:** External mode requires a small PHP package (`ephpm/worker`) that provides the request loop. This is similar to RoadRunner's worker model — the PHP side reads requests from stdin, runs the application, and writes responses to stdout.
+
+All other ePHPm features (HTTP server, static files, routing, config, and planned features like DB proxy, KV store, admin UI, observability) work identically in both modes.
+
+### Thread Safety: NTS for MVP, ZTS for v1 (embedded mode)
 
 - **MVP:** NTS (Non-Thread-Safe) PHP with `Mutex` + `tokio::task::spawn_blocking`. One PHP execution at a time per process. Simple, provably correct.
 - **v1:** ZTS (Thread-Safe) PHP with thread-per-request model. Required for production throughput.

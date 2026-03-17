@@ -20,7 +20,7 @@ ephpm/
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml              # Lint, test, deny
-│       └── release.yml         # Build matrix (PHP 8.3/8.4 × linux/mac)
+│       └── release.yml         # Build matrix (PHP 8.3/8.4 × linux/mac/windows)
 ├── crates/
 │   ├── ephpm/                  # Binary crate (main entry point)
 │   │   ├── Cargo.toml
@@ -255,12 +255,29 @@ jobs:
       matrix:
         php: ['8.3', '8.4']
         include:
+          # Linux
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact_suffix: linux-x86_64
+            binary_name: ephpm
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_suffix: linux-aarch64
+            binary_name: ephpm
+          # macOS
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_suffix: macos-aarch64
+            binary_name: ephpm
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact_suffix: macos-x86_64
+            binary_name: ephpm
+          # Windows
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact_suffix: windows-x86_64
+            binary_name: ephpm.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -286,7 +303,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ephpm-php${{ matrix.php }}-${{ matrix.artifact_suffix }}
-          path: target/release/ephpm
+          path: target/release/${{ matrix.binary_name }}
 
   release:
     needs: build
@@ -299,7 +316,34 @@ jobs:
           files: ephpm-*/*
 ```
 
-Release artifacts are named: `ephpm-php8.4-linux-x86_64`, `ephpm-php8.3-macos-aarch64`, etc. One binary per PHP version because `libphp.a` is statically linked.
+Release artifacts are named per platform. One binary per PHP version per platform because `libphp.a` is statically linked.
+
+### Platform Support
+
+| Platform | Target Triple | Production | Development | Notes |
+|---|---|---|---|---|
+| Linux x86_64 | `x86_64-unknown-linux-gnu` | **Primary** | **Primary** | Servers, CI, WSL2 |
+| Linux aarch64 | `aarch64-unknown-linux-gnu` | **Primary** | Supported | AWS Graviton, Ampere, Raspberry Pi |
+| macOS Apple Silicon | `aarch64-apple-darwin` | Supported | **Primary** | M1/M2/M3/M4 dev machines |
+| macOS Intel | `x86_64-apple-darwin` | Supported | Supported | Older Macs, CI runners |
+| Windows x86_64 | `x86_64-pc-windows-msvc` | **Not targeted** | **Primary** | Local dev via native or WSL2 |
+
+**Production vs development:** ePHPm targets Linux for production deployments. macOS and Windows builds exist so developers can run `ephpm serve` locally during development without needing Docker/Podman or WSL. The development experience should feel native on all three operating systems.
+
+**Windows notes:**
+- Windows builds use MSVC toolchain, not MinGW
+- PHP embed SAPI supports Windows — static-php-cli can produce `php8embed.lib` on Windows
+- Signals (`SIGTERM`, `SIGHUP`) are replaced with Windows equivalents: `Ctrl+C` handler via `SetConsoleCtrlHandler`, named pipe or TCP for reload
+- Forward slashes work in paths for `ephpm.toml` config values, but native backslash paths are also accepted
+- `ephpm ext build` uses the same container-based approach (Podman/Docker works on Windows)
+
+**Fully static binaries on all platforms:** All extensions are compiled into the binary at build time — no runtime `.so`/`.dll` loading. This means:
+
+| Platform | Linking | Runtime dependencies |
+|---|---|---|
+| Linux | Fully static (musl) | **None** — works on any distro, Alpine, `FROM scratch` |
+| macOS | Static libphp, dynamic libSystem | `libSystem.dylib` (always present, Apple-mandated) |
+| Windows | Static libphp, static CRT (`/MT`) | Windows system libraries only |
 
 ---
 
@@ -518,10 +562,21 @@ ini_overrides = [
 # email = "admin@example.com"
 # domains = ["example.com", "www.example.com"]
 
+# [db.sqlite]
+# path = "./data/app.db"         # file path, or ":memory:" for in-memory
+# journal_mode = "wal"
+# create = true
+
 # [db.mysql]
 # url = "mysql://user:pass@db:3306/myapp"
 # min_connections = 5
 # max_connections = 50
+# inject_env = true
+
+# [db.postgres]
+# url = "postgres://user:pass@db:5432/myapp"
+# min_connections = 5
+# max_connections = 30
 # inject_env = true
 
 # [kv]
@@ -743,16 +798,39 @@ This is the same approach FrankenPHP uses.
 
 ### Release Naming
 
+Binaries are named: `ephpm-{version}-php{php}-{suite}-{platform}`:
+
 ```
-ephpm-0.1.0-php8.4-linux-x86_64
-ephpm-0.1.0-php8.4-linux-aarch64
-ephpm-0.1.0-php8.4-macos-aarch64
-ephpm-0.1.0-php8.3-linux-x86_64
-ephpm-0.1.0-php8.3-linux-aarch64
-ephpm-0.1.0-php8.3-macos-aarch64
+# Production suites (Linux, fully static musl — zero dependencies)
+ephpm-0.1.0-php8.4-core-linux-x86_64
+ephpm-0.1.0-php8.4-wordpress-linux-x86_64
+ephpm-0.1.0-php8.4-laravel-linux-x86_64
+ephpm-0.1.0-php8.4-full-linux-x86_64
+ephpm-0.1.0-php8.4-wordpress-linux-aarch64
+# ... (same for php8.3, macOS, Windows)
+
+# Development suites (adds xdebug, pcov, spx)
+ephpm-0.1.0-php8.4-wordpress-dev-linux-x86_64
+ephpm-0.1.0-php8.4-laravel-dev-linux-x86_64
+ephpm-0.1.0-php8.4-full-dev-linux-x86_64
+ephpm-0.1.0-php8.4-wordpress-dev-macos-aarch64
+ephpm-0.1.0-php8.4-laravel-dev-windows-x86_64.exe
+# ...
 ```
 
-### Docker Images
+**Extension suites:**
+
+| Suite | Extensions | Target audience |
+|---|---|---|
+| **core** | ~15 exts — minimal PHP (json, pcre, mbstring, openssl, curl, xml, zip, etc.) | Custom builds, minimal footprint |
+| **wordpress** | core + mysqli, gd, exif, iconv, simplexml, pdo_sqlite, sqlite3 (~25 exts) | WordPress, CMS apps |
+| **laravel** | core + pdo_mysql, pdo_pgsql, pdo_sqlite, sqlite3, redis, gd, intl, bcmath (~30 exts) | Laravel, Symfony, modern frameworks |
+| **full** | Everything static-php-cli supports (~100+ exts) | "Just give me everything" |
+| ***-dev** | Any suite above + xdebug, pcov, spx (Zend extensions patched into source tree) | Local development, step debugging, coverage |
+
+Dev suites include Zend extensions (xdebug, pcov, spx) that are statically compiled by patching their source into PHP's `ext/` directory before building — the same technique PHP uses for opcache. Dev tools are disabled by default via INI settings and only activate when configured (e.g. `XDEBUG_MODE=debug`). **Dev suites should never be used in production.**
+
+### Container Images
 
 ```dockerfile
 FROM scratch
@@ -760,7 +838,34 @@ COPY ephpm /usr/local/bin/ephpm
 ENTRYPOINT ["ephpm"]
 ```
 
-Tags: `ephpm:0.1.0-php8.4`, `ephpm:0.1.0-php8.3`, `ephpm:latest` (points to latest PHP version).
+Fully static musl binaries mean `FROM scratch` works — zero runtime dependencies, smallest possible image. Multi-arch images support both `linux/amd64` and `linux/arm64`.
+
+Tags follow the suite model:
+
+```
+# Production
+ephpm:0.1.0-php8.4-wordpress          # wordpress suite (default)
+ephpm:0.1.0-php8.4-laravel            # laravel suite
+ephpm:0.1.0-php8.4-full               # all extensions
+ephpm:0.1.0-php8.4-core               # minimal core
+ephpm:latest                           # latest PHP + wordpress suite
+
+# Development (adds xdebug, pcov, spx)
+ephpm:0.1.0-php8.4-wordpress-dev
+ephpm:0.1.0-php8.4-laravel-dev
+ephpm:0.1.0-php8.4-full-dev
+```
+
+### Builder Images
+
+Container images for `ephpm ext build` (custom binary builds):
+
+```
+ghcr.io/ephpm/builder:0.1.0-php8.4
+ghcr.io/ephpm/builder:0.1.0-php8.3
+```
+
+These contain static-php-cli, Rust toolchain, ePHPm source, and all system library sources needed to compile extensions from source. Multi-arch. The build runs entirely inside the container — no compiler toolchain needed on the host.
 
 ---
 

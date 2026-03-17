@@ -131,20 +131,17 @@ This is ~100-200 lines per provider. Start with Cloudflare (most common), add ot
 
 ### Key Advantage Over CertMagic
 
-CertMagic's `certmagic.Storage` interface requires an external backend for multi-node cert sharing (Redis, etcd, S3, etc.). ePHPm's `rustls-acme` `Cache` implementation is backed by the **built-in clustered KV store** — certificates issued on any node replicate to all nodes automatically via gossip. Zero external dependencies for clustered HTTPS.
+CertMagic's `certmagic.Storage` interface requires an external backend for multi-node cert sharing (Redis, etcd, S3, etc.). Additionally, CertMagic's `Locker` interface requires an external distributed lock (etcd, Consul, DynamoDB, etc.) to prevent multiple nodes from requesting certs simultaneously.
 
-```
-Node A issues cert for example.com
-       │
-       ▼
-   Cache.store() → KvStore.set("certs:example.com", cert_bytes)
-       │
-       ├──► gossip replication to Node B
-       └──► gossip replication to Node C
+ePHPm replaces both with the **built-in clustered KV store**:
 
-Node B receives HTTPS request for example.com
-       │
-       ▼
-   Cache.load() → KvStore.get("certs:example.com") → found (replica)
-   → serves request with valid cert, no external cert store needed
-```
+| CertMagic needs | ePHPm equivalent | External dependency? |
+|---|---|---|
+| `Storage` (cert persistence) | KV store (`certs:*` keys) | **No** — built-in |
+| `Locker` (distributed lock) | KV store (`acme:lock:*` keys with TTL) | **No** — built-in |
+| Challenge token sharing | KV store (`acme:challenge:*` keys) | **No** — built-in |
+| Leader election for renewal | KV store (`acme:leader` key with TTL heartbeat) | **No** — built-in |
+
+Certificates, locks, challenge tokens, and leader election all replicate to all nodes automatically via gossip. Zero external dependencies for clustered HTTPS.
+
+See `architecture.md` → "TLS Certificate Management in a Cluster" for the full HA design covering race conditions, challenge routing, and renewal stampede prevention.

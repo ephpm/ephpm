@@ -1,1 +1,14 @@
-.idea
+# Build artifacts
+/target/
+
+# PHP SDK (built by cargo xtask via static-php-cli)
+/php-sdk/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
