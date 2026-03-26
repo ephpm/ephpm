@@ -54,18 +54,7 @@ fn run() -> anyhow::Result<ExitCode> {
 
     match cli.command {
         Some(Commands::Php { args }) => run_php(&args),
-        other => {
-            // Initialize tracing only for server mode
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| EnvFilter::new("info")),
-                )
-                .init();
-
-            let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-            rt.block_on(run_serve(other))
-        }
+        other => run_serve_sync(other),
     }
 }
 
@@ -86,8 +75,49 @@ fn exit_code_from(code: i32) -> ExitCode {
     }
 }
 
-/// Run the HTTP server (default command).
-async fn run_serve(command: Option<Commands>) -> anyhow::Result<ExitCode> {
+/// Initialize PHP and start the HTTP server.
+///
+/// PHP must be initialized BEFORE the tokio runtime is created. PHP's
+/// `php_embed_init()` starts a SIGPROF timer for `max_execution_time`.
+/// If tokio worker threads exist when the signal fires, it gets delivered
+/// to a non-PHP thread whose signal handler dereferences NULL → SIGSEGV.
+///
+/// The sequence is:
+/// 1. Load config + init tracing (no threads)
+/// 2. Init PHP + disable SIGPROF timer (still single-threaded)
+/// 3. Create tokio runtime (spawns worker threads — now safe)
+/// 4. Run HTTP server
+fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
+    // Initialize tracing
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+
+    let config = load_serve_config(command)?;
+
+    // Initialize PHP BEFORE creating tokio runtime (single-threaded here).
+    // finalize_for_http() disables SIGPROF so it can't crash worker threads.
+    ephpm_php::PhpRuntime::init().context("failed to initialize PHP runtime")?;
+    ephpm_php::PhpRuntime::finalize_for_http()
+        .context("failed to finalize PHP runtime for HTTP")?;
+
+    // Now safe to create the multi-threaded tokio runtime
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    let result = rt.block_on(async {
+        ephpm_server::serve(config).await
+    });
+
+    // Shutdown PHP runtime
+    ephpm_php::PhpRuntime::shutdown().context("failed to shutdown PHP runtime")?;
+
+    result.map(|()| ExitCode::SUCCESS)
+}
+
+/// Parse the Serve command and load configuration.
+fn load_serve_config(command: Option<Commands>) -> anyhow::Result<ephpm_config::Config> {
     let Commands::Serve {
         config,
         listen,
@@ -97,7 +127,7 @@ async fn run_serve(command: Option<Commands>) -> anyhow::Result<ExitCode> {
         listen: None,
         document_root: None,
     }) else {
-        unreachable!("run_serve called with non-Serve command");
+        unreachable!("load_serve_config called with non-Serve command");
     };
 
     let mut config = if config.exists() {
@@ -122,14 +152,5 @@ async fn run_serve(command: Option<Commands>) -> anyhow::Result<ExitCode> {
         "starting ePHPm"
     );
 
-    // Initialize PHP runtime
-    ephpm_php::PhpRuntime::init().context("failed to initialize PHP runtime")?;
-
-    // Start HTTP server (blocks until shutdown signal)
-    let result = ephpm_server::serve(config).await;
-
-    // Shutdown PHP runtime
-    ephpm_php::PhpRuntime::shutdown().context("failed to shutdown PHP runtime")?;
-
-    result.map(|()| ExitCode::SUCCESS)
+    Ok(config)
 }

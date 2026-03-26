@@ -31,6 +31,11 @@ mod ffi {
         /// Override default embed SAPI callbacks with our implementations.
         pub fn ephpm_install_sapi();
 
+        /// Shut down the initial request started by `php_embed_init()`.
+        /// Must be called after `ephpm_install_sapi()` so HTTP requests
+        /// start from a clean state.
+        pub fn ephpm_finalize_init();
+
         /// Apply INI settings (disable stack size checking).
         pub fn ephpm_apply_ini_settings() -> ::std::os::raw::c_int;
 
@@ -145,7 +150,7 @@ impl PhpRuntime {
         {
             use std::ffi::CString;
 
-            // Initialize PHP embed SAPI (module startup only, no request started).
+            // Initialize PHP embed SAPI (module + initial request startup).
             // Safety: php_embed_init must be called exactly once before any PHP
             // execution. We guarantee this via the Mutex + Option guard.
             let arg0 = CString::new("ephpm").unwrap();
@@ -201,6 +206,35 @@ impl PhpRuntime {
                 tracing::info!("PHP runtime shut down (stub)");
             }
         }
+        Ok(())
+    }
+
+    /// Finalize initialization for HTTP serve mode.
+    ///
+    /// `php_embed_init()` starts a request automatically. This marks it as
+    /// active so that the first call to `ephpm_execute_request()` properly
+    /// shuts it down before starting its own request lifecycle.
+    ///
+    /// Must be called after [`init()`] and before the first HTTP request.
+    /// Do NOT call this before using CLI mode (`cli_main`), which reuses
+    /// the embed's initial request.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PhpError::LockPoisoned` if the runtime mutex is poisoned,
+    /// or `PhpError::NotInitialized` if the runtime hasn't been initialized.
+    pub fn finalize_for_http() -> Result<(), PhpError> {
+        let runtime = PHP_RUNTIME.lock().map_err(|_| PhpError::LockPoisoned)?;
+        let _rt = runtime.as_ref().ok_or(PhpError::NotInitialized)?;
+
+        #[cfg(php_linked)]
+        {
+            // Safety: Called once after init, marks the embed's initial request
+            // as active so ephpm_execute_request shuts it down on first call.
+            unsafe { ffi::ephpm_finalize_init() };
+            tracing::debug!("PHP embed initial request marked active (ready for HTTP)");
+        }
+
         Ok(())
     }
 

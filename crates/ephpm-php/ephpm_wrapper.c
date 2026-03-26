@@ -14,9 +14,10 @@
  *   3. Safe script execution with zend_try/zend_catch bailout protection.
  *
  * The embed SAPI lifecycle:
- *   php_embed_init()          — module startup (no request started)
+ *   php_embed_init()          — module startup + initial request startup
  *   ephpm_install_sapi()      — override default callbacks with ours
- *   ephpm_execute_request()×N — per-request: startup → execute → capture
+ *   ephpm_finalize_init()     — mark initial request active (HTTP mode)
+ *   ephpm_execute_request()×N — reuse request: update SAPI → execute → capture
  *   php_embed_shutdown()      — request shutdown + module shutdown
  */
 
@@ -34,6 +35,7 @@
 #include "Zend/zend_stream.h"
 #include "Zend/zend_call_stack.h"
 #include "Zend/zend_exceptions.h"
+#include "Zend/zend_globals.h"
 #include "main/php_version.h"
 
 /* ===== Output buffer ===== */
@@ -219,6 +221,101 @@ static void capture_response_headers(void)
  * =================================================================== */
 
 /*
+ * Finalize PHP embed initialization for HTTP serve mode.
+ *
+ * Mark the embed SAPI's initial request as active so
+ * ephpm_execute_request() properly shuts it down before starting
+ * its own request lifecycle on the first HTTP request.
+ *
+ * Must be called once after php_embed_init() and ephpm_install_sapi().
+ */
+void ephpm_finalize_init(void)
+{
+    request_active = 1;
+}
+
+/* ===================================================================
+ * Signal handling overrides
+ *
+ * PHP 8.1+ installs process-wide signal handlers (via zend_signal_init)
+ * and uses SIGPROF (via setitimer/ITIMER_PROF) for max_execution_time.
+ * This is fundamentally incompatible with multi-threaded embedders:
+ *
+ *   - SIGPROF is process-wide and gets delivered to any thread
+ *   - PHP's handler (zend_signal_handler_defer) accesses per-request
+ *     globals that only exist on the PHP thread
+ *   - Tokio worker threads have no PHP state → NULL deref → SIGSEGV
+ *
+ * Since we link libphp.a statically, we override PHP's zend_signal_*
+ * functions with no-ops. The linker prefers our definitions over the
+ * archive's. ePHPm manages timeouts at the HTTP server level instead.
+ *
+ * Trade-off: pcntl_signal() won't work (PHP userland signal handling).
+ * This is acceptable — pcntl is a CLI extension and web requests should
+ * not handle signals. FrankenPHP has the same limitation.
+ *
+ * Future: when ZTS + worker pool lands, we could add a thread-safe
+ * signal forwarding layer that delivers signals only to the PHP thread.
+ * =================================================================== */
+
+/*
+ * The --wrap linker flag renames calls: zend_signal_init → __wrap_zend_signal_init.
+ * The original libphp.a symbols become __real_zend_signal_init (unused).
+ */
+
+void __wrap_zend_signal_startup(void)
+{
+    /* no-op — skip PHP's process-wide signal handler installation */
+}
+
+void __wrap_zend_signal_init(void)
+{
+    /* no-op — skip per-request signal handler setup + SIGPROF unblock */
+}
+
+void __wrap_zend_signal_deactivate(void)
+{
+    /* no-op — nothing to tear down */
+}
+
+void __wrap_zend_signal_activate(void)
+{
+    /* no-op — nothing to set up */
+}
+
+void __wrap_zend_signal_handler_unblock(void)
+{
+    /* no-op — no deferred signals to dispatch */
+}
+
+/*
+ * zend_set_timeout() directly calls sigaction(SIGPROF) + setitimer(ITIMER_PROF),
+ * bypassing the zend_signal_* system. Must also be a no-op.
+ */
+void __wrap_zend_set_timeout(long seconds, int reset_signals)
+{
+    (void)seconds;
+    (void)reset_signals;
+    /* no-op — ePHPm manages request timeouts at the HTTP server level */
+}
+
+void __wrap_zend_unset_timeout(void)
+{
+    /* no-op */
+}
+
+/*
+ * zend_call_stack_init() probes the current thread's stack boundaries
+ * on every request startup. It can fail on tokio's spawn_blocking threads
+ * which have non-standard stack layouts. Since we disable stack checking
+ * (EG(max_allowed_stack_size) = 0), this init is unnecessary.
+ */
+void __wrap_zend_call_stack_init(void)
+{
+    /* no-op — stack checking is disabled */
+}
+
+/*
  * Override the default embed SAPI callbacks with our implementations.
  * Must be called once after php_embed_init().
  */
@@ -246,15 +343,20 @@ void ephpm_install_sapi(void)
  */
 int ephpm_apply_ini_settings(void)
 {
-    zend_string *key = zend_string_init(
+    zend_string *key;
+    zend_string *val;
+
+    /* Disable stack size checking — fails on tokio's spawn_blocking
+     * threads which have a small default stack. */
+    key = zend_string_init(
         "zend.max_allowed_stack_size",
         sizeof("zend.max_allowed_stack_size") - 1, 1);
-    zend_string *val = zend_string_init("0", 1, 1);
+    val = zend_string_init("0", 1, 1);
     zend_alter_ini_entry(key, val, PHP_INI_SYSTEM, PHP_INI_STAGE_RUNTIME);
     zend_string_release(val);
     zend_string_release(key);
-
     EG(max_allowed_stack_size) = 0;
+
     return 0;
 }
 
@@ -317,17 +419,24 @@ void ephpm_request_add_server_var(const char *key, const char *value)
 }
 
 /*
- * Execute a PHP request with proper lifecycle management.
+ * Execute a PHP request.
  *
- * 1. Shuts down any previous request
- * 2. Populates SG(request_info) from the data set by Rust
- * 3. Calls php_request_startup() (triggers register_server_variables, etc.)
- * 4. Executes the script with bailout protection
- * 5. Captures response data (headers, status, output already in buffer)
+ * Reuses the active request started by php_embed_init() — we update the
+ * SAPI request info fields and execute the script without a full
+ * request shutdown/startup cycle. This is necessary because:
+ *
+ *   - php_request_startup() calls zend_signal_init() and other thread-
+ *     sensitive functions that crash on tokio's spawn_blocking threads
+ *   - The embed SAPI's initial request provides a valid execution
+ *     context that we can reuse for all HTTP requests
+ *
+ * For the NTS MVP (single PHP worker, mutex-serialized), this is safe.
+ * The ZTS worker pool milestone will use proper per-worker request
+ * lifecycle management.
  *
  * Returns:
  *   0  on success
- *  -1  if php_request_startup failed
+ *  -1  if php_request_startup failed (only on cold start)
  *  -2  if PHP bailed out (fatal error, exit(), die())
  */
 int ephpm_execute_request(const char *filename)
@@ -339,14 +448,7 @@ int ephpm_execute_request(const char *filename)
     /* Disable stack size checking */
     EG(max_allowed_stack_size) = 0;
 
-    /* Shut down the previous request if one is active */
-    if (request_active) {
-        php_request_shutdown(NULL);
-        request_active = 0;
-    }
-
-    /* Populate SAPI request info before php_request_startup.
-     * PHP reads these during request startup to set up superglobals. */
+    /* Update SAPI request info for this HTTP request */
     SG(request_info).request_method = (char *)req_method;
     SG(request_info).request_uri = (char *)req_uri;
     SG(request_info).query_string = (char *)req_query_string;
@@ -356,12 +458,129 @@ int ephpm_execute_request(const char *filename)
     SG(request_info).path_translated = (char *)req_path_translated;
     SG(request_info).proto_num = 1001; /* HTTP/1.1 */
 
-    /* Start the new request. This calls register_server_variables,
-     * read_cookies, and other SAPI callbacks. */
-    if (php_request_startup() == FAILURE) {
-        return -1;
+    /* Reset per-request SAPI state */
+    SG(headers_sent) = 0;
+    SG(request_info).no_headers = 0;
+    SG(sapi_headers).http_response_code = 200;
+    req_post_data_offset = 0;
+
+    /* Reset POST reading state so PHP re-reads body data.
+     * -1 means "not yet read"; PHP will call our read_post callback.
+     * Also close the request_body stream so php://input reads fresh. */
+    SG(read_post_bytes) = -1;
+    if (SG(request_info).request_body) {
+        php_stream_close(SG(request_info).request_body);
+        SG(request_info).request_body = NULL;
     }
-    request_active = 1;
+
+    /* Destroy old superglobal arrays so they don't carry stale data.
+     * PG(http_globals) holds zvals for $_GET, $_POST, $_SERVER, etc. */
+    for (int i = 0; i < NUM_TRACK_VARS; i++) {
+        if (Z_TYPE(PG(http_globals)[i]) != IS_UNDEF) {
+            zval_ptr_dtor(&PG(http_globals)[i]);
+            ZVAL_UNDEF(&PG(http_globals)[i]);
+        }
+    }
+
+    /* Clear the response header list from the previous request */
+    zend_llist_clean(&SG(sapi_headers).headers);
+
+    /* Rebuild superglobals by manually creating fresh arrays and
+     * populating them. We can't call php_hash_environment() because
+     * it depends on internal state set up by php_request_startup().
+     *
+     * $_SERVER — populated via our register_server_variables callback */
+    zval server_vars_zv;
+    array_init(&server_vars_zv);
+    ephpm_sapi_register_server_variables(&server_vars_zv);
+    zend_hash_update(&EG(symbol_table),
+        zend_string_init("_SERVER", sizeof("_SERVER") - 1, 0),
+        &server_vars_zv);
+    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_SERVER], &server_vars_zv);
+
+    /* $_GET — parse from query string */
+    zval get_vars;
+    array_init(&get_vars);
+    if (req_query_string && *req_query_string) {
+        /* Use PHP's query string parser */
+        char *qs_copy = estrdup(req_query_string);
+        sapi_module.treat_data(PARSE_STRING, qs_copy, &get_vars);
+        /* treat_data frees qs_copy */
+    }
+    zend_hash_update(&EG(symbol_table),
+        zend_string_init("_GET", sizeof("_GET") - 1, 0),
+        &get_vars);
+    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_GET], &get_vars);
+
+    /* $_POST — read and parse POST data via SAPI */
+    zval post_vars;
+    array_init(&post_vars);
+    if (req_post_data && req_post_data_len > 0 && req_content_type
+        && strstr(req_content_type, "application/x-www-form-urlencoded"))
+    {
+        char *post_copy = estrdup(req_post_data);
+        sapi_module.treat_data(PARSE_STRING, post_copy, &post_vars);
+    }
+    zend_hash_update(&EG(symbol_table),
+        zend_string_init("_POST", sizeof("_POST") - 1, 0),
+        &post_vars);
+    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_POST], &post_vars);
+
+    /* $_COOKIE — parse from cookie header.
+     * Cookies are "key=value" pairs separated by "; ".
+     * We parse manually since treat_data(PARSE_COOKIE) requires
+     * internal SAPI state that isn't set up in our reuse model. */
+    zval cookie_vars;
+    array_init(&cookie_vars);
+    if (req_cookie_data && *req_cookie_data) {
+        char *cookie_copy = estrdup(req_cookie_data);
+        char *saveptr = NULL;
+        char *pair = strtok_r(cookie_copy, ";", &saveptr);
+        while (pair) {
+            /* Skip leading whitespace */
+            while (*pair == ' ') pair++;
+            char *eq = strchr(pair, '=');
+            if (eq) {
+                *eq = '\0';
+                char *val = eq + 1;
+                /* Trim trailing whitespace from value */
+                size_t vlen = strlen(val);
+                while (vlen > 0 && val[vlen - 1] == ' ') vlen--;
+                php_register_variable_safe(pair, val, vlen, &cookie_vars);
+            }
+            pair = strtok_r(NULL, ";", &saveptr);
+        }
+        efree(cookie_copy);
+    }
+    zend_hash_update(&EG(symbol_table),
+        zend_string_init("_COOKIE", sizeof("_COOKIE") - 1, 0),
+        &cookie_vars);
+    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_COOKIE], &cookie_vars);
+
+    /* $_FILES — empty for now (multipart support TODO) */
+    zval files_vars;
+    array_init(&files_vars);
+    zend_hash_update(&EG(symbol_table),
+        zend_string_init("_FILES", sizeof("_FILES") - 1, 0),
+        &files_vars);
+    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_FILES], &files_vars);
+
+    /* $_REQUEST — merge of $_GET + $_POST + $_COOKIE per request_order */
+    zval request_vars;
+    array_init(&request_vars);
+    zend_hash_copy(Z_ARRVAL(request_vars), Z_ARRVAL(get_vars), zval_add_ref);
+    zend_hash_copy(Z_ARRVAL(request_vars), Z_ARRVAL(post_vars), zval_add_ref);
+    zend_hash_copy(Z_ARRVAL(request_vars), Z_ARRVAL(cookie_vars), zval_add_ref);
+    zend_hash_update(&EG(symbol_table),
+        zend_string_init("_REQUEST", sizeof("_REQUEST") - 1, 0),
+        &request_vars);
+
+    /* Pre-read POST data into the request_body stream so php://input
+     * works. sapi_read_post_data() calls our read_post callback and
+     * creates the stream that php://input wraps. */
+    if (req_post_data && req_post_data_len > 0) {
+        sapi_read_post_data();
+    }
 
     /* Re-disable stack checking (request startup may reset it) */
     EG(max_allowed_stack_size) = 0;
@@ -395,8 +614,8 @@ int ephpm_execute_request(const char *filename)
     response_status_code = SG(sapi_headers).http_response_code;
 
     /* Note: we do NOT call php_request_shutdown here.
-     * It will be called at the start of the next request
-     * or by php_embed_shutdown() at process exit. */
+     * We reuse the single embed request for all HTTP requests.
+     * php_embed_shutdown() handles final cleanup at process exit. */
 
     return result;
 }

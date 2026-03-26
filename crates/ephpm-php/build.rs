@@ -27,6 +27,10 @@ fn main() {
     link_php(&lib_dir, &target_os);
     compile_wrapper(&include_dir, &target_os);
     generate_bindings(&include_dir, &target_os);
+
+    // Note: --wrap flags for zend_signal_* are in the binary crate's
+    // build.rs (crates/ephpm/build.rs). rustc-link-arg only works for
+    // binary/cdylib targets, not library crates.
 }
 
 fn validate_sdk(lib_dir: &Path, include_dir: &Path, target_os: &str) {
