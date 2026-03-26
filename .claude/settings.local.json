@@ -34,7 +34,9 @@
       "WebFetch(domain:mod-rewrite-cheatsheet.com)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:gist.github.com)",
-      "WebFetch(domain:madewithlove.com)"
+      "WebFetch(domain:madewithlove.com)",
+      "WebFetch(domain:windows.php.net)",
+      "WebFetch(domain:wiki.php.net)"
     ]
   }
 }

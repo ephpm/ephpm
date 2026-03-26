@@ -11,6 +11,11 @@ cargo build
 # Release binary with PHP linked (requires php CLI + composer installed)
 cargo xtask release           # → target/release/ephpm (PHP 8.5)
 cargo xtask release 8.4       # → target/release/ephpm (PHP 8.4)
+
+# Windows .exe (cross-compiled from WSL, requires cargo-xwin)
+cargo install cargo-xwin
+cargo xtask release --target windows       # → target/x86_64-pc-windows-msvc/release/ephpm.exe
+cargo xtask release --target windows 8.4   # with specific PHP version
 ```
 
 Prerequisites for `cargo xtask release`: php CLI 8.2+, composer, git, and C build tools (autoconf, cmake, make, etc.). The xtask handles cloning and running static-php-cli automatically.

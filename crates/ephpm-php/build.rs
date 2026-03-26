@@ -25,8 +25,8 @@ fn main() {
     println!("cargo::rustc-cfg=php_linked");
 
     link_php(&lib_dir, &target_os);
-    compile_wrapper(&include_dir);
-    generate_bindings(&include_dir);
+    compile_wrapper(&include_dir, &target_os);
+    generate_bindings(&include_dir, &target_os);
 }
 
 fn validate_sdk(lib_dir: &Path, include_dir: &Path, target_os: &str) {
@@ -51,7 +51,9 @@ fn validate_sdk(lib_dir: &Path, include_dir: &Path, target_os: &str) {
 fn link_php(lib_dir: &Path, target_os: &str) {
     println!("cargo::rustc-link-search=native={}", lib_dir.display());
     if target_os == "windows" {
-        println!("cargo::rustc-link-lib=static=php8embed");
+        // Windows PHP ships as php8embed.dll + import lib (.lib).
+        // Use dylib linkage so the import lib resolves to the DLL at runtime.
+        println!("cargo::rustc-link-lib=dylib=php8embed");
     } else {
         println!("cargo::rustc-link-lib=static=php");
     }
@@ -116,7 +118,7 @@ fn link_system_libs(target_os: &str) {
 }
 
 /// Compile the C wrapper that provides `zend_try`/`zend_catch` guards.
-fn compile_wrapper(include_dir: &Path) {
+fn compile_wrapper(include_dir: &Path, target_os: &str) {
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let include_main = include_dir.join("main");
     let include_zend = include_dir.join("Zend");
@@ -138,11 +140,19 @@ fn compile_wrapper(include_dir: &Path) {
         build.define("_GNU_SOURCE", None);
     }
 
+    // PHP headers check these defines to select Windows-specific code paths.
+    if target_os == "windows" {
+        build.define("ZEND_WIN32", None);
+        build.define("PHP_WIN32", None);
+        build.define("ZEND_DEBUG", Some("0"));
+        build.define("ZTS", Some("0"));
+    }
+
     build.compile("ephpm_wrapper");
 }
 
 /// Generate Rust FFI bindings from PHP headers via bindgen.
-fn generate_bindings(include_dir: &Path) {
+fn generate_bindings(include_dir: &Path, target_os: &str) {
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let include_main = include_dir.join("main");
     let include_zend = include_dir.join("Zend");
@@ -181,6 +191,12 @@ fn generate_bindings(include_dir: &Path) {
         if Path::new(&musl_include).exists() {
             builder = builder.clang_arg(format!("-isystem{musl_include}"));
         }
+    }
+
+    // When cross-compiling for Windows from Linux, tell bindgen to generate
+    // bindings for the target platform instead of the host.
+    if target_os == "windows" {
+        builder = builder.clang_arg("--target=x86_64-pc-windows-msvc");
     }
 
     let bindings = builder

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::{env, fs};
 
@@ -35,12 +35,16 @@ fn print_usage() {
 Usage: cargo xtask <command> [options]
 
 Commands:
-  release [8.5]              Build ephpm with PHP linked (default: 8.5)
-  php-sdk [8.5]              Build only the PHP SDK (libphp.a + headers)
-  e2e [--php-version 8.5]    Run E2E tests (creates Kind cluster, builds images, tilt ci)
-  e2e-up [--php-version 8.5] Start E2E dev environment (tilt dashboard at localhost:10350)
-  e2e-down                   Tear down Kind cluster and all resources
-  e2e-install                Download kind, tilt, kubectl to ./bin (no global install needed)"
+  release [8.5] [--target windows]  Build ephpm with PHP linked (default: 8.5)
+  php-sdk [8.5]                     Build only the PHP SDK (libphp.a + headers)
+  e2e [--php-version 8.5]           Run E2E tests (creates Kind cluster, builds images, tilt ci)
+  e2e-up [--php-version 8.5]        Start E2E dev environment (tilt dashboard at localhost:10350)
+  e2e-down                          Tear down Kind cluster and all resources
+  e2e-install                       Download kind, tilt, kubectl to ./bin (no global install needed)
+
+Cross-compilation:
+  --target windows    Cross-compile a Windows .exe from WSL/Linux (requires cargo-xwin).
+                      Downloads PHP Windows SDK automatically from windows.php.net."
     );
 }
 
@@ -56,11 +60,51 @@ fn parse_php_version(args: &[String]) -> &str {
     "8.5"
 }
 
+/// Parse `--target <value>` from args. Only "windows" is currently supported.
+fn parse_target(args: &[String]) -> Option<&str> {
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--target" {
+            return args.get(i + 1).map(String::as_str);
+        }
+    }
+    None
+}
+
+/// Extract the PHP version from release args, skipping `--target` and its value.
+/// Falls back to "8.5" if no positional version argument is found.
+fn parse_release_php_version(args: &[String]) -> &str {
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--target" {
+            i += 2; // skip --target and its value
+            continue;
+        }
+        if !args[i].starts_with('-') {
+            return &args[i];
+        }
+        i += 1;
+    }
+    "8.5"
+}
+
+/// Dispatch release builds based on `--target` flag.
+fn release(args: &[String]) -> ExitCode {
+    match parse_target(args) {
+        None => release_linux(args),
+        Some("windows") => release_windows(args),
+        Some(other) => {
+            eprintln!("error: unsupported target '{other}' (supported: windows)");
+            eprintln!("       omit --target for the default Linux musl build");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Build the PHP SDK and then compile the release binary.
 ///
 /// static-php-cli compiles PHP with musl, so we must target musl for the
 /// Rust binary too. This produces a fully static, self-contained binary.
-fn release(args: &[String]) -> ExitCode {
+fn release_linux(args: &[String]) -> ExitCode {
     let spc_dir = spc_dir();
     let sdk_path = spc_dir.join("buildroot");
 
@@ -100,6 +144,295 @@ fn release(args: &[String]) -> ExitCode {
 
     eprintln!("==> Binary ready: target/{target}/release/ephpm");
     ExitCode::SUCCESS
+}
+
+/// Cross-compile a Windows .exe from WSL/Linux using cargo-xwin.
+///
+/// Downloads the official PHP Windows SDK (headers + import lib + DLL) from
+/// windows.php.net, then builds with the MSVC target via cargo-xwin.
+/// The resulting binary requires `php8embed.dll` at runtime.
+fn release_windows(args: &[String]) -> ExitCode {
+    let php_version = parse_release_php_version(args);
+    let target = "x86_64-pc-windows-msvc";
+    let sdk_dir = workspace_root().join("php-sdk").join("windows");
+
+    // 1. Check prerequisites
+    eprintln!("==> Checking prerequisites...");
+
+    let mut missing = Vec::new();
+    if !has_command("cargo-xwin") {
+        missing.push("cargo-xwin");
+    }
+    if !has_command("unzip") {
+        missing.push("unzip");
+    }
+
+    if !missing.is_empty() {
+        eprintln!("error: missing required tools: {}", missing.join(", "));
+        eprintln!();
+        eprintln!("Install them:");
+        if missing.contains(&"cargo-xwin") {
+            eprintln!("  cargo install cargo-xwin");
+        }
+        if missing.contains(&"unzip") {
+            eprintln!("  sudo apt install -y unzip");
+        }
+        return ExitCode::FAILURE;
+    }
+
+    // 2. Download PHP Windows SDK if not already present
+    if !sdk_dir.join("lib").join("php8embed.lib").exists() {
+        let code = download_php_windows_sdk(php_version, &sdk_dir);
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+    } else {
+        eprintln!(
+            "==> PHP Windows SDK already downloaded, skipping (delete {} to re-download)",
+            sdk_dir.display()
+        );
+    }
+
+    // 3. Ensure the MSVC target is installed
+    eprintln!("==> Ensuring Rust target {target} is installed...");
+    let status = Command::new("rustup")
+        .args(["target", "add", target])
+        .status();
+    if !ran_ok(&status) {
+        eprintln!("error: failed to add Rust target {target}");
+        return ExitCode::FAILURE;
+    }
+
+    // 4. Build with cargo-xwin
+    eprintln!("==> Building ephpm.exe (release, target: {target})...");
+    let status = Command::new("cargo")
+        .args([
+            "xwin",
+            "build",
+            "--release",
+            "--package",
+            "ephpm",
+            "--target",
+            target,
+        ])
+        .env("PHP_SDK_PATH", &sdk_dir)
+        .status();
+
+    if !ran_ok(&status) {
+        eprintln!("error: cargo xwin build failed");
+        return ExitCode::FAILURE;
+    }
+
+    // 5. Copy php8embed.dll next to the .exe
+    let exe_dir = workspace_root()
+        .join("target")
+        .join(target)
+        .join("release");
+    let dll_dest = exe_dir.join("php8embed.dll");
+    let dll_src = sdk_dir.join("lib").join("php8embed.dll");
+    if dll_src.exists() {
+        if let Err(e) = fs::copy(&dll_src, &dll_dest) {
+            eprintln!("warning: failed to copy php8embed.dll: {e}");
+        }
+    }
+
+    eprintln!();
+    eprintln!("==> Windows binary ready:");
+    eprintln!("    {}", exe_dir.join("ephpm.exe").display());
+    eprintln!("    {}", dll_dest.display());
+    eprintln!();
+    eprintln!("    Deploy both files together. php8embed.dll must be next to ephpm.exe.");
+    ExitCode::SUCCESS
+}
+
+/// Download the PHP Windows SDK (headers, import lib, and DLL) from windows.php.net.
+///
+/// Downloads two ZIP files:
+/// - Main NTS package: contains `php8embed.dll`
+/// - Devel pack: contains `php8embed.lib` (import lib) and C headers
+///
+/// Files are arranged into `sdk_dir/` matching the layout build.rs expects:
+///   sdk_dir/lib/php8embed.lib
+///   sdk_dir/lib/php8embed.dll
+///   sdk_dir/include/php/{main,Zend,TSRM,sapi}/
+fn download_php_windows_sdk(php_version: &str, sdk_dir: &Path) -> ExitCode {
+    let tmp_dir = sdk_dir.join("_tmp");
+    cleanup_dir(&tmp_dir);
+    fs::create_dir_all(&tmp_dir).ok();
+    fs::create_dir_all(sdk_dir.join("lib")).ok();
+    fs::create_dir_all(sdk_dir.join("include").join("php")).ok();
+
+    let base_url = "https://windows.php.net/downloads/releases/latest";
+
+    // Download the main NTS package (contains php8embed.dll)
+    let main_zip_name = format!("php-{php_version}-nts-Win32-vs17-x64-latest.zip");
+    let main_zip = tmp_dir.join(&main_zip_name);
+    eprintln!("==> Downloading PHP {php_version} Windows NTS package...");
+    if !download_file(&format!("{base_url}/{main_zip_name}"), &main_zip) {
+        eprintln!("error: failed to download {main_zip_name}");
+        eprintln!("       Check that PHP {php_version} Windows builds are available at:");
+        eprintln!("       https://windows.php.net/downloads/releases/latest/");
+        cleanup_dir(&tmp_dir);
+        return ExitCode::FAILURE;
+    }
+
+    // Download the devel pack (contains headers + php8embed.lib)
+    let devel_zip_name = format!("php-devel-pack-{php_version}-nts-Win32-vs17-x64-latest.zip");
+    let devel_zip = tmp_dir.join(&devel_zip_name);
+    eprintln!("==> Downloading PHP {php_version} Windows devel pack...");
+    if !download_file(&format!("{base_url}/{devel_zip_name}"), &devel_zip) {
+        eprintln!("error: failed to download {devel_zip_name}");
+        cleanup_dir(&tmp_dir);
+        return ExitCode::FAILURE;
+    }
+
+    // Extract main package and find php8embed.dll
+    let main_extract = tmp_dir.join("main");
+    eprintln!("==> Extracting NTS package...");
+    if !unzip_file(&main_zip, &main_extract) {
+        eprintln!("error: failed to extract {main_zip_name}");
+        cleanup_dir(&tmp_dir);
+        return ExitCode::FAILURE;
+    }
+
+    if let Some(dll) = find_file_recursive(&main_extract, "php8embed.dll") {
+        if let Err(e) = fs::copy(&dll, sdk_dir.join("lib").join("php8embed.dll")) {
+            eprintln!("error: failed to copy php8embed.dll: {e}");
+            cleanup_dir(&tmp_dir);
+            return ExitCode::FAILURE;
+        }
+    } else {
+        eprintln!("error: php8embed.dll not found in NTS package");
+        cleanup_dir(&tmp_dir);
+        return ExitCode::FAILURE;
+    }
+
+    // Extract devel pack and find php8embed.lib + headers
+    let devel_extract = tmp_dir.join("devel");
+    eprintln!("==> Extracting devel pack...");
+    if !unzip_file(&devel_zip, &devel_extract) {
+        eprintln!("error: failed to extract {devel_zip_name}");
+        cleanup_dir(&tmp_dir);
+        return ExitCode::FAILURE;
+    }
+
+    // Copy php8embed.lib
+    if let Some(lib) = find_file_recursive(&devel_extract, "php8embed.lib") {
+        if let Err(e) = fs::copy(&lib, sdk_dir.join("lib").join("php8embed.lib")) {
+            eprintln!("error: failed to copy php8embed.lib: {e}");
+            cleanup_dir(&tmp_dir);
+            return ExitCode::FAILURE;
+        }
+    } else {
+        eprintln!("error: php8embed.lib not found in devel pack");
+        cleanup_dir(&tmp_dir);
+        return ExitCode::FAILURE;
+    }
+
+    // Copy headers: devel pack has include/{main,Zend,TSRM,sapi}
+    // build.rs expects them at sdk_dir/include/php/{main,Zend,TSRM,sapi}
+    let dest_include = sdk_dir.join("include").join("php");
+    if let Some(include_src) = find_dir_recursive(&devel_extract, "include") {
+        for subdir in &["main", "Zend", "TSRM", "sapi", "ext"] {
+            let src = include_src.join(subdir);
+            if src.exists() {
+                let dest = dest_include.join(subdir);
+                if let Err(e) = copy_dir_recursive(&src, &dest) {
+                    eprintln!("error: failed to copy headers ({subdir}): {e}");
+                    cleanup_dir(&tmp_dir);
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    } else {
+        eprintln!("error: include directory not found in devel pack");
+        cleanup_dir(&tmp_dir);
+        return ExitCode::FAILURE;
+    }
+
+    cleanup_dir(&tmp_dir);
+    eprintln!(
+        "==> PHP Windows SDK ready at {}",
+        sdk_dir.display()
+    );
+    ExitCode::SUCCESS
+}
+
+/// Download a file via curl.
+fn download_file(url: &str, dest: &Path) -> bool {
+    let status = Command::new("curl")
+        .args(["-fSL", "-o"])
+        .arg(dest)
+        .arg(url)
+        .status();
+    ran_ok(&status)
+}
+
+/// Extract a ZIP file to a directory.
+fn unzip_file(zip: &Path, dest: &Path) -> bool {
+    fs::create_dir_all(dest).ok();
+    let status = Command::new("unzip")
+        .args(["-q", "-o"])
+        .arg(zip)
+        .arg("-d")
+        .arg(dest)
+        .status();
+    ran_ok(&status)
+}
+
+/// Recursively find the first file with the given name in a directory tree.
+fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && path.file_name().is_some_and(|n| n == name) {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(found) = find_file_recursive(&path, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Recursively find the first directory with the given name in a directory tree.
+fn find_dir_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|n| n == name) {
+                return Some(path);
+            }
+            if let Some(found) = find_dir_recursive(&path, name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Recursively copy a directory tree.
+fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dest_path)?;
+        } else {
+            fs::copy(&src_path, &dest_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove a directory tree, ignoring errors.
+fn cleanup_dir(dir: &Path) {
+    fs::remove_dir_all(dir).ok();
 }
 
 /// Return the musl target triple matching the current host architecture.
