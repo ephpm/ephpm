@@ -53,6 +53,10 @@ impl Router {
         let fs_path = self.resolve_path(&path);
 
         if Self::is_php_request(&path, &fs_path) {
+            // 404 if the resolved script doesn't exist on disk
+            if !fs_path.exists() {
+                return Ok(not_found());
+            }
             Ok(self.handle_php(req, remote_addr, fs_path).await)
         } else {
             Ok(static_files::serve(&self.document_root, &path).await)
@@ -208,6 +212,14 @@ impl Router {
             }
         }
     }
+}
+
+fn not_found() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("content-type", "text/plain")
+        .body(Full::new(Bytes::from("404 Not Found")))
+        .expect("static 404 response")
 }
 
 #[cfg(test)]
