@@ -6,6 +6,9 @@ const PHP_EXTENSIONS: &str = "bcmath,calendar,ctype,curl,dom,exif,fileinfo,filte
     gd,hash,iconv,mbstring,mysqli,mysqlnd,openssl,pcntl,pcre,pdo,pdo_mysql,phar,\
     posix,session,simplexml,sodium,tokenizer,xml,xmlreader,xmlwriter,zip,zlib";
 
+/// Pinned version of the standalone spc (static-php-cli) binary.
+const SPC_VERSION: &str = "2.8.3";
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str);
@@ -443,74 +446,54 @@ fn musl_target_triple() -> String {
     format!("{}-unknown-linux-musl", std::env::consts::ARCH)
 }
 
-/// Build libphp.a via static-php-cli.
+/// Build libphp.a via the standalone spc (static-php-cli) binary.
+///
+/// Downloads a self-contained spc binary from GitHub releases — no system
+/// PHP or Composer required. The spc binary is a PHP micro binary with the
+/// static-php-cli application bundled in.
 fn php_sdk(args: &[String]) -> ExitCode {
     let php_version = args.first().map_or("8.5", String::as_str);
 
-    // Check for the minimum tools needed to bootstrap static-php-cli.
-    // spc doctor --auto-fix handles the rest (musl toolchain, bison, flex, etc.)
-    let missing: Vec<&str> = ["php", "composer", "git"]
-        .into_iter()
-        .filter(|cmd| !has_command(cmd))
-        .collect();
-
-    if !missing.is_empty() {
-        eprintln!("error: missing required tools: {}", missing.join(", "));
-        eprintln!();
-        eprintln!("Install them:");
-        eprintln!("  sudo apt update && sudo apt install -y php-cli composer git");
+    // Only git and C build tools are needed — no system PHP or Composer.
+    if !has_command("git") {
+        eprintln!("error: git is required");
+        eprintln!("  sudo apt update && sudo apt install -y git");
         return ExitCode::FAILURE;
     }
 
     let spc_dir = spc_dir();
+    fs::create_dir_all(&spc_dir).ok();
 
-    // Clone static-php-cli if not present
-    if !spc_dir.exists() {
-        eprintln!("==> Cloning static-php-cli...");
-        let status = Command::new("git")
-            .args([
-                "clone",
-                "--depth",
-                "1",
-                "https://github.com/crazywhalecc/static-php-cli.git",
-                spc_dir.to_str().unwrap(),
-            ])
-            .status();
-
-        if !ran_ok(&status) {
-            eprintln!("error: git clone failed");
+    // Download the standalone spc binary if not present.
+    let spc_bin = spc_dir.join("spc");
+    if !spc_bin.exists() {
+        let spc_arch = if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            "x86_64"
+        };
+        let spc_os = if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            "linux"
+        };
+        let url = format!(
+            "https://github.com/crazywhalecc/static-php-cli/releases/download/{SPC_VERSION}/spc-{spc_os}-{spc_arch}.tar.gz"
+        );
+        eprintln!("==> Downloading spc v{SPC_VERSION}...");
+        if !download_and_extract_tarball(&url, &spc_dir, "spc") {
+            eprintln!("error: failed to download spc binary from {url}");
             return ExitCode::FAILURE;
         }
     }
 
-    // Install composer deps if needed.
-    // Use `composer update` instead of `install` because static-php-cli's
-    // lock file may require a newer PHP than what's available on the system.
-    if !spc_dir.join("vendor").exists() {
-        eprintln!("==> Installing static-php-cli dependencies...");
-        let status = Command::new("composer")
-            .args([
-                "update",
-                "--no-dev",
-                "--no-interaction",
-                "--ignore-platform-reqs",
-            ])
-            .current_dir(&spc_dir)
-            .status();
-
-        if !ran_ok(&status) {
-            eprintln!("error: composer install failed");
-            return ExitCode::FAILURE;
-        }
-    }
-
-    let spc_bin = spc_dir.join("bin").join("spc");
+    let spc = spc_bin.to_str().unwrap();
 
     // Let spc install its own toolchain (musl cross-compiler, missing system
     // packages, etc.). This may prompt for sudo password.
     eprintln!("==> Checking build environment (may prompt for sudo)...");
-    let status = Command::new("php")
-        .args([spc_bin.to_str().unwrap(), "doctor", "--auto-fix"])
+    let status = Command::new(spc)
+        .args(["doctor", "--auto-fix"])
         .current_dir(&spc_dir)
         .status();
 
@@ -521,9 +504,8 @@ fn php_sdk(args: &[String]) -> ExitCode {
 
     // Download PHP source + extension dependencies
     eprintln!("==> Downloading PHP {php_version} sources...");
-    let status = Command::new("php")
+    let status = Command::new(spc)
         .args([
-            spc_bin.to_str().unwrap(),
             "download",
             &format!("--with-php={php_version}"),
             &format!("--for-extensions={PHP_EXTENSIONS}"),
@@ -550,9 +532,8 @@ fn php_sdk(args: &[String]) -> ExitCode {
 
     // Build libphp.a with embed SAPI
     eprintln!("==> Building libphp.a (this takes ~15 min the first time)...");
-    let status = Command::new("php")
+    let status = Command::new(spc)
         .args([
-            spc_bin.to_str().unwrap(),
             "build",
             PHP_EXTENSIONS,
             "--build-embed",
@@ -995,10 +976,10 @@ fn container_engine() -> String {
 
 // ── PHP SDK ─────────────────────────────────────────────────────────────────
 
-/// Directory where static-php-cli lives.
+/// Directory where the spc binary and its build artifacts live.
 ///
 /// If `SPC_DIR` is set (e.g. in the CI container image), use that directly.
-/// Otherwise, clone into `<workspace>/php-sdk/static-php-cli`.
+/// Otherwise, use `<workspace>/php-sdk/static-php-cli`.
 fn spc_dir() -> PathBuf {
     env::var_os("SPC_DIR")
         .map(PathBuf::from)
@@ -1053,7 +1034,7 @@ fn require_unix(f: impl FnOnce() -> ExitCode) -> ExitCode {
         eprintln!();
         eprintln!("WSL build failed. Make sure WSL has the required tools:");
         eprintln!("  wsl -- bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh'");
-        eprintln!("  wsl -- bash -c 'sudo apt update && sudo apt install -y php-cli composer build-essential autoconf cmake pkg-config re2c libclang-dev musl-tools'");
+        eprintln!("  wsl -- bash -c 'sudo apt update && sudo apt install -y build-essential autoconf cmake pkg-config re2c libclang-dev musl-tools curl git'");
         ExitCode::FAILURE
     }
 }

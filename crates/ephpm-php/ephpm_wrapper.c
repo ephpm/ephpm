@@ -33,6 +33,8 @@
 #include "Zend/zend_ini.h"
 #include "Zend/zend_stream.h"
 #include "Zend/zend_call_stack.h"
+#include "Zend/zend_exceptions.h"
+#include "main/php_version.h"
 
 /* ===== Output buffer ===== */
 
@@ -375,8 +377,15 @@ int ephpm_execute_request(const char *filename)
         zend_file_handle file_handle;
         zend_stream_init_filename(&file_handle, filename);
         php_execute_script(&file_handle);
+
+        /* PHP 8.x: exit()/die() throws an unwind exit exception instead
+         * of calling zend_bailout(). Treat it like the old bailout path. */
+        if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
+            zend_clear_exception();
+            result = -2;
+        }
     } else {
-        /* PHP bailed out (fatal error, exit(), die()) */
+        /* PHP bailed out (fatal error) */
         result = -2;
     }
     EG(bailout) = __orig_bailout;
@@ -419,4 +428,344 @@ const char *ephpm_get_response_headers(size_t *out_len)
 {
     *out_len = headers_buf_len;
     return headers_buf;
+}
+
+/* ===================================================================
+ * CLI mode — `ephpm php ...` subcommand
+ *
+ * Provides a PHP CLI interface using the embed SAPI by handling
+ * argc/argv with php_getopt and calling the same PHP APIs that
+ * the real CLI SAPI uses. Output goes directly to stdout/stderr.
+ * =================================================================== */
+
+#include "main/php_getopt.h"
+#include "ext/standard/info.h"
+#include "main/php_output.h"
+#include "Zend/zend_extensions.h"
+#include "Zend/zend_highlight.h"
+#include "ext/standard/basic_functions.h"
+
+/*
+ * ub_write callback that writes directly to stdout.
+ * Used temporarily during CLI-mode execution.
+ */
+static size_t ephpm_sapi_ub_write_stdout(const char *str, size_t str_length)
+{
+    return fwrite(str, 1, str_length, stdout);
+}
+
+/*
+ * Get the PHP version string (compile-time constant).
+ * Does NOT require php_embed_init() — safe to call at any time.
+ */
+const char *ephpm_get_php_version(void)
+{
+    return PHP_VERSION;
+}
+
+/*
+ * Helper: switch to CLI-mode output (stdout).
+ * Saves the current ub_write and swaps in stdout mode. Also sets
+ * headers_sent + no_headers so PHP doesn't try to emit HTTP headers.
+ */
+static void cli_begin(size_t (**orig_ub_write)(const char *, size_t))
+{
+    *orig_ub_write = sapi_module.ub_write;
+    sapi_module.ub_write = ephpm_sapi_ub_write_stdout;
+    SG(headers_sent) = 1;
+    SG(request_info).no_headers = 1;
+    EG(max_allowed_stack_size) = 0;
+}
+
+/*
+ * Helper: finish CLI-mode execution. Flushes stdout and restores
+ * the original ub_write.
+ */
+static void cli_end(size_t (*orig_ub_write)(const char *, size_t))
+{
+    fflush(stdout);
+    sapi_module.ub_write = orig_ub_write;
+}
+
+/*
+ * Helper: execute code or a file with bailout protection.
+ * If `code` is non-NULL, evaluates it via zend_eval_string.
+ * If `filename` is non-NULL, executes it via php_execute_script.
+ * Returns the PHP exit status.
+ */
+static int cli_execute_protected(const char *code, const char *filename)
+{
+    int result = 0;
+    JMP_BUF *__orig_bailout = EG(bailout);
+    JMP_BUF __bailout;
+
+    EG(bailout) = &__bailout;
+    if (SETJMP(__bailout) == 0) {
+        if (code) {
+            zend_eval_string((char *)code, NULL, "ephpm php -r");
+        } else if (filename) {
+            zend_file_handle file_handle;
+            zend_stream_init_filename(&file_handle, filename);
+            php_execute_script(&file_handle);
+        }
+
+        /* PHP 8.x: exit() throws an unwind exit exception instead of
+         * calling zend_bailout(). Check for it after normal return. */
+        if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
+            zend_clear_exception();
+            result = EG(exit_status);
+        }
+    } else {
+        /* PHP bailed out (fatal error) */
+        result = EG(exit_status);
+        if (result == 0) result = 1;
+    }
+    EG(bailout) = __orig_bailout;
+    return result;
+}
+
+/* PHP CLI option table — matches the real PHP CLI SAPI options.
+ * Used by php_getopt() to parse argc/argv. */
+static const opt_struct cli_options[] = {
+    {'a', 0, "interactive"},
+    {'B', 1, "process-begin"},
+    {'C', 0, "no-chdir"},
+    {'c', 1, "php-ini"},
+    {'d', 1, "define"},
+    {'E', 1, "process-end"},
+    {'e', 0, "profile-info"},
+    {'F', 1, "process-file"},
+    {'f', 1, "file"},
+    {'h', 0, "help"},
+    {'i', 0, "info"},
+    {'l', 0, "syntax-check"},
+    {'m', 0, "modules"},
+    {'n', 0, "no-php-ini"},
+    {'q', 0, "no-header"},
+    {'R', 1, "process-code"},
+    {'H', 0, "hide-args"},
+    {'r', 1, "run"},
+    {'s', 0, "syntax-highlight"},
+    {'t', 1, "docroot"},
+    {'w', 0, "strip"},
+    {'?', 0, "usage"},
+    {'v', 0, "version"},
+    {10,  1, "rf"},
+    {10,  1, "rfunction"},
+    {11,  1, "rc"},
+    {11,  1, "rclass"},
+    {12,  1, "re"},
+    {12,  1, "rextension"},
+    {13,  1, "rz"},
+    {13,  1, "rzendextension"},
+    {14,  1, "ri"},
+    {14,  1, "rextinfo"},
+    {15,  2, "ini"},
+    {'-', 0, NULL}
+};
+
+/* Helper: print module names (for -m flag) */
+static int cli_print_module(zval *zv)
+{
+    zend_module_entry *module = Z_PTR_P(zv);
+    php_printf("%s\n", module->name);
+    return ZEND_HASH_APPLY_KEEP;
+}
+
+/* Helper: print Zend extension names (for -m flag) */
+static void cli_print_extension(zend_extension *ext)
+{
+    php_printf("%s\n", ext->name);
+}
+
+/*
+ * PHP CLI main entry point. Parses argc/argv using php_getopt with
+ * the same option table as the real PHP CLI, then dispatches to the
+ * appropriate PHP APIs.
+ *
+ * Call AFTER php_embed_init(). The embed SAPI must already be running.
+ * php_embed_init() starts a request automatically — we shut it down
+ * first so we can start fresh CLI-mode requests.
+ *
+ * Returns the process exit code (0 = success).
+ */
+int ephpm_cli_main(int argc, char **argv)
+{
+    int c;
+    char *php_optarg = NULL;
+    int php_optind = 1;
+    int result = 0;
+    size_t (*orig_ub_write)(const char *, size_t) = NULL;
+
+    char *exec_direct = NULL;   /* -r code */
+    char *script_file = NULL;   /* -f file or positional */
+    int mode = 0;               /* 0=standard, 'r'=run, 'l'=lint, etc. */
+
+    /* First pass: handle flags that print info and exit immediately */
+    while ((c = php_getopt(argc, argv, cli_options, &php_optarg, &php_optind, 0, 2)) != -1) {
+        switch (c) {
+        case 'v': /* version */
+            sapi_module.ub_write = ephpm_sapi_ub_write_stdout;
+            php_printf("PHP %s (ephpm) (built: %s %s)\n"
+                       "Copyright (c) The PHP Group\n"
+                       "Zend Engine v%s, Copyright (c) Zend Technologies\n",
+                       PHP_VERSION, __DATE__, __TIME__,
+                       ZEND_VERSION);
+            fflush(stdout);
+            return 0;
+
+        case 'i': /* phpinfo */
+            cli_begin(&orig_ub_write);
+            php_print_info(0x7FFFFFFF & ~0x200); /* PHP_INFO_ALL & ~PHP_INFO_CREDITS */
+            php_output_end_all();
+            cli_end(orig_ub_write);
+            return 0;
+
+        case 'm': /* modules */
+            cli_begin(&orig_ub_write);
+            php_printf("[PHP Modules]\n");
+            zend_hash_apply(&module_registry, (apply_func_t)cli_print_module);
+            php_printf("\n[Zend Modules]\n");
+            zend_llist_apply(&zend_extensions, (llist_apply_func_t)cli_print_extension);
+            php_printf("\n");
+            php_output_end_all();
+            cli_end(orig_ub_write);
+            return 0;
+
+        case 'h':
+        case '?':
+            /* Print a help message */
+            fprintf(stdout,
+                "Usage: ephpm php [options] [-f] <file> [--] [args...]\n"
+                "       ephpm php [options] -r <code> [--] [args...]\n"
+                "       ephpm php [options] -- [args...]\n"
+                "\n"
+                "  -a               Run as interactive shell\n"
+                "  -c <path>|<file> Look for php.ini file in this directory\n"
+                "  -n               No configuration (ini) files will be used\n"
+                "  -d foo[=bar]     Define INI entry foo with value 'bar'\n"
+                "  -e               Generate extended information for debugger/profiler\n"
+                "  -f <file>        Parse and execute <file>\n"
+                "  -h               This help\n"
+                "  -i               PHP information\n"
+                "  -l               Syntax check only (lint)\n"
+                "  -m               Show compiled in modules\n"
+                "  -r <code>        Run PHP <code> without using script tags <?..?>\n"
+                "  -B <begin_code>  Run PHP <begin_code> before processing input lines\n"
+                "  -R <code>        Run PHP <code> for every input line\n"
+                "  -F <file>        Parse and execute <file> for every input line\n"
+                "  -E <end_code>    Run PHP <end_code> after processing all input lines\n"
+                "  -H               Hide any passed arguments from external tools\n"
+                "  -s               Output HTML syntax highlighted source\n"
+                "  -v               Version number\n"
+                "  -w               Output source with stripped comments and whitespace\n"
+                "  -z <file>        Load Zend extension <file>\n"
+                "\n"
+                "  args...          Arguments passed to script. Use -- args when first argument\n"
+                "                   starts with - or script is read from stdin\n"
+                "\n"
+                "  --ini            Show configuration file names\n"
+                "  --rf <name>      Show information about function <name>\n"
+                "  --rc <name>      Show information about class <name>\n"
+                "  --re <name>      Show information about extension <name>\n"
+                "  --rz <name>      Show information about Zend extension <name>\n"
+                "  --ri <name>      Show configuration for extension <name>\n"
+            );
+            return 0;
+
+        case 15: /* --ini */
+            cli_begin(&orig_ub_write);
+            zend_eval_string(
+                "echo 'Loaded Configuration File:         ' "
+                ". (php_ini_loaded_file() ?: '(none)') . \"\\n\";\n"
+                "$s = php_ini_scanned_files();\n"
+                "if ($s) echo 'Additional .ini files parsed:      ' . $s . \"\\n\";\n",
+                NULL, "ephpm --ini");
+            php_output_end_all();
+            cli_end(orig_ub_write);
+            return 0;
+
+        default:
+            break;
+        }
+    }
+
+    /* Second pass: collect execution options */
+    php_optind = 1;
+    php_optarg = NULL;
+    while ((c = php_getopt(argc, argv, cli_options, &php_optarg, &php_optind, 0, 2)) != -1) {
+        switch (c) {
+        case 'r':
+            exec_direct = php_optarg;
+            mode = 'r';
+            break;
+        case 'f':
+            script_file = php_optarg;
+            break;
+        case 'l':
+            mode = 'l';
+            break;
+        case 'w':
+            mode = 'w';
+            break;
+        case 's':
+            mode = 's';
+            break;
+        default:
+            break;
+        }
+    }
+
+    /* Positional argument: if no -f and no -r, first non-option arg is the script */
+    if (!script_file && !exec_direct && php_optind < argc && argv[php_optind][0] != '-') {
+        script_file = argv[php_optind];
+    }
+
+    /* Execute based on mode */
+    if (mode == 'r' && exec_direct) {
+        /* -r "code" */
+        cli_begin(&orig_ub_write);
+        result = cli_execute_protected(exec_direct, NULL);
+        cli_end(orig_ub_write);
+    } else if (mode == 'l' && script_file) {
+        /* -l file (syntax check) */
+        cli_begin(&orig_ub_write);
+        {
+            zend_file_handle file_handle;
+            zend_stream_init_filename(&file_handle, script_file);
+            if (php_lint_script(&file_handle) == SUCCESS) {
+                php_printf("No syntax errors detected in %s\n", script_file);
+            } else {
+                result = 255;
+            }
+        }
+        php_output_end_all();
+        cli_end(orig_ub_write);
+    } else if (script_file) {
+        /* Execute a file (standard mode, -w, -s) */
+        cli_begin(&orig_ub_write);
+        if (mode == 'w') {
+            char code[4096];
+            snprintf(code, sizeof(code),
+                "echo php_strip_whitespace('%s');", script_file);
+            cli_execute_protected(code, NULL);
+            php_output_end_all();
+        } else if (mode == 's') {
+            char code[4096];
+            snprintf(code, sizeof(code),
+                "highlight_file('%s');", script_file);
+            cli_execute_protected(code, NULL);
+            php_output_end_all();
+        } else {
+            result = cli_execute_protected(NULL, script_file);
+        }
+        cli_end(orig_ub_write);
+    } else {
+        /* No script or code provided */
+        fprintf(stderr, "ephpm php: no input file\n"
+                        "Run 'ephpm php -h' for usage information.\n");
+        return 1;
+    }
+
+    return result;
 }

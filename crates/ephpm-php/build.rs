@@ -86,6 +86,15 @@ fn link_system_libs(target_os: &str) {
             // static-php-cli builds PHP against musl. When we target musl,
             // resolv/dl/m/pthread/rt are all part of musl's libc — no
             // separate linking is needed. Rust links musl libc statically.
+            //
+            // PHP's JIT (opcache) uses GCC CPU feature detection builtins
+            // (__cpu_indicator_init, __cpu_model, __cpu_features2) for AVX
+            // and CLDEMOTE checks. These live in libgcc.a from the musl
+            // cross-compiler toolchain.
+            if let Some(gcc_dir) = find_musl_libgcc() {
+                println!("cargo::rustc-link-search=native={}", gcc_dir.display());
+            }
+            println!("cargo::rustc-link-lib=static=gcc");
         }
         "linux" => {
             for lib in &["resolv", "dl", "m", "pthread", "rt"] {
@@ -263,6 +272,37 @@ fn find_clang_resource_include() -> Option<PathBuf> {
                 let include = entry.path().join("include");
                 if include.join("stddef.h").exists() {
                     return Some(include);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Find the directory containing `libgcc.a` from the musl cross-compiler.
+///
+/// `spc doctor --auto-fix` installs a musl GCC toolchain (e.g. under
+/// `/usr/local/musl/`). We need to add its lib directory to the linker
+/// search path so `-lgcc` resolves.
+fn find_musl_libgcc() -> Option<PathBuf> {
+    let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".into());
+    let musl_triple = format!("{arch}-linux-musl");
+
+    // Common locations where musl-cross toolchains install libgcc.a:
+    //   /usr/local/musl/lib/gcc/<triple>/<ver>/libgcc.a  (spc doctor)
+    //   /usr/lib/gcc/<triple>/<ver>/libgcc.a              (distro packages)
+    let search_roots = [
+        PathBuf::from(format!("/usr/local/musl/lib/gcc/{musl_triple}")),
+        PathBuf::from(format!("/usr/lib/gcc/{musl_triple}")),
+    ];
+
+    for root in &search_roots {
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let candidate = entry.path().join("libgcc.a");
+                if candidate.exists() {
+                    return Some(entry.path());
                 }
             }
         }

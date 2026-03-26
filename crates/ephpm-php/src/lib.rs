@@ -76,6 +76,20 @@ mod ffi {
         pub fn ephpm_get_response_headers(
             out_len: *mut usize,
         ) -> *const ::std::os::raw::c_char;
+
+        // ── CLI mode functions ──────────────────────────────────────
+
+        /// Get the PHP version string (compile-time constant).
+        /// Safe to call before `php_embed_init()`.
+        pub fn ephpm_get_php_version() -> *const ::std::os::raw::c_char;
+
+        /// PHP CLI main entry point. Parses argc/argv using php_getopt
+        /// and dispatches to the appropriate PHP APIs. Call after
+        /// `php_embed_init()`. Returns the process exit code.
+        pub fn ephpm_cli_main(
+            argc: ::std::os::raw::c_int,
+            argv: *mut *mut ::std::os::raw::c_char,
+        ) -> ::std::os::raw::c_int;
     }
 }
 
@@ -189,6 +203,86 @@ impl PhpRuntime {
         }
         Ok(())
     }
+
+    // ── CLI mode methods ──────────────────────────────────────────────────
+
+    /// Get the embedded PHP version string (e.g. "8.5.4").
+    ///
+    /// This reads a compile-time constant and does not require the PHP
+    /// runtime to be initialized.
+    #[cfg(php_linked)]
+    #[must_use]
+    pub fn php_version() -> &'static str {
+        // Safety: ephpm_get_php_version returns a pointer to the static
+        // PHP_VERSION string constant, which is valid for the entire process.
+        let ptr = unsafe { ffi::ephpm_get_php_version() };
+        // Safety: PHP_VERSION is a valid UTF-8 C string literal.
+        unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_str()
+            .unwrap_or("unknown")
+    }
+
+    /// Get the embedded PHP version string (stub mode).
+    #[cfg(not(php_linked))]
+    #[must_use]
+    pub fn php_version() -> &'static str {
+        "not available (stub mode — no libphp linked)"
+    }
+
+    /// Run the PHP CLI with the given arguments.
+    ///
+    /// Passes `args` through to PHP's argument parser, supporting all
+    /// standard PHP CLI flags (`-v`, `-r`, `-f`, `-m`, `-i`, `-l`, etc.).
+    /// Output goes directly to stdout/stderr.
+    ///
+    /// Initializes the PHP runtime if needed. Returns the PHP exit code
+    /// (0 for success).
+    ///
+    /// # Errors
+    ///
+    /// Returns `PhpError::LockPoisoned` or `PhpError::InitFailed` on failure.
+    pub fn cli_main(args: &[String]) -> Result<i32, PhpError> {
+        Self::init()?;
+
+        #[cfg(php_linked)]
+        {
+            use std::ffi::CString;
+
+            let _runtime = PHP_RUNTIME.lock().map_err(|_| PhpError::LockPoisoned)?;
+
+            // Build argc/argv for the C function.
+            // argv[0] is the program name, followed by the user's args.
+            let mut c_args: Vec<CString> = Vec::with_capacity(args.len() + 1);
+            c_args.push(CString::new("ephpm").unwrap());
+            for arg in args {
+                c_args.push(CString::new(arg.as_str()).map_err(|e| {
+                    PhpError::ExecutionFailed(format!("invalid argument: {e}"))
+                })?);
+            }
+
+            let mut argv_ptrs: Vec<*mut std::os::raw::c_char> =
+                c_args.iter().map(|s| s.as_ptr().cast_mut()).collect();
+            argv_ptrs.push(std::ptr::null_mut());
+
+            let argc = c_args.len() as std::os::raw::c_int;
+
+            // Safety: We hold the runtime lock. argv_ptrs is valid for argc
+            // entries plus a null terminator. The C function handles request
+            // lifecycle and bailout protection internally.
+            let ret = unsafe { ffi::ephpm_cli_main(argc, argv_ptrs.as_mut_ptr()) };
+            Ok(ret)
+        }
+
+        #[cfg(not(php_linked))]
+        {
+            let _ = args;
+            Err(PhpError::ExecutionFailed(
+                "PHP not linked — build with PHP_SDK_PATH to enable CLI mode".into(),
+            ))
+        }
+    }
+
+    // ── HTTP mode methods ────────────────────────────────────────────────
 
     /// Execute a PHP request.
     ///
