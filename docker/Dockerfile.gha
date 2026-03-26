@@ -1,0 +1,65 @@
+# CI runner image with all build tools pre-installed.
+#
+# Includes: Rust stable, PHP CLI, Composer, static-php-cli (with deps +
+# musl wrapper), and system build tools. Running `cargo xtask release`
+# inside this image skips all setup and goes straight to building.
+#
+# Build:
+#   docker build -f docker/Dockerfile.gha -t ghcr.io/<owner>/ephpm-ci:latest .
+#
+# Usage in GitHub Actions:
+#   jobs:
+#     build:
+#       container: ghcr.io/<owner>/ephpm-ci:latest
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ── System build tools ───────────────────────────────────────────────────────
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Basics
+    build-essential ca-certificates curl git pkg-config \
+    # PHP build deps (what spc doctor installs)
+    autoconf automake bison cmake flex gettext libtool make re2c \
+    # Bindgen needs libclang
+    libclang-dev \
+    # PHP CLI + extensions needed to run static-php-cli
+    software-properties-common gpg-agent \
+    && add-apt-repository -y ppa:ondrej/php \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    php8.4-cli php8.4-xml php8.4-mbstring php8.4-curl php8.4-tokenizer \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Composer ─────────────────────────────────────────────────────────────────
+
+RUN curl -sS https://getcomposer.org/installer | php8.4 -- --install-dir=/usr/local/bin --filename=composer
+
+# ── Rust stable ──────────────────────────────────────────────────────────────
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal \
+        --component rustfmt,clippy \
+    && rustup toolchain install nightly --component rustfmt \
+    && cargo install cargo-nextest --locked \
+    && rm -rf /usr/local/cargo/registry
+
+# ── static-php-cli (pre-installed with musl wrapper) ─────────────────────────
+
+WORKDIR /opt/static-php-cli
+RUN git clone --depth 1 https://github.com/crazywhalecc/static-php-cli.git . \
+    && composer install --no-dev --no-interaction --ignore-platform-reqs \
+    && php8.4 bin/spc doctor --auto-fix \
+    && mkdir -p buildroot/bin \
+    && ln -sf /usr/bin/pkg-config buildroot/bin/pkg-config
+
+# Pre-seed the php-sdk directory structure that cargo xtask expects.
+# The xtask will find this via SPC_DIR env var and skip clone/setup.
+ENV SPC_DIR=/opt/static-php-cli
+
+WORKDIR /src

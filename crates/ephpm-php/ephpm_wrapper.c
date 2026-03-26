@@ -1,0 +1,771 @@
+/*
+ * C wrapper for PHP embed SAPI — custom SAPI callbacks + request lifecycle.
+ *
+ * PHP uses setjmp/longjmp for error handling via zend_try/zend_catch macros.
+ * These macros cannot be used from Rust (they expand to setjmp which must be
+ * called from C). This wrapper provides:
+ *
+ *   1. Custom SAPI callbacks (ub_write, read_post, read_cookies, etc.) that
+ *      capture PHP output and bridge HTTP request data into PHP.
+ *
+ *   2. Per-request lifecycle management (request_shutdown → set info →
+ *      request_startup → execute → capture response).
+ *
+ *   3. Safe script execution with zend_try/zend_catch bailout protection.
+ *
+ * The embed SAPI lifecycle:
+ *   php_embed_init()          — module startup (no request started)
+ *   ephpm_install_sapi()      — override default callbacks with ours
+ *   ephpm_execute_request()×N — per-request: startup → execute → capture
+ *   php_embed_shutdown()      — request shutdown + module shutdown
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <setjmp.h>
+#include "sapi/embed/php_embed.h"
+#include "main/php.h"
+#include "main/SAPI.h"
+#include "main/php_main.h"
+#include "main/php_variables.h"
+#include "Zend/zend.h"
+#include "Zend/zend_ini.h"
+#include "Zend/zend_stream.h"
+#include "Zend/zend_call_stack.h"
+#include "Zend/zend_exceptions.h"
+#include "main/php_version.h"
+
+/* ===== Output buffer ===== */
+
+static char *output_buf = NULL;
+static size_t output_len = 0;
+static size_t output_cap = 0;
+
+/* ===== Response header buffer ===== */
+/* Stored as "Name: Value\n" lines after script execution */
+
+static char *headers_buf = NULL;
+static size_t headers_buf_len = 0;
+static size_t headers_buf_cap = 0;
+
+/* ===== Saved response status ===== */
+
+static int response_status_code = 200;
+
+/* ===== Request info ===== */
+/* Pointers into Rust-owned CStrings, valid only during execution */
+
+static const char *req_method = NULL;
+static const char *req_uri = NULL;
+static const char *req_query_string = NULL;
+static const char *req_content_type = NULL;
+static const char *req_cookie_data = NULL;
+static const char *req_post_data = NULL;
+static size_t req_post_data_len = 0;
+static size_t req_post_data_offset = 0;
+static const char *req_path_translated = NULL;
+
+/* ===== Server variables ===== */
+
+#define MAX_SERVER_VARS 128
+
+static struct {
+    const char *key;
+    const char *value;
+} server_vars[MAX_SERVER_VARS];
+
+static int server_var_count = 0;
+
+/* Track whether a PHP request is currently active */
+static int request_active = 0;
+
+/* ===================================================================
+ * SAPI Callbacks
+ *
+ * These are installed into PHP's sapi_module_struct by
+ * ephpm_install_sapi(). PHP calls them during request processing.
+ * =================================================================== */
+
+/*
+ * ub_write — Called by PHP for all output (echo, print, template rendering).
+ * Appends data to our output buffer instead of writing to stdout.
+ */
+static size_t ephpm_sapi_ub_write(const char *str, size_t str_length)
+{
+    if (output_len + str_length > output_cap) {
+        size_t new_cap = (output_cap == 0) ? 8192 : output_cap;
+        while (new_cap < output_len + str_length)
+            new_cap *= 2;
+        char *new_buf = realloc(output_buf, new_cap);
+        if (!new_buf) return 0;
+        output_buf = new_buf;
+        output_cap = new_cap;
+    }
+    memcpy(output_buf + output_len, str, str_length);
+    output_len += str_length;
+    return str_length;
+}
+
+/*
+ * flush — Called by PHP to flush the output buffer.
+ * No-op: we buffer the entire response and send it at once.
+ */
+static void ephpm_sapi_flush(void *server_context)
+{
+    (void)server_context;
+}
+
+/*
+ * send_headers — Called by PHP before the first output to finalize headers.
+ * We capture headers separately, so just return success.
+ */
+static int ephpm_sapi_send_headers(sapi_headers_struct *sapi_headers)
+{
+    (void)sapi_headers;
+    return SAPI_HEADER_SENT_SUCCESSFULLY;
+}
+
+/*
+ * read_post — Called by PHP to read POST request body data.
+ * Returns up to count_bytes from the POST body.
+ */
+static size_t ephpm_sapi_read_post(char *buffer, size_t count_bytes)
+{
+    if (!req_post_data || req_post_data_offset >= req_post_data_len)
+        return 0;
+
+    size_t remaining = req_post_data_len - req_post_data_offset;
+    size_t to_copy = remaining < count_bytes ? remaining : count_bytes;
+    memcpy(buffer, req_post_data + req_post_data_offset, to_copy);
+    req_post_data_offset += to_copy;
+    return to_copy;
+}
+
+/*
+ * read_cookies — Called by PHP to get the raw Cookie header string.
+ * Returns the cookie string set by Rust before execution.
+ */
+static char *ephpm_sapi_read_cookies(void)
+{
+    return (char *)req_cookie_data;
+}
+
+/*
+ * register_server_variables — Called by PHP during request startup
+ * to populate $_SERVER. We iterate over the server variables that
+ * Rust added via ephpm_request_add_server_var().
+ */
+static void ephpm_sapi_register_server_variables(zval *track_vars_array)
+{
+    for (int i = 0; i < server_var_count; i++) {
+        php_register_variable_safe(
+            (char *)server_vars[i].key,
+            (char *)server_vars[i].value,
+            strlen(server_vars[i].value),
+            track_vars_array
+        );
+    }
+}
+
+/*
+ * log_message — Called by PHP to log error messages.
+ * Routes to stderr for now. Future: call back to Rust tracing.
+ */
+static void ephpm_sapi_log_message(const char *message, int syslog_type_int)
+{
+    (void)syslog_type_int;
+    fprintf(stderr, "[PHP] %s\n", message);
+}
+
+/* ===================================================================
+ * Internal helpers
+ * =================================================================== */
+
+/*
+ * Capture response headers from PHP's SAPI globals into our buffer.
+ * Must be called after script execution, while the request is still active.
+ *
+ * Headers are stored as "Name: Value\n" lines for Rust to parse.
+ */
+static void capture_response_headers(void)
+{
+    headers_buf_len = 0;
+
+    zend_llist_position pos;
+    sapi_header_struct *h = (sapi_header_struct *)
+        zend_llist_get_first_ex(&SG(sapi_headers).headers, &pos);
+
+    while (h) {
+        size_t needed = h->header_len + 1; /* header + newline */
+        while (headers_buf_len + needed > headers_buf_cap) {
+            size_t new_cap = headers_buf_cap ? headers_buf_cap * 2 : 1024;
+            char *new_buf = realloc(headers_buf, new_cap);
+            if (!new_buf) return;
+            headers_buf = new_buf;
+            headers_buf_cap = new_cap;
+        }
+        memcpy(headers_buf + headers_buf_len, h->header, h->header_len);
+        headers_buf[headers_buf_len + h->header_len] = '\n';
+        headers_buf_len += needed;
+
+        h = (sapi_header_struct *)
+            zend_llist_get_next_ex(&SG(sapi_headers).headers, &pos);
+    }
+}
+
+/* ===================================================================
+ * Public API — called from Rust via FFI
+ * =================================================================== */
+
+/*
+ * Override the default embed SAPI callbacks with our implementations.
+ * Must be called once after php_embed_init().
+ */
+void ephpm_install_sapi(void)
+{
+    sapi_module.ub_write = ephpm_sapi_ub_write;
+    sapi_module.flush = ephpm_sapi_flush;
+    sapi_module.send_headers = ephpm_sapi_send_headers;
+    sapi_module.read_post = ephpm_sapi_read_post;
+    sapi_module.read_cookies = ephpm_sapi_read_cookies;
+    sapi_module.register_server_variables = ephpm_sapi_register_server_variables;
+    sapi_module.log_message = ephpm_sapi_log_message;
+
+    /* Update SAPI name visible to phpinfo() and $_SERVER['SERVER_SOFTWARE'] */
+    sapi_module.name = "ephpm";
+    sapi_module.pretty_name = "ePHPm Embedded Server";
+}
+
+/*
+ * Apply INI settings after php_embed_init().
+ *
+ * Disables stack size checking which fails on tokio's spawn_blocking
+ * threads (small default stack). The embed SAPI doesn't process -d
+ * command-line flags, so we set INI entries programmatically.
+ */
+int ephpm_apply_ini_settings(void)
+{
+    zend_string *key = zend_string_init(
+        "zend.max_allowed_stack_size",
+        sizeof("zend.max_allowed_stack_size") - 1, 1);
+    zend_string *val = zend_string_init("0", 1, 1);
+    zend_alter_ini_entry(key, val, PHP_INI_SYSTEM, PHP_INI_STAGE_RUNTIME);
+    zend_string_release(val);
+    zend_string_release(key);
+
+    EG(max_allowed_stack_size) = 0;
+    return 0;
+}
+
+/*
+ * Reset per-request state. Call before setting up a new request.
+ */
+void ephpm_request_clear(void)
+{
+    output_len = 0;
+    headers_buf_len = 0;
+    response_status_code = 200;
+    req_method = NULL;
+    req_uri = NULL;
+    req_query_string = NULL;
+    req_content_type = NULL;
+    req_cookie_data = NULL;
+    req_post_data = NULL;
+    req_post_data_len = 0;
+    req_post_data_offset = 0;
+    req_path_translated = NULL;
+    server_var_count = 0;
+}
+
+/*
+ * Set core request info fields. Pointers must remain valid until
+ * ephpm_execute_request() returns.
+ */
+void ephpm_request_set_info(
+    const char *method,
+    const char *uri,
+    const char *query_string,
+    const char *content_type,
+    const char *cookie,
+    const char *post_data,
+    size_t post_data_len,
+    const char *path_translated)
+{
+    req_method = method;
+    req_uri = uri;
+    req_query_string = query_string;
+    req_content_type = content_type;
+    req_cookie_data = cookie;
+    req_post_data = post_data;
+    req_post_data_len = post_data_len;
+    req_post_data_offset = 0;
+    req_path_translated = path_translated;
+}
+
+/*
+ * Add a $_SERVER variable. Call before ephpm_execute_request().
+ * Pointers must remain valid until ephpm_execute_request() returns.
+ */
+void ephpm_request_add_server_var(const char *key, const char *value)
+{
+    if (server_var_count < MAX_SERVER_VARS) {
+        server_vars[server_var_count].key = key;
+        server_vars[server_var_count].value = value;
+        server_var_count++;
+    }
+}
+
+/*
+ * Execute a PHP request with proper lifecycle management.
+ *
+ * 1. Shuts down any previous request
+ * 2. Populates SG(request_info) from the data set by Rust
+ * 3. Calls php_request_startup() (triggers register_server_variables, etc.)
+ * 4. Executes the script with bailout protection
+ * 5. Captures response data (headers, status, output already in buffer)
+ *
+ * Returns:
+ *   0  on success
+ *  -1  if php_request_startup failed
+ *  -2  if PHP bailed out (fatal error, exit(), die())
+ */
+int ephpm_execute_request(const char *filename)
+{
+    /* Reset output and response buffers */
+    output_len = 0;
+    headers_buf_len = 0;
+
+    /* Disable stack size checking */
+    EG(max_allowed_stack_size) = 0;
+
+    /* Shut down the previous request if one is active */
+    if (request_active) {
+        php_request_shutdown(NULL);
+        request_active = 0;
+    }
+
+    /* Populate SAPI request info before php_request_startup.
+     * PHP reads these during request startup to set up superglobals. */
+    SG(request_info).request_method = (char *)req_method;
+    SG(request_info).request_uri = (char *)req_uri;
+    SG(request_info).query_string = (char *)req_query_string;
+    SG(request_info).content_type = req_content_type;
+    SG(request_info).cookie_data = (char *)req_cookie_data;
+    SG(request_info).content_length = (long)req_post_data_len;
+    SG(request_info).path_translated = (char *)req_path_translated;
+    SG(request_info).proto_num = 1001; /* HTTP/1.1 */
+
+    /* Start the new request. This calls register_server_variables,
+     * read_cookies, and other SAPI callbacks. */
+    if (php_request_startup() == FAILURE) {
+        return -1;
+    }
+    request_active = 1;
+
+    /* Re-disable stack checking (request startup may reset it) */
+    EG(max_allowed_stack_size) = 0;
+
+    /* Execute the script with bailout protection.
+     * PHP's zend_try/zend_catch uses setjmp/longjmp. */
+    int result = 0;
+    JMP_BUF *__orig_bailout = EG(bailout);
+    JMP_BUF __bailout;
+
+    EG(bailout) = &__bailout;
+    if (SETJMP(__bailout) == 0) {
+        zend_file_handle file_handle;
+        zend_stream_init_filename(&file_handle, filename);
+        php_execute_script(&file_handle);
+
+        /* PHP 8.x: exit()/die() throws an unwind exit exception instead
+         * of calling zend_bailout(). Treat it like the old bailout path. */
+        if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
+            zend_clear_exception();
+            result = -2;
+        }
+    } else {
+        /* PHP bailed out (fatal error) */
+        result = -2;
+    }
+    EG(bailout) = __orig_bailout;
+
+    /* Capture response data while the request is still active */
+    capture_response_headers();
+    response_status_code = SG(sapi_headers).http_response_code;
+
+    /* Note: we do NOT call php_request_shutdown here.
+     * It will be called at the start of the next request
+     * or by php_embed_shutdown() at process exit. */
+
+    return result;
+}
+
+/*
+ * Get the captured output buffer.
+ * Returns a pointer to the buffer and sets *out_len to the length.
+ */
+const char *ephpm_get_output_buf(size_t *out_len)
+{
+    *out_len = output_len;
+    return output_buf;
+}
+
+/*
+ * Get the HTTP response status code.
+ */
+int ephpm_get_response_code(void)
+{
+    return response_status_code;
+}
+
+/*
+ * Get the captured response headers buffer.
+ * Headers are stored as "Name: Value\n" lines.
+ * Returns a pointer to the buffer and sets *out_len to the length.
+ */
+const char *ephpm_get_response_headers(size_t *out_len)
+{
+    *out_len = headers_buf_len;
+    return headers_buf;
+}
+
+/* ===================================================================
+ * CLI mode — `ephpm php ...` subcommand
+ *
+ * Provides a PHP CLI interface using the embed SAPI by handling
+ * argc/argv with php_getopt and calling the same PHP APIs that
+ * the real CLI SAPI uses. Output goes directly to stdout/stderr.
+ * =================================================================== */
+
+#include "main/php_getopt.h"
+#include "ext/standard/info.h"
+#include "main/php_output.h"
+#include "Zend/zend_extensions.h"
+#include "Zend/zend_highlight.h"
+#include "ext/standard/basic_functions.h"
+
+/*
+ * ub_write callback that writes directly to stdout.
+ * Used temporarily during CLI-mode execution.
+ */
+static size_t ephpm_sapi_ub_write_stdout(const char *str, size_t str_length)
+{
+    return fwrite(str, 1, str_length, stdout);
+}
+
+/*
+ * Get the PHP version string (compile-time constant).
+ * Does NOT require php_embed_init() — safe to call at any time.
+ */
+const char *ephpm_get_php_version(void)
+{
+    return PHP_VERSION;
+}
+
+/*
+ * Helper: switch to CLI-mode output (stdout).
+ * Saves the current ub_write and swaps in stdout mode. Also sets
+ * headers_sent + no_headers so PHP doesn't try to emit HTTP headers.
+ */
+static void cli_begin(size_t (**orig_ub_write)(const char *, size_t))
+{
+    *orig_ub_write = sapi_module.ub_write;
+    sapi_module.ub_write = ephpm_sapi_ub_write_stdout;
+    SG(headers_sent) = 1;
+    SG(request_info).no_headers = 1;
+    EG(max_allowed_stack_size) = 0;
+}
+
+/*
+ * Helper: finish CLI-mode execution. Flushes stdout and restores
+ * the original ub_write.
+ */
+static void cli_end(size_t (*orig_ub_write)(const char *, size_t))
+{
+    fflush(stdout);
+    sapi_module.ub_write = orig_ub_write;
+}
+
+/*
+ * Helper: execute code or a file with bailout protection.
+ * If `code` is non-NULL, evaluates it via zend_eval_string.
+ * If `filename` is non-NULL, executes it via php_execute_script.
+ * Returns the PHP exit status.
+ */
+static int cli_execute_protected(const char *code, const char *filename)
+{
+    int result = 0;
+    JMP_BUF *__orig_bailout = EG(bailout);
+    JMP_BUF __bailout;
+
+    EG(bailout) = &__bailout;
+    if (SETJMP(__bailout) == 0) {
+        if (code) {
+            zend_eval_string((char *)code, NULL, "ephpm php -r");
+        } else if (filename) {
+            zend_file_handle file_handle;
+            zend_stream_init_filename(&file_handle, filename);
+            php_execute_script(&file_handle);
+        }
+
+        /* PHP 8.x: exit() throws an unwind exit exception instead of
+         * calling zend_bailout(). Check for it after normal return. */
+        if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
+            zend_clear_exception();
+            result = EG(exit_status);
+        }
+    } else {
+        /* PHP bailed out (fatal error) */
+        result = EG(exit_status);
+        if (result == 0) result = 1;
+    }
+    EG(bailout) = __orig_bailout;
+    return result;
+}
+
+/* PHP CLI option table — matches the real PHP CLI SAPI options.
+ * Used by php_getopt() to parse argc/argv. */
+static const opt_struct cli_options[] = {
+    {'a', 0, "interactive"},
+    {'B', 1, "process-begin"},
+    {'C', 0, "no-chdir"},
+    {'c', 1, "php-ini"},
+    {'d', 1, "define"},
+    {'E', 1, "process-end"},
+    {'e', 0, "profile-info"},
+    {'F', 1, "process-file"},
+    {'f', 1, "file"},
+    {'h', 0, "help"},
+    {'i', 0, "info"},
+    {'l', 0, "syntax-check"},
+    {'m', 0, "modules"},
+    {'n', 0, "no-php-ini"},
+    {'q', 0, "no-header"},
+    {'R', 1, "process-code"},
+    {'H', 0, "hide-args"},
+    {'r', 1, "run"},
+    {'s', 0, "syntax-highlight"},
+    {'t', 1, "docroot"},
+    {'w', 0, "strip"},
+    {'?', 0, "usage"},
+    {'v', 0, "version"},
+    {10,  1, "rf"},
+    {10,  1, "rfunction"},
+    {11,  1, "rc"},
+    {11,  1, "rclass"},
+    {12,  1, "re"},
+    {12,  1, "rextension"},
+    {13,  1, "rz"},
+    {13,  1, "rzendextension"},
+    {14,  1, "ri"},
+    {14,  1, "rextinfo"},
+    {15,  2, "ini"},
+    {'-', 0, NULL}
+};
+
+/* Helper: print module names (for -m flag) */
+static int cli_print_module(zval *zv)
+{
+    zend_module_entry *module = Z_PTR_P(zv);
+    php_printf("%s\n", module->name);
+    return ZEND_HASH_APPLY_KEEP;
+}
+
+/* Helper: print Zend extension names (for -m flag) */
+static void cli_print_extension(zend_extension *ext)
+{
+    php_printf("%s\n", ext->name);
+}
+
+/*
+ * PHP CLI main entry point. Parses argc/argv using php_getopt with
+ * the same option table as the real PHP CLI, then dispatches to the
+ * appropriate PHP APIs.
+ *
+ * Call AFTER php_embed_init(). The embed SAPI must already be running.
+ * php_embed_init() starts a request automatically — we shut it down
+ * first so we can start fresh CLI-mode requests.
+ *
+ * Returns the process exit code (0 = success).
+ */
+int ephpm_cli_main(int argc, char **argv)
+{
+    int c;
+    char *php_optarg = NULL;
+    int php_optind = 1;
+    int result = 0;
+    size_t (*orig_ub_write)(const char *, size_t) = NULL;
+
+    char *exec_direct = NULL;   /* -r code */
+    char *script_file = NULL;   /* -f file or positional */
+    int mode = 0;               /* 0=standard, 'r'=run, 'l'=lint, etc. */
+
+    /* First pass: handle flags that print info and exit immediately */
+    while ((c = php_getopt(argc, argv, cli_options, &php_optarg, &php_optind, 0, 2)) != -1) {
+        switch (c) {
+        case 'v': /* version */
+            sapi_module.ub_write = ephpm_sapi_ub_write_stdout;
+            php_printf("PHP %s (ephpm) (built: %s %s)\n"
+                       "Copyright (c) The PHP Group\n"
+                       "Zend Engine v%s, Copyright (c) Zend Technologies\n",
+                       PHP_VERSION, __DATE__, __TIME__,
+                       ZEND_VERSION);
+            fflush(stdout);
+            return 0;
+
+        case 'i': /* phpinfo */
+            cli_begin(&orig_ub_write);
+            php_print_info(0x7FFFFFFF & ~0x200); /* PHP_INFO_ALL & ~PHP_INFO_CREDITS */
+            php_output_end_all();
+            cli_end(orig_ub_write);
+            return 0;
+
+        case 'm': /* modules */
+            cli_begin(&orig_ub_write);
+            php_printf("[PHP Modules]\n");
+            zend_hash_apply(&module_registry, (apply_func_t)cli_print_module);
+            php_printf("\n[Zend Modules]\n");
+            zend_llist_apply(&zend_extensions, (llist_apply_func_t)cli_print_extension);
+            php_printf("\n");
+            php_output_end_all();
+            cli_end(orig_ub_write);
+            return 0;
+
+        case 'h':
+        case '?':
+            /* Print a help message */
+            fprintf(stdout,
+                "Usage: ephpm php [options] [-f] <file> [--] [args...]\n"
+                "       ephpm php [options] -r <code> [--] [args...]\n"
+                "       ephpm php [options] -- [args...]\n"
+                "\n"
+                "  -a               Run as interactive shell\n"
+                "  -c <path>|<file> Look for php.ini file in this directory\n"
+                "  -n               No configuration (ini) files will be used\n"
+                "  -d foo[=bar]     Define INI entry foo with value 'bar'\n"
+                "  -e               Generate extended information for debugger/profiler\n"
+                "  -f <file>        Parse and execute <file>\n"
+                "  -h               This help\n"
+                "  -i               PHP information\n"
+                "  -l               Syntax check only (lint)\n"
+                "  -m               Show compiled in modules\n"
+                "  -r <code>        Run PHP <code> without using script tags <?..?>\n"
+                "  -B <begin_code>  Run PHP <begin_code> before processing input lines\n"
+                "  -R <code>        Run PHP <code> for every input line\n"
+                "  -F <file>        Parse and execute <file> for every input line\n"
+                "  -E <end_code>    Run PHP <end_code> after processing all input lines\n"
+                "  -H               Hide any passed arguments from external tools\n"
+                "  -s               Output HTML syntax highlighted source\n"
+                "  -v               Version number\n"
+                "  -w               Output source with stripped comments and whitespace\n"
+                "  -z <file>        Load Zend extension <file>\n"
+                "\n"
+                "  args...          Arguments passed to script. Use -- args when first argument\n"
+                "                   starts with - or script is read from stdin\n"
+                "\n"
+                "  --ini            Show configuration file names\n"
+                "  --rf <name>      Show information about function <name>\n"
+                "  --rc <name>      Show information about class <name>\n"
+                "  --re <name>      Show information about extension <name>\n"
+                "  --rz <name>      Show information about Zend extension <name>\n"
+                "  --ri <name>      Show configuration for extension <name>\n"
+            );
+            return 0;
+
+        case 15: /* --ini */
+            cli_begin(&orig_ub_write);
+            zend_eval_string(
+                "echo 'Loaded Configuration File:         ' "
+                ". (php_ini_loaded_file() ?: '(none)') . \"\\n\";\n"
+                "$s = php_ini_scanned_files();\n"
+                "if ($s) echo 'Additional .ini files parsed:      ' . $s . \"\\n\";\n",
+                NULL, "ephpm --ini");
+            php_output_end_all();
+            cli_end(orig_ub_write);
+            return 0;
+
+        default:
+            break;
+        }
+    }
+
+    /* Second pass: collect execution options */
+    php_optind = 1;
+    php_optarg = NULL;
+    while ((c = php_getopt(argc, argv, cli_options, &php_optarg, &php_optind, 0, 2)) != -1) {
+        switch (c) {
+        case 'r':
+            exec_direct = php_optarg;
+            mode = 'r';
+            break;
+        case 'f':
+            script_file = php_optarg;
+            break;
+        case 'l':
+            mode = 'l';
+            break;
+        case 'w':
+            mode = 'w';
+            break;
+        case 's':
+            mode = 's';
+            break;
+        default:
+            break;
+        }
+    }
+
+    /* Positional argument: if no -f and no -r, first non-option arg is the script */
+    if (!script_file && !exec_direct && php_optind < argc && argv[php_optind][0] != '-') {
+        script_file = argv[php_optind];
+    }
+
+    /* Execute based on mode */
+    if (mode == 'r' && exec_direct) {
+        /* -r "code" */
+        cli_begin(&orig_ub_write);
+        result = cli_execute_protected(exec_direct, NULL);
+        cli_end(orig_ub_write);
+    } else if (mode == 'l' && script_file) {
+        /* -l file (syntax check) */
+        cli_begin(&orig_ub_write);
+        {
+            zend_file_handle file_handle;
+            zend_stream_init_filename(&file_handle, script_file);
+            if (php_lint_script(&file_handle) == SUCCESS) {
+                php_printf("No syntax errors detected in %s\n", script_file);
+            } else {
+                result = 255;
+            }
+        }
+        php_output_end_all();
+        cli_end(orig_ub_write);
+    } else if (script_file) {
+        /* Execute a file (standard mode, -w, -s) */
+        cli_begin(&orig_ub_write);
+        if (mode == 'w') {
+            char code[4096];
+            snprintf(code, sizeof(code),
+                "echo php_strip_whitespace('%s');", script_file);
+            cli_execute_protected(code, NULL);
+            php_output_end_all();
+        } else if (mode == 's') {
+            char code[4096];
+            snprintf(code, sizeof(code),
+                "highlight_file('%s');", script_file);
+            cli_execute_protected(code, NULL);
+            php_output_end_all();
+        } else {
+            result = cli_execute_protected(NULL, script_file);
+        }
+        cli_end(orig_ub_write);
+    } else {
+        /* No script or code provided */
+        fprintf(stderr, "ephpm php: no input file\n"
+                        "Run 'ephpm php -h' for usage information.\n");
+        return 1;
+    }
+
+    return result;
+}

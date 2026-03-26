@@ -1,0 +1,27 @@
+[package]
+name = "ephpm-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP server for ePHPm"
+
+[dependencies]
+ephpm-config.workspace = true
+ephpm-php.workspace = true
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+http.workspace = true
+mime_guess.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

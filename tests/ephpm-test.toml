@@ -1,0 +1,12 @@
+[server]
+listen = "0.0.0.0:8080"
+document_root = "/var/www/html"
+index_files = ["index.php", "index.html"]
+
+[php]
+max_execution_time = 30
+memory_limit = "128M"
+ini_overrides = [
+    ["display_errors", "On"],
+    ["error_reporting", "E_ALL"],
+]

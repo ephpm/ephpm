@@ -1,0 +1,26 @@
+[server]
+listen = "0.0.0.0:8080"
+document_root = "/var/www/html"
+index_files = ["index.php", "index.html"]
+
+[php]
+# mode = "embedded" (default) — PHP linked via FFI, zero overhead
+# mode = "external" — spawn external PHP workers, use any PHP binary
+mode = "embedded"
+max_execution_time = 30
+memory_limit = "128M"
+ini_overrides = [
+    ["display_errors", "Off"],
+    ["error_reporting", "E_ALL"],
+]
+
+# External mode settings (only used when mode = "external"):
+# binary = "/usr/bin/php"         # path to PHP binary
+# workers = 4                     # number of worker processes
+# worker_script = "vendor/ephpm/worker.php"  # worker loop script
+
+# Future sections (not in MVP):
+# [tls]
+# [db_proxy]
+# [kv]
+# [observability]

@@ -1,0 +1,20 @@
+[package]
+name = "ephpm-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Configuration loading for ePHPm"
+
+[dependencies]
+serde.workspace = true
+figment.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+temp-env.workspace = true
+
+[lints]
+workspace = true

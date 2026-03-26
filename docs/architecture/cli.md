@@ -112,6 +112,58 @@ Sends `SIGHUP`. The running instance reloads `ephpm.toml` and performs a rolling
 
 ---
 
+### `ephpm php`
+
+Run PHP CLI commands using the embedded PHP runtime. All standard PHP CLI flags are supported — args pass straight through to PHP's own argument parser.
+
+```bash
+# Version
+ephpm php -v
+
+# Run code inline
+ephpm php -r "echo phpversion();"
+
+# Execute a file
+ephpm php script.php
+ephpm php -f script.php
+
+# PHP info
+ephpm php -i
+
+# Loaded modules
+ephpm php -m
+
+# Syntax check (lint)
+ephpm php -l src/Controller.php
+
+# INI configuration
+ephpm php --ini
+
+# Source highlighting / stripping
+ephpm php -s script.php
+ephpm php -w script.php
+
+# Reflection
+ephpm php --rf array_map
+ephpm php --rc DateTime
+ephpm php --re json
+ephpm php --ri opcache
+
+# Pass -d INI overrides
+ephpm php -d memory_limit=256M -r "echo ini_get('memory_limit');"
+
+# Exit codes propagate correctly
+ephpm php -r "exit(42);"; echo $?   # → 42
+```
+
+**Implementation notes:**
+- The `ephpm php` subcommand has clap's `disable_help_flag = true` so `-h` passes through to PHP instead of being intercepted by clap.
+- Backed by `ephpm_cli_main()` in `crates/ephpm-php/ephpm_wrapper.c`, which uses PHP's own `php_getopt` with a copy of the CLI SAPI's option table.
+- The `cli_options[]` table in `ephpm_wrapper.c` is a manual copy of PHP's `OPTIONS` array from `sapi/cli/php_cli.c`. When upgrading PHP versions, diff that array against ours and sync any new flags.
+- Output goes directly to stdout/stderr (not buffered through the HTTP SAPI).
+
+---
+
 ## Configuration Commands
 
 ### `ephpm init`

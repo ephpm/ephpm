@@ -29,7 +29,16 @@
       "Bash(cat:*)",
       "Bash(wsl:*)",
       "Bash(git:*)",
-      "Bash(test:*)"
+      "Bash(test:*)",
+      "WebFetch(domain:caddyserver.com)",
+      "WebFetch(domain:mod-rewrite-cheatsheet.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:gist.github.com)",
+      "WebFetch(domain:madewithlove.com)",
+      "WebFetch(domain:windows.php.net)",
+      "WebFetch(domain:wiki.php.net)",
+      "Bash(./target/x86_64-unknown-linux-musl/release/ephpm php:*)",
+      "Bash(echo \"exit: $?\")"
     ]
   }
 }

@@ -1,0 +1,32 @@
+# E2E tests — build ephpm with PHP, deploy to Kind, run phpinfo validation.
+#
+# Matrix: PHP 8.4 and 8.5. Each job builds a release binary with the
+# specified PHP version and asserts that the running server reports it.
+
+name: E2E Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  e2e:
+    name: E2E (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4", "8.5"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install E2E tools (kind, tilt, kubectl)
+        run: cargo xtask e2e-install
+
+      - name: Run E2E tests
+        run: cargo xtask e2e --php-version ${{ matrix.php }}

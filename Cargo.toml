@@ -1,0 +1,43 @@
+[workspace]
+members = ["crates/*", "xtask"]
+default-members = ["crates/*"]
+exclude = ["crates/ephpm-e2e"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/user/ephpm"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+tower = { version = "0.5", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+mime_guess = "2"
+tempfile = "3"
+temp-env = "0.3"
+serial_test = "3"
+
+# Internal crates
+ephpm-config = { path = "crates/ephpm-config" }
+ephpm-php = { path = "crates/ephpm-php" }
+ephpm-server = { path = "crates/ephpm-server" }
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

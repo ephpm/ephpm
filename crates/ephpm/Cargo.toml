@@ -1,0 +1,25 @@
+[package]
+name = "ephpm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "All-in-one PHP application server"
+
+[[bin]]
+name = "ephpm"
+path = "src/main.rs"
+
+[dependencies]
+ephpm-config.workspace = true
+ephpm-php.workspace = true
+ephpm-server.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+[lints]
+workspace = true

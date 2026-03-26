@@ -11,6 +11,11 @@ cargo build
 # Release binary with PHP linked (requires php CLI + composer installed)
 cargo xtask release           # → target/release/ephpm (PHP 8.5)
 cargo xtask release 8.4       # → target/release/ephpm (PHP 8.4)
+
+# Windows .exe (cross-compiled from WSL, requires cargo-xwin)
+cargo install cargo-xwin
+cargo xtask release --target windows       # → target/x86_64-pc-windows-msvc/release/ephpm.exe
+cargo xtask release --target windows 8.4   # with specific PHP version
 ```
 
 Prerequisites for `cargo xtask release`: php CLI 8.2+, composer, git, and C build tools (autoconf, cmake, make, etc.). The xtask handles cloning and running static-php-cli automatically.
@@ -34,7 +39,7 @@ IMPORTANT: Run single tests when possible, not the full suite. Use `cargo nextes
 | `ephpm-server` | HTTP server (hyper + tokio + tower) — routing, static file serving |
 | `ephpm-php` | PHP embedding via FFI — SAPI implementation, request/response mapping |
 | `ephpm-config` | Configuration (figment) — TOML + env var overrides (`EPHPM_` prefix) |
-| `xtask` | Build tooling — `cargo xtask release` builds PHP SDK + release binary |
+| `xtask` | Build & test tooling — `release`, `php-sdk`, `e2e`, `e2e-up`, `e2e-down` |
 
 ## Critical Conventions
 

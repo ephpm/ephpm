@@ -1,0 +1,6 @@
+# Kind cluster configuration for ephpm E2E tests.
+# Single control-plane node is sufficient for testing.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
