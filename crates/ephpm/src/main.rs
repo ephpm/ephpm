@@ -4,6 +4,9 @@ use std::process::ExitCode;
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 /// ePHPm — All-in-one PHP application server
 #[derive(Parser, Debug)]
@@ -88,15 +91,46 @@ fn exit_code_from(code: i32) -> ExitCode {
 /// 3. Create tokio runtime (spawns worker threads — now safe)
 /// 4. Run HTTP server
 fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
-    // Initialize tracing
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
+    // Load config first (before tracing) so we can use the configured log level.
     let config = load_serve_config(command)?;
+
+    // Initialize tracing with config-based log level (RUST_LOG env var takes precedence).
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new(&config.server.logging.level));
+
+    let fmt_layer = tracing_subscriber::fmt::layer();
+
+    // Set up access log file writer if configured.
+    let _access_guard = if config.server.logging.access.is_empty() {
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .init();
+        None
+    } else {
+        let access_path = PathBuf::from(&config.server.logging.access);
+        let access_dir = access_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let access_file = access_path.file_name()
+            .map_or_else(|| "access.log".to_string(), |f| f.to_string_lossy().into_owned());
+        let (access_writer, guard) =
+            tracing_appender::non_blocking(tracing_appender::rolling::never(access_dir, access_file));
+        let access_layer = tracing_subscriber::fmt::layer()
+            .with_writer(access_writer)
+            .with_target(true)
+            .with_filter(EnvFilter::new("access_log=info"));
+        tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .with(access_layer)
+            .init();
+        Some(guard)
+    };
+
+    tracing::info!(
+        listen = %config.server.listen,
+        document_root = %config.server.document_root.display(),
+        "starting ePHPm"
+    );
 
     // Initialize PHP BEFORE creating tokio runtime (single-threaded here).
     // finalize_for_http() disables SIGPROF so it can't crash worker threads.
@@ -117,6 +151,8 @@ fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
 }
 
 /// Parse the Serve command and load configuration.
+///
+/// Called before tracing is initialized, so no logging here.
 fn load_serve_config(command: Option<Commands>) -> anyhow::Result<ephpm_config::Config> {
     let Commands::Serve {
         config,
@@ -131,10 +167,8 @@ fn load_serve_config(command: Option<Commands>) -> anyhow::Result<ephpm_config::
     };
 
     let mut config = if config.exists() {
-        tracing::info!(path = %config.display(), "loading configuration");
         ephpm_config::Config::load(&config).context("failed to load configuration")?
     } else {
-        tracing::info!("no config file found, using defaults");
         ephpm_config::Config::default_config()?
     };
 
@@ -145,12 +179,6 @@ fn load_serve_config(command: Option<Commands>) -> anyhow::Result<ephpm_config::
     if let Some(root) = document_root {
         config.server.document_root = root;
     }
-
-    tracing::info!(
-        listen = %config.server.listen,
-        document_root = %config.server.document_root.display(),
-        "starting ePHPm"
-    );
 
     Ok(config)
 }

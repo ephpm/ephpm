@@ -47,6 +47,68 @@ pub async fn serve(document_root: &Path, url_path: &str) -> Response<Full<Bytes>
         .unwrap_or_else(|_| internal_error())
 }
 
+/// Serve a file from an already-resolved filesystem path.
+///
+/// The router has already verified the file exists and resolved it via
+/// `fallback`. We still validate path traversal for defense in depth.
+pub async fn serve_file(
+    document_root: &Path,
+    file_path: &Path,
+    accepts_gzip: bool,
+    cache_control: &str,
+    compression: crate::router::CompressionSettings,
+) -> Response<Full<Bytes>> {
+    // Security: ensure the resolved path is within the document root
+    let Ok(canonical_root) = document_root.canonicalize() else {
+        return not_found();
+    };
+    let Ok(canonical_file) = file_path.canonicalize() else {
+        return not_found();
+    };
+    if !canonical_file.starts_with(&canonical_root) {
+        tracing::warn!(
+            path = %file_path.display(),
+            "path traversal attempt blocked"
+        );
+        return forbidden();
+    }
+
+    let Ok(content) = tokio::fs::read(&canonical_file).await else {
+        return not_found();
+    };
+
+    let mime =
+        mime_guess::from_path(&canonical_file).first_raw().unwrap_or("application/octet-stream");
+
+    if accepts_gzip {
+        if let Some(compressed) = crate::router::gzip_compress(&content, mime, compression) {
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", mime)
+                .header("Content-Length", compressed.len())
+                .header("Content-Encoding", "gzip")
+                .header("Vary", "Accept-Encoding");
+            if !cache_control.is_empty() {
+                builder = builder.header("Cache-Control", cache_control);
+            }
+            return builder
+                .body(Full::new(Bytes::from(compressed)))
+                .unwrap_or_else(|_| internal_error());
+        }
+    }
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", mime)
+        .header("Content-Length", content.len());
+    if !cache_control.is_empty() {
+        builder = builder.header("Cache-Control", cache_control);
+    }
+    builder
+        .body(Full::new(Bytes::from(content)))
+        .unwrap_or_else(|_| internal_error())
+}
+
 fn not_found() -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::NOT_FOUND)

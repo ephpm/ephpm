@@ -3,6 +3,36 @@ listen = "0.0.0.0:8080"
 document_root = "/var/www/html"
 index_files = ["index.php", "index.html"]
 
+# Fallback chain — checked in order, last entry is the fallback.
+# Default: ["$uri", "$uri/", "/index.php?$query_string"]
+# For static-only sites: ["$uri", "$uri/", "=404"]
+# fallback = ["$uri", "$uri/", "/index.php?$query_string"]
+
+# [server.request]
+# max_body_size = 10485760  # bytes, 0 = unlimited. WordPress uploads may need 50 MiB.
+# max_header_size = 8192    # bytes
+
+# [server.timeouts]
+# header_read = 30  # seconds to receive request headers
+# idle = 60         # seconds before closing idle connections
+# request = 300     # total request timeout (including PHP execution)
+
+# [server.response]
+# compression = true       # gzip for text responses
+# compression_level = 1    # 1 = fast, 9 = best ratio
+# compression_min_size = 1024  # minimum bytes to compress
+
+# [server.static]
+# cache_control = ""       # Cache-Control header, e.g. "public, max-age=86400"
+# hidden_files = "deny"    # "deny" (403), "ignore" (404), or "allow"
+
+# [server.security]
+# trusted_proxies = []     # CIDR ranges for X-Forwarded-For, e.g. ["10.0.0.0/8"]
+
+# [server.logging]
+# access = ""              # access log file path (empty = disabled)
+# level = "info"           # trace, debug, info, warn, error
+
 [php]
 # mode = "embedded" (default) — PHP linked via FFI, zero overhead
 # mode = "external" — spawn external PHP workers, use any PHP binary

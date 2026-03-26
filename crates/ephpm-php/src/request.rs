@@ -57,23 +57,36 @@ pub struct PhpRequest {
 
 impl PhpRequest {
     /// Build the `$_SERVER` variables that `WordPress` and other PHP apps expect.
+    ///
+    /// Key distinction when fallback rewrites happen (e.g. `/blog/hello` → `/index.php`):
+    /// - `REQUEST_URI` = original URI (`/blog/hello`) — what the client asked for
+    /// - `SCRIPT_NAME` = resolved script (`/index.php`) — what PHP is executing
+    /// - `PHP_SELF` = same as `SCRIPT_NAME`
     #[must_use]
     pub fn server_variables(&self) -> Vec<(String, String)> {
+        // Derive SCRIPT_NAME from the resolved script_filename relative to
+        // document_root. This is correct even after fallback rewrites.
+        let script_name = self
+            .script_filename
+            .strip_prefix(&self.document_root)
+            .map_or_else(|_| self.path.clone(), |rel| format!("/{}", rel.to_string_lossy()));
+
         let mut vars = vec![
             ("REQUEST_METHOD".into(), self.method.clone()),
             ("REQUEST_URI".into(), self.uri.clone()),
             ("SCRIPT_FILENAME".into(), self.script_filename.to_string_lossy().into_owned()),
-            ("SCRIPT_NAME".into(), self.path.clone()),
+            ("SCRIPT_NAME".into(), script_name.clone()),
             ("DOCUMENT_ROOT".into(), self.document_root.to_string_lossy().into_owned()),
             ("SERVER_NAME".into(), self.server_name.clone()),
             ("SERVER_PORT".into(), self.server_port.to_string()),
             ("SERVER_SOFTWARE".into(), "ePHPm/0.1.0".into()),
             ("SERVER_PROTOCOL".into(), self.protocol.clone()),
+            ("GATEWAY_INTERFACE".into(), "CGI/1.1".into()),
             ("QUERY_STRING".into(), self.query_string.clone()),
-            ("PHP_SELF".into(), self.path.clone()),
+            ("PHP_SELF".into(), script_name),
             ("REMOTE_ADDR".into(), self.remote_addr.ip().to_string()),
             ("REMOTE_PORT".into(), self.remote_addr.port().to_string()),
-            ("PATH_INFO".into(), String::new()),
+            ("REDIRECT_STATUS".into(), "200".into()),
         ];
 
         if self.is_https {
@@ -157,7 +170,11 @@ mod tests {
         assert_eq!(find_var(&vars, "SERVER_PROTOCOL"), Some("HTTP/1.1"));
         assert_eq!(find_var(&vars, "REMOTE_ADDR"), Some("192.168.1.1"));
         assert_eq!(find_var(&vars, "REMOTE_PORT"), Some("54321"));
+        // SCRIPT_NAME derived from script_filename relative to document_root
+        assert_eq!(find_var(&vars, "SCRIPT_NAME"), Some("/index.php"));
         assert_eq!(find_var(&vars, "PHP_SELF"), Some("/index.php"));
+        assert_eq!(find_var(&vars, "GATEWAY_INTERFACE"), Some("CGI/1.1"));
+        assert_eq!(find_var(&vars, "REDIRECT_STATUS"), Some("200"));
     }
 
     #[test]
@@ -165,7 +182,6 @@ mod tests {
         let req = make_request();
         let vars = req.server_variables();
 
-        // These contain PathBuf-derived strings, so compare as PathBuf
         let script = find_var(&vars, "SCRIPT_FILENAME").unwrap();
         assert_eq!(PathBuf::from(script), PathBuf::from("/var/www/html/index.php"));
 
@@ -173,6 +189,23 @@ mod tests {
         assert_eq!(PathBuf::from(docroot), PathBuf::from("/var/www/html"));
 
         assert_eq!(find_var(&vars, "SCRIPT_NAME"), Some("/index.php"));
+    }
+
+    #[test]
+    fn test_server_variables_rewritten_request() {
+        // Simulate fallback rewrite: /blog/hello → /index.php
+        let mut req = make_request();
+        req.uri = "/blog/hello?preview=true".into();
+        req.path = "/blog/hello".into();
+        req.query_string = "preview=true".into();
+        // script_filename stays as /var/www/html/index.php (from fallback)
+        let vars = req.server_variables();
+
+        // REQUEST_URI keeps original
+        assert_eq!(find_var(&vars, "REQUEST_URI"), Some("/blog/hello?preview=true"));
+        // SCRIPT_NAME derived from resolved script
+        assert_eq!(find_var(&vars, "SCRIPT_NAME"), Some("/index.php"));
+        assert_eq!(find_var(&vars, "PHP_SELF"), Some("/index.php"));
     }
 
     #[test]

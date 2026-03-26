@@ -1,39 +1,92 @@
 //! Request router.
 //!
-//! Routes incoming HTTP requests to either PHP execution or static file serving
-//! based on the request path:
-//! - Requests for `.php` files → PHP execution via `spawn_blocking`
-//! - Everything else → static file serving
+//! Routes incoming HTTP requests using configurable `fallback` resolution:
+//! each entry is checked in order, and the first match that exists on disk
+//! is served. The last entry is the fallback (an internal rewrite or status
+//! code like `=404`).
 
-use std::net::SocketAddr;
+use std::io::Write;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use ephpm_config::Config;
 use ephpm_php::PhpRuntime;
 use ephpm_php::request::PhpRequest;
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::{Request, Response, StatusCode};
+use ipnet::IpNet;
 
 use crate::static_files;
+
+/// Result of resolving a request through `fallback`.
+enum Resolved {
+    /// A file on disk (static or PHP).
+    File(PathBuf),
+    /// A status code fallback (e.g. `=404`).
+    Status(u16),
+}
+
+/// Compression settings extracted from config.
+#[derive(Clone, Copy)]
+pub struct CompressionSettings {
+    /// Whether compression is enabled.
+    pub enabled: bool,
+    /// Gzip compression level (1–9).
+    pub level: u32,
+    /// Minimum response size in bytes to compress.
+    pub min_size: usize,
+}
 
 pub struct Router {
     document_root: PathBuf,
     index_files: Vec<String>,
+    fallback: Vec<String>,
     server_port: u16,
+    max_body_size: u64,
+    compression: CompressionSettings,
+    hidden_files: String,
+    cache_control: String,
+    request_timeout: Duration,
+    trusted_proxies: Vec<IpNet>,
 }
 
 impl Router {
     #[must_use]
     pub fn new(config: &Config) -> Self {
-        // Parse port from listen address
         let port =
             config.server.listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(8080);
+
+        let trusted_proxies: Vec<IpNet> = config
+            .server
+            .security
+            .trusted_proxies
+            .iter()
+            .filter_map(|cidr| {
+                cidr.parse::<IpNet>()
+                    .map_err(|e| tracing::warn!(cidr, %e, "ignoring invalid trusted_proxy"))
+                    .ok()
+            })
+            .collect();
 
         Self {
             document_root: config.server.document_root.clone(),
             index_files: config.server.index_files.clone(),
+            fallback: config.server.fallback.clone(),
             server_port: port,
+            max_body_size: config.server.request.max_body_size,
+            compression: CompressionSettings {
+                enabled: config.server.response.compression,
+                level: config.server.response.compression_level,
+                min_size: config.server.response.compression_min_size,
+            },
+            hidden_files: config.server.static_files.hidden_files.clone(),
+            cache_control: config.server.static_files.cache_control.clone(),
+            request_timeout: Duration::from_secs(config.server.timeouts.request),
+        trusted_proxies,
         }
     }
 
@@ -42,77 +95,125 @@ impl Router {
     /// # Errors
     ///
     /// Returns `hyper::Error` if the response cannot be constructed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a static HTTP response builder fails (should never happen).
     pub async fn handle(
         &self,
         req: Request<Incoming>,
         remote_addr: SocketAddr,
     ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        let path = req.uri().path().to_string();
+        match tokio::time::timeout(self.request_timeout, self.handle_inner(req, remote_addr)).await
+        {
+            Ok(result) => result,
+            Err(_) => Ok(error_response(StatusCode::GATEWAY_TIMEOUT, "504 Gateway Timeout")),
+        }
+    }
 
-        // Resolve the filesystem path
-        let fs_path = self.resolve_path(&path);
+    /// Inner request handler (wrapped by timeout in `handle`).
+    async fn handle_inner(
+        &self,
+        req: Request<Incoming>,
+        remote_addr: SocketAddr,
+    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+        let uri_path = req.uri().path().to_string();
+        let query_string = req.uri().query().unwrap_or("").to_string();
 
-        if Self::is_php_request(&path, &fs_path) {
-            // 404 if the resolved script doesn't exist on disk
-            if !fs_path.exists() {
-                return Ok(not_found());
+        // Block hidden files (dot-prefixed path segments like .env, .git)
+        if let Some(resp) = self.check_hidden_file(&uri_path) {
+            return Ok(resp);
+        }
+
+        // Resolve real client IP and HTTPS status from trusted proxy headers
+        let (effective_addr, is_https) = self.resolve_proxy_info(&req, remote_addr);
+
+        let accepts_gzip = self.compression.enabled && accepts_encoding(&req, "gzip");
+
+        let response = match self.resolve_fallback(&uri_path, &query_string) {
+            Resolved::File(fs_path) => {
+                if is_php_file(&fs_path) {
+                    self.handle_php(req, effective_addr, is_https, fs_path, accepts_gzip)
+                        .await
+                } else {
+                    static_files::serve_file(
+                        &self.document_root,
+                        &fs_path,
+                        accepts_gzip,
+                        &self.cache_control,
+                        self.compression,
+                    )
+                    .await
+                }
             }
-            Ok(self.handle_php(req, remote_addr, fs_path).await)
+            Resolved::Status(code) => {
+                let status = StatusCode::from_u16(code).unwrap_or(StatusCode::NOT_FOUND);
+                error_response(status, &format!("{code} {}", status.canonical_reason().unwrap_or("Error")))
+            }
+        };
+
+        Ok(response)
+    }
+
+    /// Resolve a request through the `fallback` chain.
+    ///
+    /// Each entry except the last is tested against the filesystem.
+    /// The last entry is the fallback — either a rewrite target or `=NNN`
+    /// status code.
+    fn resolve_fallback(&self, uri_path: &str, query_string: &str) -> Resolved {
+        let entries = &self.fallback;
+        if entries.is_empty() {
+            return Resolved::Status(404);
+        }
+
+        let (probes, fallback) = entries.split_at(entries.len() - 1);
+
+        for entry in probes {
+            let expanded = expand_variables(entry, uri_path, query_string);
+            if let Some(path) = self.probe_path(&expanded) {
+                return Resolved::File(path);
+            }
+        }
+
+        let last = &fallback[0];
+        if let Some(code) = last.strip_prefix('=') {
+            let code = code.parse().unwrap_or(404);
+            Resolved::Status(code)
         } else {
-            Ok(static_files::serve(&self.document_root, &path).await)
+            let expanded = expand_variables(last, uri_path, query_string);
+            let (rewrite_path, _) = split_path_query(&expanded);
+            let fs_path = self.document_root.join(rewrite_path.trim_start_matches('/'));
+            if fs_path.exists() && fs_path.is_file() {
+                Resolved::File(fs_path)
+            } else {
+                Resolved::Status(404)
+            }
         }
     }
 
-    /// Resolve a URL path to a filesystem path, checking for index files.
-    fn resolve_path(&self, url_path: &str) -> PathBuf {
-        let relative = url_path.trim_start_matches('/');
-        let fs_path = self.document_root.join(relative);
+    /// Probe a single `fallback` entry against the filesystem.
+    fn probe_path(&self, expanded: &str) -> Option<PathBuf> {
+        let (path_part, _) = split_path_query(expanded);
 
-        // If the path is a directory, try index files
-        if fs_path.is_dir() {
-            for index in &self.index_files {
-                let candidate = fs_path.join(index);
-                if candidate.exists() {
-                    return candidate;
+        if path_part.ends_with('/') {
+            let dir = self.document_root.join(path_part.trim_start_matches('/'));
+            if dir.is_dir() {
+                for index in &self.index_files {
+                    let candidate = dir.join(index);
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
                 }
             }
-        }
-
-        // If the path doesn't exist and doesn't have an extension,
-        // try index files (WordPress pretty permalinks)
-        if !fs_path.exists() && fs_path.extension().is_none() {
-            for index in &self.index_files {
-                let candidate = self.document_root.join(index);
-                if candidate.exists() {
-                    return candidate;
-                }
+            None
+        } else {
+            let fs_path = self.document_root.join(path_part.trim_start_matches('/'));
+            if fs_path.is_file() {
+                Some(fs_path)
+            } else {
+                None
             }
         }
-
-        fs_path
-    }
-
-    /// Check if a request should be handled by PHP.
-    fn is_php_request(url_path: &str, fs_path: &Path) -> bool {
-        // Direct .php request
-        if Path::new(url_path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("php")) {
-            return true;
-        }
-
-        // Resolved path is a .php file (e.g. directory → index.php)
-        if let Some(ext) = fs_path.extension() {
-            if ext == "php" {
-                return true;
-            }
-        }
-
-        // URL path has no extension and no static file exists — route to PHP
-        // This handles WordPress pretty permalinks (/2024/01/hello-world/)
-        if fs_path.extension().is_none() && !fs_path.exists() {
-            return true;
-        }
-
-        false
     }
 
     /// Handle a PHP request by executing it in a blocking task.
@@ -120,35 +221,25 @@ impl Router {
         &self,
         req: Request<Incoming>,
         remote_addr: SocketAddr,
+        is_https: bool,
         script_filename: PathBuf,
+        accepts_gzip: bool,
     ) -> Response<Full<Bytes>> {
         let method = req.method().to_string();
         let uri = req.uri().to_string();
         let path = req.uri().path().to_string();
         let query_string = req.uri().query().unwrap_or("").to_string();
         let protocol = format!("{:?}", req.version());
-
-        // Extract headers
-        let headers: Vec<(String, String)> = req
-            .headers()
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
-            .collect();
-
+        let headers = extract_headers(&req);
         let content_type =
             req.headers().get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
+        let server_name = extract_server_name(&req);
 
-        let server_name = req
-            .headers()
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("localhost")
-            .split(':')
-            .next()
-            .unwrap_or("localhost")
-            .to_string();
+        // Reject oversized request bodies before reading
+        if let Some(resp) = self.check_body_size(&req) {
+            return resp;
+        }
 
-        // Collect request body
         let body = match req.collect().await {
             Ok(collected) => collected.to_bytes().to_vec(),
             Err(_) => Vec::new(),
@@ -157,69 +248,225 @@ impl Router {
         let document_root = self.document_root.clone();
         let server_port = self.server_port;
 
-        // Execute PHP in a blocking task to avoid blocking the tokio runtime
         let result = tokio::task::spawn_blocking(move || {
-            let php_request = PhpRequest {
-                method,
-                uri,
-                path,
-                query_string,
-                script_filename,
-                document_root,
-                headers,
-                body,
-                content_type,
-                remote_addr,
-                server_name,
-                server_port,
-                is_https: false,
-                protocol,
-            };
-
-            PhpRuntime::execute(php_request)
+            PhpRuntime::execute(PhpRequest {
+                method, uri, path, query_string, script_filename,
+                document_root, headers, body, content_type, remote_addr,
+                server_name, server_port, is_https, protocol,
+            })
         })
         .await;
 
-        match result {
-            Ok(Ok(php_response)) => {
-                let status = StatusCode::from_u16(php_response.status).unwrap_or(StatusCode::OK);
-                let mut response = Response::builder().status(status);
+        build_php_response(result, accepts_gzip, self.compression)
+    }
 
-                for (name, value) in &php_response.headers {
-                    response = response.header(name.as_str(), value.as_str());
+    /// Return 413 if Content-Length exceeds the limit.
+    fn check_body_size(&self, req: &Request<Incoming>) -> Option<Response<Full<Bytes>>> {
+        if self.max_body_size == 0 {
+            return None;
+        }
+        let len: u64 = req.headers().get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if len > self.max_body_size {
+            Some(error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large"))
+        } else {
+            None
+        }
+    }
+
+    /// Block requests for hidden files (dot-prefixed path segments).
+    fn check_hidden_file(&self, uri_path: &str) -> Option<Response<Full<Bytes>>> {
+        if self.hidden_files == "allow" {
+            return None;
+        }
+        if has_hidden_segment(uri_path) {
+            let status = if self.hidden_files == "ignore" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::FORBIDDEN
+            };
+            Some(error_response(status, &format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or("Error"))))
+        } else {
+            None
+        }
+    }
+
+    /// Resolve real client address and HTTPS status from proxy headers.
+    ///
+    /// When the request comes from a trusted proxy, reads `X-Forwarded-For`
+    /// (rightmost untrusted IP) and `X-Forwarded-Proto` for HTTPS detection.
+    fn resolve_proxy_info(
+        &self,
+        req: &Request<Incoming>,
+        remote_addr: SocketAddr,
+    ) -> (SocketAddr, bool) {
+        if self.trusted_proxies.is_empty() || !self.is_trusted_proxy(remote_addr.ip()) {
+            return (remote_addr, false);
+        }
+
+        let real_ip = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|xff| self.resolve_xff(xff))
+            .unwrap_or(remote_addr.ip());
+
+        let is_https = req
+            .headers()
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|proto| proto.eq_ignore_ascii_case("https"));
+
+        (SocketAddr::new(real_ip, remote_addr.port()), is_https)
+    }
+
+    /// Check if an IP address matches any trusted proxy CIDR.
+    fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
+        self.trusted_proxies.iter().any(|net| net.contains(&ip))
+    }
+
+    /// Walk X-Forwarded-For from right to left, return the first untrusted IP.
+    fn resolve_xff(&self, xff: &str) -> Option<IpAddr> {
+        let ips: Vec<&str> = xff.split(',').map(str::trim).collect();
+        for ip_str in ips.iter().rev() {
+            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+                if !self.is_trusted_proxy(ip) {
+                    return Some(ip);
                 }
+            }
+        }
+        // All IPs in the chain are trusted — use the leftmost
+        ips.first().and_then(|s| s.parse().ok())
+    }
+}
 
-                response.body(Full::new(Bytes::from(php_response.body))).unwrap_or_else(|_| {
-                    Response::builder()
-                        .status(StatusCode::INTERNAL_SERVER_ERROR)
-                        .body(Full::new(Bytes::from("Internal Server Error")))
-                        .unwrap()
-                })
+/// Check if a URI path contains a hidden (dot-prefixed) segment.
+fn has_hidden_segment(uri_path: &str) -> bool {
+    uri_path.split('/').any(|segment| {
+        segment.starts_with('.') && !segment.is_empty() && segment != "." && segment != ".."
+    })
+}
+
+fn extract_headers(req: &Request<Incoming>) -> Vec<(String, String)> {
+    req.headers()
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
+        .collect()
+}
+
+fn extract_server_name(req: &Request<Incoming>) -> String {
+    req.headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost")
+        .split(':')
+        .next()
+        .unwrap_or("localhost")
+        .to_string()
+}
+
+/// Build a simple error response with a text body.
+fn error_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain")
+        .body(Full::new(Bytes::from(body.to_string())))
+        .expect("static error response")
+}
+
+/// Build an HTTP response from a PHP execution result, optionally gzip-compressing.
+fn build_php_response(
+    result: Result<Result<ephpm_php::response::PhpResponse, ephpm_php::PhpError>, tokio::task::JoinError>,
+    accepts_gzip: bool,
+    compression: CompressionSettings,
+) -> Response<Full<Bytes>> {
+    match result {
+        Ok(Ok(php_response)) => {
+            let status = StatusCode::from_u16(php_response.status).unwrap_or(StatusCode::OK);
+            let ct = php_response.headers.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+                .map_or("", |(_, v)| v.as_str());
+
+            let (body_bytes, compressed) = if accepts_gzip {
+                gzip_compress(&php_response.body, ct, compression)
+                    .map_or((php_response.body, false), |c| (c, true))
+            } else {
+                (php_response.body, false)
+            };
+
+            let mut resp = Response::builder().status(status);
+            for (name, value) in &php_response.headers {
+                resp = resp.header(name.as_str(), value.as_str());
             }
-            Ok(Err(err)) => {
-                tracing::error!(%err, "PHP execution failed");
-                Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Full::new(Bytes::from(format!("PHP execution error: {err}"))))
-                    .unwrap()
+            if compressed {
+                resp = resp.header("content-encoding", "gzip").header("vary", "Accept-Encoding");
             }
-            Err(err) => {
-                tracing::error!(%err, "spawn_blocking task failed");
-                Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .body(Full::new(Bytes::from("Internal Server Error")))
-                    .unwrap()
-            }
+            resp = resp.header("content-length", body_bytes.len());
+
+            resp.body(Full::new(Bytes::from(body_bytes))).unwrap_or_else(|_| {
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+            })
+        }
+        Ok(Err(err)) => {
+            tracing::error!(%err, "PHP execution failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("PHP execution error: {err}"))
+        }
+        Err(err) => {
+            tracing::error!(%err, "spawn_blocking task failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
         }
     }
 }
 
-fn not_found() -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .header("content-type", "text/plain")
-        .body(Full::new(Bytes::from("404 Not Found")))
-        .expect("static 404 response")
+/// Check if a filesystem path is a PHP file.
+fn is_php_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("php"))
+}
+
+/// Expand `$uri` and `$query_string` variables in a `fallback` entry.
+fn expand_variables(entry: &str, uri_path: &str, query_string: &str) -> String {
+    entry.replace("$uri", uri_path).replace("$query_string", query_string)
+}
+
+/// Split an expanded path into the path component and optional query string.
+fn split_path_query(expanded: &str) -> (&str, &str) {
+    expanded.split_once('?').unwrap_or((expanded, ""))
+}
+
+/// Check if the request's Accept-Encoding header contains the given encoding.
+fn accepts_encoding(req: &Request<Incoming>, encoding: &str) -> bool {
+    req.headers()
+        .get("accept-encoding")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains(encoding))
+}
+
+/// Content types eligible for gzip compression.
+fn is_compressible(content_type: &str) -> bool {
+    content_type.starts_with("text/")
+        || content_type.contains("javascript")
+        || content_type.contains("json")
+        || content_type.contains("xml")
+        || content_type.contains("svg")
+}
+
+/// Try to gzip-compress a body. Returns `None` if not worth compressing.
+#[must_use]
+pub fn gzip_compress(data: &[u8], content_type: &str, settings: CompressionSettings) -> Option<Vec<u8>> {
+    if data.len() < settings.min_size || !is_compressible(content_type) {
+        return None;
+    }
+    let level = Compression::new(settings.level);
+    let mut encoder = GzEncoder::new(Vec::new(), level);
+    encoder.write_all(data).ok()?;
+    let compressed = encoder.finish().ok()?;
+    if compressed.len() < data.len() {
+        Some(compressed)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -237,13 +484,238 @@ mod tests {
                 listen: "0.0.0.0:8080".to_string(),
                 document_root: dir.to_path_buf(),
                 index_files: vec!["index.php".to_string(), "index.html".to_string()],
+                fallback: vec![
+                    "$uri".to_string(),
+                    "$uri/".to_string(),
+                    "/index.php?$query_string".to_string(),
+                ],
+                ..ServerConfig::default()
             },
             php: PhpConfig::default(),
         };
         Router::new(&config)
     }
 
-    // ── Router::new port parsing ──────────────────────────────────────
+    fn test_router_with_404(dir: &Path) -> Router {
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.to_path_buf(),
+                index_files: vec!["index.php".to_string(), "index.html".to_string()],
+                fallback: vec!["$uri".to_string(), "$uri/".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+        };
+        Router::new(&config)
+    }
+
+    fn default_compression() -> CompressionSettings {
+        CompressionSettings {
+            enabled: true,
+            level: 1,
+            min_size: 1024,
+        }
+    }
+
+    // ── fallback resolution ─────────────────────────────────────────
+
+    #[test]
+    fn test_existing_file_matches_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("style.css"), "body{}").unwrap();
+
+        let router = test_router(dir.path());
+        let resolved = router.resolve_fallback("/style.css", "");
+        assert!(matches!(resolved, Resolved::File(p) if p == dir.path().join("style.css")));
+    }
+
+    #[test]
+    fn test_existing_php_file_matches_uri() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("info.php"), "<?php phpinfo();").unwrap();
+
+        let router = test_router(dir.path());
+        let resolved = router.resolve_fallback("/info.php", "");
+        assert!(matches!(resolved, Resolved::File(p) if p == dir.path().join("info.php")));
+    }
+
+    #[test]
+    fn test_directory_with_index_matches_uri_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("index.php"), "<?php").unwrap();
+
+        let router = test_router(dir.path());
+        let resolved = router.resolve_fallback("/", "");
+        assert!(matches!(resolved, Resolved::File(p) if p == dir.path().join("index.php")));
+    }
+
+    #[test]
+    fn test_directory_falls_to_index_html() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("index.html"), "<html>").unwrap();
+
+        let router = test_router(dir.path());
+        let resolved = router.resolve_fallback("/", "");
+        assert!(matches!(resolved, Resolved::File(p) if p == dir.path().join("index.html")));
+    }
+
+    #[test]
+    fn test_permalink_falls_to_index_php() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("index.php"), "<?php").unwrap();
+
+        let router = test_router(dir.path());
+        let resolved = router.resolve_fallback("/2024/hello-world", "p=123");
+        assert!(matches!(resolved, Resolved::File(p) if p == dir.path().join("index.php")));
+    }
+
+    #[test]
+    fn test_missing_file_with_404_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let router = test_router_with_404(dir.path());
+        let resolved = router.resolve_fallback("/nope.css", "");
+        assert!(matches!(resolved, Resolved::Status(404)));
+    }
+
+    #[test]
+    fn test_missing_php_with_404_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let router = test_router_with_404(dir.path());
+        let resolved = router.resolve_fallback("/nope.php", "");
+        assert!(matches!(resolved, Resolved::Status(404)));
+    }
+
+    #[test]
+    fn test_missing_with_no_index_falls_to_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path());
+        let resolved = router.resolve_fallback("/anything", "");
+        assert!(matches!(resolved, Resolved::Status(404)));
+    }
+
+    #[test]
+    fn test_subdirectory_with_index() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("blog")).unwrap();
+        fs::write(dir.path().join("blog/index.php"), "<?php").unwrap();
+
+        let router = test_router(dir.path());
+        let resolved = router.resolve_fallback("/blog/", "");
+        assert!(matches!(resolved, Resolved::File(p) if p == dir.path().join("blog/index.php")));
+    }
+
+    // ── helper functions ─────────────────────────────────────────────
+
+    #[test]
+    fn test_expand_variables() {
+        assert_eq!(expand_variables("$uri", "/hello", "foo=bar"), "/hello");
+        assert_eq!(
+            expand_variables("/index.php?$query_string", "/hello", "foo=bar"),
+            "/index.php?foo=bar"
+        );
+        assert_eq!(expand_variables("$uri/", "/blog", ""), "/blog/");
+    }
+
+    #[test]
+    fn test_split_path_query() {
+        assert_eq!(split_path_query("/index.php?foo=bar"), ("/index.php", "foo=bar"));
+        assert_eq!(split_path_query("/style.css"), ("/style.css", ""));
+    }
+
+    #[test]
+    fn test_is_php_file_check() {
+        assert!(is_php_file(Path::new("/var/www/index.php")));
+        assert!(is_php_file(Path::new("test.PHP")));
+        assert!(!is_php_file(Path::new("style.css")));
+        assert!(!is_php_file(Path::new("README")));
+    }
+
+    // ── hidden files ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_has_hidden_segment() {
+        assert!(has_hidden_segment("/.env"));
+        assert!(has_hidden_segment("/.git/config"));
+        assert!(has_hidden_segment("/wp-content/.htaccess"));
+        assert!(has_hidden_segment("/.hidden/file.txt"));
+        assert!(!has_hidden_segment("/index.php"));
+        assert!(!has_hidden_segment("/wp-content/uploads/file.jpg"));
+        assert!(!has_hidden_segment("/"));
+    }
+
+    // ── compression ────────────────────────────────────────────────
+
+    #[test]
+    fn test_gzip_compress_small_body() {
+        let data = b"too small";
+        assert!(gzip_compress(data, "text/html", default_compression()).is_none());
+    }
+
+    #[test]
+    fn test_gzip_compress_non_compressible() {
+        let data = vec![0u8; 2048];
+        assert!(gzip_compress(&data, "image/png", default_compression()).is_none());
+    }
+
+    #[test]
+    fn test_gzip_compress_html() {
+        let data = "<html><body>Hello World!</body></html>\n".repeat(100);
+        let compressed = gzip_compress(data.as_bytes(), "text/html", default_compression());
+        assert!(compressed.is_some());
+        assert!(compressed.unwrap().len() < data.len());
+    }
+
+    #[test]
+    fn test_gzip_compress_custom_min_size() {
+        let settings = CompressionSettings { enabled: true, level: 1, min_size: 4096 };
+        let data = "a".repeat(2048);
+        // 2048 bytes < 4096 min_size — should not compress
+        assert!(gzip_compress(data.as_bytes(), "text/html", settings).is_none());
+    }
+
+    // ── trusted proxies ────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_xff_rightmost_untrusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                document_root: dir.path().to_path_buf(),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+        };
+        config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        let router = Router::new(&config);
+
+        // 203.0.113.50 is the real client, 10.0.0.1 is the proxy
+        let xff = "203.0.113.50, 10.0.0.1";
+        let ip = router.resolve_xff(xff);
+        assert_eq!(ip, Some("203.0.113.50".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_resolve_xff_all_trusted_uses_leftmost() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                document_root: dir.path().to_path_buf(),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+        };
+        config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        let router = Router::new(&config);
+
+        let xff = "10.0.0.2, 10.0.0.1";
+        let ip = router.resolve_xff(xff);
+        assert_eq!(ip, Some("10.0.0.2".parse().unwrap()));
+    }
+
+    // ── port parsing ─────────────────────────────────────────────────
 
     #[test]
     fn test_new_parses_port() {
@@ -252,7 +724,7 @@ mod tests {
             server: ServerConfig {
                 listen: "0.0.0.0:3000".to_string(),
                 document_root: dir.path().to_path_buf(),
-                index_files: Vec::new(),
+                ..ServerConfig::default()
             },
             php: PhpConfig::default(),
         };
@@ -267,140 +739,11 @@ mod tests {
             server: ServerConfig {
                 listen: "localhost:notaport".to_string(),
                 document_root: dir.path().to_path_buf(),
-                index_files: Vec::new(),
+                ..ServerConfig::default()
             },
             php: PhpConfig::default(),
         };
         let router = Router::new(&config);
         assert_eq!(router.server_port, 8080);
-    }
-
-    #[test]
-    fn test_new_defaults_port_when_no_colon() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = Config {
-            server: ServerConfig {
-                listen: "localhost".to_string(),
-                document_root: dir.path().to_path_buf(),
-                index_files: Vec::new(),
-            },
-            php: PhpConfig::default(),
-        };
-        let router = Router::new(&config);
-        assert_eq!(router.server_port, 8080);
-    }
-
-    // ── resolve_path ──────────────────────────────────────────────────
-
-    #[test]
-    fn test_resolve_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("style.css"), "body{}").unwrap();
-
-        let router = test_router(dir.path());
-        let resolved = router.resolve_path("/style.css");
-        assert_eq!(resolved, dir.path().join("style.css"));
-    }
-
-    #[test]
-    fn test_resolve_directory_with_index_php() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("index.php"), "<?php").unwrap();
-
-        let router = test_router(dir.path());
-        let resolved = router.resolve_path("/");
-        assert_eq!(resolved, dir.path().join("index.php"));
-    }
-
-    #[test]
-    fn test_resolve_directory_falls_to_index_html() {
-        let dir = tempfile::tempdir().unwrap();
-        // No index.php, only index.html
-        fs::write(dir.path().join("index.html"), "<html>").unwrap();
-
-        let router = test_router(dir.path());
-        let resolved = router.resolve_path("/");
-        assert_eq!(resolved, dir.path().join("index.html"));
-    }
-
-    #[test]
-    fn test_resolve_permalink_to_index_php() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("index.php"), "<?php").unwrap();
-
-        let router = test_router(dir.path());
-        // Extensionless path that doesn't exist -> WordPress permalink fallback
-        let resolved = router.resolve_path("/2024/hello-world");
-        assert_eq!(resolved, dir.path().join("index.php"));
-    }
-
-    #[test]
-    fn test_resolve_nonexistent_with_extension() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let router = test_router(dir.path());
-        // Has extension, doesn't exist -> returned as-is (no fallback)
-        let resolved = router.resolve_path("/missing.css");
-        assert_eq!(resolved, dir.path().join("missing.css"));
-    }
-
-    #[test]
-    fn test_resolve_nonexistent_no_index() {
-        let dir = tempfile::tempdir().unwrap();
-        // Empty docroot, no index files to fall back to
-
-        let router = test_router(dir.path());
-        let resolved = router.resolve_path("/foo/bar");
-        assert_eq!(resolved, dir.path().join("foo/bar"));
-    }
-
-    // ── is_php_request ────────────────────────────────────────────────
-
-    #[test]
-    fn test_is_php_direct_url() {
-        let dir = tempfile::tempdir().unwrap();
-        let fs_path = dir.path().join("index.php");
-        assert!(Router::is_php_request("/index.php", &fs_path));
-    }
-
-    #[test]
-    fn test_is_php_case_insensitive() {
-        let dir = tempfile::tempdir().unwrap();
-        let fs_path = dir.path().join("INDEX.PHP");
-        assert!(Router::is_php_request("/INDEX.PHP", &fs_path));
-    }
-
-    #[test]
-    fn test_is_php_resolved_index() {
-        let dir = tempfile::tempdir().unwrap();
-        // URL is "/" but resolved fs_path is index.php
-        let fs_path = dir.path().join("index.php");
-        assert!(Router::is_php_request("/", &fs_path));
-    }
-
-    #[test]
-    fn test_is_php_permalink() {
-        let dir = tempfile::tempdir().unwrap();
-        // Non-existent extensionless path -> PHP (permalink routing)
-        let fs_path = dir.path().join("hello-world");
-        assert!(!fs_path.exists());
-        assert!(fs_path.extension().is_none());
-        assert!(Router::is_php_request("/hello-world", &fs_path));
-    }
-
-    #[test]
-    fn test_is_not_php_static_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let fs_path = dir.path().join("style.css");
-        fs::write(&fs_path, "body{}").unwrap();
-        assert!(!Router::is_php_request("/style.css", &fs_path));
-    }
-
-    #[test]
-    fn test_is_not_php_html_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let fs_path = dir.path().join("page.html");
-        fs::write(&fs_path, "<html>").unwrap();
-        assert!(!Router::is_php_request("/page.html", &fs_path));
     }
 }

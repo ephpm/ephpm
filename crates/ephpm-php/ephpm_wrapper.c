@@ -190,29 +190,70 @@ static void ephpm_sapi_log_message(const char *message, int syslog_type_int)
  *
  * Headers are stored as "Name: Value\n" lines for Rust to parse.
  */
+static void headers_buf_append(const char *data, size_t len)
+{
+    while (headers_buf_len + len > headers_buf_cap) {
+        size_t new_cap = headers_buf_cap ? headers_buf_cap * 2 : 1024;
+        char *new_buf = realloc(headers_buf, new_cap);
+        if (!new_buf) return;
+        headers_buf = new_buf;
+        headers_buf_cap = new_cap;
+    }
+    memcpy(headers_buf + headers_buf_len, data, len);
+    headers_buf_len += len;
+}
+
 static void capture_response_headers(void)
 {
     headers_buf_len = 0;
+    int has_content_type = 0;
 
     zend_llist_position pos;
     sapi_header_struct *h = (sapi_header_struct *)
         zend_llist_get_first_ex(&SG(sapi_headers).headers, &pos);
 
     while (h) {
-        size_t needed = h->header_len + 1; /* header + newline */
-        while (headers_buf_len + needed > headers_buf_cap) {
-            size_t new_cap = headers_buf_cap ? headers_buf_cap * 2 : 1024;
-            char *new_buf = realloc(headers_buf, new_cap);
-            if (!new_buf) return;
-            headers_buf = new_buf;
-            headers_buf_cap = new_cap;
+        headers_buf_append(h->header, h->header_len);
+        headers_buf_append("\n", 1);
+
+        if (!has_content_type &&
+            h->header_len > 13 &&
+            strncasecmp(h->header, "Content-Type:", 13) == 0) {
+            has_content_type = 1;
         }
-        memcpy(headers_buf + headers_buf_len, h->header, h->header_len);
-        headers_buf[headers_buf_len + h->header_len] = '\n';
-        headers_buf_len += needed;
 
         h = (sapi_header_struct *)
             zend_llist_get_next_ex(&SG(sapi_headers).headers, &pos);
+    }
+
+    /* In the reuse model, sapi_send_headers() may not fire (output goes
+     * directly through ub_write), so the default Content-Type never gets
+     * added to the headers list. Synthesize it from SG(sapi_headers).mimetype
+     * or fall back to SG(default_mimetype) + SG(default_charset). */
+    if (!has_content_type) {
+        if (SG(sapi_headers).mimetype) {
+            const char *prefix = "Content-Type: ";
+            headers_buf_append(prefix, strlen(prefix));
+            headers_buf_append(SG(sapi_headers).mimetype,
+                               strlen(SG(sapi_headers).mimetype));
+            headers_buf_append("\n", 1);
+        } else {
+            const char *mime = SG(default_mimetype);
+            const char *charset = SG(default_charset);
+            if (!mime || !*mime) mime = "text/html";
+            char ct_buf[256];
+            int ct_len;
+            if (charset && *charset) {
+                ct_len = snprintf(ct_buf, sizeof(ct_buf),
+                    "Content-Type: %s; charset=%s\n", mime, charset);
+            } else {
+                ct_len = snprintf(ct_buf, sizeof(ct_buf),
+                    "Content-Type: %s\n", mime);
+            }
+            if (ct_len > 0 && (size_t)ct_len < sizeof(ct_buf)) {
+                headers_buf_append(ct_buf, (size_t)ct_len);
+            }
+        }
     }
 }
 
@@ -512,19 +553,36 @@ int ephpm_execute_request(const char *filename)
         &get_vars);
     ZVAL_COPY(&PG(http_globals)[TRACK_VARS_GET], &get_vars);
 
-    /* $_POST — read and parse POST data via SAPI */
+    /* Pre-read POST data so php://input and multipart parsing work.
+     * sapi_read_post_data() calls our read_post callback and creates
+     * the request_body stream. Must happen before sapi_handle_post(). */
+    if (req_post_data && req_post_data_len > 0) {
+        sapi_read_post_data();
+    }
+
+    /* $_POST + $_FILES — use PHP's built-in POST handler.
+     * For multipart/form-data, this invokes rfc1867 parsing which
+     * populates both $_POST and $_FILES. For url-encoded, it populates
+     * $_POST. For other content types, both stay empty. */
     zval post_vars;
     array_init(&post_vars);
-    if (req_post_data && req_post_data_len > 0 && req_content_type
-        && strstr(req_content_type, "application/x-www-form-urlencoded"))
-    {
-        char *post_copy = estrdup(req_post_data);
-        sapi_module.treat_data(PARSE_STRING, post_copy, &post_vars);
+    zval files_vars;
+    array_init(&files_vars);
+    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_POST], &post_vars);
+    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_FILES], &files_vars);
+    if (req_post_data && req_post_data_len > 0 && req_content_type) {
+        sapi_handle_post(&PG(http_globals)[TRACK_VARS_POST]);
+        /* sapi_handle_post may have populated FILES directly */
+        zval_ptr_dtor(&files_vars);
+        ZVAL_COPY(&files_vars, &PG(http_globals)[TRACK_VARS_FILES]);
+        /* Re-read POST from http_globals in case handler replaced it */
+        zval_ptr_dtor(&post_vars);
+        ZVAL_COPY(&post_vars, &PG(http_globals)[TRACK_VARS_POST]);
     }
     zend_hash_update(&EG(symbol_table),
         zend_string_init("_POST", sizeof("_POST") - 1, 0),
         &post_vars);
-    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_POST], &post_vars);
+    ZVAL_COPY_VALUE(&PG(http_globals)[TRACK_VARS_POST], &post_vars);
 
     /* $_COOKIE — parse from cookie header.
      * Cookies are "key=value" pairs separated by "; ".
@@ -557,13 +615,11 @@ int ephpm_execute_request(const char *filename)
         &cookie_vars);
     ZVAL_COPY(&PG(http_globals)[TRACK_VARS_COOKIE], &cookie_vars);
 
-    /* $_FILES — empty for now (multipart support TODO) */
-    zval files_vars;
-    array_init(&files_vars);
+    /* $_FILES — populated by sapi_handle_post() for multipart requests */
     zend_hash_update(&EG(symbol_table),
         zend_string_init("_FILES", sizeof("_FILES") - 1, 0),
         &files_vars);
-    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_FILES], &files_vars);
+    ZVAL_COPY_VALUE(&PG(http_globals)[TRACK_VARS_FILES], &files_vars);
 
     /* $_REQUEST — merge of $_GET + $_POST + $_COOKIE per request_order */
     zval request_vars;
@@ -574,13 +630,6 @@ int ephpm_execute_request(const char *filename)
     zend_hash_update(&EG(symbol_table),
         zend_string_init("_REQUEST", sizeof("_REQUEST") - 1, 0),
         &request_vars);
-
-    /* Pre-read POST data into the request_body stream so php://input
-     * works. sapi_read_post_data() calls our read_post callback and
-     * creates the stream that php://input wraps. */
-    if (req_post_data && req_post_data_len > 0) {
-        sapi_read_post_data();
-    }
 
     /* Re-disable stack checking (request startup may reset it) */
     EG(max_allowed_stack_size) = 0;
