@@ -28,6 +28,8 @@ index_files = ["index.php", "index.html"]
 
 # [server.security]
 # trusted_proxies = []     # CIDR ranges for X-Forwarded-For, e.g. ["10.0.0.0/8"]
+# blocked_paths = []       # paths to block (403), e.g. ["/wp-config.php", "/vendor/*"]
+# allowed_php_paths = []   # PHP execution allowlist, e.g. ["/index.php", "/wp-admin/*.php"]
 
 # [server.logging]
 # access = ""              # access log file path (empty = disabled)

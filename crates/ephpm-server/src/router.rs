@@ -52,6 +52,8 @@ pub struct Router {
     cache_control: String,
     request_timeout: Duration,
     trusted_proxies: Vec<IpNet>,
+    blocked_paths: Vec<String>,
+    allowed_php_paths: Vec<String>,
 }
 
 impl Router {
@@ -86,7 +88,9 @@ impl Router {
             hidden_files: config.server.static_files.hidden_files.clone(),
             cache_control: config.server.static_files.cache_control.clone(),
             request_timeout: Duration::from_secs(config.server.timeouts.request),
-        trusted_proxies,
+            trusted_proxies,
+            blocked_paths: config.server.security.blocked_paths.clone(),
+            allowed_php_paths: config.server.security.allowed_php_paths.clone(),
         }
     }
 
@@ -125,6 +129,11 @@ impl Router {
             return Ok(resp);
         }
 
+        // Block explicitly forbidden paths
+        if is_path_blocked(&uri_path, &self.blocked_paths) {
+            return Ok(error_response(StatusCode::FORBIDDEN, "403 Forbidden"));
+        }
+
         // Resolve real client IP and HTTPS status from trusted proxy headers
         let (effective_addr, is_https) = self.resolve_proxy_info(&req, remote_addr);
 
@@ -133,8 +142,13 @@ impl Router {
         let response = match self.resolve_fallback(&uri_path, &query_string) {
             Resolved::File(fs_path) => {
                 if is_php_file(&fs_path) {
-                    self.handle_php(req, effective_addr, is_https, fs_path, accepts_gzip)
-                        .await
+                    // Enforce PHP path allowlist
+                    if self.is_php_allowed(&uri_path) {
+                        self.handle_php(req, effective_addr, is_https, fs_path, accepts_gzip)
+                            .await
+                    } else {
+                        error_response(StatusCode::FORBIDDEN, "403 Forbidden")
+                    }
                 } else {
                     static_files::serve_file(
                         &self.document_root,
@@ -293,6 +307,17 @@ impl Router {
         }
     }
 
+    /// Check if a PHP path is allowed to execute.
+    ///
+    /// When `allowed_php_paths` is empty, all PHP files are allowed.
+    /// Otherwise the URI path must match at least one pattern.
+    fn is_php_allowed(&self, uri_path: &str) -> bool {
+        if self.allowed_php_paths.is_empty() {
+            return true;
+        }
+        self.allowed_php_paths.iter().any(|pattern| glob_match(pattern, uri_path))
+    }
+
     /// Resolve real client address and HTTPS status from proxy headers.
     ///
     /// When the request comes from a trusted proxy, reads `X-Forwarded-For`
@@ -347,6 +372,69 @@ fn has_hidden_segment(uri_path: &str) -> bool {
     uri_path.split('/').any(|segment| {
         segment.starts_with('.') && !segment.is_empty() && segment != "." && segment != ".."
     })
+}
+
+/// Check if a URI path matches any blocked path pattern.
+fn is_path_blocked(uri_path: &str, blocked: &[String]) -> bool {
+    blocked.iter().any(|pattern| glob_match(pattern, uri_path))
+}
+
+/// Simple glob matching for URI paths.
+///
+/// Supports `*` as a wildcard matching any sequence of characters within
+/// a single path segment (no `/`), and exact prefix matching for patterns
+/// ending with `/*` (matches the directory and all children).
+fn glob_match(pattern: &str, path: &str) -> bool {
+    if !pattern.contains('*') {
+        // Exact match or prefix match for directories
+        return path == pattern || (pattern.ends_with('/') && path.starts_with(pattern));
+    }
+
+    // Split into segments and match segment-by-segment
+    let pat_segs: Vec<&str> = pattern.split('/').collect();
+    let uri_segs: Vec<&str> = path.split('/').collect();
+
+    // Pattern ending with /* matches directory and all children
+    if pattern.ends_with("/*") && pat_segs.len() == uri_segs.len().min(pat_segs.len()) {
+        let prefix = &pat_segs[..pat_segs.len() - 1];
+        let uri_prefix = &uri_segs[..prefix.len().min(uri_segs.len())];
+        if prefix.len() <= uri_segs.len()
+            && prefix.iter().zip(uri_prefix.iter()).all(|(p, s)| segment_match(p, s))
+        {
+            return true;
+        }
+    }
+
+    if pat_segs.len() != uri_segs.len() {
+        return false;
+    }
+
+    pat_segs.iter().zip(uri_segs.iter()).all(|(p, s)| segment_match(p, s))
+}
+
+/// Match a single path segment against a pattern segment.
+/// `*` matches any non-empty sequence of characters.
+fn segment_match(pattern: &str, segment: &str) -> bool {
+    if pattern == "*" {
+        return !segment.is_empty();
+    }
+    if !pattern.contains('*') {
+        return pattern == segment;
+    }
+    // Simple *.ext or prefix* matching
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        return segment.ends_with(suffix);
+    }
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return segment.starts_with(prefix);
+    }
+    // prefix*suffix
+    if let Some((prefix, suffix)) = pattern.split_once('*') {
+        return segment.starts_with(prefix)
+            && segment.ends_with(suffix)
+            && segment.len() >= prefix.len() + suffix.len();
+    }
+    pattern == segment
 }
 
 fn extract_headers(req: &Request<Incoming>) -> Vec<(String, String)> {
@@ -745,5 +833,109 @@ mod tests {
         };
         let router = Router::new(&config);
         assert_eq!(router.server_port, 8080);
+    }
+
+    // ── blocked paths ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_blocked_exact_path() {
+        let blocked = vec!["/wp-config.php".to_string()];
+        assert!(is_path_blocked("/wp-config.php", &blocked));
+        assert!(!is_path_blocked("/index.php", &blocked));
+    }
+
+    #[test]
+    fn test_blocked_wildcard_directory() {
+        let blocked = vec!["/vendor/*".to_string()];
+        assert!(is_path_blocked("/vendor/autoload.php", &blocked));
+        assert!(is_path_blocked("/vendor/anything", &blocked));
+        assert!(!is_path_blocked("/index.php", &blocked));
+    }
+
+    #[test]
+    fn test_blocked_extension_wildcard() {
+        let blocked = vec!["/wp-content/uploads/*.php".to_string()];
+        assert!(is_path_blocked("/wp-content/uploads/evil.php", &blocked));
+        assert!(!is_path_blocked("/wp-content/uploads/photo.jpg", &blocked));
+    }
+
+    // ── allowed PHP paths ─────────────────────────────────────────────
+
+    #[test]
+    fn test_php_allowed_empty_allows_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            server: ServerConfig {
+                document_root: dir.path().to_path_buf(),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+        };
+        let router = Router::new(&config);
+        assert!(router.is_php_allowed("/anything.php"));
+    }
+
+    #[test]
+    fn test_php_allowed_exact_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                document_root: dir.path().to_path_buf(),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+        };
+        config.server.security.allowed_php_paths = vec![
+            "/index.php".to_string(),
+            "/wp-login.php".to_string(),
+        ];
+        let router = Router::new(&config);
+        assert!(router.is_php_allowed("/index.php"));
+        assert!(router.is_php_allowed("/wp-login.php"));
+        assert!(!router.is_php_allowed("/evil.php"));
+    }
+
+    #[test]
+    fn test_php_allowed_wildcard_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                document_root: dir.path().to_path_buf(),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+        };
+        config.server.security.allowed_php_paths = vec![
+            "/index.php".to_string(),
+            "/wp-admin/*.php".to_string(),
+        ];
+        let router = Router::new(&config);
+        assert!(router.is_php_allowed("/index.php"));
+        assert!(router.is_php_allowed("/wp-admin/admin.php"));
+        assert!(router.is_php_allowed("/wp-admin/options.php"));
+        assert!(!router.is_php_allowed("/wp-content/uploads/shell.php"));
+    }
+
+    // ── glob matching ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_glob_match_exact() {
+        assert!(glob_match("/index.php", "/index.php"));
+        assert!(!glob_match("/index.php", "/other.php"));
+    }
+
+    #[test]
+    fn test_glob_match_star_segment() {
+        assert!(glob_match("/wp-admin/*.php", "/wp-admin/admin.php"));
+        assert!(!glob_match("/wp-admin/*.php", "/wp-admin/sub/deep.php"));
+        assert!(!glob_match("/wp-admin/*.php", "/index.php"));
+    }
+
+    #[test]
+    fn test_glob_match_star_catches_directory() {
+        assert!(glob_match("/vendor/*", "/vendor/autoload.php"));
+        assert!(glob_match("/vendor/*", "/vendor/anything"));
+        // nested paths beyond the /* also match (/* means "directory and children")
+        assert!(glob_match("/vendor/*", "/vendor/foo/bar"));
     }
 }

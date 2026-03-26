@@ -168,6 +168,31 @@ pub struct SecurityConfig {
     /// Default: `[]` (trust no proxies).
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
+
+    /// Path patterns blocked from all access (returns 403).
+    ///
+    /// Supports glob-style patterns: `*` matches any sequence within a segment,
+    /// `**` is not supported (use prefix matching instead).
+    ///
+    /// Examples: `["/wp-config.php", "/vendor/*", "/.env"]`
+    ///
+    /// Default: `[]` (nothing blocked beyond `hidden_files`).
+    #[serde(default)]
+    pub blocked_paths: Vec<String>,
+
+    /// Glob patterns for PHP files allowed to execute. When non-empty,
+    /// only matching PHP paths run; all others get 403.
+    ///
+    /// Patterns are matched against the URI path (e.g. `/index.php`,
+    /// `/wp-admin/admin.php`). Use `*` for single-segment wildcards.
+    ///
+    /// Examples: `["/index.php", "/wp-login.php", "/wp-admin/*.php",
+    ///            "/wp-cron.php", "/wp-comments-post.php",
+    ///            "/xmlrpc.php", "/wp-trackback.php"]`
+    ///
+    /// Default: `[]` (all PHP files allowed).
+    #[serde(default)]
+    pub allowed_php_paths: Vec<String>,
 }
 
 /// Logging configuration (`[server.logging]`).

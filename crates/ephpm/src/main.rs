@@ -31,6 +31,10 @@ enum Commands {
         /// Document root directory (overrides config)
         #[arg(short, long)]
         document_root: Option<PathBuf>,
+
+        /// Increase log verbosity (-v = debug, -vv = trace)
+        #[arg(short, long, action = clap::ArgAction::Count)]
+        verbose: u8,
     },
 
     /// Run PHP CLI commands using the embedded PHP runtime
@@ -92,11 +96,17 @@ fn exit_code_from(code: i32) -> ExitCode {
 /// 4. Run HTTP server
 fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
     // Load config first (before tracing) so we can use the configured log level.
-    let config = load_serve_config(command)?;
+    let (config, verbose) = load_serve_config(command)?;
 
-    // Initialize tracing with config-based log level (RUST_LOG env var takes precedence).
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.server.logging.level));
+    // Resolve log level: RUST_LOG > -v flag > config > "info"
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        let level = match verbose {
+            0 => config.server.logging.level.as_str(),
+            1 => "debug",
+            _ => "trace",
+        };
+        EnvFilter::new(level)
+    });
 
     let fmt_layer = tracing_subscriber::fmt::layer();
 
@@ -153,15 +163,18 @@ fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
 /// Parse the Serve command and load configuration.
 ///
 /// Called before tracing is initialized, so no logging here.
-fn load_serve_config(command: Option<Commands>) -> anyhow::Result<ephpm_config::Config> {
+/// Returns `(config, verbose_level)`.
+fn load_serve_config(command: Option<Commands>) -> anyhow::Result<(ephpm_config::Config, u8)> {
     let Commands::Serve {
         config,
         listen,
         document_root,
+        verbose,
     } = command.unwrap_or(Commands::Serve {
         config: PathBuf::from("ephpm.toml"),
         listen: None,
         document_root: None,
+        verbose: 0,
     }) else {
         unreachable!("load_serve_config called with non-Serve command");
     };
@@ -180,5 +193,5 @@ fn load_serve_config(command: Option<Commands>) -> anyhow::Result<ephpm_config::
         config.server.document_root = root;
     }
 
-    Ok(config)
+    Ok((config, verbose))
 }
