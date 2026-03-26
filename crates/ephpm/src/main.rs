@@ -31,6 +31,7 @@ enum Commands {
     },
 
     /// Run PHP CLI commands using the embedded PHP runtime
+    #[command(disable_help_flag = true)]
     Php {
         /// Arguments to pass to the PHP interpreter
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
