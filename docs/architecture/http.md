@@ -179,6 +179,38 @@ TCP Accept → TLS Handshake (tokio-rustls) → HTTP/1.1 Parse → Router
 - `is_tls` flag propagated to router so `$_SERVER['HTTPS']` is set correctly
 - When behind a trusted proxy, `X-Forwarded-Proto` takes precedence over native TLS status
 
+### Automatic TLS (ACME)
+
+Zero-config HTTPS via Let's Encrypt, like Caddy. Uses `rustls-acme` crate with TLS-ALPN-01 challenge (works on port 443 alone, no port 80 needed).
+
+**Single-node** (implemented): `DirCache` stores certs on the filesystem. On startup, requests a cert from Let's Encrypt (~5-30s), then hot-swaps on renewal. No restarts needed. Uses `LazyConfigAcceptor` to inspect each TLS `ClientHello` — ACME challenges are handled inline, normal connections pass through to hyper.
+
+**Renewal timing**: `rustls-acme` renews at 2/3 of remaining certificate validity (~30 days before expiry for standard 90-day Let's Encrypt certs). This is hardcoded in the library — there is no API to configure it. If we need customizable renewal timing in the future (e.g., for shorter-lived certs or different CAs), options are: contribute the feature upstream to `rustls-acme`, or switch to `instant-acme` which gives full control over the ACME flow at the cost of managing renewal scheduling ourselves.
+
+```toml
+[server.tls]
+domains = ["example.com", "www.example.com"]
+email = "admin@example.com"
+cache_dir = "/var/lib/ephpm/certs"
+# staging = true  # use for testing to avoid rate limits
+```
+
+**Clustered** (Phase 2 — requires KV store and gossip): In a multi-node deployment, naive ACME creates several problems that the clustered KV store solves:
+
+| Problem | What happens | Solution |
+|---------|-------------|----------|
+| **Renewal stampede** | N nodes all try to renew simultaneously, hitting Let's Encrypt rate limits (50 certs/domain/week) | Distributed lock via KV (`acme:lock:<domain>` key with TTL). One node wins, renews, others wait. |
+| **Challenge routing** | Let's Encrypt connects to the domain, DNS round-robins to any node, but only the initiating node has the challenge token | Share challenge tokens via KV (`acme:challenge:<token>` keys). Any node can respond. |
+| **Cert distribution** | After one node obtains the cert, all nodes need it immediately | Store cert in KV (`certs:<domain>` key), replicate via gossip. All nodes pick it up. |
+| **Leader election** | Only one node should drive renewals to avoid redundant work | KV-based leader (`acme:leader` key with TTL heartbeat). Leader renews, followers watch. |
+
+The `rustls-acme` crate has a pluggable `Cache` trait — swap `DirCache` for a `KvCache` implementation when clustering is built. Zero changes to the ACME logic itself.
+
+```
+Phase 1 (single-node):  AcmeConfig → DirCache (filesystem)
+Phase 2 (clustered):    AcmeConfig → KvCache (gossip-replicated KV store)
+```
+
 ## Compression
 
 Applied to both PHP and static responses when the client sends `Accept-Encoding: gzip`.
@@ -256,6 +288,10 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.tls.key` | path | — | PEM private key file |
 | `server.tls.listen` | string | — | Separate HTTPS listen address |
 | `server.tls.redirect_http` | bool | `false` | 301 redirect HTTP to HTTPS |
+| `server.tls.domains` | string[] | `[]` | Domain names for ACME auto-TLS |
+| `server.tls.email` | string | — | Contact email for ACME registration |
+| `server.tls.cache_dir` | path | `"certs"` | ACME certificate cache directory |
+| `server.tls.staging` | bool | `false` | Use Let's Encrypt staging environment |
 | `php.max_execution_time` | int | `30` | PHP per-request timeout (seconds) |
 | `php.memory_limit` | string | `"128M"` | PHP memory limit |
 | `php.ini_overrides` | [string, string][] | `[]` | INI directive overrides |
@@ -285,7 +321,6 @@ EPHPM_PHP__MEMORY_LIMIT=256M
 
 | Config | Description | Priority |
 |--------|-------------|----------|
-| `server.tls.auto` | ACME / Let's Encrypt auto-provisioning | High |
 | `server.static.etag` | ETag headers + 304 Not Modified support | Medium |
 | `server.static.expires` | Per-extension cache lifetimes | Medium |
 | `server.response.headers` | Custom response headers (CORS, CSP, HSTS) | Medium |

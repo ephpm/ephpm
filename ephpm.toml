@@ -52,10 +52,19 @@ ini_overrides = [
 # worker_script = "vendor/ephpm/worker.php"  # worker loop script
 
 # [server.tls]
+# --- Manual mode (provide your own cert/key) ---
 # cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
 # key = "/etc/letsencrypt/live/example.com/privkey.pem"
-# listen = "0.0.0.0:443"    # separate HTTPS port (omit to make server.listen HTTPS-only)
-# redirect_http = true       # 301 redirect HTTP → HTTPS (requires tls.listen)
+#
+# --- Auto mode (ACME / Let's Encrypt) ---
+# domains = ["example.com", "www.example.com"]
+# email = "admin@example.com"      # contact for expiry warnings
+# cache_dir = "certs"              # where to store certs (default: "certs")
+# staging = false                  # true = LE staging env (for testing)
+#
+# --- Shared options ---
+# listen = "0.0.0.0:443"          # separate HTTPS port (omit to make server.listen HTTPS-only)
+# redirect_http = true             # 301 redirect HTTP → HTTPS (requires tls.listen)
 
 # Future sections (not in MVP):
 # [db_proxy]

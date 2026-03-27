@@ -1,3 +1,4 @@
+pub mod acme;
 pub mod router;
 pub mod static_files;
 pub mod tls;
@@ -14,9 +15,12 @@ use hyper::server::conn::http1;
 use hyper::{Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use router::Router;
+use rustls::ServerConfig;
+use rustls_acme::is_tls_alpn_challenge;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 
 /// Start the HTTP server with the given configuration.
 ///
@@ -24,23 +28,34 @@ use tokio_rustls::TlsAcceptor;
 /// PHP execution or static file serving based on the request path.
 ///
 /// When `[server.tls]` is configured, the server terminates TLS using
-/// the provided certificate and key. If `tls.listen` is set, a separate
-/// HTTPS listener is created and the main listener serves HTTP (with
-/// optional redirect).
+/// either manual cert/key files or automatic ACME provisioning.
 ///
 /// # Errors
 ///
 /// Returns an error if the listen address is invalid or binding fails.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let listeners = bind_listeners(&config).await?;
-    accept_loop(listeners, &config).await
+    accept_loop(listeners).await
+}
+
+/// Which TLS mode the server is operating in.
+enum TlsMode {
+    /// No TLS — plain HTTP only.
+    None,
+    /// Manual TLS with a static cert/key loaded at startup.
+    Manual(TlsAcceptor),
+    /// Automatic ACME certificate provisioning (Let's Encrypt).
+    Acme {
+        challenge_config: Arc<ServerConfig>,
+        default_config: Arc<ServerConfig>,
+    },
 }
 
 /// Resolved listener state after binding.
 struct Listeners {
     main: TcpListener,
     tls_listener: Option<TcpListener>,
-    tls_acceptor: Option<TlsAcceptor>,
+    tls_mode: TlsMode,
     redirect_http: bool,
     conn: ConnSettings,
     idle_timeout: Duration,
@@ -65,20 +80,35 @@ async fn bind_listeners(config: &Config) -> anyhow::Result<Listeners> {
     let idle_timeout = Duration::from_secs(config.server.timeouts.idle);
     let router = Arc::new(Router::new(config));
 
-    // Build TLS acceptor if configured.
-    let tls_acceptor = config
-        .server
-        .tls
-        .as_ref()
-        .map(|tls_config| {
+    // Determine TLS mode.
+    let tls_mode = match config.server.tls.as_ref() {
+        Some(tls_config) if tls_config.is_manual() => {
+            let cert = tls_config.cert.as_ref().expect("is_manual checks cert");
+            let key = tls_config.key.as_ref().expect("is_manual checks key");
             tracing::info!(
-                cert = %tls_config.cert.display(),
-                key = %tls_config.key.display(),
-                "TLS enabled"
+                cert = %cert.display(),
+                key = %key.display(),
+                "TLS enabled (manual)"
             );
-            tls::build_tls_acceptor(&tls_config.cert, &tls_config.key)
-        })
-        .transpose()?;
+            let acceptor = tls::build_tls_acceptor(cert, key)?;
+            TlsMode::Manual(acceptor)
+        }
+        Some(tls_config) if tls_config.is_acme() => {
+            let setup = acme::start_acme(tls_config)?;
+            TlsMode::Acme {
+                challenge_config: setup.challenge_config,
+                default_config: setup.default_config,
+            }
+        }
+        Some(tls_config) if tls_config.cert.is_some() || tls_config.key.is_some() => {
+            anyhow::bail!(
+                "TLS config must provide both cert and key, or neither (for ACME mode)"
+            );
+        }
+        _ => TlsMode::None,
+    };
+
+    let has_tls = !matches!(tls_mode, TlsMode::None);
 
     // Determine if we need a separate TLS listener.
     let tls_listen_addr: Option<SocketAddr> = config
@@ -89,11 +119,12 @@ async fn bind_listeners(config: &Config) -> anyhow::Result<Listeners> {
         .map(|s| s.parse().context("invalid TLS listen address"))
         .transpose()?;
 
-    let redirect_http = config
-        .server
-        .tls
-        .as_ref()
-        .is_some_and(|t| t.redirect_http && t.listen.is_some());
+    let redirect_http = has_tls
+        && config
+            .server
+            .tls
+            .as_ref()
+            .is_some_and(|t| t.redirect_http && t.listen.is_some());
 
     if config
         .server
@@ -112,7 +143,7 @@ async fn bind_listeners(config: &Config) -> anyhow::Result<Listeners> {
         .with_context(|| format!("failed to bind to {addr}"))?;
 
     let tls_listener = match tls_listen_addr {
-        Some(tls_addr) => {
+        Some(tls_addr) if has_tls => {
             if tls_addr == addr {
                 anyhow::bail!(
                     "server.listen ({addr}) and server.tls.listen ({tls_addr}) \
@@ -125,10 +156,10 @@ async fn bind_listeners(config: &Config) -> anyhow::Result<Listeners> {
             tracing::info!(%tls_addr, "HTTPS listening");
             Some(listener)
         }
-        None => None,
+        _ => None,
     };
 
-    if tls_acceptor.is_some() && tls_listener.is_none() {
+    if has_tls && tls_listener.is_none() {
         tracing::info!(%addr, "HTTPS listening");
     } else if redirect_http {
         tracing::info!(%addr, "HTTP listening (redirecting to HTTPS)");
@@ -139,7 +170,7 @@ async fn bind_listeners(config: &Config) -> anyhow::Result<Listeners> {
     Ok(Listeners {
         main,
         tls_listener,
-        tls_acceptor,
+        tls_mode,
         redirect_http,
         conn,
         idle_timeout,
@@ -148,11 +179,11 @@ async fn bind_listeners(config: &Config) -> anyhow::Result<Listeners> {
 }
 
 /// Run the accept loop, dispatching connections to the appropriate handler.
-async fn accept_loop(listeners: Listeners, _config: &Config) -> anyhow::Result<()> {
+async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
     let Listeners {
         main,
         tls_listener,
-        tls_acceptor,
+        tls_mode,
         redirect_http,
         conn,
         idle_timeout,
@@ -166,36 +197,17 @@ async fn accept_loop(listeners: Listeners, _config: &Config) -> anyhow::Result<(
         tokio::select! {
             result = main.accept() => {
                 let (stream, remote_addr) = result.context("failed to accept connection")?;
-
-                if tls_listener.is_some() && redirect_http {
-                    tokio::spawn(serve_http_redirect(stream, remote_addr, conn));
-                } else if let Some(ref acceptor) = tls_acceptor {
-                    let acceptor = acceptor.clone();
-                    let router = Arc::clone(&router);
-                    tokio::spawn(async move {
-                        serve_tls_connection(stream, acceptor, router, remote_addr, conn).await;
-                    });
-                } else {
-                    let router = Arc::clone(&router);
-                    tokio::spawn(async move {
-                        serve_connection(
-                            TokioIo::new(stream), router, remote_addr, false, conn,
-                        ).await;
-                    });
-                }
+                dispatch_main_connection(
+                    stream, remote_addr, &tls_mode, tls_listener.is_some(),
+                    redirect_http, conn, &router,
+                );
             }
 
             result = async {
-                // SAFETY: guarded by `if tls_listener.is_some()` below.
                 tls_listener.as_ref().expect("guarded by is_some").accept().await
             }, if tls_listener.is_some() => {
                 let (stream, remote_addr) = result.context("failed to accept TLS connection")?;
-                // tls_listener is only set when tls_acceptor is set.
-                let acceptor = tls_acceptor.clone().expect("tls_listener requires tls_acceptor");
-                let router = Arc::clone(&router);
-                tokio::spawn(async move {
-                    serve_tls_connection(stream, acceptor, router, remote_addr, conn).await;
-                });
+                dispatch_tls_connection(stream, remote_addr, &tls_mode, conn, &router);
             }
 
             () = &mut shutdown => {
@@ -214,8 +226,84 @@ async fn accept_loop(listeners: Listeners, _config: &Config) -> anyhow::Result<(
     Ok(())
 }
 
-/// Perform a TLS handshake and then serve the connection.
-async fn serve_tls_connection(
+/// Dispatch a connection from the main listener.
+fn dispatch_main_connection(
+    stream: TcpStream,
+    remote_addr: SocketAddr,
+    tls_mode: &TlsMode,
+    has_tls_listener: bool,
+    redirect_http: bool,
+    conn: ConnSettings,
+    router: &Arc<Router>,
+) {
+    if has_tls_listener && redirect_http {
+        tokio::spawn(serve_http_redirect(stream, remote_addr, conn));
+        return;
+    }
+
+    match tls_mode {
+        TlsMode::Manual(acceptor) => {
+            let acceptor = acceptor.clone();
+            let router = Arc::clone(router);
+            tokio::spawn(async move {
+                serve_manual_tls(stream, acceptor, router, remote_addr, conn).await;
+            });
+        }
+        TlsMode::Acme {
+            challenge_config,
+            default_config,
+        } => {
+            let challenge = Arc::clone(challenge_config);
+            let default = Arc::clone(default_config);
+            let router = Arc::clone(router);
+            tokio::spawn(async move {
+                serve_acme_tls(stream, challenge, default, router, remote_addr, conn).await;
+            });
+        }
+        TlsMode::None => {
+            let router = Arc::clone(router);
+            tokio::spawn(async move {
+                serve_connection(TokioIo::new(stream), router, remote_addr, false, conn).await;
+            });
+        }
+    }
+}
+
+/// Dispatch a connection from the separate TLS listener.
+fn dispatch_tls_connection(
+    stream: TcpStream,
+    remote_addr: SocketAddr,
+    tls_mode: &TlsMode,
+    conn: ConnSettings,
+    router: &Arc<Router>,
+) {
+    match tls_mode {
+        TlsMode::Manual(acceptor) => {
+            let acceptor = acceptor.clone();
+            let router = Arc::clone(router);
+            tokio::spawn(async move {
+                serve_manual_tls(stream, acceptor, router, remote_addr, conn).await;
+            });
+        }
+        TlsMode::Acme {
+            challenge_config,
+            default_config,
+        } => {
+            let challenge = Arc::clone(challenge_config);
+            let default = Arc::clone(default_config);
+            let router = Arc::clone(router);
+            tokio::spawn(async move {
+                serve_acme_tls(stream, challenge, default, router, remote_addr, conn).await;
+            });
+        }
+        TlsMode::None => {
+            unreachable!("tls_listener only exists when TLS is configured");
+        }
+    }
+}
+
+/// Perform a manual TLS handshake and then serve the connection.
+async fn serve_manual_tls(
     stream: TcpStream,
     acceptor: TlsAcceptor,
     router: Arc<Router>,
@@ -236,6 +324,59 @@ async fn serve_tls_connection(
         };
 
     serve_connection(TokioIo::new(tls_stream), router, remote_addr, true, settings).await;
+}
+
+/// Handle an ACME-aware TLS connection using `LazyConfigAcceptor`.
+///
+/// Inspects the TLS `ClientHello` to distinguish ACME challenge connections
+/// (TLS-ALPN-01) from normal HTTPS traffic. Challenge connections are handled
+/// inline and closed; normal connections are passed through to hyper.
+async fn serve_acme_tls(
+    stream: TcpStream,
+    challenge_config: Arc<ServerConfig>,
+    default_config: Arc<ServerConfig>,
+    router: Arc<Router>,
+    remote_addr: SocketAddr,
+    settings: ConnSettings,
+) {
+    let handshake = match tokio::time::timeout(
+        settings.header_read_timeout,
+        LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stream),
+    )
+    .await
+    {
+        Ok(Ok(h)) => h,
+        Ok(Err(err)) => {
+            tracing::debug!(%remote_addr, %err, "TLS ClientHello failed");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!(%remote_addr, "TLS ClientHello timed out");
+            return;
+        }
+    };
+
+    if is_tls_alpn_challenge(&handshake.client_hello()) {
+        tracing::debug!(%remote_addr, "handling ACME TLS-ALPN-01 challenge");
+        match handshake.into_stream(challenge_config).await {
+            Ok(mut tls) => {
+                let _ = tls.shutdown().await;
+            }
+            Err(err) => {
+                tracing::debug!(%remote_addr, %err, "ACME challenge handshake failed");
+            }
+        }
+        return;
+    }
+
+    match handshake.into_stream(default_config).await {
+        Ok(tls_stream) => {
+            serve_connection(TokioIo::new(tls_stream), router, remote_addr, true, settings).await;
+        }
+        Err(err) => {
+            tracing::debug!(%remote_addr, %err, "TLS handshake failed");
+        }
+    }
 }
 
 /// Serve an HTTP connection over any transport (`TcpStream` or `TlsStream`).
@@ -269,11 +410,7 @@ async fn serve_connection<I>(
 }
 
 /// Serve a plain HTTP connection that redirects all requests to HTTPS.
-async fn serve_http_redirect(
-    stream: TcpStream,
-    remote_addr: SocketAddr,
-    settings: ConnSettings,
-) {
+async fn serve_http_redirect(stream: TcpStream, remote_addr: SocketAddr, settings: ConnSettings) {
     let io = TokioIo::new(stream);
     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let host = req

@@ -24,6 +24,8 @@ anyhow.workspace = true
 rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
+rustls-acme.workspace = true
+tokio-stream.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -219,16 +219,60 @@ pub struct LoggingConfig {
 
 /// TLS configuration (`[server.tls]`).
 ///
-/// When present, the server listens for HTTPS connections using the
-/// provided certificate and private key files.
+/// Supports two mutually exclusive modes:
+///
+/// - **Manual**: Provide `cert` and `key` paths to PEM files.
+/// - **Automatic (ACME)**: Provide `domains` for zero-config Let's Encrypt.
+///
+/// If both `cert`/`key` and `domains` are set, manual mode takes precedence.
 #[derive(Debug, Deserialize, Clone)]
 pub struct TlsConfig {
+    // --- Manual mode ---
     /// Path to the PEM-encoded certificate chain file.
-    pub cert: PathBuf,
+    #[serde(default)]
+    pub cert: Option<PathBuf>,
 
     /// Path to the PEM-encoded private key file.
-    pub key: PathBuf,
+    #[serde(default)]
+    pub key: Option<PathBuf>,
 
+    // --- ACME mode ---
+    /// Domain names for automatic certificate provisioning via ACME.
+    ///
+    /// When set (and `cert`/`key` are not), the server automatically
+    /// obtains and renews TLS certificates from Let's Encrypt.
+    ///
+    /// Example: `["example.com", "www.example.com"]`
+    #[serde(default)]
+    pub domains: Vec<String>,
+
+    /// Contact email for ACME account registration.
+    ///
+    /// Let's Encrypt uses this to send certificate expiry warnings.
+    /// Format: `"admin@example.com"` (the `mailto:` prefix is added automatically).
+    #[serde(default)]
+    pub email: Option<String>,
+
+    /// Directory to cache ACME certificates and account keys.
+    ///
+    /// Strongly recommended for production — without caching, every restart
+    /// requests a new certificate, which can hit Let's Encrypt rate limits
+    /// (50 certificates per domain per week).
+    ///
+    /// Default: `"certs"` (relative to working directory).
+    #[serde(default = "default_cache_dir")]
+    pub cache_dir: PathBuf,
+
+    /// Use Let's Encrypt staging environment for testing.
+    ///
+    /// Staging issues untrusted certificates but has relaxed rate limits.
+    /// Use this during development to avoid hitting production rate limits.
+    ///
+    /// Default: `false` (use production Let's Encrypt).
+    #[serde(default)]
+    pub staging: bool,
+
+    // --- Shared ---
     /// Optional separate listen address for HTTPS (e.g. `"0.0.0.0:443"`).
     ///
     /// When set, `server.listen` serves HTTP and this address serves HTTPS.
@@ -242,6 +286,20 @@ pub struct TlsConfig {
     /// Default: `false`.
     #[serde(default)]
     pub redirect_http: bool,
+}
+
+impl TlsConfig {
+    /// Returns `true` if manual TLS mode is configured (cert + key provided).
+    #[must_use]
+    pub fn is_manual(&self) -> bool {
+        self.cert.is_some() && self.key.is_some()
+    }
+
+    /// Returns `true` if ACME auto-provisioning is configured.
+    #[must_use]
+    pub fn is_acme(&self) -> bool {
+        !self.domains.is_empty() && !self.is_manual()
+    }
 }
 
 /// PHP runtime configuration.
@@ -425,6 +483,10 @@ fn default_hidden_files() -> String {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_cache_dir() -> PathBuf {
+    PathBuf::from("certs")
 }
 
 fn default_max_execution_time() -> u32 {
