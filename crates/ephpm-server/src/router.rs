@@ -50,10 +50,13 @@ pub struct Router {
     compression: CompressionSettings,
     hidden_files: String,
     cache_control: String,
+    etag: bool,
     request_timeout: Duration,
     trusted_proxies: Vec<IpNet>,
     blocked_paths: Vec<String>,
     allowed_php_paths: Vec<String>,
+    trusted_hosts: Vec<String>,
+    response_headers: Vec<(String, String)>,
 }
 
 impl Router {
@@ -87,10 +90,19 @@ impl Router {
             },
             hidden_files: config.server.static_files.hidden_files.clone(),
             cache_control: config.server.static_files.cache_control.clone(),
+            etag: config.server.static_files.etag,
             request_timeout: Duration::from_secs(config.server.timeouts.request),
             trusted_proxies,
             blocked_paths: config.server.security.blocked_paths.clone(),
             allowed_php_paths: config.server.security.allowed_php_paths.clone(),
+            trusted_hosts: config.server.request.trusted_hosts.clone(),
+            response_headers: config
+                .server
+                .response
+                .headers
+                .iter()
+                .map(|[k, v]| (k.clone(), v.clone()))
+                .collect(),
         }
     }
 
@@ -127,6 +139,11 @@ impl Router {
         remote_addr: SocketAddr,
         is_tls: bool,
     ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+        // Validate Host header against trusted hosts list.
+        if let Some(resp) = self.check_trusted_host(&req) {
+            return Ok(resp);
+        }
+
         let uri_path = req.uri().path().to_string();
         let query_string = req.uri().query().unwrap_or("").to_string();
 
@@ -145,10 +162,19 @@ impl Router {
 
         let accepts_gzip = self.compression.enabled && accepts_encoding(&req, "gzip");
 
-        let response = match self.resolve_fallback(&uri_path, &query_string) {
+        // Extract If-None-Match for ETag support before consuming the request.
+        let if_none_match = if self.etag {
+            req.headers()
+                .get("if-none-match")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from)
+        } else {
+            None
+        };
+
+        let mut response = match self.resolve_fallback(&uri_path, &query_string) {
             Resolved::File(fs_path) => {
                 if is_php_file(&fs_path) {
-                    // Enforce PHP path allowlist
                     if self.is_php_allowed(&uri_path) {
                         self.handle_php(req, effective_addr, is_https, fs_path, accepts_gzip)
                             .await
@@ -162,6 +188,8 @@ impl Router {
                         accepts_gzip,
                         &self.cache_control,
                         self.compression,
+                        self.etag,
+                        if_none_match.as_deref(),
                     )
                     .await
                 }
@@ -171,6 +199,9 @@ impl Router {
                 error_response(status, &format!("{code} {}", status.canonical_reason().unwrap_or("Error")))
             }
         };
+
+        // Apply custom response headers to all responses.
+        self.apply_response_headers(&mut response);
 
         Ok(response)
     }
@@ -352,6 +383,47 @@ impl Router {
             .map_or(is_tls, |proto| proto.eq_ignore_ascii_case("https"));
 
         (SocketAddr::new(real_ip, remote_addr.port()), is_https)
+    }
+
+    /// Validate the `Host` header against the trusted hosts list.
+    ///
+    /// Returns a 421 Misdirected Request if the host is not trusted.
+    fn check_trusted_host(&self, req: &Request<Incoming>) -> Option<Response<Full<Bytes>>> {
+        if self.trusted_hosts.is_empty() {
+            return None;
+        }
+        let host = req
+            .headers()
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        // Compare with and without port.
+        let host_no_port = host.split(':').next().unwrap_or(host);
+        let is_trusted = self.trusted_hosts.iter().any(|trusted| {
+            host.eq_ignore_ascii_case(trusted) || host_no_port.eq_ignore_ascii_case(trusted)
+        });
+        if is_trusted {
+            None
+        } else {
+            tracing::debug!(host, "rejected untrusted host");
+            Some(error_response(
+                StatusCode::MISDIRECTED_REQUEST,
+                "421 Misdirected Request",
+            ))
+        }
+    }
+
+    /// Apply custom response headers from config.
+    fn apply_response_headers(&self, response: &mut Response<Full<Bytes>>) {
+        let headers = response.headers_mut();
+        for (name, value) in &self.response_headers {
+            if let (Ok(name), Ok(value)) = (
+                hyper::header::HeaderName::from_bytes(name.as_bytes()),
+                hyper::header::HeaderValue::from_str(value),
+            ) {
+                headers.insert(name, value);
+            }
+        }
     }
 
     /// Check if an IP address matches any trusted proxy CIDR.

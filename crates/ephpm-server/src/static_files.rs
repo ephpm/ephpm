@@ -1,7 +1,8 @@
-//! Static file serving with MIME type detection.
+//! Static file serving with MIME type detection and `ETag` support.
 //!
 //! Serves non-PHP files (CSS, JS, images, etc.) directly from the document root.
 
+use std::hash::{DefaultHasher, Hasher};
 use std::path::Path;
 
 use http_body_util::Full;
@@ -51,12 +52,18 @@ pub async fn serve(document_root: &Path, url_path: &str) -> Response<Full<Bytes>
 ///
 /// The router has already verified the file exists and resolved it via
 /// `fallback`. We still validate path traversal for defense in depth.
+///
+/// When `etag` is enabled, computes a hash-based `ETag` for the content.
+/// If `if_none_match` contains a matching `ETag`, returns 304 Not Modified.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_file(
     document_root: &Path,
     file_path: &Path,
     accepts_gzip: bool,
     cache_control: &str,
     compression: crate::router::CompressionSettings,
+    etag: bool,
+    if_none_match: Option<&str>,
 ) -> Response<Full<Bytes>> {
     // Security: ensure the resolved path is within the document root
     let Ok(canonical_root) = document_root.canonicalize() else {
@@ -80,6 +87,22 @@ pub async fn serve_file(
     let mime =
         mime_guess::from_path(&canonical_file).first_raw().unwrap_or("application/octet-stream");
 
+    // Compute ETag and check If-None-Match.
+    let etag_value = if etag { Some(compute_etag(&content)) } else { None };
+
+    if let (Some(tag), Some(client_tag)) = (&etag_value, if_none_match) {
+        if etag_matches(tag, client_tag) {
+            let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+            builder = builder.header("ETag", tag.as_str());
+            if !cache_control.is_empty() {
+                builder = builder.header("Cache-Control", cache_control);
+            }
+            return builder
+                .body(Full::new(Bytes::new()))
+                .unwrap_or_else(|_| internal_error());
+        }
+    }
+
     if accepts_gzip {
         if let Some(compressed) = crate::router::gzip_compress(&content, mime, compression) {
             let mut builder = Response::builder()
@@ -90,6 +113,9 @@ pub async fn serve_file(
                 .header("Vary", "Accept-Encoding");
             if !cache_control.is_empty() {
                 builder = builder.header("Cache-Control", cache_control);
+            }
+            if let Some(ref tag) = etag_value {
+                builder = builder.header("ETag", tag.as_str());
             }
             return builder
                 .body(Full::new(Bytes::from(compressed)))
@@ -104,9 +130,30 @@ pub async fn serve_file(
     if !cache_control.is_empty() {
         builder = builder.header("Cache-Control", cache_control);
     }
+    if let Some(ref tag) = etag_value {
+        builder = builder.header("ETag", tag.as_str());
+    }
     builder
         .body(Full::new(Bytes::from(content)))
         .unwrap_or_else(|_| internal_error())
+}
+
+/// Compute a weak `ETag` from file content using a fast hash.
+fn compute_etag(content: &[u8]) -> String {
+    let mut hasher = DefaultHasher::new();
+    hasher.write(content);
+    format!("W/\"{:016x}\"", hasher.finish())
+}
+
+/// Check if a client's `If-None-Match` value matches our `ETag`.
+///
+/// Handles `*` and comma-separated lists of tags per HTTP spec.
+fn etag_matches(etag: &str, if_none_match: &str) -> bool {
+    let trimmed = if_none_match.trim();
+    if trimmed == "*" {
+        return true;
+    }
+    trimmed.split(',').any(|tag| tag.trim() == etag)
 }
 
 fn not_found() -> Response<Full<Bytes>> {

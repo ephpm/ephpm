@@ -92,6 +92,16 @@ pub struct RequestConfig {
     /// Default: 8192 (8 KiB).
     #[serde(default = "default_max_header_size")]
     pub max_header_size: usize,
+
+    /// Allowed `Host` header values. When non-empty, requests with
+    /// a `Host` header not in this list receive a 421 Misdirected Request.
+    ///
+    /// Prevents host header injection attacks. Values should include
+    /// the port if non-standard (e.g. `"example.com:8080"`).
+    ///
+    /// Default: `[]` (all hosts allowed).
+    #[serde(default)]
+    pub trusted_hosts: Vec<String>,
 }
 
 /// Connection timeout configuration (`[server.timeouts]`).
@@ -139,6 +149,16 @@ pub struct ResponseConfig {
     /// Default: 1024 (1 KiB).
     #[serde(default = "default_compression_min_size")]
     pub compression_min_size: usize,
+
+    /// Custom headers added to every response (both PHP and static).
+    ///
+    /// Useful for security headers like HSTS, CSP, X-Frame-Options, CORS.
+    ///
+    /// Example: `{ "Strict-Transport-Security" = "max-age=31536000", "X-Frame-Options" = "DENY" }`
+    ///
+    /// Default: `{}` (none).
+    #[serde(default)]
+    pub headers: Vec<[String; 2]>,
 }
 
 /// Static file serving configuration (`[server.static]`).
@@ -159,6 +179,16 @@ pub struct StaticConfig {
     /// Default: `"deny"`.
     #[serde(default = "default_hidden_files")]
     pub hidden_files: String,
+
+    /// Enable `ETag` headers for static files and `304 Not Modified` responses.
+    ///
+    /// When enabled, static file responses include an `ETag` header based on
+    /// a hash of the file content. Requests with a matching `If-None-Match`
+    /// header receive a `304 Not Modified` response instead of the full body.
+    ///
+    /// Default: `true`.
+    #[serde(default = "default_etag")]
+    pub etag: bool,
 }
 
 /// Security configuration (`[server.security]`).
@@ -372,6 +402,7 @@ impl Default for RequestConfig {
         Self {
             max_body_size: default_max_body_size(),
             max_header_size: default_max_header_size(),
+            trusted_hosts: Vec::new(),
         }
     }
 }
@@ -392,6 +423,7 @@ impl Default for ResponseConfig {
             compression: default_compression(),
             compression_level: default_compression_level(),
             compression_min_size: default_compression_min_size(),
+            headers: Vec::new(),
         }
     }
 }
@@ -401,6 +433,7 @@ impl Default for StaticConfig {
         Self {
             cache_control: String::new(),
             hidden_files: default_hidden_files(),
+            etag: default_etag(),
         }
     }
 }
@@ -479,6 +512,10 @@ fn default_compression_min_size() -> usize {
 
 fn default_hidden_files() -> String {
     "deny".to_string()
+}
+
+fn default_etag() -> bool {
+    true
 }
 
 fn default_log_level() -> String {
