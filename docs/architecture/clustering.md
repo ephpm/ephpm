@@ -143,7 +143,9 @@ Three ways for PHP to access the KV store, each serving different use cases. All
 
 **Priority: implement first.** This gives instant compatibility with every PHP app that already uses Redis. WordPress, Laravel, Symfony, Drupal — they all have Redis session and cache drivers. No code changes, no new dependencies.
 
-ePHPm exposes a RESP (Redis Serialization Protocol) listener on localhost. PHP's existing Redis clients connect to it as if it were a real Redis server:
+ePHPm exposes a RESP (Redis Serialization Protocol) listener that PHP's existing Redis clients connect to as if it were a real Redis server. Two transport options:
+
+**TCP (default)** — drop-in replacement, zero config changes for most apps:
 
 ```toml
 [kv.redis_compat]
@@ -151,12 +153,53 @@ enabled = true
 listen = "127.0.0.1:6379"   # looks like Redis to PHP
 ```
 
+**Unix socket** — eliminates TCP overhead (no handshake, no Nagle, no loopback routing). ~2-5x faster than TCP for high-frequency small operations like session reads. Requires a one-line config change in the PHP app:
+
+```toml
+[kv.redis_compat]
+enabled = true
+socket = "/run/ephpm/redis.sock"   # unix socket path
+# listen = "127.0.0.1:6379"       # TCP and socket can run simultaneously
+```
+
+Both can be enabled at the same time — TCP for backward compatibility and tooling (`redis-cli`), Unix socket for performance-sensitive paths.
+
+#### Transport Comparison
+
+| Transport | Latency | Throughput | Config change needed |
+|-----------|---------|------------|---------------------|
+| **TCP localhost** | ~10-50us | Good | None — point at `127.0.0.1:6379` |
+| **Unix socket** | ~2-10us | Better (~2-5x) | Change host to socket path |
+| **SAPI (direct FFI)** | ~100-200ns | Best (~100x vs TCP) | Use `ephpm_kv_*()` functions |
+
+Unix socket is the sweet spot for apps that want better performance without rewriting code. Just change the Redis connection string:
+
+```php
+// Laravel — config/database.php
+'redis' => [
+    'default' => [
+        'scheme' => 'unix',
+        'path' => '/run/ephpm/redis.sock',
+        // or for phpredis: 'host' => '/run/ephpm/redis.sock'
+    ],
+],
+
+// WordPress — wp-config.php
+define('WP_REDIS_SCHEME', 'unix');
+define('WP_REDIS_PATH', '/run/ephpm/redis.sock');
+
+// Symfony — config/packages/cache.yaml
+framework:
+    cache:
+        default_redis_provider: 'redis:///run/ephpm/redis.sock'
+```
+
 #### Supported PHP Clients
 
-Both major PHP Redis clients work out of the box:
+Both major PHP Redis clients support TCP and Unix sockets out of the box:
 
-- **`phpredis`** — C extension, best performance for RESP path. Pre-compiled into many PHP distributions.
-- **`predis/predis`** — Pure PHP, most popular Composer package. No extension required.
+- **`phpredis`** — C extension, best performance for RESP path. Pre-compiled into many PHP distributions. Supports Unix sockets natively via `host` parameter.
+- **`predis/predis`** — Pure PHP, most popular Composer package. No extension required. Supports Unix sockets via `scheme: unix` parameter.
 
 #### Framework Integration (Zero Changes)
 
@@ -353,21 +396,22 @@ The Composer package detects whether it's running inside ephpm (SAPI functions a
 
 | Path | Latency (local) | Code changes | Best for |
 |------|-----------------|-------------|----------|
-| **RESP (Redis compat)** | ~10-50μs | None — existing Redis config | Existing apps, WordPress plugins, drop-in migration |
+| **RESP over TCP** | ~10-50us | None — existing Redis config | Drop-in migration, zero effort |
+| **RESP over Unix socket** | ~2-10us | Change Redis host to socket path | Existing apps wanting more speed |
 | **Session handler** | ~100-200ns | None — INI config only | PHP sessions (automatic) |
 | **SAPI functions** | ~100-200ns | ephpm-specific calls | New apps, performance-critical paths |
 | **Composer package** | ~100-200ns | PSR-6/PSR-16 interfaces | New apps that want portability + speed |
 
-The RESP path has overhead from TCP loopback + RESP serialization (~10-50μs vs ~100ns), but it's still **100-1,000x faster than external Redis** since there's no network hop — just localhost TCP to an in-process listener.
+The RESP paths have overhead from IPC + RESP serialization, but are still **100-1,000x faster than external Redis** since there's no network hop — just in-process communication. Unix sockets cut the RESP overhead roughly in half vs TCP by eliminating the TCP/IP stack.
 
 ### Performance Expectations
 
-| Operation | SAPI (local) | RESP (local) | SAPI (remote) | External Redis |
-|-----------|-------------|-------------|---------------|----------------|
-| GET (string) | ~100-200ns | ~10-50μs | ~0.5-2ms | ~0.5-2ms |
-| SET (string) | ~200-400ns | ~10-50μs | ~0.5-2ms | ~0.5-2ms |
-| Serialization | None (shared memory) | RESP encode/decode | Internal binary | Full RESP |
-| Connection | None (in-process FFI) | Localhost TCP | Persistent internal | TCP pool |
+| Operation | SAPI (local) | RESP Unix socket | RESP TCP | SAPI (remote) | External Redis |
+|-----------|-------------|-----------------|----------|---------------|----------------|
+| GET (string) | ~100-200ns | ~2-10us | ~10-50us | ~0.5-2ms | ~0.5-2ms |
+| SET (string) | ~200-400ns | ~2-10us | ~10-50us | ~0.5-2ms | ~0.5-2ms |
+| Serialization | None (shared memory) | RESP encode/decode | RESP encode/decode | Internal binary | Full RESP |
+| Connection | None (in-process FFI) | Unix socket | Localhost TCP | Persistent internal | TCP pool |
 
 ---
 
@@ -1164,7 +1208,9 @@ eviction_policy = "allkeys-lru"        # noeviction, allkeys-lru, volatile-lru, 
 
 [kv.redis_compat]
 enabled = false                        # RESP protocol listener
-listen = "127.0.0.1:6379"             # local-only by default
+listen = "127.0.0.1:6379"             # TCP listener (default, zero-config for existing apps)
+socket = "/run/ephpm/redis.sock"       # Unix socket (~2-5x faster than TCP)
+# Both can be enabled simultaneously — TCP for tooling, socket for performance
 
 [cluster]
 enabled = false

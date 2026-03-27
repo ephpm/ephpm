@@ -921,73 +921,289 @@ ID  STATUS   REQUESTS  MEMORY   UPTIME     LAST REQUEST
 
 ### `ephpm db`
 
-DB proxy inspection.
+DB proxy inspection and management. Connects to the Node API of a running instance.
 
 ```bash
-# Pool status
-ephpm db status
+# ── Pool Status ──
 
-# Top query digests (by total time)
+ephpm db status
+ephpm db status --node 10.0.1.1:9090
+
+# ── Query Digests ──
+
+# Top query digests (by total time, default)
 ephpm db digests
-ephpm db digests --sort count     # by execution count
-ephpm db digests --sort max-time  # by worst single execution
+ephpm db digests --sort count       # by execution count
+ephpm db digests --sort avg-time    # by average execution time
+ephpm db digests --sort max-time    # by worst single execution
+ephpm db digests --sort total-time  # by cumulative time (default)
 ephpm db digests --limit 20
 
-# Slow query log
-ephpm db slow
-ephpm db slow --since 1h
-ephpm db slow --with-explain      # include EXPLAIN output
+# Filter digests
+ephpm db digests --min-count 100             # only queries executed 100+ times
+ephpm db digests --min-avg "10ms"            # only queries averaging >10ms
+ephpm db digests --type read                 # only SELECT queries
+ephpm db digests --type write                # only INSERT/UPDATE/DELETE
 
-# Reset digest stats
+# Show a specific digest's detail
+ephpm db digest 0xa3f2b1c4
+
+# Reset digest stats (clears all counters)
 ephpm db digests reset
+
+# ── Slow Queries ──
+
+ephpm db slow
+ephpm db slow --since 1h                    # last hour
+ephpm db slow --since "2026-03-27 08:00"    # since specific time
+ephpm db slow --with-explain                # include EXPLAIN output
+ephpm db slow --min-duration "500ms"        # only queries > 500ms
+ephpm db slow --limit 50
+
+# ── Pool Management ──
+
+# Live connection pool details
+ephpm db pool
+ephpm db pool --backend mysql               # filter by backend type
+ephpm db pool --backend postgres
+
+# Drain connections (for maintenance — new queries wait for fresh connections)
+ephpm db pool drain
+ephpm db pool drain --backend mysql
+
+# ── Interactive Query (development only) ──
+
+# Run a query through the proxy (for testing/debugging)
+ephpm db query "SELECT COUNT(*) FROM users"
+ephpm db query "SHOW PROCESSLIST"
+ephpm db query "EXPLAIN SELECT * FROM orders WHERE status = 'pending'"
 ```
 
 ```
+$ ephpm db status
+MySQL:
+  Primary:    db-primary:3306 (connected)
+  Replicas:   2 healthy, 0 unhealthy
+  Pool:       38/50 active, 12 idle, 0 waiting
+  Lag:        replica-1: 12ms, replica-2: 45ms
+
+Postgres:
+  Primary:    pg-primary:5432 (connected)
+  Replicas:   1 healthy
+  Pool:       8/30 active, 22 idle, 0 waiting
+
 $ ephpm db digests --limit 5
-DIGEST       QUERY                                           COUNT    AVG      MAX      TOTAL
-0xa3f2b1c4   SELECT * FROM users WHERE id = ?                45,231   2.1ms    89ms     95.0s
-0xb1c4d9e7   INSERT INTO orders (user_id, ...) VALUES (?)    12,089   5.3ms    210ms    64.1s
-0xd9e7f2a3   SELECT * FROM products WHERE category = ?        8,445   45.2ms   1.2s     381.8s
-0xf2a3b1c4   UPDATE users SET last_login = ? WHERE id = ?     6,721   1.8ms    45ms     12.1s
-0x1234abcd   SELECT COUNT(*) FROM orders WHERE status = ?     3,211   12.4ms   340ms    39.8s
+DIGEST       QUERY                                           COUNT    AVG      MAX      TOTAL    TYPE
+0xa3f2b1c4   SELECT * FROM users WHERE id = ?                45,231   2.1ms    89ms     95.0s    read
+0xb1c4d9e7   INSERT INTO orders (user_id, ...) VALUES (?)    12,089   5.3ms    210ms    64.1s    write
+0xd9e7f2a3   SELECT * FROM products WHERE category = ?        8,445   45.2ms   1.2s     381.8s   read
+0xf2a3b1c4   UPDATE users SET last_login = ? WHERE id = ?     6,721   1.8ms    45ms     12.1s    write
+0x1234abcd   SELECT COUNT(*) FROM orders WHERE status = ?     3,211   12.4ms   340ms    39.8s    read
+
+$ ephpm db digest 0xd9e7f2a3
+Digest:     0xd9e7f2a3
+Query:      SELECT * FROM products WHERE category = ? ORDER BY created_at DESC LIMIT ?
+Type:       read (routed to replica)
+Count:      8,445
+Avg time:   45.2ms
+Min time:   3.1ms
+Max time:   1,204ms
+Total time: 381.8s
+Rows sent:  avg 24.3, max 50
+First seen: 2026-03-25 14:22:01
+Last seen:  2026-03-27 09:15:33
+
+$ ephpm db slow --since 1h --with-explain --limit 3
+── 2026-03-27 09:12:44 ─────────────────────────────────────────
+Duration:  1,204ms
+Digest:    0xd9e7f2a3
+Query:     SELECT * FROM products WHERE category = 'electronics' ORDER BY created_at DESC LIMIT 50
+Backend:   db-replica-1:3306
+
+EXPLAIN:
+  id  type   table     key            rows    Extra
+  1   range  products  idx_category   48,291  Using index condition; Using filesort
+
+  → Missing index on (category, created_at). Suggest: CREATE INDEX idx_cat_date ON products(category, created_at DESC)
+
+── 2026-03-27 09:08:12 ─────────────────────────────────────────
+Duration:  892ms
+...
+
+$ ephpm db pool
+BACKEND                    TYPE       STATUS    ACTIVE  IDLE  TOTAL  MAX   WAIT    TIMEOUTS
+db-primary:3306            mysql/rw   healthy   22      8     30     50    0       0
+db-replica-1:3306          mysql/ro   healthy   10      5     15     50    0       0
+db-replica-2:3306          mysql/ro   healthy   6       9     15     50    0       0
+pg-primary:5432            postgres   healthy   5       15    20     30    0       0
+
+Total: 43 active, 37 idle, 80 connections, 0 waiting
 ```
 
 ---
 
 ### `ephpm kv`
 
-KV store inspection and operations.
+KV store inspection and operations. Connects to the Node API of a running instance.
 
 ```bash
-# Stats
+# ── Stats ──
+
 ephpm kv stats
+ephpm kv stats --node 10.0.1.1:9090
 
-# Get/set/delete (for debugging — not a production data path)
-ephpm kv get session:abc
-ephpm kv set mykey myvalue --ttl 3600
+# ── Key Operations (for debugging — not a production data path) ──
+
+# Get a key (displays value and metadata)
+ephpm kv get session:abc123
+ephpm kv get user:42:profile --format json   # pretty-print JSON values
+ephpm kv get cache:page:/blog --format hex   # binary-safe hex dump
+
+# Set a key
+ephpm kv set mykey "hello world"
+ephpm kv set mykey "hello world" --ttl 3600  # expires in 1 hour
+ephpm kv set counter 0 --ttl 86400
+
+# Delete a key
 ephpm kv del mykey
+ephpm kv del "session:*" --pattern           # delete by pattern (careful!)
 
-# Cluster membership
-ephpm kv cluster
+# Check if a key exists (without fetching the value)
+ephpm kv exists session:abc123
 
-# Key scan (pattern match, like Redis SCAN)
+# Get TTL remaining
+ephpm kv ttl session:abc123
+
+# Hash operations
+ephpm kv hget user:42 email
+ephpm kv hset user:42 email "new@example.com"
+ephpm kv hgetall user:42
+ephpm kv hdel user:42 email
+
+# Increment/decrement
+ephpm kv incr page:views:/blog
+ephpm kv incrby ratelimit:1.2.3.4 1
+
+# ── Key Scanning ──
+
+# Scan keys by pattern (like Redis SCAN — cursor-based, safe for large keyspaces)
 ephpm kv keys "session:*" --limit 100
+ephpm kv keys "cache:page:*" --limit 50
+ephpm kv keys "*" --limit 20               # all keys (careful on large stores)
+
+# Count keys matching a pattern
+ephpm kv count "session:*"
+ephpm kv count "cache:*"
+
+# Key type breakdown
+ephpm kv types
+
+# ── Bulk Operations ──
+
+# Flush all keys (requires confirmation)
+ephpm kv flush
+ephpm kv flush --pattern "cache:*"          # flush only matching keys
+ephpm kv flush --yes                        # skip confirmation
+
+# Export keys to JSON (for backup/debugging)
+ephpm kv export "session:*" > sessions.json
+ephpm kv export "*" --format redis          # Redis RESP format (importable)
+
+# Import keys from JSON
+ephpm kv import < sessions.json
+
+# ── Cluster Membership ──
+
+ephpm kv cluster
+ephpm kv cluster --detail                   # show per-node key distribution
+
+# Which node owns a specific key?
+ephpm kv owner session:abc123
+ephpm kv owner user:42:profile
 ```
 
 ```
 $ ephpm kv stats
 Memory:     124MB / 512MB (24%)
-Keys:       89,421
+Keys:       89,421 (72,104 string, 17,317 hash)
 Hit rate:   98.7% (last 5m)
 Evictions:  0 (last 5m)
+Expires:    ~3,200/min (TTL)
 Policy:     allkeys-lru
+Uptime:     3d 14h 22m
+
+$ ephpm kv get session:abc123
+Key:        session:abc123
+Type:       string
+Size:       1,247 bytes
+TTL:        842s remaining (expires in 14m 2s)
+Owner:      10.0.1.2:7946 (remote)
+Value:
+  login|b:1;username|s:5:"admin";cart|a:2:{i:0;s:5:"item1";i:1;s:5:"item2";}
+
+$ ephpm kv get user:42:profile --format json
+Key:        user:42:profile
+Type:       string
+Size:       342 bytes
+TTL:        none (no expiry)
+Owner:      10.0.1.1:7946 (local)
+Value:
+  {
+    "id": 42,
+    "name": "Alice",
+    "email": "alice@example.com",
+    "role": "admin"
+  }
+
+$ ephpm kv hgetall user:42
+Key:     user:42
+Type:    hash
+Fields:  4
+Owner:   10.0.1.1:7946 (local)
+
+FIELD        VALUE
+email        alice@example.com
+name         Alice
+role         admin
+last_login   2026-03-27T09:15:00Z
+
+$ ephpm kv keys "session:*" --limit 10
+session:a1b2c3d4    string    1,247B    TTL 842s     10.0.1.2:7946
+session:e5f6a7b8    string    892B      TTL 1,200s   10.0.1.1:7946
+session:c9d0e1f2    string    2,104B    TTL 300s     10.0.1.3:7946
+...
+10 of 12,847 keys matching "session:*"
+
+$ ephpm kv count "session:*"
+12,847
+
+$ ephpm kv types
+TYPE      COUNT     MEMORY    % OF TOTAL
+string    72,104    98MB      79%
+hash      17,317    26MB      21%
+Total     89,421    124MB
+
+$ ephpm kv owner session:abc123
+Key:    session:abc123
+Hash:   0x3a21f7b2
+Owner:  10.0.1.2:7946 (node-2)
+Replicas:
+  10.0.1.3:7946 (node-3)
+  10.0.1.1:7946 (node-1)
 
 $ ephpm kv cluster
-NODE            STATUS    KEYS      MEMORY    VNODES
-10.0.1.1:7946   healthy   31,204    42MB      150
-10.0.1.2:7946   healthy   28,891    39MB      150
-10.0.1.3:7946   healthy   29,326    43MB      150
+NODE            STATUS    KEYS      MEMORY    VNODES    GOSSIP
+10.0.1.1:7946   healthy   31,204    42MB      150       gen=127, 0.2ms ago
+10.0.1.2:7946   healthy   28,891    39MB      150       gen=124, 1.1ms ago
+10.0.1.3:7946   healthy   29,326    43MB      150       gen=131, 0.4ms ago
 Replication: async, factor=2
+Ring balance: 34.9% / 32.3% / 32.8% (ideal: 33.3%)
+
+$ ephpm kv cluster --detail
+NODE            KEYS     MEMORY   STRINGS  HASHES   HIT RATE   EVICTIONS
+10.0.1.1:7946   31,204   42MB     24,891   6,313    98.9%      0
+10.0.1.2:7946   28,891   39MB     23,104   5,787    98.4%      0
+10.0.1.3:7946   29,326   43MB     24,109   5,217    98.8%      0
 ```
 
 ---
@@ -997,17 +1213,68 @@ Replication: async, factor=2
 Cluster management.
 
 ```bash
-# Cluster status
+# ── Status ──
+
 ephpm cluster status
+ephpm cluster status --node 10.0.1.1:9090
 
-# Force a node to leave
+# ── Membership ──
+
+# Force a node to leave (for maintenance — triggers key rebalancing)
 ephpm cluster leave --node 10.0.1.3:7946
+ephpm cluster leave --node 10.0.1.3:7946 --yes   # skip confirmation
 
-# Show hash ring
+# ── Hash Ring ──
+
+# Show hash ring layout
 ephpm cluster ring
+ephpm cluster ring --verbose                       # show all vnodes
 
-# Show replication status
+# ── Replication ──
+
+# Show replication status per key range
 ephpm cluster replication
+ephpm cluster replication --behind                 # only show ranges with lag
+
+# ── Gossip ──
+
+# Show gossip protocol state
+ephpm cluster gossip
+```
+
+```
+$ ephpm cluster status
+Cluster: ephpm-cluster (3 nodes)
+State:   healthy
+Secret:  configured ✓
+mTLS:    auto-generated certs, fingerprint pinning
+
+NODE            ROLE      STATUS    UPTIME     LOAD    VERSION
+10.0.1.1:7946   member    healthy   3d 14h     45%     0.1.0
+10.0.1.2:7946   member    healthy   3d 14h     38%     0.1.0
+10.0.1.3:7946   leader    healthy   3d 14h     42%     0.1.0
+
+ACME leader: 10.0.1.3:7946 (heartbeat 12s ago)
+Certs managed: 2 (example.com, www.example.com)
+Next renewal: 23d
+
+$ ephpm cluster ring
+RANGE           OWNER           REPLICA 1       REPLICA 2
+0x0000-0x0A3F   10.0.1.1:7946   10.0.1.2:7946   10.0.1.3:7946
+0x0A40-0x1B2C   10.0.1.3:7946   10.0.1.1:7946   10.0.1.2:7946
+0x1B2D-0x2E47   10.0.1.2:7946   10.0.1.3:7946   10.0.1.1:7946
+...
+450 vnodes (150 per node), 3x replication
+
+$ ephpm cluster gossip
+NODE            GEN    LAST SEEN    RTT      STATE
+10.0.1.1:7946   127    0.2ms ago    0.8ms    alive
+10.0.1.2:7946   124    1.1ms ago    1.2ms    alive
+10.0.1.3:7946   131    0.4ms ago    0.6ms    alive
+
+Protocol: SWIM (chitchat)
+Gossip interval: 200ms
+Failure detection: 5 missed heartbeats (1s)
 ```
 
 ---
@@ -1199,9 +1466,33 @@ ephpm test           Run tests with embedded SQLite (start, test, teardown)
 
 ephpm status         Quick overview of a running node
 ephpm workers        PHP worker pool details + restart
-ephpm db             DB proxy: pool stats, query digests, slow queries
-ephpm kv             KV store: stats, get/set/del, cluster membership
-ephpm cluster        Cluster management: status, ring, replication
+ephpm db status      DB proxy pool status (active/idle connections, lag)
+ephpm db digests     Top query digests (sort by count/time, filter by type)
+ephpm db digest ID   Detail for a specific query digest
+ephpm db slow        Slow query log with optional EXPLAIN output
+ephpm db pool        Connection pool details per backend
+ephpm db pool drain  Drain connections for maintenance
+ephpm db query SQL   Run a query through the proxy (dev/debug only)
+
+ephpm kv stats       KV store memory, keys, hit rate, evictions
+ephpm kv get KEY     Get a key (value, TTL, owner node, size)
+ephpm kv set K V     Set a key with optional --ttl
+ephpm kv del KEY     Delete a key (or --pattern for glob match)
+ephpm kv keys PAT    Scan keys by pattern (cursor-based, safe)
+ephpm kv count PAT   Count keys matching a pattern
+ephpm kv types       Key type breakdown (string/hash counts + memory)
+ephpm kv owner KEY   Show which node owns a key + its replicas
+ephpm kv hgetall K   Show all fields of a hash key
+ephpm kv flush       Flush keys (all or by --pattern, requires confirm)
+ephpm kv export PAT  Export keys to JSON or Redis format
+ephpm kv import      Import keys from JSON
+ephpm kv cluster     Cluster membership, per-node key distribution
+
+ephpm cluster status   Cluster health, nodes, ACME leader, mTLS status
+ephpm cluster ring     Hash ring layout (owners + replicas per range)
+ephpm cluster leave    Force a node to leave (triggers rebalancing)
+ephpm cluster replication  Replication status per key range
+ephpm cluster gossip   Gossip protocol state (generations, RTT, liveness)
 ephpm traces         View/filter/tail distributed traces
 
 ephpm version        Version, build info, embedded PHP version
