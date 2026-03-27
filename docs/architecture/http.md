@@ -153,6 +153,32 @@ PHP must be initialized **before** the tokio runtime to avoid signal conflicts:
 - Gzip compression for compressible content types above minimum size
 - `Cache-Control` header when configured
 
+## TLS
+
+Manual TLS via `rustls` (pure Rust, no OpenSSL dependency). Certificate and key loaded from PEM files at startup.
+
+### Modes
+
+| Config | Behavior |
+|--------|----------|
+| No `[server.tls]` | Plain HTTP on `server.listen` (default) |
+| `tls.cert` + `tls.key` only | HTTPS on `server.listen`, no HTTP listener |
+| `tls.cert` + `tls.key` + `tls.listen` | HTTPS on `tls.listen`, HTTP on `server.listen` |
+| + `tls.redirect_http = true` | HTTP listener sends 301 redirects to HTTPS |
+
+### Connection Flow (TLS)
+
+```
+TCP Accept → TLS Handshake (tokio-rustls) → HTTP/1.1 Parse → Router
+                  ↓ timeout
+         header_read_timeout
+```
+
+- TLS handshake timeout reuses `server.timeouts.header_read` (default 30s)
+- ALPN negotiated to `http/1.1` only
+- `is_tls` flag propagated to router so `$_SERVER['HTTPS']` is set correctly
+- When behind a trusted proxy, `X-Forwarded-Proto` takes precedence over native TLS status
+
 ## Compression
 
 Applied to both PHP and static responses when the client sends `Accept-Encoding: gzip`.
@@ -226,6 +252,10 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.security.allowed_php_paths` | string[] | `[]` | PHP execution allowlist |
 | `server.logging.level` | string | `"info"` | Log level (trace/debug/info/warn/error) |
 | `server.logging.access` | string | `""` | Access log file path |
+| `server.tls.cert` | path | — | PEM certificate chain file (enables HTTPS) |
+| `server.tls.key` | path | — | PEM private key file |
+| `server.tls.listen` | string | — | Separate HTTPS listen address |
+| `server.tls.redirect_http` | bool | `false` | 301 redirect HTTP to HTTPS |
 | `php.max_execution_time` | int | `30` | PHP per-request timeout (seconds) |
 | `php.memory_limit` | string | `"128M"` | PHP memory limit |
 | `php.ini_overrides` | [string, string][] | `[]` | INI directive overrides |
@@ -255,8 +285,7 @@ EPHPM_PHP__MEMORY_LIMIT=256M
 
 | Config | Description | Priority |
 |--------|-------------|----------|
-| `tls.cert` / `tls.key` | Manual TLS certificate | High |
-| `tls.auto` | ACME / Let's Encrypt auto-provisioning | High |
+| `server.tls.auto` | ACME / Let's Encrypt auto-provisioning | High |
 | `server.static.etag` | ETag headers + 304 Not Modified support | Medium |
 | `server.static.expires` | Per-extension cache lifetimes | Medium |
 | `server.response.headers` | Custom response headers (CORS, CSP, HSTS) | Medium |

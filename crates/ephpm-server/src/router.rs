@@ -107,8 +107,13 @@ impl Router {
         &self,
         req: Request<Incoming>,
         remote_addr: SocketAddr,
+        is_tls: bool,
     ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        match tokio::time::timeout(self.request_timeout, self.handle_inner(req, remote_addr)).await
+        match tokio::time::timeout(
+            self.request_timeout,
+            self.handle_inner(req, remote_addr, is_tls),
+        )
+        .await
         {
             Ok(result) => result,
             Err(_) => Ok(error_response(StatusCode::GATEWAY_TIMEOUT, "504 Gateway Timeout")),
@@ -120,6 +125,7 @@ impl Router {
         &self,
         req: Request<Incoming>,
         remote_addr: SocketAddr,
+        is_tls: bool,
     ) -> Result<Response<Full<Bytes>>, hyper::Error> {
         let uri_path = req.uri().path().to_string();
         let query_string = req.uri().query().unwrap_or("").to_string();
@@ -135,7 +141,7 @@ impl Router {
         }
 
         // Resolve real client IP and HTTPS status from trusted proxy headers
-        let (effective_addr, is_https) = self.resolve_proxy_info(&req, remote_addr);
+        let (effective_addr, is_https) = self.resolve_proxy_info(&req, remote_addr, is_tls);
 
         let accepts_gzip = self.compression.enabled && accepts_encoding(&req, "gzip");
 
@@ -326,9 +332,10 @@ impl Router {
         &self,
         req: &Request<Incoming>,
         remote_addr: SocketAddr,
+        is_tls: bool,
     ) -> (SocketAddr, bool) {
         if self.trusted_proxies.is_empty() || !self.is_trusted_proxy(remote_addr.ip()) {
-            return (remote_addr, false);
+            return (remote_addr, is_tls);
         }
 
         let real_ip = req
@@ -342,7 +349,7 @@ impl Router {
             .headers()
             .get("x-forwarded-proto")
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|proto| proto.eq_ignore_ascii_case("https"));
+            .map_or(is_tls, |proto| proto.eq_ignore_ascii_case("https"));
 
         (SocketAddr::new(real_ip, remote_addr.port()), is_https)
     }

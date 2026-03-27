@@ -71,6 +71,10 @@ pub struct ServerConfig {
     /// Logging settings.
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    /// TLS configuration. When present, enables HTTPS.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
 }
 
 /// Request limits configuration (`[server.request]`).
@@ -213,6 +217,33 @@ pub struct LoggingConfig {
     pub level: String,
 }
 
+/// TLS configuration (`[server.tls]`).
+///
+/// When present, the server listens for HTTPS connections using the
+/// provided certificate and private key files.
+#[derive(Debug, Deserialize, Clone)]
+pub struct TlsConfig {
+    /// Path to the PEM-encoded certificate chain file.
+    pub cert: PathBuf,
+
+    /// Path to the PEM-encoded private key file.
+    pub key: PathBuf,
+
+    /// Optional separate listen address for HTTPS (e.g. `"0.0.0.0:443"`).
+    ///
+    /// When set, `server.listen` serves HTTP and this address serves HTTPS.
+    /// When omitted, `server.listen` serves HTTPS directly (no HTTP listener).
+    #[serde(default)]
+    pub listen: Option<String>,
+
+    /// When `true` and `listen` is set, the HTTP listener redirects
+    /// all requests to HTTPS with a 301 Moved Permanently response.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub redirect_http: bool,
+}
+
 /// PHP runtime configuration.
 #[derive(Debug, Deserialize)]
 pub struct PhpConfig {
@@ -273,6 +304,7 @@ impl Default for ServerConfig {
             static_files: StaticConfig::default(),
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
+            tls: None,
         }
     }
 }

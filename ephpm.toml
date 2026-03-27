@@ -51,8 +51,13 @@ ini_overrides = [
 # workers = 4                     # number of worker processes
 # worker_script = "vendor/ephpm/worker.php"  # worker loop script
 
+# [server.tls]
+# cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
+# key = "/etc/letsencrypt/live/example.com/privkey.pem"
+# listen = "0.0.0.0:443"    # separate HTTPS port (omit to make server.listen HTTPS-only)
+# redirect_http = true       # 301 redirect HTTP → HTTPS (requires tls.listen)
+
 # Future sections (not in MVP):
-# [tls]
 # [db_proxy]
 # [kv]
 # [observability]
