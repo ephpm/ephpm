@@ -27,6 +27,11 @@ use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 /// Listens on the configured address and routes requests to either
 /// PHP execution or static file serving based on the request path.
 ///
+/// Also starts background services:
+/// - KV store with optional RESP protocol server
+/// - MySQL connection proxy (if configured)
+/// - PostgreSQL connection proxy (if configured)
+///
 /// When `[server.tls]` is configured, the server terminates TLS using
 /// either manual cert/key files or automatic ACME provisioning.
 ///
@@ -34,6 +39,10 @@ use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 ///
 /// Returns an error if the listen address is invalid or binding fails.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
+    // Start background services.
+    let _kv_handle = start_kv_service(&config)?;
+    let _db_handles = start_db_proxies(&config).await?;
+
     let listeners = bind_listeners(&config).await?;
     accept_loop(listeners).await
 }
@@ -454,4 +463,111 @@ async fn serve_http_redirect(stream: TcpStream, remote_addr: SocketAddr, setting
 /// Wait for a shutdown signal (Ctrl+C).
 async fn shutdown_signal() {
     signal::ctrl_c().await.expect("failed to install ctrl+c handler");
+}
+
+/// Start the KV store with optional RESP server.
+fn start_kv_service(config: &Config) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    // Create the KV store
+    let store_config = ephpm_kv::store::StoreConfig {
+        memory_limit: parse_memory_size(&config.kv.memory_limit)?,
+        eviction_policy: ephpm_kv::store::EvictionPolicy::from_str_lossy(&config.kv.eviction_policy),
+    };
+    let store = ephpm_kv::store::Store::new(store_config);
+
+    if !config.kv.redis_compat.enabled {
+        tracing::debug!("KV store initialized (RESP server disabled)");
+        return Ok(None);
+    }
+
+    // Start RESP server if enabled
+    let listen = config.kv.redis_compat.listen.clone();
+    let server_config = ephpm_kv::server::ServerConfig {
+        listen,
+        ..Default::default()
+    };
+
+    let store_for_server = store;
+    let handle = tokio::spawn(async move {
+        match ephpm_kv::server::run(store_for_server, server_config).await {
+            Ok(()) => tracing::info!("KV RESP server stopped"),
+            Err(e) => tracing::error!("KV RESP server error: {e:#}"),
+        }
+    });
+
+    Ok(Some(handle))
+}
+
+/// Start database proxies (MySQL, PostgreSQL).
+async fn start_db_proxies(config: &Config) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+    let mut handles = vec![];
+
+    // MySQL proxy
+    if let Some(mysql_config) = &config.db.mysql {
+        let url = mysql_config.url.clone();
+        let listen = mysql_config
+            .listen
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1:3306".to_string());
+
+        let pool_config = ephpm_db::pool::PoolConfig {
+            min_connections: mysql_config.min_connections,
+            max_connections: mysql_config.max_connections,
+            idle_timeout: parse_duration(&mysql_config.idle_timeout)?,
+            max_lifetime: parse_duration(&mysql_config.max_lifetime)?,
+            pool_timeout: parse_duration(&mysql_config.pool_timeout)?,
+            health_check_interval: parse_duration(&mysql_config.health_check_interval)?,
+        };
+
+        let reset_strategy = ephpm_db::mysql::ResetStrategy::Always;
+
+        match ephpm_db::mysql::build_proxy(&url, &listen, pool_config, reset_strategy).await {
+            Ok(proxy) => {
+                let maintenance_handle = proxy.start_maintenance();
+                let proxy_handle = tokio::spawn(async move {
+                    match proxy.run().await {
+                        Ok(()) => tracing::info!("MySQL proxy stopped"),
+                        Err(e) => tracing::error!("MySQL proxy error: {e:#}"),
+                    }
+                });
+                handles.push(proxy_handle);
+                // Keep maintenance task alive by spawning separately
+                let _ = maintenance_handle;
+            }
+            Err(e) => {
+                tracing::error!("failed to start MySQL proxy: {e:#}");
+            }
+        }
+    }
+
+    // PostgreSQL proxy (placeholder for now)
+    if config.db.postgres.is_some() {
+        tracing::info!("PostgreSQL proxy not yet implemented");
+    }
+
+    Ok(handles)
+}
+
+/// Parse a memory size string (e.g. "256MB", "1GB") to bytes.
+fn parse_memory_size(s: &str) -> anyhow::Result<usize> {
+    let s = s.trim().to_uppercase();
+
+    let (num_str, multiplier) = if s.ends_with("MB") {
+        (&s[..s.len() - 2], 1024 * 1024)
+    } else if s.ends_with("GB") {
+        (&s[..s.len() - 2], 1024 * 1024 * 1024)
+    } else if s.ends_with("KB") {
+        (&s[..s.len() - 2], 1024)
+    } else {
+        (s.as_str(), 1)
+    };
+
+    let num: usize = num_str.trim().parse()
+        .with_context(|| format!("invalid memory size: {s}"))?;
+    Ok(num.saturating_mul(multiplier))
+}
+
+/// Parse a duration string (e.g. "30s", "5m", "1h") to std::time::Duration.
+fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
+    ephpm_db::duration::parse_duration(s)
+        .map_err(|e| anyhow::anyhow!("{}", e))
 }

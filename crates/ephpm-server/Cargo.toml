@@ -9,6 +9,8 @@ description = "HTTP server for ePHPm"
 
 [dependencies]
 ephpm-config.workspace = true
+ephpm-db.workspace = true
+ephpm-kv.workspace = true
 ephpm-php.workspace = true
 tokio.workspace = true
 hyper.workspace = true

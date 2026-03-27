@@ -17,6 +17,10 @@ pub struct Config {
     pub server: ServerConfig,
     #[serde(default)]
     pub php: PhpConfig,
+    #[serde(default)]
+    pub db: DbConfig,
+    #[serde(default)]
+    pub kv: KvConfig,
 }
 
 /// HTTP server configuration.
@@ -332,6 +336,232 @@ impl TlsConfig {
     }
 }
 
+/// Top-level database proxy configuration (`[db]`).
+///
+/// When present, ePHPm starts a transparent SQL proxy between PHP and the
+/// real database. PHP connects to `127.0.0.1:3306` (or the configured
+/// `listen` address) — it never talks to the database directly.
+#[derive(Debug, Default, Deserialize)]
+pub struct DbConfig {
+    /// MySQL proxy configuration.
+    #[serde(default)]
+    pub mysql: Option<DbBackendConfig>,
+
+    /// PostgreSQL proxy configuration.
+    #[serde(default)]
+    pub postgres: Option<DbBackendConfig>,
+
+    /// Read/write splitting settings (requires replicas on at least one backend).
+    #[serde(default)]
+    pub read_write_split: ReadWriteSplitConfig,
+}
+
+/// Configuration for a single database backend (MySQL or PostgreSQL).
+#[derive(Debug, Deserialize, Clone)]
+pub struct DbBackendConfig {
+    /// Primary database URL.
+    ///
+    /// Format: `mysql://user:pass@host:port/dbname` or
+    /// `postgres://user:pass@host:port/dbname`.
+    pub url: String,
+
+    /// TCP address for the proxy to listen on.
+    ///
+    /// PHP connects here. Default: `"127.0.0.1:3306"` for MySQL,
+    /// `"127.0.0.1:5432"` for PostgreSQL.
+    #[serde(default)]
+    pub listen: Option<String>,
+
+    /// Unix socket path for the proxy listener (faster than TCP for local PHP).
+    ///
+    /// When set, the proxy also listens on this socket in addition to `listen`.
+    #[serde(default)]
+    pub socket: Option<std::path::PathBuf>,
+
+    /// Minimum number of backend connections to keep open (warm pool).
+    ///
+    /// Default: `2`.
+    #[serde(default = "default_min_connections")]
+    pub min_connections: u32,
+
+    /// Maximum total backend connections (in-use + idle).
+    ///
+    /// PHP requests that arrive when all connections are busy will wait up
+    /// to `pool_timeout` before receiving a connection error.
+    ///
+    /// Default: `20`.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+
+    /// Duration string for closing idle backend connections.
+    ///
+    /// Default: `"300s"`.
+    #[serde(default = "default_idle_timeout")]
+    pub idle_timeout: String,
+
+    /// Duration string for maximum backend connection lifetime.
+    ///
+    /// Connections older than this are closed and replaced to prevent stale
+    /// state from accumulating on the database server.
+    ///
+    /// Default: `"1800s"`.
+    #[serde(default = "default_max_lifetime")]
+    pub max_lifetime: String,
+
+    /// Duration string to wait for an available connection before failing.
+    ///
+    /// Default: `"5s"`.
+    #[serde(default = "default_pool_timeout")]
+    pub pool_timeout: String,
+
+    /// Duration string between backend connection health checks.
+    ///
+    /// Default: `"30s"`.
+    #[serde(default = "default_health_check_interval")]
+    pub health_check_interval: String,
+
+    /// When `true`, inject `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`,
+    /// `DB_PASSWORD`, and `DATABASE_URL` environment variables into PHP
+    /// pointing at the proxy listener. Framework auto-detection
+    /// (Laravel, Symfony, WordPress) picks these up automatically.
+    ///
+    /// Default: `true`.
+    #[serde(default = "default_inject_env")]
+    pub inject_env: bool,
+
+    /// Connection reset strategy when returning a connection to the pool.
+    ///
+    /// - `"smart"` — reset only after non-SELECT statements (MySQL:
+    ///   `COM_RESET_CONNECTION`; PostgreSQL: `DISCARD ALL`). Best balance.
+    /// - `"always"` — always reset on return. Safest, slight overhead.
+    /// - `"never"` — skip reset. Fastest, but session state leaks between
+    ///   PHP requests. Use only in trusted environments.
+    ///
+    /// Default: `"smart"`.
+    #[serde(default = "default_reset_strategy")]
+    pub reset_strategy: String,
+
+    /// Read replica configuration.
+    #[serde(default)]
+    pub replicas: Option<ReplicasConfig>,
+}
+
+/// Read replica configuration for a database backend.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ReplicasConfig {
+    /// Replica database URLs. Reads are distributed across these;
+    /// writes always go to the primary.
+    pub urls: Vec<String>,
+}
+
+/// Read/write splitting configuration (`[db.read_write_split]`).
+#[derive(Debug, Deserialize)]
+pub struct ReadWriteSplitConfig {
+    /// Enable read/write splitting. Requires at least one backend with replicas.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Load balancing strategy for reads.
+    ///
+    /// - `"sticky-after-write"` — after a write, reads stay on the primary
+    ///   for `sticky_duration` to avoid read-your-writes inconsistency.
+    /// - `"lag-aware"` — skip replicas whose replication lag exceeds
+    ///   `max_replica_lag`.
+    ///
+    /// Default: `"sticky-after-write"`.
+    #[serde(default = "default_rw_strategy")]
+    pub strategy: String,
+
+    /// Duration string: after a write, how long reads stick to the primary.
+    ///
+    /// Default: `"2s"`.
+    #[serde(default = "default_sticky_duration")]
+    pub sticky_duration: String,
+
+    /// Duration string: maximum acceptable replication lag (lag-aware strategy).
+    ///
+    /// Default: `"500ms"`.
+    #[serde(default = "default_max_replica_lag")]
+    pub max_replica_lag: String,
+}
+
+impl Default for ReadWriteSplitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strategy: default_rw_strategy(),
+            sticky_duration: default_sticky_duration(),
+            max_replica_lag: default_max_replica_lag(),
+        }
+    }
+}
+
+/// KV store configuration (`[kv]`).
+#[derive(Debug, Deserialize)]
+pub struct KvConfig {
+    /// Maximum memory in bytes for the KV store. Supports suffixes:
+    /// plain number (bytes), or human-readable like `"256MB"`.
+    ///
+    /// Default: `"256MB"`.
+    #[serde(default = "default_kv_memory_limit")]
+    pub memory_limit: String,
+
+    /// Eviction policy when the memory limit is reached.
+    ///
+    /// Values: `"noeviction"`, `"allkeys-lru"`, `"volatile-lru"`, `"allkeys-random"`.
+    ///
+    /// Default: `"allkeys-lru"`.
+    #[serde(default = "default_kv_eviction_policy")]
+    pub eviction_policy: String,
+
+    /// Redis-compatible RESP protocol listener.
+    #[serde(default)]
+    pub redis_compat: KvRedisCompatConfig,
+}
+
+impl Default for KvConfig {
+    fn default() -> Self {
+        Self {
+            memory_limit: default_kv_memory_limit(),
+            eviction_policy: default_kv_eviction_policy(),
+            redis_compat: KvRedisCompatConfig::default(),
+        }
+    }
+}
+
+/// RESP protocol listener configuration (`[kv.redis_compat]`).
+#[derive(Debug, Deserialize)]
+pub struct KvRedisCompatConfig {
+    /// Enable the RESP protocol listener. When `false`, the KV store is
+    /// only accessible via the internal API.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// TCP listen address for the RESP listener.
+    ///
+    /// Default: `"127.0.0.1:6379"`.
+    #[serde(default = "default_kv_listen")]
+    pub listen: String,
+
+    /// Optional Unix socket path (faster than TCP for local connections).
+    #[serde(default)]
+    pub socket: Option<String>,
+}
+
+impl Default for KvRedisCompatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: default_kv_listen(),
+            socket: None,
+        }
+    }
+}
+
 /// PHP runtime configuration.
 #[derive(Debug, Deserialize)]
 pub struct PhpConfig {
@@ -532,6 +762,62 @@ fn default_max_execution_time() -> u32 {
 
 fn default_memory_limit() -> String {
     "128M".to_string()
+}
+
+fn default_kv_memory_limit() -> String {
+    "256MB".to_string()
+}
+
+fn default_kv_eviction_policy() -> String {
+    "allkeys-lru".to_string()
+}
+
+fn default_kv_listen() -> String {
+    "127.0.0.1:6379".to_string()
+}
+
+fn default_min_connections() -> u32 {
+    2
+}
+
+fn default_max_connections() -> u32 {
+    20
+}
+
+fn default_idle_timeout() -> String {
+    "300s".to_string()
+}
+
+fn default_max_lifetime() -> String {
+    "1800s".to_string()
+}
+
+fn default_pool_timeout() -> String {
+    "5s".to_string()
+}
+
+fn default_health_check_interval() -> String {
+    "30s".to_string()
+}
+
+fn default_inject_env() -> bool {
+    true
+}
+
+fn default_reset_strategy() -> String {
+    "smart".to_string()
+}
+
+fn default_rw_strategy() -> String {
+    "sticky-after-write".to_string()
+}
+
+fn default_sticky_duration() -> String {
+    "2s".to_string()
+}
+
+fn default_max_replica_lag() -> String {
+    "500ms".to_string()
 }
 
 #[cfg(test)]

@@ -659,6 +659,8 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
         };
         Router::new(&config)
     }
@@ -673,6 +675,8 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
         };
         Router::new(&config)
     }
@@ -854,6 +858,8 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
         };
         config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
         let router = Router::new(&config);
@@ -873,6 +879,8 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
         };
         config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
         let router = Router::new(&config);
@@ -894,6 +902,8 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
         };
         let router = Router::new(&config);
         assert_eq!(router.server_port, 3000);
@@ -909,6 +919,8 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
         };
         let router = Router::new(&config);
         assert_eq!(router.server_port, 8080);
@@ -949,6 +961,8 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
         };
         let router = Router::new(&config);
         assert!(router.is_php_allowed("/anything.php"));
@@ -963,6 +977,8 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
         };
         config.server.security.allowed_php_paths = vec![
             "/index.php".to_string(),
@@ -983,6 +999,8 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
         };
         config.server.security.allowed_php_paths = vec![
             "/index.php".to_string(),

@@ -1,0 +1,25 @@
+[package]
+name = "ephpm-kv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Embedded KV store with RESP protocol for ePHPm"
+
+[dependencies]
+ephpm-config.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

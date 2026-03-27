@@ -73,7 +73,112 @@ ini_overrides = [
 # listen = "0.0.0.0:443"          # separate HTTPS port (omit to make server.listen HTTPS-only)
 # redirect_http = true             # 301 redirect HTTP → HTTPS (requires tls.listen)
 
-# Future sections (not in MVP):
-# [db_proxy]
+# ──────────────────────────────────────────────────────────
+# Database Proxy & Connection Pooling (planned)
+# ──────────────────────────────────────────────────────────
+#
+# ePHPm sits between PHP and your database, pooling connections
+# so 200 PHP requests share 20 backend connections instead of
+# each opening their own. PHP connects to 127.0.0.1:3306 (or
+# the unix socket) — it doesn't know it's talking to a proxy.
+#
+# Configure your real database here. When inject_env = true,
+# ePHPm auto-sets DB_HOST, DB_PORT, DATABASE_URL, etc. so
+# Laravel/Symfony/WordPress pick up the proxy automatically.
+
+# --- MySQL ---
+#
+# [db.mysql]
+# url = "mysql://appuser:secret@db-primary:3306/myapp"
+# listen = "127.0.0.1:3306"           # proxy listens here (PHP connects to this)
+# socket = "/run/ephpm/mysql.sock"    # unix socket (faster, optional)
+# min_connections = 5                  # keep at least this many backend connections open
+# max_connections = 50                 # never open more than this to the real DB
+# idle_timeout = "300s"                # close idle backend connections after this
+# max_lifetime = "1800s"               # max age of a backend connection (prevents stale)
+# pool_timeout = "5s"                  # how long PHP waits if all connections are busy
+# health_check_interval = "30s"        # ping backend connections to detect failures
+# inject_env = true                    # auto-set DB_HOST, DB_PORT, DATABASE_URL for PHP
+# reset_strategy = "smart"             # smart (reset only if dirty), always, or never
+#
+# # Read replicas — SELECTs route here, writes go to primary
+# [db.mysql.replicas]
+# urls = [
+#     "mysql://appuser:secret@db-replica-1:3306/myapp",
+#     "mysql://appuser:secret@db-replica-2:3306/myapp",
+# ]
+
+# --- PostgreSQL ---
+#
+# [db.postgres]
+# url = "postgres://appuser:secret@pg-primary:5432/myapp"
+# listen = "127.0.0.1:5432"
+# socket = "/run/ephpm/pgsql.sock"
+# min_connections = 5
+# max_connections = 30
+# idle_timeout = "300s"
+# max_lifetime = "1800s"
+# pool_timeout = "5s"
+# health_check_interval = "30s"
+# inject_env = true
+# reset_strategy = "smart"
+#
+# [db.postgres.replicas]
+# urls = [
+#     "postgres://appuser:secret@pg-replica-1:5432/myapp",
+# ]
+
+# --- Read/Write Splitting ---
+#
+# [db.read_write_split]
+# enabled = false                      # requires replicas configured above
+# strategy = "sticky-after-write"      # or "lag-aware"
+# sticky_duration = "2s"               # after a write, reads stick to primary for this long
+# max_replica_lag = "500ms"            # for lag-aware: skip replicas lagging more than this
+
+# --- Query Analysis ---
+#
+# [db.analysis]
+# slow_query_threshold = "100ms"       # queries slower than this are captured
+# auto_explain = true                  # run EXPLAIN on slow queries
+# auto_explain_target = "replica"      # don't hit primary with EXPLAINs
+# digest_store_max_entries = 10000     # max unique query fingerprints to track
+
+# ──────────────────────────────────────────────────────────
+# KV Store (planned)
+# ──────────────────────────────────────────────────────────
+#
 # [kv]
+# memory_limit = "256MB"
+# eviction_policy = "allkeys-lru"      # noeviction, allkeys-lru, volatile-lru, allkeys-random
+#
+# [kv.redis_compat]
+# enabled = false                      # RESP protocol listener (existing Redis clients work)
+# listen = "127.0.0.1:6379"           # TCP (zero-config for existing apps)
+# socket = "/run/ephpm/redis.sock"    # Unix socket (faster, optional)
+
+# ──────────────────────────────────────────────────────────
+# Clustering (planned)
+# ──────────────────────────────────────────────────────────
+#
+# [cluster]
+# enabled = false
+# bind = "0.0.0.0:7946"               # gossip listen address
+# join = ["10.0.1.2:7946"]            # seed nodes (or k8s headless service DNS)
+# secret = ""                          # base64-encoded 32-byte key (encrypts gossip)
+#
+# [cluster.kv]
+# replication_factor = 2               # copies on N additional nodes
+# replication_mode = "async"           # async or sync
+
+# ──────────────────────────────────────────────────────────
+# Observability (planned)
+# ──────────────────────────────────────────────────────────
+#
 # [observability]
+# admin_ui = true
+# prometheus = true
+#
+# [observability.otlp_export]
+# endpoint = "jaeger:4317"
+# protocol = "grpc"

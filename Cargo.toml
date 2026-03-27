@@ -37,9 +37,17 @@ tokio-stream = "0.1"
 tempfile = "3"
 temp-env = "0.3"
 serial_test = "3"
+dashmap = "6"
+parking_lot = "0.12"
+tokio-util = { version = "0.7", features = ["rt"] }
+bytes = "1"
+sha1 = "0.10"
+sha2 = "0.10"
 
 # Internal crates
 ephpm-config = { path = "crates/ephpm-config" }
+ephpm-db = { path = "crates/ephpm-db" }
+ephpm-kv = { path = "crates/ephpm-kv" }
 ephpm-php = { path = "crates/ephpm-php" }
 ephpm-server = { path = "crates/ephpm-server" }
 
