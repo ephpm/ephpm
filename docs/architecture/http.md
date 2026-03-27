@@ -152,6 +152,40 @@ PHP must be initialized **before** the tokio runtime to avoid signal conflicts:
 - Path traversal protection via `canonicalize()` + prefix check
 - Gzip compression for compressible content types above minimum size
 - `Cache-Control` header when configured
+- `ETag` generation (weak, hash-based) + `If-None-Match` → 304 Not Modified
+
+## PHP Response Cache (Phase 2 — requires KV store)
+
+The static file `ETag` support only covers non-PHP assets. PHP frameworks (WordPress, Laravel) generate their own `ETag` headers for dynamic content, but every request still hits PHP to compute whether the content changed. With the clustered KV store, we can intercept PHP-generated ETags and short-circuit repeat requests across all nodes without executing PHP at all.
+
+### Flow
+
+```
+1. First request: /blog/hello
+   → PHP executes, returns response with ETag: "abc123"
+   → Server stores in KV: cache:<url_key> → { etag: "abc123", headers, body }
+   → Response sent to client
+
+2. Repeat request: /blog/hello + If-None-Match: "abc123"
+   → Server checks KV for cache:<url_key>
+   → ETag matches → return 304 Not Modified immediately
+   → No PHP execution, no mutex contention
+
+3. Works across all nodes via gossip replication
+```
+
+### Design Decisions
+
+| Decision | Options | Notes |
+|----------|---------|-------|
+| **Cache key** | URL alone vs URL + vary headers (cookies, auth) | Must not serve cached authenticated pages to anonymous users. WordPress sets different cookies for logged-in users — key should include a cookie-based cache group or skip caching entirely when auth cookies are present. |
+| **Invalidation** | TTL, purge header, PHP hook | TTL is simplest. A `X-Ephpm-Cache-Purge` response header from PHP could signal immediate invalidation. For WordPress, a must-use plugin could call a purge endpoint on content updates. |
+| **Storage scope** | ETag-only (304s) vs full response (edge cache) | ETag-only saves KV space but still requires PHP on cache miss. Full response storage turns ephpm into an edge cache — much bigger win but needs memory/eviction policy. Start with full response. |
+| **Cache bypass** | `Cache-Control: no-cache`, `no-store`, `private` | Respect standard HTTP cache directives from PHP. Never cache responses with `Set-Cookie` or `private`. |
+
+### Impact
+
+This is a significant performance multiplier for PHP applications. Most WordPress page views are anonymous and return identical content. Skipping PHP entirely for repeat visitors eliminates the single-threaded PHP mutex bottleneck and lets the async HTTP server handle cached responses at full throughput across all nodes.
 
 ## TLS
 
@@ -277,8 +311,11 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.response.compression` | bool | `true` | Enable gzip compression |
 | `server.response.compression_level` | int | `1` | Gzip level (1-9) |
 | `server.response.compression_min_size` | int | `1024` | Min bytes to compress |
+| `server.response.headers` | [string, string][] | `[]` | Custom response headers (CORS, CSP, HSTS) |
 | `server.static.cache_control` | string | `""` | Cache-Control header for static files |
 | `server.static.hidden_files` | string | `"deny"` | Dotfile handling: deny, ignore, allow |
+| `server.static.etag` | bool | `true` | `ETag` headers + 304 Not Modified support |
+| `server.request.trusted_hosts` | string[] | `[]` | Host header validation (421 if no match) |
 | `server.security.trusted_proxies` | string[] | `[]` | CIDR ranges for proxy trust |
 | `server.security.blocked_paths` | string[] | `[]` | Glob patterns to block (403) |
 | `server.security.allowed_php_paths` | string[] | `[]` | PHP execution allowlist |
@@ -321,14 +358,17 @@ EPHPM_PHP__MEMORY_LIMIT=256M
 
 | Config | Description | Priority |
 |--------|-------------|----------|
-| `server.static.etag` | ETag headers + 304 Not Modified support | Medium |
-| `server.static.expires` | Per-extension cache lifetimes | Medium |
-| `server.response.headers` | Custom response headers (CORS, CSP, HSTS) | Medium |
-| `server.request.trusted_hosts` | Host header validation | Medium |
-| `php.env` | Environment variables passed to PHP | Medium |
-| `php.disable_functions` | Shortcut for INI directive | Low |
-| `php.error_log` | Separate PHP error log path | Low |
+| `server.graceful_shutdown_timeout` | How long to wait for in-flight requests on SIGTERM | Medium |
+| `server.static.expires` | Per-extension cache lifetimes (e.g., images 1yr, CSS 1wk) | Medium |
+| `server.static.index_fallback` | Serve `index.html` for SPA routes (distinct from PHP fallback) | Medium |
+| `server.response.server_header` | Custom or disabled `Server:` header (fingerprinting prevention) | Low |
+| `server.request.max_uri_length` | Reject abnormally long URIs (defense in depth) | Low |
+| `server.worker_threads` | Tokio worker thread count (auto-detect by default) | Low |
+| `server.security.rate_limit` | Basic per-IP rate limiting | Low |
+| `server.metrics.enabled` | Prometheus metrics endpoint | Medium |
+| `server.rewrites` | Regex-based URL rewriting | Low |
 | `server.logging.format` | Text vs JSON structured logging | Low |
 | `server.logging.access_format` | Common/combined access log format | Low |
-| `server.metrics.enabled` | Prometheus metrics endpoint | Low |
-| `server.rewrites` | Regex-based URL rewriting | Low |
+| `php.env` | Environment variables passed to PHP (12-factor app support) | Medium |
+| `php.disable_functions` | Shortcut for INI directive | Low |
+| `php.error_log` | Separate PHP error log path | Low |
