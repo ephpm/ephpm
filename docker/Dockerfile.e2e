@@ -5,9 +5,9 @@
 # Build:
 #   podman build -f docker/Dockerfile.e2e -t ephpm-e2e:dev .
 
-# ── Stage 1: Build test binary ───────────────────────────────────────────────
+# ── Stage 1: Build and run tests ─────────────────────────────────────────────
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.85-bookworm
 
 WORKDIR /src
 
@@ -16,19 +16,8 @@ COPY crates/ephpm-e2e/ crates/ephpm-e2e/
 
 WORKDIR /src/crates/ephpm-e2e
 
-# Build test binaries
-RUN cargo test --no-run --release 2>&1 | tee /tmp/build.log
-
-# Find the test binary
-RUN cp $(find /src/crates/ephpm-e2e/target/release/deps/phpinfo-* -type f -executable | head -1) /phpinfo-tests
-
-# ── Stage 2: Minimal runtime ─────────────────────────────────────────────────
-
-FROM debian:bookworm-slim
-
+# Install dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /phpinfo-tests /usr/local/bin/phpinfo-tests
-
-# Run all tests in the binary
-ENTRYPOINT ["phpinfo-tests"]
+# Run all tests
+ENTRYPOINT ["cargo", "test", "--release", "--", "--test-threads=1", "--nocapture"]
