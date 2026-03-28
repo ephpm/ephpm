@@ -43,6 +43,7 @@ tokio-util = { version = "0.7", features = ["rt"] }
 bytes = "1"
 sha1 = "0.10"
 sha2 = "0.10"
+redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
 
 # Internal crates
 ephpm-config = { path = "crates/ephpm-config" }

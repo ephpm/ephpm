@@ -474,6 +474,9 @@ fn start_kv_service(config: &Config) -> anyhow::Result<Option<tokio::task::JoinH
     };
     let store = ephpm_kv::store::Store::new(store_config);
 
+    // Wire the store into PHP native functions (ephpm_kv_get, etc.)
+    ephpm_php::PhpRuntime::set_kv_store(&store);
+
     if !config.kv.redis_compat.enabled {
         tracing::debug!("KV store initialized (RESP server disabled)");
         return Ok(None);
@@ -486,9 +489,8 @@ fn start_kv_service(config: &Config) -> anyhow::Result<Option<tokio::task::JoinH
         ..Default::default()
     };
 
-    let store_for_server = store;
     let handle = tokio::spawn(async move {
-        match ephpm_kv::server::run(store_for_server, server_config).await {
+        match ephpm_kv::server::run(store, server_config).await {
             Ok(()) => tracing::info!("KV RESP server stopped"),
             Err(e) => tracing::error!("KV RESP server error: {e:#}"),
         }

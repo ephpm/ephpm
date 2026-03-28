@@ -53,9 +53,39 @@ pub async fn run(store: Arc<Store>, config: ServerConfig) -> anyhow::Result<()> 
 
     info!(listen = %config.listen, "KV store RESP server listening");
 
+    let max_buf = config.max_input_buffer;
+    let accept = serve_on(Arc::clone(&store), listener, max_buf);
+
+    tokio::select! {
+        result = accept => result,
+        () = shutdown_signal() => {
+            info!("KV server shutting down");
+            // Brief drain period for in-flight connections.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(())
+        }
+    }
+}
+
+/// Accept connections on an already-bound `listener` until the task is
+/// cancelled.
+///
+/// Unlike [`run`], this does not install a shutdown signal handler — the
+/// caller controls server lifetime by aborting the spawned task. Intended
+/// for use in tests and embedding contexts where the caller manages the
+/// listener socket.
+///
+/// # Errors
+///
+/// Returns an error if an unrecoverable accept failure occurs.
+pub async fn serve_on(
+    store: Arc<Store>,
+    listener: TcpListener,
+    max_input_buffer: usize,
+) -> anyhow::Result<()> {
     // Background expiry reaper — runs every second.
     let expiry_store = Arc::clone(&store);
-    let expiry_handle = tokio::spawn(async move {
+    let _expiry_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
@@ -63,39 +93,25 @@ pub async fn run(store: Arc<Store>, config: ServerConfig) -> anyhow::Result<()> 
         }
     });
 
-    // Accept loop.
-    let max_buf = config.max_input_buffer;
     loop {
-        tokio::select! {
-            result = listener.accept() => {
-                match result {
-                    Ok((stream, addr)) => {
-                        debug!(peer = %addr, "new KV connection");
-                        let conn_store = Arc::clone(&store);
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, &conn_store, max_buf).await {
-                                debug!(peer = %addr, error = %e, "connection closed with error");
-                            }
-                            trace!(peer = %addr, "connection closed");
-                        });
+        match listener.accept().await {
+            Ok((stream, addr)) => {
+                debug!(peer = %addr, "new KV connection");
+                let conn_store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(stream, &conn_store, max_input_buffer).await {
+                        debug!(peer = %addr, error = %e, "connection closed with error");
                     }
-                    Err(e) => {
-                        error!(error = %e, "failed to accept connection");
-                    }
-                }
+                    trace!(peer = %addr, "connection closed");
+                });
             }
-            () = shutdown_signal() => {
-                info!("KV server shutting down");
-                break;
+            Err(e) => {
+                error!(error = %e, "failed to accept connection");
             }
         }
     }
 
-    expiry_handle.abort();
-
-    // Brief drain period for in-flight connections.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
+    #[allow(unreachable_code)]
     Ok(())
 }
 

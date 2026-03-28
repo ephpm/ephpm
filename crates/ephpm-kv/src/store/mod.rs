@@ -35,7 +35,6 @@ impl EvictionPolicy {
     pub fn from_str_lossy(s: &str) -> Self {
         match s {
             "noeviction" => Self::NoEviction,
-            "allkeys-lru" => Self::AllKeysLru,
             "volatile-lru" => Self::VolatileLru,
             "allkeys-random" => Self::AllKeysRandom,
             _ => Self::AllKeysLru,
@@ -317,7 +316,7 @@ impl Store {
         let mut removed = 0;
         let mut keys_to_remove = Vec::new();
 
-        for entry in self.data.iter() {
+        for entry in &self.data {
             if removed >= sample_size {
                 break;
             }
@@ -385,7 +384,7 @@ impl Store {
             let mut oldest: Option<(String, Instant)> = None;
             let mut count = 0;
 
-            for entry in self.data.iter() {
+            for entry in &self.data {
                 if volatile_only && entry.value().expires_at.is_none() {
                     continue;
                 }
@@ -450,20 +449,20 @@ fn parse_int_value(data: &[u8]) -> Result<i64, String> {
 /// Simple glob matching supporting `*` (any chars) and `?` (single char).
 fn glob_match(pattern: &str, text: &str) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
-    let txt: Vec<char> = text.chars().collect();
-    glob_match_inner(&pat, &txt)
+    let chars: Vec<char> = text.chars().collect();
+    glob_match_inner(&pat, &chars)
 }
 
-fn glob_match_inner(pat: &[char], txt: &[char]) -> bool {
-    match (pat.first(), txt.first()) {
+fn glob_match_inner(pat: &[char], chars: &[char]) -> bool {
+    match (pat.first(), chars.first()) {
         (None, None) => true,
         (Some('*'), _) => {
             // '*' matches zero or more characters.
-            glob_match_inner(&pat[1..], txt)
-                || (!txt.is_empty() && glob_match_inner(pat, &txt[1..]))
+            glob_match_inner(&pat[1..], chars)
+                || (!chars.is_empty() && glob_match_inner(pat, &chars[1..]))
         }
-        (Some('?'), Some(_)) => glob_match_inner(&pat[1..], &txt[1..]),
-        (Some(a), Some(b)) if a == b => glob_match_inner(&pat[1..], &txt[1..]),
+        (Some('?'), Some(_)) => glob_match_inner(&pat[1..], &chars[1..]),
+        (Some(a), Some(b)) if a == b => glob_match_inner(&pat[1..], &chars[1..]),
         _ => false,
     }
 }
@@ -521,7 +520,7 @@ mod tests {
         let entry = Entry::with_expiry(
             b"v".to_vec(),
             1,
-            Instant::now() - Duration::from_secs(1),
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
         );
         s.data.insert("k".into(), entry);
         assert_eq!(s.get("k"), None);
@@ -606,7 +605,7 @@ mod tests {
         let entry = Entry::with_expiry(
             b"v".to_vec(),
             1,
-            Instant::now() - Duration::from_secs(1),
+            Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
         );
         s.data.insert("expired".into(), entry);
         s.set("alive".into(), b"v".to_vec(), None);

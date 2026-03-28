@@ -123,7 +123,8 @@ fn parse_bulk(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
         return Ok(Some(Frame::Null));
     }
 
-    let len = len as usize;
+    let len = usize::try_from(len)
+        .map_err(|_| ParseError::Protocol("bulk string length out of range".into()))?;
     let total = after_len_line + len + 2; // data + \r\n
 
     if buf.len() < total {
@@ -150,7 +151,8 @@ fn parse_array(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
         return Ok(Some(Frame::Null));
     }
 
-    let count = count as usize;
+    let count = usize::try_from(count)
+        .map_err(|_| ParseError::Protocol("array count out of range".into()))?;
 
     // We need to speculatively parse sub-frames without consuming `buf`
     // until we know the entire array is complete. Work on a snapshot of

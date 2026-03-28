@@ -13,19 +13,19 @@ ARG PHP_VERSION=8.5
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# System build tools + PHP CLI for static-php-cli
+# System build tools for static-php-cli (spc).
+#
+# The standalone spc binary bundles its own PHP — no system PHP or Composer
+# is needed. `spc doctor --auto-fix` may install additional packages, so we
+# keep apt metadata around (no `rm -rf /var/lib/apt/lists/*`).
+#
+# Key packages:
+#   unzip     — required by spc for extracting downloads
+#   gettext   — provides `autopoint`, checked by spc doctor
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates curl git pkg-config \
-    autoconf automake bison cmake flex gettext libtool make re2c \
-    libclang-dev musl-tools \
-    software-properties-common gpg-agent \
-    && add-apt-repository -y ppa:ondrej/php \
-    && apt-get update && apt-get install -y --no-install-recommends \
-    php8.4-cli php8.4-xml php8.4-mbstring php8.4-curl php8.4-tokenizer \
-    && rm -rf /var/lib/apt/lists/*
-
-# Composer
-RUN curl -sS https://getcomposer.org/installer | php8.4 -- --install-dir=/usr/local/bin --filename=composer
+    build-essential ca-certificates curl git pkg-config sudo \
+    autoconf automake bison cmake flex gettext libtool make re2c unzip \
+    libclang-dev musl-tools
 
 # Rust stable
 ENV RUSTUP_HOME=/usr/local/rustup \

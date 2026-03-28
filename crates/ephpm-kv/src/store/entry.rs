@@ -17,6 +17,7 @@ pub struct Entry {
 
 impl Entry {
     /// Create a new entry with no expiry.
+    #[must_use]
     pub fn new(data: Vec<u8>, key_len: usize) -> Self {
         let mem_size = Self::estimate_size(key_len, data.len());
         Self {
@@ -28,6 +29,7 @@ impl Entry {
     }
 
     /// Create a new entry with an absolute expiry.
+    #[must_use]
     pub fn with_expiry(data: Vec<u8>, key_len: usize, expires_at: Instant) -> Self {
         let mem_size = Self::estimate_size(key_len, data.len());
         Self {

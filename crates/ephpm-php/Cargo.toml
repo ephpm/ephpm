@@ -9,6 +9,7 @@ description = "PHP embedding via libphp FFI for ePHPm"
 build = "build.rs"
 
 [dependencies]
+ephpm-kv.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 http.workspace = true

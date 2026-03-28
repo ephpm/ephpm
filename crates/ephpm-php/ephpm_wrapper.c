@@ -699,6 +699,233 @@ const char *ephpm_get_response_headers(size_t *out_len)
 }
 
 /* ===================================================================
+ * KV store native PHP functions
+ *
+ * These register as ephpm_kv_get(), ephpm_kv_set(), etc. in PHP userland.
+ * They call into Rust via the function pointer table set by
+ * ephpm_set_kv_ops().
+ * =================================================================== */
+
+typedef struct {
+    int  (*get)(const char *key);
+    void (*get_result)(const char **ptr, size_t *len);
+    int  (*set)(const char *key, const char *val, size_t val_len, long long ttl_ms);
+    long (*del)(const char *key);
+    int  (*exists)(const char *key);
+    int  (*incr_by)(const char *key, long long delta, long long *result);
+    int  (*expire)(const char *key, long long ttl_ms);
+    long long (*pttl)(const char *key);
+} EphpmKvOps;
+
+static EphpmKvOps g_kv_ops = {0};
+
+/* ── PHP_FUNCTION implementations ─────────────────────────────── */
+
+PHP_FUNCTION(ephpm_kv_get)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.get) { RETURN_NULL(); }
+    if (!g_kv_ops.get(key)) { RETURN_NULL(); }
+
+    const char *ptr; size_t len;
+    g_kv_ops.get_result(&ptr, &len);
+    RETURN_STRINGL(ptr, len);
+}
+
+PHP_FUNCTION(ephpm_kv_set)
+{
+    char *key; size_t key_len;
+    char *val; size_t val_len;
+    zend_long ttl = 0;
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_STRING(val, val_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(ttl)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.set) { RETURN_FALSE; }
+    long long ttl_ms = ttl > 0 ? ttl * 1000LL : 0;
+    RETURN_BOOL(g_kv_ops.set(key, val, val_len, ttl_ms));
+}
+
+PHP_FUNCTION(ephpm_kv_del)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.del) { RETURN_LONG(0); }
+    RETURN_LONG(g_kv_ops.del(key));
+}
+
+PHP_FUNCTION(ephpm_kv_exists)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.exists) { RETURN_FALSE; }
+    RETURN_BOOL(g_kv_ops.exists(key));
+}
+
+PHP_FUNCTION(ephpm_kv_incr)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.incr_by) { RETURN_FALSE; }
+    long long result = 0;
+    if (!g_kv_ops.incr_by(key, 1, &result)) { RETURN_FALSE; }
+    RETURN_LONG((zend_long)result);
+}
+
+PHP_FUNCTION(ephpm_kv_decr)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.incr_by) { RETURN_FALSE; }
+    long long result = 0;
+    if (!g_kv_ops.incr_by(key, -1, &result)) { RETURN_FALSE; }
+    RETURN_LONG((zend_long)result);
+}
+
+PHP_FUNCTION(ephpm_kv_incr_by)
+{
+    char *key; size_t key_len;
+    zend_long delta;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_LONG(delta)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.incr_by) { RETURN_FALSE; }
+    long long result = 0;
+    if (!g_kv_ops.incr_by(key, (long long)delta, &result)) { RETURN_FALSE; }
+    RETURN_LONG((zend_long)result);
+}
+
+PHP_FUNCTION(ephpm_kv_expire)
+{
+    char *key; size_t key_len;
+    zend_long ttl;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_LONG(ttl)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.expire) { RETURN_FALSE; }
+    long long ttl_ms = ttl > 0 ? ttl * 1000LL : 0;
+    RETURN_BOOL(g_kv_ops.expire(key, ttl_ms));
+}
+
+PHP_FUNCTION(ephpm_kv_ttl)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.pttl) { RETURN_LONG(-2); }
+    long long pttl = g_kv_ops.pttl(key);
+    if (pttl < 0) {
+        /* -1 = no expiry, -2 = missing — pass through */
+        RETURN_LONG((zend_long)pttl);
+    }
+    /* Convert milliseconds to seconds (round up so 1ms..999ms = 1s) */
+    RETURN_LONG((zend_long)((pttl + 999) / 1000));
+}
+
+/* ── Argument info for reflection (arginfo) ──────────────────── */
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_get, 0, 0, 1)
+    ZEND_ARG_INFO(0, key)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_set, 0, 0, 2)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, value)
+    ZEND_ARG_INFO(0, ttl)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_del, 0, 0, 1)
+    ZEND_ARG_INFO(0, key)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_exists, 0, 0, 1)
+    ZEND_ARG_INFO(0, key)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_incr, 0, 0, 1)
+    ZEND_ARG_INFO(0, key)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_decr, 0, 0, 1)
+    ZEND_ARG_INFO(0, key)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_incr_by, 0, 0, 2)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, delta)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_expire, 0, 0, 2)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, ttl)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_ttl, 0, 0, 1)
+    ZEND_ARG_INFO(0, key)
+ZEND_END_ARG_INFO()
+
+/* ── Function entry table (null-terminated) ──────────────────── */
+
+static const zend_function_entry ephpm_kv_functions[] = {
+    PHP_FE(ephpm_kv_get,      arginfo_ephpm_kv_get)
+    PHP_FE(ephpm_kv_set,      arginfo_ephpm_kv_set)
+    PHP_FE(ephpm_kv_del,      arginfo_ephpm_kv_del)
+    PHP_FE(ephpm_kv_exists,   arginfo_ephpm_kv_exists)
+    PHP_FE(ephpm_kv_incr,     arginfo_ephpm_kv_incr)
+    PHP_FE(ephpm_kv_decr,     arginfo_ephpm_kv_decr)
+    PHP_FE(ephpm_kv_incr_by,  arginfo_ephpm_kv_incr_by)
+    PHP_FE(ephpm_kv_expire,   arginfo_ephpm_kv_expire)
+    PHP_FE(ephpm_kv_ttl,      arginfo_ephpm_kv_ttl)
+    PHP_FE_END
+};
+
+/*
+ * Pre-initialization: set additional_functions on the embed module.
+ * Must be called BEFORE php_embed_init() so that php_module_startup()
+ * registers these functions during module initialization.
+ */
+void ephpm_pre_init(void)
+{
+    php_embed_module.additional_functions = ephpm_kv_functions;
+}
+
+/*
+ * Set the KV ops function pointer table. Can be called at any time
+ * before PHP scripts execute — typically after php_embed_init().
+ */
+void ephpm_set_kv_ops(const EphpmKvOps *ops)
+{
+    if (ops) {
+        g_kv_ops = *ops;
+    }
+}
+
+/* ===================================================================
  * CLI mode — `ephpm php ...` subcommand
  *
  * Provides a PHP CLI interface using the embed SAPI by handling

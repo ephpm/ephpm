@@ -40,11 +40,11 @@ pub fn dispatch(store: &Arc<Store>, frame: &Frame) -> Frame {
 
     let cmd = match &args[0] {
         Frame::Bulk(b) => String::from_utf8_lossy(b).to_ascii_uppercase(),
-        Frame::Simple(s) => s.to_ascii_uppercase().into(),
+        Frame::Simple(s) => s.to_ascii_uppercase(),
         _ => return Frame::error("ERR invalid command name"),
     };
 
-    let argv: Vec<&[u8]> = args
+    let params: Vec<&[u8]> = args
         .iter()
         .skip(1)
         .filter_map(|f| match f {
@@ -53,9 +53,9 @@ pub fn dispatch(store: &Arc<Store>, frame: &Frame) -> Frame {
         })
         .collect();
 
-    debug!(cmd = %cmd, argc = argv.len(), "executing command");
+    debug!(cmd = %cmd, argc = params.len(), "executing command");
 
-    execute(store, &cmd, &argv)
+    execute(store, &cmd, &params)
 }
 
 /// Handle inline (non-RESP) commands.
@@ -238,7 +238,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             check_args!(cmd, argv, 2);
             let key = str_from(argv[0]);
             let secs = match parse_i64(argv[1]) {
-                Ok(v) if v > 0 => v as u64,
+                Ok(v) if v > 0 => u64::try_from(v).unwrap_or(u64::MAX),
                 _ => return Frame::error("ERR invalid expire time in 'expire' command"),
             };
             let ok = store.expire(&key, Duration::from_secs(secs));
@@ -248,7 +248,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             check_args!(cmd, argv, 2);
             let key = str_from(argv[0]);
             let ms = match parse_i64(argv[1]) {
-                Ok(v) if v > 0 => v as u64,
+                Ok(v) if v > 0 => u64::try_from(v).unwrap_or(u64::MAX),
                 _ => return Frame::error("ERR invalid expire time in 'pexpire' command"),
             };
             let ok = store.expire(&key, Duration::from_millis(ms));
@@ -306,7 +306,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             Frame::bulk(info.into_bytes())
         }
 
-        _ => Frame::error(format!("ERR unknown command '{}'", cmd)),
+        _ => Frame::error(format!("ERR unknown command '{cmd}'")),
     }
 }
 
@@ -335,7 +335,7 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
                 }
                 if let Ok(sec) = parse_i64(argv[i + 1]) {
                     if sec > 0 {
-                        ttl = Some(Duration::from_secs(sec as u64));
+                        ttl = Some(Duration::from_secs(u64::try_from(sec).unwrap_or(u64::MAX)));
                     }
                 }
                 i += 2;
@@ -346,7 +346,7 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
                 }
                 if let Ok(ms) = parse_i64(argv[i + 1]) {
                     if ms > 0 {
-                        ttl = Some(Duration::from_millis(ms as u64));
+                        ttl = Some(Duration::from_millis(u64::try_from(ms).unwrap_or(u64::MAX)));
                     }
                 }
                 i += 2;
@@ -418,10 +418,496 @@ fn parse_i64(b: &[u8]) -> Result<i64, Frame> {
 fn require_args(cmd: &str, argv: &[&[u8]], n: usize) -> Result<(), Frame> {
     if argv.len() < n {
         Err(Frame::error(format!(
-            "ERR wrong number of arguments for '{}' command",
-            cmd
+            "ERR wrong number of arguments for '{cmd}' command"
         )))
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::store::{Store, StoreConfig};
+
+    fn store() -> Arc<Store> {
+        Store::new(StoreConfig::default())
+    }
+
+    /// Build a command frame and dispatch it.
+    fn cmd(store: &Arc<Store>, args: &[&str]) -> Frame {
+        let frame = Frame::Array(
+            args.iter()
+                .map(|s| Frame::bulk(s.as_bytes().to_vec()))
+                .collect(),
+        );
+        dispatch(store, &frame)
+    }
+
+    fn bulk_str(f: &Frame) -> Option<&str> {
+        if let Frame::Bulk(b) = f {
+            std::str::from_utf8(b).ok()
+        } else {
+            None
+        }
+    }
+
+    fn int(f: &Frame) -> Option<i64> {
+        if let Frame::Integer(n) = f { Some(*n) } else { None }
+    }
+
+    // ── Connection commands ──────────────────────────────────────────────
+
+    #[test]
+    fn ping_bare() {
+        assert_eq!(cmd(&store(), &["PING"]), Frame::Simple("PONG".into()));
+    }
+
+    #[test]
+    fn ping_with_message() {
+        let f = cmd(&store(), &["PING", "hello"]);
+        assert_eq!(bulk_str(&f), Some("hello"));
+    }
+
+    #[test]
+    fn echo_returns_arg() {
+        let f = cmd(&store(), &["ECHO", "test"]);
+        assert_eq!(bulk_str(&f), Some("test"));
+    }
+
+    #[test]
+    fn echo_missing_arg_is_error() {
+        assert!(matches!(cmd(&store(), &["ECHO"]), Frame::Error(_)));
+    }
+
+    #[test]
+    fn select_zero_ok() {
+        assert_eq!(cmd(&store(), &["SELECT", "0"]), Frame::ok());
+    }
+
+    #[test]
+    fn select_nonzero_is_error() {
+        assert!(matches!(cmd(&store(), &["SELECT", "1"]), Frame::Error(_)));
+    }
+
+    #[test]
+    fn quit_returns_ok() {
+        assert_eq!(cmd(&store(), &["QUIT"]), Frame::ok());
+    }
+
+    #[test]
+    fn command_returns_empty_array() {
+        assert_eq!(cmd(&store(), &["COMMAND"]), Frame::Array(vec![]));
+    }
+
+    // ── GET / SET ────────────────────────────────────────────────────────
+
+    #[test]
+    fn get_missing_returns_null() {
+        assert_eq!(cmd(&store(), &["GET", "no_such_key"]), Frame::Null);
+    }
+
+    #[test]
+    fn set_and_get_round_trip() {
+        let s = store();
+        assert_eq!(cmd(&s, &["SET", "k", "v"]), Frame::ok());
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "k"])), Some("v"));
+    }
+
+    #[test]
+    fn set_overwrites_existing() {
+        let s = store();
+        cmd(&s, &["SET", "k", "old"]);
+        cmd(&s, &["SET", "k", "new"]);
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "k"])), Some("new"));
+    }
+
+    #[test]
+    fn set_with_ex_sets_ttl() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v", "EX", "60"]);
+        // Key exists with a TTL.
+        let ttl = int(&cmd(&s, &["TTL", "k"])).unwrap();
+        assert!(ttl > 0 && ttl <= 60, "expected TTL in (0, 60], got {ttl}");
+    }
+
+    #[test]
+    fn set_with_px_sets_ttl_millis() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v", "PX", "60000"]);
+        let pttl = int(&cmd(&s, &["PTTL", "k"])).unwrap();
+        assert!(pttl > 0 && pttl <= 60_000, "expected PTTL in (0, 60000], got {pttl}");
+    }
+
+    #[test]
+    fn set_nx_only_when_absent() {
+        let s = store();
+        // First call sets the key.
+        assert_eq!(cmd(&s, &["SET", "k", "first", "NX"]), Frame::ok());
+        // Second call with NX returns Null (key already exists).
+        assert_eq!(cmd(&s, &["SET", "k", "second", "NX"]), Frame::Null);
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "k"])), Some("first"));
+    }
+
+    #[test]
+    fn set_xx_only_when_present() {
+        let s = store();
+        // XX on missing key returns Null.
+        assert_eq!(cmd(&s, &["SET", "k", "v", "XX"]), Frame::Null);
+        cmd(&s, &["SET", "k", "v"]);
+        // XX on existing key succeeds.
+        assert_eq!(cmd(&s, &["SET", "k", "new", "XX"]), Frame::ok());
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "k"])), Some("new"));
+    }
+
+    #[test]
+    fn set_get_option_returns_old_value() {
+        let s = store();
+        cmd(&s, &["SET", "k", "old"]);
+        let prev = cmd(&s, &["SET", "k", "new", "GET"]);
+        assert_eq!(bulk_str(&prev), Some("old"));
+    }
+
+    #[test]
+    fn set_get_option_returns_null_when_absent() {
+        let s = store();
+        assert_eq!(cmd(&s, &["SET", "k", "v", "GET"]), Frame::Null);
+    }
+
+    #[test]
+    fn set_nx_and_xx_together_is_error() {
+        assert!(matches!(
+            cmd(&store(), &["SET", "k", "v", "NX", "XX"]),
+            Frame::Error(_)
+        ));
+    }
+
+    // ── MGET / MSET / SETNX ─────────────────────────────────────────────
+
+    #[test]
+    fn mset_and_mget() {
+        let s = store();
+        cmd(&s, &["MSET", "a", "1", "b", "2", "c", "3"]);
+        let f = cmd(&s, &["MGET", "a", "b", "c", "missing"]);
+        let Frame::Array(items) = f else { panic!("expected array") };
+        assert_eq!(bulk_str(&items[0]), Some("1"));
+        assert_eq!(bulk_str(&items[1]), Some("2"));
+        assert_eq!(bulk_str(&items[2]), Some("3"));
+        assert_eq!(items[3], Frame::Null);
+    }
+
+    #[test]
+    fn setnx_only_when_absent() {
+        let s = store();
+        assert_eq!(cmd(&s, &["SETNX", "k", "v"]), Frame::integer(1));
+        assert_eq!(cmd(&s, &["SETNX", "k", "v2"]), Frame::integer(0));
+    }
+
+    // ── DEL / EXISTS ─────────────────────────────────────────────────────
+
+    #[test]
+    fn del_existing_key() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v"]);
+        assert_eq!(cmd(&s, &["DEL", "k"]), Frame::integer(1));
+        assert_eq!(cmd(&s, &["GET", "k"]), Frame::Null);
+    }
+
+    #[test]
+    fn del_missing_key() {
+        assert_eq!(cmd(&store(), &["DEL", "nope"]), Frame::integer(0));
+    }
+
+    #[test]
+    fn del_multiple_keys_counts_removed() {
+        let s = store();
+        cmd(&s, &["MSET", "a", "1", "b", "2"]);
+        assert_eq!(cmd(&s, &["DEL", "a", "b", "missing"]), Frame::integer(2));
+    }
+
+    #[test]
+    fn exists_present_and_absent() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v"]);
+        assert_eq!(cmd(&s, &["EXISTS", "k"]), Frame::integer(1));
+        assert_eq!(cmd(&s, &["EXISTS", "nope"]), Frame::integer(0));
+    }
+
+    #[test]
+    fn exists_multiple_keys() {
+        let s = store();
+        cmd(&s, &["MSET", "a", "1", "b", "2"]);
+        assert_eq!(cmd(&s, &["EXISTS", "a", "b", "nope"]), Frame::integer(2));
+    }
+
+    // ── INCR / DECR / INCRBY / DECRBY ───────────────────────────────────
+
+    #[test]
+    fn incr_creates_key_at_one() {
+        let s = store();
+        assert_eq!(cmd(&s, &["INCR", "counter"]), Frame::integer(1));
+    }
+
+    #[test]
+    fn incr_increments_existing() {
+        let s = store();
+        cmd(&s, &["SET", "n", "10"]);
+        assert_eq!(cmd(&s, &["INCR", "n"]), Frame::integer(11));
+    }
+
+    #[test]
+    fn decr_decrements() {
+        let s = store();
+        cmd(&s, &["SET", "n", "5"]);
+        assert_eq!(cmd(&s, &["DECR", "n"]), Frame::integer(4));
+    }
+
+    #[test]
+    fn incrby_adds_delta() {
+        let s = store();
+        cmd(&s, &["SET", "n", "10"]);
+        assert_eq!(cmd(&s, &["INCRBY", "n", "5"]), Frame::integer(15));
+    }
+
+    #[test]
+    fn decrby_subtracts_delta() {
+        let s = store();
+        cmd(&s, &["SET", "n", "10"]);
+        assert_eq!(cmd(&s, &["DECRBY", "n", "3"]), Frame::integer(7));
+    }
+
+    #[test]
+    fn incr_on_non_integer_is_error() {
+        let s = store();
+        cmd(&s, &["SET", "k", "hello"]);
+        assert!(matches!(cmd(&s, &["INCR", "k"]), Frame::Error(_)));
+    }
+
+    // ── APPEND / STRLEN / GETSET ─────────────────────────────────────────
+
+    #[test]
+    fn append_creates_key() {
+        let s = store();
+        assert_eq!(cmd(&s, &["APPEND", "k", "hello"]), Frame::integer(5));
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "k"])), Some("hello"));
+    }
+
+    #[test]
+    fn append_extends_existing() {
+        let s = store();
+        cmd(&s, &["SET", "k", "hello"]);
+        cmd(&s, &["APPEND", "k", " world"]);
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "k"])), Some("hello world"));
+    }
+
+    #[test]
+    fn strlen_existing() {
+        let s = store();
+        cmd(&s, &["SET", "k", "hello"]);
+        assert_eq!(cmd(&s, &["STRLEN", "k"]), Frame::integer(5));
+    }
+
+    #[test]
+    fn strlen_missing_is_zero() {
+        assert_eq!(cmd(&store(), &["STRLEN", "nope"]), Frame::integer(0));
+    }
+
+    #[test]
+    fn getset_returns_old_and_sets_new() {
+        let s = store();
+        cmd(&s, &["SET", "k", "old"]);
+        let prev = cmd(&s, &["GETSET", "k", "new"]);
+        assert_eq!(bulk_str(&prev), Some("old"));
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "k"])), Some("new"));
+    }
+
+    #[test]
+    fn getset_missing_key_returns_null() {
+        let s = store();
+        assert_eq!(cmd(&s, &["GETSET", "k", "v"]), Frame::Null);
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "k"])), Some("v"));
+    }
+
+    // ── TTL / EXPIRE / PERSIST / TYPE ────────────────────────────────────
+
+    #[test]
+    fn ttl_no_expiry_returns_minus_one() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v"]);
+        assert_eq!(cmd(&s, &["TTL", "k"]), Frame::integer(-1));
+    }
+
+    #[test]
+    fn ttl_missing_key_returns_minus_two() {
+        assert_eq!(cmd(&store(), &["TTL", "nope"]), Frame::integer(-2));
+    }
+
+    #[test]
+    fn expire_sets_ttl() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v"]);
+        assert_eq!(cmd(&s, &["EXPIRE", "k", "30"]), Frame::integer(1));
+        let ttl = int(&cmd(&s, &["TTL", "k"])).unwrap();
+        assert!(ttl > 0 && ttl <= 30);
+    }
+
+    #[test]
+    fn expire_missing_key_returns_zero() {
+        assert_eq!(cmd(&store(), &["EXPIRE", "nope", "10"]), Frame::integer(0));
+    }
+
+    #[test]
+    fn pexpire_sets_ttl_millis() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v"]);
+        assert_eq!(cmd(&s, &["PEXPIRE", "k", "30000"]), Frame::integer(1));
+        let pttl = int(&cmd(&s, &["PTTL", "k"])).unwrap();
+        assert!(pttl > 0 && pttl <= 30_000);
+    }
+
+    #[test]
+    fn persist_removes_ttl() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v", "EX", "30"]);
+        assert_eq!(cmd(&s, &["PERSIST", "k"]), Frame::integer(1));
+        assert_eq!(cmd(&s, &["TTL", "k"]), Frame::integer(-1));
+    }
+
+    #[test]
+    fn persist_on_key_without_ttl_returns_zero() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v"]);
+        assert_eq!(cmd(&s, &["PERSIST", "k"]), Frame::integer(0));
+    }
+
+    #[test]
+    fn type_existing_key_is_string() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v"]);
+        assert_eq!(cmd(&s, &["TYPE", "k"]), Frame::Simple("string".into()));
+    }
+
+    #[test]
+    fn type_missing_key_is_none() {
+        assert_eq!(
+            cmd(&store(), &["TYPE", "nope"]),
+            Frame::Simple("none".into())
+        );
+    }
+
+    // ── KEYS / DBSIZE / FLUSHDB ──────────────────────────────────────────
+
+    #[test]
+    fn keys_wildcard_returns_all() {
+        let s = store();
+        cmd(&s, &["MSET", "a", "1", "b", "2"]);
+        let Frame::Array(keys) = cmd(&s, &["KEYS", "*"]) else {
+            panic!("expected array")
+        };
+        assert!(keys.len() >= 2);
+    }
+
+    #[test]
+    fn keys_pattern_filters() {
+        let s = store();
+        cmd(&s, &["MSET", "user:1", "a", "user:2", "b", "post:1", "c"]);
+        let Frame::Array(keys) = cmd(&s, &["KEYS", "user:*"]) else {
+            panic!("expected array")
+        };
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn dbsize_counts_keys() {
+        let s = store();
+        cmd(&s, &["MSET", "a", "1", "b", "2", "c", "3"]);
+        assert_eq!(cmd(&s, &["DBSIZE"]), Frame::integer(3));
+    }
+
+    #[test]
+    fn flushdb_removes_all_keys() {
+        let s = store();
+        cmd(&s, &["MSET", "a", "1", "b", "2"]);
+        assert_eq!(cmd(&s, &["FLUSHDB"]), Frame::ok());
+        assert_eq!(cmd(&s, &["DBSIZE"]), Frame::integer(0));
+    }
+
+    #[test]
+    fn flushall_removes_all_keys() {
+        let s = store();
+        cmd(&s, &["MSET", "a", "1", "b", "2"]);
+        assert_eq!(cmd(&s, &["FLUSHALL"]), Frame::ok());
+        assert_eq!(cmd(&s, &["DBSIZE"]), Frame::integer(0));
+    }
+
+    // ── INFO ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn info_returns_bulk_with_redis_version() {
+        let f = cmd(&store(), &["INFO"]);
+        let s = bulk_str(&f).expect("INFO should return a bulk string");
+        assert!(s.contains("redis_version:"), "missing redis_version in INFO");
+        assert!(s.contains("used_memory:"), "missing used_memory in INFO");
+    }
+
+    // ── Error cases ──────────────────────────────────────────────────────
+
+    #[test]
+    fn unknown_command_is_error() {
+        let f = cmd(&store(), &["NOTACOMMAND"]);
+        let Frame::Error(msg) = f else { panic!("expected error frame") };
+        assert!(msg.contains("NOTACOMMAND"));
+    }
+
+    #[test]
+    fn get_missing_arg_is_error() {
+        assert!(matches!(cmd(&store(), &["GET"]), Frame::Error(_)));
+    }
+
+    #[test]
+    fn set_missing_value_is_error() {
+        assert!(matches!(cmd(&store(), &["SET", "k"]), Frame::Error(_)));
+    }
+
+    #[test]
+    fn del_no_args_is_error() {
+        assert!(matches!(cmd(&store(), &["DEL"]), Frame::Error(_)));
+    }
+
+    #[test]
+    fn mget_no_args_is_error() {
+        assert!(matches!(cmd(&store(), &["MGET"]), Frame::Error(_)));
+    }
+
+    #[test]
+    fn mset_odd_args_is_error() {
+        assert!(matches!(cmd(&store(), &["MSET", "k"]), Frame::Error(_)));
+    }
+
+    #[test]
+    fn expire_invalid_time_is_error() {
+        let s = store();
+        cmd(&s, &["SET", "k", "v"]);
+        assert!(matches!(cmd(&s, &["EXPIRE", "k", "-5"]), Frame::Error(_)));
+    }
+
+    #[test]
+    fn incrby_non_integer_delta_is_error() {
+        assert!(matches!(
+            cmd(&store(), &["INCRBY", "k", "notanint"]),
+            Frame::Error(_)
+        ));
+    }
+
+    // ── Case insensitivity ───────────────────────────────────────────────
+
+    #[test]
+    fn commands_are_case_insensitive() {
+        let s = store();
+        assert_eq!(cmd(&s, &["set", "k", "v"]), Frame::ok());
+        assert_eq!(bulk_str(&cmd(&s, &["get", "k"])), Some("v"));
+        assert_eq!(cmd(&s, &["Set", "k2", "v2"]), Frame::ok());
     }
 }

@@ -2,6 +2,7 @@
 // are documented with comments before each unsafe block.
 #![allow(unsafe_code)]
 
+pub mod kv_bridge;
 pub mod request;
 pub mod response;
 pub mod sapi;
@@ -84,6 +85,16 @@ mod ffi {
 
         // ── CLI mode functions ──────────────────────────────────────
 
+        /// Register `additional_functions` (KV native functions) on
+        /// `php_embed_module`. Must be called BEFORE `php_embed_init()`.
+        pub fn ephpm_pre_init();
+
+        /// Set the KV ops function pointer table. Can be called after
+        /// `php_embed_init()`, before any PHP scripts execute.
+        pub fn ephpm_set_kv_ops(
+            ops: *const crate::kv_bridge::EphpmKvOps,
+        );
+
         /// Get the PHP version string (compile-time constant).
         /// Safe to call before `php_embed_init()`.
         pub fn ephpm_get_php_version() -> *const ::std::os::raw::c_char;
@@ -149,6 +160,11 @@ impl PhpRuntime {
         #[cfg(php_linked)]
         {
             use std::ffi::CString;
+
+            // Register KV native functions on php_embed_module.additional_functions.
+            // Safety: Must be called before php_embed_init() so php_module_startup()
+            // registers the functions. No PHP state exists yet.
+            unsafe { ffi::ephpm_pre_init() };
 
             // Initialize PHP embed SAPI (module + initial request startup).
             // Safety: php_embed_init must be called exactly once before any PHP
@@ -493,6 +509,34 @@ impl PhpRuntime {
                     Ok(PhpResponse { status, headers, body })
                 }
             }
+        }
+    }
+
+    /// Register the KV store so PHP native `ephpm_kv_*` functions can
+    /// access it.
+    ///
+    /// Must be called after [`init()`] (so the PHP runtime exists) and
+    /// before any PHP requests execute. Typically called from
+    /// `ephpm-server` after creating the [`ephpm_kv::store::Store`].
+    ///
+    /// In stub mode (no `php_linked`), this is a no-op.
+    pub fn set_kv_store(store: &std::sync::Arc<ephpm_kv::store::Store>) {
+        #[cfg(php_linked)]
+        {
+            kv_bridge::set_store(std::sync::Arc::clone(store));
+
+            // Safety: KV_OPS is a static with stable address. ephpm_set_kv_ops
+            // copies the struct into the C global — the pointer only needs to be
+            // valid for the duration of this call.
+            unsafe { ffi::ephpm_set_kv_ops(&kv_bridge::KV_OPS) };
+
+            tracing::info!("KV store wired to PHP native functions");
+        }
+
+        #[cfg(not(php_linked))]
+        {
+            let _ = store;
+            tracing::debug!("KV store set_kv_store no-op (stub mode)");
         }
     }
 }

@@ -343,11 +343,11 @@ impl TlsConfig {
 /// `listen` address) — it never talks to the database directly.
 #[derive(Debug, Default, Deserialize)]
 pub struct DbConfig {
-    /// MySQL proxy configuration.
+    /// `MySQL` proxy configuration.
     #[serde(default)]
     pub mysql: Option<DbBackendConfig>,
 
-    /// PostgreSQL proxy configuration.
+    /// `PostgreSQL` proxy configuration.
     #[serde(default)]
     pub postgres: Option<DbBackendConfig>,
 
@@ -356,7 +356,7 @@ pub struct DbConfig {
     pub read_write_split: ReadWriteSplitConfig,
 }
 
-/// Configuration for a single database backend (MySQL or PostgreSQL).
+/// Configuration for a single database backend (`MySQL` or `PostgreSQL`).
 #[derive(Debug, Deserialize, Clone)]
 pub struct DbBackendConfig {
     /// Primary database URL.
@@ -367,8 +367,8 @@ pub struct DbBackendConfig {
 
     /// TCP address for the proxy to listen on.
     ///
-    /// PHP connects here. Default: `"127.0.0.1:3306"` for MySQL,
-    /// `"127.0.0.1:5432"` for PostgreSQL.
+    /// PHP connects here. Default: `"127.0.0.1:3306"` for `MySQL`,
+    /// `"127.0.0.1:5432"` for `PostgreSQL`.
     #[serde(default)]
     pub listen: Option<String>,
 
@@ -423,7 +423,7 @@ pub struct DbBackendConfig {
     /// When `true`, inject `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`,
     /// `DB_PASSWORD`, and `DATABASE_URL` environment variables into PHP
     /// pointing at the proxy listener. Framework auto-detection
-    /// (Laravel, Symfony, WordPress) picks these up automatically.
+    /// (Laravel, Symfony, `WordPress`) picks these up automatically.
     ///
     /// Default: `true`.
     #[serde(default = "default_inject_env")]
@@ -431,8 +431,8 @@ pub struct DbBackendConfig {
 
     /// Connection reset strategy when returning a connection to the pool.
     ///
-    /// - `"smart"` — reset only after non-SELECT statements (MySQL:
-    ///   `COM_RESET_CONNECTION`; PostgreSQL: `DISCARD ALL`). Best balance.
+    /// - `"smart"` — reset only after non-SELECT statements (`MySQL`:
+    ///   `COM_RESET_CONNECTION`; `PostgreSQL`: `DISCARD ALL`). Best balance.
     /// - `"always"` — always reset on return. Safest, slight overhead.
     /// - `"never"` — skip reset. Fastest, but session state leaks between
     ///   PHP requests. Use only in trusted environments.

@@ -577,8 +577,13 @@ fn find_tool(name: &str) -> String {
 
 /// Check if a tool is available (local bin or PATH).
 fn has_e2e_tool(name: &str) -> bool {
-    let path = find_tool(name);
-    Command::new(&path)
+    // If the binary exists in ./bin/, trust it without running it — some tools
+    // (e.g. tilt) use `tool version` subcommands rather than `--version` flags.
+    let local = workspace_root().join("bin").join(name);
+    if local.exists() {
+        return true;
+    }
+    Command::new(name)
         .arg("--version")
         .output()
         .is_ok_and(|o| o.status.success())
@@ -886,18 +891,23 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
     // Build ephpm image with the specified PHP version
     if dockerfile.exists() {
         eprintln!("==> Building ephpm container image (PHP {php_version})...");
-        let status = Command::new(ce)
-            .args(["build", "-f"])
-            .arg(&dockerfile)
-            .args([
-                "--build-arg",
-                &format!("PHP_VERSION={php_version}"),
-                "-t",
-                "ephpm:dev",
-                ".",
-            ])
-            .current_dir(&root)
-            .status();
+        let mut cmd = Command::new(ce);
+        cmd.args(["build", "-f"]);
+        cmd.arg(&dockerfile);
+        cmd.args([
+            "--build-arg",
+            &format!("PHP_VERSION={php_version}"),
+            "-t",
+            "ephpm:dev",
+            ".",
+        ]);
+        // Enable BuildKit on plain docker to avoid the legacy-builder deprecation
+        // warning. Podman always uses BuildKit-equivalent behaviour; setting this
+        // env var for podman is harmless.
+        if ce == "docker" {
+            cmd.env("DOCKER_BUILDKIT", "1");
+        }
+        let status = cmd.current_dir(&root).status();
 
         if !ran_ok(&status) {
             eprintln!("error: failed to build ephpm image");
@@ -910,12 +920,14 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
     // Build E2E test runner image
     if dockerfile_e2e.exists() {
         eprintln!("==> Building E2E test runner image...");
-        let status = Command::new(ce)
-            .args(["build", "-f"])
-            .arg(&dockerfile_e2e)
-            .args(["-t", "ephpm-e2e:dev", "."])
-            .current_dir(&root)
-            .status();
+        let mut cmd = Command::new(ce);
+        cmd.args(["build", "-f"]);
+        cmd.arg(&dockerfile_e2e);
+        cmd.args(["-t", "ephpm-e2e:dev", "."]);
+        if ce == "docker" {
+            cmd.env("DOCKER_BUILDKIT", "1");
+        }
+        let status = cmd.current_dir(&root).status();
 
         if !ran_ok(&status) {
             eprintln!("error: failed to build ephpm-e2e image");
