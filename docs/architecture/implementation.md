@@ -946,13 +946,13 @@ This is the hardest crate and the core of the project.
 
 ## Future Milestones (Post-MVP)
 
-| Milestone | Key Features | Depends On |
-|-----------|-------------|------------|
-| **v0.2: ZTS + Workers** | Thread-safe PHP, multiple concurrent requests, worker pool | MVP |
-| **v0.3: TLS** | Automatic HTTPS via `rustls-acme`, Let's Encrypt | MVP |
-| **v0.4: DB Proxy** | Connection pooling, query digest, slow query detection | v0.2 |
-| **v0.5: KV Store** | In-process KV, SAPI access, TTL/eviction | v0.2 |
-| **v0.6: Admin UI** | Embedded web dashboard, request inspector | v0.4, v0.5 |
-| **v0.7: Observability** | OTLP receiver, auto-instrumentation, Prometheus `/metrics` | v0.4, v0.5 |
-| **v0.8: Clustering** | Gossip discovery, hash ring, KV replication | v0.5 |
-| **v1.0: Production** | Read/write splitting, replication lag awareness, hardening | All above |
+| Milestone | Key Features | Status |
+|-----------|-------------|--------|
+| **v0.2: ZTS + Workers** | Thread-safe PHP, multiple concurrent requests, worker pool | Planned |
+| **v0.3: TLS** | Automatic HTTPS via `rustls-acme`, Let's Encrypt | Planned |
+| **v0.4: DB Proxy** | **Implemented (partial)**: MySQL transparent proxy, connection pooling, reset strategy; **Missing**: read/write splitting, replication, slow query analysis | Ahead of schedule |
+| **v0.5: KV Store** | **Implemented (partial)**: Single-node RESP2 server, ~30 Redis commands, TTL/expiry, memory tracking, SAPI bridge for direct PHP access; **Missing**: data structures (hashes/lists/sets), clustering, persistence, eviction policies | Ahead of schedule |
+| **v0.6: Admin UI** | Embedded web dashboard, request inspector | Planned |
+| **v0.7: Observability** | OTLP receiver, auto-instrumentation, Prometheus `/metrics` | Planned |
+| **v0.8: Clustering** | Gossip discovery, hash ring, KV replication | Planned |
+| **v1.0: Production** | Read/write splitting, replication lag awareness, hardening | Planned |

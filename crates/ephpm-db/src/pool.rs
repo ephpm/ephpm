@@ -59,6 +59,7 @@ struct PoolState {
 ///
 /// Clone is cheap — it shares the same internal state via [`Arc`].
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct Pool {
     state: Arc<PoolState>,
     pub semaphore: Arc<Semaphore>,

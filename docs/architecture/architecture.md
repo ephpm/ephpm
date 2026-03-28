@@ -18,8 +18,8 @@ This document describes the full vision for ePHPm. The matrix below tracks what 
 | Graceful shutdown | Partial | Stops accepting; does not drain in-flight connections |
 | Signal handling | Partial | Ctrl+C only; no SIGHUP reload |
 | Observability | Partial | `tracing` crate logging; no OTLP export |
-| DB proxy | Planned | MySQL/Postgres wire protocol — not started |
-| KV store | Planned | Clustered key-value cache — not started |
+| DB proxy | Partial | MySQL transparent proxy (connection pooling, wire protocol, reset strategy); PostgreSQL placeholder; read/write splitting and replication not yet |
+| KV store | **Implemented (single-node)** | RESP2 protocol server (~30 Redis commands), TTL/expiry, memory tracking, DashMap-backed store; clustering planned |
 | Clustering / gossip | Planned | Multi-node coordination — not started |
 | Admin UI / API | Planned | Management interface — not started |
 | External PHP mode | Planned | Spawn external PHP workers over pipes — use any PHP binary |
@@ -273,6 +273,27 @@ password = "changeme"                 # admin UI auth (separate from node API au
 ---
 
 ## Clustered KV Store
+
+### Status
+
+**Currently Implemented (v0.5 preview):**
+- Single-node in-memory KV store using DashMap (lock-free concurrent hashmap)
+- RESP2 protocol server accepting Redis-compatible clients
+- ~30 Redis commands implemented: GET, SET, DEL, EXPIRE, TTL, INCR, APPEND, KEYS, MGET, MSET, GETSET, etc.
+- **SAPI bridge** for direct PHP access (zero serialization, zero network hop): `ephpm_kv_get`, `ephpm_kv_set`, `ephpm_kv_del`, `ephpm_kv_exists`, `ephpm_kv_incr_by`, `ephpm_kv_expire`, `ephpm_kv_pttl`
+- TTL / expiry with background sweeper + lazy expiry on access
+- Approximate memory tracking (via `mem_used()`)
+- INFO command with basic server and memory stats
+- Thread-local get buffer for safe C FFI result passing
+
+**Planned / Not Yet Implemented:**
+- Additional data structures (hashes, lists, sets, sorted sets) — currently strings only
+- Clustering (gossip discovery, consistent hash ring, cross-node replication)
+- Persistence (AOF/snapshots)
+- Eviction policies (LRU, random)
+- Memory limit enforcement
+
+---
 
 ### Why Not Embed Dragonfly (or Redis, KeyDB, etc.)
 

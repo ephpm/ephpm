@@ -57,6 +57,7 @@ const CLIENT_PLUGIN_AUTH_LENENC: u32 = 0x0020_0000;
 /// MySQL server metadata captured from the initial backend handshake.
 /// Used to generate synthetic server greetings for PHP clients.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct ServerMeta {
     server_version: String,
     capabilities: u32,

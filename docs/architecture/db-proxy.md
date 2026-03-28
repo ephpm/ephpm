@@ -4,6 +4,27 @@ This document covers the SQL connection pooling proxy, wire protocol implementat
 
 ---
 
+## Status
+
+**Currently Implemented (v0.4 preview):**
+- MySQL transparent proxy with wire protocol handshake and authentication
+- Connection pooling with configurable min/max connections
+- Connection reset strategy (always/smart/never) to reset session state between clients
+- Health checks and idle connection timeout management
+- TCP listener on configurable port
+
+**Planned / Not Yet Implemented:**
+- Read/write splitting based on query analysis
+- Replication support (primary + replicas)
+- Replica lag awareness
+- Slow query detection and logging
+- EXPLAIN output analysis
+- Query digest / statistics collection
+- PostgreSQL support (placeholder exists, needs implementation)
+- OTel span emission for query tracing
+
+---
+
 ## Quick Start Examples
 
 ### Minimal — Just Connection Pooling
