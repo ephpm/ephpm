@@ -108,6 +108,17 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             }
         }
         "SET" => cmd_set(store, argv),
+        "SETEX" => {
+            check_args!(cmd, argv, 3);
+            let key = str_from(argv[0]);
+            let secs = match parse_i64(argv[1]) {
+                Ok(v) if v > 0 => u64::try_from(v).unwrap_or(u64::MAX),
+                _ => return Frame::error("ERR invalid expire time in 'setex' command"),
+            };
+            let val = argv[2].to_vec();
+            store.set(key, val, Some(Duration::from_secs(secs)));
+            Frame::ok()
+        }
         "MGET" => {
             if argv.is_empty() {
                 return Frame::error("ERR wrong number of arguments for 'mget' command");
@@ -283,6 +294,27 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
                 Frame::Simple("string".into())
             } else {
                 Frame::Simple("none".into())
+            }
+        }
+        "RENAME" => {
+            check_args!(cmd, argv, 2);
+            let old_key = str_from(argv[0]);
+            let new_key = str_from(argv[1]);
+            match store.get(&old_key) {
+                Some(val) => {
+                    // Preserve TTL if present
+                    let ttl = store.pttl(&old_key).and_then(|ms| {
+                        if ms > 0 {
+                            Some(Duration::from_millis(u64::try_from(ms).unwrap_or(u64::MAX)))
+                        } else {
+                            None
+                        }
+                    });
+                    store.set(new_key, val, ttl);
+                    store.remove(&old_key);
+                    Frame::ok()
+                }
+                None => Frame::error("ERR no such key"),
             }
         }
         "KEYS" => {
@@ -584,6 +616,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn setex_sets_key_with_ttl() {
+        let s = store();
+        assert_eq!(cmd(&s, &["SETEX", "k", "30", "value"]), Frame::ok());
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "k"])), Some("value"));
+        let ttl = int(&cmd(&s, &["TTL", "k"])).unwrap();
+        assert!(ttl > 0 && ttl <= 30);
+    }
+
+    #[test]
+    fn setex_invalid_ttl_is_error() {
+        assert!(matches!(
+            cmd(&store(), &["SETEX", "k", "-1", "v"]),
+            Frame::Error(_)
+        ));
+    }
+
+    #[test]
+    fn setex_wrong_args_is_error() {
+        assert!(matches!(cmd(&store(), &["SETEX", "k"]), Frame::Error(_)));
+    }
+
     // ── MGET / MSET / SETNX ─────────────────────────────────────────────
 
     #[test]
@@ -795,6 +849,32 @@ mod tests {
             cmd(&store(), &["TYPE", "nope"]),
             Frame::Simple("none".into())
         );
+    }
+
+    #[test]
+    fn rename_existing_key() {
+        let s = store();
+        cmd(&s, &["SET", "old", "value"]);
+        assert_eq!(cmd(&s, &["RENAME", "old", "new"]), Frame::ok());
+        assert_eq!(cmd(&s, &["GET", "old"]), Frame::Null);
+        assert_eq!(bulk_str(&cmd(&s, &["GET", "new"])), Some("value"));
+    }
+
+    #[test]
+    fn rename_missing_key_is_error() {
+        assert!(matches!(
+            cmd(&store(), &["RENAME", "nope", "new"]),
+            Frame::Error(_)
+        ));
+    }
+
+    #[test]
+    fn rename_preserves_ttl() {
+        let s = store();
+        cmd(&s, &["SET", "old", "value", "EX", "30"]);
+        cmd(&s, &["RENAME", "old", "new"]);
+        let ttl = int(&cmd(&s, &["TTL", "new"])).unwrap();
+        assert!(ttl > 0 && ttl <= 30);
     }
 
     // ── KEYS / DBSIZE / FLUSHDB ──────────────────────────────────────────

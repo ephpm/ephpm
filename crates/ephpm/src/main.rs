@@ -2,7 +2,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Context;
+use bytes::BytesMut;
 use clap::{Parser, Subcommand};
+use ephpm_kv::resp::{Frame, parse_frame};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -44,6 +48,55 @@ enum Commands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+
+    /// Inspect or manipulate the KV store on a running server
+    Kv {
+        /// KV server host
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// KV server port
+        #[arg(long, default_value_t = 6379u16)]
+        port: u16,
+
+        #[command(subcommand)]
+        subcommand: KvSubcommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum KvSubcommand {
+    /// List keys matching a pattern (default: *)
+    Keys {
+        #[arg(default_value = "*")]
+        pattern: String,
+    },
+    /// Get the value of a key
+    Get { key: String },
+    /// Set the value of a key
+    Set {
+        key: String,
+        value: String,
+        /// Time-to-live in seconds
+        #[arg(long)]
+        ttl: Option<u64>,
+    },
+    /// Delete one or more keys
+    Del {
+        #[arg(required = true)]
+        keys: Vec<String>,
+    },
+    /// Increment a counter key
+    Incr {
+        key: String,
+        /// Increment by this amount (default: 1)
+        #[arg(long, default_value_t = 1i64)]
+        by: i64,
+    },
+    /// Show TTL information for a key
+    Ttl { key: String },
+    /// Check the connection
+    Ping,
 }
 
 fn main() -> ExitCode {
@@ -61,6 +114,11 @@ fn run() -> anyhow::Result<ExitCode> {
 
     match cli.command {
         Some(Commands::Php { args }) => run_php(&args),
+        Some(Commands::Kv { host, port, subcommand }) => {
+            let rt = tokio::runtime::Runtime::new()
+                .context("failed to create tokio runtime")?;
+            rt.block_on(run_kv(&host, port, subcommand))
+        }
         other => run_serve_sync(other),
     }
 }
@@ -208,4 +266,262 @@ fn load_serve_config(command: Option<Commands>) -> anyhow::Result<(ephpm_config:
     }
 
     Ok((config, verbose))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KV Store CLI Subcommands
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Dispatcher for all KV subcommands.
+async fn run_kv(host: &str, port: u16, sub: KvSubcommand) -> anyhow::Result<ExitCode> {
+    match sub {
+        KvSubcommand::Ping => kv_ping(host, port).await,
+        KvSubcommand::Keys { pattern } => kv_keys(host, port, &pattern).await,
+        KvSubcommand::Get { key } => kv_get(host, port, &key).await,
+        KvSubcommand::Set { key, value, ttl } => kv_set(host, port, &key, &value, ttl).await,
+        KvSubcommand::Del { keys } => kv_del(host, port, &keys).await,
+        KvSubcommand::Incr { key, by } => kv_incr(host, port, &key, by).await,
+        KvSubcommand::Ttl { key } => kv_ttl(host, port, &key).await,
+    }
+}
+
+/// TCP connection helper.
+async fn kv_connect(host: &str, port: u16) -> anyhow::Result<TcpStream> {
+    let addr: std::net::SocketAddr = format!("{host}:{port}")
+        .parse()
+        .with_context(|| format!("invalid address: {host}:{port}"))?;
+    TcpStream::connect(addr)
+        .await
+        .with_context(|| format!("could not connect to KV server at {host}:{port}"))
+}
+
+/// Send a RESP frame to the server.
+async fn kv_send(stream: &mut TcpStream, frame: &Frame) -> anyhow::Result<()> {
+    let bytes = frame.to_bytes();
+    stream
+        .write_all(&bytes)
+        .await
+        .context("failed to write command to KV server")
+}
+
+/// Receive a RESP frame from the server.
+async fn kv_recv(stream: &mut TcpStream) -> anyhow::Result<Frame> {
+    let mut buf = BytesMut::with_capacity(4096);
+    loop {
+        buf.reserve(512);
+        let n = stream
+            .read_buf(&mut buf)
+            .await
+            .context("failed to read from KV server")?;
+        if n == 0 {
+            anyhow::bail!("KV server closed connection unexpectedly");
+        }
+        if let Some(frame) = parse_frame(&mut buf)
+            .context("invalid RESP data from KV server")?
+        {
+            return Ok(frame);
+        }
+    }
+}
+
+/// Send a command and receive the response in one connection.
+async fn kv_roundtrip(host: &str, port: u16, cmd: Frame) -> anyhow::Result<Frame> {
+    let mut stream = kv_connect(host, port).await?;
+    kv_send(&mut stream, &cmd).await?;
+    kv_recv(&mut stream).await
+}
+
+/// PING command.
+async fn kv_ping(host: &str, port: u16) -> anyhow::Result<ExitCode> {
+    let cmd = Frame::Array(vec![Frame::bulk(b"PING".to_vec())]);
+    match kv_roundtrip(host, port, cmd).await? {
+        Frame::Simple(s) => {
+            println!("{s}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Frame::Error(e) => {
+            eprintln!("error: {e}");
+            Ok(ExitCode::FAILURE)
+        }
+        other => anyhow::bail!("unexpected response: {other}"),
+    }
+}
+
+/// KEYS command.
+async fn kv_keys(host: &str, port: u16, pattern: &str) -> anyhow::Result<ExitCode> {
+    let cmd = Frame::Array(vec![
+        Frame::bulk(b"KEYS".to_vec()),
+        Frame::bulk(pattern.as_bytes().to_vec()),
+    ]);
+    match kv_roundtrip(host, port, cmd).await? {
+        Frame::Array(items) => {
+            if items.is_empty() {
+                println!("(empty)");
+            } else {
+                for (i, item) in items.iter().enumerate() {
+                    match item {
+                        Frame::Bulk(b) => println!("{}) {}", i + 1, String::from_utf8_lossy(b)),
+                        other => println!("{}) {other}", i + 1),
+                    }
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Frame::Error(e) => {
+            eprintln!("error: {e}");
+            Ok(ExitCode::FAILURE)
+        }
+        other => anyhow::bail!("unexpected response: {other}"),
+    }
+}
+
+/// GET command.
+async fn kv_get(host: &str, port: u16, key: &str) -> anyhow::Result<ExitCode> {
+    let cmd = Frame::Array(vec![
+        Frame::bulk(b"GET".to_vec()),
+        Frame::bulk(key.as_bytes().to_vec()),
+    ]);
+    match kv_roundtrip(host, port, cmd).await? {
+        Frame::Bulk(data) => {
+            match std::str::from_utf8(&data) {
+                Ok(s) => println!("{s}"),
+                Err(_) => println!("<{} bytes of binary data>", data.len()),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Frame::Null => {
+            println!("(nil)");
+            Ok(ExitCode::SUCCESS)
+        }
+        Frame::Error(e) => {
+            eprintln!("error: {e}");
+            Ok(ExitCode::FAILURE)
+        }
+        other => anyhow::bail!("unexpected response: {other}"),
+    }
+}
+
+/// SET command.
+async fn kv_set(
+    host: &str,
+    port: u16,
+    key: &str,
+    value: &str,
+    ttl: Option<u64>,
+) -> anyhow::Result<ExitCode> {
+    let mut args = vec![
+        Frame::bulk(b"SET".to_vec()),
+        Frame::bulk(key.as_bytes().to_vec()),
+        Frame::bulk(value.as_bytes().to_vec()),
+    ];
+    if let Some(secs) = ttl {
+        args.push(Frame::bulk(b"EX".to_vec()));
+        args.push(Frame::bulk(secs.to_string().into_bytes()));
+    }
+    let cmd = Frame::Array(args);
+    match kv_roundtrip(host, port, cmd).await? {
+        Frame::Simple(s) => {
+            println!("{s}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Frame::Null => {
+            println!("(nil)");
+            Ok(ExitCode::SUCCESS)
+        }
+        Frame::Error(e) => {
+            eprintln!("error: {e}");
+            Ok(ExitCode::FAILURE)
+        }
+        other => anyhow::bail!("unexpected response: {other}"),
+    }
+}
+
+/// DEL command.
+async fn kv_del(host: &str, port: u16, keys: &[String]) -> anyhow::Result<ExitCode> {
+    let mut args = vec![Frame::bulk(b"DEL".to_vec())];
+    for key in keys {
+        args.push(Frame::bulk(key.as_bytes().to_vec()));
+    }
+    let cmd = Frame::Array(args);
+    match kv_roundtrip(host, port, cmd).await? {
+        Frame::Integer(n) => {
+            println!("(integer) {n}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Frame::Error(e) => {
+            eprintln!("error: {e}");
+            Ok(ExitCode::FAILURE)
+        }
+        other => anyhow::bail!("unexpected response: {other}"),
+    }
+}
+
+/// INCR command.
+async fn kv_incr(host: &str, port: u16, key: &str, by: i64) -> anyhow::Result<ExitCode> {
+    let cmd = if by == 1 {
+        Frame::Array(vec![
+            Frame::bulk(b"INCR".to_vec()),
+            Frame::bulk(key.as_bytes().to_vec()),
+        ])
+    } else {
+        Frame::Array(vec![
+            Frame::bulk(b"INCRBY".to_vec()),
+            Frame::bulk(key.as_bytes().to_vec()),
+            Frame::bulk(by.to_string().into_bytes()),
+        ])
+    };
+    match kv_roundtrip(host, port, cmd).await? {
+        Frame::Integer(n) => {
+            println!("(integer) {n}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Frame::Error(e) => {
+            eprintln!("error: {e}");
+            Ok(ExitCode::FAILURE)
+        }
+        other => anyhow::bail!("unexpected response: {other}"),
+    }
+}
+
+/// TTL command.
+async fn kv_ttl(host: &str, port: u16, key: &str) -> anyhow::Result<ExitCode> {
+    let mut stream = kv_connect(host, port).await?;
+
+    // Send TTL
+    kv_send(
+        &mut stream,
+        &Frame::Array(vec![
+            Frame::bulk(b"TTL".to_vec()),
+            Frame::bulk(key.as_bytes().to_vec()),
+        ]),
+    )
+    .await?;
+    let ttl_frame = kv_recv(&mut stream).await?;
+
+    // Send PTTL on the same connection
+    kv_send(
+        &mut stream,
+        &Frame::Array(vec![
+            Frame::bulk(b"PTTL".to_vec()),
+            Frame::bulk(key.as_bytes().to_vec()),
+        ]),
+    )
+    .await?;
+    let pttl_frame = kv_recv(&mut stream).await?;
+
+    match (ttl_frame, pttl_frame) {
+        (Frame::Integer(ttl), Frame::Integer(pttl)) => {
+            match ttl {
+                -2 => println!("key does not exist"),
+                -1 => println!("no expiry (persistent key)"),
+                s => println!("expires in {s}s ({pttl}ms)"),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        (Frame::Error(e), _) | (_, Frame::Error(e)) => {
+            eprintln!("error: {e}");
+            Ok(ExitCode::FAILURE)
+        }
+        (a, b) => anyhow::bail!("unexpected response: {a} / {b}"),
+    }
 }

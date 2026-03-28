@@ -25,6 +25,9 @@ The docs describe the full vision. Here's what actually exists today:
 | PHP embedding (NTS) | **Implemented** |
 | Request routing (pretty permalinks) | **Implemented** |
 | Configuration (TOML + env vars) | **Implemented** |
+| Embedded KV store (strings, TTL, counters) | **Implemented** |
+| KV store CLI debugging (`ephpm kv`) | **Implemented** |
+| SAPI functions (`ephpm_kv_*` in PHP) | **Implemented** |
 | Observability (tracing logs) | Partial |
 | Graceful shutdown | Partial |
 | CLI | Partial |
@@ -32,7 +35,7 @@ The docs describe the full vision. Here's what actually exists today:
 | TLS / ACME | Planned |
 | PHP embedding (ZTS) | Planned |
 | DB proxy (MySQL/Postgres) | Planned |
-| Clustered KV store | Planned |
+| Clustered KV store (hashes, lists, sets, replication) | Planned |
 | Admin UI / API | Planned |
 | External PHP mode | Planned |
 | OpenTelemetry export | Planned |

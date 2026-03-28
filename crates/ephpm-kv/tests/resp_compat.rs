@@ -6,7 +6,6 @@
 //! path: RESP framing → parser → command dispatch → store → serialised
 //! response, as seen by a real Redis client.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use ephpm_kv::server;

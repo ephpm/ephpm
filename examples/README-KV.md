@@ -194,6 +194,73 @@ ephpm_kv_expire("session:$id", 3600 * 1000); // 1 hour
 $redis->setex("session:$id", 3600, json_encode($data));
 ```
 
+## CLI Debugging Commands
+
+The `ephpm kv` subcommand provides a debugging interface to inspect and manipulate the live KV store without writing PHP code.
+
+### Basic Usage
+
+```bash
+# Test connection
+ephpm kv ping
+
+# Get a value
+ephpm kv get mykey
+
+# Set a value
+ephpm kv set mykey "hello world"
+
+# Set with TTL (in seconds)
+ephpm kv set session:abc 'data' --ttl 3600
+
+# Increment a counter
+ephpm kv incr page:views
+ephpm kv incr counter --by 5
+
+# Check TTL
+ephpm kv ttl mykey
+
+# List keys
+ephpm kv keys "*"
+ephpm kv keys "session:*"
+
+# Delete keys
+ephpm kv del mykey
+ephpm kv del key1 key2 key3
+```
+
+### Useful Patterns
+
+```bash
+# Debug rate limiting
+ephpm kv get "ratelimit:$user_id"
+ephpm kv incr "ratelimit:$user_id"
+
+# Check session data
+ephpm kv get "session:$session_id"
+
+# Monitor cache hit/miss
+ephpm kv get "cache:page:/$path"
+
+# Find all active sessions
+ephpm kv keys "session:*"
+
+# Clear all sessions
+ephpm kv del $(ephpm kv keys "session:*" | awk '{print $NF}')
+```
+
+### Connecting to Remote Server
+
+```bash
+# Connect to a different host/port
+ephpm kv --host 10.0.1.5 --port 6379 ping
+
+# Override defaults
+ephpm kv --host redis.example.com --port 6380 keys "*"
+```
+
+See [docs/architecture/cli.md](../docs/architecture/cli.md) for full CLI documentation.
+
 ## See Also
 
 - [Architecture docs](../docs/architecture/db-proxy.md)
