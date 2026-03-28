@@ -7,6 +7,9 @@ use crate::pool::PoolConfig;
 use crate::error::DbError;
 
 /// PostgreSQL proxy builder (placeholder).
+///
+/// TODO: Implement PostgreSQL wire protocol proxy with SASL authentication.
+#[allow(clippy::unused_async)]
 pub async fn build_proxy(
     _url: &str,
     _listen: &str,

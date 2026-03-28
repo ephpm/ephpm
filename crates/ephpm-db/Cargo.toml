@@ -17,6 +17,9 @@ anyhow = { workspace = true }
 parking_lot = { workspace = true }
 sha1 = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
+md5 = { workspace = true }
+base64ct = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

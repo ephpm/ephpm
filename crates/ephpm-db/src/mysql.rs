@@ -39,6 +39,7 @@ use tracing::{debug, info, warn};
 use crate::error::DbError;
 use crate::pool::{Checkout, Pool, PoolConfig};
 use crate::url::DbUrl;
+use crate::ResetStrategy;
 
 // ── Capability flags ──────────────────────────────────────────────────────────
 
@@ -54,6 +55,17 @@ const CLIENT_PS_MULTI_RESULTS: u32 = 0x0004_0000;
 const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 const CLIENT_PLUGIN_AUTH_LENENC: u32 = 0x0020_0000;
 
+// ── Read-write split & sticky routing ─────────────────────────────────────────
+
+/// Parameters for read-write splitting and sticky-after-write behavior.
+#[derive(Clone, Debug)]
+pub struct RwSplitParams {
+	/// Enable read-write splitting (route SELECTs to replicas).
+	pub enabled: bool,
+	/// How long to stick to the primary after a write operation.
+	pub sticky_duration: std::time::Duration,
+}
+
 /// MySQL server metadata captured from the initial backend handshake.
 /// Used to generate synthetic server greetings for PHP clients.
 #[derive(Clone, Debug)]
@@ -63,25 +75,22 @@ struct ServerMeta {
     capabilities: u32,
     charset: u8,
     /// Auth plugin name advertised to clients (always `mysql_native_password`).
+    ///
+    /// Captured from the backend handshake for use in synthetic client greetings
+    /// (not yet wired up — will be used when we generate per-client handshake packets).
+    #[allow(dead_code)]
     auth_plugin: String,
 }
 
 /// A running MySQL proxy that accepts client connections and pools backends.
 pub struct MySqlProxy {
     pool: Pool,
+    replica_pools: Vec<Pool>,
     meta: Arc<ServerMeta>,
     listen: String,
+    socket: Option<std::path::PathBuf>,
     reset_strategy: ResetStrategy,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum ResetStrategy {
-    /// Always send `COM_RESET_CONNECTION` on return.
-    Always,
-    /// Never reset (fastest, use only in trusted dev environments).
-    Never,
-    /// Reset only when session may be dirty (currently same as Always; TODO: track dirty bit).
-    Smart,
+    rw_split: RwSplitParams,
 }
 
 impl MySqlProxy {
@@ -94,8 +103,11 @@ impl MySqlProxy {
     pub async fn new(
         url: &str,
         listen: &str,
+        socket: Option<std::path::PathBuf>,
         pool_config: PoolConfig,
         reset_strategy: ResetStrategy,
+        replica_urls: Vec<String>,
+        rw_split: RwSplitParams,
     ) -> Result<Self, DbError> {
         let db_url = Arc::new(DbUrl::parse(url)?);
 
@@ -103,7 +115,7 @@ impl MySqlProxy {
         let (probe_stream, meta) = connect_and_handshake(&db_url).await?;
         let meta = Arc::new(meta);
 
-        // Build the pool using clones of the URL and meta for closures.
+        // Build the primary pool using clones of the URL and meta for closures.
         let db_url_c = Arc::clone(&db_url);
         let connect = move || -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
             let u = Arc::clone(&db_url_c);
@@ -121,7 +133,7 @@ impl MySqlProxy {
             Box::pin(ping_connection(stream))
         };
 
-        let pool = Pool::new(pool_config, connect, reset, ping);
+        let pool = Pool::new(pool_config.clone(), connect, reset, ping);
 
         // Seed the pool with the probe connection.
         let mut checkout = Checkout {
@@ -134,11 +146,41 @@ impl MySqlProxy {
         let stream = checkout.take_stream();
         checkout.return_to_pool(stream);
 
+        // Build replica pools.
+        let mut replica_pools = Vec::new();
+        for replica_url in replica_urls {
+            if let Ok(replica_db_url) = DbUrl::parse(&replica_url) {
+                let replica_db_url = Arc::new(replica_db_url);
+                let replica_db_url_c = Arc::clone(&replica_db_url);
+                let replica_connect = move || -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
+                    let u = Arc::clone(&replica_db_url_c);
+                    Box::pin(async move {
+                        let (stream, _) = connect_and_handshake(&u).await?;
+                        Ok(stream)
+                    })
+                };
+
+                let replica_reset = |stream: TcpStream| -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
+                    Box::pin(reset_connection(stream))
+                };
+
+                let replica_ping = |stream: TcpStream| -> crate::pool::BoxFuture<Result<(TcpStream, bool), DbError>> {
+                    Box::pin(ping_connection(stream))
+                };
+
+                let replica_pool = Pool::new(pool_config.clone(), replica_connect, replica_reset, replica_ping);
+                replica_pools.push(replica_pool);
+            }
+        }
+
         Ok(Self {
             pool,
+            replica_pools,
             meta,
             listen: listen.to_string(),
+            socket,
             reset_strategy,
+            rw_split,
         })
     }
 
@@ -189,38 +231,49 @@ impl MySqlProxy {
         // Step 3: send OK to PHP.
         send_ok(&mut client).await?;
 
-        // Step 4: get a backend connection from the pool.
-        let mut checkout = self.pool.acquire().await?;
-        let backend = checkout.take_stream();
+        // Determine if we need query-level routing or just simple proxying.
+        let needs_routing = matches!(self.reset_strategy, ResetStrategy::Smart)
+            || (self.rw_split.enabled && !self.replica_pools.is_empty());
 
-        // Step 5: bidirectional proxy until either side closes.
-        let result = proxy_bidirectional(client, backend).await;
+        if needs_routing {
+            // Step 4a: per-query routing with dirty tracking.
+            proxy_routing_loop(client, &self.pool, &self.replica_pools, &self.rw_split, self.reset_strategy)
+                .await
+        } else {
+            // Fast path: simple bidirectional copy.
+            let mut checkout = self.pool.acquire().await?;
+            let backend = checkout.take_stream();
 
-        // Step 6: reset and return backend to pool (or discard on error).
-        match result {
-            Ok(backend) => {
-                match self.reset_strategy {
-                    ResetStrategy::Never => {
-                        checkout.return_to_pool(backend);
-                    }
-                    ResetStrategy::Always | ResetStrategy::Smart => {
-                        match reset_connection(backend).await {
-                            Ok(stream) => checkout.return_to_pool(stream),
-                            Err(e) => {
-                                debug!("MySQL reset failed, discarding connection: {e}");
-                                checkout.retire();
+            let result = proxy_bidirectional(client, backend).await;
+
+            match result {
+                Ok(backend) => {
+                    match self.reset_strategy {
+                        ResetStrategy::Never => {
+                            checkout.return_to_pool(backend);
+                        }
+                        ResetStrategy::Always => {
+                            match reset_connection(backend).await {
+                                Ok(stream) => checkout.return_to_pool(stream),
+                                Err(e) => {
+                                    debug!("MySQL reset failed, discarding connection: {e}");
+                                    checkout.retire();
+                                }
                             }
+                        }
+                        ResetStrategy::Smart => {
+                            // Smart path handled by routing loop above.
+                            unreachable!()
                         }
                     }
                 }
+                Err(e) => {
+                    debug!("proxy session error, discarding backend connection: {e}");
+                    checkout.retire();
+                }
             }
-            Err(e) => {
-                debug!("proxy session error, discarding backend connection: {e}");
-                checkout.retire();
-            }
+            Ok(())
         }
-
-        Ok(())
     }
 }
 
@@ -614,6 +667,237 @@ fn parse_error_packet(payload: &[u8]) -> String {
     String::from_utf8_lossy(&payload[9..]).into_owned()
 }
 
+// ── Routing & smart reset ──────────────────────────────────────────────────────
+
+/// Kind of SQL query for routing decisions.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum QueryKind {
+    /// SELECT, SHOW, EXPLAIN, DESCRIBE — read-only, can go to replica.
+    Read,
+    /// INSERT, UPDATE, DELETE, CREATE, ALTER, DROP — modifies data, must go to primary.
+    Write,
+    /// BEGIN, START TRANSACTION — starts a transaction, sticky to primary.
+    TxBegin,
+    /// COMMIT, ROLLBACK — ends a transaction.
+    TxEnd,
+}
+
+/// Classify a SQL query based on its first keyword.
+fn classify_mysql_query(sql: &str) -> QueryKind {
+    let s = sql.trim_start();
+    // Find the first token (word).
+    let tok = s
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+
+    match tok.as_str() {
+        "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" => {
+            // Special case: SELECT ... FOR UPDATE or SELECT ... FOR SHARE → Write
+            if sql.to_ascii_uppercase().contains("FOR UPDATE")
+                || sql.to_ascii_uppercase().contains("FOR SHARE")
+            {
+                QueryKind::Write
+            } else {
+                QueryKind::Read
+            }
+        }
+        "BEGIN" | "START" => QueryKind::TxBegin,
+        "COMMIT" => QueryKind::TxEnd,
+        "ROLLBACK" => QueryKind::TxEnd,
+        _ => QueryKind::Write, // Default: treat as write (safest)
+    }
+}
+
+/// Per-client connection state for routing and dirty tracking.
+#[derive(Debug, Clone)]
+struct ClientState {
+    in_transaction: bool,
+    sticky_until: Option<std::time::Instant>,
+    dirty: bool,
+}
+
+impl Default for ClientState {
+    fn default() -> Self {
+        Self {
+            in_transaction: false,
+            sticky_until: None,
+            dirty: false,
+        }
+    }
+}
+
+/// Forward a complete MySQL response from backend to client.
+///
+/// Handles OK, ERR, EOF, and result sets by reading the full response
+/// and forwarding each packet.
+async fn forward_mysql_response(
+    backend: &mut TcpStream,
+    client: &mut TcpStream,
+) -> Result<(), DbError> {
+    let (seq, payload) = read_packet(backend).await?;
+    write_packet(client, seq, &payload).await?;
+
+    // Check response type.
+    match payload.first().copied() {
+        Some(0x00) => return Ok(()), // OK packet
+        Some(0xFF) => return Ok(()), // ERR packet
+        Some(0xFE) if payload.len() < 9 => return Ok(()), // EOF packet
+        _ => {} // Result set: read columns and rows
+    }
+
+    // Result set: read column definitions until EOF, then rows until EOF/OK.
+    loop {
+        let (seq, payload) = read_packet(backend).await?;
+        write_packet(client, seq, &payload).await?;
+
+        match payload.first().copied() {
+            Some(0xFE) if payload.len() < 9 => return Ok(()), // EOF after rows
+            Some(0xFF) => return Ok(()), // ERR
+            Some(0x00) if payload.len() <= 9 => return Ok(()), // OK
+            _ => {} // More rows
+        }
+    }
+}
+
+/// Select which pool (primary or replica) to use for the next query.
+fn select_pool<'a>(
+    primary: &'a Pool,
+    replicas: &'a [Pool],
+    state: &ClientState,
+    kind: QueryKind,
+    _rw_split: &RwSplitParams,
+) -> &'a Pool {
+    // If no replicas, always use primary.
+    if replicas.is_empty() {
+        return primary;
+    }
+
+    // In transaction: always primary.
+    if state.in_transaction {
+        return primary;
+    }
+
+    // Sticky after write: check if still in sticky window.
+    if let Some(sticky_until) = state.sticky_until {
+        if std::time::Instant::now() < sticky_until {
+            return primary;
+        }
+    }
+
+    // Read queries can use replicas.
+    if matches!(kind, QueryKind::Read) {
+        // Simple V1: use first replica. TODO: round-robin.
+        &replicas[0]
+    } else {
+        // Write, TxBegin, TxEnd: always primary.
+        primary
+    }
+}
+
+/// Proxy loop with per-query routing and dirty-bit tracking.
+async fn proxy_routing_loop(
+    mut client: TcpStream,
+    pool: &Pool,
+    replica_pools: &[Pool],
+    rw_split: &RwSplitParams,
+    reset_strategy: crate::ResetStrategy,
+) -> Result<(), DbError> {
+    let mut state = ClientState::default();
+
+    loop {
+        // Read command from client.
+        let (seq, payload) = match read_packet(&mut client).await {
+            Ok(p) => p,
+            Err(_) => break, // Client closed or error
+        };
+
+        // COM_QUIT (0x01) signals client disconnect.
+        if payload.first() == Some(&0x01) {
+            break;
+        }
+
+        // Classify query kind for routing.
+        let (target_pool, query_kind) = if rw_split.enabled && !replica_pools.is_empty() {
+            let kind = if payload.first() == Some(&0x03) {
+                // COM_QUERY: parse SQL string.
+                let sql = std::str::from_utf8(payload.get(1..).unwrap_or_default())
+                    .unwrap_or("");
+                classify_mysql_query(sql)
+            } else {
+                // Non-COM_QUERY commands (COM_PING, COM_INIT_DB, etc.) → primary.
+                QueryKind::Write
+            };
+
+            let target = select_pool(pool, replica_pools, &state, kind, rw_split);
+            (target, kind)
+        } else {
+            (pool, QueryKind::Write) // No routing: always primary
+        };
+
+        // Track dirty bit based on command type and SQL.
+        if !payload.is_empty() {
+            match payload[0] {
+                0x02 => state.dirty = true, // COM_INIT_DB
+                0x16 => state.dirty = true, // COM_STMT_PREPARE
+                0x03 => {
+                    // COM_QUERY: check SQL type.
+                    let sql = std::str::from_utf8(payload.get(1..).unwrap_or_default())
+                        .unwrap_or("");
+                    match classify_mysql_query(sql) {
+                        QueryKind::Write => state.dirty = true,
+                        QueryKind::TxBegin => {
+                            state.in_transaction = true;
+                            state.dirty = true;
+                        }
+                        QueryKind::TxEnd => {
+                            state.in_transaction = false;
+                        }
+                        _ => {} // Read queries don't dirty
+                    }
+                }
+                _ => {} // Other commands
+            }
+        }
+
+        // Acquire backend connection from target pool.
+        let mut checkout = target_pool.acquire().await?;
+        let mut backend = checkout.take_stream();
+
+        // Forward query + full response.
+        write_packet(&mut backend, seq, &payload).await?;
+        forward_mysql_response(&mut backend, &mut client).await?;
+
+        // Determine if session needs reset.
+        let should_reset = match reset_strategy {
+            crate::ResetStrategy::Always => true,
+            crate::ResetStrategy::Never => false,
+            crate::ResetStrategy::Smart => state.dirty,
+        };
+
+        // Return backend to pool with or without reset.
+        if should_reset {
+            match reset_connection(backend).await {
+                Ok(s) => {
+                    checkout.return_to_pool(s);
+                    state.dirty = false;
+                }
+                Err(_) => checkout.retire(),
+            }
+        } else {
+            checkout.return_to_pool(backend);
+        }
+
+        // Update sticky-after-write timer.
+        if rw_split.enabled && matches!(query_kind, QueryKind::Write) {
+            state.sticky_until = Some(std::time::Instant::now() + rw_split.sticky_duration);
+        }
+    }
+
+    Ok(())
+}
+
 // ── Public builder ────────────────────────────────────────────────────────────
 
 /// Build a [`Pool`] for MySQL.
@@ -622,8 +906,11 @@ fn parse_error_packet(payload: &[u8]) -> String {
 pub async fn build_proxy(
     url: &str,
     listen: &str,
+    socket: Option<std::path::PathBuf>,
     pool_config: PoolConfig,
     reset_strategy: ResetStrategy,
+    replica_urls: Vec<String>,
+    rw_split: RwSplitParams,
 ) -> Result<MySqlProxy, DbError> {
-    MySqlProxy::new(url, listen, pool_config, reset_strategy).await
+    MySqlProxy::new(url, listen, socket, pool_config, reset_strategy, replica_urls, rw_split).await
 }

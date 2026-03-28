@@ -520,9 +520,19 @@ async fn start_db_proxies(config: &Config) -> anyhow::Result<Vec<tokio::task::Jo
             health_check_interval: parse_duration(&mysql_config.health_check_interval)?,
         };
 
-        let reset_strategy = ephpm_db::mysql::ResetStrategy::Always;
+        let reset_strategy = ephpm_db::ResetStrategy::from_str(&mysql_config.reset_strategy);
 
-        match ephpm_db::mysql::build_proxy(&url, &listen, pool_config, reset_strategy).await {
+        let replica_urls = mysql_config.replicas
+            .as_ref()
+            .map(|r| r.urls.clone())
+            .unwrap_or_default();
+
+        let rw_split = ephpm_db::mysql::RwSplitParams {
+            enabled: config.db.read_write_split.enabled,
+            sticky_duration: parse_duration(&config.db.read_write_split.sticky_duration)?,
+        };
+
+        match ephpm_db::mysql::build_proxy(&url, &listen, mysql_config.socket.clone(), pool_config, reset_strategy, replica_urls, rw_split).await {
             Ok(proxy) => {
                 let maintenance_handle = proxy.start_maintenance();
                 let proxy_handle = tokio::spawn(async move {

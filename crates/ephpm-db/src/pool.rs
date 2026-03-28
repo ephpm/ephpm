@@ -67,6 +67,11 @@ pub struct Pool {
     /// Called to create a new authenticated backend connection.
     connect: Arc<dyn Fn() -> BoxFuture<Result<TcpStream, DbError>> + Send + Sync>,
     /// Called to reset a connection before returning it to idle.
+    ///
+    /// Currently the caller runs the protocol-level reset externally before
+    /// calling [`Pool::recycle`]. This closure will be used once the pool
+    /// manages reset internally (automatic reset-on-return).
+    #[allow(dead_code)]
     reset: Arc<dyn Fn(TcpStream) -> BoxFuture<Result<TcpStream, DbError>> + Send + Sync>,
     /// Called to check whether an idle connection is still alive.
     /// Returns `(stream, is_alive)` on success, or an error on I/O failure.

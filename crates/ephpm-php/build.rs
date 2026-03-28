@@ -132,6 +132,13 @@ fn link_system_libs(target_os: &str) {
             // cross-compiler toolchain.
             if let Some(gcc_dir) = find_musl_libgcc() {
                 println!("cargo::rustc-link-search=native={}", gcc_dir.display());
+            } else {
+                println!(
+                    "cargo::warning=Could not find libgcc.a for musl target. \
+                     Install a musl cross-compiler (e.g. `apt install musl-tools`) \
+                     or run `spc doctor --auto-fix`. The linker may fail with \
+                     'could not find native static library `gcc`'."
+                );
             }
             println!("cargo::rustc-link-lib=static=gcc");
         }
@@ -327,13 +334,19 @@ fn find_clang_resource_include() -> Option<PathBuf> {
 fn find_musl_libgcc() -> Option<PathBuf> {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".into());
     let musl_triple = format!("{arch}-linux-musl");
+    // On Ubuntu/Debian, `musl-tools` provides a `musl-gcc` wrapper around the
+    // host GCC. The symbols PHP's JIT needs (__cpu_indicator_init, __cpu_model)
+    // live in the *host* GCC's libgcc.a, not in a musl-specific copy.
+    let gnu_triple = format!("{arch}-linux-gnu");
 
-    // Common locations where musl-cross toolchains install libgcc.a:
+    // Common locations where musl-cross or host toolchains install libgcc.a:
     //   /usr/local/musl/lib/gcc/<triple>/<ver>/libgcc.a  (spc doctor)
-    //   /usr/lib/gcc/<triple>/<ver>/libgcc.a              (distro packages)
+    //   /usr/lib/gcc/<musl-triple>/<ver>/libgcc.a         (musl cross-compiler)
+    //   /usr/lib/gcc/<gnu-triple>/<ver>/libgcc.a          (host GCC via musl-tools wrapper)
     let search_roots = [
         PathBuf::from(format!("/usr/local/musl/lib/gcc/{musl_triple}")),
         PathBuf::from(format!("/usr/lib/gcc/{musl_triple}")),
+        PathBuf::from(format!("/usr/lib/gcc/{gnu_triple}")),
     ];
 
     for root in &search_roots {

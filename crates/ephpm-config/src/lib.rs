@@ -341,7 +341,7 @@ impl TlsConfig {
 /// When present, ePHPm starts a transparent SQL proxy between PHP and the
 /// real database. PHP connects to `127.0.0.1:3306` (or the configured
 /// `listen` address) — it never talks to the database directly.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct DbConfig {
     /// `MySQL` proxy configuration.
     #[serde(default)]
@@ -354,6 +354,10 @@ pub struct DbConfig {
     /// Read/write splitting settings (requires replicas on at least one backend).
     #[serde(default)]
     pub read_write_split: ReadWriteSplitConfig,
+
+    /// Query analysis and optimization settings.
+    #[serde(default)]
+    pub analysis: DbAnalysisConfig,
 }
 
 /// Configuration for a single database backend (`MySQL` or `PostgreSQL`).
@@ -494,6 +498,54 @@ impl Default for ReadWriteSplitConfig {
             strategy: default_rw_strategy(),
             sticky_duration: default_sticky_duration(),
             max_replica_lag: default_max_replica_lag(),
+        }
+    }
+}
+
+/// Query analysis and optimization configuration (`[db.analysis]`).
+#[derive(Debug, Deserialize)]
+pub struct DbAnalysisConfig {
+    /// Duration threshold for logging slow queries.
+    ///
+    /// Queries exceeding this time trigger `EXPLAIN` analysis.
+    ///
+    /// Default: `"1s"`.
+    #[serde(default = "default_slow_query_threshold")]
+    pub slow_query_threshold: String,
+
+    /// Enable automatic `EXPLAIN` on slow queries.
+    ///
+    /// When enabled, the proxy automatically runs `EXPLAIN` on queries that
+    /// exceed the slow query threshold.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub auto_explain: bool,
+
+    /// Output target for `EXPLAIN` analysis results.
+    ///
+    /// Values: `"stderr"`, `"stdout"`.
+    ///
+    /// Default: `"stderr"`.
+    #[serde(default = "default_auto_explain_target")]
+    pub auto_explain_target: String,
+
+    /// Maximum number of query digest entries to store in memory.
+    ///
+    /// Older entries are evicted when the limit is reached.
+    ///
+    /// Default: `100000`.
+    #[serde(default = "default_digest_max_entries")]
+    pub digest_store_max_entries: usize,
+}
+
+impl Default for DbAnalysisConfig {
+    fn default() -> Self {
+        Self {
+            slow_query_threshold: default_slow_query_threshold(),
+            auto_explain: false,
+            auto_explain_target: default_auto_explain_target(),
+            digest_store_max_entries: default_digest_max_entries(),
         }
     }
 }
@@ -818,6 +870,18 @@ fn default_sticky_duration() -> String {
 
 fn default_max_replica_lag() -> String {
     "500ms".to_string()
+}
+
+fn default_slow_query_threshold() -> String {
+    "1s".to_string()
+}
+
+fn default_auto_explain_target() -> String {
+    "stderr".to_string()
+}
+
+fn default_digest_max_entries() -> usize {
+    100_000
 }
 
 #[cfg(test)]
