@@ -40,10 +40,10 @@ use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 /// Returns an error if the listen address is invalid or binding fails.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Start background services.
-    let _kv_handle = start_kv_service(&config)?;
+    let (kv_store, _kv_handle) = start_kv_service(&config)?;
     let _db_handles = start_db_proxies(&config).await?;
 
-    let listeners = bind_listeners(&config).await?;
+    let listeners = bind_listeners(&config, kv_store).await?;
     accept_loop(listeners).await
 }
 
@@ -79,7 +79,7 @@ struct ConnSettings {
 }
 
 /// Parse config, build TLS, and bind all listeners.
-async fn bind_listeners(config: &Config) -> anyhow::Result<Listeners> {
+async fn bind_listeners(config: &Config, kv_store: Arc<ephpm_kv::store::Store>) -> anyhow::Result<Listeners> {
     let addr: SocketAddr = config.server.listen.parse().context("invalid listen address")?;
 
     let conn = ConnSettings {
@@ -87,7 +87,7 @@ async fn bind_listeners(config: &Config) -> anyhow::Result<Listeners> {
         max_header_size: config.server.request.max_header_size,
     };
     let idle_timeout = Duration::from_secs(config.server.timeouts.idle);
-    let router = Arc::new(Router::new(config));
+    let router = Arc::new(Router::new(config, kv_store));
 
     // Determine TLS mode.
     let tls_mode = match config.server.tls.as_ref() {
@@ -466,7 +466,9 @@ async fn shutdown_signal() {
 }
 
 /// Start the KV store with optional RESP server.
-fn start_kv_service(config: &Config) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+fn start_kv_service(
+    config: &Config,
+) -> anyhow::Result<(Arc<ephpm_kv::store::Store>, Option<tokio::task::JoinHandle<()>>)> {
     // Create the KV store
     let store_config = ephpm_kv::store::StoreConfig {
         memory_limit: parse_memory_size(&config.kv.memory_limit)?,
@@ -479,7 +481,7 @@ fn start_kv_service(config: &Config) -> anyhow::Result<Option<tokio::task::JoinH
 
     if !config.kv.redis_compat.enabled {
         tracing::debug!("KV store initialized (RESP server disabled)");
-        return Ok(None);
+        return Ok((store, None));
     }
 
     // Start RESP server if enabled
@@ -489,14 +491,15 @@ fn start_kv_service(config: &Config) -> anyhow::Result<Option<tokio::task::JoinH
         ..Default::default()
     };
 
+    let store_for_resp = Arc::clone(&store);
     let handle = tokio::spawn(async move {
-        match ephpm_kv::server::run(store, server_config).await {
+        match ephpm_kv::server::run(store_for_resp, server_config).await {
             Ok(()) => tracing::info!("KV RESP server stopped"),
             Err(e) => tracing::error!("KV RESP server error: {e:#}"),
         }
     });
 
-    Ok(Some(handle))
+    Ok((store, Some(handle)))
 }
 
 /// Start database proxies (MySQL, PostgreSQL).

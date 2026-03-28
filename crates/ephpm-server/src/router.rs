@@ -8,9 +8,11 @@
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ephpm_config::Config;
+use ephpm_kv::store::Store;
 use ephpm_php::PhpRuntime;
 use ephpm_php::request::PhpRequest;
 use flate2::Compression;
@@ -57,11 +59,12 @@ pub struct Router {
     allowed_php_paths: Vec<String>,
     trusted_hosts: Vec<String>,
     response_headers: Vec<(String, String)>,
+    store: Arc<Store>,
 }
 
 impl Router {
     #[must_use]
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, store: Arc<Store>) -> Self {
         let port =
             config.server.listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(8080);
 
@@ -103,6 +106,7 @@ impl Router {
                 .iter()
                 .map(|[k, v]| (k.clone(), v.clone()))
                 .collect(),
+            store,
         }
     }
 
@@ -146,6 +150,7 @@ impl Router {
 
         let uri_path = req.uri().path().to_string();
         let query_string = req.uri().query().unwrap_or("").to_string();
+        let method = req.method().as_str().to_ascii_uppercase();
 
         // Block hidden files (dot-prefixed path segments like .env, .git)
         if let Some(resp) = self.check_hidden_file(&uri_path) {
@@ -176,8 +181,38 @@ impl Router {
             Resolved::File(fs_path) => {
                 if is_php_file(&fs_path) {
                     if self.is_php_allowed(&uri_path) {
-                        self.handle_php(req, effective_addr, is_https, fs_path, accepts_gzip)
-                            .await
+                        let is_cacheable = (method == "GET" || method == "HEAD") && self.etag;
+
+                        // Pre-check: bypass PHP if client's ETag matches stored value.
+                        if is_cacheable {
+                            if let Some(client_tag) = &if_none_match {
+                                let key = php_etag_cache_key(&method, &uri_path, &query_string);
+                                if let Some(stored) = self.store.get(&key) {
+                                    let stored_etag = String::from_utf8_lossy(&stored);
+                                    if etag_matches_value(&stored_etag, client_tag) {
+                                        return Ok(Response::builder()
+                                            .status(StatusCode::NOT_MODIFIED)
+                                            .header("etag", stored_etag.as_ref())
+                                            .body(Full::new(Bytes::new()))
+                                            .expect("304 builder"));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Execute PHP
+                        let resp = self.handle_php(req, effective_addr, is_https, fs_path, accepts_gzip)
+                            .await;
+
+                        // Post-store: cache any ETag PHP set in the response.
+                        if is_cacheable {
+                            if let Some(etag_val) = resp.headers().get("etag").and_then(|v| v.to_str().ok()) {
+                                let key = php_etag_cache_key(&method, &uri_path, &query_string);
+                                self.store.set(key, etag_val.as_bytes().to_vec(), None);
+                            }
+                        }
+
+                        resp
                     } else {
                         error_response(StatusCode::FORBIDDEN, "403 Forbidden")
                     }
@@ -636,14 +671,44 @@ pub fn gzip_compress(data: &[u8], content_type: &str, settings: CompressionSetti
     }
 }
 
+/// Build the KV store key for caching a PHP response's ETag.
+///
+/// Format: `etag:{method}:{path}` or `etag:{method}:{path}?{query}` if query string is present.
+fn php_etag_cache_key(method: &str, path: &str, query: &str) -> String {
+    if query.is_empty() {
+        format!("etag:{method}:{path}")
+    } else {
+        format!("etag:{method}:{path}?{query}")
+    }
+}
+
+/// Check if a stored ETag value matches the client's `If-None-Match` header.
+///
+/// Implements RFC 7232 semantics:
+/// - Handles `*` (matches any ETag)
+/// - Handles comma-separated lists of ETags
+/// - Trims whitespace correctly
+fn etag_matches_value(etag: &str, if_none_match: &str) -> bool {
+    let trimmed = if_none_match.trim();
+    if trimmed == "*" {
+        return true;
+    }
+    trimmed.split(',').any(|tag| tag.trim() == etag)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::Path;
 
     use ephpm_config::{Config, PhpConfig, ServerConfig};
+    use ephpm_kv::store::StoreConfig;
 
     use super::*;
+
+    fn test_store() -> Arc<Store> {
+        Store::new(StoreConfig::default())
+    }
 
     fn test_router(dir: &Path) -> Router {
         let config = Config {
@@ -662,7 +727,7 @@ mod tests {
             db: Default::default(),
             kv: Default::default(),
         };
-        Router::new(&config)
+        Router::new(&config, test_store())
     }
 
     fn test_router_with_404(dir: &Path) -> Router {
@@ -678,7 +743,29 @@ mod tests {
             db: Default::default(),
             kv: Default::default(),
         };
-        Router::new(&config)
+        Router::new(&config, test_store())
+    }
+
+    #[allow(dead_code)]
+    fn test_router_with_store(dir: &Path, store: Arc<Store>) -> Router {
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.to_path_buf(),
+                index_files: vec!["index.php".to_string(), "index.html".to_string()],
+                fallback: vec![
+                    "$uri".to_string(),
+                    "$uri/".to_string(),
+                    "/index.php?$query_string".to_string(),
+                ],
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
+        };
+        config.server.static_files.etag = true;
+        Router::new(&config, store)
     }
 
     fn default_compression() -> CompressionSettings {
@@ -862,7 +949,7 @@ mod tests {
             kv: Default::default(),
         };
         config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
-        let router = Router::new(&config);
+        let router = Router::new(&config, test_store());
 
         // 203.0.113.50 is the real client, 10.0.0.1 is the proxy
         let xff = "203.0.113.50, 10.0.0.1";
@@ -883,7 +970,7 @@ mod tests {
             kv: Default::default(),
         };
         config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
-        let router = Router::new(&config);
+        let router = Router::new(&config, test_store());
 
         let xff = "10.0.0.2, 10.0.0.1";
         let ip = router.resolve_xff(xff);
@@ -905,7 +992,7 @@ mod tests {
             db: Default::default(),
             kv: Default::default(),
         };
-        let router = Router::new(&config);
+        let router = Router::new(&config, test_store());
         assert_eq!(router.server_port, 3000);
     }
 
@@ -922,7 +1009,7 @@ mod tests {
             db: Default::default(),
             kv: Default::default(),
         };
-        let router = Router::new(&config);
+        let router = Router::new(&config, test_store());
         assert_eq!(router.server_port, 8080);
     }
 
@@ -964,7 +1051,7 @@ mod tests {
             db: Default::default(),
             kv: Default::default(),
         };
-        let router = Router::new(&config);
+        let router = Router::new(&config, test_store());
         assert!(router.is_php_allowed("/anything.php"));
     }
 
@@ -984,7 +1071,7 @@ mod tests {
             "/index.php".to_string(),
             "/wp-login.php".to_string(),
         ];
-        let router = Router::new(&config);
+        let router = Router::new(&config, test_store());
         assert!(router.is_php_allowed("/index.php"));
         assert!(router.is_php_allowed("/wp-login.php"));
         assert!(!router.is_php_allowed("/evil.php"));
@@ -1006,7 +1093,7 @@ mod tests {
             "/index.php".to_string(),
             "/wp-admin/*.php".to_string(),
         ];
-        let router = Router::new(&config);
+        let router = Router::new(&config, test_store());
         assert!(router.is_php_allowed("/index.php"));
         assert!(router.is_php_allowed("/wp-admin/admin.php"));
         assert!(router.is_php_allowed("/wp-admin/options.php"));
@@ -1034,5 +1121,218 @@ mod tests {
         assert!(glob_match("/vendor/*", "/vendor/anything"));
         // nested paths beyond the /* also match (/* means "directory and children")
         assert!(glob_match("/vendor/*", "/vendor/foo/bar"));
+    }
+
+    // ── ETag caching tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_php_etag_cache_key_without_query() {
+        let key = php_etag_cache_key("GET", "/api/data", "");
+        assert_eq!(key, "etag:GET:/api/data");
+    }
+
+    #[test]
+    fn test_php_etag_cache_key_with_query() {
+        let key = php_etag_cache_key("POST", "/api/users", "id=42");
+        assert_eq!(key, "etag:POST:/api/users?id=42");
+    }
+
+    #[test]
+    fn test_etag_matches_value_exact() {
+        assert!(etag_matches_value("W/\"abc123\"", "W/\"abc123\""));
+        assert!(!etag_matches_value("W/\"abc123\"", "W/\"xyz789\""));
+    }
+
+    #[test]
+    fn test_etag_matches_value_wildcard() {
+        assert!(etag_matches_value("W/\"anything\"", "*"));
+        assert!(etag_matches_value("W/\"123\"", "*"));
+    }
+
+    #[test]
+    fn test_etag_matches_value_comma_separated() {
+        assert!(etag_matches_value("W/\"v1\"", "W/\"v1\", W/\"v2\""));
+        assert!(etag_matches_value("W/\"v2\"", "W/\"v1\", W/\"v2\""));
+        assert!(!etag_matches_value("W/\"v3\"", "W/\"v1\", W/\"v2\""));
+    }
+
+    #[test]
+    fn test_etag_matches_value_with_whitespace() {
+        assert!(etag_matches_value("W/\"v1\"", "  W/\"v1\"  "));
+        assert!(etag_matches_value("W/\"v1\"", "W/\"v1\" , W/\"v2\" "));
+    }
+
+    // ── PHP-linked ETag integration tests ────────────────────────────
+    //
+    // These tests require PHP to be linked. They verify that PHP-set
+    // ETags are properly cached in the KV store and matched on
+    // subsequent requests.
+    //
+    // Run with: cargo nextest run -p ephpm-server --run-ignored all
+
+    #[cfg(all(test, php_linked))]
+    mod php_etag_tests {
+        use hyper::body::Empty;
+        use http_body_util::BodyExt;
+        use ephpm_php::PhpRuntime;
+        use serial_test::serial;
+
+        use super::*;
+
+        /// Helper to read response body bytes
+        async fn body_bytes(resp: Response<Full<Bytes>>) -> Vec<u8> {
+            resp.into_body().collect().await.unwrap().to_bytes().to_vec()
+        }
+
+        /// Helper to create a test request
+        fn make_request(method: &str, path: &str, if_none_match: Option<&str>) -> Request<Empty> {
+            let mut builder = Request::builder().method(method).uri(path);
+            if let Some(tag) = if_none_match {
+                builder = builder.header("if-none-match", tag);
+            }
+            builder.body(Empty::new()).unwrap()
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn php_etag_stored_on_first_request() {
+            let dir = tempfile::tempdir().unwrap();
+            let php_code = r#"<?php
+header('ETag: "test-v1"');
+echo "content here";
+"#;
+            fs::write(dir.path().join("index.php"), php_code).unwrap();
+
+            let store = test_store();
+            let router = test_router_with_store(dir.path(), Arc::clone(&store));
+
+            let req = make_request("GET", "/index.php", None);
+            let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+            let resp = router.handle(req, addr, false).await.unwrap();
+
+            // Should be 200 with ETag header
+            assert_eq!(resp.status(), StatusCode::OK);
+            let etag = resp.headers().get("etag").and_then(|v| v.to_str().ok());
+            assert_eq!(etag, Some("\"test-v1\""));
+
+            // ETag should be stored in the KV store
+            let key = php_etag_cache_key("GET", "/index.php", "");
+            let stored = store.get(&key);
+            assert!(stored.is_some());
+            assert_eq!(stored.unwrap(), b"\"test-v1\"");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn php_etag_returns_304_on_match() {
+            let dir = tempfile::tempdir().unwrap();
+            let php_code = r#"<?php
+header('ETag: "test-v2"');
+// This should NOT execute on the second request
+file_put_contents('/tmp/php_executed', 'yes');
+echo "should not see this";
+"#;
+            fs::write(dir.path().join("index.php"), php_code).unwrap();
+
+            let store = test_store();
+            let router = test_router_with_store(dir.path(), Arc::clone(&store));
+
+            // Pre-seed the store with an ETag
+            let key = php_etag_cache_key("GET", "/index.php", "");
+            store.set(key, b"\"test-v2\"".to_vec(), None);
+
+            // Make request with matching If-None-Match
+            let req = make_request("GET", "/index.php", Some("\"test-v2\""));
+            let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+            let resp = router.handle(req, addr, false).await.unwrap();
+
+            // Should be 304 with no body
+            assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+            let body = body_bytes(resp).await;
+            assert!(body.is_empty());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn php_etag_executes_php_on_mismatch() {
+            let dir = tempfile::tempdir().unwrap();
+            let php_code = r#"<?php
+header('ETag: "new-version"');
+echo "new content";
+"#;
+            fs::write(dir.path().join("index.php"), php_code).unwrap();
+
+            let store = test_store();
+            let router = test_router_with_store(dir.path(), Arc::clone(&store));
+
+            // Pre-seed the store with a different ETag
+            let key = php_etag_cache_key("GET", "/index.php", "");
+            store.set(key.clone(), b"\"old-version\"".to_vec(), None);
+
+            // Make request with different If-None-Match
+            let req = make_request("GET", "/index.php", Some("\"old-version\""));
+            let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+            let resp = router.handle(req, addr, false).await.unwrap();
+
+            // Should be 200 with new ETag
+            assert_eq!(resp.status(), StatusCode::OK);
+            let etag = resp.headers().get("etag").and_then(|v| v.to_str().ok());
+            assert_eq!(etag, Some("\"new-version\""));
+
+            // Store should be updated
+            let stored = store.get(&key);
+            assert_eq!(stored.unwrap(), b"\"new-version\"");
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn php_no_etag_header_not_stored() {
+            let dir = tempfile::tempdir().unwrap();
+            let php_code = r#"<?php
+// No ETag header
+echo "no etag";
+"#;
+            fs::write(dir.path().join("index.php"), php_code).unwrap();
+
+            let store = test_store();
+            let router = test_router_with_store(dir.path(), Arc::clone(&store));
+
+            let req = make_request("GET", "/index.php", None);
+            let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+            let resp = router.handle(req, addr, false).await.unwrap();
+
+            // Should be 200 with no ETag header
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(resp.headers().get("etag").is_none());
+
+            // KV store should not have an entry for this path
+            let key = php_etag_cache_key("GET", "/index.php", "");
+            assert!(store.get(&key).is_none());
+        }
+
+        #[tokio::test]
+        #[serial]
+        async fn php_etag_not_cached_for_post() {
+            let dir = tempfile::tempdir().unwrap();
+            let php_code = r#"<?php
+header('ETag: "post-etag"');
+echo "post response";
+"#;
+            fs::write(dir.path().join("index.php"), php_code).unwrap();
+
+            let store = test_store();
+            let router = test_router_with_store(dir.path(), Arc::clone(&store));
+
+            let req = make_request("POST", "/index.php", None);
+            let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+            let resp = router.handle(req, addr, false).await.unwrap();
+
+            // POST should execute normally and return 200
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            // POST responses should NOT be cached in KV store (only GET/HEAD)
+            let key = php_etag_cache_key("POST", "/index.php", "");
+            assert!(store.get(&key).is_none());
+        }
     }
 }
