@@ -17,6 +17,9 @@ anyhow.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 bytes.workspace = true
+flate2.workspace = true
+brotli.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

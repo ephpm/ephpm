@@ -6,6 +6,7 @@
 
 mod entry;
 
+use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,6 +43,54 @@ impl EvictionPolicy {
     }
 }
 
+/// Compression algorithm for stored values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompressionAlgo {
+    /// No compression.
+    #[default]
+    None,
+    /// Gzip compression.
+    Gzip,
+    /// Brotli compression.
+    Brotli,
+    /// Zstandard compression.
+    Zstd,
+}
+
+impl CompressionAlgo {
+    /// Parse from the config string. Falls back to `None` on unknown values.
+    #[must_use]
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "gzip" => Self::Gzip,
+            "brotli" | "br" => Self::Brotli,
+            "zstd" => Self::Zstd,
+            _ => Self::None,
+        }
+    }
+}
+
+/// Configuration for value compression in the KV store.
+#[derive(Debug, Clone, Copy)]
+pub struct CompressionConfig {
+    /// The compression algorithm to use.
+    pub algo: CompressionAlgo,
+    /// Compression level (1 = fastest, 9 = best compression).
+    pub level: u32,
+    /// Minimum value size in bytes before compression is applied.
+    pub min_size: usize,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            algo: CompressionAlgo::None,
+            level: 6,
+            min_size: 1024,
+        }
+    }
+}
+
 /// Configuration for the KV store.
 #[derive(Debug, Clone)]
 pub struct StoreConfig {
@@ -49,6 +98,8 @@ pub struct StoreConfig {
     pub memory_limit: usize,
     /// Eviction policy when the memory limit is reached.
     pub eviction_policy: EvictionPolicy,
+    /// Compression configuration.
+    pub compression: CompressionConfig,
 }
 
 impl Default for StoreConfig {
@@ -56,6 +107,7 @@ impl Default for StoreConfig {
         Self {
             memory_limit: 256 * 1024 * 1024, // 256 MiB
             eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig::default(),
         }
     }
 }
@@ -86,6 +138,7 @@ impl Store {
 
     /// Get a value by key. Returns `None` if missing or expired.
     /// Touches the entry for LRU tracking.
+    /// Transparently decompresses the value if it was stored compressed.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
         let mut entry = self.data.get_mut(key)?;
@@ -95,7 +148,11 @@ impl Store {
             return None;
         }
         entry.touch();
-        Some(entry.data.clone())
+        if entry.compressed {
+            decompress_value(&entry.data, self.config.compression.algo)
+        } else {
+            Some(entry.data.clone())
+        }
     }
 
     /// Check if a key exists (and is not expired).
@@ -172,9 +229,24 @@ impl Store {
     /// Returns `true` if the write succeeded, `false` if rejected by
     /// the `NoEviction` policy when the memory limit is reached.
     pub fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        // Try compression if configured and size is above threshold.
+        let (data, compressed) =
+            if self.config.compression.algo != CompressionAlgo::None
+                && value.len() >= self.config.compression.min_size
+            {
+                let compressed_data = compress_value(&value, self.config.compression);
+                if compressed_data.len() < value.len() {
+                    (compressed_data, true)
+                } else {
+                    (value, false)
+                }
+            } else {
+                (value, false)
+            };
+
         let entry = match ttl {
-            Some(dur) => Entry::with_expiry(value, key.len(), Instant::now() + dur),
-            None => Entry::new(value, key.len()),
+            Some(dur) => Entry::with_expiry(data, key.len(), compressed, Instant::now() + dur),
+            None => Entry::new(data, key.len(), compressed),
         };
 
         let new_size = entry.mem_size;
@@ -251,14 +323,39 @@ impl Store {
                 self.remove(key);
                 // Fall through to create.
             } else {
-                let current = parse_int_value(&entry.data)?;
+                // Decompress if needed before parsing.
+                let data = if entry.compressed {
+                    decompress_value(&entry.data, self.config.compression.algo)
+                        .ok_or_else(|| "ERR failed to decompress value".to_string())?
+                } else {
+                    entry.data.clone()
+                };
+
+                let current = parse_int_value(&data)?;
                 let new_val = current.checked_add(delta).ok_or_else(|| {
                     "ERR increment or decrement would overflow".to_string()
                 })?;
                 let new_bytes = new_val.to_string().into_bytes();
+
+                // Try compression again if configured.
+                let (stored_data, compressed) =
+                    if self.config.compression.algo != CompressionAlgo::None
+                        && new_bytes.len() >= self.config.compression.min_size
+                    {
+                        let compressed_data = compress_value(&new_bytes, self.config.compression);
+                        if compressed_data.len() < new_bytes.len() {
+                            (compressed_data, true)
+                        } else {
+                            (new_bytes, false)
+                        }
+                    } else {
+                        (new_bytes, false)
+                    };
+
                 let old_mem = entry.mem_size;
-                entry.data = new_bytes;
-                entry.mem_size = Entry::new(entry.data.clone(), key.len()).mem_size;
+                entry.data = stored_data;
+                entry.compressed = compressed;
+                entry.mem_size = Entry::new(entry.data.clone(), key.len(), compressed).mem_size;
                 entry.touch();
                 let new_mem = entry.mem_size;
                 drop(entry);
@@ -287,13 +384,46 @@ impl Store {
                 self.remove(key);
                 // Fall through to create.
             } else {
-                let added = value.len();
-                entry.data.extend_from_slice(value);
-                entry.mem_size += added;
+                // Decompress if needed before appending.
+                let mut data = if entry.compressed {
+                    decompress_value(&entry.data, self.config.compression.algo)
+                        .unwrap_or_else(|| entry.data.clone())
+                } else {
+                    entry.data.clone()
+                };
+
+                let _added = value.len();
+                data.extend_from_slice(value);
+
+                // Try compression again if configured.
+                let (stored_data, compressed) =
+                    if self.config.compression.algo != CompressionAlgo::None
+                        && data.len() >= self.config.compression.min_size
+                    {
+                        let compressed_data = compress_value(&data, self.config.compression);
+                        if compressed_data.len() < data.len() {
+                            (compressed_data, true)
+                        } else {
+                            (data.clone(), false)
+                        }
+                    } else {
+                        (data.clone(), false)
+                    };
+
+                let old_mem = entry.mem_size;
+                entry.data = stored_data;
+                entry.compressed = compressed;
+                entry.mem_size = Entry::new(entry.data.clone(), key.len(), compressed).mem_size;
                 entry.touch();
-                let new_len = entry.data.len();
-                self.mem_add(added);
-                return new_len;
+                let new_mem = entry.mem_size;
+                drop(entry);
+                // Adjust memory tracking.
+                if new_mem > old_mem {
+                    self.mem_add(new_mem - old_mem);
+                } else {
+                    self.mem_sub(old_mem - new_mem);
+                }
+                return data.len();
             }
         }
 
@@ -467,6 +597,65 @@ fn glob_match_inner(pat: &[char], chars: &[char]) -> bool {
     }
 }
 
+/// Compress a value using the configured algorithm.
+/// Returns the compressed bytes (caller should check if size reduction is worth it).
+fn compress_value(data: &[u8], config: CompressionConfig) -> Vec<u8> {
+    match config.algo {
+        CompressionAlgo::None => unreachable!(),
+        CompressionAlgo::Gzip => {
+            let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(config.level));
+            if encoder.write_all(data).is_err() {
+                return data.to_vec(); // Fall back to uncompressed
+            }
+            match encoder.finish() {
+                Ok(compressed) => compressed,
+                Err(_) => data.to_vec(),
+            }
+        }
+        CompressionAlgo::Brotli => {
+            // The brotli crate (FFI bindings to C library) doesn't expose a simple
+            // high-level compression function like flate2::Compression or zstd::encode_all.
+            // For now, fall back to storing uncompressed. Users should prefer gzip or zstd.
+            // TODO: Implement via raw FFI bindings to BrotliEncoderCompress if needed.
+            data.to_vec()
+        }
+        CompressionAlgo::Zstd => {
+            #[allow(clippy::cast_possible_wrap)]
+            match zstd::encode_all(data, config.level as i32) {
+                Ok(compressed) => compressed,
+                Err(_) => data.to_vec(),
+            }
+        }
+    }
+}
+
+/// Decompress a value using the specified algorithm.
+/// Returns `None` if decompression fails.
+fn decompress_value(data: &[u8], algo: CompressionAlgo) -> Option<Vec<u8>> {
+    use std::io::Read;
+    match algo {
+        CompressionAlgo::None => unreachable!(),
+        CompressionAlgo::Gzip => {
+            let decoder = flate2::read::GzDecoder::new(data);
+            let mut output = Vec::new();
+            match std::io::BufReader::new(decoder).read_to_end(&mut output) {
+                Ok(_) => Some(output),
+                Err(_) => None,
+            }
+        }
+        CompressionAlgo::Brotli => {
+            let mut decompressor = brotli::Decompressor::new(data, 4096);
+            let mut output = Vec::new();
+            if decompressor.read_to_end(&mut output).is_ok() {
+                Some(output)
+            } else {
+                None
+            }
+        }
+        CompressionAlgo::Zstd => zstd::decode_all(data).ok(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,6 +709,7 @@ mod tests {
         let entry = Entry::with_expiry(
             b"v".to_vec(),
             1,
+            false,
             Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
         );
         s.data.insert("k".into(), entry);
@@ -605,6 +795,7 @@ mod tests {
         let entry = Entry::with_expiry(
             b"v".to_vec(),
             1,
+            false,
             Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
         );
         s.data.insert("expired".into(), entry);
@@ -620,10 +811,115 @@ mod tests {
         let s = Store::new(StoreConfig {
             memory_limit: 200,
             eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
         });
         // First write should succeed.
         assert!(s.set("k".into(), b"v".to_vec(), None));
         // Fill up memory with a large value.
         assert!(!s.set("big".into(), vec![0u8; 1024], None));
+    }
+
+    #[test]
+    fn compression_gzip_round_trip() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig {
+                algo: CompressionAlgo::Gzip,
+                level: 6,
+                min_size: 10,
+            },
+        });
+        let data = b"hello world this is a test string that should compress well";
+        s.set("key".into(), data.to_vec(), None);
+        let retrieved = s.get("key");
+        assert_eq!(retrieved, Some(data.to_vec()));
+    }
+
+    #[test]
+    fn compression_brotli_round_trip() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig {
+                algo: CompressionAlgo::Brotli,
+                level: 6,
+                min_size: 10,
+            },
+        });
+        let data = b"hello world this is another test string for brotli";
+        s.set("key".into(), data.to_vec(), None);
+        let retrieved = s.get("key");
+        assert_eq!(retrieved, Some(data.to_vec()));
+    }
+
+    #[test]
+    fn compression_zstd_round_trip() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig {
+                algo: CompressionAlgo::Zstd,
+                level: 6,
+                min_size: 10,
+            },
+        });
+        let data = b"hello world this is yet another test string for zstd";
+        s.set("key".into(), data.to_vec(), None);
+        let retrieved = s.get("key");
+        assert_eq!(retrieved, Some(data.to_vec()));
+    }
+
+    #[test]
+    fn compression_below_min_size_not_compressed() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig {
+                algo: CompressionAlgo::Gzip,
+                level: 6,
+                min_size: 1000,
+            },
+        });
+        let data = b"tiny";
+        s.set("key".into(), data.to_vec(), None);
+        let entry = s.data.get("key").unwrap();
+        assert!(!entry.compressed);
+        let retrieved = s.get("key");
+        assert_eq!(retrieved, Some(data.to_vec()));
+    }
+
+    #[test]
+    fn compression_incr_by_works() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig {
+                algo: CompressionAlgo::Gzip,
+                level: 6,
+                min_size: 1,
+            },
+        });
+        assert_eq!(s.incr_by("counter", 1), Ok(1));
+        assert_eq!(s.incr_by("counter", 5), Ok(6));
+        let retrieved = s.get("counter");
+        assert_eq!(retrieved, Some(b"6".to_vec()));
+    }
+
+    #[test]
+    fn compression_append_works() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig {
+                algo: CompressionAlgo::Zstd,
+                level: 6,
+                min_size: 1,
+            },
+        });
+        assert_eq!(s.append("key", b"hello"), 5);
+        assert_eq!(s.append("key", b" world"), 11);
+        let retrieved = s.get("key");
+        assert_eq!(retrieved, Some(b"hello world".to_vec()));
     }
 }

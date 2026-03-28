@@ -91,6 +91,10 @@ mod ffi {
         /// `php_embed_module`. Must be called BEFORE `php_embed_init()`.
         pub fn ephpm_pre_init();
 
+        /// Set a custom php.ini file path. Must be called BEFORE
+        /// `php_embed_init()` so the ini file is loaded during module startup.
+        pub fn ephpm_set_ini_file(ini_file: *const ::std::os::raw::c_char);
+
         /// Set the KV ops function pointer table. Can be called after
         /// `php_embed_init()`, before any PHP scripts execute.
         pub fn ephpm_set_kv_ops(
@@ -154,6 +158,19 @@ impl PhpRuntime {
     /// Returns `PhpError::LockPoisoned` if the runtime mutex is poisoned,
     /// or `PhpError::InitFailed` if PHP initialization fails.
     pub fn init() -> Result<(), PhpError> {
+        Self::init_with_ini_file(None)
+    }
+
+    /// Initialize the PHP runtime with a custom ini file.
+    ///
+    /// If `ini_file` is `Some`, that file will be loaded before any PHP
+    /// scripts execute. If `None`, PHP uses its default ini file search.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PhpError::LockPoisoned` if the runtime mutex is poisoned,
+    /// or `PhpError::InitFailed` if PHP initialization fails.
+    pub fn init_with_ini_file(_ini_file: Option<&std::path::Path>) -> Result<(), PhpError> {
         let mut runtime = PHP_RUNTIME.lock().map_err(|_| PhpError::LockPoisoned)?;
         if runtime.is_some() {
             return Ok(()); // Already initialized
@@ -167,6 +184,20 @@ impl PhpRuntime {
             // Safety: Must be called before php_embed_init() so php_module_startup()
             // registers the functions. No PHP state exists yet.
             unsafe { ffi::ephpm_pre_init() };
+
+            // Keep the CString alive until php_embed_init() completes so the
+            // pointer remains valid while PHP reads the configuration.
+            let _ini_file_cstring = if let Some(path) = _ini_file {
+                let cstr = CString::new(path.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| CString::new("").unwrap());
+                // Safety: Must be called before php_embed_init() so the ini file
+                // is loaded during module startup. The pointer is valid until
+                // php_embed_init() returns.
+                unsafe { ffi::ephpm_set_ini_file(cstr.as_ptr()) };
+                Some(cstr)
+            } else {
+                None
+            };
 
             // Initialize PHP embed SAPI (module + initial request startup).
             // Safety: php_embed_init must be called exactly once before any PHP

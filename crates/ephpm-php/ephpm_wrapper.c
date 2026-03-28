@@ -904,6 +904,26 @@ static const zend_function_entry ephpm_kv_functions[] = {
     PHP_FE_END
 };
 
+/* ===== INI file path ===== */
+/* Holds the custom ini file path set via ephpm_set_ini_file() */
+static const char *custom_ini_file = NULL;
+
+/*
+ * Set a custom php.ini file path.
+ * Must be called BEFORE php_embed_init() so that php_module_startup()
+ * uses this path instead of searching for php.ini in default locations.
+ *
+ * The ini_file pointer must remain valid until php_embed_init() completes.
+ * Typically, this is a CString from Rust that lives on the stack during init.
+ */
+void ephpm_set_ini_file(const char *ini_file)
+{
+    custom_ini_file = ini_file;
+    if (ini_file) {
+        php_embed_module.php_ini_path_override = (char *)ini_file;
+    }
+}
+
 /*
  * Pre-initialization: set additional_functions on the embed module.
  * Must be called BEFORE php_embed_init() so that php_module_startup()

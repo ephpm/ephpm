@@ -5,8 +5,10 @@ use std::time::Instant;
 /// A single value stored in the KV store.
 #[derive(Debug, Clone)]
 pub struct Entry {
-    /// The raw value bytes.
+    /// The raw value bytes (may be compressed).
     pub data: Vec<u8>,
+    /// `true` if `data` is compressed; `false` if raw.
+    pub compressed: bool,
     /// Absolute expiry time, or `None` for persistent keys.
     pub expires_at: Option<Instant>,
     /// Last access time for LRU eviction.
@@ -18,10 +20,11 @@ pub struct Entry {
 impl Entry {
     /// Create a new entry with no expiry.
     #[must_use]
-    pub fn new(data: Vec<u8>, key_len: usize) -> Self {
+    pub fn new(data: Vec<u8>, key_len: usize, compressed: bool) -> Self {
         let mem_size = Self::estimate_size(key_len, data.len());
         Self {
             data,
+            compressed,
             expires_at: None,
             last_accessed: Instant::now(),
             mem_size,
@@ -30,10 +33,11 @@ impl Entry {
 
     /// Create a new entry with an absolute expiry.
     #[must_use]
-    pub fn with_expiry(data: Vec<u8>, key_len: usize, expires_at: Instant) -> Self {
+    pub fn with_expiry(data: Vec<u8>, key_len: usize, compressed: bool, expires_at: Instant) -> Self {
         let mem_size = Self::estimate_size(key_len, data.len());
         Self {
             data,
+            compressed,
             expires_at: Some(expires_at),
             last_accessed: Instant::now(),
             mem_size,

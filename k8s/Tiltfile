@@ -13,20 +13,24 @@ expected_php_version = os.getenv("EXPECTED_PHP_VERSION", "8.5")
 # ── Images ───────────────────────────────────────────────────────────────────
 
 # Main ephpm image (pre-built and loaded into Kind by xtask)
-docker_build(
-    "ephpm:dev",
-    context="..",
-    dockerfile="../docker/Dockerfile",
-    only=["crates/", "xtask/", "Cargo.toml", "Cargo.lock", "tests/", "docker/"],
-)
+# Tilt does NOT rebuild this in CI mode — xtask has already done it.
+# Uncomment this only when running `tilt up` for development and you want
+# Tilt to rebuild on code changes.
+# docker_build(
+#     "ephpm:dev",
+#     context="..",
+#     dockerfile="../docker/Dockerfile",
+#     only=["crates/", "xtask/", "Cargo.toml", "Cargo.lock", "tests/", "docker/"],
+# )
 
-# E2E test runner image
-docker_build(
-    "ephpm-e2e:dev",
-    context="..",
-    dockerfile="../docker/Dockerfile.e2e",
-    only=["crates/ephpm-e2e/"],
-)
+# E2E test runner image (pre-built and loaded into Kind by xtask)
+# Tilt does NOT rebuild this in CI mode — xtask has already done it.
+# docker_build(
+#     "ephpm-e2e:dev",
+#     context="..",
+#     dockerfile="../docker/Dockerfile.e2e",
+#     only=["crates/ephpm-e2e/"],
+# )
 
 # ── Kubernetes resources ─────────────────────────────────────────────────────
 

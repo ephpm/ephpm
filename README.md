@@ -11,7 +11,7 @@ An all-in-one PHP application server written in Rust. Embeds PHP via FFI into a 
 | GC pauses | None | Go GC | Go GC | PHP GC | PHP GC | PHP GC |
 | Binary | Single static binary | Caddy module | Go binary + PHP workers | PHP + extension | Apache + modules | Nginx + separate FPM |
 | DB proxy | Planned | No | No | Connection pool | No | No |
-| Clustering | Planned | No | No | Built-in | Manual | Manual |
+| Clustering | Planned | No | No | Built-in | No | No |
 | PHP compatibility | Drop-in (embed SAPI) | Drop-in (worker SAPI) | Requires PSR-7 packages | Requires async code | Native (100%) | Native (100%) |
 | Deployment | Single binary | Requires Caddy | Multi-process | Requires PHP + Swoole extension | Apache + modules | Separate services |
 | Container-friendly | ✓ (single binary) | ✓ (Caddy module) | ✓ | ⚠️ (PHP + extension) | ⚠️ (heavier) | ⚠️ (two services) |
@@ -106,6 +106,11 @@ index_files = ["index.php", "index.html"]
 mode = "embedded"           # or "external" to use your own PHP binary
 max_execution_time = 30
 memory_limit = "128M"
+
+# Load a custom php.ini before applying overrides (optional)
+# ini_file = "/etc/php/php.ini"
+
+# INI directive overrides (applied AFTER ini_file)
 ini_overrides = [
     ["display_errors", "Off"],
     ["error_reporting", "E_ALL"],
@@ -118,7 +123,26 @@ ini_overrides = [
 # workers = 4
 ```
 
-All config values can be overridden with `EPHPM_` prefixed environment variables (e.g., `EPHPM_SERVER__LISTEN=0.0.0.0:9090`).
+### PHP Configuration
+
+ePHPm supports two ways to configure PHP:
+
+1. **`ini_file`** — Path to a custom `php.ini` file. When set, PHP loads this file during initialization. Useful for reusing an existing PHP configuration from your system or custom builds. Example: `ini_file = "/etc/php/8.5/php.ini"`
+
+2. **`ini_overrides`** — Array of `[key, value]` pairs that override individual directives. Applied *after* `ini_file` (if specified), so these take precedence. Useful for tuning settings without modifying a full ini file.
+
+Example that uses both:
+
+```toml
+[php]
+ini_file = "/etc/php/8.5/php.ini"      # Load base config
+ini_overrides = [
+    ["memory_limit", "256M"],           # Override specific settings
+    ["max_execution_time", "60"],
+]
+```
+
+All config values can be overridden with `EPHPM_` prefixed environment variables (e.g., `EPHPM_SERVER__LISTEN=0.0.0.0:9090`). Array values use the format `EPHPM_PHP__INI_OVERRIDES='[["key","val"],["key2","val2"]]'` (JSON).
 
 ## Roadmap
 

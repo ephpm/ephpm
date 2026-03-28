@@ -60,6 +60,7 @@ pub struct Router {
     trusted_hosts: Vec<String>,
     response_headers: Vec<(String, String)>,
     store: Arc<Store>,
+    php_etag_cache_config: ephpm_config::PhpETagCacheConfig,
 }
 
 impl Router {
@@ -107,6 +108,7 @@ impl Router {
                 .map(|[k, v]| (k.clone(), v.clone()))
                 .collect(),
             store,
+            php_etag_cache_config: config.server.php_etag_cache.clone(),
         }
     }
 
@@ -181,12 +183,12 @@ impl Router {
             Resolved::File(fs_path) => {
                 if is_php_file(&fs_path) {
                     if self.is_php_allowed(&uri_path) {
-                        let is_cacheable = (method == "GET" || method == "HEAD") && self.etag;
+                        let is_cacheable = (method == "GET" || method == "HEAD") && self.php_etag_cache_config.enabled;
 
                         // Pre-check: bypass PHP if client's ETag matches stored value.
                         if is_cacheable {
                             if let Some(client_tag) = &if_none_match {
-                                let key = php_etag_cache_key(&method, &uri_path, &query_string);
+                                let key = php_etag_cache_key(&self.php_etag_cache_config.key_prefix, &method, &uri_path, &query_string);
                                 if let Some(stored) = self.store.get(&key) {
                                     let stored_etag = String::from_utf8_lossy(&stored);
                                     if etag_matches_value(&stored_etag, client_tag) {
@@ -207,8 +209,14 @@ impl Router {
                         // Post-store: cache any ETag PHP set in the response.
                         if is_cacheable {
                             if let Some(etag_val) = resp.headers().get("etag").and_then(|v| v.to_str().ok()) {
-                                let key = php_etag_cache_key(&method, &uri_path, &query_string);
-                                self.store.set(key, etag_val.as_bytes().to_vec(), None);
+                                let key = php_etag_cache_key(&self.php_etag_cache_config.key_prefix, &method, &uri_path, &query_string);
+                                #[allow(clippy::cast_sign_loss)]
+                                let ttl = if self.php_etag_cache_config.ttl_secs > 0 {
+                                    Some(Duration::from_secs(self.php_etag_cache_config.ttl_secs as u64))
+                                } else {
+                                    None
+                                };
+                                self.store.set(key, etag_val.as_bytes().to_vec(), ttl);
                             }
                         }
 
@@ -673,12 +681,12 @@ pub fn gzip_compress(data: &[u8], content_type: &str, settings: CompressionSetti
 
 /// Build the KV store key for caching a PHP response's ETag.
 ///
-/// Format: `etag:{method}:{path}` or `etag:{method}:{path}?{query}` if query string is present.
-fn php_etag_cache_key(method: &str, path: &str, query: &str) -> String {
+/// Format: `{prefix}{method}:{path}` or `{prefix}{method}:{path}?{query}` if query string is present.
+fn php_etag_cache_key(prefix: &str, method: &str, path: &str, query: &str) -> String {
     if query.is_empty() {
-        format!("etag:{method}:{path}")
+        format!("{prefix}{method}:{path}")
     } else {
-        format!("etag:{method}:{path}?{query}")
+        format!("{prefix}{method}:{path}?{query}")
     }
 }
 
@@ -1127,13 +1135,13 @@ mod tests {
 
     #[test]
     fn test_php_etag_cache_key_without_query() {
-        let key = php_etag_cache_key("GET", "/api/data", "");
+        let key = php_etag_cache_key("etag:", "GET", "/api/data", "");
         assert_eq!(key, "etag:GET:/api/data");
     }
 
     #[test]
     fn test_php_etag_cache_key_with_query() {
-        let key = php_etag_cache_key("POST", "/api/users", "id=42");
+        let key = php_etag_cache_key("etag:", "POST", "/api/users", "id=42");
         assert_eq!(key, "etag:POST:/api/users?id=42");
     }
 
@@ -1216,7 +1224,7 @@ echo "content here";
             assert_eq!(etag, Some("\"test-v1\""));
 
             // ETag should be stored in the KV store
-            let key = php_etag_cache_key("GET", "/index.php", "");
+            let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
             let stored = store.get(&key);
             assert!(stored.is_some());
             assert_eq!(stored.unwrap(), b"\"test-v1\"");
@@ -1238,7 +1246,7 @@ echo "should not see this";
             let router = test_router_with_store(dir.path(), Arc::clone(&store));
 
             // Pre-seed the store with an ETag
-            let key = php_etag_cache_key("GET", "/index.php", "");
+            let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
             store.set(key, b"\"test-v2\"".to_vec(), None);
 
             // Make request with matching If-None-Match
@@ -1266,7 +1274,7 @@ echo "new content";
             let router = test_router_with_store(dir.path(), Arc::clone(&store));
 
             // Pre-seed the store with a different ETag
-            let key = php_etag_cache_key("GET", "/index.php", "");
+            let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
             store.set(key.clone(), b"\"old-version\"".to_vec(), None);
 
             // Make request with different If-None-Match
@@ -1306,7 +1314,7 @@ echo "no etag";
             assert!(resp.headers().get("etag").is_none());
 
             // KV store should not have an entry for this path
-            let key = php_etag_cache_key("GET", "/index.php", "");
+            let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
             assert!(store.get(&key).is_none());
         }
 
@@ -1331,7 +1339,7 @@ echo "post response";
             assert_eq!(resp.status(), StatusCode::OK);
 
             // POST responses should NOT be cached in KV store (only GET/HEAD)
-            let key = php_etag_cache_key("POST", "/index.php", "");
+            let key = php_etag_cache_key("etag:", "POST", "/index.php", "");
             assert!(store.get(&key).is_none());
         }
     }

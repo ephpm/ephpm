@@ -48,6 +48,15 @@ index_files = ["index.php", "index.html"]
 mode = "embedded"
 max_execution_time = 30
 memory_limit = "128M"
+
+# Optional: path to a custom php.ini file to load before ini_overrides.
+# Useful for reusing an existing PHP configuration.
+# Example: ini_file = "/etc/php.ini"
+# Default: None (PHP searches standard locations or uses defaults)
+# ini_file = "/etc/php.ini"
+
+# INI directive overrides as [key, value] pairs.
+# Applied AFTER ini_file (if specified), so these take precedence.
 ini_overrides = [
     ["display_errors", "Off"],
     ["error_reporting", "E_ALL"],

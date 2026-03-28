@@ -87,4 +87,4 @@ COPY tests/ephpm-test.toml /etc/ephpm/ephpm.toml
 EXPOSE 8080
 
 ENTRYPOINT ["tini", "--"]
-CMD ["ephpm", "--config", "/etc/ephpm/ephpm.toml"]
+CMD ["ephpm", "serve", "--config", "/etc/ephpm/ephpm.toml"]

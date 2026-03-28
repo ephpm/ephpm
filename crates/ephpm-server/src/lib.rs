@@ -473,6 +473,11 @@ fn start_kv_service(
     let store_config = ephpm_kv::store::StoreConfig {
         memory_limit: parse_memory_size(&config.kv.memory_limit)?,
         eviction_policy: ephpm_kv::store::EvictionPolicy::from_str_lossy(&config.kv.eviction_policy),
+        compression: ephpm_kv::store::CompressionConfig {
+            algo: ephpm_kv::store::CompressionAlgo::from_str_lossy(&config.kv.compression),
+            level: config.kv.compression_level,
+            min_size: config.kv.compression_min_size,
+        },
     };
     let store = ephpm_kv::store::Store::new(store_config);
 

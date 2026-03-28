@@ -27,6 +27,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 mime_guess = "2"
 flate2 = "1"
+brotli = "7"
+zstd = "0.13"
 ipnet = "2"
 tracing-appender = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }

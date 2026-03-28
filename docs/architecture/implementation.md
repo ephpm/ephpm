@@ -546,6 +546,7 @@ index_files = ["index.php", "index.html"]
 [php]
 max_execution_time = 30
 memory_limit = "128M"
+# ini_file = "/etc/php/8.5/php.ini"    # optional: load a custom php.ini
 ini_overrides = [
     ["display_errors", "Off"],
     ["error_reporting", "E_ALL"],
@@ -622,7 +623,9 @@ pub struct PhpConfig {
     #[serde(default = "default_memory_limit")]
     pub memory_limit: String,
     #[serde(default)]
-    pub ini_overrides: Vec<(String, String)>,
+    pub ini_file: Option<PathBuf>,  // path to custom php.ini (applied before ini_overrides)
+    #[serde(default)]
+    pub ini_overrides: Vec<[String; 2]>,  // INI directives as [key, value] pairs
 }
 
 fn default_index_files() -> Vec<String> {

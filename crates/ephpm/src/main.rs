@@ -216,7 +216,8 @@ fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
 
     // Initialize PHP BEFORE creating tokio runtime (single-threaded here).
     // finalize_for_http() disables SIGPROF so it can't crash worker threads.
-    ephpm_php::PhpRuntime::init().context("failed to initialize PHP runtime")?;
+    ephpm_php::PhpRuntime::init_with_ini_file(config.php.ini_file.as_deref())
+        .context("failed to initialize PHP runtime")?;
     ephpm_php::PhpRuntime::finalize_for_http()
         .context("failed to finalize PHP runtime for HTTP")?;
 

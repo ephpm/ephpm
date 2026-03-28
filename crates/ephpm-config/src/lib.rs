@@ -68,6 +68,10 @@ pub struct ServerConfig {
     #[serde(default, rename = "static")]
     pub static_files: StaticConfig,
 
+    /// PHP `ETag` cache settings.
+    #[serde(default, rename = "php_etag_cache")]
+    pub php_etag_cache: PhpETagCacheConfig,
+
     /// Security settings.
     #[serde(default)]
     pub security: SecurityConfig,
@@ -193,6 +197,59 @@ pub struct StaticConfig {
     /// Default: `true`.
     #[serde(default = "default_etag")]
     pub etag: bool,
+}
+
+/// PHP response `ETag` cache configuration (`[server.php_etag_cache]`).
+#[derive(Clone, Debug, Deserialize)]
+pub struct PhpETagCacheConfig {
+    /// Enable `ETag` caching for PHP responses.
+    ///
+    /// When enabled, `ETags` from PHP response headers are cached in the KV store.
+    /// Subsequent requests with matching `If-None-Match` headers receive
+    /// `304 Not Modified` responses without executing PHP.
+    ///
+    /// Only applies to cacheable methods (GET, HEAD).
+    ///
+    /// Default: `false`.
+    #[serde(default = "default_php_etag_cache_enabled")]
+    pub enabled: bool,
+
+    /// TTL (Time To Live) for cached `ETags` in seconds.
+    ///
+    /// - Positive number: Cache expires after N seconds. PHP executes again after expiry.
+    /// - Zero or negative (e.g. `-1`): Cache indefinitely. User must manually clear via k/v API.
+    ///
+    /// To clear cached `ETags` manually (when using indefinite TTL):
+    /// ```bash
+    /// # Via RESP CLI (if redis_compat enabled):
+    /// redis-cli DEL "etag:*"
+    ///
+    /// # Via native PHP function:
+    /// ephpm_kv_del("etag:GET:/api/endpoint");
+    /// ```
+    ///
+    /// Default: `300` (5 minutes).
+    #[serde(default = "default_php_etag_cache_ttl")]
+    pub ttl_secs: i64,
+
+    /// Key prefix for `ETag` entries in the KV store.
+    ///
+    /// `ETag`s are stored with keys like `{prefix}{method}:{path}?{query}`.
+    /// This allows organizing `ETag` data separately from other KV entries.
+    ///
+    /// Default: `"etag:"`.
+    #[serde(default = "default_php_etag_cache_prefix")]
+    pub key_prefix: String,
+}
+
+impl Default for PhpETagCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_php_etag_cache_enabled(),
+            ttl_secs: default_php_etag_cache_ttl(),
+            key_prefix: default_php_etag_cache_prefix(),
+        }
+    }
 }
 
 /// Security configuration (`[server.security]`).
@@ -568,6 +625,27 @@ pub struct KvConfig {
     #[serde(default = "default_kv_eviction_policy")]
     pub eviction_policy: String,
 
+    /// Compression algorithm for stored values.
+    ///
+    /// Values: `"none"`, `"gzip"`, `"brotli"`, `"zstd"`.
+    ///
+    /// Default: `"none"` (no compression).
+    #[serde(default = "default_kv_compression")]
+    pub compression: String,
+
+    /// Compression level (1 = fastest, 9 = best compression).
+    ///
+    /// Default: `6`.
+    #[serde(default = "default_kv_compression_level")]
+    pub compression_level: u32,
+
+    /// Minimum value size in bytes before compression is applied.
+    ///
+    /// Values smaller than this threshold are stored uncompressed.
+    /// Default: `1024` (1 KB).
+    #[serde(default = "default_kv_compression_min_size")]
+    pub compression_min_size: usize,
+
     /// Redis-compatible RESP protocol listener.
     #[serde(default)]
     pub redis_compat: KvRedisCompatConfig,
@@ -578,6 +656,9 @@ impl Default for KvConfig {
         Self {
             memory_limit: default_kv_memory_limit(),
             eviction_policy: default_kv_eviction_policy(),
+            compression: default_kv_compression(),
+            compression_level: default_kv_compression_level(),
+            compression_min_size: default_kv_compression_min_size(),
             redis_compat: KvRedisCompatConfig::default(),
         }
     }
@@ -625,7 +706,22 @@ pub struct PhpConfig {
     #[serde(default = "default_memory_limit")]
     pub memory_limit: String,
 
+    /// Optional path to a custom php.ini file.
+    ///
+    /// When set, ePHPm reads this file for PHP configuration before applying
+    /// `ini_overrides`. This allows reusing an existing php.ini from your
+    /// PHP installation or custom configuration.
+    ///
+    /// If not set, PHP uses its default ini locations (or none if not found).
+    ///
+    /// Default: `None` (no custom ini file).
+    #[serde(default)]
+    pub ini_file: Option<PathBuf>,
+
     /// INI directive overrides as `[key, value]` pairs.
+    ///
+    /// Applied after `ini_file` is loaded (if specified), so these take
+    /// precedence over `ini_file` settings.
     #[serde(default)]
     pub ini_overrides: Vec<[String; 2]>,
 }
@@ -672,6 +768,7 @@ impl Default for ServerConfig {
             timeouts: TimeoutsConfig::default(),
             response: ResponseConfig::default(),
             static_files: StaticConfig::default(),
+            php_etag_cache: PhpETagCacheConfig::default(),
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
             tls: None,
@@ -735,6 +832,7 @@ impl Default for PhpConfig {
         Self {
             max_execution_time: default_max_execution_time(),
             memory_limit: default_memory_limit(),
+            ini_file: None,
             ini_overrides: Vec::new(),
         }
     }
@@ -800,6 +898,18 @@ fn default_etag() -> bool {
     true
 }
 
+fn default_php_etag_cache_enabled() -> bool {
+    false
+}
+
+fn default_php_etag_cache_ttl() -> i64 {
+    300
+}
+
+fn default_php_etag_cache_prefix() -> String {
+    "etag:".to_string()
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -822,6 +932,18 @@ fn default_kv_memory_limit() -> String {
 
 fn default_kv_eviction_policy() -> String {
     "allkeys-lru".to_string()
+}
+
+fn default_kv_compression() -> String {
+    "none".to_string()
+}
+
+fn default_kv_compression_level() -> u32 {
+    6
+}
+
+fn default_kv_compression_min_size() -> usize {
+    1024
 }
 
 fn default_kv_listen() -> String {
