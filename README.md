@@ -4,15 +4,17 @@ An all-in-one PHP application server written in Rust. Embeds PHP via FFI into a 
 
 ## Why ePHPm?
 
-| | ePHPm | FrankenPHP | RoadRunner |
-|---|---|---|---|
-| Language | Rust | Go (CGO) | Go |
-| PHP FFI overhead | Zero (native C call) | ~2.2μs/req (11+ CGO crossings) | N/A (worker mode) |
-| GC pauses | None | Go GC | Go GC |
-| Binary | Single static binary | Caddy module | Go binary + PHP workers |
-| DB proxy | Planned | No | No |
-| Clustering | Planned | No | No |
-| PHP compatibility | Drop-in (embed SAPI) | Drop-in (worker SAPI) | Requires PSR-7 packages |
+| | ePHPm | FrankenPHP | RoadRunner | Swoole | Apache + mod_php | Nginx + php-fpm |
+|---|---|---|---|---|---|---|
+| Language | Rust | Go (CGO) | Go | PHP + C | C | C + PHP |
+| PHP FFI overhead | Zero (native C call) | ~2.2μs/req (11+ CGO crossings) | N/A (worker mode) | N/A (native) | N/A (in-process) | IPC (FastCGI) |
+| GC pauses | None | Go GC | Go GC | PHP GC | PHP GC | PHP GC |
+| Binary | Single static binary | Caddy module | Go binary + PHP workers | PHP + extension | Apache + modules | Nginx + separate FPM |
+| DB proxy | Planned | No | No | Connection pool | No | No |
+| Clustering | Planned | No | No | Built-in | Manual | Manual |
+| PHP compatibility | Drop-in (embed SAPI) | Drop-in (worker SAPI) | Requires PSR-7 packages | Requires async code | Native (100%) | Native (100%) |
+| Deployment | Single binary | Requires Caddy | Multi-process | Requires PHP + Swoole extension | Apache + modules | Separate services |
+| Container-friendly | ✓ (single binary) | ✓ (Caddy module) | ✓ | ⚠️ (PHP + extension) | ⚠️ (heavier) | ⚠️ (two services) |
 
 ## Feature Status
 
