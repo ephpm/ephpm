@@ -6,6 +6,8 @@ pub mod kv_bridge;
 pub mod request;
 pub mod response;
 pub mod sapi;
+#[cfg(all(php_linked, target_os = "windows"))]
+pub mod windows_dll;
 
 use std::sync::Mutex;
 

@@ -888,26 +888,30 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
     let dockerfile = root.join("docker").join("Dockerfile");
     let dockerfile_e2e = root.join("docker").join("Dockerfile.e2e");
 
+    // docker uses "buildx build --load" (BuildKit, result written to local
+    // daemon); podman uses plain "build" (already BuildKit-equivalent).
+    let build_args: &[&str] = if ce == "docker" {
+        &["buildx", "build", "--load"]
+    } else {
+        &["build"]
+    };
+
     // Build ephpm image with the specified PHP version
     if dockerfile.exists() {
         eprintln!("==> Building ephpm container image (PHP {php_version})...");
-        let mut cmd = Command::new(ce);
-        cmd.args(["build", "-f"]);
-        cmd.arg(&dockerfile);
-        cmd.args([
-            "--build-arg",
-            &format!("PHP_VERSION={php_version}"),
-            "-t",
-            "ephpm:dev",
-            ".",
-        ]);
-        // Enable BuildKit on plain docker to avoid the legacy-builder deprecation
-        // warning. Podman always uses BuildKit-equivalent behaviour; setting this
-        // env var for podman is harmless.
-        if ce == "docker" {
-            cmd.env("DOCKER_BUILDKIT", "1");
-        }
-        let status = cmd.current_dir(&root).status();
+        let status = Command::new(ce)
+            .args(build_args)
+            .args(["-f"])
+            .arg(&dockerfile)
+            .args([
+                "--build-arg",
+                &format!("PHP_VERSION={php_version}"),
+                "-t",
+                "ephpm:dev",
+                ".",
+            ])
+            .current_dir(&root)
+            .status();
 
         if !ran_ok(&status) {
             eprintln!("error: failed to build ephpm image");
@@ -920,14 +924,13 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
     // Build E2E test runner image
     if dockerfile_e2e.exists() {
         eprintln!("==> Building E2E test runner image...");
-        let mut cmd = Command::new(ce);
-        cmd.args(["build", "-f"]);
-        cmd.arg(&dockerfile_e2e);
-        cmd.args(["-t", "ephpm-e2e:dev", "."]);
-        if ce == "docker" {
-            cmd.env("DOCKER_BUILDKIT", "1");
-        }
-        let status = cmd.current_dir(&root).status();
+        let status = Command::new(ce)
+            .args(build_args)
+            .args(["-f"])
+            .arg(&dockerfile_e2e)
+            .args(["-t", "ephpm-e2e:dev", "."])
+            .current_dir(&root)
+            .status();
 
         if !ran_ok(&status) {
             eprintln!("error: failed to build ephpm-e2e image");

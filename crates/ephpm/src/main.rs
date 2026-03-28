@@ -67,6 +67,12 @@ fn run() -> anyhow::Result<ExitCode> {
 
 /// Run the `ephpm php` subcommand — pass args through to the embedded PHP CLI.
 fn run_php(args: &[String]) -> anyhow::Result<ExitCode> {
+    // Windows: extract the embedded php8embed.dll before the first PHP call.
+    // Guard deletes the temp directory when this function returns.
+    #[cfg(all(php_linked, target_os = "windows"))]
+    let _dll_guard = ephpm_php::windows_dll::extract_php_dll()
+        .context("failed to extract embedded php8embed.dll")?;
+
     let exit_code = ephpm_php::PhpRuntime::cli_main(args)
         .context("PHP CLI failed")?;
     let _ = ephpm_php::PhpRuntime::shutdown();
@@ -141,6 +147,14 @@ fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
         document_root = %config.server.document_root.display(),
         "starting ePHPm"
     );
+
+    // Windows: extract the embedded php8embed.dll before PHP init.
+    // Declared here so it drops after `rt` (Rust drops locals in reverse
+    // declaration order — `rt` is declared later, so it drops first, which
+    // ensures the tokio runtime is fully shut down before we delete the DLL).
+    #[cfg(all(php_linked, target_os = "windows"))]
+    let _dll_guard = ephpm_php::windows_dll::extract_php_dll()
+        .context("failed to extract embedded php8embed.dll")?;
 
     // Initialize PHP BEFORE creating tokio runtime (single-threaded here).
     // finalize_for_http() disables SIGPROF so it can't crash worker threads.

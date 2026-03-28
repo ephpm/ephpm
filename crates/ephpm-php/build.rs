@@ -25,6 +25,7 @@ fn main() {
     println!("cargo::rustc-cfg=php_linked");
 
     link_php(&lib_dir, &target_os);
+    embed_windows_dll(&lib_dir, &target_os);
     compile_wrapper(&include_dir, &target_os);
     generate_bindings(&include_dir, &target_os);
 
@@ -80,6 +81,40 @@ fn link_php(lib_dir: &Path, target_os: &str) {
             println!("cargo::rustc-link-lib=static={static_lib}");
         }
     }
+}
+
+/// Copy `php8embed.dll` to `OUT_DIR` and set `PHP_EMBED_DLL_PATH` so that
+/// `include_bytes!(env!("PHP_EMBED_DLL_PATH"))` in `windows_dll.rs` works.
+///
+/// Also links `delayimp.lib`, which is required by the MSVC linker when any
+/// DLL is compiled with `/DELAYLOAD` (the flag itself is set in the binary
+/// crate's `build.rs` because `rustc-link-arg` only takes effect there).
+fn embed_windows_dll(lib_dir: &Path, target_os: &str) {
+    if target_os != "windows" {
+        return;
+    }
+    let dll_src = lib_dir.join("php8embed.dll");
+    if !dll_src.exists() {
+        // Validation already happened in validate_sdk for the .lib file.
+        // The DLL should always accompany the import lib — warn and continue.
+        println!(
+            "cargo::warning=php8embed.dll not found in {} — DLL embedding skipped",
+            lib_dir.display()
+        );
+        return;
+    }
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let dll_dest = out_dir.join("php8embed.dll");
+    std::fs::copy(&dll_src, &dll_dest).expect("failed to copy php8embed.dll to OUT_DIR");
+
+    // Expose the absolute path so windows_dll.rs can use include_bytes!.
+    println!("cargo::rustc-env=PHP_EMBED_DLL_PATH={}", dll_dest.display());
+    // Rebuild if the source DLL changes.
+    println!("cargo::rerun-if-changed={}", dll_src.display());
+
+    // delayimp.lib is the MSVC runtime support library required whenever
+    // /DELAYLOAD is used. It resolves __delayLoadHelper2 etc.
+    println!("cargo::rustc-link-lib=delayimp");
 }
 
 fn link_system_libs(target_os: &str) {
