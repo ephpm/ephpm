@@ -8,6 +8,9 @@
  *
  * Install Predis:
  *   composer require predis/predis
+ *
+ * Note: ePHPm's KV store currently supports strings, counters, and TTL.
+ * It does NOT yet support hashes, lists, sets, or transactions.
  */
 
 require_once __DIR__ . '/../vendor/autoload.php';
@@ -25,20 +28,23 @@ try {
 
     // Verify connection
     $redis->ping();
-    echo "Connected to KV store\n";
+    echo "Connected to ePHPm KV store\n\n";
 } catch (Exception $e) {
     http_response_code(500);
     echo "Error: Could not connect to KV store at 127.0.0.1:6379\n";
-    echo "Make sure the KV server is running.\n";
+    echo "Make sure the KV server is running: cargo xtask release && ./target/release/ephpm\n";
     exit(1);
 }
 
-// ── Basic Operations ────────────────────────────────────────────────────────
+// ── Basic String Operations ──────────────────────────────────────────────
+
+echo "=== Basic Operations ===\n";
 
 // SET: Store values
 $redis->set('product:1:name', 'Laptop');
 $redis->set('product:1:price', '999.99');
 $redis->set('product:1:stock', '50');
+echo "Stored 3 product attributes\n";
 
 // GET: Retrieve values
 $name = $redis->get('product:1:name');
@@ -46,124 +52,113 @@ $price = $redis->get('product:1:price');
 echo "Product: $name (Price: \$$price)\n";
 
 // EXISTS: Check if keys exist
-$exists = $redis->exists('product:1:name');
-echo "Product exists: " . ($exists ? 'yes' : 'no') . "\n";
+$exists = $redis->exists('product:1:name', 'product:1:price', 'missing');
+echo "Keys exist: $exists (checked 3 keys)\n";
 
 // DEL: Remove keys
 $deleted = $redis->del('product:1:price');
 echo "Deleted $deleted keys\n";
 
-// ── Working with Hashes ────────────────────────────────────────────────────
-// Hashes are perfect for representing objects
+// ── Multiple Keys ────────────────────────────────────────────────────────
 
-// HSET: Store multiple fields for a key
-$redis->hset('user:123', [
-    'name'       => 'Bob',
-    'email'      => 'bob@example.com',
-    'created_at' => date('Y-m-d'),
+echo "\n=== Multiple Key Operations ===\n";
+
+// MSET: Set multiple key-value pairs
+$redis->mset([
+    'user:1:name' => 'Alice',
+    'user:1:email' => 'alice@example.com',
+    'user:2:name' => 'Bob',
+    'user:2:email' => 'bob@example.com',
 ]);
+echo "Stored user data (MSET)\n";
 
-// HGET: Get a specific field
-$name = $redis->hget('user:123', 'name');
-echo "User name: $name\n";
+// MGET: Get multiple values
+$users = $redis->mget('user:1:name', 'user:1:email', 'user:2:name', 'missing');
+echo "Retrieved users: " . json_encode($users) . "\n";
 
-// HGETALL: Get all fields as array
-$user = $redis->hgetall('user:123');
-echo "User data: " . json_encode($user, JSON_PRETTY_PRINT) . "\n";
+// ── String Manipulation ──────────────────────────────────────────────────
 
-// HINCRBY: Increment a hash field (useful for counters)
-$redis->hset('user:123', 'login_count', '0');
-$redis->hincrby('user:123', 'login_count', 1);
-$logins = $redis->hget('user:123', 'login_count');
-echo "User login count: $logins\n";
+echo "\n=== String Operations ===\n";
 
-// ── Working with Lists ──────────────────────────────────────────────────────
-// Lists are great for queues and activity logs
+// APPEND: Add to a string
+$redis->set('message', 'Hello');
+$redis->append('message', ' World!');
+$msg = $redis->get('message');
+echo "Appended string: $msg\n";
 
-// RPUSH: Add items to the end of a list
-$redis->rpush('queue:jobs', ['job:1', 'job:2', 'job:3']);
+// STRLEN: Get string length
+$len = $redis->strlen('message');
+echo "String length: $len\n";
 
-// LLEN: Get list length
-$count = $redis->llen('queue:jobs');
-echo "Jobs in queue: $count\n";
+// ── Counters and Increments ─────────────────────────────────────────────
 
-// LPOP: Remove and return the first item
-$job = $redis->lpop('queue:jobs');
-echo "Processing job: $job\n";
-
-// LRANGE: Get a range of items
-$remaining = $redis->lrange('queue:jobs', 0, -1);
-echo "Remaining jobs: " . implode(', ', $remaining) . "\n";
-
-// ── Working with Sets ───────────────────────────────────────────────────────
-// Sets are useful for membership and unique lists
-
-// SADD: Add items to a set
-$redis->sadd('tags:active', ['php', 'web', 'backend', 'php']); // duplicate 'php' ignored
-
-// SCARD: Get set size
-$count = $redis->scard('tags:active');
-echo "Active tags: $count\n";
-
-// SMEMBERS: Get all members
-$tags = $redis->smembers('tags:active');
-echo "Tags: " . implode(', ', $tags) . "\n";
-
-// SISMEMBER: Check membership
-if ($redis->sismember('tags:active', 'php')) {
-    echo "'php' is in tags:active\n";
-}
-
-// ── Expiration (TTL) ────────────────────────────────────────────────────────
-
-// Set a key with expiration (EX = seconds)
-$redis->setex('cache:result:42', 300, 'cached_data_here'); // expires in 5 minutes
-
-// Check remaining TTL
-$ttl = $redis->ttl('cache:result:42');
-echo "Cache TTL: $ttl seconds\n";
-
-// Expire an existing key
-$redis->set('temp:session:xyz', 'session_data');
-$redis->expire('temp:session:xyz', 1800); // 30 minutes
-
-// PEXPIRE: Set expiration in milliseconds (more precise)
-$redis->pexpire('temp:session:xyz', 30 * 60 * 1000);
-
-// ── Atomic Counters ─────────────────────────────────────────────────────────
+echo "\n=== Atomic Counters ===\n";
 
 // INCR: Increment by 1
 $views = $redis->incr('page:home:views');
-echo "Home page views: $views\n";
+echo "Page views: $views\n";
 
 // INCRBY: Increment by amount
-$views = $redis->incrby('page:home:views', 10);
+$views = $redis->incrby('page:home:views', 9);
 echo "Page views after batch: $views\n";
 
 // DECR / DECRBY: Decrement
-$stock = $redis->decrby('product:1:stock', 1);
+$stock = $redis->decrby('product:1:stock', 5);
 echo "Stock after sale: $stock\n";
 
-// ── Transactions (MULTI/EXEC) ───────────────────────────────────────────────
-// Atomic operations on multiple keys
+// ── Expiration (TTL) ─────────────────────────────────────────────────────
 
-try {
-    $pipe = $redis->pipeline(function ($pipe) {
-        $pipe->set('account:1:balance', '1000');
-        $pipe->set('account:2:balance', '500');
-        $pipe->incr('account:1:balance');
-        $pipe->decr('account:2:balance');
-    });
-    echo "Transaction completed: " . json_encode($pipe) . "\n";
-} catch (Exception $e) {
-    echo "Transaction error: " . $e->getMessage() . "\n";
-}
+echo "\n=== Key Expiration ===\n";
 
-// ── Useful Patterns ─────────────────────────────────────────────────────────
+// SETEX: Set with expiration (shorthand)
+$redis->setex('cache:result:42', 300, 'cached_data_here');
+echo "Set cache key with 300 second TTL\n";
+
+// Check TTL
+$ttl = $redis->ttl('cache:result:42');
+echo "Cache TTL: $ttl seconds\n";
+
+// EXPIRE: Add expiration to existing key
+$redis->set('temp:session:xyz', 'session_data');
+$redis->expire('temp:session:xyz', 1800); // 30 minutes
+echo "Expired temp:session:xyz for 1800 seconds\n";
+
+// PEXPIRE: Set expiration in milliseconds
+$redis->pexpire('temp:session:xyz', 30 * 60 * 1000);
+
+// PERSIST: Remove expiration
+$redis->persist('temp:session:xyz');
+echo "Removed expiration from temp:session:xyz\n";
+
+// ── Key Management ──────────────────────────────────────────────────────
+
+echo "\n=== Key Management ===\n";
+
+// KEYS: List keys matching pattern
+$pattern_keys = $redis->keys('user:*');
+echo "Keys matching 'user:*': " . json_encode($pattern_keys) . "\n";
+
+// TYPE: Get key type
+$type = $redis->type('user:1:name');
+echo "Type of 'user:1:name': $type\n";
+
+// RENAME: Rename a key
+$redis->set('old_key', 'value');
+$redis->rename('old_key', 'new_key');
+echo "Renamed old_key → new_key\n";
+echo "old_key exists? " . ($redis->exists('old_key') ? 'yes' : 'no') . "\n";
+echo "new_key exists? " . ($redis->exists('new_key') ? 'yes' : 'no') . "\n";
+
+// DBSIZE: Count all keys
+$size = $redis->dbsize();
+echo "Total keys in store: $size\n";
+
+// ── Useful Patterns ─────────────────────────────────────────────────────
+
+echo "\n=== Common Patterns ===\n";
 
 // Rate limiting: Track requests per user
-function check_rate_limit($user_id, $max_requests, $window_sec) {
-    global $redis;
+function check_rate_limit($redis, $user_id, $max_requests, $window_sec) {
     $key = "ratelimit:$user_id";
 
     $requests = $redis->incr($key);
@@ -174,37 +169,56 @@ function check_rate_limit($user_id, $max_requests, $window_sec) {
     return $requests <= $max_requests;
 }
 
-// Session storage
-function store_session($session_id, $data, $ttl_sec = 3600) {
-    global $redis;
+// Session storage (simple string-based)
+function store_session($redis, $session_id, $data, $ttl_sec = 3600) {
     $redis->setex("session:$session_id", $ttl_sec, json_encode($data));
 }
 
-function get_session($session_id) {
-    global $redis;
+function get_session($redis, $session_id) {
     $data = $redis->get("session:$session_id");
     return $data ? json_decode($data, true) : null;
 }
 
-echo "\n--- Pattern Examples ---\n";
-
-// Rate limit check
-if (check_rate_limit('user:123', 100, 60)) {
-    echo "User 123 within rate limit\n";
+// Page view tracking (per endpoint)
+function track_view($redis, $page) {
+    $redis->incr("views:$page");
 }
 
-// Session
-store_session('sess_abc', ['user_id' => 123, 'username' => 'alice']);
-$session = get_session('sess_abc');
-echo "Session: " . json_encode($session) . "\n";
+// Test the patterns
+if (check_rate_limit($redis, 'user:123', 100, 60)) {
+    echo "✓ User 123 within rate limit (request #1)\n";
+}
 
-// ── Available Redis Commands ────────────────────────────────────────────────
+store_session($redis, 'sess_abc', [
+    'user_id' => 123,
+    'username' => 'alice',
+    'login_time' => date('Y-m-d H:i:s'),
+]);
+$session = get_session($redis, 'sess_abc');
+echo "✓ Session stored and retrieved: " . json_encode($session) . "\n";
 
-echo "\n--- Supported Commands ---\n";
-echo "Strings: GET, SET, SETEX, INCR, DECR, APPEND, STRLEN, GETRANGE, SETRANGE\n";
-echo "Hashes: HGET, HSET, HMGET, HMSET, HGETALL, HDEL, HEXISTS, HINCRBY, HLEN\n";
-echo "Lists: LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LTRIM\n";
-echo "Sets: SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SINTER, SUNION, SDIFF\n";
-echo "Keys: DEL, EXISTS, EXPIRE, TTL, KEYS, SCAN, TYPE, RENAME\n";
-echo "Transactions: MULTI, EXEC, DISCARD, WATCH\n";
-echo "Server: PING, ECHO, SELECT, FLUSHDB, FLUSHALL, DBSIZE\n";
+track_view($redis, 'home');
+track_view($redis, 'home');
+track_view($redis, 'about');
+$home_views = $redis->get('views:home');
+$about_views = $redis->get('views:about');
+echo "✓ Page views tracked: home=$home_views, about=$about_views\n";
+
+// ── Server Commands ─────────────────────────────────────────────────────
+
+echo "\n=== Server Info ===\n";
+
+// PING: Test connection
+echo "PING: " . $redis->ping() . "\n";
+
+// INFO: Get server info
+$info = $redis->info();
+echo "Server info: " . substr((string)$info, 0, 100) . "...\n";
+
+// ECHO: Echo a string
+echo "ECHO result: " . $redis->echo('Hello from ePHPm') . "\n";
+
+echo "\n=== All Tests Complete ===\n";
+echo "Supported commands: GET, SET, SETEX, MGET, MSET, SETNX, INCR, DECR, INCRBY, DECRBY\n";
+echo "                    APPEND, STRLEN, GETSET, DEL, EXISTS, EXPIRE, PEXPIRE, PERSIST\n";
+echo "                    TTL, PTTL, TYPE, KEYS, DBSIZE, FLUSHDB, RENAME, PING, ECHO\n";
