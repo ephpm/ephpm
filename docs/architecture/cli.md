@@ -1044,167 +1044,112 @@ Total: 43 active, 37 idle, 80 connections, 0 waiting
 
 ### `ephpm kv`
 
-KV store inspection and operations. Connects to the Node API of a running instance.
+Inspect and debug the KV store on a running server. Connects directly to the embedded KV server (RESP2 protocol).
+
+**Current implementation:** String-based cache with TTL and counters. For clustering and advanced features (hashes, sets, transactions), see [Planned](#planned-kv-features) below.
+
+#### Shared Flags
 
 ```bash
-# ── Stats ──
+ephpm kv [OPTIONS] <COMMAND>
 
-ephpm kv stats
-ephpm kv stats --node 10.0.1.1:9090
+Options:
+  --host <HOST>    KV server host [default: 127.0.0.1]
+  --port <PORT>    KV server port [default: 6379]
+```
 
-# ── Key Operations (for debugging — not a production data path) ──
+#### Commands
 
-# Get a key (displays value and metadata)
+```bash
+# Connection test
+ephpm kv ping
+
+# Get a value
+ephpm kv get mykey
 ephpm kv get session:abc123
-ephpm kv get user:42:profile --format json   # pretty-print JSON values
-ephpm kv get cache:page:/blog --format hex   # binary-safe hex dump
 
-# Set a key
+# Set a value
 ephpm kv set mykey "hello world"
-ephpm kv set mykey "hello world" --ttl 3600  # expires in 1 hour
-ephpm kv set counter 0 --ttl 86400
+ephpm kv set session:data "{\"user\":42}" --ttl 3600  # with TTL in seconds
 
-# Delete a key
+# Delete keys
 ephpm kv del mykey
-ephpm kv del "session:*" --pattern           # delete by pattern (careful!)
+ephpm kv del key1 key2 key3                           # multiple keys
 
-# Check if a key exists (without fetching the value)
-ephpm kv exists session:abc123
+# List keys matching a pattern (wildcard *)
+ephpm kv keys "*"
+ephpm kv keys "session:*"
+ephpm kv keys "cache:*"
 
-# Get TTL remaining
-ephpm kv ttl session:abc123
-
-# Hash operations
-ephpm kv hget user:42 email
-ephpm kv hset user:42 email "new@example.com"
-ephpm kv hgetall user:42
-ephpm kv hdel user:42 email
-
-# Increment/decrement
+# Increment/decrement counters
 ephpm kv incr page:views:/blog
-ephpm kv incrby ratelimit:1.2.3.4 1
+ephpm kv incr counter
+ephpm kv incr counter --by 10                        # increment by N
 
-# ── Key Scanning ──
-
-# Scan keys by pattern (like Redis SCAN — cursor-based, safe for large keyspaces)
-ephpm kv keys "session:*" --limit 100
-ephpm kv keys "cache:page:*" --limit 50
-ephpm kv keys "*" --limit 20               # all keys (careful on large stores)
-
-# Count keys matching a pattern
-ephpm kv count "session:*"
-ephpm kv count "cache:*"
-
-# Key type breakdown
-ephpm kv types
-
-# ── Bulk Operations ──
-
-# Flush all keys (requires confirmation)
-ephpm kv flush
-ephpm kv flush --pattern "cache:*"          # flush only matching keys
-ephpm kv flush --yes                        # skip confirmation
-
-# Export keys to JSON (for backup/debugging)
-ephpm kv export "session:*" > sessions.json
-ephpm kv export "*" --format redis          # Redis RESP format (importable)
-
-# Import keys from JSON
-ephpm kv import < sessions.json
-
-# ── Cluster Membership ──
-
-ephpm kv cluster
-ephpm kv cluster --detail                   # show per-node key distribution
-
-# Which node owns a specific key?
-ephpm kv owner session:abc123
-ephpm kv owner user:42:profile
+# Show TTL information
+ephpm kv ttl mykey
+ephpm kv ttl session:abc123
 ```
 
+#### Examples
+
+```bash
+# Start the server with KV enabled
+cargo xtask release
+./target/release/ephpm serve
+
+# In another terminal, test the commands:
+$ ./target/debug/ephpm kv ping
+PONG
+
+$ ./target/debug/ephpm kv set greeting "hello world"
+OK
+
+$ ./target/debug/ephpm kv get greeting
+hello world
+
+$ ./target/debug/ephpm kv set counter 0
+OK
+
+$ ./target/debug/ephpm kv incr counter
+(integer) 1
+
+$ ./target/debug/ephpm kv incr counter --by 5
+(integer) 6
+
+$ ./target/debug/ephpm kv set temp value --ttl 60
+OK
+
+$ ./target/debug/ephpm kv ttl temp
+expires in 59s (59986ms)
+
+$ ./target/debug/ephpm kv keys "*"
+1) greeting
+2) counter
+3) temp
+
+$ ./target/debug/ephpm kv del counter temp
+(integer) 2
+
+$ ./target/debug/ephpm kv get missing
+(nil)
 ```
-$ ephpm kv stats
-Memory:     124MB / 512MB (24%)
-Keys:       89,421 (72,104 string, 17,317 hash)
-Hit rate:   98.7% (last 5m)
-Evictions:  0 (last 5m)
-Expires:    ~3,200/min (TTL)
-Policy:     allkeys-lru
-Uptime:     3d 14h 22m
 
-$ ephpm kv get session:abc123
-Key:        session:abc123
-Type:       string
-Size:       1,247 bytes
-TTL:        842s remaining (expires in 14m 2s)
-Owner:      10.0.1.2:7946 (remote)
-Value:
-  login|b:1;username|s:5:"admin";cart|a:2:{i:0;s:5:"item1";i:1;s:5:"item2";}
+---
 
-$ ephpm kv get user:42:profile --format json
-Key:        user:42:profile
-Type:       string
-Size:       342 bytes
-TTL:        none (no expiry)
-Owner:      10.0.1.1:7946 (local)
-Value:
-  {
-    "id": 42,
-    "name": "Alice",
-    "email": "alice@example.com",
-    "role": "admin"
-  }
+#### Planned KV Features
 
-$ ephpm kv hgetall user:42
-Key:     user:42
-Type:    hash
-Fields:  4
-Owner:   10.0.1.1:7946 (local)
+Future releases will add:
 
-FIELD        VALUE
-email        alice@example.com
-name         Alice
-role         admin
-last_login   2026-03-27T09:15:00Z
+- **Hashes, Lists, Sets** — multi-type data structures (requires Store refactoring to an enum-based Entry type)
+- **Transactions** — `MULTI`/`EXEC`/`WATCH` for atomic operations (requires per-connection state)
+- **Scan** — cursor-based iteration (SCAN, HSCAN, etc.) for large keyspaces without blocking
+- **Node API integration** — Query KV stats from a running instance's Node API (`--node` flag)
+- **Clustering** — gossip-based key distribution, replication, ownership metadata
+- **Bulk operations** — export/import, flush with pattern matching, key type breakdown
+- **Advanced patterns** — RENAME, SCAN, PEXPIRE, GETEX, GETEX with replication info
 
-$ ephpm kv keys "session:*" --limit 10
-session:a1b2c3d4    string    1,247B    TTL 842s     10.0.1.2:7946
-session:e5f6a7b8    string    892B      TTL 1,200s   10.0.1.1:7946
-session:c9d0e1f2    string    2,104B    TTL 300s     10.0.1.3:7946
-...
-10 of 12,847 keys matching "session:*"
-
-$ ephpm kv count "session:*"
-12,847
-
-$ ephpm kv types
-TYPE      COUNT     MEMORY    % OF TOTAL
-string    72,104    98MB      79%
-hash      17,317    26MB      21%
-Total     89,421    124MB
-
-$ ephpm kv owner session:abc123
-Key:    session:abc123
-Hash:   0x3a21f7b2
-Owner:  10.0.1.2:7946 (node-2)
-Replicas:
-  10.0.1.3:7946 (node-3)
-  10.0.1.1:7946 (node-1)
-
-$ ephpm kv cluster
-NODE            STATUS    KEYS      MEMORY    VNODES    GOSSIP
-10.0.1.1:7946   healthy   31,204    42MB      150       gen=127, 0.2ms ago
-10.0.1.2:7946   healthy   28,891    39MB      150       gen=124, 1.1ms ago
-10.0.1.3:7946   healthy   29,326    43MB      150       gen=131, 0.4ms ago
-Replication: async, factor=2
-Ring balance: 34.9% / 32.3% / 32.8% (ideal: 33.3%)
-
-$ ephpm kv cluster --detail
-NODE            KEYS     MEMORY   STRINGS  HASHES   HIT RATE   EVICTIONS
-10.0.1.1:7946   31,204   42MB     24,891   6,313    98.9%      0
-10.0.1.2:7946   28,891   39MB     23,104   5,787    98.4%      0
-10.0.1.3:7946   29,326   43MB     24,109   5,217    98.8%      0
-```
+See [examples/README-KV.md](../../examples/README-KV.md) for details on the embedded SAPI functions (`ephpm_kv_get`, `ephpm_kv_set`, etc.) which provide zero-copy direct access when called from PHP.
 
 ---
 

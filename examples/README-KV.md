@@ -65,19 +65,19 @@ php examples/kv-redis-predis.php
 - Familiar Redis commands and patterns
 - Works with standard PHP Redis libraries (Predis, phpredis, etc.)
 - Portable — your code works on Redis, Memcached, or ePHPm
-- Rich data structures: strings, hashes, lists, sets
+- Simple key-value string storage with expiration and counters
 
 **Supported Commands:**
 
 | Group | Commands |
 |-------|----------|
-| **Strings** | GET, SET, SETEX, INCR, DECR, APPEND, STRLEN, GETRANGE, SETRANGE |
-| **Hashes** | HGET, HSET, HMGET, HMSET, HGETALL, HDEL, HEXISTS, HINCRBY, HLEN |
-| **Lists** | LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LTRIM |
-| **Sets** | SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SINTER, SUNION, SDIFF |
-| **Keys** | DEL, EXISTS, EXPIRE, TTL, KEYS, SCAN, TYPE, RENAME |
-| **Transactions** | MULTI, EXEC, DISCARD, WATCH |
-| **Server** | PING, ECHO, SELECT, FLUSHDB, FLUSHALL, DBSIZE |
+| **Strings** | GET, SET, SETEX, MGET, MSET, SETNX, INCR, DECR, INCRBY, DECRBY, APPEND, STRLEN, GETSET |
+| **Keys** | DEL, EXISTS, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL, TYPE, KEYS, DBSIZE, FLUSHDB, FLUSHALL, RENAME |
+| **Connection** | PING, ECHO, SELECT, QUIT, COMMAND, INFO |
+
+**Not Yet Implemented:**
+
+Hashes, Lists, Sets, Transactions, SCAN — these would require architectural changes (multi-type store, per-connection state). If you need complex data structures, use a real Redis server. For ePHPm's use case (session caching, counters), strings with TTL cover 99% of patterns.
 
 ## Configuration
 
@@ -122,12 +122,12 @@ expiry_check_interval = 100
 
 ### Use Redis Protocol when:
 
-- You need complex data structures (hashes, lists, sets)
-- You want to use existing Redis libraries
+- You want to use existing Redis client libraries (Predis, phpredis)
 - You plan to swap the backend (Redis ↔ ePHPm)
-- You're building patterns like rate limiting, queues, leaderboards
+- You're building string-based patterns: rate limiting, page counters, session tags
+- You prefer familiar Redis command syntax
 
-**Example:** Shopping carts, job queues, user sessions, rankings
+**Example:** Rate limiting, page view counters, simple session storage, cache tags
 
 ## Performance Notes
 
@@ -193,6 +193,73 @@ ephpm_kv_expire("session:$id", 3600 * 1000); // 1 hour
 ```php
 $redis->setex("session:$id", 3600, json_encode($data));
 ```
+
+## CLI Debugging Commands
+
+The `ephpm kv` subcommand provides a debugging interface to inspect and manipulate the live KV store without writing PHP code.
+
+### Basic Usage
+
+```bash
+# Test connection
+ephpm kv ping
+
+# Get a value
+ephpm kv get mykey
+
+# Set a value
+ephpm kv set mykey "hello world"
+
+# Set with TTL (in seconds)
+ephpm kv set session:abc 'data' --ttl 3600
+
+# Increment a counter
+ephpm kv incr page:views
+ephpm kv incr counter --by 5
+
+# Check TTL
+ephpm kv ttl mykey
+
+# List keys
+ephpm kv keys "*"
+ephpm kv keys "session:*"
+
+# Delete keys
+ephpm kv del mykey
+ephpm kv del key1 key2 key3
+```
+
+### Useful Patterns
+
+```bash
+# Debug rate limiting
+ephpm kv get "ratelimit:$user_id"
+ephpm kv incr "ratelimit:$user_id"
+
+# Check session data
+ephpm kv get "session:$session_id"
+
+# Monitor cache hit/miss
+ephpm kv get "cache:page:/$path"
+
+# Find all active sessions
+ephpm kv keys "session:*"
+
+# Clear all sessions
+ephpm kv del $(ephpm kv keys "session:*" | awk '{print $NF}')
+```
+
+### Connecting to Remote Server
+
+```bash
+# Connect to a different host/port
+ephpm kv --host 10.0.1.5 --port 6379 ping
+
+# Override defaults
+ephpm kv --host redis.example.com --port 6380 keys "*"
+```
+
+See [docs/architecture/cli.md](../docs/architecture/cli.md) for full CLI documentation.
 
 ## See Also
 
