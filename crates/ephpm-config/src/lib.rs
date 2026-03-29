@@ -1132,4 +1132,208 @@ ini_overrides = [
             ["error_reporting", "E_ALL"]
         );
     }
+
+    #[test]
+    fn test_php_etag_cache_defaults() {
+        let config = Config::default_config().unwrap();
+        assert!(!config.server.php_etag_cache.enabled);
+        assert_eq!(config.server.php_etag_cache.ttl_secs, 300);
+        assert_eq!(config.server.php_etag_cache.key_prefix, "etag:");
+    }
+
+    #[test]
+    fn test_php_etag_cache_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server.php_etag_cache]
+enabled = true
+ttl_secs = 600
+key_prefix = "cache:etag:"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.php_etag_cache.enabled);
+        assert_eq!(config.server.php_etag_cache.ttl_secs, 600);
+        assert_eq!(config.server.php_etag_cache.key_prefix, "cache:etag:");
+    }
+
+    #[test]
+    fn test_php_etag_cache_indefinite_ttl() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server.php_etag_cache]
+enabled = true
+ttl_secs = -1
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.php_etag_cache.enabled);
+        assert_eq!(config.server.php_etag_cache.ttl_secs, -1);
+    }
+
+    #[test]
+    fn test_kv_compression_defaults() {
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.kv.compression, "none");
+        assert_eq!(config.kv.compression_level, 6);
+        assert_eq!(config.kv.compression_min_size, 1024);
+    }
+
+    #[test]
+    fn test_kv_compression_gzip_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[kv]
+compression = "gzip"
+compression_level = 9
+compression_min_size = 512
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.kv.compression, "gzip");
+        assert_eq!(config.kv.compression_level, 9);
+        assert_eq!(config.kv.compression_min_size, 512);
+    }
+
+    #[test]
+    fn test_kv_compression_zstd_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[kv]
+compression = "zstd"
+compression_level = 3
+compression_min_size = 2048
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.kv.compression, "zstd");
+        assert_eq!(config.kv.compression_level, 3);
+        assert_eq!(config.kv.compression_min_size, 2048);
+    }
+
+    #[test]
+    fn test_kv_compression_brotli_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[kv]
+compression = "brotli"
+compression_level = 5
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.kv.compression, "brotli");
+        assert_eq!(config.kv.compression_level, 5);
+    }
+
+    #[test]
+    fn test_env_var_overrides_php_etag_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server.php_etag_cache]
+enabled = false
+"#,
+        )
+        .unwrap();
+
+        temp_env::with_var("EPHPM_SERVER__PHP_ETAG_CACHE__ENABLED", Some("true"), || {
+            let config = Config::load(&file).unwrap();
+            assert!(config.server.php_etag_cache.enabled);
+        });
+    }
+
+    #[test]
+    fn test_env_var_overrides_kv_compression() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[kv]
+compression = "none"
+"#,
+        )
+        .unwrap();
+
+        temp_env::with_var("EPHPM_KV__COMPRESSION", Some("gzip"), || {
+            let config = Config::load(&file).unwrap();
+            assert_eq!(config.kv.compression, "gzip");
+        });
+    }
+
+    #[test]
+    fn test_env_var_overrides_compression_level() {
+        temp_env::with_var("EPHPM_KV__COMPRESSION_LEVEL", Some("8"), || {
+            let config = Config::default_config().unwrap();
+            assert_eq!(config.kv.compression_level, 8);
+        });
+    }
+
+    #[test]
+    fn test_env_var_overrides_compression_min_size() {
+        temp_env::with_var("EPHPM_KV__COMPRESSION_MIN_SIZE", Some("4096"), || {
+            let config = Config::default_config().unwrap();
+            assert_eq!(config.kv.compression_min_size, 4096);
+        });
+    }
+
+    #[test]
+    fn test_combined_php_etag_and_compression_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server.php_etag_cache]
+enabled = true
+ttl_secs = 3600
+key_prefix = "etag:"
+
+[kv]
+compression = "zstd"
+compression_level = 6
+compression_min_size = 1024
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+
+        // Verify ETag config
+        assert!(config.server.php_etag_cache.enabled);
+        assert_eq!(config.server.php_etag_cache.ttl_secs, 3600);
+        assert_eq!(config.server.php_etag_cache.key_prefix, "etag:");
+
+        // Verify compression config
+        assert_eq!(config.kv.compression, "zstd");
+        assert_eq!(config.kv.compression_level, 6);
+        assert_eq!(config.kv.compression_min_size, 1024);
+    }
 }
