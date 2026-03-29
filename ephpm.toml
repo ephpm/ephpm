@@ -33,6 +33,11 @@ index_files = ["index.php", "index.html"]
 # hidden_files = "deny"    # "deny" (403), "ignore" (404), or "allow"
 # etag = true              # ETag headers + 304 Not Modified support
 
+# [server.php_etag_cache]
+# enabled = false          # Cache PHP response ETags in KV store
+# ttl_secs = 300           # seconds; -1 or 0 for indefinite (manual clearing required)
+# key_prefix = "etag:"     # KV store key prefix for ETag entries
+
 # [server.security]
 # trusted_proxies = []     # CIDR ranges for X-Forwarded-For, e.g. ["10.0.0.0/8"]
 # blocked_paths = []       # paths to block (403), e.g. ["/wp-config.php", "/vendor/*"]
@@ -154,12 +159,15 @@ ini_overrides = [
 # digest_store_max_entries = 10000     # max unique query fingerprints to track
 
 # ──────────────────────────────────────────────────────────
-# KV Store (planned)
+# KV Store
 # ──────────────────────────────────────────────────────────
 #
 # [kv]
 # memory_limit = "256MB"
 # eviction_policy = "allkeys-lru"      # noeviction, allkeys-lru, volatile-lru, allkeys-random
+# compression = "none"                 # "none", "gzip", "zstd" (brotli unsupported)
+# compression_level = 6                # 1 = fastest, 9 = best ratio
+# compression_min_size = 1024          # minimum bytes before compression is applied
 #
 # [kv.redis_compat]
 # enabled = false                      # RESP protocol listener (existing Redis clients work)
