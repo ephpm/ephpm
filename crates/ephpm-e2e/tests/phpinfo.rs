@@ -32,10 +32,10 @@ async fn php_version_matches() {
         "expected body to contain \"{version_marker}\", got:\n{body}"
     );
 
-    // Validate embedded SAPI
+    // Validate ePHPm's custom SAPI name
     assert!(
-        body.contains("Server API: embed"),
-        "expected embedded SAPI, got:\n{body}"
+        body.contains("Server API: ephpm"),
+        "expected ephpm SAPI, got:\n{body}"
     );
 }
 

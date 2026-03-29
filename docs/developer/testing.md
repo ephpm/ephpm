@@ -39,14 +39,57 @@ E2E tests live in a dedicated Rust crate (`crates/ephpm-e2e/`) that runs inside 
 
 ### Current Tests
 
-**`tests/phpinfo.rs`** — validates that ephpm boots and serves PHP correctly:
+All tests read `EPHPM_URL` from the environment. `phpinfo.rs` additionally reads `EXPECTED_PHP_VERSION`.
 
-- `php_version_matches` — GETs `/index.php`, asserts 200, checks `PHP Version: X.Y` matches the version linked at build time, confirms `Server API: embed`
-- `health_check` — GETs `/`, asserts success response
+**`tests/basic.rs`** — core request lifecycle:
+- `missing_file_returns_404`
+- `php_renders_correctly`
+- `static_file_serving`
 
-The test reads two env vars:
-- `EPHPM_URL` — base URL of the ephpm service (e.g. `http://ephpm:8080`)
-- `EXPECTED_PHP_VERSION` — major.minor version to assert (e.g. `8.5`)
+**`tests/phpinfo.rs`** — PHP version and SAPI identity:
+- `php_version_matches` — GETs `/index.php`, checks `PHP Version: X.Y`, confirms `Server API: ephpm`
+- `health_check` — GETs `/`, asserts success
+
+**`tests/http.rs`** — HTTP protocol correctness:
+- `head_request_has_no_body` — HEAD returns same headers as GET but empty body
+- `post_body_reaches_php` — form POST reaches `$_POST`
+- `content_type_for_static_files` — `.css` → `text/css`, `.js` → `application/javascript`
+- `etag_304_not_modified` — ETag round-trip returns 304 with empty body
+- `gzip_response_is_compressed` — `Accept-Encoding: gzip` triggers `Content-Encoding: gzip`
+- `request_body_too_large_returns_413` — body > `max_body_size` returns 413
+- `cache_control_present_on_static_files` — `Cache-Control` header present on static files
+- `x_forwarded_for_header_reaches_php` — `X-Forwarded-For` appears as `HTTP_X_FORWARDED_FOR` in `$_SERVER`
+- `fallback_chain_serves_index_php` — GET `/` resolves via fallback chain to `index.php`
+
+**`tests/php.rs`** — PHP execution correctness:
+- `query_string_available` — `$_GET` populated from query string
+- `server_vars_populated` — `REQUEST_METHOD`, `REQUEST_URI`, `DOCUMENT_ROOT`, `REMOTE_ADDR` set
+- `php_exit_returns_output` — output before `exit(0)` delivered to client
+- `php_sets_custom_status` — `http_response_code(201)` propagates to HTTP status line
+- `cookie_header_populates_cookie_superglobal` — `Cookie:` header reaches `$_COOKIE`
+- `php_input_stream_readable` — `php://input` contains raw body for non-form POST
+- `custom_response_header_reaches_client` — PHP `header()` appears in HTTP response
+
+**`tests/errors.rs`** — PHP error recovery (zend_try/zend_catch correctness):
+- `php_fatal_error_returns_500` — undefined function call → 500, server continues
+- `php_memory_limit_exceeded_returns_500` — OOM → 500, server continues
+- `php_syntax_error_returns_500` — parse error → 500, server continues
+
+**`tests/kv.rs`** — KV store PHP native functions:
+- `kv_set_get_roundtrip`, `kv_ttl_expiry`, `kv_incr_atomic`, `kv_del_and_exists`
+- `kv_pttl_returns_minus_two_for_missing`, `kv_pttl_positive_for_live_key`
+- `kv_incr_by_delta`, `kv_expire_extends_ttl`
+- `kv_setnx_does_not_overwrite`, `kv_mset_mget_roundtrip`
+
+**`tests/concurrency.rs`** — correctness under concurrent load:
+- `concurrent_php_requests_all_succeed` — 20 parallel GETs all return correct output
+- `concurrent_kv_increments_are_consistent` — 20 concurrent increments yield unique values 1–20
+
+**`tests/security.rs`** — path and access controls:
+- `dotfile_returns_403` — `/.env` returns 403
+- `php_source_not_exposed` — `.php` response never contains `<?php`
+- `blocked_path_pattern_returns_403` — `vendor/*` glob returns 403
+- `path_traversal_is_blocked` — URL-encoded `%2e%2e` sequences don't escape docroot
 
 ### PHP Version Flow
 

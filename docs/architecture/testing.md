@@ -24,20 +24,29 @@ This document covers the end-to-end testing strategy, from single-node validatio
 
 ### Current E2E Coverage
 
-The `ephpm-e2e` crate currently tests:
-- `php_version_matches` — GET `/index.php`, verify HTTP 200, check PHP version string, verify embedded SAPI
-- `health_check` — GET `/`, verify success
+The `ephpm-e2e` crate covers the following areas. Each row is one test file.
 
-The `scripts/e2e-test.sh` bash script tests:
-- PHP execution (index.php, info.php)
-- GET parameters (query string)
-- POST parameters
-- Content-Type header validation
-- 404 response for missing files
+| File | Area | Tests |
+|------|------|-------|
+| `basic.rs` | Core lifecycle | 404, PHP render, static file |
+| `phpinfo.rs` | PHP version + SAPI | version string, health check |
+| `http.rs` | HTTP protocol | HEAD, POST, Content-Type, ETag/304, gzip, 413, Cache-Control, X-Forwarded-For, fallback chain |
+| `php.rs` | PHP execution | `$_GET`, `$_SERVER`, exit(0), custom status, `$_COOKIE`, `php://input`, `header()` |
+| `errors.rs` | PHP error recovery | fatal error → 500, OOM → 500, syntax error → 500, server survives each |
+| `kv.rs` | KV store PHP bridge | set/get, TTL, incr, del/exists, pttl, incr_by, expire, setnx, mset/mget |
+| `concurrency.rs` | Concurrent load | 20 parallel GETs, 20 concurrent KV increments |
+| `security.rs` | Access control | dotfile 403, PHP source not exposed, blocked_paths glob, path traversal |
 
-### Gaps
+### Remaining Single-Node Gaps
 
-The current E2E suite is minimal. It validates that PHP runs and serves responses, but doesn't cover most of the HTTP server features we've built. The sections below define comprehensive test plans for single-node and multi-node scenarios.
+Planned but not yet implemented (see detailed tables in the sections below):
+
+- **PHP**: `$_FILES` upload (multipart parsing), `session_start()` / `$_SESSION`, output buffering, `SCRIPT_NAME`/`SCRIPT_FILENAME` after fallback rewrite
+- **HTTP**: `If-Modified-Since` / `Last-Modified`, large file streaming, PHP-initiated redirect (`header("Location: ...")`)
+- **Security**: `allowed_php_paths` whitelist enforcement, `trusted_hosts` 421 response
+- **Config**: `X-Forwarded-For` → `REMOTE_ADDR` rewrite when `trusted_proxies` is set, `$_SERVER['HTTPS']` flag
+
+Multi-node cluster and HA tests remain out of scope until clustering is implemented (see below).
 
 ---
 

@@ -1,0 +1,6 @@
+target/
+php-sdk/
+.git/
+bin/
+docs/
+.github/
