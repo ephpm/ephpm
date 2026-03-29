@@ -21,8 +21,10 @@ pub enum ResetStrategy {
 
 impl ResetStrategy {
 	/// Parse a reset strategy from a string (case-insensitive).
+	///
+	/// Returns [`ResetStrategy::Smart`] for unrecognised values.
 	#[must_use]
-	pub fn from_str(s: &str) -> Self {
+	pub fn from_str_lossy(s: &str) -> Self {
 		match s.to_ascii_lowercase().as_str() {
 			"never" => Self::Never,
 			"always" => Self::Always,
@@ -35,6 +37,6 @@ impl std::str::FromStr for ResetStrategy {
 	type Err = std::convert::Infallible;
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		Ok(Self::from_str(s))
+		Ok(Self::from_str_lossy(s))
 	}
 }

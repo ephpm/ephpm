@@ -1,19 +1,19 @@
-//! MySQL transparent proxy with connection pooling.
+//! `MySQL` transparent proxy with connection pooling.
 //!
 //! ## How it works
 //!
-//! 1. A pool of pre-authenticated TCP connections to the real MySQL server
-//!    is maintained. Each connection completed a full MySQL handshake using
+//! 1. A pool of pre-authenticated TCP connections to the real `MySQL` server
+//!    is maintained. Each connection completed a full `MySQL` handshake using
 //!    the credentials from `[db.mysql].url`.
 //!
 //! 2. When PHP connects to the proxy (e.g. `127.0.0.1:3306`), the proxy:
 //!    a. Sends a synthetic `HandshakeV10` to the client (using saved server
-//!       metadata and a fresh 20-byte challenge).
+//!    metadata and a fresh 20-byte challenge).
 //!    b. Reads the client's `HandshakeResponse41` and accepts it without
-//!       credential validation — the proxy port only listens on loopback.
+//!    credential validation — the proxy port only listens on loopback.
 //!    c. Sends an `OK` packet.
 //!    d. Starts bidirectional byte forwarding between the client and a
-//!       checked-out backend connection.
+//!    checked-out backend connection.
 //!
 //! 3. When the client closes its connection, the proxy sends
 //!    `COM_RESET_CONNECTION` to the backend (resets session variables,
@@ -23,7 +23,7 @@
 //! ## Auth plugin support
 //!
 //! Currently supports `mysql_native_password` for backend authentication.
-//! MySQL 8+ users should configure users with:
+//! `MySQL` 8+ users should configure users with:
 //! ```sql
 //! ALTER USER 'user'@'%' IDENTIFIED WITH mysql_native_password BY 'pass';
 //! ```
@@ -66,7 +66,7 @@ pub struct RwSplitParams {
 	pub sticky_duration: std::time::Duration,
 }
 
-/// MySQL server metadata captured from the initial backend handshake.
+/// `MySQL` server metadata captured from the initial backend handshake.
 /// Used to generate synthetic server greetings for PHP clients.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -82,12 +82,13 @@ struct ServerMeta {
     auth_plugin: String,
 }
 
-/// A running MySQL proxy that accepts client connections and pools backends.
+/// A running `MySQL` proxy that accepts client connections and pools backends.
 pub struct MySqlProxy {
     pool: Pool,
     replica_pools: Vec<Pool>,
     meta: Arc<ServerMeta>,
     listen: String,
+    #[allow(dead_code)]
     socket: Option<std::path::PathBuf>,
     reset_strategy: ResetStrategy,
     rw_split: RwSplitParams,
@@ -138,7 +139,11 @@ impl MySqlProxy {
         // Seed the pool with the probe connection.
         let mut checkout = Checkout {
             stream: Some(probe_stream),
-            permit: Some(Arc::clone(&pool.semaphore).try_acquire_owned().unwrap()),
+            permit: Some(
+                Arc::clone(&pool.semaphore)
+                    .try_acquire_owned()
+                    .map_err(|_| DbError::PoolClosed)?,
+            ),
             created_at: std::time::Instant::now(),
             pool: pool.clone(),
         };
@@ -185,6 +190,7 @@ impl MySqlProxy {
     }
 
     /// Start the background pool maintenance task.
+    #[must_use]
     pub fn start_maintenance(&self) -> tokio::task::JoinHandle<()> {
         self.pool.start_background_tasks()
     }
@@ -279,7 +285,7 @@ impl MySqlProxy {
 
 // ── Backend connection & auth ─────────────────────────────────────────────────
 
-/// Connect to the MySQL backend and complete the authentication handshake.
+/// Connect to the `MySQL` backend and complete the authentication handshake.
 ///
 /// Returns the authenticated stream and the server metadata extracted from
 /// the initial greeting.
@@ -352,7 +358,7 @@ fn parse_server_greeting(payload: &[u8]) -> Result<(ServerMeta, [u8; 20]), DbErr
     }
 
     // Capability flags (lower 2 bytes).
-    let cap_low = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as u32;
+    let cap_low = u32::from(u16::from_le_bytes([payload[pos], payload[pos + 1]]));
     pos += 2;
 
     // Charset.
@@ -363,7 +369,7 @@ fn parse_server_greeting(payload: &[u8]) -> Result<(ServerMeta, [u8; 20]), DbErr
     pos += 2;
 
     // Capability flags (upper 2 bytes).
-    let cap_high = u16::from_le_bytes([payload[pos], payload[pos + 1]]) as u32;
+    let cap_high = u32::from(u16::from_le_bytes([payload[pos], payload[pos + 1]]));
     pos += 2;
     let capabilities = cap_low | (cap_high << 16);
 
@@ -427,7 +433,7 @@ fn build_handshake_response(
         | CLIENT_PS_MULTI_RESULTS
         | CLIENT_PLUGIN_AUTH
         | CLIENT_PLUGIN_AUTH_LENENC;
-    if database.map_or(false, |d| !d.is_empty()) {
+    if database.is_some_and(|d| !d.is_empty()) {
         caps |= CLIENT_CONNECT_WITH_DB;
     }
 
@@ -463,10 +469,10 @@ fn mysql_native_password(password: &str, challenge: &[u8; 20]) -> Vec<u8> {
         return vec![];
     }
     let stage1 = Sha1::digest(password.as_bytes());
-    let stage2 = Sha1::digest(&stage1);
+    let stage2 = Sha1::digest(stage1);
     let mut h = Sha1::new();
     h.update(challenge);
-    h.update(&stage2);
+    h.update(stage2);
     let stage3 = h.finalize();
     stage1.iter().zip(stage3.iter()).map(|(a, b)| a ^ b).collect()
 }
@@ -516,10 +522,10 @@ async fn send_greeting(
     payload.extend_from_slice(&1_u32.to_le_bytes()); // connection id (arbitrary)
     payload.extend_from_slice(&challenge[..8]); // auth-plugin-data part 1
     payload.push(0); // filler
-    payload.extend_from_slice(&(caps as u16).to_le_bytes()); // caps lower
+    payload.extend_from_slice(&caps.to_le_bytes()[..2]); // caps lower 16 bits
     payload.push(meta.charset);
     payload.extend_from_slice(&0x0002_u16.to_le_bytes()); // status: SERVER_STATUS_AUTOCOMMIT
-    payload.extend_from_slice(&((caps >> 16) as u16).to_le_bytes()); // caps upper
+    payload.extend_from_slice(&caps.to_le_bytes()[2..]); // caps upper 16 bits
     payload.push(21); // length of auth-plugin-data (part1=8 + part2=12 + null=1)
     payload.extend_from_slice(&[0u8; 10]); // reserved
     payload.extend_from_slice(&challenge[8..]); // auth-plugin-data part 2 (12 bytes)
@@ -551,7 +557,7 @@ async fn send_ok(client: &mut TcpStream) -> Result<(), DbError> {
 /// Send `COM_RESET_CONNECTION` and read the `OK` response.
 ///
 /// Resets: transaction state, user variables, prepared statements, temporary
-/// tables, and `LAST_INSERT_ID()`. Available since MySQL 5.7.
+/// tables, and `LAST_INSERT_ID()`. Available since `MySQL` 5.7.
 async fn reset_connection(mut stream: TcpStream) -> Result<TcpStream, DbError> {
     // COM_RESET_CONNECTION = 0x1F, sequence = 0.
     write_packet(&mut stream, 0, &[0x1F]).await?;
@@ -584,25 +590,21 @@ async fn proxy_bidirectional(
     mut client: TcpStream,
     mut backend: TcpStream,
 ) -> Result<TcpStream, DbError> {
-    let (mut cr, mut cw) = client.split();
-    let (mut br, mut bw) = backend.split();
+    // Scope the split halves so the borrows end before we move `backend`.
+    let result = {
+        let (mut cr, mut cw) = client.split();
+        let (mut br, mut bw) = backend.split();
 
-    let client_to_backend = tokio::io::copy(&mut cr, &mut bw);
-    let backend_to_client = tokio::io::copy(&mut br, &mut cw);
+        let client_to_backend = tokio::io::copy(&mut cr, &mut bw);
+        let backend_to_client = tokio::io::copy(&mut br, &mut cw);
 
-    // Run both directions concurrently. When one direction closes, shut down
-    // the other. `copy` returns 0 bytes on clean EOF.
-    let result = tokio::select! {
-        r = client_to_backend => r,
-        r = backend_to_client => r,
+        // Run both directions concurrently. When one direction closes, shut down
+        // the other. `copy` returns 0 bytes on clean EOF.
+        tokio::select! {
+            r = client_to_backend => r,
+            r = backend_to_client => r,
+        }
     };
-
-    // Reassemble the streams from the split halves.
-    // The halves borrow from the original streams — drop them to reclaim.
-    drop(cr);
-    drop(cw);
-    drop(br);
-    drop(bw);
 
     match result {
         Ok(_) => Ok(backend),
@@ -617,7 +619,7 @@ async fn proxy_bidirectional(
 
 // ── MySQL packet framing ──────────────────────────────────────────────────────
 
-/// Read one MySQL packet: `[len: 3LE][seq: 1][payload: len]`.
+/// Read one `MySQL` packet: `[len: 3LE][seq: 1][payload: len]`.
 async fn read_packet(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), DbError> {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).await?;
@@ -628,15 +630,11 @@ async fn read_packet(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), DbError> {
     Ok((seq, payload))
 }
 
-/// Write one MySQL packet.
+/// Write one `MySQL` packet.
 async fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) -> Result<(), DbError> {
-    let len = payload.len() as u32;
-    let header = [
-        (len & 0xFF) as u8,
-        ((len >> 8) & 0xFF) as u8,
-        ((len >> 16) & 0xFF) as u8,
-        seq,
-    ];
+    let len = u32::try_from(payload.len()).expect("MySQL packet too large for 32-bit length field");
+    let len_bytes = len.to_le_bytes();
+    let header = [len_bytes[0], len_bytes[1], len_bytes[2], seq];
     stream.write_all(&header).await?;
     stream.write_all(payload).await?;
     Ok(())
@@ -646,19 +644,18 @@ async fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) -> Result
 fn encode_lenenc_bytes(buf: &mut Vec<u8>, data: &[u8]) {
     let len = data.len();
     if len < 251 {
-        buf.push(len as u8);
+        buf.push(len.to_le_bytes()[0]);
     } else if len < 65536 {
         buf.push(0xFC);
-        buf.extend_from_slice(&(len as u16).to_le_bytes());
+        buf.extend_from_slice(&len.to_le_bytes()[..2]);
     } else {
         buf.push(0xFD);
-        let b = (len as u32).to_le_bytes();
-        buf.extend_from_slice(&b[..3]);
+        buf.extend_from_slice(&len.to_le_bytes()[..3]);
     }
     buf.extend_from_slice(data);
 }
 
-/// Extract the human-readable message from a MySQL `ERR_Packet`.
+/// Extract the human-readable message from a `MySQL` `ERR_Packet`.
 fn parse_error_packet(payload: &[u8]) -> String {
     // [0xFF][code: 2][#][sqlstate: 5][message...]
     if payload.len() < 9 {
@@ -704,31 +701,20 @@ fn classify_mysql_query(sql: &str) -> QueryKind {
             }
         }
         "BEGIN" | "START" => QueryKind::TxBegin,
-        "COMMIT" => QueryKind::TxEnd,
-        "ROLLBACK" => QueryKind::TxEnd,
+        "COMMIT" | "ROLLBACK" => QueryKind::TxEnd,
         _ => QueryKind::Write, // Default: treat as write (safest)
     }
 }
 
 /// Per-client connection state for routing and dirty tracking.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct ClientState {
     in_transaction: bool,
     sticky_until: Option<std::time::Instant>,
     dirty: bool,
 }
 
-impl Default for ClientState {
-    fn default() -> Self {
-        Self {
-            in_transaction: false,
-            sticky_until: None,
-            dirty: false,
-        }
-    }
-}
-
-/// Forward a complete MySQL response from backend to client.
+/// Forward a complete `MySQL` response from backend to client.
 ///
 /// Handles OK, ERR, EOF, and result sets by reading the full response
 /// and forwarding each packet.
@@ -741,8 +727,7 @@ async fn forward_mysql_response(
 
     // Check response type.
     match payload.first().copied() {
-        Some(0x00) => return Ok(()), // OK packet
-        Some(0xFF) => return Ok(()), // ERR packet
+        Some(0x00 | 0xFF) => return Ok(()), // OK or ERR packet
         Some(0xFE) if payload.len() < 9 => return Ok(()), // EOF packet
         _ => {} // Result set: read columns and rows
     }
@@ -808,9 +793,8 @@ async fn proxy_routing_loop(
 
     loop {
         // Read command from client.
-        let (seq, payload) = match read_packet(&mut client).await {
-            Ok(p) => p,
-            Err(_) => break, // Client closed or error
+        let Ok((seq, payload)) = read_packet(&mut client).await else {
+            break; // Client closed or error
         };
 
         // COM_QUIT (0x01) signals client disconnect.
@@ -839,8 +823,8 @@ async fn proxy_routing_loop(
         // Track dirty bit based on command type and SQL.
         if !payload.is_empty() {
             match payload[0] {
-                0x02 => state.dirty = true, // COM_INIT_DB
-                0x16 => state.dirty = true, // COM_STMT_PREPARE
+                // COM_INIT_DB
+                0x02 | 0x16 => state.dirty = true, // COM_STMT_PREPARE
                 0x03 => {
                     // COM_QUERY: check SQL type.
                     let sql = std::str::from_utf8(payload.get(1..).unwrap_or_default())
@@ -854,7 +838,7 @@ async fn proxy_routing_loop(
                         QueryKind::TxEnd => {
                             state.in_transaction = false;
                         }
-                        _ => {} // Read queries don't dirty
+                        QueryKind::Read => {} // Read queries don't dirty
                     }
                 }
                 _ => {} // Other commands
@@ -900,9 +884,14 @@ async fn proxy_routing_loop(
 
 // ── Public builder ────────────────────────────────────────────────────────────
 
-/// Build a [`Pool`] for MySQL.
+/// Build a [`Pool`] for `MySQL`.
 ///
 /// Exported so `lib.rs` can construct `MySqlProxy` from config.
+///
+/// # Errors
+///
+/// Propagates any error from [`MySqlProxy::new`] (backend connection or
+/// authentication failures).
 pub async fn build_proxy(
     url: &str,
     listen: &str,

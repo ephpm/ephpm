@@ -13,7 +13,8 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::server::conn::http1;
 use hyper::{Response, StatusCode};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::server::conn::auto;
 use router::Router;
 use rustls::ServerConfig;
 use rustls_acme::is_tls_alpn_challenge;
@@ -29,8 +30,8 @@ use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 ///
 /// Also starts background services:
 /// - KV store with optional RESP protocol server
-/// - MySQL connection proxy (if configured)
-/// - PostgreSQL connection proxy (if configured)
+/// - `MySQL` connection proxy (if configured)
+/// - `PostgreSQL` connection proxy (if configured)
 ///
 /// When `[server.tls]` is configured, the server terminates TLS using
 /// either manual cert/key files or automatic ACME provisioning.
@@ -389,6 +390,11 @@ async fn serve_acme_tls(
 }
 
 /// Serve an HTTP connection over any transport (`TcpStream` or `TlsStream`).
+///
+/// Uses [`auto::Builder`] which negotiates HTTP/1.1 or HTTP/2 based on the
+/// ALPN protocol agreed during the TLS handshake. Plain (non-TLS) connections
+/// always use HTTP/1.1, since h2c (HTTP/2 cleartext) is not supported by
+/// browsers.
 async fn serve_connection<I>(
     io: TokioIo<I>,
     router: Arc<Router>,
@@ -403,16 +409,21 @@ async fn serve_connection<I>(
         async move { router.handle(req, remote_addr, is_tls).await }
     });
 
-    if let Err(err) = http1::Builder::new()
+    let mut builder = auto::Builder::new(TokioExecutor::new());
+    builder
+        .http1()
         .keep_alive(true)
         .header_read_timeout(settings.header_read_timeout)
         .max_buf_size(settings.max_header_size)
-        .timer(hyper_util::rt::TokioTimer::new())
-        .serve_connection(io, service)
-        .with_upgrades()
-        .await
-    {
-        if !err.is_incomplete_message() {
+        .timer(hyper_util::rt::TokioTimer::new());
+
+    if let Err(err) = builder.serve_connection_with_upgrades(io, service).await {
+        // Downcast to hyper::Error to suppress noisy "connection closed before
+        // message was completed" errors (clients disconnecting mid-request).
+        let is_incomplete = err
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(hyper::Error::is_incomplete_message);
+        if !is_incomplete {
             tracing::debug!(%remote_addr, %err, "connection error");
         }
     }
@@ -507,7 +518,7 @@ fn start_kv_service(
     Ok((store, Some(handle)))
 }
 
-/// Start database proxies (MySQL, PostgreSQL).
+/// Start database proxies (`MySQL`, `PostgreSQL`).
 async fn start_db_proxies(config: &Config) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut handles = vec![];
 
@@ -528,7 +539,7 @@ async fn start_db_proxies(config: &Config) -> anyhow::Result<Vec<tokio::task::Jo
             health_check_interval: parse_duration(&mysql_config.health_check_interval)?,
         };
 
-        let reset_strategy = ephpm_db::ResetStrategy::from_str(&mysql_config.reset_strategy);
+        let reset_strategy = ephpm_db::ResetStrategy::from_str_lossy(&mysql_config.reset_strategy);
 
         let replica_urls = mysql_config.replicas
             .as_ref()
@@ -550,8 +561,8 @@ async fn start_db_proxies(config: &Config) -> anyhow::Result<Vec<tokio::task::Jo
                     }
                 });
                 handles.push(proxy_handle);
-                // Keep maintenance task alive by spawning separately
-                let _ = maintenance_handle;
+                // Drop the handle to detach the maintenance task — it runs independently.
+                drop(maintenance_handle);
             }
             Err(e) => {
                 tracing::error!("failed to start MySQL proxy: {e:#}");
@@ -586,8 +597,8 @@ fn parse_memory_size(s: &str) -> anyhow::Result<usize> {
     Ok(num.saturating_mul(multiplier))
 }
 
-/// Parse a duration string (e.g. "30s", "5m", "1h") to std::time::Duration.
+/// Parse a duration string (e.g. "30s", "5m", "1h") to `std::time::Duration`.
 fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
     ephpm_db::duration::parse_duration(s)
-        .map_err(|e| anyhow::anyhow!("{}", e))
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }

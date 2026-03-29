@@ -679,7 +679,7 @@ pub fn gzip_compress(data: &[u8], content_type: &str, settings: CompressionSetti
     }
 }
 
-/// Build the KV store key for caching a PHP response's ETag.
+/// Build the KV store key for caching a PHP response's `ETag`.
 ///
 /// Format: `{prefix}{method}:{path}` or `{prefix}{method}:{path}?{query}` if query string is present.
 fn php_etag_cache_key(prefix: &str, method: &str, path: &str, query: &str) -> String {
@@ -690,11 +690,11 @@ fn php_etag_cache_key(prefix: &str, method: &str, path: &str, query: &str) -> St
     }
 }
 
-/// Check if a stored ETag value matches the client's `If-None-Match` header.
+/// Check if a stored `ETag` value matches the client's `If-None-Match` header.
 ///
 /// Implements RFC 7232 semantics:
-/// - Handles `*` (matches any ETag)
-/// - Handles comma-separated lists of ETags
+/// - Handles `*` (matches any `ETag`)
+/// - Handles comma-separated lists of `ETag`s
 /// - Trims whitespace correctly
 fn etag_matches_value(etag: &str, if_none_match: &str) -> bool {
     let trimmed = if_none_match.trim();

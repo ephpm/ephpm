@@ -75,6 +75,7 @@ pub struct Pool {
     reset: Arc<dyn Fn(TcpStream) -> BoxFuture<Result<TcpStream, DbError>> + Send + Sync>,
     /// Called to check whether an idle connection is still alive.
     /// Returns `(stream, is_alive)` on success, or an error on I/O failure.
+    #[allow(clippy::type_complexity)]
     ping: Arc<dyn Fn(TcpStream) -> BoxFuture<Result<(TcpStream, bool), DbError>> + Send + Sync>,
 }
 
@@ -110,6 +111,7 @@ impl Pool {
     ///
     /// Returns a handle to an [`tokio::task::JoinHandle`] that runs until the pool
     /// is closed. Call [`Pool::close`] to stop it.
+    #[must_use]
     pub fn start_background_tasks(&self) -> tokio::task::JoinHandle<()> {
         let pool = self.clone();
         let interval = pool.config.health_check_interval;
@@ -222,7 +224,7 @@ impl Pool {
 
     /// Create new connections until we reach `min_connections`.
     async fn warm(&self) {
-        let current_idle = self.state.idle.lock().len() as u32;
+        let current_idle = u32::try_from(self.state.idle.lock().len()).unwrap_or(u32::MAX);
         if current_idle >= self.config.min_connections {
             return;
         }
@@ -301,6 +303,10 @@ impl Checkout {
     ///
     /// The caller is responsible for calling [`Checkout::retire`] or
     /// [`Checkout::return_to_pool`] after use.
+    ///
+    /// # Panics
+    ///
+    /// Panics if called more than once on the same [`Checkout`].
     #[must_use]
     pub fn take_stream(&mut self) -> TcpStream {
         self.stream.take().expect("stream already taken")

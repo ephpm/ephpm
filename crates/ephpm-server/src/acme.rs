@@ -62,7 +62,12 @@ pub fn start_acme(tls_config: &TlsConfig) -> anyhow::Result<AcmeSetup> {
 
     let state = config.state();
     let challenge_config = state.challenge_rustls_config();
-    let default_config = state.default_rustls_config();
+    let mut default_config = state.default_rustls_config();
+    // rustls_acme creates a fresh Arc here (strong count = 1), so get_mut succeeds.
+    // Add h2 ALPN so clients can negotiate HTTP/2 on ACME-managed TLS connections.
+    if let Some(cfg) = Arc::get_mut(&mut default_config) {
+        cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    }
 
     // Spawn background task to drive certificate acquisition and renewal.
     tokio::spawn(drive_acme_events(state));

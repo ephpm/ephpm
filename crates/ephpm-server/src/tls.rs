@@ -31,8 +31,9 @@ pub fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<T
         .with_single_cert(certs, key)
         .context("invalid TLS certificate/key pair")?;
 
-    // Only advertise HTTP/1.1 — this server does not support h2 yet.
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    // Advertise HTTP/2 and HTTP/1.1 (preference order: h2 first).
+    // Clients that support h2 will negotiate it; others fall back to http/1.1.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(TlsAcceptor::from(Arc::new(config)))
 }

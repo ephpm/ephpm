@@ -14,7 +14,7 @@ repository = "https://github.com/user/ephpm"
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 http-body-util = "0.1"
 http = "1"
 tower = { version = "0.5", features = ["full"] }
