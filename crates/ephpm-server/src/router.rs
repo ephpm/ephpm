@@ -22,7 +22,10 @@ use hyper::body::{Bytes, Incoming};
 use hyper::{Request, Response, StatusCode};
 use ipnet::IpNet;
 
-use crate::static_files;
+use crate::{metrics, static_files};
+
+#[allow(unused_imports)]
+use ::metrics::{counter, gauge, histogram};
 
 /// Result of resolving a request through `fallback`.
 enum Resolved {
@@ -61,11 +64,17 @@ pub struct Router {
     response_headers: Vec<(String, String)>,
     store: Arc<Store>,
     php_etag_cache_config: ephpm_config::PhpETagCacheConfig,
+    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    metrics_path: String,
 }
 
 impl Router {
     #[must_use]
-    pub fn new(config: &Config, store: Arc<Store>) -> Self {
+    pub fn new(
+        config: &Config,
+        store: Arc<Store>,
+        metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    ) -> Self {
         let port =
             config.server.listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(8080);
 
@@ -109,6 +118,8 @@ impl Router {
                 .collect(),
             store,
             php_etag_cache_config: config.server.php_etag_cache.clone(),
+            metrics_handle,
+            metrics_path: config.server.metrics.path.clone(),
         }
     }
 
@@ -127,41 +138,80 @@ impl Router {
         remote_addr: SocketAddr,
         is_tls: bool,
     ) -> Result<Response<Full<Bytes>>, hyper::Error> {
-        match tokio::time::timeout(
+        let method = req.method().as_str().to_ascii_uppercase();
+        gauge!("ephpm_http_requests_in_flight").increment(1.0);
+        let start = std::time::Instant::now();
+
+        let (result, handler) = if let Ok(result) = tokio::time::timeout(
             self.request_timeout,
             self.handle_inner(req, remote_addr, is_tls),
         )
         .await
         {
-            Ok(result) => result,
-            Err(_) => Ok(error_response(StatusCode::GATEWAY_TIMEOUT, "504 Gateway Timeout")),
+            let handler = result.as_ref().map_or("error", |(_, h)| *h);
+            (result.map(|(resp, _)| resp), handler)
+        } else {
+            counter!("ephpm_http_timeouts_total", "stage" => "request").increment(1);
+            (Ok(error_response(StatusCode::GATEWAY_TIMEOUT, "504 Gateway Timeout")), "error")
+        };
+
+        let elapsed = start.elapsed().as_secs_f64();
+        gauge!("ephpm_http_requests_in_flight").decrement(1.0);
+        if let Ok(ref resp) = result {
+            let status = resp.status().as_u16().to_string();
+            counter!("ephpm_http_requests_total",
+                "method" => method.clone(),
+                "status" => status,
+                "handler" => handler
+            )
+            .increment(1);
+            histogram!("ephpm_http_request_duration_seconds",
+                "method" => method,
+                "handler" => handler
+            )
+            .record(elapsed);
         }
+
+        result
     }
 
     /// Inner request handler (wrapped by timeout in `handle`).
+    ///
+    /// Returns the response paired with a handler label for metrics.
+    #[allow(clippy::too_many_lines)]
     async fn handle_inner(
         &self,
         req: Request<Incoming>,
         remote_addr: SocketAddr,
         is_tls: bool,
-    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    ) -> Result<(Response<Full<Bytes>>, &'static str), hyper::Error> {
         // Validate Host header against trusted hosts list.
         if let Some(resp) = self.check_trusted_host(&req) {
-            return Ok(resp);
+            return Ok((resp, "error"));
         }
 
         let uri_path = req.uri().path().to_string();
         let query_string = req.uri().query().unwrap_or("").to_string();
         let method = req.method().as_str().to_ascii_uppercase();
 
+        // Metrics endpoint — served before security checks since it is an
+        // internal ePHPm route, not user-supplied content.
+        if method == "GET" {
+            if let Some(ref handle) = self.metrics_handle {
+                if uri_path == self.metrics_path {
+                    return Ok((metrics::render(handle), "metrics"));
+                }
+            }
+        }
+
         // Block hidden files (dot-prefixed path segments like .env, .git)
         if let Some(resp) = self.check_hidden_file(&uri_path) {
-            return Ok(resp);
+            return Ok((resp, "error"));
         }
 
         // Block explicitly forbidden paths
         if is_path_blocked(&uri_path, &self.blocked_paths) {
-            return Ok(error_response(StatusCode::FORBIDDEN, "403 Forbidden"));
+            return Ok((error_response(StatusCode::FORBIDDEN, "403 Forbidden"), "error"));
         }
 
         // Resolve real client IP and HTTPS status from trusted proxy headers
@@ -179,7 +229,7 @@ impl Router {
             None
         };
 
-        let mut response = match self.resolve_fallback(&uri_path, &query_string) {
+        let (mut response, handler) = match self.resolve_fallback(&uri_path, &query_string) {
             Resolved::File(fs_path) => {
                 if is_php_file(&fs_path) {
                     if self.is_php_allowed(&uri_path) {
@@ -192,11 +242,11 @@ impl Router {
                                 if let Some(stored) = self.store.get(&key) {
                                     let stored_etag = String::from_utf8_lossy(&stored);
                                     if etag_matches_value(&stored_etag, client_tag) {
-                                        return Ok(Response::builder()
+                                        return Ok((Response::builder()
                                             .status(StatusCode::NOT_MODIFIED)
                                             .header("etag", stored_etag.as_ref())
                                             .body(Full::new(Bytes::new()))
-                                            .expect("304 builder"));
+                                            .expect("304 builder"), "php"));
                                     }
                                 }
                             }
@@ -220,12 +270,12 @@ impl Router {
                             }
                         }
 
-                        resp
+                        (resp, "php")
                     } else {
-                        error_response(StatusCode::FORBIDDEN, "403 Forbidden")
+                        (error_response(StatusCode::FORBIDDEN, "403 Forbidden"), "error")
                     }
                 } else {
-                    static_files::serve_file(
+                    (static_files::serve_file(
                         &self.document_root,
                         &fs_path,
                         accepts_gzip,
@@ -234,19 +284,19 @@ impl Router {
                         self.etag,
                         if_none_match.as_deref(),
                     )
-                    .await
+                    .await, "static")
                 }
             }
             Resolved::Status(code) => {
                 let status = StatusCode::from_u16(code).unwrap_or(StatusCode::NOT_FOUND);
-                error_response(status, &format!("{code} {}", status.canonical_reason().unwrap_or("Error")))
+                (error_response(status, &format!("{code} {}", status.canonical_reason().unwrap_or("Error"))), "error")
             }
         };
 
         // Apply custom response headers to all responses.
         self.apply_response_headers(&mut response);
 
-        Ok(response)
+        Ok((response, handler))
     }
 
     /// Resolve a request through the `fallback` chain.
@@ -338,10 +388,14 @@ impl Router {
             Ok(collected) => collected.to_bytes().to_vec(),
             Err(_) => Vec::new(),
         };
+        #[allow(clippy::cast_precision_loss)]
+        histogram!("ephpm_http_request_body_bytes", "method" => method.clone())
+            .record(body.len() as f64);
 
         let document_root = self.document_root.clone();
         let server_port = self.server_port;
 
+        let php_start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             PhpRuntime::execute(PhpRequest {
                 method, uri, path, query_string, script_filename,
@@ -350,6 +404,14 @@ impl Router {
             })
         })
         .await;
+        let php_elapsed = php_start.elapsed().as_secs_f64();
+
+        histogram!("ephpm_php_execution_duration_seconds").record(php_elapsed);
+        let exec_status = match &result {
+            Ok(Ok(_)) => "ok",
+            Ok(Err(_)) | Err(_) => "error",
+        };
+        counter!("ephpm_php_executions_total", "status" => exec_status).increment(1);
 
         build_php_response(result, accepts_gzip, self.compression)
     }
@@ -599,12 +661,26 @@ fn build_php_response(
                 .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
                 .map_or("", |(_, v)| v.as_str());
 
+            let original_len = php_response.body.len();
+            #[allow(clippy::cast_precision_loss)]
+            {
+                histogram!("ephpm_http_response_body_bytes", "handler" => "php")
+                    .record(original_len as f64);
+                histogram!("ephpm_php_output_bytes").record(original_len as f64);
+            }
+
             let (body_bytes, compressed) = if accepts_gzip {
                 gzip_compress(&php_response.body, ct, compression)
                     .map_or((php_response.body, false), |c| (c, true))
             } else {
                 (php_response.body, false)
             };
+
+            if compressed && original_len > 0 {
+                #[allow(clippy::cast_precision_loss)]
+                histogram!("ephpm_http_compression_ratio")
+                    .record(body_bytes.len() as f64 / original_len as f64);
+            }
 
             let mut resp = Response::builder().status(status);
             for (name, value) in &php_response.headers {
@@ -735,7 +811,7 @@ mod tests {
             db: Default::default(),
             kv: Default::default(),
         };
-        Router::new(&config, test_store())
+        Router::new(&config, test_store(), None)
     }
 
     fn test_router_with_404(dir: &Path) -> Router {
@@ -751,7 +827,7 @@ mod tests {
             db: Default::default(),
             kv: Default::default(),
         };
-        Router::new(&config, test_store())
+        Router::new(&config, test_store(), None)
     }
 
     #[allow(dead_code)]
@@ -773,7 +849,7 @@ mod tests {
             kv: Default::default(),
         };
         config.server.static_files.etag = true;
-        Router::new(&config, store)
+        Router::new(&config, store, None)
     }
 
     fn default_compression() -> CompressionSettings {
@@ -957,7 +1033,7 @@ mod tests {
             kv: Default::default(),
         };
         config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
-        let router = Router::new(&config, test_store());
+        let router = Router::new(&config, test_store(), None);
 
         // 203.0.113.50 is the real client, 10.0.0.1 is the proxy
         let xff = "203.0.113.50, 10.0.0.1";
@@ -978,7 +1054,7 @@ mod tests {
             kv: Default::default(),
         };
         config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
-        let router = Router::new(&config, test_store());
+        let router = Router::new(&config, test_store(), None);
 
         let xff = "10.0.0.2, 10.0.0.1";
         let ip = router.resolve_xff(xff);
@@ -1000,7 +1076,7 @@ mod tests {
             db: Default::default(),
             kv: Default::default(),
         };
-        let router = Router::new(&config, test_store());
+        let router = Router::new(&config, test_store(), None);
         assert_eq!(router.server_port, 3000);
     }
 
@@ -1017,7 +1093,7 @@ mod tests {
             db: Default::default(),
             kv: Default::default(),
         };
-        let router = Router::new(&config, test_store());
+        let router = Router::new(&config, test_store(), None);
         assert_eq!(router.server_port, 8080);
     }
 
@@ -1059,7 +1135,7 @@ mod tests {
             db: Default::default(),
             kv: Default::default(),
         };
-        let router = Router::new(&config, test_store());
+        let router = Router::new(&config, test_store(), None);
         assert!(router.is_php_allowed("/anything.php"));
     }
 
@@ -1079,7 +1155,7 @@ mod tests {
             "/index.php".to_string(),
             "/wp-login.php".to_string(),
         ];
-        let router = Router::new(&config, test_store());
+        let router = Router::new(&config, test_store(), None);
         assert!(router.is_php_allowed("/index.php"));
         assert!(router.is_php_allowed("/wp-login.php"));
         assert!(!router.is_php_allowed("/evil.php"));
@@ -1101,7 +1177,7 @@ mod tests {
             "/index.php".to_string(),
             "/wp-admin/*.php".to_string(),
         ];
-        let router = Router::new(&config, test_store());
+        let router = Router::new(&config, test_store(), None);
         assert!(router.is_php_allowed("/index.php"));
         assert!(router.is_php_allowed("/wp-admin/admin.php"));
         assert!(router.is_php_allowed("/wp-admin/options.php"));

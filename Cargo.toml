@@ -49,6 +49,8 @@ hmac = "0.12"
 md5 = "0.8"
 base64ct = { version = "1", features = ["alloc"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
 
 # Internal crates
 ephpm-config = { path = "crates/ephpm-config" }

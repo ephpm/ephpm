@@ -28,6 +28,8 @@ tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 rustls-acme.workspace = true
 tokio-stream.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

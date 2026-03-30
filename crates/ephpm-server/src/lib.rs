@@ -1,4 +1,5 @@
 pub mod acme;
+pub mod metrics;
 pub mod router;
 pub mod static_files;
 pub mod tls;
@@ -40,11 +41,18 @@ use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 ///
 /// Returns an error if the listen address is invalid or binding fails.
 pub async fn serve(config: Config) -> anyhow::Result<()> {
+    // Install Prometheus recorder if metrics are enabled.
+    let metrics_handle = if config.server.metrics.enabled {
+        Some(metrics::init().context("failed to initialize metrics")?)
+    } else {
+        None
+    };
+
     // Start background services.
     let (kv_store, _kv_handle) = start_kv_service(&config)?;
     let _db_handles = start_db_proxies(&config).await?;
 
-    let listeners = bind_listeners(&config, kv_store).await?;
+    let listeners = bind_listeners(&config, kv_store, metrics_handle).await?;
     accept_loop(listeners).await
 }
 
@@ -80,7 +88,11 @@ struct ConnSettings {
 }
 
 /// Parse config, build TLS, and bind all listeners.
-async fn bind_listeners(config: &Config, kv_store: Arc<ephpm_kv::store::Store>) -> anyhow::Result<Listeners> {
+async fn bind_listeners(
+    config: &Config,
+    kv_store: Arc<ephpm_kv::store::Store>,
+    metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+) -> anyhow::Result<Listeners> {
     let addr: SocketAddr = config.server.listen.parse().context("invalid listen address")?;
 
     let conn = ConnSettings {
@@ -88,7 +100,7 @@ async fn bind_listeners(config: &Config, kv_store: Arc<ephpm_kv::store::Store>) 
         max_header_size: config.server.request.max_header_size,
     };
     let idle_timeout = Duration::from_secs(config.server.timeouts.idle);
-    let router = Arc::new(Router::new(config, kv_store));
+    let router = Arc::new(Router::new(config, kv_store, metrics_handle));
 
     // Determine TLS mode.
     let tls_mode = match config.server.tls.as_ref() {

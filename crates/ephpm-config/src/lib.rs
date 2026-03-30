@@ -80,6 +80,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub logging: LoggingConfig,
 
+    /// Metrics / observability settings.
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+
     /// TLS configuration. When present, enables HTTPS.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -306,6 +310,37 @@ pub struct LoggingConfig {
     /// Default: `"info"`.
     #[serde(default = "default_log_level")]
     pub level: String,
+}
+
+/// Metrics / observability configuration (`[server.metrics]`).
+#[derive(Debug, Deserialize)]
+pub struct MetricsConfig {
+    /// Enable the `/metrics` Prometheus endpoint.
+    ///
+    /// When `false`, all `metrics` facade calls are zero-cost no-ops.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// URL path for the metrics endpoint.
+    ///
+    /// Default: `"/metrics"`.
+    #[serde(default = "default_metrics_path")]
+    pub path: String,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: default_metrics_path(),
+        }
+    }
+}
+
+fn default_metrics_path() -> String {
+    "/metrics".to_string()
 }
 
 /// TLS configuration (`[server.tls]`).
@@ -771,6 +806,7 @@ impl Default for ServerConfig {
             php_etag_cache: PhpETagCacheConfig::default(),
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
+            metrics: MetricsConfig::default(),
             tls: None,
         }
     }
