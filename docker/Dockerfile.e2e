@@ -20,4 +20,6 @@ WORKDIR /src/crates/ephpm-e2e
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
 # Run all tests
-ENTRYPOINT ["cargo", "test", "--release", "--", "--test-threads=1", "--nocapture"]
+# --no-fail-fast: run all test binaries even if one fails (better visibility).
+# --test-threads=1: serialize within each binary to avoid port/state conflicts.
+ENTRYPOINT ["cargo", "test", "--release", "--no-fail-fast", "--", "--test-threads=1", "--nocapture"]

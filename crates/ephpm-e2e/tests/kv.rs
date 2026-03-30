@@ -201,3 +201,68 @@ async fn kv_pttl_returns_minus_two_for_missing() {
         "ephpm_kv_pttl must return -2 for a key that does not exist"
     );
 }
+
+#[tokio::test]
+async fn kv_empty_string_value() {
+    let base = required_env("EPHPM_URL");
+
+    // Set an empty string value
+    let (s, _) = kv(&base, "op=set&key=empty_val&val=&ttl=0").await;
+    assert_eq!(s, 200);
+
+    let (s, body) = kv(&base, "op=get&key=empty_val").await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        body, "",
+        "get of a key set to empty string must return empty, got: {body:?}"
+    );
+
+    // Verify the key exists (not the same as missing)
+    let (_, body) = kv(&base, "op=exists&key=empty_val").await;
+    assert_eq!(
+        body, "1",
+        "key with empty string value must still exist"
+    );
+}
+
+#[tokio::test]
+async fn kv_large_value() {
+    let base = required_env("EPHPM_URL");
+
+    // ~10KB value
+    let large = "A".repeat(10_000);
+    let encoded = urlencoding::encode(&large);
+    let (s, _) = kv(&base, &format!("op=set&key=large_val&val={encoded}&ttl=0")).await;
+    assert_eq!(s, 200);
+
+    let (s, body) = kv(&base, "op=get&key=large_val").await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        body.len(),
+        10_000,
+        "retrieved value must be 10000 bytes, got {}",
+        body.len()
+    );
+    assert_eq!(
+        body, large,
+        "retrieved large value must match what was stored"
+    );
+}
+
+#[tokio::test]
+async fn kv_overwrite_returns_latest() {
+    let base = required_env("EPHPM_URL");
+
+    let (s, _) = kv(&base, "op=set&key=overwrite_key&val=first&ttl=0").await;
+    assert_eq!(s, 200);
+
+    let (s, _) = kv(&base, "op=set&key=overwrite_key&val=second&ttl=0").await;
+    assert_eq!(s, 200);
+
+    let (s, body) = kv(&base, "op=get&key=overwrite_key").await;
+    assert_eq!(s, 200);
+    assert_eq!(
+        body, "second",
+        "get after overwrite must return the latest value"
+    );
+}

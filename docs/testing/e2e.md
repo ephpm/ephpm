@@ -4,11 +4,11 @@ Current state of end-to-end test coverage and the tests we still need to build.
 
 ---
 
-## Current Coverage (49 tests, 9 files)
+## Current Coverage (72 tests, 14 files)
 
 The `ephpm-e2e` crate lives in `crates/ephpm-e2e/` and runs inside a Kind cluster via Tilt. See [developer/testing.md](../developer/testing.md) for infrastructure details.
 
-### Single-Node Tests (49 tests, 9 files)
+### Single-Node Tests (72 tests, 14 files)
 
 | File | Tests | Coverage |
 |------|------:|----------|
@@ -16,11 +16,15 @@ The `ephpm-e2e` crate lives in `crates/ephpm-e2e/` and runs inside a Kind cluste
 | `http.rs` | 9 | HEAD no body, POST body, content-type static, ETag 304, gzip compression, 413 body too large, cache-control, X-Forwarded-For, fallback to index.php |
 | `php.rs` | 7 | `$_GET`, `$_SERVER` vars, `exit()` output, `http_response_code()`, `$_COOKIE`, `php://input`, custom response header |
 | `phpinfo.rs` | 2 | PHP version matching, health check |
-| `kv.rs` | 10 | set/get, TTL expiry, atomic incr, del/exists, incr_by, expire extends TTL, pttl, setnx, mset/mget, pttl missing key |
+| `kv.rs` | 13 | set/get, TTL expiry, atomic incr, del/exists, incr_by, expire extends TTL, pttl, setnx, mset/mget, pttl missing key, empty values, large values (~10KB), overwrite |
 | `errors.rs` | 3 | Fatal error 500, memory limit 500, syntax error 500 (all verify server recovery) |
 | `security.rs` | 4 | Dotfile 403, PHP source not exposed, blocked_paths 403, path traversal blocked |
 | `concurrency.rs` | 2 | 20 parallel PHP requests, atomic KV increments under load |
 | `metrics.rs` | 9 | Prometheus format, build info, HTTP counters, handler labels, PHP execution metrics, in-flight gauge, body size histograms, metrics self-counting, status codes |
+| `etag_cache.rs` | 6 | PHP ETag 200+header, matching ETag 304, mismatched ETag 200, POST bypass, no If-None-Match 200, independent query strings |
+| `timeouts.rs` | 2 | PHP sleep exceeding timeout returns 504, server recovers after timeout |
+| `http_edge.rs` | 4 | Percent-encoded paths, HEAD Content-Length + empty body, ~4KB query string, multiple query params |
+| `php_extended.rs` | 5 | Empty PHP output 200, JSON content-type, multiple Set-Cookie headers, SERVER_SOFTWARE, PUT/DELETE methods |
 
 ### Cluster Tests
 
@@ -45,6 +49,10 @@ The `ephpm-e2e` crate lives in `crates/ephpm-e2e/` and runs inside a Kind cluste
 | `memory_hog.php` | Allocates 100 MB with 2M limit — OOM fatal |
 | `syntax_error.php` | `$x = ;` — parser error |
 | `kv.php` | KV store router: set/get/del/exists/pttl/incr/incr_by/expire/setnx/mset/mget |
+| `empty.php` | No output — empty response testing |
+| `etag_test.php` | Sets `ETag` header via `header()` — PHP ETag cache testing |
+| `json_response.php` | JSON `Content-Type` + `json_encode()` output |
+| `multi_cookie.php` | Sets 3 `Set-Cookie` headers via `setcookie()` |
 | `sleep.php` | `sleep(N)` via `?seconds=N` — timeout testing |
 | `large_output.php` | ~1 MiB repeating output — body size / compression |
 | `image.png` | 1x1 PNG (69 bytes) — binary content-type |
@@ -97,10 +105,10 @@ No cluster helpers, no poll_until, no optional_env.
 | PHP embedding (ZTS) | Yes | Yes (7+2 tests) | — |
 | Compression (gzip) | Yes | Yes (1 test) | — |
 | ETags / 304 (static) | Yes | Yes (1 test) | — |
-| PHP ETag cache | Yes | **No** | Medium |
+| PHP ETag cache | Yes | Yes (6 tests) | — |
 | Security (paths, dotfiles) | Yes | Yes (4 tests) | — |
 | Sessions | Yes | **No** | Medium |
-| Timeouts | Yes | **No** | Medium — `sleep.php` fixture exists |
+| Timeouts | Yes | Yes (2 tests) | — |
 | PHP error recovery | Yes | Yes (3 tests) | — |
 | Proxy headers | Yes | Yes (1 test) | Low |
 | Graceful shutdown | Yes | **No** | Medium — needs kubectl |
@@ -176,9 +184,9 @@ Build the K8s resources and test cluster membership.
 - [ ] New session created without cookie
 - [ ] Invalid session ID handled gracefully
 
-#### 7. Timeouts
-- [ ] PHP `sleep.php?seconds=30` triggers 504 when server timeout is shorter
-- [ ] Server recovers and accepts new requests after timeout
+#### 7. Timeouts (**done** — `timeouts.rs`)
+- [x] PHP `sleep.php?seconds=30` triggers 504 when server timeout is shorter
+- [x] Server recovers and accepts new requests after timeout
 
 #### 8. Graceful Shutdown (kubectl-gated)
 - [ ] Server accepts requests before SIGTERM
@@ -192,23 +200,23 @@ Build the K8s resources and test cluster membership.
 - [ ] Invalid flag returns error
 - [ ] `ephpm kv --help` prints KV subcommand options
 
-#### 10. HTTP Edge Cases
-- [ ] Percent-encoded path resolves correctly
-- [ ] Multiple query parameters preserved
-- [ ] HEAD on static file returns Content-Length with empty body
+#### 10. HTTP Edge Cases (partially done — `http_edge.rs`)
+- [x] Percent-encoded path resolves correctly
+- [x] Multiple query parameters preserved
+- [x] HEAD on static file returns Content-Length with empty body
 - [ ] POST to static file returns 405
 - [ ] Content-Length matches actual body length
 - [ ] Duplicate headers handled
-- [ ] Very long query string (~4KB) accepted
+- [x] Very long query string (~4KB) accepted
 - [ ] Empty User-Agent accepted
 - [ ] Connection: close honored
 
-#### 11. PHP Extended
-- [ ] Multiple Set-Cookie headers preserved
-- [ ] Empty PHP response returns 200 with empty body
-- [ ] `Content-Type: application/json` on JSON response
-- [ ] `SERVER_SOFTWARE` contains "ephpm"
-- [ ] `REQUEST_METHOD` correct for GET/POST/PUT/DELETE
+#### 11. PHP Extended (partially done — `php_extended.rs`)
+- [x] Multiple Set-Cookie headers preserved
+- [x] Empty PHP response returns 200 with empty body
+- [x] `Content-Type: application/json` on JSON response
+- [x] `SERVER_SOFTWARE` contains "ephpm"
+- [x] `REQUEST_METHOD` correct for GET/POST/PUT/DELETE
 - [ ] Output after `header()` modification delivered correctly
 
 #### 12. Additional Proxy Headers
@@ -230,10 +238,10 @@ Build the K8s resources and test cluster membership.
 - [ ] Structured log output contains method, path, status, duration
 - [ ] Log level filtering works
 
-#### 15. Additional KV Tests
-- [ ] Empty string values
-- [ ] Overwrite existing key
-- [ ] Large values (~10KB)
+#### 15. Additional KV Tests (partially done — added to `kv.rs`)
+- [x] Empty string values
+- [x] Overwrite existing key
+- [x] Large values (~10KB)
 - [ ] Special characters in keys/values
 - [ ] KV operations via CLI (`ephpm kv get/set/del`)
 

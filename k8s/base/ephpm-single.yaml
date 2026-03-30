@@ -21,6 +21,8 @@ spec:
           env:
             - name: EPHPM_SERVER__METRICS__ENABLED
               value: "true"
+            - name: EPHPM_SERVER__PHP_ETAG_CACHE__ENABLED
+              value: "true"
           ports:
             - containerPort: 8080
           readinessProbe:
