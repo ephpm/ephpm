@@ -39,7 +39,17 @@
       "WebFetch(domain:wiki.php.net)",
       "Bash(./target/x86_64-unknown-linux-musl/release/ephpm php:*)",
       "Bash(echo \"exit: $?\")",
-      "Bash(cargo test:*)"
+      "Bash(cargo test:*)",
+      "Bash(dpkg -l)",
+      "Bash(apt list:*)",
+      "Read(//usr/bin/**)",
+      "Bash(php -r \"new PDO\\(''''mysql:host=127.0.0.1''''\\);\")",
+      "Bash(find ~/.cargo/registry/src/ -name mod.rs -path *mysql_async*conn*)",
+      "Bash(find ~/.cargo/registry/src/ -name *.rs -path *mysql_async* -exec grep -l 'fn close' {})",
+      "Bash(2)",
+      "Bash(grep -E \"^test |FAILED|ok$|test result\")",
+      "Bash(cargo run:*)",
+      "Bash(grep -v \"^$\")"
     ]
   }
 }
