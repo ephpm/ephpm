@@ -1,5 +1,5 @@
 # Build artifacts
-/target/
+target/
 
 # PHP SDK (built by cargo xtask via static-php-cli)
 /php-sdk/
