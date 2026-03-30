@@ -10,36 +10,31 @@ An all-in-one PHP application server written in Rust. Embeds PHP via FFI into a 
 | PHP FFI overhead | Zero (native C call) | ~2.2μs/req (11+ CGO crossings) | N/A (worker mode) | N/A (native) | N/A (in-process) | IPC (FastCGI) |
 | GC pauses | None | Go GC | Go GC | PHP GC | PHP GC | PHP GC |
 | Binary | Single static binary | Caddy module | Go binary + PHP workers | PHP + extension | Apache + modules | Nginx + separate FPM |
-| DB proxy | Planned | No | No | Connection pool | No | No |
-| Clustering | Planned | No | No | Built-in | No | No |
+| Embedded DB | SQLite via [litewire](#embedded-sql--litewire) | No | No | No | No | No |
+| Clustering | Gossip (SWIM) | No | No | Built-in | No | No |
 | PHP compatibility | Drop-in (embed SAPI) | Drop-in (worker SAPI) | Requires PSR-7 packages | Requires async code | Native (100%) | Native (100%) |
 | Deployment | Single binary | Requires Caddy | Multi-process | Requires PHP + Swoole extension | Apache + modules | Separate services |
 | Container-friendly | ✓ (single binary) | ✓ (Caddy module) | ✓ | ⚠️ (PHP + extension) | ⚠️ (heavier) | ⚠️ (two services) |
 
 ## Feature Status
 
-The docs describe the full vision. Here's what actually exists today:
-
 | Feature | Status |
 |---------|--------|
-| HTTP/1.1 serving | **Implemented** |
+| HTTP/1.1 + HTTP/2 serving | **Implemented** |
 | Static file serving | **Implemented** |
-| PHP embedding (NTS) | **Implemented** |
+| PHP embedding (ZTS) | **Implemented** |
 | Request routing (pretty permalinks) | **Implemented** |
 | Configuration (TOML + env vars) | **Implemented** |
 | Embedded KV store (strings, TTL, counters) | **Implemented** |
+| KV store value compression (gzip/zstd/brotli) | **Implemented** |
 | KV store CLI debugging (`ephpm kv`) | **Implemented** |
 | SAPI functions (`ephpm_kv_*` in PHP) | **Implemented** |
-| Observability (tracing logs) | Partial |
-| Graceful shutdown | Partial |
-| CLI | Partial |
-| HTTP/2 | Planned |
+| Prometheus metrics endpoint | **Implemented** (Phase 1) |
+| Gossip clustering (SWIM via chitchat) | Partial |
+| Embedded SQL via litewire (single-node) | Partial |
+| Embedded SQL with sqld (clustered HA) | Planned |
 | TLS / ACME | Planned |
-| PHP embedding (ZTS) | Planned |
-| DB proxy (MySQL/Postgres) | Planned |
-| Clustered KV store (hashes, lists, sets, replication) | Planned |
 | Admin UI / API | Planned |
-| External PHP mode | Planned |
 | OpenTelemetry export | Planned |
 
 ## Quick Start
@@ -103,7 +98,7 @@ document_root = "/var/www/html"
 index_files = ["index.php", "index.html"]
 
 [php]
-mode = "embedded"           # or "external" to use your own PHP binary
+mode = "embedded"
 max_execution_time = 30
 memory_limit = "128M"
 
@@ -116,87 +111,93 @@ ini_overrides = [
     ["error_reporting", "E_ALL"],
 ]
 
-# External mode (use any PHP binary — custom extensions, custom builds):
-# [php]
-# mode = "external"
-# binary = "/usr/bin/php"
-# workers = 4
+# Prometheus metrics endpoint
+[server.metrics]
+enabled = true
+# path = "/metrics"   # default
+
+# Embedded SQLite (via litewire)
+[db.sqlite]
+enabled = true
+path = "/var/lib/ephpm/app.db"
 ```
 
-### PHP Configuration
+All config values can be overridden with `EPHPM_` prefixed environment variables (e.g., `EPHPM_SERVER__LISTEN=0.0.0.0:9090`).
 
-ePHPm supports two ways to configure PHP:
+## Embedded SQL & litewire
 
-1. **`ini_file`** — Path to a custom `php.ini` file. When set, PHP loads this file during initialization. Useful for reusing an existing PHP configuration from your system or custom builds. Example: `ini_file = "/etc/php/8.5/php.ini"`
+ePHPm bundles SQLite for zero-dependency deployments. PHP apps keep their existing `pdo_mysql` or `pdo_pgsql` configuration — no code changes needed. The protocol translation is provided by **[litewire](https://github.com/ephpm/litewire)**, a standalone open-source project that translates MySQL, PostgreSQL, and SQL Server wire protocols to SQLite SQL.
 
-2. **`ini_overrides`** — Array of `[key, value]` pairs that override individual directives. Applied *after* `ini_file` (if specified), so these take precedence. Useful for tuning settings without modifying a full ini file.
-
-Example that uses both:
-
-```toml
-[php]
-ini_file = "/etc/php/8.5/php.ini"      # Load base config
-ini_overrides = [
-    ["memory_limit", "256M"],           # Override specific settings
-    ["max_execution_time", "60"],
-]
+```
+PHP (pdo_mysql)   ─┐
+PHP (pdo_pgsql)   ─┤──→ litewire (wire protocol frontends)
+psql / mysql CLI  ─┘          │
+                              ▼
+                       SQL Translator
+                       (MySQL/PG → SQLite)
+                              │
+                              ▼
+                     rusqlite (single-node)
+                     or sqld  (clustered)
+                              │
+                              ▼
+                           app.db
 ```
 
-All config values can be overridden with `EPHPM_` prefixed environment variables (e.g., `EPHPM_SERVER__LISTEN=0.0.0.0:9090`). Array values use the format `EPHPM_PHP__INI_OVERRIDES='[["key","val"],["key2","val2"]]'` (JSON).
+### Single-node
 
-## Roadmap
+On a single node, litewire runs entirely in-process with a `rusqlite` backend — no child processes, just ePHPm and a `.db` file. Configure a WordPress or Laravel site with:
 
-### MVP (current)
+```
+DB_CONNECTION=mysql    # or pgsql — both work
+DB_HOST=127.0.0.1
+DB_PORT=3306           # MySQL wire, or 5432 for PG wire
+DB_DATABASE=app
+```
 
-Single-process PHP application server that can host WordPress out of the box:
-- HTTP/1.1 server with static file serving and PHP routing
-- NTS PHP embedded via custom SAPI (mutex-serialized, `spawn_blocking`)
-- TOML configuration with env var overrides
-- `cargo xtask release` builds PHP SDK via static-php-cli and links the binary
+litewire also exposes an [Hrana](https://github.com/tursodatabase/libsql/blob/main/docs/HRANA_3_SPEC.md) HTTP endpoint (`http://localhost:8080`) — a lightweight drop-in replacement for sqld. Apps using the Turso/libsql SDK or CLI can connect without running a separate database server.
 
-### v0.2 — Production Hardening
+### Clustered HA
 
-- HTTP/2 via hyper's auto-negotiation
-- TLS termination with automatic ACME certificates (rustls)
-- Graceful shutdown with connection draining
-- SIGHUP-based config reload
-- `ephpm doctor` diagnostic command
-- **External PHP mode** — spawn worker processes using any PHP binary (`php.mode = "external"`), for custom builds/extensions without rebuilding ePHPm
+For multi-node HA, ePHPm spawns [sqld](https://github.com/tursodatabase/libsql/tree/main/libsql-server) as a managed child process on each node. The sqld binary is embedded inside the ePHPm binary at build time via `include_bytes!()` — the single-binary model is preserved. litewire's backends switch from rusqlite to the `libsql` HTTP client talking to the local sqld instance.
 
-### v0.3 — Observability
+- **Primary node** — sqld runs in `--primary` mode, owns writes
+- **Replica nodes** — sqld runs in `--replica` mode, streaming WAL frames from the primary
+- **Primary election** — handled by ePHPm's gossip layer (lowest-ordinal live node wins)
 
-- OpenTelemetry tracing and metrics export
-- Request debug mode
-- Structured log output (JSON)
+See [docs/architecture/sql.md](docs/architecture/sql.md) for the full architecture.
 
-### v1 — Performance
+### About litewire
 
-- ZTS PHP with thread-per-request model (replacing mutex serialization)
-- Connection keep-alive tuning
-- Benchmark suite (Criterion)
+litewire solves a general problem — making SQLite accessible via standard database wire protocols — so it's developed as a **standalone open-source project** separate from ePHPm. ePHPm uses it as a library dependency. If you need a MySQL/PG/TDS → SQLite proxy outside of ePHPm, litewire works standalone.
 
-### Future
-
-- DB proxy with connection pooling, query digest, slow query analysis (MySQL + Postgres wire protocol)
-- Clustered KV store with gossip protocol
-- Admin UI and management API
-- Extension suites (curated PHP extension bundles)
-- Multi-node deployment with consistent hashing
+| | litewire |
+|---|---|
+| MySQL wire protocol | ✓ (`opensrv-mysql`) |
+| PostgreSQL wire protocol | ✓ (`pgwire`) |
+| SQL Server (TDS) wire protocol | ✓ |
+| Hrana HTTP (libsql/sqld compatible) | ✓ |
+| Backends | rusqlite, libsql (local or remote sqld) |
+| SQL translation | `sqlparser-rs` (MySQL + PG + MSSQL dialects) |
 
 ## Project Structure
 
 ```
 crates/
 ├── ephpm/           CLI binary — clap args, config loading, server boot
-├── ephpm-server/    HTTP server — hyper + tokio, routing, static files
+├── ephpm-server/    HTTP server — hyper + tokio, routing, static files, metrics
 ├── ephpm-php/       PHP embedding — FFI bindings, SAPI, request/response
-└── ephpm-config/    Configuration — figment, TOML + env var overrides
+├── ephpm-config/    Configuration — figment, TOML + env var overrides
+├── ephpm-kv/        Embedded KV store — DashMap, RESP2 protocol, TTL/expiry, compression
+├── ephpm-db/        DB proxy — MySQL wire protocol, connection pooling
+└── ephpm-cluster/   Clustering — SWIM gossip (chitchat), consistent hash ring, clustered KV
 ```
 
 Key design decisions:
 - **Conditional compilation** — All PHP FFI code is gated behind `#[cfg(php_linked)]`. Stub mode compiles and tests without a PHP SDK.
 - **C wrapper for safety** — PHP uses `setjmp`/`longjmp` for error handling. All Rust→PHP calls go through `ephpm_wrapper.c` with `zend_try`/`zend_catch` guards to prevent stack corruption.
-- **Async I/O, blocking PHP** — tokio handles HTTP connections. PHP execution runs on `spawn_blocking` threads behind a `Mutex` (NTS).
+- **Async I/O, blocking PHP** — tokio handles HTTP connections. PHP execution runs on `spawn_blocking` threads (ZTS).
+- **litewire for SQL** — wire protocol translation is a separate concern; litewire handles it as a library, ePHPm manages the sqld lifecycle and config.
 
 ## Contributing
 
@@ -233,8 +234,6 @@ cargo deny check
 
 ### Build & test tooling (xtask)
 
-The project uses [cargo-xtask](https://github.com/matklad/cargo-xtask) for build automation and E2E testing:
-
 ```bash
 cargo xtask release     # Build PHP SDK + ephpm binary (release mode)
 cargo xtask php-sdk     # Build only the static PHP SDK (~15 min first time)
@@ -261,11 +260,21 @@ E2E commands require Podman or Docker. Run `cargo xtask e2e-install` to download
 
 - [Getting started](docs/developer/getting-started.md) — Prerequisites, building, IDE setup
 - [Testing strategy](docs/developer/testing.md) — Unit tests, Tilt + Kind E2E, database testing
+- [E2E test coverage](docs/testing/e2e.md) — 170+ tests across single-node and cluster
 - [Architecture decisions](docs/architecture/architecture.md) — Language choice, crate design, PHP execution modes
 - [Implementation guide](docs/architecture/implementation.md) — Build system, CI, MVP spec
 - [CLI design](docs/architecture/cli.md) — Command structure, UX principles
 - [Security model](docs/architecture/security.md) — Threat model, FFI safety, trust boundaries
+- [Clustering](docs/architecture/clustering.md) — SWIM gossip, consistent hash ring, two-tier KV
+- [DB proxy](docs/architecture/db-proxy.md) — MySQL wire protocol, connection pooling, query analysis
+- [Kubernetes deployment](docs/architecture/kubernetes.md) — Helm chart, StatefulSet, gossip DNS
+- [Observability](docs/architecture/metrics.md) — Prometheus metrics, histogram buckets, phased rollout
+- [Embedded SQL](docs/architecture/sql.md) — litewire integration, sqld lifecycle, single-node vs HA
 - [Competitive analysis](docs/analysis/) — FrankenPHP, RoadRunner, Swoole comparisons
+
+## Related Projects
+
+- **[litewire](https://github.com/ephpm/litewire)** — MySQL/PG/TDS wire protocol → SQLite translation proxy. Used by ePHPm for embedded SQL, also works standalone.
 
 ## License
 
