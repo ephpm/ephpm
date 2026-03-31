@@ -29,11 +29,11 @@ An all-in-one PHP application server written in Rust. Embeds PHP via FFI into a 
 | KV store value compression (gzip/zstd/brotli) | **Implemented** |
 | KV store CLI debugging (`ephpm kv`) | **Implemented** |
 | SAPI functions (`ephpm_kv_*` in PHP) | **Implemented** |
-| Prometheus metrics endpoint | **Implemented** (Phase 1) |
+| Prometheus metrics + query stats | **Implemented** |
 | Gossip clustering (SWIM via chitchat) | **Implemented** |
 | Embedded SQLite — single-node (litewire + rusqlite) | **Implemented** |
 | Embedded SQLite — clustered HA (litewire + sqld) | **Implemented** |
-| TLS / ACME | Planned |
+| TLS (manual cert/key + ACME/Let's Encrypt) | **Implemented** |
 | Admin UI / API | Planned |
 | OpenTelemetry export | Planned |
 
@@ -180,6 +180,42 @@ PHP (pdo_mysql) → litewire (MySQL wire :3306) → SQL Translator → SQLite ba
 In single-node mode, the backend is `rusqlite` (in-process, zero overhead). In clustered mode, it switches to an HTTP client talking to the local sqld instance. Either way, PHP sees a MySQL server at `127.0.0.1:3306`.
 
 See [docs/architecture/sql.md](docs/architecture/sql.md) for the full architecture, failover details, and configuration reference.
+
+## Query Stats & Observability
+
+Every SQL query — whether it goes through the DB proxy to a real MySQL server or through litewire to SQLite — is tracked automatically. ePHPm normalizes queries (replacing literal values with `?`), groups them by digest, and records timing, throughput, and error rates.
+
+Metrics are emitted via Prometheus at `/metrics`:
+
+```
+# Histogram of query execution times, by digest and kind (query/mutation)
+ephpm_query_duration_seconds_bucket{digest="SELECT * FROM users WHERE id = ?",kind="query",le="0.01"} 4521
+
+# Total query count by status
+ephpm_query_total{digest="SELECT * FROM users WHERE id = ?",kind="query",status="ok"} 4520
+ephpm_query_total{digest="SELECT * FROM users WHERE id = ?",kind="query",status="error"} 1
+
+# Rows returned/affected
+ephpm_query_rows_total{digest="SELECT * FROM users WHERE id = ?",kind="query"} 4520
+
+# Slow query counter (exceeds threshold)
+ephpm_query_slow_total 3
+
+# Active digest count
+ephpm_query_active_digests 47
+```
+
+Slow queries (default: > 1s) are logged at WARN level with the normalized SQL and digest ID. Query stats are on by default but fully configurable:
+
+```toml
+[db.analysis]
+query_stats = true            # set to false to disable (zero overhead)
+slow_query_threshold = "500ms"
+```
+
+Point Grafana, Datadog, or any Prometheus-compatible tool at `http://your-ephpm:8080/metrics` to chart query latency, throughput, error rates, and identify slow queries — no APM agent or database plugin needed.
+
+See [docs/architecture/query-stats.md](docs/architecture/query-stats.md) for the full design.
 
 ## Project Structure
 
