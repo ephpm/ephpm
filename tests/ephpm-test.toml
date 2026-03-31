@@ -20,3 +20,9 @@ ini_overrides = [
     ["display_errors", "On"],
     ["error_reporting", "E_ALL"],
 ]
+
+[db.sqlite]
+path = "/tmp/ephpm-test.db"
+
+[db.sqlite.proxy]
+mysql_listen = "127.0.0.1:3306"

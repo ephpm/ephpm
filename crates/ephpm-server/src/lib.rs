@@ -663,11 +663,20 @@ async fn start_clustered_sqlite(
     cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
-    // Determine the initial sqld role.
-    let sqld_role = match sqlite_config.replication.role.as_str() {
+    #[cfg(target_os = "windows")]
+    {
+        anyhow::bail!(
+            "clustered SQLite (sqld sidecar) is not supported on Windows. \
+             Use single-node mode (remove [db.sqlite.replication] or set role = \"auto\" \
+             without clustering), or run on Linux/macOS/WSL."
+        );
+    }
+
+    // Determine the initial sqld role and optional role-change receiver.
+    let (sqld_role, role_rx) = match sqlite_config.replication.role.as_str() {
         "primary" => {
             tracing::info!("SQLite replication role forced to primary");
-            ephpm_sqld::SqldRole::Primary
+            (ephpm_sqld::SqldRole::Primary, None)
         }
         "replica" => {
             let url = &sqlite_config.replication.primary_grpc_url;
@@ -676,9 +685,12 @@ async fn start_clustered_sqlite(
                 "replication.primary_grpc_url is required when role = \"replica\""
             );
             tracing::info!(primary = %url, "SQLite replication role forced to replica");
-            ephpm_sqld::SqldRole::Replica {
-                primary_grpc_url: url.clone(),
-            }
+            (
+                ephpm_sqld::SqldRole::Replica {
+                    primary_grpc_url: url.clone(),
+                },
+                None,
+            )
         }
         _ => {
             // "auto" — use gossip election
@@ -689,21 +701,12 @@ async fn start_clustered_sqlite(
                 sqlite_config.sqld.grpc_listen.clone(),
             );
             let initial = election.determine_initial_role().await;
-            let role_rx = election.watch_role();
+            let rx = election.watch_role();
 
             // Spawn the election loop.
             tokio::spawn(election.run());
 
-            // Spawn role-change watcher for logging.
-            let mut watch_rx = role_rx;
-            handles.push(tokio::spawn(async move {
-                while watch_rx.changed().await.is_ok() {
-                    let new_role = watch_rx.borrow().clone();
-                    tracing::info!(?new_role, "SQLite election: role changed");
-                }
-            }));
-
-            elected_to_sqld_role(&initial)
+            (elected_to_sqld_role(&initial), Some(rx))
         }
     };
 
@@ -726,6 +729,32 @@ async fn start_clustered_sqlite(
     let sqld_http_url = sqld.http_url();
     tracing::info!(url = %sqld_http_url, "sqld is healthy, starting litewire with Hrana backend");
 
+    // Shared handle so the role-change watcher can restart sqld on failover.
+    let sqld = Arc::new(tokio::sync::Mutex::new(sqld));
+
+    // Spawn role-change watcher that restarts sqld when the election result changes.
+    if let Some(mut watch_rx) = role_rx {
+        let sqld_for_watcher = Arc::clone(&sqld);
+        handles.push(tokio::spawn(async move {
+            while watch_rx.changed().await.is_ok() {
+                let new_elected = watch_rx.borrow().clone();
+                let new_role = elected_to_sqld_role(&new_elected);
+                tracing::info!(?new_role, "SQLite election: role changed, restarting sqld");
+
+                let mut sqld = sqld_for_watcher.lock().await;
+                if let Err(e) = sqld.restart(new_role).await {
+                    tracing::error!("failed to restart sqld after role change: {e:#}");
+                    continue;
+                }
+
+                // Wait for sqld to become healthy after restart.
+                if let Err(e) = sqld.wait_healthy(Duration::from_secs(30)).await {
+                    tracing::error!("sqld not healthy after restart: {e:#}");
+                }
+            }
+        }));
+    }
+
     // Create Hrana client backend pointing at local sqld.
     let backend = litewire::backend::HranaClient::new(&sqld_http_url);
 
@@ -742,9 +771,10 @@ async fn start_clustered_sqlite(
         tracing::info!(listen = %hrana_addr, "SQLite Hrana HTTP API enabled (clustered)");
     }
 
-    // Spawn litewire serve task. sqld process is kept alive via the guard.
+    // Spawn litewire serve task. sqld is kept alive via the Arc.
+    let sqld_guard = Arc::clone(&sqld);
     handles.push(tokio::spawn(async move {
-        let _sqld_guard = sqld;
+        let _sqld_guard = sqld_guard;
         match builder.serve().await {
             Ok(()) => tracing::info!("litewire stopped (clustered)"),
             Err(e) => tracing::error!("litewire error (clustered): {e:#}"),

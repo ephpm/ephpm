@@ -4,6 +4,9 @@ target/
 # PHP SDK (built by cargo xtask via static-php-cli)
 /php-sdk/
 
+# sqld binary cache (downloaded by cargo xtask release)
+/sqld-cache/
+
 # Local tool binaries (downloaded by cargo xtask e2e-install)
 /bin/
 

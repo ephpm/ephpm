@@ -9,6 +9,9 @@ const PHP_EXTENSIONS: &str = "bcmath,calendar,ctype,curl,dom,exif,fileinfo,filte
 /// Pinned version of the standalone spc (static-php-cli) binary.
 const SPC_VERSION: &str = "2.8.3";
 
+/// Pinned version of sqld (libsql-server) for clustered SQLite.
+const SQLD_VERSION: &str = "0.24.32";
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str);
@@ -50,8 +53,8 @@ Cross-compilation:
                       Downloads PHP Windows SDK automatically from windows.php.net.
 
 SQLite clustering:
-  --sqld-binary PATH  Embed a pre-built sqld binary in the release build.
-                      If not provided, the binary is built without sqld (single-node SQLite only)."
+  --sqld-binary PATH  Override: embed a specific sqld binary (default: auto-download v{SQLD_VERSION}).
+  --no-sqld           Skip sqld embedding entirely (single-node SQLite only)."
     );
 }
 
@@ -94,6 +97,10 @@ fn parse_release_php_version(args: &[String]) -> &str {
     while i < args.len() {
         if args[i] == "--target" || args[i] == "--sqld-binary" {
             i += 2; // skip flag and its value
+            continue;
+        }
+        if args[i] == "--no-sqld" {
+            i += 1;
             continue;
         }
         if !args[i].starts_with('-') {
@@ -153,12 +160,24 @@ fn release_linux(args: &[String]) -> ExitCode {
     cmd.args(["build", "--release", "--package", "ephpm", "--target", &target])
         .env("PHP_SDK_PATH", &sdk_path);
 
-    if let Some(sqld_path) = parse_sqld_binary(args) {
-        let sqld_abs = std::path::Path::new(sqld_path)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(sqld_path));
-        eprintln!("==> Embedding sqld binary from {}", sqld_abs.display());
-        cmd.env("SQLD_BINARY_PATH", &sqld_abs);
+    // Embed sqld binary: use --sqld-binary if provided, otherwise auto-download.
+    // Pass --no-sqld to skip embedding entirely.
+    if !args.iter().any(|a| a == "--no-sqld") {
+        let sqld_path = if let Some(manual_path) = parse_sqld_binary(args) {
+            let abs = std::path::Path::new(manual_path)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(manual_path));
+            Some(abs)
+        } else {
+            download_sqld()
+        };
+
+        if let Some(path) = sqld_path {
+            eprintln!("==> Embedding sqld binary from {}", path.display());
+            cmd.env("SQLD_BINARY_PATH", &path);
+        } else {
+            eprintln!("warning: sqld binary not available — clustered SQLite will not work");
+        }
     }
 
     let status = cmd.status();
@@ -178,6 +197,18 @@ fn release_linux(args: &[String]) -> ExitCode {
 /// windows.php.net, then builds with the MSVC target via cargo-xwin.
 /// The resulting binary requires `php8embed.dll` at runtime.
 fn release_windows(args: &[String]) -> ExitCode {
+    // sqld has no Windows binary — error if user tries to embed it.
+    if parse_sqld_binary(args).is_some() {
+        eprintln!("error: sqld is not available for Windows.");
+        eprintln!("       Clustered SQLite requires Linux or macOS.");
+        eprintln!("       Use WSL to build a Linux binary with sqld embedded.");
+        return ExitCode::FAILURE;
+    }
+    if !args.iter().any(|a| a == "--no-sqld") {
+        eprintln!("note: skipping sqld embedding (not available for Windows)");
+        eprintln!("      The Windows build supports single-node SQLite only.");
+    }
+
     let php_version = parse_release_php_version(args);
     let target = "x86_64-pc-windows-msvc";
     let sdk_dir = workspace_root().join("php-sdk").join("windows");
@@ -739,6 +770,87 @@ fn download_and_extract_tarball(url: &str, dest_dir: &PathBuf, binary_name: &str
 
     make_executable(&dest_dir.join(binary_name));
     true
+}
+
+/// Download a `.tar.xz` archive via curl, extract a specific binary.
+fn download_and_extract_tar_xz(url: &str, dest_dir: &Path, binary_name: &str) -> bool {
+    let curl = Command::new("curl")
+        .args(["-fSL", url])
+        .stdout(std::process::Stdio::piped())
+        .spawn();
+
+    let Ok(curl) = curl else {
+        eprintln!("error: failed to run curl");
+        return false;
+    };
+
+    // xz -d | tar x -C <dest_dir> <binary_name>
+    let xz = Command::new("xz")
+        .arg("-d")
+        .stdin(curl.stdout.unwrap())
+        .stdout(std::process::Stdio::piped())
+        .spawn();
+
+    let Ok(xz) = xz else {
+        eprintln!("error: failed to run xz (is xz-utils installed?)");
+        return false;
+    };
+
+    let status = Command::new("tar")
+        .args(["x", "-C"])
+        .arg(dest_dir)
+        .arg(binary_name)
+        .stdin(xz.stdout.unwrap())
+        .status();
+
+    if !ran_ok(&status) {
+        eprintln!("error: failed to extract {binary_name} from archive");
+        return false;
+    }
+
+    make_executable(&dest_dir.join(binary_name));
+    true
+}
+
+/// Download the sqld binary for the current platform.
+///
+/// Downloads from Turso's GitHub releases and caches in `sqld-cache/`.
+/// Returns the path to the sqld binary, or `None` on failure.
+fn download_sqld() -> Option<PathBuf> {
+    let cache_dir = workspace_root().join("sqld-cache");
+    let sqld_path = cache_dir.join("sqld");
+
+    if sqld_path.exists() {
+        eprintln!("==> sqld {SQLD_VERSION} already cached, skipping download");
+        return Some(sqld_path);
+    }
+
+    let target = match (std::env::consts::ARCH, std::env::consts::OS) {
+        ("x86_64", "linux") => "x86_64-unknown-linux-gnu",
+        ("aarch64", "linux") => "aarch64-unknown-linux-gnu",
+        ("x86_64", "macos") => "x86_64-apple-darwin",
+        ("aarch64", "macos") => "aarch64-apple-darwin",
+        (arch, os) => {
+            eprintln!("error: no pre-built sqld binary for {arch}-{os}");
+            return None;
+        }
+    };
+
+    let url = format!(
+        "https://github.com/tursodatabase/libsql/releases/download/\
+         libsql-server-v{SQLD_VERSION}/libsql-server-{target}.tar.xz"
+    );
+
+    eprintln!("==> Downloading sqld {SQLD_VERSION} for {target}...");
+    fs::create_dir_all(&cache_dir).ok();
+
+    if !download_and_extract_tar_xz(&url, &cache_dir, "sqld") {
+        eprintln!("error: failed to download sqld from {url}");
+        return None;
+    }
+
+    eprintln!("==> sqld {SQLD_VERSION} cached at {}", sqld_path.display());
+    Some(sqld_path)
 }
 
 /// chmod +x on unix, no-op on windows.
