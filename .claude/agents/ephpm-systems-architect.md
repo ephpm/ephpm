@@ -68,13 +68,23 @@ You are an elite systems architect with deep expertise spanning Rust, PHP intern
 | Crate | Purpose |
 |-------|---------|
 | `ephpm` | CLI binary — clap args, config loading, graceful shutdown |
-| `ephpm-server` | HTTP server (hyper + tokio + tower) — routing, TLS, static file serving, compression |
-| `ephpm-php` | PHP embedding via FFI — SAPI implementation, request/response mapping; all PHP FFI gated behind `#[cfg(php_linked)]` |
-| `ephpm-config` | figment-based config (TOML + `EPHPM_` env vars with `__` as nesting separator) |
+| `ephpm-server` | HTTP server (hyper + tokio) — routing, TLS/ACME, static files, metrics, litewire/SQLite startup, TrackedBackend for query stats |
+| `ephpm-php` | PHP embedding via FFI — SAPI implementation, ZTS worker thread pool, request/response mapping; all PHP FFI gated behind `#[cfg(php_linked)]` |
+| `ephpm-config` | figment-based config (TOML + `EPHPM_` env vars with `__` as nesting separator). Key structs: `SqliteConfig`, `SqldConfig`, `ReplicationConfig`, `ClusterConfig`, `DbAnalysisConfig` |
 | `ephpm-db` | In-process SQL connection-pooling proxy — MySQL wire protocol, R/W splitting, query digest |
-| `ephpm-kv` | Embedded in-process KV store — DashMap backend, RESP protocol listener, TTL/expiry, PHP SAPI bindings, clustering |
-| `ephpm-e2e` | End-to-end test suite — Kind cluster + Tilt orchestration |
-| `xtask` | Build automation — `release`, `php-sdk`, `e2e`, `e2e-up`, `e2e-down` |
+| `ephpm-kv` | Embedded in-process KV store — DashMap backend, RESP protocol listener, TTL/expiry, compression (gzip/zstd/brotli), PHP SAPI bindings |
+| `ephpm-cluster` | Gossip clustering — SWIM protocol (chitchat), consistent hash ring, two-tier KV replication, SQLite primary election (`sqlite_election.rs`) |
+| `ephpm-sqld` | sqld binary embedding — `include_bytes!()` extraction, child process lifecycle (`SqldProcess`), health checks, failover restart. Gated by `#[cfg(sqld_embedded)]` |
+| `ephpm-query-stats` | Query observability — SQL normalizer (state machine), digest hashing (`DashMap<u64, DigestEntry>`), slow query logging, Prometheus metrics. Configurable on/off via `[db.analysis] query_stats` |
+| `ephpm-e2e` | End-to-end test suite — Kind cluster + Tilt orchestration. **Excluded from workspace** — runs inside Docker |
+| `xtask` | Build automation — `release` (PHP SDK + sqld auto-download), `php-sdk`, `e2e`, `e2e-up`, `e2e-down` |
+
+### External Dependencies
+
+| Dependency | Location | Purpose |
+|-----------|----------|---------|
+| **litewire** | `../litewire/crates/litewire` (path dep) | MySQL/Hrana wire protocol → SQLite translation. Standalone project at github.com/ephpm/litewire |
+| **sqld** | Embedded via `include_bytes!()` (v0.24.32 pinned in xtask) | SQLite replication server for clustered mode. Auto-downloaded from Turso's GitHub releases |
 
 ### Critical Design Decisions (Non-Obvious)
 

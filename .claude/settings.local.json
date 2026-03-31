@@ -56,7 +56,13 @@
       "Bash(find /home/luther/litewire/target -type d -name *pgwire*)",
       "WebFetch(domain:docs.rs)",
       "WebFetch(domain:crates.io)",
-      "Bash(cargo doc:*)"
+      "Bash(cargo doc:*)",
+      "Bash(cargo tree:*)",
+      "Bash(grep -r pgwire /home/luther/ephpm/crates --include=*.rs --include=*.toml)",
+      "Bash(find ~/.cargo/registry/src -type f -path *pgwire*)",
+      "Bash(grep -r pgwire /home/luther/litewire/crates --include=*.rs)",
+      "Bash(ls -d ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p*)",
+      "Bash(cargo fetch:*)"
     ]
   }
 }
