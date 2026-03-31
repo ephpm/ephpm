@@ -177,6 +177,102 @@ Each site has a `site.toml` in its directory specifying which region is primary.
 
 **Cost per site:** With 30 blogs across 3 regions, that's ~$0.49/site/month for global edge deployment.
 
+## Traffic Routing: Getting Users to the Nearest Node
+
+The edge nodes are deployed — now users need to reach the closest one. Three approaches, from simplest to most powerful.
+
+### Tier 1: GeoDNS (recommended to start)
+
+Use a DNS provider with location-aware responses. Your domain resolves to different IPs based on where the user is. No special infrastructure needed.
+
+**How it works:**
+
+1. Customer sets: `alice-blog.com CNAME edge.yoursaas.com`
+2. Your GeoDNS returns the nearest node's IP for `edge.yoursaas.com`
+3. ephpm handles ACME/Let's Encrypt cert issuance on the fly
+4. Request served from the nearest node with local SQLite reads
+
+**Providers:**
+
+| Provider | Cost | Notes |
+|----------|------|-------|
+| AWS Route53 (latency-based) | ~$1.50/mo | Per hosted zone + per-query |
+| Cloudflare (free plan) | $0 | Proxy mode with load balancing ($5/mo for geo steering) |
+| NS1 | ~$8/mo | Advanced traffic management |
+
+**Total cost for 3-region edge:** ~$16.50/mo (VMs + GeoDNS).
+
+**Tradeoff:** DNS TTL means failover takes 30-300 seconds. Not instant, but fine for most sites.
+
+### Tier 2: Managed Anycast (easy, no BGP knowledge)
+
+A provider gives you an anycast IP that routes to the nearest server automatically at the network layer — no DNS tricks.
+
+| Provider | How it works | Cost |
+|----------|-------------|------|
+| **Fly.io** | Every app gets anycast IPv4+IPv6 automatically. Deploy ephpm as a container, Fly routes globally. | ~$15-50/mo for 3 regions |
+| **Vultr Anycast LB** | Managed anycast IP routing to your Vultr VMs. | $10/mo + VM costs |
+| **AWS Global Accelerator** | 2 anycast IPs routing to your ALBs/instances in multiple regions. | ~$18/mo + data transfer |
+
+Fly.io is the simplest — zero networking config, just deploy to regions.
+
+### Tier 3: Own Your Anycast (full control)
+
+Run BGP yourself. The same IP address announced from every edge location. The internet's routing protocol sends users to the nearest node at the network layer — sub-second failover, no DNS involved.
+
+**Requirements:**
+
+| Component | What | Cost |
+|-----------|------|------|
+| ASN | Autonomous System Number (leased via LIR sponsor) | ~$75/yr |
+| IPv4 /24 | 256 IP addresses (minimum BGP will propagate) — lease, don't buy | ~$100-150/mo |
+| BGP sessions | Each VM runs BIRD daemon, peers with host's routers | Free on Vultr |
+| IRR + RPKI | Route objects + cryptographic origin authorization | Free (part of ASN setup) |
+
+**Setup with Vultr (cheapest practical option):**
+
+| Component | Monthly |
+|-----------|---------|
+| ASN lease | ~$6 (amortized) |
+| /24 IPv4 lease | ~$100-150 |
+| 5 Vultr VMs (1 vCPU/1 GB, BGP enabled, 32 locations available) | $30 |
+| **Total** | **~$136-186/mo** |
+
+Vultr offers free BGP sessions on all plans. You configure BIRD (BGP routing daemon) on each VM to announce your /24. All 5 VMs advertise the same IP — users hit the nearest one.
+
+**Who should do this:** Only at scale (hundreds of thousands of sites) or if you need instant failover / DDoS absorption. BGP misconfiguration can leak routes and affect other networks — you need to know what you're doing.
+
+**Providers with BGP support:**
+
+| Provider | Locations | VM cost | Notes |
+|----------|-----------|---------|-------|
+| Vultr | 32 global | $6/mo | Most popular for small anycast |
+| BuyVM | 4 (US + LU) | $3.50/mo | Very cheap, limited locations |
+| Path.net | US + EU | Custom | DDoS-focused, hands-on support |
+| iFog | EU | ~$3/mo | Popular in hobbyist BGP community |
+
+### SaaS: Custom Domain Setup
+
+For a hosting SaaS where customers bring their own domains:
+
+1. Customer adds one DNS record: `alice-blog.com CNAME edge.yoursaas.com` (or A record to your anycast IP)
+2. First request arrives at nearest ephpm node
+3. ePHPm's built-in ACME issues a Let's Encrypt cert automatically
+4. `Host: alice-blog.com` matches the vhost directory
+5. All subsequent requests served over HTTPS from local SQLite
+
+No Cloudflare for SaaS needed. No manual cert provisioning. The customer's only action is adding one DNS record.
+
+### Routing Recommendation
+
+| Stage | Approach | Monthly cost | Complexity |
+|-------|----------|-------------|------------|
+| Starting out | GeoDNS (Route53 / Cloudflare) | ~$1.50 | Minimal |
+| Growing (need simplicity) | Fly.io managed anycast | ~$15-50 | Deploy and forget |
+| Scale (need control) | Own ASN + Vultr BGP | ~$136-186 | Requires BGP expertise |
+
+Start with GeoDNS. It works today with no infrastructure changes. Move to managed or owned anycast when you outgrow it.
+
 ## Comparison to Traditional Edge Approaches
 
 | Approach | Read latency | Write latency | Complexity | Cost |
@@ -188,6 +284,27 @@ Each site has a `site.toml` in its directory specifying which region is primary.
 | Cloudflare D1 | Low (edge reads) | Medium (primary write) | Low | $$ |
 
 ePHPm's edge story is: the simplicity and cost of SQLite, with the read performance of a local database at every edge, and the write consistency of a single-writer model. It's not for every workload — but for read-heavy WordPress/CMS sites, it's hard to beat on cost and simplicity.
+
+## SaaS Cost Model
+
+Running a multi-tenant WordPress hosting SaaS across 3 regions:
+
+| Component | 100 sites | 1,000 sites |
+|-----------|-----------|-------------|
+| 3 edge VMs (Hetzner/Vultr/DO) | $15/mo | $45/mo (larger VMs) |
+| GeoDNS (Route53) | $1.50/mo | $1.50/mo |
+| ACME certs (Let's Encrypt) | Free | Free |
+| **Total** | **$16.50/mo** | **$46.50/mo** |
+| **Per customer** | **$0.165/mo** | **$0.047/mo** |
+
+At scale with owned anycast:
+
+| Component | 10,000 sites |
+|-----------|-------------|
+| 5 Vultr VMs (4 vCPU / 8 GB) | $200/mo |
+| ASN + /24 lease | $150/mo |
+| **Total** | **$350/mo** |
+| **Per customer** | **$0.035/mo** |
 
 ## Limitations
 
