@@ -62,7 +62,8 @@
       "Bash(find ~/.cargo/registry/src -type f -path *pgwire*)",
       "Bash(grep -r pgwire /home/luther/litewire/crates --include=*.rs)",
       "Bash(ls -d ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/p*)",
-      "Bash(cargo fetch:*)"
+      "Bash(cargo fetch:*)",
+      "Bash(cargo download:*)"
     ]
   }
 }
