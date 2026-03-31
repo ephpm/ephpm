@@ -50,7 +50,23 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     // Start background services.
     let (kv_store, _kv_handle) = start_kv_service(&config)?;
-    let _db_handles = start_db_proxies(&config).await?;
+
+    // Start cluster gossip before DB proxies — clustered SQLite needs the handle.
+    let cluster_handle = if config.cluster.enabled {
+        let handle = ephpm_cluster::start_gossip(&config.cluster)
+            .await
+            .context("failed to start cluster gossip")?;
+        tracing::info!(
+            node_id = %handle.self_node().id,
+            cluster_id = %handle.cluster_id(),
+            "cluster gossip started"
+        );
+        Some(Arc::new(handle))
+    } else {
+        None
+    };
+
+    let _db_handles = start_db_proxies(&config, cluster_handle.as_ref()).await?;
 
     let listeners = bind_listeners(&config, kv_store, metrics_handle).await?;
     accept_loop(listeners).await
@@ -530,8 +546,11 @@ fn start_kv_service(
     Ok((store, Some(handle)))
 }
 
-/// Start database proxies (`MySQL`, `PostgreSQL`).
-async fn start_db_proxies(config: &Config) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
+/// Start database proxies (`MySQL`, `PostgreSQL`, embedded `SQLite`).
+async fn start_db_proxies(
+    config: &Config,
+    cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
+) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut handles = vec![];
 
     // MySQL proxy
@@ -587,35 +606,164 @@ async fn start_db_proxies(config: &Config) -> anyhow::Result<Vec<tokio::task::Jo
         tracing::info!("PostgreSQL proxy not yet implemented");
     }
 
-    // Embedded SQLite via litewire (single-node)
+    // Embedded SQLite via litewire
     if let Some(sqlite_config) = &config.db.sqlite {
-        let db_path = &sqlite_config.path;
-        let backend = litewire::backend::Rusqlite::open(db_path)
-            .with_context(|| format!("failed to open SQLite database: {db_path}"))?;
-        tracing::info!(path = %db_path, "opened embedded SQLite database (single-node)");
+        let is_clustered = is_clustered_sqlite(sqlite_config, cluster.is_some());
 
-        let mut builder = litewire::LiteWire::new(backend);
-        builder = builder.mysql(&sqlite_config.proxy.mysql_listen);
-        tracing::info!(
-            listen = %sqlite_config.proxy.mysql_listen,
-            "SQLite MySQL wire protocol enabled"
-        );
-
-        if let Some(ref hrana_addr) = sqlite_config.proxy.hrana_listen {
-            builder = builder.hrana(hrana_addr);
-            tracing::info!(listen = %hrana_addr, "SQLite Hrana HTTP API enabled");
+        if is_clustered {
+            start_clustered_sqlite(sqlite_config, cluster, &mut handles).await?;
+        } else {
+            start_single_node_sqlite(sqlite_config, &mut handles)?;
         }
-
-        let handle = tokio::spawn(async move {
-            match builder.serve().await {
-                Ok(()) => tracing::info!("litewire stopped"),
-                Err(e) => tracing::error!("litewire error: {e:#}"),
-            }
-        });
-        handles.push(handle);
     }
 
     Ok(handles)
+}
+
+/// Check if clustered SQLite mode should be used.
+fn is_clustered_sqlite(sqlite_config: &ephpm_config::SqliteConfig, cluster_enabled: bool) -> bool {
+    let role = sqlite_config.replication.role.as_str();
+    role == "primary" || role == "replica" || (role == "auto" && cluster_enabled)
+}
+
+/// Start single-node SQLite (in-process rusqlite, no sqld).
+fn start_single_node_sqlite(
+    sqlite_config: &ephpm_config::SqliteConfig,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    let db_path = &sqlite_config.path;
+    let backend = litewire::backend::Rusqlite::open(db_path)
+        .with_context(|| format!("failed to open SQLite database: {db_path}"))?;
+    tracing::info!(path = %db_path, "opened embedded SQLite database (single-node)");
+
+    let mut builder = litewire::LiteWire::new(backend);
+    builder = builder.mysql(&sqlite_config.proxy.mysql_listen);
+    tracing::info!(
+        listen = %sqlite_config.proxy.mysql_listen,
+        "SQLite MySQL wire protocol enabled"
+    );
+
+    if let Some(ref hrana_addr) = sqlite_config.proxy.hrana_listen {
+        builder = builder.hrana(hrana_addr);
+        tracing::info!(listen = %hrana_addr, "SQLite Hrana HTTP API enabled");
+    }
+
+    handles.push(tokio::spawn(async move {
+        match builder.serve().await {
+            Ok(()) => tracing::info!("litewire stopped"),
+            Err(e) => tracing::error!("litewire error: {e:#}"),
+        }
+    }));
+    Ok(())
+}
+
+/// Start clustered SQLite (sqld sidecar + litewire with Hrana client backend).
+async fn start_clustered_sqlite(
+    sqlite_config: &ephpm_config::SqliteConfig,
+    cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    // Determine the initial sqld role.
+    let sqld_role = match sqlite_config.replication.role.as_str() {
+        "primary" => {
+            tracing::info!("SQLite replication role forced to primary");
+            ephpm_sqld::SqldRole::Primary
+        }
+        "replica" => {
+            let url = &sqlite_config.replication.primary_grpc_url;
+            anyhow::ensure!(
+                !url.is_empty(),
+                "replication.primary_grpc_url is required when role = \"replica\""
+            );
+            tracing::info!(primary = %url, "SQLite replication role forced to replica");
+            ephpm_sqld::SqldRole::Replica {
+                primary_grpc_url: url.clone(),
+            }
+        }
+        _ => {
+            // "auto" — use gossip election
+            let cluster_handle = cluster
+                .context("cluster must be enabled for auto SQLite replication")?;
+            let election = ephpm_cluster::SqliteElection::new(
+                Arc::clone(cluster_handle),
+                sqlite_config.sqld.grpc_listen.clone(),
+            );
+            let initial = election.determine_initial_role().await;
+            let role_rx = election.watch_role();
+
+            // Spawn the election loop.
+            tokio::spawn(election.run());
+
+            // Spawn role-change watcher for logging.
+            let mut watch_rx = role_rx;
+            handles.push(tokio::spawn(async move {
+                while watch_rx.changed().await.is_ok() {
+                    let new_role = watch_rx.borrow().clone();
+                    tracing::info!(?new_role, "SQLite election: role changed");
+                }
+            }));
+
+            elected_to_sqld_role(&initial)
+        }
+    };
+
+    // Spawn sqld as a child process.
+    let sqld_config = ephpm_sqld::SqldConfig {
+        db_path: sqlite_config.path.clone(),
+        http_listen: sqlite_config.sqld.http_listen.clone(),
+        grpc_listen: sqlite_config.sqld.grpc_listen.clone(),
+    };
+
+    let sqld = ephpm_sqld::SqldProcess::spawn(sqld_config, sqld_role)
+        .await
+        .context("failed to start sqld")?;
+
+    // Wait for sqld to become healthy.
+    sqld.wait_healthy(Duration::from_secs(30))
+        .await
+        .context("sqld did not become healthy")?;
+
+    let sqld_http_url = sqld.http_url();
+    tracing::info!(url = %sqld_http_url, "sqld is healthy, starting litewire with Hrana backend");
+
+    // Create Hrana client backend pointing at local sqld.
+    let backend = litewire::backend::HranaClient::new(&sqld_http_url);
+
+    // Start litewire with the Hrana backend.
+    let mut builder = litewire::LiteWire::new(backend);
+    builder = builder.mysql(&sqlite_config.proxy.mysql_listen);
+    tracing::info!(
+        listen = %sqlite_config.proxy.mysql_listen,
+        "SQLite MySQL wire protocol enabled (clustered)"
+    );
+
+    if let Some(ref hrana_addr) = sqlite_config.proxy.hrana_listen {
+        builder = builder.hrana(hrana_addr);
+        tracing::info!(listen = %hrana_addr, "SQLite Hrana HTTP API enabled (clustered)");
+    }
+
+    // Spawn litewire serve task. sqld process is kept alive via the guard.
+    handles.push(tokio::spawn(async move {
+        let _sqld_guard = sqld;
+        match builder.serve().await {
+            Ok(()) => tracing::info!("litewire stopped (clustered)"),
+            Err(e) => tracing::error!("litewire error (clustered): {e:#}"),
+        }
+    }));
+
+    Ok(())
+}
+
+/// Convert an [`ElectedRole`] to an [`SqldRole`].
+fn elected_to_sqld_role(elected: &ephpm_cluster::ElectedRole) -> ephpm_sqld::SqldRole {
+    match elected {
+        ephpm_cluster::ElectedRole::Primary => ephpm_sqld::SqldRole::Primary,
+        ephpm_cluster::ElectedRole::Replica { primary_grpc_url } => {
+            ephpm_sqld::SqldRole::Replica {
+                primary_grpc_url: primary_grpc_url.clone(),
+            }
+        }
+    }
 }
 
 /// Parse a memory size string (e.g. "256MB", "1GB") to bytes.
@@ -685,5 +833,43 @@ mod lib_tests {
     #[test]
     fn parse_memory_size_zero() {
         assert_eq!(parse_memory_size("0").unwrap(), 0);
+    }
+
+    fn make_sqlite_config(role: &str) -> ephpm_config::SqliteConfig {
+        ephpm_config::SqliteConfig {
+            path: "test.db".into(),
+            proxy: ephpm_config::SqliteProxyConfig::default(),
+            sqld: ephpm_config::SqldConfig::default(),
+            replication: ephpm_config::ReplicationConfig {
+                role: role.into(),
+                primary_grpc_url: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn clustered_sqlite_auto_without_cluster() {
+        let config = make_sqlite_config("auto");
+        assert!(!is_clustered_sqlite(&config, false));
+    }
+
+    #[test]
+    fn clustered_sqlite_auto_with_cluster() {
+        let config = make_sqlite_config("auto");
+        assert!(is_clustered_sqlite(&config, true));
+    }
+
+    #[test]
+    fn clustered_sqlite_explicit_primary() {
+        let config = make_sqlite_config("primary");
+        assert!(is_clustered_sqlite(&config, false));
+        assert!(is_clustered_sqlite(&config, true));
+    }
+
+    #[test]
+    fn clustered_sqlite_explicit_replica() {
+        let config = make_sqlite_config("replica");
+        assert!(is_clustered_sqlite(&config, false));
+        assert!(is_clustered_sqlite(&config, true));
     }
 }

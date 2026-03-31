@@ -1024,10 +1024,12 @@ name = "ephpm-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ephpm-cluster",
  "ephpm-config",
  "ephpm-db",
  "ephpm-kv",
  "ephpm-php",
+ "ephpm-sqld",
  "flate2",
  "http",
  "http-body-util",
