@@ -30,11 +30,6 @@ rustls-acme.workspace = true
 tokio-stream.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
-litewire = { workspace = true, optional = true }
-
-[features]
-default = ["litewire"]
-litewire = ["dep:litewire"]
 
 [dev-dependencies]
 tempfile.workspace = true
