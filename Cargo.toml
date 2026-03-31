@@ -52,6 +52,9 @@ redis = { version = "0.27", default-features = false, features = ["tokio-comp"] 
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
+# External crates
+litewire = { path = "../litewire/crates/litewire", default-features = false, features = ["mysql", "hrana", "backend-rusqlite"] }
+
 # Internal crates
 ephpm-config = { path = "crates/ephpm-config" }
 ephpm-db = { path = "crates/ephpm-db" }

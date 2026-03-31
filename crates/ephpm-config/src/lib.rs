@@ -443,6 +443,10 @@ pub struct DbConfig {
     #[serde(default)]
     pub postgres: Option<DbBackendConfig>,
 
+    /// LiteWire embedded SQLite proxy configuration.
+    #[serde(default)]
+    pub litewire: Option<LiteWireConfig>,
+
     /// Read/write splitting settings (requires replicas on at least one backend).
     #[serde(default)]
     pub read_write_split: ReadWriteSplitConfig,
@@ -548,6 +552,40 @@ pub struct ReplicasConfig {
     /// Replica database URLs. Reads are distributed across these;
     /// writes always go to the primary.
     pub urls: Vec<String>,
+}
+
+/// LiteWire embedded SQLite proxy configuration (`[db.litewire]`).
+///
+/// When present, ePHPm starts an in-process SQLite database with MySQL and/or
+/// Hrana wire protocol frontends. PHP connects to the MySQL frontend and sees
+/// a standard MySQL server — SQL is translated to SQLite on the fly.
+///
+/// Mutually exclusive with `[db.mysql]` on the same listen port.
+#[derive(Debug, Deserialize, Clone)]
+pub struct LiteWireConfig {
+    /// Backend type: `"rusqlite"` (in-process) or `"libsql"` (remote sqld).
+    #[serde(default = "default_litewire_backend")]
+    pub backend: String,
+
+    /// Path to the SQLite database file (when `backend = "rusqlite"`).
+    #[serde(default = "default_litewire_path")]
+    pub path: String,
+
+    /// URL for the remote sqld instance (when `backend = "libsql"`).
+    #[serde(default)]
+    pub sqld_url: Option<String>,
+
+    /// MySQL wire protocol listen address. Omit to disable.
+    #[serde(default = "default_litewire_mysql_listen")]
+    pub mysql_listen: Option<String>,
+
+    /// Hrana HTTP frontend listen address (sqld-compatible). Omit to disable.
+    #[serde(default)]
+    pub hrana_listen: Option<String>,
+
+    /// Inject `DB_HOST`, `DB_PORT`, etc. environment variables for PHP.
+    #[serde(default = "default_inject_env")]
+    pub inject_env: bool,
 }
 
 /// Read/write splitting configuration (`[db.read_write_split]`).
@@ -1012,6 +1050,18 @@ fn default_health_check_interval() -> String {
 
 fn default_inject_env() -> bool {
     true
+}
+
+fn default_litewire_backend() -> String {
+    "rusqlite".to_string()
+}
+
+fn default_litewire_path() -> String {
+    "app.db".to_string()
+}
+
+fn default_litewire_mysql_listen() -> Option<String> {
+    Some("127.0.0.1:3306".to_string())
 }
 
 fn default_reset_strategy() -> String {

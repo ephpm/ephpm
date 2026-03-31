@@ -25,6 +25,10 @@ tracing.workspace = true
 tracing-appender.workspace = true
 tracing-subscriber.workspace = true
 
+[features]
+default = ["litewire"]
+litewire = ["ephpm-server/litewire"]
+
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }
 serde_json = "1"
