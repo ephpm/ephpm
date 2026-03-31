@@ -264,4 +264,57 @@ mod tests {
             "expected 403 or 404, got {status}"
         );
     }
+
+    #[tokio::test]
+    async fn test_serve_javascript_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("app.js"), "console.log('hi')").unwrap();
+        let resp = serve(dir.path(), "/app.js").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers()["content-type"].to_str().unwrap();
+        assert!(
+            ct.contains("javascript"),
+            "expected javascript content-type, got {ct}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serve_png_image() {
+        let dir = tempfile::tempdir().unwrap();
+        // Minimal PNG header.
+        let png = b"\x89PNG\r\n\x1a\n";
+        fs::write(dir.path().join("icon.png"), png).unwrap();
+        let resp = serve(dir.path(), "/icon.png").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "image/png");
+    }
+
+    #[tokio::test]
+    async fn test_serve_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("empty.txt"), "").unwrap();
+        let resp = serve(dir.path(), "/empty.txt").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-length"], "0");
+    }
+
+    #[tokio::test]
+    async fn test_serve_nested_path() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("assets/css")).unwrap();
+        fs::write(dir.path().join("assets/css/main.css"), "body{}").unwrap();
+        let resp = serve(dir.path(), "/assets/css/main.css").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-type"], "text/css");
+    }
+
+    #[tokio::test]
+    async fn test_serve_binary_file_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..=255).collect();
+        fs::write(dir.path().join("binary.bin"), &data).unwrap();
+        let resp = serve(dir.path(), "/binary.bin").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, data);
+    }
 }

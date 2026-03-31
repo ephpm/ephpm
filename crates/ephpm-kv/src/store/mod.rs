@@ -883,8 +883,12 @@ mod tests {
         });
         let data = b"tiny";
         s.set("key".into(), data.to_vec(), None);
-        let entry = s.data.get("key").unwrap();
-        assert!(!entry.compressed);
+        // Drop the guard before calling s.get() to avoid DashMap deadlock.
+        let is_compressed = {
+            let entry = s.data.get("key").unwrap();
+            entry.compressed
+        };
+        assert!(!is_compressed);
         let retrieved = s.get("key");
         assert_eq!(retrieved, Some(data.to_vec()));
     }
@@ -921,5 +925,247 @@ mod tests {
         assert_eq!(s.append("key", b" world"), 11);
         let retrieved = s.get("key");
         assert_eq!(retrieved, Some(b"hello world".to_vec()));
+    }
+
+    // ── eviction policy parsing ─────────────────────────────────────
+
+    #[test]
+    fn eviction_policy_from_str_lossy_all_variants() {
+        assert_eq!(EvictionPolicy::from_str_lossy("noeviction"), EvictionPolicy::NoEviction);
+        assert_eq!(EvictionPolicy::from_str_lossy("allkeys-lru"), EvictionPolicy::AllKeysLru);
+        assert_eq!(EvictionPolicy::from_str_lossy("volatile-lru"), EvictionPolicy::VolatileLru);
+        assert_eq!(EvictionPolicy::from_str_lossy("allkeys-random"), EvictionPolicy::AllKeysRandom);
+        // Unknown falls back to AllKeysLru.
+        assert_eq!(EvictionPolicy::from_str_lossy("bogus"), EvictionPolicy::AllKeysLru);
+        assert_eq!(EvictionPolicy::from_str_lossy(""), EvictionPolicy::AllKeysLru);
+    }
+
+    // ── AllKeysLru eviction ─────────────────────────────────────────
+
+    #[test]
+    fn allkeys_lru_evicts_to_make_room() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 2048,
+            eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig::default(),
+        });
+        // Fill with entries. Each entry ~130 bytes overhead + value.
+        for i in 0..10 {
+            assert!(s.set(format!("k{i}"), vec![0u8; 50], None));
+        }
+        // This large write should trigger eviction of some keys.
+        assert!(s.set("big".into(), vec![0u8; 500], None));
+        assert!(s.get("big").is_some());
+        // Some original keys must have been evicted.
+        let remaining: usize = (0..10).filter(|i| s.exists(&format!("k{i}"))).count();
+        assert!(remaining < 10, "expected some keys evicted, {remaining}/10 remain");
+    }
+
+    #[test]
+    fn allkeys_lru_evicts_oldest_accessed_key() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 900,
+            eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig::default(),
+        });
+        // Insert 3 keys with small sleeps to get different timestamps.
+        s.set("oldest".into(), vec![1u8; 50], None);
+        std::thread::sleep(Duration::from_millis(10));
+        s.set("middle".into(), vec![2u8; 50], None);
+        std::thread::sleep(Duration::from_millis(10));
+        s.set("newest".into(), vec![3u8; 50], None);
+
+        // Touch "oldest" to refresh its LRU timestamp.
+        let _ = s.get("oldest");
+        std::thread::sleep(Duration::from_millis(10));
+
+        // Force eviction with a large write.
+        assert!(s.set("trigger".into(), vec![4u8; 200], None));
+
+        // "middle" should be evicted (least recently accessed).
+        assert!(s.get("middle").is_none(), "middle should be evicted");
+        assert!(s.get("oldest").is_some(), "oldest should survive (was touched)");
+    }
+
+    // ── VolatileLru eviction ────────────────────────────────────────
+
+    #[test]
+    fn volatile_lru_only_evicts_keys_with_ttl() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 4096,
+            eviction_policy: EvictionPolicy::VolatileLru,
+            compression: CompressionConfig::default(),
+        });
+        // Persistent keys.
+        for i in 0..3 {
+            s.set(format!("perm{i}"), vec![0u8; 50], None);
+        }
+        // Volatile keys (with TTL).
+        for i in 0..5 {
+            s.set(format!("vol{i}"), vec![0u8; 50], Some(Duration::from_secs(3600)));
+        }
+        // Large write that forces eviction.
+        assert!(s.set("big".into(), vec![0u8; 2000], None));
+        // All persistent keys should survive.
+        for i in 0..3 {
+            assert!(s.exists(&format!("perm{i}")), "perm{i} should survive");
+        }
+    }
+
+    #[test]
+    fn volatile_lru_fails_when_only_persistent_keys() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 500,
+            eviction_policy: EvictionPolicy::VolatileLru,
+            compression: CompressionConfig::default(),
+        });
+        s.set("perm".into(), vec![0u8; 50], None);
+        // No volatile keys to evict — should fail.
+        assert!(!s.set("toobig".into(), vec![0u8; 500], None));
+    }
+
+    // ── AllKeysRandom eviction ──────────────────────────────────────
+
+    #[test]
+    fn allkeys_random_evicts_to_make_room() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 2048,
+            eviction_policy: EvictionPolicy::AllKeysRandom,
+            compression: CompressionConfig::default(),
+        });
+        for i in 0..10 {
+            assert!(s.set(format!("k{i}"), vec![0u8; 50], None));
+        }
+        assert!(s.set("big".into(), vec![0u8; 500], None));
+        assert!(s.get("big").is_some());
+    }
+
+    // ── NoEviction edge cases ───────────────────────────────────────
+
+    #[test]
+    fn noeviction_rejects_when_at_limit() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 500,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        s.set("a".into(), vec![0u8; 50], None);
+        assert!(!s.set("b".into(), vec![0u8; 500], None));
+        assert!(s.get("a").is_some(), "original key should be intact");
+    }
+
+    // ── Eviction edge cases ─────────────────────────────────────────
+
+    #[test]
+    fn eviction_on_empty_store_fails() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 100,
+            eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig::default(),
+        });
+        // Value exceeds limit with nothing to evict.
+        assert!(!s.set("huge".into(), vec![0u8; 1024], None));
+    }
+
+    #[test]
+    fn unlimited_memory_accepts_any_size() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        assert!(s.set("big".into(), vec![0u8; 1_000_000], None));
+        assert!(s.get("big").is_some());
+    }
+
+    #[test]
+    fn eviction_frees_multiple_keys_for_large_write() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 2048,
+            eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig::default(),
+        });
+        for i in 0..12 {
+            assert!(s.set(format!("s{i}"), vec![0u8; 30], None));
+        }
+        assert!(s.set("large".into(), vec![0u8; 1000], None));
+        assert!(s.get("large").is_some());
+        let remaining: usize = (0..12).filter(|i| s.exists(&format!("s{i}"))).count();
+        assert!(remaining < 12, "multiple keys should have been evicted");
+    }
+
+    // ── Memory tracking ─────────────────────────────────────────────
+
+    #[test]
+    fn mem_used_tracks_insertions_and_removals() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        assert_eq!(s.mem_used(), 0);
+        s.set("key1".into(), vec![0u8; 100], None);
+        assert!(s.mem_used() > 100, "should account for overhead");
+        s.remove("key1");
+        assert_eq!(s.mem_used(), 0);
+    }
+
+    #[test]
+    fn mem_used_adjusts_on_overwrite() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        s.set("key".into(), vec![0u8; 50], None);
+        let mem1 = s.mem_used();
+        s.set("key".into(), vec![0u8; 200], None);
+        let mem2 = s.mem_used();
+        assert!(mem2 > mem1, "memory should increase with larger value");
+        s.set("key".into(), vec![0u8; 10], None);
+        let mem3 = s.mem_used();
+        assert!(mem3 < mem2, "memory should decrease with smaller value");
+    }
+
+    #[test]
+    fn flush_resets_mem_used() {
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        for i in 0..10 {
+            s.set(format!("k{i}"), vec![0u8; 100], None);
+        }
+        assert!(s.mem_used() > 0);
+        s.flush();
+        assert_eq!(s.mem_used(), 0);
+    }
+
+    // ── Glob matching ───────────────────────────────────────────────
+
+    #[test]
+    fn glob_match_question_mark() {
+        assert!(glob_match("h?llo", "hello"));
+        assert!(glob_match("h?llo", "hallo"));
+        assert!(!glob_match("h?llo", "hllo"));
+        assert!(!glob_match("h?llo", "heello"));
+    }
+
+    #[test]
+    fn glob_match_combined_wildcards() {
+        assert!(glob_match("h*o", "hello"));
+        assert!(glob_match("h*o", "ho"));
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("a*b*c", "abc"));
+        assert!(glob_match("a*b*c", "aXXbYYc"));
+        assert!(!glob_match("a*b*c", "aXXbYY"));
+    }
+
+    #[test]
+    fn glob_match_empty_pattern() {
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "nonempty"));
     }
 }

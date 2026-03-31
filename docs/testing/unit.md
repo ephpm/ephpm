@@ -10,11 +10,11 @@ Current state of test coverage and gaps to fill.
 |-------|:-----------:|:--------------------:|:---------:|:-----:|
 | ephpm-config | 19 | 0 | 19 | 19 |
 | ephpm-php | 40 (18 + 22 php_linked) | 0 | 18 | 40 |
-| ephpm-server | 42 | 0 | 42 | 42 |
-| ephpm-kv | 109 | 49 (48 + 1 doctest) | 158 | 158 |
+| ephpm-server | 84 (79 + 5 php_linked) | 0 | 84 | 84 |
+| ephpm-kv | 125 | 49 (48 + 1 doctest) | 174 | 174 |
 | ephpm-db | 5 | 0 | 5 | 5 |
 | ephpm | 0 | 3 (php_linked) | 0 | 3 |
-| **Total** | **215** | **52** | **242** | **267** |
+| **Total** | **273** | **52** | **300** | **325** |
 
 *"Stub-mode" = tests that run without PHP linked (the default `cargo test` experience).*
 
@@ -107,24 +107,28 @@ Current state of test coverage and gaps to fill.
 
 ---
 
-## ephpm-server (42 tests)
+## ephpm-server (84 tests: 62 router + 11 static + 7 tls + 8 lib, minus 5 php_linked = 79 stub-mode)
 
-### router.rs (36 tests)
+### router.rs (62 tests, 57 stub-mode + 5 php_linked)
 
-| Group | Count | Tests |
-|-------|:-----:|-------|
-| Fallback resolution | 7 | `test_existing_file_matches_uri`, `test_existing_php_file_matches_uri`, `test_directory_with_index_matches_uri_slash`, `test_directory_falls_to_index_html`, `test_permalink_falls_to_index_php`, `test_missing_file_with_404_fallback`, `test_missing_php_with_404_fallback`, `test_missing_with_no_index_falls_to_fallback`, `test_subdirectory_with_index` |
-| Helpers | 3 | `test_expand_variables`, `test_split_path_query`, `test_is_php_file_check` |
-| Security | 1 | `test_has_hidden_segment` |
-| Compression | 4 | `test_gzip_compress_small_body`, `test_gzip_compress_non_compressible`, `test_gzip_compress_html`, `test_gzip_compress_custom_min_size` |
-| Trusted proxies | 2 | `test_resolve_xff_rightmost_untrusted`, `test_resolve_xff_all_trusted_uses_leftmost` |
-| Port parsing | 2 | `test_new_parses_port`, `test_new_defaults_port_when_invalid` |
-| Blocked paths | 3 | `test_blocked_exact_path`, `test_blocked_wildcard_directory`, `test_blocked_extension_wildcard` |
-| PHP path allow | 3 | `test_php_allowed_empty_allows_all`, `test_php_allowed_exact_match`, `test_php_allowed_wildcard_directory` |
-| Glob matching | 3 | `test_glob_match_exact`, `test_glob_match_star_segment`, `test_glob_match_star_catches_directory` |
-| ETag caching | 6 | `test_php_etag_cache_key_without_query`, `test_php_etag_cache_key_with_query`, `test_etag_matches_value_exact`, `test_etag_matches_value_wildcard`, `test_etag_matches_value_comma_separated`, `test_etag_matches_value_with_whitespace` |
+| Group | Count | Coverage |
+|-------|:-----:|----------|
+| Fallback resolution | 9 | Static file, PHP file, directory index (php+html), permalink fallback, 404 fallback, missing php, no-index fallback, subdirectory index |
+| Helpers | 3 | Variable expansion, path/query splitting, PHP file detection |
+| Security: hidden files | 3 | Dotfile detection (.env, .git, .htaccess), dot-only not hidden, deep nesting |
+| Security: blocked paths | 5 | Exact path, wildcard directory, extension wildcard, empty list, multiple patterns |
+| Security: PHP allow | 3 | Empty=all allowed, exact match, wildcard directory |
+| Compression | 7 | Small body skip, non-compressible type, HTML, custom min_size, JSON, SVG, binary not compressed |
+| `is_compressible()` | 3 | Text types, application types (JS/JSON/XML/SVG), binary rejection |
+| `segment_match()` | 5 | Exact, star-any, prefix-star, suffix-star, prefix-star-suffix |
+| `is_php_file()` | 2 | Case insensitive, non-PHP extensions |
+| Trusted proxies / XFF | 2 | Rightmost untrusted IP, all-trusted leftmost fallback |
+| Port parsing | 3 | Listen address, default on invalid, IPv6 listen |
+| Glob matching | 5 | Exact, single segment, directory catch, directory prefix, no-wildcard exact |
+| ETag caching | 8 | Cache key (with/without query), exact/wildcard/comma/whitespace match, empty match, strong ETag |
+| PHP-linked ETag | 5 | Store on first req, 304 on match, no-cache bypass, POST skip, content change (php_linked) |
 
-### static_files.rs (6 tests)
+### static_files.rs (11 tests)
 
 | Test | What it covers |
 |------|----------------|
@@ -134,10 +138,40 @@ Current state of test coverage and gaps to fill.
 | `test_serve_unknown_extension` | Falls back to `application/octet-stream` |
 | `test_serve_missing_file_returns_404` | 404 for missing |
 | `test_serve_path_traversal_blocked` | `../` blocked |
+| `test_serve_javascript_file` | JavaScript content-type |
+| `test_serve_png_image` | PNG image content-type |
+| `test_serve_empty_file` | Empty file returns Content-Length: 0 |
+| `test_serve_nested_path` | Nested directory paths |
+| `test_serve_binary_file_intact` | Binary data integrity (all 256 bytes) |
+
+### tls.rs (7 tests)
+
+| Test | What it covers |
+|------|----------------|
+| `load_valid_rsa_cert_and_key` | Load RSA cert + key |
+| `load_valid_ec_cert_and_key` | Load EC cert + key |
+| `missing_cert_file_returns_error` | Missing cert file error |
+| `missing_key_file_returns_error` | Missing key file error |
+| `invalid_cert_pem_returns_error` | Malformed cert error |
+| `invalid_key_pem_returns_error` | Malformed key error |
+| `mismatched_cert_key_returns_error` | Cert/key mismatch error |
+
+### lib.rs (8 tests)
+
+| Test | What it covers |
+|------|----------------|
+| `parse_memory_size_megabytes` | "256MB" -> 268435456 |
+| `parse_memory_size_gigabytes` | "1GB" -> 1073741824 |
+| `parse_memory_size_kilobytes` | "512KB" -> 524288 |
+| `parse_memory_size_bytes_no_suffix` | "1024" -> 1024 |
+| `parse_memory_size_lowercase` | "256mb" -> 268435456 |
+| `parse_memory_size_with_whitespace` | " 256MB " trimming |
+| `parse_memory_size_invalid` | "notanumber" returns error |
+| `parse_memory_size_zero` | "0" -> 0 |
 
 ---
 
-## ephpm-kv (158 tests: 109 unit + 48 integration + 1 doctest)
+## ephpm-kv (174 tests: 125 unit + 48 integration + 1 doctest)
 
 ### command.rs (67 unit tests)
 
@@ -156,33 +190,26 @@ Current state of test coverage and gaps to fill.
 | Error handling | 7 | Unknown command, missing args (GET/SET/DEL/MGET/MSET), invalid expire time, case insensitivity |
 | Additional | 6 | Edge cases: missing args for individual commands |
 
-### store/mod.rs (23 unit tests)
+### store/mod.rs (39 unit tests)
 
-| Test | What it covers |
-|------|----------------|
-| `set_and_get` | Basic set/get |
-| `missing_key` | Get returns None for missing |
-| `overwrite` | Set overwrites existing |
-| `delete` | Remove key |
-| `exists` | Key existence check |
-| `ttl_expiry` | Key expires after TTL |
-| `pttl_no_expiry` | PTTL=-1 for no-expiry key |
-| `pttl_missing` | PTTL=-2 for missing key |
-| `incr` | Integer increment |
-| `incr_non_integer` | Increment on non-integer fails |
-| `append_new_key` | Append creates new key |
-| `append_existing` | Append concatenates |
-| `flush` | Clear all keys |
-| `keys_pattern` | KEYS with glob pattern |
-| `glob_matching` | Glob `*` and `?` matching |
-| `expire_pass_reaps` | Background reaper removes expired |
-| `noeviction_rejects_writes` | NoEviction policy rejects over-limit |
-| `compression_gzip_round_trip` | Gzip compress/decompress |
-| `compression_brotli_round_trip` | Brotli compress/decompress |
-| `compression_zstd_round_trip` | Zstd compress/decompress |
-| `compression_below_min_size_not_compressed` | Below threshold = no compression (**DEADLOCKS** - known bug) |
-| `compression_incr_by_works` | INCR works on compressed values |
-| `compression_append_works` | APPEND works on compressed values |
+| Group | Count | Coverage |
+|-------|:-----:|----------|
+| Basic operations | 6 | set/get, missing key, overwrite, delete, exists, ttl_expiry |
+| TTL / PTTL | 2 | PTTL no-expiry (-1), PTTL missing (None) |
+| Increment | 2 | Counter increment, non-integer error |
+| Append | 2 | Create key, concatenate existing |
+| Flush | 1 | Clear all keys + mem_used resets |
+| Pattern matching | 2 | KEYS with pattern, glob matching |
+| Expiry pass (GC) | 1 | Cleanup removes expired entries |
+| Compression | 6 | Gzip/Brotli/Zstd round-trip, below-min-size, INCR+APPEND on compressed |
+| Eviction: policy parsing | 1 | All 4 variants + unknown fallback to AllKeysLru |
+| Eviction: AllKeysLru | 3 | Evicts to make room, evicts oldest-accessed key, frees multiple keys |
+| Eviction: VolatileLru | 2 | Only evicts TTL keys, fails with only persistent keys |
+| Eviction: AllKeysRandom | 1 | Random eviction makes room |
+| Eviction: NoEviction | 2 | Rejects writes when full, rejects at limit |
+| Eviction: edge cases | 2 | Empty store fails, unlimited memory accepts any |
+| Memory tracking | 3 | Insert/remove tracking, overwrite tracking, flush resets |
+| Glob matching | 3 | `?` wildcard, combined `*`/`?`, empty pattern |
 
 ### resp/frame.rs (7 unit tests)
 
@@ -228,27 +255,30 @@ Full RESP protocol over TCP: PING, SET/GET (incl. binary, NX, XX, EX, PX, GET op
 | PHP: Stub mode init/execute/shutdown | 6 | Good |
 | PHP: KV bridge (C FFI) | 22 | Good (php_linked) |
 | Server: Routing fallback resolution | 9 | Good |
-| Server: Security (hidden files, blocked paths, PHP allow) | 7 | Good |
-| Server: Compression (gzip) | 4 | Good |
+| Server: Security (hidden files, blocked paths, PHP allow) | 11 | Good |
+| Server: Compression (gzip + is_compressible) | 10 | Good |
 | Server: Trusted proxy / XFF | 2 | Good |
-| Server: Port parsing | 2 | Good |
-| Server: Glob matching | 3 | Good |
-| Server: ETag caching | 6 | Good |
-| Server: Static file serving | 6 | Good |
+| Server: Port parsing | 3 | Good |
+| Server: Glob matching | 5 | Good |
+| Server: ETag caching | 10 | Good |
+| Server: segment_match() | 5 | Good |
+| Server: is_php_file() | 2 | Good |
+| Server: Static file serving | 11 | Good |
+| Server: TLS cert loading | 7 | Good |
+| Server: Memory size parsing | 8 | Good |
 | KV: Redis commands | 67 | Good |
 | KV: In-memory store + compression | 23 | Good |
+| KV: Eviction policies | 11 | Good |
+| KV: Memory tracking | 3 | Good |
+| KV: Glob matching | 3 | Good |
 | KV: RESP serialize/parse | 19 | Good |
 | KV: RESP integration (TCP) | 48 | Good |
 | DB: URL/duration parsing | 5 | Good |
-| **Server: TLS cert loading** | **0** | **Gap** |
-| **Server: Memory size parsing** | **0** | **Gap** |
 | **Server: ACME provisioning** | **0** | **Gap** |
-| **KV: Eviction policies (LRU, random, volatile)** | **0** | **Gap** |
-| **KV: Memory tracking** | **0** | **Gap** |
-| **Cluster: Config parsing** | **0** | **Gap** |
+| **Cluster: Config parsing** | **0** | **Gap (struct not yet added)** |
 | **Cluster: Gossip protocol** | **0** | **Gap (crate not yet created)** |
 | **Cluster: Clustered store routing** | **0** | **Gap (crate not yet created)** |
-| **CLI: Argument parsing** | **0** | **Gap** |
+| **CLI: Argument parsing** | **0** | **Gap (needs openssl-sys)** |
 | **PHP: Worker pool** | **0** | **Gap (php_linked only)** |
 | **PHP: SAPI callbacks** | **0** | **Gap** |
 | **Server: Graceful shutdown** | **0** | **Gap** |
@@ -260,47 +290,45 @@ Full RESP protocol over TCP: PING, SET/GET (incl. binary, NX, XX, EX, PX, GET op
 
 ### High Priority — Testable Now
 
-#### 1. TLS Certificate Loading (`ephpm-server/src/tls.rs`)
+#### 1. TLS Certificate Loading (`ephpm-server/src/tls.rs`) -- DONE
 
-- [ ] Load valid PEM certificate (RSA)
-- [ ] Load valid PEM certificate (EC)
-- [ ] Reject invalid/malformed certificate
-- [ ] Reject invalid/malformed key
-- [ ] Reject mismatched cert/key pair
-- [ ] Missing cert file returns clear error
-- [ ] Missing key file returns clear error
+- [x] Load valid PEM certificate (RSA)
+- [x] Load valid PEM certificate (EC)
+- [x] Reject invalid/malformed certificate
+- [x] Reject invalid/malformed key
+- [x] Reject mismatched cert/key pair
+- [x] Missing cert file returns clear error
+- [x] Missing key file returns clear error
 
-*Requires openssl CLI for cert generation in tests.*
+#### 2. Memory Size Parsing (`ephpm-server/src/lib.rs`) -- DONE
 
-#### 2. Memory Size Parsing (`ephpm-server/src/lib.rs`)
+- [x] Parse "256MB" -> bytes
+- [x] Parse "1GB" -> bytes
+- [x] Parse "512KB" -> bytes
+- [x] Parse raw bytes (no suffix)
+- [x] Lowercase suffix ("256mb")
+- [x] Whitespace trimming (" 256MB ")
+- [x] Invalid input returns error
+- [x] Zero returns 0
 
-- [ ] Parse "256MB" -> bytes
-- [ ] Parse "1GB" -> bytes
-- [ ] Parse "512KB" -> bytes
-- [ ] Parse raw bytes (no suffix)
-- [ ] Lowercase suffix ("256mb")
-- [ ] Whitespace trimming (" 256MB ")
-- [ ] Invalid input returns error
-- [ ] Zero returns 0
+#### 3. KV Eviction Policies (`ephpm-kv/src/store/mod.rs`) -- DONE
 
-#### 3. KV Eviction Policies (`ephpm-kv/src/store/mod.rs`)
+- [x] `EvictionPolicy` from-string parsing (all 4 variants + unknown fallback)
+- [x] `AllKeysLru`: evicts to make room for new write
+- [x] `AllKeysLru`: evicts least-recently-accessed key (not just oldest)
+- [x] `VolatileLru`: only evicts keys with TTL set
+- [x] `VolatileLru`: fails when only persistent keys exist
+- [x] `AllKeysRandom`: random eviction succeeds
+- [x] `NoEviction`: rejects writes when at memory limit
+- [x] Eviction frees enough space for large writes (multiple keys)
+- [x] Eviction on empty store fails (nothing to evict)
+- [x] Unlimited memory (limit=0) accepts any size
 
-- [ ] `EvictionPolicy` from-string parsing (all 4 variants + unknown fallback)
-- [ ] `AllKeysLru`: evicts to make room for new write
-- [ ] `AllKeysLru`: evicts least-recently-accessed key (not just oldest)
-- [ ] `VolatileLru`: only evicts keys with TTL set
-- [ ] `VolatileLru`: fails when only persistent keys exist
-- [ ] `AllKeysRandom`: random eviction succeeds
-- [ ] `NoEviction`: rejects writes when at memory limit
-- [ ] Eviction frees enough space for large writes (multiple keys)
-- [ ] Eviction on empty store fails (nothing to evict)
-- [ ] Unlimited memory (limit=0) accepts any size
+#### 4. KV Memory Tracking (`ephpm-kv/src/store/mod.rs`) -- DONE
 
-#### 4. KV Memory Tracking (`ephpm-kv/src/store/mod.rs`)
-
-- [ ] `mem_used` increases on insert
-- [ ] `mem_used` decreases on remove
-- [ ] `mem_used` adjusts on overwrite (larger and smaller values)
+- [x] `mem_used` increases on insert, decreases on remove
+- [x] `mem_used` adjusts on overwrite (larger and smaller values)
+- [x] `flush()` resets `mem_used` to 0
 
 #### 5. CLI Argument Parsing (`ephpm/src/main.rs`)
 
@@ -330,27 +358,27 @@ Full RESP protocol over TCP: PING, SET/GET (incl. binary, NX, XX, EX, PX, GET op
 
 *Depends on `ClusterConfig` struct being added to the config crate.*
 
-#### 7. Router Edge Cases (`ephpm-server/src/router.rs`)
+#### 7. Router Edge Cases (`ephpm-server/src/router.rs`) -- DONE
 
-- [ ] `is_compressible()`: text types compressible, binary types not
-- [ ] `segment_match()`: exact, prefix-star, suffix-star, prefix-star-suffix
-- [ ] `has_hidden_segment()`: dot-only not hidden, deep nesting
-- [ ] `is_php_file()`: case insensitive, non-PHP returns false
-- [ ] `gzip_compress()`: JSON, SVG, disabled for binary
-- [ ] `etag_matches_value()`: empty If-None-Match, strong ETag
-- [ ] Blocked paths: empty list blocks nothing, multiple patterns
-- [ ] IPv6 listen address parsing
-- [ ] `glob_match()`: directory prefix, no-wildcard exact
+- [x] `is_compressible()`: text types compressible, binary types not
+- [x] `segment_match()`: exact, prefix-star, suffix-star, prefix-star-suffix
+- [x] `has_hidden_segment()`: dot-only not hidden, deep nesting
+- [x] `is_php_file()`: case insensitive, non-PHP returns false
+- [x] `gzip_compress()`: JSON, SVG, disabled for binary
+- [x] `etag_matches_value()`: empty If-None-Match, strong ETag
+- [x] Blocked paths: empty list blocks nothing, multiple patterns
+- [x] IPv6 listen address parsing
+- [x] `glob_match()`: directory prefix, no-wildcard exact
 
-#### 8. Static File Edge Cases (`ephpm-server/src/static_files.rs`)
+#### 8. Static File Edge Cases (`ephpm-server/src/static_files.rs`) -- DONE
 
-- [ ] JavaScript file content-type
-- [ ] PNG image content-type
-- [ ] Empty file (Content-Length: 0)
-- [ ] Nested directory paths
-- [ ] Binary file data integrity
+- [x] JavaScript file content-type
+- [x] PNG image content-type
+- [x] Empty file (Content-Length: 0)
+- [x] Nested directory paths
+- [x] Binary file data integrity
 
-### Medium Priority — Requires Infrastructure
+### Medium Priority -- Requires Infrastructure
 
 #### 9. ACME Certificate Provisioning (`ephpm-server/src/acme.rs`)
 
@@ -379,7 +407,7 @@ Full RESP protocol over TCP: PING, SET/GET (incl. binary, NX, XX, EX, PX, GET op
 
 *Requires spawning real server.*
 
-### Lower Priority — Requires php_linked
+### Lower Priority -- Requires php_linked
 
 #### 12. PHP Worker Pool (`ephpm-php/src/lib.rs`)
 
@@ -404,10 +432,8 @@ Full RESP protocol over TCP: PING, SET/GET (incl. binary, NX, XX, EX, PX, GET op
 - [ ] Concurrent requests get isolated state
 - [ ] Binary response body passed through intact
 
-### Known Bugs
+### Resolved Bugs
 
-#### KV Store DashMap Deadlock
+#### KV Store DashMap Deadlock -- FIXED
 
-`compression_below_min_size_not_compressed` test deadlocks: it holds a DashMap read guard via `s.data.get()` then calls `s.get()` which tries `get_mut()` on the same key. The test hangs and must be skipped (`--skip compression_below_min_size`).
-
-Fix: drop the read guard before calling `s.get()`.
+`compression_below_min_size_not_compressed` previously deadlocked because it held a DashMap read guard via `s.data.get()` then called `s.get()` which tries `get_mut()` on the same key. Fixed by dropping the guard before calling `s.get()`.

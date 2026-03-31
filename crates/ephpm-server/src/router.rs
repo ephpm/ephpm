@@ -1246,6 +1246,188 @@ mod tests {
         assert!(etag_matches_value("W/\"v1\"", "W/\"v1\" , W/\"v2\" "));
     }
 
+    // ── is_compressible ─────────────────────────────────────────────
+
+    #[test]
+    fn is_compressible_text_types() {
+        assert!(is_compressible("text/html"));
+        assert!(is_compressible("text/css"));
+        assert!(is_compressible("text/plain"));
+        assert!(is_compressible("text/xml"));
+    }
+
+    #[test]
+    fn is_compressible_application_types() {
+        assert!(is_compressible("application/javascript"));
+        assert!(is_compressible("application/json"));
+        assert!(is_compressible("application/xml"));
+        assert!(is_compressible("image/svg+xml"));
+    }
+
+    #[test]
+    fn is_not_compressible_binary() {
+        assert!(!is_compressible("image/png"));
+        assert!(!is_compressible("image/jpeg"));
+        assert!(!is_compressible("application/octet-stream"));
+        assert!(!is_compressible("video/mp4"));
+    }
+
+    // ── segment_match edge cases ────────────────────────────────────
+
+    #[test]
+    fn segment_match_exact() {
+        assert!(segment_match("index.php", "index.php"));
+        assert!(!segment_match("index.php", "other.php"));
+    }
+
+    #[test]
+    fn segment_match_star_matches_any() {
+        assert!(segment_match("*", "anything"));
+        assert!(segment_match("*", "index.php"));
+    }
+
+    #[test]
+    fn segment_match_prefix_star() {
+        assert!(segment_match("*.php", "index.php"));
+        assert!(segment_match("*.php", "admin.php"));
+        assert!(!segment_match("*.php", "index.html"));
+    }
+
+    #[test]
+    fn segment_match_suffix_star() {
+        assert!(segment_match("index*", "index.php"));
+        assert!(segment_match("index*", "index.html"));
+        assert!(!segment_match("index*", "other.php"));
+    }
+
+    #[test]
+    fn segment_match_prefix_star_suffix() {
+        assert!(segment_match("wp-*.php", "wp-admin.php"));
+        assert!(segment_match("wp-*.php", "wp-login.php"));
+        assert!(!segment_match("wp-*.php", "index.php"));
+        assert!(!segment_match("wp-*.php", "wp-admin.html"));
+    }
+
+    // ── has_hidden_segment edge cases ───────────────────────────────
+
+    #[test]
+    fn has_hidden_segment_dot_only_not_hidden() {
+        assert!(!has_hidden_segment("/./file.txt"));
+        assert!(!has_hidden_segment("/../file.txt"));
+    }
+
+    #[test]
+    fn has_hidden_segment_deep_nesting() {
+        assert!(has_hidden_segment("/a/b/c/.secret/d"));
+        assert!(!has_hidden_segment("/a/b/c/d/e"));
+    }
+
+    // ── is_php_file edge cases ──────────────────────────────────────
+
+    #[test]
+    fn is_php_file_case_insensitive() {
+        assert!(is_php_file(Path::new("test.PHP")));
+        assert!(is_php_file(Path::new("test.Php")));
+    }
+
+    #[test]
+    fn is_php_file_false_for_non_php() {
+        assert!(!is_php_file(Path::new("test.html")));
+        assert!(!is_php_file(Path::new("test.js")));
+        assert!(!is_php_file(Path::new("no-extension")));
+    }
+
+    // ── gzip_compress edge cases ────────────────────────────────────
+
+    #[test]
+    fn gzip_compress_json() {
+        let data = r#"{"key": "value", "list": [1,2,3]}"#.repeat(100);
+        let compressed = gzip_compress(data.as_bytes(), "application/json", default_compression());
+        assert!(compressed.is_some(), "JSON should be compressible");
+        assert!(compressed.unwrap().len() < data.len());
+    }
+
+    #[test]
+    fn gzip_compress_svg() {
+        let data = r#"<svg xmlns="http://www.w3.org/2000/svg"><circle r="50"/></svg>"#.repeat(50);
+        let compressed = gzip_compress(data.as_bytes(), "image/svg+xml", default_compression());
+        assert!(compressed.is_some(), "SVG should be compressible");
+    }
+
+    #[test]
+    fn gzip_compress_binary_not_compressed() {
+        let data = vec![0x89, 0x50, 0x4e, 0x47]; // PNG header
+        assert!(gzip_compress(&data, "image/png", default_compression()).is_none());
+    }
+
+    // ── etag_matches_value edge cases ───────────────────────────────
+
+    #[test]
+    fn etag_matches_empty_if_none_match() {
+        assert!(!etag_matches_value("\"v1\"", ""));
+    }
+
+    #[test]
+    fn etag_matches_strong_etag() {
+        assert!(etag_matches_value("\"abc\"", "\"abc\""));
+        assert!(!etag_matches_value("\"abc\"", "\"def\""));
+    }
+
+    // ── blocked paths edge cases ────────────────────────────────────
+
+    #[test]
+    fn blocked_empty_list_blocks_nothing() {
+        let blocked: Vec<String> = vec![];
+        assert!(!is_path_blocked("/anything", &blocked));
+    }
+
+    #[test]
+    fn blocked_multiple_patterns() {
+        let blocked = vec![
+            "/wp-config.php".to_string(),
+            "/vendor/*".to_string(),
+            "/.env".to_string(),
+        ];
+        assert!(is_path_blocked("/wp-config.php", &blocked));
+        assert!(is_path_blocked("/vendor/autoload.php", &blocked));
+        assert!(is_path_blocked("/.env", &blocked));
+        assert!(!is_path_blocked("/index.php", &blocked));
+    }
+
+    // ── port parsing edge cases ─────────────────────────────────────
+
+    #[test]
+    fn port_from_ipv6_listen_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            server: ServerConfig {
+                listen: "[::]:9090".to_string(),
+                document_root: dir.path().to_path_buf(),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
+        };
+        let router = Router::new(&config, test_store(), None);
+        assert_eq!(router.server_port, 9090);
+    }
+
+    // ── glob_match edge cases ───────────────────────────────────────
+
+    #[test]
+    fn glob_match_directory_prefix() {
+        assert!(glob_match("/admin/", "/admin/settings"));
+        assert!(!glob_match("/admin/", "/other/page"));
+    }
+
+    #[test]
+    fn glob_match_no_wildcard_exact_only() {
+        assert!(glob_match("/index.php", "/index.php"));
+        assert!(!glob_match("/index.php", "/index.phps"));
+        assert!(!glob_match("/index.php", "/index.ph"));
+    }
+
     // ── PHP-linked ETag integration tests ────────────────────────────
     //
     // These tests require PHP to be linked. They verify that PHP-set

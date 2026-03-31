@@ -733,3 +733,48 @@ fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
     ephpm_db::duration::parse_duration(s)
         .map_err(|e| anyhow::anyhow!("{e}"))
 }
+
+#[cfg(test)]
+mod lib_tests {
+    use super::*;
+
+    #[test]
+    fn parse_memory_size_megabytes() {
+        assert_eq!(parse_memory_size("256MB").unwrap(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_size_gigabytes() {
+        assert_eq!(parse_memory_size("1GB").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_size_kilobytes() {
+        assert_eq!(parse_memory_size("512KB").unwrap(), 512 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_size_bytes_no_suffix() {
+        assert_eq!(parse_memory_size("1024").unwrap(), 1024);
+    }
+
+    #[test]
+    fn parse_memory_size_lowercase() {
+        assert_eq!(parse_memory_size("256mb").unwrap(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_size_with_whitespace() {
+        assert_eq!(parse_memory_size(" 256MB ").unwrap(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_size_invalid() {
+        assert!(parse_memory_size("notanumber").is_err());
+    }
+
+    #[test]
+    fn parse_memory_size_zero() {
+        assert_eq!(parse_memory_size("0").unwrap(), 0);
+    }
+}
