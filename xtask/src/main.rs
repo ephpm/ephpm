@@ -47,7 +47,11 @@ Commands:
 
 Cross-compilation:
   --target windows    Cross-compile a Windows .exe from WSL/Linux (requires cargo-xwin).
-                      Downloads PHP Windows SDK automatically from windows.php.net."
+                      Downloads PHP Windows SDK automatically from windows.php.net.
+
+SQLite clustering:
+  --sqld-binary PATH  Embed a pre-built sqld binary in the release build.
+                      If not provided, the binary is built without sqld (single-node SQLite only)."
     );
 }
 
@@ -73,13 +77,23 @@ fn parse_target(args: &[String]) -> Option<&str> {
     None
 }
 
+/// Extract `--sqld-binary <path>` from release args.
+fn parse_sqld_binary(args: &[String]) -> Option<&str> {
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--sqld-binary" {
+            return args.get(i + 1).map(String::as_str);
+        }
+    }
+    None
+}
+
 /// Extract the PHP version from release args, skipping `--target` and its value.
 /// Falls back to "8.5" if no positional version argument is found.
 fn parse_release_php_version(args: &[String]) -> &str {
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--target" {
-            i += 2; // skip --target and its value
+        if args[i] == "--target" || args[i] == "--sqld-binary" {
+            i += 2; // skip flag and its value
             continue;
         }
         if !args[i].starts_with('-') {
@@ -135,10 +149,19 @@ fn release_linux(args: &[String]) -> ExitCode {
     }
 
     eprintln!("==> Building ephpm (release, target: {target})...");
-    let status = Command::new("cargo")
-        .args(["build", "--release", "--package", "ephpm", "--target", &target])
-        .env("PHP_SDK_PATH", &sdk_path)
-        .status();
+    let mut cmd = Command::new("cargo");
+    cmd.args(["build", "--release", "--package", "ephpm", "--target", &target])
+        .env("PHP_SDK_PATH", &sdk_path);
+
+    if let Some(sqld_path) = parse_sqld_binary(args) {
+        let sqld_abs = std::path::Path::new(sqld_path)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(sqld_path));
+        eprintln!("==> Embedding sqld binary from {}", sqld_abs.display());
+        cmd.env("SQLD_BINARY_PATH", &sqld_abs);
+    }
+
+    let status = cmd.status();
 
     if !ran_ok(&status) {
         eprintln!("error: cargo build failed");

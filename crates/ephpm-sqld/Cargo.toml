@@ -1,0 +1,22 @@
+[package]
+name = "ephpm-sqld"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "sqld binary embedding and process management for ePHPm"
+
+[dependencies]
+anyhow.workspace = true
+tokio = { workspace = true, features = ["process", "time", "fs"] }
+tracing.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+
+[lints]
+workspace = true

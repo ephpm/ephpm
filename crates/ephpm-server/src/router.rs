@@ -810,6 +810,7 @@ mod tests {
             php: PhpConfig::default(),
             db: Default::default(),
             kv: Default::default(),
+            cluster: Default::default(),
         };
         Router::new(&config, test_store(), None)
     }
@@ -826,6 +827,7 @@ mod tests {
             php: PhpConfig::default(),
             db: Default::default(),
             kv: Default::default(),
+            cluster: Default::default(),
         };
         Router::new(&config, test_store(), None)
     }
@@ -847,6 +849,7 @@ mod tests {
             php: PhpConfig::default(),
             db: Default::default(),
             kv: Default::default(),
+            cluster: Default::default(),
         };
         config.server.static_files.etag = true;
         Router::new(&config, store, None)
@@ -1031,6 +1034,7 @@ mod tests {
             php: PhpConfig::default(),
             db: Default::default(),
             kv: Default::default(),
+            cluster: Default::default(),
         };
         config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
         let router = Router::new(&config, test_store(), None);
@@ -1052,6 +1056,7 @@ mod tests {
             php: PhpConfig::default(),
             db: Default::default(),
             kv: Default::default(),
+            cluster: Default::default(),
         };
         config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
         let router = Router::new(&config, test_store(), None);
@@ -1075,6 +1080,7 @@ mod tests {
             php: PhpConfig::default(),
             db: Default::default(),
             kv: Default::default(),
+            cluster: Default::default(),
         };
         let router = Router::new(&config, test_store(), None);
         assert_eq!(router.server_port, 3000);
@@ -1092,6 +1098,7 @@ mod tests {
             php: PhpConfig::default(),
             db: Default::default(),
             kv: Default::default(),
+            cluster: Default::default(),
         };
         let router = Router::new(&config, test_store(), None);
         assert_eq!(router.server_port, 8080);
@@ -1134,6 +1141,7 @@ mod tests {
             php: PhpConfig::default(),
             db: Default::default(),
             kv: Default::default(),
+            cluster: Default::default(),
         };
         let router = Router::new(&config, test_store(), None);
         assert!(router.is_php_allowed("/anything.php"));
@@ -1150,6 +1158,7 @@ mod tests {
             php: PhpConfig::default(),
             db: Default::default(),
             kv: Default::default(),
+            cluster: Default::default(),
         };
         config.server.security.allowed_php_paths = vec![
             "/index.php".to_string(),
@@ -1172,6 +1181,7 @@ mod tests {
             php: PhpConfig::default(),
             db: Default::default(),
             kv: Default::default(),
+            cluster: Default::default(),
         };
         config.server.security.allowed_php_paths = vec![
             "/index.php".to_string(),
@@ -1408,6 +1418,7 @@ mod tests {
             php: PhpConfig::default(),
             db: Default::default(),
             kv: Default::default(),
+            cluster: Default::default(),
         };
         let router = Router::new(&config, test_store(), None);
         assert_eq!(router.server_port, 9090);

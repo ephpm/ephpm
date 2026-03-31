@@ -12,6 +12,7 @@ ephpm-config.workspace = true
 ephpm-db.workspace = true
 ephpm-kv.workspace = true
 ephpm-php.workspace = true
+litewire.workspace = true
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true

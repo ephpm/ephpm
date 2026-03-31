@@ -21,6 +21,8 @@ pub struct Config {
     pub db: DbConfig,
     #[serde(default)]
     pub kv: KvConfig,
+    #[serde(default)]
+    pub cluster: ClusterConfig,
 }
 
 /// HTTP server configuration.
@@ -443,6 +445,14 @@ pub struct DbConfig {
     #[serde(default)]
     pub postgres: Option<DbBackendConfig>,
 
+    /// Embedded SQLite configuration (via litewire).
+    ///
+    /// When enabled, starts an in-process SQLite database with MySQL/Hrana
+    /// wire protocol frontends. PHP connects via `pdo_mysql` — no external
+    /// database server needed.
+    #[serde(default)]
+    pub sqlite: Option<SqliteConfig>,
+
     /// Read/write splitting settings (requires replicas on at least one backend).
     #[serde(default)]
     pub read_write_split: ReadWriteSplitConfig,
@@ -450,6 +460,109 @@ pub struct DbConfig {
     /// Query analysis and optimization settings.
     #[serde(default)]
     pub analysis: DbAnalysisConfig,
+}
+
+/// Embedded SQLite database configuration (`[db.sqlite]`).
+///
+/// Uses litewire to expose SQLite via MySQL wire protocol, so PHP apps
+/// can use their existing `pdo_mysql` drivers transparently.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SqliteConfig {
+    /// Path to the SQLite database file.
+    ///
+    /// Default: `"ephpm.db"` in the current working directory.
+    #[serde(default = "default_sqlite_path")]
+    pub path: String,
+
+    /// Wire protocol proxy settings.
+    #[serde(default)]
+    pub proxy: SqliteProxyConfig,
+
+    /// sqld process settings (clustered mode only).
+    #[serde(default)]
+    pub sqld: SqldConfig,
+
+    /// Replication settings (clustered mode only).
+    #[serde(default)]
+    pub replication: ReplicationConfig,
+}
+
+/// Wire protocol frontend addresses for the SQLite proxy (`[db.sqlite.proxy]`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct SqliteProxyConfig {
+    /// MySQL wire protocol listen address.
+    ///
+    /// PHP connects here with `pdo_mysql`. Default: `"127.0.0.1:3306"`.
+    #[serde(default = "default_sqlite_mysql_listen")]
+    pub mysql_listen: String,
+
+    /// Hrana HTTP API listen address (optional).
+    ///
+    /// Useful for CI tooling, health checks, and direct HTTP access.
+    #[serde(default)]
+    pub hrana_listen: Option<String>,
+}
+
+impl Default for SqliteProxyConfig {
+    fn default() -> Self {
+        Self {
+            mysql_listen: default_sqlite_mysql_listen(),
+            hrana_listen: None,
+        }
+    }
+}
+
+/// sqld child process configuration (`[db.sqlite.sqld]`).
+///
+/// Controls the internal sqld instance used for replication in clustered mode.
+/// Ignored in single-node mode.
+#[derive(Debug, Deserialize, Clone)]
+pub struct SqldConfig {
+    /// Hrana HTTP listen address for litewire → sqld communication.
+    #[serde(default = "default_sqld_http_listen")]
+    pub http_listen: String,
+
+    /// gRPC listen address for inter-node replication.
+    #[serde(default = "default_sqld_grpc_listen")]
+    pub grpc_listen: String,
+}
+
+impl Default for SqldConfig {
+    fn default() -> Self {
+        Self {
+            http_listen: default_sqld_http_listen(),
+            grpc_listen: default_sqld_grpc_listen(),
+        }
+    }
+}
+
+/// Replication configuration (`[db.sqlite.replication]`).
+///
+/// Controls whether this node runs sqld as a primary or replica.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ReplicationConfig {
+    /// Replication role: `"auto"`, `"primary"`, or `"replica"`.
+    ///
+    /// - `"auto"`: elected via gossip (lowest-ordinal alive node wins)
+    /// - `"primary"`: force this node as primary
+    /// - `"replica"`: force this node as replica
+    #[serde(default = "default_replication_role")]
+    pub role: String,
+
+    /// gRPC URL of the primary node (for replicas).
+    ///
+    /// Set automatically when `role = "auto"`. Required when `role = "replica"`.
+    #[serde(default)]
+    pub primary_grpc_url: String,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            role: default_replication_role(),
+            primary_grpc_url: String::new(),
+        }
+    }
 }
 
 /// Configuration for a single database backend (`MySQL` or `PostgreSQL`).
@@ -759,6 +872,15 @@ pub struct PhpConfig {
     /// precedence over `ini_file` settings.
     #[serde(default)]
     pub ini_overrides: Vec<[String; 2]>,
+
+    /// Number of dedicated PHP worker threads.
+    ///
+    /// Each worker runs in its own OS thread with PHP TLS initialized,
+    /// allowing true concurrent PHP request execution.
+    ///
+    /// Default: logical CPU count, capped at 16.
+    #[serde(default = "default_php_workers")]
+    pub workers: usize,
 }
 
 impl Config {
@@ -870,8 +992,172 @@ impl Default for PhpConfig {
             memory_limit: default_memory_limit(),
             ini_file: None,
             ini_overrides: Vec::new(),
+            workers: default_php_workers(),
         }
     }
+}
+
+fn default_sqlite_path() -> String {
+    "ephpm.db".to_string()
+}
+
+fn default_sqlite_mysql_listen() -> String {
+    "127.0.0.1:3306".to_string()
+}
+
+fn default_sqld_http_listen() -> String {
+    "127.0.0.1:8081".to_string()
+}
+
+fn default_sqld_grpc_listen() -> String {
+    "0.0.0.0:5001".to_string()
+}
+
+fn default_replication_role() -> String {
+    "auto".to_string()
+}
+
+/// Clustering configuration (`[cluster]`).
+///
+/// Enables gossip-based peer discovery using the SWIM protocol.
+#[derive(Debug, Deserialize, Clone)]
+pub struct ClusterConfig {
+    /// Enable gossip-based clustering.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Gossip UDP listen address.
+    #[serde(default = "default_cluster_bind")]
+    pub bind: String,
+
+    /// Seed node addresses for initial cluster join.
+    #[serde(default)]
+    pub join: Vec<String>,
+
+    /// Base64-encoded 32-byte symmetric key for gossip encryption.
+    #[serde(default)]
+    pub secret: String,
+
+    /// Unique node identifier. Auto-generated if empty.
+    #[serde(default)]
+    pub node_id: String,
+
+    /// Cluster identifier. Nodes with different cluster IDs ignore each other.
+    #[serde(default = "default_cluster_id")]
+    pub cluster_id: String,
+
+    /// KV clustering settings.
+    #[serde(default)]
+    pub kv: ClusterKvConfig,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_cluster_bind(),
+            join: Vec::new(),
+            secret: String::new(),
+            node_id: String::new(),
+            cluster_id: default_cluster_id(),
+            kv: ClusterKvConfig::default(),
+        }
+    }
+}
+
+/// KV clustering configuration (`[cluster.kv]`).
+#[derive(Debug, Deserialize, Clone)]
+pub struct ClusterKvConfig {
+    /// Maximum value size (bytes) for the gossip tier.
+    #[serde(default = "default_small_key_threshold")]
+    pub small_key_threshold: usize,
+
+    /// Number of replica copies for large keys.
+    #[serde(default = "default_replication_factor")]
+    pub replication_factor: usize,
+
+    /// Replication mode for large keys (`"async"` or `"sync"`).
+    #[serde(default = "default_replication_mode")]
+    pub replication_mode: String,
+
+    /// Enable hot key local caching.
+    #[serde(default = "default_hot_key_cache")]
+    pub hot_key_cache: bool,
+
+    /// Remote fetches before promoting to cache.
+    #[serde(default = "default_hot_key_threshold")]
+    pub hot_key_threshold: u32,
+
+    /// Time window (seconds) for counting remote fetches.
+    #[serde(default = "default_hot_key_window_secs")]
+    pub hot_key_window_secs: u64,
+
+    /// Max age (seconds) of cached hot-key values.
+    #[serde(default = "default_hot_key_local_ttl_secs")]
+    pub hot_key_local_ttl_secs: u64,
+
+    /// Memory budget for hot-key cache (e.g. `"64MB"`).
+    #[serde(default = "default_hot_key_max_memory")]
+    pub hot_key_max_memory: String,
+}
+
+impl Default for ClusterKvConfig {
+    fn default() -> Self {
+        Self {
+            small_key_threshold: default_small_key_threshold(),
+            replication_factor: default_replication_factor(),
+            replication_mode: default_replication_mode(),
+            hot_key_cache: default_hot_key_cache(),
+            hot_key_threshold: default_hot_key_threshold(),
+            hot_key_window_secs: default_hot_key_window_secs(),
+            hot_key_local_ttl_secs: default_hot_key_local_ttl_secs(),
+            hot_key_max_memory: default_hot_key_max_memory(),
+        }
+    }
+}
+
+fn default_php_workers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().min(16))
+}
+
+fn default_cluster_bind() -> String {
+    "0.0.0.0:7946".to_string()
+}
+
+fn default_cluster_id() -> String {
+    "ephpm".to_string()
+}
+
+fn default_small_key_threshold() -> usize {
+    512
+}
+
+fn default_replication_factor() -> usize {
+    2
+}
+
+fn default_replication_mode() -> String {
+    "async".to_string()
+}
+
+fn default_hot_key_cache() -> bool {
+    true
+}
+
+fn default_hot_key_threshold() -> u32 {
+    5
+}
+
+fn default_hot_key_window_secs() -> u64 {
+    10
+}
+
+fn default_hot_key_local_ttl_secs() -> u64 {
+    30
+}
+
+fn default_hot_key_max_memory() -> String {
+    "64MB".to_string()
 }
 
 fn default_listen() -> String {
@@ -1371,5 +1657,98 @@ compression_min_size = 1024
         assert_eq!(config.kv.compression, "zstd");
         assert_eq!(config.kv.compression_level, 6);
         assert_eq!(config.kv.compression_min_size, 1024);
+    }
+
+    #[test]
+    fn test_sqlite_defaults_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[db.sqlite]
+path = "app.db"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let sqlite = config.db.sqlite.expect("sqlite should be present");
+        assert_eq!(sqlite.path, "app.db");
+        assert_eq!(sqlite.proxy.mysql_listen, "127.0.0.1:3306");
+        assert!(sqlite.proxy.hrana_listen.is_none());
+        assert_eq!(sqlite.sqld.http_listen, "127.0.0.1:8081");
+        assert_eq!(sqlite.sqld.grpc_listen, "0.0.0.0:5001");
+        assert_eq!(sqlite.replication.role, "auto");
+        assert!(sqlite.replication.primary_grpc_url.is_empty());
+    }
+
+    #[test]
+    fn test_sqlite_full_config_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[db.sqlite]
+path = "/var/lib/ephpm/app.db"
+
+[db.sqlite.proxy]
+mysql_listen = "0.0.0.0:3307"
+hrana_listen = "0.0.0.0:8080"
+
+[db.sqlite.sqld]
+http_listen = "127.0.0.1:9081"
+grpc_listen = "0.0.0.0:6001"
+
+[db.sqlite.replication]
+role = "replica"
+primary_grpc_url = "http://10.0.1.2:5001"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let sqlite = config.db.sqlite.expect("sqlite should be present");
+        assert_eq!(sqlite.path, "/var/lib/ephpm/app.db");
+        assert_eq!(sqlite.proxy.mysql_listen, "0.0.0.0:3307");
+        assert_eq!(sqlite.proxy.hrana_listen.as_deref(), Some("0.0.0.0:8080"));
+        assert_eq!(sqlite.sqld.http_listen, "127.0.0.1:9081");
+        assert_eq!(sqlite.sqld.grpc_listen, "0.0.0.0:6001");
+        assert_eq!(sqlite.replication.role, "replica");
+        assert_eq!(
+            sqlite.replication.primary_grpc_url,
+            "http://10.0.1.2:5001"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_not_present_by_default() {
+        let config = Config::default_config().unwrap();
+        assert!(config.db.sqlite.is_none());
+    }
+
+    #[test]
+    fn test_sqlite_env_var_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[db.sqlite]
+path = "test.db"
+"#,
+        )
+        .unwrap();
+
+        temp_env::with_var(
+            "EPHPM_DB__SQLITE__REPLICATION__ROLE",
+            Some("primary"),
+            || {
+                let config = Config::load(&file).unwrap();
+                let sqlite = config.db.sqlite.expect("sqlite should be present");
+                assert_eq!(sqlite.replication.role, "primary");
+            },
+        );
     }
 }

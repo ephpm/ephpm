@@ -587,6 +587,34 @@ async fn start_db_proxies(config: &Config) -> anyhow::Result<Vec<tokio::task::Jo
         tracing::info!("PostgreSQL proxy not yet implemented");
     }
 
+    // Embedded SQLite via litewire (single-node)
+    if let Some(sqlite_config) = &config.db.sqlite {
+        let db_path = &sqlite_config.path;
+        let backend = litewire::backend::Rusqlite::open(db_path)
+            .with_context(|| format!("failed to open SQLite database: {db_path}"))?;
+        tracing::info!(path = %db_path, "opened embedded SQLite database (single-node)");
+
+        let mut builder = litewire::LiteWire::new(backend);
+        builder = builder.mysql(&sqlite_config.proxy.mysql_listen);
+        tracing::info!(
+            listen = %sqlite_config.proxy.mysql_listen,
+            "SQLite MySQL wire protocol enabled"
+        );
+
+        if let Some(ref hrana_addr) = sqlite_config.proxy.hrana_listen {
+            builder = builder.hrana(hrana_addr);
+            tracing::info!(listen = %hrana_addr, "SQLite Hrana HTTP API enabled");
+        }
+
+        let handle = tokio::spawn(async move {
+            match builder.serve().await {
+                Ok(()) => tracing::info!("litewire stopped"),
+                Err(e) => tracing::error!("litewire error: {e:#}"),
+            }
+        });
+        handles.push(handle);
+    }
+
     Ok(handles)
 }
 
