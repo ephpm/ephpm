@@ -10,7 +10,7 @@ An all-in-one PHP application server written in Rust. Embeds PHP via FFI into a 
 | PHP FFI overhead | Zero (native C call) | ~2.2μs/req (11+ CGO crossings) | N/A (worker mode) | N/A (native) | N/A (in-process) | IPC (FastCGI) |
 | GC pauses | None | Go GC | Go GC | PHP GC | PHP GC | PHP GC |
 | Binary | Single static binary | Caddy module | Go binary + PHP workers | PHP + extension | Apache + modules | Nginx + separate FPM |
-| Embedded DB | SQLite via [litewire](#embedded-sql--litewire) | No | No | No | No | No |
+| Embedded DB | SQLite via [litewire](#database-three-options-zero-code-changes) | No | No | No | No | No |
 | Clustering | Gossip (SWIM) | No | No | Built-in | No | No |
 | PHP compatibility | Drop-in (embed SAPI) | Drop-in (worker SAPI) | Requires PSR-7 packages | Requires async code | Native (100%) | Native (100%) |
 | Deployment | Single binary | Requires Caddy | Multi-process | Requires PHP + Swoole extension | Apache + modules | Separate services |
@@ -30,9 +30,9 @@ An all-in-one PHP application server written in Rust. Embeds PHP via FFI into a 
 | KV store CLI debugging (`ephpm kv`) | **Implemented** |
 | SAPI functions (`ephpm_kv_*` in PHP) | **Implemented** |
 | Prometheus metrics endpoint | **Implemented** (Phase 1) |
-| Gossip clustering (SWIM via chitchat) | Partial |
-| Embedded SQL via litewire (single-node) | Partial |
-| Embedded SQL with sqld (clustered HA) | Planned |
+| Gossip clustering (SWIM via chitchat) | **Implemented** |
+| Embedded SQLite — single-node (litewire + rusqlite) | **Implemented** |
+| Embedded SQLite — clustered HA (litewire + sqld) | **Implemented** |
 | TLS / ACME | Planned |
 | Admin UI / API | Planned |
 | OpenTelemetry export | Planned |
@@ -124,61 +124,62 @@ path = "/var/lib/ephpm/app.db"
 
 All config values can be overridden with `EPHPM_` prefixed environment variables (e.g., `EPHPM_SERVER__LISTEN=0.0.0.0:9090`).
 
-## Embedded SQL & litewire
+## Database: Three Options, Zero Code Changes
 
-ePHPm bundles SQLite for zero-dependency deployments. PHP apps keep their existing `pdo_mysql` or `pdo_pgsql` configuration — no code changes needed. The protocol translation is provided by **[litewire](https://github.com/ephpm/litewire)**, a standalone open-source project that translates MySQL, PostgreSQL, and SQL Server wire protocols to SQLite SQL.
+ePHPm gives you three database strategies. PHP apps keep their existing `pdo_mysql` configuration in all cases — no code changes needed.
 
-```
-PHP (pdo_mysql)   ─┐
-PHP (pdo_pgsql)   ─┤──→ litewire (wire protocol frontends)
-psql / mysql CLI  ─┘          │
-                              ▼
-                       SQL Translator
-                       (MySQL/PG → SQLite)
-                              │
-                              ▼
-                     rusqlite (single-node)
-                     or sqld  (clustered)
-                              │
-                              ▼
-                           app.db
+### 1. Already have a database? Use the built-in proxy
+
+If you have a MySQL or PostgreSQL server, ePHPm's DB proxy sits between PHP and your database with connection pooling, read/write splitting, and health checks. PHP connects to `localhost:3306` — the proxy handles the rest.
+
+```toml
+[db.mysql]
+url = "mysql://user:pass@db-server:3306/myapp"
 ```
 
-### Single-node
+### 2. Small site? Use embedded SQLite
 
-On a single node, litewire runs entirely in-process with a `rusqlite` backend — no child processes, just ePHPm and a `.db` file. Configure a WordPress or Laravel site with:
+No external database needed. ePHPm embeds SQLite and exposes it via MySQL wire protocol through **[litewire](https://github.com/ephpm/litewire)**. Your PHP app thinks it's talking to MySQL — it's actually talking to SQLite. One binary, one `.db` file, done.
+
+Back up with cloud volume snapshots (Kubernetes PVCs, EBS snapshots, disk images) or any file-level backup tool.
+
+```toml
+[db.sqlite]
+path = "app.db"
+```
+
+### 3. Need HA? Use clustered SQLite
+
+For multi-node high availability, ePHPm embeds [sqld](https://github.com/tursodatabase/libsql) (Turso's SQLite server) inside the binary. sqld is extracted and spawned as a managed child process at startup — the single-binary model is preserved. Replication happens automatically via WAL frame streaming over gRPC.
+
+- **Primary node** — accepts writes, streams WAL frames to replicas
+- **Replica nodes** — serve reads locally, forward writes to primary
+- **Primary election** — automatic via ePHPm's gossip layer (lowest-ordinal live node wins)
+- **Failover** — gossip detects failure, next node promotes, sqld restarts in primary mode
+
+```toml
+[db.sqlite]
+path = "/var/lib/ephpm/app.db"
+
+[db.sqlite.replication]
+role = "auto"
+
+[cluster]
+enabled = true
+join = ["ephpm-headless.default.svc.cluster.local"]
+```
+
+### How it works under the hood
 
 ```
-DB_CONNECTION=mysql    # or pgsql — both work
-DB_HOST=127.0.0.1
-DB_PORT=3306           # MySQL wire, or 5432 for PG wire
-DB_DATABASE=app
+PHP (pdo_mysql) → litewire (MySQL wire :3306) → SQL Translator → SQLite backend
 ```
 
-litewire also exposes an [Hrana](https://github.com/tursodatabase/libsql/blob/main/docs/HRANA_3_SPEC.md) HTTP endpoint (`http://localhost:8080`) — a lightweight drop-in replacement for sqld. Apps using the Turso/libsql SDK or CLI can connect without running a separate database server.
+[litewire](https://github.com/ephpm/litewire) translates MySQL wire protocol and SQL dialect to SQLite on the fly using `sqlparser-rs`. It's a standalone open-source project — works outside of ePHPm too.
 
-### Clustered HA
+In single-node mode, the backend is `rusqlite` (in-process, zero overhead). In clustered mode, it switches to an HTTP client talking to the local sqld instance. Either way, PHP sees a MySQL server at `127.0.0.1:3306`.
 
-For multi-node HA, ePHPm spawns [sqld](https://github.com/tursodatabase/libsql/tree/main/libsql-server) as a managed child process on each node. The sqld binary is embedded inside the ePHPm binary at build time via `include_bytes!()` — the single-binary model is preserved. litewire's backends switch from rusqlite to the `libsql` HTTP client talking to the local sqld instance.
-
-- **Primary node** — sqld runs in `--primary` mode, owns writes
-- **Replica nodes** — sqld runs in `--replica` mode, streaming WAL frames from the primary
-- **Primary election** — handled by ePHPm's gossip layer (lowest-ordinal live node wins)
-
-See [docs/architecture/sql.md](docs/architecture/sql.md) for the full architecture.
-
-### About litewire
-
-litewire solves a general problem — making SQLite accessible via standard database wire protocols — so it's developed as a **standalone open-source project** separate from ePHPm. ePHPm uses it as a library dependency. If you need a MySQL/PG/TDS → SQLite proxy outside of ePHPm, litewire works standalone.
-
-| | litewire |
-|---|---|
-| MySQL wire protocol | ✓ (`opensrv-mysql`) |
-| PostgreSQL wire protocol | ✓ (`pgwire`) |
-| SQL Server (TDS) wire protocol | ✓ |
-| Hrana HTTP (libsql/sqld compatible) | ✓ |
-| Backends | rusqlite, libsql (local or remote sqld) |
-| SQL translation | `sqlparser-rs` (MySQL + PG + MSSQL dialects) |
+See [docs/architecture/sql.md](docs/architecture/sql.md) for the full architecture, failover details, and configuration reference.
 
 ## Project Structure
 
@@ -190,7 +191,8 @@ crates/
 ├── ephpm-config/    Configuration — figment, TOML + env var overrides
 ├── ephpm-kv/        Embedded KV store — DashMap, RESP2 protocol, TTL/expiry, compression
 ├── ephpm-db/        DB proxy — MySQL wire protocol, connection pooling
-└── ephpm-cluster/   Clustering — SWIM gossip (chitchat), consistent hash ring, clustered KV
+├── ephpm-sqld/      sqld embedding — binary extraction, process lifecycle, health checks
+└── ephpm-cluster/   Clustering — SWIM gossip (chitchat), consistent hash ring, SQLite election
 ```
 
 Key design decisions:
