@@ -1,6 +1,7 @@
 [server]
 listen = "0.0.0.0:8080"
 document_root = "/var/www/html"
+sites_dir = "/var/www/sites"
 index_files = ["index.php", "index.html"]
 fallback = ["$uri", "$uri/", "=404"]
 

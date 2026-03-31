@@ -57,6 +57,9 @@ struct SiteConfig {
 pub struct Router {
     document_root: PathBuf,
     sites: HashMap<String, SiteConfig>,
+    /// Optional path to the sites directory for lazy vhost discovery.
+    /// When set, unknown hosts are checked against the filesystem.
+    sites_dir: Option<PathBuf>,
     index_files: Vec<String>,
     fallback: Vec<String>,
     server_port: u16,
@@ -160,6 +163,7 @@ impl Router {
         Self {
             document_root: config.server.document_root.clone(),
             sites,
+            sites_dir: config.server.sites_dir.clone(),
             index_files: config.server.index_files.clone(),
             fallback: config.server.fallback.clone(),
             server_port: port,
@@ -196,9 +200,13 @@ impl Router {
     /// Returns the document root, index files, and fallback chain for the
     /// matched site. Falls back to global defaults if no site matches or
     /// vhosting is disabled.
-    fn resolve_site(&self, host: &str) -> (&Path, &[String], &[String]) {
-        if self.sites.is_empty() {
-            return (&self.document_root, &self.index_files, &self.fallback);
+    ///
+    /// Uses lazy discovery: if a host isn't in the startup-scanned registry
+    /// but a matching directory exists in `sites_dir`, it is served immediately.
+    /// This means new sites can be deployed without restarting ephpm.
+    fn resolve_site(&self, host: &str) -> (PathBuf, &[String], &[String]) {
+        if self.sites_dir.is_none() && self.sites.is_empty() {
+            return (self.document_root.clone(), &self.index_files, &self.fallback);
         }
 
         // Strip port and trailing dot, lowercase.
@@ -209,11 +217,25 @@ impl Router {
             .trim_end_matches('.')
             .to_ascii_lowercase();
 
+        // Check the startup-scanned registry first.
+        // Verify the directory still exists — it may have been removed (teardown).
         if let Some(site) = self.sites.get(&clean) {
-            (&site.document_root, &site.index_files, &site.fallback)
-        } else {
-            (&self.document_root, &self.index_files, &self.fallback)
+            if site.document_root.is_dir() {
+                return (site.document_root.clone(), &site.index_files, &site.fallback);
+            }
         }
+
+        // Lazy filesystem check: if sites_dir is set and the directory exists,
+        // serve from it. No restart needed — new sites are discovered on demand.
+        if let Some(ref sites_dir) = self.sites_dir {
+            let candidate = sites_dir.join(&clean);
+            if candidate.is_dir() {
+                tracing::info!(host = %clean, path = %candidate.display(), "discovered new virtual host (lazy)");
+                return (candidate, &self.index_files, &self.fallback);
+            }
+        }
+
+        (self.document_root.clone(), &self.index_files, &self.fallback)
     }
 
     /// Handle an incoming HTTP request.
@@ -315,7 +337,6 @@ impl Router {
         // Resolve virtual host — determines document root, index files, fallback.
         let host = extract_server_name(&req);
         let (site_root, site_index, site_fallback) = self.resolve_site(&host);
-        let site_root_owned = site_root.to_path_buf();
 
         // Extract If-None-Match for ETag support before consuming the request.
         let if_none_match = if self.etag {
@@ -327,7 +348,7 @@ impl Router {
             None
         };
 
-        let (mut response, handler) = match self.resolve_fallback(&uri_path, &query_string, site_root, site_index, site_fallback) {
+        let (mut response, handler) = match self.resolve_fallback(&uri_path, &query_string, &site_root, site_index, site_fallback) {
             Resolved::File(fs_path) => {
                 if is_php_file(&fs_path) {
                     if self.is_php_allowed(&uri_path) {
@@ -351,7 +372,7 @@ impl Router {
                         }
 
                         // Execute PHP
-                        let resp = self.handle_php(req, effective_addr, is_https, fs_path, accepts_gzip, site_root_owned.clone())
+                        let resp = self.handle_php(req, effective_addr, is_https, fs_path, accepts_gzip, site_root.clone())
                             .await;
 
                         // Post-store: cache any ETag PHP set in the response.
@@ -374,7 +395,7 @@ impl Router {
                     }
                 } else {
                     (static_files::serve_file(
-                        &site_root_owned,
+                        &site_root,
                         &fs_path,
                         accepts_gzip,
                         &self.cache_control,
@@ -1869,10 +1890,78 @@ echo "post response";
         let router = Router::new(&config, test_store(), None);
 
         let (doc_root, index_files, fallback) = router.resolve_site("myblog.com");
-        let resolved = router.resolve_fallback("/", "", doc_root, index_files, fallback);
+        let resolved = router.resolve_fallback("/", "", &doc_root, index_files, fallback);
         assert!(
             matches!(resolved, Resolved::File(p) if p == site_dir.join("index.php")),
             "fallback should resolve index.php from site directory"
         );
+    }
+
+    #[test]
+    fn vhost_lazy_discovery_finds_new_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        fs::create_dir_all(&sites).unwrap();
+
+        // Create router with empty sites_dir — no sites at startup.
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                sites_dir: Some(sites.clone()),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
+            cluster: Default::default(),
+        };
+        let router = Router::new(&config, test_store(), None);
+
+        // Host doesn't exist yet — should fall back to default.
+        let (doc_root, _, _) = router.resolve_site("new-site.com");
+        assert_eq!(doc_root, dir.path());
+
+        // Create the directory AFTER router startup (simulates switchboard deploying).
+        let new_site = sites.join("new-site.com");
+        fs::create_dir_all(&new_site).unwrap();
+        fs::write(new_site.join("index.html"), "<html>live!</html>").unwrap();
+
+        // Now it should be discovered lazily.
+        let (doc_root, _, _) = router.resolve_site("new-site.com");
+        assert_eq!(doc_root, new_site);
+    }
+
+    #[test]
+    fn vhost_lazy_discovery_teardown() {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        let site_dir = sites.join("temp-site.com");
+        fs::create_dir_all(&site_dir).unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                sites_dir: Some(sites),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
+            cluster: Default::default(),
+        };
+        let router = Router::new(&config, test_store(), None);
+
+        // Site exists — should resolve.
+        let (doc_root, _, _) = router.resolve_site("temp-site.com");
+        assert_eq!(doc_root, site_dir);
+
+        // Delete the directory (simulates switchboard tearing down).
+        fs::remove_dir_all(&site_dir).unwrap();
+
+        // Should fall back to default now.
+        let (doc_root, _, _) = router.resolve_site("temp-site.com");
+        assert_eq!(doc_root, dir.path());
     }
 }
