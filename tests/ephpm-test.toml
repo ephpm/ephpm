@@ -10,6 +10,9 @@ max_body_size = 1024
 [server.static]
 cache_control = "public, max-age=3600"
 
+[server.metrics]
+enabled = true
+
 [server.security]
 blocked_paths = ["vendor/*"]
 

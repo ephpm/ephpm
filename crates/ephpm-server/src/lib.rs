@@ -3,6 +3,7 @@ pub mod metrics;
 pub mod router;
 pub mod static_files;
 pub mod tls;
+pub mod tracked_backend;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -66,7 +67,15 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         None
     };
 
-    let _db_handles = start_db_proxies(&config, cluster_handle.as_ref()).await?;
+    // Create shared query stats collector.
+    let query_stats = ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig {
+        enabled: config.db.analysis.query_stats,
+        slow_query_threshold: parse_duration(&config.db.analysis.slow_query_threshold)
+            .unwrap_or(Duration::from_secs(1)),
+        max_digests: config.db.analysis.digest_store_max_entries,
+    });
+
+    let _db_handles = start_db_proxies(&config, cluster_handle.as_ref(), &query_stats).await?;
 
     let listeners = bind_listeners(&config, kv_store, metrics_handle).await?;
     accept_loop(listeners).await
@@ -550,6 +559,7 @@ fn start_kv_service(
 async fn start_db_proxies(
     config: &Config,
     cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
+    query_stats: &ephpm_query_stats::QueryStats,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut handles = vec![];
 
@@ -611,9 +621,9 @@ async fn start_db_proxies(
         let is_clustered = is_clustered_sqlite(sqlite_config, cluster.is_some());
 
         if is_clustered {
-            start_clustered_sqlite(sqlite_config, cluster, &mut handles).await?;
+            start_clustered_sqlite(sqlite_config, cluster, query_stats, &mut handles).await?;
         } else {
-            start_single_node_sqlite(sqlite_config, &mut handles)?;
+            start_single_node_sqlite(sqlite_config, query_stats, &mut handles)?;
         }
     }
 
@@ -629,6 +639,7 @@ fn is_clustered_sqlite(sqlite_config: &ephpm_config::SqliteConfig, cluster_enabl
 /// Start single-node SQLite (in-process rusqlite, no sqld).
 fn start_single_node_sqlite(
     sqlite_config: &ephpm_config::SqliteConfig,
+    query_stats: &ephpm_query_stats::QueryStats,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     let db_path = &sqlite_config.path;
@@ -636,7 +647,8 @@ fn start_single_node_sqlite(
         .with_context(|| format!("failed to open SQLite database: {db_path}"))?;
     tracing::info!(path = %db_path, "opened embedded SQLite database (single-node)");
 
-    let mut builder = litewire::LiteWire::new(backend);
+    let tracked = tracked_backend::TrackedBackend::new(backend, query_stats.clone());
+    let mut builder = litewire::LiteWire::new(tracked);
     builder = builder.mysql(&sqlite_config.proxy.mysql_listen);
     tracing::info!(
         listen = %sqlite_config.proxy.mysql_listen,
@@ -661,6 +673,7 @@ fn start_single_node_sqlite(
 async fn start_clustered_sqlite(
     sqlite_config: &ephpm_config::SqliteConfig,
     cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
+    query_stats: &ephpm_query_stats::QueryStats,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "windows")]
@@ -755,11 +768,12 @@ async fn start_clustered_sqlite(
         }));
     }
 
-    // Create Hrana client backend pointing at local sqld.
+    // Create Hrana client backend pointing at local sqld, wrapped with stats tracking.
     let backend = litewire::backend::HranaClient::new(&sqld_http_url);
+    let tracked = tracked_backend::TrackedBackend::new(backend, query_stats.clone());
 
-    // Start litewire with the Hrana backend.
-    let mut builder = litewire::LiteWire::new(backend);
+    // Start litewire with the tracked backend.
+    let mut builder = litewire::LiteWire::new(tracked);
     builder = builder.mysql(&sqlite_config.proxy.mysql_listen);
     tracing::info!(
         listen = %sqlite_config.proxy.mysql_listen,

@@ -1,0 +1,17 @@
+[package]
+name = "ephpm-query-stats"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Query digest tracking and slow query logging for ePHPm"
+
+[dependencies]
+dashmap.workspace = true
+metrics.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -51,6 +51,7 @@ base64ct = { version = "1", features = ["alloc"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
 chitchat = "0.10"
 serde_json = "1"
+async-trait = "0.1"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 
@@ -60,6 +61,7 @@ ephpm-config = { path = "crates/ephpm-config" }
 ephpm-db = { path = "crates/ephpm-db" }
 ephpm-kv = { path = "crates/ephpm-kv" }
 ephpm-php = { path = "crates/ephpm-php" }
+ephpm-query-stats = { path = "crates/ephpm-query-stats" }
 ephpm-server = { path = "crates/ephpm-server" }
 ephpm-sqld = { path = "crates/ephpm-sqld" }
 

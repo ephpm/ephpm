@@ -710,6 +710,16 @@ impl Default for ReadWriteSplitConfig {
 /// Query analysis and optimization configuration (`[db.analysis]`).
 #[derive(Debug, Deserialize)]
 pub struct DbAnalysisConfig {
+    /// Enable query digest tracking and Prometheus metrics.
+    ///
+    /// When enabled, every SQL query is normalized, hashed, and tracked
+    /// with timing, throughput, and error metrics. Disable to eliminate
+    /// the per-query overhead on high-throughput workloads.
+    ///
+    /// Default: `true`.
+    #[serde(default = "default_query_stats_enabled")]
+    pub query_stats: bool,
+
     /// Duration threshold for logging slow queries.
     ///
     /// Queries exceeding this time trigger `EXPLAIN` analysis.
@@ -747,12 +757,17 @@ pub struct DbAnalysisConfig {
 impl Default for DbAnalysisConfig {
     fn default() -> Self {
         Self {
+            query_stats: default_query_stats_enabled(),
             slow_query_threshold: default_slow_query_threshold(),
             auto_explain: false,
             auto_explain_target: default_auto_explain_target(),
             digest_store_max_entries: default_digest_max_entries(),
         }
     }
+}
+
+fn default_query_stats_enabled() -> bool {
+    true
 }
 
 /// KV store configuration (`[kv]`).

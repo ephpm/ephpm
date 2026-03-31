@@ -8,11 +8,13 @@ repository.workspace = true
 description = "HTTP server for ePHPm"
 
 [dependencies]
+async-trait.workspace = true
 ephpm-cluster.workspace = true
 ephpm-config.workspace = true
 ephpm-db.workspace = true
 ephpm-kv.workspace = true
 ephpm-php.workspace = true
+ephpm-query-stats.workspace = true
 ephpm-sqld.workspace = true
 litewire.workspace = true
 tokio.workspace = true

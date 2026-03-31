@@ -49,7 +49,14 @@
       "Bash(2)",
       "Bash(grep -E \"^test |FAILED|ok$|test result\")",
       "Bash(cargo run:*)",
-      "Bash(grep -v \"^$\")"
+      "Bash(grep -v \"^$\")",
+      "Bash(wc -l /home/luther/litewire/crates/litewire-translate/src/*.rs)",
+      "Read(//home/luther/.cargo/registry/src/**)",
+      "Read(//home/luther/.cargo/**)",
+      "Bash(find /home/luther/litewire/target -type d -name *pgwire*)",
+      "WebFetch(domain:docs.rs)",
+      "WebFetch(domain:crates.io)",
+      "Bash(cargo doc:*)"
     ]
   }
 }

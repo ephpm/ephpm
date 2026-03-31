@@ -1020,15 +1020,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ephpm-query-stats"
+version = "0.1.0"
+dependencies = [
+ "dashmap",
+ "metrics",
+ "parking_lot",
+ "tracing",
+]
+
+[[package]]
 name = "ephpm-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "ephpm-cluster",
  "ephpm-config",
  "ephpm-db",
  "ephpm-kv",
  "ephpm-php",
+ "ephpm-query-stats",
  "ephpm-sqld",
  "flate2",
  "http",
