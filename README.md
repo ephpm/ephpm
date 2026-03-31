@@ -12,6 +12,7 @@ An all-in-one PHP application server written in Rust. Embeds PHP via FFI into a 
 | Binary | Single static binary | Caddy module | Go binary + PHP workers | PHP + extension | Apache + modules | Nginx + separate FPM |
 | Embedded DB | SQLite via [litewire](#database-three-options-zero-code-changes) | No | No | No | No | No |
 | Clustering | Gossip (SWIM) | No | No | Built-in | No | No |
+| Virtual hosts | Built-in ([directory-based](#virtual-hosts-multi-tenant-hosting)) | Via Caddy | No | No | `<VirtualHost>` | `server` blocks |
 | PHP compatibility | Drop-in (embed SAPI) | Drop-in (worker SAPI) | Requires PSR-7 packages | Requires async code | Native (100%) | Native (100%) |
 | Deployment | Single binary | Requires Caddy | Multi-process | Requires PHP + Swoole extension | Apache + modules | Separate services |
 | Container-friendly | ✓ (single binary) | ✓ (Caddy module) | ✓ | ⚠️ (PHP + extension) | ⚠️ (heavier) | ⚠️ (two services) |
@@ -34,6 +35,7 @@ An all-in-one PHP application server written in Rust. Embeds PHP via FFI into a 
 | Embedded SQLite — single-node (litewire + rusqlite) | **Implemented** |
 | Embedded SQLite — clustered HA (litewire + sqld) | **Implemented** |
 | TLS (manual cert/key + ACME/Let's Encrypt) | **Implemented** |
+| Virtual hosts (directory-based, multi-tenant) | **Implemented** |
 | Admin UI / API | Planned |
 | OpenTelemetry export | Planned |
 
@@ -216,6 +218,36 @@ slow_query_threshold = "500ms"
 Point Grafana, Datadog, or any Prometheus-compatible tool at `http://your-ephpm:8080/metrics` to chart query latency, throughput, error rates, and identify slow queries — no APM agent or database plugin needed.
 
 See [docs/architecture/query-stats.md](docs/architecture/query-stats.md) for the full design.
+
+## Virtual Hosts: Multi-Tenant Hosting
+
+Run multiple WordPress sites on a single ePHPm instance. The directory structure IS the config — each subdirectory is named after a domain.
+
+```toml
+[server]
+listen = "0.0.0.0:8080"
+document_root = "/var/www/marketing"   # fallback for unmatched domains
+sites_dir = "/var/www/sites"           # vhost directory
+```
+
+```
+/var/www/
+  marketing/                  # signup page (fallback for unknown domains)
+  sites/
+    alice-blog.com/           # served when Host: alice-blog.com
+      index.php
+      ephpm.db
+    bobs-recipes.com/         # served when Host: bobs-recipes.com
+      index.php
+      ephpm.db
+```
+
+- **Add a site:** create a directory, drop in WordPress
+- **Remove a site:** delete the directory — traffic falls back to your marketing page
+- **No per-site config needed:** sites inherit global PHP settings, timeouts, and security rules
+- **Shared workers:** all sites share one PHP worker pool — 20 blogs don't need 20x the memory
+
+A $3.69/mo Hetzner VM (2 ARM cores, 4 GB RAM) comfortably runs 20 WordPress blogs at ~$0.18/site. See [docs/architecture/vhosts.md](docs/architecture/vhosts.md) and [docs/architecture/hosting.md](docs/architecture/hosting.md) for full details.
 
 ## Project Structure
 

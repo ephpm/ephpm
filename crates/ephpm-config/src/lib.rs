@@ -36,6 +36,16 @@ pub struct ServerConfig {
     #[serde(default = "default_document_root")]
     pub document_root: PathBuf,
 
+    /// Virtual host directory. Each subdirectory is named after a domain.
+    ///
+    /// When set, the `Host` header is matched against subdirectory names.
+    /// Matched sites use the subdirectory as their document root.
+    /// Unmatched hosts fall back to `document_root`.
+    ///
+    /// Omit to disable vhosting (single-site mode).
+    #[serde(default)]
+    pub sites_dir: Option<PathBuf>,
+
     /// Index file names to try when a directory is requested.
     #[serde(default = "default_index_files")]
     pub index_files: Vec<String>,
@@ -934,6 +944,7 @@ impl Default for ServerConfig {
         Self {
             listen: default_listen(),
             document_root: default_document_root(),
+            sites_dir: None,
             index_files: default_index_files(),
             fallback: default_fallback(),
             request: RequestConfig::default(),

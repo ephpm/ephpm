@@ -260,12 +260,36 @@ Put a reverse proxy (Caddy recommended — automatic HTTPS per domain) in front 
 - $0.18/mo per site
 - Zero ops: one binary, one config file, automated backups via Hetzner snapshots
 
-## Implementation Status
+## Implementation Phases
 
-Virtual host support is **not yet implemented**. The design is documented here for future implementation. The key changes needed:
+### Phase 1: Directory-Based Routing (implemented)
 
-1. **Config:** Add `sites_dir` field to `ServerConfig`
-2. **Router:** Match `Host` header against `sites_dir` subdirectories
-3. **Per-site state:** Lazy-initialize litewire/rusqlite backends per site on first request
-4. **Per-site overrides:** Load `site.toml` from site directory, merge with global config
-5. **Environment injection:** Set `DB_HOST`/`DB_PORT`/database path per site before PHP dispatch
+Host header → site directory mapping with per-site document roots. All sites share the global SQLite database, KV store, and PHP worker pool.
+
+| Step | Change | File |
+|------|--------|------|
+| 1 | Add `sites_dir: Option<PathBuf>` to `ServerConfig` | `ephpm-config/src/lib.rs` |
+| 2 | Add `SiteConfig` struct and site registry `HashMap<String, SiteConfig>` to `Router` | `ephpm-server/src/router.rs` |
+| 3 | Scan `sites_dir` at startup, populate registry from directory names | `ephpm-server/src/router.rs` |
+| 4 | Add `resolve_site()` — extract Host header, strip port/trailing dot, lowercase, lookup in registry | `ephpm-server/src/router.rs` |
+| 5 | Thread per-site `document_root` through `resolve_fallback()`, `probe_path()`, `handle_php()` | `ephpm-server/src/router.rs` |
+| 6 | Unit tests: site resolution, fallback, port stripping, case insensitivity | `ephpm-server/src/router.rs` |
+
+When `sites_dir` is not configured, the router behaves identically to today (single-site mode). Zero cost path — the `sites` HashMap is empty and `resolve_site()` returns the global defaults.
+
+### Phase 2: Per-Site Databases and Overrides (future)
+
+| Feature | Description |
+|---------|-------------|
+| Per-site SQLite | Each site gets its own `ephpm.db` in its directory. Requires litewire COM_INIT_DB routing or per-site litewire instances |
+| Per-site `site.toml` | Optional overrides for `index_files`, `fallback`, `php.memory_limit`, `db.sqlite.path`, etc. Merged with global config |
+| Per-site KV namespacing | Prefix KV keys by site to prevent cross-site data leakage |
+| Per-site metrics | Add `host` label to Prometheus metrics for per-site traffic visibility |
+
+### Phase 3: Operational Features (future)
+
+| Feature | Description |
+|---------|-------------|
+| Hot reload | Detect new/removed site directories without restart (via `notify` or periodic rescan) |
+| Per-site resource limits | Memory and CPU quotas per site to prevent noisy neighbors |
+| Site provisioning API | REST API to create/delete sites, manage domains |

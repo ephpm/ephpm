@@ -5,6 +5,7 @@
 //! is served. The last entry is the fallback (an internal rewrite or status
 //! code like `=404`).
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -46,8 +47,16 @@ pub struct CompressionSettings {
     pub min_size: usize,
 }
 
+/// Per-site configuration resolved at startup from `sites_dir`.
+struct SiteConfig {
+    document_root: PathBuf,
+    index_files: Vec<String>,
+    fallback: Vec<String>,
+}
+
 pub struct Router {
     document_root: PathBuf,
+    sites: HashMap<String, SiteConfig>,
     index_files: Vec<String>,
     fallback: Vec<String>,
     server_port: u16,
@@ -66,6 +75,57 @@ pub struct Router {
     php_etag_cache_config: ephpm_config::PhpETagCacheConfig,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     metrics_path: String,
+}
+
+/// Scan `sites_dir` for virtual host subdirectories.
+///
+/// Each subdirectory becomes a virtual host keyed by its name (lowercased).
+/// Returns an empty map if `sites_dir` is `None`.
+fn scan_sites_dir(
+    sites_dir: Option<&Path>,
+    default_index_files: &[String],
+    default_fallback: &[String],
+) -> HashMap<String, SiteConfig> {
+    let Some(dir) = sites_dir else {
+        return HashMap::new();
+    };
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(path = %dir.display(), %e, "failed to read sites_dir");
+            return HashMap::new();
+        }
+    };
+
+    let mut sites = HashMap::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let host = name.to_ascii_lowercase();
+        tracing::info!(host = %host, path = %path.display(), "discovered virtual host");
+        sites.insert(
+            host,
+            SiteConfig {
+                document_root: path,
+                index_files: default_index_files.to_vec(),
+                fallback: default_fallback.to_vec(),
+            },
+        );
+    }
+
+    if sites.is_empty() {
+        tracing::warn!(path = %dir.display(), "sites_dir is empty — no virtual hosts configured");
+    } else {
+        tracing::info!(count = sites.len(), "virtual hosts loaded");
+    }
+
+    sites
 }
 
 impl Router {
@@ -90,8 +150,16 @@ impl Router {
             })
             .collect();
 
+        // Scan sites_dir for virtual host directories.
+        let sites = scan_sites_dir(
+            config.server.sites_dir.as_deref(),
+            &config.server.index_files,
+            &config.server.fallback,
+        );
+
         Self {
             document_root: config.server.document_root.clone(),
+            sites,
             index_files: config.server.index_files.clone(),
             fallback: config.server.fallback.clone(),
             server_port: port,
@@ -120,6 +188,31 @@ impl Router {
             php_etag_cache_config: config.server.php_etag_cache.clone(),
             metrics_handle,
             metrics_path: config.server.metrics.path.clone(),
+        }
+    }
+
+    /// Resolve the site configuration from the `Host` header.
+    ///
+    /// Returns the document root, index files, and fallback chain for the
+    /// matched site. Falls back to global defaults if no site matches or
+    /// vhosting is disabled.
+    fn resolve_site(&self, host: &str) -> (&Path, &[String], &[String]) {
+        if self.sites.is_empty() {
+            return (&self.document_root, &self.index_files, &self.fallback);
+        }
+
+        // Strip port and trailing dot, lowercase.
+        let clean = host
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+
+        if let Some(site) = self.sites.get(&clean) {
+            (&site.document_root, &site.index_files, &site.fallback)
+        } else {
+            (&self.document_root, &self.index_files, &self.fallback)
         }
     }
 
@@ -219,6 +312,11 @@ impl Router {
 
         let accepts_gzip = self.compression.enabled && accepts_encoding(&req, "gzip");
 
+        // Resolve virtual host — determines document root, index files, fallback.
+        let host = extract_server_name(&req);
+        let (site_root, site_index, site_fallback) = self.resolve_site(&host);
+        let site_root_owned = site_root.to_path_buf();
+
         // Extract If-None-Match for ETag support before consuming the request.
         let if_none_match = if self.etag {
             req.headers()
@@ -229,7 +327,7 @@ impl Router {
             None
         };
 
-        let (mut response, handler) = match self.resolve_fallback(&uri_path, &query_string) {
+        let (mut response, handler) = match self.resolve_fallback(&uri_path, &query_string, site_root, site_index, site_fallback) {
             Resolved::File(fs_path) => {
                 if is_php_file(&fs_path) {
                     if self.is_php_allowed(&uri_path) {
@@ -253,7 +351,7 @@ impl Router {
                         }
 
                         // Execute PHP
-                        let resp = self.handle_php(req, effective_addr, is_https, fs_path, accepts_gzip)
+                        let resp = self.handle_php(req, effective_addr, is_https, fs_path, accepts_gzip, site_root_owned.clone())
                             .await;
 
                         // Post-store: cache any ETag PHP set in the response.
@@ -276,7 +374,7 @@ impl Router {
                     }
                 } else {
                     (static_files::serve_file(
-                        &self.document_root,
+                        &site_root_owned,
                         &fs_path,
                         accepts_gzip,
                         &self.cache_control,
@@ -304,17 +402,23 @@ impl Router {
     /// Each entry except the last is tested against the filesystem.
     /// The last entry is the fallback — either a rewrite target or `=NNN`
     /// status code.
-    fn resolve_fallback(&self, uri_path: &str, query_string: &str) -> Resolved {
-        let entries = &self.fallback;
-        if entries.is_empty() {
+    fn resolve_fallback(
+        &self,
+        uri_path: &str,
+        query_string: &str,
+        doc_root: &Path,
+        index_files: &[String],
+        fallback_chain: &[String],
+    ) -> Resolved {
+        if fallback_chain.is_empty() {
             return Resolved::Status(404);
         }
 
-        let (probes, fallback) = entries.split_at(entries.len() - 1);
+        let (probes, fallback) = fallback_chain.split_at(fallback_chain.len() - 1);
 
         for entry in probes {
             let expanded = expand_variables(entry, uri_path, query_string);
-            if let Some(path) = self.probe_path(&expanded) {
+            if let Some(path) = self.probe_path(&expanded, doc_root, index_files) {
                 return Resolved::File(path);
             }
         }
@@ -326,7 +430,7 @@ impl Router {
         } else {
             let expanded = expand_variables(last, uri_path, query_string);
             let (rewrite_path, _) = split_path_query(&expanded);
-            let fs_path = self.document_root.join(rewrite_path.trim_start_matches('/'));
+            let fs_path = doc_root.join(rewrite_path.trim_start_matches('/'));
             if fs_path.exists() && fs_path.is_file() {
                 Resolved::File(fs_path)
             } else {
@@ -336,13 +440,13 @@ impl Router {
     }
 
     /// Probe a single `fallback` entry against the filesystem.
-    fn probe_path(&self, expanded: &str) -> Option<PathBuf> {
+    fn probe_path(&self, expanded: &str, doc_root: &Path, index_files: &[String]) -> Option<PathBuf> {
         let (path_part, _) = split_path_query(expanded);
 
         if path_part.ends_with('/') {
-            let dir = self.document_root.join(path_part.trim_start_matches('/'));
+            let dir = doc_root.join(path_part.trim_start_matches('/'));
             if dir.is_dir() {
-                for index in &self.index_files {
+                for index in index_files {
                     let candidate = dir.join(index);
                     if candidate.is_file() {
                         return Some(candidate);
@@ -351,7 +455,7 @@ impl Router {
             }
             None
         } else {
-            let fs_path = self.document_root.join(path_part.trim_start_matches('/'));
+            let fs_path = doc_root.join(path_part.trim_start_matches('/'));
             if fs_path.is_file() {
                 Some(fs_path)
             } else {
@@ -368,6 +472,7 @@ impl Router {
         is_https: bool,
         script_filename: PathBuf,
         accepts_gzip: bool,
+        document_root: PathBuf,
     ) -> Response<Full<Bytes>> {
         let method = req.method().to_string();
         let uri = req.uri().to_string();
@@ -392,7 +497,6 @@ impl Router {
         histogram!("ephpm_http_request_body_bytes", "method" => method.clone())
             .record(body.len() as f64);
 
-        let document_root = self.document_root.clone();
         let server_port = self.server_port;
 
         let php_start = std::time::Instant::now();
@@ -863,6 +967,11 @@ mod tests {
         }
     }
 
+    /// Test helper: call resolve_fallback with the router's own defaults.
+    fn resolve_fb(router: &Router, uri: &str, qs: &str) -> Resolved {
+        router.resolve_fallback(uri, qs, &router.document_root, &router.index_files, &router.fallback)
+    }
+
     // ── fallback resolution ─────────────────────────────────────────
 
     #[test]
@@ -871,7 +980,7 @@ mod tests {
         fs::write(dir.path().join("style.css"), "body{}").unwrap();
 
         let router = test_router(dir.path());
-        let resolved = router.resolve_fallback("/style.css", "");
+        let resolved = resolve_fb(&router, "/style.css", "");
         assert!(matches!(resolved, Resolved::File(p) if p == dir.path().join("style.css")));
     }
 
@@ -881,7 +990,7 @@ mod tests {
         fs::write(dir.path().join("info.php"), "<?php phpinfo();").unwrap();
 
         let router = test_router(dir.path());
-        let resolved = router.resolve_fallback("/info.php", "");
+        let resolved = resolve_fb(&router, "/info.php", "");
         assert!(matches!(resolved, Resolved::File(p) if p == dir.path().join("info.php")));
     }
 
@@ -891,7 +1000,7 @@ mod tests {
         fs::write(dir.path().join("index.php"), "<?php").unwrap();
 
         let router = test_router(dir.path());
-        let resolved = router.resolve_fallback("/", "");
+        let resolved = resolve_fb(&router, "/", "");
         assert!(matches!(resolved, Resolved::File(p) if p == dir.path().join("index.php")));
     }
 
@@ -901,7 +1010,7 @@ mod tests {
         fs::write(dir.path().join("index.html"), "<html>").unwrap();
 
         let router = test_router(dir.path());
-        let resolved = router.resolve_fallback("/", "");
+        let resolved = resolve_fb(&router, "/", "");
         assert!(matches!(resolved, Resolved::File(p) if p == dir.path().join("index.html")));
     }
 
@@ -911,7 +1020,7 @@ mod tests {
         fs::write(dir.path().join("index.php"), "<?php").unwrap();
 
         let router = test_router(dir.path());
-        let resolved = router.resolve_fallback("/2024/hello-world", "p=123");
+        let resolved = resolve_fb(&router, "/2024/hello-world", "p=123");
         assert!(matches!(resolved, Resolved::File(p) if p == dir.path().join("index.php")));
     }
 
@@ -920,7 +1029,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let router = test_router_with_404(dir.path());
-        let resolved = router.resolve_fallback("/nope.css", "");
+        let resolved = resolve_fb(&router, "/nope.css", "");
         assert!(matches!(resolved, Resolved::Status(404)));
     }
 
@@ -929,7 +1038,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let router = test_router_with_404(dir.path());
-        let resolved = router.resolve_fallback("/nope.php", "");
+        let resolved = resolve_fb(&router, "/nope.php", "");
         assert!(matches!(resolved, Resolved::Status(404)));
     }
 
@@ -937,7 +1046,7 @@ mod tests {
     fn test_missing_with_no_index_falls_to_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let router = test_router(dir.path());
-        let resolved = router.resolve_fallback("/anything", "");
+        let resolved = resolve_fb(&router, "/anything", "");
         assert!(matches!(resolved, Resolved::Status(404)));
     }
 
@@ -948,7 +1057,7 @@ mod tests {
         fs::write(dir.path().join("blog/index.php"), "<?php").unwrap();
 
         let router = test_router(dir.path());
-        let resolved = router.resolve_fallback("/blog/", "");
+        let resolved = resolve_fb(&router, "/blog/", "");
         assert!(matches!(resolved, Resolved::File(p) if p == dir.path().join("blog/index.php")));
     }
 
@@ -1611,5 +1720,159 @@ echo "post response";
             let key = php_etag_cache_key("etag:", "POST", "/index.php", "");
             assert!(store.get(&key).is_none());
         }
+    }
+
+    // ── virtual host resolution ──────────────────────────────────────
+
+    #[test]
+    fn vhost_resolves_to_site_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        let site_dir = sites.join("example.com");
+        fs::create_dir_all(&site_dir).unwrap();
+        fs::write(site_dir.join("index.html"), "<html>hi</html>").unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                sites_dir: Some(sites),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
+            cluster: Default::default(),
+        };
+        let router = Router::new(&config, test_store(), None);
+
+        let (doc_root, _, _) = router.resolve_site("example.com");
+        assert_eq!(doc_root, site_dir);
+    }
+
+    #[test]
+    fn vhost_fallback_to_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        fs::create_dir_all(&sites).unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                sites_dir: Some(sites),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
+            cluster: Default::default(),
+        };
+        let router = Router::new(&config, test_store(), None);
+
+        let (doc_root, _, _) = router.resolve_site("unknown.com");
+        assert_eq!(doc_root, dir.path());
+    }
+
+    #[test]
+    fn vhost_strips_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        let site_dir = sites.join("example.com");
+        fs::create_dir_all(&site_dir).unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                sites_dir: Some(sites),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
+            cluster: Default::default(),
+        };
+        let router = Router::new(&config, test_store(), None);
+
+        let (doc_root, _, _) = router.resolve_site("example.com:8080");
+        assert_eq!(doc_root, site_dir);
+    }
+
+    #[test]
+    fn vhost_case_insensitive() {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        let site_dir = sites.join("example.com");
+        fs::create_dir_all(&site_dir).unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                sites_dir: Some(sites),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
+            cluster: Default::default(),
+        };
+        let router = Router::new(&config, test_store(), None);
+
+        let (doc_root, _, _) = router.resolve_site("Example.COM");
+        assert_eq!(doc_root, site_dir);
+    }
+
+    #[test]
+    fn vhost_empty_sites_dir_uses_default() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                sites_dir: None,
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
+            cluster: Default::default(),
+        };
+        let router = Router::new(&config, test_store(), None);
+
+        let (doc_root, _, _) = router.resolve_site("anything.com");
+        assert_eq!(doc_root, dir.path());
+    }
+
+    #[test]
+    fn vhost_fallback_resolves_files_from_site_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        let site_dir = sites.join("myblog.com");
+        fs::create_dir_all(&site_dir).unwrap();
+        fs::write(site_dir.join("index.php"), "<?php echo 'hi';").unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                sites_dir: Some(sites),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: Default::default(),
+            kv: Default::default(),
+            cluster: Default::default(),
+        };
+        let router = Router::new(&config, test_store(), None);
+
+        let (doc_root, index_files, fallback) = router.resolve_site("myblog.com");
+        let resolved = router.resolve_fallback("/", "", doc_root, index_files, fallback);
+        assert!(
+            matches!(resolved, Resolved::File(p) if p == site_dir.join("index.php")),
+            "fallback should resolve index.php from site directory"
+        );
     }
 }

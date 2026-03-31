@@ -65,7 +65,9 @@
       "Bash(cargo fetch:*)",
       "Bash(cargo download:*)",
       "Bash(find ~/.cargo/registry/src -path */pgwire-0.28*/examples/sqlite.rs)",
-      "Bash(find ~/.cargo/registry/src -path */pgwire-0.28* -name *.rs)"
+      "Bash(find ~/.cargo/registry/src -path */pgwire-0.28* -name *.rs)",
+      "Bash(find ~/.cargo/registry/src -path */tiberius-*/src/client/connection.rs)",
+      "Bash(grep -r \"use tiberius\\\\|tiberius::\" /home/luther --include=*.rs)"
     ]
   }
 }
