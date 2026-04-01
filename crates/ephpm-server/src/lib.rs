@@ -1,5 +1,7 @@
 pub mod acme;
+pub mod body;
 pub mod metrics;
+pub mod rate_limit;
 pub mod router;
 pub mod static_files;
 pub mod tls;
@@ -103,6 +105,7 @@ struct Listeners {
     conn: ConnSettings,
     idle_timeout: Duration,
     router: Arc<Router>,
+    limiter: Option<Arc<rate_limit::Limiter>>,
 }
 
 /// Connection-level settings passed into spawned tasks.
@@ -119,6 +122,16 @@ async fn bind_listeners(
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
 ) -> anyhow::Result<Listeners> {
     let addr: SocketAddr = config.server.listen.parse().context("invalid listen address")?;
+
+    let limiter = {
+        let l = rate_limit::Limiter::new(config.server.limits.clone());
+        if l.is_enabled() {
+            tracing::info!("rate limiting enabled");
+            Some(Arc::new(l))
+        } else {
+            None
+        }
+    };
 
     let conn = ConnSettings {
         header_read_timeout: Duration::from_secs(config.server.timeouts.header_read),
@@ -222,6 +235,7 @@ async fn bind_listeners(
         conn,
         idle_timeout,
         router,
+        limiter,
     })
 }
 
@@ -235,7 +249,20 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         conn,
         idle_timeout,
         router,
+        limiter,
     } = listeners;
+
+    // Spawn background cleanup task for rate limiter state.
+    if let Some(ref l) = limiter {
+        let l = Arc::clone(l);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                l.cleanup_stale();
+            }
+        });
+    }
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -244,9 +271,10 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         tokio::select! {
             result = main.accept() => {
                 let (stream, remote_addr) = result.context("failed to accept connection")?;
+                let guard = acquire_connection(&limiter, &stream, remote_addr).await;
                 dispatch_main_connection(
                     stream, remote_addr, &tls_mode, tls_listener.is_some(),
-                    redirect_http, conn, &router,
+                    redirect_http, conn, &router, guard,
                 );
             }
 
@@ -254,7 +282,8 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
                 tls_listener.as_ref().expect("guarded by is_some").accept().await
             }, if tls_listener.is_some() => {
                 let (stream, remote_addr) = result.context("failed to accept TLS connection")?;
-                dispatch_tls_connection(stream, remote_addr, &tls_mode, conn, &router);
+                let guard = acquire_connection(&limiter, &stream, remote_addr).await;
+                dispatch_tls_connection(stream, remote_addr, &tls_mode, conn, &router, guard);
             }
 
             () = &mut shutdown => {
@@ -273,6 +302,29 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Try to acquire a connection slot. On rejection, send a raw 503 and return `None`.
+async fn acquire_connection(
+    limiter: &Option<Arc<rate_limit::Limiter>>,
+    stream: &TcpStream,
+    remote_addr: SocketAddr,
+) -> Option<rate_limit::ConnectionGuard> {
+    let Some(ref l) = limiter else {
+        return None;
+    };
+    match l.try_acquire_connection(remote_addr.ip()) {
+        Some(guard) => Some(guard),
+        None => {
+            tracing::debug!(%remote_addr, "connection rejected (limit reached)");
+            // Best-effort raw HTTP response — the TLS handshake hasn't happened yet
+            // for TLS connections, so this only works for plain HTTP.
+            let _ = stream.try_write(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            None
+        }
+    }
+}
+
 /// Dispatch a connection from the main listener.
 fn dispatch_main_connection(
     stream: TcpStream,
@@ -282,6 +334,7 @@ fn dispatch_main_connection(
     redirect_http: bool,
     conn: ConnSettings,
     router: &Arc<Router>,
+    guard: Option<rate_limit::ConnectionGuard>,
 ) {
     if has_tls_listener && redirect_http {
         tokio::spawn(serve_http_redirect(stream, remote_addr, conn));
@@ -293,6 +346,7 @@ fn dispatch_main_connection(
             let acceptor = acceptor.clone();
             let router = Arc::clone(router);
             tokio::spawn(async move {
+                let _guard = guard; // held until connection closes
                 serve_manual_tls(stream, acceptor, router, remote_addr, conn).await;
             });
         }
@@ -304,12 +358,14 @@ fn dispatch_main_connection(
             let default = Arc::clone(default_config);
             let router = Arc::clone(router);
             tokio::spawn(async move {
+                let _guard = guard;
                 serve_acme_tls(stream, challenge, default, router, remote_addr, conn).await;
             });
         }
         TlsMode::None => {
             let router = Arc::clone(router);
             tokio::spawn(async move {
+                let _guard = guard;
                 serve_connection(TokioIo::new(stream), router, remote_addr, false, conn).await;
             });
         }
@@ -323,12 +379,14 @@ fn dispatch_tls_connection(
     tls_mode: &TlsMode,
     conn: ConnSettings,
     router: &Arc<Router>,
+    guard: Option<rate_limit::ConnectionGuard>,
 ) {
     match tls_mode {
         TlsMode::Manual(acceptor) => {
             let acceptor = acceptor.clone();
             let router = Arc::clone(router);
             tokio::spawn(async move {
+                let _guard = guard;
                 serve_manual_tls(stream, acceptor, router, remote_addr, conn).await;
             });
         }
@@ -340,6 +398,7 @@ fn dispatch_tls_connection(
             let default = Arc::clone(default_config);
             let router = Arc::clone(router);
             tokio::spawn(async move {
+                let _guard = guard;
                 serve_acme_tls(stream, challenge, default, router, remote_addr, conn).await;
             });
         }
@@ -488,7 +547,7 @@ async fn serve_http_redirect(stream: TcpStream, remote_addr: SocketAddr, setting
                 Response::builder()
                     .status(StatusCode::MOVED_PERMANENTLY)
                     .header("location", location)
-                    .body(Full::new(Bytes::from("Redirecting to HTTPS\n")))
+                    .body(body::buffered(Full::new(Bytes::from("Redirecting to HTTPS\n"))))
                     .expect("valid redirect response"),
             )
         }

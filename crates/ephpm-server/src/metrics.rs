@@ -104,11 +104,11 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
 ///
 /// Panics if the HTTP response builder fails (should never happen with static headers).
 #[must_use]
-pub fn render(handle: &PrometheusHandle) -> Response<Full<Bytes>> {
+pub fn render(handle: &PrometheusHandle) -> Response<crate::body::ServerBody> {
     let body = handle.render();
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-        .body(Full::new(Bytes::from(body)))
+        .body(crate::body::buffered(Full::new(Bytes::from(body))))
         .expect("static metrics response builder is always valid")
 }

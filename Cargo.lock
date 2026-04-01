@@ -1035,6 +1035,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
+ "dashmap",
  "ephpm-cluster",
  "ephpm-config",
  "ephpm-db",
@@ -1060,6 +1062,7 @@ dependencies = [
  "tokio",
  "tokio-rustls 0.26.4",
  "tokio-stream",
+ "tokio-util",
  "tracing",
 ]
 

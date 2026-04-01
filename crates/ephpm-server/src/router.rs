@@ -195,6 +195,7 @@ impl Router {
             php_etag_cache_config: config.server.php_etag_cache.clone(),
             metrics_handle,
             metrics_path: config.server.metrics.path.clone(),
+            limiter,
         }
     }
 

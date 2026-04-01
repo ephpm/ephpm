@@ -35,6 +35,9 @@ rustls-acme.workspace = true
 tokio-stream.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
+dashmap.workspace = true
+tokio-util.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

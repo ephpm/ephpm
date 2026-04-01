@@ -9,10 +9,12 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Response, StatusCode};
 
+use crate::body::{self, ServerBody};
+
 /// Serve a static file from the document root.
 ///
 /// Returns a 404 response if the file doesn't exist or is outside the document root.
-pub async fn serve(document_root: &Path, url_path: &str) -> Response<Full<Bytes>> {
+pub async fn serve(document_root: &Path, url_path: &str) -> Response<ServerBody> {
     let relative = url_path.trim_start_matches('/');
     let file_path = document_root.join(relative);
 
@@ -44,7 +46,7 @@ pub async fn serve(document_root: &Path, url_path: &str) -> Response<Full<Bytes>
         .status(StatusCode::OK)
         .header("Content-Type", mime)
         .header("Content-Length", content.len())
-        .body(Full::new(Bytes::from(content)))
+        .body(body::buffered(Full::new(Bytes::from(content))))
         .unwrap_or_else(|_| internal_error())
 }
 
@@ -64,7 +66,7 @@ pub async fn serve_file(
     compression: crate::router::CompressionSettings,
     etag: bool,
     if_none_match: Option<&str>,
-) -> Response<Full<Bytes>> {
+) -> Response<ServerBody> {
     // Security: ensure the resolved path is within the document root
     let Ok(canonical_root) = document_root.canonicalize() else {
         return not_found();
@@ -98,7 +100,7 @@ pub async fn serve_file(
                 builder = builder.header("Cache-Control", cache_control);
             }
             return builder
-                .body(Full::new(Bytes::new()))
+                .body(body::buffered(Full::new(Bytes::new())))
                 .unwrap_or_else(|_| internal_error());
         }
     }
@@ -118,7 +120,7 @@ pub async fn serve_file(
                 builder = builder.header("ETag", tag.as_str());
             }
             return builder
-                .body(Full::new(Bytes::from(compressed)))
+                .body(body::buffered(Full::new(Bytes::from(compressed))))
                 .unwrap_or_else(|_| internal_error());
         }
     }
@@ -134,7 +136,7 @@ pub async fn serve_file(
         builder = builder.header("ETag", tag.as_str());
     }
     builder
-        .body(Full::new(Bytes::from(content)))
+        .body(body::buffered(Full::new(Bytes::from(content))))
         .unwrap_or_else(|_| internal_error())
 }
 
@@ -156,26 +158,26 @@ fn etag_matches(etag: &str, if_none_match: &str) -> bool {
     trimmed.split(',').any(|tag| tag.trim() == etag)
 }
 
-fn not_found() -> Response<Full<Bytes>> {
+fn not_found() -> Response<ServerBody> {
     Response::builder()
         .status(StatusCode::NOT_FOUND)
         .header("Content-Type", "text/plain")
-        .body(Full::new(Bytes::from("404 Not Found")))
+        .body(body::buffered(Full::new(Bytes::from("404 Not Found"))))
         .unwrap()
 }
 
-fn forbidden() -> Response<Full<Bytes>> {
+fn forbidden() -> Response<ServerBody> {
     Response::builder()
         .status(StatusCode::FORBIDDEN)
         .header("Content-Type", "text/plain")
-        .body(Full::new(Bytes::from("403 Forbidden")))
+        .body(body::buffered(Full::new(Bytes::from("403 Forbidden"))))
         .unwrap()
 }
 
-fn internal_error() -> Response<Full<Bytes>> {
+fn internal_error() -> Response<ServerBody> {
     Response::builder()
         .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .body(Full::new(Bytes::from("Internal Server Error")))
+        .body(body::buffered(Full::new(Bytes::from("Internal Server Error"))))
         .unwrap()
 }
 
@@ -187,8 +189,8 @@ mod tests {
 
     use super::*;
 
-    /// Collect a `Full<Bytes>` body into a `Vec<u8>`.
-    async fn body_bytes(resp: Response<Full<Bytes>>) -> Vec<u8> {
+    /// Collect a response body into a `Vec<u8>`.
+    async fn body_bytes(resp: Response<ServerBody>) -> Vec<u8> {
         resp.into_body().collect().await.unwrap().to_bytes().to_vec()
     }
 
