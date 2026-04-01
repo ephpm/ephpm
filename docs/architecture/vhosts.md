@@ -169,6 +169,72 @@ Virtual hosts work with clustered SQLite, but each site spawns its own sqld chil
 
 Beyond 3-5 clustered vhosts, an external MySQL server with ePHPm's connection-pooling DB proxy is more resource-efficient than per-site sqld processes.
 
+## KV Store Isolation
+
+In multi-tenant mode, each virtual host gets its own KV namespace automatically. PHP applications don't need any code changes — the isolation is transparent.
+
+### How It Works
+
+When a PHP request executes, ephpm sets a thread-local namespace prefix based on the `Host` header. Every `ephpm_kv_*` SAPI function call automatically prepends the hostname to the key:
+
+```php
+// PHP on alice-blog.com:
+ephpm_kv_set("cache:page:home", $html);
+// Stored as: "alice-blog.com:cache:page:home"
+
+// PHP on bobs-recipes.com:
+ephpm_kv_get("cache:page:home");
+// Looks up: "bobs-recipes.com:cache:page:home" → not found (isolated)
+```
+
+Both sites can use identical key names without conflict. The namespace is invisible to the PHP application — it sees only its own keys.
+
+### Single-Site Mode
+
+When `sites_dir` is not configured (single-site mode), the namespace is empty and no prefix is applied. Zero overhead — keys are stored exactly as PHP provides them.
+
+### RESP Protocol (Redis-Compatible) Security
+
+The RESP protocol listener (`[kv.redis_compat]`) provides raw, unnamespaced access to the entire KV store. In multi-tenant deployments:
+
+- **RESP is disabled by default** (`enabled = false`)
+- If enabled, it is for **admin/debugging use only** — not for tenant PHP applications
+- Any client connecting to the RESP port can read and write keys from all virtual hosts
+- PHP applications should use `ephpm_kv_*` SAPI functions instead, which are namespaced automatically
+
+```toml
+# Multi-tenant: keep RESP disabled (default)
+[kv.redis_compat]
+enabled = false
+
+# Single-site: RESP is safe to enable
+[kv.redis_compat]
+enabled = true
+listen = "127.0.0.1:6379"
+```
+
+### Architecture
+
+```
+PHP (alice-blog.com)                        PHP (bobs-recipes.com)
+  │                                           │
+  ├─ ephpm_kv_set("key", "val")               ├─ ephpm_kv_set("key", "val")
+  │                                           │
+  ▼                                           ▼
+SAPI bridge                                 SAPI bridge
+  ├─ namespace = "alice-blog.com"             ├─ namespace = "bobs-recipes.com"
+  ├─ store.set("alice-blog.com:key", "val")   ├─ store.set("bobs-recipes.com:key", "val")
+  │                                           │
+  └───────────────┬───────────────────────────┘
+                  │
+                  ▼
+           DashMap (shared)
+           ┌─────────────────────────────────┐
+           │ "alice-blog.com:key" → "val"    │
+           │ "bobs-recipes.com:key" → "val"  │
+           └─────────────────────────────────┘
+```
+
 ## Fallback Site as Marketing Funnel
 
 The fallback `document_root` serves requests for any domain not matched by `sites_dir`. This is useful for hosting businesses:

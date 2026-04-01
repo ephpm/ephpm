@@ -23,6 +23,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::{Request, Response, StatusCode};
 use ipnet::IpNet;
 
+use crate::body::{self, ServerBody};
 use crate::{metrics, static_files};
 
 #[allow(unused_imports)]
@@ -78,6 +79,7 @@ pub struct Router {
     php_etag_cache_config: ephpm_config::PhpETagCacheConfig,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     metrics_path: String,
+    limiter: Option<Arc<crate::rate_limit::Limiter>>,
 }
 
 /// Scan `sites_dir` for virtual host subdirectories.
@@ -137,6 +139,7 @@ impl Router {
         config: &Config,
         store: Arc<Store>,
         metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+        limiter: Option<Arc<crate::rate_limit::Limiter>>,
     ) -> Self {
         let port =
             config.server.listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(8080);
@@ -252,7 +255,7 @@ impl Router {
         req: Request<Incoming>,
         remote_addr: SocketAddr,
         is_tls: bool,
-    ) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    ) -> Result<Response<ServerBody>, hyper::Error> {
         let method = req.method().as_str().to_ascii_uppercase();
         gauge!("ephpm_http_requests_in_flight").increment(1.0);
         let start = std::time::Instant::now();
@@ -299,7 +302,7 @@ impl Router {
         req: Request<Incoming>,
         remote_addr: SocketAddr,
         is_tls: bool,
-    ) -> Result<(Response<Full<Bytes>>, &'static str), hyper::Error> {
+    ) -> Result<(Response<ServerBody>, &'static str), hyper::Error> {
         // Validate Host header against trusted hosts list.
         if let Some(resp) = self.check_trusted_host(&req) {
             return Ok((resp, "error"));
@@ -364,7 +367,7 @@ impl Router {
                                         return Ok((Response::builder()
                                             .status(StatusCode::NOT_MODIFIED)
                                             .header("etag", stored_etag.as_ref())
-                                            .body(Full::new(Bytes::new()))
+                                            .body(body::buffered(Full::new(Bytes::new())))
                                             .expect("304 builder"), "php"));
                                     }
                                 }
@@ -494,7 +497,7 @@ impl Router {
         script_filename: PathBuf,
         accepts_gzip: bool,
         document_root: PathBuf,
-    ) -> Response<Full<Bytes>> {
+    ) -> Response<ServerBody> {
         let method = req.method().to_string();
         let uri = req.uri().to_string();
         let path = req.uri().path().to_string();
@@ -522,6 +525,8 @@ impl Router {
 
         let php_start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
+            // Scope KV keys to this virtual host for multi-tenant isolation.
+            ephpm_php::kv_bridge::set_namespace(&server_name);
             PhpRuntime::execute(PhpRequest {
                 method, uri, path, query_string, script_filename,
                 document_root, headers, body, content_type, remote_addr,
@@ -542,7 +547,7 @@ impl Router {
     }
 
     /// Return 413 if Content-Length exceeds the limit.
-    fn check_body_size(&self, req: &Request<Incoming>) -> Option<Response<Full<Bytes>>> {
+    fn check_body_size(&self, req: &Request<Incoming>) -> Option<Response<ServerBody>> {
         if self.max_body_size == 0 {
             return None;
         }
@@ -558,7 +563,7 @@ impl Router {
     }
 
     /// Block requests for hidden files (dot-prefixed path segments).
-    fn check_hidden_file(&self, uri_path: &str) -> Option<Response<Full<Bytes>>> {
+    fn check_hidden_file(&self, uri_path: &str) -> Option<Response<ServerBody>> {
         if self.hidden_files == "allow" {
             return None;
         }
@@ -618,7 +623,7 @@ impl Router {
     /// Validate the `Host` header against the trusted hosts list.
     ///
     /// Returns a 421 Misdirected Request if the host is not trusted.
-    fn check_trusted_host(&self, req: &Request<Incoming>) -> Option<Response<Full<Bytes>>> {
+    fn check_trusted_host(&self, req: &Request<Incoming>) -> Option<Response<ServerBody>> {
         if self.trusted_hosts.is_empty() {
             return None;
         }
@@ -644,7 +649,7 @@ impl Router {
     }
 
     /// Apply custom response headers from config.
-    fn apply_response_headers(&self, response: &mut Response<Full<Bytes>>) {
+    fn apply_response_headers(&self, response: &mut Response<ServerBody>) {
         let headers = response.headers_mut();
         for (name, value) in &self.response_headers {
             if let (Ok(name), Ok(value)) = (
@@ -765,11 +770,11 @@ fn extract_server_name(req: &Request<Incoming>) -> String {
 }
 
 /// Build a simple error response with a text body.
-fn error_response(status: StatusCode, body: &str) -> Response<Full<Bytes>> {
+fn error_response(status: StatusCode, body: &str) -> Response<ServerBody> {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(body::buffered(Full::new(Bytes::from(body.to_string()))))
         .expect("static error response")
 }
 
@@ -778,7 +783,7 @@ fn build_php_response(
     result: Result<Result<ephpm_php::response::PhpResponse, ephpm_php::PhpError>, tokio::task::JoinError>,
     accepts_gzip: bool,
     compression: CompressionSettings,
-) -> Response<Full<Bytes>> {
+) -> Response<ServerBody> {
     match result {
         Ok(Ok(php_response)) => {
             let status = StatusCode::from_u16(php_response.status).unwrap_or(StatusCode::OK);
@@ -816,7 +821,7 @@ fn build_php_response(
             }
             resp = resp.header("content-length", body_bytes.len());
 
-            resp.body(Full::new(Bytes::from(body_bytes))).unwrap_or_else(|_| {
+            resp.body(body::buffered(Full::new(Bytes::from(body_bytes)))).unwrap_or_else(|_| {
                 error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
             })
         }
@@ -1587,7 +1592,7 @@ mod tests {
         use super::*;
 
         /// Helper to read response body bytes
-        async fn body_bytes(resp: Response<Full<Bytes>>) -> Vec<u8> {
+        async fn body_bytes(resp: Response<ServerBody>) -> Vec<u8> {
             resp.into_body().collect().await.unwrap().to_bytes().to_vec()
         }
 

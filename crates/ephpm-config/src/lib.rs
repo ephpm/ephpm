@@ -96,6 +96,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub metrics: MetricsConfig,
 
+    /// Rate limiting and connection limiting.
+    #[serde(default)]
+    pub limits: LimitsConfig,
+
     /// TLS configuration. When present, enables HTTPS.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -353,6 +357,52 @@ impl Default for MetricsConfig {
 
 fn default_metrics_path() -> String {
     "/metrics".to_string()
+}
+
+/// Rate limiting and connection limiting (`[server.limits]`).
+#[derive(Debug, Deserialize)]
+pub struct LimitsConfig {
+    /// Maximum total concurrent connections. New connections are rejected
+    /// with 503 when at capacity. `0` means unlimited.
+    ///
+    /// Default: `0` (unlimited).
+    #[serde(default)]
+    pub max_connections: usize,
+
+    /// Maximum concurrent connections per client IP. `0` means unlimited.
+    ///
+    /// Default: `0` (unlimited).
+    #[serde(default)]
+    pub per_ip_max_connections: usize,
+
+    /// Maximum requests per second per client IP (token bucket rate).
+    /// `0` means unlimited.
+    ///
+    /// Default: `0.0` (unlimited).
+    #[serde(default)]
+    pub per_ip_rate: f64,
+
+    /// Burst size for per-IP rate limiting. Allows this many requests
+    /// to be made instantly before the rate limit kicks in.
+    ///
+    /// Default: `50`.
+    #[serde(default = "default_per_ip_burst")]
+    pub per_ip_burst: u32,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_connections: 0,
+            per_ip_max_connections: 0,
+            per_ip_rate: 0.0,
+            per_ip_burst: default_per_ip_burst(),
+        }
+    }
+}
+
+fn default_per_ip_burst() -> u32 {
+    50
 }
 
 /// TLS configuration (`[server.tls]`).
@@ -838,10 +888,18 @@ impl Default for KvConfig {
 }
 
 /// RESP protocol listener configuration (`[kv.redis_compat]`).
+///
+/// **Security note for virtual hosting:** The RESP endpoint provides raw
+/// access to the entire KV store — there is no per-tenant namespace
+/// filtering. In multi-tenant (`sites_dir`) deployments, disable RESP
+/// or restrict access to admin use only. PHP applications should use the
+/// `ephpm_kv_*` SAPI functions instead, which are automatically namespaced
+/// per virtual host.
 #[derive(Debug, Deserialize)]
 pub struct KvRedisCompatConfig {
     /// Enable the RESP protocol listener. When `false`, the KV store is
-    /// only accessible via the internal API.
+    /// only accessible via the `ephpm_kv_*` PHP functions (recommended
+    /// for multi-tenant deployments).
     ///
     /// Default: `false`.
     #[serde(default)]
@@ -955,6 +1013,7 @@ impl Default for ServerConfig {
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
+            limits: LimitsConfig::default(),
             tls: None,
         }
     }

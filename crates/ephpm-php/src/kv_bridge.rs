@@ -29,6 +29,38 @@ static KV_STORE: OnceLock<Arc<Store>> = OnceLock::new();
 #[cfg(php_linked)]
 thread_local! {
     static KV_GET_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    /// Per-request KV namespace prefix (hostname for vhost isolation).
+    /// When set, all keys are prefixed with `"{namespace}:"`.
+    static KV_NAMESPACE: RefCell<String> = RefCell::new(String::new());
+}
+
+/// Set the KV namespace for the current thread/request.
+///
+/// Called by the request handler before PHP execution to scope
+/// KV keys to the current virtual host. An empty string means no
+/// namespacing (single-site mode).
+#[cfg(php_linked)]
+pub fn set_namespace(namespace: &str) {
+    KV_NAMESPACE.with(|ns| {
+        *ns.borrow_mut() = namespace.to_string();
+    });
+}
+
+/// Stub when PHP is not linked.
+#[cfg(not(php_linked))]
+pub fn set_namespace(_namespace: &str) {}
+
+/// Prepend the current namespace to a key, if set.
+#[cfg(php_linked)]
+fn namespaced_key(key: &str) -> String {
+    KV_NAMESPACE.with(|ns| {
+        let ns = ns.borrow();
+        if ns.is_empty() {
+            key.to_string()
+        } else {
+            format!("{ns}:{key}")
+        }
+    })
 }
 
 // ── C-compatible ops struct ─────────────────────────────────────────────
@@ -106,12 +138,13 @@ unsafe extern "C" fn kv_get(key: *const std::os::raw::c_char) -> std::os::raw::c
     let Ok(key_str) = key_str.to_str() else {
         return 0;
     };
+    let key_str = namespaced_key(key_str);
 
     let Some(store) = KV_STORE.get() else {
         return 0;
     };
 
-    match store.get(key_str) {
+    match store.get(&key_str) {
         Some(val) => {
             KV_GET_BUF.with(|buf| {
                 let mut buf = buf.borrow_mut();
@@ -155,6 +188,7 @@ unsafe extern "C" fn kv_set(
     let Ok(key_str) = key_str.to_str() else {
         return 0;
     };
+    let key_str = namespaced_key(key_str);
     // Safety: `val` points to `val_len` bytes of valid memory from PHP.
     let val_bytes = unsafe { std::slice::from_raw_parts(val.cast::<u8>(), val_len) };
 
@@ -169,7 +203,7 @@ unsafe extern "C" fn kv_set(
         None
     };
 
-    i32::from(store.set(key_str.to_string(), val_bytes.to_vec(), ttl))
+    i32::from(store.set(key_str, val_bytes.to_vec(), ttl))
 }
 
 #[cfg(php_linked)]
@@ -179,12 +213,13 @@ unsafe extern "C" fn kv_del(key: *const std::os::raw::c_char) -> std::os::raw::c
     let Ok(key_str) = key_str.to_str() else {
         return 0;
     };
+    let key_str = namespaced_key(key_str);
 
     let Some(store) = KV_STORE.get() else {
         return 0;
     };
 
-    std::os::raw::c_long::from(store.remove(key_str))
+    std::os::raw::c_long::from(store.remove(&key_str))
 }
 
 #[cfg(php_linked)]
@@ -194,12 +229,13 @@ unsafe extern "C" fn kv_exists(key: *const std::os::raw::c_char) -> std::os::raw
     let Ok(key_str) = key_str.to_str() else {
         return 0;
     };
+    let key_str = namespaced_key(key_str);
 
     let Some(store) = KV_STORE.get() else {
         return 0;
     };
 
-    i32::from(store.exists(key_str))
+    i32::from(store.exists(&key_str))
 }
 
 #[cfg(php_linked)]
@@ -214,12 +250,13 @@ unsafe extern "C" fn kv_incr_by(
     let Ok(key_str) = key_str.to_str() else {
         return 0;
     };
+    let key_str = namespaced_key(key_str);
 
     let Some(store) = KV_STORE.get() else {
         return 0;
     };
 
-    match store.incr_by(key_str, delta) {
+    match store.incr_by(&key_str, delta) {
         Ok(val) => {
             // Safety: `result` points to a valid `long long` in our C code.
             unsafe { *result = val };
@@ -239,6 +276,7 @@ unsafe extern "C" fn kv_expire(
     let Ok(key_str) = key_str.to_str() else {
         return 0;
     };
+    let key_str = namespaced_key(key_str);
 
     let Some(store) = KV_STORE.get() else {
         return 0;
@@ -250,7 +288,7 @@ unsafe extern "C" fn kv_expire(
 
     #[allow(clippy::cast_sign_loss)]
     let ttl = Duration::from_millis(ttl_ms as u64);
-    i32::from(store.expire(key_str, ttl))
+    i32::from(store.expire(&key_str, ttl))
 }
 
 #[cfg(php_linked)]
@@ -262,12 +300,13 @@ unsafe extern "C" fn kv_pttl(
     let Ok(key_str) = key_str.to_str() else {
         return -2;
     };
+    let key_str = namespaced_key(key_str);
 
     let Some(store) = KV_STORE.get() else {
         return -2;
     };
 
-    match store.pttl(key_str) {
+    match store.pttl(&key_str) {
         Some(ms) => ms,
         None => -2, // key does not exist
     }
