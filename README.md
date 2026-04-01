@@ -12,6 +12,8 @@ An all-in-one PHP application server written in Rust. Embeds PHP via FFI into a 
 | Binary | Single static binary | Caddy module | Go binary + PHP workers | PHP + extension | Apache + modules | Nginx + separate FPM |
 | Embedded DB | SQLite via [litewire](#database-three-options-zero-code-changes) | No | No | No | No | No |
 | Built-in KV store | Yes (RESP compatible, in-process) | No | No | No | No | No |
+| Query stats (Prometheus) | Built-in | No | No | No | No | No |
+| Auto TLS (ACME) | Built-in | Via Caddy | No | No | No | No |
 | Clustering | Gossip (SWIM) | No | No | Built-in | No | No |
 | Virtual hosts | Built-in ([directory-based](#virtual-hosts-multi-tenant-hosting)) | Via Caddy | No | No | `<VirtualHost>` | `server` blocks |
 | PHP compatibility | Drop-in (embed SAPI) | Drop-in (worker SAPI) | Requires PSR-7 packages | Requires async code | Native (100%) | Native (100%) |
