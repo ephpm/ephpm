@@ -100,6 +100,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub limits: LimitsConfig,
 
+    /// Open file cache for static file serving.
+    #[serde(default)]
+    pub file_cache: FileCacheConfig,
+
     /// TLS configuration. When present, enables HTTPS.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -360,7 +364,7 @@ fn default_metrics_path() -> String {
 }
 
 /// Rate limiting and connection limiting (`[server.limits]`).
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct LimitsConfig {
     /// Maximum total concurrent connections. New connections are rejected
     /// with 503 when at capacity. `0` means unlimited.
@@ -403,6 +407,87 @@ impl Default for LimitsConfig {
 
 fn default_per_ip_burst() -> u32 {
     50
+}
+
+/// Open file cache configuration (`[server.file_cache]`).
+///
+/// Caches file metadata (size, mtime, MIME type, `ETag`) and optionally
+/// small file content in memory. Avoids repeated filesystem `stat` and
+/// `read` calls for frequently accessed static files.
+#[derive(Clone, Debug, Deserialize)]
+pub struct FileCacheConfig {
+    /// Enable the open file cache.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Maximum number of cached entries. Oldest entries are evicted
+    /// when this limit is reached.
+    ///
+    /// Default: `10000`.
+    #[serde(default = "default_file_cache_max_entries")]
+    pub max_entries: usize,
+
+    /// Re-stat interval in seconds. Cached entries are re-validated
+    /// against the filesystem at most this often.
+    ///
+    /// Default: `30`.
+    #[serde(default = "default_file_cache_valid_secs")]
+    pub valid_secs: u64,
+
+    /// Evict entries not accessed within this many seconds.
+    ///
+    /// Default: `60`.
+    #[serde(default = "default_file_cache_inactive_secs")]
+    pub inactive_secs: u64,
+
+    /// Cache file content below this size in bytes. Larger files
+    /// only have metadata cached (size, mtime, ETag, MIME type).
+    ///
+    /// Default: `1048576` (1 MiB).
+    #[serde(default = "default_file_cache_inline_threshold")]
+    pub inline_threshold: usize,
+
+    /// Pre-compute and cache gzip-compressed variants for small
+    /// compressible files.
+    ///
+    /// Default: `true`.
+    #[serde(default = "default_file_cache_precompress")]
+    pub precompress: bool,
+}
+
+impl Default for FileCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_entries: default_file_cache_max_entries(),
+            valid_secs: default_file_cache_valid_secs(),
+            inactive_secs: default_file_cache_inactive_secs(),
+            inline_threshold: default_file_cache_inline_threshold(),
+            precompress: default_file_cache_precompress(),
+        }
+    }
+}
+
+fn default_file_cache_max_entries() -> usize {
+    10_000
+}
+
+fn default_file_cache_valid_secs() -> u64 {
+    30
+}
+
+fn default_file_cache_inactive_secs() -> u64 {
+    60
+}
+
+fn default_file_cache_inline_threshold() -> usize {
+    1_048_576
+}
+
+fn default_file_cache_precompress() -> bool {
+    true
 }
 
 /// TLS configuration (`[server.tls]`).
@@ -1014,6 +1099,7 @@ impl Default for ServerConfig {
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
             limits: LimitsConfig::default(),
+            file_cache: FileCacheConfig::default(),
             tls: None,
         }
     }

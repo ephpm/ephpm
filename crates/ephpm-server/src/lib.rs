@@ -1,5 +1,6 @@
 pub mod acme;
 pub mod body;
+pub mod file_cache;
 pub mod metrics;
 pub mod rate_limit;
 pub mod router;
@@ -106,6 +107,7 @@ struct Listeners {
     idle_timeout: Duration,
     router: Arc<Router>,
     limiter: Option<Arc<rate_limit::Limiter>>,
+    file_cache: Option<Arc<file_cache::FileCache>>,
 }
 
 /// Connection-level settings passed into spawned tasks.
@@ -138,7 +140,16 @@ async fn bind_listeners(
         max_header_size: config.server.request.max_header_size,
     };
     let idle_timeout = Duration::from_secs(config.server.timeouts.idle);
-    let router = Arc::new(Router::new(config, kv_store, metrics_handle));
+    let file_cache = if config.server.file_cache.enabled {
+        tracing::info!(
+            max_entries = config.server.file_cache.max_entries,
+            "open file cache enabled"
+        );
+        Some(Arc::new(file_cache::FileCache::new(&config.server.file_cache)))
+    } else {
+        None
+    };
+    let router = Arc::new(Router::new(config, kv_store, metrics_handle, limiter.clone(), file_cache.clone()));
 
     // Determine TLS mode.
     let tls_mode = match config.server.tls.as_ref() {
@@ -236,6 +247,7 @@ async fn bind_listeners(
         idle_timeout,
         router,
         limiter,
+        file_cache,
     })
 }
 
@@ -250,6 +262,7 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         idle_timeout,
         router,
         limiter,
+        file_cache,
     } = listeners;
 
     // Spawn background cleanup task for rate limiter state.
@@ -260,6 +273,18 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
             loop {
                 interval.tick().await;
                 l.cleanup_stale();
+            }
+        });
+    }
+
+    // Spawn background eviction task for file cache.
+    if let Some(ref fc) = file_cache {
+        let fc = Arc::clone(fc);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                fc.evict_inactive();
             }
         });
     }
@@ -308,7 +333,7 @@ async fn acquire_connection(
     stream: &TcpStream,
     remote_addr: SocketAddr,
 ) -> Option<rate_limit::ConnectionGuard> {
-    let Some(ref l) = limiter else {
+    let Some(l) = limiter else {
         return None;
     };
     match l.try_acquire_connection(remote_addr.ip()) {

@@ -80,6 +80,7 @@ pub struct Router {
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     metrics_path: String,
     limiter: Option<Arc<crate::rate_limit::Limiter>>,
+    file_cache: Option<Arc<crate::file_cache::FileCache>>,
 }
 
 /// Scan `sites_dir` for virtual host subdirectories.
@@ -140,6 +141,7 @@ impl Router {
         store: Arc<Store>,
         metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
         limiter: Option<Arc<crate::rate_limit::Limiter>>,
+        file_cache: Option<Arc<crate::file_cache::FileCache>>,
     ) -> Self {
         let port =
             config.server.listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(8080);
@@ -196,6 +198,7 @@ impl Router {
             metrics_handle,
             metrics_path: config.server.metrics.path.clone(),
             limiter,
+            file_cache,
         }
     }
 
@@ -258,6 +261,19 @@ impl Router {
         is_tls: bool,
     ) -> Result<Response<ServerBody>, hyper::Error> {
         let method = req.method().as_str().to_ascii_uppercase();
+
+        // Per-IP rate limiting (uses effective IP after proxy resolution).
+        if let Some(ref limiter) = self.limiter {
+            let (effective_addr, _) = self.resolve_proxy_info(&req, remote_addr, is_tls);
+            if !limiter.check_rate(effective_addr.ip()) {
+                counter!("ephpm_rate_limited_total").increment(1);
+                return Ok(error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "429 Too Many Requests",
+                ));
+            }
+        }
+
         gauge!("ephpm_http_requests_in_flight").increment(1.0);
         let start = std::time::Instant::now();
 
@@ -406,6 +422,7 @@ impl Router {
                         self.compression,
                         self.etag,
                         if_none_match.as_deref(),
+                        self.file_cache.as_deref(),
                     )
                     .await, "static")
                 }
@@ -943,7 +960,7 @@ mod tests {
             kv: Default::default(),
             cluster: Default::default(),
         };
-        Router::new(&config, test_store(), None)
+        Router::new(&config, test_store(), None, None, None)
     }
 
     fn test_router_with_404(dir: &Path) -> Router {
@@ -960,7 +977,7 @@ mod tests {
             kv: Default::default(),
             cluster: Default::default(),
         };
-        Router::new(&config, test_store(), None)
+        Router::new(&config, test_store(), None, None, None)
     }
 
     #[allow(dead_code)]
@@ -983,7 +1000,7 @@ mod tests {
             cluster: Default::default(),
         };
         config.server.static_files.etag = true;
-        Router::new(&config, store, None)
+        Router::new(&config, store, None, None, None)
     }
 
     fn default_compression() -> CompressionSettings {
@@ -1173,7 +1190,7 @@ mod tests {
             cluster: Default::default(),
         };
         config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
 
         // 203.0.113.50 is the real client, 10.0.0.1 is the proxy
         let xff = "203.0.113.50, 10.0.0.1";
@@ -1195,7 +1212,7 @@ mod tests {
             cluster: Default::default(),
         };
         config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
 
         let xff = "10.0.0.2, 10.0.0.1";
         let ip = router.resolve_xff(xff);
@@ -1218,7 +1235,7 @@ mod tests {
             kv: Default::default(),
             cluster: Default::default(),
         };
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
         assert_eq!(router.server_port, 3000);
     }
 
@@ -1236,7 +1253,7 @@ mod tests {
             kv: Default::default(),
             cluster: Default::default(),
         };
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
         assert_eq!(router.server_port, 8080);
     }
 
@@ -1279,7 +1296,7 @@ mod tests {
             kv: Default::default(),
             cluster: Default::default(),
         };
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
         assert!(router.is_php_allowed("/anything.php"));
     }
 
@@ -1300,7 +1317,7 @@ mod tests {
             "/index.php".to_string(),
             "/wp-login.php".to_string(),
         ];
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
         assert!(router.is_php_allowed("/index.php"));
         assert!(router.is_php_allowed("/wp-login.php"));
         assert!(!router.is_php_allowed("/evil.php"));
@@ -1323,7 +1340,7 @@ mod tests {
             "/index.php".to_string(),
             "/wp-admin/*.php".to_string(),
         ];
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
         assert!(router.is_php_allowed("/index.php"));
         assert!(router.is_php_allowed("/wp-admin/admin.php"));
         assert!(router.is_php_allowed("/wp-admin/options.php"));
@@ -1556,7 +1573,7 @@ mod tests {
             kv: Default::default(),
             cluster: Default::default(),
         };
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
         assert_eq!(router.server_port, 9090);
     }
 
@@ -1771,7 +1788,7 @@ echo "post response";
             kv: Default::default(),
             cluster: Default::default(),
         };
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("example.com");
         assert_eq!(doc_root, site_dir);
@@ -1795,7 +1812,7 @@ echo "post response";
             kv: Default::default(),
             cluster: Default::default(),
         };
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("unknown.com");
         assert_eq!(doc_root, dir.path());
@@ -1820,7 +1837,7 @@ echo "post response";
             kv: Default::default(),
             cluster: Default::default(),
         };
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("example.com:8080");
         assert_eq!(doc_root, site_dir);
@@ -1845,7 +1862,7 @@ echo "post response";
             kv: Default::default(),
             cluster: Default::default(),
         };
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("Example.COM");
         assert_eq!(doc_root, site_dir);
@@ -1867,7 +1884,7 @@ echo "post response";
             kv: Default::default(),
             cluster: Default::default(),
         };
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("anything.com");
         assert_eq!(doc_root, dir.path());
@@ -1893,7 +1910,7 @@ echo "post response";
             kv: Default::default(),
             cluster: Default::default(),
         };
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
 
         let (doc_root, index_files, fallback) = router.resolve_site("myblog.com");
         let resolved = router.resolve_fallback("/", "", &doc_root, index_files, fallback);
@@ -1922,7 +1939,7 @@ echo "post response";
             kv: Default::default(),
             cluster: Default::default(),
         };
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
 
         // Host doesn't exist yet — should fall back to default.
         let (doc_root, _, _) = router.resolve_site("new-site.com");
@@ -1957,7 +1974,7 @@ echo "post response";
             kv: Default::default(),
             cluster: Default::default(),
         };
-        let router = Router::new(&config, test_store(), None);
+        let router = Router::new(&config, test_store(), None, None, None);
 
         // Site exists — should resolve.
         let (doc_root, _, _) = router.resolve_site("temp-site.com");

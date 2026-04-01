@@ -66,6 +66,7 @@ pub async fn serve_file(
     compression: crate::router::CompressionSettings,
     etag: bool,
     if_none_match: Option<&str>,
+    file_cache: Option<&crate::file_cache::FileCache>,
 ) -> Response<ServerBody> {
     // Security: ensure the resolved path is within the document root
     let Ok(canonical_root) = document_root.canonicalize() else {
@@ -82,14 +83,53 @@ pub async fn serve_file(
         return forbidden();
     }
 
-    let Ok(content) = tokio::fs::read(&canonical_file).await else {
-        return not_found();
+    // Try the file cache first.
+    if let Some(cache) = file_cache {
+        if let Some(entry) = cache.lookup(&canonical_file).await {
+            return serve_cached_entry(
+                entry, accepts_gzip, cache_control, if_none_match,
+            );
+        }
+    }
+
+    // Check file size — stream large files instead of reading into memory.
+    let metadata = match tokio::fs::metadata(&canonical_file).await {
+        Ok(m) => m,
+        Err(_) => return not_found(),
     };
 
     let mime =
         mime_guess::from_path(&canonical_file).first_raw().unwrap_or("application/octet-stream");
 
-    // Compute ETag and check If-None-Match.
+    // Stream threshold: 1 MiB. Files above this are streamed from disk.
+    const STREAM_THRESHOLD: u64 = 1_048_576;
+
+    if metadata.len() > STREAM_THRESHOLD {
+        return serve_streamed(
+            &canonical_file,
+            &metadata,
+            mime,
+            cache_control,
+            if_none_match,
+        )
+        .await;
+    }
+
+    let Ok(content) = tokio::fs::read(&canonical_file).await else {
+        return not_found();
+    };
+
+    // Insert into cache if enabled.
+    if let Some(cache) = file_cache {
+        if let Ok(mtime) = metadata.modified() {
+            let entry = cache.insert(&canonical_file, &content, mtime, mime, compression);
+            return serve_cached_entry(
+                entry, accepts_gzip, cache_control, if_none_match,
+            );
+        }
+    }
+
+    // Uncached path — compute ETag from content hash.
     let etag_value = if etag { Some(compute_etag(&content)) } else { None };
 
     if let (Some(tag), Some(client_tag)) = (&etag_value, if_none_match) {
@@ -137,6 +177,136 @@ pub async fn serve_file(
     }
     builder
         .body(body::buffered(Full::new(Bytes::from(content))))
+        .unwrap_or_else(|_| internal_error())
+}
+
+/// Serve a response from a cached file entry.
+fn serve_cached_entry(
+    entry: crate::file_cache::CacheEntry,
+    accepts_gzip: bool,
+    cache_control: &str,
+    if_none_match: Option<&str>,
+) -> Response<ServerBody> {
+    // ETag check.
+    if let Some(client_tag) = if_none_match {
+        if etag_matches(&entry.etag, client_tag) {
+            let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+            builder = builder.header("ETag", entry.etag.as_str());
+            if !cache_control.is_empty() {
+                builder = builder.header("Cache-Control", cache_control);
+            }
+            return builder
+                .body(body::buffered(Full::new(Bytes::new())))
+                .unwrap_or_else(|_| internal_error());
+        }
+    }
+
+    // Serve pre-compressed gzip variant if available.
+    if accepts_gzip {
+        if let Some(ref gzip) = entry.gzip_content {
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", entry.mime.as_str())
+                .header("Content-Length", gzip.len())
+                .header("Content-Encoding", "gzip")
+                .header("Vary", "Accept-Encoding")
+                .header("ETag", entry.etag.as_str());
+            if !cache_control.is_empty() {
+                builder = builder.header("Cache-Control", cache_control);
+            }
+            return builder
+                .body(body::buffered(Full::new(gzip.clone())))
+                .unwrap_or_else(|_| internal_error());
+        }
+    }
+
+    // Serve from cached content if inlined.
+    if let Some(ref content) = entry.content {
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", entry.mime.as_str())
+            .header("Content-Length", content.len())
+            .header("ETag", entry.etag.as_str());
+        if !cache_control.is_empty() {
+            builder = builder.header("Cache-Control", cache_control);
+        }
+        return builder
+            .body(body::buffered(Full::new(content.clone())))
+            .unwrap_or_else(|_| internal_error());
+    }
+
+    // Content not cached (large file) — return metadata-only response.
+    // Caller will need to read from disk or stream.
+    // For now, return a response with just headers — the streaming path
+    // (Phase 3b) will handle this case properly.
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", entry.mime.as_str())
+        .header("Content-Length", entry.size)
+        .header("ETag", entry.etag.as_str());
+    if !cache_control.is_empty() {
+        builder = builder.header("Cache-Control", cache_control);
+    }
+    builder
+        .body(body::buffered(Full::new(Bytes::new())))
+        .unwrap_or_else(|_| internal_error())
+}
+
+/// Serve a large file by streaming from disk.
+///
+/// Reads the file in chunks via [`body::streamed`], avoiding loading
+/// the entire file into memory. Compression is skipped for streamed
+/// files — large compressible files should use pre-compressed variants
+/// via the file cache.
+async fn serve_streamed(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    mime: &str,
+    cache_control: &str,
+    if_none_match: Option<&str>,
+) -> Response<ServerBody> {
+    let size = metadata.len();
+    let mtime = metadata.modified().ok();
+
+    // Compute metadata-based ETag.
+    let etag_value = mtime.map(|mt| {
+        let secs = mt
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        format!("W/\"{secs:x}-{size:x}\"")
+    });
+
+    // ETag check.
+    if let (Some(tag), Some(client_tag)) = (&etag_value, if_none_match) {
+        if etag_matches(tag, client_tag) {
+            let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+            builder = builder.header("ETag", tag.as_str());
+            if !cache_control.is_empty() {
+                builder = builder.header("Cache-Control", cache_control);
+            }
+            return builder
+                .body(body::buffered(Full::new(Bytes::new())))
+                .unwrap_or_else(|_| internal_error());
+        }
+    }
+
+    let Ok(file) = tokio::fs::File::open(path).await else {
+        return not_found();
+    };
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", mime)
+        .header("Content-Length", size);
+    if !cache_control.is_empty() {
+        builder = builder.header("Cache-Control", cache_control);
+    }
+    if let Some(ref tag) = etag_value {
+        builder = builder.header("ETag", tag.as_str());
+    }
+    builder
+        .body(body::streamed(file))
         .unwrap_or_else(|_| internal_error())
 }
 
