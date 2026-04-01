@@ -8,9 +8,10 @@ An all-in-one PHP application server written in Rust. Embeds PHP via FFI into a 
 |---|---|---|---|---|---|---|
 | Language | Rust | Go (CGO) | Go | PHP + C | C | C + PHP |
 | PHP FFI overhead | Zero (native C call) | ~2.2μs/req (11+ CGO crossings) | N/A (worker mode) | N/A (native) | N/A (in-process) | IPC (FastCGI) |
-| GC pauses | None | Go GC | Go GC | PHP GC | PHP GC | PHP GC |
+| Server GC pauses | None | Go GC | Go GC | None | None | None |
 | Binary | Single static binary | Caddy module | Go binary + PHP workers | PHP + extension | Apache + modules | Nginx + separate FPM |
 | Embedded DB | SQLite via [litewire](#database-three-options-zero-code-changes) | No | No | No | No | No |
+| Built-in KV store | Yes (RESP compatible, in-process) | No | No | No | No | No |
 | Clustering | Gossip (SWIM) | No | No | Built-in | No | No |
 | Virtual hosts | Built-in ([directory-based](#virtual-hosts-multi-tenant-hosting)) | Via Caddy | No | No | `<VirtualHost>` | `server` blocks |
 | PHP compatibility | Drop-in (embed SAPI) | Drop-in (worker SAPI) | Requires PSR-7 packages | Requires async code | Native (100%) | Native (100%) |
