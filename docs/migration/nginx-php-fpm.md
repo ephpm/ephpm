@@ -100,6 +100,26 @@ max_body_size = 67108864   # 64 MB
 
 PHP-FPM's process model (`pm.dynamic`, `pm.start_servers`, spare servers) doesn't apply — ePHPm uses a fixed-size thread pool that's always warm. No cold starts, no process spawning overhead.
 
+**Connection and rate limits** (Nginx's `worker_connections`, `limit_conn`, `limit_req`):
+
+```nginx
+worker_connections 1024;
+limit_conn_zone $binary_remote_addr zone=addr:10m;
+limit_conn addr 100;
+limit_req_zone $binary_remote_addr zone=req:10m rate=10r/s;
+limit_req zone=req burst=50;
+```
+
+```toml
+[server.limits]
+max_connections = 1024
+per_ip_max_connections = 100
+per_ip_rate = 10.0       # requests/sec per IP
+per_ip_burst = 50
+```
+
+All limits default to `0` (unlimited). Set them for production to prevent abuse.
+
 ### 3. Common Nginx Location Blocks
 
 **Block dotfiles:**
@@ -109,6 +129,25 @@ location ~ /\. { deny all; }
 ```
 
 ePHPm: default behavior. Dotfiles are blocked automatically.
+
+**Open file cache** (Nginx's `open_file_cache`):
+
+```nginx
+open_file_cache max=10000 inactive=60s;
+open_file_cache_valid 30s;
+```
+
+```toml
+[server.file_cache]
+enabled = true
+max_entries = 10000
+valid_secs = 30         # re-stat interval
+inactive_secs = 60      # evict entries not accessed within this window
+inline_threshold = 1048576  # cache content for files under 1 MB
+precompress = true       # pre-compute gzip for cached compressible files
+```
+
+When enabled, ePHPm caches file metadata (size, mtime, MIME type, ETag) and small file content in memory. Files above `inline_threshold` are streamed from disk in 64 KiB chunks instead of being read entirely into memory. This matches Nginx's behavior of caching file descriptors and metadata for frequently accessed files.
 
 **Block vendor directory:**
 
