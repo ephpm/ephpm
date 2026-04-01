@@ -1,6 +1,6 @@
 # ePHPm — Embedded PHP Manager
 
-An all-in-one PHP application server written in Rust. Embeds PHP via FFI into a single static binary — no external PHP-FPM, no CGO overhead, no runtime dependencies. Drop in your WordPress or Laravel project and go.
+Run PHP applications without the infrastructure. No PHP-FPM, no MySQL server, no Redis, no reverse proxy, no certbot. One binary, one config file. Drop in WordPress or Laravel and go. When you need more, it's already built in: MySQL connection pooling, read/write splitting, a Redis-compatible KV store, clustered SQLite with automatic failover, TLS, and Prometheus metrics. One binary from `localhost` to production — same runtime in development, CI, staging, and prod. No environment drift, no deployment surprises.
 
 ## Why ePHPm?
 
