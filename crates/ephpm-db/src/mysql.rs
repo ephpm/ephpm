@@ -30,6 +30,7 @@
 //! Support for `caching_sha2_password` is planned (TODO).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use sha1::{Digest, Sha1};
@@ -75,7 +76,8 @@ const COM_STMT_FETCH: u8 = 0x1C;
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PoolTarget {
     Primary,
-    Replica,
+    /// Index into the replica pool slice, assigned by round-robin.
+    Replica(usize),
 }
 
 // ── Read-write split & sticky routing ─────────────────────────────────────────
@@ -115,6 +117,8 @@ pub struct MySqlProxy {
     socket: Option<std::path::PathBuf>,
     reset_strategy: ResetStrategy,
     rw_split: RwSplitParams,
+    /// Round-robin counter for distributing reads across replicas.
+    replica_rr: AtomicUsize,
 }
 
 impl MySqlProxy {
@@ -211,6 +215,7 @@ impl MySqlProxy {
             socket,
             reset_strategy,
             rw_split,
+            replica_rr: AtomicUsize::new(0),
         })
     }
 
@@ -274,6 +279,7 @@ impl MySqlProxy {
                 &self.replica_pools,
                 &self.rw_split,
                 self.reset_strategy,
+                &self.replica_rr,
             )
             .await
         } else {
@@ -832,12 +838,16 @@ fn parse_stmt_id(payload: &[u8]) -> Option<u32> {
 }
 
 /// Select which pool (primary or replica) to use for the next query.
+///
+/// When multiple replicas are configured, reads are distributed via
+/// round-robin using the shared `replica_rr` counter.
 fn select_pool<'a>(
     primary: &'a Pool,
     replicas: &'a [Pool],
     state: &ClientState,
     kind: QueryKind,
     _rw_split: &RwSplitParams,
+    replica_rr: &AtomicUsize,
 ) -> &'a Pool {
     // If no replicas, always use primary.
     if replicas.is_empty() {
@@ -858,8 +868,8 @@ fn select_pool<'a>(
 
     // Read queries can use replicas.
     if matches!(kind, QueryKind::Read) {
-        // Simple V1: use first replica. TODO: round-robin.
-        &replicas[0]
+        let idx = replica_rr.fetch_add(1, Ordering::Relaxed) % replicas.len();
+        &replicas[idx]
     } else {
         // Write, TxBegin, TxEnd: always primary.
         primary
@@ -874,7 +884,7 @@ fn resolve_pool_target<'a>(
 ) -> &'a Pool {
     match target {
         PoolTarget::Primary => primary,
-        PoolTarget::Replica => &replicas[0],
+        PoolTarget::Replica(idx) => &replicas[idx % replicas.len()],
     }
 }
 
@@ -889,6 +899,7 @@ fn route_command<'a>(
     state: &ClientState,
     rw_split: &RwSplitParams,
     stmt_pool_map: &HashMap<u32, PoolTarget>,
+    replica_rr: &AtomicUsize,
 ) -> (&'a Pool, QueryKind) {
     if !rw_split.enabled || replica_pools.is_empty() {
         return (pool, QueryKind::Write);
@@ -899,7 +910,7 @@ fn route_command<'a>(
         COM_QUERY | COM_STMT_PREPARE => {
             let sql = std::str::from_utf8(payload.get(1..).unwrap_or_default()).unwrap_or("");
             let kind = classify_mysql_query(sql);
-            (select_pool(pool, replica_pools, state, kind, rw_split), kind)
+            (select_pool(pool, replica_pools, state, kind, rw_split, replica_rr), kind)
         }
         COM_STMT_EXECUTE | COM_STMT_SEND_LONG_DATA | COM_STMT_FETCH => {
             let target = parse_stmt_id(payload)
@@ -959,6 +970,7 @@ async fn proxy_routing_loop(
     replica_pools: &[Pool],
     rw_split: &RwSplitParams,
     reset_strategy: crate::ResetStrategy,
+    replica_rr: &AtomicUsize,
 ) -> Result<(), DbError> {
     let mut state = ClientState::default();
     // Maps statement IDs to the pool type they were prepared on, so that
@@ -979,7 +991,7 @@ async fn proxy_routing_loop(
         }
 
         let (target_pool, query_kind) =
-            route_command(&payload, pool, replica_pools, &state, rw_split, &stmt_pool_map);
+            route_command(&payload, pool, replica_pools, &state, rw_split, &stmt_pool_map, replica_rr);
         track_dirty(&mut state, &payload, query_kind);
 
         // Acquire backend and forward the command.
@@ -991,7 +1003,12 @@ async fn proxy_routing_loop(
             let pool_target = if std::ptr::eq(target_pool, pool) {
                 PoolTarget::Primary
             } else {
-                PoolTarget::Replica
+                // Find which replica index was selected.
+                let idx = replica_pools
+                    .iter()
+                    .position(|r| std::ptr::eq(target_pool, r))
+                    .unwrap_or(0);
+                PoolTarget::Replica(idx)
             };
             if let Some(stmt_id) = forward_prepare_response(&mut backend, &mut client).await? {
                 stmt_pool_map.insert(stmt_id, pool_target);
@@ -1152,7 +1169,8 @@ mod tests {
         let replicas = vec![pool_stub()];
         let state = ClientState::default();
 
-        let target = select_pool(&primary, &replicas, &state, QueryKind::Read, &rw_split);
+        let rr = AtomicUsize::new(0);
+        let target = select_pool(&primary, &replicas, &state, QueryKind::Read, &rw_split, &rr);
         assert!(std::ptr::eq(target, &replicas[0]));
     }
 
@@ -1165,7 +1183,8 @@ mod tests {
         let replicas = vec![pool_stub()];
         let state = ClientState::default();
 
-        let target = select_pool(&primary, &replicas, &state, QueryKind::Write, &rw_split);
+        let rr = AtomicUsize::new(0);
+        let target = select_pool(&primary, &replicas, &state, QueryKind::Write, &rw_split, &rr);
         assert!(std::ptr::eq(target, &primary));
     }
 
@@ -1178,7 +1197,8 @@ mod tests {
         let replicas = vec![pool_stub()];
         let state = ClientState { in_transaction: true, ..ClientState::default() };
 
-        let target = select_pool(&primary, &replicas, &state, QueryKind::Read, &rw_split);
+        let rr = AtomicUsize::new(0);
+        let target = select_pool(&primary, &replicas, &state, QueryKind::Read, &rw_split, &rr);
         assert!(std::ptr::eq(target, &primary));
     }
 
@@ -1186,12 +1206,12 @@ mod tests {
     fn stmt_pool_map_tracks_prepare_to_execute() {
         let mut map: HashMap<u32, PoolTarget> = HashMap::new();
 
-        // Simulate: SELECT prepared on replica.
-        map.insert(1, PoolTarget::Replica);
+        // Simulate: SELECT prepared on replica 0.
+        map.insert(1, PoolTarget::Replica(0));
         // Simulate: INSERT prepared on primary.
         map.insert(2, PoolTarget::Primary);
 
-        assert_eq!(map.get(&1).copied(), Some(PoolTarget::Replica));
+        assert_eq!(map.get(&1).copied(), Some(PoolTarget::Replica(0)));
         assert_eq!(map.get(&2).copied(), Some(PoolTarget::Primary));
 
         // Close statement 1.
