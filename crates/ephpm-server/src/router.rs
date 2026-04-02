@@ -84,6 +84,13 @@ pub struct Router {
     metrics_path: String,
     limiter: Option<Arc<crate::rate_limit::Limiter>>,
     file_cache: Option<Arc<crate::file_cache::FileCache>>,
+    /// KV secret for deriving per-site RESP passwords. When set alongside
+    /// `multi_tenant_kv`, `EPHPM_REDIS_*` env vars are injected into PHP.
+    kv_secret: Option<String>,
+    /// RESP listen address (used for `EPHPM_REDIS_HOST` / `EPHPM_REDIS_PORT`).
+    kv_listen: String,
+    /// Whether the RESP protocol listener is enabled.
+    kv_redis_compat_enabled: bool,
 }
 
 /// Scan `sites_dir` for virtual host subdirectories.
@@ -212,6 +219,9 @@ impl Router {
             metrics_path: config.server.metrics.path.clone(),
             limiter,
             file_cache,
+            kv_secret: config.kv.secret.clone(),
+            kv_listen: config.kv.redis_compat.listen.clone(),
+            kv_redis_compat_enabled: config.kv.redis_compat.enabled,
         }
     }
 
@@ -224,6 +234,37 @@ impl Router {
     /// Uses lazy discovery: if a host isn't in the startup-scanned registry
     /// but a matching directory exists in `sites_dir`, it is served immediately.
     /// This means new sites can be deployed without restarting ephpm.
+    /// Build `EPHPM_REDIS_*` environment variables for PHP injection.
+    ///
+    /// Only produces variables when all conditions are met:
+    /// - `kv.redis_compat.enabled` is true
+    /// - `kv.secret` is set
+    /// - Multi-tenant mode is active (a site hostname is available)
+    fn build_kv_env_vars(&self, hostname: &str) -> Vec<(String, String)> {
+        let is_multi_tenant = self.multi_tenant_kv.is_some();
+        let Some(ref secret) = self.kv_secret else {
+            return Vec::new();
+        };
+        if !self.kv_redis_compat_enabled || !is_multi_tenant || hostname.is_empty() {
+            return Vec::new();
+        }
+
+        let password = ephpm_kv::auth::derive_site_password(secret, hostname);
+
+        // Parse host:port from the listen address.
+        let (host, port) = self
+            .kv_listen
+            .rsplit_once(':')
+            .unwrap_or(("127.0.0.1", "6379"));
+
+        vec![
+            ("EPHPM_REDIS_HOST".into(), host.into()),
+            ("EPHPM_REDIS_PORT".into(), port.into()),
+            ("EPHPM_REDIS_USERNAME".into(), hostname.into()),
+            ("EPHPM_REDIS_PASSWORD".into(), password),
+        ]
+    }
+
     fn resolve_site(&self, host: &str) -> (PathBuf, &[String], &[String]) {
         if self.sites_dir.is_none() && self.sites.is_empty() {
             return (self.document_root.clone(), &self.index_files, &self.fallback);
@@ -557,6 +598,9 @@ impl Router {
         let vhost_open_basedir = self.sites_dir.is_some() && self.open_basedir;
         let vhost_disable_shell = self.sites_dir.is_some() && self.disable_shell_exec;
 
+        // Build EPHPM_REDIS_* env vars for multi-tenant RESP auth injection.
+        let env_vars = self.build_kv_env_vars(&server_name);
+
         let php_start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             // Scope KV store to this virtual host for multi-tenant isolation.
@@ -579,7 +623,7 @@ impl Router {
             PhpRuntime::execute(PhpRequest {
                 method, uri, path, query_string, script_filename,
                 document_root, headers, body, content_type, remote_addr,
-                server_name, server_port, is_https, protocol,
+                server_name, server_port, is_https, protocol, env_vars,
             })
         })
         .await;

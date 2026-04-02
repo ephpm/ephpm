@@ -53,6 +53,13 @@ pub struct PhpRequest {
 
     /// HTTP protocol version string (e.g. "HTTP/1.1").
     pub protocol: String,
+
+    /// Extra environment variables to inject into PHP `$_SERVER`.
+    ///
+    /// These are added after the standard CGI variables and HTTP headers,
+    /// so they can override built-in values if needed. Used for injecting
+    /// `EPHPM_REDIS_*` credentials in multi-tenant mode.
+    pub env_vars: Vec<(String, String)>,
 }
 
 impl PhpRequest {
@@ -108,6 +115,11 @@ impl PhpRequest {
             vars.push((key, value.clone()));
         }
 
+        // Append extra environment variables (e.g. EPHPM_REDIS_* credentials).
+        for (key, value) in &self.env_vars {
+            vars.push((key.clone(), value.clone()));
+        }
+
         vars
     }
 
@@ -148,6 +160,7 @@ mod tests {
             server_port: 8080,
             is_https: false,
             protocol: "HTTP/1.1".into(),
+            env_vars: Vec::new(),
         }
     }
 
@@ -288,5 +301,29 @@ mod tests {
         req.headers
             .push(("COOKIE".into(), "token=xyz".into()));
         assert_eq!(req.cookie_string(), "token=xyz");
+    }
+
+    #[test]
+    fn test_env_vars_injected_into_server_variables() {
+        let mut req = make_request();
+        req.env_vars = vec![
+            ("EPHPM_REDIS_HOST".into(), "127.0.0.1".into()),
+            ("EPHPM_REDIS_PORT".into(), "6379".into()),
+            ("EPHPM_REDIS_USERNAME".into(), "example.com".into()),
+            ("EPHPM_REDIS_PASSWORD".into(), "abc123".into()),
+        ];
+        let vars = req.server_variables();
+
+        assert_eq!(find_var(&vars, "EPHPM_REDIS_HOST"), Some("127.0.0.1"));
+        assert_eq!(find_var(&vars, "EPHPM_REDIS_PORT"), Some("6379"));
+        assert_eq!(find_var(&vars, "EPHPM_REDIS_USERNAME"), Some("example.com"));
+        assert_eq!(find_var(&vars, "EPHPM_REDIS_PASSWORD"), Some("abc123"));
+    }
+
+    #[test]
+    fn test_env_vars_empty_by_default() {
+        let req = make_request();
+        let vars = req.server_variables();
+        assert!(find_var(&vars, "EPHPM_REDIS_HOST").is_none());
     }
 }

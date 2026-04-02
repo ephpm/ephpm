@@ -74,6 +74,7 @@ impl MultiTenantStore {
     /// Remove a site's store (e.g., when a preview is torn down).
     ///
     /// Returns `true` if the site existed.
+    #[must_use]
     pub fn remove_site(&self, hostname: &str) -> bool {
         self.sites.remove(hostname).is_some()
     }
@@ -82,6 +83,7 @@ impl MultiTenantStore {
     ///
     /// Returns the site's store if the hostname is valid.
     /// Password validation is handled by the caller.
+    #[must_use]
     pub fn auth_site(&self, hostname: &str) -> Option<Arc<Store>> {
         if hostname.is_empty() {
             return None;

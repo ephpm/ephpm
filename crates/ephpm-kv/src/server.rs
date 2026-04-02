@@ -15,7 +15,9 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{debug, error, info, trace};
 
+use crate::auth;
 use crate::command;
+use crate::multi_tenant::MultiTenantStore;
 use crate::resp::{self, Frame};
 use crate::store::Store;
 
@@ -30,6 +32,11 @@ pub struct ServerConfig {
     /// Optional password for RESP AUTH. When set, clients must authenticate
     /// before any commands are accepted.
     pub password: Option<String>,
+    /// Master secret for HMAC-derived per-site authentication. When set
+    /// alongside a `MultiTenantStore`, clients must `AUTH <hostname>
+    /// <derived_password>` and their connection is scoped to that site's
+    /// store.
+    pub secret: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -38,6 +45,7 @@ impl Default for ServerConfig {
             listen: "127.0.0.1:6379".into(),
             max_input_buffer: 64 * 1024 * 1024, // 64 MiB
             password: None,
+            secret: None,
         }
     }
 }
@@ -47,10 +55,19 @@ impl Default for ServerConfig {
 /// Binds a TCP listener, spawns a background expiry task, and accepts
 /// connections until a shutdown signal (Ctrl-C) is received.
 ///
+/// When `multi_tenant` is provided alongside a `secret` in the config,
+/// HMAC-derived per-site AUTH is required. Clients must send
+/// `AUTH <hostname> <derived_password>` to scope their connection to
+/// a specific site's store.
+///
 /// # Errors
 ///
 /// Returns an error if the TCP listener fails to bind.
-pub async fn run(store: Arc<Store>, config: ServerConfig) -> anyhow::Result<()> {
+pub async fn run(
+    store: Arc<Store>,
+    config: ServerConfig,
+    multi_tenant: Option<MultiTenantStore>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("failed to bind KV server to {}", config.listen))?;
@@ -59,7 +76,8 @@ pub async fn run(store: Arc<Store>, config: ServerConfig) -> anyhow::Result<()> 
 
     let max_buf = config.max_input_buffer;
     let password = config.password.clone();
-    let accept = serve_on(Arc::clone(&store), listener, max_buf, password);
+    let secret = config.secret.clone();
+    let accept = serve_on(Arc::clone(&store), listener, max_buf, password, secret, multi_tenant);
 
     tokio::select! {
         result = accept => result,
@@ -80,6 +98,10 @@ pub async fn run(store: Arc<Store>, config: ServerConfig) -> anyhow::Result<()> 
 /// for use in tests and embedding contexts where the caller manages the
 /// listener socket.
 ///
+/// When `secret` is `Some` and `multi_tenant` is `Some`, the server
+/// requires HMAC-derived per-site authentication. The `password` field
+/// is ignored in this mode.
+///
 /// # Errors
 ///
 /// Returns an error if an unrecoverable accept failure occurs.
@@ -88,8 +110,12 @@ pub async fn serve_on(
     listener: TcpListener,
     max_input_buffer: usize,
     password: Option<String>,
+    secret: Option<String>,
+    multi_tenant: Option<MultiTenantStore>,
 ) -> anyhow::Result<()> {
     let password: Option<Arc<str>> = password.map(|p| Arc::from(p.as_str()));
+    let secret: Option<Arc<str>> = secret.map(|s| Arc::from(s.as_str()));
+    let multi_tenant = multi_tenant.map(Arc::new);
 
     // Background expiry reaper — runs every second.
     let expiry_store = Arc::clone(&store);
@@ -107,10 +133,18 @@ pub async fn serve_on(
                 debug!(peer = %addr, "new KV connection");
                 let conn_store = Arc::clone(&store);
                 let conn_password = password.clone();
+                let conn_secret = secret.clone();
+                let conn_mt = multi_tenant.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        handle_connection(stream, &conn_store, max_input_buffer, conn_password)
-                            .await
+                    if let Err(e) = handle_connection(
+                        stream,
+                        &conn_store,
+                        max_input_buffer,
+                        conn_password,
+                        conn_secret,
+                        conn_mt,
+                    )
+                    .await
                     {
                         debug!(peer = %addr, error = %e, "connection closed with error");
                     }
@@ -138,39 +172,99 @@ fn extract_command_name(frame: &Frame) -> Option<String> {
             Frame::Simple(s) => Some(s.to_ascii_uppercase()),
             _ => None,
         },
-        Frame::Simple(s) => s.split_whitespace().next().map(|c| c.to_ascii_uppercase()),
+        Frame::Simple(s) => s.split_whitespace().next().map(str::to_ascii_uppercase),
         _ => None,
     }
 }
 
+/// Extract the first and optional second argument from an AUTH frame.
+///
+/// Redis supports both `AUTH <password>` and `AUTH <username> <password>`.
+/// Returns `(first_arg, second_arg)`.
+fn extract_auth_args(frame: &Frame) -> (Option<String>, Option<String>) {
+    match frame {
+        Frame::Array(a) => {
+            let first = a.get(1).and_then(|f| match f {
+                Frame::Bulk(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                Frame::Simple(s) => Some(s.clone()),
+                _ => None,
+            });
+            let second = a.get(2).and_then(|f| match f {
+                Frame::Bulk(b) => Some(String::from_utf8_lossy(b).into_owned()),
+                Frame::Simple(s) => Some(s.clone()),
+                _ => None,
+            });
+            (first, second)
+        }
+        Frame::Simple(s) => {
+            let mut parts = s.split_whitespace().skip(1);
+            let first = parts.next().map(String::from);
+            let second = parts.next().map(String::from);
+            (first, second)
+        }
+        _ => (None, None),
+    }
+}
+
+/// Result of a successful HMAC-derived AUTH.
+struct HmacAuthResult {
+    /// The site store to use for this connection.
+    store: Arc<Store>,
+}
+
 /// Handle the AUTH command, validating the password if one is configured.
 ///
-/// Returns the response frame and whether authentication succeeded.
-fn handle_auth(frame: &Frame, required_password: &Option<Arc<str>>) -> (Frame, bool) {
-    let password_arg = match frame {
-        Frame::Array(a) if a.len() >= 2 => match &a[1] {
-            Frame::Bulk(b) => Some(String::from_utf8_lossy(b).into_owned()),
-            Frame::Simple(s) => Some(s.clone()),
-            _ => None,
-        },
-        Frame::Simple(s) => s.split_whitespace().nth(1).map(String::from),
-        _ => None,
-    };
+/// Returns the response frame, whether authentication succeeded, and
+/// optionally a site store override when HMAC multi-tenant auth is used.
+fn handle_auth(
+    frame: &Frame,
+    required_password: Option<&Arc<str>>,
+    secret: Option<&Arc<str>>,
+    multi_tenant: Option<&Arc<MultiTenantStore>>,
+) -> (Frame, bool, Option<HmacAuthResult>) {
+    let (first_arg, second_arg) = extract_auth_args(frame);
 
-    match (required_password, password_arg) {
-        // Password configured and client provided one — validate.
-        (Some(expected), Some(ref provided)) if expected.as_ref() == provided.as_str() => {
-            (Frame::ok(), true)
+    // HMAC multi-tenant mode: AUTH <hostname> <derived_password>
+    if let (Some(secret_val), Some(mt)) = (secret, multi_tenant) {
+        match (first_arg, second_arg) {
+            (Some(hostname), Some(password)) => {
+                if auth::validate_site_password(secret_val, &hostname, &password) {
+                    let store = mt.get_site_store(&hostname);
+                    (
+                        Frame::ok(),
+                        true,
+                        Some(HmacAuthResult { store }),
+                    )
+                } else {
+                    (Frame::error("ERR invalid password"), false, None)
+                }
+            }
+            // Missing hostname or password argument.
+            (Some(_), None) | (None, _) => (
+                Frame::error("ERR wrong number of arguments for 'auth' command"),
+                false,
+                None,
+            ),
         }
-        // Password configured but client provided wrong one.
-        (Some(_), Some(_)) => (Frame::error("ERR invalid password"), false),
-        // Password configured but client sent AUTH with no argument.
-        (Some(_), None) => (
-            Frame::error("ERR wrong number of arguments for 'auth' command"),
-            false,
-        ),
-        // No password configured — AUTH is a no-op, always succeeds.
-        (None, _) => (Frame::ok(), true),
+    } else {
+        // Legacy single-password mode.
+        let password_arg = first_arg;
+        match (required_password, password_arg) {
+            // Password configured and client provided one — validate.
+            (Some(expected), Some(ref provided)) if expected.as_ref() == provided.as_str() => {
+                (Frame::ok(), true, None)
+            }
+            // Password configured but client provided wrong one.
+            (Some(_), Some(_)) => (Frame::error("ERR invalid password"), false, None),
+            // Password configured but client sent AUTH with no argument.
+            (Some(_), None) => (
+                Frame::error("ERR wrong number of arguments for 'auth' command"),
+                false,
+                None,
+            ),
+            // No password configured — AUTH is a no-op, always succeeds.
+            (None, _) => (Frame::ok(), true, None),
+        }
     }
 }
 
@@ -180,11 +274,21 @@ async fn handle_connection(
     store: &Arc<Store>,
     max_buf: usize,
     password: Option<Arc<str>>,
+    secret: Option<Arc<str>>,
+    multi_tenant: Option<Arc<MultiTenantStore>>,
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
     let mut write_buf = BytesMut::with_capacity(4096);
-    // If no password is configured, connections start authenticated.
-    let mut authenticated = password.is_none();
+
+    // Determine whether auth is required:
+    // - HMAC multi-tenant mode: secret + multi_tenant both set
+    // - Legacy password mode: password is set
+    // - No auth: neither secret nor password set
+    let auth_required = secret.is_some() || password.is_some();
+    let mut authenticated = !auth_required;
+
+    // When HMAC auth succeeds, the connection is scoped to a specific site store.
+    let mut active_store: Arc<Store> = Arc::clone(store);
 
     loop {
         // Try to parse frames already in the buffer before reading more.
@@ -195,9 +299,17 @@ async fn handle_connection(
 
                     // AUTH is always allowed, even before authentication.
                     if cmd_name.as_deref() == Some("AUTH") {
-                        let (response, success) = handle_auth(&frame, &password);
+                        let (response, success, hmac_result) = handle_auth(
+                            &frame,
+                            password.as_ref(),
+                            secret.as_ref(),
+                            multi_tenant.as_ref(),
+                        );
                         if success {
                             authenticated = true;
+                            if let Some(result) = hmac_result {
+                                active_store = result.store;
+                            }
                         }
                         write_buf.clear();
                         response.write_to(&mut write_buf);
@@ -223,7 +335,7 @@ async fn handle_connection(
                         continue;
                     }
 
-                    let response = command::dispatch(store, &frame);
+                    let response = command::dispatch(&active_store, &frame);
                     write_buf.clear();
                     response.write_to(&mut write_buf);
                     stream.write_all(&write_buf).await?;
