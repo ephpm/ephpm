@@ -1,12 +1,12 @@
 [package]
 name = "litewire-translate"
 description = "SQL dialect translation (MySQL/PG/T-SQL -> SQLite)"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
 
 [dependencies]
-sqlparser = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
+sqlparser = { version = "0.57", features = ["serde"] }
+thiserror = "2"
+tracing = "0.1"

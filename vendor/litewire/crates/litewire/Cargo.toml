@@ -1,10 +1,10 @@
 [package]
 name = "litewire"
 description = "MySQL, PostgreSQL, TDS, and Hrana protocol proxy for SQLite"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
 
 [[bin]]
 name = "litewire"
@@ -12,18 +12,18 @@ path = "src/main.rs"
 required-features = ["cli"]
 
 [dependencies]
-litewire-backend = { workspace = true }
-litewire-translate = { workspace = true }
-litewire-mysql = { workspace = true, optional = true }
-litewire-postgres = { workspace = true, optional = true }
-litewire-tds = { workspace = true, optional = true }
-litewire-hrana = { workspace = true, optional = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true, optional = true }
-clap = { workspace = true, optional = true }
-anyhow = { workspace = true }
-futures = { workspace = true }
+litewire-backend = { path = "../litewire-backend" }
+litewire-translate = { path = "../litewire-translate" }
+litewire-mysql = { path = "../litewire-mysql", optional = true }
+litewire-postgres = { path = "../litewire-postgres", optional = true }
+litewire-tds = { path = "../litewire-tds", optional = true }
+litewire-hrana = { path = "../litewire-hrana", optional = true }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+anyhow = "1"
+futures = "0.3"
 
 [features]
 default = ["mysql", "hrana", "backend-rusqlite"]
@@ -36,9 +36,9 @@ backend-hrana-client = ["litewire-backend/hrana-client"]
 cli = ["dep:clap", "dep:tracing-subscriber"]
 
 [dev-dependencies]
-mysql_async = { workspace = true }
-tokio-postgres = { workspace = true }
-tiberius = { workspace = true }
-tokio-util = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
-tracing-subscriber = { workspace = true }
+mysql_async = { version = "0.34", default-features = false, features = ["rustls-tls"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+tiberius = { version = "0.12", default-features = false, features = ["rustls"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

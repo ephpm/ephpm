@@ -1,27 +1,27 @@
 [package]
 name = "litewire-backend"
 description = "Backend trait and implementations for litewire"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
 
 [dependencies]
-async-trait = { workspace = true }
-parking_lot = { workspace = true }
-rusqlite = { workspace = true, optional = true }
-reqwest = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
-base64 = { workspace = true, optional = true }
-thiserror = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
+async-trait = "0.1"
+parking_lot = "0.12"
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+base64 = { version = "0.22", optional = true }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
 
 [dev-dependencies]
-litewire-hrana = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
-tracing-subscriber = { workspace = true }
+litewire-hrana = { path = "../litewire-hrana" }
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
 default = ["rusqlite"]

@@ -1,17 +1,17 @@
 [package]
 name = "litewire-postgres"
 description = "PostgreSQL wire protocol frontend for litewire"
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
 
 [dependencies]
-litewire-backend = { workspace = true }
-litewire-translate = { workspace = true }
-pgwire = { workspace = true }
-async-trait = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
-thiserror = { workspace = true }
-futures = { workspace = true }
+litewire-backend = { path = "../litewire-backend" }
+litewire-translate = { path = "../litewire-translate" }
+pgwire = "0.28"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+thiserror = "2"
+futures = "0.3"
