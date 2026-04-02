@@ -29,6 +29,7 @@
 //! ```
 //! Support for `caching_sha2_password` is planned (TODO).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use sha1::{Digest, Sha1};
@@ -36,10 +37,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
+use crate::ResetStrategy;
 use crate::error::DbError;
 use crate::pool::{Checkout, Pool, PoolConfig};
 use crate::url::DbUrl;
-use crate::ResetStrategy;
 
 // ── Capability flags ──────────────────────────────────────────────────────────
 
@@ -55,15 +56,37 @@ const CLIENT_PS_MULTI_RESULTS: u32 = 0x0004_0000;
 const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 const CLIENT_PLUGIN_AUTH_LENENC: u32 = 0x0020_0000;
 
+// ── MySQL command bytes ──────────────────────────────────────────────────────
+
+const COM_QUIT: u8 = 0x01;
+const COM_INIT_DB: u8 = 0x02;
+const COM_QUERY: u8 = 0x03;
+const COM_STMT_PREPARE: u8 = 0x16;
+const COM_STMT_EXECUTE: u8 = 0x17;
+const COM_STMT_SEND_LONG_DATA: u8 = 0x18;
+const COM_STMT_CLOSE: u8 = 0x19;
+const COM_STMT_RESET: u8 = 0x1A;
+const COM_STMT_FETCH: u8 = 0x1C;
+
+/// Which pool a prepared statement was compiled on.
+///
+/// Stored per-statement so that `COM_STMT_EXECUTE` and related commands can be
+/// routed to the same pool that handled `COM_STMT_PREPARE`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PoolTarget {
+    Primary,
+    Replica,
+}
+
 // ── Read-write split & sticky routing ─────────────────────────────────────────
 
 /// Parameters for read-write splitting and sticky-after-write behavior.
 #[derive(Clone, Debug)]
 pub struct RwSplitParams {
-	/// Enable read-write splitting (route SELECTs to replicas).
-	pub enabled: bool,
-	/// How long to stick to the primary after a write operation.
-	pub sticky_duration: std::time::Duration,
+    /// Enable read-write splitting (route SELECTs to replicas).
+    pub enabled: bool,
+    /// How long to stick to the primary after a write operation.
+    pub sticky_duration: std::time::Duration,
 }
 
 /// `MySQL` server metadata captured from the initial backend handshake.
@@ -130,9 +153,10 @@ impl MySqlProxy {
             Box::pin(reset_connection(stream))
         };
 
-        let ping = |stream: TcpStream| -> crate::pool::BoxFuture<Result<(TcpStream, bool), DbError>> {
-            Box::pin(ping_connection(stream))
-        };
+        let ping =
+            |stream: TcpStream| -> crate::pool::BoxFuture<Result<(TcpStream, bool), DbError>> {
+                Box::pin(ping_connection(stream))
+            };
 
         let pool = Pool::new(pool_config.clone(), connect, reset, ping);
 
@@ -140,9 +164,7 @@ impl MySqlProxy {
         let mut checkout = Checkout {
             stream: Some(probe_stream),
             permit: Some(
-                Arc::clone(&pool.semaphore)
-                    .try_acquire_owned()
-                    .map_err(|_| DbError::PoolClosed)?,
+                Arc::clone(&pool.semaphore).try_acquire_owned().map_err(|_| DbError::PoolClosed)?,
             ),
             created_at: std::time::Instant::now(),
             pool: pool.clone(),
@@ -157,23 +179,26 @@ impl MySqlProxy {
             if let Ok(replica_db_url) = DbUrl::parse(&replica_url) {
                 let replica_db_url = Arc::new(replica_db_url);
                 let replica_db_url_c = Arc::clone(&replica_db_url);
-                let replica_connect = move || -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
-                    let u = Arc::clone(&replica_db_url_c);
-                    Box::pin(async move {
-                        let (stream, _) = connect_and_handshake(&u).await?;
-                        Ok(stream)
-                    })
-                };
+                let replica_connect =
+                    move || -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
+                        let u = Arc::clone(&replica_db_url_c);
+                        Box::pin(async move {
+                            let (stream, _) = connect_and_handshake(&u).await?;
+                            Ok(stream)
+                        })
+                    };
 
-                let replica_reset = |stream: TcpStream| -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
-                    Box::pin(reset_connection(stream))
-                };
+                let replica_reset =
+                    |stream: TcpStream| -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
+                        Box::pin(reset_connection(stream))
+                    };
 
-                let replica_ping = |stream: TcpStream| -> crate::pool::BoxFuture<Result<(TcpStream, bool), DbError>> {
-                    Box::pin(ping_connection(stream))
-                };
+                let replica_ping = |stream: TcpStream| -> crate::pool::BoxFuture<
+                    Result<(TcpStream, bool), DbError>,
+                > { Box::pin(ping_connection(stream)) };
 
-                let replica_pool = Pool::new(pool_config.clone(), replica_connect, replica_reset, replica_ping);
+                let replica_pool =
+                    Pool::new(pool_config.clone(), replica_connect, replica_reset, replica_ping);
                 replica_pools.push(replica_pool);
             }
         }
@@ -243,8 +268,14 @@ impl MySqlProxy {
 
         if needs_routing {
             // Step 4a: per-query routing with dirty tracking.
-            proxy_routing_loop(client, &self.pool, &self.replica_pools, &self.rw_split, self.reset_strategy)
-                .await
+            proxy_routing_loop(
+                client,
+                &self.pool,
+                &self.replica_pools,
+                &self.rw_split,
+                self.reset_strategy,
+            )
+            .await
         } else {
             // Fast path: simple bidirectional copy.
             let mut checkout = self.pool.acquire().await?;
@@ -258,15 +289,13 @@ impl MySqlProxy {
                         ResetStrategy::Never => {
                             checkout.return_to_pool(backend);
                         }
-                        ResetStrategy::Always => {
-                            match reset_connection(backend).await {
-                                Ok(stream) => checkout.return_to_pool(stream),
-                                Err(e) => {
-                                    debug!("MySQL reset failed, discarding connection: {e}");
-                                    checkout.retire();
-                                }
+                        ResetStrategy::Always => match reset_connection(backend).await {
+                            Ok(stream) => checkout.return_to_pool(stream),
+                            Err(e) => {
+                                debug!("MySQL reset failed, discarding connection: {e}");
+                                checkout.retire();
                             }
-                        }
+                        },
                         ResetStrategy::Smart => {
                             // Smart path handled by routing loop above.
                             unreachable!()
@@ -300,7 +329,13 @@ async fn connect_and_handshake(url: &DbUrl) -> Result<(TcpStream, ServerMeta), D
     let (meta, challenge) = parse_server_greeting(&payload)?;
 
     // Build our HandshakeResponse41.
-    let response = build_handshake_response(&meta, &url.username, &url.password, &challenge, Some(&url.database));
+    let response = build_handshake_response(
+        &meta,
+        &url.username,
+        &url.password,
+        &challenge,
+        Some(&url.database),
+    );
     write_packet(&mut stream, 1, &response).await?;
 
     // Read OK / ERR / auth-switch.
@@ -390,24 +425,13 @@ fn parse_server_greeting(payload: &[u8]) -> Result<(ServerMeta, [u8; 20]), DbErr
 
     // Auth plugin name (null-terminated).
     let auth_plugin = if capabilities & CLIENT_PLUGIN_AUTH != 0 && pos < payload.len() {
-        let end = payload[pos..]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(payload.len() - pos);
+        let end = payload[pos..].iter().position(|&b| b == 0).unwrap_or(payload.len() - pos);
         String::from_utf8_lossy(&payload[pos..pos + end]).into_owned()
     } else {
         "mysql_native_password".to_string()
     };
 
-    Ok((
-        ServerMeta {
-            server_version,
-            capabilities,
-            charset,
-            auth_plugin,
-        },
-        challenge,
-    ))
+    Ok((ServerMeta { server_version, capabilities, charset, auth_plugin }, challenge))
 }
 
 /// Build `HandshakeResponse41` for the backend.
@@ -485,9 +509,7 @@ fn mysql_native_password(password: &str, challenge: &[u8; 20]) -> Vec<u8> {
 /// loopback only), so this challenge value has no security significance.
 fn fresh_challenge() -> [u8; 20] {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let mut c = [0u8; 20];
     c[..8].copy_from_slice(&ts.as_secs().to_ne_bytes());
     c[8..12].copy_from_slice(&ts.subsec_nanos().to_ne_bytes());
@@ -608,8 +630,9 @@ async fn proxy_bidirectional(
 
     match result {
         Ok(_) => Ok(backend),
-        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset
-            || e.kind() == std::io::ErrorKind::BrokenPipe =>
+        Err(e)
+            if e.kind() == std::io::ErrorKind::ConnectionReset
+                || e.kind() == std::io::ErrorKind::BrokenPipe =>
         {
             Ok(backend)
         }
@@ -683,11 +706,7 @@ enum QueryKind {
 fn classify_mysql_query(sql: &str) -> QueryKind {
     let s = sql.trim_start();
     // Find the first token (word).
-    let tok = s
-        .split_ascii_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_uppercase();
+    let tok = s.split_ascii_whitespace().next().unwrap_or("").to_ascii_uppercase();
 
     match tok.as_str() {
         "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" => {
@@ -729,7 +748,7 @@ async fn forward_mysql_response(
     match payload.first().copied() {
         Some(0x00 | 0xFF) => return Ok(()), // OK or ERR packet
         Some(0xFE) if payload.len() < 9 => return Ok(()), // EOF packet
-        _ => {} // Result set: read columns and rows
+        _ => {}                             // Result set: read columns and rows
     }
 
     // Result set: read column definitions until EOF, then rows until EOF/OK.
@@ -739,11 +758,77 @@ async fn forward_mysql_response(
 
         match payload.first().copied() {
             Some(0xFE) if payload.len() < 9 => return Ok(()), // EOF after rows
-            Some(0xFF) => return Ok(()), // ERR
+            Some(0xFF) => return Ok(()),                      // ERR
             Some(0x00) if payload.len() <= 9 => return Ok(()), // OK
-            _ => {} // More rows
+            _ => {}                                           // More rows
         }
     }
+}
+
+/// Forward a `COM_STMT_PREPARE` response and extract the statement ID.
+///
+/// The response format is:
+/// - `0x00` (OK): `[0x00][stmt_id: 4LE][num_columns: 2LE][num_params: 2LE][...rest]`
+///   followed by param definition packets + EOF and column definition packets + EOF.
+/// - `0xFF` (ERR): error packet.
+///
+/// Returns `Some(stmt_id)` on success, `None` on error response.
+async fn forward_prepare_response(
+    backend: &mut TcpStream,
+    client: &mut TcpStream,
+) -> Result<Option<u32>, DbError> {
+    let (seq, payload) = read_packet(backend).await?;
+    write_packet(client, seq, &payload).await?;
+
+    // ERR packet — prepare failed, no statement ID to track.
+    if payload.first() == Some(&0xFF) {
+        return Ok(None);
+    }
+
+    // Expect OK (0x00) with at least 12 bytes:
+    // [status: 1][stmt_id: 4][num_columns: 2][num_params: 2][reserved: 1][warning_count: 2]
+    if payload.len() < 12 || payload[0] != 0x00 {
+        return Err(DbError::Protocol("unexpected COM_STMT_PREPARE response format".into()));
+    }
+
+    let stmt_id = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    let num_params = u16::from_le_bytes([payload[5], payload[6]]);
+    let num_columns = u16::from_le_bytes([payload[7], payload[8]]);
+
+    // Forward parameter definition packets + EOF (if any).
+    if num_params > 0 {
+        for _ in 0..num_params {
+            let (s, p) = read_packet(backend).await?;
+            write_packet(client, s, &p).await?;
+        }
+        // EOF after params.
+        let (s, p) = read_packet(backend).await?;
+        write_packet(client, s, &p).await?;
+    }
+
+    // Forward column definition packets + EOF (if any).
+    if num_columns > 0 {
+        for _ in 0..num_columns {
+            let (s, p) = read_packet(backend).await?;
+            write_packet(client, s, &p).await?;
+        }
+        // EOF after columns.
+        let (s, p) = read_packet(backend).await?;
+        write_packet(client, s, &p).await?;
+    }
+
+    Ok(Some(stmt_id))
+}
+
+/// Extract a `u32` statement ID from bytes `[1..5]` of a prepared statement
+/// command payload (`COM_STMT_EXECUTE`, `COM_STMT_CLOSE`, etc.).
+///
+/// Returns `None` if the payload is too short.
+fn parse_stmt_id(payload: &[u8]) -> Option<u32> {
+    if payload.len() < 5 {
+        return None;
+    }
+    Some(u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]))
 }
 
 /// Select which pool (primary or replica) to use for the next query.
@@ -781,7 +866,93 @@ fn select_pool<'a>(
     }
 }
 
+/// Resolve a [`PoolTarget`] to its concrete [`Pool`] reference.
+fn resolve_pool_target<'a>(
+    target: PoolTarget,
+    primary: &'a Pool,
+    replicas: &'a [Pool],
+) -> &'a Pool {
+    match target {
+        PoolTarget::Primary => primary,
+        PoolTarget::Replica => &replicas[0],
+    }
+}
+
+/// Determine which pool and query kind to use for a given command payload.
+///
+/// Returns `(target_pool, query_kind)`. When R/W splitting is disabled or no
+/// replicas are configured, always returns the primary pool.
+fn route_command<'a>(
+    payload: &[u8],
+    pool: &'a Pool,
+    replica_pools: &'a [Pool],
+    state: &ClientState,
+    rw_split: &RwSplitParams,
+    stmt_pool_map: &HashMap<u32, PoolTarget>,
+) -> (&'a Pool, QueryKind) {
+    if !rw_split.enabled || replica_pools.is_empty() {
+        return (pool, QueryKind::Write);
+    }
+
+    let cmd = payload[0];
+    match cmd {
+        COM_QUERY | COM_STMT_PREPARE => {
+            let sql = std::str::from_utf8(payload.get(1..).unwrap_or_default()).unwrap_or("");
+            let kind = classify_mysql_query(sql);
+            (select_pool(pool, replica_pools, state, kind, rw_split), kind)
+        }
+        COM_STMT_EXECUTE | COM_STMT_SEND_LONG_DATA | COM_STMT_FETCH => {
+            let target = parse_stmt_id(payload)
+                .and_then(|id| stmt_pool_map.get(&id).copied())
+                .map_or(pool, |pt| resolve_pool_target(pt, pool, replica_pools));
+            let kind = if std::ptr::eq(target, pool) { QueryKind::Write } else { QueryKind::Read };
+            (target, kind)
+        }
+        COM_STMT_CLOSE | COM_STMT_RESET => {
+            let target = parse_stmt_id(payload)
+                .and_then(|id| stmt_pool_map.get(&id).copied())
+                .map_or(pool, |pt| resolve_pool_target(pt, pool, replica_pools));
+            (target, QueryKind::Read)
+        }
+        _ => (pool, QueryKind::Write),
+    }
+}
+
+/// Update connection dirty-bit and transaction tracking after a command.
+fn track_dirty(state: &mut ClientState, payload: &[u8], query_kind: QueryKind) {
+    let cmd = payload[0];
+    match cmd {
+        COM_INIT_DB => state.dirty = true,
+        COM_STMT_PREPARE | COM_STMT_EXECUTE => {
+            if matches!(query_kind, QueryKind::Write | QueryKind::TxBegin) {
+                state.dirty = true;
+            }
+        }
+        COM_QUERY => {
+            let sql = std::str::from_utf8(payload.get(1..).unwrap_or_default()).unwrap_or("");
+            match classify_mysql_query(sql) {
+                QueryKind::Write => state.dirty = true,
+                QueryKind::TxBegin => {
+                    state.in_transaction = true;
+                    state.dirty = true;
+                }
+                QueryKind::TxEnd => {
+                    state.in_transaction = false;
+                }
+                QueryKind::Read => {}
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Proxy loop with per-query routing and dirty-bit tracking.
+///
+/// Handles `COM_QUERY` and the full prepared statement protocol
+/// (`COM_STMT_PREPARE`, `COM_STMT_EXECUTE`, `COM_STMT_CLOSE`, etc.) with
+/// read/write-aware routing. Statement IDs are tracked per-connection so that
+/// execute/close/reset/fetch commands are routed to the same pool that
+/// compiled the statement.
 async fn proxy_routing_loop(
     mut client: TcpStream,
     pool: &Pool,
@@ -790,77 +961,60 @@ async fn proxy_routing_loop(
     reset_strategy: crate::ResetStrategy,
 ) -> Result<(), DbError> {
     let mut state = ClientState::default();
+    // Maps statement IDs to the pool type they were prepared on, so that
+    // COM_STMT_EXECUTE and friends route to the correct backend.
+    let mut stmt_pool_map: HashMap<u32, PoolTarget> = HashMap::new();
 
     loop {
-        // Read command from client.
         let Ok((seq, payload)) = read_packet(&mut client).await else {
-            break; // Client closed or error
+            break;
         };
+        if payload.is_empty() {
+            continue;
+        }
 
-        // COM_QUIT (0x01) signals client disconnect.
-        if payload.first() == Some(&0x01) {
+        let cmd = payload[0];
+        if cmd == COM_QUIT {
             break;
         }
 
-        // Classify query kind for routing.
-        let (target_pool, query_kind) = if rw_split.enabled && !replica_pools.is_empty() {
-            let kind = if payload.first() == Some(&0x03) {
-                // COM_QUERY: parse SQL string.
-                let sql = std::str::from_utf8(payload.get(1..).unwrap_or_default())
-                    .unwrap_or("");
-                classify_mysql_query(sql)
-            } else {
-                // Non-COM_QUERY commands (COM_PING, COM_INIT_DB, etc.) → primary.
-                QueryKind::Write
-            };
+        let (target_pool, query_kind) =
+            route_command(&payload, pool, replica_pools, &state, rw_split, &stmt_pool_map);
+        track_dirty(&mut state, &payload, query_kind);
 
-            let target = select_pool(pool, replica_pools, &state, kind, rw_split);
-            (target, kind)
-        } else {
-            (pool, QueryKind::Write) // No routing: always primary
-        };
-
-        // Track dirty bit based on command type and SQL.
-        if !payload.is_empty() {
-            match payload[0] {
-                // COM_INIT_DB
-                0x02 | 0x16 => state.dirty = true, // COM_STMT_PREPARE
-                0x03 => {
-                    // COM_QUERY: check SQL type.
-                    let sql = std::str::from_utf8(payload.get(1..).unwrap_or_default())
-                        .unwrap_or("");
-                    match classify_mysql_query(sql) {
-                        QueryKind::Write => state.dirty = true,
-                        QueryKind::TxBegin => {
-                            state.in_transaction = true;
-                            state.dirty = true;
-                        }
-                        QueryKind::TxEnd => {
-                            state.in_transaction = false;
-                        }
-                        QueryKind::Read => {} // Read queries don't dirty
-                    }
-                }
-                _ => {} // Other commands
-            }
-        }
-
-        // Acquire backend connection from target pool.
+        // Acquire backend and forward the command.
         let mut checkout = target_pool.acquire().await?;
         let mut backend = checkout.take_stream();
 
-        // Forward query + full response.
-        write_packet(&mut backend, seq, &payload).await?;
-        forward_mysql_response(&mut backend, &mut client).await?;
+        if cmd == COM_STMT_PREPARE {
+            write_packet(&mut backend, seq, &payload).await?;
+            let pool_target = if std::ptr::eq(target_pool, pool) {
+                PoolTarget::Primary
+            } else {
+                PoolTarget::Replica
+            };
+            if let Some(stmt_id) = forward_prepare_response(&mut backend, &mut client).await? {
+                stmt_pool_map.insert(stmt_id, pool_target);
+                debug!(stmt_id, ?pool_target, "prepared statement registered");
+            }
+        } else if cmd == COM_STMT_CLOSE {
+            write_packet(&mut backend, seq, &payload).await?;
+            if let Some(stmt_id) = parse_stmt_id(&payload) {
+                if let Some(removed) = stmt_pool_map.remove(&stmt_id) {
+                    debug!(stmt_id, ?removed, "prepared statement closed");
+                }
+            }
+        } else {
+            write_packet(&mut backend, seq, &payload).await?;
+            forward_mysql_response(&mut backend, &mut client).await?;
+        }
 
-        // Determine if session needs reset.
+        // Return backend to pool.
         let should_reset = match reset_strategy {
             crate::ResetStrategy::Always => true,
             crate::ResetStrategy::Never => false,
             crate::ResetStrategy::Smart => state.dirty,
         };
-
-        // Return backend to pool with or without reset.
         if should_reset {
             match reset_connection(backend).await {
                 Ok(s) => {
@@ -873,7 +1027,6 @@ async fn proxy_routing_loop(
             checkout.return_to_pool(backend);
         }
 
-        // Update sticky-after-write timer.
         if rw_split.enabled && matches!(query_kind, QueryKind::Write) {
             state.sticky_until = Some(std::time::Instant::now() + rw_split.sticky_duration);
         }
@@ -902,4 +1055,235 @@ pub async fn build_proxy(
     rw_split: RwSplitParams,
 ) -> Result<MySqlProxy, DbError> {
     MySqlProxy::new(url, listen, socket, pool_config, reset_strategy, replica_urls, rw_split).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── classify_mysql_query ──────────────────────────────────────────
+
+    #[test]
+    fn classify_select_as_read() {
+        assert_eq!(classify_mysql_query("SELECT * FROM users"), QueryKind::Read);
+    }
+
+    #[test]
+    fn classify_select_for_update_as_write() {
+        assert_eq!(classify_mysql_query("SELECT * FROM users FOR UPDATE"), QueryKind::Write);
+    }
+
+    #[test]
+    fn classify_show_as_read() {
+        assert_eq!(classify_mysql_query("SHOW TABLES"), QueryKind::Read);
+    }
+
+    #[test]
+    fn classify_insert_as_write() {
+        assert_eq!(classify_mysql_query("INSERT INTO users VALUES (1)"), QueryKind::Write);
+    }
+
+    #[test]
+    fn classify_begin_as_tx_begin() {
+        assert_eq!(classify_mysql_query("BEGIN"), QueryKind::TxBegin);
+    }
+
+    #[test]
+    fn classify_commit_as_tx_end() {
+        assert_eq!(classify_mysql_query("COMMIT"), QueryKind::TxEnd);
+    }
+
+    #[test]
+    fn classify_whitespace_prefix() {
+        assert_eq!(classify_mysql_query("   SELECT 1"), QueryKind::Read);
+    }
+
+    #[test]
+    fn classify_unknown_as_write() {
+        assert_eq!(classify_mysql_query("TRUNCATE TABLE users"), QueryKind::Write);
+    }
+
+    // ── parse_stmt_id ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_stmt_id_from_execute_payload() {
+        // COM_STMT_EXECUTE: [0x17][stmt_id: 4 LE][flags: 1][iteration_count: 4]...
+        let stmt_id: u32 = 42;
+        let mut payload = vec![COM_STMT_EXECUTE];
+        payload.extend_from_slice(&stmt_id.to_le_bytes());
+        payload.push(0x00); // flags
+        payload.extend_from_slice(&1_u32.to_le_bytes()); // iteration count
+
+        assert_eq!(parse_stmt_id(&payload), Some(42));
+    }
+
+    #[test]
+    fn parse_stmt_id_from_close_payload() {
+        let stmt_id: u32 = 7;
+        let mut payload = vec![COM_STMT_CLOSE];
+        payload.extend_from_slice(&stmt_id.to_le_bytes());
+
+        assert_eq!(parse_stmt_id(&payload), Some(7));
+    }
+
+    #[test]
+    fn parse_stmt_id_too_short() {
+        let payload = vec![COM_STMT_EXECUTE, 0x01, 0x00]; // only 3 bytes, need 5
+        assert_eq!(parse_stmt_id(&payload), None);
+    }
+
+    #[test]
+    fn parse_stmt_id_large_value() {
+        let stmt_id: u32 = 0x0102_0304;
+        let mut payload = vec![COM_STMT_EXECUTE];
+        payload.extend_from_slice(&stmt_id.to_le_bytes());
+
+        assert_eq!(parse_stmt_id(&payload), Some(0x0102_0304));
+    }
+
+    // ── select_pool routing with stmt_pool_map ───────────────────────
+
+    #[test]
+    fn select_routes_read_to_replica() {
+        let rw_split =
+            RwSplitParams { enabled: true, sticky_duration: std::time::Duration::from_secs(1) };
+
+        let primary = pool_stub();
+        let replicas = vec![pool_stub()];
+        let state = ClientState::default();
+
+        let target = select_pool(&primary, &replicas, &state, QueryKind::Read, &rw_split);
+        assert!(std::ptr::eq(target, &replicas[0]));
+    }
+
+    #[test]
+    fn select_routes_write_to_primary() {
+        let rw_split =
+            RwSplitParams { enabled: true, sticky_duration: std::time::Duration::from_secs(1) };
+
+        let primary = pool_stub();
+        let replicas = vec![pool_stub()];
+        let state = ClientState::default();
+
+        let target = select_pool(&primary, &replicas, &state, QueryKind::Write, &rw_split);
+        assert!(std::ptr::eq(target, &primary));
+    }
+
+    #[test]
+    fn select_routes_to_primary_in_transaction() {
+        let rw_split =
+            RwSplitParams { enabled: true, sticky_duration: std::time::Duration::from_secs(1) };
+
+        let primary = pool_stub();
+        let replicas = vec![pool_stub()];
+        let state = ClientState { in_transaction: true, ..ClientState::default() };
+
+        let target = select_pool(&primary, &replicas, &state, QueryKind::Read, &rw_split);
+        assert!(std::ptr::eq(target, &primary));
+    }
+
+    #[test]
+    fn stmt_pool_map_tracks_prepare_to_execute() {
+        let mut map: HashMap<u32, PoolTarget> = HashMap::new();
+
+        // Simulate: SELECT prepared on replica.
+        map.insert(1, PoolTarget::Replica);
+        // Simulate: INSERT prepared on primary.
+        map.insert(2, PoolTarget::Primary);
+
+        assert_eq!(map.get(&1).copied(), Some(PoolTarget::Replica));
+        assert_eq!(map.get(&2).copied(), Some(PoolTarget::Primary));
+
+        // Close statement 1.
+        map.remove(&1);
+        assert_eq!(map.get(&1), None);
+        // Statement 2 still tracked.
+        assert_eq!(map.get(&2).copied(), Some(PoolTarget::Primary));
+    }
+
+    // ── forward_prepare_response (via mock TCP pair) ─────────────────
+
+    #[tokio::test]
+    async fn forward_prepare_response_ok() {
+        // Build a mock COM_STMT_PREPARE OK response:
+        // [0x00][stmt_id: 4LE][num_columns: 2LE][num_params: 2LE][reserved: 1][warning_count: 2LE]
+        let stmt_id: u32 = 99;
+        let mut ok_payload = vec![0x00];
+        ok_payload.extend_from_slice(&stmt_id.to_le_bytes());
+        ok_payload.extend_from_slice(&0_u16.to_le_bytes()); // num_params
+        ok_payload.extend_from_slice(&0_u16.to_le_bytes()); // num_columns
+        ok_payload.push(0x00); // reserved
+        ok_payload.extend_from_slice(&0_u16.to_le_bytes()); // warnings
+
+        let (mut backend_write, mut backend_read) = make_tcp_pair().await;
+        let (mut client_write, mut client_read) = make_tcp_pair().await;
+
+        // Write the response packet on the "backend" side.
+        write_packet(&mut backend_write, 1, &ok_payload).await.unwrap();
+        drop(backend_write);
+
+        let result = forward_prepare_response(&mut backend_read, &mut client_write).await;
+        assert_eq!(result.unwrap(), Some(99));
+
+        // Verify the client received the packet.
+        let (_, forwarded) = read_packet(&mut client_read).await.unwrap();
+        assert_eq!(forwarded, ok_payload);
+    }
+
+    #[tokio::test]
+    async fn forward_prepare_response_err() {
+        // Build a mock ERR response.
+        let mut err_payload = vec![0xFF];
+        err_payload.extend_from_slice(&1045_u16.to_le_bytes()); // error code
+        err_payload.push(b'#');
+        err_payload.extend_from_slice(b"28000"); // sqlstate
+        err_payload.extend_from_slice(b"Access denied");
+
+        let (mut backend_write, mut backend_read) = make_tcp_pair().await;
+        let (mut client_write, _client_read) = make_tcp_pair().await;
+
+        write_packet(&mut backend_write, 1, &err_payload).await.unwrap();
+        drop(backend_write);
+
+        let result = forward_prepare_response(&mut backend_read, &mut client_write).await;
+        assert_eq!(result.unwrap(), None);
+    }
+
+    // ── Test helpers ─────────────────────────────────────────────────
+
+    /// Create a connected pair of `TcpStream` for testing.
+    async fn make_tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (client, server) = tokio::join!(connect, accept);
+        let (server, _addr) = server.unwrap();
+        (client.unwrap(), server)
+    }
+
+    /// Create a minimal `Pool` for testing `select_pool()`.
+    ///
+    /// The pool is not functional (cannot actually acquire connections), but
+    /// its identity (pointer address) is used to verify routing decisions.
+    fn pool_stub() -> Pool {
+        let connect = || -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
+            Box::pin(async { Err(DbError::PoolClosed) })
+        };
+        let reset = |s: TcpStream| -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
+            Box::pin(async { Ok(s) })
+        };
+        let ping = |s: TcpStream| -> crate::pool::BoxFuture<Result<(TcpStream, bool), DbError>> {
+            Box::pin(async { Ok((s, true)) })
+        };
+        let config = PoolConfig {
+            min_connections: 1,
+            max_connections: 2,
+            idle_timeout: std::time::Duration::from_secs(60),
+            max_lifetime: std::time::Duration::from_secs(300),
+            pool_timeout: std::time::Duration::from_secs(5),
+            health_check_interval: std::time::Duration::from_secs(30),
+        };
+        Pool::new(config, connect, reset, ping)
+    }
 }
