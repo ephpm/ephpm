@@ -42,6 +42,12 @@ mod ffi {
         /// Apply INI settings (disable stack size checking).
         pub fn ephpm_apply_ini_settings() -> ::std::os::raw::c_int;
 
+        /// Set a PHP INI directive for the current request.
+        pub fn ephpm_request_set_ini(
+            key: *const ::std::os::raw::c_char,
+            value: *const ::std::os::raw::c_char,
+        );
+
         /// Reset per-request state.
         pub fn ephpm_request_clear();
 
@@ -572,6 +578,29 @@ impl PhpRuntime {
             tracing::debug!("KV store set_kv_store no-op (stub mode)");
         }
     }
+
+    /// Set a PHP INI directive for the current request.
+    ///
+    /// Must be called on a PHP worker thread (inside `spawn_blocking`)
+    /// before `execute()`. Uses `PHP_INI_SYSTEM` so the value cannot be
+    /// overridden by userland `ini_set()`.
+    ///
+    /// Common use: `open_basedir` and `disable_functions` for vhost isolation.
+    #[cfg(php_linked)]
+    pub fn set_request_ini(key: &str, value: &str) {
+        let c_key = std::ffi::CString::new(key).expect("INI key contains null byte");
+        let c_val = std::ffi::CString::new(value).expect("INI value contains null byte");
+        // SAFETY: c_key and c_val are valid null-terminated C strings.
+        // ephpm_request_set_ini copies the data via zend_string_init.
+        #[allow(unsafe_code)]
+        unsafe {
+            ffi::ephpm_request_set_ini(c_key.as_ptr(), c_val.as_ptr());
+        }
+    }
+
+    /// Stub when PHP is not linked.
+    #[cfg(not(php_linked))]
+    pub fn set_request_ini(_key: &str, _value: &str) {}
 }
 
 impl Drop for PhpRuntime {

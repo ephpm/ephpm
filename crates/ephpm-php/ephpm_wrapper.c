@@ -460,6 +460,22 @@ void ephpm_request_add_server_var(const char *key, const char *value)
 }
 
 /*
+ * Set a PHP INI directive for the current request.
+ *
+ * Uses PHP_INI_SYSTEM + PHP_INI_STAGE_RUNTIME so the value takes effect
+ * immediately and cannot be overridden by userland ini_set().
+ * Call before ephpm_execute_request().
+ */
+void ephpm_request_set_ini(const char *key, const char *value)
+{
+    zend_string *zkey = zend_string_init(key, strlen(key), 0);
+    zend_string *zval = zend_string_init(value, strlen(value), 0);
+    zend_alter_ini_entry(zkey, zval, PHP_INI_SYSTEM, PHP_INI_STAGE_RUNTIME);
+    zend_string_release(zval);
+    zend_string_release(zkey);
+}
+
+/*
  * Execute a PHP request.
  *
  * Reuses the active request started by php_embed_init() — we update the

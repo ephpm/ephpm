@@ -77,6 +77,8 @@ pub struct Router {
     response_headers: Vec<(String, String)>,
     store: Arc<Store>,
     multi_tenant_kv: Option<ephpm_kv::multi_tenant::MultiTenantStore>,
+    open_basedir: bool,
+    disable_shell_exec: bool,
     php_etag_cache_config: ephpm_config::PhpETagCacheConfig,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     metrics_path: String,
@@ -194,6 +196,8 @@ impl Router {
                 .iter()
                 .map(|[k, v]| (k.clone(), v.clone()))
                 .collect(),
+            open_basedir: config.server.security.open_basedir,
+            disable_shell_exec: config.server.security.disable_shell_exec,
             multi_tenant_kv: if config.server.sites_dir.is_some() {
                 Some(ephpm_kv::multi_tenant::MultiTenantStore::new(
                     Arc::clone(&store),
@@ -550,6 +554,8 @@ impl Router {
 
         let server_port = self.server_port;
         let multi_tenant_kv = self.multi_tenant_kv.clone();
+        let vhost_open_basedir = self.sites_dir.is_some() && self.open_basedir;
+        let vhost_disable_shell = self.sites_dir.is_some() && self.disable_shell_exec;
 
         let php_start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
@@ -557,6 +563,19 @@ impl Router {
             ephpm_php::kv_bridge::set_site_store(
                 multi_tenant_kv.as_ref().map(|mt| mt.get_site_store(&server_name))
             );
+
+            // Apply per-request PHP sandbox for multi-tenant isolation.
+            if vhost_open_basedir {
+                let basedir = format!("{}:/tmp", document_root.display());
+                PhpRuntime::set_request_ini("open_basedir", &basedir);
+            }
+            if vhost_disable_shell {
+                PhpRuntime::set_request_ini(
+                    "disable_functions",
+                    "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec",
+                );
+            }
+
             PhpRuntime::execute(PhpRequest {
                 method, uri, path, query_string, script_filename,
                 document_root, headers, body, content_type, remote_addr,

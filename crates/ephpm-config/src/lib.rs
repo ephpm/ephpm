@@ -312,6 +312,36 @@ pub struct SecurityConfig {
     /// Default: `[]` (all PHP files allowed).
     #[serde(default)]
     pub allowed_php_paths: Vec<String>,
+
+    /// Restrict PHP filesystem access to each site's document root.
+    ///
+    /// When `true` and `sites_dir` is configured, PHP's `open_basedir` is
+    /// set per-request to the site's directory + `/tmp`. PHP cannot read
+    /// or write files outside that directory.
+    ///
+    /// Default: `true` when `sites_dir` is set, `false` otherwise.
+    /// Override per-site via `site.toml`.
+    #[serde(default = "default_open_basedir")]
+    pub open_basedir: bool,
+
+    /// Disable dangerous PHP functions in multi-tenant mode.
+    ///
+    /// When `true`, `exec`, `shell_exec`, `system`, `passthru`,
+    /// `proc_open`, `popen`, and `pcntl_exec` are disabled via
+    /// `disable_functions`. Prevents shell escape from `open_basedir`.
+    ///
+    /// Default: `true` when `sites_dir` is set, `false` otherwise.
+    /// Override per-site via `site.toml`.
+    #[serde(default = "default_disable_shell_exec")]
+    pub disable_shell_exec: bool,
+}
+
+fn default_open_basedir() -> bool {
+    true
+}
+
+fn default_disable_shell_exec() -> bool {
+    true
 }
 
 /// Logging configuration (`[server.logging]`).
