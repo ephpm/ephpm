@@ -620,6 +620,10 @@ pub struct DbConfig {
     #[serde(default)]
     pub postgres: Option<DbBackendConfig>,
 
+    /// TDS (`SQL Server`) proxy configuration.
+    #[serde(default)]
+    pub tds: Option<DbBackendConfig>,
+
     /// Embedded SQLite configuration (via litewire).
     ///
     /// When enabled, starts an in-process SQLite database with MySQL/Hrana
@@ -676,6 +680,20 @@ pub struct SqliteProxyConfig {
     /// Useful for CI tooling, health checks, and direct HTTP access.
     #[serde(default)]
     pub hrana_listen: Option<String>,
+
+    /// `PostgreSQL` wire protocol listen address (optional).
+    ///
+    /// When set, PHP can connect via `pdo_pgsql` as if talking to a real
+    /// `PostgreSQL` server. Default: disabled.
+    #[serde(default)]
+    pub postgres_listen: Option<String>,
+
+    /// `TDS` wire protocol listen address (optional).
+    ///
+    /// When set, clients can connect via the `TDS` protocol (SQL Server).
+    /// Default: disabled.
+    #[serde(default)]
+    pub tds_listen: Option<String>,
 }
 
 impl Default for SqliteProxyConfig {
@@ -683,6 +701,8 @@ impl Default for SqliteProxyConfig {
         Self {
             mysql_listen: default_sqlite_mysql_listen(),
             hrana_listen: None,
+            postgres_listen: None,
+            tds_listen: None,
         }
     }
 }
