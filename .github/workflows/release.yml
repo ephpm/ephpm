@@ -18,6 +18,11 @@ jobs:
         php: ["8.4", "8.5"]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ephpm/litewire
+          path: ../litewire
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build ephpm
         run: cargo xtask release ${{ matrix.php }}
@@ -42,6 +47,11 @@ jobs:
             artifact_suffix: macos-x86_64
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ephpm/litewire
+          path: ../litewire
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
