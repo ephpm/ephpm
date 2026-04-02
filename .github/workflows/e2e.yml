@@ -22,8 +22,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - name: Checkout litewire
-        run: git clone --depth 1 https://${{ secrets.GITHUB_TOKEN }}@github.com/ephpm/litewire.git ../litewire
 
       - uses: dtolnay/rust-toolchain@stable
 

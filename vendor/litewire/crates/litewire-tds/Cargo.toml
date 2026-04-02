@@ -1,0 +1,15 @@
+[package]
+name = "litewire-tds"
+description = "TDS (SQL Server) wire protocol frontend for litewire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+litewire-backend = { workspace = true }
+litewire-translate = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

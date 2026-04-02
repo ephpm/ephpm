@@ -1,0 +1,29 @@
+[package]
+name = "litewire-backend"
+description = "Backend trait and implementations for litewire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+litewire-hrana = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = { workspace = true }
+
+[features]
+default = ["rusqlite"]
+rusqlite = ["dep:rusqlite"]
+hrana-client = ["dep:reqwest", "dep:serde", "dep:serde_json", "dep:base64"]

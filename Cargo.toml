@@ -65,8 +65,8 @@ ephpm-query-stats = { path = "crates/ephpm-query-stats" }
 ephpm-server = { path = "crates/ephpm-server" }
 ephpm-sqld = { path = "crates/ephpm-sqld" }
 
-# External — litewire (embedded SQLite wire protocol proxy)
-litewire = { path = "../litewire/crates/litewire", default-features = false, features = ["mysql", "hrana", "backend-rusqlite", "backend-hrana-client"] }
+# External — litewire (vendored copy for CI, synced from ephpm/litewire)
+litewire = { path = "vendor/litewire/crates/litewire", default-features = false, features = ["mysql", "hrana", "backend-rusqlite", "backend-hrana-client"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

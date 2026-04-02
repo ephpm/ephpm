@@ -1,0 +1,12 @@
+[package]
+name = "litewire-translate"
+description = "SQL dialect translation (MySQL/PG/T-SQL -> SQLite)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sqlparser = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

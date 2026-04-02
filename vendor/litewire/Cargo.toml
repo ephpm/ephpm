@@ -1,0 +1,70 @@
+# Vendored copy of litewire for CI builds.
+# Only includes crates needed by ephpm. Synced from ephpm/litewire.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/litewire",
+    "crates/litewire-backend",
+    "crates/litewire-translate",
+    "crates/litewire-mysql",
+    "crates/litewire-postgres",
+    "crates/litewire-tds",
+    "crates/litewire-hrana",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+
+[workspace.dependencies]
+# Internal crates
+litewire-backend = { path = "crates/litewire-backend" }
+litewire-translate = { path = "crates/litewire-translate" }
+litewire-mysql = { path = "crates/litewire-mysql" }
+litewire-postgres = { path = "crates/litewire-postgres" }
+litewire-tds = { path = "crates/litewire-tds" }
+litewire-hrana = { path = "crates/litewire-hrana" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Wire protocol
+opensrv-mysql = "0.7"
+pgwire = "0.28"
+
+# SQL parsing
+sqlparser = { version = "0.57", features = ["serde"] }
+
+# Backends
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# HTTP (Hrana)
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Misc
+async-trait = "0.1"
+bytes = "1"
+base64 = "0.22"
+futures = "0.3"
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"] }
+mysql_async = { version = "0.34", default-features = false, features = ["rustls-tls"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+tiberius = { version = "0.12", default-features = false, features = ["rustls"] }
+tokio-util = { version = "0.7", features = ["compat"] }
