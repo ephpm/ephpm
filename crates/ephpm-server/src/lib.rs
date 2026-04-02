@@ -624,14 +624,28 @@ fn start_kv_service(
 
     // Start RESP server if enabled
     let listen = config.kv.redis_compat.listen.clone();
+    let password = config.kv.redis_compat.password.clone();
+    let secret = config.kv.secret.clone();
     let server_config = ephpm_kv::server::ServerConfig {
         listen,
+        password,
+        secret: secret.clone(),
         ..Default::default()
+    };
+
+    // Build multi-tenant store for HMAC auth if secret + sites_dir are both set.
+    let multi_tenant = if secret.is_some() && config.server.sites_dir.is_some() {
+        Some(ephpm_kv::multi_tenant::MultiTenantStore::new(
+            Arc::clone(&store),
+            ephpm_kv::store::StoreConfig::default(),
+        ))
+    } else {
+        None
     };
 
     let store_for_resp = Arc::clone(&store);
     let handle = tokio::spawn(async move {
-        match ephpm_kv::server::run(store_for_resp, server_config).await {
+        match ephpm_kv::server::run(store_for_resp, server_config, multi_tenant).await {
             Ok(()) => tracing::info!("KV RESP server stopped"),
             Err(e) => tracing::error!("KV RESP server error: {e:#}"),
         }
