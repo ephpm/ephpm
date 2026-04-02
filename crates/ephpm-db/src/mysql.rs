@@ -29,6 +29,7 @@
 //! ```
 //! Support for `caching_sha2_password` is planned (TODO).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use sha1::{Digest, Sha1};
@@ -86,6 +87,8 @@ struct ServerMeta {
 pub struct MySqlProxy {
     pool: Pool,
     replica_pools: Vec<Pool>,
+    /// Round-robin counter for distributing reads across replicas.
+    replica_rr: AtomicUsize,
     meta: Arc<ServerMeta>,
     listen: String,
     #[allow(dead_code)]
@@ -181,6 +184,7 @@ impl MySqlProxy {
         Ok(Self {
             pool,
             replica_pools,
+            replica_rr: AtomicUsize::new(0),
             meta,
             listen: listen.to_string(),
             socket,
@@ -243,7 +247,7 @@ impl MySqlProxy {
 
         if needs_routing {
             // Step 4a: per-query routing with dirty tracking.
-            proxy_routing_loop(client, &self.pool, &self.replica_pools, &self.rw_split, self.reset_strategy)
+            proxy_routing_loop(client, &self.pool, &self.replica_pools, &self.replica_rr, &self.rw_split, self.reset_strategy)
                 .await
         } else {
             // Fast path: simple bidirectional copy.
@@ -750,6 +754,7 @@ async fn forward_mysql_response(
 fn select_pool<'a>(
     primary: &'a Pool,
     replicas: &'a [Pool],
+    replica_rr: &AtomicUsize,
     state: &ClientState,
     kind: QueryKind,
     _rw_split: &RwSplitParams,
@@ -771,10 +776,10 @@ fn select_pool<'a>(
         }
     }
 
-    // Read queries can use replicas.
+    // Read queries can use replicas via round-robin.
     if matches!(kind, QueryKind::Read) {
-        // Simple V1: use first replica. TODO: round-robin.
-        &replicas[0]
+        let idx = replica_rr.fetch_add(1, Ordering::Relaxed) % replicas.len();
+        &replicas[idx]
     } else {
         // Write, TxBegin, TxEnd: always primary.
         primary
@@ -786,6 +791,7 @@ async fn proxy_routing_loop(
     mut client: TcpStream,
     pool: &Pool,
     replica_pools: &[Pool],
+    replica_rr: &AtomicUsize,
     rw_split: &RwSplitParams,
     reset_strategy: crate::ResetStrategy,
 ) -> Result<(), DbError> {
@@ -814,7 +820,7 @@ async fn proxy_routing_loop(
                 QueryKind::Write
             };
 
-            let target = select_pool(pool, replica_pools, &state, kind, rw_split);
+            let target = select_pool(pool, replica_pools, replica_rr, &state, kind, rw_split);
             (target, kind)
         } else {
             (pool, QueryKind::Write) // No routing: always primary

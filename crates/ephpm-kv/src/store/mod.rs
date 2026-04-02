@@ -613,11 +613,15 @@ fn compress_value(data: &[u8], config: CompressionConfig) -> Vec<u8> {
             }
         }
         CompressionAlgo::Brotli => {
-            // The brotli crate (FFI bindings to C library) doesn't expose a simple
-            // high-level compression function like flate2::Compression or zstd::encode_all.
-            // For now, fall back to storing uncompressed. Users should prefer gzip or zstd.
-            // TODO: Implement via raw FFI bindings to BrotliEncoderCompress if needed.
-            data.to_vec()
+            let mut output = Vec::new();
+            {
+                let mut encoder = brotli::CompressorWriter::new(&mut output, 4096, config.level, 22);
+                if encoder.write_all(data).is_err() {
+                    return data.to_vec(); // Fall back to uncompressed
+                }
+                // CompressorWriter flushes remaining data on drop.
+            }
+            output
         }
         CompressionAlgo::Zstd => {
             #[allow(clippy::cast_possible_wrap)]
