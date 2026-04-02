@@ -27,6 +27,9 @@ pub struct ServerConfig {
     /// Maximum input buffer size per connection (bytes). Protects against
     /// clients sending enormous payloads.
     pub max_input_buffer: usize,
+    /// Optional password for RESP AUTH. When set, clients must authenticate
+    /// before any commands are accepted.
+    pub password: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -34,6 +37,7 @@ impl Default for ServerConfig {
         Self {
             listen: "127.0.0.1:6379".into(),
             max_input_buffer: 64 * 1024 * 1024, // 64 MiB
+            password: None,
         }
     }
 }
@@ -54,7 +58,8 @@ pub async fn run(store: Arc<Store>, config: ServerConfig) -> anyhow::Result<()> 
     info!(listen = %config.listen, "KV store RESP server listening");
 
     let max_buf = config.max_input_buffer;
-    let accept = serve_on(Arc::clone(&store), listener, max_buf);
+    let password = config.password.clone();
+    let accept = serve_on(Arc::clone(&store), listener, max_buf, password);
 
     tokio::select! {
         result = accept => result,
@@ -82,7 +87,10 @@ pub async fn serve_on(
     store: Arc<Store>,
     listener: TcpListener,
     max_input_buffer: usize,
+    password: Option<String>,
 ) -> anyhow::Result<()> {
+    let password: Option<Arc<str>> = password.map(|p| Arc::from(p.as_str()));
+
     // Background expiry reaper — runs every second.
     let expiry_store = Arc::clone(&store);
     let _expiry_handle = tokio::spawn(async move {
@@ -98,8 +106,12 @@ pub async fn serve_on(
             Ok((stream, addr)) => {
                 debug!(peer = %addr, "new KV connection");
                 let conn_store = Arc::clone(&store);
+                let conn_password = password.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, &conn_store, max_input_buffer).await {
+                    if let Err(e) =
+                        handle_connection(stream, &conn_store, max_input_buffer, conn_password)
+                            .await
+                    {
                         debug!(peer = %addr, error = %e, "connection closed with error");
                     }
                     trace!(peer = %addr, "connection closed");
@@ -115,31 +127,103 @@ pub async fn serve_on(
     Ok(())
 }
 
+/// Extract the command name from a parsed RESP frame.
+///
+/// Returns the uppercased command name if the frame is a valid command
+/// (either an array with a bulk/simple first element, or a simple string).
+fn extract_command_name(frame: &Frame) -> Option<String> {
+    match frame {
+        Frame::Array(a) if !a.is_empty() => match &a[0] {
+            Frame::Bulk(b) => Some(String::from_utf8_lossy(b).to_ascii_uppercase()),
+            Frame::Simple(s) => Some(s.to_ascii_uppercase()),
+            _ => None,
+        },
+        Frame::Simple(s) => s.split_whitespace().next().map(|c| c.to_ascii_uppercase()),
+        _ => None,
+    }
+}
+
+/// Handle the AUTH command, validating the password if one is configured.
+///
+/// Returns the response frame and whether authentication succeeded.
+fn handle_auth(frame: &Frame, required_password: &Option<Arc<str>>) -> (Frame, bool) {
+    let password_arg = match frame {
+        Frame::Array(a) if a.len() >= 2 => match &a[1] {
+            Frame::Bulk(b) => Some(String::from_utf8_lossy(b).into_owned()),
+            Frame::Simple(s) => Some(s.clone()),
+            _ => None,
+        },
+        Frame::Simple(s) => s.split_whitespace().nth(1).map(String::from),
+        _ => None,
+    };
+
+    match (required_password, password_arg) {
+        // Password configured and client provided one — validate.
+        (Some(expected), Some(ref provided)) if expected.as_ref() == provided.as_str() => {
+            (Frame::ok(), true)
+        }
+        // Password configured but client provided wrong one.
+        (Some(_), Some(_)) => (Frame::error("ERR invalid password"), false),
+        // Password configured but client sent AUTH with no argument.
+        (Some(_), None) => (
+            Frame::error("ERR wrong number of arguments for 'auth' command"),
+            false,
+        ),
+        // No password configured — AUTH is a no-op, always succeeds.
+        (None, _) => (Frame::ok(), true),
+    }
+}
+
 /// Handle a single RESP connection.
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     store: &Arc<Store>,
     max_buf: usize,
+    password: Option<Arc<str>>,
 ) -> anyhow::Result<()> {
     let mut buf = BytesMut::with_capacity(4096);
     let mut write_buf = BytesMut::with_capacity(4096);
+    // If no password is configured, connections start authenticated.
+    let mut authenticated = password.is_none();
 
     loop {
         // Try to parse frames already in the buffer before reading more.
         loop {
             match resp::parse_frame(&mut buf) {
                 Ok(Some(frame)) => {
-                    let response = command::dispatch(store, &frame);
+                    let cmd_name = extract_command_name(&frame);
 
-                    // Check for QUIT.
-                    if matches!(&frame, Frame::Array(a) if !a.is_empty() && matches!(&a[0], Frame::Bulk(b) if b.eq_ignore_ascii_case(b"QUIT")))
-                    {
+                    // AUTH is always allowed, even before authentication.
+                    if cmd_name.as_deref() == Some("AUTH") {
+                        let (response, success) = handle_auth(&frame, &password);
+                        if success {
+                            authenticated = true;
+                        }
+                        write_buf.clear();
+                        response.write_to(&mut write_buf);
+                        stream.write_all(&write_buf).await?;
+                        continue;
+                    }
+
+                    // QUIT is always allowed.
+                    if cmd_name.as_deref() == Some("QUIT") {
+                        let response = Frame::ok();
                         write_buf.clear();
                         response.write_to(&mut write_buf);
                         stream.write_all(&write_buf).await?;
                         return Ok(());
                     }
 
+                    // Block all other commands until authenticated.
+                    if !authenticated {
+                        let response = Frame::error("NOAUTH Authentication required");
+                        write_buf.clear();
+                        response.write_to(&mut write_buf);
+                        stream.write_all(&write_buf).await?;
+                        continue;
+                    }
+
+                    let response = command::dispatch(store, &frame);
                     write_buf.clear();
                     response.write_to(&mut write_buf);
                     stream.write_all(&write_buf).await?;

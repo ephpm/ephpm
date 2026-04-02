@@ -1029,6 +1029,14 @@ pub struct KvRedisCompatConfig {
     /// Optional Unix socket path (faster than TCP for local connections).
     #[serde(default)]
     pub socket: Option<String>,
+
+    /// Optional password required for RESP AUTH. When set, clients must send
+    /// `AUTH <password>` before any commands are accepted. Equivalent to
+    /// Redis `requirepass`.
+    ///
+    /// Default: `None` (no authentication required).
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 impl Default for KvRedisCompatConfig {
@@ -1037,6 +1045,7 @@ impl Default for KvRedisCompatConfig {
             enabled: false,
             listen: default_kv_listen(),
             socket: None,
+            password: None,
         }
     }
 }

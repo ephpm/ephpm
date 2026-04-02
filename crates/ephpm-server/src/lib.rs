@@ -623,8 +623,10 @@ fn start_kv_service(
 
     // Start RESP server if enabled
     let listen = config.kv.redis_compat.listen.clone();
+    let password = config.kv.redis_compat.password.clone();
     let server_config = ephpm_kv::server::ServerConfig {
         listen,
+        password,
         ..Default::default()
     };
 
