@@ -15,11 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: ephpm/litewire
-          path: ../litewire
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout litewire
+        run: git clone --depth 1 https://${{ secrets.GITHUB_TOKEN }}@github.com/ephpm/litewire.git ../litewire
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
@@ -30,11 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: ephpm/litewire
-          path: ../litewire
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout litewire
+        run: git clone --depth 1 https://${{ secrets.GITHUB_TOKEN }}@github.com/ephpm/litewire.git ../litewire
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -49,11 +43,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: ephpm/litewire
-          path: ../litewire
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout litewire
+        run: git clone --depth 1 https://${{ secrets.GITHUB_TOKEN }}@github.com/ephpm/litewire.git ../litewire
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -64,9 +55,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: ephpm/litewire
-          path: ../litewire
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Checkout litewire
+        run: git clone --depth 1 https://${{ secrets.GITHUB_TOKEN }}@github.com/ephpm/litewire.git ../litewire
       - uses: EmbarkStudios/cargo-deny-action@v2
