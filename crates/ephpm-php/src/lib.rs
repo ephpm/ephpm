@@ -635,6 +635,7 @@ mod tests {
             server_port: 8080,
             is_https: false,
             protocol: "HTTP/1.1".into(),
+            env_vars: Vec::new(),
         }
     }
 

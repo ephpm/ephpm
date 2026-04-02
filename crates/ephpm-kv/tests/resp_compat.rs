@@ -32,7 +32,7 @@ impl TestServer {
 
         let store = Store::new(StoreConfig::default());
         let handle = tokio::spawn(async move {
-            server::serve_on(store, listener, 64 * 1024 * 1024)
+            server::serve_on(store, listener, 64 * 1024 * 1024, None, None, None)
                 .await
                 .ok();
         });
@@ -702,4 +702,276 @@ async fn wrong_arg_count_returns_error() {
     let mut con = srv.con().await;
     let err = redis::cmd("GET").query_async::<String>(&mut con).await;
     assert!(err.is_err(), "GET with no args should return an error");
+}
+
+// ── AUTH tests ───────────────────────────────────────────────────────────────
+
+/// Start a server with a password configured.
+struct AuthTestServer {
+    addr: String,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl AuthTestServer {
+    async fn start(password: &str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test listener");
+        let addr = listener
+            .local_addr()
+            .expect("failed to get local addr")
+            .to_string();
+
+        let store = Store::new(StoreConfig::default());
+        let pw = Some(password.to_string());
+        let handle = tokio::spawn(async move {
+            server::serve_on(store, listener, 64 * 1024 * 1024, pw, None, None)
+                .await
+                .ok();
+        });
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        Self { addr, handle }
+    }
+}
+
+impl Drop for AuthTestServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn auth_required_blocks_commands() {
+    let srv = AuthTestServer::start("secret123").await;
+
+    // Connect without auth — commands should be rejected with NOAUTH.
+    let client = redis::Client::open(format!("redis://{}/", srv.addr)).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    let err = redis::cmd("PING").query_async::<String>(&mut con).await;
+    assert!(err.is_err(), "PING without AUTH should fail");
+    let msg = err.unwrap_err().to_string();
+    assert!(
+        msg.contains("NOAUTH"),
+        "expected NOAUTH error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn auth_correct_password_allows_commands() {
+    let srv = AuthTestServer::start("secret123").await;
+
+    // Connect with the correct password via URL.
+    let url = format!("redis://:secret123@{}/", srv.addr);
+    let client = redis::Client::open(url).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    let resp: String = redis::cmd("PING").query_async(&mut con).await.unwrap();
+    assert_eq!(resp, "PONG");
+}
+
+#[tokio::test]
+async fn auth_wrong_password_rejected() {
+    let srv = AuthTestServer::start("secret123").await;
+
+    // Connect with a wrong password — the redis crate sends AUTH during connect.
+    let url = format!("redis://:wrongpass@{}/", srv.addr);
+    let client = redis::Client::open(url).unwrap();
+    let result = client.get_multiplexed_async_connection().await;
+
+    assert!(result.is_err(), "wrong password should fail to connect");
+}
+
+#[tokio::test]
+async fn auth_no_password_configured_accepts_anything() {
+    // Use the normal TestServer (no password).
+    let srv = TestServer::start().await;
+
+    // AUTH with any password should succeed when no password is configured.
+    let mut con = srv.con().await;
+    let resp: String = redis::cmd("AUTH")
+        .arg("anything")
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(resp, "OK");
+}
+
+// ── HMAC multi-tenant AUTH tests ────────────────────────────────────────────
+
+/// Start a server with HMAC-derived per-site authentication.
+struct HmacTestServer {
+    addr: String,
+    handle: tokio::task::JoinHandle<()>,
+    secret: String,
+}
+
+impl HmacTestServer {
+    async fn start(secret: &str) -> Self {
+        use ephpm_kv::multi_tenant::MultiTenantStore;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind test listener");
+        let addr = listener
+            .local_addr()
+            .expect("failed to get local addr")
+            .to_string();
+
+        let store = Store::new(StoreConfig::default());
+        let mt = MultiTenantStore::new(
+            std::sync::Arc::clone(&store),
+            StoreConfig::default(),
+        );
+        let sec = Some(secret.to_string());
+        let handle = tokio::spawn(async move {
+            server::serve_on(store, listener, 64 * 1024 * 1024, None, sec, Some(mt))
+                .await
+                .ok();
+        });
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        Self {
+            addr,
+            handle,
+            secret: secret.to_string(),
+        }
+    }
+}
+
+impl Drop for HmacTestServer {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+#[tokio::test]
+async fn hmac_auth_correct_password_succeeds() {
+    use ephpm_kv::auth::derive_site_password;
+
+    let srv = HmacTestServer::start("test-secret").await;
+    let hostname = "alice.example.com";
+    let password = derive_site_password(&srv.secret, hostname);
+
+    // Connect and manually AUTH with hostname + derived password.
+    let client = redis::Client::open(format!("redis://{}/", srv.addr)).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    // First, commands should be blocked (NOAUTH).
+    let err = redis::cmd("PING").query_async::<String>(&mut con).await;
+    assert!(err.is_err());
+    let msg = err.unwrap_err().to_string();
+    assert!(msg.contains("NOAUTH"), "expected NOAUTH, got: {msg}");
+
+    // Now AUTH with the correct hostname + password.
+    let resp: String = redis::cmd("AUTH")
+        .arg(hostname)
+        .arg(&password)
+        .query_async(&mut con)
+        .await
+        .unwrap();
+    assert_eq!(resp, "OK");
+
+    // Commands should now work.
+    let pong: String = redis::cmd("PING").query_async(&mut con).await.unwrap();
+    assert_eq!(pong, "PONG");
+}
+
+#[tokio::test]
+async fn hmac_auth_wrong_password_rejected() {
+    let srv = HmacTestServer::start("test-secret").await;
+
+    let client = redis::Client::open(format!("redis://{}/", srv.addr)).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    let err = redis::cmd("AUTH")
+        .arg("alice.example.com")
+        .arg("wrong-password")
+        .query_async::<String>(&mut con)
+        .await;
+    assert!(err.is_err());
+    let msg = err.unwrap_err().to_string();
+    assert!(
+        msg.contains("invalid password"),
+        "expected invalid password error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn hmac_auth_site_isolation() {
+    use ephpm_kv::auth::derive_site_password;
+
+    let srv = HmacTestServer::start("test-secret").await;
+
+    // Connect as alice
+    let pw_alice = derive_site_password(&srv.secret, "alice.com");
+    let client_alice = redis::Client::open(format!("redis://{}/", srv.addr)).unwrap();
+    let mut con_alice = client_alice.get_multiplexed_async_connection().await.unwrap();
+    let _: String = redis::cmd("AUTH")
+        .arg("alice.com")
+        .arg(&pw_alice)
+        .query_async(&mut con_alice)
+        .await
+        .unwrap();
+
+    // Connect as bob
+    let pw_bob = derive_site_password(&srv.secret, "bob.com");
+    let client_bob = redis::Client::open(format!("redis://{}/", srv.addr)).unwrap();
+    let mut con_bob = client_bob.get_multiplexed_async_connection().await.unwrap();
+    let _: String = redis::cmd("AUTH")
+        .arg("bob.com")
+        .arg(&pw_bob)
+        .query_async(&mut con_bob)
+        .await
+        .unwrap();
+
+    // Alice sets a key.
+    let _: () = redis::cmd("SET")
+        .arg("shared_key")
+        .arg("alice-data")
+        .query_async(&mut con_alice)
+        .await
+        .unwrap();
+
+    // Bob should not see Alice's key (isolated stores).
+    let bob_val: Option<String> = redis::cmd("GET")
+        .arg("shared_key")
+        .query_async(&mut con_bob)
+        .await
+        .unwrap();
+    assert!(
+        bob_val.is_none(),
+        "bob should not see alice's data, got: {bob_val:?}"
+    );
+
+    // Alice should see her own key.
+    let alice_val: String = redis::cmd("GET")
+        .arg("shared_key")
+        .query_async(&mut con_alice)
+        .await
+        .unwrap();
+    assert_eq!(alice_val, "alice-data");
+}
+
+#[tokio::test]
+async fn hmac_auth_missing_password_arg_rejected() {
+    let srv = HmacTestServer::start("test-secret").await;
+
+    let client = redis::Client::open(format!("redis://{}/", srv.addr)).unwrap();
+    let mut con = client.get_multiplexed_async_connection().await.unwrap();
+
+    // AUTH with only hostname (missing password) should fail.
+    let err = redis::cmd("AUTH")
+        .arg("alice.com")
+        .query_async::<String>(&mut con)
+        .await;
+    assert!(err.is_err());
+    let msg = err.unwrap_err().to_string();
+    assert!(
+        msg.contains("wrong number of arguments"),
+        "expected wrong number of arguments error, got: {msg}"
+    );
 }

@@ -20,6 +20,8 @@ bytes.workspace = true
 flate2.workspace = true
 brotli.workspace = true
 zstd.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

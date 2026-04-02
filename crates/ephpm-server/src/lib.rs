@@ -37,6 +37,7 @@ use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 /// - KV store with optional RESP protocol server
 /// - `MySQL` connection proxy (if configured)
 /// - `PostgreSQL` connection proxy (if configured)
+/// - `TDS` (SQL Server) connection proxy (if configured)
 ///
 /// When `[server.tls]` is configured, the server terminates TLS using
 /// either manual cert/key files or automatic ACME provisioning.
@@ -623,14 +624,28 @@ fn start_kv_service(
 
     // Start RESP server if enabled
     let listen = config.kv.redis_compat.listen.clone();
+    let password = config.kv.redis_compat.password.clone();
+    let secret = config.kv.secret.clone();
     let server_config = ephpm_kv::server::ServerConfig {
         listen,
+        password,
+        secret: secret.clone(),
         ..Default::default()
+    };
+
+    // Build multi-tenant store for HMAC auth if secret + sites_dir are both set.
+    let multi_tenant = if secret.is_some() && config.server.sites_dir.is_some() {
+        Some(ephpm_kv::multi_tenant::MultiTenantStore::new(
+            Arc::clone(&store),
+            ephpm_kv::store::StoreConfig::default(),
+        ))
+    } else {
+        None
     };
 
     let store_for_resp = Arc::clone(&store);
     let handle = tokio::spawn(async move {
-        match ephpm_kv::server::run(store_for_resp, server_config).await {
+        match ephpm_kv::server::run(store_for_resp, server_config, multi_tenant).await {
             Ok(()) => tracing::info!("KV RESP server stopped"),
             Err(e) => tracing::error!("KV RESP server error: {e:#}"),
         }
@@ -639,7 +654,7 @@ fn start_kv_service(
     Ok((store, Some(handle)))
 }
 
-/// Start database proxies (`MySQL`, `PostgreSQL`, embedded `SQLite`).
+/// Start database proxies (`MySQL`, `PostgreSQL`, `TDS`, embedded `SQLite`).
 async fn start_db_proxies(
     config: &Config,
     cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
@@ -695,9 +710,120 @@ async fn start_db_proxies(
         }
     }
 
-    // PostgreSQL proxy (placeholder for now)
-    if config.db.postgres.is_some() {
-        tracing::info!("PostgreSQL proxy not yet implemented");
+    // PostgreSQL proxy
+    if let Some(pg_config) = &config.db.postgres {
+        let url = pg_config.url.clone();
+        let listen = pg_config
+            .listen
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1:5432".to_string());
+
+        let pool_config = ephpm_db::pool::PoolConfig {
+            min_connections: pg_config.min_connections,
+            max_connections: pg_config.max_connections,
+            idle_timeout: parse_duration(&pg_config.idle_timeout)?,
+            max_lifetime: parse_duration(&pg_config.max_lifetime)?,
+            pool_timeout: parse_duration(&pg_config.pool_timeout)?,
+            health_check_interval: parse_duration(&pg_config.health_check_interval)?,
+        };
+
+        let reset_strategy = ephpm_db::ResetStrategy::from_str_lossy(&pg_config.reset_strategy);
+
+        let replica_urls = pg_config
+            .replicas
+            .as_ref()
+            .map(|r| r.urls.clone())
+            .unwrap_or_default();
+
+        let rw_split = ephpm_db::mysql::RwSplitParams {
+            enabled: config.db.read_write_split.enabled,
+            sticky_duration: parse_duration(&config.db.read_write_split.sticky_duration)?,
+        };
+
+        match ephpm_db::mysql::build_proxy(
+            &url,
+            &listen,
+            pg_config.socket.clone(),
+            pool_config,
+            reset_strategy,
+            replica_urls,
+            rw_split,
+        )
+        .await
+        {
+            Ok(proxy) => {
+                let maintenance_handle = proxy.start_maintenance();
+                let proxy_handle = tokio::spawn(async move {
+                    match proxy.run().await {
+                        Ok(()) => tracing::info!("PostgreSQL proxy stopped"),
+                        Err(e) => tracing::error!("PostgreSQL proxy error: {e:#}"),
+                    }
+                });
+                handles.push(proxy_handle);
+                drop(maintenance_handle);
+            }
+            Err(e) => {
+                tracing::error!("failed to start PostgreSQL proxy: {e:#}");
+            }
+        }
+    }
+
+    // TDS (SQL Server) proxy
+    if let Some(tds_config) = &config.db.tds {
+        let url = tds_config.url.clone();
+        let listen = tds_config
+            .listen
+            .clone()
+            .unwrap_or_else(|| "127.0.0.1:1433".to_string());
+
+        let pool_config = ephpm_db::pool::PoolConfig {
+            min_connections: tds_config.min_connections,
+            max_connections: tds_config.max_connections,
+            idle_timeout: parse_duration(&tds_config.idle_timeout)?,
+            max_lifetime: parse_duration(&tds_config.max_lifetime)?,
+            pool_timeout: parse_duration(&tds_config.pool_timeout)?,
+            health_check_interval: parse_duration(&tds_config.health_check_interval)?,
+        };
+
+        let reset_strategy = ephpm_db::ResetStrategy::from_str_lossy(&tds_config.reset_strategy);
+
+        let replica_urls = tds_config
+            .replicas
+            .as_ref()
+            .map(|r| r.urls.clone())
+            .unwrap_or_default();
+
+        let rw_split = ephpm_db::mysql::RwSplitParams {
+            enabled: config.db.read_write_split.enabled,
+            sticky_duration: parse_duration(&config.db.read_write_split.sticky_duration)?,
+        };
+
+        match ephpm_db::mysql::build_proxy(
+            &url,
+            &listen,
+            tds_config.socket.clone(),
+            pool_config,
+            reset_strategy,
+            replica_urls,
+            rw_split,
+        )
+        .await
+        {
+            Ok(proxy) => {
+                let maintenance_handle = proxy.start_maintenance();
+                let proxy_handle = tokio::spawn(async move {
+                    match proxy.run().await {
+                        Ok(()) => tracing::info!("TDS proxy stopped"),
+                        Err(e) => tracing::error!("TDS proxy error: {e:#}"),
+                    }
+                });
+                handles.push(proxy_handle);
+                drop(maintenance_handle);
+            }
+            Err(e) => {
+                tracing::error!("failed to start TDS proxy: {e:#}");
+            }
+        }
     }
 
     // Embedded SQLite via litewire
@@ -742,6 +868,16 @@ fn start_single_node_sqlite(
     if let Some(ref hrana_addr) = sqlite_config.proxy.hrana_listen {
         builder = builder.hrana(hrana_addr);
         tracing::info!(listen = %hrana_addr, "SQLite Hrana HTTP API enabled");
+    }
+
+    if let Some(ref pg_addr) = sqlite_config.proxy.postgres_listen {
+        builder = builder.postgres(pg_addr);
+        tracing::info!(listen = %pg_addr, "SQLite PostgreSQL wire protocol enabled");
+    }
+
+    if let Some(ref tds_addr) = sqlite_config.proxy.tds_listen {
+        builder = builder.tds(tds_addr);
+        tracing::info!(listen = %tds_addr, "SQLite TDS wire protocol enabled");
     }
 
     handles.push(tokio::spawn(async move {
@@ -867,6 +1003,16 @@ async fn start_clustered_sqlite(
     if let Some(ref hrana_addr) = sqlite_config.proxy.hrana_listen {
         builder = builder.hrana(hrana_addr);
         tracing::info!(listen = %hrana_addr, "SQLite Hrana HTTP API enabled (clustered)");
+    }
+
+    if let Some(ref pg_addr) = sqlite_config.proxy.postgres_listen {
+        builder = builder.postgres(pg_addr);
+        tracing::info!(listen = %pg_addr, "SQLite PostgreSQL wire protocol enabled (clustered)");
+    }
+
+    if let Some(ref tds_addr) = sqlite_config.proxy.tds_listen {
+        builder = builder.tds(tds_addr);
+        tracing::info!(listen = %tds_addr, "SQLite TDS wire protocol enabled (clustered)");
     }
 
     // Spawn litewire serve task. sqld is kept alive via the Arc.

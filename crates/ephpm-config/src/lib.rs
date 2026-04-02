@@ -473,7 +473,7 @@ pub struct FileCacheConfig {
     pub inactive_secs: u64,
 
     /// Cache file content below this size in bytes. Larger files
-    /// only have metadata cached (size, mtime, ETag, MIME type).
+    /// only have metadata cached (size, mtime, `ETag`, MIME type).
     ///
     /// Default: `1048576` (1 MiB).
     #[serde(default = "default_file_cache_inline_threshold")]
@@ -620,9 +620,14 @@ pub struct DbConfig {
     #[serde(default)]
     pub postgres: Option<DbBackendConfig>,
 
+    /// TDS (`SQL Server`) proxy configuration.
+    #[serde(default)]
+    pub tds: Option<DbBackendConfig>,
+
     /// Embedded SQLite configuration (via litewire).
+
     ///
-    /// When enabled, starts an in-process SQLite database with MySQL/Hrana
+    /// When enabled, starts an in-process `SQLite` database with `MySQL`/Hrana
     /// wire protocol frontends. PHP connects via `pdo_mysql` — no external
     /// database server needed.
     #[serde(default)]
@@ -637,13 +642,13 @@ pub struct DbConfig {
     pub analysis: DbAnalysisConfig,
 }
 
-/// Embedded SQLite database configuration (`[db.sqlite]`).
+/// Embedded `SQLite` database configuration (`[db.sqlite]`).
 ///
-/// Uses litewire to expose SQLite via MySQL wire protocol, so PHP apps
+/// Uses litewire to expose `SQLite` via `MySQL` wire protocol, so PHP apps
 /// can use their existing `pdo_mysql` drivers transparently.
 #[derive(Debug, Deserialize, Clone)]
 pub struct SqliteConfig {
-    /// Path to the SQLite database file.
+    /// Path to the `SQLite` database file.
     ///
     /// Default: `"ephpm.db"` in the current working directory.
     #[serde(default = "default_sqlite_path")]
@@ -662,10 +667,10 @@ pub struct SqliteConfig {
     pub replication: ReplicationConfig,
 }
 
-/// Wire protocol frontend addresses for the SQLite proxy (`[db.sqlite.proxy]`).
+/// Wire protocol frontend addresses for the `SQLite` proxy (`[db.sqlite.proxy]`).
 #[derive(Debug, Deserialize, Clone)]
 pub struct SqliteProxyConfig {
-    /// MySQL wire protocol listen address.
+    /// `MySQL` wire protocol listen address.
     ///
     /// PHP connects here with `pdo_mysql`. Default: `"127.0.0.1:3306"`.
     #[serde(default = "default_sqlite_mysql_listen")]
@@ -676,6 +681,20 @@ pub struct SqliteProxyConfig {
     /// Useful for CI tooling, health checks, and direct HTTP access.
     #[serde(default)]
     pub hrana_listen: Option<String>,
+
+    /// `PostgreSQL` wire protocol listen address (optional).
+    ///
+    /// When set, PHP can connect via `pdo_pgsql` as if talking to a real
+    /// `PostgreSQL` server. Default: disabled.
+    #[serde(default)]
+    pub postgres_listen: Option<String>,
+
+    /// `TDS` wire protocol listen address (optional).
+    ///
+    /// When set, clients can connect via the `TDS` protocol (SQL Server).
+    /// Default: disabled.
+    #[serde(default)]
+    pub tds_listen: Option<String>,
 }
 
 impl Default for SqliteProxyConfig {
@@ -683,6 +702,8 @@ impl Default for SqliteProxyConfig {
         Self {
             mysql_listen: default_sqlite_mysql_listen(),
             hrana_listen: None,
+            postgres_listen: None,
+            tds_listen: None,
         }
     }
 }
@@ -984,6 +1005,19 @@ pub struct KvConfig {
     #[serde(default = "default_kv_compression_min_size")]
     pub compression_min_size: usize,
 
+    /// Master secret for per-site RESP authentication. When set, per-site
+    /// passwords are derived as `HMAC-SHA256(secret, hostname)`. ePHPm injects
+    /// the derived password into PHP `$_ENV` as `EPHPM_REDIS_PASSWORD` for
+    /// each request.
+    ///
+    /// If absent, a random secret is generated on first boot and persisted in
+    /// the data directory. In single-site (no `sites_dir`) mode, AUTH is not
+    /// required.
+    ///
+    /// Default: `None`.
+    #[serde(default)]
+    pub secret: Option<String>,
+
     /// Redis-compatible RESP protocol listener.
     #[serde(default)]
     pub redis_compat: KvRedisCompatConfig,
@@ -997,6 +1031,7 @@ impl Default for KvConfig {
             compression: default_kv_compression(),
             compression_level: default_kv_compression_level(),
             compression_min_size: default_kv_compression_min_size(),
+            secret: None,
             redis_compat: KvRedisCompatConfig::default(),
         }
     }
@@ -1029,6 +1064,14 @@ pub struct KvRedisCompatConfig {
     /// Optional Unix socket path (faster than TCP for local connections).
     #[serde(default)]
     pub socket: Option<String>,
+
+    /// Optional password required for RESP AUTH. When set, clients must send
+    /// `AUTH <password>` before any commands are accepted. Equivalent to
+    /// Redis `requirepass`.
+    ///
+    /// Default: `None` (no authentication required).
+    #[serde(default)]
+    pub password: Option<String>,
 }
 
 impl Default for KvRedisCompatConfig {
@@ -1037,6 +1080,7 @@ impl Default for KvRedisCompatConfig {
             enabled: false,
             listen: default_kv_listen(),
             socket: None,
+            password: None,
         }
     }
 }

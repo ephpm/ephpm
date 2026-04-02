@@ -111,14 +111,14 @@ struct ServerMeta {
 pub struct MySqlProxy {
     pool: Pool,
     replica_pools: Vec<Pool>,
+    /// Round-robin counter for distributing reads across replicas.
+    replica_rr: AtomicUsize,
     meta: Arc<ServerMeta>,
     listen: String,
     #[allow(dead_code)]
     socket: Option<std::path::PathBuf>,
     reset_strategy: ResetStrategy,
     rw_split: RwSplitParams,
-    /// Round-robin counter for distributing reads across replicas.
-    replica_rr: AtomicUsize,
 }
 
 impl MySqlProxy {
@@ -210,12 +210,12 @@ impl MySqlProxy {
         Ok(Self {
             pool,
             replica_pools,
+            replica_rr: AtomicUsize::new(0),
             meta,
             listen: listen.to_string(),
             socket,
             reset_strategy,
             rw_split,
-            replica_rr: AtomicUsize::new(0),
         })
     }
 
@@ -277,9 +277,9 @@ impl MySqlProxy {
                 client,
                 &self.pool,
                 &self.replica_pools,
+                &self.replica_rr,
                 &self.rw_split,
                 self.reset_strategy,
-                &self.replica_rr,
             )
             .await
         } else {
@@ -844,10 +844,10 @@ fn parse_stmt_id(payload: &[u8]) -> Option<u32> {
 fn select_pool<'a>(
     primary: &'a Pool,
     replicas: &'a [Pool],
+    replica_rr: &AtomicUsize,
     state: &ClientState,
     kind: QueryKind,
     _rw_split: &RwSplitParams,
-    replica_rr: &AtomicUsize,
 ) -> &'a Pool {
     // If no replicas, always use primary.
     if replicas.is_empty() {
@@ -866,7 +866,7 @@ fn select_pool<'a>(
         }
     }
 
-    // Read queries can use replicas.
+    // Read queries can use replicas via round-robin.
     if matches!(kind, QueryKind::Read) {
         let idx = replica_rr.fetch_add(1, Ordering::Relaxed) % replicas.len();
         &replicas[idx]
@@ -910,7 +910,7 @@ fn route_command<'a>(
         COM_QUERY | COM_STMT_PREPARE => {
             let sql = std::str::from_utf8(payload.get(1..).unwrap_or_default()).unwrap_or("");
             let kind = classify_mysql_query(sql);
-            (select_pool(pool, replica_pools, state, kind, rw_split, replica_rr), kind)
+            (select_pool(pool, replica_pools, replica_rr, state, kind, rw_split), kind)
         }
         COM_STMT_EXECUTE | COM_STMT_SEND_LONG_DATA | COM_STMT_FETCH => {
             let target = parse_stmt_id(payload)
@@ -968,9 +968,9 @@ async fn proxy_routing_loop(
     mut client: TcpStream,
     pool: &Pool,
     replica_pools: &[Pool],
+    replica_rr: &AtomicUsize,
     rw_split: &RwSplitParams,
     reset_strategy: crate::ResetStrategy,
-    replica_rr: &AtomicUsize,
 ) -> Result<(), DbError> {
     let mut state = ClientState::default();
     // Maps statement IDs to the pool type they were prepared on, so that
@@ -1170,7 +1170,7 @@ mod tests {
         let state = ClientState::default();
 
         let rr = AtomicUsize::new(0);
-        let target = select_pool(&primary, &replicas, &state, QueryKind::Read, &rw_split, &rr);
+        let target = select_pool(&primary, &replicas, &rr, &state, QueryKind::Read, &rw_split);
         assert!(std::ptr::eq(target, &replicas[0]));
     }
 
@@ -1184,7 +1184,7 @@ mod tests {
         let state = ClientState::default();
 
         let rr = AtomicUsize::new(0);
-        let target = select_pool(&primary, &replicas, &state, QueryKind::Write, &rw_split, &rr);
+        let target = select_pool(&primary, &replicas, &rr, &state, QueryKind::Write, &rw_split);
         assert!(std::ptr::eq(target, &primary));
     }
 
@@ -1198,7 +1198,7 @@ mod tests {
         let state = ClientState { in_transaction: true, ..ClientState::default() };
 
         let rr = AtomicUsize::new(0);
-        let target = select_pool(&primary, &replicas, &state, QueryKind::Read, &rw_split, &rr);
+        let target = select_pool(&primary, &replicas, &rr, &state, QueryKind::Read, &rw_split);
         assert!(std::ptr::eq(target, &primary));
     }
 

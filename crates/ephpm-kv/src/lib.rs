@@ -21,11 +21,12 @@
 //!
 //! # async fn example() -> anyhow::Result<()> {
 //! let store = Store::new(StoreConfig::default());
-//! server::run(store, ServerConfig::default()).await?;
+//! server::run(store, ServerConfig::default(), None).await?;
 //! # Ok(())
 //! # }
 //! ```
 
+pub mod auth;
 pub mod command;
 pub mod multi_tenant;
 pub mod resp;
