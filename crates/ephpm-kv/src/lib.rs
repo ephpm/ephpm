@@ -27,6 +27,7 @@
 //! ```
 
 pub mod command;
+pub mod multi_tenant;
 pub mod resp;
 pub mod server;
 pub mod store;

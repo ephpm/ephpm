@@ -24,41 +24,43 @@ use ephpm_kv::store::Store;
 #[cfg(php_linked)]
 static KV_STORE: OnceLock<Arc<Store>> = OnceLock::new();
 
-// ── Thread-local buffer for `get` results ───────────────────────────────
+// ── Thread-local state ──────────────────────────────────────────────────
 
 #[cfg(php_linked)]
 thread_local! {
     static KV_GET_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::new());
-    /// Per-request KV namespace prefix (hostname for vhost isolation).
-    /// When set, all keys are prefixed with `"{namespace}:"`.
-    static KV_NAMESPACE: RefCell<String> = RefCell::new(String::new());
+    /// Per-request site store for vhost KV isolation.
+    /// Points to the site-specific Store for the current request's hostname.
+    /// When None, falls back to the global store (single-site mode).
+    static KV_SITE_STORE: RefCell<Option<Arc<Store>>> = const { RefCell::new(None) };
 }
 
-/// Set the KV namespace for the current thread/request.
+/// Set the KV store for the current thread/request.
 ///
-/// Called by the request handler before PHP execution to scope
-/// KV keys to the current virtual host. An empty string means no
-/// namespacing (single-site mode).
+/// Called by the request handler before PHP execution. In multi-tenant
+/// mode, this points to the site-specific store. In single-site mode,
+/// pass `None` to use the global store.
 #[cfg(php_linked)]
-pub fn set_namespace(namespace: &str) {
-    KV_NAMESPACE.with(|ns| {
-        *ns.borrow_mut() = namespace.to_string();
+pub fn set_site_store(store: Option<Arc<Store>>) {
+    KV_SITE_STORE.with(|s| {
+        *s.borrow_mut() = store;
     });
 }
 
 /// Stub when PHP is not linked.
 #[cfg(not(php_linked))]
-pub fn set_namespace(_namespace: &str) {}
+pub fn set_site_store(_store: Option<std::sync::Arc<ephpm_kv::store::Store>>) {}
 
-/// Prepend the current namespace to a key, if set.
+/// Get the effective store for the current request.
+/// Returns the site-specific store if set, otherwise the global store.
 #[cfg(php_linked)]
-fn namespaced_key(key: &str) -> String {
-    KV_NAMESPACE.with(|ns| {
-        let ns = ns.borrow();
-        if ns.is_empty() {
-            key.to_string()
+fn effective_store() -> Option<Arc<Store>> {
+    KV_SITE_STORE.with(|s| {
+        let site = s.borrow();
+        if let Some(ref store) = *site {
+            Some(Arc::clone(store))
         } else {
-            format!("{ns}:{key}")
+            KV_STORE.get().cloned()
         }
     })
 }
@@ -138,13 +140,11 @@ unsafe extern "C" fn kv_get(key: *const std::os::raw::c_char) -> std::os::raw::c
     let Ok(key_str) = key_str.to_str() else {
         return 0;
     };
-    let key_str = namespaced_key(key_str);
-
-    let Some(store) = KV_STORE.get() else {
+    let Some(store) = effective_store() else {
         return 0;
     };
 
-    match store.get(&key_str) {
+    match store.get(key_str) {
         Some(val) => {
             KV_GET_BUF.with(|buf| {
                 let mut buf = buf.borrow_mut();
@@ -213,9 +213,7 @@ unsafe extern "C" fn kv_del(key: *const std::os::raw::c_char) -> std::os::raw::c
     let Ok(key_str) = key_str.to_str() else {
         return 0;
     };
-    let key_str = namespaced_key(key_str);
-
-    let Some(store) = KV_STORE.get() else {
+    let Some(store) = effective_store() else {
         return 0;
     };
 
@@ -229,9 +227,7 @@ unsafe extern "C" fn kv_exists(key: *const std::os::raw::c_char) -> std::os::raw
     let Ok(key_str) = key_str.to_str() else {
         return 0;
     };
-    let key_str = namespaced_key(key_str);
-
-    let Some(store) = KV_STORE.get() else {
+    let Some(store) = effective_store() else {
         return 0;
     };
 
@@ -250,9 +246,7 @@ unsafe extern "C" fn kv_incr_by(
     let Ok(key_str) = key_str.to_str() else {
         return 0;
     };
-    let key_str = namespaced_key(key_str);
-
-    let Some(store) = KV_STORE.get() else {
+    let Some(store) = effective_store() else {
         return 0;
     };
 
@@ -276,9 +270,7 @@ unsafe extern "C" fn kv_expire(
     let Ok(key_str) = key_str.to_str() else {
         return 0;
     };
-    let key_str = namespaced_key(key_str);
-
-    let Some(store) = KV_STORE.get() else {
+    let Some(store) = effective_store() else {
         return 0;
     };
 
@@ -300,9 +292,7 @@ unsafe extern "C" fn kv_pttl(
     let Ok(key_str) = key_str.to_str() else {
         return -2;
     };
-    let key_str = namespaced_key(key_str);
-
-    let Some(store) = KV_STORE.get() else {
+    let Some(store) = effective_store() else {
         return -2;
     };
 

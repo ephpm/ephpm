@@ -171,43 +171,51 @@ Beyond 3-5 clustered vhosts, an external MySQL server with ePHPm's connection-po
 
 ## KV Store Isolation
 
-In multi-tenant mode, each virtual host gets its own KV namespace automatically. PHP applications don't need any code changes — the isolation is transparent.
+In multi-tenant mode, each virtual host gets its own physically separate KV store. Not key prefixing — a completely separate `DashMap`. PHP applications don't need any code changes, and RESP (Redis protocol) connections are also isolated per-site via AUTH.
 
 ### How It Works
 
-When a PHP request executes, ephpm sets a thread-local namespace prefix based on the `Host` header. Every `ephpm_kv_*` SAPI function call automatically prepends the hostname to the key:
+When `sites_dir` is configured, ephpm creates a `MultiTenantStore` that manages per-site `Store` instances. Each site's store is created lazily on the first request — same pattern as the vhost directory discovery.
 
 ```php
 // PHP on alice-blog.com:
 ephpm_kv_set("cache:page:home", $html);
-// Stored as: "alice-blog.com:cache:page:home"
+// Stored in alice-blog.com's DashMap as "cache:page:home"
 
 // PHP on bobs-recipes.com:
 ephpm_kv_get("cache:page:home");
-// Looks up: "bobs-recipes.com:cache:page:home" → not found (isolated)
+// Looks in bobs-recipes.com's DashMap → not found (physically separate)
 ```
 
-Both sites can use identical key names without conflict. The namespace is invisible to the PHP application — it sees only its own keys.
+Keys are stored exactly as PHP sends them — no prefixes, no munging. The isolation is physical, not logical. A site's store is a completely separate data structure.
+
+### Per-Site Memory Limits
+
+Each site store has its own memory limit and eviction policy. One site filling its cache doesn't evict another site's data:
+
+```toml
+[kv]
+memory_limit = "64MB"   # per-site limit (each site gets up to this much)
+```
 
 ### Single-Site Mode
 
-When `sites_dir` is not configured (single-site mode), the namespace is empty and no prefix is applied. Zero overhead — keys are stored exactly as PHP provides them.
+When `sites_dir` is not configured, all KV operations go to the global store. No `MultiTenantStore` is created. Zero overhead.
 
-### RESP Protocol (Redis-Compatible) Security
+### RESP Protocol (Redis-Compatible) with AUTH
 
-The RESP protocol listener (`[kv.redis_compat]`) provides raw, unnamespaced access to the entire KV store. In multi-tenant deployments:
+The RESP protocol listener supports per-site isolation via the Redis `AUTH` command. A RESP connection authenticates with a hostname to access that site's store:
 
-- **RESP is disabled by default** (`enabled = false`)
-- If enabled, it is for **admin/debugging use only** — not for tenant PHP applications
-- Any client connecting to the RESP port can read and write keys from all virtual hosts
-- PHP applications should use `ephpm_kv_*` SAPI functions instead, which are namespaced automatically
+```
+redis-cli -p 6379
+AUTH alice-blog.com
+SET cache:page:home "<html>..."
+GET cache:page:home   → "<html>..."
+```
+
+Without AUTH, the connection accesses the default (global) store. In multi-tenant deployments, configure RESP to require AUTH:
 
 ```toml
-# Multi-tenant: keep RESP disabled (default)
-[kv.redis_compat]
-enabled = false
-
-# Single-site: RESP is safe to enable
 [kv.redis_compat]
 enabled = true
 listen = "127.0.0.1:6379"
@@ -216,23 +224,29 @@ listen = "127.0.0.1:6379"
 ### Architecture
 
 ```
-PHP (alice-blog.com)                        PHP (bobs-recipes.com)
-  │                                           │
-  ├─ ephpm_kv_set("key", "val")               ├─ ephpm_kv_set("key", "val")
-  │                                           │
-  ▼                                           ▼
-SAPI bridge                                 SAPI bridge
-  ├─ namespace = "alice-blog.com"             ├─ namespace = "bobs-recipes.com"
-  ├─ store.set("alice-blog.com:key", "val")   ├─ store.set("bobs-recipes.com:key", "val")
-  │                                           │
-  └───────────────┬───────────────────────────┘
-                  │
-                  ▼
-           DashMap (shared)
-           ┌─────────────────────────────────┐
-           │ "alice-blog.com:key" → "val"    │
-           │ "bobs-recipes.com:key" → "val"  │
-           └─────────────────────────────────┘
+PHP (alice-blog.com)                PHP (bobs-recipes.com)
+  │                                   │
+  ├─ ephpm_kv_set("key", "val")       ├─ ephpm_kv_set("key", "val")
+  │                                   │
+  ▼                                   ▼
+SAPI bridge                         SAPI bridge
+  ├─ site store = alice's DashMap     ├─ site store = bob's DashMap
+  ├─ store.set("key", "val")          ├─ store.set("key", "val")
+  │                                   │
+  ▼                                   ▼
+MultiTenantStore
+  ├─ "alice-blog.com" → DashMap { "key" → "val" }
+  ├─ "bobs-recipes.com" → DashMap { "key" → "val" }
+  └─ default → DashMap (global, single-site fallback)
+```
+
+### RESP connection flow
+
+```
+RESP client connects → AUTH alice-blog.com
+  → MultiTenantStore.auth_site("alice-blog.com")
+  → returns alice's Store
+  → all subsequent commands operate on alice's DashMap only
 ```
 
 ## Fallback Site as Marketing Funnel

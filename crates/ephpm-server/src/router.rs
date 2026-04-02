@@ -76,6 +76,7 @@ pub struct Router {
     trusted_hosts: Vec<String>,
     response_headers: Vec<(String, String)>,
     store: Arc<Store>,
+    multi_tenant_kv: Option<ephpm_kv::multi_tenant::MultiTenantStore>,
     php_etag_cache_config: ephpm_config::PhpETagCacheConfig,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     metrics_path: String,
@@ -193,6 +194,14 @@ impl Router {
                 .iter()
                 .map(|[k, v]| (k.clone(), v.clone()))
                 .collect(),
+            multi_tenant_kv: if config.server.sites_dir.is_some() {
+                Some(ephpm_kv::multi_tenant::MultiTenantStore::new(
+                    Arc::clone(&store),
+                    ephpm_kv::store::StoreConfig::default(),
+                ))
+            } else {
+                None
+            },
             store,
             php_etag_cache_config: config.server.php_etag_cache.clone(),
             metrics_handle,
@@ -540,11 +549,14 @@ impl Router {
             .record(body.len() as f64);
 
         let server_port = self.server_port;
+        let multi_tenant_kv = self.multi_tenant_kv.clone();
 
         let php_start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
-            // Scope KV keys to this virtual host for multi-tenant isolation.
-            ephpm_php::kv_bridge::set_namespace(&server_name);
+            // Scope KV store to this virtual host for multi-tenant isolation.
+            ephpm_php::kv_bridge::set_site_store(
+                multi_tenant_kv.as_ref().map(|mt| mt.get_site_store(&server_name))
+            );
             PhpRuntime::execute(PhpRequest {
                 method, uri, path, query_string, script_filename,
                 document_root, headers, body, content_type, remote_addr,
