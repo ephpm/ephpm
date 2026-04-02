@@ -15,6 +15,9 @@ target/
 .vscode/
 *.swp
 
+# Claude Code worktrees
+.claude/worktrees/
+
 # Tilt state
 .tilt-dev/
 

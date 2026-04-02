@@ -43,55 +43,58 @@ Run PHP applications without the infrastructure. No PHP-FPM, no MySQL server, no
 | Admin UI / API | Planned |
 | OpenTelemetry export | Planned |
 
-## Quick Start
+## Install
 
-### Stub mode (no PHP, fast iteration)
-
-Requires only [Rust 1.85+](https://rustup.rs):
+### Linux / macOS
 
 ```bash
-cargo build
-cargo run -- --config ephpm.toml
+curl -fsSL https://raw.githubusercontent.com/ephpm/ephpm/main/install.sh | sh
 ```
 
-Serves static files and returns a placeholder for `.php` routes. Good for working on HTTP/routing logic.
-
-### Full build with PHP (xtask)
-
-The xtask builds the PHP SDK via [static-php-cli](https://github.com/crazywhalecc/static-php-cli) and compiles the release binary. First build ~15 min, cached after.
-
-**Linux / macOS:**
+Installs the binary, creates a default config at `/etc/ephpm/ephpm.toml`, sets up a systemd service, and starts serving at `http://your-server:8080`.
 
 ```bash
-# Install prerequisites (Ubuntu/Debian)
-sudo apt install php-cli composer git build-essential autoconf cmake pkg-config re2c
+# Specific version
+curl -fsSL https://raw.githubusercontent.com/ephpm/ephpm/main/install.sh | EPHPM_VERSION=0.1.0 sh
 
-# Build
-cargo xtask release       # → target/release/ephpm
+# Binary only (no systemd, no config)
+curl -fsSL https://raw.githubusercontent.com/ephpm/ephpm/main/install.sh | sh -s -- --no-systemd --no-config
+
+# Uninstall
+curl -fsSL https://raw.githubusercontent.com/ephpm/ephpm/main/install.sh | sh -s -- --uninstall
 ```
 
-**Windows (auto-delegates to WSL):**
-
-The xtask detects Windows and automatically re-invokes itself inside WSL. One-time WSL setup:
+### Windows
 
 ```powershell
-# PowerShell (Admin) — install WSL + Ubuntu
-wsl --install
+# PowerShell (Run as Administrator)
+irm https://raw.githubusercontent.com/ephpm/ephpm/main/install.ps1 | iex
 ```
 
-After restarting, open Ubuntu from the Start menu and install the tools:
+Installs to `C:\Program Files\ephpm\`, adds to PATH, creates a Windows service, and starts serving.
 
-```bash
-# Inside WSL
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source "$HOME/.cargo/env"
-sudo apt update && sudo apt install -y php-cli composer git build-essential autoconf cmake pkg-config re2c libclang-dev
+```powershell
+# Binary only (no service)
+irm https://raw.githubusercontent.com/ephpm/ephpm/main/install.ps1 | iex -Args "--no-service"
+
+# Uninstall
+irm https://raw.githubusercontent.com/ephpm/ephpm/main/install.ps1 | iex -Args "--uninstall"
 ```
 
-Then from your normal Windows terminal:
+> **Note:** Clustered SQLite (sqld) is not available on Windows. Single-node SQLite and the DB proxy work fully.
+
+### Build from Source
+
+For contributors or custom builds. Requires Rust 1.85+.
 
 ```bash
-cargo xtask release       # auto-runs inside WSL
+# Stub mode (no PHP, fast iteration on HTTP/routing logic)
+cargo build
+cargo run -- --config ephpm.toml
+
+# Release binary with PHP embedded
+# Prerequisites: php-cli, composer, git, build-essential, autoconf, cmake, pkg-config, re2c
+cargo xtask release       # → target/release/ephpm
 ```
 
 ## Configuration
