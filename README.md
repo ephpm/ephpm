@@ -139,7 +139,7 @@ ePHPm gives you three database strategies. PHP apps keep their existing `pdo_mys
 
 ### 1. Already have a database? Use the built-in proxy
 
-If you have a MySQL or PostgreSQL server, ePHPm's DB proxy sits between PHP and your database with connection pooling, read/write splitting, and health checks. PHP connects to `localhost:3306` — the proxy handles the rest.
+If you have a MySQL server, ePHPm's DB proxy sits between PHP and your database with connection pooling, read/write splitting, and health checks. PHP connects to `localhost:3306` — the proxy handles the rest. PostgreSQL proxy support is planned but not yet implemented.
 
 ```toml
 [db.mysql]
