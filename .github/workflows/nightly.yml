@@ -130,7 +130,51 @@ jobs:
           name: ephpm-php${{ matrix.php }}-windows-x86_64
           path: target/x86_64-pc-windows-msvc/release/ephpm.exe
 
-  # ── 2. E2E tests (using Linux build artifacts) ────────────────────────────
+  # ── 2. Fuzz testing (4 targets in parallel) ────────────────────────────────
+
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_resp_parser
+          - fuzz_sql_normalizer
+          - fuzz_mysql_classifier
+          - fuzz_mysql_parse_stmt_id
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked || true
+
+      - name: Run fuzzer (5 minutes)
+        run: |
+          cd fuzz
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            -- -max_total_time=300 -print_final_stats=1
+
+      - name: Upload corpus
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus-${{ matrix.target }}
+          path: fuzz/corpus/${{ matrix.target }}
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+
+  # ── 3. E2E tests (using Linux build artifacts) ────────────────────────────
 
   e2e:
     name: E2E (PHP ${{ matrix.php }})
@@ -184,7 +228,7 @@ jobs:
   nightly-summary:
     name: Nightly Summary
     if: always()
-    needs: [build-linux, build-macos, build-windows, e2e, audit]
+    needs: [build-linux, build-macos, build-windows, fuzz, e2e, audit]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
@@ -196,12 +240,14 @@ jobs:
           echo "| Linux builds | ${{ needs.build-linux.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| macOS builds | ${{ needs.build-macos.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Windows builds | ${{ needs.build-windows.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Fuzz testing | ${{ needs.fuzz.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| E2E tests | ${{ needs.e2e.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Dependency audit | ${{ needs.audit.result }} |" >> "$GITHUB_STEP_SUMMARY"
 
           # Fail if any required job failed
           if [[ "${{ needs.build-linux.result }}" == "failure" ]] || \
              [[ "${{ needs.build-macos.result }}" == "failure" ]] || \
+             [[ "${{ needs.fuzz.result }}" == "failure" ]] || \
              [[ "${{ needs.e2e.result }}" == "failure" ]]; then
             echo "::error::One or more critical nightly jobs failed"
             exit 1

@@ -1,0 +1,38 @@
+[package]
+name = "ephpm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bytes = "1"
+ephpm-kv = { path = "../crates/ephpm-kv" }
+ephpm-query-stats = { path = "../crates/ephpm-query-stats" }
+ephpm-db = { path = "../crates/ephpm-db" }
+
+# Prevent this from interfering with workspace
+[workspace]
+
+[[bin]]
+name = "fuzz_resp_parser"
+path = "fuzz_targets/resp_parser.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_sql_normalizer"
+path = "fuzz_targets/sql_normalizer.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_mysql_classifier"
+path = "fuzz_targets/mysql_classifier.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_mysql_parse_stmt_id"
+path = "fuzz_targets/mysql_parse_stmt_id.rs"
+doc = false
