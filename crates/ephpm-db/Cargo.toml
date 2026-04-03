@@ -24,6 +24,7 @@ base64ct = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
+mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust"] }
 
 [lints]
 workspace = true

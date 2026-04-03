@@ -195,7 +195,99 @@ jobs:
       - name: Run E2E tests
         run: cargo xtask e2e --php-version ${{ matrix.php }}
 
-  # ── 3. Dependency audit ───────────────────────────────────────────────────
+  # ── 4. App smoke tests (WordPress, Laravel, Symfony on litewire SQLite) ──
+
+  smoke-tests:
+    name: Smoke Tests (PHP ${{ matrix.php }})
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4", "8.5"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download ephpm binary
+        uses: actions/download-artifact@v4
+        with:
+          name: ephpm-php${{ matrix.php }}-linux-x86_64
+          path: artifact
+
+      - name: Prepare binary
+        run: |
+          # The artifact contains target/<triple>/release/ephpm — find and flatten it
+          BINARY=$(find artifact -name ephpm -type f | head -1)
+          if [ -z "$BINARY" ]; then
+            echo "::error::ephpm binary not found in artifact"
+            ls -laR artifact
+            exit 1
+          fi
+          mkdir -p target
+          cp "$BINARY" target/ephpm
+          chmod +x target/ephpm
+          file target/ephpm
+          echo "EPHPM_BINARY=./target/ephpm" >> "$GITHUB_ENV"
+
+      - name: Make scripts executable
+        run: chmod +x tests/smoke/*.sh
+
+      - name: Start smoke test containers
+        run: |
+          docker compose -f docker/docker-compose.smoke.yml up -d
+          echo "==> Waiting for containers to initialize..."
+          # Give containers time to download dependencies and set up apps
+          sleep 30
+
+      - name: Wait for containers healthy
+        timeout-minutes: 10
+        run: |
+          for svc in wordpress laravel symfony; do
+            echo "==> Waiting for ${svc}..."
+            timeout 300 bash -c "
+              until docker compose -f docker/docker-compose.smoke.yml ps ${svc} \
+                | grep -q healthy; do
+                sleep 5
+              done
+            " || {
+              echo "::warning::${svc} did not become healthy in time"
+              docker compose -f docker/docker-compose.smoke.yml logs ${svc} | tail -100
+            }
+          done
+
+      - name: Run WordPress smoke tests
+        if: always()
+        run: bash tests/smoke/wp-smoke.sh
+
+      - name: Run Laravel smoke tests
+        if: always()
+        run: bash tests/smoke/laravel-smoke.sh
+
+      - name: Run Symfony smoke tests
+        if: always()
+        run: bash tests/smoke/symfony-smoke.sh
+
+      - name: Collect container logs
+        if: failure()
+        run: |
+          mkdir -p smoke-logs
+          for svc in wordpress laravel symfony; do
+            docker compose -f docker/docker-compose.smoke.yml logs ${svc} \
+              > "smoke-logs/${svc}.log" 2>&1 || true
+          done
+
+      - name: Upload smoke test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs-php${{ matrix.php }}
+          path: smoke-logs/
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f docker/docker-compose.smoke.yml down -v
+
+  # ── 5. Dependency audit ──────────────────────────────────────────────────
 
   audit:
     name: Dependency Audit
@@ -228,7 +320,7 @@ jobs:
   nightly-summary:
     name: Nightly Summary
     if: always()
-    needs: [build-linux, build-macos, build-windows, fuzz, e2e, audit]
+    needs: [build-linux, build-macos, build-windows, fuzz, e2e, smoke-tests, audit]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
@@ -242,13 +334,15 @@ jobs:
           echo "| Windows builds | ${{ needs.build-windows.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Fuzz testing | ${{ needs.fuzz.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| E2E tests | ${{ needs.e2e.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Smoke tests | ${{ needs.smoke-tests.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Dependency audit | ${{ needs.audit.result }} |" >> "$GITHUB_STEP_SUMMARY"
 
           # Fail if any required job failed
           if [[ "${{ needs.build-linux.result }}" == "failure" ]] || \
              [[ "${{ needs.build-macos.result }}" == "failure" ]] || \
              [[ "${{ needs.fuzz.result }}" == "failure" ]] || \
-             [[ "${{ needs.e2e.result }}" == "failure" ]]; then
+             [[ "${{ needs.e2e.result }}" == "failure" ]] || \
+             [[ "${{ needs.smoke-tests.result }}" == "failure" ]]; then
             echo "::error::One or more critical nightly jobs failed"
             exit 1
           fi

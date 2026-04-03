@@ -709,6 +709,7 @@ pub enum QueryKind {
 }
 
 /// Classify a SQL query based on its first keyword.
+#[must_use]
 pub fn classify_mysql_query(sql: &str) -> QueryKind {
     let s = sql.trim_start();
     // Find the first token (word).
@@ -830,6 +831,7 @@ async fn forward_prepare_response(
 /// command payload (`COM_STMT_EXECUTE`, `COM_STMT_CLOSE`, etc.).
 ///
 /// Returns `None` if the payload is too short.
+#[must_use]
 pub fn parse_stmt_id(payload: &[u8]) -> Option<u32> {
     if payload.len() < 5 {
         return None;
@@ -1171,7 +1173,7 @@ mod tests {
 
         let rr = AtomicUsize::new(0);
         let target = select_pool(&primary, &replicas, &rr, &state, QueryKind::Read, &rw_split);
-        assert!(std::ptr::eq(target, &replicas[0]));
+        assert!(std::ptr::eq(target, &raw const replicas[0]));
     }
 
     #[test]
@@ -1185,7 +1187,7 @@ mod tests {
 
         let rr = AtomicUsize::new(0);
         let target = select_pool(&primary, &replicas, &rr, &state, QueryKind::Write, &rw_split);
-        assert!(std::ptr::eq(target, &primary));
+        assert!(std::ptr::eq(target, &raw const primary));
     }
 
     #[test]
@@ -1199,7 +1201,7 @@ mod tests {
 
         let rr = AtomicUsize::new(0);
         let target = select_pool(&primary, &replicas, &rr, &state, QueryKind::Read, &rw_split);
-        assert!(std::ptr::eq(target, &primary));
+        assert!(std::ptr::eq(target, &raw const primary));
     }
 
     #[test]
