@@ -1352,6 +1352,15 @@ pub struct ClusterKvConfig {
     /// Memory budget for hot-key cache (e.g. `"64MB"`).
     #[serde(default = "default_hot_key_max_memory")]
     pub hot_key_max_memory: String,
+
+    /// TCP listen port for the KV data plane.
+    ///
+    /// Used to fetch large values from the owner node when they exceed
+    /// the gossip tier threshold. Binds on `0.0.0.0:{port}`.
+    ///
+    /// Default: `7947`.
+    #[serde(default = "default_kv_data_port")]
+    pub data_port: u16,
 }
 
 impl Default for ClusterKvConfig {
@@ -1365,6 +1374,7 @@ impl Default for ClusterKvConfig {
             hot_key_window_secs: default_hot_key_window_secs(),
             hot_key_local_ttl_secs: default_hot_key_local_ttl_secs(),
             hot_key_max_memory: default_hot_key_max_memory(),
+            data_port: default_kv_data_port(),
         }
     }
 }
@@ -1411,6 +1421,10 @@ fn default_hot_key_local_ttl_secs() -> u64 {
 
 fn default_hot_key_max_memory() -> String {
     "64MB".to_string()
+}
+
+fn default_kv_data_port() -> u16 {
+    7947
 }
 
 fn default_listen() -> String {

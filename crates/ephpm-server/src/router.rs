@@ -383,13 +383,23 @@ impl Router {
         let query_string = req.uri().query().unwrap_or("").to_string();
         let method = req.method().as_str().to_ascii_uppercase();
 
-        // Metrics endpoint — served before security checks since it is an
-        // internal ePHPm route, not user-supplied content.
+        // Internal ePHPm endpoints — served before security checks since
+        // they are not user-supplied content.
         if method == "GET" {
             if let Some(ref handle) = self.metrics_handle {
                 if uri_path == self.metrics_path {
                     return Ok((metrics::render(handle), "metrics"));
                 }
+            }
+
+            // Liveness probe — always 200 if the server is running.
+            if uri_path == "/_ephpm/health" {
+                return Ok((json_response(StatusCode::OK, r#"{"status":"ok"}"#), "health"));
+            }
+
+            // Readiness probe — checks PHP initialization and DB proxy.
+            if uri_path == "/_ephpm/ready" {
+                return Ok((self.readiness_check(), "health"));
             }
         }
 
@@ -741,6 +751,20 @@ impl Router {
         }
     }
 
+    /// Check server readiness for the `/ready` probe.
+    ///
+    /// Returns 200 if PHP is initialized. Returns 503 with a reason
+    /// string otherwise.
+    fn readiness_check(&self) -> Response<ServerBody> {
+        if !PhpRuntime::is_ready() {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"status":"not_ready","reason":"PHP runtime not initialized"}"#,
+            );
+        }
+        json_response(StatusCode::OK, r#"{"status":"ready"}"#)
+    }
+
     /// Apply custom response headers from config.
     fn apply_response_headers(&self, response: &mut Response<ServerBody>) {
         let headers = response.headers_mut();
@@ -860,6 +884,15 @@ fn extract_server_name(req: &Request<Incoming>) -> String {
         .next()
         .unwrap_or("localhost")
         .to_string()
+}
+
+/// Build a JSON response with the given status and body.
+fn json_response(status: StatusCode, body: &str) -> Response<ServerBody> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(body::buffered(Full::new(Bytes::from(body.to_string()))))
+        .expect("static json response")
 }
 
 /// Build a simple error response with a text body.

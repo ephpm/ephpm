@@ -6,8 +6,9 @@
 //! - **Small values** (≤ `small_key_threshold`): stored via chitchat
 //!   gossip, replicated to all nodes automatically.
 //! - **Large values** (> threshold): stored in the local `Store`.
-//!   When the TCP data plane is implemented, these will route to an
-//!   owner node via consistent hash ring.
+//!   When a `get()` misses locally, the TCP data plane fetches the
+//!   value from the owner node (determined by hashing the key against
+//!   the list of alive cluster nodes).
 //!
 //! ## Hot key promotion
 //!
@@ -18,6 +19,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -161,9 +163,22 @@ impl ClusteredStore {
             }
         }
 
-        // 4. TCP fetch from owner node would go here (Phase 7).
-        //    For now, there's no remote fetch — the key simply doesn't exist
-        //    on this node.
+        // 4. TCP fetch from the owner node via the data plane.
+        if let Some(owner_addr) = self.resolve_owner_data_addr(key).await {
+            match crate::kv_data_plane::fetch_remote(owner_addr, key).await {
+                Ok(Some(value)) => {
+                    self.track_remote_fetch(key, &value);
+                    return Some(value);
+                }
+                Ok(None) => {
+                    tracing::debug!(key, %owner_addr, "key not found on owner node");
+                }
+                Err(e) => {
+                    tracing::debug!(key, %owner_addr, %e, "TCP data plane fetch failed");
+                }
+            }
+        }
+
         None
     }
 
@@ -255,6 +270,41 @@ impl ClusteredStore {
         &self.cluster
     }
 
+    /// Determine the TCP data plane address for the node that owns this key.
+    ///
+    /// Uses a simple hash-based owner selection: hash the key, pick a
+    /// live node by index. Returns `None` if the owner is this node
+    /// (already checked local store) or no remote nodes are alive.
+    async fn resolve_owner_data_addr(&self, key: &str) -> Option<SocketAddr> {
+        let nodes = self.cluster.nodes().await;
+        let alive: Vec<_> = nodes
+            .iter()
+            .filter(|n| n.state == crate::NodeState::Alive)
+            .collect();
+
+        if alive.len() <= 1 {
+            return None; // Only this node is alive.
+        }
+
+        let key_hash = hash_key(key);
+        #[allow(clippy::cast_possible_truncation)]
+        let idx = (key_hash as usize) % alive.len();
+        let owner = &alive[idx];
+
+        // If we own it, no remote fetch needed.
+        if owner.id == self.cluster.self_node().id {
+            return None;
+        }
+
+        // Derive data plane address from the node's gossip address IP
+        // and the configured data port.
+        owner
+            .gossip_addr
+            .parse::<SocketAddr>()
+            .ok()
+            .map(|gossip| SocketAddr::new(gossip.ip(), self.config.data_port))
+    }
+
     /// Record a remote fetch and potentially promote a key to the hot
     /// cache.
     ///
@@ -295,7 +345,13 @@ impl ClusteredStore {
 
     /// Promote a value into the local hot key cache.
     fn promote_to_hot_cache(&self, key: &str, key_hash: u64, value: &[u8]) {
-        let max_mem = parse_memory_size(&self.config.hot_key_max_memory);
+        let max_mem = match parse_memory_size(&self.config.hot_key_max_memory) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(%e, "invalid hot_key_max_memory, defaulting to 64MB");
+                64 * 1024 * 1024
+            }
+        };
         let entry_mem = (value.len() + key.len() + 64) as u64;
 
         // Don't exceed memory budget.
@@ -433,25 +489,44 @@ fn hash_key(key: &str) -> u64 {
 }
 
 /// Parse a memory size string like `"64MB"` to bytes.
-fn parse_memory_size(s: &str) -> u64 {
+///
+/// Supported units (case-insensitive): `B`, `KB`/`K`, `MB`/`M`, `GB`/`G`.
+/// Bare numbers without a unit suffix default to bytes.
+///
+/// # Errors
+///
+/// Returns an error for unrecognized unit suffixes.
+fn parse_memory_size(s: &str) -> Result<u64, ParseMemoryError> {
     let s = s.trim();
     let (num, unit) = s
         .find(|c: char| !c.is_ascii_digit() && c != '.')
         .map_or((s, ""), |i| s.split_at(i));
 
-    let base: f64 = num.parse().unwrap_or(64.0);
+    let base: f64 = num
+        .parse()
+        .map_err(|_| ParseMemoryError::InvalidNumber(s.to_string()))?;
+
     let multiplier = match unit.trim().to_uppercase().as_str() {
-        "KB" | "K" => 1024.0,
-        "GB" | "G" => 1024.0 * 1024.0 * 1024.0,
         "B" | "" => 1.0,
-        // Default to MB (covers "MB", "M", and unrecognized units).
-        _ => 1024.0 * 1024.0,
+        "KB" | "K" => 1024.0,
+        "MB" | "M" => 1024.0 * 1024.0,
+        "GB" | "G" => 1024.0 * 1024.0 * 1024.0,
+        other => return Err(ParseMemoryError::UnknownUnit(other.to_string())),
     };
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    {
-        (base * multiplier) as u64
-    }
+    Ok((base * multiplier) as u64)
+}
+
+/// Errors from [`parse_memory_size`].
+#[derive(Debug, thiserror::Error)]
+enum ParseMemoryError {
+    /// The numeric portion could not be parsed.
+    #[error("invalid memory size number: {0}")]
+    InvalidNumber(String),
+    /// An unrecognized unit suffix was provided.
+    #[error("unknown memory size unit \"{0}\" (expected B, KB, MB, or GB)")]
+    UnknownUnit(String),
 }
 
 #[cfg(test)]
@@ -460,11 +535,26 @@ mod tests {
 
     #[test]
     fn parse_memory_sizes() {
-        assert_eq!(parse_memory_size("64MB"), 64 * 1024 * 1024);
-        assert_eq!(parse_memory_size("1GB"), 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_size("512KB"), 512 * 1024);
-        assert_eq!(parse_memory_size("1024B"), 1024);
-        assert_eq!(parse_memory_size("256"), 256);
+        assert_eq!(parse_memory_size("64MB").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(parse_memory_size("1GB").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_size("512KB").unwrap(), 512 * 1024);
+        assert_eq!(parse_memory_size("1024B").unwrap(), 1024);
+        assert_eq!(parse_memory_size("256").unwrap(), 256);
+    }
+
+    #[test]
+    fn parse_memory_size_unknown_unit_errors() {
+        assert!(parse_memory_size("64TB").is_err());
+        assert!(parse_memory_size("10PB").is_err());
+    }
+
+    #[test]
+    fn parse_memory_size_case_insensitive() {
+        assert_eq!(parse_memory_size("64mb").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(parse_memory_size("1gb").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_size("512kb").unwrap(), 512 * 1024);
+        assert_eq!(parse_memory_size("100M").unwrap(), 100 * 1024 * 1024);
+        assert_eq!(parse_memory_size("2G").unwrap(), 2 * 1024 * 1024 * 1024);
     }
 
     #[test]
