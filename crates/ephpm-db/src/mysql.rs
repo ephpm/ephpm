@@ -868,7 +868,7 @@ fn parse_error_packet(payload: &[u8]) -> String {
 
 /// Kind of SQL query for routing decisions.
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum QueryKind {
+pub enum QueryKind {
     /// SELECT, SHOW, EXPLAIN, DESCRIBE — read-only, can go to replica.
     Read,
     /// INSERT, UPDATE, DELETE, CREATE, ALTER, DROP — modifies data, must go to primary.
@@ -880,7 +880,8 @@ enum QueryKind {
 }
 
 /// Classify a SQL query based on its first keyword.
-fn classify_mysql_query(sql: &str) -> QueryKind {
+#[must_use]
+pub fn classify_mysql_query(sql: &str) -> QueryKind {
     let s = sql.trim_start();
     // Find the first token (word).
     let tok = s.split_ascii_whitespace().next().unwrap_or("").to_ascii_uppercase();
@@ -1001,7 +1002,8 @@ async fn forward_prepare_response(
 /// command payload (`COM_STMT_EXECUTE`, `COM_STMT_CLOSE`, etc.).
 ///
 /// Returns `None` if the payload is too short.
-fn parse_stmt_id(payload: &[u8]) -> Option<u32> {
+#[must_use]
+pub fn parse_stmt_id(payload: &[u8]) -> Option<u32> {
     if payload.len() < 5 {
         return None;
     }

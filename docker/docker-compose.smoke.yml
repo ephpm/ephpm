@@ -1,0 +1,101 @@
+# Smoke test infrastructure for nightly CI.
+#
+# Runs three real PHP applications (WordPress, Laravel, Symfony) against ephpm
+# with litewire SQLite as the database backend. Each app runs in its own
+# container with ephpm as the application server and pdo_mysql connecting to
+# litewire's MySQL frontend on 127.0.0.1:3306 (translated to SQLite).
+#
+# Usage:
+#   docker compose -f docker/docker-compose.smoke.yml up -d
+#   tests/smoke/wp-smoke.sh
+#   tests/smoke/laravel-smoke.sh
+#   tests/smoke/symfony-smoke.sh
+#   docker compose -f docker/docker-compose.smoke.yml down -v
+#
+# Prerequisites:
+#   - ephpm release binary at ./target/ephpm (or set EPHPM_BINARY env var)
+#   - Docker with compose v2
+
+services:
+  # ── WordPress ────────────────────────────────────────────────────────────────
+  wordpress:
+    image: ubuntu:24.04
+    volumes:
+      - ${EPHPM_BINARY:-./target/ephpm}:/usr/local/bin/ephpm:ro
+      - wp-data:/var/www/html
+      - ./tests/smoke/setup-wordpress.sh:/setup.sh:ro
+      - ./tests/smoke/ephpm-wordpress.toml:/etc/ephpm/ephpm.toml:ro
+    environment:
+      DEBIAN_FRONTEND: noninteractive
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        apt-get update -qq && apt-get install -y -qq curl less mariadb-client >/dev/null 2>&1
+        chmod +x /setup.sh && /setup.sh
+        exec ephpm serve --config /etc/ephpm/ephpm.toml
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  # ── Laravel ──────────────────────────────────────────────────────────────────
+  laravel:
+    image: ubuntu:24.04
+    volumes:
+      - ${EPHPM_BINARY:-./target/ephpm}:/usr/local/bin/ephpm:ro
+      - laravel-data:/var/www/html
+      - ./tests/smoke/setup-laravel.sh:/setup.sh:ro
+      - ./tests/smoke/ephpm-laravel.toml:/etc/ephpm/ephpm.toml:ro
+    environment:
+      DEBIAN_FRONTEND: noninteractive
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        apt-get update -qq && apt-get install -y -qq curl >/dev/null 2>&1
+        chmod +x /setup.sh && /setup.sh
+        exec ephpm serve --config /etc/ephpm/ephpm.toml
+    ports:
+      - "8082:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  # ── Symfony ──────────────────────────────────────────────────────────────────
+  symfony:
+    image: ubuntu:24.04
+    volumes:
+      - ${EPHPM_BINARY:-./target/ephpm}:/usr/local/bin/ephpm:ro
+      - symfony-data:/var/www/html
+      - ./tests/smoke/setup-symfony.sh:/setup.sh:ro
+      - ./tests/smoke/ephpm-symfony.toml:/etc/ephpm/ephpm.toml:ro
+    environment:
+      DEBIAN_FRONTEND: noninteractive
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        apt-get update -qq && apt-get install -y -qq curl >/dev/null 2>&1
+        chmod +x /setup.sh && /setup.sh
+        exec ephpm serve --config /etc/ephpm/ephpm.toml
+    ports:
+      - "8083:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+volumes:
+  wp-data:
+  laravel-data:
+  symfony-data:

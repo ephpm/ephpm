@@ -1,0 +1,34 @@
+# ephpm config for Symfony API smoke test.
+#
+# Symfony serves from the public/ subdirectory with front controller
+# rewrite to index.php. Database via litewire SQLite (Doctrine DBAL
+# configured for pdo_mysql pointing at litewire).
+
+[server]
+listen = "0.0.0.0:8080"
+document_root = "/var/www/html/public"
+index_files = ["index.php", "index.html"]
+fallback = ["$uri", "$uri/", "/index.php?$query_string"]
+
+[server.request]
+max_body_size = 10
+
+[server.static]
+cache_control = "no-cache"
+
+[server.security]
+blocked_paths = [".git/*", ".env"]
+
+[php]
+max_execution_time = 60
+memory_limit = "256M"
+ini_overrides = [
+    ["display_errors", "On"],
+    ["error_reporting", "E_ALL"],
+]
+
+[db.sqlite]
+path = "/tmp/symfony.db"
+
+[db.sqlite.proxy]
+mysql_listen = "127.0.0.1:3306"
