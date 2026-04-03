@@ -5,9 +5,7 @@ fn main() {
 
     if let Ok(path) = std::env::var("SQLD_BINARY_PATH") {
         let src = std::path::Path::new(&path);
-        if !src.exists() {
-            panic!("SQLD_BINARY_PATH points to non-existent file: {path}");
-        }
+        assert!(src.exists(), "SQLD_BINARY_PATH points to non-existent file: {path}");
 
         // Copy sqld binary to OUT_DIR so include_bytes! can find it.
         let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
