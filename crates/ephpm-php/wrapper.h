@@ -15,3 +15,6 @@
 #include "Zend/zend.h"
 #include "Zend/zend_API.h"
 #include "Zend/zend_stream.h"
+#ifdef ZTS
+#include "TSRM/TSRM.h"
+#endif

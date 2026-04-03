@@ -93,7 +93,7 @@ HTTP headers are mapped to `HTTP_*` variables, except `Content-Type` -> `CONTENT
 
 ### Thread Safety
 
-PHP is NTS (Non-Thread-Safe). A global `Mutex<Option<PhpRuntime>>` serializes all PHP execution. The async HTTP server runs on tokio, but PHP calls use `spawn_blocking` to avoid blocking the event loop. One PHP request executes at a time.
+PHP is compiled with ZTS (Zend Thread Safety). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown, not request execution. Windows builds use NTS with serialized execution via mutex.
 
 ### Signal Handling
 

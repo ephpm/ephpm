@@ -1030,7 +1030,7 @@ Request B: $_SESSION['cart'][] = 'item3'; session_write_close()
            → writes {cart: [item1, item3]}  ← item2 is LOST
 ```
 
-**Current model (NTS, single PHP request):** Not a problem. The global PHP mutex serializes all requests, so concurrent session access can't happen.
+**Current model (ZTS, concurrent PHP requests):** This is a real concern. Multiple threads can execute PHP concurrently, so concurrent session access from the same user (e.g. AJAX requests) can cause lost updates.
 
 **Future model (external PHP workers, multi-process):** Locking is essential.
 

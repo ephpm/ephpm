@@ -279,7 +279,7 @@ Full RESP protocol over TCP: PING, SET/GET (incl. binary, NX, XX, EX, PX, GET op
 | **Cluster: Gossip protocol** | **0** | **Gap (crate not yet created)** |
 | **Cluster: Clustered store routing** | **0** | **Gap (crate not yet created)** |
 | **CLI: Argument parsing** | **0** | **Gap (needs openssl-sys)** |
-| **PHP: Worker pool** | **0** | **Gap (php_linked only)** |
+| **PHP: Thread pool (ZTS)** | **0** | **Gap (php_linked only)** |
 | **PHP: SAPI callbacks** | **0** | **Gap** |
 | **Server: Graceful shutdown** | **0** | **Gap** |
 | **Server: Connection handling** | **0** | **Gap** |
@@ -409,12 +409,12 @@ Full RESP protocol over TCP: PING, SET/GET (incl. binary, NX, XX, EX, PX, GET op
 
 ### Lower Priority -- Requires php_linked
 
-#### 12. PHP Worker Pool (`ephpm-php/src/lib.rs`)
+#### 12. PHP Thread Pool / ZTS (`ephpm-php/src/lib.rs`)
 
-- [ ] Pool creates configured workers
-- [ ] Request dispatched to available worker
-- [ ] Backpressure when all workers busy
-- [ ] Graceful pool shutdown
+- [ ] TSRM thread registration on first `spawn_blocking` use
+- [ ] Concurrent PHP execution across multiple threads
+- [ ] AtomicBool fast-path check for initialization
+- [ ] Graceful shutdown (mutex-protected)
 - [ ] Concurrent dispatch returns correct results
 
 #### 13. PHP SAPI Callbacks (`ephpm-php/src/sapi.rs`)

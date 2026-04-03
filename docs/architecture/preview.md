@@ -66,7 +66,7 @@ No restart. No config reload. Switchboard writes a directory, ephpm discovers it
   HTTP ─────────────┤► ephpm (:8080)                           │
   requests          │    ├─ Host header → sites_dir lookup     │
                     │    ├─ Lazy discovery (filesystem check)  │
-                    │    ├─ PHP execution (shared worker pool) │
+                    │    ├─ PHP execution (ZTS, spawn_blocking) │
                     │    └─ SQLite database (per-site file)    │
                     │                                          │
                     └──────────────────────────────────────────┘
@@ -352,7 +352,7 @@ The gossip cluster was designed for multi-node deployments across machines, but 
 
 ### Resource Usage (Multi-PHP)
 
-Each additional ephpm instance adds its own PHP worker pool:
+Each additional ephpm instance adds its own PHP thread pool:
 
 | Instances | Workers (total) | Memory overhead |
 |-----------|----------------|-----------------|

@@ -276,7 +276,7 @@ sudo systemctl enable ephpm
 ## What You Lose
 
 - **Nginx as a reverse proxy** — if you're proxying to non-PHP backends (Node, Python, etc.), you still need a reverse proxy for those.
-- **Multiple FPM pools** — ePHPm has one worker pool. If you run separate pools for different sites with different users, use ePHPm's virtual hosts instead (same isolation, simpler config).
+- **Multiple FPM pools** — ePHPm has one shared thread pool. If you run separate pools for different sites with different users, use ePHPm's virtual hosts instead (same isolation, simpler config).
 - **Nginx modules** — `ngx_pagespeed`, `ngx_brotli`, etc. Most functionality is built into ePHPm or handled at the application level.
 - **HTTP/3 (QUIC)** — not yet implemented in ePHPm. Nginx supports it via `nginx-quic`.
 

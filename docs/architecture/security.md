@@ -117,8 +117,8 @@ int ephpm_execute_script(const char *filename) {
 
 ### Process state
 
-- NTS PHP (MVP): Single-threaded execution via `Mutex<Option<PhpRuntime>>`. One request at a time. No shared mutable state between requests beyond PHP's own persistence (opcache, etc.)
-- ZTS PHP (future): Thread-per-request with TSRM. Each thread gets isolated globals. Rust must ensure no cross-thread access to PHP data.
+- ZTS PHP: Concurrent execution via `spawn_blocking` + TSRM. Each thread gets isolated globals (symbol tables, memory arena, extension state). Per-request C statics use `__thread` for thread isolation. Rust must ensure no cross-thread access to PHP data.
+- Windows (NTS fallback): Serialized execution via `Mutex<Option<PhpRuntime>>`. One request at a time.
 
 ### Request isolation
 

@@ -9,8 +9,7 @@ This document describes the full vision for ePHPm. The matrix below tracks what 
 | HTTP/1.1 | **Implemented** | hyper server, async accept loop |
 | HTTP/2 | Planned | Dependency present, no code yet |
 | TLS / ACME | Planned | No code or dependencies yet |
-| PHP embedding (NTS) | **Implemented** | Full SAPI, mutex-serialized `spawn_blocking` |
-| PHP embedding (ZTS) | Planned | v1 goal — thread-per-request model |
+| PHP embedding (ZTS) | **Implemented** | Full SAPI, concurrent via `spawn_blocking` + per-thread TSRM |
 | Static file serving | **Implemented** | MIME detection, path traversal protection |
 | Request routing | **Implemented** | `.php` → PHP, pretty permalinks → `index.php`, else static |
 | Configuration | **Implemented** | Figment — TOML + `EPHPM_` env var overrides |
@@ -142,7 +141,7 @@ ephpm admin --nodes 10.0.1.1:9090,10.0.1.2:9090,10.0.1.3:9090
 ├──────────────────────────────────────────────────────┤
 │  Admin Web UI :8080                                  │
 │  ├─ Cluster overview (all nodes)                     │
-│  ├─ Worker pool status (per-node, aggregate)         │
+│  ├─ Thread pool status (per-node, aggregate)         │
 │  ├─ Query digest dashboard (aggregated)              │
 │  ├─ Slow query log + EXPLAIN viewer                  │
 │  ├─ Trace viewer (distributed traces across nodes)   │
@@ -202,7 +201,7 @@ Every serving node exposes the Node API on a configurable port (default `:9090`)
 |---|---|---|
 | `/health` | GET | Liveness + readiness status |
 | `/metrics` | GET | Prometheus/OpenMetrics scrape endpoint |
-| `/api/workers` | GET | Worker pool: busy/idle/total, queue depth, restarts, memory per worker |
+| `/api/workers` | GET | Thread pool: busy/idle/total, queue depth, restarts, memory per thread |
 | `/api/db/digests` | GET | Query digest table: digest hash, normalized SQL, count, sum/min/max/avg time, rows |
 | `/api/db/slow` | GET | Slow query log: recent slow queries with EXPLAIN output |
 | `/api/db/pool` | GET | Connection pool stats: active/idle/total connections, wait time, timeouts |
@@ -1493,7 +1492,7 @@ Old traces age out automatically. This is a debug/development tool for real-time
 
 Standard OpenMetrics/Prometheus scrape endpoint. Any existing Grafana/Prometheus setup can scrape ePHPm with zero configuration. Exposes:
 - HTTP request metrics (rate, latency percentiles, status codes)
-- Worker pool utilization (busy, idle, queue depth)
+- Thread pool utilization (busy, idle, queue depth)
 - DB proxy metrics (query rate, latency, pool utilization, slow queries)
 - KV store metrics (hit rate, memory usage, cluster membership)
 - PHP internals (OPcache hit rate, memory usage per worker)
@@ -1614,7 +1613,7 @@ A single Rust binary that reads a TOML config, boots an HTTP server, embeds PHP 
 1. **`ephpm` binary** — single Rust binary with PHP statically linked
 2. **TOML config** — `ephpm.toml` with `[server]` and `[php]` sections
 3. **HTTP server** — hyper-based, HTTP/1.1 + HTTP/2
-4. **PHP execution** — custom SAPI, NTS mode, Mutex-guarded
+4. **PHP execution** — custom SAPI, ZTS mode, concurrent via `spawn_blocking` + TSRM
 5. **Static file serving** — CSS/JS/images served directly (not through PHP)
 6. **WordPress demo** — documented setup
 
@@ -1704,8 +1703,8 @@ PHP is statically linked into the binary via FFI. Zero IPC overhead — Rust cal
 
 | Variant | Concurrency | Status |
 |---------|-------------|--------|
-| NTS (MVP) | `Mutex` + `spawn_blocking` — one PHP execution at a time | **Implemented** |
-| ZTS (v1) | Thread-per-request via TSRM — true parallelism | Planned |
+| ZTS | `spawn_blocking` + per-thread TSRM — concurrent PHP execution | **Implemented** |
+| NTS (Windows) | `Mutex` + `spawn_blocking` — serialized execution | **Implemented** |
 
 **When to use:** Production deployments where performance matters and the bundled PHP extensions are sufficient.
 
@@ -1744,7 +1743,7 @@ worker_script = "vendor/ephpm/worker.php"
 | | Embedded | External |
 |---|---|---|
 | Overhead per request | ~0 (native C call) | ~50-200μs (IPC) |
-| Concurrency | Mutex (NTS) or threads (ZTS) | Multiple worker processes |
+| Concurrency | Concurrent threads (ZTS) | Multiple worker processes |
 | Crash isolation | PHP crash = process crash | Worker crash → auto-restart |
 | PHP version | Built into binary | User's own binary |
 | Custom extensions | Rebuild SDK | Install normally |
@@ -1754,10 +1753,9 @@ worker_script = "vendor/ephpm/worker.php"
 
 All other ePHPm features (HTTP server, static files, routing, config, and planned features like DB proxy, KV store, admin UI, observability) work identically in both modes.
 
-### Thread Safety: NTS for MVP, ZTS for v1 (embedded mode)
+### Thread Safety: ZTS (embedded mode)
 
-- **MVP:** NTS (Non-Thread-Safe) PHP with `Mutex` + `tokio::task::spawn_blocking`. One PHP execution at a time per process. Simple, provably correct.
-- **v1:** ZTS (Thread-Safe) PHP with thread-per-request model. Required for production throughput.
+PHP is compiled with ZTS (`--enable-zts`). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The mutex only protects one-time init/shutdown. Windows builds use NTS with serialized execution.
 
 ### Building libphp.a
 

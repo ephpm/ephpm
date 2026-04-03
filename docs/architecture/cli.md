@@ -44,7 +44,7 @@ ephpm serve --test --db-temp        # temp file SQLite (cleaned up on exit)
 
 **What it starts:**
 - HTTP server (`:443` by default, `:80` for HTTP→HTTPS redirect)
-- PHP worker pool
+- PHP thread pool (ZTS, `spawn_blocking`)
 - DB proxy (if configured) — or embedded SQLite in `--test` mode
 - KV store (if configured)
 - OTLP receiver (`:4317` gRPC, `:4318` HTTP — if configured)
@@ -892,7 +892,7 @@ TLS:        4 certs managed, next renewal in 23d (this node is renewal leader)
 
 ### `ephpm workers`
 
-PHP worker pool details.
+PHP thread pool details.
 
 ```bash
 # List workers
@@ -1410,7 +1410,7 @@ ephpm ext info       Show details about a specific extension
 ephpm test           Run tests with embedded SQLite (start, test, teardown)
 
 ephpm status         Quick overview of a running node
-ephpm workers        PHP worker pool details + restart
+ephpm workers        PHP thread pool details + restart
 ephpm db status      DB proxy pool status (active/idle connections, lag)
 ephpm db digests     Top query digests (sort by count/time, filter by type)
 ephpm db digest ID   Detail for a specific query digest

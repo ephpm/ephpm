@@ -584,14 +584,15 @@ fn php_sdk(args: &[String]) -> ExitCode {
         }
     }
 
-    // Build libphp.a with embed SAPI
-    eprintln!("==> Building libphp.a (this takes ~15 min the first time)...");
+    // Build libphp.a with embed SAPI (ZTS enabled for thread-safe embedding)
+    eprintln!("==> Building libphp.a with ZTS (this takes ~15 min the first time)...");
     let status = Command::new(spc)
         .args([
             "build",
             PHP_EXTENSIONS,
             "--build-embed",
             "--no-strip",
+            "--enable-zts",
         ])
         .current_dir(&spc_dir)
         .status();

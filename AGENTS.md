@@ -75,12 +75,13 @@ ephpm admin --nodes 10.0.1.1:9090,10.0.1.2:9090
 ## Core Subsystems
 
 ### 1. PHP Embedding Layer (Rust FFI + libphp)
-- Embeds PHP via `libphp` (NTS, non-thread-safe for the MVP) compiled with `--enable-embed` via `static-php-cli`
+- Embeds PHP via `libphp` (ZTS, thread-safe) compiled with `--enable-embed --enable-zts` via `static-php-cli`
 - Implements a custom SAPI — handles `echo`, `header()`, POST body reading, superglobal population
 - Zero-cost C FFI — no CGO overhead (ePHPm's key competitive advantage over FrankenPHP)
 - C wrapper (`ephpm_wrapper.c`) is required for all PHP calls due to PHP's `setjmp`/`longjmp` error handling — never call PHP APIs directly from Rust
 - Superglobals (`$_GET`, `$_POST`, `$_SERVER`) work — this is critical for adoption
-- Global `Mutex<Option<PhpRuntime>>` serializes all PHP execution in the NTS MVP
+- Concurrent PHP execution via ZTS — each `spawn_blocking` thread auto-registers with TSRM and gets its own isolated PHP context. Mutex only protects one-time init/shutdown.
+- Windows builds use NTS (`ZTS=0`) due to DLL constraints
 - Reference implementations: FrankenPHP's `frankenphp.c`, Pasir's ext-php-rs integration, `ripht-php-sapi` crate
 
 ### 2. HTTP Layer
@@ -117,7 +118,7 @@ ephpm admin --nodes 10.0.1.1:9090,10.0.1.2:9090
 - Runs as `ephpm admin --nodes 10.0.1.1:9090,...` (standalone) or `ephpm serve --admin` (embedded for dev)
 - Same binary, different subcommand — no separate build artifact
 - Connects to Node API on each serving node, aggregates data across the cluster
-- Displays: cluster overview, worker pools, query digests, slow query log, trace viewer, KV cluster health, profiling results, debug captures, live config
+- Displays: cluster overview, thread pool stats, query digests, slow query log, trace viewer, KV cluster health, profiling results, debug captures, live config
 - In production: runs on a small dedicated box/container, not on serving nodes
 - Auth: username/password (separate from Node API auth), SSO in enterprise tier
 
@@ -158,8 +159,9 @@ The worker lifecycle is:
 7. Worker loops back to step 2
 
 Key design:
-- Each PHP worker runs on a dedicated OS thread (PHP's ZTS requires this)
-- Async HTTP layer (tokio) communicates with worker threads via channels
+- PHP requests execute concurrently on tokio's `spawn_blocking` thread pool — no dedicated worker pool
+- Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own PHP context
+- Async HTTP layer (tokio) dispatches to `spawn_blocking`; responses return via oneshot channel
 - No `runtime.LockOSThread()` hacks — Rust gives direct thread control
 - PHP's ZTS thread model maps naturally to Rust's ownership/Send+Sync model
 
@@ -182,7 +184,7 @@ The project has a working Cargo workspace. PHP embedding is fully implemented an
 - HTTP server serves PHP scripts via `ephpm serve`
 - `ephpm php` subcommand provides a full PHP CLI passthrough (all standard flags work)
 
-Next milestone: ZTS PHP + worker pool (boot PHP app once, handle multiple requests per worker).
+ZTS PHP is implemented — each `spawn_blocking` thread registers with TSRM and executes PHP concurrently. Next milestone: worker mode (boot PHP app once per thread, handle multiple requests in a loop).
 
 ## Repository Structure
 
@@ -236,4 +238,4 @@ Key files:
 6. **Conditional compilation**: All PHP FFI code is gated with `#[cfg(php_linked)]`. The stub mode (no `PHP_SDK_PATH`) must always compile and pass tests. See `CLAUDE.md` for the full conventions.
 7. **Build**: `cargo xtask release` downloads a standalone `spc` binary, builds `libphp.a`, and compiles the musl-linked release binary. No system PHP or Composer required.
 8. **CLI**: `ephpm serve` starts the HTTP server. `ephpm php [args...]` is a full PHP CLI passthrough — all standard PHP flags work (`-v`, `-r`, `-f`, `-m`, `-i`, `-l`, etc.).
-9. **Next milestone:** ZTS PHP + worker pool — boot PHP app once per worker, handle multiple requests per worker in a loop (same model as FrankenPHP worker mode).
+9. **ZTS is implemented.** PHP is compiled with `--enable-zts`; each `spawn_blocking` thread gets its own TSRM context. Next milestone: worker mode — boot PHP app once per thread, handle multiple requests in a loop (same model as FrankenPHP worker mode).

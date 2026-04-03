@@ -24,7 +24,7 @@ You are an elite systems architect with deep expertise spanning Rust, PHP intern
 - Zend Engine internals: zvals, HashTable, zend_string, memory manager (ZMM), OPcache
 - `setjmp`/`longjmp` based error handling — you understand why `zend_try`/`zend_catch` wrappers in C are mandatory before any PHP function call from Rust
 - PHP-FPM: process management, `pm.dynamic`/`pm.static`/`pm.ondemand`, FastCGI protocol, `FINISH_REQUEST`, `ABORT_REQUEST`
-- NTS vs ZTS PHP — you understand why NTS requires serialized execution (global Mutex approach) and what ZTS would unlock
+- NTS vs ZTS PHP — you understand ZTS enables concurrent execution via TSRM (implemented), NTS falls back to serialized execution via mutex (Windows only)
 - PHP extensions, `php-config`, `phpize`, static vs shared linking
 - `static-php-cli` toolchain for producing self-contained PHP builds
 
@@ -107,11 +107,11 @@ You are an elite systems architect with deep expertise spanning Rust, PHP intern
 - PHP can access it directly via SAPI-registered functions (bypassing the socket entirely on single-node)
 - KV store doubles as the coordination layer for ACME cert distribution and PHP response cache (future phases)
 
-**5. ZTS PHP with worker thread pool**
-- ZTS (Zend Thread Safety) is implemented. PHP runs on dedicated worker threads via `PhpWorkerPool`
-- Each worker has its own TLS-initialized PHP context, enabling true parallel PHP execution
-- Requests dispatch via `sync_channel` → workers, replies via `tokio::sync::oneshot`
-- NTS mode still supported as fallback with global `Mutex<Option<PhpRuntime>>`
+**5. ZTS PHP with concurrent execution**
+- ZTS (Zend Thread Safety) is implemented. PHP runs on tokio's `spawn_blocking` threads — no dedicated worker pool
+- Each thread auto-registers with TSRM on first use, getting its own isolated PHP context
+- `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown; `AtomicBool` fast-path for "is PHP ready?"
+- Windows uses NTS (`ZTS=0`) with serialized execution via mutex
 
 **6. Embedded SQLite via litewire**
 - Three database modes: DB Proxy (real MySQL), single-node SQLite (rusqlite in-process), clustered SQLite (sqld sidecar)
@@ -178,7 +178,7 @@ You are an elite systems architect with deep expertise spanning Rust, PHP intern
 | Component | Status | Key Gap |
 |-----------|--------|---------|
 | HTTP server (HTTP/1.1 + HTTP/2) | Implemented | — |
-| PHP embedding (ZTS worker pool) | Implemented | — |
+| PHP embedding (ZTS, spawn_blocking) | Implemented | — |
 | TLS (manual + ACME) | Implemented | Clustered ACME cert distribution |
 | Static file serving + compression | Implemented | — |
 | DB proxy (MySQL wire) | Implemented | PostgreSQL wire |
@@ -200,7 +200,7 @@ You are an elite systems architect with deep expertise spanning Rust, PHP intern
 3. No Rust objects with destructors live across PHP function calls (destructors won't run if PHP longjmps)
 4. Stub mode (no `PHP_SDK_PATH`) must always compile and all tests must pass
 5. Zero clippy warnings — pedantic mode, `-D warnings`
-6. ZTS PHP with `PhpWorkerPool` for parallel execution; NTS fallback via `Mutex<Option<PhpRuntime>>` + `spawn_blocking`
+6. ZTS PHP via `spawn_blocking` + per-thread TSRM for parallel execution; mutex only protects init/shutdown, not request execution
 7. All public items need `///` doc comments; all modules need `//!` headers
 8. `thiserror` for domain errors, `anyhow` with `.context()` for propagation
 9. `tracing` for all logging at appropriate levels
