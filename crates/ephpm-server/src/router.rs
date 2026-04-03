@@ -1008,7 +1008,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use ephpm_config::{Config, PhpConfig, ServerConfig};
+    use ephpm_config::{ClusterConfig, Config, DbConfig, KvConfig, PhpConfig, ServerConfig};
     use ephpm_kv::store::StoreConfig;
 
     use super::*;
@@ -1031,9 +1031,9 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         Router::new(&config, test_store(), None, None, None)
     }
@@ -1048,9 +1048,9 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         Router::new(&config, test_store(), None, None, None)
     }
@@ -1070,9 +1070,9 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         config.server.static_files.etag = true;
         Router::new(&config, store, None, None, None)
@@ -1260,9 +1260,9 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
         let router = Router::new(&config, test_store(), None, None, None);
@@ -1282,9 +1282,9 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
         let router = Router::new(&config, test_store(), None, None, None);
@@ -1306,9 +1306,9 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None);
         assert_eq!(router.server_port, 3000);
@@ -1324,9 +1324,9 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None);
         assert_eq!(router.server_port, 8080);
@@ -1367,9 +1367,9 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None);
         assert!(router.is_php_allowed("/anything.php"));
@@ -1384,9 +1384,9 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         config.server.security.allowed_php_paths = vec![
             "/index.php".to_string(),
@@ -1407,9 +1407,9 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         config.server.security.allowed_php_paths = vec![
             "/index.php".to_string(),
@@ -1644,9 +1644,9 @@ mod tests {
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None);
         assert_eq!(router.server_port, 9090);
@@ -1667,6 +1667,190 @@ mod tests {
         assert!(!glob_match("/index.php", "/index.ph"));
     }
 
+    // ── ETag cache unit tests (no PHP required) ───────────────────────
+    //
+    // These tests verify the ETag cache logic in isolation — key
+    // generation, store/retrieve, matching, and TTL behavior — without
+    // needing a PHP runtime.
+
+    #[test]
+    fn etag_cache_key_without_query() {
+        let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
+        assert_eq!(key, "etag:GET:/index.php");
+    }
+
+    #[test]
+    fn etag_cache_key_with_query() {
+        let key = php_etag_cache_key("etag:", "GET", "/api/data", "page=1&sort=name");
+        assert_eq!(key, "etag:GET:/api/data?page=1&sort=name");
+    }
+
+    #[test]
+    fn etag_cache_key_head_method() {
+        let key = php_etag_cache_key("etag:", "HEAD", "/status", "");
+        assert_eq!(key, "etag:HEAD:/status");
+    }
+
+    #[test]
+    fn etag_cache_key_custom_prefix() {
+        let key = php_etag_cache_key("cache:", "GET", "/page", "");
+        assert_eq!(key, "cache:GET:/page");
+    }
+
+    #[test]
+    fn etag_store_and_retrieve() {
+        let store = test_store();
+        let key = php_etag_cache_key("etag:", "GET", "/test.php", "");
+
+        // Store an ETag.
+        store.set(key.clone(), b"\"v1\"".to_vec(), None);
+
+        // Retrieve it.
+        let stored = store.get(&key);
+        assert!(stored.is_some());
+        assert_eq!(stored.unwrap(), b"\"v1\"");
+    }
+
+    #[test]
+    fn etag_store_overwrites_previous() {
+        let store = test_store();
+        let key = php_etag_cache_key("etag:", "GET", "/test.php", "");
+
+        store.set(key.clone(), b"\"v1\"".to_vec(), None);
+        store.set(key.clone(), b"\"v2\"".to_vec(), None);
+
+        let stored = store.get(&key);
+        assert_eq!(stored.unwrap(), b"\"v2\"");
+    }
+
+    #[test]
+    fn etag_matches_wildcard() {
+        assert!(etag_matches_value("\"any\"", "*"));
+    }
+
+    #[test]
+    fn etag_matches_comma_separated_list() {
+        assert!(etag_matches_value("\"v2\"", "\"v1\", \"v2\", \"v3\""));
+        assert!(!etag_matches_value("\"v4\"", "\"v1\", \"v2\", \"v3\""));
+    }
+
+    #[test]
+    fn etag_matches_with_whitespace() {
+        assert!(etag_matches_value("\"abc\"", "  \"abc\"  "));
+        assert!(etag_matches_value("\"abc\"", "\"def\" , \"abc\""));
+    }
+
+    #[test]
+    fn etag_no_match_different_values() {
+        assert!(!etag_matches_value("\"abc\"", "\"xyz\""));
+    }
+
+    #[test]
+    fn etag_cache_respects_ttl_zero_as_indefinite() {
+        let store = test_store();
+        let key = php_etag_cache_key("etag:", "GET", "/page", "");
+
+        // TTL of None means indefinite storage.
+        store.set(key.clone(), b"\"forever\"".to_vec(), None);
+
+        // Should be retrievable.
+        let stored = store.get(&key);
+        assert_eq!(stored.unwrap(), b"\"forever\"");
+    }
+
+    #[test]
+    fn etag_cache_different_methods_different_keys() {
+        let store = test_store();
+        let get_key = php_etag_cache_key("etag:", "GET", "/page", "");
+        let head_key = php_etag_cache_key("etag:", "HEAD", "/page", "");
+
+        store.set(get_key.clone(), b"\"get-v1\"".to_vec(), None);
+        store.set(head_key.clone(), b"\"head-v1\"".to_vec(), None);
+
+        assert_eq!(store.get(&get_key).unwrap(), b"\"get-v1\"");
+        assert_eq!(store.get(&head_key).unwrap(), b"\"head-v1\"");
+    }
+
+    #[test]
+    fn etag_cache_different_paths_different_keys() {
+        let store = test_store();
+        let key_a = php_etag_cache_key("etag:", "GET", "/page-a", "");
+        let key_b = php_etag_cache_key("etag:", "GET", "/page-b", "");
+
+        store.set(key_a.clone(), b"\"a-v1\"".to_vec(), None);
+        store.set(key_b.clone(), b"\"b-v1\"".to_vec(), None);
+
+        assert_eq!(store.get(&key_a).unwrap(), b"\"a-v1\"");
+        assert_eq!(store.get(&key_b).unwrap(), b"\"b-v1\"");
+    }
+
+    #[test]
+    fn etag_cache_query_string_differentiates() {
+        let store = test_store();
+        let key_no_qs = php_etag_cache_key("etag:", "GET", "/api", "");
+        let key_with_qs = php_etag_cache_key("etag:", "GET", "/api", "v=2");
+
+        store.set(key_no_qs.clone(), b"\"no-qs\"".to_vec(), None);
+        store.set(key_with_qs.clone(), b"\"with-qs\"".to_vec(), None);
+
+        assert_eq!(store.get(&key_no_qs).unwrap(), b"\"no-qs\"");
+        assert_eq!(store.get(&key_with_qs).unwrap(), b"\"with-qs\"");
+    }
+
+    #[test]
+    fn etag_cache_304_logic_matches_stored() {
+        let store = test_store();
+        let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
+        store.set(key.clone(), b"\"cached-v1\"".to_vec(), None);
+
+        // Simulate the cache lookup that happens in handle().
+        let stored = store.get(&key);
+        assert!(stored.is_some());
+        let stored_bytes = stored.unwrap();
+        let stored_etag = String::from_utf8_lossy(&stored_bytes);
+        let client_tag = "\"cached-v1\"";
+
+        // This should match → 304.
+        assert!(etag_matches_value(&stored_etag, client_tag));
+    }
+
+    #[test]
+    fn etag_cache_304_logic_no_match() {
+        let store = test_store();
+        let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
+        store.set(key.clone(), b"\"cached-v1\"".to_vec(), None);
+
+        let stored_bytes = store.get(&key).unwrap();
+        let stored_etag = String::from_utf8_lossy(&stored_bytes);
+        let client_tag = "\"old-version\"";
+
+        // Different ETag → should not match → execute PHP.
+        assert!(!etag_matches_value(&stored_etag, client_tag));
+    }
+
+    #[test]
+    fn etag_cache_miss_returns_none() {
+        let store = test_store();
+        let key = php_etag_cache_key("etag:", "GET", "/nonexistent.php", "");
+
+        // No entry → cache miss → execute PHP.
+        assert!(store.get(&key).is_none());
+    }
+
+    #[test]
+    fn etag_cache_with_short_ttl() {
+        use std::time::Duration;
+
+        let store = test_store();
+        let key = php_etag_cache_key("etag:", "GET", "/page.php", "");
+
+        // Store with 1-second TTL.
+        store.set(key.clone(), b"\"ttl-v1\"".to_vec(), Some(Duration::from_secs(1)));
+
+        // Should be retrievable immediately.
+        assert!(store.get(&key).is_some());
+    }
+
     // ── PHP-linked ETag integration tests ────────────────────────────
     //
     // These tests require PHP to be linked. They verify that PHP-set
@@ -1675,6 +1859,7 @@ mod tests {
     //
     // Run with: cargo nextest run -p ephpm-server --run-ignored all
 
+    #[allow(unexpected_cfgs)]
     #[cfg(all(test, php_linked))]
     mod php_etag_tests {
         use hyper::body::Empty;
@@ -1859,9 +2044,9 @@ echo "post response";
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None);
 
@@ -1883,9 +2068,9 @@ echo "post response";
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None);
 
@@ -1908,9 +2093,9 @@ echo "post response";
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None);
 
@@ -1933,9 +2118,9 @@ echo "post response";
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None);
 
@@ -1955,9 +2140,9 @@ echo "post response";
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None);
 
@@ -1981,9 +2166,9 @@ echo "post response";
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None);
 
@@ -2010,9 +2195,9 @@ echo "post response";
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None);
 
@@ -2045,9 +2230,9 @@ echo "post response";
                 ..ServerConfig::default()
             },
             php: PhpConfig::default(),
-            db: Default::default(),
-            kv: Default::default(),
-            cluster: Default::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None);
 

@@ -150,9 +150,7 @@ async fn bind_listeners(
     } else {
         None
     };
-    let router = Arc::new(Router::new(config, kv_store, metrics_handle, limiter.clone(), file_cache.clone()));
-
-    // Determine TLS mode.
+    // Determine TLS mode (before router creation so we can share the kv_store).
     let tls_mode = match config.server.tls.as_ref() {
         Some(tls_config) if tls_config.is_manual() => {
             let cert = tls_config.cert.as_ref().expect("is_manual checks cert");
@@ -166,7 +164,12 @@ async fn bind_listeners(
             TlsMode::Manual(acceptor)
         }
         Some(tls_config) if tls_config.is_acme() => {
-            let setup = acme::start_acme(tls_config)?;
+            let acme_store = if config.cluster.enabled {
+                Some(Arc::clone(&kv_store))
+            } else {
+                None
+            };
+            let setup = acme::start_acme(tls_config, acme_store)?;
             TlsMode::Acme {
                 challenge_config: setup.challenge_config,
                 default_config: setup.default_config,
@@ -179,6 +182,8 @@ async fn bind_listeners(
         }
         _ => TlsMode::None,
     };
+
+    let router = Arc::new(Router::new(config, kv_store, metrics_handle, limiter.clone(), file_cache.clone()));
 
     let has_tls = !matches!(tls_mode, TlsMode::None);
 
@@ -735,15 +740,14 @@ async fn start_db_proxies(
             .map(|r| r.urls.clone())
             .unwrap_or_default();
 
-        let rw_split = ephpm_db::mysql::RwSplitParams {
+        let rw_split = ephpm_db::postgres::PgRwSplitParams {
             enabled: config.db.read_write_split.enabled,
             sticky_duration: parse_duration(&config.db.read_write_split.sticky_duration)?,
         };
 
-        match ephpm_db::mysql::build_proxy(
+        match ephpm_db::postgres::build_proxy(
             &url,
             &listen,
-            pg_config.socket.clone(),
             pool_config,
             reset_strategy,
             replica_urls,

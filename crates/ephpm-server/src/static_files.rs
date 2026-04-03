@@ -261,15 +261,15 @@ fn serve_cached_entry(
 async fn serve_streamed(
     path: &Path,
     metadata: &std::fs::Metadata,
-    mime: &str,
+    content_type: &str,
     cache_control: &str,
     if_none_match: Option<&str>,
 ) -> Response<ServerBody> {
     let size = metadata.len();
-    let mtime = metadata.modified().ok();
+    let modified_time = metadata.modified().ok();
 
     // Compute metadata-based ETag.
-    let etag_value = mtime.map(|mt| {
+    let etag_value = modified_time.map(|mt| {
         let secs = mt
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -297,7 +297,7 @@ async fn serve_streamed(
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
-        .header("Content-Type", mime)
+        .header("Content-Type", content_type)
         .header("Content-Length", size);
     if !cache_control.is_empty() {
         builder = builder.header("Cache-Control", cache_control);

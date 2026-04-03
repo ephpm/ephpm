@@ -102,7 +102,7 @@ impl FileCache {
         path: &Path,
         content: &[u8],
         mtime: SystemTime,
-        mime: &str,
+        content_type: &str,
         compression: CompressionSettings,
     ) -> CacheEntry {
         // Evict if over capacity.
@@ -121,7 +121,7 @@ impl FileCache {
         };
 
         let gzip_content = if self.precompress && cached_content.is_some() {
-            crate::router::gzip_compress(content, mime, compression).map(Bytes::from)
+            crate::router::gzip_compress(content, content_type, compression).map(Bytes::from)
         } else {
             None
         };
@@ -130,7 +130,7 @@ impl FileCache {
             size,
             mtime,
             etag,
-            mime: mime.to_string(),
+            mime: content_type.to_string(),
             content: cached_content,
             gzip_content,
             last_validated: now,
