@@ -19,7 +19,7 @@ cargo xtask release --target windows       # → target/x86_64-pc-windows-msvc/r
 # Note: Windows builds never include sqld (no Windows binary available from Turso)
 ```
 
-Prerequisites for `cargo xtask release`: php CLI 8.2+, composer, git, and C build tools (autoconf, cmake, make, etc.). The xtask handles static-php-cli and sqld downloads automatically.
+Prerequisites for `cargo xtask release`: php CLI 8.2+, composer, git, OpenSSL dev headers (`libssl-dev` on Debian/Ubuntu, `openssl-devel` on Fedora/RHEL), and C build tools (autoconf, cmake, make, etc.). The xtask handles static-php-cli and sqld downloads automatically.
 
 ## Testing
 

@@ -93,7 +93,7 @@ cargo build
 cargo run -- --config ephpm.toml
 
 # Release binary with PHP embedded
-# Prerequisites: php-cli, composer, git, build-essential, autoconf, cmake, pkg-config, re2c
+# Prerequisites: php-cli, composer, git, build-essential, autoconf, cmake, pkg-config, re2c, libssl-dev
 cargo xtask release       # → target/release/ephpm
 ```
 
