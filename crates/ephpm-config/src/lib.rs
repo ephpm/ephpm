@@ -159,6 +159,13 @@ pub struct TimeoutsConfig {
     /// Default: 300 seconds (5 minutes).
     #[serde(default = "default_request_timeout")]
     pub request: u64,
+
+    /// Grace period in seconds for in-flight connections to finish during
+    /// shutdown. After this timeout, remaining connections are force-closed.
+    ///
+    /// Default: 30 seconds.
+    #[serde(default = "default_shutdown_timeout")]
+    pub shutdown: u64,
 }
 
 /// Response configuration (`[server.response]`).
@@ -1195,6 +1202,7 @@ impl Default for TimeoutsConfig {
             header_read: default_header_read(),
             idle: default_idle(),
             request: default_request_timeout(),
+            shutdown: default_shutdown_timeout(),
         }
     }
 }
@@ -1439,6 +1447,10 @@ fn default_idle() -> u64 {
 
 fn default_request_timeout() -> u64 {
     300
+}
+
+fn default_shutdown_timeout() -> u64 {
+    30
 }
 
 fn default_max_header_size() -> usize {

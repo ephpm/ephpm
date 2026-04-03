@@ -280,13 +280,9 @@ impl PgProxy {
                         ResetStrategy::Never => {
                             checkout.return_to_pool(backend);
                         }
-                        ResetStrategy::Always => match pg_reset_connection(backend).await {
-                            Ok(stream) => checkout.return_to_pool(stream),
-                            Err(e) => {
-                                debug!("PostgreSQL reset failed, discarding connection: {e}");
-                                checkout.retire();
-                            }
-                        },
+                        ResetStrategy::Always => {
+                            checkout.return_with_reset(backend).await;
+                        }
                         ResetStrategy::Smart => {
                             unreachable!()
                         }

@@ -220,7 +220,6 @@ mod tests {
             per_ip_max_connections: 0,
             per_ip_rate: rate,
             per_ip_burst: burst,
-            ..LimitsConfig::default()
         }
     }
 
@@ -283,6 +282,36 @@ mod tests {
         // Entry has partial tokens — should not be cleaned up.
         limiter.cleanup_stale();
         assert_eq!(limiter.per_ip.len(), 1);
+    }
+
+    #[test]
+    fn cleanup_removes_fully_replenished_idle_entry() {
+        let limiter = Limiter::new(test_config(10.0, 5, 0));
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        // Consume one token to create the entry with a partially consumed bucket.
+        assert!(limiter.check_rate(ip));
+        assert_eq!(limiter.per_ip.len(), 1);
+
+        // Partially consumed — cleanup should retain it.
+        limiter.cleanup_stale();
+        assert_eq!(limiter.per_ip.len(), 1, "partially consumed entry should be retained");
+
+        // Simulate the bucket being fully replenished by directly setting
+        // tokens back to the burst limit. This tests cleanup's eviction logic
+        // in isolation — refill timing is tested separately via check_rate.
+        let burst_tokens = u64::from(limiter.config.per_ip_burst) * 1000;
+        if let Some(entry) = limiter.per_ip.get(&ip) {
+            entry.tokens.store(burst_tokens, Ordering::Relaxed);
+        }
+
+        // Now cleanup should remove the entry (0 connections + full bucket).
+        limiter.cleanup_stale();
+        assert_eq!(
+            limiter.per_ip.len(),
+            0,
+            "fully replenished idle entry should be removed by cleanup"
+        );
     }
 
     #[test]

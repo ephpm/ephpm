@@ -10,6 +10,7 @@ pub mod tracked_backend;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -106,6 +107,7 @@ struct Listeners {
     redirect_http: bool,
     conn: ConnSettings,
     idle_timeout: Duration,
+    shutdown_timeout: Duration,
     router: Arc<Router>,
     limiter: Option<Arc<rate_limit::Limiter>>,
     file_cache: Option<Arc<file_cache::FileCache>>,
@@ -244,6 +246,8 @@ async fn bind_listeners(
         tracing::info!(%addr, "HTTP listening");
     }
 
+    let shutdown_timeout = Duration::from_secs(config.server.timeouts.shutdown);
+
     Ok(Listeners {
         main,
         tls_listener,
@@ -251,6 +255,7 @@ async fn bind_listeners(
         redirect_http,
         conn,
         idle_timeout,
+        shutdown_timeout,
         router,
         limiter,
         file_cache,
@@ -265,11 +270,15 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         tls_mode,
         redirect_http,
         conn,
-        idle_timeout,
+        idle_timeout: _idle_timeout,
+        shutdown_timeout,
         router,
         limiter,
         file_cache,
     } = listeners;
+
+    // Track in-flight connections for graceful shutdown.
+    let in_flight = Arc::new(AtomicUsize::new(0));
 
     // Spawn background cleanup task for rate limiter state.
     if let Some(ref l) = limiter {
@@ -305,7 +314,7 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
                 let guard = acquire_connection(&limiter, &stream, remote_addr).await;
                 dispatch_main_connection(
                     stream, remote_addr, &tls_mode, tls_listener.is_some(),
-                    redirect_http, conn, &router, guard,
+                    redirect_http, conn, &router, guard, &in_flight,
                 );
             }
 
@@ -314,7 +323,7 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
             }, if tls_listener.is_some() => {
                 let (stream, remote_addr) = result.context("failed to accept TLS connection")?;
                 let guard = acquire_connection(&limiter, &stream, remote_addr).await;
-                dispatch_tls_connection(stream, remote_addr, &tls_mode, conn, &router, guard);
+                dispatch_tls_connection(stream, remote_addr, &tls_mode, conn, &router, guard, &in_flight);
             }
 
             () = &mut shutdown => {
@@ -324,11 +333,32 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         }
     }
 
-    tracing::info!(
-        timeout_secs = idle_timeout.as_secs(),
-        "waiting for connections to drain"
-    );
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Graceful shutdown: wait for in-flight connections to drain.
+    let active = in_flight.load(Ordering::Relaxed);
+    if active > 0 {
+        tracing::info!(
+            active_connections = active,
+            timeout_secs = shutdown_timeout.as_secs(),
+            "waiting for in-flight connections to drain"
+        );
+
+        let deadline = tokio::time::Instant::now() + shutdown_timeout;
+        loop {
+            let remaining = in_flight.load(Ordering::Relaxed);
+            if remaining == 0 {
+                tracing::info!("all connections drained");
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    remaining_connections = remaining,
+                    "shutdown timeout reached, force-closing remaining connections"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 
     Ok(())
 }
@@ -356,6 +386,15 @@ async fn acquire_connection(
     }
 }
 
+/// RAII guard that decrements the in-flight connection counter on drop.
+struct InFlightGuard(Arc<AtomicUsize>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Dispatch a connection from the main listener.
 fn dispatch_main_connection(
     stream: TcpStream,
@@ -366,9 +405,16 @@ fn dispatch_main_connection(
     conn: ConnSettings,
     router: &Arc<Router>,
     guard: Option<rate_limit::ConnectionGuard>,
+    in_flight: &Arc<AtomicUsize>,
 ) {
+    in_flight.fetch_add(1, Ordering::Relaxed);
+    let flight_guard = InFlightGuard(Arc::clone(in_flight));
+
     if has_tls_listener && redirect_http {
-        tokio::spawn(serve_http_redirect(stream, remote_addr, conn));
+        tokio::spawn(async move {
+            let _flight = flight_guard;
+            serve_http_redirect(stream, remote_addr, conn).await;
+        });
         return;
     }
 
@@ -378,6 +424,7 @@ fn dispatch_main_connection(
             let router = Arc::clone(router);
             tokio::spawn(async move {
                 let _guard = guard; // held until connection closes
+                let _flight = flight_guard;
                 serve_manual_tls(stream, acceptor, router, remote_addr, conn).await;
             });
         }
@@ -390,6 +437,7 @@ fn dispatch_main_connection(
             let router = Arc::clone(router);
             tokio::spawn(async move {
                 let _guard = guard;
+                let _flight = flight_guard;
                 serve_acme_tls(stream, challenge, default, router, remote_addr, conn).await;
             });
         }
@@ -397,6 +445,7 @@ fn dispatch_main_connection(
             let router = Arc::clone(router);
             tokio::spawn(async move {
                 let _guard = guard;
+                let _flight = flight_guard;
                 serve_connection(TokioIo::new(stream), router, remote_addr, false, conn).await;
             });
         }
@@ -411,13 +460,18 @@ fn dispatch_tls_connection(
     conn: ConnSettings,
     router: &Arc<Router>,
     guard: Option<rate_limit::ConnectionGuard>,
+    in_flight: &Arc<AtomicUsize>,
 ) {
+    in_flight.fetch_add(1, Ordering::Relaxed);
+    let flight_guard = InFlightGuard(Arc::clone(in_flight));
+
     match tls_mode {
         TlsMode::Manual(acceptor) => {
             let acceptor = acceptor.clone();
             let router = Arc::clone(router);
             tokio::spawn(async move {
                 let _guard = guard;
+                let _flight = flight_guard;
                 serve_manual_tls(stream, acceptor, router, remote_addr, conn).await;
             });
         }
@@ -430,6 +484,7 @@ fn dispatch_tls_connection(
             let router = Arc::clone(router);
             tokio::spawn(async move {
                 let _guard = guard;
+                let _flight = flight_guard;
                 serve_acme_tls(stream, challenge, default, router, remote_addr, conn).await;
             });
         }
