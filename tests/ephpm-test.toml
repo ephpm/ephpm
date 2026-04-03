@@ -7,15 +7,43 @@ fallback = ["$uri", "$uri/", "=404"]
 
 [server.request]
 max_body_size = 1024
+trusted_hosts = [
+    "ephpm", "localhost", "127.0.0.1",
+    # vhost tests
+    "nonexistent-site.example.com",
+    "lazy-test.preview.ephpm.dev",
+    "site-a.preview.ephpm.dev",
+    "site-b.preview.ephpm.dev",
+    # security P0 tests
+    "basedir-a.test",
+    "basedir-b.test",
+    "shell-test.test",
+    "kv-smoke.test",
+    "kv-a.test",
+    "kv-b.test",
+    # evil.example.com is intentionally NOT listed — tests 421 rejection
+]
+
+[server.response]
+headers = [
+    ["X-Frame-Options", "DENY"],
+    ["X-Content-Type-Options", "nosniff"],
+    ["Strict-Transport-Security", "max-age=31536000; includeSubDomains"],
+]
 
 [server.static]
 cache_control = "public, max-age=3600"
+
+[server.file_cache]
+enabled = true
 
 [server.metrics]
 enabled = true
 
 [server.security]
 blocked_paths = ["vendor/*"]
+open_basedir = true
+disable_shell_exec = true
 
 [php]
 max_execution_time = 30
@@ -25,8 +53,18 @@ ini_overrides = [
     ["error_reporting", "E_ALL"],
 ]
 
+[server.limits]
+per_ip_rate = 50.0
+per_ip_burst = 10
+
 [db.sqlite]
 path = "/tmp/ephpm-test.db"
 
 [db.sqlite.proxy]
 mysql_listen = "127.0.0.1:3306"
+postgres_listen = "127.0.0.1:5432"
+tds_listen = "127.0.0.1:1433"
+
+[db.read_write_split]
+enabled = true
+sticky_duration = "2s"

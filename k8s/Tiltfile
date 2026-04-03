@@ -4,11 +4,17 @@
 #   tilt ci                          # headless — run tests and exit
 #   tilt up --stream                 # dev mode — watch + dashboard at :10350
 #
+# Cluster E2E tests (3-node gossip cluster):
+#   CLUSTER_E2E=1 tilt ci            # headless — single-node + cluster tests
+#   CLUSTER_E2E=1 tilt up --stream   # dev mode with cluster resources
+#
 # Environment:
 #   EXPECTED_PHP_VERSION  — PHP version to assert in tests (default: "8.5")
 #   CONTAINER_ENGINE      — "podman" or "docker" (default: auto-detect)
+#   CLUSTER_E2E           — set to "1" to deploy the 3-node cluster and run cluster tests
 
 expected_php_version = os.getenv("EXPECTED_PHP_VERSION", "8.5")
+cluster_e2e = os.getenv("CLUSTER_E2E", "") == "1"
 
 # ── Images ───────────────────────────────────────────────────────────────────
 
@@ -41,6 +47,14 @@ k8s_yaml("base/ephpm-single.yaml")
 e2e_yaml = str(read_file("tests/e2e-job.yaml")).replace("__EXPECTED_PHP_VERSION__", expected_php_version)
 k8s_yaml(blob(e2e_yaml))
 
+# ── Cluster resources (opt-in via CLUSTER_E2E=1) ────────────────────────────
+
+if cluster_e2e:
+    k8s_yaml("base/ephpm-cluster.yaml")
+
+    cluster_e2e_yaml = str(read_file("tests/cluster-e2e-job.yaml")).replace("__EXPECTED_PHP_VERSION__", expected_php_version)
+    k8s_yaml(blob(cluster_e2e_yaml))
+
 # ── Resource configuration ───────────────────────────────────────────────────
 
 k8s_resource("ephpm", port_forwards="8080:8080")
@@ -48,3 +62,10 @@ k8s_resource(
     "ephpm-e2e",
     resource_deps=["ephpm"],
 )
+
+if cluster_e2e:
+    k8s_resource("ephpm-cluster", port_forwards="8081:8080")
+    k8s_resource(
+        "ephpm-cluster-e2e",
+        resource_deps=["ephpm-cluster"],
+    )
