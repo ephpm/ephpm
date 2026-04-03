@@ -624,7 +624,7 @@ pub struct DbConfig {
     #[serde(default)]
     pub tds: Option<DbBackendConfig>,
 
-    /// Embedded SQLite configuration (via litewire).
+    /// Embedded `SQLite` configuration (via litewire).
 
     ///
     /// When enabled, starts an in-process `SQLite` database with `MySQL`/Hrana

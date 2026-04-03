@@ -2,7 +2,7 @@
 //!
 //! Replaces literal values (strings, numbers) with `?` placeholders so
 //! queries differing only in parameter values map to the same digest.
-//! Uses a character-level state machine — same approach as MySQL's
+//! Uses a character-level state machine — same approach as `MySQL`'s
 //! `performance_schema`.
 
 use std::hash::{Hash, Hasher};
@@ -35,119 +35,14 @@ pub fn normalize(sql: &str) -> String {
         let c = chars[i];
         match state {
             State::Normal => {
-                // Single-quoted string
-                if c == '\'' {
-                    out.push('?');
-                    state = State::SingleQuoted;
-                    i += 1;
-                }
-                // Double-quoted string (treated as identifier in standard SQL,
-                // but MySQL uses it for strings with ANSI_QUOTES off)
-                else if c == '"' {
-                    out.push('?');
-                    state = State::DoubleQuoted;
-                    i += 1;
-                }
-                // Backtick identifier — pass through
-                else if c == '`' {
-                    out.push(c);
-                    state = State::Backtick;
-                    i += 1;
-                }
-                // Line comment: -- ...
-                else if c == '-' && i + 1 < len && chars[i + 1] == '-' {
-                    state = State::LineComment;
-                    i += 2;
-                }
-                // Block comment: /* ... */
-                else if c == '/' && i + 1 < len && chars[i + 1] == '*' {
-                    state = State::BlockComment;
-                    i += 2;
-                }
-                // Hex literal: 0x... (must check before generic digit)
-                else if c == '0'
-                    && i + 1 < len
-                    && (chars[i + 1] == 'x' || chars[i + 1] == 'X')
-                {
-                    let prev_is_ident = out
-                        .chars()
-                        .next_back()
-                        .is_some_and(|p| p.is_alphanumeric() || p == '_');
-                    if prev_is_ident {
-                        out.push(c);
-                        i += 1;
-                    } else {
-                        out.push('?');
-                        // Skip 0x and hex digits
-                        i += 2;
-                        while i < len && chars[i].is_ascii_hexdigit() {
-                            i += 1;
-                        }
-                    }
-                }
-                // Number (digit, or leading dot like .5)
-                else if c.is_ascii_digit()
-                    || (c == '.' && i + 1 < len && chars[i + 1].is_ascii_digit())
-                {
-                    let prev_is_ident = out
-                        .chars()
-                        .next_back()
-                        .is_some_and(|p| p.is_alphanumeric() || p == '_');
-                    if prev_is_ident {
-                        out.push(c);
-                        i += 1;
-                    } else {
-                        out.push('?');
-                        state = State::Number;
-                        i += 1;
-                    }
-                }
-                // Whitespace collapse
-                else if c.is_ascii_whitespace() {
-                    if !out.ends_with(' ') && !out.is_empty() {
-                        out.push(' ');
-                    }
-                    i += 1;
-                }
-                // Everything else
-                else {
-                    out.push(c);
-                    i += 1;
-                }
+                i = handle_normal(c, i, &chars, len, &mut out, &mut state);
             }
-
             State::SingleQuoted => {
-                if c == '\'' {
-                    // Escaped quote '' — stay in string
-                    if i + 1 < len && chars[i + 1] == '\'' {
-                        i += 2;
-                    } else {
-                        state = State::Normal;
-                        i += 1;
-                    }
-                } else if c == '\\' {
-                    // Backslash escape — skip next char
-                    i += 2;
-                } else {
-                    i += 1;
-                }
+                i = skip_quoted_char(c, '\'', i, &chars, len, &mut state);
             }
-
             State::DoubleQuoted => {
-                if c == '"' {
-                    if i + 1 < len && chars[i + 1] == '"' {
-                        i += 2;
-                    } else {
-                        state = State::Normal;
-                        i += 1;
-                    }
-                } else if c == '\\' {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
+                i = skip_quoted_char(c, '"', i, &chars, len, &mut state);
             }
-
             State::Backtick => {
                 out.push(c);
                 if c == '`' {
@@ -155,24 +50,19 @@ pub fn normalize(sql: &str) -> String {
                 }
                 i += 1;
             }
-
             State::Number => {
-                // Consume digits, dots, hex chars, exponent notation
                 if c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' {
                     i += 1;
                 } else {
                     state = State::Normal;
-                    // Don't advance i — re-process this char in Normal state
                 }
             }
-
             State::LineComment => {
                 if c == '\n' {
                     state = State::Normal;
                 }
                 i += 1;
             }
-
             State::BlockComment => {
                 if c == '*' && i + 1 < len && chars[i + 1] == '/' {
                     state = State::Normal;
@@ -184,15 +74,115 @@ pub fn normalize(sql: &str) -> String {
         }
     }
 
-    // Collapse IN (?, ?, ?, ...) to IN (?, ...)
     collapse_in_lists(&mut out);
 
-    // Trim trailing whitespace
     while out.ends_with(' ') {
         out.pop();
     }
 
     out
+}
+
+/// Returns `true` if the last character in `out` is alphanumeric or `_`.
+fn prev_is_identifier(out: &str) -> bool {
+    out.chars()
+        .next_back()
+        .is_some_and(|p| p.is_alphanumeric() || p == '_')
+}
+
+/// Handle a character in `Normal` state. Returns the new index.
+fn handle_normal(
+    c: char,
+    i: usize,
+    chars: &[char],
+    len: usize,
+    out: &mut String,
+    state: &mut State,
+) -> usize {
+    if c == '\'' {
+        out.push('?');
+        *state = State::SingleQuoted;
+        i + 1
+    } else if c == '"' {
+        out.push('?');
+        *state = State::DoubleQuoted;
+        i + 1
+    } else if c == '`' {
+        out.push(c);
+        *state = State::Backtick;
+        i + 1
+    } else if c == '-' && i + 1 < len && chars[i + 1] == '-' {
+        *state = State::LineComment;
+        i + 2
+    } else if c == '/' && i + 1 < len && chars[i + 1] == '*' {
+        *state = State::BlockComment;
+        i + 2
+    } else if c == '0' && i + 1 < len && (chars[i + 1] == 'x' || chars[i + 1] == 'X') {
+        handle_hex_literal(i, chars, len, out)
+    } else if c.is_ascii_digit()
+        || (c == '.' && i + 1 < len && chars[i + 1].is_ascii_digit())
+    {
+        handle_numeric_literal(c, i, out, state)
+    } else if c.is_ascii_whitespace() {
+        if !out.ends_with(' ') && !out.is_empty() {
+            out.push(' ');
+        }
+        i + 1
+    } else {
+        out.push(c);
+        i + 1
+    }
+}
+
+/// Handle a hex literal (`0xDEAD`). Returns the new index.
+fn handle_hex_literal(i: usize, chars: &[char], len: usize, out: &mut String) -> usize {
+    if prev_is_identifier(out) {
+        out.push(chars[i]);
+        i + 1
+    } else {
+        out.push('?');
+        let mut j = i + 2;
+        while j < len && chars[j].is_ascii_hexdigit() {
+            j += 1;
+        }
+        j
+    }
+}
+
+/// Handle a numeric literal (integer, float, leading dot). Returns the new index.
+fn handle_numeric_literal(c: char, i: usize, out: &mut String, state: &mut State) -> usize {
+    if prev_is_identifier(out) {
+        out.push(c);
+        i + 1
+    } else {
+        out.push('?');
+        *state = State::Number;
+        i + 1
+    }
+}
+
+/// Advance past a character inside a quoted string (single or double).
+/// Returns the new index.
+fn skip_quoted_char(
+    c: char,
+    quote: char,
+    i: usize,
+    chars: &[char],
+    len: usize,
+    state: &mut State,
+) -> usize {
+    if c == quote {
+        if i + 1 < len && chars[i + 1] == quote {
+            i + 2
+        } else {
+            *state = State::Normal;
+            i + 1
+        }
+    } else if c == '\\' {
+        i + 2
+    } else {
+        i + 1
+    }
 }
 
 /// Collapse `IN (?, ?, ?, ?)` to `IN (?, ...)`.

@@ -219,7 +219,9 @@ impl QueryStats {
                     last_seen: now,
                 },
             );
-            gauge!("ephpm_query_active_digests").set(self.entries.len() as f64);
+            #[allow(clippy::cast_precision_loss)] // digest count will never exceed 2^52
+            let count = self.entries.len() as f64;
+            gauge!("ephpm_query_active_digests").set(count);
         }
     }
 }

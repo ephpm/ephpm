@@ -31,7 +31,7 @@ pub enum SqldRole {
 /// Configuration for spawning sqld.
 #[derive(Debug, Clone)]
 pub struct SqldConfig {
-    /// Path to the SQLite database file.
+    /// Path to the `SQLite` database file.
     pub db_path: String,
     /// Hrana HTTP listen address (internal, litewire → sqld).
     pub http_listen: String,
@@ -176,7 +176,7 @@ impl SqldProcess {
             // Sending SIGTERM to request graceful shutdown is safe.
             #[allow(unsafe_code)]
             unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                libc::kill(libc::pid_t::try_from(pid).expect("pid fits in i32"), libc::SIGTERM);
             }
         }
         #[cfg(not(unix))]
@@ -221,7 +221,7 @@ impl Drop for SqldProcess {
             // Sending SIGTERM to request graceful shutdown is safe.
             #[allow(unsafe_code)]
             unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                libc::kill(libc::pid_t::try_from(pid).expect("pid fits in i32"), libc::SIGTERM);
             }
         }
         self.cleanup_temp();
@@ -250,11 +250,11 @@ async fn extract_binary() -> anyhow::Result<PathBuf> {
 }
 
 #[cfg(not(sqld_embedded))]
-async fn extract_binary() -> anyhow::Result<PathBuf> {
-    anyhow::bail!(
+fn extract_binary() -> impl std::future::Future<Output = anyhow::Result<PathBuf>> {
+    std::future::ready(Err(anyhow::anyhow!(
         "sqld binary not embedded — rebuild with SQLD_BINARY_PATH set \
          (e.g., cargo xtask release --sqld-binary /path/to/sqld)"
-    )
+    )))
 }
 
 /// Spawn the sqld child process with the given config and role.
