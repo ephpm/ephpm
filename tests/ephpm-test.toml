@@ -24,8 +24,18 @@ trusted_hosts = [
     # evil.example.com is intentionally NOT listed — tests 421 rejection
 ]
 
+[server.response]
+headers = [
+    ["X-Frame-Options", "DENY"],
+    ["X-Content-Type-Options", "nosniff"],
+    ["Strict-Transport-Security", "max-age=31536000; includeSubDomains"],
+]
+
 [server.static]
 cache_control = "public, max-age=3600"
+
+[server.file_cache]
+enabled = true
 
 [server.metrics]
 enabled = true
@@ -43,8 +53,17 @@ ini_overrides = [
     ["error_reporting", "E_ALL"],
 ]
 
+[server.limits]
+per_ip_rate = 50.0
+per_ip_burst = 10
+
 [db.sqlite]
 path = "/tmp/ephpm-test.db"
 
 [db.sqlite.proxy]
 mysql_listen = "127.0.0.1:3306"
+postgres_listen = "127.0.0.1:5432"
+
+[db.read_write_split]
+enabled = true
+sticky_duration = "2s"
