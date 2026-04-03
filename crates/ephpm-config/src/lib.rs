@@ -1735,11 +1735,11 @@ key_prefix = "cache:etag:"
         let file = dir.path().join("ephpm.toml");
         std::fs::write(
             &file,
-            r#"
+            r"
 [server.php_etag_cache]
 enabled = true
 ttl_secs = -1
-"#,
+",
         )
         .unwrap();
 
@@ -1823,10 +1823,10 @@ compression_level = 5
         let file = dir.path().join("ephpm.toml");
         std::fs::write(
             &file,
-            r#"
+            r"
 [server.php_etag_cache]
 enabled = false
-"#,
+",
         )
         .unwrap();
 

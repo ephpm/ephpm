@@ -1,4 +1,4 @@
-//! Primary election for clustered SQLite (sqld).
+//! Primary election for clustered `SQLite` (sqld).
 //!
 //! Uses the gossip KV tier to elect a primary node for sqld replication.
 //! The lowest-ordinal alive node wins. The primary heartbeats its claim
@@ -74,6 +74,7 @@ impl SqliteElection {
     ///
     /// `grpc_listen` is this node's sqld gRPC address that replicas will
     /// connect to if this node becomes primary.
+    #[must_use]
     pub fn new(cluster: Arc<ClusterHandle>, grpc_listen: String) -> Self {
         // Start as replica with empty URL — will be resolved on first tick.
         let (role_tx, role_rx) = watch::channel(ElectedRole::Replica {
