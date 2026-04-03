@@ -7,6 +7,7 @@ fallback = ["$uri", "$uri/", "=404"]
 
 [server.request]
 max_body_size = 1024
+max_header_size = 4096
 trusted_hosts = [
     "ephpm", "localhost", "127.0.0.1",
     # vhost tests
@@ -25,6 +26,7 @@ trusted_hosts = [
 ]
 
 [server.response]
+compression_min_size = 1024
 headers = [
     ["X-Frame-Options", "DENY"],
     ["X-Content-Type-Options", "nosniff"],
@@ -54,6 +56,7 @@ ini_overrides = [
 ]
 
 [server.limits]
+max_connections = 100
 per_ip_rate = 50.0
 per_ip_burst = 10
 
@@ -62,9 +65,22 @@ path = "/tmp/ephpm-test.db"
 
 [db.sqlite.proxy]
 mysql_listen = "127.0.0.1:3306"
+hrana_listen = "0.0.0.0:8081"
 postgres_listen = "127.0.0.1:5432"
 tds_listen = "127.0.0.1:1433"
+
+[server.timeouts]
+header_read = 20
+idle = 45
 
 [db.read_write_split]
 enabled = true
 sticky_duration = "2s"
+
+[kv]
+memory_limit = "64MB"
+eviction_policy = "allkeys-lru"
+
+[kv.redis_compat]
+enabled = true
+socket = "/tmp/ephpm-kv.sock"
