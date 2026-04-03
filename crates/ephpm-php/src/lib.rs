@@ -335,6 +335,16 @@ impl PhpRuntime {
         Ok(())
     }
 
+    /// Check whether the PHP runtime is initialized and ready.
+    ///
+    /// Used by health/readiness probes to determine if the server can
+    /// accept PHP requests. In stub mode (no `php_linked`), always
+    /// returns `false`.
+    #[must_use]
+    pub fn is_ready() -> bool {
+        PHP_INITIALIZED.load(Ordering::Acquire)
+    }
+
     // ── CLI mode methods ──────────────────────────────────────────────────
 
     /// Get the embedded PHP version string (e.g. "8.5.4").

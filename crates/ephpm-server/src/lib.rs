@@ -67,6 +67,16 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             cluster_id = %handle.cluster_id(),
             "cluster gossip started"
         );
+
+        // Start the KV TCP data plane for large-value cross-node fetches.
+        let data_port = config.cluster.kv.data_port;
+        let data_plane_store = Arc::clone(&kv_store);
+        tokio::spawn(async move {
+            if let Err(e) = ephpm_cluster::data_plane::serve(data_plane_store, data_port).await {
+                tracing::error!(%e, "KV data plane error");
+            }
+        });
+
         Some(Arc::new(handle))
     } else {
         None
@@ -111,6 +121,8 @@ struct Listeners {
     router: Arc<Router>,
     limiter: Option<Arc<rate_limit::Limiter>>,
     file_cache: Option<Arc<file_cache::FileCache>>,
+    /// Interval for file cache eviction sweeps (derived from `inactive_secs`).
+    file_cache_eviction_interval: Duration,
 }
 
 /// Connection-level settings passed into spawned tasks.
@@ -248,6 +260,11 @@ async fn bind_listeners(
 
     let shutdown_timeout = Duration::from_secs(config.server.timeouts.shutdown);
 
+    // Eviction interval: half of inactive_secs, clamped to [1, 60].
+    let inactive = config.server.file_cache.inactive_secs;
+    let eviction_secs = (inactive / 2).max(1).min(60);
+    let file_cache_eviction_interval = Duration::from_secs(eviction_secs);
+
     Ok(Listeners {
         main,
         tls_listener,
@@ -259,6 +276,7 @@ async fn bind_listeners(
         router,
         limiter,
         file_cache,
+        file_cache_eviction_interval,
     })
 }
 
@@ -275,6 +293,7 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         router,
         limiter,
         file_cache,
+        file_cache_eviction_interval,
     } = listeners;
 
     // Track in-flight connections for graceful shutdown.
@@ -295,8 +314,9 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
     // Spawn background eviction task for file cache.
     if let Some(ref fc) = file_cache {
         let fc = Arc::clone(fc);
+        let eviction_interval = file_cache_eviction_interval;
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(eviction_interval);
             loop {
                 interval.tick().await;
                 fc.evict_inactive();
@@ -653,9 +673,28 @@ async fn serve_http_redirect(stream: TcpStream, remote_addr: SocketAddr, setting
     }
 }
 
-/// Wait for a shutdown signal (Ctrl+C).
+/// Wait for a shutdown signal (Ctrl+C or SIGTERM).
 async fn shutdown_signal() {
-    signal::ctrl_c().await.expect("failed to install ctrl+c handler");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm =
+            signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = signal::ctrl_c() => {
+                tracing::info!("received SIGINT (Ctrl+C), shutting down");
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("received SIGTERM, shutting down");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        signal::ctrl_c().await.expect("failed to install ctrl+c handler");
+        tracing::info!("received Ctrl+C, shutting down");
+    }
 }
 
 /// Start the KV store with optional RESP server.
@@ -827,62 +866,15 @@ async fn start_db_proxies(
         }
     }
 
-    // TDS (SQL Server) proxy
-    if let Some(tds_config) = &config.db.tds {
-        let url = tds_config.url.clone();
-        let listen = tds_config
-            .listen
-            .clone()
-            .unwrap_or_else(|| "127.0.0.1:1433".to_string());
-
-        let pool_config = ephpm_db::pool::PoolConfig {
-            min_connections: tds_config.min_connections,
-            max_connections: tds_config.max_connections,
-            idle_timeout: parse_duration(&tds_config.idle_timeout)?,
-            max_lifetime: parse_duration(&tds_config.max_lifetime)?,
-            pool_timeout: parse_duration(&tds_config.pool_timeout)?,
-            health_check_interval: parse_duration(&tds_config.health_check_interval)?,
-        };
-
-        let reset_strategy = ephpm_db::ResetStrategy::from_str_lossy(&tds_config.reset_strategy);
-
-        let replica_urls = tds_config
-            .replicas
-            .as_ref()
-            .map(|r| r.urls.clone())
-            .unwrap_or_default();
-
-        let rw_split = ephpm_db::mysql::RwSplitParams {
-            enabled: config.db.read_write_split.enabled,
-            sticky_duration: parse_duration(&config.db.read_write_split.sticky_duration)?,
-        };
-
-        match ephpm_db::mysql::build_proxy(
-            &url,
-            &listen,
-            tds_config.socket.clone(),
-            pool_config,
-            reset_strategy,
-            replica_urls,
-            rw_split,
-        )
-        .await
-        {
-            Ok(proxy) => {
-                let maintenance_handle = proxy.start_maintenance();
-                let proxy_handle = tokio::spawn(async move {
-                    match proxy.run().await {
-                        Ok(()) => tracing::info!("TDS proxy stopped"),
-                        Err(e) => tracing::error!("TDS proxy error: {e:#}"),
-                    }
-                });
-                handles.push(proxy_handle);
-                drop(maintenance_handle);
-            }
-            Err(e) => {
-                tracing::error!("failed to start TDS proxy: {e:#}");
-            }
-        }
+    // TDS (SQL Server) proxy — not yet implemented.
+    // The TDS wire protocol is planned but not available. Log a clear
+    // warning so users know to use the MySQL proxy instead.
+    if config.db.tds.is_some() {
+        tracing::warn!(
+            "TDS (SQL Server) proxy is configured but not yet implemented. \
+             The TDS wire protocol is planned for a future release. \
+             Consider using the MySQL proxy ([db.mysql]) instead."
+        );
     }
 
     // Embedded SQLite via litewire
