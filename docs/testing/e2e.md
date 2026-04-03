@@ -4,11 +4,11 @@ Current state of end-to-end test coverage and the tests we still need to build.
 
 ---
 
-## Current Coverage (72 tests, 14 files)
+## Current Coverage (111 tests, 28 files)
 
 The `ephpm-e2e` crate lives in `crates/ephpm-e2e/` and runs inside a Kind cluster via Tilt. See [developer/testing.md](../developer/testing.md) for infrastructure details.
 
-### Single-Node Tests (72 tests, 14 files)
+### Single-Node Tests
 
 | File | Tests | Coverage |
 |------|------:|----------|
@@ -16,19 +16,35 @@ The `ephpm-e2e` crate lives in `crates/ephpm-e2e/` and runs inside a Kind cluste
 | `http.rs` | 9 | HEAD no body, POST body, content-type static, ETag 304, gzip compression, 413 body too large, cache-control, X-Forwarded-For, fallback to index.php |
 | `php.rs` | 7 | `$_GET`, `$_SERVER` vars, `exit()` output, `http_response_code()`, `$_COOKIE`, `php://input`, custom response header |
 | `phpinfo.rs` | 2 | PHP version matching, health check |
-| `kv.rs` | 13 | set/get, TTL expiry, atomic incr, del/exists, incr_by, expire extends TTL, pttl, setnx, mset/mget, pttl missing key, empty values, large values (~10KB), overwrite |
+| `php_config.rs` | 1 | PHP configuration validation |
+| `php_extended.rs` | 6 | Empty PHP output 200, JSON content-type, multiple Set-Cookie headers, SERVER_SOFTWARE, PUT/DELETE methods, additional PHP behavior |
+| `kv.rs` | 11 | set/get, TTL expiry, atomic incr, del/exists, incr_by, expire extends TTL, pttl, setnx, mset/mget, empty values, large values |
 | `errors.rs` | 3 | Fatal error 500, memory limit 500, syntax error 500 (all verify server recovery) |
 | `security.rs` | 4 | Dotfile 403, PHP source not exposed, blocked_paths 403, path traversal blocked |
-| `concurrency.rs` | 2 | 20 parallel PHP requests, atomic KV increments under load |
+| `security_p0.rs` | 6 | Additional security tests (host validation, allowed PHP paths, etc.) |
+| `hidden_files.rs` | 2 | Hidden file blocking modes |
+| `concurrency.rs` | — | Parallel PHP requests, atomic KV increments under load (uses non-tokio test harness) |
 | `metrics.rs` | 9 | Prometheus format, build info, HTTP counters, handler labels, PHP execution metrics, in-flight gauge, body size histograms, metrics self-counting, status codes |
 | `etag_cache.rs` | 6 | PHP ETag 200+header, matching ETag 304, mismatched ETag 200, POST bypass, no If-None-Match 200, independent query strings |
 | `timeouts.rs` | 2 | PHP sleep exceeding timeout returns 504, server recovers after timeout |
+| `timeout_edge.rs` | 1 | Timeout edge cases |
 | `http_edge.rs` | 4 | Percent-encoded paths, HEAD Content-Length + empty body, ~4KB query string, multiple query params |
-| `php_extended.rs` | 5 | Empty PHP output 200, JSON content-type, multiple Set-Cookie headers, SERVER_SOFTWARE, PUT/DELETE methods |
+| `brotli.rs` | 1 | Brotli accept-encoding handling |
+| `custom_headers.rs` | 2 | Custom response headers via config |
+| `file_cache.rs` | 4 | Open file cache behavior |
+| `vhosts.rs` | 3 | Virtual host routing |
+| `sqlite.rs` | 4 | Embedded SQLite via litewire |
+| `query_stats.rs` | 3 | Query digest tracking and metrics |
+| `rate_limit.rs` | 1 | Per-IP rate limiting |
+| `rw_split.rs` | 6 | Read/write splitting |
+| `postgres_proxy.rs` | 2 | PostgreSQL wire protocol proxy |
+| `tds_proxy.rs` | 2 | TDS wire protocol proxy |
 
 ### Cluster Tests
 
-**Not yet implemented.** No cluster infrastructure (StatefulSet, headless service, gossip config) exists in the K8s manifests.
+| File | Tests | Coverage |
+|------|------:|----------|
+| `cluster.rs` | 7 | Cluster gossip discovery, KV replication, node membership |
 
 ---
 
@@ -99,28 +115,38 @@ No cluster helpers, no poll_until, no optional_env.
 | TLS / HTTPS | Yes | **No** | Blocked — needs self-signed cert + CA trust in e2e pod |
 | Static file serving | Yes | Yes (3 tests) | — |
 | Request routing (fallback) | Yes | Yes (1 test) | — |
-| Configuration (TOML + env vars) | Yes | Indirect | Medium |
-| Embedded KV store (SAPI) | Yes | Yes (10 tests) | — |
+| Configuration (TOML + env vars) | Yes | Yes (1 test) | — |
+| Embedded KV store (SAPI) | Yes | Yes (11 tests) | — |
 | KV store CLI (`ephpm kv`) | Yes | **No** | Medium |
 | PHP embedding (ZTS) | Yes | Yes (7+2 tests) | — |
 | Compression (gzip) | Yes | Yes (1 test) | — |
+| Compression (brotli) | Yes | Yes (1 test) | — |
 | ETags / 304 (static) | Yes | Yes (1 test) | — |
 | PHP ETag cache | Yes | Yes (6 tests) | — |
-| Security (paths, dotfiles) | Yes | Yes (4 tests) | — |
+| Security (paths, dotfiles) | Yes | Yes (12 tests) | — |
 | Sessions | Yes | **No** | Medium |
-| Timeouts | Yes | Yes (2 tests) | — |
+| Timeouts | Yes | Yes (3 tests) | — |
 | PHP error recovery | Yes | Yes (3 tests) | — |
 | Proxy headers | Yes | Yes (1 test) | Low |
+| Custom response headers | Yes | Yes (2 tests) | — |
+| Virtual hosts | Yes | Yes (3 tests) | — |
+| File cache | Yes | Yes (4 tests) | — |
+| Rate limiting | Yes | Yes (1 test) | — |
 | Graceful shutdown | Yes | **No** | Medium — needs kubectl |
-| Concurrency / load | Yes | Yes (2 tests) | — |
-| Cluster gossip | Yes | **No** | High — no cluster infra |
-| Cluster KV replication | Yes | **No** | High — no cluster infra |
-| Cluster resilience | Yes | **No** | High — no cluster infra |
+| Concurrency / load | Yes | Yes | — |
+| Embedded SQLite (litewire) | Yes | Yes (4 tests) | — |
+| Query stats | Yes | Yes (3 tests) | — |
+| R/W splitting | Yes | Yes (6 tests) | — |
+| Cluster gossip | Yes | Yes (7 tests) | — |
+| Cluster KV replication | Yes | Yes (7 tests) | — |
+| Cluster resilience | Yes | **No** | Medium |
 | Observability (metrics) | Yes | Yes (9 tests) | — |
 | Observability (tracing) | Partial | **No** | Low |
 | CLI | Partial | **No** | Medium |
-| ACME | Planned | — | — |
-| DB proxy | Partial | — | — |
+| ACME | Yes | **No** | Blocked — needs real domain in e2e env |
+| DB proxy (MySQL) | Yes | Yes (6 tests) | — |
+| DB proxy (PostgreSQL) | Partial | Yes (2 tests) | — |
+| DB proxy (TDS) | Partial | Yes (2 tests) | — |
 | Admin UI / API | Planned | — | — |
 
 ---

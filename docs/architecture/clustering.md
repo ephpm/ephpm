@@ -49,8 +49,10 @@ struct KvEntry {
     expires_at: Option<Instant>,
 }
 
-/// MVP: strings + hashes only. Covers cache, sessions, object cache.
+/// Strings and hashes are implemented. Covers cache, sessions, object cache.
 /// Lists, sets, sorted sets added later if needed (see Data Structure Roadmap below).
+/// Note: in the actual implementation, strings use `DashMap<String, Entry>` and
+/// hashes use a separate `DashMap<String, HashEntry>` for type safety.
 enum KvValue {
     String(Vec<u8>),
     Hash(HashMap<Vec<u8>, Vec<u8>>),

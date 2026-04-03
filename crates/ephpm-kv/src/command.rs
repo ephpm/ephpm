@@ -290,7 +290,9 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "TYPE" => {
             check_args!(cmd, argv, 1);
             let key = str_from(argv[0]);
-            if store.exists(&key) {
+            if store.is_hash(&key) {
+                Frame::Simple("hash".into())
+            } else if store.exists(&key) {
                 Frame::Simple("string".into())
             } else {
                 Frame::Simple("none".into())
@@ -327,6 +329,79 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "FLUSHDB" | "FLUSHALL" => {
             store.flush();
             Frame::ok()
+        }
+
+        // ── Hash operations ──────────────────────────────────────
+        "HSET" => {
+            if argv.len() < 3 || argv.len() % 2 == 0 {
+                return Frame::error("ERR wrong number of arguments for 'hset' command");
+            }
+            let key = str_from(argv[0]);
+            let mut added = 0i64;
+            for pair in argv[1..].chunks(2) {
+                let field = str_from(pair[0]);
+                let value = pair[1].to_vec();
+                if store.hset(&key, &field, value) {
+                    added += 1;
+                }
+            }
+            Frame::integer(added)
+        }
+        "HGET" => {
+            check_args!(cmd, argv, 2);
+            let key = str_from(argv[0]);
+            let field = str_from(argv[1]);
+            match store.hget(&key, &field) {
+                Some(v) => Frame::bulk(v),
+                None => Frame::Null,
+            }
+        }
+        "HDEL" => {
+            if argv.len() < 2 {
+                return Frame::error("ERR wrong number of arguments for 'hdel' command");
+            }
+            let key = str_from(argv[0]);
+            let removed: i64 = argv[1..]
+                .iter()
+                .filter(|f| store.hdel(&key, &str_from(f)))
+                .count()
+                .try_into()
+                .unwrap_or(i64::MAX);
+            Frame::integer(removed)
+        }
+        "HGETALL" => {
+            check_args!(cmd, argv, 1);
+            let key = str_from(argv[0]);
+            let pairs = store.hgetall(&key);
+            let mut frames = Vec::with_capacity(pairs.len() * 2);
+            for (field, value) in pairs {
+                frames.push(Frame::bulk(field.into_bytes()));
+                frames.push(Frame::bulk(value));
+            }
+            Frame::Array(frames)
+        }
+        "HKEYS" => {
+            check_args!(cmd, argv, 1);
+            let key = str_from(argv[0]);
+            let keys = store.hkeys(&key);
+            Frame::Array(keys.into_iter().map(|k| Frame::bulk(k.into_bytes())).collect())
+        }
+        "HVALS" => {
+            check_args!(cmd, argv, 1);
+            let key = str_from(argv[0]);
+            let vals = store.hvals(&key);
+            Frame::Array(vals.into_iter().map(Frame::bulk).collect())
+        }
+        "HLEN" => {
+            check_args!(cmd, argv, 1);
+            let key = str_from(argv[0]);
+            Frame::integer(i64::try_from(store.hlen(&key)).unwrap_or(i64::MAX))
+        }
+        "HEXISTS" => {
+            check_args!(cmd, argv, 2);
+            let key = str_from(argv[0]);
+            let field = str_from(argv[1]);
+            Frame::integer(i64::from(store.hexists(&key, &field)))
         }
 
         // ── Server info ──────────────────────────────────────────

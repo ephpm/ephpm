@@ -6,6 +6,7 @@
 
 mod entry;
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -112,11 +113,37 @@ impl Default for StoreConfig {
     }
 }
 
+/// A hash entry with TTL support.
+#[derive(Debug, Clone)]
+struct HashEntry {
+    /// Field → value map.
+    fields: HashMap<String, Vec<u8>>,
+    /// Absolute expiry time, or `None` for persistent keys.
+    expires_at: Option<Instant>,
+}
+
+impl HashEntry {
+    fn is_expired(&self) -> bool {
+        self.expires_at.is_some_and(|exp| Instant::now() >= exp)
+    }
+
+    /// Rough memory estimate.
+    fn mem_size(&self) -> usize {
+        self.fields
+            .iter()
+            .map(|(k, v)| k.len() + v.len() + 64)
+            .sum::<usize>()
+            + 64
+    }
+}
+
 /// Thread-safe in-memory KV store.
 #[derive(Debug)]
 pub struct Store {
-    /// The main data map.
+    /// The main data map (string values).
     data: DashMap<String, Entry>,
+    /// Hash values stored separately to avoid Entry enum complexity.
+    hashes: DashMap<String, HashEntry>,
     /// Approximate total memory used by all entries.
     mem_used: AtomicUsize,
     /// Store configuration.
@@ -129,6 +156,7 @@ impl Store {
     pub fn new(config: StoreConfig) -> Arc<Self> {
         Arc::new(Self {
             data: DashMap::new(),
+            hashes: DashMap::new(),
             mem_used: AtomicUsize::new(0),
             config,
         })
@@ -155,21 +183,20 @@ impl Store {
         }
     }
 
-    /// Check if a key exists (and is not expired).
+    /// Check if a key exists (and is not expired). Checks both string and hash keys.
     #[must_use]
     pub fn exists(&self, key: &str) -> bool {
-        match self.data.get(key) {
-            Some(entry) => {
-                if entry.is_expired() {
-                    drop(entry);
-                    self.remove(key);
-                    false
-                } else {
-                    true
-                }
+        // Check string keys.
+        if let Some(entry) = self.data.get(key) {
+            if entry.is_expired() {
+                drop(entry);
+                self.remove(key);
+            } else {
+                return true;
             }
-            None => false,
         }
+        // Check hash keys.
+        self.is_hash(key)
     }
 
     /// Get the remaining TTL for a key in milliseconds.
@@ -193,9 +220,10 @@ impl Store {
     }
 
     /// Number of keys in the store (including not-yet-reaped expired keys).
+    /// Counts both string and hash keys.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.data.len() + self.hashes.len()
     }
 
     /// Whether the store is empty.
@@ -211,15 +239,25 @@ impl Store {
     }
 
     /// Collect keys matching a glob pattern. `*` matches everything.
+    /// Returns both string and hash keys.
     #[must_use]
     pub fn keys(&self, pattern: &str) -> Vec<String> {
         let match_all = pattern == "*";
-        self.data
+        let mut result: Vec<String> = self
+            .data
             .iter()
             .filter(|entry| !entry.value().is_expired())
             .filter(|entry| match_all || glob_match(pattern, entry.key()))
             .map(|entry| entry.key().clone())
-            .collect()
+            .collect();
+        result.extend(
+            self.hashes
+                .iter()
+                .filter(|entry| !entry.value().is_expired())
+                .filter(|entry| match_all || glob_match(pattern, entry.key()))
+                .map(|entry| entry.key().clone()),
+        );
+        result
     }
 
     // ── Write operations ─────────────────────────────────────────
@@ -266,14 +304,17 @@ impl Store {
         true
     }
 
-    /// Remove a key, returning `true` if it existed.
+    /// Remove a key, returning `true` if it existed. Removes from both
+    /// string and hash storage.
     pub fn remove(&self, key: &str) -> bool {
-        if let Some((_, old)) = self.data.remove(key) {
+        let string_removed = if let Some((_, old)) = self.data.remove(key) {
             self.mem_sub(old.mem_size);
             true
         } else {
             false
-        }
+        };
+        let hash_removed = self.hash_remove(key);
+        string_removed || hash_removed
     }
 
     /// Set an expiry on an existing key. Returns `false` if the key doesn't exist.
@@ -432,9 +473,179 @@ impl Store {
         len
     }
 
+    // ── Hash operations ──────────────────────────────────────────
+
+    /// Set a field in a hash. Creates the hash if it doesn't exist.
+    ///
+    /// Returns `true` if the field was newly inserted, `false` if updated.
+    pub fn hset(&self, key: &str, field: &str, value: Vec<u8>) -> bool {
+        let field_mem = field.len() + value.len() + 64;
+        let mut entry = self.hashes.entry(key.to_string()).or_insert_with(|| {
+            self.mem_add(64); // base hash overhead
+            HashEntry {
+                fields: HashMap::new(),
+                expires_at: None,
+            }
+        });
+        if entry.is_expired() {
+            let old_mem = entry.mem_size();
+            entry.fields.clear();
+            entry.expires_at = None;
+            self.mem_sub(old_mem);
+        }
+        let is_new = !entry.fields.contains_key(field);
+        if let Some(old_val) = entry.fields.insert(field.to_string(), value) {
+            // Replaced — adjust memory for the difference.
+            let old_field_mem = field.len() + old_val.len() + 64;
+            if field_mem > old_field_mem {
+                self.mem_add(field_mem - old_field_mem);
+            } else {
+                self.mem_sub(old_field_mem - field_mem);
+            }
+        } else {
+            self.mem_add(field_mem);
+        }
+        is_new
+    }
+
+    /// Get a field value from a hash.
+    #[must_use]
+    pub fn hget(&self, key: &str, field: &str) -> Option<Vec<u8>> {
+        let entry = self.hashes.get(key)?;
+        if entry.is_expired() {
+            drop(entry);
+            self.hash_remove(key);
+            return None;
+        }
+        entry.fields.get(field).cloned()
+    }
+
+    /// Delete a field from a hash.
+    ///
+    /// Returns `true` if the field existed and was removed.
+    pub fn hdel(&self, key: &str, field: &str) -> bool {
+        if let Some(mut entry) = self.hashes.get_mut(key) {
+            if entry.is_expired() {
+                drop(entry);
+                self.hash_remove(key);
+                return false;
+            }
+            if let Some(old_val) = entry.fields.remove(field) {
+                let freed = field.len() + old_val.len() + 64;
+                self.mem_sub(freed);
+                // Remove the hash key entirely if empty.
+                if entry.fields.is_empty() {
+                    drop(entry);
+                    self.hash_remove(key);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get all field-value pairs from a hash.
+    #[must_use]
+    pub fn hgetall(&self, key: &str) -> Vec<(String, Vec<u8>)> {
+        let Some(entry) = self.hashes.get(key) else {
+            return Vec::new();
+        };
+        if entry.is_expired() {
+            drop(entry);
+            self.hash_remove(key);
+            return Vec::new();
+        }
+        entry
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Get all field names from a hash.
+    #[must_use]
+    pub fn hkeys(&self, key: &str) -> Vec<String> {
+        let Some(entry) = self.hashes.get(key) else {
+            return Vec::new();
+        };
+        if entry.is_expired() {
+            drop(entry);
+            self.hash_remove(key);
+            return Vec::new();
+        }
+        entry.fields.keys().cloned().collect()
+    }
+
+    /// Get all values from a hash.
+    #[must_use]
+    pub fn hvals(&self, key: &str) -> Vec<Vec<u8>> {
+        let Some(entry) = self.hashes.get(key) else {
+            return Vec::new();
+        };
+        if entry.is_expired() {
+            drop(entry);
+            self.hash_remove(key);
+            return Vec::new();
+        }
+        entry.fields.values().cloned().collect()
+    }
+
+    /// Get the number of fields in a hash.
+    #[must_use]
+    pub fn hlen(&self, key: &str) -> usize {
+        let Some(entry) = self.hashes.get(key) else {
+            return 0;
+        };
+        if entry.is_expired() {
+            drop(entry);
+            self.hash_remove(key);
+            return 0;
+        }
+        entry.fields.len()
+    }
+
+    /// Check if a field exists in a hash.
+    #[must_use]
+    pub fn hexists(&self, key: &str, field: &str) -> bool {
+        let Some(entry) = self.hashes.get(key) else {
+            return false;
+        };
+        if entry.is_expired() {
+            drop(entry);
+            self.hash_remove(key);
+            return false;
+        }
+        entry.fields.contains_key(field)
+    }
+
+    /// Remove a hash key entirely.
+    fn hash_remove(&self, key: &str) -> bool {
+        if let Some((_, old)) = self.hashes.remove(key) {
+            self.mem_sub(old.mem_size());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if a key exists as a hash.
+    #[must_use]
+    pub fn is_hash(&self, key: &str) -> bool {
+        if let Some(entry) = self.hashes.get(key) {
+            if entry.is_expired() {
+                drop(entry);
+                self.hash_remove(key);
+                return false;
+            }
+            return true;
+        }
+        false
+    }
+
     /// Remove all keys.
     pub fn flush(&self) {
         self.data.clear();
+        self.hashes.clear();
         self.mem_used.store(0, Ordering::Relaxed);
     }
 
@@ -1171,5 +1382,151 @@ mod tests {
     fn glob_match_empty_pattern() {
         assert!(glob_match("", ""));
         assert!(!glob_match("", "nonempty"));
+    }
+
+    // ── Hash operations ─────────────────────────────────────────
+
+    #[test]
+    fn hset_and_hget() {
+        let s = test_store();
+        assert!(s.hset("myhash", "field1", b"value1".to_vec()));
+        assert_eq!(s.hget("myhash", "field1"), Some(b"value1".to_vec()));
+    }
+
+    #[test]
+    fn hset_overwrite_returns_false() {
+        let s = test_store();
+        assert!(s.hset("myhash", "f", b"v1".to_vec()));
+        assert!(!s.hset("myhash", "f", b"v2".to_vec()));
+        assert_eq!(s.hget("myhash", "f"), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn hget_missing_key() {
+        let s = test_store();
+        assert_eq!(s.hget("nope", "field"), None);
+    }
+
+    #[test]
+    fn hget_missing_field() {
+        let s = test_store();
+        s.hset("myhash", "f1", b"v".to_vec());
+        assert_eq!(s.hget("myhash", "f2"), None);
+    }
+
+    #[test]
+    fn hdel_existing() {
+        let s = test_store();
+        s.hset("h", "f", b"v".to_vec());
+        assert!(s.hdel("h", "f"));
+        assert_eq!(s.hget("h", "f"), None);
+    }
+
+    #[test]
+    fn hdel_missing() {
+        let s = test_store();
+        assert!(!s.hdel("h", "f"));
+    }
+
+    #[test]
+    fn hgetall() {
+        let s = test_store();
+        s.hset("h", "a", b"1".to_vec());
+        s.hset("h", "b", b"2".to_vec());
+        let mut pairs = s.hgetall("h");
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(pairs, vec![
+            ("a".to_string(), b"1".to_vec()),
+            ("b".to_string(), b"2".to_vec()),
+        ]);
+    }
+
+    #[test]
+    fn hkeys_and_hvals() {
+        let s = test_store();
+        s.hset("h", "x", b"10".to_vec());
+        s.hset("h", "y", b"20".to_vec());
+        let mut keys = s.hkeys("h");
+        keys.sort();
+        assert_eq!(keys, vec!["x", "y"]);
+        assert_eq!(s.hvals("h").len(), 2);
+    }
+
+    #[test]
+    fn hlen() {
+        let s = test_store();
+        assert_eq!(s.hlen("h"), 0);
+        s.hset("h", "a", b"1".to_vec());
+        s.hset("h", "b", b"2".to_vec());
+        assert_eq!(s.hlen("h"), 2);
+    }
+
+    #[test]
+    fn hexists() {
+        let s = test_store();
+        s.hset("h", "a", b"1".to_vec());
+        assert!(s.hexists("h", "a"));
+        assert!(!s.hexists("h", "b"));
+        assert!(!s.hexists("nope", "a"));
+    }
+
+    #[test]
+    fn hash_type_detection() {
+        let s = test_store();
+        s.hset("h", "f", b"v".to_vec());
+        assert!(s.is_hash("h"));
+        s.set("str".into(), b"v".to_vec(), None);
+        assert!(!s.is_hash("str"));
+    }
+
+    #[test]
+    fn hash_exists_in_global_exists() {
+        let s = test_store();
+        s.hset("h", "f", b"v".to_vec());
+        assert!(s.exists("h"));
+    }
+
+    #[test]
+    fn hash_remove_via_global_remove() {
+        let s = test_store();
+        s.hset("h", "f", b"v".to_vec());
+        assert!(s.remove("h"));
+        assert!(!s.exists("h"));
+    }
+
+    #[test]
+    fn hash_in_global_keys() {
+        let s = test_store();
+        s.set("str_key".into(), b"v".to_vec(), None);
+        s.hset("hash_key", "f", b"v".to_vec());
+        let mut keys = s.keys("*");
+        keys.sort();
+        assert_eq!(keys, vec!["hash_key", "str_key"]);
+    }
+
+    #[test]
+    fn hash_in_global_len() {
+        let s = test_store();
+        s.set("a".into(), b"1".to_vec(), None);
+        s.hset("b", "f", b"2".to_vec());
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn hdel_removes_empty_hash() {
+        let s = test_store();
+        s.hset("h", "only", b"v".to_vec());
+        s.hdel("h", "only");
+        assert!(!s.exists("h"));
+        assert_eq!(s.len(), 0);
+    }
+
+    #[test]
+    fn flush_clears_hashes() {
+        let s = test_store();
+        s.hset("h", "f", b"v".to_vec());
+        s.flush();
+        assert_eq!(s.hlen("h"), 0);
+        assert!(!s.exists("h"));
     }
 }

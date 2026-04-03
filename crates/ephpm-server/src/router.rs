@@ -91,6 +91,9 @@ pub struct Router {
     kv_listen: String,
     /// Whether the RESP protocol listener is enabled.
     kv_redis_compat_enabled: bool,
+    /// Database environment variables to inject into PHP `$_SERVER`.
+    /// Populated from `[db.mysql]` or `[db.postgres]` when `inject_env = true`.
+    db_env_vars: Vec<(String, String)>,
 }
 
 /// Scan `sites_dir` for virtual host subdirectories.
@@ -222,6 +225,7 @@ impl Router {
             kv_secret: config.kv.secret.clone(),
             kv_listen: config.kv.redis_compat.listen.clone(),
             kv_redis_compat_enabled: config.kv.redis_compat.enabled,
+            db_env_vars: build_db_env_vars(config),
         }
     }
 
@@ -401,6 +405,20 @@ impl Router {
             if uri_path == "/_ephpm/ready" {
                 return Ok((self.readiness_check(), "health"));
             }
+        }
+
+        // ACME HTTP-01 challenge responder — serves challenge tokens from the
+        // KV store so any cluster node can respond to Let's Encrypt challenges.
+        if let Some(token) = uri_path.strip_prefix("/.well-known/acme-challenge/") {
+            if let Some(authorization) = crate::acme::get_acme_challenge(&self.store, token) {
+                let resp = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/plain")
+                    .body(body::buffered(Full::new(Bytes::from(authorization))))
+                    .expect("acme challenge response");
+                return Ok((resp, "acme"));
+            }
+            return Ok((error_response(StatusCode::NOT_FOUND, ""), "acme"));
         }
 
         // Block hidden files (dot-prefixed path segments like .env, .git)
@@ -608,8 +626,10 @@ impl Router {
         let vhost_open_basedir = self.sites_dir.is_some() && self.open_basedir;
         let vhost_disable_shell = self.sites_dir.is_some() && self.disable_shell_exec;
 
-        // Build EPHPM_REDIS_* env vars for multi-tenant RESP auth injection.
-        let env_vars = self.build_kv_env_vars(&server_name);
+        // Build EPHPM_REDIS_* env vars for multi-tenant RESP auth injection,
+        // plus DB_* env vars for framework auto-discovery.
+        let mut env_vars = self.build_kv_env_vars(&server_name);
+        env_vars.extend_from_slice(&self.db_env_vars);
 
         let php_start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
@@ -893,6 +913,65 @@ fn json_response(status: StatusCode, body: &str) -> Response<ServerBody> {
         .header("content-type", "application/json")
         .body(body::buffered(Full::new(Bytes::from(body.to_string()))))
         .expect("static json response")
+}
+
+/// Build database environment variables from config for PHP injection.
+///
+/// When a DB backend has `inject_env = true`, produces `DB_HOST`, `DB_PORT`,
+/// `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_CONNECTION`, and `DATABASE_URL`
+/// pointing at the proxy listener. PHP frameworks auto-discover these.
+fn build_db_env_vars(config: &Config) -> Vec<(String, String)> {
+    // MySQL takes precedence (most common for PHP).
+    if let Some(ref mysql) = config.db.mysql {
+        if mysql.inject_env {
+            let listen = mysql
+                .listen
+                .as_deref()
+                .unwrap_or("127.0.0.1:3306");
+            return db_env_from_url(listen, &mysql.url, "mysql");
+        }
+    }
+    if let Some(ref pg) = config.db.postgres {
+        if pg.inject_env {
+            let listen = pg
+                .listen
+                .as_deref()
+                .unwrap_or("127.0.0.1:5432");
+            return db_env_from_url(listen, &pg.url, "pgsql");
+        }
+    }
+    Vec::new()
+}
+
+/// Parse a database URL and proxy listen address into env var pairs.
+fn db_env_from_url(listen: &str, backend_url: &str, driver: &str) -> Vec<(String, String)> {
+    let (host, port) = listen.rsplit_once(':').unwrap_or((listen, "3306"));
+
+    // Parse: scheme://user:password@host:port/dbname
+    let rest = backend_url
+        .find("://")
+        .map_or(backend_url, |i| &backend_url[i + 3..]);
+    let (creds, host_db) = rest.split_once('@').unwrap_or(("", rest));
+    let (user, password) = creds.split_once(':').unwrap_or((creds, ""));
+    let db_name = host_db
+        .split_once('/')
+        .map_or("", |(_, db)| db)
+        .split('?')
+        .next()
+        .unwrap_or("");
+
+    vec![
+        ("DB_HOST".into(), host.into()),
+        ("DB_PORT".into(), port.into()),
+        ("DB_NAME".into(), db_name.into()),
+        ("DB_USER".into(), user.into()),
+        ("DB_PASSWORD".into(), password.into()),
+        ("DB_CONNECTION".into(), driver.into()),
+        (
+            "DATABASE_URL".into(),
+            format!("{driver}://{user}:{password}@{host}:{port}/{db_name}"),
+        ),
+    ]
 }
 
 /// Build a simple error response with a text body.
