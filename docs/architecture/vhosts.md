@@ -86,15 +86,15 @@ Port numbers and trailing dots are stripped before matching. The match is exact 
 
 ## Architecture
 
-### Single Process, Shared Workers
+### Single Process, Shared Thread Pool
 
-All sites share one ephpm process and one PHP worker pool. A request to `alice-blog.com` and a request to `bobs-recipes.com` are handled by the same workers — the router sets the correct document root and database before dispatching to PHP.
+All sites share one ephpm process and tokio's `spawn_blocking` thread pool. A request to `alice-blog.com` and a request to `bobs-recipes.com` are handled by the same threads — the router sets the correct document root and database before dispatching to PHP.
 
 ```mermaid
 graph TD
     subgraph ephpm["ePHPm (single process)"]
         router["Router\n(Host → site directory)"]
-        workers["PHP Worker Pool\n(shared, 4 threads)"]
+        workers["PHP Threads (ZTS)\n(shared spawn_blocking pool)"]
 
         subgraph sites["Site Backends"]
             site1["alice-blog.com\nrusqlite → alice/ephpm.db"]
@@ -115,7 +115,7 @@ graph TD
     style sites fill:#e8f5e9,stroke:#388e3c
 ```
 
-This is efficient — 20 sites don't need 20x the workers. PHP workers are fungible; any worker can serve any site.
+This is efficient — 20 sites don't need 20x the threads. Any `spawn_blocking` thread can serve any site.
 
 ### Per-Site litewire Instances
 
@@ -134,7 +134,7 @@ For most WordPress setups, PHP connects to litewire on `127.0.0.1:3306`. The rou
 | 10 | ~330 MB | SQLite only loads when queried |
 | 20 | ~390 MB | Idle sites use near-zero extra memory |
 
-SQLite databases are opened on demand. An idle site with no recent traffic has minimal memory footprint — just the file handle. The PHP worker pool doesn't grow with site count.
+SQLite databases are opened on demand. An idle site with no recent traffic has minimal memory footprint — just the file handle. The thread pool doesn't grow with site count.
 
 ### CPU
 
@@ -344,7 +344,7 @@ Put a reverse proxy (Caddy recommended — automatic HTTPS per domain) in front 
 
 ### Phase 1: Directory-Based Routing (implemented)
 
-Host header → site directory mapping with per-site document roots. All sites share the global SQLite database, KV store, and PHP worker pool.
+Host header → site directory mapping with per-site document roots. All sites share the global SQLite database, KV store, and PHP thread pool.
 
 | Step | Change | File |
 |------|--------|------|

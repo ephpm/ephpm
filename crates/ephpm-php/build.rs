@@ -195,12 +195,17 @@ fn compile_wrapper(include_dir: &Path, target_os: &str) {
         build.define("_GNU_SOURCE", None);
     }
 
-    // PHP headers check these defines to select Windows-specific code paths.
+    // ZTS (Zend Thread Safety) — enables thread-local storage in PHP headers.
+    // All non-Windows builds use ZTS=1 for concurrent PHP execution.
+    // Windows uses NTS (ZTS=0) because the Windows PHP DLL is NTS.
     if target_os == "windows" {
         build.define("ZEND_WIN32", None);
         build.define("PHP_WIN32", None);
         build.define("ZEND_DEBUG", Some("0"));
         build.define("ZTS", Some("0"));
+    } else {
+        build.define("ZTS", Some("1"));
+        build.define("ZEND_ENABLE_STATIC_TSRMLS_CACHE", Some("1"));
     }
 
     build.compile("ephpm_wrapper");
@@ -252,6 +257,11 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
     // bindings for the target platform instead of the host.
     if target_os == "windows" {
         builder = builder.clang_arg("--target=x86_64-pc-windows-msvc");
+    } else {
+        // ZTS builds: define ZTS for bindgen so PHP headers use thread-safe macros.
+        builder = builder
+            .clang_arg("-DZTS=1")
+            .clang_arg("-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
     }
 
     let bindings = builder
@@ -270,6 +280,12 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
         .allowlist_function("php_module_shutdown")
         .allowlist_function("zend_eval_string")
         .allowlist_function("zend_stream_init_filename")
+        // TSRM (Thread Safe Resource Manager) functions — ZTS builds
+        .allowlist_function("tsrm_startup")
+        .allowlist_function("tsrm_shutdown")
+        .allowlist_function("ts_resource_ex")
+        .allowlist_function("tsrm_set_new_thread_begin_handler")
+        .allowlist_function("tsrm_set_new_thread_end_handler")
         // SAPI module struct and related types
         .allowlist_type("sapi_module_struct")
         .allowlist_type("sapi_header_struct")

@@ -26,13 +26,13 @@ This is necessary because keeping a Node.js process running for every free-tier 
 
 ### ePHPm's Architecture (vhosts)
 
-ePHPm runs one process with a shared PHP worker pool. Each site is a directory on disk. An idle site uses zero RAM and zero CPU — it's just files. When a request arrives, a pre-warmed PHP worker handles it in milliseconds and returns to the pool.
+ePHPm runs one process with a shared thread pool (tokio's `spawn_blocking`). Each site is a directory on disk. An idle site uses zero RAM and zero CPU — it's just files. When a request arrives, any thread with a TSRM context handles it in milliseconds.
 
 ```
-Request → Route by Host header → Shared worker (already hot) → Execute → Respond → Worker returns to pool
+Request → Route by Host header → spawn_blocking thread (TSRM context ready) → Execute → Respond
 ```
 
-No boot. No teardown. No cold start. No container. The worker pool is always running regardless of how many sites exist.
+No boot. No teardown. No cold start. No container. The thread pool is always running regardless of how many sites exist.
 
 ### The Cost Comparison
 

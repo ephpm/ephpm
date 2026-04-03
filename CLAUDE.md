@@ -92,7 +92,7 @@ Without `SQLD_BINARY_PATH` (dev builds), `ephpm-sqld` compiles in stub mode — 
 
 - **Conditional compilation**: All PHP FFI code is gated with `#[cfg(php_linked)]`. The `php_linked` cfg is set by `ephpm-php/build.rs` when `PHP_SDK_PATH` env var is present. Stub mode must always compile and pass tests without it.
 - **C wrapper required**: PHP uses setjmp/longjmp for error handling. Never call PHP functions directly from Rust without going through `ephpm_wrapper.c` and its `zend_try/zend_catch` guards — otherwise SIGSEGV.
-- **PHP threading**: ZTS (Zend Thread Safety) is implemented. PHP execution runs on `spawn_blocking` threads via `PhpWorkerPool`. NTS mode is also supported with a global `Mutex<Option<PhpRuntime>>` for serialized execution.
+- **PHP threading**: ZTS (Zend Thread Safety) is implemented. PHP is compiled with `--enable-zts` and each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. No dedicated worker pool — tokio's `spawn_blocking` pool is the thread pool. A `Mutex` protects only one-time `init()`/`shutdown()`, not request execution. An `AtomicBool` fast-path check avoids the mutex for the common "is PHP ready?" path. Per-request C statics use `__thread` for thread isolation. Windows stays NTS (`ZTS=0`) due to DLL constraints.
 - **MSRV**: Rust 1.85 — do not use features from newer editions without checking.
 - **Clippy**: Pedantic + all warnings denied (`-D warnings`). Zero warnings policy.
 - **Rustfmt**: 2024 edition style, `group_imports = "StdExternalCrate"`. Requires **nightly** toolchain (`cargo +nightly fmt`).

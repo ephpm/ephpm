@@ -351,15 +351,15 @@ Release artifacts are named per platform. One binary per PHP version per platfor
 
 ### Thread Safety: NTS for MVP, ZTS for v1
 
-| | MVP | v1 (Production) |
-|---|---|---|
-| **PHP build** | NTS (Non-Thread-Safe) | ZTS (Zend Thread-Safe) |
-| **Concurrency model** | `Mutex<PhpRuntime>` + `spawn_blocking` | Thread-per-request pool (like FrankenPHP) |
-| **Throughput** | One PHP request at a time per process | N concurrent PHP requests per process |
-| **Complexity** | Low — provably correct | High — thread-local storage, per-request isolation |
-| **Sufficient for** | WordPress demo, proof of concept | Production workloads |
+PHP is compiled with ZTS (Zend Thread Safety) via `--enable-zts`. Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently without interference.
 
-NTS is simpler because PHP's internal state (globals, allocator, OPcache) is process-wide. With ZTS, each thread gets its own copy of globals via TSRM (Thread-Safe Resource Manager), which FrankenPHP also uses.
+| | Current (ZTS) | Windows (NTS fallback) |
+|---|---|---|
+| **PHP build** | ZTS (Zend Thread-Safe) | NTS (Non-Thread-Safe) |
+| **Concurrency model** | `spawn_blocking` + per-thread TSRM | `Mutex` + `spawn_blocking` (serialized) |
+| **Throughput** | N concurrent PHP requests per process | One PHP request at a time per process |
+
+The `Mutex<Option<PhpRuntime>>` only protects one-time `init()`/`shutdown()`. An `AtomicBool` fast-path check avoids the mutex for the common "is PHP ready?" path. Per-request C statics use `__thread` for thread isolation.
 
 ### Building libphp.a
 
@@ -659,7 +659,7 @@ A single Rust binary that reads a TOML config, boots an HTTP server with embedde
 1. **`ephpm` binary** — single Rust binary with PHP statically linked
 2. **TOML config** — `ephpm.toml` with `[server]` and `[php]` sections
 3. **HTTP server** — hyper-based, HTTP/1.1 + HTTP/2
-4. **PHP execution** — custom SAPI, NTS mode, Mutex-guarded
+4. **PHP execution** — custom SAPI, ZTS mode, concurrent via `spawn_blocking` + TSRM
 5. **Static file serving** — CSS/JS/images served directly (not through PHP)
 6. **WordPress demo** — documented setup: download WordPress, point `document_root`, connect to external MySQL, verify admin panel works
 
@@ -951,7 +951,7 @@ This is the hardest crate and the core of the project.
 
 | Milestone | Key Features | Status |
 |-----------|-------------|--------|
-| **v0.2: ZTS + Workers** | Thread-safe PHP, multiple concurrent requests, worker pool | Planned |
+| **v0.2: ZTS + Workers** | Thread-safe PHP, multiple concurrent requests | **Implemented** (ZTS via `spawn_blocking` + TSRM) |
 | **v0.3: TLS** | Automatic HTTPS via `rustls-acme`, Let's Encrypt | Planned |
 | **v0.4: DB Proxy** | **Implemented (partial)**: MySQL transparent proxy, connection pooling, reset strategy; **Missing**: read/write splitting, replication, slow query analysis | Ahead of schedule |
 | **v0.5: KV Store** | **Implemented (partial)**: Single-node RESP2 server, ~30 Redis commands, TTL/expiry, memory tracking, SAPI bridge for direct PHP access; **Missing**: data structures (hashes/lists/sets), clustering, persistence, eviction policies | Ahead of schedule |

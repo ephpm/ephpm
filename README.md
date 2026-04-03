@@ -252,7 +252,7 @@ sites_dir = "/var/www/sites"           # vhost directory
 - **Add a site:** create a directory, drop in WordPress
 - **Remove a site:** delete the directory — traffic falls back to your marketing page
 - **No per-site config needed:** sites inherit global PHP settings, timeouts, and security rules
-- **Shared workers:** all sites share one PHP worker pool — 20 blogs don't need 20x the memory
+- **Shared thread pool:** all sites share tokio's `spawn_blocking` pool — 20 blogs don't need 20x the memory
 
 A $3.69/mo Hetzner VM (2 ARM cores, 4 GB RAM) comfortably runs 20 WordPress blogs at ~$0.18/site. See [docs/architecture/vhosts.md](docs/architecture/vhosts.md) and [docs/architecture/hosting.md](docs/architecture/hosting.md) for full details.
 

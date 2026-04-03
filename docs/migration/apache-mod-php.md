@@ -13,7 +13,7 @@ ePHPm replaces Apache and mod_php with a single binary. Your PHP files don't cha
 | URL rewriting | `.htaccess` + `mod_rewrite` | `fallback` config |
 | SSL/TLS | mod_ssl + certbot | Built-in ACME |
 | Static files | Apache serves directly | Built-in with compression |
-| Process model | prefork (one process per request) | Async I/O + PHP worker pool |
+| Process model | prefork (one process per request) | Async I/O + ZTS thread pool |
 | Memory per connection | ~30-50 MB (full Apache + PHP process) | ~50 MB shared across all |
 
 ## Step-by-Step Migration

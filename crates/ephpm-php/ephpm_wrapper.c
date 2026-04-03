@@ -38,49 +38,52 @@
 #include "Zend/zend_globals.h"
 #include "main/php_version.h"
 
-/* ===== Output buffer ===== */
+/* ===== Per-thread state =====
+ *
+ * With ZTS, multiple threads execute PHP concurrently. All per-request
+ * state must be thread-local (__thread / _Thread_local) to avoid races.
+ * On non-ZTS builds, __thread is harmless (single thread executes PHP).
+ */
 
-static char *output_buf = NULL;
-static size_t output_len = 0;
-static size_t output_cap = 0;
+static __thread char *output_buf = NULL;
+static __thread size_t output_len = 0;
+static __thread size_t output_cap = 0;
 
-/* ===== Response header buffer ===== */
-/* Stored as "Name: Value\n" lines after script execution */
+/* Response header buffer — "Name: Value\n" lines after script execution */
 
-static char *headers_buf = NULL;
-static size_t headers_buf_len = 0;
-static size_t headers_buf_cap = 0;
+static __thread char *headers_buf = NULL;
+static __thread size_t headers_buf_len = 0;
+static __thread size_t headers_buf_cap = 0;
 
-/* ===== Saved response status ===== */
+/* Saved response status */
 
-static int response_status_code = 200;
+static __thread int response_status_code = 200;
 
-/* ===== Request info ===== */
-/* Pointers into Rust-owned CStrings, valid only during execution */
+/* Request info — pointers into Rust-owned CStrings, valid only during execution */
 
-static const char *req_method = NULL;
-static const char *req_uri = NULL;
-static const char *req_query_string = NULL;
-static const char *req_content_type = NULL;
-static const char *req_cookie_data = NULL;
-static const char *req_post_data = NULL;
-static size_t req_post_data_len = 0;
-static size_t req_post_data_offset = 0;
-static const char *req_path_translated = NULL;
+static __thread const char *req_method = NULL;
+static __thread const char *req_uri = NULL;
+static __thread const char *req_query_string = NULL;
+static __thread const char *req_content_type = NULL;
+static __thread const char *req_cookie_data = NULL;
+static __thread const char *req_post_data = NULL;
+static __thread size_t req_post_data_len = 0;
+static __thread size_t req_post_data_offset = 0;
+static __thread const char *req_path_translated = NULL;
 
-/* ===== Server variables ===== */
+/* Server variables */
 
 #define MAX_SERVER_VARS 128
 
-static struct {
+static __thread struct {
     const char *key;
     const char *value;
 } server_vars[MAX_SERVER_VARS];
 
-static int server_var_count = 0;
+static __thread int server_var_count = 0;
 
-/* Track whether a PHP request is currently active */
-static int request_active = 0;
+/* Track whether a PHP request is currently active on this thread */
+static __thread int request_active = 0;
 
 /* ===================================================================
  * SAPI Callbacks
@@ -276,6 +279,93 @@ void ephpm_finalize_init(void)
 }
 
 /* ===================================================================
+ * ZTS thread lifecycle
+ *
+ * With ZTS PHP, each worker thread must be registered with the TSRM
+ * (Thread Safe Resource Manager) before accessing any PHP globals.
+ * TSRM allocates per-thread copies of all global resource tables
+ * (executor globals, SAPI globals, etc.).
+ *
+ * ephpm_thread_init()     — register this thread with TSRM + start request
+ * ephpm_thread_shutdown() — shut down request + unregister from TSRM
+ * =================================================================== */
+
+#ifdef ZTS
+#include "TSRM/TSRM.h"
+
+/*
+ * Initialize the current thread for PHP execution under ZTS.
+ *
+ * 1. Calls ts_resource(0) to register the thread with TSRM and allocate
+ *    thread-local copies of all PHP global tables.
+ * 2. Starts a PHP request (php_request_startup) so this thread has a
+ *    valid execution context.
+ *
+ * Must be called once per thread, before any PHP execution.
+ * Returns 0 on success, -1 on failure.
+ */
+int ephpm_thread_init(void)
+{
+    /* Register this thread with TSRM. ts_resource(0) is idempotent —
+     * if the thread is already registered, it returns the existing slot. */
+    ts_resource(0);
+
+    /* Override SAPI callbacks on this thread's SAPI globals.
+     * In ZTS mode, sapi_module is a global struct but the callbacks
+     * are shared. SG() macros access per-thread SAPI globals. */
+
+    /* Start a request on this thread so PHP globals are initialized. */
+    int ret = php_request_startup();
+    if (ret != SUCCESS) {
+        return -1;
+    }
+
+    /* Disable stack size checking (tokio threads have small stacks) */
+    EG(max_allowed_stack_size) = 0;
+
+    request_active = 1;
+    return 0;
+}
+
+/*
+ * Shut down PHP on the current thread.
+ *
+ * Performs request shutdown and unregisters the thread from TSRM,
+ * freeing its thread-local PHP globals.
+ */
+void ephpm_thread_shutdown(void)
+{
+    if (request_active) {
+        php_request_shutdown(NULL);
+        request_active = 0;
+    }
+
+    /* Free thread-local buffers */
+    if (output_buf) {
+        free(output_buf);
+        output_buf = NULL;
+        output_len = 0;
+        output_cap = 0;
+    }
+    if (headers_buf) {
+        free(headers_buf);
+        headers_buf = NULL;
+        headers_buf_len = 0;
+        headers_buf_cap = 0;
+    }
+
+    /* Unregister from TSRM */
+    ts_free_thread();
+}
+
+#else /* !ZTS — NTS stubs */
+
+int ephpm_thread_init(void) { return 0; }
+void ephpm_thread_shutdown(void) {}
+
+#endif /* ZTS */
+
+/* ===================================================================
  * Signal handling overrides
  *
  * PHP 8.1+ installs process-wide signal handlers (via zend_signal_init)
@@ -295,8 +385,8 @@ void ephpm_finalize_init(void)
  * This is acceptable — pcntl is a CLI extension and web requests should
  * not handle signals. FrankenPHP has the same limitation.
  *
- * Future: when ZTS + worker pool lands, we could add a thread-safe
- * signal forwarding layer that delivers signals only to the PHP thread.
+ * Future: we could add a thread-safe signal forwarding layer that
+ * delivers signals only to the target PHP thread.
  * =================================================================== */
 
 /*
@@ -487,9 +577,8 @@ void ephpm_request_set_ini(const char *key, const char *value)
  *   - The embed SAPI's initial request provides a valid execution
  *     context that we can reuse for all HTTP requests
  *
- * For the NTS MVP (single PHP worker, mutex-serialized), this is safe.
- * The ZTS worker pool milestone will use proper per-worker request
- * lifecycle management.
+ * With ZTS, each spawn_blocking thread has its own TSRM context and
+ * __thread-local per-request state, so concurrent reuse is safe.
  *
  * Returns:
  *   0  on success

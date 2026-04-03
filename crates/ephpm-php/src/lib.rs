@@ -9,6 +9,7 @@ pub mod sapi;
 #[cfg(all(php_linked, target_os = "windows"))]
 pub mod windows_dll;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use request::PhpRequest;
@@ -91,6 +92,19 @@ mod ffi {
             out_len: *mut usize,
         ) -> *const ::std::os::raw::c_char;
 
+        // ── ZTS thread lifecycle ────────────────────────────────────
+
+        /// Initialize the current thread for PHP execution under ZTS.
+        /// Registers with TSRM and starts a PHP request.
+        /// Returns 0 on success, -1 on failure.
+        /// NTS builds: no-op (returns 0).
+        pub fn ephpm_thread_init() -> ::std::os::raw::c_int;
+
+        /// Shut down PHP on the current thread.
+        /// Performs request shutdown and unregisters from TSRM.
+        /// NTS builds: no-op.
+        pub fn ephpm_thread_shutdown();
+
         // ── CLI mode functions ──────────────────────────────────────
 
         /// Register `additional_functions` (KV native functions) on
@@ -121,35 +135,60 @@ mod ffi {
     }
 }
 
+/// Tracks whether the current thread has been registered with TSRM.
+///
+/// Each `spawn_blocking` thread must call `ephpm_thread_init()` once
+/// before executing PHP. This thread-local avoids redundant registration.
+#[cfg(php_linked)]
+thread_local! {
+    static THREAD_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PhpError {
+    /// PHP module initialization (`php_embed_init`) failed.
     #[error("PHP runtime failed to initialize")]
     InitFailed,
 
+    /// A PHP script execution error (bailout, fatal, etc.).
     #[error("PHP script execution failed: {0}")]
     ExecutionFailed(String),
 
+    /// The init/shutdown mutex was poisoned by a panic.
     #[error("PHP runtime lock poisoned")]
     LockPoisoned,
 
+    /// `execute()` called before `init()`.
     #[error("PHP runtime not initialized")]
     NotInitialized,
+
+    /// TSRM thread registration failed.
+    #[error("PHP thread initialization failed")]
+    ThreadInitFailed,
 }
 
-/// Thread-safe wrapper around the PHP embed SAPI.
+/// Wrapper around the PHP embed SAPI with ZTS (Zend Thread Safety).
 ///
-/// For the MVP, PHP is NTS (Non-Thread-Safe) and access is serialized
-/// via a `Mutex`. Only one PHP request executes at a time.
+/// PHP is built with `--enable-zts`, enabling TSRM (Thread Safe Resource
+/// Manager). Each `spawn_blocking` thread registers with TSRM on first
+/// use, getting its own copy of PHP global state. This allows concurrent
+/// PHP execution across multiple threads.
 ///
-/// In v1, this will be replaced with ZTS PHP and a thread-per-request model.
+/// The `Mutex` only protects `init()` / `shutdown()` (one-time lifecycle).
+/// `execute()` runs lock-free on any registered thread.
 pub struct PhpRuntime {
     initialized: bool,
 }
 
-/// Global mutex-guarded PHP runtime instance.
+/// Whether the PHP module has been initialized (set once by `init()`).
 ///
-/// PHP's embed SAPI uses global state, so we need a single instance
-/// guarded by a mutex to ensure thread safety.
+/// Checked by `execute()` without acquiring the mutex — the atomic
+/// provides a fast-path "is PHP ready?" check.
+static PHP_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Mutex protecting one-time `init()` / `shutdown()` lifecycle.
+///
+/// Not held during `execute()` — ZTS threads execute concurrently.
 static PHP_RUNTIME: Mutex<Option<PhpRuntime>> = Mutex::new(None);
 
 impl PhpRuntime {
@@ -233,6 +272,7 @@ impl PhpRuntime {
         }
 
         *runtime = Some(PhpRuntime { initialized: true });
+        PHP_INITIALIZED.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -246,6 +286,7 @@ impl PhpRuntime {
     pub fn shutdown() -> Result<(), PhpError> {
         let mut runtime = PHP_RUNTIME.lock().map_err(|_| PhpError::LockPoisoned)?;
         if let Some(rt) = runtime.take() {
+            PHP_INITIALIZED.store(false, Ordering::Release);
             drop(rt);
 
             #[cfg(php_linked)]
@@ -279,8 +320,9 @@ impl PhpRuntime {
     /// Returns `PhpError::LockPoisoned` if the runtime mutex is poisoned,
     /// or `PhpError::NotInitialized` if the runtime hasn't been initialized.
     pub fn finalize_for_http() -> Result<(), PhpError> {
-        let runtime = PHP_RUNTIME.lock().map_err(|_| PhpError::LockPoisoned)?;
-        let _rt = runtime.as_ref().ok_or(PhpError::NotInitialized)?;
+        if !PHP_INITIALIZED.load(Ordering::Acquire) {
+            return Err(PhpError::NotInitialized);
+        }
 
         #[cfg(php_linked)]
         {
@@ -337,6 +379,8 @@ impl PhpRuntime {
         {
             use std::ffi::CString;
 
+            // CLI mode uses the initial embed request context on the main thread.
+            // Acquire the mutex to prevent concurrent CLI + HTTP mode.
             let _runtime = PHP_RUNTIME.lock().map_err(|_| PhpError::LockPoisoned)?;
 
             // Build argc/argv for the C function.
@@ -375,19 +419,26 @@ impl PhpRuntime {
 
     /// Execute a PHP request.
     ///
-    /// This acquires the global PHP runtime mutex, sets up the SAPI request
-    /// context, executes the PHP script, and returns the response.
+    /// With ZTS, this runs **without** the global mutex — each
+    /// `spawn_blocking` thread has its own TSRM-registered PHP context.
+    /// On first call from a new thread, the thread is automatically
+    /// registered with TSRM via `ephpm_thread_init()`.
     ///
     /// This function is designed to be called from `tokio::task::spawn_blocking`
     /// since it blocks the calling thread for the duration of PHP execution.
     ///
     /// # Errors
     ///
-    /// Returns `PhpError::LockPoisoned` or `PhpError::NotInitialized` on failure.
+    /// Returns `PhpError::NotInitialized` if the runtime hasn't been
+    /// initialized, or `PhpError::ThreadInitFailed` if TSRM registration fails.
     #[allow(clippy::needless_pass_by_value)]
     pub fn execute(request: PhpRequest) -> Result<PhpResponse, PhpError> {
-        let runtime = PHP_RUNTIME.lock().map_err(|_| PhpError::LockPoisoned)?;
-        let _rt = runtime.as_ref().ok_or(PhpError::NotInitialized)?;
+        if !PHP_INITIALIZED.load(Ordering::Acquire) {
+            return Err(PhpError::NotInitialized);
+        }
+
+        #[cfg(php_linked)]
+        Self::ensure_thread_registered()?;
 
         tracing::debug!(
             method = %request.method,
@@ -420,6 +471,32 @@ impl PhpRuntime {
         }
     }
 
+    /// Ensure the current thread is registered with TSRM.
+    ///
+    /// Called on every `execute()` — fast-path is a thread-local check.
+    /// Only the first call on each thread actually registers with TSRM.
+    #[cfg(php_linked)]
+    fn ensure_thread_registered() -> Result<(), PhpError> {
+        THREAD_REGISTERED.with(|registered| {
+            if registered.get() {
+                return Ok(());
+            }
+
+            // SAFETY: PHP module has been initialized (checked via atomic above).
+            // ephpm_thread_init() calls ts_resource(0) + php_request_startup(),
+            // which are the correct TSRM registration sequence. The C function
+            // uses zend_try/zend_catch internally for bailout protection.
+            let ret = unsafe { ffi::ephpm_thread_init() };
+            if ret != 0 {
+                return Err(PhpError::ThreadInitFailed);
+            }
+
+            registered.set(true);
+            tracing::debug!("TSRM thread registered for PHP execution");
+            Ok(())
+        })
+    }
+
     /// Execute a PHP script via our custom SAPI bridge.
     ///
     /// Sets up per-request state in C, executes the script with proper
@@ -428,8 +505,9 @@ impl PhpRuntime {
     fn execute_php(request: &PhpRequest) -> Result<PhpResponse, PhpError> {
         use std::ffi::CString;
 
-        // Clear previous request state in the C wrapper
-        // Safety: No PHP execution in progress (we hold the mutex).
+        // Clear previous request state in the C wrapper's thread-local buffers.
+        // SAFETY: The current thread is registered with TSRM and owns its
+        // thread-local C state. No concurrent access to these buffers.
         unsafe { ffi::ephpm_request_clear() };
 
         // Prepare C strings for the request info.
@@ -490,8 +568,10 @@ impl PhpRuntime {
             }
         }
 
-        // Execute the PHP request (handles request startup/shutdown cycle)
-        // Safety: We hold the PHP_RUNTIME mutex, so no concurrent execution.
+        // Execute the PHP request on this thread's TSRM context.
+        // SAFETY: This thread is registered with TSRM. All PHP globals
+        // accessed by ephpm_execute_request are thread-local under ZTS.
+        // The C function uses setjmp/longjmp bailout protection.
         let ret = unsafe { ffi::ephpm_execute_request(script_filename.as_ptr()) };
 
         // Retrieve the captured response from C
@@ -581,7 +661,7 @@ impl PhpRuntime {
 
     /// Set a PHP INI directive for the current request.
     ///
-    /// Must be called on a PHP worker thread (inside `spawn_blocking`)
+    /// Must be called on a TSRM-registered thread (inside `spawn_blocking`)
     /// before `execute()`. Uses `PHP_INI_SYSTEM` so the value cannot be
     /// overridden by userland `ini_set()`.
     ///
@@ -592,6 +672,7 @@ impl PhpRuntime {
         let c_val = std::ffi::CString::new(value).expect("INI value contains null byte");
         // SAFETY: c_key and c_val are valid null-terminated C strings.
         // ephpm_request_set_ini copies the data via zend_string_init.
+        // Under ZTS, this modifies the current thread's INI entries only.
         #[allow(unsafe_code)]
         unsafe {
             ffi::ephpm_request_set_ini(c_key.as_ptr(), c_val.as_ptr());

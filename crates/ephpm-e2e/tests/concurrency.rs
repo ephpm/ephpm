@@ -1,6 +1,6 @@
 //! Concurrency correctness tests.
 //!
-//! Validates that the PHP mutex / NTS serialisation layer handles multiple
+//! Validates that the PHP ZTS threading layer handles multiple
 //! simultaneous connections without deadlocking or returning wrong output,
 //! and that the KV store produces consistent results under concurrent load.
 //!
