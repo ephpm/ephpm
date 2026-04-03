@@ -94,16 +94,14 @@ pub struct RwSplitParams {
 /// `MySQL` server metadata captured from the initial backend handshake.
 /// Used to generate synthetic server greetings for PHP clients.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct ServerMeta {
     server_version: String,
     capabilities: u32,
     charset: u8,
-    /// Auth plugin name advertised to clients (always `mysql_native_password`).
+    /// Auth plugin name advertised by the backend (e.g. `caching_sha2_password`).
     ///
-    /// Captured from the backend handshake for use in synthetic client greetings
-    /// (not yet wired up — will be used when we generate per-client handshake packets).
-    #[allow(dead_code)]
+    /// Used in `build_handshake_response` to select the correct auth scheme
+    /// when authenticating pool connections to the backend.
     auth_plugin: String,
 }
 
@@ -115,8 +113,12 @@ pub struct MySqlProxy {
     replica_rr: AtomicUsize,
     meta: Arc<ServerMeta>,
     listen: String,
-    #[allow(dead_code)]
-    socket: Option<std::path::PathBuf>,
+    /// Unix socket path for local PHP connections (future).
+    ///
+    /// When set, the proxy will also listen on this Unix domain socket in
+    /// addition to the TCP `listen` address. Not yet wired up — requires
+    /// `tokio::net::UnixListener` support in `run()`.
+    _socket: Option<std::path::PathBuf>,
     reset_strategy: ResetStrategy,
     rw_split: RwSplitParams,
 }
@@ -213,7 +215,7 @@ impl MySqlProxy {
             replica_rr: AtomicUsize::new(0),
             meta,
             listen: listen.to_string(),
-            socket,
+            _socket: socket,
             reset_strategy,
             rw_split,
         })
@@ -295,13 +297,9 @@ impl MySqlProxy {
                         ResetStrategy::Never => {
                             checkout.return_to_pool(backend);
                         }
-                        ResetStrategy::Always => match reset_connection(backend).await {
-                            Ok(stream) => checkout.return_to_pool(stream),
-                            Err(e) => {
-                                debug!("MySQL reset failed, discarding connection: {e}");
-                                checkout.retire();
-                            }
-                        },
+                        ResetStrategy::Always => {
+                            checkout.return_with_reset(backend).await;
+                        }
                         ResetStrategy::Smart => {
                             // Smart path handled by routing loop above.
                             unreachable!()

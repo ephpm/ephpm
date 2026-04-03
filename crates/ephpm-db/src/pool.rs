@@ -59,7 +59,6 @@ struct PoolState {
 ///
 /// Clone is cheap — it shares the same internal state via [`Arc`].
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct Pool {
     state: Arc<PoolState>,
     pub semaphore: Arc<Semaphore>,
@@ -68,10 +67,8 @@ pub struct Pool {
     connect: Arc<dyn Fn() -> BoxFuture<Result<TcpStream, DbError>> + Send + Sync>,
     /// Called to reset a connection before returning it to idle.
     ///
-    /// Currently the caller runs the protocol-level reset externally before
-    /// calling [`Pool::recycle`]. This closure will be used once the pool
-    /// manages reset internally (automatic reset-on-return).
-    #[allow(dead_code)]
+    /// Used by [`Pool::recycle_with_reset`] to run a protocol-level reset
+    /// (e.g. `COM_RESET_CONNECTION`) before parking the connection.
     reset: Arc<dyn Fn(TcpStream) -> BoxFuture<Result<TcpStream, DbError>> + Send + Sync>,
     /// Called to check whether an idle connection is still alive.
     /// Returns `(stream, is_alive)` on success, or an error on I/O failure.
@@ -199,6 +196,28 @@ impl Pool {
         self.state.idle.lock().push_back(slot);
     }
 
+    /// Reset a connection using the pool's reset closure and return it to idle.
+    ///
+    /// Runs the protocol-level reset (e.g. `COM_RESET_CONNECTION`) before
+    /// parking the connection. If the reset fails, the connection is discarded
+    /// and the permit is freed.
+    pub(crate) async fn recycle_with_reset(
+        &self,
+        stream: TcpStream,
+        created_at: Instant,
+        permit: OwnedSemaphorePermit,
+    ) {
+        match (self.reset)(stream).await {
+            Ok(stream) => {
+                self.recycle(stream, created_at, permit);
+            }
+            Err(e) => {
+                debug!("pool reset failed, discarding connection: {e}");
+                // permit dropped → semaphore slot freed
+            }
+        }
+    }
+
     /// Shut down the pool: drain idle connections and reject new `acquire()` calls.
     pub fn close(&self) {
         self.state.closed.store(true, Ordering::Release);
@@ -319,6 +338,19 @@ impl Checkout {
     pub fn return_to_pool(mut self, stream: TcpStream) {
         if let Some(permit) = self.permit.take() {
             self.pool.recycle(stream, self.created_at, permit);
+        }
+    }
+
+    /// Reset the connection using the pool's reset closure and return it.
+    ///
+    /// Runs the protocol-level reset (e.g. `COM_RESET_CONNECTION`) before
+    /// parking the connection. If the reset fails, the connection is
+    /// discarded and the pool slot is freed.
+    pub async fn return_with_reset(mut self, stream: TcpStream) {
+        if let Some(permit) = self.permit.take() {
+            self.pool
+                .recycle_with_reset(stream, self.created_at, permit)
+                .await;
         }
     }
 
