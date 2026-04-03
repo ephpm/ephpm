@@ -7,6 +7,22 @@ fallback = ["$uri", "$uri/", "=404"]
 
 [server.request]
 max_body_size = 1024
+trusted_hosts = [
+    "ephpm", "localhost", "127.0.0.1",
+    # vhost tests
+    "nonexistent-site.example.com",
+    "lazy-test.preview.ephpm.dev",
+    "site-a.preview.ephpm.dev",
+    "site-b.preview.ephpm.dev",
+    # security P0 tests
+    "basedir-a.test",
+    "basedir-b.test",
+    "shell-test.test",
+    "kv-smoke.test",
+    "kv-a.test",
+    "kv-b.test",
+    # evil.example.com is intentionally NOT listed — tests 421 rejection
+]
 
 [server.static]
 cache_control = "public, max-age=3600"
@@ -16,6 +32,8 @@ enabled = true
 
 [server.security]
 blocked_paths = ["vendor/*"]
+open_basedir = true
+disable_shell_exec = true
 
 [php]
 max_execution_time = 30
