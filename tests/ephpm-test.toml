@@ -63,6 +63,7 @@ path = "/tmp/ephpm-test.db"
 [db.sqlite.proxy]
 mysql_listen = "127.0.0.1:3306"
 postgres_listen = "127.0.0.1:5432"
+tds_listen = "127.0.0.1:1433"
 
 [db.read_write_split]
 enabled = true
