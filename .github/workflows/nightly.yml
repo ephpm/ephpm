@@ -1,0 +1,208 @@
+# Nightly test suite — comprehensive builds and tests that are too slow for PR CI.
+#
+# Runs daily at 04:00 UTC and on manual dispatch. Covers full release builds
+# across all supported PHP versions and architectures, plus the E2E test suite.
+#
+# See docs/testing/nightly.md for the full nightly test plan.
+
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── 1. Full release builds ────────────────────────────────────────────────
+
+  build-linux:
+    name: Build (PHP ${{ matrix.php }}, linux-x86_64)
+    runs-on: ubuntu-latest
+    container: ghcr.io/${{ github.repository }}/ephpm-ci:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4", "8.5"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build ephpm
+        run: cargo xtask release ${{ matrix.php }}
+
+      - name: Run ignored integration tests
+        run: cargo nextest run --workspace --run-ignored ignored-only
+        env:
+          PHP_SDK_PATH: /opt/static-php-cli/buildroot
+
+      - name: Verify binary
+        run: |
+          TRIPLE=$(rustc -vV | awk '/^host:/ { print $2 }')
+          FILE="target/${TRIPLE}/release/ephpm"
+          test -f "$FILE" || { echo "::error::Binary not found at $FILE"; exit 1; }
+          file "$FILE"
+          ls -lh "$FILE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-php${{ matrix.php }}-linux-x86_64
+          path: target/*/release/ephpm
+
+  build-macos:
+    name: Build (PHP ${{ matrix.php }}, ${{ matrix.artifact_suffix }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4", "8.5"]
+        include:
+          - os: macos-latest
+            artifact_suffix: macos-aarch64
+          - os: macos-13
+            artifact_suffix: macos-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.4"
+
+      - name: Install system dependencies
+        run: |
+          brew install autoconf automake bison cmake flex libtool \
+            make pkg-config re2c
+
+      - name: Build ephpm
+        run: cargo xtask release ${{ matrix.php }}
+
+      - name: Run ignored integration tests
+        run: |
+          cargo install cargo-nextest --locked || true
+          cargo nextest run --workspace --run-ignored ignored-only
+
+      - name: Verify binary
+        run: |
+          FILE="target/release/ephpm"
+          test -f "$FILE" || { echo "::error::Binary not found at $FILE"; exit 1; }
+          file "$FILE"
+          ls -lh "$FILE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-php${{ matrix.php }}-${{ matrix.artifact_suffix }}
+          path: target/release/ephpm
+
+  build-windows:
+    name: Build (PHP ${{ matrix.php }}, windows-x86_64)
+    runs-on: ubuntu-latest
+    container: ghcr.io/${{ github.repository }}/ephpm-ci:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4", "8.5"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-xwin
+        run: cargo install cargo-xwin --locked || true
+
+      - name: Build Windows .exe
+        run: cargo xtask release ${{ matrix.php }} --target windows --no-sqld
+
+      - name: Verify binary
+        run: |
+          FILE="target/x86_64-pc-windows-msvc/release/ephpm.exe"
+          test -f "$FILE" || { echo "::error::Binary not found at $FILE"; exit 1; }
+          file "$FILE"
+          ls -lh "$FILE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-php${{ matrix.php }}-windows-x86_64
+          path: target/x86_64-pc-windows-msvc/release/ephpm.exe
+
+  # ── 2. E2E tests (using Linux build artifacts) ────────────────────────────
+
+  e2e:
+    name: E2E (PHP ${{ matrix.php }})
+    needs: [build-linux]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4", "8.5"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install E2E tools (kind, tilt, kubectl)
+        run: cargo xtask e2e-install
+
+      - name: Run E2E tests
+        run: cargo xtask e2e --php-version ${{ matrix.php }}
+
+  # ── 3. Dependency audit ───────────────────────────────────────────────────
+
+  audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked || true
+
+      - name: cargo audit
+        run: cargo audit
+
+      - name: cargo outdated (informational)
+        continue-on-error: true
+        run: |
+          cargo install cargo-outdated --locked || true
+          echo "## Outdated Dependencies" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cargo outdated --root-deps-only 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Summary ───────────────────────────────────────────────────────────────
+
+  nightly-summary:
+    name: Nightly Summary
+    if: always()
+    needs: [build-linux, build-macos, build-windows, e2e, audit]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check results
+        run: |
+          echo "## Nightly Build Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Job | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-----|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Linux builds | ${{ needs.build-linux.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| macOS builds | ${{ needs.build-macos.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Windows builds | ${{ needs.build-windows.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| E2E tests | ${{ needs.e2e.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Dependency audit | ${{ needs.audit.result }} |" >> "$GITHUB_STEP_SUMMARY"
+
+          # Fail if any required job failed
+          if [[ "${{ needs.build-linux.result }}" == "failure" ]] || \
+             [[ "${{ needs.build-macos.result }}" == "failure" ]] || \
+             [[ "${{ needs.e2e.result }}" == "failure" ]]; then
+            echo "::error::One or more critical nightly jobs failed"
+            exit 1
+          fi
