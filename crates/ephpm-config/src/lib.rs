@@ -879,8 +879,8 @@ pub struct ReadWriteSplitConfig {
     ///
     /// - `"sticky-after-write"` — after a write, reads stay on the primary
     ///   for `sticky_duration` to avoid read-your-writes inconsistency.
-    /// - `"lag-aware"` — skip replicas whose replication lag exceeds
-    ///   `max_replica_lag`.
+    /// - `"lag-aware"` — (planned: not yet implemented) skip replicas whose
+    ///   replication lag exceeds `max_replica_lag`.
     ///
     /// Default: `"sticky-after-write"`.
     #[serde(default = "default_rw_strategy")]
@@ -892,7 +892,8 @@ pub struct ReadWriteSplitConfig {
     #[serde(default = "default_sticky_duration")]
     pub sticky_duration: String,
 
-    /// Duration string: maximum acceptable replication lag (lag-aware strategy).
+    /// Planned: not yet implemented. Duration string for maximum acceptable
+    /// replication lag (lag-aware strategy). Currently parsed but not acted upon.
     ///
     /// Default: `"500ms"`.
     #[serde(default = "default_max_replica_lag")]
@@ -931,18 +932,18 @@ pub struct DbAnalysisConfig {
     #[serde(default = "default_slow_query_threshold")]
     pub slow_query_threshold: String,
 
-    /// Enable automatic `EXPLAIN` on slow queries.
+    /// Planned: not yet implemented. Enable automatic `EXPLAIN` on slow queries.
     ///
-    /// When enabled, the proxy automatically runs `EXPLAIN` on queries that
-    /// exceed the slow query threshold.
+    /// When enabled, the proxy will automatically run `EXPLAIN` on queries that
+    /// exceed the slow query threshold. Currently parsed but not acted upon.
     ///
     /// Default: `false`.
     #[serde(default)]
     pub auto_explain: bool,
 
-    /// Output target for `EXPLAIN` analysis results.
+    /// Planned: not yet implemented. Output target for `EXPLAIN` analysis results.
     ///
-    /// Values: `"stderr"`, `"stdout"`.
+    /// Values: `"stderr"`, `"stdout"`. Currently parsed but not acted upon.
     ///
     /// Default: `"stderr"`.
     #[serde(default = "default_auto_explain_target")]
@@ -1068,7 +1069,8 @@ pub struct KvRedisCompatConfig {
     #[serde(default = "default_kv_listen")]
     pub listen: String,
 
-    /// Optional Unix socket path (faster than TCP for local connections).
+    /// Planned: not yet implemented. Unix socket path for the RESP listener
+    /// (faster than TCP for local connections). Currently parsed but not acted upon.
     #[serde(default)]
     pub socket: Option<String>,
 

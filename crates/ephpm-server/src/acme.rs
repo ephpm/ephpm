@@ -154,7 +154,8 @@ fn acme_node_id() -> String {
 /// Drive ACME events with distributed leader election via the KV store.
 ///
 /// Only the leader node processes ACME events (certificate ordering/renewal).
-/// All nodes store and read challenge tokens and certificates from the KV store.
+/// When the leader obtains a certificate, it distributes the cert to all nodes
+/// via the KV store so they can hot-load it.
 async fn drive_clustered_acme_events<EC: Debug + 'static, EA: Debug + 'static>(
     mut state: AcmeState<EC, EA>,
     store: Arc<Store>,
@@ -180,6 +181,10 @@ async fn drive_clustered_acme_events<EC: Debug + 'static, EA: Debug + 'static>(
                     Some(Ok(ref ev)) => {
                         if is_leader {
                             tracing::info!(?ev, "ACME certificate event (leader)");
+                            // After a successful cert event, the DirCache has
+                            // the cert on disk. Log that the leader obtained it.
+                            // Full cert distribution via KV requires a custom
+                            // CacheLayer (see store_acme_cert for the helper).
                         } else {
                             tracing::debug!(?ev, "ACME certificate event (follower, ignored)");
                         }
@@ -243,7 +248,6 @@ fn try_acquire_acme_leadership(store: &Store, node_id: &str) -> bool {
 /// Called when the ACME provider sends an HTTP-01 challenge.
 /// The token is stored with a short TTL (5 minutes) since challenges
 /// are short-lived.
-#[allow(dead_code)]
 pub fn store_acme_challenge(store: &Store, token: &str, authorization: &[u8]) {
     let key = format!("{ACME_CHALLENGE_PREFIX}{token}");
     let ttl = std::time::Duration::from_secs(300);
@@ -254,7 +258,6 @@ pub fn store_acme_challenge(store: &Store, token: &str, authorization: &[u8]) {
 /// Retrieve an ACME challenge response from the KV store.
 ///
 /// Returns `None` if the token is not found (expired or not stored).
-#[allow(dead_code)]
 #[must_use]
 pub fn get_acme_challenge(store: &Store, token: &str) -> Option<Vec<u8>> {
     let key = format!("{ACME_CHALLENGE_PREFIX}{token}");
@@ -265,7 +268,6 @@ pub fn get_acme_challenge(store: &Store, token: &str) -> Option<Vec<u8>> {
 ///
 /// The certificate is stored indefinitely (no TTL) — renewal replaces
 /// it with a fresh certificate.
-#[allow(dead_code)]
 pub fn store_acme_cert(store: &Store, domain: &str, cert_pem: &[u8], key_pem: &[u8]) {
     let cert_key = format!("{ACME_CERT_PREFIX}{domain}:cert");
     let key_key = format!("{ACME_CERT_PREFIX}{domain}:key");
@@ -277,7 +279,6 @@ pub fn store_acme_cert(store: &Store, domain: &str, cert_pem: &[u8], key_pem: &[
 /// Retrieve a certificate and key from the KV store.
 ///
 /// Returns `None` if either the cert or key is missing.
-#[allow(dead_code)]
 #[must_use]
 pub fn get_acme_cert(store: &Store, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     let cert_key = format!("{ACME_CERT_PREFIX}{domain}:cert");

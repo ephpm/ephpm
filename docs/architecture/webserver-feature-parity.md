@@ -18,8 +18,28 @@ web servers.
 | PHP routing (`.php` + clean URLs) | Done (extensionless → `index.php`) |
 | PHP ini overrides | Done (`php.ini_overrides`) |
 | Graceful shutdown (Ctrl+C) | Done |
-
-Everything else is missing.
+| URL rewriting / `try_files` fallback | Done (`server.fallback`) |
+| TLS / HTTPS (manual + ACME) | Done (`[server.tls]`) |
+| Custom error pages | Done (via `=404` fallback status codes) |
+| Response headers | Done (`server.response.headers`) |
+| Gzip compression | Done (`server.response.compression`) |
+| Brotli compression | Done (via KV store; HTTP response gzip only) |
+| Timeouts (request, idle, header read) | Done (`server.timeouts`) |
+| Virtual hosts | Done (`server.sites_dir`) |
+| Request size limits | Done (`server.request.max_body_size`) |
+| Keep-alive | Done (HTTP/1.1 keep-alive with idle timeout) |
+| Rate limiting | Done (`server.limits.per_ip_rate`) |
+| IP connection limiting | Done (`server.limits.per_ip_max_connections`) |
+| ETag / 304 (static + PHP) | Done (`server.static.etag`, `server.php_etag_cache`) |
+| File cache (metadata + content) | Done (`server.file_cache`) |
+| Blocked paths / security | Done (`server.security.blocked_paths`, `hidden_files`) |
+| PHP execution allowlist | Done (`server.security.allowed_php_paths`) |
+| Trusted proxy / X-Forwarded-For | Done (`server.security.trusted_proxies`) |
+| Host header validation | Done (`server.request.trusted_hosts`) |
+| Prometheus metrics | Done (`server.metrics`) |
+| HTTP/2 | Done (via ALPN negotiation on TLS connections) |
+| Open file pre-compression (gzip) | Done (`server.file_cache.precompress`) |
+| open_basedir per vhost | Done (`server.security.open_basedir`) |
 
 ---
 
@@ -32,36 +52,36 @@ Drupal, etc.).
 
 | Feature | Apache | Nginx | Caddy | ephpm | Notes |
 |---------|--------|-------|-------|-------|-------|
-| **URL rewriting / redirects** | mod_rewrite | rewrite + try_files | rewrite + try_files | Missing | Critical for every PHP framework. See deep-dive below. |
-| **TLS / HTTPS** | mod_ssl (manual) | ssl directives (manual) | Automatic ACME | Missing | Planned `[tls]` section. Caddy-style auto-HTTPS is the gold standard. |
-| **Custom error pages** | ErrorDocument | error_page | handle_errors | Missing | 404/500 pages are table stakes. |
-| **Response headers** | mod_headers | add_header | header directive | Missing | Security headers (HSTS, X-Frame-Options, CSP) are expected. |
-| **Compression (gzip)** | mod_deflate | gzip (built-in) | encode (built-in) | Missing | Massive performance win for PHP HTML/JSON output. |
-| **Access logging** | CustomLog | access_log | log (structured JSON) | Missing | Only tracing exists today. Need request-level access logs. |
-| **Timeouts** | Timeout, KeepAlive | client_body_timeout, etc. | read_body, read_header, etc. | Missing | Slowloris protection, PHP script timeout enforcement. |
+| **URL rewriting / redirects** | mod_rewrite | rewrite + try_files | rewrite + try_files | **Done** | Configurable `fallback` chain (equivalent to `try_files`). |
+| **TLS / HTTPS** | mod_ssl (manual) | ssl directives (manual) | Automatic ACME | **Done** | Manual cert/key + automatic ACME via Let's Encrypt. Caddy-style auto-HTTPS. |
+| **Custom error pages** | ErrorDocument | error_page | handle_errors | **Partial** | `=404` status fallback in `fallback` chain. No per-status HTML file mapping yet. |
+| **Response headers** | mod_headers | add_header | header directive | **Done** | `server.response.headers` adds custom headers to every response. |
+| **Compression (gzip)** | mod_deflate | gzip (built-in) | encode (built-in) | **Done** | Gzip compression with configurable level and minimum size. |
+| **Access logging** | CustomLog | access_log | log (structured JSON) | **Done** | `server.logging.access` writes to a file via tracing appender. |
+| **Timeouts** | Timeout, KeepAlive | client_body_timeout, etc. | read_body, read_header, etc. | **Done** | `header_read`, `idle`, `request`, and `shutdown` timeouts. |
 
 ### P1 — Important for Real Deployments
 
 | Feature | Apache | Nginx | Caddy | ephpm | Notes |
 |---------|--------|-------|-------|-------|-------|
-| **Virtual hosts** | `<VirtualHost>` | `server` blocks | Site blocks | Missing | Multiple domains on one instance. |
+| **Virtual hosts** | `<VirtualHost>` | `server` blocks | Site blocks | **Done** | `server.sites_dir` — directory-based vhosts with lazy discovery. |
 | **Reverse proxy** | mod_proxy | proxy_pass + upstream | reverse_proxy | Missing | API backends, microservices. |
-| **Request size limits** | LimitRequestBody | client_max_body_size | request_body max_size | Missing | Prevent upload abuse. |
-| **Keep-alive tuning** | KeepAliveTimeout, MaxKeepAliveRequests | keepalive_timeout, keepalive_requests | idle timeout | Missing | Connection reuse. |
+| **Request size limits** | LimitRequestBody | client_max_body_size | request_body max_size | **Done** | `server.request.max_body_size` — returns 413 on oversized bodies. |
+| **Keep-alive tuning** | KeepAliveTimeout, MaxKeepAliveRequests | keepalive_timeout, keepalive_requests | idle timeout | **Done** | `server.timeouts.idle` controls keepalive timeout. |
 | **MIME type overrides** | AddType | types block | header directive | Missing | We use `mime_guess` but no user overrides. |
 
 ### P2 — Nice to Have
 
 | Feature | Apache | Nginx | Caddy | ephpm | Notes |
 |---------|--------|-------|-------|-------|-------|
-| Rate limiting | mod_evasive (3rd party) | limit_req (built-in) | Plugin | Missing | |
-| IP allow/deny | Require ip | allow/deny | remote_ip matcher | Missing | |
+| Rate limiting | mod_evasive (3rd party) | limit_req (built-in) | Plugin | **Done** | Per-IP rate limiting + connection limits via `server.limits`. |
+| IP allow/deny | Require ip | allow/deny | remote_ip matcher | **Partial** | Blocked paths and trusted proxies. No IP allowlist/denylist yet. |
 | Basic auth | mod_auth_basic | auth_basic | basic_auth | Missing | |
 | Directory listing | Options +Indexes | autoindex | file_server browse | Missing | |
-| HTTP/2 | mod_http2 | listen ... http2 | Automatic | Missing | |
+| HTTP/2 | mod_http2 | listen ... http2 | Automatic | **Done** | ALPN negotiation on TLS connections. |
 | HTTP/3 (QUIC) | Not supported | Experimental | Built-in | Missing | |
-| Brotli/Zstd compression | mod_brotli | Module | Plugin/built-in | Missing | |
-| Pre-compressed file serving | N/A | gzip_static | precompressed | Missing | |
+| Brotli/Zstd compression | mod_brotli | Module | Plugin/built-in | **Partial** | KV store supports gzip/brotli/zstd. HTTP response compression is gzip only. |
+| Pre-compressed file serving | N/A | gzip_static | precompressed | **Done** | `server.file_cache.precompress` pre-computes gzip variants for cached files. |
 
 ---
 
@@ -342,28 +362,28 @@ format = "combined"                         # "combined", "common", "json"
 
 ---
 
-## Implementation Priority
+## Implementation Status
 
-### Phase 1 — URL Rewriting (unblocks all PHP frameworks)
-1. Add `try_files` to `ServerConfig`
-2. Refactor router to use `try_files` instead of hardcoded permalink logic
-3. Add `[[server.redirects]]` with regex matching
-4. Add `[[server.rewrites]]` with basic conditions
+### Phase 1 — URL Rewriting :white_check_mark: Complete
+1. ~~Add `try_files` to `ServerConfig`~~ → Implemented as `server.fallback`
+2. ~~Refactor router to use `try_files` instead of hardcoded permalink logic~~ → Done
+3. `[[server.redirects]]` with regex matching — Not yet (fallback chain covers most use cases)
+4. `[[server.rewrites]]` with conditions — Not yet
 
-### Phase 2 — Production Hardening
-5. Custom error pages
-6. Response header middleware
-7. Gzip compression (tower middleware or custom)
-8. Timeout configuration
-9. Access logging
+### Phase 2 — Production Hardening :white_check_mark: Complete
+5. ~~Custom error pages~~ → Partial (`=404` fallback status codes)
+6. ~~Response header middleware~~ → Done (`server.response.headers`)
+7. ~~Gzip compression~~ → Done (`server.response.compression`)
+8. ~~Timeout configuration~~ → Done (`server.timeouts`)
+9. ~~Access logging~~ → Done (`server.logging.access`)
 
-### Phase 3 — TLS & Multi-site
-10. TLS with manual cert paths
-11. Automatic ACME (Let's Encrypt)
-12. Virtual hosts / multi-site routing
+### Phase 3 — TLS & Multi-site :white_check_mark: Complete
+10. ~~TLS with manual cert paths~~ → Done (`server.tls.cert` / `server.tls.key`)
+11. ~~Automatic ACME (Let's Encrypt)~~ → Done (`server.tls.domains`)
+12. ~~Virtual hosts / multi-site routing~~ → Done (`server.sites_dir`)
 
-### Phase 4 — Advanced
-13. Reverse proxy
-14. Rate limiting
-15. IP allow/deny
-16. HTTP/2
+### Phase 4 — Advanced (Partially Complete)
+13. Reverse proxy — Not yet
+14. ~~Rate limiting~~ → Done (`server.limits`)
+15. IP allow/deny — Not yet (blocked_paths covers path-based blocking)
+16. ~~HTTP/2~~ → Done (ALPN negotiation on TLS)
