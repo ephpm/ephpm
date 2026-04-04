@@ -204,8 +204,28 @@ impl ClusteredStore {
 
             true
         } else {
-            // Local store (TCP tier will route to owner in Phase 7).
-            let ok = self.store.set(key.clone(), value, ttl);
+            // Large value — route to the owner node via TCP data plane.
+            let ok = if let Some(owner_addr) =
+                self.resolve_owner_data_addr(&key).await
+            {
+                match crate::kv_data_plane::store_remote(owner_addr, &key, &value)
+                    .await
+                {
+                    Ok(accepted) => accepted,
+                    Err(e) => {
+                        tracing::warn!(
+                            key,
+                            %owner_addr,
+                            %e,
+                            "TCP data plane store failed, storing locally"
+                        );
+                        self.store.set(key.clone(), value, ttl)
+                    }
+                }
+            } else {
+                // We are the owner — store locally.
+                self.store.set(key.clone(), value, ttl)
+            };
 
             // Bump hot key version for remote invalidation.
             if ok && self.config.hot_key_cache {
@@ -569,5 +589,43 @@ mod tests {
         let h1 = hash_key("session:abc");
         let h2 = hash_key("session:xyz");
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn hash_key_distribution_reasonable() {
+        // Generate 1000 keys and check they don't all collide.
+        let mut hashes = std::collections::HashSet::new();
+        for i in 0..1000 {
+            hashes.insert(hash_key(&format!("key:{i}")));
+        }
+        // With a good hash, we expect ~1000 unique hashes.
+        assert!(
+            hashes.len() > 900,
+            "hash distribution too clustered: {} unique out of 1000",
+            hashes.len()
+        );
+    }
+
+    #[test]
+    fn hash_key_empty_string() {
+        // Should not panic.
+        let _ = hash_key("");
+    }
+
+    #[test]
+    fn parse_memory_size_with_decimals() {
+        assert_eq!(parse_memory_size("1.5GB").unwrap(), 1_610_612_736);
+        assert_eq!(parse_memory_size("0.5MB").unwrap(), 512 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_size_zero() {
+        assert_eq!(parse_memory_size("0").unwrap(), 0);
+        assert_eq!(parse_memory_size("0MB").unwrap(), 0);
+    }
+
+    #[test]
+    fn parse_memory_size_whitespace() {
+        assert_eq!(parse_memory_size("  64MB  ").unwrap(), 64 * 1024 * 1024);
     }
 }

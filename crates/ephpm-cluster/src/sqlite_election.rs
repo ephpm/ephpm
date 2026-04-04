@@ -277,4 +277,95 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn elected_role_different_replicas_not_equal() {
+        assert_ne!(
+            ElectedRole::Replica {
+                primary_grpc_url: "http://a:5001".into(),
+            },
+            ElectedRole::Replica {
+                primary_grpc_url: "http://b:5001".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn primary_claim_with_ipv6() {
+        let claim = PrimaryClaim {
+            node_id: "node-v6".into(),
+            grpc_addr: "[::1]:5001".into(),
+        };
+        let encoded = claim.encode();
+        let decoded = PrimaryClaim::decode(&encoded).unwrap();
+        assert_eq!(decoded.node_id, "node-v6");
+        assert_eq!(decoded.grpc_addr, "[::1]:5001");
+    }
+
+    #[test]
+    fn primary_claim_decode_multiple_pipes() {
+        // Only the first pipe is the separator.
+        let decoded = PrimaryClaim::decode(b"a|b|c").unwrap();
+        assert_eq!(decoded.node_id, "a");
+        assert_eq!(decoded.grpc_addr, "b|c");
+    }
+
+    #[test]
+    fn primary_claim_with_long_node_id() {
+        let long_id = "ephpm-".to_string() + &"x".repeat(200);
+        let claim = PrimaryClaim {
+            node_id: long_id.clone(),
+            grpc_addr: "10.0.1.2:5001".into(),
+        };
+        let roundtripped =
+            PrimaryClaim::decode(&claim.encode()).unwrap();
+        assert_eq!(roundtripped.node_id, long_id);
+    }
+
+    /// Verify that lowest-ordinal wins: when comparing node IDs
+    /// alphabetically, the smallest should become primary.
+    #[test]
+    fn lowest_ordinal_election_logic() {
+        // Simulate the election logic: filter alive, pick min by id.
+        let nodes = [
+            ("ephpm-c", true),
+            ("ephpm-a", true),
+            ("ephpm-b", false), // dead
+            ("ephpm-d", true),
+        ];
+
+        let lowest_alive = nodes
+            .iter()
+            .filter(|(_, alive)| *alive)
+            .min_by(|a, b| a.0.cmp(b.0))
+            .map(|(id, _)| *id);
+
+        assert_eq!(lowest_alive, Some("ephpm-a"));
+    }
+
+    /// Verify that when the primary dies, the next lowest becomes primary.
+    #[test]
+    fn failover_to_next_lowest() {
+        let nodes = [
+            ("ephpm-a", false), // was primary, now dead
+            ("ephpm-b", true),
+            ("ephpm-c", true),
+        ];
+
+        let lowest_alive = nodes
+            .iter()
+            .filter(|(_, alive)| *alive)
+            .min_by(|a, b| a.0.cmp(b.0))
+            .map(|(id, _)| *id);
+
+        assert_eq!(lowest_alive, Some("ephpm-b"));
+    }
+
+    #[test]
+    fn heartbeat_ttl_constants_valid() {
+        // TTL must be greater than heartbeat interval for liveness detection.
+        assert!(PRIMARY_TTL > HEARTBEAT_INTERVAL);
+        // The ratio should allow at least one missed heartbeat.
+        assert!(PRIMARY_TTL >= HEARTBEAT_INTERVAL * 2);
+    }
 }

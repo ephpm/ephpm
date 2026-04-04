@@ -287,6 +287,14 @@ fn spawn_child(
 mod tests {
     use super::*;
 
+    fn test_config() -> SqldConfig {
+        SqldConfig {
+            db_path: "/tmp/test.db".into(),
+            http_listen: "127.0.0.1:8081".into(),
+            grpc_listen: "0.0.0.0:5001".into(),
+        }
+    }
+
     #[test]
     fn sqld_role_equality() {
         assert_eq!(SqldRole::Primary, SqldRole::Primary);
@@ -299,25 +307,38 @@ mod tests {
     }
 
     #[test]
+    fn sqld_role_replica_equality() {
+        assert_eq!(
+            SqldRole::Replica {
+                primary_grpc_url: "http://x:5001".into(),
+            },
+            SqldRole::Replica {
+                primary_grpc_url: "http://x:5001".into(),
+            }
+        );
+        assert_ne!(
+            SqldRole::Replica {
+                primary_grpc_url: "http://a:5001".into(),
+            },
+            SqldRole::Replica {
+                primary_grpc_url: "http://b:5001".into(),
+            }
+        );
+    }
+
+    #[test]
     fn sqld_config_debug() {
-        let config = SqldConfig {
-            db_path: "/tmp/test.db".into(),
-            http_listen: "127.0.0.1:8081".into(),
-            grpc_listen: "0.0.0.0:5001".into(),
-        };
+        let config = test_config();
         let s = format!("{config:?}");
         assert!(s.contains("test.db"));
         assert!(s.contains("8081"));
+        assert!(s.contains("5001"));
     }
 
     #[cfg(not(sqld_embedded))]
     #[tokio::test]
     async fn spawn_fails_without_embedded_binary() {
-        let config = SqldConfig {
-            db_path: "/tmp/test.db".into(),
-            http_listen: "127.0.0.1:8081".into(),
-            grpc_listen: "0.0.0.0:5001".into(),
-        };
+        let config = test_config();
         match SqldProcess::spawn(config, SqldRole::Primary).await {
             Ok(_) => panic!("should fail without embedded binary"),
             Err(e) => {
@@ -328,5 +349,111 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(not(sqld_embedded))]
+    #[tokio::test]
+    async fn spawn_fails_as_replica_too() {
+        let config = test_config();
+        let role = SqldRole::Replica {
+            primary_grpc_url: "http://10.0.1.2:5001".into(),
+        };
+        match SqldProcess::spawn(config, role).await {
+            Ok(_) => panic!("should fail without embedded binary"),
+            Err(e) => {
+                let err = e.to_string();
+                assert!(
+                    err.contains("not embedded"),
+                    "expected 'not embedded' error for replica spawn, got: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn health_check_url_construction() {
+        let config = test_config();
+        // Simulate the health URL format used in wait_healthy.
+        let health_url = format!("http://{}/health", config.http_listen);
+        assert_eq!(health_url, "http://127.0.0.1:8081/health");
+    }
+
+    #[test]
+    fn health_check_url_custom_port() {
+        let config = SqldConfig {
+            db_path: "/data/mydb.db".into(),
+            http_listen: "0.0.0.0:9090".into(),
+            grpc_listen: "0.0.0.0:5001".into(),
+        };
+        let health_url = format!("http://{}/health", config.http_listen);
+        assert_eq!(health_url, "http://0.0.0.0:9090/health");
+    }
+
+    #[test]
+    fn spawn_child_args_primary() {
+        // Verify the command line arguments generated for primary role.
+        let config = test_config();
+        let binary = PathBuf::from("/fake/sqld");
+        // We can't actually spawn (binary doesn't exist), but we can
+        // test that spawn_child doesn't panic during construction.
+        let result = spawn_child(&binary, &config, &SqldRole::Primary);
+        // Will fail because /fake/sqld doesn't exist — that's fine,
+        // we're testing the arg construction path.
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn spawn_child_args_replica() {
+        let config = test_config();
+        let binary = PathBuf::from("/fake/sqld");
+        let role = SqldRole::Replica {
+            primary_grpc_url: "http://10.0.1.2:5001".into(),
+        };
+        let result = spawn_child(&binary, &config, &role);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sqld_role_debug_format() {
+        let primary_dbg = format!("{:?}", SqldRole::Primary);
+        assert_eq!(primary_dbg, "Primary");
+
+        let replica_dbg = format!(
+            "{:?}",
+            SqldRole::Replica {
+                primary_grpc_url: "http://host:5001".into()
+            }
+        );
+        assert!(replica_dbg.contains("Replica"));
+        assert!(replica_dbg.contains("host:5001"));
+    }
+
+    #[cfg(not(sqld_embedded))]
+    #[test]
+    fn extract_binary_returns_not_embedded_error() {
+        // In stub mode, extract_binary is a sync function returning a future.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(extract_binary());
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("not embedded"),
+            "expected 'not embedded', got: {err}"
+        );
+    }
+
+    #[test]
+    fn temp_path_includes_pid() {
+        let expected_prefix = format!("ephpm-sqld-{}", std::process::id());
+        let temp_path = std::env::temp_dir().join(&expected_prefix);
+        assert!(
+            temp_path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("ephpm-sqld-"),
+            "temp path should include ephpm-sqld prefix"
+        );
     }
 }

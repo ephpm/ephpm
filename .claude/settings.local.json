@@ -71,7 +71,11 @@
       "Bash(grep -E \"^/home/luther/ephpm/Cargo\\\\.toml$\")",
       "Bash(grep -rn \"feature\\\\|optional\" /home/luther/litewire/crates/*/Cargo.toml)",
       "Bash(wc -l /home/luther/litewire/crates/*/src/*.rs)",
-      "Bash(php vendor/bin/phpunit tests/SPC/store/SourcePatcherTest.php)"
+      "Bash(php vendor/bin/phpunit tests/SPC/store/SourcePatcherTest.php)",
+      "Bash(go get:*)",
+      "Bash(gvm install:*)",
+      "Bash(gvm listall:*)",
+      "WebFetch(domain:docs.github.com)"
     ]
   }
 }
