@@ -24,6 +24,7 @@ http-body-util.workspace = true
 http.workspace = true
 mime_guess.workspace = true
 tracing.workspace = true
+brotli.workspace = true
 flate2.workspace = true
 ipnet.workspace = true
 thiserror.workspace = true

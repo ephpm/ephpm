@@ -27,7 +27,7 @@ We evaluated embedding existing databases (Redis, Dragonfly, KeyDB, Garnet) and 
 | TTL / expiry | Standard | Background sweeper + lazy expiry on access. |
 | Clustering | **Nobody has this.** All competitors require external Redis/Memcached. | Gossip-based peer discovery, consistent hash ring, cross-node routing. |
 | PHP access | RoadRunner: Goridge RPC. Swoole: shared memory API. | SAPI function calls — zero serialization, zero network hop for local keys. |
-| Persistence | Optional | Optional AOF/snapshot for crash recovery. This is a cache, not a database. |
+| Persistence | Optional | **Planned — not yet implemented.** Optional AOF/snapshot for crash recovery. This is a cache, not a database. |
 | Redis protocol compat | Not required | Optional RESP listener so existing Redis clients/tools work. |
 
 ---

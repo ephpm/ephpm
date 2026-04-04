@@ -11,45 +11,6 @@ use hyper::{Response, StatusCode};
 
 use crate::body::{self, ServerBody};
 
-/// Serve a static file from the document root.
-///
-/// Returns a 404 response if the file doesn't exist or is outside the document root.
-pub async fn serve(document_root: &Path, url_path: &str) -> Response<ServerBody> {
-    let relative = url_path.trim_start_matches('/');
-    let file_path = document_root.join(relative);
-
-    // Security: ensure the resolved path is within the document root
-    let Ok(canonical_root) = document_root.canonicalize() else {
-        return not_found();
-    };
-    let Ok(canonical_file) = file_path.canonicalize() else {
-        return not_found();
-    };
-    if !canonical_file.starts_with(&canonical_root) {
-        tracing::warn!(
-            path = %url_path,
-            "path traversal attempt blocked"
-        );
-        return forbidden();
-    }
-
-    // Read the file
-    let Ok(content) = tokio::fs::read(&canonical_file).await else {
-        return not_found();
-    };
-
-    // Detect MIME type from file extension
-    let mime =
-        mime_guess::from_path(&canonical_file).first_raw().unwrap_or("application/octet-stream");
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", mime)
-        .header("Content-Length", content.len())
-        .body(body::buffered(Full::new(Bytes::from(content))))
-        .unwrap_or_else(|_| internal_error())
-}
-
 /// Serve a file from an already-resolved filesystem path.
 ///
 /// The router has already verified the file exists and resolved it via
@@ -62,6 +23,7 @@ pub async fn serve_file(
     document_root: &Path,
     file_path: &Path,
     accepts_gzip: bool,
+    accepts_br: bool,
     cache_control: &str,
     compression: crate::router::CompressionSettings,
     etag: bool,
@@ -83,12 +45,15 @@ pub async fn serve_file(
         return forbidden();
     }
 
-    // Try the file cache first.
+    // Try the file cache first. Returns `None` for metadata-only entries
+    // (large files without inlined content) so we fall through to streaming.
     if let Some(cache) = file_cache {
         if let Some(entry) = cache.lookup(&canonical_file).await {
-            return serve_cached_entry(
+            if let Some(resp) = serve_cached_entry(
                 entry, accepts_gzip, cache_control, if_none_match,
-            );
+            ) {
+                return resp;
+            }
         }
     }
 
@@ -119,13 +84,16 @@ pub async fn serve_file(
         return not_found();
     };
 
-    // Insert into cache if enabled.
+    // Insert into cache if enabled. For small files (which are inlined),
+    // serve directly from the cache entry.
     if let Some(cache) = file_cache {
         if let Ok(mtime) = metadata.modified() {
             let entry = cache.insert(&canonical_file, &content, mtime, mime, compression);
-            return serve_cached_entry(
+            if let Some(resp) = serve_cached_entry(
                 entry, accepts_gzip, cache_control, if_none_match,
-            );
+            ) {
+                return resp;
+            }
         }
     }
 
@@ -141,6 +109,27 @@ pub async fn serve_file(
             }
             return builder
                 .body(body::buffered(Full::new(Bytes::new())))
+                .unwrap_or_else(|_| internal_error());
+        }
+    }
+
+    // Prefer Brotli over gzip — better compression ratio for text assets.
+    if accepts_br {
+        if let Some(compressed) = crate::router::brotli_compress(&content, mime, compression) {
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", mime)
+                .header("Content-Length", compressed.len())
+                .header("Content-Encoding", "br")
+                .header("Vary", "Accept-Encoding");
+            if !cache_control.is_empty() {
+                builder = builder.header("Cache-Control", cache_control);
+            }
+            if let Some(ref tag) = etag_value {
+                builder = builder.header("ETag", tag.as_str());
+            }
+            return builder
+                .body(body::buffered(Full::new(Bytes::from(compressed))))
                 .unwrap_or_else(|_| internal_error());
         }
     }
@@ -181,13 +170,17 @@ pub async fn serve_file(
 }
 
 /// Serve a response from a cached file entry.
+///
+/// Returns `None` when the cache entry has no inlined content (large
+/// file), signalling the caller to fall through to the disk streaming
+/// path.
 fn serve_cached_entry(
     entry: crate::file_cache::CacheEntry,
     accepts_gzip: bool,
     cache_control: &str,
     if_none_match: Option<&str>,
-) -> Response<ServerBody> {
-    // ETag check.
+) -> Option<Response<ServerBody>> {
+    // ETag check — works even for metadata-only entries.
     if let Some(client_tag) = if_none_match {
         if etag_matches(&entry.etag, client_tag) {
             let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
@@ -195,9 +188,11 @@ fn serve_cached_entry(
             if !cache_control.is_empty() {
                 builder = builder.header("Cache-Control", cache_control);
             }
-            return builder
-                .body(body::buffered(Full::new(Bytes::new())))
-                .unwrap_or_else(|_| internal_error());
+            return Some(
+                builder
+                    .body(body::buffered(Full::new(Bytes::new())))
+                    .unwrap_or_else(|_| internal_error()),
+            );
         }
     }
 
@@ -214,9 +209,11 @@ fn serve_cached_entry(
             if !cache_control.is_empty() {
                 builder = builder.header("Cache-Control", cache_control);
             }
-            return builder
-                .body(body::buffered(Full::new(gzip.clone())))
-                .unwrap_or_else(|_| internal_error());
+            return Some(
+                builder
+                    .body(body::buffered(Full::new(gzip.clone())))
+                    .unwrap_or_else(|_| internal_error()),
+            );
         }
     }
 
@@ -230,26 +227,16 @@ fn serve_cached_entry(
         if !cache_control.is_empty() {
             builder = builder.header("Cache-Control", cache_control);
         }
-        return builder
-            .body(body::buffered(Full::new(content.clone())))
-            .unwrap_or_else(|_| internal_error());
+        return Some(
+            builder
+                .body(body::buffered(Full::new(content.clone())))
+                .unwrap_or_else(|_| internal_error()),
+        );
     }
 
-    // Content not cached (large file) — return metadata-only response.
-    // Caller will need to read from disk or stream.
-    // For now, return a response with just headers — the streaming path
-    // (Phase 3b) will handle this case properly.
-    let mut builder = Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", entry.mime.as_str())
-        .header("Content-Length", entry.size)
-        .header("ETag", entry.etag.as_str());
-    if !cache_control.is_empty() {
-        builder = builder.header("Cache-Control", cache_control);
-    }
-    builder
-        .body(body::buffered(Full::new(Bytes::new())))
-        .unwrap_or_else(|_| internal_error())
+    // Content not cached (large file) — signal caller to use the
+    // disk streaming path instead of returning an empty body.
+    None
 }
 
 /// Serve a large file by streaming from disk.
@@ -359,9 +346,35 @@ mod tests {
 
     use super::*;
 
+    /// Default compression settings (disabled) for tests.
+    fn no_compression() -> crate::router::CompressionSettings {
+        crate::router::CompressionSettings {
+            enabled: false,
+            level: 6,
+            min_size: 1024,
+        }
+    }
+
     /// Collect a response body into a `Vec<u8>`.
     async fn body_bytes(resp: Response<ServerBody>) -> Vec<u8> {
         resp.into_body().collect().await.unwrap().to_bytes().to_vec()
+    }
+
+    /// Helper: serve a file using `serve_file` with default settings.
+    async fn serve_test(docroot: &Path, filename: &str) -> Response<ServerBody> {
+        let file_path = docroot.join(filename);
+        serve_file(
+            docroot,
+            &file_path,
+            false,
+            false,
+            "",
+            no_compression(),
+            false,
+            None,
+            None,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -369,7 +382,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("page.html"), "<h1>Hello</h1>").unwrap();
 
-        let resp = serve(dir.path(), "/page.html").await;
+        let resp = serve_test(dir.path(), "page.html").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "text/html");
         assert_eq!(body_bytes(resp).await, b"<h1>Hello</h1>");
@@ -380,7 +393,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("style.css"), "body{}").unwrap();
 
-        let resp = serve(dir.path(), "/style.css").await;
+        let resp = serve_test(dir.path(), "style.css").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "text/css");
     }
@@ -391,7 +404,7 @@ mod tests {
         let content = "twelve chars";
         fs::write(dir.path().join("test.txt"), content).unwrap();
 
-        let resp = serve(dir.path(), "/test.txt").await;
+        let resp = serve_test(dir.path(), "test.txt").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()["content-length"],
@@ -404,7 +417,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("data.ephpmtest"), "binary").unwrap();
 
-        let resp = serve(dir.path(), "/data.ephpmtest").await;
+        let resp = serve_test(dir.path(), "data.ephpmtest").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()["content-type"],
@@ -416,7 +429,7 @@ mod tests {
     async fn test_serve_missing_file_returns_404() {
         let dir = tempfile::tempdir().unwrap();
 
-        let resp = serve(dir.path(), "/nonexistent.txt").await;
+        let resp = serve_test(dir.path(), "nonexistent.txt").await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -428,7 +441,19 @@ mod tests {
         // Create a file outside docroot
         fs::write(parent.path().join("secret.txt"), "secret").unwrap();
 
-        let resp = serve(&docroot, "/../secret.txt").await;
+        let file_path = docroot.join("..").join("secret.txt");
+        let resp = serve_file(
+            &docroot,
+            &file_path,
+            false,
+            false,
+            "",
+            no_compression(),
+            false,
+            None,
+            None,
+        )
+        .await;
         // Should be 403 (path resolves outside docroot) or 404 (canonicalize fails)
         let status = resp.status();
         assert!(
@@ -441,7 +466,7 @@ mod tests {
     async fn test_serve_javascript_file() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("app.js"), "console.log('hi')").unwrap();
-        let resp = serve(dir.path(), "/app.js").await;
+        let resp = serve_test(dir.path(), "app.js").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp.headers()["content-type"].to_str().unwrap();
         assert!(
@@ -456,7 +481,7 @@ mod tests {
         // Minimal PNG header.
         let png = b"\x89PNG\r\n\x1a\n";
         fs::write(dir.path().join("icon.png"), png).unwrap();
-        let resp = serve(dir.path(), "/icon.png").await;
+        let resp = serve_test(dir.path(), "icon.png").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "image/png");
     }
@@ -465,7 +490,7 @@ mod tests {
     async fn test_serve_empty_file() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("empty.txt"), "").unwrap();
-        let resp = serve(dir.path(), "/empty.txt").await;
+        let resp = serve_test(dir.path(), "empty.txt").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-length"], "0");
     }
@@ -475,7 +500,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir_all(dir.path().join("assets/css")).unwrap();
         fs::write(dir.path().join("assets/css/main.css"), "body{}").unwrap();
-        let resp = serve(dir.path(), "/assets/css/main.css").await;
+        let resp = serve_test(dir.path(), "assets/css/main.css").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "text/css");
     }
@@ -485,8 +510,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data: Vec<u8> = (0..=255).collect();
         fs::write(dir.path().join("binary.bin"), &data).unwrap();
-        let resp = serve(dir.path(), "/binary.bin").await;
+        let resp = serve_test(dir.path(), "binary.bin").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_bytes(resp).await, data);
+    }
+
+    #[tokio::test]
+    async fn test_etag_matches_wildcard() {
+        assert!(etag_matches("W/\"abc\"", "*"));
+    }
+
+    #[tokio::test]
+    async fn test_etag_matches_exact() {
+        assert!(etag_matches("W/\"abc\"", "W/\"abc\""));
+    }
+
+    #[tokio::test]
+    async fn test_etag_matches_list() {
+        assert!(etag_matches("W/\"b\"", "W/\"a\", W/\"b\", W/\"c\""));
+    }
+
+    #[tokio::test]
+    async fn test_etag_no_match() {
+        assert!(!etag_matches("W/\"x\"", "W/\"a\", W/\"b\""));
     }
 }

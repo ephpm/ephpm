@@ -756,22 +756,51 @@ impl Store {
         self.mem_used.load(Ordering::Relaxed) + needed <= limit
     }
 
-    /// Random eviction — just remove the first key we find.
+    /// Random eviction — pick a pseudo-random key and remove it.
+    ///
+    /// Uses time-based entropy mixed with an iteration counter to select
+    /// different keys on each attempt, avoiding the deterministic "always
+    /// evict the first shard entry" pattern.
     fn evict_random(&self, needed: usize) -> bool {
         let limit = self.config.memory_limit;
 
-        for _ in 0..100 {
+        for attempt in 0..100u64 {
             let current = self.mem_used.load(Ordering::Relaxed);
             if current + needed <= limit {
                 return true;
             }
 
-            let key = self.data.iter().next().map(|e| e.key().clone());
+            let len = self.data.len();
+            if len == 0 {
+                return false;
+            }
+
+            // Mix time nanos with attempt counter for pseudo-random offset.
+            let nanos = u64::from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .subsec_nanos(),
+            );
+            let seed = nanos
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(attempt.wrapping_mul(1_442_695_040_888_963_407));
+            #[allow(clippy::cast_possible_truncation)]
+            let skip = (seed >> 33) as usize % len;
+
+            let key = self.data.iter().nth(skip).map(|e| e.key().clone());
             if let Some(key) = key {
                 debug!(key = %key, "evicting key (random)");
                 self.remove(&key);
             } else {
-                return false;
+                // skip went past the end — try first entry as fallback.
+                let key = self.data.iter().next().map(|e| e.key().clone());
+                if let Some(key) = key {
+                    debug!(key = %key, "evicting key (random fallback)");
+                    self.remove(&key);
+                } else {
+                    return false;
+                }
             }
         }
 

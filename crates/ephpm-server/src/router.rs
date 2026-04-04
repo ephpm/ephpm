@@ -434,6 +434,7 @@ impl Router {
         // Resolve real client IP and HTTPS status from trusted proxy headers
         let (effective_addr, is_https) = self.resolve_proxy_info(&req, remote_addr, is_tls);
 
+        let accepts_br = self.compression.enabled && accepts_encoding(&req, "br");
         let accepts_gzip = self.compression.enabled && accepts_encoding(&req, "gzip");
 
         // Resolve virtual host — determines document root, index files, fallback.
@@ -474,7 +475,7 @@ impl Router {
                         }
 
                         // Execute PHP
-                        let resp = self.handle_php(req, effective_addr, is_https, fs_path, accepts_gzip, site_root.clone())
+                        let resp = self.handle_php(req, effective_addr, is_https, fs_path, accepts_gzip, accepts_br, site_root.clone())
                             .await;
 
                         // Post-store: cache any ETag PHP set in the response.
@@ -500,6 +501,7 @@ impl Router {
                         &site_root,
                         &fs_path,
                         accepts_gzip,
+                        accepts_br,
                         &self.cache_control,
                         self.compression,
                         self.etag,
@@ -589,6 +591,7 @@ impl Router {
     }
 
     /// Handle a PHP request by executing it in a blocking task.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_php(
         &self,
         req: Request<Incoming>,
@@ -596,6 +599,7 @@ impl Router {
         is_https: bool,
         script_filename: PathBuf,
         accepts_gzip: bool,
+        accepts_br: bool,
         document_root: PathBuf,
     ) -> Response<ServerBody> {
         let method = req.method().to_string();
@@ -666,7 +670,7 @@ impl Router {
         };
         counter!("ephpm_php_executions_total", "status" => exec_status).increment(1);
 
-        build_php_response(result, accepts_gzip, self.compression)
+        build_php_response(result, accepts_gzip, accepts_br, self.compression)
     }
 
     /// Return 413 if Content-Length exceeds the limit.
@@ -983,10 +987,13 @@ fn error_response(status: StatusCode, body: &str) -> Response<ServerBody> {
         .expect("static error response")
 }
 
-/// Build an HTTP response from a PHP execution result, optionally gzip-compressing.
+/// Build an HTTP response from a PHP execution result, optionally compressing.
+///
+/// Prefers Brotli (`br`) over gzip when the client supports it.
 fn build_php_response(
     result: Result<Result<ephpm_php::response::PhpResponse, ephpm_php::PhpError>, tokio::task::JoinError>,
     accepts_gzip: bool,
+    accepts_br: bool,
     compression: CompressionSettings,
 ) -> Response<ServerBody> {
     match result {
@@ -1004,14 +1011,24 @@ fn build_php_response(
                 histogram!("ephpm_php_output_bytes").record(original_len as f64);
             }
 
-            let (body_bytes, compressed) = if accepts_gzip {
+            // Try Brotli first (better ratio), then fall back to gzip.
+            let (body_bytes, encoding) = if accepts_br {
+                brotli_compress(&php_response.body, ct, compression)
+                    .map_or_else(
+                        || (php_response.body, None),
+                        |c| (c, Some("br")),
+                    )
+            } else if accepts_gzip {
                 gzip_compress(&php_response.body, ct, compression)
-                    .map_or((php_response.body, false), |c| (c, true))
+                    .map_or_else(
+                        || (php_response.body, None),
+                        |c| (c, Some("gzip")),
+                    )
             } else {
-                (php_response.body, false)
+                (php_response.body, None)
             };
 
-            if compressed && original_len > 0 {
+            if encoding.is_some() && original_len > 0 {
                 #[allow(clippy::cast_precision_loss)]
                 histogram!("ephpm_http_compression_ratio")
                     .record(body_bytes.len() as f64 / original_len as f64);
@@ -1021,8 +1038,8 @@ fn build_php_response(
             for (name, value) in &php_response.headers {
                 resp = resp.header(name.as_str(), value.as_str());
             }
-            if compressed {
-                resp = resp.header("content-encoding", "gzip").header("vary", "Accept-Encoding");
+            if let Some(enc) = encoding {
+                resp = resp.header("content-encoding", enc).header("vary", "Accept-Encoding");
             }
             resp = resp.header("content-length", body_bytes.len());
 
@@ -1083,6 +1100,37 @@ pub fn gzip_compress(data: &[u8], content_type: &str, settings: CompressionSetti
     let mut encoder = GzEncoder::new(Vec::new(), level);
     encoder.write_all(data).ok()?;
     let compressed = encoder.finish().ok()?;
+    if compressed.len() < data.len() {
+        Some(compressed)
+    } else {
+        None
+    }
+}
+
+/// Try to Brotli-compress a body. Returns `None` if not worth compressing.
+///
+/// Brotli typically achieves 15-25% better compression than gzip on text
+/// content, making it the preferred choice when the client supports it.
+#[must_use]
+pub fn brotli_compress(data: &[u8], content_type: &str, settings: CompressionSettings) -> Option<Vec<u8>> {
+    if data.len() < settings.min_size || !is_compressible(content_type) {
+        return None;
+    }
+    // Map gzip level (1-9) to Brotli quality (0-11). Brotli 4-6 is a
+    // good balance of speed and ratio for on-the-fly compression.
+    let quality = settings.level.min(9);
+    let mut compressed = Vec::new();
+    {
+        let mut encoder = brotli::CompressorWriter::new(
+            &mut compressed,
+            4096, // buffer size
+            quality,
+            22, // lgwin (default window size)
+        );
+        encoder.write_all(data).ok()?;
+        // CompressorWriter flushes on drop, but we need to handle errors.
+        // Drop triggers the final flush.
+    }
     if compressed.len() < data.len() {
         Some(compressed)
     } else {
