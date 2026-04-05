@@ -1024,6 +1024,39 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
     let dockerfile = root.join("docker").join("Dockerfile");
     let dockerfile_e2e = root.join("docker").join("Dockerfile.e2e");
 
+    // Download pre-built PHP SDK tarball if not already present.
+    // Uses `gh release download` which authenticates via GITHUB_TOKEN env var.
+    let sdk_dir = root.join("php-sdk");
+    fs::create_dir_all(&sdk_dir).ok();
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    let tarball_name = format!("php-sdk-{php_version}-linux-{arch}.tar.gz");
+    let tarball_path = sdk_dir.join(&tarball_name);
+    if !tarball_path.exists() && has_command("gh") {
+        eprintln!("==> Downloading pre-built PHP SDK ({tarball_name})...");
+        let status = Command::new("gh")
+            .args([
+                "release",
+                "download",
+                php_version,
+                "--repo",
+                "ephpm/php-sdk",
+                "--pattern",
+                &tarball_name,
+                "--dir",
+            ])
+            .arg(&sdk_dir)
+            .status();
+        if ran_ok(&status) {
+            eprintln!("==> PHP SDK tarball ready");
+        } else {
+            eprintln!("warning: could not download pre-built SDK, will build from source");
+        }
+    }
+
     // docker uses "buildx build --load" (BuildKit, result written to local
     // daemon); podman uses plain "build" (already BuildKit-equivalent).
     let build_args: &[&str] = if ce == "docker" {

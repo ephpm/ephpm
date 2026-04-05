@@ -2,14 +2,17 @@
 #
 # Cache strategy:
 #   base:    System deps + Rust toolchain — changes rarely
-#   php-sdk: PHP SDK via spc — only rebuilds when PHP_VERSION or xtask changes
+#   php-sdk: Pre-built tarball from build context, or built from source via spc
 #   builder: Cargo manifest fetch (cached until Cargo.lock changes) → full source build
 #
-# Build:
+# Fast build (pre-built SDK, download it first):
+#   gh release download 8.5.2 -R ephpm/php-sdk -p 'php-sdk-*-linux-x86_64.tar.gz' -D php-sdk/
+#   podman build -f docker/Dockerfile --build-arg PHP_VERSION=8.5.2 -t ephpm:dev .
+#
+# Source build (no pre-built SDK, ~15 min longer):
 #   podman build -f docker/Dockerfile --build-arg PHP_VERSION=8.5 -t ephpm:dev .
 
-# Global ARG so it can be referenced in FROM lines (each stage re-declares it to use it)
-ARG PHP_VERSION=8.5
+ARG PHP_VERSION=8.5.2
 
 # ── Stage 1: base — system deps + Rust toolchain ─────────────────────────────
 
@@ -18,19 +21,6 @@ FROM ubuntu:24.04 AS base
 ENV DEBIAN_FRONTEND=noninteractive
 
 # System build tools for static-php-cli (spc) and musl cross-compilation.
-#
-# The standalone spc binary bundles its own PHP — no system PHP or Composer
-# is needed. `spc doctor --auto-fix` may install additional packages, so we
-# keep apt metadata around (no `rm -rf /var/lib/apt/lists/*`).
-#
-# Key packages:
-#   unzip           — required by spc for extracting downloads
-#   gettext         — provides `autopoint`, checked by spc doctor
-#   musl-tools      — provides musl-gcc cross-compiler
-#   musl-dev        — musl development files and static libraries
-#   gcc-multilib    — 32-bit support for cross-compilation
-#   libstdc++-12-dev — needed for C++ standard library (musl)
-#   libgcc-12-dev   — GCC runtime library (musl)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential ca-certificates curl git pkg-config sudo \
     autoconf automake bison cmake flex gettext libtool make re2c unzip \
@@ -52,7 +42,11 @@ ENV CC_x86_64_unknown_linux_musl=musl-gcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_CC=musl-gcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
 
-# ── Stage 2: php-sdk — rebuilt only when PHP_VERSION or xtask source changes ──
+# ── Stage 2: php-sdk — use pre-built tarball or build from source ────────────
+#
+# If php-sdk/*.tar.gz exists in the build context (downloaded by the workflow
+# or manually via `gh release download`), extract it. Otherwise build from
+# source via `cargo xtask php-sdk` (~15 min).
 
 FROM base AS php-sdk
 
@@ -60,9 +54,29 @@ ARG PHP_VERSION
 
 WORKDIR /src
 
-# Workspace manifest + lock + xtask source (the only things needed to run
-# `cargo xtask php-sdk`). Stub Cargo.toml files for every other workspace
-# member keep the resolver happy without pulling in real source.
+# Copy any pre-downloaded SDK tarballs from the build context.
+# The directory may be empty — that's fine, we check in the RUN step.
+COPY php-sdk/ /tmp/php-sdk-dl/
+
+# Layout that cargo xtask release expects:
+#   php-sdk/static-php-cli/buildroot/lib/libphp.a
+#   php-sdk/static-php-cli/buildroot/include/php/
+
+# Try to find a matching tarball; if none, fall through to source build.
+RUN ARCH=$(uname -m) && \
+    TARBALL=$(find /tmp/php-sdk-dl -name "php-sdk-*-linux-${ARCH}.tar.gz" 2>/dev/null | head -1) && \
+    if [ -n "${TARBALL}" ]; then \
+        echo "==> Extracting pre-built PHP SDK from ${TARBALL}..." && \
+        mkdir -p php-sdk/static-php-cli/buildroot && \
+        tar xzf "${TARBALL}" -C php-sdk/static-php-cli/buildroot && \
+        ls -lh php-sdk/static-php-cli/buildroot/lib/libphp.a && \
+        echo "==> PHP SDK ready (pre-built)"; \
+    else \
+        echo "==> No pre-built SDK tarball found, will build from source..."; \
+    fi && \
+    rm -rf /tmp/php-sdk-dl
+
+# Source build fallback — only runs if libphp.a doesn't exist yet.
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo/ .cargo/
 COPY xtask/ xtask/
@@ -73,20 +87,20 @@ COPY crates/ephpm-php/Cargo.toml      crates/ephpm-php/Cargo.toml
 COPY crates/ephpm-db/Cargo.toml       crates/ephpm-db/Cargo.toml
 COPY crates/ephpm-kv/Cargo.toml       crates/ephpm-kv/Cargo.toml
 
-# Minimal stub src so cargo can parse (but not compile) workspace members
-RUN mkdir -p \
-        crates/ephpm/src \
-        crates/ephpm-config/src \
-        crates/ephpm-server/src \
-        crates/ephpm-php/src \
-        crates/ephpm-db/src \
-        crates/ephpm-kv/src && \
-    printf 'fn main() {}\n' > crates/ephpm/src/main.rs && \
-    for d in ephpm-config ephpm-server ephpm-php ephpm-db ephpm-kv; do \
-        touch crates/$d/src/lib.rs; \
-    done
-
-RUN cargo xtask php-sdk ${PHP_VERSION}
+RUN if [ ! -f php-sdk/static-php-cli/buildroot/lib/libphp.a ]; then \
+        mkdir -p \
+            crates/ephpm/src \
+            crates/ephpm-config/src \
+            crates/ephpm-server/src \
+            crates/ephpm-php/src \
+            crates/ephpm-db/src \
+            crates/ephpm-kv/src && \
+        printf 'fn main() {}\n' > crates/ephpm/src/main.rs && \
+        for d in ephpm-config ephpm-server ephpm-php ephpm-db ephpm-kv; do \
+            touch crates/$d/src/lib.rs; \
+        done && \
+        cargo xtask php-sdk ${PHP_VERSION}; \
+    fi
 
 # ── Stage 3: builder — dep fetch layer then full source build ─────────────────
 

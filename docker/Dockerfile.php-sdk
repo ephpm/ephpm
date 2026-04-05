@@ -1,0 +1,74 @@
+# PHP SDK base image — pre-built libphp.a + headers for a given PHP version.
+#
+# Contains the complete PHP SDK (static libphp.a, headers, pkg-config files)
+# built via static-php-cli with ZTS enabled. Used as a cache layer so release
+# builds skip the ~15 min PHP compilation step.
+#
+# Build args:
+#   PHP_VERSION  — PHP version to build (e.g., 8.4, 8.5)
+#   SPC_VERSION  — static-php-cli release version
+#
+# Build:
+#   docker build -f docker/Dockerfile.php-sdk \
+#     --build-arg PHP_VERSION=8.5 \
+#     -t ghcr.io/ephpm/php-sdk:8.5-linux-x86_64 .
+#
+# The SDK output lives at /opt/php-sdk/ containing:
+#   lib/libphp.a        — static PHP library (ZTS, embed SAPI)
+#   include/php/        — all PHP/Zend/TSRM/SAPI headers
+#   lib/pkgconfig/      — pkg-config files
+
+ARG BASE_IMAGE=ubuntu:24.04
+
+FROM ${BASE_IMAGE} AS builder
+
+ARG PHP_VERSION=8.5
+ARG SPC_VERSION=2.8.3
+ARG PHP_EXTENSIONS="bcmath,calendar,ctype,curl,dom,exif,fileinfo,filter,gd,hash,iconv,mbstring,mysqli,mysqlnd,openssl,pcntl,pcre,pdo,pdo_mysql,phar,posix,session,simplexml,sodium,tokenizer,xml,xmlreader,xmlwriter,zip,zlib"
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# System build tools required by static-php-cli
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates curl git pkg-config sudo \
+    autoconf automake bison cmake flex gettext libtool make re2c unzip \
+    libclang-dev musl-tools musl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+
+# Download the standalone spc binary (self-contained, no system PHP needed)
+RUN ARCH=$(uname -m) && \
+    curl -fSL "https://github.com/crazywhalecc/static-php-cli/releases/download/${SPC_VERSION}/spc-linux-${ARCH}.tar.gz" \
+    | tar xz && \
+    chmod +x spc
+
+# Let spc check/fix build environment
+RUN ./spc doctor --auto-fix
+
+# Download PHP source + extension dependencies
+RUN ./spc download \
+    --with-php=${PHP_VERSION} \
+    --for-extensions=${PHP_EXTENSIONS} \
+    --prefer-pre-built
+
+# Ensure pkg-config is discoverable by spc
+RUN mkdir -p buildroot/bin && \
+    ln -sf /usr/bin/pkg-config buildroot/bin/pkg-config
+
+# Build libphp.a with ZTS (embed SAPI, no stripping for debug info)
+RUN ./spc build \
+    ${PHP_EXTENSIONS} \
+    --build-embed \
+    --no-strip \
+    --enable-zts
+
+# ── Output stage — just the SDK artifacts ────────────────────────────────────
+
+FROM scratch
+
+COPY --from=builder /build/buildroot/lib/          /opt/php-sdk/lib/
+COPY --from=builder /build/buildroot/include/php/  /opt/php-sdk/include/php/
+
+LABEL org.opencontainers.image.title="ephpm PHP SDK"
+LABEL org.opencontainers.image.description="Pre-built PHP SDK (libphp.a + headers) for ephpm release builds"

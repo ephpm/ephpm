@@ -1,8 +1,9 @@
 # Build artifacts
 target/
 
-# PHP SDK (built by cargo xtask via static-php-cli)
-/php-sdk/
+# PHP SDK (built by cargo xtask via static-php-cli, or downloaded tarballs)
+/php-sdk/*
+!/php-sdk/.gitkeep
 
 # sqld binary cache (downloaded by cargo xtask release)
 /sqld-cache/

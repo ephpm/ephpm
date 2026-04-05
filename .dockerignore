@@ -1,5 +1,7 @@
 target/
-php-sdk/
+# php-sdk/*.tar.gz are needed by Dockerfile for pre-built SDK
+php-sdk/static-php-cli/
+php-sdk/windows/
 .git/
 bin/
 docs/

@@ -1,0 +1,339 @@
+# Build and push PHP SDK base images for each supported platform/arch.
+#
+# These images contain a pre-built libphp.a + headers via static-php-cli,
+# so release builds can skip the ~15 min PHP compilation step.
+#
+# Trigger: manual dispatch with PHP version param, or on tag push.
+# Matrix: linux/amd64, linux/arm64, macOS x86_64, macOS arm64, Windows x86_64.
+
+name: PHP SDK Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      php_version:
+        description: "PHP version to build (e.g., 8.4, 8.5)"
+        required: true
+        default: "8.5"
+        type: string
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+  REGISTRY: ghcr.io
+  IMAGE_BASE: ghcr.io/${{ github.repository }}/php-sdk
+
+jobs:
+  # ── Linux container images (amd64 + arm64) ─────────────────────────────────
+
+  linux:
+    name: Linux (${{ matrix.arch }}, PHP ${{ matrix.php }})
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+        php:
+          - ${{ inputs.php_version || '8.5' }}
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+            platform: linux/amd64
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # - name: Log in to GHCR
+      #   uses: docker/login-action@v3
+      #   with:
+      #     registry: ${{ env.REGISTRY }}
+      #     username: ${{ github.actor }}
+      #     password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build PHP SDK image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.php-sdk
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            PHP_VERSION=${{ matrix.php }}
+          push: false  # Set to true once registry is configured
+          tags: |
+            ${{ env.IMAGE_BASE }}:${{ matrix.php }}-linux-${{ matrix.arch }}
+            ${{ env.IMAGE_BASE }}:${{ matrix.php }}-linux-${{ matrix.arch }}-${{ github.sha }}
+          cache-from: type=gha,scope=php-sdk-${{ matrix.php }}-linux-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=php-sdk-${{ matrix.php }}-linux-${{ matrix.arch }}
+          load: true
+
+      - name: Verify SDK contents
+        run: |
+          docker create --name sdk-check ${{ env.IMAGE_BASE }}:${{ matrix.php }}-linux-${{ matrix.arch }}
+          docker cp sdk-check:/opt/php-sdk /tmp/php-sdk
+          docker rm sdk-check
+
+          echo "==> Checking libphp.a..."
+          test -f /tmp/php-sdk/lib/libphp.a || { echo "::error::libphp.a not found"; exit 1; }
+          ls -lh /tmp/php-sdk/lib/libphp.a
+
+          echo "==> Checking headers..."
+          test -d /tmp/php-sdk/include/php/main || { echo "::error::PHP headers not found"; exit 1; }
+          ls /tmp/php-sdk/include/php/
+
+          echo "==> Checking ZTS..."
+          grep -r "ZTS" /tmp/php-sdk/include/php/main/php_config.h | head -5 || true
+
+      - name: Export SDK tarball
+        run: |
+          docker create --name sdk-export ${{ env.IMAGE_BASE }}:${{ matrix.php }}-linux-${{ matrix.arch }}
+          docker cp sdk-export:/opt/php-sdk - | gzip > php-sdk-${{ matrix.php }}-linux-${{ matrix.arch }}.tar.gz
+          docker rm sdk-export
+          ls -lh php-sdk-${{ matrix.php }}-linux-${{ matrix.arch }}.tar.gz
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-sdk-${{ matrix.php }}-linux-${{ matrix.arch }}
+          path: php-sdk-${{ matrix.php }}-linux-${{ matrix.arch }}.tar.gz
+
+  # ── macOS native builds (no container — spc runs natively) ─────────────────
+
+  macos:
+    name: macOS (${{ matrix.arch }}, PHP ${{ matrix.php }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, x86_64]
+        php:
+          - ${{ inputs.php_version || '8.5' }}
+        include:
+          - arch: arm64
+            runner: macos-latest      # Apple Silicon
+            spc_arch: aarch64
+          - arch: x86_64
+            runner: macos-13          # Intel
+            spc_arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          brew install autoconf automake bison cmake flex libtool \
+            make pkg-config re2c
+
+      - name: Build PHP SDK via spc
+        env:
+          SPC_VERSION: "2.8.3"
+          PHP_EXTENSIONS: "bcmath,calendar,ctype,curl,dom,exif,fileinfo,filter,gd,hash,iconv,mbstring,mysqli,mysqlnd,openssl,pcntl,pcre,pdo,pdo_mysql,phar,posix,session,simplexml,sodium,tokenizer,xml,xmlreader,xmlwriter,zip,zlib"
+        run: |
+          mkdir -p spc-build && cd spc-build
+
+          echo "==> Downloading spc v${SPC_VERSION}..."
+          curl -fSL "https://github.com/crazywhalecc/static-php-cli/releases/download/${SPC_VERSION}/spc-macos-${{ matrix.spc_arch }}.tar.gz" \
+            | tar xz
+          chmod +x spc
+
+          echo "==> Running spc doctor..."
+          ./spc doctor --auto-fix || true
+
+          echo "==> Downloading PHP ${{ matrix.php }} sources..."
+          ./spc download \
+            --with-php=${{ matrix.php }} \
+            --for-extensions=${PHP_EXTENSIONS} \
+            --prefer-pre-built
+
+          mkdir -p buildroot/bin
+          ln -sf "$(which pkg-config)" buildroot/bin/pkg-config
+
+          echo "==> Building libphp.a with ZTS..."
+          ./spc build \
+            ${PHP_EXTENSIONS} \
+            --build-embed \
+            --no-strip \
+            --enable-zts
+
+      - name: Verify SDK contents
+        run: |
+          SDK=spc-build/buildroot
+          echo "==> Checking libphp.a..."
+          test -f ${SDK}/lib/libphp.a || { echo "::error::libphp.a not found"; exit 1; }
+          ls -lh ${SDK}/lib/libphp.a
+          file ${SDK}/lib/libphp.a
+
+          echo "==> Checking headers..."
+          test -d ${SDK}/include/php/main || { echo "::error::PHP headers not found"; exit 1; }
+
+      - name: Package SDK tarball
+        run: |
+          tar czf php-sdk-${{ matrix.php }}-macos-${{ matrix.arch }}.tar.gz \
+            -C spc-build/buildroot \
+            lib/libphp.a \
+            include/php/
+          ls -lh php-sdk-${{ matrix.php }}-macos-${{ matrix.arch }}.tar.gz
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-sdk-${{ matrix.php }}-macos-${{ matrix.arch }}
+          path: php-sdk-${{ matrix.php }}-macos-${{ matrix.arch }}.tar.gz
+
+  # ── Windows SDK (pre-built from windows.php.net) ───────────────────────────
+  #
+  # Windows uses the official PHP SDK (headers + php8embed.lib + php8embed.dll)
+  # from windows.php.net, NOT static-php-cli. This is NTS (ZTS=0) because
+  # the PHP Windows DLL is not built with thread safety.
+
+  windows:
+    name: Windows (x86_64, PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php:
+          - ${{ inputs.php_version || '8.5' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download PHP Windows SDK
+        run: |
+          PHP_VERSION="${{ matrix.php }}"
+          BASE_URL="https://windows.php.net/downloads/releases/latest"
+          QA_URL="https://windows.php.net/downloads/qa"
+
+          mkdir -p php-sdk-win/lib php-sdk-win/include/php _tmp
+
+          # 1. Download NTS package (contains php8embed.dll)
+          NTS_ZIP="php-${PHP_VERSION}-nts-Win32-vs17-x64-latest.zip"
+          echo "==> Downloading NTS package (for php8embed.dll)..."
+          if ! curl -fSL -o _tmp/nts.zip "${BASE_URL}/${NTS_ZIP}" 2>/dev/null; then
+            echo "==> Trying QA builds..."
+            curl -fSL -o _tmp/nts.zip "${QA_URL}/${NTS_ZIP}" || {
+              echo "::error::Could not download NTS package for PHP ${PHP_VERSION}"
+              exit 1
+            }
+          fi
+          unzip -q _tmp/nts.zip -d _tmp/nts
+
+          # Find and copy php8embed.dll
+          DLL=$(find _tmp/nts -name "php8embed.dll" | head -1)
+          if [ -z "${DLL}" ]; then
+            echo "::error::php8embed.dll not found in NTS package"
+            exit 1
+          fi
+          cp "${DLL}" php-sdk-win/lib/
+          echo "==> Found php8embed.dll ($(stat -c%s "${DLL}" | numfmt --to=iec))"
+
+          # 2. Download devel pack (contains php8embed.lib + headers)
+          DEVEL_ZIP="php-devel-pack-${PHP_VERSION}-nts-Win32-vs17-x64-latest.zip"
+          echo "==> Downloading devel pack (for headers + import lib)..."
+          if ! curl -fSL -o _tmp/devel.zip "${BASE_URL}/${DEVEL_ZIP}" 2>/dev/null; then
+            echo "==> Trying QA builds..."
+            curl -fSL -o _tmp/devel.zip "${QA_URL}/${DEVEL_ZIP}" || {
+              echo "::error::Could not download devel pack for PHP ${PHP_VERSION}"
+              exit 1
+            }
+          fi
+          unzip -q _tmp/devel.zip -d _tmp/devel
+
+          # Find and copy php8embed.lib
+          LIB=$(find _tmp/devel -name "php8embed.lib" | head -1)
+          if [ -z "${LIB}" ]; then
+            echo "::error::php8embed.lib not found in devel pack"
+            exit 1
+          fi
+          cp "${LIB}" php-sdk-win/lib/
+          echo "==> Found php8embed.lib"
+
+          # Copy headers (main, Zend, TSRM, sapi, ext)
+          INCLUDE_DIR=$(find _tmp/devel -type d -name "include" | head -1)
+          for subdir in main Zend TSRM sapi ext; do
+            if [ -d "${INCLUDE_DIR}/${subdir}" ]; then
+              cp -r "${INCLUDE_DIR}/${subdir}" php-sdk-win/include/php/
+            fi
+          done
+
+          rm -rf _tmp
+
+      - name: Verify SDK contents
+        run: |
+          echo "==> Checking lib..."
+          ls -la php-sdk-win/lib/
+          test -f php-sdk-win/lib/php8embed.dll || { echo "::error::php8embed.dll missing"; exit 1; }
+          test -f php-sdk-win/lib/php8embed.lib || { echo "::error::php8embed.lib missing"; exit 1; }
+          echo "==> Checking headers..."
+          ls php-sdk-win/include/php/
+
+      - name: Package SDK tarball
+        run: |
+          tar czf php-sdk-${{ matrix.php }}-windows-x86_64.tar.gz \
+            -C php-sdk-win \
+            .
+          ls -lh php-sdk-${{ matrix.php }}-windows-x86_64.tar.gz
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: php-sdk-${{ matrix.php }}-windows-x86_64
+          path: php-sdk-${{ matrix.php }}-windows-x86_64.tar.gz
+
+  # ── Attach SDK tarballs to GitHub Release ──────────────────────────────────
+
+  release:
+    name: Upload to Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: php-sdk-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.tar.gz
+
+  # ── Multi-arch manifest (Linux only — macOS/Windows are tarballs) ──────────
+  #
+  # Creates a multi-arch manifest so `docker pull php-sdk:8.5-linux` resolves
+  # to the correct arch automatically.
+
+  # manifest:
+  #   name: Create multi-arch manifest (PHP ${{ needs.linux.strategy.matrix.php }})
+  #   needs: [linux]
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     packages: write
+  #   steps:
+  #     - name: Log in to GHCR
+  #       uses: docker/login-action@v3
+  #       with:
+  #         registry: ghcr.io
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
+  #
+  #     - name: Create and push manifest
+  #       env:
+  #         PHP: ${{ inputs.php_version || '8.5' }}
+  #       run: |
+  #         docker manifest create ${{ env.IMAGE_BASE }}:${PHP}-linux \
+  #           ${{ env.IMAGE_BASE }}:${PHP}-linux-amd64 \
+  #           ${{ env.IMAGE_BASE }}:${PHP}-linux-arm64
+  #         docker manifest push ${{ env.IMAGE_BASE }}:${PHP}-linux
