@@ -38,11 +38,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        # macOS disabled until self-hosted runner is available
-        os: [ubuntu-latest]
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
       - name: Checkout litewire (path dependency)
