@@ -28,6 +28,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout litewire (path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: ephpm/litewire
+          path: ../litewire
+          token: ${{ secrets.PHP_SDK_TOKEN }}
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install E2E tools (kind, tilt, kubectl)
