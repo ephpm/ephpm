@@ -36,15 +36,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [amd64, arm64]
+        arch: [amd64]
         php:
           - ${{ inputs.php_version || '8.5' }}
         include:
           - arch: amd64
-            runner: ubuntu-latest
+            runner: [self-hosted, linux, x64]
             platform: linux/amd64
-          - arch: arm64
-            runner: ubuntu-24.04-arm
+          # arm64 disabled until self-hosted runner is available
+          # - arch: arm64
+          #   runner: ubuntu-24.04-arm
             platform: linux/arm64
     steps:
       - uses: actions/checkout@v4
@@ -196,7 +197,7 @@ jobs:
 
   windows:
     name: Windows (x86_64, PHP ${{ matrix.php }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     strategy:
       fail-fast: false
       matrix:
@@ -293,7 +294,7 @@ jobs:
     name: Upload to Release
     if: startsWith(github.ref, 'refs/tags/')
     needs: [linux, windows]  # Add macos back when runner is available
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     permissions:
       contents: write
     steps:
