@@ -95,15 +95,13 @@ async fn handle_connection(mut stream: TcpStream, store: &Store) -> anyhow::Resu
     // Read key bytes.
     let mut key_buf = vec![0u8; key_len as usize];
     stream.read_exact(&mut key_buf).await?;
-    let key = String::from_utf8(key_buf)
-        .map_err(|_| anyhow::anyhow!("invalid UTF-8 key"))?;
+    let key = String::from_utf8(key_buf).map_err(|_| anyhow::anyhow!("invalid UTF-8 key"))?;
 
     match op {
         OP_GET => {
             // Look up in local store and write response.
             if let Some(value) = store.get(&key) {
-                let len = u32::try_from(value.len())
-                    .unwrap_or(NOT_FOUND_SENTINEL - 1);
+                let len = u32::try_from(value.len()).unwrap_or(NOT_FOUND_SENTINEL - 1);
                 stream.write_u32(len).await?;
                 stream.write_all(&value).await?;
             } else {
@@ -145,8 +143,7 @@ pub async fn fetch_remote(addr: SocketAddr, key: &str) -> anyhow::Result<Option<
     // Send GET op + key.
     stream.write_u8(OP_GET).await?;
     let key_bytes = key.as_bytes();
-    let key_len = u32::try_from(key_bytes.len())
-        .map_err(|_| anyhow::anyhow!("key too long"))?;
+    let key_len = u32::try_from(key_bytes.len()).map_err(|_| anyhow::anyhow!("key too long"))?;
     stream.write_u32(key_len).await?;
     stream.write_all(key_bytes).await?;
     stream.flush().await?;
@@ -177,8 +174,7 @@ pub async fn store_remote(addr: SocketAddr, key: &str, value: &[u8]) -> anyhow::
     // Send SET op + key + value.
     stream.write_u8(OP_SET).await?;
     let key_bytes = key.as_bytes();
-    let key_len = u32::try_from(key_bytes.len())
-        .map_err(|_| anyhow::anyhow!("key too long"))?;
+    let key_len = u32::try_from(key_bytes.len()).map_err(|_| anyhow::anyhow!("key too long"))?;
     stream.write_u32(key_len).await?;
     stream.write_all(key_bytes).await?;
     let value_len = u32::try_from(value.len())
@@ -286,9 +282,7 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0..10 {
             let key = format!("k{i}");
-            handles.push(tokio::spawn(async move {
-                fetch_remote(addr, &key).await
-            }));
+            handles.push(tokio::spawn(async move { fetch_remote(addr, &key).await }));
         }
 
         for (i, handle) in handles.into_iter().enumerate() {

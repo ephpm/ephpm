@@ -78,10 +78,7 @@ async fn pool_timeout_when_exhausted() {
 
     assert!(result.is_err(), "second acquire should fail");
     let err = result.err().unwrap();
-    assert!(
-        matches!(err, DbError::PoolTimeout { .. }),
-        "error should be PoolTimeout, got: {err}"
-    );
+    assert!(matches!(err, DbError::PoolTimeout { .. }), "error should be PoolTimeout, got: {err}");
     assert!(elapsed >= Duration::from_millis(150), "should have waited near pool_timeout");
 
     drop(checkout);
@@ -134,8 +131,5 @@ async fn close_rejects_new_acquires() {
     let result = pool.acquire().await;
     assert!(result.is_err(), "acquire after close should fail");
     let err = result.err().unwrap();
-    assert!(
-        matches!(err, DbError::PoolClosed),
-        "error should be PoolClosed, got: {err}"
-    );
+    assert!(matches!(err, DbError::PoolClosed), "error should be PoolClosed, got: {err}");
 }

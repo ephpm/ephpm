@@ -389,10 +389,7 @@ pub struct MetricsConfig {
 
 impl Default for MetricsConfig {
     fn default() -> Self {
-        Self {
-            enabled: false,
-            path: default_metrics_path(),
-        }
+        Self { enabled: false, path: default_metrics_path() }
     }
 }
 
@@ -732,10 +729,7 @@ pub struct SqldConfig {
 
 impl Default for SqldConfig {
     fn default() -> Self {
-        Self {
-            http_listen: default_sqld_http_listen(),
-            grpc_listen: default_sqld_grpc_listen(),
-        }
+        Self { http_listen: default_sqld_http_listen(), grpc_listen: default_sqld_grpc_listen() }
     }
 }
 
@@ -761,10 +755,7 @@ pub struct ReplicationConfig {
 
 impl Default for ReplicationConfig {
     fn default() -> Self {
-        Self {
-            role: default_replication_role(),
-            primary_grpc_url: String::new(),
-        }
+        Self { role: default_replication_role(), primary_grpc_url: String::new() }
     }
 }
 
@@ -1085,12 +1076,7 @@ pub struct KvRedisCompatConfig {
 
 impl Default for KvRedisCompatConfig {
     fn default() -> Self {
-        Self {
-            enabled: false,
-            listen: default_kv_listen(),
-            socket: None,
-            password: None,
-        }
+        Self { enabled: false, listen: default_kv_listen(), socket: None, password: None }
     }
 }
 
@@ -1159,8 +1145,10 @@ impl Config {
     ///
     /// Returns `ConfigError::Load` if environment variables contain invalid values.
     pub fn default_config() -> Result<Self, ConfigError> {
-        let config =
-            Figment::new().merge(Env::prefixed("EPHPM_").split("__")).extract().map_err(Box::new)?;
+        let config = Figment::new()
+            .merge(Env::prefixed("EPHPM_").split("__"))
+            .extract()
+            .map_err(Box::new)?;
         Ok(config)
     }
 }
@@ -1230,13 +1218,9 @@ impl Default for StaticConfig {
     }
 }
 
-
 impl Default for LoggingConfig {
     fn default() -> Self {
-        Self {
-            access: String::new(),
-            level: default_log_level(),
-        }
+        Self { access: String::new(), level: default_log_level() }
     }
 }
 
@@ -1442,11 +1426,7 @@ fn default_index_files() -> Vec<String> {
 }
 
 fn default_fallback() -> Vec<String> {
-    vec![
-        "$uri".to_string(),
-        "$uri/".to_string(),
-        "/index.php?$query_string".to_string(),
-    ]
+    vec!["$uri".to_string(), "$uri/".to_string(), "/index.php?$query_string".to_string()]
 }
 
 fn default_max_body_size() -> u64 {
@@ -1722,10 +1702,7 @@ ini_overrides = [
         let config = Config::load(&file).unwrap();
         assert_eq!(config.php.ini_overrides.len(), 2);
         assert_eq!(config.php.ini_overrides[0], ["display_errors", "Off"]);
-        assert_eq!(
-            config.php.ini_overrides[1],
-            ["error_reporting", "E_ALL"]
-        );
+        assert_eq!(config.php.ini_overrides[1], ["error_reporting", "E_ALL"]);
     }
 
     #[test]
@@ -1989,10 +1966,7 @@ primary_grpc_url = "http://10.0.1.2:5001"
         assert_eq!(sqlite.sqld.http_listen, "127.0.0.1:9081");
         assert_eq!(sqlite.sqld.grpc_listen, "0.0.0.0:6001");
         assert_eq!(sqlite.replication.role, "replica");
-        assert_eq!(
-            sqlite.replication.primary_grpc_url,
-            "http://10.0.1.2:5001"
-        );
+        assert_eq!(sqlite.replication.primary_grpc_url, "http://10.0.1.2:5001");
     }
 
     #[test]
@@ -2014,14 +1988,10 @@ path = "test.db"
         )
         .unwrap();
 
-        temp_env::with_var(
-            "EPHPM_DB__SQLITE__REPLICATION__ROLE",
-            Some("primary"),
-            || {
-                let config = Config::load(&file).unwrap();
-                let sqlite = config.db.sqlite.expect("sqlite should be present");
-                assert_eq!(sqlite.replication.role, "primary");
-            },
-        );
+        temp_env::with_var("EPHPM_DB__SQLITE__REPLICATION__ROLE", Some("primary"), || {
+            let config = Config::load(&file).unwrap();
+            let sqlite = config.db.sqlite.expect("sqlite should be present");
+            assert_eq!(sqlite.replication.role, "primary");
+        });
     }
 }

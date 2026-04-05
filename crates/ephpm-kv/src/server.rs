@@ -15,11 +15,10 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{debug, error, info, trace};
 
-use crate::auth;
-use crate::command;
 use crate::multi_tenant::MultiTenantStore;
 use crate::resp::{self, Frame};
 use crate::store::Store;
+use crate::{auth, command};
 
 /// Configuration for the KV TCP server.
 #[derive(Debug, Clone)]
@@ -230,21 +229,15 @@ fn handle_auth(
             (Some(hostname), Some(password)) => {
                 if auth::validate_site_password(secret_val, &hostname, &password) {
                     let store = mt.get_site_store(&hostname);
-                    (
-                        Frame::ok(),
-                        true,
-                        Some(HmacAuthResult { store }),
-                    )
+                    (Frame::ok(), true, Some(HmacAuthResult { store }))
                 } else {
                     (Frame::error("ERR invalid password"), false, None)
                 }
             }
             // Missing hostname or password argument.
-            (Some(_), None) | (None, _) => (
-                Frame::error("ERR wrong number of arguments for 'auth' command"),
-                false,
-                None,
-            ),
+            (Some(_), None) | (None, _) => {
+                (Frame::error("ERR wrong number of arguments for 'auth' command"), false, None)
+            }
         }
     } else {
         // Legacy single-password mode.
@@ -257,11 +250,9 @@ fn handle_auth(
             // Password configured but client provided wrong one.
             (Some(_), Some(_)) => (Frame::error("ERR invalid password"), false, None),
             // Password configured but client sent AUTH with no argument.
-            (Some(_), None) => (
-                Frame::error("ERR wrong number of arguments for 'auth' command"),
-                false,
-                None,
-            ),
+            (Some(_), None) => {
+                (Frame::error("ERR wrong number of arguments for 'auth' command"), false, None)
+            }
             // No password configured — AUTH is a no-op, always succeeds.
             (None, _) => (Frame::ok(), true, None),
         }
@@ -373,16 +364,13 @@ async fn handle_connection(
 /// Wait for Ctrl-C / SIGTERM.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
     };
 
     #[cfg(unix)]
     {
-        let mut sigterm =
-            signal::unix::signal(signal::unix::SignalKind::terminate())
-                .expect("failed to install SIGTERM handler");
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
         tokio::select! {
             () = ctrl_c => {}
             _ = sigterm.recv() => {}

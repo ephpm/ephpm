@@ -49,9 +49,9 @@ pub async fn serve_file(
     // (large files without inlined content) so we fall through to streaming.
     if let Some(cache) = file_cache {
         if let Some(entry) = cache.lookup(&canonical_file).await {
-            if let Some(resp) = serve_cached_entry(
-                entry, accepts_gzip, cache_control, if_none_match,
-            ) {
+            if let Some(resp) =
+                serve_cached_entry(entry, accepts_gzip, cache_control, if_none_match)
+            {
                 return resp;
             }
         }
@@ -70,14 +70,8 @@ pub async fn serve_file(
     const STREAM_THRESHOLD: u64 = 1_048_576;
 
     if metadata.len() > STREAM_THRESHOLD {
-        return serve_streamed(
-            &canonical_file,
-            &metadata,
-            mime,
-            cache_control,
-            if_none_match,
-        )
-        .await;
+        return serve_streamed(&canonical_file, &metadata, mime, cache_control, if_none_match)
+            .await;
     }
 
     let Ok(content) = tokio::fs::read(&canonical_file).await else {
@@ -89,9 +83,9 @@ pub async fn serve_file(
     if let Some(cache) = file_cache {
         if let Ok(mtime) = metadata.modified() {
             let entry = cache.insert(&canonical_file, &content, mtime, mime, compression);
-            if let Some(resp) = serve_cached_entry(
-                entry, accepts_gzip, cache_control, if_none_match,
-            ) {
+            if let Some(resp) =
+                serve_cached_entry(entry, accepts_gzip, cache_control, if_none_match)
+            {
                 return resp;
             }
         }
@@ -257,10 +251,8 @@ async fn serve_streamed(
 
     // Compute metadata-based ETag.
     let etag_value = modified_time.map(|mt| {
-        let secs = mt
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let secs =
+            mt.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
         format!("W/\"{secs:x}-{size:x}\"")
     });
 
@@ -292,9 +284,7 @@ async fn serve_streamed(
     if let Some(ref tag) = etag_value {
         builder = builder.header("ETag", tag.as_str());
     }
-    builder
-        .body(body::streamed(file))
-        .unwrap_or_else(|_| internal_error())
+    builder.body(body::streamed(file)).unwrap_or_else(|_| internal_error())
 }
 
 /// Compute a weak `ETag` from file content using a fast hash.
@@ -348,11 +338,7 @@ mod tests {
 
     /// Default compression settings (disabled) for tests.
     fn no_compression() -> crate::router::CompressionSettings {
-        crate::router::CompressionSettings {
-            enabled: false,
-            level: 6,
-            min_size: 1024,
-        }
+        crate::router::CompressionSettings { enabled: false, level: 6, min_size: 1024 }
     }
 
     /// Collect a response body into a `Vec<u8>`.
@@ -363,18 +349,7 @@ mod tests {
     /// Helper: serve a file using `serve_file` with default settings.
     async fn serve_test(docroot: &Path, filename: &str) -> Response<ServerBody> {
         let file_path = docroot.join(filename);
-        serve_file(
-            docroot,
-            &file_path,
-            false,
-            false,
-            "",
-            no_compression(),
-            false,
-            None,
-            None,
-        )
-        .await
+        serve_file(docroot, &file_path, false, false, "", no_compression(), false, None, None).await
     }
 
     #[tokio::test]
@@ -406,10 +381,7 @@ mod tests {
 
         let resp = serve_test(dir.path(), "test.txt").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()["content-length"],
-            content.len().to_string().as_str()
-        );
+        assert_eq!(resp.headers()["content-length"], content.len().to_string().as_str());
     }
 
     #[tokio::test]
@@ -419,10 +391,7 @@ mod tests {
 
         let resp = serve_test(dir.path(), "data.ephpmtest").await;
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(
-            resp.headers()["content-type"],
-            "application/octet-stream"
-        );
+        assert_eq!(resp.headers()["content-type"], "application/octet-stream");
     }
 
     #[tokio::test]
@@ -442,18 +411,9 @@ mod tests {
         fs::write(parent.path().join("secret.txt"), "secret").unwrap();
 
         let file_path = docroot.join("..").join("secret.txt");
-        let resp = serve_file(
-            &docroot,
-            &file_path,
-            false,
-            false,
-            "",
-            no_compression(),
-            false,
-            None,
-            None,
-        )
-        .await;
+        let resp =
+            serve_file(&docroot, &file_path, false, false, "", no_compression(), false, None, None)
+                .await;
         // Should be 403 (path resolves outside docroot) or 404 (canonicalize fails)
         let status = resp.status();
         assert!(
@@ -469,10 +429,7 @@ mod tests {
         let resp = serve_test(dir.path(), "app.js").await;
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp.headers()["content-type"].to_str().unwrap();
-        assert!(
-            ct.contains("javascript"),
-            "expected javascript content-type, got {ct}"
-        );
+        assert!(ct.contains("javascript"), "expected javascript content-type, got {ct}");
     }
 
     #[tokio::test]

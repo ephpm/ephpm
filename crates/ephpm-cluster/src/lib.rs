@@ -21,5 +21,5 @@ pub mod sqlite_election;
 
 pub use clustered_store::ClusteredStore;
 pub use kv_data_plane as data_plane;
-pub use node::{start_gossip, ClusterHandle, NodeInfo, NodeState};
+pub use node::{ClusterHandle, NodeInfo, NodeState, start_gossip};
 pub use sqlite_election::{ElectedRole, SqliteElection};

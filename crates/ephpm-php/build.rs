@@ -71,8 +71,8 @@ fn link_php(lib_dir: &Path, target_os: &str) {
     // Link additional static libraries from the SDK that static-php-cli
     // built. We probe for each library since the set varies by config.
     for static_lib in &[
-        "ssl", "crypto", "curl", "z", "xml2", "sodium", "iconv", "charset",
-        "png16", "gd", "jpeg", "freetype", "onig", "zip", "bz2", "xslt", "exslt",
+        "ssl", "crypto", "curl", "z", "xml2", "sodium", "iconv", "charset", "png16", "gd", "jpeg",
+        "freetype", "onig", "zip", "bz2", "xslt", "exslt",
     ] {
         // Unix uses libfoo.a, Windows uses foo.lib
         let found = lib_dir.join(format!("lib{static_lib}.a")).exists()
@@ -219,15 +219,13 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
     let include_tsrm = include_dir.join("TSRM");
     let include_sapi = include_dir.join("sapi");
 
-    let mut builder = bindgen::Builder::default()
-        .header("wrapper.h")
-        .clang_args([
-            format!("-I{}", include_dir.display()),
-            format!("-I{}", include_main.display()),
-            format!("-I{}", include_zend.display()),
-            format!("-I{}", include_tsrm.display()),
-            format!("-I{}", include_sapi.display()),
-        ]);
+    let mut builder = bindgen::Builder::default().header("wrapper.h").clang_args([
+        format!("-I{}", include_dir.display()),
+        format!("-I{}", include_main.display()),
+        format!("-I{}", include_zend.display()),
+        format!("-I{}", include_tsrm.display()),
+        format!("-I{}", include_sapi.display()),
+    ]);
 
     // When targeting musl, libclang defaults to glibc headers in /usr/include/
     // which then fail to find stddef.h. We need to:
@@ -236,9 +234,7 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
     //  3. Add clang's internal headers for stddef.h, stdarg.h, etc.
     //  4. Define _GNU_SOURCE for memrchr/mempcpy declarations
     if target_env == "musl" {
-        builder = builder
-            .clang_arg("-D_GNU_SOURCE")
-            .clang_arg("-nostdlibinc");
+        builder = builder.clang_arg("-D_GNU_SOURCE").clang_arg("-nostdlibinc");
 
         // Add clang's resource directory (contains stddef.h, stdarg.h, etc.)
         if let Some(clang_include) = find_clang_resource_include() {
@@ -259,9 +255,7 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
         builder = builder.clang_arg("--target=x86_64-pc-windows-msvc");
     } else {
         // ZTS builds: define ZTS for bindgen so PHP headers use thread-safe macros.
-        builder = builder
-            .clang_arg("-DZTS=1")
-            .clang_arg("-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
+        builder = builder.clang_arg("-DZTS=1").clang_arg("-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
     }
 
     let bindings = builder
@@ -304,9 +298,7 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
         .expect("failed to generate PHP bindings");
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out_path.join("php_bindings.rs"))
-        .expect("failed to write PHP bindings");
+    bindings.write_to_file(out_path.join("php_bindings.rs")).expect("failed to write PHP bindings");
 }
 
 /// Find clang's resource directory containing compiler-internal headers

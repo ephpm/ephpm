@@ -81,9 +81,7 @@ mod tests {
         let cert = dir.join("cert.pem");
         let key = dir.join("key.pem");
         let status = std::process::Command::new("openssl")
-            .args([
-                "req", "-x509", "-newkey", "rsa:2048", "-keyout",
-            ])
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-keyout"])
             .arg(&key)
             .args(["-out"])
             .arg(&cert)
@@ -100,7 +98,12 @@ mod tests {
         let key = dir.join("ec-key.pem");
         let status = std::process::Command::new("openssl")
             .args([
-                "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
                 "-keyout",
             ])
             .arg(&key)
@@ -160,12 +163,12 @@ mod tests {
         let cert = dir.path().join("bad-cert.pem");
         let (_, key) = generate_rsa_cert(dir.path());
         std::fs::write(&cert, "not a real PEM certificate").unwrap();
-        let err = build_tls_acceptor(&cert, &key)
-            .err()
-            .expect("should fail with invalid cert");
+        let err = build_tls_acceptor(&cert, &key).err().expect("should fail with invalid cert");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("invalid TLS") || msg.contains("no private key") || msg.contains("certificate"),
+            msg.contains("invalid TLS")
+                || msg.contains("no private key")
+                || msg.contains("certificate"),
             "unexpected error: {msg}"
         );
     }
@@ -177,9 +180,7 @@ mod tests {
         let (cert, _) = generate_rsa_cert(dir.path());
         let key = dir.path().join("bad-key.pem");
         std::fs::write(&key, "not a real PEM key").unwrap();
-        let err = build_tls_acceptor(&cert, &key)
-            .err()
-            .expect("should fail with invalid key");
+        let err = build_tls_acceptor(&cert, &key).err().expect("should fail with invalid key");
         let msg = format!("{err:#}");
         assert!(msg.contains("no private key"), "unexpected error: {msg}");
     }

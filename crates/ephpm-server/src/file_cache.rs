@@ -182,10 +182,7 @@ impl FileCache {
 /// Format: `W/"{mtime_secs:x}-{size:x}"`. This avoids reading file
 /// content for ETag generation — a significant win for large files.
 fn compute_mtime_etag(mtime: SystemTime, size: u64) -> String {
-    let secs = mtime
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let secs = mtime.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs();
     format!("W/\"{secs:x}-{size:x}\"")
 }
 
@@ -205,11 +202,7 @@ mod tests {
     }
 
     fn test_compression() -> CompressionSettings {
-        CompressionSettings {
-            enabled: true,
-            level: 1,
-            min_size: 1024,
-        }
+        CompressionSettings { enabled: true, level: 1, min_size: 1024 }
     }
 
     #[test]
@@ -254,7 +247,8 @@ mod tests {
         let content = vec![0u8; 2048];
         let mtime = SystemTime::now();
 
-        let entry = cache.insert(&path, &content, mtime, "application/octet-stream", test_compression());
+        let entry =
+            cache.insert(&path, &content, mtime, "application/octet-stream", test_compression());
         assert!(entry.content.is_none(), "files above inline_threshold should not cache content");
         assert_eq!(entry.size, 2048);
     }

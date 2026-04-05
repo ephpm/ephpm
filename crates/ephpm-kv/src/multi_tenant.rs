@@ -32,11 +32,7 @@ impl MultiTenantStore {
     /// `site_config` is the template for creating per-site stores.
     #[must_use]
     pub fn new(default_store: Arc<Store>, site_config: StoreConfig) -> Self {
-        Self {
-            sites: Arc::new(DashMap::new()),
-            site_config,
-            default_store,
-        }
+        Self { sites: Arc::new(DashMap::new()), site_config, default_store }
     }
 
     /// Get or create a store for the given hostname.

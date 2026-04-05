@@ -226,10 +226,7 @@ mod tests {
         let req = make_request();
         let vars = req.server_variables();
 
-        assert_eq!(
-            find_var(&vars, "HTTP_ACCEPT_ENCODING"),
-            Some("gzip, deflate")
-        );
+        assert_eq!(find_var(&vars, "HTTP_ACCEPT_ENCODING"), Some("gzip, deflate"));
     }
 
     #[test]
@@ -245,8 +242,7 @@ mod tests {
     #[test]
     fn test_server_variables_content_type_no_http_prefix() {
         let mut req = make_request();
-        req.headers
-            .push(("content-type".into(), "application/json".into()));
+        req.headers.push(("content-type".into(), "application/json".into()));
         let vars = req.server_variables();
 
         assert_eq!(find_var(&vars, "CONTENT_TYPE"), Some("application/json"));
@@ -284,8 +280,7 @@ mod tests {
     #[test]
     fn test_cookie_string_found() {
         let mut req = make_request();
-        req.headers
-            .push(("Cookie".into(), "session=abc123".into()));
+        req.headers.push(("Cookie".into(), "session=abc123".into()));
         assert_eq!(req.cookie_string(), "session=abc123");
     }
 
@@ -298,8 +293,7 @@ mod tests {
     #[test]
     fn test_cookie_string_case_insensitive() {
         let mut req = make_request();
-        req.headers
-            .push(("COOKIE".into(), "token=xyz".into()));
+        req.headers.push(("COOKIE".into(), "token=xyz".into()));
         assert_eq!(req.cookie_string(), "token=xyz");
     }
 

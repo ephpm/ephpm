@@ -110,10 +110,7 @@ impl Limiter {
             state.connections.fetch_add(1, Ordering::Relaxed);
         }
 
-        Some(ConnectionGuard {
-            limiter: std::sync::Arc::clone(self),
-            ip,
-        })
+        Some(ConnectionGuard { limiter: std::sync::Arc::clone(self), ip })
     }
 
     /// Check if a request from the given IP is allowed under the rate limit.
@@ -248,10 +245,7 @@ mod tests {
 
     #[test]
     fn connection_limit_enforced() {
-        let config = LimitsConfig {
-            max_connections: 2,
-            ..LimitsConfig::default()
-        };
+        let config = LimitsConfig { max_connections: 2, ..LimitsConfig::default() };
         let limiter = std::sync::Arc::new(Limiter::new(config));
         let ip: IpAddr = "1.2.3.4".parse().unwrap();
 

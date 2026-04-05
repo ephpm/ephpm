@@ -99,19 +99,14 @@ pub fn start_acme(tls_config: &TlsConfig, store: Option<Arc<Store>>) -> anyhow::
         "ACME auto-TLS enabled"
     );
 
-    Ok(AcmeSetup {
-        challenge_config,
-        default_config,
-    })
+    Ok(AcmeSetup { challenge_config, default_config })
 }
 
 /// Poll the ACME state stream, logging events and errors.
 ///
 /// This task runs for the lifetime of the server. It drives certificate
 /// ordering, renewal, and cache operations.
-async fn drive_acme_events<EC: Debug + 'static, EA: Debug + 'static>(
-    mut state: AcmeState<EC, EA>,
-) {
+async fn drive_acme_events<EC: Debug + 'static, EA: Debug + 'static>(mut state: AcmeState<EC, EA>) {
     loop {
         match state.next().await {
             Some(Ok(event)) => {
@@ -144,9 +139,7 @@ const ACME_CERT_PREFIX: &str = "acme:cert:";
 /// Generate a unique node identifier for ACME leader election.
 fn acme_node_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let pid = std::process::id();
     format!("{}-{}-{}", ts.as_millis(), pid, ts.subsec_nanos())
 }

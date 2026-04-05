@@ -43,8 +43,8 @@ jobs:
         run: ln -sfn "$GITHUB_WORKSPACE/litewire" ../litewire
       - name: Install build dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential pkg-config libclang-dev libssl-dev
+          apt-get update -qq
+          apt-get install -y -qq build-essential pkg-config libclang-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -66,8 +66,8 @@ jobs:
         run: ln -sfn "$GITHUB_WORKSPACE/litewire" ../litewire
       - name: Install build dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential pkg-config libclang-dev libssl-dev
+          apt-get update -qq
+          apt-get install -y -qq build-essential pkg-config libclang-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -86,8 +86,7 @@ jobs:
           token: ${{ secrets.PHP_SDK_TOKEN }}
       - name: Symlink litewire for Cargo path dependency
         run: ln -sfn "$GITHUB_WORKSPACE/litewire" ../litewire
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential pkg-config libclang-dev libssl-dev
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked || true
+      - run: cargo deny check

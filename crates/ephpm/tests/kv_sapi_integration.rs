@@ -7,11 +7,10 @@
 //!
 //! Run with: cargo nextest run -p ephpm --run-ignored all
 
-use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::Duration;
+use std::{fs, thread};
 
 /// Helper to wait for a port to be listening.
 fn wait_for_port(port: u16, timeout_secs: u64) -> bool {
@@ -61,8 +60,7 @@ listen = "127.0.0.1:6379"
     );
 
     let mut f = tempfile::NamedTempFile::new().expect("failed to create temp config");
-    f.write_all(config_content.as_bytes())
-        .expect("failed to write config");
+    f.write_all(config_content.as_bytes()).expect("failed to write config");
     f.flush().expect("failed to flush config");
 
     (f, config_content)
@@ -83,10 +81,7 @@ fn find_ephpm_binary() -> PathBuf {
         }
     }
 
-    panic!(
-        "ephpm binary not found. Run `cargo xtask release` first. Checked: {:?}",
-        candidates
-    );
+    panic!("ephpm binary not found. Run `cargo xtask release` first. Checked: {:?}", candidates);
 }
 
 #[tokio::test]
@@ -108,11 +103,7 @@ async fn kv_sapi_set_get() {
         .expect("failed to spawn ephpm");
 
     // Wait for server to start
-    assert!(
-        wait_for_port(port as u16, 5),
-        "ephpm server failed to start on port {}",
-        port
-    );
+    assert!(wait_for_port(port as u16, 5), "ephpm server failed to start on port {}", port);
 
     // Run test and clean up
     let result = get_json(&format!("http://127.0.0.1:{}/kv_sapi_test.php?test=set_get", port))
