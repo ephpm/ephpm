@@ -35,5 +35,5 @@ jobs:
 
       - name: Run E2E tests
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.PHP_SDK_TOKEN }}
         run: cargo xtask e2e --php-version ${{ matrix.php_sdk_version }}

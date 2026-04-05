@@ -105,87 +105,88 @@ jobs:
           name: php-sdk-${{ matrix.php }}-linux-${{ matrix.arch }}
           path: php-sdk-${{ matrix.php }}-linux-${{ matrix.arch }}.tar.gz
 
-  # ── macOS native builds (no container — spc runs natively) ─────────────────
+  # ── macOS native builds (disabled until self-hosted runner is available) ─────
+  # Uncomment when Mac mini runner is set up.
 
-  macos:
-    name: macOS (${{ matrix.arch }}, PHP ${{ matrix.php }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [arm64, x86_64]
-        php:
-          - ${{ inputs.php_version || '8.5' }}
-        include:
-          - arch: arm64
-            runner: macos-latest      # Apple Silicon
-            spc_arch: aarch64
-          - arch: x86_64
-            runner: macos-13          # Intel
-            spc_arch: x86_64
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        run: |
-          brew install autoconf automake bison cmake flex libtool \
-            make pkg-config re2c
-
-      - name: Build PHP SDK via spc
-        env:
-          SPC_VERSION: "2.8.3"
-          PHP_EXTENSIONS: "bcmath,calendar,ctype,curl,dom,exif,fileinfo,filter,gd,hash,iconv,mbstring,mysqli,mysqlnd,openssl,pcntl,pcre,pdo,pdo_mysql,phar,posix,session,simplexml,sodium,tokenizer,xml,xmlreader,xmlwriter,zip,zlib"
-        run: |
-          mkdir -p spc-build && cd spc-build
-
-          echo "==> Downloading spc v${SPC_VERSION}..."
-          curl -fSL "https://github.com/crazywhalecc/static-php-cli/releases/download/${SPC_VERSION}/spc-macos-${{ matrix.spc_arch }}.tar.gz" \
-            | tar xz
-          chmod +x spc
-
-          echo "==> Running spc doctor..."
-          ./spc doctor --auto-fix || true
-
-          echo "==> Downloading PHP ${{ matrix.php }} sources..."
-          ./spc download \
-            --with-php=${{ matrix.php }} \
-            --for-extensions=${PHP_EXTENSIONS} \
-            --prefer-pre-built
-
-          mkdir -p buildroot/bin
-          ln -sf "$(which pkg-config)" buildroot/bin/pkg-config
-
-          echo "==> Building libphp.a with ZTS..."
-          ./spc build \
-            ${PHP_EXTENSIONS} \
-            --build-embed \
-            --no-strip \
-            --enable-zts
-
-      - name: Verify SDK contents
-        run: |
-          SDK=spc-build/buildroot
-          echo "==> Checking libphp.a..."
-          test -f ${SDK}/lib/libphp.a || { echo "::error::libphp.a not found"; exit 1; }
-          ls -lh ${SDK}/lib/libphp.a
-          file ${SDK}/lib/libphp.a
-
-          echo "==> Checking headers..."
-          test -d ${SDK}/include/php/main || { echo "::error::PHP headers not found"; exit 1; }
-
-      - name: Package SDK tarball
-        run: |
-          tar czf php-sdk-${{ matrix.php }}-macos-${{ matrix.arch }}.tar.gz \
-            -C spc-build/buildroot \
-            lib/libphp.a \
-            include/php/
-          ls -lh php-sdk-${{ matrix.php }}-macos-${{ matrix.arch }}.tar.gz
-
-      - name: Upload SDK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: php-sdk-${{ matrix.php }}-macos-${{ matrix.arch }}
-          path: php-sdk-${{ matrix.php }}-macos-${{ matrix.arch }}.tar.gz
+  # macos:
+  #   name: macOS (${{ matrix.arch }}, PHP ${{ matrix.php }})
+  #   runs-on: ${{ matrix.runner }}
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       arch: [arm64, x86_64]
+  #       php:
+  #         - ${{ inputs.php_version || '8.5' }}
+  #       include:
+  #         - arch: arm64
+  #           runner: macos-latest      # Apple Silicon
+  #           spc_arch: aarch64
+  #         - arch: x86_64
+  #           runner: macos-13          # Intel
+  #           spc_arch: x86_64
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Install system dependencies
+  #       run: |
+  #         brew install autoconf automake bison cmake flex libtool \
+  #           make pkg-config re2c
+  #
+  #     - name: Build PHP SDK via spc
+  #       env:
+  #         SPC_VERSION: "2.8.3"
+  #         PHP_EXTENSIONS: "bcmath,calendar,ctype,curl,dom,exif,fileinfo,filter,gd,hash,iconv,mbstring,mysqli,mysqlnd,openssl,pcntl,pcre,pdo,pdo_mysql,phar,posix,session,simplexml,sodium,tokenizer,xml,xmlreader,xmlwriter,zip,zlib"
+  #       run: |
+  #         mkdir -p spc-build && cd spc-build
+  #
+  #         echo "==> Downloading spc v${SPC_VERSION}..."
+  #         curl -fSL "https://github.com/crazywhalecc/static-php-cli/releases/download/${SPC_VERSION}/spc-macos-${{ matrix.spc_arch }}.tar.gz" \
+  #           | tar xz
+  #         chmod +x spc
+  #
+  #         echo "==> Running spc doctor..."
+  #         ./spc doctor --auto-fix || true
+  #
+  #         echo "==> Downloading PHP ${{ matrix.php }} sources..."
+  #         ./spc download \
+  #           --with-php=${{ matrix.php }} \
+  #           --for-extensions=${PHP_EXTENSIONS} \
+  #           --prefer-pre-built
+  #
+  #         mkdir -p buildroot/bin
+  #         ln -sf "$(which pkg-config)" buildroot/bin/pkg-config
+  #
+  #         echo "==> Building libphp.a with ZTS..."
+  #         ./spc build \
+  #           ${PHP_EXTENSIONS} \
+  #           --build-embed \
+  #           --no-strip \
+  #           --enable-zts
+  #
+  #     - name: Verify SDK contents
+  #       run: |
+  #         SDK=spc-build/buildroot
+  #         echo "==> Checking libphp.a..."
+  #         test -f ${SDK}/lib/libphp.a || { echo "::error::libphp.a not found"; exit 1; }
+  #         ls -lh ${SDK}/lib/libphp.a
+  #         file ${SDK}/lib/libphp.a
+  #
+  #         echo "==> Checking headers..."
+  #         test -d ${SDK}/include/php/main || { echo "::error::PHP headers not found"; exit 1; }
+  #
+  #     - name: Package SDK tarball
+  #       run: |
+  #         tar czf php-sdk-${{ matrix.php }}-macos-${{ matrix.arch }}.tar.gz \
+  #           -C spc-build/buildroot \
+  #           lib/libphp.a \
+  #           include/php/
+  #         ls -lh php-sdk-${{ matrix.php }}-macos-${{ matrix.arch }}.tar.gz
+  #
+  #     - name: Upload SDK artifact
+  #       uses: actions/upload-artifact@v4
+  #       with:
+  #         name: php-sdk-${{ matrix.php }}-macos-${{ matrix.arch }}
+  #         path: php-sdk-${{ matrix.php }}-macos-${{ matrix.arch }}.tar.gz
 
   # ── Windows SDK (pre-built from windows.php.net) ───────────────────────────
   #
@@ -291,7 +292,7 @@ jobs:
   release:
     name: Upload to Release
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [linux, macos, windows]
+    needs: [linux, windows]  # Add macos back when runner is available
     runs-on: ubuntu-latest
     permissions:
       contents: write
