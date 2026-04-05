@@ -26,7 +26,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
-      - run: cargo +nightly fmt --all -- --check
+      # --all includes local path deps (litewire), so list workspace packages explicitly
+      - run: |
+          cargo +nightly fmt -p ephpm -p ephpm-server -p ephpm-config -p ephpm-php \
+            -p ephpm-db -p ephpm-kv -p ephpm-cluster -p ephpm-sqld \
+            -p ephpm-query-stats -p xtask -- --check
 
   clippy:
     name: Clippy
@@ -86,7 +90,11 @@ jobs:
           token: ${{ secrets.PHP_SDK_TOKEN }}
       - name: Symlink litewire for Cargo path dependency
         run: ln -sfn "$GITHUB_WORKSPACE/litewire" ../litewire
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq build-essential pkg-config libclang-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked || true
+        run: cargo install cargo-deny --locked
       - run: cargo deny check
