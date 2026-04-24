@@ -1,0 +1,58 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo xtask:*)",
+
+      "Bash(./target/release/ephpm:*)",
+      "Bash(./target/debug/ephpm:*)",
+      "Bash(./target/x86_64-unknown-linux-musl/release/ephpm:*)",
+      "Bash(./target/x86_64-pc-windows-msvc/release/ephpm.exe:*)",
+      "Bash(target/release/ephpm:*)",
+      "Bash(target/debug/ephpm:*)",
+
+      "Bash(php:*)",
+      "Bash(composer:*)",
+
+      "Bash(podman:*)",
+      "Bash(docker:*)",
+      "Bash(docker-compose:*)",
+      "Bash(docker compose:*)",
+
+      "Bash(wsl:*)",
+      "Bash(dpkg -l)",
+      "Bash(apt list:*)",
+
+      "WebFetch(domain:php.net)",
+      "WebFetch(domain:windows.php.net)",
+      "WebFetch(domain:wiki.php.net)",
+      "WebFetch(domain:caddyserver.com)",
+      "WebFetch(domain:mod-rewrite-cheatsheet.com)",
+
+      "Read(//home/luther/litewire/**)",
+      "Read(//c/Users/luthe/litewire/**)",
+
+      "PowerShell(cargo xtask:*)",
+
+      "PowerShell(./target/release/ephpm.exe:*)",
+      "PowerShell(./target/debug/ephpm.exe:*)",
+      "PowerShell(./target/x86_64-pc-windows-msvc/release/ephpm.exe:*)",
+      "PowerShell(.\\target\\release\\ephpm.exe:*)",
+      "PowerShell(.\\target\\debug\\ephpm.exe:*)",
+      "PowerShell(target\\release\\ephpm.exe:*)",
+      "PowerShell(target\\debug\\ephpm.exe:*)",
+
+      "PowerShell(php:*)",
+      "PowerShell(php.exe:*)",
+      "PowerShell(composer:*)",
+      "PowerShell(composer.bat:*)",
+
+      "PowerShell(podman:*)",
+      "PowerShell(docker:*)",
+      "PowerShell(docker-compose:*)",
+      "PowerShell(docker compose:*)",
+
+      "PowerShell(wsl:*)",
+      "PowerShell(wsl.exe:*)"
+    ]
+  }
+}
