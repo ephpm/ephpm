@@ -18,6 +18,9 @@ target/
 # Claude Code worktrees
 .claude/worktrees/
 
+# Claude Code personal/local permissions (project-shared rules go in .claude/settings.json)
+.claude/settings.local.json
+
 # Tilt state
 .tilt-dev/
 
