@@ -1,4 +1,7 @@
-# SQL: Embedded Database
++++
+title = "Database"
+weight = 4
++++
 
 ePHPm bundles an embedded SQLite database for zero-dependency deployments. PHP apps connect using their existing `pdo_mysql` drivers — backed by the same in-process SQLite engine. No code changes, no external database server.
 

@@ -1,4 +1,7 @@
-# ePHPm Analysis Overview
++++
+title = "Analysis"
+weight = 9
++++
 
 This directory contains research and analysis of the competitive landscape and key technologies relevant to building ePHPm — an all-in-one PHP application server.
 

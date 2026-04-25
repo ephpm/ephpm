@@ -1,4 +1,7 @@
-# ePHPm Architecture Decisions
++++
+title = "Architecture"
+weight = 6
++++
 
 ## Feature Status
 
