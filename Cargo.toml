@@ -66,7 +66,16 @@ ephpm-server = { path = "crates/ephpm-server" }
 ephpm-sqld = { path = "crates/ephpm-sqld" }
 
 # External — litewire (embedded SQLite wire protocol proxy)
-litewire = { path = "../litewire/crates/litewire", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client"] }
+#
+# Pinned to a specific commit so builds are reproducible. To bump, replace `rev`
+# with the new commit hash and run `cargo update -p litewire`.
+#
+# For local development against a sibling litewire checkout, add to your local
+# (gitignored) .cargo/config.toml:
+#
+#   [patch."https://github.com/ephpm/litewire.git"]
+#   litewire = { path = "../litewire/crates/litewire" }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "33e24a3e6fe664b1be499a0147c9cae5756eb733", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"

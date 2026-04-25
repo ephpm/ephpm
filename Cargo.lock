@@ -2127,6 +2127,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 [[package]]
 name = "litewire"
 version = "0.1.0"
+source = "git+https://github.com/ephpm/litewire.git?rev=33e24a3e6fe664b1be499a0147c9cae5756eb733#33e24a3e6fe664b1be499a0147c9cae5756eb733"
 dependencies = [
  "anyhow",
  "futures",
@@ -2143,6 +2144,7 @@ dependencies = [
 [[package]]
 name = "litewire-backend"
 version = "0.1.0"
+source = "git+https://github.com/ephpm/litewire.git?rev=33e24a3e6fe664b1be499a0147c9cae5756eb733#33e24a3e6fe664b1be499a0147c9cae5756eb733"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2159,6 +2161,7 @@ dependencies = [
 [[package]]
 name = "litewire-hrana"
 version = "0.1.0"
+source = "git+https://github.com/ephpm/litewire.git?rev=33e24a3e6fe664b1be499a0147c9cae5756eb733#33e24a3e6fe664b1be499a0147c9cae5756eb733"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2173,6 +2176,7 @@ dependencies = [
 [[package]]
 name = "litewire-mysql"
 version = "0.1.0"
+source = "git+https://github.com/ephpm/litewire.git?rev=33e24a3e6fe664b1be499a0147c9cae5756eb733#33e24a3e6fe664b1be499a0147c9cae5756eb733"
 dependencies = [
  "async-trait",
  "litewire-backend",
@@ -2186,6 +2190,7 @@ dependencies = [
 [[package]]
 name = "litewire-postgres"
 version = "0.1.0"
+source = "git+https://github.com/ephpm/litewire.git?rev=33e24a3e6fe664b1be499a0147c9cae5756eb733#33e24a3e6fe664b1be499a0147c9cae5756eb733"
 dependencies = [
  "async-trait",
  "futures",
@@ -2200,6 +2205,7 @@ dependencies = [
 [[package]]
 name = "litewire-tds"
 version = "0.1.0"
+source = "git+https://github.com/ephpm/litewire.git?rev=33e24a3e6fe664b1be499a0147c9cae5756eb733#33e24a3e6fe664b1be499a0147c9cae5756eb733"
 dependencies = [
  "bytes",
  "litewire-backend",
@@ -2212,6 +2218,7 @@ dependencies = [
 [[package]]
 name = "litewire-translate"
 version = "0.1.0"
+source = "git+https://github.com/ephpm/litewire.git?rev=33e24a3e6fe664b1be499a0147c9cae5756eb733#33e24a3e6fe664b1be499a0147c9cae5756eb733"
 dependencies = [
  "sqlparser",
  "thiserror 2.0.18",
