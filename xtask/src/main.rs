@@ -12,6 +12,10 @@ const SPC_VERSION: &str = "2.8.3";
 /// Pinned version of sqld (libsql-server) for clustered SQLite.
 const SQLD_VERSION: &str = "0.24.32";
 
+/// Pinned version of Hugo (extended) for the documentation site.
+/// Newer versions dropped darwin tarballs in favor of .pkg installers.
+const HUGO_VERSION: &str = "0.150.0";
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str);
@@ -1214,6 +1218,7 @@ fn docs(args: &[String]) -> ExitCode {
         Some("new") => docs_new(&args[1..]),
         Some("check") => docs_check(),
         Some("deps") => docs_deps(),
+        Some("install") => docs_install(),
         Some("help" | "--help" | "-h") | None => {
             print_docs_usage();
             ExitCode::SUCCESS
@@ -1232,6 +1237,7 @@ fn print_docs_usage() {
 Usage: cargo xtask docs <subcommand> [args]
 
 Subcommands:
+  install           Download hugo extended v{HUGO_VERSION} into ./bin (no global install needed).
   serve [PORT]      Run hugo serve with live reload (default port 1313).
                     Includes draft pages so unfinished sections are visible.
   build             Build the static site to site/public (with --minify).
@@ -1243,17 +1249,37 @@ Subcommands:
     );
 }
 
+/// Resolve which `hugo` to invoke: prefer the pinned `./bin/hugo` we install,
+/// fall back to whatever's on PATH (so contributors with their own install
+/// still work).
+fn hugo_command() -> Command {
+    let local = workspace_root().join("bin").join(hugo_binary_name());
+    if local.exists() {
+        Command::new(local)
+    } else {
+        Command::new("hugo")
+    }
+}
+
+fn hugo_binary_name() -> &'static str {
+    if cfg!(windows) { "hugo.exe" } else { "hugo" }
+}
+
 fn site_dir() -> PathBuf {
     workspace_root().join("site")
 }
 
 fn ensure_hugo() -> Result<(), ExitCode> {
+    let local = workspace_root().join("bin").join(hugo_binary_name());
+    if local.exists() {
+        return Ok(());
+    }
     if has_command("hugo") {
         return Ok(());
     }
-    eprintln!("error: hugo not found in PATH");
-    eprintln!("       install: https://gohugo.io/installation/");
-    eprintln!("       you need the *extended* edition (Hextra uses SCSS).");
+    eprintln!("error: hugo not found");
+    eprintln!("       run: cargo xtask docs install");
+    eprintln!("       (downloads pinned hugo extended v{HUGO_VERSION} to ./bin/)");
     Err(ExitCode::FAILURE)
 }
 
@@ -1278,7 +1304,7 @@ fn docs_serve(args: &[String]) -> ExitCode {
     let port = args.first().cloned().unwrap_or_else(|| "1313".into());
 
     eprintln!("==> hugo serve on http://127.0.0.1:{port} (drafts included)");
-    let status = Command::new("hugo")
+    let status = hugo_command()
         .args(["server", "-D", "--bind", "127.0.0.1", "--port", &port, "-s"])
         .arg(site_dir())
         .status();
@@ -1299,7 +1325,7 @@ fn docs_build() -> ExitCode {
     }
 
     eprintln!("==> hugo --minify -s site");
-    let status = Command::new("hugo")
+    let status = hugo_command()
         .args(["--minify", "-s"])
         .arg(site_dir())
         .status();
@@ -1324,7 +1350,7 @@ fn docs_new(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let status = Command::new("hugo")
+    let status = hugo_command()
         .args(["new", "content", path, "-s"])
         .arg(site_dir())
         .status();
@@ -1364,11 +1390,14 @@ fn docs_check() -> ExitCode {
 fn docs_deps() -> ExitCode {
     let mut all_ok = true;
 
-    if has_command("hugo") {
-        eprintln!("==> hugo: ok");
+    let local_hugo = workspace_root().join("bin").join(hugo_binary_name());
+    if local_hugo.exists() {
+        eprintln!("==> hugo: ok ({})", local_hugo.display());
+    } else if has_command("hugo") {
+        eprintln!("==> hugo: ok (system PATH — pin with `cargo xtask docs install`)");
     } else {
         eprintln!(
-            "==> hugo: MISSING — install from https://gohugo.io/installation/ (extended edition)"
+            "==> hugo: MISSING — run `cargo xtask docs install` (downloads v{HUGO_VERSION} to ./bin/)"
         );
         all_ok = false;
     }
@@ -1396,4 +1425,104 @@ fn docs_deps() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// Download a pinned hugo extended binary into `./bin/`.
+///
+/// Mirrors `e2e_install`: pinned version, OS/arch detection, idempotent.
+fn docs_install() -> ExitCode {
+    let bin_dir = workspace_root().join("bin");
+    if let Err(e) = fs::create_dir_all(&bin_dir) {
+        eprintln!("error: failed to create {}: {e}", bin_dir.display());
+        return ExitCode::FAILURE;
+    }
+
+    let (os, arch) = platform();
+    // Hugo names darwin builds "darwin-universal" regardless of cpu arch.
+    let asset_arch = if os == "darwin" { "universal" } else { arch };
+    let ext = if os == "windows" { "zip" } else { "tar.gz" };
+    let asset = format!("hugo_extended_{HUGO_VERSION}_{os}-{asset_arch}.{ext}");
+    let url = format!(
+        "https://github.com/gohugoio/hugo/releases/download/v{HUGO_VERSION}/{asset}"
+    );
+
+    let bin_name = hugo_binary_name();
+    let dest = bin_dir.join(bin_name);
+
+    if dest.exists() {
+        let already_pinned = Command::new(&dest)
+            .arg("version")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(HUGO_VERSION))
+            .unwrap_or(false);
+        if already_pinned {
+            eprintln!(
+                "==> hugo v{HUGO_VERSION} already installed at {}",
+                dest.display()
+            );
+            return ExitCode::SUCCESS;
+        }
+        eprintln!(
+            "==> hugo at {} is a different version, replacing",
+            dest.display()
+        );
+        if let Err(e) = fs::remove_file(&dest) {
+            eprintln!("error: failed to remove old hugo: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    eprintln!("==> Downloading hugo v{HUGO_VERSION} ({os}/{asset_arch})...");
+
+    let success = if ext == "zip" {
+        download_and_extract_zip(&url, &bin_dir, bin_name)
+    } else {
+        download_and_extract_tarball(&url, &bin_dir, bin_name)
+    };
+
+    if !success {
+        eprintln!("error: failed to download/extract hugo from {url}");
+        return ExitCode::FAILURE;
+    }
+
+    eprintln!("==> hugo v{HUGO_VERSION} installed at {}", dest.display());
+    ExitCode::SUCCESS
+}
+
+/// Download a `.zip` archive via curl, extract a single file to `dest_dir`.
+///
+/// Uses `tar -xf` which on Windows 10+ ships as bsdtar (libarchive) and
+/// natively reads zip; on macOS bsdtar is the default `tar`.
+fn download_and_extract_zip(url: &str, dest_dir: &Path, file_name: &str) -> bool {
+    let tmp = std::env::temp_dir().join(format!("ephpm-xtask-{}.zip", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+
+    let status = Command::new("curl")
+        .args(["-fSL", "-o"])
+        .arg(&tmp)
+        .arg(url)
+        .status();
+    if !ran_ok(&status) {
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+
+    let status = Command::new("tar")
+        .arg("-xf")
+        .arg(&tmp)
+        .arg("-C")
+        .arg(dest_dir)
+        .arg(file_name)
+        .status();
+
+    let _ = fs::remove_file(&tmp);
+
+    if !ran_ok(&status) {
+        return false;
+    }
+
+    let dest_path = dest_dir.join(file_name);
+    make_executable(&dest_path);
+    true
 }
