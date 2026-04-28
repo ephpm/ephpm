@@ -423,24 +423,32 @@ The RESP paths have overhead from IPC + RESP serialization, but are still **100-
 
 Three components: gossip-based peer discovery, consistent hash ring for key routing, and replication for fault tolerance.
 
-```
-Node A ◄──gossip──► Node B ◄──gossip──► Node C
-  │                   │                   │
-  KvStore             KvStore             KvStore
-  (local shard)       (local shard)       (local shard)
-  │                   │                   │
-  └───────── consistent hash ring ────────┘
+```mermaid
+flowchart LR
+    A["Node A<br/>KvStore (local shard)"]
+    B["Node B<br/>KvStore (local shard)"]
+    C["Node C<br/>KvStore (local shard)"]
+    A <-->|gossip| B
+    B <-->|gossip| C
+    A <-->|gossip| C
+    ring(("consistent<br/>hash ring"))
+    A --- ring
+    B --- ring
+    C --- ring
 ```
 
 ### 1. Gossip-Based Peer Discovery
 
 Nodes find each other via a gossip protocol ([`chitchat`](https://github.com/quickwit-oss/chitchat) — Quickwit's SWIM-based gossip library for Rust, or a custom SWIM implementation).
 
-```
-Node A ◄──gossip──► Node B ◄──gossip──► Node C
-  │                   │                   │
-  alive, gen=5        alive, gen=3        alive, gen=7
-  load=45%            load=62%            load=38%
+```mermaid
+flowchart LR
+    A["Node A<br/>alive · gen=5<br/>load=45%"]
+    B["Node B<br/>alive · gen=3<br/>load=62%"]
+    C["Node C<br/>alive · gen=7<br/>load=38%"]
+    A <-->|gossip| B
+    B <-->|gossip| C
+    A <-->|gossip| C
 ```
 
 Each node broadcasts:

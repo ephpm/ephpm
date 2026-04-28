@@ -250,11 +250,15 @@ EPHPM_DB__SQLITE__REPLICATION__ROLE=auto
 
 ### Mode Detection
 
-```
-if db.sqlite configured:
-    if replication.role == "primary" or "replica" → clustered (sqld sidecar)
-    if replication.role == "auto" AND cluster.enabled → clustered (sqld + election)
-    else → single-node (rusqlite in-process)
+```mermaid
+flowchart TD
+    A{"[db.sqlite] configured?"}
+    A -->|no| Z[no SQLite — only DB proxy if [db.mysql]]
+    A -->|yes| B{"replication.role"}
+    B -->|primary or replica| C[clustered<br/>sqld sidecar]
+    B -->|auto| D{"[cluster] enabled?"}
+    D -->|yes| E[clustered<br/>sqld + gossip-elected primary]
+    D -->|no| F[single-node<br/>rusqlite in-process]
 ```
 
 ## Platform Support
