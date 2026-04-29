@@ -135,8 +135,8 @@ fn link_system_libs(target_os: &str) {
             } else {
                 println!(
                     "cargo::warning=Could not find libgcc.a for musl target. \
-                     Install a musl cross-compiler (e.g. `apt install musl-tools`) \
-                     or run `spc doctor --auto-fix`. The linker may fail with \
+                     Install a musl cross-compiler (e.g. `apt install musl-tools`). \
+                     The linker may fail with \
                      'could not find native static library `gcc`'."
                 );
             }
@@ -342,11 +342,11 @@ fn find_clang_resource_include() -> Option<PathBuf> {
     None
 }
 
-/// Find the directory containing `libgcc.a` from the musl cross-compiler.
+/// Find the directory containing `libgcc.a` for musl target builds.
 ///
-/// `spc doctor --auto-fix` installs a musl GCC toolchain (e.g. under
-/// `/usr/local/musl/`). We need to add its lib directory to the linker
-/// search path so `-lgcc` resolves.
+/// `apt install musl-tools` provides the `musl-gcc` wrapper around the host
+/// GCC; the libgcc.a symbols PHP's JIT needs live there. We add that lib
+/// directory to the linker search path so `-lgcc` resolves.
 fn find_musl_libgcc() -> Option<PathBuf> {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".into());
     let musl_triple = format!("{arch}-linux-musl");
@@ -356,11 +356,9 @@ fn find_musl_libgcc() -> Option<PathBuf> {
     let gnu_triple = format!("{arch}-linux-gnu");
 
     // Common locations where musl-cross or host toolchains install libgcc.a:
-    //   /usr/local/musl/lib/gcc/<triple>/<ver>/libgcc.a  (spc doctor)
-    //   /usr/lib/gcc/<musl-triple>/<ver>/libgcc.a         (musl cross-compiler)
-    //   /usr/lib/gcc/<gnu-triple>/<ver>/libgcc.a          (host GCC via musl-tools wrapper)
+    //   /usr/lib/gcc/<musl-triple>/<ver>/libgcc.a   (musl cross-compiler)
+    //   /usr/lib/gcc/<gnu-triple>/<ver>/libgcc.a    (host GCC via musl-tools wrapper)
     let search_roots = [
-        PathBuf::from(format!("/usr/local/musl/lib/gcc/{musl_triple}")),
         PathBuf::from(format!("/usr/lib/gcc/{musl_triple}")),
         PathBuf::from(format!("/usr/lib/gcc/{gnu_triple}")),
     ];
