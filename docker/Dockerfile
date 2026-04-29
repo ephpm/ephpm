@@ -2,7 +2,7 @@
 #
 # Cache strategy:
 #   base:    System deps + Rust toolchain — changes rarely
-#   php-sdk: PHP SDK via spc — only rebuilds when PHP_VERSION or xtask changes
+#   php-sdk: PHP SDK download — only invalidates when PHP_VERSION changes
 #   builder: Cargo manifest fetch (cached until Cargo.lock changes) → full source build
 #
 # Build:
@@ -17,26 +17,18 @@ FROM ubuntu:24.04 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# System build tools for static-php-cli (spc) and musl cross-compilation.
-#
-# The standalone spc binary bundles its own PHP — no system PHP or Composer
-# is needed. `spc doctor --auto-fix` may install additional packages, so we
-# keep apt metadata around (no `rm -rf /var/lib/apt/lists/*`).
-#
-# Key packages:
-#   unzip           — required by spc for extracting downloads
-#   gettext         — provides `autopoint`, checked by spc doctor
-#   musl-tools      — provides musl-gcc cross-compiler
-#   musl-dev        — musl development files and static libraries
-#   gcc-multilib    — 32-bit support for cross-compilation
-#   libstdc++-12-dev — needed for C++ standard library (musl)
-#   libgcc-12-dev   — GCC runtime library (musl)
+# System tools needed by the ephpm Rust build:
+#   - musl-tools / musl-dev: musl-gcc cross-compiler for the
+#     x86_64-unknown-linux-musl target (libphp.a is musl-linked).
+#   - libclang-dev: bindgen needs libclang to parse PHP headers.
+#   - build-essential, pkg-config: cc::Build for ephpm_wrapper.c.
+#   - curl, git, ca-certificates: rustup install + cargo registry.
+#   - tar: extracting the prebuilt PHP SDK tarball in the next stage.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates curl git pkg-config sudo \
-    autoconf automake bison cmake flex gettext libtool make re2c unzip \
-    libclang-dev musl-tools musl-dev gcc-multilib libstdc++-12-dev libgcc-12-dev
+    build-essential ca-certificates curl git pkg-config tar \
+    libclang-dev musl-tools musl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Rust stable
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
@@ -44,15 +36,18 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal
 
-# Install musl target for static linking
 RUN rustup target add x86_64-unknown-linux-musl
 
-# Configure musl cross-compiler environment
 ENV CC_x86_64_unknown_linux_musl=musl-gcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_CC=musl-gcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
 
-# ── Stage 2: php-sdk — rebuilt only when PHP_VERSION or xtask source changes ──
+# ── Stage 2: php-sdk — download prebuilt SDK ─────────────────────────────────
+#
+# `cargo xtask php-sdk` downloads `libphp.a` + headers from
+# github.com/ephpm/php-sdk releases. It's a ~30s pull (no compile), so this
+# stage is tiny but kept separate so the Cargo.lock-keyed builder layer
+# below doesn't invalidate when, say, only an .rs file changes.
 
 FROM base AS php-sdk
 
@@ -60,9 +55,8 @@ ARG PHP_VERSION
 
 WORKDIR /src
 
-# Workspace manifest + lock + xtask source (the only things needed to run
-# `cargo xtask php-sdk`). Stub Cargo.toml files for every other workspace
-# member keep the resolver happy without pulling in real source.
+# Manifest + xtask source so `cargo xtask php-sdk` is runnable. Stub
+# Cargo.toml/sources for the other workspace members keep the resolver happy.
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo/ .cargo/
 COPY xtask/ xtask/
@@ -73,7 +67,6 @@ COPY crates/ephpm-php/Cargo.toml      crates/ephpm-php/Cargo.toml
 COPY crates/ephpm-db/Cargo.toml       crates/ephpm-db/Cargo.toml
 COPY crates/ephpm-kv/Cargo.toml       crates/ephpm-kv/Cargo.toml
 
-# Minimal stub src so cargo can parse (but not compile) workspace members
 RUN mkdir -p \
         crates/ephpm/src \
         crates/ephpm-config/src \
@@ -96,8 +89,8 @@ ARG PHP_VERSION
 
 WORKDIR /src
 
-# Pre-built PHP SDK so xtask release skips the spc step entirely
-# (release_linux checks for php-sdk/static-php-cli/buildroot/lib/libphp.a)
+# Pre-downloaded PHP SDK so xtask release skips the download step entirely
+# (release_native checks for the cached SDK before fetching).
 COPY --from=php-sdk /src/php-sdk /src/php-sdk
 
 # Copy only manifest files + create stubs, then `cargo fetch`.
@@ -134,8 +127,11 @@ RUN cargo fetch
 #
 # Must use the same --target as `cargo xtask release` (x86_64-unknown-linux-musl) and
 # the same PHP_SDK_PATH so the feature flags and cfg(php_linked) match exactly.
-RUN PHP_SDK_PATH=/src/php-sdk/static-php-cli/buildroot \
-    cargo build --release --package ephpm \
+# `cargo xtask php-sdk` resolves "8.5" → "8.5.2-linux-x86_64" so the cache
+# dir name is the full version, not the shorthand. Discover it.
+RUN PHP_SDK_PATH=$(find /src/php-sdk -mindepth 1 -maxdepth 1 -type d -name '*-linux-x86_64' | head -1) \
+    && test -n "$PHP_SDK_PATH" \
+    && PHP_SDK_PATH=$PHP_SDK_PATH cargo build --release --package ephpm \
         --target x86_64-unknown-linux-musl 2>&1 | grep -v "^warning:"
 
 # Real source — invalidates from here, but the dep .rlib layer above is cached.
@@ -148,16 +144,11 @@ COPY . .
 # artifacts. Touch all project crate sources to force mtimes newer than the stubs.
 RUN find crates xtask -name '*.rs' -exec touch {} +
 
-# Verify musl toolchain can be found by the build script
-RUN which musl-gcc && musl-gcc --version && echo "musl-gcc OK" || echo "musl-gcc WARNING"
-
-# Build ephpm. xtask skips PHP SDK since libphp.a already exists from the php-sdk stage.
+# Build ephpm. xtask skips the SDK download since the tarball already extracted in php-sdk stage.
 # bash -o pipefail ensures cargo's exit code propagates through `tee` so a failed build
 # is visible (Docker's default /bin/sh is dash and does not support pipefail).
 RUN bash -euo pipefail -c 'cargo xtask release ${PHP_VERSION} 2>&1 | tee /tmp/build.log' || ( \
     echo "==> Build failed. Checking diagnostic info..." && \
-    find /usr -name "libgcc.a" 2>/dev/null | head -10 && \
-    ls -la /usr/local/musl/lib/gcc/ 2>/dev/null || true && \
     cat /tmp/build.log && \
     exit 1 \
   )

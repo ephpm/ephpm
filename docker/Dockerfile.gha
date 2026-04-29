@@ -1,8 +1,8 @@
-# CI runner image with all build tools pre-installed.
+# CI runner image with the build toolchain pre-installed.
 #
-# Includes: Rust stable, PHP CLI, Composer, static-php-cli (with deps +
-# musl wrapper), and system build tools. Running `cargo xtask release`
-# inside this image skips all setup and goes straight to building.
+# Includes: Rust stable, musl cross-compiler, libclang, and basic build
+# essentials. The PHP SDK itself is downloaded on demand by
+# `cargo xtask release` (a tarball from github.com/ephpm/php-sdk releases).
 #
 # Build:
 #   docker build -f docker/Dockerfile.gha -t ghcr.io/<owner>/ephpm-ci:latest .
@@ -17,26 +17,17 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ── System build tools ───────────────────────────────────────────────────────
-
+#
+#   - musl-tools/musl-dev: musl-gcc cross-compiler for the prebuilt PHP SDK
+#     (libphp.a is musl-linked).
+#   - libclang-dev: bindgen needs libclang.
+#   - tar/curl: SDK + sqld tarball downloads at build time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Basics
-    build-essential ca-certificates curl git pkg-config \
-    # PHP build deps (what spc doctor installs)
-    autoconf automake bison cmake flex gettext libtool make re2c \
-    # Bindgen needs libclang
-    libclang-dev \
-    # PHP CLI + extensions needed to run static-php-cli
-    software-properties-common gpg-agent \
-    && add-apt-repository -y ppa:ondrej/php \
-    && apt-get update && apt-get install -y --no-install-recommends \
-    php8.4-cli php8.4-xml php8.4-mbstring php8.4-curl php8.4-tokenizer \
+    build-essential ca-certificates curl git pkg-config tar \
+    libclang-dev musl-tools musl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# ── Composer ─────────────────────────────────────────────────────────────────
-
-RUN curl -sS https://getcomposer.org/installer | php8.4 -- --install-dir=/usr/local/bin --filename=composer
-
-# ── Rust stable ──────────────────────────────────────────────────────────────
+# ── Rust stable + nightly (for fmt only) ─────────────────────────────────────
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
@@ -46,20 +37,12 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal \
         --component rustfmt,clippy \
     && rustup toolchain install nightly --component rustfmt \
+    && rustup target add x86_64-unknown-linux-musl \
     && cargo install cargo-nextest --locked \
     && rm -rf /usr/local/cargo/registry
 
-# ── static-php-cli (pre-installed with musl wrapper) ─────────────────────────
-
-WORKDIR /opt/static-php-cli
-RUN git clone --depth 1 https://github.com/crazywhalecc/static-php-cli.git . \
-    && composer install --no-dev --no-interaction --ignore-platform-reqs \
-    && php8.4 bin/spc doctor --auto-fix \
-    && mkdir -p buildroot/bin \
-    && ln -sf /usr/bin/pkg-config buildroot/bin/pkg-config
-
-# Pre-seed the php-sdk directory structure that cargo xtask expects.
-# The xtask will find this via SPC_DIR env var and skip clone/setup.
-ENV SPC_DIR=/opt/static-php-cli
+ENV CC_x86_64_unknown_linux_musl=musl-gcc \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_CC=musl-gcc \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
 
 WORKDIR /src
