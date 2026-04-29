@@ -868,6 +868,13 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
     let dockerfile = root.join("docker").join("Dockerfile");
     let dockerfile_e2e = root.join("docker").join("Dockerfile.e2e");
 
+    // The Dockerfile takes PHP_SDK_VERSION as a full version (e.g. "8.5.2")
+    // so its php-sdk stage layer is keyed deterministically. Resolve any
+    // shorthand the caller passed (e.g. "8.5") via the same table xtask uses.
+    let Some(php_sdk_version) = resolve_php_version(php_version) else {
+        return ExitCode::FAILURE;
+    };
+
     // docker uses "buildx build --load" (BuildKit, result written to local
     // daemon); podman uses plain "build" (already BuildKit-equivalent).
     let build_args: &[&str] =
@@ -875,12 +882,18 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
 
     // Build ephpm image with the specified PHP version
     if dockerfile.exists() {
-        eprintln!("==> Building ephpm container image (PHP {php_version})...");
+        eprintln!("==> Building ephpm container image (PHP {php_sdk_version})...");
         let status = Command::new(ce)
             .args(build_args)
             .args(["-f"])
             .arg(&dockerfile)
-            .args(["--build-arg", &format!("PHP_VERSION={php_version}"), "-t", "ephpm:dev", "."])
+            .args([
+                "--build-arg",
+                &format!("PHP_SDK_VERSION={php_sdk_version}"),
+                "-t",
+                "ephpm:dev",
+                ".",
+            ])
             .current_dir(&root)
             .status();
 
