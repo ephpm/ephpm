@@ -101,7 +101,9 @@ cargo build
 cargo run -- --config ephpm.toml
 
 # Release binary with PHP embedded
-# Prerequisites: php-cli, composer, git, build-essential, autoconf, cmake, pkg-config, re2c, libssl-dev
+# Prerequisites: git, curl, tar, build-essential, pkg-config, libclang-dev, musl-tools (Linux only)
+# The PHP SDK (libphp.a + headers) is downloaded from github.com/ephpm/php-sdk releases —
+# no PHP CLI, Composer, or static-php-cli toolchain required.
 cargo xtask release       # → target/release/ephpm
 
 # A locally built binary can self-install too
@@ -323,15 +325,15 @@ cargo deny check
 ### Build & test tooling (xtask)
 
 ```bash
-cargo xtask release     # Build PHP SDK + ephpm binary (release mode)
-cargo xtask php-sdk     # Build only the static PHP SDK (~15 min first time)
+cargo xtask release     # Download PHP SDK + build ephpm binary (release mode)
+cargo xtask php-sdk     # Download only the prebuilt PHP SDK for the host platform
 cargo xtask e2e-install # Download kind, tilt, kubectl to ./bin (no global install)
 cargo xtask e2e         # Run E2E tests (creates Kind cluster, builds images, tilt ci)
 cargo xtask e2e-up      # Start E2E dev env (tilt dashboard at localhost:10350)
 cargo xtask e2e-down    # Tear down Kind cluster
 ```
 
-On Windows, `release` and `php-sdk` auto-detect the platform and re-invoke themselves inside WSL. The PHP SDK is cached at `php-sdk/static-php-cli/buildroot/` — delete that directory to force a rebuild.
+On Windows, `release` re-invokes itself inside WSL (cross-compiling to musl from native Windows isn't supported). `php-sdk` is a plain tarball download and works directly on any platform with curl + tar. The PHP SDK is cached at `php-sdk/<version>-<os>-<arch>/` — delete that directory to force a re-download.
 
 E2E commands require Podman or Docker. Run `cargo xtask e2e-install` to download kind/tilt/kubectl to `./bin/` — no global install needed. See [docs/developer/testing.md](docs/developer/testing.md) for details.
 
