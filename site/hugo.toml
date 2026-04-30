@@ -56,7 +56,7 @@ hasCJKLanguage = false
 [[menu.main]]
   identifier = "docs"
   name = "Docs"
-  pageRef = "/docs"
+  pageRef = "/getting-started"
   weight = 1
 
 [[menu.main]]
