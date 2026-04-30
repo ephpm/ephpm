@@ -1,4 +1,4 @@
-baseURL = "https://ephpm.io/"
+baseURL = "https://ephpm.dev/"
 title = "ePHPm"
 languageCode = "en-us"
 theme = "hextra"
