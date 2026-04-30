@@ -1,4 +1,7 @@
-# ePHPm CLI Architecture
++++
+title = "CLI"
+weight = 1
++++
 
 Single binary, all commands. Built with `clap` (Rust).
 

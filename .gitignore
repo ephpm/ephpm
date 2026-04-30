@@ -24,6 +24,11 @@ target/
 # Tilt state
 .tilt-dev/
 
+# Hugo build output (cargo xtask docs build)
+/site/public/
+/site/resources/_gen/
+/site/.hugo_build.lock
+
 # OS
 .DS_Store
 Thumbs.db

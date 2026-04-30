@@ -6,48 +6,20 @@ This document covers the HTTP server design, PHP execution model, request lifecy
 
 ## Request Lifecycle
 
-```
-Client Request
-    |
-    v
-TCP Accept (tokio async)
-    |
-    v
-HTTP/1.1 Parse (hyper)
-    |
-    v
-Router::handle()
-    |
-    +-- Request timeout wrapper (server.timeouts.request)
-    |
-    v
-Security Checks (in order)
-    |-- Hidden file check (.env, .git, .htaccess)
-    |-- Blocked path check (server.security.blocked_paths)
-    |-- Trusted proxy resolution (X-Forwarded-For, X-Forwarded-Proto)
-    |
-    v
-Fallback Resolution
-    |-- Try $uri as literal file
-    |-- Try $uri/ as directory (check index_files)
-    |-- Apply fallback rewrite or status code
-    |
-    v
-+------------------+--------------------+
-|                  |                    |
-v                  v                    v
-PHP file       Static file          Status code
-|              |                    |
-|-- Allowlist  |-- Path traversal   +-- 404/403/etc
-|   check      |   check
-|-- Body size  |-- MIME detection
-|   check      |-- Cache-Control
-|-- PHP exec   |-- Gzip compress
-|-- Gzip       |
-|   compress   v
-|              Response
-v
-Response
+```mermaid
+flowchart TD
+    A[Client request] --> B[TCP accept<br/>tokio async]
+    B --> C[HTTP/1.1 parse<br/>hyper]
+    C --> D[Router::handle<br/>wrapped by request timeout]
+    D --> E[Security checks<br/>hidden files · blocked paths · trusted proxy]
+    E --> F[Fallback resolution<br/>$uri → $uri/ → rewrite or status]
+    F --> G{Resolves to}
+    G -->|PHP file| H[Allowlist check<br/>Body size check<br/>PHP execute<br/>Gzip]
+    G -->|Static file| I[Path traversal check<br/>MIME detect<br/>Cache-Control<br/>Gzip]
+    G -->|Status code| J[404 / 403 / etc.]
+    H --> R[Response]
+    I --> R
+    J --> R
 ```
 
 ## PHP Execution Model
