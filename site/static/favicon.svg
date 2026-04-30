@@ -1,0 +1,127 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Gradient for the gear -->
+    <linearGradient id="gearGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E8562A"/>
+      <stop offset="100%" stop-color="#C4411A"/>
+    </linearGradient>
+
+    <!-- Gradient for elephant -->
+    <linearGradient id="elephantGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8B8FD0"/>
+      <stop offset="100%" stop-color="#6A6EB5"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Outer ring / gear shape -->
+  <g transform="translate(256, 210) scale(1.15)">
+    <!-- Gear teeth (12 teeth around the circle) -->
+    <g fill="url(#gearGrad)" opacity="0.25">
+      <rect x="-16" y="-155" width="32" height="36" rx="4" transform="rotate(0)"/>
+      <rect x="-16" y="-155" width="32" height="36" rx="4" transform="rotate(30)"/>
+      <rect x="-16" y="-155" width="32" height="36" rx="4" transform="rotate(60)"/>
+      <rect x="-16" y="-155" width="32" height="36" rx="4" transform="rotate(90)"/>
+      <rect x="-16" y="-155" width="32" height="36" rx="4" transform="rotate(120)"/>
+      <rect x="-16" y="-155" width="32" height="36" rx="4" transform="rotate(150)"/>
+      <rect x="-16" y="-155" width="32" height="36" rx="4" transform="rotate(180)"/>
+      <rect x="-16" y="-155" width="32" height="36" rx="4" transform="rotate(210)"/>
+      <rect x="-16" y="-155" width="32" height="36" rx="4" transform="rotate(240)"/>
+      <rect x="-16" y="-155" width="32" height="36" rx="4" transform="rotate(270)"/>
+      <rect x="-16" y="-155" width="32" height="36" rx="4" transform="rotate(300)"/>
+      <rect x="-16" y="-155" width="32" height="36" rx="4" transform="rotate(330)"/>
+    </g>
+
+    <!-- Gear ring -->
+    <circle cx="0" cy="0" r="140" fill="none" stroke="url(#gearGrad)" stroke-width="6" opacity="0.3"/>
+    <circle cx="0" cy="0" r="120" fill="none" stroke="url(#gearGrad)" stroke-width="2" opacity="0.15"/>
+  </g>
+
+  <!-- Simplified elephant silhouette (PHP mascot, stylized) -->
+  <g transform="translate(266, 200) scale(1.15)" fill="url(#elephantGrad)">
+    <!-- Main body - an ellipse -->
+    <ellipse cx="0" cy="10" rx="80" ry="60"/>
+
+    <!-- Head -->
+    <circle cx="-62" cy="-20" r="42"/>
+
+    <!-- Trunk - clean S-curve, moderate length -->
+    <path d="M-92,-36 C-112,-38 -122,-28 -124,-12 C-126,6 -118,18 -112,26"
+          stroke="url(#elephantGrad)" stroke-width="14" fill="none" stroke-linecap="round"/>
+    <!-- Trunk ridges -->
+    <path d="M-116,0 Q-108,2 -104,-1" stroke="#6A6EB5" stroke-width="1.5" fill="none" opacity="0.4"/>
+    <path d="M-114,12 Q-106,15 -103,11" stroke="#6A6EB5" stroke-width="1.5" fill="none" opacity="0.4"/>
+
+    <!-- Ear - large flap extending out from head -->
+    <ellipse cx="-38" cy="-18" rx="30" ry="38" fill="#7A7EC5" opacity="0.8"/>
+    <ellipse cx="-38" cy="-18" rx="20" ry="28" fill="#5C5FA0" opacity="0.5"/>
+
+    <!-- Eye -->
+    <circle cx="-72" cy="-28" r="5" fill="#111118"/>
+    <circle cx="-73" cy="-29" r="2" fill="#3A3A5A"/>
+
+    <!-- Tusk -->
+    <path d="M-82,-5 Q-90,8 -85,18" stroke="#E8E8F0" stroke-width="4" fill="none" stroke-linecap="round"/>
+
+    <!-- Front legs -->
+    <rect x="-45" y="45" width="22" height="55" rx="10" fill="url(#elephantGrad)"/>
+    <rect x="-20" y="48" width="22" height="52" rx="10" fill="#5E62A3"/>
+
+    <!-- Back legs -->
+    <rect x="20" y="45" width="22" height="55" rx="10" fill="url(#elephantGrad)"/>
+    <rect x="40" y="48" width="22" height="52" rx="10" fill="#5E62A3"/>
+
+    <!-- Tail -->
+    <path d="M78,0 Q100,-15 95,-35 Q93,-40 88,-35 Q90,-18 75,0" fill="#7A7EC5"/>
+  </g>
+
+  <!-- Embedded bracket motif: < / > representing "embedded" -->
+  <g transform="translate(266, 200) scale(1.15)" stroke="#E8562A" stroke-width="5" stroke-linecap="round" fill="none" opacity="0.5">
+    <path d="M-105,75 L-120,90 L-105,105"/>
+    <path d="M105,75 L120,90 L105,105"/>
+    <line x1="-5" y1="72" x2="5" y2="108"/>
+  </g>
+
+  <!-- Text: ePHPm drawn as paths (no font needed) -->
+  <g transform="translate(46, 420)">
+    <!-- "e" in white -->
+    <g fill="#E8E8F0">
+      <!-- e: rounded shape with horizontal bar and open bottom-right -->
+      <rect x="0" y="0" width="60" height="10" rx="2"/>
+      <rect x="0" y="0" width="10" height="60" rx="2"/>
+      <rect x="0" y="25" width="60" height="10" rx="2"/>
+      <rect x="0" y="50" width="60" height="10" rx="2"/>
+      <rect x="50" y="0" width="10" height="35" rx="2"/>
+    </g>
+
+    <!-- "P" in purple -->
+    <g fill="#8B8FD0" transform="translate(80, 0)">
+      <rect x="0" y="0" width="10" height="60" rx="2"/>
+      <rect x="0" y="0" width="55" height="10" rx="2"/>
+      <rect x="0" y="25" width="55" height="10" rx="2"/>
+      <rect x="45" y="0" width="10" height="35" rx="2"/>
+    </g>
+
+    <!-- "H" in purple -->
+    <g fill="#8B8FD0" transform="translate(155, 0)">
+      <rect x="0" y="0" width="10" height="60" rx="2"/>
+      <rect x="50" y="0" width="10" height="60" rx="2"/>
+      <rect x="0" y="25" width="60" height="10" rx="2"/>
+    </g>
+
+    <!-- "P" in purple -->
+    <g fill="#8B8FD0" transform="translate(230, 0)">
+      <rect x="0" y="0" width="10" height="60" rx="2"/>
+      <rect x="0" y="0" width="55" height="10" rx="2"/>
+      <rect x="0" y="25" width="55" height="10" rx="2"/>
+      <rect x="45" y="0" width="10" height="35" rx="2"/>
+    </g>
+
+    <!-- "m" in rust orange -->
+    <g fill="#E8562A" transform="translate(305, 0)">
+      <rect x="0" y="0" width="10" height="60" rx="2"/>
+      <rect x="0" y="0" width="75" height="10" rx="2"/>
+      <rect x="32" y="0" width="10" height="60" rx="2"/>
+      <rect x="65" y="0" width="10" height="60" rx="2"/>
+    </g>
+  </g>
+</svg>

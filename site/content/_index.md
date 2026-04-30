@@ -1,6 +1,10 @@
 +++
 title = "ePHPm"
 toc = false
+type = "docs"
+
+[cascade]
+  type = "docs"
 +++
 
 # ePHPm
@@ -11,6 +15,6 @@ Run PHP applications without the infrastructure. No PHP-FPM, no MySQL server, no
 
 When you need more, it's already built in: MySQL connection pooling, read/write splitting, a Redis-compatible KV store, clustered SQLite with automatic failover, TLS, and Prometheus metrics.
 
-[Get Started →](/docs/getting-started/)
-[Architecture →](/docs/architecture/)
+[Get Started →](/getting-started/)
+[Architecture →](/architecture/)
 [GitHub](https://github.com/ephpm/ephpm)
