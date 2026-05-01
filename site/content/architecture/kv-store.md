@@ -7,17 +7,33 @@ Why a built-in KV? PHP apps want a cache. The default answer is "run Redis." Tha
 
 ## Two access paths, one store
 
-```mermaid
-flowchart TD
-    PHP[PHP code]
-    PHP -->|ephpm_kv_*<br/>in-process · ~100 ns/op| KV
-    PHP -->|RESP2 over :6379<br/>Predis / phpredis<br/>~10–100 µs/op| KV
-    subgraph KV [ephpm-kv crate]
-        direction TB
-        S["strings store<br/>DashMap&lt;String, StringEntry&gt;"]
-        H["hash store<br/>DashMap&lt;String, HashEntry&gt;"]
-        C[transparent compression<br/>gzip · zstd · brotli<br/>threshold-gated]
-    end
+```
+                        ┌───────────────┐
+                        │   PHP code    │
+                        └───────┬───────┘
+                                │
+            ┌───────────────────┴───────────────────┐
+            │                                       │
+   ephpm_kv_* (in-process)              RESP2 over :6379
+        ~100 ns/op                      Predis / phpredis
+            │                              ~10–100 µs/op
+            │                                       │
+            └───────────────┬───────────────────────┘
+                            ▼
+                  ┌─────────────────────┐
+                  │   ephpm-kv crate    │
+                  └──────────┬──────────┘
+                             │
+       ┌─────────────────────┼─────────────────────┐
+       ▼                     ▼                     ▼
+┌──────────────┐      ┌──────────────┐    ┌──────────────────────┐
+│ strings      │      │ hash         │    │ transparent          │
+│ store        │      │ store        │    │ compression          │
+│              │      │              │    │ gzip · zstd · brotli │
+│ DashMap of   │      │ DashMap of   │    │ threshold-gated      │
+│ String →     │      │ String →     │    │                      │
+│ StringEntry  │      │ HashEntry    │    │                      │
+└──────────────┘      └──────────────┘    └──────────────────────┘
 ```
 
 Hash entries are kept separate from string entries because Redis types are mutually exclusive — `WRONGTYPE` errors flow naturally from this split.

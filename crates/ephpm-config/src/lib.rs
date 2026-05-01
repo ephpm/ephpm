@@ -1900,6 +1900,39 @@ compression = "none"
     }
 
     #[test]
+    fn test_env_var_overrides_vec_string() {
+        temp_env::with_var(
+            "EPHPM_CLUSTER__JOIN",
+            Some(r#"["10.0.0.1:7946","10.0.0.2:7946"]"#),
+            || {
+                let config = Config::default_config().unwrap();
+                assert_eq!(
+                    config.cluster.join,
+                    vec!["10.0.0.1:7946".to_string(), "10.0.0.2:7946".to_string()]
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn test_env_var_overrides_vec_pair_string() {
+        temp_env::with_var(
+            "EPHPM_PHP__INI_OVERRIDES",
+            Some(r#"[["display_errors","Off"],["error_reporting","E_ALL"]]"#),
+            || {
+                let config = Config::default_config().unwrap();
+                assert_eq!(
+                    config.php.ini_overrides,
+                    vec![
+                        ["display_errors".to_string(), "Off".to_string()],
+                        ["error_reporting".to_string(), "E_ALL".to_string()],
+                    ]
+                );
+            },
+        );
+    }
+
+    #[test]
     fn test_combined_php_etag_and_compression_config() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("ephpm.toml");

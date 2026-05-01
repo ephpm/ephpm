@@ -1,0 +1,58 @@
+{{- /* Site override of theme's mermaid script. Pinned to mermaid 10 (stable),
+       loaded from CDN, with forced full-width SVG sizing. */ -}}
+
+<style>
+  .hextra-mermaid {
+    display: flex;
+    justify-content: center;
+    width: 100%;
+    margin: 1.5rem 0;
+    background: transparent !important;
+    border: 0 !important;
+    padding: 0 !important;
+    font-family: inherit;
+    overflow-x: auto;
+  }
+  .hextra-mermaid svg {
+    max-width: 100%;
+    height: auto;
+  }
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<script>
+(function () {
+  function theme() {
+    return document.documentElement.classList.contains("dark") ? "dark" : "default";
+  }
+  function init() {
+    document.querySelectorAll(".mermaid").forEach(function (el) {
+      if (!el.dataset.original) el.dataset.original = el.textContent;
+    });
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: theme(),
+      securityLevel: "loose",
+      flowchart: { useMaxWidth: false, htmlLabels: true },
+      sequence: { useMaxWidth: false },
+    });
+    mermaid.run({ querySelector: ".mermaid" });
+  }
+  if (document.readyState === "complete" || document.readyState === "interactive") {
+    init();
+  } else {
+    document.addEventListener("DOMContentLoaded", init);
+  }
+  var pending;
+  new MutationObserver(function () {
+    clearTimeout(pending);
+    pending = setTimeout(function () {
+      document.querySelectorAll(".mermaid").forEach(function (el) {
+        el.innerHTML = el.dataset.original;
+        el.removeAttribute("data-processed");
+      });
+      init();
+    }, 150);
+  }).observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+})();
+</script>

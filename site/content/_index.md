@@ -7,8 +7,6 @@ type = "docs"
   type = "docs"
 +++
 
-# ePHPm
-
 **Embedded PHP application server, written in Rust.**
 
 Run PHP applications without the infrastructure. No PHP-FPM, no MySQL server, no Redis, no reverse proxy, no certbot. One binary, one config file. Drop in WordPress or Laravel and go.

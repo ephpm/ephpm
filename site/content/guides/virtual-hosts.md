@@ -90,29 +90,29 @@ Port numbers and trailing dots are stripped before matching. The match is exact 
 
 All sites share one ephpm process and tokio's `spawn_blocking` thread pool. A request to `alice-blog.com` and a request to `bobs-recipes.com` are handled by the same threads — the router sets the correct document root and database before dispatching to PHP.
 
-```mermaid
-graph TD
-    subgraph ephpm["ePHPm (single process)"]
-        router["Router\n(Host → site directory)"]
-        workers["PHP Threads (ZTS)\n(shared spawn_blocking pool)"]
-
-        subgraph sites["Site Backends"]
-            site1["alice-blog.com\nrusqlite → alice/ephpm.db"]
-            site2["bobs-recipes.com\nrusqlite → bobs/ephpm.db"]
-            site3["cool-photos.net\nrusqlite → cool/ephpm.db"]
-        end
-
-        router --> workers
-        workers --> site1
-        workers --> site2
-        workers --> site3
-    end
-
-    fallback["Fallback site\n/var/www/default"]
-    router -->|no match| fallback
-
-    style ephpm fill:#f5f5f5,stroke:#333
-    style sites fill:#e8f5e9,stroke:#388e3c
+```
+   ┌──────────────────── ePHPm (single process) ────────────────────┐
+   │                                                                │
+   │   ┌──────────────────────────────┐                             │
+   │   │ Router                       │ ──── no match ──────────────┼──► Fallback site
+   │   │ (Host → site directory)      │                             │    /var/www/default
+   │   └──────────────┬───────────────┘                             │
+   │                  │                                             │
+   │                  ▼                                             │
+   │   ┌──────────────────────────────┐                             │
+   │   │ PHP Threads (ZTS)            │                             │
+   │   │ (shared spawn_blocking pool) │                             │
+   │   └──────────────┬───────────────┘                             │
+   │                  │                                             │
+   │   ┌──────────────┴────── Site Backends ─────────────┐          │
+   │   │                                                 │          │
+   │   │   alice-blog.com    rusqlite → alice/ephpm.db   │          │
+   │   │   bobs-recipes.com  rusqlite → bobs/ephpm.db    │          │
+   │   │   cool-photos.net   rusqlite → cool/ephpm.db    │          │
+   │   │                                                 │          │
+   │   └─────────────────────────────────────────────────┘          │
+   │                                                                │
+   └────────────────────────────────────────────────────────────────┘
 ```
 
 This is efficient — 20 sites don't need 20x the threads. Any `spawn_blocking` thread can serve any site.

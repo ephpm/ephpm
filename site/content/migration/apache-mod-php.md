@@ -172,36 +172,16 @@ blocked_paths = ["vendor/*", "wp-config.php"]
 # Stop Apache
 sudo systemctl stop apache2
 
-# Start ePHPm
-./ephpm --config ephpm.toml
-
-# Verify it works
+# Smoke-test ePHPm in the foreground first
+sudo ephpm serve --config /etc/ephpm/ephpm.toml &
 curl http://localhost:8080
+kill %1
 
-# When satisfied, disable Apache and enable ePHPm
+# Install ePHPm as a system service (registers + starts it)
+sudo ephpm install
+
+# Disable Apache from boot
 sudo systemctl disable apache2
-```
-
-Create a systemd service for ePHPm:
-
-```ini
-# /etc/systemd/system/ephpm.service
-[Unit]
-Description=ePHPm PHP Application Server
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/ephpm --config /etc/ephpm/ephpm.toml
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-```bash
-sudo systemctl enable ephpm
-sudo systemctl start ephpm
 ```
 
 ## What You Gain

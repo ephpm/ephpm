@@ -12,18 +12,29 @@ This document describes the full vision for ePHPm. The matrix below tracks what 
 |---------|--------|-------|
 | HTTP/1.1 | **Implemented** | hyper server, async accept loop |
 | HTTP/2 | Planned | Dependency present, no code yet |
-| TLS / ACME | Planned | No code or dependencies yet |
+| TLS / ACME | **Implemented** | `rustls` + `rustls-acme` in `ephpm-server` |
 | PHP embedding (ZTS) | **Implemented** | Full SAPI, concurrent via `spawn_blocking` + per-thread TSRM |
+| PHP embedding (NTS / Windows) | **Implemented** | Serialized execution; Windows DLL constraints prevent ZTS |
 | Static file serving | **Implemented** | MIME detection, path traversal protection |
 | Request routing | **Implemented** | `.php` → PHP, pretty permalinks → `index.php`, else static |
 | Configuration | **Implemented** | Figment — TOML + `EPHPM_` env var overrides |
 | CLI | Partial | `--config` flag only; no subcommands yet |
 | Graceful shutdown | Partial | Stops accepting; does not drain in-flight connections |
 | Signal handling | Partial | Ctrl+C only; no SIGHUP reload |
-| Observability | Partial | `tracing` crate logging; no OTLP export |
-| DB proxy | Partial | MySQL transparent proxy (connection pooling, wire protocol, reset strategy); PostgreSQL placeholder; read/write splitting and replication not yet |
-| KV store | **Implemented (single-node)** | RESP2 protocol server (~30 Redis commands), TTL/expiry, memory tracking, DashMap-backed store; clustering planned |
-| Clustering / gossip | Planned | Multi-node coordination — not started |
+| Observability — logging | **Implemented** | `tracing` crate, structured logs, request lifecycle events |
+| Observability — query stats | **Implemented** | `ephpm-query-stats`: SQL normalization, digest tracking, slow query log, Prometheus metrics |
+| Observability — OTLP export | Planned | Auto-instrumentation pipeline — not started |
+| DB proxy (MySQL) | **Implemented** | Wire protocol, connection pooling, transparent forwarding to upstream MySQL |
+| DB proxy (PostgreSQL) | Planned | Placeholder only |
+| Read/write splitting | **Implemented** | `ephpm-db` routes reads to replicas, writes to primary |
+| Single-node SQLite | **Implemented** | `litewire` + `rusqlite` in-process; `pdo_mysql` clients connect transparently |
+| Clustered SQLite | **Implemented** | `litewire` + embedded `sqld` sidecar; WAL frame replication via gRPC |
+| sqld embedding | **Implemented** | Binary embedded via `include_bytes!()`; spawned per-role; auto-restart on role change |
+| Primary election | **Implemented** | Gossip KV tier (`kv:sqlite:primary`), lowest ordinal wins, TTL heartbeat |
+| KV store (single-node) | **Implemented** | RESP2 server (~30 Redis commands), TTL/expiry, DashMap-backed, SAPI bridge for zero-overhead PHP access |
+| KV store (clustering) | **Implemented** | Gossip discovery, consistent hash ring, cross-node replication |
+| KV compression | **Implemented** | gzip / zstd / brotli for stored values |
+| Clustering / gossip | **Implemented** | SWIM via `chitchat` in `ephpm-cluster` |
 | Admin UI / API | Planned | Management interface — not started |
 | External PHP mode | Planned | Spawn external PHP workers over pipes — use any PHP binary |
 | `ephpm doctor` | Planned | System diagnostics command — not started |
@@ -167,25 +178,37 @@ ephpm admin --nodes 10.0.1.1:9090,10.0.1.2:9090,10.0.1.3:9090
 
 ### Production Cluster Layout
 
-```mermaid
-flowchart TB
-    subgraph Cluster ["Production Cluster"]
-        direction TB
-        subgraph Nodes [" "]
-            direction LR
-            N1["Node 1 — ephpm serve<br/>PHP :443 · DB Proxy · KV<br/>OTLP :4318 · Node API :9090"]
-            N2["Node 2 — ephpm serve<br/>PHP :443 · DB Proxy · KV<br/>OTLP :4318 · Node API :9090"]
-            N3["Node 3 — ephpm serve<br/>PHP :443 · DB Proxy · KV<br/>OTLP :4318 · Node API :9090"]
-        end
-        Admin["Admin instance<br/>ephpm admin :8080"]
-        Admin --- N1
-        Admin --- N2
-        Admin --- N3
-    end
-    Prom[Prometheus] -->|"GET /metrics"| N1
-    Prom -->|"GET /metrics"| N2
-    Prom -->|"GET /metrics"| N3
-    Graf[Grafana] -->|PromQL| Prom
+```
+   ┌──────────────────────────── Production Cluster ────────────────────────────┐
+   │                                                                            │
+   │   ┌───────────────┐        ┌───────────────┐        ┌───────────────┐     │
+   │   │ Node 1        │        │ Node 2        │        │ Node 3        │     │
+   │   │ ephpm serve   │        │ ephpm serve   │        │ ephpm serve   │     │
+   │   │ PHP :443      │        │ PHP :443      │        │ PHP :443      │     │
+   │   │ DB Proxy · KV │        │ DB Proxy · KV │        │ DB Proxy · KV │     │
+   │   │ OTLP :4318    │        │ OTLP :4318    │        │ OTLP :4318    │     │
+   │   │ NodeAPI :9090 │        │ NodeAPI :9090 │        │ NodeAPI :9090 │     │
+   │   └───────┬───────┘        └───────┬───────┘        └───────┬───────┘     │
+   │           │                        │                        │             │
+   │           └─────────────┬──────────┴──────────┬─────────────┘             │
+   │                         │                     │                           │
+   │                ┌────────┴─────────────────────┴────────┐                  │
+   │                │  Admin instance — ephpm admin :8080   │                  │
+   │                └───────────────────────────────────────┘                  │
+   └────────────────────────────────────────────────────────────────────────────┘
+                ▲                       ▲                       ▲
+                │ GET /metrics          │ GET /metrics          │ GET /metrics
+                │                       │                       │
+                └───────────┬───────────┴───────────┬───────────┘
+                            │                       │
+                    ┌───────┴───────────────────────┴───────┐
+                    │             Prometheus                │
+                    └────────────────────┬──────────────────┘
+                                         │ PromQL
+                                         ▼
+                                  ┌───────────┐
+                                  │  Grafana  │
+                                  └───────────┘
 ```
 
 ### Node API Specification
@@ -247,22 +270,27 @@ password = "changeme"                 # admin UI auth (separate from node API au
 |---|---|
 | Async runtime | `tokio` |
 | HTTP/1.1 + HTTP/2 | `hyper` |
-| HTTP/3 (QUIC) | `quinn` |
+| HTTP/3 (QUIC) | `quinn` (planned) |
 | TLS | `rustls` |
 | Automatic ACME TLS | `rustls-acme` |
-| PHP embedding | Rust FFI + libphp (reference: `ext-php-rs`, `ripht-php-sapi`) |
+| PHP embedding | Custom Rust FFI + `libphp` (linked via `ephpm-php`'s `build.rs` + `bindgen`) |
 | Concurrent hashmap (KV store) | `dashmap` |
-| Cluster membership | `chitchat` (Quickwit's gossip lib) or custom SWIM |
+| KV value compression | `flate2` (gzip), `zstd`, `brotli` |
+| Cluster membership | `chitchat` (Quickwit's SWIM gossip lib) |
 | Consistent hashing | `hashring` |
-| MySQL protocol | `sqlparser-rs` (query parsing), custom wire protocol |
-| PostgreSQL protocol | Custom wire protocol |
+| MySQL/SQLite wire bridge | [`litewire`](https://github.com/ephpm/litewire) (path dep) — MySQL wire protocol → SQLite translation, query parsing via `sqlparser-rs` |
+| Embedded SQLite (single-node) | `rusqlite` (linked into `litewire`'s in-process backend) |
+| Embedded SQLite (clustered HA) | [`sqld`](https://github.com/tursodatabase/libsql) v0.24.32 — binary embedded via `include_bytes!()`, spawned per role, gRPC WAL frame replication |
+| MySQL upstream connection pooling | Custom pool in `ephpm-db` (R/W splitting, health checks) |
+| PostgreSQL protocol | Placeholder — wire protocol planned |
+| Query observability | Custom in `ephpm-query-stats` (digest tracker, normalizer state machine, slow-query log, Prometheus export) |
 | Prometheus metrics | `prometheus` crate |
-| OTLP receiver/exporter | `opentelemetry-otlp`, `opentelemetry-sdk` |
-| Protobuf (OTLP wire format) | `prost`, `tonic` (gRPC) |
-| Static PHP builds | `crazywhalecc/static-php-cli` (for CI) |
+| OTLP receiver/exporter | `opentelemetry-otlp`, `opentelemetry-sdk` (planned) |
+| Protobuf (OTLP wire format) | `prost`, `tonic` (gRPC) (planned) |
+| Static PHP builds | `crazywhalecc/static-php-cli` (in `cargo xtask release`) |
 | Embedded static assets | `rust-embed` |
 | CLI | `clap` |
-| Configuration | `toml` / `serde` |
+| Configuration | `figment` — TOML + `EPHPM_*` env var overrides |
 
 ---
 
@@ -270,20 +298,22 @@ password = "changeme"                 # admin UI auth (separate from node API au
 
 ### Status
 
-**Currently Implemented (v0.5 preview):**
-- Single-node in-memory KV store using DashMap (lock-free concurrent hashmap)
+**Implemented:**
+- Single-node in-memory KV store using DashMap (lock-sharded concurrent hash map)
 - RESP2 protocol server accepting Redis-compatible clients
-- ~30 Redis commands implemented: GET, SET, DEL, EXPIRE, TTL, INCR, APPEND, KEYS, MGET, MSET, GETSET, etc.
+- ~30 Redis commands: GET, SET, DEL, EXPIRE, TTL, INCR, APPEND, KEYS, MGET, MSET, GETSET, etc.
 - **SAPI bridge** for direct PHP access (zero serialization, zero network hop): `ephpm_kv_get`, `ephpm_kv_set`, `ephpm_kv_del`, `ephpm_kv_exists`, `ephpm_kv_incr_by`, `ephpm_kv_expire`, `ephpm_kv_pttl`
+- Hash store (separate DashMap) — `HGET` / `HSET` / `HGETALL` family
+- Transparent value compression — gzip / zstd / brotli, threshold-gated
 - TTL / expiry with background sweeper + lazy expiry on access
 - Approximate memory tracking (via `mem_used()`)
 - INFO command with basic server and memory stats
 - Thread-local get buffer for safe C FFI result passing
+- **Clustering** — gossip-based peer discovery (`chitchat`), consistent hash ring, cross-node replication, owner / replica routing for keys (in `ephpm-cluster`)
 
 **Planned / Not Yet Implemented:**
-- Additional data structures (hashes, lists, sets, sorted sets) — currently strings only
-- Clustering (gossip discovery, consistent hash ring, cross-node replication)
-- Persistence (AOF/snapshots)
+- Additional data structures (lists, sets, sorted sets) — currently strings + hashes only
+- Persistence (AOF / snapshots)
 - Eviction policies (LRU, random)
 - Memory limit enforcement
 
@@ -1325,6 +1355,70 @@ When `inject_env` is disabled, the developer manually points their app at the pr
 
 ---
 
+## Embedded Database (SQLite, litewire, sqld)
+
+ePHPm has three database paths, all transparent to PHP — apps connect to `127.0.0.1:3306` via `pdo_mysql` regardless of which path is active:
+
+1. **DB Proxy** (`[db.mysql]`) — forwards MySQL wire traffic to a real MySQL/PostgreSQL upstream. Connection pooling, R/W splitting, health checks. (Covered in [§DB Proxy & Connection Pooling](#db-proxy--connection-pooling) above.)
+2. **Single-node SQLite** (`[db.sqlite]`) — `litewire` + `rusqlite` in-process. No external database, no separate process.
+3. **Clustered SQLite** (`[db.sqlite]` + `[cluster]`) — `litewire` plus a managed `sqld` child process. WAL frames replicated to replicas over gRPC.
+
+The same PHP code (and the same `DB_HOST=127.0.0.1` config) runs against all three.
+
+### Mode detection
+
+ePHPm picks a mode at startup based on config:
+
+- `replication.role = "primary"` or `"replica"` → clustered
+- `replication.role = "auto"` AND `cluster.enabled = true` → clustered (role chosen by election)
+- otherwise → single-node (rusqlite in-process)
+
+In clustered/auto mode, ePHPm spawns `sqld` as a child process and watches for role changes via gossip. On failover, the role-change watcher sends `SIGTERM` to the running `sqld`, waits for shutdown, then re-spawns with the new args.
+
+### litewire — MySQL wire → SQLite translation
+
+[litewire](https://github.com/ephpm/litewire) is a standalone Rust library at `github.com/ephpm/litewire`. It accepts MySQL wire-protocol traffic on `:3306`, parses queries with `sqlparser-rs`, translates dialect-specific constructs to SQLite, and dispatches to a pluggable backend:
+
+- **In single-node mode**, the backend is `rusqlite` — direct in-process file access. Zero network hops, zero serialization.
+- **In clustered mode**, the backend is an HTTP/Hrana client pointed at the local `sqld` instance. `sqld` holds the actual database file and replicates writes.
+
+ePHPm uses litewire as a library: `LiteWire::new(backend).mysql(addr).serve()`. The `TrackedBackend` wrapper in `crates/ephpm-server/src/tracked_backend.rs` decorates any backend with query-stats recording. Disable with `[db.analysis] query_stats = false`.
+
+### sqld binary embedding
+
+`sqld` is Turso's standalone SQLite server binary. ePHPm embeds it directly into the `ephpm` binary via `include_bytes!()` so the single-binary distribution model is preserved.
+
+How it gets there:
+
+1. `cargo xtask release` downloads `sqld` v0.24.32 from Turso's GitHub Releases and exposes the path via `SQLD_BINARY_PATH`.
+2. `crates/ephpm-sqld/build.rs` reads `SQLD_BINARY_PATH` and emits an `include_bytes!()` for that file, plus the `sqld_embedded` cfg flag.
+3. At runtime, `ephpm-sqld` extracts the embedded bytes to a temp file, `chmod +x`'s it, and `Command::spawn()`s it with role-appropriate args.
+4. Health is polled via `/health` until ready before traffic flows.
+
+When `SQLD_BINARY_PATH` is unset (dev / stub builds), `ephpm-sqld` compiles in stub mode — `SqldProcess::spawn()` returns a clear error rather than silently doing nothing. This is gated by `#[cfg(sqld_embedded)]`.
+
+### Primary election
+
+In clustered mode with `role = "auto"`, primary election uses the gossip KV tier. Logic lives in `crates/ephpm-cluster/src/sqlite_election.rs`:
+
+- Each candidate writes its node ordinal to the KV key `kv:sqlite:primary` with a TTL.
+- The lowest-ordinal live node wins.
+- The winner refreshes the key periodically (heartbeat); on failure, the TTL expires and the next-lowest live node takes over.
+- Followers watch the key; when they see a new owner, they restart `sqld` in replica mode and reconnect.
+
+This shares the gossip / KV machinery already used for cross-node KV replication — there's no separate Raft cluster or external coordinator.
+
+### Windows note
+
+`sqld` is not supported on Windows. Turso doesn't publish Windows binaries for it, so:
+
+- `cargo xtask release --target windows` errors out if you try to embed it.
+- `start_clustered_sqlite()` bails with a clear message on `#[cfg(target_os = "windows")]`.
+
+Single-node SQLite (rusqlite in-process) and the MySQL/PG DB proxy work fine on Windows. Only clustered SQLite is Linux/macOS-only.
+
+---
+
 ## Latency Analysis: ePHPm vs Competitors
 
 ### PHP Embedding Overhead Per Request
@@ -1546,7 +1640,7 @@ Key benchmarks to publish:
 
 ## Repository Structure
 
-Cargo workspace with virtual manifest and `crates/` directory:
+Cargo workspace with a virtual manifest and `crates/` directory:
 
 ```
 ephpm/
@@ -1560,69 +1654,55 @@ ephpm/
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml              # Lint, test, deny
-│       └── release.yml         # Build matrix (PHP 8.3/8.4 × linux/mac/windows)
+│       └── release.yml         # Build matrix (PHP 8.4/8.5 × linux/mac/windows)
 ├── crates/
-│   ├── ephpm/                  # Binary crate (main entry point)
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       └── main.rs         # CLI (clap), config loading, server boot
-│   ├── ephpm-server/           # HTTP server crate
-│   │   ├── Cargo.toml
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── router.rs       # Route .php to PHP, else static files
-│   │       └── static_files.rs # Static file serving
-│   ├── ephpm-php/              # PHP embedding crate
-│   │   ├── Cargo.toml
-│   │   ├── build.rs            # bindgen + link libphp.a
-│   │   ├── wrapper.h           # C header includes for bindgen
-│   │   └── src/
-│   │       ├── lib.rs
-│   │       ├── sapi.rs         # Custom SAPI implementation
-│   │       ├── request.rs      # HTTP request → PHP request mapping
-│   │       └── response.rs     # PHP output → HTTP response mapping
-│   └── ephpm-config/           # Configuration crate
-│       ├── Cargo.toml
-│       └── src/
-│           └── lib.rs          # Config structs + figment loading
+│   ├── ephpm/                  # CLI binary — clap args, config loading, server boot, graceful shutdown
+│   ├── ephpm-server/           # HTTP server (hyper + tokio) — routing, static files, TLS/ACME, metrics, litewire/SQLite startup, query stats
+│   ├── ephpm-php/              # PHP embedding via FFI — SAPI, build.rs + bindgen, ZTS thread-per-request, NTS Windows
+│   ├── ephpm-config/           # Configuration (figment) — TOML + EPHPM_* env var overrides
+│   ├── ephpm-kv/               # Embedded KV store — DashMap, RESP2, TTL/expiry, gzip/zstd/brotli compression
+│   ├── ephpm-db/               # DB proxy — MySQL wire, connection pooling, R/W splitting
+│   ├── ephpm-cluster/          # Clustering — SWIM gossip (chitchat), consistent hash ring, KV replication, SQLite primary election
+│   ├── ephpm-sqld/             # sqld embedding — binary extracted via include_bytes!, child process lifecycle, health checks
+│   ├── ephpm-query-stats/      # Query observability — SQL normalizer, digest tracker, slow query log, Prometheus metrics
+│   └── ephpm-e2e/              # E2E test harness — EXCLUDED from the workspace; runs in Docker via `cargo xtask e2e`
+├── xtask/                      # Build & test tooling — `release`, `php-sdk`, `e2e`, `e2e-up`, `e2e-down`, `docs install/serve/build/check`
 ├── benches/
 │   └── throughput.rs           # Criterion benchmarks
 ├── tests/
-│   └── integration/
-│       └── wordpress.rs        # WordPress smoke test
-└── docs/
-    ├── analysis/               # Competitive analysis
-    └── architecture/           # Architecture docs
+│   └── integration/            # Cross-crate integration tests
+├── site/                       # Hugo + Hextra docs site (this site)
+└── docs/                       # Legacy markdown docs (being migrated to site/)
 ```
 
 ---
 
-## MVP Specification
+## Where We Are Today
 
-### Goal
+The original MVP — single binary, hyper + PHP, TOML config, WordPress demo — shipped. Most of the deferred-MVP list shipped too. The Feature Status matrix at the top of this page is the authoritative tracker; below is a rough grouping for readers scanning the implementation surface.
 
-A single Rust binary that reads a TOML config, boots an HTTP server, embeds PHP via libphp, and serves a WordPress site.
+**Foundations** — complete:
 
-### What the MVP Includes
+- HTTP/1.1 (hyper + tokio), static files, `.php` routing, pretty-permalink fallback
+- PHP embedding via custom SAPI: ZTS on Linux/macOS (concurrent via `spawn_blocking` + per-thread TSRM), NTS on Windows (serialized, due to DLL constraints)
+- Figment-based config: TOML + `EPHPM_*` env var overrides
+- TLS + ACME (`rustls` + `rustls-acme`)
 
-1. **`ephpm` binary** — single Rust binary with PHP statically linked
-2. **TOML config** — `ephpm.toml` with `[server]` and `[php]` sections
-3. **HTTP server** — hyper-based, HTTP/1.1 + HTTP/2
-4. **PHP execution** — custom SAPI, ZTS mode, concurrent via `spawn_blocking` + TSRM
-5. **Static file serving** — CSS/JS/images served directly (not through PHP)
-6. **WordPress demo** — documented setup
+**Storage and data** — complete:
 
-### What the MVP Does NOT Include
+- DB proxy (MySQL wire, connection pooling, R/W splitting)
+- Single-node SQLite via [litewire](https://github.com/ephpm/litewire) + `rusqlite`, transparent to PHP via `pdo_mysql`
+- Clustered SQLite via litewire + embedded `sqld` sidecar (gRPC WAL frame replication)
+- KV store: DashMap-backed, RESP2 protocol, gzip/zstd/brotli compression, SAPI bridge for in-process PHP access
+- Clustering: SWIM gossip (`chitchat`), consistent hash ring, KV replication, SQLite primary election
 
-- TLS / ACME
-- DB proxy / connection pooling
-- KV store
-- Clustering
-- Observability / admin UI
-- Worker mode (persistent PHP processes)
-- ZTS / multi-threaded PHP
+**Observability** — partial:
 
-### MVP Request Flow
+- `tracing`-based structured logs
+- Query stats: SQL normalizer, digest tracker, slow-query log, Prometheus `/metrics` endpoint
+- OTLP export, auto-instrumentation pipeline, admin UI — planned
+
+### Request Flow Today
 
 ```
 Client ──HTTP──► hyper (tokio)
@@ -1635,10 +1715,19 @@ Client ──HTTP──► hyper (tokio)
             └───┬───────┬───┘
             no  │       │ yes
                 ▼       ▼
-          static file   spawn_blocking
-          serving           │
+          static file   spawn_blocking task
+          serving       (auto-registers a fresh
+                         PHP TSRM context the
+                         first time the OS thread
+                         touches PHP)
+                            │
                             ▼
-                     Mutex<PhpRuntime>
+                     ephpm_wrapper.c
+                     (zend_try / zend_catch
+                      around PHP entry points,
+                      so setjmp/longjmp from
+                      PHP can never unwind into
+                      Rust)
                             │
                      1. Set SAPI request info
                      2. php_request_startup()
@@ -1672,7 +1761,7 @@ Client ◄──HTTP──────────────┘
 
 ### CI Matrix
 
-One binary per PHP version per platform (static linking). CI matrix builds for PHP 8.3 and 8.4 across all supported platforms.
+One binary per PHP version per platform (static linking). CI matrix builds for PHP 8.4 and 8.5 across all supported platforms.
 
 **Platform matrix:**
 
@@ -1684,7 +1773,7 @@ One binary per PHP version per platform (static linking). CI matrix builds for P
 | macOS Intel | `x86_64-apple-darwin` | Older Macs, CI runners |
 | Windows x86_64 | `x86_64-pc-windows-msvc` | Developer machines (native Windows dev) |
 
-Release artifacts: `ephpm-0.1.0-php8.4-linux-x86_64`, `ephpm-0.1.0-php8.4-windows-x86_64.exe`, etc. Linux is the primary production target. macOS and Windows builds enable native local development without Docker/WSL.
+Release artifacts: `ephpm-0.1.0-php8.5-linux-x86_64`, `ephpm-0.1.0-php8.5-windows-x86_64.exe`, etc. Linux is the primary production target. macOS and Windows builds enable native local development without Docker/WSL.
 
 ---
 

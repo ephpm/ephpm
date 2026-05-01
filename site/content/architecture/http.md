@@ -6,20 +6,42 @@ This document covers the HTTP server design, PHP execution model, request lifecy
 
 ## Request Lifecycle
 
-```mermaid
-flowchart TD
-    A[Client request] --> B[TCP accept<br/>tokio async]
-    B --> C[HTTP/1.1 parse<br/>hyper]
-    C --> D[Router::handle<br/>wrapped by request timeout]
-    D --> E[Security checks<br/>hidden files · blocked paths · trusted proxy]
-    E --> F[Fallback resolution<br/>$uri → $uri/ → rewrite or status]
-    F --> G{Resolves to}
-    G -->|PHP file| H[Allowlist check<br/>Body size check<br/>PHP execute<br/>Gzip]
-    G -->|Static file| I[Path traversal check<br/>MIME detect<br/>Cache-Control<br/>Gzip]
-    G -->|Status code| J[404 / 403 / etc.]
-    H --> R[Response]
-    I --> R
-    J --> R
+```
+   Client request
+        │
+        ▼
+   TCP accept (tokio async)
+        │
+        ▼
+   HTTP/1.1 parse (hyper)
+        │
+        ▼
+   Router::handle (wrapped by request timeout)
+        │
+        ▼
+   Security checks
+     · hidden files · blocked paths · trusted proxy
+        │
+        ▼
+   Fallback resolution
+     $uri → $uri/ → rewrite or status
+        │
+        ▼
+   Resolves to:
+        │
+        ├──── PHP file ─────► Allowlist check ──┐
+        │                     Body size check    │
+        │                     PHP execute        │
+        │                     Gzip               │
+        │                                        │
+        ├──── Static file ──► Path traversal ───┤
+        │                     MIME detect       │
+        │                     Cache-Control     │
+        │                     Gzip              │
+        │                                       │
+        └──── Status code ──► 404 / 403 / etc.──┤
+                                                ▼
+                                            Response
 ```
 
 ## PHP Execution Model
