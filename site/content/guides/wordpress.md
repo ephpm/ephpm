@@ -51,7 +51,7 @@ path = "/var/lib/ephpm/wordpress.db"
 Restart the service:
 
 ```bash
-sudo systemctl restart ephpm
+sudo ephpm restart
 ```
 
 ## 3. Tell WordPress about the database

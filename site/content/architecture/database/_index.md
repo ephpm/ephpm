@@ -27,31 +27,37 @@ ePHPm operates in two modes depending on whether clustering is enabled. The key 
 
 No sqld, no child processes. litewire runs entirely in-process with a rusqlite backend. This is the lightest possible deployment — just ephpm and a `.db` file.
 
-```mermaid
-graph TD
-    subgraph pod["ePHPm (single node)"]
-        http["HTTP Server"]
-        php["PHP Runtime"]
-        mysql_fe["litewire\nMySQL wire :3306"]
-        hrana_fe["litewire\nHrana HTTP :8080"]
-        translate["SQL Translator"]
-        rusqlite["rusqlite\n(in-process)"]
-        dbfile[("ephpm.db")]
-
-        http --> php
-        php -->|pdo_mysql| mysql_fe
-        mysql_fe --> translate
-        translate --> rusqlite
-        hrana_fe --> rusqlite
-        rusqlite --> dbfile
-    end
-
-    ext["External tools\n(libsql SDK, Turso CLI,\nmysql CLI)"] --> hrana_fe
-
-    style pod fill:#f9f9f9,stroke:#333
-    style translate fill:#e3f2fd,stroke:#1565c0
-    style rusqlite fill:#e8f5e9,stroke:#388e3c
-    style dbfile fill:#fff3e0,stroke:#ef6c00
+```
+   ┌────────────────── ePHPm (single node) ──────────────────────┐
+   │                                                             │
+   │   HTTP Server                                                │
+   │       │                                                      │
+   │       ▼                                                      │
+   │   PHP Runtime                                                │
+   │       │                                                      │
+   │       │ pdo_mysql                                            │
+   │       ▼                                                      │
+   │   ┌───────────────┐         ┌──────────────────────┐        │
+   │   │ litewire      │         │ litewire             │        │
+   │   │ MySQL :3306   │         │ Hrana HTTP :8080     │ ◄──────┼──── External tools
+   │   └───────┬───────┘         └──────────┬───────────┘        │     (libsql SDK,
+   │           │                            │                    │      Turso CLI,
+   │           ▼                            │                    │      mysql CLI)
+   │   ┌───────────────┐                    │                    │
+   │   │ SQL Translator│                    │                    │
+   │   └───────┬───────┘                    │                    │
+   │           │                            │                    │
+   │           └──────────┬─────────────────┘                    │
+   │                      ▼                                      │
+   │              ┌───────────────┐                              │
+   │              │ rusqlite      │                              │
+   │              │ (in-process)  │                              │
+   │              └───────┬───────┘                              │
+   │                      ▼                                      │
+   │                ╭───────────╮                                │
+   │                │ ephpm.db  │                                │
+   │                ╰───────────╯                                │
+   └─────────────────────────────────────────────────────────────┘
 ```
 
 Configuration:
@@ -71,38 +77,33 @@ sqld (libsql-server) is spawned as a child process on each node for replication 
 
 sqld v0.24.32 is embedded in the ephpm binary via `include_bytes!()` — no separate install needed. At startup, ephpm extracts it to a temp path and spawns it as a child process.
 
-```mermaid
-graph TD
-    subgraph cluster["ePHPm Cluster (3 nodes)"]
-        subgraph node0["Node 0 (primary)"]
-            fe0["litewire\n(MySQL wire)"]
-            translate0["SQL Translator"]
-            hrana_client0["HranaClient\n(HTTP client)"]
-            sqld0["sqld\n(primary mode)"]
-            db0[("app.db")]
-            fe0 --> translate0 --> hrana_client0
-            hrana_client0 -->|Hrana HTTP| sqld0
-            sqld0 --> db0
-        end
+```
+   ePHPm Cluster (3 nodes — primary + 2 replicas)
 
-        subgraph node1["Node 1 (replica)"]
-            fe1["litewire\n(MySQL wire)"]
-            translate1["SQL Translator"]
-            hrana_client1["HranaClient"]
-            sqld1["sqld\n(replica mode)"]
-            db1[("app.db\n(local copy)")]
-            fe1 --> translate1 --> hrana_client1
-            hrana_client1 -->|Hrana HTTP| sqld1
-            sqld1 --> db1
-        end
-
-        sqld1 -->|"gRPC sync\n(WAL frames)"| sqld0
-        sqld1 -.->|write forwarding| sqld0
-    end
-
-    style cluster fill:#f5f5f5,stroke:#333
-    style node0 fill:#e8f5e9,stroke:#388e3c
-    style node1 fill:#e1f5fe,stroke:#0288d1
+   Node 0 (primary)              Node 1 (replica)              Node 2 (replica)
+   ────────────────              ────────────────              ────────────────
+   litewire (MySQL wire)         litewire (MySQL wire)         (same as Node 1)
+        │                             │
+        ▼                             ▼
+   SQL Translator                SQL Translator
+        │                             │
+        ▼                             ▼
+   HranaClient                   HranaClient
+   (HTTP client)                 (HTTP client)
+        │                             │
+        │ Hrana HTTP                  │ Hrana HTTP
+        ▼                             ▼
+   ┌─────────────────┐  WAL sync ┌─────────────────┐
+   │ sqld            │ ◄──gRPC── │ sqld            │
+   │ (primary mode)  │           │ (replica mode)  │
+   │                 │ ──gRPC──► │                 │
+   └────────┬────────┘ writes    └────────┬────────┘
+            │          forwarded          │
+            ▼                             ▼
+       ╭────────╮                ╭─────────────────╮
+       │ app.db │                │ app.db          │
+       ╰────────╯                │ (local copy)    │
+                                 ╰─────────────────╯
 ```
 
 Configuration:
@@ -251,15 +252,22 @@ EPHPM_DB__SQLITE__REPLICATION__ROLE=auto
 
 ### Mode Detection
 
-```mermaid
-flowchart TD
-    A{"[db.sqlite] configured?"}
-    A -->|no| Z[no SQLite — only DB proxy if [db.mysql]]
-    A -->|yes| B{"replication.role"}
-    B -->|primary or replica| C[clustered<br/>sqld sidecar]
-    B -->|auto| D{"[cluster] enabled?"}
-    D -->|yes| E[clustered<br/>sqld + gossip-elected primary]
-    D -->|no| F[single-node<br/>rusqlite in-process]
+```
+   [db.sqlite] configured?
+        │
+        ├── no  ──► no SQLite (only DB proxy if [db.mysql])
+        │
+        └── yes ──► replication.role?
+                       │
+                       ├── primary | replica ──► clustered (sqld sidecar)
+                       │
+                       └── auto ──► [cluster] enabled?
+                                       │
+                                       ├── yes ──► clustered
+                                       │           (sqld + gossip-elected primary)
+                                       │
+                                       └── no  ──► single-node
+                                                   (rusqlite in-process)
 ```
 
 ## Platform Support

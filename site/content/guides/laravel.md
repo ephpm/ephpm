@@ -69,7 +69,7 @@ ephpm php artisan migrate
 ## 4. Start serving
 
 ```bash
-sudo systemctl restart ephpm   # or just: ephpm serve --config /etc/ephpm/ephpm.toml
+sudo ephpm restart
 ```
 
 ## Queues and the scheduler

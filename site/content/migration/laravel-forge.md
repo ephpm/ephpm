@@ -180,8 +180,8 @@ This doesn't change.
 # Stop Forge-managed services
 sudo systemctl stop nginx php8.2-fpm
 
-# Start ePHPm
-sudo systemctl start ephpm
+# Install ePHPm as a system service (registers + starts it)
+sudo ephpm install
 
 # Disconnect the server from Forge (optional)
 # Go to Forge dashboard → Server → Delete Server

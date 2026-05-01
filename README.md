@@ -4,20 +4,23 @@ Run PHP applications without the infrastructure. No PHP-FPM, no MySQL server, no
 
 ## Why ePHPm?
 
+How ePHPm compares to other ways of running PHP with a webserver.
+
 | | ePHPm | FrankenPHP | RoadRunner | Swoole | Apache + mod_php | Nginx + php-fpm |
 |---|---|---|---|---|---|---|
-| Language | Rust | Go (CGO) | Go | PHP + C | C | C + PHP |
-| PHP FFI overhead | Zero (native C call) | ~2.2μs/req (11+ CGO crossings) | N/A (worker mode) | N/A (native) | N/A (in-process) | IPC (FastCGI) |
+| Language | Rust | Go (CGO) | Go | PHP + C | C | C |
+| Dispatch to PHP | <1 μs (in-process C call) | ~2–3 μs (CGO crossings) | ~10–50 μs (IPC to worker) | <1 μs (in-process) | <1 μs (in-process) | ~50–100 μs (FastCGI socket) |
 | Server GC pauses | None | Go GC | Go GC | None | None | None |
 | Binary | Single static binary | Caddy module | Go binary + PHP workers | PHP + extension | Apache + modules | Nginx + separate FPM |
 | DB proxy + connection pooling | Built-in (MySQL wire, R/W split) | No | No | No | No | No |
-| Embedded DB | SQLite via [litewire](#database-three-options-zero-code-changes) | No | No | No | No | No |
+| Embedded DB | SQLite via litewire | No | No | No | No | No |
 | Built-in KV store | Yes (RESP compatible, in-process) | No | No | No | No | No |
 | Query stats (Prometheus) | Built-in | No | No | No | No | No |
 | Auto TLS (ACME) | Built-in | Via Caddy | No | No | No | No |
-| Clustering | Gossip (SWIM) | No | No | Built-in | No | No |
-| Virtual hosts | Built-in ([directory-based](#virtual-hosts-multi-tenant-hosting)) | Via Caddy | No | No | `<VirtualHost>` | `server` blocks |
-| PHP compatibility | Drop-in (embed SAPI) | Drop-in (worker SAPI) | Requires PSR-7 packages | Requires async code | Native (100%) | Native (100%) |
+| Clustering | Gossip (SWIM) | No | No | Multi-process (single node) | No | No |
+| Virtual hosts | Built-in (directory-based) | Via Caddy | No | No | `<VirtualHost>` | `server` blocks |
+| Install size | ~40 MB (varies by PHP extensions) | ~150 MB | ~60–70 MB (rr + PHP) | ~35–45 MB (PHP + .so) | ~50–60 MB (Apache + PHP) | ~40–50 MB (Nginx + PHP) |
+| PHP compatibility | Drop-in | Drop-in | Drop-in (worker mode requires PSR-7) | Drop-in (async features require rewrite) | Native (100%) | Native (100%) |
 | Deployment | Single binary | Requires Caddy | Multi-process | Requires PHP + Swoole extension | Apache + modules | Separate services |
 | Container-friendly | ✓ (single binary) | ✓ (Caddy module) | ✓ | ⚠️ (PHP + extension) | ⚠️ (heavier) | ⚠️ (two services) |
 
@@ -45,43 +48,48 @@ Run PHP applications without the infrastructure. No PHP-FPM, no MySQL server, no
 
 ## Install
 
+ePHPm is a single self-managing binary — it registers and controls its own system service. There is no install script.
+
 ### Linux / macOS
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/ephpm/ephpm/main/install.sh | sh
-```
-
-Installs the binary, creates a default config at `/etc/ephpm/ephpm.toml`, sets up a systemd service, and starts serving at `http://your-server:8080`.
+Download the latest binary from [Releases](https://github.com/ephpm/ephpm/releases), unpack, then:
 
 ```bash
-# Specific version
-curl -fsSL https://raw.githubusercontent.com/ephpm/ephpm/main/install.sh | EPHPM_VERSION=0.1.0 sh
-
-# Binary only (no systemd, no config)
-curl -fsSL https://raw.githubusercontent.com/ephpm/ephpm/main/install.sh | sh -s -- --no-systemd --no-config
-
-# Uninstall
-curl -fsSL https://raw.githubusercontent.com/ephpm/ephpm/main/install.sh | sh -s -- --uninstall
+sudo ./ephpm install
 ```
+
+This copies the binary to `/usr/local/bin/ephpm`, writes a default config to `/etc/ephpm/ephpm.toml`, registers a systemd service (Linux) or launchd plist (macOS), and starts it. The server listens on `http://localhost:8080` by default.
 
 ### Windows
 
-```powershell
-# PowerShell (Run as Administrator)
-irm https://raw.githubusercontent.com/ephpm/ephpm/main/install.ps1 | iex
-```
-
-Installs to `C:\Program Files\ephpm\`, adds to PATH, creates a Windows service, and starts serving.
+Download `ephpm.exe` from [Releases](https://github.com/ephpm/ephpm/releases). In an Administrator PowerShell:
 
 ```powershell
-# Binary only (no service)
-irm https://raw.githubusercontent.com/ephpm/ephpm/main/install.ps1 | iex -Args "--no-service"
-
-# Uninstall
-irm https://raw.githubusercontent.com/ephpm/ephpm/main/install.ps1 | iex -Args "--uninstall"
+.\ephpm.exe install
 ```
+
+Installs to `C:\Program Files\ephpm\`, adds to `PATH`, registers a Windows service, and starts it.
 
 > **Note:** Clustered SQLite (sqld) is not available on Windows. Single-node SQLite and the DB proxy work fully.
+
+### Manage the service
+
+The same subcommands work on every platform — they wrap systemd / launchd / the Windows service controller:
+
+```bash
+sudo ephpm start          # start the service
+sudo ephpm stop           # stop
+sudo ephpm restart        # restart (e.g. after editing the config)
+sudo ephpm status         # PID, uptime, listen address
+sudo ephpm logs           # tail the service log (--follow to follow)
+```
+
+### Uninstall
+
+```bash
+sudo ephpm uninstall              # remove binary, service, and data dir
+sudo ephpm uninstall --keep-data  # keep config and SQLite databases
+```
 
 ### Build from Source
 
@@ -95,6 +103,9 @@ cargo run -- --config ephpm.toml
 # Release binary with PHP embedded
 # Prerequisites: php-cli, composer, git, build-essential, autoconf, cmake, pkg-config, re2c, libssl-dev
 cargo xtask release       # → target/release/ephpm
+
+# A locally built binary can self-install too
+sudo ./target/release/ephpm install
 ```
 
 ## Configuration
@@ -131,7 +142,7 @@ enabled = true
 path = "/var/lib/ephpm/app.db"
 ```
 
-All config values can be overridden with `EPHPM_` prefixed environment variables (e.g., `EPHPM_SERVER__LISTEN=0.0.0.0:9090`).
+Any TOML key can be overridden with an `EPHPM_` prefixed environment variable — e.g. `EPHPM_SERVER__LISTEN=0.0.0.0:9090`, `EPHPM_PHP__MEMORY_LIMIT=256M`. Nesting uses `__`. Arrays use JSON syntax: `EPHPM_CLUSTER__JOIN='["a:7946","b:7946"]'`. See [Environment Variables](https://ephpm.dev/reference/environment-variables/) for the full mapping rules.
 
 ## Database: Three Options, Zero Code Changes
 

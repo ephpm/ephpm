@@ -138,25 +138,13 @@ www.yourdomain.com  A    → your-vps-ip
 ### 7. Start ePHPm
 
 ```bash
-# Test it
-ephpm --config /etc/ephpm/ephpm.toml
+# Smoke-test in the foreground
+ephpm serve --config /etc/ephpm/ephpm.toml &
+curl http://localhost:8080
+kill %1
 
-# Set up as a service
-sudo tee /etc/systemd/system/ephpm.service << 'EOF'
-[Unit]
-Description=ePHPm
-After=network.target
-
-[Service]
-ExecStart=/usr/local/bin/ephpm --config /etc/ephpm/ephpm.toml
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl enable ephpm
-sudo systemctl start ephpm
+# Install as a system service (registers + starts it)
+sudo ephpm install
 ```
 
 ### 8. Verify

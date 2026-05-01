@@ -15,34 +15,29 @@ Both see every query PHP executes. Neither currently records query-level metrics
 
 A single `ephpm-query-stats` crate that both runtimes call into. One set of metrics, one slow query threshold, one Prometheus dashboard -- whether the backend is SQLite or MySQL.
 
-```mermaid
-graph TD
-    subgraph ephpm["ePHPm"]
-        subgraph litewire_path["LiteWire Path"]
-            php1["PHP (pdo_mysql)"]
-            lw["LiteWire MySQL Frontend"]
-            tracked_be["TrackedBackend"]
-            rusqlite["rusqlite"]
-        end
-
-        subgraph proxy_path["DB Proxy Path"]
-            php2["PHP (pdo_mysql)"]
-            proxy["MySQL Proxy"]
-            mysql["Real MySQL"]
-        end
-
-        stats["QueryStats\n(ephpm-query-stats)"]
-        prom["Prometheus /metrics"]
-    end
-
-    php1 --> lw --> tracked_be --> rusqlite
-    tracked_be -->|record| stats
-    php2 --> proxy --> mysql
-    proxy -->|record| stats
-    stats --> prom
-
-    style stats fill:#e3f2fd,stroke:#1565c0
-    style tracked_be fill:#fff3e0,stroke:#ef6c00
+```
+   ┌───────────────────────────────── ePHPm ─────────────────────────────────┐
+   │                                                                         │
+   │     LiteWire Path                          DB Proxy Path                │
+   │     ──────────────                         ──────────────                │
+   │     PHP (pdo_mysql)                        PHP (pdo_mysql)              │
+   │           │                                       │                     │
+   │           ▼                                       ▼                     │
+   │     LiteWire MySQL Frontend                MySQL Proxy ──┐              │
+   │           │                                       │      │              │
+   │           ▼                                       ▼      │              │
+   │     TrackedBackend ──┐                       Real MySQL  │              │
+   │           │          │                                   │              │
+   │           ▼          │ record                     record │              │
+   │      rusqlite        │                                   │              │
+   │                      │                                   │              │
+   │                      └───────► QueryStats ◄──────────────┘              │
+   │                              (ephpm-query-stats)                        │
+   │                                       │                                 │
+   │                                       ▼                                 │
+   │                              Prometheus /metrics                        │
+   │                                                                         │
+   └─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Architecture

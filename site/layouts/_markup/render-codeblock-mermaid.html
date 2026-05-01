@@ -1,0 +1,10 @@
+{{- /* Site override of theme's mermaid render hook.
+       Use <div class="not-prose"> rather than <pre> so we don't inherit
+       Hextra's prose code-block styling (which constrains width and font).
+       Source is htmlEscaped so `<br/>` survives as literal text in
+       textContent — mermaid parses literal `<br/>` inside labels when
+       htmlLabels: true. */ -}}
+<div class="mermaid not-prose hextra-mermaid">
+{{- .Inner | htmlEscape | safeHTML -}}
+</div>
+{{- .Page.Store.Set "hasMermaid" true -}}

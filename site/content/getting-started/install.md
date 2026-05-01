@@ -3,46 +3,73 @@ title = "Install"
 weight = 1
 +++
 
+ePHPm ships as a single binary that manages itself. There's no install script — the binary registers and controls its own system service.
+
 ## Linux / macOS
 
+Download the latest binary from [Releases](https://github.com/ephpm/ephpm/releases) and unpack it, then run:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ephpm/ephpm/main/install.sh | sh
+sudo ./ephpm install
 ```
 
-Installs the binary, creates a default config at `/etc/ephpm/ephpm.toml`, sets up a systemd service, and starts serving on `http://your-server:8080`.
+`install` copies the binary to `/usr/local/bin/ephpm`, writes a default config to `/etc/ephpm/ephpm.toml`, registers a systemd service (Linux) or launchd plist (macOS), and starts it. By default the server listens on `http://localhost:8080`.
 
 Variants:
 
 ```bash
-# Pin to a specific version
-curl -fsSL https://raw.githubusercontent.com/ephpm/ephpm/main/install.sh | EPHPM_VERSION=0.1.0 sh
+# Install without starting the service
+sudo ./ephpm install --no-start
 
-# Binary only (no systemd unit, no config)
-curl -fsSL https://raw.githubusercontent.com/ephpm/ephpm/main/install.sh | sh -s -- --no-systemd --no-config
+# Skip writing the default config (keep an existing one)
+sudo ./ephpm install --no-config
 
-# Uninstall
-curl -fsSL https://raw.githubusercontent.com/ephpm/ephpm/main/install.sh | sh -s -- --uninstall
+# Install the binary only — no service, no config
+sudo ./ephpm install --binary-only
 ```
 
 ## Windows
 
-PowerShell, run as Administrator:
+Download `ephpm.exe` from [Releases](https://github.com/ephpm/ephpm/releases). In an Administrator PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/ephpm/ephpm/main/install.ps1 | iex
+.\ephpm.exe install
 ```
 
-Installs to `C:\Program Files\ephpm\`, adds to `PATH`, creates a Windows service, and starts serving.
-
-```powershell
-# Binary only (no service)
-irm https://raw.githubusercontent.com/ephpm/ephpm/main/install.ps1 | iex -Args "--no-service"
-
-# Uninstall
-irm https://raw.githubusercontent.com/ephpm/ephpm/main/install.ps1 | iex -Args "--uninstall"
-```
+Installs to `C:\Program Files\ephpm\`, adds the directory to the system `PATH`, registers a Windows service, and starts it.
 
 > Clustered SQLite (sqld) isn't available on Windows — Turso doesn't publish a Windows binary. Single-node SQLite, the MySQL/Postgres proxy, and everything else work normally.
+
+## Manage the service
+
+After `install`, the same commands work on every platform — they wrap systemd / launchd / the Windows service controller:
+
+```bash
+sudo ephpm start          # start the service
+sudo ephpm stop           # stop the service
+sudo ephpm restart        # restart (after editing the config)
+sudo ephpm status         # PID, uptime, last exit code, listen address
+sudo ephpm logs           # tail the service log
+sudo ephpm logs --follow  # follow new log lines
+```
+
+To run the server in the foreground without registering a service (useful for debugging):
+
+```bash
+sudo ephpm serve --config /etc/ephpm/ephpm.toml
+```
+
+## Uninstall
+
+```bash
+sudo ephpm uninstall
+```
+
+Stops the service, removes the binary, the service unit, and `/var/lib/ephpm/`. Pass `--keep-data` to preserve the config file and any SQLite databases:
+
+```bash
+sudo ephpm uninstall --keep-data
+```
 
 ## Build from source
 
@@ -71,9 +98,16 @@ cargo xtask release --target windows
 
 The first `cargo xtask release` is slow (it builds a fully static PHP via [static-php-cli](https://github.com/crazywhalecc/static-php-cli) — about 15 minutes). It's cached at `php-sdk/static-php-cli/buildroot/`; delete that to force a rebuild.
 
+A binary built from source can also self-install:
+
+```bash
+sudo ./target/release/ephpm install
+```
+
 ## Verify
 
 ```bash
 ephpm --version
 ephpm --help
+ephpm status
 ```

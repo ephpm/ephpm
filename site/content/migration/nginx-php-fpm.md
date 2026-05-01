@@ -246,18 +246,17 @@ If Nginx is proxying to multiple PHP-FPM pools or other backends, ePHPm doesn't 
 ### 6. Switch Over
 
 ```bash
-# Stop both services
+# Stop nginx + php-fpm
 sudo systemctl stop nginx php8.2-fpm
 
-# Start ePHPm
-./ephpm --config ephpm.toml
+# Install ePHPm as a system service (registers + starts it)
+sudo ephpm install
 
 # Verify
 curl http://localhost:8080
 
-# When satisfied
+# Disable the old stack from boot
 sudo systemctl disable nginx php8.2-fpm
-sudo systemctl enable ephpm
 ```
 
 ## What You Gain
