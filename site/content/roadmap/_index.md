@@ -11,6 +11,8 @@ These pages describe targets, not currently-shipped behavior. For what works tod
 - **[Preview Deployments](preview/)** — instant per-PR preview URLs via a GitHub bot.
 - **[Laravel Octane Driver](laravel-octane-driver/)** — native `ephpm` driver for Laravel Octane worker mode.
 - **[Symfony Runtime Adapter](symfony-runtime-driver/)** — native `ephpm` adapter under `symfony/runtime`.
+- **[WordPress Worker Mode](wordpress-worker-mode/)** — opinionated WP runtime that boots once per worker thread.
+- **[PSR-15 Worker Mode](psr-15-worker-mode/)** — generic adapter for Mezzio, Slim, and any PSR-15 framework.
 - **[Kubernetes Operator](kubernetes/)** — first-class K8s deployment.
 - **[Edge Deployments](edge/)** — running ePHPm at the edge.
 - **[Hosting Models](hosting/)** — how ePHPm could be packaged for cloud providers.
