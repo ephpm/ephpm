@@ -37,7 +37,6 @@ With the Rust decision, Caddy is no longer relevant as a dependency. The feature
 | Automatic ACME / Let's Encrypt | `rustls-acme` or `instant-acme` (see [certmagic.md](certmagic.md)) |
 | Reverse proxy | Custom implementation on `hyper` |
 | Caddyfile config | `toml` / `serde` (ePHPm's own config format) |
-| Admin API | ePHPm's admin UI (embedded web dashboard) |
 
 ### What We Learned from Caddy
 

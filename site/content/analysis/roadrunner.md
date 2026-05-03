@@ -33,7 +33,6 @@
 
 - Database connection pooling (requested since 2021, never built)
 - Multi-node clustering for KV store
-- Built-in admin dashboard
 - Debug/profiling UI
 - Query analysis tools
 
