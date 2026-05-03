@@ -1855,9 +1855,16 @@ PHP is compiled with ZTS (`--enable-zts`). Each `spawn_blocking` thread auto-reg
 
 The next evolution of the embedded-mode runtime is **worker mode** — boot the PHP app once per thread, then handle multiple requests in a loop without re-executing the bootstrap on each request (same model as FrankenPHP worker mode and RoadRunner). ZTS makes this possible since each thread already has its own persistent PHP context.
 
-The win is largest for apps with heavy bootstrap (Laravel, Symfony, large WordPress installs) where seconds-to-microseconds of every request go to redoing autoload + framework boot.
+The win is largest for apps with heavy framework bootstrap, where each request otherwise spends milliseconds redoing autoload, container build, and route compilation. Worker mode is best suited to apps that define a clean **worker contract** — a documented surface for resetting per-request state between iterations. Two are tracked as concrete drivers:
 
-For Laravel specifically, this primitive is the prerequisite for a [Laravel Octane native driver](/roadmap/laravel-octane-driver/) — Octane is the standard Laravel persistent-server adapter and an `ephpm` driver lets stock Laravel apps opt into worker mode without leaving the binary.
+- **Laravel** via [Laravel Octane](/roadmap/laravel-octane-driver/). Octane is Laravel's standard persistent-server adapter, and an `ephpm` driver lets stock Laravel apps opt into worker mode without leaving the binary.
+- **Symfony** via [`symfony/runtime`](/roadmap/symfony-runtime-driver/). Symfony's runtime component is the analogous adapter layer.
+
+#### What about WordPress?
+
+WordPress can run in worker mode (FrankenPHP has shipped a worker script for it), but it has no framework-level contract for resetting per-request state. Every implementation is a bespoke `worker.php` that hand-resets `$wp_query`, `$wp_the_query`, dozens of other globals, and all of `$_SERVER` / `$_GET` / `$_POST`, then keeps that script in sync as WordPress and the plugin ecosystem evolve. Multisite is a hard wall (`WP_NETWORK_ADMIN`-style `define()`s can't be re-set per request).
+
+The recommended WordPress path on ePHPm is the **classic embedded mode** described above — ZTS thread-per-request already gives you concurrency, full plugin compatibility, and zero per-request state-reset surface. A maintained WordPress worker script is a separate effort that may or may not happen.
 
 ### Building libphp.a
 
