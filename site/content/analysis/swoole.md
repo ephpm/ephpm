@@ -32,7 +32,6 @@
 
 - Automatic TLS / Let's Encrypt
 - Multi-node clustering
-- Built-in admin dashboard
 - Debug/profiling UI (Xdebug step debugging added in OpenSwoole 26.2.0)
 - Query analysis tools
 - Cross-platform support (Linux-only in practice)

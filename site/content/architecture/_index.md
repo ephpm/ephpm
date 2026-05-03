@@ -1841,6 +1841,31 @@ All other ePHPm features (HTTP server, static files, routing, config, and planne
 
 PHP is compiled with ZTS (`--enable-zts`). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The mutex only protects one-time init/shutdown. Windows builds use NTS with serialized execution.
 
+**Known ZTS caveats from spc / upstream PHP:**
+
+| Issue | Scope | Status |
+|-------|-------|--------|
+| OpenSSL `openssl_encrypt()` segfaults under load | x86_64 + ARM64 | Upstream PHP bug (#13648) |
+| `zend_mm_heap corrupted` on ARM64 | PHP 8.5.2+ only | Upstream PHP bug (#21029) |
+| OPcache static link — TLS transition linker errors | Linux musl | Upstream PHP bug (#15074) |
+| ~5% throughput overhead vs NTS | All platforms | Expected; TSRM bookkeeping |
+| `ext-imap` incompatible with ZTS | If used | c-client library limitation |
+
+### Worker Mode (planned) {#php-worker-mode}
+
+The next evolution of the embedded-mode runtime is **worker mode** — boot the PHP app once per thread, then handle multiple requests in a loop without re-executing the bootstrap on each request (same model as FrankenPHP worker mode and RoadRunner). ZTS makes this possible since each thread already has its own persistent PHP context.
+
+The win is largest for apps with heavy framework bootstrap, where each request otherwise spends milliseconds redoing autoload, container build, and route compilation. Worker mode is best suited to apps that define a clean **worker contract** — a documented surface for resetting per-request state between iterations. Two are tracked as concrete drivers:
+
+- **Laravel** via [Laravel Octane](/roadmap/laravel-octane-driver/). Octane is Laravel's standard persistent-server adapter, and an `ephpm` driver lets stock Laravel apps opt into worker mode without leaving the binary.
+- **Symfony** via [`symfony/runtime`](/roadmap/symfony-runtime-driver/). Symfony's runtime component is the analogous adapter layer.
+
+#### What about WordPress?
+
+WordPress can run in worker mode (FrankenPHP has shipped a worker script for it), but it has no framework-level contract for resetting per-request state. Every implementation is a bespoke `worker.php` that hand-resets `$wp_query`, `$wp_the_query`, dozens of other globals, and all of `$_SERVER` / `$_GET` / `$_POST`, then keeps that script in sync as WordPress and the plugin ecosystem evolve. Multisite is a hard wall (`WP_NETWORK_ADMIN`-style `define()`s can't be re-set per request).
+
+The recommended WordPress path on ePHPm is the **classic embedded mode** described above — ZTS thread-per-request already gives you concurrency, full plugin compatibility, and zero per-request state-reset surface. A maintained WordPress worker script is a separate effort that may or may not happen.
+
 ### Building libphp.a
 
 Use `static-php-cli` to build a static `libphp.a`:

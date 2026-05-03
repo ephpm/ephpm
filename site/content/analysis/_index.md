@@ -29,7 +29,7 @@ No single existing product covers the full ePHPm feature set. The closest compet
 | HTTP serving (no nginx) | Yes | Yes | Yes | Yes |
 | PHP execution (no php-fpm) | Yes | Yes | Yes | Yes |
 | Auto TLS (Let's Encrypt) | **Yes** (Caddy) | Partial | No | Yes |
-| Prometheus metrics | Yes | **Yes** (best) | Yes | Yes + Admin UI |
+| Prometheus metrics | Yes | **Yes** (best) | Yes | Yes |
 | DB connection pooling | **No** | **No** | **Yes** | Yes |
 | In-memory KV / sessions | **No** | Yes (single node) | Yes (single process) | Yes + clustering |
 | Multi-node clustering | **No** | **No** | **No** | Yes |
@@ -60,10 +60,8 @@ No single existing product covers the full ePHPm feature set. The closest compet
 
 2. **Multi-node clustered KV store** — All three rely on external Redis or Kubernetes. None has built-in gossip protocol, peer discovery, or distributed cache.
 
-3. **Integrated observability dashboard** — No server ships a built-in profiling dashboard, query inspector, or admin panel. All punt to external tools (Grafana, Blackfire, Xdebug).
+3. **On-demand production profiling** — No server supports token-gated profiling/cachegrind via request headers with results surfaced in a web UI.
 
-4. **On-demand production profiling** — No server supports token-gated profiling/cachegrind via request headers with results surfaced in a web UI.
+4. **SQL-layer intelligence** — No server intercepts and analyzes SQL traffic (query digests, slow query identification, auto-EXPLAIN). This requires control of the DB proxy layer.
 
-5. **SQL-layer intelligence** — No server intercepts and analyzes SQL traffic (query digests, slow query identification, auto-EXPLAIN). This requires control of the DB proxy layer.
-
-6. **Request-level debug capture** — No server captures per-request data (queries, cache hits, session data, timing) at the infrastructure level. Framework-level tools (Laravel Debugbar, Symfony Profiler) exist but only work within their respective frameworks.
+5. **Request-level debug capture** — No server captures per-request data (queries, cache hits, session data, timing) at the infrastructure level. Framework-level tools (Laravel Debugbar, Symfony Profiler) exist but only work within their respective frameworks.

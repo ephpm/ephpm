@@ -394,7 +394,6 @@ The approach is entirely portable — it depends only on Go's channel semantics 
 
 - Database connection pooling
 - In-memory KV store / clustered cache
-- Built-in admin dashboard or charts
 - Native multi-node clustering
 - Integrated debug/profiling UI
 - Query analysis / slow query tools

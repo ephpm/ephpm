@@ -319,7 +319,6 @@ Raw speed means nothing without features. Here's what each stack actually provid
 | Multi-node clustering | No | No | No | No | No | **Yes** |
 | Query digest/analysis | No | No | No | No | No | **Yes** |
 | Auto-instrumented traces | No | No | No | No | No | **Yes** |
-| Admin dashboard | No | No | No | No | No | **Yes** |
 | Superglobals work | Yes | Yes | **No** | Yes | **No** | **Yes** |
 | Zero code changes | Yes | Yes | **No** (PSR-7) | Yes | **No** (Swoole API) | **Yes** |
 | GC-free server layer | Yes (C) | Yes (C) | No (Go) | No (Go) | Yes (C) | **Yes (Rust)** |
