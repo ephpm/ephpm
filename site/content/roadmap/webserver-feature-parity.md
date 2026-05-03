@@ -23,9 +23,10 @@ web servers.
 | Custom error pages | Done (via `=404` fallback status codes) |
 | Response headers | Done (`server.response.headers`) |
 | Gzip compression | Done (`server.response.compression`) |
-| Brotli compression | Done (via KV store; HTTP response gzip only) |
+| Brotli compression | Done (HTTP responses; preferred over gzip when client supports `br`) |
 | Timeouts (request, idle, header read) | Done (`server.timeouts`) |
 | Virtual hosts | Done (`server.sites_dir`) |
+| Per-site config overrides | Done (drop a `site.toml` in each vhost directory) |
 | Request size limits | Done (`server.request.max_body_size`) |
 | Keep-alive | Done (HTTP/1.1 keep-alive with idle timeout) |
 | Rate limiting | Done (`server.limits.per_ip_rate`) |
@@ -38,8 +39,10 @@ web servers.
 | Host header validation | Done (`server.request.trusted_hosts`) |
 | Prometheus metrics | Done (`server.metrics`) |
 | HTTP/2 | Done (via ALPN negotiation on TLS connections) |
-| Open file pre-compression (gzip) | Done (`server.file_cache.precompress`) |
+| HTTP → HTTPS redirect | Done (`server.tls.redirect_http` — 301 from a separate HTTP listener) |
+| Open file pre-compression (gzip + brotli) | Done (`server.file_cache.precompress`) |
 | open_basedir per vhost | Done (`server.security.open_basedir`) |
+| Disable dangerous PHP funcs per vhost | Done (`server.security.disable_shell_exec` — turns off `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec`) |
 
 ---
 
@@ -54,7 +57,7 @@ Drupal, etc.).
 |---------|--------|-------|-------|-------|-------|
 | **URL rewriting / redirects** | mod_rewrite | rewrite + try_files | rewrite + try_files | **Done** | Configurable `fallback` chain (equivalent to `try_files`). |
 | **TLS / HTTPS** | mod_ssl (manual) | ssl directives (manual) | Automatic ACME | **Done** | Manual cert/key + automatic ACME via Let's Encrypt. Caddy-style auto-HTTPS. |
-| **Custom error pages** | ErrorDocument | error_page | handle_errors | **Partial** | `=404` status fallback in `fallback` chain. No per-status HTML file mapping yet. |
+| **Custom error pages** | ErrorDocument | error_page | handle_errors | **Done** | Custom error page served via the `fallback` chain — e.g. `fallback = ["{path}", "/errors/404.html", "=404"]` returns the custom HTML and a 404 status when nothing else matches. |
 | **Response headers** | mod_headers | add_header | header directive | **Done** | `server.response.headers` adds custom headers to every response. |
 | **Compression (gzip)** | mod_deflate | gzip (built-in) | encode (built-in) | **Done** | Gzip compression with configurable level and minimum size. |
 | **Access logging** | CustomLog | access_log | log (structured JSON) | **Done** | `server.logging.access` writes to a file via tracing appender. |
@@ -80,8 +83,9 @@ Drupal, etc.).
 | Directory listing | Options +Indexes | autoindex | file_server browse | Missing | |
 | HTTP/2 | mod_http2 | listen ... http2 | Automatic | **Done** | ALPN negotiation on TLS connections. |
 | HTTP/3 (QUIC) | Not supported | Experimental | Built-in | Missing | |
-| Brotli/Zstd compression | mod_brotli | Module | Plugin/built-in | **Partial** | KV store supports gzip/brotli/zstd. HTTP response compression is gzip only. |
-| Pre-compressed file serving | N/A | gzip_static | precompressed | **Done** | `server.file_cache.precompress` pre-computes gzip variants for cached files. |
+| Brotli compression (HTTP) | mod_brotli | Module | Plugin/built-in | **Done** | HTTP responses prefer Brotli over gzip when the client supports `br`. KV store also supports gzip/brotli/zstd for stored values. |
+| Zstd compression (HTTP) | N/A | N/A | Plugin | Missing | KV store supports zstd; HTTP response negotiation does not. |
+| Pre-compressed file serving | N/A | gzip_static | precompressed | **Done** | `server.file_cache.precompress` pre-computes gzip + brotli variants for cached files. |
 
 ---
 
@@ -364,11 +368,21 @@ format = "combined"                         # "combined", "common", "json"
 
 ## Implementation Status
 
-### Phase 1 — URL Rewriting :white_check_mark: Complete
+### Phase 1 — URL Rewriting :white_check_mark: Done
+
+The pieces every PHP app actually needs are working:
+
 1. ~~Add `try_files` to `ServerConfig`~~ → Implemented as `server.fallback`
-2. ~~Refactor router to use `try_files` instead of hardcoded permalink logic~~ → Done
-3. `[[server.redirects]]` with regex matching — Not yet (fallback chain covers most use cases)
-4. `[[server.rewrites]]` with conditions — Not yet
+2. ~~Refactor router to use the fallback chain instead of hardcoded permalink logic~~ → Done
+3. ~~Internal rewrite targets in the fallback chain~~ → Done (the last entry is an internal rewrite)
+4. ~~Status-code fallbacks (`=404`, `=403`, etc.)~~ → Done
+
+The front-controller pattern (`fallback = ["{path}", "{path}/", "/index.php?{query}"]`) covers WordPress, Laravel, Drupal, Symfony, and effectively any framework that routes through `index.php`.
+
+**Optional extensions still outstanding** — neither blocks PHP application hosting; both are separate features that some users will want for SEO migrations or non-standard URL schemes:
+
+- `[[server.redirects]]` with regex matching → still TBD
+- `[[server.rewrites]]` with arbitrary conditions → still TBD
 
 ### Phase 2 — Production Hardening :white_check_mark: Complete
 5. ~~Custom error pages~~ → Partial (`=404` fallback status codes)
@@ -380,10 +394,15 @@ format = "combined"                         # "combined", "common", "json"
 ### Phase 3 — TLS & Multi-site :white_check_mark: Complete
 10. ~~TLS with manual cert paths~~ → Done (`server.tls.cert` / `server.tls.key`)
 11. ~~Automatic ACME (Let's Encrypt)~~ → Done (`server.tls.domains`)
-12. ~~Virtual hosts / multi-site routing~~ → Done (`server.sites_dir`)
+12. ~~HTTP → HTTPS redirect~~ → Done (`server.tls.redirect_http`, 301 from separate HTTP listener)
+13. ~~Virtual hosts / multi-site routing~~ → Done (`server.sites_dir`)
+14. ~~Per-site config overrides~~ → Done (drop `site.toml` into each vhost dir)
 
 ### Phase 4 — Advanced (Partially Complete)
-13. Reverse proxy — Not yet
-14. ~~Rate limiting~~ → Done (`server.limits`)
-15. IP allow/deny — Not yet (blocked_paths covers path-based blocking)
-16. ~~HTTP/2~~ → Done (ALPN negotiation on TLS)
+15. Reverse proxy — Not yet
+16. ~~Rate limiting~~ → Done (`server.limits`)
+17. IP allow/deny — Not yet (blocked_paths covers path-based blocking)
+18. ~~HTTP/2~~ → Done (ALPN negotiation on TLS)
+19. ~~Brotli HTTP responses~~ → Done (preferred over gzip when client supports `br`)
+20. ~~Pre-compressed static file serving~~ → Done (`server.file_cache.precompress` for gzip + brotli)
+21. ~~`disable_shell_exec` for multi-tenant safety~~ → Done

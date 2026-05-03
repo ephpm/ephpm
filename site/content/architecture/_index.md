@@ -1841,6 +1841,24 @@ All other ePHPm features (HTTP server, static files, routing, config, and planne
 
 PHP is compiled with ZTS (`--enable-zts`). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The mutex only protects one-time init/shutdown. Windows builds use NTS with serialized execution.
 
+**Known ZTS caveats from spc / upstream PHP:**
+
+| Issue | Scope | Status |
+|-------|-------|--------|
+| OpenSSL `openssl_encrypt()` segfaults under load | x86_64 + ARM64 | Upstream PHP bug (#13648) |
+| `zend_mm_heap corrupted` on ARM64 | PHP 8.5.2+ only | Upstream PHP bug (#21029) |
+| OPcache static link — TLS transition linker errors | Linux musl | Upstream PHP bug (#15074) |
+| ~5% throughput overhead vs NTS | All platforms | Expected; TSRM bookkeeping |
+| `ext-imap` incompatible with ZTS | If used | c-client library limitation |
+
+### Worker Mode (planned) {#php-worker-mode}
+
+The next evolution of the embedded-mode runtime is **worker mode** — boot the PHP app once per thread, then handle multiple requests in a loop without re-executing the bootstrap on each request (same model as FrankenPHP worker mode and RoadRunner). ZTS makes this possible since each thread already has its own persistent PHP context.
+
+The win is largest for apps with heavy bootstrap (Laravel, Symfony, large WordPress installs) where seconds-to-microseconds of every request go to redoing autoload + framework boot.
+
+For Laravel specifically, this primitive is the prerequisite for a [Laravel Octane native driver](/roadmap/laravel-octane-driver/) — Octane is the standard Laravel persistent-server adapter and an `ephpm` driver lets stock Laravel apps opt into worker mode without leaving the binary.
+
 ### Building libphp.a
 
 Use `static-php-cli` to build a static `libphp.a`:
