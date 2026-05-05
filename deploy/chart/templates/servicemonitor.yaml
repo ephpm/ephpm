@@ -1,0 +1,22 @@
+{{- if and .Values.serviceMonitor.enabled .Values.observability.prometheus -}}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "ephpm.fullname" . }}
+  namespace: {{ .Values.serviceMonitor.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "ephpm.labels" . | nindent 4 }}
+    {{- with .Values.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "ephpm.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: http
+      # /metrics confirmed from query-stats.md. Admin endpoint /__/queries also exists (planned).
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      scrapeTimeout: {{ .Values.serviceMonitor.scrapeTimeout }}
+{{- end }}

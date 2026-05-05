@@ -1,0 +1,35 @@
+ePHPm {{ .Chart.AppVersion }} deployed successfully.
+
+{{- if .Values.ingress.enabled }}
+Reachable at:
+{{- range .Values.ingress.hosts }}
+  http{{ if $.Values.server.tls.enabled }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- else if eq .Values.service.type "LoadBalancer" }}
+  Watch for external IP:
+  kubectl get svc {{ include "ephpm.fullname" . }} -n {{ .Release.Namespace }} -w
+{{- else }}
+  Port-forward to test locally:
+  kubectl port-forward svc/{{ include "ephpm.fullname" . }} 8080:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+  open http://localhost:8080
+{{- end }}
+
+Mode: {{ if .Values.cluster.enabled }}StatefulSet ({{ .Values.replicaCount }}-node cluster){{ else }}Deployment (single){{ end }}
+{{- if .Values.db.mysql.enabled }}DB: MySQL proxy{{ else if .Values.db.postgres.enabled }}DB: PostgreSQL proxy{{ else if .Values.db.sqlite.enabled }}DB: SQLite{{ else }}DB: none (app manages its own){{ end }}
+{{- if .Values.cluster.enabled }}
+
+Cluster join list (EPHPM_CLUSTER__JOIN):
+  {{ include "ephpm.clusterJoinJson" . }}
+
+Per-pod endpoints:
+{{- range $i, $_ := until (int .Values.replicaCount) }}
+  {{ include "ephpm.fullname" $ }}-{{ $i }}:8080
+{{- end }}
+{{- end }}
+{{- if .Values.server.metrics.enabled }}
+
+Prometheus metrics: http://<pod>:8080/metrics
+{{- if .Values.serviceMonitor.enabled }}
+  ServiceMonitor created for Prometheus Operator.
+{{- end }}
+{{- end }}
