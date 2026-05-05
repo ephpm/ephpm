@@ -25,11 +25,6 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
-      - name: Checkout litewire (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: ephpm/litewire
-          path: ../litewire
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -49,11 +44,6 @@ jobs:
             runner: [self-hosted, macos, arm64]
     steps:
       - uses: actions/checkout@v4
-      - name: Checkout litewire (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: ephpm/litewire
-          path: ../litewire
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -64,9 +54,4 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
-      - name: Checkout litewire (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: ephpm/litewire
-          path: ../litewire
       - uses: EmbarkStudios/cargo-deny-action@v2
