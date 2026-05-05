@@ -53,9 +53,28 @@ jobs:
         with:
           name: ephpm-php${{ matrix.php }}-${{ matrix.artifact_suffix }}
           path: target/release/ephpm
+  build-windows:
+    name: Build (PHP ${{ matrix.php }}, windows-x86_64)
+    runs-on: ubuntu-latest
+    container: ghcr.io/${{ github.repository }}/ephpm-ci:latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4", "8.5"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-xwin
+        run: cargo install cargo-xwin --locked || true
+      - name: Build Windows .exe
+        run: cargo xtask release ${{ matrix.php }} --target windows --no-sqld
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-php${{ matrix.php }}-windows-x86_64
+          path: target/x86_64-pc-windows-msvc/release/ephpm.exe
   release:
     name: Create Release
-    needs: [build-linux, build-macos]
+    needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
