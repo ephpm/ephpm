@@ -13,35 +13,32 @@ jobs:
   fmt:
     name: Format
     runs-on: [self-hosted, linux, x64]
+    container: ghcr.io/${{ github.repository }}/ephpm-ci:latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt
       - run: cargo +nightly fmt --all -- --check
 
   clippy:
     name: Clippy
     runs-on: [self-hosted, linux, x64]
+    container: ghcr.io/${{ github.repository }}/ephpm-ci:latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  test:
-    name: Test (${{ matrix.name }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-x64
-            runner: [self-hosted, linux, x64]
-          - name: macos-arm64
-            runner: [self-hosted, macos, arm64]
+  test-linux:
+    name: Test (linux-x64)
+    runs-on: [self-hosted, linux, x64]
+    container: ghcr.io/${{ github.repository }}/ephpm-ci:latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo nextest run --workspace
+
+  test-macos:
+    name: Test (macos-arm64)
+    runs-on: [self-hosted, macos, arm64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -52,6 +49,7 @@ jobs:
   deny:
     name: Cargo Deny
     runs-on: [self-hosted, linux, x64]
+    container: ghcr.io/${{ github.repository }}/ephpm-ci:latest
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
