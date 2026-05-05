@@ -15,7 +15,6 @@ jobs:
   e2e:
     name: E2E (PHP ${{ matrix.php }})
     runs-on: [self-hosted, linux, x64]
-    container: ghcr.io/${{ github.repository }}/ephpm-ci:latest
     strategy:
       fail-fast: false
       matrix:
@@ -23,6 +22,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - run: apt-get update && apt-get install -y --no-install-recommends build-essential libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Install E2E tools (kind, tilt, kubectl)
         run: cargo xtask e2e-install
