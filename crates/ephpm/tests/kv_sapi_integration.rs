@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use std::{fs, thread};
+use std::thread;
 
 /// Helper to wait for a port to be listening.
 fn wait_for_port(port: u16, timeout_secs: u64) -> bool {
@@ -85,7 +85,7 @@ fn find_ephpm_binary() -> PathBuf {
 }
 
 #[tokio::test]
-#[ignore] // Requires `cargo xtask release` (PHP linked)
+#[ignore = "requires cargo xtask release (PHP linked)"]
 async fn kv_sapi_set_get() {
     let port = 9876;
     let docroot = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests");
@@ -122,7 +122,7 @@ async fn kv_sapi_set_get() {
 }
 
 #[tokio::test]
-#[ignore] // Requires `cargo xtask release` (PHP linked)
+#[ignore = "requires cargo xtask release (PHP linked)"]
 async fn kv_sapi_del() {
     let port = 9877;
     let docroot = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests");
@@ -151,7 +151,7 @@ async fn kv_sapi_del() {
 }
 
 #[tokio::test]
-#[ignore] // Requires `cargo xtask release` (PHP linked)
+#[ignore = "requires cargo xtask release (PHP linked)"]
 async fn kv_sapi_all() {
     let port = 9878;
     let docroot = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests");

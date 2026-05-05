@@ -919,6 +919,7 @@ fn start_single_node_sqlite(
 }
 
 /// Start clustered SQLite (sqld sidecar + litewire with Hrana client backend).
+#[allow(unreachable_code, unused_variables)]
 async fn start_clustered_sqlite(
     sqlite_config: &ephpm_config::SqliteConfig,
     cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,

@@ -79,7 +79,28 @@ litewire = { git = "https://github.com/ephpm/litewire.git", rev = "33e24a3e6fe66
 
 [workspace.lints.rust]
 unsafe_code = "warn"
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(php_linked)'] }
 
 [workspace.lints.clippy]
-all = "warn"
-pedantic = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Allow noisy pedantic lints
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+doc_markdown = "allow"
+items_after_statements = "allow"
+manual_clamp = "allow"
+manual_let_else = "allow"
+needless_pass_by_value = "allow"
+ref_option = "allow"
+single_match_else = "allow"
+struct_excessive_bools = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+unchecked_time_subtraction = "allow"
+ignore_without_reason = "allow"
+uninlined_format_args = "allow"
+unnecessary_cast = "allow"
+unused_async = "allow"
+unused_self = "allow"
+used_underscore_binding = "allow"
