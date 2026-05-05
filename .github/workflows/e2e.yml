@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - run: apt-get update && apt-get install -y --no-install-recommends build-essential libclang-dev
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libclang-dev
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install E2E tools (kind, tilt, kubectl)
