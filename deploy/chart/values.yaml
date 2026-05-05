@@ -1,0 +1,451 @@
+# Default values for ePHPm
+#
+# Every key here maps directly to a struct field in crates/ephpm-config/src/lib.rs.
+# Defaults match the Rust default functions exactly.
+# Config is applied via EPHPM_ env vars (double-underscore separators).
+
+replicaCount: 1
+
+image:
+  repository: ephpm
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# ---------------------------------------------------------------------------
+# [server]  →  ServerConfig
+# ---------------------------------------------------------------------------
+server:
+  # default_listen() = "0.0.0.0:8080"
+  listen: "0.0.0.0:8080"
+  # default_document_root() = "."
+  documentRoot: "."
+  # default_index_files() = ["index.php", "index.html"]
+  indexFiles:
+    - index.php
+    - index.html
+  # default_fallback() = ["$uri", "$uri/", "/index.php?$query_string"]
+  fallback: []
+  # Optional: sites_dir for virtual hosting
+  sitesDir: ""
+
+  # [server.request]  →  RequestConfig
+  request:
+    # default_max_body_size() = 10 * 1024 * 1024 (10 MiB)
+    maxBodySize: 10485760
+    # default_max_header_size() = 8192
+    maxHeaderSize: 8192
+    trustedHosts: []
+
+  # [server.timeouts]  →  TimeoutsConfig
+  timeouts:
+    # default_header_read() = 30
+    headerRead: 30
+    # default_idle() = 60
+    idle: 60
+    # default_request_timeout() = 300
+    request: 300
+    # default_shutdown_timeout() = 30
+    shutdown: 30
+
+  # [server.response]  →  ResponseConfig
+  response:
+    # default_compression() = true
+    compression: true
+    # default_compression_level() = 1
+    compressionLevel: 1
+    # default_compression_min_size() = 1024
+    compressionMinSize: 1024
+    headers: []
+
+  # [server.static]  →  StaticConfig
+  static:
+    cacheControl: ""
+    # default_hidden_files() = "deny"
+    hiddenFiles: "deny"
+    # default_etag() = true
+    etag: true
+
+  # [server.php_etag_cache]  →  PhpETagCacheConfig
+  phpEtagCache:
+    # default_php_etag_cache_enabled() = false
+    enabled: false
+    # default_php_etag_cache_ttl() = 300
+    ttlSecs: 300
+    # default_php_etag_cache_prefix() = "etag:"
+    keyPrefix: "etag:"
+
+  # [server.security]  →  SecurityConfig
+  security:
+    trustedProxies: []
+    blockedPaths: []
+    allowedPhpPaths: []
+    # default_open_basedir() = true (when sites_dir set)
+    openBasedir: true
+    # default_disable_shell_exec() = true (when sites_dir set)
+    disableShellExec: true
+
+  # [server.logging]  →  LoggingConfig
+  logging:
+    access: ""
+    # default_log_level() = "info"
+    level: "info"
+
+  # [server.metrics]  →  MetricsConfig
+  metrics:
+    # default = false
+    enabled: false
+    # default_metrics_path() = "/metrics"
+    path: "/metrics"
+
+  # [server.limits]  →  LimitsConfig
+  limits:
+    maxConnections: 0
+    perIpMaxConnections: 0
+    perIpRate: 0.0
+    # default_per_ip_burst() = 50
+    perIpBurst: 50
+
+  # [server.file_cache]  →  FileCacheConfig
+  fileCache:
+    enabled: false
+    # default_file_cache_max_entries() = 10000
+    maxEntries: 10000
+    # default_file_cache_valid_secs() = 30
+    validSecs: 30
+    # default_file_cache_inactive_secs() = 60
+    inactiveSecs: 60
+    # default_file_cache_inline_threshold() = 1048576 (1 MiB)
+    inlineThreshold: 1048576
+    # default_file_cache_precompress() = true
+    precompress: true
+
+  # [server.tls]  →  TlsConfig (optional — omit to disable TLS)
+  tls:
+    enabled: false
+    # manual mode: provide a K8s Secret name containing tls.crt and tls.key
+    secretName: ""
+    # cert/key paths inside the container (mounted from secretName)
+    cert: "/etc/ephpm/tls/tls.crt"
+    key: "/etc/ephpm/tls/tls.key"
+    # acme mode:
+    acme:
+      domains: []
+      email: ""
+      # default_cache_dir() = "certs"
+      cacheDir: "certs"
+      staging: false
+    # Shared TLS options:
+    # listen is Option<String> — when set, HTTP stays on server.listen, HTTPS on this port
+    tlsListen: "0.0.0.0:443"
+    # default redirect_http = false
+    redirectHttp: false
+
+# ---------------------------------------------------------------------------
+# [php]  →  PhpConfig
+# NOTE: There is NO "mode" field in PhpConfig. Embedded vs external is not
+# a config option — it is determined at compile time.
+# ---------------------------------------------------------------------------
+php:
+  # default_max_execution_time() = 30
+  maxExecutionTime: 30
+  # default_memory_limit() = "128M"
+  memoryLimit: "128M"
+  iniFile: ""
+  # [[key, value], ...] pairs
+  iniOverrides: []
+  # default_php_workers() = CPU count capped at 16
+  workers: 4
+
+# ---------------------------------------------------------------------------
+# [db]  →  DbConfig
+# Backends are enabled by presence: set mysql.enabled/postgres.enabled/sqlite.enabled.
+# There is NO top-level "mode" field in DbConfig.
+# ---------------------------------------------------------------------------
+db:
+  # [db.mysql]  →  Option<DbBackendConfig>
+  mysql:
+    enabled: false
+    url: ""
+    # -- Store url in a K8s Secret (key "url") instead of plain text.
+    existingSecret: ""
+    # listen: default "127.0.0.1:3306"
+    listen: "127.0.0.1:3306"
+    socket: ""
+    # default_min_connections() = 2
+    minConnections: 2
+    # default_max_connections() = 20
+    maxConnections: 20
+    # default_idle_timeout() = "300s"
+    idleTimeout: "300s"
+    # default_max_lifetime() = "1800s"
+    maxLifetime: "1800s"
+    # default_pool_timeout() = "5s"
+    poolTimeout: "5s"
+    # default_health_check_interval() = "30s"
+    healthCheckInterval: "30s"
+    # default_inject_env() = true
+    injectEnv: true
+    # default_reset_strategy() = "smart"
+    resetStrategy: "smart"
+    replicas:
+      urls: []
+
+  # [db.postgres]  →  Option<DbBackendConfig>
+  postgres:
+    enabled: false
+    url: ""
+    existingSecret: ""
+    # listen: default "127.0.0.1:5432"
+    listen: "127.0.0.1:5432"
+    socket: ""
+    minConnections: 2
+    maxConnections: 20
+    idleTimeout: "300s"
+    maxLifetime: "1800s"
+    poolTimeout: "5s"
+    healthCheckInterval: "30s"
+    injectEnv: true
+    resetStrategy: "smart"
+    replicas:
+      urls: []
+
+  # [db.tds]  →  Option<DbBackendConfig> (SQL Server)
+  # NOTE: TDS proxy is configured but NOT YET IMPLEMENTED.
+  # Confirmed from ephpm-server/src/lib.rs: logs a warning and does nothing.
+  # Kept here for future use when the TDS wire protocol is implemented.
+  tds:
+    enabled: false
+    url: ""
+    existingSecret: ""
+    listen: "127.0.0.1:1433"
+    socket: ""
+    minConnections: 2
+    maxConnections: 20
+    idleTimeout: "300s"
+    maxLifetime: "1800s"
+    poolTimeout: "5s"
+    healthCheckInterval: "30s"
+    injectEnv: true
+    resetStrategy: "smart"
+    replicas:
+      urls: []
+
+  # [db.sqlite]  →  Option<SqliteConfig>
+  sqlite:
+    enabled: false
+    # default_sqlite_path() = "ephpm.db"
+    path: "ephpm.db"
+    # Storage for the SQLite data file (K8s PVC)
+    storageSize: "5Gi"
+    storageClass: ""
+
+    # [db.sqlite.proxy]  →  SqliteProxyConfig
+    proxy:
+      # default_sqlite_mysql_listen() = "127.0.0.1:3306"
+      mysqlListen: "127.0.0.1:3306"
+      hranaListen: ""
+      postgresListen: ""
+      tdsListen: ""
+
+    # [db.sqlite.sqld]  →  SqldConfig (clustered mode only)
+    sqld:
+      # default_sqld_http_listen() = "127.0.0.1:8081"
+      httpListen: "127.0.0.1:8081"
+      # default_sqld_grpc_listen() = "0.0.0.0:5001"
+      grpcListen: "0.0.0.0:5001"
+
+    # [db.sqlite.replication]  →  ReplicationConfig (clustered mode only)
+    replication:
+      # default_replication_role() = "auto"
+      role: "auto"
+      primaryGrpcUrl: ""
+
+  # [db.read_write_split]  →  ReadWriteSplitConfig
+  readWriteSplit:
+    enabled: false
+    # default_rw_strategy() = "sticky-after-write"
+    strategy: "sticky-after-write"
+    # default_sticky_duration() = "2s"
+    stickyDuration: "2s"
+    # default_max_replica_lag() = "500ms"
+    maxReplicaLag: "500ms"
+
+  # [db.analysis]  →  DbAnalysisConfig
+  analysis:
+    # default_query_stats_enabled() = true
+    queryStats: true
+    # default_slow_query_threshold() = "1s"
+    slowQueryThreshold: "1s"
+    # auto_explain: planned, not yet implemented — parsed but not acted upon
+    autoExplain: false
+    # default_auto_explain_target() = "stderr"
+    autoExplainTarget: "stderr"
+    # default_digest_max_entries() = 100000
+    # NOTE: struct field is digest_store_max_entries despite query-stats.md saying digest_max_entries
+    digestStoreMaxEntries: 100000
+
+# ---------------------------------------------------------------------------
+# [kv]  →  KvConfig
+# ---------------------------------------------------------------------------
+kv:
+  # default_kv_memory_limit() = "256MB"
+  memoryLimit: "256MB"
+  # default_kv_eviction_policy() = "allkeys-lru"
+  evictionPolicy: "allkeys-lru"
+  # default_kv_compression() = "none"  (brotli also supported)
+  compression: "none"
+  # default_kv_compression_level() = 6
+  compressionLevel: 6
+  # default_kv_compression_min_size() = 1024
+  compressionMinSize: 1024
+  # secret for multi-tenant RESP auth (HMAC-SHA256 per-site password derivation)
+  secret: ""
+
+  # [kv.redis_compat]  →  KvRedisCompatConfig
+  redisCompat:
+    enabled: false
+    # default_kv_listen() = "127.0.0.1:6379"
+    listen: "127.0.0.1:6379"
+    socket: ""
+    # Optional RESP AUTH password (equiv to Redis requirepass)
+    password: ""
+
+# ---------------------------------------------------------------------------
+# [cluster]  →  ClusterConfig
+# ---------------------------------------------------------------------------
+cluster:
+  enabled: false
+  # default_cluster_bind() = "0.0.0.0:7946"
+  bind: "0.0.0.0:7946"
+  # Seed peers. When empty, chart derives list from StatefulSet pod DNS.
+  join: []
+  # base64-encoded 32-byte gossip encryption key. Use existingSecret instead.
+  secret: ""
+  # K8s Secret with key "gossipSecret"
+  existingSecret: ""
+  # Auto-generated if empty
+  nodeId: ""
+  # default_cluster_id() = "ephpm"
+  clusterId: "ephpm"
+
+  # [cluster.kv]  →  ClusterKvConfig
+  kv:
+    # default_small_key_threshold() = 512 bytes
+    smallKeyThreshold: 512
+    # default_replication_factor() = 2
+    replicationFactor: 2
+    # default_replication_mode() = "async"
+    replicationMode: "async"
+    # default_hot_key_cache() = true
+    hotKeyCache: true
+    # default_hot_key_threshold() = 5
+    hotKeyThreshold: 5
+    # default_hot_key_window_secs() = 10
+    hotKeyWindowSecs: 10
+    # default_hot_key_local_ttl_secs() = 30
+    hotKeyLocalTtlSecs: 30
+    # default_hot_key_max_memory() = "64MB"
+    hotKeyMaxMemory: "64MB"
+    # default_kv_data_port() = 7947  ← KV data plane TCP port
+    dataPort: 7947
+
+# ---------------------------------------------------------------------------
+# Readiness probe — confirmed from k8s/base/ephpm-single.yaml
+# ---------------------------------------------------------------------------
+readinessProbe:
+  httpGet:
+    path: /index.php
+    port: 8080
+  initialDelaySeconds: 2
+  periodSeconds: 3
+
+# -- Optional liveness probe. Authors don't use one — disabled by default.
+livenessProbe: {}
+
+# ---------------------------------------------------------------------------
+# Document root persistence
+# ---------------------------------------------------------------------------
+persistence:
+  enabled: false
+  existingClaim: ""
+  storageClass: ""
+  size: "10Gi"
+  accessMode: ReadWriteOnce
+
+# ---------------------------------------------------------------------------
+# Service
+# ---------------------------------------------------------------------------
+service:
+  type: ClusterIP
+  port: 8080
+  httpsPort: 443
+
+# ---------------------------------------------------------------------------
+# Ingress
+# ---------------------------------------------------------------------------
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: ephpm.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# ---------------------------------------------------------------------------
+# Resources / autoscaling
+# ---------------------------------------------------------------------------
+resources: {}
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 80
+
+# ---------------------------------------------------------------------------
+# Pod settings
+# ---------------------------------------------------------------------------
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  fsGroup: 1000
+
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# ---------------------------------------------------------------------------
+# Prometheus ServiceMonitor
+# ---------------------------------------------------------------------------
+serviceMonitor:
+  enabled: false
+  namespace: ""
+  interval: "30s"
+  scrapeTimeout: "10s"
+  additionalLabels: {}
