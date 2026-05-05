@@ -9,9 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use chitchat::transport::UdpTransport;
-use chitchat::{
-    ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, spawn_chitchat,
-};
+use chitchat::{ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, spawn_chitchat};
 use ephpm_config::ClusterConfig;
 
 /// Information about a single cluster node.
@@ -84,12 +82,8 @@ impl ClusterHandle {
         }
 
         // Include self if not already in live/dead sets (always alive).
-        let self_in_live = live_ids
-            .iter()
-            .any(|id| id.node_id == self.self_id);
-        let self_in_dead = dead_ids
-            .iter()
-            .any(|id| id.node_id == self.self_id);
+        let self_in_live = live_ids.iter().any(|id| id.node_id == self.self_id);
+        let self_in_dead = dead_ids.iter().any(|id| id.node_id == self.self_id);
         if !self_in_live && !self_in_dead {
             nodes.push(NodeInfo {
                 id: self.self_id.clone(),
@@ -145,11 +139,8 @@ impl ClusterHandle {
 ///
 /// Panics if the system clock is before the UNIX epoch.
 pub async fn start_gossip(config: &ClusterConfig) -> anyhow::Result<ClusterHandle> {
-    let node_id = if config.node_id.is_empty() {
-        generate_node_id()
-    } else {
-        config.node_id.clone()
-    };
+    let node_id =
+        if config.node_id.is_empty() { generate_node_id() } else { config.node_id.clone() };
 
     let listen_addr: SocketAddr = config
         .bind
@@ -197,9 +188,7 @@ pub async fn start_gossip(config: &ClusterConfig) -> anyhow::Result<ClusterHandl
 
 /// Generate a unique node ID from the hostname and a random suffix.
 fn generate_node_id() -> String {
-    let hostname = std::env::var("HOSTNAME")
-        .ok()
-        .unwrap_or_else(|| "unknown".to_string());
+    let hostname = std::env::var("HOSTNAME").ok().unwrap_or_else(|| "unknown".to_string());
 
     let suffix: u32 = rand_suffix();
     format!("{hostname}-{suffix:08x}")

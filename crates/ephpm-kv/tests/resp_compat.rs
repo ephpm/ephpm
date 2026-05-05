@@ -22,19 +22,13 @@ struct TestServer {
 
 impl TestServer {
     async fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("failed to bind test listener");
-        let addr = listener
-            .local_addr()
-            .expect("failed to get local addr")
-            .to_string();
+        let listener =
+            TcpListener::bind("127.0.0.1:0").await.expect("failed to bind test listener");
+        let addr = listener.local_addr().expect("failed to get local addr").to_string();
 
         let store = Store::new(StoreConfig::default());
         let handle = tokio::spawn(async move {
-            server::serve_on(store, listener, 64 * 1024 * 1024, None, None, None)
-                .await
-                .ok();
+            server::serve_on(store, listener, 64 * 1024 * 1024, None, None, None).await.ok();
         });
 
         // Give the accept loop a moment to become ready.
@@ -73,11 +67,7 @@ async fn ping_returns_pong() {
 async fn ping_with_message_echoes_back() {
     let srv = TestServer::start().await;
     let mut con = srv.con().await;
-    let resp: String = redis::cmd("PING")
-        .arg("hello world")
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let resp: String = redis::cmd("PING").arg("hello world").query_async(&mut con).await.unwrap();
     assert_eq!(resp, "hello world");
 }
 
@@ -85,11 +75,7 @@ async fn ping_with_message_echoes_back() {
 async fn echo_returns_argument() {
     let srv = TestServer::start().await;
     let mut con = srv.con().await;
-    let resp: String = redis::cmd("ECHO")
-        .arg("testing 123")
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let resp: String = redis::cmd("ECHO").arg("testing 123").query_async(&mut con).await.unwrap();
     assert_eq!(resp, "testing 123");
 }
 
@@ -130,14 +116,8 @@ async fn set_with_ex_applies_ttl_seconds() {
     let mut con = srv.con().await;
 
     // Use SET ... EX rather than SETEX (we don't implement the SETEX alias).
-    let _: () = redis::cmd("SET")
-        .arg("k")
-        .arg("v")
-        .arg("EX")
-        .arg(30)
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let _: () =
+        redis::cmd("SET").arg("k").arg("v").arg("EX").arg(30).query_async(&mut con).await.unwrap();
     let ttl: i64 = con.ttl("k").await.unwrap();
     assert!(ttl > 0 && ttl <= 30, "expected TTL in (0, 30], got {ttl}");
 }
@@ -157,10 +137,7 @@ async fn set_with_px_applies_ttl_millis() {
         .await
         .unwrap();
     let pttl: i64 = con.pttl("k").await.unwrap();
-    assert!(
-        pttl > 0 && pttl <= 30_000,
-        "expected PTTL in (0, 30000], got {pttl}"
-    );
+    assert!(pttl > 0 && pttl <= 30_000, "expected PTTL in (0, 30000], got {pttl}");
 }
 
 #[tokio::test]
@@ -184,24 +161,14 @@ async fn set_xx_only_when_key_present() {
     let mut con = srv.con().await;
 
     // XX on absent key → Null (redis crate returns false/None).
-    let absent: Option<String> = redis::cmd("SET")
-        .arg("k")
-        .arg("v")
-        .arg("XX")
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let absent: Option<String> =
+        redis::cmd("SET").arg("k").arg("v").arg("XX").query_async(&mut con).await.unwrap();
     assert!(absent.is_none(), "SET XX on absent key should return nil");
 
     let _: () = con.set("k", "original").await.unwrap();
 
-    let _present: Option<String> = redis::cmd("SET")
-        .arg("k")
-        .arg("updated")
-        .arg("XX")
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let _present: Option<String> =
+        redis::cmd("SET").arg("k").arg("updated").arg("XX").query_async(&mut con).await.unwrap();
 
     let got: String = con.get("k").await.unwrap();
     assert_eq!(got, "updated");
@@ -214,13 +181,8 @@ async fn set_get_option_returns_previous_value() {
 
     let _: () = con.set("k", "old").await.unwrap();
 
-    let prev: Option<String> = redis::cmd("SET")
-        .arg("k")
-        .arg("new")
-        .arg("GET")
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let prev: Option<String> =
+        redis::cmd("SET").arg("k").arg("new").arg("GET").query_async(&mut con).await.unwrap();
     assert_eq!(prev.as_deref(), Some("old"));
 
     let got: String = con.get("k").await.unwrap();
@@ -234,10 +196,7 @@ async fn mset_and_mget_multiple_keys() {
     let srv = TestServer::start().await;
     let mut con = srv.con().await;
 
-    let _: () = con
-        .mset(&[("a", "1"), ("b", "2"), ("c", "3")])
-        .await
-        .unwrap();
+    let _: () = con.mset(&[("a", "1"), ("b", "2"), ("c", "3")]).await.unwrap();
 
     let got: Vec<Option<String>> = con.mget(&["a", "b", "c", "missing"]).await.unwrap();
     assert_eq!(got[0].as_deref(), Some("1"));
@@ -251,20 +210,11 @@ async fn setnx_via_set_nx() {
     let srv = TestServer::start().await;
     let mut con = srv.con().await;
 
-    let first: i64 = redis::cmd("SETNX")
-        .arg("k")
-        .arg("v")
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let first: i64 = redis::cmd("SETNX").arg("k").arg("v").query_async(&mut con).await.unwrap();
     assert_eq!(first, 1);
 
-    let second: i64 = redis::cmd("SETNX")
-        .arg("k")
-        .arg("other")
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let second: i64 =
+        redis::cmd("SETNX").arg("k").arg("other").query_async(&mut con).await.unwrap();
     assert_eq!(second, 0);
 
     let got: String = con.get("k").await.unwrap();
@@ -410,11 +360,7 @@ async fn strlen_returns_byte_length() {
     let mut con = srv.con().await;
 
     let _: () = con.set("k", "hello").await.unwrap();
-    let len: i64 = redis::cmd("STRLEN")
-        .arg("k")
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let len: i64 = redis::cmd("STRLEN").arg("k").query_async(&mut con).await.unwrap();
     assert_eq!(len, 5);
 }
 
@@ -422,11 +368,7 @@ async fn strlen_returns_byte_length() {
 async fn strlen_missing_key_is_zero() {
     let srv = TestServer::start().await;
     let mut con = srv.con().await;
-    let len: i64 = redis::cmd("STRLEN")
-        .arg("nope")
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let len: i64 = redis::cmd("STRLEN").arg("nope").query_async(&mut con).await.unwrap();
     assert_eq!(len, 0);
 }
 
@@ -436,12 +378,8 @@ async fn getset_returns_old_value_and_sets_new() {
     let mut con = srv.con().await;
 
     let _: () = con.set("k", "old").await.unwrap();
-    let prev: String = redis::cmd("GETSET")
-        .arg("k")
-        .arg("new")
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let prev: String =
+        redis::cmd("GETSET").arg("k").arg("new").query_async(&mut con).await.unwrap();
     assert_eq!(prev, "old");
 
     let got: String = con.get("k").await.unwrap();
@@ -499,10 +437,7 @@ async fn pexpire_sets_millisecond_ttl() {
     assert!(set);
 
     let pttl: i64 = con.pttl("k").await.unwrap();
-    assert!(
-        pttl > 0 && pttl <= 30_000,
-        "expected PTTL in (0, 30000], got {pttl}"
-    );
+    assert!(pttl > 0 && pttl <= 30_000, "expected PTTL in (0, 30000], got {pttl}");
 }
 
 #[tokio::test]
@@ -510,14 +445,8 @@ async fn persist_removes_expiry() {
     let srv = TestServer::start().await;
     let mut con = srv.con().await;
 
-    let _: () = redis::cmd("SET")
-        .arg("k")
-        .arg("v")
-        .arg("EX")
-        .arg(30)
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let _: () =
+        redis::cmd("SET").arg("k").arg("v").arg("EX").arg(30).query_async(&mut con).await.unwrap();
     let removed: bool = con.persist("k").await.unwrap();
     assert!(removed);
 
@@ -541,11 +470,7 @@ async fn type_string_key() {
     let mut con = srv.con().await;
 
     let _: () = con.set("k", "v").await.unwrap();
-    let t: String = redis::cmd("TYPE")
-        .arg("k")
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let t: String = redis::cmd("TYPE").arg("k").query_async(&mut con).await.unwrap();
     assert_eq!(t, "string");
 }
 
@@ -553,11 +478,7 @@ async fn type_string_key() {
 async fn type_missing_key_returns_none_string() {
     let srv = TestServer::start().await;
     let mut con = srv.con().await;
-    let t: String = redis::cmd("TYPE")
-        .arg("nope")
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let t: String = redis::cmd("TYPE").arg("nope").query_async(&mut con).await.unwrap();
     assert_eq!(t, "none");
 }
 
@@ -579,10 +500,7 @@ async fn keys_prefix_pattern_filters() {
     let srv = TestServer::start().await;
     let mut con = srv.con().await;
 
-    let _: () = con
-        .mset(&[("user:1", "a"), ("user:2", "b"), ("post:1", "c")])
-        .await
-        .unwrap();
+    let _: () = con.mset(&[("user:1", "a"), ("user:2", "b"), ("post:1", "c")]).await.unwrap();
 
     let mut keys: Vec<String> = con.keys("user:*").await.unwrap();
     keys.sort();
@@ -669,9 +587,16 @@ async fn pipeline_set_then_get() {
     // Pipeline: SET pk pv  (ignored), GET pk, SET pk2 pv2 (ignored).
     // Non-ignored responses are collected in order: just GET pk → "pv".
     let (got,): (String,) = redis::pipe()
-        .cmd("SET").arg("pk").arg("pv").ignore()
-        .cmd("GET").arg("pk")
-        .cmd("SET").arg("pk2").arg("pv2").ignore()
+        .cmd("SET")
+        .arg("pk")
+        .arg("pv")
+        .ignore()
+        .cmd("GET")
+        .arg("pk")
+        .cmd("SET")
+        .arg("pk2")
+        .arg("pv2")
+        .ignore()
         .query_async(&mut con)
         .await
         .unwrap();
@@ -685,15 +610,10 @@ async fn pipeline_set_then_get() {
 async fn unknown_command_returns_error() {
     let srv = TestServer::start().await;
     let mut con = srv.con().await;
-    let err = redis::cmd("NOTACOMMAND")
-        .query_async::<String>(&mut con)
-        .await;
+    let err = redis::cmd("NOTACOMMAND").query_async::<String>(&mut con).await;
     assert!(err.is_err(), "unknown command should return an error");
     let msg = err.unwrap_err().to_string();
-    assert!(
-        msg.contains("NOTACOMMAND"),
-        "error message should name the command, got: {msg}"
-    );
+    assert!(msg.contains("NOTACOMMAND"), "error message should name the command, got: {msg}");
 }
 
 #[tokio::test]
@@ -714,20 +634,14 @@ struct AuthTestServer {
 
 impl AuthTestServer {
     async fn start(password: &str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("failed to bind test listener");
-        let addr = listener
-            .local_addr()
-            .expect("failed to get local addr")
-            .to_string();
+        let listener =
+            TcpListener::bind("127.0.0.1:0").await.expect("failed to bind test listener");
+        let addr = listener.local_addr().expect("failed to get local addr").to_string();
 
         let store = Store::new(StoreConfig::default());
         let pw = Some(password.to_string());
         let handle = tokio::spawn(async move {
-            server::serve_on(store, listener, 64 * 1024 * 1024, pw, None, None)
-                .await
-                .ok();
+            server::serve_on(store, listener, 64 * 1024 * 1024, pw, None, None).await.ok();
         });
 
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -753,10 +667,7 @@ async fn auth_required_blocks_commands() {
     let err = redis::cmd("PING").query_async::<String>(&mut con).await;
     assert!(err.is_err(), "PING without AUTH should fail");
     let msg = err.unwrap_err().to_string();
-    assert!(
-        msg.contains("NOAUTH"),
-        "expected NOAUTH error, got: {msg}"
-    );
+    assert!(msg.contains("NOAUTH"), "expected NOAUTH error, got: {msg}");
 }
 
 #[tokio::test]
@@ -791,11 +702,7 @@ async fn auth_no_password_configured_accepts_anything() {
 
     // AUTH with any password should succeed when no password is configured.
     let mut con = srv.con().await;
-    let resp: String = redis::cmd("AUTH")
-        .arg("anything")
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let resp: String = redis::cmd("AUTH").arg("anything").query_async(&mut con).await.unwrap();
     assert_eq!(resp, "OK");
 }
 
@@ -812,33 +719,20 @@ impl HmacTestServer {
     async fn start(secret: &str) -> Self {
         use ephpm_kv::multi_tenant::MultiTenantStore;
 
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("failed to bind test listener");
-        let addr = listener
-            .local_addr()
-            .expect("failed to get local addr")
-            .to_string();
+        let listener =
+            TcpListener::bind("127.0.0.1:0").await.expect("failed to bind test listener");
+        let addr = listener.local_addr().expect("failed to get local addr").to_string();
 
         let store = Store::new(StoreConfig::default());
-        let mt = MultiTenantStore::new(
-            std::sync::Arc::clone(&store),
-            StoreConfig::default(),
-        );
+        let mt = MultiTenantStore::new(std::sync::Arc::clone(&store), StoreConfig::default());
         let sec = Some(secret.to_string());
         let handle = tokio::spawn(async move {
-            server::serve_on(store, listener, 64 * 1024 * 1024, None, sec, Some(mt))
-                .await
-                .ok();
+            server::serve_on(store, listener, 64 * 1024 * 1024, None, sec, Some(mt)).await.ok();
         });
 
         tokio::time::sleep(Duration::from_millis(5)).await;
 
-        Self {
-            addr,
-            handle,
-            secret: secret.to_string(),
-        }
+        Self { addr, handle, secret: secret.to_string() }
     }
 }
 
@@ -867,12 +761,8 @@ async fn hmac_auth_correct_password_succeeds() {
     assert!(msg.contains("NOAUTH"), "expected NOAUTH, got: {msg}");
 
     // Now AUTH with the correct hostname + password.
-    let resp: String = redis::cmd("AUTH")
-        .arg(hostname)
-        .arg(&password)
-        .query_async(&mut con)
-        .await
-        .unwrap();
+    let resp: String =
+        redis::cmd("AUTH").arg(hostname).arg(&password).query_async(&mut con).await.unwrap();
     assert_eq!(resp, "OK");
 
     // Commands should now work.
@@ -894,10 +784,7 @@ async fn hmac_auth_wrong_password_rejected() {
         .await;
     assert!(err.is_err());
     let msg = err.unwrap_err().to_string();
-    assert!(
-        msg.contains("invalid password"),
-        "expected invalid password error, got: {msg}"
-    );
+    assert!(msg.contains("invalid password"), "expected invalid password error, got: {msg}");
 }
 
 #[tokio::test]
@@ -921,12 +808,8 @@ async fn hmac_auth_site_isolation() {
     let pw_bob = derive_site_password(&srv.secret, "bob.com");
     let client_bob = redis::Client::open(format!("redis://{}/", srv.addr)).unwrap();
     let mut con_bob = client_bob.get_multiplexed_async_connection().await.unwrap();
-    let _: String = redis::cmd("AUTH")
-        .arg("bob.com")
-        .arg(&pw_bob)
-        .query_async(&mut con_bob)
-        .await
-        .unwrap();
+    let _: String =
+        redis::cmd("AUTH").arg("bob.com").arg(&pw_bob).query_async(&mut con_bob).await.unwrap();
 
     // Alice sets a key.
     let _: () = redis::cmd("SET")
@@ -937,22 +820,13 @@ async fn hmac_auth_site_isolation() {
         .unwrap();
 
     // Bob should not see Alice's key (isolated stores).
-    let bob_val: Option<String> = redis::cmd("GET")
-        .arg("shared_key")
-        .query_async(&mut con_bob)
-        .await
-        .unwrap();
-    assert!(
-        bob_val.is_none(),
-        "bob should not see alice's data, got: {bob_val:?}"
-    );
+    let bob_val: Option<String> =
+        redis::cmd("GET").arg("shared_key").query_async(&mut con_bob).await.unwrap();
+    assert!(bob_val.is_none(), "bob should not see alice's data, got: {bob_val:?}");
 
     // Alice should see her own key.
-    let alice_val: String = redis::cmd("GET")
-        .arg("shared_key")
-        .query_async(&mut con_alice)
-        .await
-        .unwrap();
+    let alice_val: String =
+        redis::cmd("GET").arg("shared_key").query_async(&mut con_alice).await.unwrap();
     assert_eq!(alice_val, "alice-data");
 }
 
@@ -964,10 +838,7 @@ async fn hmac_auth_missing_password_arg_rejected() {
     let mut con = client.get_multiplexed_async_connection().await.unwrap();
 
     // AUTH with only hostname (missing password) should fail.
-    let err = redis::cmd("AUTH")
-        .arg("alice.com")
-        .query_async::<String>(&mut con)
-        .await;
+    let err = redis::cmd("AUTH").arg("alice.com").query_async::<String>(&mut con).await;
     assert!(err.is_err());
     let msg = err.unwrap_err().to_string();
     assert!(

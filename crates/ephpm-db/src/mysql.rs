@@ -29,8 +29,8 @@
 //! path (RSA public key exchange over non-TLS connections).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
@@ -376,13 +376,8 @@ async fn connect_and_handshake(url: &DbUrl) -> Result<(TcpStream, ServerMeta), D
                     let mut new_challenge = [0u8; 20];
                     let copy_len = switch_data.len().min(20);
                     new_challenge[..copy_len].copy_from_slice(&switch_data[..copy_len]);
-                    handle_caching_sha2(
-                        &mut stream,
-                        &url.password,
-                        &new_challenge,
-                        seq + 1,
-                    )
-                    .await?;
+                    handle_caching_sha2(&mut stream, &url.password, &new_challenge, seq + 1)
+                        .await?;
                 }
                 other => {
                     return Err(DbError::Auth(format!(
@@ -602,9 +597,7 @@ async fn handle_caching_sha2(
         Some(0x01) => {
             handle_caching_sha2_more_data(stream, password, challenge, &resp, next_seq).await
         }
-        _ => Err(DbError::Protocol(
-            "unexpected response during caching_sha2 auth".into(),
-        )),
+        _ => Err(DbError::Protocol("unexpected response during caching_sha2 auth".into())),
     }
 }
 
@@ -643,9 +636,7 @@ async fn handle_caching_sha2_more_data(
 
             if key_resp.first() == Some(&0xFF) {
                 let msg = parse_error_packet(&key_resp);
-                return Err(DbError::Auth(format!(
-                    "failed to get RSA public key: {msg}"
-                )));
+                return Err(DbError::Auth(format!("failed to get RSA public key: {msg}")));
             }
 
             // The response is the public key in PEM format (0x01 prefix + PEM data).
@@ -661,18 +652,16 @@ async fn handle_caching_sha2_more_data(
                 Some(0x00) => Ok(()),
                 Some(0xFF) => {
                     let msg = parse_error_packet(&final_resp);
-                    Err(DbError::Auth(format!(
-                        "caching_sha2 full auth error: {msg}"
-                    )))
+                    Err(DbError::Auth(format!("caching_sha2 full auth error: {msg}")))
                 }
                 _ => Err(DbError::Protocol(
                     "unexpected response after caching_sha2 full auth".into(),
                 )),
             }
         }
-        other => Err(DbError::Protocol(format!(
-            "unexpected caching_sha2 more-data flag: {other:#x}"
-        ))),
+        other => {
+            Err(DbError::Protocol(format!("unexpected caching_sha2 more-data flag: {other:#x}")))
+        }
     }
 }
 
@@ -1161,8 +1150,15 @@ async fn proxy_routing_loop(
             break;
         }
 
-        let (target_pool, query_kind) =
-            route_command(&payload, pool, replica_pools, &state, rw_split, &stmt_pool_map, replica_rr);
+        let (target_pool, query_kind) = route_command(
+            &payload,
+            pool,
+            replica_pools,
+            &state,
+            rw_split,
+            &stmt_pool_map,
+            replica_rr,
+        );
         track_dirty(&mut state, &payload, query_kind);
 
         // Acquire backend and forward the command.
@@ -1175,10 +1171,8 @@ async fn proxy_routing_loop(
                 PoolTarget::Primary
             } else {
                 // Find which replica index was selected.
-                let idx = replica_pools
-                    .iter()
-                    .position(|r| std::ptr::eq(target_pool, r))
-                    .unwrap_or(0);
+                let idx =
+                    replica_pools.iter().position(|r| std::ptr::eq(target_pool, r)).unwrap_or(0);
                 PoolTarget::Replica(idx)
             };
             if let Some(stmt_id) = forward_prepare_response(&mut backend, &mut client).await? {

@@ -86,11 +86,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "SELECT" => {
             // Single-server: only DB 0 supported.
             let db = str_arg(argv, 0).unwrap_or_default();
-            if db == "0" {
-                Frame::ok()
-            } else {
-                Frame::error("ERR DB index is out of range")
-            }
+            if db == "0" { Frame::ok() } else { Frame::error("ERR DB index is out of range") }
         }
         "QUIT" => Frame::ok(),
         "COMMAND" => {
@@ -516,17 +512,14 @@ fn str_arg(argv: &[&[u8]], idx: usize) -> Option<String> {
 /// Parse a byte slice as i64.
 fn parse_i64(b: &[u8]) -> Result<i64, Frame> {
     let s = str_from(b);
-    s.parse::<i64>()
-        .map_err(|_| Frame::error("ERR value is not an integer or out of range"))
+    s.parse::<i64>().map_err(|_| Frame::error("ERR value is not an integer or out of range"))
 }
 
 /// Return an error frame if `argv` doesn't have at least `n` elements.
 /// Uses the `?` operator trick — returns `Frame` on error.
 fn require_args(cmd: &str, argv: &[&[u8]], n: usize) -> Result<(), Frame> {
     if argv.len() < n {
-        Err(Frame::error(format!(
-            "ERR wrong number of arguments for '{cmd}' command"
-        )))
+        Err(Frame::error(format!("ERR wrong number of arguments for '{cmd}' command")))
     } else {
         Ok(())
     }
@@ -545,20 +538,12 @@ mod tests {
 
     /// Build a command frame and dispatch it.
     fn cmd(store: &Arc<Store>, args: &[&str]) -> Frame {
-        let frame = Frame::Array(
-            args.iter()
-                .map(|s| Frame::bulk(s.as_bytes().to_vec()))
-                .collect(),
-        );
+        let frame = Frame::Array(args.iter().map(|s| Frame::bulk(s.as_bytes().to_vec())).collect());
         dispatch(store, &frame)
     }
 
     fn bulk_str(f: &Frame) -> Option<&str> {
-        if let Frame::Bulk(b) = f {
-            std::str::from_utf8(b).ok()
-        } else {
-            None
-        }
+        if let Frame::Bulk(b) = f { std::str::from_utf8(b).ok() } else { None }
     }
 
     fn int(f: &Frame) -> Option<i64> {
@@ -685,10 +670,7 @@ mod tests {
 
     #[test]
     fn set_nx_and_xx_together_is_error() {
-        assert!(matches!(
-            cmd(&store(), &["SET", "k", "v", "NX", "XX"]),
-            Frame::Error(_)
-        ));
+        assert!(matches!(cmd(&store(), &["SET", "k", "v", "NX", "XX"]), Frame::Error(_)));
     }
 
     #[test]
@@ -702,10 +684,7 @@ mod tests {
 
     #[test]
     fn setex_invalid_ttl_is_error() {
-        assert!(matches!(
-            cmd(&store(), &["SETEX", "k", "-1", "v"]),
-            Frame::Error(_)
-        ));
+        assert!(matches!(cmd(&store(), &["SETEX", "k", "-1", "v"]), Frame::Error(_)));
     }
 
     #[test]
@@ -920,10 +899,7 @@ mod tests {
 
     #[test]
     fn type_missing_key_is_none() {
-        assert_eq!(
-            cmd(&store(), &["TYPE", "nope"]),
-            Frame::Simple("none".into())
-        );
+        assert_eq!(cmd(&store(), &["TYPE", "nope"]), Frame::Simple("none".into()));
     }
 
     #[test]
@@ -937,10 +913,7 @@ mod tests {
 
     #[test]
     fn rename_missing_key_is_error() {
-        assert!(matches!(
-            cmd(&store(), &["RENAME", "nope", "new"]),
-            Frame::Error(_)
-        ));
+        assert!(matches!(cmd(&store(), &["RENAME", "nope", "new"]), Frame::Error(_)));
     }
 
     #[test]
@@ -958,9 +931,7 @@ mod tests {
     fn keys_wildcard_returns_all() {
         let s = store();
         cmd(&s, &["MSET", "a", "1", "b", "2"]);
-        let Frame::Array(keys) = cmd(&s, &["KEYS", "*"]) else {
-            panic!("expected array")
-        };
+        let Frame::Array(keys) = cmd(&s, &["KEYS", "*"]) else { panic!("expected array") };
         assert!(keys.len() >= 2);
     }
 
@@ -968,9 +939,7 @@ mod tests {
     fn keys_pattern_filters() {
         let s = store();
         cmd(&s, &["MSET", "user:1", "a", "user:2", "b", "post:1", "c"]);
-        let Frame::Array(keys) = cmd(&s, &["KEYS", "user:*"]) else {
-            panic!("expected array")
-        };
+        let Frame::Array(keys) = cmd(&s, &["KEYS", "user:*"]) else { panic!("expected array") };
         assert_eq!(keys.len(), 2);
     }
 
@@ -1050,10 +1019,7 @@ mod tests {
 
     #[test]
     fn incrby_non_integer_delta_is_error() {
-        assert!(matches!(
-            cmd(&store(), &["INCRBY", "k", "notanint"]),
-            Frame::Error(_)
-        ));
+        assert!(matches!(cmd(&store(), &["INCRBY", "k", "notanint"]), Frame::Error(_)));
     }
 
     // ── Case insensitivity ───────────────────────────────────────────────

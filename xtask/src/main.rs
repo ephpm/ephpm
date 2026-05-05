@@ -153,9 +153,7 @@ fn release_linux(args: &[String]) -> ExitCode {
 
     // Ensure the musl target is installed
     eprintln!("==> Ensuring Rust target {target} is installed...");
-    let status = Command::new("rustup")
-        .args(["target", "add", &target])
-        .status();
+    let status = Command::new("rustup").args(["target", "add", &target]).status();
     if !ran_ok(&status) {
         eprintln!("error: failed to add Rust target {target}");
         return ExitCode::FAILURE;
@@ -258,9 +256,7 @@ fn release_windows(args: &[String]) -> ExitCode {
 
     // 3. Ensure the MSVC target is installed
     eprintln!("==> Ensuring Rust target {target} is installed...");
-    let status = Command::new("rustup")
-        .args(["target", "add", target])
-        .status();
+    let status = Command::new("rustup").args(["target", "add", target]).status();
     if !ran_ok(&status) {
         eprintln!("error: failed to add Rust target {target}");
         return ExitCode::FAILURE;
@@ -269,15 +265,7 @@ fn release_windows(args: &[String]) -> ExitCode {
     // 4. Build with cargo-xwin
     eprintln!("==> Building ephpm.exe (release, target: {target})...");
     let status = Command::new("cargo")
-        .args([
-            "xwin",
-            "build",
-            "--release",
-            "--package",
-            "ephpm",
-            "--target",
-            target,
-        ])
+        .args(["xwin", "build", "--release", "--package", "ephpm", "--target", target])
         .env("PHP_SDK_PATH", &sdk_dir)
         .status();
 
@@ -287,10 +275,7 @@ fn release_windows(args: &[String]) -> ExitCode {
     }
 
     // 5. Copy php8embed.dll next to the .exe
-    let exe_dir = workspace_root()
-        .join("target")
-        .join(target)
-        .join("release");
+    let exe_dir = workspace_root().join("target").join(target).join("release");
     let dll_dest = exe_dir.join("php8embed.dll");
     let dll_src = sdk_dir.join("lib").join("php8embed.dll");
     if dll_src.exists() {
@@ -414,32 +399,20 @@ fn download_php_windows_sdk(php_version: &str, sdk_dir: &Path) -> ExitCode {
     }
 
     cleanup_dir(&tmp_dir);
-    eprintln!(
-        "==> PHP Windows SDK ready at {}",
-        sdk_dir.display()
-    );
+    eprintln!("==> PHP Windows SDK ready at {}", sdk_dir.display());
     ExitCode::SUCCESS
 }
 
 /// Download a file via curl.
 fn download_file(url: &str, dest: &Path) -> bool {
-    let status = Command::new("curl")
-        .args(["-fSL", "-o"])
-        .arg(dest)
-        .arg(url)
-        .status();
+    let status = Command::new("curl").args(["-fSL", "-o"]).arg(dest).arg(url).status();
     ran_ok(&status)
 }
 
 /// Extract a ZIP file to a directory.
 fn unzip_file(zip: &Path, dest: &Path) -> bool {
     fs::create_dir_all(dest).ok();
-    let status = Command::new("unzip")
-        .args(["-q", "-o"])
-        .arg(zip)
-        .arg("-d")
-        .arg(dest)
-        .status();
+    let status = Command::new("unzip").args(["-q", "-o"]).arg(zip).arg("-d").arg(dest).status();
     ran_ok(&status)
 }
 
@@ -527,16 +500,8 @@ fn php_sdk(args: &[String]) -> ExitCode {
     // Download the standalone spc binary if not present.
     let spc_bin = spc_dir.join("spc");
     if !spc_bin.exists() {
-        let spc_arch = if cfg!(target_arch = "aarch64") {
-            "aarch64"
-        } else {
-            "x86_64"
-        };
-        let spc_os = if cfg!(target_os = "macos") {
-            "macos"
-        } else {
-            "linux"
-        };
+        let spc_arch = if cfg!(target_arch = "aarch64") { "aarch64" } else { "x86_64" };
+        let spc_os = if cfg!(target_os = "macos") { "macos" } else { "linux" };
         let url = format!(
             "https://github.com/crazywhalecc/static-php-cli/releases/download/{SPC_VERSION}/spc-{spc_os}-{spc_arch}.tar.gz"
         );
@@ -552,10 +517,7 @@ fn php_sdk(args: &[String]) -> ExitCode {
     // Let spc install its own toolchain (musl cross-compiler, missing system
     // packages, etc.). This may prompt for sudo password.
     eprintln!("==> Checking build environment (may prompt for sudo)...");
-    let status = Command::new(spc)
-        .args(["doctor", "--auto-fix"])
-        .current_dir(&spc_dir)
-        .status();
+    let status = Command::new(spc).args(["doctor", "--auto-fix"]).current_dir(&spc_dir).status();
 
     if !ran_ok(&status) {
         eprintln!("error: spc doctor failed — check output above");
@@ -593,13 +555,7 @@ fn php_sdk(args: &[String]) -> ExitCode {
     // Build libphp.a with embed SAPI (ZTS enabled for thread-safe embedding)
     eprintln!("==> Building libphp.a with ZTS (this takes ~15 min the first time)...");
     let status = Command::new(spc)
-        .args([
-            "build",
-            PHP_EXTENSIONS,
-            "--build-embed",
-            "--no-strip",
-            "--enable-zts",
-        ])
+        .args(["build", PHP_EXTENSIONS, "--build-embed", "--no-strip", "--enable-zts"])
         .current_dir(&spc_dir)
         .status();
 
@@ -644,10 +600,7 @@ fn has_e2e_tool(name: &str) -> bool {
     if local.exists() {
         return true;
     }
-    Command::new(name)
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+    Command::new(name).arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 /// Detect OS and architecture for download URLs.
@@ -660,11 +613,7 @@ fn platform() -> (&'static str, &'static str) {
         "linux"
     };
 
-    let arch = if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "amd64"
-    };
+    let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
 
     (os, arch)
 }
@@ -699,9 +648,7 @@ fn e2e_install() -> ExitCode {
     if kubectl_path.exists() {
         eprintln!("==> kubectl already installed, skipping (delete bin/kubectl to reinstall)");
     } else {
-        let url = format!(
-            "https://dl.k8s.io/release/v{KUBECTL_VERSION}/bin/{os}/{arch}/kubectl"
-        );
+        let url = format!("https://dl.k8s.io/release/v{KUBECTL_VERSION}/bin/{os}/{arch}/kubectl");
         eprintln!("==> Downloading kubectl v{KUBECTL_VERSION}...");
         if !download_binary(&url, &kubectl_path) {
             eprintln!("error: failed to download kubectl");
@@ -738,11 +685,7 @@ fn e2e_install() -> ExitCode {
 
 /// Download a single binary file via curl.
 fn download_binary(url: &str, dest: &PathBuf) -> bool {
-    let status = Command::new("curl")
-        .args(["-fSL", "-o"])
-        .arg(dest)
-        .arg(url)
-        .status();
+    let status = Command::new("curl").args(["-fSL", "-o"]).arg(dest).arg(url).status();
 
     if !ran_ok(&status) {
         return false;
@@ -755,10 +698,8 @@ fn download_binary(url: &str, dest: &PathBuf) -> bool {
 /// Download a tarball via curl, pipe through tar, extract a specific binary.
 fn download_and_extract_tarball(url: &str, dest_dir: &PathBuf, binary_name: &str) -> bool {
     // curl -fSL <url> | tar xz -C <dest_dir> <binary_name>
-    let curl = Command::new("curl")
-        .args(["-fSL", url])
-        .stdout(std::process::Stdio::piped())
-        .spawn();
+    let curl =
+        Command::new("curl").args(["-fSL", url]).stdout(std::process::Stdio::piped()).spawn();
 
     let Ok(curl) = curl else {
         return false;
@@ -781,10 +722,8 @@ fn download_and_extract_tarball(url: &str, dest_dir: &PathBuf, binary_name: &str
 
 /// Download a `.tar.xz` archive via curl, extract a specific binary.
 fn download_and_extract_tar_xz(url: &str, dest_dir: &Path, binary_name: &str) -> bool {
-    let curl = Command::new("curl")
-        .args(["-fSL", url])
-        .stdout(std::process::Stdio::piped())
-        .spawn();
+    let curl =
+        Command::new("curl").args(["-fSL", url]).stdout(std::process::Stdio::piped()).spawn();
 
     let Ok(curl) = curl else {
         eprintln!("error: failed to run curl");
@@ -947,11 +886,7 @@ fn e2e_up(args: &[String]) -> ExitCode {
         .current_dir(&k8s_dir)
         .status();
 
-    if ran_ok(&status) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if ran_ok(&status) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 /// Tear down Tilt resources and delete the Kind cluster.
@@ -961,11 +896,7 @@ fn e2e_down() -> ExitCode {
     // tilt down (ignore errors — cluster may already be gone)
     if has_e2e_tool("tilt") {
         eprintln!("==> Removing Tilt resources...");
-        Command::new(find_tool("tilt"))
-            .args(["down"])
-            .current_dir(&k8s_dir)
-            .status()
-            .ok();
+        Command::new(find_tool("tilt")).args(["down"]).current_dir(&k8s_dir).status().ok();
     }
 
     if has_e2e_tool("kind") {
@@ -988,9 +919,7 @@ fn ensure_kind_cluster() -> ExitCode {
     let kind = find_tool("kind");
 
     // Check if cluster already exists
-    let output = Command::new(&kind)
-        .args(["get", "clusters"])
-        .output();
+    let output = Command::new(&kind).args(["get", "clusters"]).output();
 
     if let Ok(output) = output {
         let clusters = String::from_utf8_lossy(&output.stdout);
@@ -1032,11 +961,8 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
 
     // docker uses "buildx build --load" (BuildKit, result written to local
     // daemon); podman uses plain "build" (already BuildKit-equivalent).
-    let build_args: &[&str] = if ce == "docker" {
-        &["buildx", "build", "--load"]
-    } else {
-        &["build"]
-    };
+    let build_args: &[&str] =
+        if ce == "docker" { &["buildx", "build", "--load"] } else { &["build"] };
 
     // Build ephpm image with the specified PHP version
     if dockerfile.exists() {
@@ -1045,13 +971,7 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
             .args(build_args)
             .args(["-f"])
             .arg(&dockerfile)
-            .args([
-                "--build-arg",
-                &format!("PHP_VERSION={php_version}"),
-                "-t",
-                "ephpm:dev",
-                ".",
-            ])
+            .args(["--build-arg", &format!("PHP_VERSION={php_version}"), "-t", "ephpm:dev", "."])
             .current_dir(&root)
             .status();
 
@@ -1102,33 +1022,19 @@ fn dump_pod_logs() {
     let kubectl = find_tool("kubectl");
 
     eprintln!("--- ephpm pod logs ---");
-    Command::new(&kubectl)
-        .args(["logs", "-l", "app=ephpm", "--tail=100"])
-        .status()
-        .ok();
+    Command::new(&kubectl).args(["logs", "-l", "app=ephpm", "--tail=100"]).status().ok();
 
     eprintln!("--- e2e job logs ---");
-    Command::new(&kubectl)
-        .args(["logs", "job/ephpm-e2e", "--tail=200"])
-        .status()
-        .ok();
+    Command::new(&kubectl).args(["logs", "job/ephpm-e2e", "--tail=200"]).status().ok();
 
     eprintln!("--- pod status ---");
-    Command::new(&kubectl)
-        .args(["get", "pods", "-o", "wide"])
-        .status()
-        .ok();
+    Command::new(&kubectl).args(["get", "pods", "-o", "wide"]).status().ok();
 }
 
 /// Determine which container engine to use (podman or docker).
 fn container_engine() -> String {
-    env::var("CONTAINER_ENGINE").unwrap_or_else(|_| {
-        if has_command("podman") {
-            "podman".into()
-        } else {
-            "docker".into()
-        }
-    })
+    env::var("CONTAINER_ENGINE")
+        .unwrap_or_else(|_| if has_command("podman") { "podman".into() } else { "docker".into() })
 }
 
 // ── PHP SDK ─────────────────────────────────────────────────────────────────
@@ -1175,32 +1081,29 @@ fn require_unix(f: impl FnOnce() -> ExitCode) -> ExitCode {
     // WSL auto-maps the Windows CWD to /mnt/c/... so no path conversion needed.
     let args: Vec<String> = env::args().skip(1).collect();
     // Source cargo env since bash -c doesn't run login profile
-    let xtask_cmd = format!(
-        "source \"$HOME/.cargo/env\" 2>/dev/null; cargo xtask {}",
-        args.join(" "),
-    );
+    let xtask_cmd =
+        format!("source \"$HOME/.cargo/env\" 2>/dev/null; cargo xtask {}", args.join(" "),);
 
     eprintln!("==> Windows detected, running via WSL...");
-    let status = Command::new("wsl")
-        .args(["--", "bash", "-c", &xtask_cmd])
-        .status();
+    let status = Command::new("wsl").args(["--", "bash", "-c", &xtask_cmd]).status();
 
     if ran_ok(&status) {
         ExitCode::SUCCESS
     } else {
         eprintln!();
         eprintln!("WSL build failed. Make sure WSL has the required tools:");
-        eprintln!("  wsl -- bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh'");
-        eprintln!("  wsl -- bash -c 'sudo apt update && sudo apt install -y build-essential autoconf cmake pkg-config re2c libclang-dev musl-tools curl git'");
+        eprintln!(
+            "  wsl -- bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh'"
+        );
+        eprintln!(
+            "  wsl -- bash -c 'sudo apt update && sudo apt install -y build-essential autoconf cmake pkg-config re2c libclang-dev musl-tools curl git'"
+        );
         ExitCode::FAILURE
     }
 }
 
 fn has_command(name: &str) -> bool {
-    Command::new(name)
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+    Command::new(name).arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 fn ran_ok(result: &Result<std::process::ExitStatus, std::io::Error>) -> bool {
@@ -1254,11 +1157,7 @@ Subcommands:
 /// still work).
 fn hugo_command() -> Command {
     let local = workspace_root().join("bin").join(hugo_binary_name());
-    if local.exists() {
-        Command::new(local)
-    } else {
-        Command::new("hugo")
-    }
+    if local.exists() { Command::new(local) } else { Command::new("hugo") }
 }
 
 fn hugo_binary_name() -> &'static str {
@@ -1309,11 +1208,7 @@ fn docs_serve(args: &[String]) -> ExitCode {
         .arg(site_dir())
         .status();
 
-    if ran_ok(&status) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if ran_ok(&status) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 fn docs_build() -> ExitCode {
@@ -1325,10 +1220,7 @@ fn docs_build() -> ExitCode {
     }
 
     eprintln!("==> hugo --minify -s site");
-    let status = hugo_command()
-        .args(["--minify", "-s"])
-        .arg(site_dir())
-        .status();
+    let status = hugo_command().args(["--minify", "-s"]).arg(site_dir()).status();
 
     if ran_ok(&status) {
         eprintln!("==> Built to site/public/");
@@ -1350,16 +1242,9 @@ fn docs_new(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let status = hugo_command()
-        .args(["new", "content", path, "-s"])
-        .arg(site_dir())
-        .status();
+    let status = hugo_command().args(["new", "content", path, "-s"]).arg(site_dir()).status();
 
-    if ran_ok(&status) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if ran_ok(&status) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 fn docs_check() -> ExitCode {
@@ -1376,15 +1261,10 @@ fn docs_check() -> ExitCode {
 
     eprintln!("==> lychee link check on site/public/");
     let pattern = format!("{}/**/*.html", public.display());
-    let status = Command::new("lychee")
-        .args(["--no-progress", "--include-fragments", &pattern])
-        .status();
+    let status =
+        Command::new("lychee").args(["--no-progress", "--include-fragments", &pattern]).status();
 
-    if ran_ok(&status) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if ran_ok(&status) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 fn docs_deps() -> ExitCode {
@@ -1406,9 +1286,7 @@ fn docs_deps() -> ExitCode {
     if theme_marker.exists() {
         eprintln!("==> hextra theme: ok");
     } else {
-        eprintln!(
-            "==> hextra theme: MISSING — run: git submodule update --init --recursive"
-        );
+        eprintln!("==> hextra theme: MISSING — run: git submodule update --init --recursive");
         all_ok = false;
     }
 
@@ -1420,11 +1298,7 @@ fn docs_deps() -> ExitCode {
         );
     }
 
-    if all_ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if all_ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 /// Download a pinned hugo extended binary into `./bin/`.
@@ -1442,9 +1316,7 @@ fn docs_install() -> ExitCode {
     let asset_arch = if os == "darwin" { "universal" } else { arch };
     let ext = if os == "windows" { "zip" } else { "tar.gz" };
     let asset = format!("hugo_extended_{HUGO_VERSION}_{os}-{asset_arch}.{ext}");
-    let url = format!(
-        "https://github.com/gohugoio/hugo/releases/download/v{HUGO_VERSION}/{asset}"
-    );
+    let url = format!("https://github.com/gohugoio/hugo/releases/download/v{HUGO_VERSION}/{asset}");
 
     let bin_name = hugo_binary_name();
     let dest = bin_dir.join(bin_name);
@@ -1457,16 +1329,10 @@ fn docs_install() -> ExitCode {
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(HUGO_VERSION))
             .unwrap_or(false);
         if already_pinned {
-            eprintln!(
-                "==> hugo v{HUGO_VERSION} already installed at {}",
-                dest.display()
-            );
+            eprintln!("==> hugo v{HUGO_VERSION} already installed at {}", dest.display());
             return ExitCode::SUCCESS;
         }
-        eprintln!(
-            "==> hugo at {} is a different version, replacing",
-            dest.display()
-        );
+        eprintln!("==> hugo at {} is a different version, replacing", dest.display());
         if let Err(e) = fs::remove_file(&dest) {
             eprintln!("error: failed to remove old hugo: {e}");
             return ExitCode::FAILURE;
@@ -1498,23 +1364,14 @@ fn download_and_extract_zip(url: &str, dest_dir: &Path, file_name: &str) -> bool
     let tmp = std::env::temp_dir().join(format!("ephpm-xtask-{}.zip", std::process::id()));
     let _ = fs::remove_file(&tmp);
 
-    let status = Command::new("curl")
-        .args(["-fSL", "-o"])
-        .arg(&tmp)
-        .arg(url)
-        .status();
+    let status = Command::new("curl").args(["-fSL", "-o"]).arg(&tmp).arg(url).status();
     if !ran_ok(&status) {
         let _ = fs::remove_file(&tmp);
         return false;
     }
 
-    let status = Command::new("tar")
-        .arg("-xf")
-        .arg(&tmp)
-        .arg("-C")
-        .arg(dest_dir)
-        .arg(file_name)
-        .status();
+    let status =
+        Command::new("tar").arg("-xf").arg(&tmp).arg("-C").arg(dest_dir).arg(file_name).status();
 
     let _ = fs::remove_file(&tmp);
 

@@ -18,10 +18,7 @@ fn sql_patterns() -> Vec<String> {
     (0..20)
         .map(|i| match i % 4 {
             0 => format!("SELECT * FROM table_{i} WHERE id = {}", i * 100),
-            1 => format!(
-                "INSERT INTO table_{i} (col_a, col_b) VALUES ({}, 'value_{i}')",
-                i * 10
-            ),
+            1 => format!("INSERT INTO table_{i} (col_a, col_b) VALUES ({}, 'value_{i}')", i * 10),
             2 => format!("UPDATE table_{i} SET col_a = {} WHERE id = {}", i * 5, i),
             _ => format!("DELETE FROM table_{i} WHERE created_at < '{i}-01-01'"),
         })
@@ -64,12 +61,7 @@ fn concurrent_recording_accuracy() {
                 barrier.wait();
                 for q in 0..queries_per_thread {
                     let idx = (t * queries_per_thread + q) % patterns.len();
-                    stats.record(
-                        &patterns[idx],
-                        Duration::from_micros(100),
-                        true,
-                        1,
-                    );
+                    stats.record(&patterns[idx], Duration::from_micros(100), true, 1);
                 }
             })
         })
@@ -97,8 +89,7 @@ fn concurrent_recording_accuracy() {
     );
 
     // Each of the 20 patterns is hit 1 (seed) + 2,500 (concurrent) = 2,501 times.
-    let expected_per_digest =
-        1 + (num_threads * queries_per_thread / patterns.len()) as u64;
+    let expected_per_digest = 1 + (num_threads * queries_per_thread / patterns.len()) as u64;
     for entry in &top {
         assert_eq!(
             entry.count, expected_per_digest,
@@ -174,10 +165,7 @@ fn normalization_throughput() {
 #[test]
 #[ignore = "nightly CI only — tests digest cap enforcement"]
 fn max_digests_cap() {
-    let config = StatsConfig {
-        max_digests: 50,
-        ..Default::default()
-    };
+    let config = StatsConfig { max_digests: 50, ..Default::default() };
     let stats = QueryStats::new(config);
 
     for i in 0..200 {
@@ -223,12 +211,7 @@ fn reset_under_concurrent_load() {
                 let mut i: usize = 0;
                 while running.load(Ordering::Relaxed) {
                     let idx = (t as usize * 1000 + i) % patterns.len();
-                    stats.record(
-                        &patterns[idx],
-                        Duration::from_micros(10),
-                        true,
-                        1,
-                    );
+                    stats.record(&patterns[idx], Duration::from_micros(10), true, 1);
                     i = i.wrapping_add(1);
                 }
             })

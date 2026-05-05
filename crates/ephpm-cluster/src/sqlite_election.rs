@@ -51,10 +51,7 @@ impl PrimaryClaim {
     fn decode(bytes: &[u8]) -> Option<Self> {
         let s = std::str::from_utf8(bytes).ok()?;
         let (node_id, grpc_addr) = s.split_once('|')?;
-        Some(Self {
-            node_id: node_id.to_string(),
-            grpc_addr: grpc_addr.to_string(),
-        })
+        Some(Self { node_id: node_id.to_string(), grpc_addr: grpc_addr.to_string() })
     }
 }
 
@@ -77,16 +74,10 @@ impl SqliteElection {
     #[must_use]
     pub fn new(cluster: Arc<ClusterHandle>, grpc_listen: String) -> Self {
         // Start as replica with empty URL — will be resolved on first tick.
-        let (role_tx, role_rx) = watch::channel(ElectedRole::Replica {
-            primary_grpc_url: String::new(),
-        });
+        let (role_tx, role_rx) =
+            watch::channel(ElectedRole::Replica { primary_grpc_url: String::new() });
 
-        Self {
-            cluster,
-            grpc_listen,
-            role_tx,
-            role_rx,
-        }
+        Self { cluster, grpc_listen, role_tx, role_rx }
     }
 
     /// Get a receiver for role changes.
@@ -118,9 +109,7 @@ impl SqliteElection {
             ElectedRole::Primary
         } else {
             // No primary yet and we're not lowest ordinal — wait.
-            ElectedRole::Replica {
-                primary_grpc_url: String::new(),
-            }
+            ElectedRole::Replica { primary_grpc_url: String::new() }
         }
     }
 
@@ -165,9 +154,8 @@ impl SqliteElection {
 
                 // Someone else claims primary — check if they're alive.
                 let nodes = self.cluster.nodes().await;
-                let primary_alive = nodes
-                    .iter()
-                    .any(|n| n.id == claim.node_id && n.state == NodeState::Alive);
+                let primary_alive =
+                    nodes.iter().any(|n| n.id == claim.node_id && n.state == NodeState::Alive);
 
                 if primary_alive {
                     return ElectedRole::Replica {
@@ -193,9 +181,7 @@ impl SqliteElection {
             ElectedRole::Primary
         } else {
             // Not our turn — wait for the rightful primary to claim.
-            ElectedRole::Replica {
-                primary_grpc_url: String::new(),
-            }
+            ElectedRole::Replica { primary_grpc_url: String::new() }
         }
     }
 
@@ -204,10 +190,8 @@ impl SqliteElection {
         let self_id = &self.cluster.self_node().id;
         let nodes = self.cluster.nodes().await;
 
-        let lowest_alive = nodes
-            .iter()
-            .filter(|n| n.state == NodeState::Alive)
-            .min_by(|a, b| a.id.cmp(&b.id));
+        let lowest_alive =
+            nodes.iter().filter(|n| n.state == NodeState::Alive).min_by(|a, b| a.id.cmp(&b.id));
 
         lowest_alive.is_some_and(|n| &n.id == self_id)
     }
@@ -218,9 +202,7 @@ impl SqliteElection {
             node_id: self.cluster.self_node().id.clone(),
             grpc_addr: self.grpc_listen.clone(),
         };
-        self.cluster
-            .gossip_set(PRIMARY_KEY, &claim.encode(), Some(PRIMARY_TTL))
-            .await;
+        self.cluster.gossip_set(PRIMARY_KEY, &claim.encode(), Some(PRIMARY_TTL)).await;
     }
 }
 
@@ -230,10 +212,7 @@ mod tests {
 
     #[test]
     fn primary_claim_roundtrip() {
-        let claim = PrimaryClaim {
-            node_id: "ephpm-0".into(),
-            grpc_addr: "10.0.1.2:5001".into(),
-        };
+        let claim = PrimaryClaim { node_id: "ephpm-0".into(), grpc_addr: "10.0.1.2:5001".into() };
         let encoded = claim.encode();
         let decoded = PrimaryClaim::decode(&encoded).unwrap();
         assert_eq!(decoded.node_id, "ephpm-0");
@@ -248,15 +227,9 @@ mod tests {
 
     #[test]
     fn primary_claim_encode_format() {
-        let claim = PrimaryClaim {
-            node_id: "node-1".into(),
-            grpc_addr: "0.0.0.0:5001".into(),
-        };
+        let claim = PrimaryClaim { node_id: "node-1".into(), grpc_addr: "0.0.0.0:5001".into() };
         let bytes = claim.encode();
-        assert_eq!(
-            std::str::from_utf8(&bytes).unwrap(),
-            "node-1|0.0.0.0:5001"
-        );
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "node-1|0.0.0.0:5001");
     }
 
     #[test]
@@ -264,38 +237,25 @@ mod tests {
         assert_eq!(ElectedRole::Primary, ElectedRole::Primary);
         assert_ne!(
             ElectedRole::Primary,
-            ElectedRole::Replica {
-                primary_grpc_url: "http://x:5001".into(),
-            }
+            ElectedRole::Replica { primary_grpc_url: "http://x:5001".into() }
         );
         assert_eq!(
-            ElectedRole::Replica {
-                primary_grpc_url: "http://x:5001".into(),
-            },
-            ElectedRole::Replica {
-                primary_grpc_url: "http://x:5001".into(),
-            }
+            ElectedRole::Replica { primary_grpc_url: "http://x:5001".into() },
+            ElectedRole::Replica { primary_grpc_url: "http://x:5001".into() }
         );
     }
 
     #[test]
     fn elected_role_different_replicas_not_equal() {
         assert_ne!(
-            ElectedRole::Replica {
-                primary_grpc_url: "http://a:5001".into(),
-            },
-            ElectedRole::Replica {
-                primary_grpc_url: "http://b:5001".into(),
-            }
+            ElectedRole::Replica { primary_grpc_url: "http://a:5001".into() },
+            ElectedRole::Replica { primary_grpc_url: "http://b:5001".into() }
         );
     }
 
     #[test]
     fn primary_claim_with_ipv6() {
-        let claim = PrimaryClaim {
-            node_id: "node-v6".into(),
-            grpc_addr: "[::1]:5001".into(),
-        };
+        let claim = PrimaryClaim { node_id: "node-v6".into(), grpc_addr: "[::1]:5001".into() };
         let encoded = claim.encode();
         let decoded = PrimaryClaim::decode(&encoded).unwrap();
         assert_eq!(decoded.node_id, "node-v6");
@@ -313,12 +273,8 @@ mod tests {
     #[test]
     fn primary_claim_with_long_node_id() {
         let long_id = "ephpm-".to_string() + &"x".repeat(200);
-        let claim = PrimaryClaim {
-            node_id: long_id.clone(),
-            grpc_addr: "10.0.1.2:5001".into(),
-        };
-        let roundtripped =
-            PrimaryClaim::decode(&claim.encode()).unwrap();
+        let claim = PrimaryClaim { node_id: long_id.clone(), grpc_addr: "10.0.1.2:5001".into() };
+        let roundtripped = PrimaryClaim::decode(&claim.encode()).unwrap();
         assert_eq!(roundtripped.node_id, long_id);
     }
 
@@ -334,11 +290,8 @@ mod tests {
             ("ephpm-d", true),
         ];
 
-        let lowest_alive = nodes
-            .iter()
-            .filter(|(_, alive)| *alive)
-            .min_by(|a, b| a.0.cmp(b.0))
-            .map(|(id, _)| *id);
+        let lowest_alive =
+            nodes.iter().filter(|(_, alive)| *alive).min_by(|a, b| a.0.cmp(b.0)).map(|(id, _)| *id);
 
         assert_eq!(lowest_alive, Some("ephpm-a"));
     }
@@ -352,11 +305,8 @@ mod tests {
             ("ephpm-c", true),
         ];
 
-        let lowest_alive = nodes
-            .iter()
-            .filter(|(_, alive)| *alive)
-            .min_by(|a, b| a.0.cmp(b.0))
-            .map(|(id, _)| *id);
+        let lowest_alive =
+            nodes.iter().filter(|(_, alive)| *alive).min_by(|a, b| a.0.cmp(b.0)).map(|(id, _)| *id);
 
         assert_eq!(lowest_alive, Some("ephpm-b"));
     }

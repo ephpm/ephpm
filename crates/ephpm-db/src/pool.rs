@@ -88,7 +88,10 @@ impl Pool {
         config: PoolConfig,
         connect: impl Fn() -> BoxFuture<Result<TcpStream, DbError>> + Send + Sync + 'static,
         reset: impl Fn(TcpStream) -> BoxFuture<Result<TcpStream, DbError>> + Send + Sync + 'static,
-        ping: impl Fn(TcpStream) -> BoxFuture<Result<(TcpStream, bool), DbError>> + Send + Sync + 'static,
+        ping: impl Fn(TcpStream) -> BoxFuture<Result<(TcpStream, bool), DbError>>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         let max = config.max_connections as usize;
         Self {
@@ -186,13 +189,13 @@ impl Pool {
     ///
     /// The caller must run the protocol-level reset (`COM_RESET_CONNECTION` /
     /// `DISCARD ALL`) before calling this. Pass the post-reset stream.
-    pub(crate) fn recycle(&self, stream: TcpStream, created_at: Instant, permit: OwnedSemaphorePermit) {
-        let slot = Slot {
-            stream,
-            created_at,
-            last_used: Instant::now(),
-            permit,
-        };
+    pub(crate) fn recycle(
+        &self,
+        stream: TcpStream,
+        created_at: Instant,
+        permit: OwnedSemaphorePermit,
+    ) {
+        let slot = Slot { stream, created_at, last_used: Instant::now(), permit };
         self.state.idle.lock().push_back(slot);
     }
 
@@ -348,9 +351,7 @@ impl Checkout {
     /// discarded and the pool slot is freed.
     pub async fn return_with_reset(mut self, stream: TcpStream) {
         if let Some(permit) = self.permit.take() {
-            self.pool
-                .recycle_with_reset(stream, self.created_at, permit)
-                .await;
+            self.pool.recycle_with_reset(stream, self.created_at, permit).await;
         }
     }
 

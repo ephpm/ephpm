@@ -85,9 +85,7 @@ pub fn normalize(sql: &str) -> String {
 
 /// Returns `true` if the last character in `out` is alphanumeric or `_`.
 fn prev_is_identifier(out: &str) -> bool {
-    out.chars()
-        .next_back()
-        .is_some_and(|p| p.is_alphanumeric() || p == '_')
+    out.chars().next_back().is_some_and(|p| p.is_alphanumeric() || p == '_')
 }
 
 /// Handle a character in `Normal` state. Returns the new index.
@@ -119,9 +117,7 @@ fn handle_normal(
         i + 2
     } else if c == '0' && i + 1 < len && (chars[i + 1] == 'x' || chars[i + 1] == 'X') {
         handle_hex_literal(i, chars, len, out)
-    } else if c.is_ascii_digit()
-        || (c == '.' && i + 1 < len && chars[i + 1].is_ascii_digit())
-    {
+    } else if c.is_ascii_digit() || (c == '.' && i + 1 < len && chars[i + 1].is_ascii_digit()) {
         handle_numeric_literal(c, i, out, state)
     } else if c.is_ascii_whitespace() {
         if !out.ends_with(' ') && !out.is_empty() {
@@ -195,8 +191,7 @@ fn collapse_in_lists(sql: &mut String) {
         let mut end = after_in;
         let chars: Vec<char> = rest.chars().collect();
         let mut j = 0;
-        while j + 2 < chars.len() && chars[j] == ',' && chars[j + 1] == ' ' && chars[j + 2] == '?'
-        {
+        while j + 2 < chars.len() && chars[j] == ',' && chars[j + 1] == ' ' && chars[j + 2] == '?' {
             j += 3;
         }
         end += j;
@@ -258,51 +253,33 @@ mod tests {
 
     #[test]
     fn normalize_float() {
-        assert_eq!(
-            normalize("WHERE price > 9.99"),
-            "WHERE price > ?"
-        );
+        assert_eq!(normalize("WHERE price > 9.99"), "WHERE price > ?");
     }
 
     #[test]
     fn normalize_escaped_quote() {
-        assert_eq!(
-            normalize("WHERE name = 'it''s'"),
-            "WHERE name = ?"
-        );
+        assert_eq!(normalize("WHERE name = 'it''s'"), "WHERE name = ?");
     }
 
     #[test]
     fn normalize_backslash_escape() {
-        assert_eq!(
-            normalize(r"WHERE name = 'it\'s'"),
-            "WHERE name = ?"
-        );
+        assert_eq!(normalize(r"WHERE name = 'it\'s'"), "WHERE name = ?");
     }
 
     #[test]
     fn normalize_in_list() {
-        assert_eq!(
-            normalize("WHERE id IN (1, 2, 3, 4, 5)"),
-            "WHERE id IN (?, ...)"
-        );
+        assert_eq!(normalize("WHERE id IN (1, 2, 3, 4, 5)"), "WHERE id IN (?, ...)");
     }
 
     #[test]
     fn normalize_in_list_single() {
         // Single value — no collapse
-        assert_eq!(
-            normalize("WHERE id IN (1)"),
-            "WHERE id IN (?)"
-        );
+        assert_eq!(normalize("WHERE id IN (1)"), "WHERE id IN (?)");
     }
 
     #[test]
     fn normalize_preserves_identifiers() {
-        assert_eq!(
-            normalize("SELECT col1, col2 FROM table1"),
-            "SELECT col1, col2 FROM table1"
-        );
+        assert_eq!(normalize("SELECT col1, col2 FROM table1"), "SELECT col1, col2 FROM table1");
     }
 
     #[test]
@@ -315,18 +292,12 @@ mod tests {
 
     #[test]
     fn normalize_strips_line_comment() {
-        assert_eq!(
-            normalize("SELECT 1 -- this is a comment\nFROM t"),
-            "SELECT ? FROM t"
-        );
+        assert_eq!(normalize("SELECT 1 -- this is a comment\nFROM t"), "SELECT ? FROM t");
     }
 
     #[test]
     fn normalize_strips_block_comment() {
-        assert_eq!(
-            normalize("SELECT /* comment */ 1 FROM t"),
-            "SELECT ? FROM t"
-        );
+        assert_eq!(normalize("SELECT /* comment */ 1 FROM t"), "SELECT ? FROM t");
     }
 
     #[test]
@@ -339,18 +310,12 @@ mod tests {
 
     #[test]
     fn normalize_preserves_null_keyword() {
-        assert_eq!(
-            normalize("WHERE val IS NULL"),
-            "WHERE val IS NULL"
-        );
+        assert_eq!(normalize("WHERE val IS NULL"), "WHERE val IS NULL");
     }
 
     #[test]
     fn normalize_hex_literal() {
-        assert_eq!(
-            normalize("WHERE data = 0xDEADBEEF"),
-            "WHERE data = ?"
-        );
+        assert_eq!(normalize("WHERE data = 0xDEADBEEF"), "WHERE data = ?");
     }
 
     #[test]
@@ -370,17 +335,11 @@ mod tests {
     #[test]
     fn normalize_negative_number() {
         // -42 is unary minus + number literal
-        assert_eq!(
-            normalize("WHERE val = -42"),
-            "WHERE val = -?"
-        );
+        assert_eq!(normalize("WHERE val = -42"), "WHERE val = -?");
     }
 
     #[test]
     fn normalize_double_quoted_string() {
-        assert_eq!(
-            normalize(r#"WHERE name = "Alice""#),
-            "WHERE name = ?"
-        );
+        assert_eq!(normalize(r#"WHERE name = "Alice""#), "WHERE name = ?");
     }
 }

@@ -20,8 +20,8 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -96,9 +96,7 @@ impl ClusteredStore {
     /// events for hot-key version changes so local caches are
     /// invalidated promptly.
     pub async fn init_hot_key_watcher(self: &Arc<Self>) {
-        if !self.config.hot_key_cache
-            || self.subscribed.swap(true, Ordering::SeqCst)
-        {
+        if !self.config.hot_key_cache || self.subscribed.swap(true, Ordering::SeqCst) {
             return;
         }
 
@@ -120,8 +118,7 @@ impl ClusteredStore {
                         let mem = entry.data.len() + entry.key.len() + 64;
                         drop(entry);
                         this.hot_cache.remove(&key_hash);
-                        this.hot_cache_mem
-                            .fetch_sub(mem as u64, Ordering::Relaxed);
+                        this.hot_cache_mem.fetch_sub(mem as u64, Ordering::Relaxed);
                         tracing::debug!(
                             key_hash,
                             old_version = new_version - 1,
@@ -158,8 +155,7 @@ impl ClusteredStore {
                 let mem = cached.data.len() + cached.key.len() + 64;
                 drop(cached);
                 self.hot_cache.remove(&key_hash);
-                self.hot_cache_mem
-                    .fetch_sub(mem as u64, Ordering::Relaxed);
+                self.hot_cache_mem.fetch_sub(mem as u64, Ordering::Relaxed);
             }
         }
 
@@ -186,12 +182,7 @@ impl ClusteredStore {
     ///
     /// Returns `true` on success, `false` if the local store rejected the
     /// write (e.g., memory limit with `NoEviction` policy).
-    pub async fn set(
-        &self,
-        key: String,
-        value: Vec<u8>,
-        ttl: Option<Duration>,
-    ) -> bool {
+    pub async fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
         if value.len() <= self.config.small_key_threshold {
             // Gossip tier: replicate to all nodes.
             self.cluster.gossip_set(&key, &value, ttl).await;
@@ -205,12 +196,8 @@ impl ClusteredStore {
             true
         } else {
             // Large value — route to the owner node via TCP data plane.
-            let ok = if let Some(owner_addr) =
-                self.resolve_owner_data_addr(&key).await
-            {
-                match crate::kv_data_plane::store_remote(owner_addr, &key, &value)
-                    .await
-                {
+            let ok = if let Some(owner_addr) = self.resolve_owner_data_addr(&key).await {
+                match crate::kv_data_plane::store_remote(owner_addr, &key, &value).await {
                     Ok(accepted) => accepted,
                     Err(e) => {
                         tracing::warn!(
@@ -249,8 +236,7 @@ impl ClusteredStore {
             let key_hash = hash_key(key);
             if let Some((_, entry)) = self.hot_cache.remove(&key_hash) {
                 let mem = entry.data.len() + entry.key.len() + 64;
-                self.hot_cache_mem
-                    .fetch_sub(mem as u64, Ordering::Relaxed);
+                self.hot_cache_mem.fetch_sub(mem as u64, Ordering::Relaxed);
             }
         }
 
@@ -297,10 +283,7 @@ impl ClusteredStore {
     /// (already checked local store) or no remote nodes are alive.
     async fn resolve_owner_data_addr(&self, key: &str) -> Option<SocketAddr> {
         let nodes = self.cluster.nodes().await;
-        let alive: Vec<_> = nodes
-            .iter()
-            .filter(|n| n.state == crate::NodeState::Alive)
-            .collect();
+        let alive: Vec<_> = nodes.iter().filter(|n| n.state == crate::NodeState::Alive).collect();
 
         if alive.len() <= 1 {
             return None; // Only this node is alive.
@@ -343,10 +326,7 @@ impl ClusteredStore {
             let mut counter = self
                 .hit_counters
                 .entry(key_hash)
-                .or_insert_with(|| HitCounter {
-                    count: 0,
-                    window_start: now,
-                });
+                .or_insert_with(|| HitCounter { count: 0, window_start: now });
 
             // Reset window if expired.
             if counter.window_start.elapsed() > window {
@@ -392,18 +372,11 @@ impl ClusteredStore {
         // Adjust memory accounting.
         if let Some(old_entry) = old {
             let old_mem = (old_entry.data.len() + old_entry.key.len() + 64) as u64;
-            self.hot_cache_mem
-                .fetch_sub(old_mem, Ordering::Relaxed);
+            self.hot_cache_mem.fetch_sub(old_mem, Ordering::Relaxed);
         }
-        self.hot_cache_mem
-            .fetch_add(entry_mem, Ordering::Relaxed);
+        self.hot_cache_mem.fetch_add(entry_mem, Ordering::Relaxed);
 
-        tracing::debug!(
-            key,
-            key_hash,
-            value_len = value.len(),
-            "promoted to hot key cache",
-        );
+        tracing::debug!(key, key_hash, value_len = value.len(), "promoted to hot key cache",);
     }
 
     /// If a key is tracked as hot, bump its version in chitchat so
@@ -412,8 +385,8 @@ impl ClusteredStore {
         let key_hash = hash_key(key);
         // Only bump if we've seen this key in the hit counters (it's hot
         // somewhere) or it's in our own hot cache.
-        let is_tracked = self.hit_counters.contains_key(&key_hash)
-            || self.hot_cache.contains_key(&key_hash);
+        let is_tracked =
+            self.hit_counters.contains_key(&key_hash) || self.hot_cache.contains_key(&key_hash);
         if !is_tracked {
             return;
         }
@@ -437,12 +410,7 @@ impl ClusteredStore {
             )
             .await;
 
-        tracing::debug!(
-            key,
-            key_hash,
-            new_version,
-            "bumped hot key version via gossip",
-        );
+        tracing::debug!(key, key_hash, new_version, "bumped hot key version via gossip",);
     }
 
     /// Periodic maintenance: evict expired hot cache entries and stale
@@ -455,8 +423,7 @@ impl ClusteredStore {
         self.hot_cache.retain(|_, entry| {
             if entry.cached_at.elapsed() >= ttl {
                 let mem = (entry.data.len() + entry.key.len() + 64) as u64;
-                self.hot_cache_mem
-                    .fetch_sub(mem, Ordering::Relaxed);
+                self.hot_cache_mem.fetch_sub(mem, Ordering::Relaxed);
                 false
             } else {
                 true
@@ -464,8 +431,7 @@ impl ClusteredStore {
         });
 
         // Evict stale hit counters (windows that have expired).
-        self.hit_counters
-            .retain(|_, counter| counter.window_start.elapsed() < window * 2);
+        self.hit_counters.retain(|_, counter| counter.window_start.elapsed() < window * 2);
     }
 
     /// Current hot cache memory usage in bytes.
@@ -518,13 +484,10 @@ fn hash_key(key: &str) -> u64 {
 /// Returns an error for unrecognized unit suffixes.
 fn parse_memory_size(s: &str) -> Result<u64, ParseMemoryError> {
     let s = s.trim();
-    let (num, unit) = s
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .map_or((s, ""), |i| s.split_at(i));
+    let (num, unit) =
+        s.find(|c: char| !c.is_ascii_digit() && c != '.').map_or((s, ""), |i| s.split_at(i));
 
-    let base: f64 = num
-        .parse()
-        .map_err(|_| ParseMemoryError::InvalidNumber(s.to_string()))?;
+    let base: f64 = num.parse().map_err(|_| ParseMemoryError::InvalidNumber(s.to_string()))?;
 
     let multiplier = match unit.trim().to_uppercase().as_str() {
         "B" | "" => 1.0,

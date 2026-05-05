@@ -8,4 +8,4 @@ mod frame;
 mod parse;
 
 pub use frame::Frame;
-pub use parse::{parse_frame, ParseError};
+pub use parse::{ParseError, parse_frame};

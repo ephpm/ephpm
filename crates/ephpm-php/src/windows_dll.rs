@@ -71,11 +71,7 @@ pub fn extract_php_dll() -> std::io::Result<PhpDllGuard> {
     std::fs::write(dir.join("php8embed.dll"), PHP_EMBED_DLL)?;
 
     // Build a null-terminated UTF-16 path for the Win32 API.
-    let wide: Vec<u16> = dir
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0u16))
-        .collect();
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0u16)).collect();
 
     // Safety: `wide` is a valid null-terminated UTF-16 string pointing to
     // an existing directory. SetDllDirectoryW only reads the string; it does

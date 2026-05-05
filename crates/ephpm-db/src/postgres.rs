@@ -19,8 +19,8 @@
 //! Supports `trust`, `md5`, and `scram-sha-256` for backend authentication.
 //! Client-facing auth is always `AuthenticationOk` (loopback only).
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64ct::Encoding;
 use sha2::{Digest as _, Sha256};
@@ -28,10 +28,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
+use crate::ResetStrategy;
 use crate::error::DbError;
 use crate::pool::{Checkout, Pool, PoolConfig};
 use crate::url::DbUrl;
-use crate::ResetStrategy;
 
 // ── PG message tags ──────────────────────────────────────────────────────────
 //
@@ -146,9 +146,7 @@ impl PgProxy {
         let mut checkout = Checkout {
             stream: Some(probe_stream),
             permit: Some(
-                Arc::clone(&pool.semaphore)
-                    .try_acquire_owned()
-                    .map_err(|_| DbError::PoolClosed)?,
+                Arc::clone(&pool.semaphore).try_acquire_owned().map_err(|_| DbError::PoolClosed)?,
             ),
             created_at: std::time::Instant::now(),
             pool: pool.clone(),
@@ -253,9 +251,8 @@ impl PgProxy {
         send_ready_for_query(&mut client, b'I').await?;
 
         // Determine if we need query-level routing or just simple proxying.
-        let needs_routing =
-            matches!(self.reset_strategy, ResetStrategy::Smart)
-                || (self.rw_split.enabled && !self.replica_pools.is_empty());
+        let needs_routing = matches!(self.reset_strategy, ResetStrategy::Smart)
+            || (self.rw_split.enabled && !self.replica_pools.is_empty());
 
         if needs_routing {
             pg_proxy_routing_loop(
@@ -275,19 +272,17 @@ impl PgProxy {
             let result = pg_proxy_bidirectional(client, backend).await;
 
             match result {
-                Ok(backend) => {
-                    match self.reset_strategy {
-                        ResetStrategy::Never => {
-                            checkout.return_to_pool(backend);
-                        }
-                        ResetStrategy::Always => {
-                            checkout.return_with_reset(backend).await;
-                        }
-                        ResetStrategy::Smart => {
-                            unreachable!()
-                        }
+                Ok(backend) => match self.reset_strategy {
+                    ResetStrategy::Never => {
+                        checkout.return_to_pool(backend);
                     }
-                }
+                    ResetStrategy::Always => {
+                        checkout.return_with_reset(backend).await;
+                    }
+                    ResetStrategy::Smart => {
+                        unreachable!()
+                    }
+                },
                 Err(e) => {
                     debug!("proxy session error, discarding backend connection: {e}");
                     checkout.retire();
@@ -324,8 +319,8 @@ async fn pg_connect_and_handshake(url: &DbUrl) -> Result<(TcpStream, PgServerMet
     startup.push(0);
 
     // The StartupMessage has no tag byte, just: [length: 4BE][payload].
-    let total_len = i32::try_from(4 + startup.len())
-        .expect("startup message too large for i32 length field");
+    let total_len =
+        i32::try_from(4 + startup.len()).expect("startup message too large for i32 length field");
     stream.write_all(&total_len.to_be_bytes()).await?;
     stream.write_all(&startup).await?;
 
@@ -347,12 +342,10 @@ async fn pg_connect_and_handshake(url: &DbUrl) -> Result<(TcpStream, PgServerMet
             }
             MSG_BACKEND_KEY_DATA => {
                 if payload.len() >= 8 {
-                    process_id = i32::from_be_bytes([
-                        payload[0], payload[1], payload[2], payload[3],
-                    ]);
-                    secret_key = i32::from_be_bytes([
-                        payload[4], payload[5], payload[6], payload[7],
-                    ]);
+                    process_id =
+                        i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    secret_key =
+                        i32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
                 }
             }
             MSG_READY_FOR_QUERY => {
@@ -369,14 +362,7 @@ async fn pg_connect_and_handshake(url: &DbUrl) -> Result<(TcpStream, PgServerMet
         }
     }
 
-    Ok((
-        stream,
-        PgServerMeta {
-            parameters,
-            process_id,
-            secret_key,
-        },
-    ))
+    Ok((stream, PgServerMeta { parameters, process_id, secret_key }))
 }
 
 /// Handle the backend authentication exchange.
@@ -394,17 +380,13 @@ async fn handle_backend_auth(
             return Err(DbError::Auth(format!("backend auth error: {msg}")));
         }
         if tag != MSG_AUTH {
-            return Err(DbError::Protocol(format!(
-                "expected auth request, got '{}'",
-                tag as char
-            )));
+            return Err(DbError::Protocol(format!("expected auth request, got '{}'", tag as char)));
         }
         if payload.len() < 4 {
             return Err(DbError::Protocol("auth message too short".into()));
         }
 
-        let auth_type =
-            i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let auth_type = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
 
         match auth_type {
             AUTH_OK => return Ok(()),
@@ -420,9 +402,7 @@ async fn handle_backend_auth(
                 // SCRAM-SHA-256 negotiation.
                 let mechanisms = parse_sasl_mechanisms(&payload[4..]);
                 if !mechanisms.iter().any(|m| m == "SCRAM-SHA-256") {
-                    return Err(DbError::Auth(
-                        "server requires unsupported SASL mechanism".into(),
-                    ));
+                    return Err(DbError::Auth("server requires unsupported SASL mechanism".into()));
                 }
                 scram_sha256_exchange(stream, username, password).await?;
             }
@@ -433,9 +413,7 @@ async fn handle_backend_auth(
                 ));
             }
             other => {
-                return Err(DbError::Auth(format!(
-                    "unsupported auth method: {other}"
-                )));
+                return Err(DbError::Auth(format!("unsupported auth method: {other}")));
             }
         }
     }
@@ -466,8 +444,8 @@ async fn scram_sha256_exchange(
     let msg_bytes = client_first.as_bytes();
     let mut sasl_init = Vec::with_capacity(mechanism.len() + 4 + msg_bytes.len());
     sasl_init.extend_from_slice(mechanism);
-    let msg_len = i32::try_from(msg_bytes.len())
-        .expect("SASL message too large for i32 length field");
+    let msg_len =
+        i32::try_from(msg_bytes.len()).expect("SASL message too large for i32 length field");
     sasl_init.extend_from_slice(&msg_len.to_be_bytes());
     sasl_init.extend_from_slice(msg_bytes);
 
@@ -484,9 +462,7 @@ async fn scram_sha256_exchange(
     }
     let auth_type = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     if auth_type != AUTH_SASL_CONTINUE {
-        return Err(DbError::Protocol(format!(
-            "expected SASL continue (11), got {auth_type}"
-        )));
+        return Err(DbError::Protocol(format!("expected SASL continue (11), got {auth_type}")));
     }
     let server_first = String::from_utf8_lossy(&payload[4..]).to_string();
 
@@ -507,15 +483,11 @@ async fn scram_sha256_exchange(
     let stored_key = Sha256::digest(&client_key);
 
     let client_final_without_proof = format!("c=biws,r={server_nonce}");
-    let auth_message =
-        format!("{client_first_bare},{server_first},{client_final_without_proof}");
+    let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
 
     let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
-    let client_proof: Vec<u8> = client_key
-        .iter()
-        .zip(client_signature.iter())
-        .map(|(a, b)| a ^ b)
-        .collect();
+    let client_proof: Vec<u8> =
+        client_key.iter().zip(client_signature.iter()).map(|(a, b)| a ^ b).collect();
 
     let proof_b64 = base64ct::Base64::encode_string(&client_proof);
     let client_final = format!("{client_final_without_proof},p={proof_b64}");
@@ -533,9 +505,7 @@ async fn scram_sha256_exchange(
     }
     let auth_type = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     if auth_type != AUTH_SASL_FINAL {
-        return Err(DbError::Protocol(format!(
-            "expected SASL final (12), got {auth_type}"
-        )));
+        return Err(DbError::Protocol(format!("expected SASL final (12), got {auth_type}")));
     }
     // We could verify the server signature here, but for a proxy it's not
     // strictly necessary — we trust the backend.
@@ -551,9 +521,7 @@ async fn scram_sha256_exchange(
     }
     let auth_type = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
     if auth_type != AUTH_OK {
-        return Err(DbError::Auth(format!(
-            "expected AUTH_OK after SCRAM, got {auth_type}"
-        )));
+        return Err(DbError::Auth(format!("expected AUTH_OK after SCRAM, got {auth_type}")));
     }
 
     Ok(())
@@ -592,8 +560,7 @@ fn parse_server_first(msg: &str) -> Result<(String, String, u32), DbError> {
     Ok((
         nonce.ok_or_else(|| DbError::Protocol("missing nonce in server-first".into()))?,
         salt.ok_or_else(|| DbError::Protocol("missing salt in server-first".into()))?,
-        iterations
-            .ok_or_else(|| DbError::Protocol("missing iterations in server-first".into()))?,
+        iterations.ok_or_else(|| DbError::Protocol("missing iterations in server-first".into()))?,
     ))
 }
 
@@ -601,8 +568,7 @@ fn parse_server_first(msg: &str) -> Result<(String, String, u32), DbError> {
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
     use hmac::{Hmac, Mac};
     type HmacSha256 = Hmac<Sha256>;
-    let mut mac =
-        HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC can take key of any size");
     mac.update(msg);
     mac.finalize().into_bytes().to_vec()
 }
@@ -613,16 +579,14 @@ fn hi(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
     type HmacSha256 = Hmac<Sha256>;
 
     // U1 = HMAC(password, salt || 0x00000001)
-    let mut mac =
-        HmacSha256::new_from_slice(password).expect("HMAC can take key of any size");
+    let mut mac = HmacSha256::new_from_slice(password).expect("HMAC can take key of any size");
     mac.update(salt);
     mac.update(&1_u32.to_be_bytes());
     let mut u_prev = mac.finalize().into_bytes().to_vec();
     let mut result = u_prev.clone();
 
     for _ in 1..iterations {
-        let mut mac =
-            HmacSha256::new_from_slice(password).expect("HMAC can take key of any size");
+        let mut mac = HmacSha256::new_from_slice(password).expect("HMAC can take key of any size");
         mac.update(&u_prev);
         u_prev = mac.finalize().into_bytes().to_vec();
         for (r, u) in result.iter_mut().zip(u_prev.iter()) {
@@ -636,9 +600,7 @@ fn hi(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8> {
 /// Generate a random nonce for SCRAM.
 fn generate_nonce() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let ptr = Arc::as_ptr(&Arc::new(())) as usize;
     format!("{:x}{:x}{:x}", ts.as_secs(), ts.subsec_nanos(), ptr)
 }
@@ -652,9 +614,7 @@ async fn read_pg_message(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), DbErro
     let tag = stream.read_u8().await?;
     let len = stream.read_i32().await?;
     if len < 4 {
-        return Err(DbError::Protocol(format!(
-            "invalid PG message length: {len}"
-        )));
+        return Err(DbError::Protocol(format!("invalid PG message length: {len}")));
     }
     let payload_len = usize::try_from(len - 4)
         .map_err(|_| DbError::Protocol("negative PG payload length".into()))?;
@@ -666,11 +626,7 @@ async fn read_pg_message(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), DbErro
 }
 
 /// Write one PG message: `[tag: 1][length: 4BE][payload]`.
-async fn write_pg_message(
-    stream: &mut TcpStream,
-    tag: u8,
-    payload: &[u8],
-) -> Result<(), DbError> {
+async fn write_pg_message(stream: &mut TcpStream, tag: u8, payload: &[u8]) -> Result<(), DbError> {
     let len = i32::try_from(payload.len() + 4)
         .expect("PG message payload too large for i32 length field");
     stream.write_u8(tag).await?;
@@ -680,17 +636,10 @@ async fn write_pg_message(
 }
 
 /// Forward a raw PG message from one stream to another.
-async fn forward_pg_message(
-    from: &mut TcpStream,
-    to: &mut TcpStream,
-) -> Result<u8, DbError> {
+async fn forward_pg_message(from: &mut TcpStream, to: &mut TcpStream) -> Result<u8, DbError> {
     let tag = from.read_u8().await?;
     let len = from.read_i32().await?;
-    let payload_len = if len >= 4 {
-        usize::try_from(len - 4).unwrap_or(0)
-    } else {
-        0
-    };
+    let payload_len = if len >= 4 { usize::try_from(len - 4).unwrap_or(0) } else { 0 };
 
     // Write tag + length.
     to.write_u8(tag).await?;
@@ -717,9 +666,7 @@ async fn forward_pg_message(
 async fn read_startup_message(stream: &mut TcpStream) -> Result<Vec<u8>, DbError> {
     let len = stream.read_i32().await?;
     if !(8..=10240).contains(&len) {
-        return Err(DbError::Protocol(format!(
-            "invalid startup message length: {len}"
-        )));
+        return Err(DbError::Protocol(format!("invalid startup message length: {len}")));
     }
     let payload_len = usize::try_from(len - 4)
         .map_err(|_| DbError::Protocol("negative startup payload length".into()))?;
@@ -728,8 +675,7 @@ async fn read_startup_message(stream: &mut TcpStream) -> Result<Vec<u8>, DbError
 
     // Check protocol version (first 4 bytes of payload).
     if payload.len() >= 4 {
-        let version =
-            i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        let version = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
         // SSL request (80877103) or cancel request (80877102): not handled.
         if version == 80_877_103 {
             // SSL request: send 'N' (no SSL) and read the real startup.
@@ -810,11 +756,7 @@ fn parse_pg_error(payload: &[u8]) -> String {
         }
         i += end + 1;
     }
-    if message.is_empty() {
-        "(unknown error)".to_string()
-    } else {
-        message
-    }
+    if message.is_empty() { "(unknown error)".to_string() } else { message }
 }
 
 // ── Reset & health check ────────────────────────────────────────────────────
@@ -907,11 +849,7 @@ enum PgQueryKind {
 /// Classify a SQL query based on its first keyword.
 fn classify_pg_query(sql: &str) -> PgQueryKind {
     let s = sql.trim_start();
-    let tok = s
-        .split_ascii_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_uppercase();
+    let tok = s.split_ascii_whitespace().next().unwrap_or("").to_ascii_uppercase();
 
     match tok.as_str() {
         "SELECT" | "SHOW" | "EXPLAIN" | "TABLE" => {
@@ -1096,10 +1034,7 @@ mod tests {
 
     #[test]
     fn classify_select_for_update_as_write() {
-        assert_eq!(
-            classify_pg_query("SELECT * FROM users FOR UPDATE"),
-            PgQueryKind::Write
-        );
+        assert_eq!(classify_pg_query("SELECT * FROM users FOR UPDATE"), PgQueryKind::Write);
     }
 
     #[test]
@@ -1109,10 +1044,7 @@ mod tests {
 
     #[test]
     fn classify_insert_as_write() {
-        assert_eq!(
-            classify_pg_query("INSERT INTO users VALUES (1)"),
-            PgQueryKind::Write
-        );
+        assert_eq!(classify_pg_query("INSERT INTO users VALUES (1)"), PgQueryKind::Write);
     }
 
     #[test]
@@ -1137,18 +1069,12 @@ mod tests {
 
     #[test]
     fn classify_unknown_as_write() {
-        assert_eq!(
-            classify_pg_query("TRUNCATE TABLE users"),
-            PgQueryKind::Write
-        );
+        assert_eq!(classify_pg_query("TRUNCATE TABLE users"), PgQueryKind::Write);
     }
 
     #[test]
     fn classify_explain_as_read() {
-        assert_eq!(
-            classify_pg_query("EXPLAIN SELECT * FROM users"),
-            PgQueryKind::Read
-        );
+        assert_eq!(classify_pg_query("EXPLAIN SELECT * FROM users"), PgQueryKind::Read);
     }
 
     // ── md5_password ────────────────────────────────────────────────
@@ -1231,26 +1157,21 @@ mod tests {
 
     #[test]
     fn select_routes_read_to_replica() {
-        let rw_split = PgRwSplitParams {
-            enabled: true,
-            sticky_duration: std::time::Duration::from_secs(1),
-        };
+        let rw_split =
+            PgRwSplitParams { enabled: true, sticky_duration: std::time::Duration::from_secs(1) };
         let primary = pool_stub();
         let replicas = vec![pool_stub()];
         let state = PgClientState::default();
         let rr = AtomicUsize::new(0);
 
-        let target =
-            pg_select_pool(&primary, &replicas, &rr, &state, PgQueryKind::Read, &rw_split);
+        let target = pg_select_pool(&primary, &replicas, &rr, &state, PgQueryKind::Read, &rw_split);
         assert!(std::ptr::eq(target, &raw const replicas[0]));
     }
 
     #[test]
     fn select_routes_write_to_primary() {
-        let rw_split = PgRwSplitParams {
-            enabled: true,
-            sticky_duration: std::time::Duration::from_secs(1),
-        };
+        let rw_split =
+            PgRwSplitParams { enabled: true, sticky_duration: std::time::Duration::from_secs(1) };
         let primary = pool_stub();
         let replicas = vec![pool_stub()];
         let state = PgClientState::default();
@@ -1263,20 +1184,14 @@ mod tests {
 
     #[test]
     fn select_routes_to_primary_in_transaction() {
-        let rw_split = PgRwSplitParams {
-            enabled: true,
-            sticky_duration: std::time::Duration::from_secs(1),
-        };
+        let rw_split =
+            PgRwSplitParams { enabled: true, sticky_duration: std::time::Duration::from_secs(1) };
         let primary = pool_stub();
         let replicas = vec![pool_stub()];
-        let state = PgClientState {
-            in_transaction: true,
-            ..PgClientState::default()
-        };
+        let state = PgClientState { in_transaction: true, ..PgClientState::default() };
         let rr = AtomicUsize::new(0);
 
-        let target =
-            pg_select_pool(&primary, &replicas, &rr, &state, PgQueryKind::Read, &rw_split);
+        let target = pg_select_pool(&primary, &replicas, &rr, &state, PgQueryKind::Read, &rw_split);
         assert!(std::ptr::eq(target, &raw const primary));
     }
 
@@ -1301,14 +1216,10 @@ mod tests {
         let (mut dst_writer, mut dst_reader) = make_tcp_pair().await;
 
         let payload = b"test payload";
-        write_pg_message(&mut src_writer, b'T', payload)
-            .await
-            .unwrap();
+        write_pg_message(&mut src_writer, b'T', payload).await.unwrap();
         drop(src_writer);
 
-        let tag = forward_pg_message(&mut src_reader, &mut dst_writer)
-            .await
-            .unwrap();
+        let tag = forward_pg_message(&mut src_reader, &mut dst_writer).await.unwrap();
         assert_eq!(tag, b'T');
         drop(dst_writer);
 

@@ -103,10 +103,7 @@ enum TlsMode {
     /// Manual TLS with a static cert/key loaded at startup.
     Manual(TlsAcceptor),
     /// Automatic ACME certificate provisioning (Let's Encrypt).
-    Acme {
-        challenge_config: Arc<ServerConfig>,
-        default_config: Arc<ServerConfig>,
-    },
+    Acme { challenge_config: Arc<ServerConfig>, default_config: Arc<ServerConfig> },
 }
 
 /// Resolved listener state after binding.
@@ -178,11 +175,8 @@ async fn bind_listeners(
             TlsMode::Manual(acceptor)
         }
         Some(tls_config) if tls_config.is_acme() => {
-            let acme_store = if config.cluster.enabled {
-                Some(Arc::clone(&kv_store))
-            } else {
-                None
-            };
+            let acme_store =
+                if config.cluster.enabled { Some(Arc::clone(&kv_store)) } else { None };
             let setup = acme::start_acme(tls_config, acme_store)?;
             TlsMode::Acme {
                 challenge_config: setup.challenge_config,
@@ -190,14 +184,18 @@ async fn bind_listeners(
             }
         }
         Some(tls_config) if tls_config.cert.is_some() || tls_config.key.is_some() => {
-            anyhow::bail!(
-                "TLS config must provide both cert and key, or neither (for ACME mode)"
-            );
+            anyhow::bail!("TLS config must provide both cert and key, or neither (for ACME mode)");
         }
         _ => TlsMode::None,
     };
 
-    let router = Arc::new(Router::new(config, kv_store, metrics_handle, limiter.clone(), file_cache.clone()));
+    let router = Arc::new(Router::new(
+        config,
+        kv_store,
+        metrics_handle,
+        limiter.clone(),
+        file_cache.clone(),
+    ));
 
     let has_tls = !matches!(tls_mode, TlsMode::None);
 
@@ -211,27 +209,17 @@ async fn bind_listeners(
         .transpose()?;
 
     let redirect_http = has_tls
-        && config
-            .server
-            .tls
-            .as_ref()
-            .is_some_and(|t| t.redirect_http && t.listen.is_some());
+        && config.server.tls.as_ref().is_some_and(|t| t.redirect_http && t.listen.is_some());
 
-    if config
-        .server
-        .tls
-        .as_ref()
-        .is_some_and(|t| t.redirect_http && t.listen.is_none())
-    {
+    if config.server.tls.as_ref().is_some_and(|t| t.redirect_http && t.listen.is_none()) {
         tracing::warn!(
             "tls.redirect_http is set but tls.listen is not — \
              redirect has no effect without a separate HTTP listener"
         );
     }
 
-    let main = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind to {addr}"))?;
+    let main =
+        TcpListener::bind(addr).await.with_context(|| format!("failed to bind to {addr}"))?;
 
     let tls_listener = match tls_listen_addr {
         Some(tls_addr) if has_tls => {
@@ -448,10 +436,7 @@ fn dispatch_main_connection(
                 serve_manual_tls(stream, acceptor, router, remote_addr, conn).await;
             });
         }
-        TlsMode::Acme {
-            challenge_config,
-            default_config,
-        } => {
+        TlsMode::Acme { challenge_config, default_config } => {
             let challenge = Arc::clone(challenge_config);
             let default = Arc::clone(default_config);
             let router = Arc::clone(router);
@@ -495,10 +480,7 @@ fn dispatch_tls_connection(
                 serve_manual_tls(stream, acceptor, router, remote_addr, conn).await;
             });
         }
-        TlsMode::Acme {
-            challenge_config,
-            default_config,
-        } => {
+        TlsMode::Acme { challenge_config, default_config } => {
             let challenge = Arc::clone(challenge_config);
             let default = Arc::clone(default_config);
             let router = Arc::clone(router);
@@ -622,9 +604,8 @@ async fn serve_connection<I>(
     if let Err(err) = builder.serve_connection_with_upgrades(io, service).await {
         // Downcast to hyper::Error to suppress noisy "connection closed before
         // message was completed" errors (clients disconnecting mid-request).
-        let is_incomplete = err
-            .downcast_ref::<hyper::Error>()
-            .is_some_and(hyper::Error::is_incomplete_message);
+        let is_incomplete =
+            err.downcast_ref::<hyper::Error>().is_some_and(hyper::Error::is_incomplete_message);
         if !is_incomplete {
             tracing::debug!(%remote_addr, %err, "connection error");
         }
@@ -641,11 +622,8 @@ async fn serve_http_redirect(stream: TcpStream, remote_addr: SocketAddr, setting
             .and_then(|h| h.to_str().ok())
             .unwrap_or("localhost")
             .to_owned();
-        let path_and_query = req
-            .uri()
-            .path_and_query()
-            .map_or("/", http::uri::PathAndQuery::as_str)
-            .to_owned();
+        let path_and_query =
+            req.uri().path_and_query().map_or("/", http::uri::PathAndQuery::as_str).to_owned();
 
         async move {
             let location = format!("https://{host}{path_and_query}");
@@ -704,7 +682,9 @@ fn start_kv_service(
     // Create the KV store
     let store_config = ephpm_kv::store::StoreConfig {
         memory_limit: parse_memory_size(&config.kv.memory_limit)?,
-        eviction_policy: ephpm_kv::store::EvictionPolicy::from_str_lossy(&config.kv.eviction_policy),
+        eviction_policy: ephpm_kv::store::EvictionPolicy::from_str_lossy(
+            &config.kv.eviction_policy,
+        ),
         compression: ephpm_kv::store::CompressionConfig {
             algo: ephpm_kv::store::CompressionAlgo::from_str_lossy(&config.kv.compression),
             level: config.kv.compression_level,
@@ -764,10 +744,7 @@ async fn start_db_proxies(
     // MySQL proxy
     if let Some(mysql_config) = &config.db.mysql {
         let url = mysql_config.url.clone();
-        let listen = mysql_config
-            .listen
-            .clone()
-            .unwrap_or_else(|| "127.0.0.1:3306".to_string());
+        let listen = mysql_config.listen.clone().unwrap_or_else(|| "127.0.0.1:3306".to_string());
 
         let pool_config = ephpm_db::pool::PoolConfig {
             min_connections: mysql_config.min_connections,
@@ -780,17 +757,25 @@ async fn start_db_proxies(
 
         let reset_strategy = ephpm_db::ResetStrategy::from_str_lossy(&mysql_config.reset_strategy);
 
-        let replica_urls = mysql_config.replicas
-            .as_ref()
-            .map(|r| r.urls.clone())
-            .unwrap_or_default();
+        let replica_urls =
+            mysql_config.replicas.as_ref().map(|r| r.urls.clone()).unwrap_or_default();
 
         let rw_split = ephpm_db::mysql::RwSplitParams {
             enabled: config.db.read_write_split.enabled,
             sticky_duration: parse_duration(&config.db.read_write_split.sticky_duration)?,
         };
 
-        match ephpm_db::mysql::build_proxy(&url, &listen, mysql_config.socket.clone(), pool_config, reset_strategy, replica_urls, rw_split).await {
+        match ephpm_db::mysql::build_proxy(
+            &url,
+            &listen,
+            mysql_config.socket.clone(),
+            pool_config,
+            reset_strategy,
+            replica_urls,
+            rw_split,
+        )
+        .await
+        {
             Ok(proxy) => {
                 let maintenance_handle = proxy.start_maintenance();
                 let proxy_handle = tokio::spawn(async move {
@@ -812,10 +797,7 @@ async fn start_db_proxies(
     // PostgreSQL proxy
     if let Some(pg_config) = &config.db.postgres {
         let url = pg_config.url.clone();
-        let listen = pg_config
-            .listen
-            .clone()
-            .unwrap_or_else(|| "127.0.0.1:5432".to_string());
+        let listen = pg_config.listen.clone().unwrap_or_else(|| "127.0.0.1:5432".to_string());
 
         let pool_config = ephpm_db::pool::PoolConfig {
             min_connections: pg_config.min_connections,
@@ -828,11 +810,7 @@ async fn start_db_proxies(
 
         let reset_strategy = ephpm_db::ResetStrategy::from_str_lossy(&pg_config.reset_strategy);
 
-        let replica_urls = pg_config
-            .replicas
-            .as_ref()
-            .map(|r| r.urls.clone())
-            .unwrap_or_default();
+        let replica_urls = pg_config.replicas.as_ref().map(|r| r.urls.clone()).unwrap_or_default();
 
         let rw_split = ephpm_db::postgres::PgRwSplitParams {
             enabled: config.db.read_write_split.enabled,
@@ -969,17 +947,12 @@ async fn start_clustered_sqlite(
                 "replication.primary_grpc_url is required when role = \"replica\""
             );
             tracing::info!(primary = %url, "SQLite replication role forced to replica");
-            (
-                ephpm_sqld::SqldRole::Replica {
-                    primary_grpc_url: url.clone(),
-                },
-                None,
-            )
+            (ephpm_sqld::SqldRole::Replica { primary_grpc_url: url.clone() }, None)
         }
         _ => {
             // "auto" — use gossip election
-            let cluster_handle = cluster
-                .context("cluster must be enabled for auto SQLite replication")?;
+            let cluster_handle =
+                cluster.context("cluster must be enabled for auto SQLite replication")?;
             let election = ephpm_cluster::SqliteElection::new(
                 Arc::clone(cluster_handle),
                 sqlite_config.sqld.grpc_listen.clone(),
@@ -1006,9 +979,7 @@ async fn start_clustered_sqlite(
         .context("failed to start sqld")?;
 
     // Wait for sqld to become healthy.
-    sqld.wait_healthy(Duration::from_secs(30))
-        .await
-        .context("sqld did not become healthy")?;
+    sqld.wait_healthy(Duration::from_secs(30)).await.context("sqld did not become healthy")?;
 
     let sqld_http_url = sqld.http_url();
     tracing::info!(url = %sqld_http_url, "sqld is healthy, starting litewire with Hrana backend");
@@ -1084,9 +1055,7 @@ fn elected_to_sqld_role(elected: &ephpm_cluster::ElectedRole) -> ephpm_sqld::Sql
     match elected {
         ephpm_cluster::ElectedRole::Primary => ephpm_sqld::SqldRole::Primary,
         ephpm_cluster::ElectedRole::Replica { primary_grpc_url } => {
-            ephpm_sqld::SqldRole::Replica {
-                primary_grpc_url: primary_grpc_url.clone(),
-            }
+            ephpm_sqld::SqldRole::Replica { primary_grpc_url: primary_grpc_url.clone() }
         }
     }
 }
@@ -1105,17 +1074,14 @@ fn parse_memory_size(s: &str) -> anyhow::Result<usize> {
         (s.as_str(), 1)
     };
 
-    let num: usize = num_str.trim().parse()
-        .with_context(|| format!("invalid memory size: {s}"))?;
+    let num: usize = num_str.trim().parse().with_context(|| format!("invalid memory size: {s}"))?;
     Ok(num.saturating_mul(multiplier))
 }
 
 /// Parse a duration string (e.g. "30s", "5m", "1h") to `std::time::Duration`.
 fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
-    ephpm_db::duration::parse_duration(s)
-        .map_err(|e| anyhow::anyhow!("{e}"))
+    ephpm_db::duration::parse_duration(s).map_err(|e| anyhow::anyhow!("{e}"))
 }
-
 
 #[cfg(test)]
 mod lib_tests {

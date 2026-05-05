@@ -6,7 +6,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use ephpm_cluster::{start_gossip, NodeState};
+use ephpm_cluster::{NodeState, start_gossip};
 use ephpm_config::ClusterConfig;
 
 /// Find a free UDP port by binding to port 0 and returning the address.
@@ -19,7 +19,12 @@ fn free_udp_addr() -> SocketAddr {
 }
 
 /// Helper: create a cluster config bound to a specific address on localhost.
-fn node_config(node_id: &str, cluster_id: &str, bind: SocketAddr, seeds: Vec<String>) -> ClusterConfig {
+fn node_config(
+    node_id: &str,
+    cluster_id: &str,
+    bind: SocketAddr,
+    seeds: Vec<String>,
+) -> ClusterConfig {
     ClusterConfig {
         enabled: true,
         bind: bind.to_string(),
@@ -78,10 +83,8 @@ async fn two_nodes_discover_each_other() {
 
     // Verify node-b also sees node-a.
     let nodes_from_b = handle2.nodes().await;
-    let alive_from_b: Vec<_> = nodes_from_b
-        .iter()
-        .filter(|n| n.state == NodeState::Alive)
-        .collect();
+    let alive_from_b: Vec<_> =
+        nodes_from_b.iter().filter(|n| n.state == NodeState::Alive).collect();
     assert!(
         alive_from_b.len() >= 2,
         "node-b should see at least 2 alive nodes, got {}",
@@ -113,9 +116,7 @@ async fn gossip_kv_propagates_between_nodes() {
     }
 
     // Set a KV entry on node-1.
-    handle1
-        .gossip_set("test-key", b"test-value", None)
-        .await;
+    handle1.gossip_set("test-key", b"test-value", None).await;
 
     // Wait for it to propagate to node-2.
     let mut found = false;
@@ -149,9 +150,7 @@ async fn gossip_kv_with_ttl() {
     let handle = start_gossip(&config).await.unwrap();
 
     // Set with a long TTL.
-    handle
-        .gossip_set("ttl-key", b"data", Some(Duration::from_secs(3600)))
-        .await;
+    handle.gossip_set("ttl-key", b"data", Some(Duration::from_secs(3600))).await;
 
     let value = handle.gossip_get("ttl-key").await;
     assert!(value.is_some(), "key with future TTL should be readable");
@@ -203,10 +202,7 @@ async fn node_departure_detected() {
             break;
         }
     }
-    assert!(
-        handle1.live_node_count().await >= 2,
-        "should have 2 live nodes before departure"
-    );
+    assert!(handle1.live_node_count().await >= 2, "should have 2 live nodes before departure");
 
     // Shut down the departing node.
     handle2.shutdown().await;
