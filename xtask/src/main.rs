@@ -1223,9 +1223,7 @@ fn docs_deps() -> ExitCode {
     if theme_marker.exists() {
         eprintln!("==> hextra theme: ok");
     } else {
-        eprintln!(
-            "==> hextra theme: MISSING — run: git submodule update --init --recursive"
-        );
+        eprintln!("==> hextra theme: MISSING — run: git submodule update --init --recursive");
         all_ok = false;
     }
 
@@ -1237,11 +1235,7 @@ fn docs_deps() -> ExitCode {
         );
     }
 
-    if all_ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if all_ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 /// Download a pinned hugo extended binary into `./bin/`.
@@ -1259,9 +1253,7 @@ fn docs_install() -> ExitCode {
     let asset_arch = if os == "darwin" { "universal" } else { arch };
     let ext = if os == "windows" { "zip" } else { "tar.gz" };
     let asset = format!("hugo_extended_{HUGO_VERSION}_{os}-{asset_arch}.{ext}");
-    let url = format!(
-        "https://github.com/gohugoio/hugo/releases/download/v{HUGO_VERSION}/{asset}"
-    );
+    let url = format!("https://github.com/gohugoio/hugo/releases/download/v{HUGO_VERSION}/{asset}");
 
     let bin_name = hugo_binary_name();
     let dest = bin_dir.join(bin_name);
@@ -1274,16 +1266,10 @@ fn docs_install() -> ExitCode {
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(HUGO_VERSION))
             .unwrap_or(false);
         if already_pinned {
-            eprintln!(
-                "==> hugo v{HUGO_VERSION} already installed at {}",
-                dest.display()
-            );
+            eprintln!("==> hugo v{HUGO_VERSION} already installed at {}", dest.display());
             return ExitCode::SUCCESS;
         }
-        eprintln!(
-            "==> hugo at {} is a different version, replacing",
-            dest.display()
-        );
+        eprintln!("==> hugo at {} is a different version, replacing", dest.display());
         if let Err(e) = fs::remove_file(&dest) {
             eprintln!("error: failed to remove old hugo: {e}");
             return ExitCode::FAILURE;
@@ -1315,23 +1301,14 @@ fn download_and_extract_zip(url: &str, dest_dir: &Path, file_name: &str) -> bool
     let tmp = std::env::temp_dir().join(format!("ephpm-xtask-{}.zip", std::process::id()));
     let _ = fs::remove_file(&tmp);
 
-    let status = Command::new("curl")
-        .args(["-fSL", "-o"])
-        .arg(&tmp)
-        .arg(url)
-        .status();
+    let status = Command::new("curl").args(["-fSL", "-o"]).arg(&tmp).arg(url).status();
     if !ran_ok(&status) {
         let _ = fs::remove_file(&tmp);
         return false;
     }
 
-    let status = Command::new("tar")
-        .arg("-xf")
-        .arg(&tmp)
-        .arg("-C")
-        .arg(dest_dir)
-        .arg(file_name)
-        .status();
+    let status =
+        Command::new("tar").arg("-xf").arg(&tmp).arg("-C").arg(dest_dir).arg(file_name).status();
 
     let _ = fs::remove_file(&tmp);
 
