@@ -117,7 +117,7 @@ impl QueryStats {
     pub fn top_queries(&self, limit: usize) -> Vec<DigestEntry> {
         let mut entries: Vec<DigestEntry> =
             self.entries.iter().map(|r| r.value().clone()).collect();
-        entries.sort_by(|a, b| b.total_time.cmp(&a.total_time));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.total_time));
         entries.truncate(limit);
         entries
     }
