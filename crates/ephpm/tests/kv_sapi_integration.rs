@@ -9,8 +9,8 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::time::Duration;
 use std::thread;
+use std::time::Duration;
 
 /// Helper to wait for a port to be listening.
 fn wait_for_port(port: u16, timeout_secs: u64) -> bool {
