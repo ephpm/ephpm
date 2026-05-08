@@ -1071,11 +1071,7 @@ Subcommands:
 /// still work).
 fn hugo_command() -> Command {
     let local = workspace_root().join("bin").join(hugo_binary_name());
-    if local.exists() {
-        Command::new(local)
-    } else {
-        Command::new("hugo")
-    }
+    if local.exists() { Command::new(local) } else { Command::new("hugo") }
 }
 
 fn hugo_binary_name() -> &'static str {
@@ -1126,11 +1122,7 @@ fn docs_serve(args: &[String]) -> ExitCode {
         .arg(site_dir())
         .status();
 
-    if ran_ok(&status) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if ran_ok(&status) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 fn docs_build() -> ExitCode {
@@ -1142,10 +1134,7 @@ fn docs_build() -> ExitCode {
     }
 
     eprintln!("==> hugo --minify -s site");
-    let status = hugo_command()
-        .args(["--minify", "-s"])
-        .arg(site_dir())
-        .status();
+    let status = hugo_command().args(["--minify", "-s"]).arg(site_dir()).status();
 
     if ran_ok(&status) {
         eprintln!("==> Built to site/public/");
@@ -1167,16 +1156,9 @@ fn docs_new(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let status = hugo_command()
-        .args(["new", "content", path, "-s"])
-        .arg(site_dir())
-        .status();
+    let status = hugo_command().args(["new", "content", path, "-s"]).arg(site_dir()).status();
 
-    if ran_ok(&status) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if ran_ok(&status) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 fn docs_check() -> ExitCode {
@@ -1193,15 +1175,10 @@ fn docs_check() -> ExitCode {
 
     eprintln!("==> lychee link check on site/public/");
     let pattern = format!("{}/**/*.html", public.display());
-    let status = Command::new("lychee")
-        .args(["--no-progress", "--include-fragments", &pattern])
-        .status();
+    let status =
+        Command::new("lychee").args(["--no-progress", "--include-fragments", &pattern]).status();
 
-    if ran_ok(&status) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if ran_ok(&status) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 fn docs_deps() -> ExitCode {
