@@ -66,23 +66,29 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY .cargo/ .cargo/
 COPY xtask/ xtask/
-COPY crates/ephpm/Cargo.toml          crates/ephpm/Cargo.toml
-COPY crates/ephpm-config/Cargo.toml   crates/ephpm-config/Cargo.toml
-COPY crates/ephpm-server/Cargo.toml   crates/ephpm-server/Cargo.toml
-COPY crates/ephpm-php/Cargo.toml      crates/ephpm-php/Cargo.toml
-COPY crates/ephpm-db/Cargo.toml       crates/ephpm-db/Cargo.toml
-COPY crates/ephpm-kv/Cargo.toml       crates/ephpm-kv/Cargo.toml
+COPY crates/ephpm/Cargo.toml              crates/ephpm/Cargo.toml
+COPY crates/ephpm-cluster/Cargo.toml      crates/ephpm-cluster/Cargo.toml
+COPY crates/ephpm-config/Cargo.toml       crates/ephpm-config/Cargo.toml
+COPY crates/ephpm-db/Cargo.toml           crates/ephpm-db/Cargo.toml
+COPY crates/ephpm-kv/Cargo.toml           crates/ephpm-kv/Cargo.toml
+COPY crates/ephpm-php/Cargo.toml          crates/ephpm-php/Cargo.toml
+COPY crates/ephpm-query-stats/Cargo.toml  crates/ephpm-query-stats/Cargo.toml
+COPY crates/ephpm-server/Cargo.toml       crates/ephpm-server/Cargo.toml
+COPY crates/ephpm-sqld/Cargo.toml         crates/ephpm-sqld/Cargo.toml
 
 # Minimal stub src so cargo can parse (but not compile) workspace members
 RUN mkdir -p \
         crates/ephpm/src \
+        crates/ephpm-cluster/src \
         crates/ephpm-config/src \
-        crates/ephpm-server/src \
-        crates/ephpm-php/src \
         crates/ephpm-db/src \
-        crates/ephpm-kv/src && \
+        crates/ephpm-kv/src \
+        crates/ephpm-php/src \
+        crates/ephpm-query-stats/src \
+        crates/ephpm-server/src \
+        crates/ephpm-sqld/src && \
     printf 'fn main() {}\n' > crates/ephpm/src/main.rs && \
-    for d in ephpm-config ephpm-server ephpm-php ephpm-db ephpm-kv; do \
+    for d in ephpm-cluster ephpm-config ephpm-db ephpm-kv ephpm-php ephpm-query-stats ephpm-server ephpm-sqld; do \
         touch crates/$d/src/lib.rs; \
     done
 
@@ -104,25 +110,31 @@ COPY --from=php-sdk /src/php-sdk /src/php-sdk
 # This layer is invalidated only when Cargo.lock or a Cargo.toml changes,
 # not on every source edit.
 COPY Cargo.toml Cargo.lock ./
-COPY xtask/Cargo.toml       xtask/Cargo.toml
-COPY crates/ephpm/Cargo.toml          crates/ephpm/Cargo.toml
-COPY crates/ephpm-config/Cargo.toml   crates/ephpm-config/Cargo.toml
-COPY crates/ephpm-server/Cargo.toml   crates/ephpm-server/Cargo.toml
-COPY crates/ephpm-php/Cargo.toml      crates/ephpm-php/Cargo.toml
-COPY crates/ephpm-db/Cargo.toml       crates/ephpm-db/Cargo.toml
-COPY crates/ephpm-kv/Cargo.toml       crates/ephpm-kv/Cargo.toml
+COPY xtask/Cargo.toml                     xtask/Cargo.toml
+COPY crates/ephpm/Cargo.toml              crates/ephpm/Cargo.toml
+COPY crates/ephpm-cluster/Cargo.toml      crates/ephpm-cluster/Cargo.toml
+COPY crates/ephpm-config/Cargo.toml       crates/ephpm-config/Cargo.toml
+COPY crates/ephpm-db/Cargo.toml           crates/ephpm-db/Cargo.toml
+COPY crates/ephpm-kv/Cargo.toml           crates/ephpm-kv/Cargo.toml
+COPY crates/ephpm-php/Cargo.toml          crates/ephpm-php/Cargo.toml
+COPY crates/ephpm-query-stats/Cargo.toml  crates/ephpm-query-stats/Cargo.toml
+COPY crates/ephpm-server/Cargo.toml       crates/ephpm-server/Cargo.toml
+COPY crates/ephpm-sqld/Cargo.toml         crates/ephpm-sqld/Cargo.toml
 
 RUN mkdir -p \
         xtask/src \
         crates/ephpm/src \
+        crates/ephpm-cluster/src \
         crates/ephpm-config/src \
-        crates/ephpm-server/src \
-        crates/ephpm-php/src \
         crates/ephpm-db/src \
-        crates/ephpm-kv/src && \
+        crates/ephpm-kv/src \
+        crates/ephpm-php/src \
+        crates/ephpm-query-stats/src \
+        crates/ephpm-server/src \
+        crates/ephpm-sqld/src && \
     printf 'fn main() {}\n' > xtask/src/main.rs && \
     printf 'fn main() {}\n' > crates/ephpm/src/main.rs && \
-    for d in ephpm-config ephpm-server ephpm-php ephpm-db ephpm-kv; do \
+    for d in ephpm-cluster ephpm-config ephpm-db ephpm-kv ephpm-php ephpm-query-stats ephpm-server ephpm-sqld; do \
         touch crates/$d/src/lib.rs; \
     done
 
