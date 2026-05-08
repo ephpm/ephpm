@@ -175,13 +175,11 @@ unsafe extern "C" fn kv_set(
     let Ok(key_str) = key_str.to_str() else {
         return 0;
     };
-    let key_str = namespaced_key(key_str);
-    // Safety: `val` points to `val_len` bytes of valid memory from PHP.
-    let val_bytes = unsafe { std::slice::from_raw_parts(val.cast::<u8>(), val_len) };
-
-    let Some(store) = KV_STORE.get() else {
+    let Some(store) = effective_store() else {
         return 0;
     };
+    // Safety: `val` points to `val_len` bytes of valid memory from PHP.
+    let val_bytes = unsafe { std::slice::from_raw_parts(val.cast::<u8>(), val_len) };
 
     let ttl = if ttl_ms > 0 {
         #[allow(clippy::cast_sign_loss)]
@@ -190,7 +188,7 @@ unsafe extern "C" fn kv_set(
         None
     };
 
-    i32::from(store.set(key_str, val_bytes.to_vec(), ttl))
+    i32::from(store.set(key_str.to_string(), val_bytes.to_vec(), ttl))
 }
 
 #[cfg(php_linked)]
