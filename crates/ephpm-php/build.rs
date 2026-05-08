@@ -9,6 +9,11 @@ fn main() {
     println!("cargo::rerun-if-changed=ephpm_wrapper.c");
     println!("cargo::rerun-if-env-changed=PHP_SDK_PATH");
 
+    println!(
+        "cargo::warning=ephpm-php build.rs running. PHP_SDK_PATH={:?}",
+        env::var_os("PHP_SDK_PATH")
+    );
+
     let Some(sdk_path) = env::var_os("PHP_SDK_PATH").map(PathBuf::from) else {
         // No PHP SDK available — build in stub mode.
         // The Rust code uses #[cfg(php_linked)] to gate FFI calls.
@@ -70,13 +75,19 @@ fn link_php(lib_dir: &Path, target_os: &str) {
 
     // Link additional static libraries from the SDK that static-php-cli
     // built. We probe for each library since the set varies by config.
+    println!("cargo::warning=probing for static support libs in {}", lib_dir.display());
     for static_lib in &[
         "ssl", "crypto", "curl", "z", "xml2", "sodium", "iconv", "charset", "png16", "gd", "jpeg",
         "freetype", "onig", "zip", "bz2", "xslt", "exslt",
     ] {
         // Unix uses libfoo.a, Windows uses foo.lib
-        let found = lib_dir.join(format!("lib{static_lib}.a")).exists()
-            || lib_dir.join(format!("{static_lib}.lib")).exists();
+        let unix_path = lib_dir.join(format!("lib{static_lib}.a"));
+        let windows_path = lib_dir.join(format!("{static_lib}.lib"));
+        let found = unix_path.exists() || windows_path.exists();
+        println!(
+            "cargo::warning=probe lib{static_lib}.a at {}: found={found}",
+            unix_path.display()
+        );
         if found {
             println!("cargo::rustc-link-lib=static={static_lib}");
         }
