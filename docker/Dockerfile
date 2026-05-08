@@ -65,14 +65,19 @@ ARG PHP_SDK_VERSION
 # Detect arch at build time (works for both x86_64 and aarch64 builders).
 # Layout we extract matches xtask::php_sdk_dir_for():
 #   /opt/php-sdk/<version>-linux-<arch>/{lib,include}/
-RUN set -eux; \
+RUN set -euxo pipefail; \
     arch=$(uname -m); \
     sdk_dir="/opt/php-sdk/${PHP_SDK_VERSION}-linux-${arch}"; \
     asset="php-sdk-${PHP_SDK_VERSION}-linux-${arch}.tar.gz"; \
     url="https://github.com/ephpm/php-sdk/releases/download/v${PHP_SDK_VERSION}/${asset}"; \
     mkdir -p "${sdk_dir}"; \
-    curl -fSL "${url}" | tar xz -C "${sdk_dir}"; \
-    test -f "${sdk_dir}/lib/libphp.a"
+    curl -fSL "${url}" -o /tmp/sdk.tar.gz; \
+    sha256sum /tmp/sdk.tar.gz; \
+    tar xzf /tmp/sdk.tar.gz -C "${sdk_dir}"; \
+    rm /tmp/sdk.tar.gz; \
+    test -f "${sdk_dir}/lib/libphp.a"; \
+    echo "==> SDK lib/ contents:"; \
+    ls -la "${sdk_dir}/lib/"
 
 # ── Stage 3: builder — dep fetch layer then full source build ─────────────────
 
