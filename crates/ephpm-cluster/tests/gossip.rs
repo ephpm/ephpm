@@ -102,7 +102,7 @@ async fn three_nodes_discover_each_other() {
     // Verify all nodes are alive.
     for handle in [&node1, &node2, &node3] {
         let members = handle.nodes().await;
-        assert_eq!(members.len(), 3, "{} sees wrong count: {members:?}", handle.self_node().id,);
+        assert_eq!(members.len(), 3, "{} sees wrong count: {members:?}", handle.self_node().id);
         assert!(
             members.iter().all(|n| n.state == NodeState::Alive),
             "all nodes should be alive: {members:?}",
@@ -279,7 +279,7 @@ async fn gossip_kv_delete_not_owned_returns_false() {
         if node2.gossip_get("owned-by-1").await.is_some() {
             break;
         }
-        assert!(start.elapsed() <= Duration::from_secs(10), "key did not replicate",);
+        assert!(start.elapsed() <= Duration::from_secs(10), "key did not replicate");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 

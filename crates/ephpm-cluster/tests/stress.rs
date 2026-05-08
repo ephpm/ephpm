@@ -117,7 +117,7 @@ async fn multi_node_convergence() {
         );
         let mut ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
         ids.sort();
-        assert_eq!(ids, expected_ids, "{} sees wrong node IDs", handle.self_node().id,);
+        assert_eq!(ids, expected_ids, "{} sees wrong node IDs", handle.self_node().id);
     }
 
     // Clean shutdown.
@@ -268,7 +268,7 @@ async fn kv_replication() {
             let key = format!("stress-key-{i:03}");
             let expected = format!("value-{i:03}");
             let actual = handle.gossip_get(&key).await.unwrap_or_else(|| {
-                panic!("{} missing key {key} after replication", handle.self_node().id,)
+                panic!("{} missing key {key} after replication", handle.self_node().id)
             });
             assert_eq!(
                 actual,
@@ -290,7 +290,7 @@ async fn kv_replication() {
         );
         for i in 0..KEY_COUNT {
             let key = format!("stress-key-{i:03}");
-            assert!(keys.contains(&key), "{} gossip_keys() missing {key}", handle.self_node().id,);
+            assert!(keys.contains(&key), "{} gossip_keys() missing {key}", handle.self_node().id);
         }
     }
 

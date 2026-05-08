@@ -1082,7 +1082,7 @@ fn require_unix(f: impl FnOnce() -> ExitCode) -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     // Source cargo env since bash -c doesn't run login profile
     let xtask_cmd =
-        format!("source \"$HOME/.cargo/env\" 2>/dev/null; cargo xtask {}", args.join(" "),);
+        format!("source \"$HOME/.cargo/env\" 2>/dev/null; cargo xtask {}", args.join(" "));
 
     eprintln!("==> Windows detected, running via WSL...");
     let status = Command::new("wsl").args(["--", "bash", "-c", &xtask_cmd]).status();

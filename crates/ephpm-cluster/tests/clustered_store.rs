@@ -56,7 +56,7 @@ async fn wait_for_convergence(handles: &[&ClusterHandle], expected: usize, timeo
         if all_ok {
             return;
         }
-        assert!(start.elapsed() <= timeout, "convergence timeout after {timeout:?}",);
+        assert!(start.elapsed() <= timeout, "convergence timeout after {timeout:?}");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -142,7 +142,7 @@ async fn small_value_replicates_via_clustered_store() {
             assert_eq!(val, b"data");
             break;
         }
-        assert!(start.elapsed() <= Duration::from_secs(10), "replication timeout",);
+        assert!(start.elapsed() <= Duration::from_secs(10), "replication timeout");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 

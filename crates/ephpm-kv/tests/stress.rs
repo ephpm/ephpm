@@ -307,7 +307,7 @@ async fn multi_tenant_isolation() {
                 let key = format!("key:{i}");
                 let expected = format!("tenant{tenant_idx}:val{i}");
                 let got: String = con.get(&key).await.expect("GET failed");
-                assert_eq!(got, expected, "tenant {hostname} read-back mismatch for {key}",);
+                assert_eq!(got, expected, "tenant {hostname} read-back mismatch for {key}");
             }
 
             // DBSIZE should reflect only this tenant's keys.
