@@ -65,7 +65,7 @@ ARG PHP_SDK_VERSION
 # Detect arch at build time (works for both x86_64 and aarch64 builders).
 # Layout we extract matches xtask::php_sdk_dir_for():
 #   /opt/php-sdk/<version>-linux-<arch>/{lib,include}/
-RUN set -euxo pipefail; \
+RUN set -eux; \
     arch=$(uname -m); \
     sdk_dir="/opt/php-sdk/${PHP_SDK_VERSION}-linux-${arch}"; \
     asset="php-sdk-${PHP_SDK_VERSION}-linux-${arch}.tar.gz"; \
