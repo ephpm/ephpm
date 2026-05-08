@@ -37,7 +37,7 @@ rustls-pemfile = "2"
 rustls-acme = { version = "0.15", default-features = false, features = ["tokio", "aws-lc-rs", "tls12", "webpki-roots"] }
 tokio-stream = "0.1"
 tempfile = "3"
-rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }
 temp-env = "0.3"
 serial_test = "3"
 dashmap = "6"

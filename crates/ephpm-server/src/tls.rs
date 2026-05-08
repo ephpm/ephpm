@@ -76,28 +76,21 @@ mod tests {
         });
     }
 
-    /// Generate a self-signed RSA cert+key pair using openssl CLI.
+    /// Generate a self-signed RSA cert+key pair using rcgen.
     fn generate_rsa_cert(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
-        let cert = dir.join("cert.pem");
-        let key = dir.join("key.pem");
-        let status = std::process::Command::new("openssl")
-            .args(["req", "-x509", "-newkey", "rsa:2048", "-keyout"])
-            .arg(&key)
-            .args(["-out"])
-            .arg(&cert)
-            .args(["-days", "1", "-nodes", "-subj", "/CN=localhost"])
-            .output()
-            .expect("openssl must be available");
-        assert!(status.status.success(), "openssl cert generation failed");
-        (cert, key)
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+            .expect("generate RSA-2048 key pair");
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("build cert params");
+        let cert = params.self_signed(&key_pair).expect("self-sign RSA cert");
+        std::fs::write(&cert_path, cert.pem()).expect("write RSA cert");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write RSA key");
+        (cert_path, key_path)
     }
 
     /// Generate a self-signed EC (P-256) cert+key pair using rcgen.
-    ///
-    /// Avoids depending on the system openssl CLI, whose EC behavior diverges
-    /// between OpenSSL 3.x and LibreSSL (LibreSSL on macOS does not honor
-    /// `-pkeyopt ec_paramgen_curve:prime256v1` and emits a key file rustls
-    /// rejects).
     fn generate_ec_cert(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let cert_path = dir.join("ec-cert.pem");
         let key_path = dir.join("ec-key.pem");
