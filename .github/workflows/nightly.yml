@@ -33,9 +33,12 @@ jobs:
         run: cargo xtask release ${{ matrix.php }}
 
       - name: Run ignored integration tests
-        run: cargo nextest run --workspace --run-ignored ignored-only
-        env:
-          PHP_SDK_PATH: /opt/static-php-cli/buildroot
+        # cargo xtask release already populated php-sdk/<ver>-linux-x86_64.
+        # Discover its absolute path and reuse it for the test build.
+        run: |
+          PHP_SDK_PATH=$(find "$(pwd)/php-sdk" -mindepth 1 -maxdepth 1 -type d -name '*-linux-x86_64' | head -1)
+          test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
+          PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run --workspace --run-ignored ignored-only
 
       - name: Verify binary
         run: |
@@ -53,6 +56,7 @@ jobs:
 
   build-macos:
     name: Build (PHP ${{ matrix.php }}, macos-aarch64)
+    # Apple Silicon only — the php-sdk release does not publish macos-x86_64.
     runs-on: [self-hosted, macos, arm64]
     strategy:
       fail-fast: false
@@ -65,16 +69,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build ephpm
+        # Pulls libphp.a from github.com/ephpm/php-sdk; no system PHP/spc
+        # toolchain required.
         run: cargo xtask release ${{ matrix.php }}
 
       - name: Run ignored integration tests
         run: |
           cargo install cargo-nextest --locked || true
-          cargo nextest run --workspace --run-ignored ignored-only
+          PHP_SDK_PATH=$(find "$(pwd)/php-sdk" -mindepth 1 -maxdepth 1 -type d -name '*-macos-aarch64' | head -1)
+          test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
+          PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run --workspace --run-ignored ignored-only
 
       - name: Verify binary
         run: |
-          FILE="target/release/ephpm"
+          FILE="target/aarch64-apple-darwin/release/ephpm"
           test -f "$FILE" || { echo "::error::Binary not found at $FILE"; exit 1; }
           file "$FILE"
           ls -lh "$FILE"
@@ -83,7 +91,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ephpm-php${{ matrix.php }}-macos-aarch64
-          path: target/release/ephpm
+          path: target/aarch64-apple-darwin/release/ephpm
 
   build-windows:
     name: Build (PHP ${{ matrix.php }}, windows-x86_64)
