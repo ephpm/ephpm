@@ -80,8 +80,10 @@ RUN set -eux; \
     ls -la "${sdk_dir}/lib/"; \
     echo "==> libz.a archive members:"; \
     ar t "${sdk_dir}/lib/libz.a"; \
-    echo "==> gz* symbols in libz.a:"; \
-    nm "${sdk_dir}/lib/libz.a" 2>/dev/null | grep -E " T (gz|inflate|deflate)" | head -20 || true
+    echo "==> gz* symbols in libz.a (full):"; \
+    nm "${sdk_dir}/lib/libz.a" 2>/dev/null | grep -E " (T|t|R|D|W) gz" || echo "(no gz* symbols found!)"; \
+    echo "==> sanity: looking for gzerror specifically:"; \
+    nm "${sdk_dir}/lib/libz.a" 2>/dev/null | grep gzerror || echo "(gzerror missing!)"
 
 # ── Stage 3: builder — dep fetch layer then full source build ─────────────────
 
