@@ -57,9 +57,18 @@ fn main() {
     // (ephpm-php is a transitive lib crate without a `links =` key).
     // Emitting -l:libfoo.a as raw rustc-link-arg here puts the libs on
     // the linker command line directly so they actually resolve.
+    //
+    // Wrapping in --start-group/--end-group forces multi-pass symbol
+    // resolution. PHP's static archives have circular dependencies
+    // (libphp.a's zlib_fopen_wrapper.o references gzerror from libz.a;
+    // libcurl references libssl; libxml2 references libz; etc.). With
+    // single-pass static linking, symbols from later archives that
+    // satisfy already-bundled rlib references can be missed if the
+    // archive member containing them isn't already pulled in.
     let lib_dir = sdk_path.join("lib");
     println!("cargo::rustc-link-arg=-L{}", lib_dir.display());
     println!("cargo::rustc-link-arg=-Wl,-Bstatic");
+    println!("cargo::rustc-link-arg=-Wl,--start-group");
     println!("cargo::rustc-link-arg=-l:libphp.a");
     for static_lib in &[
         "ssl", "crypto", "curl", "z", "xml2", "sodium", "iconv", "charset", "png16", "gd", "jpeg",
@@ -69,5 +78,6 @@ fn main() {
             println!("cargo::rustc-link-arg=-l:lib{static_lib}.a");
         }
     }
+    println!("cargo::rustc-link-arg=-Wl,--end-group");
     println!("cargo::rustc-link-arg=-Wl,-Bdynamic");
 }
