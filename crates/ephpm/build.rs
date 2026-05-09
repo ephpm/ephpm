@@ -55,27 +55,28 @@ fn main() {
     // Workaround: rustc-link-lib emitted from ephpm-php's build.rs
     // doesn't propagate to the final musl-static link in this layout
     // (ephpm-php is a transitive lib crate without a `links =` key).
-    // Emitting -l:libfoo.a as raw rustc-link-arg here puts the libs on
-    // the linker command line directly so they actually resolve.
+    //
+    // Pass the absolute paths to each .a file (not -l:libfoo.a) because
+    // libz-sys puts its own libz.a in an earlier -L path, which would
+    // win the -l:libz.a lookup and supply a libz that's missing the gz*
+    // file API symbols (gzerror, gzdopen, gzclose…). Hard-pinning the
+    // path forces the linker to use the SDK's libz.a (verified to export
+    // the full gz API).
     //
     // Wrapping in --start-group/--end-group forces multi-pass symbol
-    // resolution. PHP's static archives have circular dependencies
-    // (libphp.a's zlib_fopen_wrapper.o references gzerror from libz.a;
-    // libcurl references libssl; libxml2 references libz; etc.). With
-    // single-pass static linking, symbols from later archives that
-    // satisfy already-bundled rlib references can be missed if the
-    // archive member containing them isn't already pulled in.
+    // resolution: PHP's static archives have circular dependencies
+    // (libphp.a → libz.a → ...; libcurl → libssl; libxml2 → libz; etc.).
     let lib_dir = sdk_path.join("lib");
-    println!("cargo::rustc-link-arg=-L{}", lib_dir.display());
     println!("cargo::rustc-link-arg=-Wl,-Bstatic");
     println!("cargo::rustc-link-arg=-Wl,--start-group");
-    println!("cargo::rustc-link-arg=-l:libphp.a");
+    println!("cargo::rustc-link-arg={}", lib_dir.join("libphp.a").display());
     for static_lib in &[
         "ssl", "crypto", "curl", "z", "xml2", "sodium", "iconv", "charset", "png16", "gd", "jpeg",
         "freetype", "onig", "zip", "bz2", "xslt", "exslt",
     ] {
-        if lib_dir.join(format!("lib{static_lib}.a")).exists() {
-            println!("cargo::rustc-link-arg=-l:lib{static_lib}.a");
+        let archive = lib_dir.join(format!("lib{static_lib}.a"));
+        if archive.exists() {
+            println!("cargo::rustc-link-arg={}", archive.display());
         }
     }
     println!("cargo::rustc-link-arg=-Wl,--end-group");
