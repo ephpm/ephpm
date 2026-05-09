@@ -875,27 +875,45 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    // Use plain `<ce> build` for both docker and podman.
+    // Build path differs by container engine:
     //
-    // We previously called `docker buildx build --load`, but `--load` exports
-    // the result tarball and POSTs it back to the daemon's /images/load
-    // endpoint. The self-hosted runner's container engine (ephemerd) doesn't
-    // implement that endpoint, so the build would succeed and then fail with
-    // "POST /v1.45/images/load is not yet implemented" at the very end.
+    //  - docker: write the result as a docker-format tarball via
+    //    `buildx build --output type=docker,dest=<file>`, then feed it to
+    //    `kind load image-archive`. We *cannot* use `--load` (docker
+    //    buildx's standard "load image into local daemon") because the
+    //    self-hosted runner's container engine (ephemerd) doesn't
+    //    implement the `/images/load` endpoint that --load POSTs to —
+    //    builds succeed and then crash at the very end with
+    //    "POST /v1.45/images/load is not yet implemented". And we *cannot*
+    //    just drop --load either: the docker-container buildx driver
+    //    keeps the result in its own cache, so `kind load docker-image`
+    //    later can't find the tag in the daemon. Tarball + image-archive
+    //    sidesteps the daemon entirely.
     //
-    // Plain `docker build` either uses the legacy non-BuildKit builder (image
-    // lands directly in the daemon's image store) or buildx's `docker` driver
-    // (same outcome). Either way the resulting `ephpm:dev` tag is visible to
-    // `docker images` immediately, which is all `kind load docker-image`
-    // needs.
-    let build_args: &[&str] = &["build"];
+    //  - podman: plain `podman build` writes the image into podman's
+    //    storage directly and `kind load docker-image` reads from there.
+    let target_dir = root.join("target");
+    std::fs::create_dir_all(&target_dir).ok();
+    let ephpm_tar = target_dir.join("ephpm-image.tar");
+    let e2e_tar = target_dir.join("ephpm-e2e-image.tar");
+
+    let docker = ce == "docker";
 
     // Build ephpm image with the specified PHP version
     if dockerfile.exists() {
         eprintln!("==> Building ephpm container image (PHP {php_sdk_version})...");
-        let status = Command::new(ce)
-            .args(build_args)
-            .args(["-f"])
+        let mut cmd = Command::new(ce);
+        if docker {
+            cmd.args([
+                "buildx",
+                "build",
+                "--output",
+                &format!("type=docker,dest={}", ephpm_tar.display()),
+            ]);
+        } else {
+            cmd.arg("build");
+        }
+        cmd.args(["-f"])
             .arg(&dockerfile)
             .args([
                 "--build-arg",
@@ -904,8 +922,9 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
                 "ephpm:dev",
                 ".",
             ])
-            .current_dir(&root)
-            .status();
+            .current_dir(&root);
+
+        let status = cmd.status();
 
         if !ran_ok(&status) {
             eprintln!("error: failed to build ephpm image");
@@ -918,13 +937,20 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
     // Build E2E test runner image
     if dockerfile_e2e.exists() {
         eprintln!("==> Building E2E test runner image...");
-        let status = Command::new(ce)
-            .args(build_args)
-            .args(["-f"])
-            .arg(&dockerfile_e2e)
-            .args(["-t", "ephpm-e2e:dev", "."])
-            .current_dir(&root)
-            .status();
+        let mut cmd = Command::new(ce);
+        if docker {
+            cmd.args([
+                "buildx",
+                "build",
+                "--output",
+                &format!("type=docker,dest={}", e2e_tar.display()),
+            ]);
+        } else {
+            cmd.arg("build");
+        }
+        cmd.args(["-f"]).arg(&dockerfile_e2e).args(["-t", "ephpm-e2e:dev", "."]).current_dir(&root);
+
+        let status = cmd.status();
 
         if !ran_ok(&status) {
             eprintln!("error: failed to build ephpm-e2e image");
@@ -934,15 +960,33 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
         eprintln!("warning: docker/Dockerfile.e2e not found, skipping E2E image build");
     }
 
-    // Load images into Kind
+    // Load images into Kind. With docker we have tarballs from the build;
+    // with podman the images already live in podman storage.
     eprintln!("==> Loading images into Kind cluster...");
-    for image in ["ephpm:dev", "ephpm-e2e:dev"] {
-        let status = Command::new(&kind)
-            .args(["load", "docker-image", image, "--name", KIND_CLUSTER_NAME])
-            .status();
+    if docker {
+        for tarball in [&ephpm_tar, &e2e_tar] {
+            if !tarball.exists() {
+                continue;
+            }
+            let status = Command::new(&kind)
+                .args(["load", "image-archive"])
+                .arg(tarball)
+                .args(["--name", KIND_CLUSTER_NAME])
+                .status();
 
-        if !ran_ok(&status) {
-            eprintln!("warning: failed to load {image} into Kind (image may not exist yet)");
+            if !ran_ok(&status) {
+                eprintln!("warning: failed to load {} into Kind", tarball.display());
+            }
+        }
+    } else {
+        for image in ["ephpm:dev", "ephpm-e2e:dev"] {
+            let status = Command::new(&kind)
+                .args(["load", "docker-image", image, "--name", KIND_CLUSTER_NAME])
+                .status();
+
+            if !ran_ok(&status) {
+                eprintln!("warning: failed to load {image} into Kind (image may not exist yet)");
+            }
         }
     }
 
