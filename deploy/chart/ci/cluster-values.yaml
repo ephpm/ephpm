@@ -1,0 +1,14 @@
+# Mirrors k8s/base/ephpm-cluster.yaml — 3-node StatefulSet with gossip
+replicaCount: 3
+
+cluster:
+  enabled: true
+  clusterId: "my-cluster"
+  bind: "0.0.0.0:7946"
+  kv:
+    replicationFactor: 2
+    replicationMode: async
+
+server:
+  metrics:
+    enabled: true

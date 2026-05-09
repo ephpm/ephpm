@@ -1,0 +1,8 @@
+# Stateless Deployment with PostgreSQL proxy
+db:
+  postgres:
+    enabled: true
+    existingSecret: "myapp-pg-secret"
+    minConnections: 2
+    maxConnections: 20
+    injectEnv: true

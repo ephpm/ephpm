@@ -1,0 +1,80 @@
+# Main service (HTTP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ephpm.fullname" . }}
+  labels:
+    {{- include "ephpm.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "ephpm.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: 8080
+      protocol: TCP
+    {{- if .Values.server.tls.enabled }}
+    - name: https
+      port: {{ .Values.service.httpsPort }}
+      targetPort: 443
+      protocol: TCP
+    {{- end }}
+    {{- if .Values.kv.redisCompat.enabled }}
+    - name: redis
+      port: 6379
+      targetPort: 6379
+      protocol: TCP
+    {{- end }}
+---
+{{- if .Values.cluster.enabled }}
+# Headless service for StatefulSet DNS and gossip peer discovery.
+# Gossip port is UDP — confirmed from k8s/base/ephpm-cluster.yaml.
+# publishNotReadyAddresses=true so peers can reach each other during rolling restarts.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ephpm.headlessServiceName" . }}
+  labels:
+    {{- include "ephpm.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "ephpm.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+    - name: gossip
+      port: 7946
+      targetPort: 7946
+      protocol: UDP
+    # KV data plane — TCP, for large-value cross-node fetches
+    # Confirmed from ephpm-server/src/lib.rs data_plane::serve()
+    - name: kv-data
+      port: {{ .Values.cluster.kv.dataPort }}
+      targetPort: {{ .Values.cluster.kv.dataPort }}
+      protocol: TCP
+---
+# Per-pod services — allow targeting individual StatefulSet nodes.
+# Mirrors k8s/base/ephpm-cluster.yaml per-pod service pattern.
+{{- range $i, $_ := until (int .Values.replicaCount) }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ephpm.fullname" $ }}-{{ $i }}
+  labels:
+    {{- include "ephpm.labels" $ | nindent 4 }}
+spec:
+  selector:
+    statefulset.kubernetes.io/pod-name: {{ include "ephpm.fullname" $ }}-{{ $i }}
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+---
+{{- end }}
+{{- end }}

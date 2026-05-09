@@ -1,0 +1,6 @@
+# Single-node SQLite (StatefulSet via db.sqlite.enabled)
+db:
+  sqlite:
+    enabled: true
+    path: "/var/lib/ephpm/app.db"
+    storageSize: "5Gi"

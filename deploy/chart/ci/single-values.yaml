@@ -1,0 +1,6 @@
+# Mirrors k8s/base/ephpm-single.yaml
+server:
+  metrics:
+    enabled: true
+  phpEtagCache:
+    enabled: true

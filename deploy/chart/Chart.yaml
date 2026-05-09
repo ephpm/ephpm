@@ -1,0 +1,17 @@
+apiVersion: v2
+name: ephpm
+description: ePHPm — Embedded PHP Manager. One binary from localhost to production.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - php
+  - wordpress
+  - laravel
+  - sqlite
+  - mysql-proxy
+home: https://github.com/ephpm/ephpm
+sources:
+  - https://github.com/ephpm/ephpm
+maintainers:
+  - name: ePHPm Authors

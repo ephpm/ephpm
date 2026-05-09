@@ -1,0 +1,8 @@
+# Stateless Deployment with MySQL proxy
+db:
+  mysql:
+    enabled: true
+    existingSecret: "myapp-db-secret"
+    minConnections: 2
+    maxConnections: 20
+    injectEnv: true
