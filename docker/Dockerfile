@@ -77,7 +77,11 @@ RUN set -eux; \
     rm /tmp/sdk.tar.gz; \
     test -f "${sdk_dir}/lib/libphp.a"; \
     echo "==> SDK lib/ contents:"; \
-    ls -la "${sdk_dir}/lib/"
+    ls -la "${sdk_dir}/lib/"; \
+    echo "==> libz.a archive members:"; \
+    ar t "${sdk_dir}/lib/libz.a"; \
+    echo "==> gz* symbols in libz.a:"; \
+    nm "${sdk_dir}/lib/libz.a" 2>/dev/null | grep -E " T (gz|inflate|deflate)" | head -20 || true
 
 # ── Stage 3: builder — dep fetch layer then full source build ─────────────────
 
