@@ -964,6 +964,20 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
     // with podman the images already live in podman storage.
     eprintln!("==> Loading images into Kind cluster...");
     if docker {
+        // Single-node Kind cluster — the control-plane container is named
+        // `<cluster>-control-plane` by convention. We pass it explicitly via
+        // --nodes because the default code path runs
+        // `docker ps --filter label=io.x-k8s.kind.cluster=<name>` to enumerate
+        // nodes, and the self-hosted runner's container engine (ephemerd)
+        // returns an empty line instead of an empty list, which kind then
+        // tries to `docker inspect ''` and fails:
+        //
+        //     ERROR: failed to get role for node: ...
+        //         "docker inspect ... ''" failed with error: exit status 1
+        //         invalid container name or ID: value is empty
+        //
+        // Naming the node explicitly bypasses that lookup.
+        let control_plane = format!("{KIND_CLUSTER_NAME}-control-plane");
         for tarball in [&ephpm_tar, &e2e_tar] {
             if !tarball.exists() {
                 continue;
@@ -971,7 +985,7 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
             let status = Command::new(&kind)
                 .args(["load", "image-archive"])
                 .arg(tarball)
-                .args(["--name", KIND_CLUSTER_NAME])
+                .args(["--name", KIND_CLUSTER_NAME, "--nodes", &control_plane])
                 .status();
 
             if !ran_ok(&status) {
