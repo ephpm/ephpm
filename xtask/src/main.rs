@@ -875,10 +875,20 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    // docker uses "buildx build --load" (BuildKit, result written to local
-    // daemon); podman uses plain "build" (already BuildKit-equivalent).
-    let build_args: &[&str] =
-        if ce == "docker" { &["buildx", "build", "--load"] } else { &["build"] };
+    // Use plain `<ce> build` for both docker and podman.
+    //
+    // We previously called `docker buildx build --load`, but `--load` exports
+    // the result tarball and POSTs it back to the daemon's /images/load
+    // endpoint. The self-hosted runner's container engine (ephemerd) doesn't
+    // implement that endpoint, so the build would succeed and then fail with
+    // "POST /v1.45/images/load is not yet implemented" at the very end.
+    //
+    // Plain `docker build` either uses the legacy non-BuildKit builder (image
+    // lands directly in the daemon's image store) or buildx's `docker` driver
+    // (same outcome). Either way the resulting `ephpm:dev` tag is visible to
+    // `docker images` immediately, which is all `kind load docker-image`
+    // needs.
+    let build_args: &[&str] = &["build"];
 
     // Build ephpm image with the specified PHP version
     if dockerfile.exists() {
