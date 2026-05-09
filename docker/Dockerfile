@@ -165,7 +165,7 @@ RUN bash -euo pipefail -c 'cargo xtask release ${PHP_SDK_VERSION} 2>&1 | tee /tm
 
 # Find the built binary (target/<triple>/release/ephpm)
 RUN cp $(find target -name ephpm -type f -path '*/release/*' | head -1) /ephpm && \
-    file /ephpm
+    ls -lh /ephpm
 
 # ── Stage 4: runtime ──────────────────────────────────────────────────────────
 
