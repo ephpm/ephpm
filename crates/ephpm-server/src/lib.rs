@@ -573,6 +573,16 @@ async fn serve_acme_tls(
     }
 }
 
+// hyper's `max_buf_size` panics if given a value below its internal
+// `MINIMUM_MAX_BUFFER_SIZE` (8192 in hyper 1.x). Our `max_header_size` config is
+// allowed to be smaller — oversized headers above the configured limit are still
+// rejected by hyper's buffer ceiling, which is at most this floor.
+const HYPER_MIN_BUF_SIZE: usize = 8192;
+
+fn hyper_max_buf_size(configured: usize) -> usize {
+    configured.max(HYPER_MIN_BUF_SIZE)
+}
+
 /// Serve an HTTP connection over any transport (`TcpStream` or `TlsStream`).
 ///
 /// Uses [`auto::Builder`] which negotiates HTTP/1.1 or HTTP/2 based on the
@@ -598,7 +608,7 @@ async fn serve_connection<I>(
         .http1()
         .keep_alive(true)
         .header_read_timeout(settings.header_read_timeout)
-        .max_buf_size(settings.max_header_size)
+        .max_buf_size(hyper_max_buf_size(settings.max_header_size))
         .timer(hyper_util::rt::TokioTimer::new());
 
     if let Err(err) = builder.serve_connection_with_upgrades(io, service).await {
@@ -640,7 +650,7 @@ async fn serve_http_redirect(stream: TcpStream, remote_addr: SocketAddr, setting
     if let Err(err) = http1::Builder::new()
         .keep_alive(false)
         .header_read_timeout(settings.header_read_timeout)
-        .max_buf_size(settings.max_header_size)
+        .max_buf_size(hyper_max_buf_size(settings.max_header_size))
         .timer(hyper_util::rt::TokioTimer::new())
         .serve_connection(io, service)
         .await
