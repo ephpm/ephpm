@@ -29,6 +29,11 @@ spec:
             httpGet:
               path: /index.php
               port: 8080
+              # Match a trusted_hosts entry so the probe doesn't 421.
+              # The kubelet otherwise sends Host: <pod-ip>, which is rejected.
+              httpHeaders:
+                - name: Host
+                  value: ephpm
             initialDelaySeconds: 2
             periodSeconds: 3
 ---
