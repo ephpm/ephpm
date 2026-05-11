@@ -35,6 +35,10 @@ RUN mkdir -p src tests \
 # crates.io (and fails).
 COPY crates/ephpm-e2e/src/   ./src/
 COPY crates/ephpm-e2e/tests/ ./tests/
+# Some tests use include_str!("../../../tests/docroot/...") to embed PHP
+# fixtures that live at the project root, not under the crate. Copy them
+# into the matching path so the relative include resolves at compile time.
+COPY tests/docroot/ /src/tests/docroot/
 RUN find . -name '*.rs' -exec touch {} + \
     && cargo test --release --no-run --frozen
 
