@@ -29,7 +29,12 @@ RUN mkdir -p src tests \
 
 # Layer 2 — real source + pre-compile every test binary. After this, the
 # image carries fully-built test executables under target/release/deps/.
-COPY crates/ephpm-e2e/ ./
+# We copy only src/ and tests/ here so the Cargo.lock that layer 1's
+# `cargo fetch` regenerated isn't overwritten by the stale checked-in one
+# — otherwise --frozen below sees a mismatched lock and tries to hit
+# crates.io (and fails).
+COPY crates/ephpm-e2e/src/   ./src/
+COPY crates/ephpm-e2e/tests/ ./tests/
 RUN find . -name '*.rs' -exec touch {} + \
     && cargo test --release --no-run --frozen
 
