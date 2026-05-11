@@ -664,6 +664,17 @@ impl PhpRuntime {
     /// Common use: `open_basedir` and `disable_functions` for vhost isolation.
     #[cfg(php_linked)]
     pub fn set_request_ini(key: &str, value: &str) {
+        if !PHP_INITIALIZED.load(Ordering::Acquire) {
+            return;
+        }
+        // ephpm_request_set_ini reaches zend_string_init -> _emalloc, which
+        // requires the per-thread Zend allocator. Without TSRM registration
+        // the thread's executor_globals are uninitialised and _emalloc
+        // segfaults. Register first so the API is safe to call before
+        // execute().
+        if Self::ensure_thread_registered().is_err() {
+            return;
+        }
         let c_key = std::ffi::CString::new(key).expect("INI key contains null byte");
         let c_val = std::ffi::CString::new(value).expect("INI value contains null byte");
         // SAFETY: c_key and c_val are valid null-terminated C strings.

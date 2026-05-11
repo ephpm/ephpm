@@ -1034,10 +1034,7 @@ fn dump_pod_logs() {
     Command::new(&kubectl).args(["describe", "pod", "-l", "app=ephpm"]).status().ok();
 
     eprintln!("--- recent cluster events ---");
-    Command::new(&kubectl)
-        .args(["get", "events", "--sort-by=.lastTimestamp", "-A"])
-        .status()
-        .ok();
+    Command::new(&kubectl).args(["get", "events", "--sort-by=.lastTimestamp", "-A"]).status().ok();
 }
 
 /// Determine which container engine to use (podman or docker).
