@@ -1,25 +1,34 @@
 # E2E test runner image.
 #
-# Builds the ephpm-e2e crate and runs its integration tests as the entrypoint.
+# Builds the ephpm-e2e crate's test binaries at image build time, then runs
+# them at container runtime with --frozen --offline so the kind pod needs
+# zero network access. Without this, `cargo test` at pod startup tries to
+# reach index.crates.io for `brotli` etc. and fails on clusters whose pod
+# DNS can't resolve external hosts.
 #
 # Build:
 #   podman build -f docker/Dockerfile.e2e -t ephpm-e2e:dev .
 
-# ── Stage 1: Build and run tests ─────────────────────────────────────────────
-
 FROM rust:1.85-bookworm
 
-WORKDIR /src
-
-# Copy only the e2e crate (it's excluded from the workspace)
-COPY crates/ephpm-e2e/ crates/ephpm-e2e/
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src/crates/ephpm-e2e
 
-# Install dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+# Layer 1 — dep cache. Only Cargo.{toml,lock} are needed to fetch deps;
+# the layer is invalidated only when those files change.
+COPY crates/ephpm-e2e/Cargo.toml crates/ephpm-e2e/Cargo.lock ./
+RUN mkdir -p src tests \
+    && printf 'fn main() {}\n' > src/lib.rs \
+    && cargo fetch --locked
 
-# Run all tests
-# --no-fail-fast: run all test binaries even if one fails (better visibility).
-# --test-threads=1: serialize within each binary to avoid port/state conflicts.
-ENTRYPOINT ["cargo", "test", "--release", "--no-fail-fast", "--", "--test-threads=1", "--nocapture"]
+# Layer 2 — real source + pre-compile every test binary. After this, the
+# image carries fully-built test executables under target/release/deps/.
+COPY crates/ephpm-e2e/ ./
+RUN find . -name '*.rs' -exec touch {} + \
+    && cargo test --release --no-run --frozen
+
+# Runtime: re-runs the cached test binaries. --frozen ensures cargo never
+# touches the network even if a registry refresh would otherwise be needed.
+ENTRYPOINT ["cargo", "test", "--release", "--no-fail-fast", "--frozen", "--", "--test-threads=1", "--nocapture"]

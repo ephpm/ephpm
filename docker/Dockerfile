@@ -128,7 +128,15 @@ RUN mkdir -p \
     printf 'fn main() {}\n' > crates/ephpm/src/main.rs && \
     for d in ephpm-cluster ephpm-config ephpm-db ephpm-kv ephpm-php ephpm-query-stats ephpm-server ephpm-sqld; do \
         touch crates/$d/src/lib.rs; \
-    done
+    done && \
+    # ephpm-php Cargo.toml declares `build = "build.rs"` explicitly, so cargo
+    # errors out (rather than silently skipping) if the file is missing during
+    # the stub-precompile step. Other crates with build.rs (ephpm, ephpm-sqld)
+    # rely on auto-detection and tolerate absence, but we stub them too for
+    # consistency — all three real build.rs files arrive with the later COPY.
+    printf 'fn main() {}\n' > crates/ephpm-php/build.rs && \
+    printf 'fn main() {}\n' > crates/ephpm-sqld/build.rs && \
+    printf 'fn main() {}\n' > crates/ephpm/build.rs
 
 RUN cargo fetch
 

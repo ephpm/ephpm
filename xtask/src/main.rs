@@ -651,10 +651,14 @@ fn download_and_extract_tar_xz(url: &str, dest_dir: &Path, binary_name: &str) ->
         return false;
     };
 
+    // Turso ships the binary inside a top-level directory:
+    //   libsql-server-x86_64-unknown-linux-gnu/sqld
+    // Strip the prefix so it lands at <dest_dir>/<binary_name>, and use a
+    // wildcard so we don't have to know the exact directory name.
     let status = Command::new("tar")
-        .args(["x", "-C"])
+        .args(["x", "--strip-components=1", "--wildcards", "-C"])
         .arg(dest_dir)
-        .arg(binary_name)
+        .arg(format!("*/{binary_name}"))
         .stdin(xz.stdout.unwrap())
         .status();
 
