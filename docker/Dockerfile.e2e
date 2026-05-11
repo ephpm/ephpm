@@ -17,11 +17,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /src/crates/ephpm-e2e
 
 # Layer 1 — dep cache. Only Cargo.{toml,lock} are needed to fetch deps;
-# the layer is invalidated only when those files change.
+# the layer is invalidated only when those files change. We don't pass
+# --locked here because the checked-in Cargo.lock can lag the Cargo.toml
+# (ephpm-e2e is excluded from the workspace, so its lockfile isn't kept
+# in sync by routine workspace operations). Letting fetch update the
+# lockfile in this layer is fine — the later --frozen build pins it.
 COPY crates/ephpm-e2e/Cargo.toml crates/ephpm-e2e/Cargo.lock ./
 RUN mkdir -p src tests \
     && printf 'fn main() {}\n' > src/lib.rs \
-    && cargo fetch --locked
+    && cargo fetch
 
 # Layer 2 — real source + pre-compile every test binary. After this, the
 # image carries fully-built test executables under target/release/deps/.
