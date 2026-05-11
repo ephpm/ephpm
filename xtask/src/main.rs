@@ -1011,14 +1011,33 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
 fn dump_pod_logs() {
     let kubectl = find_tool("kubectl");
 
-    eprintln!("--- ephpm pod logs ---");
-    Command::new(&kubectl).args(["logs", "-l", "app=ephpm", "--tail=100"]).status().ok();
+    eprintln!("--- ephpm pod logs (current container) ---");
+    Command::new(&kubectl).args(["logs", "-l", "app=ephpm", "--tail=200"]).status().ok();
+
+    // For CrashLoopBackOff, the previous container's tail is what shows the
+    // actual cause of death (panic, signal, etc).
+    eprintln!("--- ephpm pod logs (previous container, if any) ---");
+    Command::new(&kubectl)
+        .args(["logs", "-l", "app=ephpm", "--previous", "--tail=200"])
+        .status()
+        .ok();
 
     eprintln!("--- e2e job logs ---");
     Command::new(&kubectl).args(["logs", "job/ephpm-e2e", "--tail=200"]).status().ok();
 
     eprintln!("--- pod status ---");
     Command::new(&kubectl).args(["get", "pods", "-o", "wide"]).status().ok();
+
+    // describe surfaces termination reason (OOMKilled, exit code, etc) and
+    // events (FailedScheduling, CrashLoopBackOff, probe failures).
+    eprintln!("--- ephpm pod describe ---");
+    Command::new(&kubectl).args(["describe", "pod", "-l", "app=ephpm"]).status().ok();
+
+    eprintln!("--- recent cluster events ---");
+    Command::new(&kubectl)
+        .args(["get", "events", "--sort-by=.lastTimestamp", "-A"])
+        .status()
+        .ok();
 }
 
 /// Determine which container engine to use (podman or docker).
