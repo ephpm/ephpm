@@ -77,7 +77,6 @@ pub struct Router {
     store: Arc<Store>,
     multi_tenant_kv: Option<ephpm_kv::multi_tenant::MultiTenantStore>,
     open_basedir: bool,
-    disable_shell_exec: bool,
     php_etag_cache_config: ephpm_config::PhpETagCacheConfig,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     metrics_path: String,
@@ -206,7 +205,6 @@ impl Router {
                 .map(|[k, v]| (k.clone(), v.clone()))
                 .collect(),
             open_basedir: config.server.security.open_basedir,
-            disable_shell_exec: config.server.security.disable_shell_exec,
             multi_tenant_kv: if config.server.sites_dir.is_some() {
                 Some(ephpm_kv::multi_tenant::MultiTenantStore::new(
                     Arc::clone(&store),
@@ -667,7 +665,10 @@ impl Router {
         let server_port = self.server_port;
         let multi_tenant_kv = self.multi_tenant_kv.clone();
         let vhost_open_basedir = self.sites_dir.is_some() && self.open_basedir;
-        let vhost_disable_shell = self.sites_dir.is_some() && self.disable_shell_exec;
+        // disable_shell_exec is applied globally via the generated php.ini
+        // (zend_disable_functions runs once at MINIT and removes the
+        // functions from the function table; runtime ini changes don't
+        // re-disable them). Wiring lives in `crates/ephpm/src/main.rs`.
 
         // Build EPHPM_REDIS_* env vars for multi-tenant RESP auth injection,
         // plus DB_* env vars for framework auto-discovery.
@@ -682,15 +683,14 @@ impl Router {
             );
 
             // Apply per-request PHP sandbox for multi-tenant isolation.
+            // open_basedir varies per vhost (each site only sees its own
+            // directory), so it has to be set per request. The C wrapper
+            // uses STAGE_ACTIVATE to bypass OnUpdateBaseDir's
+            // "must-be-tighter-than-current" check, since each site's path
+            // is a peer rather than a subset of the previous one.
             if vhost_open_basedir {
                 let basedir = format!("{}:/tmp", document_root.display());
                 PhpRuntime::set_request_ini("open_basedir", &basedir);
-            }
-            if vhost_disable_shell {
-                PhpRuntime::set_request_ini(
-                    "disable_functions",
-                    "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec",
-                );
             }
 
             PhpRuntime::execute(PhpRequest {

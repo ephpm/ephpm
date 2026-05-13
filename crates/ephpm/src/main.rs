@@ -227,10 +227,18 @@ fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
     // propagate to tokio worker threads under ZTS. Loading a real .ini file
     // routes through MINIT, where values land in the shared ini directives
     // table that every new TSRM thread sees.
+    // disable_functions only takes effect during PHP's MINIT
+    // (zend_disable_functions reads the ini value once and removes the
+    // entries from CG(function_table)). Setting it via runtime
+    // zend_alter_ini_entry just changes the ini string and leaves the
+    // functions callable, so vhost-mode disable_shell_exec needs to ride
+    // along on the generated ini instead of the per-request ini hook.
+    let vhost_disable_shell =
+        config.server.sites_dir.is_some() && config.server.security.disable_shell_exec;
+    let want_generated_ini = !config.php.ini_overrides.is_empty() || vhost_disable_shell;
+
     let (effective_ini_path, _generated_ini_guard): (Option<PathBuf>, Option<TempFileGuard>) =
-        if config.php.ini_overrides.is_empty() {
-            (config.php.ini_file.clone(), None)
-        } else {
+        if want_generated_ini {
             use std::fmt::Write as _;
 
             let mut content = String::new();
@@ -246,12 +254,20 @@ fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
             for [k, v] in &config.php.ini_overrides {
                 let _ = writeln!(content, "{k}={v}");
             }
+            if vhost_disable_shell {
+                let _ = writeln!(
+                    content,
+                    "disable_functions=exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec"
+                );
+            }
             let temp_path = std::env::temp_dir()
                 .join(format!("ephpm-{}-overrides.ini", std::process::id()));
             std::fs::write(&temp_path, content).with_context(|| {
                 format!("failed to write generated php.ini at {}", temp_path.display())
             })?;
             (Some(temp_path.clone()), Some(TempFileGuard::new(temp_path)))
+        } else {
+            (config.php.ini_file.clone(), None)
         };
 
     // Initialize PHP BEFORE creating tokio runtime (single-threaded here).

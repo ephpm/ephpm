@@ -552,15 +552,23 @@ void ephpm_request_add_server_var(const char *key, const char *value)
 /*
  * Set a PHP INI directive for the current request.
  *
- * Uses PHP_INI_SYSTEM + PHP_INI_STAGE_RUNTIME so the value takes effect
- * immediately and cannot be overridden by userland ini_set().
+ * Uses PHP_INI_SYSTEM + PHP_INI_STAGE_ACTIVATE. Not RUNTIME: the
+ * OnUpdateBaseDir handler rejects RUNTIME updates that aren't a strict
+ * subset of the prior value (open_basedir can only be tightened at
+ * runtime). We reuse a single embed request across HTTP requests, so on
+ * the second and later vhost calls a sibling site's path fails the
+ * "subset of current open_basedir" check, the update is dropped, the
+ * stale value blocks the new script from loading, and the request 500s.
+ * STAGE_ACTIVATE — the bucket PHP itself uses during request_startup —
+ * skips the tightening check, which is the behavior we want here.
+ *
  * Call before ephpm_execute_request().
  */
 void ephpm_request_set_ini(const char *key, const char *value)
 {
     zend_string *zkey = zend_string_init(key, strlen(key), 0);
     zend_string *zval = zend_string_init(value, strlen(value), 0);
-    zend_alter_ini_entry(zkey, zval, PHP_INI_SYSTEM, PHP_INI_STAGE_RUNTIME);
+    zend_alter_ini_entry(zkey, zval, PHP_INI_SYSTEM, PHP_INI_STAGE_ACTIVATE);
     zend_string_release(zval);
     zend_string_release(zkey);
 }
