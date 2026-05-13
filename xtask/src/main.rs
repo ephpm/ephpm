@@ -847,22 +847,37 @@ fn ensure_kind_cluster() -> ExitCode {
     let root = workspace_root();
     let config_path = root.join("k8s").join("kind-config.yaml");
 
-    let mut cmd = Command::new(&kind);
-    cmd.args(["create", "cluster", "--name", KIND_CLUSTER_NAME]);
+    // Kind cluster creation flakes on shared CI runners — kubeadm
+    // sometimes can't bring the control plane up within its 4-minute
+    // budget when the host is contended. Retry a couple of times,
+    // wiping any half-created cluster between attempts so the next
+    // try starts from a clean slate.
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        if attempt > 1 {
+            eprintln!(
+                "==> Kind cluster creation failed; deleting partial state and retrying ({attempt}/{MAX_ATTEMPTS})"
+            );
+            let _ = Command::new(&kind)
+                .args(["delete", "cluster", "--name", KIND_CLUSTER_NAME])
+                .status();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
 
-    if config_path.exists() {
-        cmd.arg("--config").arg(&config_path);
+        let mut cmd = Command::new(&kind);
+        cmd.args(["create", "cluster", "--name", KIND_CLUSTER_NAME, "--wait", "120s"]);
+        if config_path.exists() {
+            cmd.arg("--config").arg(&config_path);
+        }
+
+        if ran_ok(&cmd.status()) {
+            eprintln!("==> Kind cluster ready");
+            return ExitCode::SUCCESS;
+        }
     }
 
-    let status = cmd.status();
-
-    if ran_ok(&status) {
-        eprintln!("==> Kind cluster ready");
-        ExitCode::SUCCESS
-    } else {
-        eprintln!("error: failed to create Kind cluster");
-        ExitCode::FAILURE
-    }
+    eprintln!("error: failed to create Kind cluster after {MAX_ATTEMPTS} attempts");
+    ExitCode::FAILURE
 }
 
 /// Build the ephpm and E2E test runner container images, then load them into Kind.
