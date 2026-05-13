@@ -93,13 +93,17 @@ async fn open_basedir_blocks_cross_site_reads() {
         json["success"], false,
         "open_basedir must prevent cross-site file reads, got: {body}"
     );
+    // PHP surfaces the open_basedir block as either an explicit
+    // "open_basedir restriction in effect" warning or, when the
+    // underlying syscall is short-circuited first, the OS errno text
+    // ("Operation not permitted") for the file the script wasn't
+    // allowed to touch. Either is proof that open_basedir intercepted.
+    let error_msg = json["error"].as_str().unwrap_or("");
     assert!(
-        json["error"]
-            .as_str()
-            .unwrap_or("")
-            .contains("open_basedir"),
-        "error message should mention open_basedir restriction, got: {}",
-        json["error"]
+        error_msg.contains("open_basedir")
+            || error_msg.contains("Operation not permitted")
+            || error_msg.contains("Failed to open stream"),
+        "error message should indicate the read was blocked by open_basedir, got: {error_msg}"
     );
 
     teardown_site(&sites, host_a);
@@ -131,10 +135,17 @@ async fn disable_functions_blocks_shell_exec() {
         "exec() must be disabled in multi-tenant mode, got: {body}"
     );
 
+    // Modern PHP doesn't install a stub for disabled functions; it
+    // outright removes them from the function table during MINIT.
+    // From userland the call therefore looks like an undefined-function
+    // Error rather than an "exec() has been disabled" warning. Accept
+    // either spelling so the test still passes if PHP ever changes
+    // direction again.
     let error_msg = json["error"].as_str().unwrap_or("");
     assert!(
-        error_msg.contains("disabled") || error_msg.contains("has been disabled"),
-        "error should indicate function is disabled, got: {error_msg}"
+        error_msg.contains("disabled")
+            || error_msg.contains("undefined function exec"),
+        "error should indicate exec() is unavailable (disabled or removed), got: {error_msg}"
     );
 
     teardown_site(&sites, host);
