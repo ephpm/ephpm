@@ -952,6 +952,18 @@ PHP_FUNCTION(ephpm_kv_ttl)
     RETURN_LONG((zend_long)((pttl + 999) / 1000));
 }
 
+/* Redis-style PTTL: returns remaining TTL in milliseconds (or -1 / -2). */
+PHP_FUNCTION(ephpm_kv_pttl)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.pttl) { RETURN_LONG(-2); }
+    RETURN_LONG((zend_long)g_kv_ops.pttl(key));
+}
+
 /* ── Argument info for reflection (arginfo) ──────────────────── */
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_get, 0, 0, 1)
@@ -994,6 +1006,10 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_ttl, 0, 0, 1)
     ZEND_ARG_INFO(0, key)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_pttl, 0, 0, 1)
+    ZEND_ARG_INFO(0, key)
+ZEND_END_ARG_INFO()
+
 /* ── Function entry table (null-terminated) ──────────────────── */
 
 static const zend_function_entry ephpm_kv_functions[] = {
@@ -1006,6 +1022,7 @@ static const zend_function_entry ephpm_kv_functions[] = {
     PHP_FE(ephpm_kv_incr_by,  arginfo_ephpm_kv_incr_by)
     PHP_FE(ephpm_kv_expire,   arginfo_ephpm_kv_expire)
     PHP_FE(ephpm_kv_ttl,      arginfo_ephpm_kv_ttl)
+    PHP_FE(ephpm_kv_pttl,     arginfo_ephpm_kv_pttl)
     PHP_FE_END
 };
 
