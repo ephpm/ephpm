@@ -742,6 +742,7 @@ int ephpm_execute_request(const char *filename)
     /* Execute the script with bailout protection.
      * PHP's zend_try/zend_catch uses setjmp/longjmp. */
     int result = 0;
+    int fatal_bailout = 0;
     JMP_BUF *__orig_bailout = EG(bailout);
     JMP_BUF __bailout;
 
@@ -752,20 +753,33 @@ int ephpm_execute_request(const char *filename)
         php_execute_script(&file_handle);
 
         /* PHP 8.x: exit()/die() throws an unwind exit exception instead
-         * of calling zend_bailout(). Treat it like the old bailout path. */
+         * of calling zend_bailout(). Treat it like the old bailout path,
+         * but DO NOT mark it as a fatal bailout — exit() is intentional
+         * and should preserve whatever status the script set. */
         if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
             zend_clear_exception();
             result = -2;
         }
     } else {
-        /* PHP bailed out (fatal error) */
+        /* PHP bailed out via zend_bailout() — uncaught fatal error,
+         * memory_limit, parse error, etc. Distinct from exit(). */
         result = -2;
+        fatal_bailout = 1;
     }
     EG(bailout) = __orig_bailout;
 
     /* Capture response data while the request is still active */
     capture_response_headers();
     response_status_code = SG(sapi_headers).http_response_code;
+
+    /* On a true fatal bailout, surface 500 unless the script already set
+     * an explicit error status before dying. Other SAPIs (FPM, mod_php)
+     * do the same — without it the client sees the fatal-error text in
+     * a 200 OK response, which is indistinguishable from a normal page
+     * to monitoring/health checks. */
+    if (fatal_bailout && response_status_code == 200) {
+        response_status_code = 500;
+    }
 
     /* Note: we do NOT call php_request_shutdown here.
      * We reuse the single embed request for all HTTP requests.
