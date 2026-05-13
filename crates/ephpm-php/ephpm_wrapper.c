@@ -1030,43 +1030,50 @@ void ephpm_set_ini_file(const char *ini_file)
 }
 
 /*
- * Pre-initialization hook. Currently a no-op.
+ * Custom startup callback installed in place of php_embed_module.startup.
  *
- * We previously assigned `php_embed_module.additional_functions` here so
- * php_module_startup() would auto-register our functions. That doesn't
- * work: php_embed_init() unconditionally overwrites the field with its
- * own array (containing just dl()) at sapi/embed/php_embed.c:219, after
- * sapi_startup() and before module startup, so our pointer is discarded
- * before any registration happens. Instead we register after
- * php_embed_init() returns — see ephpm_register_kv_functions below.
+ * Why this is necessary, and why post-init registration cannot work:
  *
- * Kept as an empty stub for ABI continuity; safe to call but has no
- * observable effect.
+ *  1. php_embed_init() unconditionally overwrites
+ *     php_embed_module.additional_functions with its own array (just dl())
+ *     at sapi/embed/php_embed.c:219, after sapi_startup() and before
+ *     module startup. So pre-setting additional_functions in ephpm_pre_init
+ *     is wiped out before php_module_startup sees it.
+ *
+ *  2. In ZTS, zend_startup() ends by copying the main thread's CG(function_table)
+ *     into the static GLOBAL_FUNCTION_TABLE and then freeing the main thread's
+ *     table (Zend/zend.c:1114-1124). New TSRM threads (our tokio workers)
+ *     bootstrap their own CG(function_table) by copying from
+ *     GLOBAL_FUNCTION_TABLE in compiler_globals_ctor (Zend/zend.c:720). So any
+ *     functions we register after php_embed_init() returns land in nothing —
+ *     the main thread's table is gone and new threads never see them.
+ *
+ * The only window that works is "after embed.c:219 overwrite, before
+ * php_module_startup reads sapi_module.additional_functions." We get there by
+ * replacing php_embed_module.startup with this shim, restoring the KV table on
+ * the SAPI struct, then handing off to PHP's own php_module_startup. That puts
+ * the functions in CG(function_table) during MINIT, which is then copied into
+ * GLOBAL_FUNCTION_TABLE at the end of zend_startup() — exactly where new
+ * threads will pick them up.
  */
-void ephpm_pre_init(void)
+static int ephpm_module_startup(sapi_module_struct *sm)
 {
+    sm->additional_functions = ephpm_kv_functions;
+    return php_module_startup(sm, NULL);
 }
 
 /*
- * Register the KV native functions (ephpm_kv_get etc.) in PHP's global
- * function table. Must be called AFTER php_embed_init() so the Zend
- * function table exists.
+ * Pre-initialization: replace the embed SAPI's module startup callback
+ * with our shim above. Must be called BEFORE php_embed_init().
  *
- * Mirrors what php_module_startup() does for sapi_module.additional_functions:
- * scope the registration to the "standard" module so reflection reports a
- * sensible owner, then register persistently so the entries survive across
- * the per-request lifecycle.
+ * Hooking startup (rather than additional_functions directly) is the key:
+ * php_embed_init() rewrites additional_functions but leaves startup alone,
+ * so the shim still runs and gets a chance to put our table back before
+ * php_module_startup is invoked.
  */
-void ephpm_register_kv_functions(void)
+void ephpm_pre_init(void)
 {
-    zend_module_entry *standard = zend_hash_str_find_ptr(
-        &module_registry, "standard", sizeof("standard") - 1);
-    zend_module_entry *prev = EG(current_module);
-    if (standard) {
-        EG(current_module) = standard;
-    }
-    zend_register_functions(NULL, ephpm_kv_functions, NULL, MODULE_PERSISTENT);
-    EG(current_module) = prev;
+    php_embed_module.startup = ephpm_module_startup;
 }
 
 /*

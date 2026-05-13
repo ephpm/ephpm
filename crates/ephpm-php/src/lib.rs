@@ -103,17 +103,11 @@ mod ffi {
 
         // ── CLI mode functions ──────────────────────────────────────
 
-        /// Pre-initialization hook. Currently a no-op stub kept for ABI
-        /// continuity — the previous strategy of assigning
-        /// `php_embed_module.additional_functions` was overwritten by
-        /// `php_embed_init()` itself. KV functions are registered after
-        /// init via [`ephpm_register_kv_functions`] instead.
+        /// Install our embed module-startup shim so the KV native functions
+        /// (`ephpm_kv_get` etc.) get registered during PHP's module init.
+        /// Must be called BEFORE `php_embed_init()` — see the C wrapper for
+        /// the full ZTS-aware rationale.
         pub fn ephpm_pre_init();
-
-        /// Register the KV native functions (`ephpm_kv_get` etc.) into
-        /// PHP's global function table. Must be called AFTER
-        /// `php_embed_init()` so the Zend function table exists.
-        pub fn ephpm_register_kv_functions();
 
         /// Set a custom php.ini file path. Must be called BEFORE
         /// `php_embed_init()` so the ini file is loaded during module startup.
@@ -227,9 +221,10 @@ impl PhpRuntime {
         {
             use std::ffi::CString;
 
-            // Pre-init hook (currently a no-op; see ephpm_pre_init in the C
-            // wrapper for why the additional_functions approach doesn't work).
-            // Safety: no PHP state exists yet; the call is trivially safe.
+            // Install our embed module-startup shim so KV functions land in
+            // GLOBAL_FUNCTION_TABLE before any tokio worker thread copies it.
+            // Safety: must run before php_embed_init() so the shim is installed
+            // when embed's startup callback is invoked. No PHP state exists yet.
             unsafe { ffi::ephpm_pre_init() };
 
             // Keep the CString alive until php_embed_init() completes so the
@@ -260,14 +255,6 @@ impl PhpRuntime {
             // Install our custom SAPI callbacks (ub_write, read_post, etc.)
             // Safety: Must be called after php_embed_init, before any requests.
             unsafe { ffi::ephpm_install_sapi() };
-
-            // Register the ephpm_kv_* native functions in PHP's global
-            // function table. Must run after php_embed_init() because
-            // php_embed_init() overwrites the SAPI's additional_functions
-            // pointer with its own array, so the standard hook for
-            // registering extra functions is unusable here.
-            // Safety: Must be called after php_embed_init.
-            unsafe { ffi::ephpm_register_kv_functions() };
 
             // Apply INI settings (disable stack size checking for tokio threads)
             // Safety: Must be called after php_embed_init.
