@@ -139,6 +139,24 @@ fn exit_code_from(code: i32) -> ExitCode {
     if code == 0 { ExitCode::SUCCESS } else { ExitCode::from(u8::try_from(code).unwrap_or(1)) }
 }
 
+/// Removes a temp file when dropped. Used to clean up the generated
+/// php.ini we materialise from `[php] ini_overrides`.
+struct TempFileGuard {
+    path: PathBuf,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Initialize PHP and start the HTTP server.
 ///
 /// PHP must be initialized BEFORE the tokio runtime is created. PHP's
@@ -202,9 +220,43 @@ fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
     let _dll_guard = ephpm_php::windows_dll::extract_php_dll()
         .context("failed to extract embedded php8embed.dll")?;
 
+    // Build the effective PHP ini file. If the user specified ini_overrides
+    // in the config, we have to materialize them on disk and load them via
+    // PHP's normal ini path: setting them at runtime via zend_alter_ini_entry
+    // only updates the calling thread's per-thread globals, which doesn't
+    // propagate to tokio worker threads under ZTS. Loading a real .ini file
+    // routes through MINIT, where values land in the shared ini directives
+    // table that every new TSRM thread sees.
+    let (effective_ini_path, _generated_ini_guard): (Option<PathBuf>, Option<TempFileGuard>) =
+        if config.php.ini_overrides.is_empty() {
+            (config.php.ini_file.clone(), None)
+        } else {
+            use std::fmt::Write as _;
+
+            let mut content = String::new();
+            if let Some(base) = &config.php.ini_file {
+                let base_content = std::fs::read_to_string(base).with_context(|| {
+                    format!("failed to read php.ini file at {}", base.display())
+                })?;
+                content.push_str(&base_content);
+                if !content.ends_with('\n') {
+                    content.push('\n');
+                }
+            }
+            for [k, v] in &config.php.ini_overrides {
+                let _ = writeln!(content, "{k}={v}");
+            }
+            let temp_path = std::env::temp_dir()
+                .join(format!("ephpm-{}-overrides.ini", std::process::id()));
+            std::fs::write(&temp_path, content).with_context(|| {
+                format!("failed to write generated php.ini at {}", temp_path.display())
+            })?;
+            (Some(temp_path.clone()), Some(TempFileGuard::new(temp_path)))
+        };
+
     // Initialize PHP BEFORE creating tokio runtime (single-threaded here).
     // finalize_for_http() disables SIGPROF so it can't crash worker threads.
-    ephpm_php::PhpRuntime::init_with_ini_file(config.php.ini_file.as_deref())
+    ephpm_php::PhpRuntime::init_with_ini_file(effective_ini_path.as_deref())
         .context("failed to initialize PHP runtime")?;
     ephpm_php::PhpRuntime::finalize_for_http()
         .context("failed to finalize PHP runtime for HTTP")?;
