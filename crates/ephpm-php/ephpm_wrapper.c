@@ -1030,13 +1030,43 @@ void ephpm_set_ini_file(const char *ini_file)
 }
 
 /*
- * Pre-initialization: set additional_functions on the embed module.
- * Must be called BEFORE php_embed_init() so that php_module_startup()
- * registers these functions during module initialization.
+ * Pre-initialization hook. Currently a no-op.
+ *
+ * We previously assigned `php_embed_module.additional_functions` here so
+ * php_module_startup() would auto-register our functions. That doesn't
+ * work: php_embed_init() unconditionally overwrites the field with its
+ * own array (containing just dl()) at sapi/embed/php_embed.c:219, after
+ * sapi_startup() and before module startup, so our pointer is discarded
+ * before any registration happens. Instead we register after
+ * php_embed_init() returns — see ephpm_register_kv_functions below.
+ *
+ * Kept as an empty stub for ABI continuity; safe to call but has no
+ * observable effect.
  */
 void ephpm_pre_init(void)
 {
-    php_embed_module.additional_functions = ephpm_kv_functions;
+}
+
+/*
+ * Register the KV native functions (ephpm_kv_get etc.) in PHP's global
+ * function table. Must be called AFTER php_embed_init() so the Zend
+ * function table exists.
+ *
+ * Mirrors what php_module_startup() does for sapi_module.additional_functions:
+ * scope the registration to the "standard" module so reflection reports a
+ * sensible owner, then register persistently so the entries survive across
+ * the per-request lifecycle.
+ */
+void ephpm_register_kv_functions(void)
+{
+    zend_module_entry *standard = zend_hash_str_find_ptr(
+        &module_registry, "standard", sizeof("standard") - 1);
+    zend_module_entry *prev = EG(current_module);
+    if (standard) {
+        EG(current_module) = standard;
+    }
+    zend_register_functions(NULL, ephpm_kv_functions, NULL, MODULE_PERSISTENT);
+    EG(current_module) = prev;
 }
 
 /*
