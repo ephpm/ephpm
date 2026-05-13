@@ -739,6 +739,11 @@ int ephpm_execute_request(const char *filename)
     /* Re-disable stack checking (request startup may reset it) */
     EG(max_allowed_stack_size) = 0;
 
+    /* Reset PHP's last-error tracking so we can tell whether THIS script
+     * raised a fatal (vs. a stale value carried over from a prior reuse
+     * of the embed request). */
+    PG(last_error_type) = 0;
+
     /* Execute the script with bailout protection.
      * PHP's zend_try/zend_catch uses setjmp/longjmp. */
     int result = 0;
@@ -761,8 +766,8 @@ int ephpm_execute_request(const char *filename)
             result = -2;
         }
     } else {
-        /* PHP bailed out via zend_bailout() — uncaught fatal error,
-         * memory_limit, parse error, etc. Distinct from exit(). */
+        /* PHP bailed out via zend_bailout() — out-of-memory, max
+         * execution time, etc. Older fatal classes hit this path. */
         result = -2;
         fatal_bailout = 1;
     }
@@ -772,12 +777,24 @@ int ephpm_execute_request(const char *filename)
     capture_response_headers();
     response_status_code = SG(sapi_headers).http_response_code;
 
-    /* On a true fatal bailout, surface 500 unless the script already set
-     * an explicit error status before dying. Other SAPIs (FPM, mod_php)
-     * do the same — without it the client sees the fatal-error text in
-     * a 200 OK response, which is indistinguishable from a normal page
-     * to monitoring/health checks. */
-    if (fatal_bailout && response_status_code == 200) {
+    /* Decide whether to override status with 500. There are two paths:
+     *
+     *   1. zend_bailout() longjmps out of execute (legacy fatal path):
+     *      caught by SETJMP above — fatal_bailout = 1.
+     *
+     *   2. PHP 8.x uncaught Throwable: zend_exception_error() calls
+     *      zend_error_va(... | E_DONT_BAIL ...) which prints the fatal
+     *      message and lets php_execute_script return normally. SETJMP
+     *      sees nothing, so we MUST also check PG(last_error_type) to
+     *      catch this case. Without it, "Fatal error: Uncaught Error:
+     *      Call to undefined function ..." comes back as 200 OK.
+     *
+     * Either way, we only override when the script hasn't already set
+     * an explicit error status (PHP exit() / http_response_code()). */
+    int fatal_error_mask = E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR
+                           | E_USER_ERROR | E_RECOVERABLE_ERROR | E_PARSE;
+    int hit_fatal = fatal_bailout || (PG(last_error_type) & fatal_error_mask);
+    if (hit_fatal && response_status_code == 200) {
         response_status_code = 500;
     }
 
