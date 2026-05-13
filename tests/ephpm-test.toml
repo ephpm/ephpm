@@ -43,7 +43,9 @@ enabled = true
 enabled = true
 
 [server.security]
-blocked_paths = ["vendor/*"]
+# Patterns are matched against URI paths (which always start with "/"),
+# so the leading slash is mandatory for directory-style blocks.
+blocked_paths = ["/vendor/*"]
 open_basedir = true
 disable_shell_exec = true
 

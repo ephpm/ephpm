@@ -4,9 +4,11 @@
 //! - Requests with headers exceeding `max_header_size` are rejected
 //! - Requests with normal-sized headers succeed
 //!
-//! The test config sets `max_header_size = 4096` (4 KiB). hyper enforces
-//! this via `max_buf_size` and responds with 431 Request Header Fields Too
-//! Large (or drops the connection entirely for extremely large headers).
+//! The test config sets `max_header_size = 4096` (4 KiB), but hyper has a
+//! hard floor of MINIMUM_MAX_BUFFER_SIZE (8 KiB) on `max_buf_size` — see
+//! `hyper_max_buf_size()` in ephpm-server. So in practice ephpm rejects
+//! header blocks larger than 8 KiB. Use a value comfortably past that
+//! floor to ensure the limit fires regardless of the configured size.
 //!
 //! Environment variables:
 //! - `EPHPM_URL` — base URL of the ephpm instance (e.g. `http://ephpm:8080`)
@@ -18,10 +20,11 @@ async fn oversized_header_is_rejected() {
     let base_url = required_env("EPHPM_URL");
     let url = format!("{base_url}/test.html");
 
-    // Build a header value that pushes the total header block well past 4096 bytes.
-    // The request line + Host header already consume ~100 bytes, so an 8 KiB
-    // custom header guarantees we exceed the limit.
-    let large_value = "X".repeat(8 * 1024);
+    // Push the header block well past hyper's 8 KiB minimum buffer. 32 KiB
+    // is far above any reasonable max_header_size and any internal buffer
+    // floor, so the request must be rejected (or the connection dropped)
+    // regardless of the configured ephpm limit.
+    let large_value = "X".repeat(32 * 1024);
 
     let client = reqwest::Client::new();
     let result = client
