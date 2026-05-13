@@ -375,10 +375,7 @@ impl Router {
         let uri_path = match percent_decode_path(req.uri().path()) {
             Some(path) => path,
             None => {
-                return Ok((
-                    error_response(StatusCode::BAD_REQUEST, "400 Bad Request"),
-                    "error",
-                ));
+                return Ok((error_response(StatusCode::BAD_REQUEST, "400 Bad Request"), "error"));
             }
         };
         let query_string = req.uri().query().unwrap_or("").to_string();

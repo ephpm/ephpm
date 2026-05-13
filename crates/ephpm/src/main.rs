@@ -260,8 +260,8 @@ fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
                     "disable_functions=exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec"
                 );
             }
-            let temp_path = std::env::temp_dir()
-                .join(format!("ephpm-{}-overrides.ini", std::process::id()));
+            let temp_path =
+                std::env::temp_dir().join(format!("ephpm-{}-overrides.ini", std::process::id()));
             std::fs::write(&temp_path, content).with_context(|| {
                 format!("failed to write generated php.ini at {}", temp_path.display())
             })?;
