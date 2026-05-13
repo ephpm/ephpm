@@ -80,6 +80,10 @@ tds_listen = "127.0.0.1:1433"
 [server.timeouts]
 header_read = 20
 idle = 45
+# Short request budget so the timeouts/timeout_edge tests can verify
+# 504 enforcement against sleep.php without idling the suite for the
+# 5-minute production default.
+request = 5
 
 [db.read_write_split]
 enabled = true

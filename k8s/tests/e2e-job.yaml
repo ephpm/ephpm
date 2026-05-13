@@ -17,3 +17,16 @@ spec:
               value: "http://ephpm:8080"
             - name: EXPECTED_PHP_VERSION
               value: "__EXPECTED_PHP_VERSION__"
+            # security_p0 / vhosts tests write site directories into this
+            # path; the ephpm pod mounts the same hostPath so the writes
+            # are visible to the server.
+            - name: EPHPM_SITES_DIR
+              value: /var/www/sites
+          volumeMounts:
+            - name: sites
+              mountPath: /var/www/sites
+      volumes:
+        - name: sites
+          hostPath:
+            path: /var/lib/ephpm-sites
+            type: DirectoryOrCreate
