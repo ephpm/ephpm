@@ -369,7 +369,20 @@ impl Router {
             return Ok((resp, "error"));
         }
 
-        let uri_path = req.uri().path().to_string();
+        // Use the percent-decoded path for routing and static-file lookup.
+        // hyper hands us the raw URI, so `/test%2Ehtml` would otherwise be
+        // looked up as the literal name `test%2Ehtml`. percent_decode_path
+        // also rejects encoded slashes so the decoding can't be used to
+        // sneak past path-traversal or prefix-block checks.
+        let uri_path = match percent_decode_path(req.uri().path()) {
+            Some(path) => path,
+            None => {
+                return Ok((
+                    error_response(StatusCode::BAD_REQUEST, "400 Bad Request"),
+                    "error",
+                ));
+            }
+        };
         let query_string = req.uri().query().unwrap_or("").to_string();
         let method = req.method().as_str().to_ascii_uppercase();
 
@@ -863,6 +876,50 @@ fn has_hidden_segment(uri_path: &str) -> bool {
     uri_path.split('/').any(|segment| {
         segment.starts_with('.') && !segment.is_empty() && segment != "." && segment != ".."
     })
+}
+
+/// Percent-decode a URI path so static-file lookup and routing work
+/// against the literal characters the client meant.
+///
+/// Returns `None` if the input is malformed (truncated `%`, non-hex
+/// digits) or contains an encoded `/` / `\` — those would let percent
+/// encoding bypass path-traversal checks and prefix-based blocks like
+/// `/vendor/*`. Callers should treat `None` as a 400.
+///
+/// The output is validated as UTF-8; an invalid sequence also yields
+/// `None`. ASCII paths (the overwhelming majority) round-trip exactly.
+fn percent_decode_path(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_nibble(bytes[i + 1])?;
+            let lo = hex_nibble(bytes[i + 2])?;
+            let byte = (hi << 4) | lo;
+            if byte == b'/' || byte == b'\\' {
+                return None;
+            }
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Check if a URI path matches any blocked path pattern.
