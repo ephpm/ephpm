@@ -25,10 +25,10 @@ switch ($op) {
         echo ephpm_kv_pttl($key);
         break;
     case 'incr':
-        $current = (int) (ephpm_kv_get($key) ?? 0);
-        $current++;
-        ephpm_kv_set($key, (string) $current, 0);
-        echo $current;
+        // Use the atomic incr_by SAPI op rather than a get/set pair —
+        // concurrent_kv_increments_are_consistent fires 20 of these in
+        // parallel and would lose updates on the get→set race window.
+        echo ephpm_kv_incr_by($key, 1);
         break;
     case 'incr_by':
         echo ephpm_kv_incr_by($key, (int) $val);
