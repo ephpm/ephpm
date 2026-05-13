@@ -57,8 +57,14 @@ ini_overrides = [
 
 [server.limits]
 max_connections = 100
-per_ip_rate = 50.0
-per_ip_burst = 10
+# Burst and rate are sized for the e2e suite, which runs every test from
+# a single pod IP. Tests like concurrent_php_requests_all_succeed fan out
+# 20 parallel requests, and back-to-back test files cumulatively drive
+# hundreds of requests through the same bucket — anything smaller starts
+# returning 429 in tests that aren't trying to exercise the limiter at all.
+# rate_limit.rs sends well past `per_ip_burst` to still trip a 429.
+per_ip_rate = 500.0
+per_ip_burst = 100
 
 [db.sqlite]
 path = "/tmp/ephpm-test.db"
