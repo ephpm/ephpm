@@ -48,8 +48,9 @@ impl<B: Backend> Backend for TrackedBackend<B> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     /// A minimal test backend that always succeeds.
     struct StubBackend;
@@ -57,10 +58,7 @@ mod tests {
     #[async_trait::async_trait]
     impl Backend for StubBackend {
         async fn query(&self, _sql: &str, _params: &[Value]) -> Result<ResultSet, BackendError> {
-            Ok(ResultSet {
-                columns: vec![],
-                rows: vec![vec![Value::Integer(1)]],
-            })
+            Ok(ResultSet { columns: vec![], rows: vec![vec![Value::Integer(1)]] })
         }
 
         async fn execute(
@@ -68,10 +66,7 @@ mod tests {
             _sql: &str,
             _params: &[Value],
         ) -> Result<ExecuteResult, BackendError> {
-            Ok(ExecuteResult {
-                affected_rows: 1,
-                last_insert_rowid: Some(1),
-            })
+            Ok(ExecuteResult { affected_rows: 1, last_insert_rowid: Some(1) })
         }
     }
 
@@ -94,10 +89,7 @@ mod tests {
         let stats = QueryStats::new(ephpm_query_stats::StatsConfig::default());
         let backend = TrackedBackend::new(StubBackend, stats.clone());
 
-        backend
-            .execute("INSERT INTO t VALUES (1, 'hello')", &[])
-            .await
-            .unwrap();
+        backend.execute("INSERT INTO t VALUES (1, 'hello')", &[]).await.unwrap();
 
         assert_eq!(stats.digest_count(), 1);
         let top = stats.top_queries(1);

@@ -41,19 +41,13 @@ impl TestServer {
     }
 
     async fn start_with_config(config: StoreConfig) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("failed to bind test listener");
-        let addr = listener
-            .local_addr()
-            .expect("failed to get local addr")
-            .to_string();
+        let listener =
+            TcpListener::bind("127.0.0.1:0").await.expect("failed to bind test listener");
+        let addr = listener.local_addr().expect("failed to get local addr").to_string();
 
         let store = Store::new(config);
         let handle = tokio::spawn(async move {
-            server::serve_on(store, listener, 64 * 1024 * 1024, None, None, None)
-                .await
-                .ok();
+            server::serve_on(store, listener, 64 * 1024 * 1024, None, None, None).await.ok();
         });
 
         // Give the accept loop a moment to become ready.
@@ -86,30 +80,20 @@ struct HmacTestServer {
 
 impl HmacTestServer {
     async fn start(secret: &str) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("failed to bind test listener");
-        let addr = listener
-            .local_addr()
-            .expect("failed to get local addr")
-            .to_string();
+        let listener =
+            TcpListener::bind("127.0.0.1:0").await.expect("failed to bind test listener");
+        let addr = listener.local_addr().expect("failed to get local addr").to_string();
 
         let store = Store::new(StoreConfig::default());
         let mt = MultiTenantStore::new(Arc::clone(&store), StoreConfig::default());
         let sec = Some(secret.to_string());
         let handle = tokio::spawn(async move {
-            server::serve_on(store, listener, 64 * 1024 * 1024, None, sec, Some(mt))
-                .await
-                .ok();
+            server::serve_on(store, listener, 64 * 1024 * 1024, None, sec, Some(mt)).await.ok();
         });
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        Self {
-            addr,
-            handle,
-            secret: secret.to_string(),
-        }
+        Self { addr, handle, secret: secret.to_string() }
     }
 
     /// Open a raw (unauthenticated) connection to be manually AUTH'd.
@@ -143,10 +127,8 @@ async fn concurrent_writer_storm() {
         let url = format!("redis://{addr}/");
         handles.push(tokio::spawn(async move {
             let client = redis::Client::open(url).expect("invalid redis URL");
-            let mut con = client
-                .get_multiplexed_async_connection()
-                .await
-                .expect("failed to connect");
+            let mut con =
+                client.get_multiplexed_async_connection().await.expect("failed to connect");
 
             for i in 0..OPS_PER_WRITER {
                 let key = format!("w{writer_id}:k{i}");
@@ -250,8 +232,7 @@ async fn compression_round_trip_at_scale() {
     let mut con = srv.con().await;
 
     // Build compressible values: repeated patterns of varying lengths.
-    let mut expected_values: Vec<(String, Vec<u8>)> =
-        Vec::with_capacity(COMPRESSION_KEY_COUNT);
+    let mut expected_values: Vec<(String, Vec<u8>)> = Vec::with_capacity(COMPRESSION_KEY_COUNT);
     for i in 0..COMPRESSION_KEY_COUNT {
         let key = format!("cmp:{i}");
         // Create a value with repeated patterns that compresses well.
@@ -291,9 +272,7 @@ async fn compression_round_trip_at_scale() {
 async fn multi_tenant_isolation() {
     let srv = HmacTestServer::start("stress-test-secret").await;
 
-    let hostnames: Vec<String> = (0..TENANTS)
-        .map(|i| format!("tenant{i}.example.com"))
-        .collect();
+    let hostnames: Vec<String> = (0..TENANTS).map(|i| format!("tenant{i}.example.com")).collect();
 
     // Each tenant writes 200 keys via its own authenticated connection.
     let mut handles = Vec::with_capacity(TENANTS);
@@ -305,10 +284,8 @@ async fn multi_tenant_isolation() {
             let password = derive_site_password(&secret, &hostname);
             let client =
                 redis::Client::open(format!("redis://{addr}/")).expect("invalid redis URL");
-            let mut con = client
-                .get_multiplexed_async_connection()
-                .await
-                .expect("failed to connect");
+            let mut con =
+                client.get_multiplexed_async_connection().await.expect("failed to connect");
 
             // Authenticate.
             let _: String = redis::cmd("AUTH")
@@ -330,10 +307,7 @@ async fn multi_tenant_isolation() {
                 let key = format!("key:{i}");
                 let expected = format!("tenant{tenant_idx}:val{i}");
                 let got: String = con.get(&key).await.expect("GET failed");
-                assert_eq!(
-                    got, expected,
-                    "tenant {hostname} read-back mismatch for {key}",
-                );
+                assert_eq!(got, expected, "tenant {hostname} read-back mismatch for {key}");
             }
 
             // DBSIZE should reflect only this tenant's keys.

@@ -13,10 +13,7 @@ fn main() {
         std::fs::copy(src, &dest).expect("failed to copy sqld binary to OUT_DIR");
 
         println!("cargo::rustc-cfg=sqld_embedded");
-        println!(
-            "cargo::rustc-env=SQLD_BINARY_PATH={}",
-            dest.display()
-        );
+        println!("cargo::rustc-env=SQLD_BINARY_PATH={}", dest.display());
         println!("cargo::warning=sqld binary embedded from {path}");
     } else {
         println!("cargo::warning=SQLD_BINARY_PATH not set — building without embedded sqld");

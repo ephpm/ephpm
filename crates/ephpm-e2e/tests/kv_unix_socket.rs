@@ -99,16 +99,17 @@ async fn kv_ttl_works_with_unix_socket_config() {
 
     let key = "unix_sock_ttl_key";
 
-    // Set with a 50 ms TTL
+    // ephpm_kv_set takes the TTL in seconds (Redis convention), so the
+    // shortest expiry we can request is 1 s. Sleep slightly longer so
+    // scheduler jitter can't make the test flaky.
     let (status, _) = kv(
         &base_url,
-        &format!("op=set&key={key}&val=ephemeral&ttl=50"),
+        &format!("op=set&key={key}&val=ephemeral&ttl=1"),
     )
     .await;
     assert_eq!(status, 200);
 
-    // Wait for expiry
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
 
     // Key should be gone
     let (status, body) = kv(&base_url, &format!("op=get&key={key}")).await;

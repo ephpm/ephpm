@@ -11,6 +11,9 @@ echo "REQUEST_METHOD: " . $_SERVER['REQUEST_METHOD'] . "\n";
 echo "GATEWAY_INTERFACE: " . ($_SERVER['GATEWAY_INTERFACE'] ?? 'unset') . "\n";
 echo "REDIRECT_STATUS: " . ($_SERVER['REDIRECT_STATUS'] ?? 'unset') . "\n";
 echo "SERVER_PROTOCOL: " . $_SERVER['SERVER_PROTOCOL'] . "\n";
+echo "SERVER_SOFTWARE: " . ($_SERVER['SERVER_SOFTWARE'] ?? 'unset') . "\n";
+echo "SERVER_NAME: " . ($_SERVER['SERVER_NAME'] ?? 'unset') . "\n";
+echo "SERVER_PORT: " . ($_SERVER['SERVER_PORT'] ?? 'unset') . "\n";
 echo "HTTP_HOST: " . ($_SERVER['HTTP_HOST'] ?? 'unset') . "\n";
 echo "REMOTE_ADDR: " . $_SERVER['REMOTE_ADDR'] . "\n";
 

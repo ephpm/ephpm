@@ -22,18 +22,17 @@ impl Entry {
     #[must_use]
     pub fn new(data: Vec<u8>, key_len: usize, compressed: bool) -> Self {
         let mem_size = Self::estimate_size(key_len, data.len());
-        Self {
-            data,
-            compressed,
-            expires_at: None,
-            last_accessed: Instant::now(),
-            mem_size,
-        }
+        Self { data, compressed, expires_at: None, last_accessed: Instant::now(), mem_size }
     }
 
     /// Create a new entry with an absolute expiry.
     #[must_use]
-    pub fn with_expiry(data: Vec<u8>, key_len: usize, compressed: bool, expires_at: Instant) -> Self {
+    pub fn with_expiry(
+        data: Vec<u8>,
+        key_len: usize,
+        compressed: bool,
+        expires_at: Instant,
+    ) -> Self {
         let mem_size = Self::estimate_size(key_len, data.len());
         Self {
             data,
@@ -47,8 +46,7 @@ impl Entry {
     /// Returns `true` if this entry has expired.
     #[must_use]
     pub fn is_expired(&self) -> bool {
-        self.expires_at
-            .is_some_and(|exp| Instant::now() >= exp)
+        self.expires_at.is_some_and(|exp| Instant::now() >= exp)
     }
 
     /// Touch the entry, updating its last-access time for LRU.

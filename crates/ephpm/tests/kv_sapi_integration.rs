@@ -7,7 +7,6 @@
 //!
 //! Run with: cargo nextest run -p ephpm --run-ignored all
 
-use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -61,8 +60,7 @@ listen = "127.0.0.1:6379"
     );
 
     let mut f = tempfile::NamedTempFile::new().expect("failed to create temp config");
-    f.write_all(config_content.as_bytes())
-        .expect("failed to write config");
+    f.write_all(config_content.as_bytes()).expect("failed to write config");
     f.flush().expect("failed to flush config");
 
     (f, config_content)
@@ -83,14 +81,11 @@ fn find_ephpm_binary() -> PathBuf {
         }
     }
 
-    panic!(
-        "ephpm binary not found. Run `cargo xtask release` first. Checked: {:?}",
-        candidates
-    );
+    panic!("ephpm binary not found. Run `cargo xtask release` first. Checked: {:?}", candidates);
 }
 
 #[tokio::test]
-#[ignore] // Requires `cargo xtask release` (PHP linked)
+#[ignore = "requires cargo xtask release (PHP linked)"]
 async fn kv_sapi_set_get() {
     let port = 9876;
     let docroot = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests");
@@ -108,11 +103,7 @@ async fn kv_sapi_set_get() {
         .expect("failed to spawn ephpm");
 
     // Wait for server to start
-    assert!(
-        wait_for_port(port as u16, 5),
-        "ephpm server failed to start on port {}",
-        port
-    );
+    assert!(wait_for_port(port as u16, 5), "ephpm server failed to start on port {}", port);
 
     // Run test and clean up
     let result = get_json(&format!("http://127.0.0.1:{}/kv_sapi_test.php?test=set_get", port))
@@ -131,7 +122,7 @@ async fn kv_sapi_set_get() {
 }
 
 #[tokio::test]
-#[ignore] // Requires `cargo xtask release` (PHP linked)
+#[ignore = "requires cargo xtask release (PHP linked)"]
 async fn kv_sapi_del() {
     let port = 9877;
     let docroot = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests");
@@ -160,7 +151,7 @@ async fn kv_sapi_del() {
 }
 
 #[tokio::test]
-#[ignore] // Requires `cargo xtask release` (PHP linked)
+#[ignore = "requires cargo xtask release (PHP linked)"]
 async fn kv_sapi_all() {
     let port = 9878;
     let docroot = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests");

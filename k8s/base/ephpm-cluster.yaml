@@ -113,5 +113,9 @@ spec:
             httpGet:
               path: /index.php
               port: 8080
+              # Match a trusted_hosts entry so the probe doesn't 421.
+              httpHeaders:
+                - name: Host
+                  value: ephpm
             initialDelaySeconds: 2
             periodSeconds: 3

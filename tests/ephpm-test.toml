@@ -43,7 +43,9 @@ enabled = true
 enabled = true
 
 [server.security]
-blocked_paths = ["vendor/*"]
+# Patterns are matched against URI paths (which always start with "/"),
+# so the leading slash is mandatory for directory-style blocks.
+blocked_paths = ["/vendor/*"]
 open_basedir = true
 disable_shell_exec = true
 
@@ -57,8 +59,14 @@ ini_overrides = [
 
 [server.limits]
 max_connections = 100
-per_ip_rate = 50.0
-per_ip_burst = 10
+# Burst and rate are sized for the e2e suite, which runs every test from
+# a single pod IP. Tests like concurrent_php_requests_all_succeed fan out
+# 20 parallel requests, and back-to-back test files cumulatively drive
+# hundreds of requests through the same bucket — anything smaller starts
+# returning 429 in tests that aren't trying to exercise the limiter at all.
+# rate_limit.rs sends well past `per_ip_burst` to still trip a 429.
+per_ip_rate = 500.0
+per_ip_burst = 100
 
 [db.sqlite]
 path = "/tmp/ephpm-test.db"
@@ -72,6 +80,10 @@ tds_listen = "127.0.0.1:1433"
 [server.timeouts]
 header_read = 20
 idle = 45
+# Short request budget so the timeouts/timeout_edge tests can verify
+# 504 enforcement against sleep.php without idling the suite for the
+# 5-minute production default.
+request = 5
 
 [db.read_write_split]
 enabled = true

@@ -113,18 +113,14 @@ async fn basic_query_roundtrip() {
         .await
         .unwrap();
 
-    let rows: Vec<(i32, String)> = conn
-        .query("SELECT id, val FROM _ephpm_test_roundtrip WHERE id = 1")
-        .await
-        .unwrap();
+    let rows: Vec<(i32, String)> =
+        conn.query("SELECT id, val FROM _ephpm_test_roundtrip WHERE id = 1").await.unwrap();
 
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].0, 1);
     assert_eq!(rows[0].1, "hello");
 
-    conn.query_drop("DROP TABLE IF EXISTS _ephpm_test_roundtrip")
-        .await
-        .unwrap();
+    conn.query_drop("DROP TABLE IF EXISTS _ephpm_test_roundtrip").await.unwrap();
 
     drop(conn);
     pool.disconnect().await.unwrap();
@@ -226,30 +222,22 @@ async fn transaction_integrity() {
 
     // Begin transaction, insert, verify visible within txn.
     conn.query_drop("BEGIN").await.unwrap();
-    conn.query_drop("INSERT INTO _ephpm_test_txn (id, val) VALUES (1, 'txn_data')")
-        .await
-        .unwrap();
+    conn.query_drop("INSERT INTO _ephpm_test_txn (id, val) VALUES (1, 'txn_data')").await.unwrap();
 
-    let rows: Vec<(i32, String)> = conn
-        .query("SELECT id, val FROM _ephpm_test_txn WHERE id = 1")
-        .await
-        .unwrap();
+    let rows: Vec<(i32, String)> =
+        conn.query("SELECT id, val FROM _ephpm_test_txn WHERE id = 1").await.unwrap();
     assert_eq!(rows.len(), 1, "row should be visible inside transaction");
     assert_eq!(rows[0].1, "txn_data");
 
     // Rollback — row should vanish.
     conn.query_drop("ROLLBACK").await.unwrap();
 
-    let rows: Vec<(i32,)> = conn
-        .query("SELECT id FROM _ephpm_test_txn WHERE id = 1")
-        .await
-        .unwrap();
+    let rows: Vec<(i32,)> =
+        conn.query("SELECT id FROM _ephpm_test_txn WHERE id = 1").await.unwrap();
     assert!(rows.is_empty(), "row should not exist after ROLLBACK");
 
     // Cleanup.
-    conn.query_drop("DROP TABLE IF EXISTS _ephpm_test_txn")
-        .await
-        .unwrap();
+    conn.query_drop("DROP TABLE IF EXISTS _ephpm_test_txn").await.unwrap();
 
     drop(conn);
     pool.disconnect().await.unwrap();
@@ -279,10 +267,7 @@ async fn prepared_statement_lifecycle() {
         .unwrap();
 
     // Prepare, execute with parameter, verify result.
-    let stmt = conn
-        .prep("SELECT id, name FROM _ephpm_test_ps WHERE id = ?")
-        .await
-        .unwrap();
+    let stmt = conn.prep("SELECT id, name FROM _ephpm_test_ps WHERE id = ?").await.unwrap();
 
     let rows: Vec<(i32, String)> = conn.exec(&stmt, (1,)).await.unwrap();
     assert_eq!(rows.len(), 1);
@@ -297,9 +282,7 @@ async fn prepared_statement_lifecycle() {
     conn.close(stmt).await.unwrap();
 
     // Cleanup.
-    conn.query_drop("DROP TABLE IF EXISTS _ephpm_test_ps")
-        .await
-        .unwrap();
+    conn.query_drop("DROP TABLE IF EXISTS _ephpm_test_ps").await.unwrap();
 
     drop(conn);
     pool.disconnect().await.unwrap();

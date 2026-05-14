@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[allow(unused_imports)]
+use ::metrics::{counter, gauge, histogram};
 use ephpm_config::Config;
 use ephpm_kv::store::Store;
 use ephpm_php::PhpRuntime;
@@ -25,9 +27,6 @@ use ipnet::IpNet;
 
 use crate::body::{self, ServerBody};
 use crate::{metrics, static_files};
-
-#[allow(unused_imports)]
-use ::metrics::{counter, gauge, histogram};
 
 /// Result of resolving a request through `fallback`.
 enum Resolved {
@@ -78,7 +77,6 @@ pub struct Router {
     store: Arc<Store>,
     multi_tenant_kv: Option<ephpm_kv::multi_tenant::MultiTenantStore>,
     open_basedir: bool,
-    disable_shell_exec: bool,
     php_etag_cache_config: ephpm_config::PhpETagCacheConfig,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     metrics_path: String,
@@ -207,7 +205,6 @@ impl Router {
                 .map(|[k, v]| (k.clone(), v.clone()))
                 .collect(),
             open_basedir: config.server.security.open_basedir,
-            disable_shell_exec: config.server.security.disable_shell_exec,
             multi_tenant_kv: if config.server.sites_dir.is_some() {
                 Some(ephpm_kv::multi_tenant::MultiTenantStore::new(
                     Arc::clone(&store),
@@ -256,10 +253,7 @@ impl Router {
         let password = ephpm_kv::auth::derive_site_password(secret, hostname);
 
         // Parse host:port from the listen address.
-        let (host, port) = self
-            .kv_listen
-            .rsplit_once(':')
-            .unwrap_or(("127.0.0.1", "6379"));
+        let (host, port) = self.kv_listen.rsplit_once(':').unwrap_or(("127.0.0.1", "6379"));
 
         vec![
             ("EPHPM_REDIS_HOST".into(), host.into()),
@@ -275,12 +269,7 @@ impl Router {
         }
 
         // Strip port and trailing dot, lowercase.
-        let clean = host
-            .split(':')
-            .next()
-            .unwrap_or("")
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
+        let clean = host.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
 
         // Check the startup-scanned registry first.
         // Verify the directory still exists — it may have been removed (teardown).
@@ -325,21 +314,16 @@ impl Router {
             let (effective_addr, _) = self.resolve_proxy_info(&req, remote_addr, is_tls);
             if !limiter.check_rate(effective_addr.ip()) {
                 counter!("ephpm_rate_limited_total").increment(1);
-                return Ok(error_response(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "429 Too Many Requests",
-                ));
+                return Ok(error_response(StatusCode::TOO_MANY_REQUESTS, "429 Too Many Requests"));
             }
         }
 
         gauge!("ephpm_http_requests_in_flight").increment(1.0);
         let start = std::time::Instant::now();
 
-        let (result, handler) = if let Ok(result) = tokio::time::timeout(
-            self.request_timeout,
-            self.handle_inner(req, remote_addr, is_tls),
-        )
-        .await
+        let (result, handler) = if let Ok(result) =
+            tokio::time::timeout(self.request_timeout, self.handle_inner(req, remote_addr, is_tls))
+                .await
         {
             let handler = result.as_ref().map_or("error", |(_, h)| *h);
             (result.map(|(resp, _)| resp), handler)
@@ -383,7 +367,17 @@ impl Router {
             return Ok((resp, "error"));
         }
 
-        let uri_path = req.uri().path().to_string();
+        // Use the percent-decoded path for routing and static-file lookup.
+        // hyper hands us the raw URI, so `/test%2Ehtml` would otherwise be
+        // looked up as the literal name `test%2Ehtml`. percent_decode_path
+        // also rejects encoded slashes so the decoding can't be used to
+        // sneak past path-traversal or prefix-block checks.
+        let uri_path = match percent_decode_path(req.uri().path()) {
+            Some(path) => path,
+            None => {
+                return Ok((error_response(StatusCode::BAD_REQUEST, "400 Bad Request"), "error"));
+            }
+        };
         let query_string = req.uri().query().unwrap_or("").to_string();
         let method = req.method().as_str().to_ascii_uppercase();
 
@@ -443,48 +437,78 @@ impl Router {
 
         // Extract If-None-Match for ETag support before consuming the request.
         let if_none_match = if self.etag {
-            req.headers()
-                .get("if-none-match")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from)
+            req.headers().get("if-none-match").and_then(|v| v.to_str().ok()).map(String::from)
         } else {
             None
         };
 
-        let (mut response, handler) = match self.resolve_fallback(&uri_path, &query_string, &site_root, site_index, site_fallback) {
+        let (mut response, handler) = match self.resolve_fallback(
+            &uri_path,
+            &query_string,
+            &site_root,
+            site_index,
+            site_fallback,
+        ) {
             Resolved::File(fs_path) => {
                 if is_php_file(&fs_path) {
                     if self.is_php_allowed(&uri_path) {
-                        let is_cacheable = (method == "GET" || method == "HEAD") && self.php_etag_cache_config.enabled;
+                        let is_cacheable = (method == "GET" || method == "HEAD")
+                            && self.php_etag_cache_config.enabled;
 
                         // Pre-check: bypass PHP if client's ETag matches stored value.
                         if is_cacheable {
                             if let Some(client_tag) = &if_none_match {
-                                let key = php_etag_cache_key(&self.php_etag_cache_config.key_prefix, &method, &uri_path, &query_string);
+                                let key = php_etag_cache_key(
+                                    &self.php_etag_cache_config.key_prefix,
+                                    &method,
+                                    &uri_path,
+                                    &query_string,
+                                );
                                 if let Some(stored) = self.store.get(&key) {
                                     let stored_etag = String::from_utf8_lossy(&stored);
                                     if etag_matches_value(&stored_etag, client_tag) {
-                                        return Ok((Response::builder()
-                                            .status(StatusCode::NOT_MODIFIED)
-                                            .header("etag", stored_etag.as_ref())
-                                            .body(body::buffered(Full::new(Bytes::new())))
-                                            .expect("304 builder"), "php"));
+                                        return Ok((
+                                            Response::builder()
+                                                .status(StatusCode::NOT_MODIFIED)
+                                                .header("etag", stored_etag.as_ref())
+                                                .body(body::buffered(Full::new(Bytes::new())))
+                                                .expect("304 builder"),
+                                            "php",
+                                        ));
                                     }
                                 }
                             }
                         }
 
                         // Execute PHP
-                        let resp = self.handle_php(req, effective_addr, is_https, fs_path, accepts_gzip, accepts_br, site_root.clone())
+                        let resp = self
+                            .handle_php(
+                                req,
+                                effective_addr,
+                                is_https,
+                                fs_path,
+                                accepts_gzip,
+                                accepts_br,
+                                site_root.clone(),
+                            )
                             .await;
 
                         // Post-store: cache any ETag PHP set in the response.
                         if is_cacheable {
-                            if let Some(etag_val) = resp.headers().get("etag").and_then(|v| v.to_str().ok()) {
-                                let key = php_etag_cache_key(&self.php_etag_cache_config.key_prefix, &method, &uri_path, &query_string);
+                            if let Some(etag_val) =
+                                resp.headers().get("etag").and_then(|v| v.to_str().ok())
+                            {
+                                let key = php_etag_cache_key(
+                                    &self.php_etag_cache_config.key_prefix,
+                                    &method,
+                                    &uri_path,
+                                    &query_string,
+                                );
                                 #[allow(clippy::cast_sign_loss)]
                                 let ttl = if self.php_etag_cache_config.ttl_secs > 0 {
-                                    Some(Duration::from_secs(self.php_etag_cache_config.ttl_secs as u64))
+                                    Some(Duration::from_secs(
+                                        self.php_etag_cache_config.ttl_secs as u64,
+                                    ))
                                 } else {
                                     None
                                 };
@@ -497,23 +521,32 @@ impl Router {
                         (error_response(StatusCode::FORBIDDEN, "403 Forbidden"), "error")
                     }
                 } else {
-                    (static_files::serve_file(
-                        &site_root,
-                        &fs_path,
-                        accepts_gzip,
-                        accepts_br,
-                        &self.cache_control,
-                        self.compression,
-                        self.etag,
-                        if_none_match.as_deref(),
-                        self.file_cache.as_deref(),
+                    (
+                        static_files::serve_file(
+                            &site_root,
+                            &fs_path,
+                            accepts_gzip,
+                            accepts_br,
+                            &self.cache_control,
+                            self.compression,
+                            self.etag,
+                            if_none_match.as_deref(),
+                            self.file_cache.as_deref(),
+                        )
+                        .await,
+                        "static",
                     )
-                    .await, "static")
                 }
             }
             Resolved::Status(code) => {
                 let status = StatusCode::from_u16(code).unwrap_or(StatusCode::NOT_FOUND);
-                (error_response(status, &format!("{code} {}", status.canonical_reason().unwrap_or("Error"))), "error")
+                (
+                    error_response(
+                        status,
+                        &format!("{code} {}", status.canonical_reason().unwrap_or("Error")),
+                    ),
+                    "error",
+                )
             }
         };
 
@@ -566,7 +599,12 @@ impl Router {
     }
 
     /// Probe a single `fallback` entry against the filesystem.
-    fn probe_path(&self, expanded: &str, doc_root: &Path, index_files: &[String]) -> Option<PathBuf> {
+    fn probe_path(
+        &self,
+        expanded: &str,
+        doc_root: &Path,
+        index_files: &[String],
+    ) -> Option<PathBuf> {
         let (path_part, _) = split_path_query(expanded);
 
         if path_part.ends_with('/') {
@@ -582,11 +620,7 @@ impl Router {
             None
         } else {
             let fs_path = doc_root.join(path_part.trim_start_matches('/'));
-            if fs_path.is_file() {
-                Some(fs_path)
-            } else {
-                None
-            }
+            if fs_path.is_file() { Some(fs_path) } else { None }
         }
     }
 
@@ -628,7 +662,10 @@ impl Router {
         let server_port = self.server_port;
         let multi_tenant_kv = self.multi_tenant_kv.clone();
         let vhost_open_basedir = self.sites_dir.is_some() && self.open_basedir;
-        let vhost_disable_shell = self.sites_dir.is_some() && self.disable_shell_exec;
+        // disable_shell_exec is applied globally via the generated php.ini
+        // (zend_disable_functions runs once at MINIT and removes the
+        // functions from the function table; runtime ini changes don't
+        // re-disable them). Wiring lives in `crates/ephpm/src/main.rs`.
 
         // Build EPHPM_REDIS_* env vars for multi-tenant RESP auth injection,
         // plus DB_* env vars for framework auto-discovery.
@@ -639,25 +676,36 @@ impl Router {
         let result = tokio::task::spawn_blocking(move || {
             // Scope KV store to this virtual host for multi-tenant isolation.
             ephpm_php::kv_bridge::set_site_store(
-                multi_tenant_kv.as_ref().map(|mt| mt.get_site_store(&server_name))
+                multi_tenant_kv.as_ref().map(|mt| mt.get_site_store(&server_name)),
             );
 
             // Apply per-request PHP sandbox for multi-tenant isolation.
+            // open_basedir varies per vhost (each site only sees its own
+            // directory), so it has to be set per request. The C wrapper
+            // uses STAGE_ACTIVATE to bypass OnUpdateBaseDir's
+            // "must-be-tighter-than-current" check, since each site's path
+            // is a peer rather than a subset of the previous one.
             if vhost_open_basedir {
                 let basedir = format!("{}:/tmp", document_root.display());
                 PhpRuntime::set_request_ini("open_basedir", &basedir);
             }
-            if vhost_disable_shell {
-                PhpRuntime::set_request_ini(
-                    "disable_functions",
-                    "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec",
-                );
-            }
 
             PhpRuntime::execute(PhpRequest {
-                method, uri, path, query_string, script_filename,
-                document_root, headers, body, content_type, remote_addr,
-                server_name, server_port, is_https, protocol, env_vars,
+                method,
+                uri,
+                path,
+                query_string,
+                script_filename,
+                document_root,
+                headers,
+                body,
+                content_type,
+                remote_addr,
+                server_name,
+                server_port,
+                is_https,
+                protocol,
+                env_vars,
             })
         })
         .await;
@@ -678,7 +726,9 @@ impl Router {
         if self.max_body_size == 0 {
             return None;
         }
-        let len: u64 = req.headers().get("content-length")
+        let len: u64 = req
+            .headers()
+            .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
@@ -700,7 +750,10 @@ impl Router {
             } else {
                 StatusCode::FORBIDDEN
             };
-            Some(error_response(status, &format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or("Error"))))
+            Some(error_response(
+                status,
+                &format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or("Error")),
+            ))
         } else {
             None
         }
@@ -754,11 +807,7 @@ impl Router {
         if self.trusted_hosts.is_empty() {
             return None;
         }
-        let host = req
-            .headers()
-            .get("host")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
+        let host = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
         // Compare with and without port.
         let host_no_port = host.split(':').next().unwrap_or(host);
         let is_trusted = self.trusted_hosts.iter().any(|trusted| {
@@ -768,10 +817,7 @@ impl Router {
             None
         } else {
             tracing::debug!(host, "rejected untrusted host");
-            Some(error_response(
-                StatusCode::MISDIRECTED_REQUEST,
-                "421 Misdirected Request",
-            ))
+            Some(error_response(StatusCode::MISDIRECTED_REQUEST, "421 Misdirected Request"))
         }
     }
 
@@ -827,6 +873,50 @@ fn has_hidden_segment(uri_path: &str) -> bool {
     uri_path.split('/').any(|segment| {
         segment.starts_with('.') && !segment.is_empty() && segment != "." && segment != ".."
     })
+}
+
+/// Percent-decode a URI path so static-file lookup and routing work
+/// against the literal characters the client meant.
+///
+/// Returns `None` if the input is malformed (truncated `%`, non-hex
+/// digits) or contains an encoded `/` / `\` — those would let percent
+/// encoding bypass path-traversal checks and prefix-based blocks like
+/// `/vendor/*`. Callers should treat `None` as a 400.
+///
+/// The output is validated as UTF-8; an invalid sequence also yields
+/// `None`. ASCII paths (the overwhelming majority) round-trip exactly.
+fn percent_decode_path(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_nibble(bytes[i + 1])?;
+            let lo = hex_nibble(bytes[i + 2])?;
+            let byte = (hi << 4) | lo;
+            if byte == b'/' || byte == b'\\' {
+                return None;
+            }
+            out.push(byte);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Check if a URI path matches any blocked path pattern.
@@ -928,19 +1018,13 @@ fn build_db_env_vars(config: &Config) -> Vec<(String, String)> {
     // MySQL takes precedence (most common for PHP).
     if let Some(ref mysql) = config.db.mysql {
         if mysql.inject_env {
-            let listen = mysql
-                .listen
-                .as_deref()
-                .unwrap_or("127.0.0.1:3306");
+            let listen = mysql.listen.as_deref().unwrap_or("127.0.0.1:3306");
             return db_env_from_url(listen, &mysql.url, "mysql");
         }
     }
     if let Some(ref pg) = config.db.postgres {
         if pg.inject_env {
-            let listen = pg
-                .listen
-                .as_deref()
-                .unwrap_or("127.0.0.1:5432");
+            let listen = pg.listen.as_deref().unwrap_or("127.0.0.1:5432");
             return db_env_from_url(listen, &pg.url, "pgsql");
         }
     }
@@ -952,17 +1036,10 @@ fn db_env_from_url(listen: &str, backend_url: &str, driver: &str) -> Vec<(String
     let (host, port) = listen.rsplit_once(':').unwrap_or((listen, "3306"));
 
     // Parse: scheme://user:password@host:port/dbname
-    let rest = backend_url
-        .find("://")
-        .map_or(backend_url, |i| &backend_url[i + 3..]);
+    let rest = backend_url.find("://").map_or(backend_url, |i| &backend_url[i + 3..]);
     let (creds, host_db) = rest.split_once('@').unwrap_or(("", rest));
     let (user, password) = creds.split_once(':').unwrap_or((creds, ""));
-    let db_name = host_db
-        .split_once('/')
-        .map_or("", |(_, db)| db)
-        .split('?')
-        .next()
-        .unwrap_or("");
+    let db_name = host_db.split_once('/').map_or("", |(_, db)| db).split('?').next().unwrap_or("");
 
     vec![
         ("DB_HOST".into(), host.into()),
@@ -971,10 +1048,7 @@ fn db_env_from_url(listen: &str, backend_url: &str, driver: &str) -> Vec<(String
         ("DB_USER".into(), user.into()),
         ("DB_PASSWORD".into(), password.into()),
         ("DB_CONNECTION".into(), driver.into()),
-        (
-            "DATABASE_URL".into(),
-            format!("{driver}://{user}:{password}@{host}:{port}/{db_name}"),
-        ),
+        ("DATABASE_URL".into(), format!("{driver}://{user}:{password}@{host}:{port}/{db_name}")),
     ]
 }
 
@@ -991,7 +1065,10 @@ fn error_response(status: StatusCode, body: &str) -> Response<ServerBody> {
 ///
 /// Prefers Brotli (`br`) over gzip when the client supports it.
 fn build_php_response(
-    result: Result<Result<ephpm_php::response::PhpResponse, ephpm_php::PhpError>, tokio::task::JoinError>,
+    result: Result<
+        Result<ephpm_php::response::PhpResponse, ephpm_php::PhpError>,
+        tokio::task::JoinError,
+    >,
     accepts_gzip: bool,
     accepts_br: bool,
     compression: CompressionSettings,
@@ -999,7 +1076,9 @@ fn build_php_response(
     match result {
         Ok(Ok(php_response)) => {
             let status = StatusCode::from_u16(php_response.status).unwrap_or(StatusCode::OK);
-            let ct = php_response.headers.iter()
+            let ct = php_response
+                .headers
+                .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
                 .map_or("", |(_, v)| v.as_str());
 
@@ -1014,16 +1093,10 @@ fn build_php_response(
             // Try Brotli first (better ratio), then fall back to gzip.
             let (body_bytes, encoding) = if accepts_br {
                 brotli_compress(&php_response.body, ct, compression)
-                    .map_or_else(
-                        || (php_response.body, None),
-                        |c| (c, Some("br")),
-                    )
+                    .map_or_else(|| (php_response.body, None), |c| (c, Some("br")))
             } else if accepts_gzip {
                 gzip_compress(&php_response.body, ct, compression)
-                    .map_or_else(
-                        || (php_response.body, None),
-                        |c| (c, Some("gzip")),
-                    )
+                    .map_or_else(|| (php_response.body, None), |c| (c, Some("gzip")))
             } else {
                 (php_response.body, None)
             };
@@ -1049,7 +1122,10 @@ fn build_php_response(
         }
         Ok(Err(err)) => {
             tracing::error!(%err, "PHP execution failed");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &format!("PHP execution error: {err}"))
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("PHP execution error: {err}"),
+            )
         }
         Err(err) => {
             tracing::error!(%err, "spawn_blocking task failed");
@@ -1092,7 +1168,11 @@ fn is_compressible(content_type: &str) -> bool {
 
 /// Try to gzip-compress a body. Returns `None` if not worth compressing.
 #[must_use]
-pub fn gzip_compress(data: &[u8], content_type: &str, settings: CompressionSettings) -> Option<Vec<u8>> {
+pub fn gzip_compress(
+    data: &[u8],
+    content_type: &str,
+    settings: CompressionSettings,
+) -> Option<Vec<u8>> {
     if data.len() < settings.min_size || !is_compressible(content_type) {
         return None;
     }
@@ -1100,11 +1180,7 @@ pub fn gzip_compress(data: &[u8], content_type: &str, settings: CompressionSetti
     let mut encoder = GzEncoder::new(Vec::new(), level);
     encoder.write_all(data).ok()?;
     let compressed = encoder.finish().ok()?;
-    if compressed.len() < data.len() {
-        Some(compressed)
-    } else {
-        None
-    }
+    if compressed.len() < data.len() { Some(compressed) } else { None }
 }
 
 /// Try to Brotli-compress a body. Returns `None` if not worth compressing.
@@ -1112,7 +1188,11 @@ pub fn gzip_compress(data: &[u8], content_type: &str, settings: CompressionSetti
 /// Brotli typically achieves 15-25% better compression than gzip on text
 /// content, making it the preferred choice when the client supports it.
 #[must_use]
-pub fn brotli_compress(data: &[u8], content_type: &str, settings: CompressionSettings) -> Option<Vec<u8>> {
+pub fn brotli_compress(
+    data: &[u8],
+    content_type: &str,
+    settings: CompressionSettings,
+) -> Option<Vec<u8>> {
     if data.len() < settings.min_size || !is_compressible(content_type) {
         return None;
     }
@@ -1131,11 +1211,7 @@ pub fn brotli_compress(data: &[u8], content_type: &str, settings: CompressionSet
         // CompressorWriter flushes on drop, but we need to handle errors.
         // Drop triggers the final flush.
     }
-    if compressed.len() < data.len() {
-        Some(compressed)
-    } else {
-        None
-    }
+    if compressed.len() < data.len() { Some(compressed) } else { None }
 }
 
 /// Build the KV store key for caching a PHP response's `ETag`.
@@ -1239,16 +1315,18 @@ mod tests {
     }
 
     fn default_compression() -> CompressionSettings {
-        CompressionSettings {
-            enabled: true,
-            level: 1,
-            min_size: 1024,
-        }
+        CompressionSettings { enabled: true, level: 1, min_size: 1024 }
     }
 
     /// Test helper: call resolve_fallback with the router's own defaults.
     fn resolve_fb(router: &Router, uri: &str, qs: &str) -> Resolved {
-        router.resolve_fallback(uri, qs, &router.document_root, &router.index_files, &router.fallback)
+        router.resolve_fallback(
+            uri,
+            qs,
+            &router.document_root,
+            &router.index_files,
+            &router.fallback,
+        )
     }
 
     // ── fallback resolution ─────────────────────────────────────────
@@ -1548,10 +1626,8 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        config.server.security.allowed_php_paths = vec![
-            "/index.php".to_string(),
-            "/wp-login.php".to_string(),
-        ];
+        config.server.security.allowed_php_paths =
+            vec!["/index.php".to_string(), "/wp-login.php".to_string()];
         let router = Router::new(&config, test_store(), None, None, None);
         assert!(router.is_php_allowed("/index.php"));
         assert!(router.is_php_allowed("/wp-login.php"));
@@ -1571,10 +1647,8 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        config.server.security.allowed_php_paths = vec![
-            "/index.php".to_string(),
-            "/wp-admin/*.php".to_string(),
-        ];
+        config.server.security.allowed_php_paths =
+            vec!["/index.php".to_string(), "/wp-admin/*.php".to_string()];
         let router = Router::new(&config, test_store(), None, None, None);
         assert!(router.is_php_allowed("/index.php"));
         assert!(router.is_php_allowed("/wp-admin/admin.php"));
@@ -1781,11 +1855,8 @@ mod tests {
 
     #[test]
     fn blocked_multiple_patterns() {
-        let blocked = vec![
-            "/wp-config.php".to_string(),
-            "/vendor/*".to_string(),
-            "/.env".to_string(),
-        ];
+        let blocked =
+            vec!["/wp-config.php".to_string(), "/vendor/*".to_string(), "/.env".to_string()];
         assert!(is_path_blocked("/wp-config.php", &blocked));
         assert!(is_path_blocked("/vendor/autoload.php", &blocked));
         assert!(is_path_blocked("/.env", &blocked));
@@ -2022,9 +2093,9 @@ mod tests {
     #[allow(unexpected_cfgs)]
     #[cfg(all(test, php_linked))]
     mod php_etag_tests {
-        use hyper::body::Empty;
-        use http_body_util::BodyExt;
         use ephpm_php::PhpRuntime;
+        use http_body_util::BodyExt;
+        use hyper::body::Empty;
         use serial_test::serial;
 
         use super::*;

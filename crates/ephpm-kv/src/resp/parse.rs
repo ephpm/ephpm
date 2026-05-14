@@ -39,9 +39,7 @@ pub fn parse_frame(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
         b':' => parse_integer(buf),
         b'$' => parse_bulk(buf),
         b'*' => parse_array(buf),
-        byte => Err(ParseError::Protocol(format!(
-            "unexpected type byte: {byte:#04x}"
-        ))),
+        byte => Err(ParseError::Protocol(format!("unexpected type byte: {byte:#04x}"))),
     }
 }
 
@@ -68,8 +66,7 @@ fn read_line(buf: &[u8], start: usize) -> Result<(usize, &[u8]), ParseError> {
 fn parse_line_int(line: &[u8]) -> Result<i64, ParseError> {
     let s = std::str::from_utf8(line)
         .map_err(|_| ParseError::Protocol("non-UTF-8 integer line".into()))?;
-    s.parse::<i64>()
-        .map_err(|_| ParseError::Protocol(format!("invalid integer: {s}")))
+    s.parse::<i64>().map_err(|_| ParseError::Protocol(format!("invalid integer: {s}")))
 }
 
 fn parse_simple(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
@@ -231,10 +228,7 @@ mod tests {
         let frame = parse(b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n").unwrap().unwrap();
         assert_eq!(
             frame,
-            Frame::Array(vec![
-                Frame::Bulk(b"GET".to_vec()),
-                Frame::Bulk(b"key".to_vec()),
-            ])
+            Frame::Array(vec![Frame::Bulk(b"GET".to_vec()), Frame::Bulk(b"key".to_vec()),])
         );
     }
 

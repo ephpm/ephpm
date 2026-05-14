@@ -552,15 +552,23 @@ void ephpm_request_add_server_var(const char *key, const char *value)
 /*
  * Set a PHP INI directive for the current request.
  *
- * Uses PHP_INI_SYSTEM + PHP_INI_STAGE_RUNTIME so the value takes effect
- * immediately and cannot be overridden by userland ini_set().
+ * Uses PHP_INI_SYSTEM + PHP_INI_STAGE_ACTIVATE. Not RUNTIME: the
+ * OnUpdateBaseDir handler rejects RUNTIME updates that aren't a strict
+ * subset of the prior value (open_basedir can only be tightened at
+ * runtime). We reuse a single embed request across HTTP requests, so on
+ * the second and later vhost calls a sibling site's path fails the
+ * "subset of current open_basedir" check, the update is dropped, the
+ * stale value blocks the new script from loading, and the request 500s.
+ * STAGE_ACTIVATE — the bucket PHP itself uses during request_startup —
+ * skips the tightening check, which is the behavior we want here.
+ *
  * Call before ephpm_execute_request().
  */
 void ephpm_request_set_ini(const char *key, const char *value)
 {
     zend_string *zkey = zend_string_init(key, strlen(key), 0);
     zend_string *zval = zend_string_init(value, strlen(value), 0);
-    zend_alter_ini_entry(zkey, zval, PHP_INI_SYSTEM, PHP_INI_STAGE_RUNTIME);
+    zend_alter_ini_entry(zkey, zval, PHP_INI_SYSTEM, PHP_INI_STAGE_ACTIVATE);
     zend_string_release(zval);
     zend_string_release(zkey);
 }
@@ -739,9 +747,15 @@ int ephpm_execute_request(const char *filename)
     /* Re-disable stack checking (request startup may reset it) */
     EG(max_allowed_stack_size) = 0;
 
+    /* Reset PHP's last-error tracking so we can tell whether THIS script
+     * raised a fatal (vs. a stale value carried over from a prior reuse
+     * of the embed request). */
+    PG(last_error_type) = 0;
+
     /* Execute the script with bailout protection.
      * PHP's zend_try/zend_catch uses setjmp/longjmp. */
     int result = 0;
+    int fatal_bailout = 0;
     JMP_BUF *__orig_bailout = EG(bailout);
     JMP_BUF __bailout;
 
@@ -752,20 +766,45 @@ int ephpm_execute_request(const char *filename)
         php_execute_script(&file_handle);
 
         /* PHP 8.x: exit()/die() throws an unwind exit exception instead
-         * of calling zend_bailout(). Treat it like the old bailout path. */
+         * of calling zend_bailout(). Treat it like the old bailout path,
+         * but DO NOT mark it as a fatal bailout — exit() is intentional
+         * and should preserve whatever status the script set. */
         if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
             zend_clear_exception();
             result = -2;
         }
     } else {
-        /* PHP bailed out (fatal error) */
+        /* PHP bailed out via zend_bailout() — out-of-memory, max
+         * execution time, etc. Older fatal classes hit this path. */
         result = -2;
+        fatal_bailout = 1;
     }
     EG(bailout) = __orig_bailout;
 
     /* Capture response data while the request is still active */
     capture_response_headers();
     response_status_code = SG(sapi_headers).http_response_code;
+
+    /* Decide whether to override status with 500. There are two paths:
+     *
+     *   1. zend_bailout() longjmps out of execute (legacy fatal path):
+     *      caught by SETJMP above — fatal_bailout = 1.
+     *
+     *   2. PHP 8.x uncaught Throwable: zend_exception_error() calls
+     *      zend_error_va(... | E_DONT_BAIL ...) which prints the fatal
+     *      message and lets php_execute_script return normally. SETJMP
+     *      sees nothing, so we MUST also check PG(last_error_type) to
+     *      catch this case. Without it, "Fatal error: Uncaught Error:
+     *      Call to undefined function ..." comes back as 200 OK.
+     *
+     * Either way, we only override when the script hasn't already set
+     * an explicit error status (PHP exit() / http_response_code()). */
+    int fatal_error_mask = E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR
+                           | E_USER_ERROR | E_RECOVERABLE_ERROR | E_PARSE;
+    int hit_fatal = fatal_bailout || (PG(last_error_type) & fatal_error_mask);
+    if (hit_fatal && response_status_code == 200) {
+        response_status_code = 500;
+    }
 
     /* Note: we do NOT call php_request_shutdown here.
      * We reuse the single embed request for all HTTP requests.
@@ -952,6 +991,18 @@ PHP_FUNCTION(ephpm_kv_ttl)
     RETURN_LONG((zend_long)((pttl + 999) / 1000));
 }
 
+/* Redis-style PTTL: returns remaining TTL in milliseconds (or -1 / -2). */
+PHP_FUNCTION(ephpm_kv_pttl)
+{
+    char *key; size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.pttl) { RETURN_LONG(-2); }
+    RETURN_LONG((zend_long)g_kv_ops.pttl(key));
+}
+
 /* ── Argument info for reflection (arginfo) ──────────────────── */
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_get, 0, 0, 1)
@@ -994,6 +1045,10 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_ttl, 0, 0, 1)
     ZEND_ARG_INFO(0, key)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_pttl, 0, 0, 1)
+    ZEND_ARG_INFO(0, key)
+ZEND_END_ARG_INFO()
+
 /* ── Function entry table (null-terminated) ──────────────────── */
 
 static const zend_function_entry ephpm_kv_functions[] = {
@@ -1006,6 +1061,7 @@ static const zend_function_entry ephpm_kv_functions[] = {
     PHP_FE(ephpm_kv_incr_by,  arginfo_ephpm_kv_incr_by)
     PHP_FE(ephpm_kv_expire,   arginfo_ephpm_kv_expire)
     PHP_FE(ephpm_kv_ttl,      arginfo_ephpm_kv_ttl)
+    PHP_FE(ephpm_kv_pttl,     arginfo_ephpm_kv_pttl)
     PHP_FE_END
 };
 
@@ -1030,13 +1086,50 @@ void ephpm_set_ini_file(const char *ini_file)
 }
 
 /*
- * Pre-initialization: set additional_functions on the embed module.
- * Must be called BEFORE php_embed_init() so that php_module_startup()
- * registers these functions during module initialization.
+ * Custom startup callback installed in place of php_embed_module.startup.
+ *
+ * Why this is necessary, and why post-init registration cannot work:
+ *
+ *  1. php_embed_init() unconditionally overwrites
+ *     php_embed_module.additional_functions with its own array (just dl())
+ *     at sapi/embed/php_embed.c:219, after sapi_startup() and before
+ *     module startup. So pre-setting additional_functions in ephpm_pre_init
+ *     is wiped out before php_module_startup sees it.
+ *
+ *  2. In ZTS, zend_startup() ends by copying the main thread's CG(function_table)
+ *     into the static GLOBAL_FUNCTION_TABLE and then freeing the main thread's
+ *     table (Zend/zend.c:1114-1124). New TSRM threads (our tokio workers)
+ *     bootstrap their own CG(function_table) by copying from
+ *     GLOBAL_FUNCTION_TABLE in compiler_globals_ctor (Zend/zend.c:720). So any
+ *     functions we register after php_embed_init() returns land in nothing —
+ *     the main thread's table is gone and new threads never see them.
+ *
+ * The only window that works is "after embed.c:219 overwrite, before
+ * php_module_startup reads sapi_module.additional_functions." We get there by
+ * replacing php_embed_module.startup with this shim, restoring the KV table on
+ * the SAPI struct, then handing off to PHP's own php_module_startup. That puts
+ * the functions in CG(function_table) during MINIT, which is then copied into
+ * GLOBAL_FUNCTION_TABLE at the end of zend_startup() — exactly where new
+ * threads will pick them up.
+ */
+static int ephpm_module_startup(sapi_module_struct *sm)
+{
+    sm->additional_functions = ephpm_kv_functions;
+    return php_module_startup(sm, NULL);
+}
+
+/*
+ * Pre-initialization: replace the embed SAPI's module startup callback
+ * with our shim above. Must be called BEFORE php_embed_init().
+ *
+ * Hooking startup (rather than additional_functions directly) is the key:
+ * php_embed_init() rewrites additional_functions but leaves startup alone,
+ * so the shim still runs and gets a chance to put our table back before
+ * php_module_startup is invoked.
  */
 void ephpm_pre_init(void)
 {
-    php_embed_module.additional_functions = ephpm_kv_functions;
+    php_embed_module.startup = ephpm_module_startup;
 }
 
 /*

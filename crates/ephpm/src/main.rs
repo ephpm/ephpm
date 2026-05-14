@@ -7,10 +7,9 @@ use clap::{Parser, Subcommand};
 use ephpm_kv::resp::{Frame, parse_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 
 /// ePHPm — All-in-one PHP application server
 #[derive(Parser, Debug)]
@@ -115,8 +114,7 @@ fn run() -> anyhow::Result<ExitCode> {
     match cli.command {
         Some(Commands::Php { args }) => run_php(&args),
         Some(Commands::Kv { host, port, subcommand }) => {
-            let rt = tokio::runtime::Runtime::new()
-                .context("failed to create tokio runtime")?;
+            let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
             rt.block_on(run_kv(&host, port, subcommand))
         }
         other => run_serve_sync(other),
@@ -131,18 +129,31 @@ fn run_php(args: &[String]) -> anyhow::Result<ExitCode> {
     let _dll_guard = ephpm_php::windows_dll::extract_php_dll()
         .context("failed to extract embedded php8embed.dll")?;
 
-    let exit_code = ephpm_php::PhpRuntime::cli_main(args)
-        .context("PHP CLI failed")?;
+    let exit_code = ephpm_php::PhpRuntime::cli_main(args).context("PHP CLI failed")?;
     let _ = ephpm_php::PhpRuntime::shutdown();
     Ok(exit_code_from(exit_code))
 }
 
 /// Convert a PHP exit code (i32) to a Rust `ExitCode`.
 fn exit_code_from(code: i32) -> ExitCode {
-    if code == 0 {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(u8::try_from(code).unwrap_or(1))
+    if code == 0 { ExitCode::SUCCESS } else { ExitCode::from(u8::try_from(code).unwrap_or(1)) }
+}
+
+/// Removes a temp file when dropped. Used to clean up the generated
+/// php.ini we materialise from `[php] ini_overrides`.
+struct TempFileGuard {
+    path: PathBuf,
+}
+
+impl TempFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
@@ -176,27 +187,22 @@ fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
 
     // Set up access log file writer if configured.
     let _access_guard = if config.server.logging.access.is_empty() {
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .init();
+        tracing_subscriber::registry().with(env_filter).with(fmt_layer).init();
         None
     } else {
         let access_path = PathBuf::from(&config.server.logging.access);
         let access_dir = access_path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        let access_file = access_path.file_name()
+        let access_file = access_path
+            .file_name()
             .map_or_else(|| "access.log".to_string(), |f| f.to_string_lossy().into_owned());
-        let (access_writer, guard) =
-            tracing_appender::non_blocking(tracing_appender::rolling::never(access_dir, access_file));
+        let (access_writer, guard) = tracing_appender::non_blocking(
+            tracing_appender::rolling::never(access_dir, access_file),
+        );
         let access_layer = tracing_subscriber::fmt::layer()
             .with_writer(access_writer)
             .with_target(true)
             .with_filter(EnvFilter::new("access_log=info"));
-        tracing_subscriber::registry()
-            .with(env_filter)
-            .with(fmt_layer)
-            .with(access_layer)
-            .init();
+        tracing_subscriber::registry().with(env_filter).with(fmt_layer).with(access_layer).init();
         Some(guard)
     };
 
@@ -214,18 +220,66 @@ fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
     let _dll_guard = ephpm_php::windows_dll::extract_php_dll()
         .context("failed to extract embedded php8embed.dll")?;
 
+    // Build the effective PHP ini file. If the user specified ini_overrides
+    // in the config, we have to materialize them on disk and load them via
+    // PHP's normal ini path: setting them at runtime via zend_alter_ini_entry
+    // only updates the calling thread's per-thread globals, which doesn't
+    // propagate to tokio worker threads under ZTS. Loading a real .ini file
+    // routes through MINIT, where values land in the shared ini directives
+    // table that every new TSRM thread sees.
+    // disable_functions only takes effect during PHP's MINIT
+    // (zend_disable_functions reads the ini value once and removes the
+    // entries from CG(function_table)). Setting it via runtime
+    // zend_alter_ini_entry just changes the ini string and leaves the
+    // functions callable, so vhost-mode disable_shell_exec needs to ride
+    // along on the generated ini instead of the per-request ini hook.
+    let vhost_disable_shell =
+        config.server.sites_dir.is_some() && config.server.security.disable_shell_exec;
+    let want_generated_ini = !config.php.ini_overrides.is_empty() || vhost_disable_shell;
+
+    let (effective_ini_path, _generated_ini_guard): (Option<PathBuf>, Option<TempFileGuard>) =
+        if want_generated_ini {
+            use std::fmt::Write as _;
+
+            let mut content = String::new();
+            if let Some(base) = &config.php.ini_file {
+                let base_content = std::fs::read_to_string(base).with_context(|| {
+                    format!("failed to read php.ini file at {}", base.display())
+                })?;
+                content.push_str(&base_content);
+                if !content.ends_with('\n') {
+                    content.push('\n');
+                }
+            }
+            for [k, v] in &config.php.ini_overrides {
+                let _ = writeln!(content, "{k}={v}");
+            }
+            if vhost_disable_shell {
+                let _ = writeln!(
+                    content,
+                    "disable_functions=exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec"
+                );
+            }
+            let temp_path =
+                std::env::temp_dir().join(format!("ephpm-{}-overrides.ini", std::process::id()));
+            std::fs::write(&temp_path, content).with_context(|| {
+                format!("failed to write generated php.ini at {}", temp_path.display())
+            })?;
+            (Some(temp_path.clone()), Some(TempFileGuard::new(temp_path)))
+        } else {
+            (config.php.ini_file.clone(), None)
+        };
+
     // Initialize PHP BEFORE creating tokio runtime (single-threaded here).
     // finalize_for_http() disables SIGPROF so it can't crash worker threads.
-    ephpm_php::PhpRuntime::init_with_ini_file(config.php.ini_file.as_deref())
+    ephpm_php::PhpRuntime::init_with_ini_file(effective_ini_path.as_deref())
         .context("failed to initialize PHP runtime")?;
     ephpm_php::PhpRuntime::finalize_for_http()
         .context("failed to finalize PHP runtime for HTTP")?;
 
     // Now safe to create the multi-threaded tokio runtime
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-    let result = rt.block_on(async {
-        ephpm_server::serve(config).await
-    });
+    let result = rt.block_on(async { ephpm_server::serve(config).await });
 
     // Shutdown PHP runtime
     ephpm_php::PhpRuntime::shutdown().context("failed to shutdown PHP runtime")?;
@@ -238,17 +292,14 @@ fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
 /// Called before tracing is initialized, so no logging here.
 /// Returns `(config, verbose_level)`.
 fn load_serve_config(command: Option<Commands>) -> anyhow::Result<(ephpm_config::Config, u8)> {
-    let Commands::Serve {
-        config,
-        listen,
-        document_root,
-        verbose,
-    } = command.unwrap_or(Commands::Serve {
-        config: PathBuf::from("ephpm.toml"),
-        listen: None,
-        document_root: None,
-        verbose: 0,
-    }) else {
+    let Commands::Serve { config, listen, document_root, verbose } =
+        command.unwrap_or(Commands::Serve {
+            config: PathBuf::from("ephpm.toml"),
+            listen: None,
+            document_root: None,
+            verbose: 0,
+        })
+    else {
         unreachable!("load_serve_config called with non-Serve command");
     };
 
@@ -299,10 +350,7 @@ async fn kv_connect(host: &str, port: u16) -> anyhow::Result<TcpStream> {
 /// Send a RESP frame to the server.
 async fn kv_send(stream: &mut TcpStream, frame: &Frame) -> anyhow::Result<()> {
     let bytes = frame.to_bytes();
-    stream
-        .write_all(&bytes)
-        .await
-        .context("failed to write command to KV server")
+    stream.write_all(&bytes).await.context("failed to write command to KV server")
 }
 
 /// Receive a RESP frame from the server.
@@ -310,16 +358,11 @@ async fn kv_recv(stream: &mut TcpStream) -> anyhow::Result<Frame> {
     let mut buf = BytesMut::with_capacity(4096);
     loop {
         buf.reserve(512);
-        let n = stream
-            .read_buf(&mut buf)
-            .await
-            .context("failed to read from KV server")?;
+        let n = stream.read_buf(&mut buf).await.context("failed to read from KV server")?;
         if n == 0 {
             anyhow::bail!("KV server closed connection unexpectedly");
         }
-        if let Some(frame) = parse_frame(&mut buf)
-            .context("invalid RESP data from KV server")?
-        {
+        if let Some(frame) = parse_frame(&mut buf).context("invalid RESP data from KV server")? {
             return Ok(frame);
         }
     }
@@ -350,10 +393,8 @@ async fn kv_ping(host: &str, port: u16) -> anyhow::Result<ExitCode> {
 
 /// KEYS command.
 async fn kv_keys(host: &str, port: u16, pattern: &str) -> anyhow::Result<ExitCode> {
-    let cmd = Frame::Array(vec![
-        Frame::bulk(b"KEYS".to_vec()),
-        Frame::bulk(pattern.as_bytes().to_vec()),
-    ]);
+    let cmd =
+        Frame::Array(vec![Frame::bulk(b"KEYS".to_vec()), Frame::bulk(pattern.as_bytes().to_vec())]);
     match kv_roundtrip(host, port, cmd).await? {
         Frame::Array(items) => {
             if items.is_empty() {
@@ -378,10 +419,8 @@ async fn kv_keys(host: &str, port: u16, pattern: &str) -> anyhow::Result<ExitCod
 
 /// GET command.
 async fn kv_get(host: &str, port: u16, key: &str) -> anyhow::Result<ExitCode> {
-    let cmd = Frame::Array(vec![
-        Frame::bulk(b"GET".to_vec()),
-        Frame::bulk(key.as_bytes().to_vec()),
-    ]);
+    let cmd =
+        Frame::Array(vec![Frame::bulk(b"GET".to_vec()), Frame::bulk(key.as_bytes().to_vec())]);
     match kv_roundtrip(host, port, cmd).await? {
         Frame::Bulk(data) => {
             match std::str::from_utf8(&data) {
@@ -460,10 +499,7 @@ async fn kv_del(host: &str, port: u16, keys: &[String]) -> anyhow::Result<ExitCo
 /// INCR command.
 async fn kv_incr(host: &str, port: u16, key: &str, by: i64) -> anyhow::Result<ExitCode> {
     let cmd = if by == 1 {
-        Frame::Array(vec![
-            Frame::bulk(b"INCR".to_vec()),
-            Frame::bulk(key.as_bytes().to_vec()),
-        ])
+        Frame::Array(vec![Frame::bulk(b"INCR".to_vec()), Frame::bulk(key.as_bytes().to_vec())])
     } else {
         Frame::Array(vec![
             Frame::bulk(b"INCRBY".to_vec()),
@@ -491,10 +527,7 @@ async fn kv_ttl(host: &str, port: u16, key: &str) -> anyhow::Result<ExitCode> {
     // Send TTL
     kv_send(
         &mut stream,
-        &Frame::Array(vec![
-            Frame::bulk(b"TTL".to_vec()),
-            Frame::bulk(key.as_bytes().to_vec()),
-        ]),
+        &Frame::Array(vec![Frame::bulk(b"TTL".to_vec()), Frame::bulk(key.as_bytes().to_vec())]),
     )
     .await?;
     let ttl_frame = kv_recv(&mut stream).await?;
@@ -502,10 +535,7 @@ async fn kv_ttl(host: &str, port: u16, key: &str) -> anyhow::Result<ExitCode> {
     // Send PTTL on the same connection
     kv_send(
         &mut stream,
-        &Frame::Array(vec![
-            Frame::bulk(b"PTTL".to_vec()),
-            Frame::bulk(key.as_bytes().to_vec()),
-        ]),
+        &Frame::Array(vec![Frame::bulk(b"PTTL".to_vec()), Frame::bulk(key.as_bytes().to_vec())]),
     )
     .await?;
     let pttl_frame = kv_recv(&mut stream).await?;

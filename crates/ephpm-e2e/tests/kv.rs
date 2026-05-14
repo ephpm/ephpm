@@ -48,11 +48,13 @@ async fn kv_set_get_roundtrip() {
 async fn kv_ttl_expiry() {
     let base = required_env("EPHPM_URL");
 
-    let (s, _) = kv(&base, "op=set&key=ttl_exp&val=present&ttl=50").await;
+    // ephpm_kv_set takes the TTL in seconds (Redis convention), so the
+    // shortest expiry we can request is 1 s. Sleep slightly longer to
+    // tolerate scheduler jitter without ever being flaky early.
+    let (s, _) = kv(&base, "op=set&key=ttl_exp&val=present&ttl=1").await;
     assert_eq!(s, 200);
 
-    // Wait for the 50 ms TTL to expire
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
 
     let (s, body) = kv(&base, "op=get&key=ttl_exp").await;
     assert_eq!(s, 200);

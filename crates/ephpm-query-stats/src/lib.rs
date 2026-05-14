@@ -30,11 +30,7 @@ pub struct StatsConfig {
 
 impl Default for StatsConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            slow_query_threshold: Duration::from_secs(1),
-            max_digests: 100_000,
-        }
+        Self { enabled: true, slow_query_threshold: Duration::from_secs(1), max_digests: 100_000 }
     }
 }
 
@@ -97,10 +93,7 @@ impl QueryStats {
     /// Create a new stats collector with the given configuration.
     #[must_use]
     pub fn new(config: StatsConfig) -> Self {
-        Self {
-            entries: Arc::new(DashMap::new()),
-            config,
-        }
+        Self { entries: Arc::new(DashMap::new()), config }
     }
 
     /// Record a completed query (SELECT, SHOW, etc.).
@@ -122,12 +115,9 @@ impl QueryStats {
     /// Snapshot of all tracked digests, sorted by total time descending.
     #[must_use]
     pub fn top_queries(&self, limit: usize) -> Vec<DigestEntry> {
-        let mut entries: Vec<DigestEntry> = self
-            .entries
-            .iter()
-            .map(|r| r.value().clone())
-            .collect();
-        entries.sort_by(|a, b| b.total_time.cmp(&a.total_time));
+        let mut entries: Vec<DigestEntry> =
+            self.entries.iter().map(|r| r.value().clone()).collect();
+        entries.sort_by_key(|e| std::cmp::Reverse(e.total_time));
         entries.truncate(limit);
         entries
     }
@@ -274,7 +264,12 @@ mod tests {
     fn separate_digests_for_different_queries() {
         let stats = QueryStats::new(StatsConfig::default());
         stats.record_query("SELECT * FROM users WHERE id = 1", Duration::from_millis(1), true, 1);
-        stats.record_mutation("INSERT INTO users VALUES (1, 'a')", Duration::from_millis(2), true, 1);
+        stats.record_mutation(
+            "INSERT INTO users VALUES (1, 'a')",
+            Duration::from_millis(2),
+            true,
+            1,
+        );
 
         assert_eq!(stats.digest_count(), 2);
     }
@@ -306,10 +301,7 @@ mod tests {
 
     #[test]
     fn max_digests_enforced() {
-        let config = StatsConfig {
-            max_digests: 3,
-            ..Default::default()
-        };
+        let config = StatsConfig { max_digests: 3, ..Default::default() };
         let stats = QueryStats::new(config);
 
         for i in 0..10 {
@@ -385,10 +377,7 @@ mod tests {
 
     #[test]
     fn disabled_stats_records_nothing() {
-        let config = StatsConfig {
-            enabled: false,
-            ..Default::default()
-        };
+        let config = StatsConfig { enabled: false, ..Default::default() };
         let stats = QueryStats::new(config);
         stats.record_query("SELECT * FROM t WHERE id = 1", Duration::from_millis(5), true, 1);
         stats.record_mutation("INSERT INTO t VALUES (1)", Duration::from_millis(2), true, 1);

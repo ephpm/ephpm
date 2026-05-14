@@ -3,16 +3,14 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ephpm_cluster::node::{start_gossip, ClusterHandle, NodeState};
 use ephpm_cluster::ClusteredStore;
+use ephpm_cluster::node::{ClusterHandle, NodeState, start_gossip};
 use ephpm_config::{ClusterConfig, ClusterKvConfig};
 use ephpm_kv::store::{Store, StoreConfig};
 
 /// Allocate a random UDP port by binding to :0 and immediately closing.
 async fn random_udp_port() -> u16 {
-    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
-        .await
-        .expect("bind failed");
+    let sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind failed");
     sock.local_addr().expect("local_addr failed").port()
 }
 
@@ -27,9 +25,7 @@ async fn start_node(port: u16, seeds: Vec<String>, node_id: &str) -> ClusterHand
         cluster_id: "test-cluster".to_string(),
         kv: ClusterKvConfig::default(),
     };
-    start_gossip(&config)
-        .await
-        .unwrap_or_else(|e| panic!("gossip start failed for {node_id}: {e}"))
+    start_gossip(&config).await.unwrap_or_else(|e| panic!("gossip start failed for {node_id}: {e}"))
 }
 
 /// Create a local KV store with defaults.
@@ -51,12 +47,7 @@ async fn wait_for_convergence(handles: &[&ClusterHandle], expected: usize, timeo
     loop {
         let mut all_ok = true;
         for h in handles {
-            let alive = h
-                .nodes()
-                .await
-                .iter()
-                .filter(|n| n.state == NodeState::Alive)
-                .count();
+            let alive = h.nodes().await.iter().filter(|n| n.state == NodeState::Alive).count();
             if alive != expected {
                 all_ok = false;
                 break;
@@ -65,10 +56,7 @@ async fn wait_for_convergence(handles: &[&ClusterHandle], expected: usize, timeo
         if all_ok {
             return;
         }
-        assert!(
-            start.elapsed() <= timeout,
-            "convergence timeout after {timeout:?}",
-        );
+        assert!(start.elapsed() <= timeout, "convergence timeout after {timeout:?}");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
@@ -82,10 +70,7 @@ async fn small_value_routes_via_gossip() {
     let port = random_udp_port().await;
     let handle = Arc::new(start_node(port, vec![], "route-small").await);
     let store = local_store();
-    let config = ClusterKvConfig {
-        small_key_threshold: 64,
-        ..ClusterKvConfig::default()
-    };
+    let config = ClusterKvConfig { small_key_threshold: 64, ..ClusterKvConfig::default() };
 
     let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
 
@@ -112,10 +97,7 @@ async fn large_value_routes_to_local_store() {
     let port = random_udp_port().await;
     let handle = Arc::new(start_node(port, vec![], "route-large").await);
     let store = local_store();
-    let config = ClusterKvConfig {
-        small_key_threshold: 8,
-        ..ClusterKvConfig::default()
-    };
+    let config = ClusterKvConfig { small_key_threshold: 8, ..ClusterKvConfig::default() };
 
     let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
 
@@ -151,8 +133,7 @@ async fn small_value_replicates_via_clustered_store() {
     let cs2 = ClusteredStore::new(local_store(), Arc::clone(&h2), ClusterKvConfig::default());
 
     // Set on node1's clustered store.
-    cs1.set("replicated".to_string(), b"data".to_vec(), None)
-        .await;
+    cs1.set("replicated".to_string(), b"data".to_vec(), None).await;
 
     // Wait for node2 to see it via gossip.
     let start = Instant::now();
@@ -161,10 +142,7 @@ async fn small_value_replicates_via_clustered_store() {
             assert_eq!(val, b"data");
             break;
         }
-        assert!(
-            start.elapsed() <= Duration::from_secs(10),
-            "replication timeout",
-        );
+        assert!(start.elapsed() <= Duration::from_secs(10), "replication timeout");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
@@ -179,10 +157,7 @@ async fn exists_checks_both_tiers() {
     let port = random_udp_port().await;
     let handle = Arc::new(start_node(port, vec![], "exists-test").await);
     let store = local_store();
-    let config = ClusterKvConfig {
-        small_key_threshold: 16,
-        ..ClusterKvConfig::default()
-    };
+    let config = ClusterKvConfig { small_key_threshold: 16, ..ClusterKvConfig::default() };
 
     let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
 
@@ -204,10 +179,7 @@ async fn remove_from_both_tiers() {
     let port = random_udp_port().await;
     let handle = Arc::new(start_node(port, vec![], "rm-test").await);
     let store = local_store();
-    let config = ClusterKvConfig {
-        small_key_threshold: 16,
-        ..ClusterKvConfig::default()
-    };
+    let config = ClusterKvConfig { small_key_threshold: 16, ..ClusterKvConfig::default() };
 
     let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
 
@@ -384,20 +356,12 @@ async fn pttl_gossip_tier_key() {
     let port = random_udp_port().await;
     let handle = Arc::new(start_node(port, vec![], "pttl-gossip").await);
     let store = local_store();
-    let config = ClusterKvConfig {
-        small_key_threshold: 64,
-        ..ClusterKvConfig::default()
-    };
+    let config = ClusterKvConfig { small_key_threshold: 64, ..ClusterKvConfig::default() };
 
     let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
 
     // Small key with TTL → gossip tier
-    cs.set(
-        "tiny-ttl".to_string(),
-        b"val".to_vec(),
-        Some(Duration::from_secs(60)),
-    )
-    .await;
+    cs.set("tiny-ttl".to_string(), b"val".to_vec(), Some(Duration::from_secs(60))).await;
 
     let pttl = cs.pttl("tiny-ttl").await;
     assert!(pttl.is_some(), "gossip key with TTL should have pttl");
@@ -413,17 +377,13 @@ async fn pttl_local_store_key() {
     let port = random_udp_port().await;
     let handle = Arc::new(start_node(port, vec![], "pttl-local").await);
     let store = local_store();
-    let config = ClusterKvConfig {
-        small_key_threshold: 8,
-        ..ClusterKvConfig::default()
-    };
+    let config = ClusterKvConfig { small_key_threshold: 8, ..ClusterKvConfig::default() };
 
     let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
 
     // Large key with TTL → local store
     let big = vec![0u8; 100];
-    cs.set("big-ttl".to_string(), big, Some(Duration::from_secs(120)))
-        .await;
+    cs.set("big-ttl".to_string(), big, Some(Duration::from_secs(120))).await;
 
     let pttl = cs.pttl("big-ttl").await;
     assert!(pttl.is_some(), "local key with TTL should have pttl");
@@ -440,11 +400,8 @@ async fn pttl_missing_key_returns_none() {
     let handle = Arc::new(start_node(port, vec![], "pttl-miss").await);
     let store = local_store();
 
-    let cs = ClusteredStore::new(
-        Arc::clone(&store),
-        Arc::clone(&handle),
-        ClusterKvConfig::default(),
-    );
+    let cs =
+        ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), ClusterKvConfig::default());
 
     // pttl for non-existent key should return None (or -2 via local store).
     // The ClusteredStore checks gossip first (returns None), then local store.
@@ -469,7 +426,8 @@ async fn local_store_accessor_returns_correct_store() {
     let handle = Arc::new(start_node(port, vec![], "accessor").await);
     let store = local_store();
 
-    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), ClusterKvConfig::default());
+    let cs =
+        ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), ClusterKvConfig::default());
 
     // Write directly to local store, verify via accessor.
     store.set("direct".to_string(), b"value".to_vec(), None);
@@ -485,7 +443,8 @@ async fn set_returns_true_on_success() {
     let handle = Arc::new(start_node(port, vec![], "set-ok").await);
     let store = local_store();
 
-    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), ClusterKvConfig::default());
+    let cs =
+        ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), ClusterKvConfig::default());
 
     // Both small and large values should succeed.
     let small_ok = cs.set("s".to_string(), b"x".to_vec(), None).await;

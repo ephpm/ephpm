@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use ephpm_cluster::node::{start_gossip, ClusterHandle, NodeState};
+use ephpm_cluster::node::{ClusterHandle, NodeState, start_gossip};
 use ephpm_config::{ClusterConfig, ClusterKvConfig};
 
 /// Allocate a random UDP port by binding to :0 and immediately closing.
@@ -13,9 +13,7 @@ async fn random_udp_port() -> u16 {
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("failed to bind UDP socket for port allocation");
-    sock.local_addr()
-        .expect("failed to get local addr")
-        .port()
+    sock.local_addr().expect("failed to get local addr").port()
 }
 
 /// Start a gossip node on the given port with the given seeds.
@@ -35,20 +33,13 @@ async fn start_node(port: u16, seeds: Vec<String>, node_id: &str) -> ClusterHand
 }
 
 /// Poll until all handles see `expected` alive nodes, or panic after `timeout`.
-async fn wait_for_convergence(
-    handles: &[&ClusterHandle],
-    expected: usize,
-    timeout: Duration,
-) {
+async fn wait_for_convergence(handles: &[&ClusterHandle], expected: usize, timeout: Duration) {
     let start = Instant::now();
     loop {
         let mut all_converged = true;
         for handle in handles {
             let nodes = handle.nodes().await;
-            let alive_count = nodes
-                .iter()
-                .filter(|n| n.state == NodeState::Alive)
-                .count();
+            let alive_count = nodes.iter().filter(|n| n.state == NodeState::Alive).count();
             if alive_count != expected {
                 all_converged = false;
                 break;
@@ -68,9 +59,7 @@ async fn wait_for_convergence(
                     nodes,
                 );
             }
-            panic!(
-                "gossip did not converge to {expected} alive nodes within {timeout:?}"
-            );
+            panic!("gossip did not converge to {expected} alive nodes within {timeout:?}");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -108,22 +97,12 @@ async fn three_nodes_discover_each_other() {
     let node3 = start_node(port3, vec![seed], "node-3").await;
 
     // Wait for all three to see each other.
-    wait_for_convergence(
-        &[&node1, &node2, &node3],
-        3,
-        Duration::from_secs(10),
-    )
-    .await;
+    wait_for_convergence(&[&node1, &node2, &node3], 3, Duration::from_secs(10)).await;
 
     // Verify all nodes are alive.
     for handle in [&node1, &node2, &node3] {
         let members = handle.nodes().await;
-        assert_eq!(
-            members.len(),
-            3,
-            "{} sees wrong count: {members:?}",
-            handle.self_node().id,
-        );
+        assert_eq!(members.len(), 3, "{} sees wrong count: {members:?}", handle.self_node().id);
         assert!(
             members.iter().all(|n| n.state == NodeState::Alive),
             "all nodes should be alive: {members:?}",
@@ -209,8 +188,7 @@ async fn gossip_kv_ttl_expiry() {
     let node = start_node(port, vec![], "kv-ttl").await;
 
     // Set with a very short TTL.
-    node.gossip_set("ephemeral", b"data", Some(Duration::from_millis(200)))
-        .await;
+    node.gossip_set("ephemeral", b"data", Some(Duration::from_millis(200))).await;
 
     // Should be readable immediately.
     assert!(node.gossip_get("ephemeral").await.is_some());
@@ -301,10 +279,7 @@ async fn gossip_kv_delete_not_owned_returns_false() {
         if node2.gossip_get("owned-by-1").await.is_some() {
             break;
         }
-        assert!(
-            start.elapsed() <= Duration::from_secs(10),
-            "key did not replicate",
-        );
+        assert!(start.elapsed() <= Duration::from_secs(10), "key did not replicate");
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
@@ -338,8 +313,7 @@ async fn gossip_kv_pttl_returns_remaining_ms() {
     let node = start_node(port, vec![], "pttl-test").await;
 
     // Key with TTL
-    node.gossip_set("ttl-key", b"val", Some(Duration::from_secs(60)))
-        .await;
+    node.gossip_set("ttl-key", b"val", Some(Duration::from_secs(60))).await;
     let pttl = node.gossip_pttl("ttl-key").await;
     assert!(pttl.is_some(), "TTL key should have pttl");
     let ms = pttl.unwrap();
@@ -347,16 +321,10 @@ async fn gossip_kv_pttl_returns_remaining_ms() {
 
     // Key without TTL
     node.gossip_set("no-ttl", b"val", None).await;
-    assert!(
-        node.gossip_pttl("no-ttl").await.is_none(),
-        "key without TTL should return None"
-    );
+    assert!(node.gossip_pttl("no-ttl").await.is_none(), "key without TTL should return None");
 
     // Missing key
-    assert!(
-        node.gossip_pttl("missing").await.is_none(),
-        "missing key should return None"
-    );
+    assert!(node.gossip_pttl("missing").await.is_none(), "missing key should return None");
 
     node.shutdown().await;
 }
@@ -388,10 +356,7 @@ async fn gossip_kv_exists_false_after_delete() {
     assert!(node.gossip_exists("ephemeral").await);
 
     node.gossip_del("ephemeral").await;
-    assert!(
-        !node.gossip_exists("ephemeral").await,
-        "deleted key should not exist"
-    );
+    assert!(!node.gossip_exists("ephemeral").await, "deleted key should not exist");
 
     node.shutdown().await;
 }

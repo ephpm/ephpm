@@ -12,7 +12,7 @@ env:
 jobs:
   fmt:
     name: Format
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -22,33 +22,32 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
-      - name: Checkout litewire (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: ephpm/litewire
-          path: ../litewire
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config libssl-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
-  test:
-    name: Test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  test-linux:
+    name: Test (linux-x64)
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
-      - name: Checkout litewire (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: ephpm/litewire
-          path: ../litewire
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace
+
+  test-macos:
+    name: Test (macos-arm64)
+    runs-on: [self-hosted, macos, arm64]
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -56,12 +55,10 @@ jobs:
 
   deny:
     name: Cargo Deny
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
-      - name: Checkout litewire (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: ephpm/litewire
-          path: ../litewire
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --locked cargo-deny
+      - run: cargo deny check

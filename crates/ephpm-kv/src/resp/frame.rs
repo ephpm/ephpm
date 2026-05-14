@@ -3,8 +3,9 @@
 //! Implements the Redis Serialization Protocol as described in
 //! <https://redis.io/docs/reference/protocol-spec/>.
 
-use bytes::{BufMut, BytesMut};
 use std::fmt;
+
+use bytes::{BufMut, BytesMut};
 
 /// A single RESP protocol frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,10 +168,7 @@ mod tests {
 
     #[test]
     fn serialize_array() {
-        let f = Frame::Array(vec![
-            Frame::bulk("GET"),
-            Frame::bulk("key"),
-        ]);
+        let f = Frame::Array(vec![Frame::bulk("GET"), Frame::bulk("key")]);
         assert_eq!(&f.to_bytes()[..], b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n");
     }
 

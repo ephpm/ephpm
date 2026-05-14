@@ -9,8 +9,8 @@ pub mod sapi;
 #[cfg(all(php_linked, target_os = "windows"))]
 pub mod windows_dll;
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use request::PhpRequest;
 use response::PhpResponse;
@@ -79,18 +79,14 @@ mod ffi {
         ) -> ::std::os::raw::c_int;
 
         /// Get the captured output buffer. Sets `*out_len` to the length.
-        pub fn ephpm_get_output_buf(
-            out_len: *mut usize,
-        ) -> *const ::std::os::raw::c_char;
+        pub fn ephpm_get_output_buf(out_len: *mut usize) -> *const ::std::os::raw::c_char;
 
         /// Get the HTTP response status code.
         pub fn ephpm_get_response_code() -> ::std::os::raw::c_int;
 
         /// Get the captured response headers ("Name: Value\n" lines).
         /// Sets `*out_len` to the length.
-        pub fn ephpm_get_response_headers(
-            out_len: *mut usize,
-        ) -> *const ::std::os::raw::c_char;
+        pub fn ephpm_get_response_headers(out_len: *mut usize) -> *const ::std::os::raw::c_char;
 
         // ── ZTS thread lifecycle ────────────────────────────────────
 
@@ -107,8 +103,10 @@ mod ffi {
 
         // ── CLI mode functions ──────────────────────────────────────
 
-        /// Register `additional_functions` (KV native functions) on
-        /// `php_embed_module`. Must be called BEFORE `php_embed_init()`.
+        /// Install our embed module-startup shim so the KV native functions
+        /// (`ephpm_kv_get` etc.) get registered during PHP's module init.
+        /// Must be called BEFORE `php_embed_init()` — see the C wrapper for
+        /// the full ZTS-aware rationale.
         pub fn ephpm_pre_init();
 
         /// Set a custom php.ini file path. Must be called BEFORE
@@ -117,9 +115,7 @@ mod ffi {
 
         /// Set the KV ops function pointer table. Can be called after
         /// `php_embed_init()`, before any PHP scripts execute.
-        pub fn ephpm_set_kv_ops(
-            ops: *const crate::kv_bridge::EphpmKvOps,
-        );
+        pub fn ephpm_set_kv_ops(ops: *const crate::kv_bridge::EphpmKvOps);
 
         /// Get the PHP version string (compile-time constant).
         /// Safe to call before `php_embed_init()`.
@@ -225,9 +221,10 @@ impl PhpRuntime {
         {
             use std::ffi::CString;
 
-            // Register KV native functions on php_embed_module.additional_functions.
-            // Safety: Must be called before php_embed_init() so php_module_startup()
-            // registers the functions. No PHP state exists yet.
+            // Install our embed module-startup shim so KV functions land in
+            // GLOBAL_FUNCTION_TABLE before any tokio worker thread copies it.
+            // Safety: must run before php_embed_init() so the shim is installed
+            // when embed's startup callback is invoked. No PHP state exists yet.
             unsafe { ffi::ephpm_pre_init() };
 
             // Keep the CString alive until php_embed_init() completes so the
@@ -358,9 +355,7 @@ impl PhpRuntime {
         // PHP_VERSION string constant, which is valid for the entire process.
         let ptr = unsafe { ffi::ephpm_get_php_version() };
         // Safety: PHP_VERSION is a valid UTF-8 C string literal.
-        unsafe { std::ffi::CStr::from_ptr(ptr) }
-            .to_str()
-            .unwrap_or("unknown")
+        unsafe { std::ffi::CStr::from_ptr(ptr) }.to_str().unwrap_or("unknown")
     }
 
     /// Get the embedded PHP version string (stub mode).
@@ -398,9 +393,10 @@ impl PhpRuntime {
             let mut c_args: Vec<CString> = Vec::with_capacity(args.len() + 1);
             c_args.push(CString::new("ephpm").unwrap());
             for arg in args {
-                c_args.push(CString::new(arg.as_str()).map_err(|e| {
-                    PhpError::ExecutionFailed(format!("invalid argument: {e}"))
-                })?);
+                c_args
+                    .push(CString::new(arg.as_str()).map_err(|e| {
+                        PhpError::ExecutionFailed(format!("invalid argument: {e}"))
+                    })?);
             }
 
             let mut argv_ptrs: Vec<*mut std::os::raw::c_char> =
@@ -541,11 +537,8 @@ impl PhpRuntime {
             .map_err(|e| PhpError::ExecutionFailed(format!("invalid script path: {e}")))?;
 
         // Pass POST body — use null pointer for empty bodies
-        let post_data_ptr = if request.body.is_empty() {
-            std::ptr::null()
-        } else {
-            request.body.as_ptr().cast()
-        };
+        let post_data_ptr =
+            if request.body.is_empty() { std::ptr::null() } else { request.body.as_ptr().cast() };
 
         // Set core request info in C
         // Safety: All CString pointers are valid and will stay alive.
@@ -624,15 +617,11 @@ impl PhpRuntime {
 
         match ret {
             0 => Ok(PhpResponse { status, headers, body }),
-            -1 => Err(PhpError::ExecutionFailed(
-                "php_request_startup failed".into(),
-            )),
+            -1 => Err(PhpError::ExecutionFailed("php_request_startup failed".into())),
             _ => {
                 // Bailout (exit/die/fatal): return whatever output was captured
                 if body.is_empty() {
-                    Err(PhpError::ExecutionFailed(
-                        "PHP bailout (fatal error or exit)".into(),
-                    ))
+                    Err(PhpError::ExecutionFailed("PHP bailout (fatal error or exit)".into()))
                 } else {
                     // exit() and die() are common in PHP — return the output
                     Ok(PhpResponse { status, headers, body })
@@ -678,6 +667,17 @@ impl PhpRuntime {
     /// Common use: `open_basedir` and `disable_functions` for vhost isolation.
     #[cfg(php_linked)]
     pub fn set_request_ini(key: &str, value: &str) {
+        if !PHP_INITIALIZED.load(Ordering::Acquire) {
+            return;
+        }
+        // ephpm_request_set_ini reaches zend_string_init -> _emalloc, which
+        // requires the per-thread Zend allocator. Without TSRM registration
+        // the thread's executor_globals are uninitialised and _emalloc
+        // segfaults. Register first so the API is safe to call before
+        // execute().
+        if Self::ensure_thread_registered().is_err() {
+            return;
+        }
         let c_key = std::ffi::CString::new(key).expect("INI key contains null byte");
         let c_val = std::ffi::CString::new(value).expect("INI value contains null byte");
         // SAFETY: c_key and c_val are valid null-terminated C strings.
@@ -771,10 +771,7 @@ mod tests {
 
         let response = PhpRuntime::execute(make_test_request()).unwrap();
         assert_eq!(response.status, 200);
-        assert!(response
-            .headers
-            .iter()
-            .any(|(k, v)| k == "Content-Type" && v == "text/html"));
+        assert!(response.headers.iter().any(|(k, v)| k == "Content-Type" && v == "text/html"));
         let body = String::from_utf8(response.body).unwrap();
         assert!(body.contains("ePHPm Stub"));
         assert!(body.contains("test.php"));
@@ -788,9 +785,6 @@ mod tests {
         let _ = PhpRuntime::shutdown();
 
         let err = PhpRuntime::execute(make_test_request()).unwrap_err();
-        assert!(
-            matches!(err, PhpError::NotInitialized),
-            "expected NotInitialized, got {err}"
-        );
+        assert!(matches!(err, PhpError::NotInitialized), "expected NotInitialized, got {err}");
     }
 }

@@ -46,24 +46,21 @@ impl DbUrl {
         let default_port: u16 = if scheme == "mysql" { 3306 } else { 5432 };
 
         // Split user:pass@host:port/db
-        let (auth, host_path) = rest
-            .split_once('@')
-            .ok_or_else(|| DbError::InvalidUrl("missing '@' in URL".into()))?;
+        let (auth, host_path) =
+            rest.split_once('@').ok_or_else(|| DbError::InvalidUrl("missing '@' in URL".into()))?;
 
         let (username, password) = auth.split_once(':').unwrap_or((auth, ""));
 
         let (host_port, database) = host_path.split_once('/').unwrap_or((host_path, ""));
 
-        let (host, port_str) = host_port
-            .rsplit_once(':')
-            .unwrap_or((host_port, ""));
+        let (host, port_str) = host_port.rsplit_once(':').unwrap_or((host_port, ""));
 
         let port: u16 = if port_str.is_empty() {
             default_port
         } else {
-            port_str.parse().map_err(|_| {
-                DbError::InvalidUrl(format!("invalid port '{port_str}'"))
-            })?
+            port_str
+                .parse()
+                .map_err(|_| DbError::InvalidUrl(format!("invalid port '{port_str}'")))?
         };
 
         let host = if host.is_empty() { "127.0.0.1" } else { host };

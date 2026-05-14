@@ -76,41 +76,32 @@ mod tests {
         });
     }
 
-    /// Generate a self-signed RSA cert+key pair using openssl CLI.
+    /// Generate a self-signed RSA cert+key pair using rcgen.
     fn generate_rsa_cert(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
-        let cert = dir.join("cert.pem");
-        let key = dir.join("key.pem");
-        let status = std::process::Command::new("openssl")
-            .args([
-                "req", "-x509", "-newkey", "rsa:2048", "-keyout",
-            ])
-            .arg(&key)
-            .args(["-out"])
-            .arg(&cert)
-            .args(["-days", "1", "-nodes", "-subj", "/CN=localhost"])
-            .output()
-            .expect("openssl must be available");
-        assert!(status.status.success(), "openssl cert generation failed");
-        (cert, key)
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+            .expect("generate RSA-2048 key pair");
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("build cert params");
+        let cert = params.self_signed(&key_pair).expect("self-sign RSA cert");
+        std::fs::write(&cert_path, cert.pem()).expect("write RSA cert");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write RSA key");
+        (cert_path, key_path)
     }
 
-    /// Generate a self-signed EC cert+key pair using openssl CLI.
+    /// Generate a self-signed EC (P-256) cert+key pair using rcgen.
     fn generate_ec_cert(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
-        let cert = dir.join("ec-cert.pem");
-        let key = dir.join("ec-key.pem");
-        let status = std::process::Command::new("openssl")
-            .args([
-                "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
-                "-keyout",
-            ])
-            .arg(&key)
-            .args(["-out"])
-            .arg(&cert)
-            .args(["-days", "1", "-nodes", "-subj", "/CN=localhost"])
-            .output()
-            .expect("openssl must be available");
-        assert!(status.status.success(), "openssl EC cert generation failed");
-        (cert, key)
+        let cert_path = dir.join("ec-cert.pem");
+        let key_path = dir.join("ec-key.pem");
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("generate ECDSA P-256 key pair");
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("build cert params");
+        let cert = params.self_signed(&key_pair).expect("self-sign EC cert");
+        std::fs::write(&cert_path, cert.pem()).expect("write EC cert");
+        std::fs::write(&key_path, key_pair.serialize_pem()).expect("write EC key");
+        (cert_path, key_path)
     }
 
     #[test]
@@ -160,12 +151,12 @@ mod tests {
         let cert = dir.path().join("bad-cert.pem");
         let (_, key) = generate_rsa_cert(dir.path());
         std::fs::write(&cert, "not a real PEM certificate").unwrap();
-        let err = build_tls_acceptor(&cert, &key)
-            .err()
-            .expect("should fail with invalid cert");
+        let err = build_tls_acceptor(&cert, &key).err().expect("should fail with invalid cert");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("invalid TLS") || msg.contains("no private key") || msg.contains("certificate"),
+            msg.contains("invalid TLS")
+                || msg.contains("no private key")
+                || msg.contains("certificate"),
             "unexpected error: {msg}"
         );
     }
@@ -177,9 +168,7 @@ mod tests {
         let (cert, _) = generate_rsa_cert(dir.path());
         let key = dir.path().join("bad-key.pem");
         std::fs::write(&key, "not a real PEM key").unwrap();
-        let err = build_tls_acceptor(&cert, &key)
-            .err()
-            .expect("should fail with invalid key");
+        let err = build_tls_acceptor(&cert, &key).err().expect("should fail with invalid key");
         let msg = format!("{err:#}");
         assert!(msg.contains("no private key"), "unexpected error: {msg}");
     }

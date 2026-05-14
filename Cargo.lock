@@ -1179,6 +1179,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mime_guess",
+ "rcgen",
  "rustls 0.23.37",
  "rustls-acme",
  "rustls-pemfile",

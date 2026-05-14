@@ -1,15 +1,24 @@
 # Multi-stage build for ephpm with embedded PHP.
 #
 # Cache strategy:
-#   base:    System deps + Rust toolchain — changes rarely
-#   php-sdk: PHP SDK via spc — only rebuilds when PHP_VERSION or xtask changes
-#   builder: Cargo manifest fetch (cached until Cargo.lock changes) → full source build
+#   base:    System deps + Rust toolchain — changes rarely.
+#   php-sdk: Single RUN that downloads + extracts the prebuilt PHP SDK from
+#            github.com/ephpm/php-sdk releases. Keyed only on PHP_SDK_VERSION,
+#            so containerd's image layer cache reuses it across all source
+#            changes. Bumping PHP_SDK_VERSION (e.g., 8.5.2 → 8.5.3) is the
+#            only thing that invalidates this ~80 MB layer.
+#   builder: Cargo manifest fetch (cached until Cargo.lock changes) → full source build.
 #
 # Build:
-#   podman build -f docker/Dockerfile --build-arg PHP_VERSION=8.5 -t ephpm:dev .
+#   podman build -f docker/Dockerfile --build-arg PHP_SDK_VERSION=8.5.2 -t ephpm:dev .
+#
+# `cargo xtask e2e` resolves the shorthand (e.g. "8.5") to the pinned full
+# version via xtask::PHP_SDK_VERSIONS and passes it as PHP_SDK_VERSION.
 
-# Global ARG so it can be referenced in FROM lines (each stage re-declares it to use it)
-ARG PHP_VERSION=8.5
+# Pinned full version of the PHP SDK to download. Must match a release tag
+# at github.com/ephpm/php-sdk/releases (e.g., v8.5.2). The default mirrors
+# xtask::PHP_SDK_VERSIONS — keep them in sync if you bump.
+ARG PHP_SDK_VERSION=8.5.2
 
 # ── Stage 1: base — system deps + Rust toolchain ─────────────────────────────
 
@@ -17,26 +26,18 @@ FROM ubuntu:24.04 AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# System build tools for static-php-cli (spc) and musl cross-compilation.
-#
-# The standalone spc binary bundles its own PHP — no system PHP or Composer
-# is needed. `spc doctor --auto-fix` may install additional packages, so we
-# keep apt metadata around (no `rm -rf /var/lib/apt/lists/*`).
-#
-# Key packages:
-#   unzip           — required by spc for extracting downloads
-#   gettext         — provides `autopoint`, checked by spc doctor
-#   musl-tools      — provides musl-gcc cross-compiler
-#   musl-dev        — musl development files and static libraries
-#   gcc-multilib    — 32-bit support for cross-compilation
-#   libstdc++-12-dev — needed for C++ standard library (musl)
-#   libgcc-12-dev   — GCC runtime library (musl)
+# System tools needed by the ephpm Rust build:
+#   - musl-tools / musl-dev: musl-gcc cross-compiler for the
+#     x86_64-unknown-linux-musl target (libphp.a is musl-linked).
+#   - libclang-dev: bindgen needs libclang to parse PHP headers.
+#   - build-essential, pkg-config: cc::Build for ephpm_wrapper.c.
+#   - curl, git, ca-certificates: rustup install + cargo registry.
+#   - tar: extracting the prebuilt PHP SDK tarball in the next stage.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates curl git pkg-config sudo \
-    autoconf automake bison cmake flex gettext libtool make re2c unzip \
-    libclang-dev musl-tools musl-dev gcc-multilib libstdc++-12-dev libgcc-12-dev
+    build-essential ca-certificates curl git pkg-config tar \
+    libclang-dev musl-tools musl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Rust stable
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
@@ -44,87 +45,98 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal
 
-# Install musl target for static linking
 RUN rustup target add x86_64-unknown-linux-musl
 
-# Configure musl cross-compiler environment
 ENV CC_x86_64_unknown_linux_musl=musl-gcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_CC=musl-gcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
 
-# ── Stage 2: php-sdk — rebuilt only when PHP_VERSION or xtask source changes ──
+# ── Stage 2: php-sdk — download prebuilt SDK ─────────────────────────────────
+#
+# Pure shell + curl + tar — NO source COPY before the download — so the
+# resulting image layer is keyed only on the base image and PHP_SDK_VERSION.
+# containerd reuses it indefinitely across feature work / refactors / docs
+# changes. Only a version bump invalidates it.
 
 FROM base AS php-sdk
 
-ARG PHP_VERSION
+ARG PHP_SDK_VERSION
 
-WORKDIR /src
-
-# Workspace manifest + lock + xtask source (the only things needed to run
-# `cargo xtask php-sdk`). Stub Cargo.toml files for every other workspace
-# member keep the resolver happy without pulling in real source.
-COPY Cargo.toml Cargo.lock ./
-COPY .cargo/ .cargo/
-COPY xtask/ xtask/
-COPY crates/ephpm/Cargo.toml          crates/ephpm/Cargo.toml
-COPY crates/ephpm-config/Cargo.toml   crates/ephpm-config/Cargo.toml
-COPY crates/ephpm-server/Cargo.toml   crates/ephpm-server/Cargo.toml
-COPY crates/ephpm-php/Cargo.toml      crates/ephpm-php/Cargo.toml
-COPY crates/ephpm-db/Cargo.toml       crates/ephpm-db/Cargo.toml
-COPY crates/ephpm-kv/Cargo.toml       crates/ephpm-kv/Cargo.toml
-
-# Minimal stub src so cargo can parse (but not compile) workspace members
-RUN mkdir -p \
-        crates/ephpm/src \
-        crates/ephpm-config/src \
-        crates/ephpm-server/src \
-        crates/ephpm-php/src \
-        crates/ephpm-db/src \
-        crates/ephpm-kv/src && \
-    printf 'fn main() {}\n' > crates/ephpm/src/main.rs && \
-    for d in ephpm-config ephpm-server ephpm-php ephpm-db ephpm-kv; do \
-        touch crates/$d/src/lib.rs; \
-    done
-
-RUN cargo xtask php-sdk ${PHP_VERSION}
+# Detect arch at build time (works for both x86_64 and aarch64 builders).
+# Layout we extract matches xtask::php_sdk_dir_for():
+#   /opt/php-sdk/<version>-linux-<arch>/{lib,include}/
+RUN set -eux; \
+    arch=$(uname -m); \
+    sdk_dir="/opt/php-sdk/${PHP_SDK_VERSION}-linux-${arch}"; \
+    asset="php-sdk-${PHP_SDK_VERSION}-linux-${arch}.tar.gz"; \
+    url="https://github.com/ephpm/php-sdk/releases/download/v${PHP_SDK_VERSION}/${asset}"; \
+    mkdir -p "${sdk_dir}"; \
+    curl -fSL "${url}" -o /tmp/sdk.tar.gz; \
+    sha256sum /tmp/sdk.tar.gz; \
+    tar xzf /tmp/sdk.tar.gz -C "${sdk_dir}"; \
+    rm /tmp/sdk.tar.gz; \
+    test -f "${sdk_dir}/lib/libphp.a"; \
+    echo "==> SDK lib/ contents:"; \
+    ls -la "${sdk_dir}/lib/"; \
+    echo "==> libz.a archive members:"; \
+    ar t "${sdk_dir}/lib/libz.a"; \
+    echo "==> gz* symbols in libz.a (full):"; \
+    nm "${sdk_dir}/lib/libz.a" 2>/dev/null | grep -E " (T|t|R|D|W) gz" || echo "(no gz* symbols found!)"; \
+    echo "==> sanity: looking for gzerror specifically:"; \
+    nm "${sdk_dir}/lib/libz.a" 2>/dev/null | grep gzerror || echo "(gzerror missing!)"
 
 # ── Stage 3: builder — dep fetch layer then full source build ─────────────────
 
 FROM base AS builder
 
-ARG PHP_VERSION
+ARG PHP_SDK_VERSION
 
 WORKDIR /src
 
-# Pre-built PHP SDK so xtask release skips the spc step entirely
-# (release_linux checks for php-sdk/static-php-cli/buildroot/lib/libphp.a)
-COPY --from=php-sdk /src/php-sdk /src/php-sdk
+# Pull the SDK in from the cached php-sdk stage. xtask::release_native
+# checks PHP_SDK_PATH and skips downloading if the directory already
+# contains lib/libphp.a, so the release build below is a pure cargo build.
+COPY --from=php-sdk /opt/php-sdk /src/php-sdk
 
 # Copy only manifest files + create stubs, then `cargo fetch`.
 # This layer is invalidated only when Cargo.lock or a Cargo.toml changes,
 # not on every source edit.
 COPY Cargo.toml Cargo.lock ./
-COPY xtask/Cargo.toml       xtask/Cargo.toml
-COPY crates/ephpm/Cargo.toml          crates/ephpm/Cargo.toml
-COPY crates/ephpm-config/Cargo.toml   crates/ephpm-config/Cargo.toml
-COPY crates/ephpm-server/Cargo.toml   crates/ephpm-server/Cargo.toml
-COPY crates/ephpm-php/Cargo.toml      crates/ephpm-php/Cargo.toml
-COPY crates/ephpm-db/Cargo.toml       crates/ephpm-db/Cargo.toml
-COPY crates/ephpm-kv/Cargo.toml       crates/ephpm-kv/Cargo.toml
+COPY xtask/Cargo.toml                     xtask/Cargo.toml
+COPY crates/ephpm/Cargo.toml              crates/ephpm/Cargo.toml
+COPY crates/ephpm-cluster/Cargo.toml      crates/ephpm-cluster/Cargo.toml
+COPY crates/ephpm-config/Cargo.toml       crates/ephpm-config/Cargo.toml
+COPY crates/ephpm-db/Cargo.toml           crates/ephpm-db/Cargo.toml
+COPY crates/ephpm-kv/Cargo.toml           crates/ephpm-kv/Cargo.toml
+COPY crates/ephpm-php/Cargo.toml          crates/ephpm-php/Cargo.toml
+COPY crates/ephpm-query-stats/Cargo.toml  crates/ephpm-query-stats/Cargo.toml
+COPY crates/ephpm-server/Cargo.toml       crates/ephpm-server/Cargo.toml
+COPY crates/ephpm-sqld/Cargo.toml         crates/ephpm-sqld/Cargo.toml
 
 RUN mkdir -p \
         xtask/src \
         crates/ephpm/src \
+        crates/ephpm-cluster/src \
         crates/ephpm-config/src \
-        crates/ephpm-server/src \
-        crates/ephpm-php/src \
         crates/ephpm-db/src \
-        crates/ephpm-kv/src && \
+        crates/ephpm-kv/src \
+        crates/ephpm-php/src \
+        crates/ephpm-query-stats/src \
+        crates/ephpm-server/src \
+        crates/ephpm-sqld/src && \
     printf 'fn main() {}\n' > xtask/src/main.rs && \
     printf 'fn main() {}\n' > crates/ephpm/src/main.rs && \
-    for d in ephpm-config ephpm-server ephpm-php ephpm-db ephpm-kv; do \
+    for d in ephpm-cluster ephpm-config ephpm-db ephpm-kv ephpm-php ephpm-query-stats ephpm-server ephpm-sqld; do \
         touch crates/$d/src/lib.rs; \
-    done
+    done && \
+    # ephpm-php Cargo.toml declares `build = "build.rs"` explicitly, so cargo
+    # errors out (rather than silently skipping) if the file is missing during
+    # the stub-precompile step. Other crates with build.rs (ephpm, ephpm-sqld)
+    # rely on auto-detection and tolerate absence, but we stub them too for
+    # consistency — all three real build.rs files arrive with the later COPY.
+    printf 'fn main() {}\n' > crates/ephpm-php/build.rs && \
+    printf 'fn main() {}\n' > crates/ephpm-sqld/build.rs && \
+    printf 'fn main() {}\n' > crates/ephpm/build.rs
 
 RUN cargo fetch
 
@@ -134,7 +146,7 @@ RUN cargo fetch
 #
 # Must use the same --target as `cargo xtask release` (x86_64-unknown-linux-musl) and
 # the same PHP_SDK_PATH so the feature flags and cfg(php_linked) match exactly.
-RUN PHP_SDK_PATH=/src/php-sdk/static-php-cli/buildroot \
+RUN PHP_SDK_PATH=/src/php-sdk/${PHP_SDK_VERSION}-linux-$(uname -m) \
     cargo build --release --package ephpm \
         --target x86_64-unknown-linux-musl 2>&1 | grep -v "^warning:"
 
@@ -148,23 +160,20 @@ COPY . .
 # artifacts. Touch all project crate sources to force mtimes newer than the stubs.
 RUN find crates xtask -name '*.rs' -exec touch {} +
 
-# Verify musl toolchain can be found by the build script
-RUN which musl-gcc && musl-gcc --version && echo "musl-gcc OK" || echo "musl-gcc WARNING"
-
-# Build ephpm. xtask skips PHP SDK since libphp.a already exists from the php-sdk stage.
-# bash -o pipefail ensures cargo's exit code propagates through `tee` so a failed build
-# is visible (Docker's default /bin/sh is dash and does not support pipefail).
-RUN bash -euo pipefail -c 'cargo xtask release ${PHP_VERSION} 2>&1 | tee /tmp/build.log' || ( \
+# Build ephpm. xtask skips the SDK download since the tarball is already
+# extracted in /src/php-sdk/. We pass the full PHP_SDK_VERSION as the version
+# argument so xtask uses the same cache dir as the php-sdk stage.
+# bash -o pipefail ensures cargo's exit code propagates through `tee` so a failed
+# build is visible (Docker's default /bin/sh is dash and does not support pipefail).
+RUN bash -euo pipefail -c 'cargo xtask release ${PHP_SDK_VERSION} 2>&1 | tee /tmp/build.log' || ( \
     echo "==> Build failed. Checking diagnostic info..." && \
-    find /usr -name "libgcc.a" 2>/dev/null | head -10 && \
-    ls -la /usr/local/musl/lib/gcc/ 2>/dev/null || true && \
     cat /tmp/build.log && \
     exit 1 \
   )
 
 # Find the built binary (target/<triple>/release/ephpm)
 RUN cp $(find target -name ephpm -type f -path '*/release/*' | head -1) /ephpm && \
-    file /ephpm
+    ls -lh /ephpm
 
 # ── Stage 4: runtime ──────────────────────────────────────────────────────────
 

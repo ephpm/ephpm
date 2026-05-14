@@ -29,8 +29,25 @@ spec:
             httpGet:
               path: /index.php
               port: 8080
+              # Match a trusted_hosts entry so the probe doesn't 421.
+              # The kubelet otherwise sends Host: <pod-ip>, which is rejected.
+              httpHeaders:
+                - name: Host
+                  value: ephpm
             initialDelaySeconds: 2
             periodSeconds: 3
+          volumeMounts:
+            # security_p0 / vhosts e2e tests deploy site directories from
+            # the test pod and expect ephpm to discover them. Both pods
+            # mount the same hostPath on the (single) Kind node so the
+            # writes from the test pod show up here.
+            - name: sites
+              mountPath: /var/www/sites
+      volumes:
+        - name: sites
+          hostPath:
+            path: /var/lib/ephpm-sites
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service

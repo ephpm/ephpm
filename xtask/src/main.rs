@@ -2,12 +2,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::{env, fs};
 
-const PHP_EXTENSIONS: &str = "bcmath,calendar,ctype,curl,dom,exif,fileinfo,filter,\
-    gd,hash,iconv,mbstring,mysqli,mysqlnd,openssl,pcntl,pcre,pdo,pdo_mysql,phar,\
-    posix,session,simplexml,sodium,tokenizer,xml,xmlreader,xmlwriter,zip,zlib";
+/// Pinned full PHP versions per supported minor.
+///
+/// The build flow downloads pre-built `libphp.a` archives from
+/// `github.com/ephpm/php-sdk` releases. Each entry maps a minor-version
+/// shorthand (e.g. "8.5") to the specific patch release we publish SDKs for.
+/// Users may also pass a full version explicitly (e.g. "8.5.2") and the
+/// resolver will accept it as-is.
+const PHP_SDK_VERSIONS: &[(&str, &str)] = &[("8.3", "8.3.29"), ("8.4", "8.4.19"), ("8.5", "8.5.2")];
 
-/// Pinned version of the standalone spc (static-php-cli) binary.
-const SPC_VERSION: &str = "2.8.3";
+/// Default PHP minor when no version is specified on the command line.
+const DEFAULT_PHP_MINOR: &str = "8.5";
 
 /// Pinned version of sqld (libsql-server) for clustered SQLite.
 const SQLD_VERSION: &str = "0.24.32";
@@ -22,7 +27,8 @@ fn main() -> ExitCode {
 
     match cmd {
         Some("release") => require_unix(|| release(&args[1..])),
-        Some("php-sdk") => require_unix(|| php_sdk(&args[1..])),
+        // php-sdk is a pure download — works on any platform with curl + tar.
+        Some("php-sdk") => php_sdk(&args[1..]),
         Some("e2e") => e2e(&args[1..]),
         Some("e2e-up") => e2e_up(&args[1..]),
         Some("e2e-down") => e2e_down(),
@@ -47,16 +53,20 @@ Usage: cargo xtask <command> [options]
 
 Commands:
   release [8.5] [--target windows]  Build ephpm with PHP linked (default: 8.5)
-  php-sdk [8.5]                     Build only the PHP SDK (libphp.a + headers)
+  php-sdk [8.5]                     Download the PHP SDK (libphp.a + headers) for the current platform
   e2e [--php-version 8.5]           Run E2E tests (creates Kind cluster, builds images, tilt ci)
   e2e-up [--php-version 8.5]        Start E2E dev environment (tilt dashboard at localhost:10350)
   e2e-down                          Tear down Kind cluster and all resources
   e2e-install                       Download kind, tilt, kubectl to ./bin (no global install needed)
-  docs <subcommand>                 Build/serve the documentation site (run `docs help` for subcommands)
+  docs <subcommand>                 Build/serve the Hugo + Hextra documentation site
+
+The PHP SDK is downloaded from github.com/ephpm/php-sdk releases. Pass a minor
+shorthand (e.g. \"8.5\") to use the pinned patch release, or a full version
+(e.g. \"8.5.2\") for an explicit pin.
 
 Cross-compilation:
   --target windows    Cross-compile a Windows .exe from WSL/Linux (requires cargo-xwin).
-                      Downloads PHP Windows SDK automatically from windows.php.net.
+                      Downloads the same prebuilt SDK as Linux/macOS, but for windows-x86_64.
 
 SQLite clustering:
   --sqld-binary PATH  Override: embed a specific sqld binary (default: auto-download v{SQLD_VERSION}).
@@ -120,50 +130,60 @@ fn parse_release_php_version(args: &[String]) -> &str {
 /// Dispatch release builds based on `--target` flag.
 fn release(args: &[String]) -> ExitCode {
     match parse_target(args) {
-        None => release_linux(args),
+        None => release_native(args),
         Some("windows") => release_windows(args),
         Some(other) => {
             eprintln!("error: unsupported target '{other}' (supported: windows)");
-            eprintln!("       omit --target for the default Linux musl build");
+            eprintln!("       omit --target for the default native build");
             ExitCode::FAILURE
         }
     }
 }
 
-/// Build the PHP SDK and then compile the release binary.
+/// Build the PHP SDK and then compile the release binary for the host.
 ///
-/// static-php-cli compiles PHP with musl, so we must target musl for the
-/// Rust binary too. This produces a fully static, self-contained binary.
-fn release_linux(args: &[String]) -> ExitCode {
-    let spc_dir = spc_dir();
-    let sdk_path = spc_dir.join("buildroot");
+/// On Linux, the prebuilt `libphp.a` is musl-linked (built by static-php-cli
+/// in the php-sdk release pipeline), so the Rust binary must target musl too
+/// or linking fails with sigsetjmp / `__flt_rounds` style errors. The result
+/// is a fully static, self-contained binary.
+///
+/// On macOS, the prebuilt SDK was built with Homebrew clang against
+/// `aarch64-apple-darwin`, so we build for the host target directly. Only
+/// Apple Silicon is supported — there are no x86_64-darwin SDK artifacts.
+fn release_native(args: &[String]) -> ExitCode {
+    let php_version = match resolve_php_version(parse_release_php_version(args)) {
+        Some(v) => v,
+        None => return ExitCode::FAILURE,
+    };
 
-    if !sdk_path.join("lib").join("libphp.a").exists() {
-        let code = php_sdk(args);
-        if code != ExitCode::SUCCESS {
-            return code;
-        }
-    } else {
-        eprintln!("==> PHP SDK already built, skipping (delete {spc_dir:?} to rebuild)");
-    }
+    let sdk_path = php_sdk_dir(&php_version);
 
-    // static-php-cli builds PHP with musl. The Rust binary must target
-    // musl too, otherwise we get linker errors (sigsetjmp, __flt_rounds, etc.)
-    let target = musl_target_triple();
-
-    // Ensure the musl target is installed
-    eprintln!("==> Ensuring Rust target {target} is installed...");
-    let status = Command::new("rustup")
-        .args(["target", "add", &target])
-        .status();
-    if !ran_ok(&status) {
-        eprintln!("error: failed to add Rust target {target}");
+    if ensure_php_sdk(&php_version).is_err() {
         return ExitCode::FAILURE;
     }
 
-    eprintln!("==> Building ephpm (release, target: {target})...");
+    // Pick the Rust target. On Linux we cross-link against musl libphp.a,
+    // so we must build the Rust crate against the same libc.
+    let host_target = if cfg!(target_os = "macos") {
+        if let Err(code) = require_macos_arm64() {
+            return code;
+        }
+        format!("{}-apple-darwin", std::env::consts::ARCH)
+    } else {
+        // Linux — match the libc (musl) of the prebuilt libphp.a.
+        format!("{}-unknown-linux-musl", std::env::consts::ARCH)
+    };
+
+    eprintln!("==> Ensuring Rust target {host_target} is installed...");
+    let status = Command::new("rustup").args(["target", "add", &host_target]).status();
+    if !ran_ok(&status) {
+        eprintln!("error: failed to add Rust target {host_target}");
+        return ExitCode::FAILURE;
+    }
+
+    eprintln!("==> Building ephpm (release, target: {host_target})...");
     let mut cmd = Command::new("cargo");
-    cmd.args(["build", "--release", "--package", "ephpm", "--target", &target])
+    cmd.args(["build", "--release", "--package", "ephpm", "--target", &host_target])
         .env("PHP_SDK_PATH", &sdk_path);
 
     // Embed sqld binary: use --sqld-binary if provided, otherwise auto-download.
@@ -193,15 +213,34 @@ fn release_linux(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    eprintln!("==> Binary ready: target/{target}/release/ephpm");
+    eprintln!("==> Binary ready: target/{host_target}/release/ephpm");
     ExitCode::SUCCESS
+}
+
+/// Reject builds on macOS Intel — the php-sdk release pipeline only ships
+/// `macos-aarch64` artifacts, so x86_64 darwin would have nothing to link
+/// against. Apple Silicon is the only supported macOS target.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn require_macos_arm64() -> Result<(), ExitCode> {
+    if cfg!(target_arch = "aarch64") {
+        return Ok(());
+    }
+    eprintln!("error: macOS Intel (x86_64) is not supported.");
+    eprintln!("       The php-sdk release only publishes macos-aarch64 artifacts.");
+    eprintln!("       Build on Apple Silicon, or use a Linux machine.");
+    Err(ExitCode::FAILURE)
 }
 
 /// Cross-compile a Windows .exe from WSL/Linux using cargo-xwin.
 ///
-/// Downloads the official PHP Windows SDK (headers + import lib + DLL) from
-/// windows.php.net, then builds with the MSVC target via cargo-xwin.
-/// The resulting binary requires `php8embed.dll` at runtime.
+/// The Windows SDK is the same `php-sdk` GitHub release used for Linux/macOS,
+/// just the `windows-x86_64` artifact: it contains `php8embed.dll`,
+/// `php8embed.lib`, and the headers under `include/php/`. cargo-xwin handles
+/// the MSVC link.
+///
+/// The resulting binary requires `php8embed.dll` at runtime, which is also
+/// embedded into the binary via `include_bytes!()` in `windows_dll.rs` and
+/// extracted at startup.
 fn release_windows(args: &[String]) -> ExitCode {
     // sqld has no Windows binary — error if user tries to embed it.
     if parse_sqld_binary(args).is_some() {
@@ -215,69 +254,33 @@ fn release_windows(args: &[String]) -> ExitCode {
         eprintln!("      The Windows build supports single-node SQLite only.");
     }
 
-    let php_version = parse_release_php_version(args);
+    let Some(php_version) = resolve_php_version(parse_release_php_version(args)) else {
+        return ExitCode::FAILURE;
+    };
     let target = "x86_64-pc-windows-msvc";
-    let sdk_dir = workspace_root().join("php-sdk").join("windows");
 
-    // 1. Check prerequisites
     eprintln!("==> Checking prerequisites...");
-
-    let mut missing = Vec::new();
     if !has_command("cargo-xwin") {
-        missing.push("cargo-xwin");
-    }
-    if !has_command("unzip") {
-        missing.push("unzip");
-    }
-
-    if !missing.is_empty() {
-        eprintln!("error: missing required tools: {}", missing.join(", "));
-        eprintln!();
-        eprintln!("Install them:");
-        if missing.contains(&"cargo-xwin") {
-            eprintln!("  cargo install cargo-xwin");
-        }
-        if missing.contains(&"unzip") {
-            eprintln!("  sudo apt install -y unzip");
-        }
+        eprintln!("error: cargo-xwin not installed");
+        eprintln!("       cargo install cargo-xwin");
         return ExitCode::FAILURE;
     }
 
-    // 2. Download PHP Windows SDK if not already present
-    if !sdk_dir.join("lib").join("php8embed.lib").exists() {
-        let code = download_php_windows_sdk(php_version, &sdk_dir);
-        if code != ExitCode::SUCCESS {
-            return code;
-        }
-    } else {
-        eprintln!(
-            "==> PHP Windows SDK already downloaded, skipping (delete {} to re-download)",
-            sdk_dir.display()
-        );
+    if ensure_php_sdk_for(&php_version, "windows", "x86_64").is_err() {
+        return ExitCode::FAILURE;
     }
+    let sdk_dir = php_sdk_dir_for(&php_version, "windows", "x86_64");
 
-    // 3. Ensure the MSVC target is installed
     eprintln!("==> Ensuring Rust target {target} is installed...");
-    let status = Command::new("rustup")
-        .args(["target", "add", target])
-        .status();
+    let status = Command::new("rustup").args(["target", "add", target]).status();
     if !ran_ok(&status) {
         eprintln!("error: failed to add Rust target {target}");
         return ExitCode::FAILURE;
     }
 
-    // 4. Build with cargo-xwin
     eprintln!("==> Building ephpm.exe (release, target: {target})...");
     let status = Command::new("cargo")
-        .args([
-            "xwin",
-            "build",
-            "--release",
-            "--package",
-            "ephpm",
-            "--target",
-            target,
-        ])
+        .args(["xwin", "build", "--release", "--package", "ephpm", "--target", target])
         .env("PHP_SDK_PATH", &sdk_dir)
         .status();
 
@@ -286,11 +289,10 @@ fn release_windows(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // 5. Copy php8embed.dll next to the .exe
-    let exe_dir = workspace_root()
-        .join("target")
-        .join(target)
-        .join("release");
+    // Copy php8embed.dll next to the .exe so the binary is runnable as a pair
+    // (the DLL is also embedded via include_bytes!() and extracted at runtime,
+    // but shipping it side-by-side keeps things obvious).
+    let exe_dir = workspace_root().join("target").join(target).join("release");
     let dll_dest = exe_dir.join("php8embed.dll");
     let dll_src = sdk_dir.join("lib").join("php8embed.dll");
     if dll_src.exists() {
@@ -308,308 +310,171 @@ fn release_windows(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// Download the PHP Windows SDK (headers, import lib, and DLL) from windows.php.net.
+/// Resolve a user-supplied PHP version into a full pinned version string.
 ///
-/// Downloads two ZIP files:
-/// - Main NTS package: contains `php8embed.dll`
-/// - Devel pack: contains `php8embed.lib` (import lib) and C headers
+/// Accepts either a minor shorthand ("8.5") or a full version ("8.5.2").
+/// Minor shorthands are mapped via `PHP_SDK_VERSIONS`; full versions are
+/// returned as-is so users can pin to a specific patch even if it isn't
+/// in the table (in that case, the download will simply fail with a 404
+/// and the error message will point at the missing release tag).
+fn resolve_php_version(input: &str) -> Option<String> {
+    if let Some((_, full)) = PHP_SDK_VERSIONS.iter().find(|(short, _)| *short == input) {
+        return Some((*full).to_string());
+    }
+    if input.matches('.').count() == 2 {
+        return Some(input.to_string());
+    }
+    eprintln!("error: unknown PHP version '{input}'");
+    eprintln!("       supported minors:");
+    for (short, full) in PHP_SDK_VERSIONS {
+        eprintln!("         {short}  → {full}");
+    }
+    eprintln!("       or pass a full version like 8.5.2 to use that release tag directly");
+    None
+}
+
+/// Download the prebuilt PHP SDK for the host platform.
 ///
-/// Files are arranged into `sdk_dir/` matching the layout build.rs expects:
-///   sdk_dir/lib/php8embed.lib
-///   sdk_dir/lib/php8embed.dll
-///   sdk_dir/include/php/{main,Zend,TSRM,sapi}/
-fn download_php_windows_sdk(php_version: &str, sdk_dir: &Path) -> ExitCode {
-    let tmp_dir = sdk_dir.join("_tmp");
-    cleanup_dir(&tmp_dir);
-    fs::create_dir_all(&tmp_dir).ok();
-    fs::create_dir_all(sdk_dir.join("lib")).ok();
-    fs::create_dir_all(sdk_dir.join("include").join("php")).ok();
+/// `cargo xtask php-sdk [version]` — pulls `libphp.a` (Linux/macOS) or
+/// `php8embed.{dll,lib}` (Windows) plus the PHP headers from
+/// github.com/ephpm/php-sdk releases and extracts them into
+/// `<workspace>/php-sdk/<full-version>/`.
+fn php_sdk(args: &[String]) -> ExitCode {
+    let input = args.first().map_or(DEFAULT_PHP_MINOR, String::as_str);
+    let Some(version) = resolve_php_version(input) else {
+        return ExitCode::FAILURE;
+    };
 
-    let base_url = "https://windows.php.net/downloads/releases/latest";
+    let (os, arch) = match host_php_sdk_platform() {
+        Some(p) => p,
+        None => return ExitCode::FAILURE,
+    };
 
-    // Download the main NTS package (contains php8embed.dll)
-    let main_zip_name = format!("php-{php_version}-nts-Win32-vs17-x64-latest.zip");
-    let main_zip = tmp_dir.join(&main_zip_name);
-    eprintln!("==> Downloading PHP {php_version} Windows NTS package...");
-    if !download_file(&format!("{base_url}/{main_zip_name}"), &main_zip) {
-        eprintln!("error: failed to download {main_zip_name}");
-        eprintln!("       Check that PHP {php_version} Windows builds are available at:");
-        eprintln!("       https://windows.php.net/downloads/releases/latest/");
-        cleanup_dir(&tmp_dir);
+    if ensure_php_sdk_for(&version, os, arch).is_err() {
         return ExitCode::FAILURE;
     }
 
-    // Download the devel pack (contains headers + php8embed.lib)
-    let devel_zip_name = format!("php-devel-pack-{php_version}-nts-Win32-vs17-x64-latest.zip");
-    let devel_zip = tmp_dir.join(&devel_zip_name);
-    eprintln!("==> Downloading PHP {php_version} Windows devel pack...");
-    if !download_file(&format!("{base_url}/{devel_zip_name}"), &devel_zip) {
-        eprintln!("error: failed to download {devel_zip_name}");
-        cleanup_dir(&tmp_dir);
-        return ExitCode::FAILURE;
-    }
-
-    // Extract main package and find php8embed.dll
-    let main_extract = tmp_dir.join("main");
-    eprintln!("==> Extracting NTS package...");
-    if !unzip_file(&main_zip, &main_extract) {
-        eprintln!("error: failed to extract {main_zip_name}");
-        cleanup_dir(&tmp_dir);
-        return ExitCode::FAILURE;
-    }
-
-    if let Some(dll) = find_file_recursive(&main_extract, "php8embed.dll") {
-        if let Err(e) = fs::copy(&dll, sdk_dir.join("lib").join("php8embed.dll")) {
-            eprintln!("error: failed to copy php8embed.dll: {e}");
-            cleanup_dir(&tmp_dir);
-            return ExitCode::FAILURE;
-        }
-    } else {
-        eprintln!("error: php8embed.dll not found in NTS package");
-        cleanup_dir(&tmp_dir);
-        return ExitCode::FAILURE;
-    }
-
-    // Extract devel pack and find php8embed.lib + headers
-    let devel_extract = tmp_dir.join("devel");
-    eprintln!("==> Extracting devel pack...");
-    if !unzip_file(&devel_zip, &devel_extract) {
-        eprintln!("error: failed to extract {devel_zip_name}");
-        cleanup_dir(&tmp_dir);
-        return ExitCode::FAILURE;
-    }
-
-    // Copy php8embed.lib
-    if let Some(lib) = find_file_recursive(&devel_extract, "php8embed.lib") {
-        if let Err(e) = fs::copy(&lib, sdk_dir.join("lib").join("php8embed.lib")) {
-            eprintln!("error: failed to copy php8embed.lib: {e}");
-            cleanup_dir(&tmp_dir);
-            return ExitCode::FAILURE;
-        }
-    } else {
-        eprintln!("error: php8embed.lib not found in devel pack");
-        cleanup_dir(&tmp_dir);
-        return ExitCode::FAILURE;
-    }
-
-    // Copy headers: devel pack has include/{main,Zend,TSRM,sapi}
-    // build.rs expects them at sdk_dir/include/php/{main,Zend,TSRM,sapi}
-    let dest_include = sdk_dir.join("include").join("php");
-    if let Some(include_src) = find_dir_recursive(&devel_extract, "include") {
-        for subdir in &["main", "Zend", "TSRM", "sapi", "ext"] {
-            let src = include_src.join(subdir);
-            if src.exists() {
-                let dest = dest_include.join(subdir);
-                if let Err(e) = copy_dir_recursive(&src, &dest) {
-                    eprintln!("error: failed to copy headers ({subdir}): {e}");
-                    cleanup_dir(&tmp_dir);
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-    } else {
-        eprintln!("error: include directory not found in devel pack");
-        cleanup_dir(&tmp_dir);
-        return ExitCode::FAILURE;
-    }
-
-    cleanup_dir(&tmp_dir);
-    eprintln!(
-        "==> PHP Windows SDK ready at {}",
-        sdk_dir.display()
-    );
+    eprintln!("==> PHP SDK ready at {}", php_sdk_dir_for(&version, os, arch).display());
     ExitCode::SUCCESS
 }
 
-/// Download a file via curl.
-fn download_file(url: &str, dest: &Path) -> bool {
-    let status = Command::new("curl")
-        .args(["-fSL", "-o"])
-        .arg(dest)
-        .arg(url)
-        .status();
-    ran_ok(&status)
-}
-
-/// Extract a ZIP file to a directory.
-fn unzip_file(zip: &Path, dest: &Path) -> bool {
-    fs::create_dir_all(dest).ok();
-    let status = Command::new("unzip")
-        .args(["-q", "-o"])
-        .arg(zip)
-        .arg("-d")
-        .arg(dest)
-        .status();
-    ran_ok(&status)
-}
-
-/// Recursively find the first file with the given name in a directory tree.
-fn find_file_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.file_name().is_some_and(|n| n == name) {
-            return Some(path);
+/// Detect the host's `(os, arch)` pair as named in php-sdk release assets.
+///
+/// Returns `None` and prints an error for unsupported platforms (notably
+/// macOS Intel — only `macos-aarch64` is published).
+fn host_php_sdk_platform() -> Option<(&'static str, &'static str)> {
+    let os = if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        if !cfg!(target_arch = "aarch64") {
+            eprintln!("error: macOS Intel (x86_64) is not supported.");
+            eprintln!("       The php-sdk release only publishes macos-aarch64 artifacts.");
+            return None;
         }
-        if path.is_dir() {
-            if let Some(found) = find_file_recursive(&path, name) {
-                return Some(found);
-            }
-        }
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        eprintln!("error: unsupported host OS for the php-sdk download");
+        return None;
+    };
+
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        eprintln!("error: unsupported host architecture for the php-sdk download");
+        return None;
+    };
+
+    if os == "windows" && arch != "x86_64" {
+        eprintln!("error: only windows-x86_64 SDK artifacts are published");
+        return None;
     }
-    None
+
+    Some((os, arch))
 }
 
-/// Recursively find the first directory with the given name in a directory tree.
-fn find_dir_recursive(dir: &Path, name: &str) -> Option<PathBuf> {
-    let entries = fs::read_dir(dir).ok()?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if path.file_name().is_some_and(|n| n == name) {
-                return Some(path);
-            }
-            if let Some(found) = find_dir_recursive(&path, name) {
-                return Some(found);
-            }
-        }
-    }
-    None
+/// Download and extract the SDK for the host platform unless already cached.
+fn ensure_php_sdk(version: &str) -> Result<(), ()> {
+    let (os, arch) = host_php_sdk_platform().ok_or(())?;
+    ensure_php_sdk_for(version, os, arch)
 }
 
-/// Recursively copy a directory tree.
-fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(dest)?;
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-        if src_path.is_dir() {
-            copy_dir_recursive(&src_path, &dest_path)?;
-        } else {
-            fs::copy(&src_path, &dest_path)?;
-        }
+/// Download and extract the SDK for the given platform unless already cached.
+///
+/// The cache is keyed by `(version, os, arch)` so cross-compiled builds can
+/// hold multiple SDKs side-by-side without trampling each other.
+fn ensure_php_sdk_for(version: &str, os: &str, arch: &str) -> Result<(), ()> {
+    let dest = php_sdk_dir_for(version, os, arch);
+
+    // Layout we expect inside `dest/`:
+    //   lib/libphp.a            (Linux + macOS)
+    //   lib/php8embed.{dll,lib} (Windows)
+    //   include/php/{main,Zend,TSRM,sapi,ext}/...
+    let already_present = if os == "windows" {
+        dest.join("lib").join("php8embed.lib").exists()
+    } else {
+        dest.join("lib").join("libphp.a").exists()
+    };
+
+    if already_present {
+        eprintln!(
+            "==> PHP SDK {version} ({os}-{arch}) already cached at {} — skipping download",
+            dest.display()
+        );
+        return Ok(());
     }
+
+    fs::create_dir_all(&dest).map_err(|e| {
+        eprintln!("error: failed to create {}: {e}", dest.display());
+    })?;
+
+    let asset = format!("php-sdk-{version}-{os}-{arch}.tar.gz");
+    let url = format!("https://github.com/ephpm/php-sdk/releases/download/v{version}/{asset}");
+
+    eprintln!("==> Downloading {asset}...");
+    if !download_and_extract_full_tarball(&url, &dest) {
+        eprintln!("error: failed to download or extract PHP SDK from {url}");
+        eprintln!("       Verify that release v{version} exists at:");
+        eprintln!("         https://github.com/ephpm/php-sdk/releases/tag/v{version}");
+        return Err(());
+    }
+
     Ok(())
 }
 
-/// Remove a directory tree, ignoring errors.
-fn cleanup_dir(dir: &Path) {
-    fs::remove_dir_all(dir).ok();
+/// Workspace-relative cache path for a PHP SDK pinned to `(version, os, arch)`.
+fn php_sdk_dir_for(version: &str, os: &str, arch: &str) -> PathBuf {
+    workspace_root().join("php-sdk").join(format!("{version}-{os}-{arch}"))
 }
 
-/// Return the musl target triple matching the current host architecture.
-///
-/// static-php-cli compiles PHP against musl, so our Rust binary must
-/// use the same libc to avoid undefined-symbol errors at link time.
-fn musl_target_triple() -> String {
-    format!("{}-unknown-linux-musl", std::env::consts::ARCH)
+/// Convenience for the host platform — cache path for the SDK that
+/// `release_native()` will link against.
+fn php_sdk_dir(version: &str) -> PathBuf {
+    let (os, arch) = host_php_sdk_platform()
+        .expect("host platform was already validated by ensure_php_sdk before calling php_sdk_dir");
+    php_sdk_dir_for(version, os, arch)
 }
 
-/// Build libphp.a via the standalone spc (static-php-cli) binary.
+/// Stream a tarball through curl + tar to extract every entry into `dest`.
 ///
-/// Downloads a self-contained spc binary from GitHub releases — no system
-/// PHP or Composer required. The spc binary is a PHP micro binary with the
-/// static-php-cli application bundled in.
-fn php_sdk(args: &[String]) -> ExitCode {
-    let php_version = args.first().map_or("8.5", String::as_str);
+/// Uses `tar --strip-components=1` if the archive nests under a top-level
+/// directory (the php-sdk archives use `./lib/...`, so strip is harmless).
+fn download_and_extract_full_tarball(url: &str, dest: &Path) -> bool {
+    let curl =
+        Command::new("curl").args(["-fSL", url]).stdout(std::process::Stdio::piped()).spawn();
 
-    // Only git and C build tools are needed — no system PHP or Composer.
-    if !has_command("git") {
-        eprintln!("error: git is required");
-        eprintln!("  sudo apt update && sudo apt install -y git");
-        return ExitCode::FAILURE;
-    }
+    let Ok(curl) = curl else {
+        eprintln!("error: failed to spawn curl");
+        return false;
+    };
 
-    let spc_dir = spc_dir();
-    fs::create_dir_all(&spc_dir).ok();
+    let status =
+        Command::new("tar").args(["xz", "-C"]).arg(dest).stdin(curl.stdout.unwrap()).status();
 
-    // Download the standalone spc binary if not present.
-    let spc_bin = spc_dir.join("spc");
-    if !spc_bin.exists() {
-        let spc_arch = if cfg!(target_arch = "aarch64") {
-            "aarch64"
-        } else {
-            "x86_64"
-        };
-        let spc_os = if cfg!(target_os = "macos") {
-            "macos"
-        } else {
-            "linux"
-        };
-        let url = format!(
-            "https://github.com/crazywhalecc/static-php-cli/releases/download/{SPC_VERSION}/spc-{spc_os}-{spc_arch}.tar.gz"
-        );
-        eprintln!("==> Downloading spc v{SPC_VERSION}...");
-        if !download_and_extract_tarball(&url, &spc_dir, "spc") {
-            eprintln!("error: failed to download spc binary from {url}");
-            return ExitCode::FAILURE;
-        }
-    }
-
-    let spc = spc_bin.to_str().unwrap();
-
-    // Let spc install its own toolchain (musl cross-compiler, missing system
-    // packages, etc.). This may prompt for sudo password.
-    eprintln!("==> Checking build environment (may prompt for sudo)...");
-    let status = Command::new(spc)
-        .args(["doctor", "--auto-fix"])
-        .current_dir(&spc_dir)
-        .status();
-
-    if !ran_ok(&status) {
-        eprintln!("error: spc doctor failed — check output above");
-        return ExitCode::FAILURE;
-    }
-
-    // Download PHP source + extension dependencies
-    eprintln!("==> Downloading PHP {php_version} sources...");
-    let status = Command::new(spc)
-        .args([
-            "download",
-            &format!("--with-php={php_version}"),
-            &format!("--for-extensions={PHP_EXTENSIONS}"),
-            "--prefer-pre-built",
-        ])
-        .current_dir(&spc_dir)
-        .status();
-
-    if !ran_ok(&status) {
-        eprintln!("error: spc download failed");
-        return ExitCode::FAILURE;
-    }
-
-    // static-php-cli looks for pkg-config in its own buildroot/bin/, not system PATH
-    let buildroot_bin = spc_dir.join("buildroot").join("bin");
-    if !buildroot_bin.join("pkg-config").exists() {
-        fs::create_dir_all(&buildroot_bin).ok();
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink("/usr/bin/pkg-config", buildroot_bin.join("pkg-config"))
-                .ok();
-        }
-    }
-
-    // Build libphp.a with embed SAPI (ZTS enabled for thread-safe embedding)
-    eprintln!("==> Building libphp.a with ZTS (this takes ~15 min the first time)...");
-    let status = Command::new(spc)
-        .args([
-            "build",
-            PHP_EXTENSIONS,
-            "--build-embed",
-            "--no-strip",
-            "--enable-zts",
-        ])
-        .current_dir(&spc_dir)
-        .status();
-
-    if !ran_ok(&status) {
-        eprintln!("error: spc build failed");
-        return ExitCode::FAILURE;
-    }
-
-    eprintln!("==> PHP SDK ready at {}", spc_dir.join("buildroot").display());
-    ExitCode::SUCCESS
+    ran_ok(&status)
 }
 
 // ── E2E testing (Kind + Tilt) ────────────────────────────────────────────────
@@ -644,10 +509,7 @@ fn has_e2e_tool(name: &str) -> bool {
     if local.exists() {
         return true;
     }
-    Command::new(name)
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+    Command::new(name).arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 /// Detect OS and architecture for download URLs.
@@ -660,11 +522,7 @@ fn platform() -> (&'static str, &'static str) {
         "linux"
     };
 
-    let arch = if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "amd64"
-    };
+    let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
 
     (os, arch)
 }
@@ -699,9 +557,7 @@ fn e2e_install() -> ExitCode {
     if kubectl_path.exists() {
         eprintln!("==> kubectl already installed, skipping (delete bin/kubectl to reinstall)");
     } else {
-        let url = format!(
-            "https://dl.k8s.io/release/v{KUBECTL_VERSION}/bin/{os}/{arch}/kubectl"
-        );
+        let url = format!("https://dl.k8s.io/release/v{KUBECTL_VERSION}/bin/{os}/{arch}/kubectl");
         eprintln!("==> Downloading kubectl v{KUBECTL_VERSION}...");
         if !download_binary(&url, &kubectl_path) {
             eprintln!("error: failed to download kubectl");
@@ -738,11 +594,7 @@ fn e2e_install() -> ExitCode {
 
 /// Download a single binary file via curl.
 fn download_binary(url: &str, dest: &PathBuf) -> bool {
-    let status = Command::new("curl")
-        .args(["-fSL", "-o"])
-        .arg(dest)
-        .arg(url)
-        .status();
+    let status = Command::new("curl").args(["-fSL", "-o"]).arg(dest).arg(url).status();
 
     if !ran_ok(&status) {
         return false;
@@ -755,10 +607,8 @@ fn download_binary(url: &str, dest: &PathBuf) -> bool {
 /// Download a tarball via curl, pipe through tar, extract a specific binary.
 fn download_and_extract_tarball(url: &str, dest_dir: &PathBuf, binary_name: &str) -> bool {
     // curl -fSL <url> | tar xz -C <dest_dir> <binary_name>
-    let curl = Command::new("curl")
-        .args(["-fSL", url])
-        .stdout(std::process::Stdio::piped())
-        .spawn();
+    let curl =
+        Command::new("curl").args(["-fSL", url]).stdout(std::process::Stdio::piped()).spawn();
 
     let Ok(curl) = curl else {
         return false;
@@ -781,10 +631,8 @@ fn download_and_extract_tarball(url: &str, dest_dir: &PathBuf, binary_name: &str
 
 /// Download a `.tar.xz` archive via curl, extract a specific binary.
 fn download_and_extract_tar_xz(url: &str, dest_dir: &Path, binary_name: &str) -> bool {
-    let curl = Command::new("curl")
-        .args(["-fSL", url])
-        .stdout(std::process::Stdio::piped())
-        .spawn();
+    let curl =
+        Command::new("curl").args(["-fSL", url]).stdout(std::process::Stdio::piped()).spawn();
 
     let Ok(curl) = curl else {
         eprintln!("error: failed to run curl");
@@ -803,10 +651,14 @@ fn download_and_extract_tar_xz(url: &str, dest_dir: &Path, binary_name: &str) ->
         return false;
     };
 
+    // Turso ships the binary inside a top-level directory:
+    //   libsql-server-x86_64-unknown-linux-gnu/sqld
+    // Strip the prefix so it lands at <dest_dir>/<binary_name>, and use a
+    // wildcard so we don't have to know the exact directory name.
     let status = Command::new("tar")
-        .args(["x", "-C"])
+        .args(["x", "--strip-components=1", "--wildcards", "-C"])
         .arg(dest_dir)
-        .arg(binary_name)
+        .arg(format!("*/{binary_name}"))
         .stdin(xz.stdout.unwrap())
         .status();
 
@@ -947,11 +799,7 @@ fn e2e_up(args: &[String]) -> ExitCode {
         .current_dir(&k8s_dir)
         .status();
 
-    if ran_ok(&status) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if ran_ok(&status) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 /// Tear down Tilt resources and delete the Kind cluster.
@@ -961,11 +809,7 @@ fn e2e_down() -> ExitCode {
     // tilt down (ignore errors — cluster may already be gone)
     if has_e2e_tool("tilt") {
         eprintln!("==> Removing Tilt resources...");
-        Command::new(find_tool("tilt"))
-            .args(["down"])
-            .current_dir(&k8s_dir)
-            .status()
-            .ok();
+        Command::new(find_tool("tilt")).args(["down"]).current_dir(&k8s_dir).status().ok();
     }
 
     if has_e2e_tool("kind") {
@@ -988,9 +832,7 @@ fn ensure_kind_cluster() -> ExitCode {
     let kind = find_tool("kind");
 
     // Check if cluster already exists
-    let output = Command::new(&kind)
-        .args(["get", "clusters"])
-        .output();
+    let output = Command::new(&kind).args(["get", "clusters"]).output();
 
     if let Ok(output) = output {
         let clusters = String::from_utf8_lossy(&output.stdout);
@@ -1005,22 +847,37 @@ fn ensure_kind_cluster() -> ExitCode {
     let root = workspace_root();
     let config_path = root.join("k8s").join("kind-config.yaml");
 
-    let mut cmd = Command::new(&kind);
-    cmd.args(["create", "cluster", "--name", KIND_CLUSTER_NAME]);
+    // Kind cluster creation flakes on shared CI runners — kubeadm
+    // sometimes can't bring the control plane up within its 4-minute
+    // budget when the host is contended. Retry a couple of times,
+    // wiping any half-created cluster between attempts so the next
+    // try starts from a clean slate.
+    const MAX_ATTEMPTS: u32 = 3;
+    for attempt in 1..=MAX_ATTEMPTS {
+        if attempt > 1 {
+            eprintln!(
+                "==> Kind cluster creation failed; deleting partial state and retrying ({attempt}/{MAX_ATTEMPTS})"
+            );
+            let _ = Command::new(&kind)
+                .args(["delete", "cluster", "--name", KIND_CLUSTER_NAME])
+                .status();
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
 
-    if config_path.exists() {
-        cmd.arg("--config").arg(&config_path);
+        let mut cmd = Command::new(&kind);
+        cmd.args(["create", "cluster", "--name", KIND_CLUSTER_NAME, "--wait", "120s"]);
+        if config_path.exists() {
+            cmd.arg("--config").arg(&config_path);
+        }
+
+        if ran_ok(&cmd.status()) {
+            eprintln!("==> Kind cluster ready");
+            return ExitCode::SUCCESS;
+        }
     }
 
-    let status = cmd.status();
-
-    if ran_ok(&status) {
-        eprintln!("==> Kind cluster ready");
-        ExitCode::SUCCESS
-    } else {
-        eprintln!("error: failed to create Kind cluster");
-        ExitCode::FAILURE
-    }
+    eprintln!("error: failed to create Kind cluster after {MAX_ATTEMPTS} attempts");
+    ExitCode::FAILURE
 }
 
 /// Build the ephpm and E2E test runner container images, then load them into Kind.
@@ -1030,30 +887,63 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
     let dockerfile = root.join("docker").join("Dockerfile");
     let dockerfile_e2e = root.join("docker").join("Dockerfile.e2e");
 
-    // docker uses "buildx build --load" (BuildKit, result written to local
-    // daemon); podman uses plain "build" (already BuildKit-equivalent).
-    let build_args: &[&str] = if ce == "docker" {
-        &["buildx", "build", "--load"]
-    } else {
-        &["build"]
+    // The Dockerfile takes PHP_SDK_VERSION as a full version (e.g. "8.5.2")
+    // so its php-sdk stage layer is keyed deterministically. Resolve any
+    // shorthand the caller passed (e.g. "8.5") via the same table xtask uses.
+    let Some(php_sdk_version) = resolve_php_version(php_version) else {
+        return ExitCode::FAILURE;
     };
+
+    // Build path differs by container engine:
+    //
+    //  - docker: write the result as a docker-format tarball via
+    //    `buildx build --output type=docker,dest=<file>`, then feed it to
+    //    `kind load image-archive`. We *cannot* use `--load` (docker
+    //    buildx's standard "load image into local daemon") because the
+    //    self-hosted runner's container engine (ephemerd) doesn't
+    //    implement the `/images/load` endpoint that --load POSTs to —
+    //    builds succeed and then crash at the very end with
+    //    "POST /v1.45/images/load is not yet implemented". And we *cannot*
+    //    just drop --load either: the docker-container buildx driver
+    //    keeps the result in its own cache, so `kind load docker-image`
+    //    later can't find the tag in the daemon. Tarball + image-archive
+    //    sidesteps the daemon entirely.
+    //
+    //  - podman: plain `podman build` writes the image into podman's
+    //    storage directly and `kind load docker-image` reads from there.
+    let target_dir = root.join("target");
+    std::fs::create_dir_all(&target_dir).ok();
+    let ephpm_tar = target_dir.join("ephpm-image.tar");
+    let e2e_tar = target_dir.join("ephpm-e2e-image.tar");
+
+    let docker = ce == "docker";
 
     // Build ephpm image with the specified PHP version
     if dockerfile.exists() {
-        eprintln!("==> Building ephpm container image (PHP {php_version})...");
-        let status = Command::new(ce)
-            .args(build_args)
-            .args(["-f"])
+        eprintln!("==> Building ephpm container image (PHP {php_sdk_version})...");
+        let mut cmd = Command::new(ce);
+        if docker {
+            cmd.args([
+                "buildx",
+                "build",
+                "--output",
+                &format!("type=docker,dest={}", ephpm_tar.display()),
+            ]);
+        } else {
+            cmd.arg("build");
+        }
+        cmd.args(["-f"])
             .arg(&dockerfile)
             .args([
                 "--build-arg",
-                &format!("PHP_VERSION={php_version}"),
+                &format!("PHP_SDK_VERSION={php_sdk_version}"),
                 "-t",
                 "ephpm:dev",
                 ".",
             ])
-            .current_dir(&root)
-            .status();
+            .current_dir(&root);
+
+        let status = cmd.status();
 
         if !ran_ok(&status) {
             eprintln!("error: failed to build ephpm image");
@@ -1066,13 +956,20 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
     // Build E2E test runner image
     if dockerfile_e2e.exists() {
         eprintln!("==> Building E2E test runner image...");
-        let status = Command::new(ce)
-            .args(build_args)
-            .args(["-f"])
-            .arg(&dockerfile_e2e)
-            .args(["-t", "ephpm-e2e:dev", "."])
-            .current_dir(&root)
-            .status();
+        let mut cmd = Command::new(ce);
+        if docker {
+            cmd.args([
+                "buildx",
+                "build",
+                "--output",
+                &format!("type=docker,dest={}", e2e_tar.display()),
+            ]);
+        } else {
+            cmd.arg("build");
+        }
+        cmd.args(["-f"]).arg(&dockerfile_e2e).args(["-t", "ephpm-e2e:dev", "."]).current_dir(&root);
+
+        let status = cmd.status();
 
         if !ran_ok(&status) {
             eprintln!("error: failed to build ephpm-e2e image");
@@ -1082,15 +979,47 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
         eprintln!("warning: docker/Dockerfile.e2e not found, skipping E2E image build");
     }
 
-    // Load images into Kind
+    // Load images into Kind. With docker we have tarballs from the build;
+    // with podman the images already live in podman storage.
     eprintln!("==> Loading images into Kind cluster...");
-    for image in ["ephpm:dev", "ephpm-e2e:dev"] {
-        let status = Command::new(&kind)
-            .args(["load", "docker-image", image, "--name", KIND_CLUSTER_NAME])
-            .status();
+    if docker {
+        // Single-node Kind cluster — the control-plane container is named
+        // `<cluster>-control-plane` by convention. We pass it explicitly via
+        // --nodes because the default code path runs
+        // `docker ps --filter label=io.x-k8s.kind.cluster=<name>` to enumerate
+        // nodes, and the self-hosted runner's container engine (ephemerd)
+        // returns an empty line instead of an empty list, which kind then
+        // tries to `docker inspect ''` and fails:
+        //
+        //     ERROR: failed to get role for node: ...
+        //         "docker inspect ... ''" failed with error: exit status 1
+        //         invalid container name or ID: value is empty
+        //
+        // Naming the node explicitly bypasses that lookup.
+        let control_plane = format!("{KIND_CLUSTER_NAME}-control-plane");
+        for tarball in [&ephpm_tar, &e2e_tar] {
+            if !tarball.exists() {
+                continue;
+            }
+            let status = Command::new(&kind)
+                .args(["load", "image-archive"])
+                .arg(tarball)
+                .args(["--name", KIND_CLUSTER_NAME, "--nodes", &control_plane])
+                .status();
 
-        if !ran_ok(&status) {
-            eprintln!("warning: failed to load {image} into Kind (image may not exist yet)");
+            if !ran_ok(&status) {
+                eprintln!("warning: failed to load {} into Kind", tarball.display());
+            }
+        }
+    } else {
+        for image in ["ephpm:dev", "ephpm-e2e:dev"] {
+            let status = Command::new(&kind)
+                .args(["load", "docker-image", image, "--name", KIND_CLUSTER_NAME])
+                .status();
+
+            if !ran_ok(&status) {
+                eprintln!("warning: failed to load {image} into Kind (image may not exist yet)");
+            }
         }
     }
 
@@ -1101,47 +1030,39 @@ fn build_and_load_images(ce: &str, php_version: &str) -> ExitCode {
 fn dump_pod_logs() {
     let kubectl = find_tool("kubectl");
 
-    eprintln!("--- ephpm pod logs ---");
+    eprintln!("--- ephpm pod logs (current container) ---");
+    Command::new(&kubectl).args(["logs", "-l", "app=ephpm", "--tail=200"]).status().ok();
+
+    // For CrashLoopBackOff, the previous container's tail is what shows the
+    // actual cause of death (panic, signal, etc).
+    eprintln!("--- ephpm pod logs (previous container, if any) ---");
     Command::new(&kubectl)
-        .args(["logs", "-l", "app=ephpm", "--tail=100"])
+        .args(["logs", "-l", "app=ephpm", "--previous", "--tail=200"])
         .status()
         .ok();
 
     eprintln!("--- e2e job logs ---");
-    Command::new(&kubectl)
-        .args(["logs", "job/ephpm-e2e", "--tail=200"])
-        .status()
-        .ok();
+    Command::new(&kubectl).args(["logs", "job/ephpm-e2e", "--tail=200"]).status().ok();
 
     eprintln!("--- pod status ---");
-    Command::new(&kubectl)
-        .args(["get", "pods", "-o", "wide"])
-        .status()
-        .ok();
+    Command::new(&kubectl).args(["get", "pods", "-o", "wide"]).status().ok();
+
+    // describe surfaces termination reason (OOMKilled, exit code, etc) and
+    // events (FailedScheduling, CrashLoopBackOff, probe failures).
+    eprintln!("--- ephpm pod describe ---");
+    Command::new(&kubectl).args(["describe", "pod", "-l", "app=ephpm"]).status().ok();
+
+    eprintln!("--- recent cluster events ---");
+    Command::new(&kubectl).args(["get", "events", "--sort-by=.lastTimestamp", "-A"]).status().ok();
 }
 
 /// Determine which container engine to use (podman or docker).
 fn container_engine() -> String {
-    env::var("CONTAINER_ENGINE").unwrap_or_else(|_| {
-        if has_command("podman") {
-            "podman".into()
-        } else {
-            "docker".into()
-        }
-    })
+    env::var("CONTAINER_ENGINE")
+        .unwrap_or_else(|_| if has_command("podman") { "podman".into() } else { "docker".into() })
 }
 
-// ── PHP SDK ─────────────────────────────────────────────────────────────────
-
-/// Directory where the spc binary and its build artifacts live.
-///
-/// If `SPC_DIR` is set (e.g. in the CI container image), use that directly.
-/// Otherwise, use `<workspace>/php-sdk/static-php-cli`.
-fn spc_dir() -> PathBuf {
-    env::var_os("SPC_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| workspace_root().join("php-sdk").join("static-php-cli"))
-}
+// ── workspace + platform helpers ─────────────────────────────────────────────
 
 /// Find the workspace root (directory containing the root Cargo.toml).
 fn workspace_root() -> PathBuf {
@@ -1157,50 +1078,49 @@ fn workspace_root() -> PathBuf {
     }
 }
 
-/// Building libphp.a requires a Unix C toolchain (autoconf, make, gcc).
-/// On Windows, re-execute the same command inside WSL automatically.
+/// Building ephpm requires a Unix toolchain (musl-gcc on Linux, Apple clang
+/// on macOS). On Windows, re-execute the same command inside WSL.
+///
+/// The PHP SDK itself is now a plain tarball download and works on any host
+/// with `curl` + `tar`, so `cargo xtask php-sdk` doesn't go through here —
+/// only `cargo xtask release` does, since `cargo build` for a musl target
+/// from native Windows isn't supported.
 fn require_unix(f: impl FnOnce() -> ExitCode) -> ExitCode {
     if !cfg!(windows) {
         return f();
     }
 
-    // Check WSL is available
     if !has_command("wsl") {
-        eprintln!("error: PHP SDK build requires a Unix toolchain (autoconf, make, gcc).");
-        eprintln!("Install WSL: wsl --install");
+        eprintln!("error: ephpm release builds require a Unix toolchain (musl-gcc on Linux).");
+        eprintln!("       Install WSL: wsl --install");
         return ExitCode::FAILURE;
     }
 
-    // Re-invoke the same xtask command inside WSL.
-    // WSL auto-maps the Windows CWD to /mnt/c/... so no path conversion needed.
     let args: Vec<String> = env::args().skip(1).collect();
-    // Source cargo env since bash -c doesn't run login profile
-    let xtask_cmd = format!(
-        "source \"$HOME/.cargo/env\" 2>/dev/null; cargo xtask {}",
-        args.join(" "),
-    );
+    // Source cargo env since `bash -c` does not load login profiles.
+    let xtask_cmd =
+        format!("source \"$HOME/.cargo/env\" 2>/dev/null; cargo xtask {}", args.join(" "),);
 
     eprintln!("==> Windows detected, running via WSL...");
-    let status = Command::new("wsl")
-        .args(["--", "bash", "-c", &xtask_cmd])
-        .status();
+    let status = Command::new("wsl").args(["--", "bash", "-c", &xtask_cmd]).status();
 
     if ran_ok(&status) {
         ExitCode::SUCCESS
     } else {
         eprintln!();
         eprintln!("WSL build failed. Make sure WSL has the required tools:");
-        eprintln!("  wsl -- bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh'");
-        eprintln!("  wsl -- bash -c 'sudo apt update && sudo apt install -y build-essential autoconf cmake pkg-config re2c libclang-dev musl-tools curl git'");
+        eprintln!(
+            "  wsl -- bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh'"
+        );
+        eprintln!(
+            "  wsl -- bash -c 'sudo apt update && sudo apt install -y build-essential pkg-config libclang-dev musl-tools curl git'"
+        );
         ExitCode::FAILURE
     }
 }
 
 fn has_command(name: &str) -> bool {
-    Command::new(name)
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+    Command::new(name).arg("--version").output().is_ok_and(|o| o.status.success())
 }
 
 fn ran_ok(result: &Result<std::process::ExitStatus, std::io::Error>) -> bool {
@@ -1254,11 +1174,7 @@ Subcommands:
 /// still work).
 fn hugo_command() -> Command {
     let local = workspace_root().join("bin").join(hugo_binary_name());
-    if local.exists() {
-        Command::new(local)
-    } else {
-        Command::new("hugo")
-    }
+    if local.exists() { Command::new(local) } else { Command::new("hugo") }
 }
 
 fn hugo_binary_name() -> &'static str {
@@ -1309,11 +1225,7 @@ fn docs_serve(args: &[String]) -> ExitCode {
         .arg(site_dir())
         .status();
 
-    if ran_ok(&status) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if ran_ok(&status) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 fn docs_build() -> ExitCode {
@@ -1325,10 +1237,7 @@ fn docs_build() -> ExitCode {
     }
 
     eprintln!("==> hugo --minify -s site");
-    let status = hugo_command()
-        .args(["--minify", "-s"])
-        .arg(site_dir())
-        .status();
+    let status = hugo_command().args(["--minify", "-s"]).arg(site_dir()).status();
 
     if ran_ok(&status) {
         eprintln!("==> Built to site/public/");
@@ -1350,16 +1259,9 @@ fn docs_new(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let status = hugo_command()
-        .args(["new", "content", path, "-s"])
-        .arg(site_dir())
-        .status();
+    let status = hugo_command().args(["new", "content", path, "-s"]).arg(site_dir()).status();
 
-    if ran_ok(&status) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if ran_ok(&status) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 fn docs_check() -> ExitCode {
@@ -1376,15 +1278,10 @@ fn docs_check() -> ExitCode {
 
     eprintln!("==> lychee link check on site/public/");
     let pattern = format!("{}/**/*.html", public.display());
-    let status = Command::new("lychee")
-        .args(["--no-progress", "--include-fragments", &pattern])
-        .status();
+    let status =
+        Command::new("lychee").args(["--no-progress", "--include-fragments", &pattern]).status();
 
-    if ran_ok(&status) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if ran_ok(&status) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 fn docs_deps() -> ExitCode {
@@ -1406,9 +1303,7 @@ fn docs_deps() -> ExitCode {
     if theme_marker.exists() {
         eprintln!("==> hextra theme: ok");
     } else {
-        eprintln!(
-            "==> hextra theme: MISSING — run: git submodule update --init --recursive"
-        );
+        eprintln!("==> hextra theme: MISSING — run: git submodule update --init --recursive");
         all_ok = false;
     }
 
@@ -1420,11 +1315,7 @@ fn docs_deps() -> ExitCode {
         );
     }
 
-    if all_ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    if all_ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 /// Download a pinned hugo extended binary into `./bin/`.
@@ -1442,9 +1333,7 @@ fn docs_install() -> ExitCode {
     let asset_arch = if os == "darwin" { "universal" } else { arch };
     let ext = if os == "windows" { "zip" } else { "tar.gz" };
     let asset = format!("hugo_extended_{HUGO_VERSION}_{os}-{asset_arch}.{ext}");
-    let url = format!(
-        "https://github.com/gohugoio/hugo/releases/download/v{HUGO_VERSION}/{asset}"
-    );
+    let url = format!("https://github.com/gohugoio/hugo/releases/download/v{HUGO_VERSION}/{asset}");
 
     let bin_name = hugo_binary_name();
     let dest = bin_dir.join(bin_name);
@@ -1457,16 +1346,10 @@ fn docs_install() -> ExitCode {
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(HUGO_VERSION))
             .unwrap_or(false);
         if already_pinned {
-            eprintln!(
-                "==> hugo v{HUGO_VERSION} already installed at {}",
-                dest.display()
-            );
+            eprintln!("==> hugo v{HUGO_VERSION} already installed at {}", dest.display());
             return ExitCode::SUCCESS;
         }
-        eprintln!(
-            "==> hugo at {} is a different version, replacing",
-            dest.display()
-        );
+        eprintln!("==> hugo at {} is a different version, replacing", dest.display());
         if let Err(e) = fs::remove_file(&dest) {
             eprintln!("error: failed to remove old hugo: {e}");
             return ExitCode::FAILURE;
@@ -1498,23 +1381,14 @@ fn download_and_extract_zip(url: &str, dest_dir: &Path, file_name: &str) -> bool
     let tmp = std::env::temp_dir().join(format!("ephpm-xtask-{}.zip", std::process::id()));
     let _ = fs::remove_file(&tmp);
 
-    let status = Command::new("curl")
-        .args(["-fSL", "-o"])
-        .arg(&tmp)
-        .arg(url)
-        .status();
+    let status = Command::new("curl").args(["-fSL", "-o"]).arg(&tmp).arg(url).status();
     if !ran_ok(&status) {
         let _ = fs::remove_file(&tmp);
         return false;
     }
 
-    let status = Command::new("tar")
-        .arg("-xf")
-        .arg(&tmp)
-        .arg("-C")
-        .arg(dest_dir)
-        .arg(file_name)
-        .status();
+    let status =
+        Command::new("tar").arg("-xf").arg(&tmp).arg("-C").arg(dest_dir).arg(file_name).status();
 
     let _ = fs::remove_file(&tmp);
 

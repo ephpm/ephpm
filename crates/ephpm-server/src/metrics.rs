@@ -6,11 +6,11 @@
 //! Call [`init`] once at startup. Pass the returned [`PrometheusHandle`] into
 //! [`Router`](crate::router::Router) so the `/metrics` endpoint can serve it.
 
+use ::metrics::gauge;
 use anyhow::Context;
 use http_body_util::Full;
 use hyper::body::Bytes;
 use hyper::{Response, StatusCode};
-use ::metrics::gauge;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
 /// Duration histogram buckets tuned for PHP workloads.
@@ -27,7 +27,14 @@ const MUTEX_WAIT_BUCKETS: &[f64] =
 /// Body size buckets in bytes: 100B to 10MB. Covers typical HTML (5-50KB),
 /// API JSON (1-100KB), and larger asset responses.
 const BODY_BYTES_BUCKETS: &[f64] = &[
-    100.0, 1_000.0, 10_000.0, 50_000.0, 100_000.0, 500_000.0, 1_000_000.0, 5_000_000.0,
+    100.0,
+    1_000.0,
+    10_000.0,
+    50_000.0,
+    100_000.0,
+    500_000.0,
+    1_000_000.0,
+    5_000_000.0,
     10_000_000.0,
 ];
 

@@ -19,7 +19,9 @@ cargo xtask release --target windows       # → target/x86_64-pc-windows-msvc/r
 # Note: Windows builds never include sqld (no Windows binary available from Turso)
 ```
 
-Prerequisites for `cargo xtask release`: php CLI 8.2+, composer, git, OpenSSL dev headers (`libssl-dev` on Debian/Ubuntu, `openssl-devel` on Fedora/RHEL), and C build tools (autoconf, cmake, make, etc.). The xtask handles static-php-cli and sqld downloads automatically.
+Prerequisites for `cargo xtask release`: git, curl, tar, `build-essential`, `pkg-config`, `libclang-dev` (for bindgen), and `musl-tools`/`musl-dev` on Linux (the prebuilt `libphp.a` is musl-linked). The xtask downloads the PHP SDK from `github.com/ephpm/php-sdk` releases and the sqld binary from Turso releases — no PHP CLI, Composer, or static-php-cli needed.
+
+The PHP SDK is cached at `php-sdk/<version>-<os>-<arch>/` (e.g. `php-sdk/8.5.2-linux-x86_64/`). Delete that directory to force a re-download.
 
 ## Testing
 
@@ -56,9 +58,12 @@ The `ephpm-e2e` crate is **excluded from the workspace** — it runs inside Dock
 | Dependency | Location | Purpose |
 |-----------|----------|---------|
 | **litewire** | `../litewire/crates/litewire` (path dep) | MySQL/Hrana wire protocol → SQLite translation proxy |
+| **PHP SDK** | Downloaded by `cargo xtask php-sdk` from `github.com/ephpm/php-sdk` releases | Prebuilt `libphp.a` (Linux/macOS) or `php8embed.{dll,lib}` (Windows) plus PHP headers. Pinned per minor in `xtask/src/main.rs::PHP_SDK_VERSIONS` |
 | **sqld** | Embedded via `include_bytes!()` at build time | SQLite replication server for clustered mode (v0.24.32 pinned in xtask) |
 
 litewire is a standalone project at `github.com/ephpm/litewire`. It's used as a library — ePHPm calls `LiteWire::new(backend).mysql(addr).serve()`.
+
+The PHP SDK is built by a separate pipeline at `github.com/ephpm/php-sdk` (uses static-php-cli internally). ePHPm itself doesn't depend on static-php-cli at all — it just consumes the resulting tarballs.
 
 ## Architecture: Database
 

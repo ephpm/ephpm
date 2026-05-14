@@ -57,11 +57,7 @@ pub fn set_site_store(_store: Option<std::sync::Arc<ephpm_kv::store::Store>>) {}
 fn effective_store() -> Option<Arc<Store>> {
     KV_SITE_STORE.with(|s| {
         let site = s.borrow();
-        if let Some(ref store) = *site {
-            Some(Arc::clone(store))
-        } else {
-            KV_STORE.get().cloned()
-        }
+        if let Some(ref store) = *site { Some(Arc::clone(store)) } else { KV_STORE.get().cloned() }
     })
 }
 
@@ -78,12 +74,8 @@ pub struct EphpmKvOps {
     pub get: Option<unsafe extern "C" fn(key: *const std::os::raw::c_char) -> std::os::raw::c_int>,
 
     /// Retrieve the pointer and length of the last `get` result.
-    pub get_result: Option<
-        unsafe extern "C" fn(
-            ptr: *mut *const std::os::raw::c_char,
-            len: *mut usize,
-        ),
-    >,
+    pub get_result:
+        Option<unsafe extern "C" fn(ptr: *mut *const std::os::raw::c_char, len: *mut usize)>,
 
     /// Set a key to a value. `ttl_ms` of 0 means no expiry.
     /// Returns 1 on success, 0 on failure (e.g. OOM with noeviction).
@@ -97,8 +89,7 @@ pub struct EphpmKvOps {
     >,
 
     /// Delete a key. Returns 1 if it existed, 0 if not.
-    pub del:
-        Option<unsafe extern "C" fn(key: *const std::os::raw::c_char) -> std::os::raw::c_long>,
+    pub del: Option<unsafe extern "C" fn(key: *const std::os::raw::c_char) -> std::os::raw::c_long>,
 
     /// Check if a key exists. Returns 1 if yes, 0 if no.
     pub exists:
@@ -125,9 +116,8 @@ pub struct EphpmKvOps {
 
     /// Get remaining TTL in milliseconds. Returns -1 for no expiry,
     /// -2 for missing key.
-    pub pttl: Option<
-        unsafe extern "C" fn(key: *const std::os::raw::c_char) -> std::os::raw::c_longlong,
-    >,
+    pub pttl:
+        Option<unsafe extern "C" fn(key: *const std::os::raw::c_char) -> std::os::raw::c_longlong>,
 }
 
 // ── Callback implementations ────────────────────────────────────────────
@@ -158,10 +148,7 @@ unsafe extern "C" fn kv_get(key: *const std::os::raw::c_char) -> std::os::raw::c
 }
 
 #[cfg(php_linked)]
-unsafe extern "C" fn kv_get_result(
-    ptr: *mut *const std::os::raw::c_char,
-    len: *mut usize,
-) {
+unsafe extern "C" fn kv_get_result(ptr: *mut *const std::os::raw::c_char, len: *mut usize) {
     // Safety: `ptr` and `len` are valid pointers provided by our own C code
     // in `PHP_FUNCTION(ephpm_kv_get)`. The buffer remains valid because this
     // is called on the same thread immediately after `kv_get`, and the
@@ -188,13 +175,11 @@ unsafe extern "C" fn kv_set(
     let Ok(key_str) = key_str.to_str() else {
         return 0;
     };
-    let key_str = namespaced_key(key_str);
-    // Safety: `val` points to `val_len` bytes of valid memory from PHP.
-    let val_bytes = unsafe { std::slice::from_raw_parts(val.cast::<u8>(), val_len) };
-
-    let Some(store) = KV_STORE.get() else {
+    let Some(store) = effective_store() else {
         return 0;
     };
+    // Safety: `val` points to `val_len` bytes of valid memory from PHP.
+    let val_bytes = unsafe { std::slice::from_raw_parts(val.cast::<u8>(), val_len) };
 
     let ttl = if ttl_ms > 0 {
         #[allow(clippy::cast_sign_loss)]
@@ -203,7 +188,7 @@ unsafe extern "C" fn kv_set(
         None
     };
 
-    i32::from(store.set(key_str, val_bytes.to_vec(), ttl))
+    i32::from(store.set(key_str.to_string(), val_bytes.to_vec(), ttl))
 }
 
 #[cfg(php_linked)]
@@ -284,9 +269,7 @@ unsafe extern "C" fn kv_expire(
 }
 
 #[cfg(php_linked)]
-unsafe extern "C" fn kv_pttl(
-    key: *const std::os::raw::c_char,
-) -> std::os::raw::c_longlong {
+unsafe extern "C" fn kv_pttl(key: *const std::os::raw::c_char) -> std::os::raw::c_longlong {
     // Safety: `key` is a null-terminated C string from PHP.
     let key_str = unsafe { CStr::from_ptr(key) };
     let Ok(key_str) = key_str.to_str() else {
@@ -350,8 +333,8 @@ pub fn set_store(_store: std::sync::Arc<ephpm_kv::store::Store>) {
 mod tests {
     use std::ffi::CString;
     use std::sync::{Arc, OnceLock};
-    use std::time::Duration;
     use std::thread;
+    use std::time::Duration;
 
     use ephpm_kv::store::{Store, StoreConfig};
     use serial_test::serial;
@@ -631,11 +614,7 @@ mod tests {
     #[serial]
     fn pttl_with_expiry_returns_positive() {
         let store = init_store();
-        store.set(
-            "bridge_pttl_exp".into(),
-            b"v".to_vec(),
-            Some(Duration::from_secs(60)),
-        );
+        store.set("bridge_pttl_exp".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
         let key = cstr("bridge_pttl_exp");
         // Safety: key is a valid C string.
         let ms = unsafe { kv_pttl(key.as_ptr()) };

@@ -9,6 +9,11 @@ fn main() {
     println!("cargo::rerun-if-changed=ephpm_wrapper.c");
     println!("cargo::rerun-if-env-changed=PHP_SDK_PATH");
 
+    println!(
+        "cargo::warning=ephpm-php build.rs running. PHP_SDK_PATH={:?}",
+        env::var_os("PHP_SDK_PATH")
+    );
+
     let Some(sdk_path) = env::var_os("PHP_SDK_PATH").map(PathBuf::from) else {
         // No PHP SDK available — build in stub mode.
         // The Rust code uses #[cfg(php_linked)] to gate FFI calls.
@@ -70,13 +75,19 @@ fn link_php(lib_dir: &Path, target_os: &str) {
 
     // Link additional static libraries from the SDK that static-php-cli
     // built. We probe for each library since the set varies by config.
+    println!("cargo::warning=probing for static support libs in {}", lib_dir.display());
     for static_lib in &[
-        "ssl", "crypto", "curl", "z", "xml2", "sodium", "iconv", "charset",
-        "png16", "gd", "jpeg", "freetype", "onig", "zip", "bz2", "xslt", "exslt",
+        "ssl", "crypto", "curl", "z", "xml2", "sodium", "iconv", "charset", "png16", "gd", "jpeg",
+        "freetype", "onig", "zip", "bz2", "xslt", "exslt",
     ] {
         // Unix uses libfoo.a, Windows uses foo.lib
-        let found = lib_dir.join(format!("lib{static_lib}.a")).exists()
-            || lib_dir.join(format!("{static_lib}.lib")).exists();
+        let unix_path = lib_dir.join(format!("lib{static_lib}.a"));
+        let windows_path = lib_dir.join(format!("{static_lib}.lib"));
+        let found = unix_path.exists() || windows_path.exists();
+        println!(
+            "cargo::warning=probe lib{static_lib}.a at {}: found={found}",
+            unix_path.display()
+        );
         if found {
             println!("cargo::rustc-link-lib=static={static_lib}");
         }
@@ -135,8 +146,8 @@ fn link_system_libs(target_os: &str) {
             } else {
                 println!(
                     "cargo::warning=Could not find libgcc.a for musl target. \
-                     Install a musl cross-compiler (e.g. `apt install musl-tools`) \
-                     or run `spc doctor --auto-fix`. The linker may fail with \
+                     Install a musl cross-compiler (e.g. `apt install musl-tools`). \
+                     The linker may fail with \
                      'could not find native static library `gcc`'."
                 );
             }
@@ -219,15 +230,13 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
     let include_tsrm = include_dir.join("TSRM");
     let include_sapi = include_dir.join("sapi");
 
-    let mut builder = bindgen::Builder::default()
-        .header("wrapper.h")
-        .clang_args([
-            format!("-I{}", include_dir.display()),
-            format!("-I{}", include_main.display()),
-            format!("-I{}", include_zend.display()),
-            format!("-I{}", include_tsrm.display()),
-            format!("-I{}", include_sapi.display()),
-        ]);
+    let mut builder = bindgen::Builder::default().header("wrapper.h").clang_args([
+        format!("-I{}", include_dir.display()),
+        format!("-I{}", include_main.display()),
+        format!("-I{}", include_zend.display()),
+        format!("-I{}", include_tsrm.display()),
+        format!("-I{}", include_sapi.display()),
+    ]);
 
     // When targeting musl, libclang defaults to glibc headers in /usr/include/
     // which then fail to find stddef.h. We need to:
@@ -236,9 +245,7 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
     //  3. Add clang's internal headers for stddef.h, stdarg.h, etc.
     //  4. Define _GNU_SOURCE for memrchr/mempcpy declarations
     if target_env == "musl" {
-        builder = builder
-            .clang_arg("-D_GNU_SOURCE")
-            .clang_arg("-nostdlibinc");
+        builder = builder.clang_arg("-D_GNU_SOURCE").clang_arg("-nostdlibinc");
 
         // Add clang's resource directory (contains stddef.h, stdarg.h, etc.)
         if let Some(clang_include) = find_clang_resource_include() {
@@ -259,9 +266,7 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
         builder = builder.clang_arg("--target=x86_64-pc-windows-msvc");
     } else {
         // ZTS builds: define ZTS for bindgen so PHP headers use thread-safe macros.
-        builder = builder
-            .clang_arg("-DZTS=1")
-            .clang_arg("-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
+        builder = builder.clang_arg("-DZTS=1").clang_arg("-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
     }
 
     let bindings = builder
@@ -304,9 +309,7 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
         .expect("failed to generate PHP bindings");
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out_path.join("php_bindings.rs"))
-        .expect("failed to write PHP bindings");
+    bindings.write_to_file(out_path.join("php_bindings.rs")).expect("failed to write PHP bindings");
 }
 
 /// Find clang's resource directory containing compiler-internal headers
@@ -342,11 +345,11 @@ fn find_clang_resource_include() -> Option<PathBuf> {
     None
 }
 
-/// Find the directory containing `libgcc.a` from the musl cross-compiler.
+/// Find the directory containing `libgcc.a` for musl target builds.
 ///
-/// `spc doctor --auto-fix` installs a musl GCC toolchain (e.g. under
-/// `/usr/local/musl/`). We need to add its lib directory to the linker
-/// search path so `-lgcc` resolves.
+/// `apt install musl-tools` provides the `musl-gcc` wrapper around the host
+/// GCC; the libgcc.a symbols PHP's JIT needs live there. We add that lib
+/// directory to the linker search path so `-lgcc` resolves.
 fn find_musl_libgcc() -> Option<PathBuf> {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".into());
     let musl_triple = format!("{arch}-linux-musl");
@@ -356,11 +359,9 @@ fn find_musl_libgcc() -> Option<PathBuf> {
     let gnu_triple = format!("{arch}-linux-gnu");
 
     // Common locations where musl-cross or host toolchains install libgcc.a:
-    //   /usr/local/musl/lib/gcc/<triple>/<ver>/libgcc.a  (spc doctor)
-    //   /usr/lib/gcc/<musl-triple>/<ver>/libgcc.a         (musl cross-compiler)
-    //   /usr/lib/gcc/<gnu-triple>/<ver>/libgcc.a          (host GCC via musl-tools wrapper)
+    //   /usr/lib/gcc/<musl-triple>/<ver>/libgcc.a   (musl cross-compiler)
+    //   /usr/lib/gcc/<gnu-triple>/<ver>/libgcc.a    (host GCC via musl-tools wrapper)
     let search_roots = [
-        PathBuf::from(format!("/usr/local/musl/lib/gcc/{musl_triple}")),
         PathBuf::from(format!("/usr/lib/gcc/{musl_triple}")),
         PathBuf::from(format!("/usr/lib/gcc/{gnu_triple}")),
     ];

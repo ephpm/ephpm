@@ -1,25 +1,47 @@
 # E2E test runner image.
 #
-# Builds the ephpm-e2e crate and runs its integration tests as the entrypoint.
+# Builds the ephpm-e2e crate's test binaries at image build time, then runs
+# them at container runtime with --frozen --offline so the kind pod needs
+# zero network access. Without this, `cargo test` at pod startup tries to
+# reach index.crates.io for `brotli` etc. and fails on clusters whose pod
+# DNS can't resolve external hosts.
 #
 # Build:
 #   podman build -f docker/Dockerfile.e2e -t ephpm-e2e:dev .
 
-# ── Stage 1: Build and run tests ─────────────────────────────────────────────
-
 FROM rust:1.85-bookworm
 
-WORKDIR /src
-
-# Copy only the e2e crate (it's excluded from the workspace)
-COPY crates/ephpm-e2e/ crates/ephpm-e2e/
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src/crates/ephpm-e2e
 
-# Install dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+# Layer 1 — dep cache. Only Cargo.{toml,lock} are needed to fetch deps;
+# the layer is invalidated only when those files change. We don't pass
+# --locked here because the checked-in Cargo.lock can lag the Cargo.toml
+# (ephpm-e2e is excluded from the workspace, so its lockfile isn't kept
+# in sync by routine workspace operations). Letting fetch update the
+# lockfile in this layer is fine — the later --frozen build pins it.
+COPY crates/ephpm-e2e/Cargo.toml crates/ephpm-e2e/Cargo.lock ./
+RUN mkdir -p src tests \
+    && printf 'fn main() {}\n' > src/lib.rs \
+    && cargo fetch
 
-# Run all tests
-# --no-fail-fast: run all test binaries even if one fails (better visibility).
-# --test-threads=1: serialize within each binary to avoid port/state conflicts.
-ENTRYPOINT ["cargo", "test", "--release", "--no-fail-fast", "--", "--test-threads=1", "--nocapture"]
+# Layer 2 — real source + pre-compile every test binary. After this, the
+# image carries fully-built test executables under target/release/deps/.
+# We copy only src/ and tests/ here so the Cargo.lock that layer 1's
+# `cargo fetch` regenerated isn't overwritten by the stale checked-in one
+# — otherwise --frozen below sees a mismatched lock and tries to hit
+# crates.io (and fails).
+COPY crates/ephpm-e2e/src/   ./src/
+COPY crates/ephpm-e2e/tests/ ./tests/
+# Some tests use include_str!("../../../tests/docroot/...") to embed PHP
+# fixtures that live at the project root, not under the crate. Copy them
+# into the matching path so the relative include resolves at compile time.
+COPY tests/docroot/ /src/tests/docroot/
+RUN find . -name '*.rs' -exec touch {} + \
+    && cargo test --release --no-run --frozen
+
+# Runtime: re-runs the cached test binaries. --frozen ensures cargo never
+# touches the network even if a registry refresh would otherwise be needed.
+ENTRYPOINT ["cargo", "test", "--release", "--no-fail-fast", "--frozen", "--", "--test-threads=1", "--nocapture"]

@@ -14,16 +14,16 @@ on:
 jobs:
   e2e:
     name: E2E (PHP ${{ matrix.php }})
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
-        php: ["8.4", "8.5"]
+        php: ["8.5", "8.4"]
 
     steps:
       - uses: actions/checkout@v4
-
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libclang-dev
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install E2E tools (kind, tilt, kubectl)

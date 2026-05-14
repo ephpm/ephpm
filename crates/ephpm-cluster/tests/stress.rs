@@ -9,7 +9,7 @@
 use std::fmt::Write;
 use std::time::{Duration, Instant};
 
-use ephpm_cluster::node::{start_gossip, ClusterHandle, NodeState};
+use ephpm_cluster::node::{ClusterHandle, NodeState, start_gossip};
 use ephpm_config::{ClusterConfig, ClusterKvConfig};
 
 /// Allocate a random UDP port by binding to :0 and immediately closing.
@@ -17,9 +17,7 @@ async fn random_udp_port() -> u16 {
     let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
         .await
         .expect("failed to bind UDP socket for port allocation");
-    sock.local_addr()
-        .expect("failed to get local addr")
-        .port()
+    sock.local_addr().expect("failed to get local addr").port()
 }
 
 /// Start a gossip node on the given port with the given seeds.
@@ -39,20 +37,13 @@ async fn start_node(port: u16, seeds: Vec<String>, node_id: &str) -> ClusterHand
 }
 
 /// Poll until all handles see `expected` alive nodes, or panic after `timeout`.
-async fn wait_for_convergence(
-    handles: &[&ClusterHandle],
-    expected: usize,
-    timeout: Duration,
-) {
+async fn wait_for_convergence(handles: &[&ClusterHandle], expected: usize, timeout: Duration) {
     let start = Instant::now();
     loop {
         let mut all_converged = true;
         for handle in handles {
             let nodes = handle.nodes().await;
-            let alive_count = nodes
-                .iter()
-                .filter(|n| n.state == NodeState::Alive)
-                .count();
+            let alive_count = nodes.iter().filter(|n| n.state == NodeState::Alive).count();
             if alive_count != expected {
                 all_converged = false;
                 break;
@@ -65,10 +56,7 @@ async fn wait_for_convergence(
             // Print diagnostics before panicking.
             for (i, handle) in handles.iter().enumerate() {
                 let nodes = handle.nodes().await;
-                let alive = nodes
-                    .iter()
-                    .filter(|n| n.state == NodeState::Alive)
-                    .count();
+                let alive = nodes.iter().filter(|n| n.state == NodeState::Alive).count();
                 eprintln!(
                     "  node {i} ({}) sees {alive}/{} alive nodes: {:?}",
                     handle.self_node().id,
@@ -76,9 +64,7 @@ async fn wait_for_convergence(
                     nodes,
                 );
             }
-            panic!(
-                "gossip did not converge to {expected} alive nodes within {timeout:?}"
-            );
+            panic!("gossip did not converge to {expected} alive nodes within {timeout:?}");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -102,11 +88,7 @@ async fn multi_node_convergence() {
     // node N seeds on node N-1.
     let mut handles = Vec::with_capacity(NODE_COUNT);
     for (i, &port) in ports.iter().enumerate() {
-        let seeds = if i == 0 {
-            vec![]
-        } else {
-            vec![format!("127.0.0.1:{}", ports[i - 1])]
-        };
+        let seeds = if i == 0 { vec![] } else { vec![format!("127.0.0.1:{}", ports[i - 1])] };
         let node_id = format!("stress-{i}");
         handles.push(start_node(port, seeds, &node_id).await);
     }
@@ -116,9 +98,7 @@ async fn multi_node_convergence() {
     wait_for_convergence(&refs, NODE_COUNT, TIMEOUT).await;
 
     // Verify each node sees exactly the right set of node IDs.
-    let mut expected_ids: Vec<String> = (0..NODE_COUNT)
-        .map(|i| format!("stress-{i}"))
-        .collect();
+    let mut expected_ids: Vec<String> = (0..NODE_COUNT).map(|i| format!("stress-{i}")).collect();
     expected_ids.sort();
 
     for handle in &handles {
@@ -137,11 +117,7 @@ async fn multi_node_convergence() {
         );
         let mut ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
         ids.sort();
-        assert_eq!(
-            ids, expected_ids,
-            "{} sees wrong node IDs",
-            handle.self_node().id,
-        );
+        assert_eq!(ids, expected_ids, "{} sees wrong node IDs", handle.self_node().id);
     }
 
     // Clean shutdown.
@@ -168,12 +144,7 @@ async fn node_failure_detection() {
     let node2 = start_node(port2, vec![seed], "fail-2").await;
 
     // Wait for all 3 to see each other.
-    wait_for_convergence(
-        &[&node0, &node1, &node2],
-        3,
-        TIMEOUT_CONVERGE,
-    )
-    .await;
+    wait_for_convergence(&[&node0, &node1, &node2], 3, TIMEOUT_CONVERGE).await;
 
     // Drop node2 — this shuts down its gossip listener, simulating a crash.
     drop(node2);
@@ -182,18 +153,8 @@ async fn node_failure_detection() {
     // from their live nodes list (either absent or marked Dead).
     let start = Instant::now();
     loop {
-        let n0_alive = node0
-            .nodes()
-            .await
-            .iter()
-            .filter(|n| n.state == NodeState::Alive)
-            .count();
-        let n1_alive = node1
-            .nodes()
-            .await
-            .iter()
-            .filter(|n| n.state == NodeState::Alive)
-            .count();
+        let n0_alive = node0.nodes().await.iter().filter(|n| n.state == NodeState::Alive).count();
+        let n1_alive = node1.nodes().await.iter().filter(|n| n.state == NodeState::Alive).count();
 
         // Both survivors should see exactly 2 alive nodes (themselves + the
         // other survivor). Node2 should be dead or gone.
@@ -306,15 +267,9 @@ async fn kv_replication() {
         for i in 0..KEY_COUNT {
             let key = format!("stress-key-{i:03}");
             let expected = format!("value-{i:03}");
-            let actual = handle
-                .gossip_get(&key)
-                .await
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{} missing key {key} after replication",
-                        handle.self_node().id,
-                    )
-                });
+            let actual = handle.gossip_get(&key).await.unwrap_or_else(|| {
+                panic!("{} missing key {key} after replication", handle.self_node().id)
+            });
             assert_eq!(
                 actual,
                 expected.as_bytes(),
@@ -335,11 +290,7 @@ async fn kv_replication() {
         );
         for i in 0..KEY_COUNT {
             let key = format!("stress-key-{i:03}");
-            assert!(
-                keys.contains(&key),
-                "{} gossip_keys() missing {key}",
-                handle.self_node().id,
-            );
+            assert!(keys.contains(&key), "{} gossip_keys() missing {key}", handle.self_node().id);
         }
     }
 

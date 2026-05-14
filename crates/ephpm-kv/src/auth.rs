@@ -108,11 +108,7 @@ mod tests {
 
     #[test]
     fn validate_wrong_password() {
-        assert!(!validate_site_password(
-            "secret",
-            "example.com",
-            "wrong-password"
-        ));
+        assert!(!validate_site_password("secret", "example.com", "wrong-password"));
     }
 
     #[test]

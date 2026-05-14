@@ -42,6 +42,7 @@ bytes.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rcgen.workspace = true
 
 [lints]
 workspace = true
