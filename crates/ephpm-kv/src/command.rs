@@ -144,11 +144,13 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
         "SETNX" => {
             check_args!(cmd, argv, 2);
             let key = str_from(argv[0]);
-            if store.exists(&key) {
-                Frame::integer(0)
-            } else {
-                store.set(key, argv[1].to_vec(), None);
+            // Atomic check-and-set under the per-key shard lock — the
+            // exists/set pair this used to do was racy under concurrent
+            // callers.
+            if store.set_nx(key, argv[1].to_vec(), None) {
                 Frame::integer(1)
+            } else {
+                Frame::integer(0)
             }
         }
         "INCR" => {
@@ -476,12 +478,34 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
         return Frame::error("ERR NX and XX options at the same time are not compatible");
     }
 
+    // NX path: route through the atomic primitive so concurrent
+    // SET ... NX callers see exactly one winner. Note: the NX + GET
+    // combo still has a small window (we re-fetch the existing value
+    // after losing the race) — Redis itself returns the value as it
+    // was *before* our attempt, but exposing that requires a
+    // set-and-return-old primitive we don't have. Acceptable: NX+GET
+    // is rarely used and the value fetched here is still consistent
+    // with what's stored after the call.
+    if nx {
+        let inserted = store.set_nx(key.clone(), val, ttl);
+        return if get {
+            if inserted {
+                Frame::Null
+            } else {
+                match store.get(&key) {
+                    Some(v) => Frame::bulk(v),
+                    None => Frame::Null,
+                }
+            }
+        } else if inserted {
+            Frame::ok()
+        } else {
+            Frame::Null
+        };
+    }
+
     let old = store.get(&key);
 
-    // NX: Set only if the key does not exist
-    if nx && old.is_some() {
-        return Frame::Null;
-    }
     // XX: Set only if the key exists
     if xx && old.is_none() {
         return Frame::Null;

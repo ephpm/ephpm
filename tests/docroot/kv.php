@@ -38,12 +38,12 @@ switch ($op) {
         echo "ok";
         break;
     case 'setnx':
-        if (!ephpm_kv_exists($key)) {
-            ephpm_kv_set($key, $val, $ttl);
-            echo "1";
-        } else {
-            echo "0";
-        }
+        // Use the atomic SAPI op rather than an exists+set pair — the
+        // old fixture lost the race under any concurrent setnx test
+        // (two callers could both pass exists() before either reached
+        // set()). ephpm_kv_setnx does the check-and-insert under the
+        // KV store's per-key shard lock.
+        echo ephpm_kv_setnx($key, $val, $ttl) ? "1" : "0";
         break;
     case 'mset':
         // val = "k1:v1,k2:v2,..."
