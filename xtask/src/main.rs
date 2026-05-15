@@ -865,7 +865,7 @@ fn ensure_kind_cluster() -> ExitCode {
         }
 
         let mut cmd = Command::new(&kind);
-        cmd.args(["create", "cluster", "--name", KIND_CLUSTER_NAME, "--wait", "120s"]);
+        cmd.args(["create", "cluster", "--name", KIND_CLUSTER_NAME, "--wait", "300s"]);
         if config_path.exists() {
             cmd.arg("--config").arg(&config_path);
         }
