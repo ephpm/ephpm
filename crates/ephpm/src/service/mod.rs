@@ -268,9 +268,8 @@ pub fn install() -> Result<()> {
     require_elevation()?;
     let paths = Paths::for_current_platform();
 
-    let current = std::env::current_exe().map_err(|e| ServiceError::Other(format!(
-        "failed to resolve current executable: {e}"
-    )))?;
+    let current = std::env::current_exe()
+        .map_err(|e| ServiceError::Other(format!("failed to resolve current executable: {e}")))?;
 
     copy_binary(&current, &paths.binary)?;
     let wrote = write_default_config(&paths.config, &paths.document_root)?;

@@ -120,8 +120,8 @@ pub(super) fn register(paths: &Paths) -> Result<()> {
 }
 
 pub(super) fn deregister(_paths: &Paths) -> Result<()> {
-    let manager =
-        ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT).map_err(scm_err)?;
+    let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)
+        .map_err(scm_err)?;
     match manager.open_service(SERVICE_NAME, ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS) {
         Ok(svc) => svc.delete().map_err(scm_err)?,
         Err(windows_service::Error::Winapi(e))
@@ -132,8 +132,8 @@ pub(super) fn deregister(_paths: &Paths) -> Result<()> {
 }
 
 pub(super) fn start(_paths: &Paths) -> Result<()> {
-    let manager =
-        ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT).map_err(scm_err)?;
+    let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)
+        .map_err(scm_err)?;
     let svc = manager
         .open_service(SERVICE_NAME, ServiceAccess::START | ServiceAccess::QUERY_STATUS)
         .map_err(scm_err)?;
@@ -145,8 +145,8 @@ pub(super) fn start(_paths: &Paths) -> Result<()> {
 }
 
 pub(super) fn stop(_paths: &Paths) -> Result<()> {
-    let manager =
-        ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT).map_err(scm_err)?;
+    let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)
+        .map_err(scm_err)?;
     let svc = manager
         .open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)
         .map_err(scm_err)?;
@@ -166,8 +166,8 @@ pub(super) fn restart(paths: &Paths) -> Result<()> {
 }
 
 pub(super) fn status(_paths: &Paths) -> Result<StatusReport> {
-    let manager =
-        ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT).map_err(scm_err)?;
+    let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)
+        .map_err(scm_err)?;
     let svc = match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
         Ok(s) => s,
         Err(windows_service::Error::Winapi(e))
@@ -199,8 +199,8 @@ pub(super) fn logs(paths: &Paths, follow: bool) -> Result<()> {
             std::io::Error::new(std::io::ErrorKind::NotFound, "log file does not exist"),
         ));
     }
-    let mut file = std::fs::File::open(&paths.log_file)
-        .map_err(|e| ServiceError::io(&paths.log_file, e))?;
+    let mut file =
+        std::fs::File::open(&paths.log_file).map_err(|e| ServiceError::io(&paths.log_file, e))?;
     let mut content = String::new();
     file.read_to_string(&mut content).map_err(|e| ServiceError::io(&paths.log_file, e))?;
     let stdout = std::io::stdout();
@@ -225,9 +225,8 @@ pub(super) fn logs(paths: &Paths, follow: bool) -> Result<()> {
         }
         file.seek(SeekFrom::Start(pos)).map_err(|e| ServiceError::io(&paths.log_file, e))?;
         let mut chunk = String::new();
-        let read = file
-            .read_to_string(&mut chunk)
-            .map_err(|e| ServiceError::io(&paths.log_file, e))?;
+        let read =
+            file.read_to_string(&mut chunk).map_err(|e| ServiceError::io(&paths.log_file, e))?;
         if read > 0 {
             let _ = out.write_all(chunk.as_bytes());
             let _ = out.flush();
@@ -246,9 +245,7 @@ fn add_to_system_path(paths: &Paths) -> Result<()> {
 
     let key = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
     // Query existing PATH via `reg query` to avoid a winreg dep.
-    let current = std::process::Command::new("reg")
-        .args(["query", key, "/v", "Path"])
-        .output();
+    let current = std::process::Command::new("reg").args(["query", key, "/v", "Path"]).output();
     let existing = match current {
         Ok(out) if out.status.success() => {
             let text = String::from_utf8_lossy(&out.stdout);
@@ -273,11 +270,8 @@ fn add_to_system_path(paths: &Paths) -> Result<()> {
     if already_present {
         return Ok(());
     }
-    let new_value = if existing.is_empty() {
-        install_str.clone()
-    } else {
-        format!("{existing};{install_str}")
-    };
+    let new_value =
+        if existing.is_empty() { install_str.clone() } else { format!("{existing};{install_str}") };
 
     let out = std::process::Command::new("reg")
         .args(["add", key, "/v", "Path", "/t", "REG_EXPAND_SZ", "/d", &new_value, "/f"])
@@ -307,7 +301,6 @@ const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 
 windows_service::define_windows_service!(ffi_service_main, service_main);
 
-
 /// Service-main handler. Captures the config path from SCM-passed arguments
 /// (or falls back to the default install location) and runs the normal HTTP
 /// server loop.
@@ -319,7 +312,9 @@ fn service_main(arguments: Vec<OsString>) {
     }
 }
 
-fn service_main_inner(arguments: &[OsString]) -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn service_main_inner(
+    arguments: &[OsString],
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Default to the canonical install path if SCM did not pass --config.
     let mut config_path: PathBuf = Paths::for_current_platform().config;
     let mut iter = arguments.iter().skip(1);
@@ -347,8 +342,7 @@ fn service_main_inner(arguments: &[OsString]) -> std::result::Result<(), Box<dyn
         }
     };
 
-    let status_handle =
-        service_control_handler::register(SERVICE_NAME, event_handler)?;
+    let status_handle = service_control_handler::register(SERVICE_NAME, event_handler)?;
 
     status_handle.set_service_status(ServiceStatus {
         service_type: SERVICE_TYPE,

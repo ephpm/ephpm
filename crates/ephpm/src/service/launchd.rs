@@ -138,4 +138,3 @@ mod tests {
         assert!(body.contains("<key>RunAtLoad</key>"));
     }
 }
-

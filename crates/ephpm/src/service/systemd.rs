@@ -152,9 +152,10 @@ mod tests {
             log_file: PathBuf::from("/var/log/ephpm/ephpm.log"),
         };
         let body = unit_body(&paths);
-        assert!(body.contains("ExecStart=/usr/local/bin/ephpm serve --config /etc/ephpm/ephpm.toml"));
+        assert!(
+            body.contains("ExecStart=/usr/local/bin/ephpm serve --config /etc/ephpm/ephpm.toml")
+        );
         assert!(body.contains("StandardOutput=append:/var/log/ephpm/ephpm.log"));
         assert!(body.contains("WantedBy=multi-user.target"));
     }
 }
-
