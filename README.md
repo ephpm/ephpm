@@ -24,28 +24,6 @@ How ePHPm compares to other ways of running PHP with a webserver.
 | Deployment | Single binary | Requires Caddy | Multi-process | Requires PHP + Swoole extension | Apache + modules | Separate services |
 | Container-friendly | ✓ (single binary) | ✓ (Caddy module) | ✓ | ⚠️ (PHP + extension) | ⚠️ (heavier) | ⚠️ (two services) |
 
-## Feature Status
-
-| Feature | Status |
-|---------|--------|
-| HTTP/1.1 + HTTP/2 serving | **Implemented** |
-| Static file serving | **Implemented** |
-| PHP embedding (ZTS) | **Implemented** |
-| Request routing (pretty permalinks) | **Implemented** |
-| Configuration (TOML + env vars) | **Implemented** |
-| Embedded KV store (strings, TTL, counters) | **Implemented** |
-| KV store value compression (gzip/zstd/brotli) | **Implemented** |
-| KV store CLI debugging (`ephpm kv`) | **Implemented** |
-| SAPI functions (`ephpm_kv_*` in PHP) | **Implemented** |
-| Prometheus metrics + query stats | **Implemented** |
-| Gossip clustering (SWIM via chitchat) | **Implemented** |
-| Embedded SQLite — single-node (litewire + rusqlite) | **Implemented** |
-| Embedded SQLite — clustered HA (litewire + sqld) | **Implemented** |
-| TLS (manual cert/key + ACME/Let's Encrypt) | **Implemented** |
-| Virtual hosts (directory-based, multi-tenant) | **Implemented** |
-| Admin UI / API | Planned |
-| OpenTelemetry export | Planned |
-
 ## Install
 
 ePHPm is a single self-managing binary — it registers and controls its own system service. There is no install script.
@@ -348,19 +326,19 @@ E2E commands require Podman or Docker. Run `cargo xtask e2e-install` to download
 
 ## Docs
 
-- [Getting started](docs/developer/getting-started.md) — Prerequisites, building, IDE setup
-- [Testing strategy](docs/developer/testing.md) — Unit tests, Tilt + Kind E2E, database testing
-- [E2E test coverage](docs/testing/e2e.md) — 170+ tests across single-node and cluster
-- [Architecture decisions](docs/architecture/architecture.md) — Language choice, crate design, PHP execution modes
-- [Implementation guide](docs/architecture/implementation.md) — Build system, CI, MVP spec
-- [CLI design](docs/architecture/cli.md) — Command structure, UX principles
-- [Security model](docs/architecture/security.md) — Threat model, FFI safety, trust boundaries
-- [Clustering](docs/architecture/clustering.md) — SWIM gossip, consistent hash ring, two-tier KV
-- [DB proxy](docs/architecture/db-proxy.md) — MySQL wire protocol, connection pooling, query analysis
-- [Kubernetes deployment](docs/architecture/kubernetes.md) — Helm chart, StatefulSet, gossip DNS
-- [Observability](docs/architecture/metrics.md) — Prometheus metrics, histogram buckets, phased rollout
-- [Embedded SQL](docs/architecture/sql.md) — litewire integration, sqld lifecycle, single-node vs HA
-- [Competitive analysis](docs/analysis/) — FrankenPHP, RoadRunner, Swoole comparisons
+- [Getting started](https://ephpm.dev/developer/getting-started/) — Prerequisites, building, IDE setup
+- [Testing strategy](https://ephpm.dev/developer/testing/) — Unit tests, Tilt + Kind E2E, database testing
+- [E2E test coverage](https://ephpm.dev/testing/e2e/) — 170+ tests across single-node and cluster
+- [Architecture decisions](https://ephpm.dev/architecture/) — Language choice, crate design, PHP execution modes
+- [Implementation guide](https://ephpm.dev/architecture/implementation/) — Build system, CI, MVP spec
+- [CLI design](https://ephpm.dev/architecture/cli/) — Command structure, UX principles
+- [Security model](https://ephpm.dev/architecture/security/) — Threat model, FFI safety, trust boundaries
+- [Clustering](https://ephpm.dev/architecture/clustering/) — SWIM gossip, consistent hash ring, two-tier KV
+- [DB proxy](https://ephpm.dev/architecture/db-proxy/) — MySQL wire protocol, connection pooling, query analysis
+- [Kubernetes deployment](https://ephpm.dev/architecture/kubernetes/) — Helm chart, StatefulSet, gossip DNS
+- [Observability](https://ephpm.dev/architecture/metrics/) — Prometheus metrics, histogram buckets, phased rollout
+- [Embedded SQL](https://ephpm.dev/architecture/sql/) — litewire integration, sqld lifecycle, single-node vs HA
+- [Competitive analysis](https://ephpm.dev/analysis/) — FrankenPHP, RoadRunner, Swoole comparisons
 
 ## Related Projects
 
