@@ -75,7 +75,35 @@ Not implemented: hashes, lists, sets, transactions, `SCAN`, pub/sub. ePHPm targe
 
 ### Multi-tenant note
 
-The RESP listener exposes the **whole** store with no per-vhost filtering. In multi-tenant deployments (`[server] sites_dir = ...`) keep `[kv.redis_compat] enabled = false` and use the SAPI functions, which are automatically namespaced per virtual host. ePHPm derives a per-site password from the master `[kv] secret` and injects it into PHP's `$_ENV` as `EPHPM_REDIS_PASSWORD`.
+The RESP listener can be shared across virtual hosts — each site is isolated by AUTH. When both `[kv] secret` and `[server] sites_dir` are set, ePHPm derives a per-site password as `HMAC-SHA256(secret, hostname)` (lowercase hex, 64 chars) and injects four env vars into every PHP request so the site's code can connect without any per-vhost configuration:
+
+```
+EPHPM_REDIS_HOST       # from [kv.redis_compat] listen
+EPHPM_REDIS_PORT
+EPHPM_REDIS_USERNAME   # the vhost hostname (e.g. alice-blog.com)
+EPHPM_REDIS_PASSWORD   # HMAC-SHA256(secret, hostname) hex
+```
+
+The RESP server validates the incoming `AUTH <username> <password>` against the same derivation, so requests authenticated as `alice-blog.com` only see alice's `DashMap`. Bob's connection sees a separate one even though both hit the same TCP port.
+
+A PHP app consumes them like any other Redis credentials — Predis, phpredis, or the `ephpm_kv_*` SAPI functions all work without code changes:
+
+```php
+$redis = new Predis\Client([
+    'scheme'   => 'tcp',
+    'host'     => $_SERVER['EPHPM_REDIS_HOST'],
+    'port'     => (int) $_SERVER['EPHPM_REDIS_PORT'],
+    'username' => $_SERVER['EPHPM_REDIS_USERNAME'],
+    'password' => $_SERVER['EPHPM_REDIS_PASSWORD'],
+]);
+$redis->set('cache:page:home', $html);
+```
+
+If `[kv] secret` is unset, no env vars are injected and the RESP listener treats the connection as the global store — fine for single-site mode, never use that combination with `sites_dir` set.
+
+### Automatic value compression
+
+`ephpm_kv_set()` (and the RESP `SET` family) auto-compress values according to the global `[kv]` block — `compression = "gzip" | "brotli" | "zstd"` plus `compression_level` and `compression_min_size`. Values smaller than `compression_min_size` are stored raw. `ephpm_kv_get()` transparently decompresses, so PHP code only ever sees the original bytes regardless of how the value was stored. Mixed compression settings during the lifetime of a store are safe — each entry remembers whether it was compressed when it was written. See [Configuration reference](/reference/config/) for the exact knobs.
 
 ## Common patterns
 

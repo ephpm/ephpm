@@ -28,6 +28,8 @@ How ePHPm compares to other ways of running PHP with a webserver.
 
 ePHPm is a single self-managing binary — it registers and controls its own system service. There is no install script.
 
+> Prefer containers? `docker run -p 8080:8080 ephpm/ephpm:latest`. See the [Docker section of the install docs](https://ephpm.dev/getting-started/install/#docker) for the full tag scheme.
+
 ### Linux / macOS
 
 Download the latest binary from [Releases](https://github.com/ephpm/ephpm/releases), unpack, then:

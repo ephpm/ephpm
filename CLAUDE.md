@@ -73,10 +73,12 @@ Three database modes, all transparent to PHP (`pdo_mysql` connects to `127.0.0.1
 2. **Single-node SQLite** (`[db.sqlite]`) — litewire + rusqlite in-process, no external database
 3. **Clustered SQLite** (`[db.sqlite]` + `[cluster]`) — litewire + sqld sidecar, WAL frame replication via gRPC
 
-Mode detection:
+Mode detection (`is_clustered_sqlite()` in `crates/ephpm-server/src/lib.rs`):
 - If `replication.role = "primary"` or `"replica"` → clustered
 - If `replication.role = "auto"` AND `cluster.enabled = true` → clustered (election via gossip)
 - Otherwise → single-node (rusqlite in-process)
+
+Note that `replication.role` defaults to `"auto"`. So omitting `[db.sqlite.replication]` entirely is identical to setting `role = "auto"` — clustered mode if `[cluster].enabled = true`, single-node otherwise. To force single-node even with clustering on, set `replication.role` to anything other than `"primary"`, `"replica"`, or `"auto"` (e.g. `"single"`).
 
 Clustered mode spawns sqld as a child process. Primary election uses the gossip KV tier (`kv:sqlite:primary`). On failover, the role-change watcher restarts sqld in the new mode.
 
