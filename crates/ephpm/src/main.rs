@@ -11,6 +11,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
+mod service;
+
 /// ePHPm — All-in-one PHP application server
 #[derive(Parser, Debug)]
 #[command(name = "ephpm", version, about)]
@@ -60,6 +62,44 @@ enum Commands {
 
         #[command(subcommand)]
         subcommand: KvSubcommand,
+    },
+
+    /// Install ephpm as a system service and start it
+    Install,
+
+    /// Uninstall the system service
+    Uninstall {
+        /// Keep the configuration file and data directory in place
+        #[arg(long)]
+        keep_data: bool,
+    },
+
+    /// Start the installed service
+    Start,
+
+    /// Stop the installed service
+    Stop,
+
+    /// Restart the installed service
+    Restart,
+
+    /// Show service status (PID, uptime, listen address)
+    Status,
+
+    /// Tail the service log file
+    Logs {
+        /// Follow the log (like `tail -f`)
+        #[arg(short, long)]
+        follow: bool,
+    },
+
+    /// Internal: run as a Windows service (invoked by SCM, not by users)
+    #[cfg(windows)]
+    #[command(hide = true)]
+    ServiceRun {
+        /// Path to the configuration file
+        #[arg(long, default_value = "C:\\ProgramData\\ephpm\\ephpm.toml")]
+        config: PathBuf,
     },
 }
 
@@ -117,7 +157,64 @@ fn run() -> anyhow::Result<ExitCode> {
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
             rt.block_on(run_kv(&host, port, subcommand))
         }
+        Some(Commands::Install) => run_service_cmd(service::install),
+        Some(Commands::Uninstall { keep_data }) => {
+            run_service_cmd(|| service::uninstall(keep_data))
+        }
+        Some(Commands::Start) => run_service_cmd(service::start),
+        Some(Commands::Stop) => run_service_cmd(service::stop),
+        Some(Commands::Restart) => run_service_cmd(service::restart),
+        Some(Commands::Status) => run_service_cmd(service::status),
+        Some(Commands::Logs { follow }) => run_service_cmd(|| service::logs(follow)),
+        #[cfg(windows)]
+        Some(Commands::ServiceRun { .. }) => {
+            // Hand control over to the Windows service dispatcher, which calls
+            // back into our service-main once SCM is ready. The config path is
+            // re-read inside `service_main` from the SCM-passed arguments so
+            // the value parsed here is ignored.
+            service::windows::run_as_service()
+                .map(|()| ExitCode::SUCCESS)
+                .map_err(|e| anyhow::anyhow!("service dispatcher failed: {e}"))
+        }
         other => run_serve_sync(other),
+    }
+}
+
+/// Initialise a small tracing subscriber for service-management commands so
+/// `tracing::info!` calls in the `service` module show up on the console.
+fn ensure_cli_tracing() {
+    use std::sync::Once;
+
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = tracing_subscriber::registry()
+            .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+            .with(tracing_subscriber::fmt::layer().with_target(false))
+            .try_init();
+    });
+}
+
+/// Dispatch a service-management command and convert the result into an
+/// `ExitCode`. All service errors are propagated through `anyhow` with context.
+fn run_service_cmd<F>(f: F) -> anyhow::Result<ExitCode>
+where
+    F: FnOnce() -> service::Result<()>,
+{
+    ensure_cli_tracing();
+    f().context("service command failed")?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Entry point used by the Windows service worker thread. Reads the config at
+/// `config` and runs the HTTP server until shutdown.
+#[cfg(windows)]
+pub(crate) fn run_serve_with_config(config: PathBuf) -> anyhow::Result<()> {
+    let cmd = Commands::Serve { config, listen: None, document_root: None, verbose: 0 };
+    let code = run_serve_sync(Some(cmd))?;
+    if matches!(code, ExitCode::SUCCESS) {
+        Ok(())
+    } else {
+        anyhow::bail!("server exited with non-zero status")
     }
 }
 
@@ -554,5 +651,77 @@ async fn kv_ttl(host: &str, port: u16, key: &str) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::FAILURE)
         }
         (a, b) => anyhow::bail!("unexpected response: {a} / {b}"),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use clap::Parser as _;
+
+    use super::*;
+
+    #[test]
+    fn parses_install_subcommand() {
+        let cli = Cli::try_parse_from(["ephpm", "install"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Install)));
+    }
+
+    #[test]
+    fn parses_uninstall_with_keep_data_flag() {
+        let cli = Cli::try_parse_from(["ephpm", "uninstall", "--keep-data"]).unwrap();
+        match cli.command {
+            Some(Commands::Uninstall { keep_data }) => assert!(keep_data),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_uninstall_default_keeps_no_data() {
+        let cli = Cli::try_parse_from(["ephpm", "uninstall"]).unwrap();
+        match cli.command {
+            Some(Commands::Uninstall { keep_data }) => assert!(!keep_data),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_lifecycle_subcommands() {
+        assert!(matches!(
+            Cli::try_parse_from(["ephpm", "start"]).unwrap().command,
+            Some(Commands::Start)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ephpm", "stop"]).unwrap().command,
+            Some(Commands::Stop)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ephpm", "restart"]).unwrap().command,
+            Some(Commands::Restart)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["ephpm", "status"]).unwrap().command,
+            Some(Commands::Status)
+        ));
+    }
+
+    #[test]
+    fn parses_logs_with_follow() {
+        let cli = Cli::try_parse_from(["ephpm", "logs", "--follow"]).unwrap();
+        match cli.command {
+            Some(Commands::Logs { follow }) => assert!(follow),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["ephpm", "logs", "-f"]).unwrap();
+        match cli.command {
+            Some(Commands::Logs { follow }) => assert!(follow),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["ephpm", "logs"]).unwrap();
+        match cli.command {
+            Some(Commands::Logs { follow }) => assert!(!follow),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }
