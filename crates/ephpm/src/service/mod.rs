@@ -64,6 +64,11 @@ pub enum ServiceError {
     },
 
     /// The service backend reports the service is not installed.
+    ///
+    /// Currently only constructed by the Windows SCM backend; the systemd
+    /// and launchd backends fall back to running the underlying CLI and
+    /// surface its error verbatim via [`ServiceError::Command`].
+    #[cfg_attr(not(windows), allow(dead_code))]
     #[error("service is not installed — run `ephpm install` first")]
     NotInstalled,
 
