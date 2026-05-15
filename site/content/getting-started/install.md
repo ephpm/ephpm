@@ -3,7 +3,36 @@ title = "Install"
 weight = 1
 +++
 
-ePHPm ships as a single binary that manages itself. There's no install script — the binary registers and controls its own system service.
+ePHPm ships as a single binary that manages itself. There's no install script — the binary registers and controls its own system service. For trying it out without touching the host, a Docker image is also published.
+
+## Docker
+
+```bash
+docker run -p 8080:8080 ephpm/ephpm:latest
+```
+
+That starts ePHPm with default settings on `http://localhost:8080`. Mount your document root at `/var/www/html` and your config at `/etc/ephpm/ephpm.toml` to serve a real site:
+
+```bash
+docker run -p 8080:8080 \
+  -v /path/to/site:/var/www/html \
+  -v /path/to/ephpm.toml:/etc/ephpm/ephpm.toml \
+  ephpm/ephpm:latest
+```
+
+### Tags
+
+| Tag | What it tracks |
+|-----|----------------|
+| `ephpm/ephpm:latest` | Rolling latest release with the default PHP minor |
+| `ephpm/ephpm:8.5` / `ephpm/ephpm:8.4` | Rolling latest release pinned to a PHP minor |
+| `ephpm/ephpm:vX.Y.Z` | Pinned ePHPm release with the default PHP minor |
+| `ephpm/ephpm:vX.Y.Z-php8.5` | Pinned release × rolling PHP minor |
+| `ephpm/ephpm:vX.Y.Z-php8.5.2` | Pinned release × pinned PHP patch (fully reproducible) |
+
+Real SemVer build metadata uses `+` (`v0.0.1+php8.5.2`), but OCI tags reject `+`, so Docker tags substitute `-` while the upstream `+` form is preserved on each image's `org.opencontainers.image.version` label — the same trade-off k3s and rke2 make.
+
+For the standalone binary install path (single-binary, self-installing, no container runtime needed), grab an archive from [Releases](https://github.com/ephpm/ephpm/releases) and continue with the Linux / macOS or Windows section below.
 
 ## Linux / macOS
 

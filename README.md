@@ -28,6 +28,8 @@ How ePHPm compares to other ways of running PHP with a webserver.
 
 ePHPm is a single self-managing binary — it registers and controls its own system service. There is no install script.
 
+> Prefer containers? `docker run -p 8080:8080 ephpm/ephpm:latest`. See the [Docker section of the install docs](https://ephpm.dev/getting-started/install/#docker) for the full tag scheme.
+
 ### Linux / macOS
 
 Download the latest binary from [Releases](https://github.com/ephpm/ephpm/releases), unpack, then:
@@ -180,6 +182,76 @@ PHP (pdo_mysql) → litewire (MySQL wire :3306) → SQL Translator → SQLite ba
 In single-node mode, the backend is `rusqlite` (in-process, zero overhead). In clustered mode, it switches to an HTTP client talking to the local sqld instance. Either way, PHP sees a MySQL server at `127.0.0.1:3306`.
 
 See [docs/architecture/sql.md](docs/architecture/sql.md) for the full architecture, failover details, and configuration reference.
+
+## KV Store: Three Ways to Use It, Zero External Services
+
+ePHPm ships a `DashMap`-backed in-process key-value store with TTLs, atomic counters, hashes, LRU eviction, and optional value compression (gzip/zstd/brotli). No Redis server, no extension to install. Like the database, you pick the access pattern — the data lives in the same binary either way.
+
+### 1. Already use phpredis / predis? Speak RESP
+
+The KV store speaks Redis RESP2 on `127.0.0.1:6379`. Existing PHP code using `phpredis`, `predis`, or any other Redis client connects unchanged. Commands implemented: `GET` / `SET` / `SETEX` / `SETNX` / `MGET` / `MSET` / `INCR` / `DECR` / `INCRBY` / `DECRBY` / `APPEND` / `STRLEN` / `GETSET` / `DEL` / `EXISTS` / `EXPIRE` / `PEXPIRE` / `TTL` / `PTTL` / `PERSIST` / `TYPE` / `RENAME` / `KEYS` / `DBSIZE` / `HSET` / `HGET` / `HDEL` / `HGETALL` / `HKEYS` / `HVALS` / `HLEN` / `HEXISTS` / `AUTH` / `PING` / `ECHO` / `INFO`.
+
+```toml
+[kv]
+memory_limit = "256MB"
+eviction_policy = "allkeys-lru"   # noeviction | allkeys-lru | volatile-lru | allkeys-random
+compression = "zstd"              # none | gzip | brotli | zstd  (transparent, per-value)
+
+[kv.redis_compat]
+enabled = true                    # off by default — multi-tenant deployments should keep it off
+listen = "127.0.0.1:6379"
+```
+
+### 2. Want zero round-trips? Use the native PHP functions
+
+Every request gets a set of `ephpm_kv_*` functions registered as part of the ePHPm SAPI — they call directly into the in-process store with no socket, no protocol parse, no serialization. No extension to install, no client library to configure. In multi-tenant (`sites_dir`) mode they are automatically namespaced per virtual host — each site sees its own keyspace.
+
+```php
+ephpm_kv_set('cart:42', $json, 3600);   // value, TTL seconds
+$cart = ephpm_kv_get('cart:42');
+ephpm_kv_incr_by('views:home', 1);
+ephpm_kv_expire('session:abc', 1800);
+ephpm_kv_del('cart:42');
+```
+
+Available: `ephpm_kv_get`, `set`, `del`, `exists`, `incr`, `decr`, `incr_by`, `expire`, `ttl`, `pttl`. These are the recommended API for multi-tenant deployments — the RESP listener has no per-tenant namespace filtering, so leave it disabled and let PHP go through the SAPI bridge.
+
+### 3. Need HA? Use the clustered KV tier
+
+In a cluster, the KV store becomes a two-tier distributed store with no extra moving parts — it piggybacks on the same SWIM gossip layer used for SQLite primary election.
+
+- **Small values** (< 1 KB by default) ride the **gossip tier** — eventually consistent, replicated to every node, sub-millisecond reads everywhere.
+- **Large values** live on a **consistent-hash data plane** — each key is owned by N nodes (configurable replication factor), fetched on demand via TCP, with optional hot-key promotion that caches frequently-fetched remote values locally.
+- **Failover** — when a node leaves the gossip view, the hash ring rebalances and owned keys migrate to the next replicas. No primary, no election — every node can read and write.
+
+```toml
+[cluster]
+enabled = true
+join = ["ephpm-headless.default.svc.cluster.local"]
+
+[cluster.kv]
+small_key_threshold = 1024        # bytes — under this, replicate via gossip
+replication_factor = 3            # large keys: 3 owners on the ring
+replication_mode = "async"        # async | sync
+hot_key_cache = true              # cache hot remote values locally
+hot_key_max_memory = "64MB"
+```
+
+### Multi-tenant security
+
+When `sites_dir` is set, each virtual host gets its own isolated keyspace. The `ephpm_kv_*` PHP functions are namespaced automatically. For the RESP endpoint, ePHPm derives a per-site password from `HMAC-SHA256(kv.secret, hostname)` and injects it into PHP `$_ENV` as `EPHPM_REDIS_PASSWORD` for each request — so `phpredis` can `AUTH` without any per-site config in your code.
+
+### How it works under the hood
+
+```
+PHP → ephpm_kv_*  (in-process function call, ~ns)
+PHP → phpredis → :6379 (RESP2)  →  DashMap store
+            cluster mode ↓
+        gossip tier (small values, eventually consistent)
+        data plane  (large values, consistent-hash, replicated)
+```
+
+The store is a single `DashMap<String, Entry>` with concurrent reads/writes, async TTL expiry, and an approximate-memory tracker driving eviction. Compression is applied per-value above a size threshold and is transparent on read. In clustered mode the same `Store` is wrapped with a routing layer that consults the hash ring for non-local keys.
 
 ## Query Stats & Observability
 

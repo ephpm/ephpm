@@ -97,6 +97,18 @@ PHP installs a `SIGPROF` handler for `max_execution_time`. This signal is proces
 
 PHP uses `setjmp`/`longjmp` for error handling. All PHP calls go through `ephpm_wrapper.c` which wraps execution in `zend_try`/`zend_catch`. PHP 8.x `exit()`/`die()` throws an unwind exit exception, which we detect and treat as a normal response (with captured output).
 
+### PHP Fatal → HTTP 500
+
+A PHP fatal error must surface as an HTTP 500 even though the embed SAPI gives us several different ways for one to happen. `ephpm_execute_request()` in `ephpm_wrapper.c` covers two distinct detection paths:
+
+1. **`zend_bailout()` longjmp.** Out-of-memory, max-execution-time, and the older fatal-class errors call `zend_bailout()`, which longjmps out of `php_execute_script`. The `SETJMP(__bailout) == 0` guard in the wrapper catches that case and sets `fatal_bailout = 1`.
+
+2. **PHP 8.x uncaught `Throwable`.** When a script throws and nothing catches it, `zend_exception_error()` formats the message via `zend_error_va(... | E_DONT_BAIL ...)` and lets `php_execute_script` return normally. `SETJMP` sees nothing — no longjmp ever happens. To catch this path the wrapper also checks `PG(last_error_type)` against a fatal-class mask (`E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR | E_RECOVERABLE_ERROR | E_PARSE`). Without that second check, "Fatal error: Uncaught Error: Call to undefined function …" comes back as `200 OK`.
+
+`PG(last_error_type)` is reset to `0` before each request so a fatal from a previous reuse of the embed request can't leak into the next one.
+
+Once a fatal has been detected by either path, the wrapper only overrides the status when it is still the default `200`. Anything the script set explicitly via `http_response_code()` or `exit($status)` is preserved — the contract is "200 → 500 on fatal", not "always 500 on fatal".
+
 ## SAPI Callbacks
 
 | Callback | Purpose |
@@ -147,6 +159,22 @@ PHP must be initialized **before** the tokio runtime to avoid signal conflicts:
 - Gzip compression for compressible content types above minimum size
 - `Cache-Control` header when configured
 - `ETag` generation (weak, hash-based) + `If-None-Match` → 304 Not Modified
+
+### Percent-Decoding of URI Paths
+
+hyper hands the router the raw URI path, so `/test%2Ehtml` would otherwise be looked up as the literal name `test%2Ehtml`. Before any routing or filesystem lookup happens, the request path is run through `percent_decode_path()` (in `crates/ephpm-server/src/router.rs`) so `%XX` escapes resolve to their bytes — `/test%2Ehtml` becomes `/test.html` and matches the file on disk.
+
+The decoder is deliberately strict:
+
+| Input | Result |
+|-------|--------|
+| `%XX` with valid hex | decoded to the byte |
+| Truncated `%`, `%X` (one digit) | 400 Bad Request |
+| Non-hex digits (`%ZZ`, `%G1`) | 400 Bad Request |
+| Encoded slash (`%2F`) or backslash (`%5C`) | 400 Bad Request |
+| Decoded byte stream not valid UTF-8 | 400 Bad Request |
+
+Rejecting `%2F` / `%5C` is what keeps percent encoding from being used to sneak past path-traversal protection or prefix-based blocks like `/vendor/*` — a request such as `/vendor%2Fconfig.php` cannot decode into a `/`-containing path that bypasses the glob check. UTF-8 validation on the decoded bytes lets non-ASCII paths work normally while still rejecting malformed escape sequences.
 
 ## PHP Response Cache (Phase 2 — requires KV store)
 

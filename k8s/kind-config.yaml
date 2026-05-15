@@ -4,3 +4,14 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
+# Bump kubeadm's wait-control-plane budget from the 4m default. On
+# shared GitHub Actions runners the kube-apiserver pod regularly takes
+# 5–7 minutes to pass /healthz, which trips the default deadline and
+# fails the whole job (api-check: "context deadline exceeded"). Three
+# xtask retries × 4m each can't recover from a deterministic miss.
+kubeadmConfigPatches:
+  - |
+    apiVersion: kubeadm.k8s.io/v1beta3
+    kind: ClusterConfiguration
+    apiServer:
+      timeoutForControlPlane: 10m0s

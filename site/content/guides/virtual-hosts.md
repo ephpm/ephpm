@@ -60,12 +60,17 @@ Most sites need zero configuration — they inherit PHP settings, timeouts, and 
 # site.toml — only set what you want to override
 [php]
 memory_limit = "256M"             # this site needs more memory
+max_execution_time = 120          # long-running admin import scripts
+ini_overrides = [
+    ["display_errors", "On"],     # staging vhost — surface errors in-page
+    ["upload_max_filesize", "32M"],
+]
 
 [db.sqlite]
 path = "/mnt/fast-ssd/alice.db"   # custom database location
 ```
 
-Everything not specified in `site.toml` falls through to the global `ephpm.toml`.
+The `[php]` block in `site.toml` has the same shape as the global `[php]` block in `ephpm.toml` — every key documented for `PhpConfig` (`memory_limit`, `max_execution_time`, `ini_file`, `ini_overrides`, `workers`) is overridable per site. Everything not specified in `site.toml` falls through to the global `ephpm.toml`. Lists like `ini_overrides` are replaced wholesale, not merged element-wise — if you set `ini_overrides` per site you take ownership of the full list for that site.
 
 ### SQLite Database Location
 
