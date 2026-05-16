@@ -2,6 +2,8 @@
 
 Run PHP applications without the infrastructure. No PHP-FPM, no MySQL server, no Redis, no reverse proxy, no certbot. One binary, one config file. Drop in WordPress or Laravel and go. When you need more, it's already built in: MySQL connection pooling, read/write splitting, a Redis-compatible KV store, clustered SQLite with automatic failover, TLS, and Prometheus metrics. One binary from `localhost` to production — same runtime in development, CI, staging, and prod. No environment drift, no deployment surprises.
 
+Designed by [@luthermonson](https://github.com/luthermonson) in Arizona 🌵 Assembled in [Claude Opus 4.6](https://claude.ai).
+
 ## Why ePHPm?
 
 How ePHPm compares to other ways of running PHP with a webserver.
