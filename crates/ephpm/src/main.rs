@@ -60,6 +60,12 @@ enum Commands {
         #[arg(short, long, default_value_t = 8080u16)]
         port: u16,
 
+        /// Sites directory for `*.localhost` vhosting. Each subdirectory
+        /// becomes a vhost reachable at `http://<name>.localhost:<port>` —
+        /// no /etc/hosts edit required (RFC 6761 covers `*.localhost`).
+        #[arg(short, long)]
+        sites: Option<PathBuf>,
+
         /// Increase log verbosity (-v = debug, -vv = trace)
         #[arg(short, long, action = clap::ArgAction::Count)]
         verbose: u8,
@@ -199,13 +205,13 @@ fn run() -> anyhow::Result<ExitCode> {
                 .map(|()| ExitCode::SUCCESS)
                 .map_err(|e| anyhow::anyhow!("service dispatcher failed: {e}"))
         }
-        Some(Commands::Dev { listen, document_root, port, verbose }) => {
-            run_dev(listen, document_root, port, verbose)
+        Some(Commands::Dev { listen, document_root, port, sites, verbose }) => {
+            run_dev(listen, document_root, port, sites, verbose)
         }
         // Bare `ephpm` (no subcommand) is the dev-mode entry point. Service
         // backends always invoke the binary with explicit `serve --config`
         // arguments, so this default never executes under SCM/systemd/launchd.
-        None => run_dev(None, None, 8080, 0),
+        None => run_dev(None, None, 8080, None, 0),
         other @ Some(Commands::Serve { .. }) => run_serve_sync(other),
     }
 }
@@ -263,6 +269,7 @@ fn run_dev(
     listen: Option<String>,
     document_root: Option<PathBuf>,
     port: u16,
+    sites: Option<PathBuf>,
     verbose: u8,
 ) -> anyhow::Result<ExitCode> {
     let mut config = ephpm_config::Config::default_config()
@@ -285,6 +292,15 @@ fn run_dev(
         None => std::env::current_dir().context("failed to read current directory")?,
     };
 
+    // When --sites is provided, point the vhost machinery at it and enable
+    // the `.localhost` suffix-stripping so on-disk dirs are short names
+    // (`blog/`) while browsers use `blog.localhost:<port>`.
+    if let Some(sites_path) = sites {
+        let canonical = sites_path.canonicalize().unwrap_or_else(|_| sites_path.clone());
+        config.server.sites_dir = Some(canonical);
+        config.server.sites_domain_suffix = Some(".localhost".into());
+    }
+
     print_dev_banner(&config);
     run_with_config(config, verbose)
 }
@@ -295,16 +311,62 @@ fn run_dev(
 fn print_dev_banner(config: &ephpm_config::Config) {
     let version = env!("CARGO_PKG_VERSION");
     let url = format!("http://{}", config.server.listen);
-    let doc_root = config.server.document_root.display();
     let php = ephpm_php::PhpRuntime::php_version();
+
+    // Pull the port out of the listen address for vhost URLs.
+    let port = config.server.listen.rsplit(':').next().unwrap_or("8080");
 
     println!();
     println!("  ePHPm {version} — dev server");
-    println!("    serving:  {doc_root}");
-    println!("    url:      {url}");
+
+    if let Some(sites_dir) = &config.server.sites_dir {
+        println!("    sites:    {}", sites_dir.display());
+        match list_site_dirs(sites_dir) {
+            Ok(entries) if !entries.is_empty() => {
+                let suffix = config.server.sites_domain_suffix.as_deref().unwrap_or("");
+                println!("    routing:");
+                for name in entries {
+                    println!("              http://{name}{suffix}:{port}  →  {name}/");
+                }
+                println!(
+                    "              http://localhost:{port}              →  document_root fallback"
+                );
+            }
+            Ok(_) => println!(
+                "    routing:  (sites directory is empty — create subdirectories to add vhosts)"
+            ),
+            Err(e) => println!("    routing:  (could not enumerate sites: {e})"),
+        }
+        println!("    fallback: {}", config.server.document_root.display());
+    } else {
+        println!("    serving:  {}", config.server.document_root.display());
+        println!("    url:      {url}");
+    }
+
     println!("    php:      {php}");
     println!("    press ctrl+c to stop");
     println!();
+}
+
+/// List the immediate subdirectory names under `sites_dir`, sorted, lowercased,
+/// excluding dotfiles. Used by the banner — not authoritative for routing
+/// (the router does lazy discovery for dirs created after startup).
+fn list_site_dirs(sites_dir: &std::path::Path) -> std::io::Result<Vec<String>> {
+    let mut names: Vec<String> = std::fs::read_dir(sites_dir)?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                return None;
+            }
+            Some(name.to_ascii_lowercase())
+        })
+        .collect();
+    names.sort();
+    Ok(names)
 }
 
 /// Probe ports starting at `start_port` on `host`, returning the first one
