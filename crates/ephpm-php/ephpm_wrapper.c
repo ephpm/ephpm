@@ -1320,7 +1320,14 @@ PS_UPDATE_TIMESTAMP_FUNC(ephpm)
 
 /* ── ps_module registration ─────────────────────────────────────── */
 
-static const ps_module ps_mod_ephpm = PS_MOD_UPDATE_TIMESTAMP(ephpm);
+/* PS_MOD_UPDATE_TIMESTAMP expands to a comma-separated list of values
+ * (the handler's name + 9 function pointers) — the surrounding braces
+ * are the caller's job. Without them the comma-list is interpreted as
+ * a sequence of fresh declarations and collides with the function
+ * definitions above ("redeclared as different kind of symbol" cascade
+ * across every ps_*_ephpm symbol). PHP's own ext/session/mod_files.c
+ * uses the same braced form. */
+static const ps_module ps_mod_ephpm = { PS_MOD_UPDATE_TIMESTAMP(ephpm) };
 
 /* ===== INI file path ===== */
 /* Holds the custom ini file path set via ephpm_set_ini_file() */
