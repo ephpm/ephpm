@@ -10,8 +10,9 @@ ePHPm uses a layered testing approach: fast unit tests for inner logic, a dedica
 |-------|------|---------------|-------|
 | Unit | `cargo nextest` | Config parsing, routing logic, SAPI mapping, response building | Seconds |
 | Integration | `cargo nextest` (ignored by default) | PHP execution, WordPress lifecycle — requires libphp | Seconds (with SDK) |
+| Local e2e | `cargo test -p ephpm --test <name>` | Real binary spawned as a child against the loopback listener — vhost routing, HTTP correctness | Sub-second per test |
 | Elevated lifecycle | `cargo test --ignored` (env-gated, root/Administrator) | Real SCM / systemd / launchd install → uninstall flow | ~15s per platform |
-| E2E | `ephpm-e2e` crate + Tilt + Kind | Full stack against real K8s infrastructure | Minutes |
+| E2E (cluster) | `ephpm-e2e` crate + Tilt + Kind | Full stack against real K8s infrastructure, pod-to-pod networking | Minutes |
 | Benchmarks | Criterion | Throughput, latency p99 — requires libphp | Minutes |
 
 ---
@@ -31,6 +32,75 @@ Integration tests that require PHP are `#[ignore]` by default. Run them after bu
 ```bash
 cargo nextest run --workspace --run-ignored all
 ```
+
+---
+
+## Virtual Host Testing (`*.localhost`)
+
+ePHPm supports multi-tenant hosting: a `sites_dir` containing one subdirectory per virtual host, and incoming requests are routed by `Host` header to the matching directory's document root. This is wired in `crates/ephpm-server/src/router.rs::resolve_site` and exercised by both the Kind e2e suite and a fast local-process test.
+
+### How routing works
+
+Two paths populate the vhost registry:
+
+- **Startup scan** (`scan_sites_dir`) — at server boot, every immediate subdirectory of `sites_dir` becomes a registered vhost keyed by the lowercased directory name.
+- **Lazy filesystem fallback** — when a request arrives for an unknown `Host`, the router checks whether `<sites_dir>/<host>` exists on disk and serves from it if so. New sites appear without restarting.
+
+When `server.sites_domain_suffix` is set (e.g. `.localhost`), the router strips that suffix from the cleaned `Host` value before both the registry lookup and the lazy check. That lets developers keep short directory names (`~/sites/blog/`) while their browser hits `http://blog.localhost:8080`. Hosts without the suffix (`Host: blog` directly) still resolve via the bare key.
+
+If nothing matches, the request falls through to `server.document_root`.
+
+### Dev-mode workflow with `*.localhost`
+
+`ephpm dev --sites <DIR>` enables the suffix-stripping path so testing in a browser is friction-free. Per RFC 6761, **every** subdomain of `localhost` already resolves to 127.0.0.1 — no `/etc/hosts` edit, no DNS, no elevation. Chrome (since 2018), Firefox 65+, Safari, and curl all honor this.
+
+```bash
+$ mkdir -p ~/sites/{blog,shop,wiki}
+$ echo '<h1>blog</h1>' > ~/sites/blog/index.html
+$ echo '<h1>shop</h1>' > ~/sites/shop/index.html
+$ ephpm dev --sites ~/sites
+  ePHPm 0.1.0 — dev server
+    sites:    /home/luther/sites
+    routing:
+              http://blog.localhost:8080  →  blog/
+              http://shop.localhost:8080  →  shop/
+              http://wiki.localhost:8080  →  wiki/
+              http://localhost:8080       →  document_root fallback
+    fallback: /home/luther/sites
+    php:      8.5.2
+    press ctrl+c to stop
+```
+
+A subdirectory created after startup is picked up by the lazy fallback on the next matching request — no restart needed:
+
+```bash
+$ mkdir ~/sites/admin && echo '<h1>admin</h1>' > ~/sites/admin/index.html
+$ curl http://admin.localhost:8080/         # served from sites/admin/ immediately
+```
+
+### Local-process test (`vhost_routing`)
+
+`crates/ephpm/tests/vhost_routing.rs` covers the same behavior in CI without needing Kind. It:
+
+1. Builds a `tempfile::tempdir()` with `blog/`, `shop/`, `wiki/` subdirs.
+2. Spawns `target/release/ephpm dev --sites <tempdir> --port <picked>` as a child process.
+3. Drains stdout + stderr in threads so the piped child doesn't back-pressure (banner goes to stdout, tracing to stdout too — both must be read).
+4. Waits for the `HTTP listening` log line before issuing requests.
+5. Hits the loopback listener with custom `Host:` headers and asserts the served body matches the per-site `index.html`.
+6. Adds a directory mid-test to confirm lazy discovery works.
+7. A `Drop` guard kills the child even on panic so the listener doesn't leak.
+
+```bash
+cargo test -p ephpm --test vhost_routing --release -- --nocapture
+```
+
+Runs in well under a second on a warm cache. Use this as the template for any future local-process e2e test — same shape, different assertions.
+
+### Kind counterpart (`vhosts.rs`)
+
+`crates/ephpm-e2e/tests/vhosts.rs` exercises the same logic against a pod-deployed ephpm with `EPHPM_SITES_DIR` mounted from a hostPath that the test runner Job can write to. It's slower (it pays the Kind/Tilt orchestration cost) but verifies that the routing also works through K8s service DNS and that the multi-tenant `security_p0` policies (open_basedir, disable_functions, RESP auth) compose correctly with vhost selection.
+
+**Rule of thumb**: prefer the local test for routing correctness assertions; keep the Kind path for the small set of assertions that genuinely need pod-to-pod networking or the in-pod filesystem layout. Don't duplicate — if a property is covered locally, the Kind test should focus on cluster-specific behavior, not re-assert the same routing logic.
 
 ---
 
@@ -307,6 +377,8 @@ Each job builds ephpm with the specified PHP version, deploys it to a Kind clust
 |------|---------|----------------------|
 | HTTP routing, config, CLI | `cargo build` + `cargo nextest` | None (stub mode) |
 | PHP execution | `cargo xtask release` + `cargo nextest --run-ignored all` | PHP SDK |
+| Local vhost routing | `cargo test -p ephpm --test vhost_routing -- --nocapture` | None — spawns the binary directly |
+| Test a local site in a browser | `ephpm dev --sites ~/sites` | None — `*.localhost` resolves to 127.0.0.1 |
 | Service install lifecycle | `EPHPM_ELEVATED_E2E=1 cargo test -p ephpm --test service_lifecycle -- --ignored` | Root/Administrator + real service manager |
 | E2E tests (headless) | `cargo xtask e2e --php-version 8.5` | Kind + Podman/Docker |
 | E2E dev environment | `cargo xtask e2e-up --php-version 8.5` | Kind + Podman/Docker |

@@ -60,6 +60,10 @@ pub struct Router {
     /// Optional path to the sites directory for lazy vhost discovery.
     /// When set, unknown hosts are checked against the filesystem.
     sites_dir: Option<PathBuf>,
+    /// Lowercased domain suffix (e.g. `.localhost`) stripped from incoming
+    /// `Host` headers before vhost resolution. Lets dev-mode users keep
+    /// short directory names while their browser uses `*.localhost`.
+    sites_domain_suffix: Option<String>,
     index_files: Vec<String>,
     fallback: Vec<String>,
     server_port: u16,
@@ -180,6 +184,11 @@ impl Router {
             document_root: config.server.document_root.clone(),
             sites,
             sites_dir: config.server.sites_dir.clone(),
+            sites_domain_suffix: config
+                .server
+                .sites_domain_suffix
+                .as_ref()
+                .map(|s| s.to_ascii_lowercase()),
             index_files: config.server.index_files.clone(),
             fallback: config.server.fallback.clone(),
             server_port: port,
@@ -271,21 +280,38 @@ impl Router {
         // Strip port and trailing dot, lowercase.
         let clean = host.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
 
-        // Check the startup-scanned registry first.
+        // If a domain suffix is configured (e.g. `.localhost`), peel it off
+        // first so `blog.localhost` looks up the `blog/` directory. Falls
+        // back to the literal name if the host doesn't end with the suffix.
+        let stripped = self
+            .sites_domain_suffix
+            .as_deref()
+            .and_then(|suffix| clean.strip_suffix(suffix))
+            .map(str::to_owned);
+        let lookup_keys: &[&str] = match stripped.as_deref() {
+            Some(s) => &[s, clean.as_str()][..],
+            None => &[clean.as_str()][..],
+        };
+
+        // Check the startup-scanned registry first for each candidate key.
         // Verify the directory still exists — it may have been removed (teardown).
-        if let Some(site) = self.sites.get(&clean) {
-            if site.document_root.is_dir() {
-                return (site.document_root.clone(), &site.index_files, &site.fallback);
+        for key in lookup_keys {
+            if let Some(site) = self.sites.get(*key) {
+                if site.document_root.is_dir() {
+                    return (site.document_root.clone(), &site.index_files, &site.fallback);
+                }
             }
         }
 
         // Lazy filesystem check: if sites_dir is set and the directory exists,
         // serve from it. No restart needed — new sites are discovered on demand.
         if let Some(ref sites_dir) = self.sites_dir {
-            let candidate = sites_dir.join(&clean);
-            if candidate.is_dir() {
-                tracing::info!(host = %clean, path = %candidate.display(), "discovered new virtual host (lazy)");
-                return (candidate, &self.index_files, &self.fallback);
+            for key in lookup_keys {
+                let candidate = sites_dir.join(key);
+                if candidate.is_dir() {
+                    tracing::info!(host = %clean, key = %key, path = %candidate.display(), "discovered new virtual host (lazy)");
+                    return (candidate, &self.index_files, &self.fallback);
+                }
             }
         }
 

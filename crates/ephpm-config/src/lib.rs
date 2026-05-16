@@ -46,6 +46,18 @@ pub struct ServerConfig {
     #[serde(default)]
     pub sites_dir: Option<PathBuf>,
 
+    /// Optional domain suffix to strip from incoming `Host` headers when
+    /// resolving vhosts. When set (e.g. `.localhost`), a directory named
+    /// `~/sites/blog/` matches `Host: blog.localhost` — the suffix is
+    /// stripped before the registry lookup and the on-disk lazy fallback.
+    ///
+    /// Primarily used by `ephpm dev --sites` so developers can keep short
+    /// directory names while testing with `*.localhost` URLs. Production
+    /// deployments typically leave this unset and name directories with
+    /// the full FQDN (`~/sites/blog.example.com/`).
+    #[serde(default)]
+    pub sites_domain_suffix: Option<String>,
+
     /// Index file names to try when a directory is requested.
     #[serde(default = "default_index_files")]
     pub index_files: Vec<String>,
@@ -1159,6 +1171,7 @@ impl Default for ServerConfig {
             listen: default_listen(),
             document_root: default_document_root(),
             sites_dir: None,
+            sites_domain_suffix: None,
             index_files: default_index_files(),
             fallback: default_fallback(),
             request: RequestConfig::default(),
