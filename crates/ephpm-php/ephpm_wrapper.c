@@ -37,6 +37,7 @@
 #include "Zend/zend_exceptions.h"
 #include "Zend/zend_globals.h"
 #include "main/php_version.h"
+#include "ext/session/php_session.h"
 
 /* ===== Per-thread state =====
  *
@@ -1065,6 +1066,269 @@ static const zend_function_entry ephpm_kv_functions[] = {
     PHP_FE_END
 };
 
+/* ===================================================================
+ * Native session save handler — `session.save_handler = ephpm`.
+ *
+ * Stores PHP's serialised session blob in the same KV store used by the
+ * ephpm_kv_* native functions. Because that store is automatically
+ * site-namespaced in multi-tenant mode and replicated by the cluster
+ * layer, sessions inherit per-tenant isolation and affinity-free load
+ * balancing without any userland code or extra config.
+ *
+ * Wired via php_session_register_module() from inside our MINIT shim
+ * (ephpm_module_startup) — that is the only safe window in which the
+ * session extension's module list is initialised but PHP has not yet
+ * fired RINIT for any thread, so the registration is visible to every
+ * tokio worker that later copies GLOBAL_FUNCTION_TABLE / module_registry.
+ *
+ * Keys are namespaced as "session:<sid>". TTL comes from
+ * session.gc_maxlifetime; we refresh it on every write and on every
+ * timestamp update (so an active session does not expire mid-page).
+ * =================================================================== */
+
+#define EPHPM_SESSION_KEY_PREFIX "session:"
+#define EPHPM_SESSION_KEY_PREFIX_LEN (sizeof(EPHPM_SESSION_KEY_PREFIX) - 1)
+
+/*
+ * Build the KV key for a session id on the caller's stack when possible,
+ * falling back to emalloc for unusually long sids. Returns a pointer that
+ * the caller must release with `ephpm_session_key_free(buf, on_stack)`
+ * when finished. `stack_buf` must be at least 64 bytes.
+ */
+static char *ephpm_session_make_key(const char *sid, size_t sid_len,
+                                    char *stack_buf, size_t stack_buf_len,
+                                    int *used_heap)
+{
+    size_t need = EPHPM_SESSION_KEY_PREFIX_LEN + sid_len + 1;
+    char *buf;
+    if (need <= stack_buf_len) {
+        buf = stack_buf;
+        *used_heap = 0;
+    } else {
+        buf = (char *)emalloc(need);
+        *used_heap = 1;
+    }
+    memcpy(buf, EPHPM_SESSION_KEY_PREFIX, EPHPM_SESSION_KEY_PREFIX_LEN);
+    memcpy(buf + EPHPM_SESSION_KEY_PREFIX_LEN, sid, sid_len);
+    buf[EPHPM_SESSION_KEY_PREFIX_LEN + sid_len] = '\0';
+    return buf;
+}
+
+static void ephpm_session_key_free(char *buf, int used_heap)
+{
+    if (used_heap) {
+        efree(buf);
+    }
+}
+
+/* Read TTL (in seconds) from session.gc_maxlifetime, clamped to >= 0. */
+static long long ephpm_session_ttl_ms(void)
+{
+    /* PS(gc_maxlifetime) is a zend_long. 0 or negative => no expiry. */
+    long long lifetime = (long long)PS(gc_maxlifetime);
+    if (lifetime <= 0) {
+        return 0;
+    }
+    return lifetime * 1000LL;
+}
+
+/* ── PS_OPEN / PS_CLOSE ─────────────────────────────────────────── */
+
+PS_OPEN_FUNC(ephpm)
+{
+    /* save_path is irrelevant — we store in the in-process KV. session_name
+     * is the cookie name and is already tracked by ext/session. Nothing to
+     * do here, but we must not fail because php_session_initialize() bails
+     * on any non-SUCCESS return. */
+    (void)save_path;
+    (void)session_name;
+    (void)mod_data;
+    return SUCCESS;
+}
+
+PS_CLOSE_FUNC(ephpm)
+{
+    (void)mod_data;
+    return SUCCESS;
+}
+
+/* ── PS_READ ────────────────────────────────────────────────────── */
+
+PS_READ_FUNC(ephpm)
+{
+    (void)mod_data;
+    (void)maxlifetime;
+
+    if (!g_kv_ops.get || !g_kv_ops.get_result) {
+        /* No store wired — behave like an empty session rather than failing. */
+        *val = ZSTR_EMPTY_ALLOC();
+        return SUCCESS;
+    }
+
+    const char *sid_str = ZSTR_VAL(key);
+    size_t sid_len = ZSTR_LEN(key);
+    char stack[128];
+    int used_heap = 0;
+    char *kv_key = ephpm_session_make_key(sid_str, sid_len, stack, sizeof(stack), &used_heap);
+
+    if (!g_kv_ops.get(kv_key)) {
+        ephpm_session_key_free(kv_key, used_heap);
+        /* Missing keys are NOT an error — return an empty string so PHP
+         * treats the session as new. */
+        *val = ZSTR_EMPTY_ALLOC();
+        return SUCCESS;
+    }
+
+    const char *ptr = NULL;
+    size_t len = 0;
+    g_kv_ops.get_result(&ptr, &len);
+    *val = zend_string_init(ptr ? ptr : "", len, 0);
+    ephpm_session_key_free(kv_key, used_heap);
+    return SUCCESS;
+}
+
+/* ── PS_WRITE ───────────────────────────────────────────────────── */
+
+PS_WRITE_FUNC(ephpm)
+{
+    (void)mod_data;
+    (void)maxlifetime;
+
+    if (!g_kv_ops.set) {
+        return FAILURE;
+    }
+
+    const char *sid_str = ZSTR_VAL(key);
+    size_t sid_len = ZSTR_LEN(key);
+    char stack[128];
+    int used_heap = 0;
+    char *kv_key = ephpm_session_make_key(sid_str, sid_len, stack, sizeof(stack), &used_heap);
+
+    long long ttl_ms = ephpm_session_ttl_ms();
+    int ok = g_kv_ops.set(kv_key, ZSTR_VAL(val), ZSTR_LEN(val), ttl_ms);
+    ephpm_session_key_free(kv_key, used_heap);
+
+    return ok ? SUCCESS : FAILURE;
+}
+
+/* ── PS_DESTROY ─────────────────────────────────────────────────── */
+
+PS_DESTROY_FUNC(ephpm)
+{
+    (void)mod_data;
+
+    if (!g_kv_ops.del) {
+        return SUCCESS;
+    }
+
+    const char *sid_str = ZSTR_VAL(key);
+    size_t sid_len = ZSTR_LEN(key);
+    char stack[128];
+    int used_heap = 0;
+    char *kv_key = ephpm_session_make_key(sid_str, sid_len, stack, sizeof(stack), &used_heap);
+    (void)g_kv_ops.del(kv_key);
+    ephpm_session_key_free(kv_key, used_heap);
+    return SUCCESS;
+}
+
+/* ── PS_GC ──────────────────────────────────────────────────────── */
+
+PS_GC_FUNC(ephpm)
+{
+    /* The KV store enforces TTLs natively (lazy expiry on access + active
+     * reaper). PHP's GC sweep would be redundant work — report "0 sessions
+     * cleaned" via *nrdels and let the store do the right thing. */
+    (void)mod_data;
+    (void)maxlifetime;
+    if (nrdels) {
+        *nrdels = 0;
+    }
+    return 0;
+}
+
+/* ── PS_CREATE_SID ──────────────────────────────────────────────── */
+
+PS_CREATE_SID_FUNC(ephpm)
+{
+    /* Delegate to PHP's own SID generator so session.sid_length /
+     * session.sid_bits_per_character / session.hash_function stay honoured.
+     * php_session_create_id is the official entrypoint other save handlers
+     * (files, memcached, redis) use for the same reason. */
+    (void)mod_data;
+    return php_session_create_id(NULL);
+}
+
+/* ── PS_VALIDATE_SID ────────────────────────────────────────────── */
+
+PS_VALIDATE_SID_FUNC(ephpm)
+{
+    /* Required so session.use_strict_mode = 1 actually rejects forged SIDs
+     * — PHP only accepts a client-supplied SID if validate() reports
+     * SUCCESS. Return SUCCESS iff the key already exists in the store. */
+    (void)mod_data;
+
+    if (!g_kv_ops.exists) {
+        return FAILURE;
+    }
+
+    const char *sid_str = ZSTR_VAL(key);
+    size_t sid_len = ZSTR_LEN(key);
+    char stack[128];
+    int used_heap = 0;
+    char *kv_key = ephpm_session_make_key(sid_str, sid_len, stack, sizeof(stack), &used_heap);
+    int found = g_kv_ops.exists(kv_key);
+    ephpm_session_key_free(kv_key, used_heap);
+    return found ? SUCCESS : FAILURE;
+}
+
+/* ── PS_UPDATE_TIMESTAMP ────────────────────────────────────────── */
+
+PS_UPDATE_TIMESTAMP_FUNC(ephpm)
+{
+    /* session.lazy_write = 1 (the default in modern PHP) skips PS_WRITE
+     * when the serialised session blob is unchanged but still wants the
+     * TTL refreshed. Use EXPIRE rather than SET so we don't rewrite the
+     * potentially-large value blob on every request. */
+    (void)mod_data;
+    (void)maxlifetime;
+
+    if (!g_kv_ops.expire) {
+        /* Fall back to a full write if EXPIRE is unavailable. */
+        return ps_write_ephpm(mod_data, key, val, maxlifetime);
+    }
+
+    const char *sid_str = ZSTR_VAL(key);
+    size_t sid_len = ZSTR_LEN(key);
+    char stack[128];
+    int used_heap = 0;
+    char *kv_key = ephpm_session_make_key(sid_str, sid_len, stack, sizeof(stack), &used_heap);
+
+    long long ttl_ms = ephpm_session_ttl_ms();
+    int ok = 1;
+    if (ttl_ms > 0) {
+        ok = g_kv_ops.expire(kv_key, ttl_ms);
+        if (!ok && g_kv_ops.set) {
+            /* Key may have expired between read and update — restore it
+             * by falling through to a full write so the session is not
+             * silently dropped. */
+            ok = g_kv_ops.set(kv_key, ZSTR_VAL(val), ZSTR_LEN(val), ttl_ms);
+        }
+    }
+    ephpm_session_key_free(kv_key, used_heap);
+    return ok ? SUCCESS : FAILURE;
+}
+
+/* ── ps_module registration ─────────────────────────────────────── */
+
+/* PS_MOD_UPDATE_TIMESTAMP expands to a comma-separated list of values
+ * (the handler's name + 9 function pointers) — the surrounding braces
+ * are the caller's job. Without them the comma-list is interpreted as
+ * a sequence of fresh declarations and collides with the function
+ * definitions above ("redeclared as different kind of symbol" cascade
+ * across every ps_*_ephpm symbol). PHP's own ext/session/mod_files.c
+ * uses the same braced form. */
+static const ps_module ps_mod_ephpm = { PS_MOD_UPDATE_TIMESTAMP(ephpm) };
+
 /* ===== INI file path ===== */
 /* Holds the custom ini file path set via ephpm_set_ini_file() */
 static const char *custom_ini_file = NULL;
@@ -1115,7 +1379,25 @@ void ephpm_set_ini_file(const char *ini_file)
 static int ephpm_module_startup(sapi_module_struct *sm)
 {
     sm->additional_functions = ephpm_kv_functions;
-    return php_module_startup(sm, NULL);
+    int ret = php_module_startup(sm, NULL);
+
+    /* Register the native "ephpm" session save handler. Must happen after
+     * php_module_startup() — the session extension's MINIT is what wires up
+     * the global module list this call inserts into. Doing it earlier
+     * (before php_module_startup) crashes because the session extension's
+     * own globals aren't constructed yet; doing it later (after
+     * php_embed_init returns) is too late under ZTS, since the main
+     * thread's CG/EG state has already been frozen into GLOBAL_FUNCTION_TABLE
+     * for new worker threads to copy.
+     *
+     * php_session_register_module() returns 0 on success, but practically
+     * cannot fail (it's an EG_HASH append). Even if it does, we don't
+     * unwind module startup — users who haven't configured the handler
+     * pay nothing for the absence. */
+    if (ret == SUCCESS) {
+        (void)php_session_register_module(&ps_mod_ephpm);
+    }
+    return ret;
 }
 
 /*
