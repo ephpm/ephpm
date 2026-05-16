@@ -316,13 +316,54 @@ pub fn uninstall(keep_data: bool) -> Result<()> {
             std::fs::remove_dir_all(&paths.data_dir)
                 .map_err(|e| ServiceError::io(&paths.data_dir, e))?;
         }
+        // Clear out the log dir + any shared parent (`C:\ProgramData\ephpm`,
+        // `/var/log/ephpm`) that the install created. `remove_dir_all` on the
+        // log dir handles open log files; the parent removal is best-effort
+        // (only succeeds when empty).
+        if let Some(log_dir) = paths.log_file.parent()
+            && log_dir.exists()
+        {
+            let _ = std::fs::remove_dir_all(log_dir);
+        }
+        if let Some(config_parent) = paths.config.parent() {
+            let _ = std::fs::remove_dir(config_parent);
+        }
     }
 
     if paths.binary.exists() {
-        std::fs::remove_file(&paths.binary).map_err(|e| ServiceError::io(&paths.binary, e))?;
+        remove_with_retry(&paths.binary)?;
+    }
+    // Best-effort: drop the install directory if it's now empty. The Unix
+    // backends install into /usr/local/bin which is shared; `remove_dir` only
+    // succeeds when empty, so this is safe.
+    if let Some(parent) = paths.binary.parent() {
+        let _ = std::fs::remove_dir(parent);
     }
     tracing::info!("ephpm service uninstalled");
     Ok(())
+}
+
+/// Try to delete `path` up to ~3 seconds, sleeping 100ms between attempts.
+/// On Windows the SCM may still hold a handle to a just-exited service
+/// binary for a brief moment after `query_status` reports Stopped, so a
+/// naive `remove_file` races against the kernel releasing the lock.
+fn remove_with_retry(path: &Path) -> Result<()> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match std::fs::remove_file(path) {
+            Ok(()) => return Ok(()),
+            Err(e) if std::time::Instant::now() < deadline => {
+                let kind = e.kind();
+                // On Windows the locked-file error surfaces as PermissionDenied.
+                // Anything else (NotFound, etc.) we surface immediately.
+                if kind != std::io::ErrorKind::PermissionDenied {
+                    return Err(ServiceError::io(path, e));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => return Err(ServiceError::io(path, e)),
+        }
+    }
 }
 
 /// Start the installed service.

@@ -456,7 +456,29 @@ fn run_with_config(config: ephpm_config::Config, verbose: u8) -> anyhow::Result<
         EnvFilter::new(level)
     });
 
-    let fmt_layer = tracing_subscriber::fmt::layer();
+    // If a service backend launched us (e.g. Windows SCM), it sets
+    // EPHPM_SERVICE_LOG_FILE so the main tracing layer can be routed to disk
+    // — without that, SCM-detached stdout swallows every event and `ephpm
+    // logs` has nothing to read. Unix backends rely on systemd/launchd's
+    // built-in stdout redirection, so this branch is effectively Windows-only.
+    let (fmt_layer, _service_log_guard) = match std::env::var_os("EPHPM_SERVICE_LOG_FILE") {
+        Some(raw) if !raw.is_empty() => {
+            let path = PathBuf::from(raw);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let dir = path.parent().map_or_else(|| PathBuf::from("."), PathBuf::from);
+            let file_name = path
+                .file_name()
+                .map_or_else(|| "ephpm.log".to_string(), |f| f.to_string_lossy().into_owned());
+            let (writer, guard) =
+                tracing_appender::non_blocking(tracing_appender::rolling::never(dir, file_name));
+            let layer =
+                tracing_subscriber::fmt::layer().with_writer(writer).with_ansi(false).boxed();
+            (layer, Some(guard))
+        }
+        _ => (tracing_subscriber::fmt::layer().boxed(), None),
+    };
 
     // Set up access log file writer if configured.
     let _access_guard = if config.server.logging.access.is_empty() {

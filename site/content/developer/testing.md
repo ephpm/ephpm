@@ -11,6 +11,7 @@ ePHPm uses a layered testing approach: fast unit tests for inner logic, a dedica
 | Unit | `cargo nextest` | Config parsing, routing logic, SAPI mapping, response building | Seconds |
 | Integration | `cargo nextest` (ignored by default) | PHP execution, WordPress lifecycle — requires libphp | Seconds (with SDK) |
 | Local e2e | `cargo test -p ephpm --test <name>` | Real binary spawned as a child against the loopback listener — vhost routing, HTTP correctness | Sub-second per test |
+| Elevated lifecycle | `cargo test --ignored` (env-gated, root/Administrator) | Real SCM / systemd / launchd install → uninstall flow | ~15s per platform |
 | E2E (cluster) | `ephpm-e2e` crate + Tilt + Kind | Full stack against real K8s infrastructure, pod-to-pod networking | Minutes |
 | Benchmarks | Criterion | Throughput, latency p99 — requires libphp | Minutes |
 
@@ -100,6 +101,56 @@ Runs in well under a second on a warm cache. Use this as the template for any fu
 `crates/ephpm-e2e/tests/vhosts.rs` exercises the same logic against a pod-deployed ephpm with `EPHPM_SITES_DIR` mounted from a hostPath that the test runner Job can write to. It's slower (it pays the Kind/Tilt orchestration cost) but verifies that the routing also works through K8s service DNS and that the multi-tenant `security_p0` policies (open_basedir, disable_functions, RESP auth) compose correctly with vhost selection.
 
 **Rule of thumb**: prefer the local test for routing correctness assertions; keep the Kind path for the small set of assertions that genuinely need pod-to-pod networking or the in-pod filesystem layout. Don't duplicate — if a property is covered locally, the Kind test should focus on cluster-specific behavior, not re-assert the same routing logic.
+
+---
+
+## Elevated Service Lifecycle Tests
+
+The `ephpm install / start / stop / restart / status / logs / uninstall` subcommands drive the real platform service manager — SCM on Windows, systemd on Linux, launchd on macOS. None of those can be meaningfully mocked, so the tests that cover them mutate real system state and are kept out of every default run.
+
+The single test lives at `crates/ephpm/tests/service_lifecycle.rs` and walks the full lifecycle: install → status (verify pid) → stop → status (verify no pid) → start → restart (verify pid changed) → logs (verify non-empty) → `uninstall --keep-data` → reinstall on preserved data → full uninstall → idempotent re-uninstall.
+
+### Safety gates
+
+The test will only run when **both** gates are satisfied:
+
+1. `#[ignore]` keeps it out of `cargo test` and CI by default.
+2. `EPHPM_ELEVATED_E2E=1` must be set in the environment — even when passing `--ignored`. This is a tripwire against running it by accident on a machine that already cares about its `ephpm` install.
+
+Additionally, the test refuses to run if the canonical install binary already exists at `C:\Program Files\ephpm\ephpm.exe` (Windows) or `/usr/local/bin/ephpm` (Unix). That's almost certainly a production install the developer doesn't want clobbered.
+
+A `Drop` guard runs `ephpm uninstall` on the way out so a panicking test still tears the service down rather than leaving the developer's machine with a stuck SCM entry or systemd unit.
+
+### Running
+
+**Windows** (elevated PowerShell — Administrator):
+
+```powershell
+$env:EPHPM_ELEVATED_E2E="1"
+cargo test -p ephpm --test service_lifecycle -- --ignored --nocapture
+```
+
+**Linux** (needs systemd as PID 1 — Docker containers without systemd skip automatically):
+
+```bash
+sudo EPHPM_ELEVATED_E2E=1 cargo test -p ephpm --test service_lifecycle -- --ignored --nocapture
+```
+
+**macOS**:
+
+```bash
+sudo EPHPM_ELEVATED_E2E=1 cargo test -p ephpm --test service_lifecycle -- --ignored --nocapture
+```
+
+### Writing a new elevated test
+
+If you add another test that needs root / Administrator and mutates system paths, follow the same pattern:
+
+1. **Gate on both `#[ignore]` and the env var.** The env var carries a short reason describing what gets mutated, e.g. `EPHPM_ELEVATED_E2E`. Don't reuse it for a test that touches a different subsystem — define a new gate so a developer running one doesn't accidentally trigger the others.
+2. **Refuse if the canonical paths already exist.** Treat any pre-existing install as "production state, hands off". Abort the test with a clear message — don't try to clean up or coexist.
+3. **Install a `Drop` guard that performs the inverse operation.** Best-effort, swallowing errors — the cleanup is a safety net, not a correctness assertion. `uninstall` already had to be idempotent for the production flow, so the guard composes naturally.
+4. **Don't assert on platform-specific state strings.** `running` (Windows) vs `active` (systemd) vs `loaded` (launchd) all mean the same thing. Assert on the structural fields that ePHPm itself normalizes — the `pid:` line in `status` output is `<numeric>` when the service is up and `-` when it's down, regardless of backend. There's a `pid_from_status` helper in `service_lifecycle.rs` that's worth copying.
+5. **On Linux, skip cleanly when `systemctl` is absent.** WSL without systemd, Docker without systemd, and similar environments are common — let the test print a `SKIP:` message and return rather than failing on a missing binary.
 
 ---
 
@@ -328,6 +379,7 @@ Each job builds ephpm with the specified PHP version, deploys it to a Kind clust
 | PHP execution | `cargo xtask release` + `cargo nextest --run-ignored all` | PHP SDK |
 | Local vhost routing | `cargo test -p ephpm --test vhost_routing -- --nocapture` | None — spawns the binary directly |
 | Test a local site in a browser | `ephpm dev --sites ~/sites` | None — `*.localhost` resolves to 127.0.0.1 |
+| Service install lifecycle | `EPHPM_ELEVATED_E2E=1 cargo test -p ephpm --test service_lifecycle -- --ignored` | Root/Administrator + real service manager |
 | E2E tests (headless) | `cargo xtask e2e --php-version 8.5` | Kind + Podman/Docker |
 | E2E dev environment | `cargo xtask e2e-up --php-version 8.5` | Kind + Podman/Docker |
 | Tear down E2E | `cargo xtask e2e-down` | — |
