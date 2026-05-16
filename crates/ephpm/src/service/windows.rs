@@ -119,7 +119,7 @@ pub(super) fn register(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn deregister(_paths: &Paths) -> Result<()> {
+pub(super) fn deregister(paths: &Paths) -> Result<()> {
     let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)
         .map_err(scm_err)?;
     match manager.open_service(SERVICE_NAME, ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS) {
@@ -127,6 +127,11 @@ pub(super) fn deregister(_paths: &Paths) -> Result<()> {
         Err(windows_service::Error::Winapi(e))
             if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) => {}
         Err(e) => return Err(scm_err(e)),
+    }
+    // Best-effort PATH cleanup — leave the SCM cleanup intact even if we can't
+    // mutate the registry for some reason.
+    if let Err(e) = remove_from_system_path(paths) {
+        tracing::warn!(error = %e, "failed to remove install dir from system PATH");
     }
     Ok(())
 }
@@ -151,18 +156,44 @@ pub(super) fn stop(_paths: &Paths) -> Result<()> {
         .open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)
         .map_err(scm_err)?;
     let status = svc.query_status().map_err(scm_err)?;
-    if matches!(status.current_state, ServiceState::Stopped | ServiceState::StopPending) {
-        return Ok(());
+    match status.current_state {
+        ServiceState::Stopped => return Ok(()),
+        ServiceState::StopPending => {}
+        _ => {
+            svc.stop().map_err(scm_err)?;
+        }
     }
-    svc.stop().map_err(scm_err)?;
-    Ok(())
+    wait_for_state(&svc, ServiceState::Stopped, Duration::from_secs(30))
 }
 
 pub(super) fn restart(paths: &Paths) -> Result<()> {
-    stop(paths).ok();
-    // Wait briefly for the service to fully stop before starting again.
-    std::thread::sleep(Duration::from_millis(500));
+    stop(paths)?;
     start(paths)
+}
+
+/// Poll `svc` until it reaches `target` state or `timeout` elapses. Returns an
+/// error only on SCM query failure or timeout. Used by `stop` and `uninstall`
+/// so callers can be sure the service has fully transitioned before they touch
+/// the binary file on disk.
+fn wait_for_state(
+    svc: &windows_service::service::Service,
+    target: ServiceState,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let s = svc.query_status().map_err(scm_err)?;
+        if s.current_state == target {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ServiceError::command(
+                "Windows SCM",
+                format!("timed out waiting for service to reach {target:?}"),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 pub(super) fn status(_paths: &Paths) -> Result<StatusReport> {
@@ -244,25 +275,7 @@ fn add_to_system_path(paths: &Paths) -> Result<()> {
     let install_str = install_dir.display().to_string();
 
     let key = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
-    // Query existing PATH via `reg query` to avoid a winreg dep.
-    let current = std::process::Command::new("reg").args(["query", key, "/v", "Path"]).output();
-    let existing = match current {
-        Ok(out) if out.status.success() => {
-            let text = String::from_utf8_lossy(&out.stdout);
-            text.lines()
-                .find_map(|l| {
-                    let l = l.trim();
-                    let mut parts = l.splitn(3, char::is_whitespace).filter(|s| !s.is_empty());
-                    if parts.next()? != "Path" {
-                        return None;
-                    }
-                    parts.next()?; // type field (REG_SZ / REG_EXPAND_SZ)
-                    Some(parts.next().unwrap_or("").to_string())
-                })
-                .unwrap_or_default()
-        }
-        _ => String::new(),
-    };
+    let existing = query_registry_path(key).unwrap_or_default();
 
     let already_present = existing
         .split(';')
@@ -284,6 +297,72 @@ fn add_to_system_path(paths: &Paths) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Remove the install directory from the system `Path` environment variable.
+/// Idempotent: a no-op when the entry is not present.
+fn remove_from_system_path(paths: &Paths) -> Result<()> {
+    let Some(install_dir) = paths.binary.parent() else {
+        return Ok(());
+    };
+    let install_path = Path::new(install_dir);
+
+    let key = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
+    let Some(existing) = query_registry_path(key) else { return Ok(()) };
+
+    let filtered: Vec<&str> = existing
+        .split(';')
+        .filter(|p| !Path::new(p.trim()).eq_ignore_ascii_case_path(install_path))
+        .collect();
+    if filtered.len() == existing.split(';').count() {
+        // Install dir wasn't present — nothing to do.
+        return Ok(());
+    }
+    let new_value = filtered.join(";");
+
+    let out = std::process::Command::new("reg")
+        .args(["add", key, "/v", "Path", "/t", "REG_EXPAND_SZ", "/d", &new_value, "/f"])
+        .output()
+        .map_err(|e| ServiceError::command("reg add", e.to_string()))?;
+    if !out.status.success() {
+        return Err(ServiceError::command(
+            "reg add",
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Read a `REG_SZ` / `REG_EXPAND_SZ` value named `Path` from `key` via the
+/// `reg` CLI. Returns `None` when the key/value is missing or the shell-out
+/// fails. Returns `Some("")` for an empty value.
+///
+/// `reg query` prints lines like `    Path    REG_EXPAND_SZ    <value>` with
+/// multiple spaces between fields. Anything that simply splits on whitespace
+/// chokes on paths containing spaces (e.g. `C:\Program Files\ephpm`), so we
+/// strip the name + known type prefixes off the front instead.
+fn query_registry_path(key: &str) -> Option<String> {
+    let out = std::process::Command::new("reg").args(["query", key, "/v", "Path"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let l = line.trim_start();
+        let Some(rest) = l.strip_prefix("Path") else { continue };
+        // Ensure "Path" was a whole word (next char is whitespace) so we don't
+        // match value names like "PathExt".
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let after_name = rest.trim_start();
+        for ty in ["REG_EXPAND_SZ", "REG_SZ", "REG_MULTI_SZ"] {
+            if let Some(after_type) = after_name.strip_prefix(ty) {
+                return Some(after_type.trim_end_matches(['\r', '\n']).trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Map `windows_service::Error` into our typed error.
@@ -316,7 +395,8 @@ fn service_main_inner(
     arguments: &[OsString],
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Default to the canonical install path if SCM did not pass --config.
-    let mut config_path: PathBuf = Paths::for_current_platform().config;
+    let paths = Paths::for_current_platform();
+    let mut config_path: PathBuf = paths.config.clone();
     let mut iter = arguments.iter().skip(1);
     while let Some(arg) = iter.next() {
         if arg == OsStr::new("--config") {
@@ -324,6 +404,22 @@ fn service_main_inner(
                 config_path = PathBuf::from(v);
             }
         }
+    }
+
+    // SCM detaches stdout/stderr from the service process, so tracing output
+    // would otherwise vanish. Make sure the log directory exists and tell
+    // `run_serve_sync` (via env var) to route the main tracing layer to that
+    // file instead of stderr. The Unix backends rely on systemd/launchd's
+    // built-in stdout redirection so this only matters on Windows.
+    if let Some(parent) = paths.log_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // SAFETY: `set_var` is sound here because no other threads have been
+    // spawned yet — SCM has just invoked our service-main and tokio / tracing
+    // initialization has not started. Setting the env var before any reader
+    // races us is the documented safe pattern.
+    unsafe {
+        std::env::set_var("EPHPM_SERVICE_LOG_FILE", &paths.log_file);
     }
 
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
