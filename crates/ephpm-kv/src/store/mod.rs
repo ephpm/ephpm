@@ -294,6 +294,88 @@ impl Store {
         true
     }
 
+    /// Atomically set a key only if it doesn't already exist (`SETNX`).
+    ///
+    /// Returns `true` if the value was inserted, `false` if a live entry
+    /// was already present at this key. Expired entries are treated as
+    /// vacant — they get replaced and `true` returned.
+    ///
+    /// Unlike `set()`, the existence check and the insert are performed
+    /// under the same per-key write lock, so concurrent `set_nx` callers
+    /// will see exactly one winner. This is the foundation primitive
+    /// for distributed locks, idempotency keys, single-execution
+    /// constraints, and leader election.
+    ///
+    /// Returns `false` if the `NoEviction` policy refuses the write
+    /// because of memory pressure (same as `set()`).
+    pub fn set_nx(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        // Fast path: peek without taking the per-key write lock. If the
+        // key is already present and live we can bail before triggering
+        // any eviction work. The TOCTOU window between this peek and the
+        // entry() lock below is fine — the locked check below catches
+        // it; the peek just saves an unnecessary `ensure_memory` call
+        // for the common "already taken" case.
+        if let Some(existing) = self.data.get(&key) {
+            if !existing.is_expired() {
+                return false;
+            }
+        }
+
+        // Build the candidate entry first so we can compute its size
+        // before reserving memory.
+        let (data, compressed) = if self.config.compression.algo != CompressionAlgo::None
+            && value.len() >= self.config.compression.min_size
+        {
+            let compressed_data = compress_value(&value, self.config.compression);
+            if compressed_data.len() < value.len() {
+                (compressed_data, true)
+            } else {
+                (value, false)
+            }
+        } else {
+            (value, false)
+        };
+
+        let new_entry = match ttl {
+            Some(dur) => Entry::with_expiry(data, key.len(), compressed, Instant::now() + dur),
+            None => Entry::new(data, key.len(), compressed),
+        };
+        let new_size = new_entry.mem_size;
+
+        // Reserve memory BEFORE taking the per-key entry lock — eviction
+        // may need to remove entries from arbitrary shards (potentially
+        // including this one) and would deadlock if called under the
+        // entry guard. The `set()` method makes the same trade-off.
+        if !self.ensure_memory(new_size) {
+            return false;
+        }
+
+        // Atomic check-and-insert. The shard write lock held by `entry()`
+        // serialises concurrent set_nx calls for this key.
+        match self.data.entry(key) {
+            dashmap::Entry::Occupied(mut occ) => {
+                if !occ.get().is_expired() {
+                    // Lost the race; another writer landed first. We
+                    // already ran `ensure_memory` which may have evicted
+                    // unrelated keys — that's wasted work but not a
+                    // correctness bug.
+                    return false;
+                }
+                // The existing entry has expired; reclaim its bytes and
+                // replace it.
+                self.mem_sub(occ.get().mem_size);
+                self.mem_add(new_size);
+                occ.insert(new_entry);
+                true
+            }
+            dashmap::Entry::Vacant(vac) => {
+                self.mem_add(new_size);
+                vac.insert(new_entry);
+                true
+            }
+        }
+    }
+
     /// Remove a key, returning `true` if it existed. Removes from both
     /// string and hash storage.
     pub fn remove(&self, key: &str) -> bool {
@@ -925,6 +1007,81 @@ mod tests {
         assert!(!s.exists("k"));
         s.set("k".into(), b"v".to_vec(), None);
         assert!(s.exists("k"));
+    }
+
+    #[test]
+    fn set_nx_inserts_when_absent() {
+        let s = test_store();
+        assert!(s.set_nx("k".into(), b"first".to_vec(), None));
+        assert_eq!(s.get("k"), Some(b"first".to_vec()));
+    }
+
+    #[test]
+    fn set_nx_refuses_when_present() {
+        let s = test_store();
+        s.set("k".into(), b"original".to_vec(), None);
+        assert!(!s.set_nx("k".into(), b"replacement".to_vec(), None));
+        // Original value untouched.
+        assert_eq!(s.get("k"), Some(b"original".to_vec()));
+    }
+
+    #[test]
+    fn set_nx_replaces_expired_entry() {
+        let s = test_store();
+        // Plant an already-expired entry by going through the Entry API
+        // directly so we don't have to wait real time.
+        let expired = Entry::with_expiry(
+            b"stale".to_vec(),
+            1,
+            false,
+            Instant::now() - Duration::from_secs(60),
+        );
+        let mem_size = expired.mem_size;
+        s.data.insert("k".into(), expired);
+        s.mem_add(mem_size);
+
+        // Expired counts as vacant for SETNX purposes.
+        assert!(s.set_nx("k".into(), b"fresh".to_vec(), None));
+        assert_eq!(s.get("k"), Some(b"fresh".to_vec()));
+    }
+
+    #[test]
+    fn set_nx_with_ttl_applies_expiry() {
+        let s = test_store();
+        assert!(s.set_nx("k".into(), b"v".to_vec(), Some(Duration::from_secs(60))));
+        let entry = s.data.get("k").unwrap();
+        assert!(entry.expires_at.is_some(), "expected TTL to be set");
+    }
+
+    #[test]
+    fn set_nx_picks_one_winner_under_concurrent_callers() {
+        // The whole reason set_nx exists: 32 threads all call it on the
+        // same key, exactly one must observe true. The old exists+set
+        // pattern in command.rs would let multiple callers all "win"
+        // under contention.
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread;
+
+        let s = test_store();
+        let winners = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(32);
+        for i in 0..32 {
+            let s = Arc::clone(&s);
+            let winners = Arc::clone(&winners);
+            handles.push(thread::spawn(move || {
+                let payload = format!("thread-{i}").into_bytes();
+                if s.set_nx("contested".into(), payload, None) {
+                    winners.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(winners.load(Ordering::Relaxed), 1, "exactly one set_nx must win");
+        // And the key holds *some* thread's payload — which one is fine.
+        assert!(s.get("contested").is_some());
     }
 
     #[test]

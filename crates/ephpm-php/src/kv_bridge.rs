@@ -88,6 +88,20 @@ pub struct EphpmKvOps {
         ) -> std::os::raw::c_int,
     >,
 
+    /// Atomically set a key only if it doesn't already exist (SETNX).
+    /// Returns 1 if the value was inserted, 0 if a live entry was
+    /// already present at this key (or the write was refused under
+    /// `NoEviction`). The check-and-set is performed under the same
+    /// per-key shard lock, so concurrent callers see exactly one winner.
+    pub set_nx: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            val: *const std::os::raw::c_char,
+            val_len: usize,
+            ttl_ms: std::os::raw::c_longlong,
+        ) -> std::os::raw::c_int,
+    >,
+
     /// Delete a key. Returns 1 if it existed, 0 if not.
     pub del: Option<unsafe extern "C" fn(key: *const std::os::raw::c_char) -> std::os::raw::c_long>,
 
@@ -189,6 +203,35 @@ unsafe extern "C" fn kv_set(
     };
 
     i32::from(store.set(key_str.to_string(), val_bytes.to_vec(), ttl))
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_set_nx(
+    key: *const std::os::raw::c_char,
+    val: *const std::os::raw::c_char,
+    val_len: usize,
+    ttl_ms: std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    // Safety: `key` is a null-terminated C string from PHP. `val` is a
+    // pointer to `val_len` bytes from PHP's string parameter.
+    let key_str = unsafe { CStr::from_ptr(key) };
+    let Ok(key_str) = key_str.to_str() else {
+        return 0;
+    };
+    let Some(store) = effective_store() else {
+        return 0;
+    };
+    // Safety: `val` points to `val_len` bytes of valid memory from PHP.
+    let val_bytes = unsafe { std::slice::from_raw_parts(val.cast::<u8>(), val_len) };
+
+    let ttl = if ttl_ms > 0 {
+        #[allow(clippy::cast_sign_loss)]
+        Some(Duration::from_millis(ttl_ms as u64))
+    } else {
+        None
+    };
+
+    i32::from(store.set_nx(key_str.to_string(), val_bytes.to_vec(), ttl))
 }
 
 #[cfg(php_linked)]
@@ -294,6 +337,7 @@ pub static KV_OPS: EphpmKvOps = EphpmKvOps {
     get: Some(kv_get),
     get_result: Some(kv_get_result),
     set: Some(kv_set),
+    set_nx: Some(kv_set_nx),
     del: Some(kv_del),
     exists: Some(kv_exists),
     incr_by: Some(kv_incr_by),

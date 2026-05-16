@@ -855,6 +855,7 @@ typedef struct {
     int  (*get)(const char *key);
     void (*get_result)(const char **ptr, size_t *len);
     int  (*set)(const char *key, const char *val, size_t val_len, long long ttl_ms);
+    int  (*set_nx)(const char *key, const char *val, size_t val_len, long long ttl_ms);
     long (*del)(const char *key);
     int  (*exists)(const char *key);
     int  (*incr_by)(const char *key, long long delta, long long *result);
@@ -896,6 +897,27 @@ PHP_FUNCTION(ephpm_kv_set)
     if (!g_kv_ops.set) { RETURN_FALSE; }
     long long ttl_ms = ttl > 0 ? ttl * 1000LL : 0;
     RETURN_BOOL(g_kv_ops.set(key, val, val_len, ttl_ms));
+}
+
+PHP_FUNCTION(ephpm_kv_setnx)
+{
+    char *key; size_t key_len;
+    char *val; size_t val_len;
+    zend_long ttl = 0;
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_STRING(val, val_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(ttl)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.set_nx) { RETURN_FALSE; }
+    long long ttl_ms = ttl > 0 ? ttl * 1000LL : 0;
+    /* Returns true if the value was inserted, false if a live entry was
+     * already present at this key. The check-and-set is atomic under the
+     * KV store's per-shard lock — this is the primitive the PHP-side lock
+     * libraries (Cache::lock, Symfony LockFactory) build on. */
+    RETURN_BOOL(g_kv_ops.set_nx(key, val, val_len, ttl_ms));
 }
 
 PHP_FUNCTION(ephpm_kv_del)
@@ -1016,6 +1038,12 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_set, 0, 0, 2)
     ZEND_ARG_INFO(0, ttl)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_setnx, 0, 0, 2)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, value)
+    ZEND_ARG_INFO(0, ttl)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_del, 0, 0, 1)
     ZEND_ARG_INFO(0, key)
 ZEND_END_ARG_INFO()
@@ -1055,6 +1083,7 @@ ZEND_END_ARG_INFO()
 static const zend_function_entry ephpm_kv_functions[] = {
     PHP_FE(ephpm_kv_get,      arginfo_ephpm_kv_get)
     PHP_FE(ephpm_kv_set,      arginfo_ephpm_kv_set)
+    PHP_FE(ephpm_kv_setnx,    arginfo_ephpm_kv_setnx)
     PHP_FE(ephpm_kv_del,      arginfo_ephpm_kv_del)
     PHP_FE(ephpm_kv_exists,   arginfo_ephpm_kv_exists)
     PHP_FE(ephpm_kv_incr,     arginfo_ephpm_kv_incr)
