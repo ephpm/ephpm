@@ -10,6 +10,8 @@ These pages describe targets, not currently-shipped behavior. For what works tod
 
 - **[Preview Deployments](preview/)** — instant per-PR preview URLs via a GitHub bot.
 - **[OPcache Clustering & Per-Vhost Preload](opcache-clustering/)** — atomic cluster-wide OPcache invalidation via the KV store, plus per-vhost preload via `site.toml`.
+- **[Native Middleware](native-middleware/)** — load `.so` middleware between hyper and the PHP SAPI, with a documented C ABI, host callbacks into the KV store, and a Rust reference crate. Caddy-style plugins for a PHP runtime.
+- **[Dynamic PHP Extensions](dynamic-extensions/)** — load standard PHP extensions (`.so` / `.dll`) at startup from `site.toml`, the same way `extension=foo.so` works in `php.ini`. Complements the static baseline.
 - **[Laravel Octane Driver](laravel-octane-driver/)** — native `ephpm` driver for Laravel Octane worker mode.
 - **[Symfony Runtime Adapter](symfony-runtime-driver/)** — native `ephpm` adapter under `symfony/runtime`.
 - **[WordPress Worker Mode](wordpress-worker-mode/)** — opinionated WP runtime that boots once per worker thread.
