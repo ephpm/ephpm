@@ -28,6 +28,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Rust stable + nightly (for fmt only) ─────────────────────────────────────
+#
+# The stable component set MUST be a superset of rust-toolchain.toml's
+# `components` (rustfmt, clippy, llvm-tools-preview). If any are missing,
+# rustup triggers a channel sync on first `cargo` invocation in the repo —
+# and that sync's atomic component rename fails EXDEV on the CI runner's
+# overlay (rustup tmp/ and toolchains/ land on different devices).
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
@@ -35,7 +41,7 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal \
-        --component rustfmt,clippy \
+        --component rustfmt,clippy,llvm-tools-preview \
     && rustup toolchain install nightly --component rustfmt \
     && rustup target add x86_64-unknown-linux-musl \
     && cargo install cargo-nextest --locked \
