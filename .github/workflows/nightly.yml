@@ -35,10 +35,17 @@ jobs:
       - name: Run ignored integration tests
         # cargo xtask release already populated php-sdk/<ver>-linux-x86_64.
         # Discover its absolute path and reuse it for the test build.
+        #
+        # --target musl matches the release build. libphp.a is musl-linked,
+        # so test binaries must link against musl too — building for the
+        # default glibc target produces "undefined symbol: sigsetjmp / gz* /
+        # issetugid / __flt_rounds" linker errors when libphp gets pulled in.
         run: |
           PHP_SDK_PATH=$(find "$(pwd)/php-sdk" -mindepth 1 -maxdepth 1 -type d -name '*-linux-x86_64' | head -1)
           test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
-          PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run --workspace --run-ignored ignored-only
+          PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run \
+            --target x86_64-unknown-linux-musl \
+            --workspace --run-ignored ignored-only
 
       - name: Verify binary
         run: |
