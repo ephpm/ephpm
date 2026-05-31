@@ -21,10 +21,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   - musl-tools/musl-dev: musl-gcc cross-compiler for the prebuilt PHP SDK
 #     (libphp.a is musl-linked).
 #   - libclang-dev: bindgen needs libclang.
+#   - libssl-dev: the workspace test build (`cargo nextest run --workspace`)
+#     pulls a dev-dependency that links openssl-sys, which needs system
+#     OpenSSL headers + openssl.pc. The musl release build doesn't, but the
+#     native test build does.
 #   - tar/curl: SDK + sqld tarball downloads at build time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential ca-certificates curl git pkg-config tar \
-    libclang-dev musl-tools musl-dev \
+    libclang-dev libssl-dev musl-tools musl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Rust stable + nightly (for fmt only) ─────────────────────────────────────
