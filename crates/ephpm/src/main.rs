@@ -12,6 +12,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
 mod service;
+mod commands;
 
 /// ePHPm — All-in-one PHP application server
 #[derive(Parser, Debug)]
@@ -115,6 +116,12 @@ enum Commands {
     /// Show service status (PID, uptime, listen address)
     Status,
 
+    /// Manage PHP extensions compiled into this binary
+    Ext {
+        #[command(subcommand)]
+        command: ExtCommand,
+    },
+
     /// Tail the service log file
     Logs {
         /// Follow the log (like `tail -f`)
@@ -205,6 +212,15 @@ fn run() -> anyhow::Result<ExitCode> {
                 .map(|()| ExitCode::SUCCESS)
                 .map_err(|e| anyhow::anyhow!("service dispatcher failed: {e}"))
         }
+        Some(Commands::Ext { command }) => match command {
+            ExtCommand::List { json } => commands::ext::cmd_list(json).map(|()| ExitCode::SUCCESS),
+            ExtCommand::Search { query } => commands::ext::cmd_search(&query).map(|()| ExitCode::SUCCESS),
+            ExtCommand::Info { name } => commands::ext::cmd_info(&name).map(|()| ExitCode::SUCCESS),
+            ExtCommand::Build { add, suite, output } => {
+                let args = commands::ext::BuildArgs { add, suite, output };
+                commands::ext::cmd_build(&args).map(|()| ExitCode::SUCCESS)
+            }
+        },
         Some(Commands::Dev { listen, document_root, port, sites, verbose }) => {
             run_dev(listen, document_root, port, sites, verbose)
         }
@@ -908,4 +924,37 @@ mod cli_tests {
             other => panic!("unexpected: {other:?}"),
         }
     }
+}
+
+#[derive(Subcommand, Debug)]
+enum ExtCommand {
+    /// List all extensions compiled into the current binary
+    List {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search extensions available to add via `ephpm ext build`
+    Search {
+        /// Search query (extension name or partial match)
+        query: String,
+    },
+
+    /// Show details about a specific extension
+    Info {
+        /// Extension name (e.g. "curl" or "ext-curl")
+        name: String,
+    },
+    /// Rebuild ephpm with a custom extension set (requires Docker or Podman)
+    Build {
+        /// Extensions to add (comma-separated, e.g. "redis,imagick,intl")
+        #[arg(long)]
+        add: Vec<String>,
+        /// Base suite to start from: core, wordpress, laravel, full
+        #[arg(long)]
+        suite: Option<String>,
+        /// Output path for the new binary (default: ./ephpm-custom)
+        #[arg(long)]
+        output: Option<String>,
+    },
 }
