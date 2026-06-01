@@ -15,7 +15,15 @@ thiserror.workspace = true
 http.workspace = true
 
 [build-dependencies]
-bindgen = "0.71"
+# Disable bindgen's default `runtime` feature (which makes clang-sys dlopen
+# libclang via libloading) and enable `static` instead. Alpine's fully-
+# static musl build scripts can't dlopen shared libs at all — the runtime
+# load panics with "Dynamic loading not supported". With `static`,
+# clang-sys links libclang.a + LLVM static archives directly into the
+# build script binary, so no dlopen is needed. Alpine packages
+# clang-static and llvm17-static (installed in the CI image) provide
+# the required archives.
+bindgen = { version = "0.71", default-features = false, features = ["logging", "prettyplease", "static", "which-rustfmt"] }
 cc = "1"
 
 [dev-dependencies]
