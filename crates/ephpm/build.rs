@@ -141,7 +141,14 @@ fn linux_static_libs() -> &'static [&'static str] {
         "ssl", "crypto", "curl", "z", "xml2", "xslt", "exslt", "lzma", "sodium", "iconv",
         "charset", "intl", "png16", "gd", "jpeg", "freetype", "onig", "zip", "bz2", "gmp",
         "sqlite3", "pq", "pgcommon", "pgport", "edit", "ncurses", "menu", "form", "panel", "tic",
-        "icui18n", "icuuc", "icudata", "icuio", "icutu", "stdc++",
+        "icui18n", "icuuc", "icudata", "icuio", "icutu",
+        // ImageMagick (imagick extension) + codec chain
+        "MagickWand-7.Q16HDRI", "MagickCore-7.Q16HDRI", "Magick++-7.Q16HDRI",
+        "heif", "de265", "tiff", "webp", "webpdecoder", "webpdemux", "webpmux", "sharpyuv",
+        "aom", "jxl", "jxl_cms", "jxl_threads", "hwy",
+        "brotlienc", "brotlidec", "brotlicommon",
+        // libstdc++ last: all C++ libs above reference std::* / __cxa_* symbols
+        "stdc++",
     ]
 }
 
