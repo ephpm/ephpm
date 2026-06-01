@@ -36,16 +36,9 @@ FROM alpine:3.20
 #   - bash: rustup-init's installer uses it.
 #   - xz: the sqld release tarball is .tar.xz (cargo xtask release pulls
 #     it via tar -xJf). Not in Alpine's base image.
-#   - clang-static + llvm17-static: static libclang + LLVM archives.
-#     Required so clang-sys (used by bindgen) can statically link
-#     libclang into the build.rs binary instead of dlopen'ing it at
-#     runtime. Alpine's default musl static-linked binaries can't
-#     dlopen shared libs ("Dynamic loading not supported"), so any
-#     bindgen-using build.rs would otherwise panic at runtime.
-#     LIBCLANG_STATIC=1 (set below) is the env var clang-sys checks.
 RUN apk add --no-cache \
-    bash build-base ca-certificates clang clang-dev clang-libs clang-static \
-    curl git linux-headers llvm17-static openssl-dev pkgconfig tar xz
+    bash build-base ca-certificates clang clang-dev clang-libs \
+    curl git linux-headers openssl-dev pkgconfig tar xz
 
 # ── Rust stable + nightly (for fmt only) ─────────────────────────────────────
 #
@@ -68,18 +61,32 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && cargo install cargo-nextest --locked \
     && rm -rf /usr/local/cargo/registry
 
-# ── bindgen via static libclang ──────────────────────────────────────────────
+# ── Dynamic-link build scripts, keep target binaries static ─────────────────
 #
-# Alpine's musl-static binaries can't dlopen() shared libs, which breaks
-# bindgen's runtime libclang load. clang-sys (the crate bindgen uses to
-# locate libclang) honors LIBCLANG_STATIC=1 to opt into static linking
-# instead — the libclang.a from `clang-static` (apk above) gets baked
-# into the build.rs binary, eliminating the dlopen need.
+# Alpine's musl rustc defaults to fully-static binaries (crt-static on).
+# Statically linked binaries can't dlopen() shared libs — which breaks
+# bindgen's libclang load from build.rs: "could not be opened: Dynamic
+# loading not supported".
 #
-# LLVM_CONFIG_PATH points clang-sys at Alpine's llvm17 install so it
-# picks up the matching static archives (avoids version mismatch with
-# any other LLVM that happens to be on PATH).
-ENV LIBCLANG_STATIC=1 \
-    LLVM_CONFIG_PATH=/usr/lib/llvm17/bin/llvm-config
+# Stable-cargo solution that keeps the final ephpm binary fully static:
+#
+#   - Global RUSTFLAGS turns crt-static OFF. This applies to host-tier
+#     compilation (build scripts, proc macros), making them dynamically
+#     linked against musl libc — they can dlopen libclang.so.
+#   - The cargo config below re-enables crt-static ONLY for the
+#     x86_64-unknown-linux-musl target. rustc's -C target-feature flags
+#     accumulate left-to-right with last-wins semantics, so the explicit
+#     `+crt-static` overrides the global `-crt-static` for the final
+#     ephpm release binary — keeping the single-binary portability that
+#     was the whole point of going Alpine.
+#
+# Requires --target to be passed explicitly (cargo xtask release already
+# does; nightly.yml's integration-test step does too).
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+
+RUN printf '%s\n' \
+    '[target.x86_64-unknown-linux-musl]' \
+    'rustflags = ["-C", "target-feature=+crt-static"]' \
+    > $CARGO_HOME/config.toml
 
 WORKDIR /src

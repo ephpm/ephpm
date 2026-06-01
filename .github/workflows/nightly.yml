@@ -35,10 +35,18 @@ jobs:
       - name: Run ignored integration tests
         # cargo xtask release already populated php-sdk/<ver>-linux-x86_64.
         # Discover its absolute path and reuse it for the test build.
+        #
+        # --target is the same as the host (Alpine = native musl) but it
+        # must be explicit so cargo applies the [target.x86_64-unknown-
+        # linux-musl] rustflags from $CARGO_HOME/config.toml: the final
+        # test binary gets +crt-static while build scripts only get the
+        # global -crt-static (so they can dlopen libclang for bindgen).
         run: |
           PHP_SDK_PATH=$(find "$(pwd)/php-sdk" -mindepth 1 -maxdepth 1 -type d -name '*-linux-x86_64' | head -1)
           test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
-          PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run --workspace --run-ignored ignored-only
+          PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run \
+            --target x86_64-unknown-linux-musl \
+            --workspace --run-ignored ignored-only
 
       - name: Verify binary
         run: |
