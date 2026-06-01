@@ -34,9 +34,11 @@ FROM alpine:3.20
 #     bundled archive isn't used).
 #   - linux-headers: some C code in PHP-adjacent crates expects them.
 #   - bash: rustup-init's installer uses it.
+#   - xz: the sqld release tarball is .tar.xz (cargo xtask release pulls
+#     it via tar -xJf). Not in Alpine's base image.
 RUN apk add --no-cache \
     bash build-base ca-certificates clang clang-dev clang-libs \
-    curl git linux-headers openssl-dev pkgconfig tar
+    curl git linux-headers openssl-dev pkgconfig tar xz
 
 # ── Rust stable + nightly (for fmt only) ─────────────────────────────────────
 #
@@ -58,5 +60,29 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     && rustup toolchain install nightly --component rustfmt \
     && cargo install cargo-nextest --locked \
     && rm -rf /usr/local/cargo/registry
+
+# ── Cargo host config: dynamic-link build scripts ────────────────────────────
+#
+# On Alpine (musl host), rustc defaults to fully-static binaries with
+# crt-static on. Statically linked binaries can't dlopen() shared libs —
+# which breaks bindgen's runtime libclang load:
+#   "the libclang shared library [...] could not be opened:
+#    Dynamic loading not supported"
+#
+# Switching crt-static off globally would also make the final ephpm
+# binary dynamically linked to musl, defeating the single-binary
+# portability that's the point of ephpm.
+#
+# The `[host]` config block only applies to *host*-tier compilation
+# (build scripts, proc macros), and only when `--target` is explicit
+# (so cargo distinguishes "host" from "target"). The final --target
+# build of ephpm still goes through the default (static) linking.
+#
+# `cargo xtask release` already passes `--target x86_64-unknown-linux-musl`,
+# and the nightly's integration-test step does too. Both engage the split.
+RUN printf '%s\n' \
+    '[host]' \
+    'rustflags = ["-C", "target-feature=-crt-static"]' \
+    > $CARGO_HOME/config.toml
 
 WORKDIR /src
