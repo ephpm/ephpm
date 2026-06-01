@@ -352,6 +352,9 @@ fn find_clang_resource_include() -> Option<PathBuf> {
 /// directory to the linker search path so `-lgcc` resolves.
 fn find_musl_libgcc() -> Option<PathBuf> {
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".into());
+    // Alpine's native musl toolchain uses an `-alpine-` infix in the triple:
+    //   /usr/lib/gcc/x86_64-alpine-linux-musl/<ver>/libgcc.a
+    let alpine_triple = format!("{arch}-alpine-linux-musl");
     let musl_triple = format!("{arch}-linux-musl");
     // On Ubuntu/Debian, `musl-tools` provides a `musl-gcc` wrapper around the
     // host GCC. The symbols PHP's JIT needs (__cpu_indicator_init, __cpu_model)
@@ -359,9 +362,11 @@ fn find_musl_libgcc() -> Option<PathBuf> {
     let gnu_triple = format!("{arch}-linux-gnu");
 
     // Common locations where musl-cross or host toolchains install libgcc.a:
+    //   /usr/lib/gcc/<alpine-triple>/<ver>/libgcc.a (Alpine native musl)
     //   /usr/lib/gcc/<musl-triple>/<ver>/libgcc.a   (musl cross-compiler)
     //   /usr/lib/gcc/<gnu-triple>/<ver>/libgcc.a    (host GCC via musl-tools wrapper)
     let search_roots = [
+        PathBuf::from(format!("/usr/lib/gcc/{alpine_triple}")),
         PathBuf::from(format!("/usr/lib/gcc/{musl_triple}")),
         PathBuf::from(format!("/usr/lib/gcc/{gnu_triple}")),
     ];
