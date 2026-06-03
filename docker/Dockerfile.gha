@@ -29,8 +29,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 #     OpenSSL headers + openssl.pc. The musl release build doesn't, but the
 #     native test build does.
 #   - tar/curl: SDK + sqld tarball downloads at build time.
+#   - file: nightly's `Verify binary` step uses /usr/bin/file to print the
+#     artifact's ELF metadata as a sanity check.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates curl git pkg-config tar \
+    build-essential ca-certificates curl file git pkg-config tar \
     libclang-dev clang lld libssl-dev musl-tools musl-dev \
     && rm -rf /var/lib/apt/lists/*
 

@@ -84,6 +84,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      - name: Pin libclang for bindgen
+        # The runner's system Apple-clang (Xcode 16+) emits CXCallingConv
+        # value 20 (CXCallingConv_PreserveNone, added in clang 18), which
+        # bindgen 0.72 doesn't know how to tokenize — it panics with
+        # "Cannot turn unknown calling convention to tokens: 20".
+        # Pointing bindgen at llvm@17's libclang avoids the new enum value
+        # entirely. Tracked at github.com/rust-lang/rust-bindgen — remove
+        # this step once bindgen learns the new CCs (or falls back
+        # gracefully instead of panicking).
+        run: |
+          brew install llvm@17 || brew upgrade llvm@17 || true
+          LLVM_PREFIX=$(brew --prefix llvm@17)
+          echo "LIBCLANG_PATH=${LLVM_PREFIX}/lib" >> "$GITHUB_ENV"
+
       - name: Build ephpm
         # Pulls libphp.a from github.com/ephpm/php-sdk; no system PHP/spc
         # toolchain required.
