@@ -21,6 +21,9 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   - musl-tools/musl-dev: musl-gcc cross-compiler for the prebuilt PHP SDK
 #     (libphp.a is musl-linked).
 #   - libclang-dev: bindgen needs libclang.
+#   - clang/lld: cargo-xwin's Windows cross-build needs `clang-cl` (MSVC-
+#     compatible clang driver) + lld-link to compile cc-rs-driven crates
+#     like `ring` against the xwin MSVC headers.
 #   - libssl-dev: the workspace test build (`cargo nextest run --workspace`)
 #     pulls a dev-dependency that links openssl-sys, which needs system
 #     OpenSSL headers + openssl.pc. The musl release build doesn't, but the
@@ -28,7 +31,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   - tar/curl: SDK + sqld tarball downloads at build time.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential ca-certificates curl git pkg-config tar \
-    libclang-dev libssl-dev musl-tools musl-dev \
+    libclang-dev clang lld libssl-dev musl-tools musl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Rust stable + nightly (for fmt only) ─────────────────────────────────────
