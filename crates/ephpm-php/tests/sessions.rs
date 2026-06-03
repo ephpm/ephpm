@@ -128,7 +128,7 @@ fn write_then_read_round_trip() {
     // Seed the store with an empty payload so use_strict_mode accepts the SID.
     store.set(format!("session:{sid}"), b"".to_vec(), None);
 
-    let write_script = write_script(
+    let write_path = write_script(
         "session_write.php",
         &format!(
             r#"<?php
@@ -142,7 +142,7 @@ echo 'WROTE';
 "#,
         ),
     );
-    let resp = run(write_script, Some(sid));
+    let resp = run(write_path, Some(sid));
     assert_eq!(body_str(&resp), "WROTE");
 
     // The KV key should now hold PHP's serialised session blob.

@@ -75,6 +75,21 @@ fn link_php(lib_dir: &Path, target_os: &str) {
 
     // Link additional static libraries from the SDK that static-php-cli
     // built. We probe for each library since the set varies by config.
+    //
+    // `libz` is emitted with `+whole-archive` because both libphp's
+    // `zlib_fopen_wrapper.o` and libxml2's `xmlIO.c.o` reference gz*
+    // symbols. Single-pass ld resolves the first set of refs from libz,
+    // then won't re-scan libz for the second set — so debug test builds
+    // fail with `undefined reference to gzread / gzwrite / gzclose / ...`.
+    // (The release build's `--gc-sections` masks this by stripping the
+    // unused PHP zlib wrapper.) `whole-archive` forces every object from
+    // libz into the link output, so all gz* symbols are present regardless
+    // of who references them or when.
+    //
+    // This is the modern rustc-blessed alternative to wrapping the lib
+    // group in `-Wl,--start-group`/`--end-group`, which can't be emitted
+    // from a library crate's build.rs (rustc-link-arg only applies to
+    // binary/cdylib targets).
     println!("cargo::warning=probing for static support libs in {}", lib_dir.display());
     for static_lib in &[
         "ssl", "crypto", "curl", "z", "xml2", "sodium", "iconv", "charset", "png16", "gd", "jpeg",
@@ -89,7 +104,11 @@ fn link_php(lib_dir: &Path, target_os: &str) {
             unix_path.display()
         );
         if found {
-            println!("cargo::rustc-link-lib=static={static_lib}");
+            if *static_lib == "z" {
+                println!("cargo::rustc-link-lib=static:+whole-archive={static_lib}");
+            } else {
+                println!("cargo::rustc-link-lib=static={static_lib}");
+            }
         }
     }
 }
