@@ -55,9 +55,11 @@ jobs:
             --workspace --run-ignored ignored-only
 
       - name: Verify binary
+        # cargo xtask release on Linux always targets musl (libphp.a is
+        # musl-linked), so the artifact lives under the musl triple, not
+        # the host triple.
         run: |
-          TRIPLE=$(rustc -vV | awk '/^host:/ { print $2 }')
-          FILE="target/${TRIPLE}/release/ephpm"
+          FILE="target/x86_64-unknown-linux-musl/release/ephpm"
           test -f "$FILE" || { echo "::error::Binary not found at $FILE"; exit 1; }
           file "$FILE"
           ls -lh "$FILE"
@@ -66,7 +68,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ephpm-php${{ matrix.php }}-linux-x86_64
-          path: target/*/release/ephpm
+          path: target/x86_64-unknown-linux-musl/release/ephpm
 
   build-macos:
     name: Build (PHP ${{ matrix.php }}, macos-aarch64)
