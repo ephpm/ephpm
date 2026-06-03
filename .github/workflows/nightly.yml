@@ -34,7 +34,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ["8.4", "8.5"]
+        # 8.4 temporarily disabled — the 8.4.19 php-sdk linux-x86_64
+        # release tarball is missing libphp.a. Tracked upstream at
+        # github.com/ephpm/php-sdk; re-add "8.4" here once a new SDK
+        # release ships with the static lib present.
+        php: ["8.5"]
     steps:
       - uses: actions/checkout@v4
 
@@ -77,12 +81,27 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ["8.4", "8.5"]
+        # 8.4 temporarily disabled — the 8.4.19 php-sdk macos-aarch64
+        # release tarball is missing libphp.a (same upstream gap as the
+        # linux-x86_64 build). Re-add "8.4" once a new SDK release ships.
+        php: ["8.5"]
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      - name: Pin libclang for bindgen
+        # The runner's system Apple-clang (Xcode 16+) emits CXCallingConv
+        # value 20 (CXCallingConv_PreserveNone, added in clang 18), which
+        # bindgen 0.72 doesn't know how to tokenize — it panics with
+        # "Cannot turn unknown calling convention to tokens: 20".
+        # Pinning bindgen to llvm@17's libclang avoids the new enum value
+        # entirely. Tracked at github.com/rust-lang/rust-bindgen.
+        run: |
+          brew install llvm@17 || brew upgrade llvm@17 || true
+          LLVM_PREFIX=$(brew --prefix llvm@17)
+          echo "LIBCLANG_PATH=${LLVM_PREFIX}/lib" >> "$GITHUB_ENV"
 
       - name: Build ephpm
         # Pulls libphp.a from github.com/ephpm/php-sdk; no system PHP/spc
@@ -116,6 +135,14 @@ jobs:
     name: Build (PHP ${{ matrix.php }}, windows-x86_64)
     runs-on: [self-hosted, linux, x64]
     container: ephpm/ephpm-ci:latest
+    # Temporarily disabled — the php-sdk windows-x86_64 release tarball
+    # is missing PHP's win32/* headers (e.g. win32/ioutil.h, referenced by
+    # Zend/zend_stream.h), so ephpm_wrapper.c fails to compile. The
+    # cargo-xwin toolchain itself is working (PR #44 added clang+lld);
+    # this is purely an upstream packaging gap. Re-enable once
+    # github.com/ephpm/php-sdk ships a windows tarball that includes the
+    # full PHP source-tree win32/ headers.
+    if: false
     strategy:
       fail-fast: false
       matrix:
