@@ -93,7 +93,12 @@ jobs:
         # entirely. Tracked at github.com/rust-lang/rust-bindgen — remove
         # this step once bindgen learns the new CCs (or falls back
         # gracefully instead of panicking).
+        #
+        # /opt/homebrew/bin isn't on the runner's default PATH for
+        # non-login shells, so prepend it before calling brew (same
+        # pattern php-sdk's macOS job uses).
         run: |
+          export PATH="/opt/homebrew/bin:$PATH"
           brew install llvm@17 || brew upgrade llvm@17 || true
           LLVM_PREFIX=$(brew --prefix llvm@17)
           echo "LIBCLANG_PATH=${LLVM_PREFIX}/lib" >> "$GITHUB_ENV"
