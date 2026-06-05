@@ -7,9 +7,9 @@ use std::{env, fs};
 /// The build flow downloads pre-built `libphp.a` archives from
 /// `github.com/ephpm/php-sdk` releases. Each entry maps a minor-version
 /// shorthand (e.g. "8.5") to the specific patch release we publish SDKs for.
-/// Users may also pass a full version explicitly (e.g. "8.5.2") and the
+/// Users may also pass a full version explicitly (e.g. "8.5.6") and the
 /// resolver will accept it as-is.
-const PHP_SDK_VERSIONS: &[(&str, &str)] = &[("8.3", "8.3.29"), ("8.4", "8.4.19"), ("8.5", "8.5.2")];
+const PHP_SDK_VERSIONS: &[(&str, &str)] = &[("8.3", "8.3.31"), ("8.4", "8.4.21"), ("8.5", "8.5.6")];
 
 /// Default PHP minor when no version is specified on the command line.
 const DEFAULT_PHP_MINOR: &str = "8.5";
