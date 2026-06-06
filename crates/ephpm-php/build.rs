@@ -104,11 +104,8 @@ fn link_php(lib_dir: &Path, target_os: &str) {
     for static_lib in &[
         // High-level extension support libs first; they reference the
         // lower-level libs below.
-        "ssl", "crypto", "curl", "z", "xml2", "xslt", "exslt", "lzma",
-        "sodium", "iconv", "charset", "intl",
-        "png16", "gd", "jpeg", "freetype",
-        "onig", "zip", "bz2",
-        "gmp", "sqlite3",
+        "ssl", "crypto", "curl", "z", "xml2", "xslt", "exslt", "lzma", "sodium", "iconv", "charset",
+        "intl", "png16", "gd", "jpeg", "freetype", "onig", "zip", "bz2", "gmp", "sqlite3",
         // PostgreSQL libs (pdo_pgsql). Order: libpq depends on pgcommon
         // and pgport.
         "pq", "pgcommon", "pgport",
