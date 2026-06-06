@@ -76,6 +76,16 @@ fn link_php(lib_dir: &Path, target_os: &str) {
     // Link additional static libraries from the SDK that static-php-cli
     // built. We probe for each library since the set varies by config.
     //
+    // Order matters because rustc emits these to the linker in sequence
+    // and ld is single-pass. Dependencies must come AFTER the libraries
+    // that need them:
+    //   - extension libs (curl, xml2, intl, etc.) reference symbols in
+    //     the lower-level libs (ssl/crypto, z, icudata, …)
+    //   - libicui18n needs libicuuc which needs libicudata
+    //   - libstdc++ has to be last on Linux because ICU is C++ — its
+    //     archives reference std::__throw_bad_alloc, __cxa_begin_catch,
+    //     etc., which only libstdc++.a provides
+    //
     // `libz` is emitted with `+whole-archive` because both libphp's
     // `zlib_fopen_wrapper.o` and libxml2's `xmlIO.c.o` reference gz*
     // symbols. Single-pass ld resolves the first set of refs from libz,
@@ -92,8 +102,26 @@ fn link_php(lib_dir: &Path, target_os: &str) {
     // binary/cdylib targets).
     println!("cargo::warning=probing for static support libs in {}", lib_dir.display());
     for static_lib in &[
-        "ssl", "crypto", "curl", "z", "xml2", "sodium", "iconv", "charset", "png16", "gd", "jpeg",
-        "freetype", "onig", "zip", "bz2", "xslt", "exslt",
+        // High-level extension support libs first; they reference the
+        // lower-level libs below.
+        "ssl", "crypto", "curl", "z", "xml2", "xslt", "exslt", "lzma",
+        "sodium", "iconv", "charset", "intl",
+        "png16", "gd", "jpeg", "freetype",
+        "onig", "zip", "bz2",
+        "gmp", "sqlite3",
+        // PostgreSQL libs (pdo_pgsql). Order: libpq depends on pgcommon
+        // and pgport.
+        "pq", "pgcommon", "pgport",
+        // Readline / line-editing ecosystem (pulled in by pdo_sqlite and
+        // a few CLI-facing extensions on the embed build).
+        "edit", "ncurses", "menu", "form", "panel", "tic",
+        // ICU — needed by the intl extension. Order matters: i18n →
+        // uc → data, with io/tu as auxiliary modules that may pull
+        // from any of them.
+        "icui18n", "icuuc", "icudata", "icuio", "icutu",
+        // libstdc++ last: ICU is C++ and references std::* / __cxa_*
+        // symbols that only the C++ runtime provides.
+        "stdc++",
     ] {
         // Unix uses libfoo.a, Windows uses foo.lib
         let unix_path = lib_dir.join(format!("lib{static_lib}.a"));
@@ -213,6 +241,10 @@ fn compile_wrapper(include_dir: &Path, target_os: &str) {
     let mut build = cc::Build::new();
     build
         .file("ephpm_wrapper.c")
+        // Bundles the __cpu_indicator_init_local → __cpu_indicator_init
+        // thunk for GCC 13.x hosts linking against an SDK compiled with
+        // GCC 14+. See cpu_compat.c for the full rationale.
+        .file("cpu_compat.c")
         .include(include_dir)
         .include(&include_main)
         .include(&include_zend)
