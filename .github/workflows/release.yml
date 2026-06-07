@@ -127,11 +127,10 @@ jobs:
           name: ephpm-${{ github.ref_name }}-php${{ matrix.php_full }}-macos-aarch64
           path: ${{ steps.pkg.outputs.archive }}
 
-  # ── Windows binaries (cross-compiled from Linux via cargo-xwin) ────────────
+  # ── Windows binaries (native on self-hosted Windows runner) ──────────────
   build-windows:
     name: Build (PHP ${{ matrix.php_full }}, windows-x86_64)
-    runs-on: [self-hosted, linux, x64]
-    container: ephpm/ephpm-ci:latest
+    runs-on: [self-hosted, windows, x64]
     strategy:
       fail-fast: false
       matrix:
@@ -143,29 +142,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install cargo-xwin
-        run: cargo install cargo-xwin --locked || true
+      - name: Install Rust toolchain
+        shell: powershell
+        run: |
+          $rustcPath = (Get-Command rustc -ErrorAction SilentlyContinue).Source
+          if (-not $rustcPath) {
+            Write-Host "Installing rustup..."
+            Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+            .\rustup-init.exe -y --default-toolchain stable --profile minimal
+            Remove-Item rustup-init.exe
+            "$env:USERPROFILE\.cargo\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          }
+          rustup show
 
-      - name: Build Windows .exe
+      - name: Enter MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build ephpm.exe
+        shell: powershell
         run: cargo xtask release ${{ matrix.php_minor }} --target windows --no-sqld
 
       - name: Package archive
         id: pkg
+        shell: powershell
         env:
           VERSION: ${{ github.ref_name }}
           PHP_FULL: ${{ matrix.php_full }}
         run: |
-          set -eu
-          name="ephpm-${VERSION}+php${PHP_FULL}-windows-x86_64"
-          mkdir -p "dist/${name}"
-          cp target/x86_64-pc-windows-msvc/release/ephpm.exe "dist/${name}/ephpm.exe"
-          cp LICENSE "dist/${name}/LICENSE"
-          cp .github/release-readme.txt "dist/${name}/README.txt"
-          # tar.gz on Windows too: built-in `tar` (bsdtar) on Win10/11 1809+
-          # unpacks .tar.gz natively, so we don't need a separate .zip path.
-          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
-          rm -rf "dist/${name}"
-          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          $name = "ephpm-$env:VERSION+php$env:PHP_FULL-windows-x86_64"
+          $stage = "dist\$name"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\ephpm.exe "$stage\ephpm.exe"
+          Copy-Item LICENSE "$stage\LICENSE"
+          Copy-Item .github\release-readme.txt "$stage\README.txt"
+          # tar.gz on Windows: built-in `tar` (bsdtar) on Win10/11 1809+
+          # produces a portable archive consumers can `tar xzf` cross-OS.
+          tar -C dist -czf "dist\$name.tar.gz" $name
+          Remove-Item -Recurse -Force $stage
+          "archive=dist/$name.tar.gz" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
 
       - name: Upload archive
         uses: actions/upload-artifact@v4

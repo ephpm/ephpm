@@ -133,8 +133,11 @@ jobs:
 
   build-windows:
     name: Build (PHP ${{ matrix.php }}, windows-x86_64)
-    runs-on: [self-hosted, linux, x64]
-    container: ephpm/ephpm-ci:latest
+    # Native Windows build on the self-hosted Windows runner (same fleet as
+    # php-sdk). Replaces the previous cargo-xwin cross-compile-from-Linux
+    # path, which kept hitting case-sensitivity / transitive-include gaps
+    # between xwin's lowercased SDK headers and PHP source assumptions.
+    runs-on: [self-hosted, windows, x64]
     strategy:
       fail-fast: false
       matrix:
@@ -142,18 +145,47 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install cargo-xwin
-        run: cargo install cargo-xwin --locked || true
+      - name: Install Rust toolchain
+        shell: powershell
+        run: |
+          $rustcPath = (Get-Command rustc -ErrorAction SilentlyContinue).Source
+          if (-not $rustcPath) {
+            Write-Host "Installing rustup..."
+            Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+            .\rustup-init.exe -y --default-toolchain stable --profile minimal
+            Remove-Item rustup-init.exe
+            "$env:USERPROFILE\.cargo\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          }
+          rustup show
 
-      - name: Build Windows .exe
+      - name: Enter MSVC developer environment
+        # Imports vcvars64.bat into the workflow environment so cl.exe,
+        # link.exe, and the Windows SDK includes/libs are on PATH for the
+        # cargo build below (and for cc-rs crates like ring that compile
+        # their own C). Assumes VS Build Tools are pre-installed on the
+        # runner (php-sdk's build.yml installs them on first use and the
+        # install persists across ephemerd-managed runner sessions).
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build ephpm.exe
+        shell: powershell
         run: cargo xtask release ${{ matrix.php }} --target windows --no-sqld
 
       - name: Verify binary
+        shell: powershell
         run: |
-          FILE="target/x86_64-pc-windows-msvc/release/ephpm.exe"
-          test -f "$FILE" || { echo "::error::Binary not found at $FILE"; exit 1; }
-          file "$FILE"
-          ls -lh "$FILE"
+          $bin = "target\x86_64-pc-windows-msvc\release\ephpm.exe"
+          if (-not (Test-Path $bin)) {
+            Write-Error "Binary not found at $bin"
+            exit 1
+          }
+          Get-Item $bin | Format-List Name, Length, LastWriteTime
+          Write-Host "==> Linker metadata:"
+          & dumpbin /headers $bin | Select-String -Pattern 'machine|subsystem'
+          Write-Host "==> Linked DLL dependencies:"
+          & dumpbin /dependents $bin
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
