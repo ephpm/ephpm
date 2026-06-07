@@ -197,14 +197,8 @@ jobs:
           foreach ($e in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
             $envBefore[$e.Key] = $e.Value
           }
-          $dumpBat = Join-Path $env:TEMP "vcvars-dump.bat"
-          @"
-          @echo off
-          call "$vcvars" >NUL
-          set
-          "@ | Out-File -Encoding ascii -FilePath $dumpBat
-          $output = & cmd /c $dumpBat
-          Remove-Item $dumpBat
+          $cmdLine = 'call "' + $vcvars + '" >NUL & set'
+          $output = & cmd /c $cmdLine
           foreach ($line in $output) {
             if ($line -match '^([^=]+)=(.*)$') {
               if ($envBefore[$matches[1]] -ne $matches[2]) {
