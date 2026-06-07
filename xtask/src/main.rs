@@ -26,7 +26,7 @@ fn main() -> ExitCode {
     let cmd = args.first().map(String::as_str);
 
     match cmd {
-        Some("release") => require_unix(|| release(&args[1..])),
+        Some("release") => release(&args[1..]),
         // php-sdk is a pure download — works on any platform with curl + tar.
         Some("php-sdk") => php_sdk(&args[1..]),
         Some("e2e") => e2e(&args[1..]),
@@ -64,8 +64,8 @@ The PHP SDK is downloaded from github.com/ephpm/php-sdk releases. Pass a minor
 shorthand (e.g. \"8.5\") to use the pinned patch release, or a full version
 (e.g. \"8.5.2\") for an explicit pin.
 
-Cross-compilation:
-  --target windows    Cross-compile a Windows .exe from WSL/Linux (requires cargo-xwin).
+Windows builds:
+  --target windows    Build a native Windows .exe (must run on Windows; MSVC build tools required).
                       Downloads the same prebuilt SDK as Linux/macOS, but for windows-x86_64.
 
 SQLite clustering:
@@ -128,9 +128,13 @@ fn parse_release_php_version(args: &[String]) -> &str {
 }
 
 /// Dispatch release builds based on `--target` flag.
+///
+/// `release_native` requires a Unix host (musl-gcc on Linux); the Windows
+/// path requires native Windows (no cargo-xwin cross-compile). Each path
+/// applies its own host guard.
 fn release(args: &[String]) -> ExitCode {
     match parse_target(args) {
-        None => release_native(args),
+        None => require_unix(|| release_native(args)),
         Some("windows") => release_windows(args),
         Some(other) => {
             eprintln!("error: unsupported target '{other}' (supported: windows)");
@@ -231,22 +235,44 @@ fn require_macos_arm64() -> Result<(), ExitCode> {
     Err(ExitCode::FAILURE)
 }
 
-/// Cross-compile a Windows .exe from WSL/Linux using cargo-xwin.
+/// Build a Windows `ephpm.exe` natively on a Windows host.
+///
+/// Requires native Windows with the MSVC build tools (`cl.exe`, `link.exe`)
+/// and the Windows SDK on PATH — same prerequisites as any other native
+/// `cargo build` for `x86_64-pc-windows-msvc`. CI populates these by entering
+/// a VS developer environment (`ilammy/msvc-dev-cmd` or equivalent vcvars
+/// import) before invoking xtask.
 ///
 /// The Windows SDK is the same `php-sdk` GitHub release used for Linux/macOS,
 /// just the `windows-x86_64` artifact: it contains `php8embed.dll`,
-/// `php8embed.lib`, and the headers under `include/php/`. cargo-xwin handles
-/// the MSVC link.
+/// `php8embed.lib`, and the headers under `include/php/`. The build links
+/// against `php8embed.lib` (import lib for the DLL).
 ///
 /// The resulting binary requires `php8embed.dll` at runtime, which is also
 /// embedded into the binary via `include_bytes!()` in `windows_dll.rs` and
 /// extracted at startup.
+///
+/// History: this used to cross-compile from Linux via `cargo-xwin`. That path
+/// was removed because every Windows SDK case-sensitivity / transitive-include
+/// gap (Ws2tcpip.h, intsafe.h, dllimport vs static linkage, etc.) ate hours of
+/// debugging that a native build doesn't have to deal with. Native Windows
+/// runners are already provisioned on the self-hosted fleet (php-sdk uses
+/// them); ephpm now does too.
 fn release_windows(args: &[String]) -> ExitCode {
+    if !cfg!(target_os = "windows") {
+        eprintln!("error: release_windows requires a native Windows host.");
+        eprintln!("       The cargo-xwin cross-compile path was removed.");
+        eprintln!(
+            "       Use the [self-hosted, windows, x64] runner pattern in CI, \
+             or run on a Windows workstation locally."
+        );
+        return ExitCode::FAILURE;
+    }
+
     // sqld has no Windows binary — error if user tries to embed it.
     if parse_sqld_binary(args).is_some() {
         eprintln!("error: sqld is not available for Windows.");
         eprintln!("       Clustered SQLite requires Linux or macOS.");
-        eprintln!("       Use WSL to build a Linux binary with sqld embedded.");
         return ExitCode::FAILURE;
     }
     if !args.iter().any(|a| a == "--no-sqld") {
@@ -258,13 +284,6 @@ fn release_windows(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let target = "x86_64-pc-windows-msvc";
-
-    eprintln!("==> Checking prerequisites...");
-    if !has_command("cargo-xwin") {
-        eprintln!("error: cargo-xwin not installed");
-        eprintln!("       cargo install cargo-xwin");
-        return ExitCode::FAILURE;
-    }
 
     if ensure_php_sdk_for(&php_version, "windows", "x86_64").is_err() {
         return ExitCode::FAILURE;
@@ -280,12 +299,12 @@ fn release_windows(args: &[String]) -> ExitCode {
 
     eprintln!("==> Building ephpm.exe (release, target: {target})...");
     let status = Command::new("cargo")
-        .args(["xwin", "build", "--release", "--package", "ephpm", "--target", target])
+        .args(["build", "--release", "--package", "ephpm", "--target", target])
         .env("PHP_SDK_PATH", &sdk_dir)
         .status();
 
     if !ran_ok(&status) {
-        eprintln!("error: cargo xwin build failed");
+        eprintln!("error: cargo build failed");
         return ExitCode::FAILURE;
     }
 
