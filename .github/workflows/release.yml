@@ -155,10 +155,44 @@ jobs:
           }
           rustup show
 
+      - name: Install Visual Studio Build Tools
+        shell: powershell
+        # Mirrors php-sdk's install block; runner image is bare so each
+        # job installs VS Build Tools fresh via the official bootstrapper.
+        run: |
+          $installPath = "C:\BuildTools"
+          $msbuild = "$installPath\MSBuild\Current\Bin\MSBuild.exe"
+          if (Test-Path $msbuild) {
+            Write-Host "VS Build Tools already present at $installPath"
+          } else {
+            Write-Host "Downloading VS Build Tools bootstrapper..."
+            Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_buildtools.exe" -OutFile vs_buildtools.exe
+            $proc = Start-Process -FilePath .\vs_buildtools.exe `
+              -ArgumentList @(
+                '--quiet', '--wait', '--norestart', '--nocache',
+                '--installPath', $installPath,
+                '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+                '--includeRecommended'
+              ) -Wait -PassThru -NoNewWindow
+            Write-Host "Bootstrapper exit code: $($proc.ExitCode)"
+            Remove-Item vs_buildtools.exe
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            while (-not (Test-Path $msbuild) -and $sw.Elapsed.TotalMinutes -lt 20) {
+              Start-Sleep -Seconds 30
+              Write-Host ("  ...waiting for VS install ({0:F0}s)" -f $sw.Elapsed.TotalSeconds)
+            }
+            if (-not (Test-Path $msbuild)) {
+              Write-Host "::error::VS install timed out - $msbuild never appeared"
+              exit 1
+            }
+            Write-Host ("MSBuild.exe found after {0:F0}s" -f $sw.Elapsed.TotalSeconds)
+          }
+
       - name: Enter MSVC developer environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+          vsversion: "2022"
 
       - name: Build ephpm.exe
         shell: powershell
