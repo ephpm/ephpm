@@ -214,21 +214,31 @@ jobs:
         shell: powershell
         # Source vcvars64.bat from our custom install path (C:\BuildTools)
         # and export the resulting env vars to GITHUB_ENV. ilammy/msvc-dev-cmd
-        # only probes standard VS install paths (Program Files\Microsoft
-        # Visual Studio\2022\{Enterprise,Professional,Community,BuildTools})
-        # and doesn't find our Server Core-friendly C:\BuildTools install.
+        # only probes standard VS install paths and doesn't find our
+        # Server Core-friendly C:\BuildTools install.
+        #
+        # Use a temp .bat (rather than `cmd /c "...vcvars... && set"`)
+        # because Windows PowerShell 5.1 — the only PowerShell on the
+        # Server Core runner image — parses `&&` as a statement separator
+        # even inside double-quoted strings, breaking the cmd subshell.
         run: |
           $vcvars = "C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
           if (-not (Test-Path $vcvars)) {
             Write-Error "vcvars64.bat not found at $vcvars — VS Build Tools install may have failed"
             exit 1
           }
-          # cmd /c sources vcvars, then `set` dumps the env; capture and
-          # forward to GITHUB_ENV so subsequent cargo steps see cl.exe,
-          # link.exe, INCLUDE, LIB, LIBPATH, etc.
           $envBefore = @{}
-          foreach ($e in [Environment]::GetEnvironmentVariables().GetEnumerator()) { $envBefore[$e.Key] = $e.Value }
-          $output = & "${env:COMSPEC}" /s /c "`"$vcvars`" >NUL && set"
+          foreach ($e in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+            $envBefore[$e.Key] = $e.Value
+          }
+          $dumpBat = Join-Path $env:TEMP "vcvars-dump.bat"
+          @"
+          @echo off
+          call "$vcvars" >NUL
+          set
+          "@ | Out-File -Encoding ascii -FilePath $dumpBat
+          $output = & cmd /c $dumpBat
+          Remove-Item $dumpBat
           $count = 0
           foreach ($line in $output) {
             if ($line -match '^([^=]+)=(.*)$') {
