@@ -97,11 +97,22 @@ jobs:
         # /opt/homebrew/bin isn't on the runner's default PATH for
         # non-login shells, so prepend it before calling brew (same
         # pattern php-sdk's macOS job uses).
+        #
+        # BINDGEN_EXTRA_CLANG_ARGS pins clang's resource-dir to llvm@17's
+        # bundled headers. Without this, libclang@17 ends up parsing
+        # Apple-clang 21's NEON intrinsic headers (arm_neon.h /
+        # arm_vector_types.h), which use __mfp8 — a type added in
+        # clang 19+ that llvm@17 doesn't know. The build then fails
+        # with hundreds of "unknown type name '__mfp8'" /
+        # "incompatible constant for this __builtin_neon function".
         run: |
           export PATH="/opt/homebrew/bin:$PATH"
           brew install llvm@17 || brew upgrade llvm@17 || true
           LLVM_PREFIX=$(brew --prefix llvm@17)
+          # Find llvm@17's clang resource dir (varies by patch version)
+          LLVM_RESOURCE_DIR=$(ls -d "${LLVM_PREFIX}"/lib/clang/* | head -1)
           echo "LIBCLANG_PATH=${LLVM_PREFIX}/lib" >> "$GITHUB_ENV"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-resource-dir=${LLVM_RESOURCE_DIR}" >> "$GITHUB_ENV"
 
       - name: Build ephpm
         # Pulls libphp.a from github.com/ephpm/php-sdk; no system PHP/spc
@@ -148,15 +159,18 @@ jobs:
       - name: Install Rust toolchain
         shell: powershell
         run: |
-          $rustcPath = (Get-Command rustc -ErrorAction SilentlyContinue).Source
-          if (-not $rustcPath) {
+          $cargoBin = "$env:USERPROFILE\.cargo\bin"
+          if (-not (Test-Path "$cargoBin\rustup.exe")) {
             Write-Host "Installing rustup..."
             Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
             .\rustup-init.exe -y --default-toolchain stable --profile minimal
             Remove-Item rustup-init.exe
-            "$env:USERPROFILE\.cargo\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
           }
-          rustup show
+          # GITHUB_PATH applies to subsequent steps only; also update the
+          # current step's PATH so the verification below can find rustup.
+          $env:PATH = "$cargoBin;$env:PATH"
+          $cargoBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          & "$cargoBin\rustup.exe" show
 
       - name: Install Visual Studio Build Tools
         shell: powershell
