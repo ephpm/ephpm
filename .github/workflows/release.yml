@@ -189,10 +189,25 @@ jobs:
           }
 
       - name: Enter MSVC developer environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-          vsversion: "2022"
+        shell: powershell
+        # Source vcvars64.bat from our custom install path (C:\BuildTools);
+        # ilammy/msvc-dev-cmd only probes standard Program Files locations.
+        run: |
+          $vcvars = "C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) {
+            Write-Error "vcvars64.bat not found at $vcvars"
+            exit 1
+          }
+          $envBefore = @{}
+          foreach ($e in [Environment]::GetEnvironmentVariables().GetEnumerator()) { $envBefore[$e.Key] = $e.Value }
+          $output = & "${env:COMSPEC}" /s /c "`"$vcvars`" >NUL && set"
+          foreach ($line in $output) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              if ($envBefore[$matches[1]] -ne $matches[2]) {
+                "$($matches[1])=$($matches[2])" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+              }
+            }
+          }
 
       - name: Build ephpm.exe
         shell: powershell

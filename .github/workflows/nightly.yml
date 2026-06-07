@@ -211,13 +211,36 @@ jobs:
           }
 
       - name: Enter MSVC developer environment
-        # Imports vcvars64.bat into GITHUB_ENV so cl.exe, link.exe, and
-        # the Windows SDK includes/libs are on PATH for cargo build and
-        # cc-rs-driven crates like `ring`.
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
-          vsversion: "2022"
+        shell: powershell
+        # Source vcvars64.bat from our custom install path (C:\BuildTools)
+        # and export the resulting env vars to GITHUB_ENV. ilammy/msvc-dev-cmd
+        # only probes standard VS install paths (Program Files\Microsoft
+        # Visual Studio\2022\{Enterprise,Professional,Community,BuildTools})
+        # and doesn't find our Server Core-friendly C:\BuildTools install.
+        run: |
+          $vcvars = "C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) {
+            Write-Error "vcvars64.bat not found at $vcvars — VS Build Tools install may have failed"
+            exit 1
+          }
+          # cmd /c sources vcvars, then `set` dumps the env; capture and
+          # forward to GITHUB_ENV so subsequent cargo steps see cl.exe,
+          # link.exe, INCLUDE, LIB, LIBPATH, etc.
+          $envBefore = @{}
+          foreach ($e in [Environment]::GetEnvironmentVariables().GetEnumerator()) { $envBefore[$e.Key] = $e.Value }
+          $output = & "${env:COMSPEC}" /s /c "`"$vcvars`" >NUL && set"
+          $count = 0
+          foreach ($line in $output) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              $name = $matches[1]
+              $value = $matches[2]
+              if ($envBefore[$name] -ne $value) {
+                "$name=$value" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+                $count++
+              }
+            }
+          }
+          Write-Host "Forwarded $count env vars from vcvars64 to GITHUB_ENV"
 
       - name: Build ephpm.exe
         shell: powershell

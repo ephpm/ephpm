@@ -32,6 +32,37 @@ fn main() {
         return;
     }
 
+    let lib_dir = sdk_path.join("lib");
+
+    if target_os == "macos" {
+        // Apple's ld64 doesn't understand GNU ld's --wrap, --start-group/
+        // --end-group, or -Bstatic/-Bdynamic. ld64 does multi-pass
+        // symbol resolution by default, so the group flags aren't needed
+        // — just list the archives directly and let it sort circular
+        // deps out.
+        //
+        // The zend_signal_* SIGPROF wrapping that --wrap provides on
+        // Linux is currently NOT applied on macOS. This is a known gap
+        // (TODO: implement via -Wl,-alias_list or by overriding the
+        // symbols via a sibling .a built specifically to win symbol
+        // resolution order). It only matters if SIGPROF on tokio
+        // worker threads ever fires — PHP installs the handler in
+        // zend_signal_startup but typically only delivers it under
+        // max_execution_time, which ephpm enforces at the tokio layer
+        // instead and shouldn't trigger.
+        println!("cargo::rustc-link-arg={}", lib_dir.join("libphp.a").display());
+        for static_lib in macos_static_libs() {
+            let archive = lib_dir.join(format!("lib{static_lib}.a"));
+            if archive.exists() {
+                println!("cargo::rustc-link-arg={}", archive.display());
+            }
+        }
+        return;
+    }
+
+    // Linux path: GNU ld supports --wrap, --start-group/--end-group, and
+    // -Bstatic/-Bdynamic. We rely on all three.
+
     for func in &[
         "zend_signal_startup",
         "zend_signal_init",
@@ -66,14 +97,10 @@ fn main() {
     // Wrapping in --start-group/--end-group forces multi-pass symbol
     // resolution: PHP's static archives have circular dependencies
     // (libphp.a → libz.a → ...; libcurl → libssl; libxml2 → libz; etc.).
-    let lib_dir = sdk_path.join("lib");
     println!("cargo::rustc-link-arg=-Wl,-Bstatic");
     println!("cargo::rustc-link-arg=-Wl,--start-group");
     println!("cargo::rustc-link-arg={}", lib_dir.join("libphp.a").display());
-    for static_lib in &[
-        "ssl", "crypto", "curl", "z", "xml2", "sodium", "iconv", "charset", "png16", "gd", "jpeg",
-        "freetype", "onig", "zip", "bz2", "xslt", "exslt",
-    ] {
+    for static_lib in linux_static_libs() {
         let archive = lib_dir.join(format!("lib{static_lib}.a"));
         if archive.exists() {
             println!("cargo::rustc-link-arg={}", archive.display());
@@ -81,4 +108,28 @@ fn main() {
     }
     println!("cargo::rustc-link-arg=-Wl,--end-group");
     println!("cargo::rustc-link-arg=-Wl,-Bdynamic");
+}
+
+/// Static lib set the Linux SDK ships (musl-built).
+///
+/// Kept in sync with `crates/ephpm-php/build.rs`'s probe list — both
+/// paths need to know about the same SDK contents. If you add a lib
+/// here, mirror it there (and vice versa).
+fn linux_static_libs() -> &'static [&'static str] {
+    &[
+        "ssl", "crypto", "curl", "z", "xml2", "xslt", "exslt", "lzma", "sodium", "iconv",
+        "charset", "intl", "png16", "gd", "jpeg", "freetype", "onig", "zip", "bz2", "gmp",
+        "sqlite3", "pq", "pgcommon", "pgport", "edit", "ncurses", "menu", "form", "panel", "tic",
+        "icui18n", "icuuc", "icudata", "icuio", "icutu", "stdc++",
+    ]
+}
+
+/// Static lib set the macOS SDK ships.
+///
+/// macOS's libphp.a bundles some deps differently than Linux's (system
+/// libiconv lives in libSystem, libz/libxml2 are system frameworks, etc.).
+/// Start with the same list as Linux and tighten as we discover what's
+/// actually needed.
+fn macos_static_libs() -> &'static [&'static str] {
+    linux_static_libs()
 }
