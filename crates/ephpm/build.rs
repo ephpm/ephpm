@@ -57,6 +57,16 @@ fn main() {
                 println!("cargo::rustc-link-arg={}", archive.display());
             }
         }
+        // ICU on macOS is built against libc++ (Apple's C++ stdlib);
+        // libphp's intl extension drags in std::logic_error,
+        // std::length_error, ___gxx_personality_v0, etc. Rust doesn't
+        // auto-add -lc++ when we override the link line with explicit
+        // rustc-link-arg directives, so add it explicitly.
+        //
+        // Order matters: must come AFTER the static archives so ld64
+        // sees the unresolved references first, then resolves them
+        // from libc++.
+        println!("cargo::rustc-link-arg=-lc++");
         return;
     }
 

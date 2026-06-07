@@ -190,17 +190,21 @@ jobs:
 
       - name: Enter MSVC developer environment
         shell: powershell
-        # Source vcvars64.bat from our custom install path (C:\BuildTools);
-        # ilammy/msvc-dev-cmd only probes standard Program Files locations.
         run: |
           $vcvars = "C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-          if (-not (Test-Path $vcvars)) {
-            Write-Error "vcvars64.bat not found at $vcvars"
-            exit 1
-          }
+          if (-not (Test-Path $vcvars)) { Write-Error "vcvars64.bat not found"; exit 1 }
           $envBefore = @{}
-          foreach ($e in [Environment]::GetEnvironmentVariables().GetEnumerator()) { $envBefore[$e.Key] = $e.Value }
-          $output = & "${env:COMSPEC}" /s /c "`"$vcvars`" >NUL && set"
+          foreach ($e in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+            $envBefore[$e.Key] = $e.Value
+          }
+          $dumpBat = Join-Path $env:TEMP "vcvars-dump.bat"
+          @"
+          @echo off
+          call "$vcvars" >NUL
+          set
+          "@ | Out-File -Encoding ascii -FilePath $dumpBat
+          $output = & cmd /c $dumpBat
+          Remove-Item $dumpBat
           foreach ($line in $output) {
             if ($line -match '^([^=]+)=(.*)$') {
               if ($envBefore[$matches[1]] -ne $matches[2]) {
