@@ -3,22 +3,22 @@ name: Release
 # Release artifacts produced per tag:
 #
 #   * Per-platform binary archives uploaded to the GitHub release:
-#       ephpm-vX.Y.Z+php<PHP_FULL>-<os>-<arch>.tar.gz   (one per PHP minor × OS/arch)
+#       ephpm-vX.Y.Z+php<PHP_FULL>-<os>-<arch>.tar.gz   (one per PHP minor x OS/arch)
 #       SHA256SUMS                                       (covers all archives)
 #
 #   * Docker images pushed to Docker Hub at docker.io/ephpm/ephpm:
-#       :vX.Y.Z-php<PHP_FULL>     pinned ephpm release × pinned PHP patch
-#       :vX.Y.Z-php<PHP_MINOR>    pinned ephpm release × rolling PHP minor
-#       :<PHP_MINOR>              rolling latest release × rolling PHP minor
-#       :vX.Y.Z (default PHP)     pinned ephpm release × default PHP minor
-#       :latest (default PHP)     rolling latest release × default PHP minor
+#       :vX.Y.Z-php<PHP_FULL>     pinned ephpm release x pinned PHP patch
+#       :vX.Y.Z-php<PHP_MINOR>    pinned ephpm release x rolling PHP minor
+#       :<PHP_MINOR>              rolling latest release x rolling PHP minor
+#       :vX.Y.Z (default PHP)     pinned ephpm release x default PHP minor
+#       :latest (default PHP)     rolling latest release x default PHP minor
 #
 # The "+" in artifact names is real SemVer build metadata. OCI tag regex
-# rejects "+", so every Docker tag substitutes "-" for "+" — the same
+# rejects "+", so every Docker tag substitutes "-" for "+" -- the same
 # trade-off k3s and rke2 make. The real SemVer string is preserved on each
 # image via the org.opencontainers.image.version label.
 #
-# PHP version pins must match xtask::PHP_SDK_VERSIONS — keep the matrix
+# PHP version pins must match xtask::PHP_SDK_VERSIONS -- keep the matrix
 # entries below in sync if you bump a pin.
 
 on:
@@ -29,7 +29,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Linux binaries ─────────────────────────────────────────────────────────
+  # -- Linux binaries ---------------------------------------------------------
   build-linux:
     name: Build (PHP ${{ matrix.php_full }}, linux-x86_64)
     runs-on: [self-hosted, linux, x64]
@@ -70,7 +70,7 @@ jobs:
           name: ephpm-${{ github.ref_name }}-php${{ matrix.php_full }}-linux-x86_64
           path: ${{ steps.pkg.outputs.archive }}
 
-  # ── macOS binaries ─────────────────────────────────────────────────────────
+  # -- macOS binaries ---------------------------------------------------------
   build-macos:
     name: Build (PHP ${{ matrix.php_full }}, macos-aarch64)
     runs-on: [self-hosted, macos, arm64]
@@ -126,7 +126,7 @@ jobs:
           name: ephpm-${{ github.ref_name }}-php${{ matrix.php_full }}-macos-aarch64
           path: ${{ steps.pkg.outputs.archive }}
 
-  # ── Windows binaries (native on self-hosted Windows runner) ──────────────
+  # -- Windows binaries (native on self-hosted Windows runner) --------------
   build-windows:
     name: Build (PHP ${{ matrix.php_full }}, windows-x86_64)
     runs-on: [self-hosted, windows, x64]
@@ -236,7 +236,7 @@ jobs:
           name: ephpm-${{ github.ref_name }}-php${{ matrix.php_full }}-windows-x86_64
           path: ${{ steps.pkg.outputs.archive }}
 
-  # ── Docker images on Docker Hub ────────────────────────────────────────────
+  # -- Docker images on Docker Hub --------------------------------------------
   docker-image:
     name: Docker (PHP ${{ matrix.php_full }})
     runs-on: [self-hosted, linux, x64]
@@ -273,7 +273,7 @@ jobs:
           IS_DEFAULT: ${{ matrix.default }}
         run: |
           set -eu
-          # All tags substitute "+" → "-" because OCI tag regex rejects "+".
+          # All tags substitute "+" -> "-" because OCI tag regex rejects "+".
           # The real SemVer string lives in the OCI label (see --label below).
           tags="ephpm/ephpm:${VERSION}-php${PHP_FULL}"
           tags="${tags},ephpm/ephpm:${VERSION}-php${PHP_MINOR}"
@@ -303,7 +303,7 @@ jobs:
             org.opencontainers.image.version=${{ steps.tags.outputs.semver }}
             org.opencontainers.image.licenses=MIT
 
-  # ── Release: gather archives, hash them, attach to the GitHub release ──────
+  # -- Release: gather archives, hash them, attach to the GitHub release ------
   release:
     name: Create Release
     needs: [build-linux, build-macos, build-windows, docker-image]

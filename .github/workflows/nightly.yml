@@ -1,12 +1,12 @@
-# Nightly test suite — comprehensive builds and tests that are too slow for PR CI.
+# Nightly test suite -- comprehensive builds and tests that are too slow for PR CI.
 #
 # Runs daily at 04:00 UTC and on manual dispatch. Covers full release builds
 # across all supported PHP versions and architectures, plus the E2E test suite.
 #
 # Gating policy: the nightly's overall pass/fail signal is driven by the
 # release-path Build jobs only (build-linux, build-macos, build-windows).
-# Everything else — the in-build `Run ignored integration tests` step, the
-# fuzz / e2e / smoke-tests / audit jobs — is "best-effort" with
+# Everything else -- the in-build `Run ignored integration tests` step, the
+# fuzz / e2e / smoke-tests / audit jobs -- is "best-effort" with
 # continue-on-error so individual failures don't mask the release signal.
 # Failures still surface on the run page; only the summary check ignores them.
 # Re-tighten by removing continue-on-error and re-adding the job to the
@@ -25,7 +25,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── 1. Full release builds ────────────────────────────────────────────────
+  # -- 1. Full release builds ------------------------------------------------
 
   build-linux:
     name: Build (PHP ${{ matrix.php }}, linux-x86_64)
@@ -42,7 +42,7 @@ jobs:
         run: cargo xtask release ${{ matrix.php }}
 
       - name: Run ignored integration tests
-        # Auxiliary — does not gate the release path. Currently broken due to
+        # Auxiliary -- does not gate the release path. Currently broken due to
         # a libphp+libxml2 link-order issue when building debug test binaries
         # (release builds dodge it via --gc-sections). Tracked as a separate
         # task; meanwhile keep running it so we can observe the error change.
@@ -72,7 +72,7 @@ jobs:
 
   build-macos:
     name: Build (PHP ${{ matrix.php }}, macos-aarch64)
-    # Apple Silicon only — the php-sdk release does not publish macos-x86_64.
+    # Apple Silicon only -- the php-sdk release does not publish macos-x86_64.
     runs-on: [self-hosted, macos, arm64]
     strategy:
       fail-fast: false
@@ -87,10 +87,10 @@ jobs:
       - name: Pin libclang for bindgen
         # The runner's system Apple-clang (Xcode 16+) emits CXCallingConv
         # value 20 (CXCallingConv_PreserveNone, added in clang 18), which
-        # bindgen 0.72 doesn't know how to tokenize — it panics with
+        # bindgen 0.72 doesn't know how to tokenize -- it panics with
         # "Cannot turn unknown calling convention to tokens: 20".
         # Pointing bindgen at llvm@17's libclang avoids the new enum value
-        # entirely. Tracked at github.com/rust-lang/rust-bindgen — remove
+        # entirely. Tracked at github.com/rust-lang/rust-bindgen -- remove
         # this step once bindgen learns the new CCs (or falls back
         # gracefully instead of panicking).
         #
@@ -101,7 +101,7 @@ jobs:
         # BINDGEN_EXTRA_CLANG_ARGS pins clang's resource-dir to llvm@17's
         # bundled headers. Without this, libclang@17 ends up parsing
         # Apple-clang 21's NEON intrinsic headers (arm_neon.h /
-        # arm_vector_types.h), which use __mfp8 — a type added in
+        # arm_vector_types.h), which use __mfp8 -- a type added in
         # clang 19+ that llvm@17 doesn't know. The build then fails
         # with hundreds of "unknown type name '__mfp8'" /
         # "incompatible constant for this __builtin_neon function".
@@ -120,7 +120,7 @@ jobs:
         run: cargo xtask release ${{ matrix.php }}
 
       - name: Run ignored integration tests
-        # Auxiliary — does not gate the release path. See build-linux's
+        # Auxiliary -- does not gate the release path. See build-linux's
         # equivalent step for context.
         continue-on-error: true
         run: |
@@ -176,7 +176,7 @@ jobs:
         shell: powershell
         # Mirrors php-sdk's install block (we share the same Windows
         # runner image: mcr.microsoft.com/windows/servercore:ltsc2025).
-        # The runner is bare — no compiler — so each job installs VS
+        # The runner is bare -- no compiler -- so each job installs VS
         # Build Tools fresh via the official bootstrapper. Bootstrapper
         # exit on Server Core is unreliable, so we poll for MSBuild.exe.
         # Long-term: ephemerd should bake VS Build Tools into the
@@ -220,14 +220,14 @@ jobs:
         # PS 5.1 parser notes:
         #   - `&&` is rejected even inside quoted strings ("not a valid
         #     statement separator in this version"). Use `&` (single
-        #     ampersand) — cmd treats it as unconditional separator, PS
+        #     ampersand) -- cmd treats it as unconditional separator, PS
         #     parses it as literal inside a double-quoted string.
         #   - here-strings (@"..."@) require the closing "@ at column 0
         #     which fights YAML indentation; avoid them.
         run: |
           $vcvars = "C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
           if (-not (Test-Path $vcvars)) {
-            Write-Error "vcvars64.bat not found at $vcvars — VS Build Tools install may have failed"
+            Write-Error "vcvars64.bat not found at $vcvars -- VS Build Tools install may have failed"
             exit 1
           }
           $envBefore = @{}
@@ -273,12 +273,12 @@ jobs:
           name: ephpm-php${{ matrix.php }}-windows-x86_64
           path: target/x86_64-pc-windows-msvc/release/ephpm.exe
 
-  # ── 2. Fuzz testing (4 targets in parallel) ────────────────────────────────
+  # -- 2. Fuzz testing (4 targets in parallel) --------------------------------
 
   fuzz:
     name: Fuzz (${{ matrix.target }})
     runs-on: [self-hosted, linux, x64]
-    # Auxiliary — does not gate the release path.
+    # Auxiliary -- does not gate the release path.
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -319,13 +319,13 @@ jobs:
           name: fuzz-crashes-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
 
-  # ── 3. E2E tests (using Linux build artifacts) ────────────────────────────
+  # -- 3. E2E tests (using Linux build artifacts) ----------------------------
 
   e2e:
     name: E2E (PHP ${{ matrix.php }})
     needs: [build-linux]
     runs-on: [self-hosted, linux, x64]
-    # Auxiliary — does not gate the release path.
+    # Auxiliary -- does not gate the release path.
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -342,13 +342,13 @@ jobs:
       - name: Run E2E tests
         run: cargo xtask e2e --php-version ${{ matrix.php }}
 
-  # ── 4. App smoke tests (WordPress, Laravel, Symfony on litewire SQLite) ──
+  # -- 4. App smoke tests (WordPress, Laravel, Symfony on litewire SQLite) --
 
   smoke-tests:
     name: Smoke Tests (PHP ${{ matrix.php }})
     needs: [build-linux]
     runs-on: [self-hosted, linux, x64]
-    # Auxiliary — does not gate the release path.
+    # Auxiliary -- does not gate the release path.
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -365,7 +365,7 @@ jobs:
 
       - name: Prepare binary
         run: |
-          # The artifact contains target/<triple>/release/ephpm — find and flatten it
+          # The artifact contains target/<triple>/release/ephpm -- find and flatten it
           BINARY=$(find artifact -name ephpm -type f | head -1)
           if [ -z "$BINARY" ]; then
             echo "::error::ephpm binary not found in artifact"
@@ -436,12 +436,12 @@ jobs:
         if: always()
         run: docker compose -f docker/docker-compose.smoke.yml down -v
 
-  # ── 5. Dependency audit ──────────────────────────────────────────────────
+  # -- 5. Dependency audit --------------------------------------------------
 
   audit:
     name: Dependency Audit
     runs-on: [self-hosted, linux, x64]
-    # Auxiliary — does not gate the release path. Currently broken because
+    # Auxiliary -- does not gate the release path. Currently broken because
     # cargo-deny-action uses buildx, which needs --privileged (disabled by
     # the ephemerd runner).
     continue-on-error: true
@@ -468,7 +468,7 @@ jobs:
           cargo outdated --root-deps-only 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-  # ── Summary ───────────────────────────────────────────────────────────────
+  # -- Summary ---------------------------------------------------------------
 
   nightly-summary:
     name: Nightly Summary
