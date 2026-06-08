@@ -308,10 +308,18 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
         }
     }
 
-    // When cross-compiling for Windows from Linux, tell bindgen to generate
-    // bindings for the target platform instead of the host.
+    // Platform-specific bindgen defines must match what compile_wrapper
+    // passes to cc::Build, or bindgen sees the wrong branch of every
+    // platform #ifdef in PHP's headers (and reports "unknown type
+    // sigjmp_buf" / "'syslog.h' not found" because it's parsing the
+    // Unix branches with no Unix headers present).
     if target_os == "windows" {
-        builder = builder.clang_arg("--target=x86_64-pc-windows-msvc");
+        builder = builder
+            .clang_arg("--target=x86_64-pc-windows-msvc")
+            .clang_arg("-DZEND_WIN32")
+            .clang_arg("-DPHP_WIN32")
+            .clang_arg("-DZEND_DEBUG=0")
+            .clang_arg("-DZTS=0");
     } else {
         // ZTS builds: define ZTS for bindgen so PHP headers use thread-safe macros.
         builder = builder.clang_arg("-DZTS=1").clang_arg("-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
