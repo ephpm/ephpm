@@ -12,6 +12,11 @@ ignore = [
     "RUSTSEC-2026-0104",
     # time crate DoS via RFC 2822 parsing — transitive dep, no user input path
     "RUSTSEC-2026-0009",
+    # proc-macro-error2 unmaintained — pulled transitively by
+    # mysql-common-derive -> mysql_common -> mysql_async / opensrv-mysql.
+    # Compile-time-only (proc macro), no runtime exposure. Awaiting
+    # upstream migration to manyhow / proc-macro2-diagnostics.
+    "RUSTSEC-2026-0173",
 ]
 
 [licenses]

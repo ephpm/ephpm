@@ -42,49 +42,64 @@
 /* ===== Per-thread state =====
  *
  * With ZTS, multiple threads execute PHP concurrently. All per-request
- * state must be thread-local (__thread / _Thread_local) to avoid races.
- * On non-ZTS builds, __thread is harmless (single thread executes PHP).
+ * state must be thread-local to avoid races. On non-ZTS builds (Windows),
+ * thread-local storage is harmless (single thread executes PHP).
+ *
+ * EPHPM_TLS picks the right keyword per compiler:
+ *   - GCC / Clang: __thread (the long-standing extension; works pre-C11)
+ *   - MSVC:        __declspec(thread) (MSVC's equivalent; __thread isn't
+ *                  a keyword in MSVC and produces "undeclared identifier"
+ *                  for every variable trying to use it)
+ *
+ * C11's _Thread_local would work on both, but we'd need /std:c11 (or
+ * /std:c17) on MSVC and -std=c11 on GCC to enable it. The macro keeps
+ * the build-flag surface unchanged.
  */
+#if defined(_MSC_VER)
+# define EPHPM_TLS __declspec(thread)
+#else
+# define EPHPM_TLS __thread
+#endif
 
-static __thread char *output_buf = NULL;
-static __thread size_t output_len = 0;
-static __thread size_t output_cap = 0;
+static EPHPM_TLS char *output_buf = NULL;
+static EPHPM_TLS size_t output_len = 0;
+static EPHPM_TLS size_t output_cap = 0;
 
 /* Response header buffer — "Name: Value\n" lines after script execution */
 
-static __thread char *headers_buf = NULL;
-static __thread size_t headers_buf_len = 0;
-static __thread size_t headers_buf_cap = 0;
+static EPHPM_TLS char *headers_buf = NULL;
+static EPHPM_TLS size_t headers_buf_len = 0;
+static EPHPM_TLS size_t headers_buf_cap = 0;
 
 /* Saved response status */
 
-static __thread int response_status_code = 200;
+static EPHPM_TLS int response_status_code = 200;
 
 /* Request info — pointers into Rust-owned CStrings, valid only during execution */
 
-static __thread const char *req_method = NULL;
-static __thread const char *req_uri = NULL;
-static __thread const char *req_query_string = NULL;
-static __thread const char *req_content_type = NULL;
-static __thread const char *req_cookie_data = NULL;
-static __thread const char *req_post_data = NULL;
-static __thread size_t req_post_data_len = 0;
-static __thread size_t req_post_data_offset = 0;
-static __thread const char *req_path_translated = NULL;
+static EPHPM_TLS const char *req_method = NULL;
+static EPHPM_TLS const char *req_uri = NULL;
+static EPHPM_TLS const char *req_query_string = NULL;
+static EPHPM_TLS const char *req_content_type = NULL;
+static EPHPM_TLS const char *req_cookie_data = NULL;
+static EPHPM_TLS const char *req_post_data = NULL;
+static EPHPM_TLS size_t req_post_data_len = 0;
+static EPHPM_TLS size_t req_post_data_offset = 0;
+static EPHPM_TLS const char *req_path_translated = NULL;
 
 /* Server variables */
 
 #define MAX_SERVER_VARS 128
 
-static __thread struct {
+static EPHPM_TLS struct {
     const char *key;
     const char *value;
 } server_vars[MAX_SERVER_VARS];
 
-static __thread int server_var_count = 0;
+static EPHPM_TLS int server_var_count = 0;
 
 /* Track whether a PHP request is currently active on this thread */
-static __thread int request_active = 0;
+static EPHPM_TLS int request_active = 0;
 
 /* ===================================================================
  * SAPI Callbacks
