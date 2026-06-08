@@ -320,6 +320,18 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
             .clang_arg("-DPHP_WIN32")
             .clang_arg("-DZEND_DEBUG=0")
             .clang_arg("-DZTS=0");
+
+        // bindgen runs libclang directly and does NOT consume the
+        // MSVC INCLUDE env var (cl.exe does, libclang doesn't). Without
+        // this, system headers like intsafe.h and windows.h fail to
+        // resolve even though they're on disk. Read INCLUDE (set by
+        // vcvars64.bat in the workflow) and forward each path to clang
+        // as -isystem so the lookup succeeds.
+        if let Ok(include) = env::var("INCLUDE") {
+            for path in include.split(';').filter(|p| !p.is_empty()) {
+                builder = builder.clang_arg(format!("-isystem{path}"));
+            }
+        }
     } else {
         // ZTS builds: define ZTS for bindgen so PHP headers use thread-safe macros.
         builder = builder.clang_arg("-DZTS=1").clang_arg("-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
