@@ -21,9 +21,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   - musl-tools/musl-dev: musl-gcc cross-compiler for the prebuilt PHP SDK
 #     (libphp.a is musl-linked).
 #   - libclang-dev: bindgen needs libclang.
-#   - clang/lld: cargo-xwin's Windows cross-build needs `clang-cl` (MSVC-
-#     compatible clang driver) + lld-link to compile cc-rs-driven crates
-#     like `ring` against the xwin MSVC headers.
 #   - libssl-dev: the workspace test build (`cargo nextest run --workspace`)
 #     pulls a dev-dependency that links openssl-sys, which needs system
 #     OpenSSL headers + openssl.pc. The musl release build doesn't, but the
@@ -31,9 +28,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   - tar/curl: SDK + sqld tarball downloads at build time.
 #   - file: nightly's `Verify binary` step uses /usr/bin/file to print the
 #     artifact's ELF metadata as a sanity check.
+#
+# Removed in PR #65: clang+lld. These were added in PR #44 to support
+# cargo-xwin's `cc-rs`-driven Windows crates (clang-cl + lld-link).
+# Windows builds switched to native on the self-hosted Windows runner
+# in PR #53, so the cross-compile path that needed these is gone. Re-add
+# if cross-compilation ever comes back.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential ca-certificates curl file git pkg-config tar \
-    libclang-dev clang lld libssl-dev musl-tools musl-dev \
+    libclang-dev libssl-dev musl-tools musl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Rust stable + nightly (for fmt only) ─────────────────────────────────────
