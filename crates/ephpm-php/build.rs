@@ -327,9 +327,23 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
         // resolve even though they're on disk. Read INCLUDE (set by
         // vcvars64.bat in the workflow) and forward each path to clang
         // as -isystem so the lookup succeeds.
-        if let Ok(include) = env::var("INCLUDE") {
-            for path in include.split(';').filter(|p| !p.is_empty()) {
-                builder = builder.clang_arg(format!("-isystem{path}"));
+        match env::var("INCLUDE") {
+            Ok(include) => {
+                let paths: Vec<&str> = include.split(';').filter(|p| !p.is_empty()).collect();
+                println!(
+                    "cargo::warning=bindgen: forwarding {} INCLUDE paths to clang",
+                    paths.len()
+                );
+                for path in paths {
+                    println!("cargo::warning=bindgen: -isystem{path}");
+                    builder = builder.clang_arg(format!("-isystem{path}"));
+                }
+            }
+            Err(_) => {
+                println!(
+                    "cargo::warning=bindgen: INCLUDE env var not set; \
+                     Windows SDK headers won't resolve"
+                );
             }
         }
     } else {
