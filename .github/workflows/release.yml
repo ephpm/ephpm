@@ -172,6 +172,7 @@ jobs:
                 '--quiet', '--wait', '--norestart', '--nocache',
                 '--installPath', $installPath,
                 '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+                '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang',
                 '--includeRecommended'
               ) -Wait -PassThru -NoNewWindow
             Write-Host "Bootstrapper exit code: $($proc.ExitCode)"
@@ -205,6 +206,12 @@ jobs:
                 "$($matches[1])=$($matches[2])" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
               }
             }
+          }
+          $libclangDir = "C:\BuildTools\VC\Tools\Llvm\x64\bin"
+          if (Test-Path "$libclangDir\libclang.dll") {
+            "LIBCLANG_PATH=$libclangDir" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          } else {
+            Write-Warning "libclang.dll not found at $libclangDir -- bindgen may panic"
           }
 
       - name: Build ephpm.exe
