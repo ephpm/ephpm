@@ -194,6 +194,7 @@ jobs:
                 '--quiet', '--wait', '--norestart', '--nocache',
                 '--installPath', $installPath,
                 '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+                '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang',
                 '--includeRecommended'
               ) -Wait -PassThru -NoNewWindow
             Write-Host "Bootstrapper exit code: $($proc.ExitCode)"
@@ -248,6 +249,17 @@ jobs:
             }
           }
           Write-Host "Forwarded $count env vars from vcvars64 to GITHUB_ENV"
+          # bindgen needs libclang.dll; the VC.Llvm.Clang component added
+          # to the VS Build Tools install puts it at this path. Set
+          # LIBCLANG_PATH so bindgen's runtime libloading search finds it
+          # without falling back to LLVM standard-locations probing.
+          $libclangDir = "C:\BuildTools\VC\Tools\Llvm\x64\bin"
+          if (Test-Path "$libclangDir\libclang.dll") {
+            "LIBCLANG_PATH=$libclangDir" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+            Write-Host "LIBCLANG_PATH set to $libclangDir"
+          } else {
+            Write-Warning "libclang.dll not found at $libclangDir -- bindgen may panic"
+          }
 
       - name: Build ephpm.exe
         shell: powershell
