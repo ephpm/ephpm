@@ -337,6 +337,11 @@ jobs:
     name: E2E (PHP ${{ matrix.php }})
     needs: [build-linux]
     runs-on: [self-hosted, linux, x64]
+    # Run inside the CI image so cargo has a C linker available
+    # (xtask needs `cc` to compile; bare runners only ship rustup).
+    # Same image as build-linux; ephemerd's host docker socket is
+    # reachable from inside so the kind cluster inside xtask works.
+    container: ephpm/ephpm-ci:latest
     # Auxiliary -- does not gate the release path.
     continue-on-error: true
     strategy:
@@ -345,8 +350,6 @@ jobs:
         php: ["8.4", "8.5"]
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
 
       - name: Install E2E tools (kind, tilt, kubectl)
         run: cargo xtask e2e-install
