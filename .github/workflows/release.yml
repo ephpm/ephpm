@@ -39,9 +39,9 @@ jobs:
       matrix:
         include:
           - php_minor: "8.4"
-            php_full: "8.4.21"
+            php_full: "8.4.22"
           - php_minor: "8.5"
-            php_full: "8.5.6"
+            php_full: "8.5.7"
     steps:
       - uses: actions/checkout@v4
 
@@ -79,9 +79,9 @@ jobs:
       matrix:
         include:
           - php_minor: "8.4"
-            php_full: "8.4.21"
+            php_full: "8.4.22"
           - php_minor: "8.5"
-            php_full: "8.5.6"
+            php_full: "8.5.7"
     steps:
       - uses: actions/checkout@v4
 
@@ -135,9 +135,9 @@ jobs:
       matrix:
         include:
           - php_minor: "8.4"
-            php_full: "8.4.21"
+            php_full: "8.4.22"
           - php_minor: "8.5"
-            php_full: "8.5.6"
+            php_full: "8.5.7"
     steps:
       - uses: actions/checkout@v4
 
@@ -254,10 +254,10 @@ jobs:
       matrix:
         include:
           - php_minor: "8.4"
-            php_full: "8.4.21"
+            php_full: "8.4.22"
             default: false
           - php_minor: "8.5"
-            php_full: "8.5.6"
+            php_full: "8.5.7"
             default: true
     steps:
       - uses: actions/checkout@v4
