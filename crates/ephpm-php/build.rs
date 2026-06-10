@@ -321,15 +321,27 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
             .clang_arg("-DZEND_DEBUG=0")
             .clang_arg("-DZTS=0");
 
-        // bindgen runs libclang directly and does NOT consume the
-        // MSVC INCLUDE env var (cl.exe does, libclang doesn't). Without
-        // this, system headers like intsafe.h and windows.h fail to
-        // resolve even though they're on disk. Read INCLUDE (set by
-        // vcvars64.bat in the workflow) and forward each path to clang
-        // as -isystem so the lookup succeeds.
+        // bindgen runs libclang directly and does NOT consume the MSVC
+        // INCLUDE env var (cl.exe does, libclang doesn't). Without this,
+        // system headers like intsafe.h and windows.h fail to resolve
+        // even though they're on disk. Read INCLUDE (set by vcvars64.bat
+        // in the workflow) and forward each path to clang as -isystem.
+        //
+        // Two normalizations matter:
+        //   1. vcvars64 emits some path segments with doubled backslashes
+        //      (`\\include\\10.0.x\\um`). clang on Windows treats `\\` in
+        //      -isystem paths inconsistently and ends up not finding the
+        //      headers. Collapse `\\` -> `\` first.
+        //   2. Convert all `\` -> `/`. clang accepts forward slashes on
+        //      Windows everywhere and they avoid any escape-sequence
+        //      ambiguity in the argv string.
         match env::var("INCLUDE") {
             Ok(include) => {
-                let paths: Vec<&str> = include.split(';').filter(|p| !p.is_empty()).collect();
+                let paths: Vec<String> = include
+                    .split(';')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| p.replace("\\\\", "\\").replace('\\', "/"))
+                    .collect();
                 println!(
                     "cargo::warning=bindgen: forwarding {} INCLUDE paths to clang",
                     paths.len()
