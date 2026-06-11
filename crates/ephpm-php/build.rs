@@ -358,6 +358,27 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
                 );
             }
         }
+
+        // clang's builtin headers (stddef.h, stdarg.h, ...) are NOT on the
+        // MSVC INCLUDE path. zend_portability.h's C11 branch does
+        // `typedef max_align_t zend_max_align_t`, and max_align_t lives only
+        // in clang's own stddef.h under its resource dir — MSVC's stddef.h
+        // doesn't define it. Without this, bindgen fails with
+        // "unknown type name 'max_align_t'".
+        //
+        // Pass `-resource-dir` (not `-isystem`): it makes libclang search its
+        // builtin headers with highest priority, so clang's stddef.h wins over
+        // the MSVC one regardless of -isystem ordering. Forward-slash the path
+        // — clang/bindgen mishandle backslashes in args, and passing this via
+        // the BINDGEN_EXTRA_CLANG_ARGS env var fails outright because bindgen
+        // shlex-parses that value and eats `\` as escape characters.
+        if let Some(clang_include) = find_clang_resource_include() {
+            if let Some(resource_dir) = clang_include.parent() {
+                let dir = resource_dir.display().to_string().replace('\\', "/");
+                println!("cargo::warning=bindgen: -resource-dir={dir}");
+                builder = builder.clang_arg(format!("-resource-dir={dir}"));
+            }
+        }
     } else {
         // ZTS builds: define ZTS for bindgen so PHP headers use thread-safe macros.
         builder = builder.clang_arg("-DZTS=1").clang_arg("-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
