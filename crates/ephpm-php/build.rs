@@ -102,41 +102,90 @@ fn link_php(lib_dir: &Path, target_os: &str) {
     // group in `-Wl,--start-group`/`--end-group`, which can't be emitted
     // from a library crate's build.rs (rustc-link-arg only applies to
     // binary/cdylib targets).
-    println!("cargo::warning=probing for static support libs in {}", lib_dir.display());
-    for static_lib in &[
-        // High-level extension support libs first; they reference the
-        // lower-level libs below.
-        "ssl", "crypto", "curl", "z", "xml2", "xslt", "exslt", "lzma", "sodium", "iconv", "charset",
-        "intl", "png16", "gd", "jpeg", "freetype", "onig", "zip", "bz2", "gmp", "sqlite3",
-        // PostgreSQL libs (pdo_pgsql). Order: libpq depends on pgcommon
-        // and pgport.
-        "pq", "pgcommon", "pgport",
-        // Readline / line-editing ecosystem (pulled in by pdo_sqlite and
-        // a few CLI-facing extensions on the embed build).
-        "edit", "ncurses", "menu", "form", "panel", "tic",
-        // ICU — needed by the intl extension. Order matters: i18n →
-        // uc → data, with io/tu as auxiliary modules that may pull
-        // from any of them.
-        "icui18n", "icuuc", "icudata", "icuio", "icutu",
-        // libstdc++ last: ICU is C++ and references std::* / __cxa_*
-        // symbols that only the C++ runtime provides.
-        "stdc++",
-    ] {
-        // Unix uses libfoo.a, Windows uses foo.lib
-        let unix_path = lib_dir.join(format!("lib{static_lib}.a"));
-        let windows_path = lib_dir.join(format!("{static_lib}.lib"));
-        let found = unix_path.exists() || windows_path.exists();
-        println!(
-            "cargo::warning=probe lib{static_lib}.a at {}: found={found}",
-            unix_path.display()
-        );
-        if found {
-            if *static_lib == "z" {
-                println!("cargo::rustc-link-lib=static:+whole-archive={static_lib}");
-            } else {
-                println!("cargo::rustc-link-lib=static={static_lib}");
+    if target_os == "windows" {
+        // The Windows SDK ships php8embed.lib's static dependency archives
+        // (libcrypto, libssl, libxml2, icu*, libsqlite3, libsodium, ...) but
+        // with MSVC-toolchain names that don't follow the Unix `lib<name>.a`
+        // convention the probe list below assumes (`libssl.lib` not
+        // `ssl.lib`, `libsqlite3_a.lib` not `sqlite3.lib`, `icuin.lib` not
+        // `icui18n.lib`, etc.). Rather than maintain a fragile name map,
+        // link every `.lib` in the SDK lib dir. MSVC link.exe pulls objects
+        // lazily and resolves circular static-lib deps across passes, so
+        // order doesn't matter the way it does for single-pass GNU ld.
+        link_windows_static_deps(lib_dir);
+    } else {
+        // Unix: static-php-cli emits `lib<name>.a`; link the known support
+        // libs in dependency order (single-pass ld needs deps last).
+        println!("cargo::warning=probing for static support libs in {}", lib_dir.display());
+        for static_lib in &[
+            // High-level extension support libs first; they reference the
+            // lower-level libs below.
+            "ssl", "crypto", "curl", "z", "xml2", "xslt", "exslt", "lzma", "sodium", "iconv",
+            "charset", "intl", "png16", "gd", "jpeg", "freetype", "onig", "zip", "bz2", "gmp",
+            "sqlite3",
+            // PostgreSQL libs (pdo_pgsql). Order: libpq depends on pgcommon
+            // and pgport.
+            "pq", "pgcommon", "pgport",
+            // Readline / line-editing ecosystem (pulled in by pdo_sqlite and
+            // a few CLI-facing extensions on the embed build).
+            "edit", "ncurses", "menu", "form", "panel", "tic",
+            // ICU — needed by the intl extension. Order matters: i18n →
+            // uc → data, with io/tu as auxiliary modules that may pull
+            // from any of them.
+            "icui18n", "icuuc", "icudata", "icuio", "icutu",
+            // libstdc++ last: ICU is C++ and references std::* / __cxa_*
+            // symbols that only the C++ runtime provides.
+            "stdc++",
+        ] {
+            let unix_path = lib_dir.join(format!("lib{static_lib}.a"));
+            let found = unix_path.exists();
+            println!(
+                "cargo::warning=probe lib{static_lib}.a at {}: found={found}",
+                unix_path.display()
+            );
+            if found {
+                if *static_lib == "z" {
+                    println!("cargo::rustc-link-lib=static:+whole-archive={static_lib}");
+                } else {
+                    println!("cargo::rustc-link-lib=static={static_lib}");
+                }
             }
         }
+    }
+}
+
+/// Link every static `.lib` in the Windows SDK lib dir except `php8embed.lib`
+/// (already emitted by [`link_php`]). The php-sdk Windows tarball ships PHP's
+/// dependency archives with MSVC-toolchain names, so we link them all and let
+/// MSVC link.exe resolve symbols lazily across passes.
+fn link_windows_static_deps(lib_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(lib_dir) else {
+        println!(
+            "cargo::warning=could not read SDK lib dir {} for Windows dep libs",
+            lib_dir.display()
+        );
+        return;
+    };
+    let mut names: Vec<String> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("lib") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // php8embed is linked first by link_php; skipping here avoids a
+        // duplicate link directive.
+        if stem.eq_ignore_ascii_case("php8embed") {
+            continue;
+        }
+        names.push(stem.to_string());
+    }
+    names.sort();
+    for name in &names {
+        println!("cargo::warning=windows dep lib: {name}");
+        println!("cargo::rustc-link-lib=static={name}");
     }
 }
 
