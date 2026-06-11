@@ -44,15 +44,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # The nightly E2E and smoke-test jobs run inside this image and talk to
 # ephemerd's host docker socket. The socket is mounted into the job
 # container, but the client binary has to live in the image: E2E needs
-# `docker` for kind cluster creation, smoke tests need `docker compose`
-# for the WordPress/Laravel/Symfony fixtures. Only the CLI and compose
-# plugin are installed — no containerd/dockerd, the daemon is ephemerd's.
+# `docker` for kind cluster creation plus `docker buildx build --output`
+# (xtask builds the dev images as tarballs for `kind load image-archive`),
+# and smoke tests need `docker compose` for the WordPress/Laravel/Symfony
+# fixtures. Only the CLI and plugins are installed — no containerd/dockerd,
+# the daemon is ephemerd's.
 RUN install -m 0755 -d /etc/apt/keyrings \
     && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
     && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable" \
         > /etc/apt/sources.list.d/docker.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
+    && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin docker-buildx-plugin \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Rust stable + nightly (for fmt only) ─────────────────────────────────────
