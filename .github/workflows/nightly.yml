@@ -260,13 +260,11 @@ jobs:
           } else {
             Write-Warning "libclang.dll not found at $libclangDir -- bindgen may panic"
           }
-          # NOTE: clang's builtin-header resource dir (needed for C11
-          # max_align_t in zend_portability.h) is handled in
-          # crates/ephpm-php/build.rs, NOT here. Passing -resource-dir via the
-          # BINDGEN_EXTRA_CLANG_ARGS env var does not work on Windows: bindgen
-          # shlex-parses that value and eats the backslashes in the path.
-          # build.rs derives the dir from `clang --print-resource-dir`,
-          # forward-slashes it, and passes it as a bindgen clang_arg.
+          # NOTE: the C11 max_align_t gap in MSVC's stddef.h (which broke
+          # bindgen at zend_portability.h) is handled in
+          # crates/ephpm-php/build.rs by defining max_align_t for the bindgen
+          # parse — NOT here, and NOT via clang's -resource-dir (which is
+          # detrimental once the MSVC headers are forwarded as -isystem).
 
       - name: Build ephpm.exe
         shell: powershell
