@@ -260,23 +260,13 @@ jobs:
           } else {
             Write-Warning "libclang.dll not found at $libclangDir -- bindgen may panic"
           }
-          # Pin clang's builtin-header resource dir for bindgen. Without it,
-          # libclang parses with only the MSVC/UCRT headers, which never
-          # define C11 max_align_t -- zend_portability.h:797 then fails with
-          # "unknown type name 'max_align_t'". Clang's own stddef.h defines
-          # max_align_t even on MSVC targets, but only when the resource dir
-          # resolves. Same class of fix as the macOS job's
-          # BINDGEN_EXTRA_CLANG_ARGS resource-dir pin.
-          $clangLibRoot = "C:\BuildTools\VC\Tools\Llvm\x64\lib\clang"
-          $resourceDir = Get-ChildItem -Directory $clangLibRoot -ErrorAction SilentlyContinue |
-            Sort-Object Name -Descending | Select-Object -First 1
-          if ($resourceDir) {
-            "BINDGEN_EXTRA_CLANG_ARGS=-resource-dir=$($resourceDir.FullName)" |
-              Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
-            Write-Host "BINDGEN_EXTRA_CLANG_ARGS resource-dir set to $($resourceDir.FullName)"
-          } else {
-            Write-Warning "clang resource dir not found under $clangLibRoot -- bindgen may miss builtin headers"
-          }
+          # NOTE: clang's builtin-header resource dir (needed for C11
+          # max_align_t in zend_portability.h) is handled in
+          # crates/ephpm-php/build.rs, NOT here. Passing -resource-dir via the
+          # BINDGEN_EXTRA_CLANG_ARGS env var does not work on Windows: bindgen
+          # shlex-parses that value and eats the backslashes in the path.
+          # build.rs derives the dir from `clang --print-resource-dir`,
+          # forward-slashes it, and passes it as a bindgen clang_arg.
 
       - name: Build ephpm.exe
         shell: powershell
