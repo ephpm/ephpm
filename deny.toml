@@ -5,13 +5,17 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = [
     # rustls-pemfile unmaintained — transitive dep, awaiting upstream migration
     "RUSTSEC-2025-0134",
-    # rustls-webpki vulns — pinned by opensrv-mysql (litewire transitive dep)
+    # rustls-webpki cert-verification vulns — after bumping our own TLS stack
+    # to rustls-webpki 0.103.13, these now match ONLY the old 0.102.8 still
+    # pulled via opensrv-mysql 0.7.0 (latest) -> tokio-rustls 0.25 ->
+    # rustls 0.22, a litewire transitive dep. opensrv-mysql uses rustls only
+    # for server-side MySQL TLS, which does not exercise the name-constraint /
+    # CRL verification paths these advisories concern. Drop once opensrv-mysql
+    # moves to rustls 0.23 (or litewire replaces it).
     "RUSTSEC-2026-0049",
     "RUSTSEC-2026-0098",
     "RUSTSEC-2026-0099",
     "RUSTSEC-2026-0104",
-    # time crate DoS via RFC 2822 parsing — transitive dep, no user input path
-    "RUSTSEC-2026-0009",
     # proc-macro-error2 unmaintained — pulled transitively by
     # mysql-common-derive -> mysql_common -> mysql_async / opensrv-mysql.
     # Compile-time-only (proc macro), no runtime exposure. Awaiting

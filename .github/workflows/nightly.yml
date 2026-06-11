@@ -496,17 +496,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: cargo deny
+        # cargo-deny's `advisories` check reads the same RustSec database
+        # cargo-audit does, but honors the single canonical ignore list in
+        # deny.toml (advisories triaged as not-reachable / compile-time-only /
+        # blocked upstream). A separate `cargo audit` step was removed because
+        # it does NOT read deny.toml, so it re-reported every ignored advisory
+        # and the two tools drifted. cargo-deny `check` covers advisories +
+        # bans + licenses + sources in one pass — the single advisory gate.
         run: |
           curl -fsSL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
             | tar xz --strip-components=1 -C /usr/local/bin "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny"
           cargo-deny --version
           cargo-deny check
-
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked || true
-
-      - name: cargo audit
-        run: cargo audit
 
       - name: cargo outdated (informational)
         continue-on-error: true
