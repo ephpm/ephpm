@@ -24,11 +24,12 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
     if target_os == "windows" {
-        // Delay-load php8embed.dll so the process can start without the
-        // DLL on disk. windows_dll::extract_php_dll() extracts the
-        // embedded bytes and registers the temp dir via SetDllDirectoryW
-        // before the first PHP call triggers the delay-load resolver.
-        println!("cargo::rustc-link-arg=/DELAYLOAD:php8embed.dll");
+        // PHP is linked statically from php8embed.lib (the php-sdk Windows
+        // tarball is a static-php-cli `--build-embed` build — no DLL). There
+        // is no delay-loaded DLL to set up, and MSVC link.exe does not
+        // support GNU ld's `--wrap`, so the zend_signal_* SIGPROF wrapping
+        // applied on Linux is a no-op here (ephpm enforces max_execution_time
+        // at the tokio layer, so PHP's SIGPROF handler should never fire).
         return;
     }
 

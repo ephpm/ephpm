@@ -389,12 +389,6 @@ fn find_free_port(host: &str, start_port: u16) -> anyhow::Result<u16> {
 
 /// Run the `ephpm php` subcommand — pass args through to the embedded PHP CLI.
 fn run_php(args: &[String]) -> anyhow::Result<ExitCode> {
-    // Windows: extract the embedded php8embed.dll before the first PHP call.
-    // Guard deletes the temp directory when this function returns.
-    #[cfg(all(php_linked, target_os = "windows"))]
-    let _dll_guard = ephpm_php::windows_dll::extract_php_dll()
-        .context("failed to extract embedded php8embed.dll")?;
-
     let exit_code = ephpm_php::PhpRuntime::cli_main(args).context("PHP CLI failed")?;
     let _ = ephpm_php::PhpRuntime::shutdown();
     Ok(exit_code_from(exit_code))
@@ -506,14 +500,6 @@ fn run_with_config(config: ephpm_config::Config, verbose: u8) -> anyhow::Result<
         document_root = %config.server.document_root.display(),
         "starting ePHPm"
     );
-
-    // Windows: extract the embedded php8embed.dll before PHP init.
-    // Declared here so it drops after `rt` (Rust drops locals in reverse
-    // declaration order — `rt` is declared later, so it drops first, which
-    // ensures the tokio runtime is fully shut down before we delete the DLL).
-    #[cfg(all(php_linked, target_os = "windows"))]
-    let _dll_guard = ephpm_php::windows_dll::extract_php_dll()
-        .context("failed to extract embedded php8embed.dll")?;
 
     // Build the effective PHP ini file. If the user specified ini_overrides
     // in the config, we have to materialize them on disk and load them via
