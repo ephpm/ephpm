@@ -199,7 +199,7 @@ fn link_windows_static_deps(lib_dir: &Path) {
         }
         // Import stubs are a few KB; real static archives are tens of KB up
         // to hundreds of MB. Drop anything implausibly small for a static lib.
-        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let size = std::fs::metadata(&path).map_or(0, |m| m.len());
         if size < 16_384 {
             println!("cargo::warning=windows dep lib: skipping import stub {stem} ({size} bytes)");
             continue;
