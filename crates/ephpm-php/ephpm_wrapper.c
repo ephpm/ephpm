@@ -25,6 +25,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+
+/* MSVC has no POSIX strtok_r; its strtok_s has the same 3-arg semantics. */
+#ifdef _MSC_VER
+static char *ephpm_strtok_r(char *str, const char *delim, char **saveptr) {
+    return strtok_s(str, delim, saveptr);
+}
+#define strtok_r ephpm_strtok_r
+#endif
 #include "sapi/embed/php_embed.h"
 #include "main/php.h"
 #include "main/SAPI.h"
