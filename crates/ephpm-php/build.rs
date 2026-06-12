@@ -154,10 +154,26 @@ fn link_php(lib_dir: &Path, target_os: &str) {
     }
 }
 
-/// Link every static `.lib` in the Windows SDK lib dir except `php8embed.lib`
-/// (already emitted by [`link_php`]). The php-sdk Windows tarball ships PHP's
-/// dependency archives with MSVC-toolchain names, so we link them all and let
-/// MSVC link.exe resolve symbols lazily across passes.
+/// Link php8embed.lib's static dependency archives from the Windows SDK lib
+/// dir. The php-sdk tarball ships PHP's deps with MSVC-toolchain names that
+/// don't follow the Unix `lib<name>.a` convention, so we enumerate the dir
+/// rather than probe known names. Two subtleties (both diagnosed by dumpbin
+/// against the real tarball):
+///
+///   - **Import stubs.** A few deps ship both a real static archive
+///     (`libiconv_a.lib`, ~3.5 MB) and a tiny DLL import stub
+///     (`libiconv.lib`, ~3 KB). Linking the stub makes link.exe resolve that
+///     lib's *functions* from the DLL thunks, which then blocks it from
+///     pulling the matching object out of the static archive — leaving that
+///     object's data symbols (e.g. `_libiconv_version`) unresolved. Skip the
+///     stubs: when both `<name>.lib` and `<name>_a.lib` exist, drop the
+///     bare one. Also skip obvious stubs by size.
+///   - **whole-archive for gettext/iconv.** libintl (gettext) and libiconv
+///     have a circular dependency and pack the needed symbols into objects
+///     link.exe won't pull under its single forward pass. Force every object
+///     from those two archives in with `+whole-archive`. (We do NOT
+///     whole-archive the giant libs like ICU/crypto — only these two small
+///     ones — to keep the binary lean.)
 fn link_windows_static_deps(lib_dir: &Path) {
     let Ok(entries) = std::fs::read_dir(lib_dir) else {
         println!(
@@ -166,7 +182,10 @@ fn link_windows_static_deps(lib_dir: &Path) {
         );
         return;
     };
-    let mut names: Vec<String> = Vec::new();
+
+    // Collect candidate static-archive stems (file name without `.lib`),
+    // skipping php8embed (already linked by link_php) and tiny import stubs.
+    let mut stems: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("lib") {
@@ -175,17 +194,37 @@ fn link_windows_static_deps(lib_dir: &Path) {
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
-        // php8embed is linked first by link_php; skipping here avoids a
-        // duplicate link directive.
         if stem.eq_ignore_ascii_case("php8embed") {
             continue;
         }
-        names.push(stem.to_string());
+        // Import stubs are a few KB; real static archives are tens of KB up
+        // to hundreds of MB. Drop anything implausibly small for a static lib.
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        if size < 16_384 {
+            println!("cargo::warning=windows dep lib: skipping import stub {stem} ({size} bytes)");
+            continue;
+        }
+        stems.push(stem.to_string());
     }
-    names.sort();
-    for name in &names {
-        println!("cargo::warning=windows dep lib: {name}");
-        println!("cargo::rustc-link-lib=static={name}");
+
+    // When both `<name>.lib` and `<name>_a.lib` are present, the bare one is
+    // the import stub and `_a` is the static archive — drop the bare name.
+    let stem_set: std::collections::HashSet<String> = stems.iter().cloned().collect();
+    stems.retain(|s| !stem_set.contains(&format!("{s}_a")));
+
+    stems.sort();
+
+    // Archives that must be whole-archived (circular gettext/iconv symbols).
+    let whole_archive: [&str; 2] = ["libintl_a", "libiconv_a"];
+
+    for stem in &stems {
+        if whole_archive.contains(&stem.as_str()) {
+            println!("cargo::warning=windows dep lib (whole-archive): {stem}");
+            println!("cargo::rustc-link-lib=static:+whole-archive={stem}");
+        } else {
+            println!("cargo::warning=windows dep lib: {stem}");
+            println!("cargo::rustc-link-lib=static={stem}");
+        }
     }
 }
 
