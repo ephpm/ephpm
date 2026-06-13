@@ -30,6 +30,16 @@ fn main() {
         // support GNU ld's `--wrap`, so the zend_signal_* SIGPROF wrapping
         // applied on Linux is a no-op here (ephpm enforces max_execution_time
         // at the tokio layer, so PHP's SIGPROF handler should never fire).
+        //
+        // /FORCE:MULTIPLE: libintl_a and libiconv_a are both whole-archived
+        // (see ephpm-php/build.rs::link_windows_static_deps) and each bundles
+        // an identical copy of libcharset's `locale_charset`, so it ends up
+        // multiply-defined. There is no per-object exclude for whole-archive;
+        // this tells link.exe to keep the first definition and continue.
+        // `locale_charset` is the only duplicate in the whole link and both
+        // copies are byte-identical, so first-wins is correct. Emits LNK4006
+        // warnings (visible in the build log) which we accept.
+        println!("cargo::rustc-link-arg=/FORCE:MULTIPLE");
         return;
     }
 
