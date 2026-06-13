@@ -214,15 +214,18 @@ fn link_windows_static_deps(lib_dir: &Path) {
 
     stems.sort();
 
-    // Only libintl_a needs whole-archive: gettext (libintl) and iconv have a
-    // circular dependency and libintl packs its symbols into objects link.exe
-    // won't pull under a single forward pass. We do NOT whole-archive
-    // libiconv_a — now that the import stub is skipped above, it resolves
-    // (including the `_libiconv_version` data symbol) via normal lazy linking,
-    // and whole-archiving BOTH forces in each lib's bundled copy of libcharset's
-    // `locale_charset`, which collides as LNK2005. Whole-archiving only libintl
-    // means `locale_charset` is defined exactly once.
-    let whole_archive: [&str; 1] = ["libintl_a"];
+    // libintl (gettext) and libiconv both pack their public symbols into
+    // objects that link.exe won't pull under a single lazy forward pass
+    // (gettext's circular libintl_* refs; libiconv's iconv functions +
+    // the `_libiconv_version` data symbol). Both therefore need
+    // whole-archive. The catch: each GNU lib bundles its OWN identical copy
+    // of libcharset's `locale_charset`, so whole-archiving both makes that
+    // one symbol multiply-defined (LNK2005). There is no per-object exclude
+    // for whole-archive, so the binary crate's build.rs passes
+    // `/FORCE:MULTIPLE` to keep the first definition — safe here because
+    // `locale_charset` is the ONLY duplicate in the entire link and both
+    // copies are byte-identical libcharset.
+    let whole_archive: [&str; 2] = ["libintl_a", "libiconv_a"];
 
     for stem in &stems {
         if whole_archive.contains(&stem.as_str()) {
