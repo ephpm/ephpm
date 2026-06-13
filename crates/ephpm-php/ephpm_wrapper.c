@@ -47,6 +47,70 @@ static char *ephpm_strtok_r(char *str, const char *delim, char **saveptr) {
 #include "main/php_version.h"
 #include "ext/session/php_session.h"
 
+#if PHP_VERSION_ID < 80400
+#include <ctype.h>
+/* PHP 8.4 added the public `sapi_read_post_data()` helper; 8.3 and earlier
+ * keep the identical logic inline inside `sapi_activate()`, with no callable
+ * entry point. Our request-reuse model needs to drive it explicitly (to set
+ * SG(request_info).post_entry for sapi_handle_post() and to read the raw body
+ * into request_body for php://input), so on pre-8.4 we replicate 8.4's
+ * sapi_read_post_data() verbatim. It uses only globals/APIs present since
+ * well before 8.3 (SG(known_post_content_types), post_entry, content_type_dup,
+ * sapi_module.default_post_reader), so it compiles and behaves identically. */
+static void ephpm_sapi_read_post_data_compat(void) {
+    sapi_post_entry *post_entry;
+    uint32_t content_type_length = (uint32_t)strlen(SG(request_info).content_type);
+    char *content_type = estrndup(SG(request_info).content_type, content_type_length);
+    char *p;
+    char oldchar = 0;
+    void (*post_reader_func)(void) = NULL;
+
+    /* Lowercase the content type and trim trailing descriptive data so only
+     * the bare "type/subtype" remains for the handler lookup. */
+    for (p = content_type; p < content_type + content_type_length; p++) {
+        switch (*p) {
+            case ';':
+            case ',':
+            case ' ':
+                content_type_length = p - content_type;
+                oldchar = *p;
+                *p = 0;
+                break;
+            default:
+                *p = tolower((unsigned char)*p);
+                break;
+        }
+    }
+
+    /* Find an appropriate POST content handler (e.g. rfc1867 for multipart). */
+    if ((post_entry = zend_hash_str_find_ptr(&SG(known_post_content_types), content_type,
+            content_type_length)) != NULL) {
+        SG(request_info).post_entry = post_entry;
+        post_reader_func = post_entry->post_reader;
+    } else {
+        SG(request_info).post_entry = NULL;
+        if (UNEXPECTED(!sapi_module.default_post_reader)) {
+            SG(request_info).content_type_dup = NULL;
+            sapi_module.sapi_error(E_WARNING, "Unsupported content type:  '%s'", content_type);
+            efree(content_type);
+            return;
+        }
+    }
+    if (oldchar) {
+        *(p - 1) = oldchar;
+    }
+
+    SG(request_info).content_type_dup = content_type;
+
+    if (post_reader_func) {
+        post_reader_func();
+    }
+    if (sapi_module.default_post_reader) {
+        sapi_module.default_post_reader();
+    }
+}
+#endif /* PHP_VERSION_ID < 80400 */
+
 /* ===== Per-thread state =====
  *
  * With ZTS, multiple threads execute PHP concurrently. All per-request
@@ -694,7 +758,11 @@ int ephpm_execute_request(const char *filename)
      * sapi_read_post_data() calls our read_post callback and creates
      * the request_body stream. Must happen before sapi_handle_post(). */
     if (req_post_data && req_post_data_len > 0) {
+#if PHP_VERSION_ID >= 80400
         sapi_read_post_data();
+#else
+        ephpm_sapi_read_post_data_compat();
+#endif
     }
 
     /* $_POST + $_FILES — use PHP's built-in POST handler.
