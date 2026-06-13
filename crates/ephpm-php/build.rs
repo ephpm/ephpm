@@ -407,7 +407,24 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
             // priority over the /imsvc search and breaks system-header
             // resolution rather than helping (it also did not resolve
             // max_align_t in practice — see nightly 27326138898).
-            .clang_arg("-Dmax_align_t=double");
+            .clang_arg("-Dmax_align_t=double")
+            // PHP 8.5+ added overflow-checked integer arithmetic in
+            // zend_operators.h. On Windows it calls the intsafe.h intrinsics
+            // LongLongAdd / LongLongSub, which MSVC's cl.exe has but bindgen's
+            // libclang does not — so bindgen fails with "call to undeclared
+            // function 'LongLongAdd'". Define the PHP_HAVE_BUILTIN_*_OVERFLOW
+            // macros so zend_operators.h takes its clang `__builtin_*_overflow`
+            // branch instead (the path PHP itself uses for clang on Windows,
+            // php-src#17472). Harmless on 8.4, which has no such code. These
+            // are inline helpers, not part of ephpm's allowlisted binding
+            // surface, so they only need to parse — the cl.exe wrapper compile
+            // is unaffected and keeps using the intsafe path.
+            .clang_arg("-DPHP_HAVE_BUILTIN_SADDL_OVERFLOW=1")
+            .clang_arg("-DPHP_HAVE_BUILTIN_SADDLL_OVERFLOW=1")
+            .clang_arg("-DPHP_HAVE_BUILTIN_SSUBL_OVERFLOW=1")
+            .clang_arg("-DPHP_HAVE_BUILTIN_SSUBLL_OVERFLOW=1")
+            .clang_arg("-DPHP_HAVE_BUILTIN_SMULL_OVERFLOW=1")
+            .clang_arg("-DPHP_HAVE_BUILTIN_SMULLL_OVERFLOW=1");
 
         // bindgen runs libclang directly and does NOT consume the MSVC
         // INCLUDE env var (cl.exe does, libclang doesn't). Without this,
