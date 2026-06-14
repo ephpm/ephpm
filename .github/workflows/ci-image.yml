@@ -12,8 +12,20 @@ env:
 
 jobs:
   build:
-    name: Build CI Image
-    runs-on: [self-hosted, linux, x64]
+    name: Build CI Image (${{ matrix.arch }})
+    # Build each arch's image natively on a runner of that arch (no buildx /
+    # cross-build, which would need --privileged). amd64 -> :latest,
+    # arm64 -> :latest-arm64. The arm64 runner is the Apple Silicon host's
+    # embedded linux VM (ephemerd dispatches `[self-hosted, linux, arm64]`).
+    runs-on: [self-hosted, linux, "${{ matrix.arch }}"]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            suffix: ""
+          - arch: arm64
+            suffix: "-arm64"
     steps:
       - uses: actions/checkout@v4
 
@@ -28,12 +40,14 @@ jobs:
       # Plain `docker build` (no buildx) — routes through the ephemerd
       # fake-daemon's /build endpoint and the embedded BuildKit solver.
       # Avoids the buildkit-in-a-container path that needs --privileged.
+      # The arch suffix keeps the two single-arch images separate (we don't
+      # publish a multi-arch manifest; consumers pick the tag for their arch).
       - name: Build and push
         env:
           DOCKER_BUILDKIT: "0"
         run: |
-          TAG_LATEST="${{ env.IMAGE_REPO }}:latest"
-          TAG_DATED="${{ env.IMAGE_REPO }}:${{ env.DATE_TAG }}"
+          TAG_LATEST="${{ env.IMAGE_REPO }}:latest${{ matrix.suffix }}"
+          TAG_DATED="${{ env.IMAGE_REPO }}:${{ env.DATE_TAG }}${{ matrix.suffix }}"
           docker build -t "$TAG_LATEST" -t "$TAG_DATED" -f docker/Dockerfile.gha .
           docker push "$TAG_LATEST"
           docker push "$TAG_DATED"
