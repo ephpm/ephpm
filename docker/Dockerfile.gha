@@ -69,16 +69,30 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 
+# Add the musl target matching the image's own architecture. This Dockerfile
+# is built once per arch (amd64 -> ephpm/ephpm-ci:latest, arm64 ->
+# :latest-arm64), each natively on its own runner, so we only need the host's
+# musl target. `uname -m` reports x86_64 / aarch64; map to the rust triple.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal \
         --component rustfmt,clippy,llvm-tools-preview \
     && rustup toolchain install nightly --component rustfmt \
-    && rustup target add x86_64-unknown-linux-musl \
+    && case "$(uname -m)" in \
+         x86_64)  rustup target add x86_64-unknown-linux-musl ;; \
+         aarch64) rustup target add aarch64-unknown-linux-musl ;; \
+         *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
+       esac \
     && cargo install cargo-nextest --locked \
     && rm -rf /usr/local/cargo/registry
 
+# musl-gcc (from musl-tools) is the native musl compiler on whichever arch this
+# image was built for. Set the CC/linker vars for BOTH musl triples so the same
+# image works regardless — only the host-arch triple is ever actually built.
 ENV CC_x86_64_unknown_linux_musl=musl-gcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_CC=musl-gcc \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+    CC_aarch64_unknown_linux_musl=musl-gcc \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_CC=musl-gcc \
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
 
 WORKDIR /src
