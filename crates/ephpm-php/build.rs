@@ -424,7 +424,20 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
             .clang_arg("-DPHP_HAVE_BUILTIN_SSUBL_OVERFLOW=1")
             .clang_arg("-DPHP_HAVE_BUILTIN_SSUBLL_OVERFLOW=1")
             .clang_arg("-DPHP_HAVE_BUILTIN_SMULL_OVERFLOW=1")
-            .clang_arg("-DPHP_HAVE_BUILTIN_SMULLL_OVERFLOW=1");
+            .clang_arg("-DPHP_HAVE_BUILTIN_SMULLL_OVERFLOW=1")
+            // Force-include <intrin.h> for the bindgen parse. PHP 8.3's
+            // zend_call_stack.h calls the MSVC intrinsic
+            // `_AddressOfReturnAddress()` without including <intrin.h>; cl.exe
+            // knows it implicitly, but bindgen's libclang needs the
+            // declaration and fails with "call to undeclared library function
+            // '_AddressOfReturnAddress'". PHP 8.4 fixed the header to include
+            // <intrin.h> itself (under `#ifdef _MSC_VER`); force-including it
+            // here makes 8.3 behave the same. Harmless and redundant on
+            // 8.4/8.5 (their header already includes it, and `<intrin.h>` is
+            // include-guarded) — and bindgen already parses intrin.h cleanly
+            // there, so this adds no new risk.
+            .clang_arg("-include")
+            .clang_arg("intrin.h");
 
         // bindgen runs libclang directly and does NOT consume the MSVC
         // INCLUDE env var (cl.exe does, libclang doesn't). Without this,
