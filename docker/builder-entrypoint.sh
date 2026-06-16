@@ -10,30 +10,18 @@ echo "    Extensions: ${EXTENSIONS}"
 echo ""
 cd /build
 
-# Remove stale musl toolchain so doctor downloads a fresh full one (with g++/libstdc++)
+# Remove any stale musl toolchain so doctor installs spc's own proper one
 rm -rf /usr/local/musl
 
-# Run doctor to install deps including a full musl toolchain
-spc doctor --auto-fix 2>&1 | tail -5
+# Run doctor to install deps including spc's musl toolchain (do NOT swallow errors)
+spc doctor --auto-fix
 
-# After doctor, point Rust linker at the spc musl toolchain
+# Point Rust linker at spc's musl toolchain
 if [ -f /usr/local/musl/bin/x86_64-linux-musl-gcc ]; then
     export CC_x86_64_unknown_linux_musl=/usr/local/musl/bin/x86_64-linux-musl-gcc
     export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_CC=/usr/local/musl/bin/x86_64-linux-musl-gcc
     export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=/usr/local/musl/bin/x86_64-linux-musl-gcc
     echo "  Using spc musl toolchain at /usr/local/musl"
-fi
-
-# If toolchain still has no libstdc++, copy system one (ABI-compatible per musl wiki)
-MUSL_LIBSTDCXX=$(find /usr/local/musl -name 'libstdc++.a' 2>/dev/null | head -1)
-if [ -z "${MUSL_LIBSTDCXX}" ]; then
-    echo "  WARNING: musl toolchain has no libstdc++.a - trying system fallback"
-    SYS_LIBSTDCXX=$(find /usr/lib/gcc -name 'libstdc++.a' 2>/dev/null | head -1)
-    MUSL_LIB_GCC_VER=$(ls /usr/local/musl/lib/gcc/x86_64-linux-musl/ 2>/dev/null | head -1)
-    if [ -n "${SYS_LIBSTDCXX}" ] && [ -n "${MUSL_LIB_GCC_VER}" ]; then
-        cp "${SYS_LIBSTDCXX}" "/usr/local/musl/lib/gcc/x86_64-linux-musl/${MUSL_LIB_GCC_VER}/libstdc++.a"
-        echo "  Copied ${SYS_LIBSTDCXX} -> musl toolchain"
-    fi
 fi
 
 # Configure GitHub token for spc if provided
