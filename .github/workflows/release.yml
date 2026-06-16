@@ -31,35 +31,46 @@ env:
 jobs:
   # -- Linux binaries ---------------------------------------------------------
   build-linux:
-    name: Build (PHP ${{ matrix.php_full }}, linux-x86_64)
-    runs-on: [self-hosted, linux, x64]
-    container: ephpm/ephpm-ci:latest
+    name: Build (PHP ${{ matrix.php.full }}, ${{ matrix.arch.sdk }})
+    # Built natively per arch: x64 on the WSL2 linux runner, arm64 on the
+    # Apple Silicon host's embedded linux VM (ephemerd dispatches
+    # `[self-hosted, linux, arm64]`). Each uses the matching CI image.
+    runs-on: [self-hosted, linux, "${{ matrix.arch.runner }}"]
+    container: "ephpm/ephpm-ci:${{ matrix.arch.image }}"
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - php_minor: "8.3"
-            php_full: "8.3.31"
-          - php_minor: "8.4"
-            php_full: "8.4.22"
-          - php_minor: "8.5"
-            php_full: "8.5.7"
+        php:
+          - { minor: "8.3", full: "8.3.31" }
+          - { minor: "8.4", full: "8.4.22" }
+          - { minor: "8.5", full: "8.5.7" }
+        arch:
+          - runner: x64
+            image: latest
+            triple: x86_64-unknown-linux-musl
+            sdk: linux-x86_64
+          - runner: arm64
+            image: latest-arm64
+            triple: aarch64-unknown-linux-musl
+            sdk: linux-aarch64
     steps:
       - uses: actions/checkout@v4
 
       - name: Build ephpm
-        run: cargo xtask release ${{ matrix.php_minor }}
+        run: cargo xtask release ${{ matrix.php.minor }}
 
       - name: Package archive
         id: pkg
         env:
           VERSION: ${{ github.ref_name }}
-          PHP_FULL: ${{ matrix.php_full }}
+          PHP_FULL: ${{ matrix.php.full }}
         run: |
           set -eu
-          name="ephpm-${VERSION}+php${PHP_FULL}-linux-x86_64"
+          name="ephpm-${VERSION}+php${PHP_FULL}-${{ matrix.arch.sdk }}"
           mkdir -p "dist/${name}"
-          cp target/release/ephpm "dist/${name}/ephpm"
+          # cargo xtask release targets musl on Linux (libphp.a is musl-linked),
+          # so the binary lives under the musl triple, not target/release/.
+          cp "target/${{ matrix.arch.triple }}/release/ephpm" "dist/${name}/ephpm"
           cp LICENSE "dist/${name}/LICENSE"
           cp .github/release-readme.txt "dist/${name}/README.txt"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
@@ -69,7 +80,7 @@ jobs:
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
-          name: ephpm-${{ github.ref_name }}-php${{ matrix.php_full }}-linux-x86_64
+          name: ephpm-${{ github.ref_name }}-php${{ matrix.php.full }}-${{ matrix.arch.sdk }}
           path: ${{ steps.pkg.outputs.archive }}
 
   # -- macOS binaries ---------------------------------------------------------
@@ -117,7 +128,8 @@ jobs:
           set -eu
           name="ephpm-${VERSION}+php${PHP_FULL}-macos-aarch64"
           mkdir -p "dist/${name}"
-          cp target/release/ephpm "dist/${name}/ephpm"
+          # xtask release targets aarch64-apple-darwin, not target/release/.
+          cp target/aarch64-apple-darwin/release/ephpm "dist/${name}/ephpm"
           cp LICENSE "dist/${name}/LICENSE"
           cp .github/release-readme.txt "dist/${name}/README.txt"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
@@ -290,12 +302,23 @@ jobs:
           set -eu
           # All tags substitute "+" -> "-" because OCI tag regex rejects "+".
           # The real SemVer string lives in the OCI label (see --label below).
+          # Pre-release tags (e.g. v0.1.0-rc.1, detected by the "-") must not
+          # move the rolling tags (:latest, :<minor>); those track stable
+          # releases only.
+          case "${VERSION}" in
+            *-*) prerelease=true ;;
+            *)   prerelease=false ;;
+          esac
           tags="ephpm/ephpm:${VERSION}-php${PHP_FULL}"
           tags="${tags},ephpm/ephpm:${VERSION}-php${PHP_MINOR}"
-          tags="${tags},ephpm/ephpm:${PHP_MINOR}"
+          if [ "${prerelease}" = "false" ]; then
+            tags="${tags},ephpm/ephpm:${PHP_MINOR}"
+          fi
           if [ "${IS_DEFAULT}" = "true" ]; then
             tags="${tags},ephpm/ephpm:${VERSION}"
-            tags="${tags},ephpm/ephpm:latest"
+            if [ "${prerelease}" = "false" ]; then
+              tags="${tags},ephpm/ephpm:latest"
+            fi
           fi
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
           echo "semver=${VERSION}+php${PHP_FULL}" >> "$GITHUB_OUTPUT"
