@@ -325,6 +325,13 @@ jobs:
 
       - name: Build and push image
         uses: docker/build-push-action@v6
+        env:
+          # Don't upload the ".dockerbuild" build-record artifact. We never
+          # consume it, and it inflates the Create Release download to 15
+          # artifacts, adding parallel connections that the self-hosted
+          # runner's egress to Azure blob storage can't all sustain.
+          DOCKER_BUILD_RECORD_UPLOAD: false
+          DOCKER_BUILD_SUMMARY: false
         with:
           context: .
           file: docker/Dockerfile
@@ -349,14 +356,18 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download all artifacts (with retry)
+      - name: Download release archives (with retry)
         env:
           GH_TOKEN: ${{ github.token }}
+        # Only the binary tarballs are needed (pattern excludes any other
+        # artifact types). gh downloads sequentially, avoiding the parallel
+        # blob-storage connections that made actions/download-artifact@v4
+        # drop downloads on this self-hosted runner. Retry 3x for safety.
         run: |
           for attempt in 1 2 3; do
             echo "Download attempt $attempt/3..."
             rm -rf artifacts
-            if gh run download ${{ github.run_id }} --dir artifacts; then
+            if gh run download ${{ github.run_id }} --pattern 'ephpm-v*' --dir artifacts; then
               echo "Download succeeded on attempt $attempt."
               break
             fi
