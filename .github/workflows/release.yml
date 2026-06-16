@@ -349,9 +349,24 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: artifacts
+      - name: Download all artifacts (with retry)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3; do
+            echo "Download attempt $attempt/3..."
+            rm -rf artifacts
+            if gh run download ${{ github.run_id }} --dir artifacts; then
+              echo "Download succeeded on attempt $attempt."
+              break
+            fi
+            if [ $attempt -eq 3 ]; then
+              echo "::error::All 3 download attempts failed."
+              exit 1
+            fi
+            echo "Attempt $attempt failed, retrying in 30s..."
+            sleep 30
+          done
 
       - name: Collect archives and write SHA256SUMS
         id: collect
