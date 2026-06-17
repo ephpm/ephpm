@@ -1,0 +1,17 @@
+[server]
+listen        = "0.0.0.0:8080"
+document_root = "/app/wordpress"
+
+# DB Proxy mode: ePHPm runs a transparent MySQL wire-protocol proxy in front
+# of the external MySQL container, with connection pooling. WordPress's
+# pdo_mysql connects to 127.0.0.1:3306 *inside the ePHPm container*, and
+# ePHPm forwards to mysql:3306. There is intentionally no [db.sqlite] here.
+[db.mysql]
+url             = "mysql://wordpress:wordpress@mysql:3306/wordpress"
+listen          = "127.0.0.1:3306"
+max_connections = 20
+
+# Note: no [kv.redis_compat] either. WordPress's Redis Object Cache talks
+# directly to the standalone `redis` container (see wp-config.php), not to
+# ePHPm's embedded KV store. Swap to the embedded KV by enabling
+# [kv.redis_compat] and pointing WP_REDIS_HOST at 127.0.0.1.

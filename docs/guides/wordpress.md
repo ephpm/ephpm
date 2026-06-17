@@ -362,7 +362,7 @@ spec:
               mountPath: /etc/ephpm
 
         - name: wordpress-install
-          image: ephpm/ephpm:v0.1.0-rc.2-php8.5.7
+          image: ephpm/ephpm:v0.1.0-php8.5.7
           command:
             - sh
             - -c
@@ -390,7 +390,7 @@ spec:
 
       containers:
         - name: ephpm
-          image: ephpm/ephpm:v0.1.0-rc.2-php8.5.7
+          image: ephpm/ephpm:v0.1.0-php8.5.7
           command: [ephpm, serve, --config, /etc/ephpm/ephpm.toml]
           ports:
             - name: http
@@ -500,6 +500,134 @@ kubectl logs deploy/wordpress | tail -6
 > **Note on persistence:** the manifests above use `emptyDir` volumes for
 > simplicity. For production, replace with PersistentVolumeClaims and store
 > auth keys in a Secret.
+
+---
+
+## Part 4 — Docker Compose with external MySQL + Redis
+
+Parts 1–3 use ePHPm's *embedded* SQLite and KV store — one binary, zero
+external services. But ePHPm is equally happy as a thin PHP runtime in front
+of *real* infrastructure. This stack shows the other end of the spectrum:
+
+- **MySQL** in its own container, reached through ePHPm's **connection-pooling
+  MySQL proxy** (`[db.mysql]`). WordPress's `pdo_mysql` connects to
+  `127.0.0.1:3306` inside the ePHPm container; ePHPm forwards to `mysql:3306`.
+- **Redis** in its own container. WordPress's Redis Object Cache talks to it
+  **directly** (`WP_REDIS_HOST=redis`), bypassing ePHPm's embedded KV.
+
+```
+WordPress (PHP in ePHPm)
+  ├── pdo_mysql ─► 127.0.0.1:3306 (ePHPm proxy) ─► mysql:3306   (external MySQL)
+  └── Predis    ─► redis:6379                                    (external Redis)
+```
+
+Same PHP runtime, same single binary — only the backing services moved out.
+This is the mode you'd use to drop ePHPm into an existing managed-database /
+managed-cache environment, or to share one MySQL/Redis across many instances.
+
+Runnable files live in [`examples/wordpress-compose/`](../../examples/wordpress-compose/):
+`compose.yaml`, `ephpm.toml`, and `wp-config.php`.
+
+### 4.1 `ephpm.toml` — proxy, no embedded DB/KV
+
+```toml
+[server]
+listen        = "0.0.0.0:8080"
+document_root = "/app/wordpress"
+
+# Transparent MySQL proxy with pooling. No [db.sqlite], no [kv.redis_compat].
+[db.mysql]
+url             = "mysql://wordpress:wordpress@mysql:3306/wordpress"
+listen          = "127.0.0.1:3306"
+max_connections = 20
+```
+
+### 4.2 `wp-config.php` — point DB at the proxy, cache at external Redis
+
+```php
+define( 'DB_NAME',     'wordpress' );
+define( 'DB_USER',     'wordpress' );
+define( 'DB_PASSWORD', 'wordpress' );
+define( 'DB_HOST',     '127.0.0.1' );   // ePHPm proxy -> mysql:3306
+
+define( 'WP_REDIS_PLUGIN_PATH', '/app/wordpress/wp-content/plugins/redis-cache' );
+define( 'WP_REDIS_HOST',  'redis' );    // external Redis container
+define( 'WP_REDIS_PORT',  6379 );
+define( 'WP_REDIS_CLIENT', 'predis' );
+define( 'WP_CACHE', true );
+```
+
+Note: in this mode WordPress uses its **native `mysqli`** against a real MySQL,
+so there is **no** SQLite integration plugin and **no** `db.php` drop-in — only
+the Redis Object Cache drop-in.
+
+### 4.3 `compose.yaml` (abridged — see the example dir for the full file)
+
+```yaml
+name: ephpm-wordpress-external
+
+services:
+  init:        # one-shot: fetch WordPress + Redis Object Cache, drop in wp-config.php
+    image: busybox
+    command: ["sh", "-c", "..."]   # full script in examples/wordpress-compose/compose.yaml
+    volumes:
+      - ./wordpress:/wp
+      - ./wp-config.php:/wp-config.php:ro
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wordpress
+      MYSQL_PASSWORD: wordpress
+    volumes: [mysql-data:/var/lib/mysql]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uwordpress", "-pwordpress"]
+      interval: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+  ephpm:
+    image: ephpm/ephpm:8.5
+    depends_on:
+      init:  { condition: service_completed_successfully }
+      mysql: { condition: service_healthy }
+      redis: { condition: service_started }
+    command: ["ephpm", "serve", "--config", "/app/ephpm.toml"]
+    ports: ["8080:8080"]
+    volumes:
+      - ./wordpress:/app/wordpress
+      - ./ephpm.toml:/app/ephpm.toml:ro
+
+volumes:
+  mysql-data:
+```
+
+### 4.4 Run
+
+```bash
+cd examples/wordpress-compose
+docker compose up -d
+# open http://localhost:8080 and finish the WordPress installer
+```
+
+The `init` service downloads WordPress and the Redis plugin on first run; MySQL
+comes up healthy before ePHPm starts; WordPress installs into the external MySQL
+through the proxy, and its object cache lands in the external Redis:
+
+```bash
+docker compose exec redis redis-cli keys 'wp:*' | head
+docker compose exec mysql mysql -uwordpress -pwordpress wordpress -e 'SHOW TABLES;'
+```
+
+> **Not run on the authoring machine.** Unlike the embedded demos (Parts 1–3,
+> which were live-tested), this external-services stack was authored from
+> ePHPm's `[db.mysql]` proxy schema and the same WordPress/Redis wiring used
+> above; validate in your own Docker environment before relying on it.
 
 ---
 

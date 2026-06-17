@@ -1,0 +1,2 @@
+# WordPress core + plugins are fetched by the `init` service at first run.
+wordpress/
