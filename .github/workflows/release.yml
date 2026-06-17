@@ -356,39 +356,37 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download release archives (with retry)
-        env:
-          GH_TOKEN: ${{ github.token }}
-        # Only the binary tarballs are needed (pattern excludes any other
-        # artifact types). gh downloads sequentially, avoiding the parallel
-        # blob-storage connections that made actions/download-artifact@v4
-        # drop downloads on this self-hosted runner. Retry 3x for safety.
-        run: |
-          for attempt in 1 2 3; do
-            echo "Download attempt $attempt/3..."
-            rm -rf artifacts
-            if gh run download ${{ github.run_id }} --pattern 'ephpm-v*' --dir artifacts; then
-              echo "Download succeeded on attempt $attempt."
-              break
-            fi
-            if [ $attempt -eq 3 ]; then
-              echo "::error::All 3 download attempts failed."
-              exit 1
-            fi
-            echo "Attempt $attempt failed, retrying in 30s..."
-            sleep 30
-          done
+      # Download in two batches of 6 (by arch suffix) rather than all at once.
+      # actions/download-artifact@v4 fetches every matched artifact in
+      # parallel; downloading all 12 together saturated the self-hosted
+      # runner's egress to Azure blob storage and silently dropped the tail
+      # (it aborts after 5 internal retries). Two 6-way batches stay well
+      # under that ceiling. merge-multiple flattens archives into ./artifacts.
+      # (gh CLI is not installed on this runner, so a gh-based loop is out.)
+      - name: Download x86_64 archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ephpm-v*-x86_64
+          path: artifacts
+          merge-multiple: true
+
+      - name: Download aarch64 archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ephpm-v*-aarch64
+          path: artifacts
+          merge-multiple: true
 
       - name: Collect archives and write SHA256SUMS
         id: collect
         run: |
           set -eu
           mkdir -p release
-          # Each upload-artifact produces a per-name directory; flatten the
-          # actual archive files into one place so the sums file lives next
-          # to the things it sums.
+          # merge-multiple put every archive flat under artifacts/; gather
+          # them so SHA256SUMS lives next to the things it sums.
           find artifacts -type f -name '*.tar.gz' -exec cp {} release/ \;
           (cd release && sha256sum *.tar.gz | sort > SHA256SUMS)
+          echo "Collected $(ls release/*.tar.gz | wc -l) archives:"
           ls -lh release/
 
       - name: Create GitHub release
