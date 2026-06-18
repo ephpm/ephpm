@@ -74,7 +74,11 @@ services:
       retries: 10
 
   ephpm:
-    image: ephpm/ephpm:8.5
+    # Pin the ePHPm release and PHP patch for reproducibility. v0.1.1+
+    # includes the fix for the MySQL 8 backend handshake; older images
+    # ("Bad handshake" against MySQL 8.x) won't work for this demo.
+    # Use ephpm/ephpm:8.5 to track the rolling latest-release / PHP 8.5.
+    image: ephpm/ephpm:v0.1.1-php8.5.7
     depends_on:
       init:
         condition: service_completed_successfully
