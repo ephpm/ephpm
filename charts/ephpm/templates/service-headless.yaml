@@ -1,0 +1,28 @@
+{{- if .Values.cluster.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ephpm.headlessServiceName" . }}
+  labels:
+    {{- include "ephpm.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  # Peers must resolve each other before they pass readiness, or the cluster
+  # can never form.
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "ephpm.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+    - name: gossip-tcp
+      port: {{ .Values.cluster.gossipPort }}
+      targetPort: gossip-tcp
+      protocol: TCP
+    - name: gossip-udp
+      port: {{ .Values.cluster.gossipPort }}
+      targetPort: gossip-udp
+      protocol: UDP
+{{- end }}

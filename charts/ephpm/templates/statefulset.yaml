@@ -1,0 +1,20 @@
+{{- if .Values.cluster.enabled }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "ephpm.fullname" . }}
+  labels:
+    {{- include "ephpm.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "ephpm.headlessServiceName" . }}
+  replicas: {{ .Values.cluster.replicas }}
+  # SWIM gossip needs no startup ordering; bring pods up in parallel.
+  podManagementPolicy: Parallel
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "ephpm.selectorLabels" . | nindent 6 }}
+  template:
+    {{- include "ephpm.podTemplateSpec" . | nindent 4 }}
+{{- end }}

@@ -1,0 +1,21 @@
+{{- if not .Values.cluster.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ephpm.fullname" . }}
+  labels:
+    {{- include "ephpm.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "ephpm.selectorLabels" . | nindent 6 }}
+  {{- with .Values.strategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  template:
+    {{- include "ephpm.podTemplateSpec" . | nindent 4 }}
+{{- end }}

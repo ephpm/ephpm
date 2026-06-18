@@ -1,0 +1,37 @@
+ePHPm has been deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Workload: {{ if .Values.cluster.enabled }}StatefulSet ({{ .Values.cluster.replicas }} gossip-clustered replicas){{ else }}Deployment ({{ .Values.replicaCount }} replica(s)){{ end }}
+Image:    {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
+
+{{- if not (eq .Values.image.repository "ephpm/ephpm") }}
+{{- else }}
+
+NOTE: image.repository is still the upstream "ephpm/ephpm", which serves only
+the built-in demo docroot. Bake your PHP app into an image FROM ephpm/ephpm
+(app at /var/www/html) and set image.repository/image.tag to it.
+{{- end }}
+
+{{- if .Values.ingress.enabled }}
+
+Reachable via Ingress:
+{{- range .Values.ingress.hosts }}
+  http{{ if or $.Values.ingress.tls $.Values.ingress.certManager.enabled }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- if .Values.ingress.certManager.enabled }}
+TLS certificate is requested from {{ .Values.ingress.certManager.issuerKind }}/{{ .Values.ingress.certManager.issuerName }} via cert-manager.
+{{- end }}
+{{- else }}
+
+No Ingress is enabled. Port-forward to reach it locally:
+
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "ephpm.fullname" . }} 8080:{{ .Values.service.port }}
+  curl http://127.0.0.1:8080/_ephpm/health
+{{- end }}
+
+Probes:   liveness GET /_ephpm/health   readiness GET /_ephpm/ready
+{{- if .Values.metrics.enabled }}
+Metrics:  GET {{ .Values.metrics.path }} on the http port (Prometheus format)
+{{- end }}
+
+Verify rollout:
+  kubectl --namespace {{ .Release.Namespace }} rollout status {{ if .Values.cluster.enabled }}statefulset{{ else }}deployment{{ end }}/{{ include "ephpm.fullname" . }}
