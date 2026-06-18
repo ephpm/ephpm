@@ -496,11 +496,17 @@ fn build_handshake_response(
         mysql_native_password(password, challenge)
     };
 
-    // Request the same capabilities as the server minus SSL.
-    let mut caps = meta.capabilities & !0x0000_0800; // remove CLIENT_SSL
-    // Always require protocol 4.1 features.
-    caps |= CLIENT_LONG_PASSWORD
+    // Build our capability flags from an explicit allowlist of what the proxy
+    // actually implements, intersected with what the server advertises. We must
+    // NOT inherit the server's full set: MySQL 8 advertises CLIENT_CONNECT_ATTRS
+    // (0x0010_0000) and CLIENT_ZSTD_COMPRESSION_ALGORITHM (0x0400_0000), each of
+    // which requires extra trailing bytes in HandshakeResponse41 (a lenenc
+    // connection-attributes block / a compression-level byte). We don't send
+    // those, so claiming the flags makes the server reject the packet with
+    // ER_HANDSHAKE_ERROR ("Bad handshake"). CLIENT_SSL is likewise excluded.
+    const CLIENT_SUPPORTED: u32 = CLIENT_LONG_PASSWORD
         | CLIENT_LONG_FLAG
+        | CLIENT_CONNECT_WITH_DB
         | CLIENT_PROTOCOL_41
         | CLIENT_TRANSACTIONS
         | CLIENT_SECURE_CONNECTION
@@ -509,8 +515,15 @@ fn build_handshake_response(
         | CLIENT_PS_MULTI_RESULTS
         | CLIENT_PLUGIN_AUTH
         | CLIENT_PLUGIN_AUTH_LENENC;
+    let mut caps = meta.capabilities & CLIENT_SUPPORTED;
+    // Force the flags the 4.1 + plugin-auth handshake always needs, even if the
+    // server's advertised set somehow omits them.
+    caps |= CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH;
+    // Only claim CONNECT_WITH_DB when we actually append a database name.
     if database.is_some_and(|d| !d.is_empty()) {
         caps |= CLIENT_CONNECT_WITH_DB;
+    } else {
+        caps &= !CLIENT_CONNECT_WITH_DB;
     }
 
     let mut buf = Vec::with_capacity(128);
@@ -1321,6 +1334,46 @@ mod tests {
         payload.extend_from_slice(&stmt_id.to_le_bytes());
 
         assert_eq!(parse_stmt_id(&payload), Some(0x0102_0304));
+    }
+
+    // ── backend handshake capability masking ─────────────────────────
+
+    #[test]
+    fn handshake_response_strips_unsupported_caps() {
+        // A MySQL 8 server advertises CONNECT_ATTRS (0x0010_0000) and ZSTD
+        // (0x0400_0000); claiming either without its trailing payload makes the
+        // server reject the response with ER_HANDSHAKE_ERROR ("Bad handshake").
+        // The proxy must clear anything outside its supported set.
+        const CONNECT_ATTRS: u32 = 0x0010_0000;
+        const ZSTD: u32 = 0x0400_0000;
+        const SSL: u32 = 0x0000_0800;
+        let meta = ServerMeta {
+            server_version: "8.0.39".into(),
+            capabilities: u32::MAX, // server claims every flag
+            charset: 255,
+            auth_plugin: "caching_sha2_password".into(),
+        };
+        let resp = build_handshake_response(&meta, "wp", "pw", &[0u8; 20], Some("wp"));
+        let caps = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+        assert_eq!(caps & CONNECT_ATTRS, 0, "CONNECT_ATTRS must be cleared");
+        assert_eq!(caps & ZSTD, 0, "ZSTD must be cleared");
+        assert_eq!(caps & SSL, 0, "SSL must be cleared");
+        assert_ne!(caps & CLIENT_PROTOCOL_41, 0, "PROTOCOL_41 required");
+        assert_ne!(caps & CLIENT_PLUGIN_AUTH, 0, "PLUGIN_AUTH required");
+        assert_ne!(caps & CLIENT_CONNECT_WITH_DB, 0, "DB given => flag set");
+    }
+
+    #[test]
+    fn handshake_response_clears_connect_with_db_when_no_db() {
+        let meta = ServerMeta {
+            server_version: "8.0.39".into(),
+            capabilities: u32::MAX,
+            charset: 255,
+            auth_plugin: "mysql_native_password".into(),
+        };
+        let resp = build_handshake_response(&meta, "wp", "pw", &[0u8; 20], None);
+        let caps = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+        assert_eq!(caps & CLIENT_CONNECT_WITH_DB, 0, "no DB => flag cleared");
     }
 
     // ── select_pool routing with stmt_pool_map ───────────────────────
