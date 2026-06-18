@@ -1,4 +1,4 @@
-{{- if and .Values.autoscaling.enabled (not .Values.cluster.enabled) }}
+{{- if and .Values.autoscaling.enabled (not (include "ephpm.isStatefulSet" .)) }}
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

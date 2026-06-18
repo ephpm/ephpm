@@ -1,0 +1,6 @@
+# Gossip-clustered StatefulSet.
+cluster:
+  enabled: true
+  replicas: 3
+ingress:
+  enabled: false

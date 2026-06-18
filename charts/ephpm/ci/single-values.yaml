@@ -1,0 +1,6 @@
+# Stateless single Deployment (default shape).
+image:
+  repository: ephpm/ephpm
+  tag: "0.1.0"
+ingress:
+  enabled: false

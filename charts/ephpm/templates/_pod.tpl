@@ -1,6 +1,6 @@
 {{/*
-Shared pod template spec (metadata + spec) for both the Deployment and the
-StatefulSet. Include with `nindent 4` directly under a `template:` key.
+Shared pod template spec (metadata + spec) for the Deployment and StatefulSet.
+Include with `nindent 4` directly under a `template:` key.
 */}}
 {{- define "ephpm.podTemplateSpec" -}}
 metadata:
@@ -26,7 +26,7 @@ spec:
   {{- end }}
   containers:
     - name: {{ .Chart.Name }}
-      image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+      image: {{ include "ephpm.image" . | quote }}
       imagePullPolicy: {{ .Values.image.pullPolicy }}
       {{- with .Values.command }}
       command:
@@ -40,6 +40,11 @@ spec:
         - name: http
           containerPort: {{ .Values.containerPort }}
           protocol: TCP
+        {{- if .Values.tls.enabled }}
+        - name: https
+          containerPort: {{ (splitList ":" .Values.tls.listen) | last | int }}
+          protocol: TCP
+        {{- end }}
         {{- if .Values.cluster.enabled }}
         - name: gossip-tcp
           containerPort: {{ .Values.cluster.gossipPort }}
@@ -47,38 +52,17 @@ spec:
         - name: gossip-udp
           containerPort: {{ .Values.cluster.gossipPort }}
           protocol: UDP
+        - name: kv-data
+          containerPort: {{ .Values.cluster.kv.dataPort }}
+          protocol: TCP
         {{- end }}
       env:
-        - name: EPHPM_SERVER__METRICS__ENABLED
-          value: {{ .Values.metrics.enabled | quote }}
-        - name: EPHPM_SERVER__METRICS__PATH
-          value: {{ .Values.metrics.path | quote }}
-        {{- if .Values.cluster.enabled }}
-        - name: EPHPM_CLUSTER__ENABLED
-          value: "true"
-        - name: EPHPM_CLUSTER__BIND
-          value: "0.0.0.0:{{ .Values.cluster.gossipPort }}"
-        - name: EPHPM_CLUSTER__CLUSTER_ID
-          value: {{ .Values.cluster.clusterId | default (include "ephpm.fullname" .) | quote }}
-        - name: EPHPM_CLUSTER__JOIN
-          value: {{ include "ephpm.gossipJoin" . | quote }}
-        {{- if .Values.cluster.secret }}
-        - name: EPHPM_CLUSTER__SECRET
-          valueFrom:
-            secretKeyRef:
-              name: {{ include "ephpm.fullname" . }}-cluster
-              key: gossip-secret
-        {{- end }}
-        {{- end }}
+        {{- include "ephpm.configEnv" . | nindent 8 }}
         {{- with .Values.extraEnv }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- if or .Values.secretEnv .Values.existingSecret .Values.extraEnvFrom }}
+      {{- if or .Values.existingSecret .Values.extraEnvFrom }}
       envFrom:
-        {{- if .Values.secretEnv }}
-        - secretRef:
-            name: {{ include "ephpm.fullname" . }}-env
-        {{- end }}
         {{- if .Values.existingSecret }}
         - secretRef:
             name: {{ .Values.existingSecret }}
@@ -113,6 +97,23 @@ spec:
           readOnly: true
         - name: tmp
           mountPath: /tmp
+        {{- if .Values.db.sqlite.enabled }}
+        - name: data
+          mountPath: /var/lib/ephpm/sqlite
+        {{- end }}
+        {{- if and .Values.persistence.enabled (not (include "ephpm.isStatefulSet" .)) }}
+        - name: www
+          mountPath: {{ .Values.persistence.mountPath }}
+        {{- end }}
+        {{- if and .Values.tls.enabled (eq .Values.tls.mode "manual") }}
+        - name: tls
+          mountPath: {{ .Values.tls.mountPath }}
+          readOnly: true
+        {{- end }}
+        {{- if and .Values.tls.enabled (eq .Values.tls.mode "acme") }}
+        - name: acme-cache
+          mountPath: {{ .Values.tls.acme.cacheDir }}
+        {{- end }}
         {{- with .Values.extraVolumeMounts }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -122,6 +123,20 @@ spec:
         name: {{ include "ephpm.fullname" . }}
     - name: tmp
       emptyDir: {}
+    {{- if and .Values.persistence.enabled (not (include "ephpm.isStatefulSet" .)) }}
+    - name: www
+      persistentVolumeClaim:
+        claimName: {{ .Values.persistence.existingClaim | default (printf "%s-www" (include "ephpm.fullname" .)) }}
+    {{- end }}
+    {{- if and .Values.tls.enabled (eq .Values.tls.mode "manual") }}
+    - name: tls
+      secret:
+        secretName: {{ .Values.tls.secretName }}
+    {{- end }}
+    {{- if and .Values.tls.enabled (eq .Values.tls.mode "acme") }}
+    - name: acme-cache
+      emptyDir: {}
+    {{- end }}
     {{- with .Values.extraVolumes }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

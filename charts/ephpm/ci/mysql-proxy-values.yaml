@@ -1,0 +1,7 @@
+# Deployment fronting a MySQL backend via the in-pod proxy.
+db:
+  mysql:
+    enabled: true
+    url: "mysql://app:secret@db-primary:3306/app"
+ingress:
+  enabled: false

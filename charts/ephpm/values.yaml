@@ -1,50 +1,28 @@
 # Default values for the ephpm chart.
-# Every key here is overridable with `--set` or a custom values file.
+# Config precedence in ePHPm: env (EPHPM_ prefix, "__" nesting separator)
+# OVERRIDES the TOML file. This chart ships a base ephpm.toml via ConfigMap
+# (server + php) and renders the operational, secret-bearing sections
+# (db, kv, cluster, tls, metrics) as env from the typed values below.
 
-# -- Number of replicas when running as a Deployment (cluster.enabled=false).
-# Ignored when autoscaling.enabled=true or cluster.enabled=true.
 replicaCount: 1
 
 image:
-  # -- Image repository. ePHPm is a *runtime*: bake your PHP app into an image
-  # `FROM ephpm/ephpm` (app at /var/www/html) and point this at that image.
-  # The default below serves only ePHPm's built-in demo docroot.
+  # ePHPm is a runtime: bake your PHP app into an image FROM ephpm/ephpm
+  # (app at /var/www/html) and point this at it.
   repository: ephpm/ephpm
-  # -- Image tag. Empty string defaults to the chart's appVersion.
   tag: ""
   pullPolicy: IfNotPresent
 
-# -- Secrets for pulling from a private registry (your baked app image).
 imagePullSecrets: []
-# - name: regcred
-
-# -- Override the generated resource name prefix.
 nameOverride: ""
 fullnameOverride: ""
 
-# -- TCP port the ePHPm HTTP listener binds inside the container.
-# Must match `server.listen` in config.contents below.
 containerPort: 8080
-
-# Container entrypoint. The image's ENTRYPOINT is `tini --`; leaving command
-# empty preserves tini as PID 1 and only overrides the CMD via args.
 command: []
-args:
-  - "ephpm"
-  - "serve"
-  - "--config"
-  - "/etc/ephpm/ephpm.toml"
+args: ["ephpm", "serve", "--config", "/etc/ephpm/ephpm.toml"]
 
-# ---------------------------------------------------------------------------
-# ePHPm configuration (rendered into a ConfigMap at /etc/ephpm/ephpm.toml).
-#
-# Note: ePHPm also reads env vars (prefix EPHPM_, `__` as the nesting
-# separator, e.g. EPHPM_SERVER__LISTEN) and ENV OVERRIDES THE FILE. This chart
-# sets operational env (metrics, clustering) from values below; everything
-# else lives in this TOML. The db-proxy and KV/Redis listeners intentionally
-# bind 127.0.0.1 (in-pod use by the co-located PHP) and are NOT exposed as
-# Services — enable them here if your app uses them.
-# ---------------------------------------------------------------------------
+# --- Base config rendered into /etc/ephpm/ephpm.toml (server + php) ----------
+# NOTE: [php] has no "mode" field (embedded vs external is compile-time).
 config:
   contents: |
     [server]
@@ -52,44 +30,136 @@ config:
     document_root = "/var/www/html"
     index_files = ["index.php", "index.html"]
 
-    # Host-header validation. Empty = allow all (fine behind an Ingress).
     # [server.request]
-    # trusted_hosts = ["example.com", "www.example.com"]
-
-    # If TLS is terminated at the Ingress (the default for this chart), leave
-    # ePHPm on plain HTTP and do NOT configure [server.tls] here.
+    # trusted_hosts = ["example.com"]
 
     [php]
-    mode = "embedded"
     max_execution_time = 30
     memory_limit = "128M"
     ini_overrides = [
         ["display_errors", "Off"],
         ["error_reporting", "E_ALL"],
     ]
-  # -- Extra TOML appended verbatim after `contents` (e.g. [db.mysql], [kv]).
   extraToml: ""
 
-# ---------------------------------------------------------------------------
-# Clustering — switches the workload from Deployment to a StatefulSet that
-# discovers peers over SWIM gossip via the headless Service DNS.
-# ---------------------------------------------------------------------------
+# --- Metrics (served on the HTTP port at metrics.path) -----------------------
+metrics:
+  enabled: false
+  path: /metrics
+  serviceMonitor:
+    enabled: false
+    namespace: ""
+    interval: 30s
+    scrapeTimeout: 10s
+    additionalLabels: {}
+
+# --- Database proxy backends -------------------------------------------------
+# Each backend's listener binds 127.0.0.1 (in-pod use by the co-located PHP),
+# so these are NOT exposed as Services. Provide the real DB via url, or a
+# Secret via existingSecret (key defaults to "url") to avoid plaintext.
+db:
+  mysql:
+    enabled: false
+    url: ""
+    existingSecret: ""
+    secretKey: url
+    listen: "127.0.0.1:3306"
+    minConnections: 2
+    maxConnections: 20
+    injectEnv: true            # auto-set DB_HOST/DATABASE_URL for PHP
+    resetStrategy: smart
+    replicas:
+      urls: []
+  postgres:
+    enabled: false
+    url: ""
+    existingSecret: ""
+    secretKey: url
+    listen: "127.0.0.1:5432"
+    minConnections: 2
+    maxConnections: 20
+    injectEnv: true
+    resetStrategy: smart
+    replicas:
+      urls: []
+  # SQLite (with optional embedded proxy + clustered sqld). Enabling sqlite
+  # forces a StatefulSet so the data file gets a stable PVC.
+  sqlite:
+    enabled: false
+    path: ephpm.db            # stored under the data PVC mount
+    proxy:
+      mysqlListen: "127.0.0.1:3306"
+    sqld:                     # clustered mode only
+      httpListen: "127.0.0.1:8081"
+      grpcListen: "0.0.0.0:5001"
+    replication:              # clustered mode only
+      role: auto
+      primaryGrpcUrl: ""
+    persistence:
+      size: 5Gi
+      storageClass: ""
+  readWriteSplit:
+    enabled: false
+    strategy: sticky-after-write
+    stickyDuration: "2s"
+    maxReplicaLag: "500ms"
+
+# --- KV store ----------------------------------------------------------------
+kv:
+  memoryLimit: "256MB"
+  evictionPolicy: allkeys-lru
+  # Multi-tenant RESP auth secret (plaintext, or use existingSecret/key).
+  secret: ""
+  existingSecret: ""
+  secretKey: kv-secret
+  redisCompat:
+    enabled: false
+    listen: "127.0.0.1:6379"
+    password: ""
+    existingSecret: ""
+    passwordKey: redis-password
+
+# --- Clustering (StatefulSet + SWIM gossip) ----------------------------------
 cluster:
   enabled: false
   replicas: 3
-  # -- Gossip listen port (TCP + UDP). memberlist uses both.
   gossipPort: 7946
-  # -- Logical cluster id. Empty defaults to the release fullname.
-  clusterId: ""
-  # -- Explicit seed list. Empty = auto-generate from headless Service DNS
-  # for `replicas` pods (ephpm-0.<headless>..., ephpm-1...).
-  join: []
-  # -- Base64-encoded 32-byte key to encrypt gossip. Stored in a Secret and
-  # injected as EPHPM_CLUSTER__SECRET. Empty = unencrypted gossip.
-  secret: ""
+  clusterId: ""               # empty -> release fullname
+  join: []                    # empty -> derived from headless Service DNS
+  secret: ""                  # base64 32-byte key; stored in a Secret
+  existingSecret: ""
+  secretKey: gossip-secret
+  kv:
+    replicationFactor: 2
+    replicationMode: async
+    dataPort: 7947            # KV data-plane TCP port
 
-# -- Kubernetes cluster DNS domain, used to build gossip seed FQDNs.
 clusterDomain: cluster.local
+
+# --- In-pod TLS (alternative to ingress termination; default off) ------------
+# Manual: provide a TLS Secret (tls.crt/tls.key) via secretName -> mounted and
+#   referenced by path. ACME: set acme.domains/email.
+tls:
+  enabled: false
+  mode: manual                # "manual" | "acme"
+  secretName: ""              # manual: existing kubernetes.io/tls Secret
+  mountPath: /etc/ephpm/tls
+  acme:
+    domains: []
+    email: ""
+    staging: false
+    cacheDir: /var/lib/ephpm/certs
+  listen: "0.0.0.0:443"
+  redirectHttp: false
+
+# --- Document-root persistence (Deployment mode) -----------------------------
+persistence:
+  enabled: false
+  existingClaim: ""
+  storageClass: ""
+  size: 10Gi
+  accessMode: ReadWriteOnce
+  mountPath: /var/www/html
 
 service:
   type: ClusterIP
@@ -105,39 +175,12 @@ ingress:
       paths:
         - path: /
           pathType: Prefix
-  # cert-manager integration. With enabled=true the issuer annotation is added
-  # automatically and a TLS secret name is derived per host (unless tls is set
-  # explicitly below).
   certManager:
     enabled: true
-    # "ClusterIssuer" or "Issuer"
     issuerKind: ClusterIssuer
     issuerName: letsencrypt-prod
-  # Explicit TLS blocks. Leave empty to let certManager derive them per host.
   tls: []
-  # - secretName: ephpm-tls
-  #   hosts:
-  #     - ephpm.example.com
 
-# ---------------------------------------------------------------------------
-# Metrics — Prometheus endpoint served on the SAME HTTP port at metrics.path.
-# ---------------------------------------------------------------------------
-metrics:
-  enabled: false
-  path: /metrics
-  serviceMonitor:
-    # Requires the Prometheus Operator CRDs.
-    enabled: false
-    interval: 30s
-    scrapeTimeout: 10s
-    labels: {}
-
-# ---------------------------------------------------------------------------
-# Probes — ePHPm's internal endpoints are served BEFORE host validation, so
-# (unlike probing /index.php) they need no Host-header workaround.
-#   /_ephpm/health -> liveness, always 200 while the process is up
-#   /_ephpm/ready  -> readiness, 200 once the PHP runtime is initialized
-# ---------------------------------------------------------------------------
 livenessProbe:
   httpGet:
     path: /_ephpm/health
@@ -154,17 +197,10 @@ readinessProbe:
   periodSeconds: 5
   timeoutSeconds: 2
   failureThreshold: 3
-# Disabled by default; useful for slow PHP warmups.
 startupProbe: {}
 
-# -- Extra plain env vars (list of {name,value} or valueFrom).
 extraEnv: []
-# -- Sensitive env vars rendered into a Secret and mounted via envFrom
-# (map of NAME: value), e.g. DB urls, KV passwords.
-secretEnv: {}
-# -- Name of a pre-existing Secret to load as envFrom.
 existingSecret: ""
-# -- Extra envFrom entries.
 extraEnvFrom: []
 
 resources:
@@ -175,8 +211,6 @@ resources:
     cpu: 100m
     memory: 128Mi
 
-# Pod- and container-level security. ePHPm's image runs as root by default;
-# these defaults drop it to a non-root UID. 8080 (>1024) binds fine as non-root.
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532
@@ -187,10 +221,7 @@ podSecurityContext:
 securityContext:
   allowPrivilegeEscalation: false
   capabilities:
-    drop:
-      - ALL
-  # PHP writes sessions to /tmp (mounted as an emptyDir below), so enabling a
-  # read-only root filesystem is feasible — flip this after testing your app.
+    drop: ["ALL"]
   readOnlyRootFilesystem: false
 
 serviceAccount:
@@ -200,20 +231,12 @@ serviceAccount:
 
 podAnnotations: {}
 podLabels: {}
-
 nodeSelector: {}
 tolerations: []
 affinity: {}
 topologySpreadConstraints: []
-
-# Deployment-only update strategy.
 strategy: {}
-#  type: RollingUpdate
-#  rollingUpdate:
-#    maxUnavailable: 0
-#    maxSurge: 1
 
-# Horizontal Pod Autoscaler (Deployment mode only; ignored when clustered).
 autoscaling:
   enabled: false
   minReplicas: 2
@@ -224,8 +247,6 @@ autoscaling:
 podDisruptionBudget:
   enabled: false
   minAvailable: 1
-  # maxUnavailable: 1
 
-# Extra volumes/mounts (e.g. to mount app code instead of baking it in).
 extraVolumes: []
 extraVolumeMounts: []
