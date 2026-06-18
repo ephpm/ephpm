@@ -1,0 +1,42 @@
+name: Helm
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "charts/ephpm/**"
+      - ".github/workflows/helm.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "charts/ephpm/**"
+      - ".github/workflows/helm.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lint-template:
+    name: Lint & Template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.21.1
+
+      - name: helm lint
+        run: helm lint charts/ephpm
+
+      - name: helm template (default + cluster)
+        run: |
+          helm template ephpm charts/ephpm >/dev/null
+          helm template ephpm charts/ephpm --set cluster.enabled=true >/dev/null
+
+      - name: helm template (ci scenarios)
+        run: |
+          for f in charts/ephpm/ci/*.yaml; do
+            echo "== $f =="
+            helm template ephpm charts/ephpm -f "$f" >/dev/null
+          done
