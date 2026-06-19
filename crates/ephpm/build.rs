@@ -146,32 +146,27 @@ fn main() {
     // (wmemcpy, frexp, sigfillset, __udivmodti4, …) from inside the group.
     // -lc/-lm/-lgcc normally come after --end-group, which single-pass ld
     // won't revisit, so pull them into the group explicitly.
-    let musl_lib = std::path::Path::new("/usr/local/musl/x86_64-linux-musl/lib");
-    let gcc_lib = std::path::Path::new("/opt/x86_64-linux-musl-cross/lib/gcc/x86_64-linux-musl/11.2.1");
-    for (dir, name) in [
-        (musl_lib, "libc.a"),
-        (musl_lib, "libm.a"),
-        (gcc_lib, "libgcc.a"),
+    //
+    // Two candidate musl lib roots: spc's own toolchain (/usr/local/musl)
+    // and the musl-cross-make tarball (/opt/x86_64-linux-musl-cross).
+    // We try both and emit whichever archives actually exist — only one
+    // toolchain will be present at build time.
+    let gcc_lib = std::path::Path::new(
+        "/opt/x86_64-linux-musl-cross/lib/gcc/x86_64-linux-musl/11.2.1"
+    );
+    for musl_lib in [
+        std::path::Path::new("/usr/local/musl/x86_64-linux-musl/lib"),
+        std::path::Path::new("/opt/x86_64-linux-musl-cross/x86_64-linux-musl/lib"),
     ] {
-        let p = dir.join(name);
-        if p.exists() {
-            println!("cargo::rustc-link-arg={}", p.display());
-        }
-    }
-    // C++-heavy extensions (abseil/grpc) reference libc/libm/libgcc symbols
-    // (wmemcpy, frexp, sigfillset, __udivmodti4, …) from inside the group.
-    // -lc/-lm/-lgcc normally come after --end-group, which single-pass ld
-    // won't revisit, so pull them into the group explicitly.
-    let musl_lib = std::path::Path::new("/opt/x86_64-linux-musl-cross/x86_64-linux-musl/lib");
-    let gcc_lib = std::path::Path::new("/opt/x86_64-linux-musl-cross/lib/gcc/x86_64-linux-musl/11.2.1");
-    for (dir, name) in [
-        (musl_lib, "libc.a"),
-        (musl_lib, "libm.a"),
-        (gcc_lib, "libgcc.a"),
-    ] {
-        let p = dir.join(name);
-        if p.exists() {
-            println!("cargo::rustc-link-arg={}", p.display());
+        for (dir, name) in [
+            (musl_lib, "libc.a"),
+            (musl_lib, "libm.a"),
+            (gcc_lib,  "libgcc.a"),
+        ] {
+            let p = dir.join(name);
+            if p.exists() {
+                println!("cargo::rustc-link-arg={}", p.display());
+            }
         }
     }
     println!("cargo::rustc-link-arg=-Wl,--end-group");
