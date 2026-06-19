@@ -10,6 +10,9 @@ document_root = "/app/wordpress"
 url             = "mysql://wordpress:wordpress@mysql:3306/wordpress"
 listen          = "127.0.0.1:3306"
 max_connections = 20
+# Set explicitly to "always" while the default "smart" reset-strategy code
+# path has a known hang when pdo_mysql is the client (issue TBD).
+reset_strategy  = "always"
 
 # Note: no [kv.redis_compat] either. WordPress's Redis Object Cache talks
 # directly to the standalone `redis` container (see wp-config.php), not to
