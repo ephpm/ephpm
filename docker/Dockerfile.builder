@@ -20,3 +20,7 @@ RUN curl -fsSL -o /usr/local/bin/spc \
 RUN curl -fsSL https://musl.cc/x86_64-linux-musl-cross.tgz | tar xz -C /opt/
 
 WORKDIR /src/ephpm
+
+COPY docker/builder-entrypoint.sh /builder-entrypoint.sh
+RUN chmod +x /builder-entrypoint.sh
+ENTRYPOINT ["/bin/bash", "/builder-entrypoint.sh"]

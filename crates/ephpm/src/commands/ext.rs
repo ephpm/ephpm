@@ -375,23 +375,75 @@ pub fn cmd_build(args: &BuildArgs) -> Result<()> {
         .to_string_lossy()
         .to_string();
 
-    // 6. Determine builder image — prefer local build, fall back to registry
+    // 6. Determine builder image:
+    //    a) local tag built from this repo's Dockerfile.builder (preferred)
+    //    b) registry image from ghcr.io
+    //    c) if neither exists, build the local image on the spot so a fresh
+    //       clone works end-to-end without a pre-published registry image.
     let version = env!("CARGO_PKG_VERSION");
     let registry_image = format!("ghcr.io/ephpm/builder:{version}");
     let local_image = "ephpm-builder:local".to_string();
-    let image = {
-        // Check if local image exists
-        let has_local = std::process::Command::new(&engine)
-            .args(["image", "inspect", &local_image])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if has_local { local_image } else { registry_image }
+
+    let has_local = std::process::Command::new(&engine)
+        .args(["image", "inspect", &local_image])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let has_registry = !has_local && std::process::Command::new(&engine)
+        .args(["image", "inspect", &registry_image])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let image = if has_local {
+        local_image.clone()
+    } else if has_registry {
+        registry_image.clone()
+    } else {
+        // Neither image is present locally — build from the Dockerfile in this repo.
+        // Locate the repo root: walk up from cwd until we find docker/Dockerfile.builder.
+        let repo_root = {
+            let mut dir = std::env::current_dir().context("failed to get cwd")?;
+            loop {
+                if dir.join("docker/Dockerfile.builder").exists() {
+                    break dir;
+                }
+                let parent = dir.parent().map(|p| p.to_path_buf());
+                match parent {
+                    Some(p) => dir = p,
+                    None => anyhow::bail!(
+                        "could not find docker/Dockerfile.builder — run from inside the ephpm repo"
+                    ),
+                }
+            }
+        };
+        println!("  ■ Builder image not found locally — building from Dockerfile.builder");
+        println!("    (this takes a few minutes on first run)");
+        let dockerfile = repo_root.join("docker/Dockerfile.builder");
+        let build_status = std::process::Command::new(&engine)
+            .args([
+                "build",
+                "--file", &dockerfile.to_string_lossy(),
+                "--tag", &local_image,
+                &repo_root.to_string_lossy().to_string(),
+            ])
+            .status()
+            .context("failed to build builder image")?;
+        if !build_status.success() {
+            anyhow::bail!("failed to build ephpm-builder image (see output above)");
+        }
+        println!("  ■ Builder image built successfully");
+        local_image.clone()
     };
+
     println!("  ■ Image:  {image}");
     println!("  ■ Output: {output}");
     println!();
-    println!("  Pulling builder image (this may take a minute on first run)...");
 
     // 7. Run the container
     // Pass GITHUB_TOKEN if set — spc needs it to avoid rate limiting
