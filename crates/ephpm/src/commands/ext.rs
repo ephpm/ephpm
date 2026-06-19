@@ -536,3 +536,42 @@ fn suite_extensions(suite: &str) -> Vec<String> {
     };
     exts.split(',').map(|s| s.to_string()).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_ext_name;
+
+    #[test]
+    fn accepts_valid_extension_names() {
+        for name in [
+            "redis", "intl", "pdo_mysql", "pdo_sqlite", "opcache",
+            "MagickWand-7", "absl_base", "utf8_range", "name-with-123",
+        ] {
+            assert!(is_valid_ext_name(name), "should accept {name:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_name() {
+        assert!(!is_valid_ext_name(""));
+    }
+
+    #[test]
+    fn rejects_shell_metacharacters_and_separators() {
+        for name in [
+            "redis; touch /tmp/pwned",
+            "redis foo",        // space -> word splitting
+            "redis$(whoami)",
+            "redis`id`",
+            "redis|cat",
+            "redis&bg",
+            "redis>out",
+            "redis\nopenssl",   // embedded newline
+            "../../etc/passwd",  // path traversal
+            "redis,openssl",    // comma is the list separator, never part of a name
+            "r\u{00e9}dis",     // non-ASCII
+        ] {
+            assert!(!is_valid_ext_name(name), "should reject {name:?}");
+        }
+    }
+}
