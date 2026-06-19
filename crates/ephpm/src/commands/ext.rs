@@ -342,12 +342,25 @@ pub fn cmd_build(args: &BuildArgs) -> Result<()> {
     // 2. Resolve base suite extensions
     let base = suite_extensions(args.suite.as_deref().unwrap_or("core"));
 
-    // 3. Parse --add list
-    let add: Vec<String> = args.add.iter()
-        .flat_map(|s| s.split(','))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    // 3. Parse --add list, validating each name.
+    //
+    // These names are passed through to the builder container as the
+    // EXTENSIONS env var, which the entrypoint forwards to spc. Reject
+    // anything outside [A-Za-z0-9_-] so a crafted --add value can't inject
+    // shell metacharacters or extra spc arguments.
+    let mut add: Vec<String> = Vec::new();
+    for raw in args.add.iter().flat_map(|s| s.split(',')) {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !is_valid_ext_name(name) {
+            anyhow::bail!(
+                "invalid extension name {name:?}: only letters, digits, '_' and '-' are allowed"
+            );
+        }
+        add.push(name.to_string());
+    }
 
     // 4. Merge, deduplicate
     let mut all: Vec<String> = base.clone();
@@ -481,6 +494,18 @@ pub fn cmd_build(args: &BuildArgs) -> Result<()> {
     println!("  ✓ Build complete");
     println!("    Verify: {output} ext list");
     Ok(())
+}
+
+/// Validate an extension name: non-empty, ASCII alphanumerics plus '_' and '-'.
+///
+/// Extension names flow into the builder container's EXTENSIONS env var and
+/// on to spc, so anything outside this set is rejected to prevent shell
+/// injection or argument smuggling.
+fn is_valid_ext_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 fn detect_container_engine() -> Result<String> {

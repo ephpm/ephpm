@@ -33,8 +33,8 @@ SDK_PATH="${SPC_BUILD_PATH:-/build/buildroot}"
 export PHP_SDK_PATH="${SDK_PATH}"
 
 spc download \
-    --with-php=${PHP_VERSION} \
-    --for-extensions=${EXTENSIONS} \
+    --with-php="${PHP_VERSION}" \
+    --for-extensions="${EXTENSIONS}" \
     --prefer-pre-built \
     --no-alt \
     php-src,micro,frankenphp
@@ -54,6 +54,6 @@ cp target/x86_64-unknown-linux-musl/release/ephpm "${OUTPUT_FILE}"
 EXT_COUNT=$(./target/x86_64-unknown-linux-musl/release/ephpm php -m 2>/dev/null | grep -v '^\[' | grep -v '^$' | wc -l | tr -d ' ')
 echo ""
 echo "  Done - ${EXT_COUNT} extensions compiled in"
-echo "    Binary: /output/$(basename ${OUTPUT_FILE})"
+echo "    Binary: /output/$(basename "${OUTPUT_FILE}")"
 echo "  Build complete"
-echo "    Verify: ./$(basename ${OUTPUT_FILE}) ext list"
+echo "    Verify: ./$(basename "${OUTPUT_FILE}") ext list"
