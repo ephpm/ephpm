@@ -298,12 +298,24 @@ impl PgProxy {
 /// Connect to the `PostgreSQL` backend and complete the startup/auth handshake.
 ///
 /// Returns the authenticated stream and server metadata.
+///
+/// # Note on handshake construction
+///
+/// The PG wire protocol has no capability bitfield, so the analogous MySQL
+/// "inherit-then-strip" bug fixed in PR #91 cannot occur here — the
+/// `StartupMessage` is built additively from an explicit set of parameters
+/// (`user`, `database`) plus the fixed `3.0` protocol version, none of which
+/// are derived from anything the server advertised. However, the *auth*
+/// flow has its own framing pitfall (consuming the right number of `R`
+/// messages on the right code path — see `handle_backend_auth`).
+/// Integration coverage in `tests/pg_proxy_integration.rs` pins this
+/// against real PG 13 (`md5`) and PG 17 (`scram-sha-256`).
 async fn pg_connect_and_handshake(url: &DbUrl) -> Result<(TcpStream, PgServerMeta), DbError> {
     let mut stream = TcpStream::connect(url.addr()).await?;
 
     // Send StartupMessage: length (4) + protocol version (4) + key=value pairs + \0.
     let mut startup = Vec::with_capacity(128);
-    // Protocol version 3.0.
+    // Protocol version 3.0 — the stable PG protocol version since 7.4.
     startup.extend_from_slice(&0x0003_0000_i32.to_be_bytes());
     // user parameter.
     startup.extend_from_slice(b"user\0");
@@ -399,12 +411,18 @@ async fn handle_backend_auth(
                 send_password_message(stream, &response).await?;
             }
             AUTH_SASL => {
-                // SCRAM-SHA-256 negotiation.
+                // SCRAM-SHA-256 negotiation. `scram_sha256_exchange` consumes
+                // the full SASLContinue → SASLFinal → AuthenticationOk
+                // sequence itself, so we must return immediately on success
+                // rather than looping back to read another auth message —
+                // the next byte on the wire will be the post-auth
+                // `ParameterStatus` (`'S'`), not another `'R'`.
                 let mechanisms = parse_sasl_mechanisms(&payload[4..]);
                 if !mechanisms.iter().any(|m| m == "SCRAM-SHA-256") {
                     return Err(DbError::Auth("server requires unsupported SASL mechanism".into()));
                 }
                 scram_sha256_exchange(stream, username, password).await?;
+                return Ok(());
             }
             AUTH_SASL_CONTINUE | AUTH_SASL_FINAL => {
                 // These are handled within scram_sha256_exchange.
@@ -1193,6 +1211,87 @@ mod tests {
 
         let target = pg_select_pool(&primary, &replicas, &rr, &state, PgQueryKind::Read, &rw_split);
         assert!(std::ptr::eq(target, &raw const primary));
+    }
+
+    // ── handle_backend_auth SCRAM framing ────────────────────────────
+
+    /// Regression test for the SCRAM-SHA-256 "extra read after success" bug.
+    ///
+    /// After `scram_sha256_exchange` consumes the `AuthenticationOk`
+    /// (auth_type=0) itself, `handle_backend_auth` must return immediately —
+    /// not loop back and read another message. Otherwise it eats the
+    /// post-auth `ParameterStatus` (tag `'S'`) and dies with
+    /// "expected auth request, got 'S'".
+    ///
+    /// This test wires `handle_backend_auth` against a fake server that
+    /// drives the full SCRAM flow + a trailing `ParameterStatus`. A
+    /// successful return means the `ParameterStatus` was NOT consumed by
+    /// the auth handler — we can read it on the wire ourselves after.
+    #[tokio::test]
+    async fn handle_backend_auth_scram_stops_after_auth_ok() {
+        let (mut client_side, mut server_side) = make_tcp_pair().await;
+
+        // Fake server task: drive the SCRAM dance, then send a final
+        // ParameterStatus and remain open.
+        let server = tokio::spawn(async move {
+            // 1. AuthenticationSASL: i32 type=10 + "SCRAM-SHA-256\0\0"
+            let mut p = Vec::new();
+            p.extend_from_slice(&AUTH_SASL.to_be_bytes());
+            p.extend_from_slice(b"SCRAM-SHA-256\0\0");
+            write_pg_message(&mut server_side, MSG_AUTH, &p).await.unwrap();
+
+            // 2. Read client SASLInitialResponse: mechanism\0 + msg_len + msg
+            let (_tag, init) = read_pg_message(&mut server_side).await.unwrap();
+            // Find msg after "SCRAM-SHA-256\0" and 4-byte length.
+            let after_mech = &init[b"SCRAM-SHA-256\0".len() + 4..];
+            let client_first = std::str::from_utf8(after_mech).unwrap();
+            // Extract the client nonce: "n,,n=,r=<nonce>"
+            let client_nonce = client_first.split("r=").nth(1).unwrap();
+
+            // 3. AuthenticationSASLContinue: server-first-message.
+            // r=<client_nonce+server_extra>, s=<salt b64>, i=4096
+            let server_nonce = format!("{client_nonce}SERVEREXTRA");
+            let server_first = format!("r={server_nonce},s=c2FsdA==,i=4096");
+            let mut p = Vec::new();
+            p.extend_from_slice(&AUTH_SASL_CONTINUE.to_be_bytes());
+            p.extend_from_slice(server_first.as_bytes());
+            write_pg_message(&mut server_side, MSG_AUTH, &p).await.unwrap();
+
+            // 4. Read client SASLResponse (final). Discard contents — we don't
+            // verify the proof in this test; we just confirm framing.
+            let (_tag, _client_final) = read_pg_message(&mut server_side).await.unwrap();
+
+            // 5. AuthenticationSASLFinal: any v=<sig>.
+            let server_final = "v=AAAA";
+            let mut p = Vec::new();
+            p.extend_from_slice(&AUTH_SASL_FINAL.to_be_bytes());
+            p.extend_from_slice(server_final.as_bytes());
+            write_pg_message(&mut server_side, MSG_AUTH, &p).await.unwrap();
+
+            // 6. AuthenticationOk.
+            write_pg_message(&mut server_side, MSG_AUTH, &AUTH_OK.to_be_bytes()).await.unwrap();
+
+            // 7. Trailing ParameterStatus that must NOT be consumed by auth.
+            send_parameter_status(&mut server_side, "client_encoding", "UTF8").await.unwrap();
+
+            // Keep the socket open until the client closes it.
+            let mut buf = [0u8; 1];
+            let _ = server_side.read(&mut buf).await;
+        });
+
+        // Drive auth on the client side.
+        handle_backend_auth(&mut client_side, "u", "p").await.expect("SCRAM auth must succeed");
+
+        // The next byte on the wire must be 'S' (ParameterStatus). If
+        // handle_backend_auth incorrectly looped, it would have eaten this.
+        let (tag, payload) = read_pg_message(&mut client_side).await.unwrap();
+        assert_eq!(tag, MSG_PARAMETER_STATUS, "ParameterStatus must survive past auth");
+        let (k, v) = parse_parameter_status(&payload).unwrap();
+        assert_eq!(k, "client_encoding");
+        assert_eq!(v, "UTF8");
+
+        drop(client_side);
+        let _ = server.await;
     }
 
     // ── PG wire protocol helpers ────────────────────────────────────

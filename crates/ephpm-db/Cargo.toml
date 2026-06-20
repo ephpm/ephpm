@@ -25,6 +25,7 @@ base64ct = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 
 [lints]
 workspace = true
