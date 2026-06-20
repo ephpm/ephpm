@@ -15,7 +15,7 @@ mod service;
 
 /// ePHPm — All-in-one PHP application server
 #[derive(Parser, Debug)]
-#[command(name = "ephpm", version, about)]
+#[command(name = "ephpm", version = env!("EPHPM_VERSION"), about)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -309,7 +309,7 @@ fn run_dev(
 /// so it's stable across log-format changes and visible regardless of
 /// `RUST_LOG`.
 fn print_dev_banner(config: &ephpm_config::Config) {
-    let version = env!("CARGO_PKG_VERSION");
+    let version = env!("EPHPM_VERSION");
     let url = format!("http://{}", config.server.listen);
     let php = ephpm_php::PhpRuntime::php_version();
 

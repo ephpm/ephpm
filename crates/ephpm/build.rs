@@ -8,6 +8,22 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(php_linked)");
     println!("cargo::rerun-if-env-changed=PHP_SDK_PATH");
 
+    // Forward the release tag (set by .github/workflows/release.yml before
+    // `cargo xtask release`) into the binary so `ephpm --version` reports
+    // the actual published tag instead of the frozen workspace
+    // `version = "..."` in Cargo.toml. Falls back to CARGO_PKG_VERSION for
+    // dev builds where the env var is unset, so `cargo build` still works.
+    //
+    // The workflow strips the leading "v" from the git ref name so this
+    // value is the SemVer string ("0.1.1"), matching clap's default
+    // `<bin> <version>` formatting.
+    println!("cargo::rerun-if-env-changed=EPHPM_RELEASE_VERSION");
+    let version = std::env::var("EPHPM_RELEASE_VERSION")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| env::var("CARGO_PKG_VERSION").unwrap_or_default());
+    println!("cargo::rustc-env=EPHPM_VERSION={version}");
+
     // When PHP is linked (release builds), override PHP's zend_signal_*
     // functions with our no-op wrappers in ephpm_wrapper.c.
     //

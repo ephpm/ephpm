@@ -91,6 +91,13 @@ FROM base AS builder
 
 ARG PHP_SDK_VERSION
 
+# Release-time override forwarded by .github/workflows/release.yml so the
+# in-container `cargo xtask release` bakes the actual tag into the binary
+# (`ephpm --version`). Empty for local `docker build` and `cargo xtask e2e`,
+# in which case crates/ephpm/build.rs falls back to CARGO_PKG_VERSION.
+ARG EPHPM_RELEASE_VERSION=""
+ENV EPHPM_RELEASE_VERSION=${EPHPM_RELEASE_VERSION}
+
 WORKDIR /src
 
 # Pull the SDK in from the cached php-sdk stage. xtask::release_native
