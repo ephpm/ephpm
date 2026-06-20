@@ -1,0 +1,97 @@
+# WordPress on ePHPm with EXTERNAL MySQL and Redis.
+#
+# This is the "flexibility" counterpart to the all-embedded demo
+# (docs/guides/wordpress.md, Parts 1-3). Instead of ePHPm's embedded
+# SQLite + KV store, this stack wires WordPress to a real MySQL container
+# (through ePHPm's connection-pooling MySQL proxy) and a standalone Redis
+# container. The single ePHPm binary still provides the PHP runtime and
+# the transparent pdo_mysql proxy.
+#
+#   docker compose up -d
+#   # then open http://localhost:8080 and finish the WordPress installer
+#
+# Architecture:
+#   WordPress (PHP in ePHPm)
+#     ├── pdo_mysql -> 127.0.0.1:3306 (ePHPm proxy) -> mysql:3306  (external MySQL)
+#     └── Predis    -> redis:6379                                   (external Redis)
+
+name: ephpm-wordpress-external
+
+services:
+  # One-shot: fetch WordPress core + the Redis Object Cache plugin into the
+  # bind-mounted ./wordpress dir and drop in wp-config.php. No SQLite plugin
+  # here — this stack talks to a real MySQL.
+  init:
+    image: busybox
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        cd /wp
+        if [ ! -f index.php ]; then
+          echo "Downloading WordPress..."
+          wget -qO /tmp/wp.tar.gz https://wordpress.org/latest.tar.gz
+          tar -xzf /tmp/wp.tar.gz --strip-components=1
+          rm /tmp/wp.tar.gz
+        fi
+        if [ ! -f wp-content/plugins/redis-cache/redis-cache.php ]; then
+          echo "Installing Redis Object Cache plugin..."
+          wget -qO /tmp/r.zip https://downloads.wordpress.org/plugin/redis-cache.zip
+          unzip -qo /tmp/r.zip -d wp-content/plugins/
+          cp wp-content/plugins/redis-cache/includes/object-cache.php wp-content/object-cache.php
+          rm /tmp/r.zip
+        fi
+        cp /wp-config.php wp-config.php
+        echo "init complete"
+    volumes:
+      - ./wordpress:/wp
+      - ./wp-config.php:/wp-config.php:ro
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wordpress
+      MYSQL_PASSWORD: wordpress
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uwordpress", "-pwordpress"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  ephpm:
+    # Pin the ePHPm release and PHP patch for reproducibility. v0.1.1+
+    # includes the fix for the MySQL 8 backend handshake; older images
+    # ("Bad handshake" against MySQL 8.x) won't work for this demo.
+    # Use ephpm/ephpm:8.5 to track the rolling latest-release / PHP 8.5.
+    image: ephpm/ephpm:v0.1.1-php8.5.7
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    command: ["ephpm", "serve", "--config", "/app/ephpm.toml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./wordpress:/app/wordpress
+      - ./ephpm.toml:/app/ephpm.toml:ro
+
+volumes:
+  mysql-data:
