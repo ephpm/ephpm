@@ -132,6 +132,11 @@ pub struct EphpmKvOps {
     /// -2 for missing key.
     pub pttl:
         Option<unsafe extern "C" fn(key: *const std::os::raw::c_char) -> std::os::raw::c_longlong>,
+
+    /// Remove all keys from the effective store (per-site if set, else
+    /// global). Backs Redis-style `FLUSHDB` / `FLUSHALL` from PHP userland.
+    /// Returns 1 on success, 0 if no store is registered.
+    pub flush_all: Option<unsafe extern "C" fn() -> std::os::raw::c_int>,
 }
 
 // ── Callback implementations ────────────────────────────────────────────
@@ -328,6 +333,15 @@ unsafe extern "C" fn kv_pttl(key: *const std::os::raw::c_char) -> std::os::raw::
     }
 }
 
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_flush_all() -> std::os::raw::c_int {
+    let Some(store) = effective_store() else {
+        return 0;
+    };
+    store.flush();
+    1
+}
+
 // ── Static ops table ────────────────────────────────────────────────────
 
 /// The C-compatible function pointer table, ready to pass to
@@ -343,6 +357,7 @@ pub static KV_OPS: EphpmKvOps = EphpmKvOps {
     incr_by: Some(kv_incr_by),
     expire: Some(kv_expire),
     pttl: Some(kv_pttl),
+    flush_all: Some(kv_flush_all),
 };
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -663,6 +678,55 @@ mod tests {
         // Safety: key is a valid C string.
         let ms = unsafe { kv_pttl(key.as_ptr()) };
         assert!(ms > 0 && ms <= 60_000, "expected PTTL in (0, 60000], got {ms}");
+    }
+
+    // ── kv_flush_all ────────────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn flush_all_removes_all_keys_from_global_store() {
+        let store = init_store();
+        store.set("bridge_flush_a".into(), b"v1".to_vec(), None);
+        store.set("bridge_flush_b".into(), b"v2".to_vec(), Some(Duration::from_secs(60)));
+        store.hset("bridge_flush_h", "f", b"v".to_vec());
+
+        // Safety: no arguments; effective_store() falls back to global.
+        let ok = unsafe { kv_flush_all() };
+        assert_eq!(ok, 1);
+
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.mem_used(), 0);
+        assert!(!store.exists("bridge_flush_a"));
+        assert!(!store.exists("bridge_flush_b"));
+        assert!(!store.exists("bridge_flush_h"));
+    }
+
+    #[test]
+    #[serial]
+    fn flush_all_only_affects_site_store_when_set() {
+        // Make sure the global store has data, then point this thread at a
+        // separate site store and flush; the global store must be untouched.
+        let global = init_store();
+        global.set("bridge_flush_global".into(), b"keep_me".to_vec(), None);
+
+        let site = Store::new(StoreConfig::default());
+        site.set("bridge_flush_site".into(), b"goodbye".to_vec(), None);
+        set_site_store(Some(Arc::clone(&site)));
+
+        // Safety: no arguments.
+        let ok = unsafe { kv_flush_all() };
+        assert_eq!(ok, 1);
+
+        assert_eq!(site.len(), 0, "site store should be empty");
+        assert_eq!(site.mem_used(), 0, "site mem counter should be reset");
+        assert_eq!(
+            global.get("bridge_flush_global"),
+            Some(b"keep_me".to_vec()),
+            "global store must be untouched when a site store is active"
+        );
+
+        // Reset thread-local state so it doesn't leak into other serial tests.
+        set_site_store(None);
     }
 
     // ── Thread safety of the get buffer ─────────────────────────────────

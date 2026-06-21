@@ -952,6 +952,7 @@ typedef struct {
     int  (*incr_by)(const char *key, long long delta, long long *result);
     int  (*expire)(const char *key, long long ttl_ms);
     long long (*pttl)(const char *key);
+    int  (*flush_all)(void);
 } EphpmKvOps;
 
 static EphpmKvOps g_kv_ops = {0};
@@ -1117,6 +1118,19 @@ PHP_FUNCTION(ephpm_kv_pttl)
     RETURN_LONG((zend_long)g_kv_ops.pttl(key));
 }
 
+/* Redis-style FLUSHDB / FLUSHALL: removes every key from the effective
+ * store (per-site store if one was bound for this request, otherwise the
+ * global store). The Predis shim that backs the `redis-cache` WordPress
+ * plugin calls this from its flushdb()/flushall() handlers. Returns true
+ * on success, false if no KV store is registered. */
+PHP_FUNCTION(ephpm_kv_flush_all)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    if (!g_kv_ops.flush_all) { RETURN_FALSE; }
+    RETURN_BOOL(g_kv_ops.flush_all());
+}
+
 /* ── Argument info for reflection (arginfo) ──────────────────── */
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_get, 0, 0, 1)
@@ -1169,20 +1183,24 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_pttl, 0, 0, 1)
     ZEND_ARG_INFO(0, key)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_flush_all, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
 /* ── Function entry table (null-terminated) ──────────────────── */
 
 static const zend_function_entry ephpm_kv_functions[] = {
-    PHP_FE(ephpm_kv_get,      arginfo_ephpm_kv_get)
-    PHP_FE(ephpm_kv_set,      arginfo_ephpm_kv_set)
-    PHP_FE(ephpm_kv_setnx,    arginfo_ephpm_kv_setnx)
-    PHP_FE(ephpm_kv_del,      arginfo_ephpm_kv_del)
-    PHP_FE(ephpm_kv_exists,   arginfo_ephpm_kv_exists)
-    PHP_FE(ephpm_kv_incr,     arginfo_ephpm_kv_incr)
-    PHP_FE(ephpm_kv_decr,     arginfo_ephpm_kv_decr)
-    PHP_FE(ephpm_kv_incr_by,  arginfo_ephpm_kv_incr_by)
-    PHP_FE(ephpm_kv_expire,   arginfo_ephpm_kv_expire)
-    PHP_FE(ephpm_kv_ttl,      arginfo_ephpm_kv_ttl)
-    PHP_FE(ephpm_kv_pttl,     arginfo_ephpm_kv_pttl)
+    PHP_FE(ephpm_kv_get,       arginfo_ephpm_kv_get)
+    PHP_FE(ephpm_kv_set,       arginfo_ephpm_kv_set)
+    PHP_FE(ephpm_kv_setnx,     arginfo_ephpm_kv_setnx)
+    PHP_FE(ephpm_kv_del,       arginfo_ephpm_kv_del)
+    PHP_FE(ephpm_kv_exists,    arginfo_ephpm_kv_exists)
+    PHP_FE(ephpm_kv_incr,      arginfo_ephpm_kv_incr)
+    PHP_FE(ephpm_kv_decr,      arginfo_ephpm_kv_decr)
+    PHP_FE(ephpm_kv_incr_by,   arginfo_ephpm_kv_incr_by)
+    PHP_FE(ephpm_kv_expire,    arginfo_ephpm_kv_expire)
+    PHP_FE(ephpm_kv_ttl,       arginfo_ephpm_kv_ttl)
+    PHP_FE(ephpm_kv_pttl,      arginfo_ephpm_kv_pttl)
+    PHP_FE(ephpm_kv_flush_all, arginfo_ephpm_kv_flush_all)
     PHP_FE_END
 };
 

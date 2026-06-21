@@ -1680,4 +1680,37 @@ mod tests {
         assert_eq!(s.hlen("h"), 0);
         assert!(!s.exists("h"));
     }
+
+    #[test]
+    fn flush_clears_mixed_ttl_keys_and_resets_memory() {
+        // FLUSHDB/FLUSHALL backing: confirm a single flush nukes both
+        // persistent and TTL'd string keys plus hash keys, and zeros the
+        // memory accountant so subsequent writes start from a clean slate.
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        s.set("persistent".into(), b"v1".to_vec(), None);
+        s.set("ttl".into(), b"v2".to_vec(), Some(Duration::from_secs(60)));
+        s.set("ttl_short".into(), b"v3".to_vec(), Some(Duration::from_millis(1)));
+        s.hset("h", "f1", b"hv1".to_vec());
+        s.hset("h", "f2", b"hv2".to_vec());
+        assert!(s.mem_used() > 0);
+        assert_eq!(s.len(), 4); // 3 strings + 1 hash
+
+        s.flush();
+
+        assert_eq!(s.len(), 0);
+        assert_eq!(s.mem_used(), 0);
+        assert!(!s.exists("persistent"));
+        assert!(!s.exists("ttl"));
+        assert!(!s.exists("ttl_short"));
+        assert!(!s.exists("h"));
+        assert_eq!(s.pttl("ttl"), None);
+
+        // Confirm the store is still usable after flush.
+        assert!(s.set("after_flush".into(), b"ok".to_vec(), None));
+        assert_eq!(s.get("after_flush"), Some(b"ok".to_vec()));
+    }
 }
