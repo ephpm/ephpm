@@ -1,0 +1,90 @@
+# WordPress on ePHPm with an EMBEDDED object cache.
+#
+# WordPress's object cache is the ephpm/cache-wordpress drop-in, which calls
+# ePHPm's in-process KV store directly via the ephpm_kv_* SAPI functions.
+# There is no Redis container, no RESP listener, no Predis — and
+# wp_cache_flush() is a real flush (backed by ephpm_kv_flush_all()).
+#
+# The only external service is MySQL, reached through ePHPm's connection-
+# pooling proxy. (Swap [db.mysql] for [db.sqlite] in ephpm.toml to drop that
+# too and go fully embedded.)
+#
+#   docker compose up -d
+#   # open http://localhost:8080 and finish the WordPress installer
+#
+# Architecture:
+#   WordPress (PHP in ePHPm)
+#     ├── pdo_mysql ─► 127.0.0.1:3306 (ePHPm proxy) ─► mysql:3306
+#     └── object cache ─► ephpm/cache-wordpress drop-in ─► ephpm_kv_* (in-process)
+#
+# REQUIREMENT: an ePHPm image whose embedded PHP exposes ephpm_kv_flush_all()
+# (ePHPm v0.1.2+). On older images the cache still works but wp_cache_flush()
+# is a no-op.
+
+name: ephpm-wordpress-embedded-cache
+
+services:
+  init:
+    image: composer:2
+    restart: "no"
+    working_dir: /wp
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        cd /wp
+        if [ ! -f index.php ]; then
+          echo "Downloading WordPress..."
+          wget -qO /tmp/wp.tar.gz https://wordpress.org/latest.tar.gz
+          tar -xzf /tmp/wp.tar.gz --strip-components=1
+          rm /tmp/wp.tar.gz
+        fi
+        # Install the ephpm/cache-wordpress package and wire its drop-in.
+        if [ ! -d wp-content/cache-wordpress ]; then
+          echo "Installing ephpm/cache-wordpress..."
+          git clone --depth 1 https://github.com/ephpm/cache-wordpress.git \
+            wp-content/cache-wordpress
+        fi
+        # The drop-in WordPress loads; it requires the package's real drop-in,
+        # whose relative src/ fallback resolves the classes (no Composer needed).
+        printf "%s\n" "<?php" \
+          "require __DIR__ . '/cache-wordpress/dropin/object-cache.php';" \
+          > wp-content/object-cache.php
+        cp /wp-config.php wp-config.php
+        echo "init complete"
+    volumes:
+      - ./wordpress:/wp
+      - ./wp-config.php:/wp-config.php:ro
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpw
+      MYSQL_DATABASE: wordpress
+      MYSQL_USER: wordpress
+      MYSQL_PASSWORD: wordpress
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uwordpress", "-pwordpress"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  ephpm:
+    image: ephpm/ephpm:8.5
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      mysql:
+        condition: service_healthy
+    command: ["ephpm", "serve", "--config", "/app/ephpm.toml"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./wordpress:/app/wordpress
+      - ./ephpm.toml:/app/ephpm.toml:ro
+
+volumes:
+  mysql-data:
