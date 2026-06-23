@@ -269,13 +269,20 @@ impl MySqlProxy {
         // Step 3: send OK to PHP.
         send_ok(&mut client).await?;
 
-        // Determine if we need query-level routing or just simple proxying.
-        let needs_routing = matches!(self.reset_strategy, ResetStrategy::Smart)
-            || (self.rw_split.enabled && !self.replica_pools.is_empty());
+        // Decide which proxy path to use.
+        //
+        // The per-command `proxy_routing_loop` re-acquires a backend from the
+        // pool for *every* command, which destroys session continuity
+        // (`SET @v`, transactions, prepared statements). It is only safe to
+        // use when read/write splitting is actually enabled with replicas;
+        // outside of that the proxy must hold a single backend for the entire
+        // client session via `proxy_bidirectional`. Previously `Smart` always
+        // took the routing path, which caused WordPress to hang on the first
+        // multi-column SELECT and also lost user variables / transactions.
+        let use_routing_loop = self.rw_split.enabled && !self.replica_pools.is_empty();
 
-        if needs_routing {
-            // Step 4a: per-query routing with dirty tracking.
-            proxy_routing_loop(
+        if use_routing_loop {
+            return proxy_routing_loop(
                 client,
                 &self.pool,
                 &self.replica_pools,
@@ -283,36 +290,38 @@ impl MySqlProxy {
                 &self.rw_split,
                 self.reset_strategy,
             )
-            .await
-        } else {
-            // Fast path: simple bidirectional copy.
-            let mut checkout = self.pool.acquire().await?;
-            let backend = checkout.take_stream();
+            .await;
+        }
 
-            let result = proxy_bidirectional(client, backend).await;
+        // Single-backend bidirectional path. Use a dirty-sniffing copier for
+        // the client→backend direction so `Smart` can skip the reset for
+        // read-only sessions; raw byte copy in the other direction.
+        let mut checkout = self.pool.acquire().await?;
+        let backend = checkout.take_stream();
 
-            match result {
-                Ok(backend) => {
-                    match self.reset_strategy {
-                        ResetStrategy::Never => {
-                            checkout.return_to_pool(backend);
-                        }
-                        ResetStrategy::Always => {
-                            checkout.return_with_reset(backend).await;
-                        }
-                        ResetStrategy::Smart => {
-                            // Smart path handled by routing loop above.
-                            unreachable!()
-                        }
+        let result = match self.reset_strategy {
+            ResetStrategy::Smart => proxy_bidirectional_sniff(client, backend).await,
+            _ => proxy_bidirectional(client, backend).await.map(|b| (b, true)),
+        };
+
+        match result {
+            Ok((backend, dirty)) => match self.reset_strategy {
+                ResetStrategy::Never => checkout.return_to_pool(backend),
+                ResetStrategy::Always => checkout.return_with_reset(backend).await,
+                ResetStrategy::Smart => {
+                    if dirty {
+                        checkout.return_with_reset(backend).await;
+                    } else {
+                        checkout.return_to_pool(backend);
                     }
                 }
-                Err(e) => {
-                    debug!("proxy session error, discarding backend connection: {e}");
-                    checkout.retire();
-                }
+            },
+            Err(e) => {
+                debug!("proxy session error, discarding backend connection: {e}");
+                checkout.retire();
             }
-            Ok(())
         }
+        Ok(())
     }
 }
 
@@ -817,6 +826,94 @@ async fn proxy_bidirectional(
     }
 }
 
+/// Packet-aware bidirectional proxy that records whether the client ever
+/// issued anything other than a read-only command. Returns
+/// `(backend, dirty)` where `dirty == true` means the session must be reset
+/// before the backend returns to the pool (`SET`, `INSERT`, `BEGIN`,
+/// prepared statements, `USE`, etc.). A pure-`SELECT` session reports
+/// `dirty == false`, allowing the Smart strategy to skip the
+/// `COM_RESET_CONNECTION` round-trip.
+///
+/// The client→backend stream is parsed packet-by-packet so we can inspect
+/// the command byte and (for `COM_QUERY`) the SQL keyword. The
+/// backend→client stream is byte-copied with `tokio::io::copy` since we
+/// don't need to understand it — we just flush it back to the client.
+async fn proxy_bidirectional_sniff(
+    mut client: TcpStream,
+    mut backend: TcpStream,
+) -> Result<(TcpStream, bool), DbError> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let dirty = Arc::new(AtomicBool::new(false));
+    let dirty_w = Arc::clone(&dirty);
+
+    let result = {
+        let (mut cr, mut cw) = client.split();
+        let (mut br, mut bw) = backend.split();
+
+        let client_to_backend = async {
+            loop {
+                let mut header = [0u8; 4];
+                match cr.read_exact(&mut header).await {
+                    Ok(_) => {}
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::UnexpectedEof
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::BrokenPipe
+                        ) =>
+                    {
+                        return Ok::<(), std::io::Error>(());
+                    }
+                    Err(e) => return Err(e),
+                }
+                let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+                let mut payload = vec![0u8; len];
+                cr.read_exact(&mut payload).await?;
+
+                if let Some(&cmd) = payload.first() {
+                    let writeish = match cmd {
+                        COM_QUIT | 0x0E /* COM_PING */ => false,
+                        COM_QUERY => {
+                            let sql = std::str::from_utf8(&payload[1..]).unwrap_or("");
+                            !matches!(classify_mysql_query(sql), QueryKind::Read)
+                        }
+                        _ => true,
+                    };
+                    if writeish {
+                        dirty_w.store(true, Ordering::Relaxed);
+                    }
+                }
+
+                bw.write_all(&header).await?;
+                bw.write_all(&payload).await?;
+            }
+        };
+
+        let backend_to_client = tokio::io::copy(&mut br, &mut cw);
+
+        tokio::select! {
+            r = client_to_backend => r.map(|()| 0u64),
+            r = backend_to_client => r,
+        }
+    };
+
+    match result {
+        Ok(_) => Ok((backend, dirty.load(std::sync::atomic::Ordering::Relaxed))),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+            ) =>
+        {
+            Ok((backend, dirty.load(std::sync::atomic::Ordering::Relaxed)))
+        }
+        Err(e) => Err(DbError::Io(e)),
+    }
+}
+
 // ── MySQL packet framing ──────────────────────────────────────────────────────
 
 /// Read one `MySQL` packet: `[len: 3LE][seq: 1][payload: len]`.
@@ -911,10 +1008,57 @@ struct ClientState {
     dirty: bool,
 }
 
-/// Forward a complete `MySQL` response from backend to client.
+/// Decode a `MySQL` length-encoded integer from `buf`.
 ///
-/// Handles OK, ERR, EOF, and result sets by reading the full response
-/// and forwarding each packet.
+/// Returns `(value, bytes_consumed)` or `None` if the input is truncated.
+/// Encoding:
+/// - `0x00..=0xFA`  → 1-byte integer (the byte itself)
+/// - `0xFB`         → NULL (treated as 0 here; not used for column counts)
+/// - `0xFC`         → 2-byte LE integer (3 bytes total)
+/// - `0xFD`         → 3-byte LE integer (4 bytes total)
+/// - `0xFE`         → 8-byte LE integer (9 bytes total)
+fn decode_lenenc_int(buf: &[u8]) -> Option<(u64, usize)> {
+    match *buf.first()? {
+        v @ 0..=0xFA => Some((u64::from(v), 1)),
+        0xFB => Some((0, 1)),
+        0xFC if buf.len() >= 3 => Some((u64::from(u16::from_le_bytes([buf[1], buf[2]])), 3)),
+        0xFD if buf.len() >= 4 => {
+            Some((u64::from(u32::from_le_bytes([buf[1], buf[2], buf[3], 0])), 4))
+        }
+        0xFE if buf.len() >= 9 => {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&buf[1..9]);
+            Some((u64::from_le_bytes(b), 9))
+        }
+        _ => None,
+    }
+}
+
+/// Forward a complete `COM_QUERY` response from backend to client.
+///
+/// The Smart-reset routing loop returns each pooled backend to the pool after
+/// every command, so this function must consume *exactly* one full response
+/// before returning — leaving stray packets buffered desynchronises the next
+/// command (this is what made WordPress hang on `[db.mysql] reset_strategy =
+/// "smart"`: the response to `SELECT @@max_allowed_packet,@@wait_timeout`
+/// was truncated after the column-defs EOF, the row packets stayed in the
+/// backend's read buffer, and the client blocked forever waiting for them).
+///
+/// COM_QUERY responses have four shapes:
+///
+/// 1. `OK_Packet`    — `[0x00] …`           (single packet)
+/// 2. `ERR_Packet`   — `[0xFF] …`           (single packet)
+/// 3. `LOCAL INFILE` — `[0xFB] <filename>`  (multi-round file-upload flow —
+///    unsupported here; the caller will retire the connection)
+/// 4. Result set     — `[lenenc col_count]`,
+///    `col_count` column-def packets, an EOF (the proxy advertises classic
+///    EOF — `CLIENT_DEPRECATE_EOF` is *not* in its capability mask), zero or
+///    more row packets, and a terminating EOF / ERR.
+///
+/// Because the proxy's synthetic client greeting in [`send_greeting`] does
+/// not set `CLIENT_DEPRECATE_EOF` (0x0100_0000), every result set we see
+/// from real MySQL servers uses the two-EOF layout — we don't have to handle
+/// the deprecated-EOF row terminator.
 async fn forward_mysql_response(
     backend: &mut TcpStream,
     client: &mut TcpStream,
@@ -922,23 +1066,48 @@ async fn forward_mysql_response(
     let (seq, payload) = read_packet(backend).await?;
     write_packet(client, seq, &payload).await?;
 
-    // Check response type.
+    // Single-packet responses.
     match payload.first().copied() {
-        Some(0x00 | 0xFF) => return Ok(()), // OK or ERR packet
-        Some(0xFE) if payload.len() < 9 => return Ok(()), // EOF packet
-        _ => {}                             // Result set: read columns and rows
+        Some(0x00 | 0xFF) => return Ok(()),
+        Some(0xFE) if payload.len() < 9 => return Ok(()),
+        Some(0xFB) => {
+            return Err(DbError::Protocol(
+                "LOCAL INFILE response not supported by smart-reset proxy path".into(),
+            ));
+        }
+        _ => {} // Result-set header: column count as a lenenc integer.
     }
 
-    // Result set: read column definitions until EOF, then rows until EOF/OK.
-    loop {
-        let (seq, payload) = read_packet(backend).await?;
-        write_packet(client, seq, &payload).await?;
+    let (col_count, _) = decode_lenenc_int(&payload)
+        .ok_or_else(|| DbError::Protocol("malformed result-set column-count packet".into()))?;
 
-        match payload.first().copied() {
-            Some(0xFE) if payload.len() < 9 => return Ok(()), // EOF after rows
-            Some(0xFF) => return Ok(()),                      // ERR
-            Some(0x00) if payload.len() <= 9 => return Ok(()), // OK
-            _ => {}                                           // More rows
+    // Column-definition packets.
+    for _ in 0..col_count {
+        let (s, p) = read_packet(backend).await?;
+        write_packet(client, s, &p).await?;
+    }
+
+    // Intermediate EOF terminating the column-definition block.
+    let (s, p) = read_packet(backend).await?;
+    write_packet(client, s, &p).await?;
+    if p.first() == Some(&0xFF) {
+        // ERR_Packet here (e.g. cursor open failed) — no rows follow.
+        return Ok(());
+    }
+    if !(p.first() == Some(&0xFE) && p.len() < 9) {
+        return Err(DbError::Protocol(
+            "expected EOF after column definitions in result-set".into(),
+        ));
+    }
+
+    // Row packets until the terminating EOF or ERR.
+    loop {
+        let (s, p) = read_packet(backend).await?;
+        write_packet(client, s, &p).await?;
+        match p.first().copied() {
+            Some(0xFE) if p.len() < 9 => return Ok(()), // terminating EOF
+            Some(0xFF) => return Ok(()),                // ERR mid-stream
+            _ => {}                                     // another row
         }
     }
 }
@@ -1485,6 +1654,104 @@ mod tests {
 
         let result = forward_prepare_response(&mut backend_read, &mut client_write).await;
         assert_eq!(result.unwrap(), None);
+    }
+
+    // ── forward_mysql_response: full result-set framing ──────────────
+
+    /// Regression test for the WordPress hang: `forward_mysql_response`
+    /// used to return after the first EOF (the one ending the column-defs
+    /// block), leaving the row packets in the backend buffer and starving
+    /// the client. This test wraps a complete 2-column / 1-row result set
+    /// and asserts every packet is forwarded.
+    #[tokio::test]
+    async fn forward_mysql_response_two_columns_one_row() {
+        let (mut backend_write, mut backend_read) = make_tcp_pair().await;
+        let (mut client_write, mut client_read) = make_tcp_pair().await;
+
+        // Column count = 2 (lenenc).
+        write_packet(&mut backend_write, 1, &[0x02]).await.unwrap();
+        // Two column-def packets (opaque payloads — content doesn't matter).
+        write_packet(&mut backend_write, 2, &[0xAA; 16]).await.unwrap();
+        write_packet(&mut backend_write, 3, &[0xBB; 16]).await.unwrap();
+        // Intermediate EOF after column definitions.
+        write_packet(&mut backend_write, 4, &[0xFE, 0, 0, 0x02, 0]).await.unwrap();
+        // One row packet (two lenenc strings: "x", "y").
+        write_packet(&mut backend_write, 5, &[0x01, b'x', 0x01, b'y']).await.unwrap();
+        // Terminating EOF.
+        write_packet(&mut backend_write, 6, &[0xFE, 0, 0, 0x02, 0]).await.unwrap();
+        drop(backend_write);
+
+        forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
+        drop(client_write);
+
+        let mut seqs = Vec::new();
+        while let Ok((s, _)) = read_packet(&mut client_read).await {
+            seqs.push(s);
+        }
+        assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6], "all 6 packets must reach the client");
+    }
+
+    #[tokio::test]
+    async fn forward_mysql_response_ok_packet_single() {
+        let (mut backend_write, mut backend_read) = make_tcp_pair().await;
+        let (mut client_write, mut client_read) = make_tcp_pair().await;
+
+        // [0x00][affected_rows=0][last_insert_id=0][status=0x0002][warnings=0]
+        write_packet(&mut backend_write, 1, &[0x00, 0, 0, 0x02, 0, 0, 0]).await.unwrap();
+        drop(backend_write);
+
+        forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
+        drop(client_write);
+
+        let (_, p) = read_packet(&mut client_read).await.unwrap();
+        assert_eq!(p[0], 0x00, "OK packet forwarded once");
+        assert!(read_packet(&mut client_read).await.is_err(), "no further packets");
+    }
+
+    #[tokio::test]
+    async fn forward_mysql_response_empty_result_set() {
+        // Zero rows: column count, column-defs, intermediate EOF, terminating EOF.
+        let (mut backend_write, mut backend_read) = make_tcp_pair().await;
+        let (mut client_write, mut client_read) = make_tcp_pair().await;
+
+        write_packet(&mut backend_write, 1, &[0x01]).await.unwrap();
+        write_packet(&mut backend_write, 2, &[0xAA; 16]).await.unwrap();
+        write_packet(&mut backend_write, 3, &[0xFE, 0, 0, 0x02, 0]).await.unwrap();
+        write_packet(&mut backend_write, 4, &[0xFE, 0, 0, 0x02, 0]).await.unwrap();
+        drop(backend_write);
+
+        forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
+        drop(client_write);
+
+        let mut seqs = Vec::new();
+        while let Ok((s, _)) = read_packet(&mut client_read).await {
+            seqs.push(s);
+        }
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+    }
+
+    // ── decode_lenenc_int ────────────────────────────────────────────
+
+    #[test]
+    fn decode_lenenc_int_small() {
+        assert_eq!(decode_lenenc_int(&[0x42]), Some((0x42, 1)));
+        assert_eq!(decode_lenenc_int(&[0xFA]), Some((0xFA, 1)));
+    }
+
+    #[test]
+    fn decode_lenenc_int_two_byte() {
+        assert_eq!(decode_lenenc_int(&[0xFC, 0x34, 0x12]), Some((0x1234, 3)));
+    }
+
+    #[test]
+    fn decode_lenenc_int_three_byte() {
+        assert_eq!(decode_lenenc_int(&[0xFD, 0x01, 0x02, 0x03]), Some((0x0003_0201, 4)));
+    }
+
+    #[test]
+    fn decode_lenenc_int_truncated() {
+        assert_eq!(decode_lenenc_int(&[0xFC, 0x01]), None);
+        assert_eq!(decode_lenenc_int(&[]), None);
     }
 
     // ── Test helpers ─────────────────────────────────────────────────

@@ -243,6 +243,148 @@ async fn transaction_integrity() {
     pool.disconnect().await.unwrap();
 }
 
+// ── Smart reset_strategy tests ───────────────────────────────────────────────
+//
+// These exercise the `proxy_routing_loop` path (per-query routing + dirty
+// tracking). The `Always` tests above run through `proxy_bidirectional`, so
+// without these the Smart code path is never integration-tested.
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
+async fn basic_query_roundtrip_smart() {
+    let Some(url) = mysql_url() else {
+        println!("MYSQL_TEST_URL not set — skipping");
+        return;
+    };
+
+    let addr = start_proxy(&url, test_pool_config(), ResetStrategy::Smart).await;
+    let pool = mysql_async::Pool::new(proxy_opts(&addr));
+
+    // Hard timeout so a hang reports as a test failure rather than waiting
+    // for the per-test wallclock deadline.
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut conn = pool.get_conn().await.unwrap();
+
+        conn.query_drop(
+            "CREATE TABLE IF NOT EXISTS _ephpm_smart_basic (id INT PRIMARY KEY, val VARCHAR(64))",
+        )
+        .await
+        .unwrap();
+
+        conn.query_drop("INSERT INTO _ephpm_smart_basic (id, val) VALUES (1, 'hello')")
+            .await
+            .unwrap();
+
+        let rows: Vec<(i32, String)> =
+            conn.query("SELECT id, val FROM _ephpm_smart_basic WHERE id = 1").await.unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, 1);
+        assert_eq!(rows[0].1, "hello");
+
+        conn.query_drop("DROP TABLE IF EXISTS _ephpm_smart_basic").await.unwrap();
+
+        drop(conn);
+    })
+    .await;
+
+    pool.disconnect().await.unwrap();
+    result.expect("Smart-strategy roundtrip hung (timed out)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
+async fn session_isolation_smart() {
+    let Some(url) = mysql_url() else {
+        println!("MYSQL_TEST_URL not set — skipping");
+        return;
+    };
+
+    // Smart strategy should still reset between clients when the session
+    // became dirty (writes / SET commands).
+    let addr = start_proxy(&url, test_pool_config(), ResetStrategy::Smart).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        // Client A: set a user variable.
+        {
+            let pool = mysql_async::Pool::new(proxy_opts(&addr));
+            let mut conn = pool.get_conn().await.unwrap();
+            conn.query_drop("SET @myvar = 42").await.unwrap();
+
+            let rows: Vec<(Option<i32>,)> = conn.query("SELECT @myvar").await.unwrap();
+            assert_eq!(rows[0].0, Some(42));
+
+            drop(conn);
+            pool.disconnect().await.unwrap();
+        }
+
+        // Small delay to let the proxy finish the reset on the returned backend.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Client B: variable must be cleared by COM_RESET_CONNECTION.
+        {
+            let pool = mysql_async::Pool::new(proxy_opts(&addr));
+            let mut conn = pool.get_conn().await.unwrap();
+            let rows: Vec<(Option<i32>,)> = conn.query("SELECT @myvar").await.unwrap();
+            assert_eq!(
+                rows[0].0, None,
+                "@myvar should be NULL after Smart-strategy reset of dirty session"
+            );
+
+            drop(conn);
+            pool.disconnect().await.unwrap();
+        }
+    })
+    .await;
+
+    result.expect("Smart-strategy session isolation hung (timed out)");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
+async fn prepared_statement_lifecycle_smart() {
+    let Some(url) = mysql_url() else {
+        println!("MYSQL_TEST_URL not set — skipping");
+        return;
+    };
+
+    let addr = start_proxy(&url, test_pool_config(), ResetStrategy::Smart).await;
+    let pool = mysql_async::Pool::new(proxy_opts(&addr));
+
+    let result = tokio::time::timeout(Duration::from_secs(15), async {
+        let mut conn = pool.get_conn().await.unwrap();
+
+        conn.query_drop(
+            "CREATE TABLE IF NOT EXISTS _ephpm_smart_ps (id INT PRIMARY KEY, name VARCHAR(64))",
+        )
+        .await
+        .unwrap();
+        conn.query_drop("DELETE FROM _ephpm_smart_ps").await.unwrap();
+        conn.query_drop("INSERT INTO _ephpm_smart_ps (id, name) VALUES (1, 'alice'), (2, 'bob')")
+            .await
+            .unwrap();
+
+        let stmt = conn.prep("SELECT id, name FROM _ephpm_smart_ps WHERE id = ?").await.unwrap();
+
+        let rows: Vec<(i32, String)> = conn.exec(&stmt, (1,)).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "alice");
+
+        let rows: Vec<(i32, String)> = conn.exec(&stmt, (2,)).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1, "bob");
+
+        conn.close(stmt).await.unwrap();
+        conn.query_drop("DROP TABLE IF EXISTS _ephpm_smart_ps").await.unwrap();
+
+        drop(conn);
+    })
+    .await;
+
+    pool.disconnect().await.unwrap();
+    result.expect("Smart-strategy prepared-statement lifecycle hung (timed out)");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
 async fn prepared_statement_lifecycle() {
