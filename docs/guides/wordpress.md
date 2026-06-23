@@ -1,7 +1,8 @@
 # Running WordPress on ePHPm
 
+
 ePHPm is a single binary that embeds PHP, SQLite, a MySQL wire-protocol proxy,
-and a Redis-compatible KV store. No PHP-FPM, no MySQL, no Redis, no web server.
+and an in-process KV store. No PHP-FPM, no MySQL, no Redis, no web server.
 WordPress runs out of the box against all three embedded subsystems.
 
 This guide walks through three deployment paths, all **live-tested**:
@@ -20,7 +21,8 @@ This guide walks through three deployment paths, all **live-tested**:
 - ePHPm binary from the [releases page](https://github.com/ephpm/ephpm/releases)
   or `docker pull ephpm/ephpm:8.5`
 - Latest WordPress zip from [wordpress.org/latest.zip](https://wordpress.org/latest.zip)
-- The [Redis Object Cache](https://wordpress.org/plugins/redis-cache/) plugin
+- The [ephpm/cache-wordpress](https://github.com/ephpm/cache-wordpress) object-cache
+  drop-in (Composer package or git clone — see below)
 
 ---
 
@@ -40,7 +42,7 @@ unzip latest.zip        # creates ./wordpress/
 mkdir -p wordpress/wp-content/database
 ```
 
-### 1.2 Install plugins
+### 1.2 Install the SQLite drop-in and the object cache
 
 ```bash
 # SQLite database integration (replaces MySQL with embedded SQLite)
@@ -48,12 +50,29 @@ curl -O https://downloads.wordpress.org/plugin/sqlite-database-integration.zip
 unzip sqlite-database-integration.zip -d wordpress/wp-content/plugins/
 cp wordpress/wp-content/plugins/sqlite-database-integration/db.copy \
    wordpress/wp-content/db.php
+```
 
-# Redis Object Cache (uses ePHPm's embedded KV via Predis)
-curl -O https://downloads.wordpress.org/plugin/redis-cache.zip
-unzip redis-cache.zip -d wordpress/wp-content/plugins/
-cp wordpress/wp-content/plugins/redis-cache/includes/object-cache.php \
-   wordpress/wp-content/object-cache.php
+The object cache is the [`ephpm/cache-wordpress`](https://github.com/ephpm/cache-wordpress)
+drop-in. It writes `wp-content/object-cache.php`, which calls ePHPm's
+in-process KV store directly via the `ephpm_kv_*` SAPI functions — no Redis
+container, no RESP listener, no Predis, no plugin to activate.
+
+**Canonical (Composer):**
+
+```bash
+cd wordpress
+composer require ephpm/cache-wordpress
+# copy the drop-in into wp-content (it auto-discovers the Composer autoload)
+cp vendor/ephpm/cache-wordpress/dropin/object-cache.php wp-content/object-cache.php
+```
+
+**No Composer:**
+
+```bash
+cd wordpress
+git clone https://github.com/ephpm/cache-wordpress wp-content/cache-wordpress
+printf "<?php\nrequire __DIR__ . '/cache-wordpress/dropin/object-cache.php';\n" \
+  > wp-content/object-cache.php
 ```
 
 ### 1.3 Configure WordPress
@@ -78,14 +97,10 @@ define( 'SECURE_AUTH_SALT', 'change-me' );
 define( 'LOGGED_IN_SALT',   'change-me' );
 define( 'NONCE_SALT',       'change-me' );
 
-// ePHPm embedded KV store (Redis-compatible RESP2 on :6379)
-define( 'WP_REDIS_PLUGIN_PATH', __DIR__ . '/wp-content/plugins/redis-cache' );
-define( 'WP_REDIS_HOST',        '127.0.0.1' );
-define( 'WP_REDIS_PORT',        6379 );
-define( 'WP_REDIS_CLIENT',      'predis' );
-define( 'WP_REDIS_TIMEOUT',     1 );
-define( 'WP_REDIS_READ_TIMEOUT', 1 );
-define( 'WP_CACHE',             true );
+// Opt into the persistent object cache. The wp-content/object-cache.php
+// drop-in (cache-wordpress) is what makes it persistent; it talks straight
+// to ePHPm's in-process KV store. No WP_REDIS_* / Predis config needed.
+define( 'WP_CACHE', true );
 ```
 
 ### 1.4 Start ePHPm
@@ -107,9 +122,9 @@ Complete the 5-field form (site title, username, password, email).
 
 ### 1.5 Observe KV population
 
-After completing the installer and activating the Redis Object Cache
-plugin (`/wp-admin/plugins.php`), make a few requests then inspect
-the embedded KV store:
+After completing the installer, make a few requests then inspect the
+embedded KV store (the drop-in is active automatically — there is no
+plugin to enable):
 
 ```bash
 ephpm kv keys "*"
@@ -129,8 +144,12 @@ ephpm kv get "wp:options:notoptions"
 # a:2:{s:6:"WPLANG";b:1;s:14:"theme_switched";b:1;}
 ```
 
-Everything flows through Predis → RESP2 → ePHPm embedded KV.
-No external Redis process.
+Everything flows WordPress → cache-wordpress `ObjectCache` → `ephpm_kv_*`
+(in-process). No external Redis process, no RESP listener, no Predis.
+
+> `wp_cache_flush()` is a real flush (backed by `ephpm_kv_flush_all()`) and
+> needs **ePHPm v0.1.2+**. On older runtimes the cache still works, but flush
+> is a no-op and entries age out via TTL instead.
 
 ---
 
@@ -162,20 +181,21 @@ document_root = "/app/wordpress"
 [db.sqlite]
 path = "/app/data/database/wordpress.sqlite"
 
-[kv.redis_compat]
-enabled = true
-listen  = "127.0.0.1:6379"
+# No [kv.redis_compat] needed — the cache-wordpress drop-in calls the
+# in-process KV store directly, so there is no RESP listener to configure.
 ```
 
 ### 2.3 `wp-config.php` additions
 
 ```php
-define( 'WP_REDIS_PLUGIN_PATH', '/app/wordpress/wp-content/plugins/redis-cache' );
-define( 'WP_REDIS_HOST',        '127.0.0.1' );
-define( 'WP_REDIS_PORT',        6379 );
-define( 'WP_REDIS_CLIENT',      'predis' );
-define( 'WP_CACHE',             true );
+// The wp-content/object-cache.php drop-in (cache-wordpress) handles the
+// object cache via ephpm_kv_* in-process. Just opt in:
+define( 'WP_CACHE', true );
 ```
+
+Install the drop-in into the mounted `wordpress/` tree the same way as
+Part 1.2 (Composer or git clone), so `wp-content/object-cache.php` exists
+before the container starts.
 
 ### 2.4 Run
 
@@ -257,9 +277,8 @@ data:
     [db.sqlite]
     path = "/app/data/database/wordpress.sqlite"
 
-    [kv.redis_compat]
-    enabled = true
-    listen  = "127.0.0.1:6379"
+    # No [kv.redis_compat]: the cache-wordpress drop-in uses the in-process
+    # KV store directly, so no RESP listener is needed.
 
   wp-config.php: |
     <?php
@@ -279,14 +298,9 @@ data:
     define( 'LOGGED_IN_SALT',   'change-me-in-prod' );
     define( 'NONCE_SALT',       'change-me-in-prod' );
 
-    define( 'WP_REDIS_PLUGIN_PATH', '/app/wordpress/wp-content/plugins/redis-cache' );
-    define( 'WP_REDIS_HOST',        '127.0.0.1' );
-    define( 'WP_REDIS_PORT',        6379 );
-    define( 'WP_REDIS_CLIENT',      'predis' );
-    define( 'WP_REDIS_TIMEOUT',     1 );
-    define( 'WP_REDIS_READ_TIMEOUT', 1 );
-    define( 'WP_CACHE',             true );
-    define( 'WP_DEBUG',             false );
+    // Object cache via the cache-wordpress drop-in (ephpm_kv_* in-process).
+    define( 'WP_CACHE',  true );
+    define( 'WP_DEBUG',  false );
 
     $table_prefix = 'wp_';
     define( 'ABSPATH', __DIR__ . '/' );
@@ -297,8 +311,9 @@ data:
 
 Two init containers run before ephpm starts:
 
-1. **`wordpress-download`** (busybox): downloads WordPress + SQLite plugin
-   + Redis Object Cache plugin, copies wp-config.php from the ConfigMap.
+1. **`wordpress-download`** (busybox): downloads WordPress + the SQLite
+   plugin, clones the cache-wordpress drop-in and wires
+   `wp-content/object-cache.php`, copies wp-config.php from the ConfigMap.
 2. **`wordpress-install`** (ephpm): starts ephpm temporarily, POSTs the
    WordPress install form to create all 14 DB tables, then exits cleanly.
 
@@ -323,12 +338,13 @@ spec:
     spec:
       initContainers:
         - name: wordpress-download
-          image: busybox
+          image: alpine/git    # has git for the clone; unzip added below
           command:
             - sh
             - -c
             - |
               set -e
+              apk add --no-cache unzip >/dev/null
               mkdir -p /app/data/database /app/wordpress/wp-content/database
 
               if [ ! -f /app/wordpress/index.php ]; then
@@ -344,12 +360,11 @@ spec:
                 rm /tmp/s.zip
               fi
 
-              if [ ! -f /app/wordpress/wp-content/plugins/redis-cache/redis-cache.php ]; then
-                wget -q -O /tmp/r.zip https://downloads.wordpress.org/plugin/redis-cache.zip
-                unzip -q /tmp/r.zip -d /app/wordpress/wp-content/plugins/
-                cp /app/wordpress/wp-content/plugins/redis-cache/includes/object-cache.php \
-                   /app/wordpress/wp-content/object-cache.php
-                rm /tmp/r.zip
+              if [ ! -f /app/wordpress/wp-content/cache-wordpress/dropin/object-cache.php ]; then
+                git clone --depth 1 https://github.com/ephpm/cache-wordpress \
+                  /app/wordpress/wp-content/cache-wordpress
+                printf "<?php\nrequire __DIR__ . '/cache-wordpress/dropin/object-cache.php';\n" \
+                  > /app/wordpress/wp-content/object-cache.php
               fi
 
               cp /etc/ephpm/wp-config.php /app/wordpress/wp-config.php
@@ -482,10 +497,9 @@ kubectl exec deploy/wordpress -- ephpm kv keys "*"
 # 19) wp:category_relationships:1
 # 20) wp:post_meta:1
 
-kubectl logs deploy/wordpress | tail -6
+kubectl logs deploy/wordpress | tail -5
 # INFO ephpm: starting ePHPm listen=0.0.0.0:8080 document_root=/app/wordpress
 # INFO ephpm_php: PHP runtime initialized (libphp linked)
-# INFO ephpm_kv::server: KV store RESP server listening listen=127.0.0.1:6379
 # INFO ephpm_server: opened embedded SQLite database (single-node)
 # INFO ephpm_server: SQLite MySQL wire protocol enabled listen=127.0.0.1:3306
 # INFO ephpm_server: HTTP listening addr=0.0.0.0:8080
@@ -503,46 +517,42 @@ kubectl logs deploy/wordpress | tail -6
 
 ---
 
-## Part 4 — Docker Compose with external MySQL + Redis
+## Part 4 — Docker Compose with external MySQL
 
-Parts 1–3 use ePHPm's *embedded* SQLite and KV store — one binary, zero
-external services. But ePHPm is equally happy as a thin PHP runtime in front
-of *real* infrastructure. This stack shows the other end of the spectrum:
-
-- **MySQL** in its own container, reached through ePHPm's **connection-pooling
-  MySQL proxy** (`[db.mysql]`). WordPress's `pdo_mysql` connects to
-  `127.0.0.1:3306` inside the ePHPm container; ePHPm forwards to `mysql:3306`.
-- **Redis** in its own container. WordPress's Redis Object Cache talks to it
-  **directly** (`WP_REDIS_HOST=redis`), bypassing ePHPm's embedded KV.
+Parts 1–3 use ePHPm's *embedded* SQLite — one binary, zero external services.
+But ePHPm is equally happy as a thin PHP runtime in front of a *real* database.
+This stack keeps the object cache embedded (the cache-wordpress drop-in, same
+as everywhere else) but moves the database into its own MySQL container, reached
+through ePHPm's **connection-pooling MySQL proxy** (`[db.mysql]`). WordPress's
+`pdo_mysql` connects to `127.0.0.1:3306` inside the ePHPm container; ePHPm
+forwards to `mysql:3306`.
 
 ```
 WordPress (PHP in ePHPm)
-  ├── pdo_mysql ─► 127.0.0.1:3306 (ePHPm proxy) ─► mysql:3306   (external MySQL)
-  └── Predis    ─► redis:6379                                    (external Redis)
+  ├── pdo_mysql     ─► 127.0.0.1:3306 (ePHPm proxy) ─► mysql:3306  (external MySQL)
+  └── object cache  ─► cache-wordpress drop-in ─► ephpm_kv_* (in-process)
 ```
 
-Same PHP runtime, same single binary — only the backing services moved out.
-This is the mode you'd use to drop ePHPm into an existing managed-database /
-managed-cache environment, or to share one MySQL/Redis across many instances.
+This is the mode you'd use to drop ePHPm into an existing managed-database
+environment, or to share one MySQL across many instances — while still getting
+a persistent object cache for free from the same single binary, with no Redis.
 
-Runnable files live in [`examples/wordpress-compose/`](../../examples/wordpress-compose/):
-`compose.yaml`, `ephpm.toml`, and `wp-config.php`.
-
-### 4.1 `ephpm.toml` — proxy, no embedded DB/KV
+### 4.1 `ephpm.toml` — proxy, embedded object cache
 
 ```toml
 [server]
 listen        = "0.0.0.0:8080"
 document_root = "/app/wordpress"
 
-# Transparent MySQL proxy with pooling. No [db.sqlite], no [kv.redis_compat].
+# Transparent MySQL proxy with pooling. No [db.sqlite], no [kv.redis_compat]
+# (the cache-wordpress drop-in uses the in-process KV store directly).
 [db.mysql]
 url             = "mysql://wordpress:wordpress@mysql:3306/wordpress"
 listen          = "127.0.0.1:3306"
 max_connections = 20
 ```
 
-### 4.2 `wp-config.php` — point DB at the proxy, cache at external Redis
+### 4.2 `wp-config.php` — point DB at the proxy
 
 ```php
 define( 'DB_NAME',     'wordpress' );
@@ -550,26 +560,39 @@ define( 'DB_USER',     'wordpress' );
 define( 'DB_PASSWORD', 'wordpress' );
 define( 'DB_HOST',     '127.0.0.1' );   // ePHPm proxy -> mysql:3306
 
-define( 'WP_REDIS_PLUGIN_PATH', '/app/wordpress/wp-content/plugins/redis-cache' );
-define( 'WP_REDIS_HOST',  'redis' );    // external Redis container
-define( 'WP_REDIS_PORT',  6379 );
-define( 'WP_REDIS_CLIENT', 'predis' );
+// Object cache via the cache-wordpress drop-in (ephpm_kv_* in-process).
 define( 'WP_CACHE', true );
 ```
 
 Note: in this mode WordPress uses its **native `mysqli`** against a real MySQL,
-so there is **no** SQLite integration plugin and **no** `db.php` drop-in — only
-the Redis Object Cache drop-in.
+so there is **no** SQLite integration plugin and **no** `db.php` drop-in — the
+object cache is still the cache-wordpress `wp-content/object-cache.php` drop-in.
 
-### 4.3 `compose.yaml` (abridged — see the example dir for the full file)
+### 4.3 `compose.yaml`
 
 ```yaml
-name: ephpm-wordpress-external
+name: ephpm-wordpress-mysql
 
 services:
-  init:        # one-shot: fetch WordPress + Redis Object Cache, drop in wp-config.php
-    image: busybox
-    command: ["sh", "-c", "..."]   # full script in examples/wordpress-compose/compose.yaml
+  init:        # one-shot: fetch WordPress, wire the cache-wordpress drop-in, drop in wp-config.php
+    image: alpine/git
+    command:
+      - sh
+      - -c
+      - |
+        set -e
+        apk add --no-cache unzip >/dev/null
+        if [ ! -f /wp/index.php ]; then
+          wget -q -O /tmp/wp.tar.gz https://wordpress.org/latest.tar.gz
+          tar -xzf /tmp/wp.tar.gz --strip-components=1 -C /wp
+        fi
+        if [ ! -d /wp/wp-content/cache-wordpress ]; then
+          git clone --depth 1 https://github.com/ephpm/cache-wordpress \
+            /wp/wp-content/cache-wordpress
+          printf "<?php\nrequire __DIR__ . '/cache-wordpress/dropin/object-cache.php';\n" \
+            > /wp/wp-content/object-cache.php
+        fi
+        cp /wp-config.php /wp/wp-config.php
     volumes:
       - ./wordpress:/wp
       - ./wp-config.php:/wp-config.php:ro
@@ -587,16 +610,11 @@ services:
       interval: 5s
       retries: 30
 
-  redis:
-    image: redis:7-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
-
   ephpm:
     image: ephpm/ephpm:8.5
     depends_on:
       init:  { condition: service_completed_successfully }
       mysql: { condition: service_healthy }
-      redis: { condition: service_started }
     command: ["ephpm", "serve", "--config", "/app/ephpm.toml"]
     ports: ["8080:8080"]
     volumes:
@@ -610,24 +628,24 @@ volumes:
 ### 4.4 Run
 
 ```bash
-cd examples/wordpress-compose
 docker compose up -d
 # open http://localhost:8080 and finish the WordPress installer
 ```
 
-The `init` service downloads WordPress and the Redis plugin on first run; MySQL
-comes up healthy before ePHPm starts; WordPress installs into the external MySQL
-through the proxy, and its object cache lands in the external Redis:
+The `init` service downloads WordPress and wires the cache-wordpress drop-in on
+first run; MySQL comes up healthy before ePHPm starts; WordPress installs into
+the external MySQL through the proxy, and its object cache lands in ePHPm's
+in-process KV store:
 
 ```bash
-docker compose exec redis redis-cli keys 'wp:*' | head
+docker compose exec ephpm ephpm kv keys 'wp:*' | head
 docker compose exec mysql mysql -uwordpress -pwordpress wordpress -e 'SHOW TABLES;'
 ```
 
 > **Not run on the authoring machine.** Unlike the embedded demos (Parts 1–3,
-> which were live-tested), this external-services stack was authored from
-> ePHPm's `[db.mysql]` proxy schema and the same WordPress/Redis wiring used
-> above; validate in your own Docker environment before relying on it.
+> which were live-tested), this external-MySQL stack was authored from ePHPm's
+> `[db.mysql]` proxy schema; validate in your own Docker environment before
+> relying on it.
 
 ---
 
@@ -636,10 +654,10 @@ docker compose exec mysql mysql -uwordpress -pwordpress wordpress -e 'SHOW TABLE
 ```
 HTTP :8080  ──► WordPress PHP 8.5.7 (ePHPm Embedded Server SAPI, ZTS)
                     │
-                    ├── pdo_mysql  ──► litewire ──► SQLite (MySQL wire on :3306)
+                    ├── pdo_mysql       ──► litewire ──► SQLite (MySQL wire on :3306)
                     │
-                    └── Predis     ──► ePHPm KV ──► RESP2 on :6379
-                                       (object cache, transients, sessions)
+                    └── object cache    ──► cache-wordpress ──► ephpm_kv_* (in-process)
+                                            (object cache, transients, sessions)
 ```
 
 All three subsystems run inside the single `ephpm` process.
@@ -654,7 +672,7 @@ No PHP-FPM. No MySQL. No Redis. No nginx.
 | `Failed opening required '.\wp-admin/install.php'` | Document root as relative path | Use absolute path: `--document-root /abs/path/to/wordpress` |
 | `unable to open database file` | SQLite directory missing | `mkdir -p wp-content/database` |
 | `failed to bind ... os error 10013` (Windows) | Firewall blocking port | Allow port in Windows Defender Firewall |
-| KV keys empty after requests | `object-cache.php` drop-in not installed | `cp plugins/redis-cache/includes/object-cache.php wp-content/` |
-| `Predis library not found` | `WP_REDIS_PLUGIN_PATH` undefined | Add `define('WP_REDIS_PLUGIN_PATH', __DIR__ . '/wp-content/plugins/redis-cache');` |
+| KV keys empty after requests | cache-wordpress drop-in not installed | Ensure `wp-content/object-cache.php` exists (see Part 1.2) |
+| `wp_cache_flush()` returns false / no-op | ePHPm runtime older than v0.1.2 | Upgrade to ePHPm v0.1.2+ (the release with `ephpm_kv_flush_all()`) |
 | `WP_CACHE` not taking effect | `WP_CACHE` not set before `wp-settings.php` | Add `define('WP_CACHE', true);` above the `require_once` line |
 | Readiness probe causes half-initialized DB (k8s) | PHP probe hits before install completes | Probe `/license.txt` (static file); run installer in an init container |

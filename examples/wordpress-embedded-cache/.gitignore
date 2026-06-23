@@ -1,3 +1,0 @@
-# WordPress core + the cache-wordpress package are fetched by the init
-# service at first run.
-wordpress/
