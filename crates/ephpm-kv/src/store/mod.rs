@@ -749,7 +749,20 @@ impl Store {
     }
 
     fn mem_sub(&self, n: usize) {
-        self.mem_used.fetch_sub(n, Ordering::Relaxed);
+        // Saturating subtraction: `mem_used` is an *approximate*, unsigned
+        // counter, so it must never underflow. `flush()` resets it to 0 with a
+        // plain `store`, which races with concurrent `remove`/`set` on other
+        // worker threads (the store is `Arc`-shared across the spawn_blocking
+        // pool): a thread can pull an entry out of the map — capturing its
+        // `mem_size` — just before `flush` zeroes the counter, then run its
+        // `mem_sub` afterwards. A plain `fetch_sub` would wrap to ~`usize::MAX`,
+        // making `ensure_memory` believe the store is permanently full
+        // (rejecting every write under NoEviction, eviction-spinning under LRU)
+        // until restart. Flooring at 0 turns that catastrophe into a harmless,
+        // self-correcting slight undercount.
+        let _ = self
+            .mem_used
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| Some(cur.saturating_sub(n)));
     }
 
     /// Ensure there is room for `needed` bytes. Runs eviction if necessary.
@@ -1679,5 +1692,77 @@ mod tests {
         s.flush();
         assert_eq!(s.hlen("h"), 0);
         assert!(!s.exists("h"));
+    }
+
+    #[test]
+    fn flush_clears_mixed_ttl_keys_and_resets_memory() {
+        // FLUSHDB/FLUSHALL backing: confirm a single flush nukes both
+        // persistent and TTL'd string keys plus hash keys, and zeros the
+        // memory accountant so subsequent writes start from a clean slate.
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        s.set("persistent".into(), b"v1".to_vec(), None);
+        s.set("ttl".into(), b"v2".to_vec(), Some(Duration::from_secs(60)));
+        s.set("ttl_short".into(), b"v3".to_vec(), Some(Duration::from_millis(1)));
+        s.hset("h", "f1", b"hv1".to_vec());
+        s.hset("h", "f2", b"hv2".to_vec());
+        assert!(s.mem_used() > 0);
+        assert_eq!(s.len(), 4); // 3 strings + 1 hash
+
+        s.flush();
+
+        assert_eq!(s.len(), 0);
+        assert_eq!(s.mem_used(), 0);
+        assert!(!s.exists("persistent"));
+        assert!(!s.exists("ttl"));
+        assert!(!s.exists("ttl_short"));
+        assert!(!s.exists("h"));
+        assert_eq!(s.pttl("ttl"), None);
+
+        // Confirm the store is still usable after flush.
+        assert!(s.set("after_flush".into(), b"ok".to_vec(), None));
+        assert_eq!(s.get("after_flush"), Some(b"ok".to_vec()));
+    }
+
+    #[test]
+    fn mem_sub_saturates_and_does_not_underflow_after_flush() {
+        // Regression for the flush/remove race: `flush()` resets `mem_used`
+        // to 0 while another thread may still owe a `mem_sub` for an entry it
+        // pulled from the map just before the flush. With a plain `fetch_sub`
+        // that stale subtraction wraps the unsigned counter to ~usize::MAX,
+        // which permanently wedges `ensure_memory`. Here we reproduce the
+        // outcome deterministically: zero the counter, then apply a stale sub.
+        let s = Store::new(StoreConfig {
+            memory_limit: 0,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        s.set("k".into(), vec![0u8; 1024], None);
+        s.flush(); // mem_used == 0, but the entry's mem_size is still "owed"
+        assert_eq!(s.mem_used(), 0);
+
+        // Simulate the late `mem_sub` from a remove that captured the entry
+        // before flush ran. Must floor at 0, never wrap.
+        s.mem_sub(4096);
+        assert_eq!(s.mem_used(), 0, "mem_sub underflowed instead of saturating");
+
+        // And the store must still accept writes (a wrapped counter would make
+        // ensure_memory reject everything under a non-zero limit).
+        let s2 = Store::new(StoreConfig {
+            memory_limit: 1024 * 1024,
+            eviction_policy: EvictionPolicy::NoEviction,
+            compression: CompressionConfig::default(),
+        });
+        s2.set("a".into(), vec![1u8; 512], None);
+        s2.flush();
+        s2.mem_sub(99_999); // stale over-subtraction
+        assert_eq!(s2.mem_used(), 0);
+        assert!(
+            s2.set("b".into(), vec![2u8; 512], None),
+            "write rejected — counter likely underflowed and wedged ensure_memory"
+        );
     }
 }
