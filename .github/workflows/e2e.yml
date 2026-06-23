@@ -11,6 +11,18 @@ on:
   pull_request:
     branches: [main]
 
+# Serialize E2E across the whole repo. Each E2E job runs a full Kind cluster
+# plus a Rust release build inside ephemerd's shared 16 GB Linux VM; several
+# E2E runs overlapping (different PRs / push-to-main / re-pushes) saturate it
+# and the Kind apiserver gets starved mid-run ("connection reset by peer" ->
+# 30m Tilt timeout). `max-parallel: 1` already serializes the matrix legs
+# within a single run; this group serializes runs against each other so only
+# one E2E run is ever on the box at a time. cancel-in-progress: false because
+# we want queued runs to wait their turn, not be discarded.
+concurrency:
+  group: ephpm-e2e
+  cancel-in-progress: false
+
 jobs:
   e2e:
     name: E2E (PHP ${{ matrix.php }})
