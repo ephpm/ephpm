@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     // Declare php_linked as a known cfg so #[cfg(php_linked)] in this crate
@@ -119,6 +119,16 @@ fn main() {
         println!("cargo::rustc-link-arg=-Wl,--wrap={func}");
     }
 
+    // Architecture-specific musl toolchain paths. The builder image and
+    // entrypoint select the toolchain matching $(uname -m); mirror that here
+    // from cargo's target arch so arm64 hosts (Apple Silicon, Graviton) link
+    // against the aarch64 musl-cross toolchain instead of a hardcoded x86_64
+    // one. uname -m's x86_64/aarch64 tokens match the rust arch tokens and the
+    // musl.cc tarball names, so one substitution covers every path.
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".into());
+    let musl_triple = format!("{target_arch}-linux-musl");
+    let musl_cross_root = PathBuf::from(format!("/opt/{musl_triple}-cross"));
+
     // Force-link libphp.a + the support libs SPC built into the SDK.
     // Workaround: rustc-link-lib emitted from ephpm-php's build.rs
     // doesn't propagate to the final musl-static link in this layout
@@ -138,9 +148,49 @@ fn main() {
     println!("cargo::rustc-link-arg=-Wl,--start-group");
     println!("cargo::rustc-link-arg={}", lib_dir.join("libphp.a").display());
     for static_lib in linux_static_libs() {
+        // stdc++ isn't in the buildroot — it comes from the musl-cross
+        // toolchain. C++-heavy extensions (abseil/grpc) reference a huge
+        // volume of operator new/delete and std::* symbols, so force every
+        // libstdc++ object in with --whole-archive to survive single-pass ld.
+        if *static_lib == "stdc++" {
+            let musl_stdcxx = musl_cross_root.join(&musl_triple).join("lib/libstdc++.a");
+            if musl_stdcxx.exists() {
+                println!("cargo::rustc-link-arg=-Wl,--whole-archive");
+                println!("cargo::rustc-link-arg={}", musl_stdcxx.display());
+                println!("cargo::rustc-link-arg=-Wl,--no-whole-archive");
+            }
+            continue;
+        }
         let archive = lib_dir.join(format!("lib{static_lib}.a"));
         if archive.exists() {
             println!("cargo::rustc-link-arg={}", archive.display());
+        }
+    }
+    // C++-heavy extensions (abseil/grpc) reference libc/libm/libgcc symbols
+    // (wmemcpy, frexp, sigfillset, __udivmodti4, …) from inside the group.
+    // -lc/-lm/-lgcc normally come after --end-group, which single-pass ld
+    // won't revisit, so pull them into the group explicitly.
+    //
+    // Two candidate musl lib roots: spc's own toolchain (/usr/local/musl) and
+    // the musl-cross-make tarball (musl_cross_root). We emit whichever archives
+    // actually exist — only one toolchain is present at build time. libgcc's
+    // version subdir varies by toolchain/arch, so it's discovered, not hardcoded.
+    let musl_lib_roots = [
+        PathBuf::from(format!("/usr/local/musl/{musl_triple}/lib")),
+        musl_cross_root.join(&musl_triple).join("lib"),
+    ];
+    for musl_lib in &musl_lib_roots {
+        for name in ["libc.a", "libm.a"] {
+            let p = musl_lib.join(name);
+            if p.exists() {
+                println!("cargo::rustc-link-arg={}", p.display());
+            }
+        }
+    }
+    if let Some(gcc_lib) = musl_cross_gcc_lib(&musl_cross_root, &musl_triple) {
+        let p = gcc_lib.join("libgcc.a");
+        if p.exists() {
+            println!("cargo::rustc-link-arg={}", p.display());
         }
     }
     println!("cargo::rustc-link-arg=-Wl,--end-group");
@@ -157,7 +207,50 @@ fn linux_static_libs() -> &'static [&'static str] {
         "ssl", "crypto", "curl", "z", "xml2", "xslt", "exslt", "lzma", "sodium", "iconv",
         "charset", "intl", "png16", "gd", "jpeg", "freetype", "onig", "zip", "bz2", "gmp",
         "sqlite3", "pq", "pgcommon", "pgport", "edit", "ncurses", "menu", "form", "panel", "tic",
-        "icui18n", "icuuc", "icudata", "icuio", "icutu", "stdc++",
+        "icui18n", "icuuc", "icudata", "icuio", "icutu",
+        // ImageMagick (imagick extension) + codec chain
+        "MagickWand-7.Q16HDRI", "MagickCore-7.Q16HDRI", "Magick++-7.Q16HDRI",
+        "heif", "de265", "tiff", "webp", "webpdecoder", "webpdemux", "webpmux", "sharpyuv",
+        "aom", "jxl", "jxl_cms", "jxl_threads", "hwy",
+        "brotlienc", "brotlidec", "brotlicommon",
+        // gRPC + protobuf + abseil + upb (grpc extension)
+        "grpc++", "grpc++_alts", "grpc++_error_details", "grpc++_unsecure",
+        "grpc", "grpc_unsecure", "grpc_authorization_provider", "grpc_plugin_support",
+        "gpr", "address_sorting", "cares", "re2",
+        "protobuf", "protobuf-lite",
+        "upb", "upb_base_lib", "upb_hash_lib", "upb_json_lib", "upb_lex_lib",
+        "upb_mem_lib", "upb_message_lib", "upb_mini_descriptor_lib", "upb_mini_table_lib",
+        "upb_reflection_lib", "upb_textformat_lib", "upb_wire_lib",
+        "utf8_range", "utf8_range_lib", "utf8_validity",
+        "absl_base", "absl_city", "absl_civil_time", "absl_cord", "absl_cord_internal",
+        "absl_cordz_functions", "absl_cordz_handle", "absl_cordz_info", "absl_cordz_sample_token",
+        "absl_crc32c", "absl_crc_cord_state", "absl_crc_cpu_detect", "absl_crc_internal",
+        "absl_debugging_internal", "absl_decode_rust_punycode", "absl_demangle_internal",
+        "absl_demangle_rust", "absl_die_if_null", "absl_examine_stack", "absl_exponential_biased",
+        "absl_failure_signal_handler", "absl_flags_commandlineflag",
+        "absl_flags_commandlineflag_internal", "absl_flags_config", "absl_flags_internal",
+        "absl_flags_marshalling", "absl_flags_parse", "absl_flags_private_handle_accessor",
+        "absl_flags_program_name", "absl_flags_reflection", "absl_flags_usage",
+        "absl_flags_usage_internal", "absl_graphcycles_internal", "absl_hash",
+        "absl_hashtablez_sampler", "absl_int128", "absl_kernel_timeout_internal", "absl_leak_check",
+        "absl_log_flags", "absl_log_globals", "absl_log_initialize", "absl_log_internal_check_op",
+        "absl_log_internal_conditions", "absl_log_internal_fnmatch", "absl_log_internal_format",
+        "absl_log_internal_globals", "absl_log_internal_log_sink_set", "absl_log_internal_message",
+        "absl_log_internal_nullguard", "absl_log_internal_proto", "absl_log_internal_structured_proto",
+        "absl_log_severity", "absl_log_sink", "absl_low_level_hash", "absl_malloc_internal",
+        "absl_periodic_sampler", "absl_poison", "absl_random_distributions",
+        "absl_random_internal_distribution_test_util", "absl_random_internal_entropy_pool",
+        "absl_random_internal_platform", "absl_random_internal_randen",
+        "absl_random_internal_randen_hwaes", "absl_random_internal_randen_hwaes_impl",
+        "absl_random_internal_randen_slow", "absl_random_internal_seed_material",
+        "absl_random_seed_gen_exception", "absl_random_seed_sequences", "absl_raw_hash_set",
+        "absl_raw_logging_internal", "absl_scoped_set_env", "absl_spinlock_wait", "absl_stacktrace",
+        "absl_status", "absl_statusor", "absl_str_format_internal", "absl_strerror",
+        "absl_string_view", "absl_strings", "absl_strings_internal", "absl_symbolize",
+        "absl_synchronization", "absl_throw_delegate", "absl_time", "absl_time_zone",
+        "absl_tracing_internal", "absl_utf8_for_code_point", "absl_vlog_config_internal",
+        // libstdc++ last: all C++ libs above reference std::* / __cxa_* symbols
+        "stdc++",
     ]
 }
 
@@ -169,4 +262,23 @@ fn linux_static_libs() -> &'static [&'static str] {
 /// actually needed.
 fn macos_static_libs() -> &'static [&'static str] {
     linux_static_libs()
+}
+
+
+/// Locate the gcc version subdir under `<musl_cross_root>/lib/gcc/<triple>/`.
+///
+/// musl-cross-make toolchains ship exactly one gcc version directory (e.g.
+/// `11.2.1`), but the exact version differs between the x86_64 and aarch64
+/// tarballs, so we discover it at build time instead of hardcoding. If more
+/// than one is present, pick the lexicographically highest.
+fn musl_cross_gcc_lib(musl_cross_root: &Path, musl_triple: &str) -> Option<PathBuf> {
+    let base = musl_cross_root.join("lib/gcc").join(musl_triple);
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(&base)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs.pop()
 }

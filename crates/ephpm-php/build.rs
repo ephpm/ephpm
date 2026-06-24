@@ -59,6 +59,14 @@ fn validate_sdk(lib_dir: &Path, include_dir: &Path, target_os: &str) {
 /// Link libphp and its platform-specific system library dependencies.
 fn link_php(lib_dir: &Path, target_os: &str) {
     println!("cargo::rustc-link-search=native={}", lib_dir.display());
+
+    // For C++ extensions (intl/ICU/imagick), add musl-native libstdc++ search path
+    let musl_cross_lib = std::path::Path::new("/opt/x86_64-linux-musl-cross/x86_64-linux-musl/lib");
+    if musl_cross_lib.exists() {
+        println!("cargo::rustc-link-search=native={}", musl_cross_lib.display());
+        println!("cargo::warning=Added musl-cross libstdc++ path: {}", musl_cross_lib.display());
+    }
+
     if target_os == "windows" {
         // The php-sdk Windows tarball ships a *static* `php8embed.lib`
         // (static-php-cli's `--build-embed` is a static build — a fat lib
