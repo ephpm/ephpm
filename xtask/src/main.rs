@@ -768,6 +768,13 @@ fn e2e(args: &[String]) -> ExitCode {
 
     let k8s_dir = workspace_root().join("k8s");
 
+    // Baseline snapshot before Tilt deploys anything: node capacity/pressure
+    // and control-plane health. If the cluster is already under memory/disk
+    // pressure here, any downstream "connection refused" is contention, not a
+    // readiness-gate race. (ephpm pod doesn't exist yet, so its section is
+    // empty at this phase — that's expected.)
+    dump_cluster_diagnostics("pre-tilt baseline");
+
     eprintln!("==> Running E2E tests (tilt ci, PHP {php_version})...");
     let status = Command::new(find_tool("tilt"))
         .args(["ci"])
@@ -1073,6 +1080,85 @@ fn dump_pod_logs() {
 
     eprintln!("--- recent cluster events ---");
     Command::new(&kubectl).args(["get", "events", "--sort-by=.lastTimestamp", "-A"]).status().ok();
+
+    // Resource/health snapshot at failure time — the decisive bit for telling
+    // node contention apart from a clean readiness race.
+    dump_cluster_diagnostics("failure");
+}
+
+/// Snapshot cluster resource pressure and control-plane / ephpm readiness.
+///
+/// Two failure theories produce identical "connection refused" symptoms but
+/// different state here:
+///   - VM contention: node `MemoryPressure`/`DiskPressure` = True, kube-system
+///     pods with `RESTARTS > 0` (apiserver/etcd thrash), and the ephpm pod
+///     either evicted or `Ready=True` only briefly before a restart.
+///   - Readiness-gate race: node healthy, control plane stable, ephpm pod
+///     `Ready=False` / never transitioned to Ready when the e2e job hit it.
+///
+/// Called as a pre-`tilt ci` baseline and again on failure so the two can be
+/// compared directly in the job log.
+fn dump_cluster_diagnostics(phase: &str) {
+    let kubectl = find_tool("kubectl");
+    eprintln!("==== cluster diagnostics [{phase}] ====");
+
+    // Node allocatable/capacity + the three pressure conditions. A True in
+    // MemoryPressure/DiskPressure is the smoking gun for the contention theory.
+    eprintln!("--- nodes: allocatable + pressure ---");
+    Command::new(&kubectl)
+        .args([
+            "get",
+            "nodes",
+            "-o",
+            "custom-columns=NAME:.metadata.name,\
+MEM_ALLOC:.status.allocatable.memory,\
+MEM_CAP:.status.capacity.memory,\
+MEMPRESSURE:.status.conditions[?(@.type=='MemoryPressure')].status,\
+DISKPRESSURE:.status.conditions[?(@.type=='DiskPressure')].status,\
+PIDPRESSURE:.status.conditions[?(@.type=='PIDPressure')].status,\
+READY:.status.conditions[?(@.type=='Ready')].status",
+        ])
+        .status()
+        .ok();
+
+    // Control-plane churn: any RESTARTS > 0 on apiserver/etcd/scheduler means
+    // the cluster thrashed mid-run (the attempts 1-3 signature).
+    eprintln!("--- kube-system: ready / restarts / last-terminated reason ---");
+    Command::new(&kubectl)
+        .args([
+            "get",
+            "pods",
+            "-n",
+            "kube-system",
+            "-o",
+            "custom-columns=NAME:.metadata.name,\
+READY:.status.containerStatuses[*].ready,\
+RESTARTS:.status.containerStatuses[*].restartCount,\
+LASTREASON:.status.containerStatuses[*].lastState.terminated.reason",
+        ])
+        .status()
+        .ok();
+
+    // ephpm pod: Ready=False with no restarts and the e2e job already firing =>
+    // gate race. Ready=True then RESTARTS>0 / a terminated reason (OOMKilled,
+    // Error) => it came up and was killed => contention.
+    eprintln!("--- ephpm pod: phase / ready+since / restarts / last reason ---");
+    Command::new(&kubectl)
+        .args([
+            "get",
+            "pods",
+            "-l",
+            "app=ephpm",
+            "-o",
+            "custom-columns=NAME:.metadata.name,\
+PHASE:.status.phase,\
+READY:.status.conditions[?(@.type=='Ready')].status,\
+READY_SINCE:.status.conditions[?(@.type=='Ready')].lastTransitionTime,\
+RESTARTS:.status.containerStatuses[*].restartCount,\
+LASTREASON:.status.containerStatuses[*].lastState.terminated.reason",
+        ])
+        .status()
+        .ok();
 }
 
 /// Determine which container engine to use (podman or docker).
