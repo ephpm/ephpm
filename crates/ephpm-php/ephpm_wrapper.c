@@ -683,9 +683,34 @@ void ephpm_request_set_ini(const char *key, const char *value)
  */
 int ephpm_execute_request(const char *filename)
 {
-    /* Reset output and response buffers */
+    /* ---- Per-request lifecycle (php-fpm-style isolation) ----
+     * Tear down the previous request and start a fresh one. Without this,
+     * a single request was reused for the whole life of the thread, so
+     * user functions/classes/constants and the global symbol table leaked
+     * across requests — vanilla WordPress rendered only the first request
+     * per worker thread ($wp_did_header / WP_USE_THEMES persisted).
+     *
+     * php_request_shutdown() runs zend_deactivate() -> shutdown_executor(),
+     * which destroys user symbols, constants, statics, and included_files;
+     * php_request_startup() then provides a clean executor. The signal /
+     * timeout / stack functions that made php_request_startup() crash on
+     * tokio spawn_blocking threads are already no-op'd via --wrap, so this
+     * is safe. OPcache's compiled bytecode lives in SHM and survives the
+     * cycle, so the opcode cache (and JIT buffer) are preserved — this is
+     * exactly the classic php-fpm + opcache model. */
+    if (request_active) {
+        php_request_shutdown(NULL);
+        request_active = 0;
+    }
+
+    /* Reset output and response buffers (thread-local C buffers) */
     output_len = 0;
     headers_buf_len = 0;
+
+    if (php_request_startup() != SUCCESS) {
+        return -1;
+    }
+    request_active = 1;
 
     /* Disable stack size checking */
     EG(max_allowed_stack_size) = 0;
