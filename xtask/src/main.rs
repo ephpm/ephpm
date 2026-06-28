@@ -1084,6 +1084,125 @@ fn dump_pod_logs() {
     // Resource/health snapshot at failure time — the decisive bit for telling
     // node contention apart from a clean readiness race.
     dump_cluster_diagnostics("failure");
+
+    // The two questions that take longest to answer from a raw failure log:
+    // "did the server under test crash (and how)?" and "which tests failed?".
+    // Print both LAST so they're the final, most-visible lines in CI output.
+    dump_pod_exit_status();
+    summarize_failed_tests();
+}
+
+/// Map a process exit code to a fatal signal name, if it encodes one.
+///
+/// A container killed by signal N reports exit code `128 + N`. Surfacing this
+/// turns an opaque `reason: Error` / `exit code 139` into "SIGSEGV — the server
+/// crashed", which is the difference between reading kernel dmesg on the runner
+/// box and reading the CI log.
+fn decode_fatal_signal(exit_code: i64) -> Option<&'static str> {
+    if exit_code <= 128 {
+        return None;
+    }
+    Some(match exit_code - 128 {
+        4 => "SIGILL (illegal instruction)",
+        6 => "SIGABRT (abort / failed assertion)",
+        7 => "SIGBUS (bad memory access)",
+        8 => "SIGFPE (arithmetic error)",
+        9 => "SIGKILL (likely OOM-killed)",
+        11 => "SIGSEGV (segfault)",
+        15 => "SIGTERM",
+        _ => "fatal signal",
+    })
+}
+
+/// Surface the ephpm pod's container exit code / signal for the current and
+/// previous container, and shout if it encodes a crash. Without this a
+/// segfault of the server under test hides behind a generic `reason: Error`
+/// plus a downstream "connection refused" in the e2e job log.
+fn dump_pod_exit_status() {
+    let kubectl = find_tool("kubectl");
+
+    eprintln!("--- ephpm pod: container exit code / signal (current + previous) ---");
+    Command::new(&kubectl)
+        .args([
+            "get",
+            "pods",
+            "-l",
+            "app=ephpm",
+            "-o",
+            "custom-columns=NAME:.metadata.name,\
+RESTARTS:.status.containerStatuses[*].restartCount,\
+CUR_EXIT:.status.containerStatuses[*].state.terminated.exitCode,\
+CUR_SIGNAL:.status.containerStatuses[*].state.terminated.signal,\
+PREV_EXIT:.status.containerStatuses[*].lastState.terminated.exitCode,\
+PREV_SIGNAL:.status.containerStatuses[*].lastState.terminated.signal,\
+PREV_REASON:.status.containerStatuses[*].lastState.terminated.reason",
+        ])
+        .status()
+        .ok();
+
+    // Pull the raw exit codes (current + previous container) and decode each.
+    let out = Command::new(&kubectl)
+        .args([
+            "get",
+            "pods",
+            "-l",
+            "app=ephpm",
+            "-o",
+            "jsonpath={range .items[*].status.containerStatuses[*]}\
+{.state.terminated.exitCode} {.lastState.terminated.exitCode} {end}",
+        ])
+        .output();
+
+    if let Ok(o) = out {
+        let codes = String::from_utf8_lossy(&o.stdout);
+        for tok in codes.split_whitespace() {
+            if let Ok(code) = tok.parse::<i64>() {
+                if let Some(sig) = decode_fatal_signal(code) {
+                    eprintln!(
+                        "!!! ephpm container exited {code} = {sig} — the SERVER UNDER TEST \
+crashed; this is a server bug, not a test/infra flake. Check the 'previous \
+container' logs above for the last output before death."
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Extract and reprint just the failing test lines from the e2e job log so the
+/// reader doesn't have to scroll thousands of lines looking for them.
+fn summarize_failed_tests() {
+    let kubectl = find_tool("kubectl");
+    let out = Command::new(&kubectl).args(["logs", "job/ephpm-e2e", "--tail=5000"]).output();
+    let Ok(o) = out else {
+        return;
+    };
+    let log = String::from_utf8_lossy(&o.stdout);
+
+    let mut fails: Vec<&str> = Vec::new();
+    for line in log.lines() {
+        let trimmed = line.trim();
+        if trimmed.ends_with("... FAILED")
+            || trimmed.starts_with("test result: FAILED")
+            || trimmed.contains("panicked at")
+        {
+            fails.push(trimmed);
+        }
+    }
+
+    if fails.is_empty() {
+        eprintln!(
+            "==== no failing test lines found in e2e job log ====\n\
+(the job may have failed before tests ran — see the logs and crash banner above)"
+        );
+        return;
+    }
+
+    eprintln!("==== FAILED E2E TESTS (extracted from job log) ====");
+    for line in fails {
+        eprintln!("{line}");
+    }
+    eprintln!("==== end failed tests ====");
 }
 
 /// Snapshot cluster resource pressure and control-plane / ephpm readiness.
