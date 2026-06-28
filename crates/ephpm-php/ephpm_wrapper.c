@@ -159,6 +159,11 @@ static EPHPM_TLS size_t req_post_data_len = 0;
 static EPHPM_TLS size_t req_post_data_offset = 0;
 static EPHPM_TLS const char *req_path_translated = NULL;
 
+/* Non-NULL sentinel for SG(server_context). sapi_activate() only parses the
+ * POST body when server_context is set; the value itself is never dereferenced
+ * by our SAPI, so a single shared marker address suffices. */
+static int ephpm_server_context_marker = 0;
+
 /* Server variables */
 
 #define MAX_SERVER_VARS 128
@@ -703,19 +708,30 @@ int ephpm_execute_request(const char *filename)
         request_active = 0;
     }
 
-    /* Reset output and response buffers (thread-local C buffers) */
+    /* Reset output and response buffers (thread-local C buffers). The
+     * C-side POST read cursor resets too, so our read_post callback serves
+     * the request body from the start. */
     output_len = 0;
     headers_buf_len = 0;
+    req_post_data_offset = 0;
 
-    if (php_request_startup() != SUCCESS) {
-        return -1;
-    }
-    request_active = 1;
-
-    /* Disable stack size checking */
-    EG(max_allowed_stack_size) = 0;
-
-    /* Update SAPI request info for this HTTP request */
+    /* Populate SG(request_info) BEFORE php_request_startup().
+     *
+     * PHP builds the superglobals ($_GET/$_POST/$_SERVER/$_COOKIE/$_FILES/
+     * $_REQUEST) during request startup and auto-globals creation, using our
+     * installed SAPI callbacks (treat_data, read_post, read_cookies,
+     * register_server_variables). Those callbacks read these request_info
+     * fields, so the fields must be set first.
+     *
+     * The old single-request reuse model could NOT call php_request_startup()
+     * per request, so it set request_info afterwards and hand-rebuilt the
+     * superglobals. Now that the per-request lifecycle calls
+     * php_request_startup() every request (above), that manual rebuild became
+     * actively harmful: it destroyed the PG(http_globals) arrays startup had
+     * just created and re-ran sapi_module.treat_data over them, which faulted
+     * inside php_default_treat_data (use-after-free → SIGSEGV) on tokio
+     * spawn_blocking threads under load. Letting php_request_startup() own
+     * superglobal construction is the correct, crash-free php-fpm model. */
     SG(request_info).request_method = (char *)req_method;
     SG(request_info).request_uri = (char *)req_uri;
     SG(request_info).query_string = (char *)req_query_string;
@@ -725,148 +741,36 @@ int ephpm_execute_request(const char *filename)
     SG(request_info).path_translated = (char *)req_path_translated;
     SG(request_info).proto_num = 1001; /* HTTP/1.1 */
 
-    /* Reset per-request SAPI state */
-    SG(headers_sent) = 0;
-    SG(request_info).no_headers = 0;
-    SG(sapi_headers).http_response_code = 200;
-    req_post_data_offset = 0;
+    /* sapi_activate() (run inside php_request_startup) only reads and parses
+     * the POST body into $_POST when SG(server_context) is non-NULL — that is
+     * the gate cli_server/cgi use to distinguish a real request from CLI. Our
+     * SAPI callbacks key off the thread-local request buffers rather than this
+     * pointer, so a stable non-NULL sentinel is all that's needed to enable
+     * native POST parsing. Without it $_POST stays empty (php://input still
+     * works because read_post is driven separately). */
+    SG(server_context) = &ephpm_server_context_marker;
 
-    /* Reset POST reading state so PHP re-reads body data.
-     * -1 means "not yet read"; PHP will call our read_post callback.
-     * Also close the request_body stream so php://input reads fresh. */
-    SG(read_post_bytes) = -1;
-    if (SG(request_info).request_body) {
-        php_stream_close(SG(request_info).request_body);
-        SG(request_info).request_body = NULL;
+    if (php_request_startup() != SUCCESS) {
+        return -1;
     }
+    request_active = 1;
 
-    /* Destroy old superglobal arrays so they don't carry stale data.
-     * PG(http_globals) holds zvals for $_GET, $_POST, $_SERVER, etc. */
-    for (int i = 0; i < NUM_TRACK_VARS; i++) {
-        if (Z_TYPE(PG(http_globals)[i]) != IS_UNDEF) {
-            zval_ptr_dtor(&PG(http_globals)[i]);
-            ZVAL_UNDEF(&PG(http_globals)[i]);
-        }
-    }
-
-    /* Clear the response header list from the previous request */
-    zend_llist_clean(&SG(sapi_headers).headers);
-
-    /* Rebuild superglobals by manually creating fresh arrays and
-     * populating them. We can't call php_hash_environment() because
-     * it depends on internal state set up by php_request_startup().
-     *
-     * $_SERVER — populated via our register_server_variables callback */
-    zval server_vars_zv;
-    array_init(&server_vars_zv);
-    ephpm_sapi_register_server_variables(&server_vars_zv);
-    zend_hash_update(&EG(symbol_table),
-        zend_string_init("_SERVER", sizeof("_SERVER") - 1, 0),
-        &server_vars_zv);
-    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_SERVER], &server_vars_zv);
-
-    /* $_GET — parse from query string */
-    zval get_vars;
-    array_init(&get_vars);
-    if (req_query_string && *req_query_string) {
-        /* Use PHP's query string parser */
-        char *qs_copy = estrdup(req_query_string);
-        sapi_module.treat_data(PARSE_STRING, qs_copy, &get_vars);
-        /* treat_data frees qs_copy */
-    }
-    zend_hash_update(&EG(symbol_table),
-        zend_string_init("_GET", sizeof("_GET") - 1, 0),
-        &get_vars);
-    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_GET], &get_vars);
-
-    /* Pre-read POST data so php://input and multipart parsing work.
-     * sapi_read_post_data() calls our read_post callback and creates
-     * the request_body stream. Must happen before sapi_handle_post(). */
-    if (req_post_data && req_post_data_len > 0) {
-#if PHP_VERSION_ID >= 80400
-        sapi_read_post_data();
-#else
-        ephpm_sapi_read_post_data_compat();
-#endif
-    }
-
-    /* $_POST + $_FILES — use PHP's built-in POST handler.
-     * For multipart/form-data, this invokes rfc1867 parsing which
-     * populates both $_POST and $_FILES. For url-encoded, it populates
-     * $_POST. For other content types, both stay empty. */
-    zval post_vars;
-    array_init(&post_vars);
-    zval files_vars;
-    array_init(&files_vars);
-    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_POST], &post_vars);
-    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_FILES], &files_vars);
-    if (req_post_data && req_post_data_len > 0 && req_content_type) {
-        sapi_handle_post(&PG(http_globals)[TRACK_VARS_POST]);
-        /* sapi_handle_post may have populated FILES directly */
-        zval_ptr_dtor(&files_vars);
-        ZVAL_COPY(&files_vars, &PG(http_globals)[TRACK_VARS_FILES]);
-        /* Re-read POST from http_globals in case handler replaced it */
-        zval_ptr_dtor(&post_vars);
-        ZVAL_COPY(&post_vars, &PG(http_globals)[TRACK_VARS_POST]);
-    }
-    zend_hash_update(&EG(symbol_table),
-        zend_string_init("_POST", sizeof("_POST") - 1, 0),
-        &post_vars);
-    ZVAL_COPY_VALUE(&PG(http_globals)[TRACK_VARS_POST], &post_vars);
-
-    /* $_COOKIE — parse from cookie header.
-     * Cookies are "key=value" pairs separated by "; ".
-     * We parse manually since treat_data(PARSE_COOKIE) requires
-     * internal SAPI state that isn't set up in our reuse model. */
-    zval cookie_vars;
-    array_init(&cookie_vars);
-    if (req_cookie_data && *req_cookie_data) {
-        char *cookie_copy = estrdup(req_cookie_data);
-        char *saveptr = NULL;
-        char *pair = strtok_r(cookie_copy, ";", &saveptr);
-        while (pair) {
-            /* Skip leading whitespace */
-            while (*pair == ' ') pair++;
-            char *eq = strchr(pair, '=');
-            if (eq) {
-                *eq = '\0';
-                char *val = eq + 1;
-                /* Trim trailing whitespace from value */
-                size_t vlen = strlen(val);
-                while (vlen > 0 && val[vlen - 1] == ' ') vlen--;
-                php_register_variable_safe(pair, val, vlen, &cookie_vars);
-            }
-            pair = strtok_r(NULL, ";", &saveptr);
-        }
-        efree(cookie_copy);
-    }
-    zend_hash_update(&EG(symbol_table),
-        zend_string_init("_COOKIE", sizeof("_COOKIE") - 1, 0),
-        &cookie_vars);
-    ZVAL_COPY(&PG(http_globals)[TRACK_VARS_COOKIE], &cookie_vars);
-
-    /* $_FILES — populated by sapi_handle_post() for multipart requests */
-    zend_hash_update(&EG(symbol_table),
-        zend_string_init("_FILES", sizeof("_FILES") - 1, 0),
-        &files_vars);
-    ZVAL_COPY_VALUE(&PG(http_globals)[TRACK_VARS_FILES], &files_vars);
-
-    /* $_REQUEST — merge of $_GET + $_POST + $_COOKIE per request_order */
-    zval request_vars;
-    array_init(&request_vars);
-    zend_hash_copy(Z_ARRVAL(request_vars), Z_ARRVAL(get_vars), zval_add_ref);
-    zend_hash_copy(Z_ARRVAL(request_vars), Z_ARRVAL(post_vars), zval_add_ref);
-    zend_hash_copy(Z_ARRVAL(request_vars), Z_ARRVAL(cookie_vars), zval_add_ref);
-    zend_hash_update(&EG(symbol_table),
-        zend_string_init("_REQUEST", sizeof("_REQUEST") - 1, 0),
-        &request_vars);
-
-    /* Re-disable stack checking (request startup may reset it) */
+    /* tokio spawn_blocking threads have small stacks; request startup may
+     * reset this guard, so clear it afterwards. */
     EG(max_allowed_stack_size) = 0;
 
+    /* Reset per-request response status. php_request_startup()/sapi_activate()
+     * does NOT reset SG(sapi_headers).http_response_code on this embed reuse
+     * path, so without this an explicit status from a prior request on the
+     * same worker thread (e.g. http_response_code(201), or a 500 from a fatal)
+     * leaks into the next request and a 200-expecting handler returns the
+     * stale code. headers_sent / no_headers are reset for the same reason. */
+    SG(sapi_headers).http_response_code = 200;
+    SG(headers_sent) = 0;
+    SG(request_info).no_headers = 0;
+
     /* Reset PHP's last-error tracking so we can tell whether THIS script
-     * raised a fatal (vs. a stale value carried over from a prior reuse
-     * of the embed request). */
+     * raised a fatal (vs. a value carried over from a prior request). */
     PG(last_error_type) = 0;
 
     /* Execute the script with bailout protection.
