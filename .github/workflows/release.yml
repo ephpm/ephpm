@@ -429,3 +429,7 @@ jobs:
         with:
           files: release/*
           generate_release_notes: true
+          # SemVer pre-release tags carry a "-" (e.g. v0.1.0-rc.1, v0.2.0-beta.2).
+          # Mark them prerelease so GitHub does not promote them to "Latest"
+          # and demote the actual stable release in the Releases UI.
+          prerelease: ${{ contains(github.ref_name, '-') }}

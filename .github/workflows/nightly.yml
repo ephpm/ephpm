@@ -88,6 +88,14 @@ jobs:
     runs-on: [self-hosted, macos, arm64]
     strategy:
       fail-fast: false
+      # Cap at 2 to leave headroom on the Apple Silicon host. The same Mac
+      # also dispatches linux-aarch64 builds (via the embedded Linux VM),
+      # and ephemerd's per-host max_concurrent=4 was getting saturated when
+      # all 3 macos + 3 linux-aarch64 jobs hit at once -- the runner agent
+      # was reaped mid-build (observed: PHP 8.4 macos-aarch64 dying with no
+      # log activity after `actions/checkout`). 2 macos + ~2 linux-aarch64
+      # fits comfortably under the cap.
+      max-parallel: 2
       matrix:
         php: ["8.3", "8.4", "8.5"]
     steps:

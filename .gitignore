@@ -32,3 +32,10 @@ target/
 # OS
 .DS_Store
 Thumbs.db
+
+# Session-local debugging scratch (logs, run-id files, crash dumps).
+# Repo-root only -- crates with their own tmp_/ stay tracked.
+/tmp_*
+
+# Downloaded release artifact directories (gh run download / extracted tarballs).
+/ephpm-v*-*/
