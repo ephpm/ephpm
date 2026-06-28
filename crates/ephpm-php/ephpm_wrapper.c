@@ -175,8 +175,50 @@ static EPHPM_TLS struct {
 
 static EPHPM_TLS int server_var_count = 0;
 
+/* Per-request INI overrides (e.g. open_basedir for vhost isolation).
+ *
+ * These must be (re)applied AFTER php_request_startup() on every request:
+ * php_request_shutdown() runs zend_ini_deactivate(), which restores every
+ * entry modified during the request to its original value, so an override
+ * applied before the per-request shutdown/startup cycle is wiped before the
+ * script runs. We buffer the key/value pairs here (owning copies, since the
+ * caller frees its strings once ephpm_request_set_ini returns) and replay
+ * them inside ephpm_execute_request once the fresh request is live. */
+#define MAX_REQUEST_INI 16
+
+static EPHPM_TLS char *request_ini_keys[MAX_REQUEST_INI];
+static EPHPM_TLS char *request_ini_vals[MAX_REQUEST_INI];
+static EPHPM_TLS size_t request_ini_count = 0;
+
 /* Track whether a PHP request is currently active on this thread */
 static EPHPM_TLS int request_active = 0;
+
+/* Duplicate a C string with plain malloc (must outlive the Zend per-request
+ * allocator, so estrdup is unsuitable). Returns NULL on OOM or NULL input. */
+static char *ephpm_strdup_malloc(const char *s)
+{
+    if (!s) {
+        return NULL;
+    }
+    size_t n = strlen(s) + 1;
+    char *p = (char *)malloc(n);
+    if (p) {
+        memcpy(p, s, n);
+    }
+    return p;
+}
+
+/* Release all buffered per-request INI overrides. */
+static void ephpm_request_ini_reset(void)
+{
+    for (size_t i = 0; i < request_ini_count; i++) {
+        free(request_ini_keys[i]);
+        free(request_ini_vals[i]);
+        request_ini_keys[i] = NULL;
+        request_ini_vals[i] = NULL;
+    }
+    request_ini_count = 0;
+}
 
 /* ===================================================================
  * SAPI Callbacks
@@ -655,15 +697,28 @@ void ephpm_request_add_server_var(const char *key, const char *value)
  * STAGE_ACTIVATE — the bucket PHP itself uses during request_startup —
  * skips the tightening check, which is the behavior we want here.
  *
+ * Buffer the override rather than applying it now: ephpm_execute_request()
+ * tears down the active request (php_request_shutdown -> zend_ini_deactivate)
+ * before starting a fresh one, which would immediately undo an entry applied
+ * here. The buffered entries are replayed once the new request is live.
+ *
  * Call before ephpm_execute_request().
  */
 void ephpm_request_set_ini(const char *key, const char *value)
 {
-    zend_string *zkey = zend_string_init(key, strlen(key), 0);
-    zend_string *zval = zend_string_init(value, strlen(value), 0);
-    zend_alter_ini_entry(zkey, zval, PHP_INI_SYSTEM, PHP_INI_STAGE_ACTIVATE);
-    zend_string_release(zval);
-    zend_string_release(zkey);
+    if (request_ini_count >= MAX_REQUEST_INI) {
+        return;
+    }
+    char *kd = ephpm_strdup_malloc(key);
+    char *vd = ephpm_strdup_malloc(value);
+    if (!kd || !vd) {
+        free(kd);
+        free(vd);
+        return;
+    }
+    request_ini_keys[request_ini_count] = kd;
+    request_ini_vals[request_ini_count] = vd;
+    request_ini_count++;
 }
 
 /*
@@ -769,6 +824,21 @@ int ephpm_execute_request(const char *filename)
     SG(headers_sent) = 0;
     SG(request_info).no_headers = 0;
 
+    /* Replay per-request INI overrides now that the fresh request is live.
+     * Applied at STAGE_ACTIVATE (the bucket request_startup itself uses), so
+     * open_basedir for vhost isolation takes effect for this request without
+     * tripping the runtime "can only tighten" check, and is restored by the
+     * next request's php_request_shutdown(). */
+    for (size_t i = 0; i < request_ini_count; i++) {
+        zend_string *zkey = zend_string_init(request_ini_keys[i],
+                                             strlen(request_ini_keys[i]), 0);
+        zend_string *zval = zend_string_init(request_ini_vals[i],
+                                             strlen(request_ini_vals[i]), 0);
+        zend_alter_ini_entry(zkey, zval, PHP_INI_SYSTEM, PHP_INI_STAGE_ACTIVATE);
+        zend_string_release(zval);
+        zend_string_release(zkey);
+    }
+
     /* Reset PHP's last-error tracking so we can tell whether THIS script
      * raised a fatal (vs. a value carried over from a prior request). */
     PG(last_error_type) = 0;
@@ -827,9 +897,12 @@ int ephpm_execute_request(const char *filename)
         response_status_code = 500;
     }
 
-    /* Note: we do NOT call php_request_shutdown here.
-     * We reuse the single embed request for all HTTP requests.
-     * php_embed_shutdown() handles final cleanup at process exit. */
+    /* Release this request's buffered INI overrides; they have already been
+     * applied to the live request above and must not leak into the next one
+     * (which buffers its own set before calling back in). The request itself
+     * is torn down lazily at the top of the next ephpm_execute_request(), or
+     * by php_embed_shutdown() at process exit. */
+    ephpm_request_ini_reset();
 
     return result;
 }
