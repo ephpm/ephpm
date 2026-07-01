@@ -158,8 +158,10 @@ pub struct TimeoutsConfig {
     #[serde(default = "default_header_read")]
     pub header_read: u64,
 
-    /// Idle connection timeout in seconds. Connections with no activity
-    /// for this duration are closed.
+    /// Idle connection timeout in seconds. Connections with no read or
+    /// write activity for this duration are shut down gracefully.
+    ///
+    /// Set to `0` to disable the idle timeout.
     ///
     /// Default: 60 seconds.
     #[serde(default = "default_idle")]
@@ -787,9 +789,10 @@ pub struct DbBackendConfig {
     #[serde(default)]
     pub listen: Option<String>,
 
-    /// Unix socket path for the proxy listener (faster than TCP for local PHP).
-    ///
-    /// When set, the proxy also listens on this socket in addition to `listen`.
+    /// Planned: not yet implemented. Unix socket path for the proxy listener
+    /// (faster than TCP for local PHP). Currently parsed but not acted upon —
+    /// only the TCP `listen` address is active, and a warning is logged at
+    /// startup when this is set.
     #[serde(default)]
     pub socket: Option<std::path::PathBuf>,
 
@@ -1021,9 +1024,10 @@ pub struct KvConfig {
     /// the derived password into PHP `$_ENV` as `EPHPM_REDIS_PASSWORD` for
     /// each request.
     ///
-    /// If absent, a random secret is generated on first boot and persisted in
-    /// the data directory. In single-site (no `sites_dir`) mode, AUTH is not
-    /// required.
+    /// If unset, per-site RESP AUTH is disabled: in multi-tenant (`sites_dir`)
+    /// deployments with the RESP listener enabled, any client that can reach
+    /// the listener can access the default store (a warning is logged at
+    /// startup). In single-site (no `sites_dir`) mode, AUTH is not required.
     ///
     /// Default: `None`.
     #[serde(default)]
@@ -1122,10 +1126,15 @@ pub struct PhpConfig {
     #[serde(default)]
     pub ini_overrides: Vec<[String; 2]>,
 
-    /// Number of dedicated PHP worker threads.
+    /// Maximum number of threads that may execute PHP concurrently.
     ///
-    /// Each worker runs in its own OS thread with PHP TLS initialized,
-    /// allowing true concurrent PHP request execution.
+    /// Caps tokio's blocking-thread pool, which is where PHP requests run —
+    /// each thread registers its own isolated PHP (TSRM) context on first
+    /// use. Note the pool is shared with other blocking work (e.g. file
+    /// I/O), so this is an upper bound on PHP concurrency, not a dedicated
+    /// worker count.
+    ///
+    /// Set to `0` to keep tokio's default pool size (no cap).
     ///
     /// Default: logical CPU count, capped at 16.
     #[serde(default = "default_php_workers")]

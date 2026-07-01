@@ -1,6 +1,7 @@
 pub mod acme;
 pub mod body;
 pub mod file_cache;
+mod idle;
 pub mod metrics;
 pub mod rate_limit;
 pub mod router;
@@ -113,7 +114,6 @@ struct Listeners {
     tls_mode: TlsMode,
     redirect_http: bool,
     conn: ConnSettings,
-    idle_timeout: Duration,
     shutdown_timeout: Duration,
     router: Arc<Router>,
     limiter: Option<Arc<rate_limit::Limiter>>,
@@ -127,6 +127,9 @@ struct Listeners {
 struct ConnSettings {
     header_read_timeout: Duration,
     max_header_size: usize,
+    /// Close connections with no read/write activity for this long.
+    /// Zero disables the idle watchdog.
+    idle_timeout: Duration,
 }
 
 /// Parse config, build TLS, and bind all listeners.
@@ -150,8 +153,8 @@ async fn bind_listeners(
     let conn = ConnSettings {
         header_read_timeout: Duration::from_secs(config.server.timeouts.header_read),
         max_header_size: config.server.request.max_header_size,
+        idle_timeout: Duration::from_secs(config.server.timeouts.idle),
     };
-    let idle_timeout = Duration::from_secs(config.server.timeouts.idle);
     let file_cache = if config.server.file_cache.enabled {
         tracing::info!(
             max_entries = config.server.file_cache.max_entries,
@@ -259,7 +262,6 @@ async fn bind_listeners(
         tls_mode,
         redirect_http,
         conn,
-        idle_timeout,
         shutdown_timeout,
         router,
         limiter,
@@ -276,7 +278,6 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         tls_mode,
         redirect_http,
         conn,
-        idle_timeout: _idle_timeout,
         shutdown_timeout,
         router,
         limiter,
@@ -451,7 +452,7 @@ fn dispatch_main_connection(
             tokio::spawn(async move {
                 let _guard = guard;
                 let _flight = flight_guard;
-                serve_connection(TokioIo::new(stream), router, remote_addr, false, conn).await;
+                serve_connection(stream, router, remote_addr, false, conn).await;
             });
         }
     }
@@ -517,7 +518,7 @@ async fn serve_manual_tls(
             }
         };
 
-    serve_connection(TokioIo::new(tls_stream), router, remote_addr, true, settings).await;
+    serve_connection(tls_stream, router, remote_addr, true, settings).await;
 }
 
 /// Handle an ACME-aware TLS connection using `LazyConfigAcceptor`.
@@ -565,7 +566,7 @@ async fn serve_acme_tls(
 
     match handshake.into_stream(default_config).await {
         Ok(tls_stream) => {
-            serve_connection(TokioIo::new(tls_stream), router, remote_addr, true, settings).await;
+            serve_connection(tls_stream, router, remote_addr, true, settings).await;
         }
         Err(err) => {
             tracing::debug!(%remote_addr, %err, "TLS handshake failed");
@@ -589,8 +590,14 @@ fn hyper_max_buf_size(configured: usize) -> usize {
 /// ALPN protocol agreed during the TLS handshake. Plain (non-TLS) connections
 /// always use HTTP/1.1, since h2c (HTTP/2 cleartext) is not supported by
 /// browsers.
+///
+/// When `settings.idle_timeout` is non-zero, the stream is wrapped in an
+/// activity-tracking adapter and the connection future is raced against an
+/// idle watchdog: after a full quiet window with no bytes read or written,
+/// hyper's graceful shutdown is triggered so in-flight requests finish and
+/// idle keep-alive connections close immediately.
 async fn serve_connection<I>(
-    io: TokioIo<I>,
+    stream: I,
     router: Arc<Router>,
     remote_addr: SocketAddr,
     is_tls: bool,
@@ -603,6 +610,9 @@ async fn serve_connection<I>(
         async move { router.handle(req, remote_addr, is_tls).await }
     });
 
+    let tracker = idle::ActivityTracker::new();
+    let io = TokioIo::new(idle::IdleIo::new(stream, tracker.clone()));
+
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
         .http1()
@@ -611,7 +621,27 @@ async fn serve_connection<I>(
         .max_buf_size(hyper_max_buf_size(settings.max_header_size))
         .timer(hyper_util::rt::TokioTimer::new());
 
-    if let Err(err) = builder.serve_connection_with_upgrades(io, service).await {
+    let conn = builder.serve_connection_with_upgrades(io, service);
+    let mut conn = std::pin::pin!(conn);
+
+    let result = if settings.idle_timeout.is_zero() {
+        conn.await
+    } else {
+        tokio::select! {
+            result = conn.as_mut() => result,
+            () = tracker.idle_expired(settings.idle_timeout) => {
+                tracing::debug!(
+                    %remote_addr,
+                    idle_secs = settings.idle_timeout.as_secs(),
+                    "closing idle connection"
+                );
+                conn.as_mut().graceful_shutdown();
+                conn.await
+            }
+        }
+    };
+
+    if let Err(err) = result {
         // Downcast to hyper::Error to suppress noisy "connection closed before
         // message was completed" errors (clients disconnecting mid-request).
         let is_incomplete =
@@ -722,6 +752,18 @@ fn start_kv_service(
         ..Default::default()
     };
 
+    // Multi-tenant mode with the RESP listener enabled but no master secret:
+    // per-site AUTH cannot be derived, so every tenant (and anything else that
+    // can reach the listener) talks to the shared default store unauthenticated.
+    if config.server.sites_dir.is_some() && secret.is_none() {
+        tracing::warn!(
+            "[kv].secret is not set while server.sites_dir (multi-tenant mode) and \
+             kv.redis_compat are enabled — per-site RESP AUTH is disabled and any \
+             client that can reach the RESP listener can access the default store; \
+             set [kv].secret to enable per-site authentication"
+        );
+    }
+
     // Build multi-tenant store for HMAC auth if secret + sites_dir are both set.
     let multi_tenant = if secret.is_some() && config.server.sites_dir.is_some() {
         Some(ephpm_kv::multi_tenant::MultiTenantStore::new(
@@ -755,6 +797,15 @@ async fn start_db_proxies(
     if let Some(mysql_config) = &config.db.mysql {
         let url = mysql_config.url.clone();
         let listen = mysql_config.listen.clone().unwrap_or_else(|| "127.0.0.1:3306".to_string());
+
+        if let Some(socket) = &mysql_config.socket {
+            tracing::warn!(
+                socket = %socket.display(),
+                listen = %listen,
+                "[db.mysql].socket is configured but Unix socket listeners are not \
+                 yet supported — only the TCP listener is active"
+            );
+        }
 
         let pool_config = ephpm_db::pool::PoolConfig {
             min_connections: mysql_config.min_connections,
@@ -808,6 +859,15 @@ async fn start_db_proxies(
     if let Some(pg_config) = &config.db.postgres {
         let url = pg_config.url.clone();
         let listen = pg_config.listen.clone().unwrap_or_else(|| "127.0.0.1:5432".to_string());
+
+        if let Some(socket) = &pg_config.socket {
+            tracing::warn!(
+                socket = %socket.display(),
+                listen = %listen,
+                "[db.postgres].socket is configured but Unix socket listeners are not \
+                 yet supported — only the TCP listener is active"
+            );
+        }
 
         let pool_config = ephpm_db::pool::PoolConfig {
             min_connections: pg_config.min_connections,
@@ -1174,5 +1234,123 @@ mod lib_tests {
         let config = make_sqlite_config("replica");
         assert!(is_clustered_sqlite(&config, false));
         assert!(is_clustered_sqlite(&config, true));
+    }
+
+    // ── idle timeout ────────────────────────────────────────────────────────
+
+    /// Minimal router serving `dir` with a static-only fallback (no PHP).
+    fn idle_test_router(dir: &std::path::Path) -> Arc<Router> {
+        let config = ephpm_config::Config {
+            server: ephpm_config::ServerConfig {
+                document_root: dir.to_path_buf(),
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ephpm_config::ServerConfig::default()
+            },
+            php: ephpm_config::PhpConfig::default(),
+            db: ephpm_config::DbConfig::default(),
+            kv: ephpm_config::KvConfig::default(),
+            cluster: ephpm_config::ClusterConfig::default(),
+        };
+        let store = ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default());
+        Arc::new(Router::new(&config, store, None, None, None))
+    }
+
+    /// Bind a listener and serve exactly one connection with `settings`.
+    async fn spawn_one_shot_server(settings: ConnSettings) -> SocketAddr {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let router = idle_test_router(dir.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            // Keep the docroot alive for the connection's lifetime.
+            let _dir = dir;
+            let (stream, remote) = listener.accept().await.expect("accept");
+            serve_connection(stream, router, remote, false, settings).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_closes_silent_connection() {
+        use tokio::io::AsyncReadExt as _;
+
+        let addr = spawn_one_shot_server(ConnSettings {
+            header_read_timeout: Duration::from_secs(30),
+            max_header_size: 8192,
+            idle_timeout: Duration::from_secs(1),
+        })
+        .await;
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        let mut buf = [0u8; 32];
+        // Send nothing — the server must close the connection shortly after
+        // the 1s idle window (well before the 30s header-read timeout).
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("server did not close idle connection within 5s")
+            .expect("read after server-side close");
+        assert_eq!(n, 0, "expected EOF from server-side close");
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_closes_keep_alive_connection_after_response() {
+        use tokio::io::AsyncReadExt as _;
+
+        let addr = spawn_one_shot_server(ConnSettings {
+            header_read_timeout: Duration::from_secs(30),
+            max_header_size: 8192,
+            idle_timeout: Duration::from_secs(1),
+        })
+        .await;
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        client
+            .write_all(b"GET /missing.txt HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write request");
+
+        // Read the response, then keep the connection open and silent — the
+        // idle watchdog must re-arm after activity and close it afterwards.
+        let mut saw_response = false;
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+                .await
+                .expect("server did not respond/close within 5s")
+                .expect("read");
+            if n == 0 {
+                break;
+            }
+            saw_response = true;
+        }
+        assert!(saw_response, "expected an HTTP response before the idle close");
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_zero_disables_watchdog() {
+        use tokio::io::AsyncReadExt as _;
+
+        let addr = spawn_one_shot_server(ConnSettings {
+            header_read_timeout: Duration::from_secs(30),
+            max_header_size: 8192,
+            idle_timeout: Duration::ZERO,
+        })
+        .await;
+
+        let mut client = TcpStream::connect(addr).await.expect("connect");
+        // Stay silent past what would be a small idle window, then confirm
+        // the connection still works.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        client
+            .write_all(b"GET /missing.txt HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("write request");
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+            .await
+            .expect("no response within 5s")
+            .expect("read response");
+        assert!(n > 0, "expected response bytes on a still-open connection");
+        assert!(buf.starts_with(b"HTTP/1.1"), "expected an HTTP/1.1 response line");
     }
 }
