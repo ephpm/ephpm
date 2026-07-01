@@ -80,7 +80,7 @@ For contributors or custom builds. Requires Rust 1.85+.
 ```bash
 # Stub mode (no PHP, fast iteration on HTTP/routing logic)
 cargo build
-cargo run -- --config ephpm.toml
+cargo run -- serve --config ephpm.toml
 
 # Release binary with PHP embedded
 # Prerequisites: git, curl, tar, build-essential, pkg-config, libclang-dev, musl-tools (Linux only)
@@ -134,11 +134,15 @@ ePHPm gives you three database strategies. PHP apps keep their existing `pdo_mys
 
 ### 1. Already have a database? Use the built-in proxy
 
-If you have a MySQL server, ePHPm's DB proxy sits between PHP and your database with connection pooling, read/write splitting, and health checks. PHP connects to `localhost:3306` — the proxy handles the rest. PostgreSQL proxy support is planned but not yet implemented.
+If you have a MySQL or PostgreSQL server, ePHPm's DB proxy sits between PHP and your database with connection pooling, read/write splitting, and health checks. PHP connects to `localhost:3306` (or `localhost:5432` for Postgres) — the proxy handles the rest. The PostgreSQL proxy supports trust, md5, and SCRAM-SHA-256 authentication. SQL Server (TDS) proxying is not implemented.
 
 ```toml
 [db.mysql]
 url = "mysql://user:pass@db-server:3306/myapp"
+
+# or PostgreSQL
+[db.postgres]
+url = "postgres://user:pass@db-server:5432/myapp"
 ```
 
 ### 2. Small site? Use embedded SQLite
@@ -183,7 +187,7 @@ PHP (pdo_mysql) → litewire (MySQL wire :3306) → SQL Translator → SQLite ba
 
 In single-node mode, the backend is `rusqlite` (in-process, zero overhead). In clustered mode, it switches to an HTTP client talking to the local sqld instance. Either way, PHP sees a MySQL server at `127.0.0.1:3306`.
 
-See [docs/architecture/sql.md](docs/architecture/sql.md) for the full architecture, failover details, and configuration reference.
+See the [database architecture docs](site/content/architecture/database/_index.md) for the full architecture, failover details, and configuration reference.
 
 ## KV Store: Three Ways to Use It, Zero External Services
 
@@ -191,7 +195,7 @@ ePHPm ships a `DashMap`-backed in-process key-value store with TTLs, atomic coun
 
 ### 1. Already use phpredis / predis? Speak RESP
 
-The KV store speaks Redis RESP2 on `127.0.0.1:6379`. Existing PHP code using `phpredis`, `predis`, or any other Redis client connects unchanged. Commands implemented: `GET` / `SET` / `SETEX` / `SETNX` / `MGET` / `MSET` / `INCR` / `DECR` / `INCRBY` / `DECRBY` / `APPEND` / `STRLEN` / `GETSET` / `DEL` / `EXISTS` / `EXPIRE` / `PEXPIRE` / `TTL` / `PTTL` / `PERSIST` / `TYPE` / `RENAME` / `KEYS` / `DBSIZE` / `HSET` / `HGET` / `HDEL` / `HGETALL` / `HKEYS` / `HVALS` / `HLEN` / `HEXISTS` / `AUTH` / `PING` / `ECHO` / `INFO`.
+The KV store speaks Redis RESP2 on `127.0.0.1:6379`. Existing PHP code using `phpredis`, `predis`, or any other Redis client connects unchanged. Commands implemented: `GET` / `SET` / `SETEX` / `SETNX` / `MGET` / `MSET` / `INCR` / `DECR` / `INCRBY` / `DECRBY` / `APPEND` / `STRLEN` / `GETSET` / `DEL` / `EXISTS` / `EXPIRE` / `PEXPIRE` / `TTL` / `PTTL` / `PERSIST` / `TYPE` / `RENAME` / `KEYS` / `DBSIZE` / `FLUSHDB` / `FLUSHALL` / `HSET` / `HGET` / `HDEL` / `HGETALL` / `HKEYS` / `HVALS` / `HLEN` / `HEXISTS` / `AUTH` / `PING` / `ECHO` / `INFO`.
 
 ```toml
 [kv]
@@ -216,7 +220,7 @@ ephpm_kv_expire('session:abc', 1800);
 ephpm_kv_del('cart:42');
 ```
 
-Available: `ephpm_kv_get`, `set`, `del`, `exists`, `incr`, `decr`, `incr_by`, `expire`, `ttl`, `pttl`. These are the recommended API for multi-tenant deployments — the RESP listener has no per-tenant namespace filtering, so leave it disabled and let PHP go through the SAPI bridge.
+Available: `ephpm_kv_get`, `set`, `setnx`, `del`, `exists`, `incr`, `decr`, `incr_by`, `expire`, `ttl`, `pttl`, `flush_all`. These are the recommended API for multi-tenant deployments — the RESP listener has no per-tenant namespace filtering, so leave it disabled and let PHP go through the SAPI bridge.
 
 ### 3. Need HA? Use the clustered KV tier
 
@@ -289,7 +293,7 @@ slow_query_threshold = "500ms"
 
 Point Grafana, Datadog, or any Prometheus-compatible tool at `http://your-ephpm:8080/metrics` to chart query latency, throughput, error rates, and identify slow queries — no APM agent or database plugin needed.
 
-See [docs/architecture/query-stats.md](docs/architecture/query-stats.md) for the full design.
+See [site/content/architecture/query-stats.md](site/content/architecture/query-stats.md) for the full design.
 
 ## Virtual Hosts: Multi-Tenant Hosting
 
@@ -319,7 +323,7 @@ sites_dir = "/var/www/sites"           # vhost directory
 - **No per-site config needed:** sites inherit global PHP settings, timeouts, and security rules
 - **Shared thread pool:** all sites share tokio's `spawn_blocking` pool — 20 blogs don't need 20x the memory
 
-A $3.69/mo Hetzner VM (2 ARM cores, 4 GB RAM) comfortably runs 20 WordPress blogs at ~$0.18/site. See [docs/architecture/vhosts.md](docs/architecture/vhosts.md) and [docs/architecture/hosting.md](docs/architecture/hosting.md) for full details.
+A $3.69/mo Hetzner VM (2 ARM cores, 4 GB RAM) comfortably runs 20 WordPress blogs at ~$0.18/site. See [site/content/guides/virtual-hosts.md](site/content/guides/virtual-hosts.md) and [site/content/roadmap/hosting.md](site/content/roadmap/hosting.md) for full details.
 
 ## Project Structure
 
@@ -351,7 +355,7 @@ Key design decisions:
 - **cargo-deny** — `cargo install cargo-deny --locked`
 - **WSL + Ubuntu** (Windows only) — needed for `cargo xtask release` (see Quick Start above)
 
-See [docs/developer/getting-started.md](docs/developer/getting-started.md) for detailed setup instructions including per-platform Rust installation.
+See [site/content/developer/getting-started.md](site/content/developer/getting-started.md) for detailed setup instructions including per-platform Rust installation.
 
 ### Workflow
 
@@ -387,7 +391,7 @@ cargo xtask e2e-down    # Tear down Kind cluster
 
 On Windows, `release` re-invokes itself inside WSL (cross-compiling to musl from native Windows isn't supported). `php-sdk` is a plain tarball download and works directly on any platform with curl + tar. The PHP SDK is cached at `php-sdk/<version>-<os>-<arch>/` — delete that directory to force a re-download.
 
-E2E commands require Podman or Docker. Run `cargo xtask e2e-install` to download kind/tilt/kubectl to `./bin/` — no global install needed. See [docs/developer/testing.md](docs/developer/testing.md) for details.
+E2E commands require Podman or Docker. Run `cargo xtask e2e-install` to download kind/tilt/kubectl to `./bin/` — no global install needed. See [site/content/developer/testing.md](site/content/developer/testing.md) for details.
 
 ### Code conventions
 

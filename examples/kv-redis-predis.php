@@ -9,8 +9,9 @@
  * Install Predis:
  *   composer require predis/predis
  *
- * Note: ePHPm's KV store currently supports strings, counters, and TTL.
- * It does NOT yet support hashes, lists, sets, or transactions.
+ * Note: ePHPm's KV store currently supports strings, counters, hashes
+ * (HSET/HGET/HDEL/HGETALL/HKEYS/HVALS/HLEN/HEXISTS), and TTL.
+ * It does NOT yet support lists, sets, or transactions.
  */
 
 require_once __DIR__ . '/../vendor/autoload.php';

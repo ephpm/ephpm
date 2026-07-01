@@ -50,7 +50,7 @@ The embedded PHP interpreter is the **same** runtime that serves HTTP requests. 
 
 ## Windows note
 
-The first call extracts `php8embed.dll` from the binary into a temp directory before invoking PHP. The DLL is removed when the command exits. This is invisible — there's nothing to install.
+On Windows, PHP is statically linked into `ephpm.exe` (`php8embed.lib`, static CRT) — no DLL is embedded, extracted, or written to disk at runtime. There's nothing to install; `ephpm php` works out of the box.
 
 ## See also
 

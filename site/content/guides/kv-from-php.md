@@ -23,13 +23,14 @@ ephpm_kv_exists("greeting");                   // 1
 ephpm_kv_del("greeting");                      // 1
 ephpm_kv_exists("greeting");                   // 0
 
-// Counters
-ephpm_kv_incr("page:views", 1);                // 1
-ephpm_kv_incr("page:views", 5);                // 6
+// Counters — ephpm_kv_incr takes exactly one argument and always adds 1;
+// use ephpm_kv_incr_by for arbitrary deltas
+ephpm_kv_incr("page:views");                   // 1
+ephpm_kv_incr_by("page:views", 5);             // 6
 
-// TTL (in milliseconds)
+// TTL (in seconds)
 ephpm_kv_set("session:abc", "data");
-ephpm_kv_expire("session:abc", 60_000);        // 60 seconds
+ephpm_kv_expire("session:abc", 60);            // 60 seconds
 ephpm_kv_pttl("session:abc");                  // ~60000
 // returns -1 if no expiry, -2 if missing
 ```
@@ -69,9 +70,10 @@ $count = $redis->incr('page:views');
 |-------|----------|
 | Strings | `GET`, `SET`, `SETEX`, `MGET`, `MSET`, `SETNX`, `INCR`, `DECR`, `INCRBY`, `DECRBY`, `APPEND`, `STRLEN`, `GETSET` |
 | Keys | `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `PERSIST`, `TTL`, `PTTL`, `TYPE`, `KEYS`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `RENAME` |
+| Hashes | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HEXISTS` |
 | Connection | `PING`, `ECHO`, `SELECT`, `QUIT`, `COMMAND`, `INFO`, `AUTH` |
 
-Not implemented: hashes, lists, sets, transactions, `SCAN`, pub/sub. ePHPm targets the cache + counter + session use case — if you need full Redis, run actual Redis.
+Not implemented: lists, sets, transactions, `SCAN`, pub/sub. ePHPm targets the cache + counter + session use case — if you need full Redis, run actual Redis.
 
 ### Multi-tenant note
 
@@ -115,7 +117,7 @@ $cached = ephpm_kv_get($key);
 if ($cached === null) {
     $cached = expensive_lookup($id);
     ephpm_kv_set($key, json_encode($cached));
-    ephpm_kv_expire($key, 5 * 60 * 1000);   // 5 minutes
+    ephpm_kv_expire($key, 300);             // 5 minutes (seconds)
 }
 return json_decode($cached, true);
 ```
@@ -124,9 +126,9 @@ return json_decode($cached, true);
 
 ```php
 $key   = "ratelimit:{$ip}";
-$count = ephpm_kv_incr($key, 1);
+$count = ephpm_kv_incr($key);
 if ($count === 1) {
-    ephpm_kv_expire($key, 60_000);          // first request opens a 60s window
+    ephpm_kv_expire($key, 60);              // first request opens a 60s window
 }
 return $count <= $max_per_minute;
 ```
@@ -135,7 +137,7 @@ return $count <= $max_per_minute;
 
 ```php
 ephpm_kv_set("session:{$id}", json_encode($data));
-ephpm_kv_expire("session:{$id}", 3600 * 1000);  // 1 hour
+ephpm_kv_expire("session:{$id}", 3600);         // 1 hour (seconds)
 ```
 
 ## Configuration

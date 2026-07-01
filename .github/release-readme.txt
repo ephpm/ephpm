@@ -38,6 +38,7 @@ If you'd rather not install anything:
 Tag scheme:
   ephpm/ephpm:<release>-php<phpver>   pinned ePHPm release × pinned PHP patch
   ephpm/ephpm:<release>-php<minor>    pinned ePHPm release × rolling PHP minor
+  ephpm/ephpm:<release>               pinned ePHPm release × default PHP minor
   ephpm/ephpm:<minor>                 rolling latest release × rolling PHP minor
   ephpm/ephpm:latest                  rolling latest release, default PHP minor
 

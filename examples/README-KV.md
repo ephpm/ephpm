@@ -11,26 +11,34 @@ Use the native `ephpm_kv_*` PHP functions for the fastest, most direct access. N
 
 ### Example: `kv-sapi-basic.php`
 
+The `ephpm_kv_*` functions only exist inside ePHPm's embedded PHP — a standalone `php` CLI won't have them. Run the script through ePHPm:
+
 ```bash
-# Build with KV store enabled
+# Build with PHP embedded
 cargo xtask release
 
-# Run the server (with KV store)
-./target/release/ephpm
+# Option A: run the script with ePHPm's embedded PHP CLI
+./target/release/ephpm php examples/kv-sapi-basic.php
 
-# In another terminal, run the example
-php examples/kv-sapi-basic.php
+# Option B: serve the examples directory and request the script over HTTP
+./target/release/ephpm dev --document-root examples
+curl http://localhost:8080/kv-sapi-basic.php
 ```
 
 **API:**
 
-- `ephpm_kv_set(key, value)` — Store a value
 - `ephpm_kv_get(key)` — Retrieve a value (returns `null` if missing)
+- `ephpm_kv_set(key, value[, ttl_seconds])` — Store a value, with an optional TTL in seconds
+- `ephpm_kv_setnx(key, value[, ttl_seconds])` — Store a value only if the key doesn't already exist
 - `ephpm_kv_del(key)` — Delete a key (returns 1 if found, 0 if not)
 - `ephpm_kv_exists(key)` — Check if key exists (returns 1 or 0)
-- `ephpm_kv_incr(key, delta)` — Increment a numeric value
-- `ephpm_kv_expire(key, ttl_ms)` — Set TTL in milliseconds
+- `ephpm_kv_incr(key)` — Increment a numeric value by 1
+- `ephpm_kv_decr(key)` — Decrement a numeric value by 1
+- `ephpm_kv_incr_by(key, delta)` — Increment a numeric value by an arbitrary delta (negative to decrement)
+- `ephpm_kv_expire(key, ttl_seconds)` — Set TTL in seconds
+- `ephpm_kv_ttl(key)` — Get remaining TTL in seconds (-1 = no expiry, -2 = missing)
 - `ephpm_kv_pttl(key)` — Get remaining TTL in milliseconds (-1 = no expiry, -2 = missing)
+- `ephpm_kv_flush_all()` — Delete all keys
 
 **Pros:**
 - Zero-copy, direct access to embedded store
@@ -48,15 +56,25 @@ Connect to the embedded KV store using any Redis client. The store speaks the Re
 
 ### Example: `kv-redis-predis.php`
 
+The RESP listener is **off by default**. Enable it in your config first:
+
+```toml
+# ephpm.toml
+[kv.redis_compat]
+enabled = true
+listen = "127.0.0.1:6379"
+```
+
 ```bash
 # Install Predis
 composer require predis/predis
 
-# Build and run the server
+# Build and run the server with the RESP listener enabled
 cargo xtask release
-./target/release/ephpm
+./target/release/ephpm serve --config ephpm.toml
 
-# In another terminal, run the example
+# In another terminal, run the example (any PHP CLI works —
+# this example talks to the store over TCP, not via SAPI functions)
 php examples/kv-redis-predis.php
 ```
 
@@ -72,12 +90,13 @@ php examples/kv-redis-predis.php
 | Group | Commands |
 |-------|----------|
 | **Strings** | GET, SET, SETEX, MGET, MSET, SETNX, INCR, DECR, INCRBY, DECRBY, APPEND, STRLEN, GETSET |
+| **Hashes** | HSET, HGET, HDEL, HGETALL, HKEYS, HVALS, HLEN, HEXISTS |
 | **Keys** | DEL, EXISTS, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL, TYPE, KEYS, DBSIZE, FLUSHDB, FLUSHALL, RENAME |
-| **Connection** | PING, ECHO, SELECT, QUIT, COMMAND, INFO |
+| **Connection** | PING, ECHO, SELECT, QUIT, COMMAND, INFO, AUTH |
 
 **Not Yet Implemented:**
 
-Hashes, Lists, Sets, Transactions, SCAN — these would require architectural changes (multi-type store, per-connection state). If you need complex data structures, use a real Redis server. For ePHPm's use case (session caching, counters), strings with TTL cover 99% of patterns.
+Lists, Sets, Sorted Sets, Transactions (MULTI/EXEC), Pub/Sub, SCAN — these would require architectural changes (multi-type store, per-connection state). If you need those data structures, use a real Redis server. For ePHPm's use case (session caching, counters, hashes), the commands above cover 99% of patterns.
 
 ## Configuration
 
@@ -85,28 +104,27 @@ The KV store is configured in `ephpm.toml`:
 
 ```toml
 [kv]
-# Enable the KV store (default: true)
-enabled = true
+# Maximum memory for the store (default: "256MB")
+memory_limit = "256MB"
 
-# Listen address for Redis protocol
-listen = "127.0.0.1:6379"
-
-# Max input buffer per connection (protects against huge payloads)
-max_input_buffer = 67108864  # 64 MiB
-
-# Store settings
-[kv.store]
-# Memory limit (0 = unlimited)
-max_memory = 0
-
-# Eviction policy: "noeviction", "allkeys-lru", "volatile-lru", etc.
+# Eviction policy when the memory limit is reached (default: "allkeys-lru")
+# Values: "noeviction", "allkeys-lru", "volatile-lru", "allkeys-random"
 eviction_policy = "allkeys-lru"
 
-# Approximate memory check interval (milliseconds)
-memory_check_interval = 1000
+# Transparent per-value compression (default: "none")
+# Values: "none", "gzip", "brotli", "zstd"
+compression = "none"
+compression_level = 6         # 1 = fastest, 9 = best compression
+compression_min_size = 1024   # values smaller than this stay uncompressed
 
-# Expiry scan interval (cleanup expired keys)
-expiry_check_interval = 100
+# Secret used to derive per-site RESP passwords in multi-tenant mode (optional)
+# secret = "..."
+
+# Redis-compatible RESP protocol listener (disabled by default)
+[kv.redis_compat]
+enabled = false
+listen = "127.0.0.1:6379"
+# password = "..."
 ```
 
 ## When to Use Each
@@ -146,7 +164,7 @@ $cached = ephpm_kv_get("cache:user:$id");
 if ($cached === null) {
     $cached = expensive_function($id);
     ephpm_kv_set("cache:user:$id", $cached);
-    ephpm_kv_expire("cache:user:$id", 5 * 60 * 1000); // 5 minutes
+    ephpm_kv_expire("cache:user:$id", 300); // 5 minutes
 }
 ```
 
@@ -164,9 +182,9 @@ if ($cached === null) {
 **SAPI:**
 ```php
 $key = "ratelimit:$user_id";
-$count = ephpm_kv_incr($key, 1);
+$count = ephpm_kv_incr($key);
 if ($count === 1) {
-    ephpm_kv_expire($key, 60 * 1000); // 1 minute window
+    ephpm_kv_expire($key, 60); // 1 minute window
 }
 return $count <= $max_requests;
 ```
@@ -186,7 +204,7 @@ return $count <= $max_requests;
 **SAPI:**
 ```php
 ephpm_kv_set("session:$id", json_encode($data));
-ephpm_kv_expire("session:$id", 3600 * 1000); // 1 hour
+ephpm_kv_expire("session:$id", 3600); // 1 hour
 ```
 
 **Redis:**
@@ -259,11 +277,11 @@ ephpm kv --host 10.0.1.5 --port 6379 ping
 ephpm kv --host redis.example.com --port 6380 keys "*"
 ```
 
-See [docs/architecture/cli.md](../docs/architecture/cli.md) for full CLI documentation.
+See [the `ephpm kv` CLI reference](../site/content/reference/cli/kv.md) for full CLI documentation.
 
 ## See Also
 
-- [Architecture docs](../docs/architecture/db-proxy.md)
+- [KV store architecture](../site/content/architecture/kv-store.md)
 - [KV store integration tests](../crates/ephpm/tests/kv_sapi_integration.rs)
 - [Predis documentation](https://github.com/predis/predis)
 - [Redis command reference](https://redis.io/commands)

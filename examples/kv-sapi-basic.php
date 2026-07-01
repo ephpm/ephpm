@@ -44,15 +44,15 @@ echo "Deleted $deleted keys\n";
 ephpm_kv_set('page:views', '0');
 
 // Increment by 1
-$views = ephpm_kv_incr('page:views', 1);
+$views = ephpm_kv_incr('page:views');
 echo "Page views: $views\n";
 
 // Increment by 5
-$views = ephpm_kv_incr('page:views', 5);
+$views = ephpm_kv_incr_by('page:views', 5);
 echo "Page views: $views\n";
 
 // Decrement (use negative delta)
-$views = ephpm_kv_incr('page:views', -2);
+$views = ephpm_kv_incr_by('page:views', -2);
 echo "Page views: $views\n";
 
 // ── TTL (Expiration) ────────────────────────────────────────────────────────
@@ -60,8 +60,8 @@ echo "Page views: $views\n";
 // Set a temporary value (e.g., session data)
 ephpm_kv_set('session:abc123', 'user_data_here');
 
-// Expire in 30 minutes (30 * 60 * 1000 milliseconds)
-ephpm_kv_expire('session:abc123', 30 * 60 * 1000);
+// Expire in 30 minutes (30 * 60 seconds)
+ephpm_kv_expire('session:abc123', 30 * 60);
 
 // Check remaining TTL
 $ttl_ms = ephpm_kv_pttl('session:abc123');
@@ -86,7 +86,7 @@ function get_expensive_data($id) {
 
     // Store in cache for 5 minutes
     ephpm_kv_set($cache_key, $data);
-    ephpm_kv_expire($cache_key, 5 * 60 * 1000);
+    ephpm_kv_expire($cache_key, 5 * 60);
 
     return $data;
 }
@@ -100,9 +100,14 @@ echo get_expensive_data(43) . "\n";
 
 echo "\nAvailable KV SAPI functions:\n";
 echo "  ephpm_kv_get(key) -> string|null\n";
-echo "  ephpm_kv_set(key, value) -> void\n";
+echo "  ephpm_kv_set(key, value[, ttl_seconds]) -> bool\n";
+echo "  ephpm_kv_setnx(key, value[, ttl_seconds]) -> bool (true if set, false if key existed)\n";
 echo "  ephpm_kv_del(key) -> int (1 if deleted, 0 if not found)\n";
 echo "  ephpm_kv_exists(key) -> int (1 or 0)\n";
-echo "  ephpm_kv_incr(key, delta) -> int\n";
-echo "  ephpm_kv_expire(key, ttl_ms) -> int (1 if key exists, 0 if not)\n";
+echo "  ephpm_kv_incr(key) -> int (increment by 1)\n";
+echo "  ephpm_kv_decr(key) -> int (decrement by 1)\n";
+echo "  ephpm_kv_incr_by(key, delta) -> int\n";
+echo "  ephpm_kv_expire(key, ttl_seconds) -> int (1 if key exists, 0 if not)\n";
+echo "  ephpm_kv_ttl(key) -> int (seconds left, -1 if no expiry, -2 if missing)\n";
 echo "  ephpm_kv_pttl(key) -> int (milliseconds left, -1 if no expiry, -2 if missing)\n";
+echo "  ephpm_kv_flush_all() -> bool (delete all keys)\n";

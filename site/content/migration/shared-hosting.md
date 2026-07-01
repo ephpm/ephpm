@@ -39,9 +39,12 @@ SSH into your new server and download ePHPm:
 ```bash
 ssh root@your-server-ip
 
-# Download ePHPm
-curl -fSL https://github.com/ephpm/ephpm/releases/latest/download/ephpm-linux-x86_64 -o /usr/local/bin/ephpm
-chmod +x /usr/local/bin/ephpm
+# Download ePHPm — grab the tarball for your platform from
+# https://github.com/ephpm/ephpm/releases
+# Assets are named ephpm-vX.Y.Z+phpA.B.C-<os>-<arch>.tar.gz
+curl -fSLO "https://github.com/ephpm/ephpm/releases/download/vX.Y.Z/ephpm-vX.Y.Z+phpA.B.C-linux-x86_64.tar.gz"
+tar -xzf ephpm-*.tar.gz
+install -m 755 ephpm /usr/local/bin/ephpm
 ```
 
 ### 3. Copy Your Website Files
@@ -109,7 +112,7 @@ url = "mysql://root:password@127.0.0.1:3306/mysite"
 # /etc/ephpm/ephpm.toml
 
 [server]
-listen = "0.0.0.0:8080"
+listen = "0.0.0.0:80"                # HTTP — 301-redirects to HTTPS
 document_root = "/var/www/html"
 
 [php]
@@ -117,8 +120,10 @@ memory_limit = "256M"
 max_execution_time = 120
 
 [server.tls]
-acme_domains = ["yourdomain.com", "www.yourdomain.com"]
-acme_email = "you@yourdomain.com"
+listen = "0.0.0.0:443"               # HTTPS listener
+domains = ["yourdomain.com", "www.yourdomain.com"]
+email = "you@yourdomain.com"
+redirect_http = true
 ```
 
 ### 6. Point Your Domain
@@ -138,9 +143,9 @@ www.yourdomain.com  A    → your-vps-ip
 ### 7. Start ePHPm
 
 ```bash
-# Smoke-test in the foreground
+# Smoke-test in the foreground (port 80 redirects to HTTPS)
 ephpm serve --config /etc/ephpm/ephpm.toml &
-curl http://localhost:8080
+curl -I http://localhost/          # expect a 301 to https://
 kill %1
 
 # Install as a system service (registers + starts it)

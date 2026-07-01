@@ -157,7 +157,7 @@ location ^~ /vendor/ { deny all; }
 
 ```toml
 [server.security]
-blocked_paths = ["vendor/*"]
+blocked_paths = ["/vendor/*"]   # patterns match the URI path, which always starts with "/"
 ```
 
 **PHP execution restriction:**
@@ -227,8 +227,8 @@ server {
 
 ```toml
 [server.tls]
-acme_domains = ["example.com"]
-acme_email = "you@example.com"
+domains = ["example.com"]
+email = "you@example.com"
 ```
 
 Or with existing certificates:

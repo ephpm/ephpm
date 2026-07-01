@@ -51,10 +51,15 @@ through the same `effective_store()` path the `ephpm_kv_*` functions use, so
 `session:abc123` on `bob.example.com`. No prefixing, no collision risk, no
 config.
 
-In **clustered mode** (`[cluster] enabled = true`) the KV store is replicated
-across all nodes via the gossip layer, so a session created on node A is
-readable from nodes B, C, D within gossip convergence time. Sticky sessions
-become unnecessary: any node can serve any request.
+In **clustered mode** (`[cluster] enabled = true`) sessions use the same
+two-tier KV path as everything else — with the same caveats. Session blobs
+at or under `cluster.kv.small_key_threshold` (default 512 bytes) ride the
+gossip layer and replicate to **every** node, so a session created on node A
+is readable from nodes B, C, D within gossip convergence time. Larger session
+blobs are placed on a **single** consistent-hash owner node: other nodes can
+fetch them remotely (so requests can still route anywhere), but they are not
+replicated — if the owner node dies, those sessions die with it. See
+[Cluster](#cluster) below.
 
 ## TTL behaviour
 
@@ -101,28 +106,43 @@ objects.
 
 ## Cluster
 
-No configuration beyond enabling `[cluster]`. Session writes are replicated
-through the same two-tier gossip path as every other KV mutation. On node
-loss the surviving nodes already have the data; the load balancer is free to
-route the next request anywhere.
+No configuration beyond enabling `[cluster]` — but be honest with yourself
+about what the two-tier KV path gives you:
 
-Convergence is best-effort gossip (~10–30s for full-mesh convergence under
-default chitchat timings), so a session created on node A *can* be invisible
-to node B for a brief window if the user's request races ahead of the gossip
-fan-out. In practice this only matters for sub-second redirects against
-brand-new sessions; for any normal browsing flow the gap is invisible.
+- **Small session blobs** (≤ `cluster.kv.small_key_threshold`, default 512
+  bytes) gossip to every node. These survive node loss — the surviving nodes
+  already have the data, and the load balancer is free to route the next
+  request anywhere.
+- **Larger session blobs** live only on their single consistent-hash owner
+  node. Any node can *read* them (remote fetch from the owner), so routing
+  is still unrestricted — but there is no replication. Losing the owner node
+  loses every large session it owned.
+
+If sessions must survive node failure, keep `$_SESSION` small — a user id
+and a handful of flags serialise comfortably under 512 bytes. Shopping-cart
+sized payloads belong in the database, with the session holding just the key.
+
+Convergence for the gossip tier is best-effort (~10–30s for full-mesh
+convergence under default chitchat timings), so a session created on node A
+*can* be invisible to node B for a brief window if the user's request races
+ahead of the gossip fan-out. In practice this only matters for sub-second
+redirects against brand-new sessions; for any normal browsing flow the gap
+is invisible.
 
 ## Limitations
 
 - **Memory eviction.** The KV store has a configurable `memory_limit` and an
-  eviction policy. The default `noeviction` will fail writes when full —
-  sessions included — which is the right behaviour for correctness. If you
-  switch the policy to `allkeys-lru` for caching, sessions can be evicted
-  before their TTL fires. Use `volatile-lru` for session-heavy workloads
-  (evicts only keys that have a TTL set, which sessions always do).
+  eviction policy, and the default policy is `allkeys-lru` — which means
+  sessions **can be evicted before their TTL fires** whenever the store is
+  under memory pressure. A busy cache workload sharing the store can silently
+  log users out. If session loss is unacceptable, give the store a generous
+  `memory_limit`, and consider switching the policy to `noeviction` (writes
+  fail when full instead of silently dropping data) or `volatile-lru`, sized
+  so eviction stays rare.
 - **No persistence across `ephpm` restarts** (yet). The KV store is in-memory
-  only. Clustered deployments survive single-node restarts because gossip
-  re-syncs the store; restarting every node simultaneously wipes all
+  only. In clustered deployments, sessions small enough for the gossip tier
+  are re-synced to a restarted node by its peers; large sessions owned by the
+  restarted node are gone. Restarting every node simultaneously wipes all
   sessions. AOF/snapshot persistence is on the roadmap.
 - **No cross-cluster replication.** Sessions live in the same KV tier as
   the rest of your data; if you have geographically split clusters you'll

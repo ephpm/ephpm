@@ -11,21 +11,21 @@ This document describes the full vision for ePHPm. The matrix below tracks what 
 | Feature | Status | Notes |
 |---------|--------|-------|
 | HTTP/1.1 | **Implemented** | hyper server, async accept loop |
-| HTTP/2 | Planned | Dependency present, no code yet |
+| HTTP/2 | **Implemented** | Negotiated over TLS via ALPN (`h2` + `http/1.1`); plain TCP listeners are HTTP/1.1 only |
 | TLS / ACME | **Implemented** | `rustls` + `rustls-acme` in `ephpm-server` |
 | PHP embedding (ZTS) | **Implemented** | Full SAPI, concurrent via `spawn_blocking` + per-thread TSRM |
 | PHP embedding (NTS / Windows) | **Implemented** | Serialized execution; Windows DLL constraints prevent ZTS |
 | Static file serving | **Implemented** | MIME detection, path traversal protection |
 | Request routing | **Implemented** | `.php` → PHP, pretty permalinks → `index.php`, else static |
 | Configuration | **Implemented** | Figment — TOML + `EPHPM_` env var overrides |
-| CLI | Partial | `--config` flag only; no subcommands yet |
-| Graceful shutdown | Partial | Stops accepting; does not drain in-flight connections |
+| CLI | **Implemented** | Full subcommand set: `serve`, `dev`, `php`, `kv`, `install`/`uninstall`/`start`/`stop`/`restart`/`status`/`logs` |
+| Graceful shutdown | **Implemented** | Stops accepting, then drains in-flight connections up to `server.timeouts.shutdown` |
 | Signal handling | Partial | Ctrl+C only; no SIGHUP reload |
 | Observability — logging | **Implemented** | `tracing` crate, structured logs, request lifecycle events |
 | Observability — query stats | **Implemented** | `ephpm-query-stats`: SQL normalization, digest tracking, slow query log, Prometheus metrics |
 | Observability — OTLP export | Planned | Auto-instrumentation pipeline — not started |
 | DB proxy (MySQL) | **Implemented** | Wire protocol, connection pooling, transparent forwarding to upstream MySQL |
-| DB proxy (PostgreSQL) | Planned | Placeholder only |
+| DB proxy (PostgreSQL) | **Implemented** | Wire protocol, connection pooling, trust/md5/SCRAM auth, R/W splitting |
 | Read/write splitting | **Implemented** | `ephpm-db` routes reads to replicas, writes to primary |
 | Single-node SQLite | **Implemented** | `litewire` + `rusqlite` in-process; `pdo_mysql` clients connect transparently |
 | Clustered SQLite | **Implemented** | `litewire` + embedded `sqld` sidecar; WAL frame replication via gRPC |
@@ -277,12 +277,12 @@ password = "changeme"                 # admin UI auth (separate from node API au
 | Concurrent hashmap (KV store) | `dashmap` |
 | KV value compression | `flate2` (gzip), `zstd`, `brotli` |
 | Cluster membership | `chitchat` (Quickwit's SWIM gossip lib) |
-| Consistent hashing | `hashring` |
+| KV key ownership | Custom — `hash(key)` modulo the sorted alive-node list, in `ephpm-cluster` (no external crate) |
 | MySQL/SQLite wire bridge | [`litewire`](https://github.com/ephpm/litewire) (path dep) — MySQL wire protocol → SQLite translation, query parsing via `sqlparser-rs` |
 | Embedded SQLite (single-node) | `rusqlite` (linked into `litewire`'s in-process backend) |
 | Embedded SQLite (clustered HA) | [`sqld`](https://github.com/tursodatabase/libsql) v0.24.32 — binary embedded via `include_bytes!()`, spawned per role, gRPC WAL frame replication |
 | MySQL upstream connection pooling | Custom pool in `ephpm-db` (R/W splitting, health checks) |
-| PostgreSQL protocol | Placeholder — wire protocol planned |
+| PostgreSQL protocol | Implemented in `ephpm-db` — wire protocol frontend, connection pooling, trust/md5/SCRAM auth, R/W splitting |
 | Query observability | Custom in `ephpm-query-stats` (digest tracker, normalizer state machine, slow-query log, Prometheus export) |
 | Prometheus metrics | `prometheus` crate |
 | OTLP receiver/exporter | `opentelemetry-otlp`, `opentelemetry-sdk` (planned) |
@@ -309,13 +309,12 @@ password = "changeme"                 # admin UI auth (separate from node API au
 - Approximate memory tracking (via `mem_used()`)
 - INFO command with basic server and memory stats
 - Thread-local get buffer for safe C FFI result passing
+- Eviction policies — `noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-random` — enforced against `memory_limit` with approximate memory accounting
 - **Clustering** — gossip-based peer discovery (`chitchat`), consistent hash ring, cross-node replication, owner / replica routing for keys (in `ephpm-cluster`)
 
 **Planned / Not Yet Implemented:**
 - Additional data structures (lists, sets, sorted sets) — currently strings + hashes only
 - Persistence (AOF / snapshots)
-- Eviction policies (LRU, random)
-- Memory limit enforcement
 
 ---
 
@@ -463,40 +462,28 @@ bind = "0.0.0.0:7946"
 join = ["10.0.1.2:7946", "10.0.1.3:7946"]  # seed nodes
 ```
 
-#### 2. Consistent hash ring
+#### 2. Key ownership (hash modulo node list)
 
-Keys are distributed across nodes using a consistent hash ring. When a node joins or leaves, only ~1/N of keys need to be rebalanced (not all of them).
+Each large-tier key has exactly one owner node. Ownership is computed by hashing the key and indexing into the **sorted list of alive nodes** (see `crates/ephpm-cluster/src/clustered_store.rs`):
 
 ```
-            ┌───────────────────────┐
-            │    Hash Ring          │
-            │                       │
-            │   0x0000 ──► Node A   │
-            │   0x5556 ──► Node B   │
-            │   0xAAAB ──► Node C   │
-            │                       │
-            │   Key "session:abc"   │
-            │   hash = 0x3A21       │
-            │   → owned by Node A   │
-            └───────────────────────┘
+owner = alive_nodes_sorted[ hash(key) % alive_nodes_sorted.len() ]
 ```
 
-Each node uses virtual nodes (vnodes) for even distribution — e.g., 150 vnodes per physical node. The `hashring` crate handles this.
+There is no consistent hash ring, no virtual nodes, and no `hashring` dependency. The trade-off: when membership changes (a node joins, leaves, or dies), ownership remaps **broadly** — most keys change owner, not the ~1/N a consistent hash ring would give. For ePHPm's cache-oriented workload (values that can be refetched or recomputed) this is acceptable; a consistent-hashing scheme may replace it later if remapping cost becomes a problem.
 
 ```rust
-use hashring::HashRing;
-
 struct ClusterRouter {
-    ring: RwLock<HashRing<NodeId>>,
+    alive_nodes: RwLock<Vec<NodeId>>,   // sorted; updated from gossip membership
     local_node: NodeId,
     peers: DashMap<NodeId, PeerConnection>,
 }
 
 impl ClusterRouter {
-    /// Route a key to the correct node
+    /// Route a key to its owner node
     fn owner(&self, key: &[u8]) -> NodeId {
-        let ring = self.ring.read();
-        ring.get(key).cloned().unwrap()
+        let nodes = self.alive_nodes.read();
+        nodes[(hash(key) as usize) % nodes.len()].clone()
     }
 
     /// Get a value — local fast path or network hop
@@ -516,38 +503,26 @@ impl ClusterRouter {
 
 #### 3. Replication
 
-Writes go to the owner node and N replicas (the next N nodes clockwise on the ring). This provides fault tolerance — if a node dies, its replicas can serve reads immediately.
+Replication behaves differently for the two value tiers:
 
-```
-Write "session:abc" = "data"
-       │
-       ▼
-   hash(key) → Node A (owner)
-       │
-       ├──► write locally
-       ├──► replicate to Node B (replica 1)
-       └──► replicate to Node C (replica 2)
-```
+- **Small values** (≤ `[cluster.kv] small_key_threshold`, default 512 bytes) are replicated to **every node** via the gossip protocol. Each node holds a local copy; convergence is eventually consistent, typically within hundreds of milliseconds.
+- **Large values** live on **exactly one node** — the owner selected by `hash(key) % nodes`. There are no replica copies today. If the owner dies, its large values are gone and must be regenerated — fine for cache data, not for anything you can't recompute.
 
-Replication can be:
-- **Synchronous** — write waits for N replicas to confirm (stronger consistency, higher latency)
-- **Asynchronous** — write returns after local write, replicas updated in background (lower latency, eventual consistency)
-
-For sessions and cache data, async replication with read-your-writes consistency is the right default. PHP apps doing `$_SESSION['cart'] = ...` on one request and reading it on the next will hit the same node (session affinity via consistent hashing on session ID), so they get strong consistency for free.
+The `[cluster.kv]` keys `replication_factor` and `replication_mode` are **parsed but not implemented** — setting them has no effect. Multi-copy replication of large values (with sync/async write modes) is a planned feature.
 
 ```toml
 [cluster.kv]
-replication_factor = 2        # copies on 2 additional nodes
-replication_mode = "async"    # or "sync"
+replication_factor = 2        # parsed but NOT implemented — no effect today
+replication_mode = "async"    # parsed but NOT implemented — no effect today
 ```
 
 #### 4. Node join / leave / failure
 
 | Event | What happens |
 |---|---|
-| **Node joins** | Gossip announces new member. Hash ring adds vnodes. Affected key ranges transfer from current owners to new node in background. |
-| **Node leaves gracefully** | Node announces departure via gossip. Key ranges transfer to next nodes on ring before shutdown. |
-| **Node crashes** | Gossip failure detector triggers after missed heartbeats. Replicas promote to owners for affected key ranges. New replicas created on surviving nodes. |
+| **Node joins** | Gossip announces the new member. Ownership is recomputed (hash modulo the new node list) — most large-tier keys remap to new owners; remapped keys behave as cache misses until rewritten. |
+| **Node leaves gracefully** | Departure propagates via gossip; ownership is recomputed the same way. Large values held only by the departed node are gone. |
+| **Node crashes** | Gossip failure detector triggers after missed heartbeats. Surviving nodes recompute ownership; the crashed node's large values are lost. Small gossip-tier values survive — every node has a copy. |
 | **Network partition** | Nodes on each side continue serving their local keys. On heal, conflict resolution via last-write-wins (LWW) timestamps. |
 
 ### PHP Access: Zero-Overhead via SAPI

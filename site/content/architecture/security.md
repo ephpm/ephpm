@@ -14,15 +14,26 @@ This document describes the threat model, trust boundaries, and security design 
 | PHP memory exhaustion | PHP `memory_limit` INI enforced inside the runtime; Rust allocator is separate |
 | Malformed HTTP requests | hyper's strict HTTP/1.1 parser rejects protocol violations before reaching PHP |
 | Path traversal in static file serving | Canonicalize paths and reject any resolved path outside `document_root` |
-| Slowloris / slow-read attacks | Per-connection timeouts on header reads and body transfers (tower middleware) |
-| DB credential exposure in config | Config supports env var interpolation (`${DB_PASSWORD}`) to avoid plaintext secrets in TOML |
-| Unauthorized admin access | Admin endpoints bound to localhost by default; optional auth token required for remote access |
+| Slowloris / slow-read attacks | hyper's `header_read_timeout` plus tokio-level timeouts from `[server.timeouts]` (no tower middleware is involved) |
+| DB credential exposure in config | Any config value can be overridden via `EPHPM_`-prefixed environment variables (figment), so secrets can come from the environment instead of the TOML |
 
 ### What ePHPm does NOT protect against
 
 - **Vulnerabilities in PHP application code** — ePHPm executes whatever PHP code is deployed. SQL injection, XSS, etc. in the application are the application's responsibility.
 - **PHP interpreter CVEs** — ePHPm statically links libphp. Users must rebuild with patched PHP releases. The version matrix and release pipeline are designed to make this fast.
 - **Supply chain attacks on PHP extensions** — ePHPm bundles extensions at build time. Extension selection is a trust decision made at build time, not runtime.
+
+### Implemented security controls
+
+The controls that exist today, in one place:
+
+- **Per-vhost `open_basedir`** — in multi-site mode, PHP filesystem access is restricted per-request to the site's directory (+ `/tmp`)
+- **`disable_shell_exec`** — `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec` disabled via the php.ini generated at startup (default on in multi-site mode)
+- **`blocked_paths`** — glob patterns matched against the URI path (patterns must start with `/`); matches return 403
+- **`trusted_hosts`** — Host header validation; non-matching hosts get 421
+- **`trusted_proxies`** — CIDR-based proxy trust for `X-Forwarded-For` / `X-Forwarded-Proto` resolution
+- **Hidden-file modes** — dotfile requests handled per `hidden_files` (`deny`=403, `ignore`=404, `allow`)
+- **Percent-decode traversal hardening** — strict `%XX` decoding before routing; encoded `/` and `\`, truncated or non-hex escapes, and invalid UTF-8 are rejected with 400
 
 ---
 
@@ -111,9 +122,8 @@ int ephpm_execute_script(const char *filename) {
 
 ### Execution time
 
-- `max_execution_time` INI directive enforced by PHP's signal-based timer
-- On timeout, PHP triggers a fatal error caught by `zend_catch`
-- Rust-side timeout via `tokio::time::timeout` wrapping `spawn_blocking` provides a secondary safeguard
+- PHP's signal-based `max_execution_time` timer is **deliberately neutralized** — its process-wide `SIGPROF` handler would crash tokio worker threads, so the zend signal functions are no-op'd (`--wrap` on Linux)
+- Enforcement happens at the HTTP layer: `tokio::time::timeout` (from `server.timeouts.request`) wraps the `spawn_blocking` PHP execution and surfaces a timeout as HTTP 504
 
 ### Process state
 
@@ -133,15 +143,11 @@ int ephpm_execute_script(const char *filename) {
 
 The `ephpm.toml` config file should never contain plaintext secrets in production. Supported alternatives:
 
-- **Environment variable interpolation**: Use `${ENV_VAR}` syntax in config values
+- **Environment variable overrides**: any config value can be set via an `EPHPM_`-prefixed environment variable with `__` as the nesting separator (figment), e.g. `EPHPM_DB__MYSQL__URL`. There is no `${VAR}` interpolation syntax inside the TOML itself.
 - **File permissions**: Config file should be readable only by the ePHPm process user
 - **Future**: Secrets manager integration (Vault, AWS Secrets Manager, etc.)
 
-### Admin interface
-
-- Bound to `127.0.0.1` by default — not exposed to the network
-- Optional bearer token authentication for remote access
-- All admin mutations (reload, config changes) logged via `tracing`
+There is no admin interface — ePHPm exposes no admin endpoints, so there is nothing to lock down there. The optional Prometheus `/metrics` endpoint is read-only.
 
 ---
 

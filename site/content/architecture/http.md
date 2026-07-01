@@ -13,7 +13,7 @@ This document covers the HTTP server design, PHP execution model, request lifecy
    TCP accept (tokio async)
         │
         ▼
-   HTTP/1.1 parse (hyper)
+   HTTP parse (hyper — HTTP/1.1; HTTP/2 over TLS)
         │
         ▼
    Router::handle (wrapped by request timeout)
@@ -46,27 +46,32 @@ This document covers the HTTP server design, PHP execution model, request lifecy
 
 ## PHP Execution Model
 
-### Request Reuse
+### Per-Request Lifecycle
 
-The embed SAPI starts a single PHP request during `php_embed_init()`. Instead of calling `php_request_shutdown()` / `php_request_startup()` per HTTP request (which crashes in the embed SAPI), we reuse that initial request and manually reset state between requests.
+Each HTTP request runs a full `php_request_shutdown()` / `php_request_startup()` cycle (`ephpm_execute_request()` in `ephpm_wrapper.c`) — the classic php-fpm isolation model. Request shutdown destroys user functions, classes, constants, statics, and the global symbol table, so nothing leaks between requests. OPcache's compiled bytecode lives in shared memory and survives the cycle, so the opcode cache (and JIT buffer) are preserved.
 
-Per-request reset:
-1. Clear output buffer and response headers
-2. Reset `SG(read_post_bytes) = -1` so PHP re-reads POST data
-3. Close and recreate `request_body` stream for fresh `php://input`
-4. Destroy all `PG(http_globals)` arrays (stale superglobals)
-5. Rebuild `$_SERVER`, `$_GET`, `$_POST`, `$_FILES`, `$_COOKIE`, `$_REQUEST`
+Per-request sequence:
+1. Tear down the previous request (`php_request_shutdown()`); reset the thread-local output/header buffers and the POST read cursor
+2. Populate `SG(request_info)` (method, URI, query string, content type, cookies, content length) **before** startup — the SAPI callbacks read these fields during startup
+3. Set a non-NULL `SG(server_context)` sentinel — `sapi_activate()` only parses the POST body into `$_POST` when the server context is non-NULL (the same gate cli-server/cgi use)
+4. `php_request_startup()` builds all superglobals natively through the SAPI callbacks
+5. Reset response state (`http_response_code = 200`, `headers_sent`, `no_headers`) so an explicit status from a prior request on the same worker thread can't leak
+6. Replay buffered per-request INI overrides (e.g. per-vhost `open_basedir`) at `PHP_INI_STAGE_ACTIVATE` — they're buffered because applying them before startup would be undone by the shutdown/startup cycle
+7. Execute the script under bailout protection
+
+An earlier design reused one long-lived embed request and manually rebuilt the superglobals (destroying `PG(http_globals)` and re-running `sapi_module.treat_data`). That manual rebuild was removed: once the per-request lifecycle called `php_request_startup()` every request, it destroyed arrays startup had just created and caused a use-after-free SIGSEGV under load on tokio `spawn_blocking` threads. Superglobal construction is now owned entirely by `php_request_startup()`.
 
 ### Superglobal Population
 
+All superglobals are built natively by PHP request startup, driven by the installed SAPI callbacks:
+
 | Variable | Source |
 |----------|--------|
-| `$_SERVER` | Built by Rust (`PhpRequest::server_variables()`), registered via C callback |
-| `$_GET` | Parsed from query string via `sapi_module.treat_data(PARSE_STRING, ...)` |
-| `$_POST` | `sapi_handle_post()` — dispatches to content-type-specific parser |
-| `$_FILES` | Populated by `sapi_handle_post()` for multipart/form-data (rfc1867) |
-| `$_COOKIE` | Manual parsing of `Cookie` header (`key=value; key=value`) |
-| `$_REQUEST` | Merge of `$_GET` + `$_POST` + `$_COOKIE` |
+| `$_SERVER` | `register_server_variables` callback — values provided by Rust (`PhpRequest::server_variables()`) |
+| `$_GET` | Parsed by PHP from `SG(request_info).query_string` during request startup |
+| `$_POST` / `$_FILES` | Parsed natively by `sapi_activate()` (including multipart/rfc1867), fed by the `read_post` callback |
+| `$_COOKIE` | `read_cookies` callback returns the raw `Cookie` header; PHP parses it |
+| `$_REQUEST` | Built by PHP from `$_GET` + `$_POST` + `$_COOKIE` per `request_order` |
 
 ### `$_SERVER` Variables
 
@@ -91,7 +96,7 @@ PHP is compiled with ZTS (Zend Thread Safety). Each `spawn_blocking` thread auto
 
 ### Signal Handling
 
-PHP installs a `SIGPROF` handler for `max_execution_time`. This signal is process-wide and would crash tokio worker threads (NULL dereference in PHP's handler on non-PHP threads). We override PHP's signal functions with no-ops via `--wrap` linker flags and manage timeouts at the HTTP layer instead.
+PHP installs a `SIGPROF` handler for `max_execution_time`. This signal is process-wide and would crash tokio worker threads (NULL dereference in PHP's handler on non-PHP threads). On Linux we override PHP's signal functions with no-ops via GNU ld's `--wrap` linker flags. macOS's ld64 and MSVC's link.exe don't support `--wrap` (see `crates/ephpm/build.rs`), so the wrapping is not applied there. On all platforms, request timeout enforcement is done at the HTTP layer, not by PHP's signal-based timer.
 
 ### Bailout Protection
 
@@ -176,22 +181,26 @@ The decoder is deliberately strict:
 
 Rejecting `%2F` / `%5C` is what keeps percent encoding from being used to sneak past path-traversal protection or prefix-based blocks like `/vendor/*` — a request such as `/vendor%2Fconfig.php` cannot decode into a `/`-containing path that bypasses the glob check. UTF-8 validation on the decoded bytes lets non-ASCII paths work normally while still rejecting malformed escape sequences.
 
-## PHP Response Cache (Phase 2 — requires KV store)
+## PHP Response Cache
 
-The static file `ETag` support only covers non-PHP assets. PHP frameworks (WordPress, Laravel) generate their own `ETag` headers for dynamic content, but every request still hits PHP to compute whether the content changed. With the clustered KV store, we can intercept PHP-generated ETags and short-circuit repeat requests across all nodes without executing PHP at all.
+The static file `ETag` support only covers non-PHP assets. PHP frameworks (WordPress, Laravel) generate their own `ETag` headers for dynamic content, but without help every request still hits PHP to compute whether the content changed.
 
-### Flow
+**Implemented:** the ETag-based 304 short-circuit. Configured via `[server.php_etag_cache]` (enabled by default; see `Router::handle` in `crates/ephpm-server/src/router.rs`). When PHP sets an `ETag` on a GET/HEAD response, the server stores it in the KV store keyed by method + path + query string. A repeat request with a matching `If-None-Match` returns `304 Not Modified` without executing PHP at all. In clustered mode the KV entries replicate via gossip, so the short-circuit works across nodes.
+
+**Future work:** full-response caching (serving the cached body on requests without `If-None-Match`), which would turn ePHPm into an edge cache — see the design decisions below.
+
+### Flow (as implemented)
 
 ```
 1. First request: /blog/hello
    → PHP executes, returns response with ETag: "abc123"
-   → Server stores in KV: cache:<url_key> → { etag: "abc123", headers, body }
+   → Server stores in KV: <key_prefix><method>:<path>?<query> → "abc123" (with TTL)
    → Response sent to client
 
 2. Repeat request: /blog/hello + If-None-Match: "abc123"
-   → Server checks KV for cache:<url_key>
+   → Server checks KV for the stored ETag
    → ETag matches → return 304 Not Modified immediately
-   → No PHP execution, no mutex contention
+   → No PHP execution
 
 3. Works across all nodes via gossip replication
 ```
@@ -207,7 +216,7 @@ The static file `ETag` support only covers non-PHP assets. PHP frameworks (WordP
 
 ### Impact
 
-This is a significant performance multiplier for PHP applications. Most WordPress page views are anonymous and return identical content. Skipping PHP entirely for repeat visitors eliminates the single-threaded PHP mutex bottleneck and lets the async HTTP server handle cached responses at full throughput across all nodes.
+This is a significant performance multiplier for PHP applications. Most WordPress page views are anonymous and return identical content. Skipping PHP entirely for repeat visitors frees the `spawn_blocking` worker threads and lets the async HTTP server handle cached responses at full throughput across all nodes.
 
 ## TLS
 
@@ -225,13 +234,13 @@ Manual TLS via `rustls` (pure Rust, no OpenSSL dependency). Certificate and key 
 ### Connection Flow (TLS)
 
 ```
-TCP Accept → TLS Handshake (tokio-rustls) → HTTP/1.1 Parse → Router
+TCP Accept → TLS Handshake (tokio-rustls) → HTTP/1.1 or HTTP/2 → Router
                   ↓ timeout
          header_read_timeout
 ```
 
 - TLS handshake timeout reuses `server.timeouts.header_read` (default 30s)
-- ALPN negotiated to `http/1.1` only
+- ALPN advertises `h2` and `http/1.1` (h2 preferred — see `crates/ephpm-server/src/tls.rs`); hyper-util's `auto::Builder` serves whichever protocol was negotiated. Plain-TCP listeners are HTTP/1.1 only.
 - `is_tls` flag propagated to router so `$_SERVER['HTTPS']` is set correctly
 - When behind a trusted proxy, `X-Forwarded-Proto` takes precedence over native TLS status
 
@@ -269,11 +278,12 @@ Phase 2 (clustered):    AcmeConfig → KvCache (gossip-replicated KV store)
 
 ## Compression
 
-Applied to both PHP and static responses when the client sends `Accept-Encoding: gzip`.
+Applied to both PHP and static responses based on the client's `Accept-Encoding` header. Brotli (`br`) is implemented and preferred when the client accepts it (better ratio); gzip is the fallback for clients that only accept `gzip` (see `build_php_response` in `crates/ephpm-server/src/router.rs`).
 
 | Check | Condition |
 |-------|-----------|
 | Enabled | `server.response.compression = true` |
+| Algorithm | Brotli if the client accepts `br`, else gzip if it accepts `gzip`, else identity |
 | Min size | Response body >= `server.response.compression_min_size` |
 | Content type | `text/*`, `*javascript`, `*json`, `*xml`, `*svg` |
 | Smaller | Compressed size < original size |
@@ -330,8 +340,9 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.timeouts.header_read` | int | `30` | Seconds to receive headers |
 | `server.timeouts.idle` | int | `60` | Idle connection timeout (seconds) |
 | `server.timeouts.request` | int | `300` | Total request timeout (seconds) |
-| `server.response.compression` | bool | `true` | Enable gzip compression |
-| `server.response.compression_level` | int | `1` | Gzip level (1-9) |
+| `server.timeouts.shutdown` | int | `30` | Graceful shutdown drain: grace period for in-flight connections on SIGTERM |
+| `server.response.compression` | bool | `true` | Enable response compression (Brotli preferred, gzip fallback) |
+| `server.response.compression_level` | int | `1` | Compression level (1-9) |
 | `server.response.compression_min_size` | int | `1024` | Min bytes to compress |
 | `server.response.headers` | [string, string][] | `[]` | Custom response headers (CORS, CSP, HSTS) |
 | `server.static.cache_control` | string | `""` | Cache-Control header for static files |
@@ -354,6 +365,12 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `php.max_execution_time` | int | `30` | PHP per-request timeout (seconds) |
 | `php.memory_limit` | string | `"128M"` | PHP memory limit |
 | `php.ini_overrides` | [string, string][] | `[]` | INI directive overrides |
+| `server.metrics.enabled` | bool | `false` | Prometheus metrics endpoint |
+| `server.metrics.path` | string | `"/metrics"` | Metrics endpoint path |
+| `server.limits.max_connections` | int | `0` | Max total concurrent connections (0 = unlimited) |
+| `server.limits.per_ip_max_connections` | int | `0` | Max concurrent connections per client IP |
+| `server.limits.per_ip_rate` | float | `0.0` | Max requests/second per client IP (token bucket) |
+| `server.limits.per_ip_burst` | int | `50` | Burst size for per-IP rate limiting |
 
 ### CLI Flags
 
@@ -363,6 +380,8 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `-l, --listen` | serve | Listen address (overrides config) |
 | `-d, --document-root` | serve | Document root (overrides config) |
 | `-v` | serve | Debug logging (`-vv` for trace) |
+
+The full CLI has grown beyond `serve`: there are `dev`, `php`, and `kv` subcommands, plus service-lifecycle commands (`install`, `uninstall`, `start`, `stop`, `restart`, `status`). See the [CLI reference](/reference/cli/) for the complete list.
 
 Precedence: `RUST_LOG` env var > `-v` flag > `server.logging.level` > `"info"`
 
@@ -378,16 +397,15 @@ EPHPM_PHP__MEMORY_LIMIT=256M
 
 ### Roadmap
 
+Rate limiting (`[server.limits]`), Prometheus metrics (`[server.metrics]`), and graceful shutdown drain (`server.timeouts.shutdown`) have shipped and moved to the Implemented table above.
+
 | Config | Description | Priority |
 |--------|-------------|----------|
-| `server.graceful_shutdown_timeout` | How long to wait for in-flight requests on SIGTERM | Medium |
 | `server.static.expires` | Per-extension cache lifetimes (e.g., images 1yr, CSS 1wk) | Medium |
 | `server.static.index_fallback` | Serve `index.html` for SPA routes (distinct from PHP fallback) | Medium |
 | `server.response.server_header` | Custom or disabled `Server:` header (fingerprinting prevention) | Low |
 | `server.request.max_uri_length` | Reject abnormally long URIs (defense in depth) | Low |
 | `server.worker_threads` | Tokio worker thread count (auto-detect by default) | Low |
-| `server.security.rate_limit` | Basic per-IP rate limiting | Low |
-| `server.metrics.enabled` | Prometheus metrics endpoint | Medium |
 | `server.rewrites` | Regex-based URL rewriting | Low |
 | `server.logging.format` | Text vs JSON structured logging | Low |
 | `server.logging.access_format` | Common/combined access log format | Low |

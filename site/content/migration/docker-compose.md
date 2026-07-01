@@ -99,10 +99,13 @@ ports:
 ```toml
 # ePHPm
 [server]
-listen = "0.0.0.0:80"
+listen = "0.0.0.0:80"          # HTTP — 301-redirects to HTTPS
 
 [server.tls]
-acme_domains = ["example.com"]
+listen = "0.0.0.0:443"         # HTTPS listener (without this, server.listen itself serves HTTPS)
+domains = ["example.com"]
+email = "you@example.com"
+redirect_http = true
 ```
 
 ```yaml
@@ -194,7 +197,7 @@ For the KV store, use the `ephpm_kv_*` SAPI functions instead of predis/phpredis
 docker compose down
 
 # Start ePHPm
-./ephpm --config ephpm.toml
+./ephpm serve --config ephpm.toml
 ```
 
 ### 6. Keep Docker for Development (Optional)
@@ -202,8 +205,9 @@ docker compose down
 You can use Docker for development and ePHPm for production. They serve the same files. Or drop Docker entirely — ePHPm runs the same binary on your laptop as in production.
 
 ```bash
-# Development: just run ePHPm locally
-./ephpm --config ephpm.toml
+# Development: just run ePHPm locally — bare `ephpm` is dev mode
+# (binds 127.0.0.1:8080, serves the current directory, no config needed)
+./ephpm
 # Visit http://localhost:8080
 ```
 

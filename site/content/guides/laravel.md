@@ -104,7 +104,22 @@ enabled = true
 listen = "127.0.0.1:6379"
 ```
 
-Laravel speaks Redis to ePHPm's embedded KV store. No external Redis. See [KV from PHP](kv-from-php/) for the full picture.
+One catch: the embedded PHP does **not** include the phpredis extension, so Laravel must use the pure-PHP predis client instead:
+
+```bash
+composer require predis/predis
+```
+
+```dotenv
+# .env
+REDIS_CLIENT=predis
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+SESSION_DRIVER=redis
+CACHE_STORE=redis
+```
+
+Laravel speaks Redis (via predis) to ePHPm's embedded KV store. No external Redis. See [KV from PHP](kv-from-php/) for the full picture.
 
 ## Octane?
 

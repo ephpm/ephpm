@@ -74,13 +74,13 @@ When memory exceeds the limit, the eviction policy picks victims:
 - **volatile-lru** — least recently used among keys with a TTL only
 - **allkeys-random** — uniformly random victim
 
-LRU isn't strict — DashMap's sharding makes a global LRU expensive. Each shard maintains its own LRU and evictions are sampled across shards. Approximate but bounded.
+LRU isn't strict — maintaining a true global LRU over a sharded map would be expensive. Instead, each eviction pass samples 16 candidates from map iteration, compares them by `last_accessed`, and evicts the best victim; passes repeat until usage drops back under the limit. Approximate but cheap.
 
 ## RESP2 protocol
 
 The on-wire format is Redis RESP2. We don't fork a Redis-compatible parser — we have a tight implementation in [`crates/ephpm-kv/src/resp/`](https://github.com/ephpm/ephpm/tree/main/crates/ephpm-kv/src/resp). Connections are tokio tasks reading line-buffered RESP frames; one connection = one task, no thread pool.
 
-Supported command groups: strings, keys, connection. See [KV from PHP](/guides/kv-from-php/) for the full command list.
+Supported command groups: strings, hashes (`HSET`, `HGET`, `HDEL`, `HGETALL`, `HKEYS`, `HVALS`, `HLEN`, `HEXISTS`), keys, connection. See [KV from PHP](/guides/kv-from-php/) for the full command list.
 
 ## Multi-tenant isolation
 
@@ -92,7 +92,7 @@ When the RESP listener is enabled and AUTH is required, ePHPm derives per-site p
 password = HMAC-SHA256(secret, hostname)
 ```
 
-The derived password is injected into PHP's `$_ENV` as `EPHPM_REDIS_PASSWORD` for each request, so each site's PHP code can authenticate to its own scope. If `[kv] secret` is absent, ePHPm generates one on first boot and persists it in the data directory.
+The derived password is injected into PHP's `$_ENV` as `EPHPM_REDIS_PASSWORD` for each request, so each site's PHP code can authenticate to its own scope. If `[kv] secret` is unset, nothing is auto-generated — multi-tenant HMAC AUTH is simply disabled.
 
 ## Clustered KV (when `[cluster] enabled = true`)
 
@@ -106,9 +106,9 @@ This is where `kv:sqlite:primary` and other cluster-wide control state lives. De
 
 ### Tier 2 — TCP data plane (large values)
 
-Values above the threshold go through a consistent hash ring. Each key maps to an "owner" node based on `data_port` (TCP, default 7947). Writes go to the owner; reads hit the owner unless the value is in the local hot-key cache.
+Values above the threshold live on a single "owner" node, selected as `hash(key)` modulo the sorted alive-node list (no consistent hash ring — see `crates/ephpm-cluster/src/clustered_store.rs`). Requests reach the owner over the TCP data plane (`data_port`, default 7947). Writes go to the owner; reads hit the owner unless the value is in the local hot-key cache.
 
-Replication factor (`replication_factor`, default 2) determines how many nodes hold a copy. `replication_mode = "async"` (default) writes to the owner immediately and replicates in the background; `"sync"` waits for the replicas to ack before returning.
+Large-tier values are **not replicated** — each exists only on its owner node, so an owner failure loses those values. The `replication_factor` and `replication_mode` config keys are parsed but not yet implemented; setting them has no effect today. Only small (gossip-tier) values are replicated — to every node.
 
 ### Hot-key promotion
 
