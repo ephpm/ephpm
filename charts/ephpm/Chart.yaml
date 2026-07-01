@@ -1,0 +1,27 @@
+apiVersion: v2
+name: ephpm
+description: >-
+  ePHPm — an all-in-one PHP application server with PHP embedded via FFI into a
+  single static binary: HTTP server, connection-pooling DB proxy (MySQL/Postgres/
+  SQLite), KV store, and gossip clustering. Deploys as a stateless Deployment, or
+  a StatefulSet when clustering or SQLite is enabled.
+type: application
+version: 0.2.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.23.0-0"
+home: https://ephpm.dev
+icon: https://raw.githubusercontent.com/ephpm/ephpm/main/logo.svg
+sources:
+  - https://github.com/ephpm/ephpm
+keywords:
+  - php
+  - web-server
+  - application-server
+  - mysql-proxy
+  - postgres-proxy
+  - sqlite
+  - kv
+  - clustering
+maintainers:
+  - name: Anthony George
+    email: cusegeorge2@gmail.com

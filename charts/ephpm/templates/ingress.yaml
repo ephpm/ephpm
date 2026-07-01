@@ -1,0 +1,50 @@
+{{- if .Values.ingress.enabled -}}
+{{- $fullName := include "ephpm.fullname" . -}}
+{{- $svcPort := .Values.service.port -}}
+{{- $cm := .Values.ingress.certManager -}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullName }}
+  labels:
+    {{- include "ephpm.labels" . | nindent 4 }}
+  annotations:
+    {{- if and $cm.enabled (eq $cm.issuerKind "ClusterIssuer") }}
+    cert-manager.io/cluster-issuer: {{ $cm.issuerName | quote }}
+    {{- else if and $cm.enabled (eq $cm.issuerKind "Issuer") }}
+    cert-manager.io/issuer: {{ $cm.issuerName | quote }}
+    {{- end }}
+    {{- with .Values.ingress.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if .Values.ingress.tls }}
+  tls:
+    {{- toYaml .Values.ingress.tls | nindent 4 }}
+  {{- else if $cm.enabled }}
+  tls:
+    - secretName: {{ printf "%s-tls" $fullName }}
+      hosts:
+        {{- range .Values.ingress.hosts }}
+        - {{ .host | quote }}
+        {{- end }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ $fullName }}
+                port:
+                  number: {{ $svcPort }}
+          {{- end }}
+    {{- end }}
+{{- end }}

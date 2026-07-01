@@ -1,0 +1,7 @@
+# Deployment fronting a PostgreSQL backend via the in-pod proxy.
+db:
+  postgres:
+    enabled: true
+    url: "postgres://app:secret@pg-primary:5432/app"
+ingress:
+  enabled: false
