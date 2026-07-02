@@ -96,6 +96,11 @@ pub struct Router {
     /// Database environment variables to inject into PHP `$_SERVER`.
     /// Populated from `[db.mysql]` or `[db.postgres]` when `inject_env = true`.
     db_env_vars: Vec<(String, String)>,
+    /// Caps concurrent PHP executions when `[php] workers > 0` (php-fpm
+    /// `max_children` semantics). `None` = unlimited. This deliberately does
+    /// NOT cap tokio's blocking pool — static file I/O and other blocking
+    /// work must never be starved by slow PHP scripts.
+    php_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 /// Scan `sites_dir` for virtual host subdirectories.
@@ -180,6 +185,9 @@ impl Router {
             &config.server.fallback,
         );
 
+        let php_semaphore = (config.php.workers > 0)
+            .then(|| Arc::new(tokio::sync::Semaphore::new(config.php.workers)));
+
         Self {
             document_root: config.server.document_root.clone(),
             sites,
@@ -232,6 +240,7 @@ impl Router {
             kv_listen: config.kv.redis_compat.listen.clone(),
             kv_redis_compat_enabled: config.kv.redis_compat.enabled,
             db_env_vars: build_db_env_vars(config),
+            php_semaphore,
         }
     }
 
@@ -697,6 +706,18 @@ impl Router {
         // plus DB_* env vars for framework auto-discovery.
         let mut env_vars = self.build_kv_env_vars(&server_name);
         env_vars.extend_from_slice(&self.db_env_vars);
+
+        // Cap concurrent PHP executions when [php].workers is set. The permit
+        // is held for the whole execution (php-fpm max_children semantics):
+        // requests past the cap queue here until a worker frees up, still
+        // subject to the outer request timeout. Acquire never fails — the
+        // semaphore is never closed.
+        let _php_permit = match &self.php_semaphore {
+            Some(sem) => {
+                Some(Arc::clone(sem).acquire_owned().await.expect("PHP semaphore never closed"))
+            }
+            None => None,
+        };
 
         let php_start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {

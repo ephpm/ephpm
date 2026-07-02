@@ -1126,17 +1126,17 @@ pub struct PhpConfig {
     #[serde(default)]
     pub ini_overrides: Vec<[String; 2]>,
 
-    /// Maximum number of threads that may execute PHP concurrently.
+    /// Maximum number of PHP requests that may execute concurrently.
     ///
-    /// Caps tokio's blocking-thread pool, which is where PHP requests run —
-    /// each thread registers its own isolated PHP (TSRM) context on first
-    /// use. Note the pool is shared with other blocking work (e.g. file
-    /// I/O), so this is an upper bound on PHP concurrency, not a dedicated
-    /// worker count.
+    /// Equivalent to php-fpm's `pm.max_children`: requests beyond the cap
+    /// queue until a slot frees up (still subject to the request timeout).
+    /// Enforced with a semaphore around PHP execution — tokio's blocking
+    /// pool itself is never capped, so static file serving and other
+    /// blocking work cannot be starved by slow PHP scripts.
     ///
-    /// Set to `0` to keep tokio's default pool size (no cap).
+    /// `0` means unlimited (bounded only by tokio's blocking pool).
     ///
-    /// Default: logical CPU count, capped at 16.
+    /// Default: `0` (unlimited).
     #[serde(default = "default_php_workers")]
     pub workers: usize,
 }
@@ -1388,7 +1388,11 @@ impl Default for ClusterKvConfig {
 }
 
 fn default_php_workers() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get().min(16))
+    // Unlimited by default. A CPU-based default sounds attractive but is
+    // dangerous: PHP scripts that block without I/O (sleep, long queries)
+    // hold their slot past the HTTP request timeout, and a small cap lets a
+    // handful of them starve all PHP traffic. Opt into a cap explicitly.
+    0
 }
 
 fn default_cluster_bind() -> String {

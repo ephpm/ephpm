@@ -560,16 +560,14 @@ fn run_with_config(config: ephpm_config::Config, verbose: u8) -> anyhow::Result<
 
     // Now safe to create the multi-threaded tokio runtime.
     //
-    // PHP requests execute on tokio's blocking-thread pool (spawn_blocking),
-    // so [php].workers caps that pool to bound concurrent PHP execution.
-    // 0 means "no cap" — keep tokio's default pool size.
-    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
-    rt_builder.enable_all();
+    // Note: [php].workers is enforced by a semaphore around PHP execution in
+    // the router, NOT by capping tokio's blocking pool — that pool is shared
+    // with static file I/O and other blocking work, and slow PHP scripts must
+    // never starve it.
     if config.php.workers > 0 {
-        rt_builder.max_blocking_threads(config.php.workers);
-        tracing::info!(workers = config.php.workers, "PHP worker thread pool capped");
+        tracing::info!(workers = config.php.workers, "concurrent PHP executions capped");
     }
-    let rt = rt_builder.build().context("failed to create tokio runtime")?;
+    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
     let result = rt.block_on(async { ephpm_server::serve(config).await });
 
     // Shutdown PHP runtime

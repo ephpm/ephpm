@@ -126,7 +126,7 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 | `memory_limit` | string | `"128M"` | PHP `memory_limit`. |
 | `ini_file` | path | (none) | Custom `php.ini` loaded before `ini_overrides`. |
 | `ini_overrides` | array of `[string, string]` | `[]` | INI directives applied after `ini_file`. |
-| `workers` | usize | `min(logical_cpus, 16)` | Dedicated PHP worker threads. |
+| `workers` | usize | `0` (unlimited) | Max concurrent PHP executions (php-fpm `pm.max_children` semantics); excess requests queue. `0` = unlimited. |
 
 ## `[db]`
 
