@@ -12,6 +12,8 @@ use chitchat::transport::UdpTransport;
 use chitchat::{ChitchatConfig, ChitchatHandle, ChitchatId, FailureDetectorConfig, spawn_chitchat};
 use ephpm_config::ClusterConfig;
 
+use crate::secure_transport::EncryptedUdpTransport;
+
 /// Information about a single cluster node.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct NodeInfo {
@@ -130,6 +132,12 @@ impl ClusterHandle {
 /// Binds a UDP listener on `config.bind`, joins seed nodes from
 /// `config.join`, and spawns the gossip background task.
 ///
+/// When `config.secret` is non-empty, gossip runs over the
+/// [`EncryptedUdpTransport`] — every datagram is sealed with
+/// ChaCha20-Poly1305 and peers without the matching secret are
+/// invisible. When empty, gossip is plaintext UDP and a warning is
+/// logged recommending a secret on untrusted networks.
+///
 /// # Errors
 ///
 /// Returns an error if the bind address is invalid or the UDP socket
@@ -166,15 +174,28 @@ pub async fn start_gossip(config: &ClusterConfig) -> anyhow::Result<ClusterHandl
         extra_liveness_predicate: None,
     };
 
-    let handle = spawn_chitchat(chitchat_config, vec![], &UdpTransport)
-        .await
-        .context("failed to spawn chitchat gossip")?;
+    // With a secret, every gossip datagram is sealed with a key derived
+    // from it — nodes without the matching secret cannot join, read, or
+    // inject. Without one, gossip is plaintext UDP.
+    let encrypted = !config.secret.is_empty();
+    let handle = if encrypted {
+        let transport = EncryptedUdpTransport::new(&config.secret);
+        spawn_chitchat(chitchat_config, vec![], &transport).await
+    } else {
+        tracing::warn!(
+            "cluster.secret is not set — gossip and KV data plane traffic is unauthenticated \
+             plaintext; set [cluster] secret when running on untrusted networks"
+        );
+        spawn_chitchat(chitchat_config, vec![], &UdpTransport).await
+    }
+    .context("failed to spawn chitchat gossip")?;
 
     tracing::info!(
         %node_id,
         %listen_addr,
         seeds = ?config.join,
         cluster_id = %config.cluster_id,
+        encrypted,
         "gossip started"
     );
 

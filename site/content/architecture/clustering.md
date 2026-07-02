@@ -1230,7 +1230,7 @@ socket = "/run/ephpm/redis.sock"       # Unix socket (~2-5x faster than TCP)
 enabled = false
 bind = "0.0.0.0:7946"                 # gossip listen address
 join = ["10.0.1.2:7946"]              # seed nodes
-secret = ""                            # base64-encoded 32-byte key — encrypts gossip, authenticates nodes
+secret = ""                            # shared secret — encrypts gossip + KV data plane, authenticates nodes
 
 # mTLS for data plane (auto-generated certs by default)
 # When omitted, nodes generate ephemeral self-signed certs and

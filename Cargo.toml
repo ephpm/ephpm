@@ -47,6 +47,8 @@ bytes = "1"
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"
 md5 = "0.8"
 base64ct = { version = "1", features = ["alloc"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }

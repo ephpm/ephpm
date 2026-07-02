@@ -18,7 +18,7 @@ join    = ["10.0.1.10:7946", "10.0.1.11:7946", "10.0.1.12:7946"]
 cluster_id = "ephpm-prod"          # only nodes with the same id will pair
 ```
 
-> **Security note:** `cluster.secret` exists in the config schema but is currently parsed and **not used** — gossip traffic is unauthenticated and unencrypted today. Run the cluster on a trusted private network (VPC, WireGuard, Tailscale) and firewall ports 7946/7947 from the public internet. Different `cluster_id`s let you run multiple independent clusters on the same network.
+> **Security note:** set `cluster.secret` (any high-entropy string, e.g. `openssl rand -base64 32`) on every node. When set, all inter-node traffic — gossip UDP **and** the TCP KV data plane — is authenticated and encrypted with ChaCha20-Poly1305 keys derived from the secret via HKDF-SHA256. Nodes without the matching secret cannot join, read, or inject; their packets are silently dropped. When unset, inter-node traffic is unauthenticated plaintext (a warning is logged at startup) — only do that on a trusted private network (VPC, WireGuard, Tailscale) with ports 7946/7947 firewalled from the public internet. Different `cluster_id`s let you run multiple independent clusters on the same network.
 
 `join` only needs to list a few seeds — once a node joins, it discovers the rest.
 

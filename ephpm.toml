@@ -182,7 +182,8 @@ ini_overrides = [
 # enabled = false
 # bind = "0.0.0.0:7946"               # gossip listen address
 # join = ["10.0.1.2:7946"]            # seed nodes (or k8s headless service DNS)
-# secret = ""                          # base64-encoded 32-byte key (encrypts gossip)
+# secret = ""                          # shared secret — encrypts gossip + KV data plane
+#                                      # (any high-entropy string; empty = plaintext)
 #
 # [cluster.kv]
 # replication_factor = 2               # copies on N additional nodes

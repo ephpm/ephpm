@@ -15,9 +15,13 @@ tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 base64ct.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
