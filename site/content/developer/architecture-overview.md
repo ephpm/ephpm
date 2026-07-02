@@ -41,10 +41,17 @@ ephpm/
 │   │       ├── sapi.rs         # Custom SAPI implementation
 │   │       ├── request.rs      # HTTP request → PHP request mapping
 │   │       └── response.rs     # PHP output → HTTP response mapping
-│   └── ephpm-config/           # Configuration crate
-│       ├── Cargo.toml
-│       └── src/
-│           └── lib.rs          # Config structs + figment loading
+│   ├── ephpm-config/           # Configuration crate
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       └── lib.rs          # Config structs + figment loading
+│   ├── ephpm-kv/               # Embedded KV store — DashMap, RESP2, TTL/expiry, compression
+│   ├── ephpm-db/               # DB proxy — MySQL/PostgreSQL wire, pooling, R/W splitting
+│   ├── ephpm-cluster/          # Gossip clustering (chitchat), KV replication, primary election
+│   ├── ephpm-query-stats/      # SQL normalization, digest tracking, slow query log
+│   ├── ephpm-sqld/             # Embedded sqld binary + child process lifecycle
+│   └── ephpm-e2e/              # E2E test crate — EXCLUDED from the workspace
+├── xtask/                      # Build & test tooling — release, php-sdk, e2e, e2e-up, e2e-down
 ├── benches/
 │   └── throughput.rs           # Criterion benchmarks
 ├── tests/
@@ -63,6 +70,13 @@ ephpm/
 | `ephpm-server` | Library | HTTP server (hyper + tokio), request routing, static file serving |
 | `ephpm-php` | Library | PHP embedding via FFI. Custom SAPI, request/response mapping, PHP lifecycle management |
 | `ephpm-config` | Library | Configuration structs, TOML loading via figment, env var overrides |
+| `ephpm-kv` | Library | Embedded KV store — DashMap, RESP2 protocol, TTL/expiry, eviction, compression |
+| `ephpm-db` | Library | DB proxy — MySQL/PostgreSQL wire protocols, connection pooling, R/W splitting |
+| `ephpm-cluster` | Library | SWIM gossip via chitchat, KV replication, SQLite primary election |
+| `ephpm-query-stats` | Library | SQL normalization, digest tracking, slow query logging, Prometheus metrics |
+| `ephpm-sqld` | Library | sqld binary embedding and child process lifecycle for clustered SQLite |
+| `ephpm-e2e` | Tests | E2E test crate — excluded from the workspace, runs in Docker via `cargo xtask e2e` |
+| `xtask` | Binary | Build & test tooling — `release`, `php-sdk`, `e2e`, `e2e-up`, `e2e-down` |
 
 ### Root Cargo.toml (Virtual Manifest)
 
@@ -283,21 +297,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Build PHP static library
-        run: |
-          # Download and build static-php-cli
-          # Build libphp.a with WordPress-required extensions
-          bin/spc download --with-php=${{ matrix.php }} \
-            --for-extensions="bcmath,curl,dom,exif,fileinfo,filter,gd,hash,iconv,json,mbstring,mysqli,openssl,pcre,session,simplexml,sodium,xml,xmlreader,zip,zlib"
-          bin/spc build \
-            "bcmath,curl,dom,exif,fileinfo,filter,gd,hash,iconv,json,mbstring,mysqli,openssl,pcre,session,simplexml,sodium,xml,xmlreader,zip,zlib" \
-            --build-embed
-
-      - name: Build Rust binary
-        env:
-          PHP_VERSION: ${{ matrix.php }}
-          LIBPHP_DIR: ./buildroot
-        run: cargo build --release
+      # Release CI does NOT build PHP in-repo. `cargo xtask release` downloads a
+      # prebuilt PHP SDK tarball (static libphp.a / php8embed.dll + headers) from
+      # github.com/ephpm/php-sdk releases, caches it under php-sdk/, exports
+      # PHP_SDK_PATH, and builds the release binary against it.
+      - name: Build release binary (downloads prebuilt PHP SDK)
+        run: cargo xtask release ${{ matrix.php }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -425,33 +430,34 @@ The `ephpm-php` crate uses `bindgen` in `build.rs` to generate Rust FFI bindings
 
 **`crates/ephpm-php/build.rs`**
 
+The build contract is driven by the `PHP_SDK_PATH` environment variable: when it points at an unpacked PHP SDK (downloaded by `cargo xtask php-sdk` from `github.com/ephpm/php-sdk` releases), `build.rs` links PHP and sets the `php_linked` cfg; when it is absent, the crate compiles in **stub mode** — all FFI code is cfg'd out and `cargo build` works with no PHP toolchain at all. The SDK ships static archives (libphp plus its statically built dependencies), so there are no dynamic `xml2`/`ssl`/`curl` links.
+
 ```rust
 use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    let php_dir = env::var("LIBPHP_DIR")
-        .unwrap_or_else(|_| "/usr/local".to_string());
+    println!("cargo:rustc-check-cfg=cfg(php_linked)");
 
-    // Tell cargo to link against libphp.a
+    // No PHP_SDK_PATH → stub mode: no linking, no bindgen, `php_linked` unset.
+    let Ok(sdk_path) = env::var("PHP_SDK_PATH") else {
+        return;
+    };
+    println!("cargo:rustc-cfg=php_linked");
+
+    // Link the static archives shipped in the SDK — libphp.a and the
+    // statically built dependency archives it was produced with.
+    println!("cargo:rustc-link-search={sdk_path}/lib");
     println!("cargo:rustc-link-lib=static=php");
-    println!("cargo:rustc-link-search={}/lib", php_dir);
 
-    // Also link system libraries that PHP depends on
-    println!("cargo:rustc-link-lib=dylib=xml2");
-    println!("cargo:rustc-link-lib=dylib=z");
-    println!("cargo:rustc-link-lib=dylib=curl");
-    println!("cargo:rustc-link-lib=dylib=ssl");
-    println!("cargo:rustc-link-lib=dylib=crypto");
-
-    // Generate Rust FFI bindings
+    // Generate Rust FFI bindings from the SDK's headers
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
-        .clang_arg(format!("-I{}/include/php", php_dir))
-        .clang_arg(format!("-I{}/include/php/main", php_dir))
-        .clang_arg(format!("-I{}/include/php/Zend", php_dir))
-        .clang_arg(format!("-I{}/include/php/TSRM", php_dir))
-        .clang_arg(format!("-I{}/include/php/sapi/embed", php_dir))
+        .clang_arg(format!("-I{sdk_path}/include/php"))
+        .clang_arg(format!("-I{sdk_path}/include/php/main"))
+        .clang_arg(format!("-I{sdk_path}/include/php/Zend"))
+        .clang_arg(format!("-I{sdk_path}/include/php/TSRM"))
+        .clang_arg(format!("-I{sdk_path}/include/php/sapi/embed"))
         .generate()
         .expect("Unable to generate PHP bindings");
 
@@ -658,7 +664,7 @@ A single Rust binary that reads a TOML config, boots an HTTP server with embedde
 
 1. **`ephpm` binary** — single Rust binary with PHP statically linked
 2. **TOML config** — `ephpm.toml` with `[server]` and `[php]` sections
-3. **HTTP server** — hyper-based, HTTP/1.1 + HTTP/2
+3. **HTTP server** — hyper-based, HTTP/1.1 (HTTP/2 requires TLS ALPN, so it arrives together with TLS, which the MVP excludes)
 4. **PHP execution** — custom SAPI, ZTS mode, concurrent via `spawn_blocking` + TSRM
 5. **Static file serving** — CSS/JS/images served directly (not through PHP)
 6. **WordPress demo** — documented setup: download WordPress, point `document_root`, connect to external MySQL, verify admin panel works
@@ -689,7 +695,10 @@ Client ──HTTP──► hyper (tokio)
           static file   spawn_blocking
           serving           │
                             ▼
-                     Mutex<PhpRuntime>
+                     PHP worker thread (ZTS —
+                     per-thread TSRM context,
+                     requests run concurrently,
+                     no global lock)
                             │
                      1. Set SAPI request info
                         (method, URI, headers, body)
@@ -709,6 +718,8 @@ Client ──HTTP──► hyper (tokio)
                             │
 Client ◄──HTTP──────────────┘
 ```
+
+PHP execution is lock-free and concurrent: PHP is compiled with ZTS, and each `spawn_blocking` thread registers with TSRM on first use to get its own isolated PHP context. A `Mutex` guards only the one-time `init()`/`shutdown()` — never request execution.
 
 **URL Rewriting for WordPress:**
 
@@ -795,9 +806,9 @@ This is the same approach FrankenPHP uses.
 |-------------|----------------------------|---------------|
 | PHP 8.1 | EOL (December 2025) | Not supported |
 | PHP 8.2 | Security-only (until Dec 2026) | Best-effort |
-| PHP 8.3 | Active support (until Dec 2026) | **Primary** |
-| PHP 8.4 | Active support (until Dec 2027) | **Primary** |
-| PHP 8.5 | In development | Track for v1 |
+| PHP 8.3 | Active support (until Dec 2026) | **Supported — in CI (pinned 8.3.31)** |
+| PHP 8.4 | Active support (until Dec 2027) | **Supported — in CI (pinned 8.4.22)** |
+| PHP 8.5 | Active support | **Supported — in CI (pinned 8.5.7)** |
 
 ### Release Naming
 
@@ -954,8 +965,8 @@ This is the hardest crate and the core of the project.
 | **v0.2: ZTS + Workers** | Thread-safe PHP, multiple concurrent requests | **Implemented** (ZTS via `spawn_blocking` + TSRM) |
 | **v0.3: TLS** | Automatic HTTPS via `rustls-acme`, Let's Encrypt | Planned |
 | **v0.4: DB Proxy** | **Implemented (partial)**: MySQL transparent proxy, connection pooling, reset strategy; **Missing**: read/write splitting, replication, slow query analysis | Ahead of schedule |
-| **v0.5: KV Store** | **Implemented (partial)**: Single-node RESP2 server, ~30 Redis commands, TTL/expiry, memory tracking, SAPI bridge for direct PHP access; **Missing**: data structures (hashes/lists/sets), clustering, persistence, eviction policies | Ahead of schedule |
+| **v0.5: KV Store** | **Implemented**: Single-node RESP2 server, strings + hashes, TTL/expiry, eviction policies (`noeviction`/`allkeys-lru`/`volatile-lru`/`allkeys-random`) with memory-limit enforcement, compression, SAPI bridge for direct PHP access, clustering; **Missing**: lists/sets/sorted sets, persistence | Shipped |
 | **v0.6: Admin UI** | Embedded web dashboard, request inspector | Planned |
-| **v0.7: Observability** | OTLP receiver, auto-instrumentation, Prometheus `/metrics` | Planned |
-| **v0.8: Clustering** | Gossip discovery, hash ring, KV replication | Planned |
+| **v0.7: Observability** | Prometheus `/metrics` + query stats **implemented**; OTLP receiver and auto-instrumentation still planned | Partially shipped |
+| **v0.8: Clustering** | Gossip discovery (chitchat), hash-based key ownership, gossip KV replication for small values, SQLite primary election | **Implemented** |
 | **v1.0: Production** | Read/write splitting, replication lag awareness, hardening | Planned |

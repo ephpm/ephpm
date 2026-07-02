@@ -235,7 +235,7 @@ The log includes the **normalized** SQL (no PII from literal values) and the dur
 The threshold is configurable via TOML:
 
 ```toml
-[db]
+[db.analysis]
 slow_query_threshold = "1s"
 ```
 
@@ -330,19 +330,18 @@ The `QueryStats` instance is passed into the proxy at construction time (from `s
 ### Configuration
 
 ```toml
-[db]
+[db.analysis]
 # Slow query threshold (applies to both DB Proxy and LiteWire).
 # Default: "1s"
 slow_query_threshold = "1s"
 
-[db.analysis]
 # Maximum distinct query digests to track.
 # Default: 100000
-digest_max_entries = 100000
+digest_store_max_entries = 100000
 
-# Include query stats in Prometheus /metrics endpoint.
+# Include query stats in the Prometheus metrics endpoint.
 # Default: true
-query_metrics = true
+query_stats = true
 ```
 
 The `[db.analysis]` section already exists in `DbConfig` (currently used for planned auto-explain features). Query stats configuration fits naturally here.
@@ -374,7 +373,7 @@ Stats are ephemeral -- they exist only in memory for the lifetime of the process
 
 ### Top Queries Endpoint
 
-Optional: expose a `/__/queries` admin endpoint (alongside the existing `/__/metrics`) that returns the top N queries by total time. Useful for quick debugging without Prometheus.
+Idea (not implemented): expose a `/__/queries` endpoint that returns the top N queries by total time, for quick debugging without Prometheus. (Note there is no `/__/metrics` — Prometheus metrics are served at the configurable `[server.metrics]` path, `/metrics` by default.)
 
 ```
 GET /__/queries?limit=20&sort=total_time

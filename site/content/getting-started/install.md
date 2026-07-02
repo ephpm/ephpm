@@ -28,9 +28,9 @@ docker run -p 8080:8080 \
 | `ephpm/ephpm:8.5` / `ephpm/ephpm:8.4` | Rolling latest release pinned to a PHP minor |
 | `ephpm/ephpm:vX.Y.Z` | Pinned ePHPm release with the default PHP minor |
 | `ephpm/ephpm:vX.Y.Z-php8.5` | Pinned release × rolling PHP minor |
-| `ephpm/ephpm:vX.Y.Z-php8.5.2` | Pinned release × pinned PHP patch (fully reproducible) |
+| `ephpm/ephpm:vX.Y.Z-php8.5.7` | Pinned release × pinned PHP patch (fully reproducible) |
 
-Real SemVer build metadata uses `+` (`v0.0.1+php8.5.2`), but OCI tags reject `+`, so Docker tags substitute `-` while the upstream `+` form is preserved on each image's `org.opencontainers.image.version` label — the same trade-off k3s and rke2 make.
+Real SemVer build metadata uses `+` (`v0.2.0+php8.5.7`), but OCI tags reject `+`, so Docker tags substitute `-` while the upstream `+` form is preserved on each image's `org.opencontainers.image.version` label — the same trade-off k3s and rke2 make.
 
 For the standalone binary install path (single-binary, self-installing, no container runtime needed), grab an archive from [Releases](https://github.com/ephpm/ephpm/releases) and continue with the Linux / macOS or Windows section below.
 
@@ -44,22 +44,9 @@ sudo ./ephpm install
 
 `install` copies the binary to `/usr/local/bin/ephpm`, writes a default config to `/etc/ephpm/ephpm.toml`, registers a systemd service (Linux) or launchd plist (macOS), and starts it. By default the server listens on `http://localhost:8080`.
 
-Variants:
-
-```bash
-# Install without starting the service
-sudo ./ephpm install --no-start
-
-# Skip writing the default config (keep an existing one)
-sudo ./ephpm install --no-config
-
-# Install the binary only — no service, no config
-sudo ./ephpm install --binary-only
-```
-
 ## Windows
 
-Download `ephpm.exe` from [Releases](https://github.com/ephpm/ephpm/releases). In an Administrator PowerShell:
+Download the Windows `.tar.gz` archive from [Releases](https://github.com/ephpm/ephpm/releases) and extract `ephpm.exe` from it. In an Administrator PowerShell:
 
 ```powershell
 .\ephpm.exe install
@@ -107,25 +94,26 @@ For contributors or custom builds. Requires Rust 1.85+.
 ```bash
 # Stub mode — no PHP, fast iteration on HTTP/routing logic
 cargo build
-cargo run -- --config ephpm.toml
+cargo run -- serve --config ephpm.toml
 ```
 
 ```bash
 # Release binary with PHP embedded.
-# Prerequisites: php-cli 8.2+, composer, git, build-essential, autoconf, cmake,
-# pkg-config, re2c, libssl-dev (libssl-devel/openssl-devel on RHEL/Fedora).
+# Prerequisites: git, curl, tar, build-essential, pkg-config, libclang-dev,
+# and musl-tools/musl-dev on Linux (the prebuilt libphp.a is musl-linked).
 cargo xtask release       # → target/release/ephpm
 cargo xtask release 8.4   # use PHP 8.4 instead of 8.5
 ```
 
-On Windows, `cargo xtask release` re-invokes itself inside WSL automatically (the PHP SDK build needs a Unix toolchain). Cross-compiled `.exe` builds work via [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin):
+`cargo xtask release` doesn't build PHP locally — it downloads a prebuilt PHP SDK (`libphp.a` plus headers) from [github.com/ephpm/php-sdk](https://github.com/ephpm/php-sdk) releases. No PHP CLI, Composer, or static-php-cli toolchain is required. The SDK is cached at `php-sdk/<version>-<os>-<arch>/`; delete that directory to force a re-download.
 
-```bash
-cargo install cargo-xwin
-cargo xtask release --target windows
+Windows builds run natively (no cross-compile, no `cargo-xwin`) — you just need the MSVC build tools:
+
+```powershell
+cargo xtask release --target windows   # → target\x86_64-pc-windows-msvc\release\ephpm.exe
 ```
 
-The first `cargo xtask release` is slow (it builds a fully static PHP via [static-php-cli](https://github.com/crazywhalecc/static-php-cli) — about 15 minutes). It's cached at `php-sdk/static-php-cli/buildroot/`; delete that to force a rebuild.
+The SDK download is the same php-sdk release, with prebuilt `php8embed.dll`/`.lib` for Windows.
 
 A binary built from source can also self-install:
 

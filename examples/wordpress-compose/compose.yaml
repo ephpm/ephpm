@@ -78,7 +78,7 @@ services:
     # includes the fix for the MySQL 8 backend handshake; older images
     # ("Bad handshake" against MySQL 8.x) won't work for this demo.
     # Use ephpm/ephpm:8.5 to track the rolling latest-release / PHP 8.5.
-    image: ephpm/ephpm:v0.1.1-php8.5.7
+    image: ephpm/ephpm:v0.2.0-php8.5.7
     depends_on:
       init:
         condition: service_completed_successfully

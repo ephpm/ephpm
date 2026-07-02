@@ -6,21 +6,23 @@ This document covers the SQL connection pooling proxy, wire protocol implementat
 
 ## Status
 
-**Currently Implemented (v0.4 preview):**
-- MySQL transparent proxy with wire protocol handshake and authentication
+**Currently Implemented:**
+- MySQL transparent proxy with wire protocol handshake (`mysql_native_password` and `caching_sha2_password` backend auth)
+- PostgreSQL transparent proxy (`crates/ephpm-db/src/postgres.rs`)
 - Connection pooling with configurable min/max connections
 - Connection reset strategy (always/smart/never) to reset session state between clients
 - Health checks and idle connection timeout management
 - TCP listener on configurable port
+- Read/write splitting based on first-keyword query classification, with sticky-after-write routing and replica round-robin
+- Replication support (primary + replica pools via `[db.mysql.replicas]`)
+- Slow query detection and logging (`ephpm-query-stats`, `[db.analysis].slow_query_threshold`)
+- Query digest / statistics collection with Prometheus export
 
 **Planned / Not Yet Implemented:**
-- Read/write splitting based on query analysis
-- Replication support (primary + replicas)
-- Replica lag awareness
-- Slow query detection and logging
-- EXPLAIN output analysis
-- Query digest / statistics collection
-- PostgreSQL support (placeholder exists, needs implementation)
+- TDS proxying to a real SQL Server — the `[db.tds]` config is accepted, but startup logs a warning and no proxy is started (litewire's TDS frontend for embedded SQLite is separate and does work)
+- Replica lag awareness (`strategy = "lag-aware"` is parsed but not acted upon)
+- Auto-EXPLAIN output analysis (`auto_explain` is parsed but not acted upon)
+- Unix socket frontends (`socket` is parsed but not wired up)
 - OTel span emission for query tracing
 
 ---
@@ -60,10 +62,9 @@ sticky_duration = "2s"
 
 [db.analysis]
 slow_query_threshold = "200ms"
-auto_explain = true
 ```
 
-WordPress reads (most page loads) go to the replica. Writes (post saves, comment submissions) go to the primary. After a write, reads stick to the primary for 2s to avoid stale data. Queries over 200ms are logged with EXPLAIN output.
+WordPress reads (most page loads) go to the replica. Writes (post saves, comment submissions) go to the primary. After a write, reads stick to the primary for 2s to avoid stale data. Queries over 200ms are logged as slow queries. (Automatic `EXPLAIN` on slow queries — `auto_explain` — is planned: the config key is parsed but not yet implemented.)
 
 ### Laravel with PostgreSQL
 
@@ -72,7 +73,6 @@ Laravel app on Postgres with read replicas and aggressive pooling:
 ```toml
 [db.postgres]
 url = "postgres://laravel:secret@pg-primary:5432/myapp"
-socket = "/run/ephpm/pgsql.sock"
 min_connections = 5
 max_connections = 30
 pool_timeout = "3s"
@@ -86,16 +86,14 @@ urls = [
 
 [db.read_write_split]
 enabled = true
-strategy = "lag-aware"
-max_replica_lag = "500ms"
+strategy = "sticky-after-write"
+sticky_duration = "2s"
 
 [db.analysis]
 slow_query_threshold = "50ms"
-auto_explain = true
-auto_explain_target = "replica"
 ```
 
-Uses Unix socket for lower latency. Lag-aware splitting monitors replica lag and only routes reads to replicas within 500ms of the primary. Slow query threshold at 50ms for a performance-sensitive app.
+Reads round-robin across the two replicas; writes go to the primary, with sticky-after-write routing to avoid stale reads. Slow query threshold at 50ms for a performance-sensitive app. (`strategy = "lag-aware"` and `auto_explain` are parsed but not yet implemented — both are planned; use `sticky-after-write` for now.)
 
 ### Dual Database (MySQL + PostgreSQL)
 
@@ -291,8 +289,11 @@ PHP: new PDO("mysql:host=127.0.0.1")
        ▼
   1. Frontend accepts connection (MySQL/PG wire handshake)
   2. PHP sends authentication credentials
-  3. Proxy validates credentials against config
-       (NOT forwarded to real DB — proxy authenticates independently)
+  3. Proxy reads the handshake response and accepts it WITHOUT
+     validating credentials — any username/password is accepted.
+     The security model is the loopback-only listener (by design;
+     see Security below). Backend connections authenticate to the
+     real database independently with the credentials from config.
   4. Connection established — proxy creates a ConnectionState
        │
        ▼
@@ -416,18 +417,18 @@ PostgreSQL Wire Protocol:
 
 `pgwire` provides `SimpleQueryHandler` and `ExtendedQueryHandler` traits. ePHPm implements these to intercept queries, run them through the analyzer, and forward to the backend pool.
 
-### Unix Socket Frontend
+### Unix Socket Frontend (Planned — Not Yet Wired)
 
-Like the KV RESP listener, the DB proxy can also listen on Unix sockets for lower latency:
+The `socket` config key is parsed and stored, but the proxy does not yet listen on it — only the TCP `listen` address is served (see `MySqlProxy::_socket` in `crates/ephpm-db/src/mysql.rs`; wiring it up requires `tokio::net::UnixListener` support in `run()`). When implemented, it will work like the KV RESP listener:
 
 ```toml
 [db.mysql]
 listen = "127.0.0.1:3306"              # TCP (default, zero-config)
-socket = "/run/ephpm/mysql.sock"        # Unix socket (~2-5x faster)
+socket = "/run/ephpm/mysql.sock"        # Unix socket (planned, not yet wired)
 
 [db.postgres]
 listen = "127.0.0.1:5432"
-socket = "/run/ephpm/pgsql.sock"
+socket = "/run/ephpm/pgsql.sock"        # planned, not yet wired
 ```
 
 PHP frameworks detect Unix sockets automatically:
@@ -546,55 +547,46 @@ The admin UI surfaces this as a slow query dashboard with the EXPLAIN plan inlin
 
 ## Read/Write Splitting
 
-`sqlparser-rs` classifies queries by type:
+Queries are classified by their **first keyword** — a fast string match, not a SQL parse (`classify_mysql_query` in `crates/ephpm-db/src/mysql.rs`):
 
 ```rust
-use sqlparser::ast::Statement;
+/// Classify a SQL query based on its first keyword.
+pub fn classify_mysql_query(sql: &str) -> QueryKind {
+    let tok = sql.trim_start().split_ascii_whitespace().next()
+        .unwrap_or("").to_ascii_uppercase();
 
-fn classify_query(stmt: &Statement) -> QueryType {
-    match stmt {
-        Statement::Query(_) => {
-            // Check for FOR UPDATE / FOR SHARE — these are writes (take locks)
-            // Check for INTO OUTFILE — this is a write
-            // Otherwise: read
-            QueryType::Read
+    match tok.as_str() {
+        "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" => {
+            // SELECT ... FOR UPDATE / FOR SHARE take locks → Write
+            if sql.to_ascii_uppercase().contains("FOR UPDATE")
+                || sql.to_ascii_uppercase().contains("FOR SHARE")
+            {
+                QueryKind::Write
+            } else {
+                QueryKind::Read
+            }
         }
-        Statement::ShowTables { .. } |
-        Statement::ShowColumns { .. } |
-        Statement::Explain { .. } => QueryType::Read,
-
-        Statement::Insert { .. } |
-        Statement::Update { .. } |
-        Statement::Delete { .. } |
-        Statement::CreateTable { .. } |
-        Statement::AlterTable { .. } |
-        Statement::Drop { .. } |
-        Statement::Truncate { .. } => QueryType::Write,
-
-        Statement::StartTransaction { .. } => QueryType::TransactionBegin,
-        Statement::Commit { .. } => QueryType::TransactionEnd,
-        Statement::Rollback { .. } => QueryType::TransactionEnd,
-
-        // Unknown — safe default is primary
-        _ => QueryType::Write,
+        "BEGIN" | "START" => QueryKind::TxBegin,
+        "COMMIT" | "ROLLBACK" => QueryKind::TxEnd,
+        _ => QueryKind::Write, // Default: treat as write (safest)
     }
 }
 ```
 
-Read-only queries route to the replica pool. Writes route to the primary. Unknown statement types default to primary (conservative).
+Read-only queries (`SELECT`, `SHOW`, `EXPLAIN`, `DESCRIBE`) route to the replica pool; a `contains("FOR UPDATE")`/`FOR SHARE` check catches locking reads and sends them to the primary. Anything with an unrecognized first keyword (`INSERT`, `UPDATE`, `CALL`, DDL, …) defaults to Write → primary (conservative). No AST-level parsing is involved — the first-keyword approach is cheaper on the hot path and errs toward the primary when in doubt.
 
 ```
 PHP: SELECT * FROM users WHERE id = 5
-  → ePHPm parses → Read → routes to replica pool
+  → ePHPm classifies → Read → routes to replica pool
 
 PHP: INSERT INTO orders (...) VALUES (...)
-  → ePHPm parses → Write → routes to primary
+  → ePHPm classifies → Write → routes to primary
 
 PHP: SELECT * FROM inventory WHERE id = 5 FOR UPDATE
-  → ePHPm parses → Write (FOR UPDATE takes locks) → routes to primary
+  → ePHPm classifies → Write (FOR UPDATE takes locks) → routes to primary
 
 PHP: CALL process_order(42)
-  → ePHPm parses → Unknown → defaults to primary (safe)
+  → ePHPm classifies → unrecognized keyword → defaults to primary (safe)
 
 PHP: BEGIN; SELECT ...; UPDATE ...; COMMIT;
   → ePHPm detects TransactionBegin → pins to primary until TransactionEnd
@@ -763,7 +755,8 @@ ePHPm parses the SQL, extracts the shard key from the WHERE clause, hashes it, a
 - Connection credentials stored in config (same secret handling as TLS keys)
 - Query digest logging must not log sensitive parameter values — normalization replaces all literals with `?` before storage
 - Connection pooling must isolate session state between frontend connections (see Connection State Tracking)
-- Backend credentials never exposed to PHP — PHP authenticates against the proxy, proxy authenticates against the real database independently
+- Backend credentials never exposed to PHP — the proxy authenticates against the real database independently with the credentials from config
+- **The proxy does NOT validate client credentials.** The client handshake is read and discarded; any username/password is accepted. This is by design (documented in the `crates/ephpm-db/src/mysql.rs` module header): the trust boundary is the listener address, not authentication. **Operational guidance: keep `listen` on `127.0.0.1`** (the default). Never bind the proxy frontend to a routable interface — anyone who can reach the port gets the backend's access.
 
 ---
 
@@ -838,13 +831,13 @@ urls = [
 
 [db.read_write_split]
 enabled = false
-strategy = "sticky-after-write"        # sticky-after-write or lag-aware
+strategy = "sticky-after-write"        # "lag-aware" is parsed but not yet implemented
 sticky_duration = "2s"
-max_replica_lag = "500ms"              # for lag-aware strategy
+max_replica_lag = "500ms"              # for lag-aware strategy (planned, not yet implemented)
 
 [db.analysis]
 slow_query_threshold = "100ms"
-auto_explain = true
-auto_explain_target = "replica"        # don't hit primary with EXPLAINs
-digest_store_max_entries = 10000       # max unique query digests to track
+auto_explain = false                   # planned, not yet implemented (parsed but not acted upon)
+auto_explain_target = "stderr"         # planned, not yet implemented
+digest_store_max_entries = 100000      # max unique query digests to track (default)
 ```

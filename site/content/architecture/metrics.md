@@ -58,7 +58,7 @@ SQL queries flowing through the DB proxy or litewire.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `ephpm_query_duration_seconds` | histogram | `digest`, `kind` | Per-query execution time. `kind` is `"read"` or `"write"`. `digest` is the normalized SQL. |
+| `ephpm_query_duration_seconds` | histogram | `digest`, `kind` | Per-query execution time. `kind` is `"query"` or `"mutation"`. `digest` is the normalized SQL. |
 | `ephpm_query_total` | counter | `digest`, `kind`, `status` | Query count by digest. `status` is `"ok"` or `"error"`. |
 | `ephpm_query_rows_total` | counter | `digest`, `kind` | Total rows returned/affected per digest. |
 | `ephpm_query_slow_total` | counter | — | Number of queries exceeding the slow query threshold. |

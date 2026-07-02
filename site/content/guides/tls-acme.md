@@ -49,7 +49,7 @@ cache_dir = "/var/lib/ephpm/certs"
 
 ePHPm will:
 
-1. Solve a HTTP-01 challenge on the same listener (so port 80 must be reachable from the public internet for issuance, OR you can serve TLS-ALPN-01 on 443).
+1. Solve a TLS-ALPN-01 challenge on the HTTPS listener itself — the only challenge type implemented. Port 443 must be reachable from the public internet for issuance; port 80 is never used for ACME.
 2. Save the issued certificate and account key under `cache_dir`.
 3. Renew automatically before expiry.
 
@@ -69,21 +69,23 @@ staging  = true                # untrusted certs, generous rate limits
 
 Browsers will warn — that's expected. Once it works, drop `staging = true` and clear `cache_dir`.
 
-### HTTP listener for HTTP-01
+### Optional HTTP listener with redirect
 
 If you want both an HTTP (port 80) and HTTPS (port 443) listener with automatic redirect:
 
 ```toml
 [server]
-listen = "0.0.0.0:80"          # HTTP — also where HTTP-01 challenges land
+listen = "0.0.0.0:80"          # HTTP — serves traffic or 301-redirects, never ACME
 
 [server.tls]
-listen = "0.0.0.0:443"         # HTTPS
+listen = "0.0.0.0:443"         # HTTPS — ACME challenges (TLS-ALPN-01) happen here
 domains = ["example.com"]
 email   = "admin@example.com"
 cache_dir = "/var/lib/ephpm/certs"
 redirect_http = true
 ```
+
+The plain-HTTP listener only serves regular traffic (or 301-redirects when `redirect_http = true`). ACME challenges are always solved on the HTTPS listener via TLS-ALPN-01 — HTTP-01 is not implemented, so port 80 is never required for certificate issuance.
 
 ## Clustered ACME
 

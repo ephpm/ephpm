@@ -1,6 +1,6 @@
 # Virtual Hosts
 
-ePHPm supports multi-tenant hosting through directory-based virtual hosts. Each domain gets its own document root and SQLite database. No per-site configuration files needed — the directory structure IS the config.
+ePHPm supports multi-tenant hosting through directory-based virtual hosts. Each domain gets its own document root and its own isolated KV store. No per-site configuration files needed — the directory structure IS the config. (All sites currently share the single global SQLite database — per-site databases are planned for Phase 2, see below.)
 
 ## How It Works
 
@@ -16,7 +16,7 @@ When a request comes in, ePHPm matches the `Host` header against directories in 
 ```
 Request: Host: alice-blog.com
   → Look for /var/www/sites/alice-blog.com/
-  → Found? Serve from that directory with its own SQLite database
+  → Found? Serve from that directory (all sites share the global SQLite database)
   → Not found? Fall back to server.document_root (or 404 if not configured)
 ```
 
@@ -31,15 +31,12 @@ Request: Host: alice-blog.com
     alice-blog.com/               # docroot for alice-blog.com
       index.php
       wp-content/
-      ephpm.db                    # auto-created SQLite database
     bobs-recipes.com/             # docroot for bobs-recipes.com
       index.php
       wp-content/
-      ephpm.db
     cool-photos.net/              # docroot for cool-photos.net
       index.php
       wp-content/
-      ephpm.db
 ```
 
 Adding a site: create a directory named after the domain, drop WordPress in it.
@@ -47,36 +44,13 @@ Removing a site: delete the directory. Requests to that domain hit the fallback.
 
 ### Per-Site Overrides
 
-Most sites need zero configuration — they inherit PHP settings, timeouts, and security rules from the global config. If a site needs custom settings, drop a `site.toml` in its directory:
+Today, per-site configuration is intentionally minimal. What's discovered per site from `sites_dir` is the document root (the directory itself) plus that site's `index_files` and `fallback`. Everything else — PHP settings, timeouts, security rules, database — comes from the global `ephpm.toml` and is shared by all sites.
 
-```
-/var/www/sites/alice-blog.com/
-  site.toml                       # optional overrides
-  index.php
-  ephpm.db
-```
-
-```toml
-# site.toml — only set what you want to override
-[php]
-memory_limit = "256M"             # this site needs more memory
-max_execution_time = 120          # long-running admin import scripts
-ini_overrides = [
-    ["display_errors", "On"],     # staging vhost — surface errors in-page
-    ["upload_max_filesize", "32M"],
-]
-
-[db.sqlite]
-path = "/mnt/fast-ssd/alice.db"   # custom database location
-```
-
-The `[php]` block in `site.toml` has the same shape as the global `[php]` block in `ephpm.toml` — every key documented for `PhpConfig` (`memory_limit`, `max_execution_time`, `ini_file`, `ini_overrides`, `workers`) is overridable per site. Everything not specified in `site.toml` falls through to the global `ephpm.toml`. Lists like `ini_overrides` are replaced wholesale, not merged element-wise — if you set `ini_overrides` per site you take ownership of the full list for that site.
+A richer per-site override system (a `site.toml` dropped into the site directory with `[php]` and `[db.sqlite]` overrides) is planned for [Phase 2](#phase-2-per-site-databases-and-overrides-future). Until then, if one site needs a larger `memory_limit` or `max_execution_time`, raise the global value in `ephpm.toml`.
 
 ### SQLite Database Location
 
-By default, the SQLite database is created as `ephpm.db` inside the site's directory. This keeps everything self-contained — a site is one directory with code and data together.
-
-Override with `db.sqlite.path` in `site.toml` if you need the database on a different volume (e.g., fast SSD for the database, cheap storage for uploads).
+All sites share the single global SQLite database configured via `[db.sqlite] path` in `ephpm.toml`. Per-site databases (an `ephpm.db` inside each site's directory) are planned for Phase 2 — they require litewire `COM_INIT_DB` routing or per-site litewire instances.
 
 ### Host Matching
 
@@ -109,11 +83,10 @@ All sites share one ephpm process and tokio's `spawn_blocking` thread pool. A re
    │   │ (shared spawn_blocking pool) │                             │
    │   └──────────────┬───────────────┘                             │
    │                  │                                             │
-   │   ┌──────────────┴────── Site Backends ─────────────┐          │
+   │   ┌──────────────┴───── Shared Backend ─────────────┐          │
    │   │                                                 │          │
-   │   │   alice-blog.com    rusqlite → alice/ephpm.db   │          │
-   │   │   bobs-recipes.com  rusqlite → bobs/ephpm.db    │          │
-   │   │   cool-photos.net   rusqlite → cool/ephpm.db    │          │
+   │   │   litewire → rusqlite → global [db.sqlite].path │          │
+   │   │   (all sites, one database)                     │          │
    │   │                                                 │          │
    │   └─────────────────────────────────────────────────┘          │
    │                                                                │
@@ -122,11 +95,9 @@ All sites share one ephpm process and tokio's `spawn_blocking` thread pool. A re
 
 This is efficient — 20 sites don't need 20x the threads. Any `spawn_blocking` thread can serve any site.
 
-### Per-Site litewire Instances
+### Shared litewire Instance
 
-Each site gets its own litewire MySQL frontend and rusqlite backend. The frontends share a port range or use the site's `Host` header for routing (since MySQL wire protocol doesn't carry Host, each site that needs MySQL wire access gets its own port, or all sites share one litewire instance that routes by the current request context).
-
-For most WordPress setups, PHP connects to litewire on `127.0.0.1:3306`. The router injects the correct `DB_HOST`, `DB_PORT`, and database path per site before PHP executes.
+One litewire MySQL frontend and one rusqlite backend serve every site. PHP on any site connects to litewire on `127.0.0.1:3306`, and all queries land in the single global SQLite database. Per-site databases would require routing MySQL wire connections per site (the MySQL protocol doesn't carry a Host header), via `COM_INIT_DB` routing or per-site litewire instances — that's Phase 2 work.
 
 ## Resource Usage
 
@@ -135,11 +106,11 @@ For most WordPress setups, PHP connects to litewire on `127.0.0.1:3306`. The rou
 | Sites | Typical memory | Notes |
 |-------|---------------|-------|
 | 1 | ~270 MB | Baseline (4 workers) |
-| 5 | ~300 MB | +~6 MB per SQLite database loaded |
-| 10 | ~330 MB | SQLite only loads when queried |
-| 20 | ~390 MB | Idle sites use near-zero extra memory |
+| 5 | ~300 MB | Small per-site overhead (KV store, file cache) |
+| 10 | ~330 MB | Idle sites use near-zero extra memory |
+| 20 | ~390 MB | The thread pool doesn't grow with site count |
 
-SQLite databases are opened on demand. An idle site with no recent traffic has minimal memory footprint — just the file handle. The thread pool doesn't grow with site count.
+All sites share one SQLite database and one thread pool, so memory grows only with actively cached data — not with the number of directories in `sites_dir`.
 
 ### CPU
 
@@ -157,22 +128,15 @@ Shared across all sites. A 2 vCPU machine handles ~20-40 total req/s across all 
 
 ## Clustered Mode with Virtual Hosts
 
-Virtual hosts work with clustered SQLite, but each site spawns its own sqld child process for replication. This adds ~40-50 MB memory per site.
+Virtual hosts work with clustered SQLite. Because every site shares the single global database, each node runs exactly one sqld child process (~40-50 MB) regardless of how many vhosts exist — replication cost does not grow with site count.
 
-| Sites (clustered) | sqld processes | Extra memory |
-|-------------------|---------------|-------------|
-| 1 | 1 | ~40 MB |
-| 3 | 3 | ~120 MB |
-| 5 | 5 | ~200 MB |
-| 10+ | 10+ | Not recommended |
+The tradeoff is granularity: the whole shared database replicates as a unit. You can't cluster one site and leave the rest single-node.
 
-**Recommendation:** Use single-node SQLite for multi-tenant hosting. Back up with volume snapshots or Litestream. If specific sites need HA, consider:
+**Recommendation:** Use single-node SQLite for multi-tenant hosting. Back up with volume snapshots or Litestream. If you need more, consider:
 
-- Promote just those sites to clustered mode (per-site `site.toml` override)
+- Enable clustering — the shared database replicates across nodes as one unit
 - Move high-traffic sites to an external MySQL via the DB proxy
-- Run a separate ephpm instance for clustered sites
-
-Beyond 3-5 clustered vhosts, an external MySQL server with ePHPm's connection-pooling DB proxy is more resource-efficient than per-site sqld processes.
+- Run a separate ephpm instance (with its own database) for sites with different HA needs
 
 ## KV Store Isolation
 
@@ -209,22 +173,27 @@ When `sites_dir` is not configured, all KV operations go to the global store. No
 
 ### RESP Protocol (Redis-Compatible) with AUTH
 
-The RESP protocol listener supports per-site isolation via the Redis `AUTH` command. A RESP connection authenticates with a hostname to access that site's store:
-
-```
-redis-cli -p 6379
-AUTH alice-blog.com
-SET cache:page:home "<html>..."
-GET cache:page:home   → "<html>..."
-```
-
-Without AUTH, the connection accesses the default (global) store. In multi-tenant deployments, configure RESP to require AUTH:
+The RESP protocol listener supports per-site isolation via the Redis `AUTH` command. Multi-tenant auth requires a `[kv] secret`:
 
 ```toml
+[kv]
+secret = "generate-a-long-random-string"   # enables multi-tenant HMAC auth
+
 [kv.redis_compat]
 enabled = true
 listen = "127.0.0.1:6379"
 ```
+
+A RESP connection authenticates with **two** arguments — the site's hostname plus a password derived from the secret: `HMAC-SHA256(kv.secret, hostname)`. ePHPm injects that derived password into each site's PHP environment as `EPHPM_REDIS_PASSWORD`, so PHP Redis clients can authenticate without hardcoded credentials:
+
+```
+redis-cli -p 6379
+AUTH alice-blog.com <derived_password>
+SET cache:page:home "<html>..."
+GET cache:page:home   → "<html>..."
+```
+
+When `[kv] secret` is set, unauthenticated connections are rejected with `NOAUTH` — they do **not** fall back to the default store. The single-argument form `AUTH <password>` is only the legacy plain-password mode (no site isolation); it does not select a site store.
 
 ### Architecture
 
@@ -248,10 +217,12 @@ MultiTenantStore
 ### RESP connection flow
 
 ```
-RESP client connects → AUTH alice-blog.com
+RESP client connects → AUTH alice-blog.com <derived_password>
+  → verify password == HMAC-SHA256(kv.secret, "alice-blog.com")
   → MultiTenantStore.auth_site("alice-blog.com")
   → returns alice's Store
   → all subsequent commands operate on alice's DashMap only
+(no AUTH while [kv] secret is set → NOAUTH error)
 ```
 
 ## Fallback Site as Marketing Funnel
@@ -301,12 +272,12 @@ document_root = "/var/www/default"
 # Omit to disable vhosting (single-site mode).
 sites_dir = "/var/www/sites"
 
-# Global PHP settings (inherited by all sites unless overridden)
+# Global PHP settings (shared by all sites)
 [php]
 workers = 4
 memory_limit = "128M"
 
-# Global SQLite defaults (inherited by all sites)
+# Global SQLite config (one database, shared by all sites)
 [db.sqlite.proxy]
 mysql_listen = "127.0.0.1:3306"
 ```
@@ -349,7 +320,7 @@ Put a reverse proxy (Caddy recommended — automatic HTTPS per domain) in front 
 
 ### Phase 1: Directory-Based Routing (implemented)
 
-Host header → site directory mapping with per-site document roots. All sites share the global SQLite database, KV store, and PHP thread pool.
+Host header → site directory mapping with per-site document roots, plus per-site KV store isolation (`MultiTenantStore`). All sites share the global SQLite database and PHP thread pool.
 
 | Step | Change | File |
 |------|--------|------|
@@ -368,7 +339,6 @@ When `sites_dir` is not configured, the router behaves identically to today (sin
 |---------|-------------|
 | Per-site SQLite | Each site gets its own `ephpm.db` in its directory. Requires litewire COM_INIT_DB routing or per-site litewire instances |
 | Per-site `site.toml` | Optional overrides for `index_files`, `fallback`, `php.memory_limit`, `db.sqlite.path`, etc. Merged with global config |
-| Per-site KV namespacing | Prefix KV keys by site to prevent cross-site data leakage |
 | Per-site metrics | Add `host` label to Prometheus metrics for per-site traffic visibility |
 
 ### Phase 3: Operational Features (future)

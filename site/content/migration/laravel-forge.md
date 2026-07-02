@@ -71,13 +71,15 @@ ePHPm equivalent:
 # /etc/ephpm/ephpm.toml
 
 [server]
-listen = "0.0.0.0:8080"
+listen = "0.0.0.0:80"                # HTTP — 301-redirects to HTTPS
 document_root = "/home/forge/example.com/current/public"
 fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 
 [server.tls]
-acme_domains = ["example.com"]
-acme_email = "you@example.com"
+listen = "0.0.0.0:443"               # HTTPS listener
+domains = ["example.com"]
+email = "you@example.com"
+redirect_http = true
 
 [php]
 memory_limit = "256M"
@@ -87,6 +89,8 @@ workers = 8
 [db.sqlite]
 path = "/home/forge/example.com/database/database.sqlite"
 ```
+
+Note the two listeners: if `[server.tls]` had no `listen` of its own, the main `[server] listen` port would serve HTTPS directly. The split above (`:80` HTTP + `[server.tls] listen = ":443"` with `redirect_http = true`) reproduces Forge's usual redirect setup.
 
 ### 3. Update Your .env
 

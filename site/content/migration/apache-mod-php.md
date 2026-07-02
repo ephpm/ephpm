@@ -21,9 +21,12 @@ ePHPm replaces Apache and mod_php with a single binary. Your PHP files don't cha
 ### 1. Install ePHPm
 
 ```bash
-# Download the latest release binary
-curl -fSL https://github.com/ephpm/ephpm/releases/latest/download/ephpm-linux-x86_64 -o ephpm
-chmod +x ephpm
+# Grab the tarball for your platform from the releases page:
+#   https://github.com/ephpm/ephpm/releases
+# Assets are named ephpm-vX.Y.Z+phpA.B.C-<os>-<arch>.tar.gz
+curl -fSLO "https://github.com/ephpm/ephpm/releases/download/vX.Y.Z/ephpm-vX.Y.Z+phpA.B.C-linux-x86_64.tar.gz"
+tar -xzf ephpm-*.tar.gz
+sudo install -m 755 ephpm /usr/local/bin/ephpm
 ```
 
 Or build from source:
@@ -130,8 +133,8 @@ Remove certbot entirely. ePHPm handles Let's Encrypt automatically:
 
 ```toml
 [server.tls]
-acme_domains = ["example.com", "www.example.com"]
-acme_email = "you@example.com"
+domains = ["example.com", "www.example.com"]
+email = "you@example.com"
 ```
 
 **If you have existing cert files:**
@@ -163,7 +166,8 @@ ePHPm (most of this is default):
 ```toml
 [server.security]
 # Dotfiles are blocked by default (hidden_files = "deny")
-blocked_paths = ["vendor/*", "wp-config.php"]
+# Patterns match the URI path, which always starts with "/"
+blocked_paths = ["/vendor/*", "/wp-config.php"]
 ```
 
 ### 7. Switch Over

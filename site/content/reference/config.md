@@ -14,6 +14,7 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 | `listen` | string | `"0.0.0.0:8080"` | Address to listen on. |
 | `document_root` | path | `"."` | Document root for static files and PHP scripts. |
 | `sites_dir` | path | (none) | Virtual host directory. Each subdirectory is named after a domain. Omit for single-site mode. |
+| `sites_domain_suffix` | string | (none) | Suffix stripped from the `Host` header before resolving vhosts against `sites_dir` (e.g. `".localhost"` maps `blog.localhost` → `<sites_dir>/blog`). Used by `ephpm dev --sites`. |
 | `index_files` | array of strings | `["index.php", "index.html"]` | Index file names to try when a directory is requested. |
 | `fallback` | array of strings | `["$uri", "$uri/", "/index.php?$query_string"]` | URL fallback chain. Variables: `$uri`, `$query_string`. Last entry is the fallback (prefix `=` for status code, e.g. `=404`). |
 
@@ -38,8 +39,8 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `compression` | bool | `true` | Enable gzip compression for text responses. |
-| `compression_level` | u32 | `1` | gzip level (1=fastest, 9=best). |
+| `compression` | bool | `true` | Enable compression for text responses — brotli when the client accepts it, gzip fallback. |
+| `compression_level` | u32 | `1` | Compression level (1=fastest, 9=best). |
 | `compression_min_size` | usize (bytes) | `1024` | Minimum response size before compression applies. |
 | `headers` | array of `[string, string]` | `[]` | Custom headers added to every response. |
 
@@ -66,8 +67,10 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 | `trusted_proxies` | array of strings | `[]` | CIDR ranges trusted for `X-Forwarded-For`/`X-Forwarded-Proto`. |
 | `blocked_paths` | array of strings | `[]` | Glob patterns blocked with 403. |
 | `allowed_php_paths` | array of strings | `[]` | When non-empty, only matching PHP paths execute. Others get 403. |
-| `open_basedir` | bool | `true` if `sites_dir` set, else `false` | Restrict PHP filesystem access to the site's document root. |
-| `disable_shell_exec` | bool | `true` if `sites_dir` set, else `false` | Disable `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec`. |
+| `open_basedir` | bool | `true` if a `[server.security]` section is present, else `false` | Restrict PHP filesystem access to the site's document root. |
+| `disable_shell_exec` | bool | `true` if a `[server.security]` section is present, else `false` | Disable `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec`. |
+
+**Warning:** these two defaults depend on the presence of the `[server.security]` section itself — they never depend on `sites_dir`. If the section is absent entirely, both default to `false`. Multi-tenant deployments (`sites_dir` set) should always declare a `[server.security]` section explicitly.
 
 ### `[server.logging]`
 
@@ -132,20 +135,20 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 
 ### `[db.mysql]` / `[db.postgres]` / `[db.tds]`
 
-All three share the same backend config schema. Adding a section enables the proxy.
+All three share the same backend config schema. Adding a `[db.mysql]` or `[db.postgres]` section enables that proxy. The TDS proxy is **not yet implemented** — a `[db.tds]` section is accepted, but startup logs a warning and skips it.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `url` | string | (required) | Connection URL: `mysql://user:pass@host:port/db`, `postgres://...`. |
 | `listen` | string | `"127.0.0.1:3306"` (mysql), `"127.0.0.1:5432"` (postgres) | TCP address PHP connects to. |
-| `socket` | path | (none) | Unix socket path (faster than TCP for local PHP). |
+| `socket` | path | (none) | **Planned** — Unix socket path. Currently only accepted for the MySQL proxy and not yet wired there; PostgreSQL ignores it. |
 | `min_connections` | u32 | `2` | Warm pool size (idle connections kept open). |
 | `max_connections` | u32 | `20` | Max total backend connections. |
 | `idle_timeout` | duration string | `"300s"` | Close idle backend connections after this. |
 | `max_lifetime` | duration string | `"1800s"` | Recycle connections older than this. |
 | `pool_timeout` | duration string | `"5s"` | Time to wait for a connection before failing. |
 | `health_check_interval` | duration string | `"30s"` | Frequency of backend health checks. |
-| `inject_env` | bool | `true` | Inject `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DATABASE_URL` into PHP. |
+| `inject_env` | bool | `true` | Inject `DB_CONNECTION`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DATABASE_URL` into PHP. |
 | `reset_strategy` | string | `"smart"` | `"smart"` (reset after non-SELECT), `"always"`, `"never"`. |
 | `replicas.urls` | array of strings | `[]` | Read replica URLs. Reads distributed across; writes go to primary. |
 
@@ -206,7 +209,7 @@ All three share the same backend config schema. Adding a section enables the pro
 | `compression` | string | `"none"` | `none`, `gzip`, `brotli`, `zstd`. |
 | `compression_level` | u32 | `6` | 1=fastest, 9=best. |
 | `compression_min_size` | usize (bytes) | `1024` | Values below this are stored uncompressed. |
-| `secret` | string | (none) | Master secret for per-site RESP AUTH. Auto-generated if absent. |
+| `secret` | string | (none) | Master secret for per-site RESP AUTH. Not auto-generated — if unset, multi-tenant HMAC AUTH is disabled. |
 
 ### `[kv.redis_compat]`
 

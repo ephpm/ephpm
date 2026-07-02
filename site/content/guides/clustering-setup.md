@@ -15,11 +15,10 @@ Three nodes, all reachable from each other on UDP 7946 (gossip) and TCP 7947 (KV
 enabled = true
 bind    = "0.0.0.0:7946"
 join    = ["10.0.1.10:7946", "10.0.1.11:7946", "10.0.1.12:7946"]
-secret  = "BASE64_32_BYTES_HERE"   # generate: openssl rand -base64 32
 cluster_id = "ephpm-prod"          # only nodes with the same id will pair
 ```
 
-`secret` encrypts gossip traffic. All nodes must share it. Different `cluster_id`s let you run multiple independent clusters on the same network.
+> **Security note:** `cluster.secret` exists in the config schema but is currently parsed and **not used** — gossip traffic is unauthenticated and unencrypted today. Run the cluster on a trusted private network (VPC, WireGuard, Tailscale) and firewall ports 7946/7947 from the public internet. Different `cluster_id`s let you run multiple independent clusters on the same network.
 
 `join` only needs to list a few seeds — once a node joins, it discovers the rest.
 
@@ -53,20 +52,20 @@ How it works:
 
 The KV store is two-tiered automatically when clustering is on:
 
-- **Small values** (≤ 512 bytes by default) ride the gossip protocol. Eventually consistent, fast convergence (~hundreds of ms).
-- **Large values** are routed via consistent hashing — each key has an "owner" node — and replicated to N peers via the TCP data plane on port 7947. Get requests fetch from the owner; hot keys promote to a local cache.
+- **Small values** (≤ 512 bytes by default) ride the gossip protocol and end up on **every** node. Eventually consistent, fast convergence (~hundreds of ms).
+- **Large values** are routed via consistent hashing — each key lives on a single "owner" node, reached over the TCP data plane on port 7947. Get requests fetch from the owner; hot keys promote to a local cache. If the owner node dies, its large values are lost.
 
 ```toml
 [cluster.kv]
 small_key_threshold = 512           # bytes — boundary between tiers
-replication_factor  = 2             # number of replicas for large values
-replication_mode    = "async"       # or "sync" for stronger consistency, slower writes
 hot_key_cache       = true
 hot_key_threshold   = 5             # remote fetches before local cache
 hot_key_local_ttl_secs = 30
 hot_key_max_memory  = "64MB"
 data_port           = 7947
 ```
+
+> `replication_factor` and `replication_mode` appear in the config schema but are parsed and **not implemented** yet — large values are not replicated to peers. If a value must survive node loss, keep it under `small_key_threshold` (it will gossip everywhere) or store it in the clustered SQLite database instead.
 
 ## Kubernetes
 
@@ -76,24 +75,36 @@ The gossip seeds use DNS — point them at a headless Service:
 [cluster]
 enabled = true
 join = ["ephpm-headless.default.svc.cluster.local:7946"]
-secret = "BASE64_32_BYTES_HERE"
 ```
 
 `StatefulSet` + headless `Service` works well — pod-stable DNS gives consistent ordinals, which the primary election prefers. There's a sample chart in the repo's `deploy/` directory (TODO: link when published).
 
 ## Verify the cluster
 
+Watch the logs on each node — gossip membership changes are logged at `info` level as nodes discover each other and the SQLite primary is elected:
+
 ```bash
-# All nodes should agree on members
-ephpm kv keys 'cluster:*'           # gossip-state-backed cluster keys
-ephpm kv get 'kv:sqlite:primary'    # who's the SQLite primary right now?
+ephpm logs -f          # when running as a service
+# or read the process's stdout/stderr directly
 ```
 
-Prometheus metrics on `/metrics`:
+You should see membership lines for every peer and one node logging that it won the primary election.
 
-- `ephpm_cluster_members` — gauge of live peers
-- `ephpm_cluster_kv_replication_lag_seconds` — replication lag for large-value tier
-- (See [Reference → Metrics](/reference/metrics/) for the full list.)
+To poke at the KV store with `ephpm kv`, first enable the RESP listener (it's off by default):
+
+```toml
+[kv.redis_compat]
+enabled = true
+listen = "127.0.0.1:6379"
+```
+
+```bash
+ephpm kv ping                       # PONG — the KV store is up
+ephpm kv set probe hello --ttl 60   # small value → gossips to every node
+ephpm kv get probe                  # run on another node once it converges
+```
+
+Prometheus metrics on `/metrics` cover HTTP, PHP, DB, and KV behaviour. Cluster-specific metrics are limited today — there is no dedicated gauge of live peers or replication lag yet; use the gossip log lines for membership. (See [Reference → Metrics](/reference/metrics/) for what exists.)
 
 ## Failure modes worth knowing
 
