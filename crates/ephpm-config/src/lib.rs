@@ -158,8 +158,10 @@ pub struct TimeoutsConfig {
     #[serde(default = "default_header_read")]
     pub header_read: u64,
 
-    /// Idle connection timeout in seconds. Connections with no activity
-    /// for this duration are closed.
+    /// Idle connection timeout in seconds. Connections with no read or
+    /// write activity for this duration are shut down gracefully.
+    ///
+    /// Set to `0` to disable the idle timeout.
     ///
     /// Default: 60 seconds.
     #[serde(default = "default_idle")]
@@ -787,9 +789,10 @@ pub struct DbBackendConfig {
     #[serde(default)]
     pub listen: Option<String>,
 
-    /// Unix socket path for the proxy listener (faster than TCP for local PHP).
-    ///
-    /// When set, the proxy also listens on this socket in addition to `listen`.
+    /// Planned: not yet implemented. Unix socket path for the proxy listener
+    /// (faster than TCP for local PHP). Currently parsed but not acted upon —
+    /// only the TCP `listen` address is active, and a warning is logged at
+    /// startup when this is set.
     #[serde(default)]
     pub socket: Option<std::path::PathBuf>,
 
@@ -1021,9 +1024,10 @@ pub struct KvConfig {
     /// the derived password into PHP `$_ENV` as `EPHPM_REDIS_PASSWORD` for
     /// each request.
     ///
-    /// If absent, a random secret is generated on first boot and persisted in
-    /// the data directory. In single-site (no `sites_dir`) mode, AUTH is not
-    /// required.
+    /// If unset, per-site RESP AUTH is disabled: in multi-tenant (`sites_dir`)
+    /// deployments with the RESP listener enabled, any client that can reach
+    /// the listener can access the default store (a warning is logged at
+    /// startup). In single-site (no `sites_dir`) mode, AUTH is not required.
     ///
     /// Default: `None`.
     #[serde(default)]
@@ -1122,12 +1126,17 @@ pub struct PhpConfig {
     #[serde(default)]
     pub ini_overrides: Vec<[String; 2]>,
 
-    /// Number of dedicated PHP worker threads.
+    /// Maximum number of PHP requests that may execute concurrently.
     ///
-    /// Each worker runs in its own OS thread with PHP TLS initialized,
-    /// allowing true concurrent PHP request execution.
+    /// Equivalent to php-fpm's `pm.max_children`: requests beyond the cap
+    /// queue until a slot frees up (still subject to the request timeout).
+    /// Enforced with a semaphore around PHP execution — tokio's blocking
+    /// pool itself is never capped, so static file serving and other
+    /// blocking work cannot be starved by slow PHP scripts.
     ///
-    /// Default: logical CPU count, capped at 16.
+    /// `0` means unlimited (bounded only by tokio's blocking pool).
+    ///
+    /// Default: `0` (unlimited).
     #[serde(default = "default_php_workers")]
     pub workers: usize,
 }
@@ -1379,7 +1388,11 @@ impl Default for ClusterKvConfig {
 }
 
 fn default_php_workers() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get().min(16))
+    // Unlimited by default. A CPU-based default sounds attractive but is
+    // dangerous: PHP scripts that block without I/O (sleep, long queries)
+    // hold their slot past the HTTP request timeout, and a small cap lets a
+    // handful of them starve all PHP traffic. Opt into a cap explicitly.
+    0
 }
 
 fn default_cluster_bind() -> String {

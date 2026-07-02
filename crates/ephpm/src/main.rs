@@ -558,7 +558,15 @@ fn run_with_config(config: ephpm_config::Config, verbose: u8) -> anyhow::Result<
     ephpm_php::PhpRuntime::finalize_for_http()
         .context("failed to finalize PHP runtime for HTTP")?;
 
-    // Now safe to create the multi-threaded tokio runtime
+    // Now safe to create the multi-threaded tokio runtime.
+    //
+    // Note: [php].workers is enforced by a semaphore around PHP execution in
+    // the router, NOT by capping tokio's blocking pool — that pool is shared
+    // with static file I/O and other blocking work, and slow PHP scripts must
+    // never starve it.
+    if config.php.workers > 0 {
+        tracing::info!(workers = config.php.workers, "concurrent PHP executions capped");
+    }
     let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
     let result = rt.block_on(async { ephpm_server::serve(config).await });
 

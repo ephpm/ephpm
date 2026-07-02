@@ -19,11 +19,6 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 const PHP_DURATION_BUCKETS: &[f64] =
     &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
-/// Tighter buckets for mutex contention — should stay well under 10 ms in
-/// healthy deployments. High values indicate NTS serialization pressure.
-const MUTEX_WAIT_BUCKETS: &[f64] =
-    &[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5];
-
 /// Body size buckets in bytes: 100B to 10MB. Covers typical HTML (5-50KB),
 /// API JSON (1-100KB), and larger asset responses.
 const BODY_BYTES_BUCKETS: &[f64] = &[
@@ -64,11 +59,6 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
             PHP_DURATION_BUCKETS,
         )
         .context("failed to configure php_execution_duration buckets")?
-        .set_buckets_for_metric(
-            Matcher::Full("ephpm_php_mutex_wait_seconds".to_string()),
-            MUTEX_WAIT_BUCKETS,
-        )
-        .context("failed to configure php_mutex_wait buckets")?
         .set_buckets_for_metric(
             Matcher::Full("ephpm_http_request_body_bytes".to_string()),
             BODY_BYTES_BUCKETS,

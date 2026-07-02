@@ -44,6 +44,8 @@ sha2.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 rcgen.workspace = true
+# Paused-clock (`start_paused`) support for the idle-timeout watchdog tests.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
