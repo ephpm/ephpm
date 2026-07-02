@@ -1224,22 +1224,28 @@ static const zend_function_entry ephpm_kv_functions[] = {
  * Keys are namespaced as "session:<sid>". TTL comes from
  * session.gc_maxlifetime; we refresh it on every write and on every
  * timestamp update (so an active session does not expire mid-page).
+ *
+ * Concurrent requests on the same session id are serialized with a
+ * pessimistic per-session lock at "session_lock:<sid>" — see the
+ * "Session locking" section below.
  * =================================================================== */
 
 #define EPHPM_SESSION_KEY_PREFIX "session:"
 #define EPHPM_SESSION_KEY_PREFIX_LEN (sizeof(EPHPM_SESSION_KEY_PREFIX) - 1)
 
 /*
- * Build the KV key for a session id on the caller's stack when possible,
- * falling back to emalloc for unusually long sids. Returns a pointer that
- * the caller must release with `ephpm_session_key_free(buf, on_stack)`
- * when finished. `stack_buf` must be at least 64 bytes.
+ * Build a prefixed KV key for a session id on the caller's stack when
+ * possible, falling back to emalloc for unusually long sids. Returns a
+ * pointer that the caller must release with
+ * `ephpm_session_key_free(buf, used_heap)` when finished. `stack_buf`
+ * must be at least 64 bytes.
  */
-static char *ephpm_session_make_key(const char *sid, size_t sid_len,
-                                    char *stack_buf, size_t stack_buf_len,
-                                    int *used_heap)
+static char *ephpm_session_make_prefixed_key(const char *prefix, size_t prefix_len,
+                                             const char *sid, size_t sid_len,
+                                             char *stack_buf, size_t stack_buf_len,
+                                             int *used_heap)
 {
-    size_t need = EPHPM_SESSION_KEY_PREFIX_LEN + sid_len + 1;
+    size_t need = prefix_len + sid_len + 1;
     char *buf;
     if (need <= stack_buf_len) {
         buf = stack_buf;
@@ -1248,10 +1254,21 @@ static char *ephpm_session_make_key(const char *sid, size_t sid_len,
         buf = (char *)emalloc(need);
         *used_heap = 1;
     }
-    memcpy(buf, EPHPM_SESSION_KEY_PREFIX, EPHPM_SESSION_KEY_PREFIX_LEN);
-    memcpy(buf + EPHPM_SESSION_KEY_PREFIX_LEN, sid, sid_len);
-    buf[EPHPM_SESSION_KEY_PREFIX_LEN + sid_len] = '\0';
+    memcpy(buf, prefix, prefix_len);
+    memcpy(buf + prefix_len, sid, sid_len);
+    buf[prefix_len + sid_len] = '\0';
     return buf;
+}
+
+/* Convenience wrapper for the data key ("session:<sid>"). */
+static char *ephpm_session_make_key(const char *sid, size_t sid_len,
+                                    char *stack_buf, size_t stack_buf_len,
+                                    int *used_heap)
+{
+    return ephpm_session_make_prefixed_key(EPHPM_SESSION_KEY_PREFIX,
+                                           EPHPM_SESSION_KEY_PREFIX_LEN,
+                                           sid, sid_len,
+                                           stack_buf, stack_buf_len, used_heap);
 }
 
 static void ephpm_session_key_free(char *buf, int used_heap)
@@ -1272,23 +1289,214 @@ static long long ephpm_session_ttl_ms(void)
     return lifetime * 1000LL;
 }
 
+/* ── Session locking ────────────────────────────────────────────────
+ *
+ * Pessimistic per-session lock, php-fpm files-handler style: without it,
+ * two concurrent requests carrying the same session cookie both READ the
+ * blob, both mutate their in-memory copy, and the second WRITE silently
+ * clobbers the first (lost update).
+ *
+ * PS_READ acquires "session_lock:<sid>" via SETNX with a TTL before
+ * fetching the blob; PS_CLOSE (which PHP guarantees after WRITE, including
+ * during request shutdown after a bailout) releases it with DEL. On
+ * contention we spin with exponential backoff (start 10ms, cap 100ms) up
+ * to a total wait of 30s; if the lock is still held we log an E_WARNING
+ * and proceed WITHOUT the lock — a degraded read-modify-write race is
+ * strictly better than deadlocking the worker thread.
+ *
+ * The 30s TTL guards against crashed/stuck holders: a thread that dies
+ * while holding the lock stops blocking the session forever.
+ *
+ * KNOWN LIMITATION (accepted for v1): if a holder outlives the 30s TTL,
+ * the lock expires and another request may acquire it. Our release path
+ * is an unconditional DEL — the KV ops table has no compare-and-delete —
+ * so the original holder would then release the *new* holder's lock,
+ * letting a third request in early. The window requires a request that
+ * both holds a session open for >30s and overlaps two competitors, and
+ * the failure mode is the same lost-update race that exists without
+ * locking at all.
+ *
+ * On NTS builds (Windows) PHP execution is serialized in-process, so the
+ * lock is simply uncontended — the SETNX/DEL pair still balances.
+ */
+
+#define EPHPM_SESSION_LOCK_PREFIX "session_lock:"
+#define EPHPM_SESSION_LOCK_PREFIX_LEN (sizeof(EPHPM_SESSION_LOCK_PREFIX) - 1)
+
+/* Lock TTL — also the bound on how long a crashed holder can block others. */
+#define EPHPM_SESSION_LOCK_TTL_MS 30000LL
+/* Total time a contender waits before giving up and proceeding lockless. */
+#define EPHPM_SESSION_LOCK_MAX_WAIT_MS 30000u
+/* Spin backoff: start at 10ms, double each miss, cap at 100ms. */
+#define EPHPM_SESSION_LOCK_BACKOFF_START_MS 10u
+#define EPHPM_SESSION_LOCK_BACKOFF_MAX_MS 100u
+
+/* Lock ownership for the request running on this thread: the sid we hold
+ * the lock for (plain malloc — must survive Zend's per-request allocator),
+ * or NULL when no lock is held. NULL also covers the "gave up and
+ * proceeded lockless" case, so the release path never deletes a lock this
+ * thread did not acquire (except the TTL-expiry window described above). */
+static EPHPM_TLS char *session_lock_sid = NULL;
+static EPHPM_TLS size_t session_lock_sid_len = 0;
+
+/* Millisecond sleep for the lock spin loop (portable). */
+#if defined(PHP_WIN32) || defined(_WIN32)
+#include <windows.h>
+static void ephpm_sleep_ms(unsigned int ms)
+{
+    Sleep(ms);
+}
+#else
+#include <time.h>
+static void ephpm_sleep_ms(unsigned int ms)
+{
+    struct timespec ts;
+    ts.tv_sec = ms / 1000u;
+    ts.tv_nsec = (long)(ms % 1000u) * 1000000L;
+    nanosleep(&ts, NULL);
+}
+#endif
+
+/* Release the lock this thread holds, if any. Safe to call when no lock
+ * is held (no-op). */
+static void ephpm_session_lock_release(void)
+{
+    if (!session_lock_sid) {
+        return;
+    }
+    if (g_kv_ops.del) {
+        char stack[128];
+        int used_heap = 0;
+        char *lock_key = ephpm_session_make_prefixed_key(
+            EPHPM_SESSION_LOCK_PREFIX, EPHPM_SESSION_LOCK_PREFIX_LEN,
+            session_lock_sid, session_lock_sid_len,
+            stack, sizeof(stack), &used_heap);
+        (void)g_kv_ops.del(lock_key);
+        ephpm_session_key_free(lock_key, used_heap);
+    }
+    free(session_lock_sid);
+    session_lock_sid = NULL;
+    session_lock_sid_len = 0;
+}
+
+/* Acquire the per-session lock for `sid`, spinning with backoff on
+ * contention. On success, records ownership in the thread-local state so
+ * PS_CLOSE / PS_DESTROY can release it. On sustained contention (30s),
+ * warns and returns without the lock. */
+static void ephpm_session_lock_acquire(const char *sid, size_t sid_len)
+{
+    if (!g_kv_ops.set_nx || !g_kv_ops.del) {
+        /* No store (or no lock primitives) wired — nothing to lock with.
+         * The read path already degrades to an empty session in this
+         * configuration, so silently running lockless is consistent. */
+        return;
+    }
+
+    if (session_lock_sid) {
+        if (session_lock_sid_len == sid_len &&
+            memcmp(session_lock_sid, sid, sid_len) == 0) {
+            /* Already holding this session's lock (e.g. a second
+             * session_start() after session_abort() in the same request). */
+            return;
+        }
+        /* Stale lock from a different sid on this thread — a previous
+         * request that never reached PS_CLOSE (bailout edge). Release it
+         * so it cannot leak past its TTL. */
+        ephpm_session_lock_release();
+    }
+
+    char stack[128];
+    int used_heap = 0;
+    char *lock_key = ephpm_session_make_prefixed_key(
+        EPHPM_SESSION_LOCK_PREFIX, EPHPM_SESSION_LOCK_PREFIX_LEN,
+        sid, sid_len, stack, sizeof(stack), &used_heap);
+
+    unsigned int waited_ms = 0;
+    unsigned int backoff_ms = EPHPM_SESSION_LOCK_BACKOFF_START_MS;
+    int acquired = 0;
+
+    for (;;) {
+        if (g_kv_ops.set_nx(lock_key, "1", 1, EPHPM_SESSION_LOCK_TTL_MS)) {
+            acquired = 1;
+            break;
+        }
+        if (waited_ms >= EPHPM_SESSION_LOCK_MAX_WAIT_MS) {
+            break;
+        }
+        unsigned int sleep_ms = backoff_ms;
+        if (sleep_ms > EPHPM_SESSION_LOCK_MAX_WAIT_MS - waited_ms) {
+            sleep_ms = EPHPM_SESSION_LOCK_MAX_WAIT_MS - waited_ms;
+        }
+        ephpm_sleep_ms(sleep_ms);
+        waited_ms += sleep_ms;
+        backoff_ms *= 2u;
+        if (backoff_ms > EPHPM_SESSION_LOCK_BACKOFF_MAX_MS) {
+            backoff_ms = EPHPM_SESSION_LOCK_BACKOFF_MAX_MS;
+        }
+    }
+
+    if (acquired) {
+        char *owned = (char *)malloc(sid_len + 1);
+        if (owned) {
+            memcpy(owned, sid, sid_len);
+            owned[sid_len] = '\0';
+            session_lock_sid = owned;
+            session_lock_sid_len = sid_len;
+        } else {
+            /* OOM copying the sid: we cannot track ownership, so we must
+             * not keep the lock — a lock we can't release would block the
+             * session until the TTL fires. Undo and run lockless. */
+            (void)g_kv_ops.del(lock_key);
+            php_error_docref(NULL, E_WARNING,
+                "ephpm session handler: out of memory tracking session lock; "
+                "proceeding without lock");
+        }
+    } else {
+        php_error_docref(NULL, E_WARNING,
+            "ephpm session handler: could not acquire session lock after "
+            "%u ms; proceeding without lock (concurrent request may still "
+            "hold it)", waited_ms);
+    }
+
+    ephpm_session_key_free(lock_key, used_heap);
+}
+
 /* ── PS_OPEN / PS_CLOSE ─────────────────────────────────────────── */
+
+/* Non-NULL sentinel for PS(mod_data). ext/session gates the write/close
+ * handler calls on `PS(mod_data) || PS(mod_user_implemented)` (see
+ * php_session_save_current_state / php_rshutdown_session_globals in
+ * ext/session/session.c) — a native handler that leaves *mod_data NULL in
+ * open() never gets its write or close callbacks invoked, every
+ * session_write_close() warns "Failed to write session data", and nothing
+ * is persisted. We keep no real per-handler state (the KV store is global
+ * and the lock state is thread-local), so a shared marker address is all
+ * that's needed. The value is never dereferenced. */
+static int ephpm_session_mod_data_marker = 0;
 
 PS_OPEN_FUNC(ephpm)
 {
     /* save_path is irrelevant — we store in the in-process KV. session_name
-     * is the cookie name and is already tracked by ext/session. Nothing to
-     * do here, but we must not fail because php_session_initialize() bails
-     * on any non-SUCCESS return. */
+     * is the cookie name and is already tracked by ext/session. We must not
+     * fail because php_session_initialize() bails on any non-SUCCESS
+     * return, and we MUST set *mod_data non-NULL or PHP will silently skip
+     * our write/close handlers (see ephpm_session_mod_data_marker). */
     (void)save_path;
     (void)session_name;
-    (void)mod_data;
+    *mod_data = (void *)&ephpm_session_mod_data_marker;
     return SUCCESS;
 }
 
 PS_CLOSE_FUNC(ephpm)
 {
-    (void)mod_data;
+    /* PHP calls close after write (session_write_close, request shutdown,
+     * even after a bailout via RSHUTDOWN), making it the reliable place to
+     * release the per-session lock taken in PS_READ. No-op when this
+     * thread never acquired one (lockless fallback / no store). */
+    ephpm_session_lock_release();
+    /* Clear the sentinel like mod_files does — ext/session treats a
+     * non-NULL mod_data as "handler still open". */
+    *mod_data = NULL;
     return SUCCESS;
 }
 
@@ -1299,14 +1507,21 @@ PS_READ_FUNC(ephpm)
     (void)mod_data;
     (void)maxlifetime;
 
+    const char *sid_str = ZSTR_VAL(key);
+    size_t sid_len = ZSTR_LEN(key);
+
+    /* Serialize concurrent requests on the same session id: take the
+     * per-session lock BEFORE reading the blob so the read-modify-write
+     * spanning PS_READ..PS_WRITE is atomic across requests. Released in
+     * PS_CLOSE / PS_DESTROY. */
+    ephpm_session_lock_acquire(sid_str, sid_len);
+
     if (!g_kv_ops.get || !g_kv_ops.get_result) {
         /* No store wired — behave like an empty session rather than failing. */
         *val = ZSTR_EMPTY_ALLOC();
         return SUCCESS;
     }
 
-    const char *sid_str = ZSTR_VAL(key);
-    size_t sid_len = ZSTR_LEN(key);
     char stack[128];
     int used_heap = 0;
     char *kv_key = ephpm_session_make_key(sid_str, sid_len, stack, sizeof(stack), &used_heap);
@@ -1357,12 +1572,22 @@ PS_DESTROY_FUNC(ephpm)
 {
     (void)mod_data;
 
+    const char *sid_str = ZSTR_VAL(key);
+    size_t sid_len = ZSTR_LEN(key);
+
+    /* session_destroy() / session_regenerate_id(true) — the destroyed sid
+     * will never be written again by this request, so release its lock now
+     * (only if this thread actually holds it; a lock for a different sid
+     * must stay put). */
+    if (session_lock_sid && session_lock_sid_len == sid_len &&
+        memcmp(session_lock_sid, sid_str, sid_len) == 0) {
+        ephpm_session_lock_release();
+    }
+
     if (!g_kv_ops.del) {
         return SUCCESS;
     }
 
-    const char *sid_str = ZSTR_VAL(key);
-    size_t sid_len = ZSTR_LEN(key);
     char stack[128];
     int used_heap = 0;
     char *kv_key = ephpm_session_make_key(sid_str, sid_len, stack, sizeof(stack), &used_heap);

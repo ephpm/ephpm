@@ -61,6 +61,55 @@ fetch them remotely (so requests can still route anywhere), but they are not
 replicated — if the owner node dies, those sessions die with it. See
 [Cluster](#cluster) below.
 
+## Locking
+
+The handler takes a pessimistic per-session lock, the same discipline as
+PHP's built-in files handler: `session_start()` blocks while another request
+holds the same session open, so concurrent read-modify-write cycles on
+`$_SESSION` cannot lose updates. Locking is always on — there is no config
+knob.
+
+Mechanics:
+
+- On `read` (inside `session_start()`), the handler acquires
+  `session_lock:<sid>` via an atomic `SETNX` with a **30s TTL**. The TTL is
+  a dead-man's switch: a crashed or wedged holder stops blocking the session
+  after at most 30 seconds.
+- On contention it spins with exponential backoff — starting at 10ms,
+  doubling up to a 100ms cap — for a total wait of up to **30s**. If the lock
+  is still held after that, the handler logs an `E_WARNING` and proceeds
+  **without** the lock rather than deadlocking the worker: a degraded
+  lost-update window beats a hung request.
+- The lock is released (`DEL`) in `close` — which PHP fires on
+  `session_write_close()`, at request shutdown, and after fatal
+  errors/bailouts — and on `destroy` (`session_destroy()`,
+  `session_regenerate_id(true)`). Only the thread that actually acquired the
+  lock releases it; a request that proceeded lockless never deletes someone
+  else's lock.
+- Hold the session only as long as you need it: call `session_write_close()`
+  as soon as you're done mutating `$_SESSION`, exactly as you would under
+  php-fpm with the files handler, or concurrent AJAX requests from the same
+  browser will serialize on the lock.
+
+Known limitation (v1): if a request holds its session open past the 30s lock
+TTL, the lock expires and a competing request may acquire it; when the
+original holder finally closes, its unconditional `DEL` releases the *new*
+holder's lock early (the KV layer has no compare-and-delete yet). The
+exposure window requires a >30s session hold plus overlapping competitors,
+and the worst case is the same lost-update race that existed before locking.
+
+In multi-tenant mode the lock key lives in the same per-site store as the
+session data, so tenants cannot contend with each other. On Windows (NTS,
+serialized PHP execution) the lock is uncontended in-process but keeps the
+same acquire/release semantics.
+
+The lock is **node-local**: the `SETNX` runs against the in-process store,
+not the cluster tier. In clustered deployments, concurrent requests for the
+same session that land on *different* nodes are not serialized — use
+session-affinity routing (sticky sessions) if cross-node request storms on a
+single session are a real pattern for your app. On any single node the
+guarantee holds regardless of cluster mode.
+
 ## TTL behaviour
 
 The session TTL comes from `session.gc_maxlifetime` (seconds). On every

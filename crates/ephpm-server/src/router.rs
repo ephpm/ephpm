@@ -166,10 +166,11 @@ impl Router {
         let port =
             config.server.listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(8080);
 
-        let trusted_proxies: Vec<IpNet> = config
-            .server
-            .security
-            .trusted_proxies
+        let security = config.server.security.as_ref();
+
+        let trusted_proxies: Vec<IpNet> = security
+            .map(|s| s.trusted_proxies.as_slice())
+            .unwrap_or_default()
             .iter()
             .filter_map(|cidr| {
                 cidr.parse::<IpNet>()
@@ -177,6 +178,23 @@ impl Router {
                     .ok()
             })
             .collect();
+
+        let open_basedir = config.server.effective_open_basedir();
+        if config.server.sites_dir.is_some() {
+            // Multi-tenant deployments get isolation by default; surface the
+            // resolved values so an explicit opt-out is never silent.
+            tracing::info!(
+                open_basedir,
+                disable_shell_exec = config.server.effective_disable_shell_exec(),
+                "multi-tenant security defaults resolved"
+            );
+            if !open_basedir {
+                tracing::warn!(
+                    "open_basedir explicitly disabled in multi-tenant mode — \
+                     sites can read each other's files"
+                );
+            }
+        }
 
         // Scan sites_dir for virtual host directories.
         let sites = scan_sites_dir(
@@ -211,8 +229,8 @@ impl Router {
             etag: config.server.static_files.etag,
             request_timeout: Duration::from_secs(config.server.timeouts.request),
             trusted_proxies,
-            blocked_paths: config.server.security.blocked_paths.clone(),
-            allowed_php_paths: config.server.security.allowed_php_paths.clone(),
+            blocked_paths: security.map(|s| s.blocked_paths.clone()).unwrap_or_default(),
+            allowed_php_paths: security.map(|s| s.allowed_php_paths.clone()).unwrap_or_default(),
             trusted_hosts: config.server.request.trusted_hosts.clone(),
             response_headers: config
                 .server
@@ -221,7 +239,7 @@ impl Router {
                 .iter()
                 .map(|[k, v]| (k.clone(), v.clone()))
                 .collect(),
-            open_basedir: config.server.security.open_basedir,
+            open_basedir,
             multi_tenant_kv: if config.server.sites_dir.is_some() {
                 Some(ephpm_kv::multi_tenant::MultiTenantStore::new(
                     Arc::clone(&store),
@@ -1549,7 +1567,8 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        config.server.security.get_or_insert_default().trusted_proxies =
+            vec!["10.0.0.0/8".to_string()];
         let router = Router::new(&config, test_store(), None, None, None);
 
         // 203.0.113.50 is the real client, 10.0.0.1 is the proxy
@@ -1571,7 +1590,8 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        config.server.security.trusted_proxies = vec!["10.0.0.0/8".to_string()];
+        config.server.security.get_or_insert_default().trusted_proxies =
+            vec!["10.0.0.0/8".to_string()];
         let router = Router::new(&config, test_store(), None, None, None);
 
         let xff = "10.0.0.2, 10.0.0.1";
@@ -1615,6 +1635,43 @@ mod tests {
         };
         let router = Router::new(&config, test_store(), None, None, None);
         assert_eq!(router.server_port, 8080);
+    }
+
+    // ── security default resolution ──────────────────────────────────
+
+    #[test]
+    fn test_open_basedir_defaults_on_when_sites_dir_set_without_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            server: ServerConfig {
+                document_root: dir.path().to_path_buf(),
+                sites_dir: Some(dir.path().to_path_buf()),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+        };
+        let router = Router::new(&config, test_store(), None, None, None);
+        assert!(router.open_basedir, "multi-tenant mode must default open_basedir on");
+    }
+
+    #[test]
+    fn test_open_basedir_defaults_off_without_section_or_sites_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            server: ServerConfig {
+                document_root: dir.path().to_path_buf(),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+        };
+        let router = Router::new(&config, test_store(), None, None, None);
+        assert!(!router.open_basedir);
     }
 
     // ── blocked paths ─────────────────────────────────────────────────
@@ -1673,7 +1730,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        config.server.security.allowed_php_paths =
+        config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-login.php".to_string()];
         let router = Router::new(&config, test_store(), None, None, None);
         assert!(router.is_php_allowed("/index.php"));
@@ -1694,7 +1751,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        config.server.security.allowed_php_paths =
+        config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-admin/*.php".to_string()];
         let router = Router::new(&config, test_store(), None, None, None);
         assert!(router.is_php_allowed("/index.php"));
