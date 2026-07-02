@@ -97,8 +97,14 @@ pub struct ServerConfig {
     pub php_etag_cache: PhpETagCacheConfig,
 
     /// Security settings.
+    ///
+    /// `None` when the `[server.security]` section is absent from the TOML
+    /// (and no `EPHPM_SERVER__SECURITY__*` env var is set). Presence of the
+    /// section feeds into the resolved defaults for `open_basedir` and
+    /// `disable_shell_exec` — see [`ServerConfig::effective_open_basedir`]
+    /// and [`ServerConfig::effective_disable_shell_exec`].
     #[serde(default)]
-    pub security: SecurityConfig,
+    pub security: Option<SecurityConfig>,
 
     /// Logging settings.
     #[serde(default)]
@@ -340,10 +346,12 @@ pub struct SecurityConfig {
     /// set per-request to the site's directory + `/tmp`. PHP cannot read
     /// or write files outside that directory.
     ///
-    /// Default: `true` when `sites_dir` is set, `false` otherwise.
-    /// Override per-site via `site.toml`.
-    #[serde(default = "default_open_basedir")]
-    pub open_basedir: bool,
+    /// An explicitly set value always wins. When unset, resolves to `true`
+    /// if the `[server.security]` section is present OR `server.sites_dir`
+    /// is set (multi-tenant mode); otherwise `false`. Use
+    /// [`ServerConfig::effective_open_basedir`] to read the resolved value.
+    #[serde(default)]
+    pub open_basedir: Option<bool>,
 
     /// Disable dangerous PHP functions in multi-tenant mode.
     ///
@@ -351,18 +359,48 @@ pub struct SecurityConfig {
     /// `proc_open`, `popen`, and `pcntl_exec` are disabled via
     /// `disable_functions`. Prevents shell escape from `open_basedir`.
     ///
-    /// Default: `true` when `sites_dir` is set, `false` otherwise.
-    /// Override per-site via `site.toml`.
-    #[serde(default = "default_disable_shell_exec")]
-    pub disable_shell_exec: bool,
+    /// An explicitly set value always wins. When unset, resolves to `true`
+    /// if the `[server.security]` section is present OR `server.sites_dir`
+    /// is set (multi-tenant mode); otherwise `false`. Use
+    /// [`ServerConfig::effective_disable_shell_exec`] to read the resolved
+    /// value.
+    #[serde(default)]
+    pub disable_shell_exec: Option<bool>,
 }
 
-fn default_open_basedir() -> bool {
-    true
-}
+impl ServerConfig {
+    /// Resolved value of `security.open_basedir`.
+    ///
+    /// An explicitly set value always wins. When unset, resolves to `true`
+    /// if the `[server.security]` section is present (preserves the
+    /// historical present-section default) OR `sites_dir` is set (so a
+    /// multi-tenant deployment never silently runs without filesystem
+    /// isolation); otherwise `false`.
+    #[must_use]
+    pub fn effective_open_basedir(&self) -> bool {
+        self.resolve_security_flag(|s| s.open_basedir)
+    }
 
-fn default_disable_shell_exec() -> bool {
-    true
+    /// Resolved value of `security.disable_shell_exec`.
+    ///
+    /// Same resolution rules as [`Self::effective_open_basedir`]: explicit
+    /// value wins; unset resolves to `true` when the `[server.security]`
+    /// section is present or `sites_dir` is set, `false` otherwise.
+    #[must_use]
+    pub fn effective_disable_shell_exec(&self) -> bool {
+        self.resolve_security_flag(|s| s.disable_shell_exec)
+    }
+
+    /// Shared resolution for the two isolation flags.
+    fn resolve_security_flag(&self, field: impl Fn(&SecurityConfig) -> Option<bool>) -> bool {
+        match &self.security {
+            // Section present: unset fields default to true (compat with
+            // the previous `#[serde(default = "true")]` behavior).
+            Some(security) => field(security).unwrap_or(true),
+            // Section absent: default on only in multi-tenant mode.
+            None => self.sites_dir.is_some(),
+        }
+    }
 }
 
 /// Logging configuration (`[server.logging]`).
@@ -1188,7 +1226,7 @@ impl Default for ServerConfig {
             response: ResponseConfig::default(),
             static_files: StaticConfig::default(),
             php_etag_cache: PhpETagCacheConfig::default(),
-            security: SecurityConfig::default(),
+            security: None,
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
             limits: LimitsConfig::default(),
@@ -2051,6 +2089,124 @@ path = "test.db"
             let config = Config::load(&file).unwrap();
             let sqlite = config.db.sqlite.expect("sqlite should be present");
             assert_eq!(sqlite.replication.role, "primary");
+        });
+    }
+
+    // ── Security isolation default resolution ──────────────────────────
+    //
+    // `open_basedir` / `disable_shell_exec` resolve to `true` when the
+    // `[server.security]` section is present OR `sites_dir` is set;
+    // an explicitly set value always wins.
+
+    #[test]
+    fn test_security_section_absent_no_sites_dir_defaults_off() {
+        let config = Config::default_config().unwrap();
+        assert!(config.server.security.is_none());
+        assert!(!config.server.effective_open_basedir());
+        assert!(!config.server.effective_disable_shell_exec());
+    }
+
+    #[test]
+    fn test_security_section_absent_sites_dir_defaults_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server]
+sites_dir = "/var/www/sites"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.security.is_none(), "no [server.security] section in this config");
+        assert!(config.server.effective_open_basedir());
+        assert!(config.server.effective_disable_shell_exec());
+    }
+
+    #[test]
+    fn test_security_explicit_false_wins_over_sites_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server]
+sites_dir = "/var/www/sites"
+
+[server.security]
+open_basedir = false
+disable_shell_exec = false
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(!config.server.effective_open_basedir());
+        assert!(!config.server.effective_disable_shell_exec());
+    }
+
+    #[test]
+    fn test_security_section_present_field_unset_no_sites_dir_defaults_on() {
+        // Compat: existing configs that declare [server.security] (for e.g.
+        // trusted_proxies) keep the historical "present section ⇒ true"
+        // defaults even without sites_dir.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server.security]
+trusted_proxies = ["10.0.0.0/8"]
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.security.is_some());
+        assert!(config.server.effective_open_basedir());
+        assert!(config.server.effective_disable_shell_exec());
+    }
+
+    #[test]
+    fn test_security_explicit_true_without_sites_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r"
+[server.security]
+open_basedir = true
+",
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.effective_open_basedir());
+        // Unset sibling also resolves true because the section is present.
+        assert!(config.server.effective_disable_shell_exec());
+    }
+
+    #[test]
+    fn test_security_env_var_override_counts_as_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server]
+sites_dir = "/var/www/sites"
+"#,
+        )
+        .unwrap();
+
+        temp_env::with_var("EPHPM_SERVER__SECURITY__OPEN_BASEDIR", Some("false"), || {
+            let config = Config::load(&file).unwrap();
+            assert!(!config.server.effective_open_basedir());
+            // The env var materializes the section, so the unset sibling
+            // still resolves true (and sites_dir is set anyway).
+            assert!(config.server.effective_disable_shell_exec());
         });
     }
 }

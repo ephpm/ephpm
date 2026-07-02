@@ -67,10 +67,10 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 | `trusted_proxies` | array of strings | `[]` | CIDR ranges trusted for `X-Forwarded-For`/`X-Forwarded-Proto`. |
 | `blocked_paths` | array of strings | `[]` | Glob patterns blocked with 403. |
 | `allowed_php_paths` | array of strings | `[]` | When non-empty, only matching PHP paths execute. Others get 403. |
-| `open_basedir` | bool | `true` if a `[server.security]` section is present, else `false` | Restrict PHP filesystem access to the site's document root. |
-| `disable_shell_exec` | bool | `true` if a `[server.security]` section is present, else `false` | Disable `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec`. |
+| `open_basedir` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Restrict PHP filesystem access to the site's document root. |
+| `disable_shell_exec` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Disable `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec`. |
 
-**Warning:** these two defaults depend on the presence of the `[server.security]` section itself — they never depend on `sites_dir`. If the section is absent entirely, both default to `false`. Multi-tenant deployments (`sites_dir` set) should always declare a `[server.security]` section explicitly.
+**Note:** an explicitly set value always wins. When unset, these two resolve to `true` if either the `[server.security]` section is present (matching earlier releases) or `server.sites_dir` is set — so multi-tenant deployments get filesystem isolation and shell-exec hardening by default, even without a `[server.security]` section. To opt out in multi-tenant mode you must set them to `false` explicitly (ephpm logs a warning at startup when you do).
 
 ### `[server.logging]`
 

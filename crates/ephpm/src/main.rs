@@ -515,7 +515,7 @@ fn run_with_config(config: ephpm_config::Config, verbose: u8) -> anyhow::Result<
     // functions callable, so vhost-mode disable_shell_exec needs to ride
     // along on the generated ini instead of the per-request ini hook.
     let vhost_disable_shell =
-        config.server.sites_dir.is_some() && config.server.security.disable_shell_exec;
+        config.server.sites_dir.is_some() && config.server.effective_disable_shell_exec();
     let want_generated_ini = !config.php.ini_overrides.is_empty() || vhost_disable_shell;
 
     let (effective_ini_path, _generated_ini_guard): (Option<PathBuf>, Option<TempFileGuard>) =

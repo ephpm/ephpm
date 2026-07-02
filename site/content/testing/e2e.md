@@ -24,6 +24,7 @@ The `ephpm-e2e` crate lives in `crates/ephpm-e2e/` and runs inside a Kind cluste
 | `security_p0.rs` | 6 | Additional security tests (host validation, allowed PHP paths, etc.) |
 | `hidden_files.rs` | 2 | Hidden file blocking modes |
 | `concurrency.rs` | — | Parallel PHP requests, atomic KV increments under load (uses non-tokio test harness) |
+| `session_locking.rs` | 1 | Concurrent `$_SESSION` increments on one session id — per-session lock prevents lost updates |
 | `metrics.rs` | 9 | Prometheus format, build info, HTTP counters, handler labels, PHP execution metrics, in-flight gauge, body size histograms, metrics self-counting, status codes |
 | `etag_cache.rs` | 6 | PHP ETag 200+header, matching ETag 304, mismatched ETag 200, POST bypass, no If-None-Match 200, independent query strings |
 | `timeouts.rs` | 2 | PHP sleep exceeding timeout returns 504, server recovers after timeout |
@@ -70,6 +71,7 @@ The `ephpm-e2e` crate lives in `crates/ephpm-e2e/` and runs inside a Kind cluste
 | `json_response.php` | JSON `Content-Type` + `json_encode()` output |
 | `multi_cookie.php` | Sets 3 `Set-Cookie` headers via `setcookie()` |
 | `sleep.php` | `sleep(N)` via `?seconds=N` — timeout testing |
+| `session_counter.php` | Racy `$_SESSION` counter increment (50ms window) — session locking regression |
 | `large_output.php` | ~1 MiB repeating output — body size / compression |
 | `image.png` | 1x1 PNG (69 bytes) — binary content-type |
 | `test.html` | Static HTML |
