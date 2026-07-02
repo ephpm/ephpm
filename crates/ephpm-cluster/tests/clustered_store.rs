@@ -72,7 +72,7 @@ async fn small_value_routes_via_gossip() {
     let store = local_store();
     let config = ClusterKvConfig { small_key_threshold: 64, ..ClusterKvConfig::default() };
 
-    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
+    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config, None);
 
     // A small value should go to gossip, not local store.
     cs.set("tiny".to_string(), b"abc".to_vec(), None).await;
@@ -99,7 +99,7 @@ async fn large_value_routes_to_local_store() {
     let store = local_store();
     let config = ClusterKvConfig { small_key_threshold: 8, ..ClusterKvConfig::default() };
 
-    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
+    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config, None);
 
     // A large value should go to local store.
     let big = vec![0u8; 100];
@@ -129,8 +129,8 @@ async fn small_value_replicates_via_clustered_store() {
 
     wait_for_convergence(&[&h1, &h2], 2, Duration::from_secs(10)).await;
 
-    let cs1 = ClusteredStore::new(local_store(), Arc::clone(&h1), ClusterKvConfig::default());
-    let cs2 = ClusteredStore::new(local_store(), Arc::clone(&h2), ClusterKvConfig::default());
+    let cs1 = ClusteredStore::new(local_store(), Arc::clone(&h1), ClusterKvConfig::default(), None);
+    let cs2 = ClusteredStore::new(local_store(), Arc::clone(&h2), ClusterKvConfig::default(), None);
 
     // Set on node1's clustered store.
     cs1.set("replicated".to_string(), b"data".to_vec(), None).await;
@@ -159,7 +159,7 @@ async fn exists_checks_both_tiers() {
     let store = local_store();
     let config = ClusterKvConfig { small_key_threshold: 16, ..ClusterKvConfig::default() };
 
-    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
+    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config, None);
 
     // Small key → gossip.
     cs.set("s".to_string(), b"x".to_vec(), None).await;
@@ -181,7 +181,7 @@ async fn remove_from_both_tiers() {
     let store = local_store();
     let config = ClusterKvConfig { small_key_threshold: 16, ..ClusterKvConfig::default() };
 
-    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
+    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config, None);
 
     cs.set("gs".to_string(), b"tiny".to_vec(), None).await;
     cs.set("ls".to_string(), vec![0u8; 32], None).await;
@@ -214,7 +214,7 @@ async fn hot_key_promotion_after_threshold() {
         ..ClusterKvConfig::default()
     };
 
-    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
+    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config, None);
 
     let value = b"large-value-data-here";
 
@@ -250,7 +250,7 @@ async fn hot_key_cache_respects_memory_limit() {
         ..ClusterKvConfig::default()
     };
 
-    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
+    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config, None);
 
     // First key: should fit.
     let small = vec![0u8; 50];
@@ -282,7 +282,7 @@ async fn hot_key_cache_ttl_expiry() {
         ..ClusterKvConfig::default()
     };
 
-    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
+    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config, None);
 
     cs.track_remote_fetch("expires", b"data");
     assert_eq!(cs.hot_cache_len(), 1);
@@ -312,7 +312,7 @@ async fn hot_cache_cleanup_evicts_stale() {
         ..ClusterKvConfig::default()
     };
 
-    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
+    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config, None);
 
     cs.track_remote_fetch("stale", b"data");
     assert_eq!(cs.hot_cache_len(), 1);
@@ -338,7 +338,7 @@ async fn hot_key_disabled_skips_tracking() {
         ..ClusterKvConfig::default()
     };
 
-    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
+    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config, None);
 
     cs.track_remote_fetch("ignored", b"data");
     assert_eq!(cs.hot_cache_len(), 0, "should not track when disabled");
@@ -358,7 +358,7 @@ async fn pttl_gossip_tier_key() {
     let store = local_store();
     let config = ClusterKvConfig { small_key_threshold: 64, ..ClusterKvConfig::default() };
 
-    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
+    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config, None);
 
     // Small key with TTL → gossip tier
     cs.set("tiny-ttl".to_string(), b"val".to_vec(), Some(Duration::from_secs(60))).await;
@@ -379,7 +379,7 @@ async fn pttl_local_store_key() {
     let store = local_store();
     let config = ClusterKvConfig { small_key_threshold: 8, ..ClusterKvConfig::default() };
 
-    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config);
+    let cs = ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), config, None);
 
     // Large key with TTL → local store
     let big = vec![0u8; 100];
@@ -400,8 +400,12 @@ async fn pttl_missing_key_returns_none() {
     let handle = Arc::new(start_node(port, vec![], "pttl-miss").await);
     let store = local_store();
 
-    let cs =
-        ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), ClusterKvConfig::default());
+    let cs = ClusteredStore::new(
+        Arc::clone(&store),
+        Arc::clone(&handle),
+        ClusterKvConfig::default(),
+        None,
+    );
 
     // pttl for non-existent key should return None (or -2 via local store).
     // The ClusteredStore checks gossip first (returns None), then local store.
@@ -426,8 +430,12 @@ async fn local_store_accessor_returns_correct_store() {
     let handle = Arc::new(start_node(port, vec![], "accessor").await);
     let store = local_store();
 
-    let cs =
-        ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), ClusterKvConfig::default());
+    let cs = ClusteredStore::new(
+        Arc::clone(&store),
+        Arc::clone(&handle),
+        ClusterKvConfig::default(),
+        None,
+    );
 
     // Write directly to local store, verify via accessor.
     store.set("direct".to_string(), b"value".to_vec(), None);
@@ -443,8 +451,12 @@ async fn set_returns_true_on_success() {
     let handle = Arc::new(start_node(port, vec![], "set-ok").await);
     let store = local_store();
 
-    let cs =
-        ClusteredStore::new(Arc::clone(&store), Arc::clone(&handle), ClusterKvConfig::default());
+    let cs = ClusteredStore::new(
+        Arc::clone(&store),
+        Arc::clone(&handle),
+        ClusterKvConfig::default(),
+        None,
+    );
 
     // Both small and large values should succeed.
     let small_ok = cs.set("s".to_string(), b"x".to_vec(), None).await;

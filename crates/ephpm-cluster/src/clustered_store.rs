@@ -29,6 +29,7 @@ use ephpm_config::ClusterKvConfig;
 use ephpm_kv::store::Store;
 
 use crate::ClusterHandle;
+use crate::secure_transport::ClusterCipher;
 
 /// Key prefix for hot-key version metadata in chitchat state.
 const HOT_PREFIX: &str = "hot:";
@@ -41,6 +42,8 @@ pub struct ClusteredStore {
     cluster: Arc<ClusterHandle>,
     /// Configuration for tier routing and hot key behavior.
     config: ClusterKvConfig,
+    /// Cipher for TCP data plane traffic (`None` = plaintext).
+    cipher: Option<Arc<ClusterCipher>>,
     /// Per-key hit counters for hot key detection.
     hit_counters: DashMap<u64, HitCounter>,
     /// Locally cached hot key values.
@@ -73,16 +76,23 @@ struct CachedValue {
 
 impl ClusteredStore {
     /// Create a new clustered store.
+    ///
+    /// When `cipher` is `Some` (derive it with
+    /// [`ClusterCipher::for_kv_data_plane`] from `[cluster] secret`),
+    /// all TCP data plane traffic to remote nodes is sealed; the remote
+    /// listeners must be started with the same cipher.
     #[must_use]
     pub fn new(
         store: Arc<Store>,
         cluster: Arc<ClusterHandle>,
         config: ClusterKvConfig,
+        cipher: Option<Arc<ClusterCipher>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             store,
             cluster,
             config,
+            cipher,
             hit_counters: DashMap::new(),
             hot_cache: DashMap::new(),
             subscribed: AtomicBool::new(false),
@@ -161,7 +171,8 @@ impl ClusteredStore {
 
         // 4. TCP fetch from the owner node via the data plane.
         if let Some(owner_addr) = self.resolve_owner_data_addr(key).await {
-            match crate::kv_data_plane::fetch_remote(owner_addr, key).await {
+            match crate::kv_data_plane::fetch_remote(owner_addr, key, self.cipher.as_deref()).await
+            {
                 Ok(Some(value)) => {
                     self.track_remote_fetch(key, &value);
                     return Some(value);
@@ -197,7 +208,14 @@ impl ClusteredStore {
         } else {
             // Large value — route to the owner node via TCP data plane.
             let ok = if let Some(owner_addr) = self.resolve_owner_data_addr(&key).await {
-                match crate::kv_data_plane::store_remote(owner_addr, &key, &value).await {
+                match crate::kv_data_plane::store_remote(
+                    owner_addr,
+                    &key,
+                    &value,
+                    self.cipher.as_deref(),
+                )
+                .await
+                {
                     Ok(accepted) => accepted,
                     Err(e) => {
                         tracing::warn!(

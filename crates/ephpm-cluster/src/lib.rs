@@ -17,9 +17,11 @@ pub mod clustered_store;
 pub mod gossip_kv;
 pub mod kv_data_plane;
 pub mod node;
+pub mod secure_transport;
 pub mod sqlite_election;
 
 pub use clustered_store::ClusteredStore;
 pub use kv_data_plane as data_plane;
 pub use node::{ClusterHandle, NodeInfo, NodeState, start_gossip};
+pub use secure_transport::{ClusterCipher, EncryptedUdpTransport};
 pub use sqlite_election::{ElectedRole, SqliteElection};

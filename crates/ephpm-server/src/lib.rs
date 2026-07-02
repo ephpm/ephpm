@@ -70,10 +70,20 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         );
 
         // Start the KV TCP data plane for large-value cross-node fetches.
+        // When [cluster] secret is set, frames are sealed with a key
+        // derived from it (nodes without the secret cannot read/inject).
         let data_port = config.cluster.kv.data_port;
         let data_plane_store = Arc::clone(&kv_store);
+        let data_plane_cipher = if config.cluster.secret.is_empty() {
+            None
+        } else {
+            Some(Arc::new(ephpm_cluster::ClusterCipher::for_kv_data_plane(&config.cluster.secret)))
+        };
         tokio::spawn(async move {
-            if let Err(e) = ephpm_cluster::data_plane::serve(data_plane_store, data_port).await {
+            if let Err(e) =
+                ephpm_cluster::data_plane::serve(data_plane_store, data_port, data_plane_cipher)
+                    .await
+            {
                 tracing::error!(%e, "KV data plane error");
             }
         });

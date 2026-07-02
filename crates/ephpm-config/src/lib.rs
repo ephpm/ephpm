@@ -1295,7 +1295,16 @@ pub struct ClusterConfig {
     #[serde(default)]
     pub join: Vec<String>,
 
-    /// Base64-encoded 32-byte symmetric key for gossip encryption.
+    /// Shared secret for cluster transport security.
+    ///
+    /// When set, all inter-node traffic (gossip UDP and the KV TCP data
+    /// plane) is authenticated and encrypted with ChaCha20-Poly1305
+    /// keys derived from this secret via HKDF-SHA256. Nodes without the
+    /// matching secret cannot join, read, or inject traffic.
+    ///
+    /// Any high-entropy string works (e.g. `openssl rand -base64 32`).
+    /// When empty, inter-node traffic is unauthenticated plaintext and
+    /// a warning is logged at cluster startup.
     #[serde(default)]
     pub secret: String,
 
