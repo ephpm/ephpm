@@ -72,6 +72,47 @@ package is independent and gets its own repo + agent once the engine is proven.
 
 ---
 
+## Per-adapter acceptance gates (do NOT ship an adapter without these)
+
+Each adapter has its own correctness bar. Worker mode's danger is **state
+leakage between requests on a booted kernel** — so every adapter needs a suite
+that proves request N+1 sees *nothing* from request N.
+
+### WordPress worker (`ephpm/wordpress-worker`) — the hardest, gets the most tests
+
+WP is the trickiest adapter and **must not ship without a full e2e suite**. It's
+uniquely dangerous because, unlike Octane/PSR-15 (which build their own
+`Request` and never touch superglobals), **WordPress assumes real
+`$_GET`/`$_POST`/`$_SERVER`/`$_COOKIE`/`$_FILES` and carries enormous global
+state** (`$wp_query`, `$wpdb`, `$wp_object_cache`, the `$GLOBALS` soup, hooks
+registered at boot). Required before shipping:
+
+- **`worker_populate_superglobals` path must be fuzzed.** Turning superglobals
+  back on re-enters the `php_default_treat_data` path that caused the fpm UAF
+  (design §3.4 / `ephpm_wrapper.c:773-789`). Never hand-rebuild `PG(http_globals)`;
+  drive population through the normal treat_data path at a quiescent point; fuzz
+  GPC/multipart inputs before shipping.
+- **State-leakage suite:** two back-to-back requests with different query
+  strings / cookies / POST bodies each see only their own superglobals; no
+  `$_SESSION`, `$wp_query`, or global-scope bleed from the prior request.
+- **Real-WordPress golden-path e2e:** boot a stock WP install once per worker,
+  serve the homepage, a post, wp-admin login, a REST API call, and a
+  cache-backed page — asserting boot-once (framework bootstraps a single time,
+  not per request) and correct isolation across a concurrent load.
+- **Plugin/global-mutation stress:** a plugin that mutates globals per request
+  must not corrupt the next request (or the worker recycles cleanly).
+- **Object cache interaction:** the `ephpm/cache-wordpress` drop-in under worker
+  mode (KV persists across requests — verify no stale-cache cross-request bugs).
+- **Fatal-in-a-hook recycle:** a fatal inside a WP hook 500s that request,
+  recycles the worker, and the next request boots a clean WP — server never
+  wedges.
+
+### Other adapters
+- **PSR-15 / Octane / Symfony:** state-leakage suite (N+1 sees nothing from N),
+  boot-once proof, concurrency under load, fatal→500+recycle, graceful drain,
+  each against a stock skeleton app (Mezzio + Slim for PSR-15; a Laravel skeleton
+  for Octane; a Symfony skeleton for the runtime adapter).
+
 ## Top risks (carried from the design)
 
 - **State leakage** between requests → minimal-but-complete per-iteration reset built from the exact fpm-hardening lines; N+1-sees-nothing-from-N integration test.
