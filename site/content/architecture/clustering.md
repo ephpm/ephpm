@@ -1,6 +1,8 @@
 # Clustering & KV Store Architecture
 
-This document covers the in-memory KV store, gossip-based clustering, consistent hashing, replication, and all features that depend on the KV layer (ACME cert coordination, PHP response cache, session storage).
+This document covers the in-memory KV store, gossip-based clustering, `hash % nodes` key ownership, large-value replication, and all features that depend on the KV layer (ACME cert coordination, PHP response cache, session storage).
+
+> **Doc status:** this is a broad design document written ahead of implementation. Sections describing the KV store, gossip transport security, key ownership, and replication have been reconciled with the shipped code (`crates/ephpm-cluster/`). Some later sections (auto-instrumentation, admin UI wiring, and the illustrative session-handler C listing) still describe the intended design and may not match the code line-for-line — those spots are flagged inline.
 
 ---
 
@@ -25,7 +27,7 @@ We evaluated embedding existing databases (Redis, Dragonfly, KeyDB, Garnet) and 
 | Single-node KV | RoadRunner: in-memory/BoltDB/Redis drivers. Swoole: `Swoole\Table`. | In-process concurrent hashmap, zero-overhead access from PHP via SAPI. |
 | Data structures | Redis-style: strings, hashes, lists, sets, sorted sets | MVP: strings + hashes only (covers 95% of PHP usage). Lists, sets, sorted sets added later if needed. |
 | TTL / expiry | Standard | Background sweeper + lazy expiry on access. |
-| Clustering | **Nobody has this.** All competitors require external Redis/Memcached. | Gossip-based peer discovery, consistent hash ring, cross-node routing. |
+| Clustering | **Nobody has this.** All competitors require external Redis/Memcached. | Gossip-based peer discovery, `hash % nodes` key ownership, cross-node routing with replication. |
 | PHP access | RoadRunner: Goridge RPC. Swoole: shared memory API. | SAPI function calls — zero serialization, zero network hop for local keys. |
 | Persistence | Optional | **Planned — not yet implemented.** Optional AOF/snapshot for crash recovery. This is a cache, not a database. |
 | Redis protocol compat | Not required | Optional RESP listener so existing Redis clients/tools work. |
@@ -331,7 +333,7 @@ The session handler implements PHP's `SessionHandlerInterface` at the C level:
 | `destroy($id)` | `ephpm_kv_del("session:$id")` |
 | `gc($max_lifetime)` | No-op (TTL expiry handles this) |
 
-With clustering, sessions are accessible from any node — no sticky sessions required at the load balancer. Consistent hashing on session ID means reads-after-writes within the same session naturally hit the same node (strong consistency for free with async replication).
+With clustering, sessions are accessible from any node — no sticky sessions required at the load balancer. Ownership is a deterministic `hash(session_id) % alive_nodes`, so within a stable cluster reads-after-writes for a session hit the same owner (read-your-writes for free). Large session blobs are additionally replicated to `replication_factor` nodes, so a session survives owner loss.
 
 ### 3. Direct SAPI Functions — Maximum Performance
 
@@ -421,7 +423,7 @@ The RESP paths have overhead from IPC + RESP serialization, but are still **100-
 
 ### Overview
 
-Three components: gossip-based peer discovery, consistent hash ring for key routing, and replication for fault tolerance.
+Three components: gossip-based peer discovery, `hash % nodes` key ownership for routing, and replication for fault tolerance.
 
 ```
    ┌─────────────────┐   gossip    ┌─────────────────┐   gossip    ┌─────────────────┐
@@ -432,11 +434,11 @@ Three components: gossip-based peer discovery, consistent hash ring for key rout
             │                               │                               │
             └────────────── gossip ─────────┴───────────────────────────────┘
             │                               │                               │
-            │           all three register on the shared ring               │
+            │      all three share one sorted alive-node list (gossip)      │
             ▼                               ▼                               ▼
             ┌───────────────────────────────────────────────────────────────┐
-            │                  consistent hash ring                         │
-            │              (key → owner-node mapping)                       │
+            │            key ownership: hash(key) % alive_nodes             │
+            │              (key → owner + replica-set mapping)              │
             └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -544,46 +546,28 @@ A `StatefulSet` is preferred over a `Deployment` for the KV store — pods get s
 
 ### 2. Inter-Node Security
 
-Cluster communication has two channels with different security requirements:
+Cluster communication has two channels, and **both** are secured by the same symmetric pre-shared key (`[cluster] secret`) — there is no TLS or mTLS anywhere in the cluster transport. From the shared secret, ePHPm derives two domain-separated ChaCha20-Poly1305 keys via HKDF-SHA256 (`crates/ephpm-cluster/src/secure_transport.rs`):
+
+- gossip UDP: HKDF info `"ephpm-gossip-v1"`
+- KV data plane TCP: HKDF info `"ephpm-kv-data-v1"`
+
+Because the two planes derive different keys, a ciphertext valid on one plane is meaningless on the other.
 
 #### Gossip Channel (UDP)
 
-The SWIM gossip protocol uses UDP for high-frequency heartbeats and metadata exchange. Encrypted with a symmetric pre-shared key (like Consul's `encrypt` key). This prevents unauthorized nodes from joining the cluster and protects metadata (node addresses, health, KV stats) in transit.
+The SWIM gossip protocol uses UDP for high-frequency heartbeats and metadata exchange. Every datagram is sealed with the gossip key (nonce + Poly1305 tag). Datagrams that fail authentication are silently dropped, so a node without the matching secret — or one sending plaintext — is invisible to the cluster rather than an error. This prevents unauthorized nodes from joining and protects metadata (node addresses, health, KV stats) in transit.
 
-The shared secret is the only required security config — one value to set across all nodes.
+#### Data Plane (TCP + symmetric PSK)
 
-#### Data Plane (TCP + mTLS)
+KV operations between nodes (remote get/set and large-value replication) use TCP. When `[cluster] secret` is set, each request and response is sealed as a single ChaCha20-Poly1305 frame with the data-plane key:
 
-KV operations between nodes (remote get/set, replication, key rebalancing) use TCP with mutual TLS. Both sides authenticate — a rogue node can't join the cluster and read session data or inject cache entries.
-
-mTLS uses rustls (already a dependency for HTTPS serving). Two modes:
-
-**Auto-generated certs (default, zero-config):**
-
-```
-1. Node starts, generates ephemeral self-signed EC cert (P-256)
-2. Publishes cert fingerprint (SHA-256) via gossip
-   (gossip is encrypted with cluster secret, so fingerprint is trusted)
-3. Other nodes learn the fingerprint, add it to their trust store
-4. Data plane connections use mTLS — each side verifies the peer's
-   cert fingerprint against what gossip advertised
-5. Cert regenerated on restart — fingerprint propagates automatically
+```text
+[frame_len: u32 BE][nonce: 12 bytes][ciphertext + 16-byte tag]
 ```
 
-This is fully zero-config beyond the cluster secret. No CA infrastructure, no cert distribution, no renewal management. The gossip channel bootstraps trust for the data plane.
+This is **symmetric pre-shared-key authentication, not mutual TLS**. There are no certificates, no CA, no fingerprint exchange, and no `tls_cert`/`tls_key`/`tls_ca` cluster options. Both sides prove possession of the same secret by being able to seal/open frames; a peer with the wrong secret cannot read values or inject writes (frames fail authentication and the connection is dropped). When the secret is unset, the data plane is plaintext and a warning is logged at startup — only acceptable on a trusted private network.
 
-**Manual certs (enterprise/compliance):**
-
-For environments that require certs from a specific CA (corporate PKI, compliance requirements):
-
-```toml
-[cluster]
-tls_cert = "/etc/ephpm/node.pem"
-tls_key = "/etc/ephpm/node-key.pem"
-tls_ca = "/etc/ephpm/ca.pem"        # CA that signed all node certs
-```
-
-When manual certs are provided, auto-generation is skipped and standard CA verification is used instead of fingerprint pinning.
+The shared secret is the only security config — one value to set across all nodes, covering both planes.
 
 #### Security Summary
 
@@ -592,7 +576,7 @@ When manual certs are provided, auto-generation is skipped and standard CA verif
                     │         Cluster Secret           │
                     │   (symmetric, pre-shared key)    │
                     └──────────┬──────────────────────┘
-                               │
+                               │  HKDF-SHA256 (domain-separated)
                ┌───────────────┼───────────────┐
                │               │               │
                ▼               ▼               ▼
@@ -600,67 +584,50 @@ When manual certs are provided, auto-generation is skipped and standard CA verif
           │ Node A  │    │ Node B  │    │ Node C  │
           └────┬────┘    └────┬────┘    └────┬────┘
                │              │              │
-  Gossip (UDP) │◄─encrypted──►│◄─encrypted──►│
-  symmetric key│              │              │
+  Gossip (UDP) │◄─sealed─────►│◄─sealed─────►│
+  ChaCha20     │  (gossip key)│              │
                │              │              │
-  Data (TCP)   │◄───mTLS─────►│◄───mTLS─────►│
-  cert pinning │              │              │
-  or CA verify │              │              │
-               │              │              │
+  Data (TCP)   │◄─sealed─────►│◄─sealed─────►│
+  ChaCha20     │  (data key)  │              │
+  (PSK, no TLS)│              │              │
 ```
 
 | Channel | Transport | Encryption | Authentication |
 |---------|-----------|------------|----------------|
-| Gossip | UDP | Symmetric (cluster secret) | Pre-shared key |
-| Data plane | TCP | TLS 1.3 (rustls) | mTLS — auto-generated certs with fingerprint pinning, or CA-signed certs |
+| Gossip | UDP | ChaCha20-Poly1305 (gossip key from cluster secret) | Symmetric PSK — undecryptable datagrams dropped |
+| Data plane | TCP | ChaCha20-Poly1305 (data-plane key from cluster secret) | Symmetric PSK — unauthenticated frames dropped, connection closed |
 
-### 3. Consistent Hash Ring
+### 3. Key Ownership (`hash % nodes`)
 
-Keys are distributed across nodes using a consistent hash ring. When a node joins or leaves, only ~1/N of keys need to be rebalanced (not all of them).
+Large-tier keys are distributed across nodes by a plain modulo of the **sorted alive-node list** — there is no consistent hash ring, no virtual nodes, and no `hashring` crate dependency (see `crates/ephpm-cluster/src/clustered_store.rs`):
 
 ```
-            ┌───────────────────────┐
-            │    Hash Ring          │
-            │                       │
-            │   0x0000 ──► Node A   │
-            │   0x5556 ──► Node B   │
-            │   0xAAAB ──► Node C   │
-            │                       │
-            │   Key "session:abc"   │
-            │   hash = 0x3A21       │
-            │   → owned by Node A   │
-            └───────────────────────┘
+owner = alive_nodes_sorted[ hash(key) % alive_nodes_sorted.len() ]
 ```
 
-Each node uses virtual nodes (vnodes) for even distribution — e.g., 150 vnodes per physical node. The `hashring` crate handles this.
+```
+            ┌───────────────────────────┐
+            │  sorted alive nodes:       │
+            │  [ Node A, Node B, Node C ]│
+            │                            │
+            │  Key "session:abc"         │
+            │  hash % 3 = 0 → Node A     │
+            └───────────────────────────┘
+```
+
+The trade-off vs a consistent hash ring: when membership changes (a node joins, leaves, or dies), ownership remaps **broadly** — most keys change owner, not the ~1/N a ring would give. For ePHPm's cache-oriented workload (values that can be refetched or recomputed) this is acceptable; a consistent-hashing scheme may replace it later if remapping cost becomes a problem.
 
 ```rust
-use hashring::HashRing;
-
 struct ClusterRouter {
-    ring: RwLock<HashRing<NodeId>>,
+    alive_nodes: RwLock<Vec<NodeId>>,   // sorted; from gossip membership
     local_node: NodeId,
-    peers: DashMap<NodeId, PeerConnection>,
 }
 
 impl ClusterRouter {
-    /// Route a key to the correct node.
+    /// Primary owner of a key.
     fn owner(&self, key: &[u8]) -> NodeId {
-        let ring = self.ring.read();
-        ring.get(key).cloned().unwrap()
-    }
-
-    /// Get a value — local fast path or network hop.
-    async fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        let owner = self.owner(key);
-        if owner == self.local_node {
-            // Fast path: local lookup, no serialization, no network
-            self.local_store.get(key)
-        } else {
-            // Network hop: forward to owner node
-            let peer = self.peers.get(&owner)?;
-            peer.remote_get(key).await
-        }
+        let nodes = self.alive_nodes.read();
+        nodes[(hash(key) as usize) % nodes.len()].clone()
     }
 }
 ```
@@ -669,44 +636,52 @@ Crate dependencies:
 
 | Crate | Purpose |
 |-------|---------|
-| `chitchat` | Quickwit's SWIM gossip library (or custom implementation) |
-| `hashring` | Consistent hashing with virtual nodes |
+| `chitchat` | Quickwit's SWIM gossip library |
 
-### 3. Replication
+(Key ownership is a few lines of arithmetic over the gossip membership list — no external hashing crate.)
 
-Writes go to the owner node and N replicas (the next N nodes clockwise on the ring). This provides fault tolerance — if a node dies, its replicas can serve reads immediately.
+### 4. Replication
+
+Large-tier writes go to a **replica set**: the primary owner plus the next `replication_factor - 1` distinct nodes on the sorted alive-node ring (wrapping around, clamped to the cluster size). This provides fault tolerance — if the owner dies, a replica can serve reads. Small (gossip-tier) values are separately replicated to *every* node and ignore `replication_factor`.
 
 ```
-Write "session:abc" = "data"
+Write large "cart:abc" = <8 KiB>, replication_factor = 2
        │
        ▼
-   hash(key) → Node A (owner)
+   hash(key) % nodes → Node A (primary owner)
        │
-       ├──► write locally
-       ├──► replicate to Node B (replica 1)
-       └──► replicate to Node C (replica 2)
+       ├──► write to Node A (primary)
+       └──► replicate to Node B (next node on the ring)
+
+Read "cart:abc":  try Node A first → on miss/owner-down, fall back to Node B
 ```
 
-Replication modes:
-- **Asynchronous (default)** — write returns after local write, replicas updated in background (lower latency, eventual consistency)
-- **Synchronous** — write waits for N replicas to confirm (stronger consistency, higher latency)
+Replication modes (`[cluster.kv] replication_mode`):
+- **async (default)** — the client write returns after the primary/local copy is written; the remaining replicas are updated in the background (fire-and-forget, failures logged and counted). Lower latency, eventual replica convergence.
+- **sync** — the write also awaits every *reachable* replica before returning. This is best-effort read-your-writes durability against live peers: a replica that is down is logged but does **not** fail the write. It is **not** a quorum or consensus protocol (no Raft, no rollback).
 
-For sessions and cache data, async replication with read-your-writes consistency is the right default. PHP apps doing `$_SESSION['cart'] = ...` on one request and reading it on the next will hit the same node (session affinity via consistent hashing on session ID), so they get strong consistency for free.
+Read path: reads try the primary owner first, then fall back to the other replicas in ring order until one returns the value. A large value therefore survives up to `replication_factor - 1` node failures.
+
+> **Membership caveat (v1):** replication is write-time only. There is no active anti-entropy or rebalancing — a node that was down during a write does not receive the key until it is rewritten or fetched-through, and existing keys are not re-replicated when membership changes.
+
+For sessions and cache data, async replication is the right default. PHP apps doing `$_SESSION['cart'] = ...` on one request and reading it on the next hit the same owner (ownership is a deterministic function of the session id and the current membership), so within a stable cluster they get read-your-writes for free.
 
 ```toml
 [cluster.kv]
-replication_factor = 2        # copies on 2 additional nodes
-replication_mode = "async"    # or "sync"
+replication_factor = 2        # copies of each large value (owner + N-1 peers)
+replication_mode = "async"    # async (default) or sync
 ```
 
-### 4. Node Join / Leave / Failure
+### 5. Node Join / Leave / Failure
+
+Because ownership is `hash % alive_nodes` and replication is write-time only (no active rebalancing), membership changes remap ownership but do **not** move existing data:
 
 | Event | What happens |
 |-------|-------------|
-| **Node joins** | Gossip announces new member. Hash ring adds vnodes. Affected key ranges transfer from current owners to new node in background. |
-| **Node leaves gracefully** | Node announces departure via gossip. Key ranges transfer to next nodes on ring before shutdown. |
-| **Node crashes** | Gossip failure detector triggers after missed heartbeats. Replicas promote to owners for affected key ranges. New replicas created on surviving nodes. |
-| **Network partition** | Nodes on each side continue serving their local keys. On heal, conflict resolution via last-write-wins (LWW) timestamps. |
+| **Node joins** | Gossip announces the new member. Ownership is recomputed against the larger node list — most large-tier keys remap to new owner/replica sets. A remapped key is not present on its *new* replicas until it is rewritten or fetched-through; the old replicas may still serve it via read fallback. |
+| **Node leaves gracefully** | Departure propagates via gossip; ownership is recomputed. Large values it held survive if another replica in their set is still up (`replication_factor ≥ 2`); with `replication_factor = 1` they are gone. |
+| **Node crashes** | Gossip failure detector triggers after missed heartbeats. Surviving nodes recompute ownership and read via replicas — a large value survives up to `replication_factor - 1` simultaneous crashes. Small gossip-tier values always survive (every node has a copy). There is no background re-replication to restore the lost copy count yet. |
+| **Network partition** | Nodes on each side continue serving their local keys and any replicas they hold. On heal, conflict resolution via last-write-wins (LWW) timestamps. |
 
 ---
 
@@ -898,6 +873,8 @@ PHP: session_start()
 
 The session handler is registered during SAPI initialization via `php_session_register_module()`. All functions go through `ephpm_wrapper.c` with `zend_try`/`zend_catch` bailout protection.
 
+> **TODO verify / does not match the shipped code:** the C listing below is the *original design sketch*. The actual implementation in `crates/ephpm-php/ephpm_wrapper.c` does not use the `ephpm_kv_session_lock(const char *id, size_t id_len)` / `ephpm_kv_session_unlock(...)` FFI signatures shown here. Locking is done inside the wrapper via a KV op table (`g_kv_ops.set_nx` / `g_kv_ops.del`) and internal `static` helpers `ephpm_session_lock_acquire(sid, sid_len)` / `ephpm_session_lock_release(void)`, with the acquired sid tracked in thread-local state (`session_lock:<sid>`, 30s TTL, spin-with-backoff). See [the Sessions feature doc](/features/sessions/) for the authoritative behaviour.
+
 ```c
 // ephpm_wrapper.c
 
@@ -1082,7 +1059,7 @@ fn session_lock(session_id: &str, timeout: Duration) -> bool {
 }
 ```
 
-With clustering, the lock lives on whichever node owns the `session_lock:{id}` key via the hash ring. Since the session data key (`session:{id}`) hashes to the same node prefix, lock + data will typically be co-located — no extra network hop for the common case.
+With clustering, the lock key `session_lock:{id}` is small and rides the gossip tier (it is well under `small_key_threshold`), so it is replicated to every node — the `SETNX` and `DEL` operate on the local gossip-backed view. (In the shipped implementation the lock is node-local; see the [Sessions feature doc](/features/sessions/) for the exact cross-node semantics.)
 
 #### Serialization
 
@@ -1128,9 +1105,9 @@ Client → Load Balancer → Pod 0: session_start()
   │                          → session data available immediately
 ```
 
-No sticky sessions needed at the load balancer. Any node can read/write any session. Consistent hashing ensures the session key always routes to the same owner node, so there's no replication lag concern for read-your-writes within a single session.
+No sticky sessions needed at the load balancer. Any node can read/write any session. Ownership (`hash(session_id) % alive_nodes`) keeps a session on the same owner while membership is stable, so there's no replication-lag concern for read-your-writes within a single session.
 
-If the owner node (Pod 2) crashes, the replica promotes to owner automatically. The next session request routes to the new owner — no data loss, no user impact.
+If the owner node (Pod 2) crashes, a surviving node recomputes ownership and reads the session from a replica (large blobs are replicated to `replication_factor` nodes; small blobs live on every node via gossip). The session survives up to `replication_factor - 1` simultaneous owner-side failures. Note the write-time-only caveat: there is no background re-replication, so after a crash the surviving copies are not automatically topped back up to `replication_factor` until the session is rewritten.
 
 #### Performance vs Other Session Handlers
 
@@ -1197,9 +1174,9 @@ The KV store and clustering should be built incrementally:
 | **4. Session handler** | Custom PHP session save handler using KV (SAPI path) | Phase 3 |
 | **5. Composer package** | `ephpm/ephpm` — PSR-6/PSR-16 adapters, Laravel/Symfony drivers, Redis fallback | Phase 3 |
 | **6. Gossip** | `chitchat` integration, peer discovery, health, symmetric encryption | Nothing — can start in parallel with Phase 1 |
-| **6b. Inter-node mTLS** | Auto-generated certs, fingerprint exchange via gossip, data plane TLS | Phase 6 |
-| **7. Hash ring** | Consistent hashing, key routing, local vs remote (over mTLS) | Phase 1 + Phase 6b |
-| **8. Replication** | Async/sync replication, failure promotion | Phase 7 |
+| **6b. Data plane PSK encryption** | ChaCha20-Poly1305 sealing of the TCP data plane with a key derived from `[cluster] secret` (symmetric PSK, not mTLS) | Phase 6 |
+| **7. Key ownership** | `hash % nodes` owner selection, local vs remote routing over the (optionally sealed) data plane | Phase 1 + Phase 6b |
+| **8. Replication** | Async/sync large-value replication to `replication_factor` nodes, owner-then-replica read fallback (write-time only; no active rebalancing) | Phase 7 |
 | **9. ACME on KV** | Swap `DirCache` for `KvCache` in rustls-acme | Phase 8 |
 | **10. PHP response cache** | ETag interception, 304 short-circuit | Phase 7 |
 | **11. Distributed locks** | TTL-based locks, leader election | Phase 7 |
@@ -1207,7 +1184,7 @@ The KV store and clustering should be built incrementally:
 | **13. RESP lists** | `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`BRPOP` — only if Laravel queue demand warrants it | Phase 2 |
 | **14. RESP sets + sorted sets** | `SADD`/`ZADD` etc. — low priority, most apps needing these keep a dedicated Redis | Phase 2 |
 
-Phases 1-5 (single-node) and Phase 6 (gossip) can be developed in parallel. Everything after Phase 7 depends on the hash ring being operational. RESP data structure phases (13-14) can be added at any time after Phase 2.
+Phases 1-5 (single-node) and Phase 6 (gossip) can be developed in parallel. Everything after Phase 7 depends on key ownership being operational. RESP data structure phases (13-14) can be added at any time after Phase 2.
 
 ---
 
@@ -1230,16 +1207,12 @@ socket = "/run/ephpm/redis.sock"       # Unix socket (~2-5x faster than TCP)
 enabled = false
 bind = "0.0.0.0:7946"                 # gossip listen address
 join = ["10.0.1.2:7946"]              # seed nodes
-secret = ""                            # shared secret — encrypts gossip + KV data plane, authenticates nodes
-
-# mTLS for data plane (auto-generated certs by default)
-# When omitted, nodes generate ephemeral self-signed certs and
-# exchange fingerprints via the encrypted gossip channel (zero-config).
-# tls_cert = "/etc/ephpm/node.pem"    # manual: PEM cert for this node
-# tls_key = "/etc/ephpm/node-key.pem" # manual: PEM private key
-# tls_ca = "/etc/ephpm/ca.pem"        # manual: CA that signed all node certs
+secret = ""                            # shared secret — a ChaCha20-Poly1305 PSK that
+                                       # seals BOTH gossip UDP and the KV data plane TCP
+                                       # (no TLS/mTLS; there are no tls_cert/tls_key/tls_ca
+                                       # cluster options). Empty = plaintext + startup warning.
 
 [cluster.kv]
-replication_factor = 2                 # copies on N additional nodes
-replication_mode = "async"             # async or sync
+replication_factor = 2                 # copies of each large value (owner + N-1 peers); clamped to cluster size
+replication_mode = "async"             # async (default) or sync — see Replication above
 ```

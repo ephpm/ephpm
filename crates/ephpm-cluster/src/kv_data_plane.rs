@@ -71,7 +71,7 @@ const SET_OK: u8 = 0x00;
 /// SET response: rejected (e.g., memory limit with `NoEviction`).
 const SET_REJECTED: u8 = 0x01;
 
-/// Start the TCP KV data plane listener.
+/// Start the TCP KV data plane listener on all interfaces at `port`.
 ///
 /// Serves lookups against the local [`Store`] so remote cluster nodes
 /// can fetch large values that exceed the gossip tier threshold.
@@ -87,7 +87,23 @@ pub async fn serve(
     port: u16,
     cipher: Option<Arc<ClusterCipher>>,
 ) -> anyhow::Result<()> {
-    let addr: SocketAddr = ([0, 0, 0, 0], port).into();
+    serve_on(store, ([0, 0, 0, 0], port).into(), cipher).await
+}
+
+/// Start the TCP KV data plane listener bound to a specific address.
+///
+/// Like [`serve`] but binds `addr` exactly instead of `0.0.0.0:port`.
+/// Useful when several nodes share one host (e.g. in-process tests on
+/// distinct `127.0.0.x` loopback addresses).
+///
+/// # Errors
+///
+/// Returns an error if the TCP listener fails to bind.
+pub async fn serve_on(
+    store: Arc<Store>,
+    addr: SocketAddr,
+    cipher: Option<Arc<ClusterCipher>>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind KV data plane to {addr}: {e}"))?;

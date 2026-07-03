@@ -237,7 +237,7 @@ join = ["ephpm-headless.default.svc.cluster.local"]
 
 [cluster.kv]
 small_key_threshold = 1024        # bytes — under this, replicate via gossip
-replication_factor = 3            # large keys: 3 owners on the ring
+replication_factor = 3            # large keys: 3 copies (owner + 2 replicas)
 replication_mode = "async"        # async | sync
 hot_key_cache = true              # cache hot remote values locally
 hot_key_max_memory = "64MB"

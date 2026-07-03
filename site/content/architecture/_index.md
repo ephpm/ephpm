@@ -32,7 +32,7 @@ This document describes the full vision for ePHPm. The matrix below tracks what 
 | sqld embedding | **Implemented** | Binary embedded via `include_bytes!()`; spawned per-role; auto-restart on role change |
 | Primary election | **Implemented** | Gossip KV tier (`kv:sqlite:primary`), lowest ordinal wins, TTL heartbeat |
 | KV store (single-node) | **Implemented** | RESP2 server (~30 Redis commands), TTL/expiry, DashMap-backed, SAPI bridge for zero-overhead PHP access |
-| KV store (clustering) | **Implemented** | Gossip discovery, consistent hash ring, cross-node replication |
+| KV store (clustering) | **Implemented** | Gossip discovery, `hash % nodes` key ownership, large-value replication (owner + N-1 replicas, async/sync, write-time only) |
 | KV compression | **Implemented** | gzip / zstd / brotli for stored values |
 | Clustering / gossip | **Implemented** | SWIM via `chitchat` in `ephpm-cluster` |
 | Admin UI / API | Planned | Management interface — not started |
@@ -111,7 +111,7 @@ Every ePHPm node runs as a serving node. The Node API is always present — it's
 ├─────────────┼───────────────┼────────────────────────┤
 │  ACME TLS   │  Clustered KV │  Node API :9090        │
 │ (rustls-    │  (gossip +    │  ├─ /health            │
-│  acme)      │   hash ring)  │  ├─ /metrics (prom)    │
+│  acme)      │  hash%nodes)  │  ├─ /metrics (prom)    │
 │             │               │  ├─ /api/workers       │
 │             │               │  ├─ /api/db/digests    │
 │             │               │  ├─ /api/db/slow       │
@@ -310,7 +310,7 @@ password = "changeme"                 # admin UI auth (separate from node API au
 - INFO command with basic server and memory stats
 - Thread-local get buffer for safe C FFI result passing
 - Eviction policies — `noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-random` — enforced against `memory_limit` with approximate memory accounting
-- **Clustering** — gossip-based peer discovery (`chitchat`), consistent hash ring, cross-node replication, owner / replica routing for keys (in `ephpm-cluster`)
+- **Clustering** — gossip-based peer discovery (`chitchat`), `hash % nodes` key ownership, large-value replication to `replication_factor` nodes with async/sync write modes and owner-then-replica read fallback (in `ephpm-cluster`)
 
 **Planned / Not Yet Implemented:**
 - Additional data structures (lists, sets, sorted sets) — currently strings + hashes only
@@ -347,7 +347,7 @@ The same arguments apply to embedding Redis, KeyDB, or Garnet. They're all stand
 | Single-node KV | RoadRunner: in-memory/BoltDB/Redis drivers (single-node). Swoole: `Swoole\Table` (single-process shared memory). | In-process concurrent hashmap, zero-overhead access from PHP via SAPI. |
 | Data structures | Redis-style: strings, hashes, lists, sets, sorted sets | `GET`/`SET`/`DEL`, `HGET`/`HSET`, `EXPIRE`, lists. Sorted sets if needed. |
 | TTL / expiry | Standard | Background sweeper + lazy expiry on access. |
-| Clustering | **Nobody has this.** All competitors require external Redis/Memcached. | Gossip-based peer discovery, consistent hash ring, cross-node routing. |
+| Clustering | **Nobody has this.** All competitors require external Redis/Memcached. | Gossip-based peer discovery, `hash % nodes` key ownership, cross-node routing with replication. |
 | PHP access | RoadRunner: Goridge RPC. Swoole: shared memory API. | SAPI function calls — zero serialization, zero network hop for local keys. |
 | Persistence | Optional | Optional AOF/snapshot for crash recovery. This is a cache, not a database. |
 | Redis protocol | Not required | Optional RESP listener so existing Redis clients/tools work. Nice-to-have, not critical. |
@@ -506,24 +506,29 @@ impl ClusterRouter {
 Replication behaves differently for the two value tiers:
 
 - **Small values** (≤ `[cluster.kv] small_key_threshold`, default 512 bytes) are replicated to **every node** via the gossip protocol. Each node holds a local copy; convergence is eventually consistent, typically within hundreds of milliseconds.
-- **Large values** live on **exactly one node** — the owner selected by `hash(key) % nodes`. There are no replica copies today. If the owner dies, its large values are gone and must be regenerated — fine for cache data, not for anything you can't recompute.
+- **Large values** are replicated to `[cluster.kv] replication_factor` nodes (default 2): the primary owner (`hash(key) % alive_nodes`) plus the next `replication_factor - 1` distinct nodes on the sorted alive-node ring (wrapping around, clamped to the cluster size). Writes go to the whole set; reads try the owner first and fall back to the other replicas, so a large value survives the loss of its owner — up to `replication_factor - 1` node failures.
 
-The `[cluster.kv]` keys `replication_factor` and `replication_mode` are **parsed but not implemented** — setting them has no effect. Multi-copy replication of large values (with sync/async write modes) is a planned feature.
+Write mode is controlled by `replication_mode`:
+
+- `"async"` (default) — the client write returns after the primary/local copy is written; the remaining replicas are updated in the background (fire-and-forget, failures logged and counted).
+- `"sync"` — the write also awaits every *reachable* replica before returning (best-effort read-your-writes durability against live peers). A replica that is down is logged but does **not** fail the write; this is not a quorum or consensus protocol, and no rollback is performed.
+
+Replication is **write-time only** — there is no active anti-entropy or rebalancing. A node that was down during a write does not receive the key until it is rewritten or fetched-through, and existing keys are not re-replicated when membership changes.
 
 ```toml
 [cluster.kv]
-replication_factor = 2        # parsed but NOT implemented — no effect today
-replication_mode = "async"    # parsed but NOT implemented — no effect today
+replication_factor = 2        # copies of each large value (owner + N-1 peers)
+replication_mode = "async"    # async (default) or sync
 ```
 
 #### 4. Node join / leave / failure
 
 | Event | What happens |
 |---|---|
-| **Node joins** | Gossip announces the new member. Ownership is recomputed (hash modulo the new node list) — most large-tier keys remap to new owners; remapped keys behave as cache misses until rewritten. |
-| **Node leaves gracefully** | Departure propagates via gossip; ownership is recomputed the same way. Large values held only by the departed node are gone. |
-| **Node crashes** | Gossip failure detector triggers after missed heartbeats. Surviving nodes recompute ownership; the crashed node's large values are lost. Small gossip-tier values survive — every node has a copy. |
-| **Network partition** | Nodes on each side continue serving their local keys. On heal, conflict resolution via last-write-wins (LWW) timestamps. |
+| **Node joins** | Gossip announces the new member. Ownership is recomputed (hash modulo the new node list) — most large-tier keys remap to new owner/replica sets. Because replication is write-time only, a remapped key isn't present on its *new* replicas until it's rewritten or fetched-through; the old replicas may still serve it during read fallback. |
+| **Node leaves gracefully** | Departure propagates via gossip; ownership is recomputed the same way. Large values it held survive if another replica in their set is still up (`replication_factor ≥ 2`); with `replication_factor = 1` they are gone. |
+| **Node crashes** | Gossip failure detector triggers after missed heartbeats. Surviving nodes recompute ownership and read via replicas — a large value survives up to `replication_factor - 1` simultaneous crashes. With `replication_factor = 1` (or more crashes than replicas) the affected large values are lost. Small gossip-tier values always survive — every node has a copy. |
+| **Network partition** | Nodes on each side continue serving their local keys and any replicas they hold. On heal, conflict resolution via last-write-wins (LWW) timestamps. |
 
 ### PHP Access: Zero-Overhead via SAPI
 
@@ -1637,7 +1642,7 @@ ephpm/
 │   ├── ephpm-config/           # Configuration (figment) — TOML + EPHPM_* env var overrides
 │   ├── ephpm-kv/               # Embedded KV store — DashMap, RESP2, TTL/expiry, gzip/zstd/brotli compression
 │   ├── ephpm-db/               # DB proxy — MySQL wire, connection pooling, R/W splitting
-│   ├── ephpm-cluster/          # Clustering — SWIM gossip (chitchat), consistent hash ring, KV replication, SQLite primary election
+│   ├── ephpm-cluster/          # Clustering — SWIM gossip (chitchat), hash%nodes key ownership, KV replication, SQLite primary election
 │   ├── ephpm-sqld/             # sqld embedding — binary extracted via include_bytes!, child process lifecycle, health checks
 │   ├── ephpm-query-stats/      # Query observability — SQL normalizer, digest tracker, slow query log, Prometheus metrics
 │   └── ephpm-e2e/              # E2E test harness — EXCLUDED from the workspace; runs in Docker via `cargo xtask e2e`
@@ -1669,7 +1674,7 @@ The original MVP — single binary, hyper + PHP, TOML config, WordPress demo —
 - Single-node SQLite via [litewire](https://github.com/ephpm/litewire) + `rusqlite`, transparent to PHP via `pdo_mysql`
 - Clustered SQLite via litewire + embedded `sqld` sidecar (gRPC WAL frame replication)
 - KV store: DashMap-backed, RESP2 protocol, gzip/zstd/brotli compression, SAPI bridge for in-process PHP access
-- Clustering: SWIM gossip (`chitchat`), consistent hash ring, KV replication, SQLite primary election
+- Clustering: SWIM gossip (`chitchat`), `hash % nodes` key ownership, large-value KV replication (owner + N-1 replicas), SQLite primary election
 
 **Observability** — partial:
 

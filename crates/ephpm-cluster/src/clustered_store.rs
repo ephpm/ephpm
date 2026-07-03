@@ -29,10 +29,38 @@ use ephpm_config::ClusterKvConfig;
 use ephpm_kv::store::Store;
 
 use crate::ClusterHandle;
+use crate::node::NodeInfo;
 use crate::secure_transport::ClusterCipher;
 
 /// Key prefix for hot-key version metadata in chitchat state.
 const HOT_PREFIX: &str = "hot:";
+
+/// How large-value writes propagate to replica nodes.
+///
+/// # Consistency guarantee
+///
+/// Replication is **write-time only** — there is no active anti-entropy
+/// or rebalancing. See [`ClusteredStore::set`] for the exact per-mode
+/// guarantee and the membership-change caveat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicationMode {
+    /// Return as soon as the primary/local copy is written; other
+    /// replicas are updated in the background (fire-and-forget).
+    Async,
+    /// Wait for every reachable replica to acknowledge before
+    /// returning; an unreachable replica is logged, not fatal.
+    Sync,
+}
+
+impl ReplicationMode {
+    /// Parse the `[cluster.kv] replication_mode` string.
+    ///
+    /// Anything other than `"sync"` (case-insensitive) is treated as
+    /// [`ReplicationMode::Async`], matching the config default.
+    fn from_config(mode: &str) -> Self {
+        if mode.eq_ignore_ascii_case("sync") { Self::Sync } else { Self::Async }
+    }
+}
 
 /// A clustered KV store that routes between gossip and local tiers.
 pub struct ClusteredStore {
@@ -52,6 +80,12 @@ pub struct ClusteredStore {
     subscribed: AtomicBool,
     /// Approximate memory used by the hot cache.
     hot_cache_mem: AtomicU64,
+    /// Count of replica writes that failed to reach a peer (data plane
+    /// error or rejection). Observability only — a failed replica write
+    /// never fails the client set (see [`ClusteredStore::set`]). Wrapped
+    /// in an `Arc` so fire-and-forget async replica tasks can record
+    /// their failures too.
+    replica_write_failures: Arc<AtomicU64>,
 }
 
 /// Tracks remote fetch frequency for a single key.
@@ -97,6 +131,7 @@ impl ClusteredStore {
             hot_cache: DashMap::new(),
             subscribed: AtomicBool::new(false),
             hot_cache_mem: AtomicU64::new(0),
+            replica_write_failures: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -169,19 +204,30 @@ impl ClusteredStore {
             }
         }
 
-        // 4. TCP fetch from the owner node via the data plane.
-        if let Some(owner_addr) = self.resolve_owner_data_addr(key).await {
-            match crate::kv_data_plane::fetch_remote(owner_addr, key, self.cipher.as_deref()).await
-            {
+        // 4. TCP fetch from the replica set via the data plane. Try the
+        //    primary owner first, then fall back to the other replicas in
+        //    ring order — this is what lets a large value survive the
+        //    loss of its owner (up to `replication_factor - 1` failures).
+        let self_id = self.cluster.self_node().id;
+        for node in self.replica_nodes(key).await {
+            // Skip ourselves: if we had the value it would have been
+            // served by the local-store check above.
+            if node.id == self_id {
+                continue;
+            }
+            let Some(addr) = node_data_addr(&node, self.config.data_port) else {
+                continue;
+            };
+            match crate::kv_data_plane::fetch_remote(addr, key, self.cipher.as_deref()).await {
                 Ok(Some(value)) => {
                     self.track_remote_fetch(key, &value);
                     return Some(value);
                 }
                 Ok(None) => {
-                    tracing::debug!(key, %owner_addr, "key not found on owner node");
+                    tracing::debug!(key, replica = %node.id, %addr, "key not found on replica");
                 }
                 Err(e) => {
-                    tracing::debug!(key, %owner_addr, %e, "TCP data plane fetch failed");
+                    tracing::debug!(key, replica = %node.id, %addr, %e, "replica fetch failed");
                 }
             }
         }
@@ -191,8 +237,40 @@ impl ClusteredStore {
 
     /// Set a value, routing through the appropriate tier.
     ///
-    /// Returns `true` on success, `false` if the local store rejected the
-    /// write (e.g., memory limit with `NoEviction` policy).
+    /// Returns `true` on success, `false` if the primary write failed
+    /// (the local store rejected it, or the primary owner rejected /
+    /// was unreachable and no local fallback succeeded).
+    ///
+    /// # Large-value replication
+    ///
+    /// Large values are written to the **replica set**: the primary
+    /// owner (`hash(key) % alive_nodes`) plus the next
+    /// `replication_factor - 1` distinct nodes on the sorted alive-node
+    /// ring (wrapping around; clamped to the number of alive nodes). The
+    /// client-visible result reflects only the **primary** write; replica
+    /// propagation follows the configured [`ReplicationMode`]:
+    ///
+    /// - **async** (default): the primary write is awaited, then replica
+    ///   writes are spawned fire-and-forget. Failures are counted
+    ///   ([`ClusteredStore::replica_write_failures`]) and logged at
+    ///   `warn`, but never fail or delay the client set.
+    /// - **sync**: replica writes are awaited best-effort. The guarantee
+    ///   is *"every reachable replica has acknowledged when `set`
+    ///   returns"*. A replica that is down or rejects the write is
+    ///   logged and counted but does **not** fail the set — this is not
+    ///   a quorum/consensus protocol, and no rollback is performed. It
+    ///   trades the async latency win for read-your-writes durability
+    ///   against reachable peers.
+    ///
+    /// ## Membership-change caveat (v1)
+    ///
+    /// Replication happens only at write time. There is no active
+    /// anti-entropy or rebalancing: a node that was down (or not yet in
+    /// the replica set) when a key was written will **not** hold that
+    /// key until the key is rewritten or fetched-through from a node
+    /// that has it. Likewise, when membership changes the replica set
+    /// for existing keys is not recomputed retroactively. This is an
+    /// honest v1 — durable-through-rebalance replication is future work.
     pub async fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
         if value.len() <= self.config.small_key_threshold {
             // Gossip tier: replicate to all nodes.
@@ -204,40 +282,146 @@ impl ClusteredStore {
                 self.maybe_bump_hot_version(&key).await;
             }
 
-            true
-        } else {
-            // Large value — route to the owner node via TCP data plane.
-            let ok = if let Some(owner_addr) = self.resolve_owner_data_addr(&key).await {
-                match crate::kv_data_plane::store_remote(
-                    owner_addr,
-                    &key,
-                    &value,
-                    self.cipher.as_deref(),
-                )
-                .await
-                {
-                    Ok(accepted) => accepted,
-                    Err(e) => {
-                        tracing::warn!(
-                            key,
-                            %owner_addr,
-                            %e,
-                            "TCP data plane store failed, storing locally"
-                        );
-                        self.store.set(key.clone(), value, ttl)
+            return true;
+        }
+
+        // Large value — write to the replica set (primary + N-1 peers).
+        let ok = self.set_large(&key, &value, ttl).await;
+
+        // Bump hot key version for remote invalidation.
+        if ok && self.config.hot_key_cache {
+            self.maybe_bump_hot_version(&key).await;
+        }
+
+        ok
+    }
+
+    /// Write a large value to its replica set. Returns whether the
+    /// primary write succeeded (the client-visible result). See
+    /// [`ClusteredStore::set`] for the replication semantics.
+    async fn set_large(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> bool {
+        let self_id = self.cluster.self_node().id;
+        let replicas = self.replica_nodes(key).await;
+
+        // No cluster peers (single node, or only self alive): store
+        // locally and we're done.
+        if replicas.is_empty() {
+            return self.store.set(key.to_string(), value.to_vec(), ttl);
+        }
+
+        // The primary is the first replica; the rest are secondaries.
+        // Write the primary copy first — its result is what the client
+        // sees. Secondaries follow per the replication mode.
+        let (primary, secondaries) = replicas.split_first().expect("replicas is non-empty");
+        let primary_ok = self.write_one_replica(primary, &self_id, key, value, ttl).await;
+        if !primary_ok {
+            // The primary write failed. Fall back to a local copy so the
+            // value is not lost outright, mirroring the pre-replication
+            // behaviour. Do not attempt secondaries in this case.
+            if primary.id != self_id {
+                return self.store.set(key.to_string(), value.to_vec(), ttl);
+            }
+            return false;
+        }
+
+        let mode = ReplicationMode::from_config(&self.config.replication_mode);
+        match mode {
+            ReplicationMode::Async => {
+                // Fire-and-forget: spawn each secondary write and return.
+                for node in secondaries {
+                    if node.id == self_id {
+                        // Local replica — write inline (cheap, no task).
+                        if !self.store.set(key.to_string(), value.to_vec(), ttl) {
+                            self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(key, "local replica write rejected (memory limit?)");
+                        }
+                        continue;
+                    }
+                    let Some(addr) = node_data_addr(node, self.config.data_port) else {
+                        continue;
+                    };
+                    let cipher = self.cipher.clone();
+                    let key = key.to_string();
+                    let value = value.to_vec();
+                    let node_id = node.id.clone();
+                    let failures = Arc::clone(&self.replica_write_failures);
+                    tokio::spawn(async move {
+                        match crate::kv_data_plane::store_remote(
+                            addr,
+                            &key,
+                            &value,
+                            cipher.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                failures.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(
+                                    key,
+                                    replica = %node_id,
+                                    %addr,
+                                    "async replica rejected large-value write"
+                                );
+                            }
+                            Err(e) => {
+                                failures.fetch_add(1, Ordering::Relaxed);
+                                tracing::warn!(
+                                    key,
+                                    replica = %node_id,
+                                    %addr,
+                                    %e,
+                                    "async replica write failed"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+            ReplicationMode::Sync => {
+                // Best-effort: await every reachable secondary. Failures
+                // are logged/counted but do not fail the client write.
+                for node in secondaries {
+                    let ok = self.write_one_replica(node, &self_id, key, value, ttl).await;
+                    if !ok {
+                        self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
                     }
                 }
-            } else {
-                // We are the owner — store locally.
-                self.store.set(key.clone(), value, ttl)
-            };
-
-            // Bump hot key version for remote invalidation.
-            if ok && self.config.hot_key_cache {
-                self.maybe_bump_hot_version(&key).await;
             }
+        }
 
-            ok
+        true
+    }
+
+    /// Write one copy of a large value to a single replica node.
+    ///
+    /// Writes locally when `node` is this node, otherwise via the TCP
+    /// data plane. Returns whether the write was accepted (a data plane
+    /// error is logged and reported as `false`). The caller decides
+    /// whether a `false` result bumps the replica-failure counter — the
+    /// primary's failure is handled by the [`set_large`](Self::set_large)
+    /// fallback, not counted as a replica failure.
+    async fn write_one_replica(
+        &self,
+        node: &NodeInfo,
+        self_id: &str,
+        key: &str,
+        value: &[u8],
+        ttl: Option<Duration>,
+    ) -> bool {
+        if node.id == self_id {
+            return self.store.set(key.to_string(), value.to_vec(), ttl);
+        }
+        let Some(addr) = node_data_addr(node, self.config.data_port) else {
+            tracing::warn!(key, replica = %node.id, "replica has no parseable data address");
+            return false;
+        };
+        match crate::kv_data_plane::store_remote(addr, key, value, self.cipher.as_deref()).await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::warn!(key, replica = %node.id, %addr, %e, "replica write failed");
+                false
+            }
         }
     }
 
@@ -294,36 +478,34 @@ impl ClusteredStore {
         &self.cluster
     }
 
-    /// Determine the TCP data plane address for the node that owns this key.
+    /// Compute the replica set for `key` from live cluster membership.
     ///
-    /// Uses a simple hash-based owner selection: hash the key, pick a
-    /// live node by index. Returns `None` if the owner is this node
-    /// (already checked local store) or no remote nodes are alive.
-    async fn resolve_owner_data_addr(&self, key: &str) -> Option<SocketAddr> {
+    /// The set is the primary owner (`hash(key) % alive_nodes`) followed
+    /// by the next `replication_factor - 1` distinct alive nodes on the
+    /// sorted ring, wrapping around. The returned vector is ordered
+    /// primary-first (the read/write fallback order). Returns an empty
+    /// vector when only this node is alive (no clustering to do).
+    async fn replica_nodes(&self, key: &str) -> Vec<NodeInfo> {
         let nodes = self.cluster.nodes().await;
-        let alive: Vec<_> = nodes.iter().filter(|n| n.state == crate::NodeState::Alive).collect();
+        let mut alive: Vec<NodeInfo> =
+            nodes.into_iter().filter(|n| n.state == crate::NodeState::Alive).collect();
+        // `ClusterHandle::nodes` already sorts by id, but sort defensively
+        // so replica selection is stable regardless of caller.
+        alive.sort_by(|a, b| a.id.cmp(&b.id));
 
         if alive.len() <= 1 {
-            return None; // Only this node is alive.
+            return Vec::new(); // Only this node is alive.
         }
 
-        let key_hash = hash_key(key);
-        #[allow(clippy::cast_possible_truncation)]
-        let idx = (key_hash as usize) % alive.len();
-        let owner = &alive[idx];
+        replica_nodes_for(&alive, hash_key(key), self.config.replication_factor)
+    }
 
-        // If we own it, no remote fetch needed.
-        if owner.id == self.cluster.self_node().id {
-            return None;
-        }
-
-        // Derive data plane address from the node's gossip address IP
-        // and the configured data port.
-        owner
-            .gossip_addr
-            .parse::<SocketAddr>()
-            .ok()
-            .map(|gossip| SocketAddr::new(gossip.ip(), self.config.data_port))
+    /// Number of replica writes that failed to reach or be accepted by a
+    /// peer since startup. A failed replica write never fails the client
+    /// `set` — this counter is for observability only.
+    #[must_use]
+    pub fn replica_write_failures(&self) -> u64 {
+        self.replica_write_failures.load(Ordering::Relaxed)
     }
 
     /// Record a remote fetch and potentially promote a key to the hot
@@ -492,6 +674,44 @@ fn hash_key(key: &str) -> u64 {
     hasher.finish()
 }
 
+/// Select the replica set for a key from a sorted alive-node list.
+///
+/// The primary owner is `alive[key_hash % alive.len()]`; the replica set
+/// is the primary plus the next `factor - 1` distinct nodes clockwise on
+/// the ring (wrapping around). `factor` is clamped to `alive.len()`, so a
+/// replication factor larger than the cluster keeps one copy per node
+/// (never an error). The result is primary-first and contains no
+/// duplicates.
+///
+/// This is a pure function of `(alive, key_hash, factor)` so it is
+/// directly unit-testable with a fixed node list. `alive` MUST be sorted
+/// by a stable key (node id) by the caller for selection to be
+/// membership-stable.
+fn replica_nodes_for(alive: &[NodeInfo], key_hash: u64, factor: usize) -> Vec<NodeInfo> {
+    if alive.is_empty() {
+        return Vec::new();
+    }
+    let n = alive.len();
+    // Clamp the factor to the cluster size and to at least one copy.
+    let want = factor.clamp(1, n);
+    #[allow(clippy::cast_possible_truncation)]
+    let start = (key_hash as usize) % n;
+    // Walk `want` distinct nodes clockwise from the primary. Because we
+    // step over distinct indices `[start, start+1, ...] mod n`, the nodes
+    // are inherently distinct — no dedup needed.
+    (0..want).map(|offset| alive[(start + offset) % n].clone()).collect()
+}
+
+/// Derive a node's TCP data plane address from its gossip address and the
+/// configured data port. Returns `None` if the gossip address does not
+/// parse as a socket address.
+fn node_data_addr(node: &NodeInfo, data_port: u16) -> Option<SocketAddr> {
+    node.gossip_addr
+        .parse::<SocketAddr>()
+        .ok()
+        .map(|gossip| SocketAddr::new(gossip.ip(), data_port))
+}
+
 /// Parse a memory size string like `"64MB"` to bytes.
 ///
 /// Supported units (case-insensitive): `B`, `KB`/`K`, `MB`/`M`, `GB`/`G`.
@@ -608,5 +828,144 @@ mod tests {
     #[test]
     fn parse_memory_size_whitespace() {
         assert_eq!(parse_memory_size("  64MB  ").unwrap(), 64 * 1024 * 1024);
+    }
+
+    // -----------------------------------------------------------------
+    // Replica set selection
+    // -----------------------------------------------------------------
+
+    /// Build a sorted 5-node fixture: `n0`..`n4`.
+    fn fixture_nodes() -> Vec<NodeInfo> {
+        (0..5)
+            .map(|i| NodeInfo {
+                id: format!("n{i}"),
+                gossip_addr: format!("127.0.0.1:{}", 7946 + i),
+                state: crate::NodeState::Alive,
+            })
+            .collect()
+    }
+
+    /// The primary is `alive[key_hash % len]`, regardless of factor.
+    #[allow(clippy::cast_possible_truncation)]
+    fn primary_index(key_hash: u64, len: usize) -> usize {
+        (key_hash as usize) % len
+    }
+
+    #[test]
+    fn replica_set_factor_two_picks_primary_plus_next() {
+        let nodes = fixture_nodes();
+        // key_hash 7 % 5 = 2 → primary n2, then n3.
+        let set = replica_nodes_for(&nodes, 7, 2);
+        let ids: Vec<_> = set.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["n2", "n3"]);
+    }
+
+    #[test]
+    fn replica_set_wraps_around_ring() {
+        let nodes = fixture_nodes();
+        // key_hash 4 % 5 = 4 → primary n4, then wrap to n0, n1.
+        let set = replica_nodes_for(&nodes, 4, 3);
+        let ids: Vec<_> = set.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["n4", "n0", "n1"]);
+    }
+
+    #[test]
+    fn replica_set_clamps_to_alive_count() {
+        let nodes = fixture_nodes();
+        // Factor 9 on a 5-node cluster keeps 5 distinct copies, not error.
+        let set = replica_nodes_for(&nodes, 0, 9);
+        assert_eq!(set.len(), 5, "factor is clamped to the number of alive nodes");
+        // All distinct.
+        let mut ids: Vec<_> = set.iter().map(|n| n.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 5, "replica set must contain no duplicates");
+    }
+
+    #[test]
+    fn replica_set_factor_one_is_owner_only() {
+        let nodes = fixture_nodes();
+        for key_hash in [0u64, 1, 2, 3, 4, 99, 12_345] {
+            let set = replica_nodes_for(&nodes, key_hash, 1);
+            assert_eq!(set.len(), 1);
+            assert_eq!(set[0].id, nodes[primary_index(key_hash, 5)].id);
+        }
+    }
+
+    #[test]
+    fn replica_set_zero_factor_is_treated_as_one() {
+        let nodes = fixture_nodes();
+        // A misconfigured factor of 0 must still keep the primary copy.
+        let set = replica_nodes_for(&nodes, 3, 0);
+        assert_eq!(set.len(), 1);
+        assert_eq!(set[0].id, "n3");
+    }
+
+    #[test]
+    fn replica_set_empty_node_list() {
+        assert!(replica_nodes_for(&[], 42, 2).is_empty());
+    }
+
+    #[test]
+    fn replica_set_all_entries_distinct() {
+        let nodes = fixture_nodes();
+        // Exercise every start index at the max factor; each result must
+        // be duplicate-free and full-length.
+        for key_hash in 0..5u64 {
+            let set = replica_nodes_for(&nodes, key_hash, 5);
+            let mut ids: Vec<_> = set.iter().map(|n| n.id.clone()).collect();
+            assert_eq!(ids.len(), 5);
+            ids.sort();
+            ids.dedup();
+            assert_eq!(ids.len(), 5, "start={key_hash}: replicas must be distinct");
+        }
+    }
+
+    #[test]
+    fn replica_set_stable_when_unrelated_node_leaves() {
+        // Selection must be stable: dropping a node that is NOT in a
+        // key's replica set must not change that set's members. key_hash
+        // 0 % 5 = 0 → {n0, n1} with factor 2. Removing n3 (not in the
+        // set) keeps the same primary and secondary.
+        let full = fixture_nodes();
+        let before = replica_nodes_for(&full, 0, 2);
+        let before_ids: Vec<_> = before.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(before_ids, vec!["n0", "n1"]);
+
+        let reduced: Vec<NodeInfo> = full.into_iter().filter(|n| n.id != "n3").collect();
+        let after = replica_nodes_for(&reduced, 0, 2);
+        let after_ids: Vec<_> = after.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(after_ids, before_ids, "removing an unrelated node must not shift the set");
+    }
+
+    #[test]
+    fn node_data_addr_uses_configured_port() {
+        let node = NodeInfo {
+            id: "n0".to_string(),
+            gossip_addr: "10.0.0.5:7946".to_string(),
+            state: crate::NodeState::Alive,
+        };
+        let addr = node_data_addr(&node, 7947).unwrap();
+        assert_eq!(addr.to_string(), "10.0.0.5:7947");
+    }
+
+    #[test]
+    fn node_data_addr_rejects_unparseable_gossip_addr() {
+        let node = NodeInfo {
+            id: "n0".to_string(),
+            gossip_addr: "not-an-addr".to_string(),
+            state: crate::NodeState::Alive,
+        };
+        assert!(node_data_addr(&node, 7947).is_none());
+    }
+
+    #[test]
+    fn replication_mode_parsing() {
+        assert_eq!(ReplicationMode::from_config("sync"), ReplicationMode::Sync);
+        assert_eq!(ReplicationMode::from_config("SYNC"), ReplicationMode::Sync);
+        assert_eq!(ReplicationMode::from_config("async"), ReplicationMode::Async);
+        // Unknown / default falls back to async.
+        assert_eq!(ReplicationMode::from_config("whatever"), ReplicationMode::Async);
+        assert_eq!(ReplicationMode::from_config(""), ReplicationMode::Async);
     }
 }

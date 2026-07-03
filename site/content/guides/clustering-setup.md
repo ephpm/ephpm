@@ -53,11 +53,13 @@ How it works:
 The KV store is two-tiered automatically when clustering is on:
 
 - **Small values** (≤ 512 bytes by default) ride the gossip protocol and end up on **every** node. Eventually consistent, fast convergence (~hundreds of ms).
-- **Large values** are routed via consistent hashing — each key lives on a single "owner" node, reached over the TCP data plane on port 7947. Get requests fetch from the owner; hot keys promote to a local cache. If the owner node dies, its large values are lost.
+- **Large values** are routed by `hash(key) % alive_nodes` (a plain modulo of the sorted alive-node list — no consistent hash ring or virtual nodes). Each key has a primary owner reached over the TCP data plane on port 7947, and is **replicated** to `replication_factor` nodes total (default 2). Reads try the owner first, then fall back to the other replicas, so a large value survives the loss of its owner. Hot keys additionally promote to a local read cache.
 
 ```toml
 [cluster.kv]
 small_key_threshold = 512           # bytes — boundary between tiers
+replication_factor  = 2             # copies of each large value (owner + N-1 peers)
+replication_mode    = "async"       # async (default) or sync
 hot_key_cache       = true
 hot_key_threshold   = 5             # remote fetches before local cache
 hot_key_local_ttl_secs = 30
@@ -65,7 +67,10 @@ hot_key_max_memory  = "64MB"
 data_port           = 7947
 ```
 
-> `replication_factor` and `replication_mode` appear in the config schema but are parsed and **not implemented** yet — large values are not replicated to peers. If a value must survive node loss, keep it under `small_key_threshold` (it will gossip everywhere) or store it in the clustered SQLite database instead.
+- `replication_factor = 2` keeps each large value on its owner plus the next node on the ring; it is clamped to the number of alive nodes, so a factor larger than the cluster just keeps one copy per node.
+- `replication_mode = "async"` (default) returns after the primary/local write and replicates in the background; `"sync"` also awaits every reachable replica (best-effort — a down replica is logged, not fatal).
+
+> **Membership caveat:** replication is write-time only — there's no active rebalancing yet. A node that was down during a write won't have that key until it's rewritten or fetched-through, and existing keys aren't re-replicated when membership changes. A value that must survive `replication_factor - 1` simultaneous node losses, or any topology churn, is safer under `small_key_threshold` (it gossips everywhere) or in the clustered SQLite database.
 
 ## Kubernetes
 
