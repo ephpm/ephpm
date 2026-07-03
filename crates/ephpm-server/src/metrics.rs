@@ -38,6 +38,10 @@ const BODY_BYTES_BUCKETS: &[f64] = &[
 const COMPRESSION_RATIO_BUCKETS: &[f64] =
     &[0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
 
+/// Worker framework-boot duration buckets (seconds): 10 ms up to 30 s. Heavy
+/// frameworks (Laravel, WordPress) can take seconds to bootstrap once.
+const WORKER_BOOT_BUCKETS: &[f64] = &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0];
+
 /// Install the Prometheus recorder and return a scrape handle.
 ///
 /// Must be called once at process startup, before any `metrics::counter!` /
@@ -79,6 +83,17 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
             COMPRESSION_RATIO_BUCKETS,
         )
         .context("failed to configure compression_ratio buckets")?
+        .set_buckets_for_metric(
+            // Framework boot can take seconds (Laravel/WordPress) — wider range.
+            Matcher::Full("ephpm_worker_boot_duration_seconds".to_string()),
+            WORKER_BOOT_BUCKETS,
+        )
+        .context("failed to configure worker_boot_duration buckets")?
+        .set_buckets_for_metric(
+            Matcher::Full("ephpm_worker_request_wait_seconds".to_string()),
+            PHP_DURATION_BUCKETS,
+        )
+        .context("failed to configure worker_request_wait buckets")?
         .install_recorder()
         .context("failed to install Prometheus recorder")?;
 

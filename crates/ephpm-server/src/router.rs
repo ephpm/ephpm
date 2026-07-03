@@ -101,6 +101,10 @@ pub struct Router {
     /// NOT cap tokio's blocking pool — static file I/O and other blocking
     /// work must never be starved by slow PHP scripts.
     php_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+    /// Persistent worker pool when `[php] mode = "worker"`. `None` in fpm mode.
+    /// When set, PHP requests are dispatched to the pool instead of running on
+    /// the `spawn_blocking` path.
+    worker_pool: Option<Arc<crate::worker_pool::WorkerPool>>,
 }
 
 /// Scan `sites_dir` for virtual host subdirectories.
@@ -162,6 +166,7 @@ impl Router {
         metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
         limiter: Option<Arc<crate::rate_limit::Limiter>>,
         file_cache: Option<Arc<crate::file_cache::FileCache>>,
+        worker_pool: Option<Arc<crate::worker_pool::WorkerPool>>,
     ) -> Self {
         let port =
             config.server.listen.rsplit_once(':').and_then(|(_, p)| p.parse().ok()).unwrap_or(8080);
@@ -259,6 +264,7 @@ impl Router {
             kv_redis_compat_enabled: config.kv.redis_compat.enabled,
             db_env_vars: build_db_env_vars(config),
             php_semaphore,
+            worker_pool,
         }
     }
 
@@ -592,14 +598,39 @@ impl Router {
                 }
             }
             Resolved::Status(code) => {
-                let status = StatusCode::from_u16(code).unwrap_or(StatusCode::NOT_FOUND);
-                (
-                    error_response(
-                        status,
-                        &format!("{code} {}", status.canonical_reason().unwrap_or("Error")),
-                    ),
-                    "error",
-                )
+                // Worker mode: the booted framework owns routing (Octane/
+                // RoadRunner model), so every request that isn't a static asset
+                // goes to the worker entrypoint rather than 404ing on a missing
+                // file. The framework decides the real status (incl. its own
+                // 404). fpm mode keeps the literal fallback status.
+                if self.worker_pool.is_some() {
+                    // SCRIPT_FILENAME is nominal in worker mode (the worker
+                    // script is the entrypoint); use the conventional front
+                    // controller path so $_SERVER looks familiar to frameworks.
+                    let script = site_root.join("index.php");
+                    (
+                        self.handle_php(
+                            req,
+                            effective_addr,
+                            is_https,
+                            script,
+                            accepts_gzip,
+                            accepts_br,
+                            site_root.clone(),
+                        )
+                        .await,
+                        "php",
+                    )
+                } else {
+                    let status = StatusCode::from_u16(code).unwrap_or(StatusCode::NOT_FOUND);
+                    (
+                        error_response(
+                            status,
+                            &format!("{code} {}", status.canonical_reason().unwrap_or("Error")),
+                        ),
+                        "error",
+                    )
+                }
             }
         };
 
@@ -713,6 +744,34 @@ impl Router {
             .record(body.len() as f64);
 
         let server_port = self.server_port;
+
+        // Worker mode: dispatch to the persistent worker pool instead of the
+        // spawn_blocking fpm path. The whole handler is already wrapped in the
+        // outer request timeout, so a starved queue becomes a 504.
+        if let Some(pool) = self.worker_pool.clone() {
+            return self
+                .handle_php_worker(
+                    &pool,
+                    method,
+                    uri,
+                    path,
+                    query_string,
+                    &script_filename,
+                    document_root,
+                    headers,
+                    body,
+                    content_type,
+                    remote_addr,
+                    server_name,
+                    server_port,
+                    is_https,
+                    protocol,
+                    accepts_gzip,
+                    accepts_br,
+                )
+                .await;
+        }
+
         let multi_tenant_kv = self.multi_tenant_kv.clone();
         let vhost_open_basedir = self.sites_dir.is_some() && self.open_basedir;
         // disable_shell_exec is applied globally via the generated php.ini
@@ -776,6 +835,119 @@ impl Router {
         .await;
         let php_elapsed = php_start.elapsed().as_secs_f64();
 
+        histogram!("ephpm_php_execution_duration_seconds").record(php_elapsed);
+        let exec_status = match &result {
+            Ok(Ok(_)) => "ok",
+            Ok(Err(_)) | Err(_) => "error",
+        };
+        counter!("ephpm_php_executions_total", "status" => exec_status).increment(1);
+
+        build_php_response(result, accepts_gzip, accepts_br, self.compression)
+    }
+
+    /// Dispatch a PHP request to the persistent worker pool (worker mode).
+    ///
+    /// Builds an owned request from the same `$_SERVER`/cookie derivation the
+    /// fpm path uses, hands it to the pool, and awaits the `oneshot`. The outer
+    /// request timeout (in `handle`) turns a starved queue into a 504; a
+    /// dropped sender (worker bailout with no stashed sender) becomes a 500.
+    /// The response reuses `build_php_response` unchanged.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_php_worker(
+        &self,
+        pool: &Arc<crate::worker_pool::WorkerPool>,
+        method: String,
+        uri: String,
+        path: String,
+        query_string: String,
+        script_filename: &Path,
+        document_root: PathBuf,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        content_type: Option<String>,
+        remote_addr: SocketAddr,
+        server_name: String,
+        server_port: u16,
+        is_https: bool,
+        protocol: String,
+        accepts_gzip: bool,
+        accepts_br: bool,
+    ) -> Response<ServerBody> {
+        // Reuse PhpRequest's $_SERVER / cookie derivation so worker mode and
+        // fpm mode present PHP with identical request metadata.
+        let mut env_vars = self.build_kv_env_vars(&server_name);
+        env_vars.extend_from_slice(&self.db_env_vars);
+
+        let php_request = PhpRequest {
+            method: method.clone(),
+            uri: uri.clone(),
+            path,
+            query_string: query_string.clone(),
+            script_filename: script_filename.to_path_buf(),
+            document_root,
+            headers: headers.clone(),
+            body: body.clone(),
+            content_type: content_type.clone(),
+            remote_addr,
+            server_name,
+            server_port,
+            is_https,
+            protocol,
+            env_vars,
+        };
+
+        let owned = ephpm_php::worker_bridge::WorkerRequestOwned {
+            method,
+            uri,
+            query_string,
+            cookie_data: php_request.cookie_string(),
+            content_type,
+            body,
+            server_vars: php_request.server_variables(),
+            headers,
+        };
+
+        let php_start = std::time::Instant::now();
+        let queue_wait_start = php_start;
+        let recv = pool.dispatch(owned).await;
+        #[allow(clippy::cast_precision_loss)]
+        histogram!("ephpm_worker_request_wait_seconds")
+            .record(queue_wait_start.elapsed().as_secs_f64());
+
+        // Dispatch channel closed (pool draining / all workers gone) — 503.
+        let Ok(rx) = recv else {
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable");
+        };
+
+        gauge!("ephpm_worker_busy").increment(1.0);
+        // Bound the wait so a wedged worker becomes a 504 AND signals the pool
+        // to replace it (design §5.4). This inner timeout fires at or before
+        // the outer request timeout.
+        let awaited = tokio::time::timeout(self.request_timeout, rx).await;
+        gauge!("ephpm_worker_busy").decrement(1.0);
+
+        let result: Result<
+            Result<ephpm_php::response::PhpResponse, ephpm_php::PhpError>,
+            tokio::task::JoinError,
+        > = match awaited {
+            Ok(Ok(worker_resp)) => Ok(Ok(ephpm_php::response::PhpResponse {
+                status: worker_resp.status,
+                headers: worker_resp.headers,
+                body: worker_resp.body,
+            })),
+            // Sender dropped (worker unwound with no stashed sender) — 500.
+            Ok(Err(_)) => Ok(Err(ephpm_php::PhpError::ExecutionFailed(
+                "worker dropped response (bailout)".into(),
+            ))),
+            // Worker never responded in time — replace it, return 504.
+            Err(_) => {
+                pool.note_hung();
+                counter!("ephpm_http_timeouts_total", "stage" => "worker").increment(1);
+                return error_response(StatusCode::GATEWAY_TIMEOUT, "504 Gateway Timeout");
+            }
+        };
+
+        let php_elapsed = php_start.elapsed().as_secs_f64();
         histogram!("ephpm_php_execution_duration_seconds").record(php_elapsed);
         let exec_status = match &result {
             Ok(Ok(_)) => "ok",
@@ -896,6 +1068,17 @@ impl Router {
                 StatusCode::SERVICE_UNAVAILABLE,
                 r#"{"status":"not_ready","reason":"PHP runtime not initialized"}"#,
             );
+        }
+        // Worker mode: not ready until at least one worker has booted its
+        // framework and reached take_request() — prevents load balancers from
+        // routing before the framework is up (design §4.5).
+        if let Some(pool) = &self.worker_pool {
+            if pool.ready_count() == 0 {
+                return json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"status":"not_ready","reason":"no worker has finished booting"}"#,
+                );
+            }
         }
         json_response(StatusCode::OK, r#"{"status":"ready"}"#)
     }
@@ -1336,7 +1519,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        Router::new(&config, test_store(), None, None, None)
+        Router::new(&config, test_store(), None, None, None, None)
     }
 
     fn test_router_with_404(dir: &Path) -> Router {
@@ -1353,7 +1536,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        Router::new(&config, test_store(), None, None, None)
+        Router::new(&config, test_store(), None, None, None, None)
     }
 
     #[allow(dead_code)]
@@ -1376,7 +1559,7 @@ mod tests {
             cluster: ClusterConfig::default(),
         };
         config.server.static_files.etag = true;
-        Router::new(&config, store, None, None, None)
+        Router::new(&config, store, None, None, None, None)
     }
 
     fn default_compression() -> CompressionSettings {
@@ -1569,7 +1752,7 @@ mod tests {
         };
         config.server.security.get_or_insert_default().trusted_proxies =
             vec!["10.0.0.0/8".to_string()];
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
 
         // 203.0.113.50 is the real client, 10.0.0.1 is the proxy
         let xff = "203.0.113.50, 10.0.0.1";
@@ -1592,7 +1775,7 @@ mod tests {
         };
         config.server.security.get_or_insert_default().trusted_proxies =
             vec!["10.0.0.0/8".to_string()];
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
 
         let xff = "10.0.0.2, 10.0.0.1";
         let ip = router.resolve_xff(xff);
@@ -1615,7 +1798,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
         assert_eq!(router.server_port, 3000);
     }
 
@@ -1633,7 +1816,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
         assert_eq!(router.server_port, 8080);
     }
 
@@ -1653,7 +1836,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(router.open_basedir, "multi-tenant mode must default open_basedir on");
     }
 
@@ -1670,7 +1853,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(!router.open_basedir);
     }
 
@@ -1713,7 +1896,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(router.is_php_allowed("/anything.php"));
     }
 
@@ -1732,7 +1915,7 @@ mod tests {
         };
         config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-login.php".to_string()];
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(router.is_php_allowed("/index.php"));
         assert!(router.is_php_allowed("/wp-login.php"));
         assert!(!router.is_php_allowed("/evil.php"));
@@ -1753,7 +1936,7 @@ mod tests {
         };
         config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-admin/*.php".to_string()];
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(router.is_php_allowed("/index.php"));
         assert!(router.is_php_allowed("/wp-admin/admin.php"));
         assert!(router.is_php_allowed("/wp-admin/options.php"));
@@ -1983,7 +2166,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
         assert_eq!(router.server_port, 9090);
     }
 
@@ -2383,7 +2566,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("example.com");
         assert_eq!(doc_root, site_dir);
@@ -2407,7 +2590,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("unknown.com");
         assert_eq!(doc_root, dir.path());
@@ -2432,7 +2615,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("example.com:8080");
         assert_eq!(doc_root, site_dir);
@@ -2457,7 +2640,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("Example.COM");
         assert_eq!(doc_root, site_dir);
@@ -2479,7 +2662,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("anything.com");
         assert_eq!(doc_root, dir.path());
@@ -2505,7 +2688,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
 
         let (doc_root, index_files, fallback) = router.resolve_site("myblog.com");
         let resolved = router.resolve_fallback("/", "", &doc_root, index_files, fallback);
@@ -2534,7 +2717,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
 
         // Host doesn't exist yet — should fall back to default.
         let (doc_root, _, _) = router.resolve_site("new-site.com");
@@ -2569,7 +2752,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None);
 
         // Site exists — should resolve.
         let (doc_root, _, _) = router.resolve_site("temp-site.com");

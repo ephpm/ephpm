@@ -8,10 +8,19 @@ use serde::Deserialize;
 pub enum ConfigError {
     #[error("failed to load configuration: {0}")]
     Load(#[from] Box<figment::Error>),
+
+    /// A loaded config is internally inconsistent (e.g. worker mode without a
+    /// resolvable `worker_script`). Surfaced by [`Config::validate`].
+    #[error("invalid configuration: {0}")]
+    Validation(String),
 }
 
 /// Top-level ePHPm configuration.
-#[derive(Debug, Deserialize)]
+///
+/// `Default` delegates to each section's own `Default` impl (all of
+/// `ServerConfig`/`PhpConfig`/... define one), so `Config::default()` yields
+/// the same values as loading an empty TOML file.
+#[derive(Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
@@ -1175,8 +1184,109 @@ pub struct PhpConfig {
     /// `0` means unlimited (bounded only by tokio's blocking pool).
     ///
     /// Default: `0` (unlimited).
+    ///
+    /// **Ignored in worker mode** (`mode = "worker"`): concurrency is bounded
+    /// by `worker_count` (parked threads) and `worker_backlog` (queue depth),
+    /// not this semaphore. Startup logs a WARN if `workers > 0` under worker
+    /// mode so the no-op is never silent.
     #[serde(default = "default_php_workers")]
     pub workers: usize,
+
+    /// Request-execution model.
+    ///
+    /// - `"fpm"` (default) — php-fpm-shaped: each HTTP request runs a full
+    ///   `php_request_startup`/`shutdown` cycle, so framework state never
+    ///   leaks across requests. Behavior is byte-for-byte identical to
+    ///   releases before worker mode existed.
+    /// - `"worker"` — persistent worker mode (Octane/RoadRunner model): a
+    ///   fixed pool of OS threads each boot the framework **once** via
+    ///   `worker_script`, then loop over requests without re-bootstrapping.
+    ///   5-20x throughput for heavy frameworks. Requires `worker_script`.
+    ///
+    /// Whole-server switch (not per-path). See `worker_*` fields below.
+    ///
+    /// Default: `"fpm"`.
+    #[serde(default = "default_php_mode")]
+    pub mode: String,
+
+    /// Worker-mode entrypoint script, relative to `document_root`.
+    ///
+    /// The script is a loop that calls `\Ephpm\Worker\take_request()` /
+    /// `\Ephpm\Worker\send_response()`. Real framework adapters (Octane,
+    /// PSR-15) ship this; `examples/worker/worker.php` is the reference.
+    ///
+    /// **Required** when `mode = "worker"` — config load hard-errors if it is
+    /// absent or does not resolve to a file under `document_root`. Ignored in
+    /// fpm mode.
+    ///
+    /// Default: `None`.
+    #[serde(default)]
+    pub worker_script: Option<PathBuf>,
+
+    /// Number of persistent worker threads (worker mode only).
+    ///
+    /// Each worker is a permanently-parked OS thread holding a fully-booted
+    /// framework in memory, so — unlike `workers` — worker mode picks a
+    /// concrete count. `0` derives it from the CPU count, clamped to
+    /// `[2, 32]`. Heavy frameworks (WordPress ~40MB/worker) may want it lower.
+    ///
+    /// On NTS builds (Windows) this is forced to `1` with a WARN — there is a
+    /// single PHP context, so requests serialize through one booted framework.
+    ///
+    /// Ignored in fpm mode.
+    ///
+    /// Default: `0` (derive from CPU count, clamped `[2, 32]`).
+    #[serde(default = "default_worker_count")]
+    pub worker_count: usize,
+
+    /// Recycle a worker after it has handled this many requests (worker mode
+    /// only). The worker's `take_request()` returns null on the next call, the
+    /// framework loop exits, and the pool respawns a fresh worker with a clean
+    /// boot — reclaiming any slow memory growth in the framework's own state
+    /// (php-fpm `pm.max_requests` semantics).
+    ///
+    /// `0` disables recycling (never recycle on request count).
+    ///
+    /// Ignored in fpm mode.
+    ///
+    /// Default: `500`.
+    #[serde(default = "default_worker_max_requests")]
+    pub worker_max_requests: u64,
+
+    /// Dispatch-queue depth for handing requests to workers (worker mode
+    /// only). When the queue is full, the HTTP handler suspends (backpressure)
+    /// until a worker frees up, still bounded by the request timeout (504).
+    ///
+    /// `0` derives the depth from `worker_count` (one queued job per worker).
+    ///
+    /// Ignored in fpm mode.
+    ///
+    /// Default: `0` (= `worker_count`).
+    #[serde(default = "default_worker_backlog")]
+    pub worker_backlog: usize,
+
+    /// Seconds a worker gets to boot the framework and reach its first
+    /// `take_request()` (worker mode only). A worker that does not become
+    /// ready within this window is counted as a boot failure and respawned.
+    ///
+    /// Ignored in fpm mode.
+    ///
+    /// Default: `30`.
+    #[serde(default = "default_worker_boot_timeout")]
+    pub worker_boot_timeout: u64,
+
+    /// Populate native PHP superglobals (`$_GET`/`$_POST`/`$_SERVER`/...) per
+    /// request in worker mode (worker mode only).
+    ///
+    /// Off by default: Octane/PSR-15 adapters build their own request object
+    /// from the `Envelope` and never touch superglobals. Turn this on for the
+    /// WordPress adapter, which assumes real superglobals.
+    ///
+    /// Ignored in fpm mode (fpm always builds superglobals natively).
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub worker_populate_superglobals: bool,
 }
 
 impl Config {
@@ -1209,6 +1319,94 @@ impl Config {
             .extract()
             .map_err(Box::new)?;
         Ok(config)
+    }
+
+    /// Validate cross-field invariants that serde cannot express.
+    ///
+    /// Called after CLI overrides are applied (so `document_root` is final)
+    /// and before the runtime starts, so misconfiguration fails fast with a
+    /// clear message rather than a confusing runtime error.
+    ///
+    /// Worker-mode rules (see `worker-mode-design.md` §4.3):
+    /// - `mode = "worker"` requires a `worker_script` that resolves to a file
+    ///   under `document_root`.
+    /// - `mode = "worker"` with `sites_dir` set is a Phase-1-unsupported
+    ///   combination (per-host worker pools are a later phase) — hard error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] if any invariant is violated.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.php.is_worker_mode() {
+            if self.server.sites_dir.is_some() {
+                return Err(ConfigError::Validation(
+                    "[php] mode = \"worker\" is not supported together with \
+                     [server] sites_dir (multi-tenant vhosting). Worker mode \
+                     boots one framework per worker; per-host worker pools are \
+                     a future phase. Use fpm mode for multi-tenant deployments."
+                        .to_string(),
+                ));
+            }
+
+            // worker_script is required and must resolve under document_root.
+            self.resolve_worker_script()?;
+        }
+        Ok(())
+    }
+
+    /// Resolve the worker entrypoint to an absolute path under
+    /// `document_root`, validating that it exists and does not escape the root.
+    ///
+    /// The script may be given as a path relative to `document_root`
+    /// (`"worker.php"`) or as an absolute path that still lies under the root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Validation`] when `worker_script` is absent, does
+    /// not resolve to an existing file, or resolves outside `document_root`.
+    pub fn resolve_worker_script(&self) -> Result<PathBuf, ConfigError> {
+        let Some(script) = self.php.worker_script.as_ref() else {
+            return Err(ConfigError::Validation(
+                "[php] mode = \"worker\" requires [php] worker_script (the \
+                 entrypoint loop, relative to document_root)"
+                    .to_string(),
+            ));
+        };
+
+        let doc_root = &self.server.document_root;
+        let candidate = if script.is_absolute() { script.clone() } else { doc_root.join(script) };
+
+        // Canonicalize both so `..` segments and symlinks can't be used to
+        // escape the document root. If canonicalization fails the file almost
+        // certainly does not exist — surface a clear "not found" error.
+        let canon_script = candidate.canonicalize().map_err(|e| {
+            ConfigError::Validation(format!(
+                "[php] worker_script {} does not resolve to an existing file \
+                 (looked under document_root {}): {e}",
+                script.display(),
+                doc_root.display(),
+            ))
+        })?;
+
+        if !canon_script.is_file() {
+            return Err(ConfigError::Validation(format!(
+                "[php] worker_script {} is not a regular file",
+                canon_script.display(),
+            )));
+        }
+
+        // Enforce containment under document_root when the root itself exists.
+        if let Ok(canon_root) = doc_root.canonicalize() {
+            if !canon_script.starts_with(&canon_root) {
+                return Err(ConfigError::Validation(format!(
+                    "[php] worker_script {} resolves outside document_root {}",
+                    canon_script.display(),
+                    canon_root.display(),
+                )));
+            }
+        }
+
+        Ok(canon_script)
     }
 }
 
@@ -1292,7 +1490,47 @@ impl Default for PhpConfig {
             ini_file: None,
             ini_overrides: Vec::new(),
             workers: default_php_workers(),
+            mode: default_php_mode(),
+            worker_script: None,
+            worker_count: default_worker_count(),
+            worker_max_requests: default_worker_max_requests(),
+            worker_backlog: default_worker_backlog(),
+            worker_boot_timeout: default_worker_boot_timeout(),
+            worker_populate_superglobals: false,
         }
+    }
+}
+
+impl PhpConfig {
+    /// Whether persistent worker mode is requested (`mode = "worker"`).
+    ///
+    /// Case-insensitive so `"Worker"` / `"WORKER"` also match.
+    #[must_use]
+    pub fn is_worker_mode(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("worker")
+    }
+
+    /// Resolve the effective worker-thread count.
+    ///
+    /// Returns the configured `worker_count`, or — when it is `0` — a value
+    /// derived from the available CPU parallelism, clamped to `[2, 32]`.
+    /// Never returns `0`.
+    #[must_use]
+    pub fn effective_worker_count(&self) -> usize {
+        if self.worker_count > 0 {
+            return self.worker_count;
+        }
+        let cpus = std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get);
+        cpus.clamp(2, 32)
+    }
+
+    /// Resolve the effective dispatch-queue depth.
+    ///
+    /// Returns `worker_backlog`, or the effective worker count when it is `0`.
+    /// Always at least `1`.
+    #[must_use]
+    pub fn effective_worker_backlog(&self) -> usize {
+        if self.worker_backlog > 0 { self.worker_backlog } else { self.effective_worker_count() }
     }
 }
 
@@ -1463,6 +1701,29 @@ fn default_php_workers() -> usize {
     // hold their slot past the HTTP request timeout, and a small cap lets a
     // handful of them starve all PHP traffic. Opt into a cap explicitly.
     0
+}
+
+fn default_php_mode() -> String {
+    "fpm".to_string()
+}
+
+fn default_worker_count() -> usize {
+    // 0 => derive from CPU count, clamped [2, 32] (see effective_worker_count).
+    0
+}
+
+fn default_worker_max_requests() -> u64 {
+    // Conservative memory-leak guard, matching php-fpm pm.max_requests.
+    500
+}
+
+fn default_worker_backlog() -> usize {
+    // 0 => = effective_worker_count (one queued job per worker).
+    0
+}
+
+fn default_worker_boot_timeout() -> u64 {
+    30
 }
 
 fn default_cluster_bind() -> String {
@@ -2240,5 +2501,155 @@ sites_dir = "/var/www/sites"
             // still resolves true (and sites_dir is set anyway).
             assert!(config.server.effective_disable_shell_exec());
         });
+    }
+
+    // ── Worker mode config ──────────────────────────────────────────────
+
+    #[test]
+    fn test_php_mode_defaults_to_fpm() {
+        let cfg = PhpConfig::default();
+        assert_eq!(cfg.mode, "fpm");
+        assert!(!cfg.is_worker_mode());
+        assert_eq!(cfg.worker_count, 0);
+        assert_eq!(cfg.worker_max_requests, 500);
+        assert_eq!(cfg.worker_backlog, 0);
+        assert_eq!(cfg.worker_boot_timeout, 30);
+        assert!(!cfg.worker_populate_superglobals);
+        assert!(cfg.worker_script.is_none());
+    }
+
+    #[test]
+    fn test_is_worker_mode_case_insensitive() {
+        let mut cfg = PhpConfig { mode: "Worker".to_string(), ..PhpConfig::default() };
+        assert!(cfg.is_worker_mode());
+        cfg.mode = "WORKER".to_string();
+        assert!(cfg.is_worker_mode());
+        cfg.mode = "fpm".to_string();
+        assert!(!cfg.is_worker_mode());
+    }
+
+    #[test]
+    fn test_effective_worker_count_derives_and_clamps() {
+        // Explicit value passes through.
+        let mut cfg = PhpConfig { worker_count: 7, ..PhpConfig::default() };
+        assert_eq!(cfg.effective_worker_count(), 7);
+        // Derived value is always in [2, 32] and never zero.
+        cfg.worker_count = 0;
+        let derived = cfg.effective_worker_count();
+        assert!((2..=32).contains(&derived), "derived worker count out of range: {derived}");
+    }
+
+    #[test]
+    fn test_effective_worker_backlog() {
+        let mut cfg = PhpConfig { worker_count: 4, worker_backlog: 0, ..PhpConfig::default() };
+        assert_eq!(cfg.effective_worker_backlog(), 4);
+        cfg.worker_backlog = 16;
+        assert_eq!(cfg.effective_worker_backlog(), 16);
+    }
+
+    #[test]
+    fn test_worker_fields_parse_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[php]
+mode = "worker"
+worker_script = "worker.php"
+worker_count = 8
+worker_max_requests = 1000
+worker_backlog = 12
+worker_boot_timeout = 45
+worker_populate_superglobals = true
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(config.php.is_worker_mode());
+        assert_eq!(config.php.worker_script, Some(PathBuf::from("worker.php")));
+        assert_eq!(config.php.worker_count, 8);
+        assert_eq!(config.php.worker_max_requests, 1000);
+        assert_eq!(config.php.worker_backlog, 12);
+        assert_eq!(config.php.worker_boot_timeout, 45);
+        assert!(config.php.worker_populate_superglobals);
+    }
+
+    #[test]
+    fn test_validate_fpm_mode_always_ok() {
+        let cfg = Config::default();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_worker_mode_missing_script_errors() {
+        let mut cfg = Config::default();
+        cfg.php.mode = "worker".to_string();
+        cfg.php.worker_script = None;
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+        assert!(format!("{err}").contains("worker_script"));
+    }
+
+    #[test]
+    fn test_validate_worker_mode_nonexistent_script_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.server.document_root = dir.path().to_path_buf();
+        cfg.php.mode = "worker".to_string();
+        cfg.php.worker_script = Some(PathBuf::from("does-not-exist.php"));
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn test_validate_worker_mode_valid_script_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("worker.php");
+        std::fs::write(&script, "<?php // loop").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.server.document_root = dir.path().to_path_buf();
+        cfg.php.mode = "worker".to_string();
+        cfg.php.worker_script = Some(PathBuf::from("worker.php"));
+
+        cfg.validate().expect("valid worker config");
+        let resolved = cfg.resolve_worker_script().unwrap();
+        assert!(resolved.is_file());
+        assert!(resolved.ends_with("worker.php"));
+    }
+
+    #[test]
+    fn test_validate_worker_mode_script_outside_docroot_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let script = outside.path().join("worker.php");
+        std::fs::write(&script, "<?php // loop").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.server.document_root = root.path().to_path_buf();
+        cfg.php.mode = "worker".to_string();
+        // Absolute path pointing outside document_root.
+        cfg.php.worker_script = Some(script.clone());
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+        assert!(format!("{err}").contains("outside document_root"));
+    }
+
+    #[test]
+    fn test_validate_worker_mode_sites_dir_conflict_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("worker.php");
+        std::fs::write(&script, "<?php // loop").unwrap();
+
+        let mut cfg = Config::default();
+        cfg.server.document_root = dir.path().to_path_buf();
+        cfg.server.sites_dir = Some(PathBuf::from("/var/www/sites"));
+        cfg.php.mode = "worker".to_string();
+        cfg.php.worker_script = Some(PathBuf::from("worker.php"));
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+        assert!(format!("{err}").contains("sites_dir"));
     }
 }

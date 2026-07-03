@@ -6,6 +6,7 @@ pub mod kv_bridge;
 pub mod request;
 pub mod response;
 pub mod sapi;
+pub mod worker_bridge;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,6 +115,22 @@ mod ffi {
         /// Set the KV ops function pointer table. Can be called after
         /// `php_embed_init()`, before any PHP scripts execute.
         pub fn ephpm_set_kv_ops(ops: *const crate::kv_bridge::EphpmKvOps);
+
+        // ── Worker mode ─────────────────────────────────────────────
+
+        /// Set the worker ops function pointer table (`take_request` /
+        /// `send_response`). Call after `php_embed_init()`, before any worker
+        /// boots.
+        pub fn ephpm_set_worker_ops(ops: *const crate::worker_bridge::EphpmWorkerOps);
+
+        /// Toggle native superglobal population per request in worker mode
+        /// (`worker.populate_superglobals`). `0` = off (default), `1` = on.
+        pub fn ephpm_worker_set_populate_superglobals(enable: ::std::os::raw::c_int);
+
+        /// Boot a worker: run the worker script under bailout protection. Blocks
+        /// until the framework's `take_request()` loop ends. Returns 0 on a
+        /// clean loop end, -2 if a fatal bailout unwound out of the framework.
+        pub fn ephpm_worker_run(script: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
 
         /// Get the PHP version string (compile-time constant).
         /// Safe to call before `php_embed_init()`.
@@ -653,6 +670,120 @@ impl PhpRuntime {
         {
             let _ = store;
             tracing::debug!("KV store set_kv_store no-op (stub mode)");
+        }
+    }
+
+    // ── Worker mode ───────────────────────────────────────────────────────
+
+    /// Install the worker-mode ops table so `\Ephpm\Worker\take_request()` /
+    /// `send_response()` call into the Rust dispatch bridge.
+    ///
+    /// Must be called after [`init()`] and before any worker boots. Also sets
+    /// whether native superglobals are populated per request
+    /// (`worker.populate_superglobals`).
+    ///
+    /// In stub mode this is a no-op.
+    pub fn install_worker_ops(populate_superglobals: bool) {
+        #[cfg(php_linked)]
+        {
+            // SAFETY: WORKER_OPS is a static with a stable address; the C setter
+            // copies the struct, so the pointer only needs to be valid for this
+            // call. PHP is initialized (worker boot happens after init).
+            unsafe { ffi::ephpm_set_worker_ops(&worker_bridge::WORKER_OPS) };
+            unsafe {
+                ffi::ephpm_worker_set_populate_superglobals(i32::from(populate_superglobals));
+            }
+            tracing::info!(populate_superglobals, "worker ops wired to PHP native functions");
+        }
+
+        #[cfg(not(php_linked))]
+        {
+            let _ = populate_superglobals;
+            tracing::debug!("install_worker_ops no-op (stub mode)");
+        }
+    }
+
+    /// Register the current OS thread with TSRM for worker-mode execution.
+    ///
+    /// Worker threads are plain `std::thread`s (not `spawn_blocking`), so they
+    /// register once here before booting the framework. Reuses the same
+    /// thread-local guard as the fpm path so a thread never double-registers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhpError::NotInitialized`] if PHP is not initialized, or
+    /// [`PhpError::ThreadInitFailed`] if TSRM registration fails.
+    pub fn worker_thread_init() -> Result<(), PhpError> {
+        if !PHP_INITIALIZED.load(Ordering::Acquire) {
+            return Err(PhpError::NotInitialized);
+        }
+        #[cfg(php_linked)]
+        {
+            Self::ensure_thread_registered()
+        }
+        #[cfg(not(php_linked))]
+        {
+            Ok(())
+        }
+    }
+
+    /// Shut down PHP on the current worker thread: end the long-lived request
+    /// and free the TSRM slot + booted framework. Call once, when a worker
+    /// thread is exiting (recycle / bailout / drain), so the replacement boots
+    /// on a clean context.
+    ///
+    /// In stub mode this is a no-op.
+    pub fn worker_thread_shutdown() {
+        #[cfg(php_linked)]
+        {
+            // SAFETY: called on a TSRM-registered worker thread that is done
+            // executing PHP. ephpm_thread_shutdown runs php_request_shutdown +
+            // ts_free_thread and frees the thread-local capture buffers.
+            unsafe { ffi::ephpm_thread_shutdown() };
+            THREAD_REGISTERED.with(|registered| registered.set(false));
+            tracing::debug!("worker thread PHP context shut down");
+        }
+    }
+
+    /// Boot and run a worker on the current (already TSRM-registered) thread.
+    ///
+    /// Blocks until the framework's `take_request()` loop ends (graceful
+    /// shutdown, `worker_max_requests` recycle, or a fatal bailout). Returns
+    /// `Ok(true)` if the loop ended cleanly, `Ok(false)` if a fatal bailout
+    /// unwound out of the framework (the caller must recycle the worker and
+    /// fulfil any parked oneshot with a 500).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhpError::NotInitialized`] if PHP is not initialized, or
+    /// [`PhpError::ExecutionFailed`] if the script path is invalid.
+    #[allow(unused_variables)]
+    pub fn run_worker(script: &std::path::Path) -> Result<bool, PhpError> {
+        if !PHP_INITIALIZED.load(Ordering::Acquire) {
+            return Err(PhpError::NotInitialized);
+        }
+
+        #[cfg(php_linked)]
+        {
+            use std::ffi::CString;
+            let script_str = script
+                .to_str()
+                .ok_or_else(|| PhpError::ExecutionFailed("non-UTF8 worker script path".into()))?;
+            let c_script = CString::new(script_str)
+                .map_err(|e| PhpError::ExecutionFailed(format!("invalid worker script: {e}")))?;
+            // SAFETY: this thread is TSRM-registered (worker_thread_init).
+            // ephpm_worker_run runs php_execute_script under a SETJMP bailout
+            // guard on this thread's own long-lived request context. The
+            // CString outlives the call.
+            let ret = unsafe { ffi::ephpm_worker_run(c_script.as_ptr()) };
+            Ok(ret == 0)
+        }
+
+        #[cfg(not(php_linked))]
+        {
+            Err(PhpError::ExecutionFailed(
+                "PHP not linked — worker mode requires a PHP_SDK_PATH build".into(),
+            ))
         }
     }
 

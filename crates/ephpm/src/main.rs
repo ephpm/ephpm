@@ -606,6 +606,10 @@ fn load_serve_config(command: Option<Commands>) -> anyhow::Result<(ephpm_config:
         config.server.document_root = root;
     }
 
+    // Validate cross-field invariants (e.g. worker-mode worker_script) AFTER
+    // CLI overrides so document_root is final. Fails fast with a clear message.
+    config.validate().context("invalid configuration")?;
+
     Ok((config, verbose))
 }
 

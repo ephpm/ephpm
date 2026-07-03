@@ -129,7 +129,16 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 | `memory_limit` | string | `"128M"` | PHP `memory_limit`. |
 | `ini_file` | path | (none) | Custom `php.ini` loaded before `ini_overrides`. |
 | `ini_overrides` | array of `[string, string]` | `[]` | INI directives applied after `ini_file`. |
-| `workers` | usize | `0` (unlimited) | Max concurrent PHP executions (php-fpm `pm.max_children` semantics); excess requests queue. `0` = unlimited. |
+| `workers` | usize | `0` (unlimited) | Max concurrent PHP executions (php-fpm `pm.max_children` semantics); excess requests queue. `0` = unlimited. **Ignored in worker mode** (startup logs a WARN if set). |
+| `mode` | string | `"fpm"` | Request-execution model. `"fpm"` = per-request startup/shutdown (default, unchanged). `"worker"` = persistent worker mode: boot the framework once per worker, loop over requests (Octane/RoadRunner model). |
+| `worker_script` | path | (none) | Worker-mode entrypoint, relative to `document_root`. **Required** when `mode = "worker"`; config load hard-errors if absent or not a file under `document_root`. |
+| `worker_count` | usize | `0` (derive) | Number of persistent worker threads. `0` derives from CPU count, clamped `[2, 32]`. Forced to `1` on Windows (NTS, single PHP context). Worker mode only. |
+| `worker_max_requests` | u64 | `500` | Recycle a worker after N requests (php-fpm `pm.max_requests`). `0` = never recycle on count. Worker mode only. |
+| `worker_backlog` | usize | `0` (= `worker_count`) | Dispatch-queue depth. A full queue applies backpressure; a starved queue becomes a 504 via the request timeout. Worker mode only. |
+| `worker_boot_timeout` | u64 (sec) | `30` | Seconds a worker gets to boot and reach its first `take_request()`. Worker mode only. |
+| `worker_populate_superglobals` | bool | `false` | Populate native `$_GET`/`$_POST`/`$_SERVER`/... per request. Off for Octane/PSR-15 (they build their own request); on for the WordPress adapter. Worker mode only. |
+
+> **Worker mode is not supported with `[server] sites_dir`** (multi-tenant vhosting) in Phase 1 — config load hard-errors. Worker mode boots one framework per worker; per-host worker pools are a later phase.
 
 ## `[db]`
 
