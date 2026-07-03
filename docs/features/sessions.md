@@ -52,14 +52,15 @@ through the same `effective_store()` path the `ephpm_kv_*` functions use, so
 config.
 
 In **clustered mode** (`[cluster] enabled = true`) sessions use the same
-two-tier KV path as everything else — with the same caveats. Session blobs
-at or under `cluster.kv.small_key_threshold` (default 512 bytes) ride the
-gossip layer and replicate to **every** node, so a session created on node A
-is readable from nodes B, C, D within gossip convergence time. Larger session
-blobs are placed on a **single** consistent-hash owner node: other nodes can
-fetch them remotely (so requests can still route anywhere), but they are not
-replicated — if the owner node dies, those sessions die with it. See
-[Cluster](#cluster) below.
+two-tier KV path as everything else. Session blobs at or under
+`cluster.kv.small_key_threshold` (default 512 bytes) ride the gossip layer and
+replicate to **every** node, so a session created on node A is readable from
+nodes B, C, D within gossip convergence time. Larger session blobs live on the
+data-plane tier, where they are replicated to `cluster.kv.replication_factor`
+nodes (default 2) — the primary owner (`hash(key) % alive_nodes`) plus the next
+node on the ring. Reads try the owner first, then fall back to a replica, so a
+large session survives the loss of its owner node (up to
+`replication_factor - 1` failures). See [Cluster](#cluster) below.
 
 ## Locking
 
@@ -162,14 +163,20 @@ about what the two-tier KV path gives you:
   bytes) gossip to every node. These survive node loss — the surviving nodes
   already have the data, and the load balancer is free to route the next
   request anywhere.
-- **Larger session blobs** live only on their single consistent-hash owner
-  node. Any node can *read* them (remote fetch from the owner), so routing
-  is still unrestricted — but there is no replication. Losing the owner node
-  loses every large session it owned.
+- **Larger session blobs** live on the data-plane tier and are replicated to
+  `cluster.kv.replication_factor` nodes (default 2): the primary owner
+  (`hash(key) % alive_nodes`) plus the next node on the ring. Any node can
+  *read* them (owner first, then replica fallback), so routing is
+  unrestricted, and a large session survives up to `replication_factor - 1`
+  simultaneous node losses.
 
-If sessions must survive node failure, keep `$_SESSION` small — a user id
-and a handful of flags serialise comfortably under 512 bytes. Shopping-cart
-sized payloads belong in the database, with the session holding just the key.
+Replication is write-time only — there is no active rebalancing yet. A large
+session written while a replica was down, or one whose replica set shifts after
+a topology change, may end up with fewer than `replication_factor` copies until
+it is rewritten. If sessions must survive arbitrary node churn, keep
+`$_SESSION` small — a user id and a handful of flags serialise comfortably
+under 512 bytes, gossiping to every node. Shopping-cart sized payloads belong
+in the database, with the session holding just the key.
 
 Convergence for the gossip tier is best-effort (~10–30s for full-mesh
 convergence under default chitchat timings), so a session created on node A
@@ -190,9 +197,11 @@ is invisible.
   so eviction stays rare.
 - **No persistence across `ephpm` restarts** (yet). The KV store is in-memory
   only. In clustered deployments, sessions small enough for the gossip tier
-  are re-synced to a restarted node by its peers; large sessions owned by the
-  restarted node are gone. Restarting every node simultaneously wipes all
-  sessions. AOF/snapshot persistence is on the roadmap.
+  are re-synced to a restarted node by its peers; a large session survives a
+  single node restart as long as one of its replicas stays up (the restarted
+  node won't get its old copies back, though — there's no anti-entropy yet).
+  Restarting every node simultaneously wipes all sessions. AOF/snapshot
+  persistence is on the roadmap.
 - **No cross-cluster replication.** Sessions live in the same KV tier as
   the rest of your data; if you have geographically split clusters you'll
   need application-level session token forwarding, the same as any

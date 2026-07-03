@@ -106,9 +106,14 @@ This is where `kv:sqlite:primary` and other cluster-wide control state lives. De
 
 ### Tier 2 — TCP data plane (large values)
 
-Values above the threshold live on a single "owner" node, selected as `hash(key)` modulo the sorted alive-node list (no consistent hash ring — see `crates/ephpm-cluster/src/clustered_store.rs`). Requests reach the owner over the TCP data plane (`data_port`, default 7947). Writes go to the owner; reads hit the owner unless the value is in the local hot-key cache.
+Values above the threshold live on a set of "owner" nodes. The primary owner is selected as `hash(key)` modulo the sorted alive-node list (no consistent hash ring — see `crates/ephpm-cluster/src/clustered_store.rs`). Requests reach the owners over the TCP data plane (`data_port`, default 7947).
 
-Large-tier values are **not replicated** — each exists only on its owner node, so an owner failure loses those values. The `replication_factor` and `replication_mode` config keys are parsed but not yet implemented; setting them has no effect today. Only small (gossip-tier) values are replicated — to every node.
+Large-tier values are **replicated** to `[cluster.kv] replication_factor` nodes (default 2): the primary owner plus the next `replication_factor - 1` distinct nodes on the sorted alive-node ring, wrapping around. The factor is clamped to the number of alive nodes.
+
+- **Writes** go to the whole replica set. `replication_mode = "async"` (default) returns after the primary copy is written and updates the other replicas in the background; `replication_mode = "sync"` also awaits every *reachable* replica before returning (best-effort — a down replica is logged, not fatal; this is not a quorum/consensus protocol).
+- **Reads** try the primary owner first, then fall back to the other replicas in ring order. This is what lets a large value survive the loss of its owner — up to `replication_factor - 1` node failures.
+
+Replication is **write-time only**: there is no active anti-entropy or rebalancing. A node that was down during a write does not hold that key until it is rewritten or fetched-through; when membership changes, existing keys are not retroactively re-replicated. Small (gossip-tier) values are still replicated to *every* node regardless of `replication_factor`.
 
 ### Hot-key promotion
 
@@ -140,5 +145,5 @@ If you outgrow it, the RESP listener means swapping back to standalone Redis is 
 
 - [KV from PHP](/guides/kv-from-php/) — the SAPI and RESP APIs
 - [`ephpm kv` CLI](/reference/cli/kv/) — debug the live store
-- [Architecture → Clustering](/architecture/clustering/) — gossip, hash ring, data plane
+- [Architecture → Clustering](/architecture/clustering/) — gossip, key ownership, data plane replication
 - [`crates/ephpm-kv/`](https://github.com/ephpm/ephpm/tree/main/crates/ephpm-kv) — implementation

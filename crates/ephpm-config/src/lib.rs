@@ -1380,11 +1380,34 @@ pub struct ClusterKvConfig {
     #[serde(default = "default_small_key_threshold")]
     pub small_key_threshold: usize,
 
-    /// Number of replica copies for large keys.
+    /// Number of copies kept for each large (data-plane) key.
+    ///
+    /// A large key lives on its primary owner (`hash(key) % alive_nodes`)
+    /// plus the next `replication_factor - 1` distinct nodes on the
+    /// sorted alive-node ring. The factor is clamped to the number of
+    /// alive nodes, so a value larger than the cluster size simply keeps
+    /// one copy per node (never an error). `1` disables replication
+    /// (single owner copy). Default `2`.
+    ///
+    /// Replication is write-time only: a node that was down during a
+    /// write does not receive the key until it is rewritten or
+    /// fetched-through. Small (gossip-tier) values ignore this setting —
+    /// they are always replicated to every node.
     #[serde(default = "default_replication_factor")]
     pub replication_factor: usize,
 
-    /// Replication mode for large keys (`"async"` or `"sync"`).
+    /// How large-key replica writes propagate (`"async"` or `"sync"`).
+    ///
+    /// - `"async"` (default): the client write returns as soon as the
+    ///   primary copy is written; the remaining replicas are updated in
+    ///   the background (fire-and-forget, failures logged).
+    /// - `"sync"`: the write also awaits every *reachable* replica
+    ///   before returning (best-effort, read-your-writes durability
+    ///   against live peers). A replica that is down is logged but does
+    ///   not fail the write — this is not a quorum/consensus protocol.
+    ///
+    /// Any value other than `"sync"` (case-insensitive) is treated as
+    /// `"async"`.
     #[serde(default = "default_replication_mode")]
     pub replication_mode: String,
 
