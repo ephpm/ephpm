@@ -137,3 +137,21 @@ Without `SQLD_BINARY_PATH` (dev builds), `ephpm-sqld` compiles in stub mode — 
 ## CI Pipeline
 
 Runs on push/PR to main: fmt check → clippy → test → cargo-deny. Release builds triggered by `v*` tags across PHP 8.4/8.5 × Linux/macOS matrix.
+
+## Truthfulness: Docs Must Match Code
+
+A full audit (PRs #106/#107) once found ~25 documented commands that didn't exist, config knobs that were silently ignored, and docs claiming security properties the code doesn't have. These rules prevent recurrence:
+
+- **Never document something as working without verifying it in source.** Before writing user-facing docs, check the actual definition: CLI flags/subcommands in `crates/ephpm/src/main.rs` (clap), config keys and defaults in `crates/ephpm-config/src/lib.rs`, PHP SAPI functions and their arities/units in `crates/ephpm-php/ephpm_wrapper.c`, RESP commands in `crates/ephpm-kv/src/command.rs`, metric names/labels at their `counter!`/`histogram!` call sites.
+- **Future features are labeled, not implied.** Anything not implemented must say "Planned — not yet implemented." Design/aspirational docs belong in `site/content/roadmap/`, never in `reference/` or `guides/`.
+- **Never claim security or durability properties that aren't implemented** (auth, encryption, replication, isolation, credential validation). If in doubt, grep for the mechanism — a config field existing does not mean the feature exists.
+- **No silent no-op config knobs.** A new config field must be read and enforced by code in the same PR. If it genuinely can't be yet: the doc comment must say "Planned: not yet implemented — parsed but not acted upon" AND startup must `tracing::warn!` when the knob is set.
+- **No phantom metrics.** Don't register buckets for or document a metric unless something records it.
+- **Behavior changes update docs in the same PR.** When changing a default, mechanism, label, or lifecycle, grep `site/content/`, `docs/`, `examples/`, and `README.md` for the old claim and fix every hit.
+
+## Session Hygiene (branches, worktrees, scratch)
+
+- **Merge PRs with `--delete-branch`**, then delete the local branch too. After a worktree's PR merges: `git worktree remove <path>` and delete its `worktree-agent-*` branch. Never leave merged branches or worktrees behind.
+- **Review checkouts (`pr-NN-review`) are disposable** — delete them when the review ends; they're re-fetchable with `gh pr checkout NN`.
+- **Scratch output goes in gitignored paths** (`/tmp_*` at repo root is ignored) and gets deleted when the investigation ends. Never `git add -A`/`git add .` — stage files by name.
+- **Windows shells:** the null device is `$null` (PowerShell), not `NUL` — a stray redirect creates a literal `NUL` file at repo root.
