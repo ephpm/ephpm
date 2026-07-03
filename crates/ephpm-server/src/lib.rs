@@ -8,6 +8,7 @@ pub mod router;
 pub mod static_files;
 pub mod tls;
 pub mod tracked_backend;
+pub mod worker_pool;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -130,6 +131,8 @@ struct Listeners {
     file_cache: Option<Arc<file_cache::FileCache>>,
     /// Interval for file cache eviction sweeps (derived from `inactive_secs`).
     file_cache_eviction_interval: Duration,
+    /// Persistent worker pool (worker mode), drained on shutdown.
+    worker_pool: Option<Arc<worker_pool::WorkerPool>>,
 }
 
 /// Connection-level settings passed into spawned tasks.
@@ -202,12 +205,55 @@ async fn bind_listeners(
         _ => TlsMode::None,
     };
 
+    // Worker mode: wire the worker ops table and spawn the persistent worker
+    // pool BEFORE the router so PHP requests can be dispatched to it. PHP is
+    // already initialized (in main.rs, before the tokio runtime). fpm mode
+    // leaves this None and uses the spawn_blocking path unchanged.
+    let worker_pool = if config.php.is_worker_mode() {
+        let script = config
+            .resolve_worker_script()
+            .context("worker mode: failed to resolve worker_script")?;
+
+        if config.php.workers > 0 {
+            tracing::warn!(
+                "[php] workers = {} is ignored in worker mode — concurrency is \
+                 bounded by worker_count and worker_backlog",
+                config.php.workers
+            );
+        }
+
+        // Windows / NTS: a single PHP context, so force one worker (design §6.1).
+        let mut worker_count = config.php.effective_worker_count();
+        if cfg!(target_os = "windows") && worker_count > 1 {
+            tracing::warn!(
+                "worker mode on Windows (NTS) uses a single PHP context — \
+                 forcing worker_count = 1 (requests serialize through one \
+                 booted framework)"
+            );
+            worker_count = 1;
+        }
+
+        ephpm_php::PhpRuntime::install_worker_ops(config.php.worker_populate_superglobals);
+
+        let pool = worker_pool::WorkerPool::spawn(
+            script,
+            worker_count,
+            config.php.worker_max_requests,
+            config.php.effective_worker_backlog(),
+            Duration::from_secs(config.php.worker_boot_timeout),
+        );
+        Some(pool)
+    } else {
+        None
+    };
+
     let router = Arc::new(Router::new(
         config,
         kv_store,
         metrics_handle,
         limiter.clone(),
         file_cache.clone(),
+        worker_pool.clone(),
     ));
 
     let has_tls = !matches!(tls_mode, TlsMode::None);
@@ -277,6 +323,7 @@ async fn bind_listeners(
         limiter,
         file_cache,
         file_cache_eviction_interval,
+        worker_pool,
     })
 }
 
@@ -293,6 +340,7 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         limiter,
         file_cache,
         file_cache_eviction_interval,
+        worker_pool,
     } = listeners;
 
     // Track in-flight connections for graceful shutdown.
@@ -350,6 +398,12 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
                 break;
             }
         }
+    }
+
+    // Worker mode: stop accepting new dispatch so in-flight worker iterations
+    // finish and workers exit their loops cleanly (design §4.5).
+    if let Some(pool) = &worker_pool {
+        pool.drain();
     }
 
     // Graceful shutdown: wait for in-flight connections to drain.
@@ -1262,7 +1316,7 @@ mod lib_tests {
             cluster: ephpm_config::ClusterConfig::default(),
         };
         let store = ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default());
-        Arc::new(Router::new(&config, store, None, None, None))
+        Arc::new(Router::new(&config, store, None, None, None, None))
     }
 
     /// Bind a listener and serve exactly one connection with `settings`.

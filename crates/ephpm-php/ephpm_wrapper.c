@@ -44,6 +44,7 @@ static char *ephpm_strtok_r(char *str, const char *delim, char **saveptr) {
 #include "Zend/zend_call_stack.h"
 #include "Zend/zend_exceptions.h"
 #include "Zend/zend_globals.h"
+#include "Zend/zend_smart_str.h"
 #include "main/php_version.h"
 #include "ext/session/php_session.h"
 
@@ -937,6 +938,505 @@ const char *ephpm_get_response_headers(size_t *out_len)
 }
 
 /* ===================================================================
+ * Worker mode — persistent-worker engine (design: worker-mode-design.md)
+ *
+ * Registers Ephpm\Worker\take_request() / send_response() and the
+ * Ephpm\Worker\Envelope class in PHP userland. Inverts control: PHP boots
+ * the framework once (via ephpm_worker_run) then loops calling take_request()
+ * (blocks in Rust until the next HTTP request) and send_response().
+ *
+ * Everything here runs on the worker's own long-lived TSRM request context.
+ * ephpm_worker_reset_request() resets per-iteration SAPI state WITHOUT the
+ * php_request_shutdown/startup that would destroy the booted framework.
+ * =================================================================== */
+
+/* Borrowed view of the next HTTP request, filled by the Rust take_request
+ * callback. All pointers are owned by the Rust-side channel message and stay
+ * valid until the matching send_response() runs — the same "valid until
+ * execute returns" contract ephpm_request_set_info relies on. The C side
+ * copies every field into zend_strings when building the Envelope, so PHP
+ * never retains a borrowed pointer. Server vars and headers are packed as
+ * count + a flat array of (key,value) C-string pointer pairs. */
+typedef struct {
+    const char *method;
+    const char *uri;              /* REQUEST_URI (path + query) */
+    const char *query_string;     /* without leading '?' */
+    const char *cookie_data;      /* raw Cookie header value */
+    const char *content_type;     /* may be NULL */
+    const char *body;             /* raw request body (may be NULL) */
+    size_t      body_len;
+
+    size_t      server_var_count;
+    const char *const *server_var_keys;
+    const char *const *server_var_vals;
+
+    size_t      header_count;
+    const char *const *header_keys;
+    const char *const *header_vals;
+} EphpmWorkerRequest;
+
+/* Function pointer table into Rust. Mirrors EphpmWorkerOps in
+ * crates/ephpm-php/src/worker_bridge.rs — keep the two in lockstep. */
+typedef struct {
+    /* Block until the next request. On return: 1 = request available (req
+     * filled), 0 = graceful shutdown (worker returns from its loop). */
+    int (*take_request)(EphpmWorkerRequest *req);
+    /* Hand back the response. headers packed as "Name: Value\n" lines. */
+    void (*send_response)(int status,
+                          const char *headers, size_t headers_len,
+                          const char *body, size_t body_len);
+} EphpmWorkerOps;
+
+static EphpmWorkerOps g_worker_ops = {0};
+
+/* Whether the runtime asked us to populate native superglobals per request
+ * (worker.populate_superglobals — WordPress adapter). Set once before boot. */
+static int g_worker_populate_superglobals = 0;
+
+/* The Envelope class entry, registered in MINIT. */
+static zend_class_entry *ephpm_worker_envelope_ce = NULL;
+
+/*
+ * Per-iteration reset (design §3.5). Called at the top of take_request(),
+ * on the worker's own TSRM context, inside the long-lived request.
+ * Deliberately does NOT call php_request_shutdown/startup — that would tear
+ * down the booted framework. Touches the SAME SAPI globals the hardened fpm
+ * reuse path touches (ephpm_wrapper.c:823-825, :844), minus the lifecycle
+ * calls; that symmetry is the safety argument.
+ */
+void ephpm_worker_reset_request(void)
+{
+    /* Thread-local C capture buffers. */
+    output_len = 0;
+    headers_buf_len = 0;
+
+    /* Drop headers emitted by the previous response so they don't accumulate
+     * (fpm gets this free from php_request_shutdown). */
+    zend_llist_clean(&SG(sapi_headers).headers);
+    if (SG(sapi_headers).mimetype) {
+        efree(SG(sapi_headers).mimetype);
+        SG(sapi_headers).mimetype = NULL;
+    }
+
+    /* Proven leak fix on the reuse path (:823-825): without this a prior
+     * request's status / headers_sent / no_headers leaks into the next. */
+    SG(sapi_headers).http_response_code = 200;
+    SG(headers_sent) = 0;
+    SG(request_info).no_headers = 0;
+
+    /* Per-iteration fatal detection (:844). */
+    PG(last_error_type) = 0;
+
+    /* Per-iteration POST cursor. */
+    req_post_data_offset = 0;
+
+    response_status_code = 200;
+}
+
+/* Build a PHP array of (key => value) string pairs from a packed C list. */
+static void ephpm_worker_fill_str_array(zval *arr, size_t count,
+                                        const char *const *keys,
+                                        const char *const *vals)
+{
+    array_init(arr);
+    for (size_t i = 0; i < count; i++) {
+        if (!keys[i]) {
+            continue;
+        }
+        const char *v = vals[i] ? vals[i] : "";
+        add_assoc_string(arr, keys[i], (char *)v);
+    }
+}
+
+/* Parse "a=1; b=2" cookie header into an associative array. */
+static void ephpm_worker_parse_cookies(zval *arr, const char *cookie)
+{
+    array_init(arr);
+    if (!cookie || !*cookie) {
+        return;
+    }
+    char *dup = estrdup(cookie);
+    char *saveptr = NULL;
+    char *pair = strtok_r(dup, ";", &saveptr);
+    while (pair) {
+        while (*pair == ' ') pair++;
+        char *eq = strchr(pair, '=');
+        if (eq) {
+            *eq = '\0';
+            add_assoc_string(arr, pair, eq + 1);
+        }
+        pair = strtok_r(NULL, ";", &saveptr);
+    }
+    efree(dup);
+}
+
+/* Parse "a=1&b=2" query string into an associative array (no url-decoding —
+ * Phase 1 keeps it framework-neutral; adapters do their own decoding). */
+static void ephpm_worker_parse_query(zval *arr, const char *qs)
+{
+    array_init(arr);
+    if (!qs || !*qs) {
+        return;
+    }
+    char *dup = estrdup(qs);
+    char *saveptr = NULL;
+    char *pair = strtok_r(dup, "&", &saveptr);
+    while (pair) {
+        char *eq = strchr(pair, '=');
+        if (eq) {
+            *eq = '\0';
+            add_assoc_string(arr, pair, eq + 1);
+        } else if (*pair) {
+            add_assoc_string(arr, pair, "");
+        }
+        pair = strtok_r(NULL, "&", &saveptr);
+    }
+    efree(dup);
+}
+
+/* Store an array as a private property on the Envelope $this object. */
+static void ephpm_worker_set_prop_array(zval *obj, const char *name, zval *arr)
+{
+    zend_update_property(ephpm_worker_envelope_ce, Z_OBJ_P(obj), name,
+                         strlen(name), arr);
+    zval_ptr_dtor(arr);
+}
+
+static void ephpm_worker_set_prop_stringl(zval *obj, const char *name,
+                                          const char *val, size_t len)
+{
+    zend_update_property_stringl(ephpm_worker_envelope_ce, Z_OBJ_P(obj), name,
+                                 strlen(name), val ? val : "", val ? len : 0);
+}
+
+/* PHP_FUNCTION: \Ephpm\Worker\take_request(): ?\Ephpm\Worker\Envelope
+ *
+ * Runs the per-iteration reset, blocks in Rust for the next request, and
+ * returns an Envelope object (null on graceful shutdown). */
+PHP_FUNCTION(ephpm_worker_take_request)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    if (!g_worker_ops.take_request) {
+        RETURN_NULL();
+    }
+
+    /* Reset SAPI-scoped state from the previous iteration BEFORE we block, so
+     * the previous response's headers/status/output are already gone. */
+    ephpm_worker_reset_request();
+
+    EphpmWorkerRequest req;
+    memset(&req, 0, sizeof(req));
+    int have = g_worker_ops.take_request(&req);
+    if (!have) {
+        /* Graceful shutdown — worker.php's while-loop ends, ephpm_worker_run
+         * returns, the pool respawns or drains. */
+        RETURN_NULL();
+    }
+
+    /* Point the SAPI request-info + POST buffers at this request so php://input
+     * and any framework that reads them see the right body. These are the same
+     * thread-local fields the fpm read_post/read_cookies callbacks use. */
+    req_method = req.method;
+    req_uri = req.uri;
+    req_query_string = req.query_string;
+    req_content_type = req.content_type;
+    req_cookie_data = req.cookie_data;
+    req_post_data = req.body;
+    req_post_data_len = req.body_len;
+    req_post_data_offset = 0;
+
+    SG(request_info).request_method = (char *)req.method;
+    SG(request_info).request_uri = (char *)req.uri;
+    SG(request_info).query_string = (char *)req.query_string;
+    SG(request_info).content_type = req.content_type;
+    SG(request_info).cookie_data = (char *)req.cookie_data;
+    SG(request_info).content_length = (zend_long)req.body_len;
+
+    /* Optionally rebuild native superglobals through the normal, quiescent
+     * treat_data path (WordPress). We NEVER hand-rebuild PG(http_globals) —
+     * that re-triggers the php_default_treat_data UAF (design §3.4). Instead
+     * we let the registered SAPI callbacks repopulate $_SERVER/$_COOKIE/$_GET
+     * via php_hash_environment(), which is safe at this quiescent point. */
+    if (g_worker_populate_superglobals) {
+        /* Reset server-var registration to this request's set. */
+        server_var_count = 0;
+        for (size_t i = 0; i < req.server_var_count && i < MAX_SERVER_VARS; i++) {
+            ephpm_request_add_server_var(req.server_var_keys[i], req.server_var_vals[i]);
+        }
+        zend_try {
+            php_hash_environment();
+        } zend_catch {
+            /* Non-fatal: the envelope below still gives the framework the data. */
+        } zend_end_try();
+    }
+
+    /* Build the Envelope object. */
+    object_init_ex(return_value, ephpm_worker_envelope_ce);
+
+    zval tmp;
+    ephpm_worker_fill_str_array(&tmp, req.server_var_count,
+                                req.server_var_keys, req.server_var_vals);
+    ephpm_worker_set_prop_array(return_value, "serverVars", &tmp);
+
+    ephpm_worker_fill_str_array(&tmp, req.header_count,
+                                req.header_keys, req.header_vals);
+    ephpm_worker_set_prop_array(return_value, "headers", &tmp);
+
+    ephpm_worker_parse_cookies(&tmp, req.cookie_data);
+    ephpm_worker_set_prop_array(return_value, "cookies", &tmp);
+
+    ephpm_worker_parse_query(&tmp, req.query_string);
+    ephpm_worker_set_prop_array(return_value, "query", &tmp);
+
+    ephpm_worker_set_prop_stringl(return_value, "rawBody", req.body, req.body_len);
+}
+
+/* PHP_FUNCTION: \Ephpm\Worker\send_response(int, array, string): void
+ *
+ * Concatenates any captured output_buf (echo path) with the explicit $body,
+ * packs the $headers array into "Name: Value\n" lines, and hands both to the
+ * Rust send_response callback (which fulfils the parked oneshot). */
+PHP_FUNCTION(ephpm_worker_send_response)
+{
+    zend_long status;
+    zval *headers_arr;
+    char *body;
+    size_t body_len;
+
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_LONG(status)
+        Z_PARAM_ARRAY(headers_arr)
+        Z_PARAM_STRING(body, body_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_worker_ops.send_response) {
+        return;
+    }
+
+    /* Pack headers as "Name: Value\n" lines. */
+    smart_str hbuf = {0};
+    zend_string *hkey;
+    zval *hval;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(headers_arr), hkey, hval) {
+        if (!hkey) {
+            continue; /* skip numeric keys */
+        }
+        zend_string *vstr = zval_get_string(hval);
+        smart_str_appendl(&hbuf, ZSTR_VAL(hkey), ZSTR_LEN(hkey));
+        smart_str_appendl(&hbuf, ": ", 2);
+        smart_str_appendl(&hbuf, ZSTR_VAL(vstr), ZSTR_LEN(vstr));
+        smart_str_appendc(&hbuf, '\n');
+        zend_string_release(vstr);
+    } ZEND_HASH_FOREACH_END();
+    smart_str_0(&hbuf);
+
+    /* Concatenate captured echo output (if any) + explicit $body. */
+    const char *hdr_ptr = hbuf.s ? ZSTR_VAL(hbuf.s) : "";
+    size_t hdr_len = hbuf.s ? ZSTR_LEN(hbuf.s) : 0;
+
+    if (output_len > 0) {
+        smart_str bbuf = {0};
+        smart_str_appendl(&bbuf, output_buf, output_len);
+        smart_str_appendl(&bbuf, body, body_len);
+        smart_str_0(&bbuf);
+        g_worker_ops.send_response((int)status, hdr_ptr, hdr_len,
+                                   ZSTR_VAL(bbuf.s), ZSTR_LEN(bbuf.s));
+        smart_str_free(&bbuf);
+    } else {
+        g_worker_ops.send_response((int)status, hdr_ptr, hdr_len, body, body_len);
+    }
+
+    smart_str_free(&hbuf);
+
+    /* Clear the captured output so it does not bleed into the next response
+     * (the reset at the top of the next take_request also clears it, but this
+     * keeps the accounting local). */
+    output_len = 0;
+}
+
+/* ── Envelope methods ─────────────────────────────────────────────
+ * Each returns the property populated by take_request. Framework-neutral;
+ * adapters build their own Request from these. */
+
+static void ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAMETERS, const char *name)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    zval rv;
+    zval *prop = zend_read_property(ephpm_worker_envelope_ce, Z_OBJ_P(ZEND_THIS),
+                                    name, strlen(name), 1, &rv);
+    RETURN_COPY(prop);
+}
+
+PHP_METHOD(Ephpm_Worker_Envelope, serverVars)  { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "serverVars"); }
+PHP_METHOD(Ephpm_Worker_Envelope, headers)     { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "headers"); }
+PHP_METHOD(Ephpm_Worker_Envelope, cookies)     { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "cookies"); }
+PHP_METHOD(Ephpm_Worker_Envelope, query)       { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "query"); }
+PHP_METHOD(Ephpm_Worker_Envelope, rawBody)     { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "rawBody"); }
+PHP_METHOD(Ephpm_Worker_Envelope, bodyStream)  { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "rawBody"); }
+
+/* parsedBody(): ?array — Phase 1 returns null (form/multipart parsing is a
+ * framework/adapter concern; streaming bodies are Phase 3). */
+PHP_METHOD(Ephpm_Worker_Envelope, parsedBody)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    RETURN_NULL();
+}
+
+/* files(): array — Phase 1 returns empty (uploads land in Phase 3). */
+PHP_METHOD(Ephpm_Worker_Envelope, files)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    array_init(return_value);
+}
+
+/* ── arginfo ─────────────────────────────────────────────────── */
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_worker_take_request, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_worker_send_response, 0, 0, 3)
+    ZEND_ARG_INFO(0, status)
+    ZEND_ARG_INFO(0, headers)
+    ZEND_ARG_INFO(0, body)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_worker_envelope_noargs, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
+/* Namespaced free functions: PHP stores them lowercased with a backslash
+ * separator, so the entry name must be the fully-qualified "ephpm\\worker\\..."
+ * for `\Ephpm\Worker\take_request()` to resolve. */
+static const zend_function_entry ephpm_worker_functions[] = {
+    ZEND_NS_NAMED_FE("Ephpm\\Worker", take_request,
+                     ZEND_FN(ephpm_worker_take_request),
+                     arginfo_ephpm_worker_take_request)
+    ZEND_NS_NAMED_FE("Ephpm\\Worker", send_response,
+                     ZEND_FN(ephpm_worker_send_response),
+                     arginfo_ephpm_worker_send_response)
+    PHP_FE_END
+};
+
+static const zend_function_entry ephpm_worker_envelope_methods[] = {
+    PHP_ME(Ephpm_Worker_Envelope, serverVars,  arginfo_ephpm_worker_envelope_noargs, ZEND_ACC_PUBLIC)
+    PHP_ME(Ephpm_Worker_Envelope, headers,     arginfo_ephpm_worker_envelope_noargs, ZEND_ACC_PUBLIC)
+    PHP_ME(Ephpm_Worker_Envelope, cookies,     arginfo_ephpm_worker_envelope_noargs, ZEND_ACC_PUBLIC)
+    PHP_ME(Ephpm_Worker_Envelope, query,       arginfo_ephpm_worker_envelope_noargs, ZEND_ACC_PUBLIC)
+    PHP_ME(Ephpm_Worker_Envelope, parsedBody,  arginfo_ephpm_worker_envelope_noargs, ZEND_ACC_PUBLIC)
+    PHP_ME(Ephpm_Worker_Envelope, files,       arginfo_ephpm_worker_envelope_noargs, ZEND_ACC_PUBLIC)
+    PHP_ME(Ephpm_Worker_Envelope, bodyStream,  arginfo_ephpm_worker_envelope_noargs, ZEND_ACC_PUBLIC)
+    PHP_ME(Ephpm_Worker_Envelope, rawBody,     arginfo_ephpm_worker_envelope_noargs, ZEND_ACC_PUBLIC)
+    PHP_FE_END
+};
+
+/* MINIT for the worker module. Registering the Envelope class here (rather
+ * than directly in the embed startup shim) is REQUIRED: zend_register_internal_class
+ * -> do_register_internal_class reads EG(current_module) while registering the
+ * class's method table, and EG(current_module) is only non-NULL inside a real
+ * module MINIT (the engine sets it around each module's MINIT). Registering the
+ * class from the bare shim, where EG(current_module) is NULL, segfaults. The
+ * module's own `functions` table registers the namespaced free functions with
+ * the same correct module context. */
+static PHP_MINIT_FUNCTION(ephpm_worker)
+{
+    (void)type;
+    (void)module_number;
+
+    zend_class_entry ce;
+    INIT_NS_CLASS_ENTRY(ce, "Ephpm\\Worker", "Envelope", ephpm_worker_envelope_methods);
+    ephpm_worker_envelope_ce = zend_register_internal_class(&ce);
+    if (ephpm_worker_envelope_ce) {
+        /* Store the marshaled request fields as DYNAMIC properties set at
+         * runtime in take_request (zend_update_property creates them on the
+         * instance). We deliberately do NOT pre-declare typed/default
+         * properties: an internal class's default_properties_table must hold
+         * non-refcounted zvals, and a string/array default there trips
+         * "Internal zvals cannot be refcounted" at startup. Allowing dynamic
+         * properties keeps the Envelope a plain data carrier without that
+         * constraint. Not final, so adapters may subclass if useful. */
+        ephpm_worker_envelope_ce->ce_flags |= ZEND_ACC_ALLOW_DYNAMIC_PROPERTIES;
+    }
+
+    return SUCCESS;
+}
+
+/* Minimal module entry whose MINIT registers Ephpm\Worker\* + the Envelope
+ * class with a valid EG(current_module) context. Passed to php_module_startup
+ * as its `additional_module` from ephpm_module_startup, so it is started inside
+ * zend_startup — the frozen window every ZTS worker later copies. */
+static zend_module_entry ephpm_worker_module_entry = {
+    STANDARD_MODULE_HEADER,
+    "ephpm_worker",              /* name */
+    ephpm_worker_functions,      /* functions (namespaced free functions) */
+    PHP_MINIT(ephpm_worker),     /* MINIT: registers the Envelope class */
+    NULL,                        /* MSHUTDOWN */
+    NULL,                        /* RINIT */
+    NULL,                        /* RSHUTDOWN */
+    NULL,                        /* MINFO */
+    "3.0",                       /* version */
+    STANDARD_MODULE_PROPERTIES
+};
+
+/*
+ * Set the worker ops function pointer table. Called after php_embed_init(),
+ * before any worker boots. Mirrors ephpm_set_kv_ops.
+ */
+void ephpm_set_worker_ops(const EphpmWorkerOps *ops)
+{
+    if (ops) {
+        g_worker_ops = *ops;
+    }
+}
+
+/* Toggle native superglobal population (worker.populate_superglobals). */
+void ephpm_worker_set_populate_superglobals(int enable)
+{
+    g_worker_populate_superglobals = enable ? 1 : 0;
+}
+
+/*
+ * Boot a worker: run the worker script under bailout protection, exactly like
+ * ephpm_execute_request's SETJMP structure. The script sits in a
+ * while (take_request()) loop, so this call returns only when that loop ends
+ * (graceful shutdown, worker_max_requests recycle, or a fatal bailout).
+ *
+ * Runs on the worker's own long-lived TSRM request (started by
+ * ephpm_thread_init) — we do NOT start/stop a request here.
+ *
+ * Returns:
+ *    0  the loop ended cleanly (shutdown / recycle)
+ *   -2  a fatal / zend_bailout unwound out of the framework (recycle + the
+ *       Rust supervisor fulfils any parked oneshot with a 500)
+ */
+int ephpm_worker_run(const char *script)
+{
+    int result = 0;
+    JMP_BUF *__orig_bailout = EG(bailout);
+    JMP_BUF __bailout;
+
+    EG(bailout) = &__bailout;
+    if (SETJMP(__bailout) == 0) {
+        zend_file_handle file_handle;
+        zend_stream_init_filename(&file_handle, script);
+        php_execute_script(&file_handle);
+
+        /* exit()/die() throws an unwind-exit exception rather than bailing;
+         * treat it as a clean loop end (the framework asked to stop). */
+        if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
+            zend_clear_exception();
+        }
+    } else {
+        /* zend_bailout() — a fatal unwound past the current iteration's
+         * send_response. The Rust supervisor checks the parked oneshot and
+         * 500s the in-flight request; the worker is recycled. */
+        result = -2;
+    }
+    EG(bailout) = __orig_bailout;
+
+    return result;
+}
+
+/* ===================================================================
  * KV store native PHP functions
  *
  * These register as ephpm_kv_get(), ephpm_kv_set(), etc. in PHP userland.
@@ -1744,7 +2244,14 @@ void ephpm_set_ini_file(const char *ini_file)
 static int ephpm_module_startup(sapi_module_struct *sm)
 {
     sm->additional_functions = ephpm_kv_functions;
-    int ret = php_module_startup(sm, NULL);
+    /* Register the worker module as php_module_startup's `additional_module` so
+     * its functions (Ephpm\Worker\take_request/send_response) and its MINIT
+     * (the Envelope class) land in CG(function_table)/CG(class_table) DURING
+     * zend_startup — before those are frozen into GLOBAL_FUNCTION_TABLE /
+     * GLOBAL_CLASS_TABLE that new ZTS worker threads inherit. Registering it
+     * later (via zend_startup_module after this returns) leaves it invisible to
+     * worker threads (function_exists() == false there). */
+    int ret = php_module_startup(sm, &ephpm_worker_module_entry);
 
     /* Register the native "ephpm" session save handler. Must happen after
      * php_module_startup() — the session extension's MINIT is what wires up

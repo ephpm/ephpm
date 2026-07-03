@@ -1170,6 +1170,7 @@ dependencies = [
 name = "ephpm-php"
 version = "0.1.0"
 dependencies = [
+ "async-channel",
  "bindgen",
  "cc",
  "ephpm-kv",
@@ -1177,6 +1178,7 @@ dependencies = [
  "serial_test",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
@@ -1195,6 +1197,7 @@ name = "ephpm-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "async-trait",
  "brotli",
  "bytes",

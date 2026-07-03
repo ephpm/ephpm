@@ -13,6 +13,10 @@ ephpm-kv.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 http.workspace = true
+# Worker mode: async-producer / sync-consumer dispatch queue (async_channel
+# speaks both send().await and recv_blocking()) plus oneshot response return.
+async-channel.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 
 [build-dependencies]
 bindgen = "0.72"
