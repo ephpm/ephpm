@@ -1287,6 +1287,22 @@ pub struct PhpConfig {
     /// Default: `false`.
     #[serde(default)]
     pub worker_populate_superglobals: bool,
+
+    /// Request-body size (bytes) at or above which the body is *streamed* into
+    /// the worker in fixed-size chunks instead of buffered whole (worker mode
+    /// only, Phase 3). Requests with a `Content-Length` at or above this — or
+    /// with no `Content-Length` (chunked) — flow through
+    /// `Envelope::bodyStream()` / PHP's POST reader without ePHPm holding the
+    /// whole body in memory, keeping worker RSS flat for multi-GB uploads.
+    ///
+    /// Smaller requests stay on the buffered Phase-1 path (one copy each way),
+    /// which is cheaper for the common small-body case.
+    ///
+    /// Ignored in fpm mode (the fpm path always buffers the body today).
+    ///
+    /// Default: `1048576` (1 MiB).
+    #[serde(default = "default_worker_stream_threshold")]
+    pub worker_stream_threshold: u64,
 }
 
 impl Config {
@@ -1497,6 +1513,7 @@ impl Default for PhpConfig {
             worker_backlog: default_worker_backlog(),
             worker_boot_timeout: default_worker_boot_timeout(),
             worker_populate_superglobals: false,
+            worker_stream_threshold: default_worker_stream_threshold(),
         }
     }
 }
@@ -1720,6 +1737,11 @@ fn default_worker_max_requests() -> u64 {
 fn default_worker_backlog() -> usize {
     // 0 => = effective_worker_count (one queued job per worker).
     0
+}
+
+fn default_worker_stream_threshold() -> u64 {
+    // 1 MiB: bodies at/above this stream; smaller ones buffer (cheaper).
+    1024 * 1024
 }
 
 fn default_worker_boot_timeout() -> u64 {
@@ -2515,6 +2537,7 @@ sites_dir = "/var/www/sites"
         assert_eq!(cfg.worker_backlog, 0);
         assert_eq!(cfg.worker_boot_timeout, 30);
         assert!(!cfg.worker_populate_superglobals);
+        assert_eq!(cfg.worker_stream_threshold, 1024 * 1024);
         assert!(cfg.worker_script.is_none());
     }
 
@@ -2562,6 +2585,7 @@ worker_max_requests = 1000
 worker_backlog = 12
 worker_boot_timeout = 45
 worker_populate_superglobals = true
+worker_stream_threshold = 262144
 "#,
         )
         .unwrap();
@@ -2574,6 +2598,7 @@ worker_populate_superglobals = true
         assert_eq!(config.php.worker_backlog, 12);
         assert_eq!(config.php.worker_boot_timeout, 45);
         assert!(config.php.worker_populate_superglobals);
+        assert_eq!(config.php.worker_stream_threshold, 262_144);
     }
 
     #[test]

@@ -18,6 +18,20 @@
 //! [`WorkerResponse::internal_error`] (500), or the sender is dropped and the
 //! receiver sees `RecvError` (also 500).
 //!
+//! ## Phase 3: streaming bodies
+//!
+//! The ops table also carries `body_read` (incremental request body) and
+//! `response_begin`/`response_chunk`/`response_end` (incremental response). A
+//! request body is either [`WorkerBody::Buffered`] (small, Phase-1 path) or
+//! [`WorkerBody::Streaming`] (large — chunks arrive on a bounded channel the
+//! worker `blocking_recv`s via `body_read`, so ePHPm never holds the whole
+//! body). `send_response_stream` on the PHP side drives `response_begin` (which
+//! delivers status+headers on the oneshot immediately, as
+//! [`WorkerResponse::Streaming`]) then `response_chunk` per chunk (bounded
+//! `blocking_send` = download backpressure) then `response_end`. The worker
+//! threads are plain OS threads (not on the tokio runtime), so `blocking_recv`
+//! / `blocking_send` are valid there.
+//!
 //! Everything real is `#[cfg(php_linked)]`; stub builds get inert fallbacks.
 
 #[cfg(php_linked)]
@@ -27,12 +41,49 @@ use std::ffi::CString;
 #[cfg(php_linked)]
 use std::os::raw::{c_char, c_int};
 
+/// Chunk size / channel bounds shared with the streaming-body plumbing.
+///
+/// A bounded channel of `BODY_CHANNEL_DEPTH` chunks caps the in-flight buffered
+/// bytes at roughly `depth * chunk` regardless of upload size, which is the
+/// flat-memory guarantee (design §9 exit criterion).
+pub const BODY_CHANNEL_DEPTH: usize = 8;
+
 // ── Shared message types (used by ephpm-server's worker pool) ────────────
 
-/// An owned HTTP request handed to a worker thread. Owns every string/byte
-/// buffer so the borrowed [`EphpmWorkerRequest`] view stays valid for the
-/// whole iteration (until `send_response`).
-#[derive(Debug, Clone)]
+/// The request body handed to a worker: either fully buffered (Phase 1
+/// back-compat, small bodies) or streamed incrementally from the hyper task
+/// (Phase 3, large uploads with flat worker memory).
+pub enum WorkerBody {
+    /// The whole body, already in memory.
+    Buffered(Vec<u8>),
+    /// Incremental body: the worker thread `blocking_recv`s `Bytes` chunks off
+    /// this bounded receiver (a hyper task sends frames); the sender closing
+    /// signals clean EOF. `declared_len` is the `Content-Length` (so PHP's POST
+    /// reader knows how much to expect); it may be `0` for chunked bodies.
+    Streaming {
+        /// Bounded receiver of body chunks; sender close = clean EOF. Bounded,
+        /// so a slow worker applies backpressure to the hyper reader.
+        rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        /// Declared `Content-Length`, or `0` when unknown.
+        declared_len: usize,
+    },
+}
+
+impl std::fmt::Debug for WorkerBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Buffered(b) => f.debug_tuple("Buffered").field(&b.len()).finish(),
+            Self::Streaming { declared_len, .. } => {
+                f.debug_struct("Streaming").field("declared_len", declared_len).finish()
+            }
+        }
+    }
+}
+
+/// An owned HTTP request handed to a worker thread. Owns every string buffer so
+/// the borrowed [`EphpmWorkerRequest`] view stays valid for the whole iteration
+/// (until `send_response`).
+#[derive(Debug)]
 pub struct WorkerRequestOwned {
     /// HTTP method (`GET`, `POST`, ...).
     pub method: String,
@@ -44,23 +95,38 @@ pub struct WorkerRequestOwned {
     pub cookie_data: String,
     /// `Content-Type` header value, if any.
     pub content_type: Option<String>,
-    /// Raw request body bytes.
-    pub body: Vec<u8>,
+    /// The request body (buffered or streaming).
+    pub body: WorkerBody,
     /// `$_SERVER`-shaped variables as `(key, value)` pairs.
     pub server_vars: Vec<(String, String)>,
     /// HTTP headers as `(name, value)` pairs.
     pub headers: Vec<(String, String)>,
 }
 
-/// A response produced by a worker for one request.
-#[derive(Debug, Clone)]
-pub struct WorkerResponse {
-    /// HTTP status code.
-    pub status: u16,
-    /// Response headers as `(name, value)` pairs.
-    pub headers: Vec<(String, String)>,
-    /// Response body bytes.
-    pub body: Vec<u8>,
+/// A response produced by a worker for one request: either fully buffered
+/// (`send_response`) or streamed (`send_response_stream`).
+#[derive(Debug)]
+pub enum WorkerResponse {
+    /// Complete response with a fully-materialized body.
+    Buffered {
+        /// HTTP status code.
+        status: u16,
+        /// Response headers as `(name, value)` pairs.
+        headers: Vec<(String, String)>,
+        /// Response body bytes.
+        body: Vec<u8>,
+    },
+    /// Streamed response: status + headers now, body chunks arrive on `body_rx`
+    /// as the worker produces them (`send_response_stream`). The hyper handler
+    /// turns `body_rx` into a `StreamBody` so bytes flush before PHP finishes.
+    Streaming {
+        /// HTTP status code.
+        status: u16,
+        /// Response headers as `(name, value)` pairs.
+        headers: Vec<(String, String)>,
+        /// Bounded receiver of body chunks; sender close = end of body.
+        body_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    },
 }
 
 impl WorkerResponse {
@@ -68,7 +134,7 @@ impl WorkerResponse {
     /// sending a real response (design §5.3).
     #[must_use]
     pub fn internal_error() -> Self {
-        Self {
+        Self::Buffered {
             status: 500,
             headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
             body: b"Internal Server Error".to_vec(),
@@ -104,10 +170,14 @@ pub struct EphpmWorkerRequest {
     pub cookie_data: *const c_char,
     /// `Content-Type`, null-terminated, or null.
     pub content_type: *const c_char,
-    /// Raw body bytes, or null when empty.
+    /// Raw body bytes, or null when empty (unset for streaming requests).
     pub body: *const c_char,
-    /// Body length in bytes.
+    /// Body length in bytes. For streaming requests this carries the declared
+    /// `Content-Length` (so PHP's POST reader knows how much to expect); the
+    /// bytes themselves arrive through `body_read`.
     pub body_len: usize,
+    /// Non-zero when the body streams via the `body_read` op instead of `body`.
+    pub body_streaming: c_int,
 
     /// Number of `$_SERVER` entries.
     pub server_var_count: usize,
@@ -143,6 +213,20 @@ pub struct EphpmWorkerOps {
             body_len: usize,
         ),
     >,
+
+    // ── Phase 3: streaming bodies ────────────────────────────────────────
+    /// Read up to `cap` bytes of the incremental request body into `buf`.
+    /// Returns bytes written (0 = EOF, negative = error). Blocks until data or
+    /// EOF. Serves the in-memory body when the request was buffered.
+    pub body_read: Option<unsafe extern "C" fn(buf: *mut c_char, cap: usize) -> isize>,
+    /// Begin a streaming response (status + packed headers, body chunks follow).
+    pub response_begin:
+        Option<unsafe extern "C" fn(status: c_int, headers: *const c_char, headers_len: usize)>,
+    /// Push one response body chunk (blocks on backpressure). Returns 0, or
+    /// negative if the receiver/client is gone.
+    pub response_chunk: Option<unsafe extern "C" fn(buf: *const c_char, len: usize) -> isize>,
+    /// Finish the streaming response (close the body channel).
+    pub response_end: Option<unsafe extern "C" fn()>,
 }
 
 // ── Thread-local per-worker state ────────────────────────────────────────
@@ -163,7 +247,11 @@ struct CurrentRequest {
     _query: CString,
     _cookie: CString,
     _content_type: Option<CString>,
+    // For buffered requests, `body` points into here; for streaming requests
+    // this is empty and `body_len` carries the declared Content-Length.
     _body: Vec<u8>,
+    body_len: usize,
+    streaming: bool,
     _server_keys: Vec<CString>,
     _server_vals: Vec<CString>,
     _header_keys: Vec<CString>,
@@ -175,6 +263,30 @@ struct CurrentRequest {
     header_key_ptrs: Vec<*const c_char>,
     header_val_ptrs: Vec<*const c_char>,
 }
+
+/// The request-body reader for the in-flight request. Serves `body_read` from
+/// either an in-memory buffer (buffered dispatch) or a blocking chunk receiver
+/// (streaming dispatch). Never crosses a longjmp with a live lock — it lives in
+/// a thread-local `RefCell` borrowed only for the duration of one `body_read`.
+#[cfg(php_linked)]
+enum BodyReader {
+    /// No body / already drained.
+    Empty,
+    /// Buffered body with a read cursor.
+    Buffered { data: Vec<u8>, offset: usize },
+    /// Streaming body: a leftover partial chunk plus the bounded receiver. The
+    /// worker thread is a plain OS thread (not on the tokio runtime), so
+    /// `blocking_recv()` is valid here.
+    Streaming { pending: bytes::Bytes, rx: tokio::sync::mpsc::Receiver<bytes::Bytes> },
+}
+
+/// The in-flight streaming-response sender (`send_response_stream`). Chunks the
+/// worker produces are pushed here; the hyper handler drains it into a
+/// `StreamBody`. Bounded — `response_chunk` uses `blocking_send`, giving
+/// download backpressure. Longjmp-safe: the `Sender`'s `Drop` just signals the
+/// receiver (no files/locks).
+#[cfg(php_linked)]
+type ResponseChunkTx = tokio::sync::mpsc::Sender<bytes::Bytes>;
 
 #[cfg(php_linked)]
 thread_local! {
@@ -191,6 +303,13 @@ thread_local! {
 
     /// Backing storage for the request C currently borrows.
     static CURRENT_REQUEST: RefCell<Option<CurrentRequest>> = const { RefCell::new(None) };
+
+    /// The incremental request-body reader for the in-flight request. Consumed
+    /// by `body_read` (drives both read_post and bodyStream()).
+    static BODY_READER: RefCell<BodyReader> = const { RefCell::new(BodyReader::Empty) };
+
+    /// The in-flight streaming-response chunk sender (`send_response_stream`).
+    static RESPONSE_TX: RefCell<Option<ResponseChunkTx>> = const { RefCell::new(None) };
 
     /// Requests handled by this worker since boot (drives `worker_max_requests`).
     static REQUESTS_HANDLED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -238,10 +357,30 @@ pub fn take_pending_sender() -> Option<tokio::sync::oneshot::Sender<WorkerRespon
     None
 }
 
+/// Drop any in-flight streaming state left over after a bailout: the response
+/// chunk sender (closing its channel signals end-of-body to the hyper handler,
+/// so a client mid-download gets a truncated-but-not-hung response) and the
+/// body reader. Call from the pool's crash-recovery path before the worker
+/// resumes/respawns. Idempotent.
+#[cfg(php_linked)]
+pub fn clear_in_flight_streams() {
+    RESPONSE_TX.with(|cell| *cell.borrow_mut() = None);
+    BODY_READER.with(|cell| *cell.borrow_mut() = BodyReader::Empty);
+    CURRENT_REQUEST.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// Stub.
+#[cfg(not(php_linked))]
+pub fn clear_in_flight_streams() {}
+
 // ── Callback implementations ─────────────────────────────────────────────
 
+/// Build the C-borrowed request backing storage from an owned job, consuming
+/// its body into a [`BodyReader`] (returned separately so the caller can stash
+/// it in [`BODY_READER`]). The `_body` `Vec` in the returned struct is empty
+/// for streaming requests — their bytes flow through `body_read`.
 #[cfg(php_linked)]
-fn build_current_request(job: &WorkerRequestOwned) -> CurrentRequest {
+fn build_current_request(job: WorkerRequestOwned) -> (CurrentRequest, BodyReader) {
     // Lossy on interior NULs (extremely rare in HTTP metadata) — replace with
     // an empty string rather than fail the request.
     let cstr = |s: &str| CString::new(s).unwrap_or_default();
@@ -262,13 +401,35 @@ fn build_current_request(job: &WorkerRequestOwned) -> CurrentRequest {
     let header_key_ptrs: Vec<*const c_char> = header_keys.iter().map(|c| c.as_ptr()).collect();
     let header_val_ptrs: Vec<*const c_char> = header_vals.iter().map(|c| c.as_ptr()).collect();
 
-    CurrentRequest {
+    let (body_vec, body_len, streaming, reader) = match job.body {
+        WorkerBody::Buffered(data) => {
+            let len = data.len();
+            // The C borrow reads from the CurrentRequest._body copy; the reader
+            // owns its own copy so read_post/bodyStream stay consistent.
+            let reader = if len == 0 {
+                BodyReader::Empty
+            } else {
+                BodyReader::Buffered { data: data.clone(), offset: 0 }
+            };
+            (data, len, false, reader)
+        }
+        WorkerBody::Streaming { rx, declared_len } => (
+            Vec::new(),
+            declared_len,
+            true,
+            BodyReader::Streaming { pending: bytes::Bytes::new(), rx },
+        ),
+    };
+
+    let current = CurrentRequest {
         _method: method,
         _uri: uri,
         _query: query,
         _cookie: cookie,
         _content_type: content_type,
-        _body: job.body.clone(),
+        _body: body_vec,
+        body_len,
+        streaming,
         _server_keys: server_keys,
         _server_vals: server_vals,
         _header_keys: header_keys,
@@ -277,7 +438,8 @@ fn build_current_request(job: &WorkerRequestOwned) -> CurrentRequest {
         server_val_ptrs,
         header_key_ptrs,
         header_val_ptrs,
-    }
+    };
+    (current, reader)
 }
 
 /// C-callable `take_request`: block for the next job, stash its sender, and
@@ -305,8 +467,13 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
     // Stash the sender for send_response / crash recovery.
     PENDING_SENDER.with(|cell| *cell.borrow_mut() = Some(job.respond_to));
 
-    // Build owned backing storage and publish the borrowed pointers.
-    let current = build_current_request(&job.request);
+    // Any stale streaming-response sender from a prior iteration is dropped
+    // here (closing its channel) so it can never bleed into this request.
+    RESPONSE_TX.with(|cell| *cell.borrow_mut() = None);
+
+    // Build owned backing storage + the body reader, and publish the pointers.
+    let (current, reader) = build_current_request(job.request);
+    BODY_READER.with(|cell| *cell.borrow_mut() = reader);
     CURRENT_REQUEST.with(|cell| *cell.borrow_mut() = Some(current));
 
     CURRENT_REQUEST.with(|cell| {
@@ -323,12 +490,13 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
             (*req).cookie_data = cur._cookie.as_ptr();
             (*req).content_type =
                 cur._content_type.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-            (*req).body = if cur._body.is_empty() {
+            (*req).body = if cur.streaming || cur._body.is_empty() {
                 std::ptr::null()
             } else {
                 cur._body.as_ptr().cast::<c_char>()
             };
-            (*req).body_len = cur._body.len();
+            (*req).body_len = cur.body_len;
+            (*req).body_streaming = c_int::from(cur.streaming);
             (*req).server_var_count = cur.server_key_ptrs.len();
             (*req).server_var_keys = cur.server_key_ptrs.as_ptr();
             (*req).server_var_vals = cur.server_val_ptrs.as_ptr();
@@ -366,7 +534,7 @@ unsafe extern "C" fn worker_send_response(
     let parsed_headers = parse_packed_headers(header_bytes);
 
     let status = u16::try_from(status).unwrap_or(200);
-    let response = WorkerResponse { status, headers: parsed_headers, body: body_bytes };
+    let response = WorkerResponse::Buffered { status, headers: parsed_headers, body: body_bytes };
 
     // Deliver to the parked receiver. If it was already taken (shouldn't happen
     // on the normal path) or the receiver dropped, the response is discarded.
@@ -374,11 +542,128 @@ unsafe extern "C" fn worker_send_response(
         let _ = sender.send(response);
     }
 
-    // Count this completed request toward the recycle quota.
-    REQUESTS_HANDLED.with(|c| c.set(c.get().saturating_add(1)));
+    finish_iteration();
+}
 
-    // Release the borrowed request backing storage.
+/// Common per-iteration teardown after a response is delivered (buffered or
+/// streaming): bump the recycle counter and release the borrowed request +
+/// body reader so nothing leaks into the next `take_request`.
+#[cfg(php_linked)]
+fn finish_iteration() {
+    REQUESTS_HANDLED.with(|c| c.set(c.get().saturating_add(1)));
     CURRENT_REQUEST.with(|cell| *cell.borrow_mut() = None);
+    BODY_READER.with(|cell| *cell.borrow_mut() = BodyReader::Empty);
+    // Dropping the streaming-response sender (if any) closes the body channel,
+    // signalling end-of-body to the hyper handler.
+    RESPONSE_TX.with(|cell| *cell.borrow_mut() = None);
+}
+
+/// C-callable `body_read`: fill `buf` (capacity `cap`) with the next bytes of
+/// the incremental request body. Returns bytes written, 0 on EOF, negative on
+/// error. Blocks on the streaming channel until data or EOF.
+#[cfg(php_linked)]
+unsafe extern "C" fn worker_body_read(buf: *mut c_char, cap: usize) -> isize {
+    if buf.is_null() || cap == 0 {
+        return 0;
+    }
+    // SAFETY: C guarantees `buf` points to at least `cap` writable bytes for
+    // the duration of this call. We only write `n <= cap` bytes into it.
+    let out = unsafe { std::slice::from_raw_parts_mut(buf.cast::<u8>(), cap) };
+
+    BODY_READER.with(|cell| {
+        let mut reader = cell.borrow_mut();
+        match &mut *reader {
+            BodyReader::Empty => 0,
+            BodyReader::Buffered { data, offset } => {
+                let remaining = data.len().saturating_sub(*offset);
+                if remaining == 0 {
+                    return 0;
+                }
+                let n = remaining.min(cap);
+                out[..n].copy_from_slice(&data[*offset..*offset + n]);
+                *offset += n;
+                isize::try_from(n).unwrap_or(isize::MAX)
+            }
+            BodyReader::Streaming { pending, rx } => {
+                // Refill from the channel when the leftover partial chunk is
+                // empty. blocking_recv() blocks until a chunk arrives or the
+                // sender closes (EOF). This is the hyper->worker backpressure
+                // point (the worker is a plain OS thread, so blocking_recv is
+                // valid).
+                if pending.is_empty() {
+                    match rx.blocking_recv() {
+                        Some(chunk) => *pending = chunk,
+                        None => return 0, // sender closed => clean EOF
+                    }
+                }
+                let n = pending.len().min(cap);
+                out[..n].copy_from_slice(&pending[..n]);
+                // Advance past the copied bytes without reallocating.
+                let _ = pending.split_to(n);
+                isize::try_from(n).unwrap_or(isize::MAX)
+            }
+        }
+    })
+}
+
+/// C-callable `response_begin`: open a streaming response. Builds a bounded
+/// chunk channel, sends the [`WorkerResponse::Streaming`] header to the parked
+/// oneshot immediately (so hyper can start the response), and stashes the
+/// sender for the `response_chunk` calls that follow.
+#[cfg(php_linked)]
+unsafe extern "C" fn worker_response_begin(
+    status: c_int,
+    headers: *const c_char,
+    headers_len: usize,
+) {
+    // SAFETY: C passes a valid (ptr, len) for the packed headers; null => none.
+    let header_bytes: &[u8] = if headers.is_null() || headers_len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(headers.cast::<u8>(), headers_len) }
+    };
+    let parsed_headers = parse_packed_headers(header_bytes);
+    let status = u16::try_from(status).unwrap_or(200);
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(BODY_CHANNEL_DEPTH);
+    RESPONSE_TX.with(|cell| *cell.borrow_mut() = Some(tx));
+
+    if let Some(sender) = PENDING_SENDER.with(|cell| cell.borrow_mut().take()) {
+        let _ =
+            sender.send(WorkerResponse::Streaming { status, headers: parsed_headers, body_rx: rx });
+    }
+}
+
+/// C-callable `response_chunk`: push one body chunk. Blocks on the bounded
+/// channel (download backpressure). Returns 0, or -1 if the receiver is gone.
+#[cfg(php_linked)]
+unsafe extern "C" fn worker_response_chunk(buf: *const c_char, len: usize) -> isize {
+    if buf.is_null() || len == 0 {
+        return 0;
+    }
+    // SAFETY: C passes a valid (ptr, len) for the chunk, live for this call.
+    let chunk = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) };
+    let bytes = bytes::Bytes::copy_from_slice(chunk);
+
+    RESPONSE_TX.with(|cell| {
+        let borrow = cell.borrow();
+        match borrow.as_ref() {
+            // blocking_send on a plain OS worker thread: blocks on backpressure
+            // (bounded channel), errors only if the receiver dropped.
+            Some(tx) => match tx.blocking_send(bytes) {
+                Ok(()) => 0,
+                Err(_) => -1, // receiver dropped (client gone)
+            },
+            None => -1,
+        }
+    })
+}
+
+/// C-callable `response_end`: finish the streaming response and complete the
+/// iteration. Dropping the sender closes the channel (end-of-body).
+#[cfg(php_linked)]
+unsafe extern "C" fn worker_response_end() {
+    finish_iteration();
 }
 
 /// Parse `"Name: Value\n"` packed header lines into `(name, value)` pairs.
@@ -404,6 +689,10 @@ fn parse_packed_headers(bytes: &[u8]) -> Vec<(String, String)> {
 pub static WORKER_OPS: EphpmWorkerOps = EphpmWorkerOps {
     take_request: Some(worker_take_request),
     send_response: Some(worker_send_response),
+    body_read: Some(worker_body_read),
+    response_begin: Some(worker_response_begin),
+    response_chunk: Some(worker_response_chunk),
+    response_end: Some(worker_response_end),
 };
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -430,8 +719,12 @@ mod tests {
 
     #[test]
     fn internal_error_is_500() {
-        let e = WorkerResponse::internal_error();
-        assert_eq!(e.status, 500);
-        assert_eq!(e.body, b"Internal Server Error");
+        match WorkerResponse::internal_error() {
+            WorkerResponse::Buffered { status, body, .. } => {
+                assert_eq!(status, 500);
+                assert_eq!(body, b"Internal Server Error");
+            }
+            WorkerResponse::Streaming { .. } => panic!("internal_error must be buffered"),
+        }
     }
 }

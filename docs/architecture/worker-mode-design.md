@@ -157,6 +157,12 @@ place (Rust), which is cleaner for the crash-recovery accounting in §5.
   `router.rs:1132-1187`). Phase 1 is a single copy each way; **zero-copy body
   streaming is Phase 3** (§9), where `bodyStream()` becomes a real
   `php://` stream backed by the incremental hyper body reader.
+  **Phase 3 (implemented):** the ops table gained `body_read` (request stream)
+  and `response_begin`/`response_chunk`/`response_end` (response stream);
+  `WorkerBody`/`WorkerResponse` became buffered-or-streaming enums; large
+  request bodies stream in via a bounded channel the worker `blocking_recv`s,
+  and `send_response_stream()` streams the response out via a bounded channel
+  bridged to a hyper `StreamBody`. See the roadmap's "Phase 3 engine status".
 - **The output-buffer path still exists.** A framework that `echo`s instead of
   returning a body still works: `ub_write` (`ephpm_wrapper.c:234-248`) captures
   it into the thread-local `output_buf`, and `send_response` with an empty

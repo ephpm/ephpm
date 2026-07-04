@@ -17,6 +17,9 @@ http.workspace = true
 # speaks both send().await and recv_blocking()) plus oneshot response return.
 async-channel.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+# Phase 3 streaming bodies: zero-copy chunk buffers across the hyper<->worker
+# bounded channels.
+bytes.workspace = true
 
 [build-dependencies]
 bindgen = "0.72"

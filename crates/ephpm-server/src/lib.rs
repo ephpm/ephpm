@@ -235,6 +235,12 @@ async fn bind_listeners(
 
         ephpm_php::PhpRuntime::install_worker_ops(config.php.worker_populate_superglobals);
 
+        tracing::info!(
+            worker_stream_threshold = config.php.worker_stream_threshold,
+            "worker mode: request bodies at/above worker_stream_threshold stream \
+             into the worker (flat memory); smaller bodies buffer"
+        );
+
         let pool = worker_pool::WorkerPool::spawn(
             script,
             worker_count,
@@ -244,6 +250,15 @@ async fn bind_listeners(
         );
         Some(pool)
     } else {
+        // add-config-knob: worker_stream_threshold is worker-mode-only. Warn if
+        // an fpm-mode operator set it to a non-default, so it is never a silent
+        // no-op.
+        if config.php.worker_stream_threshold != 1024 * 1024 {
+            tracing::warn!(
+                "[php] worker_stream_threshold is ignored in fpm mode (it only \
+                 governs worker-mode request-body streaming)"
+            );
+        }
         None
     };
 
