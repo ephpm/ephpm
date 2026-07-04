@@ -105,6 +105,9 @@ pub struct Router {
     /// When set, PHP requests are dispatched to the pool instead of running on
     /// the `spawn_blocking` path.
     worker_pool: Option<Arc<crate::worker_pool::WorkerPool>>,
+    /// Request-body size (bytes) at/above which worker mode streams the body
+    /// instead of buffering it (Phase 3). See `[php] worker_stream_threshold`.
+    worker_stream_threshold: u64,
 }
 
 /// Scan `sites_dir` for virtual host subdirectories.
@@ -265,6 +268,7 @@ impl Router {
             db_env_vars: build_db_env_vars(config),
             php_semaphore,
             worker_pool,
+            worker_stream_threshold: config.php.worker_stream_threshold,
         }
     }
 
@@ -735,20 +739,41 @@ impl Router {
             return resp;
         }
 
-        let body = match req.collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(_) => Vec::new(),
-        };
-        #[allow(clippy::cast_precision_loss)]
-        histogram!("ephpm_http_request_body_bytes", "method" => method.clone())
-            .record(body.len() as f64);
-
         let server_port = self.server_port;
+
+        // Content-Length (if declared) drives the worker-mode buffer-vs-stream
+        // decision below.
+        let content_length: Option<u64> = req
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok());
 
         // Worker mode: dispatch to the persistent worker pool instead of the
         // spawn_blocking fpm path. The whole handler is already wrapped in the
         // outer request timeout, so a starved queue becomes a 504.
+        //
+        // Large / unknown-length bodies STREAM into the worker (Phase 3): the
+        // hyper `Incoming` body is read frame-by-frame by a task feeding a
+        // bounded channel the worker drains, so ePHPm never holds the whole
+        // body in memory. Small bodies keep the cheaper buffered path.
         if let Some(pool) = self.worker_pool.clone() {
+            let should_stream = self.worker_stream_threshold > 0
+                && content_length.is_none_or(|len| len >= self.worker_stream_threshold);
+
+            let worker_body = if should_stream {
+                stream_request_body(req, content_length)
+            } else {
+                let bytes = match req.collect().await {
+                    Ok(collected) => collected.to_bytes().to_vec(),
+                    Err(_) => Vec::new(),
+                };
+                #[allow(clippy::cast_precision_loss)]
+                histogram!("ephpm_http_request_body_bytes", "method" => method.clone())
+                    .record(bytes.len() as f64);
+                ephpm_php::worker_bridge::WorkerBody::Buffered(bytes)
+            };
+
             return self
                 .handle_php_worker(
                     &pool,
@@ -759,7 +784,7 @@ impl Router {
                     &script_filename,
                     document_root,
                     headers,
-                    body,
+                    worker_body,
                     content_type,
                     remote_addr,
                     server_name,
@@ -771,6 +796,14 @@ impl Router {
                 )
                 .await;
         }
+
+        let body = match req.collect().await {
+            Ok(collected) => collected.to_bytes().to_vec(),
+            Err(_) => Vec::new(),
+        };
+        #[allow(clippy::cast_precision_loss)]
+        histogram!("ephpm_http_request_body_bytes", "method" => method.clone())
+            .record(body.len() as f64);
 
         let multi_tenant_kv = self.multi_tenant_kv.clone();
         let vhost_open_basedir = self.sites_dir.is_some() && self.open_basedir;
@@ -863,7 +896,7 @@ impl Router {
         script_filename: &Path,
         document_root: PathBuf,
         headers: Vec<(String, String)>,
-        body: Vec<u8>,
+        body: ephpm_php::worker_bridge::WorkerBody,
         content_type: Option<String>,
         remote_addr: SocketAddr,
         server_name: String,
@@ -874,7 +907,9 @@ impl Router {
         accepts_br: bool,
     ) -> Response<ServerBody> {
         // Reuse PhpRequest's $_SERVER / cookie derivation so worker mode and
-        // fpm mode present PHP with identical request metadata.
+        // fpm mode present PHP with identical request metadata. The body is not
+        // used by server_variables()/cookie_string(), so pass an empty one —
+        // the real (possibly streaming) body travels in `owned.body`.
         let mut env_vars = self.build_kv_env_vars(&server_name);
         env_vars.extend_from_slice(&self.db_env_vars);
 
@@ -886,7 +921,7 @@ impl Router {
             script_filename: script_filename.to_path_buf(),
             document_root,
             headers: headers.clone(),
-            body: body.clone(),
+            body: Vec::new(),
             content_type: content_type.clone(),
             remote_addr,
             server_name,
@@ -923,22 +958,28 @@ impl Router {
         // Bound the wait so a wedged worker becomes a 504 AND signals the pool
         // to replace it (design §5.4). This inner timeout fires at or before
         // the outer request timeout.
+        //
+        // NOTE: for a streaming response this awaits only the HEADERS (the
+        // `send_response_stream` -> response_begin delivers status+headers
+        // immediately, before the body is produced), so a long streamed
+        // download is NOT cut off by this timeout — the body flows afterward.
         let awaited = tokio::time::timeout(self.request_timeout, rx).await;
         gauge!("ephpm_worker_busy").decrement(1.0);
 
-        let result: Result<
-            Result<ephpm_php::response::PhpResponse, ephpm_php::PhpError>,
-            tokio::task::JoinError,
-        > = match awaited {
-            Ok(Ok(worker_resp)) => Ok(Ok(ephpm_php::response::PhpResponse {
-                status: worker_resp.status,
-                headers: worker_resp.headers,
-                body: worker_resp.body,
-            })),
+        let worker_resp = match awaited {
+            Ok(Ok(resp)) => resp,
             // Sender dropped (worker unwound with no stashed sender) — 500.
-            Ok(Err(_)) => Ok(Err(ephpm_php::PhpError::ExecutionFailed(
-                "worker dropped response (bailout)".into(),
-            ))),
+            Ok(Err(_)) => {
+                counter!("ephpm_php_executions_total", "status" => "error").increment(1);
+                return build_php_response(
+                    Ok(Err(ephpm_php::PhpError::ExecutionFailed(
+                        "worker dropped response (bailout)".into(),
+                    ))),
+                    accepts_gzip,
+                    accepts_br,
+                    self.compression,
+                );
+            }
             // Worker never responded in time — replace it, return 504.
             Err(_) => {
                 pool.note_hung();
@@ -949,13 +990,24 @@ impl Router {
 
         let php_elapsed = php_start.elapsed().as_secs_f64();
         histogram!("ephpm_php_execution_duration_seconds").record(php_elapsed);
-        let exec_status = match &result {
-            Ok(Ok(_)) => "ok",
-            Ok(Err(_)) | Err(_) => "error",
-        };
-        counter!("ephpm_php_executions_total", "status" => exec_status).increment(1);
+        counter!("ephpm_php_executions_total", "status" => "ok").increment(1);
 
-        build_php_response(result, accepts_gzip, accepts_br, self.compression)
+        match worker_resp {
+            ephpm_php::worker_bridge::WorkerResponse::Buffered { status, headers, body } => {
+                build_php_response(
+                    Ok(Ok(ephpm_php::response::PhpResponse { status, headers, body })),
+                    accepts_gzip,
+                    accepts_br,
+                    self.compression,
+                )
+            }
+            // Streamed response (Phase 3): flush chunks to the client as PHP
+            // produces them. No compression (would require buffering) and no
+            // content-length (unknown up front) — chunked transfer.
+            ephpm_php::worker_bridge::WorkerResponse::Streaming { status, headers, body_rx } => {
+                build_streamed_worker_response(status, headers, body_rx)
+            }
+        }
     }
 
     /// Return 413 if Content-Length exceeds the limit.
@@ -1312,6 +1364,80 @@ fn error_response(status: StatusCode, body: &str) -> Response<ServerBody> {
 /// Build an HTTP response from a PHP execution result, optionally compressing.
 ///
 /// Prefers Brotli (`br`) over gzip when the client supports it.
+/// Stream a hyper request body into a [`WorkerBody::Streaming`] (Phase 3).
+///
+/// Spawns a task that reads the `Incoming` body frame-by-frame and forwards
+/// each data frame into a bounded channel the worker drains via `body_read`.
+/// The bounded channel is the backpressure point: a slow PHP reader stalls the
+/// hyper read, so ePHPm never buffers more than a few chunks regardless of the
+/// upload size. The task ends (closing the channel = EOF) on the last frame, a
+/// read error, or when the worker drops the receiver (request done early).
+fn stream_request_body(
+    req: Request<Incoming>,
+    content_length: Option<u64>,
+) -> ephpm_php::worker_bridge::WorkerBody {
+    use http_body_util::BodyExt;
+
+    let (tx, rx) =
+        tokio::sync::mpsc::channel::<Bytes>(ephpm_php::worker_bridge::BODY_CHANNEL_DEPTH);
+    let mut body = req.into_body();
+
+    tokio::spawn(async move {
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        if data.is_empty() {
+                            continue;
+                        }
+                        // send().await suspends when the channel is full,
+                        // applying backpressure without blocking a thread. Err
+                        // means the worker finished/dropped the receiver.
+                        if tx.send(data).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Non-data frames (trailers) are ignored for the body.
+                }
+                Some(Err(e)) => {
+                    tracing::debug!(%e, "request body stream error — ending body");
+                    break;
+                }
+                None => break, // clean EOF
+            }
+        }
+        // Dropping `tx` here closes the channel => worker sees EOF.
+    });
+
+    // `content_length` is advisory (declared length); 0 for chunked/unknown.
+    let declared_len = usize::try_from(content_length.unwrap_or(0)).unwrap_or(usize::MAX);
+    ephpm_php::worker_bridge::WorkerBody::Streaming { rx, declared_len }
+}
+
+/// Build a chunked, streamed HTTP response from a worker-mode streaming
+/// response (Phase 3). Status + headers are known now; the body flows from the
+/// channel as PHP produces it. No compression / content-length (the length is
+/// unknown up front) — hyper uses chunked transfer encoding.
+fn build_streamed_worker_response(
+    status: u16,
+    headers: Vec<(String, String)>,
+    body_rx: tokio::sync::mpsc::Receiver<Bytes>,
+) -> Response<ServerBody> {
+    let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
+    let mut resp = Response::builder().status(status);
+    for (name, value) in &headers {
+        // Skip content-length: the streamed length is not known in advance, and
+        // a stale/incorrect one would corrupt framing.
+        if name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        resp = resp.header(name.as_str(), value.as_str());
+    }
+    resp.body(body::channel_body(body_rx)).unwrap_or_else(|_| {
+        error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
+    })
+}
+
 fn build_php_response(
     result: Result<
         Result<ephpm_php::response::PhpResponse, ephpm_php::PhpError>,

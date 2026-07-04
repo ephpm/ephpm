@@ -38,6 +38,7 @@ static char *ephpm_strtok_r(char *str, const char *delim, char **saveptr) {
 #include "main/SAPI.h"
 #include "main/php_main.h"
 #include "main/php_variables.h"
+#include "main/php_streams.h"
 #include "Zend/zend.h"
 #include "Zend/zend_ini.h"
 #include "Zend/zend_stream.h"
@@ -160,10 +161,22 @@ static EPHPM_TLS size_t req_post_data_len = 0;
 static EPHPM_TLS size_t req_post_data_offset = 0;
 static EPHPM_TLS const char *req_path_translated = NULL;
 
+/* Worker mode: when set, this thread's request body is streamed from Rust via
+ * g_worker_ops.body_read rather than served from the in-memory req_post_data
+ * buffer. read_post and the bodyStream() php_stream both pull from the same
+ * incremental reader, so the body is consumed exactly once (whichever reads
+ * first wins — see the Envelope docs). Reset per iteration. */
+static EPHPM_TLS int req_body_streaming = 0;
+
 /* Non-NULL sentinel for SG(server_context). sapi_activate() only parses the
  * POST body when server_context is set; the value itself is never dereferenced
  * by our SAPI, so a single shared marker address suffices. */
 static int ephpm_server_context_marker = 0;
+
+/* Pull the next chunk of a streaming worker-mode request body (defined with
+ * the worker-mode block below, but used by the read_post SAPI callback above
+ * it). Returns bytes written into buf (0 = EOF, negative = error). */
+static long ephpm_worker_body_read(char *buf, size_t cap);
 
 /* Server variables */
 
@@ -273,6 +286,19 @@ static int ephpm_sapi_send_headers(sapi_headers_struct *sapi_headers)
  */
 static size_t ephpm_sapi_read_post(char *buffer, size_t count_bytes)
 {
+    /* Worker mode streaming: pull incrementally from Rust so PHP's own POST
+     * reader (which drives $_POST / multipart parsing) never forces the whole
+     * body into memory. read_post and bodyStream() share this reader, so the
+     * body is consumed exactly once. */
+    if (req_body_streaming) {
+        long n = ephpm_worker_body_read(buffer, count_bytes);
+        if (n <= 0) {
+            return 0;
+        }
+        req_post_data_offset += (size_t)n;
+        return (size_t)n;
+    }
+
     if (!req_post_data || req_post_data_offset >= req_post_data_len)
         return 0;
 
@@ -965,6 +991,9 @@ typedef struct {
     const char *content_type;     /* may be NULL */
     const char *body;             /* raw request body (may be NULL) */
     size_t      body_len;
+    /* Phase 3: when non-zero, the body is streamed via g_worker_ops.body_read
+     * (body/body_len are unset). When zero, the whole body is in `body`. */
+    int         body_streaming;
 
     size_t      server_var_count;
     const char *const *server_var_keys;
@@ -985,6 +1014,28 @@ typedef struct {
     void (*send_response)(int status,
                           const char *headers, size_t headers_len,
                           const char *body, size_t body_len);
+
+    /* ── Phase 3: streaming bodies ──────────────────────────────────
+     * Streaming request read (design §9). Pull up to `cap` bytes of the
+     * incremental request body into `buf`. Returns the number of bytes
+     * written (0 = clean EOF, negative = error). Blocks until at least one
+     * byte is available or EOF. Backed by a bounded channel the hyper task
+     * feeds; the worker thread blocks here. When the request was dispatched
+     * fully-buffered (no streaming reader), this serves from the in-memory
+     * body so the same read path works both ways. */
+    long (*body_read)(char *buf, size_t cap);
+
+    /* Begin a streaming response: status + packed headers, no body yet. The
+     * hyper handler builds a streamed response body from the chunks that
+     * follow. */
+    void (*response_begin)(int status,
+                           const char *headers, size_t headers_len);
+    /* Push one response body chunk. Blocks on backpressure (bounded channel).
+     * Returns 0 on success, negative if the client/receiver went away (the
+     * worker should stop producing). */
+    long (*response_chunk)(const char *buf, size_t len);
+    /* Finish the streaming response (close the body channel). */
+    void (*response_end)(void);
 } EphpmWorkerOps;
 
 static EphpmWorkerOps g_worker_ops = {0};
@@ -1027,10 +1078,76 @@ void ephpm_worker_reset_request(void)
     /* Per-iteration fatal detection (:844). */
     PG(last_error_type) = 0;
 
-    /* Per-iteration POST cursor. */
+    /* Per-iteration POST cursor + streaming flag. */
     req_post_data_offset = 0;
+    req_body_streaming = 0;
 
     response_status_code = 200;
+}
+
+/* Pull the next chunk of a streaming request body from Rust. Serves both the
+ * read_post SAPI callback ($_POST/multipart) and the bodyStream() php_stream,
+ * so the incremental body is consumed exactly once regardless of which the
+ * framework reaches for. Blocks until data is available or EOF. */
+static long ephpm_worker_body_read(char *buf, size_t cap)
+{
+    if (!g_worker_ops.body_read || cap == 0) {
+        return 0;
+    }
+    return g_worker_ops.body_read(buf, cap);
+}
+
+/* ── bodyStream(): a real readable php:// stream over the incremental body ──
+ * A php_stream whose read op pulls from ephpm_worker_body_read (backed by the
+ * bounded hyper->worker channel). Non-seekable, read-only, no writes. This is
+ * the Phase-3 zero-prebuffer request path: a multi-GB upload flows through in
+ * fixed-size reads with flat worker memory. */
+static ssize_t ephpm_body_stream_read(php_stream *stream, char *buf, size_t count)
+{
+    (void)stream;
+    long n = ephpm_worker_body_read(buf, count);
+    if (n < 0) {
+        return -1;
+    }
+    if (n == 0) {
+        stream->eof = 1;
+        return 0;
+    }
+    return (ssize_t)n;
+}
+
+static int ephpm_body_stream_close(php_stream *stream, int close_handle)
+{
+    (void)stream;
+    (void)close_handle;
+    /* Nothing owned on the C side — the Rust reader is freed when the worker
+     * finishes the request (send_response / next take_request). */
+    return 0;
+}
+
+static int ephpm_body_stream_flush(php_stream *stream)
+{
+    (void)stream;
+    return 0;
+}
+
+static const php_stream_ops ephpm_body_stream_ops = {
+    NULL,                        /* write (read-only) */
+    ephpm_body_stream_read,      /* read */
+    ephpm_body_stream_close,     /* close */
+    ephpm_body_stream_flush,     /* flush */
+    "ephpm-request-body",        /* label */
+    NULL,                        /* seek (non-seekable) */
+    NULL,                        /* cast */
+    NULL,                        /* stat */
+    NULL                         /* set_option */
+};
+
+/* Build a php_stream reading the incremental request body. */
+static php_stream *ephpm_worker_open_body_stream(void)
+{
+    php_stream *stream = php_stream_alloc(&ephpm_body_stream_ops, NULL, NULL, "rb");
+    return stream;
 }
 
 /* Build a PHP array of (key => value) string pairs from a packed C list. */
@@ -1145,12 +1262,18 @@ PHP_FUNCTION(ephpm_worker_take_request)
     req_post_data = req.body;
     req_post_data_len = req.body_len;
     req_post_data_offset = 0;
+    /* Phase 3: route read_post / bodyStream() through the incremental Rust
+     * reader when the request was dispatched streaming (large upload). */
+    req_body_streaming = req.body_streaming ? 1 : 0;
 
     SG(request_info).request_method = (char *)req.method;
     SG(request_info).request_uri = (char *)req.uri;
     SG(request_info).query_string = (char *)req.query_string;
     SG(request_info).content_type = req.content_type;
     SG(request_info).cookie_data = (char *)req.cookie_data;
+    /* For streaming requests body_len carries the declared Content-Length (so
+     * PHP's post reader knows how much to expect); the bytes arrive via
+     * body_read. For buffered requests it is the actual body length. */
     SG(request_info).content_length = (zend_long)req.body_len;
 
     /* Optionally rebuild native superglobals through the normal, quiescent
@@ -1189,7 +1312,21 @@ PHP_FUNCTION(ephpm_worker_take_request)
     ephpm_worker_parse_query(&tmp, req.query_string);
     ephpm_worker_set_prop_array(return_value, "query", &tmp);
 
-    ephpm_worker_set_prop_stringl(return_value, "rawBody", req.body, req.body_len);
+    /* Body. Buffered request: store the whole body string (Phase-1 back-compat;
+     * rawBody() and bodyStream() both serve from it). Streaming request: store
+     * an empty rawBody and a "streaming" marker — bodyStream() opens a real
+     * php:// stream over the incremental reader, and rawBody() reads that
+     * stream to a string on demand (which re-buffers; adapters that care about
+     * memory use bodyStream()). */
+    ZEND_ASSERT(ephpm_worker_envelope_ce != NULL);
+    zend_update_property_bool(ephpm_worker_envelope_ce, Z_OBJ_P(return_value),
+                              "streaming", strlen("streaming"),
+                              req.body_streaming ? 1 : 0);
+    if (req.body_streaming) {
+        ephpm_worker_set_prop_stringl(return_value, "rawBody", "", 0);
+    } else {
+        ephpm_worker_set_prop_stringl(return_value, "rawBody", req.body, req.body_len);
+    }
 }
 
 /* PHP_FUNCTION: \Ephpm\Worker\send_response(int, array, string): void
@@ -1255,6 +1392,95 @@ PHP_FUNCTION(ephpm_worker_send_response)
     output_len = 0;
 }
 
+/* Pack a PHP headers array into "Name: Value\n" lines. Caller frees the
+ * returned smart_str with smart_str_free. */
+static void ephpm_worker_pack_headers(smart_str *out, zval *headers_arr)
+{
+    zend_string *hkey;
+    zval *hval;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(headers_arr), hkey, hval) {
+        if (!hkey) {
+            continue; /* skip numeric keys */
+        }
+        zend_string *vstr = zval_get_string(hval);
+        smart_str_appendl(out, ZSTR_VAL(hkey), ZSTR_LEN(hkey));
+        smart_str_appendl(out, ": ", 2);
+        smart_str_appendl(out, ZSTR_VAL(vstr), ZSTR_LEN(vstr));
+        smart_str_appendc(out, '\n');
+        zend_string_release(vstr);
+    } ZEND_HASH_FOREACH_END();
+    smart_str_0(out);
+}
+
+/* PHP_FUNCTION: \Ephpm\Worker\send_response_stream(int $status, array $headers,
+ *                                                  $bodyResource): void
+ *
+ * Phase-3 streaming response. Rather than handing back a full body string, the
+ * framework passes a readable stream/resource; we pump it to the HTTP layer in
+ * fixed-size chunks so bytes reach the client before PHP has produced them all
+ * (flat worker memory for multi-GB downloads).
+ *
+ * Any captured echo output (ub_write) is flushed as the first chunk so the
+ * echo path still works. Backpressure: response_chunk blocks on the bounded
+ * hyper channel; if the client goes away it returns negative and we stop. */
+PHP_FUNCTION(ephpm_worker_send_response_stream)
+{
+    zend_long status;
+    zval *headers_arr;
+    zval *body_res;
+
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_LONG(status)
+        Z_PARAM_ARRAY(headers_arr)
+        Z_PARAM_RESOURCE(body_res)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_worker_ops.response_begin || !g_worker_ops.response_chunk ||
+        !g_worker_ops.response_end) {
+        /* Streaming ops not installed — nothing we can do; drop the request so
+         * the parked oneshot resolves via the supervisor's 500 net. */
+        return;
+    }
+
+    php_stream *stream;
+    php_stream_from_zval_no_verify(stream, body_res);
+    if (!stream) {
+        return;
+    }
+
+    smart_str hbuf = {0};
+    ephpm_worker_pack_headers(&hbuf, headers_arr);
+    const char *hdr_ptr = hbuf.s ? ZSTR_VAL(hbuf.s) : "";
+    size_t hdr_len = hbuf.s ? ZSTR_LEN(hbuf.s) : 0;
+
+    g_worker_ops.response_begin((int)status, hdr_ptr, hdr_len);
+    smart_str_free(&hbuf);
+
+    /* Flush any buffered echo output first. */
+    if (output_len > 0) {
+        (void)g_worker_ops.response_chunk(output_buf, output_len);
+        output_len = 0;
+    }
+
+    /* Pump the stream to the client in fixed-size chunks. */
+    char chunk[65536];
+    for (;;) {
+        ssize_t n = php_stream_read(stream, chunk, sizeof(chunk));
+        if (n <= 0) {
+            break;
+        }
+        if (g_worker_ops.response_chunk(chunk, (size_t)n) < 0) {
+            /* Receiver/client gone — stop producing. */
+            break;
+        }
+    }
+
+    g_worker_ops.response_end();
+
+    /* Release the borrowed request backing storage (the Rust send_response
+     * path does this too, but response_end delivers via a different channel). */
+}
+
 /* ── Envelope methods ─────────────────────────────────────────────
  * Each returns the property populated by take_request. Framework-neutral;
  * adapters build their own Request from these. */
@@ -1272,11 +1498,74 @@ PHP_METHOD(Ephpm_Worker_Envelope, serverVars)  { ephpm_worker_return_prop(INTERN
 PHP_METHOD(Ephpm_Worker_Envelope, headers)     { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "headers"); }
 PHP_METHOD(Ephpm_Worker_Envelope, cookies)     { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "cookies"); }
 PHP_METHOD(Ephpm_Worker_Envelope, query)       { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "query"); }
-PHP_METHOD(Ephpm_Worker_Envelope, rawBody)     { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "rawBody"); }
-PHP_METHOD(Ephpm_Worker_Envelope, bodyStream)  { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "rawBody"); }
+
+/* Whether this envelope's body is streamed (Phase 3) rather than buffered. */
+static int ephpm_worker_envelope_is_streaming(zval *this_obj)
+{
+    zval rv;
+    zval *prop = zend_read_property(ephpm_worker_envelope_ce, Z_OBJ_P(this_obj),
+                                    "streaming", strlen("streaming"), 1, &rv);
+    return prop && zend_is_true(prop);
+}
+
+/* rawBody(): string — php://input equivalent.
+ *
+ * Buffered request: returns the stored body string (Phase-1 behavior).
+ * Streaming request: drains the incremental reader into a string. This
+ * re-buffers the whole body, defeating the streaming memory win — it exists
+ * only for back-compat (a framework that insists on the raw string). Adapters
+ * that care about memory use bodyStream() instead. Consuming the body once is
+ * shared with bodyStream()/read_post, so calling both is a foot-gun. */
+PHP_METHOD(Ephpm_Worker_Envelope, rawBody)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    if (!ephpm_worker_envelope_is_streaming(ZEND_THIS)) {
+        ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "rawBody");
+        return;
+    }
+
+    /* Drain the streaming reader into a smart_str. */
+    smart_str buf = {0};
+    char chunk[65536];
+    for (;;) {
+        long n = ephpm_worker_body_read(chunk, sizeof(chunk));
+        if (n <= 0) {
+            break;
+        }
+        smart_str_appendl(&buf, chunk, (size_t)n);
+    }
+    smart_str_0(&buf);
+    if (buf.s) {
+        RETVAL_STR(buf.s);          /* transfers ownership */
+    } else {
+        RETVAL_EMPTY_STRING();
+    }
+}
+
+/* bodyStream(): resource — a real readable php:// stream over the incremental
+ * request body (Phase 3). Reading it pulls fixed-size chunks from Rust without
+ * pre-buffering, so a multi-GB upload flows through with flat worker memory.
+ * For buffered requests it still works (reads from the in-memory body). */
+PHP_METHOD(Ephpm_Worker_Envelope, bodyStream)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    php_stream *stream = ephpm_worker_open_body_stream();
+    if (!stream) {
+        RETURN_FALSE;
+    }
+    php_stream_to_zval(stream, return_value);
+}
 
 /* parsedBody(): ?array — Phase 1 returns null (form/multipart parsing is a
- * framework/adapter concern; streaming bodies are Phase 3). */
+ * framework/adapter concern). Adapters that want native $_POST/$_FILES enable
+ * worker.populate_superglobals, which drives PHP's own POST reader through the
+ * (streaming) read_post callback — so form/multipart parsing still works and,
+ * for large multipart uploads, PHP's rfc1867 handler spools file parts to
+ * temp files rather than into memory. Note: PHP's POST reader and bodyStream()
+ * share ONE incremental reader, so for a streaming request reading the body
+ * both ways drains it once — pick one. */
 PHP_METHOD(Ephpm_Worker_Envelope, parsedBody)
 {
     ZEND_PARSE_PARAMETERS_NONE();
@@ -1301,6 +1590,12 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_worker_send_response, 0, 0, 3)
     ZEND_ARG_INFO(0, body)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_worker_send_response_stream, 0, 0, 3)
+    ZEND_ARG_INFO(0, status)
+    ZEND_ARG_INFO(0, headers)
+    ZEND_ARG_INFO(0, body)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_worker_envelope_noargs, 0, 0, 0)
 ZEND_END_ARG_INFO()
 
@@ -1314,6 +1609,9 @@ static const zend_function_entry ephpm_worker_functions[] = {
     ZEND_NS_NAMED_FE("Ephpm\\Worker", send_response,
                      ZEND_FN(ephpm_worker_send_response),
                      arginfo_ephpm_worker_send_response)
+    ZEND_NS_NAMED_FE("Ephpm\\Worker", send_response_stream,
+                     ZEND_FN(ephpm_worker_send_response_stream),
+                     arginfo_ephpm_worker_send_response_stream)
     PHP_FE_END
 };
 

@@ -24,6 +24,28 @@ frameworks (Laravel, Symfony, WordPress). ePHPm's real differentiator vs. a
 **3.0 = Phase 1 + Phase 2** (engine proven end-to-end by at least the PSR-15
 adapter against a real framework). Phases 3–5 are 3.x.
 
+### Phase 3 engine status (streaming bodies — the ephpm-repo half)
+
+The Rust/C engine for streaming bodies is **implemented** (the adapter
+Composer packages remain future work):
+
+- **Request streaming.** `Envelope::bodyStream()` returns a real readable
+  `php://` stream (a `php_stream` whose read op pulls from Rust). Large or
+  unknown-`Content-Length` request bodies (`[php] worker_stream_threshold`,
+  default 1 MiB) are fed frame-by-frame from hyper's `Incoming` body across a
+  bounded channel the worker `blocking_recv`s — so ePHPm never buffers the whole
+  body. `read_post` (PHP's `$_POST`/multipart reader) pulls from the same
+  incremental reader, so form parsing still works. `rawBody()` still returns the
+  full string (buffered fallback / back-compat).
+- **Response streaming.** New primitive
+  `\Ephpm\Worker\send_response_stream(int $status, array $headers, $bodyResource)`
+  pumps a PHP stream/resource to the client in fixed-size chunks over a bounded
+  channel bridged to a hyper `StreamBody`, so bytes flush before PHP finishes
+  producing them. The string form of `send_response` is unchanged.
+- **Backpressure** is the bounded channels in both directions; **longjmp
+  safety** holds because the only values live across a bailing PHP call are the
+  `oneshot::Sender` and the (bounded) chunk channel endpoints, all Drop-safe.
+
 ---
 
 ## Repos & packaging — "do we need repos for PSR-15?"

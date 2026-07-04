@@ -33,3 +33,16 @@ pub fn streamed(file: tokio::fs::File) -> ServerBody {
     let framed = stream.map(|result| result.map(Frame::data));
     StreamBody::new(framed).boxed()
 }
+
+/// Stream response-body chunks from a channel as a [`ServerBody`] (worker-mode
+/// streaming responses, Phase 3).
+///
+/// Each [`Bytes`] the worker produces via `send_response_stream` flows straight
+/// to the client as a data frame, so bytes reach the client before PHP has
+/// produced the whole body. The sender closing ends the body.
+#[must_use]
+pub fn channel_body(rx: tokio::sync::mpsc::Receiver<Bytes>) -> ServerBody {
+    let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .map(|chunk| Ok::<_, std::io::Error>(Frame::data(chunk)));
+    StreamBody::new(stream).boxed()
+}

@@ -281,8 +281,16 @@ fn worker_main(
                 let _ = sender.send(WorkerResponse::internal_error());
                 tracing::warn!(worker_id, "worker bailed out mid-request — 500 sent, recycling");
             } else {
-                tracing::warn!(worker_id, "worker bailed out between requests — recycling");
+                // No parked oneshot: the response was already begun (buffered
+                // send_response completed, or a streaming response's headers
+                // were already delivered). For a mid-stream bailout, closing
+                // the chunk channel below truncates the body without hanging.
+                tracing::warn!(worker_id, "worker bailed out between/after response — recycling");
             }
+            // Close any still-open streaming channels so a mid-download client
+            // sees EOF rather than hanging (the sender lives in the worker's
+            // thread-locals, which persist across the respawn loop).
+            ephpm_php::worker_bridge::clear_in_flight_streams();
             counter!("ephpm_worker_recycles_total", "reason" => "fatal").increment(1);
         }
         Err(e) => {
@@ -357,7 +365,7 @@ mod tests {
             query_string: String::new(),
             cookie_data: String::new(),
             content_type: None,
-            body: Vec::new(),
+            body: ephpm_php::worker_bridge::WorkerBody::Buffered(Vec::new()),
             server_vars: Vec::new(),
             headers: Vec::new(),
         };
@@ -372,7 +380,9 @@ mod tests {
 
     #[test]
     fn internal_error_response_is_500() {
-        let e = WorkerResponse::internal_error();
-        assert_eq!(e.status, 500);
+        match WorkerResponse::internal_error() {
+            WorkerResponse::Buffered { status, .. } => assert_eq!(status, 500),
+            WorkerResponse::Streaming { .. } => panic!("internal_error must be buffered"),
+        }
     }
 }

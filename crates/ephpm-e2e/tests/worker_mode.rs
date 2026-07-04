@@ -154,3 +154,39 @@ async fn requests_keep_succeeding_across_recycles() {
         assert!(body.contains("hello /r-"), "recycle-run body wrong at {i}: {body}");
     }
 }
+
+/// Streaming round-trip (Phase 3): upload a large body and get the same bytes
+/// back. Proves `Envelope::bodyStream()` + `send_response_stream()` move the
+/// body without the worker buffering it whole. Requires a worker docroot whose
+/// script echoes the streamed request body (e.g. `examples/worker/worker-stream.php`);
+/// opt in via `EPHPM_WORKER_STREAM_URL` (separate instance from the hello
+/// worker). Self-skips when unset.
+///
+/// Verifies correctness (byte-for-byte echo) here; the flat-memory property is
+/// checked out-of-band (worker RSS during a multi-hundred-MB upload) since a
+/// black-box HTTP test cannot observe worker memory.
+#[tokio::test]
+async fn streaming_upload_echoes_back_identically() {
+    let Some(base) = std::env::var("EPHPM_WORKER_STREAM_URL").ok().filter(|s| !s.is_empty())
+    else {
+        eprintln!("EPHPM_WORKER_STREAM_URL unset — skipping worker-mode streaming test");
+        return;
+    };
+
+    // A body comfortably above a small stream threshold, with a non-trivial
+    // pattern so a truncation or reorder is caught.
+    let payload: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/echo"))
+        .body(payload.clone())
+        .send()
+        .await
+        .expect("streaming upload failed");
+    assert_eq!(resp.status().as_u16(), 200, "streaming echo not 200");
+
+    let echoed = resp.bytes().await.expect("read echoed body").to_vec();
+    assert_eq!(echoed.len(), payload.len(), "echoed length differs from upload");
+    assert!(echoed == payload, "echoed body does not match the uploaded body");
+}

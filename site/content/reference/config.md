@@ -137,6 +137,7 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 | `worker_backlog` | usize | `0` (= `worker_count`) | Dispatch-queue depth. A full queue applies backpressure; a starved queue becomes a 504 via the request timeout. Worker mode only. |
 | `worker_boot_timeout` | u64 (sec) | `30` | Seconds a worker gets to boot and reach its first `take_request()`. Worker mode only. |
 | `worker_populate_superglobals` | bool | `false` | Populate native `$_GET`/`$_POST`/`$_SERVER`/... per request. Off for Octane/PSR-15 (they build their own request); on for the WordPress adapter. Worker mode only. |
+| `worker_stream_threshold` | u64 (bytes) | `1048576` (1 MiB) | Request-body size at/above which the body **streams** into the worker in fixed-size chunks instead of buffering whole (Phase 3). Requests with a `Content-Length` at/above this — or with no `Content-Length` (chunked) — flow through `Envelope::bodyStream()` / PHP's POST reader with flat worker memory (a multi-GB upload never materializes in RAM). Smaller bodies stay buffered. Worker mode only. |
 
 > **Worker mode is not supported with `[server] sites_dir`** (multi-tenant vhosting) in Phase 1 — config load hard-errors. Worker mode boots one framework per worker; per-host worker pools are a later phase.
 
