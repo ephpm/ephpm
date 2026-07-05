@@ -1770,6 +1770,13 @@ int ephpm_worker_run(const char *script)
 
     EG(bailout) = &__bailout;
     if (SETJMP(__bailout) == 0) {
+        /* Worker entrypoints are routinely composer bin proxies / CLI-style
+         * scripts with a "#!/usr/bin/env php" shebang. The CLI SAPI skips
+         * that line; without this flag the embed compiler treats it as output
+         * BEFORE the first statement — a fatal compile error for any script
+         * opening with a namespace/declare statement (composer proxies do). */
+        CG(skip_shebang) = 1;
+
         zend_file_handle file_handle;
         zend_stream_init_filename(&file_handle, script);
         php_execute_script(&file_handle);
