@@ -128,7 +128,7 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 | `max_execution_time` | u32 (sec) | `30` | PHP `max_execution_time` per request. |
 | `memory_limit` | string | `"128M"` | PHP `memory_limit`. |
 | `ini_file` | path | (none) | Custom `php.ini` loaded before `ini_overrides`. |
-| `ini_overrides` | array of `[string, string]` | `[]` | INI directives applied after `ini_file`. |
+| `ini_overrides` | array of `[string, string]` | `[]` | INI directives applied after `ini_file`. In worker mode, `log_errors=On` is seeded as a default before `ini_file`/`ini_overrides` (either can override it) so worker-script fatals reach the engine log — `display_errors` output is captured into a buffer that is discarded when no request is in flight. |
 | `workers` | usize | `0` (unlimited) | Max concurrent PHP executions (php-fpm `pm.max_children` semantics); excess requests queue. `0` = unlimited. **Ignored in worker mode** (startup logs a WARN if set). |
 | `mode` | string | `"fpm"` | Request-execution model. `"fpm"` = per-request startup/shutdown (default, unchanged). `"worker"` = persistent worker mode: boot the framework once per worker, loop over requests (Octane/RoadRunner model). |
 | `worker_script` | path | (none) | Worker-mode entrypoint, relative to `document_root`. **Required** when `mode = "worker"`; config load hard-errors if absent or not a file under `document_root`. |

@@ -516,13 +516,24 @@ fn run_with_config(config: ephpm_config::Config, verbose: u8) -> anyhow::Result<
     // along on the generated ini instead of the per-request ini hook.
     let vhost_disable_shell =
         config.server.sites_dir.is_some() && config.server.effective_disable_shell_exec();
-    let want_generated_ini = !config.php.ini_overrides.is_empty() || vhost_disable_shell;
+    // Always generate the ini in worker mode: log_errors must default On there
+    // (see below) or a worker script that dies during boot leaves no
+    // diagnostic anywhere — display_errors output is captured into a buffer
+    // that is discarded when no request is in flight.
+    let worker_mode = config.php.mode == "worker";
+    let want_generated_ini =
+        !config.php.ini_overrides.is_empty() || vhost_disable_shell || worker_mode;
 
     let (effective_ini_path, _generated_ini_guard): (Option<PathBuf>, Option<TempFileGuard>) =
         if want_generated_ini {
             use std::fmt::Write as _;
 
             let mut content = String::new();
+            // Server-sane default, before ini_file/ini_overrides so either can
+            // override it: fatals must reach the engine log ([PHP] lines).
+            if worker_mode {
+                content.push_str("log_errors=On\n");
+            }
             if let Some(base) = &config.php.ini_file {
                 let base_content = std::fs::read_to_string(base).with_context(|| {
                     format!("failed to read php.ini file at {}", base.display())
