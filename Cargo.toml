@@ -58,12 +58,14 @@ async-trait = "0.1"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 async-channel = "2"
+libloading = "0.8"
 
 # Internal crates
 ephpm-cluster = { path = "crates/ephpm-cluster" }
 ephpm-config = { path = "crates/ephpm-config" }
 ephpm-db = { path = "crates/ephpm-db" }
 ephpm-kv = { path = "crates/ephpm-kv" }
+ephpm-middleware = { path = "crates/ephpm-middleware" }
 ephpm-php = { path = "crates/ephpm-php" }
 ephpm-query-stats = { path = "crates/ephpm-query-stats" }
 ephpm-server = { path = "crates/ephpm-server" }

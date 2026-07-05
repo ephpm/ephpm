@@ -108,6 +108,9 @@ pub struct Router {
     /// Request-body size (bytes) at/above which worker mode streams the body
     /// instead of buffering it (Phase 3). See `[php] worker_stream_threshold`.
     worker_stream_threshold: u64,
+    /// Native middleware chain (`[[middleware]]`), evaluated on the PHP-bound
+    /// path before the request body is read. `None` = no middleware mounted.
+    middleware_chain: Option<Arc<crate::middleware::MiddlewareChain>>,
 }
 
 /// Scan `sites_dir` for virtual host subdirectories.
@@ -269,7 +272,20 @@ impl Router {
             php_semaphore,
             worker_pool,
             worker_stream_threshold: config.php.worker_stream_threshold,
+            middleware_chain: None,
         }
+    }
+
+    /// Attach the native middleware chain loaded in `serve()` at startup.
+    /// Kept out of `new()`'s signature so its many existing call sites (all
+    /// middleware-free) stay unchanged.
+    #[must_use]
+    pub fn with_middleware_chain(
+        mut self,
+        chain: Option<Arc<crate::middleware::MiddlewareChain>>,
+    ) -> Self {
+        self.middleware_chain = chain;
+        self
     }
 
     /// Resolve the site configuration from the `Host` header.
@@ -725,11 +741,11 @@ impl Router {
         document_root: PathBuf,
     ) -> Response<ServerBody> {
         let method = req.method().to_string();
-        let uri = req.uri().to_string();
-        let path = req.uri().path().to_string();
+        let mut uri = req.uri().to_string();
+        let mut path = req.uri().path().to_string();
         let query_string = req.uri().query().unwrap_or("").to_string();
         let protocol = format!("{:?}", req.version());
-        let headers = extract_headers(&req);
+        let mut headers = extract_headers(&req);
         let content_type =
             req.headers().get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
         let server_name = extract_server_name(&req);
@@ -740,6 +756,53 @@ impl Router {
         }
 
         let server_port = self.server_port;
+
+        // Native middleware chain — evaluated BEFORE any body bytes are read,
+        // so a RESPOND verdict (auth reject, rate limit, ...) never pays for
+        // the body transfer. v1: every module sees the original request;
+        // accumulated REWRITE overrides are applied here, after the chain.
+        // CONTINUE/REWRITE response headers are appended to whatever response
+        // this request ultimately produces (PHP output or an error page).
+        let mut mw_response_headers: Vec<(String, String)> = Vec::new();
+        if let Some(ref chain) = self.middleware_chain {
+            let ctx = ephpm_middleware::host::RequestCtx::new(
+                &method,
+                &path,
+                &query_string,
+                &remote_addr.ip().to_string(),
+                &server_name,
+                &headers,
+            );
+            match chain.evaluate(&ctx, &path) {
+                crate::middleware::ChainVerdict::Respond { status, body, headers } => {
+                    return middleware_response(status, body, &headers);
+                }
+                crate::middleware::ChainVerdict::Continue {
+                    rewrite_path,
+                    header_overrides,
+                    response_headers,
+                } => {
+                    mw_response_headers = response_headers;
+                    for (name, value) in header_overrides {
+                        override_header(&mut headers, name, value);
+                    }
+                    if let Some(new_path) = rewrite_path {
+                        // A path rewrite affects REQUEST_URI (and PATH) only —
+                        // documented v1 behavior. Script resolution already
+                        // happened in handle_inner, so the fpm path keeps
+                        // executing the originally resolved script. Worker
+                        // mode is fully rewritten: the booted framework routes
+                        // on REQUEST_URI, which we rebuild here.
+                        uri = if query_string.is_empty() {
+                            new_path.clone()
+                        } else {
+                            format!("{new_path}?{query_string}")
+                        };
+                        path = new_path;
+                    }
+                }
+            }
+        }
 
         // Content-Length (if declared) drives the worker-mode buffer-vs-stream
         // decision below.
@@ -774,9 +837,12 @@ impl Router {
                         Ok(collected) => collected.to_bytes().to_vec(),
                         Err(_) => {
                             counter!("ephpm_http_body_overflow_total").increment(1);
-                            return error_response(
-                                StatusCode::PAYLOAD_TOO_LARGE,
-                                "413 Payload Too Large",
+                            return apply_response_headers(
+                                error_response(
+                                    StatusCode::PAYLOAD_TOO_LARGE,
+                                    "413 Payload Too Large",
+                                ),
+                                &mw_response_headers,
                             );
                         }
                     }
@@ -820,10 +886,13 @@ impl Router {
             // have produced.
             if let Some(flag) = body_overflow {
                 if flag.load(std::sync::atomic::Ordering::Acquire) {
-                    return error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large");
+                    return apply_response_headers(
+                        error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large"),
+                        &mw_response_headers,
+                    );
                 }
             }
-            return resp;
+            return apply_response_headers(resp, &mw_response_headers);
         }
 
         // fpm path buffers the whole body; cap chunked / lying clients the same
@@ -834,7 +903,10 @@ impl Router {
                 Ok(collected) => collected.to_bytes().to_vec(),
                 Err(_) => {
                     counter!("ephpm_http_body_overflow_total").increment(1);
-                    return error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large");
+                    return apply_response_headers(
+                        error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large"),
+                        &mw_response_headers,
+                    );
                 }
             }
         } else {
@@ -917,7 +989,10 @@ impl Router {
         };
         counter!("ephpm_php_executions_total", "status" => exec_status).increment(1);
 
-        build_php_response(result, accepts_gzip, accepts_br, self.compression)
+        apply_response_headers(
+            build_php_response(result, accepts_gzip, accepts_br, self.compression),
+            &mw_response_headers,
+        )
     }
 
     /// Dispatch a PHP request to the persistent worker pool (worker mode).
@@ -1394,6 +1469,76 @@ fn db_env_from_url(listen: &str, backend_url: &str, driver: &str) -> Vec<(String
     ]
 }
 
+/// Build the HTTP response for a middleware `RESPOND` verdict.
+///
+/// Defaults `content-type` to `text/plain` when the module set none, and
+/// degrades to a plain 500 if the module produced an invalid status code or
+/// header (a native module is trusted but not infallible).
+fn middleware_response(
+    status: u16,
+    body: Vec<u8>,
+    headers: &[(String, String)],
+) -> Response<ServerBody> {
+    let Ok(status) = StatusCode::from_u16(status) else {
+        tracing::error!(status, "middleware RESPOND returned an invalid status — returning 500");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, "500 Internal Server Error");
+    };
+    let mut builder = Response::builder().status(status);
+    let mut has_content_type = false;
+    for (name, value) in headers {
+        has_content_type |= name.eq_ignore_ascii_case("content-type");
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    if !has_content_type {
+        builder = builder.header("content-type", "text/plain");
+    }
+    builder.body(body::buffered(Full::new(Bytes::from(body)))).unwrap_or_else(|e| {
+        tracing::error!(%e, "middleware RESPOND produced an invalid response — returning 500");
+        error_response(StatusCode::INTERNAL_SERVER_ERROR, "500 Internal Server Error")
+    })
+}
+
+/// Append middleware-supplied response headers (`ChainVerdict::Continue`) to
+/// the response this request produced. Appends rather than replaces so
+/// duplicates like `Set-Cookie` survive; entries that are not valid HTTP
+/// header names/values are skipped with a warning.
+fn apply_response_headers(
+    mut resp: Response<ServerBody>,
+    headers: &[(String, String)],
+) -> Response<ServerBody> {
+    for (name, value) in headers {
+        if let (Ok(name), Ok(value)) = (
+            hyper::header::HeaderName::from_bytes(name.as_bytes()),
+            hyper::header::HeaderValue::from_str(value),
+        ) {
+            resp.headers_mut().append(name, value);
+        } else {
+            tracing::warn!(header = %name, "middleware response header is not valid HTTP — skipped");
+        }
+    }
+    resp
+}
+
+/// Apply one middleware request-header override: replace the value
+/// case-insensitively when the header exists (removing any duplicate
+/// occurrences so the override wins outright), append otherwise.
+fn override_header(headers: &mut Vec<(String, String)>, name: String, value: String) {
+    let mut replaced = false;
+    headers.retain_mut(|(n, v)| {
+        if n.eq_ignore_ascii_case(&name) {
+            if replaced {
+                return false;
+            }
+            replaced = true;
+            v.clone_from(&value);
+        }
+        true
+    });
+    if !replaced {
+        headers.push((name, value));
+    }
+}
+
 /// Build a simple error response with a text body.
 fn error_response(status: StatusCode, body: &str) -> Response<ServerBody> {
     Response::builder()
@@ -1707,6 +1852,7 @@ mod tests {
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         Router::new(&config, test_store(), None, None, None, None)
     }
@@ -1724,6 +1870,7 @@ mod tests {
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         Router::new(&config, test_store(), None, None, None, None)
     }
@@ -1746,6 +1893,7 @@ mod tests {
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         config.server.static_files.etag = true;
         Router::new(&config, store, None, None, None, None)
@@ -1938,6 +2086,7 @@ mod tests {
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         config.server.security.get_or_insert_default().trusted_proxies =
             vec!["10.0.0.0/8".to_string()];
@@ -1961,6 +2110,7 @@ mod tests {
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         config.server.security.get_or_insert_default().trusted_proxies =
             vec!["10.0.0.0/8".to_string()];
@@ -1986,6 +2136,7 @@ mod tests {
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert_eq!(router.server_port, 3000);
@@ -2004,6 +2155,7 @@ mod tests {
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert_eq!(router.server_port, 8080);
@@ -2024,6 +2176,7 @@ mod tests {
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(router.open_basedir, "multi-tenant mode must default open_basedir on");
@@ -2041,6 +2194,7 @@ mod tests {
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(!router.open_basedir);
@@ -2084,6 +2238,7 @@ mod tests {
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(router.is_php_allowed("/anything.php"));
@@ -2101,6 +2256,7 @@ mod tests {
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-login.php".to_string()];
@@ -2122,6 +2278,7 @@ mod tests {
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-admin/*.php".to_string()];
@@ -2354,6 +2511,7 @@ mod tests {
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert_eq!(router.server_port, 9090);
@@ -2754,6 +2912,7 @@ echo "post response";
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -2778,6 +2937,7 @@ echo "post response";
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -2803,6 +2963,7 @@ echo "post response";
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -2828,6 +2989,7 @@ echo "post response";
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -2850,6 +3012,7 @@ echo "post response";
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -2876,6 +3039,7 @@ echo "post response";
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -2905,6 +3069,7 @@ echo "post response";
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -2940,6 +3105,7 @@ echo "post response";
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 

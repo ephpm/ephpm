@@ -115,6 +115,11 @@ COPY crates/ephpm-cluster/Cargo.toml      crates/ephpm-cluster/Cargo.toml
 COPY crates/ephpm-config/Cargo.toml       crates/ephpm-config/Cargo.toml
 COPY crates/ephpm-db/Cargo.toml           crates/ephpm-db/Cargo.toml
 COPY crates/ephpm-kv/Cargo.toml           crates/ephpm-kv/Cargo.toml
+COPY crates/ephpm-middleware/Cargo.toml   crates/ephpm-middleware/Cargo.toml
+COPY crates/ephpm-middleware-cors/Cargo.toml crates/ephpm-middleware-cors/Cargo.toml
+COPY crates/ephpm-middleware-jwt/Cargo.toml crates/ephpm-middleware-jwt/Cargo.toml
+COPY crates/ephpm-middleware-ratelimit/Cargo.toml crates/ephpm-middleware-ratelimit/Cargo.toml
+COPY crates/ephpm-middleware-security-headers/Cargo.toml crates/ephpm-middleware-security-headers/Cargo.toml
 COPY crates/ephpm-php/Cargo.toml          crates/ephpm-php/Cargo.toml
 COPY crates/ephpm-query-stats/Cargo.toml  crates/ephpm-query-stats/Cargo.toml
 COPY crates/ephpm-server/Cargo.toml       crates/ephpm-server/Cargo.toml
@@ -127,13 +132,18 @@ RUN mkdir -p \
         crates/ephpm-config/src \
         crates/ephpm-db/src \
         crates/ephpm-kv/src \
+        crates/ephpm-middleware/src \
+        crates/ephpm-middleware-cors/src \
+        crates/ephpm-middleware-jwt/src \
+        crates/ephpm-middleware-ratelimit/src \
+        crates/ephpm-middleware-security-headers/src \
         crates/ephpm-php/src \
         crates/ephpm-query-stats/src \
         crates/ephpm-server/src \
         crates/ephpm-sqld/src && \
     printf 'fn main() {}\n' > xtask/src/main.rs && \
     printf 'fn main() {}\n' > crates/ephpm/src/main.rs && \
-    for d in ephpm-cluster ephpm-config ephpm-db ephpm-kv ephpm-php ephpm-query-stats ephpm-server ephpm-sqld; do \
+    for d in ephpm-cluster ephpm-config ephpm-db ephpm-kv ephpm-middleware ephpm-middleware-cors ephpm-middleware-jwt ephpm-middleware-ratelimit ephpm-middleware-security-headers ephpm-php ephpm-query-stats ephpm-server ephpm-sqld; do \
         touch crates/$d/src/lib.rs; \
     done && \
     # ephpm-php Cargo.toml declares `build = "build.rs"` explicitly, so cargo

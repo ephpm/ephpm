@@ -1,0 +1,25 @@
+[package]
+name = "ephpm-middleware-jwt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ePHPm native middleware: HS256 JWT bearer-token validation"
+
+[lib]
+# cdylib = the loadable module; rlib so unit tests can call the type directly.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ephpm-middleware.workspace = true
+serde_json.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+base64ct.workspace = true
+
+[dev-dependencies]
+ephpm-middleware = { workspace = true, features = ["host"] }
+
+[lints]
+workspace = true

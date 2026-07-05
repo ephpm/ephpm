@@ -1,0 +1,22 @@
+[package]
+name = "ephpm-middleware"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native middleware ABI + safe Rust authoring kit for ePHPm"
+
+[features]
+default = []
+# Host-side pieces (request context, host callback table construction).
+# Enabled by ephpm-server; middleware authors use the default feature set.
+host = ["dep:ephpm-kv", "dep:tracing"]
+
+[dependencies]
+serde_json.workspace = true
+ephpm-kv = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[lints]
+workspace = true

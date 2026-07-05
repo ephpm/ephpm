@@ -1,0 +1,22 @@
+[package]
+name = "ephpm-middleware-cors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ePHPm native middleware: CORS preflight handling and response headers"
+
+[lib]
+# cdylib = the loadable module; rlib so unit tests can call the type directly.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ephpm-middleware.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+ephpm-middleware = { workspace = true, features = ["host"] }
+
+[lints]
+workspace = true

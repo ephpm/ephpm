@@ -255,6 +255,28 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | `hot_key_max_memory` | string | `"64MB"` | Memory budget for hot-key cache. |
 | `data_port` | u16 | `7947` | TCP listener for the KV data plane. |
 
+## `[[middleware]]`
+
+Native middleware mounts — repeatable array-of-tables. Each mount loads a
+shared library (`.so`/`.dylib`/`.dll`) at startup (fail-fast: an unresolvable
+library, missing ABI symbol, or failing module `init` aborts server startup)
+and evaluates it on every PHP-bound request, before the request body is read.
+Mounts apply globally, not per vhost — a module can discriminate by vhost via
+the request's server name. See the [Native Middleware guide](/guides/native-middleware/).
+
+**Linux release binaries cannot load middleware as shipped:** the stock
+`x86_64-unknown-linux-musl` release binary is fully static and `dlopen` is
+unavailable (`Dynamic loading not supported` at startup). Use a
+`RUSTFLAGS="-C target-feature=-crt-static"` build — see the guide's
+[Linux section](/guides/native-middleware/#linux-release-binaries-read-this-first).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `library` | string | **required** | Bare module name resolved through the middleware search path (`<name>.<os>-<arch>.<ext>`, `lib<name>.<ext>`, `<name>.<ext>` in the working directory, `$EPHPM_MIDDLEWARE_DIR`, then `/usr/local/lib/ephpm/middleware`), or an explicit path (any value containing a path separator or file extension). Must not be empty. |
+| `match` | string | (none) | Glob the request path must match for the mount to run. `*` matches any character sequence, including `/`. Unset = every PHP-bound request. |
+| `order` | u32 | **required** | Chain position; lower runs first. Equal orders keep declaration order. |
+| `config` | inline table | (none) | Arbitrary module configuration, serialised to JSON and passed to the module's `init`. |
+
 ## See also
 
 - [Environment variables](environment-variables/) — how to override any of these via `EPHPM_*`

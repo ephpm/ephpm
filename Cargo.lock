@@ -1118,6 +1118,7 @@ version = "0.1.0"
 dependencies = [
  "figment",
  "serde",
+ "serde_json",
  "temp-env",
  "tempfile",
  "thiserror 2.0.18",
@@ -1167,6 +1168,51 @@ dependencies = [
 ]
 
 [[package]]
+name = "ephpm-middleware"
+version = "0.1.0"
+dependencies = [
+ "ephpm-kv",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "ephpm-middleware-cors"
+version = "0.1.0"
+dependencies = [
+ "ephpm-middleware",
+ "serde_json",
+]
+
+[[package]]
+name = "ephpm-middleware-jwt"
+version = "0.1.0"
+dependencies = [
+ "base64ct",
+ "ephpm-middleware",
+ "hmac 0.12.1",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
+name = "ephpm-middleware-ratelimit"
+version = "0.1.0"
+dependencies = [
+ "ephpm-kv",
+ "ephpm-middleware",
+ "serde_json",
+]
+
+[[package]]
+name = "ephpm-middleware-security-headers"
+version = "0.1.0"
+dependencies = [
+ "ephpm-middleware",
+ "serde_json",
+]
+
+[[package]]
 name = "ephpm-php"
 version = "0.1.0"
 dependencies = [
@@ -1208,6 +1254,7 @@ dependencies = [
  "ephpm-config",
  "ephpm-db",
  "ephpm-kv",
+ "ephpm-middleware",
  "ephpm-php",
  "ephpm-query-stats",
  "ephpm-sqld",
@@ -1217,6 +1264,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ipnet",
+ "libloading",
  "litewire",
  "metrics",
  "metrics-exporter-prometheus",
@@ -1225,6 +1273,7 @@ dependencies = [
  "rustls 0.23.37",
  "rustls-acme",
  "rustls-pemfile",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
