@@ -241,67 +241,136 @@ fn worker_main(
         return;
     }
 
+    // Boot completion is signalled by the worker's FIRST take_request() — the
+    // framework has finished booting and is asking for work. run_worker itself
+    // blocks for the worker's entire life, so it cannot distinguish boot from
+    // serving: readiness, the boot-duration metric, and the backoff reset all
+    // hang off this notifier, not off run_worker returning.
     let boot_start = Instant::now();
-    // Mark ready as soon as the thread is about to enter the framework loop.
-    // The first take_request() blocks in Rust, which is the readiness point.
-    pool.state.ready.fetch_add(1, Ordering::AcqRel);
-    gauge!("ephpm_worker_idle").increment(1.0);
-    pool.state.boot_failures.store(0, Ordering::Release);
+    let booted = Arc::new(AtomicBool::new(false));
+    {
+        let pool = Arc::clone(pool);
+        let booted = Arc::clone(&booted);
+        ephpm_php::worker_bridge::set_boot_notifier(Box::new(move || {
+            booted.store(true, Ordering::Release);
+            let boot_elapsed = boot_start.elapsed().as_secs_f64();
+            histogram!("ephpm_worker_boot_duration_seconds").record(boot_elapsed);
+            pool.state.ready.fetch_add(1, Ordering::AcqRel);
+            pool.state.boot_failures.store(0, Ordering::Release);
+            tracing::info!(worker_id, boot_elapsed, "worker booted");
+        }));
+    }
+
+    // Boot watchdog: a wedged boot (framework hangs before its first
+    // take_request) never returns from run_worker, so readiness would sit at
+    // 0 with no diagnostic. The watchdog cannot kill the thread (a PHP thread
+    // cannot be terminated without corrupting the ZMM) — it makes the stall
+    // visible and counts it.
+    {
+        let booted = Arc::clone(&booted);
+        let _ = std::thread::Builder::new()
+            .name(format!("ephpm-worker-{worker_id}-bootwatch"))
+            .spawn(move || {
+                std::thread::sleep(boot_timeout);
+                if !booted.load(Ordering::Acquire) {
+                    counter!("ephpm_worker_boot_timeouts_total").increment(1);
+                    tracing::error!(
+                        worker_id,
+                        timeout_secs = boot_timeout.as_secs(),
+                        "worker has not finished booting within worker_boot_timeout \
+                         (thread cannot be killed; it becomes ready if the boot completes)"
+                    );
+                }
+            });
+    }
 
     tracing::info!(worker_id, "worker booting framework");
 
     // run_worker blocks until the framework's take_request() loop ends.
-    let clean = PhpRuntime::run_worker(script);
+    let outcome = PhpRuntime::run_worker(script);
 
-    let boot_elapsed = boot_start.elapsed().as_secs_f64();
-    histogram!("ephpm_worker_boot_duration_seconds").record(boot_elapsed);
-    if boot_elapsed > boot_timeout.as_secs_f64() {
-        tracing::warn!(worker_id, boot_elapsed, "worker exceeded boot timeout");
+    // The worker is no longer serving (only if it ever was).
+    let was_booted = booted.load(Ordering::Acquire);
+    if was_booted {
+        pool.state.ready.fetch_sub(1, Ordering::AcqRel);
     }
 
-    // The worker is no longer serving.
-    pool.state.ready.fetch_sub(1, Ordering::AcqRel);
-    gauge!("ephpm_worker_idle").decrement(1.0);
-
-    match clean {
-        Ok(true) => {
-            // Clean loop end: graceful drain or worker_max_requests recycle.
-            if pool.state.draining.load(Ordering::Acquire) {
-                tracing::debug!(worker_id, "worker exited on drain");
-            } else {
-                counter!("ephpm_worker_recycles_total", "reason" => "max_requests").increment(1);
-                tracing::debug!(worker_id, "worker recycled (max_requests) — respawning");
+    if was_booted {
+        match outcome {
+            Ok(ephpm_php::WorkerExit::Clean) => {
+                // Clean loop end: graceful drain or worker_max_requests recycle.
+                if pool.state.draining.load(Ordering::Acquire) {
+                    tracing::debug!(worker_id, "worker exited on drain");
+                } else {
+                    counter!("ephpm_worker_recycles_total", "reason" => "max_requests")
+                        .increment(1);
+                    tracing::debug!(worker_id, "worker recycled (max_requests) — respawning");
+                }
+            }
+            Ok(ephpm_php::WorkerExit::ScriptExit) => {
+                // The script exit()ed mid-request; the C layer synthesized and
+                // delivered the response from SAPI state. Defensive: if the
+                // sender is somehow still parked, 500 it rather than hang.
+                if let Some(sender) = ephpm_php::worker_bridge::take_pending_sender() {
+                    let _ = sender.send(WorkerResponse::internal_error());
+                }
+                counter!("ephpm_worker_recycles_total", "reason" => "script_exit").increment(1);
+                tracing::debug!(worker_id, "worker script exited mid-request — recycling");
+            }
+            Ok(ephpm_php::WorkerExit::Fatal) => {
+                // Fatal bailout unwound past send_response. Fulfil the parked
+                // oneshot with a 500 so the in-flight request never hangs, then
+                // recycle (never resume on a possibly-corrupt kernel).
+                if let Some(sender) = ephpm_php::worker_bridge::take_pending_sender() {
+                    let _ = sender.send(WorkerResponse::internal_error());
+                    tracing::warn!(
+                        worker_id,
+                        "worker bailed out mid-request — 500 sent, recycling"
+                    );
+                } else {
+                    // No parked oneshot: the response was already begun. For a
+                    // mid-stream bailout, closing the chunk channel below
+                    // truncates the body without hanging.
+                    tracing::warn!(
+                        worker_id,
+                        "worker bailed out between/after response — recycling"
+                    );
+                }
+                // Close any still-open streaming channels so a mid-download
+                // client sees EOF rather than hanging.
+                ephpm_php::worker_bridge::clear_in_flight_streams();
+                counter!("ephpm_worker_recycles_total", "reason" => "fatal").increment(1);
+            }
+            Err(e) => {
+                // run_worker refused after a successful boot — should not
+                // happen (boot implies init); recycle defensively.
+                if let Some(sender) = ephpm_php::worker_bridge::take_pending_sender() {
+                    let _ = sender.send(WorkerResponse::internal_error());
+                }
+                tracing::error!(worker_id, ?e, "worker run failed after boot");
+                counter!("ephpm_worker_recycles_total", "reason" => "fatal").increment(1);
             }
         }
-        Ok(false) => {
-            // Fatal bailout unwound past send_response. Fulfil the parked
-            // oneshot with a 500 so the in-flight request never hangs, then
-            // recycle (never resume on a possibly-corrupt kernel).
-            if let Some(sender) = ephpm_php::worker_bridge::take_pending_sender() {
-                let _ = sender.send(WorkerResponse::internal_error());
-                tracing::warn!(worker_id, "worker bailed out mid-request — 500 sent, recycling");
-            } else {
-                // No parked oneshot: the response was already begun (buffered
-                // send_response completed, or a streaming response's headers
-                // were already delivered). For a mid-stream bailout, closing
-                // the chunk channel below truncates the body without hanging.
-                tracing::warn!(worker_id, "worker bailed out between/after response — recycling");
-            }
-            // Close any still-open streaming channels so a mid-download client
-            // sees EOF rather than hanging (the sender lives in the worker's
-            // thread-locals, which persist across the respawn loop).
-            ephpm_php::worker_bridge::clear_in_flight_streams();
-            counter!("ephpm_worker_recycles_total", "reason" => "fatal").increment(1);
+    } else {
+        // The worker exited without ever reaching take_request(): the
+        // framework failed to boot (fatal during bootstrap, script error, a
+        // script that returns without looping, or run_worker refusing). This
+        // MUST count as a boot failure — it is what drives respawn backoff;
+        // without it a broken worker.php respawns in a zero-delay hot loop.
+        if let Some(sender) = ephpm_php::worker_bridge::take_pending_sender() {
+            let _ = sender.send(WorkerResponse::internal_error());
         }
-        Err(e) => {
-            // run_worker itself refused (not initialized / bad path). Treat as
-            // a boot failure and fulfil any parked sender defensively.
-            if let Some(sender) = ephpm_php::worker_bridge::take_pending_sender() {
-                let _ = sender.send(WorkerResponse::internal_error());
-            }
-            tracing::error!(worker_id, ?e, "worker run failed");
-            pool.state.boot_failures.fetch_add(1, Ordering::AcqRel);
-            counter!("ephpm_worker_boot_failures_total").increment(1);
+        ephpm_php::worker_bridge::clear_in_flight_streams();
+        pool.state.boot_failures.fetch_add(1, Ordering::AcqRel);
+        counter!("ephpm_worker_boot_failures_total").increment(1);
+        match outcome {
+            Ok(exit) => tracing::error!(
+                worker_id,
+                ?exit,
+                "worker exited before completing boot (framework never reached \
+                 take_request) — check the worker script's error log"
+            ),
+            Err(e) => tracing::error!(worker_id, ?e, "worker boot failed"),
         }
     }
 

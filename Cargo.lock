@@ -1176,6 +1176,7 @@ dependencies = [
  "cc",
  "ephpm-kv",
  "http",
+ "metrics",
  "serial_test",
  "tempfile",
  "thiserror 2.0.18",
