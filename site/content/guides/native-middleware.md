@@ -4,63 +4,31 @@ weight = 10
 aliases = ["/roadmap/native-middleware/"]
 +++
 
-ePHPm can run **compiled middleware in front of PHP**: shared libraries
-(`.so` / `.dylib` / `.dll`) loaded once at startup and called per request
+ePHPm can run **compiled middleware in front of PHP**, called per request
 *before* PHP dispatch — and before any request-body bytes are read. A
 rejected request (bad JWT, rate-limited client, CORS preflight) never boots
 PHP and never pays for the body transfer.
 
-Modules speak a small, versioned C ABI and can call back into the host: the
-embedded (cluster-replicated) KV store and the `tracing` logger are one
-function call away. That's what makes a cluster-wide rate limiter a ~100-line
-module — the replicated counter is a single `kv_incr`.
+Middleware can call back into the host: the embedded (cluster-replicated)
+KV store and the `tracing` logger are one function call away. That's what
+makes a cluster-wide rate limiter a ~100-line module — the replicated
+counter is a single `kv_incr`.
 
-Four modules ship in-tree: `jwt`, `cors`, `ratelimit`, and
-`security-headers`.
+There are **two ways a module runs**:
 
-## Linux release binaries: read this first
+- **Built-in (static registry).** Four modules — `jwt`, `cors`,
+  `ratelimit`, `security-headers` — are compiled into **every** ePHPm
+  binary, including the fully static musl release. `library = "jwt"` just
+  works: no shared library on disk, no `dlopen`, no special build.
+- **Dynamic (shared library).** Custom out-of-tree modules are `.so` /
+  `.dylib` / `.dll` files speaking a small, versioned C ABI, loaded once at
+  startup. This lane requires a binary that can `dlopen` — see
+  [the dynamic lane and static binaries](#the-dynamic-lane-and-static-binaries).
 
-The stock Linux release binary — `cargo xtask release`, the
-`docker/Dockerfile` image, and the published release artifacts — targets
-`x86_64-unknown-linux-musl` with the C runtime **statically linked**. A
-fully static musl binary cannot `dlopen()` anything, so configuring any
-`[[middleware]]` mount makes startup fail fast with:
+## Quick start
 
-```
-error: failed to load native middleware chain: failed to load middleware
-"/mw/libephpm_middleware_security_headers.so" from ...:
-dlopen failed for ...: Dynamic loading not supported
-```
-
-To run native middleware on Linux you need an ePHPm binary with the C
-runtime **dynamically linked**. Build one by disabling `crt-static` (note
-the exact spelling — `-crt-static`; the underscore form is silently
-ignored by current rustc):
-
-```bash
-RUSTFLAGS="-C target-feature=-crt-static" cargo xtask release
-```
-
-This produces a dynamically-linked musl binary that loads middleware and
-serves PHP normally (verified with all four in-tree modules on Alpine).
-The trade-offs:
-
-- It needs a musl dynamic loader (`/lib/ld-musl-x86_64.so.1`) and
-  `libgcc_s.so.1` at runtime. On Alpine: `apk add libgcc` (the loader is
-  already there). It is no longer the run-anywhere static binary — don't
-  expect it to start on glibc-only distros.
-- Development builds (`cargo build` on a glibc host) are dynamically
-  linked already and load middleware without any of this.
-
-macOS release binaries are dynamically linked against the system runtime
-(`dlopen` is always available there), and Windows builds use
-`LoadLibrary` — neither needs a special build. The static-musl limitation
-is Linux-release-specific.
-
-## Quick start (Linux, containerized)
-
-With a `crt-static`-disabled binary in an Alpine image and the four
-in-tree modules copied to `/usr/local/lib/ephpm/middleware/`:
+Built-ins need nothing but configuration — this works with the stock
+release binary on every platform:
 
 ```toml
 # /etc/ephpm/ephpm.toml
@@ -69,23 +37,23 @@ listen = "0.0.0.0:8080"
 document_root = "/var/www/html"
 
 [[middleware]]
-library = "ephpm_middleware_security_headers"
+library = "security-headers"
 order   = 10
 config  = { csp = "default-src 'self'" }
 
 [[middleware]]
-library = "ephpm_middleware_cors"
+library = "cors"
 order   = 20
 config  = { allow_origins = ["https://app.example"] }
 
 [[middleware]]
-library = "ephpm_middleware_jwt"
+library = "jwt"
 match   = "/api/*"
 order   = 30
 config  = { secret = "change-me", claims_header = "X-Jwt-Claims" }
 
 [[middleware]]
-library = "ephpm_middleware_ratelimit"
+library = "ratelimit"
 match   = "/api/*"
 order   = 40
 config  = { per_ip_rps = 1, burst = 2 }
@@ -94,7 +62,7 @@ config  = { per_ip_rps = 1, burst = 2 }
 Startup logs each module as it initialises, then the whole chain:
 
 ```
-INFO ephpm_server::middleware: middleware initialised module=ephpm_middleware_security_headers path=/usr/local/lib/ephpm/middleware/libephpm_middleware_security_headers.so
+INFO ephpm_server::middleware: middleware initialised (builtin) module=security-headers describe=...
 ...
 INFO ephpm_server: middleware chain loaded count=4 modules=[...]
 ```
@@ -120,20 +88,20 @@ Mounts are `[[middleware]]` blocks in `ephpm.toml`, ordered explicitly:
 
 ```toml
 [[middleware]]
-library = "ephpm_middleware_security_headers"   # bare name → search path
+library = "security-headers"                    # built-in (compiled in)
 order   = 10
 config  = { csp = "default-src 'self'" }
 
 [[middleware]]
-library = "/etc/ephpm/middleware/libephpm_middleware_jwt.so"  # explicit path
+library = "/etc/ephpm/middleware/libmy_auth.so" # custom module, explicit path
 match   = "/api/*"
 order   = 30
-config  = { secret = "...", claims_header = "X-Jwt-Claims" }
+config  = { api_key = "..." }
 ```
 
 | Key | Required | Meaning |
 |-----|----------|---------|
-| `library` | yes | Module to load — bare name or explicit path (see below). Must not be empty. |
+| `library` | yes | Built-in name or shared library to load — bare name or explicit path (see below). Must not be empty. |
 | `match` | no | Path glob; the mount only runs when the request path matches. `*` matches any character sequence, **including `/`**. Unset = every PHP-bound request. |
 | `order` | yes | Chain position. Lower runs first; equal orders keep declaration order. |
 | `config` | no | Arbitrary table, serialised to JSON and handed to the module's `init`. |
@@ -142,14 +110,22 @@ Mounts are **global** — they apply to every vhost. A module that needs
 per-tenant behavior reads the request's vhost id (the server name) and
 decides itself.
 
-Loading is **fail-fast**: a library that can't be found, a missing ABI
-symbol, or a module whose `init` returns an error aborts server startup with
-a message naming the mount.
+Loading is **fail-fast**: a builtin whose `init` rejects its config, a
+library that can't be found, a missing ABI symbol, or a dynamic module
+whose `init` returns an error aborts server startup with a message naming
+the mount.
 
 ### Library resolution
 
-A `library` value containing a path separator or a file extension is used
-as-is. A bare name tries, in each search directory:
+The `library` value is checked against the **builtin registry first**.
+Each built-in answers to its short name and its crate name, with `-` and
+`_` interchangeable: `jwt`, `cors`, `ratelimit` (also `rate-limit`),
+`security-headers`, and the `ephpm-middleware-*` / `ephpm_middleware_*`
+long forms. Builtin mounts never touch the filesystem.
+
+Anything else is resolved as a shared library. A value containing a path
+separator or a file extension is used as-is. A bare name tries, in each
+search directory:
 
 1. `<name>.<os>-<arch>.<ext>` — e.g. `my-auth.linux-x86_64.so`
 2. `lib<name>.<ext>` — cargo's own artifact naming
@@ -191,9 +167,10 @@ v1 rules worth knowing:
   script was already resolved before the chain ran, so the originally
   resolved script still executes; in worker mode the framework routes on the
   rewritten `REQUEST_URI`, so rewrites fully re-route.
-- **Failures are fail-closed.** A module whose `invoke` returns non-zero —
-  including a Rust panic caught by the authoring kit — produces a plain 500,
-  never a silent pass-through.
+- **Failures are fail-closed.** A dynamic module whose `invoke` returns
+  non-zero, a Rust panic caught by the authoring kit, or a panicking
+  built-in (caught by the host) all produce a plain 500, never a silent
+  pass-through.
 - **Request bodies are not visible** to middleware. The chain runs before
   the body is read (rejecting before the transfer is the point);
   the ABI's body accessor currently always returns length 0.
@@ -201,7 +178,11 @@ v1 rules worth knowing:
 The chain runs on **PHP-bound requests only** — static file responses are
 not affected.
 
-## The shipped modules
+## The built-in modules
+
+All four are compiled into every ePHPm binary and run in-process — the
+sections below apply identically whether you mount them by short name
+(built-in) or dlopen their cdylib builds on a dynamic binary.
 
 ### `security-headers`
 
@@ -275,6 +256,54 @@ Note this is a *fixed-window* limiter (a full window's allowance can be
 consumed instantly at a window boundary), and it is distinct from the
 built-in connection-level limiter in `[server.limits]` — the two are
 independent.
+
+## The dynamic lane and static binaries
+
+Custom out-of-tree modules load through `dlopen` (`LoadLibrary` on
+Windows) — and that requires a host binary with dynamic loading available.
+**Built-ins are unaffected by everything in this section.**
+
+The stock Linux release binary — `cargo xtask release`, the
+`docker/Dockerfile` image, and the published release artifacts — targets
+`x86_64-unknown-linux-musl` with the C runtime **statically linked**. A
+fully static musl binary cannot `dlopen()` anything, so a `[[middleware]]`
+mount that resolves to a shared library makes startup fail fast with:
+
+```
+error: failed to load native middleware chain: failed to load middleware
+"/mw/libmy_auth.so" from ...:
+dlopen failed for ...: Dynamic loading not supported
+```
+
+To run *custom* middleware on Linux you need an ePHPm binary with the C
+runtime **dynamically linked**. Build one by disabling `crt-static` (note
+the exact spelling — `-crt-static`; the underscore form is silently
+ignored by current rustc):
+
+```bash
+RUSTFLAGS="-C target-feature=-crt-static" cargo xtask release
+```
+
+This produces a dynamically-linked musl binary that loads middleware and
+serves PHP normally (verified on Alpine). The trade-offs:
+
+- It needs a musl dynamic loader (`/lib/ld-musl-x86_64.so.1`) and
+  `libgcc_s.so.1` at runtime. On Alpine: `apk add libgcc` (the loader is
+  already there). It is no longer the run-anywhere static binary — don't
+  expect it to start on glibc-only distros.
+- Development builds (`cargo build` on a glibc host) are dynamically
+  linked already and load middleware without any of this.
+
+macOS release binaries are dynamically linked against the system runtime
+(`dlopen` is always available there), and Windows builds use
+`LoadLibrary` — neither needs a special build. The static-musl limitation
+is Linux-release-specific.
+
+**Compiling third-party middleware INTO a static binary** (xcaddy-style
+build-time composition, so custom modules get the same
+works-in-every-binary treatment as the built-ins) is being designed — see
+[`docs/architecture/build-compose-design.md`](https://github.com/ephpm/ephpm/blob/main/docs/architecture/build-compose-design.md)
+in the repository. Planned — not yet implemented.
 
 ## Writing your own module in Rust
 

@@ -382,6 +382,7 @@ cargo deny check
 ### Build & test tooling (xtask)
 
 ```bash
+cargo xtask doctor      # Check build prerequisites (toolchains, PHP SDK cache, optional tools)
 cargo xtask release     # Download PHP SDK + build ephpm binary (release mode)
 cargo xtask php-sdk     # Download only the prebuilt PHP SDK for the host platform
 cargo xtask e2e-install # Download kind, tilt, kubectl to ./bin (no global install)

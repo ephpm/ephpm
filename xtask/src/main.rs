@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::{env, fs};
 
+mod doctor;
+
 /// Pinned full PHP versions per supported minor.
 ///
 /// The build flow downloads pre-built `libphp.a` archives from
@@ -34,6 +36,7 @@ fn main() -> ExitCode {
         Some("e2e-down") => e2e_down(),
         Some("e2e-install") => e2e_install(),
         Some("docs") => docs(&args[1..]),
+        Some("doctor") => doctor::doctor(&args[1..]),
         Some("help" | "--help" | "-h") | None => {
             print_usage();
             ExitCode::SUCCESS
@@ -59,6 +62,7 @@ Commands:
   e2e-down                          Tear down Kind cluster and all resources
   e2e-install                       Download kind, tilt, kubectl to ./bin (no global install needed)
   docs <subcommand>                 Build/serve the Hugo + Hextra documentation site
+  doctor [--target windows]         Check build prerequisites (toolchains, PHP SDK cache, optional tools)
 
 The PHP SDK is downloaded from github.com/ephpm/php-sdk releases. Pass a minor
 shorthand (e.g. \"8.5\") to use the pinned patch release, or a full version

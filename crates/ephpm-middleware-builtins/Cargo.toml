@@ -1,0 +1,29 @@
+[package]
+name = "ephpm-middleware-builtins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The in-tree ePHPm middleware implementations (jwt, cors, ratelimit, security-headers) as plain Rust types — compiled into every ePHPm binary via the static registry"
+
+# Deliberately rlib-only and free of C ABI exports: `ephpm-server` links this
+# crate into the (possibly fully static) binary. The loadable cdylib shells
+# live in the sibling `ephpm-middleware-*` crates, which re-export these
+# types and add `declare!` — four crates each exporting the same
+# `ephpm_middleware_*` symbols cannot be linked into one binary.
+
+[dependencies]
+ephpm-middleware.workspace = true
+serde_json.workspace = true
+# jwt: HS256 via hmac/sha2 — no heavyweight JWT dependency.
+hmac.workspace = true
+sha2.workspace = true
+base64ct.workspace = true
+
+[dev-dependencies]
+ephpm-middleware = { workspace = true, features = ["host"] }
+ephpm-kv.workspace = true
+
+[lints]
+workspace = true

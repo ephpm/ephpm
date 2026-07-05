@@ -1177,18 +1177,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "ephpm-middleware-cors"
-version = "0.1.0"
-dependencies = [
- "ephpm-middleware",
- "serde_json",
-]
-
-[[package]]
-name = "ephpm-middleware-jwt"
+name = "ephpm-middleware-builtins"
 version = "0.1.0"
 dependencies = [
  "base64ct",
+ "ephpm-kv",
  "ephpm-middleware",
  "hmac 0.12.1",
  "serde_json",
@@ -1196,11 +1189,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ephpm-middleware-cors"
+version = "0.1.0"
+dependencies = [
+ "ephpm-middleware",
+ "ephpm-middleware-builtins",
+]
+
+[[package]]
+name = "ephpm-middleware-jwt"
+version = "0.1.0"
+dependencies = [
+ "ephpm-middleware",
+ "ephpm-middleware-builtins",
+]
+
+[[package]]
 name = "ephpm-middleware-ratelimit"
 version = "0.1.0"
 dependencies = [
- "ephpm-kv",
  "ephpm-middleware",
+ "ephpm-middleware-builtins",
  "serde_json",
 ]
 
@@ -1209,7 +1218,7 @@ name = "ephpm-middleware-security-headers"
 version = "0.1.0"
 dependencies = [
  "ephpm-middleware",
- "serde_json",
+ "ephpm-middleware-builtins",
 ]
 
 [[package]]
@@ -1255,6 +1264,7 @@ dependencies = [
  "ephpm-db",
  "ephpm-kv",
  "ephpm-middleware",
+ "ephpm-middleware-builtins",
  "ephpm-php",
  "ephpm-query-stats",
  "ephpm-sqld",

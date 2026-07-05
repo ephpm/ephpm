@@ -1,10 +1,18 @@
 //! Native middleware for ePHPm: the C ABI plus a safe Rust authoring kit.
 //!
-//! ePHPm loads middleware modules (`.so`/`.dylib`/`.dll`) at startup and
-//! calls them per request **before PHP dispatch** — reject, rewrite, or
-//! annotate requests at native speed, with direct access to the embedded
-//! (cluster-replicated) KV store. See `site/content/` middleware docs for
-//! the operator view.
+//! ePHPm runs middleware per request **before PHP dispatch** — reject,
+//! rewrite, or annotate requests at native speed, with direct access to the
+//! embedded (cluster-replicated) KV store. See `site/content/` middleware
+//! docs for the operator view.
+//!
+//! There are two execution lanes for the same [`Middleware`] trait:
+//!
+//! - **Builtin (static registry)** — modules compiled into the ePHPm binary
+//!   and invoked in-process via [`builtin::BuiltinModule`] (feature `host`).
+//!   Works in every binary, including the fully static musl release where
+//!   `dlopen` does not exist.
+//! - **Dynamic (C ABI)** — shared libraries (`.so`/`.dylib`/`.dll`) loaded
+//!   at startup, for out-of-tree modules on dynamically linked builds.
 //!
 //! Authoring a module in Rust:
 //!
@@ -34,6 +42,8 @@
 #![allow(unsafe_code)] // FFI crate — every unsafe block carries a SAFETY note.
 
 pub mod abi;
+#[cfg(feature = "host")]
+pub mod builtin;
 #[cfg(feature = "host")]
 pub mod host;
 

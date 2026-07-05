@@ -54,11 +54,14 @@ pub struct Config {
 /// ```
 #[derive(Debug, Deserialize)]
 pub struct MiddlewareMount {
-    /// Shared library to load. Either a bare name (resolved through the
-    /// middleware search path with a platform suffix, e.g. `auth-jwt` →
-    /// `auth-jwt.linux-x86_64.so`) or an explicit path — a value containing a
-    /// path separator or a file extension is used as-is. Must not be empty
-    /// (enforced by [`Config::validate`]).
+    /// Module to run. Checked against the builtin registry first (`jwt`,
+    /// `cors`, `ratelimit`/`rate-limit`, `security-headers` and their
+    /// `ephpm-middleware-*` long forms are compiled into every binary — no
+    /// dlopen). Anything else is a shared library: either a bare name
+    /// (resolved through the middleware search path with a platform suffix,
+    /// e.g. `auth-jwt` → `auth-jwt.linux-x86_64.so`) or an explicit path — a
+    /// value containing a path separator or a file extension is used as-is.
+    /// Must not be empty (enforced by [`Config::validate`]).
     pub library: String,
 
     /// Glob the request path must match for this mount to run. `*` matches
