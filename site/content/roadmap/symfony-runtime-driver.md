@@ -7,10 +7,12 @@ and AWS Lambda (Bref) all plug in via the same `RunnerInterface`. An ephpm
 adapter is what lets a stock Symfony / API Platform / Drupal-on-Symfony app
 opt into worker mode without leaving the binary.
 
-This is the Symfony parallel of the [Laravel Octane Driver](../laravel-octane-driver/).
-It shares the same Rust-side prerequisite — see [PHP Worker Mode](/architecture/#php-worker-mode) —
-and the same [SAPI surface](../laravel-octane-driver/#sapi-surface-rust--php). This
-document focuses on what makes the Symfony side different.
+**Status: the adapter package is planned — not yet implemented.** Its Rust-side
+prerequisite shipped in 3.0: the [worker-mode engine](/architecture/#php-worker-mode)
+and its `\Ephpm\Worker\*` primitives are live, and the
+[Laravel Octane driver](/guides/laravel-octane/) is already built on them
+(**nothing Symfony-specific is needed in Rust**). This document focuses on
+what makes the Symfony side different.
 
 ---
 
@@ -87,9 +89,10 @@ The adapter lives in two places:
    itself via Symfony's runtime resolver. Users opt in by setting
    `APP_RUNTIME` in their environment or `composer.json` — no code change to
    `public/index.php`.
-2. **Rust side** — the same SAPI bindings ([`Ephpm\Octane\take_request` etc.](../laravel-octane-driver/#sapi-surface-rust--php))
-   added for Octane. **Nothing Symfony-specific is needed in Rust.** Both
-   adapters call the same primitives.
+2. **Rust side** — nothing new. The engine primitives
+   (`\Ephpm\Worker\take_request()` etc.) shipped in 3.0 and already power the
+   Octane and WordPress adapters. **Nothing Symfony-specific is needed in
+   Rust.** All adapters call the same primitives.
 
 ---
 
@@ -116,20 +119,21 @@ HttpKernel itself.
 
 ## SAPI Surface
 
-**Identical to the Octane driver.** See
-[Laravel Octane: SAPI Surface](../laravel-octane-driver/#sapi-surface-rust--php).
-The Symfony adapter calls the same three functions:
+**Already shipped** — the engine registers framework-neutral primitives under
+`\Ephpm\Worker\*` (verified in `crates/ephpm-php/ephpm_wrapper.c`):
 
 ```php
-\Ephpm\Octane\take_request(): ?Request
-\Ephpm\Octane\send_response(Response $r): void
-\Ephpm\Octane\on_tick(int $intervalMs, callable $cb): void   // optional
+\Ephpm\Worker\take_request(): ?\Ephpm\Worker\Envelope
+\Ephpm\Worker\send_response(int $status, array $headers, string $body): void
+\Ephpm\Worker\send_response_stream(int $status, array $headers, $bodyResource): void
 ```
 
-The shared namespace (`Ephpm\Octane\*`) is a slight misnomer — these are
-generic worker-mode primitives, not Octane-specific. We could rename to
-`Ephpm\Worker\*` before stabilizing if both adapters land. Tracked under
-[Open Issues](#shared-namespace-naming).
+There is no `on_tick()` primitive — tick/interval callbacks are **planned, not
+yet implemented**. The adapter builds the Symfony `Request` from the `Envelope`
+(note: `parsedBody()` is always `null`, `files()` always `[]`, and
+`cookies()`/`query()` are not url-decoded — the adapter parses/decodes) and
+unpacks the Symfony `Response` into `(status, headers, body)` for
+`send_response`.
 
 ---
 
@@ -163,9 +167,15 @@ final class Runner implements RunnerInterface
 
     public function run(): int
     {
-        while ($request = \Ephpm\Octane\take_request()) {
+        while ($envelope = \Ephpm\Worker\take_request()) {
+            $request = EnvelopeConverter::toSymfonyRequest($envelope);
             $response = $this->kernel->handle($request);
-            \Ephpm\Octane\send_response($response);
+
+            \Ephpm\Worker\send_response(
+                $response->getStatusCode(),
+                $response->headers->all(),
+                $response->getContent() ?: '',
+            );
 
             if ($this->kernel instanceof TerminableInterface) {
                 $this->kernel->terminate($request, $response);
@@ -260,15 +270,11 @@ TSRM pool instead of forking a separate `php-cli` process.
 
 ## Open Issues
 
-### Shared namespace naming
+### Shared namespace naming — RESOLVED
 
-The SAPI primitives are currently scoped under `Ephpm\Octane\*` because
-that's where they were defined first. Both adapters use them; the name is
-misleading. Before either package leaves alpha, rename to a neutral
-`Ephpm\Worker\*` (or `Ephpm\Runtime\*`) and have the Octane and Symfony
-adapters both consume the new namespace. Either rename early or live with
-the mismatch — don't add a deprecation shim layer for two packages that
-ship together.
+The engine shipped the primitives under the neutral `Ephpm\Worker\*`
+namespace from the start; the shipped Octane and WordPress adapters consume
+it, and the Symfony adapter will too. No rename needed.
 
 ### `getenv()` pollution between requests
 
@@ -319,13 +325,12 @@ loop. Out of scope for the initial adapter; tracked separately under
 
 ## Phasing
 
-### Phase 1 — Worker mode primitive (prerequisite)
+### Phase 1 — Worker mode primitive (prerequisite) — SHIPPED
 
-Same as Octane. See [PHP Worker Mode](/architecture/#php-worker-mode).
-Shared with the Octane track — implementing it once unblocks both adapters.
-
-**Exit criteria:** generic `while (ephpm_take_request())` loop in PHP serves
-HTTP responses with zero per-request bootstrap.
+Shipped in ePHPm 3.0. See [PHP Worker Mode](/architecture/#php-worker-mode);
+the reference `examples/worker/worker.php` loop serves responses with zero
+per-request bootstrap, and the Octane and WordPress adapters run on it in
+production.
 
 ### Phase 2 — Minimal Symfony Runtime adapter
 
@@ -377,5 +382,5 @@ work without a userland event loop. Separate effort, separate PR.
 - [Symfony Runtime Component](https://symfony.com/doc/current/components/runtime.html) — official docs
 - [`php-runtime/runtime`](https://github.com/php-runtime/runtime) — community org with FrankenPHP, Swoole, RoadRunner, ReactPHP, Bref adapters
 - [Symfony `kernel.reset` tag](https://symfony.com/doc/current/reference/dic_tags.html#kernel-reset) — service reset semantics
-- [ePHPm Laravel Octane Driver](../laravel-octane-driver/) — sister roadmap; shares the SAPI surface
-- [ePHPm Architecture: PHP Worker Mode](/architecture/#php-worker-mode) — prerequisite
+- [ePHPm Laravel Octane driver](/guides/laravel-octane/) — shipped adapter on the same engine
+- [ePHPm Architecture: PHP Worker Mode](/architecture/#php-worker-mode) — the shipped engine

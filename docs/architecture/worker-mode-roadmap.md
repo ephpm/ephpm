@@ -9,6 +9,16 @@ loop over requests without re-bootstrapping. 5–20× throughput for heavy
 frameworks (Laravel, Symfony, WordPress). ePHPm's real differentiator vs. a
 "php-fpm in a box."
 
+**Status (2026-07): shipped and e2e-validated** — the Phase-1 engine, the
+Phase-3 streaming engine, `ephpm/worker` (base package), `ephpm/octane-driver`,
+and `ephpm/wordpress-worker`. Still open: `ephpm/psr15-worker`,
+`ephpm/symfony-runtime`, Phase 4 (cache bindings + ticks), Phase 5, and
+Packagist publication (all shipped packages install via VCS repos for now).
+One deviation from the plan below: `php artisan octane:start --server=ephpm`
+is **not** supported — ePHPm supervises the workers itself, so the Octane
+driver is started by running `ephpm` against
+`worker_script = "vendor/bin/ephpm-octane-worker"`.
+
 ---
 
 ## Phases & exit criteria
@@ -16,7 +26,7 @@ frameworks (Laravel, Symfony, WordPress). ePHPm's real differentiator vs. a
 | Phase | What ships | Where | Exit criterion |
 |---|---|---|---|
 | **1 — Engine** (Rust/C, the hard core) | dedicated worker-thread pool, `async_channel` dispatch + `oneshot` return, `Ephpm\Worker\take_request()`/`send_response()` + `Envelope` via the ops-table/MINIT pattern, per-iteration reset, boot/recycle/crash-recovery, config, metrics, reference `worker.php` | `ephpm/ephpm` repo | Hand-written `worker.php` serves hello-world with **zero per-request bootstrap** (boot counter increments once); N workers serve N concurrent requests on Linux; a fatal 500s that request, recycles the worker, next request succeeds, server never wedges; graceful drain; stub mode compiles |
-| **2 — First adapters** | `ephpm/worker` base package + `ephpm/psr15-worker` + `ephpm/octane-driver` | new org repos | `vendor/bin/ephpm-worker` serves a stock Mezzio and Slim skeleton; `php artisan octane:start --server=ephpm` works |
+| **2 — First adapters** | `ephpm/worker` base package + `ephpm/psr15-worker` + `ephpm/octane-driver` | new org repos | `vendor/bin/ephpm-worker` serves a stock Mezzio and Slim skeleton; the Octane driver serves a Laravel skeleton via `worker_script = "vendor/bin/ephpm-octane-worker"` (NOT via `octane:start` — ePHPm supervises the workers) |
 | **3 — Streaming bodies** | `bodyStream()` → real `php://` stream over hyper's incremental reader; streamed responses; `ephpm/symfony-runtime`, `ephpm/wordpress-worker` | engine + new repos | 1 GB multipart upload without worker memory exceeding `upload_max_filesize` |
 | **4 — Cache bindings + ticks** | PSR-16/PSR-6 over `ephpm-kv`; `Ephpm\Worker\on_tick()` on a dedicated tick thread | new repos + engine | framework cache served from `ephpm-kv` across worker reuse |
 | **5 — Ecosystem** | more adapters, cluster `Octane::table` equivalent over `ephpm-kv`, per-vhost worker pools (multi-tenant worker mode) | engine + repos | — |
@@ -51,21 +61,21 @@ Composer packages remain future work):
 ## Repos & packaging — "do we need repos for PSR-15?"
 
 **Yes.** The engine lives in `ephpm/ephpm` (Rust/C). Every framework-facing
-piece is a **separate Composer package on Packagist** under the `ephpm/` vendor
-namespace, PHP namespace `Ephpm\<Area>\*`. Today only **`ephpm/cache-wordpress`**
-exists as a shipped org PHP package (it's the naming/convention template:
-`composer require ephpm/<name>`, installs to `vendor/ephpm/<name>/`). None of the
-worker packages exist yet.
+piece is a **separate Composer package** under the `ephpm/` vendor namespace,
+PHP namespace `Ephpm\<Area>\*` (`composer require ephpm/<name>`, installs to
+`vendor/ephpm/<name>/` — `ephpm/cache-wordpress` set the convention). The
+worker packages are **not yet on Packagist** — install via VCS repositories
+until published.
 
-New repos to create (each its own `github.com/ephpm/<repo>`):
+Repos (each its own `github.com/ephpm/<repo>`):
 
-| Package | New repo | Phase | Purpose |
-|---|---|---|---|
-| `ephpm/worker` | `ephpm/php-worker` | 2 | **Base SDK** all adapters depend on: `Ephpm\Worker\Envelope` type, `take_request()`/`send_response()` stubs with IDE typehints, fail-fast guard when not run under ePHPm. (The roadmaps under-specify this shared base — it's the first thing to create.) |
-| `ephpm/psr15-worker` | `ephpm/psr15-worker` | 2 | ~60-line PSR-15 `Worker`; unlocks Mezzio, Slim, Yiisoft, every PSR-15 framework. Depends on `nyholm/psr7`. |
-| `ephpm/octane-driver` | `ephpm/octane-driver` | 2 | Laravel Octane `ephpm` server driver. |
-| `ephpm/symfony-runtime` | `ephpm/symfony-runtime` | 3 | Symfony Runtime component adapter. |
-| `ephpm/wordpress-worker` | `ephpm/wordpress-worker` | 3 | WordPress worker (needs `worker_populate_superglobals`; trickiest — WP assumes real superglobals). |
+| Package | Repo | Phase | Status | Purpose |
+|---|---|---|---|---|
+| `ephpm/worker` | `ephpm/php-worker` | 2 | **Shipped** | **Base SDK** all adapters depend on: `Ephpm\Worker\Envelope` type, `take_request()`/`send_response()` stubs with IDE typehints, fail-fast guard when not run under ePHPm. |
+| `ephpm/psr15-worker` | `ephpm/psr15-worker` | 2 | Not yet built | ~60-line PSR-15 `Worker`; unlocks Mezzio, Slim, Yiisoft, every PSR-15 framework. Depends on `nyholm/psr7`. |
+| `ephpm/octane-driver` | `ephpm/octane-driver` | 2 | **Shipped, e2e-proven** | Laravel Octane `ephpm` server driver (`vendor/bin/ephpm-octane-worker`, `EPHPM_APP_BASE`). |
+| `ephpm/symfony-runtime` | `ephpm/symfony-runtime` | 3 | Not yet built | Symfony Runtime component adapter. |
+| `ephpm/wordpress-worker` | `ephpm/wordpress-worker` | 3 | **Shipped** | WordPress worker (`bin/ephpm-wp-worker`; needs `worker_populate_superglobals` — WP assumes real superglobals). |
 
 The **reference worker script** (`examples/worker/worker.php`, a ~20-line raw
 loop) stays in the ephpm repo — it's the Phase-1 acceptance artifact, not an

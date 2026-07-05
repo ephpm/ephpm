@@ -16,6 +16,7 @@ How ePHPm compares to other ways of running PHP with a webserver.
 |---|---|---|---|---|---|---|
 | Language | Rust | Go (CGO) | Go | PHP + C | C | C |
 | Dispatch to PHP | <1 μs (in-process C call) | ~2–3 μs (CGO crossings) | ~10–50 μs (IPC to worker) | <1 μs (in-process) | <1 μs (in-process) | ~50–100 μs (FastCGI socket) |
+| Worker mode (boot app once) | Built-in (`mode = "worker"`; native [Octane](/guides/laravel-octane/) + [WordPress](/guides/wordpress-worker/) adapters) | Built-in | Built-in (core model) | Built-in (requires app rewrite) | No | No |
 | Server GC pauses | None | Go GC | Go GC | None | None | None |
 | Binary | Single static binary | Caddy module | Go binary + PHP workers | PHP + extension | Apache + modules | Nginx + separate FPM |
 | DB proxy + connection pooling | Built-in (MySQL wire, R/W split) | No | No | No | No | No |

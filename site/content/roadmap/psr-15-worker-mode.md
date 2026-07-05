@@ -7,10 +7,13 @@ middleware standard: a `Psr\Http\Server\RequestHandlerInterface` consumes a
 microframeworks all expose their applications as a top-level
 `RequestHandlerInterface`. One generic adapter unlocks all of them.
 
-This is a Phase-2 item; see [PHP Worker Mode](/architecture/#php-worker-mode)
-for the prerequisite. It shares the SAPI surface added for the
-[Laravel Octane Driver](../laravel-octane-driver/#sapi-surface-rust--php) and the
-[Symfony Runtime Adapter](../symfony-runtime-driver/#sapi-surface).
+**Status: the adapter package is planned — not yet implemented.** Its
+prerequisites all shipped in 3.0: the [worker-mode engine](/architecture/#php-worker-mode)
+(`[php] mode = "worker"`, the `\Ephpm\Worker\take_request()` /
+`send_response()` / `send_response_stream()` primitives and the `Envelope`
+object) is live, and the [Laravel Octane driver](/guides/laravel-octane/) and
+[WordPress adapter](/guides/wordpress-worker/) are built on it. This page
+describes the PSR-15 adapter that has not been built yet.
 
 ---
 
@@ -25,7 +28,7 @@ get every PSR-15 framework for free.
 | Mezzio (formerly Zend Expressive) | Native | Runs on RoadRunner via `spiral/roadrunner-http` PSR worker. |
 | Slim 4 | Native | Same. |
 | Phlow, Equip, Yiisoft v3 | Native | Various community shims. |
-| Laravel | Wraps PSR-15 inside its own kernel | Use the [Octane driver](../laravel-octane-driver/). |
+| Laravel | Wraps PSR-15 inside its own kernel | Use the shipped [Octane driver](/guides/laravel-octane/). |
 | Symfony | Wraps PSR-15 via `symfony/psr-http-message-bridge` | Use the [Symfony Runtime adapter](../symfony-runtime-driver/). |
 
 A native ePHPm PSR-15 adapter:
@@ -64,7 +67,7 @@ final class Worker
             $this->psr17,  // StreamFactory
         );
 
-        while ($envelope = \Ephpm\Octane\take_request()) {
+        while ($envelope = \Ephpm\Worker\take_request()) {
             $request = $creator->fromArrays(
                 $envelope->serverVars(),
                 $envelope->headers(),
@@ -77,13 +80,32 @@ final class Worker
 
             $response = $this->handler->handle($request);
 
-            \Ephpm\Octane\send_response($response);
+            \Ephpm\Worker\send_response(
+                $response->getStatusCode(),
+                $response->getHeaders(),
+                (string) $response->getBody(),
+            );
         }
 
         return 0;
     }
 }
 ```
+
+Notes on the shipped engine contract the adapter must account for:
+
+- The primitives live under `\Ephpm\Worker\*` (not `\Ephpm\Octane\*` as older
+  drafts assumed), and `send_response(int $status, array $headers, string $body)`
+  takes unpacked values, not a response object. Header values may be arrays
+  (one wire header per element — e.g. multiple `Set-Cookie`).
+- `Envelope::parsedBody()` always returns `null` and `files()` always returns
+  `[]` today — form/multipart parsing is the adapter's job (or enable
+  `worker_populate_superglobals` and read `$_POST`/`$_FILES`).
+- `cookies()` and `query()` are parsed but **not url-decoded**; the adapter
+  must decode.
+- `bodyStream()` returns a real readable `php://` stream resource — large
+  bodies stream in without ePHPm buffering them (see `worker_stream_threshold`
+  in the [config reference](/reference/config/)).
 
 User wires this in at the worker entrypoint:
 
@@ -164,11 +186,11 @@ implementation for users with strong preferences.
 
 ### Streaming request bodies
 
-Large request bodies (file uploads, multipart) shouldn't be fully
-materialized into a `string` before handing to the PSR-7 stream. The SAPI
-binding for `take_request` should yield a streaming `Psr\Http\Message\StreamInterface`
-backed by the underlying hyper body, not an in-memory blob. This is an
-optimization, not a correctness requirement; punt to Phase-3.
+The engine half of this shipped in 3.0: `Envelope::bodyStream()` is a real
+readable `php://` stream over hyper's incremental body reader (bodies at/above
+`worker_stream_threshold`, or chunked bodies, are never fully buffered by
+ePHPm). The remaining adapter work is wrapping that resource in a
+`Psr\Http\Message\StreamInterface` rather than draining it to a string.
 
 ### `ServerRequestCreator::fromArrays` performance
 
@@ -181,9 +203,11 @@ benchmarking against RoadRunner.
 
 ### Streaming responses
 
-Same shape as request bodies. PSR-7 responses already expose
-`StreamInterface` for the body; ePHPm's `send_response` should consume it
-incrementally rather than buffering. Phase-2 deliverable.
+The engine primitive exists:
+`\Ephpm\Worker\send_response_stream(int $status, array $headers, $bodyResource)`
+pumps a stream/resource to the client in chunks. The adapter should detach the
+PSR-7 body stream and hand it to `send_response_stream` for large responses
+instead of stringifying it.
 
 ### Framework-specific bootstrap recipes
 
@@ -198,10 +222,9 @@ adapter.
 
 ## Phasing
 
-### Phase 1 — Worker mode primitive (prerequisite)
+### Phase 1 — Worker mode primitive (prerequisite) — SHIPPED
 
-Same as Octane / Symfony / WordPress. See
-[PHP Worker Mode](/architecture/#php-worker-mode).
+Shipped in ePHPm 3.0: see [PHP Worker Mode](/architecture/#php-worker-mode).
 
 ### Phase 2 — Minimal PSR-15 adapter
 
@@ -259,6 +282,6 @@ swap the framework's default cache for `ephpm-kv`.
 - [`nyholm/psr7`](https://github.com/Nyholm/psr7) — default PSR-7 implementation
 - [Mezzio docs](https://docs.mezzio.dev/) — reference framework
 - [Slim 4 docs](https://www.slimframework.com/docs/v4/) — reference framework
-- [ePHPm Laravel Octane Driver](../laravel-octane-driver/) — sister roadmap
+- [ePHPm Laravel Octane driver](/guides/laravel-octane/) — shipped adapter on the same engine
+- [ePHPm WordPress Worker Mode](/guides/wordpress-worker/) — shipped adapter on the same engine
 - [ePHPm Symfony Runtime Adapter](../symfony-runtime-driver/) — sister roadmap
-- [ePHPm WordPress Worker Mode](../wordpress-worker-mode/) — sister roadmap
