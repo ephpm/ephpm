@@ -39,6 +39,7 @@ static char *ephpm_strtok_r(char *str, const char *delim, char **saveptr) {
 #include "main/php_main.h"
 #include "main/php_variables.h"
 #include "main/php_streams.h"
+#include "main/php_output.h"
 #include "Zend/zend.h"
 #include "Zend/zend_ini.h"
 #include "Zend/zend_stream.h"
@@ -1796,6 +1797,20 @@ int ephpm_worker_run(const char *script)
          * is safe here: unwind-exit is clean stack unwinding, not a bailout,
          * so SAPI globals and the capture buffers are intact. */
         if (req_in_flight && g_worker_ops.send_response) {
+            /* Unwind-exit skips the script's own ob_end_* calls, and worker
+             * mode has no per-request RSHUTDOWN to flush buffers — content
+             * still sitting in userland output buffers (WordPress wraps whole
+             * pages in ob_start) would otherwise never reach the ub_write
+             * capture and the synthesized response would have an empty body.
+             * Flush-and-end every buffer under a bailout guard (ob handlers
+             * run userland code). */
+            zend_try {
+                php_output_end_all();
+            } zend_catch {
+                /* A throwing ob handler forfeits its buffer; deliver what the
+                 * capture has. */
+            } zend_end_try();
+
             smart_str hbuf = {0};
             zend_llist_position pos;
             sapi_header_struct *h =
