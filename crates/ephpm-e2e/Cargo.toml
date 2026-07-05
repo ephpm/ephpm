@@ -6,6 +6,11 @@ publish = false
 
 # This crate is excluded from the workspace — it has different deps and
 # is only built inside the E2E test runner container.
+#
+# The empty [workspace] table pins this crate as its own workspace root so
+# cargo never walks up and grabs an outer manifest (matters when the checkout
+# lives nested under another repo, e.g. git worktrees).
+[workspace]
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
