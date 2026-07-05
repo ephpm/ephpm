@@ -1809,7 +1809,7 @@ How it works:
 - **Laravel** — shipped: [Laravel Octane (Worker Mode)](/guides/laravel-octane/) via `ephpm/octane-driver`.
 - **WordPress** — shipped: [WordPress Worker Mode](/guides/wordpress-worker/) via `ephpm/wordpress-worker` (requires `worker_populate_superglobals = true`).
 - **Symfony** via [`symfony/runtime`](/roadmap/symfony-runtime-driver/) — planned, not yet implemented.
-- **PSR-15** (Mezzio, Slim, …) via a [generic adapter](/roadmap/psr-15-worker-mode/) — planned, not yet implemented.
+- **PSR-15** (Mezzio, Slim, …) — shipped: [PSR-15 Apps (Worker Mode)](/guides/psr15-worker/) via `ephpm/psr15-worker`.
 
 The classic fpm mode remains the default and the right choice for apps without a worker contract — ZTS thread-per-request already gives concurrency, full compatibility, and zero state-reset surface.
 
