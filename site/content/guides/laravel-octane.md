@@ -122,5 +122,5 @@ ePHPm driver:
 
 - [Laravel guide](/guides/laravel/) — classic (fpm-mode) Laravel deployment
 - [Config reference — `[php]`](/reference/config/) — authoritative worker knobs
-- [PSR-15 worker mode](/roadmap/psr-15-worker-mode/) — planned generic adapter
+- [PSR-15 worker adapter](/guides/psr15-worker/) — shipped generic adapter (Slim, Mezzio, …)
 - [Symfony Runtime adapter](/roadmap/symfony-runtime-driver/) — planned
