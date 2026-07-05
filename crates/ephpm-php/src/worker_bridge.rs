@@ -323,6 +323,13 @@ thread_local! {
     /// worker's entire life, so it can't distinguish boot from serving).
     static BOOT_NOTIFIER: RefCell<Option<Box<dyn FnOnce() + Send>>> =
         const { RefCell::new(None) };
+
+    /// Ceiling on how long `response_chunk` waits for the client to drain the
+    /// streaming-response channel. Without it, a client that stops reading
+    /// mid-download pins this worker thread in `blocking_send` forever — N
+    /// such clients wedge the whole pool undetected.
+    static STREAM_SEND_TIMEOUT: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(std::time::Duration::from_secs(60)) };
 }
 
 /// Install the dispatch receiver for the current worker thread. Called by the
@@ -359,6 +366,19 @@ pub fn set_boot_notifier(f: Box<dyn FnOnce() + Send>) {
 /// Stub: never fires (stub `run_worker` errors before any `take_request`).
 #[cfg(not(php_linked))]
 pub fn set_boot_notifier(_f: Box<dyn FnOnce() + Send>) {}
+
+/// Set this worker thread's streaming-response send timeout: how long
+/// `response_chunk` waits for a slow/stalled client before aborting the
+/// stream (the worker sees "client gone" and stops producing). Install
+/// before `run_worker`.
+#[cfg(php_linked)]
+pub fn set_stream_send_timeout(timeout: std::time::Duration) {
+    STREAM_SEND_TIMEOUT.with(|c| c.set(timeout));
+}
+
+/// Stub.
+#[cfg(not(php_linked))]
+pub fn set_stream_send_timeout(_timeout: std::time::Duration) {}
 
 /// Take the parked `oneshot::Sender` for the in-flight request, if one is
 /// still stashed. Used by the pool's crash-recovery path: after
@@ -675,7 +695,14 @@ unsafe extern "C" fn worker_response_begin(
 }
 
 /// C-callable `response_chunk`: push one body chunk. Blocks on the bounded
-/// channel (download backpressure). Returns 0, or -1 if the receiver is gone.
+/// channel (download backpressure), but only up to the per-worker
+/// [`STREAM_SEND_TIMEOUT`]. Returns 0, or -1 if the receiver is gone or the
+/// client made no progress within the timeout.
+///
+/// The timeout matters: once a streaming response's headers are delivered,
+/// the router's hung-worker net (oneshot timeout -> `note_hung`) can never
+/// fire again for this request — an unbounded `blocking_send` here would let
+/// a client that stops reading pin this worker OS thread forever.
 #[cfg(php_linked)]
 unsafe extern "C" fn worker_response_chunk(buf: *const c_char, len: usize) -> isize {
     if buf.is_null() || len == 0 {
@@ -683,18 +710,39 @@ unsafe extern "C" fn worker_response_chunk(buf: *const c_char, len: usize) -> is
     }
     // SAFETY: C passes a valid (ptr, len) for the chunk, live for this call.
     let chunk = unsafe { std::slice::from_raw_parts(buf.cast::<u8>(), len) };
-    let bytes = bytes::Bytes::copy_from_slice(chunk);
+    let mut bytes = bytes::Bytes::copy_from_slice(chunk);
+
+    let timeout = STREAM_SEND_TIMEOUT.with(std::cell::Cell::get);
+    let deadline = std::time::Instant::now() + timeout;
 
     RESPONSE_TX.with(|cell| {
         let borrow = cell.borrow();
-        match borrow.as_ref() {
-            // blocking_send on a plain OS worker thread: blocks on backpressure
-            // (bounded channel), errors only if the receiver dropped.
-            Some(tx) => match tx.blocking_send(bytes) {
-                Ok(()) => 0,
-                Err(_) => -1, // receiver dropped (client gone)
-            },
-            None => -1,
+        let Some(tx) = borrow.as_ref() else {
+            return -1;
+        };
+        // try_send + bounded sleep instead of blocking_send: same backpressure
+        // (the channel depth still caps in-flight bytes), but with an escape
+        // hatch for a stalled client. The sleep only runs while the channel is
+        // full — the normal path is a single successful try_send.
+        loop {
+            match tx.try_send(bytes) {
+                Ok(()) => return 0,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    return -1; // receiver dropped (client gone)
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(b)) => {
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            timeout_secs = timeout.as_secs(),
+                            "streaming response stalled (client not reading) — aborting stream"
+                        );
+                        metrics::counter!("ephpm_worker_stream_stalls_total").increment(1);
+                        return -1;
+                    }
+                    bytes = b;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
         }
     })
 }

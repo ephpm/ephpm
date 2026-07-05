@@ -1358,6 +1358,15 @@ impl Config {
     ///
     /// Returns [`ConfigError::Validation`] if any invariant is violated.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // Reject unknown modes outright: a typo like "workr" would otherwise
+        // silently mean fpm (the no-silent-knob rule).
+        if self.php.mode != "fpm" && self.php.mode != "worker" {
+            return Err(ConfigError::Validation(format!(
+                "[php] mode must be \"fpm\" or \"worker\", got \"{}\"",
+                self.php.mode,
+            )));
+        }
+
         if self.php.is_worker_mode() {
             if self.server.sites_dir.is_some() {
                 return Err(ConfigError::Validation(
@@ -2681,5 +2690,18 @@ worker_stream_threshold = 262144
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
         assert!(format!("{err}").contains("sites_dir"));
+    }
+
+    #[test]
+    fn test_validate_rejects_unknown_php_mode() {
+        // A typo like "workr" must hard-error, not silently mean fpm.
+        let mut cfg = Config::default();
+        cfg.php.mode = "workr".to_string();
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+        assert!(format!("{err}").contains("mode"));
+
+        cfg.php.mode = "fpm".to_string();
+        assert!(cfg.validate().is_ok());
     }
 }

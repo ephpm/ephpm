@@ -761,20 +761,38 @@ impl Router {
             let should_stream = self.worker_stream_threshold > 0
                 && content_length.is_none_or(|len| len >= self.worker_stream_threshold);
 
-            let worker_body = if should_stream {
-                stream_request_body(req, content_length)
+            let (worker_body, body_overflow) = if should_stream {
+                let (body, overflow) = stream_request_body(req, content_length, self.max_body_size);
+                (body, Some(overflow))
             } else {
-                let bytes = match req.collect().await {
-                    Ok(collected) => collected.to_bytes().to_vec(),
-                    Err(_) => Vec::new(),
+                // The Content-Length pre-check already 413'd declared-large
+                // bodies; `Limited` catches chunked / lying clients on the
+                // buffered path (`Err` on exceeding the cap).
+                let bytes = if self.max_body_size > 0 {
+                    let cap = usize::try_from(self.max_body_size).unwrap_or(usize::MAX);
+                    match http_body_util::Limited::new(req, cap).collect().await {
+                        Ok(collected) => collected.to_bytes().to_vec(),
+                        Err(_) => {
+                            counter!("ephpm_http_body_overflow_total").increment(1);
+                            return error_response(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "413 Payload Too Large",
+                            );
+                        }
+                    }
+                } else {
+                    match req.collect().await {
+                        Ok(collected) => collected.to_bytes().to_vec(),
+                        Err(_) => Vec::new(),
+                    }
                 };
                 #[allow(clippy::cast_precision_loss)]
                 histogram!("ephpm_http_request_body_bytes", "method" => method.clone())
                     .record(bytes.len() as f64);
-                ephpm_php::worker_bridge::WorkerBody::Buffered(bytes)
+                (ephpm_php::worker_bridge::WorkerBody::Buffered(bytes), None)
             };
 
-            return self
+            let resp = self
                 .handle_php_worker(
                     &pool,
                     method,
@@ -795,11 +813,35 @@ impl Router {
                     accepts_br,
                 )
                 .await;
+
+            // The streaming cap tripped mid-body: whatever the worker made of
+            // the truncated body, the request as sent was over the limit — the
+            // client gets a 413, exactly as the Content-Length pre-check would
+            // have produced.
+            if let Some(flag) = body_overflow {
+                if flag.load(std::sync::atomic::Ordering::Acquire) {
+                    return error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large");
+                }
+            }
+            return resp;
         }
 
-        let body = match req.collect().await {
-            Ok(collected) => collected.to_bytes().to_vec(),
-            Err(_) => Vec::new(),
+        // fpm path buffers the whole body; cap chunked / lying clients the same
+        // way the Content-Length pre-check caps declared bodies.
+        let body = if self.max_body_size > 0 {
+            let cap = usize::try_from(self.max_body_size).unwrap_or(usize::MAX);
+            match http_body_util::Limited::new(req, cap).collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(_) => {
+                    counter!("ephpm_http_body_overflow_total").increment(1);
+                    return error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large");
+                }
+            }
+        } else {
+            match req.collect().await {
+                Ok(collected) => collected.to_bytes().to_vec(),
+                Err(_) => Vec::new(),
+            }
         };
         #[allow(clippy::cast_precision_loss)]
         histogram!("ephpm_http_request_body_bytes", "method" => method.clone())
@@ -1375,20 +1417,41 @@ fn error_response(status: StatusCode, body: &str) -> Response<ServerBody> {
 fn stream_request_body(
     req: Request<Incoming>,
     content_length: Option<u64>,
-) -> ephpm_php::worker_bridge::WorkerBody {
+    max_body_size: u64,
+) -> (ephpm_php::worker_bridge::WorkerBody, Arc<std::sync::atomic::AtomicBool>) {
     use http_body_util::BodyExt;
 
     let (tx, rx) =
         tokio::sync::mpsc::channel::<Bytes>(ephpm_php::worker_bridge::BODY_CHANNEL_DEPTH);
     let mut body = req.into_body();
 
+    // Set when the cumulative body size exceeds `max_body_size`. The
+    // Content-Length pre-check can't see chunked / lying clients, so the cap
+    // is enforced on the actual bytes; the router turns the flag into a 413
+    // regardless of what the worker produced from the truncated body.
+    let overflow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let overflow_task = Arc::clone(&overflow);
+
     tokio::spawn(async move {
+        let mut total: u64 = 0;
         loop {
             match body.frame().await {
                 Some(Ok(frame)) => {
                     if let Ok(data) = frame.into_data() {
                         if data.is_empty() {
                             continue;
+                        }
+                        total = total.saturating_add(data.len() as u64);
+                        if max_body_size > 0 && total > max_body_size {
+                            overflow_task.store(true, std::sync::atomic::Ordering::Release);
+                            counter!("ephpm_http_body_overflow_total").increment(1);
+                            tracing::warn!(
+                                total,
+                                max_body_size,
+                                "request body exceeded max_body_size mid-stream — \
+                                 truncating body and answering 413"
+                            );
+                            break;
                         }
                         // send().await suspends when the channel is full,
                         // applying backpressure without blocking a thread. Err
@@ -1411,7 +1474,7 @@ fn stream_request_body(
 
     // `content_length` is advisory (declared length); 0 for chunked/unknown.
     let declared_len = usize::try_from(content_length.unwrap_or(0)).unwrap_or(usize::MAX);
-    ephpm_php::worker_bridge::WorkerBody::Streaming { rx, declared_len }
+    (ephpm_php::worker_bridge::WorkerBody::Streaming { rx, declared_len }, overflow)
 }
 
 /// Build a chunked, streamed HTTP response from a worker-mode streaming

@@ -57,6 +57,9 @@ pub struct WorkerPool {
     worker_count: usize,
     /// Time each worker gets to reach its first `take_request()`.
     boot_timeout: Duration,
+    /// How long `response_chunk` waits for a stalled client before aborting a
+    /// streaming response (see `worker_bridge::set_stream_send_timeout`).
+    stream_send_timeout: Duration,
 }
 
 /// Shared, atomically-updated pool state.
@@ -89,6 +92,7 @@ impl WorkerPool {
         max_requests: u64,
         backlog: usize,
         boot_timeout: Duration,
+        stream_send_timeout: Duration,
     ) -> Arc<Self> {
         let (dispatch_tx, dispatch_rx) = async_channel::bounded(backlog.max(1));
         let state = Arc::new(PoolState {
@@ -111,6 +115,7 @@ impl WorkerPool {
             max_requests,
             worker_count,
             boot_timeout,
+            stream_send_timeout,
         });
 
         for _ in 0..worker_count {
@@ -230,6 +235,7 @@ fn worker_main(
     // so the very first take_request() inside the framework loop can pull work.
     ephpm_php::worker_bridge::set_dispatch_receiver(rx.clone());
     ephpm_php::worker_bridge::set_max_requests(max_requests);
+    ephpm_php::worker_bridge::set_stream_send_timeout(pool.stream_send_timeout);
 
     // TSRM register + start the one long-lived request the whole loop runs in.
     if let Err(e) = PhpRuntime::worker_thread_init() {
@@ -421,6 +427,7 @@ mod tests {
             500,
             4,
             Duration::from_secs(30),
+            Duration::from_secs(60),
         );
 
         assert_eq!(pool.ready_count(), 0, "no worker booted, so not ready");

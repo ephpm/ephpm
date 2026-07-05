@@ -247,6 +247,10 @@ async fn bind_listeners(
             config.php.worker_max_requests,
             config.php.effective_worker_backlog(),
             Duration::from_secs(config.php.worker_boot_timeout),
+            // A client that stops reading a streamed download for longer than
+            // the idle timeout aborts the stream (frees the worker thread) —
+            // same idleness contract the connection layer applies.
+            Duration::from_secs(config.server.timeouts.idle),
         );
         Some(pool)
     } else {
