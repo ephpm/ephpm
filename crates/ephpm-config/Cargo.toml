@@ -9,6 +9,7 @@ description = "Configuration loading for ePHPm"
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 figment.workspace = true
 thiserror.workspace = true
 

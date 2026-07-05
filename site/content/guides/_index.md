@@ -17,3 +17,4 @@ Task-oriented walkthroughs for common deployments.
 - **[Laravel Octane (Worker Mode)](laravel-octane/)** — boot Laravel once per worker with the native Octane driver.
 - **[WordPress Worker Mode](wordpress-worker/)** — boot WordPress once per worker with the `ephpm/wordpress-worker` adapter.
 - **[PSR-15 Apps (Worker Mode)](psr15-worker/)** — Slim, Mezzio, or any PSR-15 handler on the generic `ephpm/psr15-worker` adapter.
+- **[Native Middleware](native-middleware/)** — compiled `.so` middleware (JWT, CORS, rate limiting, security headers) running in front of PHP, with KV-backed cluster-wide state.

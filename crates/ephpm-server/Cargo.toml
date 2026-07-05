@@ -13,6 +13,12 @@ ephpm-cluster.workspace = true
 ephpm-config.workspace = true
 ephpm-db.workspace = true
 ephpm-kv.workspace = true
+ephpm-middleware = { workspace = true, features = ["host"] }
+# Builtin middleware registry: the four in-tree module implementations
+# linked in as a plain rlib (no C ABI exports), so `library = "jwt"` works
+# in every binary — including the fully static musl release, where dlopen
+# does not exist.
+ephpm-middleware-builtins.workspace = true
 ephpm-php.workspace = true
 ephpm-query-stats.workspace = true
 ephpm-sqld.workspace = true
@@ -37,6 +43,8 @@ tokio-stream.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
 dashmap.workspace = true
+libloading.workspace = true
+serde_json.workspace = true
 tokio-util.workspace = true
 bytes.workspace = true
 sha2.workspace = true

@@ -38,6 +38,7 @@ The full test suite hits OpenSSL via the e2e crate and may fail on hosts without
 ## Build & test tooling (xtask)
 
 ```bash
+cargo xtask doctor       # check build prerequisites (toolchains, PHP SDK cache, optional tools)
 cargo xtask release      # build PHP SDK + ephpm binary (release mode)
 cargo xtask php-sdk      # only the static PHP SDK (~15 min first time, then cached)
 cargo xtask e2e-install  # download kind, tilt, kubectl into ./bin/

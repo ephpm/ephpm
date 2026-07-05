@@ -42,6 +42,14 @@ Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and ex
 | `ephpm_php_execution_duration_seconds` | histogram | — | Time spent inside the PHP runtime, per request. |
 | `ephpm_php_output_bytes` | histogram | — | Bytes emitted by PHP per request. |
 
+## Native middleware
+
+These appear when at least one `[[middleware]]` mount is configured.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_middleware_invocations_total` | counter | `module`, `action` | Middleware invocations, one per module per matching request. `action` is the verdict: `continue`, `respond`, or `rewrite`. A module `invoke` error (non-zero return, including a caught panic) counts as `respond` — the host fails closed with a 500. |
+
 ## Worker mode
 
 These appear when `[php] mode = "worker"`.

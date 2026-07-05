@@ -8,6 +8,9 @@ An all-in-one PHP application server written in Rust that embeds PHP via FFI int
 # Stub mode (no PHP, fast iteration on HTTP/routing logic)
 cargo build
 
+# Preflight: check build prerequisites (exits non-zero if a required tool is missing)
+cargo xtask doctor            # add --target windows to check the Windows-build toolchain
+
 # Release binary with PHP + sqld embedded
 cargo xtask release           # → target/release/ephpm (PHP 8.5, sqld auto-downloaded)
 cargo xtask release 8.4       # → target/release/ephpm (PHP 8.4)

@@ -1,0 +1,22 @@
+[package]
+name = "ephpm-middleware-cors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ePHPm native middleware: CORS preflight handling and response headers (loadable cdylib shell; implementation in ephpm-middleware-builtins)"
+
+[lib]
+# cdylib = the loadable module for the dlopen lane. The implementation (and
+# the rlib ephpm-server links) is ephpm-middleware-builtins — this shell only
+# adds the C ABI exports, which must never be linked into the host binary
+# (four modules exporting the same `ephpm_middleware_*` symbols collide).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ephpm-middleware.workspace = true
+ephpm-middleware-builtins.workspace = true
+
+[lints]
+workspace = true

@@ -188,7 +188,7 @@ The project has a working Cargo workspace. PHP embedding is fully implemented an
 
 ZTS PHP runs concurrently: each `spawn_blocking` thread auto-registers with TSRM and gets its own PHP context — no dedicated worker pool. Shipped subsystems beyond core embedding: in-process MySQL DB proxy with pooling, in-process KV store (RESP + SETNX), SWIM gossip clustering, single-node and clustered SQLite (litewire + optional sqld sidecar), primary election + failover restart, query stats with Prometheus metrics, and a native PHP session handler backed by the KV tier.
 
-Active roadmap items (specs landed, no code yet): native middleware via an `elephc` cdylib and OPcache clustering with per-vhost preload.
+Native middleware shipped: a static builtin registry (`jwt`, `cors`, `ratelimit`, `security-headers` compiled into every binary — the only lane that works in the fully static musl release) plus a dlopen C-ABI lane for out-of-tree modules on dynamically linked builds. Implementations live in `ephpm-middleware-builtins`; the `ephpm-middleware-*` crates are cdylib shells (their `declare!` exports collide if linked into one binary — never add them as server deps). Active roadmap items (specs landed, no code yet): OPcache clustering with per-vhost preload.
 
 ## Repository Structure
 
@@ -209,6 +209,9 @@ crates/
 ├── ephpm-sqld/         # sqld binary embedding — include_bytes! extraction,
 │                       # SqldProcess lifecycle, failover restart
 ├── ephpm-query-stats/  # SQL normalizer + digest tracking + Prometheus metrics
+├── ephpm-middleware/   # Middleware C ABI + Rust authoring kit + host table + builtin adapter
+├── ephpm-middleware-builtins/  # The four in-tree middleware implementations (rlib, linked into the server)
+├── ephpm-middleware-{jwt,cors,ratelimit,security-headers}/  # cdylib shells for the dlopen lane
 ├── ephpm-e2e/          # E2E test suite — excluded from workspace, runs inside Docker via Tilt+Kind
 └── xtask/              # Build tooling — release, php-sdk, e2e, e2e-up, e2e-down
 ```
@@ -254,4 +257,4 @@ Key files:
 6. **Conditional compilation**: All PHP FFI code is gated with `#[cfg(php_linked)]`. The stub mode (no `PHP_SDK_PATH`) must always compile and pass tests. See `CLAUDE.md` for the full conventions.
 7. **Build**: `cargo xtask release` downloads the prebuilt PHP SDK (`libphp.a` + headers) from `github.com/ephpm/php-sdk` releases and compiles the musl-linked release binary. No system PHP, Composer, or static-php-cli required — just curl, tar, build-essential, and `musl-tools` on Linux.
 8. **CLI**: `ephpm serve` starts the HTTP server. `ephpm php [args...]` is a full PHP CLI passthrough — all standard PHP flags work (`-v`, `-r`, `-f`, `-m`, `-i`, `-l`, etc.).
-9. **ZTS is implemented.** PHP is compiled with `--enable-zts`; each `spawn_blocking` thread auto-registers with TSRM and gets its own isolated PHP context. The `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown; an `AtomicBool` fast-path handles the "is PHP ready?" hot check. Windows uses NTS (`ZTS=0`) due to DLL constraints. See the roadmap docs in `docs/architecture/` for what's next (native middleware via elephc cdylib, OPcache clustering, etc.).
+9. **ZTS is implemented.** PHP is compiled with `--enable-zts`; each `spawn_blocking` thread auto-registers with TSRM and gets its own isolated PHP context. The `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown; an `AtomicBool` fast-path handles the "is PHP ready?" hot check. Windows uses NTS (`ZTS=0`) due to DLL constraints. See the roadmap docs in `docs/architecture/` for what's next (OPcache clustering, build-time composition of extensions/middleware, etc.).

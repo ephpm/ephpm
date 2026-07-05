@@ -1,0 +1,27 @@
+[package]
+name = "ephpm-middleware-ratelimit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ePHPm native middleware: fixed-window per-client rate limiting via the embedded KV store (loadable cdylib shell; implementation in ephpm-middleware-builtins)"
+
+[lib]
+# cdylib = the loadable module for the dlopen lane. The implementation (and
+# the rlib ephpm-server links) is ephpm-middleware-builtins — this shell only
+# adds the C ABI exports, which must never be linked into the host binary
+# (four modules exporting the same `ephpm_middleware_*` symbols collide).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ephpm-middleware.workspace = true
+ephpm-middleware-builtins.workspace = true
+
+[dev-dependencies]
+# tests/fail_open.rs builds the FFI Request view by hand (host-side pieces).
+ephpm-middleware = { workspace = true, features = ["host"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

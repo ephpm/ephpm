@@ -3,6 +3,7 @@ pub mod body;
 pub mod file_cache;
 mod idle;
 pub mod metrics;
+pub mod middleware;
 pub mod rate_limit;
 pub mod router;
 pub mod static_files;
@@ -59,6 +60,23 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // Start background services.
     let (kv_store, _kv_handle) = start_kv_service(&config)?;
 
+    // Wire the KV store into the middleware host table (a no-op when no
+    // middleware is mounted), then load the chain — fail fast at startup on
+    // any unresolvable library, missing symbol, or failing init.
+    ephpm_middleware::host::set_kv_store(&kv_store);
+    let middleware_chain = if config.middleware.is_empty() {
+        None
+    } else {
+        let chain = middleware::MiddlewareChain::load(&config.middleware)
+            .context("failed to load native middleware chain")?;
+        tracing::info!(
+            count = chain.len(),
+            modules = ?chain.module_names(),
+            "middleware chain loaded"
+        );
+        Some(Arc::new(chain))
+    };
+
     // Start cluster gossip before DB proxies — clustered SQLite needs the handle.
     let cluster_handle = if config.cluster.enabled {
         let handle = ephpm_cluster::start_gossip(&config.cluster)
@@ -104,7 +122,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     let _db_handles = start_db_proxies(&config, cluster_handle.as_ref(), &query_stats).await?;
 
-    let listeners = bind_listeners(&config, kv_store, metrics_handle).await?;
+    let listeners = bind_listeners(&config, kv_store, metrics_handle, middleware_chain).await?;
     accept_loop(listeners).await
 }
 
@@ -150,6 +168,7 @@ async fn bind_listeners(
     config: &Config,
     kv_store: Arc<ephpm_kv::store::Store>,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
+    middleware_chain: Option<Arc<middleware::MiddlewareChain>>,
 ) -> anyhow::Result<Listeners> {
     let addr: SocketAddr = config.server.listen.parse().context("invalid listen address")?;
 
@@ -266,14 +285,17 @@ async fn bind_listeners(
         None
     };
 
-    let router = Arc::new(Router::new(
-        config,
-        kv_store,
-        metrics_handle,
-        limiter.clone(),
-        file_cache.clone(),
-        worker_pool.clone(),
-    ));
+    let router = Arc::new(
+        Router::new(
+            config,
+            kv_store,
+            metrics_handle,
+            limiter.clone(),
+            file_cache.clone(),
+            worker_pool.clone(),
+        )
+        .with_middleware_chain(middleware_chain),
+    );
 
     let has_tls = !matches!(tls_mode, TlsMode::None);
 
@@ -1333,6 +1355,7 @@ mod lib_tests {
             db: ephpm_config::DbConfig::default(),
             kv: ephpm_config::KvConfig::default(),
             cluster: ephpm_config::ClusterConfig::default(),
+            middleware: Vec::new(),
         };
         let store = ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default());
         Arc::new(Router::new(&config, store, None, None, None, None))

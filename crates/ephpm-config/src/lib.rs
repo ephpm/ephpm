@@ -32,6 +32,55 @@ pub struct Config {
     pub kv: KvConfig,
     #[serde(default)]
     pub cluster: ClusterConfig,
+
+    /// Native middleware chain (`[[middleware]]` blocks). Each mount loads a
+    /// shared library (`.so`/`.dylib`/`.dll`) at startup and evaluates it per
+    /// PHP-bound request, before the request body is read — see the loader in
+    /// `ephpm-server`. Mounts run in ascending `order`.
+    ///
+    /// Default: empty (no middleware loaded).
+    #[serde(default)]
+    pub middleware: Vec<MiddlewareMount>,
+}
+
+/// One native middleware mount (`[[middleware]]`).
+///
+/// ```toml
+/// [[middleware]]
+/// library = "rate-limit"
+/// match = "/api/*"
+/// order = 20
+/// config = { per_ip_rps = 50, burst = 100 }
+/// ```
+#[derive(Debug, Deserialize)]
+pub struct MiddlewareMount {
+    /// Module to run. Checked against the builtin registry first (`jwt`,
+    /// `cors`, `ratelimit`/`rate-limit`, `security-headers` and their
+    /// `ephpm-middleware-*` long forms are compiled into every binary — no
+    /// dlopen). Anything else is a shared library: either a bare name
+    /// (resolved through the middleware search path with a platform suffix,
+    /// e.g. `auth-jwt` → `auth-jwt.linux-x86_64.so`) or an explicit path — a
+    /// value containing a path separator or a file extension is used as-is.
+    /// Must not be empty (enforced by [`Config::validate`]).
+    pub library: String,
+
+    /// Glob the request path must match for this mount to run. `*` matches
+    /// any character sequence (including `/`); everything else is literal.
+    ///
+    /// Default: unset (the middleware runs on every PHP-bound request).
+    #[serde(rename = "match", default)]
+    pub match_pattern: Option<String>,
+
+    /// Position in the middleware chain. Lower values run first; mounts with
+    /// equal `order` keep their declaration order. Required — no default.
+    pub order: u32,
+
+    /// Arbitrary configuration table for the module, serialised to JSON and
+    /// passed to its `init`.
+    ///
+    /// Default: unset (the module's `init` receives NULL).
+    #[serde(default)]
+    pub config: Option<serde_json::Value>,
 }
 
 /// HTTP server configuration.
@@ -1381,6 +1430,17 @@ impl Config {
             // worker_script is required and must resolve under document_root.
             self.resolve_worker_script()?;
         }
+
+        // Native middleware: an empty `library` can never resolve, and
+        // silently skipping the mount would be a silent no-op config knob.
+        for (i, mount) in self.middleware.iter().enumerate() {
+            if mount.library.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "[[middleware]] entry {i} (order = {}): library must not be empty",
+                    mount.order,
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -2096,6 +2156,81 @@ ini_overrides = [
         assert_eq!(config.php.ini_overrides.len(), 2);
         assert_eq!(config.php.ini_overrides[0], ["display_errors", "Off"]);
         assert_eq!(config.php.ini_overrides[1], ["error_reporting", "E_ALL"]);
+    }
+
+    #[test]
+    fn test_middleware_mounts_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[[middleware]]
+library = "auth-jwt"
+match = "/api/*"
+order = 10
+
+[[middleware]]
+library = "rate-limit"
+order = 20
+config = { per_ip_rps = 50, burst = 100 }
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.middleware.len(), 2);
+
+        assert_eq!(config.middleware[0].library, "auth-jwt");
+        assert_eq!(config.middleware[0].match_pattern.as_deref(), Some("/api/*"));
+        assert_eq!(config.middleware[0].order, 10);
+        assert!(config.middleware[0].config.is_none());
+
+        assert_eq!(config.middleware[1].library, "rate-limit");
+        assert!(config.middleware[1].match_pattern.is_none());
+        assert_eq!(config.middleware[1].order, 20);
+        let mount_config = config.middleware[1].config.as_ref().expect("inline config table");
+        assert_eq!(mount_config["per_ip_rps"], serde_json::json!(50));
+        assert_eq!(mount_config["burst"], serde_json::json!(100));
+        // The loader serialises this value back to JSON for the module's init.
+        let json = serde_json::to_string(mount_config).unwrap();
+        assert!(json.contains("per_ip_rps"));
+    }
+
+    #[test]
+    fn test_middleware_missing_order_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[[middleware]]
+library = "auth-jwt"
+"#,
+        )
+        .unwrap();
+
+        assert!(Config::load(&file).is_err(), "order is required — no default");
+    }
+
+    #[test]
+    fn test_middleware_empty_library_fails_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[[middleware]]
+library = ""
+order = 10
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("library must not be empty"), "{err}");
     }
 
     #[test]

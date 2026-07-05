@@ -365,7 +365,7 @@ standard PHP way. Drop the binary, drop your extension, point
 php-mongodb`, no Dockerfile dance, no separate PHP-FPM rebuild.
 
 It also enables the natural pairing with middleware: the
-[Native Middleware](native-middleware/) loader and this loader are
+[Native Middleware](/guides/native-middleware/) loader (shipped) and this loader are
 the same shape (dlopen + lifecycle + ABI contract), differing only
 in which surface they target (the request pipeline vs the Zend
 Engine's module table). Both turn ePHPm into a small,
