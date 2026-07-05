@@ -13,3 +13,5 @@ Task-oriented walkthroughs for common deployments.
 - **[Clustering Setup](clustering-setup/)** — gossip-based HA with clustered SQLite.
 - **[KV from PHP](kv-from-php/)** — the `ephpm_kv_*` SAPI functions.
 - **[Query Stats with Prometheus](query-stats-prometheus/)** — observability for your database queries.
+- **[Laravel Octane (Worker Mode)](laravel-octane/)** — boot Laravel once per worker with the native Octane driver.
+- **[WordPress Worker Mode](wordpress-worker/)** — boot WordPress once per worker with the `ephpm/wordpress-worker` adapter.

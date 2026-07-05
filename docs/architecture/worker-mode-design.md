@@ -41,7 +41,7 @@ Phase 1 ships exactly two Rust-backed PHP functions plus one envelope object.
 worker-mode primitive, it is an Octane feature.
 
 ```php
-namespace Ephpm\Worker;   // engine namespace; adapters alias to Ephpm\Octane\*
+namespace Ephpm\Worker;   // engine namespace; adapters consume it directly
 
 /**
  * Block until the next HTTP request is routed to this worker thread.
@@ -75,9 +75,9 @@ final class Envelope {
     public function headers(): array;       // ['Name' => 'value', ...]
     public function cookies(): array;       // parsed name => value
     public function query(): array;         // parsed $_GET
-    public function parsedBody(): ?array;   // $_POST (form/multipart) or null
-    public function files(): array;         // $_FILES-shaped
-    public function bodyStream();           // Phase 1: string; Phase 3: php://stream
+    public function parsedBody(): ?array;   // as shipped: ALWAYS null (form parsing is an adapter concern)
+    public function files(): array;         // as shipped: ALWAYS [] (use populate_superglobals for $_FILES)
+    public function bodyStream();           // as shipped (Phase 3): real readable php:// stream resource
     public function rawBody(): string;      // php://input equivalent
 }
 ```

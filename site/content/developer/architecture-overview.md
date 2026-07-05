@@ -547,9 +547,9 @@ defaults < config file (ephpm.toml) < environment variables (EPHPM_*) < CLI args
 listen = "0.0.0.0:8080"
 document_root = "/var/www/html"
 index_files = ["index.php", "index.html"]
-# workers = 4                  # future: number of PHP worker threads (ZTS)
 
 [php]
+# workers = 4                  # optional cap on concurrent PHP executions (0 = unlimited)
 max_execution_time = 30
 memory_limit = "128M"
 # ini_file = "/etc/php/8.5/php.ini"    # optional: load a custom php.ini
@@ -676,8 +676,8 @@ A single Rust binary that reads a TOML config, boots an HTTP server with embedde
 - KV store
 - Clustering
 - Observability / admin UI
-- Worker mode (persistent PHP processes between requests)
-- ZTS / multi-threaded PHP execution
+- Worker mode — since shipped in 3.0 (`[php] mode = "worker"`, see [Worker Mode](/architecture/#php-worker-mode))
+- ZTS / multi-threaded PHP execution — since shipped (per-thread TSRM via `spawn_blocking`)
 
 ### Request Flow
 
@@ -969,4 +969,5 @@ This is the hardest crate and the core of the project.
 | **v0.6: Admin UI** | Embedded web dashboard, request inspector | Planned |
 | **v0.7: Observability** | Prometheus `/metrics` + query stats **implemented**; OTLP receiver and auto-instrumentation still planned | Partially shipped |
 | **v0.8: Clustering** | Gossip discovery (chitchat), hash-based key ownership, gossip KV replication for small values, SQLite primary election | **Implemented** |
+| **3.0: Worker mode** | Persistent worker mode (`[php] mode = "worker"`), streaming request/response bodies, Laravel Octane + WordPress adapters | **Implemented** |
 | **v1.0: Production** | Read/write splitting, replication lag awareness, hardening | Planned |

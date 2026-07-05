@@ -1759,65 +1759,18 @@ Release artifacts: `ephpm-0.1.0-php8.5-linux-x86_64`, `ephpm-0.1.0-php8.5-window
 
 ## PHP Execution Modes
 
-ePHPm supports two PHP execution modes, controlled by `php.mode` in config:
+PHP is statically linked into the binary via FFI — zero IPC overhead, Rust calls PHP C functions directly through the SAPI. `[php] mode` selects the **request-execution model** (see the [config reference](/reference/config/) for the authoritative key table):
 
-### Embedded mode (default)
+### fpm mode (default)
 
-PHP is statically linked into the binary via FFI. Zero IPC overhead — Rust calls PHP C functions directly through the SAPI.
+`mode = "fpm"` — php-fpm-shaped: each HTTP request runs a full `php_request_startup`/`shutdown` cycle, so framework state never leaks across requests. Behavior is byte-for-byte identical to releases before worker mode existed.
 
 | Variant | Concurrency | Status |
 |---------|-------------|--------|
 | ZTS | `spawn_blocking` + per-thread TSRM — concurrent PHP execution | **Implemented** |
 | NTS (Windows) | `Mutex` + `spawn_blocking` — serialized execution | **Implemented** |
 
-**When to use:** Production deployments where performance matters and the bundled PHP extensions are sufficient.
-
-```toml
-[php]
-mode = "embedded"   # default, no need to specify
-```
-
-### External mode
-
-ePHPm spawns PHP worker processes and communicates over stdin/stdout pipes using a binary protocol. The user provides their own PHP binary — any version, any extensions, any custom patches.
-
-```toml
-[php]
-mode = "external"
-binary = "/usr/bin/php"
-workers = 4
-worker_script = "vendor/ephpm/worker.php"
-```
-
-**How it works:**
-
-1. ePHPm spawns N long-lived PHP worker processes (`php worker.php`)
-2. Each worker runs a loop: read request from stdin → execute → write response to stdout
-3. ePHPm routes incoming HTTP requests to available workers
-4. If a worker crashes, ePHPm restarts it automatically
-
-**When to use:**
-- Custom PHP builds with proprietary or uncommon extensions
-- PHP versions not yet supported by static-php-cli
-- Environments where rebuilding the binary isn't practical
-- Teams that already manage their own PHP installations
-
-**Tradeoffs vs embedded:**
-
-| | Embedded | External |
-|---|---|---|
-| Overhead per request | ~0 (native C call) | ~50-200μs (IPC) |
-| Concurrency | Concurrent threads (ZTS) | Multiple worker processes |
-| Crash isolation | PHP crash = process crash | Worker crash → auto-restart |
-| PHP version | Built into binary | User's own binary |
-| Custom extensions | Rebuild SDK | Install normally |
-| Zero-config drop-in | Yes | Requires `worker.php` package |
-
-**PHP worker side:** External mode requires a small PHP package (`ephpm/worker`) that provides the request loop. This is similar to RoadRunner's worker model — the PHP side reads requests from stdin, runs the application, and writes responses to stdout.
-
-All other ePHPm features (HTTP server, static files, routing, config, and planned features like DB proxy, KV store, admin UI, observability) work identically in both modes.
-
-### Thread Safety: ZTS (embedded mode)
+### Thread Safety: ZTS
 
 PHP is compiled with ZTS (`--enable-zts`). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The mutex only protects one-time init/shutdown. Windows builds use NTS with serialized execution.
 
@@ -1831,20 +1784,38 @@ PHP is compiled with ZTS (`--enable-zts`). Each `spawn_blocking` thread auto-reg
 | ~5% throughput overhead vs NTS | All platforms | Expected; TSRM bookkeeping |
 | `ext-imap` incompatible with ZTS | If used | c-client library limitation |
 
-### Worker Mode (planned) {#php-worker-mode}
+### Worker Mode {#php-worker-mode}
 
-The next evolution of the embedded-mode runtime is **worker mode** — boot the PHP app once per thread, then handle multiple requests in a loop without re-executing the bootstrap on each request (same model as FrankenPHP worker mode and RoadRunner). ZTS makes this possible since each thread already has its own persistent PHP context.
+**Shipped in 3.0.** `mode = "worker"` boots the PHP app once per worker thread, then handles requests in a loop without re-executing the bootstrap (same model as FrankenPHP worker mode and RoadRunner). ZTS makes this possible since each thread already has its own persistent PHP context. The win is largest for apps with heavy framework bootstrap — each request otherwise spends milliseconds redoing autoload, container build, and route compilation.
 
-The win is largest for apps with heavy framework bootstrap, where each request otherwise spends milliseconds redoing autoload, container build, and route compilation. Worker mode is best suited to apps that define a clean **worker contract** — a documented surface for resetting per-request state between iterations. Two are tracked as concrete drivers:
+```toml
+[php]
+mode = "worker"
+worker_script = "worker.php"   # relative to document_root; required
+```
 
-- **Laravel** via [Laravel Octane](/roadmap/laravel-octane-driver/). Octane is Laravel's standard persistent-server adapter, and an `ephpm` driver lets stock Laravel apps opt into worker mode without leaving the binary.
-- **Symfony** via [`symfony/runtime`](/roadmap/symfony-runtime-driver/). Symfony's runtime component is the analogous adapter layer.
+How it works:
 
-#### What about WordPress?
+- A fixed pool of dedicated OS worker threads (`worker_count`, CPU-derived by default) each run `worker_script` once. The script boots the framework, then loops on the engine primitives registered in PHP userland:
+  - `\Ephpm\Worker\take_request(): ?\Ephpm\Worker\Envelope` — blocks until the next HTTP request; `null` on shutdown/recycle.
+  - `\Ephpm\Worker\send_response(int $status, array $headers, string $body): void` — hands the response back. Header values may be arrays (`'Set-Cookie' => [$c1, $c2]` emits one wire header per element).
+  - `\Ephpm\Worker\send_response_stream(int $status, array $headers, $bodyResource): void` — streams a PHP stream/resource to the client in chunks.
+- The `Envelope` carries `serverVars()`, `headers()` (duplicate request headers pre-joined with `", "`, `Cookie` with `"; "`), `cookies()` and `query()` (parsed but **not** url-decoded — adapters decode), `rawBody()`, and `bodyStream()` (a real readable `php://` stream; large or chunked bodies at/above `worker_stream_threshold` stream in without ePHPm buffering them). `parsedBody()` always returns `null` and `files()` always returns `[]` — form/multipart parsing is an adapter concern, or enable `worker_populate_superglobals` for real `$_POST`/`$_FILES`.
+- Workers recycle after `worker_max_requests` requests; fatals and mid-request `exit()`/`die()` produce a response (synthesized from SAPI headers + captured output for `exit()`) and recycle the worker instead of wedging the server. Boot is supervised (`worker_boot_timeout`, boot-failure backoff). Superglobals are **not** populated by default — adapters build requests from the Envelope; `worker_populate_superglobals = true` turns them back on (WordPress).
+- Worker mode is a whole-server switch and hard-errors when combined with `[server] sites_dir` (per-vhost worker pools are planned — not yet implemented).
 
-WordPress can run in worker mode (FrankenPHP has shipped a worker script for it), but it has no framework-level contract for resetting per-request state. Every implementation is a bespoke `worker.php` that hand-resets `$wp_query`, `$wp_the_query`, dozens of other globals, and all of `$_SERVER` / `$_GET` / `$_POST`, then keeps that script in sync as WordPress and the plugin ecosystem evolve. Multisite is a hard wall (`WP_NETWORK_ADMIN`-style `define()`s can't be re-set per request).
+`examples/worker/worker.php` in the repo is the minimal reference loop; `examples/worker/worker-stream.php` demonstrates streaming. Framework adapters:
 
-The recommended WordPress path on ePHPm is the **classic embedded mode** described above — ZTS thread-per-request already gives you concurrency, full plugin compatibility, and zero per-request state-reset surface. A maintained WordPress worker script is a separate effort that may or may not happen.
+- **Laravel** — shipped: [Laravel Octane (Worker Mode)](/guides/laravel-octane/) via `ephpm/octane-driver`.
+- **WordPress** — shipped: [WordPress Worker Mode](/guides/wordpress-worker/) via `ephpm/wordpress-worker` (requires `worker_populate_superglobals = true`).
+- **Symfony** via [`symfony/runtime`](/roadmap/symfony-runtime-driver/) — planned, not yet implemented.
+- **PSR-15** (Mezzio, Slim, …) via a [generic adapter](/roadmap/psr-15-worker-mode/) — planned, not yet implemented.
+
+The classic fpm mode remains the default and the right choice for apps without a worker contract — ZTS thread-per-request already gives concurrency, full compatibility, and zero state-reset surface.
+
+### External-process mode (planned — not yet implemented)
+
+An earlier design sketched an "external" mode where ePHPm would spawn user-provided `php` binaries as worker processes over stdin/stdout pipes (RoadRunner-style), for custom PHP builds and uncommon extensions. This mode does not exist today — the only implemented `[php] mode` values are `"fpm"` (the default) and `"worker"`, and PHP is always the embedded, statically linked runtime.
 
 ### Building libphp.a
 
