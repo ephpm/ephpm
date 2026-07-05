@@ -20,6 +20,9 @@ tokio = { workspace = true, features = ["sync"] }
 # Phase 3 streaming bodies: zero-copy chunk buffers across the hyper<->worker
 # bounded channels.
 bytes.workspace = true
+# Worker idle gauge, recorded where it is actually observable (the dispatch
+# recv in worker_bridge).
+metrics.workspace = true
 
 [build-dependencies]
 bindgen = "0.72"

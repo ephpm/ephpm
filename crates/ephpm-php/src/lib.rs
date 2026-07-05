@@ -178,6 +178,20 @@ pub enum PhpError {
     ThreadInitFailed,
 }
 
+/// How a worker's framework loop ended (see [`PhpRuntime::run_worker`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerExit {
+    /// The loop ended cleanly: graceful drain or `worker_max_requests` recycle.
+    Clean,
+    /// The script ended while a request was still in flight (`exit()`/`die()`
+    /// mid-request, or a break out of the loop). The C layer synthesized the
+    /// response from SAPI state and delivered it; the worker must be recycled.
+    ScriptExit,
+    /// A fatal bailout unwound out of the framework. The caller must recycle
+    /// the worker and fulfil any parked oneshot with a 500.
+    Fatal,
+}
+
 /// Wrapper around the PHP embed SAPI with ZTS (Zend Thread Safety).
 ///
 /// PHP is built with `--enable-zts`, enabling TSRM (Thread Safe Resource
@@ -748,17 +762,16 @@ impl PhpRuntime {
     /// Boot and run a worker on the current (already TSRM-registered) thread.
     ///
     /// Blocks until the framework's `take_request()` loop ends (graceful
-    /// shutdown, `worker_max_requests` recycle, or a fatal bailout). Returns
-    /// `Ok(true)` if the loop ended cleanly, `Ok(false)` if a fatal bailout
-    /// unwound out of the framework (the caller must recycle the worker and
-    /// fulfil any parked oneshot with a 500).
+    /// shutdown, `worker_max_requests` recycle, a mid-request script exit, or
+    /// a fatal bailout) — see [`WorkerExit`] for the outcomes and what the
+    /// caller must do for each.
     ///
     /// # Errors
     ///
     /// Returns [`PhpError::NotInitialized`] if PHP is not initialized, or
     /// [`PhpError::ExecutionFailed`] if the script path is invalid.
     #[allow(unused_variables)]
-    pub fn run_worker(script: &std::path::Path) -> Result<bool, PhpError> {
+    pub fn run_worker(script: &std::path::Path) -> Result<WorkerExit, PhpError> {
         if !PHP_INITIALIZED.load(Ordering::Acquire) {
             return Err(PhpError::NotInitialized);
         }
@@ -776,7 +789,11 @@ impl PhpRuntime {
             // guard on this thread's own long-lived request context. The
             // CString outlives the call.
             let ret = unsafe { ffi::ephpm_worker_run(c_script.as_ptr()) };
-            Ok(ret == 0)
+            Ok(match ret {
+                0 => WorkerExit::Clean,
+                1 => WorkerExit::ScriptExit,
+                _ => WorkerExit::Fatal,
+            })
         }
 
         #[cfg(not(php_linked))]

@@ -316,6 +316,13 @@ thread_local! {
 
     /// The recycle threshold for this worker (`0` = never recycle).
     static MAX_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Fired exactly once, on this worker's first `take_request()` — the
+    /// framework-finished-booting signal. The pool uses it to mark readiness
+    /// and record the true boot duration (`run_worker` itself blocks for the
+    /// worker's entire life, so it can't distinguish boot from serving).
+    static BOOT_NOTIFIER: RefCell<Option<Box<dyn FnOnce() + Send>>> =
+        const { RefCell::new(None) };
 }
 
 /// Install the dispatch receiver for the current worker thread. Called by the
@@ -340,6 +347,19 @@ pub fn set_max_requests(max: u64) {
 #[cfg(not(php_linked))]
 pub fn set_max_requests(_max: u64) {}
 
+/// Install the boot-completion callback for the current worker thread. Fired
+/// exactly once, on the worker's first `take_request()` — i.e. after the
+/// framework finished booting and is ready to serve. Install before
+/// `run_worker`.
+#[cfg(php_linked)]
+pub fn set_boot_notifier(f: Box<dyn FnOnce() + Send>) {
+    BOOT_NOTIFIER.with(|cell| *cell.borrow_mut() = Some(f));
+}
+
+/// Stub: never fires (stub `run_worker` errors before any `take_request`).
+#[cfg(not(php_linked))]
+pub fn set_boot_notifier(_f: Box<dyn FnOnce() + Send>) {}
+
 /// Take the parked `oneshot::Sender` for the in-flight request, if one is
 /// still stashed. Used by the pool's crash-recovery path: after
 /// `ephpm_worker_run` returns following a bailout, a still-present sender means
@@ -362,11 +382,14 @@ pub fn take_pending_sender() -> Option<tokio::sync::oneshot::Sender<WorkerRespon
 /// so a client mid-download gets a truncated-but-not-hung response) and the
 /// body reader. Call from the pool's crash-recovery path before the worker
 /// resumes/respawns. Idempotent.
+///
+/// `CURRENT_REQUEST` is NOT cleared: `worker_thread_shutdown()` runs after
+/// this and its `php_request_shutdown` may still read the `SG(request_info)`
+/// pointers that borrow from it. The thread-local drops at thread exit.
 #[cfg(php_linked)]
 pub fn clear_in_flight_streams() {
     RESPONSE_TX.with(|cell| *cell.borrow_mut() = None);
     BODY_READER.with(|cell| *cell.borrow_mut() = BodyReader::Empty);
-    CURRENT_REQUEST.with(|cell| *cell.borrow_mut() = None);
 }
 
 /// Stub.
@@ -446,6 +469,12 @@ fn build_current_request(job: WorkerRequestOwned) -> (CurrentRequest, BodyReader
 /// fill the borrowed request view.
 #[cfg(php_linked)]
 unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int {
+    // First call on this thread = the framework finished booting. Fire the
+    // pool's boot notifier (readiness, boot-duration metric, backoff reset).
+    if let Some(notify) = BOOT_NOTIFIER.with(|cell| cell.borrow_mut().take()) {
+        notify();
+    }
+
     // Cooperative recycle: once this worker has handled its quota, return
     // shutdown so the framework loop exits and the pool respawns a fresh boot.
     let max = MAX_REQUESTS.with(std::cell::Cell::get);
@@ -458,7 +487,11 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
         return 0;
     };
 
-    let job = match rx.recv_blocking() {
+    // The worker is idle exactly while it is parked in this recv.
+    metrics::gauge!("ephpm_worker_idle").increment(1.0);
+    let recv = rx.recv_blocking();
+    metrics::gauge!("ephpm_worker_idle").decrement(1.0);
+    let job = match recv {
         Ok(job) => job,
         // Sender side closed (graceful drain) — end the loop.
         Err(_) => return 0,
@@ -546,12 +579,19 @@ unsafe extern "C" fn worker_send_response(
 }
 
 /// Common per-iteration teardown after a response is delivered (buffered or
-/// streaming): bump the recycle counter and release the borrowed request +
-/// body reader so nothing leaks into the next `take_request`.
+/// streaming): bump the recycle counter and release the body reader so nothing
+/// leaks into the next `take_request`.
+///
+/// `CURRENT_REQUEST` is deliberately NOT cleared here: the C statics
+/// (`req_method`, ...) and `SG(request_info)` still point into its `CString`s,
+/// and PHP code can run between `send_response()` and the next `take_request()`
+/// (framework terminate hooks that call `header()`, which reads
+/// `request_method`). The backing storage is dropped only when the next
+/// `take_request` replaces it — while PHP is blocked inside that call — or at
+/// thread exit.
 #[cfg(php_linked)]
 fn finish_iteration() {
     REQUESTS_HANDLED.with(|c| c.set(c.get().saturating_add(1)));
-    CURRENT_REQUEST.with(|cell| *cell.borrow_mut() = None);
     BODY_READER.with(|cell| *cell.borrow_mut() = BodyReader::Empty);
     // Dropping the streaming-response sender (if any) closes the body channel,
     // signalling end-of-body to the hyper handler.

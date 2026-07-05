@@ -684,17 +684,19 @@ already uses the `metrics` crate + Prometheus exporter — `router.rs:16`,
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `ephpm_worker_pool_size` | gauge | — | configured `worker_count` |
-| `ephpm_worker_busy` | gauge | — | workers currently handling a request |
+| `ephpm_worker_busy` | gauge | — | dispatched requests awaiting a worker response (includes jobs still queued, so it can exceed `worker_count` when the backlog is deep) |
 | `ephpm_worker_idle` | gauge | — | workers parked in `take_request()` |
 | `ephpm_worker_requests_total` | counter | `worker_id` | requests handled per worker |
-| `ephpm_worker_recycles_total` | counter | `reason` (`max_requests`\|`fatal`\|`hung`) | worker respawns |
-| `ephpm_worker_boot_failures_total` | counter | — | framework boots that fatally failed |
+| `ephpm_worker_recycles_total` | counter | `reason` (`max_requests`\|`script_exit`\|`fatal`\|`hung`) | worker respawns |
+| `ephpm_worker_boot_failures_total` | counter | — | worker threads that exited before reaching their first `take_request()` (framework failed to boot) |
+| `ephpm_worker_boot_timeouts_total` | counter | — | boots still running when `worker_boot_timeout` expired (the thread is not killed; see §5) |
 | `ephpm_worker_boot_duration_seconds` | histogram | — | time to first `take_request()` |
 | `ephpm_worker_dispatch_queue_depth` | gauge | — | current bounded-channel occupancy (backpressure signal) |
 | `ephpm_worker_request_wait_seconds` | histogram | — | time a job waited in the queue before a worker picked it up |
 
-`busy`/`idle` are maintained by the dispatch layer (increment on `recv_blocking`
-returning a job, decrement on `send_response`). `queue_depth` and `wait_seconds`
+`idle` is maintained inside the dispatch recv (increment when a worker parks,
+decrement when it picks up a job or the loop ends); `busy` is maintained by the
+HTTP handler around the response await. `queue_depth` and `wait_seconds`
 are the two that tell an operator "add more workers". Keep the existing
 `ephpm_php_execution_duration_seconds` (`router.rs:779`) meaningful by recording
 it around the worker handle time too, so fpm↔worker latency is comparable.

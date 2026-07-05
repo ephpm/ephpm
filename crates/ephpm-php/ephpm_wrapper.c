@@ -168,6 +168,19 @@ static EPHPM_TLS const char *req_path_translated = NULL;
  * first wins — see the Envelope docs). Reset per iteration. */
 static EPHPM_TLS int req_body_streaming = 0;
 
+/* Worker mode: non-zero from take_request() returning a request until the
+ * matching send_response()/send_response_stream() completes. Lets
+ * ephpm_worker_run() detect a script that ended mid-request (exit()/die(),
+ * wp_die(), a loop break) and synthesize the response from SAPI state instead
+ * of dropping it. */
+static EPHPM_TLS int req_in_flight = 0;
+
+/* Worker mode: bumped once per take_request(). A bodyStream() resource
+ * captures the generation at open; reads from a stale generation return EOF
+ * so a resource stashed across iterations can never read the NEXT request's
+ * body (cross-request isolation). */
+static EPHPM_TLS unsigned long req_generation = 0;
+
 /* Non-NULL sentinel for SG(server_context). sapi_activate() only parses the
  * POST body when server_context is set; the value itself is never dereferenced
  * by our SAPI, so a single shared marker address suffices. */
@@ -1081,6 +1094,7 @@ void ephpm_worker_reset_request(void)
     /* Per-iteration POST cursor + streaming flag. */
     req_post_data_offset = 0;
     req_body_streaming = 0;
+    req_in_flight = 0;
 
     response_status_code = 200;
 }
@@ -1104,7 +1118,13 @@ static long ephpm_worker_body_read(char *buf, size_t cap)
  * fixed-size reads with flat worker memory. */
 static ssize_t ephpm_body_stream_read(php_stream *stream, char *buf, size_t count)
 {
-    (void)stream;
+    /* Generation guard: a stream resource stashed across iterations must not
+     * read the NEXT request's body from the shared thread-local reader. */
+    const unsigned long *gen = (const unsigned long *)stream->abstract;
+    if (!gen || *gen != req_generation) {
+        stream->eof = 1;
+        return 0;
+    }
     long n = ephpm_worker_body_read(buf, count);
     if (n < 0) {
         return -1;
@@ -1118,10 +1138,13 @@ static ssize_t ephpm_body_stream_read(php_stream *stream, char *buf, size_t coun
 
 static int ephpm_body_stream_close(php_stream *stream, int close_handle)
 {
-    (void)stream;
     (void)close_handle;
-    /* Nothing owned on the C side — the Rust reader is freed when the worker
-     * finishes the request (send_response / next take_request). */
+    /* Only the generation marker is owned on the C side — the Rust reader is
+     * freed when the worker finishes the request. */
+    if (stream->abstract) {
+        efree(stream->abstract);
+        stream->abstract = NULL;
+    }
     return 0;
 }
 
@@ -1143,14 +1166,23 @@ static const php_stream_ops ephpm_body_stream_ops = {
     NULL                         /* set_option */
 };
 
-/* Build a php_stream reading the incremental request body. */
+/* Build a php_stream reading the incremental request body. The abstract
+ * pointer carries the request generation the stream was opened under. */
 static php_stream *ephpm_worker_open_body_stream(void)
 {
-    php_stream *stream = php_stream_alloc(&ephpm_body_stream_ops, NULL, NULL, "rb");
+    unsigned long *gen = emalloc(sizeof(*gen));
+    *gen = req_generation;
+    php_stream *stream = php_stream_alloc(&ephpm_body_stream_ops, gen, NULL, "rb");
+    if (!stream) {
+        efree(gen);
+    }
     return stream;
 }
 
-/* Build a PHP array of (key => value) string pairs from a packed C list. */
+/* Build a PHP array of (key => value) string pairs from a packed C list.
+ * Repeated keys (duplicate request headers, e.g. X-Forwarded-For sent twice)
+ * are joined per RFC 9110 §5.3 list semantics rather than overwritten; a
+ * repeated Cookie header joins with the cookie-pair separator instead. */
 static void ephpm_worker_fill_str_array(zval *arr, size_t count,
                                         const char *const *keys,
                                         const char *const *vals)
@@ -1161,7 +1193,17 @@ static void ephpm_worker_fill_str_array(zval *arr, size_t count,
             continue;
         }
         const char *v = vals[i] ? vals[i] : "";
-        add_assoc_string(arr, keys[i], (char *)v);
+        size_t klen = strlen(keys[i]);
+        zval *existing = zend_hash_str_find(Z_ARRVAL_P(arr), keys[i], klen);
+        if (existing && Z_TYPE_P(existing) == IS_STRING) {
+            const char *sep =
+                (zend_binary_strcasecmp(keys[i], klen, "cookie", sizeof("cookie") - 1) == 0)
+                    ? "; " : ", ";
+            zend_string *joined = zend_strpprintf(0, "%s%s%s", Z_STRVAL_P(existing), sep, v);
+            add_assoc_str(arr, keys[i], joined);
+        } else {
+            add_assoc_string(arr, keys[i], (char *)v);
+        }
     }
 }
 
@@ -1251,6 +1293,11 @@ PHP_FUNCTION(ephpm_worker_take_request)
         RETURN_NULL();
     }
 
+    /* A request is now in flight (until send_response/send_response_stream
+     * completes); new generation for bodyStream() isolation. */
+    req_in_flight = 1;
+    req_generation++;
+
     /* Point the SAPI request-info + POST buffers at this request so php://input
      * and any framework that reads them see the right body. These are the same
      * thread-local fields the fpm read_post/read_cookies callbacks use. */
@@ -1329,11 +1376,49 @@ PHP_FUNCTION(ephpm_worker_take_request)
     }
 }
 
+/* Append one "Name: Value\n" line to the packed header buffer. */
+static void ephpm_worker_pack_header_line(smart_str *out, zend_string *key, zval *val)
+{
+    zend_string *vstr = zval_get_string(val);
+    smart_str_appendl(out, ZSTR_VAL(key), ZSTR_LEN(key));
+    smart_str_appendl(out, ": ", 2);
+    smart_str_appendl(out, ZSTR_VAL(vstr), ZSTR_LEN(vstr));
+    smart_str_appendc(out, '\n');
+    zend_string_release(vstr);
+}
+
+/* Pack a PHP headers array into "Name: Value\n" lines. A list value packs one
+ * line per element — the multi-value header contract (e.g.
+ * ['Set-Cookie' => [$c1, $c2]] emits two Set-Cookie lines, which the Rust side
+ * forwards as two distinct wire headers). Caller frees the smart_str. */
+static void ephpm_worker_pack_headers(smart_str *out, zval *headers_arr)
+{
+    zend_string *hkey;
+    zval *hval;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(headers_arr), hkey, hval) {
+        if (!hkey) {
+            continue; /* skip numeric keys */
+        }
+        ZVAL_DEREF(hval);
+        if (Z_TYPE_P(hval) == IS_ARRAY) {
+            zval *item;
+            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(hval), item) {
+                ZVAL_DEREF(item);
+                ephpm_worker_pack_header_line(out, hkey, item);
+            } ZEND_HASH_FOREACH_END();
+        } else {
+            ephpm_worker_pack_header_line(out, hkey, hval);
+        }
+    } ZEND_HASH_FOREACH_END();
+    smart_str_0(out);
+}
+
 /* PHP_FUNCTION: \Ephpm\Worker\send_response(int, array, string): void
  *
  * Concatenates any captured output_buf (echo path) with the explicit $body,
- * packs the $headers array into "Name: Value\n" lines, and hands both to the
- * Rust send_response callback (which fulfils the parked oneshot). */
+ * packs the $headers array into "Name: Value\n" lines (list values become one
+ * line per element), and hands both to the Rust send_response callback (which
+ * fulfils the parked oneshot). */
 PHP_FUNCTION(ephpm_worker_send_response)
 {
     zend_long status;
@@ -1351,22 +1436,8 @@ PHP_FUNCTION(ephpm_worker_send_response)
         return;
     }
 
-    /* Pack headers as "Name: Value\n" lines. */
     smart_str hbuf = {0};
-    zend_string *hkey;
-    zval *hval;
-    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(headers_arr), hkey, hval) {
-        if (!hkey) {
-            continue; /* skip numeric keys */
-        }
-        zend_string *vstr = zval_get_string(hval);
-        smart_str_appendl(&hbuf, ZSTR_VAL(hkey), ZSTR_LEN(hkey));
-        smart_str_appendl(&hbuf, ": ", 2);
-        smart_str_appendl(&hbuf, ZSTR_VAL(vstr), ZSTR_LEN(vstr));
-        smart_str_appendc(&hbuf, '\n');
-        zend_string_release(vstr);
-    } ZEND_HASH_FOREACH_END();
-    smart_str_0(&hbuf);
+    ephpm_worker_pack_headers(&hbuf, headers_arr);
 
     /* Concatenate captured echo output (if any) + explicit $body. */
     const char *hdr_ptr = hbuf.s ? ZSTR_VAL(hbuf.s) : "";
@@ -1390,26 +1461,7 @@ PHP_FUNCTION(ephpm_worker_send_response)
      * (the reset at the top of the next take_request also clears it, but this
      * keeps the accounting local). */
     output_len = 0;
-}
-
-/* Pack a PHP headers array into "Name: Value\n" lines. Caller frees the
- * returned smart_str with smart_str_free. */
-static void ephpm_worker_pack_headers(smart_str *out, zval *headers_arr)
-{
-    zend_string *hkey;
-    zval *hval;
-    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(headers_arr), hkey, hval) {
-        if (!hkey) {
-            continue; /* skip numeric keys */
-        }
-        zend_string *vstr = zval_get_string(hval);
-        smart_str_appendl(out, ZSTR_VAL(hkey), ZSTR_LEN(hkey));
-        smart_str_appendl(out, ": ", 2);
-        smart_str_appendl(out, ZSTR_VAL(vstr), ZSTR_LEN(vstr));
-        smart_str_appendc(out, '\n');
-        zend_string_release(vstr);
-    } ZEND_HASH_FOREACH_END();
-    smart_str_0(out);
+    req_in_flight = 0;
 }
 
 /* PHP_FUNCTION: \Ephpm\Worker\send_response_stream(int $status, array $headers,
@@ -1476,6 +1528,7 @@ PHP_FUNCTION(ephpm_worker_send_response_stream)
     }
 
     g_worker_ops.response_end();
+    req_in_flight = 0;
 
     /* Release the borrowed request backing storage (the Rust send_response
      * path does this too, but response_end delivers via a different channel). */
@@ -1703,6 +1756,9 @@ void ephpm_worker_set_populate_superglobals(int enable)
  *
  * Returns:
  *    0  the loop ended cleanly (shutdown / recycle)
+ *    1  the script ended while a request was still in flight (exit()/die()
+ *       mid-request — e.g. WordPress wp_die()/admin-ajax — or a loop break);
+ *       the response was synthesized from SAPI state and delivered
  *   -2  a fatal / zend_bailout unwound out of the framework (recycle + the
  *       Rust supervisor fulfils any parked oneshot with a 500)
  */
@@ -1722,6 +1778,38 @@ int ephpm_worker_run(const char *script)
          * treat it as a clean loop end (the framework asked to stop). */
         if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
             zend_clear_exception();
+        }
+
+        /* The script ended with a request still in flight (exit()/die()
+         * mid-request, or a break out of the loop without send_response).
+         * Deliver what the request actually produced — SAPI status, headers
+         * emitted via header()/setcookie(), and the captured echo output —
+         * instead of letting the parked oneshot die with the thread (which
+         * would turn every wp_die()/admin-ajax exit into a bogus 500). This
+         * is safe here: unwind-exit is clean stack unwinding, not a bailout,
+         * so SAPI globals and the capture buffers are intact. */
+        if (req_in_flight && g_worker_ops.send_response) {
+            smart_str hbuf = {0};
+            zend_llist_position pos;
+            sapi_header_struct *h =
+                zend_llist_get_first_ex(&SG(sapi_headers).headers, &pos);
+            while (h) {
+                smart_str_appendl(&hbuf, h->header, h->header_len);
+                smart_str_appendc(&hbuf, '\n');
+                h = zend_llist_get_next_ex(&SG(sapi_headers).headers, &pos);
+            }
+            smart_str_0(&hbuf);
+
+            int status = SG(sapi_headers).http_response_code;
+            g_worker_ops.send_response(status > 0 ? status : 200,
+                                       hbuf.s ? ZSTR_VAL(hbuf.s) : "",
+                                       hbuf.s ? ZSTR_LEN(hbuf.s) : 0,
+                                       output_buf ? output_buf : "",
+                                       output_len);
+            smart_str_free(&hbuf);
+            output_len = 0;
+            req_in_flight = 0;
+            result = 1;
         }
     } else {
         /* zend_bailout() — a fatal unwound past the current iteration's

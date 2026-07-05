@@ -1266,8 +1266,13 @@ pub struct PhpConfig {
     pub worker_backlog: usize,
 
     /// Seconds a worker gets to boot the framework and reach its first
-    /// `take_request()` (worker mode only). A worker that does not become
-    /// ready within this window is counted as a boot failure and respawned.
+    /// `take_request()` (worker mode only). A worker still booting when this
+    /// window expires is logged as an error and counted in
+    /// `ephpm_worker_boot_timeouts_total`. The thread is NOT killed — a PHP
+    /// thread cannot be terminated safely — and it still becomes ready if the
+    /// boot eventually completes. A worker whose boot *fails* (the script
+    /// exits before its first `take_request()`) is counted as a boot failure
+    /// and respawned with exponential backoff, independent of this timeout.
     ///
     /// Ignored in fpm mode.
     ///
