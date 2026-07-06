@@ -1,8 +1,9 @@
 # CI runner image with the build toolchain pre-installed.
 #
-# Includes: Rust stable, musl cross-compiler, libclang, and basic build
-# essentials. The PHP SDK itself is downloaded on demand by
-# `cargo xtask release` (a tarball from github.com/ephpm/php-sdk releases).
+# Includes: Rust stable, libclang, and basic build essentials. The PHP SDK
+# itself is downloaded on demand by `cargo xtask release` (a tarball from
+# github.com/ephpm/php-sdk releases; the Linux `-gnu` variant is glibc-linked
+# and builds against the host-default gnu target).
 #
 # Build:
 #   docker build -f docker/Dockerfile.gha -t ghcr.io/<owner>/ephpm-ci:latest .
@@ -18,13 +19,12 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # ── System build tools ───────────────────────────────────────────────────────
 #
-#   - musl-tools/musl-dev: musl-gcc cross-compiler for the prebuilt PHP SDK
-#     (libphp.a is musl-linked).
+#   - build-essential: cc::Build for ephpm_wrapper.c + the gcc linker driver
+#     for the glibc-dynamic (gnu) release binary.
 #   - libclang-dev: bindgen needs libclang.
 #   - libssl-dev: the workspace test build (`cargo nextest run --workspace`)
 #     pulls a dev-dependency that links openssl-sys, which needs system
-#     OpenSSL headers + openssl.pc. The musl release build doesn't, but the
-#     native test build does.
+#     OpenSSL headers + openssl.pc.
 #   - tar/curl: SDK + sqld tarball downloads at build time.
 #   - file: nightly's `Verify binary` step uses /usr/bin/file to print the
 #     artifact's ELF metadata as a sanity check.
@@ -34,9 +34,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Windows builds switched to native on the self-hosted Windows runner
 # in PR #53, so the cross-compile path that needed these is gone. Re-add
 # if cross-compilation ever comes back.
+#
+# Removed with the Linux dynamic pivot (3.0): musl-tools/musl-dev, the
+# per-arch musl rustup targets, and the CC_*/CARGO_TARGET_*_LINKER musl env.
+# Linux releases now build the host-default gnu target against the glibc
+# `-gnu` PHP SDK so the binary can dlopen() shared extensions/middleware.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential ca-certificates curl file git pkg-config tar \
-    libclang-dev libssl-dev musl-tools musl-dev \
+    libclang-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Docker CLI + compose plugin (client only, no daemon) ─────────────────────
@@ -69,30 +74,15 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 
-# Add the musl target matching the image's own architecture. This Dockerfile
-# is built once per arch (amd64 -> ephpm/ephpm-ci:latest, arm64 ->
-# :latest-arm64), each natively on its own runner, so we only need the host's
-# musl target. `uname -m` reports x86_64 / aarch64; map to the rust triple.
+# Releases target the host-default gnu triple, which ships with the stable
+# toolchain — no `rustup target add` needed. This Dockerfile is built once
+# per arch (amd64 -> ephpm/ephpm-ci:latest, arm64 -> :latest-arm64), each
+# natively on its own runner.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal \
         --component rustfmt,clippy,llvm-tools-preview \
     && rustup toolchain install nightly --component rustfmt \
-    && case "$(uname -m)" in \
-         x86_64)  rustup target add x86_64-unknown-linux-musl ;; \
-         aarch64) rustup target add aarch64-unknown-linux-musl ;; \
-         *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; \
-       esac \
     && cargo install cargo-nextest --locked \
     && rm -rf /usr/local/cargo/registry
-
-# musl-gcc (from musl-tools) is the native musl compiler on whichever arch this
-# image was built for. Set the CC/linker vars for BOTH musl triples so the same
-# image works regardless — only the host-arch triple is ever actually built.
-ENV CC_x86_64_unknown_linux_musl=musl-gcc \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_CC=musl-gcc \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
-    CC_aarch64_unknown_linux_musl=musl-gcc \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_CC=musl-gcc \
-    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
 
 WORKDIR /src

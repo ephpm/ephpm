@@ -7,10 +7,10 @@ gossip clustering, and environment-based configuration.
 
 ## Container Image
 
-ePHPm ships as a single static binary. A minimal Dockerfile:
+ePHPm ships as a single self-contained binary (glibc-dynamic on Linux). A minimal Dockerfile:
 
 ```dockerfile
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 COPY ephpm /usr/local/bin/ephpm
 COPY ephpm.toml /etc/ephpm/ephpm.toml
 COPY /var/www/html /var/www/html

@@ -121,7 +121,7 @@ fn main() {
 
     // Force-link libphp.a + the support libs SPC built into the SDK.
     // Workaround: rustc-link-lib emitted from ephpm-php's build.rs
-    // doesn't propagate to the final musl-static link in this layout
+    // doesn't propagate to the final static-archive link in this layout
     // (ephpm-php is a transitive lib crate without a `links =` key).
     //
     // Pass the absolute paths to each .a file (not -l:libfoo.a) because
@@ -145,9 +145,20 @@ fn main() {
     }
     println!("cargo::rustc-link-arg=-Wl,--end-group");
     println!("cargo::rustc-link-arg=-Wl,-Bdynamic");
+
+    // Export the binary's own symbols (the Zend/TSRM API baked in from
+    // libphp.a) into the dynamic symbol table. Shared PHP extensions loaded
+    // via `extension=` (dlopen) resolve zend_* symbols against the hosting
+    // process at load time; without --export-dynamic every load fails with
+    // unresolved Zend symbols. Standard glibc ZTS extension builds (same
+    // PHP minor, compiled via phpize/gcc against ZTS headers — distro/Sury
+    // packages are NTS-only as of 2026-07) are the compatibility target.
+    // Harmless on a fully static custom build (no dynamic symbol table to
+    // populate — dlopen is unavailable there anyway).
+    println!("cargo::rustc-link-arg=-Wl,--export-dynamic");
 }
 
-/// Static lib set the Linux SDK ships (musl-built).
+/// Static lib set the Linux SDK ships.
 ///
 /// Kept in sync with `crates/ephpm-php/build.rs`'s probe list — both
 /// paths need to know about the same SDK contents. If you add a lib

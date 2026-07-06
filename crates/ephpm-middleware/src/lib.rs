@@ -9,10 +9,11 @@
 //!
 //! - **Builtin (static registry)** — modules compiled into the ePHPm binary
 //!   and invoked in-process via [`builtin::BuiltinModule`] (feature `host`).
-//!   Works in every binary, including the fully static musl release where
+//!   Works in every binary, including custom fully static builds where
 //!   `dlopen` does not exist.
 //! - **Dynamic (C ABI)** — shared libraries (`.so`/`.dylib`/`.dll`) loaded
-//!   at startup, for out-of-tree modules on dynamically linked builds.
+//!   at startup, for out-of-tree modules. Works with the stock release
+//!   binaries on every platform (the Linux release is glibc-dynamic).
 //!
 //! Authoring a module in Rust:
 //!

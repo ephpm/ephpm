@@ -3,8 +3,8 @@
 //! Each module here is an ordinary [`ephpm_middleware::Middleware`]
 //! implementation with **no C ABI exports** — that is what lets
 //! `ephpm-server` link all of them into one binary and run them in-process
-//! through the static builtin registry (`library = "jwt"` works even in the
-//! fully static musl release, where `dlopen` does not exist).
+//! through the static builtin registry (`library = "jwt"` works even in a
+//! custom fully static build, where `dlopen` does not exist).
 //!
 //! The sibling `ephpm-middleware-{jwt,cors,ratelimit,security-headers}`
 //! crates are thin cdylib shells: they re-export these types and add the

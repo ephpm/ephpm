@@ -31,7 +31,7 @@ Never grep with `-E/-i/-v` flags through the PowerShell-backed shell (flags get 
 | pod healthy + `error sending request` cascade + **readiness probe timing out mid-suite** | server alive but not answering | starvation (blocking pool / PHP worker cap / deadlock) |
 | `NodeNotReady` / `MemoryPressure=True` in the pre-tilt baseline | cluster contention | infra, retry after checking the box |
 
-Crash follow-up on musl static builds: `backtrace()` is a no-op stub - use the container exit code, kernel `dmesg` (`error 4` = userspace read of unmapped memory = use-after-free), and `addr2line` on the unstripped binary to map the fault offset.
+Crash follow-up: on the current glibc (gnu) builds `backtrace()` works normally; on legacy/custom musl static builds it is a no-op stub - fall back to the container exit code, kernel `dmesg` (`error 4` = userspace read of unmapped memory = use-after-free), and `addr2line` on the unstripped binary to map the fault offset.
 
 ## 3. Job never starts (queued forever) = runner problem
 

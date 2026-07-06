@@ -342,11 +342,11 @@ Release artifacts are named per platform. One binary per PHP version per platfor
 - Forward slashes work in paths for `ephpm.toml` config values, but native backslash paths are also accepted
 - `ephpm ext build` uses the same container-based approach (Podman/Docker works on Windows)
 
-**Fully static binaries on all platforms:** All extensions are compiled into the binary at build time — no runtime `.so`/`.dll` loading. This means:
+**Single-file binaries on all platforms:** the baseline ~45 extensions are compiled into the binary at build time, and additional shared extensions can be loaded at startup via `[php] extensions` (see the [PHP Extensions guide](/guides/php-extensions/)):
 
 | Platform | Linking | Runtime dependencies |
 |---|---|---|
-| Linux | Fully static (musl) | **None** — works on any distro, Alpine, `FROM scratch` |
+| Linux | Static libphp, glibc-dynamic (gnu target, `--export-dynamic`) | glibc — any mainstream distro; enables `dlopen` of shared extensions/middleware (not Alpine/`FROM scratch`) |
 | macOS | Static libphp, dynamic libSystem | `libSystem.dylib` (always present, Apple-mandated) |
 | Windows | Static libphp, static CRT (`/MT`) | Windows system libraries only |
 
@@ -815,7 +815,7 @@ This is the same approach FrankenPHP uses.
 Binaries are named: `ephpm-{version}-php{php}-{suite}-{platform}`:
 
 ```
-# Production suites (Linux, fully static musl — zero dependencies)
+# Production suites (Linux, single-file glibc-dynamic binary)
 ephpm-0.1.0-php8.4-core-linux-x86_64
 ephpm-0.1.0-php8.4-wordpress-linux-x86_64
 ephpm-0.1.0-php8.4-laravel-linux-x86_64
@@ -847,12 +847,12 @@ Dev suites include Zend extensions (xdebug, pcov, spx) that are statically compi
 ### Container Images
 
 ```dockerfile
-FROM scratch
+FROM debian:13-slim
 COPY ephpm /usr/local/bin/ephpm
 ENTRYPOINT ["ephpm"]
 ```
 
-Fully static musl binaries mean `FROM scratch` works — zero runtime dependencies, smallest possible image. Multi-arch images support both `linux/amd64` and `linux/arm64`.
+Linux binaries are glibc-dynamic (so they can `dlopen` shared PHP extensions and middleware), so images use a slim glibc base (`debian:13-slim` — the binary's glibc floor is 2.39, set by the php-sdk build toolchain, so Debian 12's glibc 2.36 is too old) rather than Alpine or `FROM scratch`. Multi-arch images support both `linux/amd64` and `linux/arm64`.
 
 Tags follow the suite model:
 

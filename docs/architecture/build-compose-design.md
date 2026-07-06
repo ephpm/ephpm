@@ -4,19 +4,31 @@
 > This document describes a proposed build pipeline. Where it references
 > existing code or the open PR #88, that is labeled explicitly; everything
 > else is future work.
+>
+> **Superseded for the common case (3.0 dynamic pivot):** Linux releases
+> are now **glibc-dynamic** (`<arch>-unknown-linux-gnu`, `--export-dynamic`),
+> so runtime `dlopen` loading of shared PHP extensions (`[php] extensions`,
+> see `site/content/guides/php-extensions.md`) and middleware `.so` files
+> works out of the box — the "static by mandate" premise below no longer
+> describes the shipped product. `forge` remains relevant **only** as
+> future tooling for users who want a custom fully static binary (where
+> dlopen is genuinely unavailable) with extra extensions/middleware baked
+> in at build time.
 
 ## 1. Problem and constraint
 
-ePHPm's release binaries are **fully static by mandate** (musl,
-`crt-static`). That is the product: one file, runs anywhere, no loader, no
-shared-library surface. It is also empirically proven that a fully static
-musl binary **cannot `dlopen()` anything** — the middleware dlopen lane
-fails at startup with `Dynamic loading not supported`, and the same fate
-awaits any `php_load_extension()`-based dynamic PHP extension loader
-(designed in `site/content/roadmap/dynamic-extensions.md`, not built).
+> *Historical premise — see the superseded note above. Kept because it
+> still applies to self-built fully static musl binaries.*
 
-So runtime loading cannot be the primary extensibility mechanism. The
-primary mechanism must be **build-time composition**, the way
+ePHPm's original release binaries were **fully static by mandate** (musl,
+`crt-static`): one file, runs anywhere, no loader, no shared-library
+surface. It is empirically proven that a fully static musl binary
+**cannot `dlopen()` anything** — the middleware dlopen lane fails at
+startup with `Dynamic loading not supported`, and the same fate awaits any
+`extension=`-based shared PHP extension load.
+
+For such a binary, runtime loading cannot be the extensibility mechanism.
+The mechanism must be **build-time composition**, the way
 [xcaddy](https://github.com/caddyserver/xcaddy) composes Caddy: the user
 declares what they want, a tool generates a thin package that imports the
 plugins, and an ordinary compiler run produces a custom static binary.
@@ -40,9 +52,10 @@ they are not this document's subject.
 
 - `PHP_SDK_VERSIONS` (line ~12) pins one full PHP version per minor
   (8.3/8.4/8.5). `ensure_php_sdk_for()` downloads
-  `php-sdk-<ver>-<os>-<arch>.tar.gz` from `github.com/ephpm/php-sdk`
-  releases into `php-sdk/<ver>-<os>-<arch>/` and `release_native()` builds
-  `-p ephpm --target <arch>-unknown-linux-musl` with `PHP_SDK_PATH` set;
+  `php-sdk-<ver>-<os>-<arch>[-gnu].tar.gz` from `github.com/ephpm/php-sdk`
+  releases into `php-sdk/<ver>-<os>-<arch>[-gnu]/` (the `-gnu` libc suffix
+  applies on Linux) and `release_native()` builds
+  `-p ephpm --target <arch>-unknown-linux-gnu` with `PHP_SDK_PATH` set;
   `SQLD_BINARY_PATH` embeds sqld the same way.
 - The SDK's extension set is **fixed at php-sdk build time** (~45
   extensions listed in the roadmap doc). Changing it today means: edit

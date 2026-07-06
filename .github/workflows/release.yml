@@ -47,11 +47,11 @@ jobs:
         arch:
           - runner: x64
             image: latest
-            triple: x86_64-unknown-linux-musl
+            triple: x86_64-unknown-linux-gnu
             sdk: linux-x86_64
           - runner: arm64
             image: latest-arm64
-            triple: aarch64-unknown-linux-musl
+            triple: aarch64-unknown-linux-gnu
             sdk: linux-aarch64
     steps:
       - uses: actions/checkout@v4
@@ -80,8 +80,9 @@ jobs:
           set -eu
           name="ephpm-${VERSION}+php${PHP_FULL}-${{ matrix.arch.sdk }}"
           mkdir -p "dist/${name}"
-          # cargo xtask release targets musl on Linux (libphp.a is musl-linked),
-          # so the binary lives under the musl triple, not target/release/.
+          # cargo xtask release targets the gnu triple explicitly on Linux
+          # (glibc-dynamic binary, dlopen-capable), so the binary lives under
+          # target/<triple>/release/, not target/release/.
           cp "target/${{ matrix.arch.triple }}/release/ephpm" "dist/${name}/ephpm"
           cp LICENSE "dist/${name}/LICENSE"
           cp .github/release-readme.txt "dist/${name}/README.txt"

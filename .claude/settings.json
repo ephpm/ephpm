@@ -5,7 +5,7 @@
 
       "Bash(./target/release/ephpm:*)",
       "Bash(./target/debug/ephpm:*)",
-      "Bash(./target/x86_64-unknown-linux-musl/release/ephpm:*)",
+      "Bash(./target/x86_64-unknown-linux-gnu/release/ephpm:*)",
       "Bash(./target/x86_64-pc-windows-msvc/release/ephpm.exe:*)",
       "Bash(target/release/ephpm:*)",
       "Bash(target/debug/ephpm:*)",

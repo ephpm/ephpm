@@ -18,7 +18,7 @@ const MSRV: (u32, u32) = (1, 85);
 
 /// Remedy shared by all Linux C-toolchain checks (matches the README and
 /// CLAUDE.md prerequisites list).
-const APT_REMEDY: &str = "apt install build-essential pkg-config musl-tools musl-dev libclang-dev";
+const APT_REMEDY: &str = "apt install build-essential pkg-config libclang-dev";
 
 /// Outcome of a single check.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -243,28 +243,6 @@ fn rustc_check() -> Check {
     }
 }
 
-fn musl_target_check() -> Check {
-    if !cfg!(target_os = "linux") {
-        return Check::new(
-            "musl target",
-            Status::Skip,
-            "only needed on Linux hosts (release links against musl libphp.a)",
-        );
-    }
-    let triple = format!("{}-unknown-linux-musl", env::consts::ARCH);
-    let Ok(out) = Command::new("rustup").args(["target", "list", "--installed"]).output() else {
-        return Check::new("musl target", Status::Miss, "rustup not found - cannot verify")
-            .remedy("install rustup via https://rustup.rs");
-    };
-    let installed = String::from_utf8_lossy(&out.stdout);
-    if out.status.success() && installed.lines().any(|l| l.trim() == triple) {
-        Check::new("musl target", Status::Ok, triple)
-    } else {
-        Check::new("musl target", Status::Miss, format!("{triple} not installed"))
-            .remedy(&format!("rustup target add {triple}"))
-    }
-}
-
 fn nightly_fmt_check() -> Check {
     match version_of("cargo", &["+nightly", "fmt", "--version"]) {
         Some(line) => Check::new("nightly rustfmt", Status::Ok, line).optional(),
@@ -279,10 +257,11 @@ fn nightly_fmt_check() -> Check {
 }
 
 fn rust_checks() -> Vec<Check> {
+    // Linux release builds target the host-default gnu triple, so no extra
+    // rustup target is needed beyond the stable toolchain itself.
     vec![
         rustc_check(),
         tool_check("cargo", "install Rust via https://rustup.rs"),
-        musl_target_check(),
         nightly_fmt_check(),
     ]
 }
@@ -323,23 +302,14 @@ fn c_toolchain_checks(target: BuildTarget) -> Vec<Check> {
 }
 
 fn linux_checks() -> Vec<Check> {
+    // The Linux release build is glibc-dynamic (gnu target, glibc-linked
+    // libphp.a) — the host gcc is the linker driver; nothing beyond
+    // cc + pkg-config + libclang (bindgen) is required.
     let cc = match version_of("cc", &["--version"]).or_else(|| version_of("gcc", &["--version"])) {
         Some(line) => Check::new("cc/gcc", Status::Ok, line),
         None => Check::new("cc/gcc", Status::Miss, "no C compiler found").remedy(APT_REMEDY),
     };
-    vec![cc, tool_check("pkg-config", APT_REMEDY), musl_gcc_check(), libclang_check_linux()]
-}
-
-fn musl_gcc_check() -> Check {
-    match version_of("musl-gcc", &["--version"]) {
-        Some(line) => Check::new("musl-gcc", Status::Ok, line),
-        None => Check::new(
-            "musl-gcc",
-            Status::Miss,
-            "not found (release links against the musl libphp.a)",
-        )
-        .remedy(APT_REMEDY),
-    }
+    vec![cc, tool_check("pkg-config", APT_REMEDY), libclang_check_linux()]
 }
 
 fn macos_checks() -> Vec<Check> {
@@ -687,7 +657,7 @@ mod tests {
             "Rust toolchain",
             vec![
                 Check::new("rustc", Status::Ok, "rustc 1.94.0"),
-                Check::new("musl target", Status::Skip, "only needed on Linux hosts"),
+                Check::new("wsl", Status::Skip, "only needed on Windows hosts"),
                 Check::new("nightly rustfmt", Status::Warn, "unavailable").remedy("rustup"),
             ],
         )];

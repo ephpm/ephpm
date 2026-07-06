@@ -1780,7 +1780,7 @@ PHP is compiled with ZTS (`--enable-zts`). Each `spawn_blocking` thread auto-reg
 |-------|-------|--------|
 | OpenSSL `openssl_encrypt()` segfaults under load | x86_64 + ARM64 | Upstream PHP bug (#13648) |
 | `zend_mm_heap corrupted` on ARM64 | PHP 8.5.2+ only | Upstream PHP bug (#21029) |
-| OPcache static link — TLS transition linker errors | Linux musl | Upstream PHP bug (#15074) |
+| OPcache static link — TLS transition linker errors | Linux musl (custom fully static builds only; shipped releases are glibc/gnu) | Upstream PHP bug (#15074) |
 | ~5% throughput overhead vs NTS | All platforms | Expected; TSRM bookkeeping |
 | `ext-imap` incompatible with ZTS | If used | c-client library limitation |
 

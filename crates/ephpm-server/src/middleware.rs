@@ -8,11 +8,13 @@
 //! Each mount resolves through two lanes, in order:
 //!
 //! 1. **Builtin registry** ([`builtin`]) — the four in-tree modules compiled
-//!    into this binary and invoked in-process (no FFI, no dlopen). This is
-//!    the only lane that works in the fully static musl release binary.
+//!    into this binary and invoked in-process (no FFI, no dlopen). Works in
+//!    every binary, including custom fully static builds where `dlopen` does
+//!    not exist.
 //! 2. **Shared library** — everything else goes through the dlopen path and
-//!    the versioned C ABI host table, for out-of-tree modules on dynamically
-//!    linked builds.
+//!    the versioned C ABI host table, for out-of-tree modules. Works with the
+//!    stock release binaries on every platform (the Linux release is
+//!    glibc-dynamic).
 //!
 //! v1 chain semantics: `RESPOND` short-circuits the chain immediately.
 //! `REWRITE` accumulates a path override (last writer wins) and header
@@ -78,7 +80,7 @@ enum Backend {
 pub type BuiltinBuilder = fn(&serde_json::Value) -> Result<BuiltinModule, String>;
 
 /// Static registry of middleware compiled into every ePHPm binary —
-/// including the fully static musl release, where `dlopen` does not exist.
+/// including custom fully static builds, where `dlopen` does not exist.
 ///
 /// `[[middleware]] library` values are checked here FIRST; only unmatched
 /// names fall through to the shared-library search path. Accepted spellings

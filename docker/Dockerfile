@@ -27,29 +27,24 @@ FROM ubuntu:24.04 AS base
 ENV DEBIAN_FRONTEND=noninteractive
 
 # System tools needed by the ephpm Rust build:
-#   - musl-tools / musl-dev: musl-gcc cross-compiler for the
-#     x86_64-unknown-linux-musl target (libphp.a is musl-linked).
 #   - libclang-dev: bindgen needs libclang to parse PHP headers.
-#   - build-essential, pkg-config: cc::Build for ephpm_wrapper.c.
+#   - build-essential, pkg-config: cc::Build for ephpm_wrapper.c and the
+#     gcc linker driver for the glibc-dynamic (gnu) release binary.
 #   - curl, git, ca-certificates: rustup install + cargo registry.
 #   - tar: extracting the prebuilt PHP SDK tarball in the next stage.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential ca-certificates curl git pkg-config tar \
-    libclang-dev musl-tools musl-dev \
+    libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 
+# The gnu target is the host default — no extra rustup target or cross
+# toolchain needed (the musl-era CC_*/LINKER plumbing is gone with it).
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal
-
-RUN rustup target add x86_64-unknown-linux-musl
-
-ENV CC_x86_64_unknown_linux_musl=musl-gcc \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_CC=musl-gcc \
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
 
 # ── Stage 2: php-sdk — download prebuilt SDK ─────────────────────────────────
 #
@@ -63,12 +58,13 @@ FROM base AS php-sdk
 ARG PHP_SDK_VERSION
 
 # Detect arch at build time (works for both x86_64 and aarch64 builders).
-# Layout we extract matches xtask::php_sdk_dir_for():
-#   /opt/php-sdk/<version>-linux-<arch>/{lib,include}/
+# Layout we extract matches xtask::php_sdk_dir_for() — Linux SDKs carry a
+# `-gnu` libc suffix (glibc-linked libphp.a; the binary must dlopen()):
+#   /opt/php-sdk/<version>-linux-<arch>-gnu/{lib,include}/
 RUN set -eux; \
     arch=$(uname -m); \
-    sdk_dir="/opt/php-sdk/${PHP_SDK_VERSION}-linux-${arch}"; \
-    asset="php-sdk-${PHP_SDK_VERSION}-linux-${arch}.tar.gz"; \
+    sdk_dir="/opt/php-sdk/${PHP_SDK_VERSION}-linux-${arch}-gnu"; \
+    asset="php-sdk-${PHP_SDK_VERSION}-linux-${arch}-gnu.tar.gz"; \
     url="https://github.com/ephpm/php-sdk/releases/download/v${PHP_SDK_VERSION}/${asset}"; \
     mkdir -p "${sdk_dir}"; \
     curl -fSL "${url}" -o /tmp/sdk.tar.gz; \
@@ -163,11 +159,13 @@ RUN cargo fetch
 # .rlib artifacts are cached in this Docker layer. When real source replaces the stubs
 # after COPY . ., cargo reuses all the dep .rlibs and only recompiles project crates.
 #
-# Must use the same --target as `cargo xtask release` (x86_64-unknown-linux-musl) and
+# Must use the same --target as `cargo xtask release` (<arch>-unknown-linux-gnu) and
 # the same PHP_SDK_PATH so the feature flags and cfg(php_linked) match exactly.
-RUN PHP_SDK_PATH=/src/php-sdk/${PHP_SDK_VERSION}-linux-$(uname -m) \
+# The -Wl,--export-dynamic link arg is emitted by crates/ephpm/build.rs, so the
+# in-container build gets it for free — nothing to mirror here.
+RUN PHP_SDK_PATH=/src/php-sdk/${PHP_SDK_VERSION}-linux-$(uname -m)-gnu \
     cargo build --release --package ephpm \
-        --target x86_64-unknown-linux-musl 2>&1 | grep -v "^warning:"
+        --target $(uname -m)-unknown-linux-gnu 2>&1 | grep -v "^warning:"
 
 # Real source — invalidates from here, but the dep .rlib layer above is cached.
 # target/ is in .dockerignore so COPY . . does not overwrite the pre-compiled deps.
@@ -196,9 +194,23 @@ RUN cp $(find target -name ephpm -type f -path '*/release/*' | head -1) /ephpm &
 
 # ── Stage 4: runtime ──────────────────────────────────────────────────────────
 
-FROM alpine:3.21
+# The ephpm binary is glibc-dynamic (it must dlopen() shared PHP extensions
+# and middleware), so the runtime base has to ship glibc — a Debian slim
+# image, not alpine/scratch. ca-certificates covers ACME/TLS and outbound
+# HTTPS.
+#
+# Why debian:13 (trixie, glibc 2.41) and not debian:12 (bookworm, 2.36):
+# the php-sdk gnu tarball's libphp.a is built on a glibc 2.38+ toolchain
+# (__isoc23_strto*, strlcpy/strlcat), and the ubuntu:24.04 builder adds
+# weak GLIBC_2.39 refs (pidfd_spawnp), so the binary's floor is
+# glibc >= 2.39 — bookworm's 2.36 loader refuses to start it
+# ("version `GLIBC_2.39' not found"). Verified empirically during the
+# dynamic-pivot validation.
+FROM debian:13-slim
 
-RUN apk add --no-cache tini
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tini ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /ephpm /usr/local/bin/ephpm
 

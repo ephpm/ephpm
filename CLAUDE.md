@@ -22,9 +22,9 @@ cargo xtask release --target windows       # → target/x86_64-pc-windows-msvc/r
 # Note: Windows builds never include sqld (no Windows binary available from Turso)
 ```
 
-Prerequisites for `cargo xtask release`: git, curl, tar, `build-essential`, `pkg-config`, `libclang-dev` (for bindgen), and `musl-tools`/`musl-dev` on Linux (the prebuilt `libphp.a` is musl-linked). The xtask downloads the PHP SDK from `github.com/ephpm/php-sdk` releases and the sqld binary from Turso releases — no PHP CLI, Composer, or static-php-cli needed.
+Prerequisites for `cargo xtask release`: git, curl, tar, `build-essential`, `pkg-config`, and `libclang-dev` (for bindgen). On Linux the build targets the host-default `<arch>-unknown-linux-gnu` triple against the glibc-linked (`-gnu`) `libphp.a` — the resulting binary is a single glibc-dynamic file that can `dlopen()` shared PHP extensions and middleware; no musl toolchain is involved. The xtask downloads the PHP SDK from `github.com/ephpm/php-sdk` releases and the sqld binary from Turso releases — no PHP CLI, Composer, or static-php-cli needed.
 
-The PHP SDK is cached at `php-sdk/<version>-<os>-<arch>/` (e.g. `php-sdk/8.5.2-linux-x86_64/`). Delete that directory to force a re-download.
+The PHP SDK is cached at `php-sdk/<version>-<os>-<arch>[-gnu]/` (the `-gnu` libc suffix applies on Linux, e.g. `php-sdk/8.5.7-linux-x86_64-gnu/`). Delete that directory to force a re-download.
 
 ## Testing
 
