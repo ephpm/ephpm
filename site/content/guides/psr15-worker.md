@@ -15,21 +15,36 @@ built on the shared base package **`ephpm/worker`**
 ([github.com/ephpm/php-worker](https://github.com/ephpm/php-worker)). PSR-7
 objects come from `nyholm/psr7` + `nyholm/psr7-server`.
 
-> **Packagist status:** not yet published. Until then, install from the VCS
-> repositories (below).
+ePHPm's PHP packages are distributed via their GitHub repositories (not
+Packagist). Install them by adding each repo in the dependency tree as a
+Composer `vcs` repository.
 
 ## 1. Install
 
+Add every ePHPm repo in the tree to your app's `composer.json`. The adapter
+depends on `ephpm/worker`, so **both** repos are listed — Composer does **not**
+resolve a VCS dependency's own VCS repositories transitively, so each ePHPm
+package needs its own `repositories` entry:
+
 ```json
 // composer.json
-"repositories": [
+{
+  "repositories": [
     { "type": "vcs", "url": "https://github.com/ephpm/psr15-worker" },
     { "type": "vcs", "url": "https://github.com/ephpm/php-worker" }
-]
+  ],
+  "require": {
+    "ephpm/psr15-worker": "^0.1"
+  }
+}
 ```
 
+Both `ephpm/psr15-worker` and its `ephpm/worker` dependency are tagged
+`v0.1.0`, so `^0.1` resolves for each; each still needs its own `repositories`
+entry because Composer does not resolve VCS repos transitively. Then:
+
 ```bash
-composer require ephpm/psr15-worker
+composer update
 ```
 
 This installs the worker entrypoint at `vendor/bin/ephpm-worker` (shebang'd

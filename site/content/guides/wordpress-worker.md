@@ -17,23 +17,36 @@ URL/headers/body (`$wp_query`, `$wp`, `$post`, superglobals, current user) and
 leaves worker-lifetime state (hook registry, post types, rewrite rules, the
 object cache) alone.
 
-> **Packagist status:** not yet published. Until then, install from the VCS
-> repository (below).
+ePHPm's PHP packages are distributed via their GitHub repositories (not
+Packagist). Install them by adding each repo in the dependency tree as a
+Composer `vcs` repository.
 
 ## 1. Install the adapter
 
-In a Composer-managed WordPress root:
+In a Composer-managed WordPress root, add every ePHPm repo in the tree to
+`composer.json`. The adapter depends on `ephpm/worker`, so **both** repos are
+listed — Composer does **not** resolve a VCS dependency's own VCS repositories
+transitively, so each ePHPm package needs its own `repositories` entry:
 
 ```json
 // composer.json
-"repositories": [
+{
+  "repositories": [
     { "type": "vcs", "url": "https://github.com/ephpm/wordpress-worker" },
     { "type": "vcs", "url": "https://github.com/ephpm/php-worker" }
-]
+  ],
+  "require": {
+    "ephpm/wordpress-worker": "^0.1"
+  }
+}
 ```
 
+Both `ephpm/wordpress-worker` and its `ephpm/worker` dependency are tagged
+`v0.1.0`, so `^0.1` resolves for each; each still needs its own `repositories`
+entry because Composer does not resolve VCS repos transitively. Then:
+
 ```bash
-composer require ephpm/wordpress-worker
+composer update
 ```
 
 This installs the entrypoint at `vendor/bin/ephpm-wp-worker`. (The engine skips
