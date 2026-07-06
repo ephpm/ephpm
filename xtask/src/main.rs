@@ -133,9 +133,9 @@ fn parse_release_php_version(args: &[String]) -> &str {
 
 /// Dispatch release builds based on `--target` flag.
 ///
-/// `release_native` requires a Unix host (musl-gcc on Linux); the Windows
-/// path requires native Windows (no cargo-xwin cross-compile). Each path
-/// applies its own host guard.
+/// `release_native` requires a Unix host (gcc/glibc toolchain on Linux); the
+/// Windows path requires native Windows (no cargo-xwin cross-compile). Each
+/// path applies its own host guard.
 fn release(args: &[String]) -> ExitCode {
     match parse_target(args) {
         None => require_unix(|| release_native(args)),
@@ -150,10 +150,12 @@ fn release(args: &[String]) -> ExitCode {
 
 /// Build the PHP SDK and then compile the release binary for the host.
 ///
-/// On Linux, the prebuilt `libphp.a` is musl-linked (built by static-php-cli
-/// in the php-sdk release pipeline), so the Rust binary must target musl too
-/// or linking fails with sigsetjmp / `__flt_rounds` style errors. The result
-/// is a fully static, self-contained binary.
+/// On Linux, the prebuilt `libphp.a` is glibc-linked (the `-gnu` SDK
+/// variant), and the Rust binary targets `<arch>-unknown-linux-gnu` — the
+/// host default. The result is a single-file, glibc-dynamic binary whose
+/// dynamic symbol table exports the Zend API (`--export-dynamic`, applied by
+/// `crates/ephpm/build.rs`), so standard shared PHP extensions and
+/// middleware `.so` files load via `dlopen()`.
 ///
 /// On macOS, the prebuilt SDK was built with Homebrew clang against
 /// `aarch64-apple-darwin`, so we build for the host target directly. Only
@@ -170,16 +172,19 @@ fn release_native(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Pick the Rust target. On Linux we cross-link against musl libphp.a,
-    // so we must build the Rust crate against the same libc.
+    // Pick the Rust target. Both are the host default; we pass the triple
+    // explicitly so the output path (target/<triple>/release/ephpm) is
+    // deterministic for CI packaging.
     let host_target = if cfg!(target_os = "macos") {
         if let Err(code) = require_macos_arm64() {
             return code;
         }
         format!("{}-apple-darwin", std::env::consts::ARCH)
     } else {
-        // Linux — match the libc (musl) of the prebuilt libphp.a.
-        format!("{}-unknown-linux-musl", std::env::consts::ARCH)
+        // Linux — glibc-dynamic build matching the `-gnu` SDK's libphp.a.
+        // (Fully static musl builds cannot dlopen(), which the shared-
+        // extension and middleware lanes require.)
+        format!("{}-unknown-linux-gnu", std::env::consts::ARCH)
     };
 
     eprintln!("==> Ensuring Rust target {host_target} is installed...");
@@ -454,7 +459,8 @@ fn ensure_php_sdk_for(version: &str, os: &str, arch: &str) -> Result<(), ()> {
         eprintln!("error: failed to create {}: {e}", dest.display());
     })?;
 
-    let asset = format!("php-sdk-{version}-{os}-{arch}.tar.gz");
+    let suffix = php_sdk_libc_suffix(os);
+    let asset = format!("php-sdk-{version}-{os}-{arch}{suffix}.tar.gz");
     let url = format!("https://github.com/ephpm/php-sdk/releases/download/v{version}/{asset}");
 
     eprintln!("==> Downloading {asset}...");
@@ -468,9 +474,21 @@ fn ensure_php_sdk_for(version: &str, os: &str, arch: &str) -> Result<(), ()> {
     Ok(())
 }
 
+/// Libc suffix used in Linux SDK release-asset and cache-directory names.
+///
+/// Linux SDKs are published per libc variant; ePHPm consumes the glibc
+/// (`-gnu`) build so the resulting binary can `dlopen()` shared PHP
+/// extensions and middleware. macOS/Windows publish a single variant with
+/// no suffix. The suffix is part of the cache dir name too, so a stale
+/// musl-era cache (`<ver>-linux-<arch>/`) is never silently reused.
+fn php_sdk_libc_suffix(os: &str) -> &'static str {
+    if os == "linux" { "-gnu" } else { "" }
+}
+
 /// Workspace-relative cache path for a PHP SDK pinned to `(version, os, arch)`.
 fn php_sdk_dir_for(version: &str, os: &str, arch: &str) -> PathBuf {
-    workspace_root().join("php-sdk").join(format!("{version}-{os}-{arch}"))
+    let suffix = php_sdk_libc_suffix(os);
+    workspace_root().join("php-sdk").join(format!("{version}-{os}-{arch}{suffix}"))
 }
 
 /// Convenience for the host platform — cache path for the SDK that
@@ -1306,12 +1324,12 @@ fn workspace_root() -> PathBuf {
     }
 }
 
-/// Building ephpm requires a Unix toolchain (musl-gcc on Linux, Apple clang
+/// Building ephpm requires a Unix toolchain (gcc/glibc on Linux, Apple clang
 /// on macOS). On Windows, re-execute the same command inside WSL.
 ///
 /// The PHP SDK itself is now a plain tarball download and works on any host
 /// with `curl` + `tar`, so `cargo xtask php-sdk` doesn't go through here —
-/// only `cargo xtask release` does, since `cargo build` for a musl target
+/// only `cargo xtask release` does, since `cargo build` for a Linux target
 /// from native Windows isn't supported.
 fn require_unix(f: impl FnOnce() -> ExitCode) -> ExitCode {
     if !cfg!(windows) {
@@ -1319,7 +1337,7 @@ fn require_unix(f: impl FnOnce() -> ExitCode) -> ExitCode {
     }
 
     if !has_command("wsl") {
-        eprintln!("error: ephpm release builds require a Unix toolchain (musl-gcc on Linux).");
+        eprintln!("error: ephpm release builds require a Unix toolchain (gcc/glibc on Linux).");
         eprintln!("       Install WSL: wsl --install");
         return ExitCode::FAILURE;
     }
@@ -1341,7 +1359,7 @@ fn require_unix(f: impl FnOnce() -> ExitCode) -> ExitCode {
             "  wsl -- bash -c 'curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh'"
         );
         eprintln!(
-            "  wsl -- bash -c 'sudo apt update && sudo apt install -y build-essential pkg-config libclang-dev musl-tools curl git'"
+            "  wsl -- bash -c 'sudo apt update && sudo apt install -y build-essential pkg-config libclang-dev curl git'"
         );
         ExitCode::FAILURE
     }

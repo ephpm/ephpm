@@ -129,6 +129,7 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 | `memory_limit` | string | `"128M"` | PHP `memory_limit`. |
 | `ini_file` | path | (none) | Custom `php.ini` loaded before `ini_overrides`. |
 | `ini_overrides` | array of `[string, string]` | `[]` | INI directives applied after `ini_file`. In worker mode, `log_errors=On` is seeded as a default before `ini_file`/`ini_overrides` (either can override it) so worker-script fatals reach the engine log — `display_errors` output is captured into a buffer that is discarded when no request is in flight. |
+| `extensions` | array of string | `[]` | Shared PHP extensions loaded at startup as `extension=` lines in the generated php.ini, emitted **before** `ini_file`/`ini_overrides`. Bare names (`"redis"`) use PHP's `extension_dir` search; paths load verbatim. Must match the embedded PHP's ABI: same PHP minor, ZTS (Linux/macOS) / NTS (Windows), glibc on Linux — PHP reports a mismatch at startup. Note distro/[Sury](https://deb.sury.org/) extension packages are NTS-only (no ZTS variants as of July 2026) — on Linux, compile the extension for ZTS (phpize/gcc against matching ZTS headers). Empty entries fail validation. See the [PHP Extensions guide](/guides/php-extensions/). |
 | `workers` | usize | `0` (unlimited) | Max concurrent PHP executions (php-fpm `pm.max_children` semantics); excess requests queue. `0` = unlimited. **Ignored in worker mode** (startup logs a WARN if set). |
 | `mode` | string | `"fpm"` | Request-execution model. `"fpm"` = per-request startup/shutdown (default, unchanged). `"worker"` = persistent worker mode: boot the framework once per worker, loop over requests (Octane/RoadRunner model). |
 | `worker_script` | path | (none) | Worker-mode entrypoint, relative to `document_root`. **Required** when `mode = "worker"`; config load hard-errors if absent or not a file under `document_root`. |
@@ -269,13 +270,13 @@ read. Mounts apply globally, not per vhost — a module can discriminate by
 vhost via the request's server name. See the
 [Native Middleware guide](/guides/native-middleware/).
 
-**Built-ins work in every binary, including the fully static Linux release.**
-Only shared-library mounts (custom out-of-tree modules) need dynamic
-loading: the stock `x86_64-unknown-linux-musl` release binary is fully
-static and `dlopen` is unavailable there (`Dynamic loading not supported`
-at startup). For that lane, use a
-`RUSTFLAGS="-C target-feature=-crt-static"` build — see the guide's
-[dynamic-lane section](/guides/native-middleware/#the-dynamic-lane-and-static-binaries).
+**Built-ins work in every binary.** Shared-library mounts (custom
+out-of-tree modules) work out of the box with the stock release binaries
+on all platforms — the Linux release is glibc-dynamic
+(`<arch>-unknown-linux-gnu`), so `dlopen` is available. Only a self-built
+fully static musl binary lacks `dlopen` (`Dynamic loading not supported`
+at startup) — see the guide's
+[dynamic-lane section](/guides/native-middleware/#the-dynamic-lane).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

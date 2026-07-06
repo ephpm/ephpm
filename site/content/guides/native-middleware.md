@@ -18,12 +18,13 @@ There are **two ways a module runs**:
 
 - **Built-in (static registry).** Four modules — `jwt`, `cors`,
   `ratelimit`, `security-headers` — are compiled into **every** ePHPm
-  binary, including the fully static musl release. `library = "jwt"` just
-  works: no shared library on disk, no `dlopen`, no special build.
+  binary. `library = "jwt"` just works: no shared library on disk, no
+  `dlopen`, no special build.
 - **Dynamic (shared library).** Custom out-of-tree modules are `.so` /
   `.dylib` / `.dll` files speaking a small, versioned C ABI, loaded once at
-  startup. This lane requires a binary that can `dlopen` — see
-  [the dynamic lane and static binaries](#the-dynamic-lane-and-static-binaries).
+  startup via `dlopen` (`LoadLibrary` on Windows). This works out of the
+  box with the stock release binaries on every platform — see
+  [the dynamic lane](#the-dynamic-lane).
 
 ## Quick start
 
@@ -257,53 +258,34 @@ consumed instantly at a window boundary), and it is distinct from the
 built-in connection-level limiter in `[server.limits]` — the two are
 independent.
 
-## The dynamic lane and static binaries
+## The dynamic lane
 
 Custom out-of-tree modules load through `dlopen` (`LoadLibrary` on
-Windows) — and that requires a host binary with dynamic loading available.
-**Built-ins are unaffected by everything in this section.**
+Windows). This works with the stock release binaries on every platform:
 
-The stock Linux release binary — `cargo xtask release`, the
-`docker/Dockerfile` image, and the published release artifacts — targets
-`x86_64-unknown-linux-musl` with the C runtime **statically linked**. A
-fully static musl binary cannot `dlopen()` anything, so a `[[middleware]]`
-mount that resolves to a shared library makes startup fail fast with:
+- **Linux** release binaries (`cargo xtask release`, the
+  `docker/Dockerfile` image, and the published release artifacts) are
+  **glibc-dynamic** — a single file that targets
+  `<arch>-unknown-linux-gnu` and can `dlopen()` shared middleware (and
+  shared PHP extensions — see [PHP Extensions](/guides/php-extensions/))
+  out of the box.
+- **macOS** release binaries are dynamically linked against the system
+  runtime (`dlopen` is always available there).
+- **Windows** builds use `LoadLibrary` — no special build needed.
 
-```
-error: failed to load native middleware chain: failed to load middleware
-"/mw/libmy_auth.so" from ...:
-dlopen failed for ...: Dynamic loading not supported
-```
+The module's libc must match the host binary's: on Linux, build modules
+for the gnu target (the default on every mainstream distro toolchain) —
+see [Building modules on Linux](#building-modules-on-linux).
 
-To run *custom* middleware on Linux you need an ePHPm binary with the C
-runtime **dynamically linked**. Build one by disabling `crt-static` (note
-the exact spelling — `-crt-static`; the underscore form is silently
-ignored by current rustc):
-
-```bash
-RUSTFLAGS="-C target-feature=-crt-static" cargo xtask release
-```
-
-This produces a dynamically-linked musl binary that loads middleware and
-serves PHP normally (verified on Alpine). The trade-offs:
-
-- It needs a musl dynamic loader (`/lib/ld-musl-x86_64.so.1`) and
-  `libgcc_s.so.1` at runtime. On Alpine: `apk add libgcc` (the loader is
-  already there). It is no longer the run-anywhere static binary — don't
-  expect it to start on glibc-only distros.
-- Development builds (`cargo build` on a glibc host) are dynamically
-  linked already and load middleware without any of this.
-
-macOS release binaries are dynamically linked against the system runtime
-(`dlopen` is always available there), and Windows builds use
-`LoadLibrary` — neither needs a special build. The static-musl limitation
-is Linux-release-specific.
-
-**Compiling third-party middleware INTO a static binary** (xcaddy-style
-build-time composition, so custom modules get the same
-works-in-every-binary treatment as the built-ins) is being designed — see
-[`docs/architecture/build-compose-design.md`](https://github.com/ephpm/ephpm/blob/main/docs/architecture/build-compose-design.md)
-in the repository. Planned — not yet implemented.
+**Building a fully static binary yourself:** you can still produce a
+fully static musl ePHPm (`x86_64-unknown-linux-musl` with `crt-static`)
+if your deployment demands it, but be aware that a fully static binary
+**cannot `dlopen()` anything** — every `[[middleware]]` mount that
+resolves to a shared library (and every `[php] extensions` entry) fails
+startup with `Dynamic loading not supported`. Built-ins keep working;
+custom static composition tooling for that scenario is future work
+(`docs/architecture/build-compose-design.md`). Planned — not yet
+implemented.
 
 ## Writing your own module in Rust
 
@@ -363,36 +345,25 @@ host.log(ephpm_middleware::abi::LOG_INFO, "hello from middleware");
 The KV operations hit the same embedded store PHP sees through
 `ephpm_kv_*` — replicated across the cluster when clustering is enabled.
 
-### Building modules for the Linux musl target
+### Building modules on Linux
 
-The module must match the host binary's libc. For the release (musl)
-binary, build the module for `x86_64-unknown-linux-musl` **with
-`crt-static` disabled** — this is required, not optional:
+The module must match the host binary's libc. The release binary is
+glibc-dynamic (gnu target), so a plain release build on any mainstream
+distro produces a compatible `.so`:
 
 ```bash
-RUSTFLAGS="-C target-feature=-crt-static" \
-cargo build --release --target x86_64-unknown-linux-musl -p my-auth
+cargo build --release -p my-auth
 ```
 
-With the default (static) C runtime, rustc does not error — it prints
-`warning: dropping unsupported crate type 'cdylib' for target
-'x86_64-unknown-linux-musl'` and **produces no `.so` at all**.
-
-Two more Linux notes, both observed on Ubuntu's `musl-tools`:
-
-- The `musl-gcc` wrapper ships no dynamic `libgcc_s`, so linking fails
-  with `cannot find libgcc_s.so.1`. Workaround:
-  `ln -s /usr/lib/x86_64-linux-gnu/libgcc_s.so.1 /usr/lib/x86_64-linux-musl/`.
-  (Building inside Alpine with its native toolchain avoids this.)
-- The produced `.so` depends on `libgcc_s.so.1` and musl `libc.so` at
-  runtime — on Alpine, `apk add libgcc`.
-
-The artifact lands at
-`target/x86_64-unknown-linux-musl/release/lib<crate_name>.so`; a bare
+The artifact lands at `target/release/lib<crate_name>.so`; a bare
 `library = "<crate_name>"` mount finds the `lib<name>.so` form through
 the search path. The four in-tree modules build exactly the same way
 (`-p ephpm-middleware-jwt -p ephpm-middleware-cors
 -p ephpm-middleware-ratelimit -p ephpm-middleware-security-headers`).
+
+Build on a distro whose glibc is not newer than the deployment target's
+(the usual glibc forward-compatibility rule — a module built on Debian 12
+runs on anything with glibc >= Debian 12's).
 
 ## The C ABI (for non-Rust modules)
 

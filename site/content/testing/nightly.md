@@ -37,7 +37,7 @@ All stress/integration tests use `#[ignore]` so they never run during `cargo tes
 - FFI linking failures against real `libphp.a`
 - PHP SAPI integration regressions (the `#[ignore]` tests in `kv_sapi_integration.rs`)
 - Conditional compilation bugs — code gated behind `#[cfg(php_linked)]` that never runs in stub mode
-- Platform-specific issues (Linux musl vs macOS)
+- Platform-specific issues (Linux glibc vs macOS)
 
 **Implementation:**
 - Matrix: `{php: [8.4, 8.5]} × {os: [ubuntu-latest, macos-latest]}`

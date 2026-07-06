@@ -1,7 +1,7 @@
 //! In-process ("builtin") middleware — the static-registry execution lane.
 //!
-//! A fully static musl release binary cannot `dlopen()` anything, so the
-//! shared-library lane cannot be the only way to run middleware.
+//! A fully static (musl, `crt-static`) binary cannot `dlopen()` anything,
+//! so the shared-library lane cannot be the only way to run middleware.
 //! [`BuiltinModule`] adapts any [`Middleware`] implementation **compiled into
 //! the host binary** so the chain can call it directly: same trait, same
 //! [`Request`] view, same process-wide host table — the request accessors and

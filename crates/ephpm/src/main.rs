@@ -521,8 +521,12 @@ fn run_with_config(config: ephpm_config::Config, verbose: u8) -> anyhow::Result<
     // diagnostic anywhere — display_errors output is captured into a buffer
     // that is discarded when no request is in flight.
     let worker_mode = config.php.mode == "worker";
-    let want_generated_ini =
-        !config.php.ini_overrides.is_empty() || vhost_disable_shell || worker_mode;
+    // [php] extensions also forces ini generation: `extension=` lines only
+    // take effect when PHP parses them during MINIT, same as the overrides.
+    let want_generated_ini = !config.php.ini_overrides.is_empty()
+        || !config.php.extensions.is_empty()
+        || vhost_disable_shell
+        || worker_mode;
 
     let (effective_ini_path, _generated_ini_guard): (Option<PathBuf>, Option<TempFileGuard>) =
         if want_generated_ini {
@@ -533,6 +537,16 @@ fn run_with_config(config: ephpm_config::Config, verbose: u8) -> anyhow::Result<
             // override it: fatals must reach the engine log ([PHP] lines).
             if worker_mode {
                 content.push_str("log_errors=On\n");
+            }
+            // Shared extensions ([php] extensions) go first, before
+            // ini_file/ini_overrides, so any extension ini settings that
+            // follow apply to an already-declared extension. A bare name
+            // rides PHP's extension_dir search (`extension=redis`); a path
+            // loads verbatim (`extension=/path/to/imagick.so`). ABI
+            // mismatches (PHP minor / ZTS / libc) are rejected by PHP at
+            // startup with an explicit API-version error.
+            for ext in &config.php.extensions {
+                let _ = writeln!(content, "extension={ext}");
             }
             if let Some(base) = &config.php.ini_file {
                 let base_content = std::fs::read_to_string(base).with_context(|| {

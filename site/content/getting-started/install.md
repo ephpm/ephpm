@@ -99,13 +99,12 @@ cargo run -- serve --config ephpm.toml
 
 ```bash
 # Release binary with PHP embedded.
-# Prerequisites: git, curl, tar, build-essential, pkg-config, libclang-dev,
-# and musl-tools/musl-dev on Linux (the prebuilt libphp.a is musl-linked).
+# Prerequisites: git, curl, tar, build-essential, pkg-config, libclang-dev.
 cargo xtask release       # → target/release/ephpm
 cargo xtask release 8.4   # use PHP 8.4 instead of 8.5
 ```
 
-`cargo xtask release` doesn't build PHP locally — it downloads a prebuilt PHP SDK (`libphp.a` plus headers) from [github.com/ephpm/php-sdk](https://github.com/ephpm/php-sdk) releases. No PHP CLI, Composer, or static-php-cli toolchain is required. The SDK is cached at `php-sdk/<version>-<os>-<arch>/`; delete that directory to force a re-download.
+`cargo xtask release` doesn't build PHP locally — it downloads a prebuilt PHP SDK (`libphp.a` plus headers; on Linux the glibc-linked `-gnu` variant) from [github.com/ephpm/php-sdk](https://github.com/ephpm/php-sdk) releases. No PHP CLI, Composer, or static-php-cli toolchain is required. The SDK is cached at `php-sdk/<version>-<os>-<arch>[-gnu]/`; delete that directory to force a re-download. On Linux the result is a single glibc-dynamic binary (gnu target) that can load shared PHP extensions and middleware via `dlopen`.
 
 Windows builds run natively (no cross-compile, no `cargo-xwin`) — you just need the MSVC build tools:
 

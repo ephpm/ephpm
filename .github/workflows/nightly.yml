@@ -41,11 +41,11 @@ jobs:
         arch:
           - runner: x64
             image: latest
-            triple: x86_64-unknown-linux-musl
+            triple: x86_64-unknown-linux-gnu
             sdk: linux-x86_64
           - runner: arm64
             image: latest-arm64
-            triple: aarch64-unknown-linux-musl
+            triple: aarch64-unknown-linux-gnu
             sdk: linux-aarch64
     steps:
       - uses: actions/checkout@v4
@@ -60,16 +60,18 @@ jobs:
         # task; meanwhile keep running it so we can observe the error change.
         continue-on-error: true
         run: |
-          PHP_SDK_PATH=$(find "$(pwd)/php-sdk" -mindepth 1 -maxdepth 1 -type d -name '*-${{ matrix.arch.sdk }}' | head -1)
+          # Linux SDK cache dirs carry the -gnu libc suffix (see
+          # xtask::php_sdk_libc_suffix).
+          PHP_SDK_PATH=$(find "$(pwd)/php-sdk" -mindepth 1 -maxdepth 1 -type d -name '*-${{ matrix.arch.sdk }}-gnu' | head -1)
           test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
           PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run \
             --target ${{ matrix.arch.triple }} \
             --workspace --run-ignored ignored-only
 
       - name: Verify binary
-        # cargo xtask release on Linux always targets musl (libphp.a is
-        # musl-linked), so the artifact lives under the musl triple, not
-        # the host triple.
+        # cargo xtask release passes the gnu triple explicitly on Linux
+        # (glibc-dynamic binary, dlopen-capable), so the artifact lives
+        # under target/<triple>/release/, not target/release/.
         run: |
           FILE="target/${{ matrix.arch.triple }}/release/ephpm"
           test -f "$FILE" || { echo "::error::Binary not found at $FILE"; exit 1; }

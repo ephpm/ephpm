@@ -1222,6 +1222,38 @@ pub struct PhpConfig {
     #[serde(default)]
     pub ini_overrides: Vec<[String; 2]>,
 
+    /// Shared PHP extensions to load at startup.
+    ///
+    /// Each entry is either a bare extension name (`"redis"`, `"imagick"`)
+    /// or an absolute/relative path to a shared object. Bare names are
+    /// emitted as `extension=<name>` so PHP's own `extension_dir` search
+    /// resolves them; paths are emitted as `extension=<path>` verbatim.
+    /// The lines are written into the generated php.ini *before* `ini_file`
+    /// and `ini_overrides`, so those can still tune the extension's own ini
+    /// settings.
+    ///
+    /// The extension binary must match the embedded PHP's ABI: same PHP
+    /// minor version, same thread-safety mode (ZTS on Linux/macOS, NTS on
+    /// Windows), and — on Linux — glibc (the release binary is
+    /// glibc-dynamic). PHP verifies this at startup and rejects a mismatch
+    /// with a clear "Unable to load dynamic library" error instead of
+    /// crashing (verified: an NTS build fails with `undefined symbol:
+    /// compiler_globals`). Note that Debian/Sury `php8.5-<ext>` packages
+    /// are NTS-only (no `-zts` variants exist as of 2026-07), so on Linux a
+    /// shared extension must currently be compiled for ZTS — e.g. `phpize`
+    /// against a ZTS PHP of the same minor, or `gcc -shared` against the
+    /// matching php-sdk headers. Windows (NTS `.dll`) and macOS (ZTS
+    /// `.dylib`) work the same way via their dynamically-capable release
+    /// binaries.
+    ///
+    /// Empty entries fail validation (`validate()`): PHP would silently
+    /// ignore a bare `extension=` line, which would make the knob a silent
+    /// no-op.
+    ///
+    /// Default: empty (only the ~45 statically linked extensions).
+    #[serde(default)]
+    pub extensions: Vec<String>,
+
     /// Maximum number of PHP requests that may execute concurrently.
     ///
     /// Equivalent to php-fpm's `pm.max_children`: requests beyond the cap
@@ -1431,6 +1463,18 @@ impl Config {
             self.resolve_worker_script()?;
         }
 
+        // [php] extensions: an empty entry can never load anything, and PHP
+        // silently ignores a bare `extension=` line — rejecting it here
+        // keeps the knob from being a silent no-op.
+        for (i, ext) in self.php.extensions.iter().enumerate() {
+            if ext.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "[php] extensions entry {i} is empty — use a bare extension \
+                     name (e.g. \"redis\") or a path to a shared object",
+                )));
+            }
+        }
+
         // Native middleware: an empty `library` can never resolve, and
         // silently skipping the mount would be a silent no-op config knob.
         for (i, mount) in self.middleware.iter().enumerate() {
@@ -1579,6 +1623,7 @@ impl Default for PhpConfig {
             memory_limit: default_memory_limit(),
             ini_file: None,
             ini_overrides: Vec::new(),
+            extensions: Vec::new(),
             workers: default_php_workers(),
             mode: default_php_mode(),
             worker_script: None,
@@ -2156,6 +2201,49 @@ ini_overrides = [
         assert_eq!(config.php.ini_overrides.len(), 2);
         assert_eq!(config.php.ini_overrides[0], ["display_errors", "Off"]);
         assert_eq!(config.php.ini_overrides[1], ["error_reporting", "E_ALL"]);
+    }
+
+    #[test]
+    fn test_php_extensions_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[php]
+extensions = ["redis", "/usr/lib/php/20240924/imagick.so"]
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.extensions, vec!["redis", "/usr/lib/php/20240924/imagick.so"]);
+        config.validate().expect("non-empty extension entries should validate");
+    }
+
+    #[test]
+    fn test_php_extensions_default_empty() {
+        let config = Config::default_config().unwrap();
+        assert!(config.php.extensions.is_empty());
+        config.validate().expect("empty extension list should validate");
+    }
+
+    #[test]
+    fn test_php_extensions_empty_entry_fails_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[php]
+extensions = ["redis", ""]
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let err = config.validate().expect_err("empty extension entry must be rejected");
+        assert!(err.to_string().contains("extensions entry 1"), "unexpected error: {err}");
     }
 
     #[test]

@@ -179,8 +179,8 @@ There is no admin interface — ePHPm exposes no admin endpoints, so there is no
 
 ### Runtime
 
-- Single static binary — no dynamic library loading, no runtime dependency resolution
-- PHP extensions are compiled in at build time — no `dl()` loading at runtime (disabled by default in embed SAPI)
+- Single binary — dynamic library loading happens only for what the operator's config explicitly lists (`[[middleware]]` shared-library mounts, `[php] extensions`); nothing is loaded from ambient search paths without a config entry
+- The baseline ~45 PHP extensions are compiled in at build time; additional shared extensions load only via the `[php] extensions` config knob — runtime `dl()` from PHP code remains disabled by default in the embed SAPI
 
 ---
 
