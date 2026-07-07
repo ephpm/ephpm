@@ -17,23 +17,37 @@ built on the shared base package **`ephpm/worker`**
 provides the `Ephpm\Worker\Envelope` type and IDE stubs for the engine
 primitives.
 
-> **Packagist status:** not yet published. Until then, install from the VCS
-> repository (below).
+ePHPm's PHP packages are distributed via their GitHub repositories (not
+Packagist). Install them by adding each repo in the dependency tree as a
+Composer `vcs` repository.
 
 ## 1. Install the driver
 
-In your Laravel project:
+In your Laravel project, add every ePHPm repo in the tree to `composer.json`.
+The driver depends on `ephpm/worker`, so **both** repos are listed — Composer
+does **not** resolve a VCS dependency's own VCS repositories transitively, so
+each ePHPm package needs its own `repositories` entry:
 
 ```json
 // composer.json
-"repositories": [
+{
+  "repositories": [
     { "type": "vcs", "url": "https://github.com/ephpm/octane-driver" },
     { "type": "vcs", "url": "https://github.com/ephpm/php-worker" }
-]
+  ],
+  "require": {
+    "ephpm/octane-driver": "^0.1"
+  }
+}
 ```
 
+Both `ephpm/octane-driver` and its `ephpm/worker` dependency are tagged
+`v0.1.0`, so `^0.1` resolves for each; each still needs its own `repositories`
+entry because Composer does not resolve VCS repos transitively. Then:
+
 ```bash
-composer require laravel/octane ephpm/octane-driver
+composer require laravel/octane
+composer update
 ```
 
 This installs the worker entrypoint at `vendor/bin/ephpm-octane-worker`.

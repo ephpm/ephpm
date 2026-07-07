@@ -706,7 +706,8 @@ it around the worker handle time too, so fpm↔worker latency is comparable.
 ## 8. Packaging / repos
 
 The engine (this design) ships **in the ephpm repo**. Everything framework-facing
-is a separate Composer package on Packagist under the `ephpm/` vendor namespace.
+is a separate Composer package under the `ephpm/` vendor namespace, distributed
+via its GitHub repository as a Composer `vcs` repo (not Packagist).
 
 **Stays in `ephpm/ephpm` (this repo):**
 - The Rust/C engine: `worker_bridge.rs`, `worker_pool.rs`, the C
@@ -717,7 +718,7 @@ is a separate Composer package on Packagist under the `ephpm/` vendor namespace.
   `laravel-octane-driver.md:339-341`). Not a framework adapter — just
   `while ($e = take_request()) { send_response(200, [...], "hello"); }`.
 
-**New org repos / Packagist packages (each its own repo under `github.com/ephpm`):**
+**New org repos (each its own repo under `github.com/ephpm`, installed as a Composer `vcs` repo):**
 
 | Package | Repo | Phase | Purpose |
 |---|---|---|---|

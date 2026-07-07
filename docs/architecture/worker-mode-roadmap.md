@@ -12,8 +12,10 @@ frameworks (Laravel, Symfony, WordPress). ePHPm's real differentiator vs. a
 **Status (2026-07): shipped and e2e-validated** — the Phase-1 engine, the
 Phase-3 streaming engine, `ephpm/worker` (base package), `ephpm/octane-driver`,
 and `ephpm/wordpress-worker`. Still open: `ephpm/psr15-worker`,
-`ephpm/symfony-runtime`, Phase 4 (cache bindings + ticks), Phase 5, and
-Packagist publication (all shipped packages install via VCS repos for now).
+`ephpm/symfony-runtime`, Phase 4 (cache bindings + ticks), and Phase 5.
+Distribution is via each package's GitHub repository (Composer `vcs` repos) —
+the intended, supported install method; there are no plans to publish to
+Packagist.
 One deviation from the plan below: `php artisan octane:start --server=ephpm`
 is **not** supported — ePHPm supervises the workers itself, so the Octane
 driver is started by running `ephpm` against
@@ -64,8 +66,8 @@ Composer packages remain future work):
 piece is a **separate Composer package** under the `ephpm/` vendor namespace,
 PHP namespace `Ephpm\<Area>\*` (`composer require ephpm/<name>`, installs to
 `vendor/ephpm/<name>/` — `ephpm/cache-wordpress` set the convention). The
-worker packages are **not yet on Packagist** — install via VCS repositories
-until published.
+worker packages are distributed via their GitHub repositories (Composer `vcs`
+repos), not Packagist — this is the intended, supported install method.
 
 Repos (each its own `github.com/ephpm/<repo>`):
 
