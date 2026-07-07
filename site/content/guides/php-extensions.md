@@ -13,9 +13,13 @@ For the long tail, ePHPm loads **standard shared PHP extensions** at
 startup — the same `.so` files, loaded through the same `extension=`
 mechanism, that php-fpm and php-cli use. No ePHPm rebuild: any glibc
 **ZTS** build of an extension for the matching PHP minor loads as-is.
-The catch on Linux today is *sourcing* a ZTS build — Debian and
-[Sury](https://deb.sury.org/) packages are NTS-only (see the ABI
-contract below), so for now expect to compile the extension yourself.
+
+The easiest source of ZTS builds is the **ePHPm extension catalog** — a
+set of common extensions prebuilt ABI-matched to each release (see
+[The extension catalog](#the-extension-catalog) below). Debian and
+[Sury](https://deb.sury.org/) packages are NTS-only and are rejected at
+startup (see the ABI contract), so use the catalog, or `phpize`-compile
+your own ZTS build against the matching php-sdk headers.
 
 The static set stays the baseline. Shared loading is the escape hatch.
 
@@ -47,12 +51,46 @@ gcc -shared -fPIC -DZTS=1 -DCOMPILE_DL_MYEXT=1 \
 ```
 
 For real-world PECL extensions, `phpize` from any ZTS PHP of the same
-minor produces the same result. There is **no apt shortcut yet**: as of
+minor produces the same result. There is **no apt shortcut**: as of
 July 2026 the Sury repo publishes no ZTS packages at all (verified
 against the bookworm and trixie indexes — `php8.5-igbinary` etc. install
 NTS-only `.so` files, which ePHPm rejects at startup with
-`undefined symbol: compiler_globals`). The planned prebuilt extension
-catalog (below) is meant to close this gap.
+`undefined symbol: compiler_globals`). The [extension catalog](#the-extension-catalog)
+closes this gap with prebuilt ZTS `.so` files.
+
+## The extension catalog
+
+ePHPm publishes a curated set of common extensions, prebuilt **ZTS +
+glibc + non-debug** and ABI-matched to each PHP minor, at
+`github.com/ephpm/php-sdk` under the release tag `ext-<version>`. The
+current catalog: `igbinary`, `msgpack`, `apcu`, `redis`, `mongodb`
+(more to follow). Each tarball carries a `manifest.json` recording every
+`.so`'s `php_api_no`, `zts` flag, and sha256.
+
+Download, extract, and point `[php] extensions` at the files:
+
+```bash
+curl -fsSL -o ext.tgz \
+  https://github.com/ephpm/php-sdk/releases/download/ext-8.5.7/ephpm-ext-8.5.7-linux-x86_64-gnu.tar.gz
+mkdir -p /opt/ephpm-ext && tar xzf ext.tgz -C /opt/ephpm-ext
+```
+
+```toml
+# ephpm.toml — match the catalog version to your ePHPm PHP minor
+[php]
+extensions = [
+    "/opt/ephpm-ext/igbinary.so",
+    "/opt/ephpm-ext/msgpack.so",
+    "/opt/ephpm-ext/redis.so",
+    "/opt/ephpm-ext/mongodb.so",
+]
+```
+
+Restart and verify: `extension_loaded('redis')`, `phpinfo()`, or call a
+function (`igbinary_serialize([1,2,3])`). The catalog is regenerated
+whenever the pinned PHP SDKs are — use the `ext-<version>` tag matching
+your release. In a container, the same works in a derived image (fetch
+the tarball in a build stage, set `extensions` in the baked config).
 
 ## How it works
 
@@ -145,8 +183,9 @@ load extensions you trust.
 
 - **Per-vhost extension sets** — today the list is process-wide.
 - **`cargo xtask php-ext`** build helper (phpize against the matching PHP
-  SDK) and a published build-info manifest per release.
+  SDK) for out-of-catalog extensions.
 - **`ephpm_loaded_extensions()`** SAPI builtin (use PHP's own
   `get_loaded_extensions()` today).
-- **Prebuilt extension catalog** (`php-ext-catalog`) with per-extension
-  ZTS status.
+- **Catalog expansion + Windows/macOS catalog variants** — today the
+  catalog covers the common Linux set (igbinary, msgpack, apcu, redis,
+  mongodb); more extensions and per-OS variants are planned.
