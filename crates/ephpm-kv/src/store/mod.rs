@@ -429,6 +429,32 @@ impl Store {
     ///
     /// Returns `Err` if the stored value is not a valid integer string.
     pub fn incr_by(&self, key: &str, delta: i64) -> Result<i64, String> {
+        self.incr_by_with_ttl(key, delta, None)
+    }
+
+    /// Increment the value at `key` by `delta`, applying `ttl` only when the
+    /// key is created by this call. Treats the stored bytes as a decimal
+    /// integer string.
+    ///
+    /// Fixed-window semantics: when the key already exists the TTL is left
+    /// untouched (the window keeps counting down toward its original expiry);
+    /// when the key is absent it is created with value `delta` and the given
+    /// `ttl`. Passing `ttl = None` reproduces plain [`incr_by`] behaviour
+    /// (no expiry on create).
+    ///
+    /// This closes the fixed-window rate-limit race where a missing key
+    /// created by `incr` (no TTL) could become immortal if a separate
+    /// `set_nx` pre-seed lost the race or was skipped.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if the stored value is not a valid integer string.
+    pub fn incr_by_with_ttl(
+        &self,
+        key: &str,
+        delta: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, String> {
         // Fast path: key exists, try to update in place.
         if let Some(mut entry) = self.data.get_mut(key) {
             if entry.is_expired() {
@@ -482,9 +508,9 @@ impl Store {
             }
         }
 
-        // Key doesn't exist — create it.
+        // Key doesn't exist — create it with the caller's TTL (if any).
         let val_bytes = delta.to_string().into_bytes();
-        self.set(key.to_string(), val_bytes, None);
+        self.set(key.to_string(), val_bytes, ttl);
         Ok(delta)
     }
 
@@ -1064,6 +1090,45 @@ mod tests {
         assert!(s.set_nx("k".into(), b"v".to_vec(), Some(Duration::from_secs(60))));
         let entry = s.data.get("k").unwrap();
         assert!(entry.expires_at.is_some(), "expected TTL to be set");
+    }
+
+    #[test]
+    fn incr_by_with_ttl_sets_ttl_on_create_only() {
+        let s = test_store();
+        // First incr creates the key with the window TTL.
+        assert_eq!(s.incr_by_with_ttl("win", 1, Some(Duration::from_secs(60))), Ok(1));
+        let created_expiry = {
+            let entry = s.data.get("win").unwrap();
+            entry.expires_at.expect("expected TTL on create")
+        };
+
+        // A subsequent incr must NOT extend or reset the TTL (fixed window).
+        assert_eq!(s.incr_by_with_ttl("win", 1, Some(Duration::from_secs(600))), Ok(2));
+        let after_expiry = {
+            let entry = s.data.get("win").unwrap();
+            entry.expires_at.expect("TTL must survive subsequent incr")
+        };
+        assert_eq!(
+            created_expiry, after_expiry,
+            "TTL must be set on create and left untouched on later incrs"
+        );
+    }
+
+    #[test]
+    fn incr_by_with_ttl_recreates_after_expiry() {
+        let s = test_store();
+        // Plant an already-expired counter directly.
+        let expired =
+            Entry::with_expiry(b"5".to_vec(), 3, false, Instant::now() - Duration::from_secs(60));
+        let mem_size = expired.mem_size;
+        s.data.insert("win".into(), expired);
+        s.mem_add(mem_size);
+
+        // Incr treats the expired key as vacant: value resets to delta and a
+        // fresh TTL is applied.
+        assert_eq!(s.incr_by_with_ttl("win", 1, Some(Duration::from_secs(60))), Ok(1));
+        let entry = s.data.get("win").unwrap();
+        assert!(entry.expires_at.is_some(), "fresh window must have a TTL");
     }
 
     #[test]

@@ -389,9 +389,40 @@ fn find_free_port(host: &str, start_port: u16) -> anyhow::Result<u16> {
 
 /// Run the `ephpm php` subcommand — pass args through to the embedded PHP CLI.
 fn run_php(args: &[String]) -> anyhow::Result<ExitCode> {
+    warn_if_runtime_extension_flag(args);
     let exit_code = ephpm_php::PhpRuntime::cli_main(args).context("PHP CLI failed")?;
     let _ = ephpm_php::PhpRuntime::shutdown();
     Ok(exit_code_from(exit_code))
+}
+
+/// Warn when a runtime `-d extension=` is passed to `ephpm php`.
+///
+/// The embedded PHP runtime initialises before it parses `-d` directives, so
+/// `-d extension=…` is silently ignored (extensions must be registered at
+/// startup). Rather than let the knob be a silent no-op, warn once and point
+/// the user at the config equivalent.
+fn warn_if_runtime_extension_flag(args: &[String]) {
+    // Match `-d extension=…` (split), `-dextension=…`, and `-d=extension=…`.
+    let mut prev_was_d = false;
+    for arg in args {
+        let is_ext_directive = if prev_was_d {
+            arg.starts_with("extension=")
+        } else if let Some(rest) = arg.strip_prefix("-d") {
+            // `-dextension=…` or `-d=extension=…`
+            rest.strip_prefix('=').unwrap_or(rest).starts_with("extension=")
+        } else {
+            false
+        };
+        if is_ext_directive {
+            tracing::warn!(
+                "`-d extension=` is ignored by `ephpm php` — the embedded PHP \
+                 runtime loads extensions before parsing `-d`. Register shared \
+                 extensions via `[php] extensions` in ephpm.toml instead."
+            );
+            return;
+        }
+        prev_was_d = arg == "-d";
+    }
 }
 
 /// Convert a PHP exit code (i32) to a Rust `ExitCode`.
