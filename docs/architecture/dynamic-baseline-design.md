@@ -64,25 +64,41 @@ libc.so.6      => /lib/x86_64-linux-gnu/libc.so.6
 `ephpm php -v` → `PHP 8.5.7 (ephpm)`; ZTS confirmed via
 `ZEND_THREAD_SAFE` (`zts=1`) over HTTP in fpm mode.
 
-### 2.1 The glibc floor is 2.39 (found during validation)
+### 2.1 The glibc floor is 2.28 (deliberate: manylinux_2_28 / RHEL8 baseline)
 
-The pivot Dockerfile originally used `debian:12-slim` (glibc 2.36) as
-the runtime stage. **That fails**: the loader refuses the binary with
-`version 'GLIBC_2.38' not found` / `GLIBC_2.39 not found`. Root causes,
-verified with `objdump -T`/`readelf`:
+The shipped Linux binary's glibc requirement is the highest `GLIBC_x.y`
+symbol version pulled in at final link, across **all** objects — `libphp.a`
+(built in php-sdk) plus the Rust/system objects linked when `cargo xtask
+release` builds ephpm. Both build environments therefore set the floor, and
+both are pinned to the **manylinux_2_28** base (AlmaLinux 8, glibc 2.28,
+gcc-toolset-14): a modern GCC over an old glibc symbol floor, the same model
+Python's manylinux wheels use. glibc forward-compatibility means a
+2.28-linked binary runs on every newer glibc.
 
-- `libphp.a` in the 8.5.7 gnu SDK references **GLIBC_2.38** symbols
-  (`__isoc23_sscanf`, `__isoc23_strto*`, `strlcpy`, `strlcat`) — the SDK
-  pipeline builds on a glibc ≥ 2.38 toolchain.
-- Building on `ubuntu:24.04` (glibc 2.39) adds weak **GLIBC_2.39** refs
-  (`pidfd_spawnp`, `pidfd_getpid`) from Rust std's process spawning.
+**Verified floor = glibc 2.28** (`objdump -T ephpm | grep GLIBC_ | sort -V |
+tail -1` → `GLIBC_2.28`; the only 2.28 symbols are `fcntl64` and `statx`).
+No Rust crate (`ring`/`aws-lc`/`rustls`, Rust std) forces anything higher —
+Rust's prebuilt `x86_64-unknown-linux-gnu` std targets glibc 2.17.
 
-So the shipped binary's floor is **glibc ≥ 2.39** (Ubuntu 24.04+,
-Debian 13+, Fedora 40+). The container runtime stage is now
-`debian:13-slim` (trixie, glibc 2.41) — verified working. **Planned:**
-lowering the floor means rebuilding the php-sdk gnu tarball (and the CI
-builder image) on an older baseline such as Debian 12/Ubuntu 22.04; the
-floor is set by the build environment, not by the pivot itself.
+Two changes were needed to reach 2.28:
+1. **Build environments moved off `ubuntu:24.04` (glibc 2.39)** to
+   manylinux_2_28. On glibc 2.39, `libphp.a` picked up **GLIBC_2.38**
+   `__isoc23_*` scanf/strtol variants and the link added weak **GLIBC_2.39**
+   `pidfd_*` refs — both vanish on the 2.28 toolchain. This spans the
+   php-sdk gnu build jobs, ephpm's `docker/Dockerfile` builder stage, and the
+   `ephpm/ephpm-ci` image (`docker/Dockerfile.gha`) that release.yml /
+   nightly.yml link inside.
+2. **`_GNU_SOURCE` for the C wrapper on all Unix targets**
+   (`crates/ephpm-php/build.rs::compile_wrapper`, previously musl-only).
+   glibc 2.28 does not expose `mempcpy`/`memrchr` at the default feature
+   level, so `zend_operators.h` failed to compile until `_GNU_SOURCE` was
+   defined; glibc 2.39 had leaked those declarations, hiding the gap.
+
+Distro coverage at floor 2.28: RHEL8/AlmaLinux8/Rocky8 (2.28), Ubuntu 20.04+
+(2.31+), Debian 10+ (2.28+), Amazon Linux 2023 (2.34), Fedora 40+ (2.39+).
+**Out of scope:** Amazon Linux 2 ships glibc 2.26 (below 2.28) and reaches
+EOL in 2026; AL2023 is the supported Amazon target. The container runtime
+stage is `debian:12-slim` (bookworm, glibc 2.36); any glibc ≥ 2.28 host works.
 
 ## 3. Extension story
 
@@ -179,9 +195,9 @@ consecutive requests return `boot #1, request #N` with N climbing
 
 | Platform | Story |
 |---|---|
-| Linux x86_64 | Shipped: glibc-dynamic gnu binary, floor glibc 2.39 (§2.1). All of §3–§5 verified. |
+| Linux x86_64 | Shipped: glibc-dynamic gnu binary, floor glibc 2.28 (§2.1). All of §3–§5 verified. |
 | Linux aarch64 | Same design; **pending the arm64 gnu SDK asset** (in flight). Not yet validated. |
-| Alpine / musl hosts | Not a binary target — run the container image (`debian:13-slim` base). A self-built fully static musl binary still cannot dlopen; that use case is `forge` territory (`build-compose-design.md`). |
+| Alpine / musl hosts | Not a binary target — run the container image (`debian:12-slim` base). A self-built fully static musl binary still cannot dlopen; that use case is `forge` territory (`build-compose-design.md`). |
 | Windows | **NTS**, PHP statically linked from `php8embed.lib`. `extension=` `.dll` loading is the intended mechanism but is **not yet validated** — stock PECL DLLs import `php8*.dll`, which a static embed does not provide; treat Windows shared-extension support as unproven until smoke-tested. |
 | macOS (arm64) | ZTS `.dylib` loading is the intended mechanism; **not yet validated** (ld64 exports symbols by default, so no `--export-dynamic` analog should be needed). |
 
@@ -206,9 +222,12 @@ consecutive requests return `boot #1, request #N` with N climbing
    the aarch64 release lane end to end. (In flight.)
 2. **8.4 / 8.3 gnu SDKs** — same validation per minor once the assets
    land. (In flight.)
-3. **Glibc floor** — decide the supported floor and rebuild the SDK +
-   CI builder on that baseline (currently 2.39 by accident of build
-   environment, §2.1).
+3. **Glibc floor** — DONE: floor lowered to **glibc 2.28** (manylinux_2_28 /
+   RHEL8 baseline) by rebuilding the php-sdk gnu jobs, ephpm's
+   `docker/Dockerfile` builder, and the `ephpm/ephpm-ci` image
+   (`docker/Dockerfile.gha`) on the manylinux_2_28 base, plus the
+   `_GNU_SOURCE` wrapper fix (§2.1). Requires a php-sdk gnu-tarball rebuild
+   for the new floor to reach shipped releases.
 4. **ZTS extension distribution** — php-sdk extension catalog
    (§3.4); until then docs steer users to self-compiled ZTS builds.
 5. **Windows/macOS shared-extension smoke tests** — close the "not yet

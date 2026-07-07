@@ -5,44 +5,63 @@
 # github.com/ephpm/php-sdk releases; the Linux `-gnu` variant is glibc-linked
 # and builds against the host-default gnu target).
 #
+# GLIBC FLOOR: this image is the environment where release.yml / nightly.yml
+# link the Linux release binary, so IT sets the shipped binary's glibc floor
+# (the highest GLIBC_x.y symbol pulled in at final link, from libphp.a plus the
+# Rust/system objects). The base is the manylinux_2_28 image (AlmaLinux 8,
+# glibc 2.28, gcc-toolset-14) — a modern GCC over an old glibc symbol floor,
+# the same "manylinux" model Python wheels use. glibc forward-compat means a
+# 2.28-linked binary runs on RHEL8/AlmaLinux8, Ubuntu 20.04+, Debian 10+,
+# Amazon Linux 2023, Fedora 40+ — see docs/architecture/dynamic-baseline-design.md.
+#
 # Build:
-#   docker build -f docker/Dockerfile.gha -t ghcr.io/<owner>/ephpm-ci:latest .
+#   docker build -f docker/Dockerfile.gha \
+#     --build-arg BASE_IMAGE=quay.io/pypa/manylinux_2_28_x86_64 \
+#     -t ghcr.io/<owner>/ephpm-ci:latest .
 #
 # Usage in GitHub Actions:
 #   jobs:
 #     build:
 #       container: ghcr.io/<owner>/ephpm-ci:latest
 
-FROM ubuntu:24.04
+# Per-arch manylinux_2_28 base (AlmaLinux 8 / glibc 2.28). ci-image.yml passes
+# the arch-matching image as a build-arg (x86_64 on the x64 runner, aarch64 on
+# the arm64 runner). Defaults to x86_64 for a bare `docker build`.
+ARG BASE_IMAGE=quay.io/pypa/manylinux_2_28_x86_64
+FROM ${BASE_IMAGE}
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-# ── System build tools ───────────────────────────────────────────────────────
+# ── System build tools (dnf, AlmaLinux 8) ────────────────────────────────────
 #
-#   - build-essential: cc::Build for ephpm_wrapper.c + the gcc linker driver
-#     for the glibc-dynamic (gnu) release binary.
-#   - libclang-dev: bindgen needs libclang.
-#   - libssl-dev: the workspace test build (`cargo nextest run --workspace`)
+#   - gcc-toolset-14: modern GCC 14 (cc::Build for ephpm_wrapper.c + the linker
+#     driver for the glibc-dynamic release binary). Already present in the
+#     manylinux image under /opt/rh; enabled on PATH below.
+#   - clang-devel / llvm-devel: bindgen needs libclang to parse PHP headers.
+#   - openssl-devel: the workspace test build (`cargo nextest run --workspace`)
 #     pulls a dev-dependency that links openssl-sys, which needs system
 #     OpenSSL headers + openssl.pc.
-#   - tar/curl: SDK + sqld tarball downloads at build time.
+#   - tar/xz/curl/git: SDK + sqld tarball downloads at build time.
 #   - file: nightly's `Verify binary` step uses /usr/bin/file to print the
 #     artifact's ELF metadata as a sanity check.
 #
-# Removed in PR #65: clang+lld. These were added in PR #44 to support
-# cargo-xwin's `cc-rs`-driven Windows crates (clang-cl + lld-link).
-# Windows builds switched to native on the self-hosted Windows runner
-# in PR #53, so the cross-compile path that needed these is gone. Re-add
-# if cross-compilation ever comes back.
-#
-# Removed with the Linux dynamic pivot (3.0): musl-tools/musl-dev, the
-# per-arch musl rustup targets, and the CC_*/CARGO_TARGET_*_LINKER musl env.
-# Linux releases now build the host-default gnu target against the glibc
-# `-gnu` PHP SDK so the binary can dlopen() shared extensions/middleware.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates curl file git pkg-config tar \
-    libclang-dev libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+# NOTE (vs the old ubuntu:24.04 image): the base moved from Ubuntu (apt, glibc
+# 2.39) to manylinux_2_28 (dnf, glibc 2.28) to LOWER the shipped binary's glibc
+# floor to 2.28. Package manager and toolchain-activation differ accordingly.
+RUN dnf install -y --allowerasing \
+        gcc-toolset-14 \
+        clang-devel llvm-devel \
+        openssl-devel \
+        ca-certificates curl file git make pkgconfig tar xz which \
+    && dnf clean all
+
+# Enable gcc-toolset-14 (GCC 14) for every subsequent RUN and at container
+# runtime. The manylinux image ships an /opt/rh/gcc-toolset-14/enable script;
+# source it via a profile.d hook AND bake the key vars into ENV so
+# non-login shells (GitHub Actions `run:` steps use `sh -c`) get the modern
+# gcc/binutils on PATH without a manual `source`.
+ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:/opt/rh/gcc-toolset-14/root/usr/lib \
+    PKG_CONFIG_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64/pkgconfig:/usr/lib64/pkgconfig \
+    LIBCLANG_PATH=/usr/lib64
 
 # ── Docker CLI + compose plugin (client only, no daemon) ─────────────────────
 #
@@ -54,13 +73,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # and smoke tests need `docker compose` for the WordPress/Laravel/Symfony
 # fixtures. Only the CLI and plugins are installed — no containerd/dockerd,
 # the daemon is ephemerd's.
-RUN install -m 0755 -d /etc/apt/keyrings \
-    && curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable" \
-        > /etc/apt/sources.list.d/docker.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin docker-buildx-plugin \
-    && rm -rf /var/lib/apt/lists/*
+#
+# Docker's CentOS/RHEL 8 repo ships docker-ce-cli, docker-buildx-plugin, and
+# docker-compose-plugin as dnf packages (the AlmaLinux 8 equivalent of the
+# Ubuntu apt path the old image used).
+RUN dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo \
+    && dnf install -y docker-ce-cli docker-compose-plugin docker-buildx-plugin \
+    && dnf clean all
 
 # ── Rust stable + nightly (for fmt only) ─────────────────────────────────────
 #
@@ -72,12 +91,12 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
+    PATH=/usr/local/cargo/bin:/opt/rh/gcc-toolset-14/root/usr/bin:$PATH
 
 # Releases target the host-default gnu triple, which ships with the stable
 # toolchain — no `rustup target add` needed. This Dockerfile is built once
 # per arch (amd64 -> ephpm/ephpm-ci:latest, arm64 -> :latest-arm64), each
-# natively on its own runner.
+# natively on its own runner with the arch-matching manylinux_2_28 base.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal \
         --component rustfmt,clippy,llvm-tools-preview \
