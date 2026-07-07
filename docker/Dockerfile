@@ -23,37 +23,44 @@ ARG PHP_SDK_VERSION=8.5.7
 # ── Stage 1: base — system deps + Rust toolchain ─────────────────────────────
 #
 # GLIBC FLOOR: the builder stage links the release binary, so its base sets the
-# shipped binary's glibc floor. The manylinux_2_28 base (AlmaLinux 8, glibc
-# 2.28, gcc-toolset-14) lowers that floor to glibc 2.28 — modern GCC over an
-# old glibc symbol floor (the "manylinux" model). A 2.28-linked binary runs on
+# shipped binary's glibc floor. The almalinux:8 base (glibc 2.28) with
+# gcc-toolset-13 lowers that floor to glibc 2.28 — modern GCC over an old glibc
+# symbol floor (the "manylinux" model). A 2.28-linked binary runs on
 # RHEL8/AlmaLinux8, Ubuntu 20.04+, Debian 10+, Amazon Linux 2023, Fedora 40+.
 # See docs/architecture/dynamic-baseline-design.md.
+#
+# almalinux:8 (not quay.io/pypa/manylinux_2_28_*): same glibc 2.28 floor, but
+# Docker-format so it's pullable on the runner fleet (the manylinux OCI-index
+# format is not). gcc-toolset-13 (not 14): GCC 14 makes implicit-function-
+# declaration a hard error; 13 matches php-sdk's toolchain. Mirrors Dockerfile.gha.
 
-ARG BASE_IMAGE=quay.io/pypa/manylinux_2_28_x86_64
+ARG BASE_IMAGE=docker.io/library/almalinux:8
 FROM ${BASE_IMAGE} AS base
 
-# System tools needed by the ephpm Rust build (dnf / AlmaLinux 8):
-#   - gcc-toolset-14: cc::Build for ephpm_wrapper.c + the gcc linker driver for
-#     the glibc-dynamic (gnu) release binary. Present in the manylinux image;
-#     enabled on PATH below.
-#   - clang-devel/llvm-devel: bindgen needs libclang to parse PHP headers.
+# System tools needed by the ephpm Rust build (dnf / AlmaLinux 8). Stock
+# almalinux:8 ships almost nothing, so install it all explicitly:
+#   - gcc-toolset-13: cc::Build for ephpm_wrapper.c + the gcc linker driver for
+#     the glibc-dynamic (gnu) release binary. From the AlmaLinux AppStream.
+#   - clang/llvm-libs: bindgen needs libclang (libclang.so at /usr/lib64) to
+#     parse PHP headers.
+#   - make/perl/findutils: build scripts + cc::Build implicit rules.
 #   - curl, git, ca-certificates: rustup install + cargo registry.
 #   - tar/xz: extracting the prebuilt PHP SDK tarball in the next stage.
 RUN dnf install -y --allowerasing \
-        gcc-toolset-14 clang-devel llvm-devel \
-        ca-certificates curl git make pkgconfig tar xz which \
+        gcc-toolset-13 clang llvm-libs \
+        ca-certificates curl findutils git make perl pkgconfig tar xz which \
     && dnf clean all
 
-# Enable gcc-toolset-14 (GCC 14) on PATH for every subsequent RUN. libclang
+# Enable gcc-toolset-13 (GCC 13) on PATH for every subsequent RUN. libclang
 # for bindgen lives at /usr/lib64.
-ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:$PATH \
-    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:/opt/rh/gcc-toolset-14/root/usr/lib \
-    PKG_CONFIG_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64/pkgconfig:/usr/lib64/pkgconfig \
+ENV PATH=/opt/rh/gcc-toolset-13/root/usr/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-13/root/usr/lib64:/opt/rh/gcc-toolset-13/root/usr/lib \
+    PKG_CONFIG_PATH=/opt/rh/gcc-toolset-13/root/usr/lib64/pkgconfig:/usr/lib64/pkgconfig \
     LIBCLANG_PATH=/usr/lib64
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:/opt/rh/gcc-toolset-14/root/usr/bin:$PATH
+    PATH=/usr/local/cargo/bin:/opt/rh/gcc-toolset-13/root/usr/bin:$PATH
 
 # The gnu target is the host default — no extra rustup target or cross
 # toolchain needed (the musl-era CC_*/LINKER plumbing is gone with it).
@@ -215,7 +222,7 @@ RUN cp $(find target -name ephpm -type f -path '*/release/*' | head -1) /ephpm &
 #
 # Runtime base = debian:12-slim (bookworm, glibc 2.36). The binary's glibc
 # floor is now 2.28 (php-sdk libphp.a + the ephpm link both build on the
-# manylinux_2_28 base — glibc 2.28, no __isoc23_* / pidfd_* refs above 2.28),
+# almalinux:8 base — glibc 2.28, no __isoc23_* / pidfd_* refs above 2.28),
 # so any runtime with glibc >= 2.28 can host it. bookworm (2.36) comfortably
 # clears that and is smaller/more-stable than trixie. (The old trixie/2.41
 # requirement was an artifact of the 2.39 floor from building on ubuntu:24.04;

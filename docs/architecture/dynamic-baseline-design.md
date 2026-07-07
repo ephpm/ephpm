@@ -70,10 +70,17 @@ The shipped Linux binary's glibc requirement is the highest `GLIBC_x.y`
 symbol version pulled in at final link, across **all** objects — `libphp.a`
 (built in php-sdk) plus the Rust/system objects linked when `cargo xtask
 release` builds ephpm. Both build environments therefore set the floor, and
-both are pinned to the **manylinux_2_28** base (AlmaLinux 8, glibc 2.28,
-gcc-toolset-14): a modern GCC over an old glibc symbol floor, the same model
-Python's manylinux wheels use. glibc forward-compatibility means a
+both are pinned to **`docker.io/library/almalinux:8`** (glibc 2.28) with
+**gcc-toolset-13**: a modern GCC over an old glibc symbol floor, the same
+model Python's manylinux wheels use. glibc forward-compatibility means a
 2.28-linked binary runs on every newer glibc.
+
+almalinux:8 is used rather than `quay.io/pypa/manylinux_2_28_*` (which shares
+the same glibc 2.28 floor): the manylinux images are OCI-format image indexes
+that the runner fleet's Docker cannot pull, whereas almalinux:8 is a
+Docker-format image. gcc-toolset-13 (not 14) is used because GCC 14 makes
+implicit-function-declaration a hard error and to keep one GCC version across
+the whole pipeline (php-sdk's SDK toolchain).
 
 **Verified floor = glibc 2.28** (`objdump -T ephpm | grep GLIBC_ | sort -V |
 tail -1` → `GLIBC_2.28`; the only 2.28 symbols are `fcntl64` and `statx`).
@@ -82,7 +89,7 @@ Rust's prebuilt `x86_64-unknown-linux-gnu` std targets glibc 2.17.
 
 Two changes were needed to reach 2.28:
 1. **Build environments moved off `ubuntu:24.04` (glibc 2.39)** to
-   manylinux_2_28. On glibc 2.39, `libphp.a` picked up **GLIBC_2.38**
+   almalinux:8 (glibc 2.28). On glibc 2.39, `libphp.a` picked up **GLIBC_2.38**
    `__isoc23_*` scanf/strtol variants and the link added weak **GLIBC_2.39**
    `pidfd_*` refs — both vanish on the 2.28 toolchain. This spans the
    php-sdk gnu build jobs, ephpm's `docker/Dockerfile` builder stage, and the
@@ -222,12 +229,12 @@ consecutive requests return `boot #1, request #N` with N climbing
    the aarch64 release lane end to end. (In flight.)
 2. **8.4 / 8.3 gnu SDKs** — same validation per minor once the assets
    land. (In flight.)
-3. **Glibc floor** — DONE: floor lowered to **glibc 2.28** (manylinux_2_28 /
-   RHEL8 baseline) by rebuilding the php-sdk gnu jobs, ephpm's
-   `docker/Dockerfile` builder, and the `ephpm/ephpm-ci` image
-   (`docker/Dockerfile.gha`) on the manylinux_2_28 base, plus the
-   `_GNU_SOURCE` wrapper fix (§2.1). Requires a php-sdk gnu-tarball rebuild
-   for the new floor to reach shipped releases.
+3. **Glibc floor** — DONE: floor lowered to **glibc 2.28** (RHEL8 baseline)
+   by rebuilding the php-sdk gnu jobs, ephpm's `docker/Dockerfile` builder,
+   and the `ephpm/ephpm-ci` image (`docker/Dockerfile.gha`) on the
+   `almalinux:8` base with gcc-toolset-13, plus the `_GNU_SOURCE` wrapper fix
+   (§2.1). Requires a php-sdk gnu-tarball rebuild for the new floor to reach
+   shipped releases.
 4. **ZTS extension distribution** — php-sdk extension catalog
    (§3.4); until then docs steer users to self-compiled ZTS builds.
 5. **Windows/macOS shared-extension smoke tests** — close the "not yet

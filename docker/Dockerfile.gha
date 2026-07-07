@@ -8,15 +8,30 @@
 # GLIBC FLOOR: this image is the environment where release.yml / nightly.yml
 # link the Linux release binary, so IT sets the shipped binary's glibc floor
 # (the highest GLIBC_x.y symbol pulled in at final link, from libphp.a plus the
-# Rust/system objects). The base is the manylinux_2_28 image (AlmaLinux 8,
-# glibc 2.28, gcc-toolset-14) — a modern GCC over an old glibc symbol floor,
-# the same "manylinux" model Python wheels use. glibc forward-compat means a
-# 2.28-linked binary runs on RHEL8/AlmaLinux8, Ubuntu 20.04+, Debian 10+,
-# Amazon Linux 2023, Fedora 40+ — see docs/architecture/dynamic-baseline-design.md.
+# Rust/system objects). The base is almalinux:8 (glibc 2.28) with
+# gcc-toolset-13 — a modern GCC over an old glibc symbol floor, the same
+# "manylinux" model Python wheels use. glibc forward-compat means a 2.28-linked
+# binary runs on RHEL8/AlmaLinux8, Ubuntu 20.04+, Debian 10+, Amazon Linux 2023,
+# Fedora 40+ — see docs/architecture/dynamic-baseline-design.md.
+#
+# Why almalinux:8 and NOT quay.io/pypa/manylinux_2_28_*: the manylinux images
+# are published as OCI-format image indexes, which the runner fleet's Docker
+# (via the ephemerd fake-daemon / embedded BuildKit) cannot pull ("object
+# required", even with --platform). docker.io/library/almalinux:8 is a
+# Docker-format image with the SAME glibc 2.28 floor, so it produces an
+# identical symbol floor while being pullable everywhere. This mirrors the
+# php-sdk pipeline, which pivoted to almalinux:8 + gcc-toolset-13 for the
+# same reason.
+#
+# Why gcc-toolset-13 and NOT 14: gcc-toolset-14 makes implicit-function-
+# declaration a hard error (a GCC 14 default). ephpm's own ephpm_wrapper.c
+# compiles clean on GCC 14 (the _GNU_SOURCE fix in this PR handles that), but
+# 13 is used here to keep ONE GCC version across the whole pipeline (php-sdk's
+# SDK toolchain is gcc-toolset-13) and to avoid any latent implicit-decl error.
 #
 # Build:
 #   docker build -f docker/Dockerfile.gha \
-#     --build-arg BASE_IMAGE=quay.io/pypa/manylinux_2_28_x86_64 \
+#     --build-arg BASE_IMAGE=docker.io/library/almalinux:8 \
 #     -t ghcr.io/<owner>/ephpm-ci:latest .
 #
 # Usage in GitHub Actions:
@@ -24,43 +39,51 @@
 #     build:
 #       container: ghcr.io/<owner>/ephpm-ci:latest
 
-# Per-arch manylinux_2_28 base (AlmaLinux 8 / glibc 2.28). ci-image.yml passes
-# the arch-matching image as a build-arg (x86_64 on the x64 runner, aarch64 on
-# the arm64 runner). Defaults to x86_64 for a bare `docker build`.
-ARG BASE_IMAGE=quay.io/pypa/manylinux_2_28_x86_64
+# almalinux:8 base (glibc 2.28). A single image serves both arches — the
+# runner pulls the arch-matching manifest natively (x86_64 on the x64 runner,
+# aarch64 on the arm64 runner), so ci-image.yml passes the same value for both.
+ARG BASE_IMAGE=docker.io/library/almalinux:8
 FROM ${BASE_IMAGE}
 
 # ── System build tools (dnf, AlmaLinux 8) ────────────────────────────────────
 #
-#   - gcc-toolset-14: modern GCC 14 (cc::Build for ephpm_wrapper.c + the linker
-#     driver for the glibc-dynamic release binary). Already present in the
-#     manylinux image under /opt/rh; enabled on PATH below.
-#   - clang-devel / llvm-devel: bindgen needs libclang to parse PHP headers.
+# Unlike the manylinux image, stock almalinux:8 ships almost no build tools, so
+# EVERYTHING the ephpm Rust build needs is installed explicitly here:
+#   - gcc-toolset-13: modern GCC 13 (cc::Build for ephpm_wrapper.c + the linker
+#     driver for the glibc-dynamic release binary). NOT 14 — GCC 14 makes
+#     implicit-function-declaration a hard error; 13 keeps it a warning and
+#     matches php-sdk's SDK toolchain. Pulled from the AlmaLinux AppStream.
+#   - clang / llvm-libs: bindgen needs libclang (libclang.so) to parse PHP
+#     headers. On almalinux:8 it lands at /usr/lib64/libclang.so.* — LIBCLANG_PATH
+#     below points bindgen at it.
 #   - openssl-devel: the workspace test build (`cargo nextest run --workspace`)
 #     pulls a dev-dependency that links openssl-sys, which needs system
 #     OpenSSL headers + openssl.pc.
+#   - make/perl/findutils: perl for build scripts, findutils for the `find`
+#     mtime-touch dance, make for cc::Build's implicit rules.
 #   - tar/xz/curl/git: SDK + sqld tarball downloads at build time.
 #   - file: nightly's `Verify binary` step uses /usr/bin/file to print the
 #     artifact's ELF metadata as a sanity check.
 #
 # NOTE (vs the old ubuntu:24.04 image): the base moved from Ubuntu (apt, glibc
-# 2.39) to manylinux_2_28 (dnf, glibc 2.28) to LOWER the shipped binary's glibc
+# 2.39) to almalinux:8 (dnf, glibc 2.28) to LOWER the shipped binary's glibc
 # floor to 2.28. Package manager and toolchain-activation differ accordingly.
 RUN dnf install -y --allowerasing \
-        gcc-toolset-14 \
-        clang-devel llvm-devel \
+        gcc-toolset-13 \
+        clang llvm-libs \
         openssl-devel \
-        ca-certificates curl file git make pkgconfig tar xz which \
+        ca-certificates curl file findutils git make perl pkgconfig tar xz which \
     && dnf clean all
 
-# Enable gcc-toolset-14 (GCC 14) for every subsequent RUN and at container
-# runtime. The manylinux image ships an /opt/rh/gcc-toolset-14/enable script;
-# source it via a profile.d hook AND bake the key vars into ENV so
+# Enable gcc-toolset-13 (GCC 13) for every subsequent RUN and at container
+# runtime. almalinux:8 installs the toolset under /opt/rh/gcc-toolset-13 with an
+# `enable` script; rather than source it, the key vars are baked into ENV so
 # non-login shells (GitHub Actions `run:` steps use `sh -c`) get the modern
-# gcc/binutils on PATH without a manual `source`.
-ENV PATH=/opt/rh/gcc-toolset-14/root/usr/bin:$PATH \
-    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:/opt/rh/gcc-toolset-14/root/usr/lib \
-    PKG_CONFIG_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64/pkgconfig:/usr/lib64/pkgconfig \
+# gcc/binutils on PATH without a manual `source`. LIBCLANG_PATH points bindgen
+# at the stock system libclang (/usr/lib64), NOT the toolset's.
+ENV PATH=/opt/rh/gcc-toolset-13/root/usr/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-13/root/usr/lib64:/opt/rh/gcc-toolset-13/root/usr/lib \
+    PKG_CONFIG_PATH=/opt/rh/gcc-toolset-13/root/usr/lib64/pkgconfig:/usr/lib64/pkgconfig \
     LIBCLANG_PATH=/usr/lib64
 
 # ── Docker CLI + compose plugin (client only, no daemon) ─────────────────────
@@ -91,12 +114,12 @@ RUN dnf config-manager --add-repo https://download.docker.com/linux/centos/docke
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:/opt/rh/gcc-toolset-14/root/usr/bin:$PATH
+    PATH=/usr/local/cargo/bin:/opt/rh/gcc-toolset-13/root/usr/bin:$PATH
 
 # Releases target the host-default gnu triple, which ships with the stable
 # toolchain — no `rustup target add` needed. This Dockerfile is built once
 # per arch (amd64 -> ephpm/ephpm-ci:latest, arm64 -> :latest-arm64), each
-# natively on its own runner with the arch-matching manylinux_2_28 base.
+# natively on its own runner pulling the arch-matching almalinux:8 manifest.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal \
         --component rustfmt,clippy,llvm-tools-preview \
