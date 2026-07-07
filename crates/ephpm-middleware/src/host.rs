@@ -224,6 +224,30 @@ unsafe extern "C" fn kv_incr(key: *const u8, key_len: usize, by: i64, out: *mut 
     }
 }
 
+unsafe extern "C" fn kv_incr_ttl(
+    key: *const u8,
+    key_len: usize,
+    by: i64,
+    ttl_secs: i64,
+    out: *mut i64,
+) -> c_int {
+    if out.is_null() {
+        return -1;
+    }
+    // SAFETY: ABI contract.
+    let (Some(store), Some(k)) = (kv(), unsafe { key_str(key, key_len) }) else {
+        return -1;
+    };
+    match store.incr_by_with_ttl(k, by, ttl_of(ttl_secs)) {
+        Ok(v) => {
+            // SAFETY: out checked non-null above.
+            unsafe { *out = v };
+            0
+        }
+        Err(_) => -2,
+    }
+}
+
 unsafe extern "C" fn host_log(level: c_int, msg: *const u8, msg_len: usize) {
     if msg.is_null() {
         return;
@@ -254,6 +278,7 @@ static HOST_TABLE: EphpmHostV1 = EphpmHostV1 {
     kv_incr,
     kv_free,
     log: host_log,
+    kv_incr_ttl,
 };
 
 /// Wire the embedded KV store into the host table. Call once at startup,

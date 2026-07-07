@@ -115,11 +115,13 @@ With `[php] extensions = ["/mw/pivot_ping.so"]`:
 - CLI: `PHPRC=/mw/cli-php.ini ephpm php -r 'var_dump(pivot_ping());'` →
   same string.
 
-Caveat found: `ephpm php -d extension=...` is a **no-op** (silently —
-PHP is initialized before CLI args are parsed, and `extension=` only
-takes effect at MINIT). The CLI does not read `ephpm.toml` either; use
-`PHPRC` pointing at an ini with the `extension=` line. **Planned:** either
-honor `-d extension=` by deferring init, or warn when it is passed.
+Caveat found: `ephpm php -d extension=...` does **not** load the
+extension — PHP is initialized before CLI args are parsed, and
+`extension=` only takes effect at MINIT. `ephpm php` now **warns** when a
+runtime `-d extension=` is passed (rather than silently ignoring it) and
+points at `[php] extensions`. The CLI does not read `ephpm.toml` either;
+for a CLI-only load use `PHPRC` pointing at an ini with the `extension=`
+line.
 
 ### 3.3 ABI rules
 
@@ -180,7 +182,7 @@ consecutive requests return `boot #1, request #N` with N climbing
 | Platform | Story |
 |---|---|
 | Linux x86_64 | Shipped: glibc-dynamic gnu binary, floor glibc 2.39 (§2.1). All of §3–§5 verified. |
-| Linux aarch64 | Same design; **pending the arm64 gnu SDK asset** (in flight). Not yet validated. |
+| Linux aarch64 | Same design; the `linux-aarch64-gnu` SDK tarball is **published** (8.5.7 / 8.4.22 / 8.3.31). End-to-end release-lane validation on aarch64 is still to be confirmed. |
 | Alpine / musl hosts | Not a binary target — run the container image (`debian:13-slim` base). A self-built fully static musl binary still cannot dlopen; that use case is `forge` territory (`build-compose-design.md`). |
 | Windows | **NTS**, PHP statically linked from `php8embed.lib`. `extension=` `.dll` loading is the intended mechanism but is **not yet validated** — stock PECL DLLs import `php8*.dll`, which a static embed does not provide; treat Windows shared-extension support as unproven until smoke-tested. |
 | macOS (arm64) | ZTS `.dylib` loading is the intended mechanism; **not yet validated** (ld64 exports symbols by default, so no `--export-dynamic` analog should be needed). |
@@ -202,17 +204,18 @@ consecutive requests return `boot #1, request #N` with N climbing
 
 ## 8. Phasing / remaining work
 
-1. **arm64 gnu SDK** — publish `linux-aarch64-gnu` tarballs; validate
-   the aarch64 release lane end to end. (In flight.)
-2. **8.4 / 8.3 gnu SDKs** — same validation per minor once the assets
-   land. (In flight.)
-3. **Glibc floor** — decide the supported floor and rebuild the SDK +
+1. **gnu SDK tarballs — published.** All six `linux-{x86_64,aarch64}-gnu`
+   tarballs now exist for 8.5.7 / 8.4.22 / 8.3.31 (`gh release view
+   v8.5.7 --repo ephpm/php-sdk`). Remaining: confirm the aarch64 release
+   lane end to end (x86_64 is verified, §3–§5).
+2. **Glibc floor** — decide the supported floor and rebuild the SDK +
    CI builder on that baseline (currently 2.39 by accident of build
    environment, §2.1).
-4. **ZTS extension distribution** — php-sdk extension catalog
+3. **ZTS extension distribution** — php-sdk extension catalog
    (§3.4); until then docs steer users to self-compiled ZTS builds.
-5. **Windows/macOS shared-extension smoke tests** — close the "not yet
+4. **Windows/macOS shared-extension smoke tests** — close the "not yet
    validated" rows in §6.
-6. **macOS runner group** — bring macos-arm64 release validation onto
+5. **macOS runner group** — bring macos-arm64 release validation onto
    the native runner pool.
-7. **CLI ergonomics** — `ephpm php -d extension=` no-op (§3.2).
+6. **CLI ergonomics** — `ephpm php -d extension=` now warns rather than
+   silently ignoring the flag (§3.2).

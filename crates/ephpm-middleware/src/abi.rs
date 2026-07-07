@@ -97,7 +97,7 @@ pub struct EphpmResponse {
 ///
 /// KV operations hit the embedded, gossip-replicated store — the same data
 /// PHP sees through `ephpm_kv_*` — which is what makes a cluster-wide rate
-/// limiter a single `kv_incr` call.
+/// limiter a single `kv_incr_ttl` call.
 #[repr(C)]
 pub struct EphpmHostV1 {
     /// Host ABI version (== [`ABI_V1`] for this table).
@@ -160,6 +160,23 @@ pub struct EphpmHostV1 {
     // ── Logging ──────────────────────────────────────────────────────────
     /// Log through the host's `tracing` subscriber (`LOG_*` levels).
     pub log: unsafe extern "C" fn(level: c_int, msg: *const u8, msg_len: usize),
+
+    // ── Additions (appended for ABI compatibility) ───────────────────────
+    /// Atomic increment that applies `ttl_secs` (`<= 0` = no expiry) ONLY
+    /// when the increment creates the key. Existing keys keep their current
+    /// TTL — fixed-window semantics. Returns 0 with the new value in `out`,
+    /// negative on error (e.g. non-numeric existing value).
+    ///
+    /// Appended after [`EphpmHostV1::log`]: older middleware built against a
+    /// table without this field never reads past the offsets it knows, so
+    /// growing the table at the end is ABI-compatible.
+    pub kv_incr_ttl: unsafe extern "C" fn(
+        key: *const u8,
+        key_len: usize,
+        by: i64,
+        ttl_secs: i64,
+        out: *mut i64,
+    ) -> c_int,
 }
 
 /// Symbol names the loader looks up.

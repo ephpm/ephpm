@@ -4,10 +4,12 @@
 //! Requests are counted in 10-second windows (less KV churn than 1-second
 //! windows): each window allows `per_ip_rps * 10 + burst` requests per
 //! client. The counter key is `mw:rl:{vhost}:{client}:{window_index}`,
-//! created with a TTL via `kv_set_nx` (since `kv_incr` cannot set TTLs) and
-//! bumped with a single atomic `kv_incr` — which is also what makes the
-//! limit cluster-wide when KV replication is on. Over the limit the client
-//! gets `429` with a `Retry-After` for the seconds left in the window.
+//! bumped with a single atomic `kv_incr_ttl` — one round trip that both
+//! increments the counter and (on the first request of a window) stamps the
+//! window TTL, so a counter can never be created without an expiry. That
+//! single call is also what makes the limit cluster-wide when KV replication
+//! is on. Over the limit the client gets `429` with a `Retry-After` for the
+//! seconds left in the window.
 //!
 //! **Fail-open by design:** when the KV store is unavailable (`kv_incr`
 //! errors), the request is allowed through with a warning log. For a rate
@@ -90,10 +92,12 @@ impl Middleware for RateLimit {
         let key = format!("mw:rl:{}:{}:{}", req.vhost_id(), client, window);
 
         let host = req.host();
-        // Create the counter with a TTL when absent (kv_incr cannot set
-        // one); when the key already exists this is a no-op.
-        let _ = host.kv_set_nx(&key, b"0", KEY_TTL_SECS);
-        let Some(count) = host.kv_incr(&key, 1) else {
+        // Atomically bump the counter, applying the window TTL only when this
+        // call creates the key. This makes it impossible for a counter to be
+        // created without an expiry (which would leak the key and could pin a
+        // client "limited" into the next window). Existing keys keep their
+        // original TTL — fixed-window semantics.
+        let Some(count) = host.kv_incr_ttl(&key, 1, KEY_TTL_SECS) else {
             // Fail-open: see the crate docs for the rationale.
             host.log(
                 LOG_WARN,
