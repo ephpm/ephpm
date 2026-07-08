@@ -155,6 +155,10 @@ mod ffi {
         pub fn ephpm_opcache_invalidate_under(
             docroot: *const ::std::os::raw::c_char,
         ) -> ::std::os::raw::c_long;
+
+        /// Class+message of the last exception observed by the invalidator
+        /// on this thread ("Class: msg"; empty string when none).
+        pub fn ephpm_opcache_last_exception() -> *const ::std::os::raw::c_char;
     }
 }
 
@@ -885,7 +889,14 @@ impl PhpRuntime {
             // Failure codes from the C helper: -1 bad docroot/OOM, -2 eval
             // compile/execute failure, -4 bailout, -5 pending exception,
             // -100-N eval returned non-numeric zval of type N.
-            tracing::debug!(code = count, "opcache invalidator returned failure code");
+            // SAFETY: the pointer is a valid thread-local NUL-terminated
+            // buffer owned by the wrapper; we copy it out immediately.
+            let exc = unsafe {
+                std::ffi::CStr::from_ptr(ffi::ephpm_opcache_last_exception())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            tracing::debug!(code = count, exception = %exc, "opcache invalidator failed");
             None
         } else {
             Some(count as i64)

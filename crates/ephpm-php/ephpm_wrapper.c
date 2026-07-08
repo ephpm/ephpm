@@ -1049,8 +1049,18 @@ static int ephpm_opcache_escape_prefix(const char *prefix, char *out, size_t out
  * available (extension missing / disabled / snippet compile failed / bailout).
  * Must be called from a TSRM-registered thread with an active PHP request.
  */
+/* Last exception observed by ephpm_opcache_invalidate_under ("Class: msg").
+ * Thread-local, valid until the next call on the same thread. */
+static EPHPM_TLS char opcache_exc_buf[256];
+
+const char *ephpm_opcache_last_exception(void)
+{
+    return opcache_exc_buf;
+}
+
 long ephpm_opcache_invalidate_under(const char *docroot)
 {
+    opcache_exc_buf[0] = '\0';
     if (!docroot || docroot[0] == '\0') {
         return -1;
     }
@@ -1107,12 +1117,25 @@ long ephpm_opcache_invalidate_under(const char *docroot)
         /* Clear ANY pending exception the snippet raised. This eval runs in
          * the still-active previous/initial request, immediately before the
          * next request's script executes — a leaked pending exception would
-         * surface inside that unrelated script. The snippet is defensive
-         * (function_exists guards, @-suppressed status call), so a real
-         * exception here is exceptional; report it as "unavailable". */
+         * surface inside that unrelated script. Record class+message for
+         * diagnostics; only report failure if the eval didn't already
+         * produce a usable count. */
         if (EG(exception)) {
             if (!zend_is_unwind_exit(EG(exception))) {
-                count = -5;
+                zend_object *ex = EG(exception);
+                const char *cls = ZSTR_VAL(ex->ce->name);
+                zval msg_zv;
+                ZVAL_UNDEF(&msg_zv);
+                zval rv;
+                zval *msg = zend_read_property_ex(
+                    ex->ce, ex, ZSTR_KNOWN(ZEND_STR_MESSAGE), 1, &rv);
+                const char *msg_str =
+                    (msg && Z_TYPE_P(msg) == IS_STRING) ? Z_STRVAL_P(msg) : "?";
+                snprintf(opcache_exc_buf, sizeof(opcache_exc_buf), "%s: %s", cls, msg_str);
+                (void)msg_zv;
+                if (count < 0) {
+                    count = -5;
+                }
             }
             zend_clear_exception();
         }
