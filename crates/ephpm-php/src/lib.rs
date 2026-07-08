@@ -881,7 +881,15 @@ impl PhpRuntime {
         // helper walks OPcache under a SETJMP bailout guard and does not
         // retain the pointer past the call.
         let count = unsafe { ffi::ephpm_opcache_invalidate_under(c_docroot.as_ptr()) };
-        if count < 0 { None } else { Some(count as i64) }
+        if count < 0 {
+            // Failure codes from the C helper: -1 bad docroot/OOM, -2 eval
+            // compile/execute failure, -4 bailout, -5 pending exception,
+            // -100-N eval returned non-numeric zval of type N.
+            tracing::debug!(code = count, "opcache invalidator returned failure code");
+            None
+        } else {
+            Some(count as i64)
+        }
     }
 
     /// Stub when PHP is not linked.

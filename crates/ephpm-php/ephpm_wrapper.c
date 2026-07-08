@@ -1095,7 +1095,14 @@ long ephpm_opcache_invalidate_under(const char *docroot)
                 count = (long)Z_LVAL(retval);
             } else if (Z_TYPE(retval) == IS_DOUBLE) {
                 count = (long)Z_DVAL(retval);
+            } else {
+                /* eval succeeded but produced a non-numeric value —
+                 * encode the zval type so the Rust debug log can say why. */
+                count = -100 - (long)Z_TYPE(retval);
             }
+        } else {
+            /* compile/execute failure without bailout */
+            count = -2;
         }
         /* Clear ANY pending exception the snippet raised. This eval runs in
          * the still-active previous/initial request, immediately before the
@@ -1105,14 +1112,14 @@ long ephpm_opcache_invalidate_under(const char *docroot)
          * exception here is exceptional; report it as "unavailable". */
         if (EG(exception)) {
             if (!zend_is_unwind_exit(EG(exception))) {
-                count = -1;
+                count = -5;
             }
             zend_clear_exception();
         }
     } else {
-        /* zend_bailout() longjmped out of the snippet. Nothing to do — the
-         * live request context is still valid, we just report -1. */
-        count = -1;
+        /* zend_bailout() longjmped out of the snippet. The live request
+         * context is still valid; report the bailout distinctly. */
+        count = -4;
     }
 
     EG(bailout) = __orig_bailout;
