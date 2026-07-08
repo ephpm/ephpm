@@ -1003,8 +1003,12 @@ const char *ephpm_get_response_headers(size_t *out_len)
  * single-quoted literal — the C side escapes single quotes and backslashes
  * before splicing it in. force=true so the invalidation drops the bytecode
  * even if the file's mtime hasn't advanced (deploys often keep timestamps). */
+/* NOTE: no leading `return` and no trailing `;` — zend_eval_string_ex
+ * with a retval pointer wraps the code as `return <code>;` itself.
+ * Including our own produced `return return (...)();` → ParseError
+ * (found the hard way on the two-node kind demo). */
 static const char EPHPM_OPCACHE_SNIPPET_HEAD[] =
-    "return (function(){"
+    "(function(){"
     "if (!function_exists('opcache_get_status') || "
     "!function_exists('opcache_invalidate')) { return -1; }"
     "$s = @opcache_get_status(true);"
@@ -1017,7 +1021,7 @@ static const char EPHPM_OPCACHE_SNIPPET_TAIL[] =
     "opcache_invalidate($p, true); $n++;"
     "}}"
     "return $n;"
-    "})();";
+    "})()";
 
 /* Escape a docroot for embedding inside a single-quoted PHP literal.
  * Only ' and \ need escaping in that context. Writes into `out` (which must
