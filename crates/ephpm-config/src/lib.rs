@@ -41,6 +41,12 @@ pub struct Config {
     /// Default: empty (no middleware loaded).
     #[serde(default)]
     pub middleware: Vec<MiddlewareMount>,
+
+    /// OPcache clustering settings (`[opcache]`).
+    ///
+    /// Governs cluster-wide OPcache invalidation. See [`OpcacheConfig`].
+    #[serde(default)]
+    pub opcache: OpcacheConfig,
 }
 
 /// One native middleware mount (`[[middleware]]`).
@@ -1838,6 +1844,55 @@ impl Default for ClusterKvConfig {
             hot_key_max_memory: default_hot_key_max_memory(),
             data_port: default_kv_data_port(),
         }
+    }
+}
+
+/// OPcache clustering configuration (`[opcache]`).
+///
+/// Governs the cluster-wide invalidation watcher that fires when the KV key
+/// `opcache:version:<vhost>` changes. See
+/// `site/content/roadmap/opcache-clustering.md` for the design.
+#[derive(Debug, Deserialize, Clone)]
+pub struct OpcacheConfig {
+    /// Watch the KV store for cluster-wide invalidation events.
+    ///
+    /// When enabled, every PHP request checks `opcache:version:<vhost>` before
+    /// executing. If the version has advanced since the last invalidation on
+    /// this node, `opcache_invalidate()` is called for every cached script
+    /// under the vhost's document root before the request runs.
+    ///
+    /// The KV lookup is an in-process `DashMap::get` — sub-microsecond — so the
+    /// per-request overhead is negligible.
+    ///
+    /// Default resolution (see [`OpcacheConfig::effective_cluster_invalidation`]):
+    /// - `Some(true)` / `Some(false)` — explicit value from TOML
+    /// - `None` — defaults to `true` when `[cluster] enabled = true`,
+    ///   `false` otherwise (single-node: `ephpm cache reset` is the right
+    ///   interface).
+    ///
+    /// **Applies to fpm mode only.** In worker mode
+    /// (`[php] mode = "worker"`), the watcher is not currently invoked — the
+    /// framework holds compiled bytecode in the booted process and cluster
+    /// invalidation of a worker's OPcache is a future phase. Startup emits a
+    /// WARN when `cluster_invalidation` resolves to true under worker mode so
+    /// the no-op is never silent.
+    #[serde(default)]
+    pub cluster_invalidation: Option<bool>,
+}
+
+impl Default for OpcacheConfig {
+    fn default() -> Self {
+        Self { cluster_invalidation: None }
+    }
+}
+
+impl OpcacheConfig {
+    /// Resolve the effective `cluster_invalidation` setting.
+    ///
+    /// `None` means "auto": on when clustering is enabled, off otherwise.
+    #[must_use]
+    pub fn effective_cluster_invalidation(&self, cluster_enabled: bool) -> bool {
+        self.cluster_invalidation.unwrap_or(cluster_enabled)
     }
 }
 
