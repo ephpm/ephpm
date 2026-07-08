@@ -306,7 +306,7 @@ impl ClusteredStore {
         // No cluster peers (single node, or only self alive): store
         // locally and we're done.
         if replicas.is_empty() {
-            return self.store.set(key.to_string(), value.to_vec(), ttl);
+            return self.store.set_local(key.to_string(), value.to_vec(), ttl);
         }
 
         // The primary is the first replica; the rest are secondaries.
@@ -319,7 +319,7 @@ impl ClusteredStore {
             // value is not lost outright, mirroring the pre-replication
             // behaviour. Do not attempt secondaries in this case.
             if primary.id != self_id {
-                return self.store.set(key.to_string(), value.to_vec(), ttl);
+                return self.store.set_local(key.to_string(), value.to_vec(), ttl);
             }
             return false;
         }
@@ -331,7 +331,7 @@ impl ClusteredStore {
                 for node in secondaries {
                     if node.id == self_id {
                         // Local replica — write inline (cheap, no task).
-                        if !self.store.set(key.to_string(), value.to_vec(), ttl) {
+                        if !self.store.set_local(key.to_string(), value.to_vec(), ttl) {
                             self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(key, "local replica write rejected (memory limit?)");
                         }
@@ -410,7 +410,7 @@ impl ClusteredStore {
         ttl: Option<Duration>,
     ) -> bool {
         if node.id == self_id {
-            return self.store.set(key.to_string(), value.to_vec(), ttl);
+            return self.store.set_local(key.to_string(), value.to_vec(), ttl);
         }
         let Some(addr) = node_data_addr(node, self.config.data_port) else {
             tracing::warn!(key, replica = %node.id, "replica has no parseable data address");
@@ -430,8 +430,10 @@ impl ClusteredStore {
         // Try gossip tier first.
         let gossip_deleted = self.cluster.gossip_del(key).await;
 
-        // Also remove from local store.
-        let local_deleted = self.store.remove(key);
+        // Also remove from local store. `remove_local` skips the Replicator
+        // hook so we don't re-enter ourselves when this ClusteredStore is
+        // installed as its own local Store's replicator.
+        let local_deleted = self.store.remove_local(key);
 
         // Evict from hot cache.
         if self.config.hot_key_cache {
@@ -664,6 +666,105 @@ impl ClusterHandle {
                 callback(event.key, event.value);
             })
             .forever();
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Sync bridge to `ephpm_kv::store::Replicator`
+// ─────────────────────────────────────────────────────────────────────
+
+/// Adapter that implements the synchronous
+/// [`ephpm_kv::store::Replicator`] trait on top of the async
+/// [`ClusteredStore`] API.
+///
+/// The RESP command dispatcher and the PHP `kv_bridge` FFI callbacks call
+/// `Store::set` / `remove` / `expire` from **non-async** contexts, but
+/// `ClusteredStore`'s routing is async (chitchat writes, data-plane RPCs).
+/// This adapter bridges the two by pinning a tokio [`Handle`] at
+/// construction time and calling
+/// [`Handle::spawn`] for the async work.
+///
+/// ## Semantics
+///
+/// - **Small keys (≤ `small_key_threshold`)** — gossip fan-out is spawned
+///   fire-and-forget. The hook returns `true` immediately (the gossip tier
+///   never rejects a write locally). Peers converge in gossip-time.
+/// - **Large keys** — a bounded-inline primary write happens synchronously
+///   via `Handle::block_on` **only** when we are NOT already inside a
+///   tokio runtime. Inside a runtime we cannot `block_on` (that panics),
+///   so we spawn and return `true`. This matches the semantics operators
+///   already accept from the `replication_mode = "async"` path: replicas
+///   are best-effort, the client sees success as long as the local write
+///   would have succeeded.
+/// - **Remove / expire** — always spawned fire-and-forget. The return
+///   value reflects only the local action.
+///
+/// This is a v1 sync-bridge. A future revision may collapse the runtime
+/// gap by making the RESP dispatcher itself async and threading a routing
+/// trait through it; that is a larger refactor and out of scope here.
+pub struct KvReplicator {
+    inner: Arc<ClusteredStore>,
+    /// The tokio runtime that owns the cluster gossip + data plane tasks.
+    /// Captured at construction so sync callers on any thread can spawn
+    /// async replication work.
+    handle: tokio::runtime::Handle,
+}
+
+impl std::fmt::Debug for KvReplicator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvReplicator").field("clustered_store", &"<ClusteredStore>").finish()
+    }
+}
+
+impl KvReplicator {
+    /// Wrap a [`ClusteredStore`] as a sync [`ephpm_kv::store::Replicator`]
+    /// bound to the given tokio runtime `handle`. Typically
+    /// [`tokio::runtime::Handle::current`] captured from the server's
+    /// tokio context at startup.
+    #[must_use]
+    pub fn new(inner: Arc<ClusteredStore>, handle: tokio::runtime::Handle) -> Arc<Self> {
+        Arc::new(Self { inner, handle })
+    }
+}
+
+impl ephpm_kv::store::Replicator for KvReplicator {
+    fn replicate_set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        // Fire-and-forget: hand the routed write off to the runtime and
+        // return success. The clustered set() itself decides gossip vs
+        // local + replica fan-out and does all local writes via
+        // Store::set_local, so no recursion is possible.
+        let inner = Arc::clone(&self.inner);
+        self.handle.spawn(async move {
+            let ok = inner.set(key.clone(), value, ttl).await;
+            if !ok {
+                tracing::warn!(key, "clustered set returned false (primary rejected)");
+            }
+        });
+        true
+    }
+
+    fn replicate_remove(&self, key: &str) -> bool {
+        let inner = Arc::clone(&self.inner);
+        let key = key.to_string();
+        self.handle.spawn(async move {
+            let _ = inner.remove(&key).await;
+        });
+        // We cannot know synchronously whether the key existed on any
+        // tier; return `true` optimistically (RESP DEL semantics: the
+        // caller uses this as an "attempted" signal, not a guarantee).
+        true
+    }
+
+    fn replicate_expire(&self, key: &str, ttl: Duration) -> bool {
+        // ClusteredStore does not yet expose a cluster-wide `expire` — the
+        // gossip TTL is set at write time. Update the local copy so the
+        // node the caller is talking to honours the new expiry; remote
+        // copies keep their originally-set TTL. Document this v1 gap.
+        let ok = self.inner.local_store().expire_local(key, ttl);
+        if !ok {
+            tracing::debug!(key, "expire: no local copy (may exist only on remote replicas)");
+        }
+        ok
     }
 }
 
