@@ -4,6 +4,7 @@ pub mod file_cache;
 mod idle;
 pub mod metrics;
 pub mod middleware;
+pub mod opcache;
 pub mod rate_limit;
 pub mod router;
 pub mod static_files;
@@ -1356,6 +1357,7 @@ mod lib_tests {
             kv: ephpm_config::KvConfig::default(),
             cluster: ephpm_config::ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let store = ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default());
         Arc::new(Router::new(&config, store, None, None, None, None))

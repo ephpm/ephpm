@@ -1853,6 +1853,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         Router::new(&config, test_store(), None, None, None, None)
     }
@@ -1871,6 +1872,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         Router::new(&config, test_store(), None, None, None, None)
     }
@@ -1894,6 +1896,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         config.server.static_files.etag = true;
         Router::new(&config, store, None, None, None, None)
@@ -2087,6 +2090,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         config.server.security.get_or_insert_default().trusted_proxies =
             vec!["10.0.0.0/8".to_string()];
@@ -2111,6 +2115,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         config.server.security.get_or_insert_default().trusted_proxies =
             vec!["10.0.0.0/8".to_string()];
@@ -2137,6 +2142,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert_eq!(router.server_port, 3000);
@@ -2156,6 +2162,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert_eq!(router.server_port, 8080);
@@ -2177,6 +2184,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(router.open_basedir, "multi-tenant mode must default open_basedir on");
@@ -2195,6 +2203,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(!router.open_basedir);
@@ -2239,6 +2248,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(router.is_php_allowed("/anything.php"));
@@ -2257,6 +2267,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-login.php".to_string()];
@@ -2279,6 +2290,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-admin/*.php".to_string()];
@@ -2512,6 +2524,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert_eq!(router.server_port, 9090);
@@ -2913,6 +2926,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -2938,6 +2952,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -2964,6 +2979,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -2990,6 +3006,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -3013,6 +3030,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -3040,6 +3058,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -3070,6 +3089,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -3106,6 +3126,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
