@@ -278,8 +278,7 @@ impl Router {
             worker_stream_threshold: config.php.worker_stream_threshold,
             middleware_chain: None,
             opcache_watcher: {
-                let enabled =
-                    config.opcache.effective_cluster_invalidation(config.cluster.enabled);
+                let enabled = config.opcache.effective_cluster_invalidation(config.cluster.enabled);
                 if enabled && config.php.is_worker_mode() {
                     // Never a silent no-op: worker-mode wiring is a future
                     // phase, so surface it at startup instead.

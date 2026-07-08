@@ -22,9 +22,8 @@
 //!   both queue on the mutex — only the first performs the invalidation.
 
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use ::metrics::counter;
 use dashmap::DashMap;
@@ -273,11 +272,7 @@ mod tests {
     }
 
     fn write_version(store: &Store, vhost: &str, v: u64) {
-        store.set(
-            format!("{KV_VERSION_PREFIX}{vhost}"),
-            v.to_string().into_bytes(),
-            None,
-        );
+        store.set(format!("{KV_VERSION_PREFIX}{vhost}"), v.to_string().into_bytes(), None);
     }
 
     #[test]
@@ -297,11 +292,7 @@ mod tests {
     #[test]
     fn malformed_key_is_noop() {
         let store = store();
-        store.set(
-            format!("{KV_VERSION_PREFIX}blog"),
-            b"not-a-number".to_vec(),
-            None,
-        );
+        store.set(format!("{KV_VERSION_PREFIX}blog"), b"not-a-number".to_vec(), None);
         let watcher = OpcacheWatcher::new(true);
         assert!(matches!(watcher.check(&store, "blog"), Decision::NoOp));
     }
@@ -413,15 +404,9 @@ mod tests {
         let watcher = OpcacheWatcher::new(true);
 
         // blog's per-vhost key wins.
-        assert!(matches!(
-            watcher.check(&store, "blog"),
-            Decision::Invalidate { version: 500 }
-        ));
+        assert!(matches!(watcher.check(&store, "blog"), Decision::Invalidate { version: 500 }));
         // shop's per-vhost key loses to the broadcast.
-        assert!(matches!(
-            watcher.check(&store, "shop"),
-            Decision::Invalidate { version: 300 }
-        ));
+        assert!(matches!(watcher.check(&store, "shop"), Decision::Invalidate { version: 300 }));
     }
 
     #[test]

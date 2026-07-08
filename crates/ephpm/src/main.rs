@@ -1064,13 +1064,11 @@ async fn run_deploy(
 }
 
 /// `ephpm cache reset` / `ephpm cache status` dispatcher.
-async fn run_cache(
-    host: &str,
-    port: u16,
-    sub: CacheSubcommand,
-) -> anyhow::Result<ExitCode> {
+async fn run_cache(host: &str, port: u16, sub: CacheSubcommand) -> anyhow::Result<ExitCode> {
     match sub {
-        CacheSubcommand::Reset { site, all } => run_cache_reset(host, port, site.as_deref(), all).await,
+        CacheSubcommand::Reset { site, all } => {
+            run_cache_reset(host, port, site.as_deref(), all).await
+        }
     }
 }
 
@@ -1226,8 +1224,7 @@ mod cli_tests {
 
     #[test]
     fn parses_cache_reset_with_site() {
-        let cli =
-            Cli::try_parse_from(["ephpm", "cache", "reset", "--site", "shop"]).unwrap();
+        let cli = Cli::try_parse_from(["ephpm", "cache", "reset", "--site", "shop"]).unwrap();
         match cli.command {
             Some(Commands::Cache { subcommand: CacheSubcommand::Reset { site, all }, .. }) => {
                 assert_eq!(site.as_deref(), Some("shop"));

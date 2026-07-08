@@ -66,6 +66,16 @@ These appear when `[php] mode = "worker"`.
 | `ephpm_worker_boot_failures_total` | counter | — | Worker boots that failed (thread spawn/TSRM init failure, or the script exited before its first `take_request()`). The pool respawns with exponential backoff. |
 | `ephpm_worker_recycles_total` | counter | `reason` | Workers recycled. `reason` is `max_requests` (hit `worker_max_requests`), `script_exit` (script called `exit()`/`die()` mid-request), `fatal` (fatal error / bailout), or `hung` (never responded within the request timeout; replaced). |
 
+## OPcache clustering
+
+These appear when a cluster-wide OPcache invalidation actually fires. When
+`[opcache] cluster_invalidation = false`, or the watcher never sees an
+`opcache:version:*` change, the counter has no series.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_opcache_invalidations_total` | counter | `vhost`, `trigger` | Cluster-wide OPcache invalidations run for a vhost. `trigger` is `kv` (gossip-driven — `ephpm deploy`) or `cli` (local `ephpm cache reset` that bypassed the KV read path). |
+
 ## Database (query stats)
 
 These appear when `[db.analysis] query_stats = true` (the default).
