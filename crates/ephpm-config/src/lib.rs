@@ -1473,6 +1473,16 @@ impl Config {
                      name (e.g. \"redis\") or a path to a shared object",
                 )));
             }
+            // The generated php.ini writes `extension={ext}` verbatim, so a
+            // newline, carriage return, or NUL in an entry would inject a
+            // second arbitrary ini directive. Reject them outright.
+            if ext.contains(['\n', '\r', '\0']) {
+                return Err(ConfigError::Validation(format!(
+                    "[php] extensions entry {i} contains a newline, carriage \
+                     return, or NUL — such an entry could inject an arbitrary \
+                     ini directive into the generated php.ini",
+                )));
+            }
         }
 
         // Native middleware: an empty `library` can never resolve, and
@@ -2244,6 +2254,22 @@ extensions = ["redis", ""]
         let config = Config::load(&file).unwrap();
         let err = config.validate().expect_err("empty extension entry must be rejected");
         assert!(err.to_string().contains("extensions entry 1"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_php_extensions_ini_injection_rejected() {
+        // A newline/CR/NUL in an extension entry would inject a second ini
+        // directive into the generated php.ini. Build the config directly so
+        // the control characters survive verbatim.
+        for bad in ["redis\nmemory_limit=999G", "redis\rfoo=bar", "redis\0evil"] {
+            let mut config = Config::default();
+            config.php.extensions = vec![bad.to_string()];
+            let err = config
+                .validate()
+                .expect_err("extension entry with a control char must be rejected");
+            assert!(matches!(err, ConfigError::Validation(_)));
+            assert!(err.to_string().contains("extensions entry 0"), "unexpected error: {err}");
+        }
     }
 
     #[test]

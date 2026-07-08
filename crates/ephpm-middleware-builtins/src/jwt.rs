@@ -80,12 +80,15 @@ impl Jwt {
         let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
 
         // `exp` is required — a token that cannot expire is a config bug.
-        let exp = claims.get("exp").and_then(serde_json::Value::as_u64)?;
+        // RFC 7519 NumericDate allows non-integer values, so accept a JSON
+        // float (floored) as well as an integer rather than 401-ing a valid
+        // token.
+        let exp = claims.get("exp").and_then(numeric_date)?;
         if exp <= now {
             return None;
         }
         if let Some(nbf) = claims.get("nbf") {
-            if nbf.as_u64()? > now {
+            if numeric_date(nbf)? > now {
                 return None;
             }
         }
@@ -108,6 +111,30 @@ impl Jwt {
         }
 
         String::from_utf8(payload).ok()
+    }
+}
+
+/// Parse an RFC 7519 NumericDate claim (`exp`/`nbf`) as seconds since the
+/// epoch. Accepts a JSON integer or a JSON float (floored to whole seconds,
+/// negatives rejected); returns `None` for any other JSON type. This keeps
+/// enforcement identical while tolerating the non-integer NumericDates the
+/// spec permits.
+fn numeric_date(v: &serde_json::Value) -> Option<u64> {
+    if let Some(u) = v.as_u64() {
+        return Some(u);
+    }
+    let f = v.as_f64()?;
+    // floor() keeps the "not valid until this whole second" semantics; only
+    // finite, non-negative values within u64 range map to a NumericDate.
+    if f.is_finite() && (0.0..18_446_744_073_709_551_616.0).contains(&f) {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "bounds checked: finite, in [0, u64::MAX), floored"
+        )]
+        Some(f.floor() as u64)
+    } else {
+        None
     }
 }
 
@@ -220,6 +247,21 @@ mod tests {
         let t = token(SECRET, &format!(r#"{{"sub":"u1","exp":{}}}"#, future_exp()));
         let resp = invoke(&mw, &bearer(&t));
         assert_eq!(resp.__action(), ACTION_CONTINUE);
+    }
+
+    #[test]
+    fn float_exp_and_nbf_are_accepted() {
+        // RFC 7519 NumericDate allows non-integer values. A JSON float exp
+        // (and nbf) in the future must not be spuriously rejected.
+        let mw = jwt(serde_json::json!({ "secret": SECRET }));
+        let exp = future_exp();
+        let claims = format!(r#"{{"sub":"u1","exp":{exp}.75,"nbf":{}.5}}"#, exp - 3700);
+        let resp = invoke(&mw, &bearer(&token(SECRET, &claims)));
+        assert_eq!(resp.__action(), ACTION_CONTINUE, "float exp/nbf must be honoured");
+
+        // An expired float exp is still rejected (floor keeps enforcement).
+        let expired = token(SECRET, r#"{"sub":"u1","exp":1000.9}"#);
+        assert_401(&invoke(&mw, &bearer(&expired)), "invalid token");
     }
 
     #[test]

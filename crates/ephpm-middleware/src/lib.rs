@@ -319,6 +319,23 @@ impl<'a> Host<'a> {
         (rc == 0).then_some(out)
     }
 
+    /// Atomic increment that applies `ttl_secs` (`0` = no expiry) ONLY when
+    /// this call creates the key; existing keys keep their current TTL
+    /// (fixed-window semantics). `None` on error (e.g. non-numeric value).
+    ///
+    /// This is the correct primitive for fixed-window rate limiting: the
+    /// window key always gets its TTL atomically on creation, so a counter
+    /// can never be created without an expiry and leak.
+    #[must_use]
+    pub fn kv_incr_ttl(&self, key: &str, by: i64, ttl_secs: i64) -> Option<i64> {
+        let mut out: i64 = 0;
+        // SAFETY: valid key slice; out-param points at a local.
+        let rc = unsafe {
+            (self.table.kv_incr_ttl)(key.as_ptr(), key.len(), by, ttl_secs, &raw mut out)
+        };
+        (rc == 0).then_some(out)
+    }
+
     /// Log through the host's `tracing` subscriber.
     pub fn log(&self, level: i32, msg: &str) {
         // SAFETY: valid slice for the duration of the call.

@@ -16,6 +16,11 @@
 //!    stock release binaries on every platform (the Linux release is
 //!    glibc-dynamic).
 //!
+//! **Coverage (FPM mode):** the chain runs only for PHP-dispatched requests
+//! (inside `Router::handle_php`). Static-file responses and error responses
+//! (403/404 from the router) do NOT pass through middleware. Worker mode
+//! routes every request through PHP, so there the chain sees everything.
+//!
 //! v1 chain semantics: `RESPOND` short-circuits the chain immediately.
 //! `REWRITE` accumulates a path override (last writer wins) and header
 //! overrides (chain order); the router applies them AFTER the whole chain
