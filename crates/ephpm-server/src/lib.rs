@@ -141,9 +141,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             Arc::clone(&clustered),
             tokio::runtime::Handle::current(),
         );
-        kv_store.set_replicator(Some(
-            replicator as Arc<dyn ephpm_kv::store::Replicator>,
-        ));
+        kv_store.set_replicator(Some(replicator as Arc<dyn ephpm_kv::store::Replicator>));
         tracing::info!(
             small_key_threshold = config.cluster.kv.small_key_threshold,
             replication_factor = config.cluster.kv.replication_factor,
