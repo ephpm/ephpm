@@ -143,6 +143,18 @@ mod ffi {
             argc: ::std::os::raw::c_int,
             argv: *mut *mut ::std::os::raw::c_char,
         ) -> ::std::os::raw::c_int;
+
+        // ── OPcache clustered invalidation (phase 1) ──────────────────
+
+        /// Walk `opcache_get_status(true)['scripts']` and invalidate every
+        /// cached entry whose path starts with `docroot`.
+        ///
+        /// Returns the number of scripts invalidated on success, `-1` when
+        /// OPcache is not available or a bailout occurred. Must be called on
+        /// a TSRM-registered thread with an active PHP request context.
+        pub fn ephpm_opcache_invalidate_under(
+            docroot: *const ::std::os::raw::c_char,
+        ) -> ::std::os::raw::c_long;
     }
 }
 
@@ -838,6 +850,46 @@ impl PhpRuntime {
     /// Stub when PHP is not linked.
     #[cfg(not(php_linked))]
     pub fn set_request_ini(_key: &str, _value: &str) {}
+
+    /// Invalidate every OPcache script whose path starts with `docroot`.
+    ///
+    /// Returns the number of scripts invalidated on success, or `None` when
+    /// OPcache is unavailable (extension missing / disabled), the docroot is
+    /// malformed, or a PHP bailout occurred inside the invalidation snippet.
+    ///
+    /// Called by the ephpm-server per-vhost watcher after it detects that
+    /// the cluster-wide `opcache:version:<vhost>` key has advanced. Must be
+    /// called on a TSRM-registered thread with an active PHP request
+    /// context — safe to call at the start of `execute()` on a
+    /// `spawn_blocking` thread.
+    ///
+    /// In stub mode (no `php_linked`) always returns `None`.
+    #[cfg(php_linked)]
+    #[must_use]
+    pub fn opcache_invalidate_under(docroot: &std::path::Path) -> Option<i64> {
+        if !PHP_INITIALIZED.load(Ordering::Acquire) {
+            return None;
+        }
+        // The FFI helper depends on Zend heap-allocated resources; ensure the
+        // thread is TSRM-registered before touching them.
+        if Self::ensure_thread_registered().is_err() {
+            return None;
+        }
+        let docroot_str = docroot.to_str()?;
+        let c_docroot = std::ffi::CString::new(docroot_str).ok()?;
+        // SAFETY: c_docroot is a valid null-terminated C string; the FFI
+        // helper walks OPcache under a SETJMP bailout guard and does not
+        // retain the pointer past the call.
+        let count = unsafe { ffi::ephpm_opcache_invalidate_under(c_docroot.as_ptr()) };
+        if count < 0 { None } else { Some(count as i64) }
+    }
+
+    /// Stub when PHP is not linked.
+    #[cfg(not(php_linked))]
+    #[must_use]
+    pub fn opcache_invalidate_under(_docroot: &std::path::Path) -> Option<i64> {
+        None
+    }
 }
 
 impl Drop for PhpRuntime {

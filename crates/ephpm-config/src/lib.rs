@@ -1852,7 +1852,7 @@ impl Default for ClusterKvConfig {
 /// Governs the cluster-wide invalidation watcher that fires when the KV key
 /// `opcache:version:<vhost>` changes. See
 /// `site/content/roadmap/opcache-clustering.md` for the design.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Default, Deserialize, Clone)]
 pub struct OpcacheConfig {
     /// Watch the KV store for cluster-wide invalidation events.
     ///
@@ -1878,12 +1878,6 @@ pub struct OpcacheConfig {
     /// the no-op is never silent.
     #[serde(default)]
     pub cluster_invalidation: Option<bool>,
-}
-
-impl Default for OpcacheConfig {
-    fn default() -> Self {
-        Self { cluster_invalidation: None }
-    }
 }
 
 impl OpcacheConfig {

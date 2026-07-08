@@ -978,6 +978,144 @@ const char *ephpm_get_response_headers(size_t *out_len)
 }
 
 /* ===================================================================
+ * OPcache clustered invalidation (design: opcache-clustering.md, phase 1)
+ *
+ * ephpm_opcache_invalidate_under(docroot) walks opcache_get_status(true)['scripts']
+ * and calls opcache_invalidate($path, true) for every cached script whose
+ * full_path starts with the vhost's docroot prefix. Returns the number of
+ * scripts invalidated, or -1 if OPcache is not loaded / not enabled.
+ *
+ * Runs entirely inside userland by evaluating a small PHP snippet with
+ * zend_eval_string_ex() under a SETJMP bailout guard. This avoids the
+ * fragility of walking OPcache's internal HashTable via extension APIs
+ * (accelerator_shm layout has shifted between PHP minors) and matches the
+ * pattern already used by cli_execute_protected() for CLI mode.
+ *
+ * Must be called on a TSRM-registered thread WITH an active PHP request
+ * (i.e. at the start of ephpm_execute_request(), after php_request_startup).
+ * Callers gate the invocation with a Rust-side per-vhost version comparison
+ * so the actual invalidation runs only when a deploy has advanced the
+ * cluster-wide version key, not on every request.
+ * =================================================================== */
+
+/* Small PHP snippet that returns the number of invalidated scripts, or -1
+ * when opcache_get_status is unavailable. The prefix is inlined as a
+ * single-quoted literal — the C side escapes single quotes and backslashes
+ * before splicing it in. force=true so the invalidation drops the bytecode
+ * even if the file's mtime hasn't advanced (deploys often keep timestamps). */
+static const char EPHPM_OPCACHE_SNIPPET_HEAD[] =
+    "return (function(){"
+    "if (!function_exists('opcache_get_status') || "
+    "!function_exists('opcache_invalidate')) { return -1; }"
+    "$s = @opcache_get_status(true);"
+    "if (!is_array($s) || empty($s['scripts'])) { return 0; }"
+    "$prefix = '";
+static const char EPHPM_OPCACHE_SNIPPET_TAIL[] =
+    "'; $n = 0;"
+    "foreach ($s['scripts'] as $p => $_info) {"
+    "if (strncmp($p, $prefix, strlen($prefix)) === 0) {"
+    "opcache_invalidate($p, true); $n++;"
+    "}}"
+    "return $n;"
+    "})();";
+
+/* Escape a docroot for embedding inside a single-quoted PHP literal.
+ * Only ' and \ need escaping in that context. Writes into `out` (which must
+ * have capacity `out_cap`) and null-terminates. Returns 1 on success, 0 if
+ * the escaped string would not fit. */
+static int ephpm_opcache_escape_prefix(const char *prefix, char *out, size_t out_cap)
+{
+    size_t o = 0;
+    for (size_t i = 0; prefix[i] != '\0'; i++) {
+        char c = prefix[i];
+        if (c == '\'' || c == '\\') {
+            if (o + 2 >= out_cap) return 0;
+            out[o++] = '\\';
+            out[o++] = c;
+        } else {
+            if (o + 1 >= out_cap) return 0;
+            out[o++] = c;
+        }
+    }
+    if (o + 1 > out_cap) return 0;
+    out[o] = '\0';
+    return 1;
+}
+
+/*
+ * Invalidate every cached OPcache script whose path starts with `docroot`.
+ *
+ * Returns the number of scripts invalidated (>= 0), or -1 if OPcache is not
+ * available (extension missing / disabled / snippet compile failed / bailout).
+ * Must be called from a TSRM-registered thread with an active PHP request.
+ */
+long ephpm_opcache_invalidate_under(const char *docroot)
+{
+    if (!docroot || docroot[0] == '\0') {
+        return -1;
+    }
+
+    /* Escape the docroot into the assembled PHP snippet. 2048 covers the
+     * longest realistic filesystem path with plenty of headroom. */
+    char escaped[2048];
+    if (!ephpm_opcache_escape_prefix(docroot, escaped, sizeof(escaped))) {
+        return -1;
+    }
+
+    /* Assemble HEAD + escaped prefix + TAIL into a single null-terminated
+     * buffer for zend_eval_string_ex. */
+    size_t head_len = sizeof(EPHPM_OPCACHE_SNIPPET_HEAD) - 1;
+    size_t tail_len = sizeof(EPHPM_OPCACHE_SNIPPET_TAIL) - 1;
+    size_t esc_len = strlen(escaped);
+    size_t total = head_len + esc_len + tail_len + 1;
+    char *snippet = (char *)malloc(total);
+    if (!snippet) {
+        return -1;
+    }
+    memcpy(snippet, EPHPM_OPCACHE_SNIPPET_HEAD, head_len);
+    memcpy(snippet + head_len, escaped, esc_len);
+    memcpy(snippet + head_len + esc_len, EPHPM_OPCACHE_SNIPPET_TAIL, tail_len);
+    snippet[total - 1] = '\0';
+
+    long count = -1;
+    zval retval;
+    ZVAL_UNDEF(&retval);
+
+    /* SETJMP guard: a bailout inside opcache_get_status / opcache_invalidate
+     * (shouldn't happen in normal builds, but OOM / OPcache-in-bad-state can
+     * still trip it) must not unwind through Rust. */
+    JMP_BUF *__orig_bailout = EG(bailout);
+    JMP_BUF __bailout;
+    EG(bailout) = &__bailout;
+
+    if (SETJMP(__bailout) == 0) {
+        int rc = zend_eval_string_ex(snippet, &retval, "ephpm_opcache_invalidate", 0);
+        if (rc == SUCCESS) {
+            if (Z_TYPE(retval) == IS_LONG) {
+                count = (long)Z_LVAL(retval);
+            } else if (Z_TYPE(retval) == IS_DOUBLE) {
+                count = (long)Z_DVAL(retval);
+            }
+        }
+        /* Discard any exit-unwind exception the snippet might have thrown.
+         * We deliberately do not clear the exception on other paths — a real
+         * error from the snippet should still surface for the caller. */
+        if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
+            zend_clear_exception();
+        }
+    } else {
+        /* zend_bailout() longjmped out of the snippet. Nothing to do — the
+         * live request context is still valid, we just report -1. */
+        count = -1;
+    }
+
+    EG(bailout) = __orig_bailout;
+    zval_ptr_dtor(&retval);
+    free(snippet);
+    return count;
+}
+
+/* ===================================================================
  * Worker mode — persistent-worker engine (design: worker-mode-design.md)
  *
  * Registers Ephpm\Worker\take_request() / send_response() and the
