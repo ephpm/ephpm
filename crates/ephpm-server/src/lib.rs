@@ -142,6 +142,17 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             tokio::runtime::Handle::current(),
         );
         kv_store.set_replicator(Some(replicator as Arc<dyn ephpm_kv::store::Replicator>));
+
+        // Materialize REMOTE gossip-tier writes into this node's local
+        // Store so raw-store readers (RESP GET, PHP native functions, the
+        // OPcache watcher) see cluster writes; the origin node materializes
+        // synchronously inside the replicator.
+        ephpm_cluster::clustered_store::start_gossip_applier(
+            &cluster_handle,
+            Arc::clone(&kv_store),
+        )
+        .await;
+
         tracing::info!(
             small_key_threshold = config.cluster.kv.small_key_threshold,
             replication_factor = config.cluster.kv.replication_factor,

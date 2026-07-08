@@ -729,6 +729,15 @@ impl KvReplicator {
 
 impl ephpm_kv::store::Replicator for KvReplicator {
     fn replicate_set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        // Small values: materialize the LOCAL copy synchronously first.
+        // The gossip tier lives in chitchat state, invisible to raw-store
+        // readers (RESP GET, PHP native functions, the OPcache watcher) —
+        // without this, the origin node itself could not read back its own
+        // write. Peers materialize via the gossip applier
+        // (start_gossip_applier).
+        if value.len() <= self.inner.config.small_key_threshold {
+            self.inner.store.set_local(key.clone(), value.clone(), ttl);
+        }
         // Fire-and-forget: hand the routed write off to the runtime and
         // return success. The clustered set() itself decides gossip vs
         // local + replica fan-out and does all local writes via
@@ -744,6 +753,9 @@ impl ephpm_kv::store::Replicator for KvReplicator {
     }
 
     fn replicate_remove(&self, key: &str) -> bool {
+        // Drop the local materialized copy synchronously (mirror of the
+        // set path above), then propagate the removal.
+        self.inner.store.remove_local(key);
         let inner = Arc::clone(&self.inner);
         let key = key.to_string();
         self.handle.spawn(async move {
@@ -766,6 +778,32 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         }
         ok
     }
+}
+
+/// Materialize gossip-tier small values into the local raw [`Store`].
+///
+/// The gossip tier lives in chitchat node state — invisible to the raw
+/// `Store` that the RESP dispatcher, PHP native functions, and the OPcache
+/// watcher read. This applier subscribes to gossip KV changes and writes
+/// every REMOTE small-value update into the local store via `set_local`,
+/// making gossip a replication transport with per-node materialization.
+/// Origin nodes materialize synchronously in
+/// [`KvReplicator::replicate_set`]; their own events are skipped here.
+///
+/// Known v1 gap: `gossip_del` tombstones do not decode as values, so
+/// remote deletions do not remove the local copy until TTL expiry or a
+/// subsequent overwrite.
+pub async fn start_gossip_applier(cluster: &ClusterHandle, store: Arc<Store>) {
+    let self_id = cluster.self_node().id.clone();
+    cluster
+        .subscribe_kv_changes(move |key, value, ttl, node| {
+            if node.node_id == self_id {
+                return;
+            }
+            store.set_local(key.to_string(), value.to_vec(), ttl);
+            tracing::trace!(key, from = %node.node_id, "gossip KV change materialized locally");
+        })
+        .await;
 }
 
 /// FNV-1a-style hash for key → u64 mapping.

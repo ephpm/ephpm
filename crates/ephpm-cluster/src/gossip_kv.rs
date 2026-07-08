@@ -177,18 +177,22 @@ impl ClusterHandle {
     /// Subscribe to gossip KV changes across all nodes.
     ///
     /// The callback receives the key (without the `kv:` prefix), the
-    /// decoded value, and the node that changed it. Used for hot-key
-    /// invalidation notifications.
+    /// decoded value, the remaining TTL (when the entry carries one),
+    /// and the node that changed it. Used by the gossip→local-store
+    /// applier and hot-key invalidation notifications.
     pub async fn subscribe_kv_changes<F>(&self, callback: F)
     where
-        F: Fn(&str, &[u8], &ChitchatId) + Send + Sync + 'static,
+        F: Fn(&str, &[u8], Option<Duration>, &ChitchatId) + Send + Sync + 'static,
     {
         let chitchat = self.handle.chitchat();
         let guard = chitchat.lock().await;
         guard
             .subscribe_event(KV_PREFIX, move |event| {
                 if let Some(value) = decode_value(event.value) {
-                    callback(event.key, &value, event.node);
+                    let ttl = remaining_ttl_ms(event.value)
+                        .filter(|ms| *ms > 0)
+                        .map(Duration::from_millis);
+                    callback(event.key, &value, ttl, event.node);
                 }
             })
             .forever();
