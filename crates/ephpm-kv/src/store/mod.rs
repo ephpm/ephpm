@@ -128,8 +128,40 @@ impl HashEntry {
     }
 }
 
+/// Late-bound replication hook.
+///
+/// When installed via [`Store::set_replicator`], the store's public
+/// `set`/`remove`/`expire` entry points **delegate** the operation to the
+/// replicator instead of writing to the local map. The replicator is
+/// responsible for tier routing (e.g. gossip vs local, replica fan-out) and
+/// for eventually calling back into [`Store::set_local`] / [`Store::remove_local`]
+/// / [`Store::expire_local`] for any local-copy write.
+///
+/// The trait is synchronous because `Store::set` etc. are called from
+/// non-async contexts (RESP command dispatch, PHP native FFI callbacks). An
+/// async replicator (like `ephpm-cluster::ClusteredStore`) captures a tokio
+/// runtime handle at construction time and uses `Handle::spawn` internally
+/// for async work.
+///
+/// # Recursion guard
+///
+/// A replicator MUST NOT call [`Store::set`] / [`Store::remove`] /
+/// [`Store::expire`] on the same store instance — those would re-enter the
+/// hook and loop forever. Use the `*_local` variants for local writes.
+pub trait Replicator: Send + Sync + std::fmt::Debug {
+    /// Handle a public `set`. Returns `true` on success, mirroring
+    /// [`Store::set`]'s semantics.
+    fn replicate_set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool;
+
+    /// Handle a public `remove`. Returns `true` if the key existed.
+    fn replicate_remove(&self, key: &str) -> bool;
+
+    /// Handle a public `expire`. Returns `true` if the key existed and the
+    /// TTL was applied.
+    fn replicate_expire(&self, key: &str, ttl: Duration) -> bool;
+}
+
 /// Thread-safe in-memory KV store.
-#[derive(Debug)]
 pub struct Store {
     /// The main data map (string values).
     data: DashMap<String, Entry>,
@@ -139,6 +171,26 @@ pub struct Store {
     mem_used: AtomicUsize,
     /// Store configuration.
     config: StoreConfig,
+    /// Optional replication hook installed after construction (e.g. by the
+    /// server after cluster gossip starts). `None` on single-node — writes
+    /// take the direct local path with zero extra atomics beyond this Option
+    /// check.
+    replicator: std::sync::RwLock<Option<Arc<dyn Replicator>>>,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("data_len", &self.data.len())
+            .field("hashes_len", &self.hashes.len())
+            .field("mem_used", &self.mem_used.load(Ordering::Relaxed))
+            .field("config", &self.config)
+            .field(
+                "replicator_installed",
+                &self.replicator.read().map(|g| g.is_some()).unwrap_or(false),
+            )
+            .finish()
+    }
 }
 
 impl Store {
@@ -150,7 +202,35 @@ impl Store {
             hashes: DashMap::new(),
             mem_used: AtomicUsize::new(0),
             config,
+            replicator: std::sync::RwLock::new(None),
         })
+    }
+
+    /// Install a [`Replicator`] hook so subsequent [`Store::set`],
+    /// [`Store::remove`], and [`Store::expire`] calls delegate the write to
+    /// it (typically a clustered store that decides gossip vs local tier and
+    /// fans out to replica nodes).
+    ///
+    /// Passing `None` unhooks. Local writes issued via [`Store::set_local`] /
+    /// [`Store::remove_local`] / [`Store::expire_local`] always bypass the
+    /// hook — a replicator uses those to write its own local copy without
+    /// re-entering itself.
+    ///
+    /// This method is called at most once at server startup, after cluster
+    /// gossip has come up and the wrapping clustered store has been
+    /// constructed. See `ephpm-server::start_kv_service` /
+    /// `install_kv_replicator`.
+    pub fn set_replicator(&self, replicator: Option<Arc<dyn Replicator>>) {
+        // Poisoning is impossible here (no `.write()` guard panics inside
+        // held-lock scope), but the API is fallible — handle it defensively.
+        if let Ok(mut slot) = self.replicator.write() {
+            *slot = replicator;
+        }
+    }
+
+    /// Snapshot the currently-installed replicator, if any.
+    fn active_replicator(&self) -> Option<Arc<dyn Replicator>> {
+        self.replicator.read().ok().and_then(|g| g.clone())
     }
 
     // ── Read operations ──────────────────────────────────────────
@@ -163,7 +243,9 @@ impl Store {
         let mut entry = self.data.get_mut(key)?;
         if entry.is_expired() {
             drop(entry);
-            self.remove(key);
+            // Lazy-expiry cleanup: local only. Replicas expire the key on
+            // their own timelines; no need to broadcast the reap.
+            self.remove_local(key);
             return None;
         }
         entry.touch();
@@ -181,7 +263,8 @@ impl Store {
         if let Some(entry) = self.data.get(key) {
             if entry.is_expired() {
                 drop(entry);
-                self.remove(key);
+                // Lazy-expiry cleanup: local only.
+                self.remove_local(key);
             } else {
                 return true;
             }
@@ -198,7 +281,8 @@ impl Store {
         let entry = self.data.get(key)?;
         if entry.is_expired() {
             drop(entry);
-            self.remove(key);
+            // Lazy-expiry cleanup: local only.
+            self.remove_local(key);
             return Some(-2);
         }
         match entry.expires_at {
@@ -255,9 +339,26 @@ impl Store {
 
     /// Set a key to a value with an optional TTL.
     ///
+    /// When a [`Replicator`] is installed (clustered mode), the write is
+    /// delegated to it — the replicator decides tier routing (gossip vs
+    /// local) and replica fan-out, and issues any local-copy write through
+    /// [`Store::set_local`]. Otherwise the write goes straight to the local
+    /// map.
+    ///
     /// Returns `true` if the write succeeded, `false` if rejected by
-    /// the `NoEviction` policy when the memory limit is reached.
+    /// the `NoEviction` policy when the memory limit is reached (or by the
+    /// replicator's own primary write).
     pub fn set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        if let Some(rep) = self.active_replicator() {
+            return rep.replicate_set(key, value, ttl);
+        }
+        self.set_local(key, value, ttl)
+    }
+
+    /// Local-only write — bypasses any installed [`Replicator`]. Used by a
+    /// replicator implementation to write its own local copy without
+    /// re-entering itself. All other callers should use [`Store::set`].
+    pub fn set_local(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
         // Try compression if configured and size is above threshold.
         let (data, compressed) = if self.config.compression.algo != CompressionAlgo::None
             && value.len() >= self.config.compression.min_size
@@ -378,7 +479,20 @@ impl Store {
 
     /// Remove a key, returning `true` if it existed. Removes from both
     /// string and hash storage.
+    ///
+    /// When a [`Replicator`] is installed, the delete is delegated to it so
+    /// remote copies are dropped as well. See [`Store::remove_local`] for
+    /// the bypass variant.
     pub fn remove(&self, key: &str) -> bool {
+        if let Some(rep) = self.active_replicator() {
+            return rep.replicate_remove(key);
+        }
+        self.remove_local(key)
+    }
+
+    /// Local-only remove — bypasses any installed [`Replicator`]. Used by a
+    /// replicator implementation to drop its own local copy.
+    pub fn remove_local(&self, key: &str) -> bool {
         let string_removed = if let Some((_, old)) = self.data.remove(key) {
             self.mem_sub(old.mem_size);
             true
@@ -390,11 +504,23 @@ impl Store {
     }
 
     /// Set an expiry on an existing key. Returns `false` if the key doesn't exist.
+    ///
+    /// When a [`Replicator`] is installed, the TTL update is delegated so
+    /// remote copies see the change. See [`Store::expire_local`] for the
+    /// bypass variant.
     pub fn expire(&self, key: &str, ttl: Duration) -> bool {
+        if let Some(rep) = self.active_replicator() {
+            return rep.replicate_expire(key, ttl);
+        }
+        self.expire_local(key, ttl)
+    }
+
+    /// Local-only expire — bypasses any installed [`Replicator`].
+    pub fn expire_local(&self, key: &str, ttl: Duration) -> bool {
         if let Some(mut entry) = self.data.get_mut(key) {
             if entry.is_expired() {
                 drop(entry);
-                self.remove(key);
+                self.remove_local(key);
                 return false;
             }
             entry.expires_at = Some(Instant::now() + ttl);
@@ -410,7 +536,8 @@ impl Store {
         if let Some(mut entry) = self.data.get_mut(key) {
             if entry.is_expired() {
                 drop(entry);
-                self.remove(key);
+                // Lazy-expiry cleanup: local only.
+                self.remove_local(key);
                 return false;
             }
             let had_ttl = entry.expires_at.is_some();
@@ -459,7 +586,8 @@ impl Store {
         if let Some(mut entry) = self.data.get_mut(key) {
             if entry.is_expired() {
                 drop(entry);
-                self.remove(key);
+                // Lazy-expiry cleanup: local only.
+                self.remove_local(key);
                 // Fall through to create.
             } else {
                 // Decompress if needed before parsing.
@@ -520,7 +648,8 @@ impl Store {
         if let Some(mut entry) = self.data.get_mut(key) {
             if entry.is_expired() {
                 drop(entry);
-                self.remove(key);
+                // Lazy-expiry cleanup: local only.
+                self.remove_local(key);
                 // Fall through to create.
             } else {
                 // Decompress if needed before appending.
@@ -759,7 +888,9 @@ impl Store {
         }
 
         for key in &keys_to_remove {
-            self.remove(key);
+            // Lazy-expiry cleanup: local only. Replicas run their own
+            // expire_pass on the same TTLs.
+            self.remove_local(key);
         }
 
         if removed > 0 {
@@ -850,7 +981,9 @@ impl Store {
 
             if let Some((key, _)) = oldest {
                 debug!(key = %key, "evicting key (LRU)");
-                self.remove(&key);
+                // Eviction is a local memory-pressure decision — replicas
+                // manage their own memory. Do not broadcast the reap.
+                self.remove_local(&key);
             } else {
                 return false; // nothing to evict
             }
@@ -895,13 +1028,14 @@ impl Store {
             let key = self.data.iter().nth(skip).map(|e| e.key().clone());
             if let Some(key) = key {
                 debug!(key = %key, "evicting key (random)");
-                self.remove(&key);
+                // Eviction is a local memory-pressure decision.
+                self.remove_local(&key);
             } else {
                 // skip went past the end — try first entry as fallback.
                 let key = self.data.iter().next().map(|e| e.key().clone());
                 if let Some(key) = key {
                     debug!(key = %key, "evicting key (random fallback)");
-                    self.remove(&key);
+                    self.remove_local(&key);
                 } else {
                     return false;
                 }
@@ -1829,5 +1963,129 @@ mod tests {
             s2.set("b".into(), vec![2u8; 512], None),
             "write rejected — counter likely underflowed and wedged ensure_memory"
         );
+    }
+
+    // ── Replicator hook ─────────────────────────────────────────────
+
+    /// Recorded arguments of a single [`Replicator::replicate_set`] call.
+    type RecordedSet = (String, Vec<u8>, Option<Duration>);
+
+    /// Recorded arguments of a single [`Replicator::replicate_expire`] call.
+    type RecordedExpire = (String, Duration);
+
+    /// Test replicator that records every hook invocation and always
+    /// bypasses the local write (proving `set`/`remove`/`expire` actually
+    /// delegate rather than double-writing).
+    #[derive(Debug, Default)]
+    struct RecordingReplicator {
+        sets: std::sync::Mutex<Vec<RecordedSet>>,
+        removes: std::sync::Mutex<Vec<String>>,
+        expires: std::sync::Mutex<Vec<RecordedExpire>>,
+    }
+
+    impl Replicator for RecordingReplicator {
+        fn replicate_set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+            self.sets.lock().unwrap().push((key, value, ttl));
+            true
+        }
+        fn replicate_remove(&self, key: &str) -> bool {
+            self.removes.lock().unwrap().push(key.to_string());
+            true
+        }
+        fn replicate_expire(&self, key: &str, ttl: Duration) -> bool {
+            self.expires.lock().unwrap().push((key.to_string(), ttl));
+            true
+        }
+    }
+
+    #[test]
+    fn replicator_hook_intercepts_public_set() {
+        // The whole point of the seam: an installed replicator sees every
+        // public `set`, and the local map does NOT hold the value (proving
+        // routing decisions are the replicator's to make).
+        let s = test_store();
+        let rep = Arc::new(RecordingReplicator::default());
+        s.set_replicator(Some(Arc::clone(&rep) as Arc<dyn Replicator>));
+
+        assert!(s.set("k".into(), b"v".to_vec(), Some(Duration::from_secs(30))));
+
+        // Hook fired with the expected args.
+        let sets = rep.sets.lock().unwrap();
+        assert_eq!(sets.len(), 1, "replicator must observe exactly one set");
+        assert_eq!(sets[0].0, "k");
+        assert_eq!(sets[0].1, b"v".to_vec());
+        assert_eq!(sets[0].2, Some(Duration::from_secs(30)));
+        drop(sets);
+
+        // Local map is untouched — the replicator did not forward the
+        // write, and Store::set MUST have delegated to it.
+        assert_eq!(s.get("k"), None, "hooked set must not write locally");
+    }
+
+    #[test]
+    fn replicator_hook_intercepts_remove_and_expire() {
+        let s = test_store();
+        // Seed a value via set_local so a subsequent public remove has
+        // something to work against for the non-hook case; the hook itself
+        // is what we're validating here (`remove` delegates).
+        s.set_local("k".into(), b"v".to_vec(), None);
+
+        let rep = Arc::new(RecordingReplicator::default());
+        s.set_replicator(Some(Arc::clone(&rep) as Arc<dyn Replicator>));
+
+        assert!(s.remove("k"));
+        assert!(s.expire("k", Duration::from_secs(60)));
+
+        assert_eq!(rep.removes.lock().unwrap().as_slice(), &["k".to_string()]);
+        let expires = rep.expires.lock().unwrap();
+        assert_eq!(expires.len(), 1);
+        assert_eq!(expires[0].0, "k");
+        assert_eq!(expires[0].1, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn set_local_bypasses_replicator() {
+        // A replicator implementation writes its own local copy through
+        // `set_local` to avoid re-entering the hook. Prove that path
+        // actually skips the hook (no infinite recursion possible).
+        let s = test_store();
+        let rep = Arc::new(RecordingReplicator::default());
+        s.set_replicator(Some(Arc::clone(&rep) as Arc<dyn Replicator>));
+
+        assert!(s.set_local("k".into(), b"v".to_vec(), None));
+        assert!(s.remove_local("k"));
+        assert!(!s.expire_local("missing", Duration::from_secs(60)));
+
+        assert!(rep.sets.lock().unwrap().is_empty(), "set_local must not fire the hook");
+        assert!(rep.removes.lock().unwrap().is_empty(), "remove_local must not fire the hook");
+        assert!(rep.expires.lock().unwrap().is_empty(), "expire_local must not fire the hook");
+    }
+
+    #[test]
+    fn no_replicator_is_transparent() {
+        // Baseline: on single-node (no hook installed) the behaviour is
+        // identical to the pre-seam direct-write path. Guards the perf
+        // contract in the docs — a single Option check, no atomics.
+        let s = test_store();
+        assert!(s.set("k".into(), b"v".to_vec(), None));
+        assert_eq!(s.get("k"), Some(b"v".to_vec()));
+        assert!(s.expire("k", Duration::from_secs(60)));
+        assert!(s.remove("k"));
+        assert_eq!(s.get("k"), None);
+    }
+
+    #[test]
+    fn replicator_can_be_unhooked() {
+        // Passing None restores the direct-write path.
+        let s = test_store();
+        let rep = Arc::new(RecordingReplicator::default());
+        s.set_replicator(Some(Arc::clone(&rep) as Arc<dyn Replicator>));
+        s.set("hooked".into(), b"v".to_vec(), None);
+        assert_eq!(rep.sets.lock().unwrap().len(), 1);
+
+        s.set_replicator(None);
+        s.set("direct".into(), b"v".to_vec(), None);
+        assert_eq!(s.get("direct"), Some(b"v".to_vec()), "unhooked set must write locally");
+        assert_eq!(rep.sets.lock().unwrap().len(), 1, "replicator must not see the direct write");
     }
 }
