@@ -295,7 +295,6 @@ fn link_system_libs(target_os: &str) {
 
 /// Compile the C wrapper that provides `zend_try`/`zend_catch` guards.
 fn compile_wrapper(include_dir: &Path, target_os: &str) {
-    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let include_main = include_dir.join("main");
     let include_zend = include_dir.join("Zend");
     let include_tsrm = include_dir.join("TSRM");
@@ -315,8 +314,17 @@ fn compile_wrapper(include_dir: &Path, target_os: &str) {
         .include(&include_sapi);
 
     // PHP headers use GNU extensions (memrchr, mempcpy). Define _GNU_SOURCE
-    // so musl's headers expose the declarations and suppress warnings.
-    if target_env == "musl" {
+    // on every Unix target so the libc headers expose the declarations.
+    //
+    // musl always needs it. glibc DOES too on an older baseline: glibc 2.28
+    // (manylinux_2_28 / RHEL8) does not expose mempcpy/memrchr at the default
+    // feature-test level, so zend_operators.h fails to compile with
+    // "implicit declaration of function 'mempcpy'". Newer glibc (2.39 on
+    // ubuntu:24.04) happened to leak them without _GNU_SOURCE, which hid the
+    // gap while the build environment was Ubuntu 24.04. Defining it
+    // unconditionally on Unix keeps the wrapper compiling against the
+    // glibc-2.28 floor and is harmless on newer glibc/musl.
+    if target_os != "windows" {
         build.define("_GNU_SOURCE", None);
     }
 
