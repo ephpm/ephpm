@@ -1,16 +1,16 @@
 //! OPcache clustered invalidation e2e tests (Phase 1).
 //!
 //! Validates the watcher end-to-end:
-//!   1. PRE — warm the OPcache by hitting `opcache_status.php` and confirming
-//!      the target file is cached (`target_cached: true`).
+//!   1. PRE — warm the OPcache by hitting `opcache_status.php` (warming
+//!      probe) and confirming the target file is cached.
 //!   2. Trigger — write `opcache:version:_default` (single-node) or
 //!      `opcache:version:_all` (cluster) via the RESP listener so the watcher
 //!      fires on the next request.
-//!   3. POST — hit `opcache_status.php` again. The first post-trigger request
-//!      pays the invalidation, so `target_cached` may still be true (the
-//!      probe includes the target, which recompiles). What we assert is that
-//!      the version key has taken effect: a follow-up trigger with a NEWER
-//!      version advances the state, which the metrics/log path confirms.
+//!   3. POST — hit `opcache_status.php?warm=0` (cold probe). The request
+//!      trips the watcher BEFORE the probe script runs, so the probe must
+//!      see the target genuinely dropped (`opcache_is_script_cached` =
+//!      false). A follow-up warming probe then re-caches it. This is the
+//!      strong assertion pair — it fails if the invalidator silently no-ops.
 //!
 //! Both `EPHPM_URL` (single-node) and `EPHPM_CLUSTER_URL_*` (cluster) paths
 //! are covered. Tests skip gracefully when the required env vars are unset,
@@ -62,8 +62,20 @@ fn cluster_urls() -> Vec<String> {
 
 /// Fetch and decode the probe JSON at `<base>/opcache_status.php`.
 async fn probe_status(base_url: &str) -> serde_json::Value {
+    probe_status_with(base_url, true).await
+}
+
+/// Probe without warming (`warm=0`) — required to observe that an
+/// invalidation dropped the target, since a warming probe re-caches it
+/// within the same request.
+async fn probe_status_cold(base_url: &str) -> serde_json::Value {
+    probe_status_with(base_url, false).await
+}
+
+async fn probe_status_with(base_url: &str, warm: bool) -> serde_json::Value {
     let client = reqwest::Client::new();
-    let url = format!("{base_url}/opcache_status.php");
+    let warm_q = if warm { "1" } else { "0" };
+    let url = format!("{base_url}/opcache_status.php?warm={warm_q}");
     let resp = client
         .get(&url)
         .send()
@@ -173,17 +185,26 @@ async fn single_node_deploy_triggers_invalidation() {
         .await
         .expect("SET version key");
 
-    // POST: probe again. The endpoint returns 200 with valid JSON.
-    // opcache_enabled must still be true — the watcher must not have
-    // disabled OPcache, only invalidated the cached scripts under docroot.
-    let post = probe_status(base_url.as_str()).await;
+    // POST (cold probe): this request trips the watcher, which invalidates
+    // everything under docroot BEFORE the probe script runs — so the probe
+    // must see the target genuinely dropped (opcache_is_script_cached =
+    // false). This is the strong assertion: it fails if the invalidator
+    // silently no-ops.
+    let post = probe_status_cold(base_url.as_str()).await;
     assert!(
         post["opcache_enabled"].as_bool().unwrap_or(false),
         "OPcache should still be enabled after invalidation: {post}"
     );
     assert!(
-        post["target_cached"].as_bool().unwrap_or(false),
-        "target should be recompiled + re-cached by this request: {post}"
+        !post["target_cached"].as_bool().unwrap_or(true),
+        "target should be DROPPED by the invalidation: {post}"
+    );
+
+    // RE-WARM: the next warming probe recompiles and re-caches it.
+    let rewarm = probe_status(base_url.as_str()).await;
+    assert!(
+        rewarm["target_cached"].as_bool().unwrap_or(false),
+        "target should be recompiled + re-cached after re-warm: {rewarm}"
     );
 }
 
@@ -273,22 +294,30 @@ async fn cluster_broadcast_fans_out_to_all_nodes() {
         .await
         .expect("SET broadcast key on node 0");
 
-    // POST: probe every node. Gossip needs a moment to reach peers; retry
-    // for up to ~15 s. The probe just needs to return valid JSON with
-    // OPcache enabled after invalidation.
+    // POST: cold-probe every node until the target shows as DROPPED —
+    // the strong signal that the broadcast reached that node and its
+    // watcher ran the invalidation. Gossip needs a moment to reach peers;
+    // retry for up to ~15 s per node.
     for (i, url) in urls.iter().enumerate() {
-        let mut ok = false;
+        let mut dropped = false;
         for _ in 0..30 {
-            let post = probe_status(url.as_str()).await;
+            let post = probe_status_cold(url.as_str()).await;
             if post["opcache_enabled"].as_bool().unwrap_or(false)
-                && post["target_cached"].as_bool().unwrap_or(false)
+                && !post["target_cached"].as_bool().unwrap_or(true)
             {
-                ok = true;
+                dropped = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        assert!(ok, "node {i} ({url}) never re-cached target after broadcast");
+        assert!(dropped, "node {i} ({url}) never dropped the target after broadcast");
+
+        // And a warming probe recompiles it — the node stays serviceable.
+        let rewarm = probe_status(url.as_str()).await;
+        assert!(
+            rewarm["target_cached"].as_bool().unwrap_or(false),
+            "node {i} ({url}) failed to re-cache after invalidation: {rewarm}"
+        );
     }
 }
 

@@ -1,10 +1,14 @@
 <?php
 // OPcache status probe used by the opcache_invalidation e2e test.
 //
-// Loads a sibling target file (or the file requested via ?script=) so the
-// target's bytecode is guaranteed to be in the OPcache, then reports the
-// number of scripts currently cached under $DOCUMENT_ROOT plus whether the
-// target's own entry is present.
+// By default warms a sibling target file (include_once) so its bytecode is
+// guaranteed to be in the OPcache, then reports cache state. Pass ?warm=0 to
+// OBSERVE without warming — required to see that an invalidation actually
+// dropped the entry (a warming probe would immediately re-cache it).
+//
+// `target_cached` uses opcache_is_script_cached(): opcache_invalidate()
+// keeps the entry listed in opcache_get_status()['scripts'] but marks it
+// unusable, so presence-in-list is NOT a valid cached signal.
 //
 // Response shape (JSON):
 // {
@@ -25,16 +29,17 @@ if (isset($_GET['script'])) {
     }
 }
 
-// Warm the target so it enters the OPcache. include_once is a no-op after the
-// first inclusion within this request; the OPcache still records the entry.
-if (is_file($target)) {
+$warm = !isset($_GET['warm']) || $_GET['warm'] !== '0';
+if ($warm && is_file($target)) {
     include_once $target;
 }
 
 $response = [
-    'opcache_enabled' => function_exists('opcache_get_status'),
+    'opcache_enabled' => function_exists('opcache_get_status')
+        && is_array(@opcache_get_status(false)),
     'target' => $target,
-    'target_cached' => false,
+    'target_cached' => function_exists('opcache_is_script_cached')
+        && opcache_is_script_cached($target),
     'total_scripts' => 0,
     'docroot_scripts' => 0,
 ];
@@ -48,9 +53,6 @@ if ($response['opcache_enabled']) {
         foreach ($status['scripts'] as $path => $_info) {
             if (strpos($path, $docroot) === 0) {
                 $docroot_count++;
-            }
-            if ($path === $target) {
-                $response['target_cached'] = true;
             }
         }
         $response['docroot_scripts'] = $docroot_count;
