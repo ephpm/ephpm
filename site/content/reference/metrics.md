@@ -74,7 +74,7 @@ These appear when a cluster-wide OPcache invalidation actually fires. When
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `ephpm_opcache_invalidations_total` | counter | `vhost`, `trigger` | Cluster-wide OPcache invalidations run for a vhost. `trigger` is `kv` (gossip-driven — `ephpm deploy`) or `cli` (local `ephpm cache reset` that bypassed the KV read path). |
+| `ephpm_opcache_invalidations_total` | counter | `vhost`, `trigger` | Cluster-wide OPcache invalidations run for a vhost. `trigger` is always `kv` today — both `ephpm deploy` and `ephpm cache reset` arrive via the KV version key. The planned file watcher (roadmap Phase 3) will add a second value. |
 
 ## Database (query stats)
 

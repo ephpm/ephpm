@@ -1097,10 +1097,16 @@ long ephpm_opcache_invalidate_under(const char *docroot)
                 count = (long)Z_DVAL(retval);
             }
         }
-        /* Discard any exit-unwind exception the snippet might have thrown.
-         * We deliberately do not clear the exception on other paths — a real
-         * error from the snippet should still surface for the caller. */
-        if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
+        /* Clear ANY pending exception the snippet raised. This eval runs in
+         * the still-active previous/initial request, immediately before the
+         * next request's script executes — a leaked pending exception would
+         * surface inside that unrelated script. The snippet is defensive
+         * (function_exists guards, @-suppressed status call), so a real
+         * exception here is exceptional; report it as "unavailable". */
+        if (EG(exception)) {
+            if (!zend_is_unwind_exit(EG(exception))) {
+                count = -1;
+            }
             zend_clear_exception();
         }
     } else {

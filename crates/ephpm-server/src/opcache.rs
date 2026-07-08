@@ -49,14 +49,17 @@ pub const DEFAULT_VHOST: &str = "_default";
 /// picks up the broadcast on its first request.
 pub const BROADCAST_VHOST: &str = "_all";
 
-/// What triggered an invalidation. Used as a Prometheus label so operators can
-/// distinguish `ephpm deploy` (KV) from `ephpm cache reset` (local CLI).
+/// What triggered an invalidation. Used as a Prometheus label.
+///
+/// Phase 1 has a single trigger: every invalidation — `ephpm deploy` AND
+/// `ephpm cache reset` — arrives via the KV version key (both commands
+/// write it over RESP). Phase 3's file watcher will add a second variant;
+/// until something constructs it, no other label value exists.
 #[derive(Debug, Clone, Copy)]
 pub enum InvalidationTrigger {
-    /// The KV version key advanced (typically because a peer wrote to it).
+    /// The KV version key advanced (deploy / cache-reset write, possibly
+    /// gossip-replicated from a peer).
     Kv,
-    /// A local `ephpm cache reset` request bypassed the KV path.
-    Cli,
 }
 
 impl InvalidationTrigger {
@@ -65,7 +68,6 @@ impl InvalidationTrigger {
     pub fn label(self) -> &'static str {
         match self {
             InvalidationTrigger::Kv => "kv",
-            InvalidationTrigger::Cli => "cli",
         }
     }
 }

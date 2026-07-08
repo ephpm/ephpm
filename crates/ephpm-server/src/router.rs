@@ -1019,9 +1019,11 @@ impl Router {
             // OPcache clustered invalidation (Phase 1): if the watcher told us
             // to invalidate, drop bytecode under this vhost's docroot BEFORE
             // executing the script. Runs on the TSRM-registered blocking
-            // thread; the FFI helper opens an active PHP request via the same
-            // path execute() uses. mark_invalidated deduplicates so concurrent
-            // requests coalesce on the per-vhost mutex.
+            // thread inside the thread's still-active previous/initial request
+            // (ephpm_thread_init leaves one open; execute() cycles it AFTER
+            // this point) — OPcache SHM effects survive that cycle.
+            // mark_invalidated deduplicates so concurrent requests coalesce on
+            // the per-vhost mutex.
             if let (Some(watcher), Some(version)) = (opcache_watcher, invalidate_version) {
                 watcher.mark_invalidated(
                     &vhost_name,
