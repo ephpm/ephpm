@@ -215,7 +215,7 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `memory_limit` | string | `"256MB"` | Max memory for the KV store. |
+| `memory_limit` | string | `"256MB"` | Max memory for **stored key/value payloads**. Per-connection RESP protocol buffers are NOT counted here — bound those with `[kv.redis_compat]` `max_connections` / `max_input_buffer`. |
 | `eviction_policy` | string | `"allkeys-lru"` | `noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-random`. |
 | `compression` | string | `"none"` | `none`, `gzip`, `brotli`, `zstd`. |
 | `compression_level` | u32 | `6` | 1=fastest, 9=best. |
@@ -227,9 +227,12 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Enable the RESP listener. Off by default; in multi-tenant mode keep it off. |
-| `listen` | string | `"127.0.0.1:6379"` | RESP listener address. |
-| `socket` | string | (none) | **Not yet implemented** — parsed but unused. |
+| `listen` | string | `"127.0.0.1:6379"` | RESP listener address (TCP only). |
+| `socket` | string | (none) | **Not yet implemented** — parsed but unused; startup logs a warning if set. |
 | `password` | string | (none) | RESP `AUTH` password. |
+| `max_connections` | usize | `1000` | Max concurrent RESP connections; excess clients get `ERR max number of clients reached` (like Redis `maxclients`). `0` = unlimited. |
+| `max_input_buffer` | usize (bytes) | `1048576` (1 MiB) | Per-connection input buffer cap (like Redis `client-query-buffer-limit`). Not counted against `[kv] memory_limit`. |
+| `idle_timeout_secs` | u64 | `300` | Close RESP connections idle this long, freeing their buffers. `0` = never. |
 
 ## `[cluster]`
 

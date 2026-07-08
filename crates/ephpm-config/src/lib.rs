@@ -1184,11 +1184,54 @@ pub struct KvRedisCompatConfig {
     /// Default: `None` (no authentication required).
     #[serde(default)]
     pub password: Option<String>,
+
+    /// Maximum concurrent RESP connections. Excess clients are refused
+    /// with `ERR max number of clients reached` (like Redis `maxclients`).
+    /// `0` = unlimited.
+    ///
+    /// Default: `1000`.
+    #[serde(default = "default_kv_max_connections")]
+    pub max_connections: usize,
+
+    /// Maximum RESP input buffer per connection, in bytes (like Redis'
+    /// `client-query-buffer-limit`). This memory is per connection and is
+    /// NOT counted against `[kv] memory_limit`.
+    ///
+    /// Default: `1048576` (1 MiB).
+    #[serde(default = "default_kv_max_input_buffer")]
+    pub max_input_buffer: usize,
+
+    /// Idle timeout in seconds for RESP connections; silent connections
+    /// are closed and their buffers freed. `0` = no timeout.
+    ///
+    /// Default: `300`.
+    #[serde(default = "default_kv_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+fn default_kv_max_connections() -> usize {
+    1000
+}
+
+fn default_kv_max_input_buffer() -> usize {
+    1024 * 1024
+}
+
+fn default_kv_idle_timeout_secs() -> u64 {
+    300
 }
 
 impl Default for KvRedisCompatConfig {
     fn default() -> Self {
-        Self { enabled: false, listen: default_kv_listen(), socket: None, password: None }
+        Self {
+            enabled: false,
+            listen: default_kv_listen(),
+            socket: None,
+            password: None,
+            max_connections: default_kv_max_connections(),
+            max_input_buffer: default_kv_max_input_buffer(),
+            idle_timeout_secs: default_kv_idle_timeout_secs(),
+        }
     }
 }
 

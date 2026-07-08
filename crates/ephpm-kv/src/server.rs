@@ -1,9 +1,15 @@
 //! TCP server accepting RESP protocol connections.
 //!
-//! Listens on a configurable address (and optionally a Unix socket) and
-//! spawns a task per connection. Each connection reads RESP frames,
-//! dispatches them to the [`Store`] via [`command::dispatch`], and writes
-//! the response back.
+//! Listens on a configurable TCP address and spawns a task per
+//! connection. Each connection reads RESP frames, dispatches them to the
+//! [`Store`] via [`command::dispatch`], and writes the response back.
+//!
+//! Connections are bounded three ways (all configurable): a global
+//! connection cap (excess clients get `ERR max number of clients
+//! reached`, like Redis), a per-connection input-buffer cap, and an idle
+//! read timeout. Without these the lane's memory is proportional to
+//! `in-flight frame bytes x connections`, entirely outside the store's
+//! `memory_limit` accounting.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,8 +32,15 @@ pub struct ServerConfig {
     /// TCP listen address, e.g. `"127.0.0.1:6379"`.
     pub listen: String,
     /// Maximum input buffer size per connection (bytes). Protects against
-    /// clients sending enormous payloads.
+    /// clients sending enormous payloads. Note this is per connection and
+    /// is NOT counted against the store's `memory_limit`.
     pub max_input_buffer: usize,
+    /// Maximum concurrent connections. Excess clients are refused with
+    /// `ERR max number of clients reached`. `0` = unlimited.
+    pub max_connections: usize,
+    /// Idle read timeout in seconds. Connections that send nothing for
+    /// this long are closed, freeing their buffers. `0` = no timeout.
+    pub idle_timeout_secs: u64,
     /// Optional password for RESP AUTH. When set, clients must authenticate
     /// before any commands are accepted.
     pub password: Option<String>,
@@ -42,7 +55,12 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:6379".into(),
-            max_input_buffer: 64 * 1024 * 1024, // 64 MiB
+            // 1 MiB, matching Redis' client-query-buffer-limit default.
+            // The previous 64 MiB default let a handful of connections
+            // with large in-flight frames OOM a memory-capped container.
+            max_input_buffer: 1024 * 1024,
+            max_connections: 1000,
+            idle_timeout_secs: 300,
             password: None,
             secret: None,
         }
@@ -73,10 +91,7 @@ pub async fn run(
 
     info!(listen = %config.listen, "KV store RESP server listening");
 
-    let max_buf = config.max_input_buffer;
-    let password = config.password.clone();
-    let secret = config.secret.clone();
-    let accept = serve_on(Arc::clone(&store), listener, max_buf, password, secret, multi_tenant);
+    let accept = serve_on(Arc::clone(&store), listener, config, multi_tenant);
 
     tokio::select! {
         result = accept => result,
@@ -107,14 +122,19 @@ pub async fn run(
 pub async fn serve_on(
     store: Arc<Store>,
     listener: TcpListener,
-    max_input_buffer: usize,
-    password: Option<String>,
-    secret: Option<String>,
+    config: ServerConfig,
     multi_tenant: Option<MultiTenantStore>,
 ) -> anyhow::Result<()> {
-    let password: Option<Arc<str>> = password.map(|p| Arc::from(p.as_str()));
-    let secret: Option<Arc<str>> = secret.map(|s| Arc::from(s.as_str()));
+    let max_input_buffer = config.max_input_buffer;
+    let idle_timeout_secs = config.idle_timeout_secs;
+    let password: Option<Arc<str>> = config.password.map(|p| Arc::from(p.as_str()));
+    let secret: Option<Arc<str>> = config.secret.map(|s| Arc::from(s.as_str()));
     let multi_tenant = multi_tenant.map(Arc::new);
+
+    // Connection cap: excess clients get a Redis-style refusal instead of
+    // an unbounded task + buffers each. `0` disables the cap.
+    let conn_permits = (config.max_connections > 0)
+        .then(|| Arc::new(tokio::sync::Semaphore::new(config.max_connections)));
 
     // Background expiry reaper — runs every second.
     let expiry_store = Arc::clone(&store);
@@ -128,17 +148,35 @@ pub async fn serve_on(
 
     loop {
         match listener.accept().await {
-            Ok((stream, addr)) => {
+            Ok((mut stream, addr)) => {
+                let permit = match &conn_permits {
+                    Some(sem) => match Arc::clone(sem).try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            debug!(peer = %addr, "refusing KV connection: max clients reached");
+                            tokio::spawn(async move {
+                                let _ = stream
+                                    .write_all(b"-ERR max number of clients reached\r\n")
+                                    .await;
+                            });
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 debug!(peer = %addr, "new KV connection");
                 let conn_store = Arc::clone(&store);
                 let conn_password = password.clone();
                 let conn_secret = secret.clone();
                 let conn_mt = multi_tenant.clone();
                 tokio::spawn(async move {
+                    // Hold the connection permit for the task's lifetime.
+                    let _permit = permit;
                     if let Err(e) = handle_connection(
                         stream,
                         &conn_store,
                         max_input_buffer,
+                        idle_timeout_secs,
                         conn_password,
                         conn_secret,
                         conn_mt,
@@ -260,10 +298,12 @@ fn handle_auth(
 }
 
 /// Handle a single RESP connection.
+#[allow(clippy::too_many_lines)]
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     store: &Arc<Store>,
     max_buf: usize,
+    idle_timeout_secs: u64,
     password: Option<Arc<str>>,
     secret: Option<Arc<str>>,
     multi_tenant: Option<Arc<MultiTenantStore>>,
@@ -353,7 +393,21 @@ async fn handle_connection(
             return Ok(());
         }
 
-        let n = stream.read_buf(&mut buf).await?;
+        // Idle timeout: a silent peer must not pin this task (and its
+        // buffers) forever — half-open sockets otherwise linger until TCP
+        // keepalive, hours later.
+        let read = stream.read_buf(&mut buf);
+        let n = if idle_timeout_secs > 0 {
+            match tokio::time::timeout(Duration::from_secs(idle_timeout_secs), read).await {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    debug!("closing idle KV connection");
+                    return Ok(());
+                }
+            }
+        } else {
+            read.await?
+        };
         if n == 0 {
             // Connection closed by client.
             return Ok(());
