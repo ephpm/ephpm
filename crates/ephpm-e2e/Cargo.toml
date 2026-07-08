@@ -14,8 +14,13 @@ publish = false
 
 [dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 urlencoding = "2"
 brotli = "7"
+# Used by the opcache_invalidation test to write invalidation-version keys
+# via the RESP listener (same wire the ephpm CLI uses).
+ephpm-kv = { path = "../ephpm-kv" }
+bytes = "1"
+anyhow = "1"
