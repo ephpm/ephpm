@@ -109,10 +109,17 @@ async fn sync_store_set_routes_through_clustered_store_gossip_tier() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Small keys are gossip-only — the local map must NOT hold a copy,
-    // proving Store::set delegated to the replicator and did not also
-    // do a direct-write.
-    assert!(local.get("issue-143").is_none(), "local map must not double-store small values");
+    // The ORIGIN node must hold a materialized local copy: raw-store
+    // readers (RESP GET, PHP native functions, the OPcache watcher) never
+    // consult the gossip tier, so without local materialization the
+    // origin could not read back its own write (found live on the
+    // two-node kind demo). Gossip is the transport; each node's Store is
+    // the materialized view.
+    assert_eq!(
+        local.get("issue-143").as_deref(),
+        Some(b"v".as_slice()),
+        "origin node must materialize its own small-value write locally"
+    );
 
     // Clear the replicator so its Arc<ClusteredStore> is released; then
     // drop the clustered handle and the local store — leaving `handle`
