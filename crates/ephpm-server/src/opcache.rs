@@ -39,9 +39,16 @@ use ephpm_kv::store::Store;
 pub const KV_VERSION_PREFIX: &str = "opcache:version:";
 
 /// The fallback vhost name for `[server] document_root` when no `sites_dir` is
-/// configured. Matches the value the CLI's `--all` deploy writes when no
-/// specific `--site` is supplied.
+/// configured, or when the CLI runs `ephpm cache reset` without `--site`.
 pub const DEFAULT_VHOST: &str = "_default";
+
+/// Broadcast key written by `ephpm deploy --all`. When present, the watcher
+/// treats it as a "cluster-wide invalidate every vhost" event and folds its
+/// version into each per-vhost check (`max(per_vhost, broadcast)`). Lets a
+/// single-write cover every site without requiring the CLI to enumerate
+/// them — a brand-new site whose per-vhost key has never been written still
+/// picks up the broadcast on its first request.
+pub const BROADCAST_VHOST: &str = "_all";
 
 /// What triggered an invalidation. Used as a Prometheus label so operators can
 /// distinguish `ephpm deploy` (KV) from `ephpm cache reset` (local CLI).
@@ -116,6 +123,14 @@ pub struct OpcacheWatcher {
     enabled: bool,
 }
 
+/// Fetch and parse `opcache:version:<vhost>` from the store. Returns `None`
+/// on miss or malformed value.
+fn read_version(store: &Store, vhost: &str) -> Option<u64> {
+    let raw = store.get(&format!("{KV_VERSION_PREFIX}{vhost}"))?;
+    let s = std::str::from_utf8(&raw).ok()?.trim();
+    s.parse::<u64>().ok()
+}
+
 impl OpcacheWatcher {
     /// Construct a new watcher. `enabled` typically comes from
     /// [`OpcacheConfig::effective_cluster_invalidation`](ephpm_config::OpcacheConfig::effective_cluster_invalidation).
@@ -146,16 +161,14 @@ impl OpcacheWatcher {
             return Decision::NoOp;
         }
 
-        let key = format!("{KV_VERSION_PREFIX}{vhost}");
-        let Some(raw) = store.get(&key) else {
+        // Fold the broadcast key into the per-vhost version so `ephpm deploy
+        // --all` fans out without the CLI having to enumerate vhosts.
+        let per_vhost = read_version(store, vhost).unwrap_or(0);
+        let broadcast = read_version(store, BROADCAST_VHOST).unwrap_or(0);
+        let current_version = per_vhost.max(broadcast);
+        if current_version == 0 {
             return Decision::NoOp;
-        };
-        let Ok(current) = std::str::from_utf8(&raw).map(str::trim) else {
-            return Decision::NoOp;
-        };
-        let Ok(current_version) = current.parse::<u64>() else {
-            return Decision::NoOp;
-        };
+        }
 
         let state = self.state_for(vhost);
         if current_version > state.last_invalidated_version.load(Ordering::Acquire) {
@@ -372,6 +385,43 @@ mod tests {
             Decision::Invalidate { version } => assert_eq!(version, 200),
             Decision::NoOp => panic!("shop's state was contaminated by blog's mark"),
         }
+    }
+
+    #[test]
+    fn broadcast_key_triggers_all_vhosts() {
+        // ephpm deploy --all writes opcache:version:_all. Every vhost that
+        // has never had a per-vhost key still picks up the broadcast on its
+        // first check.
+        let store = store();
+        write_version(&store, BROADCAST_VHOST, 500);
+        let watcher = OpcacheWatcher::new(true);
+
+        for vhost in ["blog", "shop", "docs"] {
+            match watcher.check(&store, vhost) {
+                Decision::Invalidate { version } => assert_eq!(version, 500),
+                Decision::NoOp => panic!("broadcast should trigger {vhost}"),
+            }
+        }
+    }
+
+    #[test]
+    fn broadcast_and_per_vhost_take_max() {
+        let store = store();
+        write_version(&store, BROADCAST_VHOST, 300);
+        write_version(&store, "blog", 500);
+        write_version(&store, "shop", 100);
+        let watcher = OpcacheWatcher::new(true);
+
+        // blog's per-vhost key wins.
+        assert!(matches!(
+            watcher.check(&store, "blog"),
+            Decision::Invalidate { version: 500 }
+        ));
+        // shop's per-vhost key loses to the broadcast.
+        assert!(matches!(
+            watcher.check(&store, "shop"),
+            Decision::Invalidate { version: 300 }
+        ));
     }
 
     #[test]

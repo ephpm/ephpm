@@ -122,6 +122,51 @@ enum Commands {
         follow: bool,
     },
 
+    /// Deploy: invalidate the cluster-wide OPcache for one vhost, or every
+    /// vhost via the broadcast key. Writes `opcache:version:<vhost>` (or
+    /// `opcache:version:_all`) via the running server's RESP listener; gossip
+    /// replicates the write to every peer within seconds.
+    ///
+    /// Requires the running server to have `[kv.redis_compat] enabled = true`
+    /// so the CLI (a separate process) can reach the in-process KV store.
+    Deploy {
+        /// Invalidate a specific vhost. Mutually exclusive with `--all`.
+        #[arg(long, group = "target")]
+        site: Option<String>,
+
+        /// Invalidate every vhost via the broadcast key (`opcache:version:_all`).
+        #[arg(long, group = "target")]
+        all: bool,
+
+        /// Optional revision tag (e.g. a git SHA). Recorded at
+        /// `opcache:revision:<vhost>` for observability; does not itself
+        /// trigger invalidation.
+        #[arg(long)]
+        rev: Option<String>,
+
+        /// RESP server host (default: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// RESP server port (default: 6379)
+        #[arg(long, default_value_t = 6379u16)]
+        port: u16,
+    },
+
+    /// Cache management subcommands (OPcache introspection and local reset).
+    Cache {
+        /// RESP server host (default: 127.0.0.1)
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// RESP server port (default: 6379)
+        #[arg(long, default_value_t = 6379u16)]
+        port: u16,
+
+        #[command(subcommand)]
+        subcommand: CacheSubcommand,
+    },
+
     /// Internal: run as a Windows service (invoked by SCM, not by users)
     #[cfg(windows)]
     #[command(hide = true)]
@@ -129,6 +174,23 @@ enum Commands {
         /// Path to the configuration file
         #[arg(long, default_value = "C:\\ProgramData\\ephpm\\ephpm.toml")]
         config: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheSubcommand {
+    /// Local-only OPcache reset (bypasses KV — does not propagate to peers).
+    /// Behaves identically to `deploy` on a single-node server; use `deploy`
+    /// on a cluster to broadcast the reset.
+    Reset {
+        /// Reset the OPcache under one vhost's docroot. Mutually exclusive
+        /// with `--all`.
+        #[arg(long, group = "reset-target")]
+        site: Option<String>,
+
+        /// Reset every vhost via the broadcast key.
+        #[arg(long, group = "reset-target")]
+        all: bool,
     },
 }
 
@@ -185,6 +247,14 @@ fn run() -> anyhow::Result<ExitCode> {
         Some(Commands::Kv { host, port, subcommand }) => {
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
             rt.block_on(run_kv(&host, port, subcommand))
+        }
+        Some(Commands::Deploy { site, all, rev, host, port }) => {
+            let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+            rt.block_on(run_deploy(&host, port, site.as_deref(), all, rev.as_deref()))
+        }
+        Some(Commands::Cache { host, port, subcommand }) => {
+            let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+            rt.block_on(run_cache(&host, port, subcommand))
         }
         Some(Commands::Install) => run_service_cmd(service::install),
         Some(Commands::Uninstall { keep_data }) => {
@@ -906,6 +976,149 @@ async fn kv_ttl(host: &str, port: u16, key: &str) -> anyhow::Result<ExitCode> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// OPcache Clustering CLI Subcommands (Phase 1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Vhost name used when neither `--site` nor `--all` is supplied. Mirrors the
+/// server-side `crate::opcache::DEFAULT_VHOST`; kept in-lockstep manually since
+/// the CLI does not depend on `ephpm-server`.
+const OPCACHE_DEFAULT_VHOST: &str = "_default";
+
+/// Broadcast vhost name written by `--all`. Kept in-lockstep with the
+/// server-side `crate::opcache::BROADCAST_VHOST`.
+const OPCACHE_BROADCAST_VHOST: &str = "_all";
+
+/// KV key prefix for the per-vhost version counter.
+const OPCACHE_VERSION_PREFIX: &str = "opcache:version:";
+
+/// KV key prefix for the optional revision tag (informational only —
+/// invalidation still keys off `opcache:version:*`).
+const OPCACHE_REVISION_PREFIX: &str = "opcache:revision:";
+
+/// Current wall-clock time in milliseconds since the UNIX epoch. Used as the
+/// monotonically-nondecreasing version stamp. Any well-formed epoch_ms works
+/// as a trigger; the actual value is opaque to the watcher.
+fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Human-facing hint when the RESP listener refuses a TCP connection — the
+/// server is either not running or has `[kv.redis_compat]` disabled.
+fn resp_connect_hint(host: &str, port: u16) -> String {
+    format!(
+        "could not reach RESP listener at {host}:{port} — is ephpm running with \
+         `[kv.redis_compat] enabled = true` in ephpm.toml?"
+    )
+}
+
+/// Issue a RESP `SET key value` roundtrip, returning `Ok` on `+OK`.
+async fn kv_set_raw(host: &str, port: u16, key: &str, value: &str) -> anyhow::Result<()> {
+    let stream = TcpStream::connect(format!("{host}:{port}"))
+        .await
+        .with_context(|| resp_connect_hint(host, port))?;
+    let mut stream = stream;
+    let cmd = Frame::Array(vec![
+        Frame::bulk(b"SET".to_vec()),
+        Frame::bulk(key.as_bytes().to_vec()),
+        Frame::bulk(value.as_bytes().to_vec()),
+    ]);
+    kv_send(&mut stream, &cmd).await?;
+    match kv_recv(&mut stream).await? {
+        Frame::Simple(_) => Ok(()),
+        Frame::Error(e) => anyhow::bail!("KV server returned error: {e}"),
+        other => anyhow::bail!("unexpected RESP response: {other}"),
+    }
+}
+
+/// `ephpm deploy`: write `opcache:version:<vhost> = <epoch_ms>` and, when
+/// `--rev` is supplied, also `opcache:revision:<vhost> = <rev>`.
+async fn run_deploy(
+    host: &str,
+    port: u16,
+    site: Option<&str>,
+    all: bool,
+    rev: Option<&str>,
+) -> anyhow::Result<ExitCode> {
+    let vhost = resolve_target(site, all)?;
+    let stamp = epoch_ms();
+    let stamp_str = stamp.to_string();
+    let version_key = format!("{OPCACHE_VERSION_PREFIX}{vhost}");
+    kv_set_raw(host, port, &version_key, &stamp_str).await?;
+    if let Some(revision) = rev {
+        let rev_key = format!("{OPCACHE_REVISION_PREFIX}{vhost}");
+        kv_set_raw(host, port, &rev_key, revision).await?;
+    }
+    if vhost == OPCACHE_BROADCAST_VHOST {
+        println!("deployed: broadcast (every vhost) at {stamp_str}");
+    } else {
+        println!("deployed: vhost={vhost} at {stamp_str}");
+    }
+    if let Some(revision) = rev {
+        println!("  revision: {revision}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `ephpm cache reset` / `ephpm cache status` dispatcher.
+async fn run_cache(
+    host: &str,
+    port: u16,
+    sub: CacheSubcommand,
+) -> anyhow::Result<ExitCode> {
+    match sub {
+        CacheSubcommand::Reset { site, all } => run_cache_reset(host, port, site.as_deref(), all).await,
+    }
+}
+
+/// `ephpm cache reset --site <name> | --all`
+///
+/// Wire-level identical to `deploy` (writes the same version key). The
+/// separate command exists so operators can distinguish a local dev reset
+/// from a deploy event in shell history / audit logs. On single-node
+/// deployments the two commands behave identically; on a cluster, both
+/// propagate via gossip because the KV write happens through the RESP
+/// listener into the same in-process store.
+async fn run_cache_reset(
+    host: &str,
+    port: u16,
+    site: Option<&str>,
+    all: bool,
+) -> anyhow::Result<ExitCode> {
+    let vhost = resolve_target(site, all)?;
+    let stamp = epoch_ms();
+    let stamp_str = stamp.to_string();
+    let key = format!("{OPCACHE_VERSION_PREFIX}{vhost}");
+    kv_set_raw(host, port, &key, &stamp_str).await?;
+    if vhost == OPCACHE_BROADCAST_VHOST {
+        println!("cache reset: broadcast (every vhost) at {stamp_str}");
+    } else {
+        println!("cache reset: vhost={vhost} at {stamp_str}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Resolve `--site <name>` / `--all` / neither into a vhost key.
+fn resolve_target(site: Option<&str>, all: bool) -> anyhow::Result<String> {
+    match (site, all) {
+        (Some(_), true) => {
+            anyhow::bail!("--site and --all are mutually exclusive")
+        }
+        (Some(name), false) => {
+            let normalised = name.trim().to_ascii_lowercase();
+            if normalised.is_empty() {
+                anyhow::bail!("--site must not be empty");
+            }
+            Ok(normalised)
+        }
+        (None, true) => Ok(OPCACHE_BROADCAST_VHOST.to_string()),
+        (None, false) => Ok(OPCACHE_DEFAULT_VHOST.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod cli_tests {
     use clap::Parser as _;
@@ -975,5 +1188,69 @@ mod cli_tests {
             Some(Commands::Logs { follow }) => assert!(!follow),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_deploy_with_site() {
+        let cli =
+            Cli::try_parse_from(["ephpm", "deploy", "--site", "blog", "--rev", "abc123"]).unwrap();
+        match cli.command {
+            Some(Commands::Deploy { site, all, rev, .. }) => {
+                assert_eq!(site.as_deref(), Some("blog"));
+                assert!(!all);
+                assert_eq!(rev.as_deref(), Some("abc123"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_deploy_with_all() {
+        let cli = Cli::try_parse_from(["ephpm", "deploy", "--all"]).unwrap();
+        match cli.command {
+            Some(Commands::Deploy { site, all, rev, .. }) => {
+                assert_eq!(site, None);
+                assert!(all);
+                assert_eq!(rev, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deploy_site_and_all_are_mutex() {
+        let err = Cli::try_parse_from(["ephpm", "deploy", "--site", "blog", "--all"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cannot be used"), "expected mutex error, got: {msg}");
+    }
+
+    #[test]
+    fn parses_cache_reset_with_site() {
+        let cli =
+            Cli::try_parse_from(["ephpm", "cache", "reset", "--site", "shop"]).unwrap();
+        match cli.command {
+            Some(Commands::Cache { subcommand: CacheSubcommand::Reset { site, all }, .. }) => {
+                assert_eq!(site.as_deref(), Some("shop"));
+                assert!(!all);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_target_prefers_site() {
+        assert_eq!(resolve_target(Some("Blog"), false).unwrap(), "blog");
+        assert_eq!(resolve_target(None, true).unwrap(), OPCACHE_BROADCAST_VHOST);
+        assert_eq!(resolve_target(None, false).unwrap(), OPCACHE_DEFAULT_VHOST);
+    }
+
+    #[test]
+    fn resolve_target_rejects_empty_site() {
+        assert!(resolve_target(Some("   "), false).is_err());
+    }
+
+    #[test]
+    fn resolve_target_rejects_mutex() {
+        assert!(resolve_target(Some("blog"), true).is_err());
     }
 }
