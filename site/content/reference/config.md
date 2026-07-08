@@ -24,7 +24,7 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 |-----|------|---------|-------------|
 | `max_body_size` | u64 (bytes) | `10_485_760` (10 MiB) | Max request body. `0` = unlimited. Exceeding sends 413. |
 | `max_header_size` | usize (bytes) | `8192` | Max total request header size. |
-| `trusted_hosts` | array of strings | `[]` | Allowed `Host` header values. Empty = allow all. Mismatched hosts get 421. |
+| `trusted_hosts` | array of strings | `[]` | Allowed `Host` header values. Empty = allow all. Mismatched hosts get 421. `/_ephpm/health`, `/_ephpm/ready`, and the metrics path are exempt (probes/scrapes address pods by IP). |
 
 ### `[server.timeouts]` (all in seconds)
 

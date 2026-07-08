@@ -2763,6 +2763,42 @@ static void cli_end(size_t (*orig_ub_write)(const char *, size_t))
 }
 
 /*
+ * Register $argv/$argc and script-identity $_SERVER vars for the CLI path.
+ *
+ * The embedded request starts during runtime init — before CLI argument
+ * parsing — so php_hash_environment ran without SG(request_info).argv and
+ * userland saw no $argv at all (php-cli parses args first, so it never
+ * hits this). Symfony Console / artisan silently degrade to the default
+ * command when $argv is missing. Populate request_info, let
+ * php_build_argv install $argv/$argc into the global symbol table and
+ * $_SERVER, then top up the script-identity keys frameworks read.
+ *
+ * SG(request_info).path_translated is deliberately left NULL: SAPI
+ * deactivation efree()s it, so it must never point at C argv memory.
+ */
+static void cli_register_argv(int argc, char **argv, int script_ind, const char *script_name)
+{
+    argv[script_ind] = (char *)script_name;
+    SG(request_info).argc = argc - script_ind;
+    SG(request_info).argv = &argv[script_ind];
+
+    zend_is_auto_global_str("_SERVER", sizeof("_SERVER") - 1);
+    zval *server = &PG(http_globals)[TRACK_VARS_SERVER];
+    php_build_argv(NULL, Z_TYPE_P(server) == IS_ARRAY ? server : NULL);
+
+    if (Z_TYPE_P(server) == IS_ARRAY) {
+        static const char *const keys[] = {
+            "PHP_SELF", "SCRIPT_NAME", "SCRIPT_FILENAME", "PATH_TRANSLATED"
+        };
+        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+            zval tmp;
+            ZVAL_STRING(&tmp, script_name);
+            zend_hash_str_update(Z_ARRVAL_P(server), keys[i], strlen(keys[i]), &tmp);
+        }
+    }
+}
+
+/*
  * Helper: execute code or a file with bailout protection.
  * If `code` is non-NULL, evaluates it via zend_eval_string.
  * If `filename` is non-NULL, executes it via php_execute_script.
@@ -2994,7 +3030,19 @@ int ephpm_cli_main(int argc, char **argv)
     /* Positional argument: if no -f and no -r, first non-option arg is the script */
     if (!script_file && !exec_direct && php_optind < argc && argv[php_optind][0] != '-') {
         script_file = argv[php_optind];
+        php_optind++; /* consume it: what follows are the script's args */
     }
+
+    /* Make script arguments visible to userland ($argv/$argc/$_SERVER).
+     * argv[php_optind - 1] is repurposed as $argv[0] (php-cli does the
+     * same slot trick); "-" stands in for -r code, matching php-cli. */
+    if (script_file || exec_direct) {
+        cli_register_argv(argc, argv, php_optind - 1, script_file ? script_file : "-");
+    }
+
+    /* CLI scripts routinely start with a shebang (artisan, composer, …);
+     * the embed compiler does not skip it by default. */
+    CG(skip_shebang) = 1;
 
     /* Execute based on mode */
     if (mode == 'r' && exec_direct) {
