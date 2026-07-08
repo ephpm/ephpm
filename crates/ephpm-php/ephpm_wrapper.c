@@ -2692,6 +2692,17 @@ static int ephpm_module_startup(sapi_module_struct *sm)
 void ephpm_pre_init(void)
 {
     php_embed_module.startup = ephpm_module_startup;
+
+    /* The SAPI name must be "ephpm" BEFORE php_embed_init():
+     * sapi_startup() struct-copies php_embed_module into sapi_module, and
+     * OPcache's accel_startup() (inside php_module_startup) checks
+     * sapi_module.name against its supported-SAPIs allowlist on PHP < 8.5,
+     * caching the verdict for the process lifetime. Renaming only in
+     * ephpm_install_sapi() (post-init) left OPcache seeing "embed" at
+     * startup — permanently "Startup Failed" even though the SDK
+     * whitelists "ephpm". */
+    php_embed_module.name = "ephpm";
+    php_embed_module.pretty_name = "ePHPm Embedded Server";
 }
 
 /*
