@@ -108,7 +108,50 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             }
         });
 
-        Some(Arc::new(handle))
+        let cluster_handle = Arc::new(handle);
+
+        // Wire the local KV Store through the ClusteredStore replicator so
+        // RESP + PHP native writes routed via `Store::set`/`remove`/`expire`
+        // fan out to cluster peers (small values via chitchat gossip; large
+        // values via the TCP data plane with `replication_factor` copies).
+        //
+        // This resolves the gap where a `SET foo bar` on node A would only
+        // touch node A's local map — issue #143. Without this hook the
+        // clustered KV knobs (`[cluster.kv].replication_factor` /
+        // `.replication_mode`) are silent no-ops from the RESP + PHP lanes,
+        // and cluster-wide features like OPcache invalidation cannot fan
+        // out across nodes.
+        let clustered = ephpm_cluster::ClusteredStore::new(
+            Arc::clone(&kv_store),
+            Arc::clone(&cluster_handle),
+            config.cluster.kv.clone(),
+            if config.cluster.secret.is_empty() {
+                None
+            } else {
+                Some(Arc::new(ephpm_cluster::ClusterCipher::for_kv_data_plane(
+                    &config.cluster.secret,
+                )))
+            },
+        );
+        // Wake the hot-key invalidation watcher (no-op when hot_key_cache
+        // is disabled in config).
+        clustered.init_hot_key_watcher().await;
+
+        let replicator = ephpm_cluster::KvReplicator::new(
+            Arc::clone(&clustered),
+            tokio::runtime::Handle::current(),
+        );
+        kv_store.set_replicator(Some(
+            replicator as Arc<dyn ephpm_kv::store::Replicator>,
+        ));
+        tracing::info!(
+            small_key_threshold = config.cluster.kv.small_key_threshold,
+            replication_factor = config.cluster.kv.replication_factor,
+            replication_mode = %config.cluster.kv.replication_mode,
+            "clustered KV replicator installed on local Store"
+        );
+
+        Some(cluster_handle)
     } else {
         None
     };
