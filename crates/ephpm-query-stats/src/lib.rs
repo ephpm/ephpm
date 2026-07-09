@@ -8,10 +8,16 @@
 pub mod digest;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use metrics::{counter, gauge, histogram};
+
+/// Placeholder value used for the `digest` label on metrics once the
+/// per-digest label series budget is exhausted. Named to line up with
+/// Prometheus community conventions for cardinality overflow bins.
+const DIGEST_OTHER_BUCKET: &str = "__other__";
 
 /// Configuration for query stats tracking.
 #[derive(Debug, Clone)]
@@ -23,14 +29,36 @@ pub struct StatsConfig {
     /// Queries slower than this are logged at WARN level.
     pub slow_query_threshold: Duration,
 
-    /// Maximum number of distinct query digests to track.
-    /// Prevents unbounded memory growth from unique queries.
+    /// Maximum number of distinct query digests to track internally.
+    /// Prevents unbounded memory growth from unique queries. This
+    /// bounds `top_queries()` output and `DigestEntry` storage; it is
+    /// **not** the Prometheus label-series bound (see
+    /// [`Self::metric_label_series_max`]).
     pub max_digests: usize,
+
+    /// Maximum number of distinct `digest` label values exposed to
+    /// Prometheus histograms and counters. Digests seen after this
+    /// budget is exhausted are still tracked internally (up to
+    /// `max_digests`) and returned by `top_queries()`, but their
+    /// Prometheus emissions are folded into the shared
+    /// `digest="__other__"` bucket to bound label-series cardinality.
+    ///
+    /// The default of `1000` keeps a single ePHPm process's
+    /// per-metric cardinality well inside sensible Prometheus scrape
+    /// budgets even under a query template explosion (the sort of
+    /// thing that used to melt Prometheus servers when `max_digests`
+    /// was allowed to be the cardinality bound).
+    pub metric_label_series_max: usize,
 }
 
 impl Default for StatsConfig {
     fn default() -> Self {
-        Self { enabled: true, slow_query_threshold: Duration::from_secs(1), max_digests: 100_000 }
+        Self {
+            enabled: true,
+            slow_query_threshold: Duration::from_secs(1),
+            max_digests: 100_000,
+            metric_label_series_max: 1000,
+        }
     }
 }
 
@@ -86,6 +114,15 @@ impl QueryKind {
 #[derive(Clone)]
 pub struct QueryStats {
     entries: Arc<DashMap<u64, DigestEntry>>,
+    /// Set of digest IDs whose real digest text has been emitted as a
+    /// Prometheus `digest` label. Once `.len() >= metric_label_series_max`,
+    /// subsequent new digests are folded into the shared
+    /// `digest="__other__"` bucket to bound label cardinality.
+    label_digests: Arc<DashSet<u64>>,
+    /// One-shot flag: set the first time a digest falls into the
+    /// `__other__` bucket, so we log a single warning per process
+    /// instead of spamming.
+    label_overflow_warned: Arc<AtomicBool>,
     config: StatsConfig,
 }
 
@@ -93,7 +130,12 @@ impl QueryStats {
     /// Create a new stats collector with the given configuration.
     #[must_use]
     pub fn new(config: StatsConfig) -> Self {
-        Self { entries: Arc::new(DashMap::new()), config }
+        Self {
+            entries: Arc::new(DashMap::new()),
+            label_digests: Arc::new(DashSet::new()),
+            label_overflow_warned: Arc::new(AtomicBool::new(false)),
+            config,
+        }
     }
 
     /// Record a completed query (SELECT, SHOW, etc.).
@@ -131,7 +173,33 @@ impl QueryStats {
     /// Reset all counters.
     pub fn reset(&self) {
         self.entries.clear();
+        self.label_digests.clear();
+        self.label_overflow_warned.store(false, Ordering::Relaxed);
         gauge!("ephpm_query_active_digests").set(0.0);
+    }
+
+    /// Decide whether this digest's normalized SQL is allowed as a
+    /// Prometheus `digest` label value, or whether it should fold into
+    /// the shared `__other__` overflow bucket.
+    fn label_for_digest<'a>(&self, id: u64, normalized: &'a str) -> std::borrow::Cow<'a, str> {
+        // Fast path: already admitted.
+        if self.label_digests.contains(&id) {
+            return truncate_for_label(normalized);
+        }
+        // Try to admit — capped by metric_label_series_max.
+        if self.label_digests.len() < self.config.metric_label_series_max {
+            self.label_digests.insert(id);
+            return truncate_for_label(normalized);
+        }
+        // Budget exhausted: fold into the overflow bucket and warn
+        // exactly once so operators know cardinality is being clipped.
+        if !self.label_overflow_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                cap = self.config.metric_label_series_max,
+                "query stats metric label cardinality cap reached; new digests fold into digest=\"__other__\" for Prometheus emissions (internal tracking is unaffected)"
+            );
+        }
+        std::borrow::Cow::Borrowed(DIGEST_OTHER_BUCKET)
     }
 
     fn record_internal(
@@ -151,15 +219,36 @@ impl QueryStats {
         let now = Instant::now();
         let kind_str = kind.as_str();
 
-        // Prometheus metrics
-        let digest_label = truncate_for_label(&normalized);
-        histogram!("ephpm_query_duration_seconds", "digest" => digest_label.clone(), "kind" => kind_str)
-            .record(duration.as_secs_f64());
+        // Prometheus metrics — bounded label cardinality.
+        //
+        // `label_for_digest` returns a `Cow<'_, str>` and admits at
+        // most `metric_label_series_max` distinct digests as real
+        // label values across the process lifetime; every other digest
+        // folds into a single `digest="__other__"` bucket. This bounds
+        // the label-series cardinality of each histogram/counter
+        // regardless of how many distinct query shapes hit the app.
+        let digest_label = self.label_for_digest(id, &normalized);
+        let digest_label = digest_label.into_owned();
+        histogram!(
+            "ephpm_query_duration_seconds",
+            "digest" => digest_label.clone(),
+            "kind" => kind_str,
+        )
+        .record(duration.as_secs_f64());
         let status = if success { "ok" } else { "error" };
-        counter!("ephpm_query_total", "digest" => digest_label.clone(), "kind" => kind_str, "status" => status)
-            .increment(1);
-        counter!("ephpm_query_rows_total", "digest" => digest_label, "kind" => kind_str)
-            .increment(rows);
+        counter!(
+            "ephpm_query_total",
+            "digest" => digest_label.clone(),
+            "kind" => kind_str,
+            "status" => status,
+        )
+        .increment(1);
+        counter!(
+            "ephpm_query_rows_total",
+            "digest" => digest_label,
+            "kind" => kind_str,
+        )
+        .increment(rows);
 
         // Slow query logging
         if duration > self.config.slow_query_threshold {
@@ -232,13 +321,15 @@ fn classify_query(sql: &str) -> QueryKind {
     }
 }
 
-/// Truncate normalized SQL for use as a Prometheus label.
-/// Caps at 64 chars to control cardinality.
-fn truncate_for_label(normalized: &str) -> String {
+/// Truncate normalized SQL for use as a Prometheus label. Caps at 64
+/// chars to keep label bodies bounded (this is per-label-value length;
+/// the cross-label cardinality is bounded separately by
+/// [`StatsConfig::metric_label_series_max`]).
+fn truncate_for_label(normalized: &str) -> std::borrow::Cow<'_, str> {
     if normalized.len() <= 64 {
-        normalized.to_string()
+        std::borrow::Cow::Borrowed(normalized)
     } else {
-        format!("{}...", &normalized[..61])
+        std::borrow::Cow::Owned(format!("{}...", &normalized[..61]))
     }
 }
 
@@ -356,7 +447,7 @@ mod tests {
     #[test]
     fn truncate_label_short() {
         let s = "SELECT * FROM t";
-        assert_eq!(truncate_for_label(s), s);
+        assert_eq!(truncate_for_label(s).as_ref(), s);
     }
 
     #[test]
@@ -365,6 +456,48 @@ mod tests {
         let label = truncate_for_label(s);
         assert!(label.len() <= 67); // 64 + "..."
         assert!(label.ends_with("..."));
+    }
+
+    #[test]
+    fn label_series_cap_folds_excess_digests_to_other_bucket() {
+        // With a cap of 2, the third and later distinct digests must
+        // fold into the shared __other__ bucket for Prometheus label
+        // emission, but internal digest tracking is unaffected.
+        let stats =
+            QueryStats::new(StatsConfig { metric_label_series_max: 2, ..Default::default() });
+
+        stats.record_query("SELECT * FROM t1 WHERE id = 1", Duration::from_millis(1), true, 0);
+        stats.record_query("SELECT * FROM t2 WHERE id = 1", Duration::from_millis(1), true, 0);
+        stats.record_query("SELECT * FROM t3 WHERE id = 1", Duration::from_millis(1), true, 0);
+        stats.record_query("SELECT * FROM t4 WHERE id = 1", Duration::from_millis(1), true, 0);
+
+        // Only the first two admitted digests get their own label
+        // slot; t3 and t4 fold into __other__.
+        assert_eq!(stats.label_digests.len(), 2);
+
+        // Internal tracking still sees all four digests — nothing is
+        // dropped there.
+        assert_eq!(stats.digest_count(), 4);
+
+        // Reset also clears the label admission set so the cap resets
+        // cleanly.
+        stats.reset();
+        assert_eq!(stats.label_digests.len(), 0);
+    }
+
+    #[test]
+    fn label_series_cap_admits_all_when_under_budget() {
+        let stats =
+            QueryStats::new(StatsConfig { metric_label_series_max: 100, ..Default::default() });
+        for i in 0..5 {
+            stats.record_query(
+                &format!("SELECT * FROM t{i} WHERE id = 1"),
+                Duration::from_millis(1),
+                true,
+                0,
+            );
+        }
+        assert_eq!(stats.label_digests.len(), 5);
     }
 
     #[test]

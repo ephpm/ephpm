@@ -112,12 +112,16 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         None
     };
 
-    // Create shared query stats collector.
+    // Create shared query stats collector. The label-series cap
+    // keeps Prometheus cardinality bounded regardless of query
+    // template explosion (see `StatsConfig::metric_label_series_max`
+    // for details); default via `Default::default()` for now.
     let query_stats = ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig {
         enabled: config.db.analysis.query_stats,
         slow_query_threshold: parse_duration(&config.db.analysis.slow_query_threshold)
             .unwrap_or(Duration::from_secs(1)),
         max_digests: config.db.analysis.digest_store_max_entries,
+        ..Default::default()
     });
 
     let _db_handles = start_db_proxies(&config, cluster_handle.as_ref(), &query_stats).await?;
