@@ -2576,7 +2576,7 @@ mod tests {
         // Retrieve it.
         let stored = store.get(&key);
         assert!(stored.is_some());
-        assert_eq!(stored.unwrap(), b"\"v1\"");
+        assert_eq!(stored.unwrap().as_ref(), b"\"v1\"");
     }
 
     #[test]
@@ -2588,7 +2588,7 @@ mod tests {
         store.set(key.clone(), b"\"v2\"".to_vec(), None);
 
         let stored = store.get(&key);
-        assert_eq!(stored.unwrap(), b"\"v2\"");
+        assert_eq!(stored.unwrap().as_ref(), b"\"v2\"");
     }
 
     #[test]
@@ -2623,7 +2623,7 @@ mod tests {
 
         // Should be retrievable.
         let stored = store.get(&key);
-        assert_eq!(stored.unwrap(), b"\"forever\"");
+        assert_eq!(stored.unwrap().as_ref(), b"\"forever\"");
     }
 
     #[test]
@@ -2635,8 +2635,8 @@ mod tests {
         store.set(get_key.clone(), b"\"get-v1\"".to_vec(), None);
         store.set(head_key.clone(), b"\"head-v1\"".to_vec(), None);
 
-        assert_eq!(store.get(&get_key).unwrap(), b"\"get-v1\"");
-        assert_eq!(store.get(&head_key).unwrap(), b"\"head-v1\"");
+        assert_eq!(store.get(&get_key).unwrap().as_ref(), b"\"get-v1\"");
+        assert_eq!(store.get(&head_key).unwrap().as_ref(), b"\"head-v1\"");
     }
 
     #[test]
@@ -2648,8 +2648,8 @@ mod tests {
         store.set(key_a.clone(), b"\"a-v1\"".to_vec(), None);
         store.set(key_b.clone(), b"\"b-v1\"".to_vec(), None);
 
-        assert_eq!(store.get(&key_a).unwrap(), b"\"a-v1\"");
-        assert_eq!(store.get(&key_b).unwrap(), b"\"b-v1\"");
+        assert_eq!(store.get(&key_a).unwrap().as_ref(), b"\"a-v1\"");
+        assert_eq!(store.get(&key_b).unwrap().as_ref(), b"\"b-v1\"");
     }
 
     #[test]
@@ -2661,8 +2661,8 @@ mod tests {
         store.set(key_no_qs.clone(), b"\"no-qs\"".to_vec(), None);
         store.set(key_with_qs.clone(), b"\"with-qs\"".to_vec(), None);
 
-        assert_eq!(store.get(&key_no_qs).unwrap(), b"\"no-qs\"");
-        assert_eq!(store.get(&key_with_qs).unwrap(), b"\"with-qs\"");
+        assert_eq!(store.get(&key_no_qs).unwrap().as_ref(), b"\"no-qs\"");
+        assert_eq!(store.get(&key_with_qs).unwrap().as_ref(), b"\"with-qs\"");
     }
 
     #[test]

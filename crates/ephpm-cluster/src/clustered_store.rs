@@ -184,8 +184,12 @@ impl ClusteredStore {
         }
 
         // 2. Check local store (we own this key, or it's not clustered).
+        // `Store::get` now returns `Bytes` (Arc-cloned, no memcpy); the
+        // clustered API still returns `Vec<u8>` for callers that hold it
+        // across await points, so we materialise here at the API
+        // boundary. The internal read path stays copy-free.
         if let Some(value) = self.store.get(key) {
-            return Some(value);
+            return Some(value.to_vec());
         }
 
         // 3. Check hot key cache.

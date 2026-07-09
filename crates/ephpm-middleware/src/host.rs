@@ -140,7 +140,14 @@ unsafe extern "C" fn kv_get(
     };
     match store.get(k) {
         Some(v) => {
-            let boxed = v.into_boxed_slice();
+            // `Store::get` now returns `bytes::Bytes` (Arc-shared,
+            // cheap to obtain). The middleware ABI hands PHP a
+            // heap-owned `(ptr, len)` freed by `kv_free` via
+            // `Box::from_raw` — that requires an owned allocation,
+            // so the one memcpy stays at this FFI boundary and only
+            // this boundary (previously the `.clone()` inside
+            // `Store::get` did the same copy on every read too).
+            let boxed: Box<[u8]> = v.as_ref().to_vec().into_boxed_slice();
             let len = boxed.len();
             // SAFETY: out/out_len checked non-null above.
             unsafe {
