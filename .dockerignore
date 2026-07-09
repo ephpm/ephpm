@@ -4,3 +4,5 @@ php-sdk/
 bin/
 docs/
 .github/
+.claude/
+tmp_*/
