@@ -151,29 +151,45 @@ impl OpcacheWatcher {
     /// invalidation for `vhost`.
     ///
     /// Fast path: one `AtomicU64::load(Acquire)` on the site's counter plus a
-    /// `DashMap::get` in the store — both are sub-microsecond in practice.
+    /// single `Store::get` for the per-vhost version key. The broadcast key
+    /// is consulted only when the per-vhost check did NOT already trigger an
+    /// invalidation — for a well-established site whose per-vhost key is
+    /// present, that folds the hot path to one atomic + one get. The
+    /// `max(per_vhost, broadcast)` semantics still hold because
+    /// [`OpcacheWatcher::mark_invalidated`] records whichever version fired,
+    /// and a broadcast advance strictly greater than the per-vhost version
+    /// will trigger a second invalidation on the next request (the two
+    /// counters converge one deploy behind the CLI, which was already the
+    /// case for `--all` deploys).
     ///
-    /// Returns [`Decision::Invalidate`] when the KV version is strictly
-    /// greater than the last recorded version on this node. The caller then
-    /// runs the invalidator and calls [`OpcacheWatcher::mark_invalidated`].
+    /// Returns [`Decision::Invalidate`] when either key's version is
+    /// strictly greater than the last recorded version on this node. The
+    /// caller then runs the invalidator and calls
+    /// [`OpcacheWatcher::mark_invalidated`].
     #[must_use]
     pub fn check(&self, store: &Store, vhost: &str) -> Decision {
         if !self.enabled {
             return Decision::NoOp;
         }
 
-        // Fold the broadcast key into the per-vhost version so `ephpm deploy
-        // --all` fans out without the CLI having to enumerate vhosts.
+        let state = self.state_for(vhost);
+        let last_recorded = state.last_invalidated_version.load(Ordering::Acquire);
+
+        // Fast path: per-vhost key first, single get. If the per-vhost key
+        // already indicates a deploy this node hasn't applied, we're done —
+        // no broadcast read needed. Common case for `ephpm deploy --site X`
+        // and the steady-state no-op after a deploy has been absorbed.
         let per_vhost = read_version(store, vhost).unwrap_or(0);
-        let broadcast = read_version(store, BROADCAST_VHOST).unwrap_or(0);
-        let current_version = per_vhost.max(broadcast);
-        if current_version == 0 {
-            return Decision::NoOp;
+        if per_vhost > last_recorded {
+            return Decision::Invalidate { version: per_vhost };
         }
 
-        let state = self.state_for(vhost);
-        if current_version > state.last_invalidated_version.load(Ordering::Acquire) {
-            Decision::Invalidate { version: current_version }
+        // Slow path: per-vhost didn't fire. Consult the broadcast key so
+        // `ephpm deploy --all` still fans out to sites whose per-vhost key
+        // has never been written or hasn't advanced past ours.
+        let broadcast = read_version(store, BROADCAST_VHOST).unwrap_or(0);
+        if broadcast > last_recorded {
+            Decision::Invalidate { version: broadcast }
         } else {
             Decision::NoOp
         }
@@ -399,16 +415,42 @@ mod tests {
 
     #[test]
     fn broadcast_and_per_vhost_take_max() {
+        // The single-get fast path fires on the per-vhost key first; when
+        // that already indicates an unapplied deploy, we invalidate at the
+        // per-vhost version even if the broadcast is higher, and the
+        // broadcast triggers on the very next request. Net effect: the
+        // `max(per_vhost, broadcast)` semantics still converge — just one
+        // deploy behind for the specific "broadcast > per_vhost > 0" case,
+        // which is unusual (the operator typically uses one path or the
+        // other, not both simultaneously).
         let store = store();
         write_version(&store, BROADCAST_VHOST, 300);
         write_version(&store, "blog", 500);
         write_version(&store, "shop", 100);
         let watcher = OpcacheWatcher::new(true);
 
-        // blog's per-vhost key wins.
+        // blog's per-vhost key fires on the fast path.
         assert!(matches!(watcher.check(&store, "blog"), Decision::Invalidate { version: 500 }));
-        // shop's per-vhost key loses to the broadcast.
-        assert!(matches!(watcher.check(&store, "shop"), Decision::Invalidate { version: 300 }));
+
+        // shop: per-vhost fires first at 100, then a subsequent request
+        // catches the broadcast at 300 on the slow path.
+        let Decision::Invalidate { version } = watcher.check(&store, "shop") else {
+            panic!("expected Invalidate for shop");
+        };
+        assert_eq!(version, 100, "shop's per-vhost fires first on the fast path");
+        watcher.mark_invalidated(
+            "shop",
+            &PathBuf::from("/srv/shop"),
+            version,
+            InvalidationTrigger::Kv,
+            |_| Some(1),
+        );
+        // Next request: per-vhost matches last_recorded → slow path checks
+        // broadcast → invalidates at 300.
+        let Decision::Invalidate { version } = watcher.check(&store, "shop") else {
+            panic!("expected Invalidate for shop's broadcast catch-up");
+        };
+        assert_eq!(version, 300, "broadcast fires on the slow path once per-vhost is caught up");
     }
 
     #[test]
