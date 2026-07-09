@@ -168,7 +168,7 @@ async fn sync_store_set_routes_large_value_to_local_via_set_local() {
         assert!(Instant::now() < deadline, "large-value routed write never landed locally");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert_eq!(local.get("large"), Some(vec![0xAB; 64]));
+    assert_eq!(local.get("large").as_deref(), Some(vec![0xAB; 64].as_slice()));
     // Gossip must not hold the large value.
     assert!(handle.gossip_get("large").await.is_none());
 
