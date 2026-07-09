@@ -53,6 +53,31 @@ async fn ini_overrides_take_effect() {
     );
 }
 
+#[tokio::test]
+async fn opcache_is_enabled_over_http() {
+    let base_url = required_env("EPHPM_URL");
+    let url = format!("{base_url}/opcache_check.php");
+
+    let resp = reqwest::get(&url)
+        .await
+        .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
+    assert_eq!(resp.status().as_u16(), 200, "expected 200 from /opcache_check.php");
+
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .expect("opcache_check.php must return valid JSON");
+
+    assert_eq!(body["ext_loaded"], true, "Zend OPcache must be compiled into the SDK");
+    // OPcache only starts for SAPI names on its allowlist; the "ephpm"
+    // SAPI is whitelisted by the SDK build (spc rc16+). Regression here
+    // means every request recompiles every script.
+    assert_eq!(
+        body["enabled"], true,
+        "OPcache must be ACTIVE over HTTP (opcache_get_status), got: {body}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn worker_concurrency() {
     let base_url = required_env("EPHPM_URL");

@@ -21,25 +21,46 @@
 ARG PHP_SDK_VERSION=8.5.7
 
 # ── Stage 1: base — system deps + Rust toolchain ─────────────────────────────
+#
+# GLIBC FLOOR: the builder stage links the release binary, so its base sets the
+# shipped binary's glibc floor. The almalinux:8 base (glibc 2.28) with
+# gcc-toolset-13 lowers that floor to glibc 2.28 — modern GCC over an old glibc
+# symbol floor (the "manylinux" model). A 2.28-linked binary runs on
+# RHEL8/AlmaLinux8, Ubuntu 20.04+, Debian 10+, Amazon Linux 2023, Fedora 40+.
+# See docs/architecture/dynamic-baseline-design.md.
+#
+# almalinux:8 (not quay.io/pypa/manylinux_2_28_*): same glibc 2.28 floor, but
+# Docker-format so it's pullable on the runner fleet (the manylinux OCI-index
+# format is not). gcc-toolset-13 (not 14): GCC 14 makes implicit-function-
+# declaration a hard error; 13 matches php-sdk's toolchain. Mirrors Dockerfile.gha.
 
-FROM ubuntu:24.04 AS base
+ARG BASE_IMAGE=docker.io/library/almalinux:8
+FROM ${BASE_IMAGE} AS base
 
-ENV DEBIAN_FRONTEND=noninteractive
-
-# System tools needed by the ephpm Rust build:
-#   - libclang-dev: bindgen needs libclang to parse PHP headers.
-#   - build-essential, pkg-config: cc::Build for ephpm_wrapper.c and the
-#     gcc linker driver for the glibc-dynamic (gnu) release binary.
+# System tools needed by the ephpm Rust build (dnf / AlmaLinux 8). Stock
+# almalinux:8 ships almost nothing, so install it all explicitly:
+#   - gcc-toolset-13: cc::Build for ephpm_wrapper.c + the gcc linker driver for
+#     the glibc-dynamic (gnu) release binary. From the AlmaLinux AppStream.
+#   - clang/llvm-libs: bindgen needs libclang (libclang.so at /usr/lib64) to
+#     parse PHP headers.
+#   - make/perl/findutils: build scripts + cc::Build implicit rules.
 #   - curl, git, ca-certificates: rustup install + cargo registry.
-#   - tar: extracting the prebuilt PHP SDK tarball in the next stage.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates curl git pkg-config tar \
-    libclang-dev \
-    && rm -rf /var/lib/apt/lists/*
+#   - tar/xz: extracting the prebuilt PHP SDK tarball in the next stage.
+RUN dnf install -y --allowerasing \
+        gcc-toolset-13 clang llvm-libs \
+        ca-certificates curl findutils git make perl pkgconfig tar xz which \
+    && dnf clean all
+
+# Enable gcc-toolset-13 (GCC 13) on PATH for every subsequent RUN. libclang
+# for bindgen lives at /usr/lib64.
+ENV PATH=/opt/rh/gcc-toolset-13/root/usr/bin:$PATH \
+    LD_LIBRARY_PATH=/opt/rh/gcc-toolset-13/root/usr/lib64:/opt/rh/gcc-toolset-13/root/usr/lib \
+    PKG_CONFIG_PATH=/opt/rh/gcc-toolset-13/root/usr/lib64/pkgconfig:/usr/lib64/pkgconfig \
+    LIBCLANG_PATH=/usr/lib64
 
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
+    PATH=/usr/local/cargo/bin:/opt/rh/gcc-toolset-13/root/usr/bin:$PATH
 
 # The gnu target is the host default — no extra rustup target or cross
 # toolchain needed (the musl-era CC_*/LINKER plumbing is gone with it).
@@ -199,14 +220,15 @@ RUN cp $(find target -name ephpm -type f -path '*/release/*' | head -1) /ephpm &
 # image, not alpine/scratch. ca-certificates covers ACME/TLS and outbound
 # HTTPS.
 #
-# Why debian:13 (trixie, glibc 2.41) and not debian:12 (bookworm, 2.36):
-# the php-sdk gnu tarball's libphp.a is built on a glibc 2.38+ toolchain
-# (__isoc23_strto*, strlcpy/strlcat), and the ubuntu:24.04 builder adds
-# weak GLIBC_2.39 refs (pidfd_spawnp), so the binary's floor is
-# glibc >= 2.39 — bookworm's 2.36 loader refuses to start it
-# ("version `GLIBC_2.39' not found"). Verified empirically during the
-# dynamic-pivot validation.
-FROM debian:13-slim
+# Runtime base = debian:12-slim (bookworm, glibc 2.36). The binary's glibc
+# floor is now 2.28 (php-sdk libphp.a + the ephpm link both build on the
+# almalinux:8 base — glibc 2.28, no __isoc23_* / pidfd_* refs above 2.28),
+# so any runtime with glibc >= 2.28 can host it. bookworm (2.36) comfortably
+# clears that and is smaller/more-stable than trixie. (The old trixie/2.41
+# requirement was an artifact of the 2.39 floor from building on ubuntu:24.04;
+# see docs/architecture/dynamic-baseline-design.md §2.1.) debian:11-slim
+# (bullseye, glibc 2.31) would also work if an even older runtime is wanted.
+FROM debian:12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tini ca-certificates \
