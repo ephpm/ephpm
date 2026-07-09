@@ -483,11 +483,6 @@ impl Router {
         remote_addr: SocketAddr,
         is_tls: bool,
     ) -> Result<(Response<ServerBody>, &'static str), hyper::Error> {
-        // Validate Host header against trusted hosts list.
-        if let Some(resp) = self.check_trusted_host(&req) {
-            return Ok((resp, "error"));
-        }
-
         // Use the percent-decoded path for routing and static-file lookup.
         // hyper hands us the raw URI, so `/test%2Ehtml` would otherwise be
         // looked up as the literal name `test%2Ehtml`. percent_decode_path
@@ -502,8 +497,11 @@ impl Router {
         let query_string = req.uri().query().unwrap_or("").to_string();
         let method = req.method().as_str().to_ascii_uppercase();
 
-        // Internal ePHPm endpoints — served before security checks since
-        // they are not user-supplied content.
+        // Internal ePHPm endpoints — served before the trusted-host check
+        // (and every other security check) since they are not user-supplied
+        // content. Kubernetes probes and Prometheus scrapes address pods by
+        // raw IP, so a `Host`-gated probe would 421 and the pod would never
+        // become ready.
         if method == "GET" {
             if let Some(ref handle) = self.metrics_handle {
                 if uri_path == self.metrics_path {
@@ -520,6 +518,11 @@ impl Router {
             if uri_path == "/_ephpm/ready" {
                 return Ok((self.readiness_check(), "health"));
             }
+        }
+
+        // Validate Host header against trusted hosts list.
+        if let Some(resp) = self.check_trusted_host(&req) {
+            return Ok((resp, "error"));
         }
 
         // ACME HTTP-01 challenge responder — serves challenge tokens from the

@@ -28,7 +28,14 @@ impl TestServer {
 
         let store = Store::new(StoreConfig::default());
         let handle = tokio::spawn(async move {
-            server::serve_on(store, listener, 64 * 1024 * 1024, None, None, None).await.ok();
+            server::serve_on(
+                store,
+                listener,
+                server::ServerConfig { max_input_buffer: 64 * 1024 * 1024, ..Default::default() },
+                None,
+            )
+            .await
+            .ok();
         });
 
         // Give the accept loop a moment to become ready.
@@ -51,6 +58,56 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         self.handle.abort();
     }
+}
+
+// ── Connection limits ────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn connection_cap_refuses_excess_clients() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let store = Store::new(StoreConfig::default());
+    let handle = tokio::spawn(async move {
+        server::serve_on(
+            store,
+            listener,
+            server::ServerConfig { max_connections: 1, ..Default::default() },
+            None,
+        )
+        .await
+        .ok();
+    });
+    tokio::time::sleep(Duration::from_millis(5)).await;
+
+    // First client occupies the only slot.
+    let mut first = tokio::net::TcpStream::connect(&addr).await.expect("first connect");
+    first.write_all(b"*1\r\n$4\r\nPING\r\n").await.expect("write ping");
+    let mut pong = [0u8; 7];
+    first.read_exact(&mut pong).await.expect("read pong");
+    assert_eq!(&pong, b"+PONG\r\n");
+
+    // Second client must be refused with a Redis-style error.
+    let mut second = tokio::net::TcpStream::connect(&addr).await.expect("second connect");
+    let mut refusal = Vec::new();
+    second.read_to_end(&mut refusal).await.expect("read refusal");
+    let text = String::from_utf8_lossy(&refusal);
+    assert!(
+        text.starts_with("-ERR max number of clients reached"),
+        "expected max-clients refusal, got: {text:?}"
+    );
+
+    // Slot frees on disconnect: a third client succeeds afterwards.
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut third = tokio::net::TcpStream::connect(&addr).await.expect("third connect");
+    third.write_all(b"*1\r\n$4\r\nPING\r\n").await.expect("write ping");
+    let mut pong = [0u8; 7];
+    third.read_exact(&mut pong).await.expect("read pong after slot freed");
+    assert_eq!(&pong, b"+PONG\r\n");
+
+    handle.abort();
 }
 
 // ── Connection commands ───────────────────────────────────────────────────────
@@ -641,7 +698,18 @@ impl AuthTestServer {
         let store = Store::new(StoreConfig::default());
         let pw = Some(password.to_string());
         let handle = tokio::spawn(async move {
-            server::serve_on(store, listener, 64 * 1024 * 1024, pw, None, None).await.ok();
+            server::serve_on(
+                store,
+                listener,
+                server::ServerConfig {
+                    max_input_buffer: 64 * 1024 * 1024,
+                    password: pw,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .ok();
         });
 
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -727,7 +795,18 @@ impl HmacTestServer {
         let mt = MultiTenantStore::new(std::sync::Arc::clone(&store), StoreConfig::default());
         let sec = Some(secret.to_string());
         let handle = tokio::spawn(async move {
-            server::serve_on(store, listener, 64 * 1024 * 1024, None, sec, Some(mt)).await.ok();
+            server::serve_on(
+                store,
+                listener,
+                server::ServerConfig {
+                    max_input_buffer: 64 * 1024 * 1024,
+                    secret: sec,
+                    ..Default::default()
+                },
+                Some(mt),
+            )
+            .await
+            .ok();
         });
 
         tokio::time::sleep(Duration::from_millis(5)).await;

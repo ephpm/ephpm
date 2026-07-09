@@ -46,7 +46,7 @@ The embedded PHP interpreter is the **same** runtime that serves HTTP requests. 
 
 ## How it works
 
-`ephpm php` invokes PHP's CLI SAPI directly via FFI. It's not a wrapper around an external `php` binary. The argument list is forwarded as-is, including `-r`, `-d`, file paths, and trailing application arguments.
+`ephpm php` runs the embedded PHP runtime (the `ephpm` SAPI) in CLI mode via FFI. It's not a wrapper around an external `php` binary. The argument list is forwarded as-is, including `-r`, `-d`, file paths, and trailing application arguments — script arguments are registered as `$argv`/`$argc` (and mirrored into `$_SERVER`, with `PHP_SELF`/`SCRIPT_NAME`/`SCRIPT_FILENAME` set to the script path) exactly as the stock `php` CLI does, so Symfony Console, artisan, and WP-CLI see their arguments. Shebang lines (`#!/usr/bin/env php`) are skipped.
 
 ## Windows note
 

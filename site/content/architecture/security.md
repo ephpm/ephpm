@@ -30,7 +30,7 @@ The controls that exist today, in one place:
 - **Per-vhost `open_basedir`** — in multi-site mode, PHP filesystem access is restricted per-request to the site's directory (+ `/tmp`)
 - **`disable_shell_exec`** — `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec` disabled via the php.ini generated at startup (default on in multi-site mode)
 - **`blocked_paths`** — glob patterns matched against the URI path (patterns must start with `/`); matches return 403
-- **`trusted_hosts`** — Host header validation; non-matching hosts get 421
+- **`trusted_hosts`** — Host header validation; non-matching hosts get 421. Internal endpoints (`/_ephpm/health`, `/_ephpm/ready`, the metrics path) are exempt so Kubernetes probes and Prometheus scrapes can address the pod by raw IP
 - **`trusted_proxies`** — CIDR-based proxy trust for `X-Forwarded-For` / `X-Forwarded-Proto` resolution
 - **Hidden-file modes** — dotfile requests handled per `hidden_files` (`deny`=403, `ignore`=404, `allow`)
 - **Percent-decode traversal hardening** — strict `%XX` decoding before routing; encoded `/` and `\`, truncated or non-hex escapes, and invalid UTF-8 are rejected with 400

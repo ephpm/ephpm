@@ -24,8 +24,10 @@ jobs:
         include:
           - arch: x64
             suffix: ""
+            base_image: docker.io/library/almalinux:8
           - arch: arm64
             suffix: "-arm64"
+            base_image: docker.io/library/almalinux:8
     steps:
       - uses: actions/checkout@v4
 
@@ -48,6 +50,13 @@ jobs:
         run: |
           TAG_LATEST="${{ env.IMAGE_REPO }}:latest${{ matrix.suffix }}"
           TAG_DATED="${{ env.IMAGE_REPO }}:${{ env.DATE_TAG }}${{ matrix.suffix }}"
-          docker build -t "$TAG_LATEST" -t "$TAG_DATED" -f docker/Dockerfile.gha .
+          # The almalinux:8 base (glibc 2.28) lowers the shipped release
+          # binary's glibc floor to 2.28. A single multi-arch image serves both
+          # runners — each pulls its own arch's manifest natively — so the same
+          # value is passed for x64 and arm64. (manylinux_2_28 was dropped: its
+          # OCI-index format is unpullable on the runner fleet's Docker.)
+          docker build \
+            --build-arg BASE_IMAGE="${{ matrix.base_image }}" \
+            -t "$TAG_LATEST" -t "$TAG_DATED" -f docker/Dockerfile.gha .
           docker push "$TAG_LATEST"
           docker push "$TAG_DATED"
