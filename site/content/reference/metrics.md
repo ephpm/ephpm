@@ -92,7 +92,11 @@ These appear when `[db.analysis] query_stats = true` (the default).
 
 ## Cardinality notes
 
-`digest`-labeled series are bounded by `[db.analysis] digest_store_max_entries` (default 100,000). If your Prometheus is unhappy with the cardinality, lower that limit or set `query_stats = false`.
+The per-metric `digest` label series is **capped** — by default at 1,000 distinct label values per process (`StatsConfig::metric_label_series_max`). Every additional distinct digest observed after the cap is exhausted has its Prometheus emissions folded into a single shared `digest="__other__"` bucket. Internal tracking (`top_queries()`, the digest table, the slow-query log) is **not** affected by this cap and still exposes the real normalized SQL — only the Prometheus label surface is bounded.
+
+The internal digest table itself is bounded separately by `[db.analysis] digest_store_max_entries` (default 100,000). That knob controls how many distinct digests are held in memory for `top_queries()`; the label-series cap above controls Prometheus cardinality.
+
+The cap is configurable: `[db.analysis] metric_label_series_max` (default `1000`, `0` = unlimited). If your Prometheus is unhappy regardless, set `query_stats = false` to disable the metrics entirely.
 
 The `path`-style labels you might expect on HTTP metrics (`/users/123`) are deliberately *not* present — Prometheus' best-practice is to keep label cardinality bounded, and request paths in PHP apps explode it. Use the slow-query log + tracing for path-level debugging.
 

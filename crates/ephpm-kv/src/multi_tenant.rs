@@ -125,8 +125,8 @@ mod tests {
         alice.set("key".into(), b"alice-data".to_vec(), None);
         bob.set("key".into(), b"bob-data".to_vec(), None);
 
-        assert_eq!(alice.get("key"), Some(b"alice-data".to_vec()));
-        assert_eq!(bob.get("key"), Some(b"bob-data".to_vec()));
+        assert_eq!(alice.get("key").as_deref(), Some(&b"alice-data"[..]));
+        assert_eq!(bob.get("key").as_deref(), Some(&b"bob-data"[..]));
     }
 
     #[test]

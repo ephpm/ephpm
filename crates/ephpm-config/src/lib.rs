@@ -1064,6 +1064,14 @@ pub struct DbAnalysisConfig {
     /// Default: `100000`.
     #[serde(default = "default_digest_max_entries")]
     pub digest_store_max_entries: usize,
+
+    /// Maximum number of distinct `digest` label values emitted to
+    /// Prometheus. Digests beyond the cap fold into `digest="__other__"`,
+    /// bounding metric cardinality. `0` = unlimited.
+    ///
+    /// Default: `1000`.
+    #[serde(default = "default_metric_label_series_max")]
+    pub metric_label_series_max: usize,
 }
 
 impl Default for DbAnalysisConfig {
@@ -1074,8 +1082,13 @@ impl Default for DbAnalysisConfig {
             auto_explain: false,
             auto_explain_target: default_auto_explain_target(),
             digest_store_max_entries: default_digest_max_entries(),
+            metric_label_series_max: default_metric_label_series_max(),
         }
     }
+}
+
+fn default_metric_label_series_max() -> usize {
+    1000
 }
 
 fn default_query_stats_enabled() -> bool {
@@ -3044,5 +3057,68 @@ worker_stream_threshold = 262144
 
         cfg.php.mode = "fpm".to_string();
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── [db.analysis] metric_label_series_max ─────────────────────────
+    //
+    // Wired into StatsConfig::metric_label_series_max at
+    // ephpm-server/src/lib.rs so a change to the config actually bounds
+    // Prometheus digest-label cardinality. Both the default and an
+    // explicit override must parse; 0 = unlimited.
+
+    #[test]
+    fn test_db_analysis_metric_label_series_max_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        // No [db.analysis] block at all — the default must land at 1000.
+        std::fs::write(&file, "").unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.db.analysis.metric_label_series_max, 1000);
+    }
+
+    #[test]
+    fn test_db_analysis_metric_label_series_max_override_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r"
+[db.analysis]
+metric_label_series_max = 250
+",
+        )
+        .unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.db.analysis.metric_label_series_max, 250);
+    }
+
+    #[test]
+    fn test_db_analysis_metric_label_series_max_zero_is_unlimited() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r"
+[db.analysis]
+metric_label_series_max = 0
+",
+        )
+        .unwrap();
+        let config = Config::load(&file).unwrap();
+        // 0 is the documented "unlimited" sentinel — parses as 0 and is
+        // interpreted by the query-stats crate as no cap.
+        assert_eq!(config.db.analysis.metric_label_series_max, 0);
+    }
+
+    #[test]
+    fn test_db_analysis_metric_label_series_max_env_var_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "").unwrap();
+
+        temp_env::with_var("EPHPM_DB__ANALYSIS__METRIC_LABEL_SERIES_MAX", Some("5000"), || {
+            let config = Config::load(&file).unwrap();
+            assert_eq!(config.db.analysis.metric_label_series_max, 5000);
+        });
     }
 }

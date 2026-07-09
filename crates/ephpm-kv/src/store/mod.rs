@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use dashmap::DashMap;
 pub use entry::Entry;
 use tracing::{debug, trace};
@@ -111,8 +112,9 @@ impl Default for StoreConfig {
 /// A hash entry with TTL support.
 #[derive(Debug, Clone)]
 struct HashEntry {
-    /// Field → value map.
-    fields: HashMap<String, Vec<u8>>,
+    /// Field → value map. Values are [`Bytes`] so `hget`/`hgetall`/
+    /// `hvals` return `Arc`-clones instead of copying every byte.
+    fields: HashMap<String, Bytes>,
     /// Absolute expiry time, or `None` for persistent keys.
     expires_at: Option<Instant>,
 }
@@ -176,6 +178,12 @@ pub struct Store {
     /// take the direct local path with zero extra atomics beyond this Option
     /// check.
     replicator: std::sync::RwLock<Option<Arc<dyn Replicator>>>,
+    /// Anchor `Instant` for `Entry::last_accessed`. Storing nanoseconds
+    /// since this anchor as a `u64` lets each `Entry` keep its LRU
+    /// timestamp in an `AtomicU64` — so `get()` can touch it under the
+    /// shard *read* lock instead of taking the write lock via
+    /// `get_mut`. 584 years of headroom in `u64::MAX` nanos.
+    anchor: Instant,
 }
 
 impl std::fmt::Debug for Store {
@@ -203,6 +211,7 @@ impl Store {
             mem_used: AtomicUsize::new(0),
             config,
             replicator: std::sync::RwLock::new(None),
+            anchor: Instant::now(),
         })
     }
 
@@ -233,14 +242,35 @@ impl Store {
         self.replicator.read().ok().and_then(|g| g.clone())
     }
 
+    /// Current time as nanoseconds since the store anchor. Used for
+    /// `AtomicU64`-based LRU timestamps on entries.
+    #[inline]
+    fn now_nanos(&self) -> u64 {
+        // Saturate at u64::MAX rather than panicking on the (unreachable
+        // in practice) overflow after 584 years of uptime.
+        u64::try_from(self.anchor.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
     // ── Read operations ──────────────────────────────────────────
 
     /// Get a value by key. Returns `None` if missing or expired.
     /// Touches the entry for LRU tracking.
     /// Transparently decompresses the value if it was stored compressed.
+    ///
+    /// # Performance
+    ///
+    /// Returns [`Bytes`] rather than `Vec<u8>` so the caller gets a
+    /// cheap `Arc`-clone of the stored value, not a full byte copy. Uses
+    /// the shard **read** lock (`DashMap::get`) rather than the write
+    /// lock (`get_mut`): the LRU touch is an `AtomicU64::store`, so
+    /// concurrent GETs on the same shard no longer serialise.
+    ///
+    /// A compressed value is decoded into a fresh `Bytes` on the read
+    /// path; that decode allocation is unavoidable but happens exactly
+    /// once per read, not twice.
     #[must_use]
-    pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let mut entry = self.data.get_mut(key)?;
+    pub fn get(&self, key: &str) -> Option<Bytes> {
+        let entry = self.data.get(key)?;
         if entry.is_expired() {
             drop(entry);
             // Lazy-expiry cleanup: local only. Replicas expire the key on
@@ -248,10 +278,11 @@ impl Store {
             self.remove_local(key);
             return None;
         }
-        entry.touch();
+        entry.touch(self.now_nanos());
         if entry.compressed {
             decompress_value(&entry.data, self.config.compression.algo)
         } else {
+            // Bytes::clone is an atomic refcount bump — no memcpy.
             Some(entry.data.clone())
         }
     }
@@ -365,17 +396,18 @@ impl Store {
         {
             let compressed_data = compress_value(&value, self.config.compression);
             if compressed_data.len() < value.len() {
-                (compressed_data, true)
+                (Bytes::from(compressed_data), true)
             } else {
-                (value, false)
+                (Bytes::from(value), false)
             }
         } else {
-            (value, false)
+            (Bytes::from(value), false)
         };
 
+        let now = self.now_nanos();
         let entry = match ttl {
-            Some(dur) => Entry::with_expiry(data, key.len(), compressed, Instant::now() + dur),
-            None => Entry::new(data, key.len(), compressed),
+            Some(dur) => Entry::with_expiry(data, key.len(), compressed, Instant::now() + dur, now),
+            None => Entry::new(data, key.len(), compressed, now),
         };
 
         let new_size = entry.mem_size;
@@ -429,17 +461,18 @@ impl Store {
         {
             let compressed_data = compress_value(&value, self.config.compression);
             if compressed_data.len() < value.len() {
-                (compressed_data, true)
+                (Bytes::from(compressed_data), true)
             } else {
-                (value, false)
+                (Bytes::from(value), false)
             }
         } else {
-            (value, false)
+            (Bytes::from(value), false)
         };
 
+        let now = self.now_nanos();
         let new_entry = match ttl {
-            Some(dur) => Entry::with_expiry(data, key.len(), compressed, Instant::now() + dur),
-            None => Entry::new(data, key.len(), compressed),
+            Some(dur) => Entry::with_expiry(data, key.len(), compressed, Instant::now() + dur, now),
+            None => Entry::new(data, key.len(), compressed, now),
         };
         let new_size = new_entry.mem_size;
 
@@ -611,19 +644,19 @@ impl Store {
                 {
                     let compressed_data = compress_value(&new_bytes, self.config.compression);
                     if compressed_data.len() < new_bytes.len() {
-                        (compressed_data, true)
+                        (Bytes::from(compressed_data), true)
                     } else {
-                        (new_bytes, false)
+                        (Bytes::from(new_bytes), false)
                     }
                 } else {
-                    (new_bytes, false)
+                    (Bytes::from(new_bytes), false)
                 };
 
                 let old_mem = entry.mem_size;
                 entry.data = stored_data;
                 entry.compressed = compressed;
-                entry.mem_size = Entry::new(entry.data.clone(), key.len(), compressed).mem_size;
-                entry.touch();
+                entry.mem_size = Entry::new(entry.data.clone(), key.len(), compressed, 0).mem_size;
+                entry.touch(self.now_nanos());
                 let new_mem = entry.mem_size;
                 drop(entry);
                 // Adjust memory tracking.
@@ -652,16 +685,18 @@ impl Store {
                 self.remove_local(key);
                 // Fall through to create.
             } else {
-                // Decompress if needed before appending.
-                let mut data = if entry.compressed {
+                // Decompress if needed before appending. We need a
+                // mutable owned Vec to grow, so decompress-or-copy the
+                // stored bytes into a fresh Vec.
+                let mut data: Vec<u8> = if entry.compressed {
                     decompress_value(&entry.data, self.config.compression.algo)
-                        .unwrap_or_else(|| entry.data.clone())
+                        .map_or_else(|| entry.data.to_vec(), |b| b.to_vec())
                 } else {
-                    entry.data.clone()
+                    entry.data.to_vec()
                 };
 
-                let _added = value.len();
                 data.extend_from_slice(value);
+                let final_len = data.len();
 
                 // Try compression again if configured.
                 let (stored_data, compressed) = if self.config.compression.algo
@@ -670,19 +705,19 @@ impl Store {
                 {
                     let compressed_data = compress_value(&data, self.config.compression);
                     if compressed_data.len() < data.len() {
-                        (compressed_data, true)
+                        (Bytes::from(compressed_data), true)
                     } else {
-                        (data.clone(), false)
+                        (Bytes::from(data), false)
                     }
                 } else {
-                    (data.clone(), false)
+                    (Bytes::from(data), false)
                 };
 
                 let old_mem = entry.mem_size;
                 entry.data = stored_data;
                 entry.compressed = compressed;
-                entry.mem_size = Entry::new(entry.data.clone(), key.len(), compressed).mem_size;
-                entry.touch();
+                entry.mem_size = Entry::new(entry.data.clone(), key.len(), compressed, 0).mem_size;
+                entry.touch(self.now_nanos());
                 let new_mem = entry.mem_size;
                 drop(entry);
                 // Adjust memory tracking.
@@ -691,7 +726,7 @@ impl Store {
                 } else {
                     self.mem_sub(old_mem - new_mem);
                 }
-                return data.len();
+                return final_len;
             }
         }
 
@@ -707,6 +742,7 @@ impl Store {
     /// Returns `true` if the field was newly inserted, `false` if updated.
     pub fn hset(&self, key: &str, field: &str, value: Vec<u8>) -> bool {
         let field_mem = field.len() + value.len() + 64;
+        let value = Bytes::from(value);
         let mut entry = self.hashes.entry(key.to_string()).or_insert_with(|| {
             self.mem_add(64); // base hash overhead
             HashEntry { fields: HashMap::new(), expires_at: None }
@@ -733,8 +769,11 @@ impl Store {
     }
 
     /// Get a field value from a hash.
+    ///
+    /// Returns a cheap [`Bytes`] `Arc`-clone; no memcpy of the field
+    /// value.
     #[must_use]
-    pub fn hget(&self, key: &str, field: &str) -> Option<Vec<u8>> {
+    pub fn hget(&self, key: &str, field: &str) -> Option<Bytes> {
         let entry = self.hashes.get(key)?;
         if entry.is_expired() {
             drop(entry);
@@ -769,8 +808,11 @@ impl Store {
     }
 
     /// Get all field-value pairs from a hash.
+    ///
+    /// Values are cheap [`Bytes`] `Arc`-clones; field names are copied
+    /// (they're `String`s, no `Arc` sharing).
     #[must_use]
-    pub fn hgetall(&self, key: &str) -> Vec<(String, Vec<u8>)> {
+    pub fn hgetall(&self, key: &str) -> Vec<(String, Bytes)> {
         let Some(entry) = self.hashes.get(key) else {
             return Vec::new();
         };
@@ -797,8 +839,10 @@ impl Store {
     }
 
     /// Get all values from a hash.
+    ///
+    /// Returned values are cheap [`Bytes`] `Arc`-clones.
     #[must_use]
-    pub fn hvals(&self, key: &str) -> Vec<Vec<u8>> {
+    pub fn hvals(&self, key: &str) -> Vec<Bytes> {
         let Some(entry) = self.hashes.get(key) else {
             return Vec::new();
         };
@@ -957,19 +1001,24 @@ impl Store {
             }
 
             // Sample keys and find the one with the oldest last_accessed.
-            let mut oldest: Option<(String, Instant)> = None;
+            // last_accessed is nanoseconds since the store anchor, read
+            // via a Relaxed atomic load — LRU sampling is approximate by
+            // design so a lost update just picks a slightly-wrong
+            // victim, never a correctness bug.
+            let mut oldest: Option<(String, u64)> = None;
             let mut count = 0;
 
             for entry in &self.data {
                 if volatile_only && entry.value().expires_at.is_none() {
                     continue;
                 }
+                let ts = entry.value().last_accessed_nanos();
                 match &oldest {
-                    Some((_, ts)) if entry.value().last_accessed < *ts => {
-                        oldest = Some((entry.key().clone(), entry.value().last_accessed));
+                    Some((_, oldest_ts)) if ts < *oldest_ts => {
+                        oldest = Some((entry.key().clone(), ts));
                     }
                     None => {
-                        oldest = Some((entry.key().clone(), entry.value().last_accessed));
+                        oldest = Some((entry.key().clone(), ts));
                     }
                     _ => {}
                 }
@@ -1115,7 +1164,13 @@ fn compress_value(data: &[u8], config: CompressionConfig) -> Vec<u8> {
 
 /// Decompress a value using the specified algorithm.
 /// Returns `None` if decompression fails.
-fn decompress_value(data: &[u8], algo: CompressionAlgo) -> Option<Vec<u8>> {
+///
+/// The decoded value is wrapped in [`Bytes`] at the boundary — the
+/// decoder still needs to write into a growable `Vec<u8>`, but the
+/// caller (typically `Store::get`) receives the same `Bytes` handle it
+/// would have gotten from the fast path, so downstream code doesn't
+/// branch on the compressed/uncompressed shape.
+fn decompress_value(data: &[u8], algo: CompressionAlgo) -> Option<Bytes> {
     use std::io::Read;
     match algo {
         CompressionAlgo::None => unreachable!(),
@@ -1123,16 +1178,20 @@ fn decompress_value(data: &[u8], algo: CompressionAlgo) -> Option<Vec<u8>> {
             let decoder = flate2::read::GzDecoder::new(data);
             let mut output = Vec::new();
             match std::io::BufReader::new(decoder).read_to_end(&mut output) {
-                Ok(_) => Some(output),
+                Ok(_) => Some(Bytes::from(output)),
                 Err(_) => None,
             }
         }
         CompressionAlgo::Brotli => {
             let mut decompressor = brotli::Decompressor::new(data, 4096);
             let mut output = Vec::new();
-            if decompressor.read_to_end(&mut output).is_ok() { Some(output) } else { None }
+            if decompressor.read_to_end(&mut output).is_ok() {
+                Some(Bytes::from(output))
+            } else {
+                None
+            }
         }
-        CompressionAlgo::Zstd => zstd::decode_all(data).ok(),
+        CompressionAlgo::Zstd => zstd::decode_all(data).ok().map(Bytes::from),
     }
 }
 
@@ -1148,7 +1207,7 @@ mod tests {
     fn set_and_get() {
         let s = test_store();
         s.set("hello".into(), b"world".to_vec(), None);
-        assert_eq!(s.get("hello"), Some(b"world".to_vec()));
+        assert_eq!(s.get("hello").as_deref(), Some(&b"world"[..]));
     }
 
     #[test]
@@ -1162,7 +1221,7 @@ mod tests {
         let s = test_store();
         s.set("k".into(), b"v1".to_vec(), None);
         s.set("k".into(), b"v2".to_vec(), None);
-        assert_eq!(s.get("k"), Some(b"v2".to_vec()));
+        assert_eq!(s.get("k").as_deref(), Some(&b"v2"[..]));
     }
 
     #[test]
@@ -1186,7 +1245,7 @@ mod tests {
     fn set_nx_inserts_when_absent() {
         let s = test_store();
         assert!(s.set_nx("k".into(), b"first".to_vec(), None));
-        assert_eq!(s.get("k"), Some(b"first".to_vec()));
+        assert_eq!(s.get("k").as_deref(), Some(&b"first"[..]));
     }
 
     #[test]
@@ -1195,7 +1254,7 @@ mod tests {
         s.set("k".into(), b"original".to_vec(), None);
         assert!(!s.set_nx("k".into(), b"replacement".to_vec(), None));
         // Original value untouched.
-        assert_eq!(s.get("k"), Some(b"original".to_vec()));
+        assert_eq!(s.get("k").as_deref(), Some(&b"original"[..]));
     }
 
     #[test]
@@ -1204,10 +1263,11 @@ mod tests {
         // Plant an already-expired entry by going through the Entry API
         // directly so we don't have to wait real time.
         let expired = Entry::with_expiry(
-            b"stale".to_vec(),
+            Bytes::from_static(b"stale"),
             1,
             false,
             Instant::now() - Duration::from_secs(60),
+            0,
         );
         let mem_size = expired.mem_size;
         s.data.insert("k".into(), expired);
@@ -1215,7 +1275,7 @@ mod tests {
 
         // Expired counts as vacant for SETNX purposes.
         assert!(s.set_nx("k".into(), b"fresh".to_vec(), None));
-        assert_eq!(s.get("k"), Some(b"fresh".to_vec()));
+        assert_eq!(s.get("k").as_deref(), Some(&b"fresh"[..]));
     }
 
     #[test]
@@ -1252,8 +1312,13 @@ mod tests {
     fn incr_by_with_ttl_recreates_after_expiry() {
         let s = test_store();
         // Plant an already-expired counter directly.
-        let expired =
-            Entry::with_expiry(b"5".to_vec(), 3, false, Instant::now() - Duration::from_secs(60));
+        let expired = Entry::with_expiry(
+            Bytes::from_static(b"5"),
+            3,
+            false,
+            Instant::now() - Duration::from_secs(60),
+            0,
+        );
         let mem_size = expired.mem_size;
         s.data.insert("win".into(), expired);
         s.mem_add(mem_size);
@@ -1301,10 +1366,11 @@ mod tests {
         let s = test_store();
         // Set with a TTL that has already passed.
         let entry = Entry::with_expiry(
-            b"v".to_vec(),
+            Bytes::from_static(b"v"),
             1,
             false,
             Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            0,
         );
         s.data.insert("k".into(), entry);
         assert_eq!(s.get("k"), None);
@@ -1342,7 +1408,7 @@ mod tests {
     fn append_new_key() {
         let s = test_store();
         assert_eq!(s.append("k", b"hello"), 5);
-        assert_eq!(s.get("k"), Some(b"hello".to_vec()));
+        assert_eq!(s.get("k").as_deref(), Some(&b"hello"[..]));
     }
 
     #[test]
@@ -1350,7 +1416,7 @@ mod tests {
         let s = test_store();
         s.set("k".into(), b"hello".to_vec(), None);
         assert_eq!(s.append("k", b" world"), 11);
-        assert_eq!(s.get("k"), Some(b"hello world".to_vec()));
+        assert_eq!(s.get("k").as_deref(), Some(&b"hello world"[..]));
     }
 
     #[test]
@@ -1387,10 +1453,11 @@ mod tests {
     fn expire_pass_reaps() {
         let s = test_store();
         let entry = Entry::with_expiry(
-            b"v".to_vec(),
+            Bytes::from_static(b"v"),
             1,
             false,
             Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+            0,
         );
         s.data.insert("expired".into(), entry);
         s.set("alive".into(), b"v".to_vec(), None);
@@ -1423,7 +1490,7 @@ mod tests {
         let data = b"hello world this is a test string that should compress well";
         s.set("key".into(), data.to_vec(), None);
         let retrieved = s.get("key");
-        assert_eq!(retrieved, Some(data.to_vec()));
+        assert_eq!(retrieved.as_deref(), Some(&data[..]));
     }
 
     #[test]
@@ -1440,7 +1507,7 @@ mod tests {
         let data = b"hello world this is another test string for brotli";
         s.set("key".into(), data.to_vec(), None);
         let retrieved = s.get("key");
-        assert_eq!(retrieved, Some(data.to_vec()));
+        assert_eq!(retrieved.as_deref(), Some(&data[..]));
     }
 
     #[test]
@@ -1453,7 +1520,7 @@ mod tests {
         let data = b"hello world this is yet another test string for zstd";
         s.set("key".into(), data.to_vec(), None);
         let retrieved = s.get("key");
-        assert_eq!(retrieved, Some(data.to_vec()));
+        assert_eq!(retrieved.as_deref(), Some(&data[..]));
     }
 
     #[test]
@@ -1476,7 +1543,7 @@ mod tests {
         };
         assert!(!is_compressed);
         let retrieved = s.get("key");
-        assert_eq!(retrieved, Some(data.to_vec()));
+        assert_eq!(retrieved.as_deref(), Some(&data[..]));
     }
 
     #[test]
@@ -1489,7 +1556,7 @@ mod tests {
         assert_eq!(s.incr_by("counter", 1), Ok(1));
         assert_eq!(s.incr_by("counter", 5), Ok(6));
         let retrieved = s.get("counter");
-        assert_eq!(retrieved, Some(b"6".to_vec()));
+        assert_eq!(retrieved.as_deref(), Some(&b"6"[..]));
     }
 
     #[test]
@@ -1502,7 +1569,7 @@ mod tests {
         assert_eq!(s.append("key", b"hello"), 5);
         assert_eq!(s.append("key", b" world"), 11);
         let retrieved = s.get("key");
-        assert_eq!(retrieved, Some(b"hello world".to_vec()));
+        assert_eq!(retrieved.as_deref(), Some(&b"hello world"[..]));
     }
 
     // ── eviction policy parsing ─────────────────────────────────────
@@ -1753,7 +1820,7 @@ mod tests {
     fn hset_and_hget() {
         let s = test_store();
         assert!(s.hset("myhash", "field1", b"value1".to_vec()));
-        assert_eq!(s.hget("myhash", "field1"), Some(b"value1".to_vec()));
+        assert_eq!(s.hget("myhash", "field1").as_deref(), Some(&b"value1"[..]));
     }
 
     #[test]
@@ -1761,7 +1828,7 @@ mod tests {
         let s = test_store();
         assert!(s.hset("myhash", "f", b"v1".to_vec()));
         assert!(!s.hset("myhash", "f", b"v2".to_vec()));
-        assert_eq!(s.hget("myhash", "f"), Some(b"v2".to_vec()));
+        assert_eq!(s.hget("myhash", "f").as_deref(), Some(&b"v2"[..]));
     }
 
     #[test]
@@ -1800,7 +1867,10 @@ mod tests {
         pairs.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(
             pairs,
-            vec![("a".to_string(), b"1".to_vec()), ("b".to_string(), b"2".to_vec()),]
+            vec![
+                ("a".to_string(), Bytes::from_static(b"1")),
+                ("b".to_string(), Bytes::from_static(b"2")),
+            ]
         );
     }
 
@@ -1923,7 +1993,7 @@ mod tests {
 
         // Confirm the store is still usable after flush.
         assert!(s.set("after_flush".into(), b"ok".to_vec(), None));
-        assert_eq!(s.get("after_flush"), Some(b"ok".to_vec()));
+        assert_eq!(s.get("after_flush").as_deref(), Some(&b"ok"[..]));
     }
 
     #[test]
@@ -2068,7 +2138,7 @@ mod tests {
         // contract in the docs — a single Option check, no atomics.
         let s = test_store();
         assert!(s.set("k".into(), b"v".to_vec(), None));
-        assert_eq!(s.get("k"), Some(b"v".to_vec()));
+        assert_eq!(s.get("k").as_deref(), Some(b"v".as_slice()));
         assert!(s.expire("k", Duration::from_secs(60)));
         assert!(s.remove("k"));
         assert_eq!(s.get("k"), None);
@@ -2085,7 +2155,11 @@ mod tests {
 
         s.set_replicator(None);
         s.set("direct".into(), b"v".to_vec(), None);
-        assert_eq!(s.get("direct"), Some(b"v".to_vec()), "unhooked set must write locally");
+        assert_eq!(
+            s.get("direct").as_deref(),
+            Some(b"v".as_slice()),
+            "unhooked set must write locally"
+        );
         assert_eq!(rep.sets.lock().unwrap().len(), 1, "replicator must not see the direct write");
     }
 }

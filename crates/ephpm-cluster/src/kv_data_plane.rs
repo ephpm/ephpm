@@ -474,7 +474,7 @@ mod tests {
 
         // Verify it landed in the local store.
         let value = store.get("remote_key");
-        assert_eq!(value, Some(b"remote_val".to_vec()));
+        assert_eq!(value.as_deref(), Some(&b"remote_val"[..]));
     }
 
     #[tokio::test]
@@ -546,7 +546,7 @@ mod tests {
 
         let ok = store_remote(addr, "enc_key", b"enc_val", Some(&cipher)).await.unwrap();
         assert!(ok);
-        assert_eq!(store.get("enc_key"), Some(b"enc_val".to_vec()));
+        assert_eq!(store.get("enc_key").as_deref(), Some(&b"enc_val"[..]));
 
         let result = fetch_remote(addr, "enc_key", Some(&cipher)).await.unwrap();
         assert_eq!(result, Some(b"enc_val".to_vec()));

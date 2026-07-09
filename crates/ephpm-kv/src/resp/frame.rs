@@ -5,9 +5,16 @@
 
 use std::fmt;
 
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 
 /// A single RESP protocol frame.
+///
+/// `Bulk` holds a [`Bytes`] rather than a `Vec<u8>` so it can be
+/// constructed directly from the KV store's stored value (an
+/// `Arc`-shared `Bytes`) without a second byte-copy on the read path.
+/// `Bytes` implements zero-copy conversions from `Vec<u8>`,
+/// `&'static [u8]`, and `BytesMut::split_to` output — the parser
+/// converts its input buffer to a `Bytes` in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     /// `+OK\r\n` — status reply.
@@ -17,7 +24,7 @@ pub enum Frame {
     /// `:1000\r\n` — 64-bit signed integer.
     Integer(i64),
     /// `$6\r\nfoobar\r\n` — binary-safe string.
-    Bulk(Vec<u8>),
+    Bulk(Bytes),
     /// `*2\r\n...` — ordered collection of frames.
     Array(Vec<Frame>),
     /// `$-1\r\n` or `*-1\r\n` — null value.
@@ -37,9 +44,14 @@ impl Frame {
         Self::Error(msg.into())
     }
 
-    /// Convenience constructor for a bulk string from `&str`.
+    /// Convenience constructor for a bulk string.
+    ///
+    /// Accepts anything convertible to [`Bytes`] — `Vec<u8>`,
+    /// `&'static [u8]`, `&'static str`, `String`, and `Bytes` itself.
+    /// A `Vec<u8>` or `String` moves into `Bytes` without copying; a
+    /// `Bytes` is `Arc`-cloned.
     #[must_use]
-    pub fn bulk(data: impl Into<Vec<u8>>) -> Self {
+    pub fn bulk(data: impl Into<Bytes>) -> Self {
         Self::Bulk(data.into())
     }
 

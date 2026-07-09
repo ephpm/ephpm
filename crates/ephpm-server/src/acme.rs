@@ -281,7 +281,9 @@ pub fn store_acme_challenge(store: &Store, token: &str, authorization: &[u8]) {
 #[must_use]
 pub fn get_acme_challenge(store: &Store, token: &str) -> Option<Vec<u8>> {
     let key = format!("{ACME_CHALLENGE_PREFIX}{token}");
-    store.get(&key)
+    // Materialise to Vec at the public API boundary — the challenge
+    // response gets serialised into the HTTP-01 response body anyway.
+    store.get(&key).map(|b| b.to_vec())
 }
 
 /// Store an issued certificate in the KV store for distribution.
@@ -305,7 +307,7 @@ pub fn get_acme_cert(store: &Store, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> 
     let key_key = format!("{ACME_CERT_PREFIX}{domain}:key");
     let cert = store.get(&cert_key)?;
     let key = store.get(&key_key)?;
-    Some((cert, key))
+    Some((cert.to_vec(), key.to_vec()))
 }
 
 // ── Cache layer for cluster-wide cert + account distribution ─────────────────
@@ -396,7 +398,7 @@ impl CertCache for KvCache {
         match self.store.get(&key) {
             Some(bytes) => {
                 tracing::debug!(key = %key, len = bytes.len(), "ACME cert loaded from KV cache");
-                Ok(Some(bytes))
+                Ok(Some(bytes.to_vec()))
             }
             None => {
                 tracing::debug!(key = %key, "ACME cert not in KV cache");
@@ -442,7 +444,7 @@ impl AccountCache for KvCache {
         match self.store.get(&key) {
             Some(bytes) => {
                 tracing::debug!(key = %key, "ACME account loaded from KV cache");
-                Ok(Some(bytes))
+                Ok(Some(bytes.to_vec()))
             }
             None => {
                 tracing::debug!(key = %key, "ACME account not in KV cache");

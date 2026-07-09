@@ -252,13 +252,16 @@ Registered once at startup via the `metrics` crate (same pattern as existing ePH
 | `ephpm_query_active_digests` | Gauge | | Number of distinct digests being tracked |
 
 Labels:
-- `digest` -- first 16 chars of the normalized SQL (truncated for cardinality control)
+- `digest` -- normalized SQL, truncated to 64 chars for label body safety
 - `kind` -- `query` or `mutation` (determined by first keyword: SELECT vs INSERT/UPDATE/DELETE)
 - `status` -- `ok` or `error`
 
-**Cardinality control**: The `digest` label uses a truncated prefix, not the full SQL or hash. This caps Prometheus label cardinality at `max_digests`. Applications generating millions of unique queries won't explode the metrics store.
+**Cardinality control** happens on two axes:
 
-Alternative: use the digest hash as label instead of truncated SQL. More compact but harder to read in dashboards. Make this configurable.
+1. Per-label-value length: `digest` is truncated to 64 characters so any single label body stays small.
+2. Cross-label-value cardinality: the number of distinct `digest` label values exposed to Prometheus is capped by `StatsConfig::metric_label_series_max` (default 1,000). Digests observed after the cap fold into a single shared `digest="__other__"` bucket for Prometheus emissions. Internal digest tracking is separate and bounded by `max_digests` (default 100,000).
+
+This ensures Prometheus never sees more than ~1,000 series per `digest`-labeled metric per process, regardless of query template explosion — a class of failure the pre-cap implementation was vulnerable to.
 
 ### LiteWire Integration: TrackedBackend
 

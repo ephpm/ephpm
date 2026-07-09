@@ -478,7 +478,7 @@ mod tests {
         // Safety: key and val are valid for the duration of the call.
         let ok = unsafe { kv_set(key.as_ptr(), val.as_ptr().cast(), val.len(), 0) };
         assert_eq!(ok, 1);
-        assert_eq!(store.get("bridge_set_k"), Some(b"value".to_vec()));
+        assert_eq!(store.get("bridge_set_k").as_deref(), Some(&b"value"[..]));
     }
 
     #[test]
@@ -513,7 +513,7 @@ mod tests {
         let val: &[u8] = &[0x00, 0x01, 0xFF, 0xFE];
         // Safety: key is a valid C string; val is valid for val.len() bytes.
         unsafe { kv_set(key.as_ptr(), val.as_ptr().cast(), val.len(), 0) };
-        assert_eq!(store.get("bridge_set_bin"), Some(val.to_vec()));
+        assert_eq!(store.get("bridge_set_bin").as_deref(), Some(&val[..]));
     }
 
     // ── kv_del ──────────────────────────────────────────────────────────
@@ -573,7 +573,7 @@ mod tests {
         let ok = unsafe { kv_incr_by(key.as_ptr(), 1, &mut result) };
         assert_eq!(ok, 1);
         assert_eq!(result, 1);
-        assert_eq!(store.get("bridge_incr_new"), Some(b"1".to_vec()));
+        assert_eq!(store.get("bridge_incr_new").as_deref(), Some(&b"1"[..]));
     }
 
     #[test]
@@ -720,8 +720,8 @@ mod tests {
         assert_eq!(site.len(), 0, "site store should be empty");
         assert_eq!(site.mem_used(), 0, "site mem counter should be reset");
         assert_eq!(
-            global.get("bridge_flush_global"),
-            Some(b"keep_me".to_vec()),
+            global.get("bridge_flush_global").as_deref(),
+            Some(&b"keep_me"[..]),
             "global store must be untouched when a site store is active"
         );
 
