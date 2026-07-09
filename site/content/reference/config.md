@@ -210,6 +210,7 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | `auto_explain` | bool | `false` | **Not yet implemented** — parsed but unused. |
 | `auto_explain_target` | string | `"stderr"` | **Not yet implemented**. |
 | `digest_store_max_entries` | usize | `100_000` | Max in-memory query digests; oldest evicted on overflow. |
+| `metric_label_series_max` | usize | `1000` | Max distinct `digest` label values emitted to Prometheus; overflow folds into `digest="__other__"`. `0` = unlimited. |
 
 ## `[kv]`
 

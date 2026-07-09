@@ -93,9 +93,14 @@ ephpm_query_active_digests
 
 ## Cardinality is bounded
 
-Digests are normalized — literals become `?`, so the cardinality is roughly the number of *distinct query shapes* in your app, not the number of *executions*. ePHPm caps this at `digest_store_max_entries` (default 100,000) and evicts oldest entries on overflow.
+Digests are normalized — literals become `?`, so the *shape* cardinality is roughly the number of distinct query shapes in your app, not the number of executions.
 
-If your cardinality is climbing unexpectedly, look for queries with non-literal pieces that shouldn't vary: dynamic table names, raw SQL fragments built per request, etc.
+Two bounds apply on top of that:
+
+1. **Prometheus label-series cap** — at most 1,000 distinct `digest` label values are exposed per process (default). Additional digests fold their Prometheus emissions into a single shared `digest="__other__"` bucket. This means your Prometheus never sees more than ~1,000 series per `digest`-labeled metric no matter how many query shapes hit the app.
+2. **Internal digest table** — capped at `digest_store_max_entries` (default 100,000), which bounds `top_queries()` output and memory use.
+
+If you observe `digest="__other__"` traffic in Prometheus you know the cap is being hit; the real per-digest breakdown is still available via the API / logs. If your cardinality is climbing unexpectedly, look for queries with non-literal pieces that shouldn't vary: dynamic table names, raw SQL fragments built per request, etc.
 
 ## Grafana
 

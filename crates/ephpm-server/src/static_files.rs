@@ -16,11 +16,17 @@ use crate::body::{self, ServerBody};
 /// The router has already verified the file exists and resolved it via
 /// `fallback`. We still validate path traversal for defense in depth.
 ///
+/// `canonical_root` must be the document root already passed through
+/// `Path::canonicalize()` — the router caches that per site (the root is
+/// constant for the process lifetime), saving a syscall on every static
+/// hit. The per-request file path is still canonicalized here: that is
+/// the traversal/symlink check and doubles as the existence probe.
+///
 /// When `etag` is enabled, computes a hash-based `ETag` for the content.
 /// If `if_none_match` contains a matching `ETag`, returns 304 Not Modified.
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_file(
-    document_root: &Path,
+    canonical_root: &Path,
     file_path: &Path,
     accepts_gzip: bool,
     accepts_br: bool,
@@ -31,13 +37,10 @@ pub async fn serve_file(
     file_cache: Option<&crate::file_cache::FileCache>,
 ) -> Response<ServerBody> {
     // Security: ensure the resolved path is within the document root
-    let Ok(canonical_root) = document_root.canonicalize() else {
-        return not_found();
-    };
     let Ok(canonical_file) = file_path.canonicalize() else {
         return not_found();
     };
-    if !canonical_file.starts_with(&canonical_root) {
+    if !canonical_file.starts_with(canonical_root) {
         tracing::warn!(
             path = %file_path.display(),
             "path traversal attempt blocked"
@@ -347,9 +350,24 @@ mod tests {
     }
 
     /// Helper: serve a file using `serve_file` with default settings.
+    ///
+    /// Mirrors the router's contract: the document root is canonicalized
+    /// once by the caller (the router caches it), not inside `serve_file`.
     async fn serve_test(docroot: &Path, filename: &str) -> Response<ServerBody> {
+        let canonical_root = docroot.canonicalize().expect("canonicalize test docroot");
         let file_path = docroot.join(filename);
-        serve_file(docroot, &file_path, false, false, "", no_compression(), false, None, None).await
+        serve_file(
+            &canonical_root,
+            &file_path,
+            false,
+            false,
+            "",
+            no_compression(),
+            false,
+            None,
+            None,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -410,10 +428,20 @@ mod tests {
         // Create a file outside docroot
         fs::write(parent.path().join("secret.txt"), "secret").unwrap();
 
+        let canonical_root = docroot.canonicalize().unwrap();
         let file_path = docroot.join("..").join("secret.txt");
-        let resp =
-            serve_file(&docroot, &file_path, false, false, "", no_compression(), false, None, None)
-                .await;
+        let resp = serve_file(
+            &canonical_root,
+            &file_path,
+            false,
+            false,
+            "",
+            no_compression(),
+            false,
+            None,
+            None,
+        )
+        .await;
         // Should be 403 (path resolves outside docroot) or 404 (canonicalize fails)
         let status = resp.status();
         assert!(
