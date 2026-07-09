@@ -47,7 +47,14 @@ impl TestServer {
 
         let store = Store::new(config);
         let handle = tokio::spawn(async move {
-            server::serve_on(store, listener, 64 * 1024 * 1024, None, None, None).await.ok();
+            server::serve_on(
+                store,
+                listener,
+                server::ServerConfig { max_input_buffer: 64 * 1024 * 1024, ..Default::default() },
+                None,
+            )
+            .await
+            .ok();
         });
 
         // Give the accept loop a moment to become ready.
@@ -88,7 +95,18 @@ impl HmacTestServer {
         let mt = MultiTenantStore::new(Arc::clone(&store), StoreConfig::default());
         let sec = Some(secret.to_string());
         let handle = tokio::spawn(async move {
-            server::serve_on(store, listener, 64 * 1024 * 1024, None, sec, Some(mt)).await.ok();
+            server::serve_on(
+                store,
+                listener,
+                server::ServerConfig {
+                    max_input_buffer: 64 * 1024 * 1024,
+                    secret: sec,
+                    ..Default::default()
+                },
+                Some(mt),
+            )
+            .await
+            .ok();
         });
 
         tokio::time::sleep(Duration::from_millis(10)).await;

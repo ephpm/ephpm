@@ -847,6 +847,14 @@ fn start_kv_service(
     }
 
     // Start RESP server if enabled
+    if config.kv.redis_compat.socket.is_some() {
+        tracing::warn!(
+            "[kv.redis_compat].socket is set but Unix-socket listening is not yet \
+             implemented — the RESP listener is TCP-only (listening on {}); remove \
+             the socket key or point clients at the TCP address",
+            config.kv.redis_compat.listen
+        );
+    }
     let listen = config.kv.redis_compat.listen.clone();
     let password = config.kv.redis_compat.password.clone();
     let secret = config.kv.secret.clone();
@@ -854,7 +862,9 @@ fn start_kv_service(
         listen,
         password,
         secret: secret.clone(),
-        ..Default::default()
+        max_connections: config.kv.redis_compat.max_connections,
+        max_input_buffer: config.kv.redis_compat.max_input_buffer,
+        idle_timeout_secs: config.kv.redis_compat.idle_timeout_secs,
     };
 
     // Multi-tenant mode with the RESP listener enabled but no master secret:
