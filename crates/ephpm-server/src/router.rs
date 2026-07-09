@@ -10,7 +10,7 @@ use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[allow(unused_imports)]
 use ::metrics::{counter, gauge, histogram};
@@ -111,7 +111,21 @@ pub struct Router {
     /// Native middleware chain (`[[middleware]]`), evaluated on the PHP-bound
     /// path before the request body is read. `None` = no middleware mounted.
     middleware_chain: Option<Arc<crate::middleware::MiddlewareChain>>,
+    /// Canonicalized document roots, keyed by the as-configured root path,
+    /// with the instant they were resolved. Caching removes a
+    /// `canonicalize()` syscall from every static-file hit (issue #132),
+    /// but entries are revalidated after a short TTL: `canonicalize()`
+    /// resolves symlinks, and atomic-deploy layouts flip a symlinked
+    /// docroot to a new release directory — an immortal cache would pin
+    /// the OLD release forever.
+    canonical_roots: dashmap::DashMap<PathBuf, (PathBuf, Instant)>,
 }
+
+/// How long a cached canonicalized docroot stays valid before the next
+/// request re-resolves it. Long enough to amortize the syscall away at any
+/// realistic request rate, short enough that a symlink-flip deploy is
+/// picked up almost immediately.
+const CANONICAL_ROOT_TTL: Duration = Duration::from_secs(2);
 
 /// Scan `sites_dir` for virtual host subdirectories.
 ///
@@ -273,7 +287,27 @@ impl Router {
             worker_pool,
             worker_stream_threshold: config.php.worker_stream_threshold,
             middleware_chain: None,
+            canonical_roots: dashmap::DashMap::new(),
         }
+    }
+
+    /// Canonicalized form of a site's document root, cached with a short
+    /// TTL ([`CANONICAL_ROOT_TTL`]). The TTL matters: `canonicalize()`
+    /// resolves symlinks, and atomic-deploy layouts (docroot → symlink →
+    /// `releases/N`) flip that symlink on deploy — a permanent cache would
+    /// keep serving the old release. Returns `None` when the root does not
+    /// exist — the caller treats that as 404, matching the previous
+    /// per-request `canonicalize()` behavior.
+    fn canonical_root(&self, root: &Path) -> Option<PathBuf> {
+        if let Some(hit) = self.canonical_roots.get(root) {
+            let (canon, resolved_at) = hit.value();
+            if resolved_at.elapsed() < CANONICAL_ROOT_TTL {
+                return Some(canon.clone());
+            }
+        }
+        let canon = root.canonicalize().ok()?;
+        self.canonical_roots.insert(root.to_path_buf(), (canon.clone(), Instant::now()));
+        Some(canon)
     }
 
     /// Attach the native middleware chain loaded in `serve()` at startup.
@@ -602,10 +636,10 @@ impl Router {
                     } else {
                         (error_response(StatusCode::FORBIDDEN, "403 Forbidden"), "error")
                     }
-                } else {
+                } else if let Some(canonical_root) = self.canonical_root(&site_root) {
                     (
                         static_files::serve_file(
-                            &site_root,
+                            &canonical_root,
                             &fs_path,
                             accepts_gzip,
                             accepts_br,
@@ -618,6 +652,8 @@ impl Router {
                         .await,
                         "static",
                     )
+                } else {
+                    (error_response(StatusCode::NOT_FOUND, "404 Not Found"), "error")
                 }
             }
             Resolved::Status(code) => {
@@ -1725,8 +1761,18 @@ fn is_php_file(path: &Path) -> bool {
 }
 
 /// Expand `$uri` and `$query_string` variables in a `fallback` entry.
-fn expand_variables(entry: &str, uri_path: &str, query_string: &str) -> String {
-    entry.replace("$uri", uri_path).replace("$query_string", query_string)
+///
+/// Borrows when the entry has no `$` placeholders — the common case for
+/// literal fallback entries, probed on every request.
+fn expand_variables<'a>(
+    entry: &'a str,
+    uri_path: &str,
+    query_string: &str,
+) -> std::borrow::Cow<'a, str> {
+    if !entry.contains('$') {
+        return std::borrow::Cow::Borrowed(entry);
+    }
+    std::borrow::Cow::Owned(entry.replace("$uri", uri_path).replace("$query_string", query_string))
 }
 
 /// Split an expanded path into the path component and optional query string.
