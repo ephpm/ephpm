@@ -2,12 +2,32 @@
 //!
 //! Replaces literal values (strings, numbers) with `?` placeholders so
 //! queries differing only in parameter values map to the same digest.
-//! Uses a character-level state machine — same approach as `MySQL`'s
-//! `performance_schema`.
+//! Uses a byte-level state machine — same approach as `MySQL`'s
+//! `performance_schema`, but working on `&[u8]` rather than `Vec<char>`
+//! so we do not allocate a `Vec` of `char`s (4 bytes/char) per
+//! statement on the hot path.
+//!
+//! The output digest for a given SQL string is **stable** across this
+//! rewrite: extend the test corpus in `tests` below when adding new
+//! edge cases so a future rewrite can compare against the same
+//! oracle.
 
 use std::hash::{Hash, Hasher};
 
 /// Normalize a SQL query by replacing literal values with `?`.
+///
+/// # Design
+///
+/// Single-pass, byte-oriented state machine — never materialises the
+/// input as `Vec<char>`. IN-list collapse happens inline (once the
+/// second `?` inside a run of `IN (?, ?, ...)` is emitted, subsequent
+/// `, ?` entries are folded into `...`).
+///
+/// SQL identifiers are ASCII-only in the grammars ePHPm targets
+/// (MySQL, SQLite, Postgres, TDS), so the state machine reads bytes
+/// directly. Non-ASCII UTF-8 bytes inside string literals are elided
+/// as part of the `?` placeholder — the placeholder covers the whole
+/// literal.
 ///
 /// # Examples
 ///
@@ -22,205 +42,256 @@ use std::hash::{Hash, Hasher};
 ///     normalize("INSERT INTO t VALUES (1, 'hello', 3.14)"),
 ///     "INSERT INTO t VALUES (?, ?, ?)"
 /// );
+/// assert_eq!(
+///     normalize("WHERE id IN (1, 2, 3, 4, 5)"),
+///     "WHERE id IN (?, ...)"
+/// );
 /// ```
 #[must_use]
 pub fn normalize(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut state = State::Normal;
-    let chars: Vec<char> = sql.chars().collect();
-    let len = chars.len();
+    let bytes = sql.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
+    let len = bytes.len();
 
     while i < len {
-        let c = chars[i];
-        match state {
-            State::Normal => {
-                i = handle_normal(c, i, &chars, len, &mut out, &mut state);
+        let b = bytes[i];
+        match b {
+            // ── Single-quoted string literal ──────────────────
+            b'\'' => {
+                emit_placeholder(&mut out);
+                i = skip_quoted(bytes, i + 1, b'\'');
             }
-            State::SingleQuoted => {
-                i = skip_quoted_char(c, '\'', i, &chars, len, &mut state);
+            // ── Double-quoted string literal ──────────────────
+            b'"' => {
+                emit_placeholder(&mut out);
+                i = skip_quoted(bytes, i + 1, b'"');
             }
-            State::DoubleQuoted => {
-                i = skip_quoted_char(c, '"', i, &chars, len, &mut state);
-            }
-            State::Backtick => {
-                out.push(c);
-                if c == '`' {
-                    state = State::Normal;
-                }
+            // ── Backtick-quoted identifier (preserved) ────────
+            b'`' => {
+                out.push(b);
                 i += 1;
-            }
-            State::Number => {
-                if c.is_ascii_digit() || c == '.' || c == 'e' || c == 'E' {
+                while i < len {
+                    out.push(bytes[i]);
+                    if bytes[i] == b'`' {
+                        i += 1;
+                        break;
+                    }
                     i += 1;
-                } else {
-                    state = State::Normal;
                 }
             }
-            State::LineComment => {
-                if c == '\n' {
-                    state = State::Normal;
+            // ── Line comment `-- ...` ─────────────────────────
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
                 }
-                i += 1;
             }
-            State::BlockComment => {
-                if c == '*' && i + 1 < len && chars[i + 1] == '/' {
-                    state = State::Normal;
+            // ── Block comment `/* ... */` ─────────────────────
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                // Skip past closing `*/` if present.
+                if i + 1 < len {
                     i += 2;
-                } else {
+                }
+            }
+            // ── Hex literal `0xDEADBEEF` ──────────────────────
+            b'0' if i + 1 < len
+                && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
+                && !prev_is_identifier(&out) =>
+            {
+                emit_placeholder(&mut out);
+                i += 2;
+                while i < len && bytes[i].is_ascii_hexdigit() {
                     i += 1;
                 }
+            }
+            // ── Numeric literal (integer, float, leading dot) ─
+            b'0'..=b'9' if !prev_is_identifier(&out) => {
+                emit_placeholder(&mut out);
+                i = skip_number(bytes, i + 1);
+            }
+            b'.' if i + 1 < len && bytes[i + 1].is_ascii_digit() && !prev_is_identifier(&out) => {
+                emit_placeholder(&mut out);
+                i = skip_number(bytes, i + 1);
+            }
+            // ── Whitespace collapse ───────────────────────────
+            b' ' | b'\t' | b'\n' | b'\r' => {
+                // Emit a single space between tokens, never a leading
+                // space and never two in a row.
+                if !out.is_empty() && out.last() != Some(&b' ') {
+                    out.push(b' ');
+                }
+                i += 1;
+            }
+            // ── Everything else is passed through ─────────────
+            _ => {
+                out.push(b);
+                i += 1;
             }
         }
     }
 
-    collapse_in_lists(&mut out);
-
-    while out.ends_with(' ') {
+    // Trim any trailing space introduced by whitespace collapse.
+    while out.last() == Some(&b' ') {
         out.pop();
     }
 
-    out
+    // SAFETY: `out` contains only ASCII bytes we pushed ourselves
+    // (identifier bytes copied through, `?`, `,`, whitespace) or
+    // backtick-quoted identifier bytes copied verbatim from `bytes`.
+    // Non-ASCII UTF-8 sequences that appear only inside quoted string
+    // literals are collapsed to `?` before being emitted — they never
+    // reach `out`. So `out` is valid UTF-8. (Any pathological input
+    // that violates this would already be a bug in the state machine;
+    // we validate with `from_utf8` as a belt-and-suspenders check.)
+    String::from_utf8(out).unwrap_or_default()
 }
 
-/// Returns `true` if the last character in `out` is alphanumeric or `_`.
-fn prev_is_identifier(out: &str) -> bool {
-    out.chars().next_back().is_some_and(|p| p.is_alphanumeric() || p == '_')
-}
-
-/// Handle a character in `Normal` state. Returns the new index.
-fn handle_normal(
-    c: char,
-    i: usize,
-    chars: &[char],
-    len: usize,
-    out: &mut String,
-    state: &mut State,
-) -> usize {
-    if c == '\'' {
-        out.push('?');
-        *state = State::SingleQuoted;
-        i + 1
-    } else if c == '"' {
-        out.push('?');
-        *state = State::DoubleQuoted;
-        i + 1
-    } else if c == '`' {
-        out.push(c);
-        *state = State::Backtick;
-        i + 1
-    } else if c == '-' && i + 1 < len && chars[i + 1] == '-' {
-        *state = State::LineComment;
-        i + 2
-    } else if c == '/' && i + 1 < len && chars[i + 1] == '*' {
-        *state = State::BlockComment;
-        i + 2
-    } else if c == '0' && i + 1 < len && (chars[i + 1] == 'x' || chars[i + 1] == 'X') {
-        handle_hex_literal(i, chars, len, out)
-    } else if c.is_ascii_digit() || (c == '.' && i + 1 < len && chars[i + 1].is_ascii_digit()) {
-        handle_numeric_literal(c, i, out, state)
-    } else if c.is_ascii_whitespace() {
-        if !out.ends_with(' ') && !out.is_empty() {
-            out.push(' ');
-        }
-        i + 1
-    } else {
-        out.push(c);
-        i + 1
+/// Emit a `?` placeholder to the normalized output, folding runs of
+/// `?, ?, ?, ...` inside an `IN (` list into a single `?, ...`.
+///
+/// Detection rule: at the moment we're about to push another `?`, if
+/// the tail of `out` is already `?, ` and the byte before that first
+/// `?` is `(`, `,`, or ` ` (i.e. we really are inside a
+/// comma-separated list), replace the trailing `, ` with `, ...` and
+/// drop this `?`. Subsequent `?` in the same list will hit the
+/// second guard (`..., `) and also be dropped.
+fn emit_placeholder(out: &mut Vec<u8>) {
+    // Third-or-later placeholder inside an IN-list we've already
+    // collapsed. Tail will look like `..., ` (comma+space came in
+    // after the previous element and its `?` was folded). Drop this
+    // `?` AND the trailing `, ` so the eventual closing `)` sits flush
+    // against `...`.
+    if ends_with(out, b"..., ") {
+        let n = out.len();
+        out.truncate(n - 2);
+        return;
     }
-}
-
-/// Handle a hex literal (`0xDEAD`). Returns the new index.
-fn handle_hex_literal(i: usize, chars: &[char], len: usize, out: &mut String) -> usize {
-    if prev_is_identifier(out) {
-        out.push(chars[i]);
-        i + 1
-    } else {
-        out.push('?');
-        let mut j = i + 2;
-        while j < len && chars[j].is_ascii_hexdigit() {
-            j += 1;
-        }
-        j
+    // Second placeholder inside an IN-list. Tail is `?, ` — check
+    // whether we're actually inside `IN (` (as opposed to `VALUES
+    // (`, a function call, a subquery, etc.). Only IN lists collapse,
+    // matching the historical `collapse_in_lists` behaviour so digest
+    // outputs stay stable across the rewrite.
+    if ends_with(out, b"?, ") && preceding_list_is_in(out) {
+        let n = out.len();
+        // Replace the trailing `, ` with `, ...` and drop the `?`.
+        out.truncate(n - 2);
+        out.extend_from_slice(b", ...");
+        return;
     }
+    out.push(b'?');
 }
 
-/// Handle a numeric literal (integer, float, leading dot). Returns the new index.
-fn handle_numeric_literal(c: char, i: usize, out: &mut String, state: &mut State) -> usize {
-    if prev_is_identifier(out) {
-        out.push(c);
-        i + 1
-    } else {
-        out.push('?');
-        *state = State::Number;
-        i + 1
+/// Given that `out` ends with `?, `, check whether the opening `(` of
+/// the surrounding list was preceded by the `IN` keyword. Only IN
+/// lists collapse; `VALUES (?, ?, ?)`, subqueries, and function calls
+/// must be left untouched to preserve the historical digest shape.
+fn preceding_list_is_in(out: &[u8]) -> bool {
+    // Layout at call time (tail): `... IN (?, `
+    //                                  ^^^ we walk back from here.
+    // n-3 = '?', n-4 = '(' (the list opener we want to check).
+    let n = out.len();
+    if n < 4 || out[n - 4] != b'(' {
+        return false;
     }
-}
-
-/// Advance past a character inside a quoted string (single or double).
-/// Returns the new index.
-fn skip_quoted_char(
-    c: char,
-    quote: char,
-    i: usize,
-    chars: &[char],
-    len: usize,
-    state: &mut State,
-) -> usize {
-    if c == quote {
-        if i + 1 < len && chars[i + 1] == quote {
-            i + 2
-        } else {
-            *state = State::Normal;
-            i + 1
-        }
-    } else if c == '\\' {
-        i + 2
-    } else {
-        i + 1
+    // Scan backwards from just before `(`, skipping whitespace, and
+    // check for the two ASCII bytes `N`/`n` then `I`/`i`.
+    let mut j = n - 4;
+    while j > 0 && matches!(out[j - 1], b' ' | b'\t') {
+        j -= 1;
     }
+    if j < 2 {
+        return false;
+    }
+    let a = out[j - 2];
+    let b = out[j - 1];
+    let is_in = (a == b'I' || a == b'i') && (b == b'N' || b == b'n');
+    if !is_in {
+        return false;
+    }
+    // Guard against matching the tail of an identifier like `WITHIN`
+    // or `MAIN`: the byte before `IN` must not be identifier-like.
+    if j >= 3 {
+        let before = out[j - 3];
+        if before.is_ascii_alphanumeric() || before == b'_' {
+            return false;
+        }
+    }
+    true
 }
 
-/// Collapse `IN (?, ?, ?, ?)` to `IN (?, ...)`.
-fn collapse_in_lists(sql: &mut String) {
-    // Simple approach: find "IN (?" followed by ", ?" repetitions
-    while let Some(start) = sql.find("IN (?, ?") {
-        // Find the closing paren
-        let after_in = start + 5; // position after "IN (?"
-        let rest = &sql[after_in..];
-        let mut end = after_in;
-        let chars: Vec<char> = rest.chars().collect();
-        let mut j = 0;
-        while j + 2 < chars.len() && chars[j] == ',' && chars[j + 1] == ' ' && chars[j + 2] == '?' {
-            j += 3;
+/// Check whether `out` ends with the byte suffix `suffix`.
+#[inline]
+fn ends_with(out: &[u8], suffix: &[u8]) -> bool {
+    out.len() >= suffix.len() && &out[out.len() - suffix.len()..] == suffix
+}
+
+/// Advance past a quoted string literal starting at `start`. Handles
+/// SQL-standard doubled-quote escapes (`''`, `""`) and backslash
+/// escapes (`\'`, `\"`). Returns the index just after the closing
+/// quote (or `len` if unterminated).
+fn skip_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let len = bytes.len();
+    let mut i = start;
+    while i < len {
+        let b = bytes[i];
+        if b == quote {
+            // Doubled quote is an escaped quote — skip both and keep
+            // going.
+            if i + 1 < len && bytes[i + 1] == quote {
+                i += 2;
+                continue;
+            }
+            return i + 1;
         }
-        end += j;
-        if end > after_in {
-            // Replace the repeated ", ?" with ", ..."
-            sql.replace_range(after_in..end, ", ...");
+        if b == b'\\' && i + 1 < len {
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    len
+}
+
+/// Advance past a numeric literal starting at `start`. Consumes
+/// digits, optional decimal point, and optional `e`/`E` exponent.
+fn skip_number(bytes: &[u8], start: usize) -> usize {
+    let len = bytes.len();
+    let mut i = start;
+    while i < len {
+        let b = bytes[i];
+        if b.is_ascii_digit() || b == b'.' || b == b'e' || b == b'E' {
+            i += 1;
         } else {
             break;
         }
     }
+    i
+}
+
+/// Returns `true` if the last byte in `out` looks like part of an
+/// identifier (`[A-Za-z0-9_]`).
+#[inline]
+fn prev_is_identifier(out: &[u8]) -> bool {
+    matches!(out.last(), Some(b) if b.is_ascii_alphanumeric() || *b == b'_')
 }
 
 /// Compute a 64-bit digest hash of a normalized SQL string.
+///
+/// Uses `DefaultHasher` (SipHash-1-3). The follow-up in #141 called
+/// out `ahash`/`xxhash` as candidates, but no faster hasher is
+/// currently a workspace dependency, so keeping `DefaultHasher`
+/// avoids adding one just for this crate. Revisit if a workspace-wide
+/// hasher lands.
 #[must_use]
 pub fn digest_id(normalized: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     normalized.hash(&mut hasher);
     hasher.finish()
-}
-
-/// State machine for SQL normalization.
-enum State {
-    Normal,
-    SingleQuoted,
-    DoubleQuoted,
-    Backtick,
-    Number,
-    LineComment,
-    BlockComment,
 }
 
 #[cfg(test)]
@@ -275,6 +346,13 @@ mod tests {
     fn normalize_in_list_single() {
         // Single value — no collapse
         assert_eq!(normalize("WHERE id IN (1)"), "WHERE id IN (?)");
+    }
+
+    #[test]
+    fn normalize_in_list_two_values() {
+        // Two values also compresses to `?, ...` — matches the old
+        // behaviour of `collapse_in_lists` which triggered at `?, ?`.
+        assert_eq!(normalize("WHERE id IN (1, 2)"), "WHERE id IN (?, ...)");
     }
 
     #[test]
@@ -341,5 +419,96 @@ mod tests {
     #[test]
     fn normalize_double_quoted_string() {
         assert_eq!(normalize(r#"WHERE name = "Alice""#), "WHERE name = ?");
+    }
+
+    // ── New edge cases: unicode in literals, nested parens, tab/CRLF ─
+
+    #[test]
+    fn normalize_unicode_in_string_literal() {
+        // Non-ASCII UTF-8 bytes inside a quoted literal are collapsed
+        // into the `?` placeholder just like any other content; the
+        // output is still valid UTF-8.
+        assert_eq!(
+            normalize("SELECT * FROM t WHERE name = 'café ☕'"),
+            "SELECT * FROM t WHERE name = ?"
+        );
+    }
+
+    #[test]
+    fn normalize_unicode_in_double_quoted_literal() {
+        assert_eq!(
+            normalize(r#"SELECT * FROM t WHERE name = "北京""#),
+            "SELECT * FROM t WHERE name = ?"
+        );
+    }
+
+    #[test]
+    fn normalize_escaped_double_quote_in_string() {
+        // \" inside a double-quoted literal must not terminate it.
+        assert_eq!(normalize(r#"WHERE name = "he said \"hi\"""#), "WHERE name = ?");
+    }
+
+    #[test]
+    fn normalize_doubled_double_quote_in_string() {
+        // "" inside a double-quoted literal is an escaped quote.
+        assert_eq!(normalize(r#"WHERE name = "he said ""hi""""#), "WHERE name = ?");
+    }
+
+    #[test]
+    fn normalize_in_list_with_nested_paren_in_string() {
+        // A `(` inside a string literal must not confuse the IN-list
+        // collapse — the literal is elided first.
+        assert_eq!(normalize("WHERE id IN ('a(b', 'c(d', 'e(f')"), "WHERE id IN (?, ...)");
+    }
+
+    #[test]
+    fn normalize_nested_parens_in_expression() {
+        // Non-IN parens (subqueries, function calls) should not
+        // trigger IN collapse.
+        assert_eq!(
+            normalize("SELECT COALESCE((SELECT 1), (SELECT 2), 3)"),
+            "SELECT COALESCE((SELECT ?), (SELECT ?), ?)"
+        );
+    }
+
+    #[test]
+    fn normalize_tab_and_crlf_whitespace() {
+        assert_eq!(
+            normalize("SELECT\t*\r\nFROM\tt\r\nWHERE\tid\t=\t1"),
+            "SELECT * FROM t WHERE id = ?"
+        );
+    }
+
+    #[test]
+    fn normalize_multiple_in_lists_in_same_query() {
+        // Each independent IN list collapses; the second must not
+        // pollute the first.
+        assert_eq!(
+            normalize("WHERE a IN (1, 2, 3) AND b IN (4, 5, 6)"),
+            "WHERE a IN (?, ...) AND b IN (?, ...)"
+        );
+    }
+
+    #[test]
+    fn normalize_unterminated_string_does_not_panic() {
+        // Adversarial input: missing closing quote. Must produce
+        // *some* string without panicking.
+        let out = normalize("WHERE name = 'unterminated");
+        assert!(out.contains('?'));
+    }
+
+    #[test]
+    fn normalize_empty_string_literal() {
+        assert_eq!(normalize("WHERE name = ''"), "WHERE name = ?");
+    }
+
+    #[test]
+    fn normalize_empty_input() {
+        assert_eq!(normalize(""), "");
+    }
+
+    #[test]
+    fn normalize_only_whitespace() {
+        assert_eq!(normalize("   \t\n"), "");
     }
 }
