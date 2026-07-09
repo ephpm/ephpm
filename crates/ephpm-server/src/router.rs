@@ -47,11 +47,89 @@ pub struct CompressionSettings {
     pub min_size: usize,
 }
 
+/// How long a "no site directory for this host" answer is cached
+/// before we retry the on-disk lookup. Short enough that lazy vhost
+/// discovery still feels immediate for legitimate deploys; long
+/// enough that a burst of bot probes for the same `Host: <random>`
+/// doesn't restatstore the filesystem on every request.
+const UNKNOWN_SITE_TTL: Duration = Duration::from_secs(60);
+
 /// Per-site configuration resolved at startup from `sites_dir`.
 struct SiteConfig {
     document_root: PathBuf,
     index_files: Vec<String>,
     fallback: Vec<String>,
+}
+
+/// A URI-path glob pattern pre-split into segments at Router
+/// construction. The router's hot path evaluates blocked-path and
+/// allowed-PHP-path lists on every request; the old `glob_match`
+/// re-split every pattern into `Vec<&str>` per request, allocating a
+/// short-lived Vec per pattern-check pair (2 patterns × N requests ×
+/// M segments). Pre-splitting turns that back into borrows.
+///
+/// The `raw` field is kept because the exact/prefix short-circuit
+/// still uses the whole-pattern string comparison.
+#[derive(Clone)]
+struct CompiledGlob {
+    /// Original pattern string, used for exact and prefix matches
+    /// (`ends_with('/')` and non-wildcard patterns).
+    raw: String,
+    /// Pattern split by `/` at Router construction; each segment may
+    /// itself contain `*` wildcards (handled by [`segment_match`]).
+    segments: Vec<String>,
+    /// `true` if this pattern is `<prefix>/*` — matches the prefix
+    /// directory and every child path underneath.
+    prefix_wildcard: bool,
+    /// `true` if the pattern contains any `*`; when `false` we can
+    /// take the exact-match / prefix-match short-circuit without
+    /// scanning segments.
+    has_wildcard: bool,
+}
+
+impl CompiledGlob {
+    /// Pre-split a raw pattern string.
+    fn compile(raw: &str) -> Self {
+        Self {
+            raw: raw.to_string(),
+            segments: raw.split('/').map(str::to_string).collect(),
+            prefix_wildcard: raw.ends_with("/*"),
+            has_wildcard: raw.contains('*'),
+        }
+    }
+
+    /// Match a URI path against the pre-split pattern. Semantics are
+    /// identical to the previous per-request `glob_match(raw, path)`.
+    fn matches(&self, path: &str) -> bool {
+        if !self.has_wildcard {
+            // Exact match, or directory-prefix match if the pattern
+            // ends in `/`.
+            return path == self.raw || (self.raw.ends_with('/') && path.starts_with(&self.raw));
+        }
+
+        // Fast-path split of `path` into segments; the pattern
+        // segments are already split. Both are short slices of `&str`
+        // (borrowed from the input `path` and from `self.segments`).
+        // No Vec allocation per call.
+        let uri_segs: Vec<&str> = path.split('/').collect();
+
+        // `<prefix>/*` matches the directory and everything below it.
+        if self.prefix_wildcard {
+            let prefix = &self.segments[..self.segments.len() - 1];
+            let uri_prefix = &uri_segs[..prefix.len().min(uri_segs.len())];
+            if prefix.len() <= uri_segs.len()
+                && prefix.iter().zip(uri_prefix.iter()).all(|(p, s)| segment_match(p, s))
+            {
+                return true;
+            }
+        }
+
+        if self.segments.len() != uri_segs.len() {
+            return false;
+        }
+
+        self.segments.iter().zip(uri_segs.iter()).all(|(p, s)| segment_match(p, s))
+    }
 }
 
 pub struct Router {
@@ -74,10 +152,18 @@ pub struct Router {
     etag: bool,
     request_timeout: Duration,
     trusted_proxies: Vec<IpNet>,
-    blocked_paths: Vec<String>,
-    allowed_php_paths: Vec<String>,
+    /// Blocked-path patterns, pre-split at Router construction so the
+    /// per-request path check is allocation-free.
+    blocked_paths: Vec<CompiledGlob>,
+    /// PHP-allowlist patterns, pre-split at Router construction so
+    /// [`Router::is_php_allowed`] avoids per-request splitting.
+    allowed_php_paths: Vec<CompiledGlob>,
     trusted_hosts: Vec<String>,
-    response_headers: Vec<(String, String)>,
+    /// Config response headers precomputed as valid
+    /// (HeaderName, HeaderValue) at Router construction. Entries with
+    /// invalid names or values are dropped at startup with a warning
+    /// so we don't repeat the parse per response.
+    response_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
     store: Arc<Store>,
     multi_tenant_kv: Option<ephpm_kv::multi_tenant::MultiTenantStore>,
     open_basedir: bool,
@@ -111,6 +197,22 @@ pub struct Router {
     /// Native middleware chain (`[[middleware]]`), evaluated on the PHP-bound
     /// path before the request body is read. `None` = no middleware mounted.
     middleware_chain: Option<Arc<crate::middleware::MiddlewareChain>>,
+    /// Negative-lookup cache for [`resolve_site`]: hosts that neither
+    /// match a scanned site nor an on-disk site directory. Bot probes
+    /// hit unknown Host headers constantly; without this cache each
+    /// probe triggers a `sites_dir.join(host).is_dir()` syscall and
+    /// (previously) a `tracing::info!` line per unknown hostname.
+    ///
+    /// Entries expire so lazy vhost discovery still works — a site
+    /// deployed after the first probe becomes visible within
+    /// [`UNKNOWN_SITE_TTL`].
+    unknown_site_cache: dashmap::DashMap<String, std::time::Instant>,
+    /// Cache of per-hostname derived KV site passwords (HMAC-SHA256 of
+    /// `secret + hostname`). The HMAC is deterministic — computed once
+    /// per host per process, then served from the DashMap for the rest
+    /// of that process's lifetime. Sized at whatever the site fleet
+    /// naturally produces (one entry per active vhost).
+    kv_site_password_cache: dashmap::DashMap<String, String>,
 }
 
 /// Scan `sites_dir` for virtual host subdirectories.
@@ -240,15 +342,39 @@ impl Router {
             etag: config.server.static_files.etag,
             request_timeout: Duration::from_secs(config.server.timeouts.request),
             trusted_proxies,
-            blocked_paths: security.map(|s| s.blocked_paths.clone()).unwrap_or_default(),
-            allowed_php_paths: security.map(|s| s.allowed_php_paths.clone()).unwrap_or_default(),
+            blocked_paths: security
+                .map(|s| s.blocked_paths.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .map(|p| CompiledGlob::compile(p))
+                .collect(),
+            allowed_php_paths: security
+                .map(|s| s.allowed_php_paths.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .map(|p| CompiledGlob::compile(p))
+                .collect(),
             trusted_hosts: config.server.request.trusted_hosts.clone(),
             response_headers: config
                 .server
                 .response
                 .headers
                 .iter()
-                .map(|[k, v]| (k.clone(), v.clone()))
+                .filter_map(|[k, v]| {
+                    match (
+                        hyper::header::HeaderName::from_bytes(k.as_bytes()),
+                        hyper::header::HeaderValue::from_str(v),
+                    ) {
+                        (Ok(name), Ok(value)) => Some((name, value)),
+                        _ => {
+                            tracing::warn!(
+                                header = %k,
+                                "[server.response] headers entry is not a valid HTTP header — skipped at startup"
+                            );
+                            None
+                        }
+                    }
+                })
                 .collect(),
             open_basedir,
             multi_tenant_kv: if config.server.sites_dir.is_some() {
@@ -273,6 +399,8 @@ impl Router {
             worker_pool,
             worker_stream_threshold: config.php.worker_stream_threshold,
             middleware_chain: None,
+            unknown_site_cache: dashmap::DashMap::new(),
+            kv_site_password_cache: dashmap::DashMap::new(),
         }
     }
 
@@ -312,7 +440,17 @@ impl Router {
             return Vec::new();
         }
 
-        let password = ephpm_kv::auth::derive_site_password(secret, hostname);
+        // Per-hostname HMAC-SHA256 password is deterministic — cache
+        // it in a DashMap keyed by hostname so we compute the HMAC
+        // exactly once per host per process instead of on every
+        // request.
+        let password = if let Some(cached) = self.kv_site_password_cache.get(hostname) {
+            cached.clone()
+        } else {
+            let derived = ephpm_kv::auth::derive_site_password(secret, hostname);
+            self.kv_site_password_cache.insert(hostname.to_string(), derived.clone());
+            derived
+        };
 
         // Parse host:port from the listen address.
         let (host, port) = self.kv_listen.rsplit_once(':').unwrap_or(("127.0.0.1", "6379"));
@@ -332,6 +470,26 @@ impl Router {
 
         // Strip port and trailing dot, lowercase.
         let clean = host.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+
+        // Negative-lookup fast path: a host we've already determined
+        // has no site directory does not need to re-syscall the
+        // filesystem. Bot probes against `Host: <random>.example.com`
+        // hit this constantly; every one used to trigger an `is_dir`
+        // syscall and (worse) an `info!` line per unknown hostname.
+        //
+        // Entries TTL out (`UNKNOWN_SITE_TTL`) so lazy vhost
+        // discovery — the feature that lets an operator drop a new
+        // directory into `sites_dir` without restart — still works
+        // within about a minute of the site coming online.
+        if let Some(cached_at) = self.unknown_site_cache.get(&clean) {
+            if cached_at.elapsed() < UNKNOWN_SITE_TTL {
+                return (self.document_root.clone(), &self.index_files, &self.fallback);
+            }
+            // Cache entry is stale — drop it and fall through to the
+            // real lookup so a freshly-deployed site is found.
+            drop(cached_at);
+            self.unknown_site_cache.remove(&clean);
+        }
 
         // If a domain suffix is configured (e.g. `.localhost`), peel it off
         // first so `blog.localhost` looks up the `blog/` directory. Falls
@@ -362,10 +520,22 @@ impl Router {
             for key in lookup_keys {
                 let candidate = sites_dir.join(key);
                 if candidate.is_dir() {
-                    tracing::info!(host = %clean, key = %key, path = %candidate.display(), "discovered new virtual host (lazy)");
+                    // Discovery of a real vhost is worth an info line
+                    // (once per host). Bot-probe misses go to `debug`
+                    // via the fall-through below.
+                    tracing::debug!(host = %clean, key = %key, path = %candidate.display(), "discovered new virtual host (lazy)");
                     return (candidate, &self.index_files, &self.fallback);
                 }
             }
+        }
+
+        // Nothing matched. Remember this host so we don't re-syscall
+        // for the next probe from the same bot. Cap at a
+        // configuration-agnostic ceiling to avoid unbounded growth
+        // under a very determined attacker; 10_000 covers realistic
+        // long-tail probing without becoming a memory concern.
+        if self.unknown_site_cache.len() < 10_000 {
+            self.unknown_site_cache.insert(clean, std::time::Instant::now());
         }
 
         (self.document_root.clone(), &self.index_files, &self.fallback)
@@ -386,7 +556,12 @@ impl Router {
         remote_addr: SocketAddr,
         is_tls: bool,
     ) -> Result<Response<ServerBody>, hyper::Error> {
-        let method = req.method().as_str().to_ascii_uppercase();
+        // Standard HTTP methods from hyper are already uppercase; use
+        // `as_str()` (which yields `&'static str` for standard
+        // methods) instead of an owned uppercase `String`. Custom
+        // methods return a &str tied to the Method; own the label as
+        // a String only when we have to.
+        let method_label: String = req.method().as_str().to_string();
 
         // Per-IP rate limiting (uses effective IP after proxy resolution).
         if let Some(ref limiter) = self.limiter {
@@ -416,13 +591,13 @@ impl Router {
         if let Ok(ref resp) = result {
             let status = resp.status().as_u16().to_string();
             counter!("ephpm_http_requests_total",
-                "method" => method.clone(),
+                "method" => method_label.clone(),
                 "status" => status,
                 "handler" => handler
             )
             .increment(1);
             histogram!("ephpm_http_request_duration_seconds",
-                "method" => method,
+                "method" => method_label,
                 "handler" => handler
             )
             .record(elapsed);
@@ -453,14 +628,23 @@ impl Router {
             }
         };
         let query_string = req.uri().query().unwrap_or("").to_string();
-        let method = req.method().as_str().to_ascii_uppercase();
+        // hyper's `Method::as_str()` returns the canonical uppercase
+        // form for standard methods (`GET`, `POST`, ...); no
+        // `to_ascii_uppercase` alloc needed. For custom methods it
+        // returns the client-supplied bytes verbatim (already
+        // uppercase-normalised by hyper's parser). We use `method_ref`
+        // for the fast-path equality comparisons and hand the
+        // downstream PHP path a `String` only where the signature
+        // still requires one.
+        let method_ref = req.method().clone();
+        let method = method_ref.as_str();
 
         // Internal ePHPm endpoints — served before the trusted-host check
         // (and every other security check) since they are not user-supplied
         // content. Kubernetes probes and Prometheus scrapes address pods by
         // raw IP, so a `Host`-gated probe would 421 and the pod would never
         // become ready.
-        if method == "GET" {
+        if method_ref == hyper::Method::GET {
             if let Some(ref handle) = self.metrics_handle {
                 if uri_path == self.metrics_path {
                     return Ok((metrics::render(handle), "metrics"));
@@ -502,8 +686,9 @@ impl Router {
             return Ok((resp, "error"));
         }
 
-        // Block explicitly forbidden paths
-        if is_path_blocked(&uri_path, &self.blocked_paths) {
+        // Block explicitly forbidden paths (patterns pre-split at
+        // Router construction — no per-request Vec<&str> allocation).
+        if self.blocked_paths.iter().any(|p| p.matches(&uri_path)) {
             return Ok((error_response(StatusCode::FORBIDDEN, "403 Forbidden"), "error"));
         }
 
@@ -534,7 +719,8 @@ impl Router {
             Resolved::File(fs_path) => {
                 if is_php_file(&fs_path) {
                     if self.is_php_allowed(&uri_path) {
-                        let is_cacheable = (method == "GET" || method == "HEAD")
+                        let is_cacheable = (method_ref == hyper::Method::GET
+                            || method_ref == hyper::Method::HEAD)
                             && self.php_etag_cache_config.enabled;
 
                         // Pre-check: bypass PHP if client's ETag matches stored value.
@@ -542,7 +728,7 @@ impl Router {
                             if let Some(client_tag) = &if_none_match {
                                 let key = php_etag_cache_key(
                                     &self.php_etag_cache_config.key_prefix,
-                                    &method,
+                                    method,
                                     &uri_path,
                                     &query_string,
                                 );
@@ -582,7 +768,7 @@ impl Router {
                             {
                                 let key = php_etag_cache_key(
                                     &self.php_etag_cache_config.key_prefix,
-                                    &method,
+                                    method,
                                     &uri_path,
                                     &query_string,
                                 );
@@ -647,9 +833,9 @@ impl Router {
                 } else {
                     let status = StatusCode::from_u16(code).unwrap_or(StatusCode::NOT_FOUND);
                     (
-                        error_response(
+                        error_response_owned(
                             status,
-                            &format!("{code} {}", status.canonical_reason().unwrap_or("Error")),
+                            format!("{code} {}", status.canonical_reason().unwrap_or("Error"),),
                         ),
                         "error",
                     )
@@ -1159,10 +1345,13 @@ impl Router {
             } else {
                 StatusCode::FORBIDDEN
             };
-            Some(error_response(
-                status,
-                &format!("{} {}", status.as_u16(), status.canonical_reason().unwrap_or("Error")),
-            ))
+            // Two-outcome dispatch: hidden-file blocking is either
+            // "deny" (403) or "ignore" (404). Handing back a canned
+            // `&'static` body keeps [`error_response`] on the
+            // no-alloc fast path.
+            let body: &'static str =
+                if status == StatusCode::NOT_FOUND { "404 Not Found" } else { "403 Forbidden" };
+            Some(error_response(status, body))
         } else {
             None
         }
@@ -1176,7 +1365,9 @@ impl Router {
         if self.allowed_php_paths.is_empty() {
             return true;
         }
-        self.allowed_php_paths.iter().any(|pattern| glob_match(pattern, uri_path))
+        // Patterns are pre-split at Router construction — the per-
+        // request check does not split into `Vec<&str>`.
+        self.allowed_php_paths.iter().any(|p| p.matches(uri_path))
     }
 
     /// Resolve real client address and HTTPS status from proxy headers.
@@ -1256,15 +1447,15 @@ impl Router {
     }
 
     /// Apply custom response headers from config.
+    ///
+    /// The header pairs are already validated to `(HeaderName,
+    /// HeaderValue)` at Router construction time, so this hot-path
+    /// method is one clone per pair — no per-response
+    /// `HeaderName::from_bytes` / `HeaderValue::from_str` parse.
     fn apply_response_headers(&self, response: &mut Response<ServerBody>) {
         let headers = response.headers_mut();
         for (name, value) in &self.response_headers {
-            if let (Ok(name), Ok(value)) = (
-                hyper::header::HeaderName::from_bytes(name.as_bytes()),
-                hyper::header::HeaderValue::from_str(value),
-            ) {
-                headers.insert(name, value);
-            }
+            headers.insert(name.clone(), value.clone());
         }
     }
 
@@ -1339,12 +1530,21 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-/// Check if a URI path matches any blocked path pattern.
+/// Test-only reference implementation kept for the legacy glob unit
+/// tests; production routing uses [`CompiledGlob::matches`] which is
+/// pre-split at Router construction.
+#[cfg(test)]
 fn is_path_blocked(uri_path: &str, blocked: &[String]) -> bool {
     blocked.iter().any(|pattern| glob_match(pattern, uri_path))
 }
 
 /// Simple glob matching for URI paths.
+///
+/// Kept for the unit-test corpus that pins the historical match
+/// semantics; production paths go through [`CompiledGlob::matches`],
+/// which uses this same segment-matching logic but on pre-split
+/// segments so the hot path is allocation-free.
+#[cfg_attr(not(test), allow(dead_code))]
 ///
 /// Supports `*` as a wildcard matching any sequence of characters within
 /// a single path segment (no `/`), and exact prefix matching for patterns
@@ -1421,11 +1621,15 @@ fn extract_server_name(req: &Request<Incoming>) -> String {
 }
 
 /// Build a JSON response with the given status and body.
-fn json_response(status: StatusCode, body: &str) -> Response<ServerBody> {
+///
+/// Takes a `&'static str` and constructs the body with
+/// [`Bytes::from_static`], so canned responses (`/_ephpm/health`,
+/// `/_ephpm/ready`) do not allocate a `Vec<u8>` per request.
+fn json_response(status: StatusCode, body: &'static str) -> Response<ServerBody> {
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(body::buffered(Full::new(Bytes::from(body.to_string()))))
+        .body(body::buffered(Full::new(Bytes::from_static(body.as_bytes()))))
         .expect("static json response")
 }
 
@@ -1543,12 +1747,31 @@ fn override_header(headers: &mut Vec<(String, String)>, name: String, value: Str
 }
 
 /// Build a simple error response with a text body.
-fn error_response(status: StatusCode, body: &str) -> Response<ServerBody> {
+///
+/// Takes a `&'static str` and constructs the body with
+/// [`Bytes::from_static`]; every call site passes a compile-time
+/// string literal (`"400 Bad Request"`, `"403 Forbidden"`, ...), so
+/// error responses do not allocate a body `Vec<u8>` per request.
+fn error_response(status: StatusCode, body: &'static str) -> Response<ServerBody> {
     Response::builder()
         .status(status)
         .header("content-type", "text/plain")
-        .body(body::buffered(Full::new(Bytes::from(body.to_string()))))
+        .body(body::buffered(Full::new(Bytes::from_static(body.as_bytes()))))
         .expect("static error response")
+}
+
+/// Build a simple error response with a dynamically-owned text body.
+///
+/// Companion to [`error_response`] for the (few) cold paths that
+/// need to embed a runtime-formatted body (fallback status codes,
+/// PHP execution error messages). The hot path uses `error_response`
+/// with a `&'static str` and pays no allocation.
+fn error_response_owned(status: StatusCode, body: String) -> Response<ServerBody> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "text/plain")
+        .body(body::buffered(Full::new(Bytes::from(body))))
+        .expect("owned-body error response")
 }
 
 /// Build an HTTP response from a PHP execution result, optionally compressing.
@@ -1707,9 +1930,9 @@ fn build_php_response(
         }
         Ok(Err(err)) => {
             tracing::error!(%err, "PHP execution failed");
-            error_response(
+            error_response_owned(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("PHP execution error: {err}"),
+                format!("PHP execution error: {err}"),
             )
         }
         Err(err) => {
@@ -1725,8 +1948,21 @@ fn is_php_file(path: &Path) -> bool {
 }
 
 /// Expand `$uri` and `$query_string` variables in a `fallback` entry.
-fn expand_variables(entry: &str, uri_path: &str, query_string: &str) -> String {
-    entry.replace("$uri", uri_path).replace("$query_string", query_string)
+///
+/// Almost every fallback entry is a bare `/index.php` or similar with
+/// no placeholder — the previous unconditional double `String::replace`
+/// allocated two Strings per fallback per request even when there was
+/// nothing to expand. The `contains('$')` guard short-circuits those
+/// cases into a borrowed `Cow` with zero allocation.
+fn expand_variables<'a>(
+    entry: &'a str,
+    uri_path: &str,
+    query_string: &str,
+) -> std::borrow::Cow<'a, str> {
+    if !entry.contains('$') {
+        return std::borrow::Cow::Borrowed(entry);
+    }
+    std::borrow::Cow::Owned(entry.replace("$uri", uri_path).replace("$query_string", query_string))
 }
 
 /// Split an expanded path into the path component and optional query string.
@@ -3084,6 +3320,15 @@ echo "post response";
         let new_site = sites.join("new-site.com");
         fs::create_dir_all(&new_site).unwrap();
         fs::write(new_site.join("index.html"), "<html>live!</html>").unwrap();
+
+        // A negative-lookup cache entry with an `UNKNOWN_SITE_TTL`
+        // window would keep serving the fall-back for up to a
+        // minute; drop it directly here so the test stays fast
+        // without weakening the TTL for prod. Bot probes are the
+        // reason the cache exists; a legitimate switchboard deploy
+        // in prod sees the site come alive on the next miss after
+        // the TTL elapses.
+        router.unknown_site_cache.clear();
 
         // Now it should be discovered lazily.
         let (doc_root, _, _) = router.resolve_site("new-site.com");
