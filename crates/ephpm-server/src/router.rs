@@ -10,7 +10,7 @@ use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[allow(unused_imports)]
 use ::metrics::{counter, gauge, histogram};
@@ -111,11 +111,21 @@ pub struct Router {
     /// Native middleware chain (`[[middleware]]`), evaluated on the PHP-bound
     /// path before the request body is read. `None` = no middleware mounted.
     middleware_chain: Option<Arc<crate::middleware::MiddlewareChain>>,
-    /// Canonicalized document roots, keyed by the as-configured root path.
-    /// Roots are constant for the process lifetime, so caching removes a
-    /// `canonicalize()` syscall from every static-file hit (issue #132).
-    canonical_roots: dashmap::DashMap<PathBuf, PathBuf>,
+    /// Canonicalized document roots, keyed by the as-configured root path,
+    /// with the instant they were resolved. Caching removes a
+    /// `canonicalize()` syscall from every static-file hit (issue #132),
+    /// but entries are revalidated after a short TTL: `canonicalize()`
+    /// resolves symlinks, and atomic-deploy layouts flip a symlinked
+    /// docroot to a new release directory — an immortal cache would pin
+    /// the OLD release forever.
+    canonical_roots: dashmap::DashMap<PathBuf, (PathBuf, Instant)>,
 }
+
+/// How long a cached canonicalized docroot stays valid before the next
+/// request re-resolves it. Long enough to amortize the syscall away at any
+/// realistic request rate, short enough that a symlink-flip deploy is
+/// picked up almost immediately.
+const CANONICAL_ROOT_TTL: Duration = Duration::from_secs(2);
 
 /// Scan `sites_dir` for virtual host subdirectories.
 ///
@@ -281,16 +291,22 @@ impl Router {
         }
     }
 
-    /// Canonicalized form of a site's document root, cached for the process
-    /// lifetime (roots never change at runtime). Returns `None` when the
-    /// root does not exist — the caller treats that as 404, matching the
-    /// previous per-request `canonicalize()` behavior.
+    /// Canonicalized form of a site's document root, cached with a short
+    /// TTL ([`CANONICAL_ROOT_TTL`]). The TTL matters: `canonicalize()`
+    /// resolves symlinks, and atomic-deploy layouts (docroot → symlink →
+    /// `releases/N`) flip that symlink on deploy — a permanent cache would
+    /// keep serving the old release. Returns `None` when the root does not
+    /// exist — the caller treats that as 404, matching the previous
+    /// per-request `canonicalize()` behavior.
     fn canonical_root(&self, root: &Path) -> Option<PathBuf> {
         if let Some(hit) = self.canonical_roots.get(root) {
-            return Some(hit.clone());
+            let (canon, resolved_at) = hit.value();
+            if resolved_at.elapsed() < CANONICAL_ROOT_TTL {
+                return Some(canon.clone());
+            }
         }
         let canon = root.canonicalize().ok()?;
-        self.canonical_roots.insert(root.to_path_buf(), canon.clone());
+        self.canonical_roots.insert(root.to_path_buf(), (canon.clone(), Instant::now()));
         Some(canon)
     }
 
