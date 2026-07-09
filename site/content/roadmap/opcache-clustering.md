@@ -1,5 +1,17 @@
 # OPcache Clustering & Per-Vhost Preload
 
+> **Status:** Phase 1 (cluster-wide invalidation) is implemented on the
+> fpm dispatch path and shipped with `ephpm deploy` / `ephpm cache reset`
+> and the `[opcache] cluster_invalidation` config knob. Phases 2 (per-vhost
+> preload) and 3 (file-change watcher) remain design-only.
+>
+> Phase 1 known gaps: worker mode (`[php] mode = "worker"`) is NOT wired
+> yet — the watcher is skipped and startup logs a WARN so the no-op is
+> never silent. No `check_interval` knob: the design's optional interval
+> is not implemented (every request pays one atomic load + one KV get,
+> which is sub-microsecond in practice). `ephpm cache status` is not
+> implemented; use `opcache_get_status()` from PHP for now.
+
 ePHPm runs PHP through the embed SAPI, which means OPcache lives in the
 same process as the HTTP server, the KV store, and the gossip cluster.
 That alignment unlocks a class of OPcache features that's genuinely
@@ -150,29 +162,40 @@ Key properties:
 
 ### CLI surface
 
+Implemented (Phase 1):
+
 ```bash
 # Invalidate one vhost cluster-wide
 ephpm deploy --site blog
 
-# Tag the deploy with a revision (recorded as 'opcache:revision:<vhost>'
+# Tag the deploy with a revision (recorded at 'opcache:revision:<vhost>'
 # for observability; doesn't affect invalidation logic)
 ephpm deploy --site blog --rev a8f13d2
 
-# Invalidate every vhost
+# Invalidate every vhost via the broadcast key opcache:version:_all
 ephpm deploy --all
 
-# Local-only reset (bypass KV, doesn't broadcast — useful in dev mode
-# or when running single-node)
+# Local-only reset (functionally identical to deploy on a single node;
+# on a cluster, still propagates via gossip because the RESP listener
+# writes to the same in-process store)
 ephpm cache reset --site blog
 ephpm cache reset --all
-
-# Inspect cache state
-ephpm cache status                 # global summary
-ephpm cache status --site blog     # per-vhost: hit rate, script count, memory
 ```
 
-All four are thin commands that either write to KV (`deploy`) or call
-the local invalidation directly (`cache reset`).
+Not implemented (planned):
+
+```bash
+# Planned — not yet implemented
+ephpm cache status                 # global summary
+ephpm cache status --site blog     # per-vhost stats
+```
+
+**Process-boundary note.** `ephpm deploy` / `ephpm cache reset` are
+separate processes from the running server, so they cannot poke the
+in-process KV `DashMap` directly. They write via the RESP listener at
+`[kv.redis_compat] listen`. If `enabled = false`, the CLI prints a
+clear connection hint. Alternative admin socket / HTTP endpoint options
+are on the roadmap.
 
 ### Config surface
 
@@ -180,17 +203,15 @@ In `ephpm.toml`:
 
 ```toml
 [opcache]
-# Watch KV for cluster-wide invalidation events. Default: true when
-# [cluster] is enabled, false otherwise (single-node — `ephpm cache
-# reset` is the right interface).
+# Watch KV for cluster-wide invalidation events. Optional. When unset,
+# defaults to true if [cluster].enabled = true, false otherwise
+# (single-node — `ephpm cache reset` is still available).
 cluster_invalidation = true
-
-# How often the per-request watcher checks KV for a new version. The
-# default checks every request — the lookup is in-process and cheap,
-# so the staleness window is essentially zero. Bump this on
-# very-high-RPS workloads where the cost adds up.
-check_interval = "0s"
 ```
+
+`check_interval` from the earlier design draft is **not implemented** —
+every request pays one atomic load plus one `DashMap::get`, which is
+sub-microsecond; the ~1 ms/100k-RPS overhead does not need a knob yet.
 
 In `<vhost>/site.toml`:
 
@@ -273,21 +294,27 @@ operators trade staleness for less work on extreme workloads.
 
 ### Metrics
 
-Exposed via the existing Prometheus `/metrics` endpoint:
+Implemented (Phase 1):
 
 ```
-ephpm_opcache_invalidations_total{vhost="blog", trigger="kv|cli|filewatcher"}
-ephpm_opcache_compile_seconds_bucket{vhost="blog"}
-ephpm_opcache_preload_seconds_bucket{vhost="blog"}
-ephpm_opcache_hit_ratio{vhost="blog"}
-ephpm_opcache_scripts_cached{vhost="blog"}
+ephpm_opcache_invalidations_total{vhost, trigger="kv|cli"}
+```
+
+Incremented every time the watcher runs an invalidation for a vhost.
+`trigger` is `kv` for gossip-driven invalidations (`ephpm deploy`) and
+`cli` for local resets that bypassed the KV read path. Only vhosts that
+actually experience an invalidation appear.
+
+Planned (Phases 2 / 3):
+
+```
+ephpm_opcache_compile_seconds_bucket{vhost}
+ephpm_opcache_preload_seconds_bucket{vhost}
+ephpm_opcache_hit_ratio{vhost}
+ephpm_opcache_scripts_cached{vhost}
 ephpm_opcache_memory_used_bytes
 ephpm_opcache_memory_free_bytes
 ```
-
-Most are pulled from `opcache_get_status()` on metrics scrape (cheap;
-returns a snapshot). The `invalidations_total` and `compile_seconds`
-are incremented inline at the invalidation/compile sites.
 
 ---
 

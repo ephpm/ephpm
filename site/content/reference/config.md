@@ -289,6 +289,25 @@ at startup) — see the guide's
 | `order` | u32 | **required** | Chain position; lower runs first. Equal orders keep declaration order. |
 | `config` | inline table | (none) | Arbitrary module configuration, serialised to JSON and passed to the module's `init`. |
 
+## `[opcache]`
+
+Governs the cluster-wide OPcache invalidation watcher (Phase 1 of the
+[OPcache clustering roadmap](/roadmap/opcache-clustering/)). When enabled,
+every PHP request checks `opcache:version:<vhost>` in the in-process KV
+store and, when the value has advanced since this node last saw it, runs
+`opcache_invalidate()` for every cached script under the vhost's docroot
+before executing the request. The lookup is one atomic load plus one
+`DashMap::get` — sub-microsecond in the fast path.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `cluster_invalidation` | bool | (auto) | Watch the KV store for invalidation events. Unset defaults to `true` when `[cluster] enabled = true`, `false` otherwise. Applies to fpm mode only (`[php] mode = "fpm"`); worker mode logs a WARN at startup and skips the watcher. |
+
+The companion CLI is `ephpm deploy` / `ephpm cache reset` — both write
+the version key via the RESP listener, so `[kv.redis_compat] enabled = true`
+is required for the CLI to reach the running server. See the roadmap
+page for the wire semantics.
+
 ## See also
 
 - [Environment variables](environment-variables/) — how to override any of these via `EPHPM_*`

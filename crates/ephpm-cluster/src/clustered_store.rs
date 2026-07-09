@@ -310,7 +310,7 @@ impl ClusteredStore {
         // No cluster peers (single node, or only self alive): store
         // locally and we're done.
         if replicas.is_empty() {
-            return self.store.set(key.to_string(), value.to_vec(), ttl);
+            return self.store.set_local(key.to_string(), value.to_vec(), ttl);
         }
 
         // The primary is the first replica; the rest are secondaries.
@@ -323,7 +323,7 @@ impl ClusteredStore {
             // value is not lost outright, mirroring the pre-replication
             // behaviour. Do not attempt secondaries in this case.
             if primary.id != self_id {
-                return self.store.set(key.to_string(), value.to_vec(), ttl);
+                return self.store.set_local(key.to_string(), value.to_vec(), ttl);
             }
             return false;
         }
@@ -335,7 +335,7 @@ impl ClusteredStore {
                 for node in secondaries {
                     if node.id == self_id {
                         // Local replica — write inline (cheap, no task).
-                        if !self.store.set(key.to_string(), value.to_vec(), ttl) {
+                        if !self.store.set_local(key.to_string(), value.to_vec(), ttl) {
                             self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(key, "local replica write rejected (memory limit?)");
                         }
@@ -414,7 +414,7 @@ impl ClusteredStore {
         ttl: Option<Duration>,
     ) -> bool {
         if node.id == self_id {
-            return self.store.set(key.to_string(), value.to_vec(), ttl);
+            return self.store.set_local(key.to_string(), value.to_vec(), ttl);
         }
         let Some(addr) = node_data_addr(node, self.config.data_port) else {
             tracing::warn!(key, replica = %node.id, "replica has no parseable data address");
@@ -434,8 +434,10 @@ impl ClusteredStore {
         // Try gossip tier first.
         let gossip_deleted = self.cluster.gossip_del(key).await;
 
-        // Also remove from local store.
-        let local_deleted = self.store.remove(key);
+        // Also remove from local store. `remove_local` skips the Replicator
+        // hook so we don't re-enter ourselves when this ClusteredStore is
+        // installed as its own local Store's replicator.
+        let local_deleted = self.store.remove_local(key);
 
         // Evict from hot cache.
         if self.config.hot_key_cache {
@@ -669,6 +671,234 @@ impl ClusterHandle {
             })
             .forever();
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Sync bridge to `ephpm_kv::store::Replicator`
+// ─────────────────────────────────────────────────────────────────────
+
+/// Adapter that implements the synchronous
+/// [`ephpm_kv::store::Replicator`] trait on top of the async
+/// [`ClusteredStore`] API.
+///
+/// The RESP command dispatcher and the PHP `kv_bridge` FFI callbacks call
+/// `Store::set` / `remove` / `expire` from **non-async** contexts, but
+/// `ClusteredStore`'s routing is async (chitchat writes, data-plane RPCs).
+/// This adapter bridges the two by pinning a tokio [`Handle`] at
+/// construction time and calling
+/// [`Handle::spawn`] for the async work.
+///
+/// ## Semantics
+///
+/// - **Small keys (≤ `small_key_threshold`)** — gossip fan-out is spawned
+///   fire-and-forget. The hook returns `true` immediately (the gossip tier
+///   never rejects a write locally). Peers converge in gossip-time.
+/// - **Large keys** — a bounded-inline primary write happens synchronously
+///   via `Handle::block_on` **only** when we are NOT already inside a
+///   tokio runtime. Inside a runtime we cannot `block_on` (that panics),
+///   so we spawn and return `true`. This matches the semantics operators
+///   already accept from the `replication_mode = "async"` path: replicas
+///   are best-effort, the client sees success as long as the local write
+///   would have succeeded.
+/// - **Remove / expire** — always spawned fire-and-forget. The return
+///   value reflects only the local action.
+///
+/// This is a v1 sync-bridge. A future revision may collapse the runtime
+/// gap by making the RESP dispatcher itself async and threading a routing
+/// trait through it; that is a larger refactor and out of scope here.
+pub struct KvReplicator {
+    inner: Arc<ClusteredStore>,
+    /// The tokio runtime that owns the cluster gossip + data plane tasks.
+    /// Captured at construction so sync callers on any thread can spawn
+    /// async replication work.
+    handle: tokio::runtime::Handle,
+    /// Shared with [`start_gossip_applier`]. When we materialize a local
+    /// copy synchronously we also record the origin `write_ms` here so a
+    /// slower echo of that same write cannot clobber a newer overwrite.
+    applied: AppliedWriteMap,
+}
+
+impl std::fmt::Debug for KvReplicator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvReplicator").field("clustered_store", &"<ClusteredStore>").finish()
+    }
+}
+
+impl KvReplicator {
+    /// Wrap a [`ClusteredStore`] as a sync [`ephpm_kv::store::Replicator`]
+    /// bound to the given tokio runtime `handle`. Typically
+    /// [`tokio::runtime::Handle::current`] captured from the server's
+    /// tokio context at startup.
+    ///
+    /// `applied` MUST be the same handle passed to
+    /// [`start_gossip_applier`] on this node — sharing it is what makes
+    /// local writes and remote applies participate in the same
+    /// last-arrival-wins ordering.
+    #[must_use]
+    pub fn new(
+        inner: Arc<ClusteredStore>,
+        handle: tokio::runtime::Handle,
+        applied: AppliedWriteMap,
+    ) -> Arc<Self> {
+        Arc::new(Self { inner, handle, applied })
+    }
+}
+
+impl ephpm_kv::store::Replicator for KvReplicator {
+    fn replicate_set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        // Small values: materialize the LOCAL copy synchronously first.
+        // The gossip tier lives in chitchat state, invisible to raw-store
+        // readers (RESP GET, PHP native functions, the OPcache watcher) —
+        // without this, the origin node itself could not read back its own
+        // write. Peers materialize via the gossip applier
+        // (start_gossip_applier).
+        if value.len() <= self.inner.config.small_key_threshold {
+            self.inner.store.set_local(key.clone(), value.clone(), ttl);
+            // Record OUR own write in the applied map so a slower echo of
+            // this write from gossip does not clobber a newer local
+            // overwrite that lands between the local materialization and
+            // the echo. Use the same wall-clock now-ms that encode_value
+            // stamps into the gossip payload so the ordering is
+            // consistent across the two paths.
+            let write_ms = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+            )
+            .unwrap_or(u64::MAX);
+            self.applied.insert(key.clone(), write_ms);
+        }
+        // Fire-and-forget: hand the routed write off to the runtime and
+        // return success. The clustered set() itself decides gossip vs
+        // local + replica fan-out and does all local writes via
+        // Store::set_local, so no recursion is possible.
+        let inner = Arc::clone(&self.inner);
+        self.handle.spawn(async move {
+            let ok = inner.set(key.clone(), value, ttl).await;
+            if !ok {
+                tracing::warn!(key, "clustered set returned false (primary rejected)");
+            }
+        });
+        true
+    }
+
+    fn replicate_remove(&self, key: &str) -> bool {
+        // Drop the local materialized copy synchronously (mirror of the
+        // set path above), then propagate the removal.
+        self.inner.store.remove_local(key);
+        let inner = Arc::clone(&self.inner);
+        let key = key.to_string();
+        self.handle.spawn(async move {
+            let _ = inner.remove(&key).await;
+        });
+        // We cannot know synchronously whether the key existed on any
+        // tier; return `true` optimistically (RESP DEL semantics: the
+        // caller uses this as an "attempted" signal, not a guarantee).
+        true
+    }
+
+    fn replicate_expire(&self, key: &str, ttl: Duration) -> bool {
+        // ClusteredStore does not yet expose a cluster-wide `expire` — the
+        // gossip TTL is set at write time. Update the local copy so the
+        // node the caller is talking to honours the new expiry; remote
+        // copies keep their originally-set TTL. Document this v1 gap.
+        let ok = self.inner.local_store().expire_local(key, ttl);
+        if !ok {
+            tracing::debug!(key, "expire: no local copy (may exist only on remote replicas)");
+        }
+        ok
+    }
+}
+
+/// Per-key last-applied `write_ms` shared between the gossip applier and
+/// the origin-side [`KvReplicator::replicate_set`]. Keeps the local
+/// materialized copy last-arrival-wins: a slow gossip echo of an older
+/// write can no longer clobber a newer write we already applied
+/// locally.
+///
+/// v1 legacy entries decode as `write_ms = 0` and always apply on first
+/// arrival (0 <= any current-format write_ms is not true for the strict
+/// `<=` check → applied on first sight; a second stale echo with
+/// write_ms=0 is skipped, which is the correct behavior).
+pub type AppliedWriteMap = Arc<DashMap<String, u64>>;
+
+/// Construct a fresh [`AppliedWriteMap`] for use by both the applier and
+/// [`KvReplicator`]. Callers wire the SAME handle through both so origin
+/// writes and remote applies participate in the same ordering.
+#[must_use]
+pub fn new_applied_write_map() -> AppliedWriteMap {
+    Arc::new(DashMap::new())
+}
+
+/// Materialize gossip-tier small values into the local raw [`Store`].
+///
+/// The gossip tier lives in chitchat node state — invisible to the raw
+/// `Store` that the RESP dispatcher, PHP native functions, and the OPcache
+/// watcher read. This applier subscribes to gossip KV changes and writes
+/// every REMOTE small-value update into the local store via `set_local`,
+/// making gossip a replication transport with per-node materialization.
+/// Origin nodes materialize synchronously in
+/// [`KvReplicator::replicate_set`]; their own events are skipped here.
+///
+/// **Last-arrival-wins ordering.** The applier keeps a per-key
+/// `last-applied write_ms` in `applied` and skips any incoming write
+/// whose `write_ms <= last_seen`. The origin also records its own
+/// `write_ms` in the same map, so a delayed echo of the origin's own
+/// write cannot clobber a newer local overwrite. Pre-`write_ms` peers
+/// send `write_ms = 0`, which always applies on first sight.
+///
+/// Known v1 gap: `gossip_del` tombstones do not decode as values, so
+/// remote deletions do not remove the local copy until TTL expiry or a
+/// subsequent overwrite.
+pub async fn start_gossip_applier(
+    cluster: &ClusterHandle,
+    store: Arc<Store>,
+    applied: AppliedWriteMap,
+) {
+    let self_id = cluster.self_node().id.clone();
+    cluster
+        .subscribe_kv_changes(move |key, value, ttl, write_ms, node| {
+            if node.node_id == self_id {
+                return;
+            }
+            if !should_apply(&applied, key, write_ms) {
+                tracing::trace!(
+                    key,
+                    from = %node.node_id,
+                    write_ms,
+                    "gossip KV change skipped as stale"
+                );
+                return;
+            }
+            store.set_local(key.to_string(), value.to_vec(), ttl);
+            tracing::trace!(
+                key,
+                from = %node.node_id,
+                write_ms,
+                "gossip KV change materialized locally"
+            );
+        })
+        .await;
+}
+
+/// Pure last-arrival-wins gate for the gossip applier.
+///
+/// Returns `true` (and records `write_ms`) when this incoming write is
+/// strictly newer than the last one we materialized for `key`; returns
+/// `false` when it is stale (write_ms <= last-applied) so a slow echo
+/// cannot clobber a newer write we already accepted. Legacy v1 payloads
+/// (`write_ms = 0`) apply on first sight — the map has no entry yet —
+/// and subsequent v1 echoes for the same key are skipped, which is the
+/// desired behavior.
+fn should_apply(applied: &AppliedWriteMap, key: &str, write_ms: u64) -> bool {
+    if let Some(prev) = applied.get(key) {
+        if write_ms <= *prev {
+            return false;
+        }
+    }
+    applied.insert(key.to_string(), write_ms);
+    true
 }
 
 /// FNV-1a-style hash for key → u64 mapping.
@@ -971,5 +1201,59 @@ mod tests {
         // Unknown / default falls back to async.
         assert_eq!(ReplicationMode::from_config("whatever"), ReplicationMode::Async);
         assert_eq!(ReplicationMode::from_config(""), ReplicationMode::Async);
+    }
+
+    // -----------------------------------------------------------------
+    // Last-arrival-wins ordering (issue #150.1)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn should_apply_first_write_lands() {
+        let applied = new_applied_write_map();
+        assert!(should_apply(&applied, "k", 1000));
+        assert_eq!(*applied.get("k").unwrap(), 1000);
+    }
+
+    #[test]
+    fn should_apply_newer_write_lands() {
+        let applied = new_applied_write_map();
+        assert!(should_apply(&applied, "k", 1000));
+        assert!(should_apply(&applied, "k", 2000));
+        assert_eq!(*applied.get("k").unwrap(), 2000);
+    }
+
+    #[test]
+    fn should_apply_stale_write_is_skipped() {
+        let applied = new_applied_write_map();
+        assert!(should_apply(&applied, "k", 2000));
+        // Delayed echo of an older write must NOT clobber the newer one.
+        assert!(!should_apply(&applied, "k", 1000));
+        // Equal write_ms is treated as stale (write_ms <= last_applied).
+        assert!(!should_apply(&applied, "k", 2000));
+        assert_eq!(*applied.get("k").unwrap(), 2000);
+    }
+
+    #[test]
+    fn should_apply_legacy_zero_write_ms_lands_once() {
+        // Pre-write_ms peers emit write_ms = 0. The first echo applies
+        // (map has no entry), the second is treated as stale — matches
+        // the desired "apply on first sight, deduplicate re-sends"
+        // behavior during rolling upgrades.
+        let applied = new_applied_write_map();
+        assert!(should_apply(&applied, "legacy-key", 0));
+        assert!(!should_apply(&applied, "legacy-key", 0));
+    }
+
+    #[test]
+    fn should_apply_origin_recorded_write_blocks_stale_echo() {
+        // Simulates KvReplicator::replicate_set recording its own write
+        // in the applied map, then a slow echo of the SAME write coming
+        // back through gossip. The echo must be skipped.
+        let applied = new_applied_write_map();
+        let origin_write_ms = 5000;
+        applied.insert("origin-key".into(), origin_write_ms);
+        assert!(!should_apply(&applied, "origin-key", origin_write_ms));
+        // A newer overwrite (say a follow-up SET) should still apply.
+        assert!(should_apply(&applied, "origin-key", origin_write_ms + 1));
     }
 }

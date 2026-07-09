@@ -100,7 +100,11 @@ The KV store goes from in-process to a distributed two-tier system:
 
 ### Tier 1 — gossip-backed (small values)
 
-Values up to `[cluster.kv] small_key_threshold` (default 512 bytes) ride the gossip protocol via chitchat. They're encoded into the gossip state with base64 + millisecond expiry. Convergence is fast (hundreds of ms typical). Eventually consistent.
+Values up to `[cluster.kv] small_key_threshold` (default 512 bytes) ride the gossip protocol via chitchat. They're encoded into the gossip state with base64 + millisecond expiry + an origin-stamped `write_ms`. Convergence is fast (hundreds of ms typical). Eventually consistent.
+
+Applies are **last-arrival-wins** by origin `write_ms`: each node keeps a per-key `last-applied` timestamp shared between the gossip applier and the origin-side write path, and skips any incoming write whose `write_ms` is not strictly newer. This prevents a slow gossip echo of an older write from clobbering a newer write already materialized locally. The origin itself records its own `write_ms` in the same map, so even the echo of its own gossip broadcast cannot overwrite a follow-up local write.
+
+**Only `SET`/`DEL` replicate today.** `INCR`, `DECR`, and other read-modify-write ops are **local-only** — they mutate the owner node's counter without gossiping the new value. The built-in `ratelimit` middleware uses `INCR`, so rate-limit windows are enforced **per node**, not cluster-wide (issue #150). A cluster-wide replicated `INCR` is planned.
 
 This is where `kv:sqlite:primary` and other cluster-wide control state lives. Designed for small, frequently-read, eventually-consistent values.
 

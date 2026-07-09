@@ -4,6 +4,7 @@ pub mod file_cache;
 mod idle;
 pub mod metrics;
 pub mod middleware;
+pub mod opcache;
 pub mod rate_limit;
 pub mod router;
 pub mod static_files;
@@ -74,6 +75,20 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             modules = ?chain.module_names(),
             "middleware chain loaded"
         );
+        // In cluster mode, the built-in ratelimit middleware uses local KV
+        // INCR to track the request count per window. INCR is NOT yet
+        // replicated across the cluster (issue #150 — writes gossip on
+        // SET, but INCR is a local-only op today), so the rate limit is
+        // enforced PER NODE, not across the whole fleet. Surface the gap
+        // at startup instead of leaving operators to find it in prod.
+        if config.cluster.enabled && chain.module_names().contains(&"ratelimit") {
+            tracing::warn!(
+                "[middleware] ratelimit mounted with [cluster].enabled = true — KV INCR is \
+                 not yet replicated across nodes, so rate limits are enforced PER NODE. A \
+                 client hitting N nodes gets up to N × the configured allowance. See \
+                 site/content/reference/middleware/ratelimit.md for the current status."
+            );
+        }
         Some(Arc::new(chain))
     };
 
@@ -107,7 +122,66 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             }
         });
 
-        Some(Arc::new(handle))
+        let cluster_handle = Arc::new(handle);
+
+        // Wire the local KV Store through the ClusteredStore replicator so
+        // RESP + PHP native writes routed via `Store::set`/`remove`/`expire`
+        // fan out to cluster peers (small values via chitchat gossip; large
+        // values via the TCP data plane with `replication_factor` copies).
+        //
+        // This resolves the gap where a `SET foo bar` on node A would only
+        // touch node A's local map — issue #143. Without this hook the
+        // clustered KV knobs (`[cluster.kv].replication_factor` /
+        // `.replication_mode`) are silent no-ops from the RESP + PHP lanes,
+        // and cluster-wide features like OPcache invalidation cannot fan
+        // out across nodes.
+        let clustered = ephpm_cluster::ClusteredStore::new(
+            Arc::clone(&kv_store),
+            Arc::clone(&cluster_handle),
+            config.cluster.kv.clone(),
+            if config.cluster.secret.is_empty() {
+                None
+            } else {
+                Some(Arc::new(ephpm_cluster::ClusterCipher::for_kv_data_plane(
+                    &config.cluster.secret,
+                )))
+            },
+        );
+        // Wake the hot-key invalidation watcher (no-op when hot_key_cache
+        // is disabled in config).
+        clustered.init_hot_key_watcher().await;
+
+        // Shared last-arrival-wins ordering map: threaded through both the
+        // replicator (records origin writes) and the applier (records
+        // remote applies), so a slow gossip echo of an older write can't
+        // clobber a newer local overwrite.
+        let applied = ephpm_cluster::clustered_store::new_applied_write_map();
+        let replicator = ephpm_cluster::KvReplicator::new(
+            Arc::clone(&clustered),
+            tokio::runtime::Handle::current(),
+            Arc::clone(&applied),
+        );
+        kv_store.set_replicator(Some(replicator as Arc<dyn ephpm_kv::store::Replicator>));
+
+        // Materialize REMOTE gossip-tier writes into this node's local
+        // Store so raw-store readers (RESP GET, PHP native functions, the
+        // OPcache watcher) see cluster writes; the origin node materializes
+        // synchronously inside the replicator.
+        ephpm_cluster::clustered_store::start_gossip_applier(
+            &cluster_handle,
+            Arc::clone(&kv_store),
+            applied,
+        )
+        .await;
+
+        tracing::info!(
+            small_key_threshold = config.cluster.kv.small_key_threshold,
+            replication_factor = config.cluster.kv.replication_factor,
+            replication_mode = %config.cluster.kv.replication_mode,
+            "clustered KV replicator installed on local Store"
+        );
+
+        Some(cluster_handle)
     } else {
         None
     };
@@ -1369,6 +1443,7 @@ mod lib_tests {
             kv: ephpm_config::KvConfig::default(),
             cluster: ephpm_config::ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let store = ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default());
         Arc::new(Router::new(&config, store, None, None, None, None))

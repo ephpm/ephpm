@@ -241,11 +241,18 @@ v1 is HS256 only — RS256/JWKS is not implemented.
 
 ### `ratelimit`
 
-Fixed-window per-client rate limiting backed by the embedded KV store —
-when KV replication is on, the limit is **cluster-wide**. Requests are
-counted in 10-second windows; each window allows
+Fixed-window per-client rate limiting backed by the embedded KV store.
+Requests are counted in 10-second windows; each window allows
 `per_ip_rps × 10 + burst` requests per client. Over the limit: `429` with
 `Retry-After` for the seconds left in the window.
+
+**Cluster scope: per-node only, not cluster-wide (v1).** The counter is
+maintained with KV `INCR`, which is not yet gossip-replicated across
+nodes — only `SET`/`DEL` writes propagate. That means each node enforces
+its own window independently: a client hitting N nodes gets up to N ×
+the configured allowance. A cluster-wide window is planned (issue #150),
+tracked with replicated `INCR`. Startup logs a `warn!` when `ratelimit`
+is mounted with `[cluster].enabled = true` so operators see the gap.
 
 | key | default | meaning |
 |-----|---------|---------|

@@ -197,6 +197,10 @@ pub struct Router {
     /// Native middleware chain (`[[middleware]]`), evaluated on the PHP-bound
     /// path before the request body is read. `None` = no middleware mounted.
     middleware_chain: Option<Arc<crate::middleware::MiddlewareChain>>,
+    /// Cluster-wide OPcache invalidation watcher (Phase 1). Consulted on
+    /// every PHP request in fpm mode. Currently not wired into the worker-mode
+    /// dispatch path (see `[opcache].cluster_invalidation` docs).
+    opcache_watcher: crate::opcache::OpcacheWatcher,
     /// Negative-lookup cache for [`resolve_site`]: hosts that neither
     /// match a scanned site nor an on-disk site directory. Bot probes
     /// hit unknown Host headers constantly; without this cache each
@@ -413,6 +417,25 @@ impl Router {
             worker_pool,
             worker_stream_threshold: config.php.worker_stream_threshold,
             middleware_chain: None,
+            opcache_watcher: {
+                let enabled = config.opcache.effective_cluster_invalidation(config.cluster.enabled);
+                if enabled && config.php.is_worker_mode() {
+                    // Never a silent no-op: worker-mode wiring is a future
+                    // phase, so surface it at startup instead.
+                    tracing::warn!(
+                        "[opcache] cluster_invalidation is enabled but [php] mode = \
+                         \"worker\" — Phase 1 of OPcache clustering wires the watcher on \
+                         the fpm dispatch path only. Worker-mode invalidation is planned; \
+                         see site/content/roadmap/opcache-clustering.md."
+                    );
+                } else if enabled {
+                    tracing::info!(
+                        cluster_enabled = config.cluster.enabled,
+                        "[opcache] cluster_invalidation enabled — watching opcache:version:<vhost>"
+                    );
+                }
+                crate::opcache::OpcacheWatcher::new(enabled)
+            },
             unknown_site_cache: dashmap::DashMap::new(),
             kv_site_password_cache: dashmap::DashMap::new(),
             canonical_roots: dashmap::DashMap::new(),
@@ -495,6 +518,25 @@ impl Router {
             ("EPHPM_REDIS_USERNAME".into(), hostname.into()),
             ("EPHPM_REDIS_PASSWORD".into(), password),
         ]
+    }
+
+    /// Vhost key used for OPcache clustered invalidation (`opcache:version:<key>`).
+    ///
+    /// Mirrors `resolve_site`'s host-normalisation so a request that routes to
+    /// `<sites_dir>/blog/` invalidates against `opcache:version:blog` — matching
+    /// exactly what `ephpm deploy --site blog` writes. When no `sites_dir` is
+    /// configured, uses [`crate::opcache::DEFAULT_VHOST`] (`_default`).
+    fn opcache_vhost_key(&self, host: &str) -> String {
+        if self.sites_dir.is_none() && self.sites.is_empty() {
+            return crate::opcache::DEFAULT_VHOST.to_string();
+        }
+        let clean = host.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+        if let Some(suffix) = &self.sites_domain_suffix {
+            if let Some(stripped) = clean.strip_suffix(suffix.as_str()) {
+                return stripped.to_string();
+            }
+        }
+        if clean.is_empty() { crate::opcache::DEFAULT_VHOST.to_string() } else { clean }
     }
 
     fn resolve_site(&self, host: &str) -> (PathBuf, &[String], &[String]) {
@@ -1156,6 +1198,19 @@ impl Router {
         let mut env_vars = self.build_kv_env_vars(&server_name);
         env_vars.extend_from_slice(&self.db_env_vars);
 
+        // Phase-1 OPcache clustered invalidation: fast-path check outside the
+        // spawn_blocking hop so a no-op costs one atomic load + one KV get and
+        // never touches the blocking pool. When Decision::Invalidate fires, we
+        // pass the version + vhost name down so the blocking closure can call
+        // the FFI invalidator inside the PHP request lifecycle (must run on a
+        // TSRM-registered thread with an active request).
+        let vhost_name = self.opcache_vhost_key(&server_name);
+        let invalidate_version = match self.opcache_watcher.check(&self.store, &vhost_name) {
+            crate::opcache::Decision::NoOp => None,
+            crate::opcache::Decision::Invalidate { version } => Some(version),
+        };
+        let opcache_watcher = invalidate_version.map(|_| self.opcache_watcher.clone());
+
         // Cap concurrent PHP executions when [php].workers is set. The permit
         // is held for the whole execution (php-fpm max_children semantics):
         // requests past the cap queue here until a worker frees up, still
@@ -1184,6 +1239,24 @@ impl Router {
             if vhost_open_basedir {
                 let basedir = format!("{}:/tmp", document_root.display());
                 PhpRuntime::set_request_ini("open_basedir", &basedir);
+            }
+
+            // OPcache clustered invalidation (Phase 1): if the watcher told us
+            // to invalidate, drop bytecode under this vhost's docroot BEFORE
+            // executing the script. Runs on the TSRM-registered blocking
+            // thread inside the thread's still-active previous/initial request
+            // (ephpm_thread_init leaves one open; execute() cycles it AFTER
+            // this point) — OPcache SHM effects survive that cycle.
+            // mark_invalidated deduplicates so concurrent requests coalesce on
+            // the per-vhost mutex.
+            if let (Some(watcher), Some(version)) = (opcache_watcher, invalidate_version) {
+                watcher.mark_invalidated(
+                    &vhost_name,
+                    &document_root,
+                    version,
+                    crate::opcache::InvalidationTrigger::Kv,
+                    PhpRuntime::opcache_invalidate_under,
+                );
             }
 
             PhpRuntime::execute(PhpRequest {
@@ -2125,6 +2198,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         Router::new(&config, test_store(), None, None, None, None)
     }
@@ -2143,6 +2217,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         Router::new(&config, test_store(), None, None, None, None)
     }
@@ -2166,6 +2241,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         config.server.static_files.etag = true;
         Router::new(&config, store, None, None, None, None)
@@ -2359,6 +2435,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         config.server.security.get_or_insert_default().trusted_proxies =
             vec!["10.0.0.0/8".to_string()];
@@ -2383,6 +2460,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         config.server.security.get_or_insert_default().trusted_proxies =
             vec!["10.0.0.0/8".to_string()];
@@ -2409,6 +2487,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert_eq!(router.server_port, 3000);
@@ -2428,6 +2507,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert_eq!(router.server_port, 8080);
@@ -2449,6 +2529,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(router.open_basedir, "multi-tenant mode must default open_basedir on");
@@ -2467,6 +2548,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(!router.open_basedir);
@@ -2511,6 +2593,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert!(router.is_php_allowed("/anything.php"));
@@ -2529,6 +2612,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-login.php".to_string()];
@@ -2551,6 +2635,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-admin/*.php".to_string()];
@@ -2784,6 +2869,7 @@ mod tests {
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
         assert_eq!(router.server_port, 9090);
@@ -3185,6 +3271,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -3210,6 +3297,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -3236,6 +3324,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -3262,6 +3351,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -3285,6 +3375,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -3312,6 +3403,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -3342,6 +3434,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 
@@ -3387,6 +3480,7 @@ echo "post response";
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
             middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
         };
         let router = Router::new(&config, test_store(), None, None, None, None);
 

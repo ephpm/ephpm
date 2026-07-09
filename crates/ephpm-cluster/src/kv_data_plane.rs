@@ -160,7 +160,11 @@ async fn handle_connection(
         }
         OP_SET => {
             let value = request.value.expect("SET request always carries a value");
-            let ok = store.set(request.key, value, None);
+            // Replica-side write: we are the receiver of a fanned-out replica
+            // copy, not the origin. Use `set_local` so we don't re-enter any
+            // installed Replicator hook and re-fanout the same key back to
+            // our peers (infinite loop).
+            let ok = store.set_local(request.key, value, None);
             vec![if ok { SET_OK } else { SET_REJECTED }]
         }
         other => {
