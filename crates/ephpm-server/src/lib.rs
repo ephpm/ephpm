@@ -75,6 +75,20 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             modules = ?chain.module_names(),
             "middleware chain loaded"
         );
+        // In cluster mode, the built-in ratelimit middleware uses local KV
+        // INCR to track the request count per window. INCR is NOT yet
+        // replicated across the cluster (issue #150 — writes gossip on
+        // SET, but INCR is a local-only op today), so the rate limit is
+        // enforced PER NODE, not across the whole fleet. Surface the gap
+        // at startup instead of leaving operators to find it in prod.
+        if config.cluster.enabled && chain.module_names().contains(&"ratelimit") {
+            tracing::warn!(
+                "[middleware] ratelimit mounted with [cluster].enabled = true — KV INCR is \
+                 not yet replicated across nodes, so rate limits are enforced PER NODE. A \
+                 client hitting N nodes gets up to N × the configured allowance. See \
+                 site/content/reference/middleware/ratelimit.md for the current status."
+            );
+        }
         Some(Arc::new(chain))
     };
 
@@ -137,9 +151,15 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         // is disabled in config).
         clustered.init_hot_key_watcher().await;
 
+        // Shared last-arrival-wins ordering map: threaded through both the
+        // replicator (records origin writes) and the applier (records
+        // remote applies), so a slow gossip echo of an older write can't
+        // clobber a newer local overwrite.
+        let applied = ephpm_cluster::clustered_store::new_applied_write_map();
         let replicator = ephpm_cluster::KvReplicator::new(
             Arc::clone(&clustered),
             tokio::runtime::Handle::current(),
+            Arc::clone(&applied),
         );
         kv_store.set_replicator(Some(replicator as Arc<dyn ephpm_kv::store::Replicator>));
 
@@ -150,6 +170,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         ephpm_cluster::clustered_store::start_gossip_applier(
             &cluster_handle,
             Arc::clone(&kv_store),
+            applied,
         )
         .await;
 

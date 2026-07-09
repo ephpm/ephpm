@@ -5,10 +5,23 @@
 //! other node automatically via the SWIM gossip protocol.
 //!
 //! Values are base64-encoded (chitchat stores `String → String`) with
-//! an optional TTL encoded as an epoch-millisecond prefix.
+//! an optional TTL and the origin's wall-clock write time encoded as a
+//! millisecond prefix pair.
 //!
-//! Wire format: `"{expiry_ms}:{base64_value}"` where `expiry_ms` is
-//! `0` for no-TTL entries.
+//! Wire format: `"{expiry_ms}:{write_ms}:{base64_value}"`.
+//!   - `expiry_ms` is the epoch-millisecond expiry (0 = no TTL).
+//!   - `write_ms` is the epoch-millisecond the origin node produced the
+//!     value. Used by the gossip applier for last-arrival-wins ordering
+//!     so a slow echo of an older write cannot clobber a newer one.
+//!
+//! **Legacy format compatibility.** The v1 format was
+//! `"{expiry_ms}:{base64_value}"` (no `write_ms`). `decode_value`,
+//! `remaining_ttl_ms`, and the subscription decoder still accept it so a
+//! rolling upgrade from a pre-`write_ms` peer does not drop data on the
+//! floor. Legacy entries are treated as `write_ms = 0`, which means the
+//! applier will always apply them (they are strictly older than any
+//! current-format entry). Only encode is one-way: new writes always
+//! emit the three-field form.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -30,21 +43,49 @@ fn now_epoch_ms() -> u64 {
 }
 
 /// Encode a binary value + optional TTL into the chitchat string format.
+///
+/// Emits the current three-field form `"{expiry_ms}:{write_ms}:{b64}"`.
+/// `write_ms` is stamped at encode time so the applier on remote nodes
+/// can order overlapping writes deterministically (last arrival wins).
 fn encode_value(value: &[u8], ttl: Option<Duration>) -> String {
+    let now_ms = now_epoch_ms();
     let expiry_ms = ttl.map_or(0u64, |d| {
         let ttl_ms = u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-        now_epoch_ms().saturating_add(ttl_ms)
+        now_ms.saturating_add(ttl_ms)
     });
     let b64 = Base64::encode_string(value);
-    format!("{expiry_ms}:{b64}")
+    format!("{expiry_ms}:{now_ms}:{b64}")
+}
+
+/// Split an encoded value into (expiry_ms, write_ms, base64) while
+/// accepting both the v1 two-field format and the v2 three-field format.
+///
+/// v1 entries are reported with `write_ms = 0` — the smallest possible
+/// value, which lets the applier treat them as strictly older than any
+/// current-format entry and always apply them once.
+fn split_encoded(encoded: &str) -> Option<(u64, u64, &str)> {
+    let (first, rest) = encoded.split_once(':')?;
+    let expiry_ms: u64 = first.parse().ok()?;
+    if let Some((second, tail)) = rest.split_once(':') {
+        // Three-field form. `second` MUST parse as u64 for this to be a
+        // v2 payload; if it doesn't, fall back to treating `rest` as
+        // legacy base64 (unlikely — base64 alphabet has no ':' — but
+        // symmetric with the accept-both contract).
+        if let Ok(write_ms) = second.parse::<u64>() {
+            return Some((expiry_ms, write_ms, tail));
+        }
+    }
+    // v1 two-field form: no write_ms, `rest` is the base64 payload.
+    Some((expiry_ms, 0, rest))
 }
 
 /// Decode a chitchat value string back to binary, checking TTL.
 ///
-/// Returns `None` if the entry has expired.
+/// Accepts BOTH the v2 three-field format and the v1 two-field format —
+/// necessary during a rolling upgrade where some peers still run the
+/// pre-`write_ms` code path. Returns `None` if the entry has expired.
 fn decode_value(encoded: &str) -> Option<Vec<u8>> {
-    let (expiry_str, b64) = encoded.split_once(':')?;
-    let expiry_ms: u64 = expiry_str.parse().ok()?;
+    let (expiry_ms, _write_ms, b64) = split_encoded(encoded)?;
 
     if expiry_ms > 0 && now_epoch_ms() >= expiry_ms {
         return None; // expired
@@ -53,13 +94,27 @@ fn decode_value(encoded: &str) -> Option<Vec<u8>> {
     Base64::decode_vec(b64).ok()
 }
 
-/// Remaining TTL from an encoded value, in milliseconds.
+/// Decode and also return the origin write time. Used by the gossip
+/// applier for stale-write detection.
+///
+/// v1 legacy entries return `write_ms = 0`, which sorts before any
+/// v2 timestamp — so a legacy entry always applies on first arrival.
+fn decode_value_with_write_ms(encoded: &str) -> Option<(Vec<u8>, u64)> {
+    let (expiry_ms, write_ms, b64) = split_encoded(encoded)?;
+    if expiry_ms > 0 && now_epoch_ms() >= expiry_ms {
+        return None;
+    }
+    let bytes = Base64::decode_vec(b64).ok()?;
+    Some((bytes, write_ms))
+}
+
+/// Remaining TTL from an encoded value, in milliseconds. Accepts both
+/// v1 and v2 wire formats (rolling-upgrade compatible).
 ///
 /// Returns `None` if no TTL is set or the value format is invalid.
 /// Returns `Some(0)` if already expired.
 fn remaining_ttl_ms(encoded: &str) -> Option<u64> {
-    let (expiry_str, _) = encoded.split_once(':')?;
-    let expiry_ms: u64 = expiry_str.parse().ok()?;
+    let (expiry_ms, _write_ms, _b64) = split_encoded(encoded)?;
     if expiry_ms == 0 {
         return None; // no TTL
     }
@@ -178,21 +233,22 @@ impl ClusterHandle {
     ///
     /// The callback receives the key (without the `kv:` prefix), the
     /// decoded value, the remaining TTL (when the entry carries one),
-    /// and the node that changed it. Used by the gossip→local-store
-    /// applier and hot-key invalidation notifications.
+    /// the origin `write_ms` stamped by the writer (0 for pre-`write_ms`
+    /// legacy entries), and the node that changed it. Used by the
+    /// gossip→local-store applier and hot-key invalidation notifications.
     pub async fn subscribe_kv_changes<F>(&self, callback: F)
     where
-        F: Fn(&str, &[u8], Option<Duration>, &ChitchatId) + Send + Sync + 'static,
+        F: Fn(&str, &[u8], Option<Duration>, u64, &ChitchatId) + Send + Sync + 'static,
     {
         let chitchat = self.handle.chitchat();
         let guard = chitchat.lock().await;
         guard
             .subscribe_event(KV_PREFIX, move |event| {
-                if let Some(value) = decode_value(event.value) {
+                if let Some((value, write_ms)) = decode_value_with_write_ms(event.value) {
                     let ttl = remaining_ttl_ms(event.value)
                         .filter(|ms| *ms > 0)
                         .map(Duration::from_millis);
-                    callback(event.key, &value, ttl, event.node);
+                    callback(event.key, &value, ttl, write_ms, event.node);
                 }
             })
             .forever();
@@ -223,7 +279,10 @@ mod tests {
     fn encode_decode_no_ttl() {
         let value = b"hello world";
         let encoded = encode_value(value, None);
+        // v2 wire form: "{expiry}:{write_ms}:{b64}", so the leading "0:"
+        // (no TTL) is followed by another numeric colon-terminated field.
         assert!(encoded.starts_with("0:"));
+        assert!(encoded.matches(':').count() >= 2);
         let decoded = decode_value(&encoded).expect("should decode");
         assert_eq!(decoded, value);
     }
@@ -232,10 +291,10 @@ mod tests {
     fn encode_decode_with_ttl() {
         let value = b"test data";
         let encoded = encode_value(value, Some(Duration::from_secs(3600)));
-        // Expiry should be non-zero.
-        let (expiry_str, _) = encoded.split_once(':').unwrap();
-        let expiry: u64 = expiry_str.parse().unwrap();
+        // Expiry should be non-zero, and write_ms should also be non-zero.
+        let (expiry, write_ms, _b64) = split_encoded(&encoded).unwrap();
         assert!(expiry > 0);
+        assert!(write_ms > 0);
         // Should decode fine (not expired).
         let decoded = decode_value(&encoded).expect("should decode");
         assert_eq!(decoded, value);
@@ -245,8 +304,35 @@ mod tests {
     fn decode_expired_returns_none() {
         // Manually craft an expired entry (expiry in the past).
         let b64 = Base64::encode_string(b"old data");
-        let encoded = format!("1:{b64}"); // epoch ms = 1 → long expired
+        let encoded = format!("1:1:{b64}"); // epoch ms = 1 → long expired
         assert!(decode_value(&encoded).is_none());
+    }
+
+    #[test]
+    fn decode_accepts_legacy_two_field_format() {
+        // A pre-write_ms peer emits "{expiry}:{b64}" with no write_ms
+        // slot. The applier still needs to accept those during a rolling
+        // upgrade or data goes on the floor.
+        let value = b"legacy peer wrote this";
+        let b64 = Base64::encode_string(value);
+        let legacy = format!("0:{b64}"); // no TTL, no write_ms
+        let decoded = decode_value(&legacy).expect("legacy form should decode");
+        assert_eq!(decoded, value);
+        let (bytes, write_ms) =
+            decode_value_with_write_ms(&legacy).expect("legacy form should split");
+        assert_eq!(bytes, value);
+        assert_eq!(write_ms, 0, "legacy entries report write_ms = 0");
+        assert!(remaining_ttl_ms(&legacy).is_none());
+    }
+
+    #[test]
+    fn decode_accepts_current_three_field_format() {
+        // Round-trip through encode_value → decode_value_with_write_ms.
+        let value = b"v2 write";
+        let encoded = encode_value(value, None);
+        let (bytes, write_ms) = decode_value_with_write_ms(&encoded).expect("v2 should decode");
+        assert_eq!(bytes, value);
+        assert!(write_ms > 0, "v2 entries carry a real write_ms");
     }
 
     #[test]
@@ -267,8 +353,19 @@ mod tests {
     #[test]
     fn remaining_ttl_expired() {
         let b64 = Base64::encode_string(b"x");
-        let encoded = format!("1:{b64}");
+        let encoded = format!("1:1:{b64}");
         let ttl = remaining_ttl_ms(&encoded).expect("should have TTL");
+        assert_eq!(ttl, 0);
+    }
+
+    #[test]
+    fn remaining_ttl_expired_legacy_two_field() {
+        // Legacy peer emits "{expiry}:{b64}" — remaining_ttl_ms MUST still
+        // report a value or a rolling upgrade would silently break TTL
+        // observability on freshly-written keys from the older peer.
+        let b64 = Base64::encode_string(b"x");
+        let encoded = format!("1:{b64}");
+        let ttl = remaining_ttl_ms(&encoded).expect("legacy TTL should decode");
         assert_eq!(ttl, 0);
     }
 

@@ -89,7 +89,11 @@ async fn sync_store_set_routes_through_clustered_store_gossip_tier() {
 
     // Install the sync bridge on the local store — this is what
     // `serve()` does at startup.
-    let replicator = KvReplicator::new(Arc::clone(&clustered), tokio::runtime::Handle::current());
+    let replicator = KvReplicator::new(
+        Arc::clone(&clustered),
+        tokio::runtime::Handle::current(),
+        ephpm_cluster::clustered_store::new_applied_write_map(),
+    );
     local.set_replicator(Some(replicator as Arc<dyn Replicator>));
 
     // Sync API — mirrors what the RESP dispatcher and PHP kv_bridge do.
@@ -145,7 +149,11 @@ async fn sync_store_set_routes_large_value_to_local_via_set_local() {
         ClusterKvConfig { small_key_threshold: 8, ..ClusterKvConfig::default() },
         None,
     );
-    let replicator = KvReplicator::new(Arc::clone(&clustered), tokio::runtime::Handle::current());
+    let replicator = KvReplicator::new(
+        Arc::clone(&clustered),
+        tokio::runtime::Handle::current(),
+        ephpm_cluster::clustered_store::new_applied_write_map(),
+    );
     local.set_replicator(Some(replicator as Arc<dyn Replicator>));
 
     // Large value — goes to the local store tier via ClusteredStore.
@@ -197,7 +205,11 @@ async fn hooked_sync_set_replicates_to_peer_via_gossip() {
         ClusterKvConfig { small_key_threshold: 4096, ..ClusterKvConfig::default() },
         None,
     );
-    let rep1 = KvReplicator::new(Arc::clone(&cs1), tokio::runtime::Handle::current());
+    let rep1 = KvReplicator::new(
+        Arc::clone(&cs1),
+        tokio::runtime::Handle::current(),
+        ephpm_cluster::clustered_store::new_applied_write_map(),
+    );
     local1.set_replicator(Some(rep1 as Arc<dyn Replicator>));
 
     let local2 = Store::new(StoreConfig::default());
