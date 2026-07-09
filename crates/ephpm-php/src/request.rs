@@ -100,18 +100,15 @@ impl PhpRequest {
             vars.push(("HTTPS".into(), "on".into()));
         }
 
-        // Map HTTP headers to $_SERVER variables
+        // Map HTTP headers to $_SERVER variables.
+        //
+        // Formerly built the CGI-style key with two String allocs per
+        // header (`to_uppercase()` then `.replace('-','_')`). Header
+        // names are ASCII by RFC 7230, so we can do a single byte
+        // pass — one allocation per non-canonicalised header, with
+        // the `HTTP_` prefix filled in place.
         for (name, value) in &self.headers {
-            let key = match name.to_lowercase().as_str() {
-                "host" => "HTTP_HOST".to_string(),
-                "cookie" => "HTTP_COOKIE".to_string(),
-                "content-type" => "CONTENT_TYPE".to_string(),
-                "content-length" => "CONTENT_LENGTH".to_string(),
-                _ => {
-                    // Convert "Accept-Encoding" → "HTTP_ACCEPT_ENCODING"
-                    format!("HTTP_{}", name.to_uppercase().replace('-', "_"))
-                }
-            };
+            let key = cgi_header_key(name);
             vars.push((key, value.clone()));
         }
 
@@ -132,6 +129,49 @@ impl PhpRequest {
             .map(|(_, value)| value.clone())
             .unwrap_or_default()
     }
+}
+
+/// Build the CGI-style `$_SERVER` key for an HTTP header name in one
+/// byte pass.
+///
+/// Headers `host`, `cookie`, `content-type`, `content-length` map to
+/// non-`HTTP_` keys per the CGI spec (and PHP's SAPI conventions);
+/// everything else becomes `HTTP_<UPPER-WITH-UNDERSCORES>`. The old
+/// implementation called `to_lowercase()` for dispatch and then, on
+/// the general path, `to_uppercase()` and `.replace('-', '_')` — three
+/// String allocations per header. HTTP header names are ASCII by RFC
+/// 7230 so this can be a single ASCII upper + dash-to-underscore
+/// pass writing into a pre-sized `String`.
+#[must_use]
+pub(crate) fn cgi_header_key(name: &str) -> String {
+    // Special-case the ASCII-canonical spellings first (case-
+    // insensitive). Doing this without a to_lowercase alloc is a
+    // simple `eq_ignore_ascii_case`.
+    if name.eq_ignore_ascii_case("host") {
+        return "HTTP_HOST".to_string();
+    }
+    if name.eq_ignore_ascii_case("cookie") {
+        return "HTTP_COOKIE".to_string();
+    }
+    if name.eq_ignore_ascii_case("content-type") {
+        return "CONTENT_TYPE".to_string();
+    }
+    if name.eq_ignore_ascii_case("content-length") {
+        return "CONTENT_LENGTH".to_string();
+    }
+
+    let bytes = name.as_bytes();
+    let mut out = String::with_capacity(5 + bytes.len());
+    out.push_str("HTTP_");
+    for b in bytes {
+        let c = match *b {
+            b'-' => b'_',
+            b @ b'a'..=b'z' => b - 32,
+            b => b,
+        };
+        out.push(char::from(c));
+    }
+    out
 }
 
 #[cfg(test)]
