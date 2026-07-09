@@ -48,7 +48,7 @@ pub fn dispatch(store: &Arc<Store>, frame: &Frame) -> Frame {
         .iter()
         .skip(1)
         .filter_map(|f| match f {
-            Frame::Bulk(b) => Some(b.as_slice()),
+            Frame::Bulk(b) => Some(b.as_ref()),
             _ => None,
         })
         .collect();
@@ -310,7 +310,10 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
                             None
                         }
                     });
-                    store.set(new_key, val, ttl);
+                    // Convert Bytes → Vec<u8> at the write boundary
+                    // (Store::set still takes an owned Vec). RENAME is
+                    // cold enough that this extra copy is fine.
+                    store.set(new_key, val.to_vec(), ttl);
                     store.remove(&old_key);
                     Frame::ok()
                 }

@@ -154,8 +154,14 @@ fn parse_bulk(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
         return Ok(None);
     }
 
-    let data = buf[after_len_line..after_len_line + len].to_vec();
-    let _ = buf.split_to(total);
+    // Drain the bulk payload straight out of the input buffer as a
+    // zero-copy `Bytes` slice. `BytesMut::split_to` reuses the
+    // underlying allocation, so we avoid the `.to_vec()` memcpy the old
+    // path did — matters for large PUT bodies from PHP session writes.
+    let head = buf.split_to(after_len_line);
+    let data = buf.split_to(len).freeze();
+    let _ = buf.split_to(2); // trailing \r\n
+    drop(head);
     Ok(Some(Frame::Bulk(data)))
 }
 
@@ -246,7 +252,7 @@ mod tests {
     #[test]
     fn bulk_string() {
         let frame = parse(b"$6\r\nfoobar\r\n").unwrap().unwrap();
-        assert_eq!(frame, Frame::Bulk(b"foobar".to_vec()));
+        assert_eq!(frame, Frame::Bulk(bytes::Bytes::from_static(b"foobar")));
     }
 
     #[test]
@@ -260,7 +266,10 @@ mod tests {
         let frame = parse(b"*2\r\n$3\r\nGET\r\n$3\r\nkey\r\n").unwrap().unwrap();
         assert_eq!(
             frame,
-            Frame::Array(vec![Frame::Bulk(b"GET".to_vec()), Frame::Bulk(b"key".to_vec()),])
+            Frame::Array(vec![
+                Frame::Bulk(bytes::Bytes::from_static(b"GET")),
+                Frame::Bulk(bytes::Bytes::from_static(b"key")),
+            ])
         );
     }
 
