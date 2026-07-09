@@ -1,9 +1,10 @@
 # OPcache Clustering & Per-Vhost Preload
 
-> **Status:** Phase 1 (cluster-wide invalidation) is implemented on the
-> fpm dispatch path and shipped with `ephpm deploy` / `ephpm cache reset`
-> and the `[opcache] cluster_invalidation` config knob. Phases 2 (per-vhost
-> preload) and 3 (file-change watcher) remain design-only.
+> **Status:** Phase 1 (cluster-wide invalidation) **shipped in 0.4.0** —
+> see the [user guide](/guides/opcache-cluster-invalidation/) for setup,
+> the `ephpm deploy` / `ephpm cache reset` CLI, and Kubernetes usage.
+> This page remains the design rationale plus the still-unimplemented
+> Phases 2 (per-vhost preload) and 3 (file-change watcher).
 >
 > Phase 1 known gaps: worker mode (`[php] mode = "worker"`) is NOT wired
 > yet — the watcher is skipped and startup logs a WARN so the no-op is
