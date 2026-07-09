@@ -1058,6 +1058,14 @@ pub struct DbAnalysisConfig {
     /// Default: `100000`.
     #[serde(default = "default_digest_max_entries")]
     pub digest_store_max_entries: usize,
+
+    /// Maximum number of distinct `digest` label values emitted to
+    /// Prometheus. Digests beyond the cap fold into `digest="__other__"`,
+    /// bounding metric cardinality. `0` = unlimited.
+    ///
+    /// Default: `1000`.
+    #[serde(default = "default_metric_label_series_max")]
+    pub metric_label_series_max: usize,
 }
 
 impl Default for DbAnalysisConfig {
@@ -1068,8 +1076,13 @@ impl Default for DbAnalysisConfig {
             auto_explain: false,
             auto_explain_target: default_auto_explain_target(),
             digest_store_max_entries: default_digest_max_entries(),
+            metric_label_series_max: default_metric_label_series_max(),
         }
     }
+}
+
+fn default_metric_label_series_max() -> usize {
+    1000
 }
 
 fn default_query_stats_enabled() -> bool {

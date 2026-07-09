@@ -86,7 +86,7 @@ The per-metric `digest` label series is **capped** — by default at 1,000 disti
 
 The internal digest table itself is bounded separately by `[db.analysis] digest_store_max_entries` (default 100,000). That knob controls how many distinct digests are held in memory for `top_queries()`; the label-series cap above controls Prometheus cardinality.
 
-If you need finer-grained control (raise or lower the label cap), that value is currently a build-time default and not yet a config knob — planned. In the meantime, if your Prometheus is unhappy, set `query_stats = false` to disable the metrics entirely.
+The cap is configurable: `[db.analysis] metric_label_series_max` (default `1000`, `0` = unlimited). If your Prometheus is unhappy regardless, set `query_stats = false` to disable the metrics entirely.
 
 The `path`-style labels you might expect on HTTP metrics (`/users/123`) are deliberately *not* present — Prometheus' best-practice is to keep label cardinality bounded, and request paths in PHP apps explode it. Use the slow-query log + tracing for path-level debugging.
 
