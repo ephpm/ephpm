@@ -983,13 +983,16 @@ const char *ephpm_get_response_headers(size_t *out_len)
  * ephpm_opcache_invalidate_under(docroot) walks opcache_get_status(true)['scripts']
  * and calls opcache_invalidate($path, true) for every cached script whose
  * full_path starts with the vhost's docroot prefix. Returns the number of
- * scripts invalidated, or -1 if OPcache is not loaded / not enabled.
+ * scripts invalidated, or one of the EPHPM_OPCACHE_* failure codes below.
  *
- * Runs entirely inside userland by evaluating a small PHP snippet with
- * zend_eval_string_ex() under a SETJMP bailout guard. This avoids the
- * fragility of walking OPcache's internal HashTable via extension APIs
- * (accelerator_shm layout has shifted between PHP minors) and matches the
- * pattern already used by cli_execute_protected() for CLI mode.
+ * Implementation: direct C-level calls into the OPcache extension via
+ * zend_call_known_function. Earlier revisions of this branch evaluated a
+ * userland snippet with zend_eval_string_ex, but that path has a footgun —
+ * zend_eval_string_ex with a retval WRAPS the code as `return <code>;`, so
+ * any accidental leading `return` produces `return return (...);` → ParseError
+ * (found the hard way on the two-node kind demo). Direct calls eliminate the
+ * eval entirely: look up opcache_get_status / opcache_invalidate in
+ * EG(function_table) and invoke them the same way a compiled call site would.
  *
  * Must be called on a TSRM-registered thread WITH an active PHP request
  * (i.e. at the start of ephpm_execute_request(), after php_request_startup).
@@ -998,63 +1001,22 @@ const char *ephpm_get_response_headers(size_t *out_len)
  * cluster-wide version key, not on every request.
  * =================================================================== */
 
-/* Small PHP snippet that returns the number of invalidated scripts, or -1
- * when opcache_get_status is unavailable. The prefix is inlined as a
- * single-quoted literal — the C side escapes single quotes and backslashes
- * before splicing it in. force=true so the invalidation drops the bytecode
- * even if the file's mtime hasn't advanced (deploys often keep timestamps). */
-/* NOTE: no leading `return` and no trailing `;` — zend_eval_string_ex
- * with a retval pointer wraps the code as `return <code>;` itself.
- * Including our own produced `return return (...)();` → ParseError
- * (found the hard way on the two-node kind demo). */
-static const char EPHPM_OPCACHE_SNIPPET_HEAD[] =
-    "(function(){"
-    "if (!function_exists('opcache_get_status') || "
-    "!function_exists('opcache_invalidate')) { return -1; }"
-    "$s = @opcache_get_status(true);"
-    "if (!is_array($s) || empty($s['scripts'])) { return 0; }"
-    "$prefix = '";
-static const char EPHPM_OPCACHE_SNIPPET_TAIL[] =
-    "'; $n = 0;"
-    "foreach ($s['scripts'] as $p => $_info) {"
-    "if (strncmp($p, $prefix, strlen($prefix)) === 0) {"
-    "opcache_invalidate($p, true); $n++;"
-    "}}"
-    "return $n;"
-    "})()";
+/* Failure contract (must match crates/ephpm-php/src/lib.rs::opcache_invalidate_under):
+ *   -1: OPcache extension unavailable — opcache_get_status or opcache_invalidate
+ *       missing from the function table, or opcache_get_status returned a
+ *       shape we don't recognise (non-array / no 'scripts' HashTable).
+ *   -2: SETJMP bailout inside one of the direct calls (OOM / OPcache in
+ *       bad state).
+ *   -3: A userland exception surfaced inside one of the direct calls; the
+ *       class/message is stashed for ephpm_opcache_last_exception().
+ * Non-negative values are the number of scripts invalidated. */
+#define EPHPM_OPCACHE_UNAVAILABLE (-1L)
+#define EPHPM_OPCACHE_BAILOUT     (-2L)
+#define EPHPM_OPCACHE_EXCEPTION   (-3L)
 
-/* Escape a docroot for embedding inside a single-quoted PHP literal.
- * Only ' and \ need escaping in that context. Writes into `out` (which must
- * have capacity `out_cap`) and null-terminates. Returns 1 on success, 0 if
- * the escaped string would not fit. */
-static int ephpm_opcache_escape_prefix(const char *prefix, char *out, size_t out_cap)
-{
-    size_t o = 0;
-    for (size_t i = 0; prefix[i] != '\0'; i++) {
-        char c = prefix[i];
-        if (c == '\'' || c == '\\') {
-            if (o + 2 >= out_cap) return 0;
-            out[o++] = '\\';
-            out[o++] = c;
-        } else {
-            if (o + 1 >= out_cap) return 0;
-            out[o++] = c;
-        }
-    }
-    if (o + 1 > out_cap) return 0;
-    out[o] = '\0';
-    return 1;
-}
-
-/*
- * Invalidate every cached OPcache script whose path starts with `docroot`.
- *
- * Returns the number of scripts invalidated (>= 0), or -1 if OPcache is not
- * available (extension missing / disabled / snippet compile failed / bailout).
- * Must be called from a TSRM-registered thread with an active PHP request.
- */
 /* Last exception observed by ephpm_opcache_invalidate_under ("Class: msg").
- * Thread-local, valid until the next call on the same thread. */
+ * Thread-local, valid until the next call on the same thread. Cleared at the
+ * top of every call. */
 static EPHPM_TLS char opcache_exc_buf[256];
 
 const char *ephpm_opcache_last_exception(void)
@@ -1062,96 +1024,154 @@ const char *ephpm_opcache_last_exception(void)
     return opcache_exc_buf;
 }
 
+/* If a userland exception is pending on the executor, format its class name
+ * and message into opcache_exc_buf and clear it. A leaked pending exception
+ * would surface inside the next unrelated script — same reason the old
+ * snippet-based path did this after zend_eval_string_ex. */
+static void ephpm_opcache_capture_exception(void)
+{
+    if (!EG(exception)) {
+        return;
+    }
+    if (zend_is_unwind_exit(EG(exception))) {
+        /* exit()/die() unwind — leave it in place for the outer request loop. */
+        return;
+    }
+    zend_object *ex = EG(exception);
+    const char *cls = ZSTR_VAL(ex->ce->name);
+    zval rv;
+    zval *msg = zend_read_property_ex(
+        ex->ce, ex, ZSTR_KNOWN(ZEND_STR_MESSAGE), 1, &rv);
+    const char *msg_str =
+        (msg && Z_TYPE_P(msg) == IS_STRING) ? Z_STRVAL_P(msg) : "?";
+    snprintf(opcache_exc_buf, sizeof(opcache_exc_buf), "%s: %s", cls, msg_str);
+    zend_clear_exception();
+}
+
+/*
+ * Invalidate every cached OPcache script whose path starts with `docroot`.
+ *
+ * Returns the number of scripts invalidated (>= 0), or one of the
+ * EPHPM_OPCACHE_* codes above. Must be called from a TSRM-registered thread
+ * with an active PHP request.
+ */
 long ephpm_opcache_invalidate_under(const char *docroot)
 {
     opcache_exc_buf[0] = '\0';
     if (!docroot || docroot[0] == '\0') {
-        return -1;
+        return EPHPM_OPCACHE_UNAVAILABLE;
     }
 
-    /* Escape the docroot into the assembled PHP snippet. 2048 covers the
-     * longest realistic filesystem path with plenty of headroom. */
-    char escaped[2048];
-    if (!ephpm_opcache_escape_prefix(docroot, escaped, sizeof(escaped))) {
-        return -1;
+    /* Look up opcache_get_status / opcache_invalidate directly in the executor
+     * function table. If OPcache is not loaded (or was disabled at runtime and
+     * unregistered its functions), we get NULL and bail. */
+    zend_function *fn_status = zend_hash_str_find_ptr(
+        EG(function_table), "opcache_get_status", sizeof("opcache_get_status") - 1);
+    zend_function *fn_invalidate = zend_hash_str_find_ptr(
+        EG(function_table), "opcache_invalidate", sizeof("opcache_invalidate") - 1);
+    if (!fn_status || !fn_invalidate) {
+        return EPHPM_OPCACHE_UNAVAILABLE;
     }
 
-    /* Assemble HEAD + escaped prefix + TAIL into a single null-terminated
-     * buffer for zend_eval_string_ex. */
-    size_t head_len = sizeof(EPHPM_OPCACHE_SNIPPET_HEAD) - 1;
-    size_t tail_len = sizeof(EPHPM_OPCACHE_SNIPPET_TAIL) - 1;
-    size_t esc_len = strlen(escaped);
-    size_t total = head_len + esc_len + tail_len + 1;
-    char *snippet = (char *)malloc(total);
-    if (!snippet) {
-        return -1;
-    }
-    memcpy(snippet, EPHPM_OPCACHE_SNIPPET_HEAD, head_len);
-    memcpy(snippet + head_len, escaped, esc_len);
-    memcpy(snippet + head_len + esc_len, EPHPM_OPCACHE_SNIPPET_TAIL, tail_len);
-    snippet[total - 1] = '\0';
-
-    long count = -1;
-    zval retval;
-    ZVAL_UNDEF(&retval);
+    size_t prefix_len = strlen(docroot);
+    long count = 0;
 
     /* SETJMP guard: a bailout inside opcache_get_status / opcache_invalidate
-     * (shouldn't happen in normal builds, but OOM / OPcache-in-bad-state can
-     * still trip it) must not unwind through Rust. */
+     * (OOM / OPcache-in-bad-state) must not unwind through Rust. */
     JMP_BUF *__orig_bailout = EG(bailout);
     JMP_BUF __bailout;
     EG(bailout) = &__bailout;
 
+    zval status_ret;
+    ZVAL_UNDEF(&status_ret);
+
     if (SETJMP(__bailout) == 0) {
-        int rc = zend_eval_string_ex(snippet, &retval, "ephpm_opcache_invalidate", 0);
-        if (rc == SUCCESS) {
-            if (Z_TYPE(retval) == IS_LONG) {
-                count = (long)Z_LVAL(retval);
-            } else if (Z_TYPE(retval) == IS_DOUBLE) {
-                count = (long)Z_DVAL(retval);
-            } else {
-                /* eval succeeded but produced a non-numeric value —
-                 * encode the zval type so the Rust debug log can say why. */
-                count = -100 - (long)Z_TYPE(retval);
-            }
-        } else {
-            /* compile/execute failure without bailout */
-            count = -2;
-        }
-        /* Clear ANY pending exception the snippet raised. This eval runs in
-         * the still-active previous/initial request, immediately before the
-         * next request's script executes — a leaked pending exception would
-         * surface inside that unrelated script. Record class+message for
-         * diagnostics; only report failure if the eval didn't already
-         * produce a usable count. */
+        /* status_ret = opcache_get_status(true); — pass a single boolean-true
+         * argument so the returned array includes the per-script table. */
+        zval status_args[1];
+        ZVAL_TRUE(&status_args[0]);
+        zend_call_known_function(
+            fn_status, NULL, NULL, &status_ret, 1, status_args, NULL);
+
         if (EG(exception)) {
-            if (!zend_is_unwind_exit(EG(exception))) {
-                zend_object *ex = EG(exception);
-                const char *cls = ZSTR_VAL(ex->ce->name);
-                zval msg_zv;
-                ZVAL_UNDEF(&msg_zv);
-                zval rv;
-                zval *msg = zend_read_property_ex(
-                    ex->ce, ex, ZSTR_KNOWN(ZEND_STR_MESSAGE), 1, &rv);
-                const char *msg_str =
-                    (msg && Z_TYPE_P(msg) == IS_STRING) ? Z_STRVAL_P(msg) : "?";
-                snprintf(opcache_exc_buf, sizeof(opcache_exc_buf), "%s: %s", cls, msg_str);
-                (void)msg_zv;
-                if (count < 0) {
-                    count = -5;
-                }
-            }
-            zend_clear_exception();
+            ephpm_opcache_capture_exception();
+            count = EPHPM_OPCACHE_EXCEPTION;
+            goto done;
         }
+
+        if (Z_TYPE(status_ret) != IS_ARRAY) {
+            /* opcache.enable=0 returns false; anything non-array means OPcache
+             * is not cooperating. Nothing to invalidate. */
+            count = EPHPM_OPCACHE_UNAVAILABLE;
+            goto done;
+        }
+
+        /* Fetch the 'scripts' sub-array. Missing / empty is a success with
+         * zero invalidations (cold cache, or freshly reset). */
+        zval *scripts_zv = zend_hash_str_find(
+            Z_ARRVAL(status_ret), "scripts", sizeof("scripts") - 1);
+        if (!scripts_zv || Z_TYPE_P(scripts_zv) != IS_ARRAY) {
+            count = 0;
+            goto done;
+        }
+
+        /* Iterate the scripts HashTable. Keys are the absolute script paths
+         * (OPcache stores full_path as the key). For each key whose prefix
+         * matches the vhost docroot, invoke opcache_invalidate($path, true). */
+        HashTable *scripts_ht = Z_ARRVAL_P(scripts_zv);
+        zend_string *key;
+        zend_ulong idx;
+        zval *val;
+        (void)idx;
+        (void)val;
+        ZEND_HASH_FOREACH_KEY_VAL(scripts_ht, idx, key, val) {
+            if (!key) {
+                /* integer key — never a script path; skip. */
+                continue;
+            }
+            if (ZSTR_LEN(key) < prefix_len) {
+                continue;
+            }
+            if (memcmp(ZSTR_VAL(key), docroot, prefix_len) != 0) {
+                continue;
+            }
+
+            /* opcache_invalidate($path, true) — force=true so an unchanged
+             * mtime doesn't block the drop (deploys often preserve timestamps). */
+            zval inv_args[2];
+            ZVAL_STR_COPY(&inv_args[0], key);
+            ZVAL_TRUE(&inv_args[1]);
+
+            zval inv_ret;
+            ZVAL_UNDEF(&inv_ret);
+            zend_call_known_function(
+                fn_invalidate, NULL, NULL, &inv_ret, 2, inv_args, NULL);
+
+            zval_ptr_dtor(&inv_args[0]);
+            zval_ptr_dtor(&inv_ret);
+
+            if (EG(exception)) {
+                ephpm_opcache_capture_exception();
+                count = EPHPM_OPCACHE_EXCEPTION;
+                goto done;
+            }
+            count++;
+        } ZEND_HASH_FOREACH_END();
     } else {
-        /* zend_bailout() longjmped out of the snippet. The live request
-         * context is still valid; report the bailout distinctly. */
-        count = -4;
+        /* zend_bailout() longjmped. Report distinctly. */
+        count = EPHPM_OPCACHE_BAILOUT;
     }
 
+done:
     EG(bailout) = __orig_bailout;
-    zval_ptr_dtor(&retval);
-    free(snippet);
+
+    /* Belt-and-braces: even on the happy path, ensure nothing we called left
+     * a pending exception behind that would surface in the next script. */
+    if (EG(exception) && !zend_is_unwind_exit(EG(exception))) {
+        ephpm_opcache_capture_exception();
+    }
+
+    zval_ptr_dtor(&status_ret);
     return count;
 }
 

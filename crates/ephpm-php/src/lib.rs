@@ -886,9 +886,23 @@ impl PhpRuntime {
         // retain the pointer past the call.
         let count = unsafe { ffi::ephpm_opcache_invalidate_under(c_docroot.as_ptr()) };
         if count < 0 {
-            // Failure codes from the C helper: -1 bad docroot/OOM, -2 eval
-            // compile/execute failure, -4 bailout, -5 pending exception,
-            // -100-N eval returned non-numeric zval of type N.
+            // Failure contract (mirrors the EPHPM_OPCACHE_* #defines in
+            // ephpm_wrapper.c). Keep this table and the C-side #defines
+            // synchronised:
+            //   -1 EPHPM_OPCACHE_UNAVAILABLE — extension missing / disabled
+            //                                  or opcache_get_status returned
+            //                                  a shape we don't recognise.
+            //   -2 EPHPM_OPCACHE_BAILOUT     — SETJMP bailout inside the
+            //                                  direct calls.
+            //   -3 EPHPM_OPCACHE_EXCEPTION   — a userland exception surfaced;
+            //                                  class+message stashed for
+            //                                  ephpm_opcache_last_exception().
+            let reason = match count {
+                -1 => "unavailable",
+                -2 => "bailout",
+                -3 => "exception",
+                _ => "unknown",
+            };
             // SAFETY: the pointer is a valid thread-local NUL-terminated
             // buffer owned by the wrapper; we copy it out immediately.
             let exc = unsafe {
@@ -896,7 +910,12 @@ impl PhpRuntime {
                     .to_string_lossy()
                     .into_owned()
             };
-            tracing::debug!(code = count, exception = %exc, "opcache invalidator failed");
+            tracing::debug!(
+                code = count,
+                reason = reason,
+                exception = %exc,
+                "opcache invalidator failed"
+            );
             None
         } else {
             Some(count as i64)
