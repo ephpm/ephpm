@@ -111,6 +111,10 @@ pub struct Router {
     /// Native middleware chain (`[[middleware]]`), evaluated on the PHP-bound
     /// path before the request body is read. `None` = no middleware mounted.
     middleware_chain: Option<Arc<crate::middleware::MiddlewareChain>>,
+    /// Canonicalized document roots, keyed by the as-configured root path.
+    /// Roots are constant for the process lifetime, so caching removes a
+    /// `canonicalize()` syscall from every static-file hit (issue #132).
+    canonical_roots: dashmap::DashMap<PathBuf, PathBuf>,
 }
 
 /// Scan `sites_dir` for virtual host subdirectories.
@@ -273,7 +277,21 @@ impl Router {
             worker_pool,
             worker_stream_threshold: config.php.worker_stream_threshold,
             middleware_chain: None,
+            canonical_roots: dashmap::DashMap::new(),
         }
+    }
+
+    /// Canonicalized form of a site's document root, cached for the process
+    /// lifetime (roots never change at runtime). Returns `None` when the
+    /// root does not exist — the caller treats that as 404, matching the
+    /// previous per-request `canonicalize()` behavior.
+    fn canonical_root(&self, root: &Path) -> Option<PathBuf> {
+        if let Some(hit) = self.canonical_roots.get(root) {
+            return Some(hit.clone());
+        }
+        let canon = root.canonicalize().ok()?;
+        self.canonical_roots.insert(root.to_path_buf(), canon.clone());
+        Some(canon)
     }
 
     /// Attach the native middleware chain loaded in `serve()` at startup.
@@ -602,10 +620,10 @@ impl Router {
                     } else {
                         (error_response(StatusCode::FORBIDDEN, "403 Forbidden"), "error")
                     }
-                } else {
+                } else if let Some(canonical_root) = self.canonical_root(&site_root) {
                     (
                         static_files::serve_file(
-                            &site_root,
+                            &canonical_root,
                             &fs_path,
                             accepts_gzip,
                             accepts_br,
@@ -618,6 +636,8 @@ impl Router {
                         .await,
                         "static",
                     )
+                } else {
+                    (error_response(StatusCode::NOT_FOUND, "404 Not Found"), "error")
                 }
             }
             Resolved::Status(code) => {
@@ -1725,8 +1745,18 @@ fn is_php_file(path: &Path) -> bool {
 }
 
 /// Expand `$uri` and `$query_string` variables in a `fallback` entry.
-fn expand_variables(entry: &str, uri_path: &str, query_string: &str) -> String {
-    entry.replace("$uri", uri_path).replace("$query_string", query_string)
+///
+/// Borrows when the entry has no `$` placeholders — the common case for
+/// literal fallback entries, probed on every request.
+fn expand_variables<'a>(
+    entry: &'a str,
+    uri_path: &str,
+    query_string: &str,
+) -> std::borrow::Cow<'a, str> {
+    if !entry.contains('$') {
+        return std::borrow::Cow::Borrowed(entry);
+    }
+    std::borrow::Cow::Owned(entry.replace("$uri", uri_path).replace("$query_string", query_string))
 }
 
 /// Split an expanded path into the path component and optional query string.
