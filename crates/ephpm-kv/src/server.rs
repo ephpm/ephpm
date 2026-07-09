@@ -154,10 +154,17 @@ pub async fn serve_on(
                         Ok(permit) => Some(permit),
                         Err(_) => {
                             debug!(peer = %addr, "refusing KV connection: max clients reached");
+                            // Bound the refusal write: a non-reading peer would
+                            // otherwise pin a spawned refusal task indefinitely,
+                            // and a flood of such peers would exhaust task
+                            // memory even though the connection cap did its
+                            // job on the accept path.
                             tokio::spawn(async move {
-                                let _ = stream
-                                    .write_all(b"-ERR max number of clients reached\r\n")
-                                    .await;
+                                let _ = tokio::time::timeout(
+                                    Duration::from_secs(5),
+                                    stream.write_all(b"-ERR max number of clients reached\r\n"),
+                                )
+                                .await;
                             });
                             continue;
                         }
