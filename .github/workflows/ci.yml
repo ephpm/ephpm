@@ -1,10 +1,20 @@
 name: CI
 
+# Docs-only changes (site/, docs/, markdown) skip CI entirely — nothing
+# they touch is compiled or tested by these jobs, and the fleet is small.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "site/**"
+      - "docs/**"
+      - "**.md"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "site/**"
+      - "docs/**"
+      - "**.md"
 
 env:
   CARGO_TERM_COLOR: always
