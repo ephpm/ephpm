@@ -195,7 +195,7 @@ impl std::fmt::Debug for Store {
             .field("config", &self.config)
             .field(
                 "replicator_installed",
-                &self.replicator.read().map(|g| g.is_some()).unwrap_or(false),
+                &self.replicator.read().is_ok_and(|g| g.is_some()),
             )
             .field("anchor", &self.anchor)
             .finish()
