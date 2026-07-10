@@ -157,6 +157,23 @@ pub struct WorkerJob {
 /// the C `take_request` shim. **Layout must match `EphpmWorkerRequest` in
 /// `ephpm_wrapper.c`.** All pointers borrow from the thread-local
 /// [`CURRENT_REQUEST`] and stay valid until the next `take_request` call.
+///
+/// # SAFETY (Phase 1 lazy Envelope contract)
+///
+/// The C wrapper's Phase 1 fast path (`ephpm_wrapper.c` — lazy Envelope) also
+/// depends on this exact lifetime: `take_request` stashes the header /
+/// server-var pointer arrays into thread-local C state and returns without
+/// materializing PHP arrays, so those pointers must stay valid until the
+/// matching `send_response` completes on this worker thread. The invariant
+/// holds because `CURRENT_REQUEST` is written on entry to `worker_take_request`
+/// (`crates/ephpm-php/src/worker_bridge.rs::worker_take_request`, line ~530),
+/// is only cleared / overwritten by the NEXT `worker_take_request` call on the
+/// same thread (see `ephpm_worker_reset_request` in the C wrapper — the reset
+/// runs synchronously at the top of the next take_request), and the
+/// `CurrentRequest` fields (Vec / CString) are `#[allow(dead_code)]`
+/// specifically to keep the compiler from freeing them while borrowed by C.
+/// The `req_generation` counter provides a cross-iteration isolation check
+/// for userland-stashed Envelopes.
 #[cfg(php_linked)]
 #[repr(C)]
 pub struct EphpmWorkerRequest {
