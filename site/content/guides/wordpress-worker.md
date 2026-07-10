@@ -82,8 +82,8 @@ explicit `worker_count` lower than the CPU-derived default:
 
 ```toml
 [php]
-worker_count = 4          # 0 = derive from CPU count, clamped [2, 32]
-worker_max_requests = 500 # recycle after N requests (0 = never)
+worker_count = 4            # 0 = derive from cgroup quota (Linux) or CPU count [2, 32]
+worker_max_requests = 10000 # recycle after N requests (0 = never; pure leak guard)
 ```
 
 Recycling matters more for WordPress than for container-based frameworks:

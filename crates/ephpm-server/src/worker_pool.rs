@@ -122,9 +122,15 @@ impl WorkerPool {
             pool.spawn_worker();
         }
 
+        let recycle_policy = if max_requests == 0 {
+            "disabled (leak-free framework loops)".to_string()
+        } else {
+            format!("recycle after {max_requests} requests per worker")
+        };
         tracing::info!(
             worker_count,
             max_requests,
+            recycle_policy = %recycle_policy,
             backlog = backlog.max(1),
             script = %pool.worker_script.display(),
             "worker pool started"
@@ -305,12 +311,24 @@ fn worker_main(
         match outcome {
             Ok(ephpm_php::WorkerExit::Clean) => {
                 // Clean loop end: graceful drain or worker_max_requests recycle.
+                let requests_served = ephpm_php::worker_bridge::requests_handled();
+                let uptime_secs = boot_start.elapsed().as_secs_f64();
                 if pool.state.draining.load(Ordering::Acquire) {
-                    tracing::debug!(worker_id, "worker exited on drain");
+                    tracing::debug!(
+                        worker_id,
+                        requests_served,
+                        uptime_secs,
+                        "worker exited on drain",
+                    );
                 } else {
                     counter!("ephpm_worker_recycles_total", "reason" => "max_requests")
                         .increment(1);
-                    tracing::debug!(worker_id, "worker recycled (max_requests) — respawning");
+                    tracing::debug!(
+                        worker_id,
+                        requests_served,
+                        uptime_secs,
+                        "worker recycled (max_requests) — respawning",
+                    );
                 }
             }
             Ok(ephpm_php::WorkerExit::ScriptExit) => {

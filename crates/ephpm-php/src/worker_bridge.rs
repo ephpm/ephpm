@@ -354,6 +354,22 @@ pub fn set_max_requests(max: u64) {
 #[cfg(not(php_linked))]
 pub fn set_max_requests(_max: u64) {}
 
+/// Requests handled by this worker thread since boot. `0` on a fresh worker
+/// (or in stub mode). Used by the pool supervisor to log recycle events with
+/// the number of requests actually served.
+#[cfg(php_linked)]
+#[must_use]
+pub fn requests_handled() -> u64 {
+    REQUESTS_HANDLED.with(std::cell::Cell::get)
+}
+
+/// Stub: no PHP linked, no worker requests.
+#[cfg(not(php_linked))]
+#[must_use]
+pub fn requests_handled() -> u64 {
+    0
+}
+
 /// Install the boot-completion callback for the current worker thread. Fired
 /// exactly once, on the worker's first `take_request()` — i.e. after the
 /// framework finished booting and is ready to serve. Install before

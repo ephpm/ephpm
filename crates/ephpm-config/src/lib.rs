@@ -1378,7 +1378,12 @@ pub struct PhpConfig {
     ///
     /// Ignored in fpm mode.
     ///
-    /// Default: `0` (derive from CPU count, clamped `[2, 32]`).
+    /// Default: `0` — derive from the cgroup CPU quota when running under one
+    /// (`cpu.max` on cgroup v2, `cpu.cfs_quota_us`/`cpu.cfs_period_us` on v1;
+    /// Linux only), otherwise from host parallelism clamped to `[2, 32]`. The
+    /// quota-aware path is the sweet spot inside CPU-limited containers, where
+    /// the host-parallelism derivation overshoots (measured 2026-07-09: at a
+    /// 0.25-CPU quota, 1 worker beat the derived 2 by ~24% on hello c=16).
     #[serde(default = "default_worker_count")]
     pub worker_count: usize,
 
@@ -1392,7 +1397,11 @@ pub struct PhpConfig {
     ///
     /// Ignored in fpm mode.
     ///
-    /// Default: `500`.
+    /// Default: `10000`. A pure leak guard — for a leak-free framework loop,
+    /// recycling adds overhead (framework reboot) without any benefit. Raised
+    /// from `500` (2026-07-09 roadmap): at 2,000 rps the old default recycled
+    /// every ~0.25 s. Each recycle is logged at debug (worker id, requests
+    /// served, uptime) so its frequency is visible.
     #[serde(default = "default_worker_max_requests")]
     pub worker_max_requests: u64,
 
@@ -1721,15 +1730,32 @@ impl PhpConfig {
     /// Resolve the effective worker-thread count.
     ///
     /// Returns the configured `worker_count`, or — when it is `0` — a value
-    /// derived from the available CPU parallelism, clamped to `[2, 32]`.
-    /// Never returns `0`.
+    /// derived from the cgroup CPU quota (Linux, when present) or otherwise
+    /// from host parallelism clamped to `[2, 32]`. Never returns `0`. See
+    /// [`Self::effective_worker_count_with_source`] to also learn *why* a
+    /// given value was picked (for logging at pool startup).
     #[must_use]
     pub fn effective_worker_count(&self) -> usize {
+        self.effective_worker_count_with_source().0
+    }
+
+    /// Same as [`Self::effective_worker_count`] but also reports the source of
+    /// the derivation so the worker pool can log why it picked N threads.
+    #[must_use]
+    pub fn effective_worker_count_with_source(&self) -> (usize, WorkerCountSource) {
         if self.worker_count > 0 {
-            return self.worker_count;
+            return (self.worker_count, WorkerCountSource::Explicit);
+        }
+        if let Some(quota_cpus) = read_cgroup_cpu_quota() {
+            // Round up so a 0.25 quota gives 1 worker, a 1.5 quota gives 2.
+            // ceil().max(1.0) is always >= 1.0 and bounded by the small quotas
+            // real containers use, so the cast is sign- and range-safe.
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let n = quota_cpus.ceil().max(1.0) as usize;
+            return (n, WorkerCountSource::CgroupQuota { quota_cpus });
         }
         let cpus = std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get);
-        cpus.clamp(2, 32)
+        (cpus.clamp(2, 32), WorkerCountSource::HostParallelism { cpus })
     }
 
     /// Resolve the effective dispatch-queue depth.
@@ -1959,13 +1985,105 @@ fn default_php_mode() -> String {
 }
 
 fn default_worker_count() -> usize {
-    // 0 => derive from CPU count, clamped [2, 32] (see effective_worker_count).
+    // 0 => derive at startup — cgroup CPU quota if present (Linux), otherwise
+    // host parallelism clamped [2, 32]. See `PhpConfig::effective_worker_count`.
     0
 }
 
+/// Where the effective `worker_count` came from — surfaced for structured
+/// logging at pool startup so operators can see why N threads were chosen.
+#[derive(Debug, Clone, Copy)]
+pub enum WorkerCountSource {
+    /// The user set `worker_count = N` explicitly.
+    Explicit,
+    /// Derived from a container/cgroup CPU quota.
+    CgroupQuota {
+        /// Raw quota in CPU units (0.25 for a 25%-of-one-core limit).
+        quota_cpus: f64,
+    },
+    /// Derived from host parallelism, clamped `[2, 32]`.
+    HostParallelism {
+        /// Detected host parallelism before clamping.
+        cpus: usize,
+    },
+}
+
+impl WorkerCountSource {
+    /// A short label suitable for a `tracing` field.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::CgroupQuota { .. } => "cgroup_quota",
+            Self::HostParallelism { .. } => "host_parallelism",
+        }
+    }
+}
+
+/// Read the cgroup CPU quota (v2 preferred, v1 fallback). Returns the quota in
+/// CPU units — `Some(0.25)` for a 25%-of-one-core limit, `None` when no quota
+/// is set (`cpu.max = "max"`), when not running under a cgroup, or on
+/// non-Linux platforms.
+#[cfg(target_os = "linux")]
+fn read_cgroup_cpu_quota() -> Option<f64> {
+    // cgroup v2: /sys/fs/cgroup/cpu.max = "<quota> <period>" or "max <period>".
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        return parse_cgroup_v2_cpu_max(&s);
+    }
+    // cgroup v1: quota_us == -1 means unlimited.
+    let quota = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").ok()?;
+    let period = std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us").ok()?;
+    parse_cgroup_v1_cpu(&quota, &period)
+}
+
+/// Non-Linux: no cgroup CPU quota concept — always fall back to host cores.
+#[cfg(not(target_os = "linux"))]
+fn read_cgroup_cpu_quota() -> Option<f64> {
+    None
+}
+
+/// Parse the two-word cgroup v2 `cpu.max` contents, e.g. `"25000 100000"` or
+/// `"max 100000"`. Returns `Some(quota / period)` in CPU units, or `None` if
+/// unlimited / malformed / period == 0.
+///
+/// Compiled everywhere so the unit tests (which run on Windows/macOS CI) can
+/// exercise it against literal strings without touching a real cgroupfs.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn parse_cgroup_v2_cpu_max(contents: &str) -> Option<f64> {
+    let line = contents.lines().next()?.trim();
+    let mut parts = line.split_ascii_whitespace();
+    let quota_str = parts.next()?;
+    let period_str = parts.next()?;
+    if quota_str.eq_ignore_ascii_case("max") {
+        return None;
+    }
+    let quota: u64 = quota_str.parse().ok()?;
+    let period: u64 = period_str.parse().ok()?;
+    if period == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    Some(quota as f64 / period as f64)
+}
+
+/// Parse the cgroup v1 quota/period pair. `-1` in `cpu.cfs_quota_us` means
+/// unlimited (returns `None`).
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn parse_cgroup_v1_cpu(quota_raw: &str, period_raw: &str) -> Option<f64> {
+    let quota: i64 = quota_raw.trim().parse().ok()?;
+    let period: u64 = period_raw.trim().parse().ok()?;
+    if quota <= 0 || period == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
+    Some(quota as u64 as f64 / period as f64)
+}
+
 fn default_worker_max_requests() -> u64 {
-    // Conservative memory-leak guard, matching php-fpm pm.max_requests.
-    500
+    // Pure leak guard, not a churn trigger: for a leak-free framework loop
+    // recycling is pure overhead. Raised from 500 (2026-07-09 roadmap): at
+    // 2,000 rps, the old default recycled every ~0.25 s.
+    10_000
 }
 
 fn default_worker_backlog() -> usize {
@@ -2901,7 +3019,7 @@ sites_dir = "/var/www/sites"
         assert_eq!(cfg.mode, "fpm");
         assert!(!cfg.is_worker_mode());
         assert_eq!(cfg.worker_count, 0);
-        assert_eq!(cfg.worker_max_requests, 500);
+        assert_eq!(cfg.worker_max_requests, 10_000);
         assert_eq!(cfg.worker_backlog, 0);
         assert_eq!(cfg.worker_boot_timeout, 30);
         assert!(!cfg.worker_populate_superglobals);
@@ -2924,10 +3042,61 @@ sites_dir = "/var/www/sites"
         // Explicit value passes through.
         let mut cfg = PhpConfig { worker_count: 7, ..PhpConfig::default() };
         assert_eq!(cfg.effective_worker_count(), 7);
-        // Derived value is always in [2, 32] and never zero.
+        assert!(matches!(cfg.effective_worker_count_with_source().1, WorkerCountSource::Explicit));
+        // Derived value is never zero; upper bound is [1, 32] (cgroup path may
+        // return 1 inside a CPU-limited container, otherwise clamp is [2, 32]).
         cfg.worker_count = 0;
         let derived = cfg.effective_worker_count();
-        assert!((2..=32).contains(&derived), "derived worker count out of range: {derived}");
+        assert!((1..=32).contains(&derived), "derived worker count out of range: {derived}");
+    }
+
+    #[test]
+    fn test_parse_cgroup_v2_cpu_max() {
+        // 25% of one core: 0.25 CPU units, ceil() -> 1 worker.
+        assert!((parse_cgroup_v2_cpu_max("25000 100000").unwrap() - 0.25).abs() < 1e-9);
+        // Exactly one core.
+        assert!((parse_cgroup_v2_cpu_max("100000 100000").unwrap() - 1.0).abs() < 1e-9);
+        // 2.5 cores.
+        assert!((parse_cgroup_v2_cpu_max("250000 100000").unwrap() - 2.5).abs() < 1e-9);
+        // Unlimited.
+        assert_eq!(parse_cgroup_v2_cpu_max("max 100000"), None);
+        assert_eq!(parse_cgroup_v2_cpu_max("MAX 100000"), None);
+        // Trailing newline (real cgroupfs writes always include one).
+        assert!((parse_cgroup_v2_cpu_max("25000 100000\n").unwrap() - 0.25).abs() < 1e-9);
+        // Malformed / degenerate.
+        assert_eq!(parse_cgroup_v2_cpu_max(""), None);
+        assert_eq!(parse_cgroup_v2_cpu_max("only-one-word"), None);
+        assert_eq!(parse_cgroup_v2_cpu_max("abc def"), None);
+        assert_eq!(parse_cgroup_v2_cpu_max("100000 0"), None);
+    }
+
+    #[test]
+    fn test_parse_cgroup_v1_cpu() {
+        assert!((parse_cgroup_v1_cpu("25000", "100000").unwrap() - 0.25).abs() < 1e-9);
+        assert!((parse_cgroup_v1_cpu("100000\n", "100000\n").unwrap() - 1.0).abs() < 1e-9);
+        // -1 = unlimited (v1 sentinel).
+        assert_eq!(parse_cgroup_v1_cpu("-1", "100000"), None);
+        // Period 0 -> would divide by zero.
+        assert_eq!(parse_cgroup_v1_cpu("100000", "0"), None);
+        assert_eq!(parse_cgroup_v1_cpu("junk", "100000"), None);
+    }
+
+    #[test]
+    fn test_worker_count_source_ceiling() {
+        // Small quotas ceil to 1, fractional quotas above 1 ceil upward.
+        // We can't force read_cgroup_cpu_quota() in tests, so exercise the
+        // ceil() math via the parser results directly. Ceiled quotas are
+        // always positive here (the parser returns None for <=0), so the
+        // f64 -> u64 cast is sign- and range-safe.
+        fn ceil_u64(q: f64) -> u64 {
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let v = q.ceil() as u64;
+            v
+        }
+        assert_eq!(parse_cgroup_v2_cpu_max("25000 100000").map(ceil_u64), Some(1));
+        assert_eq!(parse_cgroup_v2_cpu_max("100000 100000").map(ceil_u64), Some(1));
+        assert_eq!(parse_cgroup_v2_cpu_max("150000 100000").map(ceil_u64), Some(2));
+        assert_eq!(parse_cgroup_v2_cpu_max("400000 100000").map(ceil_u64), Some(4));
     }
 
     #[test]

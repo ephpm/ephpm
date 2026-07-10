@@ -319,7 +319,32 @@ async fn bind_listeners(
         }
 
         // Windows / NTS: a single PHP context, so force one worker (design §6.1).
-        let mut worker_count = config.php.effective_worker_count();
+        let (mut worker_count, wc_source) = config.php.effective_worker_count_with_source();
+        match wc_source {
+            ephpm_config::WorkerCountSource::Explicit => {
+                tracing::info!(
+                    worker_count,
+                    source = "explicit",
+                    "worker_count from [php].worker_count"
+                );
+            }
+            ephpm_config::WorkerCountSource::CgroupQuota { quota_cpus } => {
+                tracing::info!(
+                    worker_count,
+                    source = "cgroup_quota",
+                    quota_cpus,
+                    "worker_count derived from cgroup CPU quota (ceil(quota))"
+                );
+            }
+            ephpm_config::WorkerCountSource::HostParallelism { cpus } => {
+                tracing::info!(
+                    worker_count,
+                    source = "host_parallelism",
+                    detected_cpus = cpus,
+                    "worker_count derived from host parallelism (clamped [2, 32])"
+                );
+            }
+        }
         if cfg!(target_os = "windows") && worker_count > 1 {
             tracing::warn!(
                 "worker mode on Windows (NTS) uses a single PHP context — \
