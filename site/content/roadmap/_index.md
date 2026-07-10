@@ -8,8 +8,14 @@ Forward-looking design documents — what we're planning, what we're considering
 
 These pages describe targets, not currently-shipped behavior. For what works today, see [Architecture](/docs/architecture/) and [Feature Status](/docs/introduction/feature-status/).
 
+- **[Worker Dispatch Fast Path](worker-dispatch-fastpath/)** — closing the measured gap to in-process runtimes: lazy Envelope, handoff economics, quota-aware defaults.
+- **[Turso Engine](turso-engine/)** — one engine for both modes: the Rust SQLite rewrite replacing rusqlite and the sqld sidecar, gated on upstream GA.
+- **[Clustered KV v2](clustered-kv-v2/)** — owner-routed counters and cluster-correct rate limiting (delete tombstones and TTL replication shipped as v1.1).
+- **[Benchmarks as a Release Artifact](benchmarks/)** — in-tree bench recipes, per-release numbers, and a regression gate.
+- **[NTS Prefork Mode](nts-prefork/)** — trading features for pure per-request PHP speed, gated on a post-PGO measurement.
+- **[The Deploy Story](deploy-warmup/)** — post-invalidation warmup, `ephpm doctor <framework>`, `cache status`, thin deploy hooks.
 - **[Preview Deployments](preview/)** — instant per-PR preview URLs via a GitHub bot.
-- **[OPcache Clustering & Per-Vhost Preload](opcache-clustering/)** — atomic cluster-wide OPcache invalidation via the KV store, plus per-vhost preload via `site.toml`.
+- **[OPcache Clustering & Per-Vhost Preload](opcache-clustering/)** — Phase 1 (cluster-wide invalidation) shipped in 0.4.0; per-vhost preload and worker-mode invalidation remain.
 - **[Symfony Runtime Adapter](symfony-runtime-driver/)** — native `ephpm` adapter under `symfony/runtime`, on top of the shipped worker-mode engine.
 - **[Kubernetes Operator](kubernetes/)** — first-class K8s deployment.
 - **[Edge Deployments](edge/)** — running ePHPm at the edge.
