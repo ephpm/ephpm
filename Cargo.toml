@@ -82,7 +82,7 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "33e24a3e6fe664b1be499a0147c9cae5756eb733", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "54b5fcee0df8aaeb8c1085ca17d8c9d376e51280", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client"] }
 
 [workspace.lints.rust]
 unsafe_code = "warn"
