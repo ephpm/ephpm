@@ -334,7 +334,26 @@ ephpm_opcache_memory_free_bytes
 
 Phase 1 is the foundational piece — everything else builds on the
 KV-driven contract and the FFI helper. Roughly a long weekend's work
-end-to-end including tests.
+end-to-end including tests. **Shipped in 0.4.0** — see the
+[user guide](/guides/opcache-cluster-invalidation/).
+
+### Phase 1.5 — Worker-mode invalidation (not yet implemented)
+
+Phase 1 wires the watcher into the fpm dispatch path only; with
+`[php] mode = "worker"` the watcher is skipped (startup WARNs so the
+no-op is never silent). Closing it: run the same
+`OpcacheWatcher::check` at the top of the worker `take_request` loop —
+the worker thread is TSRM-registered with an active request, satisfying
+the invalidator's context contract, and the per-vhost mutex already
+coalesces concurrent workers. One design question to settle: a
+persistent worker holds the booted framework's classes in memory
+regardless of OPcache, so invalidation alone does not swap code in a
+running worker — it must pair with worker recycling
+(`worker_max_requests`-style drain) for a full deploy. Document the
+semantics: invalidation refreshes what workers *compile next*
+(templates, lazily-loaded classes); a code swap of the booted core
+needs recycle-on-deploy, which is the natural companion knob
+(`[opcache] recycle_workers_on_deploy = true`).
 
 ### Phase 2 — Per-vhost preload
 
