@@ -112,10 +112,11 @@ Phase 2 (per-vhost preload) and Phase 3 (file watcher).
 
 - **Worker mode is not wired yet** — with `[php] mode = "worker"` the
   watcher is skipped and startup logs a WARN. Planned.
-- **`EXPIRE`/`INCR` do not replicate** — only SET/DEL fan out. Rate-limit
-  middleware counters are therefore per-node in a cluster (startup warns
-  when this combination is active).
-- **Remote deletes** propagate as tombstones that peers don't apply to
-  local copies until TTL expiry or overwrite; the version-key scheme is
-  unaffected (it only ever overwrites).
+- **`INCR` does not replicate** — SET, DEL, and EXPIRE all fan out
+  (deletes ride a write-stamped gossip tombstone; EXPIRE re-emits the
+  value with the new expiry). Read-modify-write ops like INCR are still
+  local-only, so rate-limit middleware counters are per-node in a
+  cluster (startup warns when this combination is active). See the
+  [`clustered-kv-v2` roadmap](/roadmap/clustered-kv-v2/) for the
+  owner-routed `INCR` design.
 - `ephpm cache status` is not implemented; use `opcache_get_status()`.

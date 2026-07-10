@@ -260,7 +260,15 @@ async fn gossip_kv_replicates_between_nodes() {
 }
 
 #[tokio::test]
-async fn gossip_kv_delete_not_owned_returns_false() {
+async fn gossip_kv_cross_node_delete_wins_by_write_ms() {
+    // Under KV v1.1 tombstone semantics, ANY node can broadcast a delete
+    // — the tombstone (`"TS:{write_ms}"`) rides the same gossip
+    // subscription as SETs, and peers apply it by last-arrival-wins. That
+    // is what makes cluster-wide `session_destroy()` work: a logout on
+    // node B must invalidate the session on node A even though A owned
+    // the write. Prior to v1.1, `gossip_del` returned `false` on a
+    // non-owner and the delete silently dropped — the exact
+    // clustered-session bug PR #163 documented.
     let port1 = random_udp_port().await;
     let port2 = random_udp_port().await;
     let seed = format!("127.0.0.1:{port1}");
@@ -270,10 +278,9 @@ async fn gossip_kv_delete_not_owned_returns_false() {
 
     wait_for_convergence(&[&node1, &node2], 2, Duration::from_secs(10)).await;
 
-    // Node1 sets a key.
     node1.gossip_set("owned-by-1", b"value", None).await;
 
-    // Wait for replication.
+    // Wait for node2 to see it.
     let start = Instant::now();
     loop {
         if node2.gossip_get("owned-by-1").await.is_some() {
@@ -283,13 +290,25 @@ async fn gossip_kv_delete_not_owned_returns_false() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // Node2 cannot delete it (it doesn't own it).
-    assert!(!node2.gossip_del("owned-by-1").await);
-    // Node1 can still read it.
-    assert!(node1.gossip_get("owned-by-1").await.is_some());
+    // Non-owner delete: node2 broadcasts a tombstone. Always returns
+    // true — the intent has been published either way.
+    assert!(node2.gossip_del("owned-by-1").await);
 
-    // Node1 can delete it.
-    assert!(node1.gossip_del("owned-by-1").await);
+    // The tombstone is newer than node1's SET, so read paths on both
+    // nodes must report the key as deleted within convergence.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut n1_gone = false;
+    let mut n2_gone = false;
+    while Instant::now() < deadline && !(n1_gone && n2_gone) {
+        n1_gone = node1.gossip_get("owned-by-1").await.is_none();
+        n2_gone = node2.gossip_get("owned-by-1").await.is_none();
+        if n1_gone && n2_gone {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(n1_gone, "origin node1 must observe the cross-node tombstone");
+    assert!(n2_gone, "node2 must observe its own tombstone immediately");
 
     node1.shutdown().await;
     node2.shutdown().await;

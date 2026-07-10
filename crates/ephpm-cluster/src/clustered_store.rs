@@ -760,12 +760,7 @@ impl ephpm_kv::store::Replicator for KvReplicator {
             // the echo. Use the same wall-clock now-ms that encode_value
             // stamps into the gossip payload so the ordering is
             // consistent across the two paths.
-            let write_ms = u64::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |d| d.as_millis()),
-            )
-            .unwrap_or(u64::MAX);
+            let write_ms = current_write_ms();
             self.applied.insert(key.clone(), write_ms);
         }
         // Fire-and-forget: hand the routed write off to the runtime and
@@ -784,8 +779,14 @@ impl ephpm_kv::store::Replicator for KvReplicator {
 
     fn replicate_remove(&self, key: &str) -> bool {
         // Drop the local materialized copy synchronously (mirror of the
-        // set path above), then propagate the removal.
+        // set path above), then propagate the removal via a gossip
+        // tombstone. Record our own write_ms in the applied map so a
+        // slow echo of THIS tombstone through gossip does not clobber a
+        // follow-up SET we later accept locally.
         self.inner.store.remove_local(key);
+        let write_ms = current_write_ms();
+        self.applied.insert(key.to_string(), write_ms);
+
         let inner = Arc::clone(&self.inner);
         let key = key.to_string();
         self.handle.spawn(async move {
@@ -798,16 +799,63 @@ impl ephpm_kv::store::Replicator for KvReplicator {
     }
 
     fn replicate_expire(&self, key: &str, ttl: Duration) -> bool {
-        // ClusteredStore does not yet expose a cluster-wide `expire` — the
-        // gossip TTL is set at write time. Update the local copy so the
-        // node the caller is talking to honours the new expiry; remote
-        // copies keep their originally-set TTL. Document this v1 gap.
+        // Update the local copy synchronously so this node's readers see
+        // the new expiry immediately, then re-broadcast the (unchanged)
+        // value with the new TTL through the gossip tier. Peers apply the
+        // event by the same last-arrival-wins rule the SET applier uses,
+        // so a TTL refresh (extend) propagates just like a shorten — the
+        // origin's newer `write_ms` wins, and the peer takes whatever
+        // expiry the origin last stamped. That's what session refresh
+        // needs; a shorter-wins rule would break lazy_write.
         let ok = self.inner.local_store().expire_local(key, ttl);
         if !ok {
-            tracing::debug!(key, "expire: no local copy (may exist only on remote replicas)");
+            tracing::debug!(key, "expire: no local copy to re-broadcast (may exist only on peers)");
+            return false;
         }
-        ok
+        // Read the current bytes so we can re-emit them with the new TTL.
+        // `Store::get` returns Bytes cheaply (Arc-cloned).
+        let Some(bytes) = self.inner.local_store().get(key) else {
+            // Racy edge: the entry expired between expire_local and get.
+            // Nothing to broadcast, but the local update did succeed.
+            return true;
+        };
+        // Record OUR own write_ms so a slower echo of the same expiry
+        // update from gossip does not clobber a newer local overwrite.
+        let write_ms = current_write_ms();
+        self.applied.insert(key.to_string(), write_ms);
+
+        let inner = Arc::clone(&self.inner);
+        let key_owned = key.to_string();
+        let value = bytes.to_vec();
+        let threshold = inner.config.small_key_threshold;
+        self.handle.spawn(async move {
+            // Small-key tier only: the gossip TTL update is what carries
+            // the new expiry across the cluster. Large values live only on
+            // their replica set; a TTL update for a large value updates
+            // this node's copy (already done above) but does not fan out
+            // to peer replicas — the roadmap's OP_EXPIRE data-plane frame
+            // is out of scope for this change. Session blobs are almost
+            // always well below `small_key_threshold`, so refresh works
+            // for the primary consumer.
+            if value.len() <= threshold {
+                inner.cluster().gossip_set(&key_owned, &value, Some(ttl)).await;
+            }
+        });
+        true
     }
+}
+
+/// Current epoch time in milliseconds, matching the stamp
+/// [`gossip_kv::encode_value`] and [`gossip_kv::encode_tombstone`]
+/// use — so origin-side bookkeeping in the applied map orders correctly
+/// against remote echoes.
+fn current_write_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Per-key last-applied `write_ms` shared between the gossip applier and
@@ -841,15 +889,28 @@ pub fn new_applied_write_map() -> AppliedWriteMap {
 /// [`KvReplicator::replicate_set`]; their own events are skipped here.
 ///
 /// **Last-arrival-wins ordering.** The applier keeps a per-key
-/// `last-applied write_ms` in `applied` and skips any incoming write
+/// `last-applied write_ms` in `applied` and skips any incoming event
 /// whose `write_ms <= last_seen`. The origin also records its own
 /// `write_ms` in the same map, so a delayed echo of the origin's own
 /// write cannot clobber a newer local overwrite. Pre-`write_ms` peers
 /// send `write_ms = 0`, which always applies on first sight.
 ///
-/// Known v1 gap: `gossip_del` tombstones do not decode as values, so
-/// remote deletions do not remove the local copy until TTL expiry or a
-/// subsequent overwrite.
+/// **Tombstones.** A remote delete rides the same subscription as a
+/// tombstone-marker payload (see [`crate::gossip_kv`]). When the
+/// tombstone's `write_ms` beats the last-applied write for its key, the
+/// applier calls `remove_local` — dropping both the gossip-materialized
+/// copy and any locally-held data-plane replica of the same key. That
+/// unifies delete propagation for the two tiers without a separate
+/// data-plane OP_DELETE frame: every node subscribes to gossip and
+/// removes on tombstone regardless of which tier originally held the
+/// value.
+///
+/// **TTL updates.** An EXPIRE on the origin re-emits the current value
+/// with the new `expiry_ms` and a fresh `write_ms`. Peers apply the
+/// event verbatim by the same last-arrival-wins rule — so a session TTL
+/// refresh (which *extends* the expiry) replicates correctly, not just a
+/// shortening. Write-time ordering already serializes intent; the peer
+/// takes whatever expiry the origin last stamped.
 pub async fn start_gossip_applier(
     cluster: &ClusterHandle,
     store: Arc<Store>,
@@ -857,26 +918,41 @@ pub async fn start_gossip_applier(
 ) {
     let self_id = cluster.self_node().id.clone();
     cluster
-        .subscribe_kv_changes(move |key, value, ttl, write_ms, node| {
-            if node.node_id == self_id {
+        .subscribe_kv_changes(move |event| {
+            if event.node().node_id == self_id {
                 return;
             }
+            let key = event.key();
+            let write_ms = event.write_ms();
             if !should_apply(&applied, key, write_ms) {
                 tracing::trace!(
                     key,
-                    from = %node.node_id,
+                    from = %event.node().node_id,
                     write_ms,
                     "gossip KV change skipped as stale"
                 );
                 return;
             }
-            store.set_local(key.to_string(), value.to_vec(), ttl);
-            tracing::trace!(
-                key,
-                from = %node.node_id,
-                write_ms,
-                "gossip KV change materialized locally"
-            );
+            match event {
+                crate::gossip_kv::KvChangeEvent::Set { value, ttl, .. } => {
+                    store.set_local(key.to_string(), value.to_vec(), ttl);
+                    tracing::trace!(
+                        key,
+                        from = %event.node().node_id,
+                        write_ms,
+                        "gossip KV set materialized locally"
+                    );
+                }
+                crate::gossip_kv::KvChangeEvent::Tombstone { .. } => {
+                    store.remove_local(key);
+                    tracing::trace!(
+                        key,
+                        from = %event.node().node_id,
+                        write_ms,
+                        "gossip KV tombstone applied locally"
+                    );
+                }
+            }
         })
         .await;
 }

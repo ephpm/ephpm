@@ -913,7 +913,7 @@ impl Router {
                     (
                         error_response_owned(
                             status,
-                            format!("{code} {}", status.canonical_reason().unwrap_or("Error"),),
+                            format!("{code} {}", status.canonical_reason().unwrap_or("Error")),
                         ),
                         "error",
                     )
