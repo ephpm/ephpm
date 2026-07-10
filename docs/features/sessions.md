@@ -185,34 +185,20 @@ ahead of the gossip fan-out. In practice this only matters for sub-second
 redirects against brand-new sessions; for any normal browsing flow the gap
 is invisible.
 
-### Clustered-mode caveats (KV replication v1)
-
-Two session behaviors degrade in clustered mode because of gaps that
-KV replication v1 shipped with (both documented in the
-[clustered KV v2 roadmap](/roadmap/clustered-kv-v2/), which fixes them):
-
-- **`session_destroy()` is not cluster-wide.** Destroy removes the
-  session on the node that handled the request, but copies already
-  materialized on other nodes are not deleted — replication v1's delete
-  tombstones are not applied by peers. A destroyed session id keeps
-  working on other nodes until its TTL expires
-  (`session.gc_maxlifetime`, default 1440 s = 24 minutes). Treat logout
-  and privilege-revocation as *eventually* effective, not immediate. If
-  immediate cluster-wide logout is a hard requirement today, use sticky
-  sessions at your load balancer or run single-node.
-
-- **Idle-timeout refresh is local.** With `session.lazy_write = 1`
-  (PHP's default), a request that reads but doesn't change the session
-  refreshes the TTL via `EXPIRE` — which v1 does not replicate. A
-  read-mostly user bounced across nodes can lose their session on a
-  node whose copy still carries the original TTL, despite being
-  active. Mitigation: `session.lazy_write = 0` in clustered mode —
-  every request rewrites the blob, and writes *do* replicate with a
-  fresh TTL (cost: one KV set per request). Sessions that write on
-  most requests are unaffected either way.
-
-Single-node and multi-tenant (non-clustered) deployments are unaffected
-by both.
+**`session_destroy()` and `session.lazy_write` are cluster-wide.** A logout
+on node B removes the session from every node — the handler's `destroy`
+callback broadcasts a write-stamped tombstone that peer appliers use to
+drop their local copies (both gossip-materialized and any data-plane
+replica). A `session.lazy_write = 1` TTL refresh on the read path
+re-emits the current session bytes with the new expiry stamp, so a
+session heartbeat on one node extends its lifetime on every node — no
+node holds a stale short-TTL copy that expires early. Both of these
+propagate within gossip convergence (typically well under a second on
+loopback / same-rack; ~10–30s worst case under default chitchat
+timings), and eventual consistency remains the honest characterization:
+convergence is not synchronous. See
+[architecture/kv-store](/architecture/kv-store/#tier-1--gossip-backed-small-values)
+for the SET/DEL/EXPIRE replication contract.
 
 ## Limitations
 

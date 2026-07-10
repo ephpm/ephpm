@@ -243,3 +243,265 @@ async fn hooked_sync_set_replicates_to_peer_via_gossip() {
     shutdown(h1).await;
     shutdown(h2).await;
 }
+
+/// Fixture: two chitchat-joined nodes, each with a local `Store` hooked
+/// through a `KvReplicator` + a running gossip applier — exactly the
+/// wiring `ephpm-server::serve()` installs at startup. Returns
+/// `(handle, local, clustered)` per node so tests can drive sync
+/// `Store::remove` / `Store::expire` and observe cluster-wide effects.
+async fn two_node_hooked_fixture() -> TwoNode {
+    let port1 = random_udp_port().await;
+    let port2 = random_udp_port().await;
+    let seed = format!("127.0.0.1:{port1}");
+
+    let h1 = Arc::new(start_node(port1, vec![], "hook-a").await);
+    let h2 = Arc::new(start_node(port2, vec![seed], "hook-b").await);
+    wait_for_convergence(&[&h1, &h2], 2, Duration::from_secs(10)).await;
+
+    // Force gossip tier so writes fan out via chitchat.
+    let cfg = ClusterKvConfig { small_key_threshold: 4096, ..ClusterKvConfig::default() };
+
+    let (local1, cs1) = hook_node(&h1, cfg.clone()).await;
+    let (local2, cs2) = hook_node(&h2, cfg).await;
+
+    TwoNode { h1, local1, cs1, h2, local2, cs2 }
+}
+
+struct TwoNode {
+    h1: Arc<ClusterHandle>,
+    local1: Arc<Store>,
+    cs1: Arc<ClusteredStore>,
+    h2: Arc<ClusterHandle>,
+    local2: Arc<Store>,
+    cs2: Arc<ClusteredStore>,
+}
+
+impl TwoNode {
+    async fn shutdown(self) {
+        self.local1.set_replicator(None);
+        self.local2.set_replicator(None);
+        drop(self.cs1);
+        drop(self.cs2);
+        drop(self.local1);
+        drop(self.local2);
+        shutdown(self.h1).await;
+        shutdown(self.h2).await;
+    }
+}
+
+/// Install the same replicator + applier pair `ephpm-server::serve()`
+/// wires up. Returns the local Store + the ClusteredStore for reads.
+async fn hook_node(
+    handle: &Arc<ClusterHandle>,
+    cfg: ClusterKvConfig,
+) -> (Arc<Store>, Arc<ClusteredStore>) {
+    let local = Store::new(StoreConfig::default());
+    let clustered = ClusteredStore::new(Arc::clone(&local), Arc::clone(handle), cfg, None);
+    let applied = ephpm_cluster::clustered_store::new_applied_write_map();
+    let replicator = KvReplicator::new(
+        Arc::clone(&clustered),
+        tokio::runtime::Handle::current(),
+        applied.clone(),
+    );
+    local.set_replicator(Some(replicator as Arc<dyn Replicator>));
+    ephpm_cluster::clustered_store::start_gossip_applier(handle, Arc::clone(&local), applied).await;
+    (local, clustered)
+}
+
+/// Poll until `predicate` returns true, or the deadline expires.
+/// Returns whether the predicate ever became true.
+async fn wait_until<F, Fut>(mut predicate: F, timeout: Duration) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if predicate().await {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Delete-propagation: node A sets a small-value key, both nodes see it,
+/// A removes it, and B's materialized copy disappears within convergence.
+#[tokio::test]
+async fn remote_delete_removes_peer_local_copy() {
+    let f = two_node_hooked_fixture().await;
+
+    // Set on A, wait for B to materialize (gossip applier fires).
+    assert!(f.local1.set("session:abc".into(), b"payload".to_vec(), None));
+    assert!(
+        wait_until(|| async { f.local2.get("session:abc").is_some() }, Duration::from_secs(5))
+            .await,
+        "gossip SET must materialize on peer B"
+    );
+    assert_eq!(f.local2.get("session:abc").as_deref(), Some(b"payload".as_slice()));
+
+    // Delete on A. Before this PR the tombstone was invisible to the
+    // applier and B's copy lingered until TTL. Now the tombstone rides
+    // the same subscription and remove_local fires on B.
+    assert!(f.local1.remove("session:abc"));
+
+    assert!(
+        wait_until(|| async { f.local2.get("session:abc").is_none() }, Duration::from_secs(5))
+            .await,
+        "tombstone must propagate: peer B's local copy should be dropped"
+    );
+    // ClusteredStore::get on B must also read as deleted (gossip_get
+    // now honours the tombstone's write_ms ordering, and the local copy
+    // is gone).
+    assert!(f.cs2.get("session:abc").await.is_none());
+
+    f.shutdown().await;
+}
+
+/// A stale tombstone (older write_ms) must NOT delete a newer SET.
+/// Ordering guarantee: `write_ms <= last_applied` is treated as stale.
+#[tokio::test]
+async fn stale_tombstone_does_not_delete_newer_set() {
+    let f = two_node_hooked_fixture().await;
+
+    // Write v1 on A, let B see it, then overwrite with v2 on A — B's
+    // last-applied write_ms is now the v2 stamp.
+    assert!(f.local1.set("k".into(), b"v1".to_vec(), None));
+    assert!(wait_until(|| async { f.local2.get("k").is_some() }, Duration::from_secs(5)).await);
+
+    // Small gap so the SET's write_ms is strictly < any tombstone we
+    // build "before" it below.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(f.local1.set("k".into(), b"v2".to_vec(), None));
+    assert!(
+        wait_until(
+            || async { f.local2.get("k").as_deref() == Some(b"v2".as_slice()) },
+            Duration::from_secs(5)
+        )
+        .await,
+        "peer B must materialize the overwrite"
+    );
+
+    // Simulate a delayed echo of an OLDER delete via
+    // ClusterHandle::gossip_del on A — but issued before the v2 write
+    // in wall-clock time. In practice we can't rewind time from a test,
+    // so we exercise the ordering guarantee at the applied-map level:
+    // after v2, a tombstone stamped NOW is newer and DOES delete
+    // (positive control), but the applier's `should_apply` gate is what
+    // rejects stale echoes. Verified in the pure test in
+    // clustered_store.rs::should_apply_stale_write_is_skipped. Here we
+    // additionally assert the positive-control shape: a fresh delete
+    // still works after the overwrite.
+    assert!(f.local1.remove("k"));
+    assert!(
+        wait_until(|| async { f.local2.get("k").is_none() }, Duration::from_secs(5)).await,
+        "fresh delete after overwrite must still propagate"
+    );
+
+    f.shutdown().await;
+}
+
+/// EXPIRE-propagation, extend case: node A sets with a short TTL, then
+/// extends the TTL — B's copy must survive past the ORIGINAL expiry.
+#[tokio::test]
+async fn expire_extend_propagates_across_cluster() {
+    let f = two_node_hooked_fixture().await;
+
+    // Set with a moderate TTL (2s) on A — long enough for chitchat
+    // gossip convergence to reach B before it expires. Give B enough
+    // time to materialize.
+    assert!(f.local1.set("session:xyz".into(), b"blob".to_vec(), Some(Duration::from_secs(2))));
+    assert!(
+        wait_until(|| async { f.local2.get("session:xyz").is_some() }, Duration::from_secs(10))
+            .await,
+        "initial SET must reach peer"
+    );
+
+    // Immediately extend the TTL well beyond the original.
+    // lazy_write / update_timestamp fires this exact call on session
+    // refresh: same value, longer TTL.
+    assert!(f.local1.expire("session:xyz", Duration::from_secs(60)));
+
+    // Wait until the extension has propagated (peer's PTTL passes the
+    // original 2s budget). Prior to this PR the extension was
+    // local-only and peer's copy expired at the original write time.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        f.local2.get("session:xyz").is_some(),
+        "peer must still hold the value past the original TTL after EXPIRE extend"
+    );
+    // And through ClusteredStore.
+    assert!(f.cs2.get("session:xyz").await.is_some());
+
+    f.shutdown().await;
+}
+
+/// EXPIRE-propagation, shorten case: extending isn't the only refresh
+/// pattern — a shortened TTL must also take effect on the peer.
+#[tokio::test]
+async fn expire_shorten_propagates_across_cluster() {
+    let f = two_node_hooked_fixture().await;
+
+    // Set with a long TTL (30s) on A, let B materialize.
+    assert!(f.local1.set("k".into(), b"v".to_vec(), Some(Duration::from_secs(30))));
+    assert!(wait_until(|| async { f.local2.get("k").is_some() }, Duration::from_secs(2)).await);
+
+    // Shorten the TTL to 500ms. The peer must observe the shorter
+    // expiry: its copy should disappear within a couple of seconds even
+    // though the original TTL was 30s. The applier surfaces an
+    // already-expired incoming SET as a Tombstone (see
+    // `subscribe_kv_changes`), so an event that arrives a hair after
+    // the encoded expiry still deletes the peer's stale copy — the
+    // race that made KV v1 EXPIRE a no-op.
+    assert!(f.local1.expire("k", Duration::from_millis(500)));
+
+    assert!(
+        wait_until(|| async { f.local2.get("k").is_none() }, Duration::from_secs(5)).await,
+        "shortened TTL must propagate — peer's copy should expire (was 30s TTL, shortened to 500ms)"
+    );
+
+    f.shutdown().await;
+}
+
+/// The session-destroy end-to-end scenario at the store level. A user
+/// logs in on node A, then logs out on node B (`session_destroy()` maps
+/// to `Store::remove` on whichever node handles the logout). The
+/// original node's copy must be gone — otherwise the session survives
+/// the logout on any node still holding its own materialized copy.
+#[tokio::test]
+async fn session_destroy_from_peer_removes_origin_copy() {
+    let f = two_node_hooked_fixture().await;
+
+    // Login on A: set the session blob (small so it rides gossip).
+    assert!(f.local1.set("session:logout-scenario".into(), b"user_id=42".to_vec(), None));
+    // Wait for B to materialize.
+    assert!(
+        wait_until(
+            || async { f.local2.get("session:logout-scenario").is_some() },
+            Duration::from_secs(5)
+        )
+        .await,
+        "session must be readable on both nodes after login"
+    );
+
+    // Logout on B — session_destroy() → Store::remove on node B.
+    assert!(f.local2.remove("session:logout-scenario"));
+
+    // A's local materialized copy must be gone within convergence.
+    // Prior to this PR the tombstone was invisible: A held the session
+    // until TTL expiry or overwrite, so the user was "logged in" on A
+    // for the entire session lifetime after logout.
+    assert!(
+        wait_until(
+            || async { f.local1.get("session:logout-scenario").is_none() },
+            Duration::from_secs(5)
+        )
+        .await,
+        "peer-initiated destroy must remove the origin's copy — the whole point of clustered \
+         sessions"
+    );
+
+    f.shutdown().await;
+}

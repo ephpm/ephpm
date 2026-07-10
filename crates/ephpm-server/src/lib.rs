@@ -76,17 +76,21 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
             "middleware chain loaded"
         );
         // In cluster mode, the built-in ratelimit middleware uses local KV
-        // INCR to track the request count per window. INCR is NOT yet
-        // replicated across the cluster (issue #150 — writes gossip on
-        // SET, but INCR is a local-only op today), so the rate limit is
-        // enforced PER NODE, not across the whole fleet. Surface the gap
-        // at startup instead of leaving operators to find it in prod.
+        // INCR to track the request count per window. SET/DEL and EXPIRE
+        // now replicate across the cluster (KV replication v1.1), but
+        // INCR is still local-only — read-modify-write ops need owner
+        // routing to be cluster-correct (see
+        // site/content/roadmap/clustered-kv-v2.md, "Replicated counters"),
+        // so the rate limit is still enforced PER NODE, not across the
+        // whole fleet. Surface the gap at startup instead of leaving
+        // operators to find it in prod.
         if config.cluster.enabled && chain.module_names().contains(&"ratelimit") {
             tracing::warn!(
                 "[middleware] ratelimit mounted with [cluster].enabled = true — KV INCR is \
-                 not yet replicated across nodes, so rate limits are enforced PER NODE. A \
-                 client hitting N nodes gets up to N × the configured allowance. See \
-                 site/content/reference/middleware/ratelimit.md for the current status."
+                 not yet replicated across nodes (SET/DEL/EXPIRE now do), so rate limits are \
+                 enforced PER NODE. A client hitting N nodes gets up to N × the configured \
+                 allowance. See site/content/reference/middleware/ratelimit.md for the current \
+                 status."
             );
         }
         Some(Arc::new(chain))
