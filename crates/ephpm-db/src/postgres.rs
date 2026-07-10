@@ -221,6 +221,8 @@ impl PgProxy {
                     continue;
                 }
             };
+            // See mysql.rs: Nagle + delayed ACK costs ~40ms per small round trip.
+            let _ = client.set_nodelay(true);
             debug!(%peer, "PostgreSQL client connected");
             let p = Arc::clone(&proxy);
             tokio::spawn(async move {
@@ -312,6 +314,7 @@ impl PgProxy {
 /// against real PG 13 (`md5`) and PG 17 (`scram-sha-256`).
 async fn pg_connect_and_handshake(url: &DbUrl) -> Result<(TcpStream, PgServerMeta), DbError> {
     let mut stream = TcpStream::connect(url.addr()).await?;
+    let _ = stream.set_nodelay(true);
 
     // Send StartupMessage: length (4) + protocol version (4) + key=value pairs + \0.
     let mut startup = Vec::with_capacity(128);

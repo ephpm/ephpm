@@ -117,6 +117,9 @@ pub async fn serve_on(
                 continue;
             }
         };
+        // Small framed request/response protocol — same Nagle/delayed-ACK
+        // stall as the DB proxies without this.
+        let _ = stream.set_nodelay(true);
         let store = Arc::clone(&store);
         let cipher = cipher.clone();
         tokio::spawn(async move {
@@ -293,6 +296,7 @@ pub async fn fetch_remote(
     cipher: Option<&ClusterCipher>,
 ) -> anyhow::Result<Option<Vec<u8>>> {
     let mut stream = TcpStream::connect(addr).await?;
+    let _ = stream.set_nodelay(true);
 
     // Send GET op + key.
     write_message(&mut stream, &encode_get_request(key)?, cipher).await?;
@@ -335,6 +339,7 @@ pub async fn store_remote(
     cipher: Option<&ClusterCipher>,
 ) -> anyhow::Result<bool> {
     let mut stream = TcpStream::connect(addr).await?;
+    let _ = stream.set_nodelay(true);
 
     // Send SET op + key + value.
     write_message(&mut stream, &encode_set_request(key, value)?, cipher).await?;
