@@ -8,6 +8,7 @@ Forward-looking design documents — what we're planning, what we're considering
 
 These pages describe targets, not currently-shipped behavior. For what works today, see [Architecture](/docs/architecture/) and [Feature Status](/docs/introduction/feature-status/).
 
+- **[Performance Master List](performance/)** — every measured or audited performance item in one living table: shipped (with numbers), backlog, gated, unexplored.
 - **[Worker Dispatch Fast Path](worker-dispatch-fastpath/)** — closing the measured gap to in-process runtimes: lazy Envelope, handoff economics, quota-aware defaults.
 - **[Turso Engine](turso-engine/)** — one engine for both modes: the Rust SQLite rewrite replacing rusqlite and the sqld sidecar, gated on upstream GA.
 - **[Clustered KV v2](clustered-kv-v2/)** — owner-routed counters and cluster-correct rate limiting (delete tombstones and TTL replication shipped as v1.1).
