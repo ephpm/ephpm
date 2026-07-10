@@ -11,6 +11,7 @@
 
 use ephpm_e2e::required_env;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Get the sites directory path from env.
 fn sites_dir() -> PathBuf {
@@ -71,12 +72,20 @@ async fn lazy_discovered_site_serves_content() {
     )
     .expect("failed to write index.html");
 
-    // Request again — should now serve from the new site directory.
-    let resp = get_with_host(&base_url, host, "/index.html").await;
+    // Request again — served from the new site directory once the router's
+    // negative-lookup cache (UNKNOWN_SITE_TTL, 2s) expires. The documented
+    // contract is "live within seconds", not "live on the very next
+    // request", so poll rather than assert instantly.
+    let mut resp = get_with_host(&base_url, host, "/index.html").await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    while resp.status().as_u16() != 200 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        resp = get_with_host(&base_url, host, "/index.html").await;
+    }
     assert_eq!(
         resp.status().as_u16(),
         200,
-        "expected 200 from lazily discovered site"
+        "expected 200 from lazily discovered site within the discovery window"
     );
     let body = resp.text().await.expect("failed to read body");
     assert!(

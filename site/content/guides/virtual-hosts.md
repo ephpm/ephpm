@@ -242,7 +242,8 @@ When a customer cancels and their site directory is removed, traffic from existi
 1. Customer signs up for alice-blog.com
    → Create /var/www/sites/alice-blog.com/
    → Install WordPress
-   → Site is live immediately (no restart needed with future hot-reload)
+   → Site is live within ~2 seconds (no restart — the router re-checks
+     unknown hosts after a short negative-lookup TTL)
 
 2. Customer is active
    → Requests to alice-blog.com served from site directory
