@@ -45,18 +45,24 @@ effort gets wasted.
 
 ## Design
 
-### Phase 0 — measure, then config wins (v0.4.1-sized)
+### Phase 0 — measure, then config wins ✅ config portion SHIPPED (v0.4.1)
 
-- Flamegraph the worker path under c=16 load (perf inside the container;
-  dhat for the Rust allocs) and validate the decomposition above.
-- **Quota-aware `worker_count` derivation**: the default derives from
-  host parallelism, which overshoots inside CPU-limited containers — the
-  knob matrix measured 1 worker beating the derived 2 by ~24% at 0.25
-  CPU (2,100 vs 1,690 rps). Derive from the cgroup CPU quota
-  (`cpu.max`) when present, host cores otherwise.
-- **Recycle default**: `worker_max_requests = 500` forces a worker
-  reboot every ~0.25 s at 2,000 rps. Raise the default and log recycle
-  frequency so the cost is visible.
+The two config fixes landed within hours of this page being written
+(PR #159):
+
+- **Quota-aware `worker_count` derivation** — shipped. `worker_count =
+  0` now reads the cgroup CPU quota (v2 `cpu.max`, v1
+  `cfs_quota_us`/`cfs_period_us`) and derives `ceil(quota_cpus)`,
+  falling back to host parallelism without a quota. The knob matrix
+  that motivated it: 1 worker beat the derived 2 by ~24% at 0.25 CPU
+  (2,100 vs 1,690 rps). Startup logs the derivation source.
+- **Recycle default** — shipped. `worker_max_requests` default raised
+  500 → 10,000 (500 forced a worker reboot every ~0.25 s at 2,000 rps);
+  each recycle logs worker id, requests served, and uptime.
+
+Still open from Phase 0: flamegraph the worker path under c=16 load
+(perf inside the container; dhat for the Rust allocs) and validate the
+decomposition above before investing in Phases 1–2.
 
 ### Phase 1 — lazy Envelope
 
