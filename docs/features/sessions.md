@@ -185,6 +185,35 @@ ahead of the gossip fan-out. In practice this only matters for sub-second
 redirects against brand-new sessions; for any normal browsing flow the gap
 is invisible.
 
+### Clustered-mode caveats (KV replication v1)
+
+Two session behaviors degrade in clustered mode because of gaps that
+KV replication v1 shipped with (both documented in the
+[clustered KV v2 roadmap](/roadmap/clustered-kv-v2/), which fixes them):
+
+- **`session_destroy()` is not cluster-wide.** Destroy removes the
+  session on the node that handled the request, but copies already
+  materialized on other nodes are not deleted — replication v1's delete
+  tombstones are not applied by peers. A destroyed session id keeps
+  working on other nodes until its TTL expires
+  (`session.gc_maxlifetime`, default 1440 s = 24 minutes). Treat logout
+  and privilege-revocation as *eventually* effective, not immediate. If
+  immediate cluster-wide logout is a hard requirement today, use sticky
+  sessions at your load balancer or run single-node.
+
+- **Idle-timeout refresh is local.** With `session.lazy_write = 1`
+  (PHP's default), a request that reads but doesn't change the session
+  refreshes the TTL via `EXPIRE` — which v1 does not replicate. A
+  read-mostly user bounced across nodes can lose their session on a
+  node whose copy still carries the original TTL, despite being
+  active. Mitigation: `session.lazy_write = 0` in clustered mode —
+  every request rewrites the blob, and writes *do* replicate with a
+  fresh TTL (cost: one KV set per request). Sessions that write on
+  most requests are unaffected either way.
+
+Single-node and multi-tenant (non-clustered) deployments are unaffected
+by both.
+
 ## Limitations
 
 - **Memory eviction.** The KV store has a configurable `memory_limit` and an
