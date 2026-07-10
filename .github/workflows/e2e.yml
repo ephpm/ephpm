@@ -5,11 +5,21 @@
 
 name: E2E Tests
 
+# Docs-only changes skip E2E — see ci.yml; doubly important here since
+# each E2E run occupies the serialized repo-wide concurrency group.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "site/**"
+      - "docs/**"
+      - "**.md"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "site/**"
+      - "docs/**"
+      - "**.md"
 
 # Serialize E2E across the whole repo. Each E2E job runs a full Kind cluster
 # plus a Rust release build inside ephemerd's shared 16 GB Linux VM; several
