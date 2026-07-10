@@ -335,6 +335,8 @@ The session handler implements PHP's `SessionHandlerInterface` at the C level:
 
 With clustering, sessions are accessible from any node — no sticky sessions required at the load balancer. Ownership is a deterministic `hash(session_id) % alive_nodes`, so within a stable cluster reads-after-writes for a session hit the same owner (read-your-writes for free). Large session blobs are additionally replicated to `replication_factor` nodes, so a session survives owner loss.
 
+> **KV v1 caveats:** `session_destroy()` and lazy-write TTL refresh are not replicated cluster-wide — see the [clustered KV v2 roadmap](/roadmap/clustered-kv-v2/) and the sessions doc's clustered-mode caveats.
+
 ### 3. Direct SAPI Functions — Maximum Performance
 
 **Priority: implement third.** For applications that want the absolute fastest KV access — 1,000-10,000x faster than RESP for local keys. Requires ephpm-specific PHP code.
@@ -829,7 +831,7 @@ Most WordPress page views are anonymous and return identical content. Skipping P
 
 ### Session Storage
 
-PHP sessions stored in the KV store instead of the filesystem. With clustering, sessions are accessible from any node — no sticky sessions required at the load balancer.
+PHP sessions stored in the KV store instead of the filesystem. With clustering, sessions are accessible from any node — no sticky sessions required at the load balancer (but note the KV v1 caveats: `session_destroy()` and lazy-write TTL refresh are not replicated — see the [clustered KV v2 roadmap](/roadmap/clustered-kv-v2/)).
 
 #### How PHP Sessions Work
 
