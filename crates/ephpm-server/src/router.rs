@@ -49,10 +49,13 @@ pub struct CompressionSettings {
 
 /// How long a "no site directory for this host" answer is cached
 /// before we retry the on-disk lookup. Short enough that lazy vhost
-/// discovery still feels immediate for legitimate deploys; long
-/// enough that a burst of bot probes for the same `Host: <random>`
-/// doesn't restatstore the filesystem on every request.
-const UNKNOWN_SITE_TTL: Duration = Duration::from_secs(60);
+/// discovery stays near-immediate for legitimate deploys — 60s here
+/// shipped in 0.4.0 and made freshly created site directories 404 for
+/// up to a minute after any prior probe (caught by the vhosts e2e once
+/// the suite was un-broken). 2s still collapses bot-probe bursts for
+/// the same `Host: <random>` into one stat per window, which is all
+/// the cache is for; a stat every 2s per unique host is noise.
+const UNKNOWN_SITE_TTL: Duration = Duration::from_secs(2);
 
 /// Per-site configuration resolved at startup from `sites_dir`.
 struct SiteConfig {
@@ -913,7 +916,7 @@ impl Router {
                     (
                         error_response_owned(
                             status,
-                            format!("{code} {}", status.canonical_reason().unwrap_or("Error"),),
+                            format!("{code} {}", status.canonical_reason().unwrap_or("Error")),
                         ),
                         "error",
                     )
