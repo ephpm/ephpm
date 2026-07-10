@@ -193,10 +193,7 @@ impl std::fmt::Debug for Store {
             .field("hashes_len", &self.hashes.len())
             .field("mem_used", &self.mem_used.load(Ordering::Relaxed))
             .field("config", &self.config)
-            .field(
-                "replicator_installed",
-                &self.replicator.read().is_ok_and(|g| g.is_some()),
-            )
+            .field("replicator_installed", &self.replicator.read().is_ok_and(|g| g.is_some()))
             .field("anchor", &self.anchor)
             .finish()
     }
