@@ -131,8 +131,8 @@ authoritative details:
 
 | Knob | Default | What it does |
 |---|---|---|
-| `worker_count` | `0` (CPU-derived, clamped 2–32; forced 1 on Windows) | Persistent worker threads. |
-| `worker_max_requests` | `500` | Recycle a worker after N requests (fresh boot reclaims slow memory growth). `0` = never. |
+| `worker_count` | `0` (cgroup-quota- or CPU-derived) | Persistent worker threads. `0` derives from the cgroup CPU quota when present (Linux — the sweet spot inside CPU-limited containers), else host parallelism clamped 2–32. Forced to `1` on Windows. |
+| `worker_max_requests` | `10000` | Recycle a worker after N requests (fresh boot reclaims slow memory growth). Pure leak guard — for a leak-free framework loop, prefer `0`. |
 | `worker_backlog` | `0` (= `worker_count`) | Dispatch-queue depth; a full queue applies HTTP backpressure. |
 | `worker_boot_timeout` | `30` | Boots slower than this are logged as errors and counted (`ephpm_worker_boot_timeouts_total`). |
 | `worker_stream_threshold` | `1 MiB` | Request bodies at/above this (or chunked bodies) stream into the worker instead of buffering. |

@@ -454,8 +454,8 @@ Extend `PhpConfig` (`crates/ephpm-config/src/lib.rs:1137-1180`). Follow the
 mode = "fpm"                 # "fpm" (default, unchanged) | "worker"
 # worker-mode only:
 worker_script = "worker.php" # entrypoint, relative to document_root; required if mode="worker"
-worker_count = 0             # 0 => derive from CPU count (see below); else explicit
-worker_max_requests = 500    # recycle a worker after N requests (0 = never)
+worker_count = 0             # 0 => derive from cgroup quota (Linux) or CPU count; else explicit
+worker_max_requests = 10000  # recycle a worker after N requests (0 = never)
 worker_backlog = 0           # dispatch queue depth; 0 => = worker_count
 worker_boot_timeout = 30     # seconds; boot must reach first take_request() within this
 worker_populate_superglobals = false  # true for the WordPress adapter
@@ -467,11 +467,16 @@ worker_populate_superglobals = false  # true for the WordPress adapter
   defaults to 0=unlimited *deliberately* because uncapped-but-lazy is safe for
   fpm — see the pointed comment at `config lib.rs:1460-1481`), worker mode
   *must* pick a concrete count because each worker is a permanently-parked OS
-  thread holding a full framework in memory. Derive `num_cpus` (clamped
-  `[2, 32]`); document that heavy frameworks (WordPress ~40MB/worker) may want
-  it lower.
-- `worker_max_requests` is the memory-leak guard (§5.2). Default 500 —
-  conservative, matches php-fpm `pm.max_requests` conventions.
+  thread holding a full framework in memory. On Linux, derive from the cgroup
+  CPU quota (`cpu.max` v2 or `cfs_quota_us`/`cfs_period_us` v1) when running
+  under one — inside CPU-limited containers this is the sweet spot; the
+  host-parallelism derivation overshoots. Otherwise derive from
+  `num_cpus` (clamped `[2, 32]`). Heavy frameworks (WordPress ~40MB/worker)
+  may want it lower.
+- `worker_max_requests` is the memory-leak guard (§5.2). Default `10000` —
+  a pure leak guard, not a churn trigger. For a leak-free framework loop
+  recycling is pure overhead (each recycle re-boots the framework). Each
+  recycle is logged at debug (worker id, requests served, uptime).
 
 ### 4.2 Relationship to `[php] workers` (the existing semaphore)
 

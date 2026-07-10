@@ -146,8 +146,9 @@ async fn requests_keep_succeeding_across_recycles() {
         return;
     };
 
-    // Enough requests to cross a default worker_max_requests (500) if the
-    // harness lowered it; regardless, every request must be a clean 200.
+    // Enough requests to cross a lowered worker_max_requests if the harness
+    // set one (default is 10000, so this loop alone does not recycle);
+    // regardless, every request must be a clean 200.
     for i in 0..200 {
         let (status, body) = get(&base, &format!("/r-{i}")).await;
         assert_eq!(status, 200, "request {i} failed across recycles ({status}): {body}");
