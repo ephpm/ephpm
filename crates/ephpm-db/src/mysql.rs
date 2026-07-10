@@ -247,6 +247,9 @@ impl MySqlProxy {
                     continue;
                 }
             };
+            // Nagle + delayed ACK stalls every small request/response round
+            // trip by ~40ms on Linux loopback (measured 44ms/query, 2026-07-09).
+            let _ = client.set_nodelay(true);
             debug!(%peer, "MySQL client connected");
             let p = Arc::clone(&proxy);
             tokio::spawn(async move {
@@ -333,6 +336,7 @@ impl MySqlProxy {
 /// the initial greeting.
 async fn connect_and_handshake(url: &DbUrl) -> Result<(TcpStream, ServerMeta), DbError> {
     let mut stream = TcpStream::connect(url.addr()).await?;
+    let _ = stream.set_nodelay(true);
 
     // Receive HandshakeV10.
     let (_, payload) = read_packet(&mut stream).await?;

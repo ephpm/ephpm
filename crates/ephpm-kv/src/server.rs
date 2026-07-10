@@ -149,6 +149,9 @@ pub async fn serve_on(
     loop {
         match listener.accept().await {
             Ok((mut stream, addr)) => {
+                // RESP is small request/response frames; Nagle + delayed ACK
+                // stalls each round trip ~40ms on Linux without this.
+                let _ = stream.set_nodelay(true);
                 let permit = match &conn_permits {
                     Some(sem) => match Arc::clone(sem).try_acquire_owned() {
                         Ok(permit) => Some(permit),
