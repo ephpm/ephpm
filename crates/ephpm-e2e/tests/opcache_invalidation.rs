@@ -32,9 +32,7 @@
 
 use std::time::Duration;
 
-use bytes::BytesMut;
 use ephpm_e2e::required_env;
-use ephpm_kv::resp::{Frame, parse_frame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -89,38 +87,63 @@ async fn probe_status_with(base_url: &str, warm: bool) -> serde_json::Value {
     resp.json().await.unwrap_or_else(|e| panic!("invalid JSON from {url}: {e}"))
 }
 
-/// Open a RESP connection and send a single command, returning the response.
-async fn resp_roundtrip(host: &str, port: u16, cmd: Frame) -> anyhow::Result<Frame> {
+/// Minimal RESP reply for the two commands this test sends (SET, PING) —
+/// both answer with a single simple-string or error line.
+///
+/// Deliberately local: ephpm-e2e is excluded from the workspace and its
+/// Docker image builds the crate standalone, so it must not path-depend on
+/// workspace crates. The previous `ephpm-kv` path dependency (added in #144)
+/// silently broke every E2E image build until #164 unmasked it — the dep
+/// drags in workspace-inherited manifest fields and further path deps.
+#[derive(Debug)]
+enum RespReply {
+    Simple,
+    Error(String),
+}
+
+/// Encode a RESP2 array-of-bulk-strings command.
+fn encode_cmd(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", parts.len()).into_bytes();
+    for p in parts {
+        out.extend_from_slice(format!("${}\r\n", p.len()).as_bytes());
+        out.extend_from_slice(p);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+/// Open a RESP connection and send a single command, returning the reply line.
+async fn resp_roundtrip(host: &str, port: u16, parts: &[&[u8]]) -> anyhow::Result<RespReply> {
     let mut stream = TcpStream::connect(format!("{host}:{port}"))
         .await
         .map_err(|e| anyhow::anyhow!("connect {host}:{port}: {e}"))?;
-    let bytes = cmd.to_bytes();
-    stream.write_all(&bytes).await?;
-    let mut buf = BytesMut::with_capacity(4096);
-    loop {
-        buf.reserve(512);
-        let n = stream.read_buf(&mut buf).await?;
+    stream.write_all(&encode_cmd(parts)).await?;
+    let mut buf = Vec::with_capacity(256);
+    let mut chunk = [0u8; 64];
+    while !buf.windows(2).any(|w| w == b"\r\n") {
+        let n = stream.read(&mut chunk).await?;
         if n == 0 {
-            anyhow::bail!("connection closed before RESP frame arrived");
+            anyhow::bail!("connection closed before RESP reply arrived");
         }
-        if let Some(frame) = parse_frame(&mut buf)? {
-            return Ok(frame);
-        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let line = String::from_utf8_lossy(&buf);
+    let line = line.trim_end_matches(['\r', '\n']);
+    match line.as_bytes().first() {
+        Some(b'+') => Ok(RespReply::Simple),
+        Some(b'-') => Ok(RespReply::Error(line[1..].to_string())),
+        _ => anyhow::bail!("unexpected RESP reply: {line}"),
     }
 }
 
 /// Write `opcache:version:<vhost> = value` via RESP.
 async fn set_version(host: &str, port: u16, vhost: &str, value: u64) -> anyhow::Result<()> {
     let key = format!("{OPCACHE_VERSION_PREFIX}{vhost}");
-    let cmd = Frame::Array(vec![
-        Frame::bulk(b"SET".to_vec()),
-        Frame::bulk(key.into_bytes()),
-        Frame::bulk(value.to_string().into_bytes()),
-    ]);
-    match resp_roundtrip(host, port, cmd).await? {
-        Frame::Simple(_) => Ok(()),
-        Frame::Error(e) => anyhow::bail!("RESP error: {e}"),
-        other => anyhow::bail!("unexpected response: {other}"),
+    let value = value.to_string();
+    let parts: [&[u8]; 3] = [b"SET", key.as_bytes(), value.as_bytes()];
+    match resp_roundtrip(host, port, &parts).await? {
+        RespReply::Simple => Ok(()),
+        RespReply::Error(e) => anyhow::bail!("RESP error: {e}"),
     }
 }
 
@@ -156,8 +179,7 @@ async fn single_node_deploy_triggers_invalidation() {
 
     // Skip cleanly if the RESP listener is disabled — the test can't function
     // without it (the CLI has no other way to write to the in-process KV).
-    let ping = Frame::Array(vec![Frame::bulk(b"PING".to_vec())]);
-    if resp_roundtrip(&kv_host, kv_port, ping).await.is_err() {
+    if resp_roundtrip(&kv_host, kv_port, &[b"PING".as_slice()]).await.is_err() {
         eprintln!(
             "RESP listener at {kv_host}:{kv_port} unreachable — skipping (\
              enable [kv.redis_compat] in ephpm.toml)"
@@ -221,8 +243,7 @@ async fn single_node_cache_reset_works() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(6379);
 
-    let ping = Frame::Array(vec![Frame::bulk(b"PING".to_vec())]);
-    if resp_roundtrip(&kv_host, kv_port, ping).await.is_err() {
+    if resp_roundtrip(&kv_host, kv_port, &[b"PING".as_slice()]).await.is_err() {
         eprintln!("RESP listener unreachable — skipping");
         return;
     }
@@ -282,8 +303,7 @@ async fn cluster_broadcast_fans_out_to_all_nodes() {
     }
 
     // Check that node 0's RESP listener is reachable at all.
-    let ping = Frame::Array(vec![Frame::bulk(b"PING".to_vec())]);
-    if resp_roundtrip(&host0, kv_port, ping).await.is_err() {
+    if resp_roundtrip(&host0, kv_port, &[b"PING".as_slice()]).await.is_err() {
         eprintln!("node 0 RESP unreachable at {host0}:{kv_port} — skipping");
         return;
     }

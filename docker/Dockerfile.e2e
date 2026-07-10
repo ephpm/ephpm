@@ -22,13 +22,6 @@ WORKDIR /src/crates/ephpm-e2e
 # (ephpm-e2e is excluded from the workspace, so its lockfile isn't kept
 # in sync by routine workspace operations). Letting fetch update the
 # lockfile in this layer is fine — the later --frozen build pins it.
-# ephpm-e2e has a path dependency on ../ephpm-kv (the RESP client used by
-# the opcache_invalidation test, added in #144) — the crate must exist in
-# the image or `cargo fetch` cannot load its manifest and the build dies
-# with "failed to load manifest for dependency `ephpm-kv`". Copied in full
-# (ephpm-kv has no further path dependencies); an ephpm-kv change correctly
-# invalidates this layer because the e2e binaries compile it.
-COPY crates/ephpm-kv/ /src/crates/ephpm-kv/
 COPY crates/ephpm-e2e/Cargo.toml crates/ephpm-e2e/Cargo.lock ./
 RUN mkdir -p src tests \
     && printf 'fn main() {}\n' > src/lib.rs \
