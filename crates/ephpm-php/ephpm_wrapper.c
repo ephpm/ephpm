@@ -187,6 +187,36 @@ static EPHPM_TLS unsigned long req_generation = 0;
  * by our SAPI, so a single shared marker address suffices. */
 static int ephpm_server_context_marker = 0;
 
+/* Worker mode — lazy Envelope backing store (Phase 1 fast path).
+ *
+ * `take_request` stashes borrowed pointers to the Rust-owned request data
+ * here without materializing any of the four PHP arrays (serverVars,
+ * headers, cookies, query). The Envelope's accessor methods build each
+ * array on first call, cache it as a property, and return the cached
+ * value on subsequent calls in the same request.
+ *
+ * Lifetime: the pointers borrow from `CurrentRequest` in
+ * `crates/ephpm-php/src/worker_bridge.rs`, which the Rust side keeps alive
+ * from the moment `worker_take_request` publishes it until the matching
+ * `send_response` completes on the same worker thread — the same "valid
+ * until execute returns" contract `ephpm_request_set_info` relies on
+ * (:653-672). The C wrapper never dereferences these pointers outside a
+ * matched take_request/send_response pair.
+ *
+ * Cross-iteration isolation: an Envelope stashed by userland across the
+ * loop iteration would still hold the old `req_generation` on its
+ * `generation` property; each accessor compares against the current
+ * `req_generation` and returns an empty array if it does not match, so a
+ * stashed Envelope can never read the next request's data. */
+static EPHPM_TLS size_t             req_lazy_server_count = 0;
+static EPHPM_TLS const char *const *req_lazy_server_keys  = NULL;
+static EPHPM_TLS const char *const *req_lazy_server_vals  = NULL;
+static EPHPM_TLS size_t             req_lazy_header_count = 0;
+static EPHPM_TLS const char *const *req_lazy_header_keys  = NULL;
+static EPHPM_TLS const char *const *req_lazy_header_vals  = NULL;
+static EPHPM_TLS const char        *req_lazy_cookie_data  = NULL;
+static EPHPM_TLS const char        *req_lazy_query_string = NULL;
+
 /* Pull the next chunk of a streaming worker-mode request body (defined with
  * the worker-mode block below, but used by the read_post SAPI callback above
  * it). Returns bytes written into buf (0 = EOF, negative = error). */
@@ -1295,6 +1325,21 @@ void ephpm_worker_reset_request(void)
     req_body_streaming = 0;
     req_in_flight = 0;
 
+    /* Per-iteration lazy-envelope backing pointers. take_request() will
+     * re-populate these before returning the new Envelope; nulling them here
+     * makes any accidental accessor call in the gap between iterations
+     * (there should be none — the reset runs synchronously inside
+     * take_request) return an empty array via the generation-mismatch path
+     * rather than reading stale pointers. */
+    req_lazy_server_count = 0;
+    req_lazy_server_keys  = NULL;
+    req_lazy_server_vals  = NULL;
+    req_lazy_header_count = 0;
+    req_lazy_header_keys  = NULL;
+    req_lazy_header_vals  = NULL;
+    req_lazy_cookie_data  = NULL;
+    req_lazy_query_string = NULL;
+
     response_status_code = 200;
 }
 
@@ -1386,7 +1431,8 @@ static void ephpm_worker_fill_str_array(zval *arr, size_t count,
                                         const char *const *keys,
                                         const char *const *vals)
 {
-    array_init(arr);
+    /* Pre-size the hashtable to avoid rehash growth on the hot path. */
+    array_init_size(arr, count);
     for (size_t i = 0; i < count; i++) {
         if (!keys[i]) {
             continue;
@@ -1399,9 +1445,9 @@ static void ephpm_worker_fill_str_array(zval *arr, size_t count,
                 (zend_binary_strcasecmp(keys[i], klen, "cookie", sizeof("cookie") - 1) == 0)
                     ? "; " : ", ";
             zend_string *joined = zend_strpprintf(0, "%s%s%s", Z_STRVAL_P(existing), sep, v);
-            add_assoc_str(arr, keys[i], joined);
+            add_assoc_str_ex(arr, keys[i], klen, joined);
         } else {
-            add_assoc_string(arr, keys[i], (char *)v);
+            add_assoc_stringl_ex(arr, keys[i], klen, (char *)v, strlen(v));
         }
     }
 }
@@ -1540,23 +1586,35 @@ PHP_FUNCTION(ephpm_worker_take_request)
         } zend_end_try();
     }
 
-    /* Build the Envelope object. */
+    /* Build the Envelope object.
+     *
+     * Phase 1 lazy fast path (roadmap `worker-dispatch-fastpath.md` §Phase 1):
+     * we do NOT materialize serverVars/headers/cookies/query here — they are
+     * built by the Envelope accessor methods on first call and cached as
+     * properties. Most handlers touch one or two of them, so eagerly building
+     * five arrays per request (5 array_init + N allocations per array) is
+     * pure waste on the hot path.
+     *
+     * The pointer arrays that back the lazy build borrow from CurrentRequest
+     * on the Rust side; they stay valid until this thread's matching
+     * send_response completes. We stamp the current req_generation onto the
+     * Envelope so a userland-stashed envelope from a prior iteration can
+     * detect that its data pointers no longer refer to it and return empty
+     * instead of reading the next request's data. */
     object_init_ex(return_value, ephpm_worker_envelope_ce);
 
-    zval tmp;
-    ephpm_worker_fill_str_array(&tmp, req.server_var_count,
-                                req.server_var_keys, req.server_var_vals);
-    ephpm_worker_set_prop_array(return_value, "serverVars", &tmp);
+    req_lazy_server_count = req.server_var_count;
+    req_lazy_server_keys  = req.server_var_keys;
+    req_lazy_server_vals  = req.server_var_vals;
+    req_lazy_header_count = req.header_count;
+    req_lazy_header_keys  = req.header_keys;
+    req_lazy_header_vals  = req.header_vals;
+    req_lazy_cookie_data  = req.cookie_data;
+    req_lazy_query_string = req.query_string;
 
-    ephpm_worker_fill_str_array(&tmp, req.header_count,
-                                req.header_keys, req.header_vals);
-    ephpm_worker_set_prop_array(return_value, "headers", &tmp);
-
-    ephpm_worker_parse_cookies(&tmp, req.cookie_data);
-    ephpm_worker_set_prop_array(return_value, "cookies", &tmp);
-
-    ephpm_worker_parse_query(&tmp, req.query_string);
-    ephpm_worker_set_prop_array(return_value, "query", &tmp);
+    zend_update_property_long(ephpm_worker_envelope_ce, Z_OBJ_P(return_value),
+                              "generation", strlen("generation"),
+                              (zend_long)req_generation);
 
     /* Body. Buffered request: store the whole body string (Phase-1 back-compat;
      * rawBody() and bodyStream() both serve from it). Streaming request: store
@@ -1746,10 +1804,124 @@ static void ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAMETERS, const char *n
     RETURN_COPY(prop);
 }
 
-PHP_METHOD(Ephpm_Worker_Envelope, serverVars)  { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "serverVars"); }
-PHP_METHOD(Ephpm_Worker_Envelope, headers)     { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "headers"); }
-PHP_METHOD(Ephpm_Worker_Envelope, cookies)     { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "cookies"); }
-PHP_METHOD(Ephpm_Worker_Envelope, query)       { ephpm_worker_return_prop(INTERNAL_FUNCTION_PARAM_PASSTHRU, "query"); }
+/* Is this Envelope still associated with the in-flight request? An envelope
+ * stashed by userland across the loop iteration (foot-gun documented in the
+ * guide) fails this check; accessors then return empty arrays instead of
+ * reading the next request's data. */
+static int ephpm_worker_envelope_is_current(zval *this_obj)
+{
+    zval rv;
+    zval *gen = zend_read_property(ephpm_worker_envelope_ce, Z_OBJ_P(this_obj),
+                                   "generation", strlen("generation"), 1, &rv);
+    if (!gen || Z_TYPE_P(gen) != IS_LONG) {
+        return 0;
+    }
+    return (unsigned long)Z_LVAL_P(gen) == req_generation;
+}
+
+/* Fetch the cached array property for `name`, or NULL if not yet built.
+ * The property is set to IS_NULL by ZE by default (dynamic properties: reads
+ * before a write hand back an uninitialized-property warning + IS_NULL).
+ * Treat IS_ARRAY as "cached", anything else as "needs building". */
+static zval *ephpm_worker_get_cached_array(zval *this_obj, const char *name, size_t name_len, zval *rv)
+{
+    zval *prop = zend_read_property(ephpm_worker_envelope_ce, Z_OBJ_P(this_obj),
+                                    name, name_len, 1, rv);
+    if (prop && Z_TYPE_P(prop) == IS_ARRAY) {
+        return prop;
+    }
+    return NULL;
+}
+
+/* Lazy accessor bodies. Each: (1) check the cache; (2) validate generation
+ * (empty array if stale — never expose the next request's data); (3) build
+ * the array from the stashed pointers; (4) cache it as a property; (5)
+ * return it. */
+PHP_METHOD(Ephpm_Worker_Envelope, serverVars)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    zval rv;
+    zval *cached = ephpm_worker_get_cached_array(ZEND_THIS, "serverVars",
+                                                 strlen("serverVars"), &rv);
+    if (cached) {
+        RETURN_COPY(cached);
+    }
+    zval arr;
+    if (ephpm_worker_envelope_is_current(ZEND_THIS)) {
+        ephpm_worker_fill_str_array(&arr, req_lazy_server_count,
+                                    req_lazy_server_keys, req_lazy_server_vals);
+    } else {
+        array_init(&arr);
+    }
+    ephpm_worker_set_prop_array(ZEND_THIS, "serverVars", &arr);
+    zval *back = zend_read_property(ephpm_worker_envelope_ce, Z_OBJ_P(ZEND_THIS),
+                                    "serverVars", strlen("serverVars"), 1, &rv);
+    RETURN_COPY(back);
+}
+
+PHP_METHOD(Ephpm_Worker_Envelope, headers)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    zval rv;
+    zval *cached = ephpm_worker_get_cached_array(ZEND_THIS, "headers",
+                                                 strlen("headers"), &rv);
+    if (cached) {
+        RETURN_COPY(cached);
+    }
+    zval arr;
+    if (ephpm_worker_envelope_is_current(ZEND_THIS)) {
+        ephpm_worker_fill_str_array(&arr, req_lazy_header_count,
+                                    req_lazy_header_keys, req_lazy_header_vals);
+    } else {
+        array_init(&arr);
+    }
+    ephpm_worker_set_prop_array(ZEND_THIS, "headers", &arr);
+    zval *back = zend_read_property(ephpm_worker_envelope_ce, Z_OBJ_P(ZEND_THIS),
+                                    "headers", strlen("headers"), 1, &rv);
+    RETURN_COPY(back);
+}
+
+PHP_METHOD(Ephpm_Worker_Envelope, cookies)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    zval rv;
+    zval *cached = ephpm_worker_get_cached_array(ZEND_THIS, "cookies",
+                                                 strlen("cookies"), &rv);
+    if (cached) {
+        RETURN_COPY(cached);
+    }
+    zval arr;
+    if (ephpm_worker_envelope_is_current(ZEND_THIS)) {
+        ephpm_worker_parse_cookies(&arr, req_lazy_cookie_data);
+    } else {
+        array_init(&arr);
+    }
+    ephpm_worker_set_prop_array(ZEND_THIS, "cookies", &arr);
+    zval *back = zend_read_property(ephpm_worker_envelope_ce, Z_OBJ_P(ZEND_THIS),
+                                    "cookies", strlen("cookies"), 1, &rv);
+    RETURN_COPY(back);
+}
+
+PHP_METHOD(Ephpm_Worker_Envelope, query)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    zval rv;
+    zval *cached = ephpm_worker_get_cached_array(ZEND_THIS, "query",
+                                                 strlen("query"), &rv);
+    if (cached) {
+        RETURN_COPY(cached);
+    }
+    zval arr;
+    if (ephpm_worker_envelope_is_current(ZEND_THIS)) {
+        ephpm_worker_parse_query(&arr, req_lazy_query_string);
+    } else {
+        array_init(&arr);
+    }
+    ephpm_worker_set_prop_array(ZEND_THIS, "query", &arr);
+    zval *back = zend_read_property(ephpm_worker_envelope_ce, Z_OBJ_P(ZEND_THIS),
+                                    "query", strlen("query"), 1, &rv);
+    RETURN_COPY(back);
+}
 
 /* Whether this envelope's body is streamed (Phase 3) rather than buffered. */
 static int ephpm_worker_envelope_is_streaming(zval *this_obj)
