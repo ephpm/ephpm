@@ -3,6 +3,10 @@
 > **Status: DESIGN — not yet implemented.** The tooling exists in
 > scattered, proven form (the ePHPm-lab k6 profiles, the opcache e2e);
 > this page designs its consolidation into a per-release discipline.
+>
+> For the numbers and findings measured **so far**, see the
+> [Benchmarking](/benchmarking/) section — this page is the plan for
+> making that a repeatable per-release artifact.
 
 ## Why this page exists
 
