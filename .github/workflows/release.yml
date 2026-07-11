@@ -42,7 +42,7 @@ jobs:
       matrix:
         php:
           - { minor: "8.3", full: "8.3.31" }
-          - { minor: "8.4", full: "8.4.22" }
+          - { minor: "8.4", full: "8.4.23" }
           - { minor: "8.5", full: "8.5.7" }
         arch:
           - runner: x64
