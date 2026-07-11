@@ -138,6 +138,14 @@ jobs:
           echo "BINDGEN_EXTRA_CLANG_ARGS=-resource-dir=${LLVM_RESOURCE_DIR}" >> "$GITHUB_ENV"
 
       - name: Build ephpm
+        env:
+          # PHP SDK 8.5.7 macOS objects are built with a newer Xcode that
+          # emits calls to `___isPlatformVersionAtLeast` (macOS 12+ runtime
+          # helper). The linker infers deployment target from the .rlib
+          # objects and complains at 11.0. Setting the floor to 12.0 (Apple
+          # dropped support for anything older) resolves it and matches the
+          # SDK's build environment. 8.3/8.4 SDKs also link cleanly at 12.0.
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
         run: cargo xtask release ${{ matrix.php_minor }}
 
       - name: Package archive

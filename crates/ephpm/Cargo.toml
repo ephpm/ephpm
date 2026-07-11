@@ -20,7 +20,7 @@ ephpm-db.workspace = true
 ephpm-kv.workspace = true
 ephpm-php.workspace = true
 ephpm-server.workspace = true
-# mimalloc as the global allocator for the ephpm binary.
+# mimalloc as the global allocator for the ephpm binary. Non-Windows only.
 #
 # Wins in workloads with many small, short-lived allocations (HTTP request
 # frames, RESP command payloads, MySQL packet vecs, litewire query buffers) —
@@ -30,9 +30,13 @@ ephpm-server.workspace = true
 #
 # Applied only at the binary crate level so downstream test/dev tooling
 # (unit tests, xtask, doc builds) uses the standard allocator and doesn't
-# introduce platform-specific surprises in CI. Windows-supported (bundled
-# in the mimalloc crate's build.rs).
-mimalloc = { version = "0.1", default-features = false }
+# introduce platform-specific surprises in CI.
+#
+# Not on Windows: mimalloc-sys builds its C with `/MD` (dynamic CRT) while
+# the PHP SDK's static objects are `/MT`, and MSVC refuses to link the
+# mismatch (LNK2038). The Windows allocator picture is also different —
+# SEG_HEAP already reduces the contention mimalloc addresses on glibc — so
+# Windows keeps the system allocator.
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -41,6 +45,7 @@ tracing-subscriber.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+mimalloc = { version = "0.1", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
