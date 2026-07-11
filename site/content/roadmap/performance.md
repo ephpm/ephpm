@@ -12,16 +12,22 @@
 
 | Item | Measured win | Where |
 |---|---|---|
-| `TCP_NODELAY` on every proxy, KV, and data-plane socket | **~200× per DB query** (44 ms → sub-ms; every SELECT and connect paid a Nagle + delayed-ACK stall) | [ephpm#161](https://github.com/ephpm/ephpm/pull/161), [litewire#3](https://github.com/ephpm/litewire/pull/3) |
-| Hardware intrinsics restored in the PHP SDK (SHA-NI sha256, PCLMUL crc32, AVX2 base64 — disabled since the project began by one C++-only compiler flag) | sha256 **2.7×**, crc32c 2.2×; every HMAC, cache key, and ETag benefits | [php-sdk#36](https://github.com/ephpm/php-sdk/pull/36) + build guard |
+| Single-node SQLite query latency: `TCP_NODELAY` on all sockets **plus** coalescing the litewire result-set response into one write (PHP's mysqlnd client sets no nodelay, so multi-segment result sets deadlocked on its Nagle + delayed-ACK) | **208× — measured on the v0.4.1 release image**: point-SELECT p50 44.010 ms → 0.211 ms; INSERT 1.07 ms → 0.267 ms | [ephpm#161](https://github.com/ephpm/ephpm/pull/161), [litewire#3](https://github.com/ephpm/litewire/pull/3), [litewire#7](https://github.com/ephpm/litewire/pull/7) |
+| Hardware intrinsics restored in the PHP SDK (SHA-NI sha256, PCLMUL crc32, AVX2 base64 — disabled since the project began by one C++-only compiler flag) | **sha256 2.3× — measured on the release image**: 306 → 133 ns/digest; every HMAC, cache key, and ETag benefits | [php-sdk#36](https://github.com/ephpm/php-sdk/pull/36) + build guard |
 | Quota-aware `worker_count` derivation + recycle default 500 → 10,000 | **+24%** worker throughput at container CPU quotas; recycle churn (one reboot per worker per ~0.25 s at 2k req/s) eliminated | [ephpm#159](https://github.com/ephpm/ephpm/pull/159) |
 | litewire translate cache (LRU by query text) | **139×** on repeated queries (38.6 µs → 277 ns per translate) | [litewire#5](https://github.com/ephpm/litewire/pull/5) |
 | litewire `prepare_cached` + removal of the LIMIT-0 metadata probe | prepare round-trips halved | [litewire#5](https://github.com/ephpm/litewire/pull/5) |
 | litewire per-connection backends (WAL, real concurrent readers) | **52×** on hot selects vs the reopen path; also fixes cross-connection transaction isolation | [litewire#6](https://github.com/ephpm/litewire/pull/6) |
+| Expression-column typing (`SELECT 1`, `SELECT a+b`) | correctness: untyped columns typed by value, fixing a `2006 server has gone away` on real-prepared table-less queries | [litewire#8](https://github.com/ephpm/litewire/pull/8) |
 | Lazy-vhost negative-cache TTL 60 s → 2 s | regression fix: freshly deployed sites go live in seconds, not up to a minute | [ephpm#164](https://github.com/ephpm/ephpm/pull/164) |
 | WordPress worker per-request lifecycle (`init`/`wp_loaded` replay) | correctness unblock for worker-mode WooCommerce; ~2 ms/request cost | [wordpress-worker v0.1.1](https://github.com/ephpm/wordpress-worker/releases/tag/v0.1.1) |
 
-Release verification (post-fix DB matrix, sha256 ns/op on the shipped
+All headline numbers above were re-measured on the built v0.4.1 release
+image (not a dev build) before shipping — the DB verification caught,
+and this table reflects, that the original server-side nodelay alone did
+not cure the single-node SQLite path (the mysqlnd client's Nagle needed
+the result-set write coalescing in litewire#7). Release verification
+(post-fix DB matrix, sha256 ns/op on the shipped
 image, KV RESP-lane parity, before/after charts) accompanies the v0.4.1
 release notes.
 
