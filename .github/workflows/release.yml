@@ -107,7 +107,7 @@ jobs:
           - php_minor: "8.3"
             php_full: "8.3.31"
           - php_minor: "8.4"
-            php_full: "8.4.22"
+            php_full: "8.4.23"
           - php_minor: "8.5"
             php_full: "8.5.7"
     steps:
@@ -174,7 +174,7 @@ jobs:
           - php_minor: "8.3"
             php_full: "8.3.31"
           - php_minor: "8.4"
-            php_full: "8.4.22"
+            php_full: "8.4.23"
           - php_minor: "8.5"
             php_full: "8.5.7"
     steps:
@@ -304,7 +304,7 @@ jobs:
           - php_minor: "8.3"
             php_full: "8.3.31"
           - php_minor: "8.4"
-            php_full: "8.4.22"
+            php_full: "8.4.23"
             default: false
           - php_minor: "8.5"
             php_full: "8.5.7"
