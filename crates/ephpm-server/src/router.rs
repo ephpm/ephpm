@@ -1324,39 +1324,44 @@ impl Router {
         accepts_gzip: bool,
         accepts_br: bool,
     ) -> Response<ServerBody> {
-        // Reuse PhpRequest's $_SERVER / cookie derivation so worker mode and
-        // fpm mode present PHP with identical request metadata. The body is not
-        // used by server_variables()/cookie_string(), so pass an empty one —
-        // the real (possibly streaming) body travels in `owned.body`.
+        // Build $_SERVER and the cookie string with the *same* derivation the
+        // fpm path uses (via the shared free functions in ephpm_php::request),
+        // so worker mode and fpm mode present PHP with byte-identical request
+        // metadata. We build directly from the owned/borrowed locals here
+        // rather than constructing a throwaway `PhpRequest` — that intermediate
+        // built $_SERVER a second time and cloned method/uri/query/headers/
+        // content_type on the hot path for no reason.
         let mut env_vars = self.build_kv_env_vars(&server_name);
         env_vars.extend_from_slice(&self.db_env_vars);
 
-        let php_request = PhpRequest {
-            method: method.clone(),
-            uri: uri.clone(),
-            path,
-            query_string: query_string.clone(),
-            script_filename: script_filename.to_path_buf(),
-            document_root,
-            headers: headers.clone(),
-            body: Vec::new(),
-            content_type: content_type.clone(),
-            remote_addr,
-            server_name,
+        let cookie_data = ephpm_php::request::cookie_string_from_headers(&headers);
+        let server_vars = ephpm_php::request::build_server_variables(
+            &method,
+            &uri,
+            &query_string,
+            script_filename,
+            &document_root,
+            &path,
+            &server_name,
             server_port,
+            &protocol,
+            remote_addr,
             is_https,
-            protocol,
-            env_vars,
-        };
+            &headers,
+            &env_vars,
+        );
 
+        // `method`, `uri`, `query_string`, and `headers` are owned locals that
+        // are no longer read below — move them into the owned request instead
+        // of cloning.
         let owned = ephpm_php::worker_bridge::WorkerRequestOwned {
             method,
             uri,
             query_string,
-            cookie_data: php_request.cookie_string(),
+            cookie_data,
             content_type,
             body,
-            server_vars: php_request.server_variables(),
+            server_vars,
             headers,
         };
 

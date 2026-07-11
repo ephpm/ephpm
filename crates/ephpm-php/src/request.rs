@@ -71,64 +71,119 @@ impl PhpRequest {
     /// - `PHP_SELF` = same as `SCRIPT_NAME`
     #[must_use]
     pub fn server_variables(&self) -> Vec<(String, String)> {
-        // Derive SCRIPT_NAME from the resolved script_filename relative to
-        // document_root. This is correct even after fallback rewrites.
-        let script_name = self
-            .script_filename
-            .strip_prefix(&self.document_root)
-            .map_or_else(|_| self.path.clone(), |rel| format!("/{}", rel.to_string_lossy()));
-
-        let mut vars = vec![
-            ("REQUEST_METHOD".into(), self.method.clone()),
-            ("REQUEST_URI".into(), self.uri.clone()),
-            ("SCRIPT_FILENAME".into(), self.script_filename.to_string_lossy().into_owned()),
-            ("SCRIPT_NAME".into(), script_name.clone()),
-            ("DOCUMENT_ROOT".into(), self.document_root.to_string_lossy().into_owned()),
-            ("SERVER_NAME".into(), self.server_name.clone()),
-            ("SERVER_PORT".into(), self.server_port.to_string()),
-            ("SERVER_SOFTWARE".into(), "ePHPm/0.1.0".into()),
-            ("SERVER_PROTOCOL".into(), self.protocol.clone()),
-            ("GATEWAY_INTERFACE".into(), "CGI/1.1".into()),
-            ("QUERY_STRING".into(), self.query_string.clone()),
-            ("PHP_SELF".into(), script_name),
-            ("REMOTE_ADDR".into(), self.remote_addr.ip().to_string()),
-            ("REMOTE_PORT".into(), self.remote_addr.port().to_string()),
-            ("REDIRECT_STATUS".into(), "200".into()),
-        ];
-
-        if self.is_https {
-            vars.push(("HTTPS".into(), "on".into()));
-        }
-
-        // Map HTTP headers to $_SERVER variables.
-        //
-        // Formerly built the CGI-style key with two String allocs per
-        // header (`to_uppercase()` then `.replace('-','_')`). Header
-        // names are ASCII by RFC 7230, so we can do a single byte
-        // pass — one allocation per non-canonicalised header, with
-        // the `HTTP_` prefix filled in place.
-        for (name, value) in &self.headers {
-            let key = cgi_header_key(name);
-            vars.push((key, value.clone()));
-        }
-
-        // Append extra environment variables (e.g. EPHPM_REDIS_* credentials).
-        for (key, value) in &self.env_vars {
-            vars.push((key.clone(), value.clone()));
-        }
-
-        vars
+        build_server_variables(
+            &self.method,
+            &self.uri,
+            &self.query_string,
+            &self.script_filename,
+            &self.document_root,
+            &self.path,
+            &self.server_name,
+            self.server_port,
+            &self.protocol,
+            self.remote_addr,
+            self.is_https,
+            &self.headers,
+            &self.env_vars,
+        )
     }
 
     /// Extract the cookie string from the request headers.
     #[must_use]
     pub fn cookie_string(&self) -> String {
-        self.headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("cookie"))
-            .map(|(_, value)| value.clone())
-            .unwrap_or_default()
+        cookie_string_from_headers(&self.headers)
     }
+}
+
+/// Build the `$_SERVER` variables from borrowed request fields.
+///
+/// This is the single source of truth for `$_SERVER` derivation, shared by
+/// both [`PhpRequest::server_variables`] (fpm path) and the worker dispatch
+/// path in `ephpm-server`. Keeping it a free function lets the worker path
+/// build `$_SERVER` directly from its owned locals without allocating a
+/// throwaway [`PhpRequest`].
+///
+/// Key distinction when fallback rewrites happen (e.g. `/blog/hello` → `/index.php`):
+/// - `REQUEST_URI` = original URI (`/blog/hello`) — what the client asked for
+/// - `SCRIPT_NAME` = resolved script (`/index.php`) — what PHP is executing
+/// - `PHP_SELF` = same as `SCRIPT_NAME`
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn build_server_variables(
+    method: &str,
+    uri: &str,
+    query_string: &str,
+    script_filename: &std::path::Path,
+    document_root: &std::path::Path,
+    path: &str,
+    server_name: &str,
+    server_port: u16,
+    protocol: &str,
+    remote_addr: SocketAddr,
+    is_https: bool,
+    headers: &[(String, String)],
+    env_vars: &[(String, String)],
+) -> Vec<(String, String)> {
+    // Derive SCRIPT_NAME from the resolved script_filename relative to
+    // document_root. This is correct even after fallback rewrites.
+    let script_name = script_filename
+        .strip_prefix(document_root)
+        .map_or_else(|_| path.to_owned(), |rel| format!("/{}", rel.to_string_lossy()));
+
+    let mut vars = vec![
+        ("REQUEST_METHOD".into(), method.to_owned()),
+        ("REQUEST_URI".into(), uri.to_owned()),
+        ("SCRIPT_FILENAME".into(), script_filename.to_string_lossy().into_owned()),
+        ("SCRIPT_NAME".into(), script_name.clone()),
+        ("DOCUMENT_ROOT".into(), document_root.to_string_lossy().into_owned()),
+        ("SERVER_NAME".into(), server_name.to_owned()),
+        ("SERVER_PORT".into(), server_port.to_string()),
+        ("SERVER_SOFTWARE".into(), "ePHPm/0.1.0".into()),
+        ("SERVER_PROTOCOL".into(), protocol.to_owned()),
+        ("GATEWAY_INTERFACE".into(), "CGI/1.1".into()),
+        ("QUERY_STRING".into(), query_string.to_owned()),
+        ("PHP_SELF".into(), script_name),
+        ("REMOTE_ADDR".into(), remote_addr.ip().to_string()),
+        ("REMOTE_PORT".into(), remote_addr.port().to_string()),
+        ("REDIRECT_STATUS".into(), "200".into()),
+    ];
+
+    if is_https {
+        vars.push(("HTTPS".into(), "on".into()));
+    }
+
+    // Map HTTP headers to $_SERVER variables.
+    //
+    // Formerly built the CGI-style key with two String allocs per
+    // header (`to_uppercase()` then `.replace('-','_')`). Header
+    // names are ASCII by RFC 7230, so we can do a single byte
+    // pass — one allocation per non-canonicalised header, with
+    // the `HTTP_` prefix filled in place.
+    for (name, value) in headers {
+        let key = cgi_header_key(name);
+        vars.push((key, value.clone()));
+    }
+
+    // Append extra environment variables (e.g. EPHPM_REDIS_* credentials).
+    for (key, value) in env_vars {
+        vars.push((key.clone(), value.clone()));
+    }
+
+    vars
+}
+
+/// Extract the cookie string from request headers (first `Cookie` header,
+/// case-insensitive; empty string if absent).
+///
+/// Shared by [`PhpRequest::cookie_string`] and the worker dispatch path so
+/// both derive the cookie data identically.
+#[must_use]
+pub fn cookie_string_from_headers(headers: &[(String, String)]) -> String {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default()
 }
 
 /// Build the CGI-style `$_SERVER` key for an HTTP header name in one
@@ -359,5 +414,66 @@ mod tests {
         let req = make_request();
         let vars = req.server_variables();
         assert!(find_var(&vars, "EPHPM_REDIS_HOST").is_none());
+    }
+
+    /// The worker dispatch path in `ephpm-server` builds `$_SERVER` by calling
+    /// [`build_server_variables`] directly from its owned locals rather than
+    /// constructing a `PhpRequest`. This test guards that both derivations
+    /// produce byte-identical output for the same synthetic request — if this
+    /// ever diverges, worker mode and fpm mode would present PHP with
+    /// different `$_SERVER`, which is a correctness bug.
+    #[test]
+    fn test_worker_path_server_variables_match_request_mode() {
+        // A request that exercises every interesting branch: HTTPS on, a
+        // fallback rewrite (uri != script), custom + canonical headers, and
+        // injected env vars.
+        let mut req = make_request();
+        req.uri = "/blog/hello?preview=true".into();
+        req.path = "/blog/hello".into();
+        req.query_string = "preview=true".into();
+        req.is_https = true;
+        req.headers = vec![
+            ("host".into(), "example.com".into()),
+            ("accept-encoding".into(), "gzip, deflate".into()),
+            ("content-type".into(), "application/json".into()),
+            ("content-length".into(), "42".into()),
+            ("x-custom-header".into(), "value".into()),
+            ("cookie".into(), "session=abc123".into()),
+        ];
+        req.env_vars = vec![
+            ("EPHPM_REDIS_HOST".into(), "127.0.0.1".into()),
+            ("EPHPM_REDIS_PORT".into(), "6379".into()),
+        ];
+
+        // fpm path: via PhpRequest::server_variables().
+        let request_mode = req.server_variables();
+
+        // worker path: the exact call `handle_php_worker` makes, built from
+        // borrowed/owned fields with no intermediate PhpRequest.
+        let worker_mode = build_server_variables(
+            &req.method,
+            &req.uri,
+            &req.query_string,
+            &req.script_filename,
+            &req.document_root,
+            &req.path,
+            &req.server_name,
+            req.server_port,
+            &req.protocol,
+            req.remote_addr,
+            req.is_https,
+            &req.headers,
+            &req.env_vars,
+        );
+
+        // Byte-identical, including order.
+        assert_eq!(worker_mode, request_mode);
+    }
+
+    #[test]
+    fn test_worker_path_cookie_matches_request_mode() {
+        let mut req = make_request();
+        req.headers.push(("Cookie".into(), "session=abc123".into()));
+        assert_eq!(cookie_string_from_headers(&req.headers), req.cookie_string());
     }
 }
