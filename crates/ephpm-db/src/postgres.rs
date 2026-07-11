@@ -118,7 +118,12 @@ impl PgProxy {
         let db_url = Arc::new(DbUrl::parse(url)?);
 
         // Establish a probe connection to capture server metadata.
-        let (probe_stream, meta) = pg_connect_and_handshake(&db_url).await?;
+        //
+        // Bounded exponential backoff (250ms doubling to 8s, ~10 tries) so
+        // startup ordering under k8s/systemd doesn't leave the proxy dead
+        // when the DB comes up a few seconds later. See
+        // `pg_connect_with_retry` for the schedule.
+        let (probe_stream, meta) = pg_connect_with_retry(&db_url).await?;
         let meta = Arc::new(meta);
 
         // Build the primary pool.
@@ -312,6 +317,68 @@ impl PgProxy {
 /// messages on the right code path — see `handle_backend_auth`).
 /// Integration coverage in `tests/pg_proxy_integration.rs` pins this
 /// against real PG 13 (`md5`) and PG 17 (`scram-sha-256`).
+/// Bounded exponential backoff wrapper around [`pg_connect_and_handshake`].
+///
+/// Retries on the same schedule as the MySQL proxy: ~250ms, 500ms, 1s, 2s,
+/// 4s, 8s, ..., 10 attempts, ~40s total. Prevents startup ordering (k8s,
+/// systemd) from wedging the proxy when the backend comes up seconds
+/// later.
+async fn pg_connect_with_retry(url: &DbUrl) -> Result<(TcpStream, PgServerMeta), DbError> {
+    const MAX_ATTEMPTS: u32 = 10;
+    const INITIAL_BACKOFF_MS: u64 = 250;
+    const MAX_BACKOFF_MS: u64 = 8_000;
+
+    let mut backoff_ms = INITIAL_BACKOFF_MS;
+    let mut last_err: Option<DbError> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match pg_connect_and_handshake(url).await {
+            Ok(ok) => {
+                if attempt > 1 {
+                    info!(
+                        attempt,
+                        addr = %url.addr(),
+                        "PostgreSQL backend connection established after retry"
+                    );
+                }
+                return Ok(ok);
+            }
+            Err(e) => {
+                let is_last = attempt == MAX_ATTEMPTS;
+                if is_last {
+                    warn!(
+                        attempt,
+                        addr = %url.addr(),
+                        error = %e,
+                        "PostgreSQL backend still unreachable after max retries; giving up"
+                    );
+                } else if attempt >= 3 {
+                    warn!(
+                        attempt,
+                        addr = %url.addr(),
+                        error = %e,
+                        backoff_ms,
+                        "PostgreSQL backend connect failed; retrying"
+                    );
+                } else {
+                    info!(
+                        attempt,
+                        addr = %url.addr(),
+                        error = %e,
+                        backoff_ms,
+                        "PostgreSQL backend not yet reachable; retrying"
+                    );
+                }
+                last_err = Some(e);
+                if !is_last {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms.saturating_mul(2)).min(MAX_BACKOFF_MS);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or(DbError::Auth("pg_connect_with_retry: no attempt recorded".into())))
+}
+
 async fn pg_connect_and_handshake(url: &DbUrl) -> Result<(TcpStream, PgServerMeta), DbError> {
     let mut stream = TcpStream::connect(url.addr()).await?;
     let _ = stream.set_nodelay(true);

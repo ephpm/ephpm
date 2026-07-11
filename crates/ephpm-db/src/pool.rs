@@ -143,13 +143,21 @@ impl Pool {
             return Err(DbError::PoolClosed);
         }
 
-        let permit = tokio::time::timeout(
-            self.config.pool_timeout,
-            Arc::clone(&self.semaphore).acquire_owned(),
-        )
-        .await
-        .map_err(|_| DbError::PoolTimeout { max: self.config.max_connections })?
-        .map_err(|_| DbError::PoolClosed)?; // semaphore closed
+        // Fast path: try_acquire_owned skips the tokio timer + notify machinery
+        // when a permit is immediately available (the overwhelmingly common
+        // case under a warm, correctly-sized pool). Falls back to the timeout
+        // wait when the pool is saturated.
+        let permit = match Arc::clone(&self.semaphore).try_acquire_owned() {
+            Ok(p) => p,
+            Err(tokio::sync::TryAcquireError::NoPermits) => tokio::time::timeout(
+                self.config.pool_timeout,
+                Arc::clone(&self.semaphore).acquire_owned(),
+            )
+            .await
+            .map_err(|_| DbError::PoolTimeout { max: self.config.max_connections })?
+            .map_err(|_| DbError::PoolClosed)?,
+            Err(tokio::sync::TryAcquireError::Closed) => return Err(DbError::PoolClosed),
+        };
 
         // Try an idle connection. Skip expired ones.
         loop {
