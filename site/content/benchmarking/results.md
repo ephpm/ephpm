@@ -56,6 +56,53 @@ and single-request latency); the modest RPS gain is the combined effect
 of that plus wave-1. Worker-dispatch and further items are still being
 measured — see [Findings](findings/) for what the data ruled in and out.
 
+## v0.5.0 — resource-aware autotuning (in progress)
+
+v0.5.0's headline is **container-derived PHP tuning**: on boot in serve
+mode, ePHPm reads the cgroup CPU and memory limits and derives an opcache
+/ memory / realpath / assertions profile, with `opcache.validate_timestamps`
+off (deploys become events via `ephpm deploy` / `ephpm cache reset`).
+Operator config overrides any derived value.
+
+**Setup (reproducible):** a **300-file `require_once` app** (`index.php`
+includes 300 tiny class files each request — deliberately stat-heavy),
+`--cpus 1 --memory 512m`, `oha` at c=16, 15 s, warmup first, 100% `2xx`.
+v0.4.2 runs stock PHP ini; v0.5.0 auto-derives.
+
+**The profile v0.5.0 derived for this box (its own startup log):**
+
+```
+autotune (serve): cpu_quota=1.00 mem=512MiB (cgroup v2) ->
+  workers=1[cgroup_quota] opcache.memory_consumption=92MB memory_limit=356M
+  interned=8MB jit_buffer=32MB (buffer-only, jit off) max_files=20000
+  realpath=16M/ttl=600 validate_timestamps=0 assertions=-1
+```
+
+(It also logs the deploys-are-events contract, and — because this bench
+config left the RESP listener disabled — correctly WARNs that
+`ephpm deploy` can't reach the server.)
+
+**Result:**
+
+| | v0.4.2 (stock ini) | v0.5.0 (autotuned) | Change |
+|---|---|---|---|
+| RPS | 874 | **1144** | **+31%** |
+| p50 | 15.0 ms | 14.8 ms | −1% |
+| p99 | 20.6 ms | 19.2 ms | −7% |
+
+**+31% throughput with zero operator tuning**, driven mainly by
+`validate_timestamps=0` eliminating ~300 `stat()` syscalls per request on
+this include-heavy workload, plus the realpath cache and compiled-out
+assertions.
+
+**Honest bounds:** this app is deliberately near the *upper* end of what
+autotuning buys (300 includes/request). A single-file `hello.php` shows
+~0% (it has nothing to stat and fits any opcache). A real framework app
+lands **between** — wherever its file count and filesystem cost sit, and
+higher on container overlay / network filesystems where `stat()` is
+pricier. The number is a demonstrated ceiling-ish case, not a promise for
+every app.
+
 ## How to read these
 
 - **Absolute numbers are environment-specific.** The db.php p50 was
