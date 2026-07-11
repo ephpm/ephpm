@@ -84,6 +84,23 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 #   litewire = { path = "../litewire/crates/litewire" }
 litewire = { git = "https://github.com/ephpm/litewire.git", rev = "fbbfe8d60ff4c74558fb4a8126ef21c343debada", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client"] }
 
+# Release-profile tuning for v0.4.2 perf release.
+#
+# `lto = "fat"` and `codegen-units = 1` widen the optimizer's view across
+# every crate at link time. Empirically this shaves 5-15% off tight
+# hot paths (proxy dispatch, KV RESP framing, query-stats record) at the
+# cost of a longer release build.
+#
+# `panic = "abort"` is DELIBERATELY NOT set. The middleware runtime
+# (`crates/ephpm-middleware`) uses `std::panic::catch_unwind` to fail
+# CLOSED on a panicking middleware `invoke` (return 500) and to fail
+# STARTUP on a panicking `init`. Under `panic = "abort"` those
+# `catch_unwind` calls become no-ops and any middleware panic terminates
+# the whole process — every request dies instead of one. Keep unwinding.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+
 [workspace.lints.rust]
 unsafe_code = "warn"
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(php_linked)'] }

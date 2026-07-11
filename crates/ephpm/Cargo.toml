@@ -20,6 +20,19 @@ ephpm-db.workspace = true
 ephpm-kv.workspace = true
 ephpm-php.workspace = true
 ephpm-server.workspace = true
+# mimalloc as the global allocator for the ephpm binary.
+#
+# Wins in workloads with many small, short-lived allocations (HTTP request
+# frames, RESP command payloads, MySQL packet vecs, litewire query buffers) —
+# the default system allocator has measurable contention under concurrent
+# tokio task load. Default features only (no `secure` — that adds tag
+# checks intended for adversarial-heap workloads at a real perf cost).
+#
+# Applied only at the binary crate level so downstream test/dev tooling
+# (unit tests, xtask, doc builds) uses the standard allocator and doesn't
+# introduce platform-specific surprises in CI. Windows-supported (bundled
+# in the mimalloc crate's build.rs).
+mimalloc = { version = "0.1", default-features = false }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
