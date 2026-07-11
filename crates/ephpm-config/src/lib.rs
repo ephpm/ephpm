@@ -1265,6 +1265,54 @@ pub struct PhpConfig {
     #[serde(default = "default_memory_limit")]
     pub memory_limit: String,
 
+    /// Override OPcache timestamp validation (`opcache.validate_timestamps`).
+    ///
+    /// When PHP has OPcache loaded, `validate_timestamps` controls whether the
+    /// engine `stat()`s each cached script on (re)use to detect edits. ePHPm
+    /// picks a mode-appropriate default when this knob is left unset:
+    ///
+    /// - `ephpm serve` (production): **`false`** — trust the cache. Code changes
+    ///   go live via `ephpm deploy` / `ephpm cache reset`, which invalidate
+    ///   OPcache through the RESP listener (deploys-are-events). This avoids a
+    ///   `stat()` per cached file every `revalidate_freq` seconds and yields a
+    ///   deterministic "code changes only on a deploy" contract.
+    /// - `ephpm dev` (bare `ephpm` / `ephpm dev`): **`true`** — instant
+    ///   edit-refresh so the dev loop stays tight. Never overridden by the
+    ///   serve-mode default.
+    ///
+    /// Set explicitly to force a value in *either* mode: `true` re-enables
+    /// stat-on-use under `serve` (e.g. a bind-mounted docroot that changes
+    /// without a deploy), `false` freezes the cache under `dev`.
+    ///
+    /// **Serve mode + `false` requires an invalidation lever.** If the RESP
+    /// listener is disabled (`[kv.redis_compat] enabled = false`) there is no
+    /// way for `ephpm deploy` / `ephpm cache reset` to reach the running
+    /// server, so cached code can never be refreshed without a restart. Startup
+    /// logs a WARN in that case.
+    ///
+    /// Only takes effect when OPcache is actually loaded (it is in the release
+    /// build). With no OPcache extension, the directive is inert.
+    ///
+    /// Default: `None` (mode-appropriate: off under `serve`, on under `dev`).
+    #[serde(default)]
+    pub opcache_validate_timestamps: Option<bool>,
+
+    /// Override OPcache revalidation frequency in seconds
+    /// (`opcache.revalidate_freq`).
+    ///
+    /// Only meaningful when timestamp validation is on (see
+    /// `opcache_validate_timestamps`). Bounds how often the engine re-`stat()`s
+    /// a given cached script: at most once per this many seconds. PHP's own
+    /// default is `2`. Raising it (e.g. `60`) cuts `stat()` traffic on
+    /// container/overlay/network filesystems at the cost of picking up edits
+    /// more slowly.
+    ///
+    /// Ignored when validation is off (nothing is re-stat'd).
+    ///
+    /// Default: `None` (PHP's built-in default of `2` applies).
+    #[serde(default)]
+    pub opcache_revalidate_freq: Option<u32>,
+
     /// Optional path to a custom php.ini file.
     ///
     /// When set, ePHPm reads this file for PHP configuration before applying
@@ -1702,6 +1750,8 @@ impl Default for PhpConfig {
         Self {
             max_execution_time: default_max_execution_time(),
             memory_limit: default_memory_limit(),
+            opcache_validate_timestamps: None,
+            opcache_revalidate_freq: None,
             ini_file: None,
             ini_overrides: Vec::new(),
             extensions: Vec::new(),
@@ -1765,6 +1815,38 @@ impl PhpConfig {
     #[must_use]
     pub fn effective_worker_backlog(&self) -> usize {
         if self.worker_backlog > 0 { self.worker_backlog } else { self.effective_worker_count() }
+    }
+
+    /// Resolve the effective `opcache.validate_timestamps` value for a run.
+    ///
+    /// `dev_mode` is `true` under `ephpm dev` / bare `ephpm` and `false` under
+    /// `ephpm serve`. When `opcache_validate_timestamps` is set explicitly it
+    /// wins in either mode; otherwise the mode default applies: `true` (on) for
+    /// dev, `false` (off) for serve.
+    #[must_use]
+    pub fn effective_validate_timestamps(&self, dev_mode: bool) -> bool {
+        self.opcache_validate_timestamps.unwrap_or(dev_mode)
+    }
+
+    /// OPcache ini directives to write into the generated php.ini for this run.
+    ///
+    /// Returns `(key, value)` pairs for `opcache.validate_timestamps` (always,
+    /// resolved via [`Self::effective_validate_timestamps`]) and
+    /// `opcache.revalidate_freq` (only when `opcache_revalidate_freq` is set).
+    /// These are appended before user `ini_overrides` so an operator can still
+    /// override them through `ini_overrides` if they insist.
+    #[must_use]
+    pub fn opcache_ini_lines(&self, dev_mode: bool) -> Vec<(String, String)> {
+        let mut lines = Vec::with_capacity(2);
+        let validate = self.effective_validate_timestamps(dev_mode);
+        lines.push((
+            "opcache.validate_timestamps".to_string(),
+            if validate { "1" } else { "0" }.to_string(),
+        ));
+        if let Some(freq) = self.opcache_revalidate_freq {
+            lines.push(("opcache.revalidate_freq".to_string(), freq.to_string()));
+        }
+        lines
     }
 }
 
@@ -3009,6 +3091,84 @@ sites_dir = "/var/www/sites"
             // still resolves true (and sites_dir is set anyway).
             assert!(config.server.effective_disable_shell_exec());
         });
+    }
+
+    // ── OPcache timestamp validation ────────────────────────────────────
+
+    #[test]
+    fn test_opcache_validate_timestamps_defaults_to_none() {
+        let cfg = PhpConfig::default();
+        assert_eq!(cfg.opcache_validate_timestamps, None);
+        assert_eq!(cfg.opcache_revalidate_freq, None);
+    }
+
+    #[test]
+    fn test_opcache_mode_defaults_serve_off_dev_on() {
+        let cfg = PhpConfig::default();
+        // Unset → mode default: serve off, dev on.
+        assert!(!cfg.effective_validate_timestamps(false), "serve default must be off");
+        assert!(cfg.effective_validate_timestamps(true), "dev default must be on");
+    }
+
+    #[test]
+    fn test_opcache_explicit_override_wins_in_both_modes() {
+        let on = PhpConfig { opcache_validate_timestamps: Some(true), ..PhpConfig::default() };
+        assert!(on.effective_validate_timestamps(false), "explicit true forces on under serve");
+        assert!(on.effective_validate_timestamps(true));
+
+        let off = PhpConfig { opcache_validate_timestamps: Some(false), ..PhpConfig::default() };
+        assert!(!off.effective_validate_timestamps(true), "explicit false forces off under dev");
+        assert!(!off.effective_validate_timestamps(false));
+    }
+
+    #[test]
+    fn test_opcache_ini_lines_serve_default() {
+        let cfg = PhpConfig::default();
+        let lines = cfg.opcache_ini_lines(false);
+        assert_eq!(lines, vec![("opcache.validate_timestamps".to_string(), "0".to_string())]);
+    }
+
+    #[test]
+    fn test_opcache_ini_lines_dev_default() {
+        let cfg = PhpConfig::default();
+        let lines = cfg.opcache_ini_lines(true);
+        assert_eq!(lines, vec![("opcache.validate_timestamps".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn test_opcache_ini_lines_include_revalidate_freq_when_set() {
+        let cfg = PhpConfig {
+            opcache_validate_timestamps: Some(true),
+            opcache_revalidate_freq: Some(60),
+            ..PhpConfig::default()
+        };
+        let lines = cfg.opcache_ini_lines(false);
+        assert_eq!(
+            lines,
+            vec![
+                ("opcache.validate_timestamps".to_string(), "1".to_string()),
+                ("opcache.revalidate_freq".to_string(), "60".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_opcache_config_loads_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r"
+[php]
+opcache_validate_timestamps = true
+opcache_revalidate_freq = 60
+",
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.opcache_validate_timestamps, Some(true));
+        assert_eq!(config.php.opcache_revalidate_freq, Some(60));
     }
 
     // ── Worker mode config ──────────────────────────────────────────────

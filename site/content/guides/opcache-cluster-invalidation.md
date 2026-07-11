@@ -10,6 +10,46 @@ deploy event is a single write to the gossip-replicated KV store; each
 node's per-request watcher (one atomic load + one KV read) drops the
 vhost's cached scripts before the next request executes.
 
+## Deploys are events (`ephpm serve`, planned for v0.5.0)
+
+> **Planned for v0.5.0 — not in v0.4.x.** This default flip is a
+> user-visible behavior change and ships in the next minor. On v0.4.x,
+> serve mode still inherits PHP's `validate_timestamps=1, revalidate_freq=2`.
+
+Starting in **v0.5.0**, `ephpm serve` defaults `opcache.validate_timestamps=0`:
+the server **trusts the OPcache** and never `stat()`s cached scripts on the
+hot path. Code changes become a deliberate *event* — they go live only when
+you run `ephpm deploy` (or `ephpm cache reset`), which invalidates the cache
+through the RESP listener. `ephpm dev` keeps `validate_timestamps=1` so the
+edit-refresh loop stays instant.
+
+| Mode | `validate_timestamps` default | Code changes go live… |
+|------|-------------------------------|-----------------------|
+| `ephpm serve` | `0` (off) | on `ephpm deploy` / `ephpm cache reset` |
+| `ephpm dev` (or bare `ephpm`) | `1` (on) | on the next request after you save |
+
+Override either way with the `[php] opcache_validate_timestamps` knob
+(`true` re-enables stat-on-use under serve, e.g. for a bind-mounted docroot;
+`false` freezes the cache under dev). `[php] opcache_revalidate_freq` tunes
+how often a re-stat happens when validation is on.
+
+> ⚠️ **Serve mode + validation off needs an invalidation lever.** With
+> `validate_timestamps=0`, the *only* way to refresh cached code without a
+> restart is `ephpm deploy` / `ephpm cache reset`, and those write over the
+> RESP listener. If `[kv.redis_compat] enabled = false`, there is no lever
+> at all — startup logs a **WARN** and cached code stays frozen until the
+> process restarts. Either enable the RESP listener (loopback is fine) or
+> set `[php] opcache_validate_timestamps = true`.
+
+Why off and not just a high `revalidate_freq`? On a 500-file autoload app
+(ePHPm-lab bench #5), `validate_timestamps=1 revalidate_freq=2` measured
+912 rps, `revalidate_freq=60` measured 999 rps (+9.5%), and off measured
+995 rps. Since `freq=60` already recovers essentially all the throughput,
+off is chosen for the **deterministic deploys-are-events contract**, not for
+raw speed — with a bonus that on container/overlay/network filesystems the
+`stat()` savings are larger, and in immutable-container deploys (files can't
+change) validation is pure waste.
+
 ## Requirements
 
 - ePHPm **≥ 0.4.0**, `[php] mode = "fpm"` (the default — see
@@ -100,13 +140,15 @@ A complete, tested manifest pair (demo + php-fpm comparison benchmark)
 lives in the [ePHPm-lab repository](https://github.com/tinfoyle/ePHPm-lab)
 under `k8s/opcache-cluster.yaml`.
 
-## Why not `opcache.validate_timestamps`?
+## Why not rely on `opcache.validate_timestamps`?
 
-The stock approach pays a `stat()` per include site per request, always,
-on every node — and still can't make a deploy atomic across a cluster.
-The comparison table and alternatives are in the
-[design document](/roadmap/opcache-clustering/), along with the planned
-Phase 2 (per-vhost preload) and Phase 3 (file watcher).
+Timestamp validation pays a `stat()` per include site per request (bounded
+by `revalidate_freq`), on every node — and still can't make a deploy atomic
+across a cluster. That is why serve mode turns it **off** by default (v0.5.0,
+see [above](#deploys-are-events-ephpm-serve-planned-for-v050)) and uses the
+KV-driven invalidation event instead. The comparison table and alternatives
+are in the [design document](/roadmap/opcache-clustering/), along with the
+planned Phase 2 (per-vhost preload) and Phase 3 (file watcher).
 
 ## Gaps and caveats
 
