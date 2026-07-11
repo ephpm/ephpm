@@ -1313,6 +1313,99 @@ pub struct PhpConfig {
     #[serde(default)]
     pub opcache_revalidate_freq: Option<u32>,
 
+    /// Override `opcache.memory_consumption` (MB of shared opcode cache).
+    ///
+    /// When unset, ePHPm **auto-derives** this from the detected memory budget
+    /// (container cgroup limit, else host `MemTotal`): ~18% of memory, clamped
+    /// to `[64, 512]` MB. Set explicitly to pin the SHM size regardless of the
+    /// detected budget. Only takes effect in serve mode (dev keeps PHP's
+    /// default of 128 MB unless you set this).
+    ///
+    /// Default: `None` (auto-derived in serve, PHP default in dev).
+    #[serde(default)]
+    pub opcache_memory_consumption: Option<u32>,
+
+    /// Override `opcache.interned_strings_buffer` (MB for interned strings).
+    ///
+    /// When unset, ePHPm auto-derives it to scale with the opcache SHM size:
+    /// ~1 MB per 16 MB of `opcache.memory_consumption`, clamped to `[8, 64]`
+    /// MB. Set explicitly to pin it. Serve mode only (dev keeps the PHP
+    /// default).
+    ///
+    /// Default: `None` (auto-derived in serve, PHP default in dev).
+    #[serde(default)]
+    pub opcache_interned_strings_buffer: Option<u32>,
+
+    /// Override `opcache.jit_buffer_size` (MB reserved for the JIT).
+    ///
+    /// When unset, ePHPm auto-derives a buffer size (~1/64 of the memory
+    /// budget, clamped `[32, 64]` MB) and emits it in serve mode. **This does
+    /// NOT enable JIT.** `opcache.jit` is left at PHP's default (opt-in via
+    /// `ini_overrides`): JIT helps CPU-bound workloads but can regress the
+    /// I/O-bound request path typical of web apps, so auto-enabling it is a
+    /// separate benched decision. The buffer is merely pre-sized so enabling
+    /// JIT later needs no config change.
+    ///
+    /// Default: `None` (auto-derived buffer in serve; JIT still off).
+    #[serde(default)]
+    pub opcache_jit_buffer_size: Option<u32>,
+
+    /// Override `opcache.max_accelerated_files` (cap on cached script slots).
+    ///
+    /// When unset, ePHPm uses a generous **fixed** default of `20000` in serve
+    /// mode. This is deliberately NOT derived from memory: the right value is
+    /// shaped by how many `.php` files the *application* has, not by the
+    /// machine size. 20000 comfortably covers large frameworks (Laravel /
+    /// WordPress + plugins) while PHP rounds it up to the next prime internally.
+    ///
+    /// Default: `None` (fixed 20000 in serve, PHP default in dev).
+    #[serde(default)]
+    pub opcache_max_accelerated_files: Option<u32>,
+
+    /// Override the derived per-request `memory_limit` (e.g. `"192M"`).
+    ///
+    /// Takes precedence over the legacy [`Self::memory_limit`] field **and**
+    /// over the auto-derived value. When unset, ePHPm derives a per-request
+    /// limit in serve mode from `(memory_budget − opcache_shm − ~64 MB
+    /// overhead) / worker_count`, clamped to a `128 MB` floor; with no
+    /// detectable memory budget it keeps PHP's `128M` default rather than
+    /// inventing a huge number. Dev mode keeps [`Self::memory_limit`].
+    ///
+    /// Default: `None` (auto-derived in serve, `memory_limit` in dev).
+    #[serde(default)]
+    pub php_memory_limit: Option<String>,
+
+    /// Override `realpath_cache_size` (e.g. `"16M"`).
+    ///
+    /// When unset, serve mode uses `16M` (up from PHP's stingy `256K`) to cut
+    /// `realpath()`/`stat()` traffic on deep framework autoload trees; dev mode
+    /// keeps the PHP default so freshly-created files resolve immediately. Set
+    /// explicitly to pin it in either mode.
+    ///
+    /// Default: `None` (`16M` in serve, PHP default in dev).
+    #[serde(default)]
+    pub realpath_cache_size: Option<String>,
+
+    /// Override `realpath_cache_ttl` in seconds.
+    ///
+    /// When unset, serve mode uses `600` (vs PHP's `120`) so realpath entries
+    /// live longer between deploys; dev mode keeps the PHP default. Set
+    /// explicitly to pin it.
+    ///
+    /// Default: `None` (`600` in serve, PHP default in dev).
+    #[serde(default)]
+    pub realpath_cache_ttl: Option<u32>,
+
+    /// Override `zend.assertions`.
+    ///
+    /// When unset, serve mode uses `-1` (assertions compiled out — zero
+    /// runtime cost, the production-recommended value) and dev mode uses `1`
+    /// (assertions active). Set explicitly (`-1`, `0`, or `1`) to pin it.
+    ///
+    /// Default: `None` (`-1` in serve, `1` in dev).
+    #[serde(default)]
+    pub zend_assertions: Option<i8>,
+
     /// Optional path to a custom php.ini file.
     ///
     /// When set, ePHPm reads this file for PHP configuration before applying
@@ -1752,6 +1845,14 @@ impl Default for PhpConfig {
             memory_limit: default_memory_limit(),
             opcache_validate_timestamps: None,
             opcache_revalidate_freq: None,
+            opcache_memory_consumption: None,
+            opcache_interned_strings_buffer: None,
+            opcache_jit_buffer_size: None,
+            opcache_max_accelerated_files: None,
+            php_memory_limit: None,
+            realpath_cache_size: None,
+            realpath_cache_ttl: None,
+            zend_assertions: None,
             ini_file: None,
             ini_overrides: Vec::new(),
             extensions: Vec::new(),
@@ -1828,25 +1929,418 @@ impl PhpConfig {
         self.opcache_validate_timestamps.unwrap_or(dev_mode)
     }
 
-    /// OPcache ini directives to write into the generated php.ini for this run.
+    /// Resolve the effective per-request PHP `memory_limit` string.
     ///
-    /// Returns `(key, value)` pairs for `opcache.validate_timestamps` (always,
-    /// resolved via [`Self::effective_validate_timestamps`]) and
-    /// `opcache.revalidate_freq` (only when `opcache_revalidate_freq` is set).
-    /// These are appended before user `ini_overrides` so an operator can still
-    /// override them through `ini_overrides` if they insist.
+    /// Precedence: explicit [`Self::php_memory_limit`] → derived (serve only,
+    /// when a memory budget is detectable) → the legacy [`Self::memory_limit`]
+    /// field (which itself defaults to `128M`). See [`Self::derive_tuning`] for
+    /// the derivation.
+    #[must_use]
+    pub fn effective_memory_limit(&self, dev_mode: bool) -> String {
+        self.autotune(dev_mode).memory_limit.value
+    }
+
+    /// Compute the full resource-aware tuning profile for this run.
+    ///
+    /// Detects the CPU quota and memory budget (cgroup-aware, falling back to
+    /// host totals), then resolves every tunable through the three-tier
+    /// precedence: **explicit `[php]` config → auto-derived → PHP stock
+    /// default**. The returned [`AutoTune`] records each value *and* where it
+    /// came from so the caller can both emit ini lines and log a transparent
+    /// summary.
+    ///
+    /// `dev_mode` selects the profile family: serve mode derives production
+    /// values from the detected resources; dev mode keeps PHP-friendly defaults
+    /// (timestamp validation on, assertions on, loose realpath) so the
+    /// edit-refresh loop stays tight. Explicit config still wins in either mode.
+    #[must_use]
+    pub fn autotune(&self, dev_mode: bool) -> AutoTune {
+        let (mem_budget, mem_source) = detect_memory_budget();
+        let cpu_quota = read_cgroup_cpu_quota();
+        let (workers, worker_source) = self.effective_worker_count_with_source();
+        let derived = derive_tuning(cpu_quota, mem_budget, workers, dev_mode);
+
+        // Three-tier resolution helper: explicit config wins, then the derived
+        // value (if serve mode produced one), then the PHP stock default.
+        fn resolve<T: Clone>(explicit: Option<T>, derived: Option<T>, default: T) -> TunedValue<T> {
+            match (explicit, derived) {
+                (Some(v), _) => TunedValue { value: v, origin: Origin::Explicit },
+                (None, Some(v)) => TunedValue { value: v, origin: Origin::Derived },
+                (None, None) => TunedValue { value: default, origin: Origin::Default },
+            }
+        }
+
+        // validate_timestamps is a bool that always resolves (mode default),
+        // so its "default" is the mode-appropriate value and any explicit knob
+        // wins — track origin accordingly.
+        let validate = TunedValue {
+            value: self.effective_validate_timestamps(dev_mode),
+            origin: if self.opcache_validate_timestamps.is_some() {
+                Origin::Explicit
+            } else {
+                Origin::Derived
+            },
+        };
+
+        AutoTune {
+            cpu_quota,
+            mem_budget,
+            mem_source,
+            workers,
+            worker_source,
+            dev_mode,
+            validate_timestamps: validate,
+            revalidate_freq: self
+                .opcache_revalidate_freq
+                .map(|f| TunedValue { value: f, origin: Origin::Explicit }),
+            memory_consumption: resolve(
+                self.opcache_memory_consumption,
+                derived.opcache_memory_consumption,
+                // PHP stock opcache.memory_consumption default is 128 MB.
+                128,
+            ),
+            interned_strings_buffer: resolve(
+                self.opcache_interned_strings_buffer,
+                derived.opcache_interned_strings_buffer,
+                8,
+            ),
+            jit_buffer_size: resolve(
+                self.opcache_jit_buffer_size,
+                derived.opcache_jit_buffer_size,
+                0,
+            ),
+            max_accelerated_files: resolve(
+                self.opcache_max_accelerated_files,
+                derived.opcache_max_accelerated_files,
+                10_000,
+            ),
+            memory_limit: resolve(
+                self.php_memory_limit.clone(),
+                derived.memory_limit.clone(),
+                self.memory_limit.clone(),
+            ),
+            realpath_cache_size: resolve(
+                self.realpath_cache_size.clone(),
+                derived.realpath_cache_size.clone(),
+                "256K".to_string(),
+            ),
+            realpath_cache_ttl: resolve(self.realpath_cache_ttl, derived.realpath_cache_ttl, 120),
+            zend_assertions: resolve(self.zend_assertions, derived.zend_assertions, 1),
+        }
+    }
+
+    /// OPcache/engine ini directives to write into the generated php.ini.
+    ///
+    /// Layers the full resource-aware autotuning profile (see
+    /// [`Self::autotune`]): `opcache.validate_timestamps` (always), plus every
+    /// tunable whose value came from explicit config **or** a serve-mode
+    /// derivation. Values that resolved to the PHP stock default are omitted so
+    /// the engine's own default applies (keeping dev mode's php.ini minimal).
+    /// All lines are emitted *before* user `ini_overrides`, so an operator can
+    /// still override any of them through `ini_overrides` as the final lever.
     #[must_use]
     pub fn opcache_ini_lines(&self, dev_mode: bool) -> Vec<(String, String)> {
-        let mut lines = Vec::with_capacity(2);
-        let validate = self.effective_validate_timestamps(dev_mode);
+        self.autotune(dev_mode).ini_lines()
+    }
+}
+
+/// Where a resolved tunable's value came from — surfaced in the autotune log
+/// so operators can see which values they pinned vs which ePHPm derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The operator set the `[php]` field explicitly — it wins over derivation.
+    Explicit,
+    /// ePHPm derived the value from detected CPU/memory (serve mode).
+    Derived,
+    /// Neither explicit nor derived — PHP's stock default applies (the line is
+    /// omitted from the generated ini so the engine's own default takes hold).
+    Default,
+}
+
+impl Origin {
+    /// Single-char marker for the compact autotune log line
+    /// (`*` = explicit/pinned, otherwise blank).
+    #[must_use]
+    fn marker(self) -> &'static str {
+        match self {
+            Self::Explicit => "*",
+            Self::Derived | Self::Default => "",
+        }
+    }
+}
+
+/// A resolved tunable: its effective value plus where that value came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunedValue<T> {
+    /// The effective value used for this run.
+    pub value: T,
+    /// Whether it was pinned by config, derived, or left at the PHP default.
+    pub origin: Origin,
+}
+
+/// The raw derived values (serve mode only). Every field is `None` in dev mode
+/// or when the required resource (memory budget) could not be detected — the
+/// three-tier resolver then falls through to the PHP stock default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DerivedTuning {
+    /// Derived `opcache.memory_consumption` (MB).
+    pub opcache_memory_consumption: Option<u32>,
+    /// Derived `opcache.interned_strings_buffer` (MB).
+    pub opcache_interned_strings_buffer: Option<u32>,
+    /// Derived `opcache.jit_buffer_size` (MB). JIT itself stays off.
+    pub opcache_jit_buffer_size: Option<u32>,
+    /// Derived `opcache.max_accelerated_files` (fixed, not resource-shaped).
+    pub opcache_max_accelerated_files: Option<u32>,
+    /// Derived per-request `memory_limit` (e.g. `"192M"`).
+    pub memory_limit: Option<String>,
+    /// Derived `realpath_cache_size` (e.g. `"16M"`).
+    pub realpath_cache_size: Option<String>,
+    /// Derived `realpath_cache_ttl` (seconds).
+    pub realpath_cache_ttl: Option<u32>,
+    /// Derived `zend.assertions` (`-1` in serve).
+    pub zend_assertions: Option<i8>,
+}
+
+/// One mebibyte in bytes.
+const MIB: u64 = 1024 * 1024;
+
+/// Derive the resource-aware serve-mode tuning profile from the detected CPU
+/// quota, memory budget, and effective worker count.
+///
+/// Returns an all-`None` [`DerivedTuning`] in **dev mode** (dev keeps
+/// PHP-friendly defaults so edits refresh instantly and assertions stay on).
+/// In serve mode:
+///
+/// - `opcache.memory_consumption` = ~18% of the memory budget, clamped
+///   `[64, 512]` MB. (Always derived in serve, even with no memory budget:
+///   the floor gives a sane 64 MB.)
+/// - `opcache.interned_strings_buffer` = ~1 MB per 16 MB of opcache SHM,
+///   clamped `[8, 64]` MB.
+/// - `opcache.jit_buffer_size` = ~1/64 of the memory budget, clamped
+///   `[32, 64]` MB (buffer only — JIT is **not** auto-enabled).
+/// - `opcache.max_accelerated_files` = a generous fixed `20000` (app-file-count
+///   shaped, not resource-shaped — see the field doc).
+/// - `memory_limit` = `(budget − opcache_shm − 64 MB overhead) / workers`,
+///   floored at `128 MB`. With no detectable memory budget it stays `None`
+///   (keep PHP's `128M`) rather than inventing a huge number.
+/// - `realpath_cache_size` = `16M`; `realpath_cache_ttl` = `600`.
+/// - `zend.assertions` = `-1` (compiled out).
+#[must_use]
+pub fn derive_tuning(
+    cpu_quota: Option<f64>,
+    mem_bytes: Option<u64>,
+    workers: usize,
+    dev_mode: bool,
+) -> DerivedTuning {
+    // CPU quota is detected and logged, but no serve tunable is CPU-shaped
+    // today (JIT stays off, and worker_count already consumes the quota). Bind
+    // it so the signature documents the input and a future CPU-shaped knob has
+    // it to hand.
+    let _ = cpu_quota;
+
+    if dev_mode {
+        // Dev keeps PHP-friendly defaults across the board.
+        return DerivedTuning::default();
+    }
+
+    // opcache.memory_consumption: ~18% of the budget, clamped [64, 512] MB.
+    // With no detectable budget, the floor (64 MB) still gives a sane serve
+    // value — opcache SHM is fixed-size and cheap relative to a modern host.
+    let opcache_mb: u32 = {
+        let by_ratio = mem_bytes.map_or(64, |b| (b * 18 / 100) / MIB) as u32;
+        by_ratio.clamp(64, 512)
+    };
+
+    // interned_strings_buffer: ~1 MB per 16 MB of opcache SHM, clamped [8, 64].
+    let interned_mb: u32 = (opcache_mb / 16).clamp(8, 64);
+
+    // jit_buffer_size: ~1/64 of the budget, clamped [32, 64] MB. Buffer only.
+    let jit_mb: u32 = {
+        let by_ratio = mem_bytes.map_or(32, |b| (b / 64) / MIB) as u32;
+        by_ratio.clamp(32, 64)
+    };
+
+    // Per-request memory_limit: only derived when we actually know the budget —
+    // otherwise keep PHP's 128M (returned as None). Reserve the opcache SHM and
+    // a ~64 MB engine/server overhead, then split across concurrent workers.
+    let memory_limit: Option<String> = mem_bytes.map(|budget| {
+        let overhead = 64 * MIB + u64::from(opcache_mb) * MIB;
+        let per_request_bytes = budget.saturating_sub(overhead) / (workers.max(1) as u64);
+        let per_request_mb = (per_request_bytes / MIB).max(128);
+        // Cap the string at a u32-safe MB count for tidy formatting; budgets
+        // this large are unrealistic but keep the cast honest.
+        let mb = u32::try_from(per_request_mb).unwrap_or(u32::MAX);
+        format!("{mb}M")
+    });
+
+    DerivedTuning {
+        opcache_memory_consumption: Some(opcache_mb),
+        opcache_interned_strings_buffer: Some(interned_mb),
+        opcache_jit_buffer_size: Some(jit_mb),
+        // Fixed, generous — deliberately NOT memory-shaped.
+        opcache_max_accelerated_files: Some(20_000),
+        memory_limit,
+        realpath_cache_size: Some("16M".to_string()),
+        realpath_cache_ttl: Some(600),
+        zend_assertions: Some(-1),
+    }
+}
+
+/// The fully-resolved resource-aware tuning profile for a run: the detected
+/// inputs (CPU quota, memory budget + source, worker count + source) plus every
+/// tunable resolved through the explicit → derived → default precedence.
+///
+/// Produced by [`PhpConfig::autotune`]. Feeds both the generated php.ini (via
+/// [`Self::ini_lines`]) and the startup autotune log (via
+/// [`Self::summary_line`]).
+#[derive(Debug, Clone)]
+pub struct AutoTune {
+    /// Detected cgroup CPU quota in CPU units (`None` = unlimited/not-cgrouped).
+    pub cpu_quota: Option<f64>,
+    /// Detected memory budget in bytes (`None` = nothing detectable).
+    pub mem_budget: Option<u64>,
+    /// Where the memory figure came from.
+    pub mem_source: MemorySource,
+    /// Effective worker count driving the per-request `memory_limit` split.
+    pub workers: usize,
+    /// Where the worker count came from.
+    pub worker_source: WorkerCountSource,
+    /// Whether this is the dev-mode profile (vs serve).
+    pub dev_mode: bool,
+    /// Resolved `opcache.validate_timestamps`.
+    pub validate_timestamps: TunedValue<bool>,
+    /// Resolved `opcache.revalidate_freq` (only present when explicitly set).
+    pub revalidate_freq: Option<TunedValue<u32>>,
+    /// Resolved `opcache.memory_consumption` (MB).
+    pub memory_consumption: TunedValue<u32>,
+    /// Resolved `opcache.interned_strings_buffer` (MB).
+    pub interned_strings_buffer: TunedValue<u32>,
+    /// Resolved `opcache.jit_buffer_size` (MB). JIT stays off.
+    pub jit_buffer_size: TunedValue<u32>,
+    /// Resolved `opcache.max_accelerated_files`.
+    pub max_accelerated_files: TunedValue<u32>,
+    /// Resolved per-request `memory_limit` string.
+    pub memory_limit: TunedValue<String>,
+    /// Resolved `realpath_cache_size` string.
+    pub realpath_cache_size: TunedValue<String>,
+    /// Resolved `realpath_cache_ttl` (seconds).
+    pub realpath_cache_ttl: TunedValue<u32>,
+    /// Resolved `zend.assertions`.
+    pub zend_assertions: TunedValue<i8>,
+}
+
+impl AutoTune {
+    /// The ini `(key, value)` pairs to write, before user `ini_overrides`.
+    ///
+    /// `opcache.validate_timestamps` is always emitted (its default is
+    /// mode-dependent, not a PHP stock value). Every other tunable is emitted
+    /// only when its origin is [`Origin::Explicit`] or [`Origin::Derived`];
+    /// values left at the PHP stock default are omitted so the engine default
+    /// applies and dev-mode php.ini stays minimal.
+    #[must_use]
+    pub fn ini_lines(&self) -> Vec<(String, String)> {
+        let mut lines: Vec<(String, String)> = Vec::new();
+
+        // Always emit: the "default" here is the mode-appropriate value.
         lines.push((
             "opcache.validate_timestamps".to_string(),
-            if validate { "1" } else { "0" }.to_string(),
+            if self.validate_timestamps.value { "1" } else { "0" }.to_string(),
         ));
-        if let Some(freq) = self.opcache_revalidate_freq {
-            lines.push(("opcache.revalidate_freq".to_string(), freq.to_string()));
+        if let Some(freq) = &self.revalidate_freq {
+            lines.push(("opcache.revalidate_freq".to_string(), freq.value.to_string()));
         }
+
+        // Emit a `<key>=<value>` line only when the value is pinned or derived.
+        let mut push_if_set = |key: &str, tv_origin: Origin, value: String| {
+            if tv_origin != Origin::Default {
+                lines.push((key.to_string(), value));
+            }
+        };
+
+        push_if_set(
+            "opcache.memory_consumption",
+            self.memory_consumption.origin,
+            format!("{}", self.memory_consumption.value),
+        );
+        push_if_set(
+            "opcache.interned_strings_buffer",
+            self.interned_strings_buffer.origin,
+            format!("{}", self.interned_strings_buffer.value),
+        );
+        push_if_set(
+            "opcache.jit_buffer_size",
+            self.jit_buffer_size.origin,
+            // PHP accepts a bare MB integer for jit_buffer_size as bytes, so
+            // append the M suffix explicitly.
+            format!("{}M", self.jit_buffer_size.value),
+        );
+        push_if_set(
+            "opcache.max_accelerated_files",
+            self.max_accelerated_files.origin,
+            format!("{}", self.max_accelerated_files.value),
+        );
+        push_if_set("memory_limit", self.memory_limit.origin, self.memory_limit.value.clone());
+        push_if_set(
+            "realpath_cache_size",
+            self.realpath_cache_size.origin,
+            self.realpath_cache_size.value.clone(),
+        );
+        push_if_set(
+            "realpath_cache_ttl",
+            self.realpath_cache_ttl.origin,
+            format!("{}", self.realpath_cache_ttl.value),
+        );
+        push_if_set(
+            "zend.assertions",
+            self.zend_assertions.origin,
+            format!("{}", self.zend_assertions.value),
+        );
+
         lines
+    }
+
+    /// A single compact, human-readable summary line for the startup INFO log.
+    ///
+    /// A `*` after a value marks it as explicitly pinned by config (vs derived
+    /// or defaulted), so operators can see at a glance what they overrode.
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        let mode = if self.dev_mode { "dev" } else { "serve" };
+        let cpu = self.cpu_quota.map_or_else(|| "unlimited".to_string(), |q| format!("{q:.2}"));
+        let mem =
+            self.mem_budget.map_or_else(|| "unknown".to_string(), |b| format!("{}MiB", b / MIB));
+        let jit_state = if self.jit_buffer_size.origin == Origin::Default {
+            "off"
+        } else {
+            "buffer-only, jit off"
+        };
+        format!(
+            "autotune ({mode}): cpu_quota={cpu} mem={mem} ({}) -> workers={}[{}] \
+             opcache.memory_consumption={}MB{} memory_limit={}{} interned={}MB{} \
+             jit_buffer={}MB{} ({jit_state}) max_files={}{} realpath={}{}/ttl={}{} \
+             validate_timestamps={}{} assertions={}{}",
+            self.mem_source.label(),
+            self.workers,
+            self.worker_source.label(),
+            self.memory_consumption.value,
+            self.memory_consumption.origin.marker(),
+            self.memory_limit.value,
+            self.memory_limit.origin.marker(),
+            self.interned_strings_buffer.value,
+            self.interned_strings_buffer.origin.marker(),
+            self.jit_buffer_size.value,
+            self.jit_buffer_size.origin.marker(),
+            self.max_accelerated_files.value,
+            self.max_accelerated_files.origin.marker(),
+            self.realpath_cache_size.value,
+            self.realpath_cache_size.origin.marker(),
+            self.realpath_cache_ttl.value,
+            self.realpath_cache_ttl.origin.marker(),
+            u8::from(self.validate_timestamps.value),
+            self.validate_timestamps.origin.marker(),
+            self.zend_assertions.value,
+            self.zend_assertions.origin.marker(),
+        )
     }
 }
 
@@ -2159,6 +2653,152 @@ fn parse_cgroup_v1_cpu(quota_raw: &str, period_raw: &str) -> Option<f64> {
     }
     #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss)]
     Some(quota as u64 as f64 / period as f64)
+}
+
+/// Where the memory figure used for autotuning came from — surfaced in the
+/// startup log so operators can see whether ePHPm read a real container limit
+/// or fell back to total host memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemorySource {
+    /// A cgroup **v2** `memory.max` limit (bytes).
+    CgroupV2,
+    /// A cgroup **v1** `memory.limit_in_bytes` limit (bytes).
+    CgroupV1,
+    /// No cgroup limit — total system memory (`/proc/meminfo` `MemTotal`) is
+    /// used instead. On non-Linux platforms this is the only source.
+    SystemTotal,
+    /// Neither a cgroup limit nor a readable system total — nothing to derive
+    /// from, so memory-shaped tunables keep their PHP-stock defaults.
+    Unknown,
+}
+
+impl MemorySource {
+    /// A short label suitable for a `tracing` field / the autotune summary.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CgroupV2 => "cgroup v2",
+            Self::CgroupV1 => "cgroup v1",
+            Self::SystemTotal => "system-total",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Detect the memory budget (in bytes) to size PHP/OPcache against, plus where
+/// the figure came from.
+///
+/// Resolution order (Linux):
+/// 1. cgroup **v2** `/sys/fs/cgroup/memory.max` (a real container limit).
+/// 2. cgroup **v1** `/sys/fs/cgroup/memory/memory.limit_in_bytes`.
+/// 3. `/proc/meminfo` `MemTotal` (total host memory — no container limit).
+///
+/// A cgroup limit of `"max"` (v2) or an absurdly-large sentinel (v1) means "no
+/// limit set" and is skipped so we fall through to the system total. On
+/// non-Linux platforms only the (unavailable) system-total path applies, so
+/// this returns `(None, MemorySource::Unknown)` and callers keep PHP defaults.
+#[must_use]
+pub fn detect_memory_budget() -> (Option<u64>, MemorySource) {
+    if let Some(bytes) = read_cgroup_memory_limit() {
+        // Distinguish v2 vs v1 purely for the log label; the value is the same
+        // shape either way. read_cgroup_memory_limit already prefers v2.
+        let source = if std::path::Path::new("/sys/fs/cgroup/memory.max").exists() {
+            MemorySource::CgroupV2
+        } else {
+            MemorySource::CgroupV1
+        };
+        return (Some(bytes), source);
+    }
+    if let Some(total) = read_total_system_memory() {
+        return (Some(total), MemorySource::SystemTotal);
+    }
+    (None, MemorySource::Unknown)
+}
+
+/// Read the cgroup memory limit in bytes (v2 preferred, v1 fallback).
+///
+/// Returns `None` when no limit is set (`memory.max = "max"` on v2, or a
+/// near-`u64::MAX` sentinel on v1), when not running under a cgroup, or on
+/// non-Linux platforms — the caller then falls back to total system memory.
+#[cfg(target_os = "linux")]
+fn read_cgroup_memory_limit() -> Option<u64> {
+    // cgroup v2: /sys/fs/cgroup/memory.max = "<bytes>" or "max".
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        return parse_cgroup_v2_memory_max(&s);
+    }
+    // cgroup v1: memory.limit_in_bytes. Unlimited is represented by a huge
+    // page-aligned sentinel close to i64::MAX / u64::MAX.
+    let raw = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok()?;
+    parse_cgroup_v1_memory_limit(&raw)
+}
+
+/// Non-Linux: no cgroup memory concept — always fall back to system total.
+#[cfg(not(target_os = "linux"))]
+fn read_cgroup_memory_limit() -> Option<u64> {
+    None
+}
+
+/// Parse the cgroup v2 `memory.max` contents: a byte count, or the literal
+/// `"max"` meaning "no limit" (returns `None`).
+///
+/// Compiled everywhere so the unit tests (which run on Windows/macOS CI) can
+/// exercise it against literal strings without a real cgroupfs.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn parse_cgroup_v2_memory_max(contents: &str) -> Option<u64> {
+    let line = contents.lines().next()?.trim();
+    if line.eq_ignore_ascii_case("max") {
+        return None;
+    }
+    let bytes: u64 = line.parse().ok()?;
+    if bytes == 0 { None } else { Some(bytes) }
+}
+
+/// Parse the cgroup v1 `memory.limit_in_bytes` value. The kernel represents
+/// "unlimited" as a huge page-aligned sentinel (typically
+/// `0x7FFF_FFFF_FFFF_F000` — `i64::MAX` rounded down to a page boundary, or a
+/// near-`u64::MAX` value on 64-bit). Any value at or above a conservative
+/// threshold (half of `u64::MAX`, far larger than any real machine's RAM) is
+/// treated as "no limit" and returns `None`.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn parse_cgroup_v1_memory_limit(raw: &str) -> Option<u64> {
+    let bytes: u64 = raw.trim().parse().ok()?;
+    // No physical machine has ~4 EiB of RAM; anything this large is the
+    // "unlimited" sentinel, not a real cap. The classic v1 sentinel is
+    // `i64::MAX` page-aligned (`0x7FFF_FFFF_FFFF_F000` ≈ 9.22 EiB), so the
+    // threshold sits comfortably below it (`1 << 62` ≈ 4.6 EiB) yet far above
+    // any real host's RAM.
+    const UNLIMITED_THRESHOLD: u64 = 1 << 62;
+    if bytes == 0 || bytes >= UNLIMITED_THRESHOLD { None } else { Some(bytes) }
+}
+
+/// Read total system memory in bytes from `/proc/meminfo` (`MemTotal`, which
+/// is reported in kibibytes). Returns `None` on non-Linux platforms or if the
+/// field is missing/unparseable — callers then keep PHP-stock defaults.
+#[cfg(target_os = "linux")]
+fn read_total_system_memory() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_meminfo_memtotal(&meminfo)
+}
+
+/// Non-Linux: no `/proc/meminfo`. We keep the dependency footprint minimal
+/// (no `sysinfo` crate) rather than pull a platform abstraction just for the
+/// fallback, so memory-shaped tunables keep PHP defaults off-Linux.
+#[cfg(not(target_os = "linux"))]
+fn read_total_system_memory() -> Option<u64> {
+    None
+}
+
+/// Parse `MemTotal:` (kibibytes) out of `/proc/meminfo` contents and convert to
+/// bytes. Format: `MemTotal:        4028860 kB`.
+#[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
+fn parse_meminfo_memtotal(contents: &str) -> Option<u64> {
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kib: u64 = rest.split_ascii_whitespace().next()?.parse().ok()?;
+            return Some(kib.saturating_mul(1024));
+        }
+    }
+    None
 }
 
 fn default_worker_max_requests() -> u64 {
@@ -3123,13 +3763,34 @@ sites_dir = "/var/www/sites"
 
     #[test]
     fn test_opcache_ini_lines_serve_default() {
+        // Serve mode now emits the derived autotuning profile in addition to
+        // validate_timestamps. The exact opcache/memory byte values depend on
+        // the host's detected memory budget, so assert on the *keys* present
+        // and the environment-independent ones (assertions, realpath, files).
         let cfg = PhpConfig::default();
         let lines = cfg.opcache_ini_lines(false);
-        assert_eq!(lines, vec![("opcache.validate_timestamps".to_string(), "0".to_string())]);
+        let keys: Vec<&str> = lines.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"opcache.validate_timestamps"));
+        assert!(keys.contains(&"opcache.memory_consumption"));
+        assert!(keys.contains(&"opcache.interned_strings_buffer"));
+        assert!(keys.contains(&"opcache.jit_buffer_size"));
+        assert!(keys.contains(&"opcache.max_accelerated_files"));
+        assert!(keys.contains(&"realpath_cache_size"));
+        assert!(keys.contains(&"realpath_cache_ttl"));
+        assert!(keys.contains(&"zend.assertions"));
+        // Environment-independent derived values.
+        let get = |k: &str| lines.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("opcache.validate_timestamps"), Some("0"));
+        assert_eq!(get("opcache.max_accelerated_files"), Some("20000"));
+        assert_eq!(get("realpath_cache_size"), Some("16M"));
+        assert_eq!(get("realpath_cache_ttl"), Some("600"));
+        assert_eq!(get("zend.assertions"), Some("-1"));
     }
 
     #[test]
     fn test_opcache_ini_lines_dev_default() {
+        // Dev mode derives nothing — only the mode-appropriate
+        // validate_timestamps line is emitted, keeping the dev php.ini minimal.
         let cfg = PhpConfig::default();
         let lines = cfg.opcache_ini_lines(true);
         assert_eq!(lines, vec![("opcache.validate_timestamps".to_string(), "1".to_string())]);
@@ -3137,12 +3798,13 @@ sites_dir = "/var/www/sites"
 
     #[test]
     fn test_opcache_ini_lines_include_revalidate_freq_when_set() {
+        // Dev mode so no derived lines interfere — assert exact output.
         let cfg = PhpConfig {
             opcache_validate_timestamps: Some(true),
             opcache_revalidate_freq: Some(60),
             ..PhpConfig::default()
         };
-        let lines = cfg.opcache_ini_lines(false);
+        let lines = cfg.opcache_ini_lines(true);
         assert_eq!(
             lines,
             vec![
@@ -3150,6 +3812,189 @@ sites_dir = "/var/www/sites"
                 ("opcache.revalidate_freq".to_string(), "60".to_string()),
             ]
         );
+    }
+
+    // --- Resource-aware autotuning: cgroup memory parsing ---
+
+    #[test]
+    fn test_parse_cgroup_v2_memory_max_real_limit() {
+        // 320 MiB limit.
+        let bytes = 320 * 1024 * 1024;
+        assert_eq!(parse_cgroup_v2_memory_max(&format!("{bytes}\n")), Some(bytes));
+    }
+
+    #[test]
+    fn test_parse_cgroup_v2_memory_max_unlimited() {
+        assert_eq!(parse_cgroup_v2_memory_max("max\n"), None);
+        assert_eq!(parse_cgroup_v2_memory_max("MAX"), None);
+        // Zero is treated as no usable limit.
+        assert_eq!(parse_cgroup_v2_memory_max("0"), None);
+    }
+
+    #[test]
+    fn test_parse_cgroup_v1_memory_limit_real_limit() {
+        let bytes = 4u64 * 1024 * 1024 * 1024; // 4 GiB
+        assert_eq!(parse_cgroup_v1_memory_limit(&format!("{bytes}\n")), Some(bytes));
+    }
+
+    #[test]
+    fn test_parse_cgroup_v1_memory_limit_unlimited_sentinel() {
+        // The classic cgroup v1 "unlimited" sentinel (i64::MAX page-aligned).
+        assert_eq!(parse_cgroup_v1_memory_limit("9223372036854771712"), None);
+        // Near-u64::MAX also counts as unlimited.
+        assert_eq!(parse_cgroup_v1_memory_limit(&u64::MAX.to_string()), None);
+        // Zero => no limit.
+        assert_eq!(parse_cgroup_v1_memory_limit("0"), None);
+    }
+
+    #[test]
+    fn test_parse_meminfo_memtotal() {
+        let sample = "MemTotal:        4028860 kB\nMemFree:  100000 kB\n";
+        // 4028860 KiB -> bytes.
+        assert_eq!(parse_meminfo_memtotal(sample), Some(4_028_860 * 1024));
+        assert_eq!(parse_meminfo_memtotal("MemFree: 1 kB"), None);
+    }
+
+    // --- Resource-aware autotuning: derivation formulas ---
+
+    #[test]
+    fn test_derive_tuning_dev_mode_is_empty() {
+        // Dev keeps PHP-friendly defaults regardless of resources.
+        let d = derive_tuning(Some(4.0), Some(4 * 1024 * 1024 * 1024), 4, true);
+        assert_eq!(d, DerivedTuning::default());
+    }
+
+    #[test]
+    fn test_derive_tuning_small_pod_320mi_quarter_cpu() {
+        // 320 MiB / 0.25 CPU => 1 worker.
+        let mem = 320 * 1024 * 1024;
+        let d = derive_tuning(Some(0.25), Some(mem), 1, false);
+        // 18% of 320 MiB = 57.6 MiB -> clamps up to the 64 MB floor.
+        assert_eq!(d.opcache_memory_consumption, Some(64));
+        // interned: 64/16 = 4 -> clamps up to 8.
+        assert_eq!(d.opcache_interned_strings_buffer, Some(8));
+        // jit: 320MiB/64 = 5 MB -> clamps up to 32.
+        assert_eq!(d.opcache_jit_buffer_size, Some(32));
+        assert_eq!(d.opcache_max_accelerated_files, Some(20_000));
+        // memory_limit: (320 - 64 opcache - 64 overhead)/1 = 192 MiB.
+        assert_eq!(d.memory_limit.as_deref(), Some("192M"));
+        assert_eq!(d.realpath_cache_size.as_deref(), Some("16M"));
+        assert_eq!(d.realpath_cache_ttl, Some(600));
+        assert_eq!(d.zend_assertions, Some(-1));
+    }
+
+    #[test]
+    fn test_derive_tuning_large_4gi_4cpu() {
+        let mem = 4u64 * 1024 * 1024 * 1024; // 4 GiB
+        let d = derive_tuning(Some(4.0), Some(mem), 4, false);
+        // 18% of 4096 MiB = 737 MiB -> clamps down to the 512 MB ceiling.
+        assert_eq!(d.opcache_memory_consumption, Some(512));
+        // interned: 512/16 = 32 (within [8,64]).
+        assert_eq!(d.opcache_interned_strings_buffer, Some(32));
+        // jit: 4096/64 = 64 MB (at the ceiling).
+        assert_eq!(d.opcache_jit_buffer_size, Some(64));
+        // memory_limit: (4096 - 512 - 64)/4 = 880 MiB.
+        assert_eq!(d.memory_limit.as_deref(), Some("880M"));
+    }
+
+    #[test]
+    fn test_derive_tuning_unlimited_memory_keeps_php_default() {
+        // No detectable memory budget: opcache SHM still gets the sane 64 MB
+        // floor, but per-request memory_limit stays None (keep PHP's 128M)
+        // rather than inventing a huge number.
+        let d = derive_tuning(None, None, 4, false);
+        assert_eq!(d.opcache_memory_consumption, Some(64));
+        assert_eq!(d.opcache_jit_buffer_size, Some(32));
+        assert_eq!(d.memory_limit, None);
+    }
+
+    #[test]
+    fn test_derive_tuning_memory_limit_floors_at_128() {
+        // A tiny 128 MiB pod: (128 - 64 opcache - 64 overhead)/1 = 0 -> floor 128.
+        let mem = 128 * 1024 * 1024;
+        let d = derive_tuning(Some(0.25), Some(mem), 1, false);
+        assert_eq!(d.memory_limit.as_deref(), Some("128M"));
+    }
+
+    // --- Three-tier override precedence ---
+
+    #[test]
+    fn test_autotune_explicit_beats_derived_beats_default() {
+        // Explicit config value wins over any derivation.
+        let cfg = PhpConfig {
+            opcache_memory_consumption: Some(256),
+            php_memory_limit: Some("777M".to_string()),
+            zend_assertions: Some(0),
+            ..PhpConfig::default()
+        };
+        let at = cfg.autotune(false);
+        assert_eq!(at.memory_consumption.value, 256);
+        assert_eq!(at.memory_consumption.origin, Origin::Explicit);
+        assert_eq!(at.memory_limit.value, "777M");
+        assert_eq!(at.memory_limit.origin, Origin::Explicit);
+        assert_eq!(at.zend_assertions.value, 0);
+        assert_eq!(at.zend_assertions.origin, Origin::Explicit);
+
+        // Unset fields are derived (serve mode).
+        assert_eq!(at.max_accelerated_files.origin, Origin::Derived);
+        assert_eq!(at.max_accelerated_files.value, 20_000);
+        assert_eq!(at.realpath_cache_size.origin, Origin::Derived);
+        assert_eq!(at.realpath_cache_size.value, "16M");
+    }
+
+    #[test]
+    fn test_autotune_dev_mode_leaves_values_at_php_default() {
+        // Dev mode derives nothing, so unset knobs resolve to the PHP default
+        // and are omitted from the ini (Origin::Default).
+        let cfg = PhpConfig::default();
+        let at = cfg.autotune(true);
+        assert_eq!(at.memory_consumption.origin, Origin::Default);
+        assert_eq!(at.max_accelerated_files.origin, Origin::Default);
+        assert_eq!(at.zend_assertions.origin, Origin::Default);
+        // But an explicit knob still wins in dev.
+        let cfg2 = PhpConfig { zend_assertions: Some(-1), ..PhpConfig::default() };
+        let at2 = cfg2.autotune(true);
+        assert_eq!(at2.zend_assertions.value, -1);
+        assert_eq!(at2.zend_assertions.origin, Origin::Explicit);
+    }
+
+    #[test]
+    fn test_autotune_summary_line_marks_explicit() {
+        let cfg = PhpConfig { opcache_memory_consumption: Some(200), ..PhpConfig::default() };
+        let line = cfg.autotune(false).summary_line();
+        assert!(line.contains("autotune (serve)"));
+        // Explicit memory_consumption is marked with a `*` (after the MB unit).
+        assert!(line.contains("opcache.memory_consumption=200MB*"), "got: {line}");
+    }
+
+    #[test]
+    fn test_new_autotune_knobs_load_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[php]
+opcache_memory_consumption = 256
+opcache_interned_strings_buffer = 24
+opcache_jit_buffer_size = 48
+opcache_max_accelerated_files = 30000
+php_memory_limit = "256M"
+realpath_cache_size = "32M"
+realpath_cache_ttl = 900
+zend_assertions = 0
+"#,
+        )
+        .unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.opcache_memory_consumption, Some(256));
+        assert_eq!(config.php.opcache_interned_strings_buffer, Some(24));
+        assert_eq!(config.php.opcache_jit_buffer_size, Some(48));
+        assert_eq!(config.php.opcache_max_accelerated_files, Some(30000));
+        assert_eq!(config.php.php_memory_limit.as_deref(), Some("256M"));
+        assert_eq!(config.php.realpath_cache_size.as_deref(), Some("32M"));
+        assert_eq!(config.php.realpath_cache_ttl, Some(900));
+        assert_eq!(config.php.zend_assertions, Some(0));
     }
 
     #[test]

@@ -50,6 +50,49 @@ raw speed — with a bonus that on container/overlay/network filesystems the
 `stat()` savings are larger, and in immutable-container deploys (files can't
 change) validation is pure waste.
 
+## Resource-aware autotuning (`ephpm serve`, planned for v0.5.0)
+
+> **Planned for v0.5.0 — not in v0.4.x.**
+
+The deploys-are-events model has a sibling: *right-size the runtime to the box
+it lands on*. A deploy is an event, and so is the pod it lands in — a 320 MiB /
+0.25-CPU sidecar and a 4 GiB / 4-CPU node run the **same image** but should not
+run the same `php.ini`. Hand-tuning OPcache SHM, the per-request `memory_limit`,
+and buffer sizes per environment is exactly the kind of drift that immutable
+images are supposed to kill.
+
+On boot, `ephpm serve` reads the container's CPU quota and memory limit the
+same cgroup-aware way `worker_count` already does (cgroup v2 `memory.max` →
+v1 `memory.limit_in_bytes` → `/proc/meminfo` `MemTotal`), then derives a tuned
+profile:
+
+- **OPcache SHM** (`opcache.memory_consumption`) tracks ~18% of the memory
+  budget, clamped `[64, 512]` MB — big enough for large frameworks, never
+  starving a tiny pod's page cache.
+- **Per-request `memory_limit`** is `(budget − opcache_shm − ~64 MB overhead)
+  / worker_count`, floored at `128 MB`, so N concurrent requests can't
+  collectively exceed the pod's cgroup limit and get OOM-killed.
+- **Interned-strings** and **JIT buffers** scale with the SHM / budget
+  (clamped). The JIT *buffer* is sized but **JIT is left off** — it helps
+  CPU-bound work and can regress the I/O-bound request path typical of web
+  apps, so enabling it stays a deliberate, benched opt-in via `ini_overrides`.
+- **`realpath_cache_size=16M` / `ttl=600`** and **`zend.assertions=-1`**
+  (compiled out) are the standard production values; dev keeps PHP-friendly
+  defaults.
+
+Every directive resolves through **explicit `[php]` config → derived → PHP
+default**, so you can pin exactly the one knob you care about
+(`opcache_memory_consumption = 256`) and let the rest auto-tune, with
+`ini_overrides` as the final escape hatch. Serve startup logs one INFO line
+showing what was detected and derived (pinned values marked `*`):
+
+```
+autotune (serve): cpu_quota=0.25 mem=320MiB (cgroup v2) -> workers=1[cgroup_quota] opcache.memory_consumption=64MB memory_limit=192M interned=8MB jit_buffer=32MB (buffer-only, jit off) max_files=20000 realpath=16M/ttl=600 validate_timestamps=0 assertions=-1
+```
+
+See the [config reference](/reference/config/#resource-aware-autotuning) for
+the full formula table and every knob.
+
 ## Requirements
 
 - ePHPm **≥ 0.4.0**, `[php] mode = "fpm"` (the default — see

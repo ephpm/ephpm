@@ -126,9 +126,17 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_execution_time` | u32 (sec) | `30` | PHP `max_execution_time` per request. |
-| `memory_limit` | string | `"128M"` | PHP `memory_limit`. |
+| `memory_limit` | string | `"128M"` | PHP `memory_limit`. Serves as the dev-mode value and the ultimate fallback; in serve mode it is superseded by the auto-derived per-request limit (see `php_memory_limit` and [Resource-aware autotuning](#resource-aware-autotuning)). |
 | `opcache_validate_timestamps` | bool | (mode default) | Override `opcache.validate_timestamps`. **Planned for v0.5.0.** Unset resolves per mode: **off** (`0`) under `ephpm serve` (trust the cache — refresh code with `ephpm deploy` / `ephpm cache reset`), **on** (`1`) under `ephpm dev` (instant edit-refresh). Set `true`/`false` to force a value in either mode. See the [deploy guide](/guides/opcache-cluster-invalidation/) for the deploys-are-events contract. |
 | `opcache_revalidate_freq` | u32 (sec) | (none → PHP default `2`) | Override `opcache.revalidate_freq`. **Planned for v0.5.0.** Only meaningful when timestamp validation is on: how often (at most) the engine re-`stat()`s a cached script. Raising it (e.g. `60`) cuts `stat()` traffic on overlay/network filesystems at the cost of slower edit pickup. Ignored when validation is off. |
+| `opcache_memory_consumption` | u32 (MB) | (auto-derived) | Override `opcache.memory_consumption`. **Planned for v0.5.0.** Unset → auto-derived in serve mode (~18% of the detected memory budget, clamped `[64, 512]` MB); dev keeps PHP's 128 MB. See [Resource-aware autotuning](#resource-aware-autotuning). |
+| `opcache_interned_strings_buffer` | u32 (MB) | (auto-derived) | Override `opcache.interned_strings_buffer`. **Planned for v0.5.0.** Unset → auto-derived (~1 MB per 16 MB of opcache SHM, clamped `[8, 64]` MB) in serve mode; PHP default in dev. |
+| `opcache_jit_buffer_size` | u32 (MB) | (auto-derived) | Override `opcache.jit_buffer_size`. **Planned for v0.5.0.** Unset → auto-sized (~1/64 of memory, clamped `[32, 64]` MB) in serve mode. **Sizes the buffer only — JIT is NOT auto-enabled** (`opcache.jit` stays at PHP's default; opt in via `ini_overrides`). JIT helps CPU-bound work but can regress I/O-bound web apps, so auto-enable is a separate benched decision. |
+| `opcache_max_accelerated_files` | u32 | `20000` (serve) | Override `opcache.max_accelerated_files`. **Planned for v0.5.0.** A generous **fixed** default in serve mode (PHP default in dev). Deliberately *not* derived from memory — the right value is shaped by how many `.php` files the app has, not the machine size. |
+| `php_memory_limit` | string | (auto-derived) | Override the per-request `memory_limit`, taking precedence over `memory_limit` **and** the derivation. **Planned for v0.5.0.** Unset → serve mode derives `(memory_budget − opcache_shm − ~64 MB overhead) / worker_count`, floored at `128 MB`; with no detectable memory budget it keeps PHP's `128M`. Dev keeps `memory_limit`. |
+| `realpath_cache_size` | string | `16M` (serve) | Override `realpath_cache_size`. **Planned for v0.5.0.** Serve uses `16M` (vs PHP's `256K`) to cut `realpath()`/`stat()` traffic on deep autoload trees; dev keeps the PHP default so new files resolve instantly. |
+| `realpath_cache_ttl` | u32 (sec) | `600` (serve) | Override `realpath_cache_ttl`. **Planned for v0.5.0.** Serve uses `600` (vs PHP's `120`); dev keeps the PHP default. |
+| `zend_assertions` | i8 | `-1` (serve) / `1` (dev) | Override `zend.assertions`. **Planned for v0.5.0.** Serve uses `-1` (assertions compiled out — zero runtime cost, production-recommended); dev uses `1` (assertions active). Set `-1`/`0`/`1` to pin. |
 | `ini_file` | path | (none) | Custom `php.ini` loaded before `ini_overrides`. |
 | `ini_overrides` | array of `[string, string]` | `[]` | INI directives applied after `ini_file`. In worker mode, `log_errors=On` is seeded as a default before `ini_file`/`ini_overrides` (either can override it) so worker-script fatals reach the engine log — `display_errors` output is captured into a buffer that is discarded when no request is in flight. |
 | `extensions` | array of string | `[]` | Shared PHP extensions loaded at startup as `extension=` lines in the generated php.ini, emitted **before** `ini_file`/`ini_overrides`. Bare names (`"redis"`) use PHP's `extension_dir` search; paths load verbatim. Must match the embedded PHP's ABI: same PHP minor, ZTS (Linux/macOS) / NTS (Windows), glibc on Linux — PHP reports a mismatch at startup. Note distro/[Sury](https://deb.sury.org/) extension packages are NTS-only (no ZTS variants as of July 2026) — on Linux, compile the extension for ZTS (phpize/gcc against matching ZTS headers). Empty entries fail validation. See the [PHP Extensions guide](/guides/php-extensions/). |
@@ -143,6 +151,48 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 | `worker_stream_threshold` | u64 (bytes) | `1048576` (1 MiB) | Request-body size at/above which the body **streams** into the worker in fixed-size chunks instead of buffering whole (Phase 3). Requests with a `Content-Length` at/above this — or with no `Content-Length` (chunked) — flow through `Envelope::bodyStream()` / PHP's POST reader with flat worker memory (a multi-GB upload never materializes in RAM). Smaller bodies stay buffered. Worker mode only. |
 
 > **Worker mode is not supported with `[server] sites_dir`** (multi-tenant vhosting) in Phase 1 — config load hard-errors. Worker mode boots one framework per worker; per-host worker pools are a later phase.
+
+### Resource-aware autotuning
+
+> **Planned for v0.5.0.**
+
+On boot, `ephpm serve` detects the container's CPU and memory limits (cgroup-aware) and derives a tuned set of PHP/OPcache ini defaults sized to the box it is actually running on. This is the *deploys-are-events, right-size-the-runtime* story: you ship the same image to a 320 MiB / 0.25-CPU pod and a 4 GiB / 4-CPU node, and each one sizes OPcache, the per-request memory limit, interned-string and JIT buffers, and the realpath cache to fit — without a per-environment config file.
+
+**Detection (Linux):**
+
+1. **CPU quota** — cgroup v2 `cpu.max`, else v1 `cpu.cfs_quota_us`/`cpu.cfs_period_us`. `None` when unlimited. (Already drives `worker_count`.)
+2. **Memory budget** — cgroup v2 `/sys/fs/cgroup/memory.max`, else v1 `memory.limit_in_bytes`; `"max"`/the unlimited sentinel means no limit, in which case ePHPm falls back to total system memory (`/proc/meminfo` `MemTotal`). No new crate — it reads the same cgroupfs/`/proc` files as the CPU path.
+
+Non-Linux platforms have no cgroup limit and keep PHP defaults for memory-shaped knobs.
+
+**Derivation (serve mode):**
+
+| Directive | Formula | Clamp |
+|-----------|---------|-------|
+| `opcache.memory_consumption` | ~18% of memory budget | `[64, 512]` MB |
+| `opcache.interned_strings_buffer` | ~1 MB per 16 MB of opcache SHM | `[8, 64]` MB |
+| `opcache.jit_buffer_size` | ~1/64 of memory budget (**JIT stays off**) | `[32, 64]` MB |
+| `opcache.max_accelerated_files` | fixed `20000` (app-shaped, not memory-shaped) | — |
+| `memory_limit` (per request) | `(budget − opcache_shm − ~64 MB overhead) / worker_count` | floor `128` MB |
+| `realpath_cache_size` | `16M` | — |
+| `realpath_cache_ttl` | `600` | — |
+| `zend.assertions` | `-1` (compiled out) | — |
+
+Dev mode (`ephpm dev` / bare `ephpm`) derives none of these: it keeps PHP-friendly defaults (timestamp validation on, assertions on, loose realpath) so the edit-refresh loop stays tight.
+
+**Resolution precedence (per directive):** explicit `[php]` value → auto-derived → PHP stock default. Pin any single knob (e.g. `opcache_memory_consumption = 256`) and the rest keep auto-tuning. `ini_overrides` still layers last as the ultimate escape hatch.
+
+**Transparency:** serve startup logs one INFO line summarizing what was detected and derived, marking any explicitly-pinned value with a `*`. Example for a 320 MiB / 0.25-CPU pod:
+
+```
+autotune (serve): cpu_quota=0.25 mem=320MiB (cgroup v2) -> workers=1[cgroup_quota] opcache.memory_consumption=64MB memory_limit=192M interned=8MB jit_buffer=32MB (buffer-only, jit off) max_files=20000 realpath=16M/ttl=600 validate_timestamps=0 assertions=-1
+```
+
+and for a 4 GiB / 4-CPU node:
+
+```
+autotune (serve): cpu_quota=4.00 mem=4096MiB (cgroup v2) -> workers=4[cgroup_quota] opcache.memory_consumption=512MB memory_limit=880M interned=32MB jit_buffer=64MB (buffer-only, jit off) max_files=20000 realpath=16M/ttl=600 validate_timestamps=0 assertions=-1
+```
 
 ## `[db]`
 

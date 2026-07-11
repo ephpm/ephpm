@@ -655,8 +655,12 @@ fn run_with_config(
     // on under dev) and is always emitted into the generated ini, so ini
     // generation is now unconditional. The other flags below still document
     // *why* generation would be needed even absent the opcache line.
-    let opcache_ini_lines = config.php.opcache_ini_lines(dev_mode);
-    let validate_timestamps = config.php.effective_validate_timestamps(dev_mode);
+    // Resolve the full resource-aware autotuning profile once: it feeds both
+    // the generated php.ini (opcache/memory/realpath/assertions lines) and the
+    // startup autotune summary log below.
+    let autotune = config.php.autotune(dev_mode);
+    let opcache_ini_lines = autotune.ini_lines();
+    let validate_timestamps = autotune.validate_timestamps.value;
     // [php] extensions also forces ini generation: `extension=` lines only
     // take effect when PHP parses them during MINIT, same as the overrides.
     let want_generated_ini = !opcache_ini_lines.is_empty()
@@ -718,6 +722,12 @@ fn run_with_config(
         } else {
             (config.php.ini_file.clone(), None)
         };
+
+    // Resource-aware autotuning: log the detected CPU/memory budget and the
+    // derived (or explicitly-pinned) PHP/OPcache profile at INFO. Trust
+    // requires visibility — an operator must be able to see exactly what
+    // ePHPm sized itself to and which values they overrode (marked `*`).
+    tracing::info!("{}", autotune.summary_line());
 
     // State the OPcache staleness contract at startup so operators know how
     // code changes reach a running server. Under serve mode with validation
