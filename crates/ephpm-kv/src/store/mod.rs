@@ -994,13 +994,18 @@ impl Store {
         // still cheap under a large index.
         let mut hints_to_prune = Vec::new();
 
-        // Iterate the TTL hint set. Bounded by sample_size for the reap
-        // budget; we intentionally allow the loop to run past the reap
-        // budget in the hint-pruning direction because those are also
-        // amortised-O(1) map ops. `DashSet` iterates by-value refs, so
-        // `hint` is a `RefMulti` yielding the &String key.
-        for hint in self.ttl_keys.iter() {
-            if removed >= sample_size {
+        // Iterate the TTL hint set, bounding TOTAL work per pass by
+        // `sample_size` — not just the reap count. Every visited hint is one
+        // `data.get()` plus, potentially, a prune. If we capped only the reap
+        // count, a large stale-hint population (mass `persist()` after mass
+        // `expire()` leaves the index full of hints whose entries no longer
+        // carry a TTL) would keep `removed` at 0 and scan the entire index —
+        // reintroducing the O(ttl_keys.len()) stall this index exists to
+        // avoid. Stale hints instead drain incrementally across successive
+        // passes. `DashSet` iterates by-value refs, so `hint` is a `RefMulti`
+        // yielding the &String key.
+        for (visited, hint) in self.ttl_keys.iter().enumerate() {
+            if removed >= sample_size || visited >= sample_size {
                 break;
             }
             let key: &String = hint.key();
@@ -2385,6 +2390,35 @@ mod tests {
         assert_eq!(s.ttl_keys.len(), 0, "expire_pass must self-heal stale hints");
         // The persistent key must NOT be removed.
         assert!(s.exists("persistent"));
+    }
+
+    #[test]
+    fn expire_pass_bounds_total_work_under_stale_hints() {
+        // A large stale-hint population (mass persist() after mass expire()
+        // leaves the index full of hints whose entries no longer carry a TTL)
+        // must NOT make one pass O(ttl_keys.len()). With sample_size = 10 and
+        // 100 all-stale hints, a single pass visits at most 10 and prunes at
+        // most 10 — it does not drain all 100 in one shot (that would be the
+        // O(n) stall the index exists to avoid). Successive passes drain them.
+        let s = test_store();
+        for i in 0..100 {
+            s.ttl_keys.insert(format!("ghost{i}")); // dead hints: no backing entry
+        }
+        assert_eq!(s.ttl_keys.len(), 100);
+
+        let reaped = s.expire_pass(10);
+        assert_eq!(reaped, 0, "no live TTL'd keys → nothing to reap");
+        assert!(
+            s.ttl_keys.len() >= 90,
+            "one pass must be bounded by sample_size, not prune all hints; left {}",
+            s.ttl_keys.len()
+        );
+
+        // Self-healing across passes: repeated bounded passes drain the index.
+        for _ in 0..20 {
+            s.expire_pass(10);
+        }
+        assert_eq!(s.ttl_keys.len(), 0, "successive passes must drain stale hints");
     }
 
     #[test]
