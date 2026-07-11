@@ -11,7 +11,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer};
 
-/// Global allocator override for the ephpm binary.
+/// Global allocator override for the ephpm binary (Unix only).
 ///
 /// mimalloc gives lower allocator contention and better locality than the
 /// default system allocator under the ePHPm workload profile (many small,
@@ -23,6 +23,10 @@ use tracing_subscriber::{EnvFilter, Layer};
 /// retaining freed pages for reuse than the default allocator, so RSS
 /// looks larger at steady state. This is normal — track it against the
 /// 320 MiB target and adjust with `MIMALLOC_PURGE_DELAY` if needed.
+///
+/// Windows uses the system allocator — see the Cargo.toml comment on the
+/// mimalloc dep for the MSVC `/MD` vs PHP-SDK `/MT` link mismatch.
+#[cfg(unix)]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
