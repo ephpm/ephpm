@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
@@ -142,7 +142,14 @@ impl MySqlProxy {
         let db_url = Arc::new(DbUrl::parse(url)?);
 
         // Establish a single connection to capture server metadata.
-        let (probe_stream, meta) = connect_and_handshake(&db_url).await?;
+        //
+        // Under k8s/systemd startup ordering the backend may not be reachable
+        // yet — the proxy used to bail immediately and stay dead for the
+        // process lifetime, requiring a manual restart after the DB came up.
+        // Bounded exponential backoff (250ms doubling to 8s, ~10 tries,
+        // ~30s total) makes the proxy resilient to a slow-to-start backend
+        // without wedging on a genuine misconfiguration.
+        let (probe_stream, meta) = connect_with_retry(&db_url, "MySQL").await?;
         let meta = Arc::new(meta);
 
         // Build the primary pool using clones of the URL and meta for closures.
@@ -329,6 +336,81 @@ impl MySqlProxy {
 }
 
 // ── Backend connection & auth ─────────────────────────────────────────────────
+
+/// Bounded exponential backoff wrapper around [`connect_and_handshake`].
+///
+/// Attempts the initial connect + handshake with increasing delays between
+/// tries so a slow-to-start backend (k8s/systemd ordering) doesn't kill the
+/// proxy on process startup. Retries approximately: 250ms, 500ms, 1s, 2s,
+/// 4s, 8s, 8s, 8s, 8s (10 attempts, ~40s total).
+///
+/// Constants chosen to keep the total bounded without introducing a new
+/// config knob (this is a reliability paper cut, not an operator dial).
+/// Errors are logged at INFO for the first few attempts, WARN thereafter.
+///
+/// `db_kind` is a short label ("MySQL", "PostgreSQL") used only for logs.
+async fn connect_with_retry(
+    url: &DbUrl,
+    db_kind: &str,
+) -> Result<(TcpStream, ServerMeta), DbError> {
+    const MAX_ATTEMPTS: u32 = 10;
+    const INITIAL_BACKOFF_MS: u64 = 250;
+    const MAX_BACKOFF_MS: u64 = 8_000;
+
+    let mut backoff_ms = INITIAL_BACKOFF_MS;
+    let mut last_err: Option<DbError> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match connect_and_handshake(url).await {
+            Ok(ok) => {
+                if attempt > 1 {
+                    info!(
+                        db = db_kind,
+                        attempt,
+                        addr = %url.addr(),
+                        "backend connection established after retry"
+                    );
+                }
+                return Ok(ok);
+            }
+            Err(e) => {
+                let is_last = attempt == MAX_ATTEMPTS;
+                if is_last {
+                    warn!(
+                        db = db_kind,
+                        attempt,
+                        addr = %url.addr(),
+                        error = %e,
+                        "backend still unreachable after max retries; giving up"
+                    );
+                } else if attempt >= 3 {
+                    warn!(
+                        db = db_kind,
+                        attempt,
+                        addr = %url.addr(),
+                        error = %e,
+                        backoff_ms,
+                        "backend connect failed; retrying"
+                    );
+                } else {
+                    info!(
+                        db = db_kind,
+                        attempt,
+                        addr = %url.addr(),
+                        error = %e,
+                        backoff_ms,
+                        "backend not yet reachable; retrying"
+                    );
+                }
+                last_err = Some(e);
+                if !is_last {
+                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                    backoff_ms = (backoff_ms.saturating_mul(2)).min(MAX_BACKOFF_MS);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or(DbError::Auth("connect_with_retry: no attempt recorded".into())))
+}
 
 /// Connect to the `MySQL` backend and complete the authentication handshake.
 ///
@@ -666,9 +748,27 @@ async fn handle_caching_sha2_more_data(
             }
 
             // The response is the public key in PEM format (0x01 prefix + PEM data).
-            // For non-TLS connections, we need to encrypt the password with it.
-            // As a simpler fallback: send the password as null-terminated plaintext.
-            // This works over local/trusted connections (which is our proxy use case).
+            //
+            // KNOWN GAP: the correct wire behaviour for non-TLS caching_sha2
+            // full-auth is to XOR the null-terminated password with the
+            // 20-byte scramble (repeated to cover the plaintext length) and
+            // RSA-PKCS1-OAEP encrypt the result under the server's public
+            // key, then send the ciphertext. The current implementation
+            // sends the password as null-terminated plaintext instead —
+            // this works when the backend is on a trusted network (our
+            // loopback proxy pool, the common ePHPm deployment), but any
+            // operator running the pool over a non-loopback network gets
+            // plaintext password exposure on the *initial* cache-miss
+            // connect. Fast-auth caches the password hash on the backend
+            // so subsequent connects skip this branch, bounding the
+            // exposure to first-connect-per-user.
+            //
+            // Full RSA-OAEP is a follow-up PR: it needs the `rsa` and
+            // `sha1` crates (sha1 is already a transitive dep, rsa is
+            // new + license-clean but nontrivial to license-audit for
+            // cargo deny) plus integration tests against a real MySQL 8.4
+            // instance to catch OAEP padding edge cases. Deferred to the
+            // DB-auth harness cycle.
             let mut pwd_bytes = password.as_bytes().to_vec();
             pwd_bytes.push(0);
             write_packet(stream, key_seq + 1, &pwd_bytes).await?;
@@ -693,19 +793,68 @@ async fn handle_caching_sha2_more_data(
 
 // ── Client greeting & handshake ───────────────────────────────────────────────
 
+/// Global counter mixed into every challenge to guarantee inter-connection
+/// uniqueness without touching the OS clock or the allocator.
+///
+/// The old code called `Arc::new(())` on every connect just to grab an
+/// allocation-address hash — that's an allocator round trip per client
+/// connection on a hot path. A relaxed atomic increment is nanoseconds.
+static CHALLENGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide seed for the challenge PRNG. Initialised lazily on first
+/// use with the same time-based mix the old code did, then reused across
+/// every call. Consumers don't rely on this being cryptographically
+/// unpredictable — see the security note on `fresh_challenge`.
+static CHALLENGE_SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Cheap xorshift64* step for the challenge PRNG. Not for cryptographic
+/// use — the security note on `fresh_challenge` explains why that's fine.
+#[inline]
+fn xorshift64_star(state: u64) -> u64 {
+    let mut x = state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+}
+
 /// Generate a non-cryptographic 20-byte challenge for the fake client greeting.
 ///
 /// Security note: the proxy does not validate client auth responses (local
 /// loopback only), so this challenge value has no security significance.
+///
+/// # Performance
+///
+/// The previous implementation called `SystemTime::now()` (a syscall) plus
+/// `Arc::new(())` (an allocator round-trip) plus a raw-pointer cast on every
+/// client connect. Replaced with a self-seeded xorshift64* PRNG mixed with a
+/// process-wide atomic counter — no syscalls, no allocations, no unsafe.
 fn fresh_challenge() -> [u8; 20] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    // Lazy seed: on first call mix the wall clock, PID, and a stack address
+    // to break same-boot-second collisions when many processes come up
+    // together. After that every call is atomic-load + a few shifts.
+    let seed = *CHALLENGE_SEED.get_or_init(|| {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+        let stack_probe = std::ptr::from_ref::<u8>(&0u8) as usize as u64;
+        u64::from(ts.subsec_nanos())
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(ts.as_secs())
+            .wrapping_add(stack_probe)
+            .wrapping_add(u64::from(std::process::id()))
+            .max(1) // xorshift needs a non-zero state
+    });
+
+    let ctr = CHALLENGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut state = seed ^ ctr.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+
     let mut c = [0u8; 20];
-    c[..8].copy_from_slice(&ts.as_secs().to_ne_bytes());
-    c[8..12].copy_from_slice(&ts.subsec_nanos().to_ne_bytes());
-    // Mix in the task ID hash for uniqueness across concurrent connections.
-    let ptr = Arc::as_ptr(&Arc::new(())) as usize;
-    c[12..20].copy_from_slice(&ptr.to_ne_bytes());
+    for chunk in c.chunks_mut(8) {
+        state = xorshift64_star(state.max(1));
+        let bytes = state.to_ne_bytes();
+        let take = chunk.len().min(bytes.len());
+        chunk[..take].copy_from_slice(&bytes[..take]);
+    }
     c
 }
 
@@ -980,6 +1129,33 @@ pub enum QueryKind {
     TxEnd,
 }
 
+/// Case-insensitive ASCII substring search that does **not** allocate.
+///
+/// Equivalent to `haystack.to_ascii_uppercase().contains(needle)` when
+/// `needle` is already uppercase, but scans in place. Used on the hot
+/// routing path where classify runs per client command.
+fn contains_ascii_ignore_case(haystack: &str, needle_upper: &str) -> bool {
+    let hb = haystack.as_bytes();
+    let nb = needle_upper.as_bytes();
+    if nb.is_empty() {
+        return true;
+    }
+    if hb.len() < nb.len() {
+        return false;
+    }
+    let max_start = hb.len() - nb.len();
+    'outer: for i in 0..=max_start {
+        for (j, &nch) in nb.iter().enumerate() {
+            let hch = hb[i + j].to_ascii_uppercase();
+            if hch != nch {
+                continue 'outer;
+            }
+        }
+        return true;
+    }
+    false
+}
+
 /// Classify a SQL query based on its first keyword.
 #[must_use]
 pub fn classify_mysql_query(sql: &str) -> QueryKind {
@@ -989,9 +1165,14 @@ pub fn classify_mysql_query(sql: &str) -> QueryKind {
 
     match tok.as_str() {
         "SELECT" | "SHOW" | "EXPLAIN" | "DESCRIBE" | "DESC" => {
-            // Special case: SELECT ... FOR UPDATE or SELECT ... FOR SHARE → Write
-            if sql.to_ascii_uppercase().contains("FOR UPDATE")
-                || sql.to_ascii_uppercase().contains("FOR SHARE")
+            // Special case: SELECT ... FOR UPDATE or SELECT ... FOR SHARE → Write.
+            //
+            // Old hotpath: `sql.to_ascii_uppercase()` allocated a fresh String
+            // on every classify call, twice (once per contains). Case-insensitive
+            // substring scan avoids both allocations — this runs on every client
+            // command via the routing loop.
+            if contains_ascii_ignore_case(sql, "FOR UPDATE")
+                || contains_ascii_ignore_case(sql, "FOR SHARE")
             {
                 QueryKind::Write
             } else {
@@ -1794,5 +1975,63 @@ mod tests {
             health_check_interval: std::time::Duration::from_secs(30),
         };
         Pool::new(config, connect, reset, ping)
+    }
+
+    // ── contains_ascii_ignore_case (classify hot-path helper) ────────
+
+    #[test]
+    fn contains_ascii_ignore_case_matches_mixed_case() {
+        assert!(contains_ascii_ignore_case("select * from t for update", "FOR UPDATE"));
+        assert!(contains_ascii_ignore_case("SELECT ... For Update", "FOR UPDATE"));
+        assert!(contains_ascii_ignore_case("SELECT ... FOR share", "FOR SHARE"));
+    }
+
+    #[test]
+    fn contains_ascii_ignore_case_rejects_when_absent() {
+        assert!(!contains_ascii_ignore_case("SELECT * FROM t", "FOR UPDATE"));
+        assert!(!contains_ascii_ignore_case("", "FOR UPDATE"));
+    }
+
+    #[test]
+    fn contains_ascii_ignore_case_empty_needle_matches() {
+        assert!(contains_ascii_ignore_case("anything", ""));
+        assert!(contains_ascii_ignore_case("", ""));
+    }
+
+    #[test]
+    fn classify_select_for_update_still_write_after_trim() {
+        // Regression guard: the alloc-free contains helper must preserve the
+        // exact classification the old `to_ascii_uppercase().contains(...)`
+        // pair produced.
+        assert_eq!(
+            classify_mysql_query("SELECT * FROM t WHERE id = 1 FOR UPDATE"),
+            QueryKind::Write
+        );
+        assert_eq!(classify_mysql_query("select id from t for share"), QueryKind::Write);
+        assert_eq!(classify_mysql_query("SELECT * FROM t"), QueryKind::Read);
+    }
+
+    // ── fresh_challenge ─────────────────────────────────────────────
+
+    #[test]
+    fn fresh_challenge_produces_unique_values() {
+        // The atomic counter guarantees each call yields a distinct challenge.
+        // (The old ptr-of-fresh-Arc pattern didn't reliably differ across
+        // calls on the same allocator.)
+        let a = fresh_challenge();
+        let b = fresh_challenge();
+        let c = fresh_challenge();
+        assert_ne!(a, b, "consecutive challenges must differ");
+        assert_ne!(b, c, "consecutive challenges must differ");
+        assert_eq!(a.len(), 20);
+    }
+
+    #[test]
+    fn fresh_challenge_is_nonzero() {
+        // Sanity: 20-byte all-zero challenges are technically valid but a
+        // strong smell of a broken PRNG. A well-mixed xorshift should
+        // essentially never produce all zeros.
+        let c = fresh_challenge();
+        assert!(c.iter().any(|&b| b != 0), "challenge should not be all zeros");
     }
 }
