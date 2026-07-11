@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 pub use entry::Entry;
 use tracing::{debug, trace};
 
@@ -169,6 +169,26 @@ pub struct Store {
     data: DashMap<String, Entry>,
     /// Hash values stored separately to avoid Entry enum complexity.
     hashes: DashMap<String, HashEntry>,
+    /// Set of keys whose entries currently have a non-`None` `expires_at`.
+    ///
+    /// # Why a side index
+    ///
+    /// The periodic [`expire_pass`](Self::expire_pass) used to iterate the
+    /// entire `data` map calling `is_expired` on every entry — O(all keys)
+    /// under memory pressure even when only a few percent had TTLs. Session
+    /// stores, rate-limit counters, and cache keys typically fit this
+    /// pattern (small TTL'd subset alongside a much larger persistent set).
+    ///
+    /// This set is maintained by every write path: `set_local`,
+    /// `expire_local`, `persist`, `remove_local`, `incr_by_with_ttl` for
+    /// create-with-ttl, and `flush`. It is treated as a **hint** — the
+    /// authoritative TTL check is still `Entry::is_expired`, so a
+    /// stale/false-positive entry in the set just costs an extra map lookup
+    /// (the pass re-checks and removes if the entry no longer has a TTL).
+    ///
+    /// Complexity: `expire_pass` cost drops from O(data.len()) to
+    /// O(ttl_keys.len() + reaped) per invocation.
+    ttl_keys: DashSet<String>,
     /// Approximate total memory used by all entries.
     mem_used: AtomicUsize,
     /// Store configuration.
@@ -191,6 +211,7 @@ impl std::fmt::Debug for Store {
         f.debug_struct("Store")
             .field("data_len", &self.data.len())
             .field("hashes_len", &self.hashes.len())
+            .field("ttl_keys_len", &self.ttl_keys.len())
             .field("mem_used", &self.mem_used.load(Ordering::Relaxed))
             .field("config", &self.config)
             .field("replicator_installed", &self.replicator.read().is_ok_and(|g| g.is_some()))
@@ -206,6 +227,7 @@ impl Store {
         Arc::new(Self {
             data: DashMap::new(),
             hashes: DashMap::new(),
+            ttl_keys: DashSet::new(),
             mem_used: AtomicUsize::new(0),
             config,
             replicator: std::sync::RwLock::new(None),
@@ -409,6 +431,7 @@ impl Store {
         };
 
         let new_size = entry.mem_size;
+        let has_ttl = entry.expires_at.is_some();
 
         // Remove old entry first so we can reclaim its memory.
         if let Some((_, old)) = self.data.remove(&key) {
@@ -417,10 +440,22 @@ impl Store {
 
         // Check memory limit before inserting.
         if !self.ensure_memory(new_size) {
+            // Old TTL-index entry (if any) was already stripped by the remove
+            // above via the same-key insert below not happening; ensure the
+            // hint doesn't linger on a rejected write.
+            self.ttl_keys.remove(&key);
             return false;
         }
 
         self.mem_add(new_size);
+        // Maintain the TTL side index: add on TTL'd writes, remove on the
+        // TTL-less overwrite of a previously-TTL'd key. Set-membership is
+        // idempotent so a re-write with the same TTL state is a no-op.
+        if has_ttl {
+            self.ttl_keys.insert(key.clone());
+        } else {
+            self.ttl_keys.remove(&key);
+        }
         self.data.insert(key, entry);
         true
     }
@@ -482,9 +517,10 @@ impl Store {
             return false;
         }
 
+        let has_ttl = new_entry.expires_at.is_some();
         // Atomic check-and-insert. The shard write lock held by `entry()`
         // serialises concurrent set_nx calls for this key.
-        match self.data.entry(key) {
+        let (inserted, key_ref) = match self.data.entry(key) {
             dashmap::Entry::Occupied(mut occ) => {
                 if !occ.get().is_expired() {
                     // Lost the race; another writer landed first. We
@@ -497,15 +533,25 @@ impl Store {
                 // replace it.
                 self.mem_sub(occ.get().mem_size);
                 self.mem_add(new_size);
+                let k = occ.key().clone();
                 occ.insert(new_entry);
-                true
+                (true, k)
             }
             dashmap::Entry::Vacant(vac) => {
                 self.mem_add(new_size);
+                let k = vac.key().clone();
                 vac.insert(new_entry);
-                true
+                (true, k)
+            }
+        };
+        if inserted {
+            if has_ttl {
+                self.ttl_keys.insert(key_ref);
+            } else {
+                self.ttl_keys.remove(&key_ref);
             }
         }
+        inserted
     }
 
     /// Remove a key, returning `true` if it existed. Removes from both
@@ -526,6 +572,10 @@ impl Store {
     pub fn remove_local(&self, key: &str) -> bool {
         let string_removed = if let Some((_, old)) = self.data.remove(key) {
             self.mem_sub(old.mem_size);
+            // Keep the TTL hint set consistent — a false positive would just
+            // cost `expire_pass` a dead lookup, but strict consistency here
+            // keeps the set size proportional to live TTL'd keys.
+            self.ttl_keys.remove(key);
             true
         } else {
             false
@@ -555,6 +605,10 @@ impl Store {
                 return false;
             }
             entry.expires_at = Some(Instant::now() + ttl);
+            drop(entry);
+            // Track this key in the TTL side index so the periodic
+            // expire_pass scans only TTL'd keys instead of the whole map.
+            self.ttl_keys.insert(key.to_string());
             true
         } else {
             false
@@ -573,6 +627,12 @@ impl Store {
             }
             let had_ttl = entry.expires_at.is_some();
             entry.expires_at = None;
+            drop(entry);
+            if had_ttl {
+                // Key no longer has a TTL — drop from the side index so
+                // `expire_pass` doesn't waste a lookup on it.
+                self.ttl_keys.remove(key);
+            }
             had_ttl
         } else {
             false
@@ -908,6 +968,7 @@ impl Store {
     pub fn flush(&self) {
         self.data.clear();
         self.hashes.clear();
+        self.ttl_keys.clear();
         self.mem_used.store(0, Ordering::Relaxed);
     }
 
@@ -915,20 +976,60 @@ impl Store {
 
     /// Run a single pass of lazy expiration, removing up to `sample_size`
     /// expired keys. Called periodically by the background task.
+    ///
+    /// # Performance
+    ///
+    /// Iterates over the TTL side index [`ttl_keys`](Self::ttl_keys) instead
+    /// of the whole `data` map — O(TTL'd keys) rather than O(all keys). The
+    /// side index is a *hint*: an entry might have had its TTL cleared by
+    /// `persist` between insertion and the pass, or the key might already
+    /// have been reaped by a concurrent `get`/`remove`. The authoritative
+    /// check remains `Entry::is_expired`; false-positive hints just cost an
+    /// extra map lookup and get pruned in-band.
     pub fn expire_pass(&self, sample_size: usize) -> usize {
         let mut removed = 0;
         let mut keys_to_remove = Vec::new();
+        // Also drop hint entries whose underlying key no longer exists or no
+        // longer has a TTL. Bounded by the same sample budget so the pass is
+        // still cheap under a large index.
+        let mut hints_to_prune = Vec::new();
 
-        for entry in &self.data {
+        // Iterate the TTL hint set. Bounded by sample_size for the reap
+        // budget; we intentionally allow the loop to run past the reap
+        // budget in the hint-pruning direction because those are also
+        // amortised-O(1) map ops. `DashSet` iterates by-value refs, so
+        // `hint` is a `RefMulti` yielding the &String key.
+        for hint in self.ttl_keys.iter() {
             if removed >= sample_size {
                 break;
             }
-            if entry.value().is_expired() {
-                keys_to_remove.push(entry.key().clone());
-                removed += 1;
+            let key: &String = hint.key();
+            match self.data.get(key) {
+                Some(entry) => {
+                    // Authoritative TTL check.
+                    if entry.expires_at.is_none() {
+                        // persist() cleared the TTL after the hint was
+                        // added — drop the stale hint.
+                        let stale = key.clone();
+                        drop(entry);
+                        hints_to_prune.push(stale);
+                    } else if entry.is_expired() {
+                        let expired = key.clone();
+                        drop(entry);
+                        keys_to_remove.push(expired);
+                        removed += 1;
+                    }
+                }
+                None => {
+                    // Entry already reaped elsewhere; the hint is dead.
+                    hints_to_prune.push(key.clone());
+                }
             }
         }
 
+        for key in &hints_to_prune {
+            self.ttl_keys.remove(key);
+        }
         for key in &keys_to_remove {
             // Lazy-expiry cleanup: local only. Replicas run their own
             // expire_pass on the same TTLs.
@@ -1458,6 +1559,9 @@ mod tests {
             0,
         );
         s.data.insert("expired".into(), entry);
+        // The direct data.insert bypasses set_local's TTL-index maintenance;
+        // plant the hint by hand so the pass sees the entry.
+        s.ttl_keys.insert("expired".into());
         s.set("alive".into(), b"v".to_vec(), None);
         let reaped = s.expire_pass(100);
         assert_eq!(reaped, 1);
@@ -1611,16 +1715,20 @@ mod tests {
             eviction_policy: EvictionPolicy::AllKeysLru,
             compression: CompressionConfig::default(),
         });
-        // Insert 3 keys with small sleeps to get different timestamps.
+        // Insert 3 keys with sleeps larger than LRU_TOUCH_GRANULARITY_NANOS
+        // (100ms). Below that granularity `touch` skips the store — LRU
+        // semantics are documented to be preserved *at 100ms granularity*.
         s.set("oldest".into(), vec![1u8; 50], None);
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(150));
         s.set("middle".into(), vec![2u8; 50], None);
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(150));
         s.set("newest".into(), vec![3u8; 50], None);
+        std::thread::sleep(Duration::from_millis(150));
 
-        // Touch "oldest" to refresh its LRU timestamp.
+        // Touch "oldest" to refresh its LRU timestamp past the coarse
+        // granularity window.
         let _ = s.get("oldest");
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(150));
 
         // Force eviction with a large write.
         assert!(s.set("trigger".into(), vec![4u8; 200], None));
@@ -2140,6 +2248,194 @@ mod tests {
         assert!(s.expire("k", Duration::from_secs(60)));
         assert!(s.remove("k"));
         assert_eq!(s.get("k"), None);
+    }
+
+    // ── Coarse-clock LRU touch ──────────────────────────────────────
+
+    #[test]
+    fn coarse_touch_skips_store_within_granularity() {
+        // Touches within the granularity window must NOT advance the
+        // timestamp — that's the whole point of the coarse-clock filter
+        // (skip the cache-line RMW on hot GETs). Uses touch_precise to
+        // plant an exact baseline, then verifies that a same-timestamp
+        // touch is a no-op.
+        use crate::store::entry::LRU_TOUCH_GRANULARITY_NANOS;
+        let s = test_store();
+        s.set("k".into(), b"v".to_vec(), None);
+        let entry = s.data.get("k").unwrap();
+        // Plant a baseline nanos value.
+        entry.touch_precise(1_000_000_000);
+        // A touch with the same value must not change anything.
+        entry.touch(1_000_000_000);
+        assert_eq!(entry.last_accessed_nanos(), 1_000_000_000);
+        // A touch just below the granularity window must also be a no-op.
+        entry.touch(1_000_000_000 + LRU_TOUCH_GRANULARITY_NANOS - 1);
+        assert_eq!(entry.last_accessed_nanos(), 1_000_000_000);
+    }
+
+    #[test]
+    fn coarse_touch_advances_after_granularity() {
+        use crate::store::entry::LRU_TOUCH_GRANULARITY_NANOS;
+        let s = test_store();
+        s.set("k".into(), b"v".to_vec(), None);
+        let entry = s.data.get("k").unwrap();
+        entry.touch_precise(1_000_000_000);
+        // A touch past the granularity window updates the stamp.
+        entry.touch(1_000_000_000 + LRU_TOUCH_GRANULARITY_NANOS);
+        assert_eq!(entry.last_accessed_nanos(), 1_000_000_000 + LRU_TOUCH_GRANULARITY_NANOS);
+    }
+
+    #[test]
+    fn coarse_touch_preserves_eviction_ordering() {
+        // The LRU eviction test at "allkeys_lru_evicts_oldest_accessed_key"
+        // uses 10ms sleeps between operations which is below the 100ms
+        // granularity — but with a get() following a sleep, the elapsed
+        // now_nanos IS pushed past the granularity. Verify a similar
+        // scenario at coarse-clock scale: touch a "cold" key past the
+        // granularity and confirm it survives eviction.
+        let s = Store::new(StoreConfig {
+            memory_limit: 900,
+            eviction_policy: EvictionPolicy::AllKeysLru,
+            compression: CompressionConfig::default(),
+        });
+        s.set("oldest".into(), vec![1u8; 50], None);
+        std::thread::sleep(Duration::from_millis(150));
+        s.set("middle".into(), vec![2u8; 50], None);
+        std::thread::sleep(Duration::from_millis(150));
+        s.set("newest".into(), vec![3u8; 50], None);
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Touch oldest — past coarse granularity, so the store lands.
+        let _ = s.get("oldest");
+        std::thread::sleep(Duration::from_millis(150));
+
+        assert!(s.set("trigger".into(), vec![4u8; 200], None));
+        assert!(s.get("middle").is_none(), "middle should be evicted (untouched, oldest access)");
+        assert!(s.get("oldest").is_some(), "oldest should survive (was touched past granularity)");
+    }
+
+    // ── TTL side index (expire_pass optimization) ───────────────────
+
+    #[test]
+    fn ttl_keys_populated_on_set_with_ttl() {
+        let s = test_store();
+        s.set("volatile".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
+        assert!(s.ttl_keys.contains("volatile"), "TTL'd key must appear in the side index");
+        s.set("permanent".into(), b"v".to_vec(), None);
+        assert!(
+            !s.ttl_keys.contains("permanent"),
+            "persistent key must NOT appear in the side index"
+        );
+    }
+
+    #[test]
+    fn ttl_keys_removed_on_persist() {
+        let s = test_store();
+        s.set("k".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
+        assert!(s.ttl_keys.contains("k"));
+        assert!(s.persist("k"), "persist must succeed for a TTL'd key");
+        assert!(!s.ttl_keys.contains("k"), "persist must drop the key from the TTL index");
+    }
+
+    #[test]
+    fn ttl_keys_added_on_expire() {
+        let s = test_store();
+        s.set("k".into(), b"v".to_vec(), None);
+        assert!(!s.ttl_keys.contains("k"));
+        assert!(s.expire("k", Duration::from_secs(60)));
+        assert!(s.ttl_keys.contains("k"), "expire must add the key to the TTL index");
+    }
+
+    #[test]
+    fn ttl_keys_removed_on_remove() {
+        let s = test_store();
+        s.set("k".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
+        assert!(s.ttl_keys.contains("k"));
+        s.remove("k");
+        assert!(!s.ttl_keys.contains("k"), "remove must drop the TTL index entry");
+    }
+
+    #[test]
+    fn ttl_keys_flushed_on_flush() {
+        let s = test_store();
+        s.set("a".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
+        s.set("b".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
+        assert_eq!(s.ttl_keys.len(), 2);
+        s.flush();
+        assert_eq!(s.ttl_keys.len(), 0, "flush must clear the TTL index");
+    }
+
+    #[test]
+    fn expire_pass_prunes_stale_ttl_hints() {
+        // If a hint outlives its underlying entry (e.g. remove_local was
+        // racing with the pass) or the entry lost its TTL via persist,
+        // expire_pass must self-heal by dropping the stale hint. Plant
+        // both scenarios by hand and confirm the pass cleans up.
+        let s = test_store();
+        // Case 1: hint points at a key that no longer exists.
+        s.ttl_keys.insert("ghost".into());
+        // Case 2: hint points at a key whose TTL was cleared.
+        s.set("persistent".into(), b"v".to_vec(), None);
+        s.ttl_keys.insert("persistent".into()); // stale hint
+        assert_eq!(s.ttl_keys.len(), 2);
+
+        let reaped = s.expire_pass(100);
+        assert_eq!(reaped, 0, "no live TTL'd keys → nothing to reap");
+        // Both stale hints must be pruned.
+        assert_eq!(s.ttl_keys.len(), 0, "expire_pass must self-heal stale hints");
+        // The persistent key must NOT be removed.
+        assert!(s.exists("persistent"));
+    }
+
+    #[test]
+    fn expire_pass_only_visits_ttl_keys() {
+        // Regression on the O(all keys) → O(TTL keys) win: with 100
+        // persistent keys and 1 TTL'd expired key, the pass reaps the
+        // expired one without touching the persistents. This is a
+        // behavioural test — full complexity proof needs the bench harness.
+        let s = test_store();
+        for i in 0..100 {
+            s.set(format!("perm{i}"), b"v".to_vec(), None);
+        }
+        // Plant one already-expired TTL'd entry via the public API — then
+        // hand-manipulate the entry's expires_at into the past.
+        s.set("expired".into(), b"v".to_vec(), Some(Duration::from_millis(1)));
+        // The 1ms TTL is a legitimate expiry; sleep past it.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let reaped = s.expire_pass(100);
+        assert_eq!(reaped, 1);
+        assert!(!s.exists("expired"));
+        for i in 0..100 {
+            assert!(s.exists(&format!("perm{i}")), "perm{i} must survive expire_pass");
+        }
+    }
+
+    #[test]
+    fn ttl_keys_stays_consistent_across_overwrite_state_changes() {
+        // A key initially TTL'd, then overwritten without TTL, must be
+        // dropped from the index. And back the other way.
+        let s = test_store();
+        s.set("k".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
+        assert!(s.ttl_keys.contains("k"));
+
+        // Overwrite without TTL — must clear the hint.
+        s.set("k".into(), b"v2".to_vec(), None);
+        assert!(!s.ttl_keys.contains("k"), "overwrite w/o TTL must clear the hint");
+
+        // Overwrite with TTL — must re-add.
+        s.set("k".into(), b"v3".to_vec(), Some(Duration::from_secs(30)));
+        assert!(s.ttl_keys.contains("k"), "overwrite w/ TTL must re-add the hint");
+    }
+
+    #[test]
+    fn set_nx_maintains_ttl_index() {
+        let s = test_store();
+        assert!(s.set_nx("k1".into(), b"v".to_vec(), Some(Duration::from_secs(60))));
+        assert!(s.ttl_keys.contains("k1"), "set_nx with TTL must add the hint");
+
+        assert!(s.set_nx("k2".into(), b"v".to_vec(), None));
+        assert!(!s.ttl_keys.contains("k2"), "set_nx without TTL must not add the hint");
     }
 
     #[test]
