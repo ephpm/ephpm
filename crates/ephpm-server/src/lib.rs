@@ -197,9 +197,16 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         metric_label_series_max: config.db.analysis.metric_label_series_max,
     });
 
+    // Bind the HTTP listeners BEFORE constructing DB proxies: proxy startup
+    // now retries a down backend with backoff (up to ~40s per proxy), and if
+    // that ran first the listen sockets wouldn't exist yet — long enough for
+    // orchestrator TCP readiness probes to kill the pod. With the sockets
+    // bound, probes pass and connections queue in the accept backlog while
+    // the proxies come up. Hard proxy errors still fail startup.
+    let listeners = bind_listeners(&config, kv_store, metrics_handle, middleware_chain).await?;
+
     let _db_handles = start_db_proxies(&config, cluster_handle.as_ref(), &query_stats).await?;
 
-    let listeners = bind_listeners(&config, kv_store, metrics_handle, middleware_chain).await?;
     accept_loop(listeners).await
 }
 
