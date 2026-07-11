@@ -532,6 +532,13 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         tokio::select! {
             result = main.accept() => {
                 let (stream, remote_addr) = result.context("failed to accept connection")?;
+                // HTTP responses (JSON APIs, small pages, 304s) are frequently
+                // sub-MSS; without nodelay, Nagle holds the response tail until
+                // the client ACKs, which delayed-ACK defers ~40ms — surfacing as
+                // p50 latency under keep-alive/concurrency. hyper's server does
+                // not set this; the KV RESP listener already does for the same
+                // reason (ephpm-kv server.rs).
+                let _ = stream.set_nodelay(true);
                 let guard = acquire_connection(&limiter, &stream, remote_addr).await;
                 dispatch_main_connection(
                     stream, remote_addr, &tls_mode, tls_listener.is_some(),
@@ -543,6 +550,9 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
                 tls_listener.as_ref().expect("guarded by is_some").accept().await
             }, if tls_listener.is_some() => {
                 let (stream, remote_addr) = result.context("failed to accept TLS connection")?;
+                // Same rationale as the plain-HTTP accept above; set on the raw
+                // TCP stream before the TLS handshake wraps it.
+                let _ = stream.set_nodelay(true);
                 let guard = acquire_connection(&limiter, &stream, remote_addr).await;
                 dispatch_tls_connection(stream, remote_addr, &tls_mode, conn, &router, guard, &in_flight);
             }
