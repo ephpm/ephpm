@@ -7,6 +7,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(php_linked)");
     println!("cargo::rerun-if-changed=wrapper.h");
     println!("cargo::rerun-if-changed=ephpm_wrapper.c");
+    println!("cargo::rerun-if-changed=resolver_shim.c");
     println!("cargo::rerun-if-env-changed=PHP_SDK_PATH");
 
     println!(
@@ -312,6 +313,16 @@ fn compile_wrapper(include_dir: &Path, target_os: &str) {
         .include(&include_zend)
         .include(&include_tsrm)
         .include(&include_sapi);
+
+    // ext/standard/dns.c inside libphp.a references the underscored resolver
+    // names (__dn_expand, __dn_skipname, __res_nsearch). Ubuntu 22.04+
+    // (glibc 2.35+) drops the unversioned compat aliases; newer linkers
+    // (rust-lld, GNU ld ≥ 2.38) won't silently match the unversioned refs to
+    // the versioned `__dn_expand@GLIBC_2.2.5`. resolver_shim.c provides
+    // tail-call wrappers on Linux only.
+    if target_os == "linux" {
+        build.file("resolver_shim.c");
+    }
 
     // PHP headers use GNU extensions (memrchr, mempcpy). Define _GNU_SOURCE
     // on every Unix target so the libc headers expose the declarations.
