@@ -49,10 +49,18 @@ jobs:
             image: latest
             triple: x86_64-unknown-linux-gnu
             sdk: linux-x86_64
+            lto: fat
           - runner: arm64
             image: latest-arm64
             triple: aarch64-unknown-linux-gnu
             sdk: linux-aarch64
+            # Thin LTO on arm64: the fat-LTO final link of the ephpm binary
+            # (libphp.a + ICU + everything, codegen-units=1) exceeds the
+            # arm64 build host's memory — rustc gets SIGKILLed by the OOM
+            # killer even running as the only job. Thin LTO cuts link-time
+            # memory to a fraction for a ~1% perf delta on a target where
+            # we publish no benchmark numbers anyway.
+            lto: thin
     steps:
       - uses: actions/checkout@v4
 
@@ -69,6 +77,10 @@ jobs:
           echo "EPHPM_RELEASE_VERSION=${REF_NAME#v}" >> "$GITHUB_ENV"
 
       - name: Build ephpm
+        env:
+          # Overrides profile.release.lto from Cargo.toml per-arch (see the
+          # matrix `lto` values — arm64 must use thin to fit in host memory).
+          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.arch.lto }}
         run: cargo xtask release ${{ matrix.php.minor }}
 
       - name: Package archive
