@@ -391,7 +391,7 @@ fn run_dev(
     }
 
     print_dev_banner(&config);
-    run_with_config(config, verbose)
+    run_with_config(config, verbose, true)
 }
 
 /// Pretty banner printed once at dev-server startup. Stdout, not tracing,
@@ -552,14 +552,24 @@ impl Drop for TempFileGuard {
 fn run_serve_sync(command: Option<Commands>) -> anyhow::Result<ExitCode> {
     // Load config first (before tracing) so we can use the configured log level.
     let (config, verbose) = load_serve_config(command)?;
-    run_with_config(config, verbose)
+    run_with_config(config, verbose, false)
 }
 
 /// Shared HTTP server startup path used by both `serve` (production) and
 /// `dev` (developer) entry points. Initialises tracing, applies PHP ini
 /// overrides, boots the embedded PHP runtime in single-threaded mode, then
 /// hands off to the tokio-driven HTTP loop.
-fn run_with_config(config: ephpm_config::Config, verbose: u8) -> anyhow::Result<ExitCode> {
+///
+/// `dev_mode` is `true` on the `ephpm dev` / bare-`ephpm` path and `false` on
+/// `ephpm serve`. It only affects the OPcache timestamp-validation default:
+/// serve trusts the cache (`validate_timestamps=0`, invalidate via
+/// `ephpm deploy`), dev stat-refreshes every request (`validate_timestamps=1`).
+/// An explicit `[php] opcache_validate_timestamps` overrides either way.
+fn run_with_config(
+    config: ephpm_config::Config,
+    verbose: u8,
+    dev_mode: bool,
+) -> anyhow::Result<ExitCode> {
     // Resolve log level: RUST_LOG > -v flag > config > "info"
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         let level = match verbose {
@@ -641,9 +651,20 @@ fn run_with_config(config: ephpm_config::Config, verbose: u8) -> anyhow::Result<
     // diagnostic anywhere — display_errors output is captured into a buffer
     // that is discarded when no request is in flight.
     let worker_mode = config.php.mode == "worker";
+    // OPcache timestamp-validation default is mode-dependent (off under serve,
+    // on under dev) and is always emitted into the generated ini, so ini
+    // generation is now unconditional. The other flags below still document
+    // *why* generation would be needed even absent the opcache line.
+    // Resolve the full resource-aware autotuning profile once: it feeds both
+    // the generated php.ini (opcache/memory/realpath/assertions lines) and the
+    // startup autotune summary log below.
+    let autotune = config.php.autotune(dev_mode);
+    let opcache_ini_lines = autotune.ini_lines();
+    let validate_timestamps = autotune.validate_timestamps.value;
     // [php] extensions also forces ini generation: `extension=` lines only
     // take effect when PHP parses them during MINIT, same as the overrides.
-    let want_generated_ini = !config.php.ini_overrides.is_empty()
+    let want_generated_ini = !opcache_ini_lines.is_empty()
+        || !config.php.ini_overrides.is_empty()
         || !config.php.extensions.is_empty()
         || vhost_disable_shell
         || worker_mode;
@@ -677,6 +698,12 @@ fn run_with_config(config: ephpm_config::Config, verbose: u8) -> anyhow::Result<
                     content.push('\n');
                 }
             }
+            // OPcache timestamp-validation default (mode-dependent) + optional
+            // revalidate_freq. Before ini_overrides so an operator can still
+            // force a different value through ini_overrides if they insist.
+            for (k, v) in &opcache_ini_lines {
+                let _ = writeln!(content, "{k}={v}");
+            }
             for [k, v] in &config.php.ini_overrides {
                 let _ = writeln!(content, "{k}={v}");
             }
@@ -695,6 +722,40 @@ fn run_with_config(config: ephpm_config::Config, verbose: u8) -> anyhow::Result<
         } else {
             (config.php.ini_file.clone(), None)
         };
+
+    // Resource-aware autotuning: log the detected CPU/memory budget and the
+    // derived (or explicitly-pinned) PHP/OPcache profile at INFO. Trust
+    // requires visibility — an operator must be able to see exactly what
+    // ePHPm sized itself to and which values they overrode (marked `*`).
+    tracing::info!("{}", autotune.summary_line());
+
+    // State the OPcache staleness contract at startup so operators know how
+    // code changes reach a running server. Under serve mode with validation
+    // off, the ONLY way to refresh cached code is `ephpm deploy` /
+    // `ephpm cache reset` — which write through the RESP listener. If that
+    // listener is disabled there is no invalidation lever at all, so warn
+    // loudly rather than let an operator get stuck with frozen code.
+    if validate_timestamps {
+        tracing::info!(
+            "opcache timestamp validation ON ({} mode); code changes are picked \
+             up automatically",
+            if dev_mode { "dev" } else { "serve" }
+        );
+    } else {
+        tracing::info!(
+            "opcache timestamp validation OFF (serve mode); code changes require \
+             `ephpm deploy` or `ephpm cache reset`"
+        );
+        if !config.kv.redis_compat.enabled {
+            tracing::warn!(
+                "opcache timestamp validation is OFF but the RESP listener is \
+                 disabled ([kv.redis_compat] enabled = false) — `ephpm deploy` / \
+                 `ephpm cache reset` cannot reach this server, so cached code can \
+                 only be refreshed by restarting. Enable the RESP listener, or set \
+                 [php] opcache_validate_timestamps = true."
+            );
+        }
+    }
 
     // Initialize PHP BEFORE creating tokio runtime (single-threaded here).
     // finalize_for_http() disables SIGPROF so it can't crash worker threads.
