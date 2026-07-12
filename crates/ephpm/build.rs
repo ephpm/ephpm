@@ -1,5 +1,6 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn main() {
     // Declare php_linked as a known cfg so #[cfg(php_linked)] in this crate
@@ -94,6 +95,31 @@ fn main() {
         // sees the unresolved references first, then resolves them
         // from libc++.
         println!("cargo::rustc-link-arg=-lc++");
+
+        // The PHP 8.5 SDK's sqlite objects call __isPlatformVersionAtLeast
+        // (clang emits it for `if (@available(macOS ...))` guards; the
+        // 8.5.7 SDK was built with an Xcode new enough to add them for
+        // sqlite3_stmt_isexplain). That symbol lives in compiler-rt's
+        // builtins archive, NOT libSystem — and rustc links with
+        // -nodefaultlibs, which drops clang_rt from the link entirely.
+        // Ask the active Apple clang for its resource dir and link the
+        // builtins archive explicitly. Harmless when no object references
+        // the symbol (8.3/8.4 SDKs) — ld64 dead-strips it.
+        if let Ok(out) = Command::new("cc").arg("--print-resource-dir").output() {
+            if out.status.success() {
+                let resource_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let builtins = Path::new(&resource_dir).join("lib/darwin/libclang_rt.osx.a");
+                if builtins.exists() {
+                    println!("cargo::rustc-link-arg={}", builtins.display());
+                } else {
+                    println!(
+                        "cargo::warning=libclang_rt.osx.a not found under {resource_dir}; \
+                         linking may fail with undefined __isPlatformVersionAtLeast \
+                         (PHP 8.5 SDK sqlite @available guards)"
+                    );
+                }
+            }
+        }
         return;
     }
 
