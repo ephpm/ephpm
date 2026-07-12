@@ -56,7 +56,7 @@ and single-request latency); the modest RPS gain is the combined effect
 of that plus wave-1. Worker-dispatch and further items are still being
 measured — see [Findings](findings/) for what the data ruled in and out.
 
-## v0.5.0 — resource-aware autotuning (in progress)
+## v0.5.0 — resource-aware autotuning
 
 v0.5.0's headline is **container-derived PHP tuning**: on boot in serve
 mode, ePHPm reads the cgroup CPU and memory limits and derives an opcache
@@ -82,7 +82,7 @@ autotune (serve): cpu_quota=1.00 mem=512MiB (cgroup v2) ->
 config left the RESP listener disabled — correctly WARNs that
 `ephpm deploy` can't reach the server.)
 
-**Result:**
+**Result (development builds, first measurement):**
 
 | | v0.4.2 (stock ini) | v0.5.0 (autotuned) | Change |
 |---|---|---|---|
@@ -90,10 +90,21 @@ config left the RESP listener disabled — correctly WARNs that
 | p50 | 15.0 ms | 14.8 ms | −1% |
 | p99 | 20.6 ms | 19.2 ms | −7% |
 
-**+31% throughput with zero operator tuning**, driven mainly by
+**Result (confirmation against the published `ephpm/ephpm:v0.4.2-php8.4`
+release image, same fixture, v0.5.0 rebased on the v0.4.2 final tree):**
+
+| | v0.4.2 (released image) | v0.5.0 (autotuned) | Change |
+|---|---|---|---|
+| RPS | 816 | **1096** | **+34%** |
+| p50 | 15.8 ms | 15.5 ms | −2% |
+| p99 | 38.9 ms | **20.0 ms** | **−49%** |
+
+**+31–34% throughput with zero operator tuning**, driven mainly by
 `validate_timestamps=0` eliminating ~300 `stat()` syscalls per request on
 this include-heavy workload, plus the realpath cache and compiled-out
-assertions.
+assertions. The p99 halving in the confirmation run is the same effect
+seen through the tail: with per-request stats gone, the slow requests
+stop queueing behind metadata I/O.
 
 **Honest bounds:** this app is deliberately near the *upper* end of what
 autotuning buys (300 includes/request). A single-file `hello.php` shows
