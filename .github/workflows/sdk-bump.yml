@@ -1,0 +1,177 @@
+name: SDK Bump
+
+# Opens a pin-bump PR when a new, COMPLETE PHP SDK release exists at
+# ephpm/php-sdk. Auto-PR ONLY — merging stays manual (auto-merge is Phase 3,
+# explicitly out of scope).
+#
+# Trigger paths:
+#   - repository_dispatch (sdk-release-complete): receiving side of the
+#     Phase 3 plumbing. Nothing sends this event yet — php-sdk's
+#     watch-php.yml cannot fire cross-repo repository_dispatch with its
+#     default GITHUB_TOKEN; that needs a GitHub App token (Phase 3).
+#   - workflow_dispatch (php_version): manual bump for a specific version.
+#   - daily schedule: reconciliation — polls php-sdk releases and discovers
+#     complete SDKs the pins have not caught up to. Until Phase 3 wires the
+#     cross-repo dispatch, this poll is the primary discovery path.
+#
+# Token note: the default GITHUB_TOKEN can push branches and open PRs in
+# this repo, but PRs it opens do NOT trigger CI workflows (GitHub's
+# recursion guard). Until the Phase 3 App token replaces it, close/reopen
+# the PR or push an empty commit to get a CI run.
+
+on:
+  repository_dispatch:
+    types: [sdk-release-complete]
+  workflow_dispatch:
+    inputs:
+      php_version:
+        description: "Full PHP version to check/bump to (e.g. 8.5.8). Empty = reconcile every pinned minor."
+        required: false
+        type: string
+  schedule:
+    # Daily reconciliation, offset from the top of the hour.
+    - cron: "41 5 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sdk-bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full default branch history not needed; we branch from origin/main.
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Reconcile PHP SDK pins
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SDK_REPO: ephpm/php-sdk
+          # workflow_dispatch input, or the repository_dispatch payload
+          # (client_payload.php_version), or empty = reconcile all minors.
+          EXPLICIT_VERSION: ${{ inputs.php_version || github.event.client_payload.php_version || '' }}
+        run: |
+          set -u
+
+          fail() { echo "::error::$*"; exit 1; }
+
+          # The SDK platform tarballs ephpm consumes. Keep in sync with
+          # ephpm/php-sdk versions.json (.platforms_required) — hardcoded
+          # here because this job runs from a bare ephpm checkout and the
+          # manifest lives in the other repo.
+          REQUIRED_PLATFORMS="linux-x86_64-gnu linux-aarch64-gnu macos-aarch64 windows-x86_64"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Current pins, parsed from the PHP_SDK_VERSIONS table:
+          #   ("8.3", "8.3.31") -> "8.3 8.3.31" per line.
+          pins=$(grep -oE '\("8\.[0-9]+", "8\.[0-9]+\.[0-9]+"\)' xtask/src/main.rs \
+            | tr -d '()",')
+          [ -n "$pins" ] || fail "could not parse PHP_SDK_VERSIONS from xtask/src/main.rs"
+          echo "current pins:"; echo "$pins" | sed 's/^/  /'
+
+          rc=0
+          # Read the pin list on fd 3 so commands inside the loop (cargo,
+          # gh, git) can't swallow the remaining lines from stdin.
+          while read -r minor current <&3; do
+            # Resolve the candidate version for this minor.
+            if [ -n "$EXPLICIT_VERSION" ]; then
+              case "$EXPLICIT_VERSION" in
+                "$minor".*) latest="$EXPLICIT_VERSION" ;;
+                *) continue ;;
+              esac
+            else
+              latest=$(gh release list --repo "$SDK_REPO" --limit 200 \
+                --json tagName --jq '.[].tagName' \
+                | grep -E "^v${minor//./\\.}\.[0-9]+$" | sed 's/^v//' \
+                | sort -V | tail -1)
+              if [ -z "$latest" ]; then
+                echo "==> ${minor}: no SDK releases found — skipping"
+                continue
+              fi
+            fi
+
+            # Pin already current (or ahead — never downgrade)?
+            if [ "$latest" = "$current" ] || \
+               [ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -1)" != "$latest" ]; then
+              echo "==> ${minor}: pin ${current} is current (newest SDK: ${latest})"
+              continue
+            fi
+            echo "==> ${minor}: pin ${current} is outdated; newest SDK is ${latest}"
+
+            # Completeness gate: every required platform tarball must be
+            # attached to the SDK release before we bump to it.
+            assets=$(gh api "repos/${SDK_REPO}/releases/tags/v${latest}" \
+              --jq '.assets[].name' 2>/dev/null || true)
+            [ -n "$assets" ] || { echo "    v${latest} release/tag not found — skipping"; continue; }
+            missing=""
+            for plat in $REQUIRED_PLATFORMS; do
+              echo "$assets" | grep -qxF "php-sdk-${latest}-${plat}.tar.gz" \
+                || missing="$missing $plat"
+            done
+            if [ -n "$missing" ]; then
+              echo "    v${latest} is INCOMPLETE (missing:${missing}) — not bumping"
+              continue
+            fi
+
+            # Marker-branch idempotency (no labels by design): one branch
+            # per target version. Skip if the branch or an open PR exists.
+            branch="bump/php-${latest}"
+            if [ "$(gh pr list --head "$branch" --state open --json number --jq length)" != "0" ]; then
+              echo "    open PR from ${branch} already exists — skipping"
+              continue
+            fi
+            if git ls-remote --exit-code origin "refs/heads/${branch}" >/dev/null 2>&1; then
+              echo "    branch ${branch} already exists on origin — skipping"
+              continue
+            fi
+
+            echo "    creating ${branch} and bumping pins..."
+            git checkout -B "$branch" origin/main
+            cargo run -q -p xtask -- bump-php-pin "$minor" "$latest" \
+              || fail "cargo xtask bump-php-pin ${minor} ${latest} failed"
+
+            git add xtask/src/main.rs .github/workflows/release.yml \
+              docker/Dockerfile site/content/developer/architecture-overview.md
+            git commit -m "chore(php): bump PHP ${minor} pin to ${latest}" \
+              || fail "nothing to commit after bump-php-pin — pin sites out of sync?"
+            git push origin "$branch" || fail "pushing ${branch} failed"
+
+            body_file=$(mktemp)
+            {
+              echo "Automated pin bump: PHP ${minor} \`${current}\` -> \`${latest}\`."
+              echo
+              echo "SDK release: https://github.com/${SDK_REPO}/releases/tag/v${latest}"
+              echo
+              echo "Asset inventory on \`v${latest}\` (all required platforms verified present):"
+              echo '```'
+              echo "$assets"
+              echo '```'
+              echo
+              echo "Opened by \`sdk-bump.yml\`. Auto-PR only — review and merge manually"
+              echo "(auto-merge is Phase 3). Note: PRs opened with the default"
+              echo "GITHUB_TOKEN do not trigger CI; close/reopen or push to the"
+              echo "branch to get a run."
+            } > "$body_file"
+            gh pr create --base main --head "$branch" \
+              --title "chore(php): bump PHP ${minor} pin to ${latest}" \
+              --body-file "$body_file" \
+              || fail "opening PR for ${branch} failed"
+            echo "    PR opened for ${branch}"
+
+            # Back to a clean base for the next minor.
+            git checkout --detach origin/main
+          done 3<<EOF
+          $pins
+          EOF
+
+          exit "$rc"
