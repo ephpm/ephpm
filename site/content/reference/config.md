@@ -220,6 +220,7 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `path` | string | `"ephpm.db"` | SQLite database file path. |
+| `engine` | string | `"sqlite"` | **Experimental knob.** `"sqlite"` = the genuine SQLite C engine (default, production-supported). `"turso"` = the [Turso Database](https://github.com/tursodatabase/turso) engine (Rust rewrite of SQLite, **Beta upstream — experimental, not for production data**; single-node only, rejected at startup in clustered mode; `VACUUM` and multi-process access unsupported). See the [Turso engine roadmap](/roadmap/turso-engine/). |
 
 #### `[db.sqlite.proxy]`
 
