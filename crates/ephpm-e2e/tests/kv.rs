@@ -268,3 +268,117 @@ async fn kv_overwrite_returns_latest() {
         "get after overwrite must return the latest value"
     );
 }
+
+// ── ephpm_kv_wait (blocking versioned wait) ─────────────────────────────
+//
+// The fixture's `wait` op passes `val` as last_version and `ttl` as the
+// timeout in MILLISECONDS, printing "timeout" or "<version>:<value>".
+
+#[tokio::test]
+async fn kv_wait_zero_returns_snapshot_immediately() {
+    let base = required_env("EPHPM_URL");
+
+    let (s, _) = kv(&base, "op=set&key=wait_snap&val=hello&ttl=0").await;
+    assert_eq!(s, 200);
+
+    // last_version=0 registers the watch and snapshots without blocking,
+    // even with a long timeout.
+    let start = std::time::Instant::now();
+    let (s, body) = kv(&base, "op=wait&key=wait_snap&val=0&ttl=10000").await;
+    assert_eq!(s, 200);
+    let (ver, value) = body
+        .split_once(':')
+        .unwrap_or_else(|| panic!("expected '<version>:<value>', got {body:?}"));
+    assert!(ver.parse::<u64>().unwrap() >= 1, "version must be >= 1, got {ver}");
+    assert_eq!(value, "hello");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "snapshot wait must not block for the full timeout"
+    );
+}
+
+#[tokio::test]
+async fn kv_wait_times_out_without_writes() {
+    let base = required_env("EPHPM_URL");
+
+    // Learn the current version, then wait past it with a short timeout.
+    let (_, snap) = kv(&base, "op=wait&key=wait_to&val=0&ttl=1000").await;
+    let ver = snap.split(':').next().expect("snapshot must include a version");
+
+    let start = std::time::Instant::now();
+    let (s, body) = kv(&base, &format!("op=wait&key=wait_to&val={ver}&ttl=300")).await;
+    assert_eq!(s, 200);
+    assert_eq!(body, "timeout", "no writes → wait must time out");
+    assert!(
+        start.elapsed() >= Duration::from_millis(300),
+        "timeout must not fire early"
+    );
+}
+
+#[tokio::test]
+async fn kv_wait_wakes_on_concurrent_set() {
+    let base = required_env("EPHPM_URL");
+
+    let (s, _) = kv(&base, "op=set&key=wait_wake&val=old&ttl=0").await;
+    assert_eq!(s, 200);
+    let (_, snap) = kv(&base, "op=wait&key=wait_wake&val=0&ttl=1000").await;
+    let ver: u64 = snap
+        .split(':')
+        .next()
+        .and_then(|v| v.parse().ok())
+        .expect("snapshot must include a version");
+
+    // Start a long wait on one connection, then write from another.
+    let waiter = {
+        let base = base.clone();
+        tokio::spawn(async move {
+            kv(&base, &format!("op=wait&key=wait_wake&val={ver}&ttl=15000")).await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let write_at = std::time::Instant::now();
+    let (s, _) = kv(&base, "op=set&key=wait_wake&val=new&ttl=0").await;
+    assert_eq!(s, 200);
+
+    let (s, body) = waiter.await.expect("waiter task must not panic");
+    let wake_latency = write_at.elapsed();
+    assert_eq!(s, 200);
+    let (new_ver, value) = body
+        .split_once(':')
+        .unwrap_or_else(|| panic!("expected '<version>:<value>', got {body:?}"));
+    assert!(new_ver.parse::<u64>().unwrap() > ver, "version must advance past {ver}");
+    assert_eq!(value, "new", "waiter must observe the written value");
+    // The whole point vs. polling: wakeup is push-driven, far below the
+    // 15 s timeout (generous bound for CI jitter).
+    assert!(
+        wake_latency < Duration::from_secs(5),
+        "wakeup took {wake_latency:?} — should be push-driven, not timeout-driven"
+    );
+}
+
+#[tokio::test]
+async fn kv_wait_observes_delete_as_null() {
+    let base = required_env("EPHPM_URL");
+
+    let (s, _) = kv(&base, "op=set&key=wait_del&val=doomed&ttl=0").await;
+    assert_eq!(s, 200);
+    let (_, snap) = kv(&base, "op=wait&key=wait_del&val=0&ttl=1000").await;
+    let ver = snap.split(':').next().expect("snapshot must include a version").to_owned();
+
+    let waiter = {
+        let base = base.clone();
+        tokio::spawn(async move {
+            kv(&base, &format!("op=wait&key=wait_del&val={ver}&ttl=15000")).await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (s, _) = kv(&base, "op=del&key=wait_del").await;
+    assert_eq!(s, 200);
+
+    let (s, body) = waiter.await.expect("waiter task must not panic");
+    assert_eq!(s, 200);
+    assert!(
+        body.ends_with(":null"),
+        "deleted key must surface as '<version>:null', got {body:?}"
+    );
+}

@@ -35,10 +35,63 @@ ephpm_kv_pttl("session:abc");                  // ~60000
 // returns -1 if no expiry, -2 if missing
 ```
 
+### Blocking waits — `ephpm_kv_wait()`
+
+```php
+ephpm_kv_wait(string $key, int $last_version, int $timeout_ms): array|false
+```
+
+Blocks the calling PHP thread until `$key` is written again (its watch
+version exceeds `$last_version`) or `$timeout_ms` elapses. On change it
+returns `['value' => string|null, 'version' => int]` — `value` is `null`
+when the key was deleted or expired. On timeout it returns `false`.
+
+Semantics you can rely on:
+
+- **Versions are per-key and monotonic** for the process lifetime. They
+  only advance for writes made *after* the first wait on that key, so
+  always start the protocol with `$last_version = 0`: that first call
+  registers the watch and returns the current value + version
+  immediately (a race-free snapshot), without blocking.
+- **What bumps the version:** `set`, `setnx` (on insert), `del`, `incr`
+  / `decr` / `incr_by`, `append` (via RESP), expiry reaping, and
+  `flush_all`. TTL-only changes (`expire`) and hash-field ops (RESP
+  `HSET`/`HDEL`) do **not**.
+- **Negative arguments clamp to 0**; `$timeout_ms = 0` is a
+  non-blocking poll.
+- **Cost when unused: zero.** Writes pay a single atomic load until the
+  first `ephpm_kv_wait()` in the process; only writes to a *watched* key
+  pay a version bump + wakeup. Watch slots are never reclaimed, so wait
+  on a small set of well-known channel keys, not on unbounded
+  per-request keys.
+
+The intended use is worker-mode SSE fan-out — replacing a
+poll-and-`usleep()` loop with zero idle CPU and sub-millisecond wakeup:
+
+```php
+// One SSE connection: snapshot once, then block until state changes.
+$r = ephpm_kv_wait('board:state', 0, 0);        // register + snapshot
+send_event(render($r['value']));
+$ver = $r['version'];
+while (true) {
+    $r = ephpm_kv_wait('board:state', $ver, 15000);
+    if ($r === false) { send_keepalive(); continue; }   // timeout tick
+    $ver = $r['version'];
+    send_event(render($r['value']));
+}
+```
+
+Blocking is safe in worker mode (the wait parks that connection's
+dedicated worker thread — which is exactly what a poll loop did, minus
+the burn). In fpm mode the whole request runs under
+`[server.timeouts] request` (default 300 s), so keep `$timeout_ms` well
+below that.
+
 ### When to use SAPI
 
 - High-frequency operations (logging, hit counters, rate limit hot path)
 - Simple key/value patterns
+- Realtime push (SSE) via `ephpm_kv_wait` — there is no RESP equivalent
 - You don't care about portability to standalone Redis
 
 ## RESP protocol (Predis / phpredis)

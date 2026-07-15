@@ -137,6 +137,26 @@ pub struct EphpmKvOps {
     /// global). Backs Redis-style `FLUSHDB` / `FLUSHALL` from PHP userland.
     /// Returns 1 on success, 0 if no store is registered.
     pub flush_all: Option<unsafe extern "C" fn() -> std::os::raw::c_int>,
+
+    /// Block until the key's watch version exceeds `last_version` or
+    /// `timeout_ms` elapses (see `Store::wait_for_change`). Returns:
+    /// - `0` — timeout (or no store registered); `*new_version` untouched.
+    /// - `1` — version advanced and the key holds a value: `*new_version`
+    ///   receives the version and the value is in the thread-local get
+    ///   buffer (retrieve via `get_result`, same contract as `get`).
+    /// - `2` — version advanced but the key is absent (deleted/expired):
+    ///   `*new_version` receives the version; the get buffer is untouched.
+    ///
+    /// Blocking is safe here: callers are PHP worker OS threads or the
+    /// tokio `spawn_blocking` pool, never async tasks.
+    pub wait: Option<
+        unsafe extern "C" fn(
+            key: *const std::os::raw::c_char,
+            last_version: std::os::raw::c_longlong,
+            timeout_ms: std::os::raw::c_longlong,
+            new_version: *mut std::os::raw::c_longlong,
+        ) -> std::os::raw::c_int,
+    >,
 }
 
 // ── Callback implementations ────────────────────────────────────────────
@@ -342,6 +362,51 @@ unsafe extern "C" fn kv_flush_all() -> std::os::raw::c_int {
     1
 }
 
+#[cfg(php_linked)]
+unsafe extern "C" fn kv_wait(
+    key: *const std::os::raw::c_char,
+    last_version: std::os::raw::c_longlong,
+    timeout_ms: std::os::raw::c_longlong,
+    new_version: *mut std::os::raw::c_longlong,
+) -> std::os::raw::c_int {
+    // Safety: `key` is a null-terminated C string provided by PHP's
+    // zend_parse_parameters. Valid for the duration of this call.
+    let key_str = unsafe { CStr::from_ptr(key) };
+    let Ok(key_str) = key_str.to_str() else {
+        return 0;
+    };
+    let Some(store) = effective_store() else {
+        return 0;
+    };
+
+    // Negative inputs clamp to 0: last_version 0 = "register + snapshot",
+    // timeout 0 = non-blocking poll.
+    let last = u64::try_from(last_version).unwrap_or(0);
+    let timeout = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));
+
+    match store.wait_for_change(key_str, last, timeout) {
+        Some((version, value)) => {
+            // Safety: `new_version` points to a valid `long long` local in
+            // our C wrapper code (PHP_FUNCTION(ephpm_kv_wait)).
+            unsafe {
+                *new_version = std::os::raw::c_longlong::try_from(version).unwrap_or(i64::MAX)
+            };
+            match value {
+                Some(val) => {
+                    KV_GET_BUF.with(|buf| {
+                        let mut buf = buf.borrow_mut();
+                        buf.clear();
+                        buf.extend_from_slice(&val);
+                    });
+                    1
+                }
+                None => 2,
+            }
+        }
+        None => 0,
+    }
+}
+
 // ── Static ops table ────────────────────────────────────────────────────
 
 /// The C-compatible function pointer table, ready to pass to
@@ -358,6 +423,7 @@ pub static KV_OPS: EphpmKvOps = EphpmKvOps {
     expire: Some(kv_expire),
     pttl: Some(kv_pttl),
     flush_all: Some(kv_flush_all),
+    wait: Some(kv_wait),
 };
 
 // ── Public API ──────────────────────────────────────────────────────────
@@ -727,6 +793,96 @@ mod tests {
 
         // Reset thread-local state so it doesn't leak into other serial tests.
         set_site_store(None);
+    }
+
+    // ── kv_wait ─────────────────────────────────────────────────────────
+
+    #[test]
+    #[serial]
+    fn wait_with_zero_last_version_snapshots_immediately() {
+        let store = init_store();
+        store.set("bridge_wait_snap".into(), b"current".to_vec(), None);
+
+        let key = cstr("bridge_wait_snap");
+        let mut new_version: std::os::raw::c_longlong = 0;
+        // Safety: key and new_version are valid for the duration of the call.
+        let rc = unsafe { kv_wait(key.as_ptr(), 0, 5_000, &mut new_version) };
+        assert_eq!(rc, 1, "snapshot must report a present value");
+        assert!(new_version >= 1);
+
+        let mut ptr: *const std::os::raw::c_char = std::ptr::null();
+        let mut len: usize = 0;
+        // Safety: ptr and len are valid stack variables.
+        unsafe { kv_get_result(&mut ptr, &mut len) };
+        let got = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+        assert_eq!(got, b"current");
+    }
+
+    #[test]
+    #[serial]
+    fn wait_snapshot_on_missing_key_returns_absent() {
+        init_store();
+        let key = cstr("bridge_wait_missing");
+        let mut new_version: std::os::raw::c_longlong = 0;
+        // Safety: key and new_version are valid.
+        let rc = unsafe { kv_wait(key.as_ptr(), 0, 1_000, &mut new_version) };
+        assert_eq!(rc, 2, "missing key must report changed-but-absent");
+        assert!(new_version >= 1);
+    }
+
+    #[test]
+    #[serial]
+    fn wait_times_out_when_nothing_changes() {
+        let store = init_store();
+        store.set("bridge_wait_to".into(), b"v".to_vec(), None);
+        let key = cstr("bridge_wait_to");
+
+        // Snapshot to learn the current version.
+        let mut ver: std::os::raw::c_longlong = 0;
+        // Safety: key and ver are valid.
+        assert_eq!(unsafe { kv_wait(key.as_ptr(), 0, 1_000, &mut ver) }, 1);
+
+        // Waiting past the current version with no writes must time out.
+        let start = std::time::Instant::now();
+        let mut unused: std::os::raw::c_longlong = 0;
+        // Safety: key and unused are valid.
+        let rc = unsafe { kv_wait(key.as_ptr(), ver, 80, &mut unused) };
+        assert_eq!(rc, 0, "must time out");
+        assert!(start.elapsed() >= Duration::from_millis(80));
+    }
+
+    #[test]
+    #[serial]
+    fn wait_wakes_on_concurrent_set() {
+        let store = init_store();
+        store.set("bridge_wait_wake".into(), b"old".to_vec(), None);
+        let key = cstr("bridge_wait_wake");
+
+        let mut ver: std::os::raw::c_longlong = 0;
+        // Safety: key and ver are valid.
+        assert_eq!(unsafe { kv_wait(key.as_ptr(), 0, 1_000, &mut ver) }, 1);
+
+        let writer = {
+            let store = Arc::clone(&store);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                store.set("bridge_wait_wake".into(), b"new".to_vec(), None);
+            })
+        };
+
+        let mut new_ver: std::os::raw::c_longlong = 0;
+        // Safety: key and new_ver are valid.
+        let rc = unsafe { kv_wait(key.as_ptr(), ver, 10_000, &mut new_ver) };
+        writer.join().unwrap();
+
+        assert_eq!(rc, 1, "waiter must wake with a value");
+        assert!(new_ver > ver);
+        let mut ptr: *const std::os::raw::c_char = std::ptr::null();
+        let mut len: usize = 0;
+        // Safety: ptr and len are valid stack variables.
+        unsafe { kv_get_result(&mut ptr, &mut len) };
+        let got = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+        assert_eq!(got, b"new");
     }
 
     // ── Thread safety of the get buffer ─────────────────────────────────

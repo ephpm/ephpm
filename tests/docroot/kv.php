@@ -53,6 +53,18 @@ switch ($op) {
         }
         echo "ok";
         break;
+    case 'wait':
+        // Blocking versioned wait. val = last_version; ttl is reused as the
+        // timeout in MILLISECONDS here (unlike the seconds of the other
+        // ops). Prints "timeout" or "<version>:<value>" ("<version>:null"
+        // when the key is absent at wakeup).
+        $r = ephpm_kv_wait($key, (int) $val, $ttl);
+        if ($r === false) {
+            echo "timeout";
+        } else {
+            echo $r['version'] . ':' . ($r['value'] ?? 'null');
+        }
+        break;
     case 'mget':
         // key = "k1,k2,..."
         $out = [];

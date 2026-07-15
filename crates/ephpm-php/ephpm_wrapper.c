@@ -2233,6 +2233,11 @@ typedef struct {
     int  (*expire)(const char *key, long long ttl_ms);
     long long (*pttl)(const char *key);
     int  (*flush_all)(void);
+    /* Blocking versioned wait. Returns 0 = timeout, 1 = changed with a
+     * value (in the get_result buffer), 2 = changed but key absent.
+     * Must stay LAST-appended: the layout mirrors kv_bridge.rs. */
+    int  (*wait)(const char *key, long long last_version, long long timeout_ms,
+                 long long *new_version);
 } EphpmKvOps;
 
 static EphpmKvOps g_kv_ops = {0};
@@ -2411,6 +2416,58 @@ PHP_FUNCTION(ephpm_kv_flush_all)
     RETURN_BOOL(g_kv_ops.flush_all());
 }
 
+/* ephpm_kv_wait(string $key, int $last_version, int $timeout_ms): array|false
+ *
+ * Block until $key's watch version exceeds $last_version, or $timeout_ms
+ * elapses. On change returns ['value' => string|null, 'version' => int]
+ * ('value' is null when the key was deleted or has expired); on timeout
+ * returns false (the SSE idiom: emit a keepalive and re-wait).
+ *
+ * The version is per-key and monotonic for the process lifetime; it only
+ * advances for writes made AFTER the first wait on that key. Always seed
+ * the protocol with $last_version = 0 — that first call registers the
+ * watch and returns the current value+version immediately (race-free
+ * snapshot), never trusting a version you didn't get from a prior call.
+ * Negative $last_version/$timeout_ms are treated as 0; $timeout_ms = 0 is
+ * a non-blocking poll.
+ *
+ * Blocking is intentional and safe: in worker mode this parks the
+ * dedicated worker OS thread (the intended SSE pattern — replaces
+ * poll+usleep loops with zero idle CPU and sub-ms wakeup); in fpm mode it
+ * parks a spawn_blocking thread, so keep $timeout_ms well below
+ * [server.timeouts] request there. Watches observe string keys only
+ * (set/setnx/del/incr/decr/incr_by/append/expiry-reap/flush bump the
+ * version; hset/hdel and TTL-only changes do not). */
+PHP_FUNCTION(ephpm_kv_wait)
+{
+    char *key; size_t key_len;
+    zend_long last_version;
+    zend_long timeout_ms;
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_LONG(last_version)
+        Z_PARAM_LONG(timeout_ms)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!g_kv_ops.wait) { RETURN_FALSE; }
+
+    long long new_version = 0;
+    int rc = g_kv_ops.wait(key, (long long)last_version, (long long)timeout_ms,
+                           &new_version);
+    if (rc == 0) { RETURN_FALSE; } /* timeout */
+
+    array_init(return_value);
+    add_assoc_long(return_value, "version", (zend_long)new_version);
+    if (rc == 1) {
+        const char *ptr; size_t len;
+        g_kv_ops.get_result(&ptr, &len);
+        add_assoc_stringl(return_value, "value", ptr, len);
+    } else {
+        /* rc == 2: version advanced but the key is absent (deleted). */
+        add_assoc_null(return_value, "value");
+    }
+}
+
 /* ── Argument info for reflection (arginfo) ──────────────────── */
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_get, 0, 0, 1)
@@ -2466,6 +2523,12 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_flush_all, 0, 0, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_wait, 0, 0, 3)
+    ZEND_ARG_INFO(0, key)
+    ZEND_ARG_INFO(0, last_version)
+    ZEND_ARG_INFO(0, timeout_ms)
+ZEND_END_ARG_INFO()
+
 /* ── Function entry table (null-terminated) ──────────────────── */
 
 static const zend_function_entry ephpm_kv_functions[] = {
@@ -2481,6 +2544,7 @@ static const zend_function_entry ephpm_kv_functions[] = {
     PHP_FE(ephpm_kv_ttl,       arginfo_ephpm_kv_ttl)
     PHP_FE(ephpm_kv_pttl,      arginfo_ephpm_kv_pttl)
     PHP_FE(ephpm_kv_flush_all, arginfo_ephpm_kv_flush_all)
+    PHP_FE(ephpm_kv_wait,      arginfo_ephpm_kv_wait)
     PHP_FE_END
 };
 
