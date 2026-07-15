@@ -2,8 +2,8 @@
 
 > **Status:** the two enabling primitives — `ephpm_kv_wait()` and
 > streaming brotli compression — **shipped** (PRs
-> [#183](https://github.com/ephpm/ephpm/pull/183) and
-> [#184](https://github.com/ephpm/ephpm/pull/184)). The SSE hub
+> [#184](https://github.com/ephpm/ephpm/pull/184) and
+> [#185](https://github.com/ephpm/ephpm/pull/185)). The SSE hub
 > described in the second half is **Planned — not yet implemented**,
 > targeted at v0.6.0.
 
