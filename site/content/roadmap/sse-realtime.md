@@ -49,8 +49,9 @@ Now: `[server.response] compression_streaming = "sse"` wraps
 persists for the stream's lifetime, flushed per event so every event
 decodes the moment it arrives. Because successive re-renders of the
 same elements are nearly identical, event N compresses against events
-N−1, N−2, … and collapses to a small delta — the demo's ~5 KB grid
-re-render drops to tens of bytes after the first event. Default is
+N−1, N−2, … and collapses to a small delta — measured on the demo: a
+60 s session of ~15.6 KB re-renders averaged ~37 bytes per event on the
+wire (~420× fewer bytes; numbers in PR #185). Default is
 `"off"`, which keeps the streamed path byte-for-byte identical to
 v0.5.0. See the [configuration reference](/reference/config/).
 
