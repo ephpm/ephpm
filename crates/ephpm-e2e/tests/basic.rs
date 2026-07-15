@@ -76,3 +76,31 @@ async fn static_file_serving() {
         "expected static HTML content, got:\n{body}"
     );
 }
+
+#[tokio::test]
+async fn ob_buffer_and_shutdown_output_are_captured() {
+    // Regression: fpm-mode capture ran before PHP flushed open ob_ buffers
+    // or ran shutdown functions, so `ob_start(); echo ...` returned an
+    // empty body and WordPress 7.0 rendered every page as 0 bytes.
+    let base_url = required_env("EPHPM_URL");
+
+    let url = format!("{base_url}/ob_shutdown.php");
+    let resp = reqwest::get(&url)
+        .await
+        .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
+
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = resp.text().await.expect("failed to read response body");
+    assert!(
+        body.contains("OB_BODY_"),
+        "unclosed ob_start() content missing from body: {body:?}"
+    );
+    assert!(
+        body.contains("SHUTDOWN_RAN"),
+        "register_shutdown_function output missing from body: {body:?}"
+    );
+    assert!(
+        body.contains("OB_BODY_SHUTDOWN_RAN"),
+        "shutdown output must come after buffered body: {body:?}"
+    );
+}

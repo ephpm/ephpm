@@ -943,6 +943,39 @@ int ephpm_execute_request(const char *filename)
     }
     EG(bailout) = __orig_bailout;
 
+    /* Run user shutdown functions and flush every open output buffer
+     * BEFORE capturing the response. Request teardown is lazy (top of the
+     * NEXT ephpm_execute_request), so without this, content still sitting
+     * in userland ob_ buffers at script end — and anything printed by
+     * register_shutdown_function() — never reached the ub_write capture:
+     * `ob_start(); echo "hello";` returned content-length: 0, and
+     * WordPress 7.0 (which finalizes its template-enhancement buffer on
+     * the `shutdown` action) rendered EVERY page as 0 bytes. Mirrors the
+     * worker-mode unwind-exit flush (see the php_output_end_all block in
+     * the worker loop).
+     *
+     * Shutdown functions run even after exit()/fatals — that is php-fpm
+     * behavior and WordPress' fatal handler depends on it. Both calls run
+     * under a bailout guard (shutdown functions and ob handlers execute
+     * userland code that can exit()/fatal); a bailout forfeits whatever
+     * remained, and we deliver what the capture has — same policy as
+     * worker mode.
+     *
+     * php_free_shutdown_functions() empties the list afterwards so the
+     * lazy php_request_shutdown() at the top of the next request cannot
+     * run the same shutdown functions a second time. */
+    zend_try {
+        php_call_shutdown_functions();
+    } zend_catch {
+        /* exit()/fatal inside a shutdown function — deliver what we have. */
+    } zend_end_try();
+    php_free_shutdown_functions();
+    zend_try {
+        php_output_end_all();
+    } zend_catch {
+        /* A throwing ob handler forfeits its buffer. */
+    } zend_end_try();
+
     /* Capture response data while the request is still active */
     capture_response_headers();
     response_status_code = SG(sapi_headers).http_response_code;
