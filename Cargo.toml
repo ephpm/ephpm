@@ -82,11 +82,9 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-#
-# NOTE(feat/db-engine-turso-experimental): temporarily pinned to the
-# litewire feat/turso-backend branch head. Re-pin to litewire main once
-# ephpm/litewire#<turso-backend PR> merges.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "1cff10501350af64ef38f7fb82066a2b1a886d34", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
+# litewire main @ 0ff501e — includes the experimental turso backend
+# (ephpm/litewire#9).
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "0ff501e5767c", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #
