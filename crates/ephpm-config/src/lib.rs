@@ -904,12 +904,53 @@ pub struct ReplicationConfig {
     /// Set automatically when `role = "auto"`. Required when `role = "replica"`.
     #[serde(default)]
     pub primary_grpc_url: String,
+
+    /// **Experimental** — enable CDC-native SQLite replication with
+    /// `[db.sqlite] engine = "turso"` in clustered mode.
+    ///
+    /// Default: `false`. Setting this alongside `engine = "turso"` and
+    /// `[cluster] enabled = true` opts in to Phase 2 of the Turso engine
+    /// roadmap: litewire tails the primary's `turso_cdc` stream and
+    /// ships per-transaction batches to replicas over the CDC transport.
+    /// sqld is not spawned in this mode.
+    ///
+    /// Without this flag set, combining `engine = "turso"` with
+    /// clustered mode is a hard startup error — the flag is what
+    /// distinguishes "I know this is experimental" from a config typo.
+    ///
+    /// This knob is **strictly additive**: setting it to `false` (or
+    /// omitting it) preserves every prior release's behavior. Turning
+    /// it on selects the experimental replication path — sqld remains
+    /// the clustered default for `engine = "sqlite"`.
+    #[serde(default)]
+    pub cdc_experimental: bool,
+
+    /// **Experimental** — CDC replication TCP listen address on the
+    /// primary node.
+    ///
+    /// Only used when `cdc_experimental = true` and this node is elected
+    /// primary. Replicas connect here and stream `TxnBatch` frames.
+    /// Default: `"0.0.0.0:5015"`.
+    ///
+    /// Ignored (parsed but not acted upon) when
+    /// `cdc_experimental = false`.
+    #[serde(default = "default_cdc_listen")]
+    pub cdc_listen: String,
 }
 
 impl Default for ReplicationConfig {
     fn default() -> Self {
-        Self { role: default_replication_role(), primary_grpc_url: String::new() }
+        Self {
+            role: default_replication_role(),
+            primary_grpc_url: String::new(),
+            cdc_experimental: false,
+            cdc_listen: default_cdc_listen(),
+        }
     }
+}
+
+fn default_cdc_listen() -> String {
+    "0.0.0.0:5015".to_string()
 }
 
 /// Configuration for a single database backend (`MySQL` or `PostgreSQL`).

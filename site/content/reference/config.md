@@ -244,7 +244,9 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `role` | string | `"auto"` | `"auto"` (gossip-elected), `"primary"`, `"replica"`. |
-| `primary_grpc_url` | string | `""` | Primary gRPC URL (set automatically in `auto` mode; required for `replica`). |
+| `primary_grpc_url` | string | `""` | Primary gRPC URL (set automatically in `auto` mode; required for `replica`). In CDC-native mode (`cdc_experimental = true`) this field carries the primary's CDC TCP address instead. |
+| `cdc_experimental` | bool | `false` | **Experimental** — opt in to Phase 2 CDC-native replication (`engine = "turso"` only). See the [Turso engine roadmap](/roadmap/turso-engine/#phase-2--cdc-native-replication-experimental-implementation-available-gated-on-ga-for-default). Without this flag, `engine = "turso"` + clustered mode is a hard startup error. |
+| `cdc_listen` | string | `"0.0.0.0:5015"` | **Experimental** — TCP listen address for the CDC replication server on the primary. Ignored when `cdc_experimental = false`. |
 
 ### `[db.read_write_split]`
 

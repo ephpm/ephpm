@@ -82,9 +82,9 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire main @ 699e6345 — framework wire-compat: WP + Laravel over MySQL frontend (litewire#11)
-# (ephpm/litewire#9).
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "699e6345d539", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
+# litewire main @ 7a0b59c4 — wire-compat (litewire#11) + Phase 2 CDC
+# tail/apply API (litewire#10) + identifier-sanitization fix (litewire#12).
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "7a0b59c40ce6", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #
