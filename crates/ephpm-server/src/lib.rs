@@ -8,6 +8,7 @@ pub mod opcache;
 pub mod rate_limit;
 pub mod router;
 pub mod static_files;
+pub mod stream_compress;
 pub mod tls;
 pub mod tracked_backend;
 pub mod worker_pool;

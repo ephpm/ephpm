@@ -42,6 +42,7 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 | `compression` | bool | `true` | Enable compression for text responses — brotli when the client accepts it, gzip fallback. |
 | `compression_level` | u32 | `1` | Compression level (1=fastest, 9=best). |
 | `compression_min_size` | usize (bytes) | `1024` | Minimum response size before compression applies. |
+| `compression_streaming` | string | `"off"` | Streamed worker-response (`send_response_stream`) compression: `"off"` (identity, byte-for-byte the previous behavior), `"sse"` (brotli with a per-event flush and a stream-lifetime window for `text/event-stream` responses), `"all"` (every streamed response). Needs `compression = true` and a client `Accept-Encoding: br`; unknown values warn at startup and act as `"off"`. Buffered responses are unaffected. |
 | `headers` | array of `[string, string]` | `[]` | Custom headers added to every response. |
 
 ### `[server.static]`

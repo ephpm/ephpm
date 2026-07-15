@@ -341,7 +341,12 @@ mod tests {
 
     /// Default compression settings (disabled) for tests.
     fn no_compression() -> crate::router::CompressionSettings {
-        crate::router::CompressionSettings { enabled: false, level: 6, min_size: 1024 }
+        crate::router::CompressionSettings {
+            enabled: false,
+            level: 6,
+            min_size: 1024,
+            streaming: crate::router::StreamingCompression::Off,
+        }
     }
 
     /// Collect a response body into a `Vec<u8>`.

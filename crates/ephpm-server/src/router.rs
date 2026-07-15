@@ -45,6 +45,44 @@ pub struct CompressionSettings {
     pub level: u32,
     /// Minimum response size in bytes to compress.
     pub min_size: usize,
+    /// Streamed worker-response compression mode.
+    pub streaming: StreamingCompression,
+}
+
+/// Streamed worker-response compression mode
+/// (`[server.response] compression_streaming`).
+///
+/// Applies only to worker-mode `send_response_stream` bodies. Buffered
+/// responses keep the whole-body brotli/gzip path regardless of this
+/// setting.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum StreamingCompression {
+    /// Streamed responses pass through identity-encoded. The code path is
+    /// identical to releases before this knob existed: no encoder, task,
+    /// or extra channel is created.
+    #[default]
+    Off,
+    /// Brotli-compress streamed responses whose Content-Type is
+    /// `text/event-stream`, flushing per chunk so every SSE event decodes
+    /// as it arrives (see [`crate::stream_compress`]).
+    Sse,
+    /// Brotli-compress every streamed worker response.
+    All,
+}
+
+impl StreamingCompression {
+    /// Parse the config string (`"off"` / `"sse"` / `"all"`,
+    /// case-insensitive). Returns `None` for unknown values so the caller
+    /// can warn — a typo must never become a silent no-op.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "sse" => Some(Self::Sse),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
 }
 
 /// How long a "no site directory for this host" answer is cached
@@ -357,6 +395,17 @@ impl Router {
                 enabled: config.server.response.compression,
                 level: config.server.response.compression_level,
                 min_size: config.server.response.compression_min_size,
+                streaming: StreamingCompression::parse(
+                    &config.server.response.compression_streaming,
+                )
+                .unwrap_or_else(|| {
+                    tracing::warn!(
+                        value = %config.server.response.compression_streaming,
+                        "unknown [server.response] compression_streaming value \
+                         (expected \"off\", \"sse\", or \"all\") — falling back to \"off\""
+                    );
+                    StreamingCompression::Off
+                }),
             },
             hidden_files: config.server.static_files.hidden_files.clone(),
             cache_control: config.server.static_files.cache_control.clone(),
@@ -1425,10 +1474,17 @@ impl Router {
                 )
             }
             // Streamed response (Phase 3): flush chunks to the client as PHP
-            // produces them. No compression (would require buffering) and no
-            // content-length (unknown up front) — chunked transfer.
+            // produces them. No content-length (unknown up front) — chunked
+            // transfer. Optionally wrapped in a flush-per-chunk brotli
+            // encoder when `[server.response] compression_streaming` says so.
             ephpm_php::worker_bridge::WorkerResponse::Streaming { status, headers, body_rx } => {
-                build_streamed_worker_response(status, headers, body_rx)
+                build_streamed_worker_response(
+                    status,
+                    headers,
+                    body_rx,
+                    accepts_br,
+                    self.compression,
+                )
             }
         }
     }
@@ -1967,13 +2023,24 @@ fn stream_request_body(
 
 /// Build a chunked, streamed HTTP response from a worker-mode streaming
 /// response (Phase 3). Status + headers are known now; the body flows from the
-/// channel as PHP produces it. No compression / content-length (the length is
-/// unknown up front) — hyper uses chunked transfer encoding.
+/// channel as PHP produces it. No content-length (the length is unknown up
+/// front) — hyper uses chunked transfer encoding.
+///
+/// Compression: gated by `[server.response] compression_streaming`. With the
+/// default `Off` (or a client without `Accept-Encoding: br`, or a body PHP
+/// already encoded) the body channel is passed to hyper untouched — the exact
+/// pre-knob code path, no wrapper allocated. Otherwise the channel is wrapped
+/// in a flush-per-chunk brotli encoder task ([`crate::stream_compress`]) and
+/// `Content-Encoding: br` + `Vary: Accept-Encoding` are added.
 fn build_streamed_worker_response(
     status: u16,
     headers: Vec<(String, String)>,
     body_rx: tokio::sync::mpsc::Receiver<Bytes>,
+    accepts_br: bool,
+    compression: CompressionSettings,
 ) -> Response<ServerBody> {
+    let compress = streamed_response_wants_brotli(&headers, accepts_br, compression.streaming);
+
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
     let mut resp = Response::builder().status(status);
     for (name, value) in &headers {
@@ -1984,9 +2051,45 @@ fn build_streamed_worker_response(
         }
         resp = resp.header(name.as_str(), value.as_str());
     }
-    resp.body(body::channel_body(body_rx)).unwrap_or_else(|_| {
+
+    let body = if compress {
+        resp = resp.header("content-encoding", "br").header("vary", "Accept-Encoding");
+        body::channel_body(crate::stream_compress::brotli_stream_body(body_rx))
+    } else {
+        body::channel_body(body_rx)
+    };
+    resp.body(body).unwrap_or_else(|_| {
         error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
     })
+}
+
+/// Decide whether a streamed worker response gets the brotli wrapper.
+///
+/// Requires all of:
+/// - mode != `Off`;
+/// - the client advertised brotli support (`accepts_br` — which already
+///   folds in the master `[server.response] compression` switch);
+/// - PHP did not set its own `Content-Encoding` (never double-encode);
+/// - for `Sse` mode, a `text/event-stream` Content-Type.
+fn streamed_response_wants_brotli(
+    headers: &[(String, String)],
+    accepts_br: bool,
+    mode: StreamingCompression,
+) -> bool {
+    if mode == StreamingCompression::Off || !accepts_br {
+        return false;
+    }
+    if headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-encoding")) {
+        return false;
+    }
+    match mode {
+        StreamingCompression::Off => false,
+        StreamingCompression::All => true,
+        StreamingCompression::Sse => headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("content-type")
+                && v.trim_start().to_ascii_lowercase().starts_with("text/event-stream")
+        }),
+    }
 }
 
 fn build_php_response(
@@ -2256,7 +2359,12 @@ mod tests {
     }
 
     fn default_compression() -> CompressionSettings {
-        CompressionSettings { enabled: true, level: 1, min_size: 1024 }
+        CompressionSettings {
+            enabled: true,
+            level: 1,
+            min_size: 1024,
+            streaming: StreamingCompression::Off,
+        }
     }
 
     /// Test helper: call resolve_fallback with the router's own defaults.
@@ -2422,7 +2530,12 @@ mod tests {
 
     #[test]
     fn test_gzip_compress_custom_min_size() {
-        let settings = CompressionSettings { enabled: true, level: 1, min_size: 4096 };
+        let settings = CompressionSettings {
+            enabled: true,
+            level: 1,
+            min_size: 4096,
+            streaming: StreamingCompression::Off,
+        };
         let data = "a".repeat(2048);
         // 2048 bytes < 4096 min_size — should not compress
         assert!(gzip_compress(data.as_bytes(), "text/html", settings).is_none());
@@ -3502,5 +3615,170 @@ echo "post response";
         // Should fall back to default now.
         let (doc_root, _, _) = router.resolve_site("temp-site.com");
         assert_eq!(doc_root, dir.path());
+    }
+    // ── streaming compression (worker send_response_stream) ────────
+
+    fn compression_with(streaming: StreamingCompression) -> CompressionSettings {
+        CompressionSettings { enabled: true, level: 1, min_size: 1024, streaming }
+    }
+
+    fn sse_headers() -> Vec<(String, String)> {
+        vec![
+            ("Content-Type".to_string(), "text/event-stream".to_string()),
+            ("Cache-Control".to_string(), "no-store".to_string()),
+        ]
+    }
+
+    #[test]
+    fn streaming_compression_parse() {
+        assert_eq!(StreamingCompression::parse("off"), Some(StreamingCompression::Off));
+        assert_eq!(StreamingCompression::parse("sse"), Some(StreamingCompression::Sse));
+        assert_eq!(StreamingCompression::parse("all"), Some(StreamingCompression::All));
+        assert_eq!(StreamingCompression::parse("SSE"), Some(StreamingCompression::Sse));
+        assert_eq!(StreamingCompression::parse("gzip"), None, "unknown must not parse");
+        assert_eq!(StreamingCompression::parse(""), None);
+    }
+
+    #[test]
+    fn streamed_brotli_predicate() {
+        let sse = sse_headers();
+        let html = vec![("Content-Type".to_string(), "text/html".to_string())];
+        let encoded = vec![
+            ("Content-Type".to_string(), "text/event-stream".to_string()),
+            ("Content-Encoding".to_string(), "gzip".to_string()),
+        ];
+
+        // Off: never, regardless of everything else.
+        assert!(!streamed_response_wants_brotli(&sse, true, StreamingCompression::Off));
+        // No client brotli support: never.
+        assert!(!streamed_response_wants_brotli(&sse, false, StreamingCompression::Sse));
+        assert!(!streamed_response_wants_brotli(&sse, false, StreamingCompression::All));
+        // Sse: only text/event-stream.
+        assert!(streamed_response_wants_brotli(&sse, true, StreamingCompression::Sse));
+        assert!(!streamed_response_wants_brotli(&html, true, StreamingCompression::Sse));
+        // All: any content type.
+        assert!(streamed_response_wants_brotli(&html, true, StreamingCompression::All));
+        // Never double-encode a body PHP already encoded.
+        assert!(!streamed_response_wants_brotli(&encoded, true, StreamingCompression::Sse));
+        assert!(!streamed_response_wants_brotli(&encoded, true, StreamingCompression::All));
+        // Charset suffix on the content type still matches.
+        let sse_charset =
+            vec![("content-type".to_string(), "text/event-stream; charset=utf-8".to_string())];
+        assert!(streamed_response_wants_brotli(&sse_charset, true, StreamingCompression::Sse));
+    }
+
+    /// The zero-behavior-change contract: with the default `Off` the
+    /// response has no compression headers and the body bytes pass
+    /// through untouched, even for a brotli-capable client.
+    #[tokio::test]
+    async fn streamed_response_off_is_identity() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let resp = build_streamed_worker_response(
+            200,
+            sse_headers(),
+            rx,
+            true,
+            compression_with(StreamingCompression::Off),
+        );
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("content-encoding").is_none(), "Off must not set an encoding");
+
+        tx.send(Bytes::from_static(
+            b"data: one
+
+",
+        ))
+        .await
+        .unwrap();
+        tx.send(Bytes::from_static(
+            b"data: two
+
+",
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            &body[..],
+            b"data: one
+
+data: two
+
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_response_sse_compresses_and_round_trips() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let resp = build_streamed_worker_response(
+            200,
+            sse_headers(),
+            rx,
+            true,
+            compression_with(StreamingCompression::Sse),
+        );
+        assert_eq!(
+            resp.headers().get("content-encoding").and_then(|v| v.to_str().ok()),
+            Some("br")
+        );
+        assert_eq!(
+            resp.headers().get("vary").and_then(|v| v.to_str().ok()),
+            Some("Accept-Encoding")
+        );
+        // PHP-supplied headers survive.
+        assert_eq!(
+            resp.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+
+        tx.send(Bytes::from_static(
+            b"data: one
+
+",
+        ))
+        .await
+        .unwrap();
+        tx.send(Bytes::from_static(
+            b"data: two
+
+",
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+        let wire = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(!wire.is_empty());
+
+        let mut plain = Vec::new();
+        let mut dec = brotli::Decompressor::new(&wire[..], 4096);
+        std::io::Read::read_to_end(&mut dec, &mut plain).expect("valid brotli stream");
+        assert_eq!(
+            &plain[..],
+            b"data: one
+
+data: two
+
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_response_sse_mode_leaves_non_sse_alone() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let headers = vec![("Content-Type".to_string(), "application/octet-stream".to_string())];
+        let resp = build_streamed_worker_response(
+            200,
+            headers,
+            rx,
+            true,
+            compression_with(StreamingCompression::Sse),
+        );
+        assert!(resp.headers().get("content-encoding").is_none());
+        tx.send(Bytes::from_static(b" raw")).await.unwrap();
+        drop(tx);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b" raw");
     }
 }

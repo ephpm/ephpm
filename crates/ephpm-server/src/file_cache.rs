@@ -202,7 +202,12 @@ mod tests {
     }
 
     fn test_compression() -> CompressionSettings {
-        CompressionSettings { enabled: true, level: 1, min_size: 1024 }
+        CompressionSettings {
+            enabled: true,
+            level: 1,
+            min_size: 1024,
+            streaming: crate::router::StreamingCompression::Off,
+        }
     }
 
     #[test]
