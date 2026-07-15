@@ -317,7 +317,7 @@ config is not itself an opt-in; a feature elsewhere (today just
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `listen` | string, optional | *(derived: gossip bind IP with port `bind_port + 1`)* | TCP listen address for the channel. Ignored when no channel feature is enabled. |
+| `listen` | string, optional | *(derived: gossip bind IP with port `bind_port + 2` — `+ 2` because the KV data plane already claims gossip + 1 (7947))* | TCP listen address for the channel. Ignored when no channel feature is enabled. |
 | `secret` | string, optional | *(fall back to `[cluster] secret`)* | Shared secret for the channel handshake (distinct HKDF domain from gossip/KV). When neither this nor `[cluster] secret` is set, the channel refuses to bind — channel features require authentication (fail-closed). |
 
 ### `[cluster.kv]`

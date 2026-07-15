@@ -144,7 +144,8 @@ cdc_experimental = true       # this is what turns the channel on
 ```
 
 That's the complete opt-in. `[cluster.channel]` needs no entries at
-all in the common case — the channel listens on `bind_port + 1` by
+all in the common case — the channel listens on `bind_port + 2` by
+(skipping gossip + 1 = 7947, the KV data-plane default)
 default and reuses `[cluster] secret`. Explicit `listen` /
 `secret` overrides are available if you need them.
 

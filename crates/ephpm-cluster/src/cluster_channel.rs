@@ -386,10 +386,13 @@ fn resolve_listen_addr(
         });
     }
     let gossip = cluster.gossip_socket_addr();
+    // gossip_port + 2, NOT + 1: the KV data plane's default port (7947) is
+    // already gossip-default (7946) + 1, so deriving +1 would collide with
+    // it on any default-ported cluster. +2 lands on 7948 with defaults.
     let port = gossip
         .port()
-        .checked_add(1)
-        .context("gossip port is u16::MAX; cannot derive cluster channel port")?;
+        .checked_add(2)
+        .context("gossip port is >= u16::MAX - 1; cannot derive cluster channel port")?;
     Ok(SocketAddr::new(gossip.ip(), port))
 }
 
@@ -664,7 +667,7 @@ mod tests {
     async fn channel_stays_off_when_no_features_enabled() {
         // Bring up a real gossip listener so we have a real
         // ClusterHandle to derive from. The bound gossip port dictates
-        // what "port + 1" would be — we then confirm nothing is
+        // what "port + 2" would be — we then confirm nothing is
         // listening on that port after `maybe_start`.
         let gossip_bind = pick_free_port_addr();
 
@@ -676,7 +679,7 @@ mod tests {
         };
         let cluster = crate::start_gossip(&cfg).await.expect("gossip start");
 
-        let derived_port = cluster.gossip_socket_addr().port() + 1;
+        let derived_port = cluster.gossip_socket_addr().port() + 2;
         let derived_addr = format!("127.0.0.1:{derived_port}");
 
         let channel_cfg = ephpm_config::ClusterChannelConfig::default();
@@ -699,7 +702,7 @@ mod tests {
     }
 
     /// When a feature IS enabled, the channel must bind. Also confirms
-    /// the derived-address rule (`gossip_port + 1`) is honored when
+    /// the derived-address rule (`gossip_port + 2`) is honored when
     /// `[cluster.channel] listen` is unset.
     #[tokio::test]
     async fn channel_binds_when_a_feature_is_enabled_and_derives_port_from_gossip() {
@@ -712,7 +715,7 @@ mod tests {
             ..ephpm_config::ClusterConfig::default()
         };
         let cluster = crate::start_gossip(&cfg).await.expect("gossip start");
-        let expected_port = cluster.gossip_socket_addr().port() + 1;
+        let expected_port = cluster.gossip_socket_addr().port() + 2;
 
         let channel_cfg = ephpm_config::ClusterChannelConfig::default();
         let handle = maybe_start(&channel_cfg, &cfg.secret, &cluster, FeatureFlags { cdc: true })
