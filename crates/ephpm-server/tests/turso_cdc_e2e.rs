@@ -1,45 +1,53 @@
-//! End-to-end proof for Phase 2 CDC-native replication.
+//! End-to-end proof for Phase 2 CDC-native replication over the
+//! cluster channel v1.
 //!
 //! Spins up primary + replica CDC drivers in the same process against
-//! two separate DB files, communicating over a real TCP socket. Proves:
+//! two separate DB files, communicating over a real cluster channel
+//! listener (yamux over TCP, ChaCha20-Poly1305 handshake). Proves:
 //!
 //! - Writes on the primary appear on the replica (DDL + INSERT + UPDATE + DELETE)
-//! - Replica catches up after joining late (via the persisted watermark)
-//! - Killing the primary connection (replica reconnects) does not lose
-//!   already-applied batches (idempotency)
+//! - Killing the replica session (drop the yamux stream) and starting
+//!   a fresh one does not double-apply already-replicated batches
+//!   (idempotency via litewire's monotonic apply watermark)
 //!
 //! # Scope note
 //!
 //! This runs the CDC drivers directly rather than through the full
-//! ephpm binary + cluster election machinery. That keeps the test fast
-//! (no gossip convergence wait, no cluster bootstrap) while still
-//! exercising the wire protocol, the tail loop, and the apply loop end
-//! to end. The full podman 2-node compose is a Phase 2.1 deliverable —
-//! see `docs/turso-phase2-cdc-design.md`.
+//! ephpm binary + cluster election machinery. It DOES exercise the
+//! real cluster channel end-to-end (bind, handshake, yamux mux,
+//! stream-type dispatch, per-stream backpressure) — the piece the
+//! rework was fundamentally about. The gossip-integrated election
+//! path still requires the full podman two-node bring-up (Phase 2.1
+//! deliverable).
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use ephpm_cluster::{
+    ChannelFeatureFlags, ChannelHandle, IncomingStream, maybe_start_cluster_channel, start_gossip,
+};
+use ephpm_config::{ClusterChannelConfig, ClusterConfig};
 use litewire::backend::{Backend, Value};
 use litewire::litewire_turso::Turso;
 use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, read_watermark};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
-// We reproduce the minimal wire protocol inline rather than reaching
-// into ephpm_server::turso_cdc private items — this keeps the test
-// honest as a black-box exercise of the design.
-
+const CDC_STREAM_TYPE: &str = "cdc/default";
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
-#[derive(serde::Serialize, serde::Deserialize)]
+// -- Wire format twin (kept inline so the test remains an honest
+//    black-box exercise of the design; the module-internal Frame is
+//    private).
+
+#[derive(Serialize, Deserialize)]
 enum Frame {
     Batch { rows: Vec<WireCdcRow> },
     Ping,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct WireCdcRow {
     change_id: i64,
     change_txn_id: Option<i64>,
@@ -81,7 +89,7 @@ impl From<WireCdcRow> for CdcRow {
     }
 }
 
-async fn write_frame(w: &mut TcpStream, frame: &Frame) -> anyhow::Result<()> {
+async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, frame: &Frame) -> anyhow::Result<()> {
     let json = serde_json::to_vec(frame)?;
     let len = u32::try_from(json.len())?;
     anyhow::ensure!(len <= MAX_FRAME_LEN);
@@ -91,7 +99,7 @@ async fn write_frame(w: &mut TcpStream, frame: &Frame) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn read_frame(r: &mut TcpStream) -> anyhow::Result<Frame> {
+async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> anyhow::Result<Frame> {
     let mut len_buf = [0u8; 4];
     r.read_exact(&mut len_buf).await?;
     let len = u32::from_be_bytes(len_buf);
@@ -101,25 +109,55 @@ async fn read_frame(r: &mut TcpStream) -> anyhow::Result<Frame> {
     Ok(serde_json::from_slice(&body)?)
 }
 
-/// Start a primary tail+publish loop. Returns the bound socket address
-/// and a shutdown-signal drop guard for the tail task (dropping the
-/// returned `_JoinHandle` and the sender aborts everything).
-async fn spawn_primary(
-    mgmt: Arc<Turso>,
-) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let addr = listener.local_addr().unwrap();
+// -- Cluster channel bring-up on one loopback port. We start gossip
+//    so `maybe_start_cluster_channel` has a `ClusterHandle` to derive
+//    the port from, and pass a `cdc: true` feature flag so the channel
+//    actually binds.
 
+async fn start_channel(node_id: &str) -> (Arc<ephpm_cluster::ClusterHandle>, ChannelHandle) {
+    let gossip_bind = pick_free_port();
+    let cluster_cfg = ClusterConfig {
+        enabled: true,
+        bind: gossip_bind,
+        secret: "e2e-shared-secret".to_string(),
+        node_id: node_id.to_string(),
+        cluster_id: "cdc-e2e".to_string(),
+        ..ClusterConfig::default()
+    };
+    let cluster = Arc::new(start_gossip(&cluster_cfg).await.expect("gossip start"));
+    let channel = maybe_start_cluster_channel(
+        &ClusterChannelConfig::default(),
+        &cluster_cfg.secret,
+        &cluster,
+        ChannelFeatureFlags { cdc: true },
+    )
+    .await
+    .expect("channel start")
+    .expect("channel bound (feature is enabled)");
+    (cluster, channel)
+}
+
+fn pick_free_port() -> String {
+    let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    s.local_addr().unwrap().to_string()
+}
+
+/// Spawn a primary tail loop + a channel handler for `cdc/default`.
+///
+/// Returns the primary's channel address (what a replica dials).
+async fn spawn_primary_on_channel(
+    mgmt: Arc<Turso>,
+    channel: &ChannelHandle,
+) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
     let (tx, _rx0) = broadcast::channel::<Arc<TxnBatch>>(1024);
 
-    let tx_srv = tx.clone();
-    let listener_handle = tokio::spawn(async move {
-        loop {
-            let (mut stream, _peer) = match listener.accept().await {
-                Ok(x) => x,
-                Err(_) => continue,
-            };
-            let mut rx = tx_srv.subscribe();
+    // Register the CDC stream-type handler.
+    let mut cdc_streams = channel.register_exact(CDC_STREAM_TYPE);
+    let tx_for_subs = tx.clone();
+    let dispatch = tokio::spawn(async move {
+        while let Some(incoming) = cdc_streams.recv().await {
+            let mut rx = tx_for_subs.subscribe();
+            let IncomingStream { mut stream, .. } = incoming;
             tokio::spawn(async move {
                 while let Ok(batch) = rx.recv().await {
                     let frame =
@@ -132,7 +170,8 @@ async fn spawn_primary(
         }
     });
 
-    let tail_handle = tokio::spawn(async move {
+    // Tail loop.
+    let tail = tokio::spawn(async move {
         let mut tailer = CdcTailer::new(&mgmt, 0);
         loop {
             match tailer.poll_batch().await {
@@ -145,18 +184,19 @@ async fn spawn_primary(
         }
     });
 
-    (addr, vec![listener_handle, tail_handle])
+    (channel.listen_addr(), vec![dispatch, tail])
 }
 
-/// Start a replica connect+apply loop against `primary_addr`.
-async fn spawn_replica(
+/// Spawn a replica: dial the primary's channel and apply frames.
+async fn spawn_replica_on_channel(
     mgmt: Arc<Turso>,
     primary_addr: std::net::SocketAddr,
+    channel: ChannelHandle,
 ) -> tokio::task::JoinHandle<()> {
     let apply_conn = mgmt.raw_connection().unwrap();
     tokio::spawn(async move {
         loop {
-            match TcpStream::connect(primary_addr).await {
+            match channel.dial(primary_addr, CDC_STREAM_TYPE).await {
                 Ok(mut stream) => loop {
                     match read_frame(&mut stream).await {
                         Ok(Frame::Batch { rows }) => {
@@ -177,9 +217,6 @@ async fn spawn_replica(
 }
 
 async fn count_rows(backend: &Arc<Turso>, table: &str) -> i64 {
-    // Returns -1 if the table doesn't exist yet (the CREATE TABLE DDL
-    // hasn't been replayed on the replica). Callers use `eventually` to
-    // poll until convergence.
     let rs = backend.query(&format!("SELECT COUNT(*) FROM \"{table}\""), &[]).await;
     match rs {
         Ok(rs) => match &rs.rows[0][0] {
@@ -190,8 +227,6 @@ async fn count_rows(backend: &Arc<Turso>, table: &str) -> i64 {
     }
 }
 
-/// Poll an async condition to true (with timeout) — used to give the
-/// tail/apply loops time to converge.
 async fn eventually_async<F, Fut>(mut check: F, timeout: Duration) -> bool
 where
     F: FnMut() -> Fut,
@@ -207,17 +242,20 @@ where
     check().await
 }
 
-/// **HEADLINE E2E**: two nodes in one process, a real TCP socket between
-/// them, DDL and DML from primary land on the replica.
+/// **HEADLINE E2E**: two nodes in one process, each with its own
+/// cluster channel, DDL and DML from primary land on the replica via
+/// a real yamux stream through the authenticated handshake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_node_cdc_replicates_ddl_and_dml_end_to_end() {
+async fn two_node_cdc_replicates_ddl_and_dml_end_to_end_via_channel() {
     let primary_file = tempfile::NamedTempFile::new().unwrap();
     let replica_file = tempfile::NamedTempFile::new().unwrap();
 
-    // Primary: TWO factories on the same file — a wire factory that
-    // auto-enables CDC on every session, and a mgmt factory used by the
-    // tail loop. Verified safe by
-    // `litewire-turso/tests/multi_factory_same_file.rs`.
+    // Bring up two independent cluster channels (each with its own
+    // gossip stack — in real deployments they'd share a cluster, but
+    // for this test we only need channel-to-channel connectivity).
+    let (_pc, primary_channel) = start_channel("primary").await;
+    let (_rc, replica_channel) = start_channel("replica").await;
+
     let primary_wire = Arc::new(
         Turso::builder(primary_file.path().to_str().unwrap())
             .enable_cdc_on_connect(true)
@@ -227,18 +265,17 @@ async fn two_node_cdc_replicates_ddl_and_dml_end_to_end() {
     );
     let primary_mgmt = Arc::new(Turso::open(primary_file.path().to_str().unwrap()).await.unwrap());
 
-    // Replica: wire factory (reads only), mgmt factory (apply loop).
     let replica_wire = Arc::new(Turso::open(replica_file.path().to_str().unwrap()).await.unwrap());
     let replica_mgmt = Arc::new(Turso::open(replica_file.path().to_str().unwrap()).await.unwrap());
 
-    let (primary_addr, _primary_handles) = spawn_primary(Arc::clone(&primary_mgmt)).await;
-    let _replica_handle = spawn_replica(Arc::clone(&replica_mgmt), primary_addr).await;
+    let (primary_addr, _primary_handles) =
+        spawn_primary_on_channel(Arc::clone(&primary_mgmt), &primary_channel).await;
+    let _replica_handle =
+        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary_addr, replica_channel).await;
 
-    // Let the replica connect.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Let the replica connect and complete the handshake.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // Drive writes THROUGH the wire factory (so enable_cdc_on_connect
-    // takes effect — this is what a real litewire client does).
     let session = primary_wire.connect().await.unwrap();
     session
         .execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL)", &[])
@@ -249,36 +286,37 @@ async fn two_node_cdc_replicates_ddl_and_dml_end_to_end() {
     session.execute("UPDATE posts SET title = 'HELLO' WHERE id = 1", &[]).await.unwrap();
     session.execute("DELETE FROM posts WHERE id = 2", &[]).await.unwrap();
 
-    // The replica should converge: 1 row (id=1, 'HELLO').
     let converged = eventually_async(
         || {
             let rw = Arc::clone(&replica_wire);
             async move { count_rows(&rw, "posts").await == 1 }
         },
-        Duration::from_secs(5),
+        Duration::from_secs(10),
     )
     .await;
-    assert!(converged, "replica did not converge to 1 row after 5s");
+    assert!(converged, "replica did not converge to 1 row after 10s");
 
-    // Confirm the value replicated correctly.
     let rs = replica_wire.query("SELECT id, title FROM posts", &[]).await.unwrap();
     assert_eq!(rs.rows.len(), 1);
     assert_eq!(rs.rows[0][0], Value::Integer(1));
     assert_eq!(rs.rows[0][1], Value::Text("HELLO".into()));
 
-    // Watermark on the replica should be > 0.
     let wm = read_watermark(&replica_mgmt.raw_connection().unwrap()).await.unwrap();
     assert!(wm > 0, "replica watermark did not advance: {wm}");
 }
 
-/// Idempotency across replica reconnect: kill the TCP connection
-/// mid-stream (by dropping the replica task and starting a fresh one).
-/// The v1 replica starts from cursor 0; already-applied batches are
-/// skipped by the watermark check.
+/// Idempotency across replica reconnect: kill the yamux stream
+/// mid-flight and start a fresh dial. The fresh session starts from
+/// cursor 0 and re-applies every batch; the watermark should keep
+/// the row count at 5, not 10.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn replica_reconnect_does_not_double_apply() {
+async fn replica_reconnect_via_channel_does_not_double_apply() {
     let primary_file = tempfile::NamedTempFile::new().unwrap();
     let replica_file = tempfile::NamedTempFile::new().unwrap();
+
+    let (_pc, primary_channel) = start_channel("primary-r").await;
+    let (_rc1, replica_channel_1) = start_channel("replica-r-1").await;
+    let (_rc2, replica_channel_2) = start_channel("replica-r-2").await;
 
     let primary_wire = Arc::new(
         Turso::builder(primary_file.path().to_str().unwrap())
@@ -291,12 +329,13 @@ async fn replica_reconnect_does_not_double_apply() {
     let replica_wire = Arc::new(Turso::open(replica_file.path().to_str().unwrap()).await.unwrap());
     let replica_mgmt = Arc::new(Turso::open(replica_file.path().to_str().unwrap()).await.unwrap());
 
-    let (addr, _primary_handles) = spawn_primary(Arc::clone(&primary_mgmt)).await;
+    let (primary_addr, _primary_handles) =
+        spawn_primary_on_channel(Arc::clone(&primary_mgmt), &primary_channel).await;
 
-    // First replica session.
-    let first_replica = spawn_replica(Arc::clone(&replica_mgmt), addr).await;
+    let first_replica =
+        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary_addr, replica_channel_1).await;
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     let session = primary_wire.connect().await.unwrap();
     session.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).await.unwrap();
@@ -304,23 +343,20 @@ async fn replica_reconnect_does_not_double_apply() {
         session.execute(&format!("INSERT INTO t VALUES ({i}, 'r{i}')"), &[]).await.unwrap();
     }
 
-    // Wait for initial convergence.
     let converged = eventually_async(
         || {
             let rw = Arc::clone(&replica_wire);
             async move { count_rows(&rw, "t").await == 5 }
         },
-        Duration::from_secs(5),
+        Duration::from_secs(10),
     )
     .await;
     assert!(converged, "first replica did not converge");
 
-    // Kill the first replica task, then start a fresh one. The fresh
-    // one starts from cursor 0 (v1 behavior) and re-applies every batch;
-    // the watermark should keep the row count at 5, not 10.
     first_replica.abort();
-    let _second_replica = spawn_replica(Arc::clone(&replica_mgmt), addr).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _second_replica =
+        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary_addr, replica_channel_2).await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
 
     let n = count_rows(&replica_wire, "t").await;
     assert_eq!(n, 5, "reconnected replica double-applied rows: {n}");

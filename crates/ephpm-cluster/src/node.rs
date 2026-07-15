@@ -114,6 +114,17 @@ impl ClusterHandle {
         &self.cluster_id
     }
 
+    /// Return this node's gossip UDP bind address.
+    ///
+    /// Used by dependents that need to derive their own listen address
+    /// from the gossip address (e.g. the cluster channel picks
+    /// `gossip_port + 1` by default so operators only have to reason
+    /// about one cluster port range).
+    #[must_use]
+    pub fn gossip_socket_addr(&self) -> SocketAddr {
+        self.gossip_addr
+    }
+
     /// Return the number of currently alive nodes (including self).
     pub async fn live_node_count(&self) -> usize {
         let chitchat = self.handle.chitchat();

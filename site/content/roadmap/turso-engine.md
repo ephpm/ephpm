@@ -116,11 +116,18 @@ path is a **single ordered stream** with no schema-sync side channel.
   record-format decoder for DML replay, sqlite_schema-SQL replay for
   DDL). 25 unit + integration tests in `litewire-turso`.
 - ephpm `turso_cdc` module: two `Turso` factories per node (wire +
-  mgmt), primary tail loop → broadcast → TCP subscriber server; replica
-  connect + apply loop; JSON-framed protocol (base64 for record blobs).
-  2-node e2e integration test proves DDL + INSERT + UPDATE + DELETE
-  land on the replica over a real TCP socket and that reconnect is
-  idempotent.
+  mgmt), primary tail loop → broadcast → **cluster channel handler**;
+  replica dial + apply loop; JSON-framed protocol (base64 for record
+  blobs). 2-node e2e integration test proves DDL + INSERT + UPDATE +
+  DELETE land on the replica through a real authenticated, multiplexed
+  cluster channel and that reconnect is idempotent.
+- **Transport = the [cluster channel v1](/roadmap/cluster-channel/):**
+  a single, lazy-bound, `yamux`-multiplexed, ChaCha20-Poly1305-
+  authenticated TCP listener shared by all opt-in cluster features. CDC
+  is registered as stream type `cdc/<vhost>`; snapshot bootstrap is
+  RESERVED (`snapshot/<vhost>`). The channel only binds when a feature
+  asks — configs without `cdc_experimental` are byte-identical to
+  before.
 - Additive config knob: `cdc_experimental` defaults to `false`;
   `engine = "turso"` + clustered mode without it is still a hard startup
   error pointing at the knob. v0.4.x-compatible under versioning policy.
@@ -132,9 +139,10 @@ path is a **single ordered stream** with no schema-sync side channel.
 - Persisted subscriber watermark across primary restart (v1: broadcast
   channel; new subscribers start from the current position, not from
   cursor 0 of the primary's history).
-- CDC replication traffic encryption (v1: MUST run on trusted network
-  or through a TLS-terminating proxy — same operational posture as
-  gossip in v1).
+- TLS wrapping of the cluster channel (v1: the channel handshake and
+  framing are ChaCha20-Poly1305-authenticated with the operator's
+  shared secret, but not TLS. Per-plane PKI identity is a Phase 2.1
+  item — see the [cluster channel roadmap](/roadmap/cluster-channel/)).
 - `turso_cdc` retention pruning (v1: table grows unbounded — no
   operational issue on the small-write experimental workloads Phase 2
   targets, but must be solved before Phase 3 default).

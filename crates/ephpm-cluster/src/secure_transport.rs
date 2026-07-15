@@ -47,6 +47,10 @@ const GOSSIP_INFO: &[u8] = b"ephpm-gossip-v1";
 /// HKDF domain-separation info string for the KV data plane key.
 const KV_DATA_INFO: &[u8] = b"ephpm-kv-data-v1";
 
+/// HKDF domain-separation info string for the cluster channel key
+/// (multiplexed cluster data plane — CDC, future snapshots, etc.).
+const CLUSTER_CHANNEL_INFO: &[u8] = b"ephpm-cluster-channel-v1";
+
 /// ChaCha20-Poly1305 nonce length in bytes.
 const NONCE_LEN: usize = 12;
 
@@ -103,6 +107,18 @@ impl ClusterCipher {
     #[must_use]
     pub fn for_kv_data_plane(secret: &str) -> Self {
         Self::derive(secret, KV_DATA_INFO)
+    }
+
+    /// Create the cipher used for the cluster channel handshake and
+    /// stream framing (the multiplexed data plane for CDC and any
+    /// future bulk-stream cluster feature).
+    ///
+    /// Uses a distinct HKDF `info` string so a sealed frame from the KV
+    /// data plane is unrecognizable on the cluster channel (and vice
+    /// versa) even though both derive from the same operator secret.
+    #[must_use]
+    pub fn for_cluster_channel(secret: &str) -> Self {
+        Self::derive(secret, CLUSTER_CHANNEL_INFO)
     }
 
     /// Seal a plaintext message: `nonce || ciphertext+tag`.

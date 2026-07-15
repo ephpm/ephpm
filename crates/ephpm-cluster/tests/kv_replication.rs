@@ -106,6 +106,7 @@ async fn start_test_node(
         node_id: node_id.to_string(),
         cluster_id: "kv-repl-test".to_string(),
         kv: config.clone(),
+        ..ClusterConfig::default()
     };
     let handle = Arc::new(
         start_gossip(&cluster_config)

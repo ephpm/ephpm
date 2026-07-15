@@ -192,6 +192,25 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         None
     };
 
+    // Cluster channel — lazy-bound. Bound only if a channel feature
+    // (today: Turso CDC replication) is enabled on this node. When no
+    // feature asks, `maybe_start_cluster_channel` returns `Ok(None)`
+    // and no socket is bound — preserving byte-identical startup for
+    // any config that doesn't opt in to a channel feature.
+    let channel_handle = if let Some(ref cluster_handle) = cluster_handle {
+        let features = resolve_channel_features(&config);
+        ephpm_cluster::maybe_start_cluster_channel(
+            &config.cluster.channel,
+            &config.cluster.secret,
+            cluster_handle,
+            features,
+        )
+        .await
+        .context("failed to start cluster channel")?
+    } else {
+        None
+    };
+
     // Create shared query stats collector. The label-series cap keeps
     // Prometheus cardinality bounded regardless of query template
     // explosion (see `StatsConfig::metric_label_series_max`).
@@ -211,9 +230,24 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // the proxies come up. Hard proxy errors still fail startup.
     let listeners = bind_listeners(&config, kv_store, metrics_handle, middleware_chain).await?;
 
-    let _db_handles = start_db_proxies(&config, cluster_handle.as_ref(), &query_stats).await?;
+    let _db_handles =
+        start_db_proxies(&config, cluster_handle.as_ref(), channel_handle.as_ref(), &query_stats)
+            .await?;
 
     accept_loop(listeners).await
+}
+
+/// Resolve which cluster-channel features are enabled on this node.
+///
+/// The single source of truth for the "if nothing needs it, don't bind
+/// it" contract — extend this when adding a new channel feature.
+fn resolve_channel_features(config: &Config) -> ephpm_cluster::ChannelFeatureFlags {
+    let cdc = config
+        .db
+        .sqlite
+        .as_ref()
+        .is_some_and(|s| s.replication.cdc_experimental && s.engine == "turso");
+    ephpm_cluster::ChannelFeatureFlags { cdc }
 }
 
 /// Which TLS mode the server is operating in.
@@ -1029,6 +1063,7 @@ fn start_kv_service(
 async fn start_db_proxies(
     config: &Config,
     cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
+    channel_handle: Option<&ephpm_cluster::ChannelHandle>,
     query_stats: &ephpm_query_stats::QueryStats,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut handles = vec![];
@@ -1173,10 +1208,14 @@ async fn start_db_proxies(
 
         if is_clustered {
             if sqlite_config.engine == "turso" && cdc_experimental {
-                // Phase 2: CDC-native replication, no sqld sidecar.
+                // Phase 2: CDC-native replication over the cluster
+                // channel, no sqld sidecar. The channel handle is
+                // guaranteed Some by `resolve_channel_features` — if
+                // it's None here, something reordered startup wrong.
                 turso_cdc::start_clustered_turso_cdc(
                     sqlite_config,
                     cluster,
+                    channel_handle,
                     query_stats,
                     &mut handles,
                 )

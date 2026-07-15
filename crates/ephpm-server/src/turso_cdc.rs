@@ -1,4 +1,5 @@
-//! **Experimental** Phase 2 CDC-native SQLite replication.
+//! **Experimental** Phase 2 CDC-native SQLite replication over the
+//! cluster channel v1.
 //!
 //! Alternative to `start_clustered_sqlite` (the sqld sidecar path) for
 //! `[db.sqlite] engine = "turso"` combined with clustered mode and the
@@ -8,6 +9,22 @@
 //! evidence-gathering scaffolding for the Turso engine roadmap's Phase 2;
 //! nothing here is used unless the operator explicitly opts in. All
 //! wiring is strictly additive.
+//!
+//! # Transport
+//!
+//! CDC batches ride the [cluster channel](ephpm_cluster::cluster_channel)
+//! — a single, opt-in, authenticated,
+//! `yamux`-multiplexed TCP listener that any cluster feature can share.
+//! The listener is only bound when a feature asks for it; before this
+//! module opted in, the channel port was closed.
+//!
+//! Each CDC stream is named `cdc/<vhost>` (today just `cdc/default`
+//! — per-vhost replication is Phase 2.1). The primary registers a
+//! handler for `"cdc/default"` on the channel; replicas dial the
+//! primary's channel address and open a stream of that name. The
+//! per-transaction frame format inside the stream stays as it was
+//! (length-prefixed JSON) — the multiplexer only replaces the
+//! bespoke TCP dance around it.
 //!
 //! # Architecture
 //!
@@ -29,7 +46,9 @@
 //!  │  turso_cdc → complete batches   │    │        │ apply_batch  │
 //!  │  → broadcast channel            │    │  mgmt factory:        │
 //!  │        │                        │    │  read framed batch    │
-//!  │  TCP subscriber server          │◀───┤  → apply_batch(&conn) │
+//!  │  cluster channel handler for    │    │  from cluster channel │
+//!  │  "cdc/default" fans one         │◀───┤  stream "cdc/default" │
+//!  │  broadcast::Receiver per stream │    │  → apply_batch(&conn) │
 //!  └─────────────────────────────────┘    └───────────────────────┘
 //! ```
 //!
@@ -38,7 +57,7 @@
 //! The sqlite election machinery (`ephpm_cluster::SqliteElection`) is
 //! unchanged. On role change, the initial role's tasks stay running
 //! (v1 simplification) and new tasks for the new role are spawned;
-//! stale tasks eventually notice a broken TCP connection and log out.
+//! stale tasks eventually notice a broken channel stream and log out.
 //! **The divergence window is the same class as sqld async replication:**
 //! a former primary that had unshipped batches at the moment it died
 //! has lost those writes.
@@ -49,10 +68,10 @@
 //! seeding replicas with a copy of the primary's DB file before starting
 //! them (or accepting that replicas start empty and only replicate
 //! forward from the point they join). A snapshot-over-transport
-//! bootstrap is designed in `docs/turso-phase2-cdc-design.md` but not
-//! implemented.
+//! bootstrap ride on `snapshot/<vhost>` streams — that name is
+//! RESERVED in [`ephpm_cluster::stream_type::SNAPSHOT_PREFIX`] today.
 //!
-//! # Wire format
+//! # Wire format (inside the yamux stream)
 //!
 //! Length-prefixed JSON frames:
 //!
@@ -63,32 +82,41 @@
 //! ```
 //!
 //! Payload is a JSON-encoded [`Frame`]. JSON is chosen for v1
-//! debuggability (a tcpdump gives you a readable `TxnBatch`). Frame
-//! size is bounded at 16 MiB; oversized frames drop the connection.
-//! **Encryption is not wired up in v1** — replication traffic MUST run
-//! on a trusted network segment or through a TLS-terminating proxy.
+//! debuggability. Frame size is bounded at 16 MiB; oversized frames
+//! drop the stream. Authentication and confidentiality are handled by
+//! the channel handshake — inside the stream there is no per-frame
+//! sealing (yamux payloads travel through the already-authenticated
+//! TCP connection).
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use ephpm_cluster::{ChannelStream, IncomingStream};
 use ephpm_config::SqliteConfig;
 use litewire::litewire_turso::Turso;
 use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
 
 use crate::tracked_backend;
+
+/// Full stream-type string this build uses for the default vhost.
+///
+/// Per-vhost replication is Phase 2.1; today every CDC stream uses
+/// `"cdc/default"`.
+const CDC_STREAM_TYPE: &str = "cdc/default";
 
 /// Maximum frame length accepted on either side of the wire (16 MiB).
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
 /// Broadcast channel capacity — how many transactions the primary can
 /// buffer between polls before slow subscribers start missing (`Lagged`)
-/// frames. When a subscriber lags, it disconnects and reconnects (its
-/// own retry loop) — replication picks up from the persisted watermark.
+/// frames. When a subscriber lags, it disconnects; the replica's
+/// reconnect loop opens a fresh stream and starts from cursor 0
+/// (idempotency provided by [`apply_batch`]'s monotonic watermark).
 const BROADCAST_CAPACITY: usize = 1024;
 
 /// How often the primary polls `turso_cdc` for new batches. Turso 0.7.0
@@ -99,6 +127,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// is unreachable.
 const REPLICA_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
+/// Heartbeat interval on primary-side subscribers.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Frame types carried on the CDC replication wire.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Frame {
@@ -106,7 +137,7 @@ enum Frame {
     /// [`litewire_turso::cdc::TxnBatch::rows`].
     Batch { rows: Vec<WireCdcRow> },
     /// Heartbeat — sent every ~5s from primary to keep the subscriber
-    /// TCP connection warm even during idle periods.
+    /// stream warm even during idle periods.
     Ping,
 }
 
@@ -185,26 +216,36 @@ mod serde_bytes_opt {
 // Startup entry point.
 // ---------------------------------------------------------------------------
 
-/// Start Phase 2 CDC-native replication for a clustered Turso engine.
+/// Start Phase 2 CDC-native replication for a clustered Turso engine,
+/// riding the [cluster channel](ephpm_cluster::cluster_channel).
 ///
 /// Opens two Turso factories against the same DB file — one for the
 /// litewire wire frontends (with `enable_cdc_on_connect` set on the
-/// primary) and one for the CDC tail/apply path. Then starts:
+/// primary) and one for the CDC tail/apply path. Then:
 ///
 /// - Litewire wire frontends against the wire factory (always).
 /// - On primary: a tail loop reading `turso_cdc` and broadcasting
-///   batches, plus a TCP server that forwards them to subscribers.
-/// - On replica: a TCP client that connects to the primary and applies
-///   received batches.
+///   batches, plus a channel stream handler that forwards them to any
+///   inbound `cdc/default` stream.
+/// - On replica: a channel-dial loop that opens `cdc/default` against
+///   the primary and applies received batches.
+///
+/// The `channel_handle` argument comes from
+/// [`ephpm_cluster::maybe_start_cluster_channel`] — when it's `None`,
+/// the channel was never bound (no channel feature asked for it) and
+/// this function returns an error, since CDC replication is exactly
+/// such a feature. The caller in `lib.rs` guarantees `Some` on this
+/// code path.
 ///
 /// # Errors
 ///
 /// Returns an error if either factory cannot open, if the elected role
-/// requires a peer address that isn't configured, or if the CDC
-/// listener/connection cannot be established.
+/// requires a peer address that isn't configured, or if the cluster
+/// channel is not available (indicating a startup ordering bug).
 pub async fn start_clustered_turso_cdc(
     sqlite_config: &SqliteConfig,
     cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
+    channel_handle: Option<&ephpm_cluster::ChannelHandle>,
     query_stats: &ephpm_query_stats::QueryStats,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
@@ -212,22 +253,39 @@ pub async fn start_clustered_turso_cdc(
         "clustered Turso CDC replication requires [cluster] enabled = true; \
          no cluster handle available",
     )?;
+    let channel = channel_handle.context(
+        "clustered Turso CDC replication requires the cluster channel to be bound; \
+         maybe_start_cluster_channel returned None despite cdc_experimental = true \
+         (startup ordering bug)",
+    )?;
 
     tracing::warn!(
         engine = "turso",
         role = %sqlite_config.replication.role,
-        cdc_listen = %sqlite_config.replication.cdc_listen,
-        "starting EXPERIMENTAL Phase 2 CDC-native SQLite replication. \
-         sqld is NOT spawned; replication uses litewire's turso_cdc stream. \
-         Turso engine remains Beta upstream — do not use with data you \
-         cannot recreate. See site/content/roadmap/turso-engine.md."
+        channel_listen = %channel.listen_addr(),
+        "starting EXPERIMENTAL Phase 2 CDC-native SQLite replication over the cluster \
+         channel. sqld is NOT spawned; replication uses litewire's turso_cdc stream. \
+         Turso engine remains Beta upstream — do not use with data you cannot recreate. \
+         See site/content/roadmap/turso-engine.md and site/content/roadmap/cluster-channel.md."
     );
+
+    // add-config-knob discipline: cdc_listen was replaced by the
+    // cluster channel and is now a documented no-op. Warn when it's
+    // explicitly set so operators fix their config; stay quiet at the
+    // default value.
+    if sqlite_config.replication.cdc_listen != "0.0.0.0:5015" {
+        tracing::warn!(
+            cdc_listen = %sqlite_config.replication.cdc_listen,
+            "[db.sqlite.replication] cdc_listen is deprecated — parsed but not acted upon. \
+             CDC now rides the cluster channel; move any port allocation to \
+             [cluster.channel] listen. This knob will be removed in a future release."
+        );
+    }
 
     let db_path = &sqlite_config.path;
 
-    // Determine our initial role first, so we can size the wire-factory's
-    // enable_cdc_on_connect appropriately.
-    let (initial_role, role_rx) = determine_role(sqlite_config, cluster).await?;
+    let channel_advertise = channel.listen_addr();
+    let (initial_role, role_rx) = determine_role(sqlite_config, cluster, channel_advertise).await?;
 
     // Wire factory: served to litewire. Primary opts every session into
     // CDC so writes coming through the frontends are captured.
@@ -251,28 +309,45 @@ pub async fn start_clustered_turso_cdc(
     let tracked = tracked_backend::TrackedBackend::new(wire_factory, query_stats.clone());
     spawn_litewire_serve(sqlite_config, tracked, handles);
 
-    // Broadcast channel for primary-side batches.
+    // Broadcast channel for primary-side batches. Cloned per inbound
+    // subscriber stream; each subscriber runs its own copy.
     let (tx, _rx0) = broadcast::channel::<Arc<TxnBatch>>(BROADCAST_CAPACITY);
 
-    let cdc_listen = sqlite_config.replication.cdc_listen.clone();
+    // Register the primary-side handler NOW even if we start as
+    // replica. On a later role transition the handler is already in
+    // place — we just start feeding the broadcast channel from the
+    // tail loop.
+    let mut cdc_streams = channel.register_exact(CDC_STREAM_TYPE);
+    let tx_for_subs = tx.clone();
+    handles.push(tokio::spawn(async move {
+        while let Some(incoming) = cdc_streams.recv().await {
+            let rx = tx_for_subs.subscribe();
+            let IncomingStream { stream, peer, .. } = incoming;
+            tokio::spawn(async move {
+                if let Err(e) = serve_subscriber(stream, rx).await {
+                    tracing::info!(peer = %peer, "CDC subscriber disconnected: {e:#}");
+                }
+            });
+        }
+    }));
 
     // Kick off role-appropriate work for the initial role.
     let mgmt = Arc::clone(&mgmt_factory);
     let tx0 = tx.clone();
-    let listen0 = cdc_listen.clone();
+    let channel0 = channel.clone();
     handles.push(tokio::spawn(async move {
-        start_role(initial_role, mgmt, tx0, listen0).await;
+        start_role(initial_role, mgmt, tx0, channel0).await;
     }));
 
     // Role-change watcher: on a role transition, spawn the new role's
     // driver. Old drivers stay running and drain naturally; v1 accepts
     // this simplification because in practice a role change only fires
-    // on failure/join events, and the new driver's TCP-bind/connect
-    // dance will fail cleanly if it collides with a stale one.
+    // on failure/join events, and the new driver's stream open will
+    // succeed cleanly regardless of stale ones.
     if let Some(mut watch_rx) = role_rx {
         let mgmt = Arc::clone(&mgmt_factory);
         let tx = tx.clone();
-        let listen = cdc_listen.clone();
+        let channel = channel.clone();
         handles.push(tokio::spawn(async move {
             while watch_rx.changed().await.is_ok() {
                 let new_elected = watch_rx.borrow().clone();
@@ -280,8 +355,8 @@ pub async fn start_clustered_turso_cdc(
                 tracing::info!(?new_role, "CDC replication: role change detected");
                 let mgmt = Arc::clone(&mgmt);
                 let tx = tx.clone();
-                let listen = listen.clone();
-                tokio::spawn(async move { start_role(new_role, mgmt, tx, listen).await });
+                let channel = channel.clone();
+                tokio::spawn(async move { start_role(new_role, mgmt, tx, channel).await });
             }
         }));
     }
@@ -292,14 +367,31 @@ pub async fn start_clustered_turso_cdc(
 #[derive(Debug, Clone)]
 enum Role {
     Primary,
-    Replica { primary_addr: String },
+    Replica { primary_addr: SocketAddr },
 }
 
 fn elected_to_role(elected: ephpm_cluster::ElectedRole) -> Role {
     match elected {
         ephpm_cluster::ElectedRole::Primary => Role::Primary,
         ephpm_cluster::ElectedRole::Replica { primary_grpc_url } => {
-            Role::Replica { primary_addr: primary_grpc_url }
+            // In CDC-native mode the election broadcasts the primary's
+            // *cluster channel* address in the `primary_grpc_url`
+            // field. If it fails to parse we treat it as a config error
+            // and log — the driver task will exit and the next role
+            // change will get a fresh chance.
+            match primary_grpc_url.parse::<SocketAddr>() {
+                Ok(addr) => Role::Replica { primary_addr: addr },
+                Err(e) => {
+                    tracing::error!(
+                        primary = %primary_grpc_url,
+                        "CDC replica: primary address is not a valid SocketAddr: {e}"
+                    );
+                    // Fall back to a bogus address; the replica loop
+                    // will fail to connect and just log — this is
+                    // preferable to panicking a background task.
+                    Role::Replica { primary_addr: SocketAddr::from(([127, 0, 0, 1], 0)) }
+                }
+            }
         }
     }
 }
@@ -307,6 +399,7 @@ fn elected_to_role(elected: ephpm_cluster::ElectedRole) -> Role {
 async fn determine_role(
     sqlite_config: &SqliteConfig,
     cluster: &Arc<ephpm_cluster::ClusterHandle>,
+    channel_advertise: SocketAddr,
 ) -> anyhow::Result<(Role, Option<tokio::sync::watch::Receiver<ephpm_cluster::ElectedRole>>)> {
     match sqlite_config.replication.role.as_str() {
         "primary" => Ok((Role::Primary, None)),
@@ -314,21 +407,26 @@ async fn determine_role(
             anyhow::ensure!(
                 !sqlite_config.replication.primary_grpc_url.is_empty(),
                 "replication.primary_grpc_url is required when role = \"replica\" \
-                 in CDC-native replication mode (this field carries the \
-                 primary's CDC TCP address in this mode)"
+                 in CDC-native replication mode (this field carries the primary's \
+                 cluster channel address in this mode, e.g. \"10.0.0.1:7947\")"
             );
-            Ok((
-                Role::Replica { primary_addr: sqlite_config.replication.primary_grpc_url.clone() },
-                None,
-            ))
+            let addr: SocketAddr =
+                sqlite_config.replication.primary_grpc_url.parse().with_context(|| {
+                    format!(
+                        "replication.primary_grpc_url is not a valid SocketAddr in CDC-native \
+                         mode (expected \"host:port\", got {:?})",
+                        sqlite_config.replication.primary_grpc_url
+                    )
+                })?;
+            Ok((Role::Replica { primary_addr: addr }, None))
         }
         _ => {
             // "auto" — reuse the same election as the sqld path but
-            // advertise the CDC listen address (that's what replicas need
-            // to reach in this mode).
+            // advertise the cluster channel address (that's what
+            // replicas need to dial in this mode).
             let election = ephpm_cluster::SqliteElection::new(
                 Arc::clone(cluster),
-                sqlite_config.replication.cdc_listen.clone(),
+                channel_advertise.to_string(),
             );
             let initial = election.determine_initial_role().await;
             let rx = election.watch_role();
@@ -342,16 +440,16 @@ async fn start_role(
     role: Role,
     mgmt: Arc<Turso>,
     tx: broadcast::Sender<Arc<TxnBatch>>,
-    cdc_listen: String,
+    channel: ephpm_cluster::ChannelHandle,
 ) {
     match role {
         Role::Primary => {
-            if let Err(e) = run_primary(mgmt, tx, cdc_listen).await {
+            if let Err(e) = run_primary(mgmt, tx).await {
                 tracing::error!("CDC primary loop exited: {e:#}");
             }
         }
         Role::Replica { primary_addr } => {
-            if let Err(e) = run_replica(mgmt, primary_addr).await {
+            if let Err(e) = run_replica(mgmt, primary_addr, channel).await {
                 tracing::error!("CDC replica loop exited: {e:#}");
             }
         }
@@ -359,41 +457,12 @@ async fn start_role(
 }
 
 // ---------------------------------------------------------------------------
-// Primary: tail + broadcast + serve subscribers.
+// Primary: tail + broadcast. (Subscriber-side accept is registered up in
+// `start_clustered_turso_cdc` so it exists across role transitions.)
 // ---------------------------------------------------------------------------
 
-async fn run_primary(
-    mgmt: Arc<Turso>,
-    tx: broadcast::Sender<Arc<TxnBatch>>,
-    cdc_listen: String,
-) -> anyhow::Result<()> {
-    // Start the TCP subscriber server.
-    let listener = TcpListener::bind(&cdc_listen)
-        .await
-        .with_context(|| format!("failed to bind CDC listener at {cdc_listen}"))?;
-    tracing::info!(listen = %cdc_listen, "CDC primary: subscriber listener bound");
-
-    let tx_for_listener = tx.clone();
-    tokio::spawn(async move {
-        loop {
-            let (stream, peer) = match listener.accept().await {
-                Ok(x) => x,
-                Err(e) => {
-                    tracing::debug!(%e, "CDC listener accept error");
-                    continue;
-                }
-            };
-            tracing::info!(peer = %peer, "CDC primary: subscriber connected");
-            let rx = tx_for_listener.subscribe();
-            tokio::spawn(async move {
-                if let Err(e) = serve_subscriber(stream, rx).await {
-                    tracing::info!(peer = %peer, "CDC subscriber disconnected: {e:#}");
-                }
-            });
-        }
-    });
-
-    // Tail loop: poll turso_cdc, push complete batches to broadcast.
+async fn run_primary(mgmt: Arc<Turso>, tx: broadcast::Sender<Arc<TxnBatch>>) -> anyhow::Result<()> {
+    tracing::info!("CDC primary: tail loop starting");
     let mut tailer = CdcTailer::new(&mgmt, 0);
     loop {
         match tailer.poll_batch().await {
@@ -401,8 +470,6 @@ async fn run_primary(
                 let arc = Arc::new(batch);
                 // send() Err means no receivers; that's fine — subscribers
                 // reconnect and stream from cursor 0 on the next connect.
-                // In production we'd persist the watermark client-side;
-                // v1 relies on subscribers being connected before writes.
                 let _ = tx.send(arc);
             }
             Ok(None) => {
@@ -417,10 +484,10 @@ async fn run_primary(
 }
 
 async fn serve_subscriber(
-    mut stream: TcpStream,
+    mut stream: ChannelStream,
     mut rx: broadcast::Receiver<Arc<TxnBatch>>,
 ) -> anyhow::Result<()> {
-    let mut hb = tokio::time::interval(Duration::from_secs(5));
+    let mut hb = tokio::time::interval(HEARTBEAT_INTERVAL);
     hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -435,10 +502,8 @@ async fn serve_subscriber(
                     }
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // Subscriber fell behind by n batches. v1 policy:
-                        // drop the connection so the client reconnects
-                        // and restarts the stream. In v1 that means
-                        // starting from cursor 0 (persistence is a v2
-                        // improvement).
+                        // drop the stream so the client reconnects and
+                        // restarts. Watermark keeps re-application safe.
                         anyhow::bail!("subscriber lagged by {n} batches; forcing reconnect");
                     }
                     Err(broadcast::error::RecvError::Closed) => {
@@ -454,21 +519,25 @@ async fn serve_subscriber(
 }
 
 // ---------------------------------------------------------------------------
-// Replica: connect + read + apply.
+// Replica: dial the cluster channel + read + apply.
 // ---------------------------------------------------------------------------
 
-async fn run_replica(mgmt: Arc<Turso>, primary_addr: String) -> anyhow::Result<()> {
+async fn run_replica(
+    mgmt: Arc<Turso>,
+    primary_addr: SocketAddr,
+    channel: ephpm_cluster::ChannelHandle,
+) -> anyhow::Result<()> {
     // The replica's local Turso engine serves reads via litewire; writes
     // arrive only through apply_batch, keyed by monotonic watermark.
     let apply_conn = mgmt.raw_connection()?;
 
     loop {
-        match TcpStream::connect(&primary_addr).await {
+        match channel.dial(primary_addr, CDC_STREAM_TYPE).await {
             Ok(mut stream) => {
-                tracing::info!(primary = %primary_addr, "CDC replica: connected to primary");
+                tracing::info!(primary = %primary_addr, "CDC replica: channel stream open");
                 match consume_frames(&mut stream, &apply_conn).await {
                     Ok(()) => {
-                        tracing::info!("CDC replica: primary closed connection cleanly");
+                        tracing::info!("CDC replica: primary closed stream cleanly");
                     }
                     Err(e) => {
                         tracing::warn!("CDC replica stream error: {e:#}");
@@ -476,7 +545,7 @@ async fn run_replica(mgmt: Arc<Turso>, primary_addr: String) -> anyhow::Result<(
                 }
             }
             Err(e) => {
-                tracing::debug!(primary = %primary_addr, "CDC replica connect failed: {e}");
+                tracing::debug!(primary = %primary_addr, "CDC replica dial failed: {e:#}");
             }
         }
         tokio::time::sleep(REPLICA_RECONNECT_DELAY).await;
@@ -484,7 +553,7 @@ async fn run_replica(mgmt: Arc<Turso>, primary_addr: String) -> anyhow::Result<(
 }
 
 async fn consume_frames(
-    stream: &mut TcpStream,
+    stream: &mut ChannelStream,
     apply_conn: &litewire::litewire_turso::TursoConnection,
 ) -> anyhow::Result<()> {
     loop {
@@ -493,10 +562,6 @@ async fn consume_frames(
             Frame::Batch { rows } => {
                 let batch = TxnBatch { rows: rows.into_iter().map(CdcRow::from).collect() };
                 if let Err(e) = apply_batch(apply_conn, &batch).await {
-                    // v1 policy: log at ERROR, keep the connection alive
-                    // so operators can see the failure stream. Skipping a
-                    // bad batch silently would leave the replica in a
-                    // divergent state; crashing would too.
                     tracing::error!(
                         change_id = batch.commit_change_id(),
                         "CDC apply_batch error: {e:#}"
@@ -509,7 +574,8 @@ async fn consume_frames(
 }
 
 // ---------------------------------------------------------------------------
-// Frame codec.
+// Frame codec — operates on any tokio Async{Read,Write} (i.e. a
+// [`ChannelStream`] on the wire, a `tokio::io::DuplexStream` in tests).
 // ---------------------------------------------------------------------------
 
 async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, frame: &Frame) -> anyhow::Result<()> {
@@ -640,5 +706,17 @@ mod tests {
         AsyncWriteExt::write_all(&mut client, &over.to_be_bytes()).await.unwrap();
         let err = read_frame(&mut server).await.unwrap_err();
         assert!(err.to_string().contains("frame too large"), "unexpected error: {err}");
+    }
+
+    /// The `cdc/` prefix constant this module uses matches the well-known
+    /// prefix registered on the cluster channel side.
+    #[test]
+    fn cdc_stream_type_matches_registry_prefix() {
+        assert!(
+            CDC_STREAM_TYPE.starts_with(ephpm_cluster::stream_type::CDC_PREFIX),
+            "CDC stream type {CDC_STREAM_TYPE:?} must live under the {:?} prefix so the \
+             cluster channel dispatch table stays coherent",
+            ephpm_cluster::stream_type::CDC_PREFIX
+        );
     }
 }

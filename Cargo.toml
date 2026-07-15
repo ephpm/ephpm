@@ -42,7 +42,7 @@ temp-env = "0.3"
 serial_test = "3"
 dashmap = "6"
 parking_lot = "0.12"
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "compat"] }
 bytes = "1"
 sha1 = "0.10"
 sha2 = "0.10"
@@ -59,6 +59,8 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 async-channel = "2"
 libloading = "0.8"
+yamux = "0.14"
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 
 # Internal crates
 ephpm-cluster = { path = "crates/ephpm-cluster" }

@@ -26,6 +26,7 @@ async fn start_node(port: u16, seeds: Vec<String>, node_id: &str) -> ClusterHand
         node_id: node_id.to_string(),
         cluster_id: "test-cluster".to_string(),
         kv: ClusterKvConfig::default(),
+        ..ClusterConfig::default()
     };
     start_gossip(&config)
         .await

@@ -13,6 +13,7 @@
 //! join = ["10.0.1.2:7946"]
 //! ```
 
+pub mod cluster_channel;
 pub mod clustered_store;
 pub mod gossip_kv;
 pub mod kv_data_plane;
@@ -20,6 +21,10 @@ pub mod node;
 pub mod secure_transport;
 pub mod sqlite_election;
 
+pub use cluster_channel::{
+    ChannelStream, FeatureFlags as ChannelFeatureFlags, Handle as ChannelHandle, IncomingStream,
+    maybe_start as maybe_start_cluster_channel, stream_type,
+};
 pub use clustered_store::{ClusteredStore, KvReplicator};
 pub use kv_data_plane as data_plane;
 pub use node::{ClusterHandle, NodeInfo, NodeState, start_gossip};

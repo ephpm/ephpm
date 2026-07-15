@@ -90,18 +90,34 @@ up three corrections:
 - **ePHPm side (reuse):** the cluster layer already owns membership
   (chitchat gossip), primary election (`sqlite_election.rs` — unchanged),
   and a replication data plane (`KvReplicator`'s transport pattern). Phase
-  2 adds a DB replication channel alongside KV replication: primary
-  publishes CDC transaction batches; replicas apply them through their
-  local Turso engine and record the applied `change_id` watermark in the
-  same transaction (exactly-once apply by construction).
+  2 rides CDC batches on the **cluster channel v1** — a single, opt-in,
+  authenticated, `yamux`-multiplexed TCP listener shared by all future
+  cluster data-plane features (see the [cluster channel
+  roadmap](/roadmap/cluster-channel/) and
+  `crates/ephpm-cluster/src/cluster_channel.rs`). Primary publishes CDC
+  transaction batches on stream type `cdc/<vhost>`; replicas dial the
+  primary's channel address, open a stream of that name, and apply
+  batches through their local Turso engine — recording the applied
+  `change_id` watermark in the same transaction (exactly-once apply by
+  construction).
 - **What dies:** the sqld sidecar — child-process management, binary
   embedding (`include_bytes!` of a 100MB+ binary), health polling, and the
   Hrana client hop on replicas. Failover becomes "stop applying, start
   capturing" with no process restarts.
-- **Alternative transport:** self-host Turso's open sync protocol using
-  `turso_sync_engine` instead of our own batching. Decide on measured
-  simplicity (roadmap language): our transport is fewer new dependencies;
-  theirs solves bootstrap + partial sync already.
+- **Transport:** the cluster channel handles the framing story
+  end-to-end: ChaCha20-Poly1305 handshake (distinct HKDF domain from
+  gossip / KV data plane so cross-plane replay is impossible), yamux
+  per-stream flow-control backpressure, string-typed stream registry so
+  future features (snapshot bootstrap, watermark sync) plug in without
+  a version bump. Inside the yamux stream, per-transaction payloads use
+  length-prefixed JSON (16 MiB frame cap; base64 for record blobs) —
+  no per-frame sealing since the TCP connection is already
+  authenticated at handshake.
+- **Alternative considered — Turso's open sync protocol** via
+  `turso_sync_engine`. Deferred: our channel is fewer new deps and
+  reuses the cluster secret/handshake infrastructure that already
+  exists for gossip and KV. Sync protocol may still land later on a
+  `sync/<vhost>` stream over the same channel.
 
 ## Open questions (must be answered before any Phase 2 code)
 

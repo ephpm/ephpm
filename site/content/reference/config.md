@@ -244,9 +244,9 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `role` | string | `"auto"` | `"auto"` (gossip-elected), `"primary"`, `"replica"`. |
-| `primary_grpc_url` | string | `""` | Primary gRPC URL (set automatically in `auto` mode; required for `replica`). In CDC-native mode (`cdc_experimental = true`) this field carries the primary's CDC TCP address instead. |
-| `cdc_experimental` | bool | `false` | **Experimental** — opt in to Phase 2 CDC-native replication (`engine = "turso"` only). See the [Turso engine roadmap](/roadmap/turso-engine/#phase-2--cdc-native-replication-experimental-implementation-available-gated-on-ga-for-default). Without this flag, `engine = "turso"` + clustered mode is a hard startup error. |
-| `cdc_listen` | string | `"0.0.0.0:5015"` | **Experimental** — TCP listen address for the CDC replication server on the primary. Ignored when `cdc_experimental = false`. |
+| `primary_grpc_url` | string | `""` | Primary gRPC URL (set automatically in `auto` mode; required for `replica`). In CDC-native mode (`cdc_experimental = true`) this field carries the primary's **cluster channel address** (e.g. `10.0.0.1:7947`) instead of a gRPC URL. |
+| `cdc_experimental` | bool | `false` | **Experimental** — opt in to Phase 2 CDC-native replication (`engine = "turso"` only). Setting this to `true` also implicitly enables the [cluster channel](#clusterchannel) on this node. See the [Turso engine roadmap](/roadmap/turso-engine/#phase-2--cdc-native-replication-experimental-implementation-available-gated-on-ga-for-default) and the [cluster channel design](/roadmap/cluster-channel/). Without this flag, `engine = "turso"` + clustered mode is a hard startup error. |
+| `cdc_listen` | string | `"0.0.0.0:5015"` | **Deprecated — parsed but not acted upon.** CDC now rides the multiplexed [cluster channel](#clusterchannel); this legacy per-CDC listener has been removed. Setting it to a non-default value logs a startup warning. Move any explicit port allocation to `[cluster.channel] listen`. |
 
 ### `[db.read_write_split]`
 
@@ -301,6 +301,24 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | `secret` | string | `""` | Shared secret for cluster transport security. When set, gossip UDP and the KV TCP data plane are encrypted and authenticated (ChaCha20-Poly1305, keys derived via HKDF-SHA256); nodes without it cannot join, read, or inject. Empty = plaintext (warning logged at startup). |
 | `node_id` | string | (auto) | Unique node identifier. Auto-generated if empty. |
 | `cluster_id` | string | `"ephpm"` | Nodes with different `cluster_id`s ignore each other. |
+
+### `[cluster.channel]`
+
+**Experimental-adjacent.** The cluster channel is a single,
+authenticated, `yamux`-multiplexed TCP listener that opt-in cluster
+features share (Turso CDC replication today; snapshot bootstrap and
+watermark sync in future phases). It is **only bound when at least one
+feature asks for it**: a config that ships no channel feature is
+byte-identical to a config without this section — no socket, no task,
+no startup log noise above `debug!`. Adding `[cluster.channel]` to a
+config is not itself an opt-in; a feature elsewhere (today just
+`[db.sqlite.replication] cdc_experimental = true`) has to ask. See the
+[cluster channel roadmap](/roadmap/cluster-channel/) for the design.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `listen` | string, optional | *(derived: gossip bind IP with port `bind_port + 1`)* | TCP listen address for the channel. Ignored when no channel feature is enabled. |
+| `secret` | string, optional | *(fall back to `[cluster] secret`)* | Shared secret for the channel handshake (distinct HKDF domain from gossip/KV). When neither this nor `[cluster] secret` is set, the channel refuses to bind — channel features require authentication (fail-closed). |
 
 ### `[cluster.kv]`
 
