@@ -774,6 +774,19 @@ pub struct SqliteConfig {
     #[serde(default = "default_sqlite_path")]
     pub path: String,
 
+    /// Database engine: `"sqlite"` (default) or `"turso"` (**experimental**).
+    ///
+    /// - `"sqlite"` — the genuine `SQLite` C engine (rusqlite, bundled).
+    ///   This is the default and the only production-supported engine.
+    /// - `"turso"` — the Turso Database engine, a ground-up Rust rewrite
+    ///   of `SQLite` that is **Beta upstream**. Single-node mode only:
+    ///   combining `engine = "turso"` with clustered `SQLite` is rejected
+    ///   at startup. Startup logs a warning when this engine is selected.
+    ///
+    /// Any other value is rejected at startup.
+    #[serde(default = "default_sqlite_engine")]
+    pub engine: String,
+
     /// Wire protocol proxy settings.
     #[serde(default)]
     pub proxy: SqliteProxyConfig,
@@ -2348,6 +2361,10 @@ fn default_sqlite_path() -> String {
     "ephpm.db".to_string()
 }
 
+fn default_sqlite_engine() -> String {
+    "sqlite".to_string()
+}
+
 fn default_sqlite_mysql_listen() -> String {
     "127.0.0.1:3306".to_string()
 }
@@ -3551,6 +3568,26 @@ path = "app.db"
         assert_eq!(sqlite.sqld.grpc_listen, "0.0.0.0:5001");
         assert_eq!(sqlite.replication.role, "auto");
         assert!(sqlite.replication.primary_grpc_url.is_empty());
+        assert_eq!(sqlite.engine, "sqlite", "engine must default to the genuine SQLite C engine");
+    }
+
+    #[test]
+    fn test_sqlite_engine_turso_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[db.sqlite]
+path = "app.db"
+engine = "turso"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let sqlite = config.db.sqlite.expect("sqlite should be present");
+        assert_eq!(sqlite.engine, "turso");
     }
 
     #[test]

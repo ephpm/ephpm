@@ -1166,15 +1166,39 @@ async fn start_db_proxies(
     // Embedded SQLite via litewire
     if let Some(sqlite_config) = &config.db.sqlite {
         let is_clustered = is_clustered_sqlite(sqlite_config, cluster.is_some());
+        validate_sqlite_engine(&sqlite_config.engine, is_clustered)?;
 
         if is_clustered {
             start_clustered_sqlite(sqlite_config, cluster, query_stats, &mut handles).await?;
         } else {
-            start_single_node_sqlite(sqlite_config, query_stats, &mut handles)?;
+            start_single_node_sqlite(sqlite_config, query_stats, &mut handles).await?;
         }
     }
 
     Ok(handles)
+}
+
+/// Validate the `[db.sqlite].engine` knob.
+///
+/// `"sqlite"` is always valid. `"turso"` (experimental) is valid only in
+/// single-node mode — clustered SQLite replicates through the sqld sidecar,
+/// which requires the genuine SQLite C engine (Turso-engine clustering is
+/// Phase 2 of the roadmap, not implemented). Anything else is a hard error
+/// so a typo can never silently fall back to a different engine.
+fn validate_sqlite_engine(engine: &str, is_clustered: bool) -> anyhow::Result<()> {
+    match engine {
+        "turso" if is_clustered => anyhow::bail!(
+            "[db.sqlite] engine = \"turso\" is not supported in clustered mode \
+             (sqld replication requires engine = \"sqlite\"; Turso-engine \
+             clustering is planned for Phase 2 of the Turso engine roadmap). \
+             Set engine = \"sqlite\" or disable clustering/replication."
+        ),
+        "sqlite" | "turso" => Ok(()),
+        other => anyhow::bail!(
+            "[db.sqlite] engine = \"{other}\" is not a valid engine; \
+             valid values: \"sqlite\" (default), \"turso\" (experimental)"
+        ),
+    }
 }
 
 /// Check if clustered SQLite mode should be used.
@@ -1183,19 +1207,59 @@ fn is_clustered_sqlite(sqlite_config: &ephpm_config::SqliteConfig, cluster_enabl
     role == "primary" || role == "replica" || (role == "auto" && cluster_enabled)
 }
 
-/// Start single-node SQLite (in-process rusqlite, no sqld).
-fn start_single_node_sqlite(
+/// Start single-node SQLite (in-process engine, no sqld).
+///
+/// The engine is selected by `[db.sqlite].engine` (validated upstream by
+/// `validate_sqlite_engine`): `"sqlite"` uses rusqlite (the genuine SQLite
+/// C engine, the default), `"turso"` uses the experimental Turso Database
+/// engine via `litewire-turso`.
+async fn start_single_node_sqlite(
     sqlite_config: &ephpm_config::SqliteConfig,
     query_stats: &ephpm_query_stats::QueryStats,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     let db_path = &sqlite_config.path;
-    let backend = litewire::backend::Rusqlite::open(db_path)
-        .with_context(|| format!("failed to open SQLite database: {db_path}"))?;
-    tracing::info!(path = %db_path, "opened embedded SQLite database (single-node)");
+    if sqlite_config.engine == "turso" {
+        tracing::warn!(
+            path = %db_path,
+            "[db.sqlite] engine = \"turso\" is EXPERIMENTAL: the Turso Database \
+             engine is Beta upstream and not yet a production SQLite replacement. \
+             Do not use it for data you cannot recreate. VACUUM and multi-process \
+             access are unsupported. See the Turso engine roadmap page."
+        );
+        let backend = litewire::Turso::open(db_path)
+            .await
+            .with_context(|| format!("failed to open database with Turso engine: {db_path}"))?;
+        tracing::info!(
+            path = %db_path,
+            engine = "turso",
+            "opened embedded database (single-node, experimental Turso engine)"
+        );
+        spawn_single_node_litewire(
+            sqlite_config,
+            tracked_backend::TrackedBackend::new(backend, query_stats.clone()),
+            handles,
+        );
+    } else {
+        let backend = litewire::backend::Rusqlite::open(db_path)
+            .with_context(|| format!("failed to open SQLite database: {db_path}"))?;
+        tracing::info!(path = %db_path, "opened embedded SQLite database (single-node)");
+        spawn_single_node_litewire(
+            sqlite_config,
+            tracked_backend::TrackedBackend::new(backend, query_stats.clone()),
+            handles,
+        );
+    }
+    Ok(())
+}
 
-    let tracked = tracked_backend::TrackedBackend::new(backend, query_stats.clone());
-    let mut builder = litewire::LiteWire::new(tracked);
+/// Wire the configured frontends onto a litewire builder and spawn it.
+fn spawn_single_node_litewire(
+    sqlite_config: &ephpm_config::SqliteConfig,
+    backend: impl litewire::backend::Backend,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    let mut builder = litewire::LiteWire::new(backend);
     builder = builder.mysql(&sqlite_config.proxy.mysql_listen);
     tracing::info!(
         listen = %sqlite_config.proxy.mysql_listen,
@@ -1223,7 +1287,6 @@ fn start_single_node_sqlite(
             Err(e) => tracing::error!("litewire error: {e:#}"),
         }
     }));
-    Ok(())
 }
 
 /// Start clustered SQLite (sqld sidecar + litewire with Hrana client backend).
@@ -1439,6 +1502,7 @@ mod lib_tests {
     fn make_sqlite_config(role: &str) -> ephpm_config::SqliteConfig {
         ephpm_config::SqliteConfig {
             path: "test.db".into(),
+            engine: "sqlite".into(),
             proxy: ephpm_config::SqliteProxyConfig::default(),
             sqld: ephpm_config::SqldConfig::default(),
             replication: ephpm_config::ReplicationConfig {
@@ -1472,6 +1536,31 @@ mod lib_tests {
         let config = make_sqlite_config("replica");
         assert!(is_clustered_sqlite(&config, false));
         assert!(is_clustered_sqlite(&config, true));
+    }
+
+    // ── [db.sqlite].engine validation ───────────────────────────────────────
+
+    #[test]
+    fn sqlite_engine_default_always_valid() {
+        assert!(validate_sqlite_engine("sqlite", false).is_ok());
+        assert!(validate_sqlite_engine("sqlite", true).is_ok());
+    }
+
+    #[test]
+    fn turso_engine_valid_single_node_only() {
+        assert!(validate_sqlite_engine("turso", false).is_ok());
+    }
+
+    #[test]
+    fn turso_engine_rejected_in_clustered_mode() {
+        let err = validate_sqlite_engine("turso", true).unwrap_err();
+        assert!(err.to_string().contains("not supported in clustered mode"), "{err}");
+    }
+
+    #[test]
+    fn unknown_engine_rejected() {
+        let err = validate_sqlite_engine("sqlite3", false).unwrap_err();
+        assert!(err.to_string().contains("not a valid engine"), "{err}");
     }
 
     // ── idle timeout ────────────────────────────────────────────────────────

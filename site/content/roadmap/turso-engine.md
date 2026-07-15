@@ -53,13 +53,25 @@ black-box sidecar ever was.
   (`/v2/pipeline`, `/pull-updates`) with a reference local server —
   self-hosting is a supported premise, not a loophole.
 - Near-complete SQLite surface compatibility; **missing: multiprocess
-  support, vacuum**. Beta, `v0.7.0-pre` release line.
+  support, vacuum**. Beta, `v0.7.0-pre` release line. (Update
+  2026-07-14: `v0.7.0` non-pre is out on crates.io; upstream positioning
+  is still Beta and multiprocess/vacuum are still experimental flags —
+  gate 1 remains open.)
 - SQLite file-format compatibility is claimed; must be verified by us
   (see gates) before any migration story is written.
 
 ## Plan
 
 ### Phase 1 — experimental backend (can start before GA)
+
+> **Status: SHIPPED (experimental), 2026-07.** litewire has a
+> `litewire-turso` backend (facade feature `turso`, off by default;
+> engine pinned `turso =0.7.0`) and ePHPm exposes it as
+> `[db.sqlite] engine = "turso"` — single-node only, rejected in
+> clustered mode, warns at startup. Gate 2–4 evidence lives in
+> `docs/turso-phase1-results.md`; Phase 2 design notes in
+> `docs/turso-phase2-cdc-design.md`. Gates 1 and 5 remain open and the
+> default engine is unchanged.
 
 A `turso-backend` crate in litewire beside `rusqlite-backend`, behind a
 feature flag and an explicit opt-in config knob marked **experimental**
