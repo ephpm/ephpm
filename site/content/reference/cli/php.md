@@ -24,16 +24,25 @@ ephpm php script.php
 ephpm php artisan migrate
 ephpm php artisan tinker
 
-# WordPress (WP-CLI)
-ephpm php wp-cli.phar plugin list
-ephpm php wp-cli.phar user list
-
-# Composer (also a phar)
-ephpm php composer.phar install
-
 # Print loaded modules
 ephpm php -m
 ```
+
+## Phar support and the SAPI caveat
+
+The `phar` extension is compiled in, and `.phar` archives load and execute:
+`ephpm php app.phar` runs the archive's stub, and `phar://` streams work.
+
+However, `ephpm php` reports `PHP_SAPI` as `ephpm`, not `cli` — and some
+popular phar tools refuse to run on any SAPI other than `cli`:
+
+- **WP-CLI** (`wp-cli.phar`) exits immediately: *"WP-CLI only works correctly
+  from the command line, using the 'cli' PHP SAPI."*
+- **Composer** (`composer.phar`) aborts: *"Composer cannot be run safely on
+  non-CLI SAPIs with register_argc_argv=On."*
+
+For those tools, use a stock `php` CLI binary. Phars that don't gate on
+`PHP_SAPI` run fine under `ephpm php`.
 
 ## Why use `ephpm php`?
 
@@ -46,7 +55,7 @@ The embedded PHP interpreter is the **same** runtime that serves HTTP requests. 
 
 ## How it works
 
-`ephpm php` runs the embedded PHP runtime (the `ephpm` SAPI) in CLI mode via FFI. It's not a wrapper around an external `php` binary. The argument list is forwarded as-is, including `-r`, `-d`, file paths, and trailing application arguments — script arguments are registered as `$argv`/`$argc` (and mirrored into `$_SERVER`, with `PHP_SELF`/`SCRIPT_NAME`/`SCRIPT_FILENAME` set to the script path) exactly as the stock `php` CLI does, so Symfony Console, artisan, and WP-CLI see their arguments. Shebang lines (`#!/usr/bin/env php`) are skipped.
+`ephpm php` runs the embedded PHP runtime (the `ephpm` SAPI) in CLI mode via FFI. It's not a wrapper around an external `php` binary. The argument list is forwarded as-is, including `-r`, `-d`, file paths, and trailing application arguments — script arguments are registered as `$argv`/`$argc` (and mirrored into `$_SERVER`, with `PHP_SELF`/`SCRIPT_NAME`/`SCRIPT_FILENAME` set to the script path) exactly as the stock `php` CLI does, so Symfony Console and artisan see their arguments. Shebang lines (`#!/usr/bin/env php`) are skipped.
 
 ## Windows note
 
