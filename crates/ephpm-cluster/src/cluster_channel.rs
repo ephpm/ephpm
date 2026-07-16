@@ -192,6 +192,11 @@ impl std::fmt::Debug for Handle {
 
 struct HandleInner {
     listen_addr: SocketAddr,
+    /// The gossip layer's listen IP, captured at bind time. Used to
+    /// substitute the wildcard IP when advertising this node's
+    /// dial-me address to peers via
+    /// [`Handle::advertise_addr`] — see the doc there for why.
+    gossip_advertise_ip: std::net::IpAddr,
     cipher: Arc<ClusterCipher>,
     /// Registered stream handlers, keyed by full stream-type string.
     ///
@@ -231,9 +236,31 @@ pub type ChannelStream = Compat<yamux::Stream>;
 
 impl Handle {
     /// The address the channel listener is bound on.
+    ///
+    /// This is the raw bind address — it may have an unspecified IP
+    /// (`0.0.0.0` / `::`) if the operator asked us to bind on all
+    /// interfaces. Do NOT publish this to peers verbatim; use
+    /// [`Handle::advertise_addr`] instead (see the doc there for why).
     #[must_use]
     pub fn listen_addr(&self) -> SocketAddr {
         self.inner.listen_addr
+    }
+
+    /// The address peers should dial to reach this node's channel.
+    ///
+    /// Substitutes the wildcard IP (`0.0.0.0` / `::`) with the gossip
+    /// advertise IP so remote replicas do not try to dial `0.0.0.0`
+    /// (which they will, refused by their local stack). The port is
+    /// always the actual listener port.
+    ///
+    /// If the operator bound both the channel and gossip on wildcard
+    /// IPs there is no discoverable advertise IP; this returns `None`
+    /// and callers must refuse the operation with a config error
+    /// pointing operators at `[cluster] bind` or an explicit
+    /// `[cluster.channel] listen`.
+    #[must_use]
+    pub fn advertise_addr(&self) -> Option<SocketAddr> {
+        resolve_advertise_addr(self.inner.listen_addr, self.inner.gossip_advertise_ip)
     }
 
     /// Register a handler for exact stream-type `pattern`.
@@ -358,9 +385,12 @@ pub async fn maybe_start(
     let cipher = Arc::new(ClusterCipher::for_cluster_channel(effective_secret));
     let handlers: Arc<Mutex<Vec<HandlerEntry>>> = Arc::new(Mutex::new(Vec::new()));
 
+    let gossip_advertise_ip = cluster.gossip_socket_addr().ip();
+
     let handle = Handle {
         inner: Arc::new(HandleInner {
             listen_addr,
+            gossip_advertise_ip,
             cipher: Arc::clone(&cipher),
             handlers: Arc::clone(&handlers),
         }),
@@ -394,6 +424,32 @@ fn resolve_listen_addr(
         .checked_add(2)
         .context("gossip port is >= u16::MAX - 1; cannot derive cluster channel port")?;
     Ok(SocketAddr::new(gossip.ip(), port))
+}
+
+/// Compute the address peers should dial to reach us.
+///
+/// If the listener bound a wildcard IP (`0.0.0.0` / `::`), substitute
+/// the gossip layer's own listen IP — it's the only IP we know is
+/// meaningful to peers (they either directly know it from `join =
+/// [...]` or discovered us through gossip with that IP already
+/// published as our identity).
+///
+/// Returns `None` when the gossip IP is *also* unspecified. In that
+/// case there is no discoverable advertise IP and the caller must
+/// refuse the operation with a clear config error — publishing
+/// `0.0.0.0:PORT` to peers is guaranteed-broken (a remote replica
+/// would dial `0.0.0.0` on its local stack, which is refused).
+///
+/// Kept as a free function so both the runtime and the unit tests
+/// exercise the identical logic without spinning up a real listener.
+fn resolve_advertise_addr(listen: SocketAddr, gossip_ip: std::net::IpAddr) -> Option<SocketAddr> {
+    if !listen.ip().is_unspecified() {
+        return Some(listen);
+    }
+    if gossip_ip.is_unspecified() {
+        return None;
+    }
+    Some(SocketAddr::new(gossip_ip, listen.port()))
 }
 
 // ---------------------------------------------------------------------------
@@ -822,5 +878,136 @@ mod tests {
         // flakiness in CI we can move to explicit gossip port hopping.
         let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         s.local_addr().unwrap().to_string()
+    }
+
+    // -----------------------------------------------------------------
+    // advertise_addr — the "don't publish 0.0.0.0 to peers" contract.
+    //
+    // Regression coverage for the exact bug that the cross-container
+    // cluster e2e surfaced: with `bind = "0.0.0.0"` on both nodes, the
+    // primary was publishing `0.0.0.0:PORT` into the election KV, and
+    // replicas were dialing 0.0.0.0 on their local stack. The unit
+    // test level catches this cheaply.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn resolve_advertise_returns_listen_when_listen_ip_is_specific() {
+        // A specific bound IP is already the advertise IP — return
+        // verbatim.
+        let listen: SocketAddr = "10.0.1.5:8094".parse().unwrap();
+        let gossip_ip = "10.0.1.5".parse().unwrap();
+        assert_eq!(resolve_advertise_addr(listen, gossip_ip), Some(listen));
+    }
+
+    #[test]
+    fn resolve_advertise_substitutes_gossip_ip_when_listen_is_wildcard_v4() {
+        // This is Bug 2: listen is 0.0.0.0, gossip has a real IP, so
+        // we publish gossip_ip:listen_port to peers.
+        let listen: SocketAddr = "0.0.0.0:8094".parse().unwrap();
+        let gossip_ip = "10.0.1.5".parse().unwrap();
+        let advertise = resolve_advertise_addr(listen, gossip_ip).expect("resolvable");
+        assert_eq!(advertise.ip().to_string(), "10.0.1.5");
+        assert_eq!(advertise.port(), 8094);
+    }
+
+    #[test]
+    fn resolve_advertise_substitutes_gossip_ip_when_listen_is_wildcard_v6() {
+        // Same wildcard rule for IPv6 :: — the ip().is_unspecified()
+        // check covers both families uniformly.
+        let listen: SocketAddr = "[::]:8094".parse().unwrap();
+        let gossip_ip = "fd00::1".parse().unwrap();
+        let advertise = resolve_advertise_addr(listen, gossip_ip).expect("resolvable");
+        assert_eq!(advertise.ip().to_string(), "fd00::1");
+        assert_eq!(advertise.port(), 8094);
+    }
+
+    #[test]
+    fn resolve_advertise_returns_none_when_both_are_wildcard() {
+        // No discoverable IP anywhere — caller must refuse to
+        // start with a config error, not publish 0.0.0.0.
+        let listen: SocketAddr = "0.0.0.0:8094".parse().unwrap();
+        let gossip_ip = "0.0.0.0".parse().unwrap();
+        assert!(resolve_advertise_addr(listen, gossip_ip).is_none());
+    }
+
+    #[test]
+    fn resolve_advertise_none_for_v6_wildcard_pair() {
+        let listen: SocketAddr = "[::]:8094".parse().unwrap();
+        let gossip_ip = "::".parse().unwrap();
+        assert!(resolve_advertise_addr(listen, gossip_ip).is_none());
+    }
+
+    /// End-to-end: a real handle bound with a specific IP returns
+    /// `Some(listen_addr)` verbatim from `advertise_addr` — the
+    /// happy-path we do NOT want the fix to change.
+    #[tokio::test]
+    async fn advertise_addr_matches_listen_when_bound_to_loopback() {
+        let gossip_bind = pick_free_port_addr();
+        let cfg = ephpm_config::ClusterConfig {
+            enabled: true,
+            bind: gossip_bind,
+            secret: "advertise-test-secret".to_string(),
+            ..ephpm_config::ClusterConfig::default()
+        };
+        let cluster = crate::start_gossip(&cfg).await.expect("gossip start");
+        let handle = maybe_start(
+            &ephpm_config::ClusterChannelConfig::default(),
+            &cfg.secret,
+            &cluster,
+            FeatureFlags { cdc: true },
+        )
+        .await
+        .expect("maybe_start")
+        .expect("channel handle");
+        assert_eq!(handle.advertise_addr(), Some(handle.listen_addr()));
+    }
+
+    /// End-to-end for Bug 2: bind on `0.0.0.0` — `listen_addr()` must
+    /// still be `0.0.0.0:PORT` (that's what we bound), but
+    /// `advertise_addr()` must swap in a routable IP (loopback in
+    /// this test, since chitchat has the *identical* wildcard problem
+    /// and we bind gossip on 127.0.0.1 too).
+    ///
+    /// This is the assertion the missing test would have made and
+    /// which would have caught the shipped bug.
+    #[tokio::test]
+    async fn advertise_addr_substitutes_wildcard_bound_channel() {
+        // Bind gossip on a real IP so it has an advertise IP to
+        // donate, but tell the channel to bind on 0.0.0.0 (a pattern
+        // real operators use, and the shape of the container
+        // deployment that surfaced Bug 2).
+        let gossip_bind = pick_free_port_addr();
+        let cfg = ephpm_config::ClusterConfig {
+            enabled: true,
+            bind: gossip_bind,
+            secret: "advertise-test-secret".to_string(),
+            ..ephpm_config::ClusterConfig::default()
+        };
+        let cluster = crate::start_gossip(&cfg).await.expect("gossip start");
+
+        // Pick a free TCP port for the channel by binding and dropping.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let chan_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let channel_cfg = ephpm_config::ClusterChannelConfig {
+            listen: Some(format!("0.0.0.0:{chan_port}")),
+            secret: None,
+        };
+        let handle = maybe_start(&channel_cfg, &cfg.secret, &cluster, FeatureFlags { cdc: true })
+            .await
+            .expect("maybe_start")
+            .expect("channel handle");
+
+        assert!(
+            handle.listen_addr().ip().is_unspecified(),
+            "test precondition: we asked for a wildcard bind"
+        );
+        let advertise = handle.advertise_addr().expect("advertise must resolve");
+        assert!(
+            !advertise.ip().is_unspecified(),
+            "advertise_addr must NOT be a wildcard: got {advertise}"
+        );
+        assert_eq!(advertise.port(), handle.listen_addr().port());
     }
 }

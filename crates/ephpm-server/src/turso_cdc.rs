@@ -284,7 +284,21 @@ pub async fn start_clustered_turso_cdc(
 
     let db_path = &sqlite_config.path;
 
-    let channel_advertise = channel.listen_addr();
+    // Use the resolved advertise address — NOT `listen_addr()`
+    // verbatim — for what we publish to peers. This matters when the
+    // channel is bound on a wildcard IP (`0.0.0.0` / `::`): if we
+    // published `0.0.0.0:PORT` into the election KV, remote replicas
+    // would dial `0.0.0.0` on their own stack (refused). Refuse to
+    // start when there is no discoverable advertise IP anywhere, and
+    // point operators at the two knobs that fix it.
+    let channel_advertise = channel.advertise_addr().context(
+        "clustered Turso CDC replication cannot advertise the cluster channel address: \
+         both [cluster] bind and [cluster.channel] listen use an unspecified IP \
+         (0.0.0.0 / ::), so there is no address we can publish that a remote replica \
+         could dial. Bind [cluster] to a specific IP that peers can reach (e.g. \
+         \"10.0.1.5:7946\"), or set [cluster.channel] listen to a specific \
+         host:port explicitly.",
+    )?;
     let (initial_role, role_rx) = determine_role(sqlite_config, cluster, channel_advertise).await?;
 
     // Wire factory: served to litewire. Primary opts every session into
@@ -376,10 +390,17 @@ fn elected_to_role(elected: ephpm_cluster::ElectedRole) -> Role {
         ephpm_cluster::ElectedRole::Replica { primary_grpc_url } => {
             // In CDC-native mode the election broadcasts the primary's
             // *cluster channel* address in the `primary_grpc_url`
-            // field. If it fails to parse we treat it as a config error
-            // and log — the driver task will exit and the next role
-            // change will get a fresh chance.
-            match primary_grpc_url.parse::<SocketAddr>() {
+            // field. Note: the election machinery is shared with the
+            // sqld path, which stores `"http://host:port"` (raw sqld
+            // gRPC URL format) — so this reader normalizes both forms.
+            //
+            // We fix it here on the reader side rather than teach the
+            // emitter to publish two formats: the emitter feeds a
+            // gossip KV entry that's read by every subscriber, and
+            // bloating that entry with a second serialization for one
+            // consumer's benefit is the wrong direction. The sqld
+            // reader keeps its URL form; the CDC reader strips.
+            match parse_primary_addr(&primary_grpc_url) {
                 Ok(addr) => Role::Replica { primary_addr: addr },
                 Err(e) => {
                     tracing::error!(
@@ -396,6 +417,41 @@ fn elected_to_role(elected: ephpm_cluster::ElectedRole) -> Role {
     }
 }
 
+/// Parse a primary address published by [`ephpm_cluster::SqliteElection`].
+///
+/// Accepts both:
+/// - Raw `SocketAddr` form (`"10.0.0.1:8094"`) — what the CDC path
+///   will publish once every deployment has upgraded.
+/// - URL form (`"http://10.0.0.1:8094"`, optionally with trailing
+///   path) — what the shared election emitter produces today for the
+///   sqld path. See the `elected_to_role` doc for why we normalize on
+///   the reader side.
+///
+/// Returns `Err` on unparseable input; the caller logs and falls back
+/// to a bogus address so the driver task does not panic.
+/// Parse a primary address published by [`ephpm_cluster::SqliteElection`].
+///
+/// Public so cross-crate integration tests can exercise the exact same
+/// parse the production replica uses. See the module-level Bug 1 doc
+/// on why we accept both `http://addr` and raw `addr` forms.
+///
+/// # Errors
+///
+/// Returns an error when the input cannot be reduced to a valid
+/// `host:port` after scheme/path stripping.
+pub fn parse_primary_addr(s: &str) -> anyhow::Result<SocketAddr> {
+    let trimmed = s.trim();
+    // Strip a scheme prefix if present (`http://`, `https://`, or any
+    // other `<scheme>://`), then strip any trailing path so the parse
+    // sees a bare `host:port`.
+    let host_and_path = match trimmed.split_once("://") {
+        Some((_scheme, rest)) => rest,
+        None => trimmed,
+    };
+    let host_port = host_and_path.split(['/', '?', '#']).next().unwrap_or(host_and_path);
+    host_port.parse::<SocketAddr>().with_context(|| format!("expected host:port, got {trimmed:?}"))
+}
+
 async fn determine_role(
     sqlite_config: &SqliteConfig,
     cluster: &Arc<ephpm_cluster::ClusterHandle>,
@@ -410,11 +466,17 @@ async fn determine_role(
                  in CDC-native replication mode (this field carries the primary's \
                  cluster channel address in this mode, e.g. \"10.0.0.1:7947\")"
             );
-            let addr: SocketAddr =
-                sqlite_config.replication.primary_grpc_url.parse().with_context(|| {
+            // Accept both "host:port" and "http://host:port" forms —
+            // the URL form is what auto-election publishes today
+            // (shared with the sqld path); operators who copy that
+            // address into an explicit `[db.sqlite.replication]
+            // primary_grpc_url` value should not have their config
+            // rejected just because we changed the reader.
+            let addr = parse_primary_addr(&sqlite_config.replication.primary_grpc_url)
+                .with_context(|| {
                     format!(
-                        "replication.primary_grpc_url is not a valid SocketAddr in CDC-native \
-                         mode (expected \"host:port\", got {:?})",
+                        "replication.primary_grpc_url is not a valid address in CDC-native \
+                         mode (expected \"host:port\" or \"http://host:port\", got {:?})",
                         sqlite_config.replication.primary_grpc_url
                     )
                 })?;
@@ -718,5 +780,76 @@ mod tests {
              cluster channel dispatch table stays coherent",
             ephpm_cluster::stream_type::CDC_PREFIX
         );
+    }
+
+    // -----------------------------------------------------------------
+    // parse_primary_addr — Bug 1 regression coverage.
+    //
+    // The elected-primary KV entry today is emitted by the shared
+    // sqlite_election machinery in URL form (`http://addr`). The old
+    // code parsed it directly as a SocketAddr and dropped every
+    // election result on the floor. These tests lock in the "accept
+    // both forms" contract.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_primary_addr_accepts_raw_socketaddr() {
+        let addr = parse_primary_addr("10.0.0.1:8094").unwrap();
+        assert_eq!(addr, "10.0.0.1:8094".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_primary_addr_accepts_http_url_form() {
+        // This is the exact string sqlite_election publishes today.
+        let addr = parse_primary_addr("http://10.0.0.1:8094").unwrap();
+        assert_eq!(addr, "10.0.0.1:8094".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_primary_addr_accepts_https_url_form() {
+        let addr = parse_primary_addr("https://10.0.0.1:8094").unwrap();
+        assert_eq!(addr, "10.0.0.1:8094".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_primary_addr_strips_trailing_path() {
+        let addr = parse_primary_addr("http://10.0.0.1:8094/hrana/v3").unwrap();
+        assert_eq!(addr, "10.0.0.1:8094".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_primary_addr_ipv6_forms() {
+        let raw = parse_primary_addr("[::1]:8094").unwrap();
+        assert_eq!(raw, "[::1]:8094".parse::<SocketAddr>().unwrap());
+        let url = parse_primary_addr("http://[::1]:8094").unwrap();
+        assert_eq!(url, "[::1]:8094".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn parse_primary_addr_rejects_garbage() {
+        assert!(parse_primary_addr("").is_err());
+        assert!(parse_primary_addr("not-a-host-port").is_err());
+        assert!(parse_primary_addr("http://").is_err());
+    }
+
+    /// Direct regression proof: the exact log line from the observed
+    /// failure (`primary=http://0.0.0.0:8094`) now parses to a real
+    /// SocketAddr instead of the SocketAddr-parse error the old code
+    /// produced. The `0.0.0.0` here is only a bug-2 artifact (that
+    /// the primary should not have advertised it) — parsing must
+    /// still succeed so the caller reaches the dial attempt and the
+    /// operator can see the real problem in the error.
+    #[test]
+    fn elected_to_role_parses_wildcard_url_form_from_field_bug() {
+        let elected = ephpm_cluster::ElectedRole::Replica {
+            primary_grpc_url: "http://0.0.0.0:8094".to_string(),
+        };
+        let role = elected_to_role(elected);
+        match role {
+            Role::Replica { primary_addr } => {
+                assert_eq!(primary_addr, "0.0.0.0:8094".parse::<SocketAddr>().unwrap());
+            }
+            Role::Primary => panic!("expected Role::Replica, got Primary"),
+        }
     }
 }
