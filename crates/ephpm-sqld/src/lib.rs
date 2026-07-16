@@ -246,27 +246,39 @@ fn extract_binary() -> impl std::future::Future<Output = anyhow::Result<PathBuf>
     )))
 }
 
+/// Build the sqld command line for the given config and role.
+fn build_command(
+    binary_path: &std::path::Path,
+    config: &SqldConfig,
+    role: &SqldRole,
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(binary_path);
+    cmd.arg("--db-path").arg(&config.db_path).arg("--http-listen-addr").arg(&config.http_listen);
+
+    match role {
+        SqldRole::Primary => {
+            cmd.arg("--grpc-listen-addr").arg(&config.grpc_listen);
+        }
+        SqldRole::Replica { primary_grpc_url } => {
+            // sqld rejects --grpc-listen-addr when --primary-grpc-url is
+            // set. A replica syncs from the primary and does not serve
+            // WAL frames to further replicas in this topology.
+            cmd.arg("--primary-grpc-url").arg(primary_grpc_url);
+        }
+    }
+
+    cmd
+}
+
 /// Spawn the sqld child process with the given config and role.
 fn spawn_child(
     binary_path: &std::path::Path,
     config: &SqldConfig,
     role: &SqldRole,
 ) -> anyhow::Result<tokio::process::Child> {
-    let mut cmd = tokio::process::Command::new(binary_path);
-    cmd.arg("--db-path")
-        .arg(&config.db_path)
-        .arg("--http-listen-addr")
-        .arg(&config.http_listen)
-        .arg("--grpc-listen-addr")
-        .arg(&config.grpc_listen);
-
-    if let SqldRole::Replica { primary_grpc_url } = role {
-        cmd.arg("--primary-grpc-url").arg(primary_grpc_url);
-    }
-
+    let mut cmd = build_command(binary_path, config, role);
     // Inherit stdout/stderr so sqld logs appear in ephpm's output.
     cmd.stdout(std::process::Stdio::inherit()).stderr(std::process::Stdio::inherit());
-
     cmd.spawn().context("failed to spawn sqld child process")
 }
 
@@ -361,26 +373,69 @@ mod tests {
         assert_eq!(health_url, "http://0.0.0.0:9090/health");
     }
 
-    #[test]
-    fn spawn_child_args_primary() {
-        // Verify the command line arguments generated for primary role.
-        let config = test_config();
-        let binary = PathBuf::from("/fake/sqld");
-        // We can't actually spawn (binary doesn't exist), but we can
-        // test that spawn_child doesn't panic during construction.
-        let result = spawn_child(&binary, &config, &SqldRole::Primary);
-        // Will fail because /fake/sqld doesn't exist — that's fine,
-        // we're testing the arg construction path.
-        assert!(result.is_err());
+    fn collect_args(cmd: &tokio::process::Command) -> Vec<String> {
+        cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect()
     }
 
     #[test]
-    fn spawn_child_args_replica() {
+    fn build_command_primary_has_grpc_listen() {
         let config = test_config();
-        let binary = PathBuf::from("/fake/sqld");
+        let cmd = build_command(std::path::Path::new("/fake/sqld"), &config, &SqldRole::Primary);
+        let args = collect_args(&cmd);
+        assert!(
+            args.iter().any(|a| a == "--grpc-listen-addr"),
+            "primary must serve gRPC: {args:?}"
+        );
+        assert!(
+            args.iter().all(|a| a != "--primary-grpc-url"),
+            "primary must not point at another primary: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_command_replica_omits_grpc_listen() {
+        // Regression: sqld's CLI rejects --grpc-listen-addr combined with
+        // --primary-grpc-url. Replicas must not pass the listener flag.
+        let config = test_config();
         let role = SqldRole::Replica { primary_grpc_url: "http://10.0.1.2:5001".into() };
-        let result = spawn_child(&binary, &config, &role);
-        assert!(result.is_err());
+        let cmd = build_command(std::path::Path::new("/fake/sqld"), &config, &role);
+        let args = collect_args(&cmd);
+        assert!(
+            args.iter().all(|a| a != "--grpc-listen-addr"),
+            "replica must not pass --grpc-listen-addr (sqld rejects the combination): {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "--primary-grpc-url"),
+            "replica must point at its primary: {args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a == "http://10.0.1.2:5001"),
+            "primary URL must be passed through verbatim: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_command_common_args_both_roles() {
+        let config = test_config();
+        for role in
+            [SqldRole::Primary, SqldRole::Replica { primary_grpc_url: "http://x:5001".into() }]
+        {
+            let cmd = build_command(std::path::Path::new("/fake/sqld"), &config, &role);
+            let args = collect_args(&cmd);
+            assert!(args.iter().any(|a| a == "--db-path"), "{role:?} needs --db-path: {args:?}");
+            assert!(
+                args.iter().any(|a| a == "--http-listen-addr"),
+                "{role:?} needs --http-listen-addr: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_child_fails_on_missing_binary() {
+        let config = test_config();
+        assert!(
+            spawn_child(std::path::Path::new("/fake/sqld"), &config, &SqldRole::Primary).is_err()
+        );
     }
 
     #[test]
