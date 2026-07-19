@@ -273,6 +273,30 @@ pub struct ResponseConfig {
     #[serde(default = "default_compression_min_size")]
     pub compression_min_size: usize,
 
+    /// Streaming (worker-mode `send_response_stream`) response compression.
+    ///
+    /// Values: `"off"`, `"sse"`, `"all"`.
+    ///
+    /// - `"off"` — streamed responses go out identity-encoded; the code
+    ///   path is byte-for-byte identical to releases without this knob.
+    /// - `"sse"` — streamed responses with Content-Type
+    ///   `text/event-stream` are brotli-compressed with one encoder whose
+    ///   window persists for the stream's lifetime, flushed per chunk so
+    ///   each SSE event is decodable the moment it arrives. Repeated
+    ///   re-renders of similar markup compress to tiny wire deltas.
+    /// - `"all"` — every streamed worker response is compressed this way
+    ///   (including binary downloads — usually wasteful; prefer `"sse"`).
+    ///
+    /// Only applies when `compression = true` and the client sent
+    /// `Accept-Encoding: br`; otherwise the stream passes through
+    /// untouched. Unknown values log a startup warning and behave as
+    /// `"off"`. Buffered (fpm and worker `send_response`) responses are
+    /// unaffected — they keep the existing whole-body compression.
+    ///
+    /// Default: `"off"`.
+    #[serde(default = "default_compression_streaming")]
+    pub compression_streaming: String,
+
     /// Custom headers added to every response (both PHP and static).
     ///
     /// Useful for security headers like HSTS, CSP, X-Frame-Options, CORS.
@@ -1830,6 +1854,7 @@ impl Default for ResponseConfig {
             compression: default_compression(),
             compression_level: default_compression_level(),
             compression_min_size: default_compression_min_size(),
+            compression_streaming: default_compression_streaming(),
             headers: Vec::new(),
         }
     }
@@ -2935,6 +2960,10 @@ fn default_compression_min_size() -> usize {
     1024
 }
 
+fn default_compression_streaming() -> String {
+    "off".to_string()
+}
+
 fn default_hidden_files() -> String {
     "deny".to_string()
 }
@@ -3355,6 +3384,37 @@ ttl_secs = -1
         let config = Config::load(&file).unwrap();
         assert!(config.server.php_etag_cache.enabled);
         assert_eq!(config.server.php_etag_cache.ttl_secs, -1);
+    }
+
+    #[test]
+    fn test_compression_streaming_defaults_off() {
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.server.response.compression_streaming, "off");
+    }
+
+    #[test]
+    fn test_compression_streaming_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server.response]
+compression_streaming = "sse"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.response.compression_streaming, "sse");
+    }
+
+    #[test]
+    fn test_env_var_overrides_compression_streaming() {
+        temp_env::with_var("EPHPM_SERVER__RESPONSE__COMPRESSION_STREAMING", Some("all"), || {
+            let config = Config::default_config().unwrap();
+            assert_eq!(config.server.response.compression_streaming, "all");
+        });
     }
 
     #[test]
