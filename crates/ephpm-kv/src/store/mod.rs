@@ -5,6 +5,7 @@
 //! approximate memory tracking.
 
 mod entry;
+mod watch;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -16,6 +17,7 @@ use bytes::Bytes;
 use dashmap::{DashMap, DashSet};
 pub use entry::Entry;
 use tracing::{debug, trace};
+use watch::WatchSlot;
 
 /// Eviction policy when the memory limit is reached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -204,6 +206,16 @@ pub struct Store {
     /// shard *read* lock instead of taking the write lock via
     /// `get_mut`. 584 years of headroom in `u64::MAX` nanos.
     anchor: Instant,
+    /// Per-key watch slots backing [`Store::wait_for_change`]
+    /// (`ephpm_kv_wait()` from PHP). Created lazily on first wait, never
+    /// reclaimed — see the [`watch`] module docs for the design and the
+    /// zero-cost-when-unused invariant.
+    watchers: DashMap<String, Arc<WatchSlot>>,
+    /// Number of live entries in `watchers`. Write paths check this with
+    /// a single atomic load before doing any watch-related work, so
+    /// deployments that never call `wait_for_change` pay exactly one
+    /// uncontended `Acquire` load per write — nothing else.
+    watch_slots: AtomicUsize,
 }
 
 impl std::fmt::Debug for Store {
@@ -216,6 +228,8 @@ impl std::fmt::Debug for Store {
             .field("config", &self.config)
             .field("replicator_installed", &self.replicator.read().is_ok_and(|g| g.is_some()))
             .field("anchor", &self.anchor)
+            .field("watchers_len", &self.watchers.len())
+            .field("watch_slots", &self.watch_slots.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -232,6 +246,8 @@ impl Store {
             config,
             replicator: std::sync::RwLock::new(None),
             anchor: Instant::now(),
+            watchers: DashMap::new(),
+            watch_slots: AtomicUsize::new(0),
         })
     }
 
@@ -386,6 +402,97 @@ impl Store {
         result
     }
 
+    // ── Key watches (blocking wait) ──────────────────────────────
+
+    /// Block until `key`'s watch version exceeds `last_version`, or
+    /// `timeout` elapses. This is the engine behind PHP's
+    /// `ephpm_kv_wait()`.
+    ///
+    /// Returns `Some((new_version, value))` when the version advanced
+    /// (`value` is `None` if the key is absent/deleted at wakeup time),
+    /// or `None` on timeout.
+    ///
+    /// The first call for a key creates its watch slot at version `1`,
+    /// so `wait_for_change(key, 0, _)` returns immediately with the
+    /// current value — the race-free "register + snapshot" step. See the
+    /// [`watch`] module docs for the full protocol and versioning rules.
+    ///
+    /// # Blocking
+    ///
+    /// Parks the calling OS thread. Callers are PHP worker threads or
+    /// the tokio `spawn_blocking` pool — never call this from an async
+    /// task.
+    ///
+    /// # Clustering
+    ///
+    /// Wakeups fire when the **local** copy of the key is written
+    /// (`set_local` / `remove_local` / in-place mutations), so on a
+    /// clustered store a waiter observes changes as they land on its own
+    /// node.
+    #[must_use]
+    pub fn wait_for_change(
+        &self,
+        key: &str,
+        last_version: u64,
+        timeout: Duration,
+    ) -> Option<(u64, Option<Bytes>)> {
+        let slot = self.watch_slot(key);
+        let version = slot.wait_past(last_version, timeout)?;
+        Some((version, self.get(key)))
+    }
+
+    /// Number of live watch slots (keys that have ever been waited on).
+    #[must_use]
+    pub fn watch_slot_count(&self) -> usize {
+        self.watch_slots.load(Ordering::Acquire)
+    }
+
+    /// Get or lazily create the watch slot for `key`.
+    fn watch_slot(&self, key: &str) -> Arc<WatchSlot> {
+        if let Some(slot) = self.watchers.get(key) {
+            return Arc::clone(&slot);
+        }
+        match self.watchers.entry(key.to_string()) {
+            dashmap::Entry::Occupied(occ) => Arc::clone(occ.get()),
+            dashmap::Entry::Vacant(vac) => {
+                let slot = Arc::new(WatchSlot::new());
+                // Publish the count BEFORE the slot becomes visible in the
+                // map (we hold the shard write lock here): a writer that
+                // sees the slot must also see a non-zero count, so it never
+                // skips a notify for a visible slot. The reverse (count
+                // visible, slot not yet) only makes a writer do one wasted
+                // lookup.
+                self.watch_slots.fetch_add(1, Ordering::Release);
+                vac.insert(Arc::clone(&slot));
+                slot
+            }
+        }
+    }
+
+    /// Look up the watch slot for `key`, gated by the fast-path count
+    /// check. Returns `None` — at the cost of a single `Acquire` load —
+    /// when no key has ever been waited on.
+    ///
+    /// Write paths that consume the key by value call this *before* the
+    /// map insert (borrowing the key) and bump the returned slot *after*
+    /// the write is visible, so a woken waiter always reads the new value.
+    #[inline]
+    fn watch_slot_if_any(&self, key: &str) -> Option<Arc<WatchSlot>> {
+        if self.watch_slots.load(Ordering::Acquire) == 0 {
+            return None;
+        }
+        self.watchers.get(key).map(|slot| Arc::clone(&slot))
+    }
+
+    /// Bump the watch version for `key` if it is being watched. Called by
+    /// write paths that still hold the key by reference after the write.
+    #[inline]
+    fn notify_write(&self, key: &str) {
+        if let Some(slot) = self.watch_slot_if_any(key) {
+            slot.bump();
+        }
+    }
+
     // ── Write operations ─────────────────────────────────────────
 
     /// Set a key to a value with an optional TTL.
@@ -456,7 +563,14 @@ impl Store {
         } else {
             self.ttl_keys.remove(&key);
         }
+        // Snapshot the watch slot BEFORE `key` moves into the insert; bump
+        // AFTER the insert so a woken waiter always reads the new value.
+        // One Acquire load when nothing is watched (the common case).
+        let watch = self.watch_slot_if_any(&key);
         self.data.insert(key, entry);
+        if let Some(slot) = watch {
+            slot.bump();
+        }
         true
     }
 
@@ -546,10 +660,12 @@ impl Store {
         };
         if inserted {
             if has_ttl {
-                self.ttl_keys.insert(key_ref);
+                self.ttl_keys.insert(key_ref.clone());
             } else {
                 self.ttl_keys.remove(&key_ref);
             }
+            // Wake any waiters — the insert is visible at this point.
+            self.notify_write(&key_ref);
         }
         inserted
     }
@@ -581,7 +697,14 @@ impl Store {
             false
         };
         let hash_removed = self.hash_remove(key);
-        string_removed || hash_removed
+        let removed = string_removed || hash_removed;
+        if removed {
+            // A delete is a state change: wake waiters so they observe the
+            // key as absent (covers explicit del, lazy-expiry reaps, and
+            // LRU eviction — all funnel through remove_local).
+            self.notify_write(key);
+        }
+        removed
     }
 
     /// Set an expiry on an existing key. Returns `false` if the key doesn't exist.
@@ -723,6 +846,9 @@ impl Store {
                 } else {
                     self.mem_sub(old_mem - new_mem);
                 }
+                // In-place update — wake waiters (the create path below
+                // notifies via set → set_local).
+                self.notify_write(key);
                 return Ok(new_val);
             }
         }
@@ -784,6 +910,9 @@ impl Store {
                 } else {
                     self.mem_sub(old_mem - new_mem);
                 }
+                // In-place append — wake waiters (the create path below
+                // notifies via set → set_local).
+                self.notify_write(key);
                 return final_len;
             }
         }
@@ -970,6 +1099,15 @@ impl Store {
         self.hashes.clear();
         self.ttl_keys.clear();
         self.mem_used.store(0, Ordering::Relaxed);
+        // A flush changes every key — wake all waiters so they observe the
+        // now-empty store. Watch slots themselves survive the flush (their
+        // versions must stay monotonic for the process lifetime; see the
+        // `watch` module docs).
+        if self.watch_slots.load(Ordering::Acquire) != 0 {
+            for slot in &self.watchers {
+                slot.value().bump();
+            }
+        }
     }
 
     // ── Background maintenance ───────────────────────────────────
@@ -2489,5 +2627,183 @@ mod tests {
             "unhooked set must write locally"
         );
         assert_eq!(rep.sets.lock().unwrap().len(), 1, "replicator must not see the direct write");
+    }
+
+    // ── Key watches (wait_for_change) ───────────────────────────────
+
+    #[test]
+    fn writes_never_create_watch_slots() {
+        // The zero-cost invariant: a store that is never waited on must
+        // not grow any watch state, no matter how much it is written.
+        let s = test_store();
+        for i in 0..100 {
+            s.set(format!("k{i}"), b"v".to_vec(), None);
+            let _ = s.incr_by("counter", 1);
+            s.remove(&format!("k{i}"));
+        }
+        assert_eq!(s.watch_slot_count(), 0, "writes must not allocate watch slots");
+        assert!(s.watchers.is_empty());
+    }
+
+    #[test]
+    fn wait_zero_returns_snapshot_immediately() {
+        let s = test_store();
+        s.set("k".into(), b"initial".to_vec(), None);
+        let start = Instant::now();
+        // last_version = 0 → fresh slot at version 1 already exceeds it:
+        // register + snapshot without blocking.
+        let (ver, val) = s.wait_for_change("k", 0, Duration::from_secs(30)).unwrap();
+        assert!(start.elapsed() < Duration::from_secs(1), "must not block");
+        assert_eq!(ver, 1);
+        assert_eq!(val.as_deref(), Some(&b"initial"[..]));
+        assert_eq!(s.watch_slot_count(), 1);
+    }
+
+    #[test]
+    fn wait_snapshot_on_missing_key_has_no_value() {
+        let s = test_store();
+        let (ver, val) = s.wait_for_change("ghost", 0, Duration::from_secs(1)).unwrap();
+        assert_eq!(ver, 1);
+        assert_eq!(val, None);
+    }
+
+    #[test]
+    fn wait_times_out_without_writes() {
+        let s = test_store();
+        let (ver, _) = s.wait_for_change("k", 0, Duration::from_secs(1)).unwrap();
+        let start = Instant::now();
+        assert!(s.wait_for_change("k", ver, Duration::from_millis(60)).is_none());
+        assert!(start.elapsed() >= Duration::from_millis(60));
+    }
+
+    #[test]
+    fn set_wakes_waiter_with_new_value() {
+        let s = test_store();
+        s.set("k".into(), b"old".to_vec(), None);
+        let (ver, _) = s.wait_for_change("k", 0, Duration::from_secs(1)).unwrap();
+
+        let waiter = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || s.wait_for_change("k", ver, Duration::from_secs(10)))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        s.set("k".into(), b"new".to_vec(), None);
+
+        let (new_ver, val) = waiter.join().unwrap().expect("waiter must wake on set");
+        assert!(new_ver > ver);
+        assert_eq!(val.as_deref(), Some(&b"new"[..]));
+    }
+
+    #[test]
+    fn del_wakes_waiter_with_absent_value() {
+        let s = test_store();
+        s.set("k".into(), b"v".to_vec(), None);
+        let (ver, _) = s.wait_for_change("k", 0, Duration::from_secs(1)).unwrap();
+
+        let waiter = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || s.wait_for_change("k", ver, Duration::from_secs(10)))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(s.remove("k"));
+
+        let (new_ver, val) = waiter.join().unwrap().expect("waiter must wake on del");
+        assert!(new_ver > ver);
+        assert_eq!(val, None, "deleted key must surface as absent");
+    }
+
+    #[test]
+    fn incr_wakes_waiter() {
+        let s = test_store();
+        let (ver, _) = s.wait_for_change("counter", 0, Duration::from_secs(1)).unwrap();
+
+        let waiter = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || s.wait_for_change("counter", ver, Duration::from_secs(10)))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(s.incr_by("counter", 1), Ok(1));
+
+        let (_, val) = waiter.join().unwrap().expect("waiter must wake on incr");
+        assert_eq!(val.as_deref(), Some(&b"1"[..]));
+    }
+
+    #[test]
+    fn expire_does_not_bump_version() {
+        // TTL-only changes are not value changes; the eventual expiry
+        // reap (a remove_local) is what wakes waiters.
+        let s = test_store();
+        s.set("k".into(), b"v".to_vec(), None);
+        let (ver, _) = s.wait_for_change("k", 0, Duration::from_secs(1)).unwrap();
+        assert!(s.expire("k", Duration::from_secs(3600)));
+        assert!(
+            s.wait_for_change("k", ver, Duration::from_millis(60)).is_none(),
+            "expire must not bump the watch version"
+        );
+    }
+
+    #[test]
+    fn writes_to_other_keys_do_not_wake_waiter() {
+        let s = test_store();
+        let (ver, _) = s.wait_for_change("watched", 0, Duration::from_secs(1)).unwrap();
+        s.set("unrelated".into(), b"v".to_vec(), None);
+        assert!(
+            s.wait_for_change("watched", ver, Duration::from_millis(60)).is_none(),
+            "unrelated writes must not bump the watched key's version"
+        );
+    }
+
+    #[test]
+    fn flush_wakes_waiters_and_keeps_slots() {
+        let s = test_store();
+        s.set("k".into(), b"v".to_vec(), None);
+        let (ver, _) = s.wait_for_change("k", 0, Duration::from_secs(1)).unwrap();
+
+        let waiter = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || s.wait_for_change("k", ver, Duration::from_secs(10)))
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        s.flush();
+
+        let (new_ver, val) = waiter.join().unwrap().expect("waiter must wake on flush");
+        assert!(new_ver > ver);
+        assert_eq!(val, None, "flushed key must surface as absent");
+        // Slots survive the flush — versions must stay monotonic.
+        assert_eq!(s.watch_slot_count(), 1);
+    }
+
+    #[test]
+    fn versions_are_monotonic_across_writes() {
+        let s = test_store();
+        let (mut ver, _) = s.wait_for_change("k", 0, Duration::from_secs(1)).unwrap();
+        for i in 0..5 {
+            s.set("k".into(), format!("v{i}").into_bytes(), None);
+            let (new_ver, val) =
+                s.wait_for_change("k", ver, Duration::from_secs(1)).expect("version advanced");
+            assert!(new_ver > ver, "versions must strictly increase");
+            assert_eq!(val.as_deref(), Some(format!("v{i}").as_bytes()));
+            ver = new_ver;
+        }
+    }
+
+    #[test]
+    fn multiple_waiters_all_wake_on_one_write() {
+        let s = test_store();
+        let (ver, _) = s.wait_for_change("k", 0, Duration::from_secs(1)).unwrap();
+
+        let waiters: Vec<_> = (0..4)
+            .map(|_| {
+                let s = Arc::clone(&s);
+                std::thread::spawn(move || s.wait_for_change("k", ver, Duration::from_secs(10)))
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(50));
+        s.set("k".into(), b"fanout".to_vec(), None);
+
+        for w in waiters {
+            let (_, val) = w.join().unwrap().expect("every waiter must wake");
+            assert_eq!(val.as_deref(), Some(&b"fanout"[..]));
+        }
     }
 }
