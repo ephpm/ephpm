@@ -29,13 +29,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # -- Linux binaries ---------------------------------------------------------
+  # -- Linux x86_64 binaries ---------------------------------------------------
+  # arm64 lives in its own job (build-linux-arm64) so it can be throttled
+  # independently: the v0.5.1 release run proved that firing every leg at
+  # once kills the shared hosts (all 9 non-x64 legs died mid-build with
+  # "runner lost communication" / vanished-disk signatures) while the x64
+  # pool handled 3 builds + 3 Docker jobs fine.
   build-linux:
     name: Build (PHP ${{ matrix.php.full }}, ${{ matrix.arch.sdk }})
-    # Built natively per arch: x64 on the WSL2 linux runner, arm64 on the
-    # Apple Silicon host's embedded linux VM (ephemerd dispatches
-    # `[self-hosted, linux, arm64]`). Each uses the matching CI image.
-    runs-on: [self-hosted, linux, "${{ matrix.arch.runner }}"]
+    runs-on: [self-hosted, linux, x64]
     container: "ephpm/ephpm-ci:${{ matrix.arch.image }}"
     strategy:
       fail-fast: false
@@ -50,17 +52,6 @@ jobs:
             triple: x86_64-unknown-linux-gnu
             sdk: linux-x86_64
             lto: fat
-          - runner: arm64
-            image: latest-arm64
-            triple: aarch64-unknown-linux-gnu
-            sdk: linux-aarch64
-            # Thin LTO on arm64: the fat-LTO final link of the ephpm binary
-            # (libphp.a + ICU + everything, codegen-units=1) exceeds the
-            # arm64 build host's memory — rustc gets SIGKILLed by the OOM
-            # killer even running as the only job. Thin LTO cuts link-time
-            # memory to a fraction for a ~1% perf delta on a target where
-            # we publish no benchmark numbers anyway.
-            lto: thin
     steps:
       - uses: actions/checkout@v4
 
@@ -108,12 +99,84 @@ jobs:
           name: ephpm-${{ github.ref_name }}-php${{ matrix.php.full }}-${{ matrix.arch.sdk }}
           path: ${{ steps.pkg.outputs.archive }}
 
+  # -- Linux arm64 binaries ----------------------------------------------------
+  build-linux-arm64:
+    name: Build (PHP ${{ matrix.php.full }}, linux-aarch64)
+    # arm64 builds run in the Apple Silicon host's embedded linux VM
+    # (ephemerd dispatches `[self-hosted, linux, arm64]`) — the SAME
+    # physical machine that runs build-macos natively. `needs: build-macos`
+    # is the only cross-job serialization GitHub offers, and max-parallel: 1
+    # keeps the VM to one heavy link at a time. Without both, the v0.5.1
+    # release run put 6 concurrent release builds on that one host and every
+    # runner on it died mid-build.
+    needs: build-macos
+    runs-on: [self-hosted, linux, arm64]
+    container: "ephpm/ephpm-ci:latest-arm64"
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        php:
+          - { minor: "8.3", full: "8.3.31" }
+          - { minor: "8.4", full: "8.4.23" }
+          - { minor: "8.5", full: "8.5.7" }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute release version
+        # See build-linux for rationale; strips leading "v" from the git ref.
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          echo "EPHPM_RELEASE_VERSION=${REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build ephpm
+        env:
+          # Thin LTO on arm64: the fat-LTO final link of the ephpm binary
+          # (libphp.a + ICU + everything, codegen-units=1) exceeds the
+          # arm64 build host's memory — rustc gets SIGKILLed by the OOM
+          # killer even running as the only job. Thin LTO cuts link-time
+          # memory to a fraction for a ~1% perf delta on a target where
+          # we publish no benchmark numbers anyway.
+          CARGO_PROFILE_RELEASE_LTO: thin
+        run: cargo xtask release ${{ matrix.php.minor }}
+
+      - name: Package archive
+        id: pkg
+        env:
+          VERSION: ${{ github.ref_name }}
+          PHP_FULL: ${{ matrix.php.full }}
+        run: |
+          set -eu
+          name="ephpm-${VERSION}+php${PHP_FULL}-linux-aarch64"
+          mkdir -p "dist/${name}"
+          # cargo xtask release targets the gnu triple explicitly on Linux
+          # (glibc-dynamic binary, dlopen-capable), so the binary lives under
+          # target/<triple>/release/, not target/release/.
+          cp "target/aarch64-unknown-linux-gnu/release/ephpm" "dist/${name}/ephpm"
+          cp LICENSE "dist/${name}/LICENSE"
+          cp .github/release-readme.txt "dist/${name}/README.txt"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          rm -rf "dist/${name}"
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-${{ github.ref_name }}-php${{ matrix.php.full }}-linux-aarch64
+          path: ${{ steps.pkg.outputs.archive }}
+
   # -- macOS binaries ---------------------------------------------------------
   build-macos:
     name: Build (PHP ${{ matrix.php_full }}, macos-aarch64)
     runs-on: [self-hosted, macos, arm64]
     strategy:
       fail-fast: false
+      # One fat-LTO release build at a time on the Apple Silicon host — it
+      # also hosts the linux-arm64 build VM (see build-linux-arm64). Raise
+      # to 2 only after a release proves real headroom.
+      max-parallel: 1
       matrix:
         include:
           - php_minor: "8.3"
@@ -189,6 +252,10 @@ jobs:
     runs-on: [self-hosted, windows, x64]
     strategy:
       fail-fast: false
+      # One release build per Windows worker at a time: the v0.5.1 run's 3
+      # concurrent legs took the pool down mid-build (work-dir device
+      # vanished under the runner). Loosen only with proven headroom.
+      max-parallel: 1
       matrix:
         include:
           - php_minor: "8.3"
@@ -407,7 +474,7 @@ jobs:
   # -- Release: gather archives, hash them, attach to the GitHub release ------
   release:
     name: Create Release
-    needs: [build-linux, build-macos, build-windows, docker-image]
+    needs: [build-linux, build-linux-arm64, build-macos, build-windows, docker-image]
     runs-on: [self-hosted, linux, x64]
     permissions:
       contents: write
