@@ -351,6 +351,13 @@ jobs:
 
       - name: Build ephpm.exe
         shell: powershell
+        env:
+          # Thin LTO on Windows: the fat-LTO final link (libphp static lib +
+          # everything, codegen-units=1) OOMs rustc-LLVM on the ephemerd
+          # worker VMs ("rustc-LLVM ERROR: out of memory", v0.5.1 run).
+          # Same trade as linux-aarch64 (#181): ~1% perf delta on a target
+          # with no published benchmark numbers.
+          CARGO_PROFILE_RELEASE_LTO: thin
         run: cargo xtask release ${{ matrix.php_minor }} --target windows --no-sqld
 
       - name: Package archive
