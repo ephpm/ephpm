@@ -684,12 +684,12 @@ impl Router {
         remote_addr: SocketAddr,
         is_tls: bool,
     ) -> Result<Response<ServerBody>, hyper::Error> {
-        // Standard HTTP methods from hyper are already uppercase; use
-        // `as_str()` (which yields `&'static str` for standard
-        // methods) instead of an owned uppercase `String`. Custom
-        // methods return a &str tied to the Method; own the label as
-        // a String only when we have to.
-        let method_label: String = req.method().as_str().to_string();
+        // Metrics label for the request method. Standard HTTP methods map to
+        // a `&'static str` so the two metric sites below allocate nothing per
+        // request (issue #136); non-standard methods collapse to `"OTHER"`,
+        // which also caps `method` label cardinality (an attacker sending
+        // random verbs can't explode the Prometheus series count).
+        let method_label: &'static str = method_metric_label(req.method());
 
         // Per-IP rate limiting (uses effective IP after proxy resolution).
         if let Some(ref limiter) = self.limiter {
@@ -703,10 +703,17 @@ impl Router {
         gauge!("ephpm_http_requests_in_flight").increment(1.0);
         let start = std::time::Instant::now();
 
-        let (result, handler) = if let Ok(result) =
-            tokio::time::timeout(self.request_timeout, self.handle_inner(req, remote_addr, is_tls))
-                .await
-        {
+        // A `request` timeout of 0 disables the per-request deadline
+        // (`[server.timeouts] request = 0`). In that mode we run the inner
+        // handler directly rather than paying to arm and disarm a tokio
+        // timer on every request (issue #135) - the timer registration is
+        // ~0.02ms of pure overhead when the deadline never fires.
+        let inner = self.handle_inner(req, remote_addr, is_tls);
+        let (result, handler) = if self.request_timeout.is_zero() {
+            let result = inner.await;
+            let handler = result.as_ref().map_or("error", |(_, h)| *h);
+            (result.map(|(resp, _)| resp), handler)
+        } else if let Ok(result) = tokio::time::timeout(self.request_timeout, inner).await {
             let handler = result.as_ref().map_or("error", |(_, h)| *h);
             (result.map(|(resp, _)| resp), handler)
         } else {
@@ -717,10 +724,18 @@ impl Router {
         let elapsed = start.elapsed().as_secs_f64();
         gauge!("ephpm_http_requests_in_flight").decrement(1.0);
         if let Ok(ref resp) = result {
-            let status = resp.status().as_u16().to_string();
+            // Map the status to a `&'static str` label. The `metrics` macros
+            // require label values to be `'static` (they intern into
+            // `Cow<'static, str>`); the previous code satisfied that by
+            // allocating `status.as_u16().to_string()` per request. The
+            // helper returns a static literal for the codes this server emits
+            // and collapses anything else to "other", so the hot path
+            // allocates nothing and status-label cardinality stays bounded
+            // (issue #136).
+            let status_label = status_metric_label(resp.status());
             counter!("ephpm_http_requests_total",
-                "method" => method_label.clone(),
-                "status" => status,
+                "method" => method_label,
+                "status" => status_label,
                 "handler" => handler
             )
             .increment(1);
@@ -1435,7 +1450,16 @@ impl Router {
         // `send_response_stream` -> response_begin delivers status+headers
         // immediately, before the body is produced), so a long streamed
         // download is NOT cut off by this timeout — the body flows afterward.
-        let awaited = tokio::time::timeout(self.request_timeout, rx).await;
+        //
+        // A `request` timeout of 0 disables the deadline (issue #135): await
+        // the receiver directly so no inner timer is armed. `rx` awaited bare
+        // yields `Result<_, RecvError>`; wrap it as `Ok(_)` to match the
+        // `timeout` arm's `Result<Result<_, _>, Elapsed>` shape.
+        let awaited = if self.request_timeout.is_zero() {
+            Ok(rx.await)
+        } else {
+            tokio::time::timeout(self.request_timeout, rx).await
+        };
         gauge!("ephpm_worker_busy").decrement(1.0);
 
         let worker_resp = match awaited {
@@ -1780,6 +1804,71 @@ fn extract_headers(req: &Request<Incoming>) -> Vec<(String, String)> {
         .iter()
         .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
         .collect()
+}
+
+/// Map an HTTP method to a `&'static str` metrics label.
+///
+/// Standard methods return their canonical spelling as a `&'static str`
+/// (no allocation on the metrics hot path, issue #136). Any non-standard
+/// verb collapses to `"OTHER"` so a client sending random custom methods
+/// cannot explode Prometheus `method`-label cardinality.
+fn method_metric_label(method: &hyper::Method) -> &'static str {
+    match *method {
+        hyper::Method::GET => "GET",
+        hyper::Method::POST => "POST",
+        hyper::Method::PUT => "PUT",
+        hyper::Method::DELETE => "DELETE",
+        hyper::Method::HEAD => "HEAD",
+        hyper::Method::OPTIONS => "OPTIONS",
+        hyper::Method::PATCH => "PATCH",
+        hyper::Method::TRACE => "TRACE",
+        hyper::Method::CONNECT => "CONNECT",
+        _ => "OTHER",
+    }
+}
+
+/// Map an HTTP status code to a `&'static str` metrics label.
+///
+/// The `metrics` macros require label values to be `'static`; returning a
+/// static literal keeps the metrics hot path allocation-free (issue #136)
+/// where the previous code allocated `status.as_u16().to_string()` per
+/// request. Covers the status codes this server and typical PHP
+/// applications emit; anything outside the set collapses to `"other"` so
+/// an app returning arbitrary codes cannot explode `status`-label
+/// cardinality.
+fn status_metric_label(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        200 => "200",
+        201 => "201",
+        202 => "202",
+        204 => "204",
+        206 => "206",
+        301 => "301",
+        302 => "302",
+        303 => "303",
+        304 => "304",
+        307 => "307",
+        308 => "308",
+        400 => "400",
+        401 => "401",
+        403 => "403",
+        404 => "404",
+        405 => "405",
+        406 => "406",
+        409 => "409",
+        410 => "410",
+        413 => "413",
+        415 => "415",
+        421 => "421",
+        422 => "422",
+        429 => "429",
+        500 => "500",
+        501 => "501",
+        502 => "502",
+        503 => "503",
+        504 => "504",
+        _ => "other",
+    }
 }
 
 fn extract_server_name(req: &Request<Incoming>) -> String {
@@ -3780,5 +3869,103 @@ data: two
         drop(tx);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b" raw");
+    }
+
+    // -- metrics label helper (#136) --------------------------------
+
+    #[test]
+    fn method_metric_label_standard_methods_are_static() {
+        // Standard verbs map to their canonical spelling with no allocation.
+        assert_eq!(method_metric_label(&hyper::Method::GET), "GET");
+        assert_eq!(method_metric_label(&hyper::Method::POST), "POST");
+        assert_eq!(method_metric_label(&hyper::Method::PUT), "PUT");
+        assert_eq!(method_metric_label(&hyper::Method::DELETE), "DELETE");
+        assert_eq!(method_metric_label(&hyper::Method::HEAD), "HEAD");
+        assert_eq!(method_metric_label(&hyper::Method::OPTIONS), "OPTIONS");
+        assert_eq!(method_metric_label(&hyper::Method::PATCH), "PATCH");
+        assert_eq!(method_metric_label(&hyper::Method::TRACE), "TRACE");
+        assert_eq!(method_metric_label(&hyper::Method::CONNECT), "CONNECT");
+    }
+
+    #[test]
+    fn method_metric_label_custom_method_collapses_to_other() {
+        // A non-standard verb must NOT be reflected verbatim into the label --
+        // that would let a client explode Prometheus `method` cardinality.
+        let custom = hyper::Method::from_bytes(b"WHATEVER").unwrap();
+        assert_eq!(method_metric_label(&custom), "OTHER");
+    }
+
+    #[test]
+    fn method_metric_label_matches_as_str_for_standard_verbs() {
+        // For the standard verbs the label is byte-identical to the previous
+        // `method.as_str().to_string()` behavior -- this pins that the
+        // allocation-free path did not change what the label reports.
+        for m in [
+            hyper::Method::GET,
+            hyper::Method::POST,
+            hyper::Method::PUT,
+            hyper::Method::DELETE,
+            hyper::Method::HEAD,
+            hyper::Method::OPTIONS,
+            hyper::Method::PATCH,
+            hyper::Method::TRACE,
+            hyper::Method::CONNECT,
+        ] {
+            assert_eq!(method_metric_label(&m), m.as_str());
+        }
+    }
+
+    #[test]
+    fn status_label_matches_code_for_known_statuses() {
+        // The status label switched from `as_u16().to_string()` (an alloc) to
+        // a `&'static str` lookup. For every code this server emits, the
+        // label must still be the exact 3-digit string the old path produced.
+        for code in [
+            200u16, 201, 202, 204, 206, 301, 302, 303, 304, 307, 308, 400, 401, 403, 404, 405, 406,
+            409, 410, 413, 415, 421, 422, 429, 500, 501, 502, 503, 504,
+        ] {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert_eq!(status_metric_label(status), code.to_string());
+        }
+    }
+
+    #[test]
+    fn status_label_unknown_code_collapses_to_other() {
+        // An exotic status (e.g. a PHP app returning 418) must not become its
+        // own Prometheus series -- it collapses to "other".
+        assert_eq!(status_metric_label(StatusCode::from_u16(418).unwrap()), "other");
+        assert_eq!(status_metric_label(StatusCode::from_u16(299).unwrap()), "other");
+    }
+
+    // -- request-timeout disable (#135) -----------------------------
+
+    #[test]
+    fn request_timeout_zero_yields_zero_duration() {
+        // `[server.timeouts] request = 0` must produce a zero `request_timeout`
+        // so `handle` takes the no-timer fast path. A non-zero value must not.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                document_root: dir.path().to_path_buf(),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+
+        config.server.timeouts.request = 0;
+        let router = Router::new(&config, test_store(), None, None, None, None);
+        assert!(
+            router.request_timeout.is_zero(),
+            "request = 0 must disable the per-request deadline"
+        );
+
+        config.server.timeouts.request = 30;
+        let router = Router::new(&config, test_store(), None, None, None, None);
+        assert_eq!(router.request_timeout, Duration::from_secs(30));
     }
 }
