@@ -70,7 +70,9 @@ jobs:
       - name: Build ephpm
         env:
           # Overrides profile.release.lto from Cargo.toml per-arch (see the
-          # matrix `lto` values — arm64 must use thin to fit in host memory).
+          # matrix `lto` value). linux-x64 keeps fat LTO -- it builds fine on
+          # the x64 hosts. The memory-constrained targets (linux-aarch64,
+          # windows) run in their own jobs below with LTO disabled.
           CARGO_PROFILE_RELEASE_LTO: ${{ matrix.arch.lto }}
         run: cargo xtask release ${{ matrix.php.minor }}
 
@@ -133,13 +135,16 @@ jobs:
 
       - name: Build ephpm
         env:
-          # Thin LTO on arm64: the fat-LTO final link of the ephpm binary
-          # (libphp.a + ICU + everything, codegen-units=1) exceeds the
-          # arm64 build host's memory — rustc gets SIGKILLed by the OOM
-          # killer even running as the only job. Thin LTO cuts link-time
-          # memory to a fraction for a ~1% perf delta on a target where
-          # we publish no benchmark numbers anyway.
-          CARGO_PROFILE_RELEASE_LTO: thin
+          # LTO off on arm64: the fat-LTO final link of the ephpm binary
+          # (libphp.a + ICU + everything, codegen-units=1 from profile.release
+          # per #171) exceeds the arm64 build host's memory -- rustc gets
+          # SIGKILLed by the OOM killer even running as the only job. Thin LTO
+          # (#181) held for a while, but the turso engine (#183, linked by
+          # default) grew the binary past what thin-LTO fits on this host in
+          # the v0.5.1 arc. Disabling LTO cuts link-time memory the most, for
+          # a low single-digit perf delta on a target with no published
+          # benchmark numbers. Revisit thin/fat once the VM memory is raised.
+          CARGO_PROFILE_RELEASE_LTO: "off"
         run: cargo xtask release ${{ matrix.php.minor }}
 
       - name: Package archive
@@ -352,12 +357,16 @@ jobs:
       - name: Build ephpm.exe
         shell: powershell
         env:
-          # Thin LTO on Windows: the fat-LTO final link (libphp static lib +
-          # everything, codegen-units=1) OOMs rustc-LLVM on the ephemerd
-          # worker VMs ("rustc-LLVM ERROR: out of memory", v0.5.1 run).
-          # Same trade as linux-aarch64 (#181): ~1% perf delta on a target
-          # with no published benchmark numbers.
-          CARGO_PROFILE_RELEASE_LTO: thin
+          # LTO off on Windows: the fat-LTO final link (libphp static lib +
+          # everything, codegen-units=1 from profile.release per #171) OOMs
+          # rustc-LLVM on the ephemerd worker VMs ("rustc-LLVM ERROR: out of
+          # memory"). Windows built fine on fat-LTO through v0.5.0; the turso
+          # engine (#183, linked by default) grew the binary enough to OOM in
+          # the v0.5.1 arc, and thin-LTO (#193) was not enough either.
+          # Disabling LTO cuts link-time memory the most, for a low
+          # single-digit perf delta on a target with no published benchmark
+          # numbers. Same trade as linux-aarch64. Revisit once VM memory grows.
+          CARGO_PROFILE_RELEASE_LTO: "off"
         run: cargo xtask release ${{ matrix.php_minor }} --target windows --no-sqld
 
       - name: Package archive
