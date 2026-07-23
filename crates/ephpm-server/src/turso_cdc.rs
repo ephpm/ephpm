@@ -62,14 +62,88 @@
 //! a former primary that had unshipped batches at the moment it died
 //! has lost those writes.
 //!
-//! # Bootstrap of a fresh replica
+//! # Bootstrap of a fresh replica (Phase 2.1, task #97)
 //!
-//! **Deferred to Phase 2.1.** For v1, the operator is responsible for
-//! seeding replicas with a copy of the primary's DB file before starting
-//! them (or accepting that replicas start empty and only replicate
-//! forward from the point they join). A snapshot-over-transport
-//! bootstrap ride on `snapshot/<vhost>` streams — that name is
-//! RESERVED in [`ephpm_cluster::stream_type::SNAPSHOT_PREFIX`] today.
+//! A *cold* replica (empty local DB) cannot catch up by tailing CDC
+//! alone: [`enable_cdc`] only captures mutations that happen after it is
+//! switched on, so any pre-CDC data on the primary has no CDC rows to
+//! replay. Worse, once CDC-log truncation lands (a future phase), even
+//! post-CDC history is not guaranteed to be replayable from
+//! `change_id = 0`. A cold replica therefore needs a base snapshot of
+//! the primary's current state before it starts tailing.
+//!
+//! ## Snapshot mechanism: online logical dump (chosen for v1)
+//!
+//! The snapshot is a logical dump (schema DDL plus per-table `INSERT`s
+//! with explicit `rowid`) captured on the primary inside a single read
+//! transaction (`BEGIN` ... `COMMIT`), together with the watermark
+//! `N = MAX(turso_cdc.change_id)` read in that same transaction so the
+//! dump and `N` are consistent.
+//!
+//! Why a logical dump and not a physical file copy:
+//!
+//! - turso 0.7.0 exposes no online-backup, `serialize`, or local
+//!   `checkpoint` API (verified against the pinned `turso = 0.7.0`
+//!   crate: `Database`/`Connection` have `execute`/`query`/`prepare`/
+//!   `pragma_*` but nothing that yields a consistent byte image, and
+//!   the `checkpoint()` method exists only on the remote sync database,
+//!   not the local one). `VACUUM INTO` is likewise out: litewire's
+//!   Turso backend rejects `VACUUM` outright and turso 0.7.0's VACUUM
+//!   is incomplete upstream.
+//! - A raw file-byte copy would have to reason about turso's on-disk
+//!   shape (main file plus any `-wal`/`-shm` sidecars, whose
+//!   memory-mapped index state is not portable across a copy) and hold
+//!   a write lock across the copy. A logical dump is format-agnostic
+//!   and fully online: reads run under a `BEGIN` read view without
+//!   blocking primary writers, so (unlike the quiesce-copy fallback the
+//!   task allowed) bootstrap does NOT pause primary writes.
+//! - The dump reads live table state, so it captures pre-CDC data that
+//!   a tail-from-0 replay would miss. This is the property that makes
+//!   cold-join actually work.
+//!
+//! The cost is that a very large DB is dumped as row-level `INSERT`s
+//! rather than copied as pages; for an experimental Phase 2.1 that is an
+//! acceptable trade. A physical page-copy path (pending a turso backup
+//! API) is noted as future work.
+//!
+//! ## Correctness sequence
+//!
+//! Cold replica, before subscribing to CDC:
+//!
+//! 1. Detect cold start: [`read_watermark`] on the local mgmt
+//!    connection returns `0` AND the DB has no user tables.
+//! 2. Dial `snapshot/default` to the primary; receive the header
+//!    (`watermark = N`) followed by the chunked SQL body.
+//! 3. Apply the dump to the local DB, then seed the replica watermark
+//!    to `N` (write `__litewire_cdc_watermark.applied_change_id = N`,
+//!    the same table [`apply_batch`] maintains). This all completes
+//!    before the litewire wire frontends start serving, so a client
+//!    read never observes partial snapshot state.
+//! 4. Subscribe to CDC as before. The primary tails from `change_id 0`,
+//!    but [`apply_batch`] skips any batch whose `commit_change_id() <=
+//!    N` (idempotent no-op against the seeded watermark), so only
+//!    post-`N` changes are applied: the tail continues cleanly past the
+//!    snapshot point.
+//!
+//! Snapshot/tail race: because the tail always re-broadcasts from `0`
+//! and apply is idempotent past the watermark, there is no gap between
+//! "snapshot at N" and "tail from N+1" even if writes land on the
+//! primary during the dump; they simply arrive as post-`N` batches.
+//!
+//! The `snapshot/<vhost>` stream name is reserved in
+//! [`ephpm_cluster::stream_type::SNAPSHOT_PREFIX`]; v1 uses only
+//! `snapshot/default` (single-vhost, matching `cdc/default`).
+//!
+//! ## Scope guards (v1)
+//!
+//! - Single vhost: `snapshot/default` only.
+//! - No CDC-log truncation handling: v1 relies on the log growing
+//!   unbounded (as the CDC path does). When truncation lands, the
+//!   snapshot watermark `N` and the tail's oldest retained `change_id`
+//!   must be reconciled (ship a snapshot at >= the truncation point);
+//!   that interaction is deferred.
+//! - Experimental + gated: the whole path is behind
+//!   `cdc_experimental = true`; sqld stays the production default.
 //!
 //! # Wire format (inside the yamux stream)
 //!
@@ -96,7 +170,7 @@ use anyhow::Context;
 use ephpm_cluster::{ChannelStream, IncomingStream};
 use ephpm_config::SqliteConfig;
 use litewire::litewire_turso::Turso;
-use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch};
+use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, read_watermark};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast;
@@ -109,8 +183,35 @@ use crate::tracked_backend;
 /// `"cdc/default"`.
 const CDC_STREAM_TYPE: &str = "cdc/default";
 
+/// Full stream-type string for the default vhost's snapshot bootstrap
+/// stream (Phase 2.1, task #97). A cold replica dials this once to fetch
+/// the primary's base state before subscribing to [`CDC_STREAM_TYPE`].
+///
+/// Per-vhost snapshots are future work; today every snapshot uses
+/// `"snapshot/default"` under [`ephpm_cluster::stream_type::SNAPSHOT_PREFIX`].
+const SNAPSHOT_STREAM_TYPE: &str = "snapshot/default";
+
 /// Maximum frame length accepted on either side of the wire (16 MiB).
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
+
+/// Maximum size of a single snapshot data chunk (16 MiB), matching the
+/// CDC per-frame cap. The snapshot body is split into chunks of at most
+/// this size so an arbitrarily large dump never needs a single
+/// oversized allocation on either side.
+const MAX_SNAPSHOT_CHUNK_LEN: u32 = 16 * 1024 * 1024;
+
+/// Target size of each emitted snapshot chunk. Kept well under
+/// [`MAX_SNAPSHOT_CHUNK_LEN`] so the length prefix always fits and the
+/// receiver's per-chunk allocation stays bounded.
+const SNAPSHOT_CHUNK_TARGET: usize = 1024 * 1024;
+
+/// Name of litewire's replica watermark table. Seeding it to the
+/// snapshot watermark `N` makes [`apply_batch`] treat every CDC batch
+/// with `commit_change_id() <= N` as an idempotent no-op. This mirrors
+/// the `CREATE TABLE`/`INSERT OR IGNORE` that litewire-turso's
+/// `ensure_watermark_table` performs; we depend on the table name and
+/// shape staying stable under the exact litewire pin.
+const WATERMARK_TABLE: &str = "__litewire_cdc_watermark";
 
 /// Broadcast channel capacity — how many transactions the primary can
 /// buffer between polls before slow subscribers start missing (`Lagged`)
@@ -318,6 +419,23 @@ pub async fn start_clustered_turso_cdc(
             .await
             .with_context(|| format!("failed to open mgmt Turso factory at {db_path}"))?,
     );
+
+    // Register the primary-side snapshot handler NOW, before anything
+    // dials, so a peer that comes up as a cold replica can always reach
+    // us for a bootstrap regardless of which role we started in. The
+    // handler pattern mirrors the CDC handler below (registered
+    // up-front so it survives role transitions).
+    spawn_snapshot_server(channel, Arc::clone(&mgmt_factory), handles);
+
+    // Cold-start bootstrap: if we begin life as a replica with an empty
+    // local DB, fetch the primary's base snapshot BEFORE the litewire
+    // wire frontends start serving; otherwise a client read could
+    // observe partial state. This is awaited (blocking startup) on
+    // purpose; the wire frontends spin up only after it completes. A
+    // primary, or a replica whose DB is already populated, skips this.
+    if let Role::Replica { primary_addr } = &initial_role {
+        maybe_bootstrap_cold_replica(&mgmt_factory, *primary_addr, channel).await;
+    }
 
     // Start litewire wire frontends. Wire factory is moved in here.
     let tracked = tracked_backend::TrackedBackend::new(wire_factory, query_stats.clone());
@@ -636,6 +754,561 @@ async fn consume_frames(
 }
 
 // ---------------------------------------------------------------------------
+// Snapshot bootstrap (Phase 2.1, task #97).
+//
+// A cold replica dials `snapshot/default`; the primary answers with a
+// header carrying the watermark `N` (= MAX(turso_cdc.change_id) at the
+// moment of the dump), followed by the SQL dump body as length-prefixed
+// chunks, terminated by an end marker. The replica applies the dump,
+// seeds its watermark to `N`, then subscribes to CDC where apply_batch
+// idempotently skips everything <= N.
+//
+// The snapshot wire format is deliberately NOT the JSON `Frame` codec:
+// the body is raw SQL text (potentially many MiB), so a binary chunked
+// framing avoids base64/JSON overhead. The 16 MiB per-chunk cap matches
+// the CDC frame cap.
+// ---------------------------------------------------------------------------
+
+/// Snapshot wire header, sent once at the start of a snapshot stream
+/// before any data chunk. JSON-encoded, length-prefixed (`u32` BE),
+/// bounded by [`MAX_SNAPSHOT_CHUNK_LEN`] like every other frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotHeader {
+    /// Watermark this snapshot corresponds to: the highest
+    /// `turso_cdc.change_id` whose effects are included in the dump. The
+    /// replica seeds its applied watermark to this value so the CDC tail
+    /// resumes exactly past it.
+    watermark: i64,
+    /// Total dump body length in bytes across all chunks. Advisory: used
+    /// for logging/progress; the authoritative end signal is the
+    /// zero-length end-marker chunk.
+    total_len: u64,
+}
+
+/// Spawn the primary-side snapshot server. Registered up-front (like the
+/// CDC handler) so a cold replica can bootstrap from us no matter which
+/// role we started in. Each inbound `snapshot/default` stream is served
+/// on its own task from a fresh mgmt connection.
+fn spawn_snapshot_server(
+    channel: &ephpm_cluster::ChannelHandle,
+    mgmt: Arc<Turso>,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    let mut snapshot_streams = channel.register_exact(SNAPSHOT_STREAM_TYPE);
+    handles.push(tokio::spawn(async move {
+        while let Some(incoming) = snapshot_streams.recv().await {
+            let mgmt = Arc::clone(&mgmt);
+            let IncomingStream { stream, peer, .. } = incoming;
+            tokio::spawn(async move {
+                match serve_snapshot(stream, &mgmt).await {
+                    Ok(n) => {
+                        tracing::info!(peer = %peer, watermark = n, "served snapshot bootstrap");
+                    }
+                    Err(e) => {
+                        tracing::warn!(peer = %peer, "snapshot bootstrap failed: {e:#}");
+                    }
+                }
+            });
+        }
+    }));
+}
+
+/// Serve one snapshot to a dialing replica: produce the logical dump
+/// under a consistent read view and stream it. Returns the watermark on
+/// success.
+///
+/// Public so the cross-node snapshot integration test drives the exact
+/// production serve path rather than a copy (mirrors why
+/// [`parse_primary_addr`] is public). Not part of a stable API.
+///
+/// # Errors
+///
+/// Returns an error if the dump cannot be produced or the stream write
+/// fails.
+pub async fn serve_snapshot(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Result<i64> {
+    let conn = mgmt.raw_connection().context("snapshot: open mgmt connection")?;
+    let (watermark, dump) = produce_snapshot(&conn).await.context("snapshot: produce dump")?;
+
+    let header = SnapshotHeader { watermark, total_len: dump.len() as u64 };
+    write_snapshot_header(&mut stream, &header).await?;
+
+    for chunk in dump.as_bytes().chunks(SNAPSHOT_CHUNK_TARGET) {
+        write_snapshot_chunk(&mut stream, chunk).await?;
+    }
+    // Zero-length end marker: signals a clean end of body.
+    write_snapshot_chunk(&mut stream, &[]).await?;
+    stream.flush().await?;
+    Ok(watermark)
+}
+
+/// Produce a logical dump of the current DB state plus the aligned
+/// watermark, captured inside a single read transaction so the two are
+/// consistent.
+///
+/// The dump is a sequence of SQL statements: `CREATE` DDL for every user
+/// table/index, followed by rowid-preserving `INSERT`s for every
+/// user-table row. Internal bookkeeping tables (`turso_cdc`, the
+/// litewire watermark table, turso internals, and `sqlite_*`) are
+/// excluded; the replica reconstructs its own watermark row from the
+/// header.
+async fn produce_snapshot(conn: &turso::Connection) -> anyhow::Result<(i64, String)> {
+    // BEGIN pins a consistent read view for the whole dump; turso's
+    // MVCC/WAL read path does not block writers, so this is fully online
+    // (no primary write pause). Errors after BEGIN roll back via the
+    // trailing COMMIT/ROLLBACK.
+    conn.execute("BEGIN", ()).await.context("snapshot: BEGIN read view")?;
+    let result = produce_snapshot_inner(conn).await;
+    // End the read view regardless of outcome. A read-only txn COMMIT and
+    // ROLLBACK are equivalent here; prefer COMMIT on success.
+    match &result {
+        Ok(_) => {
+            let _ = conn.execute("COMMIT", ()).await;
+        }
+        Err(_) => {
+            let _ = conn.execute("ROLLBACK", ()).await;
+        }
+    }
+    result
+}
+
+async fn produce_snapshot_inner(conn: &turso::Connection) -> anyhow::Result<(i64, String)> {
+    let watermark = current_max_change_id(conn).await?;
+
+    let mut dump = String::new();
+    let tables = snapshot_schema(conn, &mut dump).await?;
+    for table in &tables {
+        snapshot_table_rows(conn, table, &mut dump).await?;
+    }
+    Ok((watermark, dump))
+}
+
+/// Read the highest `change_id` in `turso_cdc` (0 when the log is empty
+/// or the table does not exist). This is the snapshot watermark: every
+/// committed change up to this id is reflected in the dump.
+async fn current_max_change_id(conn: &turso::Connection) -> anyhow::Result<i64> {
+    // COALESCE handles the empty-table case; the missing-table case (CDC
+    // never enabled) is caught by the error path -> 0.
+    let mut stmt = match conn.prepare("SELECT COALESCE(MAX(change_id), 0) FROM turso_cdc").await {
+        Ok(s) => s,
+        Err(_) => return Ok(0),
+    };
+    let mut rows = stmt.query(()).await.context("snapshot: query MAX(change_id)")?;
+    match rows.next().await.context("snapshot: read MAX(change_id)")? {
+        Some(row) => match row.get_value(0).context("snapshot: MAX(change_id) value")? {
+            turso::Value::Integer(i) => Ok(i),
+            _ => Ok(0),
+        },
+        None => Ok(0),
+    }
+}
+
+/// Append `CREATE` DDL for every user object to `dump` and return the
+/// list of user table names (in creation order) to dump rows for.
+///
+/// Reads `sqlite_schema` directly. Internal objects are skipped (see
+/// [`is_internal_object`]). Autoindexes (NULL `sql`) are skipped: they
+/// follow their parent table's DDL automatically.
+async fn snapshot_schema(
+    conn: &turso::Connection,
+    dump: &mut String,
+) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT type, name, sql FROM sqlite_schema \
+             WHERE sql IS NOT NULL \
+             ORDER BY rowid",
+        )
+        .await
+        .context("snapshot: prepare schema read")?;
+    let mut rows = stmt.query(()).await.context("snapshot: query schema")?;
+
+    let mut tables = Vec::new();
+    while let Some(row) = rows.next().await.context("snapshot: next schema row")? {
+        let obj_type = value_text(&row, 0)?;
+        let name = value_text(&row, 1)?;
+        let sql = value_text(&row, 2)?;
+
+        if is_internal_object(&name) {
+            continue;
+        }
+        // Emit the object's own DDL verbatim. `sqlite_schema.sql` already
+        // holds the exact CREATE text the primary ran.
+        dump.push_str(&sql);
+        dump.push_str(";\n");
+
+        if obj_type == "table" {
+            tables.push(name);
+        }
+    }
+    Ok(tables)
+}
+
+/// Append rowid-preserving `INSERT` statements for every row of `table`
+/// to `dump`. Preserving rowid is mandatory: the CDC apply path keys
+/// INSERT/UPDATE/DELETE by rowid, so the replica must land identical
+/// rowids for post-snapshot CDC replay to stay consistent.
+async fn snapshot_table_rows(
+    conn: &turso::Connection,
+    table: &str,
+    dump: &mut String,
+) -> anyhow::Result<()> {
+    let cols = table_columns(conn, table).await?;
+    let col_list = cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", ");
+
+    let select_sql = format!(
+        "SELECT rowid, {} FROM {} ORDER BY rowid",
+        cols.iter().map(|c| quote_ident(c)).collect::<Vec<_>>().join(", "),
+        quote_ident(table),
+    );
+    let mut stmt = conn
+        .prepare(&select_sql)
+        .await
+        .with_context(|| format!("snapshot: prepare row read for {table}"))?;
+    let mut rows =
+        stmt.query(()).await.with_context(|| format!("snapshot: query rows for {table}"))?;
+
+    while let Some(row) = rows.next().await.context("snapshot: next data row")? {
+        let rowid = match row.get_value(0).context("snapshot: rowid value")? {
+            turso::Value::Integer(i) => i,
+            v => anyhow::bail!("snapshot: non-integer rowid in {table}: {v:?}"),
+        };
+        let mut literals = Vec::with_capacity(cols.len());
+        for i in 0..cols.len() {
+            let v = row.get_value(i + 1).context("snapshot: column value")?;
+            literals.push(sql_literal(&v)?);
+        }
+        // INSERT OR REPLACE keeps re-runs (e.g. an interrupted bootstrap
+        // retried) idempotent by rowid.
+        use std::fmt::Write as _;
+        writeln!(
+            dump,
+            "INSERT OR REPLACE INTO {} (rowid, {}) VALUES ({}, {});",
+            quote_ident(table),
+            col_list,
+            rowid,
+            literals.join(", "),
+        )
+        .expect("writing to a String is infallible");
+    }
+    Ok(())
+}
+
+/// List the storable column names of `table` via `PRAGMA table_info`, in
+/// record order.
+async fn table_columns(conn: &turso::Connection, table: &str) -> anyhow::Result<Vec<String>> {
+    let sql = format!("PRAGMA table_info({})", quote_ident(table));
+    let mut stmt = conn.prepare(&sql).await.context("snapshot: prepare table_info")?;
+    let mut rows = stmt.query(()).await.context("snapshot: query table_info")?;
+    let mut names = Vec::new();
+    while let Some(row) = rows.next().await.context("snapshot: next table_info row")? {
+        // table_info columns: (cid, name, type, notnull, dflt_value, pk).
+        names.push(value_text(&row, 1)?);
+    }
+    anyhow::ensure!(!names.is_empty(), "snapshot: table {table} has no columns");
+    Ok(names)
+}
+
+/// Apply a received snapshot dump to the local (cold) DB, then seed the
+/// watermark to `N` so the CDC tail resumes exactly past it.
+async fn apply_snapshot(
+    conn: &turso::Connection,
+    watermark: i64,
+    dump: &str,
+) -> anyhow::Result<()> {
+    // Execute the whole dump as a batch. It is self-consistent DDL+DML
+    // captured under one read view on the primary.
+    conn.execute_batch(dump).await.context("snapshot: apply dump")?;
+    seed_watermark(conn, watermark).await.context("snapshot: seed watermark")?;
+    Ok(())
+}
+
+/// Create (if absent) and set litewire's replica watermark table to
+/// `watermark`. Mirrors litewire-turso's `ensure_watermark_table` shape;
+/// see [`WATERMARK_TABLE`] for the coupling note.
+async fn seed_watermark(conn: &turso::Connection, watermark: i64) -> anyhow::Result<()> {
+    conn.execute(
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {WATERMARK_TABLE} (\
+                id INTEGER PRIMARY KEY CHECK (id = 0), \
+                applied_change_id INTEGER NOT NULL)"
+        ),
+        (),
+    )
+    .await
+    .context("snapshot: create watermark table")?;
+    conn.execute(
+        &format!("INSERT OR REPLACE INTO {WATERMARK_TABLE} (id, applied_change_id) VALUES (0, ?)"),
+        (watermark,),
+    )
+    .await
+    .context("snapshot: write watermark")?;
+    Ok(())
+}
+
+/// Cold-start bootstrap: if the local DB is empty, dial the primary for a
+/// base snapshot and apply it before returning. A non-empty local DB
+/// (already bootstrapped, or a warm restart) skips the transfer.
+///
+/// This never propagates an error: a bootstrap failure logs and lets the
+/// node come up empty and replicate forward (degraded but not crashed),
+/// matching the "replicas may start empty" v1 fallback. It retries the
+/// dial a bounded number of times to ride out the window where the
+/// primary's channel is not yet accepting.
+async fn maybe_bootstrap_cold_replica(
+    mgmt: &Turso,
+    primary_addr: SocketAddr,
+    channel: &ephpm_cluster::ChannelHandle,
+) {
+    let conn = match mgmt.raw_connection() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("snapshot bootstrap: cannot open local connection: {e:#}");
+            return;
+        }
+    };
+
+    match local_db_is_cold(&conn).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!("snapshot bootstrap: local DB already populated; skipping");
+            return;
+        }
+        Err(e) => {
+            tracing::warn!("snapshot bootstrap: cold-check failed, skipping: {e:#}");
+            return;
+        }
+    }
+
+    tracing::warn!(
+        primary = %primary_addr,
+        "EXPERIMENTAL snapshot bootstrap: local Turso DB is cold; fetching base snapshot \
+         from the primary before serving. This is Phase 2.1 and gated behind \
+         cdc_experimental."
+    );
+
+    const MAX_ATTEMPTS: u32 = 30;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match fetch_and_apply_snapshot(&conn, primary_addr, channel).await {
+            Ok(n) => {
+                tracing::info!(
+                    primary = %primary_addr,
+                    watermark = n,
+                    "snapshot bootstrap complete; replica seeded and ready to tail CDC"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    attempt,
+                    primary = %primary_addr,
+                    "snapshot bootstrap attempt failed: {e:#}"
+                );
+                tokio::time::sleep(REPLICA_RECONNECT_DELAY).await;
+            }
+        }
+    }
+    tracing::error!(
+        primary = %primary_addr,
+        "snapshot bootstrap gave up after {MAX_ATTEMPTS} attempts; replica will start empty \
+         and replicate forward only (pre-snapshot data will be MISSING until a restart \
+         succeeds in bootstrapping)"
+    );
+}
+
+/// A DB is "cold" when the applied watermark is 0 AND there are no user
+/// tables yet. The double check avoids re-bootstrapping a replica that
+/// legitimately holds an empty-but-initialized DB, and avoids treating a
+/// primary-turned-replica (which has real tables but no watermark row)
+/// as cold.
+async fn local_db_is_cold(conn: &turso::Connection) -> anyhow::Result<bool> {
+    let wm = read_watermark(conn).await.context("snapshot: read local watermark")?;
+    if wm != 0 {
+        return Ok(false);
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT COUNT(*) FROM sqlite_schema \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             AND name NOT LIKE '\\_\\_%' ESCAPE '\\' \
+             AND name != 'turso_cdc'",
+        )
+        .await
+        .context("snapshot: prepare user-table count")?;
+    let mut rows = stmt.query(()).await.context("snapshot: query user-table count")?;
+    let count = match rows.next().await.context("snapshot: read user-table count")? {
+        Some(row) => match row.get_value(0).context("snapshot: user-table count value")? {
+            turso::Value::Integer(i) => i,
+            _ => 0,
+        },
+        None => 0,
+    };
+    Ok(count == 0)
+}
+
+/// Dial the primary, receive a snapshot, and apply it locally. Returns
+/// the watermark applied.
+///
+/// Public so the cross-node snapshot integration test drives the exact
+/// production fetch/apply path (mirrors [`parse_primary_addr`]). Not part
+/// of a stable API.
+///
+/// # Errors
+///
+/// Returns an error if the dial, header/chunk read, or dump application
+/// fails.
+pub async fn fetch_and_apply_snapshot(
+    conn: &turso::Connection,
+    primary_addr: SocketAddr,
+    channel: &ephpm_cluster::ChannelHandle,
+) -> anyhow::Result<i64> {
+    let mut stream = channel
+        .dial(primary_addr, SNAPSHOT_STREAM_TYPE)
+        .await
+        .with_context(|| format!("snapshot: dial {primary_addr}"))?;
+
+    let header = read_snapshot_header(&mut stream).await.context("snapshot: read header")?;
+    let mut body = Vec::with_capacity(usize::try_from(header.total_len).unwrap_or(0));
+    loop {
+        let chunk = read_snapshot_chunk(&mut stream).await.context("snapshot: read chunk")?;
+        if chunk.is_empty() {
+            break; // end marker
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let dump = String::from_utf8(body).context("snapshot: dump body is not valid utf-8")?;
+    apply_snapshot(conn, header.watermark, &dump).await?;
+    Ok(header.watermark)
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot codec: header (JSON, length-prefixed) + binary chunks
+// (length-prefixed), zero-length chunk = end marker. Operates on any
+// tokio Async{Read,Write} so tests can drive it over a DuplexStream.
+// ---------------------------------------------------------------------------
+
+async fn write_snapshot_header<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    header: &SnapshotHeader,
+) -> anyhow::Result<()> {
+    let json = serde_json::to_vec(header).context("snapshot header serialize")?;
+    let len = u32::try_from(json.len()).context("snapshot header too large for u32 prefix")?;
+    anyhow::ensure!(
+        len <= MAX_SNAPSHOT_CHUNK_LEN,
+        "snapshot header too large: {len} > {MAX_SNAPSHOT_CHUNK_LEN}"
+    );
+    w.write_all(&len.to_be_bytes()).await?;
+    w.write_all(&json).await?;
+    Ok(())
+}
+
+async fn read_snapshot_header<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+) -> anyhow::Result<SnapshotHeader> {
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf);
+    anyhow::ensure!(
+        len <= MAX_SNAPSHOT_CHUNK_LEN,
+        "snapshot header too large: {len} > {MAX_SNAPSHOT_CHUNK_LEN}"
+    );
+    let mut body = vec![0u8; len as usize];
+    r.read_exact(&mut body).await?;
+    serde_json::from_slice(&body).context("snapshot header parse")
+}
+
+async fn write_snapshot_chunk<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    chunk: &[u8],
+) -> anyhow::Result<()> {
+    let len = u32::try_from(chunk.len()).context("snapshot chunk too large for u32 prefix")?;
+    anyhow::ensure!(
+        len <= MAX_SNAPSHOT_CHUNK_LEN,
+        "snapshot chunk too large: {len} > {MAX_SNAPSHOT_CHUNK_LEN}"
+    );
+    w.write_all(&len.to_be_bytes()).await?;
+    w.write_all(chunk).await?;
+    Ok(())
+}
+
+async fn read_snapshot_chunk<R: AsyncReadExt + Unpin>(r: &mut R) -> anyhow::Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf).await?;
+    let len = u32::from_be_bytes(len_buf);
+    anyhow::ensure!(
+        len <= MAX_SNAPSHOT_CHUNK_LEN,
+        "snapshot chunk too large: {len} > {MAX_SNAPSHOT_CHUNK_LEN}"
+    );
+    let mut body = vec![0u8; len as usize];
+    r.read_exact(&mut body).await?;
+    Ok(body)
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot SQL helpers: identifier quoting and value literalization.
+// ---------------------------------------------------------------------------
+
+/// Read a text column value, erroring if it is not text.
+fn value_text(row: &turso::Row, idx: usize) -> anyhow::Result<String> {
+    match row.get_value(idx).context("snapshot: get text value")? {
+        turso::Value::Text(s) => Ok(s),
+        v => anyhow::bail!("snapshot: expected text at column {idx}, got {v:?}"),
+    }
+}
+
+/// Quote a SQL identifier with double quotes, escaping embedded quotes.
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Render a turso value as a self-contained SQL literal for the dump.
+/// Blobs use the `X'..'` hex form; text is single-quote escaped.
+fn sql_literal(v: &turso::Value) -> anyhow::Result<String> {
+    Ok(match v {
+        turso::Value::Null => "NULL".to_string(),
+        turso::Value::Integer(i) => i.to_string(),
+        turso::Value::Real(f) => {
+            // Use a round-trippable representation. Non-finite floats
+            // cannot be expressed as SQL literals; reject them loudly
+            // rather than silently corrupt the replica.
+            anyhow::ensure!(f.is_finite(), "snapshot: non-finite float cannot be dumped: {f}");
+            format!("{f:?}")
+        }
+        turso::Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        turso::Value::Blob(b) => {
+            use std::fmt::Write as _;
+            let mut hex = String::with_capacity(b.len() * 2 + 3);
+            hex.push_str("X'");
+            for byte in b {
+                write!(hex, "{byte:02x}").expect("writing to a String is infallible");
+            }
+            hex.push('\'');
+            hex
+        }
+    })
+}
+
+/// Is this a bookkeeping object the snapshot must not ship?
+///
+/// Excludes:
+/// - `sqlite_*`: engine-internal (schema, sequence, autoindex).
+/// - `turso_cdc`: the CDC log itself (rebuilt by enabling CDC, and in v1
+///   replicas do not capture, so it stays absent).
+/// - `__turso_internal*`: turso 0.7.0's own bookkeeping, e.g. the
+///   `__turso_internal_seq_*` autoincrement backing tables. Their
+///   `sqlite_schema.sql` is a real CREATE statement, but replaying it is
+///   rejected by the engine ("Object name reserved for internal use"),
+///   so they must never be dumped.
+/// - [`WATERMARK_TABLE`]: litewire's replica watermark, seeded from the
+///   snapshot header instead.
+///
+/// The broad `__` prefix guard is intentional: every internal
+/// bookkeeping table this path has encountered uses a `__`-prefixed
+/// name, and user tables conventionally do not.
+fn is_internal_object(name: &str) -> bool {
+    name.starts_with("sqlite_") || name.starts_with("__") || name == "turso_cdc"
+}
+
+// ---------------------------------------------------------------------------
 // Frame codec — operates on any tokio Async{Read,Write} (i.e. a
 // [`ChannelStream`] on the wire, a `tokio::io::DuplexStream` in tests).
 // ---------------------------------------------------------------------------
@@ -768,6 +1441,103 @@ mod tests {
         AsyncWriteExt::write_all(&mut client, &over.to_be_bytes()).await.unwrap();
         let err = read_frame(&mut server).await.unwrap_err();
         assert!(err.to_string().contains("frame too large"), "unexpected error: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Snapshot codec: header + chunks + end marker roundtrip, and the
+    // oversized-chunk rejection. Mirrors the CDC frame_codec_* tests.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn snapshot_codec_header_chunks_end_marker_roundtrip() {
+        let (mut client, mut server) = tokio::io::duplex(1 << 20);
+
+        let header = SnapshotHeader { watermark: 42, total_len: 11 };
+        let chunk_a = b"hello ".to_vec();
+        let chunk_b = b"world".to_vec();
+
+        // Writer side.
+        write_snapshot_header(&mut client, &header).await.unwrap();
+        write_snapshot_chunk(&mut client, &chunk_a).await.unwrap();
+        write_snapshot_chunk(&mut client, &chunk_b).await.unwrap();
+        write_snapshot_chunk(&mut client, &[]).await.unwrap(); // end marker
+        client.flush().await.unwrap();
+
+        // Reader side.
+        let got_header = read_snapshot_header(&mut server).await.unwrap();
+        assert_eq!(got_header.watermark, 42);
+        assert_eq!(got_header.total_len, 11);
+
+        let mut body = Vec::new();
+        loop {
+            let chunk = read_snapshot_chunk(&mut server).await.unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn snapshot_codec_rejects_oversized_chunk_prefix() {
+        let (mut client, mut server) = tokio::io::duplex(65536);
+        let over = MAX_SNAPSHOT_CHUNK_LEN + 1;
+        AsyncWriteExt::write_all(&mut client, &over.to_be_bytes()).await.unwrap();
+        let err = read_snapshot_chunk(&mut server).await.unwrap_err();
+        assert!(err.to_string().contains("snapshot chunk too large"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_codec_rejects_oversized_header_prefix() {
+        let (mut client, mut server) = tokio::io::duplex(65536);
+        let over = MAX_SNAPSHOT_CHUNK_LEN + 1;
+        AsyncWriteExt::write_all(&mut client, &over.to_be_bytes()).await.unwrap();
+        let err = read_snapshot_header(&mut server).await.unwrap_err();
+        assert!(err.to_string().contains("snapshot header too large"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn snapshot_stream_type_matches_registry_prefix() {
+        assert!(
+            SNAPSHOT_STREAM_TYPE.starts_with(ephpm_cluster::stream_type::SNAPSHOT_PREFIX),
+            "snapshot stream type {SNAPSHOT_STREAM_TYPE:?} must live under the {:?} prefix",
+            ephpm_cluster::stream_type::SNAPSHOT_PREFIX
+        );
+    }
+
+    #[test]
+    fn sql_literal_forms_are_escaped_and_round_trippable() {
+        assert_eq!(sql_literal(&turso::Value::Null).unwrap(), "NULL");
+        assert_eq!(sql_literal(&turso::Value::Integer(7)).unwrap(), "7");
+        assert_eq!(sql_literal(&turso::Value::Integer(-7)).unwrap(), "-7");
+        // Single quotes doubled.
+        assert_eq!(sql_literal(&turso::Value::Text("a'b".into())).unwrap(), "'a''b'");
+        // Blob as hex.
+        assert_eq!(sql_literal(&turso::Value::Blob(vec![0x00, 0xde, 0xad])).unwrap(), "X'00dead'");
+        // Non-finite float rejected.
+        assert!(sql_literal(&turso::Value::Real(f64::INFINITY)).is_err());
+    }
+
+    #[test]
+    fn quote_ident_escapes_embedded_quotes() {
+        assert_eq!(quote_ident("posts"), "\"posts\"");
+        assert_eq!(quote_ident("weird\"name"), "\"weird\"\"name\"");
+    }
+
+    #[test]
+    fn internal_objects_are_excluded_from_snapshot() {
+        assert!(is_internal_object("sqlite_sequence"));
+        assert!(is_internal_object("turso_cdc"));
+        assert!(is_internal_object(WATERMARK_TABLE));
+        // turso 0.7.0's autoincrement backing table for turso_cdc: its
+        // sqlite_schema.sql is a real CREATE the engine refuses to
+        // replay, so it must be filtered.
+        assert!(is_internal_object(
+            "__turso_internal_seq___turso_internal_autoincrement_turso_cdc"
+        ));
+        assert!(!is_internal_object("posts"));
+        assert!(!is_internal_object("users"));
     }
 
     /// The `cdc/` prefix constant this module uses matches the well-known
