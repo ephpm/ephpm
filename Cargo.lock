@@ -1277,13 +1277,17 @@ dependencies = [
  "dashmap",
  "ephpm-config",
  "ephpm-kv",
+ "futures",
  "hkdf",
+ "parking_lot",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
+ "yamux",
 ]
 
 [[package]]
@@ -1430,6 +1434,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "async-trait",
+ "base64ct",
  "brotli",
  "bytes",
  "dashmap",
@@ -1457,6 +1462,7 @@ dependencies = [
  "rustls 0.23.37",
  "rustls-acme",
  "rustls-pemfile",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -2581,7 +2587,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 [[package]]
 name = "litewire"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=699e6345d539#699e6345d539a59c56475974eabdec64c229ef1c"
+source = "git+https://github.com/ephpm/litewire.git?rev=7a0b59c40ce6#7a0b59c40ce6727fb52e9402c6e80f713fcda265"
 dependencies = [
  "anyhow",
  "futures",
@@ -2599,7 +2605,7 @@ dependencies = [
 [[package]]
 name = "litewire-backend"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=699e6345d539#699e6345d539a59c56475974eabdec64c229ef1c"
+source = "git+https://github.com/ephpm/litewire.git?rev=7a0b59c40ce6#7a0b59c40ce6727fb52e9402c6e80f713fcda265"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2616,7 +2622,7 @@ dependencies = [
 [[package]]
 name = "litewire-hrana"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=699e6345d539#699e6345d539a59c56475974eabdec64c229ef1c"
+source = "git+https://github.com/ephpm/litewire.git?rev=7a0b59c40ce6#7a0b59c40ce6727fb52e9402c6e80f713fcda265"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2631,7 +2637,7 @@ dependencies = [
 [[package]]
 name = "litewire-mysql"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=699e6345d539#699e6345d539a59c56475974eabdec64c229ef1c"
+source = "git+https://github.com/ephpm/litewire.git?rev=7a0b59c40ce6#7a0b59c40ce6727fb52e9402c6e80f713fcda265"
 dependencies = [
  "async-trait",
  "litewire-backend",
@@ -2645,7 +2651,7 @@ dependencies = [
 [[package]]
 name = "litewire-postgres"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=699e6345d539#699e6345d539a59c56475974eabdec64c229ef1c"
+source = "git+https://github.com/ephpm/litewire.git?rev=7a0b59c40ce6#7a0b59c40ce6727fb52e9402c6e80f713fcda265"
 dependencies = [
  "async-trait",
  "futures",
@@ -2660,7 +2666,7 @@ dependencies = [
 [[package]]
 name = "litewire-tds"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=699e6345d539#699e6345d539a59c56475974eabdec64c229ef1c"
+source = "git+https://github.com/ephpm/litewire.git?rev=7a0b59c40ce6#7a0b59c40ce6727fb52e9402c6e80f713fcda265"
 dependencies = [
  "bytes",
  "litewire-backend",
@@ -2673,7 +2679,7 @@ dependencies = [
 [[package]]
 name = "litewire-translate"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=699e6345d539#699e6345d539a59c56475974eabdec64c229ef1c"
+source = "git+https://github.com/ephpm/litewire.git?rev=7a0b59c40ce6#7a0b59c40ce6727fb52e9402c6e80f713fcda265"
 dependencies = [
  "lru 0.12.5",
  "parking_lot",
@@ -2685,7 +2691,7 @@ dependencies = [
 [[package]]
 name = "litewire-turso"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=699e6345d539#699e6345d539a59c56475974eabdec64c229ef1c"
+source = "git+https://github.com/ephpm/litewire.git?rev=7a0b59c40ce6#7a0b59c40ce6727fb52e9402c6e80f713fcda265"
 dependencies = [
  "async-trait",
  "litewire-backend",
@@ -3005,6 +3011,12 @@ dependencies = [
  "uuid",
  "zstd",
 ]
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "nom"
@@ -5989,6 +6001,21 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.0.0"
+
+[[package]]
+name = "yamux"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "767113d8f66a81e461362462aa71d8d0108cbf3430d4442fb88a04e31be81165"
+dependencies = [
+ "futures",
+ "log",
+ "nohash-hasher",
+ "parking_lot",
+ "pin-project",
+ "static_assertions",
+ "web-time",
+]
 
 [[package]]
 name = "yansi"

@@ -45,6 +45,8 @@ metrics-exporter-prometheus.workspace = true
 dashmap.workspace = true
 libloading.workspace = true
 serde_json.workspace = true
+serde = { workspace = true }
+base64ct = { workspace = true }
 tokio-util.workspace = true
 bytes.workspace = true
 sha2.workspace = true

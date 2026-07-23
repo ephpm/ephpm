@@ -1,11 +1,44 @@
-# Turso Engine Phase 2 — CDC-Native Replication (design notes)
+# Turso Engine Phase 2 — CDC-Native Replication (implementation notes)
 
-Design notes only — no code. Companion to
-[turso-phase1-results.md](turso-phase1-results.md) and the
-[roadmap page](../site/content/roadmap/turso-engine.md). Phase 2 is gated
-on upstream GA (roadmap gate 1, currently **not met**).
+Companion to [turso-phase1-results.md](turso-phase1-results.md) and the
+[roadmap page](../site/content/roadmap/turso-engine.md). Phase 2 is
+gated on upstream GA (roadmap gate 1, currently **not met**) for
+promotion to a default; the **experimental** implementation described
+below has landed behind an opt-in knob so we can gather the operational
+evidence needed for gate 5 (WordPress/Laravel e2e).
 
-## The verified CDC API (turso 0.7.0 source, not docs)
+## Empirical corrections to the original design (2026-07-14)
+
+Phase 1 documented the CDC surface from a source-code read. Building the
+actual tail/apply pipeline forced empirical verification (see
+`crates/litewire-turso/tests/cdc_ddl_capture.rs` in litewire) and turned
+up three corrections:
+
+1. **DDL IS captured.** The headline blocking question — "does CDC
+   capture `CREATE TABLE`/`ALTER TABLE`/`CREATE INDEX`/`DROP TABLE`?" —
+   is **yes**. Turso 0.7.0 emits DDL as ordinary row mutations on
+   `sqlite_schema` within the same `turso_cdc` stream. The `after`-image
+   record's column 4 carries the CREATE statement text; the applier
+   simply re-executes it. This means replication is a **single ordered
+   stream**, not a data+schema pair — WordPress/Laravel's runtime DDL
+   flows through the normal path with no side channel. Verified by 7
+   integration tests against `turso = "=0.7.0"`.
+
+2. **Column order in `turso_cdc` is not what the source-only read
+   suggested.** The actual v2 schema (from
+   `turso_core::translate::emitter::mod::emit_cdc_insns_v2`) is
+   `(change_id, change_time, change_txn_id, change_type, table_name, id,
+   before, after, updates)` — `change_txn_id` is **column 3**, not
+   column 9. The tailer's SELECT list has been aligned accordingly.
+
+3. **`change_type` numeric values are** `INSERT=1, UPDATE=0, DELETE=-1,
+   COMMIT=2` (not the `0=DELETE, 1=INSERT` the doc previously suggested).
+   COMMIT rows have `table_name = NULL` and `id = NULL`.
+
+4. **`turso_cdc_version.version` is a TEXT tag `"v2"`**, not an
+   integer. Version-detection code must match on text.
+
+## The verified CDC API (turso 0.7.0 source + integration tests)
 
 - Enablement is **per-connection**:
   `PRAGMA capture_data_changes_conn('<mode>[,<table>]')`. As of 0.7.0 this
@@ -15,18 +48,23 @@ on upstream GA (roadmap gate 1, currently **not met**).
 - Captured changes are written **transactionally into a regular table**
   (default `turso_cdc`), so the log commits/rolls back atomically with the
   data it describes, and is readable with plain SQL. Schema is versioned
-  via a `turso_cdc_version` table; current version **v2** (9 columns:
-  `change_id, change_time, change_type, table_name, id, before, after,
-  updates, change_txn_id`), where v2 adds `change_txn_id` and explicit
-  COMMIT records (`change_type = 2`) — i.e. transaction boundaries are in
-  the stream.
+  via a `turso_cdc_version` table; current version **v2** (9 columns; see
+  correction #2 above for the actual order), where v2 adds
+  `change_txn_id` and explicit COMMIT records (`change_type = 2`) — i.e.
+  transaction boundaries are in the stream.
 - Stability: the API surface is young (v1→v2 schema bump already happened;
   the pragma was renamed within the 0.7 line). Pin exactly and
   version-detect via `turso_cdc_version` before tailing.
 - Upstream's own sync engine (`turso_sync_engine`, same repo, MIT) is
   built on these primitives plus the open sync wire protocol
-  (`/v2/pipeline`, `/pull-updates`) — a reference consumer we can crib
-  from or adopt outright.
+  (`/v2/pipeline`, `/pull-updates`). **We do not use it in Phase 2 v1**:
+  its coroutine (`genawaiter`) execution model doesn't compose with
+  tokio, it operates on `turso_core` primitives (not the async `turso`
+  crate's `Connection`), and Turso 0.7.0's lack of multiprocess support
+  means opening the same file through both handles is unsafe. Instead,
+  litewire ships a small (~600 lines including tests) `cdc` module with
+  a `CdcTailer` + `apply_batch` API and its own SQLite record-format
+  decoder for DML replay.
 
 ## Proposed shape
 
@@ -52,18 +90,34 @@ on upstream GA (roadmap gate 1, currently **not met**).
 - **ePHPm side (reuse):** the cluster layer already owns membership
   (chitchat gossip), primary election (`sqlite_election.rs` — unchanged),
   and a replication data plane (`KvReplicator`'s transport pattern). Phase
-  2 adds a DB replication channel alongside KV replication: primary
-  publishes CDC transaction batches; replicas apply them through their
-  local Turso engine and record the applied `change_id` watermark in the
-  same transaction (exactly-once apply by construction).
+  2 rides CDC batches on the **cluster channel v1** — a single, opt-in,
+  authenticated, `yamux`-multiplexed TCP listener shared by all future
+  cluster data-plane features (see the [cluster channel
+  roadmap](/roadmap/cluster-channel/) and
+  `crates/ephpm-cluster/src/cluster_channel.rs`). Primary publishes CDC
+  transaction batches on stream type `cdc/<vhost>`; replicas dial the
+  primary's channel address, open a stream of that name, and apply
+  batches through their local Turso engine — recording the applied
+  `change_id` watermark in the same transaction (exactly-once apply by
+  construction).
 - **What dies:** the sqld sidecar — child-process management, binary
   embedding (`include_bytes!` of a 100MB+ binary), health polling, and the
   Hrana client hop on replicas. Failover becomes "stop applying, start
   capturing" with no process restarts.
-- **Alternative transport:** self-host Turso's open sync protocol using
-  `turso_sync_engine` instead of our own batching. Decide on measured
-  simplicity (roadmap language): our transport is fewer new dependencies;
-  theirs solves bootstrap + partial sync already.
+- **Transport:** the cluster channel handles the framing story
+  end-to-end: ChaCha20-Poly1305 handshake (distinct HKDF domain from
+  gossip / KV data plane so cross-plane replay is impossible), yamux
+  per-stream flow-control backpressure, string-typed stream registry so
+  future features (snapshot bootstrap, watermark sync) plug in without
+  a version bump. Inside the yamux stream, per-transaction payloads use
+  length-prefixed JSON (16 MiB frame cap; base64 for record blobs) —
+  no per-frame sealing since the TCP connection is already
+  authenticated at handshake.
+- **Alternative considered — Turso's open sync protocol** via
+  `turso_sync_engine`. Deferred: our channel is fewer new deps and
+  reuses the cluster secret/handshake infrastructure that already
+  exists for gossip and KV. Sync protocol may still land later on a
+  `sync/<vhost>` stream over the same channel.
 
 ## Open questions (must be answered before any Phase 2 code)
 

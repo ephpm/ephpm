@@ -904,12 +904,56 @@ pub struct ReplicationConfig {
     /// Set automatically when `role = "auto"`. Required when `role = "replica"`.
     #[serde(default)]
     pub primary_grpc_url: String,
+
+    /// **Experimental** — enable CDC-native SQLite replication with
+    /// `[db.sqlite] engine = "turso"` in clustered mode.
+    ///
+    /// Default: `false`. Setting this alongside `engine = "turso"` and
+    /// `[cluster] enabled = true` opts in to Phase 2 of the Turso engine
+    /// roadmap: litewire tails the primary's `turso_cdc` stream and
+    /// ships per-transaction batches to replicas over the CDC transport.
+    /// sqld is not spawned in this mode.
+    ///
+    /// Without this flag set, combining `engine = "turso"` with
+    /// clustered mode is a hard startup error — the flag is what
+    /// distinguishes "I know this is experimental" from a config typo.
+    ///
+    /// This knob is **strictly additive**: setting it to `false` (or
+    /// omitting it) preserves every prior release's behavior. Turning
+    /// it on selects the experimental replication path — sqld remains
+    /// the clustered default for `engine = "sqlite"`.
+    #[serde(default)]
+    pub cdc_experimental: bool,
+
+    /// **Deprecated — parsed but not acted upon.**
+    ///
+    /// Previously the CDC replication TCP listen address for the
+    /// bespoke CDC transport. That transport was replaced by the
+    /// cluster channel v1 (see [`ClusterChannelConfig`]) — CDC now
+    /// rides the multiplexed cluster channel, whose listen address
+    /// lives at `[cluster.channel] listen`.
+    ///
+    /// Setting this field emits a startup warning; leaving it at
+    /// default is silent. It will be removed in a future release.
+    ///
+    /// [`ClusterChannelConfig`]: super::ClusterChannelConfig
+    #[serde(default = "default_cdc_listen")]
+    pub cdc_listen: String,
 }
 
 impl Default for ReplicationConfig {
     fn default() -> Self {
-        Self { role: default_replication_role(), primary_grpc_url: String::new() }
+        Self {
+            role: default_replication_role(),
+            primary_grpc_url: String::new(),
+            cdc_experimental: false,
+            cdc_listen: default_cdc_listen(),
+        }
     }
+}
+
+fn default_cdc_listen() -> String {
+    "0.0.0.0:5015".to_string()
 }
 
 /// Configuration for a single database backend (`MySQL` or `PostgreSQL`).
@@ -2447,6 +2491,20 @@ pub struct ClusterConfig {
     /// KV clustering settings.
     #[serde(default)]
     pub kv: ClusterKvConfig,
+
+    /// Cluster channel settings — the multiplexed, authenticated
+    /// data-plane listener used by opt-in cluster features (Turso CDC
+    /// replication today; snapshot bootstrap and watermark sync in
+    /// future phases).
+    ///
+    /// The channel listener is **only bound when at least one feature
+    /// asks for it** — a config that ships no channel-using feature
+    /// produces zero new sockets, zero task spawns, and zero startup
+    /// log lines above `debug!`. This is the "opt-in transport"
+    /// contract; adding this block to your config is not itself an
+    /// opt-in.
+    #[serde(default)]
+    pub channel: ClusterChannelConfig,
 }
 
 impl Default for ClusterConfig {
@@ -2459,8 +2517,50 @@ impl Default for ClusterConfig {
             node_id: String::new(),
             cluster_id: default_cluster_id(),
             kv: ClusterKvConfig::default(),
+            channel: ClusterChannelConfig::default(),
         }
     }
+}
+
+/// Cluster channel configuration (`[cluster.channel]`).
+///
+/// The cluster channel is a single, authenticated, `yamux`-multiplexed
+/// TCP listener that opt-in cluster features share (Turso CDC
+/// replication today; snapshot bootstrap and watermark sync reserved).
+///
+/// **Lazy bind contract:** the listener is only started when at least
+/// one registered channel feature is enabled on this node. A config
+/// that ships no such feature produces zero new sockets and zero
+/// startup log noise above `debug!`. Adding this block to your config
+/// is not itself an opt-in — a feature elsewhere must ask for it.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct ClusterChannelConfig {
+    /// Listen address for the cluster channel TCP listener.
+    ///
+    /// When unset (the default) the address is derived at runtime as
+    /// `<cluster.bind IP>:<cluster.bind port + 1>` — so operators who
+    /// exposed the gossip port only have to remember one port range
+    /// (`bind` and `bind+1`). Set this explicitly to override.
+    ///
+    /// Ignored (parsed but not acted upon) when no channel feature is
+    /// enabled — see the [`ClusterChannelConfig`] type docs.
+    #[serde(default)]
+    pub listen: Option<String>,
+
+    /// Shared secret for the cluster channel handshake and stream
+    /// framing.
+    ///
+    /// When unset (the default), the channel falls back to
+    /// `[cluster] secret` (the same secret used to authenticate gossip
+    /// and the KV data plane). A distinct HKDF domain
+    /// (`ephpm-cluster-channel-v1`) is used to derive the channel key
+    /// so ciphertexts are never valid across planes.
+    ///
+    /// The channel refuses to bind when no secret is available (fail
+    /// closed): setting `[cluster] secret` — or explicitly setting
+    /// this field — is a prerequisite for any channel feature.
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 /// KV clustering configuration (`[cluster.kv]`).

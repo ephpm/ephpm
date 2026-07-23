@@ -87,13 +87,72 @@ seam this needs. Deliverable is *data*, not adoption:
 - A durability/crash-recovery smoke (kill -9 mid-write, reopen,
   integrity check) — beta engines earn trust here or nowhere.
 
-### Phase 2 — CDC-native replication (gated on GA)
+### Phase 2 — CDC-native replication (**experimental implementation available; gated on GA for default**)
 
 Replace the sqld sidecar: litewire tails the engine's CDC stream on the
 primary; ePHPm's cluster layer ships changes to replicas (own transport
 or Turso's open sync protocol — decide on measured simplicity). Election
 and failover machinery is unchanged. sqld support enters deprecation
 with a full release cycle of overlap.
+
+**Status (2026-07-14): experimental implementation landed behind
+`[db.sqlite.replication] cdc_experimental = true`.** Enabling it (with
+`engine = "turso"` + `[cluster] enabled = true`) selects a CDC-native
+replication path that runs a `litewire::litewire_turso::cdc::CdcTailer`
+on the primary and applies batches to replicas via `apply_batch` — no
+sqld sidecar, no child process, no gRPC. sqld remains the production
+clustered default for `engine = "sqlite"`.
+
+**Headline empirical finding (from building this):** Turso 0.7.0 CDC
+captures DDL. `CREATE TABLE`/`CREATE INDEX`/`ALTER TABLE ADD COLUMN`/
+`DROP TABLE` all appear in the same `turso_cdc` stream as row DML,
+encoded as mutations on `sqlite_schema`. This means the replication
+path is a **single ordered stream** with no schema-sync side channel.
+
+**Landed in this experimental cut:**
+
+- litewire `CdcTailer` + `apply_batch` API (per-transaction batches,
+  monotonic `__litewire_cdc_watermark` for exactly-once apply, SQLite
+  record-format decoder for DML replay, sqlite_schema-SQL replay for
+  DDL). 25 unit + integration tests in `litewire-turso`.
+- ephpm `turso_cdc` module: two `Turso` factories per node (wire +
+  mgmt), primary tail loop → broadcast → **cluster channel handler**;
+  replica dial + apply loop; JSON-framed protocol (base64 for record
+  blobs). 2-node e2e integration test proves DDL + INSERT + UPDATE +
+  DELETE land on the replica through a real authenticated, multiplexed
+  cluster channel and that reconnect is idempotent.
+- **Transport = the [cluster channel v1](/roadmap/cluster-channel/):**
+  a single, lazy-bound, `yamux`-multiplexed, ChaCha20-Poly1305-
+  authenticated TCP listener shared by all opt-in cluster features. CDC
+  is registered as stream type `cdc/<vhost>`; snapshot bootstrap is
+  RESERVED (`snapshot/<vhost>`). The channel only binds when a feature
+  asks — configs without `cdc_experimental` are byte-identical to
+  before.
+- Additive config knob: `cdc_experimental` defaults to `false`;
+  `engine = "turso"` + clustered mode without it is still a hard startup
+  error pointing at the knob. v0.4.x-compatible under versioning policy.
+
+**Deferred to Phase 2.1:**
+
+- Fresh-replica snapshot bootstrap (v1: operator seeds the DB file
+  before starting the replica, or accepts that replicas start empty).
+- Persisted subscriber watermark across primary restart (v1: broadcast
+  channel; new subscribers start from the current position, not from
+  cursor 0 of the primary's history).
+- TLS wrapping of the cluster channel (v1: the channel handshake and
+  framing are ChaCha20-Poly1305-authenticated with the operator's
+  shared secret, but not TLS. Per-plane PKI identity is a Phase 2.1
+  item — see the [cluster channel roadmap](/roadmap/cluster-channel/)).
+- `turso_cdc` retention pruning (v1: table grows unbounded — no
+  operational issue on the small-write experimental workloads Phase 2
+  targets, but must be solved before Phase 3 default).
+- 2-node podman/kind e2e test running the full ephpm binary against a
+  real MySQL wire client. The in-process integration test proves the
+  replication pipeline; the podman lift is largely test-orchestration.
+- Wire-frontend session capture without the factory-level flag (v1:
+  every wire session that goes through the primary's wire factory gets
+  CDC because `enable_cdc_on_connect = true`; a session that uses
+  `raw_connection()` bypasses this — a documented gotcha).
 
 ### Phase 3 — default engine (a major-version decision)
 

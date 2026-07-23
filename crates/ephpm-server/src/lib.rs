@@ -11,6 +11,7 @@ pub mod static_files;
 pub mod stream_compress;
 pub mod tls;
 pub mod tracked_backend;
+pub mod turso_cdc;
 pub mod worker_pool;
 
 use std::net::SocketAddr;
@@ -191,6 +192,25 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         None
     };
 
+    // Cluster channel — lazy-bound. Bound only if a channel feature
+    // (today: Turso CDC replication) is enabled on this node. When no
+    // feature asks, `maybe_start_cluster_channel` returns `Ok(None)`
+    // and no socket is bound — preserving byte-identical startup for
+    // any config that doesn't opt in to a channel feature.
+    let channel_handle = if let Some(ref cluster_handle) = cluster_handle {
+        let features = resolve_channel_features(&config);
+        ephpm_cluster::maybe_start_cluster_channel(
+            &config.cluster.channel,
+            &config.cluster.secret,
+            cluster_handle,
+            features,
+        )
+        .await
+        .context("failed to start cluster channel")?
+    } else {
+        None
+    };
+
     // Create shared query stats collector. The label-series cap keeps
     // Prometheus cardinality bounded regardless of query template
     // explosion (see `StatsConfig::metric_label_series_max`).
@@ -210,9 +230,24 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // the proxies come up. Hard proxy errors still fail startup.
     let listeners = bind_listeners(&config, kv_store, metrics_handle, middleware_chain).await?;
 
-    let _db_handles = start_db_proxies(&config, cluster_handle.as_ref(), &query_stats).await?;
+    let _db_handles =
+        start_db_proxies(&config, cluster_handle.as_ref(), channel_handle.as_ref(), &query_stats)
+            .await?;
 
     accept_loop(listeners).await
+}
+
+/// Resolve which cluster-channel features are enabled on this node.
+///
+/// The single source of truth for the "if nothing needs it, don't bind
+/// it" contract — extend this when adding a new channel feature.
+fn resolve_channel_features(config: &Config) -> ephpm_cluster::ChannelFeatureFlags {
+    let cdc = config
+        .db
+        .sqlite
+        .as_ref()
+        .is_some_and(|s| s.replication.cdc_experimental && s.engine == "turso");
+    ephpm_cluster::ChannelFeatureFlags { cdc }
 }
 
 /// Which TLS mode the server is operating in.
@@ -1028,6 +1063,7 @@ fn start_kv_service(
 async fn start_db_proxies(
     config: &Config,
     cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
+    channel_handle: Option<&ephpm_cluster::ChannelHandle>,
     query_stats: &ephpm_query_stats::QueryStats,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut handles = vec![];
@@ -1167,11 +1203,37 @@ async fn start_db_proxies(
     // Embedded SQLite via litewire
     if let Some(sqlite_config) = &config.db.sqlite {
         let is_clustered = is_clustered_sqlite(sqlite_config, cluster.is_some());
-        validate_sqlite_engine(&sqlite_config.engine, is_clustered)?;
+        let cdc_experimental = sqlite_config.replication.cdc_experimental;
+        validate_sqlite_engine(&sqlite_config.engine, is_clustered, cdc_experimental)?;
 
         if is_clustered {
-            start_clustered_sqlite(sqlite_config, cluster, query_stats, &mut handles).await?;
+            if sqlite_config.engine == "turso" && cdc_experimental {
+                // Phase 2: CDC-native replication over the cluster
+                // channel, no sqld sidecar. The channel handle is
+                // guaranteed Some by `resolve_channel_features` — if
+                // it's None here, something reordered startup wrong.
+                turso_cdc::start_clustered_turso_cdc(
+                    sqlite_config,
+                    cluster,
+                    channel_handle,
+                    query_stats,
+                    &mut handles,
+                )
+                .await?;
+            } else {
+                start_clustered_sqlite(sqlite_config, cluster, query_stats, &mut handles).await?;
+            }
         } else {
+            // In single-node mode the cdc_experimental flag is a documented
+            // no-op — CDC only makes sense with a peer to ship batches to.
+            // Warn if it was set so operators don't think it's doing
+            // something.
+            if cdc_experimental {
+                tracing::warn!(
+                    "[db.sqlite.replication] cdc_experimental = true has no effect in \
+                     single-node mode (no cluster peers to replicate to); ignoring."
+                );
+            }
             start_single_node_sqlite(sqlite_config, query_stats, &mut handles).await?;
         }
     }
@@ -1181,18 +1243,26 @@ async fn start_db_proxies(
 
 /// Validate the `[db.sqlite].engine` knob.
 ///
-/// `"sqlite"` is always valid. `"turso"` (experimental) is valid only in
-/// single-node mode — clustered SQLite replicates through the sqld sidecar,
-/// which requires the genuine SQLite C engine (Turso-engine clustering is
-/// Phase 2 of the roadmap, not implemented). Anything else is a hard error
-/// so a typo can never silently fall back to a different engine.
-fn validate_sqlite_engine(engine: &str, is_clustered: bool) -> anyhow::Result<()> {
+/// `"sqlite"` is always valid. `"turso"` (experimental) is valid in
+/// single-node mode; in clustered mode it requires
+/// `[db.sqlite.replication] cdc_experimental = true` to opt in to the
+/// Phase 2 CDC-native replication path (sqld is not spawned in that
+/// mode). Anything else is a hard error so a typo can never silently
+/// fall back to a different engine.
+fn validate_sqlite_engine(
+    engine: &str,
+    is_clustered: bool,
+    cdc_experimental: bool,
+) -> anyhow::Result<()> {
     match engine {
-        "turso" if is_clustered => anyhow::bail!(
+        "turso" if is_clustered && !cdc_experimental => anyhow::bail!(
             "[db.sqlite] engine = \"turso\" is not supported in clustered mode \
-             (sqld replication requires engine = \"sqlite\"; Turso-engine \
-             clustering is planned for Phase 2 of the Turso engine roadmap). \
-             Set engine = \"sqlite\" or disable clustering/replication."
+             without the experimental CDC replication opt-in. \
+             Set [db.sqlite.replication] cdc_experimental = true to enable \
+             Phase 2 CDC-native replication (EXPERIMENTAL — Turso engine is \
+             Beta upstream, sqld remains the production clustered default \
+             for engine = \"sqlite\"), or set engine = \"sqlite\" to use the \
+             production sqld path."
         ),
         "sqlite" | "turso" => Ok(()),
         other => anyhow::bail!(
@@ -1509,6 +1579,7 @@ mod lib_tests {
             replication: ephpm_config::ReplicationConfig {
                 role: role.into(),
                 primary_grpc_url: String::new(),
+                ..ephpm_config::ReplicationConfig::default()
             },
         }
     }
@@ -1543,24 +1614,32 @@ mod lib_tests {
 
     #[test]
     fn sqlite_engine_default_always_valid() {
-        assert!(validate_sqlite_engine("sqlite", false).is_ok());
-        assert!(validate_sqlite_engine("sqlite", true).is_ok());
+        assert!(validate_sqlite_engine("sqlite", false, false).is_ok());
+        assert!(validate_sqlite_engine("sqlite", true, false).is_ok());
+        assert!(validate_sqlite_engine("sqlite", true, true).is_ok());
     }
 
     #[test]
     fn turso_engine_valid_single_node_only() {
-        assert!(validate_sqlite_engine("turso", false).is_ok());
+        assert!(validate_sqlite_engine("turso", false, false).is_ok());
+        // cdc_experimental is a no-op in single-node mode but must not error.
+        assert!(validate_sqlite_engine("turso", false, true).is_ok());
     }
 
     #[test]
-    fn turso_engine_rejected_in_clustered_mode() {
-        let err = validate_sqlite_engine("turso", true).unwrap_err();
-        assert!(err.to_string().contains("not supported in clustered mode"), "{err}");
+    fn turso_engine_rejected_in_clustered_mode_without_cdc_optin() {
+        let err = validate_sqlite_engine("turso", true, false).unwrap_err();
+        assert!(err.to_string().contains("cdc_experimental"), "{err}");
+    }
+
+    #[test]
+    fn turso_engine_allowed_in_clustered_mode_with_cdc_optin() {
+        assert!(validate_sqlite_engine("turso", true, true).is_ok());
     }
 
     #[test]
     fn unknown_engine_rejected() {
-        let err = validate_sqlite_engine("sqlite3", false).unwrap_err();
+        let err = validate_sqlite_engine("sqlite3", false, false).unwrap_err();
         assert!(err.to_string().contains("not a valid engine"), "{err}");
     }
 
