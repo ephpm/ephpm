@@ -20,6 +20,14 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Instant;
 
+/// Coarse granularity for activity stamps. A read/write within this window of
+/// the last recorded activity does not re-store the timestamp, so a busy
+/// connection's `poll_read`/`poll_write` storm doesn't bounce the shared
+/// `last_activity_ms` cache line between the read and write tasks on every
+/// byte. The idle watchdog only cares about second-scale windows, so a 50ms
+/// stamp granularity is invisible to it.
+const TOUCH_GRANULARITY_MS: u64 = 50;
+
 /// Shared last-activity clock for a single connection.
 ///
 /// Stores milliseconds elapsed since the tracker was created in an
@@ -41,9 +49,20 @@ impl ActivityTracker {
     }
 
     /// Record activity at the current instant.
+    ///
+    /// Skips the atomic store when the previous stamp is younger than
+    /// [`TOUCH_GRANULARITY_MS`], collapsing the per-poll write storm on a busy
+    /// connection into at most one store per 50ms window. The read of
+    /// `last_activity_ms` is `Relaxed` and uncontended in the common case; the
+    /// deadline only ever moves forward, so a coalesced stamp can under-report
+    /// activity by at most one granularity window — negligible against the
+    /// second-scale idle timeout.
     fn touch(&self) {
         let ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
-        self.last_activity_ms.store(ms, Ordering::Relaxed);
+        let prev = self.last_activity_ms.load(Ordering::Relaxed);
+        if ms.saturating_sub(prev) >= TOUCH_GRANULARITY_MS {
+            self.last_activity_ms.store(ms, Ordering::Relaxed);
+        }
     }
 
     /// The instant of the most recent recorded activity.
@@ -160,5 +179,31 @@ mod tests {
 
         tracker.idle_expired(Duration::from_secs(60)).await;
         assert!(start.elapsed() >= Duration::from_secs(90));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn touch_within_granularity_is_coalesced() {
+        let tracker = ActivityTracker::new();
+
+        // First touch after 100ms records the stamp.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tracker.touch();
+        let first = tracker.last_activity_ms.load(Ordering::Relaxed);
+        assert_eq!(first, 100);
+
+        // A second touch 10ms later (< 50ms granularity) must NOT move the
+        // stamp — the store is skipped.
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tracker.touch();
+        assert_eq!(
+            tracker.last_activity_ms.load(Ordering::Relaxed),
+            first,
+            "touch within the granularity window must not re-store"
+        );
+
+        // Past the window, the stamp advances again.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        tracker.touch();
+        assert_eq!(tracker.last_activity_ms.load(Ordering::Relaxed), 160);
     }
 }
