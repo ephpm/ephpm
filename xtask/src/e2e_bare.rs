@@ -33,6 +33,52 @@ use crate::{DEFAULT_PHP_MINOR, release, workspace_root};
 /// and gets the cluster fixture. Everything else runs against a single node.
 const CLUSTER_SUITES: &[&str] = &["cluster"];
 
+/// Single-node suites that mutate shared SQLite state and must each run
+/// against a FRESH database, and single-threaded within the suite.
+///
+/// Why fresh-DB-per-suite: every single-node suite historically shared one
+/// long-lived node (and thus one SQLite file). State accumulated across
+/// suites -- e.g. the `sqlite` suite seeds `test_kv`, then a later suite's
+/// row-count assertions saw leftover rows, and re-`CREATE TABLE` collided.
+/// Spinning each of these up on its own fresh data dir removes cross-suite
+/// contamination.
+///
+/// Why single-threaded (`--test-threads=1`): these suites contain tests that
+/// are mutually exclusive on the SAME table within one suite -- e.g.
+/// `sqlite`'s `sqlite_create_table_and_insert` expects exactly 2 rows while a
+/// sibling test inserts a third, and `..._query_after_cleanup_fails` drops the
+/// table out from under a concurrent test. A fresh DB fixes cross-suite bleed
+/// but NOT this intra-suite races; serial execution does. These suites are
+/// short, so the serial cost is negligible.
+///
+/// Each of these reuses the single-node DB-proxy ports (3306, ...), so they
+/// run strictly sequentially -- spawned, run, torn down -- one at a time,
+/// BEFORE the shared node claims those ports.
+const ISOLATED_DB_SUITES: &[&str] = &["sqlite", "sqlite_advanced", "rw_split"];
+
+/// Single-node suites that need a bespoke server config and their own fresh
+/// node (also sequential, also reusing the single-node ports).
+///
+/// `opcache_invalidation` needs `[opcache] cluster_invalidation = true` (off by
+/// default in single-node mode) AND a config where the default document_root
+/// request resolves to the `_default` OPcache vhost -- which means NOT setting
+/// `sites_dir` (with a sites_dir configured, the vhost key becomes the request
+/// host `127.0.0.1`, not `_default`, and the test's `opcache:version:_default`
+/// write would never match). See `SingleNodeOptions`.
+const ISOLATED_CONFIG_SUITES: &[&str] = &["opcache_invalidation"];
+
+/// Suites that run single-threaded (a superset of the DB suites). Kept as a
+/// helper so `run_suite` can pick the right `--test-threads` value.
+fn suite_is_serial(name: &str) -> bool {
+    ISOLATED_DB_SUITES.contains(&name)
+}
+
+/// Whether a suite needs its own freshly-spawned, then-torn-down single node
+/// (rather than sharing the long-lived one).
+fn suite_needs_fresh_node(name: &str) -> bool {
+    ISOLATED_DB_SUITES.contains(&name) || ISOLATED_CONFIG_SUITES.contains(&name)
+}
+
 /// Test suites that must be excluded from bare-process runs entirely.
 ///
 /// A few historical suites were Kind-only (they poke Kubernetes services,
@@ -132,12 +178,52 @@ pub fn run(args: &[String]) -> ExitCode {
 
     let mut failed: Vec<String> = Vec::new();
 
-    if !single_suites.is_empty() {
+    // Split the single-node suites into "isolated" (each needs its own fresh
+    // node -- for DB state isolation or a bespoke config) and "shared" (all
+    // run against one long-lived node). The isolated suites reuse the same
+    // single-node DB-proxy ports (3306, ...), so they MUST run before the
+    // shared node claims those ports, and strictly one at a time.
+    let (isolated_suites, shared_suites): (Vec<_>, Vec<_>) =
+        single_suites.into_iter().partition(|(name, _)| suite_needs_fresh_node(name));
+
+    if !isolated_suites.is_empty() {
         eprintln!(
-            "==> Running {} single-node suite(s) against a bare ephpm on 127.0.0.1...",
-            single_suites.len()
+            "==> Running {} isolated single-node suite(s), each on a fresh ephpm + fresh DB...",
+            isolated_suites.len()
         );
-        let fixture = match SingleNodeSpawn::start(&ephpm_bin, &docroot, &scratch_root) {
+        for (name, path) in &isolated_suites {
+            let opts = SingleNodeOptions::for_suite(name);
+            let fixture = match SingleNodeSpawn::start(&ephpm_bin, &docroot, &scratch_root, &opts) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("error: failed to start fresh node for suite {name}: {e}");
+                    failed.push((*name).clone());
+                    continue;
+                }
+            };
+            let env = fixture.env(&php_version);
+            let suite_failed = if run_suite(name, path, &env) {
+                Vec::new()
+            } else {
+                failed.push((*name).clone());
+                vec![(*name).clone()]
+            };
+            fixture.dump_on_failure(&suite_failed);
+            drop(fixture);
+        }
+    }
+
+    if !shared_suites.is_empty() {
+        eprintln!(
+            "==> Running {} single-node suite(s) against a shared bare ephpm on 127.0.0.1...",
+            shared_suites.len()
+        );
+        let fixture = match SingleNodeSpawn::start(
+            &ephpm_bin,
+            &docroot,
+            &scratch_root,
+            &SingleNodeOptions::shared(),
+        ) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("error: failed to start single-node fixture: {e}");
@@ -145,12 +231,14 @@ pub fn run(args: &[String]) -> ExitCode {
             }
         };
         let env = fixture.env(&php_version);
-        for (name, path) in &single_suites {
+        let mut shared_failed: Vec<String> = Vec::new();
+        for (name, path) in &shared_suites {
             if !run_suite(name, path, &env) {
-                failed.push(name.clone());
+                shared_failed.push((*name).clone());
             }
         }
-        fixture.dump_on_failure(&failed);
+        fixture.dump_on_failure(&shared_failed);
+        failed.extend(shared_failed);
         drop(fixture);
     }
 
@@ -330,9 +418,13 @@ fn discover_test_binaries(deps: &Path) -> io::Result<Vec<(String, PathBuf)>> {
 }
 
 fn run_suite(name: &str, binary: &Path, env: &[(String, String)]) -> bool {
-    eprintln!("==> Running suite: {name}");
+    // DB-stateful suites must run single-threaded: several of their tests are
+    // mutually exclusive on the same table within one suite (see
+    // ISOLATED_DB_SUITES). Everything else parallelises fine.
+    let threads = if suite_is_serial(name) { "1" } else { "4" };
+    eprintln!("==> Running suite: {name} (--test-threads={threads})");
     let mut cmd = Command::new(binary);
-    cmd.args(["--test-threads=4"]);
+    cmd.arg(format!("--test-threads={threads}"));
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -355,7 +447,8 @@ fn recreate_dir(path: &Path) -> io::Result<()> {
 
 /// Single-node ephpm.toml template. Placeholders: `{HTTP_PORT}`, `{MYSQL_PORT}`,
 /// `{HRANA_PORT}`, `{PG_PORT}`, `{TDS_PORT}`, `{DATA_DIR}`, `{DOCROOT}`,
-/// `{SITES_DIR}`, `{KV_SOCKET}`.
+/// `{SITES_DIR_LINE}` (the whole `sites_dir = "..."` line, or empty),
+/// `{OPCACHE_BLOCK}` (an optional `[opcache]` section, or empty), `{KV_SOCKET}`.
 ///
 /// Shape mirrors `tests/ephpm-test.toml` (the config baked into the container
 /// image) as closely as possible. The only intentional divergences are:
@@ -377,7 +470,7 @@ const SINGLE_NODE_TEMPLATE: &str = r#"# Auto-generated by `cargo xtask e2e` -- d
 [server]
 listen = "127.0.0.1:{HTTP_PORT}"
 document_root = "{DOCROOT}"
-sites_dir = "{SITES_DIR}"
+{SITES_DIR_LINE}
 index_files = ["index.php", "index.html"]
 fallback = ["$uri", "$uri/", "=404"]
 
@@ -465,6 +558,7 @@ eviction_policy = "allkeys-lru"
 [kv.redis_compat]
 enabled = true
 socket = "{KV_SOCKET}"
+{OPCACHE_BLOCK}
 "#;
 
 /// Cluster node template. Placeholders: `{HTTP_PORT}`, `{MYSQL_PORT}`,
@@ -518,29 +612,88 @@ data_port = {KV_DATA_PORT}
 
 // ── single-node fixture ─────────────────────────────────────────────────────
 
+/// Per-fixture single-node config knobs.
+///
+/// The isolated suites need small config divergences from the shared node;
+/// this captures them so one `SingleNodeSpawn::start` covers every case.
+struct SingleNodeOptions {
+    /// Scratch subdirectory name (keeps logs/DBs from stomping each other when
+    /// several fresh nodes are spawned sequentially). Also used for log labels.
+    slug: String,
+    /// Configure `[server] sites_dir`. The shared node needs it (vhost/security
+    /// suites deploy per-host site dirs); the opcache suite must NOT have it
+    /// (with a sites_dir, the OPcache vhost key for a `127.0.0.1` request is
+    /// the host, not `_default`, and the test writes `opcache:version:_default`).
+    with_sites_dir: bool,
+    /// Emit `[opcache] cluster_invalidation = true`. Off by default in
+    /// single-node mode, so the opcache_invalidation suite needs it turned on
+    /// for the watcher to run at all.
+    opcache_invalidation: bool,
+}
+
+impl SingleNodeOptions {
+    /// Options for the long-lived shared node (all non-isolated suites).
+    fn shared() -> Self {
+        Self { slug: "single".to_string(), with_sites_dir: true, opcache_invalidation: false }
+    }
+
+    /// Options tailored to a specific isolated suite.
+    fn for_suite(name: &str) -> Self {
+        if ISOLATED_CONFIG_SUITES.contains(&name) {
+            // opcache_invalidation: enable the watcher, drop sites_dir so the
+            // default docroot resolves to the `_default` OPcache vhost.
+            Self {
+                slug: format!("single-{name}"),
+                with_sites_dir: false,
+                opcache_invalidation: true,
+            }
+        } else {
+            // DB suites: fresh DB, but otherwise the same shape as the shared
+            // node (sites_dir present is harmless; they don't use it).
+            Self {
+                slug: format!("single-{name}"),
+                with_sites_dir: true,
+                opcache_invalidation: false,
+            }
+        }
+    }
+}
+
 struct SingleNodeSpawn {
     child: Child,
     http_port: u16,
     _data_dir: PathBuf,
-    sites_dir: PathBuf,
+    sites_dir: Option<PathBuf>,
+    /// The (canonicalized) document_root this node serves, exported to tests as
+    /// EXPECTED_DOCUMENT_ROOT so `$_SERVER['DOCUMENT_ROOT']` assertions are
+    /// environment-agnostic (the container path is `/var/www/html`; here it is
+    /// the repo's `tests/docroot`).
+    docroot: PathBuf,
+    label: String,
     stderr_log: PathBuf,
     stdout_log: PathBuf,
 }
 
 impl SingleNodeSpawn {
-    fn start(binary: &Path, docroot: &Path, scratch_root: &Path) -> io::Result<Self> {
+    fn start(
+        binary: &Path,
+        docroot: &Path,
+        scratch_root: &Path,
+        opts: &SingleNodeOptions,
+    ) -> io::Result<Self> {
         let http_port: u16 = 18100;
         // DB proxy listeners keep the reference-config ports. The docroot PHP
         // scripts connect to a hardcoded 127.0.0.1:3306 fallback (single-node
         // [db.sqlite] does not inject DB_HOST/DB_PORT), so the mysql proxy must
-        // own 3306 or every SQLite write 500s. A single node owns the loopback,
-        // so these do not collide with anything.
+        // own 3306 or every SQLite write 500s. Only one single node runs at a
+        // time (isolated suites are spawned/torn down sequentially, before the
+        // shared node), so these ports never collide.
         let mysql_port: u16 = 3306;
         let hrana_port: u16 = 8081;
         let pg_port: u16 = 5432;
         let tds_port: u16 = 1433;
 
-        let node_dir = scratch_root.join("single");
+        let node_dir = scratch_root.join(&opts.slug);
         fs::create_dir_all(&node_dir)?;
         let data_dir = node_dir.join("data");
         fs::create_dir_all(&data_dir)?;
@@ -548,12 +701,27 @@ impl SingleNodeSpawn {
         // tests create/remove per-host site dirs themselves at runtime; we just
         // guarantee the parent exists and is writable (mirrors /var/www/sites in
         // the container image).
-        let sites_dir = node_dir.join("sites");
-        fs::create_dir_all(&sites_dir)?;
+        let sites_dir = if opts.with_sites_dir {
+            let dir = node_dir.join("sites");
+            fs::create_dir_all(&dir)?;
+            Some(dir)
+        } else {
+            None
+        };
         // Unix-domain socket for [kv.redis_compat] (matches the reference
         // config's /tmp/ephpm-kv.sock). Kept short to stay under the ~104-char
         // sun_path limit on Linux.
         let kv_socket = node_dir.join("kv.sock");
+
+        let sites_dir_line = match &sites_dir {
+            Some(dir) => format!("sites_dir = \"{}\"", escape_toml(dir)),
+            None => String::new(),
+        };
+        let opcache_block = if opts.opcache_invalidation {
+            "\n[opcache]\ncluster_invalidation = true".to_string()
+        } else {
+            String::new()
+        };
 
         let config = SINGLE_NODE_TEMPLATE
             .replace("{HTTP_PORT}", &http_port.to_string())
@@ -562,7 +730,8 @@ impl SingleNodeSpawn {
             .replace("{PG_PORT}", &pg_port.to_string())
             .replace("{TDS_PORT}", &tds_port.to_string())
             .replace("{DATA_DIR}", &escape_toml(&data_dir))
-            .replace("{SITES_DIR}", &escape_toml(&sites_dir))
+            .replace("{SITES_DIR_LINE}", &sites_dir_line)
+            .replace("{OPCACHE_BLOCK}", &opcache_block)
             .replace("{KV_SOCKET}", &escape_toml(&kv_socket))
             .replace("{DOCROOT}", &escape_toml(docroot));
 
@@ -575,7 +744,8 @@ impl SingleNodeSpawn {
         let stderr_file = fs::File::create(&stderr_log)?;
 
         eprintln!(
-            "    spawning single-node ephpm on 127.0.0.1:{http_port} (config: {})",
+            "    spawning single-node ephpm [{}] on 127.0.0.1:{http_port} (config: {})",
+            opts.slug,
             config_path.display()
         );
         let child = Command::new(binary)
@@ -586,9 +756,18 @@ impl SingleNodeSpawn {
             .spawn()?;
 
         wait_for_health(http_port, Duration::from_secs(10))?;
-        eprintln!("    single-node ephpm ready on 127.0.0.1:{http_port}");
+        eprintln!("    single-node ephpm [{}] ready on 127.0.0.1:{http_port}", opts.slug);
 
-        Ok(Self { child, http_port, _data_dir: data_dir, sites_dir, stderr_log, stdout_log })
+        Ok(Self {
+            child,
+            http_port,
+            _data_dir: data_dir,
+            sites_dir,
+            docroot: docroot.to_path_buf(),
+            label: opts.slug.clone(),
+            stderr_log,
+            stdout_log,
+        })
     }
 
     fn env(&self, php_version: &str) -> Vec<(String, String)> {
@@ -597,20 +776,31 @@ impl SingleNodeSpawn {
         // process; setting it on the test binary is a no-op. The etag cache is
         // enabled in the server config template instead (see
         // SINGLE_NODE_TEMPLATE / [server.php_etag_cache]).
-        vec![
+        let mut env = vec![
             ("EPHPM_URL".to_string(), format!("http://127.0.0.1:{}", self.http_port)),
             ("EXPECTED_PHP_VERSION".to_string(), php_version.to_string()),
-            // vhost/security_p0 suites deploy per-host site dirs into this path.
-            ("EPHPM_SITES_DIR".to_string(), self.sites_dir.to_string_lossy().into_owned()),
-        ]
+            // php::server_vars_populated asserts $_SERVER['DOCUMENT_ROOT'].
+            // Under bare-process that is the repo's tests/docroot, not the
+            // container's /var/www/html, so hand the test the actual value.
+            ("EXPECTED_DOCUMENT_ROOT".to_string(), self.docroot.to_string_lossy().into_owned()),
+        ];
+        // vhost/security_p0 suites deploy per-host site dirs into this path.
+        // Only set when this node actually has a sites_dir configured.
+        if let Some(dir) = &self.sites_dir {
+            env.push(("EPHPM_SITES_DIR".to_string(), dir.to_string_lossy().into_owned()));
+        }
+        env
     }
 
     fn dump_on_failure(&self, failed: &[String]) {
         if failed.is_empty() {
             return;
         }
-        dump_log("single-node stderr", &self.stderr_log);
-        dump_log("single-node stdout (last 200 lines)", &self.stdout_log);
+        dump_log(&format!("single-node [{}] stderr", self.label), &self.stderr_log);
+        dump_log(
+            &format!("single-node [{}] stdout (last 200 lines)", self.label),
+            &self.stdout_log,
+        );
     }
 }
 
