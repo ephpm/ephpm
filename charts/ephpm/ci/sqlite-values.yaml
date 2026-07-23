@@ -1,0 +1,8 @@
+# SQLite backend -> forces a StatefulSet with a data PVC.
+db:
+  sqlite:
+    enabled: true
+    persistence:
+      size: 2Gi
+ingress:
+  enabled: false

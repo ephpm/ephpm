@@ -1,0 +1,32 @@
+{{- if include "ephpm.isStatefulSet" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ephpm.headlessServiceName" . }}
+  labels:
+    {{- include "ephpm.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "ephpm.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+    {{- if .Values.cluster.enabled }}
+    - name: gossip-tcp
+      port: {{ .Values.cluster.gossipPort }}
+      targetPort: gossip-tcp
+      protocol: TCP
+    - name: gossip-udp
+      port: {{ .Values.cluster.gossipPort }}
+      targetPort: gossip-udp
+      protocol: UDP
+    - name: kv-data
+      port: {{ .Values.cluster.kv.dataPort }}
+      targetPort: kv-data
+      protocol: TCP
+    {{- end }}
+{{- end }}

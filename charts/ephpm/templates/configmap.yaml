@@ -1,0 +1,13 @@
+{{- include "ephpm.validate" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "ephpm.fullname" . }}
+  labels:
+    {{- include "ephpm.labels" . | nindent 4 }}
+data:
+  ephpm.toml: |
+{{ .Values.config.contents | indent 4 }}
+{{- with .Values.config.extraToml }}
+{{ . | indent 4 }}
+{{- end }}

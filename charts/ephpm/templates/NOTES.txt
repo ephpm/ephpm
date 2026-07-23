@@ -1,0 +1,35 @@
+{{- $sts := include "ephpm.isStatefulSet" . -}}
+ePHPm release "{{ .Release.Name }}" deployed in namespace "{{ .Release.Namespace }}".
+
+Workload: {{ if $sts }}StatefulSet ({{ include "ephpm.replicas" . }} replicas{{ if .Values.cluster.enabled }}, gossip-clustered{{ end }}{{ if .Values.db.sqlite.enabled }}, sqlite on a data PVC{{ end }}){{ else }}Deployment ({{ .Values.replicaCount }} replica(s)){{ end }}
+Image:    {{ include "ephpm.image" . }}
+{{- if eq .Values.image.repository "ephpm/ephpm" }}
+
+NOTE: image.repository is still upstream "ephpm/ephpm" (demo docroot only).
+Bake your PHP app into an image FROM ephpm/ephpm (app at /var/www/html) and set
+image.repository / image.tag to it.
+{{- end }}
+
+{{- if .Values.ingress.enabled }}
+
+URL(s):
+{{- range .Values.ingress.hosts }}
+  http{{ if or $.Values.ingress.tls $.Values.ingress.certManager.enabled }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- if .Values.ingress.certManager.enabled }}
+TLS via cert-manager {{ .Values.ingress.certManager.issuerKind }}/{{ .Values.ingress.certManager.issuerName }}.
+{{- end }}
+{{- else }}
+
+No Ingress enabled. Reach it locally:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "ephpm.fullname" . }} 8080:{{ .Values.service.port }}
+  curl http://127.0.0.1:8080/_ephpm/health
+{{- end }}
+
+Probes:  liveness /_ephpm/health   readiness /_ephpm/ready
+{{- if .Values.metrics.enabled }}
+Metrics: {{ .Values.metrics.path }} on the http port
+{{- end }}
+
+Rollout status:
+  kubectl -n {{ .Release.Namespace }} rollout status {{ if $sts }}statefulset{{ else }}deployment{{ end }}/{{ include "ephpm.fullname" . }}
