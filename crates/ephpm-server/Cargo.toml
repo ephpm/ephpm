@@ -23,6 +23,7 @@ ephpm-php.workspace = true
 ephpm-query-stats.workspace = true
 ephpm-sqld.workspace = true
 litewire.workspace = true
+turso.workspace = true
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
