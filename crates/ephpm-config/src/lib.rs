@@ -2438,10 +2438,27 @@ pub struct ClusterConfig {
     /// matching secret cannot join, read, or inject traffic.
     ///
     /// Any high-entropy string works (e.g. `openssl rand -base64 32`).
-    /// When empty, inter-node traffic is unauthenticated plaintext and
-    /// a warning is logged at cluster startup.
+    ///
+    /// When empty, clustering refuses to start unless
+    /// [`allow_insecure_no_auth`](Self::allow_insecure_no_auth) is set to
+    /// `true`. This is a fail-closed guard: an empty secret means the
+    /// gossip transport and the KV TCP data plane run in unauthenticated
+    /// plaintext, letting any host on the cluster network forge KV writes
+    /// (sessions, rate-limit counters, ACME/OPcache keys).
     #[serde(default)]
     pub secret: String,
+
+    /// Explicitly permit running the cluster without an authenticating
+    /// [`secret`](Self::secret).
+    ///
+    /// Default `false`. When `false` and clustering is enabled with an
+    /// empty `secret`, startup fails closed with an actionable error. Set
+    /// this to `true` only on a fully trusted private network (VPC,
+    /// WireGuard, Tailscale) where every host with access to the gossip
+    /// and KV data-plane ports is trusted; a loud warning is still logged.
+    /// Not recommended.
+    #[serde(default)]
+    pub allow_insecure_no_auth: bool,
 
     /// Unique node identifier. Auto-generated if empty.
     #[serde(default)]
@@ -2463,10 +2480,45 @@ impl Default for ClusterConfig {
             bind: default_cluster_bind(),
             join: Vec::new(),
             secret: String::new(),
+            allow_insecure_no_auth: false,
             node_id: String::new(),
             cluster_id: default_cluster_id(),
             kv: ClusterKvConfig::default(),
         }
+    }
+}
+
+impl ClusterConfig {
+    /// Whether clustering may start given the current security settings.
+    ///
+    /// Returns an error (fail closed) when clustering is enabled with an
+    /// empty [`secret`](Self::secret) and
+    /// [`allow_insecure_no_auth`](Self::allow_insecure_no_auth) is
+    /// `false`. An empty secret means the gossip transport and the KV TCP
+    /// data plane run unauthenticated, so any host on the cluster network
+    /// can forge KV writes. The error message tells the operator how to
+    /// fix it.
+    ///
+    /// This is a no-op (returns `Ok(())`) when clustering is disabled, so
+    /// single-node deployments are never affected.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `enabled` is `true`, `secret` is empty, and
+    /// `allow_insecure_no_auth` is `false`.
+    pub fn ensure_secure(&self) -> Result<(), String> {
+        if self.enabled && self.secret.is_empty() && !self.allow_insecure_no_auth {
+            return Err(
+                "[cluster] enabled = true but no [cluster] secret is set: gossip and the KV \
+                 data plane would run as unauthenticated plaintext, letting any host on the \
+                 cluster network forge KV writes (sessions, rate limits, ACME/OPcache keys). \
+                 Set [cluster] secret (e.g. `openssl rand -base64 32`), or explicitly set \
+                 [cluster] allow_insecure_no_auth = true to run clustering without \
+                 authentication -- NOT recommended."
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -3090,6 +3142,46 @@ fn default_digest_max_entries() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_disabled_empty_secret_is_ok() {
+        // Single-node (clustering off) is never affected by the gate.
+        let cfg = ClusterConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.secret.is_empty());
+        assert!(cfg.ensure_secure().is_ok());
+    }
+
+    #[test]
+    fn cluster_enabled_empty_secret_fails_closed() {
+        let cfg = ClusterConfig { enabled: true, ..ClusterConfig::default() };
+        let err = cfg.ensure_secure().expect_err("empty secret + enabled must fail closed");
+        assert!(err.contains("secret"), "error should mention the secret: {err}");
+        assert!(err.contains("allow_insecure_no_auth"), "error should point at the opt-in: {err}");
+    }
+
+    #[test]
+    fn cluster_enabled_with_secret_is_ok() {
+        let cfg = ClusterConfig {
+            enabled: true,
+            secret: "s3cret-value".to_string(),
+            ..ClusterConfig::default()
+        };
+        assert!(cfg.ensure_secure().is_ok());
+    }
+
+    #[test]
+    fn cluster_enabled_empty_secret_opt_in_bypasses_gate() {
+        let cfg = ClusterConfig {
+            enabled: true,
+            allow_insecure_no_auth: true,
+            ..ClusterConfig::default()
+        };
+        assert!(
+            cfg.ensure_secure().is_ok(),
+            "explicit allow_insecure_no_auth must bypass the gate"
+        );
+    }
 
     #[test]
     fn test_default_config() {

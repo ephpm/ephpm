@@ -45,6 +45,12 @@ pub struct SqldConfig {
 /// health, and cleans up on drop or explicit shutdown.
 pub struct SqldProcess {
     child: tokio::process::Child,
+    /// Owns the private 0700 directory the binary lives in. Dropping it
+    /// removes the directory and its contents; kept alive for the whole
+    /// process lifetime so the executable is not pulled out from under
+    /// sqld. `Option` so [`cleanup_temp`](Self::cleanup_temp) can consume
+    /// it for eager removal on explicit shutdown.
+    temp_dir: Option<tempfile::TempDir>,
     temp_path: PathBuf,
     config: SqldConfig,
     role: SqldRole,
@@ -61,7 +67,7 @@ impl SqldProcess {
     /// - Binary extraction or permission setting fails
     /// - Process fails to spawn
     pub async fn spawn(config: SqldConfig, role: SqldRole) -> anyhow::Result<Self> {
-        let temp_path = extract_binary().await?;
+        let (temp_dir, temp_path) = extract_binary().await?;
         let child = spawn_child(&temp_path, &config, &role)?;
 
         tracing::info!(
@@ -72,7 +78,14 @@ impl SqldProcess {
             "sqld process spawned"
         );
 
-        Ok(Self { child, temp_path, config, role, http_client: reqwest::Client::new() })
+        Ok(Self {
+            child,
+            temp_dir: Some(temp_dir),
+            temp_path,
+            config,
+            role,
+            http_client: reqwest::Client::new(),
+        })
     }
 
     /// Poll the sqld health endpoint until it responds or the timeout expires.
@@ -193,11 +206,18 @@ impl SqldProcess {
         Ok(())
     }
 
-    /// Remove the temp binary file.
-    fn cleanup_temp(&self) {
-        if self.temp_path.exists() {
-            if let Err(e) = std::fs::remove_file(&self.temp_path) {
-                tracing::warn!(path = %self.temp_path.display(), %e, "failed to remove temp sqld binary");
+    /// Remove the temp binary and its private directory.
+    ///
+    /// Consumes the [`tempfile::TempDir`] guard so the whole 0700
+    /// directory (binary included) is removed eagerly; if it was already
+    /// taken (e.g. cleanup ran twice) this is a no-op. When the guard is
+    /// dropped without being consumed here, `tempfile` still removes the
+    /// directory on drop, so cleanup is guaranteed either way.
+    fn cleanup_temp(&mut self) {
+        if let Some(dir) = self.temp_dir.take() {
+            let path = dir.path().to_path_buf();
+            if let Err(e) = dir.close() {
+                tracing::warn!(path = %path.display(), %e, "failed to remove temp sqld dir");
             }
         }
     }
@@ -219,27 +239,67 @@ impl Drop for SqldProcess {
     }
 }
 
-/// Extract the embedded sqld binary to a temporary file.
+/// Extract the embedded sqld binary into a fresh private temp directory.
+///
+/// Security: the file is created inside a freshly-made directory with
+/// `0700` permissions and an unpredictable, single-use name (via the
+/// `tempfile` crate, which uses `O_EXCL`/`mkdtemp` semantics). This
+/// avoids the symlink/pre-plant race of writing to a predictable
+/// `temp_dir()/ephpm-sqld-<pid>` path on a shared or container tmpfs:
+/// an attacker cannot pre-create the target to redirect the write or
+/// swap the executable between `chmod +x` and `exec`.
 #[cfg(sqld_embedded)]
-async fn extract_binary() -> anyhow::Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!("ephpm-sqld-{}", std::process::id()));
-    tokio::fs::write(&path, SQLD_BINARY)
-        .await
-        .with_context(|| format!("failed to extract sqld to {}", path.display()))?;
+async fn extract_binary() -> anyhow::Result<(tempfile::TempDir, PathBuf)> {
+    // Blocking filesystem work (mkdtemp + O_EXCL create + write + chmod)
+    // is done on a blocking thread so we never stall the async runtime.
+    tokio::task::spawn_blocking(|| {
+        use std::io::Write;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o755);
-        tokio::fs::set_permissions(&path, perms).await.context("failed to set sqld permissions")?;
-    }
+        // Fresh directory with an unpredictable, single-use name
+        // (mkdtemp semantics: created with O_EXCL, never a reused path).
+        let dir = tempfile::Builder::new()
+            .prefix("ephpm-sqld-")
+            .tempdir()
+            .context("failed to create private temp dir for sqld")?;
 
-    tracing::debug!(path = %path.display(), "extracted sqld binary");
-    Ok(path)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .context("failed to lock down sqld temp dir permissions")?;
+        }
+
+        // The directory is private (0700) and freshly created, so the
+        // executable name inside it is safe to fix. `create_new` (O_EXCL)
+        // still refuses to follow a pre-planted symlink or clobber an
+        // existing file.
+        let path = dir.path().join("sqld");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("failed to create sqld binary at {}", path.display()))?;
+        file.write_all(SQLD_BINARY).context("failed to write sqld binary")?;
+        file.sync_all().context("failed to flush sqld binary")?;
+        drop(file);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                .context("failed to set sqld permissions")?;
+        }
+
+        tracing::debug!(path = %path.display(), "extracted sqld binary");
+        Ok((dir, path))
+    })
+    .await
+    .context("sqld extraction task panicked")?
 }
 
 #[cfg(not(sqld_embedded))]
-fn extract_binary() -> impl std::future::Future<Output = anyhow::Result<PathBuf>> {
+fn extract_binary()
+-> impl std::future::Future<Output = anyhow::Result<(tempfile::TempDir, PathBuf)>> {
     std::future::ready(Err(anyhow::anyhow!(
         "sqld binary not embedded — rebuild with SQLD_BINARY_PATH set \
          (e.g., cargo xtask release --sqld-binary /path/to/sqld)"
@@ -460,13 +520,26 @@ mod tests {
         assert!(err.contains("not embedded"), "expected 'not embedded', got: {err}");
     }
 
+    /// The extraction directory is created with a fresh, unpredictable
+    /// name (not a predictable `temp_dir()/ephpm-sqld-<pid>`). Verify the
+    /// `tempfile` primitive we rely on yields a unique 0700 dir under the
+    /// expected prefix and that two calls do not collide.
     #[test]
-    fn temp_path_includes_pid() {
-        let expected_prefix = format!("ephpm-sqld-{}", std::process::id());
-        let temp_path = std::env::temp_dir().join(&expected_prefix);
+    fn extraction_dir_is_unique_and_private() {
+        let a = tempfile::Builder::new().prefix("ephpm-sqld-").tempdir().unwrap();
+        let b = tempfile::Builder::new().prefix("ephpm-sqld-").tempdir().unwrap();
+        assert_ne!(a.path(), b.path(), "extraction dirs must not collide");
         assert!(
-            temp_path.file_name().unwrap().to_str().unwrap().starts_with("ephpm-sqld-"),
-            "temp path should include ephpm-sqld prefix"
+            a.path().file_name().unwrap().to_str().unwrap().starts_with("ephpm-sqld-"),
+            "extraction dir keeps the ephpm-sqld- prefix"
         );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(a.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mode = std::fs::metadata(a.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "extraction dir must be private (0700)");
+        }
     }
 }
