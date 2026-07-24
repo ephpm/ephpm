@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 #[allow(unused_imports)]
 use ::metrics::{counter, gauge, histogram};
-use ephpm_config::Config;
+use ephpm_config::{Config, MiddlewareMount};
 use ephpm_kv::store::Store;
 use ephpm_php::PhpRuntime;
 use ephpm_php::request::PhpRequest;
@@ -270,6 +270,66 @@ pub struct Router {
     /// docroot to a new release directory — an immortal cache would pin
     /// the OLD release forever.
     canonical_roots: dashmap::DashMap<PathBuf, (PathBuf, Instant)>,
+    /// Inbound request-header names (lowercased) stripped UNCONDITIONALLY at
+    /// ingest, before the middleware chain runs and before any header crosses
+    /// to PHP. This closes two spoofing vectors:
+    ///
+    /// * `proxy` (httpoxy) — a forged `Proxy:` request header must never
+    ///   surface as `$_SERVER['HTTP_PROXY']`.
+    /// * every configured JWT `claims_header` — the `jwt` middleware only
+    ///   `override_header`-sanitizes its claims header when it actually runs,
+    ///   and in fpm mode it only runs when the request path matches the
+    ///   module's `match` glob. A request to a non-matching path would
+    ///   otherwise pass a client-forged claims header straight through to PHP.
+    ///   Stripping at ingest makes a `match`-skipped (or bypassed) module
+    ///   unable to leave a forged value behind.
+    ///
+    /// Always contains `"proxy"`; JWT claims-header names are appended at
+    /// construction from `[[middleware]]` config (see
+    /// [`ingest_strip_headers`]).
+    ingest_strip_headers: Vec<String>,
+}
+
+/// Header names always stripped from inbound requests at ingest, in addition
+/// to any configured JWT `claims_header`. `proxy` defends against httpoxy
+/// (CVE-2016-5385 and friends): a forged `Proxy:` request header must never
+/// become PHP's `HTTP_PROXY`.
+const ALWAYS_STRIPPED_INGEST_HEADERS: &[&str] = &["proxy"];
+
+/// Build the lowercased list of inbound headers to strip at ingest.
+///
+/// Combines [`ALWAYS_STRIPPED_INGEST_HEADERS`] with the `claims_header` of
+/// every configured `jwt` middleware mount. Because the claims header is only
+/// sanitized by the jwt module when that module actually runs (and in fpm
+/// mode it only runs on `match`-glob paths), stripping it up-front guarantees
+/// a client can never forge it on a path the module skips. Names are
+/// deduplicated and lowercased for the case-insensitive compare in
+/// [`extract_headers`].
+fn build_ingest_strip_headers(mounts: &[MiddlewareMount]) -> Vec<String> {
+    let mut names: Vec<String> =
+        ALWAYS_STRIPPED_INGEST_HEADERS.iter().map(|s| (*s).to_owned()).collect();
+    for mount in mounts {
+        // Only the builtin `jwt` module (and its long-form spellings) forwards
+        // a claims header; match the same canonicalization the middleware
+        // registry uses.
+        let canonical = mount.library.replace('_', "-");
+        if !matches!(canonical.as_str(), "jwt" | "ephpm-middleware-jwt") {
+            continue;
+        }
+        if let Some(name) = mount
+            .config
+            .as_ref()
+            .and_then(|c| c.get("claims_header"))
+            .and_then(serde_json::Value::as_str)
+        {
+            if !name.is_empty() {
+                names.push(name.to_ascii_lowercase());
+            }
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 /// How long a cached canonicalized docroot stays valid before the next
@@ -501,6 +561,7 @@ impl Router {
             unknown_site_cache: dashmap::DashMap::new(),
             kv_site_password_cache: dashmap::DashMap::new(),
             canonical_roots: dashmap::DashMap::new(),
+            ingest_strip_headers: build_ingest_strip_headers(&config.middleware),
         }
     }
 
@@ -1089,7 +1150,7 @@ impl Router {
         let mut path = req.uri().path().to_string();
         let query_string = req.uri().query().unwrap_or("").to_string();
         let protocol = format!("{:?}", req.version());
-        let mut headers = extract_headers(&req);
+        let mut headers = extract_headers(req.headers(), &self.ingest_strip_headers);
         let content_type =
             req.headers().get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
         let server_name = extract_server_name(&req);
@@ -1822,9 +1883,19 @@ fn segment_match(pattern: &str, segment: &str) -> bool {
     pattern == segment
 }
 
-fn extract_headers(req: &Request<Incoming>) -> Vec<(String, String)> {
-    req.headers()
+/// Collect inbound request headers into owned `(name, value)` pairs, dropping
+/// any header whose name (case-insensitively) appears in `strip` before it can
+/// reach the middleware chain or PHP.
+///
+/// `strip` is the router's [`Router::ingest_strip_headers`] list — always
+/// `proxy` (httpoxy) plus every configured JWT `claims_header`. Stripping here,
+/// at the single ingest point shared by the fpm and worker dispatch paths,
+/// guarantees a client-forged value can never surface as `$_SERVER['HTTP_*']`
+/// even when the JWT middleware is skipped by its `match` glob (or absent).
+fn extract_headers(headers: &hyper::HeaderMap, strip: &[String]) -> Vec<(String, String)> {
+    headers
         .iter()
+        .filter(|(name, _)| !strip.iter().any(|s| name.as_str().eq_ignore_ascii_case(s)))
         .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or("").to_string()))
         .collect()
 }
@@ -2424,6 +2495,84 @@ mod tests {
             opcache: ephpm_config::OpcacheConfig::default(),
         };
         Router::new(&config, test_store(), None, None, None, None)
+    }
+
+    // ── Ingest header hygiene (Finding 3) ────────────────────────────────
+
+    /// A JWT middleware mount scoped to `/api/*` with an explicit claims
+    /// header. On a non-API path this module never runs, so the strip at
+    /// ingest is the only thing standing between a forged claims header and
+    /// PHP's `$_SERVER`.
+    fn jwt_mount(claims_header: &str) -> MiddlewareMount {
+        MiddlewareMount {
+            library: "jwt".to_string(),
+            match_pattern: Some("/api/*".to_string()),
+            order: 10,
+            config: Some(serde_json::json!({
+                "secret": "s3cret",
+                "claims_header": claims_header,
+            })),
+        }
+    }
+
+    #[test]
+    fn ingest_strip_list_always_contains_proxy() {
+        let strip = build_ingest_strip_headers(&[]);
+        assert!(
+            strip.iter().any(|h| h == "proxy"),
+            "Proxy (httpoxy) must always be stripped even with no middleware: {strip:?}"
+        );
+    }
+
+    #[test]
+    fn ingest_strip_list_includes_configured_jwt_claims_header() {
+        let strip = build_ingest_strip_headers(&[jwt_mount("X-Jwt-Claims")]);
+        // Lowercased for the case-insensitive ingest compare.
+        assert!(strip.iter().any(|h| h == "x-jwt-claims"), "{strip:?}");
+        assert!(strip.iter().any(|h| h == "proxy"), "{strip:?}");
+    }
+
+    #[test]
+    fn ingest_strip_list_ignores_non_jwt_mounts() {
+        // A cors mount carrying an incidental `claims_header` key must not
+        // contribute — only the jwt module forwards claims.
+        let cors = MiddlewareMount {
+            library: "cors".to_string(),
+            match_pattern: None,
+            order: 10,
+            config: Some(serde_json::json!({ "claims_header": "X-Not-Jwt" })),
+        };
+        let strip = build_ingest_strip_headers(&[cors]);
+        assert!(!strip.iter().any(|h| h == "x-not-jwt"), "{strip:?}");
+    }
+
+    /// The core Finding 3 proof: with a `/api/*`-scoped jwt module, a request
+    /// to a NON-matching path (`/index.php`) carrying a client-forged
+    /// `Proxy` and a forged claims header must have BOTH stripped before the
+    /// header list is handed to PHP — even though the middleware never ran.
+    #[test]
+    fn forged_proxy_and_claims_headers_absent_from_php_on_non_matching_path() {
+        let strip = build_ingest_strip_headers(&[jwt_mount("X-Jwt-Claims")]);
+
+        let mut incoming = hyper::HeaderMap::new();
+        incoming.insert("Proxy", "http://evil.example:8080".parse().unwrap());
+        incoming.insert("X-Jwt-Claims", "{\"sub\":\"admin\"}".parse().unwrap());
+        incoming.insert("Host", "victim.example".parse().unwrap());
+        incoming.insert("User-Agent", "curl/8".parse().unwrap());
+
+        let handed_to_php = extract_headers(&incoming, &strip);
+
+        assert!(
+            !handed_to_php.iter().any(|(n, _)| n.eq_ignore_ascii_case("proxy")),
+            "forged Proxy must not reach PHP: {handed_to_php:?}"
+        );
+        assert!(
+            !handed_to_php.iter().any(|(n, _)| n.eq_ignore_ascii_case("x-jwt-claims")),
+            "forged claims header must not reach PHP on a match-skipped path: {handed_to_php:?}"
+        );
+        // Legitimate headers are preserved untouched.
+        assert!(handed_to_php.iter().any(|(n, _)| n.eq_ignore_ascii_case("host")));
+        assert!(handed_to_php.iter().any(|(n, _)| n.eq_ignore_ascii_case("user-agent")));
     }
 
     fn test_router_with_404(dir: &Path) -> Router {
