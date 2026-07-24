@@ -183,8 +183,9 @@ pub async fn start_gossip(config: &ClusterConfig) -> anyhow::Result<ClusterHandl
         spawn_chitchat(chitchat_config, vec![], &transport).await
     } else {
         tracing::warn!(
-            "cluster.secret is not set — gossip and KV data plane traffic is unauthenticated \
-             plaintext; set [cluster] secret when running on untrusted networks"
+            "cluster.secret is not set (running with allow_insecure_no_auth) -- gossip and KV \
+             data plane traffic is unauthenticated plaintext; set [cluster] secret when running \
+             on untrusted networks"
         );
         spawn_chitchat(chitchat_config, vec![], &UdpTransport).await
     }

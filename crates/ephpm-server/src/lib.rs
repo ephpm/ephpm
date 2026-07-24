@@ -99,6 +99,24 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     // Start cluster gossip before DB proxies — clustered SQLite needs the handle.
     let cluster_handle = if config.cluster.enabled {
+        // Fail closed on an unauthenticated cluster: an empty secret means
+        // gossip and the KV data plane run as plaintext with no auth, so any
+        // host on the cluster network can forge KV writes. Require a secret
+        // unless the operator explicitly opts into insecure mode.
+        config
+            .cluster
+            .ensure_secure()
+            .map_err(|msg| anyhow::anyhow!(msg))
+            .context("refusing to start clustering without authentication")?;
+        if config.cluster.allow_insecure_no_auth && config.cluster.secret.is_empty() {
+            tracing::warn!(
+                "[cluster] allow_insecure_no_auth = true with an empty secret: gossip and the \
+                 KV data plane are running as UNAUTHENTICATED PLAINTEXT. Any host on the cluster \
+                 network can read and forge KV writes. Only use this on a fully trusted private \
+                 network with the gossip and data-plane ports firewalled from untrusted hosts."
+            );
+        }
+
         let handle = ephpm_cluster::start_gossip(&config.cluster)
             .await
             .context("failed to start cluster gossip")?;
