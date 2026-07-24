@@ -367,6 +367,13 @@ jobs:
           # single-digit perf delta on a target with no published benchmark
           # numbers. Same trade as linux-aarch64. Revisit once VM memory grows.
           CARGO_PROFILE_RELEASE_LTO: "off"
+          # Bump rustc's thread stack: with LTO off the Windows build gets
+          # far enough to compile sqlparser (a turso #183 dependency), whose
+          # deeply-recursive AST types overflow rustc's default thread stack
+          # on the Windows toolchain (STATUS_STACK_OVERFLOW, 0xc00000fd),
+          # made heavier by codegen-units=1 + opt-level=3. 32 MiB clears it.
+          # linux-aarch64 compiles sqlparser fine, so this is windows-only.
+          RUST_MIN_STACK: "33554432"
         run: cargo xtask release ${{ matrix.php_minor }} --target windows --no-sqld
 
       - name: Package archive
