@@ -57,7 +57,13 @@ pub fn validate_site_password(secret: &str, hostname: &str, provided: &str) -> b
 }
 
 /// Constant-time byte comparison to prevent timing attacks.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+///
+/// Length is not secret (it always leaks via the early return), but for
+/// equal-length inputs the loop always visits every byte so no timing oracle
+/// reveals where the first mismatch is. Shared with the legacy single-password
+/// `AUTH` path in [`crate::server`] so both authentication modes compare
+/// credentials in constant time.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

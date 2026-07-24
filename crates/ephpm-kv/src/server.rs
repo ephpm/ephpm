@@ -291,8 +291,12 @@ fn handle_auth(
         // Legacy single-password mode.
         let password_arg = first_arg;
         match (required_password, password_arg) {
-            // Password configured and client provided one — validate.
-            (Some(expected), Some(ref provided)) if expected.as_ref() == provided.as_str() => {
+            // Password configured and client provided one — validate in
+            // constant time so a mismatch's position is not a timing oracle
+            // (same primitive the HMAC multi-tenant path uses).
+            (Some(expected), Some(ref provided))
+                if auth::constant_time_eq(expected.as_bytes(), provided.as_bytes()) =>
+            {
                 (Frame::ok(), true, None)
             }
             // Password configured but client provided wrong one.
@@ -443,4 +447,45 @@ async fn shutdown_signal() {
 
     #[cfg(not(unix))]
     ctrl_c.await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::{Frame, handle_auth};
+
+    /// Build a RESP `AUTH <password>` frame.
+    fn auth_frame(password: &str) -> Frame {
+        Frame::Array(vec![
+            Frame::Bulk(bytes::Bytes::from_static(b"AUTH")),
+            Frame::Bulk(bytes::Bytes::copy_from_slice(password.as_bytes())),
+        ])
+    }
+
+    #[test]
+    fn legacy_auth_accepts_correct_password() {
+        let expected: Arc<str> = Arc::from("s3cret");
+        let (_frame, ok, _hmac) =
+            handle_auth(&auth_frame("s3cret"), Some(&expected), None, None);
+        assert!(ok, "correct legacy password must authenticate");
+    }
+
+    #[test]
+    fn legacy_auth_rejects_wrong_password() {
+        let expected: Arc<str> = Arc::from("s3cret");
+        let (_frame, ok, _hmac) =
+            handle_auth(&auth_frame("wrong"), Some(&expected), None, None);
+        assert!(!ok, "wrong legacy password must be rejected");
+    }
+
+    #[test]
+    fn legacy_auth_rejects_prefix_of_password() {
+        // A prefix that would pass a short-circuiting compare's first bytes
+        // must still fail — the constant-time compare rejects unequal lengths.
+        let expected: Arc<str> = Arc::from("s3cret");
+        let (_frame, ok, _hmac) =
+            handle_auth(&auth_frame("s3c"), Some(&expected), None, None);
+        assert!(!ok, "a prefix of the password must not authenticate");
+    }
 }
