@@ -312,6 +312,14 @@ thread_local! {
     static DISPATCH_RX: RefCell<Option<async_channel::Receiver<WorkerJob>>> =
         const { RefCell::new(None) };
 
+    /// Shared counter of jobs currently sitting in the dispatch channel.
+    /// Incremented by the pool on enqueue, decremented here after each
+    /// successful `recv_blocking`. Lets the pool report queue depth from a
+    /// single `Relaxed` load instead of the SeqCst spin-loop in
+    /// `async_channel::Sender::len()` on every dispatch.
+    static DISPATCH_DEPTH: RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>> =
+        const { RefCell::new(None) };
+
     /// The parked `oneshot::Sender` for the in-flight request. Stashed by
     /// `take_request`, taken by `send_response` (or by the supervisor on
     /// bailout). This is the only Rust value live across the PHP call.
@@ -359,6 +367,19 @@ pub fn set_dispatch_receiver(rx: async_channel::Receiver<WorkerJob>) {
 /// Stub: no dispatch channel without PHP linked.
 #[cfg(not(php_linked))]
 pub fn set_dispatch_receiver(_rx: async_channel::Receiver<WorkerJob>) {}
+
+/// Install the shared queue-depth counter for the current worker thread.
+/// Decremented on every successful `recv_blocking` so the pool can report
+/// dispatch-queue occupancy without calling `async_channel::len()` per
+/// dispatch (a SeqCst spin-loop) on the hot path.
+#[cfg(php_linked)]
+pub fn set_dispatch_depth_counter(depth: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    DISPATCH_DEPTH.with(|cell| *cell.borrow_mut() = Some(depth));
+}
+
+/// Stub: no dispatch-depth accounting without PHP linked.
+#[cfg(not(php_linked))]
+pub fn set_dispatch_depth_counter(_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>) {}
 
 /// Set the per-worker recycle threshold (`worker_max_requests`; `0` disables).
 #[cfg(php_linked)]
@@ -549,6 +570,13 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
         // Sender side closed (graceful drain) — end the loop.
         Err(_) => return 0,
     };
+    // The job just left the dispatch channel — reflect it in the shared
+    // depth counter the pool reports as `ephpm_worker_dispatch_queue_depth`.
+    DISPATCH_DEPTH.with(|cell| {
+        if let Some(depth) = cell.borrow().as_ref() {
+            depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
 
     // Stash the sender for send_response / crash recovery.
     PENDING_SENDER.with(|cell| *cell.borrow_mut() = Some(job.respond_to));

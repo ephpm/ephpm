@@ -199,7 +199,11 @@ pub struct Router {
     /// PHP-allowlist patterns, pre-split at Router construction so
     /// [`Router::is_php_allowed`] avoids per-request splitting.
     allowed_php_paths: Vec<CompiledGlob>,
-    trusted_hosts: Vec<String>,
+    /// Trusted `Host` values, pre-lowercased at construction so
+    /// [`Router::check_trusted_host`] lowercases the incoming host once and
+    /// does a single-pass ASCII compare per entry — no per-request
+    /// `eq_ignore_ascii_case` (which re-lowercases both sides every call).
+    trusted_hosts: Box<[Box<str>]>,
     /// Config response headers precomputed as valid
     /// (HeaderName, HeaderValue) at Router construction. Entries with
     /// invalid names or values are dropped at startup with a warning
@@ -424,7 +428,13 @@ impl Router {
                 .iter()
                 .map(|p| CompiledGlob::compile(p))
                 .collect(),
-            trusted_hosts: config.server.request.trusted_hosts.clone(),
+            trusted_hosts: config
+                .server
+                .request
+                .trusted_hosts
+                .iter()
+                .map(|h| h.to_ascii_lowercase().into_boxed_str())
+                .collect(),
             response_headers: config
                 .server
                 .response
@@ -1605,11 +1615,15 @@ impl Router {
             return None;
         }
         let host = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("");
-        // Compare with and without port.
-        let host_no_port = host.split(':').next().unwrap_or(host);
-        let is_trusted = self.trusted_hosts.iter().any(|trusted| {
-            host.eq_ignore_ascii_case(trusted) || host_no_port.eq_ignore_ascii_case(trusted)
-        });
+        // Lowercase the incoming host ONCE; the trusted list is already
+        // lowercased at construction, so each entry compare is a plain byte
+        // equality rather than a per-entry `eq_ignore_ascii_case`.
+        let host_lc = host.to_ascii_lowercase();
+        let host_no_port = host_lc.split(':').next().unwrap_or(&host_lc);
+        let is_trusted = self
+            .trusted_hosts
+            .iter()
+            .any(|trusted| host_lc == **trusted || host_no_port == &**trusted);
         if is_trusted {
             None
         } else {
@@ -1662,17 +1676,19 @@ impl Router {
     }
 
     /// Walk X-Forwarded-For from right to left, return the first untrusted IP.
+    ///
+    /// Uses `rsplit` to scan right-to-left in place — no `Vec` allocation for
+    /// the (typically 1-3 element) proxy chain on this per-request path.
     fn resolve_xff(&self, xff: &str) -> Option<IpAddr> {
-        let ips: Vec<&str> = xff.split(',').map(str::trim).collect();
-        for ip_str in ips.iter().rev() {
-            if let Ok(ip) = ip_str.parse::<IpAddr>() {
+        for ip_str in xff.rsplit(',') {
+            if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
                 if !self.is_trusted_proxy(ip) {
                     return Some(ip);
                 }
             }
         }
-        // All IPs in the chain are trusted — use the leftmost
-        ips.first().and_then(|s| s.parse().ok())
+        // All IPs in the chain are trusted (or unparseable) — use the leftmost.
+        xff.split(',').next().and_then(|s| s.trim().parse().ok())
     }
 }
 
@@ -1695,6 +1711,13 @@ fn has_hidden_segment(uri_path: &str) -> bool {
 /// `None`. ASCII paths (the overwhelming majority) round-trip exactly.
 fn percent_decode_path(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
+    // Fast path: the overwhelming majority of request paths contain no `%`.
+    // `raw` is already a valid `&str` (UTF-8), so with nothing to decode we
+    // can hand back an owned copy without the byte-by-byte scan, the
+    // `Vec<u8>` build, or the trailing `from_utf8` re-validation.
+    if !bytes.contains(&b'%') {
+        return Some(raw.to_owned());
+    }
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -2679,6 +2702,34 @@ mod tests {
         let xff = "10.0.0.2, 10.0.0.1";
         let ip = router.resolve_xff(xff);
         assert_eq!(ip, Some("10.0.0.2".parse().unwrap()));
+    }
+
+    // ── percent decoding (fast-path parity) ─────────────────────────
+
+    #[test]
+    fn percent_decode_free_of_percent_roundtrips() {
+        // The `%`-free fast path must return the exact input unchanged.
+        for p in ["/", "/index.php", "/a/b/c.txt", "/wp-admin/", "/x?y=z"] {
+            assert_eq!(percent_decode_path(p).as_deref(), Some(p), "fast path changed {p}");
+        }
+    }
+
+    #[test]
+    fn percent_decode_still_decodes_escapes() {
+        // `%2E` -> '.', so `test%2Ehtml` decodes to `test.html`.
+        assert_eq!(percent_decode_path("/test%2Ehtml").as_deref(), Some("/test.html"));
+        assert_eq!(percent_decode_path("/a%20b").as_deref(), Some("/a b"));
+    }
+
+    #[test]
+    fn percent_decode_rejects_encoded_slash_and_malformed() {
+        // Encoded '/' (%2F) and '\' (%5C) must be rejected (traversal bypass).
+        assert_eq!(percent_decode_path("/a%2Fb"), None);
+        assert_eq!(percent_decode_path("/a%5Cb"), None);
+        // Truncated / non-hex escapes are malformed.
+        assert_eq!(percent_decode_path("/a%"), None);
+        assert_eq!(percent_decode_path("/a%2"), None);
+        assert_eq!(percent_decode_path("/a%zz"), None);
     }
 
     // ── port parsing ─────────────────────────────────────────────────
