@@ -54,7 +54,7 @@ const CLUSTER_SUITES: &[&str] = &["cluster"];
 /// Each of these reuses the single-node DB-proxy ports (3306, ...), so they
 /// run strictly sequentially -- spawned, run, torn down -- one at a time,
 /// BEFORE the shared node claims those ports.
-const ISOLATED_DB_SUITES: &[&str] = &["sqlite", "sqlite_advanced", "rw_split"];
+const ISOLATED_DB_SUITES: &[&str] = &["sqlite", "sqlite_advanced", "rw_split", "query_stats"];
 
 /// Single-node suites that need a bespoke server config and their own fresh
 /// node (also sequential, also reusing the single-node ports).
