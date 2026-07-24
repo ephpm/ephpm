@@ -1,0 +1,40 @@
+# K8s E2E tests - Kind + Tilt path. Opt-in via workflow_dispatch only.
+#
+# The default E2E path (.github/workflows/e2e.yml) uses bare processes; this
+# workflow exists so engineers and agents can smoke K8s deployment shape
+# (readiness gates, StatefulSet identity, headless service DNS, sqld PVC
+# behavior) before pushing code that touches k8s/ manifests. Not run on PRs
+# because Kind requires --privileged DinD, which is a container-to-container
+# poisoning risk in the shared self-hosted VM.
+
+name: K8s E2E Tests (opt-in)
+
+on:
+  workflow_dispatch:
+    inputs:
+      php:
+        description: "PHP minor version (8.3, 8.4, 8.5)"
+        required: false
+        default: "8.5"
+
+# Kind still needs the repo-wide serialization - one Kind cluster per runner,
+# and the ephemerd shared VM can't tolerate two Kind installs concurrently.
+concurrency:
+  group: ephpm-k8s-e2e
+  cancel-in-progress: false
+
+jobs:
+  k8s-e2e:
+    name: K8s E2E (PHP ${{ github.event.inputs.php }})
+    runs-on: [self-hosted, linux, x64]
+
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libclang-dev
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install E2E tools (kind, tilt, kubectl)
+        run: cargo xtask k8s-e2e-install
+
+      - name: Run K8s E2E tests
+        run: cargo xtask k8s-e2e --php-version ${{ github.event.inputs.php }}

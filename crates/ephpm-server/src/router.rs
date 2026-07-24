@@ -227,6 +227,17 @@ pub struct Router {
     /// Database environment variables to inject into PHP `$_SERVER`.
     /// Populated from `[db.mysql]` or `[db.postgres]` when `inject_env = true`.
     db_env_vars: Vec<(String, String)>,
+    /// This node's stable cluster identity, injected into PHP `$_SERVER` as
+    /// `EPHPM_NODE_ID`. Set from the running gossip node's id (or the
+    /// configured `[cluster] node_id` in single-node mode). `None` when no
+    /// identity is available; PHP then sees no `EPHPM_NODE_ID` key.
+    ///
+    /// Environment-agnostic on purpose: it is a distinct value per node in
+    /// BOTH the bare-process harness (config sets `node_id = "cluster-node-N"`)
+    /// and the Kind StatefulSet (auto-derived `<pod-name>-<rand>` per pod),
+    /// so cluster e2e tests can assert on it instead of the OS hostname (which
+    /// collapses to one value when every node is a process on the same host).
+    node_id: Option<String>,
     /// Caps concurrent PHP executions when `[php] workers > 0` (php-fpm
     /// `max_children` semantics). `None` = unlimited. This deliberately does
     /// NOT cap tokio's blocking pool — static file I/O and other blocking
@@ -475,6 +486,14 @@ impl Router {
             kv_listen: config.kv.redis_compat.listen.clone(),
             kv_redis_compat_enabled: config.kv.redis_compat.enabled,
             db_env_vars: build_db_env_vars(config),
+            // Prefer the explicit `[cluster] node_id`; `serve()` overrides this
+            // via `with_node_id` with the effective gossip id once clustering
+            // is up (that id is auto-derived per node when config leaves it
+            // empty). Empty config value => None so PHP sees no key here.
+            node_id: {
+                let id = config.cluster.node_id.trim();
+                if id.is_empty() { None } else { Some(id.to_string()) }
+            },
             php_semaphore,
             worker_pool,
             worker_stream_threshold: config.php.worker_stream_threshold,
@@ -532,6 +551,25 @@ impl Router {
         chain: Option<Arc<crate::middleware::MiddlewareChain>>,
     ) -> Self {
         self.middleware_chain = chain;
+        self
+    }
+
+    /// Override this node's `EPHPM_NODE_ID` (injected into PHP `$_SERVER`)
+    /// with the effective runtime cluster identity.
+    ///
+    /// `serve()` passes the running gossip node's id here so PHP sees the same
+    /// distinct-per-node value the cluster uses internally -- including the
+    /// auto-derived id when `[cluster] node_id` is left empty (e.g. the Kind
+    /// StatefulSet, where each pod gets `<pod-name>-<rand>`). A `None` or empty
+    /// argument leaves whatever `new()` derived from config untouched.
+    #[must_use]
+    pub fn with_node_id(mut self, node_id: Option<String>) -> Self {
+        if let Some(id) = node_id {
+            let id = id.trim();
+            if !id.is_empty() {
+                self.node_id = Some(id.to_string());
+            }
+        }
         self
     }
 
@@ -1274,6 +1312,9 @@ impl Router {
         // plus DB_* env vars for framework auto-discovery.
         let mut env_vars = self.build_kv_env_vars(&server_name);
         env_vars.extend_from_slice(&self.db_env_vars);
+        if let Some(ref id) = self.node_id {
+            env_vars.push(("EPHPM_NODE_ID".to_string(), id.clone()));
+        }
 
         // Phase-1 OPcache clustered invalidation: fast-path check outside the
         // spawn_blocking hop so a no-op costs one atomic load + one KV get and
@@ -1407,6 +1448,9 @@ impl Router {
         // content_type on the hot path for no reason.
         let mut env_vars = self.build_kv_env_vars(&server_name);
         env_vars.extend_from_slice(&self.db_env_vars);
+        if let Some(ref id) = self.node_id {
+            env_vars.push(("EPHPM_NODE_ID".to_string(), id.clone()));
+        }
 
         let cookie_data = ephpm_php::request::cookie_string_from_headers(&headers);
         let server_vars = ephpm_php::request::build_server_variables(

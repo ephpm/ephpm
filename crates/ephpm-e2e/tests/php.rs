@@ -55,9 +55,28 @@ async fn server_vars_populated() {
         body.contains("REQUEST_URI: /test.php"),
         "$_SERVER['REQUEST_URI'] not set correctly:\n{body}"
     );
+    // DOCUMENT_ROOT is whatever `[server] document_root` points at, which
+    // differs by environment: `/var/www/html` in the container image, the
+    // repo's `tests/docroot` under the bare-process harness. The harness that
+    // knows the path exports it as EXPECTED_DOCUMENT_ROOT; default to the
+    // container path so the Kind harness (which does not set it) still passes.
+    // Rather than assert an exact string (brittle across environments) we only
+    // require the line to be present and non-empty, then match the expected
+    // value when the harness provides it.
+    let expected_docroot = std::env::var("EXPECTED_DOCUMENT_ROOT")
+        .unwrap_or_else(|_| "/var/www/html".to_string());
+    let docroot_line = body
+        .lines()
+        .find_map(|line| line.strip_prefix("DOCUMENT_ROOT: "))
+        .unwrap_or_else(|| panic!("$_SERVER['DOCUMENT_ROOT'] line missing:\n{body}"));
     assert!(
-        body.contains("DOCUMENT_ROOT: /var/www/html"),
-        "$_SERVER['DOCUMENT_ROOT'] not set correctly:\n{body}"
+        !docroot_line.trim().is_empty(),
+        "$_SERVER['DOCUMENT_ROOT'] is empty:\n{body}"
+    );
+    assert_eq!(
+        docroot_line.trim(),
+        expected_docroot.trim_end_matches('/'),
+        "$_SERVER['DOCUMENT_ROOT'] mismatch (expected {expected_docroot}):\n{body}"
     );
 
     let has_remote_addr = body.lines().any(|line| {

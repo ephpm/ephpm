@@ -5,7 +5,9 @@ description: Reproduce ephpm E2E test failures locally against a containerized r
 
 # Run E2E tests against a local container
 
-The CI E2E harness is Kind + Tilt (`cargo xtask e2e`), but 90% of failures reproduce against a plain container plus the pre-built test binaries. Iteration: ~10 min image build, then seconds per test run.
+The default CI E2E harness is now bare-process — `cargo xtask e2e` spawns ephpm on 127.0.0.1 (no Kind, no Tilt, no privileged DinD) and runs the ephpm-e2e test binaries against it. For the fastest possible iteration on a server-side fix, that's what to use: one release binary + `cargo xtask e2e --tests <suite>`. The Kind harness (`cargo xtask k8s-e2e`, workflow_dispatch only) is opt-in and reserved for smoking K8s deployment shape.
+
+The container-based flow below is still valid for reproducing failures when you already have an image built (~10 min image build vs a fresh release build), and for verifying long-lived container behaviors. Pick whichever loop is faster for the change you're testing.
 
 ## 1. Build the release image
 
@@ -54,4 +56,4 @@ For crash bugs, run the full suite list 3 passes and require `running=true resta
 
 ## Full-fidelity fallback
 
-If the failure needs the real cluster (readiness gates, sqld, gossip): `cargo xtask e2e` (Kind + Tilt, needs podman machine + privileged dind on ephemerd hosts). On failure it dumps pod logs, cluster diagnostics, container exit codes, and a FAILED-tests summary at the end of the output.
+If the failure needs the real Kind cluster (readiness gates, StatefulSet identity, headless service DNS, sqld PVC behavior): `cargo xtask k8s-e2e` (renamed from `cargo xtask e2e` — the old name is now the bare-process default). This is opt-in only and lives at `.github/workflows/k8s-e2e.yml` as a `workflow_dispatch` job, because Kind needs podman machine + privileged dind on ephemerd hosts and we don't want that on every PR. On failure it dumps pod logs, cluster diagnostics, container exit codes, and a FAILED-tests summary at the end of the output.
