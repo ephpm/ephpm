@@ -501,35 +501,36 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     permissions:
       contents: write
+      # Needed to list this run's artifacts via the REST API (below).
+      actions: read
     steps:
-      # Download in two batches of 6 (by arch suffix) rather than all at once.
-      # actions/download-artifact@v4 fetches every matched artifact in
-      # parallel; downloading all 12 together saturated the self-hosted
-      # runner's egress to Azure blob storage and silently dropped the tail
-      # (it aborts after 5 internal retries). Two 6-way batches stay well
-      # under that ceiling. merge-multiple flattens archives into ./artifacts.
-      # (gh CLI is not installed on this runner, so a gh-based loop is out.)
-      - name: Download x86_64 archives
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ephpm-v*-x86_64
-          path: artifacts
-          merge-multiple: true
+      - uses: actions/checkout@v4
 
-      - name: Download aarch64 archives
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ephpm-v*-aarch64
-          path: artifacts
-          merge-multiple: true
+      # Collect the build archives via the REST run-artifacts endpoint rather
+      # than actions/download-artifact@v4. download-artifact only sees the
+      # CURRENT run attempt's artifacts, so a `gh run rerun --failed` (which
+      # only re-uploads the reran legs) leaves the already-green legs' archives
+      # stranded on the prior attempt and the publish fails -- which forced
+      # every retry to be a full all-legs rebuild. The run-artifacts endpoint
+      # lists every artifact across ALL attempts, so a single flaky leg can be
+      # rerun-failed without redoing the whole matrix. The script downloads
+      # sequentially, which also avoids the parallel egress saturation that
+      # made the old all-at-once download silently drop its tail.
+      - name: Collect build archives (all run attempts)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          OUT_DIR: artifacts
+        run: python3 .github/scripts/collect_release_artifacts.py
 
       - name: Collect archives and write SHA256SUMS
         id: collect
         run: |
           set -eu
           mkdir -p release
-          # merge-multiple put every archive flat under artifacts/; gather
-          # them so SHA256SUMS lives next to the things it sums.
+          # The collect step above extracted every archive flat under
+          # artifacts/; gather them so SHA256SUMS lives next to what it sums.
           find artifacts -type f -name '*.tar.gz' -exec cp {} release/ \;
           (cd release && sha256sum *.tar.gz | sort > SHA256SUMS)
           echo "Collected $(ls release/*.tar.gz | wc -l) archives:"
