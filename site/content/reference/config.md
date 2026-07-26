@@ -32,7 +32,7 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 |-----|------|---------|-------------|
 | `header_read` | u64 | `30` | Time to receive complete request headers after connect. |
 | `idle` | u64 | `60` | Idle connection timeout. |
-| `request` | u64 | `300` | Total request timeout including PHP execution. |
+| `request` | u64 | `300` | Total request timeout including PHP execution. `0` disables the per-request deadline (the router skips arming a tokio timer per request); a stuck request then relies on the idle/header-read timeouts instead of a hard cutoff. |
 | `shutdown` | u64 | `30` | Grace period for in-flight connections during shutdown. |
 
 ### `[server.response]`

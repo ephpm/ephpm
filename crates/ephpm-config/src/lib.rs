@@ -240,6 +240,13 @@ pub struct TimeoutsConfig {
     /// Total request processing timeout in seconds. Covers the entire
     /// request lifecycle including PHP execution.
     ///
+    /// Set to `0` to disable the per-request deadline entirely - the router
+    /// then runs each request without arming a tokio timer, which removes a
+    /// small but measurable per-request overhead on very hot, short-request
+    /// workloads. With the deadline off, a wedged request relies on the idle
+    /// and header-read timeouts (and, in worker mode, the worker's own
+    /// liveness handling) rather than a hard request cutoff.
+    ///
     /// Default: 300 seconds (5 minutes).
     #[serde(default = "default_request_timeout")]
     pub request: u64,
