@@ -522,7 +522,7 @@ jobs:
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
           OUT_DIR: artifacts
-        run: python3 .github/scripts/collect_release_artifacts.py
+        run: bash .github/scripts/collect_release_artifacts.sh
 
       - name: Collect archives and write SHA256SUMS
         id: collect
