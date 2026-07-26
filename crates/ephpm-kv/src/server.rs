@@ -466,16 +466,14 @@ mod tests {
     #[test]
     fn legacy_auth_accepts_correct_password() {
         let expected: Arc<str> = Arc::from("s3cret");
-        let (_frame, ok, _hmac) =
-            handle_auth(&auth_frame("s3cret"), Some(&expected), None, None);
+        let (_frame, ok, _hmac) = handle_auth(&auth_frame("s3cret"), Some(&expected), None, None);
         assert!(ok, "correct legacy password must authenticate");
     }
 
     #[test]
     fn legacy_auth_rejects_wrong_password() {
         let expected: Arc<str> = Arc::from("s3cret");
-        let (_frame, ok, _hmac) =
-            handle_auth(&auth_frame("wrong"), Some(&expected), None, None);
+        let (_frame, ok, _hmac) = handle_auth(&auth_frame("wrong"), Some(&expected), None, None);
         assert!(!ok, "wrong legacy password must be rejected");
     }
 
@@ -484,8 +482,7 @@ mod tests {
         // A prefix that would pass a short-circuiting compare's first bytes
         // must still fail — the constant-time compare rejects unequal lengths.
         let expected: Arc<str> = Arc::from("s3cret");
-        let (_frame, ok, _hmac) =
-            handle_auth(&auth_frame("s3c"), Some(&expected), None, None);
+        let (_frame, ok, _hmac) = handle_auth(&auth_frame("s3c"), Some(&expected), None, None);
         assert!(!ok, "a prefix of the password must not authenticate");
     }
 }
