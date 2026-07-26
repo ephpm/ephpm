@@ -1,12 +1,16 @@
-# E2E tests — build ephpm with PHP, deploy to Kind, run phpinfo validation.
+# E2E tests - bare-process default.
 #
-# Matrix: PHP 8.4 and 8.5. Each job builds a release binary with the
-# specified PHP version and asserts that the running server reports it.
+# Spawns ephpm binaries directly on 127.0.0.1 (no Kind, no Tilt, no
+# `--privileged` DinD in the CI path) and runs the ephpm-e2e test binaries
+# against them. Matrix: PHP 8.3, 8.4, 8.5. See `xtask/src/e2e_bare.rs`.
+#
+# The old Kind + Tilt harness lives at .github/workflows/k8s-e2e.yml as an
+# opt-in workflow_dispatch job for engineers who want to smoke K8s deploy
+# shape before checking in code that touches k8s/.
 
 name: E2E Tests
 
-# Docs-only changes skip E2E — see ci.yml; doubly important here since
-# each E2E run occupies the serialized repo-wide concurrency group.
+# Docs-only changes skip E2E (unchanged from the Kind era).
 on:
   push:
     branches: [main]
@@ -21,35 +25,24 @@ on:
       - "docs/**"
       - "**.md"
 
-# Serialize E2E across the whole repo. Each E2E job runs a full Kind cluster
-# plus a Rust release build inside ephemerd's shared 16 GB Linux VM; several
-# E2E runs overlapping (different PRs / push-to-main / re-pushes) saturate it
-# and the Kind apiserver gets starved mid-run ("connection reset by peer" ->
-# 30m Tilt timeout). `max-parallel: 1` already serializes the matrix legs
-# within a single run; this group serializes runs against each other so only
-# one E2E run is ever on the box at a time. cancel-in-progress: false because
-# we want queued runs to wait their turn, not be discarded.
-concurrency:
-  group: ephpm-e2e
-  cancel-in-progress: false
+# NOTE: no `concurrency` group. Bare-process runs are independent - each job
+# spawns ephpm processes on high, per-run loopback ports and cleans up on exit.
+# Multiple E2E runs can share the runner without stepping on each other, and
+# the matrix legs can run in parallel.
 
 jobs:
-  e2e:
-    name: E2E (PHP ${{ matrix.php }})
+  e2e-bare:
+    name: E2E bare-process (PHP ${{ matrix.php }})
     runs-on: [self-hosted, linux, x64]
     strategy:
       fail-fast: false
-      max-parallel: 1
       matrix:
         php: ["8.3", "8.5", "8.4"]
 
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libclang-dev
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install E2E tools (kind, tilt, kubectl)
-        run: cargo xtask e2e-install
-
-      - name: Run E2E tests
+      - name: Run bare-process E2E
         run: cargo xtask e2e --php-version ${{ matrix.php }}

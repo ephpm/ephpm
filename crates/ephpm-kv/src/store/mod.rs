@@ -796,15 +796,37 @@ impl Store {
         delta: i64,
         ttl: Option<Duration>,
     ) -> Result<i64, String> {
-        // Fast path: key exists, try to update in place.
-        if let Some(mut entry) = self.data.get_mut(key) {
-            if entry.is_expired() {
-                drop(entry);
-                // Lazy-expiry cleanup: local only.
-                self.remove_local(key);
-                // Fall through to create.
-            } else {
-                // Decompress if needed before parsing.
+        // The whole read-modify-write MUST happen under one shard write lock,
+        // otherwise two concurrent increments on a missing key both observe it
+        // absent and both create it with value `delta`, losing an update (the
+        // `concurrent_kv_increments_are_consistent` e2e regression: 20 parallel
+        // `incr` on a freshly-deleted key returned 18). `data.entry()` holds the
+        // shard write lock across the check-and-create, serialising callers for
+        // this key the same way `set_nx` does.
+        //
+        // Eviction must NOT run while that lock is held: `ensure_memory` ->
+        // `evict_lru` locks arbitrary shards (possibly this one) and would
+        // deadlock. So, mirroring `set_nx`, peek first and reserve memory up
+        // front only when the key looks absent/expired (the create case). The
+        // peek can race, but the entry lock below is authoritative: a wasted
+        // `ensure_memory` on the rare lost race is not a correctness bug.
+        let needs_create = self.data.get(key).is_none_or(|existing| existing.is_expired());
+        if needs_create {
+            // A freshly-created counter is a single small integer string;
+            // reserve for it before taking the entry lock.
+            let create_size =
+                Entry::new(Bytes::from(delta.to_string().into_bytes()), key.len(), false, 0)
+                    .mem_size;
+            if !self.ensure_memory(create_size) {
+                return Err("ERR out of memory".to_string());
+            }
+        }
+
+        let now = self.now_nanos();
+        let result = match self.data.entry(key.to_string()) {
+            dashmap::Entry::Occupied(mut occ) if !occ.get().is_expired() => {
+                // Update path: parse the live value and store `current + delta`.
+                let entry = occ.get();
                 let data = if entry.compressed {
                     decompress_value(&entry.data, self.config.compression.algo)
                         .ok_or_else(|| "ERR failed to decompress value".to_string())?
@@ -833,30 +855,62 @@ impl Store {
                     (Bytes::from(new_bytes), false)
                 };
 
+                let entry = occ.get_mut();
                 let old_mem = entry.mem_size;
                 entry.data = stored_data;
                 entry.compressed = compressed;
                 entry.mem_size = Entry::new(entry.data.clone(), key.len(), compressed, 0).mem_size;
-                entry.touch(self.now_nanos());
+                entry.touch(now);
                 let new_mem = entry.mem_size;
-                drop(entry);
-                // Adjust memory tracking.
+                // Adjust memory tracking (delta of the digit-string length).
                 if new_mem > old_mem {
                     self.mem_add(new_mem - old_mem);
                 } else {
                     self.mem_sub(old_mem - new_mem);
                 }
-                // In-place update — wake waiters (the create path below
-                // notifies via set → set_local).
-                self.notify_write(key);
-                return Ok(new_val);
+                new_val
             }
-        }
+            entry => {
+                // Create path: key vacant or holding an expired entry. Replace
+                // it with a fresh counter at value `delta` and the caller's TTL.
+                let val_bytes = delta.to_string().into_bytes();
+                let new_entry = match ttl {
+                    Some(dur) => Entry::with_expiry(
+                        Bytes::from(val_bytes),
+                        key.len(),
+                        false,
+                        Instant::now() + dur,
+                        now,
+                    ),
+                    None => Entry::new(Bytes::from(val_bytes), key.len(), false, now),
+                };
+                let new_size = new_entry.mem_size;
+                let has_ttl = new_entry.expires_at.is_some();
+                match entry {
+                    dashmap::Entry::Occupied(mut occ) => {
+                        // Expired entry: reclaim its bytes, then replace.
+                        self.mem_sub(occ.get().mem_size);
+                        self.mem_add(new_size);
+                        occ.insert(new_entry);
+                    }
+                    dashmap::Entry::Vacant(vac) => {
+                        self.mem_add(new_size);
+                        vac.insert(new_entry);
+                    }
+                }
+                if has_ttl {
+                    self.ttl_keys.insert(key.to_string());
+                } else {
+                    self.ttl_keys.remove(key);
+                }
+                delta
+            }
+        };
 
-        // Key doesn't exist — create it with the caller's TTL (if any).
-        let val_bytes = delta.to_string().into_bytes();
-        self.set(key.to_string(), val_bytes, ttl);
-        Ok(delta)
+        // Wake any versioned waiters now that the write is visible. Done after
+        // the entry guard has been dropped by the `match` arms above.
+        self.notify_write(key);
+        Ok(result)
     }
 
     /// Append `value` to the existing value at `key`, or create it.
@@ -1727,6 +1781,36 @@ mod tests {
         assert!(s.incr_by("k", 1).is_err());
     }
 
+    /// Regression for the `incr_by` create-path race: N threads incrementing a
+    /// missing key concurrently must land exactly N, with no lost updates.
+    /// Before the `data.entry()` rewrite, two threads that both observed the
+    /// key absent would each create it at value 1, dropping an increment (the
+    /// `concurrent_kv_increments_are_consistent` e2e failure: 20 -> 18).
+    #[test]
+    fn incr_by_concurrent_create_has_no_lost_updates() {
+        // Repeat: the race only fires when threads collide on the create
+        // window, which is timing-dependent, so a single pass could get lucky.
+        for _ in 0..50 {
+            let s = test_store();
+            const N: i64 = 32;
+            let mut handles = Vec::with_capacity(N as usize);
+            for _ in 0..N {
+                let s = Arc::clone(&s);
+                handles.push(std::thread::spawn(move || {
+                    s.incr_by("ctr", 1).expect("incr must succeed");
+                }));
+            }
+            for h in handles {
+                h.join().expect("increment thread panicked");
+            }
+            let final_val = s.get("ctr").expect("counter must exist");
+            assert_eq!(
+                final_val.as_ref(),
+                N.to_string().as_bytes(),
+                "concurrent incr lost updates: expected {N}"
+            );
+        }
+    }
     #[test]
     fn append_new_key() {
         let s = test_store();

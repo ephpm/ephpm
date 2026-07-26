@@ -39,7 +39,7 @@ cargo deny check                           # license/advisory audit
 
 IMPORTANT: Run single tests when possible, not the full suite. Use `cargo test -p <crate> <test_name>`. `cargo nextest` is preferred but may not be installed — fall back to `cargo test`.
 
-The `ephpm-e2e` crate is **excluded from the workspace** — it runs inside Docker via `cargo xtask e2e` and has different dependencies. Don't try to compile it with `cargo test --workspace`.
+The `ephpm-e2e` crate is **excluded from the workspace** and has different dependencies — don't try to compile it with `cargo test --workspace`. It runs bare-process by default via `cargo xtask e2e` (spawns ephpm on 127.0.0.1, no Kind), or via `cargo xtask k8s-e2e` for opt-in Kind + Tilt cluster testing (dispatched from `.github/workflows/k8s-e2e.yml`).
 
 ## Workspace Structure
 
@@ -54,7 +54,7 @@ The `ephpm-e2e` crate is **excluded from the workspace** — it runs inside Dock
 | `ephpm-cluster` | Clustering — SWIM gossip (chitchat), consistent hash ring, KV replication, SQLite primary election |
 | `ephpm-sqld` | sqld embedding — binary extraction via `include_bytes!()`, child process lifecycle, health checks |
 | `ephpm-query-stats` | Query observability — SQL normalization, digest tracking, slow query logging, Prometheus metrics |
-| `xtask` | Build & test tooling — `release`, `php-sdk`, `e2e`, `e2e-up`, `e2e-down` |
+| `xtask` | Build & test tooling — `release`, `php-sdk`, `e2e` (bare-process default), `k8s-e2e`/`k8s-e2e-up`/`k8s-e2e-down` (opt-in Kind path) |
 
 ## External Dependencies
 
