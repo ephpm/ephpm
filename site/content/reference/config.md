@@ -296,7 +296,8 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | `enabled` | bool | `false` | Enable gossip clustering. |
 | `bind` | string | `"0.0.0.0:7946"` | Gossip UDP listener. |
 | `join` | array of strings | `[]` | Seed addresses for initial cluster join. |
-| `secret` | string | `""` | Shared secret for cluster transport security. When set, gossip UDP and the KV TCP data plane are encrypted and authenticated (ChaCha20-Poly1305, keys derived via HKDF-SHA256); nodes without it cannot join, read, or inject. Empty = plaintext (warning logged at startup). |
+| `secret` | string | `""` | Shared secret for cluster transport security. When set, gossip UDP and the KV TCP data plane are encrypted and authenticated (ChaCha20-Poly1305, keys derived via HKDF-SHA256); nodes without it cannot join, read, or inject. **Required when `enabled = true`:** an empty secret is a hard startup error unless `allow_insecure_no_auth = true`. |
+| `allow_insecure_no_auth` | bool | `false` | Opt in to running clustering with an empty `secret` (unauthenticated plaintext gossip + KV data plane). Off by default so clustering fails closed. Set `true` only on a fully trusted private network with ports 7946/7947 firewalled from untrusted hosts; a loud warning is still logged. Not recommended. |
 | `node_id` | string | (auto) | Unique node identifier. Auto-generated if empty. |
 | `cluster_id` | string | `"ephpm"` | Nodes with different `cluster_id`s ignore each other. |
 

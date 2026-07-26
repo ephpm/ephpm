@@ -97,9 +97,13 @@ impl SqliteElection {
         if let Some(bytes) = self.cluster.gossip_get(PRIMARY_KEY).await {
             if let Some(claim) = PrimaryClaim::decode(&bytes) {
                 if claim.node_id != self.cluster.self_node().id {
-                    return ElectedRole::Replica {
-                        primary_grpc_url: format!("http://{}", claim.grpc_addr),
-                    };
+                    if let Some(url) = self.replica_url_for(&claim).await {
+                        return ElectedRole::Replica { primary_grpc_url: url };
+                    }
+                    // Claim points at a host that is not a known member.
+                    // Refuse to dial it (defense in depth against a forged
+                    // gossip claim) and wait for a valid one.
+                    return ElectedRole::Replica { primary_grpc_url: String::new() };
                 }
             }
         }
@@ -152,15 +156,21 @@ impl SqliteElection {
                     return ElectedRole::Primary;
                 }
 
-                // Someone else claims primary — check if they're alive.
+                // Someone else claims primary -- check if they're alive AND
+                // that the advertised gRPC address belongs to a known member
+                // (defense in depth: a forged claim from a plaintext gossip
+                // injection must not make us dial an arbitrary host).
                 let nodes = self.cluster.nodes().await;
                 let primary_alive =
                     nodes.iter().any(|n| n.id == claim.node_id && n.state == NodeState::Alive);
 
                 if primary_alive {
-                    return ElectedRole::Replica {
-                        primary_grpc_url: format!("http://{}", claim.grpc_addr),
-                    };
+                    if let Some(url) = self.replica_url_for(&claim).await {
+                        return ElectedRole::Replica { primary_grpc_url: url };
+                    }
+                    // Alive primary but the gRPC host is not a known member --
+                    // refuse to dial it and wait for a valid claim.
+                    return ElectedRole::Replica { primary_grpc_url: String::new() };
                 }
 
                 // Primary is dead — fall through to re-election.
@@ -196,6 +206,36 @@ impl SqliteElection {
         lowest_alive.is_some_and(|n| &n.id == self_id)
     }
 
+    /// Validate a primary claim and build the replica gRPC URL for it.
+    ///
+    /// Returns `Some(url)` only when the claim's advertised `grpc_addr`
+    /// host matches a currently-known gossip member's address. This is
+    /// defense in depth on top of the mandatory cluster secret (see
+    /// `ClusterConfig::ensure_secure`): even if an attacker managed to
+    /// inject a claim into gossip, a replica will not dial a `host:port`
+    /// that does not belong to a live cluster member (blocks SSRF and
+    /// pointing replication at an attacker-controlled sqld).
+    ///
+    /// The comparison is by host only, because a node's gossip address
+    /// and its sqld gRPC address use different ports on the same host.
+    async fn replica_url_for(&self, claim: &PrimaryClaim) -> Option<String> {
+        let claim_host = host_of(&claim.grpc_addr)?;
+        let nodes = self.cluster.nodes().await;
+        let known = nodes.iter().filter_map(|n| host_of(&n.gossip_addr));
+
+        if member_hosts_contain(known, &claim_host) {
+            Some(format!("http://{}", claim.grpc_addr))
+        } else {
+            tracing::warn!(
+                primary = %claim.node_id,
+                grpc_addr = %claim.grpc_addr,
+                "refusing to dial SQLite primary: advertised gRPC host is not a known cluster \
+                 member (possible forged gossip claim)"
+            );
+            None
+        }
+    }
+
     /// Publish this node's primary claim to the gossip KV tier.
     async fn publish_claim(&self) {
         let claim = PrimaryClaim {
@@ -204,6 +244,30 @@ impl SqliteElection {
         };
         self.cluster.gossip_set(PRIMARY_KEY, &claim.encode(), Some(PRIMARY_TTL)).await;
     }
+}
+
+/// Extract the host portion of a `host:port` (or `[ipv6]:port`) address.
+///
+/// Returns `None` if the string has no port separator. Parsing as a
+/// [`SocketAddr`](std::net::SocketAddr) first canonicalizes IPv6 forms
+/// (e.g. `[::1]` vs `[0:0:...:1]`) so two spellings of the same address
+/// compare equal; a bare `host:port` that is not a literal socket addr
+/// falls back to splitting on the last colon.
+fn host_of(addr: &str) -> Option<String> {
+    if let Ok(sock) = addr.parse::<std::net::SocketAddr>() {
+        return Some(sock.ip().to_string());
+    }
+    // Not a literal IP:port (e.g. a DNS name). Split off the final `:port`.
+    let (host, _port) = addr.rsplit_once(':')?;
+    if host.is_empty() { None } else { Some(host.to_string()) }
+}
+
+/// Whether any known member host equals `claim_host`.
+fn member_hosts_contain<I>(mut members: I, claim_host: &str) -> bool
+where
+    I: Iterator<Item = String>,
+{
+    members.any(|h| h == claim_host)
 }
 
 #[cfg(test)]
@@ -309,6 +373,51 @@ mod tests {
             nodes.iter().filter(|(_, alive)| *alive).min_by(|a, b| a.0.cmp(b.0)).map(|(id, _)| *id);
 
         assert_eq!(lowest_alive, Some("ephpm-b"));
+    }
+
+    #[test]
+    fn host_of_ipv4_socket() {
+        assert_eq!(host_of("10.0.1.2:5001").as_deref(), Some("10.0.1.2"));
+    }
+
+    #[test]
+    fn host_of_ipv6_socket_canonicalizes() {
+        // Both spellings of loopback must yield the same host string so a
+        // member advertised one way still matches a claim spelled another.
+        let a = host_of("[::1]:5001").unwrap();
+        let b = host_of("[0:0:0:0:0:0:0:1]:7946").unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn host_of_dns_name_splits_last_colon() {
+        assert_eq!(host_of("node-a.internal:5001").as_deref(), Some("node-a.internal"));
+    }
+
+    #[test]
+    fn host_of_no_port_is_none() {
+        assert_eq!(host_of("10.0.1.2"), None);
+        assert_eq!(host_of(""), None);
+    }
+
+    #[test]
+    fn member_validation_accepts_known_host() {
+        // A claim's gRPC host (different port) matching a member's gossip
+        // host is accepted.
+        let members = ["10.0.1.2:7946".to_string(), "10.0.1.3:7946".to_string()];
+        let claim_host = host_of("10.0.1.2:5001").unwrap();
+        let known = members.iter().filter_map(|m| host_of(m));
+        assert!(member_hosts_contain(known, &claim_host));
+    }
+
+    #[test]
+    fn member_validation_rejects_unknown_host() {
+        // A forged claim pointing at an attacker host not in the member
+        // list must be rejected.
+        let members = ["10.0.1.2:7946".to_string(), "10.0.1.3:7946".to_string()];
+        let claim_host = host_of("6.6.6.6:5001").unwrap();
+        let known = members.iter().filter_map(|m| host_of(m));
+        assert!(!member_hosts_contain(known, &claim_host));
     }
 
     #[test]

@@ -35,6 +35,7 @@ async fn start_node(port: u16, seeds: Vec<String>, node_id: &str) -> ClusterHand
         bind: format!("127.0.0.1:{port}"),
         join: seeds,
         secret: String::new(),
+        allow_insecure_no_auth: false,
         node_id: node_id.to_string(),
         cluster_id: "seam-test".to_string(),
         kv: ClusterKvConfig::default(),
