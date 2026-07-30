@@ -1482,6 +1482,7 @@ dependencies = [
  "anyhow",
  "libc",
  "reqwest",
+ "tempfile",
  "tokio",
  "tracing",
 ]

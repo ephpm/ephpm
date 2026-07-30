@@ -567,7 +567,9 @@ KV operations between nodes (remote get/set and large-value replication) use TCP
 [frame_len: u32 BE][nonce: 12 bytes][ciphertext + 16-byte tag]
 ```
 
-This is **symmetric pre-shared-key authentication, not mutual TLS**. There are no certificates, no CA, no fingerprint exchange, and no `tls_cert`/`tls_key`/`tls_ca` cluster options. Both sides prove possession of the same secret by being able to seal/open frames; a peer with the wrong secret cannot read values or inject writes (frames fail authentication and the connection is dropped). When the secret is unset, the data plane is plaintext and a warning is logged at startup — only acceptable on a trusted private network.
+This is **symmetric pre-shared-key authentication, not mutual TLS**. There are no certificates, no CA, no fingerprint exchange, and no `tls_cert`/`tls_key`/`tls_ca` cluster options. Both sides prove possession of the same secret by being able to seal/open frames; a peer with the wrong secret cannot read values or inject writes (frames fail authentication and the connection is dropped).
+
+**Fail-closed on an empty secret.** Because an unset secret means unauthenticated plaintext gossip and data plane, ePHPm **refuses to start** clustering (`enabled = true`) when `secret` is empty. To run without a secret on a trusted private network, opt in explicitly with `allow_insecure_no_auth = true`; a loud warning is logged. This closes the previous fail-open behavior where an empty secret only produced a startup warning.
 
 The shared secret is the only security config — one value to set across all nodes, covering both planes.
 
@@ -1209,10 +1211,13 @@ socket = "/run/ephpm/redis.sock"       # Unix socket (~2-5x faster than TCP)
 enabled = false
 bind = "0.0.0.0:7946"                 # gossip listen address
 join = ["10.0.1.2:7946"]              # seed nodes
-secret = ""                            # shared secret — a ChaCha20-Poly1305 PSK that
+secret = "REPLACE_ME"                  # shared secret -- a ChaCha20-Poly1305 PSK that
                                        # seals BOTH gossip UDP and the KV data plane TCP
                                        # (no TLS/mTLS; there are no tls_cert/tls_key/tls_ca
-                                       # cluster options). Empty = plaintext + startup warning.
+                                       # cluster options). REQUIRED when enabled = true:
+                                       # an empty secret is a hard startup error unless
+                                       # allow_insecure_no_auth = true (not recommended).
+# allow_insecure_no_auth = false       # opt in to empty-secret plaintext clustering
 
 [cluster.kv]
 replication_factor = 2                 # copies of each large value (owner + N-1 peers); clamped to cluster size

@@ -82,18 +82,27 @@ async fn cluster_all_nodes_serve_http() {
 }
 
 // ---------------------------------------------------------------------------
-// cluster_nodes_report_distinct_hostnames: verify StatefulSet identity
+// cluster_nodes_report_distinct_identities: verify each node has a distinct
+// cluster identity (node_id).
+//
+// Environment-agnostic: asserts on the ephpm cluster `node_id` (distinct per
+// node in BOTH the bare-process harness and a Kubernetes StatefulSet), NOT the
+// OS hostname. Under bare-process every node is a process on the same host, so
+// the hostnames are identical -- node_id is the correct discriminator. The
+// StatefulSet path also gives each pod a distinct node_id (auto-derived
+// `<pod-name>-<rand>` when `[cluster] node_id` is unset), so the assertion
+// holds in Kind too.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn cluster_nodes_report_distinct_hostnames() {
+async fn cluster_nodes_report_distinct_identities() {
     let urls = cluster_urls();
     if urls.is_empty() {
         return;
     }
 
     let client = reqwest::Client::new();
-    let mut hostnames = Vec::with_capacity(urls.len());
+    let mut node_ids = Vec::with_capacity(urls.len());
 
     for (i, url) in urls.iter().enumerate() {
         let resp = client
@@ -114,27 +123,27 @@ async fn cluster_nodes_report_distinct_hostnames() {
             .await
             .unwrap_or_else(|e| panic!("invalid JSON from node {i}: {e}"));
 
-        let hostname = json["hostname"]
+        let node_id = json["node_id"]
             .as_str()
-            .expect("hostname field missing")
+            .expect("node_id field missing")
             .to_owned();
 
         assert!(
-            !hostname.is_empty(),
-            "node {i} returned empty hostname"
+            !node_id.is_empty(),
+            "node {i} returned empty node_id (ephpm did not inject EPHPM_NODE_ID): {json}"
         );
-        hostnames.push(hostname);
+        node_ids.push(node_id);
     }
 
-    // All hostnames must be unique (StatefulSet gives each pod a distinct name).
-    let unique: std::collections::HashSet<&str> = hostnames.iter().map(String::as_str).collect();
+    // Each node must report a distinct cluster identity.
+    let unique: std::collections::HashSet<&str> = node_ids.iter().map(String::as_str).collect();
     assert_eq!(
         unique.len(),
         expected_cluster_size(),
-        "expected {} distinct hostnames, got {}: {:?}",
+        "expected {} distinct node_ids, got {}: {:?}",
         expected_cluster_size(),
         unique.len(),
-        hostnames
+        node_ids
     );
 }
 
@@ -439,57 +448,71 @@ async fn cluster_sqlite_write_on_any_node() {
 }
 
 // ---------------------------------------------------------------------------
-// cluster_load_balancer_distributes_traffic: ClusterIP service spreads requests
+// cluster_traffic_reaches_all_nodes: every node is directly reachable and
+// reports a distinct identity (client-side round-robin).
+//
+// Environment-agnostic: instead of leaning on a Kubernetes ClusterIP Service
+// to spread traffic (which does not exist when curling processes on 127.0.0.1
+// directly), this drives client-side round-robin over each node's own URL
+// (EPHPM_CLUSTER_URL_0/1/2) and asserts every node responds AND reports a
+// distinct node_id. That proves "traffic can reach all nodes" without a K8s
+// Service, and holds identically under Kind (where each per-pod URL routes to
+// its own pod).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn cluster_load_balancer_distributes_traffic() {
+async fn cluster_traffic_reaches_all_nodes() {
     let urls = cluster_urls();
     if urls.is_empty() {
         return;
     }
 
-    // Use the ClusterIP service URL (EPHPM_URL) to send multiple requests
-    // and verify that at least 2 different nodes respond (proving the
-    // Kubernetes service is distributing traffic).
-    let lb_url = match cluster_env("EPHPM_URL") {
-        Some(u) => u,
-        None => {
-            eprintln!("EPHPM_URL not set — skipping load balancer test");
-            return;
-        }
-    };
-
     let client = reqwest::Client::builder()
-        // Disable connection pooling to ensure each request can land on a different pod.
+        // No pooling: each request opens a fresh connection to the target node.
         .pool_max_idle_per_host(0)
         .build()
         .expect("failed to build reqwest client");
 
-    let mut seen_hostnames = std::collections::HashSet::new();
+    let mut seen_node_ids = std::collections::HashSet::new();
 
-    // Send enough requests to likely hit multiple pods.
-    for _ in 0..20 {
-        let resp = client
-            .get(format!("{lb_url}/cluster_info.php"))
-            .send()
-            .await;
+    // Round-robin several passes over every node's own URL.
+    for _ in 0..5 {
+        for (i, url) in urls.iter().enumerate() {
+            let resp = client
+                .get(format!("{url}/cluster_info.php"))
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("GET /cluster_info.php on node {i} ({url}) failed: {e}"));
 
-        if let Ok(resp) = resp {
-            if resp.status().is_success() {
-                if let Ok(json) = resp.json::<serde_json::Value>().await {
-                    if let Some(hostname) = json["hostname"].as_str() {
-                        seen_hostnames.insert(hostname.to_owned());
-                    }
-                }
-            }
+            assert!(
+                resp.status().is_success(),
+                "node {i} ({url}) returned {} for /cluster_info.php",
+                resp.status()
+            );
+
+            let json: serde_json::Value = resp
+                .json()
+                .await
+                .unwrap_or_else(|e| panic!("invalid JSON from node {i} ({url}): {e}"));
+
+            let node_id = json["node_id"]
+                .as_str()
+                .unwrap_or_else(|| panic!("node {i} ({url}) missing node_id: {json}"))
+                .to_owned();
+            assert!(
+                !node_id.is_empty(),
+                "node {i} ({url}) returned empty node_id: {json}"
+            );
+            seen_node_ids.insert(node_id);
         }
     }
 
-    assert!(
-        seen_hostnames.len() >= 2,
-        "expected requests via ClusterIP to reach at least 2 different pods, \
-         but only saw: {:?}",
-        seen_hostnames
+    // Client-side round-robin must have reached every distinct node.
+    assert_eq!(
+        seen_node_ids.len(),
+        expected_cluster_size(),
+        "client-side round-robin should reach all {} nodes, but only saw distinct node_ids: {:?}",
+        expected_cluster_size(),
+        seen_node_ids
     );
 }
