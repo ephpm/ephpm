@@ -19,7 +19,10 @@ on:
       - "docs/**"
       - "**.md"
   pull_request:
-    branches: [main]
+    # `main` plus long-lived feature branches that other PRs stack onto -- see
+    # the matching note in ci.yml. A PR targeting a stacked branch otherwise
+    # gets no E2E coverage at all.
+    branches: [main, "feat/**"]
     paths-ignore:
       - "site/**"
       - "docs/**"

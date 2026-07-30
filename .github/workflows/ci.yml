@@ -10,7 +10,12 @@ on:
       - "docs/**"
       - "**.md"
   pull_request:
-    branches: [main]
+    # `main` plus long-lived feature branches that other PRs stack onto.
+    # Without the glob, a PR targeting e.g. feat/turso-cdc-replication gets
+    # NO checks at all -- which is how a 1700-line change to the cluster
+    # transport and the CDC replication protocol ended up with nothing having
+    # so much as type-checked it. Stacked work needs the same gate as main.
+    branches: [main, "feat/**"]
     paths-ignore:
       - "site/**"
       - "docs/**"
