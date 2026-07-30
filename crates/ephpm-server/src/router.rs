@@ -1217,6 +1217,13 @@ impl Router {
         document_root: PathBuf,
     ) -> Response<ServerBody> {
         let method = req.method().to_string();
+        // `method` is the client's raw verb and belongs in PHP's `$_SERVER`,
+        // never in a Prometheus label — that is exactly what
+        // `method_metric_label` exists to prevent (see `handle`): standard
+        // verbs map to a `&'static str`, everything else collapses to
+        // `"OTHER"`, so random verbs can't explode the series count or cost
+        // a `String` allocation per request on the hot path.
+        let method_label: &'static str = method_metric_label(req.method());
         let mut uri = req.uri().to_string();
         let mut path = req.uri().path().to_string();
         let query_string = req.uri().query().unwrap_or("").to_string();
@@ -1329,7 +1336,7 @@ impl Router {
                     }
                 };
                 #[allow(clippy::cast_precision_loss)]
-                histogram!("ephpm_http_request_body_bytes", "method" => method.clone())
+                histogram!("ephpm_http_request_body_bytes", "method" => method_label)
                     .record(bytes.len() as f64);
                 (ephpm_php::worker_bridge::WorkerBody::Buffered(bytes), None)
             };
@@ -1392,7 +1399,7 @@ impl Router {
             }
         };
         #[allow(clippy::cast_precision_loss)]
-        histogram!("ephpm_http_request_body_bytes", "method" => method.clone())
+        histogram!("ephpm_http_request_body_bytes", "method" => method_label)
             .record(body.len() as f64);
 
         let multi_tenant_kv = self.multi_tenant_kv.clone();
