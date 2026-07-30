@@ -402,16 +402,15 @@ impl Handle {
             .await
             .with_context(|| format!("cluster channel: connect to {peer_addr}"))?;
         tcp.set_nodelay(true).ok();
-        let session = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            handshake_initiate(&mut tcp, &self.inner.keys),
-        )
-        .await
-        .with_context(|| format!("cluster channel: handshake with {peer_addr} timed out"))?
-        .with_context(|| format!("cluster channel: handshake with {peer_addr}"))?;
+        let handshake = handshake_initiate(&mut tcp, &self.inner.keys);
+        let session = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake)
+            .await
+            .with_context(|| format!("cluster channel: handshake with {peer_addr} timed out"))?
+            .with_context(|| format!("cluster channel: handshake with {peer_addr}"))?;
 
         let sealed = SealedStream::new(tcp, session);
-        let mut conn = yamux::Connection::new(sealed.compat(), yamux_config(), yamux::Mode::Client);
+        let cfg = yamux_config();
+        let mut conn = yamux::Connection::new(sealed.compat(), cfg, yamux::Mode::Client);
 
         let stream =
             poll_new_outbound(&mut conn).await.context("cluster channel: yamux open outbound")?;
@@ -505,12 +504,8 @@ pub async fn maybe_start(
         }),
     };
 
-    tokio::spawn(accept_loop(
-        listener,
-        keys,
-        Arc::clone(&handlers),
-        Some(Arc::clone(cluster)),
-    ));
+    let peers = Some(Arc::clone(cluster));
+    tokio::spawn(accept_loop(listener, keys, Arc::clone(&handlers), peers));
 
     tracing::info!(
         %listen_addr,
@@ -622,9 +617,10 @@ async fn accept_loop(
         let handlers = Arc::clone(&handlers);
         let cluster = cluster.clone();
         tokio::spawn(async move {
-            let admitted = match &cluster {
-                Some(cluster) => peer_is_cluster_member(cluster, peer.ip()).await,
-                None => true,
+            let admitted = if let Some(cluster) = &cluster {
+                peer_is_cluster_member(cluster, peer.ip()).await
+            } else {
+                true
             };
             if !admitted {
                 tracing::warn!(
@@ -662,8 +658,8 @@ async fn accept_loop(
             };
 
             let sealed = SealedStream::new(tcp, session);
-            let conn =
-                yamux::Connection::new(sealed.compat(), yamux_config(), yamux::Mode::Server);
+            let cfg = yamux_config();
+            let conn = yamux::Connection::new(sealed.compat(), cfg, yamux::Mode::Server);
             drive_connection(conn, handlers, peer).await;
         });
     }
@@ -1297,8 +1293,8 @@ mod tests {
         let mut tcp = TcpStream::connect(addr).await.unwrap();
         let session = handshake_initiate(&mut tcp, &keys).await.expect("handshake");
         let sealed = SealedStream::new(tcp, session);
-        let mut conn =
-            yamux::Connection::new(sealed.compat(), yamux_config(), yamux::Mode::Client);
+        let cfg = yamux_config();
+        let mut conn = yamux::Connection::new(sealed.compat(), cfg, yamux::Mode::Client);
         let stream = poll_new_outbound(&mut conn).await.unwrap();
         tokio::spawn(drive_connection(conn, Arc::new(Mutex::new(Vec::new())), addr));
 
@@ -1395,11 +1391,13 @@ mod tests {
         assert!(noise.is_err(), "a replayed handshake must never reach the dispatch table");
     }
 
-    /// The post-handshake transport must actually be sealed: bytes that
-    /// leave the adapter are ciphertext, and a tampered frame is a hard
-    /// error rather than silently-accepted plaintext.
+    /// **CRIT-2 regression.** The post-handshake transport must actually
+    /// be sealed: a roundtrip through the adapter returns the plaintext,
+    /// but the bytes that reach the underlying transport do not contain
+    /// it. Before the fix the doc claimed this and yamux ran on the raw
+    /// socket.
     #[tokio::test]
-    async fn sealed_stream_roundtrips_and_rejects_tampering() {
+    async fn sealed_stream_roundtrips_but_puts_ciphertext_on_the_wire() {
         let cipher = ClusterCipher::for_cluster_channel_session("s", b"transcript");
         let (a, b) = tokio::io::duplex(64 * 1024);
 

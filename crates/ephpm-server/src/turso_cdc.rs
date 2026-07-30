@@ -352,11 +352,14 @@ mod serde_bytes_opt {
 /// primary) and one for the CDC tail/apply path. Then:
 ///
 /// - Litewire wire frontends against the wire factory (always).
-/// - On primary: a tail loop reading `turso_cdc` and broadcasting
-///   batches, plus a channel stream handler that forwards them to any
-///   inbound `cdc/default` stream.
+/// - A `cdc/default` stream handler that, while this node is primary,
+///   gives every inbound subscriber its own `turso_cdc` tailer starting
+///   at the watermark that subscriber announces.
+/// - A `snapshot/default` handler that, while this node is primary,
+///   serves a cold replica's base snapshot.
 /// - On replica: a channel-dial loop that opens `cdc/default` against
-///   the primary and applies received batches.
+///   the primary, announces its watermark, and applies received
+///   batches.
 ///
 /// The `channel_handle` argument comes from
 /// [`ephpm_cluster::maybe_start_cluster_channel`] — when it's `None`,
@@ -451,9 +454,11 @@ pub async fn start_clustered_turso_cdc(
         .await
         .with_context(|| format!("failed to open wire Turso factory at {db_path}"))?;
 
-    // Mgmt factory: used by the tail loop on the primary and the apply
-    // loop on the replica. Never opts into CDC-on-connect (the tailer
-    // reads turso_cdc explicitly; the applier only writes).
+    // Mgmt factory: used by the per-subscriber tailers and the snapshot
+    // dumper on the primary, and by the apply loop on the replica. Never
+    // opts into CDC-on-connect — the tailer reads turso_cdc explicitly,
+    // and the applier's writes must NOT be re-captured (that would make
+    // a replica echo the primary's changes into its own CDC log).
     let mgmt_factory = Arc::new(
         Turso::open(db_path)
             .await
@@ -1152,26 +1157,30 @@ async fn apply_snapshot(
 ///
 /// A snapshot is, by construction, schema `CREATE`s followed by
 /// `INSERT OR REPLACE`s. Anything else — `ATTACH`, `PRAGMA`, `DROP`,
-/// `UPDATE`, `DELETE`, or a comment hiding one — is a peer trying to
-/// run SQL of its own choosing on us, and the bootstrap path used to
-/// hand the whole blob straight to `execute_batch`.
+/// `UPDATE`, `DELETE` — is a peer trying to run SQL of its own choosing
+/// on us, and the bootstrap path used to hand the whole blob straight
+/// to `execute_batch`.
 const ALLOWED_STATEMENT_PREFIXES: [&str; 2] = ["CREATE", "INSERT"];
 
 /// Reject a dump that contains anything outside
 /// [`ALLOWED_STATEMENT_PREFIXES`].
 ///
-/// The scan is quote-aware (single-quoted strings with `''` escapes,
+/// The scan is quote-aware — single-quoted strings with `''` escapes,
 /// double-quoted identifiers with `""` escapes, and `X'..'` blobs are
-/// all just quoted runs) and refuses SQL comments outright — the
-/// producer never emits one, and allowing them would mean the
-/// allowlist and the engine could disagree about where a statement
-/// starts.
+/// all just quoted runs, so a `;` inside one is not a separator.
+///
+/// Comments are **skipped, not rejected**: `sqlite_schema.sql` stores
+/// the exact `CREATE` text the operator wrote, comments included, so
+/// refusing them would make a perfectly ordinary database
+/// un-bootstrappable. Skipping keeps them from hiding a separator, and
+/// [`check_statement_allowed`] looks past leading comments to find the
+/// statement's real first keyword.
 ///
 /// # Errors
 ///
 /// Returns an error naming the offending statement (truncated) when the
-/// dump contains a disallowed statement, an unterminated quote, or a
-/// comment.
+/// dump contains a disallowed statement, an unterminated quote, or an
+/// unterminated block comment.
 fn validate_snapshot_dump(dump: &str) -> anyhow::Result<()> {
     let bytes = dump.as_bytes();
     let mut start = 0usize;
@@ -1197,10 +1206,22 @@ fn validate_snapshot_dump(dump: &str) -> anyhow::Result<()> {
                 }
             }
             b'-' if bytes.get(i + 1) == Some(&b'-') => {
-                anyhow::bail!("SQL comments are not allowed in a snapshot dump");
+                // Line comment: runs to the newline, or to EOF.
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                anyhow::bail!("SQL comments are not allowed in a snapshot dump");
+                i += 2;
+                loop {
+                    anyhow::ensure!(i + 1 < bytes.len(), "unterminated block comment in dump");
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
             }
             b';' => {
                 check_statement_allowed(&dump[start..i])?;
@@ -1210,14 +1231,14 @@ fn validate_snapshot_dump(dump: &str) -> anyhow::Result<()> {
             _ => i += 1,
         }
     }
-    // Trailing text after the last `;` must be blank.
+    // Trailing text after the last `;` must be blank (or a comment).
     check_statement_allowed(&dump[start..])
 }
 
-/// Allow an empty/whitespace statement, or one starting with an
-/// allowlisted keyword.
+/// Allow an empty/whitespace/comment-only statement, or one starting
+/// with an allowlisted keyword.
 fn check_statement_allowed(stmt: &str) -> anyhow::Result<()> {
-    let trimmed = stmt.trim();
+    let trimmed = strip_leading_noise(stmt);
     if trimmed.is_empty() {
         return Ok(());
     }
@@ -1232,6 +1253,25 @@ fn check_statement_allowed(stmt: &str) -> anyhow::Result<()> {
         truncate_for_log(trimmed)
     );
     Ok(())
+}
+
+/// Drop leading whitespace and leading SQL comments so the statement's
+/// first keyword is what gets checked. Returns `""` when the input is
+/// nothing but whitespace and comments (including an unterminated one).
+fn strip_leading_noise(stmt: &str) -> &str {
+    let mut s = stmt;
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("--") {
+            let Some(nl) = rest.find('\n') else { return "" };
+            s = &rest[nl + 1..];
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            let Some(end) = rest.find("*/") else { return "" };
+            s = &rest[end + 2..];
+        } else {
+            return s;
+        }
+    }
 }
 
 /// First 120 characters of `s`, for error messages that must not dump a
@@ -1809,11 +1849,29 @@ mod tests {
         }
     }
 
+    /// Comments must be tolerated — `sqlite_schema.sql` preserves the
+    /// operator's original `CREATE` text, comments and all, so rejecting
+    /// them would make an ordinary database un-bootstrappable. They must
+    /// not be able to smuggle a statement past the allowlist either.
     #[test]
-    fn validator_rejects_comments_and_unterminated_quotes() {
-        assert!(validate_snapshot_dump("-- sneaky\nCREATE TABLE t (a);").is_err());
-        assert!(validate_snapshot_dump("/* sneaky */ CREATE TABLE t (a);").is_err());
+    fn validator_tolerates_comments_without_letting_them_smuggle() {
+        validate_snapshot_dump("-- a note\nCREATE TABLE t (a);").unwrap();
+        validate_snapshot_dump("/* a note */ CREATE TABLE t (a);").unwrap();
+        validate_snapshot_dump("CREATE TABLE t (\n  a INTEGER -- the id\n);").unwrap();
+        validate_snapshot_dump("CREATE TABLE t (a); -- trailing").unwrap();
+        // A comment cannot hide a disallowed statement...
+        assert!(validate_snapshot_dump("-- note\nDROP TABLE t;").is_err());
+        assert!(validate_snapshot_dump("CREATE TABLE t (a); /* x */ DROP TABLE t;").is_err());
+        // ...and cannot hide a statement separator either: the `;` here
+        // is inside the comment, so `DROP` is part of the same statement
+        // as the CREATE rather than a new allowed one.
+        validate_snapshot_dump("CREATE TABLE t (a); -- ; DROP TABLE t\n").unwrap();
+    }
+
+    #[test]
+    fn validator_rejects_unterminated_quotes_and_comments() {
         assert!(validate_snapshot_dump("INSERT INTO t VALUES ('unterminated);").is_err());
+        assert!(validate_snapshot_dump("CREATE TABLE t (a); /* never closed").is_err());
     }
 
     #[test]
