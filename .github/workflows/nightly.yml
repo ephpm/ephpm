@@ -11,8 +11,6 @@
 # Failures still surface on the run page; only the summary check ignores them.
 # Re-tighten by removing continue-on-error and re-adding the job to the
 # nightly-summary fail gate.
-#
-# See docs/testing/nightly.md for the full nightly test plan.
 
 name: Nightly
 
