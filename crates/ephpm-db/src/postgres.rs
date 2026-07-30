@@ -53,8 +53,10 @@ const MSG_ERROR_RESPONSE: u8 = b'E';
 const MSG_QUERY: u8 = b'Q';
 /// `Terminate` — frontend connection close.
 const MSG_TERMINATE: u8 = b'X';
-/// `Parse` — frontend extended query: parse a prepared statement.
-const MSG_PARSE: u8 = b'P';
+/// `CopyInResponse` — backend is waiting for the client to stream `COPY ... FROM STDIN` data.
+const MSG_COPY_IN_RESPONSE: u8 = b'G';
+/// `CopyBothResponse` — backend entered bidirectional copy mode.
+const MSG_COPY_BOTH_RESPONSE: u8 = b'W';
 
 // ── Auth types ───────────────────────────────────────────────────────────────
 
@@ -993,6 +995,24 @@ fn pg_select_pool<'a>(
 }
 
 /// Proxy loop with per-query routing and dirty-bit tracking.
+///
+/// Per-message routing is only sound for the *simple* query protocol: a
+/// `Query` message is always answered by a backend message stream that
+/// terminates in `ReadyForQuery`, so the proxy can block on the backend
+/// before reading from the client again.
+///
+/// The *extended* query protocol breaks that assumption. `Parse`, `Bind`,
+/// `Describe`, `Execute` and `Close` produce no backend output at all until
+/// the client sends `Sync` — which is a *later client* message. Forwarding a
+/// single extended-protocol message and then awaiting `ReadyForQuery`
+/// deadlocks the session on the first prepared statement, which is what every
+/// real client does (`PDO_pgsql`, `PQexecParams`, `tokio-postgres`). The same
+/// holds once the backend answers with `CopyInResponse`/`CopyBothResponse`:
+/// the next move belongs to the client, not the backend.
+///
+/// In both cases the session is pinned to one backend connection and spliced
+/// straight through for the rest of its lifetime — see
+/// [`pg_relay_pinned_session`].
 async fn pg_proxy_routing_loop(
     mut client: TcpStream,
     pool: &Pool,
@@ -1013,28 +1033,28 @@ async fn pg_proxy_routing_loop(
             break;
         }
 
-        // For simple Query messages, classify and route.
-        let query_kind = if tag == MSG_QUERY {
-            // Query payload is null-terminated SQL.
-            let sql = String::from_utf8_lossy(&payload);
-            let sql = sql.trim_end_matches('\0');
-            classify_pg_query(sql)
-        } else {
-            // Extended query protocol messages (Parse, Bind, etc.) — treat as writes
-            // unless we can inspect the SQL in Parse.
-            if tag == MSG_PARSE && payload.len() > 1 {
-                // Parse: [name\0][query\0][param_count: 2][param_oids...]
-                let name_end = payload.iter().position(|&b| b == 0).unwrap_or(0);
-                let query_start = name_end + 1;
-                let query_end = payload[query_start..]
-                    .iter()
-                    .position(|&b| b == 0)
-                    .map_or(payload.len(), |p| query_start + p);
-                let sql = String::from_utf8_lossy(&payload[query_start..query_end]);
-                classify_pg_query(&sql)
-            } else {
-                PgQueryKind::Write
+        // Anything that is not a simple `Query` belongs to the extended query
+        // protocol (or a copy sub-protocol). Pin to the primary — a replica
+        // cannot serve writes that may arrive later on the same pinned
+        // connection — and relay the remainder of the session verbatim.
+        if tag != MSG_QUERY {
+            debug!(
+                tag = %char::from(tag),
+                "extended query protocol in use; pinning session to primary"
+            );
+            let mut checkout = pool.acquire().await?;
+            let mut backend = checkout.take_stream();
+            if let Err(e) = write_pg_message(&mut backend, tag, &payload).await {
+                checkout.retire();
+                return Err(e);
             }
+            return pg_relay_pinned_session(client, backend, checkout, reset_strategy).await;
+        }
+
+        // Query payload is null-terminated SQL.
+        let query_kind = {
+            let sql = String::from_utf8_lossy(&payload);
+            classify_pg_query(sql.trim_end_matches('\0'))
         };
 
         // Update state tracking.
@@ -1056,12 +1076,23 @@ async fn pg_proxy_routing_loop(
 
         write_pg_message(&mut backend, tag, &payload).await?;
 
-        // Forward response(s) until ReadyForQuery.
+        // Forward response(s) until ReadyForQuery — or until the backend hands
+        // the conversation back to the client via a copy sub-protocol, in
+        // which case no further backend output is coming.
+        let mut copy_mode = false;
         loop {
             let resp_tag = forward_pg_message(&mut backend, &mut client).await?;
             if resp_tag == MSG_READY_FOR_QUERY {
                 break;
             }
+            if resp_tag == MSG_COPY_IN_RESPONSE || resp_tag == MSG_COPY_BOTH_RESPONSE {
+                copy_mode = true;
+                break;
+            }
+        }
+
+        if copy_mode {
+            return pg_relay_pinned_session(client, backend, checkout, reset_strategy).await;
         }
 
         // Return backend to pool.
@@ -1087,6 +1118,37 @@ async fn pg_proxy_routing_loop(
         }
     }
 
+    Ok(())
+}
+
+/// Pin an already-acquired `backend` to `client` and splice both directions
+/// until either side closes, then recycle the backend.
+///
+/// Used for the extended query protocol and the copy sub-protocols, where
+/// message boundaries do not line up with turn boundaries and the proxy
+/// therefore cannot tell when it is safe to block on the backend. Because no
+/// per-statement state can be tracked through an opaque splice, the connection
+/// is always reset before being parked unless the operator explicitly opted
+/// out with [`ResetStrategy::Never`].
+async fn pg_relay_pinned_session(
+    client: TcpStream,
+    backend: TcpStream,
+    checkout: Checkout,
+    reset_strategy: ResetStrategy,
+) -> Result<(), DbError> {
+    match pg_proxy_bidirectional(client, backend).await {
+        Ok(backend) => {
+            if matches!(reset_strategy, ResetStrategy::Never) {
+                checkout.return_to_pool(backend);
+            } else {
+                checkout.return_with_reset(backend).await;
+            }
+        }
+        Err(e) => {
+            debug!("pinned session error, discarding backend connection: {e}");
+            checkout.retire();
+        }
+    }
     Ok(())
 }
 
@@ -1397,6 +1459,72 @@ mod tests {
         assert_eq!(rdata, payload);
     }
 
+    // ── extended query protocol ─────────────────────────────────────
+
+    /// Regression test for the extended-query-protocol deadlock.
+    ///
+    /// `pg_proxy_routing_loop` used to forward exactly one client message and
+    /// then block awaiting `ReadyForQuery`. In the extended protocol the
+    /// backend stays silent until the client sends `Sync`, so the proxy never
+    /// read it and the session wedged on the first prepared statement. The
+    /// routing loop is entered whenever `reset_strategy == Smart`, which is
+    /// the default, so this was the shipped path.
+    #[tokio::test]
+    async fn extended_query_protocol_does_not_deadlock() {
+        // Fake PG backend: silent until it sees Sync ('S'), then answers
+        // ParseComplete / BindComplete / CommandComplete / ReadyForQuery.
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend_task = tokio::spawn(async move {
+            let (mut sock, _) = backend_listener.accept().await.unwrap();
+            while let Ok((tag, _payload)) = read_pg_message(&mut sock).await {
+                if tag == b'S' {
+                    write_pg_message(&mut sock, b'1', &[]).await.unwrap();
+                    write_pg_message(&mut sock, b'2', &[]).await.unwrap();
+                    write_pg_message(&mut sock, b'C', b"SELECT 1\0").await.unwrap();
+                    send_ready_for_query(&mut sock, b'I').await.unwrap();
+                }
+            }
+        });
+
+        let (mut client, proxy_side) = make_tcp_pair().await;
+        let rw_split =
+            PgRwSplitParams { enabled: false, sticky_duration: std::time::Duration::from_secs(1) };
+        let proxy_task = tokio::spawn(async move {
+            let pool = pool_dialing(backend_addr);
+            let rr = AtomicUsize::new(0);
+            pg_proxy_routing_loop(proxy_side, &pool, &[], &rr, &rw_split, ResetStrategy::Smart)
+                .await
+        });
+
+        // Parse / Bind / Describe / Execute / Sync — what PDO_pgsql sends for
+        // a prepared statement.
+        write_pg_message(&mut client, b'P', b"\0SELECT 1\0\0\0").await.unwrap();
+        write_pg_message(&mut client, b'B', b"\0\0\0\0\0\0\0\0").await.unwrap();
+        write_pg_message(&mut client, b'D', b"P\0").await.unwrap();
+        write_pg_message(&mut client, b'E', b"\0\0\0\0\0").await.unwrap();
+        write_pg_message(&mut client, b'S', &[]).await.unwrap();
+
+        let tags = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut seen = Vec::new();
+            loop {
+                let (tag, _) = read_pg_message(&mut client).await.unwrap();
+                seen.push(tag);
+                if tag == MSG_READY_FOR_QUERY {
+                    return seen;
+                }
+            }
+        })
+        .await
+        .expect("extended query protocol must not deadlock");
+
+        assert_eq!(tags, vec![b'1', b'2', b'C', MSG_READY_FOR_QUERY]);
+
+        drop(client);
+        proxy_task.abort();
+        backend_task.abort();
+    }
+
     // ── Test helpers ─────────────────────────────────────────────────
 
     /// Create a connected pair of `TcpStream` for testing.
@@ -1415,6 +1543,30 @@ mod tests {
         let connect = || -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
             Box::pin(async { Err(DbError::PoolClosed) })
         };
+        let reset = |s: TcpStream| -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
+            Box::pin(async { Ok(s) })
+        };
+        let ping = |s: TcpStream| -> crate::pool::BoxFuture<Result<(TcpStream, bool), DbError>> {
+            Box::pin(async { Ok((s, true)) })
+        };
+        let config = PoolConfig {
+            min_connections: 1,
+            max_connections: 2,
+            idle_timeout: std::time::Duration::from_secs(60),
+            max_lifetime: std::time::Duration::from_secs(300),
+            pool_timeout: std::time::Duration::from_secs(5),
+            health_check_interval: std::time::Duration::from_secs(30),
+        };
+        Pool::new(config, connect, reset, ping)
+    }
+
+    /// Create a `Pool` whose connections dial `addr` with no PG handshake.
+    fn pool_dialing(addr: std::net::SocketAddr) -> Pool {
+        let connect = move || -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
+            Box::pin(async move { TcpStream::connect(addr).await.map_err(DbError::from) })
+        };
+        // No-op reset: the fake backend in these tests does not implement
+        // `DISCARD ALL`.
         let reset = |s: TcpStream| -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
             Box::pin(async { Ok(s) })
         };
