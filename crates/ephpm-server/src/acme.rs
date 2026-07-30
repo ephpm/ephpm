@@ -7,15 +7,31 @@
 //! ## Clustered mode
 //!
 //! When a KV store is provided, ACME operates in distributed mode:
-//! - **Leader election**: an `acme:leader` key with TTL heartbeat ensures
-//!   only one node issues/renews certificates at a time.
-//! - **Challenge tokens**: stored in the KV store so any node can respond
-//!   to HTTP-01 challenges.
+//! - **Leader election**: an `acme:leader` key with TTL heartbeat, plus a
+//!   lowest-node-id tie-break, settles on one node. Only that node drives
+//!   ordering and renewal; every other node waits for the leader's
+//!   certificate to appear in the KV store rather than ordering its own.
+//!   The gossip KV tier has no compare-and-swap, so the claim is confirmed
+//!   over two heartbeats before it is acted on — see
+//!   `try_acquire_acme_leadership`.
+//! - **Challenge tokens**: **not yet implemented.** `get_acme_challenge`
+//!   lets any node answer `/.well-known/acme-challenge/<token>` out of the
+//!   KV store, but nothing populates those keys, and the TLS-ALPN-01
+//!   challenge material this SAPI actually requests lives only in the
+//!   ordering node's in-memory resolver. Validation therefore has to reach
+//!   the leader.
 //! - **Certificate distribution**: issued certs are written to the KV
 //!   store by the leader as soon as ACME finishes ordering, then loaded
 //!   by every other node on cache miss. A local [`DirCache`] is kept
 //!   alongside the KV cache so a single-node leader can also reload
 //!   its cert after restart without paying a network round-trip.
+//!   **Not yet implemented**: a follower does not pick up a *renewed*
+//!   certificate while it is running. `rustls-acme` consults the cert cache
+//!   exactly once per `AcmeState`, and its resolver's `set_cert` is
+//!   `pub(crate)`, so a fresh certificate cannot be injected from outside
+//!   the state machine. Followers serve the certificate they loaded at
+//!   startup until they restart. Closing this needs a KV-backed
+//!   `ResolvesServerCert` of our own.
 //!
 //! The recommended low-level integration uses [`tokio_rustls::LazyConfigAcceptor`]
 //! to inspect each TLS `ClientHello`: ACME challenge connections are handled
@@ -25,13 +41,14 @@ use std::convert::Infallible;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use ephpm_config::TlsConfig;
 use ephpm_kv::store::Store;
 use rustls::ServerConfig;
 use rustls_acme::caches::DirCache;
-use rustls_acme::{AccountCache, AcmeConfig, AcmeState, CertCache};
+use rustls_acme::{AccountCache, AcmeConfig, AcmeState, CertCache, EventOk};
 use sha2::{Digest, Sha256};
 use tokio_stream::StreamExt;
 
@@ -82,8 +99,14 @@ pub fn start_acme(tls_config: &TlsConfig, store: Option<Arc<Store>>) -> anyhow::
     let clustered = store.is_some();
     let (challenge_config, default_config) = match store {
         Some(kv_store) => {
-            let cache =
-                LayeredCache::new(KvCache::new(Arc::clone(&kv_store)), DirCache::new(cache_dir));
+            // Shared with the event loop below. The cache needs to know
+            // whether this node currently holds ACME leadership, because
+            // reporting a cache miss to rustls-acme is what makes it place an
+            // order — and only the leader may do that.
+            let leader_flag = Arc::new(AtomicBool::new(false));
+            let kv_cache = KvCache::new(Arc::clone(&kv_store));
+            let cache = LayeredCache::new(kv_cache, DirCache::new(cache_dir))
+                .with_leader_gate(Arc::clone(&leader_flag));
             let config = base.cache(cache);
             let config = if let Some(email) = email {
                 config.contact_push(format!("mailto:{email}"))
@@ -96,7 +119,7 @@ pub fn start_acme(tls_config: &TlsConfig, store: Option<Arc<Store>>) -> anyhow::
             if let Some(cfg) = Arc::get_mut(&mut default_config) {
                 cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             }
-            tokio::spawn(drive_clustered_acme_events(state, kv_store));
+            tokio::spawn(drive_clustered_acme_events(state, kv_store, leader_flag));
             (challenge_config, default_config)
         }
         None => {
@@ -157,6 +180,17 @@ const ACME_LEADER_KEY: &str = "acme:leader";
 const ACME_LEADER_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Heartbeat interval for the ACME leader (must be less than TTL).
 const ACME_LEADER_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Consecutive confirmed heartbeats required before a node acts as leader.
+///
+/// The gossip KV tier is eventually consistent, so during the second or so it
+/// takes a write to propagate, two nodes can each win their *local* claim.
+/// Requiring the claim to survive another heartbeat gives the deterministic
+/// tie-break in [`try_acquire_acme_leadership`] time to settle before anything
+/// talks to Let's Encrypt.
+const ACME_LEADER_CONFIRMATIONS: u32 = 2;
+/// How often a follower re-checks the KV store for the leader's certificate
+/// while holding a `load_cert` open.
+const ACME_FOLLOWER_CERT_POLL: std::time::Duration = std::time::Duration::from_secs(5);
 /// KV key prefix for ACME challenge tokens.
 const ACME_CHALLENGE_PREFIX: &str = "acme:challenge:";
 /// KV key prefix for stored certificates.
@@ -172,15 +206,41 @@ fn acme_node_id() -> String {
 
 /// Drive ACME events with distributed leader election via the KV store.
 ///
-/// Only the leader node processes ACME events (certificate ordering/renewal).
-/// When the leader obtains a certificate, it distributes the cert to all nodes
-/// via the KV store so they can hot-load it.
+/// Only the leader orders and renews certificates. The leader's cache layer
+/// publishes each new certificate into the KV store, and followers pick it up
+/// on their one and only `load_cert`.
+///
+/// ## Why followers poll at all
+///
+/// `rustls-acme` builds its `load_cert` future once, in `AcmeState::new`, and
+/// consumes it on the first poll. A node that never polls therefore never
+/// installs *any* certificate in its resolver and cannot serve HTTPS. So a
+/// follower is allowed to poll until it has deployed a certificate — and
+/// [`LayeredCache`] holds that load open instead of reporting a miss, which
+/// is the only way a poll can fall through to placing an order.
+///
+/// Once a follower has deployed, it stops polling entirely. That freezes its
+/// renewal timer, which is what keeps it off Let's Encrypt for good.
+///
+/// ## Known limitation
+///
+/// A follower therefore does *not* pick up the leader's renewed certificate:
+/// `AcmeState` consults the cert cache exactly once, and its resolver's
+/// `set_cert` is `pub(crate)`, so there is no way to inject a fresh
+/// certificate from outside the state machine. Followers serve the
+/// certificate they loaded at startup until they restart. Closing that gap
+/// needs a KV-backed `ResolvesServerCert` of our own; it is tracked as the
+/// remaining clustered-ACME work.
 async fn drive_clustered_acme_events<EC: Debug + 'static, EA: Debug + 'static>(
     mut state: AcmeState<EC, EA>,
     store: Arc<Store>,
+    leader_flag: Arc<AtomicBool>,
 ) {
     let node_id = acme_node_id();
     let mut is_leader = false;
+    let mut confirmations: u32 = 0;
+    // Set once this node has a certificate installed in its resolver.
+    let mut deployed = false;
     let mut heartbeat_interval = tokio::time::interval(ACME_LEADER_HEARTBEAT);
     heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -188,16 +248,33 @@ async fn drive_clustered_acme_events<EC: Debug + 'static, EA: Debug + 'static>(
         tokio::select! {
             // Heartbeat: try to acquire or maintain leadership.
             _ = heartbeat_interval.tick() => {
-                is_leader = try_acquire_acme_leadership(&store, &node_id);
-                if is_leader {
+                if try_acquire_acme_leadership(&store, &node_id) {
+                    confirmations = confirmations.saturating_add(1);
+                } else {
+                    confirmations = 0;
+                }
+                let now_leader = confirmations >= ACME_LEADER_CONFIRMATIONS;
+                if now_leader != is_leader {
+                    is_leader = now_leader;
+                    leader_flag.store(is_leader, Ordering::Release);
+                    if is_leader {
+                        tracing::info!(node_id, "this node is now the ACME leader");
+                    } else {
+                        tracing::info!(node_id, "this node is no longer the ACME leader");
+                    }
+                } else if is_leader {
                     tracing::debug!("ACME leader heartbeat maintained");
                 }
             }
-            // Process ACME events (only meaningful if we're the leader,
-            // but we always poll to keep the state machine alive).
-            event = state.next() => {
+            // Drive the state machine only while it cannot place an order we
+            // do not want: always on the leader, and on a follower only until
+            // it has a certificate deployed.
+            event = state.next(), if is_leader || !deployed => {
                 match event {
                     Some(Ok(ref ev)) => {
+                        if matches!(ev, EventOk::DeployedCachedCert | EventOk::DeployedNewCert) {
+                            deployed = true;
+                        }
                         if is_leader {
                             // The cache layer wired into AcmeConfig
                             // pushes new certs into the KV store as part
@@ -206,14 +283,14 @@ async fn drive_clustered_acme_events<EC: Debug + 'static, EA: Debug + 'static>(
                             // already replicated cluster-wide.
                             tracing::info!(?ev, "ACME certificate event (leader, distributed via KV)");
                         } else {
-                            tracing::debug!(?ev, "ACME certificate event (follower)");
+                            tracing::info!(?ev, "ACME certificate event (follower, loaded from KV)");
                         }
                     }
                     Some(Err(ref err)) => {
                         if is_leader {
                             tracing::error!(?err, "ACME error (leader)");
                         } else {
-                            tracing::debug!(?err, "ACME error (follower)");
+                            tracing::warn!(?err, "ACME error (follower)");
                         }
                     }
                     None => {
@@ -226,41 +303,60 @@ async fn drive_clustered_acme_events<EC: Debug + 'static, EA: Debug + 'static>(
     }
 }
 
-/// Try to acquire ACME leadership via the KV store.
+/// Try to acquire or renew ACME leadership via the KV store.
 ///
-/// Uses a simple compare-and-set pattern: if the `acme:leader` key
-/// doesn't exist or was set by us, we (re)claim it with a TTL.
+/// Returns `true` if this node holds the `acme:leader` key.
 ///
-/// Returns `true` if this node is now the leader.
+/// # This is not a true distributed lock
+///
+/// [`Store::set_nx`] is a genuine atomic test-and-set *within one process*,
+/// which is why it replaces the previous get-then-set. Across the cluster
+/// there is no equivalent: the gossip KV tier
+/// (`ClusterHandle::gossip_set`/`gossip_get` in `ephpm-cluster`) offers only
+/// last-write-wins set / get / delete over eventually consistent chitchat
+/// state — it has no compare-and-swap primitive to build on. Two nodes
+/// starting together can therefore both win their local claim for the second
+/// or so it takes the write to propagate.
+///
+/// What makes it converge is the tie-break below: a node that sees a
+/// *different* holder yields unless its own id sorts lower, in which case it
+/// takes the key over. The comparison is total and every node eventually
+/// applies it to the same converged value, so exactly one node survives —
+/// the same "lowest id wins" rule `ephpm-cluster::sqlite_election` uses.
+/// The caller additionally waits [`ACME_LEADER_CONFIRMATIONS`] heartbeats
+/// before acting on a claim, so the pre-convergence window cannot turn into
+/// duplicate certificate orders.
 fn try_acquire_acme_leadership(store: &Store, node_id: &str) -> bool {
-    let current = store.get(ACME_LEADER_KEY);
-    match current {
-        None => {
-            // No leader — claim it.
-            store.set(
-                ACME_LEADER_KEY.to_string(),
-                node_id.as_bytes().to_vec(),
-                Some(ACME_LEADER_TTL),
-            );
-            tracing::info!(node_id, "acquired ACME leadership");
-            true
-        }
-        Some(existing) => {
-            let existing_id = String::from_utf8_lossy(&existing);
-            if existing_id == node_id {
-                // We're already the leader — renew the TTL.
-                store.set(
-                    ACME_LEADER_KEY.to_string(),
-                    node_id.as_bytes().to_vec(),
-                    Some(ACME_LEADER_TTL),
-                );
-                true
-            } else {
-                // Another node is the leader.
-                false
-            }
-        }
+    let key = ACME_LEADER_KEY.to_string();
+    let claim = node_id.as_bytes().to_vec();
+
+    // `set_nx` is atomic within this process: only one caller creates the key.
+    if store.set_nx(key.clone(), claim.clone(), Some(ACME_LEADER_TTL)) {
+        tracing::info!(node_id, "acquired ACME leadership");
+        return true;
     }
+
+    let Some(existing) = store.get(ACME_LEADER_KEY) else {
+        // Expired between the `set_nx` and this read. Leave it to the next
+        // heartbeat rather than racing.
+        return false;
+    };
+    let existing_id = String::from_utf8_lossy(&existing);
+    if existing_id == node_id {
+        // We already hold it — renew the TTL.
+        store.set(key, claim, Some(ACME_LEADER_TTL));
+        return true;
+    }
+    if node_id < &*existing_id {
+        tracing::info!(
+            node_id,
+            %existing_id,
+            "taking over ACME leadership (lower node id wins the tie-break)"
+        );
+        store.set(key, claim, Some(ACME_LEADER_TTL));
+        return true;
+    }
+    false
 }
 
 /// Store an ACME challenge token in the KV store for any node to serve.
@@ -486,13 +582,37 @@ impl AccountCache for KvCache {
 pub struct LayeredCache {
     kv: KvCache,
     dir: DirCache<PathBuf>,
+    /// When present, a miss in *both* tiers is held open unless this node is
+    /// the ACME leader. See [`LayeredCache::with_leader_gate`].
+    leader: Option<Arc<AtomicBool>>,
 }
 
 impl LayeredCache {
     /// Construct a new layered cache from its KV and disk components.
+    ///
+    /// Without [`LayeredCache::with_leader_gate`] a cache miss is reported to
+    /// rustls-acme as-is, which is the correct behaviour for a single node.
     #[must_use]
     pub fn new(kv: KvCache, dir: DirCache<PathBuf>) -> Self {
-        Self { kv, dir }
+        Self { kv, dir, leader: None }
+    }
+
+    /// Gate cache misses on ACME leadership.
+    ///
+    /// `rustls-acme` reads `Ok(None)` from `load_cert` as "no certificate
+    /// exists, place an order". In a cluster that must only ever happen on
+    /// one node: five duplicate orders for the same domain set in a week is a
+    /// hard Let's Encrypt lockout with no way to shorten it. With the gate
+    /// installed, a node that is not the leader waits for the leader's
+    /// certificate to land in the KV store instead of reporting a miss, so it
+    /// can never fall through to ordering.
+    ///
+    /// `flag` is written by the ACME event loop as leadership changes, so a
+    /// node that is promoted mid-wait stops waiting and takes over ordering.
+    #[must_use]
+    pub fn with_leader_gate(mut self, flag: Arc<AtomicBool>) -> Self {
+        self.leader = Some(flag);
+        self
     }
 }
 
@@ -505,18 +625,34 @@ impl CertCache for LayeredCache {
         domains: &[String],
         directory_url: &str,
     ) -> Result<Option<Vec<u8>>, Self::EC> {
-        // Try KV first so cluster-wide rollouts win over stale local disk.
-        match self.kv.load_cert(domains, directory_url).await {
-            Ok(Some(bytes)) => return Ok(Some(bytes)),
-            Ok(None) => {}
-            Err(_unreachable) => {} // Infallible
-        }
-        match self.dir.load_cert(domains, directory_url).await {
-            Ok(value) => Ok(value),
-            Err(err) => {
-                tracing::warn!(?err, "ACME DirCache cert load failed — treating as miss");
-                Ok(None)
+        loop {
+            // Try KV first so cluster-wide rollouts win over stale local disk.
+            match self.kv.load_cert(domains, directory_url).await {
+                Ok(Some(bytes)) => return Ok(Some(bytes)),
+                Ok(None) => {}
+                Err(_unreachable) => {} // Infallible
             }
+            match self.dir.load_cert(domains, directory_url).await {
+                Ok(Some(bytes)) => return Ok(Some(bytes)),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(?err, "ACME DirCache cert load failed — treating as miss");
+                }
+            }
+
+            // Both tiers missed. Reporting the miss is what makes rustls-acme
+            // place an order, so only the leader is allowed to do it; see
+            // [`LayeredCache::with_leader_gate`].
+            let may_order = self.leader.as_ref().is_none_or(|f| f.load(Ordering::Acquire));
+            if may_order {
+                return Ok(None);
+            }
+            tracing::debug!(
+                ?domains,
+                "ACME certificate not cached and this node is not the ACME leader — \
+                 waiting for the leader to publish instead of ordering"
+            );
+            tokio::time::sleep(ACME_FOLLOWER_CERT_POLL).await;
         }
     }
 
@@ -658,6 +794,98 @@ mod tests {
     fn acme_cert_missing_returns_none() {
         let store = test_store();
         assert!(get_acme_cert(&store, "missing.com").is_none());
+    }
+
+    #[test]
+    fn acme_leader_lower_node_id_takes_over() {
+        // Both nodes can win their *local* claim while the gossip write is
+        // in flight, so the tie-break has to be deterministic once the value
+        // converges: the lower id keeps the key, the higher id yields.
+        let store = test_store();
+        assert!(try_acquire_acme_leadership(&store, "node-z"));
+        assert!(
+            try_acquire_acme_leadership(&store, "node-a"),
+            "a lower node id must take the key over once it observes the holder"
+        );
+        assert_eq!(store.get(ACME_LEADER_KEY).as_deref(), Some(b"node-a".as_slice()));
+        assert!(
+            !try_acquire_acme_leadership(&store, "node-z"),
+            "the higher node id must yield on its next heartbeat"
+        );
+    }
+
+    #[test]
+    fn acme_leader_election_converges_regardless_of_claim_order() {
+        // Models the pre-convergence window: several nodes each won their
+        // local claim, then gossip settled on an arbitrary one of them. One
+        // heartbeat round across every node must land on the same answer no
+        // matter which claim gossip happened to keep.
+        for first in ["node-c", "node-a", "node-b"] {
+            let store = test_store();
+            assert!(try_acquire_acme_leadership(&store, first));
+            for id in ["node-c", "node-a", "node-b"] {
+                try_acquire_acme_leadership(&store, id);
+            }
+            assert_eq!(
+                store.get(ACME_LEADER_KEY).as_deref(),
+                Some(b"node-a".as_slice()),
+                "one heartbeat round must converge on the lowest node id (first claim: {first})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn layered_cache_follower_waits_instead_of_reporting_a_miss() {
+        // A cache miss is what makes rustls-acme place an order. On a
+        // follower it must never be reported: N nodes reporting a miss is N
+        // duplicate Let's Encrypt orders and a week-long rate-limit lockout.
+        let store = test_store();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let leader = Arc::new(AtomicBool::new(false));
+        let cache = LayeredCache::new(KvCache::new(store), DirCache::new(tmp.path().to_path_buf()))
+            .with_leader_gate(Arc::clone(&leader));
+
+        let domains = ["absent.example.com".to_string()];
+        let waited = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            cache.load_cert(&domains, TEST_DIRECTORY),
+        )
+        .await;
+        assert!(waited.is_err(), "a follower must hold the load open, not report a miss");
+
+        // Promoted to leader: the miss is now allowed through so this node
+        // can order.
+        leader.store(true, Ordering::Release);
+        let loaded = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            cache.load_cert(&domains, TEST_DIRECTORY),
+        )
+        .await
+        .expect("the leader must not be gated")
+        .expect("infallible");
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn layered_cache_follower_returns_the_leaders_cert() {
+        let store = test_store();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let domains = vec!["published.example.com".to_string()];
+        let cert = b"cert-published-by-the-leader";
+        KvCache::new(Arc::clone(&store))
+            .store_cert(&domains, TEST_DIRECTORY, cert)
+            .await
+            .expect("infallible");
+
+        let cache = LayeredCache::new(KvCache::new(store), DirCache::new(tmp.path().to_path_buf()))
+            .with_leader_gate(Arc::new(AtomicBool::new(false)));
+
+        let loaded = cache.load_cert(&domains, TEST_DIRECTORY).await.expect("infallible");
+        assert_eq!(
+            loaded.as_deref(),
+            Some(cert.as_slice()),
+            "the gate must not delay a cert that is already published",
+        );
     }
 
     #[test]

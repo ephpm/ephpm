@@ -28,7 +28,7 @@ Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and ex
 | `ephpm_http_requests_total` | counter | `method`, `status`, `handler` | Total HTTP requests handled. `handler` is the route class (e.g. `php`, `static`, `error`). To keep series cardinality bounded, `method` is one of the standard verbs (`GET`, `POST`, ...) or `OTHER` for any non-standard verb, and `status` is the numeric code for the common statuses this server and typical apps emit or `other` for uncommon codes. |
 | `ephpm_http_requests_in_flight` | gauge | — | Currently in-flight HTTP requests. |
 | `ephpm_http_request_duration_seconds` | histogram | `method`, `handler` | Request handling time, end-to-end (no `status` label). |
-| `ephpm_http_request_body_bytes` | histogram | `method` | Request body size. |
+| `ephpm_http_request_body_bytes` | histogram | `method` | Request body size. `method` is bounded the same way as above (standard verb or `OTHER`). |
 | `ephpm_http_response_body_bytes` | histogram | `handler` | Response body size before compression. Recorded on the PHP path only (`handler="php"`). |
 | `ephpm_http_compression_ratio` | histogram | — | Compressed-to-original ratio; covers both Brotli and gzip responses. |
 | `ephpm_http_timeouts_total` | counter | `stage` | Requests killed by the request timeout. Only value: `request`. |

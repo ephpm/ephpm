@@ -38,7 +38,7 @@ EPHPM_SERVER__METRICS__PATH="/metrics"
 | `ephpm_http_request_duration_seconds` | histogram | `method`, `handler` | End-to-end request duration (includes PHP execution for PHP requests). |
 | `ephpm_http_requests_in_flight` | gauge | — | Number of requests currently being processed. |
 | `ephpm_http_timeouts_total` | counter | `stage` | Requests that hit the timeout. `stage` is `"request"`. |
-| `ephpm_http_request_body_bytes` | histogram | `method` | Request body size in bytes. |
+| `ephpm_http_request_body_bytes` | histogram | `method` | Request body size in bytes. `method` is a standard verb or `OTHER`, never the client's raw verb. |
 | `ephpm_http_response_body_bytes` | histogram | `handler` | Response body size in bytes (before compression). |
 | `ephpm_http_compression_ratio` | histogram | — | Compression ratio (compressed / original). Values near 0 = excellent compression. |
 | `ephpm_rate_limited_total` | counter | — | Requests rejected by rate limiting. |

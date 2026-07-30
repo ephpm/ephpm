@@ -525,7 +525,14 @@ fn parse_server_greeting(payload: &[u8]) -> Result<(ServerMeta, [u8; 20]), DbErr
     // Filler.
     pos += 1;
 
-    if pos + 6 > payload.len() {
+    // Everything from here to the auth-plugin-data length is a fixed 8-byte
+    // run: capability low (2) + charset (1) + status (2) + capability high (2)
+    // + plugin data length (1). The guard has to cover all 8 — at 6 a greeting
+    // truncated to exactly `pos + 6` or `pos + 7` passed the check and then
+    // panicked indexing `payload[pos + 6]` / `payload[pos + 7]` below. That is
+    // reachable from whatever answers on the configured DB port, and inside
+    // `Pool::warm` it silently kills the detached maintenance task.
+    if pos + 8 > payload.len() {
         return Err(DbError::Protocol("greeting too short (caps)".into()));
     }
 
@@ -1609,6 +1616,43 @@ pub async fn build_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── parse_server_greeting bounds ──────────────────────────────────
+
+    /// Build a `HandshakeV10` payload truncated to `pos + extra` bytes, where
+    /// `pos` is the offset of the capability-flags run.
+    fn truncated_greeting(extra: usize) -> Vec<u8> {
+        let mut p = vec![10u8]; // protocol version
+        p.extend_from_slice(b"8.0.0\0"); // server version
+        p.extend_from_slice(&[0, 0, 0, 0]); // connection id
+        p.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // auth-plugin-data part 1
+        p.push(0); // filler
+        p.resize(p.len() + extra, 0);
+        p
+    }
+
+    /// A greeting truncated to exactly the old `pos + 6` / `pos + 7` bound
+    /// passed the length check and then panicked indexing `payload[pos + 6]`
+    /// and `payload[pos + 7]`. Reachable from whatever answers on the
+    /// configured DB port.
+    #[test]
+    fn short_greeting_is_rejected_not_panicked() {
+        for extra in 0..8 {
+            let payload = truncated_greeting(extra);
+            let result = parse_server_greeting(&payload);
+            assert!(
+                matches!(result, Err(DbError::Protocol(_))),
+                "greeting with {extra} capability bytes must be rejected, not panic"
+            );
+        }
+    }
+
+    #[test]
+    fn greeting_with_full_capability_run_parses() {
+        // 8 capability-run bytes + 10 reserved + 13 auth-plugin-data part 2.
+        let payload = truncated_greeting(8 + 10 + 13);
+        assert!(parse_server_greeting(&payload).is_ok(), "a complete greeting must still parse");
+    }
 
     // ── classify_mysql_query ──────────────────────────────────────────
 

@@ -37,6 +37,12 @@ ephpm-server.workspace = true
 # mismatch (LNK2038). The Windows allocator picture is also different —
 # SEG_HEAP already reduces the contention mimalloc addresses on glibc — so
 # Windows keeps the system allocator.
+#
+# tempfile is a runtime dependency, not just a test one: the generated
+# php.ini is materialised into a private mkdtemp directory (see
+# `run_with_config`), because a predictable path under a shared /tmp is
+# attacker-plantable.
+tempfile = "3"
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -58,7 +64,6 @@ windows-sys = { version = "0.59", features = [
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde_json = "1"
-tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]

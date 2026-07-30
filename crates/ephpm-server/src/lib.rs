@@ -517,6 +517,46 @@ async fn bind_listeners(
     })
 }
 
+/// Pause after an `accept()` failure that is likely to repeat immediately.
+///
+/// Long enough that a wedged listener cannot spin a core, short enough that a
+/// transient descriptor shortage clears without a visible stall.
+const ACCEPT_BACKOFF_MS: u64 = 50;
+
+/// Decide what to do about a failed `accept()`.
+///
+/// An accept error is never fatal to the server. Descriptor exhaustion
+/// (`EMFILE`/`ENFILE`) and an aborted handshake (`ECONNABORTED`) are
+/// transient, per-connection conditions; propagating either out of
+/// [`accept_loop`] used to terminate the loop and shut the whole process
+/// down over one bad connection.
+///
+/// Returns `Some(backoff)` when the caller should pause before accepting
+/// again. Errors that clearly concern a single connection retry immediately;
+/// everything else — including descriptor exhaustion, which has no stable
+/// [`std::io::ErrorKind`] and would otherwise busy-loop — backs off first.
+fn handle_accept_error(err: &std::io::Error, listener: &str) -> Option<Duration> {
+    match err.kind() {
+        std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::Interrupted => {
+            tracing::debug!(
+                error = %err,
+                "{listener} accept failed for one connection; continuing"
+            );
+            None
+        }
+        _ => {
+            tracing::warn!(
+                error = %err,
+                backoff_ms = ACCEPT_BACKOFF_MS,
+                "{listener} accept failed; backing off and continuing"
+            );
+            Some(Duration::from_millis(ACCEPT_BACKOFF_MS))
+        }
+    }
+}
+
 /// Run the accept loop, dispatching connections to the appropriate handler.
 async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
     let Listeners {
@@ -567,7 +607,15 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
     loop {
         tokio::select! {
             result = main.accept() => {
-                let (stream, remote_addr) = result.context("failed to accept connection")?;
+                let (stream, remote_addr) = match result {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        if let Some(backoff) = handle_accept_error(&e, "HTTP") {
+                            tokio::time::sleep(backoff).await;
+                        }
+                        continue;
+                    }
+                };
                 // HTTP responses (JSON APIs, small pages, 304s) are frequently
                 // sub-MSS; without nodelay, Nagle holds the response tail until
                 // the client ACKs, which delayed-ACK defers ~40ms — surfacing as
@@ -585,7 +633,15 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
             result = async {
                 tls_listener.as_ref().expect("guarded by is_some").accept().await
             }, if tls_listener.is_some() => {
-                let (stream, remote_addr) = result.context("failed to accept TLS connection")?;
+                let (stream, remote_addr) = match result {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        if let Some(backoff) = handle_accept_error(&e, "HTTPS") {
+                            tokio::time::sleep(backoff).await;
+                        }
+                        continue;
+                    }
+                };
                 // Same rationale as the plain-HTTP accept above; set on the raw
                 // TCP stream before the TLS handshake wraps it.
                 let _ = stream.set_nodelay(true);
@@ -1717,5 +1773,28 @@ mod lib_tests {
             .expect("read response");
         assert!(n > 0, "expected response bytes on a still-open connection");
         assert!(buf.starts_with(b"HTTP/1.1"), "expected an HTTP/1.1 response line");
+    }
+
+    // ── accept() error handling ──────────────────────────────────────
+
+    /// An accept error must never be fatal. Both of these used to be
+    /// `result.context(..)?` out of `accept_loop`, so one aborted handshake
+    /// or a momentary descriptor shortage took the whole process down.
+    #[test]
+    fn aborted_handshake_retries_without_backoff() {
+        let err = std::io::Error::from(std::io::ErrorKind::ConnectionAborted);
+        assert_eq!(handle_accept_error(&err, "HTTP"), None);
+    }
+
+    #[test]
+    fn unrecognised_accept_error_backs_off_instead_of_spinning() {
+        // Descriptor exhaustion (EMFILE/ENFILE) has no stable `ErrorKind`, so
+        // it lands in the catch-all arm. Retrying instantly would busy-loop a
+        // core while the process is already degraded.
+        let err = std::io::Error::other("simulated descriptor exhaustion");
+        assert_eq!(
+            handle_accept_error(&err, "HTTP"),
+            Some(Duration::from_millis(ACCEPT_BACKOFF_MS))
+        );
     }
 }

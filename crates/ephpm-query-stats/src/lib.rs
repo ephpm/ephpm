@@ -369,15 +369,23 @@ fn classify_query(sql: &str) -> QueryKind {
 }
 
 /// Truncate normalized SQL for use as a Prometheus label. Caps at 64
-/// chars to keep label bodies bounded (this is per-label-value length;
+/// bytes to keep label bodies bounded (this is per-label-value length;
 /// the cross-label cardinality is bounded separately by
 /// [`StatsConfig::metric_label_series_max`]).
 fn truncate_for_label(normalized: &str) -> std::borrow::Cow<'_, str> {
     if normalized.len() <= 64 {
-        std::borrow::Cow::Borrowed(normalized)
-    } else {
-        std::borrow::Cow::Owned(format!("{}...", &normalized[..61]))
+        return std::borrow::Cow::Borrowed(normalized);
     }
+    // Byte-slicing at a fixed 61 panics when the boundary lands inside a
+    // multi-byte character. Non-ASCII does reach the normalized SQL — via
+    // backtick-quoted identifiers and the normalizer's catch-all byte copy —
+    // so any query over 64 bytes containing a UTF-8 identifier used to panic
+    // the recording call and drop the litewire connection.
+    let mut end = 61;
+    while !normalized.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}...", &normalized[..end]))
 }
 
 #[cfg(test)]
@@ -503,6 +511,29 @@ mod tests {
         let label = truncate_for_label(s);
         assert!(label.len() <= 67); // 64 + "..."
         assert!(label.ends_with("..."));
+    }
+
+    /// The truncation used to be a raw byte slice at 61, which panics when
+    /// that offset lands inside a multi-byte character. Non-ASCII reaches
+    /// the normalized SQL through backtick identifiers and the normalizer's
+    /// catch-all byte copy, so this was reachable from a query.
+    #[test]
+    fn truncate_label_does_not_split_a_utf8_character() {
+        // Byte 61 is the *second* byte of the first `é` (bytes 60..62).
+        let s = format!("{}{}", "a".repeat(60), "é".repeat(10));
+        assert!(s.len() > 64, "input must be long enough to truncate");
+        assert!(!s.is_char_boundary(61), "byte 61 must land mid-character for this test");
+
+        let label = truncate_for_label(&s);
+        let expected = format!("{}...", "a".repeat(60));
+        assert!(label.ends_with("..."));
+        assert_eq!(&*label, expected.as_str());
+    }
+
+    #[test]
+    fn truncate_label_passes_through_at_exactly_64_bytes() {
+        let s = "a".repeat(64);
+        assert_eq!(&*truncate_for_label(&s), s.as_str());
     }
 
     #[test]

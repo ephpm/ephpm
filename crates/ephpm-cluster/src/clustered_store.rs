@@ -108,6 +108,31 @@ struct CachedValue {
     key: String,
 }
 
+/// Approximate heap footprint accounted for one hot-cache entry.
+fn hot_entry_bytes(entry: &CachedValue) -> u64 {
+    (entry.data.len() + entry.key.len() + 64) as u64
+}
+
+/// Evict `key_hash` from the hot cache, debiting the memory counter by the
+/// footprint of the entry *this caller actually removed*.
+///
+/// The accounting must hang off the value returned by `remove`, never off a
+/// value read beforehand. `DashMap::remove` returns `Some` to exactly one
+/// caller, so this is race-free; debiting unconditionally is not. Two readers
+/// hitting the same expired entry both used to subtract, and `hot_cache_mem`
+/// is a `u64` — it wraps to ~`u64::MAX`, the budget check in
+/// [`ClusteredStore::maybe_promote_hot_key`] is then always over, and hot-key
+/// promotion is silently dead for the rest of the process's life while
+/// [`ClusteredStore::hot_cache_mem_used`] reports garbage.
+///
+/// The caller must not be holding a `DashMap` guard for `key_hash`: `remove`
+/// takes the shard write lock.
+fn evict_hot_entry(cache: &DashMap<u64, CachedValue>, mem: &AtomicU64, key_hash: u64) {
+    if let Some((_, entry)) = cache.remove(&key_hash) {
+        mem.fetch_sub(hot_entry_bytes(&entry), Ordering::Relaxed);
+    }
+}
+
 impl ClusteredStore {
     /// Create a new clustered store.
     ///
@@ -158,19 +183,20 @@ impl ClusteredStore {
                 };
 
                 // If we have a cached copy at an older version, evict it.
-                if let Some(entry) = this.hot_cache.get(&key_hash) {
-                    if entry.version < new_version {
-                        let mem = entry.data.len() + entry.key.len() + 64;
-                        drop(entry);
-                        this.hot_cache.remove(&key_hash);
-                        this.hot_cache_mem.fetch_sub(mem as u64, Ordering::Relaxed);
-                        tracing::debug!(
-                            key_hash,
-                            old_version = new_version - 1,
-                            new_version,
-                            "hot key invalidated via gossip",
-                        );
-                    }
+                // Read the stale version out and release the shard read guard
+                // before `evict_hot_entry` takes the write lock.
+                let stale_version = this
+                    .hot_cache
+                    .get(&key_hash)
+                    .and_then(|entry| (entry.version < new_version).then_some(entry.version));
+                if let Some(old_version) = stale_version {
+                    evict_hot_entry(&this.hot_cache, &this.hot_cache_mem, key_hash);
+                    tracing::debug!(
+                        key_hash,
+                        old_version,
+                        new_version,
+                        "hot key invalidated via gossip",
+                    );
                 }
             })
             .await;
@@ -200,11 +226,13 @@ impl ClusteredStore {
                 if cached.cached_at.elapsed() < ttl && cached.key == key {
                     return Some(cached.data.clone());
                 }
-                // Expired — remove it.
-                let mem = cached.data.len() + cached.key.len() + 64;
+                // Expired (or a hash collision with another key) — evict it.
+                // Drop the shard read guard first: `evict_hot_entry` takes the
+                // write lock, and it debits the counter only for the entry it
+                // actually removed, so two readers racing here cannot
+                // double-subtract.
                 drop(cached);
-                self.hot_cache.remove(&key_hash);
-                self.hot_cache_mem.fetch_sub(mem as u64, Ordering::Relaxed);
+                evict_hot_entry(&self.hot_cache, &self.hot_cache_mem, key_hash);
             }
         }
 
@@ -441,11 +469,7 @@ impl ClusteredStore {
 
         // Evict from hot cache.
         if self.config.hot_key_cache {
-            let key_hash = hash_key(key);
-            if let Some((_, entry)) = self.hot_cache.remove(&key_hash) {
-                let mem = entry.data.len() + entry.key.len() + 64;
-                self.hot_cache_mem.fetch_sub(mem as u64, Ordering::Relaxed);
-            }
+            evict_hot_entry(&self.hot_cache, &self.hot_cache_mem, hash_key(key));
         }
 
         gossip_deleted || local_deleted
@@ -560,8 +584,10 @@ impl ClusteredStore {
         };
         let entry_mem = (value.len() + key.len() + 64) as u64;
 
-        // Don't exceed memory budget.
-        if self.hot_cache_mem.load(Ordering::Relaxed) + entry_mem > max_mem {
+        // Don't exceed memory budget. `saturating_add` so a bad accounting
+        // state can never turn this check into an overflow panic in debug
+        // builds.
+        if self.hot_cache_mem.load(Ordering::Relaxed).saturating_add(entry_mem) > max_mem {
             return;
         }
 
@@ -575,10 +601,11 @@ impl ClusteredStore {
             },
         );
 
-        // Adjust memory accounting.
+        // Adjust memory accounting. `insert` returns the displaced value to
+        // exactly one caller, so debiting off `old` is race-free for the same
+        // reason `evict_hot_entry` is.
         if let Some(old_entry) = old {
-            let old_mem = (old_entry.data.len() + old_entry.key.len() + 64) as u64;
-            self.hot_cache_mem.fetch_sub(old_mem, Ordering::Relaxed);
+            self.hot_cache_mem.fetch_sub(hot_entry_bytes(&old_entry), Ordering::Relaxed);
         }
         self.hot_cache_mem.fetch_add(entry_mem, Ordering::Relaxed);
 
@@ -625,11 +652,12 @@ impl ClusteredStore {
         let ttl = Duration::from_secs(self.config.hot_key_local_ttl_secs);
         let window = Duration::from_secs(self.config.hot_key_window_secs);
 
-        // Evict expired hot cache entries.
+        // Evict expired hot cache entries. `retain` visits each entry once
+        // under its shard lock, so the debit here happens exactly once per
+        // removal — same invariant `evict_hot_entry` enforces.
         self.hot_cache.retain(|_, entry| {
             if entry.cached_at.elapsed() >= ttl {
-                let mem = (entry.data.len() + entry.key.len() + 64) as u64;
-                self.hot_cache_mem.fetch_sub(mem, Ordering::Relaxed);
+                self.hot_cache_mem.fetch_sub(hot_entry_bytes(entry), Ordering::Relaxed);
                 false
             } else {
                 true
@@ -1085,6 +1113,54 @@ mod tests {
         assert_eq!(parse_memory_size("512kb").unwrap(), 512 * 1024);
         assert_eq!(parse_memory_size("100M").unwrap(), 100 * 1024 * 1024);
         assert_eq!(parse_memory_size("2G").unwrap(), 2 * 1024 * 1024 * 1024);
+    }
+
+    // ── hot cache memory accounting ──────────────────────────────────
+
+    fn hot_entry(len: usize) -> CachedValue {
+        CachedValue {
+            data: vec![0u8; len],
+            cached_at: Instant::now(),
+            version: 1,
+            key: "hot:key".to_string(),
+        }
+    }
+
+    /// Two readers racing on the same expired entry both used to
+    /// `fetch_sub` its footprint. `hot_cache_mem` is a `u64`, so the second
+    /// subtraction wrapped it to ~`u64::MAX`, the budget check in
+    /// `maybe_promote_hot_key` was over forever after, and hot-key promotion
+    /// went silently dead for the rest of the process's life.
+    #[test]
+    fn concurrent_eviction_debits_the_counter_exactly_once() {
+        let cache: DashMap<u64, CachedValue> = DashMap::new();
+        let mem = AtomicU64::new(0);
+
+        let entry = hot_entry(1024);
+        let bytes = hot_entry_bytes(&entry);
+        cache.insert(7, entry);
+        mem.store(bytes, Ordering::Relaxed);
+
+        std::thread::scope(|scope| {
+            for _ in 0..16 {
+                scope.spawn(|| evict_hot_entry(&cache, &mem, 7));
+            }
+        });
+
+        assert!(cache.is_empty(), "the entry must be gone");
+        assert_eq!(
+            mem.load(Ordering::Relaxed),
+            0,
+            "exactly one caller may debit the counter; a second subtraction wraps the u64"
+        );
+    }
+
+    #[test]
+    fn evicting_a_missing_key_leaves_the_counter_alone() {
+        let cache: DashMap<u64, CachedValue> = DashMap::new();
+        let mem = AtomicU64::new(4096);
+        evict_hot_entry(&cache, &mem, 99);
+        assert_eq!(mem.load(Ordering::Relaxed), 4096);
     }
 
     #[test]

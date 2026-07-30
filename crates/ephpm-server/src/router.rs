@@ -603,6 +603,37 @@ impl Router {
         Some(canon)
     }
 
+    /// Require a resolved PHP script to live inside its site's document root.
+    ///
+    /// The static branch gets this for free from `static_files::serve_file`,
+    /// which canonicalizes the file and checks
+    /// `starts_with(canonical_root)`. The PHP branch had only
+    /// [`Router::is_php_allowed`], a URI *prefix* test that cannot see
+    /// symlinks or dot segments — so a script reachable through a symlink
+    /// pointing out of the docroot executed anyway, which under `sites_dir`
+    /// vhosting is cross-tenant code execution.
+    ///
+    /// Canonicalizing the root goes through the cached [`Router::canonical_root`];
+    /// only the script itself costs a `canonicalize()` per request, the same
+    /// price the static path already pays.
+    fn php_script_contained(&self, fs_path: &Path, site_root: &Path) -> bool {
+        let Some(canonical_root) = self.canonical_root(site_root) else {
+            return false;
+        };
+        let Ok(canonical_script) = fs_path.canonicalize() else {
+            return false;
+        };
+        if !canonical_script.starts_with(&canonical_root) {
+            tracing::warn!(
+                path = %fs_path.display(),
+                root = %canonical_root.display(),
+                "PHP path traversal attempt blocked"
+            );
+            return false;
+        }
+        true
+    }
+
     /// Attach the native middleware chain loaded in `serve()` at startup.
     /// Kept out of `new()`'s signature so its many existing call sites (all
     /// middleware-free) stay unchanged.
@@ -970,7 +1001,9 @@ impl Router {
         ) {
             Resolved::File(fs_path) => {
                 if is_php_file(&fs_path) {
-                    if self.is_php_allowed(&uri_path) {
+                    if self.is_php_allowed(&uri_path)
+                        && self.php_script_contained(&fs_path, &site_root)
+                    {
                         let is_cacheable = (method_ref == hyper::Method::GET
                             || method_ref == hyper::Method::HEAD)
                             && self.php_etag_cache_config.enabled;
@@ -1184,6 +1217,13 @@ impl Router {
         document_root: PathBuf,
     ) -> Response<ServerBody> {
         let method = req.method().to_string();
+        // `method` is the client's raw verb and belongs in PHP's `$_SERVER`,
+        // never in a Prometheus label — that is exactly what
+        // `method_metric_label` exists to prevent (see `handle`): standard
+        // verbs map to a `&'static str`, everything else collapses to
+        // `"OTHER"`, so random verbs can't explode the series count or cost
+        // a `String` allocation per request on the hot path.
+        let method_label: &'static str = method_metric_label(req.method());
         let mut uri = req.uri().to_string();
         let mut path = req.uri().path().to_string();
         let query_string = req.uri().query().unwrap_or("").to_string();
@@ -1296,7 +1336,7 @@ impl Router {
                     }
                 };
                 #[allow(clippy::cast_precision_loss)]
-                histogram!("ephpm_http_request_body_bytes", "method" => method.clone())
+                histogram!("ephpm_http_request_body_bytes", "method" => method_label)
                     .record(bytes.len() as f64);
                 (ephpm_php::worker_bridge::WorkerBody::Buffered(bytes), None)
             };
@@ -1359,7 +1399,7 @@ impl Router {
             }
         };
         #[allow(clippy::cast_precision_loss)]
-        histogram!("ephpm_http_request_body_bytes", "method" => method.clone())
+        histogram!("ephpm_http_request_body_bytes", "method" => method_label)
             .record(body.len() as f64);
 
         let multi_tenant_kv = self.multi_tenant_kv.clone();
@@ -1416,7 +1456,7 @@ impl Router {
             // "must-be-tighter-than-current" check, since each site's path
             // is a peer rather than a subset of the previous one.
             if vhost_open_basedir {
-                let basedir = format!("{}:/tmp", document_root.display());
+                let basedir = vhost_open_basedir_value(&document_root);
                 PhpRuntime::set_request_ini("open_basedir", &basedir);
             }
 
@@ -1804,12 +1844,25 @@ fn has_hidden_segment(uri_path: &str) -> bool {
     })
 }
 
+/// Returns `true` if any segment of `path` is exactly `..`.
+///
+/// Both `/` and `\` count as separators: once the URI path is joined onto a
+/// document root, Windows treats the backslash as a real separator, so
+/// `/a\..\b` traverses exactly like `/a/../b`.
+fn has_dot_dot_segment(path: &str) -> bool {
+    path.split(['/', '\\']).any(|segment| segment == "..")
+}
+
 /// Percent-decode a URI path so static-file lookup and routing work
 /// against the literal characters the client meant.
 ///
 /// Returns `None` if the input is malformed (truncated `%`, non-hex
-/// digits) or contains an encoded `/` / `\` — those would let percent
-/// encoding bypass path-traversal checks and prefix-based blocks like
+/// digits), contains an encoded `/` / `\`, or contains a `..` path
+/// segment — all three would let the request address a file the URI-level
+/// checks never saw. Nothing downstream normalizes dot segments: the joined
+/// path goes straight to the filesystem, so `/../b/index.php` on a raw
+/// socket (browsers normalize it away, `curl --path-as-is` does not) would
+/// otherwise escape the document root and bypass prefix-based blocks like
 /// `/vendor/*`. Callers should treat `None` as a 400.
 ///
 /// The output is validated as UTF-8; an invalid sequence also yields
@@ -1821,7 +1874,7 @@ fn percent_decode_path(raw: &str) -> Option<String> {
     // can hand back an owned copy without the byte-by-byte scan, the
     // `Vec<u8>` build, or the trailing `from_utf8` re-validation.
     if !bytes.contains(&b'%') {
-        return Some(raw.to_owned());
+        return if has_dot_dot_segment(raw) { None } else { Some(raw.to_owned()) };
     }
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -1843,7 +1896,13 @@ fn percent_decode_path(raw: &str) -> Option<String> {
             i += 1;
         }
     }
-    String::from_utf8(out).ok()
+    let decoded = String::from_utf8(out).ok()?;
+    // `%2e%2e` decodes to `..`, so the dot-segment check has to run on the
+    // decoded form, not the raw one.
+    if has_dot_dot_segment(&decoded) {
+        return None;
+    }
+    Some(decoded)
 }
 
 fn hex_nibble(b: u8) -> Option<u8> {
@@ -2389,6 +2448,23 @@ fn build_php_response(
     }
 }
 
+/// Build the per-vhost `open_basedir` value: the site's document root plus
+/// the system temp directory.
+///
+/// PHP splits `open_basedir` on the platform's `PATH_SEPARATOR` — `:` on
+/// Unix, `;` on Windows. Hardcoding `:` produced a single bogus Windows
+/// entry (`C:\sites\blog:/tmp`) that matches no path, so every file access
+/// under a vhost was denied. `/tmp` is Unix-only for the same reason;
+/// `std::env::temp_dir()` is the portable equivalent and honours `TMPDIR`.
+///
+/// `ServerConfig::effective_open_basedir` defaults to `true` whenever
+/// `sites_dir` is set, so this value is what a default Windows vhost
+/// deployment runs with.
+fn vhost_open_basedir_value(document_root: &Path) -> String {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    format!("{}{separator}{}", document_root.display(), std::env::temp_dir().display())
+}
+
 /// Check if a filesystem path is a PHP file.
 fn is_php_file(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("php"))
@@ -2925,6 +3001,65 @@ mod tests {
         assert_eq!(percent_decode_path("/a%zz"), None);
     }
 
+    #[test]
+    fn percent_decode_rejects_dot_dot_segments() {
+        // Nothing downstream normalizes dot segments, and `has_hidden_segment`
+        // explicitly exempts `..`, so a literal `../` used to be joined
+        // straight onto the document root. Browsers normalize it away; a raw
+        // socket or `curl --path-as-is` does not.
+        assert_eq!(percent_decode_path("/../b/index.php"), None);
+        assert_eq!(percent_decode_path("/a/../../etc/passwd"), None);
+        assert_eq!(percent_decode_path("/a/.."), None);
+        // `%2e%2e` decodes to `..` — the check must run after decoding.
+        assert_eq!(percent_decode_path("/%2e%2e/b/index.php"), None);
+        // Backslash is a separator once the path is joined on Windows.
+        assert_eq!(percent_decode_path("/a\\..\\b"), None);
+        // `..` inside a segment is an ordinary filename, not a traversal.
+        assert_eq!(percent_decode_path("/a..b/c").as_deref(), Some("/a..b/c"));
+        assert_eq!(percent_decode_path("/...").as_deref(), Some("/..."));
+    }
+
+    // ── PHP document-root containment ────────────────────────────────
+
+    /// The PHP branch used to run `handle_php` on whatever
+    /// `doc_root.join(path)` produced, guarded only by `is_php_allowed`
+    /// (a URI prefix test). Under `sites_dir` vhosting that is cross-tenant
+    /// code execution.
+    #[test]
+    fn php_script_outside_document_root_is_rejected() {
+        let outer = tempfile::tempdir().unwrap();
+        let docroot = outer.path().join("site-a");
+        let sibling = outer.path().join("site-b");
+        std::fs::create_dir_all(&docroot).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(docroot.join("index.php"), "<?php echo 'a';").unwrap();
+        std::fs::write(sibling.join("index.php"), "<?php echo 'b';").unwrap();
+
+        let router = test_router(&docroot);
+
+        // Exactly what `probe_path` builds for `GET /../site-b/index.php`.
+        let escaped = docroot.join("../site-b/index.php");
+        assert!(escaped.is_file(), "traversal target must exist for this test to mean anything");
+        assert!(
+            !router.php_script_contained(&escaped, &docroot),
+            "a PHP script resolving outside the document root must not execute"
+        );
+
+        assert!(
+            router.php_script_contained(&docroot.join("index.php"), &docroot),
+            "a PHP script inside the document root must still execute"
+        );
+    }
+
+    #[test]
+    fn php_script_missing_file_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path());
+        // `canonicalize()` fails on a nonexistent path; treat that as
+        // "not contained" rather than trusting the unresolved join.
+        assert!(!router.php_script_contained(&dir.path().join("nope.php"), dir.path()));
+    }
+
     // ── port parsing ─────────────────────────────────────────────────
 
     #[test]
@@ -3236,6 +3371,34 @@ mod tests {
     fn has_hidden_segment_deep_nesting() {
         assert!(has_hidden_segment("/a/b/c/.secret/d"));
         assert!(!has_hidden_segment("/a/b/c/d/e"));
+    }
+
+    // ── per-vhost open_basedir ──────────────────────────────────────
+
+    /// PHP splits `open_basedir` on the platform `PATH_SEPARATOR`. The value
+    /// used to be `format!("{}:/tmp", document_root.display())`, so on
+    /// Windows — where the separator is `;` and the docroot itself contains
+    /// a drive-letter colon — a vhost got one bogus entry matching nothing
+    /// and every file access was denied.
+    #[test]
+    fn vhost_open_basedir_uses_platform_separator_and_real_temp_dir() {
+        let temp = std::env::temp_dir();
+        let root = temp.join("ephpm-basedir-test");
+        let value = vhost_open_basedir_value(&root);
+
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let parts: Vec<&str> = value.split(separator).collect();
+        assert_eq!(parts.len(), 2, "expected exactly docroot + temp dir, got {value}");
+        assert_eq!(
+            parts[0],
+            root.display().to_string(),
+            "the document root must survive verbatim (drive-letter colon included)"
+        );
+        assert_eq!(
+            parts[1],
+            temp.display().to_string(),
+            "the second entry must be the real temp dir, not a literal /tmp"
+        );
     }
 
     // ── is_php_file edge cases ──────────────────────────────────────
