@@ -286,15 +286,30 @@ async fn two_node_cdc_replicates_ddl_and_dml_end_to_end_via_channel() {
     session.execute("UPDATE posts SET title = 'HELLO' WHERE id = 1", &[]).await.unwrap();
     session.execute("DELETE FROM posts WHERE id = 2", &[]).await.unwrap();
 
+    // Gate on the terminal state, not the row count alone. The primary applies
+    // each statement as its own CDC batch, so `COUNT(*) == 1` is true at *two*
+    // points in the stream: once after `INSERT (1,'hello')` lands on its own,
+    // and again after the final `DELETE`. Polling on the count lets the gate
+    // fire on that first intermediate state, and the assertions below then race
+    // the UPDATE -- observed in CI as `left: Text("hello"), right: Text("HELLO")`
+    // with the whole test finishing in 1.6s, well inside the 10s timeout.
+    // Requiring the post-UPDATE title makes the predicate unambiguous.
     let converged = eventually_async(
         || {
             let rw = Arc::clone(&replica_wire);
-            async move { count_rows(&rw, "posts").await == 1 }
+            async move {
+                let Ok(rs) = rw.query("SELECT id, title FROM posts", &[]).await else {
+                    return false;
+                };
+                rs.rows.len() == 1
+                    && rs.rows[0][0] == Value::Integer(1)
+                    && rs.rows[0][1] == Value::Text("HELLO".into())
+            }
         },
         Duration::from_secs(10),
     )
     .await;
-    assert!(converged, "replica did not converge to 1 row after 10s");
+    assert!(converged, "replica did not converge to the terminal state after 10s");
 
     let rs = replica_wire.query("SELECT id, title FROM posts", &[]).await.unwrap();
     assert_eq!(rs.rows.len(), 1);
