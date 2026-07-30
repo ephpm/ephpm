@@ -519,24 +519,6 @@ fn exit_code_from(code: i32) -> ExitCode {
     if code == 0 { ExitCode::SUCCESS } else { ExitCode::from(u8::try_from(code).unwrap_or(1)) }
 }
 
-/// Removes a temp file when dropped. Used to clean up the generated
-/// php.ini we materialise from `[php] ini_overrides`.
-struct TempFileGuard {
-    path: PathBuf,
-}
-
-impl TempFileGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 /// Initialize PHP and start the HTTP server.
 ///
 /// PHP must be initialized BEFORE the tokio runtime is created. PHP's
@@ -669,7 +651,7 @@ fn run_with_config(
         || vhost_disable_shell
         || worker_mode;
 
-    let (effective_ini_path, _generated_ini_guard): (Option<PathBuf>, Option<TempFileGuard>) =
+    let (effective_ini_path, _generated_ini_guard): (Option<PathBuf>, Option<tempfile::TempDir>) =
         if want_generated_ini {
             use std::fmt::Write as _;
 
@@ -713,12 +695,53 @@ fn run_with_config(
                     "disable_functions=exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec"
                 );
             }
-            let temp_path =
-                std::env::temp_dir().join(format!("ephpm-{}-overrides.ini", std::process::id()));
-            std::fs::write(&temp_path, content).with_context(|| {
-                format!("failed to write generated php.ini at {}", temp_path.display())
-            })?;
-            (Some(temp_path.clone()), Some(TempFileGuard::new(temp_path)))
+            // This file inlines the operator's entire `[php] ini_file` plus
+            // every `ini_override`, and PHP reads it back during MINIT — as
+            // root on most deployments. A fixed, PID-derived name under a
+            // shared /tmp is attacker-reachable: `fs::write` follows symlinks
+            // and truncates, so a pre-planted symlink turns startup into an
+            // arbitrary-file truncation, and the window between the write and
+            // PHP's read is enough to swap in `extension=` or
+            // `auto_prepend_file=`.
+            //
+            // Same shape as the sqld binary extraction in `ephpm-sqld`:
+            // mkdtemp (O_EXCL, never a reused path), 0700, then `create_new`
+            // so the open still refuses to follow a symlink or clobber an
+            // existing file. The `TempDir` guard owns the cleanup and must
+            // outlive PHP's read, so it is what the caller holds on to.
+            use std::io::Write as _;
+
+            let dir = tempfile::Builder::new()
+                .prefix("ephpm-ini-")
+                .tempdir()
+                .context("failed to create a private temp dir for the generated php.ini")?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .context("failed to lock down the generated php.ini directory")?;
+            }
+
+            let temp_path = dir.path().join("overrides.ini");
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+                .context("failed to create the generated php.ini")?;
+            file.write_all(content.as_bytes()).context("failed to write the generated php.ini")?;
+            file.sync_all().context("failed to flush the generated php.ini")?;
+            drop(file);
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))
+                    .context("failed to lock down the generated php.ini")?;
+            }
+
+            tracing::debug!(path = %temp_path.display(), "wrote generated php.ini");
+            (Some(temp_path), Some(dir))
         } else {
             (config.php.ini_file.clone(), None)
         };
