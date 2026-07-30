@@ -45,8 +45,9 @@ fn main() {
         // tarball is a static-php-cli `--build-embed` build — no DLL). There
         // is no delay-loaded DLL to set up, and MSVC link.exe does not
         // support GNU ld's `--wrap`, so the zend_signal_* SIGPROF wrapping
-        // applied on Linux is a no-op here (ephpm enforces max_execution_time
-        // at the tokio layer, so PHP's SIGPROF handler should never fire).
+        // applied on Linux is a no-op here (ephpm bounds a request at the
+        // tokio layer via [server.timeouts] request and never sets PHP's
+        // max_execution_time, so PHP's SIGPROF handler should never fire).
         //
         // /FORCE:MULTIPLE: libintl_a and libiconv_a are both whole-archived
         // (see ephpm-php/build.rs::link_windows_static_deps) and each bundles
@@ -76,8 +77,8 @@ fn main() {
         // resolution order). It only matters if SIGPROF on tokio
         // worker threads ever fires — PHP installs the handler in
         // zend_signal_startup but typically only delivers it under
-        // max_execution_time, which ephpm enforces at the tokio layer
-        // instead and shouldn't trigger.
+        // max_execution_time, which ephpm never sets — it bounds a request
+        // at the tokio layer via [server.timeouts] request instead.
         println!("cargo::rustc-link-arg={}", lib_dir.join("libphp.a").display());
         for static_lib in macos_static_libs() {
             let archive = lib_dir.join(format!("lib{static_lib}.a"));

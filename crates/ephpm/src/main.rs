@@ -514,6 +514,64 @@ fn warn_if_runtime_extension_flag(args: &[String]) {
     }
 }
 
+/// Warn once at startup for every config knob that is parsed but not acted
+/// upon, so a silently-ignored setting can never look like it took effect.
+///
+/// Each field is compared against its own section's `Default`, so an untouched
+/// config stays quiet and only a deliberate override produces a line. Whenever
+/// one of these knobs gains a real implementation, delete its branch here and
+/// the matching "Planned: not yet implemented" doc comment in `ephpm-config`.
+fn warn_unimplemented_knobs(config: &ephpm_config::Config) {
+    let php_defaults = ephpm_config::PhpConfig::default();
+    if config.php.max_execution_time != php_defaults.max_execution_time {
+        tracing::warn!(
+            max_execution_time = config.php.max_execution_time,
+            request_timeout = config.server.timeouts.request,
+            "[php] max_execution_time is not enforced — the value is not \
+             written into the generated php.ini, and PHP's own SIGPROF-based \
+             timer is deliberately disabled because that handler crashes when \
+             the signal lands on a tokio worker thread. The per-request \
+             deadline actually in force is [server.timeouts] request."
+        );
+    }
+
+    let rw_defaults = ephpm_config::ReadWriteSplitConfig::default();
+    if config.db.read_write_split.strategy != rw_defaults.strategy {
+        tracing::warn!(
+            strategy = %config.db.read_write_split.strategy,
+            "[db.read_write_split] strategy is parsed but not acted upon — the \
+             proxy always behaves as \"{}\" (reads stick to the primary for \
+             sticky_duration after a write)",
+            rw_defaults.strategy
+        );
+    }
+    if config.db.read_write_split.max_replica_lag != rw_defaults.max_replica_lag {
+        tracing::warn!(
+            max_replica_lag = %config.db.read_write_split.max_replica_lag,
+            "[db.read_write_split] max_replica_lag is parsed but not acted \
+             upon — replica lag is never measured, so no replica is skipped"
+        );
+    }
+
+    let analysis_defaults = ephpm_config::DbAnalysisConfig::default();
+    if config.db.analysis.auto_explain != analysis_defaults.auto_explain {
+        tracing::warn!(
+            auto_explain = config.db.analysis.auto_explain,
+            "[db.analysis] auto_explain is parsed but not acted upon — slow \
+             queries are still logged via [db.analysis] slow_query_threshold, \
+             but EXPLAIN is never run"
+        );
+    }
+    if config.db.analysis.auto_explain_target != analysis_defaults.auto_explain_target {
+        tracing::warn!(
+            auto_explain_target = %config.db.analysis.auto_explain_target,
+            "[db.analysis] auto_explain_target is parsed but not acted upon — \
+             EXPLAIN analysis is not implemented, so nothing is written to any \
+             target"
+        );
+    }
+}
+
 /// Convert a PHP exit code (i32) to a Rust `ExitCode`.
 fn exit_code_from(code: i32) -> ExitCode {
     if code == 0 { ExitCode::SUCCESS } else { ExitCode::from(u8::try_from(code).unwrap_or(1)) }
@@ -630,6 +688,9 @@ fn run_with_config(
         document_root = %config.server.document_root.display(),
         "starting ePHPm"
     );
+
+    // Never let a parsed-but-unimplemented knob look like it took effect.
+    warn_unimplemented_knobs(&config);
 
     // Build the effective PHP ini file. If the user specified ini_overrides
     // in the config, we have to materialize them on disk and load them via

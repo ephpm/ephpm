@@ -1301,7 +1301,24 @@ impl Default for KvRedisCompatConfig {
 /// PHP runtime configuration.
 #[derive(Debug, Deserialize)]
 pub struct PhpConfig {
-    /// Maximum execution time in seconds for a single PHP request.
+    /// Planned: not yet implemented — parsed but not acted upon.
+    ///
+    /// Nothing reads this field. It is **not** written into the generated
+    /// php.ini either: that file carries only `extension=` lines, the
+    /// `ini_file` body, the autotuned opcache/engine lines, `ini_overrides`,
+    /// and `disable_functions`.
+    ///
+    /// Emitting it would not help. PHP enforces `max_execution_time` with a
+    /// `SIGPROF` timer whose handler ePHPm deliberately neutralizes on Linux
+    /// (`crates/ephpm/build.rs` `--wrap`s `zend_signal_*` to no-ops, because
+    /// the signal lands on whichever thread is running and dereferences NULL
+    /// on a tokio worker). So the directive would be advisory at best.
+    ///
+    /// The per-request deadline that *is* enforced is
+    /// `[server.timeouts] request` (default `300` seconds), applied at the
+    /// HTTP layer. Setting this knob logs a warning at startup.
+    ///
+    /// Default: `30`.
     #[serde(default = "default_max_execution_time")]
     pub max_execution_time: u32,
 
