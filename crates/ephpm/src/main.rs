@@ -108,6 +108,20 @@ enum Commands {
         #[arg(long, default_value_t = 6379u16)]
         port: u16,
 
+        /// Password sent as RESP AUTH before the first command. Needed
+        /// whenever the server sets [kv.redis_compat] password or [kv] secret
+        /// — without it every command is refused with NOAUTH. Falls back to
+        /// the EPHPM_KV_PASSWORD environment variable.
+        #[arg(long)]
+        password: Option<String>,
+
+        /// First argument of the two-argument AUTH <user> <password> form.
+        /// Under per-site HMAC auth ([kv] secret with [server] sites_dir) this
+        /// is the vhost hostname, and the connection is scoped to that vhost's
+        /// store. Requires --password.
+        #[arg(long)]
+        user: Option<String>,
+
         #[command(subcommand)]
         subcommand: KvSubcommand,
     },
@@ -170,6 +184,12 @@ enum Commands {
         /// RESP server port (default: 6379)
         #[arg(long, default_value_t = 6379u16)]
         port: u16,
+
+        /// Password sent as RESP AUTH before the first command. Needed
+        /// whenever the server sets [kv.redis_compat] password. Falls back to
+        /// the EPHPM_KV_PASSWORD environment variable.
+        #[arg(long)]
+        password: Option<String>,
     },
 
     /// Cache management subcommands (OPcache introspection and local reset).
@@ -181,6 +201,12 @@ enum Commands {
         /// RESP server port (default: 6379)
         #[arg(long, default_value_t = 6379u16)]
         port: u16,
+
+        /// Password sent as RESP AUTH before the first command. Needed
+        /// whenever the server sets [kv.redis_compat] password. Falls back to
+        /// the EPHPM_KV_PASSWORD environment variable.
+        #[arg(long)]
+        password: Option<String>,
 
         #[command(subcommand)]
         subcommand: CacheSubcommand,
@@ -263,17 +289,20 @@ fn run() -> anyhow::Result<ExitCode> {
 
     match cli.command {
         Some(Commands::Php { args }) => run_php(&args),
-        Some(Commands::Kv { host, port, subcommand }) => {
+        Some(Commands::Kv { host, port, password, user, subcommand }) => {
+            let auth = KvAuth::resolve(user, password)?;
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-            rt.block_on(run_kv(&host, port, subcommand))
+            rt.block_on(run_kv(&host, port, &auth, subcommand))
         }
-        Some(Commands::Deploy { site, all, rev, host, port }) => {
+        Some(Commands::Deploy { site, all, rev, host, port, password }) => {
+            let auth = KvAuth::resolve(None, password)?;
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-            rt.block_on(run_deploy(&host, port, site.as_deref(), all, rev.as_deref()))
+            rt.block_on(run_deploy(&host, port, &auth, site.as_deref(), all, rev.as_deref()))
         }
-        Some(Commands::Cache { host, port, subcommand }) => {
+        Some(Commands::Cache { host, port, password, subcommand }) => {
+            let auth = KvAuth::resolve(None, password)?;
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
-            rt.block_on(run_cache(&host, port, subcommand))
+            rt.block_on(run_cache(&host, port, &auth, subcommand))
         }
         Some(Commands::Install) => run_service_cmd(service::install),
         Some(Commands::Uninstall { keep_data }) => {
@@ -884,27 +913,110 @@ fn load_serve_config(command: Option<Commands>) -> anyhow::Result<(ephpm_config:
 // KV Store CLI Subcommands
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Dispatcher for all KV subcommands.
-async fn run_kv(host: &str, port: u16, sub: KvSubcommand) -> anyhow::Result<ExitCode> {
-    match sub {
-        KvSubcommand::Ping => kv_ping(host, port).await,
-        KvSubcommand::Keys { pattern } => kv_keys(host, port, &pattern).await,
-        KvSubcommand::Get { key } => kv_get(host, port, &key).await,
-        KvSubcommand::Set { key, value, ttl } => kv_set(host, port, &key, &value, ttl).await,
-        KvSubcommand::Del { keys } => kv_del(host, port, &keys).await,
-        KvSubcommand::Incr { key, by } => kv_incr(host, port, &key, by).await,
-        KvSubcommand::Ttl { key } => kv_ttl(host, port, &key).await,
+/// RESP credentials used for the CLI's short-lived connections.
+///
+/// The server turns `AUTH` on when either `[kv.redis_compat] password` or
+/// `[kv] secret` is set, and until a connection authenticates it answers every
+/// command except `AUTH` and `QUIT` with `-NOAUTH Authentication required`.
+/// There are two server-side modes:
+///
+/// - **Legacy single password** (`[kv.redis_compat] password`) — satisfied by
+///   `--password` alone, which sends `AUTH <password>`.
+/// - **Per-site HMAC** (`[kv] secret` together with `[server] sites_dir`) — the
+///   server expects `AUTH <hostname> <HMAC-SHA256(secret, hostname)>` and
+///   scopes the connection to that vhost's store. Satisfied by
+///   `--user <hostname> --password <derived>`; the derived value is exactly
+///   what ePHPm injects into PHP as `EPHPM_REDIS_PASSWORD`. Note that
+///   `deploy` / `cache reset` write keys the server reads from the *default*
+///   store, which a site-scoped connection cannot reach — those two commands
+///   only work under legacy-password mode.
+#[derive(Debug, Clone)]
+struct KvAuth {
+    /// First `AUTH` argument — the vhost hostname under per-site HMAC auth.
+    user: Option<String>,
+    /// The password. `None` means send no `AUTH` command at all.
+    password: Option<String>,
+}
+
+impl KvAuth {
+    /// Resolve credentials from the CLI flags, falling back to the
+    /// `EPHPM_KV_PASSWORD` environment variable when `--password` is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `--user` is given with no password, since the
+    /// two-argument `AUTH` form cannot be built from a username alone.
+    fn resolve(user: Option<String>, password: Option<String>) -> anyhow::Result<Self> {
+        let password =
+            password.or_else(|| std::env::var("EPHPM_KV_PASSWORD").ok()).filter(|p| !p.is_empty());
+        if user.is_some() && password.is_none() {
+            anyhow::bail!(
+                "--user requires a password — pass --password, or set the \
+                 EPHPM_KV_PASSWORD environment variable"
+            );
+        }
+        Ok(Self { user, password })
+    }
+
+    /// The `AUTH` frame to send before the first command, or `None` when no
+    /// credentials were supplied.
+    fn frame(&self) -> Option<Frame> {
+        let password = self.password.as_ref()?;
+        let mut args = vec![Frame::bulk(b"AUTH".to_vec())];
+        if let Some(user) = &self.user {
+            args.push(Frame::bulk(user.as_bytes().to_vec()));
+        }
+        args.push(Frame::bulk(password.as_bytes().to_vec()));
+        Some(Frame::Array(args))
     }
 }
 
-/// TCP connection helper.
-async fn kv_connect(host: &str, port: u16) -> anyhow::Result<TcpStream> {
+/// Dispatcher for all KV subcommands.
+async fn run_kv(
+    host: &str,
+    port: u16,
+    auth: &KvAuth,
+    sub: KvSubcommand,
+) -> anyhow::Result<ExitCode> {
+    match sub {
+        KvSubcommand::Ping => kv_ping(host, port, auth).await,
+        KvSubcommand::Keys { pattern } => kv_keys(host, port, auth, &pattern).await,
+        KvSubcommand::Get { key } => kv_get(host, port, auth, &key).await,
+        KvSubcommand::Set { key, value, ttl } => kv_set(host, port, auth, &key, &value, ttl).await,
+        KvSubcommand::Del { keys } => kv_del(host, port, auth, &keys).await,
+        KvSubcommand::Incr { key, by } => kv_incr(host, port, auth, &key, by).await,
+        KvSubcommand::Ttl { key } => kv_ttl(host, port, auth, &key).await,
+    }
+}
+
+/// TCP connection helper. Authenticates before returning, so every caller
+/// gets a stream that is ready for real commands.
+async fn kv_connect(host: &str, port: u16, auth: &KvAuth) -> anyhow::Result<TcpStream> {
     let addr: std::net::SocketAddr = format!("{host}:{port}")
         .parse()
         .with_context(|| format!("invalid address: {host}:{port}"))?;
-    TcpStream::connect(addr)
+    let mut stream = TcpStream::connect(addr)
         .await
-        .with_context(|| format!("could not connect to KV server at {host}:{port}"))
+        .with_context(|| format!("could not connect to KV server at {host}:{port}"))?;
+    kv_authenticate(&mut stream, auth).await?;
+    Ok(stream)
+}
+
+/// Send `AUTH` and check the reply.
+///
+/// A no-op when no password was supplied: the server only demands `AUTH` when
+/// it is configured with credentials, and sending one unprompted is harmless
+/// but pointless.
+async fn kv_authenticate(stream: &mut TcpStream, auth: &KvAuth) -> anyhow::Result<()> {
+    let Some(frame) = auth.frame() else {
+        return Ok(());
+    };
+    kv_send(stream, &frame).await?;
+    match kv_recv(stream).await? {
+        Frame::Simple(_) => Ok(()),
+        Frame::Error(e) => anyhow::bail!("KV authentication failed: {e}"),
+        other => anyhow::bail!("unexpected AUTH response: {other}"),
+    }
 }
 
 /// Send a RESP frame to the server.
@@ -929,16 +1041,16 @@ async fn kv_recv(stream: &mut TcpStream) -> anyhow::Result<Frame> {
 }
 
 /// Send a command and receive the response in one connection.
-async fn kv_roundtrip(host: &str, port: u16, cmd: Frame) -> anyhow::Result<Frame> {
-    let mut stream = kv_connect(host, port).await?;
+async fn kv_roundtrip(host: &str, port: u16, auth: &KvAuth, cmd: Frame) -> anyhow::Result<Frame> {
+    let mut stream = kv_connect(host, port, auth).await?;
     kv_send(&mut stream, &cmd).await?;
     kv_recv(&mut stream).await
 }
 
 /// PING command.
-async fn kv_ping(host: &str, port: u16) -> anyhow::Result<ExitCode> {
+async fn kv_ping(host: &str, port: u16, auth: &KvAuth) -> anyhow::Result<ExitCode> {
     let cmd = Frame::Array(vec![Frame::bulk(b"PING".to_vec())]);
-    match kv_roundtrip(host, port, cmd).await? {
+    match kv_roundtrip(host, port, auth, cmd).await? {
         Frame::Simple(s) => {
             println!("{s}");
             Ok(ExitCode::SUCCESS)
@@ -952,10 +1064,10 @@ async fn kv_ping(host: &str, port: u16) -> anyhow::Result<ExitCode> {
 }
 
 /// KEYS command.
-async fn kv_keys(host: &str, port: u16, pattern: &str) -> anyhow::Result<ExitCode> {
+async fn kv_keys(host: &str, port: u16, auth: &KvAuth, pattern: &str) -> anyhow::Result<ExitCode> {
     let cmd =
         Frame::Array(vec![Frame::bulk(b"KEYS".to_vec()), Frame::bulk(pattern.as_bytes().to_vec())]);
-    match kv_roundtrip(host, port, cmd).await? {
+    match kv_roundtrip(host, port, auth, cmd).await? {
         Frame::Array(items) => {
             if items.is_empty() {
                 println!("(empty)");
@@ -978,10 +1090,10 @@ async fn kv_keys(host: &str, port: u16, pattern: &str) -> anyhow::Result<ExitCod
 }
 
 /// GET command.
-async fn kv_get(host: &str, port: u16, key: &str) -> anyhow::Result<ExitCode> {
+async fn kv_get(host: &str, port: u16, auth: &KvAuth, key: &str) -> anyhow::Result<ExitCode> {
     let cmd =
         Frame::Array(vec![Frame::bulk(b"GET".to_vec()), Frame::bulk(key.as_bytes().to_vec())]);
-    match kv_roundtrip(host, port, cmd).await? {
+    match kv_roundtrip(host, port, auth, cmd).await? {
         Frame::Bulk(data) => {
             match std::str::from_utf8(&data) {
                 Ok(s) => println!("{s}"),
@@ -1005,6 +1117,7 @@ async fn kv_get(host: &str, port: u16, key: &str) -> anyhow::Result<ExitCode> {
 async fn kv_set(
     host: &str,
     port: u16,
+    auth: &KvAuth,
     key: &str,
     value: &str,
     ttl: Option<u64>,
@@ -1019,7 +1132,7 @@ async fn kv_set(
         args.push(Frame::bulk(secs.to_string().into_bytes()));
     }
     let cmd = Frame::Array(args);
-    match kv_roundtrip(host, port, cmd).await? {
+    match kv_roundtrip(host, port, auth, cmd).await? {
         Frame::Simple(s) => {
             println!("{s}");
             Ok(ExitCode::SUCCESS)
@@ -1037,13 +1150,13 @@ async fn kv_set(
 }
 
 /// DEL command.
-async fn kv_del(host: &str, port: u16, keys: &[String]) -> anyhow::Result<ExitCode> {
+async fn kv_del(host: &str, port: u16, auth: &KvAuth, keys: &[String]) -> anyhow::Result<ExitCode> {
     let mut args = vec![Frame::bulk(b"DEL".to_vec())];
     for key in keys {
         args.push(Frame::bulk(key.as_bytes().to_vec()));
     }
     let cmd = Frame::Array(args);
-    match kv_roundtrip(host, port, cmd).await? {
+    match kv_roundtrip(host, port, auth, cmd).await? {
         Frame::Integer(n) => {
             println!("(integer) {n}");
             Ok(ExitCode::SUCCESS)
@@ -1057,7 +1170,13 @@ async fn kv_del(host: &str, port: u16, keys: &[String]) -> anyhow::Result<ExitCo
 }
 
 /// INCR command.
-async fn kv_incr(host: &str, port: u16, key: &str, by: i64) -> anyhow::Result<ExitCode> {
+async fn kv_incr(
+    host: &str,
+    port: u16,
+    auth: &KvAuth,
+    key: &str,
+    by: i64,
+) -> anyhow::Result<ExitCode> {
     let cmd = if by == 1 {
         Frame::Array(vec![Frame::bulk(b"INCR".to_vec()), Frame::bulk(key.as_bytes().to_vec())])
     } else {
@@ -1067,7 +1186,7 @@ async fn kv_incr(host: &str, port: u16, key: &str, by: i64) -> anyhow::Result<Ex
             Frame::bulk(by.to_string().into_bytes()),
         ])
     };
-    match kv_roundtrip(host, port, cmd).await? {
+    match kv_roundtrip(host, port, auth, cmd).await? {
         Frame::Integer(n) => {
             println!("(integer) {n}");
             Ok(ExitCode::SUCCESS)
@@ -1081,8 +1200,8 @@ async fn kv_incr(host: &str, port: u16, key: &str, by: i64) -> anyhow::Result<Ex
 }
 
 /// TTL command.
-async fn kv_ttl(host: &str, port: u16, key: &str) -> anyhow::Result<ExitCode> {
-    let mut stream = kv_connect(host, port).await?;
+async fn kv_ttl(host: &str, port: u16, auth: &KvAuth, key: &str) -> anyhow::Result<ExitCode> {
+    let mut stream = kv_connect(host, port, auth).await?;
 
     // Send TTL
     kv_send(
@@ -1156,11 +1275,18 @@ fn resp_connect_hint(host: &str, port: u16) -> String {
 }
 
 /// Issue a RESP `SET key value` roundtrip, returning `Ok` on `+OK`.
-async fn kv_set_raw(host: &str, port: u16, key: &str, value: &str) -> anyhow::Result<()> {
+async fn kv_set_raw(
+    host: &str,
+    port: u16,
+    auth: &KvAuth,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
     let stream = TcpStream::connect(format!("{host}:{port}"))
         .await
         .with_context(|| resp_connect_hint(host, port))?;
     let mut stream = stream;
+    kv_authenticate(&mut stream, auth).await?;
     let cmd = Frame::Array(vec![
         Frame::bulk(b"SET".to_vec()),
         Frame::bulk(key.as_bytes().to_vec()),
@@ -1169,6 +1295,10 @@ async fn kv_set_raw(host: &str, port: u16, key: &str, value: &str) -> anyhow::Re
     kv_send(&mut stream, &cmd).await?;
     match kv_recv(&mut stream).await? {
         Frame::Simple(_) => Ok(()),
+        Frame::Error(e) if e.starts_with("NOAUTH") => anyhow::bail!(
+            "KV server requires authentication ({e}) — pass --password or set \
+             EPHPM_KV_PASSWORD to the value of [kv.redis_compat] password"
+        ),
         Frame::Error(e) => anyhow::bail!("KV server returned error: {e}"),
         other => anyhow::bail!("unexpected RESP response: {other}"),
     }
@@ -1179,6 +1309,7 @@ async fn kv_set_raw(host: &str, port: u16, key: &str, value: &str) -> anyhow::Re
 async fn run_deploy(
     host: &str,
     port: u16,
+    auth: &KvAuth,
     site: Option<&str>,
     all: bool,
     rev: Option<&str>,
@@ -1187,10 +1318,10 @@ async fn run_deploy(
     let stamp = epoch_ms();
     let stamp_str = stamp.to_string();
     let version_key = format!("{OPCACHE_VERSION_PREFIX}{vhost}");
-    kv_set_raw(host, port, &version_key, &stamp_str).await?;
+    kv_set_raw(host, port, auth, &version_key, &stamp_str).await?;
     if let Some(revision) = rev {
         let rev_key = format!("{OPCACHE_REVISION_PREFIX}{vhost}");
-        kv_set_raw(host, port, &rev_key, revision).await?;
+        kv_set_raw(host, port, auth, &rev_key, revision).await?;
     }
     if vhost == OPCACHE_BROADCAST_VHOST {
         println!("deployed: broadcast (every vhost) at {stamp_str}");
@@ -1204,10 +1335,15 @@ async fn run_deploy(
 }
 
 /// `ephpm cache reset` / `ephpm cache status` dispatcher.
-async fn run_cache(host: &str, port: u16, sub: CacheSubcommand) -> anyhow::Result<ExitCode> {
+async fn run_cache(
+    host: &str,
+    port: u16,
+    auth: &KvAuth,
+    sub: CacheSubcommand,
+) -> anyhow::Result<ExitCode> {
     match sub {
         CacheSubcommand::Reset { site, all } => {
-            run_cache_reset(host, port, site.as_deref(), all).await
+            run_cache_reset(host, port, auth, site.as_deref(), all).await
         }
     }
 }
@@ -1223,6 +1359,7 @@ async fn run_cache(host: &str, port: u16, sub: CacheSubcommand) -> anyhow::Resul
 async fn run_cache_reset(
     host: &str,
     port: u16,
+    auth: &KvAuth,
     site: Option<&str>,
     all: bool,
 ) -> anyhow::Result<ExitCode> {
@@ -1230,7 +1367,7 @@ async fn run_cache_reset(
     let stamp = epoch_ms();
     let stamp_str = stamp.to_string();
     let key = format!("{OPCACHE_VERSION_PREFIX}{vhost}");
-    kv_set_raw(host, port, &key, &stamp_str).await?;
+    kv_set_raw(host, port, auth, &key, &stamp_str).await?;
     if vhost == OPCACHE_BROADCAST_VHOST {
         println!("cache reset: broadcast (every vhost) at {stamp_str}");
     } else {
@@ -1372,6 +1509,84 @@ mod cli_tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_kv_password_flag() {
+        // Parent-level flags come before the subcommand, same as --host/--port.
+        let args = ["ephpm", "kv", "--password", "s3cr3t", "ping"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Some(Commands::Kv { password, user, .. }) => {
+                assert_eq!(password.as_deref(), Some("s3cr3t"));
+                assert_eq!(user, None);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_kv_user_flag() {
+        let args = ["ephpm", "kv", "--user", "blog", "--password", "pw", "ping"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Some(Commands::Kv { user, .. }) => assert_eq!(user.as_deref(), Some("blog")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_deploy_password_flag() {
+        let args = ["ephpm", "deploy", "--all", "--password", "pw"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Some(Commands::Deploy { password, .. }) => assert_eq!(password.as_deref(), Some("pw")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_cache_password_flag() {
+        let args = ["ephpm", "cache", "--password", "pw", "reset", "--all"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Some(Commands::Cache { password, .. }) => assert_eq!(password.as_deref(), Some("pw")),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn kv_auth_without_credentials_sends_no_auth_frame() {
+        let auth = KvAuth { user: None, password: None };
+        assert!(auth.frame().is_none());
+    }
+
+    #[test]
+    fn kv_auth_password_only_uses_single_argument_form() {
+        let auth = KvAuth::resolve(None, Some("pw".to_string())).unwrap();
+        let want = Frame::Array(vec![Frame::bulk("AUTH"), Frame::bulk("pw")]);
+        assert_eq!(auth.frame(), Some(want));
+    }
+
+    #[test]
+    fn kv_auth_with_user_uses_two_argument_form() {
+        // What the server's per-site HMAC mode expects on the wire:
+        // AUTH <hostname> <HMAC-SHA256(secret, hostname)>.
+        let auth = KvAuth::resolve(Some("h".to_string()), Some("p".to_string())).unwrap();
+        let want = Frame::Array(vec![Frame::bulk("AUTH"), Frame::bulk("h"), Frame::bulk("p")]);
+        assert_eq!(auth.frame(), Some(want));
+    }
+
+    #[test]
+    fn kv_auth_rejects_user_without_password() {
+        let err = KvAuth::resolve(Some("h".to_string()), None).unwrap_err();
+        assert!(err.to_string().contains("--user requires a password"), "got: {err}");
+    }
+
+    #[test]
+    fn kv_auth_ignores_an_empty_password() {
+        let auth = KvAuth::resolve(None, Some(String::new())).unwrap();
+        assert!(auth.frame().is_none());
     }
 
     #[test]

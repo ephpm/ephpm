@@ -15,9 +15,9 @@ This is the Phase-1 OPcache clustering interface. See the
 ## Synopsis
 
 ```bash
-ephpm deploy --site <NAME> [--rev SHA] [--host HOST] [--port PORT]
-ephpm deploy --all           [--rev SHA] [--host HOST] [--port PORT]
-ephpm deploy                 [--rev SHA] [--host HOST] [--port PORT]
+ephpm deploy --site <NAME> [--rev SHA] [--host HOST] [--port PORT] [--password PW]
+ephpm deploy --all           [--rev SHA] [--host HOST] [--port PORT] [--password PW]
+ephpm deploy                 [--rev SHA] [--host HOST] [--port PORT] [--password PW]
 ```
 
 | Flag | Default | Purpose |
@@ -27,6 +27,7 @@ ephpm deploy                 [--rev SHA] [--host HOST] [--port PORT]
 | `--rev` | (none) | Optional revision tag (e.g. a git SHA). Recorded at `opcache:revision:<vhost>` for observability; does not itself trigger invalidation. |
 | `--host` | `127.0.0.1` | RESP server host |
 | `--port` | `6379` | RESP server port |
+| `--password` | `$EPHPM_KV_PASSWORD` | Password sent as RESP `AUTH` before the write. Required when the server sets `[kv.redis_compat] password`. See [`ephpm kv`](/reference/cli/kv/#authentication) for the two auth modes and the per-site HMAC limitation. |
 
 Neither `--site` nor `--all` means "the default vhost" (`_default`),
 which is what a single-node deployment with no `sites_dir` uses.

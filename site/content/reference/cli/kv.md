@@ -8,15 +8,42 @@ Inspect or manipulate the KV store on a running ePHPm server. Speaks the RESP2 p
 ## Synopsis
 
 ```bash
-ephpm kv [--host HOST] [--port PORT] <subcommand> [args]
+ephpm kv [--host HOST] [--port PORT] [--password PW] [--user NAME] <subcommand> [args]
 ```
 
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--host` | `127.0.0.1` | KV server host |
 | `--port` | `6379` | KV server port |
+| `--password` | `$EPHPM_KV_PASSWORD` | Password sent as RESP `AUTH` before the first command |
+| `--user` | (none) | First argument of the two-argument `AUTH <user> <password>` form. Requires `--password`. |
+
+Like `--host` and `--port`, these are flags of `ephpm kv` itself, so they go **before** the subcommand.
 
 The server must be configured with `[kv.redis_compat] enabled = true` for these commands to connect.
+
+## Authentication
+
+The RESP listener requires `AUTH` as soon as either `[kv.redis_compat] password` or `[kv] secret` is set — until a connection authenticates, every command except `AUTH` and `QUIT` is answered with `-NOAUTH Authentication required`. There are two server-side modes:
+
+**Single password** (`[kv.redis_compat] password`) — pass `--password`, or set `EPHPM_KV_PASSWORD` and leave the flag off:
+
+```bash
+ephpm kv --password "$KV_PASSWORD" keys '*'
+
+export EPHPM_KV_PASSWORD=...
+ephpm kv keys '*'
+```
+
+**Per-site HMAC** (`[kv] secret` together with `[server] sites_dir`) — the server expects `AUTH <hostname> <HMAC-SHA256(secret, hostname)>` and scopes the connection to that vhost's store. The derived password is the same value ePHPm injects into PHP as `EPHPM_REDIS_PASSWORD`, so pass it with `--user`:
+
+```bash
+ephpm kv --user blog.example.com --password "$DERIVED" keys '*'
+```
+
+The CLI does not derive that value itself — it never reads `[kv] secret`.
+
+**Limitation:** `ephpm deploy` and `ephpm cache reset` accept `--password` but not `--user`. They write `opcache:version:*`, which the server's OPcache watcher reads from the *default* store, and a site-scoped HMAC connection can only reach one vhost's store. Under per-site HMAC auth there is currently no CLI route to those keys.
 
 ## Subcommands
 
@@ -98,6 +125,9 @@ ephpm kv keys 'session:*' | xargs -r ephpm kv del
 
 # Connect to a remote instance
 ephpm kv --host 10.0.1.5 --port 6379 keys '*'
+
+# Connect to a password-protected listener
+ephpm kv --host 10.0.1.5 --password "$KV_PASSWORD" keys '*'
 ```
 
 ## See also
