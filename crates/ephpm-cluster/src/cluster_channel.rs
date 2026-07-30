@@ -30,40 +30,66 @@
 //! [`maybe_start`] with the resolved flags; if none are set the
 //! function returns `Ok(None)` without touching the network.
 //!
-//! # Handshake
+//! # Handshake (v2 — mutual challenge/response)
 //!
 //! Both sides derive `ClusterCipher::for_cluster_channel(secret)`
-//! (distinct HKDF domain from gossip / KV data plane). The initiator
-//! writes:
+//! (distinct HKDF domain from gossip / KV data plane) and use it *only*
+//! to seal the three handshake messages:
 //!
 //! ```text
-//!   [version: u8 = 0x01]
-//!   [sealed_challenge_len: u16 BE]
-//!   [sealed_challenge]         // seal(random 32-byte nonce)
+//!   I → R  [version: u8 = 0x02][len: u16 BE][seal(C_i)]
+//!   R → I  [version: u8 = 0x02][len: u16 BE][seal(C_i || C_r)]
+//!   I → R                     [len: u16 BE][seal(C_r)]
 //! ```
 //!
-//! The responder opens the challenge (proves possession of the secret),
-//! re-seals the *same* nonce with a fresh AEAD nonce, and writes it
-//! back with a version-byte prefix. The initiator verifies the
-//! recovered nonce equals what it sent. Either side dropping on any
-//! failure is the "wrong secret" signal; there is deliberately no
-//! typed error reply, so a wrong-secret peer looks identical to a
-//! stray TCP scanner.
+//! `C_i` and `C_r` are fresh 32-byte `OsRng` challenges chosen by the
+//! initiator and the responder respectively. Message 2 proves the
+//! responder holds the secret *and* contributes freshness; message 3
+//! proves the initiator holds the secret and is not replaying a
+//! recording. Both comparisons are constant-time.
 //!
-//! **TLS is Phase 2.1** — the channel today is authenticated with
-//! ChaCha20-Poly1305 (same primitive as gossip / KV data plane) but
-//! not TLS-wrapped. The framing is symmetric-key sealed end-to-end,
-//! so eavesdroppers see ciphertext, but there is no PKI-based peer
-//! identity beyond "holds the shared cluster secret".
+//! Replaying a captured message 1 gets the attacker a message 2 sealing
+//! a challenge they cannot open, so they cannot produce message 3 —
+//! the responder drops them. Every side dropping silently on failure is
+//! the "wrong secret" signal; there is deliberately no typed error
+//! reply, so a wrong-secret peer looks identical to a stray TCP
+//! scanner.
+//!
+//! # Post-handshake confidentiality
+//!
+//! Both sides then derive a **per-connection** key from the operator
+//! secret salted with the transcript `C_i || C_r`
+//! ([`ClusterCipher::for_cluster_channel_session`]) and wrap the TCP
+//! stream in a sealing adapter: every byte the multiplexer writes is
+//! sealed into a length-prefixed ChaCha20-Poly1305 frame, and every
+//! frame is opened (authenticated) on read. This mirrors what
+//! [`crate::kv_data_plane`] does for its request/response messages, so
+//! an eavesdropper on the channel sees ciphertext only, and a
+//! man-in-the-middle cannot splice frames between connections (the
+//! keys differ per connection).
+//!
+//! **There is still no TLS and no PKI peer identity** beyond "holds the
+//! shared cluster secret" plus a coarse gossip-membership check on the
+//! peer IP (see [`maybe_start`]). Certificate-based identity is future
+//! work.
 //!
 //! # Multiplexing
 //!
-//! After the handshake, both sides speak `yamux 0.14` over the raw
-//! (post-handshake) TCP stream. Each yamux stream begins with a
-//! length-prefixed UTF-8 stream-type string from
-//! [`stream_type`]: `cdc/<vhost>` (implemented), `snapshot/<vhost>`
-//! (RESERVED — refused with a logged warning today). Unknown stream
-//! types are logged and closed.
+//! After the handshake, both sides speak `yamux 0.14` over the sealed
+//! stream. Each yamux stream begins with a length-prefixed UTF-8
+//! stream-type string from [`stream_type`]: `cdc/<vhost>` and
+//! `snapshot/<vhost>` are both implemented (the CDC replication path
+//! registers handlers for them). Unknown stream types are logged and
+//! closed.
+//!
+//! # Denial-of-service bounds
+//!
+//! Pre-authentication work is bounded: at most
+//! `MAX_INFLIGHT_HANDSHAKES` handshakes run concurrently (further
+//! connections are dropped immediately rather than queued), and each
+//! one must finish inside `HANDSHAKE_TIMEOUT`. Post-handshake, yamux
+//! is configured with at most `MAX_STREAMS_PER_CONNECTION` concurrent
+//! streams per connection.
 //!
 //! Backpressure is yamux's native per-stream flow-control window
 //! (256 KiB per stream by default). A stalled reader blocks new writes
@@ -76,25 +102,32 @@
 //! subscriber and forces a reconnect).
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use ephpm_config::ClusterChannelConfig;
 use futures::io::{AsyncRead as FuturesAsyncRead, AsyncWrite as FuturesAsyncWrite};
 use parking_lot::Mutex;
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 use crate::ClusterHandle;
 use crate::secure_transport::ClusterCipher;
 
 /// Handshake protocol version byte. Bump on wire-format change.
-const HANDSHAKE_VERSION: u8 = 0x01;
+///
+/// `0x02` is the mutual challenge/response handshake with a
+/// per-connection session key. `0x01` (initiator-only challenge, no
+/// session key, plaintext payload afterwards) was replayable and is
+/// **not** accepted — an old peer looks like a wrong-secret peer.
+const HANDSHAKE_VERSION: u8 = 0x02;
 
 /// Challenge nonce length in bytes. The *plaintext* random challenge
 /// that gets sealed — the AEAD nonce is a separate 12-byte value
@@ -102,9 +135,10 @@ const HANDSHAKE_VERSION: u8 = 0x01;
 const CHALLENGE_LEN: usize = 32;
 
 /// Cap on the sealed handshake message length to bound the initial
-/// read. `SEAL_OVERHEAD + CHALLENGE_LEN` is 60 bytes; the cap leaves
-/// headroom for a future handshake extension without a version bump
-/// while still rejecting garbage.
+/// read. The largest handshake message seals `2 * CHALLENGE_LEN` bytes
+/// (92 with `SEAL_OVERHEAD`); the cap leaves headroom for a future
+/// handshake extension without a version bump while still rejecting
+/// garbage.
 const MAX_HANDSHAKE_LEN: u16 = 256;
 
 /// Cap on the stream-type string a peer may send when opening a stream.
@@ -112,6 +146,38 @@ const MAX_HANDSHAKE_LEN: u16 = 256;
 /// and refusing anything longer keeps a malicious peer from wasting
 /// memory before we recognize the type.
 const MAX_STREAM_TYPE_LEN: u16 = 128;
+
+/// Wall-clock budget for one inbound handshake, from the first byte to
+/// the last. Without this an attacker can pin a task and a file
+/// descriptor indefinitely by connecting and never writing.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many inbound handshakes may run concurrently. Connections that
+/// arrive while the budget is exhausted are closed immediately rather
+/// than queued — queueing would just move the unbounded growth from
+/// tasks to the accept backlog.
+const MAX_INFLIGHT_HANDSHAKES: usize = 64;
+
+/// Concurrent yamux streams allowed per connection (yamux's own default
+/// is 512). Every cluster feature today needs one stream per peer, so
+/// this is generous while still bounding how many handler tasks and
+/// 256 KiB flow-control windows one authenticated peer can force us to
+/// allocate.
+const MAX_STREAMS_PER_CONNECTION: usize = 64;
+
+/// Maximum sealed frame length accepted on the post-handshake stream.
+/// yamux writes at most a 16 KiB payload per call (its default
+/// `split_send_size`), so 1 MiB is far above anything the multiplexer
+/// produces and well under an allocation worth worrying about.
+const MAX_SEALED_FRAME_LEN: usize = 1024 * 1024;
+
+/// Largest plaintext run sealed into a single frame on write. Bounds
+/// the per-frame buffer on both sides regardless of what the
+/// multiplexer hands us in one `poll_write`.
+const MAX_SEALED_PLAINTEXT_LEN: usize = 64 * 1024;
+
+/// Length of the sealed-frame length prefix, in bytes.
+const SEALED_LEN_PREFIX: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Feature registry — the "lazy bind" contract.
@@ -160,11 +226,15 @@ pub mod stream_type {
     /// vhost) is what selects the handler on the accepting side.
     pub const CDC_PREFIX: &str = "cdc/";
 
-    /// Snapshot bootstrap stream — RESERVED for Phase 2.1.
+    /// Snapshot bootstrap stream, one per vhost / logical database.
     ///
-    /// A future replica joining a running primary will open one of
-    /// these to receive a base snapshot before subscribing to the CDC
-    /// stream. Not implemented today; refused with a logged warning.
+    /// Wire form: `"snapshot/<vhost>"`. A cold replica joining a running
+    /// primary opens one of these to receive a base snapshot before
+    /// subscribing to the CDC stream. The handler is registered by the
+    /// CDC replication feature (`ephpm-server`'s `turso_cdc` module);
+    /// the channel itself only routes the stream type. When no feature
+    /// has registered a handler, the stream is closed like any other
+    /// unknown type.
     pub const SNAPSHOT_PREFIX: &str = "snapshot/";
 }
 
@@ -190,14 +260,36 @@ impl std::fmt::Debug for Handle {
     }
 }
 
+/// The keys a channel endpoint needs: the long-lived handshake cipher
+/// plus the operator secret, retained so a per-connection session key
+/// can be derived from the handshake transcript.
+///
+/// Deliberately has no `Debug` impl — nothing should ever print it.
+struct ChannelKeys {
+    handshake: ClusterCipher,
+    secret: String,
+}
+
+impl ChannelKeys {
+    fn new(secret: &str) -> Self {
+        Self { handshake: ClusterCipher::for_cluster_channel(secret), secret: secret.to_string() }
+    }
+
+    /// Derive this connection's frame key from the handshake transcript
+    /// (`C_i || C_r`). Both peers compute the identical transcript.
+    fn session(&self, transcript: &[u8]) -> ClusterCipher {
+        ClusterCipher::for_cluster_channel_session(&self.secret, transcript)
+    }
+}
+
 struct HandleInner {
     listen_addr: SocketAddr,
     /// The gossip layer's listen IP, captured at bind time. Used to
     /// substitute the wildcard IP when advertising this node's
     /// dial-me address to peers via
     /// [`Handle::advertise_addr`] — see the doc there for why.
-    gossip_advertise_ip: std::net::IpAddr,
-    cipher: Arc<ClusterCipher>,
+    gossip_advertise_ip: IpAddr,
+    keys: Arc<ChannelKeys>,
     /// Registered stream handlers, keyed by full stream-type string.
     ///
     /// The accept loop looks up an incoming stream's type here; a miss
@@ -310,12 +402,16 @@ impl Handle {
             .await
             .with_context(|| format!("cluster channel: connect to {peer_addr}"))?;
         tcp.set_nodelay(true).ok();
-        handshake_initiate(&mut tcp, &self.inner.cipher)
-            .await
-            .with_context(|| format!("cluster channel: handshake with {peer_addr}"))?;
+        let session = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            handshake_initiate(&mut tcp, &self.inner.keys),
+        )
+        .await
+        .with_context(|| format!("cluster channel: handshake with {peer_addr} timed out"))?
+        .with_context(|| format!("cluster channel: handshake with {peer_addr}"))?;
 
-        let cfg = yamux::Config::default();
-        let mut conn = yamux::Connection::new(tcp.compat(), cfg, yamux::Mode::Client);
+        let sealed = SealedStream::new(tcp, session);
+        let mut conn = yamux::Connection::new(sealed.compat(), yamux_config(), yamux::Mode::Client);
 
         let stream =
             poll_new_outbound(&mut conn).await.context("cluster channel: yamux open outbound")?;
@@ -343,6 +439,19 @@ impl Handle {
 /// (the "don't turn it on" contract) — no socket is bound and no task
 /// is spawned in that case.
 ///
+/// # Peer admission
+///
+/// An inbound connection must (a) complete the mutual handshake, which
+/// requires the shared secret, and (b) originate from an IP address
+/// that gossip currently knows as a cluster member (alive or dead).
+/// The second check is coarse — it is per-host, not per-process, and it
+/// trusts the TCP source address, so it does not survive NAT or a
+/// spoofed source on a network where that is possible. It is defence in
+/// depth behind the handshake, not a substitute for it: it means a
+/// stolen secret alone does not let an arbitrary internet host pull a
+/// database snapshot, and it bounds the blast radius to hosts already
+/// in the mesh.
+///
 /// # Errors
 ///
 /// Returns an error if a feature is enabled but a shared secret is
@@ -351,7 +460,7 @@ impl Handle {
 pub async fn maybe_start(
     channel: &ClusterChannelConfig,
     cluster_secret: &str,
-    cluster: &ClusterHandle,
+    cluster: &Arc<ClusterHandle>,
     features: FeatureFlags,
 ) -> anyhow::Result<Option<Handle>> {
     if !features.any_enabled() {
@@ -382,7 +491,7 @@ pub async fn maybe_start(
         .with_context(|| format!("cluster channel: bind {listen_addr}"))?;
     let listen_addr = listener.local_addr().unwrap_or(listen_addr);
 
-    let cipher = Arc::new(ClusterCipher::for_cluster_channel(effective_secret));
+    let keys = Arc::new(ChannelKeys::new(effective_secret));
     let handlers: Arc<Mutex<Vec<HandlerEntry>>> = Arc::new(Mutex::new(Vec::new()));
 
     let gossip_advertise_ip = cluster.gossip_socket_addr().ip();
@@ -391,12 +500,17 @@ pub async fn maybe_start(
         inner: Arc::new(HandleInner {
             listen_addr,
             gossip_advertise_ip,
-            cipher: Arc::clone(&cipher),
+            keys: Arc::clone(&keys),
             handlers: Arc::clone(&handlers),
         }),
     };
 
-    tokio::spawn(accept_loop(listener, Arc::clone(&cipher), Arc::clone(&handlers)));
+    tokio::spawn(accept_loop(
+        listener,
+        keys,
+        Arc::clone(&handlers),
+        Some(Arc::clone(cluster)),
+    ));
 
     tracing::info!(
         %listen_addr,
@@ -404,6 +518,16 @@ pub async fn maybe_start(
         "cluster channel: listener bound (opt-in features active)"
     );
     Ok(Some(handle))
+}
+
+/// yamux settings shared by both ends of every channel connection.
+///
+/// Only deviation from the crate default is the per-connection stream
+/// cap (`512` → [`MAX_STREAMS_PER_CONNECTION`]).
+fn yamux_config() -> yamux::Config {
+    let mut cfg = yamux::Config::default();
+    cfg.set_max_num_streams(MAX_STREAMS_PER_CONNECTION);
+    cfg
 }
 
 fn resolve_listen_addr(
@@ -456,11 +580,24 @@ fn resolve_advertise_addr(listen: SocketAddr, gossip_ip: std::net::IpAddr) -> Op
 // Accept loop.
 // ---------------------------------------------------------------------------
 
+/// Accept inbound channel connections.
+///
+/// `cluster` is `Some` in production and gates admission on gossip
+/// membership (see [`maybe_start`]). It is `None` only in this module's
+/// unit tests, which drive the accept loop directly against a loopback
+/// pair with no gossip mesh to consult; passing `None` disables the
+/// membership check and nothing else.
 async fn accept_loop(
     listener: TcpListener,
-    cipher: Arc<ClusterCipher>,
+    keys: Arc<ChannelKeys>,
     handlers: Arc<Mutex<Vec<HandlerEntry>>>,
+    cluster: Option<Arc<ClusterHandle>>,
 ) {
+    // Bounds concurrent *pre-authentication* work. Permits are released
+    // as soon as the handshake resolves, so long-lived authenticated
+    // connections never hold a slot.
+    let handshakes = Arc::new(Semaphore::new(MAX_INFLIGHT_HANDSHAKES));
+
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -470,89 +607,430 @@ async fn accept_loop(
             }
         };
         tcp.set_nodelay(true).ok();
-        let cipher = Arc::clone(&cipher);
+
+        let Ok(permit) = Arc::clone(&handshakes).try_acquire_owned() else {
+            tracing::warn!(
+                peer = %peer,
+                limit = MAX_INFLIGHT_HANDSHAKES,
+                "cluster channel: too many in-flight handshakes; dropping connection"
+            );
+            drop(tcp);
+            continue;
+        };
+
+        let keys = Arc::clone(&keys);
         let handlers = Arc::clone(&handlers);
+        let cluster = cluster.clone();
         tokio::spawn(async move {
-            let mut tcp = tcp;
-            if let Err(e) = handshake_respond(&mut tcp, &cipher).await {
-                // Drop with debug — a wrong-secret peer is legitimate
-                // background noise; we should not warn per-attempt.
-                tracing::debug!(peer = %peer, "cluster channel: handshake failed: {e:#}");
+            let admitted = match &cluster {
+                Some(cluster) => peer_is_cluster_member(cluster, peer.ip()).await,
+                None => true,
+            };
+            if !admitted {
+                tracing::warn!(
+                    peer = %peer,
+                    "cluster channel: refusing connection from an address gossip does not \
+                     know as a cluster member"
+                );
+                drop(permit);
                 return;
             }
-            let cfg = yamux::Config::default();
-            let conn = yamux::Connection::new(tcp.compat(), cfg, yamux::Mode::Server);
+
+            let mut tcp = tcp;
+            let handshake =
+                tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_respond(&mut tcp, &keys)).await;
+            // Release the pre-auth budget before the (unbounded in time)
+            // connection-serving phase begins.
+            drop(permit);
+
+            let session = match handshake {
+                Ok(Ok(session)) => session,
+                Ok(Err(e)) => {
+                    // Drop with debug — a wrong-secret peer is legitimate
+                    // background noise; we should not warn per-attempt.
+                    tracing::debug!(peer = %peer, "cluster channel: handshake failed: {e:#}");
+                    return;
+                }
+                Err(_) => {
+                    tracing::debug!(
+                        peer = %peer,
+                        timeout_secs = HANDSHAKE_TIMEOUT.as_secs(),
+                        "cluster channel: handshake timed out"
+                    );
+                    return;
+                }
+            };
+
+            let sealed = SealedStream::new(tcp, session);
+            let conn =
+                yamux::Connection::new(sealed.compat(), yamux_config(), yamux::Mode::Server);
             drive_connection(conn, handlers, peer).await;
         });
     }
+}
+
+/// Is `ip` an address gossip currently associates with a cluster member?
+///
+/// Dead members count: a node that just restarted still has to be able
+/// to reconnect, and the failure detector takes tens of seconds to
+/// forget it. Self counts too — loopback and single-node test setups
+/// dial themselves.
+async fn peer_is_cluster_member(cluster: &ClusterHandle, ip: IpAddr) -> bool {
+    if ip == cluster.gossip_socket_addr().ip() {
+        return true;
+    }
+    cluster
+        .nodes()
+        .await
+        .iter()
+        .filter_map(|n| n.gossip_addr.parse::<SocketAddr>().ok())
+        .any(|addr| addr.ip() == ip)
 }
 
 // ---------------------------------------------------------------------------
 // Handshake.
 // ---------------------------------------------------------------------------
 
-async fn handshake_initiate(tcp: &mut TcpStream, cipher: &ClusterCipher) -> anyhow::Result<()> {
+/// Constant-time byte-slice equality.
+///
+/// The handshake comparisons are not realistically timing-attackable
+/// (a wrong guess just drops the connection, and the values are
+/// single-use), but a challenge/response check is exactly the shape of
+/// code that should never leak a prefix-match length. `black_box`
+/// keeps the accumulate-then-compare from being turned back into an
+/// early-exit loop by the optimizer.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
+}
+
+/// Generate a fresh random challenge.
+fn fresh_challenge() -> [u8; CHALLENGE_LEN] {
     use chacha20poly1305::aead::OsRng;
     use chacha20poly1305::aead::rand_core::RngCore;
 
     let mut challenge = [0u8; CHALLENGE_LEN];
     OsRng.fill_bytes(&mut challenge);
+    challenge
+}
 
-    let sealed = cipher.seal(&challenge).context("seal challenge")?;
-    let len = u16::try_from(sealed.len()).context("challenge too long")?;
-    anyhow::ensure!(len <= MAX_HANDSHAKE_LEN, "challenge > MAX_HANDSHAKE_LEN");
-
-    tcp.write_all(&[HANDSHAKE_VERSION]).await?;
+/// Write `[len: u16 BE][sealed]` for an already-sealed handshake body.
+async fn write_handshake_body(tcp: &mut TcpStream, sealed: &[u8]) -> anyhow::Result<()> {
+    let len = u16::try_from(sealed.len()).context("handshake message too long")?;
+    anyhow::ensure!(len <= MAX_HANDSHAKE_LEN, "handshake message > MAX_HANDSHAKE_LEN");
     tcp.write_all(&len.to_be_bytes()).await?;
-    tcp.write_all(&sealed).await?;
+    tcp.write_all(sealed).await?;
     tcp.flush().await?;
-
-    // Read reply: [version][sealed_len: u16 BE][sealed_reply]
-    let mut ver = [0u8; 1];
-    tcp.read_exact(&mut ver).await.context("read handshake reply version")?;
-    anyhow::ensure!(ver[0] == HANDSHAKE_VERSION, "handshake version mismatch: got {}", ver[0]);
-    let mut lenbuf = [0u8; 2];
-    tcp.read_exact(&mut lenbuf).await?;
-    let reply_len = u16::from_be_bytes(lenbuf);
-    anyhow::ensure!(reply_len <= MAX_HANDSHAKE_LEN, "handshake reply too long");
-    let mut sealed_reply = vec![0u8; reply_len as usize];
-    tcp.read_exact(&mut sealed_reply).await?;
-
-    let plaintext = cipher.open(&sealed_reply).context("handshake reply auth failed")?;
-    anyhow::ensure!(
-        plaintext == challenge,
-        "handshake replay mismatch (peer opened challenge but returned different nonce)"
-    );
     Ok(())
 }
 
-async fn handshake_respond(tcp: &mut TcpStream, cipher: &ClusterCipher) -> anyhow::Result<()> {
+/// Read `[len: u16 BE][sealed]` and open it with the handshake key.
+async fn read_handshake_body(
+    tcp: &mut TcpStream,
+    cipher: &ClusterCipher,
+) -> anyhow::Result<Vec<u8>> {
+    let mut lenbuf = [0u8; 2];
+    tcp.read_exact(&mut lenbuf).await?;
+    let len = u16::from_be_bytes(lenbuf);
+    anyhow::ensure!(len <= MAX_HANDSHAKE_LEN, "handshake message too long: {len}");
+    let mut sealed = vec![0u8; len as usize];
+    tcp.read_exact(&mut sealed).await?;
+    cipher.open(&sealed).context("handshake message failed authentication")
+}
+
+/// Build the transcript both peers hash into their session key.
+fn transcript(initiator: &[u8; CHALLENGE_LEN], responder: &[u8; CHALLENGE_LEN]) -> Vec<u8> {
+    let mut t = Vec::with_capacity(CHALLENGE_LEN * 2);
+    t.extend_from_slice(initiator);
+    t.extend_from_slice(responder);
+    t
+}
+
+/// Dial side of the v2 handshake. Returns the per-connection cipher
+/// every subsequent byte on this TCP stream is sealed with.
+async fn handshake_initiate(
+    tcp: &mut TcpStream,
+    keys: &ChannelKeys,
+) -> anyhow::Result<ClusterCipher> {
+    let challenge_i = fresh_challenge();
+
+    tcp.write_all(&[HANDSHAKE_VERSION]).await?;
+    let sealed = keys.handshake.seal(&challenge_i).context("seal initiator challenge")?;
+    write_handshake_body(tcp, &sealed).await?;
+
+    // Message 2: [version][len][seal(C_i || C_r)].
+    let mut ver = [0u8; 1];
+    tcp.read_exact(&mut ver).await.context("read handshake reply version")?;
+    anyhow::ensure!(ver[0] == HANDSHAKE_VERSION, "handshake version mismatch: got {}", ver[0]);
+    let reply = read_handshake_body(tcp, &keys.handshake).await.context("read handshake reply")?;
+    anyhow::ensure!(
+        reply.len() == CHALLENGE_LEN * 2,
+        "handshake reply wrong length: {} (expected {})",
+        reply.len(),
+        CHALLENGE_LEN * 2
+    );
+    let (echoed, responder) = reply.split_at(CHALLENGE_LEN);
+    anyhow::ensure!(
+        constant_time_eq(echoed, &challenge_i),
+        "handshake reply did not echo our challenge (replayed or forged responder)"
+    );
+    let mut challenge_r = [0u8; CHALLENGE_LEN];
+    challenge_r.copy_from_slice(responder);
+
+    // Message 3: prove we can open the responder's challenge too.
+    let sealed = keys.handshake.seal(&challenge_r).context("seal responder challenge echo")?;
+    write_handshake_body(tcp, &sealed).await?;
+
+    Ok(keys.session(&transcript(&challenge_i, &challenge_r)))
+}
+
+/// Accept side of the v2 handshake. Returns the per-connection cipher.
+///
+/// The responder's own challenge is what defeats replay: an attacker
+/// re-sending a captured message 1 receives a message 2 built around a
+/// challenge they have never seen and cannot open, so they cannot
+/// produce message 3.
+async fn handshake_respond(
+    tcp: &mut TcpStream,
+    keys: &ChannelKeys,
+) -> anyhow::Result<ClusterCipher> {
     let mut ver = [0u8; 1];
     tcp.read_exact(&mut ver).await.context("read handshake version")?;
     anyhow::ensure!(ver[0] == HANDSHAKE_VERSION, "handshake version mismatch: got {}", ver[0]);
-    let mut lenbuf = [0u8; 2];
-    tcp.read_exact(&mut lenbuf).await?;
-    let ch_len = u16::from_be_bytes(lenbuf);
-    anyhow::ensure!(ch_len <= MAX_HANDSHAKE_LEN, "handshake challenge too long");
-    let mut sealed_ch = vec![0u8; ch_len as usize];
-    tcp.read_exact(&mut sealed_ch).await?;
 
-    let challenge = cipher.open(&sealed_ch).context("handshake challenge auth failed")?;
+    let opened =
+        read_handshake_body(tcp, &keys.handshake).await.context("read initiator challenge")?;
     anyhow::ensure!(
-        challenge.len() == CHALLENGE_LEN,
+        opened.len() == CHALLENGE_LEN,
         "handshake challenge wrong length: {}",
-        challenge.len()
+        opened.len()
+    );
+    let mut challenge_i = [0u8; CHALLENGE_LEN];
+    challenge_i.copy_from_slice(&opened);
+
+    let challenge_r = fresh_challenge();
+    let session_transcript = transcript(&challenge_i, &challenge_r);
+
+    // Message 2 seals the transcript itself: the echo of C_i (which
+    // proves we opened it) followed by our own fresh C_r.
+    tcp.write_all(&[HANDSHAKE_VERSION]).await?;
+    let sealed = keys.handshake.seal(&session_transcript).context("seal handshake reply")?;
+    write_handshake_body(tcp, &sealed).await?;
+
+    // Message 3 must be the responder challenge, sealed by a peer that
+    // holds the secret. A replayer cannot get here.
+    let confirm =
+        read_handshake_body(tcp, &keys.handshake).await.context("read handshake confirmation")?;
+    anyhow::ensure!(
+        constant_time_eq(&confirm, &challenge_r),
+        "handshake confirmation did not echo our challenge (replay attempt)"
     );
 
-    let sealed_reply = cipher.seal(&challenge).context("seal handshake reply")?;
-    let reply_len = u16::try_from(sealed_reply.len()).context("reply too long")?;
-    anyhow::ensure!(reply_len <= MAX_HANDSHAKE_LEN, "reply > MAX_HANDSHAKE_LEN");
+    Ok(keys.session(&session_transcript))
+}
 
-    tcp.write_all(&[HANDSHAKE_VERSION]).await?;
-    tcp.write_all(&reply_len.to_be_bytes()).await?;
-    tcp.write_all(&sealed_reply).await?;
-    tcp.flush().await?;
-    Ok(())
+// ---------------------------------------------------------------------------
+// Sealed stream: per-frame ChaCha20-Poly1305 over the post-handshake TCP
+// connection. Same posture as `kv_data_plane`'s framed messages, but as
+// an `AsyncRead`/`AsyncWrite` adapter so yamux can sit on top of it.
+// ---------------------------------------------------------------------------
+
+/// Wraps a byte stream so every write is sealed into a
+/// `[len: u32 BE][nonce || ciphertext+tag]` frame and every read opens
+/// one.
+///
+/// Framing is invisible to the caller: `poll_read` hands back plaintext
+/// bytes from the current frame and only touches the socket when that
+/// frame is exhausted. A frame that fails authentication is a hard
+/// `InvalidData` error — there is no "skip and continue", because on a
+/// stream transport a forged frame means the stream is no longer
+/// trustworthy.
+struct SealedStream<S> {
+    inner: S,
+    cipher: ClusterCipher,
+
+    // Read state.
+    hdr: [u8; SEALED_LEN_PREFIX],
+    hdr_filled: usize,
+    body: Vec<u8>,
+    body_filled: usize,
+    plain: Vec<u8>,
+    plain_pos: usize,
+
+    // Write state: one sealed frame at a time, flushed before the next
+    // plaintext run is accepted.
+    out: Vec<u8>,
+    out_pos: usize,
+}
+
+impl<S> SealedStream<S> {
+    fn new(inner: S, cipher: ClusterCipher) -> Self {
+        Self {
+            inner,
+            cipher,
+            hdr: [0u8; SEALED_LEN_PREFIX],
+            hdr_filled: 0,
+            body: Vec::new(),
+            body_filled: 0,
+            plain: Vec::new(),
+            plain_pos: 0,
+            out: Vec::new(),
+            out_pos: 0,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> SealedStream<S> {
+    /// Push any bytes of the current sealed frame that have not reached
+    /// the socket yet.
+    fn poll_flush_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.out_pos < self.out.len() {
+            let n = ready!(Pin::new(&mut self.inner).poll_write(cx, &self.out[self.out_pos..]))?;
+            if n == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "cluster channel: sealed write made no progress",
+                )));
+            }
+            self.out_pos += n;
+        }
+        self.out.clear();
+        self.out_pos = 0;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for SealedStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        loop {
+            // 1. Serve whatever plaintext the last opened frame still has.
+            if this.plain_pos < this.plain.len() {
+                let n = out.remaining().min(this.plain.len() - this.plain_pos);
+                if n == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                out.put_slice(&this.plain[this.plain_pos..this.plain_pos + n]);
+                this.plain_pos += n;
+                return Poll::Ready(Ok(()));
+            }
+
+            // 2. Length prefix.
+            if this.hdr_filled < SEALED_LEN_PREFIX {
+                let mut rb = ReadBuf::new(&mut this.hdr[this.hdr_filled..]);
+                ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+                let n = rb.filled().len();
+                if n == 0 {
+                    return if this.hdr_filled == 0 {
+                        // Clean EOF on a frame boundary.
+                        Poll::Ready(Ok(()))
+                    } else {
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "cluster channel: EOF inside a sealed frame header",
+                        )))
+                    };
+                }
+                this.hdr_filled += n;
+                continue;
+            }
+
+            // 3. Frame body.
+            let want = usize::try_from(u32::from_be_bytes(this.hdr)).unwrap_or(usize::MAX);
+            if want == 0 || want > MAX_SEALED_FRAME_LEN {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("cluster channel: sealed frame length {want} out of range"),
+                )));
+            }
+            if this.body.len() != want {
+                this.body.resize(want, 0);
+            }
+            while this.body_filled < want {
+                let mut rb = ReadBuf::new(&mut this.body[this.body_filled..]);
+                ready!(Pin::new(&mut this.inner).poll_read(cx, &mut rb))?;
+                let n = rb.filled().len();
+                if n == 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "cluster channel: EOF inside a sealed frame body",
+                    )));
+                }
+                this.body_filled += n;
+            }
+
+            let Some(plain) = this.cipher.open(&this.body) else {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "cluster channel: sealed frame failed authentication",
+                )));
+            };
+            this.plain = plain;
+            this.plain_pos = 0;
+            this.hdr_filled = 0;
+            this.body_filled = 0;
+            this.body.clear();
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SealedStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        // Never interleave two frames: finish the pending one first.
+        ready!(this.poll_flush_pending(cx))?;
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let take = buf.len().min(MAX_SEALED_PLAINTEXT_LEN);
+        let sealed = this
+            .cipher
+            .seal(&buf[..take])
+            .map_err(|e| io::Error::other(format!("cluster channel: seal failed: {e}")))?;
+        let len = u32::try_from(sealed.len())
+            .map_err(|_| io::Error::other("cluster channel: sealed frame too large"))?;
+
+        this.out.clear();
+        this.out.reserve(SEALED_LEN_PREFIX + sealed.len());
+        this.out.extend_from_slice(&len.to_be_bytes());
+        this.out.extend_from_slice(&sealed);
+        this.out_pos = 0;
+
+        // Best effort: whatever does not fit in the socket buffer now is
+        // completed by the next poll_write / poll_flush. The plaintext is
+        // already committed, so we report it as written.
+        if let Poll::Ready(Err(e)) = this.poll_flush_pending(cx) {
+            return Poll::Ready(Err(e));
+        }
+        Poll::Ready(Ok(take))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_flush_pending(cx))?;
+        Pin::new(&mut this.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        ready!(this.poll_flush_pending(cx))?;
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -677,20 +1155,11 @@ fn dispatch_stream(
             let _ = tx.send(IncomingStream { stream_type, stream, peer });
         }
         None => {
-            if stream_type.starts_with(stream_type::SNAPSHOT_PREFIX) {
-                tracing::warn!(
-                    stream_type = %stream_type,
-                    %peer,
-                    "cluster channel: snapshot stream received but not implemented in this build \
-                     (RESERVED for Phase 2.1); closing"
-                );
-            } else {
-                tracing::warn!(
-                    stream_type = %stream_type,
-                    %peer,
-                    "cluster channel: no handler for stream type; closing"
-                );
-            }
+            tracing::warn!(
+                stream_type = %stream_type,
+                %peer,
+                "cluster channel: no handler registered for stream type; closing"
+            );
             drop(stream);
         }
     }
@@ -733,7 +1202,7 @@ mod tests {
             secret: "test-secret-not-important-if-no-feature-enabled".to_string(),
             ..ephpm_config::ClusterConfig::default()
         };
-        let cluster = crate::start_gossip(&cfg).await.expect("gossip start");
+        let cluster = Arc::new(crate::start_gossip(&cfg).await.expect("gossip start"));
 
         let derived_port = cluster.gossip_socket_addr().port() + 2;
         let derived_addr = format!("127.0.0.1:{derived_port}");
@@ -770,7 +1239,7 @@ mod tests {
             secret: "a-secret-value-for-tests".to_string(),
             ..ephpm_config::ClusterConfig::default()
         };
-        let cluster = crate::start_gossip(&cfg).await.expect("gossip start");
+        let cluster = Arc::new(crate::start_gossip(&cfg).await.expect("gossip start"));
         let expected_port = cluster.gossip_socket_addr().port() + 2;
 
         let channel_cfg = ephpm_config::ClusterChannelConfig::default();
@@ -793,7 +1262,7 @@ mod tests {
             secret: String::new(), // no secret
             ..ephpm_config::ClusterConfig::default()
         };
-        let cluster = crate::start_gossip(&cfg).await.expect("gossip start");
+        let cluster = Arc::new(crate::start_gossip(&cfg).await.expect("gossip start"));
 
         let channel_cfg = ephpm_config::ClusterChannelConfig::default();
         let err = maybe_start(&channel_cfg, "", &cluster, FeatureFlags { cdc: true })
@@ -807,11 +1276,11 @@ mod tests {
     }
 
     /// Handshake + open a stream + dispatch by exact type. Uses a
-    /// loopback pair — no gossip involved for this leg.
+    /// loopback pair — no gossip involved for this leg, so the accept
+    /// loop runs with the membership check disabled (`None`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handshake_then_stream_dispatch_roundtrip() {
-        let secret = "roundtrip-secret";
-        let cipher = Arc::new(ClusterCipher::for_cluster_channel(secret));
+        let keys = Arc::new(ChannelKeys::new("roundtrip-secret"));
         let handlers: Arc<Mutex<Vec<HandlerEntry>>> = Arc::new(Mutex::new(Vec::new()));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -822,13 +1291,14 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         handlers.lock().push(HandlerEntry { pattern: "cdc/default".into(), prefix: false, tx });
 
-        tokio::spawn(accept_loop(listener, Arc::clone(&cipher), Arc::clone(&handlers)));
+        tokio::spawn(accept_loop(listener, Arc::clone(&keys), Arc::clone(&handlers), None));
 
         // Dial as a client.
         let mut tcp = TcpStream::connect(addr).await.unwrap();
-        handshake_initiate(&mut tcp, &cipher).await.expect("handshake");
-        let cfg = yamux::Config::default();
-        let mut conn = yamux::Connection::new(tcp.compat(), cfg, yamux::Mode::Client);
+        let session = handshake_initiate(&mut tcp, &keys).await.expect("handshake");
+        let sealed = SealedStream::new(tcp, session);
+        let mut conn =
+            yamux::Connection::new(sealed.compat(), yamux_config(), yamux::Mode::Client);
         let stream = poll_new_outbound(&mut conn).await.unwrap();
         tokio::spawn(drive_connection(conn, Arc::new(Mutex::new(Vec::new())), addr));
 
@@ -837,8 +1307,7 @@ mod tests {
         cs.write_all(b"hello").await.unwrap();
         cs.flush().await.unwrap();
 
-        let incoming =
-            tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv()).await.unwrap();
+        let incoming = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await.unwrap();
         let mut incoming = incoming.expect("dispatched stream");
         assert_eq!(incoming.stream_type, "cdc/default");
         let mut buf = [0u8; 5];
@@ -851,23 +1320,119 @@ mod tests {
     /// error, and no stream should ever reach a registered handler.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn wrong_secret_is_rejected_silently() {
-        let good_cipher = Arc::new(ClusterCipher::for_cluster_channel("good-secret"));
-        let bad_cipher = ClusterCipher::for_cluster_channel("bad-secret");
+        let good = Arc::new(ChannelKeys::new("good-secret"));
+        let bad = ChannelKeys::new("bad-secret");
         let handlers: Arc<Mutex<Vec<HandlerEntry>>> = Arc::new(Mutex::new(Vec::new()));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         handlers.lock().push(HandlerEntry { pattern: "cdc/".into(), prefix: true, tx });
-        tokio::spawn(accept_loop(listener, Arc::clone(&good_cipher), Arc::clone(&handlers)));
+        tokio::spawn(accept_loop(listener, Arc::clone(&good), Arc::clone(&handlers), None));
 
         let mut tcp = TcpStream::connect(addr).await.unwrap();
-        let hs = handshake_initiate(&mut tcp, &bad_cipher).await;
+        let hs = handshake_initiate(&mut tcp, &bad).await;
         assert!(hs.is_err(), "handshake with wrong secret must fail on initiator side");
 
         // Nothing should arrive on the handler within a short window.
-        let noise = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv()).await;
+        let noise = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
         assert!(noise.is_err(), "no stream should be dispatched for a rejected peer");
+    }
+
+    /// **CRIT-1 regression.** Record a full, legitimate handshake, then
+    /// replay the captured initiator bytes verbatim against a fresh
+    /// responder. Under the v1 handshake this cleared the accept path
+    /// (the responder only ever echoed what it was given). Under v2 the
+    /// responder issues its own challenge, so the replayed transcript
+    /// cannot produce a valid third message and the connection is
+    /// dropped without a single stream being dispatched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recorded_handshake_cannot_be_replayed() {
+        let keys = Arc::new(ChannelKeys::new("replay-secret"));
+        let handlers: Arc<Mutex<Vec<HandlerEntry>>> = Arc::new(Mutex::new(Vec::new()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        handlers.lock().push(HandlerEntry { pattern: "cdc/".into(), prefix: true, tx });
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(accept_loop(listener, Arc::clone(&keys), Arc::clone(&handlers), None));
+
+        // 1. Capture what a legitimate initiator puts on the wire.
+        let mut recorder = TcpStream::connect(addr).await.unwrap();
+        let challenge = fresh_challenge();
+        let sealed = keys.handshake.seal(&challenge).unwrap();
+        let len = u16::try_from(sealed.len()).unwrap();
+        let mut captured = vec![HANDSHAKE_VERSION];
+        captured.extend_from_slice(&len.to_be_bytes());
+        captured.extend_from_slice(&sealed);
+        recorder.write_all(&captured).await.unwrap();
+        recorder.flush().await.unwrap();
+        drop(recorder);
+
+        // 2. Replay those exact bytes on a brand new connection.
+        let mut attacker = TcpStream::connect(addr).await.unwrap();
+        attacker.write_all(&captured).await.unwrap();
+        attacker.flush().await.unwrap();
+
+        // The responder answers, but with a challenge of its own that
+        // the attacker cannot open — so it cannot complete message 3.
+        let mut ver = [0u8; 1];
+        attacker.read_exact(&mut ver).await.unwrap();
+        assert_eq!(ver[0], HANDSHAKE_VERSION);
+        let mut lenbuf = [0u8; 2];
+        attacker.read_exact(&mut lenbuf).await.unwrap();
+        let reply_len = usize::from(u16::from_be_bytes(lenbuf));
+        let mut reply = vec![0u8; reply_len];
+        attacker.read_exact(&mut reply).await.unwrap();
+
+        // Best an attacker without the secret can do: echo the bytes
+        // back. That is not a valid seal of C_r, so the responder drops.
+        attacker.write_all(&lenbuf).await.unwrap();
+        attacker.write_all(&reply).await.unwrap();
+        attacker.flush().await.unwrap();
+
+        let noise = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+        assert!(noise.is_err(), "a replayed handshake must never reach the dispatch table");
+    }
+
+    /// The post-handshake transport must actually be sealed: bytes that
+    /// leave the adapter are ciphertext, and a tampered frame is a hard
+    /// error rather than silently-accepted plaintext.
+    #[tokio::test]
+    async fn sealed_stream_roundtrips_and_rejects_tampering() {
+        let cipher = ClusterCipher::for_cluster_channel_session("s", b"transcript");
+        let (a, b) = tokio::io::duplex(64 * 1024);
+
+        let mut writer = SealedStream::new(a, cipher.clone());
+        writer.write_all(b"plaintext-marker").await.unwrap();
+        writer.flush().await.unwrap();
+
+        let mut reader = SealedStream::new(b, cipher);
+        let mut got = [0u8; 16];
+        reader.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"plaintext-marker");
+
+        // And the raw bytes on the underlying transport are not the
+        // plaintext.
+        let (mut raw_a, raw_b) = tokio::io::duplex(64 * 1024);
+        let cipher2 = ClusterCipher::for_cluster_channel_session("s", b"transcript");
+        let mut writer2 = SealedStream::new(raw_b, cipher2);
+        writer2.write_all(b"plaintext-marker").await.unwrap();
+        writer2.flush().await.unwrap();
+        let mut on_the_wire = vec![0u8; 4 + 16 + crate::secure_transport::SEAL_OVERHEAD];
+        raw_a.read_exact(&mut on_the_wire).await.unwrap();
+        assert!(
+            !on_the_wire.windows(16).any(|w| w == b"plaintext-marker"),
+            "channel payload must not appear in cleartext on the wire"
+        );
+    }
+
+    #[test]
+    fn constant_time_eq_matches_normal_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
     }
 
     fn pick_free_port_addr() -> String {
@@ -949,7 +1514,7 @@ mod tests {
             secret: "advertise-test-secret".to_string(),
             ..ephpm_config::ClusterConfig::default()
         };
-        let cluster = crate::start_gossip(&cfg).await.expect("gossip start");
+        let cluster = Arc::new(crate::start_gossip(&cfg).await.expect("gossip start"));
         let handle = maybe_start(
             &ephpm_config::ClusterChannelConfig::default(),
             &cfg.secret,
@@ -983,7 +1548,7 @@ mod tests {
             secret: "advertise-test-secret".to_string(),
             ..ephpm_config::ClusterConfig::default()
         };
-        let cluster = crate::start_gossip(&cfg).await.expect("gossip start");
+        let cluster = Arc::new(crate::start_gossip(&cfg).await.expect("gossip start"));
 
         // Pick a free TCP port for the channel by binding and dropping.
         let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

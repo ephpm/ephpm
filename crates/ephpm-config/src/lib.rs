@@ -2538,9 +2538,11 @@ pub struct ClusterChannelConfig {
     /// Listen address for the cluster channel TCP listener.
     ///
     /// When unset (the default) the address is derived at runtime as
-    /// `<cluster.bind IP>:<cluster.bind port + 1>` — so operators who
-    /// exposed the gossip port only have to remember one port range
-    /// (`bind` and `bind+1`). Set this explicitly to override.
+    /// `<cluster.bind IP>:<cluster.bind port + 2>` — `+ 2` and not
+    /// `+ 1` because the KV data plane already claims `gossip + 1`
+    /// (7947 with default ports). With defaults the channel lands on
+    /// 7948, so operators who exposed the gossip port only have to
+    /// remember one small port range. Set this explicitly to override.
     ///
     /// Ignored (parsed but not acted upon) when no channel feature is
     /// enabled — see the [`ClusterChannelConfig`] type docs.
