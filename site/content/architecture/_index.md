@@ -543,10 +543,10 @@ ephpm_kv_set("session:abc", $data, ttl: 3600);
 $data = ephpm_kv_get("session:abc");
 ephpm_kv_del("session:abc");
 
-// Hash operations
-ephpm_kv_hset("user:123", "email", "user@example.com");
-$email = ephpm_kv_hget("user:123", "email");
-$all = ephpm_kv_hgetall("user:123");
+// Counters and TTL
+ephpm_kv_incr_by("hits:home", 1);
+ephpm_kv_expire("session:abc", 3600);
+$ms = ephpm_kv_pttl("session:abc");
 
 // With clustering, this is transparent:
 // - If key is local → direct memory access, ~100ns

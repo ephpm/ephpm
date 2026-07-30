@@ -92,7 +92,7 @@ When the RESP listener is enabled and AUTH is required, ePHPm derives per-site p
 password = HMAC-SHA256(secret, hostname)
 ```
 
-The derived password is injected into PHP's `$_ENV` as `EPHPM_REDIS_PASSWORD` for each request, so each site's PHP code can authenticate to its own scope. If `[kv] secret` is unset, nothing is auto-generated — multi-tenant HMAC AUTH is simply disabled.
+The derived password is injected into PHP's `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request, so each site's PHP code can authenticate to its own scope. If `[kv] secret` is unset, nothing is auto-generated — multi-tenant HMAC AUTH is simply disabled.
 
 ## Clustered KV (when `[cluster] enabled = true`)
 

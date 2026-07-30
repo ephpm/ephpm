@@ -51,7 +51,7 @@ The `ephpm-e2e` crate is **excluded from the workspace** and has different depen
 | `ephpm-config` | Configuration (figment) — TOML + env var overrides (`EPHPM_` prefix) |
 | `ephpm-kv` | Embedded KV store — DashMap, RESP2 protocol, TTL/expiry, compression (gzip/zstd/brotli) |
 | `ephpm-db` | DB proxy — MySQL wire protocol, connection pooling, R/W splitting |
-| `ephpm-cluster` | Clustering — SWIM gossip (chitchat), consistent hash ring, KV replication, SQLite primary election |
+| `ephpm-cluster` | Clustering — SWIM gossip (chitchat), hashed large-value ownership (`hash(key)` mod sorted alive nodes — not a consistent-hash ring), KV replication, SQLite primary election |
 | `ephpm-sqld` | sqld embedding — binary extraction via `include_bytes!()`, child process lifecycle, health checks |
 | `ephpm-query-stats` | Query observability — SQL normalization, digest tracking, slow query logging, Prometheus metrics |
 | `xtask` | Build & test tooling — `release`, `php-sdk`, `e2e` (bare-process default), `k8s-e2e`/`k8s-e2e-up`/`k8s-e2e-down` (opt-in Kind path) |
