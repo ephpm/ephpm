@@ -1456,7 +1456,7 @@ impl Router {
             // "must-be-tighter-than-current" check, since each site's path
             // is a peer rather than a subset of the previous one.
             if vhost_open_basedir {
-                let basedir = format!("{}:/tmp", document_root.display());
+                let basedir = vhost_open_basedir_value(&document_root);
                 PhpRuntime::set_request_ini("open_basedir", &basedir);
             }
 
@@ -2448,6 +2448,23 @@ fn build_php_response(
     }
 }
 
+/// Build the per-vhost `open_basedir` value: the site's document root plus
+/// the system temp directory.
+///
+/// PHP splits `open_basedir` on the platform's `PATH_SEPARATOR` — `:` on
+/// Unix, `;` on Windows. Hardcoding `:` produced a single bogus Windows
+/// entry (`C:\sites\blog:/tmp`) that matches no path, so every file access
+/// under a vhost was denied. `/tmp` is Unix-only for the same reason;
+/// `std::env::temp_dir()` is the portable equivalent and honours `TMPDIR`.
+///
+/// `ServerConfig::effective_open_basedir` defaults to `true` whenever
+/// `sites_dir` is set, so this value is what a default Windows vhost
+/// deployment runs with.
+fn vhost_open_basedir_value(document_root: &Path) -> String {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    format!("{}{separator}{}", document_root.display(), std::env::temp_dir().display())
+}
+
 /// Check if a filesystem path is a PHP file.
 fn is_php_file(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("php"))
@@ -3354,6 +3371,34 @@ mod tests {
     fn has_hidden_segment_deep_nesting() {
         assert!(has_hidden_segment("/a/b/c/.secret/d"));
         assert!(!has_hidden_segment("/a/b/c/d/e"));
+    }
+
+    // ── per-vhost open_basedir ──────────────────────────────────────
+
+    /// PHP splits `open_basedir` on the platform `PATH_SEPARATOR`. The value
+    /// used to be `format!("{}:/tmp", document_root.display())`, so on
+    /// Windows — where the separator is `;` and the docroot itself contains
+    /// a drive-letter colon — a vhost got one bogus entry matching nothing
+    /// and every file access was denied.
+    #[test]
+    fn vhost_open_basedir_uses_platform_separator_and_real_temp_dir() {
+        let temp = std::env::temp_dir();
+        let root = temp.join("ephpm-basedir-test");
+        let value = vhost_open_basedir_value(&root);
+
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let parts: Vec<&str> = value.split(separator).collect();
+        assert_eq!(parts.len(), 2, "expected exactly docroot + temp dir, got {value}");
+        assert_eq!(
+            parts[0],
+            root.display().to_string(),
+            "the document root must survive verbatim (drive-letter colon included)"
+        );
+        assert_eq!(
+            parts[1],
+            temp.display().to_string(),
+            "the second entry must be the real temp dir, not a literal /tmp"
+        );
     }
 
     // ── is_php_file edge cases ──────────────────────────────────────

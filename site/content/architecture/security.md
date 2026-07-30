@@ -27,7 +27,7 @@ This document describes the threat model, trust boundaries, and security design 
 
 The controls that exist today, in one place:
 
-- **Per-vhost `open_basedir`** — in multi-site mode, PHP filesystem access is restricted per-request to the site's directory (+ `/tmp`)
+- **Per-vhost `open_basedir`** — in multi-site mode, PHP filesystem access is restricted per-request to the site's directory plus the system temp directory (`std::env::temp_dir()`, so `TMPDIR` is honoured and Windows gets its real temp path). Entries are joined with the platform's `PATH_SEPARATOR` (`:` on Unix, `;` on Windows).
 - **`disable_shell_exec`** — `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec` disabled via the php.ini generated at startup (default on in multi-site mode)
 - **`blocked_paths`** — glob patterns matched against the URI path (patterns must start with `/`); matches return 403
 - **`trusted_hosts`** — Host header validation; non-matching hosts get 421. Internal endpoints (`/_ephpm/health`, `/_ephpm/ready`, the metrics path) are exempt so Kubernetes probes and Prometheus scrapes can address the pod by raw IP
