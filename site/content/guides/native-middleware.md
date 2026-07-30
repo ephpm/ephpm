@@ -235,7 +235,15 @@ are enforced when configured.
 
 With `claims_header = "X-Jwt-Claims"`, PHP reads the verified claims from
 `$_SERVER['HTTP_X_JWT_CLAIMS']` without re-verifying the token. Any
-client-sent header of that name is replaced, so PHP can trust it.
+client-sent header of that name is **stripped at ingest** — before the
+middleware chain runs and before any header crosses to PHP — so a request
+that never matches this module's `match` glob (or bypasses it entirely) can
+never smuggle a forged claims value through. When a valid token is present
+the `jwt` module then sets the header to the verified claims JSON. PHP can
+therefore trust `HTTP_X_JWT_CLAIMS` regardless of request path.
+
+> ePHPm also always strips the `Proxy` request header at ingest (httpoxy
+> defense), so it never surfaces as `$_SERVER['HTTP_PROXY']`.
 
 v1 is HS256 only — RS256/JWKS is not implemented.
 

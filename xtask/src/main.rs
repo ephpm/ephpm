@@ -4,6 +4,7 @@ use std::{env, fs};
 
 mod bump;
 mod doctor;
+mod e2e_bare;
 
 /// Pinned full PHP versions per supported minor.
 ///
@@ -32,10 +33,11 @@ fn main() -> ExitCode {
         Some("release") => release(&args[1..]),
         // php-sdk is a pure download — works on any platform with curl + tar.
         Some("php-sdk") => php_sdk(&args[1..]),
-        Some("e2e") => e2e(&args[1..]),
-        Some("e2e-up") => e2e_up(&args[1..]),
-        Some("e2e-down") => e2e_down(),
-        Some("e2e-install") => e2e_install(),
+        Some("e2e") => e2e_bare::run(&args[1..]),
+        Some("k8s-e2e") => e2e(&args[1..]),
+        Some("k8s-e2e-up") => e2e_up(&args[1..]),
+        Some("k8s-e2e-down") => e2e_down(),
+        Some("k8s-e2e-install") => e2e_install(),
         Some("docs") => docs(&args[1..]),
         Some("doctor") => doctor::doctor(&args[1..]),
         Some("bump-php-pin") => bump::bump_php_pin(&args[1..]),
@@ -59,10 +61,11 @@ Usage: cargo xtask <command> [options]
 Commands:
   release [8.5] [--target windows]  Build ephpm with PHP linked (default: 8.5)
   php-sdk [8.5]                     Download the PHP SDK (libphp.a + headers) for the current platform
-  e2e [--php-version 8.5]           Run E2E tests (creates Kind cluster, builds images, tilt ci)
-  e2e-up [--php-version 8.5]        Start E2E dev environment (tilt dashboard at localhost:10350)
-  e2e-down                          Tear down Kind cluster and all resources
-  e2e-install                       Download kind, tilt, kubectl to ./bin (no global install needed)
+  e2e [--php-version 8.5]           Run bare-process E2E tests (spawns ephpm on 127.0.0.1, no Kind/Tilt)
+  k8s-e2e [--php-version 8.5]       Run K8s E2E tests (opt-in; creates Kind cluster, builds images, tilt ci)
+  k8s-e2e-up [--php-version 8.5]    Start K8s E2E dev environment (opt-in; tilt dashboard at localhost:10350)
+  k8s-e2e-down                      Tear down Kind cluster and all resources
+  k8s-e2e-install                   Download kind, tilt, kubectl to ./bin (no global install needed)
   docs <subcommand>                 Build/serve the Hugo + Hextra documentation site
   doctor [--target windows]         Check build prerequisites (toolchains, PHP SDK cache, optional tools)
   bump-php-pin <minor> <full>       Update every PHP SDK pin site for <minor> (--check: verify pin drift)
@@ -521,7 +524,7 @@ fn download_and_extract_full_tarball(url: &str, dest: &Path) -> bool {
     ran_ok(&status)
 }
 
-// ── E2E testing (Kind + Tilt) ────────────────────────────────────────────────
+// ── K8s E2E testing (Kind + Tilt) — opt-in only ──────────────────────────────
 
 const KIND_CLUSTER_NAME: &str = "ephpm-dev";
 const KIND_VERSION: &str = "0.27.0";
@@ -776,7 +779,7 @@ fn e2e(args: &[String]) -> ExitCode {
     // Check prerequisites
     for tool in ["kind", "tilt", "kubectl"] {
         if !has_e2e_tool(tool) {
-            eprintln!("error: {tool} not found. Run `cargo xtask e2e-install` to download it.");
+            eprintln!("error: {tool} not found. Run `cargo xtask k8s-e2e-install` to download it.");
             return ExitCode::FAILURE;
         }
     }
@@ -825,7 +828,7 @@ fn e2e_up(args: &[String]) -> ExitCode {
 
     for tool in ["kind", "tilt", "kubectl"] {
         if !has_e2e_tool(tool) {
-            eprintln!("error: {tool} not found. Run `cargo xtask e2e-install` to download it.");
+            eprintln!("error: {tool} not found. Run `cargo xtask k8s-e2e-install` to download it.");
             return ExitCode::FAILURE;
         }
     }

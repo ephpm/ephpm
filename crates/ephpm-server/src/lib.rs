@@ -100,6 +100,24 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 
     // Start cluster gossip before DB proxies — clustered SQLite needs the handle.
     let cluster_handle = if config.cluster.enabled {
+        // Fail closed on an unauthenticated cluster: an empty secret means
+        // gossip and the KV data plane run as plaintext with no auth, so any
+        // host on the cluster network can forge KV writes. Require a secret
+        // unless the operator explicitly opts into insecure mode.
+        config
+            .cluster
+            .ensure_secure()
+            .map_err(|msg| anyhow::anyhow!(msg))
+            .context("refusing to start clustering without authentication")?;
+        if config.cluster.allow_insecure_no_auth && config.cluster.secret.is_empty() {
+            tracing::warn!(
+                "[cluster] allow_insecure_no_auth = true with an empty secret: gossip and the \
+                 KV data plane are running as UNAUTHENTICATED PLAINTEXT. Any host on the cluster \
+                 network can read and forge KV writes. Only use this on a fully trusted private \
+                 network with the gossip and data-plane ports firewalled from untrusted hosts."
+            );
+        }
+
         let handle = ephpm_cluster::start_gossip(&config.cluster)
             .await
             .context("failed to start cluster gossip")?;
@@ -228,7 +246,14 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // orchestrator TCP readiness probes to kill the pod. With the sockets
     // bound, probes pass and connections queue in the accept backlog while
     // the proxies come up. Hard proxy errors still fail startup.
-    let listeners = bind_listeners(&config, kv_store, metrics_handle, middleware_chain).await?;
+    // Effective node id for PHP's EPHPM_NODE_ID: the running gossip node's id
+    // when clustered (distinct per node even if `[cluster] node_id` was left
+    // empty and auto-derived), else None (Router falls back to config).
+    let effective_node_id = cluster_handle.as_ref().map(|h| h.self_node().id.clone());
+
+    let listeners =
+        bind_listeners(&config, kv_store, metrics_handle, middleware_chain, effective_node_id)
+            .await?;
 
     let _db_handles =
         start_db_proxies(&config, cluster_handle.as_ref(), channel_handle.as_ref(), &query_stats)
@@ -299,6 +324,10 @@ async fn bind_listeners(
     kv_store: Arc<ephpm_kv::store::Store>,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     middleware_chain: Option<Arc<middleware::MiddlewareChain>>,
+    // Effective cluster node id (from the running gossip handle), injected into
+    // PHP `$_SERVER` as `EPHPM_NODE_ID`. `None` in single-node mode, where the
+    // Router falls back to `[cluster] node_id` from config.
+    node_id: Option<String>,
 ) -> anyhow::Result<Listeners> {
     let addr: SocketAddr = config.server.listen.parse().context("invalid listen address")?;
 
@@ -449,7 +478,13 @@ async fn bind_listeners(
             file_cache.clone(),
             worker_pool.clone(),
         )
-        .with_middleware_chain(middleware_chain),
+        .with_middleware_chain(middleware_chain)
+        // Expose the effective gossip node id to PHP (EPHPM_NODE_ID). When
+        // clustering is on this is the runtime id -- distinct per node even
+        // when `[cluster] node_id` is left empty (auto-derived per pod in
+        // Kind). In single-node mode this is None, so Router keeps whatever it
+        // derived from `[cluster] node_id`.
+        .with_node_id(node_id),
     );
 
     let has_tls = !matches!(tls_mode, TlsMode::None);

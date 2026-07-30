@@ -14,7 +14,10 @@ tokio-util.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
-dashmap.workspace = true
+# `raw-api` exposes DashMap's inner shards so LRU eviction can sample keys
+# from random shards (O(sample_size), never O(n)) instead of always walking
+# the map from the front. Pinned dashmap 6.x; see store::sample_oldest.
+dashmap = { workspace = true, features = ["raw-api"] }
 parking_lot.workspace = true
 bytes.workspace = true
 flate2.workspace = true

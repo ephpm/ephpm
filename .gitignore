@@ -7,7 +7,7 @@ target/
 # sqld binary cache (downloaded by cargo xtask release)
 /sqld-cache/
 
-# Local tool binaries (downloaded by cargo xtask e2e-install)
+# Local tool binaries (downloaded by cargo xtask k8s-e2e-install)
 /bin/
 
 # IDE

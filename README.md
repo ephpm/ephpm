@@ -382,18 +382,19 @@ cargo deny check
 ### Build & test tooling (xtask)
 
 ```bash
-cargo xtask doctor      # Check build prerequisites (toolchains, PHP SDK cache, optional tools)
-cargo xtask release     # Download PHP SDK + build ephpm binary (release mode)
-cargo xtask php-sdk     # Download only the prebuilt PHP SDK for the host platform
-cargo xtask e2e-install # Download kind, tilt, kubectl to ./bin (no global install)
-cargo xtask e2e         # Run E2E tests (creates Kind cluster, builds images, tilt ci)
-cargo xtask e2e-up      # Start E2E dev env (tilt dashboard at localhost:10350)
-cargo xtask e2e-down    # Tear down Kind cluster
+cargo xtask doctor          # Check build prerequisites (toolchains, PHP SDK cache, optional tools)
+cargo xtask release         # Download PHP SDK + build ephpm binary (release mode)
+cargo xtask php-sdk         # Download only the prebuilt PHP SDK for the host platform
+cargo xtask e2e             # Run bare-process E2E tests (spawns ephpm on 127.0.0.1, no Kind/Tilt)
+cargo xtask k8s-e2e-install # Opt-in: download kind, tilt, kubectl to ./bin
+cargo xtask k8s-e2e         # Opt-in: run E2E in a Kind cluster via tilt ci
+cargo xtask k8s-e2e-up      # Opt-in: start K8s dev env (tilt dashboard at localhost:10350)
+cargo xtask k8s-e2e-down    # Opt-in: tear down Kind cluster
 ```
 
 On Windows, `release` re-invokes itself inside WSL (building a Linux binary from native Windows isn't supported). `php-sdk` is a plain tarball download and works directly on any platform with curl + tar. The PHP SDK is cached at `php-sdk/<version>-<os>-<arch>[-gnu]/` (the `-gnu` libc suffix applies on Linux) — delete that directory to force a re-download.
 
-E2E commands require Podman or Docker. Run `cargo xtask e2e-install` to download kind/tilt/kubectl to `./bin/` — no global install needed. See [site/content/developer/testing.md](site/content/developer/testing.md) for details.
+The default `cargo xtask e2e` spawns bare ephpm processes on 127.0.0.1 — no container engine required. The opt-in `k8s-e2e*` commands require Podman or Docker; run `cargo xtask k8s-e2e-install` to download kind/tilt/kubectl to `./bin/`. See [site/content/developer/testing.md](site/content/developer/testing.md) for details.
 
 ### Code conventions
 

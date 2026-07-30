@@ -9,7 +9,9 @@ Work the ladder top-down. Each step either identifies the failure class or rules
 
 ## 1. Read the failure summary FIRST (bottom of the E2E job log)
 
-`cargo xtask e2e` prints, as the LAST lines on failure (added in #105):
+Default path is `cargo xtask e2e` (bare-process). On failure it dumps each node's stderr file and prints a `==== FAILED E2E SUITES (bare-process) ====` block with the per-suite names.
+
+Opt-in Kind path is `cargo xtask k8s-e2e` (dispatched via `.github/workflows/k8s-e2e.yml`). It prints, as the LAST lines on failure (added in #105):
 - `==== FAILED E2E TESTS ====` - the extracted `... FAILED` / `panicked at` lines. Read these before scrolling anywhere else.
 - `--- ephpm pod: container exit code / signal ---` + a loud banner if the server crashed.
 

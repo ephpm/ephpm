@@ -22,6 +22,7 @@ fn wordpress_integration_placeholder() {
     //    - POST to wp-login.php sets a session cookie
     //    - Pretty permalinks route through PHP correctly
     //
-    // These scenarios are covered by the ephpm-e2e crate which runs in a
-    // Kind cluster via `cargo xtask e2e`.
+    // These scenarios are covered by the ephpm-e2e crate which runs
+    // bare-process via `cargo xtask e2e` (or `cargo xtask k8s-e2e` for the
+    // opt-in Kind path).
 }

@@ -15,10 +15,13 @@ Three nodes, all reachable from each other on UDP 7946 (gossip) and TCP 7947 (KV
 enabled = true
 bind    = "0.0.0.0:7946"
 join    = ["10.0.1.10:7946", "10.0.1.11:7946", "10.0.1.12:7946"]
+secret  = "REPLACE_ME"             # required -- see the security note below
 cluster_id = "ephpm-prod"          # only nodes with the same id will pair
 ```
 
-> **Security note:** set `cluster.secret` (any high-entropy string, e.g. `openssl rand -base64 32`) on every node. When set, all inter-node traffic — gossip UDP **and** the TCP KV data plane — is authenticated and encrypted with ChaCha20-Poly1305 keys derived from the secret via HKDF-SHA256. Nodes without the matching secret cannot join, read, or inject; their packets are silently dropped. When unset, inter-node traffic is unauthenticated plaintext (a warning is logged at startup) — only do that on a trusted private network (VPC, WireGuard, Tailscale) with ports 7946/7947 firewalled from the public internet. Different `cluster_id`s let you run multiple independent clusters on the same network.
+> **Required: `cluster.secret`.** As of this release, clustering **fails to start** if `enabled = true` and `secret` is empty. Set `cluster.secret` (any high-entropy string, e.g. `openssl rand -base64 32`) -- the same value on every node. When set, all inter-node traffic -- gossip UDP **and** the TCP KV data plane -- is authenticated and encrypted with ChaCha20-Poly1305 keys derived from the secret via HKDF-SHA256. Nodes without the matching secret cannot join, read, or inject; their packets are silently dropped. Different `cluster_id`s let you run multiple independent clusters on the same network.
+>
+> **Breaking change:** older releases allowed an empty secret (plaintext, unauthenticated) with only a startup warning. That is now a hard startup error, because an empty secret lets any host on the cluster network forge KV writes (sessions, rate-limit counters, ACME/OPcache keys). If you must run without a secret on a fully trusted private network (VPC, WireGuard, Tailscale) with ports 7946/7947 firewalled from untrusted hosts, opt in explicitly with `allow_insecure_no_auth = true` -- a loud warning is still logged. Not recommended.
 
 `join` only needs to list a few seeds — once a node joins, it discovers the rest.
 
@@ -43,7 +46,7 @@ grpc_listen = "0.0.0.0:5001"       # primary streams WAL frames here
 How it works:
 
 - **Primary election** uses the gossip KV (`kv:sqlite:primary`) with a TTL heartbeat. The lowest-ordinal alive node wins. On failure, the next-lowest takes over within ~10s.
-- The primary spawns sqld in primary mode; replicas spawn sqld in replica mode pointed at the primary's gRPC URL.
+- The primary spawns sqld in primary mode; replicas spawn sqld in replica mode pointed at the primary's gRPC URL. Before a replica dials that URL it validates the advertised host against the live gossip membership list and refuses to connect to a host that is not a known cluster member -- defense in depth so a forged primary claim cannot redirect replication at an attacker-controlled sqld.
 - A role-change watcher SIGTERMs and re-spawns sqld when the role flips.
 
 > Clustered SQLite isn't supported on Windows — Turso doesn't ship a Windows sqld binary. Use single-node SQLite or a real MySQL backend on Windows.
