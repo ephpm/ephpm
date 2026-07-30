@@ -2354,7 +2354,10 @@ impl AutoTune {
         // there: dev mode (no derivation at all) and serve mode on
         // macOS/Windows (no detectable memory budget). PHP then fell back to
         // its own compiled default and the configured value vanished.
-        lines.push(("memory_limit".to_string(), self.memory_limit.value.clone()));
+        // Passing a non-`Default` origin is what forces emission; a bare
+        // `lines.push` here cannot compile, because `push_if_set` holds a
+        // mutable borrow of `lines` that is still live for the calls below.
+        push_if_set("memory_limit", Origin::Explicit, self.memory_limit.value.clone());
         push_if_set(
             "realpath_cache_size",
             self.realpath_cache_size.origin,
