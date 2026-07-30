@@ -103,7 +103,17 @@ impl std::fmt::Debug for ClusterCipher {
 impl ClusterCipher {
     /// Derive a cipher from the shared secret with the given HKDF info.
     fn derive(secret: &str, info: &[u8]) -> Self {
-        let hkdf = Hkdf::<Sha256>::new(None, secret.as_bytes());
+        Self::derive_salted(secret, None, info)
+    }
+
+    /// Derive a cipher from the shared secret, optionally salted.
+    ///
+    /// Private so the `expect` below stays out of the public API: 32 bytes
+    /// is always a valid HKDF-SHA256 output length, so it is unreachable,
+    /// and `clippy::missing_panics_doc` would otherwise make every public
+    /// constructor document a panic that cannot happen.
+    fn derive_salted(secret: &str, salt: Option<&[u8]>, info: &[u8]) -> Self {
+        let hkdf = Hkdf::<Sha256>::new(salt, secret.as_bytes());
         let mut key = [0u8; 32];
         hkdf.expand(info, &mut key).expect("32 bytes is a valid HKDF-SHA256 output length");
         Self { cipher: ChaCha20Poly1305::new(Key::from_slice(&key)) }
@@ -149,11 +159,7 @@ impl ClusterCipher {
     /// `cluster_channel`'s handshake).
     #[must_use]
     pub fn for_cluster_channel_session(secret: &str, transcript: &[u8]) -> Self {
-        let hkdf = Hkdf::<Sha256>::new(Some(transcript), secret.as_bytes());
-        let mut key = [0u8; 32];
-        hkdf.expand(CLUSTER_CHANNEL_SESSION_INFO, &mut key)
-            .expect("32 bytes is a valid HKDF-SHA256 output length");
-        Self { cipher: ChaCha20Poly1305::new(Key::from_slice(&key)) }
+        Self::derive_salted(secret, Some(transcript), CLUSTER_CHANNEL_SESSION_INFO)
     }
 
     /// Seal a plaintext message: `nonce || ciphertext+tag`.
