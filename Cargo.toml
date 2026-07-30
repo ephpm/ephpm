@@ -82,9 +82,16 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire main @ 699e6345 — framework wire-compat: WP + Laravel over MySQL frontend (litewire#11)
-# (ephpm/litewire#9).
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "699e6345d539", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
+# litewire main @ 7a0b59c4 — identifier sanitization in the metadata translator
+# (litewire#12), on top of framework wire-compat (litewire#11).
+#
+# SECURITY: do not move this pin backwards. 699e6345 and earlier interpolate the
+# client-supplied table name straight into SQL text in
+# litewire-translate/src/metadata.rs, and detect_metadata_query() runs before
+# sqlparser, so a crafted identifier in SHOW CREATE TABLE / SHOW INDEX /
+# DESCRIBE becomes arbitrary SQL. 7a0b59c4 adds sanitize_identifier() and
+# applies it at every extraction site.
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "7a0b59c40ce6", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
 
 # Release-profile tuning for v0.4.2 perf release.
 #

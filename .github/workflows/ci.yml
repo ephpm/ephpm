@@ -10,7 +10,12 @@ on:
       - "docs/**"
       - "**.md"
   pull_request:
-    branches: [main]
+    # `main` plus long-lived feature branches that other PRs stack onto.
+    # Without the glob, a PR targeting e.g. feat/turso-cdc-replication gets
+    # NO checks at all -- which is how a 1700-line change to the cluster
+    # transport and the CDC replication protocol ended up with nothing having
+    # so much as type-checked it. Stacked work needs the same gate as main.
+    branches: [main, "feat/**"]
     paths-ignore:
       - "site/**"
       - "docs/**"
@@ -35,7 +40,28 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config libssl-dev
+      - name: Install build prerequisites
+        # Some runners in the fleet come up as root without `sudo` installed, so
+        # a bare `sudo apt-get` exits 127 (command not found) and reds out the
+        # job in under 10s for reasons unrelated to the change under test.
+        # Observed on both Clippy and E2E legs. Resolve the escalation method at
+        # run time rather than assuming it.
+        run: |
+          set -eu
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "apt-get unavailable; assuming the image already provides build prerequisites"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "::error::not running as root and sudo is unavailable"
+            exit 1
+          fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config libssl-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -47,7 +73,28 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config libssl-dev
+      - name: Install build prerequisites
+        # Some runners in the fleet come up as root without `sudo` installed, so
+        # a bare `sudo apt-get` exits 127 (command not found) and reds out the
+        # job in under 10s for reasons unrelated to the change under test.
+        # Observed on both Clippy and E2E legs. Resolve the escalation method at
+        # run time rather than assuming it.
+        run: |
+          set -eu
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "apt-get unavailable; assuming the image already provides build prerequisites"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "::error::not running as root and sudo is unavailable"
+            exit 1
+          fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config libssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
@@ -68,7 +115,28 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     steps:
       - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config libssl-dev
+      - name: Install build prerequisites
+        # Some runners in the fleet come up as root without `sudo` installed, so
+        # a bare `sudo apt-get` exits 127 (command not found) and reds out the
+        # job in under 10s for reasons unrelated to the change under test.
+        # Observed on both Clippy and E2E legs. Resolve the escalation method at
+        # run time rather than assuming it.
+        run: |
+          set -eu
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "apt-get unavailable; assuming the image already provides build prerequisites"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "::error::not running as root and sudo is unavailable"
+            exit 1
+          fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config libssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo install --locked cargo-deny
       - run: cargo deny check
