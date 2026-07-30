@@ -990,6 +990,18 @@ async fn shutdown_signal() {
     }
 }
 
+/// What [`start_kv_service`] hands back: the process-wide default store, the
+/// per-vhost store when `sites_dir` is configured, and the RESP listener's
+/// join handle.
+///
+/// Named rather than written inline so the signature stays under
+/// `clippy::type_complexity`.
+type KvService = (
+    Arc<ephpm_kv::store::Store>,
+    Option<ephpm_kv::multi_tenant::MultiTenantStore>,
+    Option<tokio::task::JoinHandle<()>>,
+);
+
 /// Start the KV store with optional RESP server.
 ///
 /// Returns the process-wide default [`Store`](ephpm_kv::store::Store), the
@@ -1002,13 +1014,7 @@ async fn shutdown_signal() {
 /// to be handed this same instance. Constructing a second one gives each
 /// consumer its own lazily-populated map, and `ephpm_kv_set()` from PHP then
 /// lands in a different `Store` than a Predis `SET` on the same vhost.
-fn start_kv_service(
-    config: &Config,
-) -> anyhow::Result<(
-    Arc<ephpm_kv::store::Store>,
-    Option<ephpm_kv::multi_tenant::MultiTenantStore>,
-    Option<tokio::task::JoinHandle<()>>,
-)> {
+fn start_kv_service(config: &Config) -> anyhow::Result<KvService> {
     // Create the KV store
     let store_config = ephpm_kv::store::StoreConfig {
         memory_limit: parse_memory_size(&config.kv.memory_limit)?,
