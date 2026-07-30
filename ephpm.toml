@@ -49,9 +49,9 @@ index_files = ["index.php", "index.html"]
 # level = "info"           # trace, debug, info, warn, error
 
 [php]
-# mode = "embedded" (default) — PHP linked via FFI, zero overhead
-# mode = "external" — spawn external PHP workers, use any PHP binary
-mode = "embedded"
+# mode = "fpm" (default) — php-fpm-shaped: full startup/shutdown per request
+# mode = "worker" — persistent workers holding a booted framework in memory
+mode = "fpm"
 max_execution_time = 30
 memory_limit = "128M"
 
@@ -68,10 +68,9 @@ ini_overrides = [
     ["error_reporting", "E_ALL"],
 ]
 
-# External mode settings (only used when mode = "external"):
-# binary = "/usr/bin/php"         # path to PHP binary
-# workers = 4                     # number of worker processes
-# worker_script = "vendor/ephpm/worker.php"  # worker loop script
+# Worker mode settings (only used when mode = "worker"):
+# worker_script = "vendor/ephpm/worker.php"  # worker loop script (required)
+# worker_count = 0                # persistent workers; 0 derives from CPU quota
 
 # [server.tls]
 # --- Manual mode (provide your own cert/key) ---

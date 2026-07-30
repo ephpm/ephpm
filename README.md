@@ -103,7 +103,7 @@ document_root = "/var/www/html"
 index_files = ["index.php", "index.html"]
 
 [php]
-mode = "embedded"
+mode = "fpm"
 max_execution_time = 30
 memory_limit = "128M"
 
@@ -221,14 +221,14 @@ ephpm_kv_expire('session:abc', 1800);
 ephpm_kv_del('cart:42');
 ```
 
-Available: `ephpm_kv_get`, `set`, `setnx`, `del`, `exists`, `incr`, `decr`, `incr_by`, `expire`, `ttl`, `pttl`, `flush_all`. These are the recommended API for multi-tenant deployments — the RESP listener has no per-tenant namespace filtering, so leave it disabled and let PHP go through the SAPI bridge.
+Available: `ephpm_kv_get`, `set`, `setnx`, `del`, `exists`, `incr`, `decr`, `incr_by`, `expire`, `ttl`, `pttl`, `flush_all`, `wait`. These are the lowest-latency API — a direct FFI call, no socket. The RESP listener is also safe for multi-tenant use: set `[kv] secret` and each connection is scoped to a single site's keyspace by HMAC AUTH (see below).
 
 ### 3. Need HA? Use the clustered KV tier
 
 In a cluster, the KV store becomes a two-tier distributed store with no extra moving parts — it piggybacks on the same SWIM gossip layer used for SQLite primary election.
 
-- **Small values** (< 1 KB by default) ride the **gossip tier** — eventually consistent, replicated to every node, sub-millisecond reads everywhere.
-- **Large values** live on a **consistent-hash data plane** — each key is owned by N nodes (configurable replication factor), fetched on demand via TCP, with optional hot-key promotion that caches frequently-fetched remote values locally.
+- **Small values** (< 512 bytes by default) ride the **gossip tier** — eventually consistent, replicated to every node, sub-millisecond reads everywhere.
+- **Large values** live on a **hashed data plane** — the owner is `hash(key)` modulo the sorted alive-node list (no consistent-hash ring), replicated to N nodes (configurable replication factor), fetched on demand via TCP, with optional hot-key promotion that caches frequently-fetched remote values locally.
 - **Failover** — when a node leaves the gossip view, the hash ring rebalances and owned keys migrate to the next replicas. No primary, no election — every node can read and write.
 
 ```toml
@@ -237,7 +237,7 @@ enabled = true
 join = ["ephpm-headless.default.svc.cluster.local"]
 
 [cluster.kv]
-small_key_threshold = 1024        # bytes — under this, replicate via gossip
+small_key_threshold = 512         # bytes — under this, replicate via gossip (default)
 replication_factor = 3            # large keys: 3 copies (owner + 2 replicas)
 replication_mode = "async"        # async | sync
 hot_key_cache = true              # cache hot remote values locally
@@ -246,7 +246,7 @@ hot_key_max_memory = "64MB"
 
 ### Multi-tenant security
 
-When `sites_dir` is set, each virtual host gets its own isolated keyspace. The `ephpm_kv_*` PHP functions are namespaced automatically. For the RESP endpoint, ePHPm derives a per-site password from `HMAC-SHA256(kv.secret, hostname)` and injects it into PHP `$_ENV` as `EPHPM_REDIS_PASSWORD` for each request — so `phpredis` can `AUTH` without any per-site config in your code.
+When `sites_dir` is set, each virtual host gets its own isolated keyspace. The `ephpm_kv_*` PHP functions are namespaced automatically. For the RESP endpoint, ePHPm derives a per-site password from `HMAC-SHA256(kv.secret, hostname)` and injects it into PHP `$_SERVER` as `EPHPM_REDIS_PASSWORD` for each request — so `phpredis` can `AUTH` without any per-site config in your code.
 
 ### How it works under the hood
 

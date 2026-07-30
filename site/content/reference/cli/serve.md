@@ -3,13 +3,14 @@ title = "ephpm serve"
 weight = 1
 +++
 
-Start the PHP application server. This is the default command — `ephpm` with no subcommand is `ephpm serve`.
+Start the PHP application server. This is the command service backends invoke.
+
+Note that `ephpm` with **no** subcommand is not `serve` — it starts the [development server](../#ephpm-dev) on port 8080. The subcommand is required for production use.
 
 ## Synopsis
 
 ```bash
 ephpm serve [-c FILE] [-l ADDR] [-d DIR] [-v...]
-ephpm                                              # equivalent
 ```
 
 ## Flags
@@ -25,7 +26,7 @@ ephpm                                              # equivalent
 
 ```bash
 # Default config, default listen
-ephpm
+ephpm serve
 
 # Explicit config file
 ephpm serve --config /etc/ephpm/ephpm.toml
@@ -33,8 +34,8 @@ ephpm serve --config /etc/ephpm/ephpm.toml
 # Quick override for a one-off serve
 ephpm serve --listen 127.0.0.1:9090 --document-root ./public
 
-# Trace logging for debugging
-ephpm -vv
+# Trace logging for debugging (-v lives on the subcommand, not the bare binary)
+ephpm serve -vv
 
 # Drop logs into a file
 RUST_LOG=info ephpm serve 2>&1 | tee /var/log/ephpm.log

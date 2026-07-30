@@ -349,11 +349,6 @@ ephpm_kv_set("user:123:profile", $json, ttl: 3600);
 $json = ephpm_kv_get("user:123:profile");
 ephpm_kv_del("user:123:profile");
 
-// Hash operations
-ephpm_kv_hset("user:123", "email", "user@example.com");
-$email = ephpm_kv_hget("user:123", "email");
-$all = ephpm_kv_hgetall("user:123");
-
 // Atomic operations
 $count = ephpm_kv_incr("page:views");
 $exists = ephpm_kv_exists("cache:key");
@@ -1127,17 +1122,24 @@ For the common case (session key local to the node), ephpm is **1,000-10,000x fa
 
 ### Distributed Locking
 
-General-purpose distributed locks for PHP applications, built on KV with TTL:
+General-purpose distributed locks for PHP applications, built on the atomic
+`ephpm_kv_setnx()` primitive plus a TTL:
 
 ```php
-$lock = ephpm_kv_lock("deploy:mutex", ttl: 30);
-if ($lock) {
-    // critical section
-    ephpm_kv_unlock("deploy:mutex");
+// setnx() returns true only if the key did not already exist.
+if (ephpm_kv_setnx("deploy:mutex", getmypid())) {
+    ephpm_kv_expire("deploy:mutex", 30);  // never hold it forever
+    try {
+        // critical section
+    } finally {
+        ephpm_kv_del("deploy:mutex");
+    }
 }
 ```
 
-Used internally for ACME coordination, available to PHP apps for their own needs.
+ePHPm uses the same KV + TTL pattern internally to elect a single ACME
+certificate requester across the cluster, but that coordination lives in Rust
+(`crates/ephpm-server/src/acme.rs`) — it is not exposed as a PHP lock API.
 
 ### Rate Limiting
 
