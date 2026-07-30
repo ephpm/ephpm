@@ -2077,10 +2077,11 @@ impl PhpConfig {
     /// OPcache/engine ini directives to write into the generated php.ini.
     ///
     /// Layers the full resource-aware autotuning profile (see
-    /// [`Self::autotune`]): `opcache.validate_timestamps` (always), plus every
-    /// tunable whose value came from explicit config **or** a serve-mode
-    /// derivation. Values that resolved to the PHP stock default are omitted so
-    /// the engine's own default applies (keeping dev mode's php.ini minimal).
+    /// [`Self::autotune`]): `opcache.validate_timestamps` and `memory_limit`
+    /// (both always), plus every tunable whose value came from explicit config
+    /// **or** a serve-mode derivation. Values that resolved to the PHP stock
+    /// default are omitted so the engine's own default applies (keeping dev
+    /// mode's php.ini minimal).
     /// All lines are emitted *before* user `ini_overrides`, so an operator can
     /// still override any of them through `ini_overrides` as the final lever.
     #[must_use]
@@ -2278,10 +2279,12 @@ impl AutoTune {
     /// The ini `(key, value)` pairs to write, before user `ini_overrides`.
     ///
     /// `opcache.validate_timestamps` is always emitted (its default is
-    /// mode-dependent, not a PHP stock value). Every other tunable is emitted
-    /// only when its origin is [`Origin::Explicit`] or [`Origin::Derived`];
-    /// values left at the PHP stock default are omitted so the engine default
-    /// applies and dev-mode php.ini stays minimal.
+    /// mode-dependent, not a PHP stock value), and so is `memory_limit` (its
+    /// bottom tier is the `[php] memory_limit` field, not a PHP stock value).
+    /// Every other tunable is emitted only when its origin is
+    /// [`Origin::Explicit`] or [`Origin::Derived`]; values left at the PHP
+    /// stock default are omitted so the engine default applies and dev-mode
+    /// php.ini stays minimal.
     #[must_use]
     pub fn ini_lines(&self) -> Vec<(String, String)> {
         let mut lines: Vec<(String, String)> = Vec::new();
@@ -2324,7 +2327,17 @@ impl AutoTune {
             self.max_accelerated_files.origin,
             format!("{}", self.max_accelerated_files.value),
         );
-        push_if_set("memory_limit", self.memory_limit.origin, self.memory_limit.value.clone());
+        // `memory_limit` is emitted unconditionally, unlike every other
+        // tunable above. Its bottom resolution tier is the `[php] memory_limit`
+        // field, which serde always populates (defaulting to `128M`) and which
+        // an operator may have pinned — it is *not* a PHP stock value the
+        // engine would apply on its own. Routing it through `push_if_set`
+        // dropped the line whenever the origin came out `Origin::Default`,
+        // which is exactly the case where the operator's own value lives
+        // there: dev mode (no derivation at all) and serve mode on
+        // macOS/Windows (no detectable memory budget). PHP then fell back to
+        // its own compiled default and the configured value vanished.
+        lines.push(("memory_limit".to_string(), self.memory_limit.value.clone()));
         push_if_set(
             "realpath_cache_size",
             self.realpath_cache_size.origin,
@@ -3986,10 +3999,17 @@ sites_dir = "/var/www/sites"
     #[test]
     fn test_opcache_ini_lines_dev_default() {
         // Dev mode derives nothing — only the mode-appropriate
-        // validate_timestamps line is emitted, keeping the dev php.ini minimal.
+        // validate_timestamps line plus the always-emitted memory_limit,
+        // keeping the dev php.ini minimal.
         let cfg = PhpConfig::default();
         let lines = cfg.opcache_ini_lines(true);
-        assert_eq!(lines, vec![("opcache.validate_timestamps".to_string(), "1".to_string())]);
+        assert_eq!(
+            lines,
+            vec![
+                ("opcache.validate_timestamps".to_string(), "1".to_string()),
+                ("memory_limit".to_string(), "128M".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -4006,7 +4026,53 @@ sites_dir = "/var/www/sites"
             vec![
                 ("opcache.validate_timestamps".to_string(), "1".to_string()),
                 ("opcache.revalidate_freq".to_string(), "60".to_string()),
+                ("memory_limit".to_string(), "128M".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn test_memory_limit_emitted_in_dev_mode() {
+        // Regression: `[php] memory_limit` resolves through the bottom
+        // ("stock default") tier of the three-tier resolver, so it used to be
+        // filtered out of the generated php.ini as `Origin::Default`. Dev mode
+        // derives nothing, so this is where the drop always bit.
+        let cfg = PhpConfig { memory_limit: "512M".to_string(), ..PhpConfig::default() };
+        let lines = cfg.opcache_ini_lines(true);
+        assert!(
+            lines.contains(&("memory_limit".to_string(), "512M".to_string())),
+            "dev-mode php.ini must carry [php] memory_limit, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_memory_limit_emitted_when_origin_is_default() {
+        // Platform-independent form of the same regression: whatever the host
+        // detects, a memory_limit that resolved to the bottom tier must still
+        // reach the generated ini. This is the serve-mode path on macOS and
+        // Windows, where `read_total_system_memory()` returns `None` so
+        // `derive_tuning` produces no `memory_limit`.
+        let mut at = PhpConfig::default().autotune(true);
+        at.memory_limit = TunedValue { value: "384M".to_string(), origin: Origin::Default };
+        let lines = at.ini_lines();
+        assert!(
+            lines.contains(&("memory_limit".to_string(), "384M".to_string())),
+            "Origin::Default memory_limit must still be emitted, got: {lines:?}"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_memory_limit_emitted_in_serve_mode_without_memory_budget() {
+        // On non-Linux hosts `detect_memory_budget()` yields `None`, so serve
+        // mode derives no memory_limit and the configured value lands in the
+        // bottom tier — the second half of the same regression.
+        let cfg = PhpConfig { memory_limit: "512M".to_string(), ..PhpConfig::default() };
+        let lines = cfg.opcache_ini_lines(false);
+        assert!(
+            lines.contains(&("memory_limit".to_string(), "512M".to_string())),
+            "serve-mode php.ini must carry [php] memory_limit when nothing is \
+             derived, got: {lines:?}"
         );
     }
 
