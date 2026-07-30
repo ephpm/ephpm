@@ -577,9 +577,11 @@ For local keys, ePHPm's KV is **1,000-10,000x faster than Redis** because there'
 
 ### TLS Certificate Management in a Cluster
 
-The clustered KV store backs ePHPm's TLS certificate storage, locking, and ACME challenge coordination. This solves three HA problems that naive auto-TLS implementations get wrong.
+The clustered KV store backs ePHPm's TLS certificate storage and issuance coordination. This section frames three HA problems that naive auto-TLS implementations get wrong.
 
-#### Problem 1: Cert Issuance Race Condition
+> **Implementation status.** Problem 3 (renewal stampede) is solved as described below, in `crates/ephpm-server/src/acme.rs`. Problems 1 and 2 are **design sketches, not implemented**, and the `KvStore.lock` / `KvStore.unlock` and `certs:<domain>:*` primitives they use do not exist. Read them for the shape of the problem, not for current behaviour. What actually ships is: one elected leader drives the whole `rustls-acme` state machine (which subsumes Problem 1 — there is no separate per-domain issuance lock because only one node ever orders), and TLS-ALPN-01 challenge material is *not* shared across nodes, so Let's Encrypt's validation connection must reach the leader.
+
+#### Problem 1: Cert Issuance Race Condition (design sketch — not implemented)
 
 Without coordination, multiple nodes all detect that no cert exists for `example.com` and simultaneously request one from Let's Encrypt. This wastes ACME quota (50 certs/domain/week rate limit) and may trigger rate-limiting bans.
 
@@ -607,7 +609,7 @@ Node B: lock released, checks KvStore → cert exists → done, no issuance need
 
 The lock has a TTL (default 5 minutes) to prevent deadlock if a node crashes mid-issuance. If the lock holder dies, another node acquires the lock after TTL expiry and retries.
 
-#### Problem 2: ACME Challenge Routing
+#### Problem 2: ACME Challenge Routing (design sketch — not implemented)
 
 Let's Encrypt validates domain ownership by making an HTTP request to `http://example.com/.well-known/acme-challenge/<token>`. In a multi-node setup behind a load balancer, the challenge request may hit any node — not necessarily the one that initiated the ACME order.
 
@@ -637,65 +639,62 @@ Let's Encrypt requests: GET http://example.com/.well-known/acme-challenge/abc123
    Let's Encrypt: challenge passed ✓
 ```
 
-This works for HTTP-01 challenges. For TLS-ALPN-01 challenges, the same approach applies — the challenge certificate is stored in the KV store and any node can present it during the TLS handshake.
+**Timing:** Gossip replication typically completes in ~100-200ms. The ACME protocol has a built-in delay between creating the challenge and checking it (the server tells the client to poll for status), so propagation latency would not be the obstacle.
 
-**Timing:** Gossip replication typically completes in ~100-200ms. The ACME protocol has a built-in delay between creating the challenge and checking it (the server tells the client to poll for status), so propagation latency is not an issue.
+**What ships today:** ePHPm requests TLS-ALPN-01, and `rustls-acme` holds that challenge certificate in the ordering node's in-memory resolver — nothing writes it to the KV store, so no other node can present it. `ephpm-server` does serve `/.well-known/acme-challenge/<token>` out of `acme:challenge:<token>`, but nothing populates those keys either. Until challenge sharing is built, point the domain at one node during issuance or use manual TLS.
 
-#### Problem 3: Renewal Stampede
+#### Problem 3: Renewal Stampede (implemented)
 
 All nodes notice the cert for `example.com` expires in 29 days. Without coordination, all nodes attempt renewal simultaneously.
 
 **Solution: Leader election for cert renewal.**
 
-One node is responsible for certificate renewals at any given time. Election uses the KV store:
+One node is responsible for certificate renewals at any given time. Election uses the KV store (`crates/ephpm-server/src/acme.rs`):
 
 ```
-KvStore.set("acme:leader", node_id="A", ttl=60s)
-  → Node A is the cert renewal leader
-  → Node A refreshes the TTL every 30s (heartbeat)
-  → Node A checks all certs, renews any expiring within 30 days
+SETNX "acme:leader" = <node_id>, ttl=30s
+  → claim is atomic within a process; the gossip tier has no compare-and-swap
+  → holder refreshes the TTL every 10s (heartbeat)
+  → a node that sees a different holder yields unless its own id sorts lower
+  → a claim must survive 2 consecutive heartbeats before the node acts on it
 
-If Node A dies:
-  → TTL expires after 60s
-  → Node B or C acquires leadership
-  → New leader picks up renewal duties
+If the leader dies:
+  → the key expires after 30s
+  → another node's SETNX succeeds
+  → after 2 confirming heartbeats it starts driving ordering and renewal
 ```
 
-Only the leader initiates renewals. All other nodes receive the renewed certs via KV replication. This reduces ACME requests to the minimum necessary (one request per cert, regardless of cluster size).
+Only the leader drives the `rustls-acme` state machine, so only the leader can place an order. A follower's cache lookup is held open rather than reported as a miss, and a miss is the only thing that makes `rustls-acme` order — so N nodes can never turn into N duplicate orders. Renewal timing itself is `rustls-acme`'s: 2/3 of certificate validity, hardcoded, roughly 30 days before expiry for a 90-day Let's Encrypt certificate.
 
-#### Full Cert Lifecycle
+**Not yet implemented:** a running follower does not pick up a *renewed* certificate. `rustls-acme` consults its cert cache exactly once per `AcmeState`, and its resolver's `set_cert` is `pub(crate)`, so nothing outside the state machine can install a fresh certificate. Followers serve the certificate they loaded at startup until they restart. Closing this needs a KV-backed `ResolvesServerCert` of ePHPm's own.
+
+#### Full Cert Lifecycle (as implemented)
 
 ```
-1. First HTTPS request arrives for example.com
+1. Every node starts its ACME event loop and begins the leadership heartbeat
        │
        ▼
-2. Node checks KvStore for "certs:example.com:cert"
-   ├── Found → use it, serve request with TLS
-   └── Not found ↓
+2. One node's claim survives 2 consecutive heartbeats → it is the leader
        │
-3. Acquire lock: KvStore.lock("acme:lock:example.com")
-   ├── Lock held by another node → wait, then goto 2
-   └── Lock acquired ↓
+       ▼
+3. rustls-acme asks LayeredCache for a cached cert (KV tier, then local DirCache)
+   ├── Hit  → deploy into the resolver, sleep until 2/3 of validity
+   ├── Miss on the leader   → report the miss; rustls-acme places an order
+   └── Miss on a follower   → hold the lookup open, re-check every 5s
        │
-4. Create ACME order (Let's Encrypt)
+4. Leader orders from Let's Encrypt and answers the TLS-ALPN-01 challenge
+   (validation must reach the leader — challenge material is not shared yet)
        │
-5. Store challenge token: KvStore.set("acme:challenge:<token>", response)
-       │ (replicated to all nodes via gossip)
+5. Leader deploys the new cert and its cache writes the PEM to
+   "acme:cert:<domains>:cert:<directory-hash>" plus the local DirCache
+       │ (KV entry replicated to all nodes via gossip)
        │
-6. Tell Let's Encrypt to verify → challenge request hits any node → passes
+6. Each follower's held-open lookup now returns the cert → deployed locally
        │
-7. Download issued cert
-       │
-8. Store cert: KvStore.set("certs:example.com:cert", cert_pem)
-   Store key:  KvStore.set("certs:example.com:key", key_pem)
-       │ (replicated to all nodes via gossip)
-       │
-9. Release lock: KvStore.unlock("acme:lock:example.com")
-       │
-10. All nodes now have the cert locally (replica) → zero-latency TLS handshakes
+7. Renewal: the leader's timer fires at 2/3 validity → back to step 4
 ```
 
-No external cert store (Redis, S3, etcd) needed. No external lock service (etcd, Consul) needed. Zero-config clustered HTTPS using ePHPm's built-in KV store and gossip protocol.
+No external cert store (Redis, S3, etcd) and no external lock service (etcd, Consul) are needed — ePHPm's built-in KV store and gossip protocol carry the certificate and the election. Two gaps remain before this is hands-off in a cluster: TLS-ALPN-01 challenge material is not shared between nodes, and a running follower does not pick up a renewed certificate until it restarts.
 
 ---
 

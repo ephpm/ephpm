@@ -260,20 +260,24 @@ cache_dir = "/var/lib/ephpm/certs"
 # staging = true  # use for testing to avoid rate limits
 ```
 
-**Clustered** (Phase 2 — requires KV store and gossip): In a multi-node deployment, naive ACME creates several problems that the clustered KV store solves:
+**Clustered** (requires KV store and gossip): In a multi-node deployment, naive ACME creates several problems that the clustered KV store addresses. The implementation lives in `crates/ephpm-server/src/acme.rs`.
 
-| Problem | What happens | Solution |
+| Problem | What happens | What ePHPm does |
 |---------|-------------|----------|
-| **Renewal stampede** | N nodes all try to renew simultaneously, hitting Let's Encrypt rate limits (50 certs/domain/week) | Distributed lock via KV (`acme:lock:<domain>` key with TTL). One node wins, renews, others wait. |
-| **Challenge routing** | Let's Encrypt connects to the domain, DNS round-robins to any node, but only the initiating node has the challenge token | Share challenge tokens via KV (`acme:challenge:<token>` keys). Any node can respond. |
-| **Cert distribution** | After one node obtains the cert, all nodes need it immediately | Store cert in KV (`certs:<domain>` key), replicate via gossip. All nodes pick it up. |
-| **Leader election** | Only one node should drive renewals to avoid redundant work | KV-based leader (`acme:leader` key with TTL heartbeat). Leader renews, followers watch. |
+| **Renewal stampede** | N nodes all try to renew simultaneously; five duplicate certificates for the same domain set in a week is a hard Let's Encrypt lockout | Only the elected leader drives the `rustls-acme` state machine. A follower's cache lookup is held open instead of reporting a miss, and a miss is the only thing that makes `rustls-acme` place an order. |
+| **Challenge routing** | Let's Encrypt connects to the domain, DNS round-robins to any node, but only the ordering node holds the challenge material | **Not yet implemented.** ePHPm uses TLS-ALPN-01, and `rustls-acme` keeps that challenge certificate in the ordering node's in-memory resolver — it is not shared. Validation succeeds only when Let's Encrypt's connection reaches the leader. Point the domain at a single node, or use manual TLS, until challenge sharing lands. (`ephpm-server` can serve an HTTP-01 response out of `acme:challenge:<token>`, but nothing writes those keys yet.) |
+| **Cert distribution** | After one node obtains the cert, all nodes need it | The leader's cache writes the PEM to the KV store (`acme:cert:<domains>:cert:<directory-hash>`) as part of the `rustls-acme` state machine; gossip replicates it, and each follower loads it on its own first cache lookup. |
+| **Leader election** | Only one node should drive ordering and renewal | `acme:leader` key with a TTL heartbeat, plus a lowest-node-id tie-break. |
 
-The `rustls-acme` crate has a pluggable `Cache` trait — swap `DirCache` for a `KvCache` implementation when clustering is built. Zero changes to the ACME logic itself.
+**Leader election is not a strict lock.** The gossip KV tier exposes only last-write-wins set/get/delete over eventually consistent state — there is no compare-and-swap to build a real distributed lock on. The claim is atomic within a process (`SETNX`), and across nodes it converges via the tie-break: a node that observes a different holder yields unless its own id sorts lower. A claim must survive two consecutive heartbeats before the node acts on it, which keeps the ~1-3s gossip propagation window from turning into duplicate orders.
+
+**Not yet implemented — follower renewal pickup.** A follower loads the leader's certificate once, at startup. `rustls-acme` consults its cert cache exactly once per `AcmeState`, and its resolver's `set_cert` is `pub(crate)`, so a renewed certificate cannot be pushed into a running follower from outside the state machine. Followers keep serving the certificate they started with until they restart. Closing this requires a KV-backed `ResolvesServerCert` implementation of our own.
+
+The `rustls-acme` crate has a pluggable `Cache` trait, which is what makes this possible: `LayeredCache` writes through to both a `KvCache` (cluster-wide) and the local `DirCache`, and prefers the KV tier on read.
 
 ```
-Phase 1 (single-node):  AcmeConfig → DirCache (filesystem)
-Phase 2 (clustered):    AcmeConfig → KvCache (gossip-replicated KV store)
+Single-node:  AcmeConfig → DirCache (filesystem)
+Clustered:    AcmeConfig → LayeredCache → KvCache (gossip-replicated) + DirCache (local)
 ```
 
 ## Compression
