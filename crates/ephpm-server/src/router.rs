@@ -210,6 +210,10 @@ pub struct Router {
     /// so we don't repeat the parse per response.
     response_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
     store: Arc<Store>,
+    /// Per-vhost KV stores. Cloned from the single instance `start_kv_service`
+    /// builds and shares with the RESP listener, so a vhost's keyspace is the
+    /// same `Arc<Store>` whether it is reached from PHP or over RESP.
+    /// `None` outside multi-tenant mode.
     multi_tenant_kv: Option<ephpm_kv::multi_tenant::MultiTenantStore>,
     open_basedir: bool,
     php_etag_cache_config: ephpm_config::PhpETagCacheConfig,
@@ -401,10 +405,21 @@ fn scan_sites_dir(
 }
 
 impl Router {
+    /// Build the router.
+    ///
+    /// `multi_tenant_kv` must be the process-wide instance created by
+    /// `start_kv_service` — the same handle the RESP listener is given. The
+    /// router does **not** create its own: a `MultiTenantStore` owns the
+    /// hostname → `Arc<Store>` map that defines a vhost's keyspace, so a
+    /// second instance would give the PHP path a different set of stores than
+    /// RESP clients get for the same hostnames. Pass `None` when
+    /// `[server] sites_dir` is unset (single-site mode, where every request
+    /// uses `store` directly) or in tests that never exercise per-vhost KV.
     #[must_use]
     pub fn new(
         config: &Config,
         store: Arc<Store>,
+        multi_tenant_kv: Option<ephpm_kv::multi_tenant::MultiTenantStore>,
         metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
         limiter: Option<Arc<crate::rate_limit::Limiter>>,
         file_cache: Option<Arc<crate::file_cache::FileCache>>,
@@ -528,14 +543,7 @@ impl Router {
                 })
                 .collect(),
             open_basedir,
-            multi_tenant_kv: if config.server.sites_dir.is_some() {
-                Some(ephpm_kv::multi_tenant::MultiTenantStore::new(
-                    Arc::clone(&store),
-                    ephpm_kv::store::StoreConfig::default(),
-                ))
-            } else {
-                None
-            },
+            multi_tenant_kv,
             store,
             php_etag_cache_config: config.server.php_etag_cache.clone(),
             metrics_handle,
@@ -2538,7 +2546,7 @@ mod tests {
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        Router::new(&config, test_store(), None, None, None, None)
+        Router::new(&config, test_store(), None, None, None, None, None)
     }
 
     // ── Ingest header hygiene (Finding 3) ────────────────────────────────
@@ -2635,7 +2643,7 @@ mod tests {
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        Router::new(&config, test_store(), None, None, None, None)
+        Router::new(&config, test_store(), None, None, None, None, None)
     }
 
     #[allow(dead_code)]
@@ -2660,7 +2668,7 @@ mod tests {
             opcache: ephpm_config::OpcacheConfig::default(),
         };
         config.server.static_files.etag = true;
-        Router::new(&config, store, None, None, None, None)
+        Router::new(&config, store, None, None, None, None, None)
     }
 
     fn default_compression() -> CompressionSettings {
@@ -2865,7 +2873,7 @@ mod tests {
         };
         config.server.security.get_or_insert_default().trusted_proxies =
             vec!["10.0.0.0/8".to_string()];
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         // 203.0.113.50 is the real client, 10.0.0.1 is the proxy
         let xff = "203.0.113.50, 10.0.0.1";
@@ -2890,7 +2898,7 @@ mod tests {
         };
         config.server.security.get_or_insert_default().trusted_proxies =
             vec!["10.0.0.0/8".to_string()];
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         let xff = "10.0.0.2, 10.0.0.1";
         let ip = router.resolve_xff(xff);
@@ -2943,7 +2951,7 @@ mod tests {
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert_eq!(router.server_port, 3000);
     }
 
@@ -2963,7 +2971,7 @@ mod tests {
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert_eq!(router.server_port, 8080);
     }
 
@@ -2985,7 +2993,7 @@ mod tests {
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert!(router.open_basedir, "multi-tenant mode must default open_basedir on");
     }
 
@@ -3004,7 +3012,7 @@ mod tests {
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert!(!router.open_basedir);
     }
 
@@ -3049,7 +3057,7 @@ mod tests {
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert!(router.is_php_allowed("/anything.php"));
     }
 
@@ -3070,7 +3078,7 @@ mod tests {
         };
         config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-login.php".to_string()];
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert!(router.is_php_allowed("/index.php"));
         assert!(router.is_php_allowed("/wp-login.php"));
         assert!(!router.is_php_allowed("/evil.php"));
@@ -3093,7 +3101,7 @@ mod tests {
         };
         config.server.security.get_or_insert_default().allowed_php_paths =
             vec!["/index.php".to_string(), "/wp-admin/*.php".to_string()];
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert!(router.is_php_allowed("/index.php"));
         assert!(router.is_php_allowed("/wp-admin/admin.php"));
         assert!(router.is_php_allowed("/wp-admin/options.php"));
@@ -3325,7 +3333,7 @@ mod tests {
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert_eq!(router.server_port, 9090);
     }
 
@@ -3727,7 +3735,7 @@ echo "post response";
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("example.com");
         assert_eq!(doc_root, site_dir);
@@ -3753,7 +3761,7 @@ echo "post response";
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("unknown.com");
         assert_eq!(doc_root, dir.path());
@@ -3780,7 +3788,7 @@ echo "post response";
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("example.com:8080");
         assert_eq!(doc_root, site_dir);
@@ -3807,7 +3815,7 @@ echo "post response";
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("Example.COM");
         assert_eq!(doc_root, site_dir);
@@ -3831,7 +3839,7 @@ echo "post response";
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         let (doc_root, _, _) = router.resolve_site("anything.com");
         assert_eq!(doc_root, dir.path());
@@ -3859,7 +3867,7 @@ echo "post response";
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         let (doc_root, index_files, fallback) = router.resolve_site("myblog.com");
         let resolved = router.resolve_fallback("/", "", &doc_root, index_files, fallback);
@@ -3890,7 +3898,7 @@ echo "post response";
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         // Host doesn't exist yet — should fall back to default.
         let (doc_root, _, _) = router.resolve_site("new-site.com");
@@ -3936,7 +3944,7 @@ echo "post response";
             middleware: Vec::new(),
             opcache: ephpm_config::OpcacheConfig::default(),
         };
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         // Site exists — should resolve.
         let (doc_root, _, _) = router.resolve_site("temp-site.com");
@@ -4202,14 +4210,14 @@ data: two
         };
 
         config.server.timeouts.request = 0;
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert!(
             router.request_timeout.is_zero(),
             "request = 0 must disable the per-request deadline"
         );
 
         config.server.timeouts.request = 30;
-        let router = Router::new(&config, test_store(), None, None, None, None);
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert_eq!(router.request_timeout, Duration::from_secs(30));
     }
 }
