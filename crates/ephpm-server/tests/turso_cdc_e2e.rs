@@ -7,8 +7,10 @@
 //!
 //! - Writes on the primary appear on the replica (DDL + INSERT + UPDATE + DELETE)
 //! - Killing the replica session (drop the yamux stream) and starting
-//!   a fresh one does not double-apply already-replicated batches
-//!   (idempotency via litewire's monotonic apply watermark)
+//!   a fresh one **resumes**: batches produced during the gap still
+//!   arrive (the subscriber announces its watermark and the primary
+//!   tails from exactly there) and nothing is applied twice
+//!   (litewire's monotonic apply watermark)
 //!
 //! # Scope note
 //!
@@ -24,7 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ephpm_cluster::{
-    ChannelFeatureFlags, ChannelHandle, IncomingStream, maybe_start_cluster_channel, start_gossip,
+    ChannelFeatureFlags, ChannelHandle, ChannelStream, IncomingStream,
+    maybe_start_cluster_channel, start_gossip,
 };
 use ephpm_config::{ClusterChannelConfig, ClusterConfig};
 use litewire::backend::{Backend, Value};
@@ -32,7 +35,6 @@ use litewire::litewire_turso::Turso;
 use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, read_watermark};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::broadcast;
 
 const CDC_STREAM_TYPE: &str = "cdc/default";
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
@@ -43,6 +45,8 @@ const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 enum Frame {
+    /// Replica → primary, first frame: the watermark to resume from.
+    Subscribe { from_change_id: i64 },
     Batch { rows: Vec<WireCdcRow> },
     Ping,
 }
@@ -142,52 +146,52 @@ fn pick_free_port() -> String {
     s.local_addr().unwrap().to_string()
 }
 
-/// Spawn a primary tail loop + a channel handler for `cdc/default`.
+/// Register the primary's `cdc/default` handler. Each inbound stream
+/// gets its own `CdcTailer` anchored at the watermark the subscriber
+/// announces — the production shape, and the thing that makes a
+/// reconnect resume instead of skip.
 ///
 /// Returns the primary's channel address (what a replica dials).
 async fn spawn_primary_on_channel(
     mgmt: Arc<Turso>,
     channel: &ChannelHandle,
 ) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
-    let (tx, _rx0) = broadcast::channel::<Arc<TxnBatch>>(1024);
-
-    // Register the CDC stream-type handler.
     let mut cdc_streams = channel.register_exact(CDC_STREAM_TYPE);
-    let tx_for_subs = tx.clone();
     let dispatch = tokio::spawn(async move {
         while let Some(incoming) = cdc_streams.recv().await {
-            let mut rx = tx_for_subs.subscribe();
-            let IncomingStream { mut stream, .. } = incoming;
+            let IncomingStream { stream, .. } = incoming;
+            let mgmt = Arc::clone(&mgmt);
             tokio::spawn(async move {
-                while let Ok(batch) = rx.recv().await {
-                    let frame =
-                        Frame::Batch { rows: batch.rows.iter().map(WireCdcRow::from).collect() };
-                    if write_frame(&mut stream, &frame).await.is_err() {
-                        break;
-                    }
+                if let Err(e) = serve_one_subscriber(stream, &mgmt).await {
+                    eprintln!("serve subscriber: {e:#}");
                 }
             });
         }
     });
 
-    // Tail loop.
-    let tail = tokio::spawn(async move {
-        let mut tailer = CdcTailer::new(&mgmt, 0);
-        loop {
-            match tailer.poll_batch().await {
-                Ok(Some(batch)) => {
-                    let _ = tx.send(Arc::new(batch));
-                }
-                Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
-                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-            }
-        }
-    });
-
-    (channel.listen_addr(), vec![dispatch, tail])
+    (channel.listen_addr(), vec![dispatch])
 }
 
-/// Spawn a replica: dial the primary's channel and apply frames.
+async fn serve_one_subscriber(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Result<()> {
+    let from = match read_frame(&mut stream).await? {
+        Frame::Subscribe { from_change_id } => from_change_id,
+        _ => anyhow::bail!("expected Subscribe as the first frame"),
+    };
+    let mut tailer = CdcTailer::new(mgmt, from);
+    loop {
+        match tailer.poll_batch().await {
+            Ok(Some(batch)) => {
+                let frame =
+                    Frame::Batch { rows: batch.rows.iter().map(WireCdcRow::from).collect() };
+                write_frame(&mut stream, &frame).await?;
+            }
+            Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+            Err(e) => anyhow::bail!("tail poll: {e}"),
+        }
+    }
+}
+
+/// Spawn a replica: announce our watermark, then apply frames.
 async fn spawn_replica_on_channel(
     mgmt: Arc<Turso>,
     primary_addr: std::net::SocketAddr,
@@ -197,19 +201,29 @@ async fn spawn_replica_on_channel(
     tokio::spawn(async move {
         loop {
             match channel.dial(primary_addr, CDC_STREAM_TYPE).await {
-                Ok(mut stream) => loop {
-                    match read_frame(&mut stream).await {
-                        Ok(Frame::Batch { rows }) => {
-                            let batch =
-                                TxnBatch { rows: rows.into_iter().map(CdcRow::from).collect() };
-                            if let Err(e) = apply_batch(&apply_conn, &batch).await {
-                                eprintln!("apply_batch: {e:#}");
+                Ok(mut stream) => {
+                    let wm = read_watermark(&apply_conn).await.unwrap_or(0);
+                    let subscribed =
+                        write_frame(&mut stream, &Frame::Subscribe { from_change_id: wm }).await;
+                    if subscribed.is_ok() {
+                        loop {
+                            match read_frame(&mut stream).await {
+                                Ok(Frame::Batch { rows }) if !rows.is_empty() => {
+                                    let batch = TxnBatch {
+                                        rows: rows.into_iter().map(CdcRow::from).collect(),
+                                    };
+                                    if let Err(e) = apply_batch(&apply_conn, &batch).await {
+                                        eprintln!("apply_batch: {e:#}");
+                                        break;
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(_) => break,
                             }
                         }
-                        Ok(Frame::Ping) => {}
-                        Err(_) => break,
                     }
-                },
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
             }
         }
@@ -305,12 +319,30 @@ async fn two_node_cdc_replicates_ddl_and_dml_end_to_end_via_channel() {
     assert!(wm > 0, "replica watermark did not advance: {wm}");
 }
 
-/// Idempotency across replica reconnect: kill the yamux stream
-/// mid-flight and start a fresh dial. The fresh session starts from
-/// cursor 0 and re-applies every batch; the watermark should keep
-/// the row count at 5, not 10.
+/// Reconnect must **resume**, not skip and not duplicate.
+///
+/// The earlier version of this test stopped after the reconnect and
+/// asserted the row count was still 5. That proved nothing: with no
+/// writes after the reconnect the second subscriber received zero
+/// frames, so the assertion passed for the wrong reason and would
+/// equally have passed while the primary silently dropped every batch
+/// that landed in the gap.
+///
+/// This version writes on both sides of the reconnect and checks both
+/// halves of the property:
+///
+/// - rows written *before* the reconnect are still there exactly once
+///   (no double-apply — the watermark held), and
+/// - rows written *after* the reconnect arrive (no permanent loss —
+///   the new subscriber resumed from the replica's watermark instead of
+///   starting wherever the primary happened to be).
+///
+/// The second half is the CRIT-3 regression: under the shared
+/// `broadcast` fan-out the fresh subscriber only ever saw values sent
+/// after its `subscribe()` call, so anything produced during the
+/// reconnect window was gone for good.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn replica_reconnect_via_channel_does_not_double_apply() {
+async fn replica_reconnect_via_channel_resumes_without_double_apply() {
     let primary_file = tempfile::NamedTempFile::new().unwrap();
     let replica_file = tempfile::NamedTempFile::new().unwrap();
 
@@ -353,11 +385,44 @@ async fn replica_reconnect_via_channel_does_not_double_apply() {
     .await;
     assert!(converged, "first replica did not converge");
 
+    let watermark_before = read_watermark(&replica_mgmt.raw_connection().unwrap()).await.unwrap();
+    assert!(watermark_before > 0, "precondition: replica applied something");
+
+    // Kill the session. Write while nobody is subscribed — these rows
+    // are produced entirely inside the reconnect gap.
     first_replica.abort();
+    for i in 6..=8 {
+        session.execute(&format!("INSERT INTO t VALUES ({i}, 'gap{i}')"), &[]).await.unwrap();
+    }
+
     let _second_replica =
         spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary_addr, replica_channel_2).await;
-    tokio::time::sleep(Duration::from_millis(700)).await;
 
+    // ...and after it is back, one more.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    session.execute("INSERT INTO t VALUES (9, 'after')", &[]).await.unwrap();
+
+    let converged = eventually_async(
+        || {
+            let rw = Arc::clone(&replica_wire);
+            async move { count_rows(&rw, "t").await == 9 }
+        },
+        Duration::from_secs(10),
+    )
+    .await;
     let n = count_rows(&replica_wire, "t").await;
-    assert_eq!(n, 5, "reconnected replica double-applied rows: {n}");
+    assert!(
+        converged,
+        "reconnected replica did not resume: expected 9 rows, got {n} (rows written during \
+         the reconnect gap were dropped)"
+    );
+
+    // Exactly once, not twice: the pre-reconnect rows survived and the
+    // gap rows were not applied twice.
+    let rs = replica_wire.query("SELECT COUNT(DISTINCT id) FROM t", &[]).await.unwrap();
+    assert_eq!(rs.rows[0][0], Value::Integer(9));
+    let rs = replica_wire.query("SELECT v FROM t WHERE id = 1", &[]).await.unwrap();
+    assert_eq!(rs.rows[0][0], Value::Text("r1".into()));
+    let rs = replica_wire.query("SELECT v FROM t WHERE id = 7", &[]).await.unwrap();
+    assert_eq!(rs.rows[0][0], Value::Text("gap7".into()));
 }

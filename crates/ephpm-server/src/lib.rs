@@ -241,12 +241,18 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 ///
 /// The single source of truth for the "if nothing needs it, don't bind
 /// it" contract — extend this when adding a new channel feature.
+///
+/// The conditions must match the ones `start_db_proxies` uses to
+/// actually take the CDC path, `is_clustered_sqlite()` included:
+/// without that last check a config with `replication.role = "single"`
+/// would open a channel listener and only *then* log that
+/// `cdc_experimental` is being ignored.
 fn resolve_channel_features(config: &Config) -> ephpm_cluster::ChannelFeatureFlags {
-    let cdc = config
-        .db
-        .sqlite
-        .as_ref()
-        .is_some_and(|s| s.replication.cdc_experimental && s.engine == "turso");
+    let cdc = config.db.sqlite.as_ref().is_some_and(|s| {
+        s.replication.cdc_experimental
+            && s.engine == "turso"
+            && is_clustered_sqlite(s, config.cluster.enabled)
+    });
     ephpm_cluster::ChannelFeatureFlags { cdc }
 }
 

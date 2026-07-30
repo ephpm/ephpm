@@ -939,6 +939,24 @@ pub struct ReplicationConfig {
     /// [`ClusterChannelConfig`]: super::ClusterChannelConfig
     #[serde(default = "default_cdc_listen")]
     pub cdc_listen: String,
+
+    /// Maximum snapshot-bootstrap payload a cold replica will accept
+    /// from the primary, in bytes. Default: 1 GiB.
+    ///
+    /// Only consulted on the CDC-native path
+    /// (`cdc_experimental = true`), where a joining replica pulls a
+    /// logical dump of the primary's database over the cluster channel.
+    /// The advertised length in the snapshot header is checked against
+    /// this before any buffer is reserved, and the running total is
+    /// checked as chunks arrive — so a peer that streams forever, or
+    /// claims an absurd length, is cut off instead of exhausting
+    /// memory.
+    ///
+    /// Raise it if a legitimate database dump is larger than the
+    /// default; bootstrap fails with a message naming this knob when it
+    /// is too low.
+    #[serde(default = "default_max_snapshot_bytes")]
+    pub max_snapshot_bytes: u64,
 }
 
 impl Default for ReplicationConfig {
@@ -948,12 +966,17 @@ impl Default for ReplicationConfig {
             primary_grpc_url: String::new(),
             cdc_experimental: false,
             cdc_listen: default_cdc_listen(),
+            max_snapshot_bytes: default_max_snapshot_bytes(),
         }
     }
 }
 
 fn default_cdc_listen() -> String {
     "0.0.0.0:5015".to_string()
+}
+
+fn default_max_snapshot_bytes() -> u64 {
+    1024 * 1024 * 1024
 }
 
 /// Configuration for a single database backend (`MySQL` or `PostgreSQL`).
