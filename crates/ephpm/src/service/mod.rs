@@ -175,12 +175,17 @@ impl Paths {
 /// `document_root` is the path written into the generated `[server]` section so
 /// that Windows installs reference `C:\ProgramData\ephpm\www` and Unix installs
 /// reference `/var/www/html`.
+///
+/// The body must round-trip through `Config::load` + `Config::validate` — the
+/// installer writes this file and then *starts* the service, so anything
+/// `validate()` rejects turns a fresh install into a service that dies on
+/// boot. `default_config_parses_and_validates` pins that.
 #[must_use]
 pub fn default_config_toml(document_root: &Path) -> String {
     let document_root_str = document_root.display().to_string();
     let escaped = document_root_str.replace('\\', "\\\\");
     format!(
-        "[server]\nlisten = \"0.0.0.0:8080\"\ndocument_root = \"{escaped}\"\nindex_files = [\"index.php\", \"index.html\"]\n\n[php]\nmode = \"embedded\"\nmax_execution_time = 30\nmemory_limit = \"128M\"\n"
+        "[server]\nlisten = \"0.0.0.0:8080\"\ndocument_root = \"{escaped}\"\nindex_files = [\"index.php\", \"index.html\"]\n\n[php]\nmode = \"fpm\"\nmax_execution_time = 30\nmemory_limit = \"128M\"\n"
     )
 }
 
@@ -524,8 +529,29 @@ mod tests {
         assert!(toml.contains("listen = \"0.0.0.0:8080\""));
         assert!(toml.contains("document_root = \"/var/www/html\""));
         assert!(toml.contains("[php]"));
+        assert!(toml.contains("mode = \"fpm\""));
         assert!(toml.contains("memory_limit = \"128M\""));
         assert!(toml.contains("max_execution_time = 30"));
+    }
+
+    #[test]
+    fn default_config_parses_and_validates() {
+        // `install()` writes this file and then immediately starts the
+        // service, so the generated body must survive exactly what the serve
+        // path does to it: `Config::load` followed by `Config::validate`.
+        // Asserting on substrings alone previously let `mode = "embedded"`
+        // ship — a value `validate()` rejects, so every fresh install came up
+        // dead.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ephpm.toml");
+        std::fs::write(&path, default_config_toml(Path::new("/var/www/html")))
+            .expect("write generated config");
+
+        let config = ephpm_config::Config::load(&path).expect("generated config must parse");
+        config.validate().expect("generated config must pass validate()");
+        assert_eq!(config.php.mode, "fpm");
+        assert_eq!(config.php.max_execution_time, 30);
+        assert_eq!(config.php.memory_limit, "128M");
     }
 
     #[test]

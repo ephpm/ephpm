@@ -60,7 +60,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     };
 
     // Start background services.
-    let (kv_store, _kv_handle) = start_kv_service(&config)?;
+    let (kv_store, multi_tenant_kv, _kv_handle) = start_kv_service(&config)?;
 
     // Wire the KV store into the middleware host table (a no-op when no
     // middleware is mounted), then load the chain — fail fast at startup on
@@ -231,9 +231,15 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // empty and auto-derived), else None (Router falls back to config).
     let effective_node_id = cluster_handle.as_ref().map(|h| h.self_node().id.clone());
 
-    let listeners =
-        bind_listeners(&config, kv_store, metrics_handle, middleware_chain, effective_node_id)
-            .await?;
+    let listeners = bind_listeners(
+        &config,
+        kv_store,
+        multi_tenant_kv,
+        metrics_handle,
+        middleware_chain,
+        effective_node_id,
+    )
+    .await?;
 
     let _db_handles = start_db_proxies(&config, cluster_handle.as_ref(), &query_stats).await?;
 
@@ -281,6 +287,10 @@ struct ConnSettings {
 async fn bind_listeners(
     config: &Config,
     kv_store: Arc<ephpm_kv::store::Store>,
+    // The one `MultiTenantStore` built by `start_kv_service`. `Some` exactly
+    // when `[server] sites_dir` is set; shared with the RESP listener so PHP
+    // and RESP clients see one keyspace per vhost.
+    multi_tenant_kv: Option<ephpm_kv::multi_tenant::MultiTenantStore>,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     middleware_chain: Option<Arc<middleware::MiddlewareChain>>,
     // Effective cluster node id (from the running gossip handle), injected into
@@ -432,6 +442,7 @@ async fn bind_listeners(
         Router::new(
             config,
             kv_store,
+            multi_tenant_kv,
             metrics_handle,
             limiter.clone(),
             file_cache.clone(),
@@ -1035,10 +1046,31 @@ async fn shutdown_signal() {
     }
 }
 
+/// What [`start_kv_service`] hands back: the process-wide default store, the
+/// per-vhost store when `sites_dir` is configured, and the RESP listener's
+/// join handle.
+///
+/// Named rather than written inline so the signature stays under
+/// `clippy::type_complexity`.
+type KvService = (
+    Arc<ephpm_kv::store::Store>,
+    Option<ephpm_kv::multi_tenant::MultiTenantStore>,
+    Option<tokio::task::JoinHandle<()>>,
+);
+
 /// Start the KV store with optional RESP server.
-fn start_kv_service(
-    config: &Config,
-) -> anyhow::Result<(Arc<ephpm_kv::store::Store>, Option<tokio::task::JoinHandle<()>>)> {
+///
+/// Returns the process-wide default [`Store`](ephpm_kv::store::Store), the
+/// per-vhost [`MultiTenantStore`](ephpm_kv::multi_tenant::MultiTenantStore)
+/// when `sites_dir` is configured, and the RESP listener's join handle.
+///
+/// The multi-tenant store is built **here and only here**. Its `sites` map is
+/// what makes two vhost keyspaces distinct, so every consumer — the PHP path
+/// (`Router` → `kv_bridge::set_site_store`) and the RESP listener alike — has
+/// to be handed this same instance. Constructing a second one gives each
+/// consumer its own lazily-populated map, and `ephpm_kv_set()` from PHP then
+/// lands in a different `Store` than a Predis `SET` on the same vhost.
+fn start_kv_service(config: &Config) -> anyhow::Result<KvService> {
     // Create the KV store
     let store_config = ephpm_kv::store::StoreConfig {
         memory_limit: parse_memory_size(&config.kv.memory_limit)?,
@@ -1051,14 +1083,24 @@ fn start_kv_service(
             min_size: config.kv.compression_min_size,
         },
     };
-    let store = ephpm_kv::store::Store::new(store_config);
+    let store = ephpm_kv::store::Store::new(store_config.clone());
 
     // Wire the store into PHP native functions (ephpm_kv_get, etc.)
     ephpm_php::PhpRuntime::set_kv_store(&store);
 
+    // Per-vhost stores inherit the `[kv]` block (memory_limit, eviction_policy,
+    // compression) rather than `StoreConfig::default()` — otherwise every vhost
+    // silently ran on the hardcoded 256 MiB / allkeys-lru / no-compression
+    // defaults no matter what the operator configured.
+    let multi_tenant = if config.server.sites_dir.is_some() {
+        Some(ephpm_kv::multi_tenant::MultiTenantStore::new(Arc::clone(&store), store_config))
+    } else {
+        None
+    };
+
     if !config.kv.redis_compat.enabled {
         tracing::debug!("KV store initialized (RESP server disabled)");
-        return Ok((store, None));
+        return Ok((store, multi_tenant, None));
     }
 
     // Start RESP server if enabled
@@ -1094,25 +1136,23 @@ fn start_kv_service(
         );
     }
 
-    // Build multi-tenant store for HMAC auth if secret + sites_dir are both set.
-    let multi_tenant = if secret.is_some() && config.server.sites_dir.is_some() {
-        Some(ephpm_kv::multi_tenant::MultiTenantStore::new(
-            Arc::clone(&store),
-            ephpm_kv::store::StoreConfig::default(),
-        ))
-    } else {
-        None
-    };
+    // Hand the RESP listener the *same* multi-tenant handle the router gets,
+    // so `AUTH <hostname> <derived>` resolves to the identical `Arc<Store>`
+    // that PHP's `ephpm_kv_*` functions write through for that vhost. Only
+    // wired when a secret exists: without one the listener has no way to
+    // derive per-site credentials and stays on the shared default store
+    // (warned about just above).
+    let resp_multi_tenant = if secret.is_some() { multi_tenant.clone() } else { None };
 
     let store_for_resp = Arc::clone(&store);
     let handle = tokio::spawn(async move {
-        match ephpm_kv::server::run(store_for_resp, server_config, multi_tenant).await {
+        match ephpm_kv::server::run(store_for_resp, server_config, resp_multi_tenant).await {
             Ok(()) => tracing::info!("KV RESP server stopped"),
             Err(e) => tracing::error!("KV RESP server error: {e:#}"),
         }
     });
 
-    Ok((store, Some(handle)))
+    Ok((store, multi_tenant, Some(handle)))
 }
 
 /// Start database proxies (`MySQL`, `PostgreSQL`, `TDS`, embedded `SQLite`).
@@ -1655,6 +1695,71 @@ mod lib_tests {
         assert!(err.to_string().contains("not a valid engine"), "{err}");
     }
 
+    // ── KV service wiring ───────────────────────────────────────────────────
+
+    #[test]
+    fn kv_service_has_no_multi_tenant_store_without_sites_dir() {
+        let config = Config::default();
+        let (_store, multi_tenant, handle) = start_kv_service(&config).expect("start kv service");
+        assert!(multi_tenant.is_none(), "single-site mode needs no per-vhost stores");
+        assert!(handle.is_none(), "[kv.redis_compat] is off by default");
+    }
+
+    #[test]
+    fn kv_service_site_stores_inherit_the_kv_config() {
+        // Per-vhost stores are templated from the `[kv]` block, not
+        // `StoreConfig::default()`. They previously ran on the hardcoded
+        // 256 MiB / allkeys-lru / no-compression defaults no matter what the
+        // operator configured.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            server: ephpm_config::ServerConfig {
+                sites_dir: Some(dir.path().to_path_buf()),
+                ..ephpm_config::ServerConfig::default()
+            },
+            kv: ephpm_config::KvConfig {
+                memory_limit: "8MB".to_string(),
+                ..ephpm_config::KvConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let (default_store, multi_tenant, _handle) =
+            start_kv_service(&config).expect("start kv service");
+        let multi_tenant = multi_tenant.expect("sites_dir set, so a per-vhost store exists");
+
+        assert_eq!(default_store.config().memory_limit, 8 * 1024 * 1024);
+        assert_eq!(
+            multi_tenant.get_site_store("blog.example.com").config().memory_limit,
+            8 * 1024 * 1024,
+            "site stores must inherit [kv] memory_limit"
+        );
+    }
+
+    #[test]
+    fn kv_service_multi_tenant_clone_shares_site_stores() {
+        // The handle handed to the router and the one handed to the RESP
+        // listener are clones of one instance, so a vhost resolves to the same
+        // `Arc<Store>` on both paths. Two `MultiTenantStore::new` calls would
+        // not — that was the split-keyspace bug.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            server: ephpm_config::ServerConfig {
+                sites_dir: Some(dir.path().to_path_buf()),
+                ..ephpm_config::ServerConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let (_store, multi_tenant, _handle) = start_kv_service(&config).expect("start kv service");
+        let router_side = multi_tenant.expect("sites_dir set, so a per-vhost store exists");
+        let resp_side = router_side.clone();
+
+        let a = router_side.get_site_store("blog.example.com");
+        let b = resp_side.get_site_store("blog.example.com");
+        assert!(Arc::ptr_eq(&a, &b), "PHP and RESP must share one store per vhost");
+    }
+
     // ── idle timeout ────────────────────────────────────────────────────────
 
     /// Minimal router serving `dir` with a static-only fallback (no PHP).
@@ -1673,7 +1778,7 @@ mod lib_tests {
             opcache: ephpm_config::OpcacheConfig::default(),
         };
         let store = ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default());
-        Arc::new(Router::new(&config, store, None, None, None, None))
+        Arc::new(Router::new(&config, store, None, None, None, None, None))
     }
 
     /// Bind a listener and serve exactly one connection with `settings`.

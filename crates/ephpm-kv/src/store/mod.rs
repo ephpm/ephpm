@@ -251,6 +251,18 @@ impl Store {
         })
     }
 
+    /// The [`StoreConfig`] this store was built with.
+    ///
+    /// Memory limit, eviction policy, and compression are fixed at
+    /// construction, so this is read-only. Exposed so a caller that hands a
+    /// config template to a
+    /// [`MultiTenantStore`](crate::multi_tenant::MultiTenantStore) can check
+    /// that the per-site stores actually inherited it.
+    #[must_use]
+    pub fn config(&self) -> &StoreConfig {
+        &self.config
+    }
+
     /// Install a [`Replicator`] hook so subsequent [`Store::set`],
     /// [`Store::remove`], and [`Store::expire`] calls delegate the write to
     /// it (typically a clustered store that decides gossip vs local tier and

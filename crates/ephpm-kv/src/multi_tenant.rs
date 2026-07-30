@@ -164,6 +164,49 @@ mod tests {
     }
 
     #[test]
+    fn clones_share_the_same_site_stores() {
+        // `Clone` shares the `sites` map, so handing one instance to the PHP
+        // path and a clone to the RESP listener keeps a vhost on one keyspace.
+        let default = Store::new(StoreConfig::default());
+        let php_side = MultiTenantStore::new(default, test_config());
+        let resp_side = php_side.clone();
+
+        let from_php = php_side.get_site_store("alice.com");
+        let from_resp = resp_side.get_site_store("alice.com");
+        assert!(Arc::ptr_eq(&from_php, &from_resp));
+
+        from_php.set("k".into(), b"v".to_vec(), None);
+        assert_eq!(resp_side.get_site_store("alice.com").get("k").as_deref(), Some(&b"v"[..]));
+        assert_eq!(php_side.site_count(), 1);
+        assert_eq!(resp_side.site_count(), 1);
+    }
+
+    #[test]
+    fn separate_instances_do_not_share_site_stores() {
+        // Why `Clone` (above) is mandatory rather than merely convenient:
+        // `new()` always allocates a fresh `sites` map, so two instances over
+        // the same default store still give a vhost two disjoint keyspaces.
+        let default = Store::new(StoreConfig::default());
+        let one = MultiTenantStore::new(Arc::clone(&default), test_config());
+        let two = MultiTenantStore::new(default, test_config());
+
+        let from_one = one.get_site_store("alice.com");
+        let from_two = two.get_site_store("alice.com");
+        assert!(!Arc::ptr_eq(&from_one, &from_two));
+
+        from_one.set("k".into(), b"v".to_vec(), None);
+        assert_eq!(from_two.get("k"), None);
+    }
+
+    #[test]
+    fn site_stores_inherit_the_template_config() {
+        let default = Store::new(StoreConfig::default());
+        let mt = MultiTenantStore::new(default, test_config());
+        let site = mt.get_site_store("alice.com");
+        assert_eq!(site.config().memory_limit, test_config().memory_limit);
+    }
+
+    #[test]
     fn site_data_not_visible_from_default() {
         let default = Store::new(StoreConfig::default());
         let mt = MultiTenantStore::new(default, test_config());

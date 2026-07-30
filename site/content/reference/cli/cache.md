@@ -10,13 +10,16 @@ is implemented; `status` is planned. See the
 ## Synopsis
 
 ```bash
-ephpm cache [--host HOST] [--port PORT] <subcommand>
+ephpm cache [--host HOST] [--port PORT] [--password PW] <subcommand>
 ```
 
 | Flag | Default | Purpose |
 |------|---------|---------|
 | `--host` | `127.0.0.1` | RESP server host |
 | `--port` | `6379` | RESP server port |
+| `--password` | `$EPHPM_KV_PASSWORD` | Password sent as RESP `AUTH` before the write. Required when the server sets `[kv.redis_compat] password`. See [`ephpm kv`](/reference/cli/kv/#authentication) for the two auth modes and the per-site HMAC limitation. |
+
+These are flags of `ephpm cache` itself, so they go **before** the subcommand.
 
 ## Subcommands
 
