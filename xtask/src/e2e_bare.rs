@@ -65,7 +65,15 @@ const ISOLATED_DB_SUITES: &[&str] = &["sqlite", "sqlite_advanced", "rw_split", "
 /// `sites_dir` (with a sites_dir configured, the vhost key becomes the request
 /// host `127.0.0.1`, not `_default`, and the test's `opcache:version:_default`
 /// write would never match). See `SingleNodeOptions`.
-const ISOLATED_CONFIG_SUITES: &[&str] = &["opcache_invalidation"];
+/// `rate_limit` is the one suite that *wants* to be throttled: it fires a burst
+/// and asserts a 429. Sharing a token bucket with every other suite made both
+/// goals unsatisfiable -- the shared node needs enough headroom that hundreds of
+/// back-to-back requests never trip the limiter, while this suite needs a
+/// ceiling low enough to hit deliberately. The result was spurious 429s in
+/// suites that never touch the limiter (observed repeatedly in the `kv` suite:
+/// `left: 429, right: 200`). It now gets its own node with a small bucket, so
+/// the shared node can run a generous one.
+const ISOLATED_CONFIG_SUITES: &[&str] = &["opcache_invalidation", "rate_limit"];
 
 /// Suites that run single-threaded (a superset of the DB suites). Kept as a
 /// helper so `run_suite` can pick the right `--test-threads` value.
@@ -530,8 +538,7 @@ ini_overrides = [
 
 [server.limits]
 max_connections = 100
-per_ip_rate = 500.0
-per_ip_burst = 100
+{LIMITS_BLOCK}
 
 [db.sqlite]
 path = "{DATA_DIR}/ephpm-test.db"
@@ -629,32 +636,51 @@ struct SingleNodeOptions {
     /// single-node mode, so the opcache_invalidation suite needs it turned on
     /// for the watcher to run at all.
     opcache_invalidation: bool,
+    /// Emit a deliberately small `[server.limits]` token bucket. Only the
+    /// `rate_limit` suite wants this; every other node gets a generous one so
+    /// the limiter never fires in suites that aren't testing it.
+    tight_rate_limit: bool,
 }
 
 impl SingleNodeOptions {
     /// Options for the long-lived shared node (all non-isolated suites).
     fn shared() -> Self {
-        Self { slug: "single".to_string(), with_sites_dir: true, opcache_invalidation: false }
+        Self {
+            slug: "single".to_string(),
+            with_sites_dir: true,
+            opcache_invalidation: false,
+            tight_rate_limit: false,
+        }
     }
 
     /// Options tailored to a specific isolated suite.
     fn for_suite(name: &str) -> Self {
-        if ISOLATED_CONFIG_SUITES.contains(&name) {
+        let slug = format!("single-{name}");
+        match name {
             // opcache_invalidation: enable the watcher, drop sites_dir so the
             // default docroot resolves to the `_default` OPcache vhost.
-            Self {
-                slug: format!("single-{name}"),
+            "opcache_invalidation" => Self {
+                slug,
                 with_sites_dir: false,
                 opcache_invalidation: true,
-            }
-        } else {
-            // DB suites: fresh DB, but otherwise the same shape as the shared
-            // node (sites_dir present is harmless; they don't use it).
-            Self {
-                slug: format!("single-{name}"),
+                tight_rate_limit: false,
+            },
+            // rate_limit: small bucket, on its own node. See
+            // ISOLATED_CONFIG_SUITES for why this can't share the shared node.
+            "rate_limit" => Self {
+                slug,
                 with_sites_dir: true,
                 opcache_invalidation: false,
-            }
+                tight_rate_limit: true,
+            },
+            // DB suites: fresh DB, but otherwise the same shape as the shared
+            // node (sites_dir present is harmless; they don't use it).
+            _ => Self {
+                slug,
+                with_sites_dir: true,
+                opcache_invalidation: false,
+                tight_rate_limit: false,
+            },
         }
     }
 }
@@ -722,6 +748,14 @@ impl SingleNodeSpawn {
         } else {
             String::new()
         };
+        // Only the rate_limit suite runs a bucket small enough to trip. Every
+        // other node gets a budget large enough that the whole suite's traffic
+        // never reaches it, which is what stops the spurious 429s.
+        let limits_block = if opts.tight_rate_limit {
+            "per_ip_rate = 500.0\nper_ip_burst = 100"
+        } else {
+            "per_ip_rate = 100000.0\nper_ip_burst = 20000"
+        };
 
         let config = SINGLE_NODE_TEMPLATE
             .replace("{HTTP_PORT}", &http_port.to_string())
@@ -732,6 +766,7 @@ impl SingleNodeSpawn {
             .replace("{DATA_DIR}", &escape_toml(&data_dir))
             .replace("{SITES_DIR_LINE}", &sites_dir_line)
             .replace("{OPCACHE_BLOCK}", &opcache_block)
+            .replace("{LIMITS_BLOCK}", limits_block)
             .replace("{KV_SOCKET}", &escape_toml(&kv_socket))
             .replace("{DOCROOT}", &escape_toml(docroot));
 

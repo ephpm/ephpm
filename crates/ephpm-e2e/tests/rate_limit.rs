@@ -4,7 +4,14 @@
 //! - Rapid bursts of requests eventually trigger 429 Too Many Requests
 //! - After the rate limit window resets, requests succeed again (200)
 //!
-//! The test config (`ephpm-test.toml`) sets `per_ip_rate = 500`,
+//! This suite needs a small token bucket, which every other suite needs to
+//! *not* have. Under `cargo xtask e2e` (bare-process) it therefore runs on its
+//! own node: `xtask`'s `ISOLATED_CONFIG_SUITES` gives it `per_ip_rate = 500` /
+//! `per_ip_burst = 100` while the shared node runs a budget large enough that
+//! the limiter never fires. Under the Kind path it still shares one node
+//! configured by `tests/ephpm-test.toml`, which keeps the same 500/100 values.
+//!
+//! Either way the effective limits are `per_ip_rate = 500`,
 //! `per_ip_burst = 100`, and `max_connections = 100`. We fire requests
 //! concurrently — well past the burst — so they outpace the 500/s
 //! refill before responses come back. Concurrency is capped well below
