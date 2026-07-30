@@ -43,14 +43,37 @@ jobs:
             image: latest
             triple: x86_64-unknown-linux-gnu
             sdk: linux-x86_64
+            # Plenty of headroom on the WSL2 x64 runner -- keep
+            # profile.release's fat LTO.
+            lto: fat
           - runner: arm64
             image: latest-arm64
             triple: aarch64-unknown-linux-gnu
             sdk: linux-aarch64
+            # Quoted so YAML doesn't fold it to the boolean `false`
+            # (cargo's `lto = false` means "thin-local", not "off").
+            lto: "off"
     steps:
       - uses: actions/checkout@v4
 
       - name: Build ephpm
+        env:
+          # Per-arch LTO, mirroring release.yml's build-linux-arm64 step.
+          #
+          # The fat-LTO final link of the ephpm binary (libphp.a + ICU +
+          # everything, codegen-units=1 from profile.release) exceeds the
+          # arm64 build host's memory -- rustc gets SIGKILLed by the OOM
+          # killer. That killed every linux-aarch64 nightly leg for 8+
+          # consecutive runs; often the OOM killer took the runner agent
+          # too, surfacing as "the self-hosted runner lost communication
+          # with the server" rather than a build error.
+          #
+          # Thin LTO is NOT enough here: release.yml tried it (#181) and
+          # had to drop to off once the turso engine (#183) grew the
+          # binary. Match release.yml so nightly and release build the
+          # arm64 artifact the same way. Revisit once the VM memory is
+          # raised.
+          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.arch.lto }}
         run: cargo xtask release ${{ matrix.php }}
 
       - name: Run ignored integration tests
@@ -381,10 +404,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install E2E tools (kind, tilt, kubectl)
-        run: cargo xtask e2e-install
-
-      - name: Run E2E tests
+      - name: Run bare-process E2E tests
         run: cargo xtask e2e --php-version ${{ matrix.php }}
 
   # -- 4. App smoke tests (WordPress, Laravel, Symfony on litewire SQLite) --

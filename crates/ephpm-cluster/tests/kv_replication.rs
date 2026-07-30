@@ -103,6 +103,7 @@ async fn start_test_node(
         bind: format!("{ip}:{gossip_port}"),
         join: seeds,
         secret: secret.to_string(),
+        allow_insecure_no_auth: false,
         node_id: node_id.to_string(),
         cluster_id: "kv-repl-test".to_string(),
         kv: config.clone(),

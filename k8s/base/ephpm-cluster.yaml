@@ -95,6 +95,12 @@ spec:
           env:
             - name: EPHPM_CLUSTER__ENABLED
               value: "true"
+            # Fixed test-only shared secret so all 3 nodes derive the same
+            # ChaCha20-Poly1305 transport keys and the mandatory-secret gate
+            # (ClusterConfig::ensure_secure) lets them start. TEST ONLY --
+            # never reuse this value in a real deployment.
+            - name: EPHPM_CLUSTER__SECRET
+              value: "e2e-cluster-secret-not-for-prod"
             - name: EPHPM_CLUSTER__BIND
               value: "0.0.0.0:7946"
             - name: EPHPM_CLUSTER__CLUSTER_ID

@@ -70,7 +70,9 @@ jobs:
       - name: Build ephpm
         env:
           # Overrides profile.release.lto from Cargo.toml per-arch (see the
-          # matrix `lto` values — arm64 must use thin to fit in host memory).
+          # matrix `lto` value). linux-x64 keeps fat LTO -- it builds fine on
+          # the x64 hosts. The memory-constrained targets (linux-aarch64,
+          # windows) run in their own jobs below with LTO disabled.
           CARGO_PROFILE_RELEASE_LTO: ${{ matrix.arch.lto }}
         run: cargo xtask release ${{ matrix.php.minor }}
 
@@ -133,13 +135,16 @@ jobs:
 
       - name: Build ephpm
         env:
-          # Thin LTO on arm64: the fat-LTO final link of the ephpm binary
-          # (libphp.a + ICU + everything, codegen-units=1) exceeds the
-          # arm64 build host's memory — rustc gets SIGKILLed by the OOM
-          # killer even running as the only job. Thin LTO cuts link-time
-          # memory to a fraction for a ~1% perf delta on a target where
-          # we publish no benchmark numbers anyway.
-          CARGO_PROFILE_RELEASE_LTO: thin
+          # LTO off on arm64: the fat-LTO final link of the ephpm binary
+          # (libphp.a + ICU + everything, codegen-units=1 from profile.release
+          # per #171) exceeds the arm64 build host's memory -- rustc gets
+          # SIGKILLed by the OOM killer even running as the only job. Thin LTO
+          # (#181) held for a while, but the turso engine (#183, linked by
+          # default) grew the binary past what thin-LTO fits on this host in
+          # the v0.5.1 arc. Disabling LTO cuts link-time memory the most, for
+          # a low single-digit perf delta on a target with no published
+          # benchmark numbers. Revisit thin/fat once the VM memory is raised.
+          CARGO_PROFILE_RELEASE_LTO: "off"
         run: cargo xtask release ${{ matrix.php.minor }}
 
       - name: Package archive
@@ -351,6 +356,24 @@ jobs:
 
       - name: Build ephpm.exe
         shell: powershell
+        env:
+          # LTO off on Windows: the fat-LTO final link (libphp static lib +
+          # everything, codegen-units=1 from profile.release per #171) OOMs
+          # rustc-LLVM on the ephemerd worker VMs ("rustc-LLVM ERROR: out of
+          # memory"). Windows built fine on fat-LTO through v0.5.0; the turso
+          # engine (#183, linked by default) grew the binary enough to OOM in
+          # the v0.5.1 arc, and thin-LTO (#193) was not enough either.
+          # Disabling LTO cuts link-time memory the most, for a low
+          # single-digit perf delta on a target with no published benchmark
+          # numbers. Same trade as linux-aarch64. Revisit once VM memory grows.
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          # Bump rustc's thread stack: with LTO off the Windows build gets
+          # far enough to compile sqlparser (a turso #183 dependency), whose
+          # deeply-recursive AST types overflow rustc's default thread stack
+          # on the Windows toolchain (STATUS_STACK_OVERFLOW, 0xc00000fd),
+          # made heavier by codegen-units=1 + opt-level=3. 32 MiB clears it.
+          # linux-aarch64 compiles sqlparser fine, so this is windows-only.
+          RUST_MIN_STACK: "33554432"
         run: cargo xtask release ${{ matrix.php_minor }} --target windows --no-sqld
 
       - name: Package archive
@@ -478,35 +501,36 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     permissions:
       contents: write
+      # Needed to list this run's artifacts via the REST API (below).
+      actions: read
     steps:
-      # Download in two batches of 6 (by arch suffix) rather than all at once.
-      # actions/download-artifact@v4 fetches every matched artifact in
-      # parallel; downloading all 12 together saturated the self-hosted
-      # runner's egress to Azure blob storage and silently dropped the tail
-      # (it aborts after 5 internal retries). Two 6-way batches stay well
-      # under that ceiling. merge-multiple flattens archives into ./artifacts.
-      # (gh CLI is not installed on this runner, so a gh-based loop is out.)
-      - name: Download x86_64 archives
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ephpm-v*-x86_64
-          path: artifacts
-          merge-multiple: true
+      - uses: actions/checkout@v4
 
-      - name: Download aarch64 archives
-        uses: actions/download-artifact@v4
-        with:
-          pattern: ephpm-v*-aarch64
-          path: artifacts
-          merge-multiple: true
+      # Collect the build archives via the REST run-artifacts endpoint rather
+      # than actions/download-artifact@v4. download-artifact only sees the
+      # CURRENT run attempt's artifacts, so a `gh run rerun --failed` (which
+      # only re-uploads the reran legs) leaves the already-green legs' archives
+      # stranded on the prior attempt and the publish fails -- which forced
+      # every retry to be a full all-legs rebuild. The run-artifacts endpoint
+      # lists every artifact across ALL attempts, so a single flaky leg can be
+      # rerun-failed without redoing the whole matrix. The script downloads
+      # sequentially, which also avoids the parallel egress saturation that
+      # made the old all-at-once download silently drop its tail.
+      - name: Collect build archives (all run attempts)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          OUT_DIR: artifacts
+        run: bash .github/scripts/collect_release_artifacts.sh
 
       - name: Collect archives and write SHA256SUMS
         id: collect
         run: |
           set -eu
           mkdir -p release
-          # merge-multiple put every archive flat under artifacts/; gather
-          # them so SHA256SUMS lives next to the things it sums.
+          # The collect step above extracted every archive flat under
+          # artifacts/; gather them so SHA256SUMS lives next to what it sums.
           find artifacts -type f -name '*.tar.gz' -exec cp {} release/ \;
           (cd release && sha256sum *.tar.gz | sort > SHA256SUMS)
           echo "Collected $(ls release/*.tar.gz | wc -l) archives:"

@@ -39,7 +39,7 @@ cargo deny check                           # license/advisory audit
 
 IMPORTANT: Run single tests when possible, not the full suite. Use `cargo test -p <crate> <test_name>`. `cargo nextest` is preferred but may not be installed — fall back to `cargo test`.
 
-The `ephpm-e2e` crate is **excluded from the workspace** — it runs inside Docker via `cargo xtask e2e` and has different dependencies. Don't try to compile it with `cargo test --workspace`.
+The `ephpm-e2e` crate is **excluded from the workspace** and has different dependencies — don't try to compile it with `cargo test --workspace`. It runs bare-process by default via `cargo xtask e2e` (spawns ephpm on 127.0.0.1, no Kind), or via `cargo xtask k8s-e2e` for opt-in Kind + Tilt cluster testing (dispatched from `.github/workflows/k8s-e2e.yml`).
 
 ## Workspace Structure
 
@@ -54,17 +54,17 @@ The `ephpm-e2e` crate is **excluded from the workspace** — it runs inside Dock
 | `ephpm-cluster` | Clustering — SWIM gossip (chitchat), consistent hash ring, KV replication, SQLite primary election |
 | `ephpm-sqld` | sqld embedding — binary extraction via `include_bytes!()`, child process lifecycle, health checks |
 | `ephpm-query-stats` | Query observability — SQL normalization, digest tracking, slow query logging, Prometheus metrics |
-| `xtask` | Build & test tooling — `release`, `php-sdk`, `e2e`, `e2e-up`, `e2e-down` |
+| `xtask` | Build & test tooling — `release`, `php-sdk`, `e2e` (bare-process default), `k8s-e2e`/`k8s-e2e-up`/`k8s-e2e-down` (opt-in Kind path) |
 
 ## External Dependencies
 
 | Dependency | Location | Purpose |
 |-----------|----------|---------|
-| **litewire** | `../litewire/crates/litewire` (path dep) | MySQL/Hrana wire protocol → SQLite translation proxy |
+| **litewire** | Git dep on `github.com/ephpm/litewire`, pinned by `rev` in the workspace `Cargo.toml` | MySQL/Hrana wire protocol → SQLite translation proxy |
 | **PHP SDK** | Downloaded by `cargo xtask php-sdk` from `github.com/ephpm/php-sdk` releases | Prebuilt `libphp.a` (Linux/macOS) or `php8embed.{dll,lib}` (Windows) plus PHP headers. Pinned per minor in `xtask/src/main.rs::PHP_SDK_VERSIONS` |
 | **sqld** | Embedded via `include_bytes!()` at build time | SQLite replication server for clustered mode (v0.24.32 pinned in xtask) |
 
-litewire is a standalone project at `github.com/ephpm/litewire`. It's used as a library — ePHPm calls `LiteWire::new(backend).mysql(addr).serve()`.
+litewire is a standalone project at `github.com/ephpm/litewire`. It's used as a library — ePHPm calls `LiteWire::new(backend).mysql(addr).serve()`. Bumping it means updating the `rev` in the workspace `Cargo.toml` and running `cargo update -p litewire`. To work against a sibling checkout without changing the pin, add a `[patch."https://github.com/ephpm/litewire.git"]` entry pointing at `../litewire/crates/litewire` in your local config — see the comment above the dependency in `Cargo.toml`.
 
 The PHP SDK is built by a separate pipeline at `github.com/ephpm/php-sdk` (uses static-php-cli internally). ePHPm itself doesn't depend on static-php-cli at all — it just consumes the resulting tarballs.
 

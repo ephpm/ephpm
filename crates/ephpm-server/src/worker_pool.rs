@@ -47,6 +47,12 @@ pub struct WorkerPool {
     /// Kept alive so the channel never closes while the supervisor respawns
     /// workers between boots. Cloned into each worker thread.
     dispatch_rx: async_channel::Receiver<WorkerJob>,
+    /// Jobs currently sitting in the dispatch channel. Incremented on enqueue
+    /// ([`WorkerPool::dispatch`]) and decremented by each worker in the bridge
+    /// after `recv_blocking`. Backs `ephpm_worker_dispatch_queue_depth` with a
+    /// single `Relaxed` load, replacing a per-dispatch `async_channel::len()`
+    /// (a SeqCst spin-loop over head/tail).
+    queue_depth: Arc<AtomicUsize>,
     /// Shared runtime state (readiness, liveness, drain flag).
     state: Arc<PoolState>,
     /// Worker entrypoint script (absolute, validated under document_root).
@@ -110,6 +116,7 @@ impl WorkerPool {
         let pool = Arc::new(Self {
             dispatch_tx,
             dispatch_rx,
+            queue_depth: Arc::new(AtomicUsize::new(0)),
             state,
             worker_script,
             max_requests,
@@ -145,6 +152,13 @@ impl WorkerPool {
         self.state.ready.load(Ordering::Acquire)
     }
 
+    /// Current dispatch-queue depth (jobs enqueued, not yet pulled by a
+    /// worker). Test-only accessor for the counter-pair accounting.
+    #[cfg(test)]
+    fn queue_depth(&self) -> usize {
+        self.queue_depth.load(Ordering::Relaxed)
+    }
+
     /// Dispatch a request to the pool and return the receiver for its response.
     ///
     /// `send().await` suspends when the bounded queue is full (backpressure);
@@ -161,10 +175,22 @@ impl WorkerPool {
     ) -> Result<oneshot::Receiver<WorkerResponse>, DispatchClosed> {
         let (tx, rx) = oneshot::channel();
         let job = WorkerJob { request, respond_to: tx };
-        gauge!("ephpm_worker_dispatch_queue_depth").set(self.dispatch_tx.len() as f64);
+        // Account the enqueue before the (awaitable) send so a worker pulling
+        // concurrently can only ever decrement a value we already added.
+        // `send().await` may suspend under backpressure; the count reflects the
+        // job as queued for that whole window, which is exactly the depth we
+        // want to report.
+        let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        #[allow(clippy::cast_precision_loss)]
+        gauge!("ephpm_worker_dispatch_queue_depth").set(depth as f64);
         match self.dispatch_tx.send(job).await {
             Ok(()) => Ok(rx),
-            Err(_) => Err(DispatchClosed),
+            Err(_) => {
+                // Send failed (channel closed) — the job never entered the
+                // queue and no worker will pull it, so undo the accounting.
+                self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                Err(DispatchClosed)
+            }
         }
     }
 
@@ -240,6 +266,7 @@ fn worker_main(
     // Install this thread's dispatch receiver and recycle quota BEFORE booting,
     // so the very first take_request() inside the framework loop can pull work.
     ephpm_php::worker_bridge::set_dispatch_receiver(rx.clone());
+    ephpm_php::worker_bridge::set_dispatch_depth_counter(Arc::clone(&pool.queue_depth));
     ephpm_php::worker_bridge::set_max_requests(max_requests);
     ephpm_php::worker_bridge::set_stream_send_timeout(pool.stream_send_timeout);
 
@@ -470,6 +497,58 @@ mod tests {
         pool.drain();
         pool.note_hung();
         assert_eq!(pool.ready_count(), 0);
+    }
+
+    fn dummy_request() -> ephpm_php::worker_bridge::WorkerRequestOwned {
+        ephpm_php::worker_bridge::WorkerRequestOwned {
+            method: "GET".into(),
+            uri: "/".into(),
+            query_string: String::new(),
+            cookie_data: String::new(),
+            content_type: None,
+            body: ephpm_php::worker_bridge::WorkerBody::Buffered(Vec::new()),
+            server_vars: Vec::new(),
+            headers: Vec::new(),
+        }
+    }
+
+    /// The counter-pair depth gauge tracks enqueues. With no workers to pull
+    /// (stub mode), each successful dispatch leaves the job in the channel and
+    /// the depth counter reflects it — replacing the per-dispatch
+    /// `async_channel::len()` read.
+    #[tokio::test]
+    async fn dispatch_increments_queue_depth() {
+        let pool = WorkerPool::spawn(
+            PathBuf::from("/nonexistent/worker.php"),
+            0,
+            500,
+            4, // backlog: room for a few queued jobs
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        assert_eq!(pool.queue_depth(), 0);
+
+        // Two successful enqueues (no worker pulls them) bump the depth to 2.
+        assert!(pool.dispatch(dummy_request()).await.is_ok());
+        assert!(pool.dispatch(dummy_request()).await.is_ok());
+        assert_eq!(pool.queue_depth(), 2, "each enqueue must increment depth");
+    }
+
+    /// A dispatch that fails because the channel is closed (draining) must NOT
+    /// leak an increment into the depth counter.
+    #[tokio::test]
+    async fn failed_dispatch_does_not_leak_queue_depth() {
+        let pool = WorkerPool::spawn(
+            PathBuf::from("/nonexistent/worker.php"),
+            0,
+            500,
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        pool.drain(); // closes the sender
+        assert!(pool.dispatch(dummy_request()).await.is_err());
+        assert_eq!(pool.queue_depth(), 0, "failed enqueue must roll back the increment");
     }
 
     #[test]
