@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ephpm_cluster::{
-    ChannelFeatureFlags, ChannelHandle, ChannelStream, IncomingStream,
-    maybe_start_cluster_channel, start_gossip,
+    ChannelFeatureFlags, ChannelHandle, ChannelStream, IncomingStream, maybe_start_cluster_channel,
+    start_gossip,
 };
 use ephpm_config::{ClusterChannelConfig, ClusterConfig};
 use ephpm_server::turso_cdc::{fetch_and_apply_snapshot, serve_snapshot};
@@ -52,8 +52,12 @@ const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 #[derive(Serialize, Deserialize)]
 enum Frame {
     /// Replica → primary, first frame: the watermark to resume from.
-    Subscribe { from_change_id: i64 },
-    Batch { rows: Vec<WireCdcRow> },
+    Subscribe {
+        from_change_id: i64,
+    },
+    Batch {
+        rows: Vec<WireCdcRow>,
+    },
     Ping,
 }
 

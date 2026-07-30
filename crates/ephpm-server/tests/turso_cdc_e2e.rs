@@ -26,8 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ephpm_cluster::{
-    ChannelFeatureFlags, ChannelHandle, ChannelStream, IncomingStream,
-    maybe_start_cluster_channel, start_gossip,
+    ChannelFeatureFlags, ChannelHandle, ChannelStream, IncomingStream, maybe_start_cluster_channel,
+    start_gossip,
 };
 use ephpm_config::{ClusterChannelConfig, ClusterConfig};
 use litewire::backend::{Backend, Value};
@@ -46,8 +46,12 @@ const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 #[derive(Serialize, Deserialize)]
 enum Frame {
     /// Replica → primary, first frame: the watermark to resume from.
-    Subscribe { from_change_id: i64 },
-    Batch { rows: Vec<WireCdcRow> },
+    Subscribe {
+        from_change_id: i64,
+    },
+    Batch {
+        rows: Vec<WireCdcRow>,
+    },
     Ping,
 }
 

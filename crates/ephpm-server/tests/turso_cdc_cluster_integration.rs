@@ -64,8 +64,12 @@ const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 #[derive(Serialize, Deserialize)]
 enum Frame {
     /// Replica → primary, first frame: the watermark to resume from.
-    Subscribe { from_change_id: i64 },
-    Batch { rows: Vec<WireCdcRow> },
+    Subscribe {
+        from_change_id: i64,
+    },
+    Batch {
+        rows: Vec<WireCdcRow>,
+    },
     Ping,
 }
 
