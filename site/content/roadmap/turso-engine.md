@@ -116,43 +116,65 @@ path is a **single ordered stream** with no schema-sync side channel.
   record-format decoder for DML replay, sqlite_schema-SQL replay for
   DDL). 25 unit + integration tests in `litewire-turso`.
 - ephpm `turso_cdc` module: two `Turso` factories per node (wire +
-  mgmt), primary tail loop → broadcast → **cluster channel handler**;
-  replica dial + apply loop; JSON-framed protocol (base64 for record
-  blobs). 2-node e2e integration test proves DDL + INSERT + UPDATE +
-  DELETE land on the replica through a real authenticated, multiplexed
-  cluster channel and that reconnect is idempotent.
-- **Transport = the [cluster channel v1](/roadmap/cluster-channel/):**
-  a single, lazy-bound, `yamux`-multiplexed, ChaCha20-Poly1305-
-  authenticated TCP listener shared by all opt-in cluster features. CDC
-  is registered as stream type `cdc/<vhost>`; snapshot bootstrap is
-  RESERVED (`snapshot/<vhost>`). The channel only binds when a feature
-  asks — configs without `cdc_experimental` are byte-identical to
-  before.
+  mgmt); on the primary each inbound subscriber stream gets its **own**
+  `CdcTailer`, anchored at the watermark the subscriber sends in its
+  first frame; replica dial + subscribe + apply loop; JSON-framed
+  protocol (base64 for record blobs). 2-node e2e integration test
+  proves DDL + INSERT + UPDATE + DELETE land on the replica through a
+  real authenticated, multiplexed cluster channel, and that a reconnect
+  both resumes (rows written during the gap arrive) and does not
+  double-apply.
+- **Transport = the [cluster channel](/roadmap/cluster-channel/):**
+  a single, lazy-bound, `yamux`-multiplexed TCP listener shared by all
+  opt-in cluster features, with a mutual ChaCha20-Poly1305
+  challenge/response handshake and per-connection sealing of every
+  post-handshake byte. CDC is registered as stream type `cdc/<vhost>`
+  and snapshot bootstrap as `snapshot/<vhost>`. The channel only binds
+  when a feature asks — configs without `cdc_experimental` are
+  byte-identical to before.
+- Cold-replica snapshot bootstrap over `snapshot/<vhost>`: an online
+  logical dump captured under one read view, plus the aligned
+  watermark. Served only by the elected primary, size-capped by
+  `[db.sqlite.replication] max_snapshot_bytes`, and validated against a
+  `CREATE`/`INSERT` statement allowlist before it is applied.
 - Additive config knob: `cdc_experimental` defaults to `false`;
   `engine = "turso"` + clustered mode without it is still a hard startup
   error pointing at the knob. v0.4.x-compatible under versioning policy.
 
-**Deferred to Phase 2.1:**
+**Still deferred:**
 
-- Fresh-replica snapshot bootstrap (v1: operator seeds the DB file
-  before starting the replica, or accepts that replicas start empty).
-- Persisted subscriber watermark across primary restart (v1: broadcast
-  channel; new subscribers start from the current position, not from
-  cursor 0 of the primary's history).
-- TLS wrapping of the cluster channel (v1: the channel handshake and
-  framing are ChaCha20-Poly1305-authenticated with the operator's
-  shared secret, but not TLS. Per-plane PKI identity is a Phase 2.1
-  item — see the [cluster channel roadmap](/roadmap/cluster-channel/)).
+- Subscriber watermarks that survive a *primary change*. Resume works
+  within one primary (the subscriber names its cursor); after a
+  failover the new primary's `change_id` space is its own, so a
+  cross-primary cursor needs a cluster-wide watermark scheme.
+- TLS wrapping of the cluster channel. The channel is authenticated and
+  encrypted with the operator's shared secret, but there is no PKI peer
+  identity — see the [cluster channel
+  roadmap](/roadmap/cluster-channel/).
 - `turso_cdc` retention pruning (v1: table grows unbounded — no
   operational issue on the small-write experimental workloads Phase 2
-  targets, but must be solved before Phase 3 default).
+  targets, but must be solved before Phase 3 default). Note this
+  interacts with snapshot bootstrap: once the log is truncated, a
+  snapshot watermark below the oldest retained `change_id` is not
+  replayable.
+- Read-only enforcement on replica wire frontends. litewire has no
+  read-only mode, so a replica's MySQL/Hrana frontend accepts writes
+  that nothing replicates; the replica logs a warning at startup.
+- Triggers in the snapshot. They are deliberately not shipped (CDC
+  already carries the rows a trigger produced on the primary), which is
+  correct for replay but means a replica promoted to primary has no
+  triggers until an operator recreates them.
 - 2-node podman/kind e2e test running the full ephpm binary against a
   real MySQL wire client. The in-process integration test proves the
   replication pipeline; the podman lift is largely test-orchestration.
-- Wire-frontend session capture without the factory-level flag (v1:
-  every wire session that goes through the primary's wire factory gets
-  CDC because `enable_cdc_on_connect = true`; a session that uses
-  `raw_connection()` bypasses this — a documented gotcha).
+- Wire-frontend session capture without the factory-level flag: capture
+  is enabled on every node's wire factory (`enable_cdc_on_connect =
+  true`, so a node promoted mid-life still captures), but a session
+  that uses `raw_connection()` bypasses it — a documented gotcha.
+- `TxnBatch::commit_change_id()` panics on an empty batch inside
+  litewire; ephpm rejects empty batch frames on the wire instead.
+  Making the litewire API return `Option<i64>` needs a litewire PR and
+  a pin bump.
 
 ### Phase 3 — default engine (a major-version decision)
 

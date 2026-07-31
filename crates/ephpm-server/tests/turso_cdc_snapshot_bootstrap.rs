@@ -26,7 +26,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ephpm_cluster::{
-    ChannelFeatureFlags, ChannelHandle, IncomingStream, maybe_start_cluster_channel, start_gossip,
+    ChannelFeatureFlags, ChannelHandle, ChannelStream, IncomingStream, maybe_start_cluster_channel,
+    start_gossip,
 };
 use ephpm_config::{ClusterChannelConfig, ClusterConfig};
 use ephpm_server::turso_cdc::{fetch_and_apply_snapshot, serve_snapshot};
@@ -35,11 +36,14 @@ use litewire::litewire_turso::Turso;
 use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, read_watermark};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::broadcast;
 
 const CDC_STREAM_TYPE: &str = "cdc/default";
 const SNAPSHOT_STREAM_TYPE: &str = "snapshot/default";
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
+
+/// Generous ceiling for the test's snapshot transfers — mirrors the
+/// `[db.sqlite.replication] max_snapshot_bytes` default.
+const MAX_SNAPSHOT_BYTES: u64 = 1024 * 1024 * 1024;
 
 // -- CDC wire-frame twin (private in the module; kept inline to keep the
 //    test an honest black-box exercise of the tail path). The snapshot
@@ -47,7 +51,13 @@ const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 enum Frame {
-    Batch { rows: Vec<WireCdcRow> },
+    /// Replica → primary, first frame: the watermark to resume from.
+    Subscribe {
+        from_change_id: i64,
+    },
+    Batch {
+        rows: Vec<WireCdcRow>,
+    },
     Ping,
 }
 
@@ -165,41 +175,43 @@ async fn spawn_primary(
         }
     }));
 
-    // CDC dispatch + tail.
-    let (tx, _rx0) = broadcast::channel::<Arc<TxnBatch>>(1024);
+    // CDC dispatch: one tailer per subscriber, anchored at the
+    // watermark the subscriber announces.
     let mut cdc_streams = channel.register_exact(CDC_STREAM_TYPE);
-    let tx_for_subs = tx.clone();
+    let cdc_mgmt = Arc::clone(&mgmt);
     handles.push(tokio::spawn(async move {
         while let Some(incoming) = cdc_streams.recv().await {
-            let mut rx = tx_for_subs.subscribe();
-            let IncomingStream { mut stream, .. } = incoming;
+            let IncomingStream { stream, .. } = incoming;
+            let mgmt = Arc::clone(&cdc_mgmt);
             tokio::spawn(async move {
-                while let Ok(batch) = rx.recv().await {
-                    let frame =
-                        Frame::Batch { rows: batch.rows.iter().map(WireCdcRow::from).collect() };
-                    if write_frame(&mut stream, &frame).await.is_err() {
-                        break;
-                    }
+                if let Err(e) = serve_one_subscriber(stream, &mgmt).await {
+                    eprintln!("serve subscriber: {e:#}");
                 }
             });
         }
     }));
 
-    let tail_mgmt = Arc::clone(&mgmt);
-    handles.push(tokio::spawn(async move {
-        let mut tailer = CdcTailer::new(&tail_mgmt, 0);
-        loop {
-            match tailer.poll_batch().await {
-                Ok(Some(batch)) => {
-                    let _ = tx.send(Arc::new(batch));
-                }
-                Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
-                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-            }
-        }
-    }));
-
     (channel.listen_addr(), handles)
+}
+
+/// Mirror of the production per-subscriber serve loop.
+async fn serve_one_subscriber(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Result<()> {
+    let from = match read_frame(&mut stream).await? {
+        Frame::Subscribe { from_change_id } => from_change_id,
+        _ => anyhow::bail!("expected Subscribe as the first frame"),
+    };
+    let mut tailer = CdcTailer::new(mgmt, from);
+    loop {
+        match tailer.poll_batch().await {
+            Ok(Some(batch)) => {
+                let frame =
+                    Frame::Batch { rows: batch.rows.iter().map(WireCdcRow::from).collect() };
+                write_frame(&mut stream, &frame).await?;
+            }
+            Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+            Err(e) => anyhow::bail!("tail poll: {e}"),
+        }
+    }
 }
 
 /// Spawn the replica CDC tail loop (used AFTER bootstrap). Applies via
@@ -214,19 +226,29 @@ fn spawn_replica_tail(
     tokio::spawn(async move {
         loop {
             match channel.dial(primary_addr, CDC_STREAM_TYPE).await {
-                Ok(mut stream) => loop {
-                    match read_frame(&mut stream).await {
-                        Ok(Frame::Batch { rows }) => {
-                            let batch =
-                                TxnBatch { rows: rows.into_iter().map(CdcRow::from).collect() };
-                            if let Err(e) = apply_batch(&apply_conn, &batch).await {
-                                eprintln!("apply_batch: {e:#}");
+                Ok(mut stream) => {
+                    let wm = read_watermark(&apply_conn).await.unwrap_or(0);
+                    let subscribed =
+                        write_frame(&mut stream, &Frame::Subscribe { from_change_id: wm }).await;
+                    if subscribed.is_ok() {
+                        loop {
+                            match read_frame(&mut stream).await {
+                                Ok(Frame::Batch { rows }) if !rows.is_empty() => {
+                                    let batch = TxnBatch {
+                                        rows: rows.into_iter().map(CdcRow::from).collect(),
+                                    };
+                                    if let Err(e) = apply_batch(&apply_conn, &batch).await {
+                                        eprintln!("apply_batch: {e:#}");
+                                        break;
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(_) => break,
                             }
                         }
-                        Ok(Frame::Ping) => {}
-                        Err(_) => break,
                     }
-                },
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
             }
         }
@@ -313,7 +335,14 @@ async fn cold_replica_bootstraps_snapshot_then_tails_cdc() {
     // where the primary channel is still coming up.
     let mut bootstrapped_wm = None;
     for _ in 0..30 {
-        match fetch_and_apply_snapshot(&replica_conn, primary_addr, &replica_channel).await {
+        match fetch_and_apply_snapshot(
+            &replica_conn,
+            primary_addr,
+            &replica_channel,
+            MAX_SNAPSHOT_BYTES,
+        )
+        .await
+        {
             Ok(n) => {
                 bootstrapped_wm = Some(n);
                 break;

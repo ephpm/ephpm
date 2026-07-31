@@ -37,27 +37,40 @@
 //! ```text
 //!            primary node                     replica node(s)
 //!  ┌─────────────────────────────────┐    ┌───────────────────────┐
-//!  │ litewire → Turso (wire factory  │    │ litewire → Turso      │
-//!  │   with enable_cdc_on_connect=T) │    │  (wire factory,       │
-//!  │        │                        │    │   cdc=off — RO)       │
+//!  │ litewire → Turso (wire factory, │    │ litewire → Turso      │
+//!  │   enable_cdc_on_connect = true) │    │  (wire factory,       │
+//!  │        │                        │    │   capture also on)    │
 //!  │  writes capture into turso_cdc  │    │        │              │
-//!  │        ▼                        │    │   local reads only    │
-//!  │  mgmt factory: CdcTailer polls  │    │        ▲              │
-//!  │  turso_cdc → complete batches   │    │        │ apply_batch  │
-//!  │  → broadcast channel            │    │  mgmt factory:        │
-//!  │        │                        │    │  read framed batch    │
-//!  │  cluster channel handler for    │    │  from cluster channel │
-//!  │  "cdc/default" fans one         │◀───┤  stream "cdc/default" │
-//!  │  broadcast::Receiver per stream │    │  → apply_batch(&conn) │
+//!  │        ▼                        │    │   serves reads        │
+//!  │  per-subscriber CdcTailer from  │    │        ▲              │
+//!  │  the subscriber's watermark     │    │        │ apply_batch  │
+//!  │        │                        │    │  mgmt factory:        │
+//!  │  cluster channel handler for    │    │  send Subscribe{wm},  │
+//!  │  "cdc/default": one tailer per  │◀───┤  read framed batches, │
+//!  │  inbound stream                 │    │  → apply_batch(&conn) │
 //!  └─────────────────────────────────┘    └───────────────────────┘
 //! ```
+//!
+//! Capture (`enable_cdc_on_connect`) is enabled on **every** node's wire
+//! factory, not just the one that booted as primary. A node promoted by
+//! the election cannot retroactively turn capture on for wire sessions
+//! that already exist, so a promoted replica would otherwise serve
+//! writes that were never captured and the cluster would diverge
+//! silently after every failover. Whether a node *ships* what it
+//! captured is decided at serve time by the current role, not at
+//! factory-build time.
+//!
+//! **A replica's wire frontend is read-write, and writes made against
+//! it are NOT replicated anywhere.** litewire has no read-only frontend
+//! mode, so v1 cannot enforce this; the replica logs a warning at
+//! startup. Point application traffic at the primary.
 //!
 //! # Failover
 //!
 //! The sqlite election machinery (`ephpm_cluster::SqliteElection`) is
-//! unchanged. On role change, the initial role's tasks stay running
-//! (v1 simplification) and new tasks for the new role are spawned;
-//! stale tasks eventually notice a broken channel stream and log out.
+//! unchanged. On role change the previous role's driver task is
+//! aborted and a driver for the new role is spawned, so a flapping
+//! election does not accumulate drivers.
 //! **The divergence window is the same class as sqld async replication:**
 //! a former primary that had unshipped batches at the moment it died
 //! has lost those writes.
@@ -119,16 +132,14 @@
 //!    the same table [`apply_batch`] maintains). This all completes
 //!    before the litewire wire frontends start serving, so a client
 //!    read never observes partial snapshot state.
-//! 4. Subscribe to CDC as before. The primary tails from `change_id 0`,
-//!    but [`apply_batch`] skips any batch whose `commit_change_id() <=
-//!    N` (idempotent no-op against the seeded watermark), so only
-//!    post-`N` changes are applied: the tail continues cleanly past the
-//!    snapshot point.
+//! 4. Subscribe to CDC. The subscribe frame carries the replica's
+//!    watermark, so the primary starts a tailer at exactly `N` and the
+//!    first batch the replica sees is `N + 1`. [`apply_batch`] remains
+//!    idempotent below the watermark as a second line of defence.
 //!
-//! Snapshot/tail race: because the tail always re-broadcasts from `0`
-//! and apply is idempotent past the watermark, there is no gap between
-//! "snapshot at N" and "tail from N+1" even if writes land on the
-//! primary during the dump; they simply arrive as post-`N` batches.
+//! Snapshot/tail race: writes that land on the primary during the dump
+//! get `change_id > N` and are therefore delivered by the post-snapshot
+//! tail. There is no gap and no overlap.
 //!
 //! The `snapshot/<vhost>` stream name is reserved in
 //! [`ephpm_cluster::stream_type::SNAPSHOT_PREFIX`]; v1 uses only
@@ -142,6 +153,10 @@
 //!   snapshot watermark `N` and the tail's oldest retained `change_id`
 //!   must be reconciled (ship a snapshot at >= the truncation point);
 //!   that interaction is deferred.
+//! - Triggers are **not** shipped in the snapshot (the primary logs a
+//!   warning naming any it skipped). This is deliberate: CDC already
+//!   carries the row effects a trigger produced on the primary, so a
+//!   replica that also held the trigger would apply them twice.
 //! - Experimental + gated: the whole path is behind
 //!   `cdc_experimental = true`; sqld stays the production default.
 //!
@@ -157,13 +172,14 @@
 //!
 //! Payload is a JSON-encoded [`Frame`]. JSON is chosen for v1
 //! debuggability. Frame size is bounded at 16 MiB; oversized frames
-//! drop the stream. Authentication and confidentiality are handled by
-//! the channel handshake — inside the stream there is no per-frame
-//! sealing (yamux payloads travel through the already-authenticated
-//! TCP connection).
+//! drop the stream. Authentication and confidentiality come from the
+//! cluster channel underneath: every byte of the yamux connection is
+//! sealed with ChaCha20-Poly1305 under a per-connection key, so this
+//! module does no sealing of its own.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -173,7 +189,6 @@ use litewire::litewire_turso::Turso;
 use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, read_watermark};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::broadcast;
 
 use crate::tracked_backend;
 
@@ -205,6 +220,14 @@ const MAX_SNAPSHOT_CHUNK_LEN: u32 = 16 * 1024 * 1024;
 /// receiver's per-chunk allocation stays bounded.
 const SNAPSHOT_CHUNK_TARGET: usize = 1024 * 1024;
 
+/// Ceiling on the up-front allocation the receiver makes from the
+/// peer-supplied `total_len` hint (8 MiB). Beyond this the buffer grows
+/// as chunks actually arrive, so a peer claiming `u64::MAX` gets an
+/// 8 MiB reservation rather than a capacity-overflow panic or an
+/// allocator abort. The real ceiling on the transfer is
+/// `[db.sqlite.replication] max_snapshot_bytes`.
+const SNAPSHOT_PREALLOC_CAP: u64 = 8 * 1024 * 1024;
+
 /// Name of litewire's replica watermark table. Seeding it to the
 /// snapshot watermark `N` makes [`apply_batch`] treat every CDC batch
 /// with `commit_change_id() <= N` as an idempotent no-op. This mirrors
@@ -212,13 +235,6 @@ const SNAPSHOT_CHUNK_TARGET: usize = 1024 * 1024;
 /// `ensure_watermark_table` performs; we depend on the table name and
 /// shape staying stable under the exact litewire pin.
 const WATERMARK_TABLE: &str = "__litewire_cdc_watermark";
-
-/// Broadcast channel capacity — how many transactions the primary can
-/// buffer between polls before slow subscribers start missing (`Lagged`)
-/// frames. When a subscriber lags, it disconnects; the replica's
-/// reconnect loop opens a fresh stream and starts from cursor 0
-/// (idempotency provided by [`apply_batch`]'s monotonic watermark).
-const BROADCAST_CAPACITY: usize = 1024;
 
 /// How often the primary polls `turso_cdc` for new batches. Turso 0.7.0
 /// has no wakeup signal for CDC inserts, so we poll on a schedule.
@@ -232,8 +248,19 @@ const REPLICA_RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Frame types carried on the CDC replication wire.
+///
+/// The stream is not symmetric: [`Frame::Subscribe`] only ever travels
+/// replica → primary and is only ever valid as the first frame;
+/// [`Frame::Batch`] and [`Frame::Ping`] only ever travel primary →
+/// replica. They share one enum so both directions share one codec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Frame {
+    /// **Replica → primary, first frame only.** The replica's applied
+    /// watermark. The primary starts this subscriber's tailer at
+    /// exactly this `change_id`, so nothing between the watermark and
+    /// "now" can be skipped — which is what makes a reconnect (or a
+    /// warm restart) safe without a snapshot.
+    Subscribe { from_change_id: i64 },
     /// A committed transaction batch. `rows` mirrors
     /// [`litewire_turso::cdc::TxnBatch::rows`].
     Batch { rows: Vec<WireCdcRow> },
@@ -325,11 +352,14 @@ mod serde_bytes_opt {
 /// primary) and one for the CDC tail/apply path. Then:
 ///
 /// - Litewire wire frontends against the wire factory (always).
-/// - On primary: a tail loop reading `turso_cdc` and broadcasting
-///   batches, plus a channel stream handler that forwards them to any
-///   inbound `cdc/default` stream.
+/// - A `cdc/default` stream handler that, while this node is primary,
+///   gives every inbound subscriber its own `turso_cdc` tailer starting
+///   at the watermark that subscriber announces.
+/// - A `snapshot/default` handler that, while this node is primary,
+///   serves a cold replica's base snapshot.
 /// - On replica: a channel-dial loop that opens `cdc/default` against
-///   the primary and applies received batches.
+///   the primary, announces its watermark, and applies received
+///   batches.
 ///
 /// The `channel_handle` argument comes from
 /// [`ephpm_cluster::maybe_start_cluster_channel`] — when it's `None`,
@@ -402,30 +432,74 @@ pub async fn start_clustered_turso_cdc(
     )?;
     let (initial_role, role_rx) = determine_role(sqlite_config, cluster, channel_advertise).await?;
 
-    // Wire factory: served to litewire. Primary opts every session into
-    // CDC so writes coming through the frontends are captured.
-    let wire_cdc_on = matches!(initial_role, Role::Primary);
+    // Tracks whether this node is currently the primary. Read by the
+    // stream handlers, written by the role-change watcher. `Relaxed` is
+    // right here: a handler that reads a stale value for a few
+    // microseconds around a role flip either serves one extra stream
+    // (which the new primary's election heartbeat will supersede) or
+    // refuses one that the replica retries two seconds later.
+    let is_primary = Arc::new(AtomicBool::new(matches!(initial_role, Role::Primary)));
+
+    // Wire factory: served to litewire. Capture is enabled on EVERY
+    // node, not just the one that booted as primary: `Turso::builder`
+    // fixes `enable_cdc_on_connect` for the life of the factory, and
+    // that factory is moved into litewire below. A node promoted later
+    // by the election could therefore never start capturing, and every
+    // write it served after promotion would be invisible to replicas.
+    // Capturing everywhere costs a `turso_cdc` row per local write on
+    // replicas; shipping is gated by role at serve time instead.
     let wire_factory = Turso::builder(db_path)
-        .enable_cdc_on_connect(wire_cdc_on)
+        .enable_cdc_on_connect(true)
         .build()
         .await
         .with_context(|| format!("failed to open wire Turso factory at {db_path}"))?;
 
-    // Mgmt factory: used by the tail loop on the primary and the apply
-    // loop on the replica. Never opts into CDC-on-connect (the tailer
-    // reads turso_cdc explicitly; the applier only writes).
+    // Mgmt factory: used by the per-subscriber tailers and the snapshot
+    // dumper on the primary, and by the apply loop on the replica. Never
+    // opts into CDC-on-connect — the tailer reads turso_cdc explicitly,
+    // and the applier's writes must NOT be re-captured (that would make
+    // a replica echo the primary's changes into its own CDC log).
     let mgmt_factory = Arc::new(
         Turso::open(db_path)
             .await
             .with_context(|| format!("failed to open mgmt Turso factory at {db_path}"))?,
     );
 
+    let max_snapshot_bytes = sqlite_config.replication.max_snapshot_bytes;
+
     // Register the primary-side snapshot handler NOW, before anything
-    // dials, so a peer that comes up as a cold replica can always reach
-    // us for a bootstrap regardless of which role we started in. The
-    // handler pattern mirrors the CDC handler below (registered
-    // up-front so it survives role transitions).
-    spawn_snapshot_server(channel, Arc::clone(&mgmt_factory), handles);
+    // dials, so a peer that comes up as a cold replica can reach us as
+    // soon as we win an election. Serving is gated on actually being
+    // primary — a replica must never hand a peer a full logical dump of
+    // the database.
+    spawn_snapshot_server(channel, Arc::clone(&mgmt_factory), Arc::clone(&is_primary), handles);
+
+    // Register the CDC subscriber handler NOW even if we start as
+    // replica, so it is already in place after a promotion. Each
+    // inbound stream announces the watermark it has applied and gets
+    // its own tailer starting there.
+    let mut cdc_streams = channel.register_exact(CDC_STREAM_TYPE);
+    let subs_mgmt = Arc::clone(&mgmt_factory);
+    let subs_is_primary = Arc::clone(&is_primary);
+    handles.push(tokio::spawn(async move {
+        while let Some(incoming) = cdc_streams.recv().await {
+            let IncomingStream { stream, peer, .. } = incoming;
+            if !subs_is_primary.load(Ordering::Relaxed) {
+                tracing::warn!(
+                    peer = %peer,
+                    "CDC: refusing to serve a replication stream — this node is not the \
+                     primary; the peer is dialing a stale elected-primary address"
+                );
+                continue;
+            }
+            let mgmt = Arc::clone(&subs_mgmt);
+            tokio::spawn(async move {
+                if let Err(e) = serve_subscriber(stream, &mgmt).await {
+                    tracing::info!(peer = %peer, "CDC subscriber disconnected: {e:#}");
+                }
+            });
+        }
+    }));
 
     // Cold-start bootstrap: if we begin life as a replica with an empty
     // local DB, fetch the primary's base snapshot BEFORE the litewire
@@ -434,63 +508,38 @@ pub async fn start_clustered_turso_cdc(
     // purpose; the wire frontends spin up only after it completes. A
     // primary, or a replica whose DB is already populated, skips this.
     if let Role::Replica { primary_addr } = &initial_role {
-        maybe_bootstrap_cold_replica(&mgmt_factory, *primary_addr, channel).await;
+        maybe_bootstrap_cold_replica(&mgmt_factory, *primary_addr, channel, max_snapshot_bytes)
+            .await?;
     }
 
     // Start litewire wire frontends. Wire factory is moved in here.
     let tracked = tracked_backend::TrackedBackend::new(wire_factory, query_stats.clone());
     spawn_litewire_serve(sqlite_config, tracked, handles);
 
-    // Broadcast channel for primary-side batches. Cloned per inbound
-    // subscriber stream; each subscriber runs its own copy.
-    let (tx, _rx0) = broadcast::channel::<Arc<TxnBatch>>(BROADCAST_CAPACITY);
-
-    // Register the primary-side handler NOW even if we start as
-    // replica. On a later role transition the handler is already in
-    // place — we just start feeding the broadcast channel from the
-    // tail loop.
-    let mut cdc_streams = channel.register_exact(CDC_STREAM_TYPE);
-    let tx_for_subs = tx.clone();
-    handles.push(tokio::spawn(async move {
-        while let Some(incoming) = cdc_streams.recv().await {
-            let rx = tx_for_subs.subscribe();
-            let IncomingStream { stream, peer, .. } = incoming;
-            tokio::spawn(async move {
-                if let Err(e) = serve_subscriber(stream, rx).await {
-                    tracing::info!(peer = %peer, "CDC subscriber disconnected: {e:#}");
-                }
-            });
-        }
-    }));
-
     // Kick off role-appropriate work for the initial role.
-    let mgmt = Arc::clone(&mgmt_factory);
-    let tx0 = tx.clone();
-    let channel0 = channel.clone();
-    handles.push(tokio::spawn(async move {
-        start_role(initial_role, mgmt, tx0, channel0).await;
-    }));
+    let initial_driver =
+        tokio::spawn(start_role(initial_role, Arc::clone(&mgmt_factory), channel.clone()));
 
-    // Role-change watcher: on a role transition, spawn the new role's
-    // driver. Old drivers stay running and drain naturally; v1 accepts
-    // this simplification because in practice a role change only fires
-    // on failure/join events, and the new driver's stream open will
-    // succeed cleanly regardless of stale ones.
+    // Role-change watcher. The previous role's driver is aborted before
+    // the new one starts: a flapping election would otherwise pile up
+    // replica dial loops that all keep applying batches into the same
+    // connection.
     if let Some(mut watch_rx) = role_rx {
         let mgmt = Arc::clone(&mgmt_factory);
-        let tx = tx.clone();
         let channel = channel.clone();
         handles.push(tokio::spawn(async move {
+            let mut current = initial_driver;
             while watch_rx.changed().await.is_ok() {
                 let new_elected = watch_rx.borrow().clone();
                 let new_role = elected_to_role(new_elected);
                 tracing::info!(?new_role, "CDC replication: role change detected");
-                let mgmt = Arc::clone(&mgmt);
-                let tx = tx.clone();
-                let channel = channel.clone();
-                tokio::spawn(async move { start_role(new_role, mgmt, tx, channel).await });
+                is_primary.store(matches!(new_role, Role::Primary), Ordering::Relaxed);
+                current.abort();
+                current = tokio::spawn(start_role(new_role, Arc::clone(&mgmt), channel.clone()));
             }
         }));
+    } else {
+        handles.push(initial_driver);
     }
 
     Ok(())
@@ -582,7 +631,9 @@ async fn determine_role(
                 !sqlite_config.replication.primary_grpc_url.is_empty(),
                 "replication.primary_grpc_url is required when role = \"replica\" \
                  in CDC-native replication mode (this field carries the primary's \
-                 cluster channel address in this mode, e.g. \"10.0.0.1:7947\")"
+                 cluster channel address in this mode, e.g. \"10.0.0.1:7948\" — \
+                 the channel defaults to the gossip port + 2, not the KV data \
+                 plane's gossip port + 1)"
             );
             // Accept both "host:port" and "http://host:port" forms —
             // the URL form is what auto-election publishes today
@@ -616,17 +667,13 @@ async fn determine_role(
     }
 }
 
-async fn start_role(
-    role: Role,
-    mgmt: Arc<Turso>,
-    tx: broadcast::Sender<Arc<TxnBatch>>,
-    channel: ephpm_cluster::ChannelHandle,
-) {
+async fn start_role(role: Role, mgmt: Arc<Turso>, channel: ephpm_cluster::ChannelHandle) {
     match role {
         Role::Primary => {
-            if let Err(e) = run_primary(mgmt, tx).await {
-                tracing::error!("CDC primary loop exited: {e:#}");
-            }
+            // Nothing to drive: on the primary, each inbound subscriber
+            // stream owns its own tailer (see `serve_subscriber`), so
+            // there is no shared tail loop to run.
+            tracing::info!("CDC primary: serving replication streams on {CDC_STREAM_TYPE}");
         }
         Role::Replica { primary_addr } => {
             if let Err(e) = run_replica(mgmt, primary_addr, channel).await {
@@ -637,62 +684,62 @@ async fn start_role(
 }
 
 // ---------------------------------------------------------------------------
-// Primary: tail + broadcast. (Subscriber-side accept is registered up in
-// `start_clustered_turso_cdc` so it exists across role transitions.)
+// Primary: one tailer per subscriber. (Subscriber-side accept is
+// registered up in `start_clustered_turso_cdc` so it exists across role
+// transitions.)
 // ---------------------------------------------------------------------------
 
-async fn run_primary(mgmt: Arc<Turso>, tx: broadcast::Sender<Arc<TxnBatch>>) -> anyhow::Result<()> {
-    tracing::info!("CDC primary: tail loop starting");
-    let mut tailer = CdcTailer::new(&mgmt, 0);
+/// Serve one replica's `cdc/default` stream.
+///
+/// The replica's first frame is [`Frame::Subscribe`], carrying the
+/// `change_id` it has already applied. We open a [`CdcTailer`] at
+/// exactly that cursor and pump batches into the stream from there.
+///
+/// This is deliberately **not** a fan-out from one shared cursor. An
+/// earlier version broadcast a single primary-wide tailer to all
+/// subscribers via `tokio::sync::broadcast`; `subscribe()` only
+/// delivers values sent after the call and the wire had no way to ask
+/// for a resume point, so every lag event and every reconnect silently
+/// and permanently dropped the batches in the gap while the shared
+/// cursor marched on. One cursor per subscriber, anchored to a
+/// watermark the subscriber names, makes that structurally impossible.
+///
+/// The cost is one `turso_cdc` poll per subscriber per
+/// [`POLL_INTERVAL`]. With the handful of replicas v1 targets that is
+/// the right trade against losing writes.
+async fn serve_subscriber(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Result<()> {
+    let from = match read_frame(&mut stream).await.context("read subscribe frame")? {
+        Frame::Subscribe { from_change_id } => from_change_id,
+        other => anyhow::bail!("expected Subscribe as the first CDC frame, got {other:?}"),
+    };
+    anyhow::ensure!(from >= 0, "subscriber sent a negative watermark: {from}");
+    tracing::info!(from_change_id = from, "CDC: subscriber attached");
+
+    let mut tailer = CdcTailer::new(mgmt, from);
+    let mut idle_since = tokio::time::Instant::now();
+
     loop {
         match tailer.poll_batch().await {
             Ok(Some(batch)) => {
-                let arc = Arc::new(batch);
-                // send() Err means no receivers; that's fine — subscribers
-                // reconnect and stream from cursor 0 on the next connect.
-                let _ = tx.send(arc);
+                let frame =
+                    Frame::Batch { rows: batch.rows.iter().map(WireCdcRow::from).collect() };
+                write_frame(&mut stream, &frame).await?;
+                idle_since = tokio::time::Instant::now();
             }
             Ok(None) => {
+                // Keep the stream warm so a replica can tell "idle
+                // primary" from "dead primary".
+                if idle_since.elapsed() >= HEARTBEAT_INTERVAL {
+                    write_frame(&mut stream, &Frame::Ping).await?;
+                    idle_since = tokio::time::Instant::now();
+                }
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
             Err(e) => {
-                tracing::error!("CDC tail poll error: {e:#}");
-                tokio::time::sleep(POLL_INTERVAL * 4).await;
-            }
-        }
-    }
-}
-
-async fn serve_subscriber(
-    mut stream: ChannelStream,
-    mut rx: broadcast::Receiver<Arc<TxnBatch>>,
-) -> anyhow::Result<()> {
-    let mut hb = tokio::time::interval(HEARTBEAT_INTERVAL);
-    hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        tokio::select! {
-            recv = rx.recv() => {
-                match recv {
-                    Ok(batch) => {
-                        let frame = Frame::Batch {
-                            rows: batch.rows.iter().map(WireCdcRow::from).collect(),
-                        };
-                        write_frame(&mut stream, &frame).await?;
-                    }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // Subscriber fell behind by n batches. v1 policy:
-                        // drop the stream so the client reconnects and
-                        // restarts. Watermark keeps re-application safe.
-                        anyhow::bail!("subscriber lagged by {n} batches; forcing reconnect");
-                    }
-                    Err(broadcast::error::RecvError::Closed) => {
-                        anyhow::bail!("primary broadcast channel closed");
-                    }
-                }
-            }
-            _ = hb.tick() => {
-                write_frame(&mut stream, &Frame::Ping).await?;
+                // Drop the stream rather than skip past the failure —
+                // the replica reconnects with the same watermark and we
+                // retry from the identical cursor.
+                anyhow::bail!("CDC tail poll error: {e:#}");
             }
         }
     }
@@ -711,11 +758,31 @@ async fn run_replica(
     // arrive only through apply_batch, keyed by monotonic watermark.
     let apply_conn = mgmt.raw_connection()?;
 
+    tracing::warn!(
+        primary = %primary_addr,
+        "CDC replica: the local wire frontends accept WRITES and litewire has no read-only \
+         mode, but nothing replicates a write made against a replica — it will diverge from \
+         the primary and be overwritten or shadowed by replayed batches. Point application \
+         traffic at the primary."
+    );
+
     loop {
         match channel.dial(primary_addr, CDC_STREAM_TYPE).await {
             Ok(mut stream) => {
-                tracing::info!(primary = %primary_addr, "CDC replica: channel stream open");
-                match consume_frames(&mut stream, &apply_conn).await {
+                // Resume from exactly what we have applied. Read it
+                // fresh on every connect: a previous session may have
+                // advanced it. A read failure must not kill the driver —
+                // subscribing from a stale or default cursor would be
+                // worse than waiting for the next attempt.
+                let watermark = match read_watermark(&apply_conn).await {
+                    Ok(w) => w,
+                    Err(e) => {
+                        tracing::warn!("CDC replica: cannot read local watermark: {e}");
+                        tokio::time::sleep(REPLICA_RECONNECT_DELAY).await;
+                        continue;
+                    }
+                };
+                match subscribe_and_consume(&mut stream, &apply_conn, watermark).await {
                     Ok(()) => {
                         tracing::info!("CDC replica: primary closed stream cleanly");
                     }
@@ -732,6 +799,19 @@ async fn run_replica(
     }
 }
 
+/// Announce our watermark, then apply everything the primary sends.
+async fn subscribe_and_consume(
+    stream: &mut ChannelStream,
+    apply_conn: &litewire::litewire_turso::TursoConnection,
+    watermark: i64,
+) -> anyhow::Result<()> {
+    write_frame(stream, &Frame::Subscribe { from_change_id: watermark })
+        .await
+        .context("send subscribe frame")?;
+    tracing::info!(from_change_id = watermark, "CDC replica: subscribed");
+    consume_frames(stream, apply_conn).await
+}
+
 async fn consume_frames(
     stream: &mut ChannelStream,
     apply_conn: &litewire::litewire_turso::TursoConnection,
@@ -740,15 +820,28 @@ async fn consume_frames(
         let frame = read_frame(stream).await?;
         match frame {
             Frame::Batch { rows } => {
+                // `TxnBatch::commit_change_id` reads the last row and
+                // panics on an empty batch, and `apply_batch` calls it
+                // unconditionally — so a peer sending `{"rows":[]}`
+                // would take down this task, which nothing joins, and
+                // replication would stop forever with no error path.
+                // Reject the frame instead of constructing the batch.
+                anyhow::ensure!(!rows.is_empty(), "peer sent an empty CDC batch frame");
                 let batch = TxnBatch { rows: rows.into_iter().map(CdcRow::from).collect() };
-                if let Err(e) = apply_batch(apply_conn, &batch).await {
-                    tracing::error!(
-                        change_id = batch.commit_change_id(),
-                        "CDC apply_batch error: {e:#}"
-                    );
-                }
+                let change_id = batch.commit_change_id();
+                // A failed apply must NOT be skipped: continuing to the
+                // next batch would let the watermark advance past the
+                // failure and make the divergence permanent and silent.
+                // Fail the stream; the replica reconnects and resumes
+                // from the watermark, which has not moved.
+                apply_batch(apply_conn, &batch)
+                    .await
+                    .with_context(|| format!("CDC apply_batch failed at change_id {change_id}"))?;
             }
             Frame::Ping => {}
+            Frame::Subscribe { .. } => {
+                anyhow::bail!("primary sent a Subscribe frame; wrong direction");
+            }
         }
     }
 }
@@ -785,20 +878,32 @@ struct SnapshotHeader {
     total_len: u64,
 }
 
-/// Spawn the primary-side snapshot server. Registered up-front (like the
-/// CDC handler) so a cold replica can bootstrap from us no matter which
-/// role we started in. Each inbound `snapshot/default` stream is served
-/// on its own task from a fresh mgmt connection.
+/// Spawn the primary-side snapshot server. The handler is registered
+/// up-front (like the CDC handler) so it is already in place after a
+/// promotion, but a stream is only **served** while this node is the
+/// elected primary: a full logical dump of the database is the most
+/// sensitive thing on the channel, and a replica has no business
+/// handing one out.
 fn spawn_snapshot_server(
     channel: &ephpm_cluster::ChannelHandle,
     mgmt: Arc<Turso>,
+    is_primary: Arc<AtomicBool>,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
     let mut snapshot_streams = channel.register_exact(SNAPSHOT_STREAM_TYPE);
     handles.push(tokio::spawn(async move {
         while let Some(incoming) = snapshot_streams.recv().await {
-            let mgmt = Arc::clone(&mgmt);
             let IncomingStream { stream, peer, .. } = incoming;
+            if !is_primary.load(Ordering::Relaxed) {
+                tracing::warn!(
+                    peer = %peer,
+                    "snapshot bootstrap: refusing to serve a database dump — this node is \
+                     not the primary; the peer is dialing a stale elected-primary address"
+                );
+                drop(stream);
+                continue;
+            }
+            let mgmt = Arc::clone(&mgmt);
             tokio::spawn(async move {
                 match serve_snapshot(stream, &mgmt).await {
                     Ok(n) => {
@@ -908,6 +1013,17 @@ async fn current_max_change_id(conn: &turso::Connection) -> anyhow::Result<i64> 
 /// Reads `sqlite_schema` directly. Internal objects are skipped (see
 /// [`is_internal_object`]). Autoindexes (NULL `sql`) are skipped: they
 /// follow their parent table's DDL automatically.
+///
+/// **Triggers are skipped**, with a warning naming each one. Two
+/// reasons, one correctness and one safety:
+///
+/// - CDC replays the row effects a trigger produced on the primary. A
+///   replica that also held the trigger would fire it again on top of
+///   those replayed rows and diverge.
+/// - A trigger body is the one piece of `sqlite_schema.sql` that
+///   contains statement separators inside itself, which would make the
+///   receiving side's statement allowlist (see
+///   [`validate_snapshot_dump`]) unable to reason about the dump.
 async fn snapshot_schema(
     conn: &turso::Connection,
     dump: &mut String,
@@ -929,6 +1045,15 @@ async fn snapshot_schema(
         let sql = value_text(&row, 2)?;
 
         if is_internal_object(&name) {
+            continue;
+        }
+        if obj_type == "trigger" {
+            tracing::warn!(
+                trigger = %name,
+                "snapshot bootstrap: not shipping trigger to the replica — CDC already \
+                 carries the rows it produced on the primary, so replaying the trigger \
+                 there would double-apply them"
+            );
             continue;
         }
         // Emit the object's own DDL verbatim. `sqlite_schema.sql` already
@@ -1010,16 +1135,154 @@ async fn table_columns(conn: &turso::Connection, table: &str) -> anyhow::Result<
 
 /// Apply a received snapshot dump to the local (cold) DB, then seed the
 /// watermark to `N` so the CDC tail resumes exactly past it.
+///
+/// The dump arrives from the network and is only UTF-8 checked before
+/// this point, so it is validated against a statement allowlist first
+/// — see [`validate_snapshot_dump`]. Only then does it reach
+/// `execute_batch`.
 async fn apply_snapshot(
     conn: &turso::Connection,
     watermark: i64,
     dump: &str,
 ) -> anyhow::Result<()> {
+    validate_snapshot_dump(dump).context("snapshot: dump rejected by the statement allowlist")?;
     // Execute the whole dump as a batch. It is self-consistent DDL+DML
     // captured under one read view on the primary.
     conn.execute_batch(dump).await.context("snapshot: apply dump")?;
     seed_watermark(conn, watermark).await.context("snapshot: seed watermark")?;
     Ok(())
+}
+
+/// Statement kinds a snapshot dump may contain.
+///
+/// A snapshot is, by construction, schema `CREATE`s followed by
+/// `INSERT OR REPLACE`s. Anything else — `ATTACH`, `PRAGMA`, `DROP`,
+/// `UPDATE`, `DELETE` — is a peer trying to run SQL of its own choosing
+/// on us, and the bootstrap path used to hand the whole blob straight
+/// to `execute_batch`.
+const ALLOWED_STATEMENT_PREFIXES: [&str; 2] = ["CREATE", "INSERT"];
+
+/// Reject a dump that contains anything outside
+/// [`ALLOWED_STATEMENT_PREFIXES`].
+///
+/// The scan is quote-aware — single-quoted strings with `''` escapes,
+/// double-quoted identifiers with `""` escapes, and `X'..'` blobs are
+/// all just quoted runs, so a `;` inside one is not a separator.
+///
+/// Comments are **skipped, not rejected**: `sqlite_schema.sql` stores
+/// the exact `CREATE` text the operator wrote, comments included, so
+/// refusing them would make a perfectly ordinary database
+/// un-bootstrappable. Skipping keeps them from hiding a separator, and
+/// [`check_statement_allowed`] looks past leading comments to find the
+/// statement's real first keyword.
+///
+/// # Errors
+///
+/// Returns an error naming the offending statement (truncated) when the
+/// dump contains a disallowed statement, an unterminated quote, or an
+/// unterminated block comment.
+fn validate_snapshot_dump(dump: &str) -> anyhow::Result<()> {
+    let bytes = dump.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                i += 1;
+                loop {
+                    anyhow::ensure!(i < bytes.len(), "unterminated quoted literal in dump");
+                    if bytes[i] == quote {
+                        // A doubled quote is an escaped quote, not a close.
+                        if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                // Line comment: runs to the newline, or to EOF.
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                loop {
+                    anyhow::ensure!(i + 1 < bytes.len(), "unterminated block comment in dump");
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b';' => {
+                check_statement_allowed(&dump[start..i])?;
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    // Trailing text after the last `;` must be blank (or a comment).
+    check_statement_allowed(&dump[start..])
+}
+
+/// Allow an empty/whitespace/comment-only statement, or one starting
+/// with an allowlisted keyword.
+fn check_statement_allowed(stmt: &str) -> anyhow::Result<()> {
+    let trimmed = strip_leading_noise(stmt);
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let keyword = trimmed
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect::<String>()
+        .to_ascii_uppercase();
+    anyhow::ensure!(
+        ALLOWED_STATEMENT_PREFIXES.contains(&keyword.as_str()),
+        "disallowed statement in snapshot dump (only CREATE and INSERT are accepted): {}",
+        truncate_for_log(trimmed)
+    );
+    Ok(())
+}
+
+/// Drop leading whitespace and leading SQL comments so the statement's
+/// first keyword is what gets checked. Returns `""` when the input is
+/// nothing but whitespace and comments (including an unterminated one).
+fn strip_leading_noise(stmt: &str) -> &str {
+    let mut s = stmt;
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("--") {
+            let Some(nl) = rest.find('\n') else { return "" };
+            s = &rest[nl + 1..];
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            let Some(end) = rest.find("*/") else { return "" };
+            s = &rest[end + 2..];
+        } else {
+            return s;
+        }
+    }
+}
+
+/// First 120 characters of `s`, for error messages that must not dump a
+/// multi-megabyte payload into the log.
+fn truncate_for_log(s: &str) -> String {
+    const LIMIT: usize = 120;
+    if s.chars().count() <= LIMIT {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(LIMIT).collect();
+    format!("{head}…")
 }
 
 /// Create (if absent) and set litewire's replica watermark table to
@@ -1049,34 +1312,29 @@ async fn seed_watermark(conn: &turso::Connection, watermark: i64) -> anyhow::Res
 /// base snapshot and apply it before returning. A non-empty local DB
 /// (already bootstrapped, or a warm restart) skips the transfer.
 ///
-/// This never propagates an error: a bootstrap failure logs and lets the
-/// node come up empty and replicate forward (degraded but not crashed),
-/// matching the "replicas may start empty" v1 fallback. It retries the
-/// dial a bounded number of times to ride out the window where the
-/// primary's channel is not yet accepting.
+/// Exhausting the retry budget is **fatal**. Coming up empty was the
+/// previous behaviour and it is worse than not coming up at all: the
+/// node would immediately start serving reads that silently omit every
+/// row written before the CDC log's earliest retained entry, with
+/// nothing but a startup `error!` to say so. Failing startup is loud,
+/// and an orchestrator restart is exactly the retry that has a chance
+/// of working.
+///
+/// # Errors
+///
+/// Returns an error if the local connection cannot be opened, if the
+/// cold-start check fails, or if every bootstrap attempt fails.
 async fn maybe_bootstrap_cold_replica(
     mgmt: &Turso,
     primary_addr: SocketAddr,
     channel: &ephpm_cluster::ChannelHandle,
-) {
-    let conn = match mgmt.raw_connection() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("snapshot bootstrap: cannot open local connection: {e:#}");
-            return;
-        }
-    };
+    max_snapshot_bytes: u64,
+) -> anyhow::Result<()> {
+    let conn = mgmt.raw_connection().context("snapshot bootstrap: open local connection")?;
 
-    match local_db_is_cold(&conn).await {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::info!("snapshot bootstrap: local DB already populated; skipping");
-            return;
-        }
-        Err(e) => {
-            tracing::warn!("snapshot bootstrap: cold-check failed, skipping: {e:#}");
-            return;
-        }
+    if !local_db_is_cold(&conn).await.context("snapshot bootstrap: cold-start check")? {
+        tracing::info!("snapshot bootstrap: local DB already populated; skipping");
+        return Ok(());
     }
 
     tracing::warn!(
@@ -1087,15 +1345,16 @@ async fn maybe_bootstrap_cold_replica(
     );
 
     const MAX_ATTEMPTS: u32 = 30;
+    let mut last_error = None;
     for attempt in 1..=MAX_ATTEMPTS {
-        match fetch_and_apply_snapshot(&conn, primary_addr, channel).await {
+        match fetch_and_apply_snapshot(&conn, primary_addr, channel, max_snapshot_bytes).await {
             Ok(n) => {
                 tracing::info!(
                     primary = %primary_addr,
                     watermark = n,
                     "snapshot bootstrap complete; replica seeded and ready to tail CDC"
                 );
-                return;
+                return Ok(());
             }
             Err(e) => {
                 tracing::debug!(
@@ -1103,16 +1362,19 @@ async fn maybe_bootstrap_cold_replica(
                     primary = %primary_addr,
                     "snapshot bootstrap attempt failed: {e:#}"
                 );
+                last_error = Some(e);
                 tokio::time::sleep(REPLICA_RECONNECT_DELAY).await;
             }
         }
     }
-    tracing::error!(
-        primary = %primary_addr,
-        "snapshot bootstrap gave up after {MAX_ATTEMPTS} attempts; replica will start empty \
-         and replicate forward only (pre-snapshot data will be MISSING until a restart \
-         succeeds in bootstrapping)"
-    );
+
+    let cause = last_error.unwrap_or_else(|| anyhow::anyhow!("no attempt recorded an error"));
+    Err(cause.context(format!(
+        "snapshot bootstrap from {primary_addr} failed after {MAX_ATTEMPTS} attempts. \
+         Refusing to start: a cold replica that comes up without its base snapshot would \
+         serve reads missing every pre-CDC row. Check that the primary is reachable on its \
+         cluster channel address and that both nodes share a [cluster] secret."
+    )))
 }
 
 /// A DB is "cold" when the applied watermark is 0 AND there are no user
@@ -1152,14 +1414,20 @@ async fn local_db_is_cold(conn: &turso::Connection) -> anyhow::Result<bool> {
 /// production fetch/apply path (mirrors [`parse_primary_addr`]). Not part
 /// of a stable API.
 ///
+/// `max_snapshot_bytes` bounds how much body this call will accept
+/// before giving up — see `[db.sqlite.replication] max_snapshot_bytes`.
+///
 /// # Errors
 ///
 /// Returns an error if the dial, header/chunk read, or dump application
-/// fails.
+/// fails, if the peer announces or streams more than
+/// `max_snapshot_bytes`, or if the dump contains a statement outside
+/// the `CREATE`/`INSERT` allowlist.
 pub async fn fetch_and_apply_snapshot(
     conn: &turso::Connection,
     primary_addr: SocketAddr,
     channel: &ephpm_cluster::ChannelHandle,
+    max_snapshot_bytes: u64,
 ) -> anyhow::Result<i64> {
     let mut stream = channel
         .dial(primary_addr, SNAPSHOT_STREAM_TYPE)
@@ -1167,12 +1435,32 @@ pub async fn fetch_and_apply_snapshot(
         .with_context(|| format!("snapshot: dial {primary_addr}"))?;
 
     let header = read_snapshot_header(&mut stream).await.context("snapshot: read header")?;
-    let mut body = Vec::with_capacity(usize::try_from(header.total_len).unwrap_or(0));
+    anyhow::ensure!(
+        header.total_len <= max_snapshot_bytes,
+        "snapshot: peer announced {} bytes, above the [db.sqlite.replication] \
+         max_snapshot_bytes limit of {max_snapshot_bytes}",
+        header.total_len
+    );
+
+    // `total_len` is advisory and peer-controlled: a hostile or buggy
+    // peer can claim anything, so it is only ever a *hint* for the
+    // initial allocation, clamped to a size we are happy to reserve up
+    // front. The authoritative limit is the running total below.
+    let hint = header.total_len.min(SNAPSHOT_PREALLOC_CAP);
+    let mut body = Vec::with_capacity(usize::try_from(hint).unwrap_or(0));
+    let mut received: u64 = 0;
     loop {
         let chunk = read_snapshot_chunk(&mut stream).await.context("snapshot: read chunk")?;
         if chunk.is_empty() {
             break; // end marker
         }
+        received = received.saturating_add(chunk.len() as u64);
+        anyhow::ensure!(
+            received <= max_snapshot_bytes,
+            "snapshot: body exceeded the [db.sqlite.replication] max_snapshot_bytes limit \
+             of {max_snapshot_bytes} (a peer streaming chunks without an end marker would \
+             otherwise grow this buffer without bound)"
+        );
         body.extend_from_slice(&chunk);
     }
     let dump = String::from_utf8(body).context("snapshot: dump body is not valid utf-8")?;
@@ -1517,6 +1805,80 @@ mod tests {
         assert_eq!(sql_literal(&turso::Value::Blob(vec![0x00, 0xde, 0xad])).unwrap(), "X'00dead'");
         // Non-finite float rejected.
         assert!(sql_literal(&turso::Value::Real(f64::INFINITY)).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Snapshot dump allowlist. The dump arrives from the network and
+    // used to go straight into `execute_batch`, so anything that is not
+    // a CREATE or an INSERT is a peer running SQL of its choosing on us.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn validator_accepts_a_real_dump_shape() {
+        let dump = "CREATE TABLE \"posts\" (id INTEGER PRIMARY KEY, title TEXT);\n\
+                    CREATE INDEX \"idx\" ON \"posts\" (title);\n\
+                    INSERT OR REPLACE INTO \"posts\" (rowid, \"id\", \"title\") \
+                    VALUES (1, 1, 'hello');\n";
+        validate_snapshot_dump(dump).expect("a dump this module produced must validate");
+    }
+
+    #[test]
+    fn validator_tolerates_semicolons_inside_literals() {
+        let dump = "INSERT OR REPLACE INTO \"t\" (rowid, \"v\") \
+                    VALUES (1, 'a;DROP TABLE t;--');\n";
+        validate_snapshot_dump(dump).expect("a semicolon inside a string is not a separator");
+        let dump = "CREATE TABLE \"weird;name\" (a TEXT);\n";
+        validate_snapshot_dump(dump).expect("a semicolon inside an identifier is not a separator");
+    }
+
+    #[test]
+    fn validator_rejects_statements_outside_the_allowlist() {
+        for bad in [
+            "ATTACH DATABASE '/etc/passwd' AS steal;",
+            "PRAGMA journal_mode = WAL;",
+            "DROP TABLE posts;",
+            "DELETE FROM posts;",
+            "UPDATE posts SET title = 'x';",
+            "CREATE TABLE t (a);\nDROP TABLE t;",
+        ] {
+            let err = validate_snapshot_dump(bad).unwrap_err();
+            assert!(
+                err.to_string().contains("disallowed statement"),
+                "expected a rejection for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    /// Comments must be tolerated — `sqlite_schema.sql` preserves the
+    /// operator's original `CREATE` text, comments and all, so rejecting
+    /// them would make an ordinary database un-bootstrappable. They must
+    /// not be able to smuggle a statement past the allowlist either.
+    #[test]
+    fn validator_tolerates_comments_without_letting_them_smuggle() {
+        validate_snapshot_dump("-- a note\nCREATE TABLE t (a);").unwrap();
+        validate_snapshot_dump("/* a note */ CREATE TABLE t (a);").unwrap();
+        validate_snapshot_dump("CREATE TABLE t (\n  a INTEGER -- the id\n);").unwrap();
+        validate_snapshot_dump("CREATE TABLE t (a); -- trailing").unwrap();
+        // A comment cannot hide a disallowed statement...
+        assert!(validate_snapshot_dump("-- note\nDROP TABLE t;").is_err());
+        assert!(validate_snapshot_dump("CREATE TABLE t (a); /* x */ DROP TABLE t;").is_err());
+        // ...and cannot hide a statement separator either: the `;` here
+        // is inside the comment, so `DROP` is part of the same statement
+        // as the CREATE rather than a new allowed one.
+        validate_snapshot_dump("CREATE TABLE t (a); -- ; DROP TABLE t\n").unwrap();
+    }
+
+    #[test]
+    fn validator_rejects_unterminated_quotes_and_comments() {
+        assert!(validate_snapshot_dump("INSERT INTO t VALUES ('unterminated);").is_err());
+        assert!(validate_snapshot_dump("CREATE TABLE t (a); /* never closed").is_err());
+    }
+
+    #[test]
+    fn validator_accepts_empty_and_whitespace_only_dumps() {
+        validate_snapshot_dump("").unwrap();
+        validate_snapshot_dump("  \n\t ").unwrap();
+        validate_snapshot_dump(";;\n;").unwrap();
     }
 
     #[test]
