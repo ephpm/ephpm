@@ -236,6 +236,11 @@ const SNAPSHOT_PREALLOC_CAP: u64 = 8 * 1024 * 1024;
 /// shape staying stable under the exact litewire pin.
 const WATERMARK_TABLE: &str = "__litewire_cdc_watermark";
 
+/// Name of Turso's CDC log table. Created lazily by the engine on the
+/// first captured write, which is why [`is_missing_cdc_log`] has to treat
+/// its absence as "no changes yet" rather than as a failure.
+const CDC_LOG_TABLE: &str = "turso_cdc";
+
 /// How often the primary polls `turso_cdc` for new batches. Turso 0.7.0
 /// has no wakeup signal for CDC inserts, so we poll on a schedule.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -707,7 +712,16 @@ async fn start_role(role: Role, mgmt: Arc<Turso>, channel: ephpm_cluster::Channe
 /// The cost is one `turso_cdc` poll per subscriber per
 /// [`POLL_INTERVAL`]. With the handful of replicas v1 targets that is
 /// the right trade against losing writes.
-async fn serve_subscriber(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Result<()> {
+///
+/// Generic over the stream so the loop can be driven directly in tests
+/// over a `tokio::io::duplex` pair. Production always passes a
+/// [`ChannelStream`]; before this was generic the only coverage of this
+/// function was a hand-rolled copy inside the e2e tests, which is how the
+/// cold-start reconnect loop went unnoticed.
+async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    mut stream: S,
+    mgmt: &Turso,
+) -> anyhow::Result<()> {
     let from = match read_frame(&mut stream).await.context("read subscribe frame")? {
         Frame::Subscribe { from_change_id } => from_change_id,
         other => anyhow::bail!("expected Subscribe as the first CDC frame, got {other:?}"),
@@ -717,16 +731,47 @@ async fn serve_subscriber(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Re
 
     let mut tailer = CdcTailer::new(mgmt, from);
     let mut idle_since = tokio::time::Instant::now();
+    let mut logged_missing_log = false;
 
     loop {
-        match tailer.poll_batch().await {
-            Ok(Some(batch)) => {
+        let batch = match tailer.poll_batch().await {
+            Ok(batch) => batch,
+            // `turso_cdc` is created lazily by litewire-turso, on the
+            // first captured write — not when CDC is enabled and not
+            // when a session connects. On a freshly provisioned cluster
+            // that has served no writes yet, the table is simply absent,
+            // and "absent" is indistinguishable from "empty": both mean
+            // zero changes to ship. Treating it as a hard error tore the
+            // subscriber down on every poll, and the replica redialed
+            // every REPLICA_RECONNECT_DELAY, producing an error loop
+            // that only stopped once someone happened to write.
+            Err(e) if is_missing_cdc_log(&e) => {
+                if !logged_missing_log {
+                    logged_missing_log = true;
+                    tracing::info!(
+                        "CDC: turso_cdc does not exist yet — the primary has served no captured \
+                         write since this database was created. Holding the subscriber open; \
+                         batches will flow as soon as the first write lands."
+                    );
+                }
+                None
+            }
+            Err(e) => {
+                // Drop the stream rather than skip past the failure —
+                // the replica reconnects with the same watermark and we
+                // retry from the identical cursor.
+                anyhow::bail!("CDC tail poll error: {e:#}");
+            }
+        };
+
+        match batch {
+            Some(batch) => {
                 let frame =
                     Frame::Batch { rows: batch.rows.iter().map(WireCdcRow::from).collect() };
                 write_frame(&mut stream, &frame).await?;
                 idle_since = tokio::time::Instant::now();
             }
-            Ok(None) => {
+            None => {
                 // Keep the stream warm so a replica can tell "idle
                 // primary" from "dead primary".
                 if idle_since.elapsed() >= HEARTBEAT_INTERVAL {
@@ -735,14 +780,23 @@ async fn serve_subscriber(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Re
                 }
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
-            Err(e) => {
-                // Drop the stream rather than skip past the failure —
-                // the replica reconnects with the same watermark and we
-                // retry from the identical cursor.
-                anyhow::bail!("CDC tail poll error: {e:#}");
-            }
         }
     }
+}
+
+/// True when `e` is litewire reporting that the CDC log table does not
+/// exist yet.
+///
+/// This matches on the message text because it has to: litewire's
+/// `BackendError` carries only `Sqlite(String)`/`Other(String)`, so there
+/// is no typed variant to match on. The durable fix is a typed
+/// "relation missing" variant upstream in litewire plus a pin bump; until
+/// then, `serve_subscriber`'s cold-start test pins this behaviour so a
+/// message change upstream fails loudly here instead of silently
+/// restoring the reconnect loop.
+fn is_missing_cdc_log<E: std::fmt::Display>(e: &E) -> bool {
+    let msg = e.to_string();
+    msg.contains("no such table") && msg.contains(CDC_LOG_TABLE)
 }
 
 // ---------------------------------------------------------------------------
@@ -1729,6 +1783,115 @@ mod tests {
         AsyncWriteExt::write_all(&mut client, &over.to_be_bytes()).await.unwrap();
         let err = read_frame(&mut server).await.unwrap_err();
         assert!(err.to_string().contains("frame too large"), "unexpected error: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Cold-start: `turso_cdc` missing is "no changes yet", not an error.
+    //
+    // These pin the exact message shape litewire produces today. If an
+    // upstream change alters it, `missing_cdc_log_matches_litewire_text`
+    // fails — which is the point: the reconnect loop it prevents is
+    // silent, so the guard must not be allowed to rot quietly.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn missing_cdc_log_matches_litewire_text() {
+        // Verbatim from a real run: the primary polled before any write
+        // had created the log. (litewire wraps turso's parse error in
+        // BackendError::Sqlite, whose Display prepends "SQLite error: ".)
+        let e = "SQLite error: Parse error: no such table: turso_cdc";
+        assert!(is_missing_cdc_log(&e), "should recognise the cold-start error");
+    }
+
+    /// Drives the **production** `serve_subscriber` against a database
+    /// that has never been written to, which is the state of every
+    /// freshly provisioned cluster.
+    ///
+    /// Before the cold-start guard, `poll_batch` returned "no such table:
+    /// turso_cdc", `serve_subscriber` bailed, and the replica redialed
+    /// every `REPLICA_RECONNECT_DELAY` (2s) forever — an error loop that
+    /// only ended when someone happened to write. Here that manifests as
+    /// the task completing almost immediately with an error.
+    ///
+    /// The assertion is two-part on purpose: staying alive is not enough,
+    /// the subscriber must still deliver the first real batch afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_primary_holds_subscriber_open_until_first_write() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+
+        // Mgmt factory: what the tailer reads through. Never enables
+        // CDC-on-connect, so nothing here creates turso_cdc.
+        let mgmt = Arc::new(Turso::open(&path).await.unwrap());
+
+        // Precondition: the log genuinely does not exist yet. If a future
+        // litewire creates it eagerly, this assert fires and tells us the
+        // guard is no longer load-bearing.
+        {
+            let conn = mgmt.raw_connection().unwrap();
+            let probe = conn.prepare("SELECT 1 FROM turso_cdc LIMIT 1").await;
+            assert!(probe.is_err(), "turso_cdc should not exist before any captured write");
+        }
+
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        let mgmt_for_task = Arc::clone(&mgmt);
+        let task = tokio::spawn(async move { serve_subscriber(server, &mgmt_for_task).await });
+
+        // Subscribe from the very beginning, as a cold replica does.
+        write_frame(&mut client, &Frame::Subscribe { from_change_id: 0 }).await.unwrap();
+
+        // The old behaviour ended the task here. Give it well over the
+        // poll interval to prove it does not.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !task.is_finished(),
+            "subscriber died on a cold database — the reconnect loop has regressed"
+        );
+
+        // Now write through a CDC-capturing session; turso_cdc springs
+        // into existence and the batch must reach the still-open stream.
+        // `connect` comes from the Backend trait, scoped here so it does
+        // not leak into the rest of the test module.
+        use litewire::backend::Backend;
+        let wire = Turso::builder(&path).enable_cdc_on_connect(true).build().await.unwrap();
+        let session = wire.connect().await.unwrap();
+        session.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).await.unwrap();
+        session.execute("INSERT INTO t VALUES (1, 'hello')", &[]).await.unwrap();
+
+        // Read frames until a non-empty Batch arrives (heartbeat Pings
+        // may interleave). The whole point is that this stream — the one
+        // opened before the table existed — is the one that delivers.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut got_batch = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(2), read_frame(&mut client)).await {
+                Ok(Ok(Frame::Batch { rows })) if !rows.is_empty() => {
+                    got_batch = true;
+                    break;
+                }
+                Ok(Err(e)) => panic!("stream broke after the first write: {e}"),
+                // A heartbeat Ping or an empty Batch (Ok(Ok(_))), and a
+                // read that simply timed out (Err(_)): both mean "nothing
+                // yet, keep waiting until the deadline".
+                Ok(Ok(_)) | Err(_) => {}
+            }
+        }
+        assert!(got_batch, "no CDC batch arrived on the subscriber opened before the first write");
+
+        task.abort();
+    }
+
+    #[test]
+    fn missing_cdc_log_ignores_unrelated_failures() {
+        // A different missing table must NOT be swallowed — that would
+        // hide a genuinely broken replica behind an idle-looking stream.
+        assert!(!is_missing_cdc_log(&"SQLite error: Parse error: no such table: posts"));
+        // Nor should generic I/O or corruption errors.
+        assert!(!is_missing_cdc_log(&"SQLite error: database disk image is malformed"));
+        assert!(!is_missing_cdc_log(&"backend error: connection closed"));
+        // A message merely mentioning the table is not a missing-table
+        // error; both halves must be present.
+        assert!(!is_missing_cdc_log(&"SQLite error: turso_cdc is locked"));
     }
 
     // -----------------------------------------------------------------
