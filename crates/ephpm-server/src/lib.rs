@@ -1196,6 +1196,81 @@ fn start_kv_service(config: &Config) -> anyhow::Result<KvService> {
     Ok((store, multi_tenant, Some(handle)))
 }
 
+/// Warn about every database listener bound to a non-loopback address.
+///
+/// None of the SQL frontends authenticate anyone. The `[db.mysql]` proxy
+/// reads the client handshake and discards it without validating
+/// credentials; the `[db.postgres]` proxy answers any startup message
+/// with `AuthenticationOk`; litewire's `MySQL`/Hrana/`PostgreSQL`/TDS
+/// frontends in front of embedded `SQLite` do no authentication either.
+/// That is by design — the whole model assumes the listener is reachable
+/// only by PHP running in this same process. A routable bind address
+/// therefore publishes unauthenticated read/write access to the database
+/// to anyone who can reach the port.
+///
+/// This warns rather than refusing to start. Unlike `[cluster] secret`
+/// there is no credential an operator could configure to make the
+/// listener safe, and binding `0.0.0.0` inside a container that is
+/// firewalled by a network policy is a legitimate deployment.
+fn warn_on_exposed_db_listeners(config: &Config) {
+    // Defaults mirror the ones applied where each proxy is started below.
+    if let Some(mysql) = &config.db.mysql {
+        warn_if_db_listener_exposed(
+            "[db.mysql] listen",
+            mysql.listen.as_deref().unwrap_or("127.0.0.1:3306"),
+        );
+    }
+    if let Some(pg) = &config.db.postgres {
+        warn_if_db_listener_exposed(
+            "[db.postgres] listen",
+            pg.listen.as_deref().unwrap_or("127.0.0.1:5432"),
+        );
+    }
+    if let Some(sqlite) = &config.db.sqlite {
+        let proxy = &sqlite.proxy;
+        warn_if_db_listener_exposed("[db.sqlite.proxy] mysql_listen", &proxy.mysql_listen);
+        let optional = [
+            ("[db.sqlite.proxy] hrana_listen", proxy.hrana_listen.as_deref()),
+            ("[db.sqlite.proxy] postgres_listen", proxy.postgres_listen.as_deref()),
+            ("[db.sqlite.proxy] tds_listen", proxy.tds_listen.as_deref()),
+        ];
+        for (key, addr) in optional {
+            if let Some(addr) = addr {
+                warn_if_db_listener_exposed(key, addr);
+            }
+        }
+    }
+}
+
+/// Emit the exposure warning for one listener, if it is in fact exposed.
+fn warn_if_db_listener_exposed(key: &str, addr: &str) {
+    if let Some(exposure) = db_listen_exposure(addr) {
+        tracing::warn!(
+            "{key} = \"{addr}\" listens on {exposure}. The SQL wire frontends do NOT \
+             authenticate clients — any host that can reach this port gets full read/write \
+             access to the database. Bind a loopback address unless this port is firewalled \
+             from untrusted networks."
+        );
+    }
+}
+
+/// Classify a listen address for the exposure warning.
+///
+/// Returns a description of how the address is exposed, or `None` when it
+/// is loopback-only. Addresses that are not IP literals (`localhost:3306`,
+/// `db.internal:3306`) also return `None`: classifying them would require
+/// a DNS lookup at startup, and a wrong warning is worse than no warning.
+fn db_listen_exposure(addr: &str) -> Option<&'static str> {
+    let socket: SocketAddr = addr.trim().parse().ok()?;
+    if socket.ip().is_loopback() {
+        None
+    } else if socket.ip().is_unspecified() {
+        Some("all network interfaces")
+    } else {
+        Some("a non-loopback address")
+    }
+}
+
 /// Start database proxies (`MySQL`, `PostgreSQL`, `TDS`, embedded `SQLite`).
 async fn start_db_proxies(
     config: &Config,
@@ -1204,6 +1279,8 @@ async fn start_db_proxies(
     query_stats: &ephpm_query_stats::QueryStats,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut handles = vec![];
+
+    warn_on_exposed_db_listeners(config);
 
     // MySQL proxy
     if let Some(mysql_config) = &config.db.mysql {
@@ -1705,6 +1782,31 @@ mod lib_tests {
     #[test]
     fn parse_memory_size_zero() {
         assert_eq!(parse_memory_size("0").unwrap(), 0);
+    }
+
+    #[test]
+    fn db_listen_exposure_allows_loopback() {
+        assert!(db_listen_exposure("127.0.0.1:3306").is_none());
+        assert!(db_listen_exposure("127.0.0.2:3306").is_none());
+        assert!(db_listen_exposure("[::1]:3306").is_none());
+        assert!(db_listen_exposure(" 127.0.0.1:3306 ").is_none());
+    }
+
+    #[test]
+    fn db_listen_exposure_flags_wildcard_and_routable() {
+        assert_eq!(db_listen_exposure("0.0.0.0:3306"), Some("all network interfaces"));
+        assert_eq!(db_listen_exposure("[::]:3306"), Some("all network interfaces"));
+        assert_eq!(db_listen_exposure("10.0.0.5:3306"), Some("a non-loopback address"));
+        assert_eq!(db_listen_exposure("203.0.113.7:5432"), Some("a non-loopback address"));
+    }
+
+    #[test]
+    fn db_listen_exposure_skips_addresses_it_cannot_classify() {
+        // Hostnames would need a DNS lookup to classify; warning on a
+        // guess would be worse than staying quiet.
+        assert!(db_listen_exposure("localhost:3306").is_none());
+        assert!(db_listen_exposure("db.internal:3306").is_none());
+        assert!(db_listen_exposure("").is_none());
     }
 
     fn make_sqlite_config(role: &str) -> ephpm_config::SqliteConfig {
