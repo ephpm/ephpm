@@ -87,13 +87,107 @@ seam this needs. Deliverable is *data*, not adoption:
 - A durability/crash-recovery smoke (kill -9 mid-write, reopen,
   integrity check) — beta engines earn trust here or nowhere.
 
-### Phase 2 — CDC-native replication (gated on GA)
+### Phase 2 — CDC-native replication (**experimental implementation available; gated on GA for default**)
 
 Replace the sqld sidecar: litewire tails the engine's CDC stream on the
 primary; ePHPm's cluster layer ships changes to replicas (own transport
 or Turso's open sync protocol — decide on measured simplicity). Election
 and failover machinery is unchanged. sqld support enters deprecation
 with a full release cycle of overlap.
+
+**Status (2026-07-14): experimental implementation landed behind
+`[db.sqlite.replication] cdc_experimental = true`.** Enabling it (with
+`engine = "turso"` + `[cluster] enabled = true`) selects a CDC-native
+replication path that runs a `litewire::litewire_turso::cdc::CdcTailer`
+on the primary and applies batches to replicas via `apply_batch` — no
+sqld sidecar, no child process, no gRPC. sqld remains the production
+clustered default for `engine = "sqlite"`.
+
+**Headline empirical finding (from building this):** Turso 0.7.0 CDC
+captures DDL. `CREATE TABLE`/`CREATE INDEX`/`ALTER TABLE ADD COLUMN`/
+`DROP TABLE` all appear in the same `turso_cdc` stream as row DML,
+encoded as mutations on `sqlite_schema`. This means the replication
+path is a **single ordered stream** with no schema-sync side channel.
+
+**Landed in this experimental cut:**
+
+- litewire `CdcTailer` + `apply_batch` API (per-transaction batches,
+  monotonic `__litewire_cdc_watermark` for exactly-once apply, SQLite
+  record-format decoder for DML replay, sqlite_schema-SQL replay for
+  DDL). 25 unit + integration tests in `litewire-turso`.
+- ephpm `turso_cdc` module: two `Turso` factories per node (wire +
+  mgmt); on the primary each inbound subscriber stream gets its **own**
+  `CdcTailer`, anchored at the watermark the subscriber sends in its
+  first frame; replica dial + subscribe + apply loop; JSON-framed
+  protocol (base64 for record blobs). 2-node e2e integration test
+  proves DDL + INSERT + UPDATE + DELETE land on the replica through a
+  real authenticated, multiplexed cluster channel, and that a reconnect
+  both resumes (rows written during the gap arrive) and does not
+  double-apply.
+- **Transport = the [cluster channel](/roadmap/cluster-channel/):**
+  a single, lazy-bound, `yamux`-multiplexed TCP listener shared by all
+  opt-in cluster features, with a mutual ChaCha20-Poly1305
+  challenge/response handshake and per-connection sealing of every
+  post-handshake byte. CDC is registered as stream type `cdc/<vhost>`
+  and snapshot bootstrap as `snapshot/<vhost>`. The channel only binds
+  when a feature asks — configs without `cdc_experimental` are
+  byte-identical to before.
+- Cold-replica snapshot bootstrap over `snapshot/<vhost>`: an online
+  logical dump captured under one read view, plus the aligned
+  watermark. Served only by the elected primary, size-capped by
+  `[db.sqlite.replication] max_snapshot_bytes`, and validated against a
+  `CREATE`/`INSERT` statement allowlist before it is applied.
+- Additive config knob: `cdc_experimental` defaults to `false`;
+  `engine = "turso"` + clustered mode without it is still a hard startup
+  error pointing at the knob. v0.4.x-compatible under versioning policy.
+
+**Still deferred:**
+
+- Subscriber watermarks that survive a *primary change*. Resume works
+  within one primary (the subscriber names its cursor); after a
+  failover the new primary's `change_id` space is its own, so a
+  cross-primary cursor needs a cluster-wide watermark scheme.
+- TLS wrapping of the cluster channel. The channel is authenticated and
+  encrypted with the operator's shared secret, but there is no PKI peer
+  identity — see the [cluster channel
+  roadmap](/roadmap/cluster-channel/).
+- `turso_cdc` retention pruning (v1: table grows unbounded — no
+  operational issue on the small-write experimental workloads Phase 2
+  targets, but must be solved before Phase 3 default). Note this
+  interacts with snapshot bootstrap: once the log is truncated, a
+  snapshot watermark below the oldest retained `change_id` is not
+  replayable.
+- Read-only enforcement on replica wire frontends. litewire has no
+  read-only mode, so a replica's MySQL/Hrana frontend accepts writes
+  that nothing replicates; the replica logs a warning at startup.
+- Schema replay executes wire-supplied SQL. Note the asymmetry with the
+  snapshot path above: the snapshot dump *is* checked against a
+  `CREATE`/`INSERT` allowlist, but the CDC apply path is not. When a
+  batch carries a `sqlite_schema` row, `apply_batch` runs its stored
+  `sql` text directly (`litewire-turso/src/cdc.rs`) with no allowlist of
+  statement kinds. The DML path is safe — values bind as parameters and
+  identifiers go through `escape_ident` — but a peer whose frames reach
+  `apply_batch` can run arbitrary SQL on a replica, including `ATTACH`
+  and `PRAGMA`. Reaching it requires the cluster secret *and* passing
+  the gossip-membership check, so the peer is already a trusted node
+  that dictates replicated data anyway; the residual gap is that a
+  compromised primary can do more than corrupt rows. Closing it needs a
+  litewire PR to parse and allowlist the replayed DDL, plus a pin bump.
+- Triggers in the snapshot. They are deliberately not shipped (CDC
+  already carries the rows a trigger produced on the primary), which is
+  correct for replay but means a replica promoted to primary has no
+  triggers until an operator recreates them.
+- 2-node podman/kind e2e test running the full ephpm binary against a
+  real MySQL wire client. The in-process integration test proves the
+  replication pipeline; the podman lift is largely test-orchestration.
+- Wire-frontend session capture without the factory-level flag: capture
+  is enabled on every node's wire factory (`enable_cdc_on_connect =
+  true`, so a node promoted mid-life still captures), but a session
+  that uses `raw_connection()` bypasses it — a documented gotcha.
+- `TxnBatch::commit_change_id()` panics on an empty batch inside
+  litewire; ephpm rejects empty batch frames on the wire instead.
+  Making the litewire API return `Option<i64>` needs a litewire PR and
+  a pin bump.
 
 ### Phase 3 — default engine (a major-version decision)
 

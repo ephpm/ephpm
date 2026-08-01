@@ -22,6 +22,10 @@ hkdf.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tokio-util.workspace = true
+yamux.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

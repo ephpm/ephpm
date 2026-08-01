@@ -244,7 +244,10 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `role` | string | `"auto"` | `"auto"` (gossip-elected), `"primary"`, `"replica"`. |
-| `primary_grpc_url` | string | `""` | Primary gRPC URL (set automatically in `auto` mode; required for `replica`). |
+| `primary_grpc_url` | string | `""` | Primary gRPC URL (set automatically in `auto` mode; required for `replica`). In CDC-native mode (`cdc_experimental = true`) this field carries the primary's **cluster channel address** (e.g. `10.0.0.1:7948` — the channel defaults to the gossip port + 2) instead of a gRPC URL. |
+| `cdc_experimental` | bool | `false` | **Experimental** — opt in to Phase 2 CDC-native replication (`engine = "turso"` only). Setting this to `true` also implicitly enables the [cluster channel](#clusterchannel) on this node. See the [Turso engine roadmap](/roadmap/turso-engine/#phase-2--cdc-native-replication-experimental-implementation-available-gated-on-ga-for-default) and the [cluster channel design](/roadmap/cluster-channel/). Without this flag, `engine = "turso"` + clustered mode is a hard startup error. |
+| `cdc_listen` | string | `"0.0.0.0:5015"` | **Deprecated — parsed but not acted upon.** CDC now rides the multiplexed [cluster channel](#clusterchannel); this legacy per-CDC listener has been removed. Setting it to a non-default value logs a startup warning. Move any explicit port allocation to `[cluster.channel] listen`. |
+| `max_snapshot_bytes` | u64 (bytes) | `1073741824` (1 GiB) | Largest snapshot-bootstrap payload a cold replica will accept from the primary. Only used on the CDC-native path. Both the length the primary advertises and the running total of received chunks are checked against it, so a peer cannot exhaust the replica's memory by claiming an absurd size or streaming without an end marker. Bootstrap fails with a message naming this knob when a legitimate dump is larger. |
 
 ### `[db.read_write_split]`
 
@@ -300,6 +303,35 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | `allow_insecure_no_auth` | bool | `false` | Opt in to running clustering with an empty `secret` (unauthenticated plaintext gossip + KV data plane). Off by default so clustering fails closed. Set `true` only on a fully trusted private network with ports 7946/7947 firewalled from untrusted hosts; a loud warning is still logged. Not recommended. |
 | `node_id` | string | (auto) | Unique node identifier. Auto-generated if empty. |
 | `cluster_id` | string | `"ephpm"` | Nodes with different `cluster_id`s ignore each other. |
+
+### `[cluster.channel]`
+
+**Experimental-adjacent.** The cluster channel is a single,
+authenticated, `yamux`-multiplexed TCP listener that opt-in cluster
+features share (Turso CDC replication and its snapshot bootstrap
+today). It is **only bound when at least one feature asks for it**: a
+config that ships no channel feature is byte-identical to a config
+without this section — no socket, no task, no startup log noise above
+`debug!`. Adding `[cluster.channel]` to a config is not itself an
+opt-in; a feature elsewhere (today just `[db.sqlite.replication]
+cdc_experimental = true` in clustered mode) has to ask. See the
+[cluster channel roadmap](/roadmap/cluster-channel/) for the design.
+
+**Security posture.** Connections complete a mutual challenge/response
+handshake in which both peers prove possession of the shared secret and
+both contribute fresh randomness, so a recorded handshake cannot be
+replayed. Both ends then derive a per-connection key from the secret
+salted with the handshake transcript, and every subsequent byte —
+yamux framing included — is sealed with ChaCha20-Poly1305. Inbound
+connections must additionally come from an IP that gossip currently
+knows as a cluster member. There is **no TLS and no certificate-based
+peer identity**: authentication is "holds the shared cluster secret",
+and the membership check is per-host and trusts the TCP source address.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `listen` | string, optional | *(derived: gossip bind IP with port `bind_port + 2` — `+ 2` because the KV data plane already claims gossip + 1 (7947), so defaults land on 7948)* | TCP listen address for the channel. Ignored when no channel feature is enabled. |
+| `secret` | string, optional | *(fall back to `[cluster] secret`)* | Shared secret for the channel handshake and per-connection frame keys (distinct HKDF domains from gossip/KV and from each other). When neither this nor `[cluster] secret` is set, the channel refuses to bind — channel features require authentication (fail-closed). |
 
 ### `[cluster.kv]`
 

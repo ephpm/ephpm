@@ -8,6 +8,10 @@
 //!
 //! - gossip UDP: `"ephpm-gossip-v1"`
 //! - KV data plane TCP: `"ephpm-kv-data-v1"`
+//! - cluster channel handshake: `"ephpm-cluster-channel-v1"`
+//! - cluster channel session frames: `"ephpm-cluster-channel-session-v1"`
+//!   (additionally salted with the handshake transcript, so every
+//!   connection gets its own key)
 //!
 //! ## Sealed message layout
 //!
@@ -47,6 +51,15 @@ const GOSSIP_INFO: &[u8] = b"ephpm-gossip-v1";
 /// HKDF domain-separation info string for the KV data plane key.
 const KV_DATA_INFO: &[u8] = b"ephpm-kv-data-v1";
 
+/// HKDF domain-separation info string for the cluster channel key
+/// (multiplexed cluster data plane — CDC, future snapshots, etc.).
+const CLUSTER_CHANNEL_INFO: &[u8] = b"ephpm-cluster-channel-v1";
+
+/// HKDF domain-separation info string for a *per-connection* cluster
+/// channel key. Distinct from [`CLUSTER_CHANNEL_INFO`] so a handshake
+/// ciphertext is never a valid post-handshake frame and vice versa.
+const CLUSTER_CHANNEL_SESSION_INFO: &[u8] = b"ephpm-cluster-channel-session-v1";
+
 /// ChaCha20-Poly1305 nonce length in bytes.
 const NONCE_LEN: usize = 12;
 
@@ -69,9 +82,12 @@ const DROP_WARN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// A symmetric cipher for sealing and opening cluster messages.
 ///
-/// Construct with [`ClusterCipher::for_gossip`] or
-/// [`ClusterCipher::for_kv_data_plane`] — the two derive different keys
-/// from the same secret so ciphertexts are never valid across planes.
+/// Construct with [`ClusterCipher::for_gossip`],
+/// [`ClusterCipher::for_kv_data_plane`],
+/// [`ClusterCipher::for_cluster_channel`], or
+/// [`ClusterCipher::for_cluster_channel_session`] — each derives a
+/// different key from the same secret so ciphertexts are never valid
+/// across planes.
 #[derive(Clone)]
 pub struct ClusterCipher {
     cipher: ChaCha20Poly1305,
@@ -87,7 +103,17 @@ impl std::fmt::Debug for ClusterCipher {
 impl ClusterCipher {
     /// Derive a cipher from the shared secret with the given HKDF info.
     fn derive(secret: &str, info: &[u8]) -> Self {
-        let hkdf = Hkdf::<Sha256>::new(None, secret.as_bytes());
+        Self::derive_salted(secret, None, info)
+    }
+
+    /// Derive a cipher from the shared secret, optionally salted.
+    ///
+    /// Private so the `expect` below stays out of the public API: 32 bytes
+    /// is always a valid HKDF-SHA256 output length, so it is unreachable,
+    /// and `clippy::missing_panics_doc` would otherwise make every public
+    /// constructor document a panic that cannot happen.
+    fn derive_salted(secret: &str, salt: Option<&[u8]>, info: &[u8]) -> Self {
+        let hkdf = Hkdf::<Sha256>::new(salt, secret.as_bytes());
         let mut key = [0u8; 32];
         hkdf.expand(info, &mut key).expect("32 bytes is a valid HKDF-SHA256 output length");
         Self { cipher: ChaCha20Poly1305::new(Key::from_slice(&key)) }
@@ -103,6 +129,37 @@ impl ClusterCipher {
     #[must_use]
     pub fn for_kv_data_plane(secret: &str) -> Self {
         Self::derive(secret, KV_DATA_INFO)
+    }
+
+    /// Create the cipher used for the cluster channel handshake and
+    /// stream framing (the multiplexed data plane for CDC and any
+    /// future bulk-stream cluster feature).
+    ///
+    /// Uses a distinct HKDF `info` string so a sealed frame from the KV
+    /// data plane is unrecognizable on the cluster channel (and vice
+    /// versa) even though both derive from the same operator secret.
+    #[must_use]
+    pub fn for_cluster_channel(secret: &str) -> Self {
+        Self::derive(secret, CLUSTER_CHANNEL_INFO)
+    }
+
+    /// Derive a **per-connection** cluster channel cipher, bound to a
+    /// handshake `transcript`.
+    ///
+    /// The transcript is fed in as the HKDF salt, so two connections
+    /// that exchanged different challenges get unrelated keys even
+    /// though they share one operator secret. That is what makes a
+    /// recorded handshake useless to replay: an attacker who re-sends
+    /// captured bytes cannot derive the key for the session those bytes
+    /// establish, because the responder mixes a fresh challenge of its
+    /// own into the transcript.
+    ///
+    /// Callers must pass a transcript that both peers computed
+    /// independently from values each of them contributed (see
+    /// `cluster_channel`'s handshake).
+    #[must_use]
+    pub fn for_cluster_channel_session(secret: &str, transcript: &[u8]) -> Self {
+        Self::derive_salted(secret, Some(transcript), CLUSTER_CHANNEL_SESSION_INFO)
     }
 
     /// Seal a plaintext message: `nonce || ciphertext+tag`.
@@ -293,6 +350,27 @@ mod tests {
         // Same secret, different info string → different key.
         let sealed = ClusterCipher::for_gossip("shared").seal(b"data").unwrap();
         assert!(ClusterCipher::for_kv_data_plane("shared").open(&sealed).is_none());
+    }
+
+    #[test]
+    fn session_key_differs_from_handshake_key() {
+        // A handshake ciphertext must never open as a session frame:
+        // different HKDF info string, and the session key is salted.
+        let sealed = ClusterCipher::for_cluster_channel("shared").seal(b"data").unwrap();
+        let session = ClusterCipher::for_cluster_channel_session("shared", &[0u8; 64]);
+        assert!(session.open(&sealed).is_none());
+    }
+
+    #[test]
+    fn session_key_is_bound_to_the_transcript() {
+        // Two connections with different transcripts derive unrelated
+        // keys — this is what makes a captured handshake unreplayable
+        // into a readable session.
+        let key_a = ClusterCipher::for_cluster_channel_session("shared", b"transcript-a");
+        let key_b = ClusterCipher::for_cluster_channel_session("shared", b"transcript-b");
+        let sealed = key_a.seal(b"secret payload").unwrap();
+        assert!(key_b.open(&sealed).is_none());
+        assert_eq!(key_a.open(&sealed).unwrap(), b"secret payload");
     }
 
     #[test]

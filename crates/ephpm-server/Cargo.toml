@@ -23,6 +23,7 @@ ephpm-php.workspace = true
 ephpm-query-stats.workspace = true
 ephpm-sqld.workspace = true
 litewire.workspace = true
+turso.workspace = true
 tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
@@ -45,6 +46,8 @@ metrics-exporter-prometheus.workspace = true
 dashmap.workspace = true
 libloading.workspace = true
 serde_json.workspace = true
+serde = { workspace = true }
+base64ct = { workspace = true }
 tokio-util.workspace = true
 bytes.workspace = true
 sha2.workspace = true

@@ -42,7 +42,7 @@ temp-env = "0.3"
 serial_test = "3"
 dashmap = "6"
 parking_lot = "0.12"
-tokio-util = { version = "0.7", features = ["rt"] }
+tokio-util = { version = "0.7", features = ["rt", "compat"] }
 bytes = "1"
 sha1 = "0.10"
 sha2 = "0.10"
@@ -59,6 +59,8 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
 async-channel = "2"
 libloading = "0.8"
+yamux = "0.14"
+futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 
 # Internal crates
 ephpm-cluster = { path = "crates/ephpm-cluster" }
@@ -83,7 +85,8 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
 # litewire main @ 7a0b59c4 — identifier sanitization in the metadata translator
-# (litewire#12), on top of framework wire-compat (litewire#11).
+# (litewire#12), on top of framework wire-compat (litewire#11) and the Phase 2
+# CDC tail/apply API (litewire#10) this branch builds on.
 #
 # SECURITY: do not move this pin backwards. 699e6345 and earlier interpolate the
 # client-supplied table name straight into SQL text in
@@ -92,6 +95,12 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 # DESCRIBE becomes arbitrary SQL. 7a0b59c4 adds sanitize_identifier() and
 # applies it at every extraction site.
 litewire = { git = "https://github.com/ephpm/litewire.git", rev = "7a0b59c40ce6", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
+# Direct dependency on the same turso the pinned litewire uses, so the
+# snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
+# in its signatures. Pinned to the exact version litewire pins (=0.7.0)
+# so the two resolve to a single crate instance and TursoConnection
+# (re-exported by litewire) is the same turso::Connection.
+turso = { version = "=0.7.0", default-features = false }
 
 # Release-profile tuning for v0.4.2 perf release.
 #

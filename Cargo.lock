@@ -1277,13 +1277,17 @@ dependencies = [
  "dashmap",
  "ephpm-config",
  "ephpm-kv",
+ "futures",
  "hkdf",
+ "parking_lot",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
+ "yamux",
 ]
 
 [[package]]
@@ -1430,6 +1434,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "async-trait",
+ "base64ct",
  "brotli",
  "bytes",
  "dashmap",
@@ -1457,6 +1462,7 @@ dependencies = [
  "rustls 0.23.37",
  "rustls-acme",
  "rustls-pemfile",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -1466,6 +1472,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "turso",
 ]
 
 [[package]]
@@ -3006,6 +3013,12 @@ dependencies = [
  "uuid",
  "zstd",
 ]
+
+[[package]]
+name = "nohash-hasher"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 
 [[package]]
 name = "nom"
@@ -5990,6 +6003,21 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.0.0"
+
+[[package]]
+name = "yamux"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "767113d8f66a81e461362462aa71d8d0108cbf3430d4442fb88a04e31be81165"
+dependencies = [
+ "futures",
+ "log",
+ "nohash-hasher",
+ "parking_lot",
+ "pin-project",
+ "static_assertions",
+ "web-time",
+]
 
 [[package]]
 name = "yansi"
