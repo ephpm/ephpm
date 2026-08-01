@@ -285,6 +285,27 @@ pub struct Router {
     /// docroot to a new release directory — an immortal cache would pin
     /// the OLD release forever.
     canonical_roots: dashmap::DashMap<PathBuf, (PathBuf, Instant)>,
+    /// Canonicalized PHP *script* paths, keyed by the joined-but-unresolved
+    /// path [`Router::resolve_fallback`] produced, with the instant they were
+    /// resolved. Same shape and same reasoning as [`Router::canonical_roots`],
+    /// applied to the other half of [`Router::php_script_contained`] so a PHP
+    /// request no longer pays an O(path-depth) `realpath()` walk per hit.
+    ///
+    /// Only the canonicalized path is cached — never the containment verdict.
+    /// The `starts_with(canonical_root)` test is recomputed on every request
+    /// against the root resolved for *that* request, so one vhost's cached
+    /// entry can never authorize another's, and a docroot that moves inside
+    /// [`CANONICAL_ROOT_TTL`] re-decides immediately.
+    ///
+    /// Bounded by [`CANONICAL_SCRIPT_CACHE_MAX`]; see
+    /// [`Router::remember_canonical_script`] for the behavior at the cap.
+    canonical_scripts: dashmap::DashMap<PathBuf, (PathBuf, Instant)>,
+    /// When [`Router::canonical_scripts`] was last swept of expired entries.
+    /// The sweep is O(cache size), so it is throttled to at most once per
+    /// [`CANONICAL_SCRIPT_TTL`] — otherwise a scanner that keeps the cache at
+    /// its cap would turn every miss into a full scan, which is worse than the
+    /// syscall this cache exists to remove.
+    canonical_scripts_swept: std::sync::Mutex<Instant>,
     /// Inbound request-header names (lowercased) stripped UNCONDITIONALLY at
     /// ingest, before the middleware chain runs and before any header crosses
     /// to PHP. This closes two spoofing vectors:
@@ -352,6 +373,41 @@ fn build_ingest_strip_headers(mounts: &[MiddlewareMount]) -> Vec<String> {
 /// realistic request rate, short enough that a symlink-flip deploy is
 /// picked up almost immediately.
 const CANONICAL_ROOT_TTL: Duration = Duration::from_secs(2);
+
+/// How long a cached canonicalized PHP script path stays valid.
+///
+/// Deliberately *derived from* [`CANONICAL_ROOT_TTL`] rather than written as
+/// its own number: both halves of [`Router::php_script_contained`] are cached,
+/// and the containment guarantee is only as fresh as the staler of the two, so
+/// the two windows must not be allowed to drift apart.
+///
+/// What the window costs, stated plainly: the check exists to stop a PHP file
+/// that resolves outside its document root from executing. If a path is
+/// resolved while contained, then swapped for a symlink pointing out of the
+/// docroot, requests keep executing against the cached (contained) resolution
+/// for up to this long. Doing that requires write access inside the document
+/// root — the same capability that `[server] allowed_php_paths` exists to
+/// contain — and two seconds is the same exposure the docroot side has shipped
+/// with since the canonical-root cache landed. It is bounded and small; before
+/// the containment check existed at all the window was unbounded.
+const CANONICAL_SCRIPT_TTL: Duration = CANONICAL_ROOT_TTL;
+
+/// Hard cap on [`Router::canonical_scripts`] entries.
+///
+/// The key is a filesystem path built from the request path, so its growth is
+/// client-driven. `..` segments are rejected at ingest by
+/// [`percent_decode_path`], which keeps the worst case from being arbitrary —
+/// but it does not make the key space small. Every `.php` file under a
+/// document root is a distinct key (thousands per WordPress install, times the
+/// vhost count), and on the case-insensitive filesystems ePHPm also targets
+/// (macOS, Windows) `Path` compares case-sensitively while the filesystem does
+/// not, so `/InDeX.php` and `/index.php` are two keys for one file and the key
+/// space is genuinely unbounded. An unbounded map on a client-controlled key
+/// is a memory-exhaustion vector; a cap is not optional.
+///
+/// 4096 entries is far more than any real site's set of PHP entry points and
+/// costs on the order of a megabyte of paths.
+const CANONICAL_SCRIPT_CACHE_MAX: usize = 4096;
 
 /// Scan `sites_dir` for virtual host subdirectories.
 ///
@@ -588,6 +644,8 @@ impl Router {
             unknown_site_cache: dashmap::DashMap::new(),
             kv_site_password_cache: dashmap::DashMap::new(),
             canonical_roots: dashmap::DashMap::new(),
+            canonical_scripts: dashmap::DashMap::new(),
+            canonical_scripts_swept: std::sync::Mutex::new(Instant::now()),
             ingest_strip_headers: build_ingest_strip_headers(&config.middleware),
         }
     }
@@ -621,25 +679,99 @@ impl Router {
     /// pointing out of the docroot executed anyway, which under `sites_dir`
     /// vhosting is cross-tenant code execution.
     ///
-    /// Canonicalizing the root goes through the cached [`Router::canonical_root`];
-    /// only the script itself costs a `canonicalize()` per request, the same
-    /// price the static path already pays.
+    /// Both sides are cached: the root through [`Router::canonical_root`], the
+    /// script through [`Router::canonical_scripts`]. `canonicalize()` is a
+    /// `realpath()` walk — one `lstat` per path component, so an
+    /// O(path-depth) burst of syscalls — and paying it uncached on every PHP
+    /// request would undo the same syscall the docroot cache was added to
+    /// remove. What is *not* cached is the decision: the
+    /// `starts_with(canonical_root)` comparison below runs on every request
+    /// against the root resolved for that request, so a cache entry can only
+    /// ever save work, never grant reach.
     fn php_script_contained(&self, fs_path: &Path, site_root: &Path) -> bool {
         let Some(canonical_root) = self.canonical_root(site_root) else {
             return false;
         };
+
+        if let Some(cached) = self.cached_script_contained(fs_path, &canonical_root) {
+            if !cached {
+                Self::warn_traversal(fs_path, &canonical_root);
+            }
+            return cached;
+        }
+
         let Ok(canonical_script) = fs_path.canonicalize() else {
             return false;
         };
         if !canonical_script.starts_with(&canonical_root) {
-            tracing::warn!(
-                path = %fs_path.display(),
-                root = %canonical_root.display(),
-                "PHP path traversal attempt blocked"
-            );
+            Self::warn_traversal(fs_path, &canonical_root);
             return false;
         }
+        // Only in-docroot resolutions are worth remembering. A script that
+        // resolved outside is an attack or a misconfiguration: it gets a 403
+        // either way, it does not need to be fast, and keeping it out means
+        // attacker-shaped paths cannot crowd real entry points out of a
+        // bounded cache quite as easily.
+        self.remember_canonical_script(fs_path, canonical_script);
         true
+    }
+
+    /// Single place the containment failure is logged, so the cached and
+    /// uncached branches of [`Router::php_script_contained`] cannot drift.
+    fn warn_traversal(fs_path: &Path, canonical_root: &Path) {
+        tracing::warn!(
+            path = %fs_path.display(),
+            root = %canonical_root.display(),
+            "PHP path traversal attempt blocked"
+        );
+    }
+
+    /// Containment answer from [`Router::canonical_scripts`] alone, or `None`
+    /// when there is no entry or the entry is older than
+    /// [`CANONICAL_SCRIPT_TTL`].
+    ///
+    /// The comparison happens here, under the map guard, for two reasons: it
+    /// avoids cloning the cached `PathBuf` onto the hot path, and it makes it
+    /// structurally impossible to cache the verdict — `canonical_root` is an
+    /// argument, so the answer is always recomputed for the caller's root.
+    fn cached_script_contained(&self, fs_path: &Path, canonical_root: &Path) -> Option<bool> {
+        let hit = self.canonical_scripts.get(fs_path)?;
+        let (canonical_script, resolved_at) = hit.value();
+        if resolved_at.elapsed() >= CANONICAL_SCRIPT_TTL {
+            return None;
+        }
+        Some(canonical_script.starts_with(canonical_root))
+    }
+
+    /// Record a freshly resolved script path, keeping the cache under
+    /// [`CANONICAL_SCRIPT_CACHE_MAX`].
+    ///
+    /// At the cap the cache first drops everything already past its TTL (at
+    /// most once per [`CANONICAL_SCRIPT_TTL`], since that sweep is O(cache
+    /// size)); if it is still full of live entries the new path is simply not
+    /// remembered and the request pays the `canonicalize()` it already paid.
+    /// That is deliberate: the degraded state is exactly the pre-cache
+    /// behavior, so a client that floods the cache can cost the server back
+    /// the optimization but can never cost it correctness or unbounded memory.
+    /// No LRU, no eviction bookkeeping on the hot path.
+    fn remember_canonical_script(&self, fs_path: &Path, canonical_script: PathBuf) {
+        if self.canonical_scripts.len() >= CANONICAL_SCRIPT_CACHE_MAX {
+            // `try_lock` rather than `lock`: if another thread is already
+            // sweeping there is nothing useful to wait for, and a request
+            // thread must never block here.
+            let Ok(mut last_sweep) = self.canonical_scripts_swept.try_lock() else {
+                return;
+            };
+            if last_sweep.elapsed() < CANONICAL_SCRIPT_TTL {
+                return;
+            }
+            self.canonical_scripts.retain(|_, entry| entry.1.elapsed() < CANONICAL_SCRIPT_TTL);
+            *last_sweep = Instant::now();
+            if self.canonical_scripts.len() >= CANONICAL_SCRIPT_CACHE_MAX {
+                return;
+            }
+        }
+        self.canonical_scripts.insert(fs_path.to_path_buf(), (canonical_script, Instant::now()));
     }
 
     /// Attach the native middleware chain loaded in `serve()` at startup.
@@ -3066,6 +3198,128 @@ mod tests {
         // `canonicalize()` fails on a nonexistent path; treat that as
         // "not contained" rather than trusting the unresolved join.
         assert!(!router.php_script_contained(&dir.path().join("nope.php"), dir.path()));
+    }
+
+    /// The regression that would actually hurt: `php_script_contained` now
+    /// caches the canonicalized script path, so the traversal rejection has to
+    /// survive a warm cache. A first call that populates the cache must not
+    /// make a second identical call succeed, and a rejected path must not be
+    /// remembered at all.
+    #[test]
+    fn php_script_traversal_stays_rejected_with_a_warm_cache() {
+        let outer = tempfile::tempdir().unwrap();
+        let docroot = outer.path().join("site-a");
+        let sibling = outer.path().join("site-b");
+        std::fs::create_dir_all(&docroot).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(docroot.join("index.php"), "<?php echo 'a';").unwrap();
+        std::fs::write(sibling.join("index.php"), "<?php echo 'b';").unwrap();
+
+        let router = test_router(&docroot);
+        let escaped = docroot.join("../site-b/index.php");
+        let legit = docroot.join("index.php");
+
+        // Warm every cache the check touches (docroot and script) with a
+        // legitimate hit first, so the traversal below runs against a
+        // populated cache rather than a cold one.
+        assert!(router.php_script_contained(&legit, &docroot));
+        assert!(router.php_script_contained(&legit, &docroot), "cached hit must still be allowed");
+
+        for attempt in 0..3 {
+            assert!(
+                !router.php_script_contained(&escaped, &docroot),
+                "traversal must stay rejected on attempt {attempt} with a warm cache"
+            );
+        }
+        // A rejected path is never remembered, so it cannot occupy a slot in
+        // the bounded cache or be served from it later.
+        assert!(
+            !router.canonical_scripts.contains_key(&escaped),
+            "a script that resolved outside the document root must not be cached"
+        );
+
+        // And the legitimate path is still allowed after the rejections.
+        assert!(router.php_script_contained(&legit, &docroot));
+    }
+
+    /// The cache stores the canonicalized path, never the verdict. Proving it:
+    /// the *same* cached script path checked against a different document root
+    /// must be rejected, even though the entry was inserted while contained.
+    #[test]
+    fn cached_script_is_rechecked_against_the_requesting_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let root_a = outer.path().join("site-a");
+        let root_b = outer.path().join("site-b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+        std::fs::write(root_a.join("index.php"), "<?php echo 'a';").unwrap();
+
+        let router = test_router(&root_a);
+        let script = root_a.join("index.php");
+
+        assert!(router.php_script_contained(&script, &root_a));
+        assert!(
+            router.canonical_scripts.contains_key(&script),
+            "the contained resolution should have been cached"
+        );
+        assert!(
+            !router.php_script_contained(&script, &root_b),
+            "a cache entry from one vhost must never authorize a script under another"
+        );
+    }
+
+    /// The vector the containment check actually exists for, now that `..` is
+    /// rejected at ingest by `percent_decode_path`: a symlink inside the
+    /// document root pointing at a sibling tenant. Unix-only — creating a
+    /// symlink on Windows needs privileges CI does not grant.
+    #[cfg(unix)]
+    #[test]
+    fn php_script_symlink_escape_is_rejected_hot_and_cold() {
+        let outer = tempfile::tempdir().unwrap();
+        let docroot = outer.path().join("site-a");
+        let sibling = outer.path().join("site-b");
+        std::fs::create_dir_all(&docroot).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("secrets.php"), "<?php echo 'b';").unwrap();
+        std::os::unix::fs::symlink(sibling.join("secrets.php"), docroot.join("link.php")).unwrap();
+
+        let router = test_router(&docroot);
+        let link = docroot.join("link.php");
+        assert!(link.is_file(), "the symlink must resolve for this test to mean anything");
+
+        // Cold and warm: `canonicalize()` follows the symlink out of the
+        // docroot both times, and the rejection is never cached as an allow.
+        assert!(!router.php_script_contained(&link, &docroot));
+        assert!(!router.php_script_contained(&link, &docroot));
+        assert!(!router.canonical_scripts.contains_key(&link));
+    }
+
+    /// The cache must not grow without bound on client-controlled keys. This
+    /// pins the cap enforcement without writing 4096 files: it pre-fills the
+    /// map to the cap with synthetic live entries, then checks that a genuine
+    /// resolution neither exceeds the cap nor changes the answer.
+    #[test]
+    fn canonical_script_cache_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), "<?php echo 'a';").unwrap();
+        let router = test_router(dir.path());
+
+        let canon = dir.path().canonicalize().unwrap();
+        for i in 0..CANONICAL_SCRIPT_CACHE_MAX {
+            router
+                .canonical_scripts
+                .insert(canon.join(format!("filler-{i}.php")), (canon.clone(), Instant::now()));
+        }
+        assert_eq!(router.canonical_scripts.len(), CANONICAL_SCRIPT_CACHE_MAX);
+
+        // At the cap the entries are all live and the sweep is throttled, so
+        // the new path is simply not remembered — the check still answers
+        // correctly, it just pays the `canonicalize()` it already paid.
+        assert!(router.php_script_contained(&dir.path().join("index.php"), dir.path()));
+        assert!(
+            router.canonical_scripts.len() <= CANONICAL_SCRIPT_CACHE_MAX,
+            "the cache must never exceed its cap"
+        );
     }
 
     // ── port parsing ─────────────────────────────────────────────────
