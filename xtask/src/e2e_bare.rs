@@ -95,6 +95,19 @@ fn suite_needs_fresh_node(name: &str) -> bool {
 /// or gate them individually.
 const SKIP_SUITES: &[&str] = &[];
 
+// Deliberately unclassified suites — i.e. ones where "runs against the
+// long-lived shared single node" is a decision rather than an oversight.
+// Nothing reads this note; it exists so a future reader does not "fix" the
+// omission by moving a suite onto its own fixture.
+//
+// - `path_traversal` — drives hand-written request lines over a raw TcpStream
+//   (reqwest normalizes `../` client-side, so the attack is not expressible
+//   with an ordinary client). It asserts against the standard docroot
+//   (`/index.php`, `/subdir/index.html`, `/test.html`) and attempts to reach
+//   `tests/php/traversal_canary.php`, which sits OUTSIDE that docroot in the
+//   sibling `tests/php/`. No bespoke config and no DB state, so the shared
+//   node is the right fixture; an isolated node would only cost a spawn.
+
 pub fn run(args: &[String]) -> ExitCode {
     if args.iter().any(|a| a == "--help" || a == "-h" || a == "help") {
         print_usage();
