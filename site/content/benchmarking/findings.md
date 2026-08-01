@@ -113,6 +113,85 @@ measured latency-bound at c=1. Same change, same build — the *test* was
 the variable. If a latency optimization reads as a no-op, check whether
 the test is saturated before concluding it didn't work.
 
+## `SQLITE_BUSY` is the clustered write ceiling
+
+Benchmarking the two clustered SQLite paths against each other for
+v0.6.0 turned up a hard limit in the **shipping** one. Clustered SQLite
+(the sqld sidecar) does not degrade gracefully under concurrent writes —
+it falls off a cliff:
+
+| concurrency | RPS | p50 | p99 | HTTP 500s |
+|---|---|---|---|---|
+| 1 | 458 | 2.12 ms | 2.99 ms | 0 |
+| 2 | 635 | 3.04 ms | 4.63 ms | 0 |
+| **4** | **744** ← peak | 4.99 ms | 12.96 ms | 2 |
+| 8 | 453 | 9.6 ms | 29.8 ms | 8 |
+| 16 | **37** | 20.4 ms | **5.04 s** | 0 (stalls instead) |
+
+Throughput peaks at **c=4**, halves by c=8, and collapses at c=16. In one
+20 s run at c=16, *zero* requests completed — all sixteen connections hung
+to the deadline. The error behind it, captured from a request body under
+load:
+
+```
+SQLSTATE[HY000]: General error: 1205
+  SQLite error: [SQLITE_BUSY] SQLite error: database is locked
+```
+
+That is single-writer serialization: SQLite takes one write lock, sqld
+serializes writers behind it, and past a handful of concurrent writers
+connections either time out into a 500 or wait indefinitely.
+
+**Two things make this worse than the raw numbers suggest.** First, the
+failure is **silent server-side** — the primary logs nothing at all: no
+lock, busy, timeout, or error line. The only evidence is on the client.
+Second, the mode it degrades into is *hanging*, not erroring, so a health
+check that only looks for 5xx sees a healthy node.
+
+**The MVCC claim, verified rather than assumed.** The [Turso engine
+roadmap](/roadmap/turso-engine/) listed a concurrent-writers benchmark as
+a Phase 1 deliverable, with the explicit caveat that MVCC beating
+WAL + `busy_timeout` was "the headline claim to verify, not assume."
+Measured on the same harness, same machine, same fixture: CDC-native
+clustered Turso sustained **694 RPS at c=16 with no `SQLITE_BUSY` and no
+stalls**, against 37 RPS for clustered SQLite. That is the claim
+verified — on this fixture and this quota, with the engine still Beta
+upstream and the remaining gates still open.
+
+**Lesson:** benchmark the *write* path at concurrency before trusting a
+replication design. Lane C looks fine at c=1 (458 RPS, 2 ms p50) and only
+reveals the ceiling above c=4 — and a read-only benchmark would never
+have found it at all, because on a primary a `SELECT` never touches
+replication.
+
+## Lazily-created tables make "absent" look like "broken"
+
+The same v0.6.0 pass found a cold-start defect in CDC replication worth
+generalizing. Turso creates its `turso_cdc` log table **lazily, on the
+first captured write** — not when CDC is enabled, and not when a session
+connects. A freshly provisioned cluster that has served no traffic
+therefore has no log table, and the primary's tailer was treating "table
+does not exist" as a fatal poll error: it dropped the subscriber, the
+replica redialed 2 s later, and the cycle repeated indefinitely.
+
+Two nodes idling with **zero** requests for 40 s produced 21 subscriber
+attach/disconnect cycles on the primary and 24 resubscribes on the
+replica. A single write ended it permanently.
+
+Nothing was lost — replication converges as soon as any write lands — but
+an operator standing up a cluster sees a continuous error loop and
+reasonably concludes replication is broken.
+
+Two lessons. **"Absent" and "empty" are the same answer** when the
+absence is just laziness: zero rows to ship either way. The snapshot path
+in the same module already encoded exactly that (returning watermark 0 on
+a missing table); only the subscriber path disagreed. **And a test that
+re-implements the code under test proves nothing about it** — the 2-node
+e2e tests hand-rolled their own copy of the primary's serving loop, so
+the production function had no direct coverage, which is precisely why
+this survived a full security-review pass. Making it testable found the
+bug the copy could not.
+
 ## Meta-lesson
 
 The wins that mattered were structural and cheap (a socket option, a

@@ -81,11 +81,22 @@ seam this needs. Deliverable is *data*, not adoption:
 
 - The existing DB latency matrix (point SELECT, insert, connect) —
   Turso engine vs rusqlite vs MySQL baselines.
+  **Partially done (2026-08-01):** SELECT and INSERT measured against
+  rusqlite; **connect latency and the MySQL baselines are not yet
+  measured.**
 - A concurrent-writers benchmark (N wire connections inserting), where
   MVCC should beat WAL + busy_timeout — this is the headline claim to
   verify, not assume.
+  **Done (2026-08-01) — claim verified.** At c=16 single-INSERT writes,
+  CDC-native clustered Turso sustained 694 RPS with no `SQLITE_BUSY`,
+  against 37 RPS for clustered SQLite via sqld, which surfaced
+  `SQLITE_BUSY` as HTTP 500 and hung connections. Numbers and bounds in
+  [Results](/benchmarking/results/#v060--the-turso-engine-measured-against-sqlite);
+  the failure mode in
+  [Findings](/benchmarking/findings/#sqlite_busy-is-the-clustered-write-ceiling).
 - A durability/crash-recovery smoke (kill -9 mid-write, reopen,
   integrity check) — beta engines earn trust here or nowhere.
+  **Not started.**
 
 ### Phase 2 — CDC-native replication (**experimental implementation available; gated on GA for default**)
 
@@ -180,6 +191,12 @@ path is a **single ordered stream** with no schema-sync side channel.
 - 2-node podman/kind e2e test running the full ephpm binary against a
   real MySQL wire client. The in-process integration test proves the
   replication pipeline; the podman lift is largely test-orchestration.
+  **Manually validated 2026-08-01, still not automated.** Two release
+  containers on a podman network completed cold snapshot bootstrap
+  (watermark 24) → CDC subscribe → convergence, driven by PHP `pdo_mysql`
+  through litewire, and the replica held 57,634 rows after a ~57k-row
+  write benchmark. That was a scripted one-off during benchmarking, not
+  a checked-in test — nothing in CI covers it yet.
 - Wire-frontend session capture without the factory-level flag: capture
   is enabled on every node's wire factory (`enable_cdc_on_connect =
   true`, so a node promoted mid-life still captures), but a session
@@ -201,7 +218,14 @@ is a new-minor (or larger) event, never a patch.
 1. Upstream GA: a stable (non-pre) release and upstream's own
    production-readiness statement; multiprocess + vacuum landed.
 2. Phase 1 benchmarks at parity-or-better on our matrix, including
-   tails.
+   tails. **Partially evidenced (2026-08-01), gate still open.** On the
+   `db.php` read path Turso is better on both throughput and tails
+   (+17% RPS / −12% p99 at c=1; −27% p99 at c=16). On single-node writes
+   throughput is at parity but the **c=16 write p99 is worse** than
+   rusqlite (32.3 ms vs 24.3 ms, worse in both reps) — the one cell where
+   Turso loses, and the reason this gate is not closed. `connect`
+   latency and the MySQL baselines are still unmeasured. See
+   [Results](/benchmarking/results/#v060--the-turso-engine-measured-against-sqlite).
 3. File-format round-trip verified by us (SQLite-written DB opened by
    Turso and back, checksummed).
 4. Crash-recovery soak clean.
