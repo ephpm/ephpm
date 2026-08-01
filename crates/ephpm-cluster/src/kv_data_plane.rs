@@ -700,7 +700,12 @@ mod tests {
         client.write_u32(MAX_VALUE_LEN + 1).await.unwrap();
         client.flush().await.unwrap();
 
-        let err = server.await.unwrap().unwrap_err();
+        // `unwrap_err()` would require `Request: Debug` for the Ok variant, and
+        // `Request` carries the key and value bytes — deriving Debug on it puts
+        // stored values one stray `{:?}` away from the logs. Match instead.
+        let Err(err) = server.await.unwrap() else {
+            panic!("expected an oversized-length error, got a parsed request");
+        };
         assert!(err.to_string().contains("exceeds maximum"), "got {err}");
     }
 
