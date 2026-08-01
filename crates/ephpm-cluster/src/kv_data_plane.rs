@@ -207,9 +207,10 @@ async fn read_request(
         if value_len > MAX_VALUE_LEN {
             anyhow::bail!("value length {value_len} exceeds maximum {MAX_VALUE_LEN}");
         }
-        let mut value_buf = vec![0u8; value_len as usize];
-        stream.read_exact(&mut value_buf).await?;
-        Some(value_buf)
+        // Chunked: on the plaintext path the peer is unauthenticated, so
+        // a bare `vec![0u8; value_len]` is a 64 MiB allocation for the
+        // cost of a 9-byte header.
+        Some(read_exact_chunked(stream, value_len as usize).await?)
     } else {
         None
     };
@@ -272,11 +273,35 @@ async fn read_frame(stream: &mut TcpStream, cipher: &ClusterCipher) -> anyhow::R
              (peer sending plaintext to an encrypted data plane?)"
         );
     }
-    let mut frame = vec![0u8; frame_len as usize];
-    stream.read_exact(&mut frame).await?;
+    // Chunked, because this runs *before* `cipher.open()` — the peer is
+    // still unauthenticated here. Allocating `frame_len` up front would
+    // hand any host that can reach the port a 64 MiB allocation per
+    // 4-byte header, with no need to send a single byte of payload.
+    let frame = read_exact_chunked(stream, frame_len as usize).await?;
     cipher.open(&frame).ok_or_else(|| {
         anyhow::anyhow!("failed to authenticate KV data plane frame (wrong cluster secret?)")
     })
+}
+
+/// Read exactly `len` bytes, growing the buffer as data actually arrives.
+///
+/// Every length on this wire is peer-supplied and read before its
+/// payload, so `vec![0u8; len]` charges us the peer's *claim* rather than
+/// what they send. Reading in chunks bounds the cost of a lie to one
+/// chunk plus whatever was really transferred, while a legitimate
+/// transfer still ends up in a single contiguous `Vec`.
+async fn read_exact_chunked(stream: &mut TcpStream, len: usize) -> anyhow::Result<Vec<u8>> {
+    /// Bytes pulled off the socket per read before growing the buffer.
+    const CHUNK: usize = 64 * 1024;
+
+    let mut buf = Vec::with_capacity(len.min(CHUNK));
+    while buf.len() < len {
+        let start = buf.len();
+        let want = (len - start).min(CHUNK);
+        buf.resize(start + want, 0);
+        stream.read_exact(&mut buf[start..]).await?;
+    }
+    Ok(buf)
 }
 
 /// Fetch a value from a remote node's KV data plane.
@@ -316,8 +341,15 @@ pub async fn fetch_remote(
     if value_len == NOT_FOUND_SENTINEL {
         return Ok(None);
     }
-    let mut buf = vec![0u8; value_len as usize];
-    stream.read_exact(&mut buf).await?;
+    // The encrypted path above is bounded by MAX_FRAME_LEN before anything
+    // is allocated; the plaintext path had no bound at all — which is
+    // exactly the deployment with no `[cluster] secret`, where the
+    // responder is not authenticated either. Bound it the same way the
+    // server bounds an inbound value, then read it in chunks.
+    if value_len > MAX_VALUE_LEN {
+        anyhow::bail!("peer advertised value length {value_len} exceeding maximum {MAX_VALUE_LEN}");
+    }
+    let buf = read_exact_chunked(&mut stream, value_len as usize).await?;
     Ok(Some(buf))
 }
 
@@ -631,6 +663,50 @@ mod tests {
         assert!(parse_request(&[]).is_err());
         assert!(parse_request(&[OP_GET]).is_err());
         assert!(parse_request(&[OP_GET, 0, 0, 0, 5, b'a']).is_err());
+    }
+
+    /// Values larger than one read chunk must reassemble byte-exactly:
+    /// the chunked reader is on the path of every plaintext SET and GET.
+    #[tokio::test]
+    async fn multi_chunk_value_round_trip() {
+        let store = Arc::new(Store::new(ephpm_kv::store::StoreConfig::default()));
+        let addr = spawn_multi_handler(Arc::clone(&store), None).await;
+
+        // 200 KiB spans four 64 KiB read chunks.
+        let value: Vec<u8> =
+            (0..200 * 1024).map(|i| u8::try_from(i % 251).expect("i % 251 < 256")).collect();
+
+        assert!(store_remote(addr, "big", &value, None).await.unwrap());
+        let fetched = fetch_remote(addr, "big", None).await.unwrap();
+        assert_eq!(fetched, Some(value));
+    }
+
+    /// A peer that advertises a value length past the cap is rejected on
+    /// the header, before any memory is committed on its behalf.
+    #[tokio::test]
+    async fn oversized_value_len_rejected_before_allocating() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_request(&mut stream, None).await
+        });
+
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_u8(OP_SET).await.unwrap();
+        client.write_u32(3).await.unwrap();
+        client.write_all(b"key").await.unwrap();
+        // Claim far more than the cap, then send no payload at all.
+        client.write_u32(MAX_VALUE_LEN + 1).await.unwrap();
+        client.flush().await.unwrap();
+
+        // `unwrap_err()` would require `Request: Debug` for the Ok variant, and
+        // `Request` carries the key and value bytes — deriving Debug on it puts
+        // stored values one stray `{:?}` away from the logs. Match instead.
+        let Err(err) = server.await.unwrap() else {
+            panic!("expected an oversized-length error, got a parsed request");
+        };
+        assert!(err.to_string().contains("exceeds maximum"), "got {err}");
     }
 
     #[test]

@@ -58,6 +58,22 @@ const MSG_COPY_IN_RESPONSE: u8 = b'G';
 /// `CopyBothResponse` — backend entered bidirectional copy mode.
 const MSG_COPY_BOTH_RESPONSE: u8 = b'W';
 
+// ── Protocol limits ──────────────────────────────────────────────────────────
+
+/// Largest PG message payload `read_pg_message` will buffer (64 MiB).
+///
+/// The length prefix is peer-controlled and arrives before any payload,
+/// so an unbounded `vec![0u8; len - 4]` lets five bytes (`Q` followed by
+/// `0x7FFFFFFF`) zero-fill 2 GiB of memory; a handful of connections then
+/// OOM the whole server process. `read_startup_message` has always
+/// bounded its own length field — this applies the same treatment to the
+/// per-message path, with a limit generous enough for real queries and
+/// bind parameters. Backend-side callers only read control messages
+/// (auth exchange, `DISCARD ALL`, `SELECT 1`) through this path; query
+/// results are streamed by `forward_pg_message` in 8 KiB chunks and are
+/// unaffected by this bound.
+const MAX_PG_MESSAGE_LEN: i32 = 64 * 1024 * 1024;
+
 // ── Auth types ───────────────────────────────────────────────────────────────
 
 const AUTH_OK: i32 = 0;
@@ -703,7 +719,7 @@ fn generate_nonce() -> String {
 async fn read_pg_message(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), DbError> {
     let tag = stream.read_u8().await?;
     let len = stream.read_i32().await?;
-    if len < 4 {
+    if !(4..=MAX_PG_MESSAGE_LEN).contains(&len) {
         return Err(DbError::Protocol(format!("invalid PG message length: {len}")));
     }
     let payload_len = usize::try_from(len - 4)

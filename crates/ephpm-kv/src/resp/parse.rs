@@ -2,8 +2,29 @@
 //!
 //! Reads frames incrementally from a `BytesMut` buffer. Returns
 //! `Ok(None)` when more data is needed (incomplete frame).
+//!
+//! Parsing is two-phase. `scan_frame` walks the buffer by index and
+//! produces a `FrameSpec` tree in which bulk payloads are recorded as
+//! byte ranges, without copying or consuming anything. Only once a whole
+//! frame is known to be present does [`parse_frame`] split it off the
+//! buffer and materialise the [`Frame`], slicing bulk payloads out of the
+//! frozen `Bytes` (still zero-copy).
+//!
+//! Two properties fall out of that split, both of which the previous
+//! recursive-on-`BytesMut` parser got wrong:
+//!
+//! - Array elements are scanned against an index, so an N-element array
+//!   costs O(N) work. The old parser copied the entire remaining buffer
+//!   into a fresh `BytesMut` per element — quadratic, and repeated on
+//!   every socket read while the array was still incomplete.
+//! - Nesting is capped at `MAX_ARRAY_DEPTH` (32). Without a cap, ~40 KiB of
+//!   repeated `*1\r\n` (far below `max_input_buffer`) recursed thousands
+//!   of frames deep and overflowed the tokio worker stack, taking down
+//!   the whole process rather than the one connection.
 
-use bytes::BytesMut;
+use std::ops::Range;
+
+use bytes::{Bytes, BytesMut};
 
 use super::frame::Frame;
 
@@ -30,15 +51,44 @@ const MAX_BULK_LEN: usize = 512 * 1024 * 1024;
 /// incomplete). Pre-reserve only a small amount and let the vector grow.
 const MAX_ARRAY_PREALLOC: usize = 1024;
 
+/// Maximum nesting depth allowed for RESP arrays.
+///
+/// Mirrors Redis's hardcoded `PROTO_NESTED_MULTIBULK_DEPTH` (32). Nesting
+/// is attacker-controlled and each level costs a stack frame in
+/// [`scan_frame`], so without a cap a small packet of repeated `*1\r\n`
+/// overflows the thread stack — which aborts the entire process, not just
+/// the offending connection. Real RESP2 client traffic is one level deep.
+const MAX_ARRAY_DEPTH: usize = 32;
+
 /// Errors that can occur while parsing RESP frames.
+///
+/// An incomplete frame is not an error — [`parse_frame`] reports it as
+/// `Ok(None)` so the caller reads more from the socket and retries.
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
-    /// The frame is incomplete — need more data from the socket.
-    #[error("incomplete frame")]
-    Incomplete,
     /// The frame contains invalid data.
     #[error("protocol error: {0}")]
     Protocol(String),
+}
+
+/// A frame that has been located in the buffer but not yet materialised.
+///
+/// Bulk payloads are held as byte ranges into the buffer that was scanned,
+/// so scanning allocates nothing per payload and copies nothing.
+#[derive(Debug)]
+enum FrameSpec {
+    /// `+<line>\r\n`
+    Simple(String),
+    /// `-<line>\r\n`
+    Error(String),
+    /// `:<int>\r\n`
+    Integer(i64),
+    /// A null bulk string (`$-1\r\n`) or null array (`*-1\r\n`).
+    Null,
+    /// `$<len>\r\n<payload>\r\n` — the range covers `<payload>`.
+    Bulk(Range<usize>),
+    /// `*<count>\r\n<elements...>`
+    Array(Vec<FrameSpec>),
 }
 
 /// Try to parse a complete RESP frame from `buf`.
@@ -49,20 +99,37 @@ pub enum ParseError {
 ///
 /// # Errors
 ///
-/// Returns [`ParseError::Protocol`] when the buffer contains invalid RESP data.
+/// Returns [`ParseError::Protocol`] when the buffer contains invalid RESP
+/// data, including an array nested deeper than `MAX_ARRAY_DEPTH` (32).
 pub fn parse_frame(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
-    if buf.is_empty() {
+    // Phase 1: locate the frame without consuming or copying anything.
+    let Some((spec, end)) = scan_frame(&buf[..], 0, 0)? else {
         return Ok(None);
-    }
+    };
 
-    // Peek at the type byte without consuming.
-    match buf[0] {
-        b'+' => parse_simple(buf),
-        b'-' => parse_error(buf),
-        b':' => parse_integer(buf),
-        b'$' => parse_bulk(buf),
-        b'*' => parse_array(buf),
-        byte => Err(ParseError::Protocol(format!("unexpected type byte: {byte:#04x}"))),
+    // Phase 2: the frame is known-complete, so take exactly its bytes.
+    // `split_to().freeze()` reuses the existing allocation, and every
+    // bulk payload is a `Bytes` slice of it — no payload is ever copied.
+    let data = buf.split_to(end).freeze();
+    Ok(Some(materialize(spec, &data)))
+}
+
+/// Turn a scanned [`FrameSpec`] into a [`Frame`], slicing bulk payloads
+/// out of `data` (the frozen bytes the spec was scanned against).
+///
+/// Recursion is bounded by [`MAX_ARRAY_DEPTH`], enforced during scanning.
+/// Every range came from [`scan_bulk`], which only emits ranges fully
+/// inside the scanned region, so the slices are always in bounds.
+fn materialize(spec: FrameSpec, data: &Bytes) -> Frame {
+    match spec {
+        FrameSpec::Simple(s) => Frame::Simple(s),
+        FrameSpec::Error(s) => Frame::Error(s),
+        FrameSpec::Integer(n) => Frame::Integer(n),
+        FrameSpec::Null => Frame::Null,
+        FrameSpec::Bulk(range) => Frame::Bulk(data.slice(range)),
+        FrameSpec::Array(items) => {
+            Frame::Array(items.into_iter().map(|item| materialize(item, data)).collect())
+        }
     }
 }
 
@@ -78,11 +145,13 @@ fn find_crlf(buf: &[u8], offset: usize) -> Option<usize> {
     None
 }
 
-/// Parse a line ending in `\r\n`, returning the content between `start`
-/// and the `\r`. Returns `Incomplete` if no CRLF found yet.
-fn read_line(buf: &[u8], start: usize) -> Result<(usize, &[u8]), ParseError> {
-    let crlf = find_crlf(buf, start).ok_or(ParseError::Incomplete)?;
-    Ok((crlf + 2, &buf[start..crlf]))
+/// Read a line ending in `\r\n`, returning the index just past the CRLF
+/// and the content between `start` and the `\r`.
+///
+/// Returns `None` when the buffer does not yet contain a full line.
+fn read_line(buf: &[u8], start: usize) -> Option<(usize, &[u8])> {
+    let crlf = find_crlf(buf, start)?;
+    Some((crlf + 2, &buf[start..crlf]))
 }
 
 /// Parse the integer in a RESP line (used for lengths and `:` frames).
@@ -92,55 +161,54 @@ fn parse_line_int(line: &[u8]) -> Result<i64, ParseError> {
     s.parse::<i64>().map_err(|_| ParseError::Protocol(format!("invalid integer: {s}")))
 }
 
-fn parse_simple(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
-    match read_line(buf, 1) {
-        Ok((end, line)) => {
-            let s = String::from_utf8_lossy(line).into_owned();
-            let _ = buf.split_to(end);
-            Ok(Some(Frame::Simple(s)))
-        }
-        Err(ParseError::Incomplete) => Ok(None),
-        Err(e) => Err(e),
+/// Locate one frame starting at `start`, without consuming `buf`.
+///
+/// Returns the frame's spec and the index just past its last byte, or
+/// `None` when the buffer does not yet hold the whole frame. `depth` is
+/// the array nesting level of this frame (0 at the top level).
+fn scan_frame(
+    buf: &[u8],
+    start: usize,
+    depth: usize,
+) -> Result<Option<(FrameSpec, usize)>, ParseError> {
+    if start >= buf.len() {
+        return Ok(None);
+    }
+
+    match buf[start] {
+        b'+' => Ok(scan_line(buf, start).map(|(s, end)| (FrameSpec::Simple(s), end))),
+        b'-' => Ok(scan_line(buf, start).map(|(s, end)| (FrameSpec::Error(s), end))),
+        b':' => scan_integer(buf, start),
+        b'$' => scan_bulk(buf, start),
+        b'*' => scan_array(buf, start, depth),
+        byte => Err(ParseError::Protocol(format!("unexpected type byte: {byte:#04x}"))),
     }
 }
 
-fn parse_error(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
-    match read_line(buf, 1) {
-        Ok((end, line)) => {
-            let s = String::from_utf8_lossy(line).into_owned();
-            let _ = buf.split_to(end);
-            Ok(Some(Frame::Error(s)))
-        }
-        Err(ParseError::Incomplete) => Ok(None),
-        Err(e) => Err(e),
-    }
+/// Scan a `\r\n`-terminated payload line (`+`/`-` frames).
+fn scan_line(buf: &[u8], start: usize) -> Option<(String, usize)> {
+    let (end, line) = read_line(buf, start + 1)?;
+    Some((String::from_utf8_lossy(line).into_owned(), end))
 }
 
-fn parse_integer(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
-    match read_line(buf, 1) {
-        Ok((end, line)) => {
-            let n = parse_line_int(line)?;
-            let _ = buf.split_to(end);
-            Ok(Some(Frame::Integer(n)))
-        }
-        Err(ParseError::Incomplete) => Ok(None),
-        Err(e) => Err(e),
-    }
+fn scan_integer(buf: &[u8], start: usize) -> Result<Option<(FrameSpec, usize)>, ParseError> {
+    let Some((end, line)) = read_line(buf, start + 1) else {
+        return Ok(None);
+    };
+    let n = parse_line_int(line)?;
+    Ok(Some((FrameSpec::Integer(n), end)))
 }
 
-fn parse_bulk(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
-    let (after_len_line, len_line) = match read_line(buf, 1) {
-        Ok(v) => v,
-        Err(ParseError::Incomplete) => return Ok(None),
-        Err(e) => return Err(e),
+fn scan_bulk(buf: &[u8], start: usize) -> Result<Option<(FrameSpec, usize)>, ParseError> {
+    let Some((after_len_line, len_line)) = read_line(buf, start + 1) else {
+        return Ok(None);
     };
 
     let len = parse_line_int(len_line)?;
 
     // Null bulk string: $-1\r\n
     if len < 0 {
-        let _ = buf.split_to(after_len_line);
-        return Ok(Some(Frame::Null));
+        return Ok(Some((FrameSpec::Null, after_len_line)));
     }
 
     let len = usize::try_from(len)
@@ -148,36 +216,39 @@ fn parse_bulk(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
     if len > MAX_BULK_LEN {
         return Err(ParseError::Protocol("invalid bulk length".into()));
     }
-    let total = after_len_line + len + 2; // data + \r\n
 
-    if buf.len() < total {
+    let data_end = after_len_line + len;
+    let end = data_end + 2; // data + \r\n
+    if buf.len() < end {
         return Ok(None);
     }
 
-    // Drain the bulk payload straight out of the input buffer as a
-    // zero-copy `Bytes` slice. `BytesMut::split_to` reuses the
-    // underlying allocation, so we avoid the `.to_vec()` memcpy the old
-    // path did — matters for large PUT bodies from PHP session writes.
-    let head = buf.split_to(after_len_line);
-    let data = buf.split_to(len).freeze();
-    let _ = buf.split_to(2); // trailing \r\n
-    drop(head);
-    Ok(Some(Frame::Bulk(data)))
+    Ok(Some((FrameSpec::Bulk(after_len_line..data_end), end)))
 }
 
-fn parse_array(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
-    let (after_len_line, len_line) = match read_line(buf, 1) {
-        Ok(v) => v,
-        Err(ParseError::Incomplete) => return Ok(None),
-        Err(e) => return Err(e),
+fn scan_array(
+    buf: &[u8],
+    start: usize,
+    depth: usize,
+) -> Result<Option<(FrameSpec, usize)>, ParseError> {
+    // Reject before recursing: this is the only thing standing between a
+    // few kilobytes of `*1\r\n` and a stack overflow that kills the
+    // process. See `MAX_ARRAY_DEPTH`.
+    if depth >= MAX_ARRAY_DEPTH {
+        return Err(ParseError::Protocol(format!(
+            "array nesting deeper than {MAX_ARRAY_DEPTH} levels"
+        )));
+    }
+
+    let Some((after_len_line, len_line)) = read_line(buf, start + 1) else {
+        return Ok(None);
     };
 
     let count = parse_line_int(len_line)?;
 
     // Null array: *-1\r\n
     if count < 0 {
-        let _ = buf.split_to(after_len_line);
-        return Ok(Some(Frame::Null));
+        return Ok(Some((FrameSpec::Null, after_len_line)));
     }
 
     let count = usize::try_from(count)
@@ -186,34 +257,24 @@ fn parse_array(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
         return Err(ParseError::Protocol("invalid multibulk length".into()));
     }
 
-    // We need to speculatively parse sub-frames without consuming `buf`
-    // until we know the entire array is complete. Work on a snapshot of
-    // the remaining bytes. Reserve only a bounded amount up front: the
-    // advertised `count` is trusted only as far as `MAX_ARRAY_LEN`, and even
-    // then the array may be incomplete, so we let the vector grow rather than
-    // allocating `count` slots from an unverified header.
+    // Reserve only a bounded amount up front: the advertised `count` is
+    // trusted only as far as `MAX_ARRAY_LEN`, and even then the array may
+    // be incomplete, so we let the vector grow rather than allocating
+    // `count` slots from an unverified header.
     let mut cursor = after_len_line;
     let mut items = Vec::with_capacity(count.min(MAX_ARRAY_PREALLOC));
 
     for _ in 0..count {
-        if cursor >= buf.len() {
+        // Elements are scanned in place against an index — no per-element
+        // copy of the remaining buffer.
+        let Some((item, end)) = scan_frame(buf, cursor, depth + 1)? else {
             return Ok(None);
-        }
-
-        let mut sub = BytesMut::from(&buf[cursor..]);
-        match parse_frame(&mut sub) {
-            Ok(Some(frame)) => {
-                let consumed = buf.len() - cursor - sub.len();
-                cursor += consumed;
-                items.push(frame);
-            }
-            Ok(None) => return Ok(None),
-            Err(e) => return Err(e),
-        }
+        };
+        items.push(item);
+        cursor = end;
     }
 
-    let _ = buf.split_to(cursor);
-    Ok(Some(Frame::Array(items)))
+    Ok(Some((FrameSpec::Array(items), cursor)))
 }
 
 #[cfg(test)]
@@ -339,6 +400,86 @@ mod tests {
     fn huge_bulk_len_rejected() {
         let over = format!("${}\r\n", MAX_BULK_LEN + 1);
         assert!(matches!(parse(over.as_bytes()), Err(ParseError::Protocol(_))));
+    }
+
+    /// Nesting exactly at the cap still parses: 32 levels of single-element
+    /// arrays wrapping a simple string.
+    #[test]
+    fn nesting_at_depth_cap_parses() {
+        let mut input = "*1\r\n".repeat(MAX_ARRAY_DEPTH);
+        input.push_str("+OK\r\n");
+        let frame = parse(input.as_bytes()).unwrap();
+        assert!(frame.is_some(), "nesting at the cap must parse");
+    }
+
+    /// One level past the cap is a protocol error, not a deeper recursion.
+    #[test]
+    fn nesting_past_depth_cap_rejected() {
+        let mut input = "*1\r\n".repeat(MAX_ARRAY_DEPTH + 1);
+        input.push_str("+OK\r\n");
+        let err = parse(input.as_bytes()).unwrap_err();
+        assert!(matches!(err, ParseError::Protocol(_)), "got {err:?}");
+    }
+
+    /// The DoS shape: ~40 KiB of repeated `*1\r\n` — well under the 1 MiB
+    /// `max_input_buffer`, but ~10,000 frames deep. Before the depth cap
+    /// this overflowed the tokio worker stack and SIGSEGV'd the whole
+    /// process. It must now be a plain protocol error on one connection.
+    #[test]
+    fn deeply_nested_array_does_not_overflow_stack() {
+        let input = "*1\r\n".repeat(10_000);
+        let err = parse(input.as_bytes()).unwrap_err();
+        assert!(matches!(err, ParseError::Protocol(_)), "got {err:?}");
+    }
+
+    /// Bulk payloads inside an array are slices of the input allocation,
+    /// not copies — the property the index-based scan exists to preserve.
+    #[test]
+    fn nested_bulk_payloads_are_zero_copy_slices() {
+        let mut buf = BytesMut::from(&b"*1\r\n$3\r\nabc\r\n"[..]);
+        let base = buf.as_ptr() as usize;
+        let frame = parse_frame(&mut buf).unwrap().unwrap();
+        let Frame::Array(items) = frame else { panic!("expected an array") };
+        let Frame::Bulk(ref data) = items[0] else { panic!("expected a bulk") };
+        assert_eq!(&data[..], b"abc");
+        // The payload points into the original buffer's allocation at the
+        // offset where "abc" sits (4 bytes of "*1\r\n" + 4 of "$3\r\n").
+        assert_eq!(data.as_ptr() as usize, base + 8, "bulk payload was copied");
+    }
+
+    /// A partially received array must not consume anything: the caller
+    /// re-parses the same buffer after the next socket read.
+    #[test]
+    fn incomplete_array_leaves_buffer_untouched() {
+        let mut buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n"[..]);
+        let before = buf.len();
+        assert!(parse_frame(&mut buf).unwrap().is_none());
+        assert_eq!(buf.len(), before, "incomplete frame must not be consumed");
+
+        // Completing it yields the whole array.
+        buf.extend_from_slice(b"$3\r\nkey\r\n");
+        let frame = parse_frame(&mut buf).unwrap().unwrap();
+        assert_eq!(
+            frame,
+            Frame::Array(vec![
+                Frame::Bulk(bytes::Bytes::from_static(b"GET")),
+                Frame::Bulk(bytes::Bytes::from_static(b"key")),
+            ])
+        );
+        assert!(buf.is_empty());
+    }
+
+    /// Nested arrays round-trip with their elements intact.
+    #[test]
+    fn nested_array_round_trip() {
+        let frame = parse(b"*2\r\n*1\r\n:1\r\n$2\r\nhi\r\n").unwrap().unwrap();
+        assert_eq!(
+            frame,
+            Frame::Array(vec![
+                Frame::Array(vec![Frame::Integer(1)]),
+                Frame::Bulk(bytes::Bytes::from_static(b"hi")),
+            ])
+        );
     }
 
     /// The exact fuzzer crash input must parse without panicking — every

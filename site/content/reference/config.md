@@ -216,6 +216,11 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | `reset_strategy` | string | `"smart"` | `"smart"` (reset after non-SELECT), `"always"`, `"never"`. |
 | `replicas.urls` | array of strings | `[]` | Read replica URLs. Reads distributed across; writes go to primary. |
 
+> **The proxy listener is unauthenticated — keep it on loopback.**
+> The proxy does not validate client credentials. The MySQL proxy reads the client handshake response and discards it; the PostgreSQL proxy answers any startup message with `AuthenticationOk`. The real credentials in `url` are used only for the proxy's own pooled connections to the backend, and are never required of the client.
+>
+> Binding `listen` to a non-loopback address therefore gives full read/write access to your database to any host that can reach the port. ePHPm logs a startup warning when `listen` is a non-loopback IP literal (`0.0.0.0:3306`, `10.0.0.5:3306`, …), but does **not** refuse to start — binding `0.0.0.0` inside a container that is firewalled by a network policy is a legitimate deployment. Addresses given as hostnames (`localhost:3306`, `db.internal:3306`) are not classified, because that would require a DNS lookup at startup; no warning is logged for them either way.
+
 ### `[db.sqlite]`
 
 | Key | Type | Default | Description |
@@ -231,6 +236,8 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | `hrana_listen` | string | (none) | Hrana HTTP API listener. |
 | `postgres_listen` | string | (none) | PostgreSQL wire protocol listener. |
 | `tds_listen` | string | (none) | TDS (SQL Server) wire protocol listener. |
+
+> **These listeners are unauthenticated too.** litewire's MySQL, Hrana, PostgreSQL, and TDS frontends accept any client — the PostgreSQL frontend is explicitly wired to a no-op startup handler, and the others never ask for credentials. The design assumes only PHP inside this process reaches them. As with `[db.mysql]`, each of these four keys is checked at startup and a non-loopback IP literal logs a warning naming the risk; startup is not blocked. Bind loopback unless the port is firewalled from untrusted networks.
 
 #### `[db.sqlite.sqld]` (clustered mode only)
 
