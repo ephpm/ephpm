@@ -160,6 +160,19 @@ path is a **single ordered stream** with no schema-sync side channel.
 - Read-only enforcement on replica wire frontends. litewire has no
   read-only mode, so a replica's MySQL/Hrana frontend accepts writes
   that nothing replicates; the replica logs a warning at startup.
+- Schema replay executes wire-supplied SQL. Note the asymmetry with the
+  snapshot path above: the snapshot dump *is* checked against a
+  `CREATE`/`INSERT` allowlist, but the CDC apply path is not. When a
+  batch carries a `sqlite_schema` row, `apply_batch` runs its stored
+  `sql` text directly (`litewire-turso/src/cdc.rs`) with no allowlist of
+  statement kinds. The DML path is safe — values bind as parameters and
+  identifiers go through `escape_ident` — but a peer whose frames reach
+  `apply_batch` can run arbitrary SQL on a replica, including `ATTACH`
+  and `PRAGMA`. Reaching it requires the cluster secret *and* passing
+  the gossip-membership check, so the peer is already a trusted node
+  that dictates replicated data anyway; the residual gap is that a
+  compromised primary can do more than corrupt rows. Closing it needs a
+  litewire PR to parse and allowlist the replayed DDL, plus a pin bump.
 - Triggers in the snapshot. They are deliberately not shipped (CDC
   already carries the rows a trigger produced on the primary), which is
   correct for replay but means a replica promoted to primary has no
