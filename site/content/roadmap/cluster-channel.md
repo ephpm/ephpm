@@ -54,47 +54,70 @@ free (the test binds it directly to prove the channel didn't).
 
 ## Handshake
 
-Version 1 handshake — before any yamux frame flows:
+Version 2 handshake — mutual challenge/response, before any yamux frame
+flows:
 
 ```text
 initiator → responder:
-  [version: u8 = 0x01]
-  [sealed_len: u16 BE]
-  [sealed_challenge]         # seal(random 32-byte nonce)
+  [version: u8 = 0x02][sealed_len: u16 BE][seal(C_i)]
 
 responder → initiator:
-  [version: u8 = 0x01]
-  [sealed_len: u16 BE]
-  [sealed_reply]             # seal(SAME challenge nonce)
+  [version: u8 = 0x02][sealed_len: u16 BE][seal(C_i || C_r)]
+
+initiator → responder:
+                      [sealed_len: u16 BE][seal(C_r)]
 ```
 
-Both sides derive `ClusterCipher::for_cluster_channel(secret)` — a
-distinct HKDF-SHA256 domain (`ephpm-cluster-channel-v1`) from
+`C_i` and `C_r` are fresh 32-byte `OsRng` challenges chosen
+independently by each side. Both derive
+`ClusterCipher::for_cluster_channel(secret)` for these three messages —
+a distinct HKDF-SHA256 domain (`ephpm-cluster-channel-v1`) from
 `for_gossip` and `for_kv_data_plane`, so a stray gossip datagram or KV
-data-plane frame can never authenticate here. The responder opens the
-challenge (proves it holds the secret), seals the *same* nonce back
-with a fresh AEAD nonce, and the initiator verifies the round trip.
-Either side dropping on any failure is the "wrong secret" signal —
-deliberately no typed error reply, so a wrong-secret peer is
-indistinguishable from a stray TCP port scan.
+data-plane frame can never authenticate here. Message 2 proves the
+responder holds the secret; message 3 proves the initiator does. Both
+echo comparisons are constant-time.
+
+Version 1 was a single round trip in which the responder echoed back
+the challenge it was handed. That was **replayable**: a passive
+observer who recorded one legitimate setup could re-send the captured
+bytes verbatim and clear the accept path without holding the secret.
+The responder's own challenge is what closes that — a replayer receives
+a message 2 built around a value it cannot open, so it cannot produce
+message 3. v1 peers are rejected; both ends of a channel ship in the
+same binary, so there is no mixed-version window inside a release.
 
 **Fail-closed:** the channel refuses to bind when a channel feature is
 enabled but no secret is configured (neither `[cluster.channel] secret`
 nor `[cluster] secret`). Authentication is not optional; a channel
 feature is authenticated or absent.
 
-**TLS is Phase 2.1** — the channel today is authenticated with
-ChaCha20-Poly1305 (same primitive as gossip / KV data plane) but not
-TLS-wrapped. Eavesdroppers see ciphertext, but there is no PKI-based
-peer identity beyond "holds the shared cluster secret". TLS wrapping
-adds no additional security on a trusted network segment but is needed
-for the mixed-trust operator posture; see the deferred items below.
+**Peer admission.** After the handshake — actually, before it — the
+accepting side checks the connecting IP against the live gossip member
+set. This is coarse: per-host rather than per-process, and it trusts
+the TCP source address. It is defence in depth behind the secret, so
+that a leaked secret alone does not let an arbitrary host pull a
+database snapshot.
+
+**Post-handshake confidentiality.** Both sides derive a
+*per-connection* key from the secret salted with the transcript
+`C_i || C_r` (HKDF domain `ephpm-cluster-channel-session-v1`) and wrap
+the socket in a sealing adapter: every byte yamux writes goes out as a
+length-prefixed ChaCha20-Poly1305 frame and every frame is
+authenticated on read. Because the key is per-connection, frames cannot
+be spliced between connections. A frame that fails authentication
+drops the connection.
+
+**TLS is still deferred.** There is no PKI-based peer identity beyond
+"holds the shared cluster secret". TLS wrapping adds no additional
+security on a trusted network segment but is needed for the mixed-trust
+operator posture; see the deferred items below.
 
 ## Multiplexing
 
-After the handshake, both sides speak **yamux 0.14** over the raw TCP
-stream. Each yamux stream is opened by the initiator and begins with a
-length-prefixed UTF-8 stream-type string:
+After the handshake, both sides speak **yamux 0.14** over the sealed
+stream described above (yamux never sees the raw socket). Each yamux
+stream is opened by the initiator and begins with a length-prefixed
+UTF-8 stream-type string:
 
 ```text
 [stream_type_len: u16 BE][stream_type: utf-8 bytes]
@@ -105,7 +128,7 @@ length-prefixed UTF-8 stream-type string:
 | Prefix | Status | Purpose |
 |---|---|---|
 | `cdc/<vhost>` | Implemented | CDC replication (Turso engine) — see [`turso-engine`](/roadmap/turso-engine/#phase-2--cdc-native-replication-experimental-implementation-available-gated-on-ga-for-default) |
-| `snapshot/<vhost>` | **RESERVED** — refused with a logged warning today | Fresh-replica base snapshot before CDC catch-up (Phase 2.1) |
+| `snapshot/<vhost>` | Implemented | Cold-replica base snapshot before CDC catch-up. Served only while the local node is the elected primary. |
 
 The stream-type string is what drives dispatch on the accepting side.
 Unknown types are logged (WARN) and the stream is closed; the yamux
@@ -118,17 +141,25 @@ new stream type until they upgrade.
 Yamux gives per-stream flow control (256 KiB window by default). A
 stalled reader on one stream pauses writes to that stream without
 blocking other streams on the same connection. In CDC terms: a slow
-replica pauses the primary's tail broadcast on **that** subscriber's
-stream only. The `broadcast::Sender` upstream of the write loop
-absorbs transient stall via its 1024-entry queue; sustained stall
-produces a `RecvError::Lagged` on the receiver side, which the
-subscriber loop treats as "close the stream" — the replica's
-reconnect loop opens a fresh stream and litewire's
-`__litewire_cdc_watermark` guarantees idempotent replay.
+replica pauses only its **own** subscriber stream, because each
+subscriber owns a private `CdcTailer` rather than sharing a fan-out.
+The tailer simply stops advancing while its write is blocked, so a
+stalled replica cannot cause the primary to skip past batches it has
+not yet received — the failure mode is lag, not loss. (An earlier
+design broadcast one shared cursor to every subscriber; lag there meant
+`RecvError::Lagged` and permanently dropped batches.)
+
+### Resource bounds
+
+Pre-authentication work is capped: at most 64 concurrent inbound
+handshakes (further connections are closed immediately rather than
+queued) and a 10-second deadline on each. Post-handshake, yamux is
+configured for at most 64 concurrent streams per connection.
 
 ## What rides the channel today
 
-Just CDC replication (`cdc/default`). Opt in with:
+CDC replication (`cdc/default`) and its cold-replica snapshot bootstrap
+(`snapshot/default`). Opt in with:
 
 ```toml
 [cluster]
@@ -153,21 +184,18 @@ default and reuses `[cluster] secret`. Explicit `listen` /
 
 Roughly in priority order:
 
-1. **Snapshot bootstrap (`snapshot/<vhost>`).** A joining replica
-   opens a snapshot stream, receives the primary's current DB image,
-   then subscribes to `cdc/<vhost>` from the corresponding watermark.
-   Removes the "operator seeds the DB file" step from the Turso CDC
-   deployment story.
-2. **Watermark sync stream.** Persist subscriber watermarks
+1. **Watermark sync stream.** Persist subscriber watermarks
    cluster-wide so a subscriber that reconnects to a *different*
-   primary (post-failover) resumes from its last-applied cursor
-   instead of restarting from zero.
-3. **TLS wrap (Phase 2.1).** Optional TLS layer between the TCP
+   primary (post-failover) resumes at a cursor that means the same
+   thing on the new primary. Within one primary, resume already works:
+   the subscriber names its watermark in the first frame and the
+   primary tails from exactly there.
+2. **TLS wrap.** Optional TLS layer between the TCP
    handshake and yamux, using ACME-issued certs from the existing
    `rustls-acme` integration. Reuses the per-cluster secret as the
    handshake fallback so mixed-version rollouts don't need coordinated
    flips.
-4. **Bulk log stream (unfixed schema).** A generic
+3. **Bulk log stream (unfixed schema).** A generic
    `log/<feature>/<vhost>` stream for future features that need
    ordered, backpressured, authenticated cluster-wide log distribution
    without inventing a fresh transport.

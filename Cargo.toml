@@ -95,6 +95,12 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 # DESCRIBE becomes arbitrary SQL. 7a0b59c4 adds sanitize_identifier() and
 # applies it at every extraction site.
 litewire = { git = "https://github.com/ephpm/litewire.git", rev = "7a0b59c40ce6", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
+# Direct dependency on the same turso the pinned litewire uses, so the
+# snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
+# in its signatures. Pinned to the exact version litewire pins (=0.7.0)
+# so the two resolve to a single crate instance and TursoConnection
+# (re-exported by litewire) is the same turso::Connection.
+turso = { version = "=0.7.0", default-features = false }
 
 # Release-profile tuning for v0.4.2 perf release.
 #

@@ -48,23 +48,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ephpm_cluster::{
-    ChannelFeatureFlags, ChannelHandle, ClusterHandle, ElectedRole, IncomingStream, SqliteElection,
-    maybe_start_cluster_channel, start_gossip,
+    ChannelFeatureFlags, ChannelHandle, ChannelStream, ClusterHandle, ElectedRole, IncomingStream,
+    SqliteElection, maybe_start_cluster_channel, start_gossip,
 };
 use ephpm_config::{ClusterChannelConfig, ClusterConfig};
 use litewire::backend::{Backend, Value};
 use litewire::litewire_turso::Turso;
-use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch};
+use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, read_watermark};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::broadcast;
 
 const CDC_STREAM_TYPE: &str = "cdc/default";
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize)]
 enum Frame {
-    Batch { rows: Vec<WireCdcRow> },
+    /// Replica → primary, first frame: the watermark to resume from.
+    Subscribe {
+        from_change_id: i64,
+    },
+    Batch {
+        rows: Vec<WireCdcRow>,
+    },
     Ping,
 }
 
@@ -258,39 +263,42 @@ async fn drive_primary_role(
     mgmt: Arc<Turso>,
     channel: &ChannelHandle,
 ) -> Vec<tokio::task::JoinHandle<()>> {
-    let (tx, _rx0) = broadcast::channel::<Arc<TxnBatch>>(1024);
     let mut cdc_streams = channel.register_exact(CDC_STREAM_TYPE);
-    let tx_for_subs = tx.clone();
     let dispatch = tokio::spawn(async move {
         while let Some(incoming) = cdc_streams.recv().await {
-            let mut rx = tx_for_subs.subscribe();
-            let IncomingStream { mut stream, .. } = incoming;
+            let IncomingStream { stream, .. } = incoming;
+            let mgmt = Arc::clone(&mgmt);
             tokio::spawn(async move {
-                while let Ok(batch) = rx.recv().await {
-                    let frame =
-                        Frame::Batch { rows: batch.rows.iter().map(WireCdcRow::from).collect() };
-                    if write_frame(&mut stream, &frame).await.is_err() {
-                        break;
-                    }
+                if let Err(e) = serve_one_subscriber(stream, &mgmt).await {
+                    eprintln!("serve subscriber: {e:#}");
                 }
             });
         }
     });
 
-    let tail = tokio::spawn(async move {
-        let mut tailer = CdcTailer::new(&mgmt, 0);
-        loop {
-            match tailer.poll_batch().await {
-                Ok(Some(batch)) => {
-                    let _ = tx.send(Arc::new(batch));
-                }
-                Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
-                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-            }
-        }
-    });
+    vec![dispatch]
+}
 
-    vec![dispatch, tail]
+/// Mirror of the production per-subscriber serve loop: the subscriber
+/// names the watermark it has applied and gets its own tailer anchored
+/// there, so nothing can be skipped on a reconnect.
+async fn serve_one_subscriber(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Result<()> {
+    let from = match read_frame(&mut stream).await? {
+        Frame::Subscribe { from_change_id } => from_change_id,
+        _ => anyhow::bail!("expected Subscribe as the first frame"),
+    };
+    let mut tailer = CdcTailer::new(mgmt, from);
+    loop {
+        match tailer.poll_batch().await {
+            Ok(Some(batch)) => {
+                let frame =
+                    Frame::Batch { rows: batch.rows.iter().map(WireCdcRow::from).collect() };
+                write_frame(&mut stream, &frame).await?;
+            }
+            Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
+            Err(e) => anyhow::bail!("tail poll: {e}"),
+        }
+    }
 }
 
 /// Drive the replica side: dial the channel with what the election
@@ -320,19 +328,29 @@ async fn drive_replica_role(
     tokio::spawn(async move {
         loop {
             match channel.dial(primary_addr, CDC_STREAM_TYPE).await {
-                Ok(mut stream) => loop {
-                    match read_frame(&mut stream).await {
-                        Ok(Frame::Batch { rows }) => {
-                            let batch =
-                                TxnBatch { rows: rows.into_iter().map(CdcRow::from).collect() };
-                            if let Err(e) = apply_batch(&apply_conn, &batch).await {
-                                eprintln!("apply_batch: {e:#}");
+                Ok(mut stream) => {
+                    let wm = read_watermark(&apply_conn).await.unwrap_or(0);
+                    let subscribed =
+                        write_frame(&mut stream, &Frame::Subscribe { from_change_id: wm }).await;
+                    if subscribed.is_ok() {
+                        loop {
+                            match read_frame(&mut stream).await {
+                                Ok(Frame::Batch { rows }) if !rows.is_empty() => {
+                                    let batch = TxnBatch {
+                                        rows: rows.into_iter().map(CdcRow::from).collect(),
+                                    };
+                                    if let Err(e) = apply_batch(&apply_conn, &batch).await {
+                                        eprintln!("apply_batch: {e:#}");
+                                        break;
+                                    }
+                                }
+                                Ok(_) => {}
+                                Err(_) => break,
                             }
                         }
-                        Ok(Frame::Ping) => {}
-                        Err(_) => break,
                     }
-                },
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 Err(e) => {
                     eprintln!("dial({primary_addr}) failed: {e:#}");
                     tokio::time::sleep(Duration::from_millis(50)).await;
