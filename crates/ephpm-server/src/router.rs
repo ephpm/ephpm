@@ -3306,10 +3306,9 @@ mod tests {
 
         let canon = dir.path().canonicalize().unwrap();
         for i in 0..CANONICAL_SCRIPT_CACHE_MAX {
-            router.canonical_scripts.insert(
-                canon.join(format!("filler-{i}.php")),
-                (canon.clone(), Instant::now()),
-            );
+            router
+                .canonical_scripts
+                .insert(canon.join(format!("filler-{i}.php")), (canon.clone(), Instant::now()));
         }
         assert_eq!(router.canonical_scripts.len(), CANONICAL_SCRIPT_CACHE_MAX);
 
