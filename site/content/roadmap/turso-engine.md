@@ -218,13 +218,15 @@ is a new-minor (or larger) event, never a patch.
 1. Upstream GA: a stable (non-pre) release and upstream's own
    production-readiness statement; multiprocess + vacuum landed.
 2. Phase 1 benchmarks at parity-or-better on our matrix, including
-   tails. **Partially evidenced (2026-08-01), gate still open.** On the
-   `db.php` read path Turso is better on both throughput and tails
-   (+17% RPS / −12% p99 at c=1; −27% p99 at c=16). On single-node writes
-   throughput is at parity but the **c=16 write p99 is worse** than
-   rusqlite (32.3 ms vs 24.3 ms, worse in both reps) — the one cell where
-   Turso loses, and the reason this gate is not closed. `connect`
-   latency and the MySQL baselines are still unmeasured. See
+   tails. **Substantially evidenced (release build, 2026-08-02), gate
+   still open.** Reads: Turso +15% RPS at c=1 with the steadier c=16
+   tail (30.9 vs 46.0 ms p99). Writes: parity — 666 vs 648 RPS at c=1,
+   and at c=16 rusqlite edges throughput (1130 vs 1120) with the better
+   p99 (18.7 vs 20.8 ms); the mid-cycle run's "Turso write tail is
+   worse" finding did not persist into the release build. What keeps the
+   gate open: `connect` latency and the MySQL baselines are still
+   unmeasured, and one c=16 write-p99 cell in rusqlite's favor is within
+   this harness's run-to-run spread. See
    [Results](/benchmarking/results/#v060--the-turso-engine-measured-against-sqlite).
 3. File-format round-trip verified by us (SQLite-written DB opened by
    Turso and back, checksummed).

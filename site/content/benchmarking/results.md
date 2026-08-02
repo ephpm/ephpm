@@ -135,51 +135,63 @@ limiting and `query_stats` were disabled identically in every lane.
 | **C** | `sqlite` | cluster | sqld sidecar, WAL frames over gRPC (the shipping clustered path) |
 | **D** | `turso` | cluster | CDC-native over the cluster channel, no sidecar |
 
-### Read path — `db.php`, 10 sequential SELECTs
+Two measurements were taken this cycle. The **mid-cycle** run (litewire
+`23b8de63`) found the per-request costs that motivated litewire#15
+(per-session workers + handle reuse); the **release** run below is the
+one that matches shipped v0.6.0 — image built from `97e2a60`, litewire
+pinned at `d1c0b341`. Where they differ, the release numbers are the
+claim.
+
+### Read path — `db.php`, 10 sequential SELECTs (release build)
 
 | Lane | c=1 RPS | p50 | p99 | c=16 RPS | p50 | p99 |
 |---|---|---|---|---|---|---|
-| A sqlite single | 331 | 2.98 ms | 3.48 ms | 566 | 26.95 ms | 42.58 ms |
-| **B turso single** | **388** | **2.54 ms** | **3.06 ms** | **598** | 26.86 ms | **31.09 ms** |
-| C sqlite cluster | 168 | 5.89 ms | 6.61 ms | 250 | 78.35 ms | 91.28 ms |
-| **D turso cluster** | **344** | **2.81 ms** | 4.16 ms | **531** | 30.12 ms | **36.08 ms** |
+| A sqlite single | 322 | 3.09 ms | 3.47 ms | 612 | 22.26 ms | 46.02 ms |
+| **B turso single** | **371** | **2.65 ms** | **3.25 ms** | **646** | 24.62 ms | **30.93 ms** |
+| C sqlite cluster | 147 | 6.71 ms | 8.19 ms | 240 | 82.56 ms | 92.07 ms |
+| **D turso cluster** | **358** | **2.75 ms** | **3.38 ms** | **601** | 26.41 ms | **33.19 ms** |
 
-### Write path — one INSERT per request
+### Write path — one INSERT per request (release build)
 
 | Lane | c=1 RPS | p50 | p99 | c=16 RPS | p50 | p99 |
 |---|---|---|---|---|---|---|
-| A sqlite single | 596 | 1.64 ms | 2.06 ms | 879 | 18.37 ms | **24.34 ms** |
-| B turso single | 618 | 1.57 ms | 2.27 ms | **899** | 17.80 ms | 32.33 ms |
-| C sqlite cluster | 398 | 2.42 ms | 3.42 ms | **0.8 / 52** | — | ~1.5 s |
-| **D turso cluster** | **523** | **1.82 ms** | 3.06 ms | **694** | 22.75 ms | 40.82 ms |
+| A sqlite single | 648 | 1.51 ms | 1.93 ms | **1130** | **14.26 ms** | **18.68 ms** |
+| B turso single | 666 | **1.47 ms** | 1.86 ms | 1120 | 14.38 ms | 20.77 ms |
+| C sqlite cluster | 384 | 2.27 ms | 7.66 ms | **0 completed** | — | — |
+| **D turso cluster** | **558** | **1.70 ms** | 3.00 ms | **876** | 17.71 ms | 26.34 ms |
 
 ### What the data says
 
-**Single-node reads: Turso wins, including the tail.** +17% RPS at c=1
-with −12% p99, and at c=16 a **−27% p99** (31.09 vs 42.58 ms) for a
-modest +6% RPS. Turso is faster *and* steadier on the read path.
+**Single-node writes: the engines are now even.** 648 vs 666 RPS at
+c=1; at c=16 SQLite actually edges ahead (1130 vs 1120, with the better
+p99: 18.7 vs 20.8 ms). The mid-cycle run had Turso ahead here; the
+server-side work that landed between the two runs closed it.
 
-**Single-node writes: throughput parity, worse tail.** +2–4% RPS is
-inside the noise this harness resolves, and Turso's c=16 write p99 is
-**worse** — 32.33 ms vs 24.34 ms, and worse in both reps (39.83 vs
-27.25 ms). This is not a clean sweep, and the write tail is the cell to
-watch as the engine matures.
+**Single-node reads: Turso's lead persists.** +15% RPS at c=1 (371 vs
+322) with a ~440 µs p50 gap that was essentially unchanged between the
+two measurements, and the steadier c=16 tail (30.9 vs 46.0 ms p99).
+Notably, handle reuse is enabled on the SQLite lane in this build and
+verified active in the startup log, yet the read gap did not move — see
+the follow-up note under Honest bounds.
 
-**Clustered: the gap is large.** CDC-native replication beats the sqld
-sidecar **2.1×** on read throughput (531 vs 250 RPS) with a p99 of
-36 ms against 91 ms, and **~13×** on concurrent writes.
+**Clustered: the gap is decisive and grew.** CDC-native replication
+beats the sqld sidecar **2.5×** on read throughput (601 vs 240 RPS, p99
+33 vs 92 ms). On concurrent writes there is no longer a ratio to report:
+clustered SQLite completed **zero requests** in both 20 s reps at c=16,
+while CDC sustained **876 RPS**.
 
-**The cost of replication is the sharpest contrast.** Measured against
-each engine's *own* single-node baseline at c=16 writes, clustered Turso
-retains **77%** of its throughput (694 of 899) while shipping every
-change to a replica. Clustered SQLite retains **6%** (52 of 879).
+**The cost of replication is the sharpest contrast.** Against each
+engine's own single-node baseline at c=16 writes, clustered Turso
+retains **78%** of its throughput (876 of 1120) while shipping every
+change to a replica. Clustered SQLite retains **0%**.
 
-**Clustered SQLite collapses under concurrent writes.** Lane C peaks at
-c=4 and falls off a cliff: 744 RPS at c=4 → 453 at c=8 → **37 at c=16**,
-with a p99 of 5.04 s, `SQLITE_BUSY` surfacing to PHP as HTTP 500, and
-connections that never get served at all. See
-[Findings](findings/#sqlite_busy-is-the-clustered-write-ceiling). This is
-the *shipping* clustered path, not the experimental one.
+**Clustered SQLite collapses under concurrent writes.** The mid-cycle
+concurrency sweep located the cliff: 744 RPS at c=4 → 453 at c=8 →
+**37 at c=16**, p99 5.04 s, `SQLITE_BUSY` surfacing to PHP as HTTP 500 —
+and in the release run the c=16 cell completed nothing at all. See
+[Findings](findings/#sqlite_busy-is-the-clustered-write-ceiling) and
+[issue #217](https://github.com/ephpm/ephpm/issues/217). This is the
+*shipping* clustered path, not the experimental one.
 
 **CDC kept pace under sustained load.** The replica finished the write
 lanes holding 57,634 rows after a ~57k-row benchmark. Treat that as
@@ -205,6 +217,16 @@ a lane that failed it was discarded rather than reported.
   not hold at another.
 - **No MySQL/PostgreSQL baseline** was measured in this pass, so this is
   a SQLite-lineage comparison only.
+- **Handle reuse is enabled but its measured effect did not arrive.**
+  litewire's backend-level A/B showed reuse saving ~400 µs per
+  connect+10-query cycle, and the release build verifiably enables it —
+  yet the end-to-end SQLite read p50 kept the same ~440 µs gap to Turso
+  in both measurements. The working hypothesis is that handles are being
+  discarded rather than returned on the wire frontend's disconnect path
+  (the pool's designed-safe failure mode, equal to prior behavior);
+  confirming needs the pool's hit/discard counters surfaced in ePHPm.
+  Tracked as a post-v0.6.0 follow-up — the backend-layer saving is real
+  and measured, its delivery through the wire path is not yet.
 
 ## How to read these
 
