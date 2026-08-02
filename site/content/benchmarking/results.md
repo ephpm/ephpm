@@ -114,6 +114,98 @@ higher on container overlay / network filesystems where `stat()` is
 pricier. The number is a demonstrated ceiling-ish case, not a promise for
 every app.
 
+## v0.6.0 — the Turso engine, measured against SQLite
+
+v0.6.0 ships the [Turso engine](/roadmap/turso-engine/) as an
+**experimental, opt-in** backend (`[db.sqlite] engine = "turso"`) and an
+experimental CDC-native clustered mode (`cdc_experimental = true`). This
+is the first measurement of both against the shipping SQLite paths.
+
+**Setup:** one machine, one session, podman on WSL2, four lanes, each
+node `--cpus 1`. `oha`, 8 s warmup then 2 × 20 s measured, best rep
+reported with *its own* p50/p99. 100% `2xx` verified per cell. Fixtures
+are the canonical [`db.php`](/benchmarking/methodology/#fixtures) (10
+sequential PDO `SELECT`s) and a single-`INSERT` write fixture. Rate
+limiting and `query_stats` were disabled identically in every lane.
+
+| Lane | Engine | Mode | Replication |
+|---|---|---|---|
+| **A** | `sqlite` | single | — (rusqlite, the shipping default) |
+| **B** | `turso` | single | — |
+| **C** | `sqlite` | cluster | sqld sidecar, WAL frames over gRPC (the shipping clustered path) |
+| **D** | `turso` | cluster | CDC-native over the cluster channel, no sidecar |
+
+### Read path — `db.php`, 10 sequential SELECTs
+
+| Lane | c=1 RPS | p50 | p99 | c=16 RPS | p50 | p99 |
+|---|---|---|---|---|---|---|
+| A sqlite single | 331 | 2.98 ms | 3.48 ms | 566 | 26.95 ms | 42.58 ms |
+| **B turso single** | **388** | **2.54 ms** | **3.06 ms** | **598** | 26.86 ms | **31.09 ms** |
+| C sqlite cluster | 168 | 5.89 ms | 6.61 ms | 250 | 78.35 ms | 91.28 ms |
+| **D turso cluster** | **344** | **2.81 ms** | 4.16 ms | **531** | 30.12 ms | **36.08 ms** |
+
+### Write path — one INSERT per request
+
+| Lane | c=1 RPS | p50 | p99 | c=16 RPS | p50 | p99 |
+|---|---|---|---|---|---|---|
+| A sqlite single | 596 | 1.64 ms | 2.06 ms | 879 | 18.37 ms | **24.34 ms** |
+| B turso single | 618 | 1.57 ms | 2.27 ms | **899** | 17.80 ms | 32.33 ms |
+| C sqlite cluster | 398 | 2.42 ms | 3.42 ms | **0.8 / 52** | — | ~1.5 s |
+| **D turso cluster** | **523** | **1.82 ms** | 3.06 ms | **694** | 22.75 ms | 40.82 ms |
+
+### What the data says
+
+**Single-node reads: Turso wins, including the tail.** +17% RPS at c=1
+with −12% p99, and at c=16 a **−27% p99** (31.09 vs 42.58 ms) for a
+modest +6% RPS. Turso is faster *and* steadier on the read path.
+
+**Single-node writes: throughput parity, worse tail.** +2–4% RPS is
+inside the noise this harness resolves, and Turso's c=16 write p99 is
+**worse** — 32.33 ms vs 24.34 ms, and worse in both reps (39.83 vs
+27.25 ms). This is not a clean sweep, and the write tail is the cell to
+watch as the engine matures.
+
+**Clustered: the gap is large.** CDC-native replication beats the sqld
+sidecar **2.1×** on read throughput (531 vs 250 RPS) with a p99 of
+36 ms against 91 ms, and **~13×** on concurrent writes.
+
+**The cost of replication is the sharpest contrast.** Measured against
+each engine's *own* single-node baseline at c=16 writes, clustered Turso
+retains **77%** of its throughput (694 of 899) while shipping every
+change to a replica. Clustered SQLite retains **6%** (52 of 879).
+
+**Clustered SQLite collapses under concurrent writes.** Lane C peaks at
+c=4 and falls off a cliff: 744 RPS at c=4 → 453 at c=8 → **37 at c=16**,
+with a p99 of 5.04 s, `SQLITE_BUSY` surfacing to PHP as HTTP 500, and
+connections that never get served at all. See
+[Findings](findings/#sqlite_busy-is-the-clustered-write-ceiling). This is
+the *shipping* clustered path, not the experimental one.
+
+**CDC kept pace under sustained load.** The replica finished the write
+lanes holding 57,634 rows after a ~57k-row benchmark. Treat that as
+strong evidence CDC kept up, **not** as proven exact equality — the
+instantaneous primary count was not captured at the same moment. The
+5-row convergence gate run before every clustered lane *was* exact, and
+a lane that failed it was discarded rather than reported.
+
+### Honest bounds on these numbers
+
+- **The engine is Beta upstream and experimental here.** These numbers
+  are evidence for the roadmap's decision gates, not a recommendation to
+  move production data onto Turso. Gates 1, 3, 4 and 5 remain open.
+- **No lab control run was taken for these DB fixtures**, so per
+  [Methodology](methodology/), the *absolute* RPS values do not transfer
+  to other hardware. Every lane ran on the same machine in the same
+  session, so the **A/B deltas are the durable claim**; the absolute
+  ceilings are not.
+- **The write fixture is one INSERT per request**, each its own implicit
+  transaction. That is the shape a PHP app produces and the shape CDC
+  batches on, but it is not a bulk-load or long-transaction benchmark.
+- **`--cpus 1` per node.** Per methodology, a result at one quota need
+  not hold at another.
+- **No MySQL/PostgreSQL baseline** was measured in this pass, so this is
+  a SQLite-lineage comparison only.
+
 ## How to read these
 
 - **Absolute numbers are environment-specific.** The db.php p50 was
