@@ -1668,6 +1668,13 @@ fn spawn_litewire_serve<B: litewire::backend::Backend>(
         builder = builder.tds(tds_addr);
         tracing::info!(listen = %tds_addr, "SQLite TDS wire protocol enabled (CDC-replicated Turso)");
     }
+    if sqlite_config.proxy.max_connections > 0 {
+        builder = builder.max_connections(sqlite_config.proxy.max_connections);
+        tracing::info!(
+            max_connections = sqlite_config.proxy.max_connections,
+            "SQLite wire frontends: connection cap enabled (CDC-replicated Turso)"
+        );
+    }
     handles.push(tokio::spawn(async move {
         match builder.serve().await {
             Ok(()) => tracing::info!("litewire stopped (CDC-replicated Turso)"),

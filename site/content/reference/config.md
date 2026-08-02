@@ -236,6 +236,7 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | `hrana_listen` | string | (none) | Hrana HTTP API listener. |
 | `postgres_listen` | string | (none) | PostgreSQL wire protocol listener. |
 | `tds_listen` | string | (none) | TDS (SQL Server) wire protocol listener. |
+| `max_connections` | integer | `0` (unlimited) | Cap on concurrent wire connections across the MySQL/PostgreSQL/TDS frontends combined. Beyond the cap, connections are refused at accept time (MySQL clients get error 1040 "Too many connections"), never queued. Each wire session holds one OS thread, so this also bounds those threads. Hrana (stateless HTTP) is not counted. Same semantics as `[db.mysql] max_connections`. |
 
 > **These listeners are unauthenticated too.** litewire's MySQL, Hrana, PostgreSQL, and TDS frontends accept any client — the PostgreSQL frontend is explicitly wired to a no-op startup handler, and the others never ask for credentials. The design assumes only PHP inside this process reaches them. As with `[db.mysql]`, each of these four keys is checked at startup and a non-loopback IP literal logs a warning naming the risk; startup is not blocked. Bind loopback unless the port is firewalled from untrusted networks.
 
