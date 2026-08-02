@@ -490,6 +490,10 @@ spec:
     - name: data
       port: 7947
       protocol: TCP
+    # Only needed with experimental CDC replication (cdc_experimental):
+    # - name: cluster-channel
+    #   port: 7948
+    #   protocol: TCP
 ```
 
 The gossip config uses the service DNS name instead of IPs:
@@ -543,12 +547,14 @@ A `StatefulSet` is preferred over a `Deployment` for the KV store — pods get s
 
 ### 2. Inter-Node Security
 
-Cluster communication has two channels, and **both** are secured by the same symmetric pre-shared key (`[cluster] secret`) — there is no TLS or mTLS anywhere in the cluster transport. From the shared secret, ePHPm derives two domain-separated ChaCha20-Poly1305 keys via HKDF-SHA256 (`crates/ephpm-cluster/src/secure_transport.rs`):
+Cluster communication has two always-on channels plus one opt-in channel, and **all of them** are secured by the same symmetric pre-shared key (`[cluster] secret`) — there is no TLS or mTLS anywhere in the cluster transport. From the shared secret, ePHPm derives domain-separated ChaCha20-Poly1305 keys via HKDF-SHA256 (`crates/ephpm-cluster/src/secure_transport.rs`):
 
 - gossip UDP: HKDF info `"ephpm-gossip-v1"`
 - KV data plane TCP: HKDF info `"ephpm-kv-data-v1"`
+- cluster channel handshake: HKDF info `"ephpm-cluster-channel-v1"`
+- cluster channel session frames: HKDF info `"ephpm-cluster-channel-session-v1"` (salted per-session from the handshake transcript)
 
-Because the two planes derive different keys, a ciphertext valid on one plane is meaningless on the other.
+Because each plane derives a different key, a ciphertext valid on one plane is meaningless on the others.
 
 #### Gossip Channel (UDP)
 
@@ -566,7 +572,13 @@ This is **symmetric pre-shared-key authentication, not mutual TLS**. There are n
 
 **Fail-closed on an empty secret.** Because an unset secret means unauthenticated plaintext gossip and data plane, ePHPm **refuses to start** clustering (`enabled = true`) when `secret` is empty. To run without a secret on a trusted private network, opt in explicitly with `allow_insecure_no_auth = true`; a loud warning is logged. This closes the previous fail-open behavior where an empty secret only produced a startup warning.
 
-The shared secret is the only security config — one value to set across all nodes, covering both planes.
+#### Cluster Channel (TCP, opt-in)
+
+Opt-in cluster features — today, experimental CDC-native Turso replication and its snapshot bootstrap (`[db.sqlite.replication] cdc_experimental = true`) — share one additional multiplexed TCP listener, the [cluster channel](/roadmap/cluster-channel/). It binds **only when a feature asks for it** (default port: gossip port + 2, so `7948`; override with `[cluster.channel] listen`) — configs without such a feature open no extra port and are byte-identical to before.
+
+Security is one step stronger than the KV data plane: before any payload flows, both sides complete a **mutual challenge/response handshake** (each proves possession of the secret by sealing the other's challenge), and every post-handshake byte is sealed under a **per-session key** derived from the handshake transcript — so a recorded session cannot be replayed into a new one. Inbound connections are additionally checked against live gossip membership before the handshake is attempted. Like the other planes this is symmetric PSK, not mTLS: there is no per-node identity, and any holder of the secret is a full peer. `[cluster.channel] secret` can override the key for this plane alone; firewall guidance: open TCP 7948 between nodes only when `cdc_experimental` is enabled.
+
+The shared secret is the only security config — one value to set across all nodes, covering every plane.
 
 #### Security Summary
 

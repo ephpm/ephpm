@@ -400,19 +400,6 @@ pub async fn start_clustered_turso_cdc(
          See site/content/roadmap/turso-engine.md and site/content/roadmap/cluster-channel.md."
     );
 
-    // add-config-knob discipline: cdc_listen was replaced by the
-    // cluster channel and is now a documented no-op. Warn when it's
-    // explicitly set so operators fix their config; stay quiet at the
-    // default value.
-    if sqlite_config.replication.cdc_listen != "0.0.0.0:5015" {
-        tracing::warn!(
-            cdc_listen = %sqlite_config.replication.cdc_listen,
-            "[db.sqlite.replication] cdc_listen is deprecated — parsed but not acted upon. \
-             CDC now rides the cluster channel; move any port allocation to \
-             [cluster.channel] listen. This knob will be removed in a future release."
-        );
-    }
-
     let db_path = &sqlite_config.path;
 
     // Use the resolved advertise address — NOT `listen_addr()`

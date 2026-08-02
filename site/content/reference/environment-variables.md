@@ -23,7 +23,7 @@ Examples:
 | `[kv] compression = "zstd"` | `EPHPM_KV__COMPRESSION=zstd` |
 | `[kv.redis_compat] enabled = true` | `EPHPM_KV__REDIS_COMPAT__ENABLED=true` |
 | `[cluster] enabled = true` | `EPHPM_CLUSTER__ENABLED=true` |
-| `[cluster.kv] data_port = 7948` | `EPHPM_CLUSTER__KV__DATA_PORT=7948` |
+| `[cluster.kv] data_port = 7950` | `EPHPM_CLUSTER__KV__DATA_PORT=7950` |
 
 This works because ePHPm uses [figment](https://github.com/SergioBenitez/Figment) with `Env::prefixed("EPHPM_").split("__")`.
 

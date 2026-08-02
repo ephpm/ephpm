@@ -34,6 +34,7 @@ The controls that exist today, in one place:
 - **`trusted_proxies`** — CIDR-based proxy trust for `X-Forwarded-For` / `X-Forwarded-Proto` resolution
 - **Hidden-file modes** — dotfile requests handled per `hidden_files` (`deny`=403, `ignore`=404, `allow`)
 - **Percent-decode traversal hardening** — strict `%XX` decoding before routing; encoded `/` and `\`, truncated or non-hex escapes, and invalid UTF-8 are rejected with 400
+- **Encrypted cluster transport** — with `[cluster] secret` set, all inter-node traffic is authenticated and sealed with ChaCha20-Poly1305 keys derived per plane via HKDF-SHA256: gossip UDP, the KV data plane, and (opt-in, when `cdc_experimental` is enabled) the mutual-handshake [cluster channel](/architecture/clustering/#cluster-channel-tcp-opt-in) carrying CDC replication with per-session keys. Clustering fails closed when the secret is empty. Symmetric PSK, not mTLS — see [Clustering → Inter-Node Security](/architecture/clustering/#2-inter-node-security).
 
 ---
 

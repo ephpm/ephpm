@@ -10,11 +10,7 @@ deploy event is a single write to the gossip-replicated KV store; each
 node's per-request watcher (one atomic load + one KV read) drops the
 vhost's cached scripts before the next request executes.
 
-## Deploys are events (`ephpm serve`, planned for v0.5.0)
-
-> **Planned for v0.5.0 — not in v0.4.x.** This default flip is a
-> user-visible behavior change and ships in the next minor. On v0.4.x,
-> serve mode still inherits PHP's `validate_timestamps=1, revalidate_freq=2`.
+## Deploys are events (`ephpm serve`)
 
 Starting in **v0.5.0**, `ephpm serve` defaults `opcache.validate_timestamps=0`:
 the server **trusts the OPcache** and never `stat()`s cached scripts on the
@@ -50,9 +46,7 @@ raw speed — with a bonus that on container/overlay/network filesystems the
 `stat()` savings are larger, and in immutable-container deploys (files can't
 change) validation is pure waste.
 
-## Resource-aware autotuning (`ephpm serve`, planned for v0.5.0)
-
-> **Planned for v0.5.0 — not in v0.4.x.**
+## Resource-aware autotuning (`ephpm serve`)
 
 The deploys-are-events model has a sibling: *right-size the runtime to the box
 it lands on*. A deploy is an event, and so is the pod it lands in — a 320 MiB /

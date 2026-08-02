@@ -5,7 +5,7 @@
 > [#184](https://github.com/ephpm/ephpm/pull/184) and
 > [#185](https://github.com/ephpm/ephpm/pull/185)). The SSE hub
 > described in the second half is **Planned — not yet implemented**,
-> targeted at v0.6.0.
+> targeted at v0.7.
 
 ## Why realtime is suddenly ePHPm-shaped
 
@@ -55,7 +55,7 @@ wire (~420× fewer bytes; numbers in PR #185). Default is
 `"off"`, which keeps the streamed path byte-for-byte identical to
 v0.5.0. See the [configuration reference](/reference/config/).
 
-## Planned — not yet implemented: the SSE hub (v0.6.0 target)
+## Planned — not yet implemented: the SSE hub (v0.7 target)
 
 The remaining constraint is structural: **one SSE connection parks one
 worker thread** for its whole lifetime, so `[php] worker_count` caps

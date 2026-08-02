@@ -932,21 +932,6 @@ pub struct ReplicationConfig {
     #[serde(default)]
     pub cdc_experimental: bool,
 
-    /// **Deprecated — parsed but not acted upon.**
-    ///
-    /// Previously the CDC replication TCP listen address for the
-    /// bespoke CDC transport. That transport was replaced by the
-    /// cluster channel v1 (see [`ClusterChannelConfig`]) — CDC now
-    /// rides the multiplexed cluster channel, whose listen address
-    /// lives at `[cluster.channel] listen`.
-    ///
-    /// Setting this field emits a startup warning; leaving it at
-    /// default is silent. It will be removed in a future release.
-    ///
-    /// [`ClusterChannelConfig`]: super::ClusterChannelConfig
-    #[serde(default = "default_cdc_listen")]
-    pub cdc_listen: String,
-
     /// Maximum snapshot-bootstrap payload a cold replica will accept
     /// from the primary, in bytes. Default: 1 GiB.
     ///
@@ -972,14 +957,9 @@ impl Default for ReplicationConfig {
             role: default_replication_role(),
             primary_grpc_url: String::new(),
             cdc_experimental: false,
-            cdc_listen: default_cdc_listen(),
             max_snapshot_bytes: default_max_snapshot_bytes(),
         }
     }
-}
-
-fn default_cdc_listen() -> String {
-    "0.0.0.0:5015".to_string()
 }
 
 fn default_max_snapshot_bytes() -> u64 {
