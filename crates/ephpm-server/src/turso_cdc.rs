@@ -236,11 +236,6 @@ const SNAPSHOT_PREALLOC_CAP: u64 = 8 * 1024 * 1024;
 /// shape staying stable under the exact litewire pin.
 const WATERMARK_TABLE: &str = "__litewire_cdc_watermark";
 
-/// Name of Turso's CDC log table. Created lazily by the engine on the
-/// first captured write, which is why [`is_missing_cdc_log`] has to treat
-/// its absence as "no changes yet" rather than as a failure.
-const CDC_LOG_TABLE: &str = "turso_cdc";
-
 /// How often the primary polls `turso_cdc` for new batches. Turso 0.7.0
 /// has no wakeup signal for CDC inserts, so we poll on a schedule.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -731,31 +726,15 @@ async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 
     let mut tailer = CdcTailer::new(mgmt, from);
     let mut idle_since = tokio::time::Instant::now();
-    let mut logged_missing_log = false;
 
     loop {
+        // A cold primary — one whose `turso_cdc` log does not exist
+        // because it has served no captured write yet — polls as
+        // `Ok(None)`, not as an error. That tolerance lives in litewire
+        // (`CdcTailer::poll_batch`), where "absent" and "empty" are the
+        // same answer and no consumer has to know the difference.
         let batch = match tailer.poll_batch().await {
             Ok(batch) => batch,
-            // `turso_cdc` is created lazily by litewire-turso, on the
-            // first captured write — not when CDC is enabled and not
-            // when a session connects. On a freshly provisioned cluster
-            // that has served no writes yet, the table is simply absent,
-            // and "absent" is indistinguishable from "empty": both mean
-            // zero changes to ship. Treating it as a hard error tore the
-            // subscriber down on every poll, and the replica redialed
-            // every REPLICA_RECONNECT_DELAY, producing an error loop
-            // that only stopped once someone happened to write.
-            Err(e) if is_missing_cdc_log(&e) => {
-                if !logged_missing_log {
-                    logged_missing_log = true;
-                    tracing::info!(
-                        "CDC: turso_cdc does not exist yet — the primary has served no captured \
-                         write since this database was created. Holding the subscriber open; \
-                         batches will flow as soon as the first write lands."
-                    );
-                }
-                None
-            }
             Err(e) => {
                 // Drop the stream rather than skip past the failure —
                 // the replica reconnects with the same watermark and we
@@ -782,21 +761,6 @@ async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             }
         }
     }
-}
-
-/// True when `e` is litewire reporting that the CDC log table does not
-/// exist yet.
-///
-/// This matches on the message text because it has to: litewire's
-/// `BackendError` carries only `Sqlite(String)`/`Other(String)`, so there
-/// is no typed variant to match on. The durable fix is a typed
-/// "relation missing" variant upstream in litewire plus a pin bump; until
-/// then, `serve_subscriber`'s cold-start test pins this behaviour so a
-/// message change upstream fails loudly here instead of silently
-/// restoring the reconnect loop.
-fn is_missing_cdc_log<E: std::fmt::Display>(e: &E) -> bool {
-    let msg = e.to_string();
-    msg.contains("no such table") && msg.contains(CDC_LOG_TABLE)
 }
 
 // ---------------------------------------------------------------------------
@@ -1786,22 +1750,13 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Cold-start: `turso_cdc` missing is "no changes yet", not an error.
+    // Cold-start: a primary whose `turso_cdc` log does not exist yet
+    // must hold its subscriber open, not tear it down.
     //
-    // These pin the exact message shape litewire produces today. If an
-    // upstream change alters it, `missing_cdc_log_matches_litewire_text`
-    // fails — which is the point: the reconnect loop it prevents is
-    // silent, so the guard must not be allowed to rot quietly.
+    // The tolerance itself lives in litewire; this asserts the behaviour
+    // ePHPm depends on, so a pin that lost the fix fails here rather
+    // than silently restoring a 2-second reconnect loop in production.
     // -----------------------------------------------------------------
-
-    #[test]
-    fn missing_cdc_log_matches_litewire_text() {
-        // Verbatim from a real run: the primary polled before any write
-        // had created the log. (litewire wraps turso's parse error in
-        // BackendError::Sqlite, whose Display prepends "SQLite error: ".)
-        let e = "SQLite error: Parse error: no such table: turso_cdc";
-        assert!(is_missing_cdc_log(&e), "should recognise the cold-start error");
-    }
 
     /// Drives the **production** `serve_subscriber` against a database
     /// that has never been written to, which is the state of every
@@ -1879,19 +1834,6 @@ mod tests {
         assert!(got_batch, "no CDC batch arrived on the subscriber opened before the first write");
 
         task.abort();
-    }
-
-    #[test]
-    fn missing_cdc_log_ignores_unrelated_failures() {
-        // A different missing table must NOT be swallowed — that would
-        // hide a genuinely broken replica behind an idle-looking stream.
-        assert!(!is_missing_cdc_log(&"SQLite error: Parse error: no such table: posts"));
-        // Nor should generic I/O or corruption errors.
-        assert!(!is_missing_cdc_log(&"SQLite error: database disk image is malformed"));
-        assert!(!is_missing_cdc_log(&"backend error: connection closed"));
-        // A message merely mentioning the table is not a missing-table
-        // error; both halves must be present.
-        assert!(!is_missing_cdc_log(&"SQLite error: turso_cdc is locked"));
     }
 
     // -----------------------------------------------------------------
