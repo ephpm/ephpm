@@ -84,9 +84,18 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire main @ 7a0b59c4 — identifier sanitization in the metadata translator
-# (litewire#12), on top of framework wire-compat (litewire#11) and the Phase 2
-# CDC tail/apply API (litewire#10) this branch builds on.
+# litewire main @ 23b8de63 — CDC cold-start tolerance (litewire#14) and unbound
+# params executed as NULL (litewire#13), on top of identifier sanitization in
+# the metadata translator (litewire#12), framework wire-compat (litewire#11) and
+# the Phase 2 CDC tail/apply API (litewire#10).
+#
+# 23b8de63 (litewire#14) makes CdcTailer::poll_batch report an absent turso_cdc
+# log as Ok(None) instead of an error. Turso creates that table lazily on the
+# first captured write, so a freshly provisioned cluster has none; before the
+# fix ephpm's CDC primary treated the poll error as fatal and dropped the
+# replica's subscription every ~2s until someone wrote. ephpm no longer carries
+# a local workaround for this — `cold_primary_holds_subscriber_open_until_first_write`
+# in turso_cdc.rs fails if a pin without the fix is ever selected.
 #
 # SECURITY: do not move this pin backwards. 699e6345 and earlier interpolate the
 # client-supplied table name straight into SQL text in
@@ -94,7 +103,7 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 # sqlparser, so a crafted identifier in SHOW CREATE TABLE / SHOW INDEX /
 # DESCRIBE becomes arbitrary SQL. 7a0b59c4 adds sanitize_identifier() and
 # applies it at every extraction site.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "7a0b59c40ce6", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "23b8de63effb", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.0)

@@ -707,7 +707,16 @@ async fn start_role(role: Role, mgmt: Arc<Turso>, channel: ephpm_cluster::Channe
 /// The cost is one `turso_cdc` poll per subscriber per
 /// [`POLL_INTERVAL`]. With the handful of replicas v1 targets that is
 /// the right trade against losing writes.
-async fn serve_subscriber(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Result<()> {
+///
+/// Generic over the stream so the loop can be driven directly in tests
+/// over a `tokio::io::duplex` pair. Production always passes a
+/// [`ChannelStream`]; before this was generic the only coverage of this
+/// function was a hand-rolled copy inside the e2e tests, which is how the
+/// cold-start reconnect loop went unnoticed.
+async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    mut stream: S,
+    mgmt: &Turso,
+) -> anyhow::Result<()> {
     let from = match read_frame(&mut stream).await.context("read subscribe frame")? {
         Frame::Subscribe { from_change_id } => from_change_id,
         other => anyhow::bail!("expected Subscribe as the first CDC frame, got {other:?}"),
@@ -719,14 +728,29 @@ async fn serve_subscriber(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Re
     let mut idle_since = tokio::time::Instant::now();
 
     loop {
-        match tailer.poll_batch().await {
-            Ok(Some(batch)) => {
+        // A cold primary — one whose `turso_cdc` log does not exist
+        // because it has served no captured write yet — polls as
+        // `Ok(None)`, not as an error. That tolerance lives in litewire
+        // (`CdcTailer::poll_batch`), where "absent" and "empty" are the
+        // same answer and no consumer has to know the difference.
+        let batch = match tailer.poll_batch().await {
+            Ok(batch) => batch,
+            Err(e) => {
+                // Drop the stream rather than skip past the failure —
+                // the replica reconnects with the same watermark and we
+                // retry from the identical cursor.
+                anyhow::bail!("CDC tail poll error: {e:#}");
+            }
+        };
+
+        match batch {
+            Some(batch) => {
                 let frame =
                     Frame::Batch { rows: batch.rows.iter().map(WireCdcRow::from).collect() };
                 write_frame(&mut stream, &frame).await?;
                 idle_since = tokio::time::Instant::now();
             }
-            Ok(None) => {
+            None => {
                 // Keep the stream warm so a replica can tell "idle
                 // primary" from "dead primary".
                 if idle_since.elapsed() >= HEARTBEAT_INTERVAL {
@@ -734,12 +758,6 @@ async fn serve_subscriber(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Re
                     idle_since = tokio::time::Instant::now();
                 }
                 tokio::time::sleep(POLL_INTERVAL).await;
-            }
-            Err(e) => {
-                // Drop the stream rather than skip past the failure —
-                // the replica reconnects with the same watermark and we
-                // retry from the identical cursor.
-                anyhow::bail!("CDC tail poll error: {e:#}");
             }
         }
     }
@@ -1729,6 +1747,93 @@ mod tests {
         AsyncWriteExt::write_all(&mut client, &over.to_be_bytes()).await.unwrap();
         let err = read_frame(&mut server).await.unwrap_err();
         assert!(err.to_string().contains("frame too large"), "unexpected error: {err}");
+    }
+
+    // -----------------------------------------------------------------
+    // Cold-start: a primary whose `turso_cdc` log does not exist yet
+    // must hold its subscriber open, not tear it down.
+    //
+    // The tolerance itself lives in litewire; this asserts the behaviour
+    // ePHPm depends on, so a pin that lost the fix fails here rather
+    // than silently restoring a 2-second reconnect loop in production.
+    // -----------------------------------------------------------------
+
+    /// Drives the **production** `serve_subscriber` against a database
+    /// that has never been written to, which is the state of every
+    /// freshly provisioned cluster.
+    ///
+    /// Before the cold-start guard, `poll_batch` returned "no such table:
+    /// turso_cdc", `serve_subscriber` bailed, and the replica redialed
+    /// every `REPLICA_RECONNECT_DELAY` (2s) forever — an error loop that
+    /// only ended when someone happened to write. Here that manifests as
+    /// the task completing almost immediately with an error.
+    ///
+    /// The assertion is two-part on purpose: staying alive is not enough,
+    /// the subscriber must still deliver the first real batch afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cold_primary_holds_subscriber_open_until_first_write() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+
+        // Mgmt factory: what the tailer reads through. Never enables
+        // CDC-on-connect, so nothing here creates turso_cdc.
+        let mgmt = Arc::new(Turso::open(&path).await.unwrap());
+
+        // Precondition: the log genuinely does not exist yet. If a future
+        // litewire creates it eagerly, this assert fires and tells us the
+        // guard is no longer load-bearing.
+        {
+            let conn = mgmt.raw_connection().unwrap();
+            let probe = conn.prepare("SELECT 1 FROM turso_cdc LIMIT 1").await;
+            assert!(probe.is_err(), "turso_cdc should not exist before any captured write");
+        }
+
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        let mgmt_for_task = Arc::clone(&mgmt);
+        let task = tokio::spawn(async move { serve_subscriber(server, &mgmt_for_task).await });
+
+        // Subscribe from the very beginning, as a cold replica does.
+        write_frame(&mut client, &Frame::Subscribe { from_change_id: 0 }).await.unwrap();
+
+        // The old behaviour ended the task here. Give it well over the
+        // poll interval to prove it does not.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !task.is_finished(),
+            "subscriber died on a cold database — the reconnect loop has regressed"
+        );
+
+        // Now write through a CDC-capturing session; turso_cdc springs
+        // into existence and the batch must reach the still-open stream.
+        // `connect` comes from the Backend trait, scoped here so it does
+        // not leak into the rest of the test module.
+        use litewire::backend::Backend;
+        let wire = Turso::builder(&path).enable_cdc_on_connect(true).build().await.unwrap();
+        let session = wire.connect().await.unwrap();
+        session.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).await.unwrap();
+        session.execute("INSERT INTO t VALUES (1, 'hello')", &[]).await.unwrap();
+
+        // Read frames until a non-empty Batch arrives (heartbeat Pings
+        // may interleave). The whole point is that this stream — the one
+        // opened before the table existed — is the one that delivers.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut got_batch = false;
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(2), read_frame(&mut client)).await {
+                Ok(Ok(Frame::Batch { rows })) if !rows.is_empty() => {
+                    got_batch = true;
+                    break;
+                }
+                Ok(Err(e)) => panic!("stream broke after the first write: {e}"),
+                // A heartbeat Ping or an empty Batch (Ok(Ok(_))), and a
+                // read that simply timed out (Err(_)): both mean "nothing
+                // yet, keep waiting until the deadline".
+                Ok(Ok(_)) | Err(_) => {}
+            }
+        }
+        assert!(got_batch, "no CDC batch arrived on the subscriber opened before the first write");
+
+        task.abort();
     }
 
     // -----------------------------------------------------------------
