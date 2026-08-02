@@ -1526,9 +1526,23 @@ async fn start_single_node_sqlite(
             handles,
         );
     } else {
-        let backend = litewire::backend::Rusqlite::open(db_path)
+        // Handle reuse is opt-in in litewire (it changes cross-session state
+        // semantics for a general-purpose library); ePHPm opts in here
+        // deliberately because PHP's connect-per-request pattern is exactly
+        // the profile it serves — without it every request pays a fresh
+        // sqlite3_open plus WAL-index attach (~280 µs measured) and starts
+        // with a cold prepared-statement cache. Idle cap 16: sessions track
+        // in-flight PHP requests, which the worker pool already bounds far
+        // below this on typical quotas.
+        let backend = litewire::backend::Rusqlite::builder(db_path)
+            .handle_reuse(16)
+            .build()
             .with_context(|| format!("failed to open SQLite database: {db_path}"))?;
-        tracing::info!(path = %db_path, "opened embedded SQLite database (single-node)");
+        tracing::info!(
+            path = %db_path,
+            handle_reuse = true,
+            "opened embedded SQLite database (single-node)"
+        );
         spawn_single_node_litewire(
             sqlite_config,
             tracked_backend::TrackedBackend::new(backend, query_stats.clone()),
@@ -1564,6 +1578,14 @@ fn spawn_single_node_litewire(
     if let Some(ref tds_addr) = sqlite_config.proxy.tds_listen {
         builder = builder.tds(tds_addr);
         tracing::info!(listen = %tds_addr, "SQLite TDS wire protocol enabled");
+    }
+
+    if sqlite_config.proxy.max_connections > 0 {
+        builder = builder.max_connections(sqlite_config.proxy.max_connections);
+        tracing::info!(
+            max_connections = sqlite_config.proxy.max_connections,
+            "SQLite wire frontends: connection cap enabled"
+        );
     }
 
     handles.push(tokio::spawn(async move {
@@ -1692,6 +1714,14 @@ async fn start_clustered_sqlite(
     if let Some(ref tds_addr) = sqlite_config.proxy.tds_listen {
         builder = builder.tds(tds_addr);
         tracing::info!(listen = %tds_addr, "SQLite TDS wire protocol enabled (clustered)");
+    }
+
+    if sqlite_config.proxy.max_connections > 0 {
+        builder = builder.max_connections(sqlite_config.proxy.max_connections);
+        tracing::info!(
+            max_connections = sqlite_config.proxy.max_connections,
+            "SQLite wire frontends: connection cap enabled (clustered)"
+        );
     }
 
     // Spawn litewire serve task. sqld is kept alive via the Arc.

@@ -84,8 +84,13 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire main @ 23b8de63 — CDC cold-start tolerance (litewire#14) and unbound
-# params executed as NULL (litewire#13), on top of identifier sanitization in
+# litewire main @ d1c0b341 — SQLite backend performance (litewire#15): a
+# per-session worker thread replaces per-statement spawn_blocking, an opt-in
+# handle-reuse pool (`RusqliteBuilder::handle_reuse`, enabled by ephpm's
+# single-node path — see spawn_single_node_litewire), and a `max_connections`
+# accept-time cap on the wire frontends (wired to [db.sqlite.proxy]
+# max_connections). On top of CDC cold-start tolerance (litewire#14) and unbound
+# params executed as NULL (litewire#13), identifier sanitization in
 # the metadata translator (litewire#12), framework wire-compat (litewire#11) and
 # the Phase 2 CDC tail/apply API (litewire#10).
 #
@@ -103,7 +108,7 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 # sqlparser, so a crafted identifier in SHOW CREATE TABLE / SHOW INDEX /
 # DESCRIBE becomes arbitrary SQL. 7a0b59c4 adds sanitize_identifier() and
 # applies it at every extraction site.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "23b8de63effb", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "d1c0b3413061", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.0)

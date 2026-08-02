@@ -859,6 +859,21 @@ pub struct SqliteProxyConfig {
     /// Default: disabled.
     #[serde(default)]
     pub tds_listen: Option<String>,
+
+    /// Maximum concurrent wire connections across the `MySQL`, `PostgreSQL`
+    /// and `TDS` frontends combined. `0` means unlimited.
+    ///
+    /// Connections beyond the cap are refused at accept time (`MySQL`
+    /// clients receive error 1040 "Too many connections"; other protocols
+    /// get a clean close) — never queued. Each accepted wire session holds
+    /// one OS thread in litewire's session-worker model, so this cap also
+    /// bounds those threads. The Hrana HTTP frontend is stateless and is
+    /// not counted.
+    ///
+    /// Default: `0` (unlimited), matching `[db.mysql] max_connections` and
+    /// `[server.limits] max_connections`.
+    #[serde(default)]
+    pub max_connections: usize,
 }
 
 impl Default for SqliteProxyConfig {
@@ -868,6 +883,7 @@ impl Default for SqliteProxyConfig {
             hrana_listen: None,
             postgres_listen: None,
             tds_listen: None,
+            max_connections: 0,
         }
     }
 }
@@ -3881,11 +3897,41 @@ path = "app.db"
         assert_eq!(sqlite.path, "app.db");
         assert_eq!(sqlite.proxy.mysql_listen, "127.0.0.1:3306");
         assert!(sqlite.proxy.hrana_listen.is_none());
+        assert_eq!(
+            sqlite.proxy.max_connections, 0,
+            "max_connections must default to 0 (unlimited) when [db.sqlite.proxy] is absent — \
+             a surprise cap would refuse connections on upgrade"
+        );
         assert_eq!(sqlite.sqld.http_listen, "127.0.0.1:8081");
         assert_eq!(sqlite.sqld.grpc_listen, "0.0.0.0:5001");
         assert_eq!(sqlite.replication.role, "auto");
         assert!(sqlite.replication.primary_grpc_url.is_empty());
         assert_eq!(sqlite.engine, "sqlite", "engine must default to the genuine SQLite C engine");
+    }
+
+    #[test]
+    fn test_sqlite_proxy_max_connections_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[db.sqlite]
+path = "app.db"
+
+[db.sqlite.proxy]
+max_connections = 64
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let sqlite = config.db.sqlite.expect("sqlite should be present");
+        assert_eq!(sqlite.proxy.max_connections, 64);
+        // Setting max_connections alone must not disturb sibling defaults
+        // (the section is now present, so serde section-level defaults no
+        // longer apply — each field default must hold on its own).
+        assert_eq!(sqlite.proxy.mysql_listen, "127.0.0.1:3306");
     }
 
     #[test]
