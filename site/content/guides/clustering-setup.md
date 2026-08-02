@@ -7,7 +7,7 @@ ePHPm clusters via SWIM gossip ([chitchat](https://github.com/quickwit-oss/chitc
 
 ## Minimum viable cluster
 
-Three nodes, all reachable from each other on UDP 7946 (gossip) and TCP 7947 (KV data plane):
+Three nodes, all reachable from each other on UDP 7946 (gossip) and TCP 7947 (KV data plane). (With experimental CDC replication — `cdc_experimental = true` — also open TCP 7948, the [cluster channel](/architecture/clustering/#cluster-channel-tcp-opt-in).)
 
 ```toml
 # Same on every node — only `node_id` should differ (or be left empty for auto)

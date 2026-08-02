@@ -966,7 +966,7 @@ This is the hardest crate and the core of the project.
 | **v0.3: TLS** | Automatic HTTPS via `rustls-acme`, Let's Encrypt | Planned |
 | **v0.4: DB Proxy** | **Implemented (partial)**: MySQL transparent proxy, connection pooling, reset strategy; **Missing**: read/write splitting, replication, slow query analysis | Ahead of schedule |
 | **v0.5: KV Store** | **Implemented**: Single-node RESP2 server, strings + hashes, TTL/expiry, eviction policies (`noeviction`/`allkeys-lru`/`volatile-lru`/`allkeys-random`) with memory-limit enforcement, compression, SAPI bridge for direct PHP access, clustering; **Missing**: lists/sets/sorted sets, persistence | Shipped |
-| **v0.6: Admin UI** | Embedded web dashboard, request inspector | Planned |
+| **Future: Admin UI** | Embedded web dashboard, request inspector | Planned |
 | **v0.7: Observability** | Prometheus `/metrics` + query stats **implemented**; OTLP receiver and auto-instrumentation still planned | Partially shipped |
 | **v0.8: Clustering** | Gossip discovery (chitchat), hash-based key ownership, gossip KV replication for small values, SQLite primary election | **Implemented** |
 | **3.0: Worker mode** | Persistent worker mode (`[php] mode = "worker"`), streaming request/response bodies, Laravel Octane + WordPress adapters | **Implemented** |

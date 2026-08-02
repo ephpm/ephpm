@@ -139,7 +139,7 @@ Without `SQLD_BINARY_PATH` (dev builds), `ephpm-sqld` compiles in stub mode — 
 
 ## CI Pipeline
 
-Runs on push/PR to main: fmt check → clippy → test → cargo-deny. Release builds triggered by `v*` tags across PHP 8.4/8.5 × Linux/macOS matrix.
+Runs on push/PR to main: fmt check → clippy → test → cargo-deny. Release builds triggered by `v*` tags across PHP 8.3/8.4/8.5 × linux-x64/linux-arm64/macos/windows, plus the Docker image; `Create Release` publishes only after all build legs succeed.
 
 ## Truthfulness: Docs Must Match Code
 

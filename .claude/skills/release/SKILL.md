@@ -24,7 +24,7 @@ The `v*` push triggers `.github/workflows/release.yml`. `EPHPM_RELEASE_VERSION` 
 
 - Binaries: `ephpm-vX.Y.Z+php<FULL>-<os>-<arch>.tar.gz` for linux-x86_64, linux-aarch64, macos-aarch64, windows-x86_64 x PHP pins (see `matrix.php` in release.yml; keep in sync with `xtask::PHP_SDK_VERSIONS`). Plus `SHA256SUMS`.
 - Docker: `ephpm/ephpm:vX.Y.Z-php<FULL>`, `:vX.Y.Z-php<MINOR>`, `:<MINOR>`, `:vX.Y.Z`, `:latest` (rolling tags skip pre-releases; a `-` in the tag = prerelease, marked so on GitHub).
-- `Create Release` publishes ONLY after build-linux + build-macos + build-windows + docker-image all succeed.
+- `Create Release` publishes ONLY after build-linux + build-linux-arm64 + build-macos + build-windows + docker-image all succeed. (arm64 is the leg that historically parks a release — OOM on the self-hosted runner — so when publish never fires, check it first.)
 
 ## 4. Monitor and rescue
 
