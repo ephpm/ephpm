@@ -134,7 +134,13 @@ async fn start_channel(node_id: &str) -> (Arc<ephpm_cluster::ClusterHandle>, Cha
     };
     let cluster = Arc::new(start_gossip(&cluster_cfg).await.expect("gossip start"));
     let channel = maybe_start_cluster_channel(
-        &ClusterChannelConfig::default(),
+        // Bind an OS-assigned port. The default (gossip port + 2) is a
+        // derived TCP port that pick_free_port() never validated -- it
+        // checks a UDP port, and even that with a close-then-rebind race.
+        // Under parallel nextest workers that collided in CI
+        // ("Address already in use"). Port 0 cannot collide, and
+        // ChannelHandle::listen_addr() reports the post-bind address.
+        &ClusterChannelConfig { listen: Some("127.0.0.1:0".to_string()), secret: None },
         &cluster_cfg.secret,
         &cluster,
         ChannelFeatureFlags { cdc: true },
