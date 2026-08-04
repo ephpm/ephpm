@@ -221,12 +221,17 @@ a lane that failed it was discarded rather than reported.
   litewire's backend-level A/B showed reuse saving ~400 µs per
   connect+10-query cycle, and the release build verifiably enables it —
   yet the end-to-end SQLite read p50 kept the same ~440 µs gap to Turso
-  in both measurements. The working hypothesis is that handles are being
-  discarded rather than returned on the wire frontend's disconnect path
-  (the pool's designed-safe failure mode, equal to prior behavior);
-  confirming needs the pool's hit/discard counters surfaced in ePHPm.
-  Tracked as a post-v0.6.0 follow-up — the backend-layer saving is real
-  and measured, its delivery through the wire path is not yet.
+  in both measurements. The working hypothesis was that handles were being
+  discarded rather than returned on the wire frontend's disconnect path.
+
+  **Answered in v0.6.1, and the hypothesis was wrong.** The v0.6.1 proxy
+  matrix below puts a *pooled* connection in front of litewire, which
+  holds one warm session across many PHP requests — the first
+  configuration in which handle reuse has anything to reuse. The gap did
+  not close: SQLite p50 3.97 ms vs Turso 3.32 ms through an identical
+  pooled path, a **650 µs gap, wider than the 440 µs baseline**. The
+  engine difference is genuinely engine-side, not an artifact of
+  per-request connect cost, so removing that cost does not recover it.
 
 ## v0.6.1 — the clustered-sqld write collapse, fixed
 
@@ -328,6 +333,120 @@ for this architecture, and no admission tuning moves it —
   absolute RPS does not transfer to a real cluster. The **deltas** —
   "0 completed → ~598" and "8 is as bad as off" — are the durable claim.
 
+
+## v0.6.1 — the database proxy: two pool defects, and what the hop costs
+
+ePHPm can put its own connection-pooling proxy (`[db.mysql]` /
+`[db.postgres]`) between PHP and the database. That inserts an extra wire
+hop in order to reuse authenticated backend sessions across PHP requests
+— a trade worth measuring in both directions, because a PHP request
+without persistent connections otherwise pays a fresh connect and
+handshake every single time.
+
+Measuring it first required fixing it. Two defects, one hiding the other,
+both fixed in [ephpm#221](https://github.com/ephpm/ephpm/pull/221).
+
+**Provenance:** ePHPm `bdc9861` (main, post-#221/#222/#224), litewire
+`62636c4c`, PHP 8.5.7 ZTS. One host, podman; ePHPm containers `--cpus 1`,
+`mysql:8` and `postgres:16` upstreams `--cpus 4`; `oha`, 8 s warmup,
+2 × 15 s reps; every cell below verified 100% HTTP 200.
+
+### The bugs were invisible in throughput
+
+`COM_QUIT` was forwarded to the *pooled* backend, which closed; the dead
+socket was parked as healthy; the resulting `BrokenPipe` was mapped to
+`Ok(..)`, so the corpse was re-parked. v0.6.0 served roughly
+`min_connections` requests and then returned
+`[2006] MySQL server has gone away` to everything after — permanently, at
+ordinary request rates, while looking fine under sustained load.
+
+Fixing that uncovered a second defect it had been masking: `Pool::recycle`
+parked the semaphore permit *inside* the idle slot, while `acquire` takes
+a permit *before* consulting the idle queue. Returning a connection
+therefore **consumed** a permit instead of releasing one. Once
+`in-use + idle` reached `max_connections`, nothing on the healthy path
+could free one again — a pool full of good connections it could not hand
+out. Defect one had hidden it by killing a connection per request, whose
+constant discards released permits continuously.
+
+Neither showed up as an error rate. The pooled lanes measured **876 RPS
+in which every response was an HTTP 500**, and `oha` reports those cells
+as `Success rate: 100.00%` because it counts transport success, not HTTP
+status. Read as throughput they said pooling was 2.9× faster than no
+proxy at all.
+
+### The hop costs 1.3–2.2 ms per request
+
+Both rows of each pair dial a fresh backend per request, so the proxy is
+the only difference between them.
+
+| `db.php` (10 sequential SELECTs), c=1 | RPS | p50 | Hop cost |
+|---|---|---|---|
+| litewire, no proxy | 323 / 323 | 3.05 ms | — |
+| litewire via proxy, no reuse | 218 / 217 | 4.53 ms | −33%, +1.48 ms |
+| `mysql:8`, no proxy | 355 / 356 | 2.75 ms | — |
+| `mysql:8` via proxy, no reuse | 241 / 241 | 4.09 ms | −32%, +1.34 ms |
+| `postgres:16`, no proxy | 104 / 104 | 9.39 ms | — |
+| `postgres:16` via proxy, no reuse | 85 / 85 | 11.62 ms | −19%, +2.23 ms |
+
+### What pooling buys, and when it pays for the hop
+
+Same build, same host, reuse the only variable:
+
+| `db.php` | c=1 no-reuse → pooled | c=16 no-reuse → pooled |
+|---|---|---|
+| litewire | 218 → 249 (**+14%**) | 374 → 705 (**+89%**) |
+| `mysql:8` | 241 → 287 (**+19%**) | 510 → 617 (**+21%**) |
+| `postgres:16` | 85 → 125 (**+47%**) | 166 → 211 (**+27%**) |
+
+Against connecting *directly*, the answer depends on concurrency and on
+the wire protocol:
+
+| vs. direct | c=1 | c=16 |
+|---|---|---|
+| litewire | 323 → 249 (**−23%**) | 490 → 705 (**+44%**) |
+| `mysql:8` | 355 → 287 (**−19%**) | 454 → 617 (**+36%**) |
+| `postgres:16` | 104 → 125 (**+20%**) | 97 → 211 (**+117%**) |
+
+On the MySQL wire the proxy is a **net loss at c=1 and a net win at
+c=16** — its value is concurrency headroom and connection multiplexing,
+not single-request latency. PostgreSQL wins at both, for a different
+reason: `pdo_pgsql` pays a full SCRAM-SHA-256 handshake on every request,
+and the proxy answers its client with `AuthenticationOk` and never makes
+PHP do that work. The direct PG path does not scale at all (104 → 97 RPS
+from c=1 to c=16); the pooled path more than doubles.
+
+### The PostgreSQL pool-exhaustion cliff is gone
+
+v0.6.0 at the shipped default `[db.postgres] max_connections = 20`
+collapsed past ~24 concurrent requests — 192 → 7 RPS with 41 of 74
+responses 500, p50 pinned to exactly `pool_timeout`. That was the permit
+deadlock, not session pinning. On v0.6.1, swept at the same default:
+
+| concurrency | 16 | 20 | 24 | 32 |
+|---|---|---|---|---|
+| `db.php` RPS | 210 | 209 | 208 | 208 |
+| non-2xx | none | none | none | none |
+
+Flat and clean through 32 concurrent requests against a cap of 20 —
+queueing, as intended, rather than failing.
+
+### Still true in v0.6.1
+
+- **`[db.mysql]` cannot be chained in front of the in-process
+  `[db.sqlite]` litewire.** `start_db_proxies()` awaits the proxy's
+  backend connect inline and the litewire branch runs after it, so the
+  proxy spends its whole 10-attempt (~40 s, not configurable) backoff
+  dialling a listener that cannot exist yet, then gives up. The failure
+  is non-fatal and nearly silent: one `ERROR` line, then the server
+  serves HTTP normally with nothing bound to the proxy's port and every
+  database page returning `[2002] Connection refused`. Liveness and
+  readiness both look healthy.
+- **Reported numbers come with `[db.analysis] query_stats = false`.**
+  v0.6.1 records query stats from the proxies
+  ([ephpm#224](https://github.com/ephpm/ephpm/pull/224)); leaving it on
+  taxes the wire path specifically, which is exactly what `db.php`
+  measures. The cost of leaving it on is not characterised here.
 ## How to read these
 
 - **Absolute numbers are environment-specific.** The db.php p50 was
