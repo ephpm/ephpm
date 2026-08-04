@@ -3,7 +3,9 @@ title = "Query Stats with Prometheus"
 weight = 7
 +++
 
-ePHPm tracks every SQL query that flows through it — to a real MySQL/Postgres backend or to embedded SQLite — and exposes per-digest timing, throughput, and error-rate as Prometheus metrics. No APM agent, no database plugin.
+ePHPm tracks the SQL that flows through it — to a real MySQL/Postgres backend or to embedded SQLite — and exposes per-digest timing, throughput, and error-rate as Prometheus metrics. No APM agent, no database plugin.
+
+Coverage is complete on the embedded-SQLite paths. On the MySQL/Postgres proxy it is limited to the statements the proxy actually parses, and the durations are wire round trips rather than in-process execution time; the [`[db.analysis]` coverage table](/reference/config/#dbanalysis) spells out exactly what each path records.
 
 ## Turn it on
 

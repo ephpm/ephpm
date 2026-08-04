@@ -1310,6 +1310,7 @@ dependencies = [
  "base64ct",
  "bytes",
  "ephpm-config",
+ "ephpm-query-stats",
  "hmac 0.12.1",
  "md5 0.8.0",
  "mysql_async",

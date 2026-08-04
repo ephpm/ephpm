@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64ct::Encoding;
+use ephpm_query_stats::QueryStats;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -35,6 +36,7 @@ use tracing::{debug, info, warn};
 use crate::ResetStrategy;
 use crate::error::DbError;
 use crate::pool::{Checkout, Pool, PoolConfig};
+use crate::stats::ResponseOutcome;
 use crate::url::DbUrl;
 
 // ── PG message tags ──────────────────────────────────────────────────────────
@@ -53,6 +55,8 @@ const MSG_BACKEND_KEY_DATA: u8 = b'K';
 const MSG_READY_FOR_QUERY: u8 = b'Z';
 /// `ErrorResponse` — backend error.
 const MSG_ERROR_RESPONSE: u8 = b'E';
+/// `DataRow` — one row of a result set. Counted for query stats.
+const MSG_DATA_ROW: u8 = b'D';
 /// `Query` — frontend simple query.
 const MSG_QUERY: u8 = b'Q';
 /// `Terminate` — frontend connection close.
@@ -120,6 +124,10 @@ pub struct PgProxy {
     listen: String,
     reset_strategy: ResetStrategy,
     rw_split: PgRwSplitParams,
+    /// Shared per-process query stats. Recording is gated on
+    /// [`QueryStats::is_enabled`] so `[db.analysis] query_stats = false`
+    /// leaves the forwarding paths byte-for-byte as they were.
+    stats: QueryStats,
 }
 
 impl PgProxy {
@@ -136,6 +144,7 @@ impl PgProxy {
         reset_strategy: ResetStrategy,
         replica_urls: Vec<String>,
         rw_split: PgRwSplitParams,
+        stats: QueryStats,
     ) -> Result<Self, DbError> {
         let db_url = Arc::new(DbUrl::parse(url)?);
 
@@ -219,7 +228,16 @@ impl PgProxy {
             listen: listen.to_string(),
             reset_strategy,
             rw_split,
+            stats,
         })
+    }
+
+    /// The stats handle, or `None` when recording is switched off.
+    ///
+    /// Mirrors `MySqlProxy::stats`: a disabled collector means the routing
+    /// loop never reads the clock or copies SQL out of the wire buffer.
+    fn stats(&self) -> Option<&QueryStats> {
+        self.stats.is_enabled().then_some(&self.stats)
     }
 
     /// Start the background pool maintenance task.
@@ -291,10 +309,14 @@ impl PgProxy {
                 &self.replica_rr,
                 &self.rw_split,
                 self.reset_strategy,
+                self.stats(),
             )
             .await
         } else {
-            // Fast path: simple bidirectional copy.
+            // Fast path: simple bidirectional copy. No message framing in
+            // either direction, so no statement is ever visible here and
+            // query stats record nothing — see `stats.rs`. Only reachable
+            // with `reset_strategy = "never"`/`"always"` and no replicas.
             let mut checkout = self.pool.acquire().await?;
             let backend = checkout.take_stream();
 
@@ -1109,6 +1131,22 @@ fn pg_select_pool<'a>(
 /// In both cases the session is pinned to one backend connection and spliced
 /// straight through for the rest of its lifetime — see
 /// [`pg_relay_pinned_session`].
+///
+/// # Query stats
+///
+/// Simple `Query` messages are recorded: the clock runs from just before the
+/// message is written to the backend until the terminating `ReadyForQuery`
+/// is forwarded, `ErrorResponse` anywhere in that stream marks the statement
+/// failed, and `DataRow` messages are counted. Statements that reach the
+/// pinned-splice paths above are *not* recorded, because after the switch
+/// the proxy no longer reads message boundaries — see [`crate::stats`].
+///
+/// The row count is rows *returned*. Rows *affected* by a mutation live in
+/// the `CommandComplete` payload (`"UPDATE 3"`), which
+/// [`forward_pg_message`] streams through without buffering, so a mutation
+/// records zero rows rather than a guessed number. This is the one place
+/// the proxy's numbers are narrower than `TrackedBackend`'s, which gets
+/// `affected_rows` directly from litewire.
 async fn pg_proxy_routing_loop(
     mut client: TcpStream,
     pool: &Pool,
@@ -1116,6 +1154,7 @@ async fn pg_proxy_routing_loop(
     replica_rr: &AtomicUsize,
     rw_split: &PgRwSplitParams,
     reset_strategy: ResetStrategy,
+    recorder: Option<&QueryStats>,
 ) -> Result<(), DbError> {
     let mut state = PgClientState::default();
 
@@ -1151,11 +1190,12 @@ async fn pg_proxy_routing_loop(
             return pg_relay_pinned_session(client, backend, checkout, reset_strategy).await;
         }
 
-        // Query payload is null-terminated SQL.
-        let query_kind = {
-            let sql = String::from_utf8_lossy(&payload);
-            classify_pg_query(sql.trim_end_matches('\0'))
-        };
+        // Query payload is null-terminated SQL. Borrowed, not copied: the
+        // payload outlives the recording call at the bottom of this
+        // iteration, so instrumentation costs no allocation.
+        let sql_cow = String::from_utf8_lossy(&payload);
+        let sql = sql_cow.trim_end_matches('\0');
+        let query_kind = classify_pg_query(sql);
 
         // Update state tracking.
         match query_kind {
@@ -1174,10 +1214,13 @@ async fn pg_proxy_routing_loop(
         let mut checkout = target_pool.acquire().await?;
         let mut backend = checkout.take_stream();
 
+        let started = recorder.map(|_| std::time::Instant::now());
+
         // Any failure below leaves the backend mid-message or mid-result-set.
         // Discard it explicitly rather than letting control flow reach a
         // `return_to_pool`.
         let mut copy_mode = false;
+        let mut outcome = ResponseOutcome::ok_unknown_rows();
         let relay: Result<(), DbError> = async {
             write_pg_message(&mut backend, tag, &payload).await?;
 
@@ -1186,6 +1229,11 @@ async fn pg_proxy_routing_loop(
             // sub-protocol, in which case no further backend output is coming.
             loop {
                 let resp_tag = forward_pg_message(&mut backend, &mut client).await?;
+                match resp_tag {
+                    MSG_DATA_ROW => outcome.rows += 1,
+                    MSG_ERROR_RESPONSE => outcome.ok = false,
+                    _ => {}
+                }
                 if resp_tag == MSG_READY_FOR_QUERY {
                     return Ok(());
                 }
@@ -1203,7 +1251,14 @@ async fn pg_proxy_routing_loop(
         }
 
         if copy_mode {
+            // The statement is still in flight — its outcome belongs to the
+            // copy stream we are about to splice, so recording it now would
+            // publish a truncated duration. Left out deliberately.
             return pg_relay_pinned_session(client, backend, checkout, reset_strategy).await;
+        }
+
+        if let (Some(collector), Some(started)) = (recorder, started) {
+            collector.record(sql, started.elapsed(), outcome.ok, outcome.rows);
         }
 
         // Return backend to pool.
@@ -1267,6 +1322,10 @@ async fn pg_relay_pinned_session(
 
 /// Build a [`PgProxy`] from configuration parameters.
 ///
+/// `stats` is the process-wide collector shared with the litewire paths;
+/// pass one built with `enabled: false` (i.e. `[db.analysis] query_stats =
+/// false`) to leave the forwarding paths uninstrumented.
+///
 /// # Errors
 ///
 /// Propagates any error from [`PgProxy::new`] (backend connection or
@@ -1278,8 +1337,9 @@ pub async fn build_proxy(
     reset_strategy: ResetStrategy,
     replica_urls: Vec<String>,
     rw_split: PgRwSplitParams,
+    stats: QueryStats,
 ) -> Result<PgProxy, DbError> {
-    PgProxy::new(url, listen, pool_config, reset_strategy, replica_urls, rw_split).await
+    PgProxy::new(url, listen, pool_config, reset_strategy, replica_urls, rw_split, stats).await
 }
 
 #[cfg(test)]
@@ -1604,8 +1664,16 @@ mod tests {
         let proxy_task = tokio::spawn(async move {
             let pool = pool_dialing(backend_addr);
             let rr = AtomicUsize::new(0);
-            pg_proxy_routing_loop(proxy_side, &pool, &[], &rr, &rw_split, ResetStrategy::Smart)
-                .await
+            pg_proxy_routing_loop(
+                proxy_side,
+                &pool,
+                &[],
+                &rr,
+                &rw_split,
+                ResetStrategy::Smart,
+                None,
+            )
+            .await
         });
 
         // Parse / Bind / Describe / Execute / Sync — what PDO_pgsql sends for
@@ -1634,6 +1702,125 @@ mod tests {
         drop(client);
         proxy_task.abort();
         backend_task.abort();
+    }
+
+    // ── query stats ─────────────────────────────────────────────────
+
+    /// Fake PG backend that answers one simple `Query` with `row_count`
+    /// data rows, optionally followed by an `ErrorResponse`.
+    fn spawn_query_backend(
+        listener: tokio::net::TcpListener,
+        row_count: usize,
+        fail: bool,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            while let Ok((tag, _payload)) = read_pg_message(&mut sock).await {
+                if tag != MSG_QUERY {
+                    continue;
+                }
+                write_pg_message(&mut sock, b'T', b"\0\0").await.unwrap();
+                for _ in 0..row_count {
+                    write_pg_message(&mut sock, MSG_DATA_ROW, b"\0\0").await.unwrap();
+                }
+                if fail {
+                    let mut err = Vec::new();
+                    err.push(b'M');
+                    err.extend_from_slice(b"boom\0");
+                    err.push(0);
+                    write_pg_message(&mut sock, MSG_ERROR_RESPONSE, &err).await.unwrap();
+                } else {
+                    write_pg_message(&mut sock, b'C', b"SELECT 2\0").await.unwrap();
+                }
+                send_ready_for_query(&mut sock, b'I').await.unwrap();
+            }
+        })
+    }
+
+    /// Drive one simple `Query` through the routing loop against a fake
+    /// backend and return once `ReadyForQuery` has reached the client.
+    async fn drive_pg_query(stats: Option<QueryStats>, row_count: usize, fail: bool) {
+        let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend_listener.local_addr().unwrap();
+        let backend_task = spawn_query_backend(backend_listener, row_count, fail);
+
+        let (mut client, proxy_side) = make_tcp_pair().await;
+        let rw_split =
+            PgRwSplitParams { enabled: false, sticky_duration: std::time::Duration::from_secs(1) };
+        let proxy_task = tokio::spawn(async move {
+            let pool = pool_dialing(backend_addr);
+            let rr = AtomicUsize::new(0);
+            pg_proxy_routing_loop(
+                proxy_side,
+                &pool,
+                &[],
+                &rr,
+                &rw_split,
+                // `Never` keeps the fake backend out of the DISCARD ALL path.
+                ResetStrategy::Never,
+                stats.as_ref(),
+            )
+            .await
+        });
+
+        write_pg_message(&mut client, MSG_QUERY, b"SELECT * FROM users WHERE id = 1\0")
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let (tag, _) = read_pg_message(&mut client).await.unwrap();
+                if tag == MSG_READY_FOR_QUERY {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the query must complete");
+
+        drop(client);
+        proxy_task.abort();
+        backend_task.abort();
+    }
+
+    #[tokio::test]
+    async fn pg_routing_loop_records_simple_queries() {
+        let stats = QueryStats::new(ephpm_query_stats::StatsConfig::default());
+        drive_pg_query(Some(stats.clone()), 2, false).await;
+
+        assert_eq!(stats.digest_count(), 1);
+        let top = stats.top_queries(1);
+        assert_eq!(top[0].count, 1);
+        assert_eq!(top[0].error_count, 0);
+        assert_eq!(top[0].total_rows, 2, "DataRow messages are counted, not estimated");
+        assert!(top[0].digest_text.contains('?'), "literals must be normalized away");
+        assert!(top[0].total_time > std::time::Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn pg_routing_loop_records_errors() {
+        let stats = QueryStats::new(ephpm_query_stats::StatsConfig::default());
+        drive_pg_query(Some(stats.clone()), 1, true).await;
+
+        let top = stats.top_queries(1);
+        assert_eq!(top[0].count, 1);
+        assert_eq!(top[0].error_count, 1, "ErrorResponse in the stream marks the statement failed");
+        assert_eq!(top[0].total_rows, 1, "rows already forwarded before the error are real");
+    }
+
+    /// Negative control for `[db.analysis] query_stats = false`.
+    #[tokio::test]
+    async fn pg_routing_loop_records_nothing_when_stats_are_off() {
+        // No collector at all — what `PgProxy::stats()` yields when off.
+        drive_pg_query(None, 2, false).await;
+
+        // A present-but-disabled collector must also stay empty.
+        let disabled = QueryStats::new(ephpm_query_stats::StatsConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        drive_pg_query(Some(disabled.clone()), 2, false).await;
+        assert_eq!(disabled.digest_count(), 0);
     }
 
     // ── Test helpers ─────────────────────────────────────────────────

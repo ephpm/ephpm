@@ -1323,6 +1323,9 @@ async fn start_db_proxies(
             reset_strategy,
             replica_urls,
             rw_split,
+            // Same collector the litewire paths hand to `TrackedBackend`, so
+            // proxied and embedded queries land on one metrics surface.
+            query_stats.clone(),
         )
         .await
         {
@@ -1383,6 +1386,7 @@ async fn start_db_proxies(
             reset_strategy,
             replica_urls,
             rw_split,
+            query_stats.clone(),
         )
         .await
         {

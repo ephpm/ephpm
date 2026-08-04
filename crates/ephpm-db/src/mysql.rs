@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use ephpm_query_stats::QueryStats;
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -44,6 +45,7 @@ use tracing::{debug, info, warn};
 use crate::ResetStrategy;
 use crate::error::DbError;
 use crate::pool::{Checkout, Pool, PoolConfig};
+use crate::stats::{PendingStatement, ResponseOutcome, SpliceWatch};
 use crate::url::DbUrl;
 
 // ── Capability flags ──────────────────────────────────────────────────────────
@@ -81,6 +83,17 @@ enum PoolTarget {
     Primary,
     /// Index into the replica pool slice, assigned by round-robin.
     Replica(usize),
+}
+
+/// Per-connection record of a statement the client prepared.
+#[derive(Clone, Debug)]
+struct PreparedStmt {
+    /// Pool the statement was compiled on; execute/close must follow it.
+    target: PoolTarget,
+    /// SQL text seen in `COM_STMT_PREPARE`, retained only when query stats
+    /// are enabled so `COM_STMT_EXECUTE` can be attributed to a digest.
+    /// `None` means "not tracking" — never "unknown statement".
+    sql: Option<String>,
 }
 
 // ── Read-write split & sticky routing ─────────────────────────────────────────
@@ -124,6 +137,10 @@ pub struct MySqlProxy {
     _socket: Option<std::path::PathBuf>,
     reset_strategy: ResetStrategy,
     rw_split: RwSplitParams,
+    /// Shared per-process query stats. Recording is gated on
+    /// [`QueryStats::is_enabled`] so `[db.analysis] query_stats = false`
+    /// leaves the forwarding paths byte-for-byte as they were.
+    stats: QueryStats,
 }
 
 impl MySqlProxy {
@@ -141,6 +158,7 @@ impl MySqlProxy {
         reset_strategy: ResetStrategy,
         replica_urls: Vec<String>,
         rw_split: RwSplitParams,
+        stats: QueryStats,
     ) -> Result<Self, DbError> {
         let db_url = Arc::new(DbUrl::parse(url)?);
 
@@ -228,7 +246,17 @@ impl MySqlProxy {
             _socket: socket,
             reset_strategy,
             rw_split,
+            stats,
         })
+    }
+
+    /// The stats handle, or `None` when recording is switched off.
+    ///
+    /// Every tap point takes this shape so that a disabled collector skips
+    /// clock reads and SQL copies entirely rather than relying on
+    /// `QueryStats::record` to discard them.
+    fn stats(&self) -> Option<&QueryStats> {
+        self.stats.is_enabled().then_some(&self.stats)
     }
 
     /// Start the background pool maintenance task.
@@ -302,6 +330,7 @@ impl MySqlProxy {
                 &self.replica_rr,
                 &self.rw_split,
                 self.reset_strategy,
+                self.stats(),
             )
             .await;
         }
@@ -313,7 +342,10 @@ impl MySqlProxy {
         let mut checkout = self.pool.acquire().await?;
         let backend = checkout.take_stream();
 
-        let outcome = proxy_bidirectional_sniff(client, backend).await;
+        // Because every strategy now takes the packet-aware relay, query
+        // stats see this path regardless of `reset_strategy` — there is no
+        // longer an opaque byte-copy variant that hides statements.
+        let outcome = proxy_bidirectional_sniff(client, backend, self.stats()).await;
 
         match outcome.backend {
             Some(backend) => match self.reset_strategy {
@@ -1030,9 +1062,27 @@ struct SessionOutcome {
 /// on to catch a desynchronised connection either — the ping is skipped inside
 /// the validation window, and a leftover `OK` packet is indistinguishable from
 /// a `COM_PING` reply.
+///
+/// ## Query stats
+///
+/// When `stats` is `Some`, each forwarded `COM_QUERY` is remembered and
+/// recorded once its response has completed. Completion is inferred from the
+/// arrival of the *next* client command, which the MySQL protocol guarantees
+/// cannot happen until the previous response has been fully received — see
+/// [`SpliceWatch`] for the full argument and for why prepared-statement
+/// executes are out of reach here.
+///
+/// Every session-ending path settles the trailing statement before returning:
+/// an intercepted `COM_QUIT` is itself "the next command" and so carries the
+/// same completion proof, and a client that just closes its socket is caught
+/// by the read-failure exits. All four settle points go through
+/// [`flush_pending`] — missing one silently drops the last statement of a
+/// connection, which for short-lived PHP sessions is a large share of all
+/// traffic. When `stats` is `None` the only cost is a `None` check per read.
 async fn proxy_bidirectional_sniff(
     mut client: TcpStream,
     mut backend: TcpStream,
+    stats: Option<&QueryStats>,
 ) -> SessionOutcome {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1040,24 +1090,40 @@ async fn proxy_bidirectional_sniff(
     let dirty = Arc::new(AtomicBool::new(false));
     let dirty_w = Arc::clone(&dirty);
 
+    let recorder = stats.map(|s| (s, Arc::new(SpliceWatch::new())));
+    let watch_r = recorder.as_ref().map(|(_, w)| Arc::clone(w));
+
     let end = {
         let (mut cr, mut cw) = client.split();
         let (mut br, mut bw) = backend.split();
 
         let client_to_backend = async {
+            let mut pending: Option<PendingStatement> = None;
             loop {
                 let mut header = [0u8; 4];
                 // Any read failure here is a client-side event: EOF, reset, or
                 // a half-written packet. None of them say anything about the
-                // backend.
+                // backend. The session is over, so settle the trailing
+                // statement rather than dropping it — a client that closes
+                // without COM_QUIT still had its last response forwarded.
                 if cr.read_exact(&mut header).await.is_err() {
+                    flush_pending(recorder.as_ref(), &mut pending);
                     return SessionEnd::Client;
                 }
                 let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
                 let mut payload = vec![0u8; len];
                 if cr.read_exact(&mut payload).await.is_err() {
+                    flush_pending(recorder.as_ref(), &mut pending);
                     return SessionEnd::Client;
                 }
+
+                // A new command proves the previous response completed. This
+                // must stay ahead of the COM_QUIT interception below: QUIT is
+                // itself "the next command", so it carries the same proof and
+                // is what settles the last statement of an orderly PHP
+                // session — the common clean end, and therefore the one that
+                // matters most for stats completeness.
+                flush_pending(recorder.as_ref(), &mut pending);
 
                 if let Some(&cmd) = payload.first() {
                     // Session termination: swallow it. Forwarding this is the
@@ -1079,9 +1145,20 @@ async fn proxy_bidirectional_sniff(
                     }
                 }
 
+                // Arm before the command hits the wire: the response cannot
+                // arrive before the write, so the reader half can never see
+                // a chunk for a statement that has not been armed yet.
+                let armed = recorder.as_ref().and_then(|(_, w)| {
+                    recordable_sql(&payload).map(|sql| {
+                        w.arm();
+                        PendingStatement { sql: sql.to_string(), sent_ns: w.now_ns() }
+                    })
+                });
+
                 if bw.write_all(&header).await.is_err() || bw.write_all(&payload).await.is_err() {
                     return SessionEnd::Backend;
                 }
+                pending = armed;
             }
         };
 
@@ -1090,6 +1167,13 @@ async fn proxy_bidirectional_sniff(
             loop {
                 match br.read(&mut buf).await {
                     Ok(n) if n > 0 => {
+                        // Date the response bytes so the client half can
+                        // settle the statement they belong to. One clock read
+                        // per read syscall — per buffer, not per packet or
+                        // row — and only when stats are on.
+                        if let Some(watch) = watch_r.as_deref() {
+                            watch.note_backend_chunk(&buf[..n]);
+                        }
                         if cw.write_all(&buf[..n]).await.is_err() {
                             return SessionEnd::Client;
                         }
@@ -1126,6 +1210,42 @@ async fn proxy_bidirectional_sniff(
     SessionOutcome {
         backend: reusable.then_some(backend),
         dirty: dirty.load(std::sync::atomic::Ordering::Relaxed),
+    }
+}
+
+/// The SQL text a forwarded command should be attributed to, if any.
+///
+/// Only `COM_QUERY` qualifies. Two deliberate exclusions:
+///
+/// - `COM_STMT_PREPARE` carries SQL, but preparing is a metadata round trip
+///   rather than an execution. Recording it under the statement's digest
+///   would publish parse latency as query latency. `TrackedBackend` makes
+///   the same call for litewire's `describe_columns`.
+/// - `COM_STMT_EXECUTE` is an execution, but carries only a statement ID.
+///   Mapping it back to SQL requires having parsed the *prepare response*,
+///   which only the R/W-split routing loop does; the splice path never
+///   reads the backend→client direction. See [`crate::stats`].
+fn recordable_sql(payload: &[u8]) -> Option<&str> {
+    if payload.first() != Some(&COM_QUERY) {
+        return None;
+    }
+    std::str::from_utf8(&payload[1..]).ok().filter(|sql| !sql.trim().is_empty())
+}
+
+/// Settle a pending statement, if there is one and stats are on.
+///
+/// Called at every point that constitutes proof the previous response
+/// completed: the arrival of the next client command — which includes the
+/// intercepted `COM_QUIT` that ends a normal PHP session — and both
+/// client-side read failures that end a session without one. Missing any of
+/// them silently drops the last statement of a connection, which for
+/// short-lived PHP sessions is a large share of all traffic.
+fn flush_pending(
+    recorder: Option<&(&QueryStats, Arc<SpliceWatch>)>,
+    pending: &mut Option<PendingStatement>,
+) {
+    if let (Some((stats, watch)), Some(statement)) = (recorder, pending.take()) {
+        watch.flush(stats, &statement);
     }
 }
 
@@ -1306,17 +1426,27 @@ fn decode_lenenc_int(buf: &[u8]) -> Option<(u64, usize)> {
 /// not set `CLIENT_DEPRECATE_EOF` (0x0100_0000), every result set we see
 /// from real MySQL servers uses the two-EOF layout — we don't have to handle
 /// the deprecated-EOF row terminator.
+///
+/// The returned [`ResponseOutcome`] is assembled purely from bytes this
+/// function already had to look at: the `OK_Packet`'s length-encoded
+/// affected-row count, the presence of an `ERR_Packet`, or the number of
+/// row packets in a result set. Nothing is estimated.
 async fn forward_mysql_response(
     backend: &mut TcpStream,
     client: &mut TcpStream,
-) -> Result<(), DbError> {
+) -> Result<ResponseOutcome, DbError> {
     let (seq, payload) = read_packet(backend).await?;
     write_packet(client, seq, &payload).await?;
 
     // Single-packet responses.
     match payload.first().copied() {
-        Some(0x00 | 0xFF) => return Ok(()),
-        Some(0xFE) if payload.len() < 9 => return Ok(()),
+        Some(0x00) => {
+            // OK_Packet: [0x00][affected_rows: lenenc][last_insert_id: lenenc]…
+            let affected = decode_lenenc_int(&payload[1..]).map_or(0, |(v, _)| v);
+            return Ok(ResponseOutcome { ok: true, rows: affected });
+        }
+        Some(0xFF) => return Ok(ResponseOutcome { ok: false, rows: 0 }),
+        Some(0xFE) if payload.len() < 9 => return Ok(ResponseOutcome::ok_unknown_rows()),
         Some(0xFB) => {
             return Err(DbError::Protocol(
                 "LOCAL INFILE response not supported by smart-reset proxy path".into(),
@@ -1339,7 +1469,7 @@ async fn forward_mysql_response(
     write_packet(client, s, &p).await?;
     if p.first() == Some(&0xFF) {
         // ERR_Packet here (e.g. cursor open failed) — no rows follow.
-        return Ok(());
+        return Ok(ResponseOutcome { ok: false, rows: 0 });
     }
     if !(p.first() == Some(&0xFE) && p.len() < 9) {
         return Err(DbError::Protocol(
@@ -1348,13 +1478,17 @@ async fn forward_mysql_response(
     }
 
     // Row packets until the terminating EOF or ERR.
+    let mut rows = 0u64;
     loop {
         let (s, p) = read_packet(backend).await?;
         write_packet(client, s, &p).await?;
         match p.first().copied() {
-            Some(0xFE) if p.len() < 9 => return Ok(()), // terminating EOF
-            Some(0xFF) => return Ok(()),                // ERR mid-stream
-            _ => {}                                     // another row
+            // Terminating EOF.
+            Some(0xFE) if p.len() < 9 => return Ok(ResponseOutcome { ok: true, rows }),
+            // ERR mid-stream: the rows already forwarded are real, but the
+            // statement did not complete successfully.
+            Some(0xFF) => return Ok(ResponseOutcome { ok: false, rows }),
+            _ => rows += 1,
         }
     }
 }
@@ -1487,7 +1621,7 @@ fn route_command<'a>(
     replica_pools: &'a [Pool],
     state: &ClientState,
     rw_split: &RwSplitParams,
-    stmt_pool_map: &HashMap<u32, PoolTarget>,
+    stmt_pool_map: &HashMap<u32, PreparedStmt>,
     replica_rr: &AtomicUsize,
 ) -> (&'a Pool, QueryKind) {
     if !rw_split.enabled || replica_pools.is_empty() {
@@ -1503,18 +1637,37 @@ fn route_command<'a>(
         }
         COM_STMT_EXECUTE | COM_STMT_SEND_LONG_DATA | COM_STMT_FETCH => {
             let target = parse_stmt_id(payload)
-                .and_then(|id| stmt_pool_map.get(&id).copied())
+                .and_then(|id| stmt_pool_map.get(&id).map(|s| s.target))
                 .map_or(pool, |pt| resolve_pool_target(pt, pool, replica_pools));
             let kind = if std::ptr::eq(target, pool) { QueryKind::Write } else { QueryKind::Read };
             (target, kind)
         }
         COM_STMT_CLOSE | COM_STMT_RESET => {
             let target = parse_stmt_id(payload)
-                .and_then(|id| stmt_pool_map.get(&id).copied())
+                .and_then(|id| stmt_pool_map.get(&id).map(|s| s.target))
                 .map_or(pool, |pt| resolve_pool_target(pt, pool, replica_pools));
             (target, QueryKind::Read)
         }
         _ => (pool, QueryKind::Write),
+    }
+}
+
+/// SQL to attribute a routing-loop command to, if any.
+///
+/// Extends [`recordable_sql`] with `COM_STMT_EXECUTE`: this path parsed the
+/// prepare response, so it holds the statement ID → SQL mapping the splice
+/// path lacks. `COM_STMT_PREPARE` is still excluded on purpose — see
+/// [`recordable_sql`] for why.
+fn routing_recordable_sql<'a>(
+    payload: &'a [u8],
+    stmt_pool_map: &'a HashMap<u32, PreparedStmt>,
+) -> Option<&'a str> {
+    match payload.first().copied() {
+        Some(COM_QUERY) => recordable_sql(payload),
+        Some(COM_STMT_EXECUTE) => parse_stmt_id(payload)
+            .and_then(|id| stmt_pool_map.get(&id))
+            .and_then(|stmt| stmt.sql.as_deref()),
+        _ => None,
     }
 }
 
@@ -1546,10 +1699,17 @@ fn track_dirty(state: &mut ClientState, payload: &[u8], query_kind: QueryKind) {
     }
 }
 
+/// What relaying one client command produced.
+struct RelayResult {
+    /// The prepared-statement id, when the command was a `COM_STMT_PREPARE`
+    /// the backend accepted.
+    prepared: Option<u32>,
+    /// What the response said, when the command had one the proxy framed.
+    /// `None` for prepare and close — neither is a recordable execution.
+    response: Option<ResponseOutcome>,
+}
+
 /// Forward one client command to `backend` and relay the response.
-///
-/// Returns the prepared-statement id when `payload` was a `COM_STMT_PREPARE`
-/// the backend accepted, `None` otherwise.
 ///
 /// # Errors
 ///
@@ -1562,13 +1722,19 @@ async fn relay_one_command(
     client: &mut TcpStream,
     seq: u8,
     payload: &[u8],
-) -> Result<Option<u32>, DbError> {
+) -> Result<RelayResult, DbError> {
     write_packet(backend, seq, payload).await?;
     match payload[0] {
-        COM_STMT_PREPARE => forward_prepare_response(backend, client).await,
+        COM_STMT_PREPARE => Ok(RelayResult {
+            prepared: forward_prepare_response(backend, client).await?,
+            response: None,
+        }),
         // COM_STMT_CLOSE is fire-and-forget — the server sends no response.
-        COM_STMT_CLOSE => Ok(None),
-        _ => forward_mysql_response(backend, client).await.map(|()| None),
+        COM_STMT_CLOSE => Ok(RelayResult { prepared: None, response: None }),
+        _ => Ok(RelayResult {
+            prepared: None,
+            response: Some(forward_mysql_response(backend, client).await?),
+        }),
     }
 }
 
@@ -1579,6 +1745,17 @@ async fn relay_one_command(
 /// read/write-aware routing. Statement IDs are tracked per-connection so that
 /// execute/close/reset/fetch commands are routed to the same pool that
 /// compiled the statement.
+///
+/// # Query stats
+///
+/// This path frames both directions, so recording is exact: the clock runs
+/// from just before the command is written to the backend until
+/// [`forward_mysql_response`] has consumed the last packet of its response,
+/// and success plus row counts come out of that response. Because the
+/// prepare response is parsed here, the SQL captured at
+/// `COM_STMT_PREPARE` time is retained per connection and used to attribute
+/// each `COM_STMT_EXECUTE` — coverage the single-backend splice path cannot
+/// match.
 async fn proxy_routing_loop(
     mut client: TcpStream,
     pool: &Pool,
@@ -1586,11 +1763,13 @@ async fn proxy_routing_loop(
     replica_rr: &AtomicUsize,
     rw_split: &RwSplitParams,
     reset_strategy: crate::ResetStrategy,
+    recorder: Option<&QueryStats>,
 ) -> Result<(), DbError> {
     let mut state = ClientState::default();
-    // Maps statement IDs to the pool type they were prepared on, so that
-    // COM_STMT_EXECUTE and friends route to the correct backend.
-    let mut stmt_pool_map: HashMap<u32, PoolTarget> = HashMap::new();
+    // Maps statement IDs to the pool they were prepared on (so that
+    // COM_STMT_EXECUTE and friends route to the correct backend) and, when
+    // stats are on, to the SQL they were compiled from.
+    let mut stmt_pool_map: HashMap<u32, PreparedStmt> = HashMap::new();
 
     loop {
         let Ok((seq, payload)) = read_packet(&mut client).await else {
@@ -1627,8 +1806,9 @@ async fn proxy_routing_loop(
         // A relay failure means this backend is no longer in a known protocol
         // state. Discard it explicitly — never let it fall through to a
         // `return_to_pool` below.
-        let prepared = match relay_one_command(&mut backend, &mut client, seq, &payload).await {
-            Ok(prepared) => prepared,
+        let started = recorder.map(|_| std::time::Instant::now());
+        let relayed = match relay_one_command(&mut backend, &mut client, seq, &payload).await {
+            Ok(relayed) => relayed,
             Err(e) => {
                 debug!("backend relay failed, discarding connection: {e}");
                 checkout.retire();
@@ -1645,8 +1825,13 @@ async fn proxy_routing_loop(
                     replica_pools.iter().position(|r| std::ptr::eq(target_pool, r)).unwrap_or(0);
                 PoolTarget::Replica(idx)
             };
-            if let Some(stmt_id) = prepared {
-                stmt_pool_map.insert(stmt_id, pool_target);
+            // Retain the prepared SQL only when it will be used: it is what
+            // lets a later COM_STMT_EXECUTE be attributed to a digest.
+            let sql = recorder
+                .and_then(|_| std::str::from_utf8(payload.get(1..).unwrap_or_default()).ok())
+                .map(ToString::to_string);
+            if let Some(stmt_id) = relayed.prepared {
+                stmt_pool_map.insert(stmt_id, PreparedStmt { target: pool_target, sql });
                 debug!(stmt_id, ?pool_target, "prepared statement registered");
             }
         } else if cmd == COM_STMT_CLOSE {
@@ -1654,6 +1839,18 @@ async fn proxy_routing_loop(
                 if let Some(removed) = stmt_pool_map.remove(&stmt_id) {
                     debug!(stmt_id, ?removed, "prepared statement closed");
                 }
+            }
+        }
+
+        // Record after the statement-id map is up to date, so a
+        // COM_STMT_EXECUTE resolves against the SQL its prepare registered.
+        // `relayed.response` is `None` for prepare and close, neither of
+        // which is a recordable execution.
+        if let (Some(collector), Some(started), Some(outcome)) =
+            (recorder, started, relayed.response)
+        {
+            if let Some(sql) = routing_recordable_sql(&payload, &stmt_pool_map) {
+                collector.record(sql, started.elapsed(), outcome.ok, outcome.rows);
             }
         }
 
@@ -1687,7 +1884,10 @@ async fn proxy_routing_loop(
 
 /// Build a [`Pool`] for `MySQL`.
 ///
-/// Exported so `lib.rs` can construct `MySqlProxy` from config.
+/// Exported so `lib.rs` can construct `MySqlProxy` from config. `stats` is
+/// the process-wide collector shared with the litewire paths; pass one built
+/// with `enabled: false` (i.e. `[db.analysis] query_stats = false`) to leave
+/// the forwarding paths uninstrumented.
 ///
 /// # Errors
 ///
@@ -1701,8 +1901,10 @@ pub async fn build_proxy(
     reset_strategy: ResetStrategy,
     replica_urls: Vec<String>,
     rw_split: RwSplitParams,
+    stats: QueryStats,
 ) -> Result<MySqlProxy, DbError> {
-    MySqlProxy::new(url, listen, socket, pool_config, reset_strategy, replica_urls, rw_split).await
+    MySqlProxy::new(url, listen, socket, pool_config, reset_strategy, replica_urls, rw_split, stats)
+        .await
 }
 
 #[cfg(test)]
@@ -1912,21 +2114,21 @@ mod tests {
 
     #[test]
     fn stmt_pool_map_tracks_prepare_to_execute() {
-        let mut map: HashMap<u32, PoolTarget> = HashMap::new();
+        let mut map: HashMap<u32, PreparedStmt> = HashMap::new();
 
         // Simulate: SELECT prepared on replica 0.
-        map.insert(1, PoolTarget::Replica(0));
+        map.insert(1, PreparedStmt { target: PoolTarget::Replica(0), sql: None });
         // Simulate: INSERT prepared on primary.
-        map.insert(2, PoolTarget::Primary);
+        map.insert(2, PreparedStmt { target: PoolTarget::Primary, sql: None });
 
-        assert_eq!(map.get(&1).copied(), Some(PoolTarget::Replica(0)));
-        assert_eq!(map.get(&2).copied(), Some(PoolTarget::Primary));
+        assert_eq!(map.get(&1).map(|s| s.target), Some(PoolTarget::Replica(0)));
+        assert_eq!(map.get(&2).map(|s| s.target), Some(PoolTarget::Primary));
 
         // Close statement 1.
         map.remove(&1);
-        assert_eq!(map.get(&1), None);
+        assert!(!map.contains_key(&1));
         // Statement 2 still tracked.
-        assert_eq!(map.get(&2).copied(), Some(PoolTarget::Primary));
+        assert_eq!(map.get(&2).map(|s| s.target), Some(PoolTarget::Primary));
     }
 
     // ── forward_prepare_response (via mock TCP pair) ─────────────────
@@ -2002,7 +2204,7 @@ mod tests {
         write_packet(&mut backend_write, 6, &[0xFE, 0, 0, 0x02, 0]).await.unwrap();
         drop(backend_write);
 
-        forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
+        let outcome = forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
         drop(client_write);
 
         let mut seqs = Vec::new();
@@ -2010,6 +2212,8 @@ mod tests {
             seqs.push(s);
         }
         assert_eq!(seqs, vec![1, 2, 3, 4, 5, 6], "all 6 packets must reach the client");
+        assert!(outcome.ok);
+        assert_eq!(outcome.rows, 1, "one row packet between the two EOFs");
     }
 
     #[tokio::test]
@@ -2021,12 +2225,46 @@ mod tests {
         write_packet(&mut backend_write, 1, &[0x00, 0, 0, 0x02, 0, 0, 0]).await.unwrap();
         drop(backend_write);
 
-        forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
+        let outcome = forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
         drop(client_write);
 
         let (_, p) = read_packet(&mut client_read).await.unwrap();
         assert_eq!(p[0], 0x00, "OK packet forwarded once");
         assert!(read_packet(&mut client_read).await.is_err(), "no further packets");
+        assert!(outcome.ok);
+        assert_eq!(outcome.rows, 0);
+    }
+
+    #[tokio::test]
+    async fn forward_mysql_response_ok_packet_reports_affected_rows() {
+        let (mut backend_write, mut backend_read) = make_tcp_pair().await;
+        let (mut client_write, _client_read) = make_tcp_pair().await;
+
+        // [0x00][affected_rows=5][last_insert_id=0][status][warnings]
+        write_packet(&mut backend_write, 1, &[0x00, 5, 0, 0x02, 0, 0, 0]).await.unwrap();
+        drop(backend_write);
+
+        let outcome = forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
+        assert!(outcome.ok);
+        assert_eq!(outcome.rows, 5, "affected rows come out of the OK packet, not a guess");
+    }
+
+    #[tokio::test]
+    async fn forward_mysql_response_err_packet_marks_failure() {
+        let (mut backend_write, mut backend_read) = make_tcp_pair().await;
+        let (mut client_write, _client_read) = make_tcp_pair().await;
+
+        let mut err = vec![0xFF];
+        err.extend_from_slice(&1146_u16.to_le_bytes());
+        err.push(b'#');
+        err.extend_from_slice(b"42S02");
+        err.extend_from_slice(b"Table 'x' doesn't exist");
+        write_packet(&mut backend_write, 1, &err).await.unwrap();
+        drop(backend_write);
+
+        let outcome = forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
+        assert!(!outcome.ok);
+        assert_eq!(outcome.rows, 0);
     }
 
     #[tokio::test]
@@ -2041,7 +2279,7 @@ mod tests {
         write_packet(&mut backend_write, 4, &[0xFE, 0, 0, 0x02, 0]).await.unwrap();
         drop(backend_write);
 
-        forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
+        let outcome = forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
         drop(client_write);
 
         let mut seqs = Vec::new();
@@ -2049,6 +2287,232 @@ mod tests {
             seqs.push(s);
         }
         assert_eq!(seqs, vec![1, 2, 3, 4]);
+        assert!(outcome.ok);
+        assert_eq!(outcome.rows, 0, "an empty result set must report zero rows");
+    }
+
+    // ── query stats: what a command is attributed to ─────────────────
+
+    /// Build a `COM_QUERY` payload.
+    fn com_query(sql: &str) -> Vec<u8> {
+        let mut p = vec![COM_QUERY];
+        p.extend_from_slice(sql.as_bytes());
+        p
+    }
+
+    /// Build a `COM_STMT_EXECUTE` payload for `stmt_id`.
+    fn com_stmt_execute(stmt_id: u32) -> Vec<u8> {
+        let mut p = vec![COM_STMT_EXECUTE];
+        p.extend_from_slice(&stmt_id.to_le_bytes());
+        p.push(0x00); // flags
+        p.extend_from_slice(&1_u32.to_le_bytes()); // iteration count
+        p
+    }
+
+    #[test]
+    fn recordable_sql_takes_com_query() {
+        let payload = com_query("SELECT * FROM users WHERE id = 1");
+        assert_eq!(recordable_sql(&payload), Some("SELECT * FROM users WHERE id = 1"));
+    }
+
+    #[test]
+    fn recordable_sql_skips_prepare_and_execute() {
+        // COM_STMT_PREPARE carries SQL but is a metadata round trip, not an
+        // execution — recording it would publish parse latency as query
+        // latency. COM_STMT_EXECUTE is an execution but carries no SQL.
+        let mut prepare = vec![COM_STMT_PREPARE];
+        prepare.extend_from_slice(b"SELECT * FROM users WHERE id = ?");
+        assert_eq!(recordable_sql(&prepare), None, "prepare must not be recorded as a query");
+        assert_eq!(recordable_sql(&com_stmt_execute(1)), None);
+    }
+
+    #[test]
+    fn recordable_sql_skips_empty_and_non_utf8() {
+        assert_eq!(recordable_sql(&com_query("   ")), None);
+        assert_eq!(recordable_sql(&[COM_QUERY, 0xFF, 0xFE]), None);
+        assert_eq!(recordable_sql(&[]), None);
+    }
+
+    #[test]
+    fn routing_loop_attributes_execute_to_the_prepared_sql() {
+        // The routing loop parses the prepare *response*, so it holds the
+        // statement ID → SQL mapping and can attribute an execute.
+        let mut map: HashMap<u32, PreparedStmt> = HashMap::new();
+        map.insert(
+            7,
+            PreparedStmt {
+                target: PoolTarget::Primary,
+                sql: Some("SELECT * FROM users WHERE id = ?".to_string()),
+            },
+        );
+
+        assert_eq!(
+            routing_recordable_sql(&com_stmt_execute(7), &map),
+            Some("SELECT * FROM users WHERE id = ?")
+        );
+        // An execute for a statement we never saw prepared stays unrecorded
+        // rather than being attributed to a made-up digest.
+        assert_eq!(routing_recordable_sql(&com_stmt_execute(8), &map), None);
+        // And with stats off no SQL was retained, so nothing is recordable.
+        map.insert(9, PreparedStmt { target: PoolTarget::Primary, sql: None });
+        assert_eq!(routing_recordable_sql(&com_stmt_execute(9), &map), None);
+    }
+
+    // ── query stats: the splice tap point ────────────────────────────
+
+    /// Write a `COM_QUERY` from the client side of the proxy.
+    async fn send_query(client: &mut TcpStream, sql: &str) {
+        write_packet(client, 0, &com_query(sql)).await.unwrap();
+    }
+
+    /// Answer one command on the fake backend with a minimal OK packet, and
+    /// wait for the client to read it back so the proxy has demonstrably
+    /// stamped the response.
+    async fn answer_ok(backend: &mut TcpStream, client: &mut TcpStream) {
+        let (_, _cmd) = read_packet(backend).await.unwrap();
+        write_packet(backend, 1, &[0x00, 0, 0, 0x02, 0, 0, 0]).await.unwrap();
+        let (_, resp) = read_packet(client).await.unwrap();
+        assert_eq!(resp[0], 0x00);
+    }
+
+    /// Drive two queries plus a disconnect through the sniffing splice path
+    /// and return the stats collector it recorded into.
+    async fn drive_sniff_session(stats: Option<QueryStats>) -> Option<QueryStats> {
+        let (mut driver, proxy_client) = make_tcp_pair().await;
+        let (proxy_backend, mut fake_backend) = make_tcp_pair().await;
+
+        let handed = stats.clone();
+        let proxy = tokio::spawn(async move {
+            proxy_bidirectional_sniff(proxy_client, proxy_backend, handed.as_ref()).await
+        });
+
+        send_query(&mut driver, "SELECT * FROM users WHERE id = 1").await;
+        answer_ok(&mut fake_backend, &mut driver).await;
+
+        // The second command is what proves the first response completed.
+        send_query(&mut driver, "SELECT * FROM users WHERE id = 2").await;
+        answer_ok(&mut fake_backend, &mut driver).await;
+
+        // Disconnect: the last statement is settled on the way out.
+        drop(driver);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), proxy).await;
+        stats
+    }
+
+    #[tokio::test]
+    async fn splice_path_records_forwarded_queries() {
+        let stats =
+            drive_sniff_session(Some(QueryStats::new(ephpm_query_stats::StatsConfig::default())))
+                .await
+                .unwrap();
+
+        assert_eq!(stats.digest_count(), 1, "both queries share one digest after normalization");
+        let top = stats.top_queries(1);
+        assert_eq!(top[0].count, 2, "the trailing statement must be settled on disconnect");
+        assert_eq!(top[0].error_count, 0);
+        assert_eq!(top[0].total_rows, 0, "the splice path cannot count rows and must not guess");
+        assert!(top[0].total_time > std::time::Duration::ZERO);
+    }
+
+    /// Negative control for the `[db.analysis] query_stats = false` path: the
+    /// exact same session with no collector attached must record nothing and
+    /// still forward every byte.
+    #[tokio::test]
+    async fn splice_path_records_nothing_when_stats_are_off() {
+        // `None` is what `MySqlProxy::stats()` yields when the toggle is off.
+        assert!(drive_sniff_session(None).await.is_none());
+
+        // And a collector that is present but disabled must also stay empty —
+        // proving the toggle holds at both layers.
+        let disabled = QueryStats::new(ephpm_query_stats::StatsConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let stats = drive_sniff_session(Some(disabled)).await.unwrap();
+        assert_eq!(stats.digest_count(), 0);
+    }
+
+    /// The trailing statement of a session must still be timed when the
+    /// client ends with `COM_QUIT`, which is intercepted and never forwarded
+    /// to the pooled backend. QUIT is itself "the next command", so it
+    /// carries the same proof that the previous response completed — and it
+    /// is the *common* clean end for a PHP client, so this is the settle
+    /// point that matters most for stats completeness.
+    #[tokio::test]
+    async fn splice_path_settles_trailing_statement_on_intercepted_quit() {
+        let stats = QueryStats::new(ephpm_query_stats::StatsConfig::default());
+        let (mut driver, proxy_client) = make_tcp_pair().await;
+        let (proxy_backend, mut fake_backend) = make_tcp_pair().await;
+
+        let handed = stats.clone();
+        let proxy = tokio::spawn(async move {
+            proxy_bidirectional_sniff(proxy_client, proxy_backend, Some(&handed)).await
+        });
+
+        send_query(&mut driver, "SELECT * FROM users WHERE id = 1").await;
+        answer_ok(&mut fake_backend, &mut driver).await;
+
+        // Orderly close, exactly as mysqlnd does when PDO drops its handle.
+        write_packet(&mut driver, 0, &[COM_QUIT]).await.unwrap();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), proxy)
+            .await
+            .expect("the session must end when the client sends COM_QUIT")
+            .expect("proxy task must not panic");
+        assert!(
+            outcome.backend.is_some(),
+            "an intercepted COM_QUIT must leave the pooled backend recyclable"
+        );
+
+        assert_eq!(
+            stats.digest_count(),
+            1,
+            "the statement preceding COM_QUIT must still be recorded"
+        );
+        let top = stats.top_queries(1);
+        assert_eq!(top[0].count, 1);
+        assert!(top[0].total_time > std::time::Duration::ZERO);
+
+        // The backend must never have been handed the QUIT byte: nothing
+        // more arrives on it, so this read can only time out.
+        let leaked = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            read_packet(&mut fake_backend),
+        )
+        .await;
+        assert!(leaked.is_err(), "COM_QUIT must not reach the pooled backend");
+    }
+
+    /// The documented prepared-statement limitation, pinned: on the splice
+    /// path a prepare/execute pair produces no digest at all, because the
+    /// prepare is metadata and the execute cannot be mapped back to SQL.
+    #[tokio::test]
+    async fn splice_path_does_not_record_prepared_statements() {
+        let stats = QueryStats::new(ephpm_query_stats::StatsConfig::default());
+        let (mut driver, proxy_client) = make_tcp_pair().await;
+        let (proxy_backend, mut fake_backend) = make_tcp_pair().await;
+
+        let handed = stats.clone();
+        let proxy = tokio::spawn(async move {
+            proxy_bidirectional_sniff(proxy_client, proxy_backend, Some(&handed)).await
+        });
+
+        let mut prepare = vec![COM_STMT_PREPARE];
+        prepare.extend_from_slice(b"SELECT * FROM users WHERE id = ?");
+        write_packet(&mut driver, 0, &prepare).await.unwrap();
+        answer_ok(&mut fake_backend, &mut driver).await;
+
+        write_packet(&mut driver, 0, &com_stmt_execute(1)).await.unwrap();
+        answer_ok(&mut fake_backend, &mut driver).await;
+
+        drop(driver);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), proxy).await;
+
+        assert_eq!(
+            stats.digest_count(),
+            0,
+            "prepare is metadata and execute has no SQL — neither may be recorded here"
+        );
     }
 
     // ── decode_lenenc_int ────────────────────────────────────────────

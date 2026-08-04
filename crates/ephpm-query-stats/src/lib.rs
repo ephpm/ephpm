@@ -152,6 +152,19 @@ impl QueryStats {
         }
     }
 
+    /// Whether recording is switched on (`[db.analysis] query_stats`).
+    ///
+    /// Every `record*` method already short-circuits when this is `false`,
+    /// so callers that only need the toggle honoured can ignore it. It
+    /// exists for callers that must skip *producing* the arguments as well:
+    /// the DB proxy would otherwise clone SQL text out of wire buffers and
+    /// read the clock on every forwarded command just to throw the values
+    /// away inside `record`.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+
     /// Record a completed query (SELECT, SHOW, etc.).
     pub fn record_query(&self, sql: &str, duration: Duration, success: bool, rows: u64) {
         self.record_internal(sql, duration, success, rows, QueryKind::Query);
@@ -584,6 +597,15 @@ mod tests {
         stats.record("SELECT 1", Duration::from_millis(1), true, 1);
         stats.record("INSERT INTO t VALUES (1)", Duration::from_millis(1), true, 1);
         assert_eq!(stats.digest_count(), 2);
+    }
+
+    #[test]
+    fn is_enabled_reflects_config() {
+        assert!(QueryStats::new(StatsConfig::default()).is_enabled());
+        assert!(
+            !QueryStats::new(StatsConfig { enabled: false, ..Default::default() }).is_enabled(),
+            "callers gate argument construction on this — it must track the config flag"
+        );
     }
 
     #[test]

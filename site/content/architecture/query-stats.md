@@ -9,7 +9,9 @@ ePHPm has two SQL strategies (see [sql.md](sql.md)):
 - **DB Proxy** (`ephpm-db`) -- forwards MySQL wire traffic to a real MySQL server
 - **LiteWire** (`litewire`) -- translates MySQL wire traffic to SQLite
 
-Both see every query PHP executes. Neither currently records query-level metrics. Without this, operators have no visibility into slow queries, hot tables, error patterns, or query mix. They have to bolt on external tools (slow query log on MySQL, APM agents in PHP) that don't exist in the LiteWire/SQLite path at all.
+Both see every query PHP executes. Before this design landed, neither recorded query-level metrics, so operators had no visibility into slow queries, hot tables, error patterns, or query mix — they had to bolt on external tools (slow query log on MySQL, APM agents in PHP) that don't exist in the LiteWire/SQLite path at all.
+
+> **Status:** both paths now record. The LiteWire side is complete (`TrackedBackend`); the DB Proxy side records only where the proxy already parses the wire protocol, which is narrower — see the [`[db.analysis]` coverage table](/reference/config/#dbanalysis) for exactly what each path captures.
 
 ## Solution
 
