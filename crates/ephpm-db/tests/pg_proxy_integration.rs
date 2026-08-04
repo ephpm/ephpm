@@ -70,6 +70,9 @@ async fn start_proxy(
         reset_strategy,
         vec![],
         PgRwSplitParams { enabled: false, sticky_duration: Duration::from_secs(0) },
+        // Instrumented like production: these tests exercise the recording
+        // tap point as a side effect of every forwarded statement.
+        ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig::default()),
     )
     .await
     .expect("failed to create PgProxy — backend handshake failed");

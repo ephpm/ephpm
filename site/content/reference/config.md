@@ -211,7 +211,7 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | `pool_timeout` | duration string | `"5s"` | Time to wait for a connection before failing. |
 | `health_check_interval` | duration string | `"30s"` | Frequency of backend health checks. |
 | `inject_env` | bool | `true` | Inject `DB_CONNECTION`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DATABASE_URL` into PHP. |
-| `reset_strategy` | string | `"smart"` | `"smart"` (reset after non-SELECT), `"always"`, `"never"`. |
+| `reset_strategy` | string | `"smart"` | `"smart"` (reset after non-SELECT), `"always"`, `"never"`. On PostgreSQL it also decides whether [query stats](#dbanalysis) see proxied statements — `"always"`/`"never"` without replicas take an opaque splice and record nothing. The MySQL proxy frames every session regardless, so its stats coverage does not depend on this knob. |
 | `replicas.urls` | array of strings | `[]` | Read replica URLs. Reads distributed across; writes go to primary. |
 
 > **The proxy listener is unauthenticated — keep it on loopback.**
@@ -267,12 +267,32 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `query_stats` | bool | `true` | Track per-digest timing/throughput metrics. |
+| `query_stats` | bool | `true` | Track per-digest timing/throughput metrics. Applies to the embedded SQLite paths **and** the MySQL/PostgreSQL proxies — see the coverage table below. |
 | `slow_query_threshold` | duration string | `"1s"` | Queries exceeding this are logged at WARN. |
 | `auto_explain` | bool | `false` | **Not yet implemented** — parsed but unused. |
 | `auto_explain_target` | string | `"stderr"` | **Not yet implemented**. |
 | `digest_store_max_entries` | usize | `100_000` | Max in-memory query digests; oldest evicted on overflow. |
 | `metric_label_series_max` | usize | `1000` | Max distinct `digest` label values emitted to Prometheus; overflow folds into `digest="__other__"`. `0` = unlimited. |
+
+#### What query stats cover
+
+One collector serves every database path, so proxied and embedded queries land on the same metric names with no extra label to distinguish them. What each path can *see* differs, because the proxy only observes statements at the points where it already parses the wire protocol:
+
+| Path | Statements recorded | Duration measured | Row counts |
+|------|--------------------|-------------------|------------|
+| Embedded SQLite (`[db.sqlite]`, any engine or replication mode) | All queries and mutations | In-process execution time | Rows returned / rows affected |
+| MySQL proxy, single-backend path (any reset strategy) | `COM_QUERY` only | Wire round trip: command written to the backend → last response byte read back | Not available |
+| MySQL proxy, R/W splitting enabled with replicas | `COM_QUERY` and `COM_STMT_EXECUTE` | Same wire round trip | Rows returned, or affected rows from the `OK` packet |
+| PostgreSQL proxy, `reset_strategy = "smart"` (default) or R/W splitting | Simple `Query` messages | Wire round trip: message written → `ReadyForQuery` | Rows returned (`DataRow` count); mutations record `0` |
+| PostgreSQL proxy, `reset_strategy = "never"`/`"always"` without replicas | None | — | — |
+
+Notable gaps, all deliberate:
+
+- **Proxy durations include the network.** The embedded-SQLite numbers are in-process execution time; the proxy numbers are a round trip to your database server. Comparing them directly is comparing two different things.
+- **`COM_STMT_PREPARE` is never recorded.** Preparing is a metadata round trip, not an execution — recording it under the statement's digest would publish parse latency as query latency.
+- **`COM_STMT_EXECUTE` is invisible on the default MySQL path.** Attributing an execute to its SQL requires having parsed the *prepare response*, which only the R/W-split routing loop does. Applications that turn off PDO's emulated prepares (`PDO::ATTR_EMULATE_PREPARES = false`) will therefore see little or no proxy query-stat traffic unless R/W splitting is on.
+- **PostgreSQL extended-protocol traffic is invisible.** `Parse`/`Bind`/`Execute` pin the session to one backend and splice it verbatim, because message boundaries stop lining up with turn boundaries. Same for `COPY`, and for PostgreSQL sessions using `reset_strategy = "never"`/`"always"` without replicas.
+- **Rows the proxy cannot count are reported as `0`, never estimated.**
 
 ## `[kv]`
 

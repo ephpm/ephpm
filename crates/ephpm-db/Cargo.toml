@@ -9,6 +9,7 @@ description = "SQL proxy and connection pooling for ePHPm"
 
 [dependencies]
 ephpm-config = { workspace = true }
+ephpm-query-stats = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }

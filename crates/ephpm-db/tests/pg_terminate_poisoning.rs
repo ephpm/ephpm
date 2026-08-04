@@ -332,6 +332,9 @@ async fn start_proxy(backend: &MockPgBackend, reset_strategy: ResetStrategy) -> 
         reset_strategy,
         vec![],
         PgRwSplitParams { enabled: false, sticky_duration: Duration::from_secs(0) },
+        // Instrumented like production, so these pool-lifecycle tests also
+        // exercise the query-stats tap point on every relayed statement.
+        ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig::default()),
     )
     .await
     .expect("build PgProxy against mock backend");

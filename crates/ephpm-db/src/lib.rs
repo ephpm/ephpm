@@ -5,6 +5,7 @@ pub mod error;
 pub mod mysql;
 pub mod pool;
 pub mod postgres;
+mod stats;
 pub mod url;
 
 /// Strategy for resetting backend connections when returning to the pool.

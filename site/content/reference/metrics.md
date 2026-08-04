@@ -90,6 +90,10 @@ These appear when `[db.analysis] query_stats = true` (the default).
 
 `digest` is the **normalized SQL** (literals replaced with `?`), truncated to 64 characters for label safety. Cardinality scales with distinct query *shapes*, not executions.
 
+These series are emitted by both the embedded SQLite paths and the MySQL/PostgreSQL proxies, with **no label distinguishing them** — one collector, one metrics surface. That is worth knowing when reading `ephpm_query_duration_seconds`: the embedded paths time in-process execution, while the proxies time a wire round trip to your database server (command written to the backend socket → last response byte read back), which includes network latency. If a deployment runs a proxy and the embedded engine at the same time, the two are mixed under one metric name.
+
+`ephpm_query_rows_total` is likewise narrower on the proxy paths, which report `0` where they cannot count rows rather than estimating: the default MySQL path has no row visibility at all, and the PostgreSQL path counts rows *returned* but not rows *affected* by a mutation. Statement coverage per path — including what the proxies deliberately do not record, such as prepared-statement executes and PostgreSQL extended-protocol traffic — is tabulated under [`[db.analysis]`](/reference/config/#dbanalysis) in the config reference.
+
 ## Cardinality notes
 
 The per-metric `digest` label series is **capped** — by default at 1,000 distinct label values per process (`StatsConfig::metric_label_series_max`). Every additional distinct digest observed after the cap is exhausted has its Prometheus emissions folded into a single shared `digest="__other__"` bucket. Internal tracking (`top_queries()`, the digest table, the slow-query log) is **not** affected by this cap and still exposes the real normalized SQL — only the Prometheus label surface is bounded.

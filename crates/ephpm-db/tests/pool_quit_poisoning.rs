@@ -330,6 +330,9 @@ async fn start_proxy(backend: &MockBackend, reset_strategy: ResetStrategy) -> St
         reset_strategy,
         vec![],
         RwSplitParams { enabled: false, sticky_duration: Duration::from_secs(0) },
+        // Instrumented like production, so these pool-lifecycle tests also
+        // exercise the query-stats tap point on every relayed command.
+        ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig::default()),
     )
     .await
     .expect("build MySqlProxy against mock backend");

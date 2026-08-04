@@ -54,7 +54,12 @@ EPHPM_SERVER__METRICS__PATH="/metrics"
 ### Query Stats Metrics (from `ephpm-query-stats`)
 
 Enabled when `[db.analysis] query_stats = true` (default). These metrics track
-SQL queries flowing through the DB proxy or litewire.
+SQL queries flowing through the DB proxy or litewire, sharing one collector and
+one set of label dimensions — there is no label identifying which path a sample
+came from. Note that proxy durations are wire round trips (they include network
+latency to the database server) while litewire durations are in-process, and
+that the proxy records a narrower set of statements. See the
+[`[db.analysis]` coverage table](/reference/config/#dbanalysis).
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
