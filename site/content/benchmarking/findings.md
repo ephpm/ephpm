@@ -164,6 +164,175 @@ reveals the ceiling above c=4 — and a read-only benchmark would never
 have found it at all, because on a primary a `SELECT` never touches
 replication.
 
+## From zero to a plateau: write admission for sqld
+
+The section above ends at a diagnosis. This one is what came of it, and
+the short version is that the fix was a semaphore in the right place —
+but finding the right place, and the right *size*, took the measurement
+apart in ways worth writing down. Shipped in v0.6.1 as
+`[db.sqlite.sqld] write_permits` ([ephpm#217](https://github.com/ephpm/ephpm/issues/217),
+litewire side at [litewire#16](https://github.com/ephpm/litewire/pull/16)).
+
+### The failure is a hang, and that is the whole problem
+
+Re-measured for v0.6.1 across a five-value permit sweep — twenty cells,
+two reps each, two independent cluster bring-ups — there were **zero
+HTTP 500s**. Not "few". None, anywhere in the matrix.
+
+Every cell that completed anything reported `Success rate: 100.00%`.
+Every cell that failed reported an *empty* status-code distribution,
+`NaN` percentiles, and all N clients "aborted due to deadline". The
+server never answers, so it never gets to answer wrongly.
+
+This is the observation that reframes the bug. An error-rate dashboard
+sees a clean 100% success rate while the database serves no one. A
+throughput dashboard sees `1.07 RPS` — a small number, not obviously a
+different *kind* of number from `600`. Only a completed-request count
+distinguishes "slow" from "dead", which is why every table in this
+section carries one.
+
+The earlier v0.6.0 pass caught the same behaviour at c=16 ("zero requests
+completed — all sixteen connections hung"). What the wider sweep shows is
+that this is the *normal* failure mode past the cliff, not the extreme
+tail of it.
+
+### Why the cap belongs at the Hrana backend and nowhere else
+
+The obvious temptation is a global write limiter in ePHPm. The data says
+that would be a mistake: **sqld is the only path with this problem, and
+every other path is actively rewarded by write concurrency.**
+
+| write path (write.php, RPS) | c=1 | c=16 | shape |
+|---|---|---|---|
+| Single-node SQLite (in-process rusqlite) | 648 | **1130** | scales up |
+| Turso engine, single-node | 666 | **1120** | scales up |
+| CDC-native cluster | 558 | **876** | scales up |
+| **Clustered sqld** | 458 | **collapse** | falls off a cliff |
+
+Three of the four *gain* 1.6–1.7× from c=1 to c=16. A cap sized to rescue
+the fourth would take that back from all of them for nothing — none of
+them has a single lock behind an HTTP round trip, which is the specific
+shape that makes sqld fragile.
+
+So the permit lives in litewire's **Hrana backend**, the one component
+that exists only when sqld is the store. Single-node SQLite, the Turso
+engine, CDC replication and the MySQL proxy never see it. That is not
+caution; it is the measurement telling you where the boundary is.
+
+### The sweep
+
+2 nodes, `--cpus 1` each, `write.php` (one autocommit INSERT per
+request), 15 s cells, 2 reps, 2 independent bring-ups, replication
+verified before every measurement. Ranges span all reps and runs.
+
+| `write_permits` | c=1 | c=4 | c=8 | c=16 |
+|---|---|---|---|---|
+| **0** (off — v0.6.0 behaviour) | 442–455 | 118–552 *erratic* | **0 completed** | **0 completed** |
+| **1** | 415–445 | 561–595 | 527–593 | **551–598** |
+| 2 | 443–445 | 497–532 | 520–573 | 565–574 |
+| 4 | 410–442 | 171–228 | 531–534 | 494–517 |
+| 8 | 444–451 | 232–266 | **0 completed** | **0 completed** |
+
+Reads (`db.php`, c=16) measured **229–240 RPS across every row**,
+baseline included. Reads never take a permit — WAL lets readers run
+alongside the writer, so admitting them would throttle traffic that was
+never the problem.
+
+A note on the `0` row versus the c=8 = 453 RPS in the table above: these
+are different sessions, and per [how to read these](/benchmarking/results/#how-to-read-these)
+absolute numbers do not transfer between them. The *shape* reproduced
+exactly — healthy at c=1, erratic at c=4, dead past it. The c=4 cell is
+worth calling out as an unstable knee rather than an operating point: the
+baseline measured 118 and 552 RPS on successive reps of the same cell. A
+single c=4 number from the unpatched path means nothing.
+
+### Why 1, and why 8 is as bad as off
+
+Two results in that table do the work.
+
+**The cliff sits between 4 and 8 concurrent writes reaching sqld.**
+`write_permits = 8` is *above* it, so it admits enough writers to
+reproduce the collapse exactly — same zero completions as no cap at all.
+A permit count only helps if it is below the threshold of the resource it
+protects, and here the useful range turns out to be narrow. The value is
+not a free dial where more is safer.
+
+**One permit already saturates the engine.** At c=16, `permits = 1`
+sustains ~598 writes/s, which is **~1.67 ms per serialized write**. The
+c=1 lane — a single client, no contention, nothing to queue behind —
+costs ~2.2 ms per request end to end, of which the write is the same
+~1.7 ms. The queue is *full*: sqld is doing back-to-back writes with no
+idle gap, and the semaphore is feeding it exactly as fast as it can
+swallow.
+
+That is why the ordering is monotone — **1 > 2 > 4 >> 8**. Additional
+permits cannot raise a ceiling set by a single writer; SQLite serializes
+regardless. All they can do is move contention from litewire's orderly
+FIFO queue into sqld's lock, which is the thing that degrades badly. The
+correct size for a semaphore in front of a single-writer engine is one.
+
+### What the permit has to know about transactions
+
+The subtle part is not the semaphore, it is deciding when to let go of
+it. An explicit transaction holds SQLite's write lock from its first
+write until `COMMIT`, so its permit must live exactly that long.
+
+Three cases were wrong in the dangerous direction before tests found
+them:
+
+- **`COMMIT` must never acquire.** If committing needed a permit, then
+  every permit being held by a transaction waiting to commit is a
+  deadlock. `COMMIT` only releases — and it carries the permit *across*
+  its own round trip rather than dropping it on entry, because sqld holds
+  the write lock until the commit lands.
+- **`END` is SQLite's synonym for `COMMIT`**, and litewire's statement
+  classifier had no entry for it. Treated as an ordinary statement, a
+  session that wrote inside `BEGIN … END` parked a permit and never gave
+  it back — a slow leak that ends with every write blocked forever. A
+  test caught it; review had not.
+- **`ROLLBACK TO savepoint` does not end a transaction.** It reads like a
+  rollback and classifies like one, but the transaction — and the write
+  lock — continue. Releasing there hands the permit to another writer
+  while the first still holds the lock.
+
+Acquisition is **lazy**, which falls out of the same reasoning: a plain
+`BEGIN` is deferred, and SQLite takes no write lock until the first
+write, so a read-only transaction takes no permit at all. That matters
+more than it sounds — wrapping reads in a transaction is something ORMs
+do constantly, and an eager implementation would have spent the whole
+permit budget on transactions that never write.
+
+### The honest bound
+
+This converts a collapse into a plateau. It does not make clustered sqld
+fast:
+
+| write path, c=16 | RPS |
+|---|---|
+| Single-node SQLite (rusqlite) | ~1130 |
+| Turso engine, single-node | ~1120 |
+| CDC-native cluster | ~876 |
+| **Clustered sqld, `write_permits = 1`** | **~598** |
+| Clustered sqld, default (`0`) | **0 completed** |
+
+Roughly half the single-node ceiling, and that gap is not tuning debt —
+it is one writer plus an HTTP round trip per statement. No permit count
+moves it, because the arithmetic above shows the writer is already
+saturated at one.
+
+The structural answer is a different replication design, not a better
+semaphore: [CDC-native clustering](/roadmap/turso-engine/) sustains ~876
+RPS at c=16 on the same fixture because it does not funnel writes through
+a single remote lock at all. Admission control makes the shipping
+clustered path **dependable**; v0.7 is where it gets fast.
+
+**Lesson:** when a system collapses instead of plateauing, the fix is
+usually to stop offering it work it cannot take, not to make the work
+cheaper — and the correct amount to offer is a property of the resource,
+which means it has to be measured rather than guessed. Sized by
+intuition, this knob would have been set to the CPU count and would have
+done nothing at all.
+
 ## Lazily-created tables make "absent" look like "broken"
 
 The same v0.6.0 pass found a cold-start defect in CDC replication worth

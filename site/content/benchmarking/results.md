@@ -228,6 +228,106 @@ a lane that failed it was discarded rather than reported.
   Tracked as a post-v0.6.0 follow-up — the backend-layer saving is real
   and measured, its delivery through the wire path is not yet.
 
+## v0.6.1 — the clustered-sqld write collapse, fixed
+
+v0.6.0's matrix found one outlier: **clustered SQLite via sqld collapsed
+under concurrent writes** while every other path scaled up. v0.6.1 adds
+`[db.sqlite.sqld] write_permits`, an opt-in cap on writes in flight
+against sqld. Full arc in
+[From zero to a plateau](/benchmarking/findings/#from-zero-to-a-plateau-write-admission-for-sqld);
+issue [ephpm#217](https://github.com/ephpm/ephpm/issues/217).
+
+**Provenance:** ePHPm `bab470e` (+ this change), litewire `62636c4c`. Lane C of
+the db matrix: 2 nodes, `--cpus 1` each, `write.php` (one autocommit
+INSERT per request), 15 s cells, 2 reps, 2 independent cluster bring-ups
+plus a same-binary confirmation run, replication verified before every
+measurement.
+
+### The failure was a hang, not an error
+
+Across the entire matrix there were **zero 5xx**. Completed cells were
+100% success; failed cells have an *empty* status-code distribution,
+`NaN` percentiles, and every client timing out. A dashboard watching RPS
+or error rate reads a total wedge as a small number — which is why the
+tables below report completed responses, not only throughput.
+
+### write.php throughput (RPS)
+
+| `write_permits` | c=1 | c=4 | c=8 | c=16 |
+|---|---|---|---|---|
+| **0** (default, = v0.6.0) | 442–455 | 118–552 *erratic* | **0 completed** | **0 completed** |
+| **1** (recommended) | 415–445 | 561–595 | 527–593 | **551–598** |
+| 2 | 443–445 | 497–532 | 520–573 | 565–574 |
+| 4 | 410–442 | 171–228 | 531–534 | 494–517 |
+| 8 | 444–451 | 232–266 | **0 completed** | **0 completed** |
+
+**Reads are unaffected:** `db.php` at c=16 measured 229–240 RPS across
+*every* setting including baseline. Reads never take a permit — WAL lets
+them run alongside the writer.
+
+### Config-only A/B: same binary, knob off vs on
+
+The sweep above changes the binary between the baseline row and the rest.
+This pass does not — one image, two config files — which isolates the
+knob from every other v0.6.1 change:
+
+| `write.php` c=16, one binary | RPS | completed in 15 s | 5xx | hangs |
+|---|---|---|---|---|
+| knob absent (default `0`) | 1.07 | **0** | 0 | all 16 |
+| `write_permits = 1` | **594–598** | **8,901–8,956** | 0 | none |
+
+p50 15.8 ms, p99 ~68 ms at `write_permits = 1`. With the knob absent the
+v0.6.1 binary reproduces the v0.6.0 collapse exactly — which is the
+evidence that the default of `0` is genuinely inert.
+
+### Why the recommended value is 1, not "as many as possible"
+
+- **The cliff sits between 4 and 8 concurrent writes reaching sqld.**
+  `write_permits = 8` is *above* it and reproduces the collapse exactly.
+  A permit count only helps if it is below the threshold of the resource
+  it protects.
+- **One permit already saturates the single writer.** 598 writes/s is
+  ~1.67 ms per serialized write — the same per-write cost the c=1 lane
+  shows. Higher values cannot raise the ceiling because SQLite
+  serializes regardless; they only move contention from litewire's FIFO
+  queue into sqld's lock. Monotone: 1 > 2 > 4 >> 8.
+
+### What this does not fix
+
+Admission control converts a **collapse into a plateau**. It does not
+make clustered sqld competitive:
+
+| Path (write.php, c=16) | RPS |
+|---|---|
+| Single-node SQLite (rusqlite) | ~1130 |
+| Turso engine, single-node | ~1120 |
+| CDC-native cluster | ~876 |
+| **Clustered sqld, `write_permits = 1`** | **~598** |
+| Clustered sqld, default (`0`) | **0 completed** |
+
+The remaining gap is single-writer physics plus an HTTP round trip per
+statement. Roughly half the single-node ceiling is the realistic target
+for this architecture, and no admission tuning moves it —
+[CDC-native clustering](/roadmap/turso-engine/) is the structural answer.
+
+### Caveats
+
+- **The default is `0` in v0.6.x**, so a *default* clustered deployment
+  still wedges at c≥8. Set `write_permits = 1` if you run clustered
+  SQLite under write load. The default is planned to become `1` in
+  v0.7.0.
+- **`c=4` is an unstable knee**, not a stable operating point. The
+  baseline measured 118 and 552 RPS on successive reps of the same cell.
+  Treat any single c=4 number from the unpatched path as meaningless.
+- **Autocommit workload.** One INSERT per request. A workload dominated
+  by multi-statement *explicit* transactions behaves differently: a
+  transaction holds its permit from first write to `COMMIT`, so values
+  above `1` let two transactions contend inside sqld again — `1` is
+  correct there for a second, independent reason.
+- Per methodology, `--cpus 1` and podman/WSL RTT ceilings mean the
+  absolute RPS does not transfer to a real cluster. The **deltas** —
+  "0 completed → ~598" and "8 is as bad as off" — are the durable claim.
+
 ## How to read these
 
 - **Absolute numbers are environment-specific.** The db.php p50 was
