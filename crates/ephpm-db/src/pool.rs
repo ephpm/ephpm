@@ -22,12 +22,65 @@ use crate::error::DbError;
 /// A boxed, send future. Used as the return type for closures stored in the pool.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
+/// Ping an idle connection at checkout when it has been parked at least this
+/// long.
+///
+/// A pooled backend can die while it sits in the idle queue — the server
+/// restarts, an idle timeout fires, a firewall reaps the flow — and nothing
+/// in the pool notices until the next caller writes to it and gets
+/// `BrokenPipe`. The background health check only samples every
+/// `health_check_interval` (30s by default), which leaves a window in which
+/// every checkout hands out a corpse.
+///
+/// Validating on *every* checkout would be correct but costs a full backend
+/// round trip (`COM_PING` / `SELECT 1`, roughly 50–100µs on loopback) on the
+/// hot path, which is the same order as the query it precedes. A connection
+/// handed back and immediately re-acquired cannot have died in the interim
+/// for any reason the ping would detect, so the check is skipped below this
+/// threshold: under sustained load the pool never pays for it, and a quiet
+/// site — the exact shape that exposes dead idle connections — always does.
+const VALIDATE_AFTER_IDLE: Duration = Duration::from_millis(500);
+
+/// Whether a pooled backend still has unread bytes waiting on it.
+///
+/// A client that ends its session without draining the response to its last
+/// command leaves the backend mid-conversation. The connection is perfectly
+/// alive, so nothing on the liveness path notices, but the leftover bytes
+/// would be read as the *next* session's response. Neither a `MySQL` server
+/// nor a pooled `PostgreSQL` connection sends unsolicited traffic in normal
+/// operation, so anything readable at end-of-session is leftover data and the
+/// connection must be discarded rather than recycled.
+///
+/// Non-blocking: a single `try_read`. It consumes a byte when data is present,
+/// which is harmless precisely because the caller discards the connection in
+/// that case.
+///
+/// Best-effort, and callers must treat it as such: `try_read` consults tokio's
+/// readiness cache and can report `WouldBlock` for data that has arrived but
+/// whose readiness event was lost when the reader half was cancelled. It may
+/// therefore miss a desynchronised connection; it will never falsely condemn a
+/// clean one.
+pub(crate) fn has_unread_bytes(stream: &TcpStream) -> bool {
+    let mut probe = [0u8; 1];
+    match stream.try_read(&mut probe) {
+        // Nothing waiting — the only case in which the connection is reusable.
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+        // `Ok(n > 0)` is leftover data, `Ok(0)` is EOF, and any other error
+        // means the socket is unhealthy. None of them are reusable.
+        Ok(_) | Err(_) => true,
+    }
+}
+
 /// Configuration parameters for the pool.
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
     /// Keep at least this many connections open at all times.
     pub min_connections: u32,
-    /// Never exceed this many connections (in-use + idle).
+    /// Never exceed this many concurrent checkouts.
+    ///
+    /// This also bounds live backend connections: a connection is only ever
+    /// dialled while its caller holds a permit, so the number in existence
+    /// cannot outgrow the peak number of simultaneous checkouts.
     pub max_connections: u32,
     /// Close idle connections that have been idle longer than this.
     pub idle_timeout: Duration,
@@ -40,14 +93,16 @@ pub struct PoolConfig {
 }
 
 /// An idle slot in the pool.
+///
+/// Deliberately holds no semaphore permit. A permit represents *a checkout in
+/// progress*, not *a connection that exists* — see [`Pool::acquire`] for why
+/// the distinction is load-bearing.
 struct Slot {
     stream: TcpStream,
     /// Time the backend connection was first established.
     created_at: Instant,
     /// Time the connection was last returned to the pool.
     last_used: Instant,
-    /// The semaphore permit "parked" with this idle connection.
-    permit: OwnedSemaphorePermit,
 }
 
 struct PoolState {
@@ -128,10 +183,38 @@ impl Pool {
         })
     }
 
+    /// Number of connections currently parked in the idle queue.
+    ///
+    /// Does not count connections that are checked out. Intended for tests and
+    /// diagnostics — the value is a snapshot and may be stale the moment it is
+    /// returned.
+    #[must_use]
+    pub fn idle_len(&self) -> usize {
+        self.state.idle.lock().len()
+    }
+
     /// Acquire a connection from the pool, waiting up to `pool_timeout`.
     ///
     /// Tries the idle queue first; creates a new connection if the queue is empty
     /// (within `max_connections` limit).
+    ///
+    /// Idle connections that have been parked longer than
+    /// [`VALIDATE_AFTER_IDLE`] are pinged before being handed out; one that
+    /// fails is discarded and the next candidate (or a fresh dial) is used
+    /// instead. A caller therefore never receives a connection the pool has
+    /// already observed to be dead.
+    ///
+    /// # Permit accounting
+    ///
+    /// A permit means "a checkout is in progress", not "a connection exists".
+    /// Idle connections hold none. This matters: permits were once parked with
+    /// idle slots, which made returning a connection *consume* a permit rather
+    /// than release one. Once `in-use + idle` reached `max_connections`,
+    /// nothing on the healthy path could free a permit again and every later
+    /// acquire blocked until `pool_timeout` — a pool full of perfectly good
+    /// connections that it could not hand out. That deadlock was masked for as
+    /// long as the proxy was killing connections on every request, because the
+    /// resulting discards released permits continuously.
     ///
     /// # Errors
     ///
@@ -169,18 +252,35 @@ impl Pool {
             let idle_ok = slot.last_used.elapsed() < self.config.idle_timeout;
 
             if age_ok && idle_ok {
-                // Discard the parked permit (we now hold `permit` from above).
-                drop(slot.permit);
+                // Validate before handing out. A connection that has been
+                // parked for a while may have been closed by the server with
+                // no local indication; writing to it is how the caller finds
+                // out, and by then the request has already failed.
+                let stream = if slot.last_used.elapsed() >= VALIDATE_AFTER_IDLE {
+                    match (self.ping)(slot.stream).await {
+                        Ok((stream, true)) => stream,
+                        Ok((_, false)) => {
+                            debug!("idle connection failed checkout validation, discarding");
+                            continue;
+                        }
+                        Err(e) => {
+                            debug!("idle connection validation I/O error, discarding: {e}");
+                            continue;
+                        }
+                    }
+                } else {
+                    slot.stream
+                };
+
                 return Ok(Checkout {
-                    stream: Some(slot.stream),
+                    stream: Some(stream),
                     permit: Some(permit),
                     created_at: slot.created_at,
                     pool: self.clone(),
                 });
             }
-            // Expired: discard both the stream and its parked permit.
+            // Expired: discard the stream and try the next candidate.
             debug!("discarding expired idle connection");
-            drop(slot.permit);
         }
 
         // No suitable idle connection — open a new one.
@@ -197,14 +297,26 @@ impl Pool {
     ///
     /// The caller must run the protocol-level reset (`COM_RESET_CONNECTION` /
     /// `DISCARD ALL`) before calling this. Pass the post-reset stream.
+    ///
+    /// The caller must also have established that the connection is still
+    /// live. Re-parking a connection the backend has already closed poisons
+    /// the idle queue: the next caller draws the corpse, fails, and — if its
+    /// failure path also recycles — puts it straight back. See
+    /// [`crate::mysql`] for the session-termination interception that keeps
+    /// this invariant on the proxy paths.
     pub(crate) fn recycle(
         &self,
         stream: TcpStream,
         created_at: Instant,
         permit: OwnedSemaphorePermit,
     ) {
-        let slot = Slot { stream, created_at, last_used: Instant::now(), permit };
+        let slot = Slot { stream, created_at, last_used: Instant::now() };
         self.state.idle.lock().push_back(slot);
+        // Release the permit *after* the connection is visible in the idle
+        // queue, so a caller woken by this release is guaranteed to find it.
+        // Dropping it is the point: returning a connection has to hand a
+        // permit back to whoever is waiting, not consume one.
+        drop(permit);
     }
 
     /// Reset a connection using the pool's reset closure and return it to idle.
@@ -258,27 +370,28 @@ impl Pool {
         if current_idle >= self.config.min_connections {
             return;
         }
-        let needed = self.config.min_connections - current_idle;
+        // Warm-up connections are parked directly rather than checked out, so
+        // they are not covered by a permit. Bound them by the semaphore's free
+        // capacity so warming can never push the live connection count past
+        // `max_connections` while checkouts are in flight.
+        let headroom = self.semaphore.available_permits().saturating_sub(current_idle as usize);
+        let needed = usize::try_from(self.config.min_connections - current_idle)
+            .unwrap_or(usize::MAX)
+            .min(headroom);
         for _ in 0..needed {
             if self.state.closed.load(Ordering::Acquire) {
                 break;
             }
-            // Try to grab a permit without blocking.
-            let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
-                break; // at max_connections
-            };
             match (self.connect)().await {
                 Ok(stream) => {
                     self.state.idle.lock().push_back(Slot {
                         stream,
                         created_at: Instant::now(),
                         last_used: Instant::now(),
-                        permit,
                     });
                 }
                 Err(e) => {
                     warn!("pool warm-up connection failed: {e}");
-                    // permit is dropped, freeing the slot
                 }
             }
         }
@@ -297,16 +410,13 @@ impl Pool {
                         stream,
                         created_at: slot.created_at,
                         last_used: slot.last_used,
-                        permit: slot.permit,
                     });
                 }
                 Ok((_, false)) => {
                     debug!("health check failed: dropping connection");
-                    // permit dropped here
                 }
                 Err(e) => {
                     debug!("health check I/O error: {e}");
-                    // permit dropped here
                 }
             }
         }
@@ -373,5 +483,49 @@ impl Drop for Checkout {
     fn drop(&mut self) {
         // If the stream was not taken, it is dropped here (connection closed).
         // The permit is also dropped, freeing the pool slot.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// Connect a client/server socket pair over loopback.
+    async fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).await.expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+        (client, server)
+    }
+
+    /// A connection whose peer has sent nothing is clean and must be reusable.
+    /// A false positive here would discard every healthy pooled connection.
+    #[tokio::test]
+    async fn quiet_connection_has_no_unread_bytes() {
+        let (client, _server) = socket_pair().await;
+        assert!(!has_unread_bytes(&client), "an idle connection must not be condemned");
+    }
+
+    /// Leftover response data must condemn the connection — that is the whole
+    /// point: those bytes would be read as the next session's reply.
+    #[tokio::test]
+    async fn pending_data_is_detected() {
+        let (client, mut server) = socket_pair().await;
+        server.write_all(b"leftover").await.expect("write");
+        client.readable().await.expect("readable");
+        assert!(has_unread_bytes(&client), "buffered peer data must condemn the connection");
+    }
+
+    /// A closed peer reads as EOF, which is likewise not reusable.
+    #[tokio::test]
+    async fn closed_peer_is_detected() {
+        let (client, server) = socket_pair().await;
+        drop(server);
+        client.readable().await.expect("readable");
+        assert!(has_unread_bytes(&client), "a peer that closed must condemn the connection");
     }
 }

@@ -4,6 +4,8 @@
 //! requiring a real database server. Uses `tokio::net::TcpListener` to
 //! simulate a backend.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use ephpm_db::error::DbError;
@@ -132,4 +134,175 @@ async fn close_rejects_new_acquires() {
     assert!(result.is_err(), "acquire after close should fail");
     let err = result.err().unwrap();
     assert!(matches!(err, DbError::PoolClosed), "error should be PoolClosed, got: {err}");
+}
+
+// ── Checkout-time validation ─────────────────────────────────────────────────
+
+/// Build a pool whose `ping` verdict and dial count are observable.
+///
+/// `alive` decides what the ping closure reports; `pings` and `connects` count
+/// how often each closure ran.
+fn instrumented_pool(
+    addr: std::net::SocketAddr,
+    alive: bool,
+) -> (Pool, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let connects = Arc::new(AtomicUsize::new(0));
+    let pings = Arc::new(AtomicUsize::new(0));
+
+    let connects_c = Arc::clone(&connects);
+    let connect = move || -> ephpm_db::pool::BoxFuture<Result<TcpStream, DbError>> {
+        let counter = Arc::clone(&connects_c);
+        Box::pin(async move {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(TcpStream::connect(addr).await?)
+        })
+    };
+    let reset = |s: TcpStream| -> ephpm_db::pool::BoxFuture<Result<TcpStream, DbError>> {
+        Box::pin(async { Ok(s) })
+    };
+    let pings_c = Arc::clone(&pings);
+    let ping =
+        move |s: TcpStream| -> ephpm_db::pool::BoxFuture<Result<(TcpStream, bool), DbError>> {
+            let counter = Arc::clone(&pings_c);
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok((s, alive))
+            })
+        };
+
+    (Pool::new(test_config(4), connect, reset, ping), connects, pings)
+}
+
+/// A connection returned and immediately re-acquired cannot have died in the
+/// interim for any reason a ping would catch, so the checkout must not pay for
+/// one. This is what keeps validation off the hot path under load.
+#[tokio::test]
+async fn acquire_skips_validation_for_a_freshly_returned_connection() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            held.push(s);
+        }
+    });
+
+    let (pool, connects, pings) = instrumented_pool(addr, true);
+
+    let mut checkout = pool.acquire().await.unwrap();
+    let stream = checkout.take_stream();
+    checkout.return_to_pool(stream);
+
+    let second = pool.acquire().await;
+    assert!(second.is_ok(), "re-acquire should succeed");
+    assert_eq!(pings.load(Ordering::SeqCst), 0, "no ping should run inside the validation window");
+    assert_eq!(connects.load(Ordering::SeqCst), 1, "the idle connection should have been reused");
+
+    accept.abort();
+}
+
+/// Past the idle threshold the connection is pinged, and a ping that reports
+/// "dead" must cause the pool to discard the slot and dial fresh rather than
+/// hand out a socket it already knows is gone.
+#[tokio::test]
+async fn acquire_discards_an_idle_connection_that_fails_validation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            held.push(s);
+        }
+    });
+
+    let (pool, connects, pings) = instrumented_pool(addr, false);
+
+    let mut checkout = pool.acquire().await.unwrap();
+    let stream = checkout.take_stream();
+    checkout.return_to_pool(stream);
+    assert_eq!(pool.idle_len(), 1, "connection should be parked");
+
+    // Wait past the pool's 500ms checkout-validation threshold.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let second = pool.acquire().await;
+    assert!(second.is_ok(), "acquire should recover by dialling a fresh connection");
+    assert_eq!(pings.load(Ordering::SeqCst), 1, "the idle connection should have been pinged");
+    assert_eq!(connects.load(Ordering::SeqCst), 2, "a fresh connection should have been dialled");
+    assert_eq!(pool.idle_len(), 0, "the failed connection must not be left in the idle queue");
+
+    accept.abort();
+}
+
+/// A live connection that has been idle a while is pinged and then handed out
+/// — validation must not throw away healthy connections.
+#[tokio::test]
+async fn acquire_keeps_an_idle_connection_that_passes_validation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            held.push(s);
+        }
+    });
+
+    let (pool, connects, pings) = instrumented_pool(addr, true);
+
+    let mut checkout = pool.acquire().await.unwrap();
+    let stream = checkout.take_stream();
+    checkout.return_to_pool(stream);
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let second = pool.acquire().await;
+    assert!(second.is_ok(), "acquire should succeed");
+    assert_eq!(pings.load(Ordering::SeqCst), 1, "the idle connection should have been pinged");
+    assert_eq!(connects.load(Ordering::SeqCst), 1, "no redial should have been needed");
+
+    accept.abort();
+}
+
+/// Every idle connection parks a semaphore permit. If `acquire` demands a
+/// *fresh* permit before consulting the idle queue, a pool that has grown to
+/// `max_connections` can never hand out the connections it already holds:
+/// returning a connection parks a permit rather than releasing one, so nothing
+/// on the healthy path ever frees one again and every later acquire blocks
+/// until `pool_timeout`.
+///
+/// This is a pool-accounting bug, not a protocol bug — it needs enough
+/// concurrency to grow the pool to its ceiling, which a sequential probe
+/// structurally cannot do.
+#[tokio::test]
+async fn acquire_reuses_idle_connections_when_the_pool_is_at_capacity() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            held.push(s);
+        }
+    });
+
+    let (pool, connects, _pings) = instrumented_pool(addr, true);
+
+    // Grow the pool to max_connections (4) concurrently, then return them all.
+    let mut checkouts = Vec::new();
+    for _ in 0..4 {
+        checkouts.push(pool.acquire().await.expect("initial acquire"));
+    }
+    for mut checkout in checkouts {
+        let stream = checkout.take_stream();
+        checkout.return_to_pool(stream);
+    }
+    assert_eq!(pool.idle_len(), 4, "pool should now be full of idle connections");
+    assert_eq!(connects.load(Ordering::SeqCst), 4, "should have dialled exactly max_connections");
+
+    // The pool holds four perfectly good connections. Handing one out must not
+    // require a permit that only a discard could ever produce.
+    let checkout = pool.acquire().await;
+    assert!(checkout.is_ok(), "acquire must reuse an idle connection; it timed out instead");
+    assert_eq!(connects.load(Ordering::SeqCst), 4, "should have reused, not redialled");
+
+    accept.abort();
 }
