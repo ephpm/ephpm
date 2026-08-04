@@ -11,8 +11,12 @@
 //!    credential validation — loopback only), sends synthetic metadata,
 //!    and starts bidirectional byte forwarding.
 //!
-//! 3. When the client closes or sends `Terminate`, the proxy sends
-//!    `DISCARD ALL` to the backend and returns the connection to the pool.
+//! 3. When the client closes or sends `Terminate`, the proxy closes only the
+//!    client-facing socket. `Terminate` is **intercepted, never forwarded** —
+//!    the backend is shared across sessions and closing it would poison the
+//!    pool. The proxy then sends `DISCARD ALL` to the backend (unless
+//!    `reset_strategy = "never"`) and returns the still-open connection to the
+//!    pool.
 //!
 //! ## Auth support
 //!
@@ -294,10 +298,8 @@ impl PgProxy {
             let mut checkout = self.pool.acquire().await?;
             let backend = checkout.take_stream();
 
-            let result = pg_proxy_bidirectional(client, backend).await;
-
-            match result {
-                Ok(backend) => match self.reset_strategy {
+            match pg_proxy_bidirectional(client, backend).await {
+                Some(backend) => match self.reset_strategy {
                     ResetStrategy::Never => {
                         checkout.return_to_pool(backend);
                     }
@@ -308,8 +310,8 @@ impl PgProxy {
                         unreachable!()
                     }
                 },
-                Err(e) => {
-                    debug!("proxy session error, discarding backend connection: {e}");
+                None => {
+                    debug!("backend connection failed during session; discarding, not recycling");
                     checkout.retire();
                 }
             }
@@ -905,35 +907,103 @@ async fn pg_ping_connection(mut stream: TcpStream) -> Result<(TcpStream, bool), 
 
 // ── Bidirectional proxy ─────────────────────────────────────────────────────
 
-/// Splice `client` ↔ `backend` until one side closes.
+/// Which side of the proxy ended a session.
 ///
-/// Returns the backend stream on clean close so it can be reset and recycled.
+/// See the MySQL counterpart in [`crate::mysql`] — the same reasoning applies:
+/// both sides report identical `io::ErrorKind` values, so error kind alone
+/// cannot decide whether a pooled backend is still usable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PgSessionEnd {
+    /// The client finished — `Terminate`, EOF, or a failure on the client
+    /// socket. The backend never learned the session ended.
+    Client,
+    /// The backend connection failed or closed. It must be discarded.
+    Backend,
+}
+
+/// Relay `client` ↔ `backend` until the session ends.
+///
+/// Returns the backend stream when the *client* ended the session, and `None`
+/// when the backend failed and must be discarded rather than recycled.
+///
+/// ## `Terminate` is intercepted, never forwarded
+///
+/// `Terminate` (`'X'`) is the PG frontend's "close this connection" message —
+/// PDO sends it when the request ends. Relaying it to a *pooled* backend makes
+/// the server close the connection, and the pool then hands that dead socket
+/// to the next request. It is swallowed here, exactly as `COM_QUIT` is on the
+/// MySQL side.
+///
+/// ## Framing
+///
+/// Post-startup PG frontend messages are uniformly `[tag: 1][len: 4BE][payload]`,
+/// so the client→backend direction can be framed without understanding any
+/// individual message — enough to spot `Terminate`. The backend→client
+/// direction is copied in bulk but hand-rolled so an I/O error can be
+/// attributed to the side that produced it.
 async fn pg_proxy_bidirectional(
     mut client: TcpStream,
     mut backend: TcpStream,
-) -> Result<TcpStream, DbError> {
-    let result = {
+) -> Option<TcpStream> {
+    let end = {
         let (mut cr, mut cw) = client.split();
         let (mut br, mut bw) = backend.split();
 
-        let client_to_backend = tokio::io::copy(&mut cr, &mut bw);
-        let backend_to_client = tokio::io::copy(&mut br, &mut cw);
+        let client_to_backend = async {
+            let mut header = [0u8; 5];
+            loop {
+                // Any read failure is a client-side event and says nothing
+                // about the health of the backend.
+                if cr.read_exact(&mut header).await.is_err() {
+                    return PgSessionEnd::Client;
+                }
+                if header[0] == MSG_TERMINATE {
+                    debug!("client sent Terminate; not forwarding to pooled backend");
+                    return PgSessionEnd::Client;
+                }
+                let len = i32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+                if !(4..=MAX_PG_MESSAGE_LEN).contains(&len) {
+                    debug!(len, "client sent an out-of-range PG message length; ending session");
+                    return PgSessionEnd::Client;
+                }
+                let payload_len = usize::try_from(len - 4).unwrap_or(0);
+                let mut payload = vec![0u8; payload_len];
+                if payload_len > 0 && cr.read_exact(&mut payload).await.is_err() {
+                    return PgSessionEnd::Client;
+                }
+
+                if bw.write_all(&header).await.is_err() || bw.write_all(&payload).await.is_err() {
+                    return PgSessionEnd::Backend;
+                }
+            }
+        };
+
+        let backend_to_client = async {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match br.read(&mut buf).await {
+                    Ok(n) if n > 0 => {
+                        if cw.write_all(&buf[..n]).await.is_err() {
+                            return PgSessionEnd::Client;
+                        }
+                    }
+                    // `Ok(0)` is backend EOF; `Err` is a backend read failure.
+                    // With `Terminate` no longer forwarded, EOF means the
+                    // server genuinely closed the connection.
+                    Ok(_) | Err(_) => return PgSessionEnd::Backend,
+                }
+            }
+        };
 
         tokio::select! {
-            r = client_to_backend => r,
-            r = backend_to_client => r,
+            e = client_to_backend => e,
+            e = backend_to_client => e,
         }
     };
 
-    match result {
-        Ok(_) => Ok(backend),
-        Err(e)
-            if e.kind() == std::io::ErrorKind::ConnectionReset
-                || e.kind() == std::io::ErrorKind::BrokenPipe =>
-        {
-            Ok(backend)
-        }
-        Err(e) => Err(DbError::Io(e)),
+    match end {
+        PgSessionEnd::Client => Some(backend),
+        PgSessionEnd::Backend => None,
     }
 }
 
@@ -1046,6 +1116,10 @@ async fn pg_proxy_routing_loop(
         };
 
         if tag == MSG_TERMINATE {
+            // Session termination belongs to the client-facing socket only.
+            // Pooled backends are shared across sessions and must never see
+            // it — see `pg_proxy_bidirectional` for the full rationale.
+            debug!("client sent Terminate; ending session without touching pooled backends");
             break;
         }
 
@@ -1090,21 +1164,32 @@ async fn pg_proxy_routing_loop(
         let mut checkout = target_pool.acquire().await?;
         let mut backend = checkout.take_stream();
 
-        write_pg_message(&mut backend, tag, &payload).await?;
-
-        // Forward response(s) until ReadyForQuery — or until the backend hands
-        // the conversation back to the client via a copy sub-protocol, in
-        // which case no further backend output is coming.
+        // Any failure below leaves the backend mid-message or mid-result-set.
+        // Discard it explicitly rather than letting control flow reach a
+        // `return_to_pool`.
         let mut copy_mode = false;
-        loop {
-            let resp_tag = forward_pg_message(&mut backend, &mut client).await?;
-            if resp_tag == MSG_READY_FOR_QUERY {
-                break;
+        let relay: Result<(), DbError> = async {
+            write_pg_message(&mut backend, tag, &payload).await?;
+
+            // Forward response(s) until ReadyForQuery — or until the backend
+            // hands the conversation back to the client via a copy
+            // sub-protocol, in which case no further backend output is coming.
+            loop {
+                let resp_tag = forward_pg_message(&mut backend, &mut client).await?;
+                if resp_tag == MSG_READY_FOR_QUERY {
+                    return Ok(());
+                }
+                if resp_tag == MSG_COPY_IN_RESPONSE || resp_tag == MSG_COPY_BOTH_RESPONSE {
+                    copy_mode = true;
+                    return Ok(());
+                }
             }
-            if resp_tag == MSG_COPY_IN_RESPONSE || resp_tag == MSG_COPY_BOTH_RESPONSE {
-                copy_mode = true;
-                break;
-            }
+        }
+        .await;
+        if let Err(e) = relay {
+            debug!("backend relay failed, discarding connection: {e}");
+            checkout.retire();
+            return Err(e);
         }
 
         if copy_mode {
@@ -1153,15 +1238,15 @@ async fn pg_relay_pinned_session(
     reset_strategy: ResetStrategy,
 ) -> Result<(), DbError> {
     match pg_proxy_bidirectional(client, backend).await {
-        Ok(backend) => {
+        Some(backend) => {
             if matches!(reset_strategy, ResetStrategy::Never) {
                 checkout.return_to_pool(backend);
             } else {
                 checkout.return_with_reset(backend).await;
             }
         }
-        Err(e) => {
-            debug!("pinned session error, discarding backend connection: {e}");
+        None => {
+            debug!("pinned session backend failed; discarding, not recycling");
             checkout.retire();
         }
     }

@@ -22,6 +22,25 @@ use crate::error::DbError;
 /// A boxed, send future. Used as the return type for closures stored in the pool.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
+/// Ping an idle connection at checkout when it has been parked at least this
+/// long.
+///
+/// A pooled backend can die while it sits in the idle queue — the server
+/// restarts, an idle timeout fires, a firewall reaps the flow — and nothing
+/// in the pool notices until the next caller writes to it and gets
+/// `BrokenPipe`. The background health check only samples every
+/// `health_check_interval` (30s by default), which leaves a window in which
+/// every checkout hands out a corpse.
+///
+/// Validating on *every* checkout would be correct but costs a full backend
+/// round trip (`COM_PING` / `SELECT 1`, roughly 50–100µs on loopback) on the
+/// hot path, which is the same order as the query it precedes. A connection
+/// handed back and immediately re-acquired cannot have died in the interim
+/// for any reason the ping would detect, so the check is skipped below this
+/// threshold: under sustained load the pool never pays for it, and a quiet
+/// site — the exact shape that exposes dead idle connections — always does.
+const VALIDATE_AFTER_IDLE: Duration = Duration::from_millis(500);
+
 /// Configuration parameters for the pool.
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
@@ -128,10 +147,26 @@ impl Pool {
         })
     }
 
+    /// Number of connections currently parked in the idle queue.
+    ///
+    /// Does not count connections that are checked out. Intended for tests and
+    /// diagnostics — the value is a snapshot and may be stale the moment it is
+    /// returned.
+    #[must_use]
+    pub fn idle_len(&self) -> usize {
+        self.state.idle.lock().len()
+    }
+
     /// Acquire a connection from the pool, waiting up to `pool_timeout`.
     ///
     /// Tries the idle queue first; creates a new connection if the queue is empty
     /// (within `max_connections` limit).
+    ///
+    /// Idle connections that have been parked longer than
+    /// [`VALIDATE_AFTER_IDLE`] are pinged before being handed out; one that
+    /// fails is discarded and the next candidate (or a fresh dial) is used
+    /// instead. A caller therefore never receives a connection the pool has
+    /// already observed to be dead.
     ///
     /// # Errors
     ///
@@ -171,8 +206,29 @@ impl Pool {
             if age_ok && idle_ok {
                 // Discard the parked permit (we now hold `permit` from above).
                 drop(slot.permit);
+
+                // Validate before handing out. A connection that has been
+                // parked for a while may have been closed by the server with
+                // no local indication; writing to it is how the caller finds
+                // out, and by then the request has already failed.
+                let stream = if slot.last_used.elapsed() >= VALIDATE_AFTER_IDLE {
+                    match (self.ping)(slot.stream).await {
+                        Ok((stream, true)) => stream,
+                        Ok((_, false)) => {
+                            debug!("idle connection failed checkout validation, discarding");
+                            continue;
+                        }
+                        Err(e) => {
+                            debug!("idle connection validation I/O error, discarding: {e}");
+                            continue;
+                        }
+                    }
+                } else {
+                    slot.stream
+                };
+
                 return Ok(Checkout {
-                    stream: Some(slot.stream),
+                    stream: Some(stream),
                     permit: Some(permit),
                     created_at: slot.created_at,
                     pool: self.clone(),
@@ -197,6 +253,13 @@ impl Pool {
     ///
     /// The caller must run the protocol-level reset (`COM_RESET_CONNECTION` /
     /// `DISCARD ALL`) before calling this. Pass the post-reset stream.
+    ///
+    /// The caller must also have established that the connection is still
+    /// live. Re-parking a connection the backend has already closed poisons
+    /// the idle queue: the next caller draws the corpse, fails, and — if its
+    /// failure path also recycles — puts it straight back. See
+    /// [`crate::mysql`] for the session-termination interception that keeps
+    /// this invariant on the proxy paths.
     pub(crate) fn recycle(
         &self,
         stream: TcpStream,

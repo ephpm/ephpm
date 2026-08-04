@@ -15,10 +15,13 @@
 //!    d. Starts bidirectional byte forwarding between the client and a
 //!    checked-out backend connection.
 //!
-//! 3. When the client closes its connection, the proxy sends
-//!    `COM_RESET_CONNECTION` to the backend (resets session variables,
-//!    temporary tables, prepared statements, etc.) and returns the
-//!    connection to the pool.
+//! 3. When the client ends its session — `COM_QUIT` or a plain socket close —
+//!    the proxy closes only the client-facing socket. `COM_QUIT` is
+//!    **intercepted, never forwarded**: the backend is shared across sessions
+//!    and closing it would poison the pool. Depending on `reset_strategy` the
+//!    proxy then sends `COM_RESET_CONNECTION` to the backend (resetting
+//!    session variables, temporary tables, prepared statements, etc.) and
+//!    returns the still-open connection to the pool.
 //!
 //! ## Auth plugin support
 //!
@@ -303,31 +306,29 @@ impl MySqlProxy {
             .await;
         }
 
-        // Single-backend bidirectional path. Use a dirty-sniffing copier for
-        // the client→backend direction so `Smart` can skip the reset for
-        // read-only sessions; raw byte copy in the other direction.
+        // Single-backend path. Every strategy goes through the packet-aware
+        // relay: intercepting `COM_QUIT` requires seeing packet boundaries, so
+        // there is no correct byte-copy variant for a *pooled* backend. The
+        // `dirty` bit it produces is only consulted by `Smart`.
         let mut checkout = self.pool.acquire().await?;
         let backend = checkout.take_stream();
 
-        let result = match self.reset_strategy {
-            ResetStrategy::Smart => proxy_bidirectional_sniff(client, backend).await,
-            _ => proxy_bidirectional(client, backend).await.map(|b| (b, true)),
-        };
+        let outcome = proxy_bidirectional_sniff(client, backend).await;
 
-        match result {
-            Ok((backend, dirty)) => match self.reset_strategy {
+        match outcome.backend {
+            Some(backend) => match self.reset_strategy {
                 ResetStrategy::Never => checkout.return_to_pool(backend),
                 ResetStrategy::Always => checkout.return_with_reset(backend).await,
                 ResetStrategy::Smart => {
-                    if dirty {
+                    if outcome.dirty {
                         checkout.return_with_reset(backend).await;
                     } else {
                         checkout.return_to_pool(backend);
                     }
                 }
             },
-            Err(e) => {
-                debug!("proxy session error, discarding backend connection: {e}");
+            None => {
+                debug!("backend connection failed during session; discarding, not recycling");
                 checkout.retire();
             }
         }
@@ -950,92 +951,114 @@ async fn ping_connection(mut stream: TcpStream) -> Result<(TcpStream, bool), DbE
 
 // ── Bidirectional proxy ───────────────────────────────────────────────────────
 
-/// Splice `client` ↔ `backend` until one side closes.
+/// Which side of the proxy ended a session.
 ///
-/// Returns the backend stream on clean close so it can be reset and recycled.
-/// Returns `Err` if an I/O error occurs (backend is discarded).
-async fn proxy_bidirectional(
-    mut client: TcpStream,
-    mut backend: TcpStream,
-) -> Result<TcpStream, DbError> {
-    // Scope the split halves so the borrows end before we move `backend`.
-    let result = {
-        let (mut cr, mut cw) = client.split();
-        let (mut br, mut bw) = backend.split();
-
-        let client_to_backend = tokio::io::copy(&mut cr, &mut bw);
-        let backend_to_client = tokio::io::copy(&mut br, &mut cw);
-
-        // Run both directions concurrently. When one direction closes, shut down
-        // the other. `copy` returns 0 bytes on clean EOF.
-        tokio::select! {
-            r = client_to_backend => r,
-            r = backend_to_client => r,
-        }
-    };
-
-    match result {
-        Ok(_) => Ok(backend),
-        Err(e)
-            if e.kind() == std::io::ErrorKind::ConnectionReset
-                || e.kind() == std::io::ErrorKind::BrokenPipe =>
-        {
-            Ok(backend)
-        }
-        Err(e) => Err(DbError::Io(e)),
-    }
+/// The distinction decides whether the pooled backend may be recycled. Both
+/// sides report the same `io::ErrorKind` values (`BrokenPipe`,
+/// `ConnectionReset`), so the kind alone cannot be used: a client that
+/// disappears mid-response and a backend that has closed are
+/// indistinguishable by error kind, and treating the latter as a clean end
+/// re-parks a dead socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionEnd {
+    /// The client finished — orderly `COM_QUIT`, EOF, or a failure on the
+    /// client socket. The backend was never told the session ended, so it is
+    /// still usable.
+    Client,
+    /// The backend connection failed or closed. It must be discarded.
+    Backend,
 }
 
-/// Packet-aware bidirectional proxy that records whether the client ever
-/// issued anything other than a read-only command. Returns
-/// `(backend, dirty)` where `dirty == true` means the session must be reset
-/// before the backend returns to the pool (`SET`, `INSERT`, `BEGIN`,
-/// prepared statements, `USE`, etc.). A pure-`SELECT` session reports
-/// `dirty == false`, allowing the Smart strategy to skip the
-/// `COM_RESET_CONNECTION` round-trip.
+/// Result of proxying one client session over a pooled backend.
+struct SessionOutcome {
+    /// The backend stream, or `None` when the backend must be discarded.
+    ///
+    /// Deliberately not a `Result`: the previous signature returned
+    /// `Ok((backend, dirty))` for `BrokenPipe`/`ConnectionReset`, which is how
+    /// a dead backend got recycled as if the session had ended cleanly. Making
+    /// "backend still usable" the payload rather than the error discriminant
+    /// removes that failure mode by construction.
+    backend: Option<TcpStream>,
+    /// Whether the client issued anything that requires a session reset.
+    dirty: bool,
+}
+
+/// Packet-aware bidirectional proxy for one client session.
 ///
-/// The client→backend stream is parsed packet-by-packet so we can inspect
-/// the command byte and (for `COM_QUERY`) the SQL keyword. The
-/// backend→client stream is byte-copied with `tokio::io::copy` since we
-/// don't need to understand it — we just flush it back to the client.
+/// Records whether the client ever issued anything other than a read-only
+/// command: `dirty == true` means the session must be reset before the
+/// backend returns to the pool (`SET`, `INSERT`, `BEGIN`, prepared
+/// statements, `USE`, etc.). A pure-`SELECT` session reports `dirty ==
+/// false`, allowing the Smart strategy to skip the `COM_RESET_CONNECTION`
+/// round trip.
+///
+/// ## `COM_QUIT` is intercepted, never forwarded
+///
+/// PHP has no idea the proxy pools anything. When a request ends, PDO
+/// destroys its handle and mysqlnd sends `COM_QUIT` — a request to *close the
+/// connection*, which is correct for the client-facing socket and catastrophic
+/// for the pooled one. Relaying it makes the backend close, and every
+/// subsequent checkout of that slot draws a corpse. `COM_QUIT` therefore
+/// terminates the relay loop here and is dropped on the floor; the backend
+/// never learns the client went away and is recycled alive.
+///
+/// The same reasoning applies to a client that simply closes its socket: EOF
+/// on the client side is a client-side event and must not be relayed as a
+/// backend shutdown.
+///
+/// ## Framing
+///
+/// Both directions are framed rather than byte-copied. The client→backend
+/// direction has to be, in order to see command bytes at all; the
+/// backend→client direction is hand-copied so that an error can be
+/// attributed to the side that produced it (see [`SessionEnd`]).
+///
+/// ## Known limitation
+///
+/// A client that pipelines — writes `COM_QUIT` without having read the
+/// response to its previous command — can leave unread bytes on the backend
+/// socket, which would desynchronise the next session on that connection.
+/// `mysqlnd` is strictly synchronous so this does not arise in practice, and
+/// the checkout-time validation in [`crate::pool::Pool::acquire`] rejects a
+/// connection left in that state rather than handing it out.
 async fn proxy_bidirectional_sniff(
     mut client: TcpStream,
     mut backend: TcpStream,
-) -> Result<(TcpStream, bool), DbError> {
+) -> SessionOutcome {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let dirty = Arc::new(AtomicBool::new(false));
     let dirty_w = Arc::clone(&dirty);
 
-    let result = {
+    let end = {
         let (mut cr, mut cw) = client.split();
         let (mut br, mut bw) = backend.split();
 
         let client_to_backend = async {
             loop {
                 let mut header = [0u8; 4];
-                match cr.read_exact(&mut header).await {
-                    Ok(_) => {}
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::UnexpectedEof
-                                | std::io::ErrorKind::ConnectionReset
-                                | std::io::ErrorKind::BrokenPipe
-                        ) =>
-                    {
-                        return Ok::<(), std::io::Error>(());
-                    }
-                    Err(e) => return Err(e),
+                // Any read failure here is a client-side event: EOF, reset, or
+                // a half-written packet. None of them say anything about the
+                // backend.
+                if cr.read_exact(&mut header).await.is_err() {
+                    return SessionEnd::Client;
                 }
                 let len = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
                 let mut payload = vec![0u8; len];
-                cr.read_exact(&mut payload).await?;
+                if cr.read_exact(&mut payload).await.is_err() {
+                    return SessionEnd::Client;
+                }
 
                 if let Some(&cmd) = payload.first() {
+                    // Session termination: swallow it. Forwarding this is the
+                    // pool-poisoning bug — see the function docs.
+                    if cmd == COM_QUIT {
+                        debug!("client sent COM_QUIT; not forwarding to pooled backend");
+                        return SessionEnd::Client;
+                    }
                     let writeish = match cmd {
-                        COM_QUIT | 0x0E /* COM_PING */ => false,
+                        0x0E /* COM_PING */ => false,
                         COM_QUERY => {
                             let sql = std::str::from_utf8(&payload[1..]).unwrap_or("");
                             !matches!(classify_mysql_query(sql), QueryKind::Read)
@@ -1047,30 +1070,45 @@ async fn proxy_bidirectional_sniff(
                     }
                 }
 
-                bw.write_all(&header).await?;
-                bw.write_all(&payload).await?;
+                if bw.write_all(&header).await.is_err() || bw.write_all(&payload).await.is_err() {
+                    return SessionEnd::Backend;
+                }
             }
         };
 
-        let backend_to_client = tokio::io::copy(&mut br, &mut cw);
+        let backend_to_client = async {
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match br.read(&mut buf).await {
+                    Ok(n) if n > 0 => {
+                        if cw.write_all(&buf[..n]).await.is_err() {
+                            return SessionEnd::Client;
+                        }
+                    }
+                    // `Ok(0)` is backend EOF; `Err` is a backend read failure.
+                    // Once COM_QUIT is no longer forwarded, EOF means the
+                    // server really did drop the connection — either way the
+                    // stream is not reusable.
+                    Ok(_) | Err(_) => return SessionEnd::Backend,
+                }
+            }
+        };
 
+        // Both branches are cancel-safe at the point the other completes:
+        // `read` consumes nothing when dropped, and a cancelled write targets
+        // the side that has already gone away.
         tokio::select! {
-            r = client_to_backend => r.map(|()| 0u64),
-            r = backend_to_client => r,
+            e = client_to_backend => e,
+            e = backend_to_client => e,
         }
     };
 
-    match result {
-        Ok(_) => Ok((backend, dirty.load(std::sync::atomic::Ordering::Relaxed))),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
-            ) =>
-        {
-            Ok((backend, dirty.load(std::sync::atomic::Ordering::Relaxed)))
-        }
-        Err(e) => Err(DbError::Io(e)),
+    SessionOutcome {
+        backend: match end {
+            SessionEnd::Client => Some(backend),
+            SessionEnd::Backend => None,
+        },
+        dirty: dirty.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
 
@@ -1491,6 +1529,32 @@ fn track_dirty(state: &mut ClientState, payload: &[u8], query_kind: QueryKind) {
     }
 }
 
+/// Forward one client command to `backend` and relay the response.
+///
+/// Returns the prepared-statement id when `payload` was a `COM_STMT_PREPARE`
+/// the backend accepted, `None` otherwise.
+///
+/// # Errors
+///
+/// Any error leaves the backend connection in an unknown protocol state — a
+/// partially written command, a partially drained result set. The caller must
+/// discard the connection; returning it to the pool would desynchronise
+/// whichever session picks it up next.
+async fn relay_one_command(
+    backend: &mut TcpStream,
+    client: &mut TcpStream,
+    seq: u8,
+    payload: &[u8],
+) -> Result<Option<u32>, DbError> {
+    write_packet(backend, seq, payload).await?;
+    match payload[0] {
+        COM_STMT_PREPARE => forward_prepare_response(backend, client).await,
+        // COM_STMT_CLOSE is fire-and-forget — the server sends no response.
+        COM_STMT_CLOSE => Ok(None),
+        _ => forward_mysql_response(backend, client).await.map(|()| None),
+    }
+}
+
 /// Proxy loop with per-query routing and dirty-bit tracking.
 ///
 /// Handles `COM_QUERY` and the full prepared statement protocol
@@ -1521,6 +1585,10 @@ async fn proxy_routing_loop(
 
         let cmd = payload[0];
         if cmd == COM_QUIT {
+            // Session termination belongs to the client-facing socket only.
+            // The pooled backends are shared across sessions and must never
+            // see it — see `proxy_bidirectional_sniff` for the full rationale.
+            debug!("client sent COM_QUIT; ending session without touching pooled backends");
             break;
         }
 
@@ -1539,8 +1607,19 @@ async fn proxy_routing_loop(
         let mut checkout = target_pool.acquire().await?;
         let mut backend = checkout.take_stream();
 
+        // A relay failure means this backend is no longer in a known protocol
+        // state. Discard it explicitly — never let it fall through to a
+        // `return_to_pool` below.
+        let prepared = match relay_one_command(&mut backend, &mut client, seq, &payload).await {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                debug!("backend relay failed, discarding connection: {e}");
+                checkout.retire();
+                return Err(e);
+            }
+        };
+
         if cmd == COM_STMT_PREPARE {
-            write_packet(&mut backend, seq, &payload).await?;
             let pool_target = if std::ptr::eq(target_pool, pool) {
                 PoolTarget::Primary
             } else {
@@ -1549,20 +1628,16 @@ async fn proxy_routing_loop(
                     replica_pools.iter().position(|r| std::ptr::eq(target_pool, r)).unwrap_or(0);
                 PoolTarget::Replica(idx)
             };
-            if let Some(stmt_id) = forward_prepare_response(&mut backend, &mut client).await? {
+            if let Some(stmt_id) = prepared {
                 stmt_pool_map.insert(stmt_id, pool_target);
                 debug!(stmt_id, ?pool_target, "prepared statement registered");
             }
         } else if cmd == COM_STMT_CLOSE {
-            write_packet(&mut backend, seq, &payload).await?;
             if let Some(stmt_id) = parse_stmt_id(&payload) {
                 if let Some(removed) = stmt_pool_map.remove(&stmt_id) {
                     debug!(stmt_id, ?removed, "prepared statement closed");
                 }
             }
-        } else {
-            write_packet(&mut backend, seq, &payload).await?;
-            forward_mysql_response(&mut backend, &mut client).await?;
         }
 
         // Return backend to pool.
