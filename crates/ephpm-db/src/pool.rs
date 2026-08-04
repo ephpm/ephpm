@@ -41,6 +41,36 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// site — the exact shape that exposes dead idle connections — always does.
 const VALIDATE_AFTER_IDLE: Duration = Duration::from_millis(500);
 
+/// Whether a pooled backend still has unread bytes waiting on it.
+///
+/// A client that ends its session without draining the response to its last
+/// command leaves the backend mid-conversation. The connection is perfectly
+/// alive, so nothing on the liveness path notices, but the leftover bytes
+/// would be read as the *next* session's response. Neither a `MySQL` server
+/// nor a pooled `PostgreSQL` connection sends unsolicited traffic in normal
+/// operation, so anything readable at end-of-session is leftover data and the
+/// connection must be discarded rather than recycled.
+///
+/// Non-blocking: a single `try_read`. It consumes a byte when data is present,
+/// which is harmless precisely because the caller discards the connection in
+/// that case.
+///
+/// Best-effort, and callers must treat it as such: `try_read` consults tokio's
+/// readiness cache and can report `WouldBlock` for data that has arrived but
+/// whose readiness event was lost when the reader half was cancelled. It may
+/// therefore miss a desynchronised connection; it will never falsely condemn a
+/// clean one.
+pub(crate) fn has_unread_bytes(stream: &TcpStream) -> bool {
+    let mut probe = [0u8; 1];
+    match stream.try_read(&mut probe) {
+        // Nothing waiting — the only case in which the connection is reusable.
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => false,
+        // `Ok(n > 0)` is leftover data, `Ok(0)` is EOF, and any other error
+        // means the socket is unhealthy. None of them are reusable.
+        Ok(_) | Err(_) => true,
+    }
+}
+
 /// Configuration parameters for the pool.
 #[derive(Clone, Debug)]
 pub struct PoolConfig {
@@ -436,5 +466,49 @@ impl Drop for Checkout {
     fn drop(&mut self) {
         // If the stream was not taken, it is dropped here (connection closed).
         // The permit is also dropped, freeing the pool slot.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// Connect a client/server socket pair over loopback.
+    async fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).await.expect("connect");
+        let (server, _) = listener.accept().await.expect("accept");
+        (client, server)
+    }
+
+    /// A connection whose peer has sent nothing is clean and must be reusable.
+    /// A false positive here would discard every healthy pooled connection.
+    #[tokio::test]
+    async fn quiet_connection_has_no_unread_bytes() {
+        let (client, _server) = socket_pair().await;
+        assert!(!has_unread_bytes(&client), "an idle connection must not be condemned");
+    }
+
+    /// Leftover response data must condemn the connection — that is the whole
+    /// point: those bytes would be read as the next session's reply.
+    #[tokio::test]
+    async fn pending_data_is_detected() {
+        let (client, mut server) = socket_pair().await;
+        server.write_all(b"leftover").await.expect("write");
+        client.readable().await.expect("readable");
+        assert!(has_unread_bytes(&client), "buffered peer data must condemn the connection");
+    }
+
+    /// A closed peer reads as EOF, which is likewise not reusable.
+    #[tokio::test]
+    async fn closed_peer_is_detected() {
+        let (client, server) = socket_pair().await;
+        drop(server);
+        client.readable().await.expect("readable");
+        assert!(has_unread_bytes(&client), "a peer that closed must condemn the connection");
     }
 }

@@ -1001,10 +1001,20 @@ async fn pg_proxy_bidirectional(
         }
     };
 
-    match end {
-        PgSessionEnd::Client => Some(backend),
-        PgSessionEnd::Backend => None,
-    }
+    let reusable = match end {
+        // The client left a partly drained response behind — alive, but not
+        // safe to hand to the next session. On PG this also condemns a
+        // connection carrying an unconsumed asynchronous `NoticeResponse` or
+        // `NotificationResponse`, which is the right call: the next session's
+        // `DISCARD ALL` would read it as its own reply.
+        PgSessionEnd::Client if crate::pool::has_unread_bytes(&backend) => {
+            debug!("client ended mid-response, leaving unread backend bytes; discarding");
+            false
+        }
+        PgSessionEnd::Client => true,
+        PgSessionEnd::Backend => false,
+    };
+    reusable.then_some(backend)
 }
 
 // ── Routing & smart reset ────────────────────────────────────────────────────

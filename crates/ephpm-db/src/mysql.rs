@@ -1013,14 +1013,23 @@ struct SessionOutcome {
 /// backend→client direction is hand-copied so that an error can be
 /// attributed to the side that produced it (see [`SessionEnd`]).
 ///
-/// ## Known limitation
+/// ## Session hygiene
 ///
-/// A client that pipelines — writes `COM_QUIT` without having read the
-/// response to its previous command — can leave unread bytes on the backend
-/// socket, which would desynchronise the next session on that connection.
-/// `mysqlnd` is strictly synchronous so this does not arise in practice, and
-/// the checkout-time validation in [`crate::pool::Pool::acquire`] rejects a
-/// connection left in that state rather than handing it out.
+/// A backend is recycled only when the client ended the session *and*
+/// [`crate::pool::has_unread_bytes`] finds nothing left on the backend socket. The second
+/// condition covers a client that ends its session mid-conversation — one that
+/// writes `COM_QUIT`, or just closes, without having read the response to its
+/// previous command. That leaves a partly drained response behind, and
+/// recycling it would desynchronise whichever session picks the connection up
+/// next.
+///
+/// `mysqlnd` is strictly synchronous, so this guards against clients ePHPm
+/// does not ship rather than a case seen in practice. It is deliberately not
+/// load-bearing: the check is best-effort (see [`crate::pool::has_unread_bytes`]), and
+/// checkout-time validation in [`crate::pool::Pool::acquire`] cannot be relied
+/// on to catch a desynchronised connection either — the ping is skipped inside
+/// the validation window, and a leftover `OK` packet is indistinguishable from
+/// a `COM_PING` reply.
 async fn proxy_bidirectional_sniff(
     mut client: TcpStream,
     mut backend: TcpStream,
@@ -1103,11 +1112,19 @@ async fn proxy_bidirectional_sniff(
         }
     };
 
+    let reusable = match end {
+        // The client left a partly drained response behind — alive, but not
+        // safe to hand to the next session.
+        SessionEnd::Client if crate::pool::has_unread_bytes(&backend) => {
+            debug!("client ended mid-response, leaving unread backend bytes; discarding");
+            false
+        }
+        SessionEnd::Client => true,
+        SessionEnd::Backend => false,
+    };
+
     SessionOutcome {
-        backend: match end {
-            SessionEnd::Client => Some(backend),
-            SessionEnd::Backend => None,
-        },
+        backend: reusable.then_some(backend),
         dirty: dirty.load(std::sync::atomic::Ordering::Relaxed),
     }
 }
