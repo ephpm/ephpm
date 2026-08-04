@@ -1690,7 +1690,20 @@ async fn start_clustered_sqlite(
     }
 
     // Create Hrana client backend pointing at local sqld, wrapped with stats tracking.
-    let backend = litewire::backend::HranaClient::new(&sqld_http_url);
+    //
+    // Write admission control is scoped to this backend on purpose. sqld is
+    // the only store here with a single write lock behind an HTTP round trip,
+    // and it is the only one that collapses under concurrent writes rather
+    // than plateauing. Applying the same cap to the in-process rusqlite
+    // backend or the MySQL proxy would cost throughput and buy nothing.
+    let mut backend = litewire::backend::HranaClient::new(&sqld_http_url);
+    if sqlite_config.sqld.write_permits > 0 {
+        backend = backend.write_permits(sqlite_config.sqld.write_permits);
+        tracing::info!(
+            write_permits = sqlite_config.sqld.write_permits,
+            "sqld write admission control enabled (reads uncapped; excess writes queue)"
+        );
+    }
     let tracked = tracked_backend::TrackedBackend::new(backend, query_stats.clone());
 
     // Start litewire with the tracked backend.

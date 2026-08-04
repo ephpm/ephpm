@@ -84,7 +84,18 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire main @ d1c0b341 — SQLite backend performance (litewire#15): a
+# litewire main @ 62636c4c — write admission control for the Hrana/sqld backend
+# (litewire#16): an opt-in write-permit semaphore (`HranaClient::write_permits`,
+# 0 = unlimited = default) that queues excess writers instead of letting sqld
+# collapse, wired to [db.sqlite.sqld] write_permits in the clustered path only.
+# Reads never take a permit; an explicit transaction holds its permit from its
+# first write until COMMIT. Fixes the clustered-SQLite write collapse (#217),
+# where c>=8 concurrent writers completed *zero* requests — a hang, not a 500,
+# so it was invisible to error-rate monitoring. Same PR closes a CI blind spot:
+# `backend-hrana-client` is not a default feature, so litewire CI had never
+# compiled hrana_client.rs at all and its unit tests had stopped compiling.
+#
+# On top of SQLite backend performance (litewire#15): a
 # per-session worker thread replaces per-statement spawn_blocking, an opt-in
 # handle-reuse pool (`RusqliteBuilder::handle_reuse`, enabled by ephpm's
 # single-node path — see spawn_single_node_litewire), and a `max_connections`
@@ -108,7 +119,7 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 # sqlparser, so a crafted identifier in SHOW CREATE TABLE / SHOW INDEX /
 # DESCRIBE becomes arbitrary SQL. 7a0b59c4 adds sanitize_identifier() and
 # applies it at every extraction site.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "d1c0b3413061", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "62636c4c2ba8", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.0)

@@ -244,6 +244,7 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 |-----|------|---------|-------------|
 | `http_listen` | string | `"127.0.0.1:8081"` | sqld HTTP listener (litewire → sqld). |
 | `grpc_listen` | string | `"0.0.0.0:5001"` | sqld gRPC listener (inter-node replication). |
+| `write_permits` | integer | `0` (unlimited) | Maximum writes in flight against sqld at once. **Default 0 (off) in v0.6.x; planned default 1 in v0.7.0 — a single permit already saturates sqld's single writer and prevents the c>=8 write collapse ([issue #217](https://github.com/ephpm/ephpm/issues/217)).** SQLite has one writer; past ~4 concurrent writers sqld queues them so badly that requests stop completing altogether. Setting this admits `n` writes and queues the rest FIFO — never refused, only delayed (a queued write fails only after litewire's 30s acquire timeout, as a retriable `SQLITE_BUSY`). Reads are never capped. Clustered SQLite only: single-node SQLite and the MySQL proxy ignore it. Values above `1` do not raise throughput (SQLite serializes writes regardless) and `8` reproduces the collapse; `1` is also required for workloads dominated by multi-statement explicit transactions, since a transaction holds its permit until `COMMIT`. Full measurements and reasoning: [From zero to a plateau](/benchmarking/findings/#from-zero-to-a-plateau-write-admission-for-sqld) and the [v0.6.1 results](/benchmarking/results/#v061--the-clustered-sqld-write-collapse-fixed). |
 
 #### `[db.sqlite.replication]` (clustered mode only)
 

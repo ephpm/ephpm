@@ -901,11 +901,57 @@ pub struct SqldConfig {
     /// gRPC listen address for inter-node replication.
     #[serde(default = "default_sqld_grpc_listen")]
     pub grpc_listen: String,
+
+    /// Maximum **writes** litewire will have in flight against sqld at
+    /// once.
+    ///
+    /// Default `0` (off) in v0.6.x; planned default `1` in v0.7.0 — a
+    /// single permit already saturates sqld's single writer and prevents
+    /// the c>=8 write collapse (issue #217). `0` means unlimited, which is
+    /// the behavior of every prior release.
+    ///
+    /// SQLite has exactly one writer. Handing sqld more concurrent writes
+    /// than it can absorb makes it queue them so badly that requests stop
+    /// completing at all: past roughly four concurrent writers throughput
+    /// *collapses* rather than plateauing, and it does so by **hanging**,
+    /// not by erroring — the measured sweep produced zero HTTP 500s while
+    /// completing zero requests. Setting this admits `n` writes at a time
+    /// and parks the rest in a FIFO queue, so the excess waits locally
+    /// instead of thrashing inside sqld.
+    ///
+    /// Only the **clustered** SQLite path reads this — it configures
+    /// litewire's Hrana backend, which exists only when sqld is the store.
+    /// Single-node SQLite (in-process rusqlite) and the MySQL DB proxy are
+    /// unaffected, deliberately: they do not have sqld's queueing problem
+    /// and capping them would only lose throughput.
+    ///
+    /// Reads are never capped. Writes are never refused, only queued —
+    /// a queued write fails only if it waits longer than litewire's
+    /// 30-second acquire timeout, which surfaces as a retriable
+    /// `SQLITE_BUSY`.
+    ///
+    /// A workload dominated by multi-statement *explicit* transactions
+    /// wants `1` for a second, independent reason: a transaction holds its
+    /// permit from its first write to `COMMIT`, so anything above `1` lets
+    /// two transactions contend inside sqld again.
+    ///
+    /// Measured: `1` sustains ~598 RPS at c=16 where `0` completes *zero*
+    /// requests, and `8` sits above the cliff and reproduces the collapse.
+    /// One permit already saturates sqld's writer (~1.67 ms per serialized
+    /// write, the same per-write cost a single-client run shows), so higher
+    /// values cannot raise the ceiling. Full data and reasoning:
+    /// <https://ephpm.dev/benchmarking/findings/#from-zero-to-a-plateau-write-admission-for-sqld>
+    #[serde(default)]
+    pub write_permits: usize,
 }
 
 impl Default for SqldConfig {
     fn default() -> Self {
-        Self { http_listen: default_sqld_http_listen(), grpc_listen: default_sqld_grpc_listen() }
+        Self {
+            http_listen: default_sqld_http_listen(),
+            grpc_listen: default_sqld_grpc_listen(),
+            write_permits: 0,
+        }
     }
 }
 
@@ -3884,6 +3930,11 @@ path = "app.db"
         );
         assert_eq!(sqlite.sqld.http_listen, "127.0.0.1:8081");
         assert_eq!(sqlite.sqld.grpc_listen, "0.0.0.0:5001");
+        assert_eq!(
+            sqlite.sqld.write_permits, 0,
+            "write_permits must default to 0 (unlimited) when [db.sqlite.sqld] is absent — \
+             a surprise write cap would throttle every clustered deployment on upgrade"
+        );
         assert_eq!(sqlite.replication.role, "auto");
         assert!(sqlite.replication.primary_grpc_url.is_empty());
         assert_eq!(sqlite.engine, "sqlite", "engine must default to the genuine SQLite C engine");
@@ -3965,8 +4016,37 @@ primary_grpc_url = "http://10.0.1.2:5001"
         assert_eq!(sqlite.proxy.hrana_listen.as_deref(), Some("0.0.0.0:8080"));
         assert_eq!(sqlite.sqld.http_listen, "127.0.0.1:9081");
         assert_eq!(sqlite.sqld.grpc_listen, "0.0.0.0:6001");
+        assert_eq!(
+            sqlite.sqld.write_permits, 0,
+            "an explicit [db.sqlite.sqld] section that omits write_permits must still default \
+             to unlimited"
+        );
         assert_eq!(sqlite.replication.role, "replica");
         assert_eq!(sqlite.replication.primary_grpc_url, "http://10.0.1.2:5001");
+    }
+
+    #[test]
+    fn test_sqld_write_permits_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[db.sqlite]
+path = "/var/lib/ephpm/app.db"
+
+[db.sqlite.sqld]
+write_permits = 4
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let sqlite = config.db.sqlite.expect("sqlite should be present");
+        assert_eq!(sqlite.sqld.write_permits, 4);
+        // Setting one key in the section must not disturb the others.
+        assert_eq!(sqlite.sqld.http_listen, "127.0.0.1:8081");
+        assert_eq!(sqlite.sqld.grpc_listen, "0.0.0.0:5001");
     }
 
     #[test]
