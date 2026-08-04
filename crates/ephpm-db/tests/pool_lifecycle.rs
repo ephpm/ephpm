@@ -262,3 +262,47 @@ async fn acquire_keeps_an_idle_connection_that_passes_validation() {
 
     accept.abort();
 }
+
+/// Every idle connection parks a semaphore permit. If `acquire` demands a
+/// *fresh* permit before consulting the idle queue, a pool that has grown to
+/// `max_connections` can never hand out the connections it already holds:
+/// returning a connection parks a permit rather than releasing one, so nothing
+/// on the healthy path ever frees one again and every later acquire blocks
+/// until `pool_timeout`.
+///
+/// This is a pool-accounting bug, not a protocol bug — it needs enough
+/// concurrency to grow the pool to its ceiling, which a sequential probe
+/// structurally cannot do.
+#[tokio::test]
+async fn acquire_reuses_idle_connections_when_the_pool_is_at_capacity() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accept = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((s, _)) = listener.accept().await {
+            held.push(s);
+        }
+    });
+
+    let (pool, connects, _pings) = instrumented_pool(addr, true);
+
+    // Grow the pool to max_connections (4) concurrently, then return them all.
+    let mut checkouts = Vec::new();
+    for _ in 0..4 {
+        checkouts.push(pool.acquire().await.expect("initial acquire"));
+    }
+    for mut checkout in checkouts {
+        let stream = checkout.take_stream();
+        checkout.return_to_pool(stream);
+    }
+    assert_eq!(pool.idle_len(), 4, "pool should now be full of idle connections");
+    assert_eq!(connects.load(Ordering::SeqCst), 4, "should have dialled exactly max_connections");
+
+    // The pool holds four perfectly good connections. Handing one out must not
+    // require a permit that only a discard could ever produce.
+    let checkout = pool.acquire().await;
+    assert!(checkout.is_ok(), "acquire must reuse an idle connection; it timed out instead");
+    assert_eq!(connects.load(Ordering::SeqCst), 4, "should have reused, not redialled");
+
+    accept.abort();
+}

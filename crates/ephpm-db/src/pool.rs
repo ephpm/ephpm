@@ -76,7 +76,11 @@ pub(crate) fn has_unread_bytes(stream: &TcpStream) -> bool {
 pub struct PoolConfig {
     /// Keep at least this many connections open at all times.
     pub min_connections: u32,
-    /// Never exceed this many connections (in-use + idle).
+    /// Never exceed this many concurrent checkouts.
+    ///
+    /// This also bounds live backend connections: a connection is only ever
+    /// dialled while its caller holds a permit, so the number in existence
+    /// cannot outgrow the peak number of simultaneous checkouts.
     pub max_connections: u32,
     /// Close idle connections that have been idle longer than this.
     pub idle_timeout: Duration,
@@ -89,14 +93,16 @@ pub struct PoolConfig {
 }
 
 /// An idle slot in the pool.
+///
+/// Deliberately holds no semaphore permit. A permit represents *a checkout in
+/// progress*, not *a connection that exists* — see [`Pool::acquire`] for why
+/// the distinction is load-bearing.
 struct Slot {
     stream: TcpStream,
     /// Time the backend connection was first established.
     created_at: Instant,
     /// Time the connection was last returned to the pool.
     last_used: Instant,
-    /// The semaphore permit "parked" with this idle connection.
-    permit: OwnedSemaphorePermit,
 }
 
 struct PoolState {
@@ -198,6 +204,18 @@ impl Pool {
     /// instead. A caller therefore never receives a connection the pool has
     /// already observed to be dead.
     ///
+    /// # Permit accounting
+    ///
+    /// A permit means "a checkout is in progress", not "a connection exists".
+    /// Idle connections hold none. This matters: permits were once parked with
+    /// idle slots, which made returning a connection *consume* a permit rather
+    /// than release one. Once `in-use + idle` reached `max_connections`,
+    /// nothing on the healthy path could free a permit again and every later
+    /// acquire blocked until `pool_timeout` — a pool full of perfectly good
+    /// connections that it could not hand out. That deadlock was masked for as
+    /// long as the proxy was killing connections on every request, because the
+    /// resulting discards released permits continuously.
+    ///
     /// # Errors
     ///
     /// - [`DbError::PoolClosed`] if the pool has been shut down.
@@ -234,9 +252,6 @@ impl Pool {
             let idle_ok = slot.last_used.elapsed() < self.config.idle_timeout;
 
             if age_ok && idle_ok {
-                // Discard the parked permit (we now hold `permit` from above).
-                drop(slot.permit);
-
                 // Validate before handing out. A connection that has been
                 // parked for a while may have been closed by the server with
                 // no local indication; writing to it is how the caller finds
@@ -264,9 +279,8 @@ impl Pool {
                     pool: self.clone(),
                 });
             }
-            // Expired: discard both the stream and its parked permit.
+            // Expired: discard the stream and try the next candidate.
             debug!("discarding expired idle connection");
-            drop(slot.permit);
         }
 
         // No suitable idle connection — open a new one.
@@ -296,8 +310,13 @@ impl Pool {
         created_at: Instant,
         permit: OwnedSemaphorePermit,
     ) {
-        let slot = Slot { stream, created_at, last_used: Instant::now(), permit };
+        let slot = Slot { stream, created_at, last_used: Instant::now() };
         self.state.idle.lock().push_back(slot);
+        // Release the permit *after* the connection is visible in the idle
+        // queue, so a caller woken by this release is guaranteed to find it.
+        // Dropping it is the point: returning a connection has to hand a
+        // permit back to whoever is waiting, not consume one.
+        drop(permit);
     }
 
     /// Reset a connection using the pool's reset closure and return it to idle.
@@ -351,27 +370,28 @@ impl Pool {
         if current_idle >= self.config.min_connections {
             return;
         }
-        let needed = self.config.min_connections - current_idle;
+        // Warm-up connections are parked directly rather than checked out, so
+        // they are not covered by a permit. Bound them by the semaphore's free
+        // capacity so warming can never push the live connection count past
+        // `max_connections` while checkouts are in flight.
+        let headroom = self.semaphore.available_permits().saturating_sub(current_idle as usize);
+        let needed = usize::try_from(self.config.min_connections - current_idle)
+            .unwrap_or(usize::MAX)
+            .min(headroom);
         for _ in 0..needed {
             if self.state.closed.load(Ordering::Acquire) {
                 break;
             }
-            // Try to grab a permit without blocking.
-            let Ok(permit) = Arc::clone(&self.semaphore).try_acquire_owned() else {
-                break; // at max_connections
-            };
             match (self.connect)().await {
                 Ok(stream) => {
                     self.state.idle.lock().push_back(Slot {
                         stream,
                         created_at: Instant::now(),
                         last_used: Instant::now(),
-                        permit,
                     });
                 }
                 Err(e) => {
                     warn!("pool warm-up connection failed: {e}");
-                    // permit is dropped, freeing the slot
                 }
             }
         }
@@ -390,16 +410,13 @@ impl Pool {
                         stream,
                         created_at: slot.created_at,
                         last_used: slot.last_used,
-                        permit: slot.permit,
                     });
                 }
                 Ok((_, false)) => {
                     debug!("health check failed: dropping connection");
-                    // permit dropped here
                 }
                 Err(e) => {
                     debug!("health check I/O error: {e}");
-                    // permit dropped here
                 }
             }
         }

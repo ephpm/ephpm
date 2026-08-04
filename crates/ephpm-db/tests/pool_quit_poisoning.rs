@@ -226,16 +226,27 @@ const REQUEST_PACING: Duration = Duration::from_millis(20);
 ///
 /// Returns the id of the backend connection that served the query.
 async fn client_session(proxy: &str) -> Result<usize, String> {
-    let result =
-        match tokio::time::timeout(Duration::from_secs(5), client_session_inner(proxy)).await {
-            Ok(result) => result,
-            Err(_) => Err("session timed out".to_string()),
-        };
+    client_session_sql(proxy, "SELECT backend_id").await
+}
+
+/// As `client_session`, but with a caller-chosen statement. A write marks the
+/// session dirty, which routes the return through `COM_RESET_CONNECTION` — a
+/// longer checkout window, and the shape the pooled write lanes exercise.
+async fn client_session_sql(proxy: &str, sql: &str) -> Result<usize, String> {
+    let result = match tokio::time::timeout(
+        Duration::from_secs(5),
+        client_session_inner(proxy, sql),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err("session timed out".to_string()),
+    };
     tokio::time::sleep(REQUEST_PACING).await;
     result
 }
 
-async fn client_session_inner(proxy: &str) -> Result<usize, String> {
+async fn client_session_inner(proxy: &str, sql: &str) -> Result<usize, String> {
     let mut s = TcpStream::connect(proxy).await.map_err(|e| format!("connect: {e}"))?;
     let _ = s.set_nodelay(true);
     read_packet(&mut s).await.map_err(|e| format!("greeting: {e}"))?;
@@ -248,7 +259,7 @@ async fn client_session_inner(proxy: &str) -> Result<usize, String> {
     }
 
     let mut query = vec![COM_QUERY];
-    query.extend_from_slice(b"SELECT backend_id");
+    query.extend_from_slice(sql.as_bytes());
     write_packet(&mut s, 0, &query).await.map_err(|e| format!("query: {e}"))?;
     let id = read_result_set(&mut s).await?;
 
@@ -458,5 +469,67 @@ async fn broken_backend_is_discarded_not_reparked() {
     for i in 1..=5 {
         let result = client_session(&proxy).await;
         assert!(result.is_ok(), "recovery session #{i} failed: {result:?} — corpse was re-parked");
+    }
+}
+
+/// Concurrent write sessions, sustained across several rounds.
+///
+/// A sequential probe structurally cannot catch pool-accounting bugs: it never
+/// has more than one connection in flight, so the pool never grows to
+/// `max_connections` and the semaphore is never fully subscribed. This drives
+/// four times `max_connections` concurrently and repeats, so the pool reaches
+/// its ceiling and then has to keep recycling through it.
+///
+/// Writes specifically: `dirty` routes the return through
+/// `COM_RESET_CONNECTION`, which widens the window in which every connection is
+/// simultaneously checked out.
+///
+/// The failure this pins is a wedge, not a blip — once the pool stops being
+/// able to hand out the connections it holds, every later request fails with
+/// `PoolTimeout` and it never recovers. So the later rounds matter more than
+/// the first.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_write_sessions_do_not_wedge_the_pool() {
+    let backend = start_mock_backend().await;
+    let proxy = start_proxy(&backend, ResetStrategy::Smart).await;
+
+    for round in 1..=5 {
+        let mut handles = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let proxy = proxy.clone();
+            handles.push(tokio::spawn(async move {
+                client_session_sql(&proxy, "INSERT INTO t VALUES (1)").await
+            }));
+        }
+        for (i, handle) in handles.into_iter().enumerate() {
+            let result = handle.await.expect("session task panicked");
+            assert!(result.is_ok(), "round {round}, session {i} failed: {result:?}");
+        }
+    }
+
+    assert_eq!(
+        backend.quits.load(Ordering::SeqCst),
+        0,
+        "COM_QUIT must never be relayed, concurrency or not"
+    );
+}
+
+/// The same shape with reads, which return without a reset and so cycle through
+/// the pool faster.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_read_sessions_do_not_wedge_the_pool() {
+    let backend = start_mock_backend().await;
+    let proxy = start_proxy(&backend, ResetStrategy::Smart).await;
+
+    for round in 1..=5 {
+        let mut handles = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let proxy = proxy.clone();
+            handles.push(tokio::spawn(async move { client_session(&proxy).await }));
+        }
+        for (i, handle) in handles.into_iter().enumerate() {
+            let result = handle.await.expect("session task panicked");
+            assert!(result.is_ok(), "round {round}, session {i} failed: {result:?}");
+        }
     }
 }
