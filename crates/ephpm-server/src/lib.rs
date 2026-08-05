@@ -1558,22 +1558,89 @@ async fn start_single_node_sqlite(
         // with a cold prepared-statement cache. Idle cap 16: sessions track
         // in-flight PHP requests, which the worker pool already bounds far
         // below this on typical quotas.
-        let backend = litewire::backend::Rusqlite::builder(db_path)
-            .handle_reuse(16)
-            .build()
-            .with_context(|| format!("failed to open SQLite database: {db_path}"))?;
+        let backend = std::sync::Arc::new(
+            litewire::backend::Rusqlite::builder(db_path)
+                .handle_reuse(16)
+                .build()
+                .with_context(|| format!("failed to open SQLite database: {db_path}"))?,
+        );
         tracing::info!(
             path = %db_path,
             handle_reuse = true,
             "opened embedded SQLite database (single-node)"
         );
+        // Keep a handle to the concrete backend before it is erased, so the
+        // free-list counters stay reachable. `handle_reuse=true` above only
+        // says the feature was *requested*; whether connections actually hit
+        // the free-list is invisible without this — litewire's backend crate
+        // has no logging or metrics of its own, and `reuse_stats()` is its
+        // only observability surface.
+        spawn_reuse_stats_logger(&backend, handles);
         spawn_single_node_litewire(
             sqlite_config,
-            tracked_backend::TrackedBackend::new(backend, query_stats.clone()),
+            tracked_backend::TrackedBackend::new(SharedRusqlite(backend), query_stats.clone()),
             handles,
         );
     }
     Ok(())
+}
+
+/// Shares one [`litewire::backend::Rusqlite`] between litewire — which takes
+/// the backend by value and erases it to `Arc<dyn Backend>` — and the stats
+/// logger, which needs the concrete type for `reuse_stats()`.
+///
+/// `Backend` is not implemented for `Arc<T>`, so this newtype forwards the one
+/// required method. Cost is one extra vtable hop per session open, which is
+/// noise against the `sqlite3_open` it guards.
+struct SharedRusqlite(std::sync::Arc<litewire::backend::Rusqlite>);
+
+#[async_trait::async_trait]
+impl litewire::backend::Backend for SharedRusqlite {
+    async fn connect(
+        &self,
+    ) -> Result<Box<dyn litewire::backend::BackendConn>, litewire::backend::BackendError> {
+        self.0.connect().await
+    }
+}
+
+/// Interval between handle-reuse stat lines.
+const REUSE_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Periodically log litewire's session free-list counters at debug level.
+///
+/// Reading these is how you tell three failure modes apart, which latency
+/// alone cannot: `discarded` climbing with load means the pool's hygiene pass
+/// is rejecting handles; `misses` climbing with `discarded` at zero means the
+/// park (asynchronous — the session's worker parks after `drop` posts to it)
+/// is losing the race with the next connect; `expired` climbing means the idle
+/// age sweep is retiring handles between bursts.
+fn spawn_reuse_stats_logger(
+    backend: &std::sync::Arc<litewire::backend::Rusqlite>,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    let backend = std::sync::Arc::clone(backend);
+    handles.push(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(REUSE_STATS_INTERVAL);
+        // The first tick fires immediately; skip it so the first line carries
+        // a full interval of traffic rather than an all-zero snapshot.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(stats) = backend.reuse_stats() else {
+                // Reuse disabled — nothing to report, and never will be.
+                return;
+            };
+            tracing::debug!(
+                hits = stats.hits,
+                misses = stats.misses,
+                returned = stats.returned,
+                discarded = stats.discarded,
+                expired = stats.expired,
+                idle = stats.idle,
+                "SQLite handle reuse stats"
+            );
+        }
+    }));
 }
 
 /// Wire the configured frontends onto a litewire builder and spawn it.
