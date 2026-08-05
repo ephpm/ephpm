@@ -26,7 +26,9 @@ pub fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<T
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
 
-    let mut config = ServerConfig::builder()
+    let mut config = ServerConfig::builder_with_provider(crypto_provider())
+        .with_safe_default_protocol_versions()
+        .context("crypto provider does not support the default TLS versions")?
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("invalid TLS certificate/key pair")?;
@@ -38,14 +40,45 @@ pub fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<T
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
+/// The rustls crypto provider this server uses.
+///
+/// **This must be named explicitly, and `ServerConfig::builder()` must never
+/// be called.** Both `ring` and `aws-lc-rs` end up compiled in: the workspace
+/// pins `rustls` to `ring`, while `rustls-acme`, `rcgen` and `hyper-rustls`
+/// (via `metrics-exporter-prometheus`) enable `aws-lc-rs`, and Cargo unions
+/// features. With both features on, rustls' `from_crate_features()` returns
+/// `None` — it does not pick one — so the bare builder panics at runtime:
+///
+/// > Could not automatically determine the process-level CryptoProvider from
+/// > Rustls crate features.
+///
+/// That is not hypothetical: it made every `[server.tls]` static-certificate
+/// startup abort with exit 101. See `tests/tls_provider_independence.rs`.
+///
+/// `ring` is chosen to match the workspace `rustls` pin. Consolidating the
+/// stack on a single provider is tracked in issue #241.
+///
+/// The `OnceLock` means every config built here shares one `Arc`, so "the
+/// whole server uses one provider" is checkable by pointer identity.
+fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    static PROVIDER: std::sync::OnceLock<Arc<rustls::crypto::CryptoProvider>> =
+        std::sync::OnceLock::new();
+    Arc::clone(PROVIDER.get_or_init(|| Arc::new(rustls::crypto::ring::default_provider())))
+}
+
 /// Load PEM-encoded certificates from a file.
 fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
     let file =
         File::open(path).with_context(|| format!("cannot open cert file: {}", path.display()))?;
     let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
-        .with_context(|| format!("failed to parse PEM certificates from {}", path.display()))
+        .with_context(|| format!("failed to parse PEM certificates from {}", path.display()))?;
+    // A PEM file with no CERTIFICATE block parses "successfully" into zero
+    // certs; without this check the failure surfaces later as an opaque
+    // rustls error instead of naming the file.
+    anyhow::ensure!(!certs.is_empty(), "no certificates found in {}", path.display());
+    Ok(certs)
 }
 
 /// Load a private key from a PEM file.
