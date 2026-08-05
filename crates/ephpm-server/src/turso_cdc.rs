@@ -825,15 +825,20 @@ async fn consume_frames(
         let frame = read_frame(stream).await?;
         match frame {
             Frame::Batch { rows } => {
-                // `TxnBatch::commit_change_id` reads the last row and
-                // panics on an empty batch, and `apply_batch` calls it
-                // unconditionally — so a peer sending `{"rows":[]}`
-                // would take down this task, which nothing joins, and
-                // replication would stop forever with no error path.
-                // Reject the frame instead of constructing the batch.
-                anyhow::ensure!(!rows.is_empty(), "peer sent an empty CDC batch frame");
+                // Kept as defence in depth, not because litewire still
+                // needs it: since litewire#17 `commit_change_id` returns
+                // `Option<i64>` and `apply_batch` reports an empty batch
+                // as an error instead of panicking the applying task
+                // (which nothing joins). Two reasons this stays anyway.
+                // Validating a peer's frame is our job, not that of
+                // whichever litewire revision the pin happens to name.
+                // And rejecting here keeps the error legible: past this
+                // point every failure is reported "at change_id N",
+                // which an empty batch has no value for.
                 let batch = TxnBatch { rows: rows.into_iter().map(CdcRow::from).collect() };
-                let change_id = batch.commit_change_id();
+                let Some(change_id) = batch.commit_change_id() else {
+                    anyhow::bail!("peer sent an empty CDC batch frame");
+                };
                 // A failed apply must NOT be skipped: continuing to the
                 // next batch would let the watermark advance past the
                 // failure and make the divergence permanent and silent.
