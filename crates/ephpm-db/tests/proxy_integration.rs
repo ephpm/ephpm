@@ -80,6 +80,51 @@ async fn start_proxy(
     panic!("proxy did not become ready at {listen_addr}");
 }
 
+/// Boot a [`MySqlProxy`] with read/write splitting enabled and one replica
+/// pointed at the same backend URL.
+///
+/// This is the combination that selects `proxy_routing_loop`, the per-command
+/// path that frames responses and returns the backend to the pool after every
+/// command. Nothing else reaches it.
+async fn start_proxy_rw_split(
+    backend_url: &str,
+    pool_config: PoolConfig,
+    reset_strategy: ResetStrategy,
+) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listen_addr = listener.local_addr().unwrap().to_string();
+
+    let proxy = MySqlProxy::new(
+        backend_url,
+        &listen_addr,
+        None,
+        pool_config,
+        reset_strategy,
+        vec![backend_url.to_string()],
+        RwSplitParams { enabled: true, sticky_duration: Duration::from_secs(0) },
+        ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig::default()),
+    )
+    .await
+    .expect("failed to create MySqlProxy");
+
+    drop(listener);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    tokio::spawn(async move {
+        if let Err(e) = proxy.run().await {
+            eprintln!("proxy stopped: {e}");
+        }
+    });
+
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(&listen_addr).await.is_ok() {
+            return listen_addr;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("proxy did not become ready at {listen_addr}");
+}
+
 /// Build a `mysql_async` connection opts that route through the proxy.
 fn proxy_opts(proxy_addr: &str) -> mysql_async::Opts {
     mysql_async::OptsBuilder::default()
@@ -431,4 +476,107 @@ async fn prepared_statement_lifecycle() {
 
     drop(conn);
     pool.disconnect().await.unwrap();
+}
+
+// ── Multi-result responses (issue #223) ──────────────────────────────────────
+
+/// A stored-procedure `CALL` returns two result sets followed by a terminating
+/// `OK`. `forward_mysql_response` used to return after the first terminating
+/// `EOF`, leaving the rest buffered on the *pooled* backend socket — so the
+/// corruption outlived the session that caused it.
+///
+/// Three things are asserted against a real `MySQL` server, in the order they
+/// break:
+///
+/// 1. both result sets reach the client;
+/// 2. the next command *on the same client session* reads its own response;
+/// 3. a *different* client session, drawing the same pooled backend, reads its
+///    own response too.
+///
+/// `max_connections = 1` makes (3) load-bearing: there is exactly one backend
+/// connection, so the second session provably gets the one the `CALL` ran on.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
+async fn multi_result_call_does_not_desync_the_pooled_backend() {
+    let Some(url) = mysql_url() else {
+        println!("MYSQL_TEST_URL not set — skipping");
+        return;
+    };
+
+    let config = PoolConfig {
+        min_connections: 1,
+        max_connections: 1,
+        idle_timeout: Duration::from_secs(60),
+        max_lifetime: Duration::from_secs(300),
+        pool_timeout: Duration::from_secs(5),
+        health_check_interval: Duration::from_secs(30),
+    };
+    let addr = start_proxy_rw_split(&url, config, ResetStrategy::Smart).await;
+
+    // A desync shows up as a hang, so bound the whole thing.
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        // Setup. `BEGIN … END` is scoped by the server's parser, so no
+        // DELIMITER games are needed over the wire.
+        {
+            let pool = mysql_async::Pool::new(proxy_opts(&addr));
+            let mut conn = pool.get_conn().await.unwrap();
+            conn.query_drop("DROP PROCEDURE IF EXISTS _ephpm_two_results").await.unwrap();
+            conn.query_drop(
+                "CREATE PROCEDURE _ephpm_two_results() \
+                 BEGIN SELECT 11 AS a; SELECT 22 AS b; END",
+            )
+            .await
+            .unwrap();
+            drop(conn);
+            pool.disconnect().await.unwrap();
+        }
+
+        // Session A: the multi-result command, then a follow-up on the same
+        // session.
+        {
+            let pool = mysql_async::Pool::new(proxy_opts(&addr));
+            let mut conn = pool.get_conn().await.unwrap();
+
+            let mut call = conn.query_iter("CALL _ephpm_two_results()").await.unwrap();
+            let first: Vec<(i32,)> = call.collect().await.unwrap();
+            assert_eq!(first, vec![(11,)], "the first result set must reach the client");
+            let second: Vec<(i32,)> = call.collect().await.unwrap();
+            assert_eq!(second, vec![(22,)], "the second result set must reach the client too");
+            drop(call);
+
+            let rows: Vec<(i32,)> = conn.query("SELECT 33").await.unwrap();
+            assert_eq!(rows[0].0, 33, "the next command must read its own response");
+
+            drop(conn);
+            pool.disconnect().await.unwrap();
+        }
+
+        // Let the proxy finish parking the backend.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Session B: a different client session on the same pooled backend.
+        {
+            let pool = mysql_async::Pool::new(proxy_opts(&addr));
+            let mut conn = pool.get_conn().await.unwrap();
+            let rows: Vec<(i32,)> = conn.query("SELECT 44").await.unwrap();
+            assert_eq!(
+                rows[0].0, 44,
+                "a pooled backend must not carry a previous session's result sets"
+            );
+            drop(conn);
+            pool.disconnect().await.unwrap();
+        }
+
+        // Cleanup.
+        {
+            let pool = mysql_async::Pool::new(proxy_opts(&addr));
+            let mut conn = pool.get_conn().await.unwrap();
+            conn.query_drop("DROP PROCEDURE IF EXISTS _ephpm_two_results").await.unwrap();
+            drop(conn);
+            pool.disconnect().await.unwrap();
+        }
+    })
+    .await;
+
+    result.expect("a multi-result CALL desynchronised the proxy (timed out)");
 }

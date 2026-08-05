@@ -9,7 +9,9 @@
 //! 2. When PHP connects to the proxy (e.g. `127.0.0.1:5432`), the proxy
 //!    reads the client's `StartupMessage`, sends `AuthenticationOk` (no
 //!    credential validation — loopback only), sends synthetic metadata,
-//!    and starts bidirectional byte forwarding.
+//!    and starts bidirectional message forwarding. Both directions are
+//!    framed on every path, which is what lets `[db.analysis]` see statements
+//!    regardless of `reset_strategy`.
 //!
 //! 3. When the client closes or sends `Terminate`, the proxy closes only the
 //!    client-facing socket. `Terminate` is **intercepted, never forwarded** —
@@ -24,7 +26,7 @@
 //! Client-facing auth is always `AuthenticationOk` (loopback only).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use base64ct::Encoding;
 use ephpm_query_stats::QueryStats;
@@ -62,6 +64,16 @@ const MSG_DATA_ROW: u8 = b'D';
 const MSG_QUERY: u8 = b'Q';
 /// `Terminate` — frontend connection close.
 const MSG_TERMINATE: u8 = b'X';
+/// `Sync` — frontend end of an extended-query batch, answered by one
+/// `ReadyForQuery`.
+///
+/// Shares its byte with the backend's `ParameterStatus`; the two never travel
+/// in the same direction, and this constant is only ever matched against
+/// frontend traffic.
+const MSG_SYNC: u8 = b'S';
+/// `FunctionCall` — frontend fastpath call, likewise answered by one
+/// `ReadyForQuery`.
+const MSG_FUNCTION_CALL: u8 = b'F';
 /// `CopyInResponse` — backend is waiting for the client to stream `COPY ... FROM STDIN` data.
 const MSG_COPY_IN_RESPONSE: u8 = b'G';
 /// `CopyBothResponse` — backend entered bidirectional copy mode.
@@ -373,14 +385,21 @@ impl PgProxy {
             )
             .await
         } else {
-            // Fast path: simple bidirectional copy. No message framing in
-            // either direction, so no statement is ever visible here and
-            // query stats record nothing — see `stats.rs`. Only reachable
-            // with `reset_strategy = "never"`/`"always"` and no replicas.
+            // Single-backend path: one pooled connection held for the whole
+            // session. Reachable with `reset_strategy = "never"`/`"always"`
+            // and no replicas.
+            //
+            // It is *not* an unframed fast path any more. Both directions are
+            // framed, so statements on this path are recorded exactly as the
+            // routing loop records them — see `pg_proxy_bidirectional_sniff`.
+            // It stays a separate path from the routing loop because the
+            // routing loop re-acquires a backend per command, which would
+            // scatter a session's `SET`s, temp tables and advisory locks
+            // across different connections.
             let mut checkout = self.pool.acquire().await?;
             let backend = checkout.take_stream();
 
-            match pg_proxy_bidirectional(client, backend).await {
+            match pg_proxy_bidirectional_sniff(client, backend, self.stats()).await {
                 Some(backend) => match self.reset_strategy {
                     ResetStrategy::Never => {
                         checkout.return_to_pool(backend);
@@ -812,15 +831,64 @@ async fn write_pg_message(stream: &mut TcpStream, tag: u8, payload: &[u8]) -> Re
     Ok(())
 }
 
-/// Forward a raw PG message from one stream to another.
-async fn forward_pg_message(from: &mut TcpStream, to: &mut TcpStream) -> Result<u8, DbError> {
-    let tag = from.read_u8().await?;
-    let len = from.read_i32().await?;
+/// Which side of a relay failed, when one did.
+///
+/// The splice path needs this distinction: a read failure condemns the
+/// pooled backend, a write failure to the client does not (see
+/// [`PgSessionEnd`]). Collapsing both into one error — which is all a
+/// `Result` can express — is how a live backend gets discarded, or worse, a
+/// dead one recycled.
+enum Relayed {
+    /// A complete message with this tag reached the destination.
+    Message(u8),
+    /// The source stream failed or closed mid-message.
+    SourceGone(DbError),
+    /// The destination stream failed.
+    SinkGone(DbError),
+}
+
+/// Forward one PG message from `from` to `to`, reporting which side failed.
+///
+/// The single framing primitive for both directions on every PG path.
+/// Generic over the endpoints so it serves the whole-stream routing loop
+/// (`&mut TcpStream`) and the split, buffered halves of
+/// [`pg_proxy_bidirectional_sniff`] alike — there is deliberately no second
+/// copy of this framing to keep in sync.
+///
+/// # Cancellation
+///
+/// This function is **not** cancel-safe, and cannot be: framing requires
+/// several awaits, so dropping it part-way leaves bytes consumed from `from`
+/// that were never written to `to`. `partial` exists so a caller that races
+/// this against another future can find out. It is set once the first byte of
+/// a message has been consumed and cleared when the message has been fully
+/// forwarded, so a caller reading it after a cancellation learns exactly
+/// whether the source stream was left mid-message. Parked waiting for the
+/// *next* message — the idle state — leaves it clear, which is what keeps a
+/// normal end-of-session from condemning a perfectly good connection.
+async fn relay_pg_message<R, W>(from: &mut R, to: &mut W, partial: &AtomicBool) -> Relayed
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let tag = match from.read_u8().await {
+        Ok(t) => t,
+        Err(e) => return Relayed::SourceGone(e.into()),
+    };
+    partial.store(true, Ordering::Relaxed);
+    let len = match from.read_i32().await {
+        Ok(l) => l,
+        Err(e) => return Relayed::SourceGone(e.into()),
+    };
     let payload_len = if len >= 4 { usize::try_from(len - 4).unwrap_or(0) } else { 0 };
 
     // Write tag + length.
-    to.write_u8(tag).await?;
-    to.write_all(&len.to_be_bytes()).await?;
+    if let Err(e) = to.write_u8(tag).await {
+        return Relayed::SinkGone(e.into());
+    }
+    if let Err(e) = to.write_all(&len.to_be_bytes()).await {
+        return Relayed::SinkGone(e.into());
+    }
 
     // Forward payload in chunks to avoid allocating for large results.
     if payload_len > 0 {
@@ -828,13 +896,31 @@ async fn forward_pg_message(from: &mut TcpStream, to: &mut TcpStream) -> Result<
         let mut buf = vec![0u8; remaining.min(8192)];
         while remaining > 0 {
             let to_read = remaining.min(buf.len());
-            from.read_exact(&mut buf[..to_read]).await?;
-            to.write_all(&buf[..to_read]).await?;
+            if let Err(e) = from.read_exact(&mut buf[..to_read]).await {
+                return Relayed::SourceGone(e.into());
+            }
+            if let Err(e) = to.write_all(&buf[..to_read]).await {
+                return Relayed::SinkGone(e.into());
+            }
             remaining -= to_read;
         }
     }
 
-    Ok(tag)
+    partial.store(false, Ordering::Relaxed);
+    Relayed::Message(tag)
+}
+
+/// Forward a raw PG message from one stream to another.
+///
+/// The turn-based routing loop awaits this to completion and discards the
+/// backend on any failure, so it needs neither the side attribution nor the
+/// partial-message flag [`relay_pg_message`] carries.
+async fn forward_pg_message(from: &mut TcpStream, to: &mut TcpStream) -> Result<u8, DbError> {
+    let partial = AtomicBool::new(false);
+    match relay_pg_message(from, to, &partial).await {
+        Relayed::Message(tag) => Ok(tag),
+        Relayed::SourceGone(e) | Relayed::SinkGone(e) => Err(e),
+    }
 }
 
 /// Read the client's `StartupMessage` (no tag byte).
@@ -990,7 +1076,52 @@ enum PgSessionEnd {
     Backend,
 }
 
-/// Relay `client` ↔ `backend` until the session ends.
+/// A client message the backend will answer with exactly one `ReadyForQuery`.
+///
+/// `sql` is `Some` only for a simple `Query` — the one frontend message the
+/// proxy can attribute to a digest.
+struct PgTurn {
+    /// The statement text, when this turn is recordable.
+    sql: Option<String>,
+    /// When the message was handed to the backend.
+    started: std::time::Instant,
+}
+
+/// Largest number of un-answered turns a session may have in flight.
+///
+/// The pending-turn queue drains on `ReadyForQuery`, so its length is the
+/// number of commands the client has pipelined without their responses having
+/// been delivered. Nothing in the PHP ecosystem pipelines at all; a client
+/// that does, and that also stops reading, would otherwise grow this queue
+/// without bound. Reached only by a client working to reach it, and the
+/// session simply ends.
+const MAX_PENDING_TURNS: usize = 4096;
+
+/// Whether a frontend message ends a protocol turn — i.e. is answered by a
+/// `ReadyForQuery`.
+///
+/// `Query` and `FunctionCall` each get one; in the extended query protocol an
+/// entire `Parse`/`Bind`/`Describe`/`Execute` batch gets exactly one, at
+/// `Sync`. Enqueuing a turn for *all* of them rather than only for `Query` is
+/// what keeps the queue aligned with the `ReadyForQuery` stream in a session
+/// that mixes both protocols: the extended-protocol turn pops its own
+/// unrecordable entry instead of stealing a simple query's.
+const fn pg_ends_a_turn(tag: u8) -> bool {
+    matches!(tag, MSG_QUERY | MSG_SYNC | MSG_FUNCTION_CALL)
+}
+
+/// The statement text a `Query` payload should be attributed to, if any.
+///
+/// The payload is a null-terminated string. Empty queries — which PG answers
+/// with `EmptyQueryResponse` — are not statements and are left unrecorded
+/// rather than folded into a blank digest.
+fn pg_recordable_sql(payload: &[u8]) -> Option<String> {
+    let sql = String::from_utf8_lossy(payload);
+    let sql = sql.trim_end_matches('\0');
+    (!sql.trim().is_empty()).then(|| sql.to_string())
+}
+
+/// Relay `client` ↔ `backend` until the session ends, recording statements.
 ///
 /// Returns the backend stream when the *client* ended the session, and `None`
 /// when the backend failed and must be discarded rather than recycled.
@@ -1005,18 +1136,57 @@ enum PgSessionEnd {
 ///
 /// ## Framing
 ///
-/// Post-startup PG frontend messages are uniformly `[tag: 1][len: 4BE][payload]`,
-/// so the client→backend direction can be framed without understanding any
-/// individual message — enough to spot `Terminate`. The backend→client
-/// direction is copied in bulk but hand-rolled so an I/O error can be
-/// attributed to the side that produced it.
-async fn pg_proxy_bidirectional(
+/// Both directions are framed. Post-startup PG messages are uniformly
+/// `[tag: 1][len: 4BE][payload]` in *both* directions, so this costs no
+/// protocol understanding beyond the tag byte.
+///
+/// The backend→client direction used to be copied in bulk, which made this the
+/// only proxy path that could not see a statement: with `reset_strategy =
+/// "never"`/`"always"` and no replicas, a whole deployment's traffic was
+/// invisible to `[db.analysis]`. Framing it closes that gap — and unlike the
+/// MySQL splice path, which has to infer completion from the arrival of the
+/// *next* client command, PG hands the proxy an explicit end-of-turn marker in
+/// `ReadyForQuery`. Durations, row counts and error status here are therefore
+/// exactly what the routing loop reports, not an approximation.
+///
+/// Framing is not paid for in syscalls: the backend read half is buffered and
+/// the client write half is coalesced, flushed whenever the read buffer drains
+/// (the point at which the relay is about to block anyway). A large result set
+/// still crosses in `BufReader`-sized reads, not one syscall per message.
+///
+/// ## What is still not recorded
+///
+/// Extended-protocol executions. `Parse` carries SQL and `Execute` is the
+/// execution, but mapping one to the other means tracking named statements and
+/// portals across the session; the turn-based routing loop does not do it
+/// either, and recording `Parse` alone would publish planning time as query
+/// time. Same reasoning as `COM_STMT_PREPARE` on the MySQL side — see
+/// [`crate::stats`].
+async fn pg_proxy_bidirectional_sniff(
     mut client: TcpStream,
     mut backend: TcpStream,
+    stats: Option<&QueryStats>,
 ) -> Option<TcpStream> {
-    let end = {
-        let (mut cr, mut cw) = client.split();
-        let (mut br, mut bw) = backend.split();
+    use std::collections::VecDeque;
+
+    use parking_lot::Mutex;
+    use tokio::io::{BufReader, BufWriter};
+
+    let turns: Arc<Mutex<VecDeque<PgTurn>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let turns_w = Arc::clone(&turns);
+    // Set while a backend message has been partly consumed. Framing takes
+    // several awaits, so unlike the bulk copy this replaced, the reader half
+    // is not cancel-safe — see `relay_pg_message`.
+    let partial = AtomicBool::new(false);
+
+    let (end, buffered_response) = {
+        let (mut cr, cw) = client.split();
+        let (br, mut bw) = backend.split();
+        // Buffered so that per-message framing does not become per-message
+        // syscalls. The client write half is flushed below at every point the
+        // relay is about to wait.
+        let mut br = BufReader::new(br);
+        let mut cw = BufWriter::new(cw);
 
         let client_to_backend = async {
             let mut header = [0u8; 5];
@@ -1041,6 +1211,24 @@ async fn pg_proxy_bidirectional(
                     return PgSessionEnd::Client;
                 }
 
+                // Enqueue before the message hits the wire: the response
+                // cannot arrive before the write, so the reader half can never
+                // see a `ReadyForQuery` for a turn that is not queued yet.
+                // Costs one branch per message when stats are off.
+                if stats.is_some() && pg_ends_a_turn(header[0]) {
+                    let sql =
+                        if header[0] == MSG_QUERY { pg_recordable_sql(&payload) } else { None };
+                    let mut queue = turns_w.lock();
+                    if queue.len() >= MAX_PENDING_TURNS {
+                        debug!(
+                            "client pipelined more than {MAX_PENDING_TURNS} unanswered turns; \
+                             ending session"
+                        );
+                        return PgSessionEnd::Client;
+                    }
+                    queue.push_back(PgTurn { sql, started: std::time::Instant::now() });
+                }
+
                 if bw.write_all(&header).await.is_err() || bw.write_all(&payload).await.is_err() {
                     return PgSessionEnd::Backend;
                 }
@@ -1048,26 +1236,61 @@ async fn pg_proxy_bidirectional(
         };
 
         let backend_to_client = async {
-            let mut buf = vec![0u8; 16 * 1024];
+            let mut outcome = ResponseOutcome { ok: true, rows: 0 };
             loop {
-                match br.read(&mut buf).await {
-                    Ok(n) if n > 0 => {
-                        if cw.write_all(&buf[..n]).await.is_err() {
-                            return PgSessionEnd::Client;
+                let tag = match relay_pg_message(&mut br, &mut cw, &partial).await {
+                    Relayed::Message(tag) => tag,
+                    // Source EOF or failure. With `Terminate` no longer
+                    // forwarded, EOF means the server genuinely closed the
+                    // connection — either way it is not reusable.
+                    Relayed::SourceGone(_) => return PgSessionEnd::Backend,
+                    Relayed::SinkGone(_) => return PgSessionEnd::Client,
+                };
+
+                match tag {
+                    MSG_DATA_ROW => outcome.rows += 1,
+                    MSG_ERROR_RESPONSE => outcome.ok = false,
+                    _ => {}
+                }
+
+                if tag == MSG_READY_FOR_QUERY {
+                    if let Some(collector) = stats {
+                        // Pop unconditionally: an extended-protocol or copy
+                        // turn carries no SQL but still owns this
+                        // `ReadyForQuery`, and leaving its entry behind would
+                        // misattribute every later statement on the session.
+                        if let Some(turn) = turns.lock().pop_front() {
+                            if let Some(sql) = turn.sql {
+                                collector.record(
+                                    &sql,
+                                    turn.started.elapsed(),
+                                    outcome.ok,
+                                    outcome.rows,
+                                );
+                            }
                         }
                     }
-                    // `Ok(0)` is backend EOF; `Err` is a backend read failure.
-                    // With `Terminate` no longer forwarded, EOF means the
-                    // server genuinely closed the connection.
-                    Ok(_) | Err(_) => return PgSessionEnd::Backend,
+                    outcome = ResponseOutcome { ok: true, rows: 0 };
+                }
+
+                // Nothing more is buffered, so the next read will wait: get
+                // what has been forwarded in front of the client first.
+                if br.buffer().is_empty() && cw.flush().await.is_err() {
+                    return PgSessionEnd::Client;
                 }
             }
         };
 
-        tokio::select! {
+        let end = tokio::select! {
             e = client_to_backend => e,
             e = backend_to_client => e,
-        }
+        };
+        // Bytes the reader pulled off the socket but has not forwarded belong
+        // to a response nobody consumed. `has_unread_bytes` cannot see them —
+        // they are no longer on the socket — so they have to be reported out.
+        // Two shapes: whole messages sitting in the read buffer, and a single
+        // message the reader was cancelled part-way through.
+        (end, !br.buffer().is_empty() || partial.load(Ordering::Relaxed))
     };
 
     let reusable = match end {
@@ -1076,7 +1299,12 @@ async fn pg_proxy_bidirectional(
         // connection carrying an unconsumed asynchronous `NoticeResponse` or
         // `NotificationResponse`, which is the right call: the next session's
         // `DISCARD ALL` would read it as its own reply.
-        PgSessionEnd::Client if crate::pool::has_unread_bytes(&backend) => {
+        //
+        // The two checks are complementary, not redundant: `has_unread_bytes`
+        // probes bytes still on the socket, `buffered_response` covers bytes
+        // that have already left it for the relay's own buffers. Neither can
+        // see the other's case.
+        PgSessionEnd::Client if buffered_response || crate::pool::has_unread_bytes(&backend) => {
             debug!("client ended mid-response, leaving unread backend bytes; discarding");
             false
         }
@@ -1234,7 +1462,8 @@ async fn pg_proxy_routing_loop(
                 checkout.retire();
                 return Err(e);
             }
-            return pg_relay_pinned_session(client, backend, checkout, reset_strategy).await;
+            return pg_relay_pinned_session(client, backend, checkout, reset_strategy, recorder)
+                .await;
         }
 
         // Query payload is null-terminated SQL. Borrowed, not copied: the
@@ -1299,9 +1528,13 @@ async fn pg_proxy_routing_loop(
 
         if copy_mode {
             // The statement is still in flight — its outcome belongs to the
-            // copy stream we are about to splice, so recording it now would
-            // publish a truncated duration. Left out deliberately.
-            return pg_relay_pinned_session(client, backend, checkout, reset_strategy).await;
+            // copy stream we are about to relay, so recording it now would
+            // publish a truncated duration. Left out deliberately: its
+            // `ReadyForQuery` arrives inside the pinned session, whose turn
+            // queue starts empty, so it settles nothing rather than being
+            // misattributed.
+            return pg_relay_pinned_session(client, backend, checkout, reset_strategy, recorder)
+                .await;
         }
 
         if let (Some(collector), Some(started)) = (recorder, started) {
@@ -1334,22 +1567,26 @@ async fn pg_proxy_routing_loop(
     Ok(())
 }
 
-/// Pin an already-acquired `backend` to `client` and splice both directions
+/// Pin an already-acquired `backend` to `client` and relay both directions
 /// until either side closes, then recycle the backend.
 ///
 /// Used for the extended query protocol and the copy sub-protocols, where
-/// message boundaries do not line up with turn boundaries and the proxy
-/// therefore cannot tell when it is safe to block on the backend. Because no
-/// per-statement state can be tracked through an opaque splice, the connection
-/// is always reset before being parked unless the operator explicitly opted
-/// out with [`ResetStrategy::Never`].
+/// message boundaries do not line up with *turn* boundaries and the proxy
+/// therefore cannot tell when it is safe to block on the backend. Message
+/// boundaries themselves stay visible, so a simple `Query` issued later on the
+/// same pinned session is still recorded — `stats` is threaded through for
+/// that. The connection is always reset before being parked unless the
+/// operator explicitly opted out with [`ResetStrategy::Never`], because
+/// extended-protocol session state (named statements, portals) cannot be
+/// tracked per command.
 async fn pg_relay_pinned_session(
     client: TcpStream,
     backend: TcpStream,
     checkout: Checkout,
     reset_strategy: ResetStrategy,
+    stats: Option<&QueryStats>,
 ) -> Result<(), DbError> {
-    match pg_proxy_bidirectional(client, backend).await {
+    match pg_proxy_bidirectional_sniff(client, backend, stats).await {
         Some(backend) => {
             if matches!(reset_strategy, ResetStrategy::Never) {
                 checkout.return_to_pool(backend);
@@ -1938,6 +2175,250 @@ mod tests {
         });
         drive_pg_query(Some(disabled.clone()), 2, false).await;
         assert_eq!(disabled.digest_count(), 0);
+    }
+
+    // ── relay cancellation safety ───────────────────────────────────
+
+    /// The idle state must not look like a partly consumed message.
+    ///
+    /// The reader half of the single-backend relay spends most of a session
+    /// parked here. If that set the flag, every clean end-of-session would
+    /// condemn its pooled backend and the pool would never reuse anything.
+    #[tokio::test]
+    async fn relay_flag_stays_clear_while_waiting_for_a_message() {
+        let (_src_write, mut src_read) = make_tcp_pair().await;
+        let (mut sink, _sink_read) = make_tcp_pair().await;
+        let partial = AtomicBool::new(false);
+
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            relay_pg_message(&mut src_read, &mut sink, &partial),
+        )
+        .await;
+
+        assert!(timed_out.is_err(), "no message was sent, so the relay must still be waiting");
+        assert!(!partial.load(Ordering::Relaxed), "waiting for the next message is not partial");
+    }
+
+    /// A message the relay was cancelled part-way through must be reported.
+    ///
+    /// Framing takes several awaits, so unlike the bulk copy this replaced,
+    /// the reader half is not cancel-safe: the tag byte is gone from the
+    /// stream and was never forwarded. Recycling that backend hands the next
+    /// session a connection whose stream starts mid-message.
+    #[tokio::test]
+    async fn relay_flag_is_set_when_cancelled_mid_message() {
+        let (mut src_write, mut src_read) = make_tcp_pair().await;
+        let (mut sink, _sink_read) = make_tcp_pair().await;
+        let partial = AtomicBool::new(false);
+
+        // A tag byte and nothing else: the relay consumes it, then blocks on
+        // the length field.
+        src_write.write_all(&[MSG_DATA_ROW]).await.unwrap();
+
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            relay_pg_message(&mut src_read, &mut sink, &partial),
+        )
+        .await;
+
+        assert!(
+            timed_out.is_err(),
+            "the message is incomplete, so the relay must still be waiting"
+        );
+        assert!(partial.load(Ordering::Relaxed), "a consumed tag byte must condemn the connection");
+    }
+
+    /// A completed message clears the flag again, so a session that ends
+    /// between messages stays recyclable.
+    #[tokio::test]
+    async fn relay_flag_clears_after_a_complete_message() {
+        let (mut src_write, mut src_read) = make_tcp_pair().await;
+        let (mut sink, _sink_read) = make_tcp_pair().await;
+        let partial = AtomicBool::new(false);
+
+        write_pg_message(&mut src_write, MSG_DATA_ROW, b"\0\0").await.unwrap();
+
+        let relayed = relay_pg_message(&mut src_read, &mut sink, &partial).await;
+        assert!(matches!(relayed, Relayed::Message(MSG_DATA_ROW)));
+        assert!(
+            !partial.load(Ordering::Relaxed),
+            "a fully forwarded message leaves nothing behind"
+        );
+    }
+
+    // ── query stats on the single-backend path ──────────────────────
+    //
+    // Before this path framed the backend→client direction it recorded
+    // nothing at all, so `reset_strategy = "never"`/`"always"` without
+    // replicas made a whole deployment's traffic invisible to
+    // `[db.analysis]`. These pin the closed gap.
+
+    /// Read client-bound messages until `ReadyForQuery`, returning the tags.
+    ///
+    /// Also proves the coalescing client writer flushed: a message that stayed
+    /// in the `BufWriter` would never arrive and this would time out.
+    async fn read_to_ready(client: &mut TcpStream) -> Vec<u8> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut seen = Vec::new();
+            loop {
+                let (tag, _) = read_pg_message(client).await.unwrap();
+                seen.push(tag);
+                if tag == MSG_READY_FOR_QUERY {
+                    return seen;
+                }
+            }
+        })
+        .await
+        .expect("the response must reach the client")
+    }
+
+    /// Answer one simple `Query` on the fake backend with `rows` data rows.
+    async fn answer_query(backend: &mut TcpStream, rows: usize, fail: bool) {
+        let (tag, _) = read_pg_message(backend).await.unwrap();
+        assert_eq!(tag, MSG_QUERY);
+        write_pg_message(backend, b'T', b"\0\0").await.unwrap();
+        for _ in 0..rows {
+            write_pg_message(backend, MSG_DATA_ROW, b"\0\0").await.unwrap();
+        }
+        if fail {
+            write_pg_message(backend, MSG_ERROR_RESPONSE, b"Mboom\0\0").await.unwrap();
+        } else {
+            write_pg_message(backend, b'C', b"SELECT 0\0").await.unwrap();
+        }
+        send_ready_for_query(backend, b'I').await.unwrap();
+    }
+
+    /// Run one simple `Query` through the single-backend relay and return the
+    /// backend the relay decided was reusable.
+    async fn drive_sniff_query(
+        stats: Option<&QueryStats>,
+        rows: usize,
+        fail: bool,
+    ) -> Option<TcpStream> {
+        let (mut driver, proxy_client) = make_tcp_pair().await;
+        let (proxy_backend, mut fake_backend) = make_tcp_pair().await;
+
+        let handed = stats.cloned();
+        let proxy = tokio::spawn(async move {
+            pg_proxy_bidirectional_sniff(proxy_client, proxy_backend, handed.as_ref()).await
+        });
+
+        write_pg_message(&mut driver, MSG_QUERY, b"SELECT * FROM users WHERE id = 1\0")
+            .await
+            .unwrap();
+        answer_query(&mut fake_backend, rows, fail).await;
+        read_to_ready(&mut driver).await;
+
+        // Orderly close, exactly as PDO does when the request ends.
+        write_pg_message(&mut driver, MSG_TERMINATE, &[]).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), proxy)
+            .await
+            .expect("an intercepted Terminate must end the session")
+            .expect("proxy task must not panic")
+    }
+
+    #[tokio::test]
+    async fn pg_single_backend_path_records_simple_queries() {
+        let stats = QueryStats::new(ephpm_query_stats::StatsConfig::default());
+        let backend = drive_sniff_query(Some(&stats), 2, false).await;
+        assert!(backend.is_some(), "an intercepted Terminate must leave the backend recyclable");
+
+        assert_eq!(stats.digest_count(), 1);
+        let top = stats.top_queries(1);
+        assert_eq!(top[0].count, 1);
+        assert_eq!(top[0].error_count, 0);
+        assert_eq!(
+            top[0].total_rows, 2,
+            "DataRow messages are counted here now, exactly as the routing loop counts them"
+        );
+        assert!(top[0].digest_text.contains('?'), "literals must be normalized away");
+        assert!(top[0].total_time > std::time::Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn pg_single_backend_path_records_errors() {
+        let stats = QueryStats::new(ephpm_query_stats::StatsConfig::default());
+        drive_sniff_query(Some(&stats), 1, true).await;
+
+        let top = stats.top_queries(1);
+        assert_eq!(top[0].count, 1);
+        assert_eq!(top[0].error_count, 1, "ErrorResponse in the turn marks the statement failed");
+        assert_eq!(top[0].total_rows, 1, "rows forwarded before the error are real");
+    }
+
+    /// Negative control for `[db.analysis] query_stats = false`: the same
+    /// session with no collector, and with a present-but-disabled one, must
+    /// record nothing and still relay every message.
+    #[tokio::test]
+    async fn pg_single_backend_path_records_nothing_when_stats_are_off() {
+        // `None` is what `PgProxy::stats()` yields when the toggle is off.
+        assert!(drive_sniff_query(None, 2, false).await.is_some());
+
+        let disabled = QueryStats::new(ephpm_query_stats::StatsConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        drive_sniff_query(Some(&disabled), 2, false).await;
+        assert_eq!(disabled.digest_count(), 0, "the toggle must reach this tap point");
+    }
+
+    /// Turn alignment under pipelining.
+    ///
+    /// `ReadyForQuery` is the completion marker, and the extended query
+    /// protocol produces one at `Sync` just as a simple `Query` produces one
+    /// of its own. If only `Query` enqueued a turn, an extended batch whose
+    /// `ReadyForQuery` arrives *after* a later `Query` was sent would pop that
+    /// query's entry and publish the batch's numbers under the query's digest.
+    ///
+    /// Nothing in the PHP ecosystem pipelines, so this pins the invariant
+    /// rather than a shipped scenario — but the invariant is what makes the
+    /// numbers trustworthy.
+    #[tokio::test]
+    async fn pg_single_backend_path_keeps_turns_aligned_under_pipelining() {
+        let stats = QueryStats::new(ephpm_query_stats::StatsConfig::default());
+        let (mut driver, proxy_client) = make_tcp_pair().await;
+        let (proxy_backend, mut fake_backend) = make_tcp_pair().await;
+
+        let handed = stats.clone();
+        let proxy = tokio::spawn(async move {
+            pg_proxy_bidirectional_sniff(proxy_client, proxy_backend, Some(&handed)).await
+        });
+
+        // An extended-protocol batch and a simple query, both in flight before
+        // either is answered.
+        write_pg_message(&mut driver, b'P', b"\0SELECT 1\0\0\0").await.unwrap();
+        write_pg_message(&mut driver, MSG_SYNC, &[]).await.unwrap();
+        write_pg_message(&mut driver, MSG_QUERY, b"SELECT * FROM users WHERE id = 1\0")
+            .await
+            .unwrap();
+
+        // The backend drains all three, then answers in order: the batch
+        // returns no rows, the query returns two.
+        for _ in 0..3 {
+            read_pg_message(&mut fake_backend).await.unwrap();
+        }
+        write_pg_message(&mut fake_backend, b'1', &[]).await.unwrap();
+        write_pg_message(&mut fake_backend, b'C', b"SELECT 0\0").await.unwrap();
+        send_ready_for_query(&mut fake_backend, b'I').await.unwrap();
+        write_pg_message(&mut fake_backend, b'T', b"\0\0").await.unwrap();
+        write_pg_message(&mut fake_backend, MSG_DATA_ROW, b"\0\0").await.unwrap();
+        write_pg_message(&mut fake_backend, MSG_DATA_ROW, b"\0\0").await.unwrap();
+        write_pg_message(&mut fake_backend, b'C', b"SELECT 2\0").await.unwrap();
+        send_ready_for_query(&mut fake_backend, b'I').await.unwrap();
+
+        read_to_ready(&mut driver).await;
+        read_to_ready(&mut driver).await;
+        write_pg_message(&mut driver, MSG_TERMINATE, &[]).await.unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), proxy).await;
+
+        assert_eq!(stats.digest_count(), 1, "only the simple query is recordable");
+        let top = stats.top_queries(1);
+        assert_eq!(top[0].count, 1);
+        assert_eq!(
+            top[0].total_rows, 2,
+            "the query must carry its own row count, not the extended batch's zero"
+        );
     }
 
     // ── Test helpers ─────────────────────────────────────────────────

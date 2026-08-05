@@ -314,3 +314,149 @@ async fn prepared_statement_lifecycle() {
 
     client.batch_execute("DROP TABLE IF EXISTS _ephpm_pg_ps").await.unwrap();
 }
+
+// ── Multi-result responses, and the single-backend framed path ───────────────
+
+/// PostgreSQL's counterpart to the MySQL multi-result desync (issue #223).
+///
+/// The MySQL bug was that a `CALL` returns several result sets and the proxy
+/// stopped after the first. PG cannot have that bug by construction: a
+/// multi-statement simple `Query` produces several `RowDescription` /
+/// `DataRow` / `CommandComplete` groups but exactly *one* `ReadyForQuery`, and
+/// both PG paths relay until they see it. This test pins that against a real
+/// server rather than against a reading of the protocol spec.
+///
+/// It runs on `reset_strategy = "never"` with no replicas — the single-backend
+/// path, which nothing else in this file exercises — so it also covers the
+/// framed relay that replaced the opaque byte copy.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires PG_TEST_URL — nightly CI only"]
+async fn multi_statement_query_does_not_desync_the_pooled_backend() {
+    let Some(url) = pg_url() else {
+        println!("PG_TEST_URL not set — skipping");
+        return;
+    };
+
+    let config = PoolConfig {
+        min_connections: 1,
+        max_connections: 1,
+        idle_timeout: Duration::from_secs(60),
+        max_lifetime: Duration::from_secs(300),
+        pool_timeout: Duration::from_secs(5),
+        health_check_interval: Duration::from_secs(30),
+    };
+    // `Never` + no replicas selects the single-backend relay.
+    let addr = start_proxy(&url, config, ResetStrategy::Never).await;
+
+    // A desync shows up as a hang, so bound the whole thing.
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        // Session A: a multi-statement simple query, then a follow-up.
+        {
+            let (client, connection) = proxy_config(&addr).connect(NoTls).await.unwrap();
+            let handle = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            let messages = client.simple_query("SELECT 11 AS a; SELECT 22 AS b").await.unwrap();
+            let values: Vec<String> = messages
+                .iter()
+                .filter_map(|m| match m {
+                    tokio_postgres::SimpleQueryMessage::Row(r) => {
+                        Some(r.get(0).unwrap().to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(values, vec!["11", "22"], "both result sets must reach the client");
+
+            let rows = client.simple_query("SELECT 33").await.unwrap();
+            let follow_up: Vec<String> = rows
+                .iter()
+                .filter_map(|m| match m {
+                    tokio_postgres::SimpleQueryMessage::Row(r) => {
+                        Some(r.get(0).unwrap().to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(follow_up, vec!["33"], "the next command must read its own response");
+
+            drop(client);
+            let _ = handle.await;
+        }
+
+        // Let the proxy finish parking the backend.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Session B: a different client session on the same pooled backend
+        // (`max_connections = 1`, so it is provably the same one).
+        {
+            let (client, connection) = proxy_config(&addr).connect(NoTls).await.unwrap();
+            let handle = tokio::spawn(async move {
+                let _ = connection.await;
+            });
+
+            let rows = client.simple_query("SELECT 44").await.unwrap();
+            let values: Vec<String> = rows
+                .iter()
+                .filter_map(|m| match m {
+                    tokio_postgres::SimpleQueryMessage::Row(r) => {
+                        Some(r.get(0).unwrap().to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                values,
+                vec!["44"],
+                "a pooled backend must not carry a previous session's result sets"
+            );
+
+            drop(client);
+            let _ = handle.await;
+        }
+    })
+    .await;
+
+    result.expect("a multi-statement query desynchronised the PG proxy (timed out)");
+}
+
+/// A large result set through the single-backend framed relay.
+///
+/// The relay coalesces client-bound writes and flushes only when its read
+/// buffer drains. A response bigger than that buffer is what proves the flush
+/// rule never strands bytes: get it wrong and the client waits forever for the
+/// tail of the result set.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires PG_TEST_URL — nightly CI only"]
+async fn large_result_set_streams_through_the_single_backend_path() {
+    let Some(url) = pg_url() else {
+        println!("PG_TEST_URL not set — skipping");
+        return;
+    };
+
+    let addr = start_proxy(&url, test_pool_config(), ResetStrategy::Never).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let (client, connection) = proxy_config(&addr).connect(NoTls).await.unwrap();
+        let handle = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+
+        let messages = client
+            .simple_query("SELECT i, repeat('x', 200) FROM generate_series(1, 5000) AS i")
+            .await
+            .unwrap();
+        let rows = messages
+            .iter()
+            .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+            .count();
+        assert_eq!(rows, 5000, "every row of a multi-megabyte result set must reach the client");
+
+        drop(client);
+        let _ = handle.await;
+    })
+    .await;
+
+    result.expect("a large result set stalled in the relay (timed out)");
+}
