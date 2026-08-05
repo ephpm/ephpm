@@ -259,6 +259,50 @@ jobs:
           # so one red leg does not hide the state of the others.
           cargo nextest run -p ephpm-db --run-ignored all --no-fail-fast
 
+      - name: Verify the guard fails rather than skips
+        # The guard from issue #238 is itself a thing that can silently stop
+        # working — if `db_url` ever regressed to returning None under CI, this
+        # whole workflow would go back to reporting green against no database
+        # and nothing would say so. So assert the negative here, permanently,
+        # instead of hand-checking it once at review time.
+        #
+        # Deliberately exports no *_TEST_URL. The real run above exports them
+        # inside its own `run:` block rather than into GITHUB_ENV precisely so
+        # they do not leak into this step.
+        if: always()
+        env:
+          EPHPM_REQUIRE_DB_TESTS: "1"
+        run: |
+          set -eu
+
+          expect_failure() {  # expect_failure DESCRIPTION EXPECTED_TEXT -- CMD...
+            local desc="$1" expected="$2"; shift 3
+            if "$@" > /tmp/guard.log 2>&1; then
+              echo "::error::$desc — the command PASSED. The fail-not-skip guard is not working, so a missing database can report green again (issue #238)."
+              cat /tmp/guard.log
+              exit 1
+            fi
+            if ! grep -qF "$expected" /tmp/guard.log; then
+              echo "::error::$desc — failed, but not for the expected reason (wanted: $expected)"
+              cat /tmp/guard.log
+              exit 1
+            fi
+            echo "ok: $desc"
+          }
+
+          # 1. A test whose URL is unset must fail, not skip.
+          expect_failure \
+            "unset PG_TEST_URL under CI" \
+            "Refusing to skip" \
+            -- cargo nextest run -p ephpm-db --run-ignored ignored-only \
+                 -E 'binary(pg_proxy_integration) and test(backend_handshake_completes)'
+
+          # 2. A required URL the workflow never provisioned must fail the job.
+          expect_failure \
+            "unprovisioned database URL" \
+            "did not provision" \
+            -- cargo nextest run -p ephpm-db -E 'binary(db_env_guard)'
+
       - name: Database logs
         if: failure()
         run: |
