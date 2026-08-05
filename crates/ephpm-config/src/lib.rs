@@ -4,6 +4,9 @@ use figment::Figment;
 use figment::providers::{Env, Format, Toml};
 use serde::Deserialize;
 
+#[cfg(test)]
+mod test_env;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to load configuration: {0}")]
@@ -1807,6 +1810,13 @@ impl Config {
     ///
     /// Returns `ConfigError::Load` if the TOML file cannot be read or parsed.
     pub fn load(path: &PathBuf) -> Result<Self, ConfigError> {
+        // Reading the `EPHPM_*` environment is a read of process-global state.
+        // Under `cfg(test)` that read is serialised against the tests that
+        // override those variables — see `crate::test_env` for the full story.
+        // Compiled out entirely in real builds.
+        #[cfg(test)]
+        let _env_guard = test_env::read_guard();
+
         let config = Figment::new()
             .merge(Toml::file(path))
             .merge(Env::prefixed("EPHPM_").split("__"))
@@ -1821,6 +1831,10 @@ impl Config {
     ///
     /// Returns `ConfigError::Load` if environment variables contain invalid values.
     pub fn default_config() -> Result<Self, ConfigError> {
+        // See the note in `load` — same process-global read, same guard.
+        #[cfg(test)]
+        let _env_guard = test_env::read_guard();
+
         let config = Figment::new()
             .merge(Env::prefixed("EPHPM_").split("__"))
             .extract()
@@ -3365,6 +3379,11 @@ fn default_digest_max_entries() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Every test here reads the `EPHPM_*` process environment through
+    // `Config::load` / `Config::default_config`. Tests that need an override
+    // must install it with `EnvVars` — see `crate::test_env`; nothing else in
+    // this module may touch `std::env` directly.
+    use crate::test_env::EnvVars;
 
     #[test]
     fn cluster_disabled_empty_secret_is_ok() {
@@ -3490,18 +3509,16 @@ listen = "0.0.0.0:8080"
         )
         .unwrap();
 
-        temp_env::with_var("EPHPM_SERVER__LISTEN", Some("127.0.0.1:9090"), || {
-            let config = Config::load(&file).unwrap();
-            assert_eq!(config.server.listen, "127.0.0.1:9090");
-        });
+        let _env = EnvVars::set("EPHPM_SERVER__LISTEN", "127.0.0.1:9090");
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.listen, "127.0.0.1:9090");
     }
 
     #[test]
     fn test_env_var_override_without_file() {
-        temp_env::with_var("EPHPM_PHP__MEMORY_LIMIT", Some("256M"), || {
-            let config = Config::default_config().unwrap();
-            assert_eq!(config.php.memory_limit, "256M");
-        });
+        let _env = EnvVars::set("EPHPM_PHP__MEMORY_LIMIT", "256M");
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.php.memory_limit, "256M");
     }
 
     #[test]
@@ -3733,10 +3750,9 @@ compression_streaming = "sse"
 
     #[test]
     fn test_env_var_overrides_compression_streaming() {
-        temp_env::with_var("EPHPM_SERVER__RESPONSE__COMPRESSION_STREAMING", Some("all"), || {
-            let config = Config::default_config().unwrap();
-            assert_eq!(config.server.response.compression_streaming, "all");
-        });
+        let _env = EnvVars::set("EPHPM_SERVER__RESPONSE__COMPRESSION_STREAMING", "all");
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.server.response.compression_streaming, "all");
     }
 
     #[test]
@@ -3821,10 +3837,9 @@ enabled = false
         )
         .unwrap();
 
-        temp_env::with_var("EPHPM_SERVER__PHP_ETAG_CACHE__ENABLED", Some("true"), || {
-            let config = Config::load(&file).unwrap();
-            assert!(config.server.php_etag_cache.enabled);
-        });
+        let _env = EnvVars::set("EPHPM_SERVER__PHP_ETAG_CACHE__ENABLED", "true");
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.php_etag_cache.enabled);
     }
 
     #[test]
@@ -3840,58 +3855,48 @@ compression = "none"
         )
         .unwrap();
 
-        temp_env::with_var("EPHPM_KV__COMPRESSION", Some("gzip"), || {
-            let config = Config::load(&file).unwrap();
-            assert_eq!(config.kv.compression, "gzip");
-        });
+        let _env = EnvVars::set("EPHPM_KV__COMPRESSION", "gzip");
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.kv.compression, "gzip");
     }
 
     #[test]
     fn test_env_var_overrides_compression_level() {
-        temp_env::with_var("EPHPM_KV__COMPRESSION_LEVEL", Some("8"), || {
-            let config = Config::default_config().unwrap();
-            assert_eq!(config.kv.compression_level, 8);
-        });
+        let _env = EnvVars::set("EPHPM_KV__COMPRESSION_LEVEL", "8");
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.kv.compression_level, 8);
     }
 
     #[test]
     fn test_env_var_overrides_compression_min_size() {
-        temp_env::with_var("EPHPM_KV__COMPRESSION_MIN_SIZE", Some("4096"), || {
-            let config = Config::default_config().unwrap();
-            assert_eq!(config.kv.compression_min_size, 4096);
-        });
+        let _env = EnvVars::set("EPHPM_KV__COMPRESSION_MIN_SIZE", "4096");
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.kv.compression_min_size, 4096);
     }
 
     #[test]
     fn test_env_var_overrides_vec_string() {
-        temp_env::with_var(
-            "EPHPM_CLUSTER__JOIN",
-            Some(r#"["10.0.0.1:7946","10.0.0.2:7946"]"#),
-            || {
-                let config = Config::default_config().unwrap();
-                assert_eq!(
-                    config.cluster.join,
-                    vec!["10.0.0.1:7946".to_string(), "10.0.0.2:7946".to_string()]
-                );
-            },
+        let _env = EnvVars::set("EPHPM_CLUSTER__JOIN", r#"["10.0.0.1:7946","10.0.0.2:7946"]"#);
+        let config = Config::default_config().unwrap();
+        assert_eq!(
+            config.cluster.join,
+            vec!["10.0.0.1:7946".to_string(), "10.0.0.2:7946".to_string()]
         );
     }
 
     #[test]
     fn test_env_var_overrides_vec_pair_string() {
-        temp_env::with_var(
+        let _env = EnvVars::set(
             "EPHPM_PHP__INI_OVERRIDES",
-            Some(r#"[["display_errors","Off"],["error_reporting","E_ALL"]]"#),
-            || {
-                let config = Config::default_config().unwrap();
-                assert_eq!(
-                    config.php.ini_overrides,
-                    vec![
-                        ["display_errors".to_string(), "Off".to_string()],
-                        ["error_reporting".to_string(), "E_ALL".to_string()],
-                    ]
-                );
-            },
+            r#"[["display_errors","Off"],["error_reporting","E_ALL"]]"#,
+        );
+        let config = Config::default_config().unwrap();
+        assert_eq!(
+            config.php.ini_overrides,
+            vec![
+                ["display_errors".to_string(), "Off".to_string()],
+                ["error_reporting".to_string(), "E_ALL".to_string()],
+            ]
         );
     }
 
@@ -4091,11 +4096,10 @@ path = "test.db"
         )
         .unwrap();
 
-        temp_env::with_var("EPHPM_DB__SQLITE__REPLICATION__ROLE", Some("primary"), || {
-            let config = Config::load(&file).unwrap();
-            let sqlite = config.db.sqlite.expect("sqlite should be present");
-            assert_eq!(sqlite.replication.role, "primary");
-        });
+        let _env = EnvVars::set("EPHPM_DB__SQLITE__REPLICATION__ROLE", "primary");
+        let config = Config::load(&file).unwrap();
+        let sqlite = config.db.sqlite.expect("sqlite should be present");
+        assert_eq!(sqlite.replication.role, "primary");
     }
 
     // ── Security isolation default resolution ──────────────────────────
@@ -4207,13 +4211,12 @@ sites_dir = "/var/www/sites"
         )
         .unwrap();
 
-        temp_env::with_var("EPHPM_SERVER__SECURITY__OPEN_BASEDIR", Some("false"), || {
-            let config = Config::load(&file).unwrap();
-            assert!(!config.server.effective_open_basedir());
-            // The env var materializes the section, so the unset sibling
-            // still resolves true (and sites_dir is set anyway).
-            assert!(config.server.effective_disable_shell_exec());
-        });
+        let _env = EnvVars::set("EPHPM_SERVER__SECURITY__OPEN_BASEDIR", "false");
+        let config = Config::load(&file).unwrap();
+        assert!(!config.server.effective_open_basedir());
+        // The env var materializes the section, so the unset sibling
+        // still resolves true (and sites_dir is set anyway).
+        assert!(config.server.effective_disable_shell_exec());
     }
 
     // ── OPcache timestamp validation ────────────────────────────────────
@@ -4826,9 +4829,8 @@ metric_label_series_max = 0
         let file = dir.path().join("ephpm.toml");
         std::fs::write(&file, "").unwrap();
 
-        temp_env::with_var("EPHPM_DB__ANALYSIS__METRIC_LABEL_SERIES_MAX", Some("5000"), || {
-            let config = Config::load(&file).unwrap();
-            assert_eq!(config.db.analysis.metric_label_series_max, 5000);
-        });
+        let _env = EnvVars::set("EPHPM_DB__ANALYSIS__METRIC_LABEL_SERIES_MAX", "5000");
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.db.analysis.metric_label_series_max, 5000);
     }
 }

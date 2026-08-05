@@ -54,5 +54,5 @@ The Windows/Linux runners are **ephemerd** JIT runners on Luther's box; macOS ru
 If Cargo Deny (or every PR) goes red simultaneously: new RUSTSEC advisory. `cargo update -p <crate>` on a tiny branch, merge first, then update other branches from main. Precedent: anyhow RUSTSEC-2026-0190 (#108); ignored-advisory precedent in `deny.toml` (proc-macro-error2).
 
 ## Known flakes
-- `ephpm-config` tests mutate process-global `EPHPM_*` env vars - parallel runs flake; `cargo test -p ephpm-config -- --test-threads=1` is authoritative.
+- `ephpm-config` tests mutate process-global `EPHPM_*` env vars. `crate::test_env` now serialises those mutations against every `Config::load`/`default_config`, so the suite is parallel-safe and `--test-threads=1` is no longer required (issue #235). If it flakes again, look for a test that touched the environment outside an `EnvVars` guard.
 - sqlite e2e suite has a pre-existing parallel-isolation issue (shared table).
