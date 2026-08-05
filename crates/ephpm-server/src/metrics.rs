@@ -42,6 +42,18 @@ const COMPRESSION_RATIO_BUCKETS: &[f64] =
 /// frameworks (Laravel, WordPress) can take seconds to bootstrap once.
 const WORKER_BOOT_BUCKETS: &[f64] = &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0];
 
+/// CDC batch-apply duration buckets (seconds): 100 µs up to 5 s. A batch
+/// is one replicated transaction, so the healthy range is sub-millisecond
+/// and the tail matters more than the median.
+const CDC_APPLY_BUCKETS: &[f64] =
+    &[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1.0, 5.0];
+
+/// Snapshot bootstrap transfer buckets (seconds): 10 ms up to 5 min. A
+/// logical dump of a large database is minutes, not milliseconds, and it
+/// blocks a cold replica's startup — the wide top end is the point.
+const CDC_SNAPSHOT_BUCKETS: &[f64] =
+    &[0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0];
+
 /// Install the Prometheus recorder and return a scrape handle.
 ///
 /// Must be called once at process startup, before any `metrics::counter!` /
@@ -94,6 +106,16 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
             PHP_DURATION_BUCKETS,
         )
         .context("failed to configure worker_request_wait buckets")?
+        .set_buckets_for_metric(
+            Matcher::Full(crate::turso_cdc_metrics::METRIC_APPLY_DURATION.to_string()),
+            CDC_APPLY_BUCKETS,
+        )
+        .context("failed to configure cdc_apply_duration buckets")?
+        .set_buckets_for_metric(
+            Matcher::Full(crate::turso_cdc_metrics::METRIC_SNAPSHOT_DURATION.to_string()),
+            CDC_SNAPSHOT_BUCKETS,
+        )
+        .context("failed to configure cdc_snapshot_duration buckets")?
         .install_recorder()
         .context("failed to install Prometheus recorder")?;
 

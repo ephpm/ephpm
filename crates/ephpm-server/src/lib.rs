@@ -13,6 +13,7 @@ pub mod stream_compress;
 pub mod tls;
 pub mod tracked_backend;
 pub mod turso_cdc;
+pub mod turso_cdc_metrics;
 pub mod worker_pool;
 
 use std::net::SocketAddr;

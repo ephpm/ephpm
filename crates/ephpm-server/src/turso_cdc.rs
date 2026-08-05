@@ -190,7 +190,7 @@ use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, re
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::tracked_backend;
+use crate::{tracked_backend, turso_cdc_metrics as cdc_metrics};
 
 /// Full stream-type string this build uses for the default vhost.
 ///
@@ -243,6 +243,17 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// How long a replica waits between connect retries when the primary
 /// is unreachable.
 const REPLICA_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+/// How often the primary samples `MAX(turso_cdc.change_id)` to publish
+/// [`cdc_metrics::METRIC_HEAD_CHANGE_ID`].
+///
+/// One indexed `MAX()` on an INTEGER PRIMARY KEY per second, and only
+/// while this node is the elected primary. That is what makes the lag
+/// gauge honest when no subscriber is attached: without it the head
+/// would only ever advance as a side effect of shipping, so a primary
+/// whose replica just died would report a frozen lag instead of a
+/// growing one.
+const HEAD_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Heartbeat interval on primary-side subscribers.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -454,6 +465,17 @@ pub async fn start_clustered_turso_cdc(
 
     let max_snapshot_bytes = sqlite_config.replication.max_snapshot_bytes;
 
+    // Seed the zero-valued CDC series before anything can record. An
+    // operator scraping a freshly booted node must be able to tell
+    // "replication is on and idle" from "this build has no CDC
+    // instrumentation", and an absent counter cannot say which.
+    cdc_metrics::init();
+
+    // Publish MAX(change_id) on a timer while primary. See
+    // HEAD_SAMPLE_INTERVAL for why this cannot be folded into the
+    // shipping path.
+    spawn_head_sampler(Arc::clone(&mgmt_factory), Arc::clone(&is_primary), handles);
+
     // Register the primary-side snapshot handler NOW, before anything
     // dials, so a peer that comes up as a cold replica can reach us as
     // soon as we win an election. Serving is gated on actually being
@@ -472,6 +494,7 @@ pub async fn start_clustered_turso_cdc(
         while let Some(incoming) = cdc_streams.recv().await {
             let IncomingStream { stream, peer, .. } = incoming;
             if !subs_is_primary.load(Ordering::Relaxed) {
+                cdc_metrics::record_stream_refused("cdc");
                 tracing::warn!(
                     peer = %peer,
                     "CDC: refusing to serve a replication stream — this node is not the \
@@ -670,6 +693,45 @@ async fn start_role(role: Role, mgmt: Arc<Turso>, channel: ephpm_cluster::Channe
     }
 }
 
+/// Spawn the primary-side head sampler: publish
+/// `MAX(turso_cdc.change_id)` every [`HEAD_SAMPLE_INTERVAL`] while this
+/// node is the elected primary.
+///
+/// The connection is opened once and reused; a per-tick connection would
+/// cost more than the query. A read failure is logged at debug and the
+/// loop continues — `current_max_change_id` already answers `0` for the
+/// cold case where `turso_cdc` does not exist yet, and the head gauge is
+/// monotonic, so a transient failure cannot walk it backwards.
+fn spawn_head_sampler(
+    mgmt: Arc<Turso>,
+    is_primary: Arc<AtomicBool>,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    handles.push(tokio::spawn(async move {
+        let conn = match mgmt.raw_connection() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("CDC head sampler: cannot open mgmt connection: {e:#}");
+                return;
+            }
+        };
+        let mut ticker = tokio::time::interval(HEAD_SAMPLE_INTERVAL);
+        loop {
+            ticker.tick().await;
+            // Only the primary has a meaningful head: a replica's local
+            // turso_cdc holds whatever its own wire frontend captured,
+            // which is not the replication stream's position.
+            if !is_primary.load(Ordering::Relaxed) {
+                continue;
+            }
+            match current_max_change_id(&conn).await {
+                Ok(head) => cdc_metrics::observe_head(head),
+                Err(e) => tracing::debug!("CDC head sampler: MAX(change_id) failed: {e:#}"),
+            }
+        }
+    }));
+}
+
 // ---------------------------------------------------------------------------
 // Primary: one tailer per subscriber. (Subscriber-side accept is
 // registered up in `start_clustered_turso_cdc` so it exists across role
@@ -700,7 +762,16 @@ async fn start_role(role: Role, mgmt: Arc<Turso>, channel: ephpm_cluster::Channe
 /// [`ChannelStream`]; before this was generic the only coverage of this
 /// function was a hand-rolled copy inside the e2e tests, which is how the
 /// cold-start reconnect loop went unnoticed.
-async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+///
+/// Public for the same reason [`serve_snapshot`] is: the two-node e2e
+/// suites drive this exact function rather than a twin, so the metrics it
+/// records are the ones a real primary records. Not part of a stable API.
+///
+/// # Errors
+///
+/// Returns an error if the first frame is not a valid `Subscribe`, if a
+/// `turso_cdc` poll fails, or if the stream breaks.
+pub async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     mut stream: S,
     mgmt: &Turso,
 ) -> anyhow::Result<()> {
@@ -710,6 +781,12 @@ async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     };
     anyhow::ensure!(from >= 0, "subscriber sent a negative watermark: {from}");
     tracing::info!(from_change_id = from, "CDC: subscriber attached");
+
+    // RAII: every exit path below is a `?` or a `bail!`, so the
+    // subscriber gauge and this cursor's contribution to the lag gauge
+    // are unwound by the guard's Drop rather than by a detach call this
+    // function has no single place to make.
+    let subscriber = cdc_metrics::attach_subscriber(from);
 
     let mut tailer = CdcTailer::new(mgmt, from);
     let mut idle_since = tokio::time::Instant::now();
@@ -726,18 +803,42 @@ async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
                 // Drop the stream rather than skip past the failure —
                 // the replica reconnects with the same watermark and we
                 // retry from the identical cursor.
+                cdc_metrics::record_tail_poll_error();
                 anyhow::bail!("CDC tail poll error: {e:#}");
             }
         };
 
-        match batch {
-            Some(batch) => {
+        // A rowless batch has no commit `change_id` to advance a cursor
+        // with (litewire#17 made `commit_change_id` return `Option`), and
+        // shipping `{"rows":[]}` would trip the subscriber's own
+        // empty-frame guard and tear the stream down. Fold it into the
+        // idle arm below: nothing to send, nothing to record.
+        let shippable = batch.and_then(|b| {
+            let id = b.commit_change_id()?;
+            Some((b, id))
+        });
+
+        match shippable {
+            Some((batch, commit_change_id)) => {
+                let rows = batch.rows.len();
                 let frame =
                     Frame::Batch { rows: batch.rows.iter().map(WireCdcRow::from).collect() };
                 write_frame(&mut stream, &frame).await?;
+                // Recorded only after the frame is on the wire: counting
+                // a batch we then failed to write would overstate how far
+                // this subscriber has actually got.
+                subscriber.record_batch_shipped(commit_change_id, rows);
                 idle_since = tokio::time::Instant::now();
             }
             None => {
+                // No *complete* transaction beyond the cursor, so the
+                // cursor is a lower bound on the head — free, with no
+                // extra query. A lower bound is safe because the head
+                // gauge only ever moves via `fetch_max`; the sampler
+                // supplies the exact MAX, and an in-flight uncommitted
+                // transaction (whose rows are already in the log but not
+                // yet yielded) is the gap between the two.
+                cdc_metrics::observe_head(tailer.cursor());
                 // Keep the stream warm so a replica can tell "idle
                 // primary" from "dead primary".
                 if idle_since.elapsed() >= HEARTBEAT_INTERVAL {
@@ -754,7 +855,19 @@ async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 // Replica: dial the cluster channel + read + apply.
 // ---------------------------------------------------------------------------
 
-async fn run_replica(
+/// The replica driver: dial the primary's `cdc/default` stream, announce
+/// the local watermark, apply what arrives, and retry forever.
+///
+/// Public so the two-node e2e suites run this exact loop instead of a
+/// twin — it is where the reconnect and connect-outcome metrics are
+/// recorded, and a copied loop would record none of them. Only returns on
+/// a fatal setup error; normal stream failures are retried internally.
+/// Not part of a stable API.
+///
+/// # Errors
+///
+/// Returns an error only if the local apply connection cannot be opened.
+pub async fn run_replica(
     mgmt: Arc<Turso>,
     primary_addr: SocketAddr,
     channel: ephpm_cluster::ChannelHandle,
@@ -782,6 +895,7 @@ async fn run_replica(
                 let watermark = match read_watermark(&apply_conn).await {
                     Ok(w) => w,
                     Err(e) => {
+                        cdc_metrics::record_connect_outcome("watermark_error");
                         tracing::warn!("CDC replica: cannot read local watermark: {e}");
                         tokio::time::sleep(REPLICA_RECONNECT_DELAY).await;
                         continue;
@@ -789,14 +903,17 @@ async fn run_replica(
                 };
                 match subscribe_and_consume(&mut stream, &apply_conn, watermark).await {
                     Ok(()) => {
+                        cdc_metrics::record_connect_outcome("closed");
                         tracing::info!("CDC replica: primary closed stream cleanly");
                     }
                     Err(e) => {
+                        cdc_metrics::record_connect_outcome("stream_error");
                         tracing::warn!("CDC replica stream error: {e:#}");
                     }
                 }
             }
             Err(e) => {
+                cdc_metrics::record_connect_outcome("dial_error");
                 tracing::debug!(primary = %primary_addr, "CDC replica dial failed: {e:#}");
             }
         }
@@ -805,20 +922,34 @@ async fn run_replica(
 }
 
 /// Announce our watermark, then apply everything the primary sends.
-async fn subscribe_and_consume(
-    stream: &mut ChannelStream,
+///
+/// Generic over the stream, and public, for the same reason
+/// [`serve_subscriber`] is: the two-node e2e suites drive this exact
+/// function so the replica-side metrics under test are the production
+/// ones. Not part of a stable API.
+///
+/// # Errors
+///
+/// Returns an error if the subscribe frame cannot be sent, if the primary
+/// sends a malformed or wrong-direction frame, or if `apply_batch` fails.
+pub async fn subscribe_and_consume<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
     apply_conn: &litewire::litewire_turso::TursoConnection,
     watermark: i64,
 ) -> anyhow::Result<()> {
     write_frame(stream, &Frame::Subscribe { from_change_id: watermark })
         .await
         .context("send subscribe frame")?;
+    // Publish what we are resuming from before a single batch lands, so
+    // the watermark gauge reflects durable local state rather than only
+    // what this process has applied since it started.
+    cdc_metrics::record_applied_watermark(watermark);
     tracing::info!(from_change_id = watermark, "CDC replica: subscribed");
     consume_frames(stream, apply_conn).await
 }
 
-async fn consume_frames(
-    stream: &mut ChannelStream,
+async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
+    stream: &mut S,
     apply_conn: &litewire::litewire_turso::TursoConnection,
 ) -> anyhow::Result<()> {
     loop {
@@ -839,14 +970,33 @@ async fn consume_frames(
                 let Some(change_id) = batch.commit_change_id() else {
                     anyhow::bail!("peer sent an empty CDC batch frame");
                 };
+                // Read after the guard: an empty batch never reaches the
+                // recording site below, so `rows_applied` can never be
+                // incremented by zero for a frame we rejected.
+                let row_count = batch.rows.len();
                 // A failed apply must NOT be skipped: continuing to the
                 // next batch would let the watermark advance past the
                 // failure and make the divergence permanent and silent.
                 // Fail the stream; the replica reconnects and resumes
                 // from the watermark, which has not moved.
-                apply_batch(apply_conn, &batch)
-                    .await
-                    .with_context(|| format!("CDC apply_batch failed at change_id {change_id}"))?;
+                let started = std::time::Instant::now();
+                match apply_batch(apply_conn, &batch).await {
+                    Ok(()) => {
+                        // Advances the watermark gauge to `change_id`,
+                        // which is exactly what the local watermark table
+                        // now holds.
+                        cdc_metrics::record_batch_applied(change_id, row_count, started.elapsed());
+                    }
+                    Err(e) => {
+                        // Deliberately does NOT touch the watermark
+                        // gauge: the watermark did not move, and a gauge
+                        // that advanced past a failed apply would report
+                        // convergence that has not happened.
+                        cdc_metrics::record_apply_error();
+                        return Err(anyhow::Error::new(e)
+                            .context(format!("CDC apply_batch failed at change_id {change_id}")));
+                    }
+                }
             }
             Frame::Ping => {}
             Frame::Subscribe { .. } => {
@@ -905,6 +1055,7 @@ fn spawn_snapshot_server(
         while let Some(incoming) = snapshot_streams.recv().await {
             let IncomingStream { stream, peer, .. } = incoming;
             if !is_primary.load(Ordering::Relaxed) {
+                cdc_metrics::record_stream_refused("snapshot");
                 tracing::warn!(
                     peer = %peer,
                     "snapshot bootstrap: refusing to serve a database dump — this node is \
@@ -941,19 +1092,41 @@ fn spawn_snapshot_server(
 /// Returns an error if the dump cannot be produced or the stream write
 /// fails.
 pub async fn serve_snapshot(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Result<i64> {
+    // Recorded here rather than at the call site so a test that drives
+    // `serve_snapshot` directly still exercises the instrumentation, and
+    // so both outcomes are counted in one place.
+    let started = std::time::Instant::now();
+    match serve_snapshot_inner(&mut stream, mgmt).await {
+        Ok((watermark, bytes)) => {
+            cdc_metrics::record_snapshot_served("ok", bytes, started.elapsed());
+            Ok(watermark)
+        }
+        Err(e) => {
+            cdc_metrics::record_snapshot_served("error", 0, started.elapsed());
+            Err(e)
+        }
+    }
+}
+
+/// Body of [`serve_snapshot`]. Returns the watermark and the dump size in
+/// bytes so the caller can record both without measuring twice.
+async fn serve_snapshot_inner(
+    stream: &mut ChannelStream,
+    mgmt: &Turso,
+) -> anyhow::Result<(i64, u64)> {
     let conn = mgmt.raw_connection().context("snapshot: open mgmt connection")?;
     let (watermark, dump) = produce_snapshot(&conn).await.context("snapshot: produce dump")?;
 
     let header = SnapshotHeader { watermark, total_len: dump.len() as u64 };
-    write_snapshot_header(&mut stream, &header).await?;
+    write_snapshot_header(stream, &header).await?;
 
     for chunk in dump.as_bytes().chunks(SNAPSHOT_CHUNK_TARGET) {
-        write_snapshot_chunk(&mut stream, chunk).await?;
+        write_snapshot_chunk(stream, chunk).await?;
     }
     // Zero-length end marker: signals a clean end of body.
-    write_snapshot_chunk(&mut stream, &[]).await?;
+    write_snapshot_chunk(stream, &[]).await?;
     stream.flush().await?;
-    Ok(watermark)
+    Ok((watermark, dump.len() as u64))
 }
 
 /// Produce a logical dump of the current DB state plus the aligned
@@ -1343,6 +1516,13 @@ async fn maybe_bootstrap_cold_replica(
     let conn = mgmt.raw_connection().context("snapshot bootstrap: open local connection")?;
 
     if !local_db_is_cold(&conn).await.context("snapshot bootstrap: cold-start check")? {
+        cdc_metrics::record_bootstrap("skipped");
+        // A warm replica already has a watermark; publish it so the gauge
+        // is populated before the first batch rather than reading 0 until
+        // one arrives.
+        if let Ok(wm) = read_watermark(&conn).await {
+            cdc_metrics::record_applied_watermark(wm);
+        }
         tracing::info!("snapshot bootstrap: local DB already populated; skipping");
         return Ok(());
     }
@@ -1359,6 +1539,7 @@ async fn maybe_bootstrap_cold_replica(
     for attempt in 1..=MAX_ATTEMPTS {
         match fetch_and_apply_snapshot(&conn, primary_addr, channel, max_snapshot_bytes).await {
             Ok(n) => {
+                cdc_metrics::record_bootstrap("ok");
                 tracing::info!(
                     primary = %primary_addr,
                     watermark = n,
@@ -1378,6 +1559,7 @@ async fn maybe_bootstrap_cold_replica(
         }
     }
 
+    cdc_metrics::record_bootstrap("failed");
     let cause = last_error.unwrap_or_else(|| anyhow::anyhow!("no attempt recorded an error"));
     Err(cause.context(format!(
         "snapshot bootstrap from {primary_addr} failed after {MAX_ATTEMPTS} attempts. \
@@ -1439,6 +1621,7 @@ pub async fn fetch_and_apply_snapshot(
     channel: &ephpm_cluster::ChannelHandle,
     max_snapshot_bytes: u64,
 ) -> anyhow::Result<i64> {
+    let started = std::time::Instant::now();
     let mut stream = channel
         .dial(primary_addr, SNAPSHOT_STREAM_TYPE)
         .await
@@ -1475,6 +1658,12 @@ pub async fn fetch_and_apply_snapshot(
     }
     let dump = String::from_utf8(body).context("snapshot: dump body is not valid utf-8")?;
     apply_snapshot(conn, header.watermark, &dump).await?;
+    // Only counted once the dump is durably applied: bytes received into
+    // a buffer that then failed validation are not a bootstrap.
+    cdc_metrics::record_snapshot_received(received, started.elapsed());
+    // The local watermark table now holds exactly this value, so the
+    // replica's watermark gauge is correct before the CDC tail starts.
+    cdc_metrics::record_applied_watermark(header.watermark);
     Ok(header.watermark)
 }
 
