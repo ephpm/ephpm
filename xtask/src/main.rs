@@ -259,13 +259,14 @@ fn require_macos_arm64() -> Result<(), ExitCode> {
 /// import) before invoking xtask.
 ///
 /// The Windows SDK is the same `php-sdk` GitHub release used for Linux/macOS,
-/// just the `windows-x86_64` artifact: it contains `php8embed.dll`,
-/// `php8embed.lib`, and the headers under `include/php/`. The build links
-/// against `php8embed.lib` (import lib for the DLL).
+/// just the `windows-x86_64` artifact: it contains a *static* `php8embed.lib`
+/// (static-php-cli `--build-embed` emits a fat lib of PHP's objects, not a
+/// DLL plus import lib), its static dependency archives, and the headers under
+/// `include/php/`. `crates/ephpm-php/build.rs` links it with
+/// `rustc-link-lib=static=php8embed`.
 ///
-/// The resulting binary requires `php8embed.dll` at runtime, which is also
-/// embedded into the binary via `include_bytes!()` in `windows_dll.rs` and
-/// extracted at startup.
+/// The resulting `ephpm.exe` is a single self-contained binary, same as on
+/// Linux/macOS — there is no DLL to ship, extract, or delay-load.
 ///
 /// History: this used to cross-compile from Linux via `cargo-xwin`. That path
 /// was removed because every Windows SDK case-sensitivity / transitive-include
@@ -313,9 +314,22 @@ fn release_windows(args: &[String]) -> ExitCode {
     }
 
     eprintln!("==> Building ephpm.exe (release, target: {target})...");
+    // Override the workspace's `lto = "fat"` / `codegen-units = 1` for Windows
+    // only. Fat LTO deserializes every crate's LLVM IR into a single module in
+    // a single process; that process is the peak-RSS of the whole build, and
+    // on the self-hosted Windows runner each job gets a fixed-size Hyper-V
+    // container, so the peak sets how many jobs can run concurrently.
+    //
+    // Thin LTO keeps per-module summaries and parallelizes instead, cutting
+    // peak memory substantially while retaining most of the optimization. The
+    // fat-LTO profile exists for the v0.4.2 perf work on proxy dispatch / KV
+    // RESP framing / query-stats — hot paths of the *Linux* deployment. Linux
+    // release artifacts are unaffected: this is set here, not in Cargo.toml.
     let status = Command::new("cargo")
         .args(["build", "--release", "--package", "ephpm", "--target", target])
         .env("PHP_SDK_PATH", &sdk_dir)
+        .env("CARGO_PROFILE_RELEASE_LTO", "thin")
+        .env("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "16")
         .status();
 
     if !ran_ok(&status) {
@@ -323,24 +337,18 @@ fn release_windows(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Copy php8embed.dll next to the .exe so the binary is runnable as a pair
-    // (the DLL is also embedded via include_bytes!() and extracted at runtime,
-    // but shipping it side-by-side keeps things obvious).
+    // No DLL to ship. The php-sdk Windows tarball ships a *static*
+    // php8embed.lib (static-php-cli `--build-embed` is a static build — a fat
+    // lib of PHP's objects), which crates/ephpm-php/build.rs links with
+    // `rustc-link-lib=static=php8embed`. ephpm.exe is a single self-contained
+    // binary on Windows, same as on Linux/macOS.
     let exe_dir = workspace_root().join("target").join(target).join("release");
-    let dll_dest = exe_dir.join("php8embed.dll");
-    let dll_src = sdk_dir.join("lib").join("php8embed.dll");
-    if dll_src.exists() {
-        if let Err(e) = fs::copy(&dll_src, &dll_dest) {
-            eprintln!("warning: failed to copy php8embed.dll: {e}");
-        }
-    }
 
     eprintln!();
     eprintln!("==> Windows binary ready:");
     eprintln!("    {}", exe_dir.join("ephpm.exe").display());
-    eprintln!("    {}", dll_dest.display());
     eprintln!();
-    eprintln!("    Deploy both files together. php8embed.dll must be next to ephpm.exe.");
+    eprintln!("    Single static binary — no DLL to deploy alongside it.");
     ExitCode::SUCCESS
 }
 

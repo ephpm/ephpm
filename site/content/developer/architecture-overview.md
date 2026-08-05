@@ -298,7 +298,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       # Release CI does NOT build PHP in-repo. `cargo xtask release` downloads a
-      # prebuilt PHP SDK tarball (static libphp.a / php8embed.dll + headers) from
+      # prebuilt PHP SDK tarball (static libphp.a / php8embed.lib + headers) from
       # github.com/ephpm/php-sdk releases, caches it under php-sdk/, exports
       # PHP_SDK_PATH, and builds the release binary against it.
       - name: Build release binary (downloads prebuilt PHP SDK)
