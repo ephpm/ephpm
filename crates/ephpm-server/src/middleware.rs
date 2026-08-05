@@ -875,6 +875,10 @@ mod tests {
     }
 
     /// Locate a built middleware cdylib in the workspace target directory.
+    ///
+    /// These are the *shipped* module artifacts, produced only by an explicit
+    /// `cargo build` of the crate — `cargo test --workspace` does not emit a
+    /// library crate's `cdylib` output, so on a fresh tree they are absent.
     fn built_module_path(stem: &str) -> Option<PathBuf> {
         let target_root = std::env::var("CARGO_TARGET_DIR").map_or_else(
             |_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"),
@@ -887,18 +891,41 @@ mod tests {
             .find(|candidate| candidate.is_file())
     }
 
+    /// Resolve a shipped cdylib, or decide what an absent artifact means.
+    ///
+    /// Locally, absent means "not built yet" and the test skips. In CI it
+    /// means the build wiring regressed, and skipping is exactly the failure
+    /// being closed here: this lane was *never* exercised, because nothing
+    /// built the artifact and the skip fired silently on every run. CI sets
+    /// `MIDDLEWARE_CDYLIB_REQUIRED=1` alongside the build step that
+    /// produces them, which turns the skip into a hard failure.
+    ///
+    /// Deliberately NOT `EPHPM_`-prefixed: that prefix is figment's config
+    /// namespace, so an `EPHPM_*` variable exported for the whole
+    /// `cargo nextest run --workspace` invocation is also visible to
+    /// `ephpm-config`'s own tests as a config key.
+    fn require_module_path(stem: &str) -> Option<PathBuf> {
+        if let Some(path) = built_module_path(stem) {
+            return Some(path);
+        }
+        assert!(
+            std::env::var_os("MIDDLEWARE_CDYLIB_REQUIRED").is_none(),
+            "shipped middleware cdylib `{stem}` is missing but \
+             MIDDLEWARE_CDYLIB_REQUIRED is set — build it with `cargo build --workspace`"
+        );
+        eprintln!("skipping: {stem} cdylib not built (run `cargo build --workspace`)");
+        None
+    }
+
     /// Full dlopen → init → invoke → shutdown lifecycle against the real
-    /// `ephpm-middleware-security-headers` cdylib. Deterministic: when no
-    /// artifact exists yet (bare `cargo test -p ephpm-server` on a fresh
-    /// tree), the test skips instead of failing — `cargo build --workspace`
-    /// produces the artifact. The E2E suite still covers the containerised
-    /// path.
+    /// `ephpm-middleware-security-headers` cdylib — the artifact operators
+    /// actually deploy, as opposed to the purpose-built fixtures in
+    /// `tests/middleware_dlopen.rs`. Runs on every CI platform, which is what
+    /// gives the dlopen lane macOS `dyld` coverage (the E2E suite is
+    /// Linux-only).
     #[test]
     fn load_real_module_end_to_end() {
-        let Some(path) = built_module_path("ephpm_middleware_security_headers") else {
-            eprintln!(
-                "skipping: security-headers cdylib not built (run `cargo build --workspace`)"
-            );
+        let Some(path) = require_module_path("ephpm_middleware_security_headers") else {
             return;
         };
         let mounts = vec![MiddlewareMount {
@@ -930,6 +957,51 @@ mod tests {
             }
         }
         // Dropping the chain exercises shutdown + dlclose.
+        drop(chain);
+    }
+
+    /// The shipped `ephpm-middleware-cors` cdylib, dlopened and driven through
+    /// a preflight — the `RESPOND` short-circuit marshaled back across the C
+    /// ABI (status, body, headers), which the `CONTINUE`-only security-headers
+    /// test above never touches.
+    ///
+    /// This is the same module and the same verdict the E2E suite asserts over
+    /// real HTTP, so a divergence between "the chain decided 204" and "the
+    /// client saw 204" localises to the router rather than to the loader.
+    #[test]
+    fn load_real_cors_module_preflight_short_circuits() {
+        let Some(path) = require_module_path("ephpm_middleware_cors") else {
+            return;
+        };
+        let mounts = vec![MiddlewareMount {
+            library: path.to_string_lossy().into_owned(),
+            match_pattern: None,
+            order: 10,
+            config: Some(serde_json::json!({ "allow_origins": ["*"], "max_age": 600 })),
+        }];
+        let chain = MiddlewareChain::load(&mounts).expect("load real cors module");
+        assert_eq!(chain.len(), 1);
+
+        let ctx = RequestCtx::new(
+            "OPTIONS",
+            "/api/x.php",
+            "",
+            "203.0.113.7",
+            "vhost-dynamic-cors",
+            &[
+                ("Origin".to_owned(), "https://any.example".to_owned()),
+                ("Access-Control-Request-Method".to_owned(), "PUT".to_owned()),
+            ],
+        );
+        match chain.evaluate(&ctx, "/api/x.php") {
+            ChainVerdict::Respond { status, body, headers } => {
+                assert_eq!(status, 204);
+                assert!(body.is_empty());
+                assert_eq!(find_header(&headers, "Access-Control-Allow-Origin"), Some("*"));
+                assert_eq!(find_header(&headers, "Access-Control-Max-Age"), Some("600"));
+            }
+            ChainVerdict::Continue { .. } => panic!("preflight must short-circuit through dlopen"),
+        }
         drop(chain);
     }
 }

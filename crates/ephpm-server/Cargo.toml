@@ -58,6 +58,33 @@ tempfile.workspace = true
 rcgen.workspace = true
 # Paused-clock (`start_paused`) support for the idle-timeout watchdog tests.
 tokio = { workspace = true, features = ["test-util"] }
+# Real MySQL client for the handle-reuse experiment: PHP's `pdo_mysql` opens a
+# connection per request, and the only way to observe what that does to
+# litewire's session-worker free-list is to drive the wire frontend with a
+# client that connects and disconnects the same way. Same pin as ephpm-db's
+# proxy integration tests.
+mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust"] }
+
+# Loadable middleware fixtures for the dlopen lane (tests/middleware_dlopen.rs).
+#
+# These are `examples` rather than workspace crates on purpose: cargo emits an
+# example's declared crate-types during an ordinary `cargo test -p
+# ephpm-server`, whereas a library crate's `cdylib` output is produced only by
+# an explicit `cargo build -p <crate>` — not by `cargo test --workspace`, and
+# not by a dev-dependency edge (both verified). That gap is why the dlopen
+# loader had no enforced coverage: the one test that touched it skipped
+# whenever the artifact was absent, which in CI was always.
+[[example]]
+name = "mw_probe_v1"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "mw_probe_abi_v2"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "mw_probe_no_invoke"
+crate-type = ["cdylib"]
 
 [lints]
 workspace = true

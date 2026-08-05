@@ -233,6 +233,40 @@ a lane that failed it was discarded rather than reported.
   engine difference is genuinely engine-side, not an artifact of
   per-request connect cost, so removing that cost does not recover it.
 
+  **Measured directly in v0.6.2 — no handles are being discarded.** The
+  v0.6.1 answer was an inference from latency; the free-list counters
+  themselves were unreachable, because the `Rusqlite` is moved into
+  `TrackedBackend` and then erased to `Arc<dyn Backend>`. ePHPm now keeps
+  a handle to the concrete backend and logs
+  `litewire::backend::Rusqlite::reuse_stats()` at debug level every 60 s
+  (`hits`/`misses`/`returned`/`discarded`/`expired`/`idle`) — litewire's
+  backend crate has no logging of its own, so this was invisible.
+  Driving ePHPm's exact single-node stack with a real MySQL client that
+  connects and disconnects per request, the way `pdo_mysql` does:
+
+  | workload | hits | misses | returned | discarded | expired |
+  |---|---|---|---|---|---|
+  | 30 sequential sessions, clean `COM_QUIT` | 29 | 3 | 31 | **0** | 0 |
+  | 5 waves × 8 concurrent sessions | 28 | 14 | 42 | **0** | 0 |
+  | 10 abrupt TCP closes, no `COM_QUIT` | 10 | 2 | 11 | **0** | 0 |
+
+  Zero discards in every shape, and a 91% free-list hit rate on the
+  sequential (single-threaded PHP) profile. Reuse engages exactly as
+  designed, and a clean `COM_QUIT` and an abrupt client disconnect behave
+  identically — there is no analogue here of the `COM_QUIT` mishandling
+  fixed in the DB proxy's own pool
+  ([#221](https://github.com/ephpm/ephpm/pull/221)).
+
+  The one real inefficiency the counters expose is unrelated to
+  correctness: under concurrency a third of connects **miss** with zero
+  discards. Parking is asynchronous — dropping a session only posts an
+  end-of-session message, and the session's own worker thread performs the
+  hygiene pass and parks afterwards — so a wave of concurrent connects can
+  outrun the previous wave's parks, spawn fresh workers, and drift the
+  free-list toward its idle cap. That costs a `sqlite3_open` plus WAL-index
+  attach on those connects but never corrupts anything. Regression tests:
+  `crates/ephpm-server/tests/sqlite_handle_reuse.rs`.
+
 ## v0.6.1 — the clustered-sqld write collapse, fixed
 
 v0.6.0's matrix found one outlier: **clustered SQLite via sqld collapsed
