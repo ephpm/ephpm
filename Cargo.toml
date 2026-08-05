@@ -50,6 +50,12 @@ hmac = "0.12"
 hkdf = "0.12"
 chacha20poly1305 = "0.10"
 md5 = "0.8"
+# RSA-OAEP public-key encryption for the caching_sha2_password full-auth
+# handshake (crates/ephpm-db/src/mysql.rs). Already in the dependency graph via
+# rustls-acme and rcgen, so this pulls in nothing new — and it lets us avoid the
+# pure-Rust `rsa` crate, which still carries the unpatched RUSTSEC-2023-0071
+# (Marvin timing sidechannel).
+aws-lc-rs = "1.16"
 base64ct = { version = "1", features = ["alloc"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }
 chitchat = "0.10"

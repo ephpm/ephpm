@@ -7,7 +7,7 @@ This document covers the SQL connection pooling proxy, wire protocol implementat
 ## Status
 
 **Currently Implemented:**
-- MySQL transparent proxy with wire protocol handshake (`mysql_native_password` and `caching_sha2_password` backend auth)
+- MySQL transparent proxy with wire protocol handshake. Backend auth covers `mysql_native_password` and `caching_sha2_password` — the latter on **both** its paths: the fast path against the server's password cache, and the full-auth RSA public-key exchange the server demands when the account is not cached (a new account, or any account on the first connect after a server restart). No `ALTER USER ... IDENTIFIED WITH mysql_native_password` is needed against a stock MySQL 8
 - PostgreSQL transparent proxy (`crates/ephpm-db/src/postgres.rs`)
 - Connection pooling with configurable min/max connections
 - Connection reset strategy (always/smart/never) to reset session state between clients

@@ -27,14 +27,27 @@
 //!
 //! Supports both `mysql_native_password` and `caching_sha2_password`.
 //! `MySQL` 8+ defaults to `caching_sha2_password`, which is handled
-//! transparently. For `caching_sha2_password`, the proxy supports the
-//! "fast auth" path (server has password hash cached) and the "full auth"
-//! path (RSA public key exchange over non-TLS connections).
+//! transparently. For `caching_sha2_password`, the proxy supports both:
+//!
+//! - **Fast auth** — the server already has the password hash in its
+//!   in-memory cache and answers the initial token with `0x01 0x03`.
+//! - **Full auth** — the cache has no entry (first connect for this account,
+//!   or the first connect after a server restart, which flushes the cache).
+//!   The server answers `0x01 0x04`; the proxy then requests the server's RSA
+//!   public key, XORs the NUL-terminated password with the connection
+//!   scramble, RSA-OAEP encrypts the result and sends the ciphertext.
+//!
+//! The proxy always dials its upstream in plaintext — there is no TLS to the
+//! backend (no `CLIENT_SSL` in our capability set, no config knob for it), so
+//! the cleartext full-auth variant the protocol permits over a secure channel
+//! is deliberately not implemented. If upstream TLS is ever added, that branch
+//! becomes available and should be added alongside it.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use base64ct::Encoding as _;
 use ephpm_query_stats::QueryStats;
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
@@ -802,11 +815,17 @@ async fn handle_caching_sha2(
 ///
 /// The server may respond with:
 /// - `0x01 0x03`: fast auth success — read the final OK packet.
-/// - `0x01 0x04`: full auth required — send the password via RSA or plaintext.
+/// - `0x01 0x04`: full auth required — fetch the server's RSA public key and
+///   send the scrambled password encrypted under it.
+///
+/// `challenge` must be the scramble the server most recently sent us — the
+/// nonce from `HandshakeV10`, or the replacement nonce from an
+/// `AuthSwitchRequest` if one was issued. Full auth XORs the password with it,
+/// and the server XORs with its own copy, so a stale scramble fails auth.
 async fn handle_caching_sha2_more_data(
     stream: &mut TcpStream,
     password: &str,
-    _challenge: &[u8; 20],
+    challenge: &[u8; 20],
     resp: &[u8],
     seq: u8,
 ) -> Result<(), DbError> {
@@ -836,31 +855,26 @@ async fn handle_caching_sha2_more_data(
                 return Err(DbError::Auth(format!("failed to get RSA public key: {msg}")));
             }
 
-            // The response is the public key in PEM format (0x01 prefix + PEM data).
+            // The response is `[0x01][PEM-encoded X.509 SubjectPublicKeyInfo]`.
             //
-            // KNOWN GAP: the correct wire behaviour for non-TLS caching_sha2
-            // full-auth is to XOR the null-terminated password with the
-            // 20-byte scramble (repeated to cover the plaintext length) and
-            // RSA-PKCS1-OAEP encrypt the result under the server's public
-            // key, then send the ciphertext. The current implementation
-            // sends the password as null-terminated plaintext instead —
-            // this works when the backend is on a trusted network (our
-            // loopback proxy pool, the common ePHPm deployment), but any
-            // operator running the pool over a non-loopback network gets
-            // plaintext password exposure on the *initial* cache-miss
-            // connect. Fast-auth caches the password hash on the backend
-            // so subsequent connects skip this branch, bounding the
-            // exposure to first-connect-per-user.
+            // Encrypt the password under that key exactly the way libmysql's
+            // `caching_sha2_password_auth_client` does:
             //
-            // Full RSA-OAEP is a follow-up PR: it needs the `rsa` and
-            // `sha1` crates (sha1 is already a transitive dep, rsa is
-            // new + license-clean but nontrivial to license-audit for
-            // cargo deny) plus integration tests against a real MySQL 8.4
-            // instance to catch OAEP padding edge cases. Deferred to the
-            // DB-auth harness cycle.
-            let mut pwd_bytes = password.as_bytes().to_vec();
-            pwd_bytes.push(0);
-            write_packet(stream, key_seq + 1, &pwd_bytes).await?;
+            //   1. Take the password bytes plus its NUL terminator.
+            //   2. XOR that buffer with the 20-byte auth scramble, repeating
+            //      the scramble cyclically to cover the whole buffer.
+            //   3. RSA-encrypt with OAEP padding (SHA-1 hash, MGF1-SHA1, no
+            //      label) — OpenSSL's `RSA_PKCS1_OAEP_PADDING` defaults, which
+            //      is what the server decrypts with.
+            //   4. Send the raw ciphertext as the next packet.
+            //
+            // The XOR step is what makes this replay-proof: the scramble is
+            // per-connection, so a captured ciphertext is useless on any other
+            // connection even though the password never changes.
+            let key_der = parse_rsa_public_key_pem(&key_resp)?;
+            let scrambled = xor_password_with_scramble(password, challenge);
+            let encrypted = rsa_oaep_encrypt(&key_der, &scrambled)?;
+            write_packet(stream, key_seq + 1, &encrypted).await?;
 
             let (_, final_resp) = read_packet(stream).await?;
             match final_resp.first() {
@@ -878,6 +892,92 @@ async fn handle_caching_sha2_more_data(
             Err(DbError::Protocol(format!("unexpected caching_sha2 more-data flag: {other:#x}")))
         }
     }
+}
+
+/// XOR the NUL-terminated password with the 20-byte auth scramble.
+///
+/// This is libmysql's `xor_string`: the scramble is applied cyclically over a
+/// buffer of `password.len() + 1` bytes (the trailing NUL is part of the
+/// plaintext the server expects, not a framing artefact).
+///
+/// An empty password yields a single byte — `0x00 ^ scramble[0]` — which is
+/// exactly what the client sends; the server XORs it back to an empty string.
+fn xor_password_with_scramble(password: &str, scramble: &[u8; 20]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(password.len() + 1);
+    buf.extend_from_slice(password.as_bytes());
+    buf.push(0);
+    for (i, byte) in buf.iter_mut().enumerate() {
+        *byte ^= scramble[i % scramble.len()];
+    }
+    buf
+}
+
+/// Extract DER-encoded X.509 `SubjectPublicKeyInfo` bytes from the server's
+/// public-key response.
+///
+/// The payload is `[0x01][PEM text]`. `MySQL` writes the key with
+/// `PEM_write_bio_RSA_PUBKEY`, so the PEM label is `PUBLIC KEY` (SPKI), not the
+/// PKCS#1 `RSA PUBLIC KEY` form.
+fn parse_rsa_public_key_pem(payload: &[u8]) -> Result<Vec<u8>, DbError> {
+    let pem_bytes = payload
+        .strip_prefix(&[0x01])
+        .ok_or_else(|| DbError::Protocol("RSA public key response missing 0x01 prefix".into()))?;
+    let pem = std::str::from_utf8(pem_bytes)
+        .map_err(|_| DbError::Protocol("RSA public key is not valid UTF-8".into()))?;
+
+    const BEGIN: &str = "-----BEGIN PUBLIC KEY-----";
+    const END: &str = "-----END PUBLIC KEY-----";
+
+    let start = pem.find(BEGIN).ok_or_else(|| {
+        // A PKCS#1 key would need a different decoder; say so rather than
+        // failing later with an opaque "key rejected".
+        if pem.contains("-----BEGIN RSA PUBLIC KEY-----") {
+            DbError::Protocol("server sent a PKCS#1 RSA public key; expected X.509 SPKI".into())
+        } else {
+            DbError::Protocol("RSA public key response is not PEM".into())
+        }
+    })? + BEGIN.len();
+    let end = pem[start..]
+        .find(END)
+        .ok_or_else(|| DbError::Protocol("RSA public key PEM is missing its END line".into()))?
+        + start;
+
+    // Strip line breaks and any surrounding whitespace before base64-decoding.
+    let body: String = pem[start..end].chars().filter(|c| !c.is_whitespace()).collect();
+    base64ct::Base64::decode_vec(&body)
+        .map_err(|_| DbError::Protocol("RSA public key PEM body is not valid base64".into()))
+}
+
+/// RSA-encrypt `plaintext` under the DER-encoded SPKI public key using OAEP
+/// with SHA-1 for both the hash and MGF1 — the padding OpenSSL applies for
+/// `RSA_PKCS1_OAEP_PADDING`, and therefore the padding `MySQL` decrypts with.
+fn rsa_oaep_encrypt(key_der: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, DbError> {
+    use aws_lc_rs::rsa::{OAEP_SHA1_MGF1SHA1, OaepPublicEncryptingKey, PublicEncryptingKey};
+
+    let public_key = PublicEncryptingKey::from_der(key_der)
+        .map_err(|e| DbError::Auth(format!("backend RSA public key rejected: {e}")))?;
+    let oaep_key = OaepPublicEncryptingKey::new(public_key)
+        .map_err(|_| DbError::Auth("backend RSA public key unusable for OAEP".into()))?;
+
+    // OAEP-SHA1 overhead is 2*20 + 2 bytes; a 2048-bit key leaves 214 bytes,
+    // far more than MySQL's 32-character password limit — but a very long
+    // password against a small key would otherwise fail inside aws-lc with an
+    // opaque error, so check explicitly.
+    let max = oaep_key.max_plaintext_size(&OAEP_SHA1_MGF1SHA1);
+    if plaintext.len() > max {
+        return Err(DbError::Auth(format!(
+            "password too long for backend RSA key: {} bytes, max {max}",
+            plaintext.len()
+        )));
+    }
+
+    let mut ciphertext = vec![0u8; oaep_key.ciphertext_size()];
+    let written = oaep_key
+        .encrypt(&OAEP_SHA1_MGF1SHA1, plaintext, &mut ciphertext, None)
+        .map_err(|_| DbError::Auth("RSA-OAEP encryption of the password failed".into()))?
+        .len();
+    ciphertext.truncate(written);
+    Ok(ciphertext)
 }
 
 // ── Client greeting & handshake ───────────────────────────────────────────────
@@ -2781,5 +2881,181 @@ mod tests {
         // essentially never produce all zeros.
         let c = fresh_challenge();
         assert!(c.iter().any(|&b| b != 0), "challenge should not be all zeros");
+    }
+
+    // ── caching_sha2_password full auth ───────────────────────────────
+
+    /// A scramble with no repeating structure, so a cyclic-wrap bug can't
+    /// accidentally produce the right answer.
+    const SCRAMBLE: [u8; 20] = [
+        0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+        0x01, 0x02, 0x03, 0x04, 0x05,
+    ];
+
+    #[test]
+    fn xor_password_includes_the_nul_terminator() {
+        // libmysql XORs `strlen(passwd) + 1` bytes — the NUL is part of the
+        // plaintext the server decrypts and compares, not framing. Dropping it
+        // produces a buffer the server reads as a different password.
+        let out = xor_password_with_scramble("secret", &SCRAMBLE);
+        assert_eq!(out.len(), 7, "6 password bytes + NUL");
+        // The terminator is NUL, so XORing it yields the scramble byte itself.
+        assert_eq!(out[6], SCRAMBLE[6], "terminator must be XORed too");
+    }
+
+    #[test]
+    fn xor_password_matches_hand_computed_vector() {
+        let out = xor_password_with_scramble("ab", &SCRAMBLE);
+        // Third byte is the NUL terminator XORed with scramble[2] == 0x33.
+        assert_eq!(out, vec![b'a' ^ 0x11, b'b' ^ 0x22, 0x33]);
+    }
+
+    #[test]
+    fn xor_password_repeats_scramble_cyclically() {
+        // 25 chars + NUL = 26 bytes, so the scramble wraps at index 20. This is
+        // the case a naive `zip()` silently truncates.
+        let password = "a".repeat(25);
+        let out = xor_password_with_scramble(&password, &SCRAMBLE);
+        assert_eq!(out.len(), 26);
+        assert_eq!(out[20], b'a' ^ SCRAMBLE[0], "byte 20 must reuse scramble[0]");
+        assert_eq!(out[24], b'a' ^ SCRAMBLE[4]);
+        assert_eq!(out[25], SCRAMBLE[5], "terminator lands at scramble[5]");
+    }
+
+    #[test]
+    fn xor_password_empty_is_one_byte() {
+        // An empty password still sends the terminator, XORed with scramble[0].
+        let out = xor_password_with_scramble("", &SCRAMBLE);
+        assert_eq!(out, vec![SCRAMBLE[0]]);
+    }
+
+    #[test]
+    fn xor_password_is_its_own_inverse() {
+        // The server recovers the plaintext by XORing with its copy of the
+        // scramble, so the transform must be an involution.
+        let password = "correct horse battery staple";
+        let once = xor_password_with_scramble(password, &SCRAMBLE);
+        let twice: Vec<u8> =
+            once.iter().enumerate().map(|(i, b)| b ^ SCRAMBLE[i % SCRAMBLE.len()]).collect();
+        let mut expected = password.as_bytes().to_vec();
+        expected.push(0);
+        assert_eq!(twice, expected);
+    }
+
+    /// Generate a 2048-bit key and return `(spki_der, private_key)` — the same
+    /// shape `MySQL` hands us, so the parser and the encryptor are tested
+    /// against a real key rather than a fixture.
+    fn generate_test_key() -> (Vec<u8>, aws_lc_rs::rsa::PrivateDecryptingKey) {
+        use aws_lc_rs::encoding::{AsDer, PublicKeyX509Der};
+        use aws_lc_rs::rsa::{KeySize, PrivateDecryptingKey};
+
+        let private_key = PrivateDecryptingKey::generate(KeySize::Rsa2048).unwrap();
+        let der = AsDer::<PublicKeyX509Der>::as_der(&private_key.public_key()).unwrap();
+        (der.as_ref().to_vec(), private_key)
+    }
+
+    /// Wrap DER in the `[0x01][PEM]` envelope `MySQL` sends, with the 64-column
+    /// line wrapping OpenSSL emits.
+    fn pem_response(der: &[u8]) -> Vec<u8> {
+        let b64 = base64ct::Base64::encode_string(der);
+        let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
+        for chunk in b64.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).unwrap());
+            pem.push('\n');
+        }
+        pem.push_str("-----END PUBLIC KEY-----\n");
+
+        let mut payload = vec![0x01];
+        payload.extend_from_slice(pem.as_bytes());
+        payload
+    }
+
+    #[test]
+    fn parse_rsa_public_key_pem_round_trips_der() {
+        let (der, _key) = generate_test_key();
+        let parsed = parse_rsa_public_key_pem(&pem_response(&der)).unwrap();
+        assert_eq!(parsed, der, "line-wrapped PEM must decode back to the DER");
+    }
+
+    #[test]
+    fn parse_rsa_public_key_pem_rejects_missing_prefix() {
+        let (der, _key) = generate_test_key();
+        let payload = &pem_response(&der)[1..]; // drop the 0x01
+        let err = parse_rsa_public_key_pem(payload).unwrap_err();
+        assert!(err.to_string().contains("0x01 prefix"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_rsa_public_key_pem_names_the_pkcs1_case() {
+        // A PKCS#1 key would fail deep inside aws-lc with an opaque rejection;
+        // the parser should say which encoding it got instead.
+        let payload = b"\x01-----BEGIN RSA PUBLIC KEY-----\nAAAA\n-----END RSA PUBLIC KEY-----\n";
+        let err = parse_rsa_public_key_pem(payload).unwrap_err();
+        assert!(err.to_string().contains("PKCS#1"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_rsa_public_key_pem_rejects_truncated_pem() {
+        // A short read that lost the END line must not be decoded as a key.
+        let (der, _key) = generate_test_key();
+        let full = pem_response(&der);
+        let truncated = &full[..full.len() / 2];
+        assert!(parse_rsa_public_key_pem(truncated).is_err());
+    }
+
+    #[test]
+    fn rsa_oaep_encrypt_decrypts_back_to_the_scrambled_password() {
+        // End-to-end over the exact bytes the wire carries: XOR, encrypt with
+        // OAEP-SHA1, then decrypt with the matching private key. This pins the
+        // padding choice — swapping to SHA-256 or PKCS#1 v1.5 fails here.
+        use aws_lc_rs::rsa::{OAEP_SHA1_MGF1SHA1, OaepPrivateDecryptingKey};
+
+        let (der, private_key) = generate_test_key();
+        let parsed_der = parse_rsa_public_key_pem(&pem_response(&der)).unwrap();
+
+        let scrambled = xor_password_with_scramble("secret", &SCRAMBLE);
+        let ciphertext = rsa_oaep_encrypt(&parsed_der, &scrambled).unwrap();
+        assert_eq!(ciphertext.len(), 256, "2048-bit key yields 256-byte ciphertext");
+        assert_ne!(ciphertext, scrambled);
+
+        let decrypter = OaepPrivateDecryptingKey::new(private_key).unwrap();
+        let mut out = vec![0u8; decrypter.min_output_size()];
+        let plaintext =
+            decrypter.decrypt(&OAEP_SHA1_MGF1SHA1, &ciphertext, &mut out, None).unwrap();
+        assert_eq!(plaintext, scrambled.as_slice());
+
+        // And un-XORing recovers the original NUL-terminated password, which is
+        // exactly what the server does before comparing against its hash.
+        let recovered: Vec<u8> =
+            plaintext.iter().enumerate().map(|(i, b)| b ^ SCRAMBLE[i % SCRAMBLE.len()]).collect();
+        assert_eq!(recovered, b"secret\0");
+    }
+
+    #[test]
+    fn rsa_oaep_encrypt_is_randomised() {
+        // OAEP seeds every operation, so two encryptions of identical plaintext
+        // must differ. A deterministic ciphertext would mean padding is off.
+        let (der, _key) = generate_test_key();
+        let scrambled = xor_password_with_scramble("secret", &SCRAMBLE);
+        let a = rsa_oaep_encrypt(&der, &scrambled).unwrap();
+        let b = rsa_oaep_encrypt(&der, &scrambled).unwrap();
+        assert_ne!(a, b, "OAEP must not produce a deterministic ciphertext");
+    }
+
+    #[test]
+    fn rsa_oaep_encrypt_rejects_an_oversized_password() {
+        // 2048-bit key with OAEP-SHA1 leaves 214 bytes. Beyond that we want a
+        // named error, not an opaque failure from the crypto library.
+        let (der, _key) = generate_test_key();
+        let long = "x".repeat(300);
+        let scrambled = xor_password_with_scramble(&long, &SCRAMBLE);
+        let err = rsa_oaep_encrypt(&der, &scrambled).unwrap_err();
+        assert!(err.to_string().contains("too long"), "got: {err}");
+    }
+
+    #[test]
+    fn rsa_oaep_encrypt_rejects_garbage_key() {
+        let err = rsa_oaep_encrypt(b"not a der key", b"payload").unwrap_err();
+        assert!(err.to_string().contains("rejected"), "got: {err}");
     }
 }
