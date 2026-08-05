@@ -166,6 +166,27 @@ fn spawn_primary(mgmt: Arc<Turso>, channel: &ChannelHandle) -> std::net::SocketA
     channel.listen_addr()
 }
 
+/// The primary's CDC write head: `MAX(turso_cdc.change_id)`.
+///
+/// Read straight from the database rather than from
+/// `ephpm_cdc_primary_head_change_id`, so the quiesce gate below is
+/// anchored to a fact about the data and never to the instrumentation it
+/// is about to assert on. Answers `0` while the log does not exist yet.
+async fn primary_head(conn: &turso::Connection) -> i64 {
+    let Ok(mut stmt) = conn.prepare("SELECT COALESCE(MAX(change_id), 0) FROM turso_cdc").await
+    else {
+        return 0;
+    };
+    let Ok(mut rows) = stmt.query(()).await else { return 0 };
+    match rows.next().await {
+        Ok(Some(row)) => match row.get_value(0) {
+            Ok(turso::Value::Integer(i)) => i,
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
 /// Replica side: dial once and run the production consume loop, which is
 /// what records the apply metrics and the watermark gauge.
 fn spawn_replica(
@@ -263,16 +284,56 @@ async fn two_node_cdc_flow_renders_every_metric_in_a_real_scrape() {
         session.execute(&format!("INSERT INTO posts VALUES ({i}, 'post-{i}')"), &[]).await.unwrap();
     }
 
-    // Converge on the replica's own durable watermark, not on a metric —
-    // otherwise the assertions below would be checking the metric against
-    // itself.
+    // Quiesce before sampling anything.
+    //
+    // This gate used to be `read_watermark(...) > 0`, which is satisfied
+    // by the FIRST of the six batches this test produces — so every
+    // assertion below raced the remaining five. That is what made the
+    // suite flaky (observed both as "batches applied did not advance:
+    // 0 -> 0" and as "applied_change_id gauge (10) disagrees with the
+    // watermark actually stored in the replica database (12)"): the
+    // scrape was rendered at one instant and compared against a database
+    // read taken a few milliseconds later, with replication still moving
+    // in between.
+    //
+    // The fix is to wait for the terminal state rather than to relax the
+    // comparison. No writes are issued after this point, so once the
+    // replica's durable watermark equals the primary's CDC head, nothing
+    // further can arrive and every series below is stable.
+    //
+    // The gauge is included in the gate on purpose: `apply_batch` commits
+    // the watermark row *inside* its own transaction and
+    // `record_batch_applied` runs immediately after it returns, so the
+    // gauge legitimately trails the database by microseconds. Waiting for
+    // it to settle is synchronisation, not a weakened assertion — if the
+    // gauge never agrees, this gate times out and fails with all three
+    // values named.
+    let primary_conn = primary_mgmt.raw_connection().unwrap();
     let replica_conn = replica_mgmt.raw_connection().unwrap();
     let converged = eventually(
-        || async { read_watermark(&replica_conn).await.unwrap_or(0) > 0 },
-        Duration::from_secs(15),
+        || async {
+            let head = primary_head(&primary_conn).await;
+            head > 0
+                && read_watermark(&replica_conn).await.unwrap_or(-1) == head
+                && metric_value(&handle.render(), cdc_metrics::METRIC_APPLIED_CHANGE_ID, &[])
+                    .map(|v| v as i64)
+                    == Some(head)
+                && metric_value(&handle.render(), cdc_metrics::METRIC_SUBSCRIBERS, &[])
+                    .map(|v| v as i64)
+                    == Some(1)
+        },
+        Duration::from_secs(30),
     )
     .await;
-    assert!(converged, "replica never applied anything");
+    assert!(
+        converged,
+        "replica never reached the primary's CDC head: primary head {}, replica watermark {}, \
+         applied_change_id gauge {:?}, subscribers {:?}",
+        primary_head(&primary_conn).await,
+        read_watermark(&replica_conn).await.unwrap_or(-1),
+        metric_value(&handle.render(), cdc_metrics::METRIC_APPLIED_CHANGE_ID, &[]),
+        metric_value(&handle.render(), cdc_metrics::METRIC_SUBSCRIBERS, &[]),
+    );
 
     // Let the ship-side idle path run at least once so the head gauge is
     // published from a caught-up tailer.
@@ -323,19 +384,34 @@ async fn two_node_cdc_flow_renders_every_metric_in_a_real_scrape() {
     assert!(apply_count > 0.0, "apply duration histogram recorded no observations");
 
     // --- the watermark gauge must equal reality ----------------------
+    //
+    // Three-way, not two: the gauge, the replica's own database, and the
+    // primary's CDC head must all agree. Comparing the gauge only against
+    // the database would be satisfiable by a gauge that is merely
+    // self-consistent; pinning both to the primary's head proves the
+    // replica actually finished the work the primary produced.
     let real_watermark = read_watermark(&replica_conn).await.unwrap();
+    let expected_head = primary_head(&primary_conn).await;
     let gauge_watermark = require_metric_i64(&scrape, cdc_metrics::METRIC_APPLIED_CHANGE_ID, &[]);
     assert_eq!(
         gauge_watermark, real_watermark,
         "applied_change_id gauge ({gauge_watermark}) disagrees with the watermark actually \
          stored in the replica database ({real_watermark})"
     );
+    assert_eq!(
+        real_watermark, expected_head,
+        "replica watermark ({real_watermark}) is not the primary's CDC head ({expected_head}) \
+         even though the quiesce gate passed"
+    );
 
     // --- lag ---------------------------------------------------------
     let head = require_metric_i64(&scrape, cdc_metrics::METRIC_HEAD_CHANGE_ID, &[]);
     let shipped_cursor = require_metric_i64(&scrape, cdc_metrics::METRIC_SHIPPED_CHANGE_ID, &[]);
     let lag = require_metric_i64(&scrape, cdc_metrics::METRIC_LAG_CHANGES, &[]);
-    assert!(head > 0, "head change_id never advanced");
+    assert_eq!(
+        head, expected_head,
+        "head_change_id gauge ({head}) is not the primary's actual CDC head ({expected_head})"
+    );
     // The documented identity: lag is a subtraction of two change_ids,
     // not an independently maintained number that could drift from them.
     assert_eq!(
