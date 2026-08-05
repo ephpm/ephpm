@@ -98,7 +98,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      # The dlopen middleware lane needs loadable modules on disk, and NOTHING
+      # in a test build produces them: `cargo test`/`cargo nextest` do not emit
+      # a library crate's `cdylib` output, and a dev-dependency edge only pulls
+      # the rlib (both verified). Without this step the middleware tests find
+      # no artifact — which is how that lane reached v0.6.1 with the loader,
+      # the ABI handshake, and symbol resolution never once executed by CI.
+      # `--lib` builds the four shipped ephpm-middleware-* cdylibs; `--examples`
+      # builds the fixtures in crates/ephpm-server/examples/.
+      - name: Build loadable middleware modules
+        run: cargo build --workspace --lib --examples
       - run: cargo nextest run --workspace
+        env:
+          # Turns "cdylib missing → skip" into a hard failure, so a regression
+          # in the step above reds the build instead of silently un-testing it.
+          MIDDLEWARE_CDYLIB_REQUIRED: "1"
 
   test-macos:
     name: Test (macos-arm64)
@@ -108,7 +122,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      # See the linux leg. This is also the only CI job that dlopens a real
+      # module through macOS `dyld` — the E2E suite is Linux-only.
+      - name: Build loadable middleware modules
+        run: cargo build --workspace --lib --examples
       - run: cargo nextest run --workspace
+        env:
+          MIDDLEWARE_CDYLIB_REQUIRED: "1"
 
   deny:
     name: Cargo Deny
