@@ -189,22 +189,30 @@ jobs:
           echo "resolved: mysql=$MYSQL_EP mysql-sha2=$MYSQL_SHA2_EP pg=$PG_EP"
 
       - name: Wait for databases to accept queries
-        # A TCP-reachable MySQL is not a ready MySQL: the official image binds a
+        # A TCP-reachable MySQL is not a ready MySQL: the official image runs a
         # temporary server during initdb. Wait on the real one.
         run: |
           set -eu
 
           wait_mysql() {
             local c="$1"
+            # DO NOT use `mysqladmin ping -uroot -p...` here, however natural it
+            # looks. Measured on mysql:8.0.46: a single successful root
+            # authentication over the container's loopback is enough for the
+            # proxy's subsequent connect as 'root'@'%' to take the caching_sha2
+            # FAST path. The full-auth branch — the branch #234 lived in — then
+            # never executes, and the suite goes green while covering nothing.
+            # Verified both ways against a fresh container:
+            #   mysqladmin probe first  -> proxy connects, tests pass on broken main
+            #   log-marker probe only   -> "caching_sha2 full auth error", as it should
+            # So readiness here must not authenticate at all.
+            #
+            # The log marker is exact rather than heuristic: initdb's temporary
+            # server runs with networking disabled and logs `port: 0`; only the
+            # real server logs `port: 3306`.
             for _ in $(seq 1 150); do
-              # Connects to 127.0.0.1 *inside* the container, which MySQL
-              # matches as 'root'@'localhost' — a different account from the
-              # 'root'@'%' the proxy authenticates as, so this does not warm the
-              # caching_sha2 password cache for the account under test.
-              if $RUNTIME exec "$c" mysqladmin ping \
-                   -h 127.0.0.1 --protocol=tcp --get-server-public-key \
-                   -uroot -p"$MYSQL_PW" --silent >/dev/null 2>&1; then
-                echo "$c ready"; return 0
+              if $RUNTIME logs "$c" 2>&1 | grep -q "ready for connections.*port: 3306"; then
+                echo "$c ready (no client authenticated against it)"; return 0
               fi
               sleep 2
             done
