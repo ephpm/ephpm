@@ -24,11 +24,16 @@
 #
 # Why the databases are started explicitly instead of with `services:`
 # --------------------------------------------------------------------
-# See the `probe-services` job below, which measures rather than assumes.
 # Explicit `docker run` is the shape the smoke-tests job in nightly.yml already
 # uses on this fleet, and it lets us resolve the reachable address at runtime
-# (see `Resolve database endpoints`) instead of hard-coding 127.0.0.1, which
-# only holds for one of the runner shapes in the fleet.
+# (see `Resolve database endpoints`) instead of hard-coding 127.0.0.1.
+#
+# The ephemerd runners do not expose a real dockerd — it is a containerd shim
+# (`pkg/dind` in the ephemerd repo). `run`/`exec`/`logs`/`inspect`/`rm` are all
+# implemented, but two behaviours differ from dockerd and both are load-bearing
+# here: a published port with an empty host port is silently dropped, and the
+# runner shares a CNI bridge with the containers it starts, so the container IP
+# is directly reachable. Both are handled explicitly below.
 
 name: DB Integration
 
@@ -110,10 +115,24 @@ jobs:
       - name: Start databases
         run: |
           set -eu
-          # Unique names so two concurrent runs on the same host do not collide,
-          # and an OS-assigned host port for the same reason (`-p 127.0.0.1::N`).
+          # Unique names so two concurrent runs on the same host do not collide.
           SUFFIX="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           echo "DB_SUFFIX=$SUFFIX" >> "$GITHUB_ENV"
+
+          # Explicit host ports, derived from the run id so two concurrent runs
+          # on the same runner do not collide. NOT `-p 127.0.0.1::3306`: the
+          # ephemerd fleet's Docker API is a containerd shim, and its
+          # port-forward installer skips any binding whose host port is empty
+          # (pkg/dind/containers.go). A let-docker-pick binding is therefore
+          # silently dropped — no error, and inspect echoes the empty binding
+          # back so `docker port` reports nothing either.
+          BASE=$(( 20000 + (GITHUB_RUN_ID % 20000) ))
+          MYSQL_HOST_PORT=$BASE
+          MYSQL_SHA2_HOST_PORT=$(( BASE + 1 ))
+          PG_HOST_PORT=$(( BASE + 2 ))
+          for v in MYSQL_HOST_PORT MYSQL_SHA2_HOST_PORT PG_HOST_PORT; do
+            eval "echo \"$v=\$$v\"" >> "$GITHUB_ENV"
+          done
 
           # MySQL 8 with DEFAULT authentication. Do NOT add
           # --default-authentication-plugin=mysql_native_password and do NOT
@@ -123,7 +142,7 @@ jobs:
           $RUNTIME run -d --name "ephpm-mysql-$SUFFIX" \
             -e MYSQL_ROOT_PASSWORD="$MYSQL_PW" \
             -e MYSQL_DATABASE=test \
-            -p 127.0.0.1::3306 \
+            -p "127.0.0.1:$MYSQL_HOST_PORT:3306" \
             docker.io/library/mysql:8.0
 
           # A SECOND, pristine MySQL for the caching_sha2 full-auth tests.
@@ -135,7 +154,7 @@ jobs:
           $RUNTIME run -d --name "ephpm-mysql-sha2-$SUFFIX" \
             -e MYSQL_ROOT_PASSWORD="$MYSQL_PW" \
             -e MYSQL_DATABASE=test \
-            -p 127.0.0.1::3306 \
+            -p "127.0.0.1:$MYSQL_SHA2_HOST_PORT:3306" \
             docker.io/library/mysql:8.0
 
           # PostgreSQL 17 — defaults to scram-sha-256, the path
@@ -143,16 +162,21 @@ jobs:
           $RUNTIME run -d --name "ephpm-pg-$SUFFIX" \
             -e POSTGRES_PASSWORD="$PG_PW" \
             -e POSTGRES_DB=test \
-            -p 127.0.0.1::5432 \
+            -p "127.0.0.1:$PG_HOST_PORT:5432" \
             docker.io/library/postgres:17
 
       - name: Resolve database endpoints
-        # Do not assume 127.0.0.1 reaches a published port. Two runner shapes
-        # exist in this fleet: a host-process runner (published ports land in
-        # the runner's own netns, 127.0.0.1 works) and a containerised runner
-        # talking to the host's docker socket (published ports land on the
-        # host; the container's bridge IP is what is reachable). Probe both and
-        # use whichever answers, rather than encoding one shape.
+        # Do not assume the published port is how you reach the container.
+        #
+        # On a normal dockerd, 127.0.0.1:<published> is right. On the ephemerd
+        # fleet the Docker API is a containerd shim: publishing is a userspace
+        # proxy that setns's into the runner's network namespace to listen, and
+        # dials the container from that same namespace (pkg/dind/portforward.go)
+        # — which means the runner is already on the container's CNI bridge and
+        # can reach <container IP>:<internal port> directly, with or without a
+        # published port.
+        #
+        # Probe both and use whichever answers, so this works on either.
         run: |
           set -eu
 
@@ -160,13 +184,12 @@ jobs:
             timeout 2 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
           }
 
-          resolve() {  # resolve CONTAINER INTERNAL_PORT -> "host:port" on stdout
-            local c="$1" internal="$2"
-            local hostport ip
-            hostport="$($RUNTIME port "$c" "$internal/tcp" 2>/dev/null | head -1 | sed 's/.*://')"
+          resolve() {  # resolve CONTAINER INTERNAL_PORT HOST_PORT -> "host:port"
+            local c="$1" internal="$2" hostport="$3"
+            local ip
             ip="$($RUNTIME inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$c" 2>/dev/null | head -1)"
             for _ in $(seq 1 120); do
-              if [ -n "$hostport" ] && probe 127.0.0.1 "$hostport"; then
+              if probe 127.0.0.1 "$hostport"; then
                 echo "127.0.0.1:$hostport"; return 0
               fi
               if [ -n "$ip" ] && probe "$ip" "$internal"; then
@@ -179,9 +202,9 @@ jobs:
             return 1
           }
 
-          MYSQL_EP="$(resolve "ephpm-mysql-$DB_SUFFIX" 3306)"
-          MYSQL_SHA2_EP="$(resolve "ephpm-mysql-sha2-$DB_SUFFIX" 3306)"
-          PG_EP="$(resolve "ephpm-pg-$DB_SUFFIX" 5432)"
+          MYSQL_EP="$(resolve "ephpm-mysql-$DB_SUFFIX" 3306 "$MYSQL_HOST_PORT")"
+          MYSQL_SHA2_EP="$(resolve "ephpm-mysql-sha2-$DB_SUFFIX" 3306 "$MYSQL_SHA2_HOST_PORT")"
+          PG_EP="$(resolve "ephpm-pg-$DB_SUFFIX" 5432 "$PG_HOST_PORT")"
 
           echo "MYSQL_EP=$MYSQL_EP"     >> "$GITHUB_ENV"
           echo "MYSQL_SHA2_EP=$MYSQL_SHA2_EP" >> "$GITHUB_ENV"
