@@ -84,7 +84,25 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire main @ 62636c4c — write admission control for the Hrana/sqld backend
+# litewire main @ b086ddaa — CDC replay hardening (litewire#17). Two things.
+# (1) Replayed schema DDL is parsed and allowlisted before it reaches the
+# engine. A CDC batch carrying a `sqlite_schema` row used to have its stored
+# `sql` text executed as-is, so a peer whose frames reached `apply_batch` could
+# run arbitrary SQL on a replica — confirmed by short-circuiting the new
+# allowlist, where `PRAGMA writable_schema=ON` applied successfully.
+# `classify_replayed_ddl` now admits only a *single* CREATE TABLE /
+# CREATE [UNIQUE] INDEX / CREATE VIEW / CREATE TRIGGER, which is the whole set
+# `sqlite_schema.sql` can hold (ALTER surfaces as the rewritten CREATE TABLE;
+# DROP arrives as a DELETE that litewire answers with its own DROP ... IF
+# EXISTS). CREATE VIRTUAL TABLE is refused deliberately — it invokes a module
+# with peer-chosen arguments. CREATE TRIGGER is recognised and *skipped*, not
+# replayed: CDC already carries the rows a trigger produced on the primary, so
+# a replica holding the trigger would double-apply them. That matches what
+# ephpm's snapshot bootstrap already does with triggers.
+# (2) `TxnBatch::commit_change_id()` returns `Option<i64>` instead of panicking
+# on an empty batch, and `apply_batch` reports an empty batch as an error.
+#
+# On top of write admission control for the Hrana/sqld backend
 # (litewire#16): an opt-in write-permit semaphore (`HranaClient::write_permits`,
 # 0 = unlimited = default) that queues excess writers instead of letting sqld
 # collapse, wired to [db.sqlite.sqld] write_permits in the clustered path only.
@@ -113,13 +131,23 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 # a local workaround for this — `cold_primary_holds_subscriber_open_until_first_write`
 # in turso_cdc.rs fails if a pin without the fix is ever selected.
 #
-# SECURITY: do not move this pin backwards. 699e6345 and earlier interpolate the
+# The empty-batch half of litewire#17 does NOT remove a workaround. ephpm's
+# frame-level rejection in `consume_frames` stays, downgraded from a
+# workaround to defence in depth: validating a peer's frame is ephpm's job
+# rather than the pinned revision's, and rejecting at decode time keeps the
+# diagnostics legible, since every failure past that point is reported "at
+# change_id N" — which an empty batch has no value for.
+#
+# SECURITY: do not move this pin backwards. Pins before litewire#17 execute
+# peer-supplied `sqlite_schema.sql` text verbatim on the CDC apply path, which
+# hands any node that clears the cluster handshake ATTACH and PRAGMA on every
+# replica. 699e6345 and earlier interpolate the
 # client-supplied table name straight into SQL text in
 # litewire-translate/src/metadata.rs, and detect_metadata_query() runs before
 # sqlparser, so a crafted identifier in SHOW CREATE TABLE / SHOW INDEX /
 # DESCRIBE becomes arbitrary SQL. 7a0b59c4 adds sanitize_identifier() and
 # applies it at every extraction site.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "62636c4c2ba8", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "b086ddaa869a", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.0)

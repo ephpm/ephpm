@@ -125,7 +125,7 @@ path is a **single ordered stream** with no schema-sync side channel.
 - litewire `CdcTailer` + `apply_batch` API (per-transaction batches,
   monotonic `__litewire_cdc_watermark` for exactly-once apply, SQLite
   record-format decoder for DML replay, sqlite_schema-SQL replay for
-  DDL). 25 unit + integration tests in `litewire-turso`.
+  DDL). 45 unit + integration tests in `litewire-turso`.
 - ephpm `turso_cdc` module: two `Turso` factories per node (wire +
   mgmt); on the primary each inbound subscriber stream gets its **own**
   `CdcTailer`, anchored at the watermark the subscriber sends in its
@@ -151,6 +151,37 @@ path is a **single ordered stream** with no schema-sync side channel.
 - Additive config knob: `cdc_experimental` defaults to `false`;
   `engine = "turso"` + clustered mode without it is still a hard startup
   error pointing at the knob. v0.4.x-compatible under versioning policy.
+- **Schema replay is allowlisted (v0.6.2, litewire#17).** A CDC batch
+  carrying a `sqlite_schema` row used to have its stored `sql` text run
+  directly, so a peer whose frames reached `apply_batch` could run
+  arbitrary SQL on a replica — including `ATTACH` and `PRAGMA`. That
+  asymmetry with the snapshot path (dump checked, CDC not) is closed:
+  `classify_replayed_ddl` now parses the text first and admits only
+  what `sqlite_schema.sql` can hold — a **single** `CREATE TABLE`,
+  `CREATE [UNIQUE] INDEX`, `CREATE VIEW` or `CREATE TRIGGER`. That is
+  the whole legitimate set, because `ALTER TABLE ... ADD COLUMN`
+  surfaces as an UPDATE whose text is the *rewritten* `CREATE TABLE`
+  and `DROP` arrives as a DELETE that litewire answers with a
+  `DROP ... IF EXISTS` of its own construction. `CREATE VIRTUAL TABLE`
+  is refused as well, deliberately: it invokes a module with
+  peer-chosen arguments, which is a larger capability than building a
+  b-tree. The statement scan is quote- and comment-aware, so a `;`
+  inside a literal, a quoted identifier or a comment is not a
+  separator, and an unterminated quote or comment is refused rather
+  than guessed at. Triggers are recognised and skipped rather than
+  replayed (see the deferred note below). Reaching `apply_batch` still
+  requires the cluster secret and gossip membership; what this removes
+  is a trusted peer's ability to do more than corrupt rows.
+- **Empty CDC batch frames no longer depend on a local workaround
+  (v0.6.2, litewire#17).** `TxnBatch::commit_change_id()` returned
+  `i64` and panicked on an empty batch, which a peer could reach by
+  sending `{"rows":[]}` — taking down an applying task nothing joins.
+  It now returns `Option<i64>`, and litewire's `apply_batch` reports an
+  empty batch as an error. ePHPm keeps its frame-level rejection as
+  defence in depth: validating a peer's frame is ePHPm's job rather
+  than the pinned revision's, and rejecting at decode time keeps the
+  diagnostics legible (every failure past that point is reported "at
+  change_id N", which an empty batch has no value for).
 
 **Still deferred:**
 
@@ -171,23 +202,13 @@ path is a **single ordered stream** with no schema-sync side channel.
 - Read-only enforcement on replica wire frontends. litewire has no
   read-only mode, so a replica's MySQL/Hrana frontend accepts writes
   that nothing replicates; the replica logs a warning at startup.
-- Schema replay executes wire-supplied SQL. Note the asymmetry with the
-  snapshot path above: the snapshot dump *is* checked against a
-  `CREATE`/`INSERT` allowlist, but the CDC apply path is not. When a
-  batch carries a `sqlite_schema` row, `apply_batch` runs its stored
-  `sql` text directly (`litewire-turso/src/cdc.rs`) with no allowlist of
-  statement kinds. The DML path is safe — values bind as parameters and
-  identifiers go through `escape_ident` — but a peer whose frames reach
-  `apply_batch` can run arbitrary SQL on a replica, including `ATTACH`
-  and `PRAGMA`. Reaching it requires the cluster secret *and* passing
-  the gossip-membership check, so the peer is already a trusted node
-  that dictates replicated data anyway; the residual gap is that a
-  compromised primary can do more than corrupt rows. Closing it needs a
-  litewire PR to parse and allowlist the replayed DDL, plus a pin bump.
-- Triggers in the snapshot. They are deliberately not shipped (CDC
-  already carries the rows a trigger produced on the primary), which is
-  correct for replay but means a replica promoted to primary has no
-  triggers until an operator recreates them.
+- Triggers reach a replica by neither path. The snapshot deliberately
+  does not ship them and CDC replay deliberately skips them — CDC
+  already carries the rows a trigger produced on the primary, so a
+  replica holding the trigger would fire it again on top of those
+  replayed rows and diverge. That is correct for replay, but it means a
+  replica promoted to primary has no triggers until an operator
+  recreates them.
 - 2-node podman/kind e2e test running the full ephpm binary against a
   real MySQL wire client. The in-process integration test proves the
   replication pipeline; the podman lift is largely test-orchestration.
@@ -201,10 +222,6 @@ path is a **single ordered stream** with no schema-sync side channel.
   is enabled on every node's wire factory (`enable_cdc_on_connect =
   true`, so a node promoted mid-life still captures), but a session
   that uses `raw_connection()` bypasses it — a documented gotcha.
-- `TxnBatch::commit_change_id()` panics on an empty batch inside
-  litewire; ephpm rejects empty batch frames on the wire instead.
-  Making the litewire API return `Option<i64>` needs a litewire PR and
-  a pin bump.
 
 ### Phase 3 — default engine (a major-version decision)
 
