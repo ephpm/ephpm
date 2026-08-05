@@ -390,8 +390,11 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     # Run inside the CI image so cargo has a C linker available
     # (xtask needs `cc` to compile; bare runners only ship rustup).
-    # Same image as build-linux; ephemerd's host docker socket is
-    # reachable from inside so the kind cluster inside xtask works.
+    # Same image as build-linux. `cargo xtask e2e` dispatches to
+    # xtask/src/e2e_bare.rs, which spawns ephpm processes directly on
+    # 127.0.0.1 -- no Kind, no Tilt, no docker socket, no privileged
+    # DinD. The Kind path lives behind `cargo xtask k8s-e2e` and is
+    # only reachable from k8s-e2e.yml (workflow_dispatch only).
     container: ephpm/ephpm-ci:latest
     # Auxiliary -- does not gate the release path.
     continue-on-error: true
