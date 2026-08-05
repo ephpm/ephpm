@@ -58,6 +58,12 @@ tempfile.workspace = true
 rcgen.workspace = true
 # Paused-clock (`start_paused`) support for the idle-timeout watchdog tests.
 tokio = { workspace = true, features = ["test-util"] }
+# Real MySQL client for the handle-reuse experiment: PHP's `pdo_mysql` opens a
+# connection per request, and the only way to observe what that does to
+# litewire's session-worker free-list is to drive the wire frontend with a
+# client that connects and disconnects the same way. Same pin as ephpm-db's
+# proxy integration tests.
+mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust"] }
 
 # Loadable middleware fixtures for the dlopen lane (tests/middleware_dlopen.rs).
 #
