@@ -63,6 +63,20 @@ const CLIENT_PS_MULTI_RESULTS: u32 = 0x0004_0000;
 const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
 const CLIENT_PLUGIN_AUTH_LENENC: u32 = 0x0020_0000;
 
+// ── Server status flags ───────────────────────────────────────────────────────
+
+/// `SERVER_MORE_RESULTS_EXISTS` — set in the status field of the `OK`/`EOF`
+/// packet that terminates a result set when *another* result set follows on
+/// the same command.
+///
+/// The proxy asks the backend for `CLIENT_MULTI_STATEMENTS`,
+/// `CLIENT_MULTI_RESULTS` and `CLIENT_PS_MULTI_RESULTS` (see
+/// [`build_handshake_response`]) and advertises the same to its own clients
+/// (see [`send_greeting`]), so multi-result responses are not hypothetical:
+/// `CALL`ing a stored procedure produces one, and so does any client that
+/// takes us up on the multi-statement capability we offered.
+const SERVER_MORE_RESULTS_EXISTS: u16 = 0x0008;
+
 // ── MySQL command bytes ──────────────────────────────────────────────────────
 
 const COM_QUIT: u8 = 0x01;
@@ -1450,6 +1464,35 @@ fn decode_lenenc_int(buf: &[u8]) -> Option<(u64, usize)> {
     }
 }
 
+/// Status flags of an `OK_Packet`, or `None` if the packet is truncated.
+///
+/// Layout under `CLIENT_PROTOCOL_41` (which the proxy always negotiates):
+/// `[0x00][affected_rows: lenenc][last_insert_id: lenenc][status: 2LE][warnings: 2LE]`.
+///
+/// A packet too short to carry the field yields `None`, which every caller
+/// treats as "no further result sets" — the conservative reading, since it
+/// makes the proxy stop rather than block on bytes that may never arrive.
+fn ok_packet_status(payload: &[u8]) -> Option<u16> {
+    let rest = payload.get(1..)?;
+    let (_, affected_len) = decode_lenenc_int(rest)?;
+    let rest = rest.get(affected_len..)?;
+    let (_, insert_id_len) = decode_lenenc_int(rest)?;
+    let rest = rest.get(insert_id_len..)?;
+    Some(u16::from_le_bytes([*rest.first()?, *rest.get(1)?]))
+}
+
+/// Status flags of a classic `EOF_Packet`: `[0xFE][warnings: 2LE][status: 2LE]`.
+///
+/// Same truncation rule as [`ok_packet_status`].
+fn eof_packet_status(payload: &[u8]) -> Option<u16> {
+    Some(u16::from_le_bytes([*payload.get(3)?, *payload.get(4)?]))
+}
+
+/// Whether a terminating `OK`/`EOF` packet says another result set follows.
+fn more_results_follow(status: Option<u16>) -> bool {
+    status.is_some_and(|s| s & SERVER_MORE_RESULTS_EXISTS != 0)
+}
+
 /// Forward a complete `COM_QUERY` response from backend to client.
 ///
 /// The Smart-reset routing loop returns each pooled backend to the pool after
@@ -1460,7 +1503,48 @@ fn decode_lenenc_int(buf: &[u8]) -> Option<(u64, usize)> {
 /// was truncated after the column-defs EOF, the row packets stayed in the
 /// backend's read buffer, and the client blocked forever waiting for them).
 ///
-/// COM_QUERY responses have four shapes:
+/// ## One command, possibly many result sets
+///
+/// "One full response" is not "one result set". `CALL`ing a stored procedure,
+/// or any client using the multi-statement capability the proxy advertises,
+/// produces a *sequence* of result sets: each is terminated by an `OK`/`EOF`
+/// packet whose status field carries [`SERVER_MORE_RESULTS_EXISTS`], and the
+/// last one does not. This function therefore loops over
+/// [`forward_one_result_set`] until that flag clears.
+///
+/// Returning after the first result set — as this used to do (issue #223) —
+/// leaves the remainder buffered on the *pooled* backend socket. Because the
+/// routing loop parks the connection immediately afterwards, the leftovers
+/// outlive the session that caused them and desynchronise whichever session
+/// checks the connection out next. Checkout validation does not rescue that:
+/// [`crate::pool::has_unread_bytes`] is best-effort, and a leftover `OK`
+/// packet is indistinguishable from a `COM_PING` reply.
+///
+/// ## Aggregation
+///
+/// The returned [`ResponseOutcome`] covers the whole command: `rows` is the
+/// sum across result sets and `ok` is false if *any* of them carried an
+/// `ERR_Packet`. That matches how a client sees the statement — one command,
+/// one digest entry — and every field still comes from bytes this function
+/// had to parse anyway. Nothing is estimated.
+async fn forward_mysql_response(
+    backend: &mut TcpStream,
+    client: &mut TcpStream,
+) -> Result<ResponseOutcome, DbError> {
+    let mut total = ResponseOutcome { ok: true, rows: 0 };
+    loop {
+        let (outcome, more) = forward_one_result_set(backend, client).await?;
+        total.ok &= outcome.ok;
+        total.rows = total.rows.saturating_add(outcome.rows);
+        if !more {
+            return Ok(total);
+        }
+    }
+}
+
+/// Forward exactly one result set, reporting whether another follows.
+///
+/// A single result set has four shapes:
 ///
 /// 1. `OK_Packet`    — `[0x00] …`           (single packet)
 /// 2. `ERR_Packet`   — `[0xFF] …`           (single packet)
@@ -1476,14 +1560,12 @@ fn decode_lenenc_int(buf: &[u8]) -> Option<(u64, usize)> {
 /// from real MySQL servers uses the two-EOF layout — we don't have to handle
 /// the deprecated-EOF row terminator.
 ///
-/// The returned [`ResponseOutcome`] is assembled purely from bytes this
-/// function already had to look at: the `OK_Packet`'s length-encoded
-/// affected-row count, the presence of an `ERR_Packet`, or the number of
-/// row packets in a result set. Nothing is estimated.
-async fn forward_mysql_response(
+/// `ERR_Packet` always ends the sequence: it carries no status field, so the
+/// server has no way to announce a successor and does not send one.
+async fn forward_one_result_set(
     backend: &mut TcpStream,
     client: &mut TcpStream,
-) -> Result<ResponseOutcome, DbError> {
+) -> Result<(ResponseOutcome, bool), DbError> {
     let (seq, payload) = read_packet(backend).await?;
     write_packet(client, seq, &payload).await?;
 
@@ -1492,10 +1574,14 @@ async fn forward_mysql_response(
         Some(0x00) => {
             // OK_Packet: [0x00][affected_rows: lenenc][last_insert_id: lenenc]…
             let affected = decode_lenenc_int(&payload[1..]).map_or(0, |(v, _)| v);
-            return Ok(ResponseOutcome { ok: true, rows: affected });
+            let more = more_results_follow(ok_packet_status(&payload));
+            return Ok((ResponseOutcome { ok: true, rows: affected }, more));
         }
-        Some(0xFF) => return Ok(ResponseOutcome { ok: false, rows: 0 }),
-        Some(0xFE) if payload.len() < 9 => return Ok(ResponseOutcome::ok_unknown_rows()),
+        Some(0xFF) => return Ok((ResponseOutcome { ok: false, rows: 0 }, false)),
+        Some(0xFE) if payload.len() < 9 => {
+            let more = more_results_follow(eof_packet_status(&payload));
+            return Ok((ResponseOutcome::ok_unknown_rows(), more));
+        }
         Some(0xFB) => {
             return Err(DbError::Protocol(
                 "LOCAL INFILE response not supported by smart-reset proxy path".into(),
@@ -1513,12 +1599,14 @@ async fn forward_mysql_response(
         write_packet(client, s, &p).await?;
     }
 
-    // Intermediate EOF terminating the column-definition block.
+    // Intermediate EOF terminating the column-definition block. Its status
+    // field describes the *column block*, not the command, so it is never
+    // consulted for SERVER_MORE_RESULTS_EXISTS.
     let (s, p) = read_packet(backend).await?;
     write_packet(client, s, &p).await?;
     if p.first() == Some(&0xFF) {
         // ERR_Packet here (e.g. cursor open failed) — no rows follow.
-        return Ok(ResponseOutcome { ok: false, rows: 0 });
+        return Ok((ResponseOutcome { ok: false, rows: 0 }, false));
     }
     if !(p.first() == Some(&0xFE) && p.len() < 9) {
         return Err(DbError::Protocol(
@@ -1532,11 +1620,15 @@ async fn forward_mysql_response(
         let (s, p) = read_packet(backend).await?;
         write_packet(client, s, &p).await?;
         match p.first().copied() {
-            // Terminating EOF.
-            Some(0xFE) if p.len() < 9 => return Ok(ResponseOutcome { ok: true, rows }),
+            // Terminating EOF — the only packet in a result set whose status
+            // field can announce a successor.
+            Some(0xFE) if p.len() < 9 => {
+                let more = more_results_follow(eof_packet_status(&p));
+                return Ok((ResponseOutcome { ok: true, rows }, more));
+            }
             // ERR mid-stream: the rows already forwarded are real, but the
             // statement did not complete successfully.
-            Some(0xFF) => return Ok(ResponseOutcome { ok: false, rows }),
+            Some(0xFF) => return Ok((ResponseOutcome { ok: false, rows }, false)),
             _ => rows += 1,
         }
     }
@@ -2439,6 +2531,271 @@ mod tests {
         assert_eq!(outcome.rows, 0, "an empty result set must report zero rows");
     }
 
+    // ── multi-result responses (issue #223) ──────────────────────────
+
+    /// `SERVER_STATUS_AUTOCOMMIT` — noise the flag check must see past.
+    const STATUS_AUTOCOMMIT: u16 = 0x0002;
+
+    /// Build a classic `EOF_Packet`: `[0xFE][warnings: 2LE][status: 2LE]`.
+    fn eof(status: u16) -> Vec<u8> {
+        let s = status.to_le_bytes();
+        vec![0xFE, 0, 0, s[0], s[1]]
+    }
+
+    /// Build an `OK_Packet` with an explicit affected-row count and status.
+    ///
+    /// `[0x00][affected: lenenc][last_insert_id: lenenc][status: 2LE][warnings: 2LE]`
+    fn ok_packet(affected: u8, status: u16) -> Vec<u8> {
+        let s = status.to_le_bytes();
+        vec![0x00, affected, 0, s[0], s[1], 0, 0]
+    }
+
+    /// Write one single-column, single-row result set.
+    ///
+    /// `marker` is the row's only byte, so a test can tell which result set a
+    /// packet the client received actually came from. `end_status` goes in the
+    /// terminating EOF — set [`SERVER_MORE_RESULTS_EXISTS`] there to announce a
+    /// successor.
+    async fn write_result_set(sock: &mut TcpStream, seq: &mut u8, marker: u8, end_status: u16) {
+        for payload in [
+            vec![0x01],             // column count
+            vec![0xAA; 16],         // column definition
+            eof(STATUS_AUTOCOMMIT), // end of column definitions
+            vec![0x01, marker],     // one row: a 1-byte lenenc string
+            eof(end_status),        // end of this result set
+        ] {
+            *seq += 1;
+            write_packet(sock, *seq, &payload).await.unwrap();
+        }
+    }
+
+    /// Read packets from `client` until the terminating `OK_Packet` of a
+    /// `CALL`-shaped response, returning every row marker seen along the way.
+    async fn collect_markers_until_ok(client: &mut TcpStream) -> Vec<u8> {
+        let mut markers = Vec::new();
+        loop {
+            let (_, p) = read_packet(client).await.unwrap();
+            match p.first().copied() {
+                Some(0x00) if p.len() == 7 => return markers,
+                // A one-byte lenenc string is the row shape `write_result_set`
+                // emits; column defs are 16 bytes of 0xAA and EOFs start 0xFE.
+                Some(0x01) if p.len() == 2 => markers.push(p[1]),
+                _ => {}
+            }
+        }
+    }
+
+    /// The regression test for issue #223.
+    ///
+    /// A `CALL` returns two result sets followed by a terminating `OK`. The
+    /// old code returned after the *first* terminating EOF, leaving result set
+    /// two and the final `OK` buffered on the backend socket — so the next
+    /// command read the previous command's leftovers. The sentinel response
+    /// written after the multi-result response is what proves the boundary is
+    /// exact: the second call must land on it, not inside the first response.
+    #[tokio::test]
+    async fn forward_mysql_response_consumes_every_result_set() {
+        let (mut backend_write, mut backend_read) = make_tcp_pair().await;
+        let (mut client_write, mut client_read) = make_tcp_pair().await;
+
+        let mut seq = 0u8;
+        // Result set one announces a successor…
+        write_result_set(&mut backend_write, &mut seq, b'a', STATUS_AUTOCOMMIT | 0x0008).await;
+        // …result set two announces the trailing OK…
+        write_result_set(&mut backend_write, &mut seq, b'b', STATUS_AUTOCOMMIT | 0x0008).await;
+        // …and the OK ends the command, exactly as a stored-procedure CALL does.
+        seq += 1;
+        write_packet(&mut backend_write, seq, &ok_packet(0, STATUS_AUTOCOMMIT)).await.unwrap();
+
+        // The *next* command's response. Nothing may consume this.
+        seq = 0;
+        write_result_set(&mut backend_write, &mut seq, b'z', STATUS_AUTOCOMMIT).await;
+
+        let outcome = forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
+        assert!(outcome.ok);
+        assert_eq!(outcome.rows, 2, "rows are summed across every result set of the command");
+
+        let markers = collect_markers_until_ok(&mut client_read).await;
+        assert_eq!(markers, vec![b'a', b'b'], "both result sets must reach the client");
+
+        // The sentinel is still on the backend socket, untouched, and the next
+        // command picks up exactly there.
+        let next = forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
+        assert_eq!(next.rows, 1);
+        let (_, header) = read_packet(&mut client_read).await.unwrap();
+        assert_eq!(header, vec![0x01], "the next response starts at its own column-count packet");
+    }
+
+    /// The multi-statement shape: `INSERT; INSERT` is answered with two `OK`
+    /// packets, the first carrying `SERVER_MORE_RESULTS_EXISTS`. Affected rows
+    /// accumulate across both.
+    #[tokio::test]
+    async fn forward_mysql_response_follows_chained_ok_packets() {
+        let (mut backend_write, mut backend_read) = make_tcp_pair().await;
+        let (mut client_write, mut client_read) = make_tcp_pair().await;
+
+        write_packet(&mut backend_write, 1, &ok_packet(2, STATUS_AUTOCOMMIT | 0x0008))
+            .await
+            .unwrap();
+        write_packet(&mut backend_write, 2, &ok_packet(3, STATUS_AUTOCOMMIT)).await.unwrap();
+        drop(backend_write);
+
+        let outcome = forward_mysql_response(&mut backend_read, &mut client_write).await.unwrap();
+        drop(client_write);
+
+        assert!(outcome.ok);
+        assert_eq!(outcome.rows, 5, "affected rows accumulate across chained OK packets");
+
+        let mut seen = 0;
+        while read_packet(&mut client_read).await.is_ok() {
+            seen += 1;
+        }
+        assert_eq!(seen, 2, "both OK packets must reach the client");
+    }
+
+    /// An `ERR_Packet` ends the sequence: it carries no status field, so the
+    /// server cannot announce a successor and does not send one. Blocking on a
+    /// further packet here would hang the session.
+    #[tokio::test]
+    async fn forward_mysql_response_stops_at_an_error_packet() {
+        let (mut backend_write, mut backend_read) = make_tcp_pair().await;
+        let (mut client_write, _client_read) = make_tcp_pair().await;
+
+        write_packet(&mut backend_write, 1, &ok_packet(1, STATUS_AUTOCOMMIT | 0x0008))
+            .await
+            .unwrap();
+        let mut err = vec![0xFF];
+        err.extend_from_slice(&1146_u16.to_le_bytes());
+        err.push(b'#');
+        err.extend_from_slice(b"42S02");
+        err.extend_from_slice(b"Table 'x' doesn't exist");
+        write_packet(&mut backend_write, 2, &err).await.unwrap();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            forward_mysql_response(&mut backend_read, &mut client_write),
+        )
+        .await
+        .expect("an ERR_Packet must terminate the sequence, not wait for another")
+        .unwrap();
+
+        assert!(!outcome.ok, "the failed statement must mark the whole command failed");
+        assert_eq!(outcome.rows, 1, "rows from the statement that did succeed are real");
+    }
+
+    #[test]
+    fn status_flags_come_out_of_the_right_offsets() {
+        // OK: [0x00][affected: lenenc][last_insert_id: lenenc][status][warnings]
+        assert_eq!(ok_packet_status(&ok_packet(0, 0x000A)), Some(0x000A));
+        // A 2-byte lenenc affected-row count must not shift the status read.
+        let shifted = vec![0x00, 0xFC, 0x34, 0x12, 0, 0x0A, 0x00, 0, 0];
+        assert_eq!(ok_packet_status(&shifted), Some(0x000A));
+        // Truncation reads as "no more results" rather than panicking.
+        assert_eq!(ok_packet_status(&[0x00]), None);
+        assert_eq!(eof_packet_status(&[0xFE, 0, 0]), None);
+        assert!(!more_results_follow(None));
+        assert!(more_results_follow(Some(0x000A)));
+        assert!(!more_results_follow(Some(0x0002)));
+    }
+
+    /// The pooled variant: a multi-result command must not poison the
+    /// connection it ran on. The routing loop parks the backend after every
+    /// command, so leftovers from a `CALL` would be read as the *next
+    /// session's* response — the corruption outliving the session that caused
+    /// it is what #221's working pool turned from a session bug into a
+    /// cross-session one.
+    #[tokio::test]
+    async fn routing_loop_multi_result_leaves_the_pooled_backend_clean() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let backend_task = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+
+            // Command one: a CALL returning two result sets plus a final OK.
+            read_packet(&mut sock).await.unwrap();
+            let mut seq = 0u8;
+            write_result_set(&mut sock, &mut seq, b'a', STATUS_AUTOCOMMIT | 0x0008).await;
+            write_result_set(&mut sock, &mut seq, b'b', STATUS_AUTOCOMMIT | 0x0008).await;
+            seq += 1;
+            write_packet(&mut sock, seq, &ok_packet(0, STATUS_AUTOCOMMIT)).await.unwrap();
+
+            // Command two: an ordinary single-result SELECT.
+            read_packet(&mut sock).await.unwrap();
+            let mut seq = 0u8;
+            write_result_set(&mut sock, &mut seq, b'z', STATUS_AUTOCOMMIT).await;
+
+            // Hold the socket open so the pool keeps seeing a live connection.
+            std::future::pending::<()>().await;
+        });
+
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pool = pool_dialing_counted(addr, Arc::clone(&dials));
+        let (mut driver, proxy_side) = make_tcp_pair().await;
+
+        let pool_for_proxy = pool.clone();
+        let proxy = tokio::spawn(async move {
+            let rr = AtomicUsize::new(0);
+            let rw_split = RwSplitParams {
+                enabled: false,
+                sticky_duration: std::time::Duration::from_secs(1),
+            };
+            // `Never` keeps COM_RESET_CONNECTION away from the scripted backend.
+            proxy_routing_loop(
+                proxy_side,
+                &pool_for_proxy,
+                &[],
+                &rr,
+                &rw_split,
+                crate::ResetStrategy::Never,
+                None,
+            )
+            .await
+        });
+
+        // Session one: the multi-result command.
+        send_query(&mut driver, "CALL two_result_sets()").await;
+        let markers = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            collect_markers_until_ok(&mut driver),
+        )
+        .await
+        .expect("the whole multi-result response must reach the client");
+        assert_eq!(markers, vec![b'a', b'b']);
+
+        // Session two, on the connection session one parked. If the CALL had
+        // left result set two buffered, this read would return the `b` row
+        // instead of `z` — or the trailing OK, which is not a result-set
+        // header at all.
+        send_query(&mut driver, "SELECT id FROM t").await;
+        let (_, header) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), read_packet(&mut driver))
+                .await
+                .expect("the follow-up query must get a response")
+                .unwrap();
+        assert_eq!(header, vec![0x01], "the follow-up must read its own column-count packet");
+
+        let mut row = None;
+        for _ in 0..4 {
+            let (_, p) = read_packet(&mut driver).await.unwrap();
+            if p.len() == 2 && p[0] == 0x01 {
+                row = Some(p[1]);
+            }
+        }
+        assert_eq!(row, Some(b'z'), "the follow-up must read its own row, not leftovers");
+
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "both commands must have run on one pooled connection"
+        );
+
+        drop(driver);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), proxy).await;
+        assert_eq!(pool.idle_len(), 1, "the backend must be parked, not retired");
+        backend_task.abort();
+    }
+
     // ── query stats: what a command is attributed to ─────────────────
 
     /// Build a `COM_QUERY` payload.
@@ -2716,6 +3073,42 @@ mod tests {
         };
         let config = PoolConfig {
             min_connections: 1,
+            max_connections: 2,
+            idle_timeout: std::time::Duration::from_secs(60),
+            max_lifetime: std::time::Duration::from_secs(300),
+            pool_timeout: std::time::Duration::from_secs(5),
+            health_check_interval: std::time::Duration::from_secs(30),
+        };
+        Pool::new(config, connect, reset, ping)
+    }
+
+    /// A `Pool` whose connections dial `addr` with no `MySQL` handshake,
+    /// counting every dial in `dials`.
+    ///
+    /// The counter is what turns "the second command worked" into "the second
+    /// command worked *on the same pooled connection*" — without it a test
+    /// cannot tell a clean recycle from a silent retire-and-redial.
+    fn pool_dialing_counted(
+        addr: std::net::SocketAddr,
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Pool {
+        let connect = move || -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
+            let dials = Arc::clone(&dials);
+            Box::pin(async move {
+                dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                TcpStream::connect(addr).await.map_err(DbError::from)
+            })
+        };
+        // No-op reset and always-alive ping: the scripted backends in these
+        // tests speak only the responses they were written to speak.
+        let reset = |s: TcpStream| -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
+            Box::pin(async { Ok(s) })
+        };
+        let ping = |s: TcpStream| -> crate::pool::BoxFuture<Result<(TcpStream, bool), DbError>> {
+            Box::pin(async { Ok((s, true)) })
+        };
+        let config = PoolConfig {
+            min_connections: 0,
             max_connections: 2,
             idle_timeout: std::time::Duration::from_secs(60),
             max_lifetime: std::time::Duration::from_secs(300),

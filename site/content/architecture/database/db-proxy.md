@@ -15,8 +15,9 @@ This document covers the SQL connection pooling proxy, wire protocol implementat
 - TCP listener on configurable port
 - Read/write splitting based on first-keyword query classification, with sticky-after-write routing and replica round-robin
 - Replication support (primary + replica pools via `[db.mysql.replicas]`)
+- Multi-result MySQL responses (stored-procedure `CALL`, multi-statement queries): every result set of a command is forwarded before the pooled backend is parked, so a `CALL` cannot leave leftovers for the next session to read ([issue #223](https://github.com/ephpm/ephpm/issues/223))
 - Slow query detection and logging (`ephpm-query-stats`, `[db.analysis].slow_query_threshold`)
-- Query digest / statistics collection with Prometheus export, recorded into the same collector the embedded-SQLite paths use. The proxy can only observe statements where it already parses the wire protocol, so coverage is narrower than the embedded path — the [`[db.analysis]` coverage table](/reference/config/#dbanalysis) lists exactly what each path records, and what it deliberately does not (prepared-statement executes on the default MySQL path, PostgreSQL extended-protocol traffic, and PostgreSQL sessions using `reset_strategy = "never"`/`"always"` without replicas)
+- Query digest / statistics collection with Prometheus export, recorded into the same collector the embedded-SQLite paths use. Every proxy path frames the wire protocol under every `reset_strategy`, so no configuration turns recording off — but the proxy can only attribute statements it can map back to SQL text, so coverage is still narrower than the embedded path. The [`[db.analysis]` coverage table](/reference/config/#dbanalysis) lists exactly what each path records, and what it deliberately does not (prepared-statement executes on the default MySQL path, PostgreSQL extended-protocol executions and `COPY`)
 
 **Planned / Not Yet Implemented:**
 - TDS proxying to a real SQL Server — the `[db.tds]` config is accepted, but startup logs a warning and no proxy is started (litewire's TDS frontend for embedded SQLite is separate and does work)

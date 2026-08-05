@@ -211,7 +211,7 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 | `pool_timeout` | duration string | `"5s"` | Time to wait for a connection before failing. |
 | `health_check_interval` | duration string | `"30s"` | Frequency of backend health checks. |
 | `inject_env` | bool | `true` | Inject `DB_CONNECTION`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DATABASE_URL` into PHP. |
-| `reset_strategy` | string | `"smart"` | `"smart"` (reset after non-SELECT), `"always"`, `"never"`. On PostgreSQL it also decides whether [query stats](#dbanalysis) see proxied statements — `"always"`/`"never"` without replicas take an opaque splice and record nothing. The MySQL proxy frames every session regardless, so its stats coverage does not depend on this knob. |
+| `reset_strategy` | string | `"smart"` | `"smart"` (reset after non-SELECT), `"always"`, `"never"`. Both proxies frame every session under every strategy, so [query stats](#dbanalysis) coverage does not depend on this knob on either engine. |
 | `replicas.urls` | array of strings | `[]` | Read replica URLs. Reads distributed across; writes go to primary. |
 
 > **The proxy listener is unauthenticated — keep it on loopback.**
@@ -323,16 +323,18 @@ One collector serves every database path, so proxied and embedded queries land o
 |------|--------------------|-------------------|------------|
 | Embedded SQLite (`[db.sqlite]`, any engine or replication mode) | All queries and mutations | In-process execution time | Rows returned / rows affected |
 | MySQL proxy, single-backend path (any reset strategy) | `COM_QUERY` only | Wire round trip: command written to the backend → last response byte read back | Not available |
-| MySQL proxy, R/W splitting enabled with replicas | `COM_QUERY` and `COM_STMT_EXECUTE` | Same wire round trip | Rows returned, or affected rows from the `OK` packet |
-| PostgreSQL proxy, `reset_strategy = "smart"` (default) or R/W splitting | Simple `Query` messages | Wire round trip: message written → `ReadyForQuery` | Rows returned (`DataRow` count); mutations record `0` |
-| PostgreSQL proxy, `reset_strategy = "never"`/`"always"` without replicas | None | — | — |
+| MySQL proxy, R/W splitting enabled with replicas | `COM_QUERY` and `COM_STMT_EXECUTE` | Same wire round trip | Rows returned, or affected rows from the `OK` packet — summed across every result set of a multi-result command (`CALL`, multi-statement), which is recorded as one statement |
+| PostgreSQL proxy, any reset strategy, with or without replicas | Simple `Query` messages | Wire round trip: message written → `ReadyForQuery` | Rows returned (`DataRow` count); mutations record `0` |
+
+No `reset_strategy` value turns recording off on either engine — every proxy path frames the wire protocol.
 
 Notable gaps, all deliberate:
 
 - **Proxy durations include the network.** The embedded-SQLite numbers are in-process execution time; the proxy numbers are a round trip to your database server. Comparing them directly is comparing two different things.
 - **`COM_STMT_PREPARE` is never recorded.** Preparing is a metadata round trip, not an execution — recording it under the statement's digest would publish parse latency as query latency.
 - **`COM_STMT_EXECUTE` is invisible on the default MySQL path.** Attributing an execute to its SQL requires having parsed the *prepare response*, which only the R/W-split routing loop does. Applications that turn off PDO's emulated prepares (`PDO::ATTR_EMULATE_PREPARES = false`) will therefore see little or no proxy query-stat traffic unless R/W splitting is on.
-- **PostgreSQL extended-protocol traffic is invisible.** `Parse`/`Bind`/`Execute` pin the session to one backend and splice it verbatim, because message boundaries stop lining up with turn boundaries. Same for `COPY`, and for PostgreSQL sessions using `reset_strategy = "never"`/`"always"` without replicas.
+- **PostgreSQL extended-protocol executions are invisible.** Messages stay framed, but attributing an `Execute` to the SQL a `Parse` carried means tracking named statements and portals across the session; recording the `Parse` alone would publish planning time as query time, exactly as for `COM_STMT_PREPARE`. Same for `COPY`. A simple `Query` issued later on such a session *is* recorded.
+- **MySQL durations on the single-backend path are an upper bound.** That path does not frame the backend→client direction, so completion is inferred from the arrival of the next client command. PostgreSQL has an explicit `ReadyForQuery` marker on every path and is exact everywhere.
 - **Rows the proxy cannot count are reported as `0`, never estimated.**
 
 ## `[kv]`

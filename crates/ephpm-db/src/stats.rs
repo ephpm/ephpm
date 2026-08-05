@@ -31,25 +31,43 @@
 //!
 //! # What is *not* recorded
 //!
-//! Recording only happens on code paths where the proxy already frames the
-//! protocol. Anything it forwards as an opaque byte splice is invisible to
-//! it, and is left out rather than estimated:
+//! Every proxy path frames the wire protocol, on both engines and under every
+//! `reset_strategy` — there is no opaque byte-splice path left, so no
+//! configuration makes a deployment's traffic wholesale invisible. What is
+//! still left out is left out for protocol reasons, and is left out rather
+//! than estimated:
 //!
 //! - MySQL `COM_STMT_EXECUTE` on the single-backend (non R/W-split) path.
-//!   That path never parses the backend→client direction, so it never sees
-//!   the statement ID that `COM_STMT_PREPARE` returned and cannot map an
-//!   execute back to SQL text.
+//!   That path frames the client→backend direction only, so it never sees the
+//!   statement ID that `COM_STMT_PREPARE` returned and cannot map an execute
+//!   back to SQL text. The R/W-split routing loop parses the prepare response
+//!   and therefore can.
 //! - MySQL `COM_STMT_PREPARE` itself, on every path. Preparing is a metadata
 //!   operation, not an execution; recording its round trip under the same
 //!   digest as the statement would report parse latency as query latency.
 //!   This matches `TrackedBackend`, which deliberately passes
 //!   `describe_columns` through unrecorded for the same reason.
-//! - PostgreSQL extended-query-protocol traffic (`Parse`/`Bind`/`Execute`)
-//!   and both copy sub-protocols. Those pin the session to one backend and
-//!   splice it verbatim, because message boundaries stop lining up with turn
-//!   boundaries.
-//! - Every statement on a session using `reset_strategy = "never"` or
-//!   `"always"` *without* R/W splitting, which is spliced end to end.
+//! - PostgreSQL extended-query-protocol executions (`Parse`/`Bind`/`Execute`)
+//!   and both copy sub-protocols. Messages stay framed, but mapping an
+//!   `Execute` back to the SQL a `Parse` carried means tracking named
+//!   statements and portals across the session, and recording the `Parse`
+//!   alone would publish planning time as query time — the same argument as
+//!   `COM_STMT_PREPARE` above. Simple `Query` messages issued later on such a
+//!   session *are* recorded.
+//!
+//! # How completion is established
+//!
+//! The two engines differ, and the difference shows up in the numbers:
+//!
+//! - PostgreSQL sends an explicit `ReadyForQuery` at the end of every turn, on
+//!   every path. Durations, row counts and error status are therefore exact
+//!   everywhere, and identical between the routing loop and the
+//!   single-backend relay.
+//! - MySQL has no such marker on the single-backend path, which does not frame
+//!   the backend→client direction. There, completion is inferred from the
+//!   arrival of the *next* client command — see [`SpliceWatch`] — which costs
+//!   row counts and makes the timing an upper bound. The R/W-split routing
+//!   loop, which does frame both directions, is exact.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
