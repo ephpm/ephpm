@@ -324,6 +324,10 @@ pub struct Router {
     /// construction from `[[middleware]]` config (see
     /// [`ingest_strip_headers`]).
     ingest_strip_headers: Vec<String>,
+    /// Upstream health of the configured SQL proxies, consulted by
+    /// [`Router::readiness_check`]. `None` when the router was built without
+    /// one (tests); readiness then ignores the database entirely.
+    db_health: Option<Arc<crate::db_health::DbProxyHealth>>,
 }
 
 /// Header names always stripped from inbound requests at ingest, in addition
@@ -647,6 +651,7 @@ impl Router {
             canonical_scripts: dashmap::DashMap::new(),
             canonical_scripts_swept: std::sync::Mutex::new(Instant::now()),
             ingest_strip_headers: build_ingest_strip_headers(&config.middleware),
+            db_health: None,
         }
     }
 
@@ -802,6 +807,18 @@ impl Router {
                 self.node_id = Some(id.to_string());
             }
         }
+        self
+    }
+
+    /// Attach the SQL proxies' upstream health to the readiness probe.
+    ///
+    /// `serve()` builds one [`DbProxyHealth`](crate::db_health::DbProxyHealth)
+    /// from config before the listeners are bound and hands the same handle
+    /// to proxy startup, so `/_ephpm/ready` reports 503 until every
+    /// configured proxy has reached its upstream once.
+    #[must_use]
+    pub fn with_db_health(mut self, db_health: Arc<crate::db_health::DbProxyHealth>) -> Self {
+        self.db_health = Some(db_health);
         self
     }
 
@@ -1939,7 +1956,32 @@ impl Router {
                 );
             }
         }
+        // A configured SQL proxy that has never reached its upstream cannot
+        // serve a single query — the process must stay out of rotation and a
+        // rollout containing it must stall. Deliberately a *first-connect*
+        // gate, not a live database probe: see `crate::db_health` for why a
+        // post-startup outage must not evict every replica at once.
+        if let Some(resp) = Self::db_not_ready(self.db_health.as_ref()) {
+            return resp;
+        }
         json_response(StatusCode::OK, r#"{"status":"ready"}"#)
+    }
+
+    /// The database half of [`Router::readiness_check`]: `Some(503)` when a
+    /// configured SQL proxy has never reached its upstream, `None` otherwise.
+    ///
+    /// Split out so the behavior can be tested without a live PHP runtime.
+    fn db_not_ready(
+        db_health: Option<&Arc<crate::db_health::DbProxyHealth>>,
+    ) -> Option<Response<ServerBody>> {
+        let pending = db_health?.first_never_connected()?;
+        Some(json_response_owned(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                r#"{{"status":"not_ready","reason":"database proxy has not reached its upstream: {}"}}"#,
+                json_escape(&pending.describe())
+            ),
+        ))
     }
 
     /// Apply custom response headers from config.
@@ -2230,6 +2272,45 @@ fn json_response(status: StatusCode, body: &'static str) -> Response<ServerBody>
         .header("content-type", "application/json")
         .body(body::buffered(Full::new(Bytes::from_static(body.as_bytes()))))
         .expect("static json response")
+}
+
+/// A JSON response whose body is built at runtime.
+///
+/// Only used off the hot path (the readiness probe, which needs to name the
+/// proxy that is holding the pod down).
+fn json_response_owned(status: StatusCode, body: String) -> Response<ServerBody> {
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(body::buffered(Full::new(Bytes::from(body))))
+        .expect("owned json response")
+}
+
+/// Escape a string for embedding in a JSON string literal.
+///
+/// The readiness reason interpolates config-derived text (a listen address
+/// and an upstream `host:port`). Those are operator-controlled rather than
+/// attacker-controlled, but a stray quote would still emit a body that no
+/// probe could parse, so escape rather than trust.
+fn json_escape(s: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                // Writing to a String is infallible.
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Build database environment variables from config for PHP injection.
@@ -4636,5 +4717,107 @@ data: two
         config.server.timeouts.request = 30;
         let router = Router::new(&config, test_store(), None, None, None, None, None);
         assert_eq!(router.request_timeout, Duration::from_secs(30));
+    }
+
+    // ── Readiness: database proxy upstream (issue #226) ───────────────────
+
+    /// A `DbProxyHealth` with one MySQL proxy configured.
+    fn health_with_mysql() -> Arc<crate::db_health::DbProxyHealth> {
+        let mut config = Config::default();
+        config.db.mysql = Some(ephpm_config::DbBackendConfig {
+            url: "mysql://root@127.0.0.1:3307/main".to_string(),
+            listen: Some("127.0.0.1:3306".to_string()),
+            ..Default::default()
+        });
+        crate::db_health::DbProxyHealth::from_config(&config).expect("valid db config")
+    }
+
+    /// No `[db.mysql]` / `[db.postgres]` at all: readiness must not mention
+    /// databases. That is the overwhelming majority of deployments (embedded
+    /// SQLite, or no database) and must behave exactly as before.
+    #[test]
+    fn readiness_ignores_databases_when_no_proxy_is_configured() {
+        let health = crate::db_health::DbProxyHealth::from_config(&Config::default()).unwrap();
+        assert!(Router::db_not_ready(Some(&health)).is_none());
+        assert!(Router::db_not_ready(None).is_none());
+    }
+
+    /// The reported hole: the proxy never reached its upstream, yet the
+    /// server reported ready and served 500s.
+    #[test]
+    fn readiness_fails_while_a_proxy_has_never_reached_its_upstream() {
+        let health = health_with_mysql();
+        let resp = Router::db_not_ready(Some(&health)).expect("must report not ready");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        health.mysql().unwrap().record_up();
+        assert!(
+            Router::db_not_ready(Some(&health)).is_none(),
+            "one upstream handshake must clear the readiness gate"
+        );
+    }
+
+    /// The 503 body must be parseable JSON that names the proxy — an operator
+    /// reading `kubectl describe` should not have to open the logs to learn
+    /// which upstream is unreachable.
+    #[tokio::test]
+    async fn readiness_body_names_the_pending_proxy() {
+        let health = health_with_mysql();
+        let resp = Router::db_not_ready(Some(&health)).expect("not ready");
+        let bytes = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .expect("collect body")
+            .to_bytes();
+        let body = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("probe body is JSON");
+        assert_eq!(parsed["status"], "not_ready");
+        let reason = parsed["reason"].as_str().expect("reason string");
+        assert!(reason.contains("mysql"), "reason names the proxy kind: {reason}");
+        assert!(reason.contains("127.0.0.1:3307"), "reason names the upstream: {reason}");
+    }
+
+    /// A post-startup outage must NOT flap readiness. If this test starts
+    /// failing, someone changed the gate to read live upstream state — read
+    /// the `crate::db_health` module docs before calling that a fix.
+    #[test]
+    fn readiness_does_not_flap_on_a_post_startup_outage() {
+        let health = health_with_mysql();
+        let mysql = health.mysql().unwrap();
+        mysql.record_up();
+        mysql.record_down(&"connection refused");
+        assert!(!mysql.is_up(), "the live gauge must reflect the outage");
+        assert!(
+            Router::db_not_ready(Some(&health)).is_none(),
+            "a database outage must not evict the pod from rotation"
+        );
+    }
+
+    /// The whole probe path, including ordering against the PHP and
+    /// worker-pool gates. Stub builds only: marking the PHP runtime ready is
+    /// a flag flip there, rather than a real SAPI boot.
+    #[cfg(not(php_linked))]
+    #[test]
+    fn ready_endpoint_reports_503_until_the_proxy_reaches_its_upstream() {
+        let dir = tempfile::tempdir().unwrap();
+        ephpm_php::PhpRuntime::init_with_ini_file(None).expect("stub init");
+
+        let health = health_with_mysql();
+        let router = test_router(dir.path()).with_db_health(Arc::clone(&health));
+        assert_eq!(
+            router.readiness_check().status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "/_ephpm/ready must be 503 while the proxy has never reached its upstream"
+        );
+
+        health.mysql().unwrap().record_up();
+        assert_eq!(router.readiness_check().status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn json_escape_neutralizes_quotes_and_controls() {
+        assert_eq!(json_escape("a\"b"), "a\\\"b");
+        assert_eq!(json_escape("a\nb"), "a\\nb");
+        assert_eq!(json_escape("a\\b"), "a\\\\b");
+        assert_eq!(json_escape("plain"), "plain");
     }
 }

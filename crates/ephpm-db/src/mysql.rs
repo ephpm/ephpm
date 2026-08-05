@@ -44,6 +44,7 @@ use tracing::{debug, info, warn};
 
 use crate::ResetStrategy;
 use crate::error::DbError;
+use crate::health::{ProxyHealth, RetryBudget};
 use crate::pool::{Checkout, Pool, PoolConfig};
 use crate::stats::{PendingStatement, ResponseOutcome, SpliceWatch};
 use crate::url::DbUrl;
@@ -147,6 +148,11 @@ impl MySqlProxy {
     /// Create a new proxy by connecting to the backend, authenticating, and
     /// building the pool.
     ///
+    /// Connects eagerly with a **bounded** retry budget (~40 s) and returns
+    /// the error to the caller if the backend never answers. Production
+    /// startup uses [`spawn_deferred`] instead, which binds the listener
+    /// first and retries the upstream forever in the background.
+    ///
     /// # Errors
     ///
     /// Returns an error if the initial backend connection or handshake fails.
@@ -161,25 +167,69 @@ impl MySqlProxy {
         stats: QueryStats,
     ) -> Result<Self, DbError> {
         let db_url = Arc::new(DbUrl::parse(url)?);
+        let health = ProxyHealth::new("mysql", listen, db_url.addr());
+        Self::connect(
+            db_url,
+            listen,
+            socket,
+            pool_config,
+            reset_strategy,
+            replica_urls,
+            rw_split,
+            stats,
+            health,
+            RetryBudget::Bounded(10),
+        )
+        .await
+    }
 
+    /// Connect to the upstream and build the pools.
+    ///
+    /// Shared by the eager constructor and the deferred startup path; the
+    /// only difference between them is the [`RetryBudget`].
+    async fn connect(
+        db_url: Arc<DbUrl>,
+        listen: &str,
+        socket: Option<std::path::PathBuf>,
+        pool_config: PoolConfig,
+        reset_strategy: ResetStrategy,
+        replica_urls: Vec<String>,
+        rw_split: RwSplitParams,
+        stats: QueryStats,
+        health: Arc<ProxyHealth>,
+        retry: RetryBudget,
+    ) -> Result<Self, DbError> {
         // Establish a single connection to capture server metadata.
         //
         // Under k8s/systemd startup ordering the backend may not be reachable
         // yet — the proxy used to bail immediately and stay dead for the
         // process lifetime, requiring a manual restart after the DB came up.
-        // Bounded exponential backoff (250ms doubling to 8s, ~10 tries,
-        // ~30s total) makes the proxy resilient to a slow-to-start backend
-        // without wedging on a genuine misconfiguration.
-        let (probe_stream, meta) = connect_with_retry(&db_url, "MySQL").await?;
+        // Exponential backoff (250ms doubling to the budget's ceiling) makes
+        // the proxy resilient to a slow-to-start backend.
+        let (probe_stream, meta) = connect_with_retry(&db_url, "MySQL", &health, retry).await?;
         let meta = Arc::new(meta);
 
         // Build the primary pool using clones of the URL and meta for closures.
+        // The pool's connect closure is also the live upstream-health signal:
+        // every physical backend connection the pool opens (never once per
+        // request) moves `ephpm_db_proxy_upstream_up`, so an upstream that
+        // dies after startup is visible without a dedicated prober.
         let db_url_c = Arc::clone(&db_url);
+        let health_c = Arc::clone(&health);
         let connect = move || -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
             let u = Arc::clone(&db_url_c);
+            let h = Arc::clone(&health_c);
             Box::pin(async move {
-                let (stream, _) = connect_and_handshake(&u).await?;
-                Ok(stream)
+                match connect_and_handshake(&u).await {
+                    Ok((stream, _)) => {
+                        h.record_up();
+                        Ok(stream)
+                    }
+                    Err(e) => {
+                        h.record_down(&e);
+                        Err(e)
+                    }
+                }
             })
         };
 
@@ -275,7 +325,23 @@ impl MySqlProxy {
     pub async fn run(self) -> Result<(), DbError> {
         let listener = TcpListener::bind(&self.listen).await?;
         info!(listen = %self.listen, "MySQL proxy listening");
+        self.run_on(Arc::new(listener)).await
+    }
 
+    /// Accept client connections on an already-bound listener.
+    ///
+    /// Split out from [`MySqlProxy::run`] so startup can bind the listen
+    /// socket before the upstream is reachable: clients that arrive during
+    /// the upstream-connect window queue in the kernel accept backlog and
+    /// are served as soon as the loop starts, instead of getting
+    /// `ECONNREFUSED`.
+    ///
+    /// # Errors
+    ///
+    /// Currently never returns `Err` — accept errors are logged and the
+    /// loop continues. The signature is fallible for symmetry with
+    /// [`MySqlProxy::run`].
+    pub async fn run_on(self, listener: Arc<TcpListener>) -> Result<(), DbError> {
         let proxy = Arc::new(self);
         loop {
             let (client, peer) = match listener.accept().await {
@@ -370,31 +436,34 @@ impl MySqlProxy {
 
 // ── Backend connection & auth ─────────────────────────────────────────────────
 
-/// Bounded exponential backoff wrapper around [`connect_and_handshake`].
+/// Exponential-backoff wrapper around [`connect_and_handshake`].
 ///
 /// Attempts the initial connect + handshake with increasing delays between
-/// tries so a slow-to-start backend (k8s/systemd ordering) doesn't kill the
-/// proxy on process startup. Retries approximately: 250ms, 500ms, 1s, 2s,
-/// 4s, 8s, 8s, 8s, 8s (10 attempts, ~40s total).
+/// tries so a slow-to-start backend (k8s/systemd ordering, or a listener
+/// this same process is about to bind) doesn't kill the proxy on startup.
+/// Delays run 250 ms doubling to the [`RetryBudget`]'s ceiling.
 ///
-/// Constants chosen to keep the total bounded without introducing a new
-/// config knob (this is a reliability paper cut, not an operator dial).
-/// Errors are logged at INFO for the first few attempts, WARN thereafter.
+/// Every attempt moves [`ProxyHealth`], which owns log throttling and the
+/// failure metrics — so an unbounded retry against a long-dead upstream
+/// stays visible without becoming log volume.
 ///
 /// `db_kind` is a short label ("MySQL", "PostgreSQL") used only for logs.
 async fn connect_with_retry(
     url: &DbUrl,
     db_kind: &str,
+    health: &ProxyHealth,
+    retry: RetryBudget,
 ) -> Result<(TcpStream, ServerMeta), DbError> {
-    const MAX_ATTEMPTS: u32 = 10;
     const INITIAL_BACKOFF_MS: u64 = 250;
-    const MAX_BACKOFF_MS: u64 = 8_000;
 
+    let max_backoff_ms = retry.max_backoff_ms();
     let mut backoff_ms = INITIAL_BACKOFF_MS;
-    let mut last_err: Option<DbError> = None;
-    for attempt in 1..=MAX_ATTEMPTS {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt = attempt.saturating_add(1);
         match connect_and_handshake(url).await {
             Ok(ok) => {
+                health.record_up();
                 if attempt > 1 {
                     info!(
                         db = db_kind,
@@ -406,7 +475,8 @@ async fn connect_with_retry(
                 return Ok(ok);
             }
             Err(e) => {
-                let is_last = attempt == MAX_ATTEMPTS;
+                health.record_down(&e);
+                let is_last = retry.is_final_attempt(attempt);
                 if is_last {
                     warn!(
                         db = db_kind,
@@ -415,34 +485,13 @@ async fn connect_with_retry(
                         error = %e,
                         "backend still unreachable after max retries; giving up"
                     );
-                } else if attempt >= 3 {
-                    warn!(
-                        db = db_kind,
-                        attempt,
-                        addr = %url.addr(),
-                        error = %e,
-                        backoff_ms,
-                        "backend connect failed; retrying"
-                    );
-                } else {
-                    info!(
-                        db = db_kind,
-                        attempt,
-                        addr = %url.addr(),
-                        error = %e,
-                        backoff_ms,
-                        "backend not yet reachable; retrying"
-                    );
+                    return Err(e);
                 }
-                last_err = Some(e);
-                if !is_last {
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    backoff_ms = (backoff_ms.saturating_mul(2)).min(MAX_BACKOFF_MS);
-                }
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms.saturating_mul(2)).min(max_backoff_ms);
             }
         }
     }
-    Err(last_err.unwrap_or(DbError::Auth("connect_with_retry: no attempt recorded".into())))
 }
 
 /// Connect to the `MySQL` backend and complete the authentication handshake.
@@ -1905,6 +1954,105 @@ pub async fn build_proxy(
 ) -> Result<MySqlProxy, DbError> {
     MySqlProxy::new(url, listen, socket, pool_config, reset_strategy, replica_urls, rw_split, stats)
         .await
+}
+
+/// Bind the proxy listener now; reach the upstream in the background.
+///
+/// This is the startup path. It inverts the old ordering, which connected
+/// to the upstream first and only bound the listener afterwards — so a
+/// proxy whose upstream was not yet up spent its whole retry budget with
+/// **no socket bound**, then gave up permanently. Two things fell out of
+/// that: an upstream started later in the same process (`[db.mysql]`
+/// pointed at `[db.sqlite]`'s own litewire listener) could never be
+/// reached, and any deployment whose database was down at boot came up
+/// with a dead proxy that only a restart could fix.
+///
+/// What this does instead:
+///
+/// 1. Parse the URL and bind the listen socket **synchronously**. Both are
+///    configuration errors, so both are fatal to startup — a proxy that
+///    cannot bind its port must not be a logged warning and a silently
+///    dead listener.
+/// 2. Return immediately, so the rest of startup (including the embedded
+///    SQLite listener this proxy may be pointed at) proceeds.
+/// 3. Reach the upstream from a background task with an unbounded,
+///    capped-backoff retry, then serve on the already-bound listener.
+///
+/// Clients that connect during step 3 do not get `ECONNREFUSED`: the socket
+/// is bound, so their connections sit in the kernel accept backlog and are
+/// served as soon as the upstream answers. That window is bounded by
+/// [`BACKLOG_GRACE`] — past it, clients are accepted and closed so they fail
+/// fast rather than blocking on a greeting that will not come.
+///
+/// `health` is moved into the connect loop and the pool; the caller keeps a
+/// clone to drive the readiness probe.
+///
+/// # Errors
+///
+/// Returns an error if the URL is malformed or the listen address cannot be
+/// bound. Upstream unreachability is *not* an error here — that is what the
+/// background retry and [`ProxyHealth`] are for.
+pub async fn spawn_deferred(
+    url: &str,
+    listen: &str,
+    socket: Option<std::path::PathBuf>,
+    pool_config: PoolConfig,
+    reset_strategy: ResetStrategy,
+    replica_urls: Vec<String>,
+    rw_split: RwSplitParams,
+    stats: QueryStats,
+    health: Arc<ProxyHealth>,
+) -> Result<tokio::task::JoinHandle<()>, DbError> {
+    let db_url = Arc::new(DbUrl::parse(url)?);
+    let listener = TcpListener::bind(listen).await?;
+    info!(
+        listen = %listen,
+        upstream = %db_url.addr(),
+        "MySQL proxy listening (upstream connect continues in the background)"
+    );
+
+    let listen_owned = listen.to_string();
+    let listener = Arc::new(listener);
+    Ok(tokio::spawn(async move {
+        // Fail-fast guard for a long outage; aborted the moment the upstream
+        // answers, and a no-op entirely when that happens inside the grace
+        // period (the common case).
+        let drain = tokio::spawn(crate::health::drain_while_upstream_down(
+            Arc::clone(&listener),
+            Arc::clone(&health),
+        ));
+
+        let proxy = match MySqlProxy::connect(
+            db_url,
+            &listen_owned,
+            socket,
+            pool_config,
+            reset_strategy,
+            replica_urls,
+            rw_split,
+            stats,
+            health,
+            RetryBudget::Unbounded,
+        )
+        .await
+        {
+            Ok(proxy) => proxy,
+            Err(e) => {
+                // Unreachable in practice: the unbounded budget never gives
+                // up, so only a pool-seed failure lands here. Leave the drain
+                // running so clients keep failing fast rather than hanging.
+                tracing::error!("MySQL proxy failed to start: {e:#}");
+                return;
+            }
+        };
+        drain.abort();
+        // Detach pool maintenance — it runs for the proxy's lifetime.
+        drop(proxy.start_maintenance());
+        match proxy.run_on(listener).await {
+            Ok(()) => info!("MySQL proxy stopped"),
+            Err(e) => tracing::error!("MySQL proxy error: {e:#}"),
+        }
+    }))
 }
 
 #[cfg(test)]

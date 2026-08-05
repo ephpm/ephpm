@@ -35,6 +35,7 @@ use tracing::{debug, info, warn};
 
 use crate::ResetStrategy;
 use crate::error::DbError;
+use crate::health::{ProxyHealth, RetryBudget};
 use crate::pool::{Checkout, Pool, PoolConfig};
 use crate::stats::ResponseOutcome;
 use crate::url::DbUrl;
@@ -134,6 +135,11 @@ impl PgProxy {
     /// Create a new proxy by connecting to the backend, authenticating, and
     /// building the pool.
     ///
+    /// Connects eagerly with a **bounded** retry budget (~40 s) and returns
+    /// the error to the caller. Production startup uses [`spawn_deferred`]
+    /// instead, which binds the listener first and retries the upstream
+    /// forever in the background.
+    ///
     /// # Errors
     ///
     /// Returns an error if the initial backend connection or handshake fails.
@@ -147,23 +153,63 @@ impl PgProxy {
         stats: QueryStats,
     ) -> Result<Self, DbError> {
         let db_url = Arc::new(DbUrl::parse(url)?);
+        let health = ProxyHealth::new("postgres", listen, db_url.addr());
+        Self::connect(
+            db_url,
+            listen,
+            pool_config,
+            reset_strategy,
+            replica_urls,
+            rw_split,
+            stats,
+            health,
+            RetryBudget::Bounded(10),
+        )
+        .await
+    }
 
+    /// Connect to the upstream and build the pools.
+    ///
+    /// Shared by the eager constructor and the deferred startup path; the
+    /// only difference between them is the [`RetryBudget`].
+    async fn connect(
+        db_url: Arc<DbUrl>,
+        listen: &str,
+        pool_config: PoolConfig,
+        reset_strategy: ResetStrategy,
+        replica_urls: Vec<String>,
+        rw_split: PgRwSplitParams,
+        stats: QueryStats,
+        health: Arc<ProxyHealth>,
+        retry: RetryBudget,
+    ) -> Result<Self, DbError> {
         // Establish a probe connection to capture server metadata.
         //
-        // Bounded exponential backoff (250ms doubling to 8s, ~10 tries) so
+        // Exponential backoff (250ms doubling to the budget's ceiling) so
         // startup ordering under k8s/systemd doesn't leave the proxy dead
         // when the DB comes up a few seconds later. See
         // `pg_connect_with_retry` for the schedule.
-        let (probe_stream, meta) = pg_connect_with_retry(&db_url).await?;
+        let (probe_stream, meta) = pg_connect_with_retry(&db_url, &health, retry).await?;
         let meta = Arc::new(meta);
 
-        // Build the primary pool.
+        // Build the primary pool. The connect closure doubles as the live
+        // upstream-health signal (see the MySQL proxy for the rationale).
         let db_url_c = Arc::clone(&db_url);
+        let health_c = Arc::clone(&health);
         let connect = move || -> crate::pool::BoxFuture<Result<TcpStream, DbError>> {
             let u = Arc::clone(&db_url_c);
+            let h = Arc::clone(&health_c);
             Box::pin(async move {
-                let (stream, _) = pg_connect_and_handshake(&u).await?;
-                Ok(stream)
+                match pg_connect_and_handshake(&u).await {
+                    Ok((stream, _)) => {
+                        h.record_up();
+                        Ok(stream)
+                    }
+                    Err(e) => {
+                        h.record_down(&e);
+                        Err(e)
+                    }
+                }
             })
         };
 
@@ -256,7 +302,21 @@ impl PgProxy {
     pub async fn run(self) -> Result<(), DbError> {
         let listener = TcpListener::bind(&self.listen).await?;
         info!(listen = %self.listen, "PostgreSQL proxy listening");
+        self.run_on(Arc::new(listener)).await
+    }
 
+    /// Accept client connections on an already-bound listener.
+    ///
+    /// See [`MySqlProxy::run_on`](crate::mysql::MySqlProxy::run_on) — same
+    /// contract: the listen socket is bound before the upstream is known
+    /// reachable, so early clients queue in the accept backlog rather than
+    /// getting `ECONNREFUSED`.
+    ///
+    /// # Errors
+    ///
+    /// Currently never returns `Err`; accept errors are logged and the loop
+    /// continues.
+    pub async fn run_on(self, listener: Arc<TcpListener>) -> Result<(), DbError> {
         let proxy = Arc::new(self);
         loop {
             let (client, peer) = match listener.accept().await {
@@ -359,22 +419,28 @@ impl PgProxy {
 /// messages on the right code path — see `handle_backend_auth`).
 /// Integration coverage in `tests/pg_proxy_integration.rs` pins this
 /// against real PG 13 (`md5`) and PG 17 (`scram-sha-256`).
-/// Bounded exponential backoff wrapper around [`pg_connect_and_handshake`].
+/// Exponential-backoff wrapper around [`pg_connect_and_handshake`].
 ///
-/// Retries on the same schedule as the MySQL proxy: ~250ms, 500ms, 1s, 2s,
-/// 4s, 8s, ..., 10 attempts, ~40s total. Prevents startup ordering (k8s,
-/// systemd) from wedging the proxy when the backend comes up seconds
-/// later.
-async fn pg_connect_with_retry(url: &DbUrl) -> Result<(TcpStream, PgServerMeta), DbError> {
-    const MAX_ATTEMPTS: u32 = 10;
+/// Same schedule as the MySQL proxy: 250 ms doubling to the
+/// [`RetryBudget`]'s ceiling. Prevents startup ordering (k8s, systemd, or a
+/// listener this process binds moments later) from wedging the proxy when
+/// the backend comes up seconds later. [`ProxyHealth`] owns the failure
+/// logging and metrics.
+async fn pg_connect_with_retry(
+    url: &DbUrl,
+    health: &ProxyHealth,
+    retry: RetryBudget,
+) -> Result<(TcpStream, PgServerMeta), DbError> {
     const INITIAL_BACKOFF_MS: u64 = 250;
-    const MAX_BACKOFF_MS: u64 = 8_000;
 
+    let max_backoff_ms = retry.max_backoff_ms();
     let mut backoff_ms = INITIAL_BACKOFF_MS;
-    let mut last_err: Option<DbError> = None;
-    for attempt in 1..=MAX_ATTEMPTS {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt = attempt.saturating_add(1);
         match pg_connect_and_handshake(url).await {
             Ok(ok) => {
+                health.record_up();
                 if attempt > 1 {
                     info!(
                         attempt,
@@ -385,40 +451,21 @@ async fn pg_connect_with_retry(url: &DbUrl) -> Result<(TcpStream, PgServerMeta),
                 return Ok(ok);
             }
             Err(e) => {
-                let is_last = attempt == MAX_ATTEMPTS;
-                if is_last {
+                health.record_down(&e);
+                if retry.is_final_attempt(attempt) {
                     warn!(
                         attempt,
                         addr = %url.addr(),
                         error = %e,
                         "PostgreSQL backend still unreachable after max retries; giving up"
                     );
-                } else if attempt >= 3 {
-                    warn!(
-                        attempt,
-                        addr = %url.addr(),
-                        error = %e,
-                        backoff_ms,
-                        "PostgreSQL backend connect failed; retrying"
-                    );
-                } else {
-                    info!(
-                        attempt,
-                        addr = %url.addr(),
-                        error = %e,
-                        backoff_ms,
-                        "PostgreSQL backend not yet reachable; retrying"
-                    );
+                    return Err(e);
                 }
-                last_err = Some(e);
-                if !is_last {
-                    tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                    backoff_ms = (backoff_ms.saturating_mul(2)).min(MAX_BACKOFF_MS);
-                }
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms.saturating_mul(2)).min(max_backoff_ms);
             }
         }
     }
-    Err(last_err.unwrap_or(DbError::Auth("pg_connect_with_retry: no attempt recorded".into())))
 }
 
 async fn pg_connect_and_handshake(url: &DbUrl) -> Result<(TcpStream, PgServerMeta), DbError> {
@@ -1340,6 +1387,76 @@ pub async fn build_proxy(
     stats: QueryStats,
 ) -> Result<PgProxy, DbError> {
     PgProxy::new(url, listen, pool_config, reset_strategy, replica_urls, rw_split, stats).await
+}
+
+/// Bind the proxy listener now; reach the upstream in the background.
+///
+/// The `PostgreSQL` twin of
+/// [`mysql::spawn_deferred`](crate::mysql::spawn_deferred) — see that
+/// function for the full rationale. In short: bind (fatal on failure),
+/// return, then connect upstream with unbounded capped-backoff retry and
+/// serve on the already-bound listener. Clients arriving before the upstream
+/// answers queue in the accept backlog for up to
+/// [`BACKLOG_GRACE`](crate::health::BACKLOG_GRACE), then are closed on
+/// arrival so they fail fast.
+///
+/// # Errors
+///
+/// Returns an error if the URL is malformed or the listen address cannot be
+/// bound. Upstream unreachability is not an error here.
+pub async fn spawn_deferred(
+    url: &str,
+    listen: &str,
+    pool_config: PoolConfig,
+    reset_strategy: ResetStrategy,
+    replica_urls: Vec<String>,
+    rw_split: PgRwSplitParams,
+    stats: QueryStats,
+    health: Arc<ProxyHealth>,
+) -> Result<tokio::task::JoinHandle<()>, DbError> {
+    let db_url = Arc::new(DbUrl::parse(url)?);
+    let listener = TcpListener::bind(listen).await?;
+    info!(
+        listen = %listen,
+        upstream = %db_url.addr(),
+        "PostgreSQL proxy listening (upstream connect continues in the background)"
+    );
+
+    let listen_owned = listen.to_string();
+    let listener = Arc::new(listener);
+    Ok(tokio::spawn(async move {
+        // See the MySQL twin: bounded backlog window, then fail fast.
+        let drain = tokio::spawn(crate::health::drain_while_upstream_down(
+            Arc::clone(&listener),
+            Arc::clone(&health),
+        ));
+
+        let proxy = match PgProxy::connect(
+            db_url,
+            &listen_owned,
+            pool_config,
+            reset_strategy,
+            replica_urls,
+            rw_split,
+            stats,
+            health,
+            RetryBudget::Unbounded,
+        )
+        .await
+        {
+            Ok(proxy) => proxy,
+            Err(e) => {
+                tracing::error!("PostgreSQL proxy failed to start: {e:#}");
+                return;
+            }
+        };
+        drain.abort();
+        drop(proxy.start_maintenance());
+        match proxy.run_on(listener).await {
+            Ok(()) => info!("PostgreSQL proxy stopped"),
+            Err(e) => tracing::error!("PostgreSQL proxy error: {e:#}"),
+        }
+    }))
 }
 
 #[cfg(test)]

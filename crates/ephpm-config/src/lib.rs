@@ -1119,6 +1119,29 @@ pub struct DbBackendConfig {
     pub replicas: Option<ReplicasConfig>,
 }
 
+/// Hand-written so a Rust-constructed `DbBackendConfig` lands on exactly
+/// the values an empty TOML table would produce. A derived `Default` would
+/// give `min_connections = 0` and empty duration strings — values no
+/// TOML-loaded config can ever hold, which is a trap for tests.
+impl Default for DbBackendConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            listen: None,
+            socket: None,
+            min_connections: default_min_connections(),
+            max_connections: default_max_connections(),
+            idle_timeout: default_idle_timeout(),
+            max_lifetime: default_max_lifetime(),
+            pool_timeout: default_pool_timeout(),
+            health_check_interval: default_health_check_interval(),
+            inject_env: default_inject_env(),
+            reset_strategy: default_reset_strategy(),
+            replicas: None,
+        }
+    }
+}
+
 /// Read replica configuration for a database backend.
 #[derive(Debug, Deserialize, Clone)]
 pub struct ReplicasConfig {
