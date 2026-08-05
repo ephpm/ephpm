@@ -12,6 +12,7 @@ ephpm-config = { workspace = true }
 ephpm-query-stats = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
+metrics = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }

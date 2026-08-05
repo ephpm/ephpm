@@ -30,7 +30,12 @@ ePHPm exposes two built-in probe endpoints on the main HTTP port:
 | Endpoint | Purpose | Response |
 |----------|---------|----------|
 | `/_ephpm/health` | Liveness probe | `200 {"status":"ok"}` — always succeeds if the process is running |
-| `/_ephpm/ready` | Readiness probe | `200 {"status":"ready"}` when PHP runtime is initialized; `503 {"status":"not_ready","reason":"PHP runtime not initialized"}` otherwise |
+| `/_ephpm/ready` | Readiness probe | `200 {"status":"ready"}` once the PHP runtime is initialized, a worker has finished booting (worker mode only), and every configured SQL proxy has reached its upstream at least once. Otherwise `503 {"status":"not_ready","reason":"..."}` naming which of those is outstanding. |
+
+Readiness gates on the SQL proxy's **first** upstream connect, not on live
+database reachability — a shared-database outage must not fail every replica's
+probe at once and empty the Service. See
+[Readiness and the database proxy](/reference/config/#readiness-and-the-database-proxy).
 
 ### Pod spec example
 

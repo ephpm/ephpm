@@ -219,6 +219,39 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 >
 > Binding `listen` to a non-loopback address therefore gives full read/write access to your database to any host that can reach the port. ePHPm logs a startup warning when `listen` is a non-loopback IP literal (`0.0.0.0:3306`, `10.0.0.5:3306`, …), but does **not** refuse to start — binding `0.0.0.0` inside a container that is firewalled by a network policy is a legitimate deployment. Addresses given as hostnames (`localhost:3306`, `db.internal:3306`) are not classified, because that would require a DNS lookup at startup; no warning is logged for them either way.
 
+#### Startup: the upstream does not have to be reachable
+
+The proxy binds `listen` at startup and reaches `url` from a background task,
+retrying forever with exponential backoff (250 ms doubling to a 30 s ceiling).
+A database that is slower to start than ePHPm — or that restarts later — is
+picked up when it appears; no ePHPm restart is needed. Clients that connect
+during the window queue in the kernel accept backlog rather than getting
+`ECONNREFUSED`, so PHP's first request waits instead of erroring.
+
+Two things *are* fatal at startup, because both are configuration errors: a
+`url` that cannot be parsed, and a `listen` address that cannot be bound.
+
+#### Readiness and the database proxy
+
+`/_ephpm/ready` reports **503 until every configured proxy has reached its
+upstream once**. A process whose proxy has never connected cannot serve a
+single query, so it must stay out of load-balancer rotation, and a rollout
+containing such a pod should stall rather than replace healthy pods.
+
+After that first success, readiness never flaps on upstream state again. This
+is deliberate: gating readiness on live database reachability would fail every
+replica's probe at the same instant during a shared-database outage, empty the
+Service, and turn a degraded database into a total outage — including for the
+static assets and non-DB routes those pods could still serve. Liveness
+(`/_ephpm/health`) stays green throughout; restarting the process does not
+bring a remote database back.
+
+A post-startup outage is reported instead of routed around:
+`ephpm_db_proxy_upstream_up` drops to `0`,
+`ephpm_db_proxy_connect_failures_total` climbs, and the proxy logs at ERROR
+(throttled to one line per minute). See
+[Metrics → Database (proxy upstream health)](/reference/metrics/#database-proxy-upstream-health).
+
 ### `[db.sqlite]`
 
 | Key | Type | Default | Description |

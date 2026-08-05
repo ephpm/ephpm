@@ -76,6 +76,31 @@ These appear when a cluster-wide OPcache invalidation actually fires. When
 |--------|------|--------|-------------|
 | `ephpm_opcache_invalidations_total` | counter | `vhost`, `trigger` | Cluster-wide OPcache invalidations run for a vhost. `trigger` is always `kv` today — both `ephpm deploy` and `ephpm cache reset` arrive via the KV version key. The planned file watcher (roadmap Phase 3) will add a second value. |
 
+## Database (proxy upstream health)
+
+These appear when `[db.mysql]` or `[db.postgres]` is configured. Labels: `db`
+(`mysql` / `postgres`) and `upstream` (the resolved `host:port` — never the
+URL, which carries credentials).
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_db_proxy_upstream_ever_connected` | gauge | `db`, `upstream` | `1` once the proxy has completed one upstream handshake since boot. Latches — it never returns to `0`. While it is `0`, `/_ephpm/ready` reports 503. |
+| `ephpm_db_proxy_upstream_up` | gauge | `db`, `upstream` | `1` if the most recent upstream connect attempt succeeded, `0` if it failed. Flaps with the database. |
+| `ephpm_db_proxy_connect_failures_total` | counter | `db`, `upstream` | Upstream connect/handshake failures. |
+
+`ephpm_db_proxy_upstream_up` is the metric to alert on. Readiness deliberately
+does **not** flap with it — a shared database going down would otherwise fail
+every replica's probe at the same instant and empty the Service. See
+[Readiness and the database proxy](/reference/config/#readiness-and-the-database-proxy).
+
+```promql
+# A proxy that never came up: the pod is not in rotation and never will be.
+ephpm_db_proxy_upstream_ever_connected == 0
+
+# A database outage on a pod that IS still in rotation, serving 500s.
+ephpm_db_proxy_upstream_up == 0 and ephpm_db_proxy_upstream_ever_connected == 1
+```
+
 ## Database (query stats)
 
 These appear when `[db.analysis] query_stats = true` (the default).

@@ -1,5 +1,6 @@
 pub mod acme;
 pub mod body;
+pub mod db_health;
 pub mod file_cache;
 mod idle;
 pub mod metrics;
@@ -240,6 +241,12 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         metric_label_series_max: config.db.analysis.metric_label_series_max,
     });
 
+    // Upstream health for every configured SQL proxy, built BEFORE the HTTP
+    // listeners so `/_ephpm/ready` can never report ready in the window
+    // between the router existing and the proxies starting. Fails startup on
+    // a malformed proxy URL.
+    let db_health = db_health::DbProxyHealth::from_config(&config)?;
+
     // Bind the HTTP listeners BEFORE constructing DB proxies: proxy startup
     // now retries a down backend with backoff (up to ~40s per proxy), and if
     // that ran first the listen sockets wouldn't exist yet — long enough for
@@ -258,12 +265,18 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         metrics_handle,
         middleware_chain,
         effective_node_id,
+        Arc::clone(&db_health),
     )
     .await?;
 
-    let _db_handles =
-        start_db_proxies(&config, cluster_handle.as_ref(), channel_handle.as_ref(), &query_stats)
-            .await?;
+    let _db_handles = start_db_proxies(
+        &config,
+        cluster_handle.as_ref(),
+        channel_handle.as_ref(),
+        &query_stats,
+        &db_health,
+    )
+    .await?;
 
     accept_loop(listeners).await
 }
@@ -338,6 +351,9 @@ async fn bind_listeners(
     // PHP `$_SERVER` as `EPHPM_NODE_ID`. `None` in single-node mode, where the
     // Router falls back to `[cluster] node_id` from config.
     node_id: Option<String>,
+    // Upstream health of the configured SQL proxies, so the readiness probe
+    // reports 503 until each one has reached its upstream at least once.
+    db_health: Arc<db_health::DbProxyHealth>,
 ) -> anyhow::Result<Listeners> {
     let addr: SocketAddr = config.server.listen.parse().context("invalid listen address")?;
 
@@ -495,7 +511,8 @@ async fn bind_listeners(
         // when `[cluster] node_id` is left empty (auto-derived per pod in
         // Kind). In single-node mode this is None, so Router keeps whatever it
         // derived from `[cluster] node_id`.
-        .with_node_id(node_id),
+        .with_node_id(node_id)
+        .with_db_health(db_health),
     );
 
     let has_tls = !matches!(tls_mode, TlsMode::None);
@@ -1272,11 +1289,29 @@ fn db_listen_exposure(addr: &str) -> Option<&'static str> {
 }
 
 /// Start database proxies (`MySQL`, `PostgreSQL`, `TDS`, embedded `SQLite`).
+///
+/// # Startup ordering
+///
+/// The SQL proxies bind their listen sockets here and reach their upstreams
+/// from background tasks, so nothing in this function blocks on a database
+/// being reachable. That is load-bearing, not tidiness: the embedded-SQLite
+/// branch below runs *after* the proxy branches, and a `[db.mysql]` proxy
+/// pointed at `[db.sqlite]`'s own litewire listener used to exhaust its
+/// entire connect budget against a listener this function had not bound yet,
+/// then give up permanently (issue #226). The same inversion fixes every
+/// deployment whose database is simply slower to start than ePHPm.
+///
+/// Errors from proxy startup — a malformed URL, a listen address that cannot
+/// be bound — are now fatal rather than logged. A proxy that cannot bind its
+/// port is a configuration error, and the previous behavior (log, continue,
+/// leave the port dead) is precisely the failure mode this function is being
+/// fixed for.
 async fn start_db_proxies(
     config: &Config,
     cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
     channel_handle: Option<&ephpm_cluster::ChannelHandle>,
     query_stats: &ephpm_query_stats::QueryStats,
+    db_health: &db_health::DbProxyHealth,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut handles = vec![];
 
@@ -1315,36 +1350,28 @@ async fn start_db_proxies(
             sticky_duration: parse_duration(&config.db.read_write_split.sticky_duration)?,
         };
 
-        match ephpm_db::mysql::build_proxy(
-            &url,
-            &listen,
-            mysql_config.socket.clone(),
-            pool_config,
-            reset_strategy,
-            replica_urls,
-            rw_split,
-            // Same collector the litewire paths hand to `TrackedBackend`, so
-            // proxied and embedded queries land on one metrics surface.
-            query_stats.clone(),
-        )
-        .await
-        {
-            Ok(proxy) => {
-                let maintenance_handle = proxy.start_maintenance();
-                let proxy_handle = tokio::spawn(async move {
-                    match proxy.run().await {
-                        Ok(()) => tracing::info!("MySQL proxy stopped"),
-                        Err(e) => tracing::error!("MySQL proxy error: {e:#}"),
-                    }
-                });
-                handles.push(proxy_handle);
-                // Drop the handle to detach the maintenance task — it runs independently.
-                drop(maintenance_handle);
-            }
-            Err(e) => {
-                tracing::error!("failed to start MySQL proxy: {e:#}");
-            }
-        }
+        let health = db_health
+            .mysql()
+            .cloned()
+            .context("[db.mysql] is configured but no health handle was registered")?;
+
+        handles.push(
+            ephpm_db::mysql::spawn_deferred(
+                &url,
+                &listen,
+                mysql_config.socket.clone(),
+                pool_config,
+                reset_strategy,
+                replica_urls,
+                rw_split,
+                // Same collector the litewire paths hand to `TrackedBackend`, so
+                // proxied and embedded queries land on one metrics surface.
+                query_stats.clone(),
+                health,
+            )
+            .await
+            .context("failed to start MySQL proxy")?,
+        );
     }
 
     // PostgreSQL proxy
@@ -1379,32 +1406,25 @@ async fn start_db_proxies(
             sticky_duration: parse_duration(&config.db.read_write_split.sticky_duration)?,
         };
 
-        match ephpm_db::postgres::build_proxy(
-            &url,
-            &listen,
-            pool_config,
-            reset_strategy,
-            replica_urls,
-            rw_split,
-            query_stats.clone(),
-        )
-        .await
-        {
-            Ok(proxy) => {
-                let maintenance_handle = proxy.start_maintenance();
-                let proxy_handle = tokio::spawn(async move {
-                    match proxy.run().await {
-                        Ok(()) => tracing::info!("PostgreSQL proxy stopped"),
-                        Err(e) => tracing::error!("PostgreSQL proxy error: {e:#}"),
-                    }
-                });
-                handles.push(proxy_handle);
-                drop(maintenance_handle);
-            }
-            Err(e) => {
-                tracing::error!("failed to start PostgreSQL proxy: {e:#}");
-            }
-        }
+        let health = db_health
+            .postgres()
+            .cloned()
+            .context("[db.postgres] is configured but no health handle was registered")?;
+
+        handles.push(
+            ephpm_db::postgres::spawn_deferred(
+                &url,
+                &listen,
+                pool_config,
+                reset_strategy,
+                replica_urls,
+                rw_split,
+                query_stats.clone(),
+                health,
+            )
+            .await
+            .context("failed to start PostgreSQL proxy")?,
+        );
     }
 
     // TDS (SQL Server) proxy — not yet implemented.

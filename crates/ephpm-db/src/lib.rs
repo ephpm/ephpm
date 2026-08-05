@@ -2,6 +2,7 @@
 
 pub mod duration;
 pub mod error;
+pub mod health;
 pub mod mysql;
 pub mod pool;
 pub mod postgres;
