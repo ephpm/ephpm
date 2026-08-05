@@ -264,6 +264,29 @@ async fn client_connected_before_the_upstream_is_served_from_the_backlog() {
         .expect("the queued client must complete its handshake");
 }
 
+/// The backlog window is bounded. An upstream that is simply *down* must not
+/// leave clients blocked reading a greeting that never comes — mysqlnd's read
+/// timeout is 24 hours, so that would pin a PHP worker until the HTTP request
+/// deadline. Past the grace period the proxy closes clients on arrival.
+///
+/// This was found by the podman reproduction of #226, not by review: the
+/// first cut of the fix traded a fast 500 for a 300 s hang.
+#[tokio::test]
+async fn a_long_dead_upstream_closes_clients_instead_of_hanging_them() {
+    let upstream = reserve_addr().await; // never comes up
+    let (listen, health) = spawn_proxy(upstream).await;
+
+    tokio::time::sleep(ephpm_db::health::BACKLOG_GRACE + Duration::from_millis(750)).await;
+    assert!(!health.ever_connected(), "sanity: the upstream never appeared");
+
+    let mut client = TcpStream::connect(&listen).await.expect("connect still succeeds");
+    let mut buf = [0u8; 4];
+    let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut buf))
+        .await
+        .expect("the client must be closed promptly, not left blocked on a read");
+    assert_eq!(read.ok(), Some(0), "the proxy must close the connection (EOF), not answer it");
+}
+
 /// Retry is unbounded on the deferred path: an upstream down for longer than
 /// the old ~40 s budget must still be picked up. Before the fix the proxy
 /// gave up permanently and only a process restart could recover it.

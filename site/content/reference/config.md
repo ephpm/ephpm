@@ -224,9 +224,16 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 The proxy binds `listen` at startup and reaches `url` from a background task,
 retrying forever with exponential backoff (250 ms doubling to a 30 s ceiling).
 A database that is slower to start than ePHPm — or that restarts later — is
-picked up when it appears; no ePHPm restart is needed. Clients that connect
-during the window queue in the kernel accept backlog rather than getting
-`ECONNREFUSED`, so PHP's first request waits instead of erroring.
+picked up when it appears; no ePHPm restart is needed.
+
+Clients that connect during the first **5 seconds** of that window queue in the
+kernel accept backlog rather than getting `ECONNREFUSED`, so PHP's first
+request waits a moment and then succeeds. Past 5 seconds the proxy accepts and
+immediately closes each client, so callers fail fast: a client whose TCP
+connect succeeded would otherwise block reading a server greeting that never
+comes, and mysqlnd's read timeout is 24 hours by default — that would pin a PHP
+worker until the HTTP request deadline. PHP reports the close promptly
+(`Lost connection to MySQL server at 'reading initial communication packet'`).
 
 Two things *are* fatal at startup, because both are configuration errors: a
 `url` that cannot be parsed, and a `listen` address that cannot be bound.

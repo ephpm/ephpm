@@ -302,7 +302,7 @@ impl PgProxy {
     pub async fn run(self) -> Result<(), DbError> {
         let listener = TcpListener::bind(&self.listen).await?;
         info!(listen = %self.listen, "PostgreSQL proxy listening");
-        self.run_on(listener).await
+        self.run_on(Arc::new(listener)).await
     }
 
     /// Accept client connections on an already-bound listener.
@@ -316,7 +316,7 @@ impl PgProxy {
     ///
     /// Currently never returns `Err`; accept errors are logged and the loop
     /// continues.
-    pub async fn run_on(self, listener: TcpListener) -> Result<(), DbError> {
+    pub async fn run_on(self, listener: Arc<TcpListener>) -> Result<(), DbError> {
         let proxy = Arc::new(self);
         loop {
             let (client, peer) = match listener.accept().await {
@@ -1395,7 +1395,10 @@ pub async fn build_proxy(
 /// [`mysql::spawn_deferred`](crate::mysql::spawn_deferred) — see that
 /// function for the full rationale. In short: bind (fatal on failure),
 /// return, then connect upstream with unbounded capped-backoff retry and
-/// serve on the already-bound listener.
+/// serve on the already-bound listener. Clients arriving before the upstream
+/// answers queue in the accept backlog for up to
+/// [`BACKLOG_GRACE`](crate::health::BACKLOG_GRACE), then are closed on
+/// arrival so they fail fast.
 ///
 /// # Errors
 ///
@@ -1420,7 +1423,14 @@ pub async fn spawn_deferred(
     );
 
     let listen_owned = listen.to_string();
+    let listener = Arc::new(listener);
     Ok(tokio::spawn(async move {
+        // See the MySQL twin: bounded backlog window, then fail fast.
+        let drain = tokio::spawn(crate::health::drain_while_upstream_down(
+            Arc::clone(&listener),
+            Arc::clone(&health),
+        ));
+
         let proxy = match PgProxy::connect(
             db_url,
             &listen_owned,
@@ -1440,6 +1450,7 @@ pub async fn spawn_deferred(
                 return;
             }
         };
+        drain.abort();
         drop(proxy.start_maintenance());
         match proxy.run_on(listener).await {
             Ok(()) => info!("PostgreSQL proxy stopped"),

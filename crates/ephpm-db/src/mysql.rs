@@ -325,7 +325,7 @@ impl MySqlProxy {
     pub async fn run(self) -> Result<(), DbError> {
         let listener = TcpListener::bind(&self.listen).await?;
         info!(listen = %self.listen, "MySQL proxy listening");
-        self.run_on(listener).await
+        self.run_on(Arc::new(listener)).await
     }
 
     /// Accept client connections on an already-bound listener.
@@ -341,7 +341,7 @@ impl MySqlProxy {
     /// Currently never returns `Err` — accept errors are logged and the
     /// loop continues. The signature is fallible for symmetry with
     /// [`MySqlProxy::run`].
-    pub async fn run_on(self, listener: TcpListener) -> Result<(), DbError> {
+    pub async fn run_on(self, listener: Arc<TcpListener>) -> Result<(), DbError> {
         let proxy = Arc::new(self);
         loop {
             let (client, peer) = match listener.accept().await {
@@ -1980,7 +1980,9 @@ pub async fn build_proxy(
 ///
 /// Clients that connect during step 3 do not get `ECONNREFUSED`: the socket
 /// is bound, so their connections sit in the kernel accept backlog and are
-/// served as soon as the upstream answers.
+/// served as soon as the upstream answers. That window is bounded by
+/// [`BACKLOG_GRACE`] — past it, clients are accepted and closed so they fail
+/// fast rather than blocking on a greeting that will not come.
 ///
 /// `health` is moved into the connect loop and the pool; the caller keeps a
 /// clone to drive the readiness probe.
@@ -2010,7 +2012,16 @@ pub async fn spawn_deferred(
     );
 
     let listen_owned = listen.to_string();
+    let listener = Arc::new(listener);
     Ok(tokio::spawn(async move {
+        // Fail-fast guard for a long outage; aborted the moment the upstream
+        // answers, and a no-op entirely when that happens inside the grace
+        // period (the common case).
+        let drain = tokio::spawn(crate::health::drain_while_upstream_down(
+            Arc::clone(&listener),
+            Arc::clone(&health),
+        ));
+
         let proxy = match MySqlProxy::connect(
             db_url,
             &listen_owned,
@@ -2028,11 +2039,13 @@ pub async fn spawn_deferred(
             Ok(proxy) => proxy,
             Err(e) => {
                 // Unreachable in practice: the unbounded budget never gives
-                // up, so only a pool-seed failure lands here.
+                // up, so only a pool-seed failure lands here. Leave the drain
+                // running so clients keep failing fast rather than hanging.
                 tracing::error!("MySQL proxy failed to start: {e:#}");
                 return;
             }
         };
+        drain.abort();
         // Detach pool maintenance — it runs for the proxy's lifetime.
         drop(proxy.start_maintenance());
         match proxy.run_on(listener).await {

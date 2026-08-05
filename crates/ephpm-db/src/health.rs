@@ -37,6 +37,68 @@ const LOG_INTERVAL_SECS: u64 = 60;
 /// the thousandth carries nothing new.
 const UNTHROTTLED_FAILURES: u64 = 3;
 
+/// How long a bound-but-not-yet-connected proxy lets clients sit in the
+/// kernel accept backlog before it starts closing them on arrival.
+///
+/// The backlog is what makes a late upstream invisible to PHP: a request
+/// that arrives while the proxy is still dialing waits a few hundred
+/// milliseconds and then succeeds, instead of getting `ECONNREFUSED`. But
+/// the backlog must not be the behavior for an upstream that is simply
+/// *down*: a client whose TCP connect succeeded then blocks reading a
+/// server greeting that never comes, and mysqlnd's read timeout is 24 hours
+/// by default. That converts fast 500s into requests that pin a PHP worker
+/// until the HTTP request deadline — a worse failure than the one this
+/// whole change exists to fix.
+///
+/// So the backlog window is bounded. After this long without an upstream,
+/// the proxy accepts and immediately closes, which PHP reports promptly
+/// ("Lost connection ... reading initial communication packet"). Five
+/// seconds comfortably covers both cases it needs to cover: a listener
+/// bound later in this same process (~250 ms) and a database container
+/// starting alongside ePHPm.
+pub const BACKLOG_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Accept and immediately close clients while the upstream is unreachable.
+///
+/// Spawned alongside the upstream-connect loop and aborted the moment the
+/// upstream answers. Sleeps [`BACKLOG_GRACE`] first so a proxy whose
+/// upstream appears promptly never drops a client at all.
+///
+/// One client can be dropped at the switchover instant — an `accept()` that
+/// completes in the same poll as the abort. PDO reports it and the next
+/// request succeeds; the alternative is machinery to close a millisecond-
+/// wide window.
+pub async fn drain_while_upstream_down(
+    listener: Arc<tokio::net::TcpListener>,
+    health: Arc<ProxyHealth>,
+) {
+    tokio::time::sleep(BACKLOG_GRACE).await;
+    tracing::warn!(
+        db = health.kind(),
+        upstream = %health.upstream(),
+        listen = %health.listen(),
+        grace_secs = BACKLOG_GRACE.as_secs(),
+        "database proxy upstream still unreachable after the backlog grace period; \
+         closing client connections on arrival so callers fail fast instead of \
+         blocking on a greeting that will not come"
+    );
+    loop {
+        match listener.accept().await {
+            // Dropping the stream sends FIN. The client sees a closed
+            // connection rather than an unbounded read.
+            Ok((client, peer)) => {
+                tracing::debug!(%peer, "closing client: proxy upstream is unreachable");
+                drop(client);
+            }
+            Err(e) => {
+                tracing::warn!("proxy accept error while upstream is down: {e}");
+                // Don't spin on a persistent accept error (EMFILE).
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
 /// How long a proxy keeps trying to reach its upstream before giving up.
 ///
 /// The two variants exist because the two entry points have different
