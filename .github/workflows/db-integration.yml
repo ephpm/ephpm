@@ -277,7 +277,9 @@ jobs:
     continue-on-error: true
     timeout-minutes: 10
     services:
-      probe-pg:
+      # No hyphen in the service id: it appears in a GitHub expression path
+      # (`job.services.<id>`) where `-` parses as subtraction.
+      probepg:
         image: postgres:17
         env:
           POSTGRES_PASSWORD: ephpm-test
@@ -287,9 +289,9 @@ jobs:
     steps:
       - name: Report what the runner gave us
         run: |
-          echo "job.services.probe-pg.id      = ${{ job.services.probe-pg.id }}"
-          echo "job.services.probe-pg.ports  = ${{ toJSON(job.services.probe-pg.ports) }}"
-          PORT="${{ job.services.probe-pg.ports['5432'] }}"
+          echo "job.services.probepg.id     = ${{ job.services.probepg.id }}"
+          echo "job.services.probepg.ports  = ${{ toJSON(job.services.probepg.ports) }}"
+          PORT="${{ job.services.probepg.ports['5432'] }}"
           if [ -z "$PORT" ]; then
             echo "RESULT: services: did NOT provision a mapped port on this runner"
             exit 1
