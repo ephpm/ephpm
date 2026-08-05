@@ -2,6 +2,7 @@ pub mod acme;
 pub mod body;
 pub mod db_health;
 pub mod file_cache;
+pub mod http3;
 mod idle;
 pub mod metrics;
 pub mod middleware;
@@ -325,6 +326,10 @@ struct Listeners {
     file_cache_eviction_interval: Duration,
     /// Persistent worker pool (worker mode), drained on shutdown.
     worker_pool: Option<Arc<worker_pool::WorkerPool>>,
+    /// Bound QUIC endpoint serving HTTP/3, when `[server.http3]` is enabled.
+    /// `None` means HTTP/3 is off — the TCP listeners are unaffected either
+    /// way, since HTTP/3 is additive (UDP) rather than a replacement.
+    http3_endpoint: Option<quinn::Endpoint>,
 }
 
 /// Connection-level settings passed into spawned tasks.
@@ -407,6 +412,59 @@ async fn bind_listeners(
             anyhow::bail!("TLS config must provide both cert and key, or neither (for ACME mode)");
         }
         _ => TlsMode::None,
+    };
+
+    // HTTP/3 (UDP) is bound before the router is built so the `Alt-Svc`
+    // advertisement can be attached only if the QUIC socket really came up.
+    //
+    // The address it defaults to is whatever terminates TLS over TCP:
+    // `[server.tls] listen` when a separate HTTPS listener is configured,
+    // otherwise `[server] listen`. Same authority and port as HTTPS, different
+    // transport — which is exactly what an `Alt-Svc: h3=":<port>"` promises.
+    let https_addr: SocketAddr = match config.server.tls.as_ref().and_then(|t| t.listen.as_ref()) {
+        Some(raw) => raw.parse().context("invalid TLS listen address")?,
+        None => addr,
+    };
+    let (http3_endpoint, alt_svc) = match http3::Http3Params::resolve(config, https_addr)? {
+        Some(params) => {
+            let endpoint = http3::build_endpoint(params.listen, &params.cert, &params.key)?;
+            // Read the port back off the socket rather than trusting config:
+            // with `listen = "…:0"` the OS picks it, and advertising `:0`
+            // would send every client to a port that is not there.
+            let bound = endpoint
+                .local_addr()
+                .context("HTTP/3 endpoint has no local address after binding")?;
+            let max_age = config.server.http3.alt_svc_max_age;
+            tracing::info!(
+                listen = %bound,
+                alt_svc_max_age = max_age,
+                "HTTP/3 (QUIC) listening on UDP"
+            );
+            if max_age == 0 {
+                tracing::warn!(
+                    "[server.http3] alt_svc_max_age = 0 suppresses the Alt-Svc header — \
+                     browsers will never discover HTTP/3 and will stay on TCP"
+                );
+            }
+            (Some(endpoint), Some((bound.port(), max_age)))
+        }
+        None => {
+            // add-config-knob: the two supporting knobs only mean anything when
+            // `enabled = true`. Warn rather than let them read as effective.
+            if config.server.http3.listen.is_some() {
+                tracing::warn!(
+                    "[server.http3] listen is ignored while enabled = false — \
+                     no QUIC socket is bound"
+                );
+            }
+            if config.server.http3.alt_svc_max_age != 86400 {
+                tracing::warn!(
+                    "[server.http3] alt_svc_max_age is ignored while enabled = false — \
+                     no Alt-Svc header is advertised"
+                );
+            }
+            (None, None)
+        }
     };
 
     // Worker mode: wire the worker ops table and spawn the persistent worker
@@ -495,8 +553,8 @@ async fn bind_listeners(
         None
     };
 
-    let router = Arc::new(
-        Router::new(
+    let router = Arc::new({
+        let router = Router::new(
             config,
             kv_store,
             multi_tenant_kv,
@@ -512,8 +570,14 @@ async fn bind_listeners(
         // Kind). In single-node mode this is None, so Router keeps whatever it
         // derived from `[cluster] node_id`.
         .with_node_id(node_id)
-        .with_db_health(db_health),
-    );
+        .with_db_health(db_health);
+
+        // Only advertise HTTP/3 once its UDP socket is confirmed bound.
+        match alt_svc {
+            Some((port, max_age)) => router.with_alt_svc(port, max_age),
+            None => router,
+        }
+    });
 
     let has_tls = !matches!(tls_mode, TlsMode::None);
 
@@ -583,6 +647,7 @@ async fn bind_listeners(
         file_cache,
         file_cache_eviction_interval,
         worker_pool,
+        http3_endpoint,
     })
 }
 
@@ -640,10 +705,30 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         file_cache,
         file_cache_eviction_interval,
         worker_pool,
+        http3_endpoint,
     } = listeners;
 
     // Track in-flight connections for graceful shutdown.
     let in_flight = Arc::new(AtomicUsize::new(0));
+
+    // HTTP/3 accepts on its own task: QUIC connections arrive on a UDP socket
+    // that has nothing to do with the TCP `accept()` calls below. It shares
+    // `in_flight` so the drain loop at the end of this function waits for
+    // in-progress HTTP/3 requests exactly as it does for TCP connections.
+    let http3_shutdown = tokio::sync::watch::channel(false);
+    let http3_task = http3_endpoint.map(|endpoint| {
+        let router = Arc::clone(&router);
+        let in_flight = Arc::clone(&in_flight);
+        let mut rx = http3_shutdown.0.subscribe();
+        tokio::spawn(async move {
+            http3::accept_loop(endpoint, router, in_flight, async move {
+                // `changed()` only errors if every sender is gone, which also
+                // means shutdown; either way, stop accepting.
+                let _ = rx.changed().await;
+            })
+            .await;
+        })
+    });
 
     // Spawn background cleanup task for rate limiter state.
     if let Some(ref l) = limiter {
@@ -725,6 +810,10 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         }
     }
 
+    // Stop accepting new QUIC connections. In-flight HTTP/3 requests keep
+    // running and are covered by the `in_flight` drain below.
+    let _ = http3_shutdown.0.send(true);
+
     // Worker mode: stop accepting new dispatch so in-flight worker iterations
     // finish and workers exit their loops cleanly (design §4.5).
     if let Some(pool) = &worker_pool {
@@ -756,6 +845,13 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    // The QUIC endpoint sends CONNECTION_CLOSE to its peers as the accept loop
+    // exits; give that task a bounded moment to finish so clients see a clean
+    // close instead of a timeout.
+    if let Some(task) = http3_task {
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
     }
 
     Ok(())

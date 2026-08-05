@@ -106,7 +106,7 @@ Every ePHPm node runs as a serving node. The Node API is always present — it's
 │  (hyper /   │  (MySQL/PG)   │  (gRPC :4317 /         │
 │   tokio)    │  + query      │   HTTP :4318)          │
 │  + HTTP/2   │    digest     │                        │
-│  + QUIC     │  + slow query │                        │
+│  + HTTP/3   │  + slow query │                        │
 │             │    analysis   │                        │
 ├─────────────┼───────────────┼────────────────────────┤
 │  ACME TLS   │  Clustered KV │  Node API :9090        │
@@ -270,7 +270,7 @@ password = "changeme"                 # admin UI auth (separate from node API au
 |---|---|
 | Async runtime | `tokio` |
 | HTTP/1.1 + HTTP/2 | `hyper` |
-| HTTP/3 (QUIC) | `quinn` (planned) |
+| HTTP/3 (QUIC) | `quinn` + `h3` (opt-in via `[server.http3]`) |
 | TLS | `rustls` |
 | Automatic ACME TLS | `rustls-acme` |
 | PHP embedding | Custom Rust FFI + `libphp` (linked via `ephpm-php`'s `build.rs` + `bindgen`) |

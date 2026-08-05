@@ -122,6 +122,32 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 | `listen` | string | (none) | Separate HTTPS listener. When set, `[server] listen` serves HTTP and this serves HTTPS. |
 | `redirect_http` | bool | `false` | When `listen` is set, the HTTP listener redirects everything to HTTPS (301). |
 
+### `[server.http3]`
+
+HTTP/3 runs over **UDP**, *in addition to* the TCP listeners — HTTP/1.1 and HTTP/2 keep working exactly as before. Enabling it binds one extra UDP socket.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable the HTTP/3 (QUIC) listener. Requires a static `[server.tls]` `cert`+`key`; startup **fails** if TLS is absent or in ACME mode rather than silently serving TCP only. |
+| `listen` | string | (none) | UDP address for QUIC. Unset derives it from the HTTPS listener — `[server.tls] listen` when set, otherwise `[server] listen` — i.e. the same port as HTTPS, on UDP. |
+| `alt_svc_max_age` | u64 (sec) | `86400` (24 h) | `ma=` value of the `Alt-Svc` header advertised on HTTPS responses. `0` suppresses the header entirely. |
+
+**Clients only reach HTTP/3 after seeing `Alt-Svc`.** A browser speaks TCP first and switches to HTTP/3 on a later request, once it has seen `Alt-Svc: h3=":443"; ma=86400` on an HTTPS response. ePHPm emits that header on every TLS-terminated response (not on plain `http://`, which cannot upgrade). Setting `alt_svc_max_age = 0` means no browser will ever discover HTTP/3 — only clients told about it out of band (`curl --http3-only`, or an `HTTPS`/`SVCB` DNS record) will connect.
+
+**Limitation — ACME is not supported on HTTP/3 yet.** QUIC bakes its certificate into the endpoint at bind time, whereas `rustls-acme` rotates certificates during the process lifetime. `enabled = true` together with ACME TLS is a startup error, deliberately: ePHPm refuses to come up quietly without the HTTP/3 listener you asked for. Use a static `cert`/`key` for now; ACME support is planned.
+
+**Firewalls:** QUIC is UDP. Opening TCP/443 is not enough — UDP on the same port must also be reachable, or clients will try HTTP/3, fail, and silently fall back to TCP.
+
+```toml
+[server.tls]
+cert = "/etc/ephpm/fullchain.pem"
+key  = "/etc/ephpm/privkey.pem"
+
+[server.http3]
+enabled = true          # binds UDP on the HTTPS address
+alt_svc_max_age = 86400
+```
+
 ## `[php]`
 
 | Key | Type | Default | Description |

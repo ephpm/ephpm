@@ -34,6 +34,12 @@ tracing-appender = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+# HTTP/3 (QUIC). The rustls-ring feature keeps QUIC on the SAME rustls
+# crypto provider the TCP TLS path installs as the process default (see
+# the rustls pin above) - mixing providers is a runtime panic risk.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
 rustls-acme = { version = "0.15", default-features = false, features = ["tokio", "aws-lc-rs", "tls12", "webpki-roots"] }
 tokio-stream = "0.1"
 tempfile = "3"

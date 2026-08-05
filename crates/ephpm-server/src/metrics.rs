@@ -58,6 +58,13 @@ pub fn init() -> anyhow::Result<PrometheusHandle> {
             PHP_DURATION_BUCKETS,
         )
         .context("failed to configure http_request_duration buckets")?
+        // HTTP/3 gets its own duration series so h3-vs-h2 latency is
+        // comparable; same buckets, so the two are directly overlayable.
+        .set_buckets_for_metric(
+            Matcher::Full("ephpm_http3_request_duration_seconds".to_string()),
+            PHP_DURATION_BUCKETS,
+        )
+        .context("failed to configure http3_request_duration buckets")?
         .set_buckets_for_metric(
             Matcher::Full("ephpm_php_execution_duration_seconds".to_string()),
             PHP_DURATION_BUCKETS,

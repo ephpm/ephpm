@@ -192,6 +192,10 @@ pub struct ServerConfig {
     /// TLS configuration. When present, enables HTTPS.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
+
+    /// HTTP/3 (QUIC) settings.
+    #[serde(default)]
+    pub http3: Http3Config,
 }
 
 /// Request limits configuration (`[server.request]`).
@@ -756,6 +760,64 @@ impl TlsConfig {
     #[must_use]
     pub fn is_acme(&self) -> bool {
         !self.domains.is_empty() && !self.is_manual()
+    }
+}
+
+/// HTTP/3 (QUIC) configuration (`[server.http3]`).
+///
+/// HTTP/3 runs over **UDP**, alongside — never instead of — the TCP
+/// listeners that serve HTTP/1.1 and HTTP/2. Enabling it therefore binds an
+/// additional UDP socket; nothing about the TCP side changes.
+///
+/// QUIC mandates TLS 1.3, so HTTP/3 only starts when TLS is configured with a
+/// static certificate (`[server.tls] cert` + `key`). ACME-provisioned
+/// certificates are **not** wired into the QUIC endpoint yet — see
+/// [`Http3Config::enabled`].
+#[derive(Debug, Deserialize, Clone)]
+pub struct Http3Config {
+    /// Enable the HTTP/3 (QUIC) listener.
+    ///
+    /// Default: `false`. HTTP/3 is opt-in because it binds an extra UDP
+    /// socket and requires a static TLS certificate.
+    ///
+    /// When `true` but TLS is absent or is in ACME mode, startup logs a
+    /// warning and the QUIC listener does not start — the TCP listeners are
+    /// unaffected. ePHPm never silently continues without the HTTP/3
+    /// listener an operator asked for.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// UDP address for the QUIC listener (e.g. `"0.0.0.0:443"`).
+    ///
+    /// Absent (the default) means "derive from the HTTPS listener": the UDP
+    /// socket binds the same address and port that serves HTTPS over TCP
+    /// (`[server.tls] listen` when set, otherwise `[server] listen`). That
+    /// matches how browsers expect to find HTTP/3 — same authority, same
+    /// port number, different transport.
+    ///
+    /// Set explicitly only to move QUIC to a different port; the port used
+    /// here is what gets advertised in `Alt-Svc`.
+    #[serde(default)]
+    pub listen: Option<String>,
+
+    /// `max-age` in seconds for the `Alt-Svc` response header advertised on
+    /// HTTPS responses (`Alt-Svc: h3=":443"; ma=86400`).
+    ///
+    /// Browsers do not attempt HTTP/3 until they have seen this header over
+    /// TCP, so it is the discovery mechanism, not a hint. It caps how long a
+    /// client may keep using the advertised HTTP/3 endpoint without
+    /// re-confirming it.
+    ///
+    /// Default: `86400` (24 hours). Set to `0` to suppress the header
+    /// entirely — HTTP/3 then only serves clients that were told about it
+    /// some other way (e.g. `curl --http3-only`, `HTTPS`/`SVCB` DNS records).
+    #[serde(default = "default_alt_svc_max_age")]
+    pub alt_svc_max_age: u64,
+}
+
+impl Default for Http3Config {
+    fn default() -> Self {
+        Self { enabled: false, listen: None, alt_svc_max_age: default_alt_svc_max_age() }
     }
 }
 
@@ -1993,6 +2055,7 @@ impl Default for ServerConfig {
             limits: LimitsConfig::default(),
             file_cache: FileCacheConfig::default(),
             tls: None,
+            http3: Http3Config::default(),
         }
     }
 }
@@ -3224,6 +3287,11 @@ fn default_max_body_size() -> u64 {
     10 * 1024 * 1024 // 10 MiB
 }
 
+/// Default `Alt-Svc` max-age: 24 hours, the value nginx and Caddy advertise.
+fn default_alt_svc_max_age() -> u64 {
+    86400
+}
+
 fn default_header_read() -> u64 {
     30
 }
@@ -3384,6 +3452,88 @@ mod tests {
     // must install it with `EnvVars` — see `crate::test_env`; nothing else in
     // this module may touch `std::env` directly.
     use crate::test_env::EnvVars;
+
+    // ── [server.http3] ───────────────────────────────────────────────
+
+    /// Section absent: HTTP/3 must be off, with the documented Alt-Svc
+    /// max-age. `ServerConfig` has a hand-written `Default`, so this also
+    /// guards against that impl and the serde field defaults drifting apart.
+    #[test]
+    fn http3_section_absent_defaults_to_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(!config.server.http3.enabled, "HTTP/3 must be opt-in");
+        assert_eq!(config.server.http3.listen, None);
+        assert_eq!(config.server.http3.alt_svc_max_age, 86400);
+
+        // ...and the struct default agrees with what TOML parsing produced.
+        let direct = ServerConfig::default();
+        assert!(!direct.http3.enabled);
+        assert_eq!(direct.http3.alt_svc_max_age, 86400);
+    }
+
+    /// Section present but partial: the unset fields must fall back to their
+    /// field-level defaults, not to zero/None-by-derive.
+    #[test]
+    fn http3_section_present_keeps_field_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server.http3]\nenabled = true\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.http3.enabled);
+        assert_eq!(config.server.http3.listen, None, "listen derives from the HTTPS address");
+        assert_eq!(
+            config.server.http3.alt_svc_max_age, 86400,
+            "a partial [server.http3] section must not zero the Alt-Svc max-age"
+        );
+    }
+
+    #[test]
+    fn http3_section_parses_every_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server.http3]
+enabled = true
+listen = "0.0.0.0:8443"
+alt_svc_max_age = 3600
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.http3.enabled);
+        assert_eq!(config.server.http3.listen.as_deref(), Some("0.0.0.0:8443"));
+        assert_eq!(config.server.http3.alt_svc_max_age, 3600);
+    }
+
+    #[test]
+    fn test_env_var_overrides_http3_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server.http3]\nenabled = false\n").unwrap();
+
+        let _env = EnvVars::set("EPHPM_SERVER__HTTP3__ENABLED", "true");
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.http3.enabled);
+    }
+
+    #[test]
+    fn test_env_var_overrides_http3_alt_svc_max_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+
+        let _env = EnvVars::set("EPHPM_SERVER__HTTP3__ALT_SVC_MAX_AGE", "120");
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.http3.alt_svc_max_age, 120);
+    }
 
     #[test]
     fn cluster_disabled_empty_secret_is_ok() {
