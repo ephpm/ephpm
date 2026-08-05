@@ -111,6 +111,11 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 
 Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If both are set, manual wins.
 
+> **Known issue:** manual `cert`+`key` mode panics at startup on every release
+> from v0.1.0 through v0.6.1 — the process exits before binding a listener.
+> ACME mode is unaffected. See [TLS / ACME](/guides/tls-acme/) for details and
+> workarounds. Fixed on `main`.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `cert` | path | (none) | PEM-encoded certificate chain (manual mode). |

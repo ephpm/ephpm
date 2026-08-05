@@ -5,6 +5,26 @@ weight = 4
 
 ePHPm has TLS built in. Two modes: bring your own cert, or have ePHPm fetch one from Let's Encrypt automatically.
 
+> **Known issue — manual `cert` + `key` does not start on v0.1.0 through v0.6.1.**
+>
+> On every released version up to and including v0.6.1, starting ePHPm with
+> `[server.tls] cert` and `key` logs `TLS enabled (manual)` and then **panics
+> before binding a listener**:
+>
+> ```
+> Could not automatically determine the process-level CryptoProvider
+> ```
+>
+> The process exits with status 101 and serves nothing. This is not a
+> regression — it has never worked in any release; the bug dates to v0.1.0
+> and was found in August 2026 while adding HTTP/3.
+>
+> **ACME mode is unaffected** and is the only TLS configuration that has ever
+> worked on a released build. If you need TLS today, use ACME (below), or
+> terminate TLS at a proxy and run ePHPm plain-HTTP behind it.
+>
+> Fixed on `main`; the fix ships in the next release.
+
 ## Manual cert + key
 
 Point at PEM-encoded files:
