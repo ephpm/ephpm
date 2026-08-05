@@ -1306,6 +1306,7 @@ name = "ephpm-db"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "aws-lc-rs",
  "base64ct",
  "bytes",
  "ephpm-config",
