@@ -2,8 +2,10 @@
 //!
 //! These tests require a running `PostgreSQL` server. Set `PG_TEST_URL` to a
 //! connection string (e.g. `postgres://postgres:test@127.0.0.1:5433/test`) to
-//! enable them. All tests are `#[ignore]` so they only run in nightly CI via
-//! `cargo test -- --ignored`.
+//! enable them. All tests are `#[ignore]`, and CI runs them in
+//! `.github/workflows/db-integration.yml` against a real `postgres:17`.
+//! Locally an unset `PG_TEST_URL` skips; in CI it is a failure — see
+//! `tests/common/mod.rs`.
 //!
 //! These tests cover the analogous handshake-handling concerns that affected
 //! the MySQL proxy in PR #91. The PG wire protocol has no capability
@@ -35,9 +37,11 @@ use ephpm_db::pool::PoolConfig;
 use ephpm_db::postgres::{PgProxy, PgRwSplitParams};
 use tokio_postgres::NoTls;
 
+mod common;
+
 /// Read `PG_TEST_URL` or return `None` (caller should skip).
 fn pg_url() -> Option<String> {
-    std::env::var("PG_TEST_URL").ok()
+    common::db_url("PG_TEST_URL")
 }
 
 /// Build a default pool config suitable for tests.
@@ -114,7 +118,7 @@ fn proxy_config(proxy_addr: &str) -> tokio_postgres::Config {
 /// implementation did — the proxy will fail to spawn and this test will
 /// panic before `start_proxy` returns.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires PG_TEST_URL — nightly CI only"]
+#[ignore = "requires PG_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn backend_handshake_completes() {
     let Some(url) = pg_url() else {
         println!("PG_TEST_URL not set — skipping");
@@ -128,7 +132,7 @@ async fn backend_handshake_completes() {
 
 /// Round-trip a simple query through the proxy.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires PG_TEST_URL — nightly CI only"]
+#[ignore = "requires PG_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn basic_query_roundtrip() {
     let Some(url) = pg_url() else {
         println!("PG_TEST_URL not set — skipping");
@@ -165,7 +169,7 @@ async fn basic_query_roundtrip() {
 
 /// Open and close multiple connections; verify the pool reuses backends.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires PG_TEST_URL — nightly CI only"]
+#[ignore = "requires PG_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn connection_pool_reuse() {
     let Some(url) = pg_url() else {
         println!("PG_TEST_URL not set — skipping");
@@ -198,7 +202,7 @@ async fn connection_pool_reuse() {
 /// `DISCARD ALL` (issued by the proxy on Always reset), session-local
 /// settings must not leak to the next client.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires PG_TEST_URL — nightly CI only"]
+#[ignore = "requires PG_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn session_isolation() {
     let Some(url) = pg_url() else {
         println!("PG_TEST_URL not set — skipping");
@@ -241,7 +245,7 @@ async fn session_isolation() {
 
 /// Verify BEGIN/INSERT/ROLLBACK semantics across the proxy.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires PG_TEST_URL — nightly CI only"]
+#[ignore = "requires PG_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn transaction_integrity() {
     let Some(url) = pg_url() else {
         println!("PG_TEST_URL not set — skipping");
@@ -279,7 +283,7 @@ async fn transaction_integrity() {
 /// Parse/Bind/Execute/Sync). `tokio_postgres::query` always uses the extended
 /// protocol, so this exercises that path implicitly.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires PG_TEST_URL — nightly CI only"]
+#[ignore = "requires PG_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn prepared_statement_lifecycle() {
     let Some(url) = pg_url() else {
         println!("PG_TEST_URL not set — skipping");
@@ -330,7 +334,7 @@ async fn prepared_statement_lifecycle() {
 /// path, which nothing else in this file exercises — so it also covers the
 /// framed relay that replaced the opaque byte copy.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires PG_TEST_URL — nightly CI only"]
+#[ignore = "requires PG_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn multi_statement_query_does_not_desync_the_pooled_backend() {
     let Some(url) = pg_url() else {
         println!("PG_TEST_URL not set — skipping");
@@ -428,7 +432,7 @@ async fn multi_statement_query_does_not_desync_the_pooled_backend() {
 /// rule never strands bytes: get it wrong and the client waits forever for the
 /// tail of the result set.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires PG_TEST_URL — nightly CI only"]
+#[ignore = "requires PG_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn large_result_set_streams_through_the_single_backend_path() {
     let Some(url) = pg_url() else {
         println!("PG_TEST_URL not set — skipping");

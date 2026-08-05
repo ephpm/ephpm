@@ -1,0 +1,302 @@
+# ephpm-db integration tests against real databases.
+#
+# Why this workflow exists (issue #238)
+# -------------------------------------
+# `crates/ephpm-db/tests/{proxy,pg_proxy}_integration.rs` and friends are
+# `#[ignore]`d and read a `*_TEST_URL` env var. Nothing in this repo ever set
+# one, and no workflow used `services:` at all, so the entire suite skipped and
+# reported green. That is how issue #234 shipped: the MySQL proxy could not
+# authenticate to a *default-configured* MySQL 8, and the suite that nominally
+# covers the proxy could not have caught it. A benchmark found it instead.
+#
+# Why a separate workflow rather than a job in ci.yml
+# ---------------------------------------------------
+# This job pulls and boots three database servers and builds+runs the ephpm-db
+# test binaries. The self-hosted fleet is small and heavily contended, and
+# ci.yml already dispatches five jobs on every push. Paying that on PRs that
+# cannot possibly affect the proxy is a real cost to everyone's queue time.
+#
+# So: path-filtered on the code that can break these tests, plus an
+# unconditional daily run of `main` so coverage does not depend on the path
+# filter being complete. If this ever becomes a required check, note the
+# skipped-required-check trap — a path-filtered workflow reports "expected"
+# forever on PRs it does not run for.
+#
+# Why the databases are started explicitly instead of with `services:`
+# --------------------------------------------------------------------
+# See the `probe-services` job below, which measures rather than assumes.
+# Explicit `docker run` is the shape the smoke-tests job in nightly.yml already
+# uses on this fleet, and it lets us resolve the reachable address at runtime
+# (see `Resolve database endpoints`) instead of hard-coding 127.0.0.1, which
+# only holds for one of the runner shapes in the fleet.
+
+name: DB Integration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/ephpm-db/**"
+      - "crates/ephpm-query-stats/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/db-integration.yml"
+  pull_request:
+    branches: [main, "feat/**"]
+    paths:
+      - "crates/ephpm-db/**"
+      - "crates/ephpm-query-stats/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/db-integration.yml"
+  # Unconditional daily coverage of main, so a break that arrives through a
+  # path not listed above (a base-image change, a transitive dependency) still
+  # surfaces within a day.
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Credentials for throwaway loopback containers that live for the duration of
+  # one job. Not secrets.
+  MYSQL_PW: ephpm-test
+  PG_PW: ephpm-test
+
+jobs:
+  db-integration:
+    name: ephpm-db against real databases
+    runs-on: [self-hosted, linux, x64]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build prerequisites
+        # Same resolver as ci.yml: some runners in the fleet come up as root
+        # without `sudo`, so a bare `sudo apt-get` exits 127 and reds the job in
+        # seconds for reasons unrelated to the change under test.
+        run: |
+          set -eu
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "apt-get unavailable; assuming the image already provides build prerequisites"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "::error::not running as root and sudo is unavailable"
+            exit 1
+          fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config libssl-dev
+
+      - name: Resolve container runtime
+        run: |
+          set -eu
+          if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            RUNTIME=docker
+          elif command -v podman >/dev/null 2>&1; then
+            RUNTIME=podman
+          else
+            echo "::error::neither docker nor podman is usable on this runner; cannot start test databases"
+            exit 1
+          fi
+          echo "RUNTIME=$RUNTIME" >> "$GITHUB_ENV"
+          echo "using $RUNTIME"
+          $RUNTIME --version
+
+      - name: Start databases
+        run: |
+          set -eu
+          # Unique names so two concurrent runs on the same host do not collide,
+          # and an OS-assigned host port for the same reason (`-p 127.0.0.1::N`).
+          SUFFIX="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "DB_SUFFIX=$SUFFIX" >> "$GITHUB_ENV"
+
+          # MySQL 8 with DEFAULT authentication. Do NOT add
+          # --default-authentication-plugin=mysql_native_password and do NOT
+          # `ALTER USER ... IDENTIFIED WITH mysql_native_password` anywhere in
+          # this job: caching_sha2_password is the plugin the proxy must handle,
+          # and downgrading it is precisely the workaround that hid #234.
+          $RUNTIME run -d --name "ephpm-mysql-$SUFFIX" \
+            -e MYSQL_ROOT_PASSWORD="$MYSQL_PW" \
+            -e MYSQL_DATABASE=test \
+            -p 127.0.0.1::3306 \
+            docker.io/library/mysql:8.0
+
+          # A SECOND, pristine MySQL for the caching_sha2 full-auth tests.
+          # Those tests create/drop accounts and call FLUSH PRIVILEGES, which
+          # empties the server's password cache — running them against the same
+          # server as the general proxy tests would perturb the auth state those
+          # tests run under. Keeping it separate also guarantees the server this
+          # suite exercises full auth against is cache-cold by construction.
+          $RUNTIME run -d --name "ephpm-mysql-sha2-$SUFFIX" \
+            -e MYSQL_ROOT_PASSWORD="$MYSQL_PW" \
+            -e MYSQL_DATABASE=test \
+            -p 127.0.0.1::3306 \
+            docker.io/library/mysql:8.0
+
+          # PostgreSQL 17 — defaults to scram-sha-256, the path
+          # pg_proxy_integration's handshake tests care about.
+          $RUNTIME run -d --name "ephpm-pg-$SUFFIX" \
+            -e POSTGRES_PASSWORD="$PG_PW" \
+            -e POSTGRES_DB=test \
+            -p 127.0.0.1::5432 \
+            docker.io/library/postgres:17
+
+      - name: Resolve database endpoints
+        # Do not assume 127.0.0.1 reaches a published port. Two runner shapes
+        # exist in this fleet: a host-process runner (published ports land in
+        # the runner's own netns, 127.0.0.1 works) and a containerised runner
+        # talking to the host's docker socket (published ports land on the
+        # host; the container's bridge IP is what is reachable). Probe both and
+        # use whichever answers, rather than encoding one shape.
+        run: |
+          set -eu
+
+          probe() {  # probe HOST PORT -> 0 if a TCP connect succeeds
+            timeout 2 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null
+          }
+
+          resolve() {  # resolve CONTAINER INTERNAL_PORT -> "host:port" on stdout
+            local c="$1" internal="$2"
+            local hostport ip
+            hostport="$($RUNTIME port "$c" "$internal/tcp" 2>/dev/null | head -1 | sed 's/.*://')"
+            ip="$($RUNTIME inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$c" 2>/dev/null | head -1)"
+            for _ in $(seq 1 120); do
+              if [ -n "$hostport" ] && probe 127.0.0.1 "$hostport"; then
+                echo "127.0.0.1:$hostport"; return 0
+              fi
+              if [ -n "$ip" ] && probe "$ip" "$internal"; then
+                echo "$ip:$internal"; return 0
+              fi
+              sleep 2
+            done
+            echo "::error::no reachable endpoint for $c (tried 127.0.0.1:$hostport and $ip:$internal)" >&2
+            $RUNTIME logs "$c" 2>&1 | tail -50 >&2
+            return 1
+          }
+
+          MYSQL_EP="$(resolve "ephpm-mysql-$DB_SUFFIX" 3306)"
+          MYSQL_SHA2_EP="$(resolve "ephpm-mysql-sha2-$DB_SUFFIX" 3306)"
+          PG_EP="$(resolve "ephpm-pg-$DB_SUFFIX" 5432)"
+
+          echo "MYSQL_EP=$MYSQL_EP"     >> "$GITHUB_ENV"
+          echo "MYSQL_SHA2_EP=$MYSQL_SHA2_EP" >> "$GITHUB_ENV"
+          echo "PG_EP=$PG_EP"           >> "$GITHUB_ENV"
+          echo "resolved: mysql=$MYSQL_EP mysql-sha2=$MYSQL_SHA2_EP pg=$PG_EP"
+
+      - name: Wait for databases to accept queries
+        # A TCP-reachable MySQL is not a ready MySQL: the official image binds a
+        # temporary server during initdb. Wait on the real one.
+        run: |
+          set -eu
+
+          wait_mysql() {
+            local c="$1"
+            for _ in $(seq 1 150); do
+              # Connects to 127.0.0.1 *inside* the container, which MySQL
+              # matches as 'root'@'localhost' — a different account from the
+              # 'root'@'%' the proxy authenticates as, so this does not warm the
+              # caching_sha2 password cache for the account under test.
+              if $RUNTIME exec "$c" mysqladmin ping \
+                   -h 127.0.0.1 --protocol=tcp --get-server-public-key \
+                   -uroot -p"$MYSQL_PW" --silent >/dev/null 2>&1; then
+                echo "$c ready"; return 0
+              fi
+              sleep 2
+            done
+            echo "::error::$c never became ready"
+            $RUNTIME logs "$c" 2>&1 | tail -80
+            return 1
+          }
+
+          wait_pg() {
+            local c="$1"
+            for _ in $(seq 1 60); do
+              if $RUNTIME exec "$c" pg_isready -U postgres -d test >/dev/null 2>&1; then
+                echo "$c ready"; return 0
+              fi
+              sleep 2
+            done
+            echo "::error::$c never became ready"
+            $RUNTIME logs "$c" 2>&1 | tail -80
+            return 1
+          }
+
+          wait_mysql "ephpm-mysql-$DB_SUFFIX"
+          wait_mysql "ephpm-mysql-sha2-$DB_SUFFIX"
+          wait_pg "ephpm-pg-$DB_SUFFIX"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+
+      - name: Run ephpm-db integration tests
+        env:
+          # Turns "URL unset" from a skip into a failure inside
+          # crates/ephpm-db/tests/common/mod.rs. Every name listed in
+          # common::REQUIRED_DB_URL_VARS must be exported below, or
+          # tests/db_env_guard.rs fails the job.
+          EPHPM_REQUIRE_DB_TESTS: "1"
+        run: |
+          set -eu
+          export MYSQL_TEST_URL="mysql://root:${MYSQL_PW}@${MYSQL_EP}/test"
+          export MYSQL_SHA2_TEST_URL="mysql://root:${MYSQL_PW}@${MYSQL_SHA2_EP}/mysql"
+          export PG_TEST_URL="postgres://postgres:${PG_PW}@${PG_EP}/test"
+          # `--run-ignored all` covers both the #[ignore]d database tests and
+          # the always-on guard test in the same binary set. `--no-fail-fast`
+          # so one red leg does not hide the state of the others.
+          cargo nextest run -p ephpm-db --run-ignored all --no-fail-fast
+
+      - name: Database logs
+        if: failure()
+        run: |
+          for c in "ephpm-mysql-$DB_SUFFIX" "ephpm-mysql-sha2-$DB_SUFFIX" "ephpm-pg-$DB_SUFFIX"; do
+            echo "===== $c ====="
+            $RUNTIME logs "$c" 2>&1 | tail -100 || true
+          done
+
+      - name: Tear down databases
+        if: always()
+        run: |
+          for c in "ephpm-mysql-$DB_SUFFIX" "ephpm-mysql-sha2-$DB_SUFFIX" "ephpm-pg-$DB_SUFFIX"; do
+            $RUNTIME rm -f "$c" >/dev/null 2>&1 || true
+          done
+
+  probe-services:
+    # TEMPORARY, informational. Issue #238 asked whether GitHub's `services:`
+    # key works on the self-hosted (ephemerd) fleet — no workflow in this repo
+    # has ever used it, so there was no evidence either way. This job answers it
+    # by measurement. It is continue-on-error so the answer cannot red a PR, and
+    # it is removed once the result is recorded in the PR description.
+    name: Probe (informational) — does `services:` work on this fleet
+    runs-on: [self-hosted, linux, x64]
+    continue-on-error: true
+    timeout-minutes: 10
+    services:
+      probe-pg:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: ephpm-test
+          POSTGRES_DB: test
+        ports:
+          - 5432/tcp
+    steps:
+      - name: Report what the runner gave us
+        run: |
+          echo "job.services.probe-pg.id      = ${{ job.services.probe-pg.id }}"
+          echo "job.services.probe-pg.ports  = ${{ toJSON(job.services.probe-pg.ports) }}"
+          PORT="${{ job.services.probe-pg.ports['5432'] }}"
+          if [ -z "$PORT" ]; then
+            echo "RESULT: services: did NOT provision a mapped port on this runner"
+            exit 1
+          fi
+          if timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$PORT"; then
+            echo "RESULT: services: WORKS — postgres reachable at 127.0.0.1:$PORT"
+          else
+            echo "RESULT: services: provisioned a port ($PORT) but it is NOT reachable at 127.0.0.1"
+            exit 1
+          fi
