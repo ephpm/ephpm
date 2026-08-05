@@ -77,12 +77,28 @@ const ISOLATED_DB_SUITES: &[&str] = &["sqlite", "sqlite_advanced", "rw_split", "
 /// cdylib, which every other suite must NOT have (the CORS module appends
 /// response headers to every PHP response, and `custom_headers`/`etag_cache`
 /// assert exact header sets).
-const ISOLATED_CONFIG_SUITES: &[&str] = &["opcache_invalidation", "rate_limit", "middleware"];
+///
+/// `worker_mode` needs `[php] mode = "worker"`, which is a WHOLE-SERVER switch
+/// (every request is served by the persistent worker pool, so the fpm docroot's
+/// scripts are unreachable) and hard-errors when combined with
+/// `[server] sites_dir`. It therefore gets its own node, its own docroot
+/// (`tests/worker-docroot`), and no sites_dir. Before this suite was wired up,
+/// nothing in the repo ever set `EPHPM_WORKER_URL`, so all of
+/// `crates/ephpm-e2e/tests/worker_mode.rs` self-skipped in every lane —
+/// worker mode had zero end-to-end coverage.
+const ISOLATED_CONFIG_SUITES: &[&str] =
+    &["opcache_invalidation", "rate_limit", "middleware", "worker_mode"];
 
 /// Suites that run single-threaded (a superset of the DB suites). Kept as a
 /// helper so `run_suite` can pick the right `--test-threads` value.
+///
+/// `worker_mode` is serial for a different reason than the DB suites: several
+/// of its tests deliberately kill a worker (`?__fatal=1`, `?__exit=1`) while
+/// another asserts that a workload recycled *no* worker, reading the
+/// `ephpm_worker_recycles_total` counter before and after. That counter is
+/// process-global, so a concurrent sibling test would make the assertion flap.
 fn suite_is_serial(name: &str) -> bool {
-    ISOLATED_DB_SUITES.contains(&name)
+    ISOLATED_DB_SUITES.contains(&name) || name == "worker_mode"
 }
 
 /// Whether a suite needs its own freshly-spawned, then-torn-down single node
@@ -135,6 +151,19 @@ pub fn run(args: &[String]) -> ExitCode {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: failed to canonicalize {}: {e}", docroot.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Worker mode is a whole-server switch, so its node serves a separate tree
+    // holding only the worker entrypoint (`worker_script` must resolve under
+    // document_root). Resolved eagerly so a missing fixture fails before any
+    // node is spawned.
+    let worker_docroot = root.join("tests").join("worker-docroot");
+    let worker_docroot = match worker_docroot.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: worker docroot {} unusable: {e}", worker_docroot.display());
             return ExitCode::FAILURE;
         }
     };
@@ -236,14 +265,16 @@ pub fn run(args: &[String]) -> ExitCode {
         );
         for (name, path) in &isolated_suites {
             let opts = SingleNodeOptions::for_suite(name, middleware_lib.as_deref());
-            let fixture = match SingleNodeSpawn::start(&ephpm_bin, &docroot, &scratch_root, &opts) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("error: failed to start fresh node for suite {name}: {e}");
-                    failed.push((*name).clone());
-                    continue;
-                }
-            };
+            let node_docroot = if opts.worker { &worker_docroot } else { &docroot };
+            let fixture =
+                match SingleNodeSpawn::start(&ephpm_bin, node_docroot, &scratch_root, &opts) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        eprintln!("error: failed to start fresh node for suite {name}: {e}");
+                        failed.push((*name).clone());
+                        continue;
+                    }
+                };
             let env = fixture.env(&php_version);
             let suite_failed = if run_suite(name, path, &env) {
                 Vec::new()
@@ -625,6 +656,7 @@ ini_overrides = [
     ["display_errors", "On"],
     ["error_reporting", "E_ALL"],
 ]
+{PHP_WORKER_BLOCK}
 
 [server.limits]
 max_connections = 100
@@ -736,6 +768,10 @@ struct SingleNodeOptions {
     /// to every PHP response, which other suites assert exact header sets
     /// against.
     middleware_lib: Option<PathBuf>,
+    /// Emit `[php] mode = "worker"` + `worker_script`. Only the `worker_mode`
+    /// suite; implies `with_sites_dir = false` (the combination hard-errors at
+    /// config load) and the `tests/worker-docroot` document root.
+    worker: bool,
 }
 
 impl SingleNodeOptions {
@@ -747,6 +783,7 @@ impl SingleNodeOptions {
             opcache_invalidation: false,
             tight_rate_limit: false,
             middleware_lib: None,
+            worker: false,
         }
     }
 
@@ -764,6 +801,18 @@ impl SingleNodeOptions {
                 opcache_invalidation: true,
                 tight_rate_limit: false,
                 middleware_lib: None,
+                worker: false,
+            },
+            // worker_mode: persistent worker pool over tests/worker-docroot.
+            // sites_dir MUST stay off — worker mode + sites_dir is rejected at
+            // config load, so the node would never start.
+            "worker_mode" => Self {
+                slug,
+                with_sites_dir: false,
+                opcache_invalidation: false,
+                tight_rate_limit: false,
+                middleware_lib: None,
+                worker: true,
             },
             // rate_limit: small bucket, on its own node. See
             // ISOLATED_CONFIG_SUITES for why this can't share the shared node.
@@ -773,6 +822,7 @@ impl SingleNodeOptions {
                 opcache_invalidation: false,
                 tight_rate_limit: true,
                 middleware_lib: None,
+                worker: false,
             },
             // middleware: mount the freshly built cors cdylib by explicit
             // path, exercising the dlopen lane in a real server.
@@ -782,6 +832,7 @@ impl SingleNodeOptions {
                 opcache_invalidation: false,
                 tight_rate_limit: false,
                 middleware_lib: middleware_lib.map(Path::to_path_buf),
+                worker: false,
             },
             // DB suites: fresh DB, but otherwise the same shape as the shared
             // node (sites_dir present is harmless; they don't use it).
@@ -791,6 +842,7 @@ impl SingleNodeOptions {
                 opcache_invalidation: false,
                 tight_rate_limit: false,
                 middleware_lib: None,
+                worker: false,
             },
         }
     }
@@ -819,6 +871,9 @@ struct SingleNodeSpawn {
     /// `EPHPM_MIDDLEWARE_LIB` so the suite can reuse the same artifact for
     /// its own spawns instead of re-deriving the build path.
     middleware_lib: Option<PathBuf>,
+    /// This node runs `[php] mode = "worker"`; `env()` additionally exports
+    /// `EPHPM_WORKER_URL`, which is what the `worker_mode` suite gates on.
+    worker: bool,
 }
 
 impl SingleNodeSpawn {
@@ -872,6 +927,16 @@ impl SingleNodeSpawn {
         // Only the rate_limit suite runs a bucket small enough to trip. Every
         // other node gets a budget large enough that the whole suite's traffic
         // never reaches it, which is what stops the spurious 429s.
+        // Worker mode: a small, fixed pool so `boot #B` ids stay bounded and
+        // the suite can tell "no worker was recycled" from "a worker rebooted".
+        // worker_max_requests is left generous on purpose — the recycle test
+        // asserts requests keep succeeding, not that a recycle happens.
+        let php_worker_block = if opts.worker {
+            "mode = \"worker\"\nworker_script = \"worker.php\"\nworker_count = 3\n\
+             worker_max_requests = 10000\nworker_boot_timeout = 60"
+        } else {
+            ""
+        };
         let limits_block = if opts.tight_rate_limit {
             "per_ip_rate = 500.0\nper_ip_burst = 100"
         } else {
@@ -905,6 +970,7 @@ impl SingleNodeSpawn {
             .replace("{OPCACHE_BLOCK}", &opcache_block)
             .replace("{MIDDLEWARE_BLOCK}", &middleware_block)
             .replace("{LIMITS_BLOCK}", limits_block)
+            .replace("{PHP_WORKER_BLOCK}", php_worker_block)
             .replace("{KV_SOCKET}", &escape_toml(&kv_socket))
             .replace("{DOCROOT}", &escape_toml(docroot));
 
@@ -928,7 +994,19 @@ impl SingleNodeSpawn {
             .stderr(Stdio::from(stderr_file))
             .spawn()?;
 
-        wait_for_health(http_port, Duration::from_secs(10))?;
+        // Worker mode has to boot the framework in every worker before the
+        // first request can be served, so it gets a longer readiness window.
+        let health_timeout =
+            if opts.worker { Duration::from_secs(60) } else { Duration::from_secs(10) };
+        wait_for_health(http_port, health_timeout)?;
+        if opts.worker {
+            // `/_ephpm/health` is pure liveness (200 as soon as the listener is
+            // up), so on a worker node it says nothing about whether any worker
+            // has finished booting the framework. Wait for a real request to be
+            // served before handing the node to the suite, otherwise the first
+            // test races the boot and sees a 504.
+            wait_for_worker(http_port, health_timeout)?;
+        }
         eprintln!("    single-node ephpm [{}] ready on 127.0.0.1:{http_port}", opts.slug);
 
         Ok(Self {
@@ -942,6 +1020,7 @@ impl SingleNodeSpawn {
             middleware_lib: opts.middleware_lib.clone(),
             stderr_log,
             stdout_log,
+            worker: opts.worker,
         })
     }
 
@@ -982,6 +1061,14 @@ impl SingleNodeSpawn {
         if let Some(lib) = &self.middleware_lib {
             env.push(("EPHPM_BINARY".to_string(), self.binary.to_string_lossy().into_owned()));
             env.push(("EPHPM_MIDDLEWARE_LIB".to_string(), lib.to_string_lossy().into_owned()));
+        }
+        // The worker_mode suite gates on EPHPM_WORKER_URL rather than EPHPM_URL
+        // precisely so it cannot be pointed at an fpm-mode node by accident.
+        if self.worker {
+            env.push((
+                "EPHPM_WORKER_URL".to_string(),
+                format!("http://127.0.0.1:{}", self.http_port),
+            ));
         }
         env
     }
@@ -1157,6 +1244,25 @@ fn wait_for_health(port: u16, timeout: Duration) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
         format!("ephpm on 127.0.0.1:{port} did not become healthy within {timeout:?}: {last_err}"),
+    ))
+}
+
+/// Wait until a worker-mode node actually serves a PHP request (not just the
+/// liveness probe). Proves at least one worker finished booting the framework.
+fn wait_for_worker(port: u16, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_err = String::from("no attempts made");
+    while Instant::now() < deadline {
+        match tcp_get(port, "/_xtask_worker_warmup") {
+            Ok(200) => return Ok(()),
+            Ok(status) => last_err = format!("worker request returned HTTP {status}"),
+            Err(e) => last_err = format!("connect error: {e}"),
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("no worker on 127.0.0.1:{port} served a request within {timeout:?}: {last_err}"),
     ))
 }
 

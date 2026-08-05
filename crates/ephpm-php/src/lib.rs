@@ -203,6 +203,13 @@ pub enum WorkerExit {
     /// mid-request, or a break out of the loop). The C layer synthesized the
     /// response from SAPI state and delivered it; the worker must be recycled.
     ScriptExit,
+    /// The in-flight request ended on a PHP fatal (uncaught `Throwable`,
+    /// `E_ERROR`, …). Like [`WorkerExit::ScriptExit`] the C layer already
+    /// synthesized and delivered the response — forced to 500 unless the
+    /// script had set an explicit status — so the caller must NOT send another
+    /// one; it differs only in that the worker died rather than chose to stop,
+    /// which is what the recycle-reason metric reports.
+    ScriptFatal,
     /// A fatal bailout unwound out of the framework. The caller must recycle
     /// the worker and fulfil any parked oneshot with a 500.
     Fatal,
@@ -808,6 +815,7 @@ impl PhpRuntime {
             Ok(match ret {
                 0 => WorkerExit::Clean,
                 1 => WorkerExit::ScriptExit,
+                2 => WorkerExit::ScriptFatal,
                 _ => WorkerExit::Fatal,
             })
         }

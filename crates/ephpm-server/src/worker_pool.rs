@@ -368,6 +368,20 @@ fn worker_main(
                 counter!("ephpm_worker_recycles_total", "reason" => "script_exit").increment(1);
                 tracing::debug!(worker_id, "worker script exited mid-request — recycling");
             }
+            Ok(ephpm_php::WorkerExit::ScriptFatal) => {
+                // The request died on a PHP fatal. The C layer synthesized the
+                // response (500 unless the script chose a status) and delivered
+                // it, so the oneshot is already fulfilled; the drain below is
+                // the same defensive path ScriptExit uses.
+                if let Some(sender) = ephpm_php::worker_bridge::take_pending_sender() {
+                    let _ = sender.send(WorkerResponse::internal_error());
+                }
+                counter!("ephpm_worker_recycles_total", "reason" => "fatal").increment(1);
+                tracing::warn!(
+                    worker_id,
+                    "worker request ended on a PHP fatal — 500 delivered, recycling"
+                );
+            }
             Ok(ephpm_php::WorkerExit::Fatal) => {
                 // Fatal bailout unwound past send_response. Fulfil the parked
                 // oneshot with a 500 so the in-flight request never hangs, then
