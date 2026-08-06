@@ -29,11 +29,23 @@
 # (see `Resolve database endpoints`) instead of hard-coding 127.0.0.1.
 #
 # The ephemerd runners do not expose a real dockerd — it is a containerd shim
-# (`pkg/dind` in the ephemerd repo). `run`/`exec`/`logs`/`inspect`/`rm` are all
-# implemented, but two behaviours differ from dockerd and both are load-bearing
-# here: a published port with an empty host port is silently dropped, and the
-# runner shares a CNI bridge with the containers it starts, so the container IP
-# is directly reachable. Both are handled explicitly below.
+# (`pkg/dind` in the ephemerd repo). `run`/`exec`/`inspect`/`rm` work, but three
+# behaviours differ from dockerd and all three are load-bearing here:
+#
+#   1. A published port with an empty host port is silently dropped, so
+#      `-p 127.0.0.1::3306` creates no forward at all. Host ports are explicit.
+#   2. Publishing is a userspace proxy that accepts on the runner side *before*
+#      dialling the container, so a successful TCP connect proves nothing about
+#      whether the database is up. Readiness has to be protocol-level.
+#   3. `docker logs` returns the stream un-multiplexed; against a non-TTY
+#      container the CLI rejects it with "unrecognized stream: 50". Containers
+#      are started with `-t` so the CLI does not try to demultiplex, which keeps
+#      the failure-diagnostics step useful. Nothing depends on logs otherwise.
+#
+# The proxy also dials the container from inside the runner's own network
+# namespace, which means the runner shares the containers' CNI bridge and can
+# reach `<container IP>:<internal port>` directly — the fallback in
+# `Resolve database endpoints`.
 
 name: DB Integration
 
@@ -139,7 +151,7 @@ jobs:
           # `ALTER USER ... IDENTIFIED WITH mysql_native_password` anywhere in
           # this job: caching_sha2_password is the plugin the proxy must handle,
           # and downgrading it is precisely the workaround that hid #234.
-          $RUNTIME run -d --name "ephpm-mysql-$SUFFIX" \
+          $RUNTIME run -d -t --name "ephpm-mysql-$SUFFIX" \
             -e MYSQL_ROOT_PASSWORD="$MYSQL_PW" \
             -e MYSQL_DATABASE=test \
             -p "127.0.0.1:$MYSQL_HOST_PORT:3306" \
@@ -151,7 +163,7 @@ jobs:
           # server as the general proxy tests would perturb the auth state those
           # tests run under. Keeping it separate also guarantees the server this
           # suite exercises full auth against is cache-cold by construction.
-          $RUNTIME run -d --name "ephpm-mysql-sha2-$SUFFIX" \
+          $RUNTIME run -d -t --name "ephpm-mysql-sha2-$SUFFIX" \
             -e MYSQL_ROOT_PASSWORD="$MYSQL_PW" \
             -e MYSQL_DATABASE=test \
             -p "127.0.0.1:$MYSQL_SHA2_HOST_PORT:3306" \
@@ -159,11 +171,20 @@ jobs:
 
           # PostgreSQL 17 — defaults to scram-sha-256, the path
           # pg_proxy_integration's handshake tests care about.
-          $RUNTIME run -d --name "ephpm-pg-$SUFFIX" \
+          $RUNTIME run -d -t --name "ephpm-pg-$SUFFIX" \
             -e POSTGRES_PASSWORD="$PG_PW" \
             -e POSTGRES_DB=test \
             -p "127.0.0.1:$PG_HOST_PORT:5432" \
             docker.io/library/postgres:17
+
+      # Toolchain setup sits between starting the databases and waiting on them
+      # on purpose: MySQL's initdb takes ~20-30s and this overlaps it. It also
+      # guarantees `cargo` exists before the guard-verification step, which runs
+      # with `if: always()` and would otherwise fail for the wrong reason when
+      # something upstream of it breaks.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
 
       - name: Resolve database endpoints
         # Do not assume the published port is how you reach the container.
@@ -217,30 +238,46 @@ jobs:
         run: |
           set -eu
 
-          wait_mysql() {
-            local c="$1"
-            # DO NOT use `mysqladmin ping -uroot -p...` here, however natural it
-            # looks. Measured on mysql:8.0.46: a single successful root
-            # authentication over the container's loopback is enough for the
-            # proxy's subsequent connect as 'root'@'%' to take the caching_sha2
-            # FAST path. The full-auth branch — the branch #234 lived in — then
-            # never executes, and the suite goes green while covering nothing.
-            # Verified both ways against a fresh container:
-            #   mysqladmin probe first  -> proxy connects, tests pass on broken main
-            #   log-marker probe only   -> "caching_sha2 full auth error", as it should
-            # So readiness here must not authenticate at all.
-            #
-            # The log marker is exact rather than heuristic: initdb's temporary
-            # server runs with networking disabled and logs `port: 0`; only the
-            # real server logs `port: 3306`.
+          # Readiness for MySQL is "the server sent us its handshake packet".
+          #
+          # DO NOT use `mysqladmin ping -uroot -p...` here, however natural it
+          # looks. Measured on mysql:8.0.46: a single successful root
+          # authentication over the container's loopback is enough for the
+          # proxy's subsequent connect as 'root'@'%' to take the caching_sha2
+          # FAST path. The full-auth branch — the branch #234 lived in — then
+          # never executes, and the suite goes green while covering nothing.
+          # Verified both ways against a fresh container:
+          #   mysqladmin probe first -> proxy connects, tests pass on broken main
+          #   probe that authenticates nothing -> "caching_sha2 full auth error"
+          # So readiness must not authenticate.
+          #
+          # It also cannot be a bare TCP connect. Publishing on this fleet is a
+          # userspace proxy that accepts immediately and only then dials the
+          # container, so a successful connect says nothing about mysqld. And it
+          # cannot read the container log: `docker logs` here returns the stream
+          # un-multiplexed and the CLI fails with "unrecognized stream: 50".
+          #
+          # The handshake packet is what is left, and it is exactly right: the
+          # server sends it unprompted on connect, before any authentication, and
+          # only the real server sends one — initdb's temporary server runs with
+          # networking disabled, so until it is replaced the proxy's dial fails
+          # and the connection closes with zero bytes.
+          mysql_banner() {  # mysql_banner HOST PORT -> 0 if a handshake arrived
+            local n
+            n=$(timeout 5 bash -c "exec 3<>/dev/tcp/$1/$2; head -c 16 <&3" 2>/dev/null | wc -c)
+            [ "${n:-0}" -gt 0 ]
+          }
+
+          wait_mysql() {  # wait_mysql LABEL HOST:PORT
+            local label="$1" host="${2%%:*}" port="${2##*:}"
             for _ in $(seq 1 150); do
-              if $RUNTIME logs "$c" 2>&1 | grep -q "ready for connections.*port: 3306"; then
-                echo "$c ready (no client authenticated against it)"; return 0
+              if mysql_banner "$host" "$port"; then
+                echo "$label ready (handshake received; nothing authenticated)"
+                return 0
               fi
               sleep 2
             done
-            echo "::error::$c never became ready"
-            $RUNTIME logs "$c" 2>&1 | tail -80
+            echo "::error::$label ($2) never sent a handshake"
             return 1
           }
 
@@ -257,13 +294,9 @@ jobs:
             return 1
           }
 
-          wait_mysql "ephpm-mysql-$DB_SUFFIX"
-          wait_mysql "ephpm-mysql-sha2-$DB_SUFFIX"
+          wait_mysql "ephpm-mysql-$DB_SUFFIX" "$MYSQL_EP"
+          wait_mysql "ephpm-mysql-sha2-$DB_SUFFIX" "$MYSQL_SHA2_EP"
           wait_pg "ephpm-pg-$DB_SUFFIX"
-
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
 
       - name: Run ephpm-db integration tests
         env:
