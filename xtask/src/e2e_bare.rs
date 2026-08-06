@@ -73,7 +73,11 @@ const ISOLATED_DB_SUITES: &[&str] = &["sqlite", "sqlite_advanced", "rw_split", "
 /// suites that never touch the limiter (observed repeatedly in the `kv` suite:
 /// `left: 429, right: 200`). It now gets its own node with a small bucket, so
 /// the shared node can run a generous one.
-const ISOLATED_CONFIG_SUITES: &[&str] = &["opcache_invalidation", "rate_limit"];
+/// `middleware` needs a `[[middleware]]` mount pointing at a freshly built
+/// cdylib, which every other suite must NOT have (the CORS module appends
+/// response headers to every PHP response, and `custom_headers`/`etag_cache`
+/// assert exact header sets).
+const ISOLATED_CONFIG_SUITES: &[&str] = &["opcache_invalidation", "rate_limit", "middleware"];
 
 /// Suites that run single-threaded (a superset of the DB suites). Kept as a
 /// helper so `run_suite` can pick the right `--test-threads` value.
@@ -199,6 +203,24 @@ pub fn run(args: &[String]) -> ExitCode {
 
     let mut failed: Vec<String> = Vec::new();
 
+    // The `middleware` suite mounts a real loadable module by path, so a
+    // cdylib has to exist before its node starts. Nothing else in the build
+    // produces one: `cargo xtask release` builds the `ephpm` binary only, and
+    // the shipped middleware crates' `cdylib` output comes exclusively from an
+    // explicit `cargo build -p <crate>`. Build it here, and only when that
+    // suite is actually selected, so `--tests basic` stays cheap.
+    let middleware_lib = if single_suites.iter().any(|(name, _)| name == "middleware") {
+        match build_middleware_cdylib() {
+            Some(path) => Some(path),
+            None => {
+                eprintln!("error: could not build the middleware cdylib for the e2e suite");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
     // Split the single-node suites into "isolated" (each needs its own fresh
     // node -- for DB state isolation or a bespoke config) and "shared" (all
     // run against one long-lived node). The isolated suites reuse the same
@@ -213,7 +235,7 @@ pub fn run(args: &[String]) -> ExitCode {
             isolated_suites.len()
         );
         for (name, path) in &isolated_suites {
-            let opts = SingleNodeOptions::for_suite(name);
+            let opts = SingleNodeOptions::for_suite(name, middleware_lib.as_deref());
             let fixture = match SingleNodeSpawn::start(&ephpm_bin, &docroot, &scratch_root, &opts) {
                 Ok(f) => f,
                 Err(e) => {
@@ -389,6 +411,59 @@ fn resolve_ephpm_binary(args: &[String], php_version: &str) -> Option<PathBuf> {
     None
 }
 
+/// Build the shipped `ephpm-middleware-cors` cdylib and return its path.
+///
+/// This is the artifact the `middleware` suite mounts by path, and it is the
+/// whole point of that suite: it proves the dlopen lane works with a module
+/// built exactly the way the docs tell operators to build one — not with a
+/// purpose-made test fixture.
+///
+/// Built with the same `--release --target <triple>` shape as
+/// `crate::release()` so it shares that build's dependency artifacts; the
+/// alternative (a bare `--release`) would recompile the dependency graph into
+/// a second output directory for no benefit.
+fn build_middleware_cdylib() -> Option<PathBuf> {
+    let host_target = if cfg!(target_os = "macos") {
+        format!("{}-apple-darwin", std::env::consts::ARCH)
+    } else {
+        format!("{}-unknown-linux-gnu", std::env::consts::ARCH)
+    };
+
+    eprintln!("==> Building middleware cdylib (ephpm-middleware-cors, release)...");
+    let status = Command::new("cargo")
+        .args([
+            "build",
+            "--release",
+            "--package",
+            "ephpm-middleware-cors",
+            "--target",
+            &host_target,
+        ])
+        .current_dir(workspace_root())
+        .status();
+    if !matches!(&status, Ok(s) if s.success()) {
+        eprintln!("error: cargo build -p ephpm-middleware-cors failed");
+        return None;
+    }
+
+    let file = format!(
+        "{}ephpm_middleware_cors.{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_EXTENSION
+    );
+    // Honour CARGO_TARGET_DIR: containerised runs mount a shared target volume
+    // outside the checkout, where `<root>/target` does not exist at all.
+    let target_root = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace_root().join("target"), PathBuf::from);
+    let path = target_root.join(&host_target).join("release").join(&file);
+    if !path.is_file() {
+        eprintln!("error: middleware cdylib not found at {}", path.display());
+        return None;
+    }
+    eprintln!("    middleware cdylib ready: {}", path.display());
+    Some(path)
+}
+
 /// Enumerate `<deps>/<suite>-<hash>[.exe]`, keeping only the newest binary per
 /// suite name.
 fn discover_test_binaries(deps: &Path) -> io::Result<Vec<(String, PathBuf)>> {
@@ -469,7 +544,9 @@ fn recreate_dir(path: &Path) -> io::Result<()> {
 /// Single-node ephpm.toml template. Placeholders: `{HTTP_PORT}`, `{MYSQL_PORT}`,
 /// `{HRANA_PORT}`, `{PG_PORT}`, `{TDS_PORT}`, `{DATA_DIR}`, `{DOCROOT}`,
 /// `{SITES_DIR_LINE}` (the whole `sites_dir = "..."` line, or empty),
-/// `{OPCACHE_BLOCK}` (an optional `[opcache]` section, or empty), `{KV_SOCKET}`.
+/// `{OPCACHE_BLOCK}` (an optional `[opcache]` section, or empty),
+/// `{MIDDLEWARE_BLOCK}` (an optional `[[middleware]]` mount, or empty),
+/// `{KV_SOCKET}`.
 ///
 /// Shape mirrors `tests/ephpm-test.toml` (the config baked into the container
 /// image) as closely as possible. The only intentional divergences are:
@@ -579,6 +656,7 @@ eviction_policy = "allkeys-lru"
 enabled = true
 socket = "{KV_SOCKET}"
 {OPCACHE_BLOCK}
+{MIDDLEWARE_BLOCK}
 "#;
 
 /// Cluster node template. Placeholders: `{HTTP_PORT}`, `{MYSQL_PORT}`,
@@ -653,6 +731,11 @@ struct SingleNodeOptions {
     /// `rate_limit` suite wants this; every other node gets a generous one so
     /// the limiter never fires in suites that aren't testing it.
     tight_rate_limit: bool,
+    /// Mount this shared library as a `[[middleware]]` entry. Only the
+    /// `middleware` suite sets it — the CORS module appends response headers
+    /// to every PHP response, which other suites assert exact header sets
+    /// against.
+    middleware_lib: Option<PathBuf>,
 }
 
 impl SingleNodeOptions {
@@ -663,11 +746,14 @@ impl SingleNodeOptions {
             with_sites_dir: true,
             opcache_invalidation: false,
             tight_rate_limit: false,
+            middleware_lib: None,
         }
     }
 
-    /// Options tailored to a specific isolated suite.
-    fn for_suite(name: &str) -> Self {
+    /// Options tailored to a specific isolated suite. `middleware_lib` is the
+    /// cdylib built by [`build_middleware_cdylib`], present only when the
+    /// `middleware` suite was selected.
+    fn for_suite(name: &str, middleware_lib: Option<&Path>) -> Self {
         let slug = format!("single-{name}");
         match name {
             // opcache_invalidation: enable the watcher, drop sites_dir so the
@@ -677,6 +763,7 @@ impl SingleNodeOptions {
                 with_sites_dir: false,
                 opcache_invalidation: true,
                 tight_rate_limit: false,
+                middleware_lib: None,
             },
             // rate_limit: small bucket, on its own node. See
             // ISOLATED_CONFIG_SUITES for why this can't share the shared node.
@@ -685,6 +772,16 @@ impl SingleNodeOptions {
                 with_sites_dir: true,
                 opcache_invalidation: false,
                 tight_rate_limit: true,
+                middleware_lib: None,
+            },
+            // middleware: mount the freshly built cors cdylib by explicit
+            // path, exercising the dlopen lane in a real server.
+            "middleware" => Self {
+                slug,
+                with_sites_dir: true,
+                opcache_invalidation: false,
+                tight_rate_limit: false,
+                middleware_lib: middleware_lib.map(Path::to_path_buf),
             },
             // DB suites: fresh DB, but otherwise the same shape as the shared
             // node (sites_dir present is harmless; they don't use it).
@@ -693,6 +790,7 @@ impl SingleNodeOptions {
                 with_sites_dir: true,
                 opcache_invalidation: false,
                 tight_rate_limit: false,
+                middleware_lib: None,
             },
         }
     }
@@ -711,6 +809,16 @@ struct SingleNodeSpawn {
     label: String,
     stderr_log: PathBuf,
     stdout_log: PathBuf,
+    /// The ephpm binary this node was spawned from. Exported as
+    /// `EPHPM_BINARY` **only** when `middleware_lib` is set: the `middleware`
+    /// suite needs it to assert that a *bad* mount makes startup fail, which
+    /// cannot be observed from a node that is already up. Other suites must
+    /// not see it — see the note in [`SingleNodeSpawn::env`].
+    binary: PathBuf,
+    /// Loadable module mounted on this node, exported as
+    /// `EPHPM_MIDDLEWARE_LIB` so the suite can reuse the same artifact for
+    /// its own spawns instead of re-deriving the build path.
+    middleware_lib: Option<PathBuf>,
 }
 
 impl SingleNodeSpawn {
@@ -769,6 +877,22 @@ impl SingleNodeSpawn {
         } else {
             "per_ip_rate = 100000.0\nper_ip_burst = 20000"
         };
+        // Mount by EXPLICIT PATH on purpose: that is the dlopen lane's entry
+        // condition (`resolve_library` treats a value with a separator or an
+        // extension as a path), and a bare name like "cors" would silently
+        // resolve to the builtin static registry instead — testing nothing.
+        // `allow_origins` is a specific origin, not "*", so a request from an
+        // unlisted origin must come back with NO CORS headers; that is what
+        // distinguishes "the module ran and decided" from "something bolted
+        // headers on".
+        let middleware_block = match &opts.middleware_lib {
+            Some(lib) => format!(
+                "\n[[middleware]]\nlibrary = \"{}\"\norder = 10\n\
+                 config = {{ allow_origins = [\"https://allowed.e2e.test\"], max_age = 600 }}",
+                escape_toml(lib)
+            ),
+            None => String::new(),
+        };
 
         let config = SINGLE_NODE_TEMPLATE
             .replace("{HTTP_PORT}", &http_port.to_string())
@@ -779,6 +903,7 @@ impl SingleNodeSpawn {
             .replace("{DATA_DIR}", &escape_toml(&data_dir))
             .replace("{SITES_DIR_LINE}", &sites_dir_line)
             .replace("{OPCACHE_BLOCK}", &opcache_block)
+            .replace("{MIDDLEWARE_BLOCK}", &middleware_block)
             .replace("{LIMITS_BLOCK}", limits_block)
             .replace("{KV_SOCKET}", &escape_toml(&kv_socket))
             .replace("{DOCROOT}", &escape_toml(docroot));
@@ -813,6 +938,8 @@ impl SingleNodeSpawn {
             sites_dir,
             docroot: docroot.to_path_buf(),
             label: opts.slug.clone(),
+            binary: binary.to_path_buf(),
+            middleware_lib: opts.middleware_lib.clone(),
             stderr_log,
             stdout_log,
         })
@@ -836,6 +963,25 @@ impl SingleNodeSpawn {
         // Only set when this node actually has a sites_dir configured.
         if let Some(dir) = &self.sites_dir {
             env.push(("EPHPM_SITES_DIR".to_string(), dir.to_string_lossy().into_owned()));
+        }
+        // `EPHPM_BINARY` and `EPHPM_MIDDLEWARE_LIB` go ONLY to the node that
+        // has a middleware mount -- i.e. only the `middleware` suite, which
+        // spawns extra ephpm processes to assert that a broken `[[middleware]]`
+        // entry aborts startup.
+        //
+        // Do NOT hoist `EPHPM_BINARY` out of this branch and set it for every
+        // suite. `ephpm-e2e`'s self-managed fixtures treat it as an opt-in
+        // switch -- `bare_process_smoke` reads it and, when present, spawns its
+        // own 2-node cluster. Exporting it globally woke that suite up for the
+        // first time ever, and it failed immediately: it derives its docroot
+        // from `CARGO_MANIFEST_DIR`, which under `cargo xtask e2e` is *xtask's*
+        // manifest dir (the harness execs pre-built test binaries, which
+        // inherit xtask's environment), so it looked for `xtask/tests/docroot`.
+        // That suite is dormant *and* broken under this harness; un-dormanting
+        // it is separate work.
+        if let Some(lib) = &self.middleware_lib {
+            env.push(("EPHPM_BINARY".to_string(), self.binary.to_string_lossy().into_owned()));
+            env.push(("EPHPM_MIDDLEWARE_LIB".to_string(), lib.to_string_lossy().into_owned()));
         }
         env
     }
