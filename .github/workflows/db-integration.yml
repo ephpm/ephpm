@@ -24,9 +24,15 @@
 #
 # Why the databases are started explicitly instead of with `services:`
 # --------------------------------------------------------------------
-# Explicit `docker run` is the shape the smoke-tests job in nightly.yml already
-# uses on this fleet, and it lets us resolve the reachable address at runtime
-# (see `Resolve database endpoints`) instead of hard-coding 127.0.0.1.
+# Because `services:` does not work here — measured, not assumed. A throwaway
+# probe job on a linux/x64 runner (PR #244) showed the runner happily creating
+# the network and the service container and then announcing
+# "probepg service is healthy" — which is vacuous, since the shim's inspect
+# returns no Healthcheck key so the runner's health template renders empty.
+# Meanwhile `docker port <id>` returned `5432/tcp -> invalid IP:` and
+# `job.services.probepg.ports` came out `{}`. The service starts, reports
+# healthy, and there is no address to reach it on. That is a worse failure than
+# an outright error, and it is why this workflow starts containers itself.
 #
 # The ephemerd runners do not expose a real dockerd — it is a containerd shim
 # (`pkg/dind` in the ephemerd repo). `run`/`exec`/`inspect`/`rm` work, but three
@@ -373,40 +379,3 @@ jobs:
           for c in "ephpm-mysql-$DB_SUFFIX" "ephpm-mysql-sha2-$DB_SUFFIX" "ephpm-pg-$DB_SUFFIX"; do
             $RUNTIME rm -f "$c" >/dev/null 2>&1 || true
           done
-
-  probe-services:
-    # TEMPORARY, informational. Issue #238 asked whether GitHub's `services:`
-    # key works on the self-hosted (ephemerd) fleet — no workflow in this repo
-    # has ever used it, so there was no evidence either way. This job answers it
-    # by measurement. It is continue-on-error so the answer cannot red a PR, and
-    # it is removed once the result is recorded in the PR description.
-    name: Probe (informational) — does `services:` work on this fleet
-    runs-on: [self-hosted, linux, x64]
-    continue-on-error: true
-    timeout-minutes: 10
-    services:
-      # No hyphen in the service id: it appears in a GitHub expression path
-      # (`job.services.<id>`) where `-` parses as subtraction.
-      probepg:
-        image: postgres:17
-        env:
-          POSTGRES_PASSWORD: ephpm-test
-          POSTGRES_DB: test
-        ports:
-          - 5432/tcp
-    steps:
-      - name: Report what the runner gave us
-        run: |
-          echo "job.services.probepg.id     = ${{ job.services.probepg.id }}"
-          echo "job.services.probepg.ports  = ${{ toJSON(job.services.probepg.ports) }}"
-          PORT="${{ job.services.probepg.ports['5432'] }}"
-          if [ -z "$PORT" ]; then
-            echo "RESULT: services: did NOT provision a mapped port on this runner"
-            exit 1
-          fi
-          if timeout 5 bash -c "exec 3<>/dev/tcp/127.0.0.1/$PORT"; then
-            echo "RESULT: services: WORKS — postgres reachable at 127.0.0.1:$PORT"
-          else
-            echo "RESULT: services: provisioned a port ($PORT) but it is NOT reachable at 127.0.0.1"
-            exit 1
-          fi
