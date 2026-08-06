@@ -25,6 +25,30 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Canary for the release path's core assumption: the fleet can build and
+  # load Docker images WITHOUT privileged containers. release.yml's Docker
+  # legs use buildx with `driver: docker` (daemon-embedded BuildKit) because
+  # the default docker-container driver needs a --privileged BuildKit
+  # container, which ephemerd denies (dind.allow_privileged off) — that
+  # combination killed all three v0.6.1 Docker legs. release.yml only runs
+  # on tag push, so without this job the next release is the first test of
+  # any change to that assumption. ~30s.
+  docker-driver-smoke:
+    name: Docker build (unprivileged)
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Set up Docker Buildx (docker driver, no privileged container)
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
+
+      - name: Build through the daemon's BuildKit
+        run: |
+          dir="$(mktemp -d)"
+          printf 'FROM busybox\nRUN echo unprivileged-buildx-ok\n' > "$dir/Dockerfile"
+          docker buildx build --load -t mayfly-smoke:ci "$dir"
+          docker image rm mayfly-smoke:ci
+
   fmt:
     name: Format
     runs-on: [self-hosted, linux, x64]
