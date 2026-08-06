@@ -47,7 +47,9 @@ jobs:
           dir="$(mktemp -d)"
           printf 'FROM busybox\nRUN echo unprivileged-build-ok\n' > "$dir/Dockerfile"
           docker build -t mayfly-smoke:ci "$dir"
-          docker image rm mayfly-smoke:ci
+          # No `docker image rm`: the shim doesn't implement image deletion
+          # ("DELETE /images/... is not yet implemented"), and cleanup is
+          # moot anyway — JIT runners are single-use and discarded.
 
   fmt:
     name: Format
