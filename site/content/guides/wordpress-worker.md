@@ -107,6 +107,23 @@ requests and workers, and replicates across nodes in cluster mode. See the
 
 ## Limitations
 
+- **Block themes render, but their CSS is emitted only on the first request a
+  worker serves.** WordPress tracks what it has already printed in
+  worker-lifetime state — `$wp_styles` / `$wp_scripts` (`WP_Dependencies::$done`)
+  and the static `WP_Style_Engine_CSS_Rules_Store`. On a persistent worker those
+  survive the request, so the second and later requests print no
+  `<style>` blocks at all: measured on WordPress 6.7.1 with Twenty Twenty-Five,
+  the homepage drops from ~50 KB (21 inline stylesheets, including
+  `global-styles-inline-css` and `core-block-supports-inline-css`) to ~12 KB
+  with zero. `wp_unique_id()`'s counter also keeps climbing, so the generated
+  `wp-container-core-*-is-layout-N` classes drift away from the CSS that was
+  printed. Resetting those registries per request is the **adapter's** job, not
+  the engine's — until the adapter does it, serve block themes in fpm mode.
+  (The engine itself renders blocks fine: `do_blocks()`, nested template parts,
+  the Query loop, the Interactivity API and REST all survive a persistent
+  worker. This was previously reported as an engine crash in
+  [ephpm#116](https://github.com/ephpm/ephpm/issues/116); it no longer
+  reproduces.)
 - Worker mode is a whole-server switch; it is **not supported with
   `[server] sites_dir`** (config load hard-errors), so multi-tenant vhosting —
   including WordPress multisite behind vhosts — stays on fpm mode for now.

@@ -602,6 +602,21 @@ worker request `longjmp`s out of the framework handler. Three things must hold:
    `ephpm_worker_run` returns, and `WorkerPool` respawns a fresh worker with a
    clean boot. Cost: one framework re-boot per fatal. Correct: yes.
 
+**Not every fatal is a bailout.** The most common one in practice — a PHP 8
+uncaught `Throwable` — never reaches the `SETJMP` above: `zend_exception_error()`
+prints `Fatal error: Uncaught …` through `zend_error_va(… | E_DONT_BAIL …)`, and
+`php_execute_script`'s own `zend_try` swallows the bailout, so the script simply
+"returns" with the request still in flight and lands in the exit-synthesis branch
+alongside `exit()`/`die()`. That branch therefore checks
+`PG(last_error_type) & (E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR |
+E_RECOVERABLE_ERROR | E_PARSE)` and forces the synthesized status to 500 when the
+script did not choose one itself — the same override `ephpm_execute_request` has
+always applied on the fpm path. Without it the response carried the default 200
+with the fatal text as its body. `ephpm_worker_run` returns `2` for this case
+(`WorkerExit::ScriptFatal`), so the recycle is counted as `reason="fatal"` rather
+than `reason="script_exit"`; the response is already delivered, so the supervisor
+must not send another.
+
 ### 5.4 Detecting dead / hung workers; timeouts
 
 - **Hung request (infinite loop / blocked syscall in PHP).** SIGPROF-based

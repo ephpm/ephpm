@@ -2163,6 +2163,9 @@ void ephpm_worker_set_populate_superglobals(int enable)
  *    1  the script ended while a request was still in flight (exit()/die()
  *       mid-request — e.g. WordPress wp_die()/admin-ajax — or a loop break);
  *       the response was synthesized from SAPI state and delivered
+ *    2  same, but the request ended on a PHP fatal (uncaught Throwable /
+ *       E_ERROR). The synthesized response was forced to 500 unless the script
+ *       had already chosen a status
  *   -2  a fatal / zend_bailout unwound out of the framework (recycle + the
  *       Rust supervisor fulfils any parked oneshot with a 500)
  */
@@ -2226,7 +2229,32 @@ int ephpm_worker_run(const char *script)
             smart_str_0(&hbuf);
 
             int status = SG(sapi_headers).http_response_code;
-            g_worker_ops.send_response(status > 0 ? status : 200,
+            if (status <= 0) {
+                status = 200;
+            }
+
+            /* Fatal -> 500, mirroring the fpm path (:997-1002).
+             *
+             * A PHP 8 uncaught Throwable does NOT reach the SETJMP above:
+             * zend_exception_error() prints "Fatal error: Uncaught ..." via
+             * zend_error_va(... | E_DONT_BAIL ...) and php_execute_script's
+             * own zend_try swallows the bailout, so the script simply
+             * "returns" with a request still in flight and lands here. Without
+             * this check the synthesized response carries the DEFAULT 200 and
+             * ships the fatal-error text as a successful body — caches and
+             * uptime monitors then treat a crashed request as healthy.
+             *
+             * Only override when the script did not set an explicit status
+             * itself, so a deliberate exit() after http_response_code(201) (or
+             * a framework's own 500) keeps what it chose. Same mask as fpm. */
+            const int fatal_error_mask = E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR
+                                         | E_USER_ERROR | E_RECOVERABLE_ERROR | E_PARSE;
+            int hit_fatal = (PG(last_error_type) & fatal_error_mask) != 0;
+            if (hit_fatal && status == 200) {
+                status = 500;
+            }
+
+            g_worker_ops.send_response(status,
                                        hbuf.s ? ZSTR_VAL(hbuf.s) : "",
                                        hbuf.s ? ZSTR_LEN(hbuf.s) : 0,
                                        output_buf ? output_buf : "",
@@ -2234,7 +2262,10 @@ int ephpm_worker_run(const char *script)
             smart_str_free(&hbuf);
             output_len = 0;
             req_in_flight = 0;
-            result = 1;
+            /* 2 = the request died on a fatal (response synthesized as 500);
+             * 1 = the script deliberately exit()ed mid-request. Both deliver a
+             * response and both recycle; the distinction is observability. */
+            result = hit_fatal ? 2 : 1;
         }
     } else {
         /* zend_bailout() — a fatal unwound past the current iteration's

@@ -7,15 +7,21 @@
 //!
 //! Because worker mode is a whole-server switch, this needs a SEPARATE server
 //! instance from the default fpm docroot the other e2e tests use. The harness
-//! provides its base URL via `EPHPM_WORKER_URL`. Tests self-skip (pass) when
-//! that variable is unset, so they don't break fpm-only CI lanes — set it to
-//! opt in once the worker-mode deployment is wired into the E2E stack.
+//! provides its base URL via `EPHPM_WORKER_URL`. `cargo xtask e2e` spawns that
+//! node (`tests/worker-docroot`, `[php] mode = "worker"`, 3 workers) and
+//! exports the variable — see `xtask/src/e2e_bare.rs`. Tests still self-skip
+//! when it is unset so the suite can be run standalone against an existing
+//! deployment.
 //!
 //! Exit criteria covered:
 //! - boot-once: a boot counter that increments once per worker, not per request
 //! - concurrency: N workers serve N concurrent requests on Linux (ZTS)
 //! - fatal -> 500 + recycle + next request succeeds + server never wedges
 //! - worker_max_requests recycle
+//! - issue #116: a `do_blocks()`-shaped nested render never recycles a worker,
+//!   and renders byte-identically on every request of a worker's life
+//! - `exit()` mid-request delivers the request's output and leaves the server
+//!   serving
 //!
 //! The reference worker.php emits, per request:
 //!   hello <REQUEST_URI> (boot #<B>, request #<R>)
@@ -105,11 +111,10 @@ async fn concurrent_requests_all_succeed() {
 /// fatal returns 500, the worker recycles, and the NEXT request succeeds — the
 /// server never wedges.
 ///
-/// This drives a `fatal.php`-style path served by the same worker instance:
-/// the reference worker.php only says hello, so the harness's worker docroot
-/// must additionally route a "please fatal" trigger (e.g. `/__fatal`). If the
-/// deployed worker script does not support a fatal trigger, this test only
-/// asserts the server keeps serving after hammering it.
+/// The trigger is a query flag the worker script must honor. The harness's
+/// fixture (`tests/worker-docroot/worker.php`) routes `?__fatal=1` to an
+/// uncaught `Error`; a deployment whose script ignores the flag still gets the
+/// "server keeps serving" half of this test.
 #[tokio::test]
 async fn fatal_500s_then_recovers() {
     let Some(base) = worker_url() else {
@@ -120,11 +125,21 @@ async fn fatal_500s_then_recovers() {
     // Trigger a fatal (best-effort: depends on the deployed worker script
     // honoring a `?__fatal=1` query). Accept either a 500 (fatal handled) or a
     // 200 (script ignored the trigger) — but in NO case may the request hang.
-    let (fatal_status, _) = get(&base, "/trigger?__fatal=1").await;
+    let (fatal_status, fatal_body) = get(&base, "/trigger?__fatal=1").await;
     assert!(
         fatal_status == 500 || fatal_status == 200,
         "fatal trigger returned unexpected status {fatal_status}"
     );
+    // If the worker script honored the trigger, the request DIED — a response
+    // carrying PHP's fatal-error text must never be a 200. Worker mode used to
+    // ship exactly that (the synthesized response kept the default 200), so
+    // caches and uptime monitors saw a crashed request as healthy.
+    if fatal_body.contains("Fatal error") {
+        assert_eq!(
+            fatal_status, 500,
+            "a request that ended on a PHP fatal returned {fatal_status}, not 500: {fatal_body}"
+        );
+    }
 
     // The server must still serve normal requests afterwards.
     for i in 0..10 {
@@ -156,6 +171,149 @@ async fn requests_keep_succeeding_across_recycles() {
     }
 }
 
+/// Extract a `key=value` field from the fixture's blocks trailer comment
+/// (`<!-- blocks depth=3 len=… sha1=… boot=… request=… -->`).
+fn trailer_field<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("{key}=");
+    let start = body.rfind(&needle)? + needle.len();
+    let rest = &body[start..];
+    let end = rest.find(|c: char| c == ' ' || c == '\n').unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Total `ephpm_worker_recycles_total` across every `reason` label, scraped
+/// from `/metrics`.
+///
+/// This — not the worker script's own `boot #N` counter — is the reliable
+/// "did a worker die?" signal: under ZTS each worker thread gets its own PHP
+/// globals, so a per-worker `static $bootCount` reads 1 on every worker AND on
+/// every respawned replacement. Boot ids cannot tell a recycle from a sibling.
+async fn worker_recycles(base: &str) -> f64 {
+    let (status, body) = get(base, "/metrics").await;
+    assert_eq!(status, 200, "/metrics not available on the worker node: {body}");
+    body.lines()
+        // Skip the `# HELP` / `# TYPE` lines, which also carry the metric name.
+        .filter(|l| l.starts_with("ephpm_worker_recycles_total"))
+        .filter_map(|l| l.rsplit(' ').next())
+        .filter_map(|v| v.trim().parse::<f64>().ok())
+        .sum()
+}
+
+/// Issue #116 regression: a nested, output-buffered, recursive render — the
+/// shape WordPress' `do_blocks()` produces — must not take the resident worker
+/// down, and must render identically on every request of a worker's life.
+///
+/// The fixture route (`?__blocks=N`, `tests/worker-docroot/worker.php`)
+/// deliberately combines the three engine behaviours #116 implicated:
+/// userland recursion re-entering through internal functions
+/// (`preg_replace_callback`/`array_map`), a userland output buffer opened and
+/// closed at every nesting level, and a response big enough to grow the SAPI
+/// capture buffer through several reallocs — repeated on a worker that never
+/// runs `php_request_shutdown` between requests.
+///
+/// What this proves: the engine survives that workload and produces stable
+/// output across a worker's whole life. What it does NOT prove: that a real
+/// WordPress block theme renders correctly — WordPress' own per-request
+/// registries (`$wp_styles`/`$wp_scripts`, `WP_Style_Engine_CSS_Rules_Store`)
+/// are worker-lifetime state that only a framework adapter can reset, and no
+/// black-box test in this repo exercises them.
+#[tokio::test]
+async fn nested_block_render_never_recycles_the_worker() {
+    let Some(base) = worker_url() else {
+        eprintln!("EPHPM_WORKER_URL unset — skipping worker-mode block-render test");
+        return;
+    };
+
+    // Warm every worker, then take the recycle baseline. Other tests in this
+    // suite deliberately kill workers (fatal, exit), so the baseline must be
+    // read here rather than assumed to be zero.
+    for i in 0..30 {
+        let (status, body) = get(&base, &format!("/warm-{i}")).await;
+        assert_eq!(status, 200, "warmup request {i} failed: {body}");
+    }
+    let recycles_before = worker_recycles(&base).await;
+
+    // Render the nested workload many times over. A worker that dies mid-render
+    // shows up two ways: a non-200 (or a hang) here, or a bump in the recycle
+    // counter checked below.
+    let mut digest: Option<String> = None;
+    for i in 0..120 {
+        let (status, body) = get(&base, "/blocks?__blocks=4").await;
+        assert_eq!(status, 200, "block render {i} returned {status}: {body}");
+
+        let sha = trailer_field(&body, "sha1")
+            .unwrap_or_else(|| panic!("block render {i} produced no sha1 trailer: {body}"))
+            .to_string();
+        let len: usize = trailer_field(&body, "len")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| panic!("block render {i} produced no len trailer"));
+        // Guards against the workload being silently defanged (a fixture edit
+        // that drops the recursion depth would make the test pass vacuously).
+        assert!(len > 10_000, "block render {i} produced only {len} bytes — workload too small");
+
+        match &digest {
+            None => digest = Some(sha),
+            Some(first) => assert_eq!(
+                first, &sha,
+                "block render {i} differs from the first render — per-request state leaked \
+                 into the renderer"
+            ),
+        }
+    }
+
+    // The render must not have cost a single worker.
+    let recycles_after = worker_recycles(&base).await;
+    assert!(
+        recycles_after <= recycles_before,
+        "the nested block render recycled {} worker(s) (issue #116)",
+        recycles_after - recycles_before
+    );
+
+    // And the pool must still be serving normally.
+    for i in 0..30 {
+        let (status, body) = get(&base, &format!("/after-blocks-{i}")).await;
+        assert_eq!(status, 200, "post-render request {i} failed: {body}");
+        assert!(body.contains("hello /after-blocks-"), "post-render body wrong: {body}");
+    }
+}
+
+/// `exit()` mid-request must deliver that request's output — including bytes
+/// still sitting in a userland output buffer, which worker mode has no
+/// per-request RSHUTDOWN to flush — and must leave the server serving.
+///
+/// This is the second finding on issue #116. It pins the CURRENT contract:
+/// the response is synthesized from SAPI state and the pool recovers. It does
+/// not assert that the worker itself survives — today an `exit()` ends the
+/// worker's loop and the pool respawns it.
+#[tokio::test]
+async fn exit_mid_request_delivers_output_and_server_keeps_serving() {
+    let Some(base) = worker_url() else {
+        eprintln!("EPHPM_WORKER_URL unset — skipping worker-mode exit test");
+        return;
+    };
+
+    for round in 0..5 {
+        let (status, body) = get(&base, "/exit-route?__exit=1").await;
+        assert_eq!(status, 200, "exit round {round} returned {status}: {body}");
+        assert!(
+            body.contains("exit-route echoed"),
+            "exit round {round} lost the echoed output: {body}"
+        );
+        assert!(
+            body.contains("exit-route buffered"),
+            "exit round {round} lost output still held in a userland buffer — the engine did \
+             not flush it before synthesizing the response: {body}"
+        );
+
+        // The pool must keep serving immediately afterwards.
+        for i in 0..5 {
+            let (status, body) = get(&base, &format!("/after-exit-{round}-{i}")).await;
+            assert_eq!(status, 200, "request after exit wedged the server: {status} {body}");
+            assert!(body.contains("hello /after-exit-"), "post-exit body wrong: {body}");
+        }
+    }
+}
+
 /// Streaming round-trip (Phase 3): upload a large body and get the same bytes
 /// back. Proves `Envelope::bodyStream()` + `send_response_stream()` move the
 /// body without the worker buffering it whole. Requires a worker docroot whose
@@ -168,8 +326,7 @@ async fn requests_keep_succeeding_across_recycles() {
 /// black-box HTTP test cannot observe worker memory.
 #[tokio::test]
 async fn streaming_upload_echoes_back_identically() {
-    let Some(base) = std::env::var("EPHPM_WORKER_STREAM_URL").ok().filter(|s| !s.is_empty())
-    else {
+    let Some(base) = std::env::var("EPHPM_WORKER_STREAM_URL").ok().filter(|s| !s.is_empty()) else {
         eprintln!("EPHPM_WORKER_STREAM_URL unset — skipping worker-mode streaming test");
         return;
     };
