@@ -69,6 +69,39 @@ that the proxy records a narrower set of statements. See the
 | `ephpm_query_slow_total` | counter | — | Number of queries exceeding the slow query threshold. |
 | `ephpm_query_active_digests` | gauge | — | Number of unique query digests currently tracked. |
 
+### CDC Replication Metrics (experimental)
+
+Emitted only when the experimental CDC-native Turso replication path is running
+(`[db.sqlite] engine = "turso"` + clustering + `[db.sqlite.replication]
+cdc_experimental = true`). The full table — every series, its labels, and the
+PromQL to alert on — is in the
+[metrics reference](/reference/metrics/#cdc-native-turso-replication).
+
+The design decision worth knowing here is what "replication lag" means. Two
+positions are published: `ephpm_cdc_primary_head_change_id` (the primary's write
+head in its `turso_cdc` log) and `ephpm_cdc_applied_change_id` (the replica's
+applied watermark). `ephpm_cdc_replication_lag_changes` is the primary-local
+difference between the head and the slowest attached subscriber's shipped
+cursor.
+
+All three are counted in **`change_id`s — change-log rows, not seconds**. That is
+what the data supports: a seconds-valued lag needs a commit timestamp on the
+wire, and while `turso_cdc` records one (`change_time`), litewire's `CdcRow` does
+not carry it. Publishing a time-based lag would therefore require a litewire
+change plus a CDC wire-format change; inventing one from row counts would be
+worse than not having it, so the row lag is what ships and the unit is stated
+everywhere it appears.
+
+Two smaller consequences of that model:
+
+- The shipped cursor is the **minimum** across attached subscribers, so a single
+  caught-up replica cannot mask a lagging one, and it is **retained** after the
+  last subscriber detaches, so a primary that keeps taking writes after its
+  replica dies shows a growing lag rather than a frozen one.
+- The lag/head/shipped gauges are not pre-seeded at zero the way the counters
+  are. A node that has never replicated anything publishing `lag = 0` would read
+  as "fully caught up", which is the opposite of the truth.
+
 ---
 
 ## Histogram Buckets
@@ -81,6 +114,8 @@ Custom bucket configurations are tuned for PHP workloads:
 | `ephpm_php_execution_duration_seconds` | 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, 10s |
 | Body size histograms | 100B, 1KB, 10KB, 50KB, 100KB, 500KB, 1MB, 5MB, 10MB |
 | `ephpm_http_compression_ratio` | 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9 |
+| `ephpm_cdc_apply_duration_seconds` | 100µs, 500µs, 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 500ms, 1s, 5s |
+| `ephpm_cdc_snapshot_duration_seconds` | 10ms, 50ms, 100ms, 500ms, 1s, 2.5s, 5s, 10s, 30s, 60s, 120s, 300s |
 
 ---
 

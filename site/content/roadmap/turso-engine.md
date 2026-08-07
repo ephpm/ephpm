@@ -182,9 +182,24 @@ path is a **single ordered stream** with no schema-sync side channel.
   than the pinned revision's, and rejecting at decode time keeps the
   diagnostics legible (every failure past that point is reported "at
   change_id N", which an empty batch has no value for).
+- Prometheus instrumentation for the whole path — batches and rows
+  shipped and applied, subscriber count, the applied watermark, apply and
+  tail-poll errors, reconnects by outcome, snapshot bytes and outcome,
+  and a replication-lag gauge. Full table in the
+  [metrics reference](/reference/metrics/#cdc-native-turso-replication).
+  The lag is measured in **change-log rows, not seconds**; a time-based
+  lag is listed under "still deferred" below because it needs a wire
+  change, not a calculation.
 
 **Still deferred:**
 
+- A **time-based** replication lag. `ephpm_cdc_replication_lag_changes`
+  counts change-log rows, which answers "how far behind" but not "how
+  many seconds behind". A seconds-valued lag needs a commit timestamp
+  travelling with each change: `turso_cdc` stores one (`change_time`),
+  but litewire's `CdcRow` does not expose it, so this needs a litewire
+  PR adding the field plus a matching CDC wire-format change here. Not
+  fakeable from row counts, so nothing is published in the meantime.
 - Subscriber watermarks that survive a *primary change*. Resume works
   within one primary (the subscriber names its cursor); after a
   failover the new primary's `change_id` space is its own, so a

@@ -21,101 +21,33 @@
 //! rework was fundamentally about. The gossip-integrated election
 //! path still requires the full podman two-node bring-up (Phase 2.1
 //! deliverable).
+//!
+//! # Why there is no wire-format twin here any more
+//!
+//! This suite used to define its own `Frame`/`WireCdcRow` enums and its
+//! own serve/apply loops, on the reasoning that a black-box copy kept the
+//! test honest about the design. In practice it did the opposite: the
+//! copy could (and did) drift from `ephpm_server::turso_cdc`, and a test
+//! that re-implements the thing it is testing cannot catch a defect in
+//! the real implementation. It now drives the production
+//! [`ephpm_server::turso_cdc::serve_subscriber`] and
+//! [`ephpm_server::turso_cdc::run_replica`] directly, which is also what
+//! makes the instrumentation assertions in `turso_cdc_metrics_e2e.rs`
+//! meaningful — they observe metrics recorded by production code.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use ephpm_cluster::{
-    ChannelFeatureFlags, ChannelHandle, ChannelStream, IncomingStream, maybe_start_cluster_channel,
-    start_gossip,
+    ChannelFeatureFlags, ChannelHandle, IncomingStream, maybe_start_cluster_channel, start_gossip,
 };
 use ephpm_config::{ClusterChannelConfig, ClusterConfig};
+use ephpm_server::turso_cdc::{run_replica, serve_subscriber};
 use litewire::backend::{Backend, Value};
 use litewire::litewire_turso::Turso;
-use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, read_watermark};
-use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use litewire::litewire_turso::cdc::read_watermark;
 
 const CDC_STREAM_TYPE: &str = "cdc/default";
-const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
-
-// -- Wire format twin (kept inline so the test remains an honest
-//    black-box exercise of the design; the module-internal Frame is
-//    private).
-
-#[derive(Serialize, Deserialize)]
-enum Frame {
-    /// Replica → primary, first frame: the watermark to resume from.
-    Subscribe {
-        from_change_id: i64,
-    },
-    Batch {
-        rows: Vec<WireCdcRow>,
-    },
-    Ping,
-}
-
-#[derive(Serialize, Deserialize)]
-struct WireCdcRow {
-    change_id: i64,
-    change_txn_id: Option<i64>,
-    change_type: i64,
-    table_name: Option<String>,
-    id: Option<i64>,
-    before: Option<Vec<u8>>,
-    after: Option<Vec<u8>>,
-    updates: Option<Vec<u8>>,
-}
-
-impl From<&CdcRow> for WireCdcRow {
-    fn from(r: &CdcRow) -> Self {
-        Self {
-            change_id: r.change_id,
-            change_txn_id: r.change_txn_id,
-            change_type: r.change_type,
-            table_name: r.table_name.clone(),
-            id: r.id,
-            before: r.before.clone(),
-            after: r.after.clone(),
-            updates: r.updates.clone(),
-        }
-    }
-}
-
-impl From<WireCdcRow> for CdcRow {
-    fn from(w: WireCdcRow) -> Self {
-        Self {
-            change_id: w.change_id,
-            change_txn_id: w.change_txn_id,
-            change_type: w.change_type,
-            table_name: w.table_name,
-            id: w.id,
-            before: w.before,
-            after: w.after,
-            updates: w.updates,
-        }
-    }
-}
-
-async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, frame: &Frame) -> anyhow::Result<()> {
-    let json = serde_json::to_vec(frame)?;
-    let len = u32::try_from(json.len())?;
-    anyhow::ensure!(len <= MAX_FRAME_LEN);
-    w.write_all(&len.to_be_bytes()).await?;
-    w.write_all(&json).await?;
-    w.flush().await?;
-    Ok(())
-}
-
-async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> anyhow::Result<Frame> {
-    let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf);
-    anyhow::ensure!(len <= MAX_FRAME_LEN);
-    let mut body = vec![0u8; len as usize];
-    r.read_exact(&mut body).await?;
-    Ok(serde_json::from_slice(&body)?)
-}
 
 // -- Cluster channel bring-up on one loopback port. We start gossip
 //    so `maybe_start_cluster_channel` has a `ClusterHandle` to derive
@@ -156,13 +88,13 @@ fn pick_free_port() -> String {
     s.local_addr().unwrap().to_string()
 }
 
-/// Register the primary's `cdc/default` handler. Each inbound stream
-/// gets its own `CdcTailer` anchored at the watermark the subscriber
-/// announces — the production shape, and the thing that makes a
-/// reconnect resume instead of skip.
+/// Register the primary's `cdc/default` handler, dispatching each
+/// inbound stream into the **production** `serve_subscriber` — one
+/// `CdcTailer` per subscriber, anchored at the watermark that subscriber
+/// announces, which is what makes a reconnect resume instead of skip.
 ///
 /// Returns the primary's channel address (what a replica dials).
-async fn spawn_primary_on_channel(
+fn spawn_primary_on_channel(
     mgmt: Arc<Turso>,
     channel: &ChannelHandle,
 ) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
@@ -172,7 +104,7 @@ async fn spawn_primary_on_channel(
             let IncomingStream { stream, .. } = incoming;
             let mgmt = Arc::clone(&mgmt);
             tokio::spawn(async move {
-                if let Err(e) = serve_one_subscriber(stream, &mgmt).await {
+                if let Err(e) = serve_subscriber(stream, &mgmt).await {
                     eprintln!("serve subscriber: {e:#}");
                 }
             });
@@ -182,60 +114,16 @@ async fn spawn_primary_on_channel(
     (channel.listen_addr(), vec![dispatch])
 }
 
-async fn serve_one_subscriber(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Result<()> {
-    let from = match read_frame(&mut stream).await? {
-        Frame::Subscribe { from_change_id } => from_change_id,
-        _ => anyhow::bail!("expected Subscribe as the first frame"),
-    };
-    let mut tailer = CdcTailer::new(mgmt, from);
-    loop {
-        match tailer.poll_batch().await {
-            Ok(Some(batch)) => {
-                let frame =
-                    Frame::Batch { rows: batch.rows.iter().map(WireCdcRow::from).collect() };
-                write_frame(&mut stream, &frame).await?;
-            }
-            Ok(None) => tokio::time::sleep(Duration::from_millis(10)).await,
-            Err(e) => anyhow::bail!("tail poll: {e}"),
-        }
-    }
-}
-
-/// Spawn a replica: announce our watermark, then apply frames.
-async fn spawn_replica_on_channel(
+/// Spawn the **production** replica driver: dial, announce the local
+/// watermark, apply, retry.
+fn spawn_replica_on_channel(
     mgmt: Arc<Turso>,
     primary_addr: std::net::SocketAddr,
     channel: ChannelHandle,
 ) -> tokio::task::JoinHandle<()> {
-    let apply_conn = mgmt.raw_connection().unwrap();
     tokio::spawn(async move {
-        loop {
-            match channel.dial(primary_addr, CDC_STREAM_TYPE).await {
-                Ok(mut stream) => {
-                    let wm = read_watermark(&apply_conn).await.unwrap_or(0);
-                    let subscribed =
-                        write_frame(&mut stream, &Frame::Subscribe { from_change_id: wm }).await;
-                    if subscribed.is_ok() {
-                        loop {
-                            match read_frame(&mut stream).await {
-                                Ok(Frame::Batch { rows }) if !rows.is_empty() => {
-                                    let batch = TxnBatch {
-                                        rows: rows.into_iter().map(CdcRow::from).collect(),
-                                    };
-                                    if let Err(e) = apply_batch(&apply_conn, &batch).await {
-                                        eprintln!("apply_batch: {e:#}");
-                                        break;
-                                    }
-                                }
-                                Ok(_) => {}
-                                Err(_) => break,
-                            }
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
-                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
-            }
+        if let Err(e) = run_replica(mgmt, primary_addr, channel).await {
+            eprintln!("replica driver exited: {e:#}");
         }
     })
 }
@@ -293,9 +181,9 @@ async fn two_node_cdc_replicates_ddl_and_dml_end_to_end_via_channel() {
     let replica_mgmt = Arc::new(Turso::open(replica_file.path().to_str().unwrap()).await.unwrap());
 
     let (primary_addr, _primary_handles) =
-        spawn_primary_on_channel(Arc::clone(&primary_mgmt), &primary_channel).await;
+        spawn_primary_on_channel(Arc::clone(&primary_mgmt), &primary_channel);
     let _replica_handle =
-        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary_addr, replica_channel).await;
+        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary_addr, replica_channel);
 
     // Let the replica connect and complete the handshake.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -387,10 +275,10 @@ async fn replica_reconnect_via_channel_resumes_without_double_apply() {
     let replica_mgmt = Arc::new(Turso::open(replica_file.path().to_str().unwrap()).await.unwrap());
 
     let (primary_addr, _primary_handles) =
-        spawn_primary_on_channel(Arc::clone(&primary_mgmt), &primary_channel).await;
+        spawn_primary_on_channel(Arc::clone(&primary_mgmt), &primary_channel);
 
     let first_replica =
-        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary_addr, replica_channel_1).await;
+        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary_addr, replica_channel_1);
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -421,7 +309,7 @@ async fn replica_reconnect_via_channel_resumes_without_double_apply() {
     }
 
     let _second_replica =
-        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary_addr, replica_channel_2).await;
+        spawn_replica_on_channel(Arc::clone(&replica_mgmt), primary_addr, replica_channel_2);
 
     // ...and after it is back, one more.
     tokio::time::sleep(Duration::from_millis(300)).await;

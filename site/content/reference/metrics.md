@@ -119,6 +119,87 @@ These series are emitted by both the embedded SQLite paths and the MySQL/Postgre
 
 `ephpm_query_rows_total` is likewise narrower on the proxy paths, which report `0` where they cannot count rows rather than estimating: the default MySQL path has no row visibility at all, and the PostgreSQL path counts rows *returned* but not rows *affected* by a mutation. Statement coverage per path — including what the proxies deliberately do not record, such as prepared-statement executes and PostgreSQL extended-protocol traffic — is tabulated under [`[db.analysis]`](/reference/config/#dbanalysis) in the config reference.
 
+## CDC-native Turso replication
+
+These appear only when `[db.sqlite] engine = "turso"` is combined with
+clustering and `[db.sqlite.replication] cdc_experimental = true`. A
+deployment on sqld or single-node SQLite has no `ephpm_cdc_*` series at all.
+The whole path is **experimental** — see
+[Roadmap → Turso engine](/roadmap/turso-engine/).
+
+Every node registers both the primary-side and replica-side series at startup,
+zeroed, so an idle node is distinguishable from a build without the
+instrumentation. Which ones actually move depends on the elected role.
+
+### Primary (shipping) side
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_cdc_subscribers` | gauge | — | CDC subscriber streams currently attached to this node. Counted from the moment a stream sends its `Subscribe` frame until the stream ends for any reason. **This is the metric to alert on**: `0` on a primary means nothing is being replicated. |
+| `ephpm_cdc_batches_shipped_total` | counter | — | Committed transaction batches written into subscriber streams, summed across subscribers. Counted after the frame is on the wire, so a batch that failed to write is not counted. |
+| `ephpm_cdc_rows_shipped_total` | counter | — | `turso_cdc` rows contained in those batches. |
+| `ephpm_cdc_shipped_change_id` | gauge | — | The **lowest** `change_id` shipped across all attached subscribers — i.e. the slowest replica's position, so one caught-up replica cannot mask another that is far behind. Retained after the last subscriber detaches. Absent until the first subscriber ever attaches. |
+| `ephpm_cdc_primary_head_change_id` | gauge | — | `MAX(turso_cdc.change_id)` on this node: the write head of the change log. Sampled once a second while primary, and also advanced for free whenever a tailer runs dry. Monotonic. |
+| `ephpm_cdc_replication_lag_changes` | gauge | — | `primary_head_change_id - shipped_change_id`. **The headline replication-lag metric — see the unit warning below.** Clamped at `0`. Absent until the first subscriber ever attaches. |
+| `ephpm_cdc_tail_poll_errors_total` | counter | — | `turso_cdc` poll failures. The stream is dropped and the replica resumes from the same watermark, so this is a retry signal, not a data-loss signal. |
+| `ephpm_cdc_streams_refused_total` | counter | `stream` | Inbound streams refused because this node is not the elected primary — a peer is dialing a stale primary address. `stream` is `cdc` or `snapshot`. |
+| `ephpm_cdc_snapshots_served_total` | counter | `status` | Snapshot bootstraps served to cold replicas. `status` is `ok` or `error`. |
+| `ephpm_cdc_snapshot_bytes_served_total` | counter | — | Logical-dump bytes written to dialing replicas. Successful transfers only. |
+| `ephpm_cdc_snapshot_duration_seconds` | histogram | `role` | Snapshot transfer time. `role` is `serve` (primary produced and streamed the dump) or `fetch` (replica received and applied it). |
+
+### Replica (apply) side
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_cdc_batches_applied_total` | counter | — | CDC batches applied to the local database. A batch that failed to apply is **not** counted here; it appears in `ephpm_cdc_apply_errors_total`. |
+| `ephpm_cdc_rows_applied_total` | counter | — | `turso_cdc` rows applied. |
+| `ephpm_cdc_applied_change_id` | gauge | — | This replica's applied watermark, mirroring litewire's `__litewire_cdc_watermark` table. Published on subscribe, after a snapshot bootstrap, and after every applied batch — deliberately **not** advanced past a batch that failed to apply. |
+| `ephpm_cdc_apply_errors_total` | counter | — | `apply_batch` failures. The stream is failed and the watermark does not move; the replica reconnects and retries from the identical cursor. Any non-zero rate here means replication is stalled, not degraded. |
+| `ephpm_cdc_apply_duration_seconds` | histogram | — | Per-batch apply time on the replica. One batch is one replicated transaction. |
+| `ephpm_cdc_replica_connects_total` | counter | `outcome` | Subscribe attempts, one increment per attempt by terminal outcome: `closed` (primary closed the stream cleanly), `dial_error` (could not reach the primary), `stream_error` (connected, then the stream failed), `watermark_error` (could not read the local watermark). Reconnect rate is the sum across all four. |
+| `ephpm_cdc_bootstrap_total` | counter | `outcome` | Cold-start snapshot bootstrap decisions. `outcome` is `ok`, `skipped` (local database already populated) or `failed` (retry budget exhausted — startup aborts deliberately rather than serving incomplete data). |
+| `ephpm_cdc_snapshot_bytes_received_total` | counter | — | Logical-dump bytes received and successfully applied during bootstrap. |
+
+### What the lag metric means (and does not)
+
+`ephpm_cdc_replication_lag_changes` is a **row count, not a duration**. Both of
+its inputs are `change_id` values, and turso allocates one `change_id` per
+captured row change. A lag of `500` means five hundred row changes behind — which
+is sub-millisecond on an idle cluster and several minutes behind a bulk import.
+**Do not graph it with a seconds unit and do not alert on it as if it were one.**
+
+It is measured at the *ship* boundary — the moment a batch is written into the
+subscriber's stream — not at the *apply* boundary on the replica. It therefore
+excludes network flight time and the replica's apply cost. For true end-to-end
+lag, subtract across nodes:
+
+```promql
+# End-to-end replication lag, in change-log rows.
+max(ephpm_cdc_primary_head_change_id) - min(ephpm_cdc_applied_change_id)
+
+# Replication is not happening at all — the unambiguous alert.
+max(ephpm_cdc_subscribers) == 0
+
+# Replication is stalled on a failing apply (the watermark is not moving).
+rate(ephpm_cdc_apply_errors_total[5m]) > 0
+```
+
+There is deliberately **no seconds-valued lag metric**. Producing one requires a
+commit timestamp travelling with each change so the consumer can subtract it
+from its own clock. The `turso_cdc` table does store one (`change_time`), but
+litewire's `CdcRow` does not expose it, so surfacing a time-based lag needs a
+litewire change to carry `change_time` plus a matching CDC wire-format change —
+not an ePHPm-side calculation. Until both land, any "seconds behind" figure
+would be invented, so none is published.
+
+### Cardinality
+
+Every series above is either unlabelled or carries a label with a fixed, small
+set of values (`stream`: 2, `status`: 2, `role`: 2, `outcome`: 4 or 3). There are
+deliberately **no per-peer or per-address labels** — a label per replica would
+scale series count with cluster size and churn a new series on every pod
+replacement.
+
 ## Cardinality notes
 
 The per-metric `digest` label series is **capped** — by default at 1,000 distinct label values per process (`StatsConfig::metric_label_series_max`). Every additional distinct digest observed after the cap is exhausted has its Prometheus emissions folded into a single shared `digest="__other__"` bucket. Internal tracking (`top_queries()`, the digest table, the slow-query log) is **not** affected by this cap and still exposes the real normalized SQL — only the Prometheus label surface is bounded.
@@ -135,6 +216,8 @@ Buckets are custom per metric — configured with `Matcher::Full` rules in [`cra
 
 - Duration histograms (`ephpm_http_request_duration_seconds`, `ephpm_php_execution_duration_seconds`, `ephpm_worker_request_wait_seconds`): 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 seconds
 - `ephpm_worker_boot_duration_seconds`: 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30 seconds (framework boot can take seconds)
+- `ephpm_cdc_apply_duration_seconds`: 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1, 5 seconds (one replicated transaction; the healthy range is sub-millisecond, so the buckets start two decades lower than the HTTP ones)
+- `ephpm_cdc_snapshot_duration_seconds`: 0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300 seconds (a logical dump of a large database is minutes, and it blocks a cold replica's startup)
 - Body-size histograms (`ephpm_http_request_body_bytes`, `ephpm_http_response_body_bytes`, `ephpm_php_output_bytes`): 100 B, 1 KB, 10 KB, 50 KB, 100 KB, 500 KB, 1 MB, 5 MB, 10 MB
 - `ephpm_http_compression_ratio`: 0.05 through 0.9
 
