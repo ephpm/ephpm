@@ -256,6 +256,18 @@ jobs:
             -ArgumentList @("xtask","release","${{ inputs.php_minor }}","--target","windows","--no-sqld") `
             -NoNewWindow -PassThru
 
+          # Touch .Handle BEFORE the process exits. .NET can only report
+          # ExitCode if it still holds an open handle to the process; if the
+          # first access happens after exit, $proc.ExitCode is $null forever.
+          # Runs 31145743727 and 31148330870 both hit this: the build finished
+          # ("Finished `release` profile", ephpm.exe produced), printed
+          # "exit_code            = " with nothing after it, and then failed
+          # the job -- because $null -ne 0 is TRUE in PowerShell.
+          #
+          # That is worse than a cosmetic bug: it made a successful build and
+          # a genuinely failed one indistinguishable from the job status.
+          $null = $proc.Handle
+
           $maxSum = 0
           $maxOne = 0
           $maxOneName = ""
@@ -275,15 +287,31 @@ jobs:
             Start-Sleep -Milliseconds 500
           }
           $sw.Stop()
+          # Settles the exit code even if the handle trick above ever fails.
+          $proc.WaitForExit()
+          $exitCode = $proc.ExitCode
 
           Write-Host "=== RESULT ==="
           Write-Host ("wall_seconds         = {0:N0}" -f $sw.Elapsed.TotalSeconds)
           Write-Host ("max_sum_bytes        = {0}" -f $maxSum)
           Write-Host ("max_sum_gib          = {0:N2}" -f ($maxSum / 1GB))
           Write-Host ("max_single_proc_gib  = {0:N2}  ({1})" -f ($maxOne / 1GB), $maxOneName)
-          Write-Host ("exit_code            = {0}" -f $proc.ExitCode)
+          Write-Host ("exit_code            = {0}" -f $exitCode)
 
-          if ($proc.ExitCode -ne 0) {
-            Write-Error "build failed with exit code $($proc.ExitCode)"
-            exit $proc.ExitCode
+          # Independent confirmation that a build really happened, so an
+          # unreadable exit code can never again be mistaken for either
+          # outcome. The artifact is the ground truth.
+          $exe = "target\x86_64-pc-windows-msvc\release\ephpm.exe"
+          if (Test-Path $exe) {
+            Write-Host ("binary_bytes         = {0}" -f (Get-Item $exe).Length)
+          } else {
+            Write-Host "::error::$exe was not produced -- the build did not complete"
+            exit 1
+          }
+
+          if ($null -eq $exitCode) {
+            Write-Host "::warning::exit code unreadable; falling back to the artifact check above"
+          } elseif ($exitCode -ne 0) {
+            Write-Error "build failed with exit code $exitCode"
+            exit $exitCode
           }
