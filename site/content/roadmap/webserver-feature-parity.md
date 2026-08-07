@@ -84,7 +84,7 @@ How ephpm stacks up against the traditional servers PHP developers reach for. Ev
 | IP allow/deny lists | Require ip | allow/deny | remote_ip matcher | Not yet | path-based blocking is covered |
 | Regex `[[server.redirects]]` (301/302 from regex) | mod_rewrite `[R]` | rewrite ... permanent | redir | Not yet | SEO migrations / vanity URLs |
 | Regex `[[server.rewrites]]` with conditions | mod_rewrite `RewriteCond` | rewrite if blocks | rewrite matcher | Not yet | Beyond `server.fallback` |
-| HTTP/3 (QUIC) | Not supported | Experimental | Built-in | Not yet | Would need `quinn` integration |
+| HTTP/3 (QUIC) | Not supported | Experimental | Built-in | **Yes** | `quinn` + `h3`, opt-in via `[server.http3]`. Static TLS cert only — ACME not wired in yet |
 | Basic auth | mod_auth_basic | auth_basic | basic_auth | Not yet | Useful for staging gating |
 | Directory listing / autoindex | Options +Indexes | autoindex | file_server browse | Not yet | Largely replaced by S3-style buckets these days |
 | Zstd compression (HTTP responses) | N/A | N/A | Plugin | Not yet | KV store supports zstd; HTTP response negotiation does not |

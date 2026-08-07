@@ -87,6 +87,14 @@ ini_overrides = [
 # listen = "0.0.0.0:443"          # separate HTTPS port (omit to make server.listen HTTPS-only)
 # redirect_http = true             # 301 redirect HTTP → HTTPS (requires tls.listen)
 
+# HTTP/3 (QUIC). Runs on UDP alongside the TCP listeners - HTTP/1.1 and
+# HTTP/2 are unaffected. Requires a static [server.tls] cert+key above;
+# enabling it with ACME is a startup error, not a silent downgrade.
+# [server.http3]
+# enabled = true                   # default: false
+# listen = "0.0.0.0:443"           # omit to reuse the HTTPS address on UDP
+# alt_svc_max_age = 86400          # ma= in the Alt-Svc header; 0 disables it
+
 # ──────────────────────────────────────────────────────────
 # Database Proxy & Connection Pooling (planned)
 # ──────────────────────────────────────────────────────────

@@ -23,6 +23,30 @@ use tokio_rustls::TlsAcceptor;
 /// Returns an error if the files cannot be read, parsed, or if the cert/key
 /// pair is invalid.
 pub fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<TlsAcceptor> {
+    // Advertise HTTP/2 and HTTP/1.1 (preference order: h2 first).
+    // Clients that support h2 will negotiate it; others fall back to http/1.1.
+    let config = build_server_config(cert_path, key_path, &[b"h2".to_vec(), b"http/1.1".to_vec()])?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Build a [`rustls::ServerConfig`] from PEM cert/key files with the given
+/// ALPN protocol list.
+///
+/// Both transports go through this one function: the TCP listener asks for
+/// `["h2", "http/1.1"]`, the QUIC listener asks for `["h3"]`. Sharing it is
+/// what guarantees they agree on the crypto provider (see
+/// [`crypto_provider`]) — "HTTP/3 negotiated a different provider than HTTPS"
+/// is not representable.
+///
+/// # Errors
+///
+/// Returns an error if the files cannot be read or parsed, or if the
+/// cert/key pair is invalid.
+pub fn build_server_config(
+    cert_path: &Path,
+    key_path: &Path,
+    alpn: &[Vec<u8>],
+) -> anyhow::Result<ServerConfig> {
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
 
@@ -33,11 +57,9 @@ pub fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<T
         .with_single_cert(certs, key)
         .context("invalid TLS certificate/key pair")?;
 
-    // Advertise HTTP/2 and HTTP/1.1 (preference order: h2 first).
-    // Clients that support h2 will negotiate it; others fall back to http/1.1.
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    config.alpn_protocols = alpn.to_vec();
 
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    Ok(config)
 }
 
 /// The rustls crypto provider this server uses.
@@ -59,7 +81,9 @@ pub fn build_tls_acceptor(cert_path: &Path, key_path: &Path) -> anyhow::Result<T
 /// stack on a single provider is tracked in issue #241.
 ///
 /// The `OnceLock` means every config built here shares one `Arc`, so "the
-/// whole server uses one provider" is checkable by pointer identity.
+/// whole server uses one provider" is checkable by pointer identity — which
+/// is exactly how the HTTP/3 tests assert that QUIC and HTTPS-over-TCP did
+/// not diverge.
 fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     static PROVIDER: std::sync::OnceLock<Arc<rustls::crypto::CryptoProvider>> =
         std::sync::OnceLock::new();
@@ -76,7 +100,8 @@ fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
         .with_context(|| format!("failed to parse PEM certificates from {}", path.display()))?;
     // A PEM file with no CERTIFICATE block parses "successfully" into zero
     // certs; without this check the failure surfaces later as an opaque
-    // rustls error instead of naming the file.
+    // rustls error instead of naming the file (or, for QUIC, as a handshake
+    // that never completes).
     anyhow::ensure!(!certs.is_empty(), "no certificates found in {}", path.display());
     Ok(certs)
 }
@@ -93,24 +118,32 @@ fn load_private_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
         .ok_or_else(|| anyhow::anyhow!("no private key found in {}", path.display()))
 }
 
+/// Certificate fixtures shared by the TLS and HTTP/3 test modules.
+///
+/// HTTP/3 has to build its endpoint from the *same* cert-loading path the TCP
+/// listener uses, so its tests need the same fixtures; duplicating them would
+/// let the two drift.
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests_support {
+    use std::path::Path;
     use std::sync::Once;
-
-    use super::*;
 
     static CRYPTO_INIT: Once = Once::new();
 
-    fn init_crypto() {
+    /// Install the process-wide rustls crypto provider exactly once.
+    ///
+    /// Both `ring` and `aws-lc-rs` are compiled into this binary (the TLS pin
+    /// selects ring; `rustls-acme` pulls aws-lc-rs), so rustls refuses to pick
+    /// one implicitly in some configurations. Tests pin it explicitly and
+    /// ignore an `Err` — another test module may have won the race.
+    pub(crate) fn init_crypto() {
         CRYPTO_INIT.call_once(|| {
-            rustls::crypto::ring::default_provider()
-                .install_default()
-                .expect("install ring crypto provider");
+            let _ = rustls::crypto::ring::default_provider().install_default();
         });
     }
 
     /// Generate a self-signed RSA cert+key pair using rcgen.
-    fn generate_rsa_cert(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    pub(crate) fn generate_rsa_cert(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let cert_path = dir.join("cert.pem");
         let key_path = dir.join("key.pem");
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
@@ -124,7 +157,7 @@ mod tests {
     }
 
     /// Generate a self-signed EC (P-256) cert+key pair using rcgen.
-    fn generate_ec_cert(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    pub(crate) fn generate_ec_cert(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
         let cert_path = dir.join("ec-cert.pem");
         let key_path = dir.join("ec-key.pem");
         let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
@@ -136,6 +169,12 @@ mod tests {
         std::fs::write(&key_path, key_pair.serialize_pem()).expect("write EC key");
         (cert_path, key_path)
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tests_support::{generate_ec_cert, generate_rsa_cert, init_crypto};
+    use super::*;
 
     #[test]
     fn load_valid_rsa_cert_and_key() {

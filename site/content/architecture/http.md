@@ -244,6 +244,23 @@ TCP Accept → TLS Handshake (tokio-rustls) → HTTP/1.1 or HTTP/2 → Router
 - `is_tls` flag propagated to router so `$_SERVER['HTTPS']` is set correctly
 - When behind a trusted proxy, `X-Forwarded-Proto` takes precedence over native TLS status
 
+## HTTP/3 (QUIC)
+
+Opt-in via `[server.http3] enabled = true` (default off). HTTP/3 is **additive**: it binds a UDP socket next to the TCP listeners, which keep serving HTTP/1.1 and HTTP/2 unchanged. By default the UDP socket takes the same address and port as the HTTPS listener.
+
+```
+UDP Recv → QUIC handshake (quinn, TLS 1.3, ALPN "h3") → h3 session
+        → per-request stream → Router::handle → same pipeline as TCP
+```
+
+Design points:
+
+- **One pipeline, two transports.** `Router::handle` is generic over the request-body type (`RequestBody` in `router.rs`). The TCP path passes hyper's `Incoming`; HTTP/3 passes `http3::H3RequestBody`, an adapter over a QUIC receive stream. Everything downstream — vhost resolution, middleware, static files, `$_SERVER`, body limits, `ephpm_http_*` metrics — is shared code, not a parallel implementation. The TCP path monomorphizes to what it compiled to before, so there is no added runtime cost.
+- **One crypto provider.** The QUIC endpoint's `rustls::ServerConfig` is built by the same `tls::build_server_config` the TCP listener uses; only the ALPN list differs (`h3` vs `h2`/`http/1.1`). A unit test asserts both configs resolve the identical provider — two live rustls providers in one process is a runtime hazard.
+- **Discovery is via `Alt-Svc`.** Browsers speak TCP first and only try HTTP/3 after seeing `Alt-Svc: h3=":443"; ma=86400` on an HTTPS response. ePHPm adds that header to every TLS-terminated response (never to plain `http://`, which cannot upgrade), and only after the QUIC socket has actually bound.
+- **Static certificates only.** `quinn::ServerConfig` captures its crypto at endpoint-creation time, while `rustls-acme` rotates certificates mid-process. Enabling HTTP/3 with ACME is a **startup error** rather than a quiet fall back to TCP-only. ACME support is planned.
+- **Graceful shutdown.** The QUIC accept loop stops on the same shutdown signal and sends `CONNECTION_CLOSE`; in-flight HTTP/3 work is counted in the same in-flight gauge the TCP drain waits on.
+
 ### Automatic TLS (ACME)
 
 Zero-config HTTPS via Let's Encrypt, like Caddy. Uses `rustls-acme` crate with TLS-ALPN-01 challenge (works on port 443 alone, no port 80 needed).

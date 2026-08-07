@@ -21,7 +21,7 @@ use ephpm_php::request::PhpRequest;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use http_body_util::{BodyExt, Full};
-use hyper::body::{Bytes, Incoming};
+use hyper::body::Bytes;
 use hyper::{Request, Response, StatusCode};
 use ipnet::IpNet;
 
@@ -173,6 +173,31 @@ impl CompiledGlob {
     }
 }
 
+/// What the request pipeline needs from a request body, whatever transport
+/// produced it.
+///
+/// The TCP path supplies hyper's [`hyper::body::Incoming`]; HTTP/3 supplies
+/// [`crate::http3::H3RequestBody`]. Naming the bounds once — rather than
+/// hard-coding `Incoming` — is what lets HTTP/3 reuse [`Router::handle`]
+/// instead of growing a second request pipeline. The TCP path monomorphizes
+/// to exactly the code it had before, so this costs nothing at runtime.
+pub trait RequestBody:
+    hyper::body::Body<Data = Bytes, Error = Self::BodyError> + Send + Unpin + 'static
+{
+    /// The body's error type, re-stated so it can carry the bounds the
+    /// pipeline needs: `Display` for logging and the blanket
+    /// `Into<Box<dyn Error>>` that `http_body_util::Limited` requires.
+    type BodyError: std::error::Error + Send + Sync + 'static;
+}
+
+impl<B, E> RequestBody for B
+where
+    B: hyper::body::Body<Data = Bytes, Error = E> + Send + Unpin + 'static,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    type BodyError = E;
+}
+
 pub struct Router {
     document_root: PathBuf,
     sites: HashMap<String, SiteConfig>,
@@ -209,6 +234,13 @@ pub struct Router {
     /// invalid names or values are dropped at startup with a warning
     /// so we don't repeat the parse per response.
     response_headers: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)>,
+    /// Precomputed `Alt-Svc` value advertising the HTTP/3 endpoint, e.g.
+    /// `h3=":443"; ma=86400`.
+    ///
+    /// `None` when HTTP/3 is disabled or `alt_svc_max_age = 0`. This header is
+    /// the *only* way a browser learns HTTP/3 exists, so it goes on every
+    /// TLS-terminated response — see [`Router::apply_alt_svc`].
+    alt_svc: Option<hyper::header::HeaderValue>,
     store: Arc<Store>,
     /// Per-vhost KV stores. Cloned from the single instance `start_kv_service`
     /// builds and shares with the RESP listener, so a vhost's keyspace is the
@@ -602,6 +634,8 @@ impl Router {
                     }
                 })
                 .collect(),
+            // Filled in by `with_alt_svc` once the QUIC endpoint has bound.
+            alt_svc: None,
             open_basedir,
             multi_tenant_kv,
             store,
@@ -791,6 +825,45 @@ impl Router {
         self
     }
 
+    /// Advertise an HTTP/3 endpoint via `Alt-Svc` on TLS responses.
+    ///
+    /// Called by `serve()` **after** the QUIC endpoint has actually bound, so
+    /// ePHPm never advertises an HTTP/3 port that isn't listening — a stale
+    /// `Alt-Svc` costs clients a failed connection attempt and a fallback on
+    /// every request until `ma` expires.
+    ///
+    /// `port` is the UDP port the QUIC endpoint bound; `max_age` of 0
+    /// suppresses the header (see `[server.http3] alt_svc_max_age`).
+    #[must_use]
+    pub fn with_alt_svc(mut self, port: u16, max_age: u64) -> Self {
+        self.alt_svc = crate::http3::alt_svc_value(port, max_age).and_then(|value| {
+            match hyper::header::HeaderValue::from_str(&value) {
+                Ok(header) => Some(header),
+                Err(err) => {
+                    tracing::warn!(%err, %value, "computed Alt-Svc value is not a valid header");
+                    None
+                }
+            }
+        });
+        self
+    }
+
+    /// Add the `Alt-Svc` HTTP/3 advertisement to a response.
+    ///
+    /// Only TLS-terminated responses get it: an `http://` origin cannot
+    /// upgrade to HTTP/3 (QUIC mandates TLS), so advertising there would just
+    /// be noise. Responses served *over* HTTP/3 carry it too, matching nginx
+    /// and Caddy — it keeps the advertisement fresh for clients that later
+    /// fall back to TCP.
+    fn apply_alt_svc(&self, response: &mut Response<ServerBody>, is_tls: bool) {
+        if !is_tls {
+            return;
+        }
+        if let Some(value) = &self.alt_svc {
+            response.headers_mut().insert(hyper::header::ALT_SVC, value.clone());
+        }
+    }
+
     /// Override this node's `EPHPM_NODE_ID` (injected into PHP `$_SERVER`)
     /// with the effective runtime cluster identity.
     ///
@@ -975,12 +1048,15 @@ impl Router {
     /// # Panics
     ///
     /// Panics if a static HTTP response builder fails (should never happen).
-    pub async fn handle(
+    pub async fn handle<B>(
         &self,
-        req: Request<Incoming>,
+        req: Request<B>,
         remote_addr: SocketAddr,
         is_tls: bool,
-    ) -> Result<Response<ServerBody>, hyper::Error> {
+    ) -> Result<Response<ServerBody>, hyper::Error>
+    where
+        B: RequestBody,
+    {
         // Metrics label for the request method. Standard HTTP methods map to
         // a `&'static str` so the two metric sites below allocate nothing per
         // request (issue #136); non-standard methods collapse to `"OTHER"`,
@@ -1020,6 +1096,14 @@ impl Router {
 
         let elapsed = start.elapsed().as_secs_f64();
         gauge!("ephpm_http_requests_in_flight").decrement(1.0);
+
+        // Advertise HTTP/3 on every TLS response, including error and timeout
+        // paths — a client that only ever sees 404s should still discover h3.
+        let mut result = result;
+        if let Ok(ref mut resp) = result {
+            self.apply_alt_svc(resp, is_tls);
+        }
+
         if let Ok(ref resp) = result {
             // Map the status to a `&'static str` label. The `metrics` macros
             // require label values to be `'static` (they intern into
@@ -1050,12 +1134,15 @@ impl Router {
     ///
     /// Returns the response paired with a handler label for metrics.
     #[allow(clippy::too_many_lines)]
-    async fn handle_inner(
+    async fn handle_inner<B>(
         &self,
-        req: Request<Incoming>,
+        req: Request<B>,
         remote_addr: SocketAddr,
         is_tls: bool,
-    ) -> Result<(Response<ServerBody>, &'static str), hyper::Error> {
+    ) -> Result<(Response<ServerBody>, &'static str), hyper::Error>
+    where
+        B: RequestBody,
+    {
         // Use the percent-decoded path for routing and static-file lookup.
         // hyper hands us the raw URI, so `/test%2Ehtml` would otherwise be
         // looked up as the literal name `test%2Ehtml`. percent_decode_path
@@ -1363,16 +1450,19 @@ impl Router {
 
     /// Handle a PHP request by executing it in a blocking task.
     #[allow(clippy::too_many_arguments)]
-    async fn handle_php(
+    async fn handle_php<B>(
         &self,
-        req: Request<Incoming>,
+        req: Request<B>,
         remote_addr: SocketAddr,
         is_https: bool,
         script_filename: PathBuf,
         accepts_gzip: bool,
         accepts_br: bool,
         document_root: PathBuf,
-    ) -> Response<ServerBody> {
+    ) -> Response<ServerBody>
+    where
+        B: RequestBody,
+    {
         let method = req.method().to_string();
         // `method` is the client's raw verb and belongs in PHP's `$_SERVER`,
         // never in a Prometheus label — that is exactly what
@@ -1826,7 +1916,7 @@ impl Router {
     }
 
     /// Return 413 if Content-Length exceeds the limit.
-    fn check_body_size(&self, req: &Request<Incoming>) -> Option<Response<ServerBody>> {
+    fn check_body_size<B>(&self, req: &Request<B>) -> Option<Response<ServerBody>> {
         if self.max_body_size == 0 {
             return None;
         }
@@ -1883,9 +1973,9 @@ impl Router {
     ///
     /// When the request comes from a trusted proxy, reads `X-Forwarded-For`
     /// (rightmost untrusted IP) and `X-Forwarded-Proto` for HTTPS detection.
-    fn resolve_proxy_info(
+    fn resolve_proxy_info<B>(
         &self,
-        req: &Request<Incoming>,
+        req: &Request<B>,
         remote_addr: SocketAddr,
         is_tls: bool,
     ) -> (SocketAddr, bool) {
@@ -1912,7 +2002,7 @@ impl Router {
     /// Validate the `Host` header against the trusted hosts list.
     ///
     /// Returns a 421 Misdirected Request if the host is not trusted.
-    fn check_trusted_host(&self, req: &Request<Incoming>) -> Option<Response<ServerBody>> {
+    fn check_trusted_host<B>(&self, req: &Request<B>) -> Option<Response<ServerBody>> {
         if self.trusted_hosts.is_empty() {
             return None;
         }
@@ -2250,7 +2340,7 @@ fn status_metric_label(status: StatusCode) -> &'static str {
     }
 }
 
-fn extract_server_name(req: &Request<Incoming>) -> String {
+fn extract_server_name<B>(req: &Request<B>) -> String {
     req.headers()
         .get("host")
         .and_then(|v| v.to_str().ok())
@@ -2465,8 +2555,8 @@ fn error_response_owned(status: StatusCode, body: String) -> Response<ServerBody
 /// hyper read, so ePHPm never buffers more than a few chunks regardless of the
 /// upload size. The task ends (closing the channel = EOF) on the last frame, a
 /// read error, or when the worker drops the receiver (request done early).
-fn stream_request_body(
-    req: Request<Incoming>,
+fn stream_request_body<B: RequestBody>(
+    req: Request<B>,
     content_length: Option<u64>,
     max_body_size: u64,
 ) -> (ephpm_php::worker_bridge::WorkerBody, Arc<std::sync::atomic::AtomicBool>) {
@@ -2712,7 +2802,7 @@ fn split_path_query(expanded: &str) -> (&str, &str) {
 }
 
 /// Check if the request's Accept-Encoding header contains the given encoding.
-fn accepts_encoding(req: &Request<Incoming>, encoding: &str) -> bool {
+fn accepts_encoding<B>(req: &Request<B>, encoding: &str) -> bool {
     req.headers()
         .get("accept-encoding")
         .and_then(|v| v.to_str().ok())
@@ -2808,6 +2898,7 @@ mod tests {
 
     use ephpm_config::{ClusterConfig, Config, DbConfig, KvConfig, PhpConfig, ServerConfig};
     use ephpm_kv::store::StoreConfig;
+    use http_body_util::Empty;
 
     use super::*;
 
@@ -2863,6 +2954,76 @@ mod tests {
             strip.iter().any(|h| h == "proxy"),
             "Proxy (httpoxy) must always be stripped even with no middleware: {strip:?}"
         );
+    }
+
+    // ── Alt-Svc (HTTP/3 discovery) ───────────────────────────────────
+
+    /// Browsers only try HTTP/3 after seeing `Alt-Svc` on a TCP response, so
+    /// this asserts it lands on the ordinary HTTP/1.1+2 path — not just on
+    /// HTTP/3 responses, where it would be useless for discovery.
+    #[tokio::test]
+    async fn alt_svc_is_emitted_on_tls_responses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        let router = test_router(dir.path()).with_alt_svc(443, 86400);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req =
+            Request::builder().method("GET").uri("/a.txt").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, true).await.unwrap();
+
+        assert_eq!(
+            resp.headers().get(hyper::header::ALT_SVC).and_then(|v| v.to_str().ok()),
+            Some("h3=\":443\"; ma=86400")
+        );
+    }
+
+    /// An `http://` origin cannot upgrade to HTTP/3 (QUIC mandates TLS), so
+    /// advertising there would only cost bytes.
+    #[tokio::test]
+    async fn alt_svc_is_absent_on_plaintext_responses() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        let router = test_router(dir.path()).with_alt_svc(443, 86400);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req =
+            Request::builder().method("GET").uri("/a.txt").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+
+        assert!(resp.headers().get(hyper::header::ALT_SVC).is_none());
+    }
+
+    /// `alt_svc_max_age = 0` must suppress the header outright.
+    #[tokio::test]
+    async fn alt_svc_absent_when_max_age_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        let router = test_router(dir.path()).with_alt_svc(443, 0);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req =
+            Request::builder().method("GET").uri("/a.txt").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, true).await.unwrap();
+
+        assert!(resp.headers().get(hyper::header::ALT_SVC).is_none());
+    }
+
+    /// A router that was never told about an HTTP/3 endpoint must not
+    /// advertise one — this is what keeps `Alt-Svc` from pointing at a port
+    /// that never bound.
+    #[tokio::test]
+    async fn alt_svc_absent_when_http3_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        let router = test_router(dir.path());
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req =
+            Request::builder().method("GET").uri("/a.txt").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, true).await.unwrap();
+
+        assert!(resp.headers().get(hyper::header::ALT_SVC).is_none());
     }
 
     #[test]
@@ -4046,8 +4207,11 @@ mod tests {
     #[cfg(all(test, php_linked))]
     mod php_etag_tests {
         use ephpm_php::PhpRuntime;
-        use http_body_util::BodyExt;
-        use hyper::body::Empty;
+        // `Empty` lives in `http_body_util`, not `hyper::body` — this module
+        // is `cfg(php_linked)`, so the wrong path went unnoticed until
+        // `Router::handle` became generic over the body type and made
+        // `Request<Empty<Bytes>>` a legal argument at all.
+        use http_body_util::{BodyExt, Empty};
         use serial_test::serial;
 
         use super::*;
@@ -4058,7 +4222,11 @@ mod tests {
         }
 
         /// Helper to create a test request
-        fn make_request(method: &str, path: &str, if_none_match: Option<&str>) -> Request<Empty> {
+        fn make_request(
+            method: &str,
+            path: &str,
+            if_none_match: Option<&str>,
+        ) -> Request<Empty<Bytes>> {
             let mut builder = Request::builder().method(method).uri(path);
             if let Some(tag) = if_none_match {
                 builder = builder.header("if-none-match", tag);

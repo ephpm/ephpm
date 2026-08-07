@@ -69,6 +69,11 @@ EPHPM_CLUSTER__NODE_ID=$HOSTNAME                     # pod name as ordinal hint
 EPHPM_SERVER__TLS__DOMAINS='["example.com"]'
 EPHPM_SERVER__TLS__EMAIL=admin@example.com
 EPHPM_SERVER__TLS__CACHE_DIR=/data/certs
+
+# HTTP/3 (QUIC). Needs a static [server.tls] cert+key — enabling this with
+# ACME is a startup error, not a silent downgrade to TCP-only.
+EPHPM_SERVER__HTTP3__ENABLED=true
+EPHPM_SERVER__HTTP3__ALT_SVC_MAX_AGE=86400
 ```
 
 ## Logging-only env var

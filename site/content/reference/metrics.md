@@ -34,6 +34,21 @@ Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and ex
 | `ephpm_http_timeouts_total` | counter | `stage` | Requests killed by the request timeout. Only value: `request`. |
 | `ephpm_rate_limited_total` | counter | — | Rejections from `[server.limits]`. Incremented only for per-IP rate limiting. |
 
+## HTTP/3 (QUIC)
+
+Emitted only when `[server.http3] enabled = true`; the series are absent otherwise. HTTP/3 requests **also** increment every `ephpm_http_*` metric above — the shared request pipeline records those regardless of transport — so these are transport-level counters on top, not a separate accounting.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_http3_connections_total` | counter | — | QUIC connections that completed their handshake. |
+| `ephpm_http3_connections_active` | gauge | — | Currently established QUIC connections. |
+| `ephpm_http3_connection_errors_total` | counter | `stage` | Per-connection failures. `stage="handshake"` (bad ALPN, version negotiation, client gave up before the handshake completed) or `stage="session"` (the HTTP/3 session failed after the handshake). |
+| `ephpm_http3_requests_total` | counter | — | Requests accepted on HTTP/3 streams. |
+| `ephpm_http3_request_duration_seconds` | histogram | — | HTTP/3 request time including writing the response body out over QUIC. Uses the same buckets as `ephpm_http_request_duration_seconds`, so the two overlay directly. |
+| `ephpm_http3_stripped_headers_total` | counter | — | Connection-specific response header names removed before sending (RFC 9114 §4.2 forbids `Connection`, `Keep-Alive`, `Proxy-Connection`, `Transfer-Encoding`, `Upgrade` in HTTP/3). Non-zero means an app or a `[server.response] headers` entry is emitting a header that is meaningless over HTTP/3 — worth fixing at the source. |
+
+A rising `ephpm_http3_connection_errors_total{stage="handshake"}` with `ephpm_http3_connections_total` flat usually means UDP is being blocked on the path — clients are trying HTTP/3 and falling back to TCP.
+
 ## PHP
 
 | Metric | Type | Labels | Description |
@@ -214,7 +229,7 @@ The `path`-style labels you might expect on HTTP metrics (`/users/123`) are deli
 
 Buckets are custom per metric — configured with `Matcher::Full` rules in [`crates/ephpm-server/src/metrics.rs`](https://github.com/ephpm/ephpm/blob/main/crates/ephpm-server/src/metrics.rs), not the `metrics_exporter_prometheus` builder defaults:
 
-- Duration histograms (`ephpm_http_request_duration_seconds`, `ephpm_php_execution_duration_seconds`, `ephpm_worker_request_wait_seconds`): 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 seconds
+- Duration histograms (`ephpm_http_request_duration_seconds`, `ephpm_http3_request_duration_seconds`, `ephpm_php_execution_duration_seconds`, `ephpm_worker_request_wait_seconds`): 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 seconds
 - `ephpm_worker_boot_duration_seconds`: 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30 seconds (framework boot can take seconds)
 - `ephpm_cdc_apply_duration_seconds`: 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5, 1, 5 seconds (one replicated transaction; the healthy range is sub-millisecond, so the buckets start two decades lower than the HTTP ones)
 - `ephpm_cdc_snapshot_duration_seconds`: 0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300 seconds (a logical dump of a large database is minutes, and it blocks a cold replica's startup)

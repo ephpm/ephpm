@@ -53,6 +53,19 @@ fn tcp_tls_acceptor_builds_without_an_installed_provider() {
         .expect("static-cert TLS must not need a process-default crypto provider");
 }
 
+/// HTTP/3 builds its QUIC endpoint through the same `tls.rs` code path, so it
+/// inherits the fix — asserted here rather than assumed.
+#[tokio::test]
+async fn http3_endpoint_builds_without_an_installed_provider() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (cert, key) = self_signed(dir.path());
+
+    let endpoint =
+        ephpm_server::http3::build_endpoint("127.0.0.1:0".parse().expect("addr"), &cert, &key)
+            .expect("HTTP/3 endpoint must not need a process-default crypto provider");
+    endpoint.close(quinn::VarInt::from_u32(0), b"test over");
+}
+
 /// A valid PEM that simply contains no CERTIFICATE block must be rejected
 /// against the offending file, not deferred into an opaque rustls error.
 ///

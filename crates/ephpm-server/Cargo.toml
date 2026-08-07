@@ -52,6 +52,9 @@ tokio-util.workspace = true
 bytes.workspace = true
 sha2.workspace = true
 async-channel.workspace = true
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
