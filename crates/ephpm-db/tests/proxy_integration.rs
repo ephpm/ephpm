@@ -2,8 +2,12 @@
 //!
 //! These tests require a running `MySQL` server. Set `MYSQL_TEST_URL` to a
 //! connection string (e.g. `mysql://root:test@127.0.0.1:3306/test`) to enable
-//! them. All tests are `#[ignore]` so they only run in nightly CI via
-//! `cargo test -- --ignored`.
+//! them. All tests are `#[ignore]`, and CI runs them in
+//! `.github/workflows/db-integration.yml` against a real `mysql:8.0` with its
+//! **default** authentication plugin.
+//!
+//! Locally an unset `MYSQL_TEST_URL` skips; in CI it is a failure. See
+//! `tests/common/mod.rs` for why.
 
 use std::time::Duration;
 
@@ -12,9 +16,11 @@ use ephpm_db::mysql::{MySqlProxy, RwSplitParams};
 use ephpm_db::pool::PoolConfig;
 use mysql_async::prelude::*;
 
+mod common;
+
 /// Read `MYSQL_TEST_URL` or return `None` (caller should skip).
 fn mysql_url() -> Option<String> {
-    std::env::var("MYSQL_TEST_URL").ok()
+    common::db_url("MYSQL_TEST_URL")
 }
 
 /// Build a default pool config suitable for tests.
@@ -139,7 +145,7 @@ fn proxy_opts(proxy_addr: &str) -> mysql_async::Opts {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
+#[ignore = "requires MYSQL_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn basic_query_roundtrip() {
     let Some(url) = mysql_url() else {
         println!("MYSQL_TEST_URL not set — skipping");
@@ -175,7 +181,7 @@ async fn basic_query_roundtrip() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
+#[ignore = "requires MYSQL_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn connection_pool_reuse() {
     let Some(url) = mysql_url() else {
         println!("MYSQL_TEST_URL not set — skipping");
@@ -209,7 +215,7 @@ async fn connection_pool_reuse() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
+#[ignore = "requires MYSQL_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn session_isolation() {
     let Some(url) = mysql_url() else {
         println!("MYSQL_TEST_URL not set — skipping");
@@ -249,7 +255,7 @@ async fn session_isolation() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
+#[ignore = "requires MYSQL_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn transaction_integrity() {
     let Some(url) = mysql_url() else {
         println!("MYSQL_TEST_URL not set — skipping");
@@ -298,7 +304,7 @@ async fn transaction_integrity() {
 // without these the Smart code path is never integration-tested.
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
+#[ignore = "requires MYSQL_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn basic_query_roundtrip_smart() {
     let Some(url) = mysql_url() else {
         println!("MYSQL_TEST_URL not set — skipping");
@@ -341,7 +347,7 @@ async fn basic_query_roundtrip_smart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
+#[ignore = "requires MYSQL_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn session_isolation_smart() {
     let Some(url) = mysql_url() else {
         println!("MYSQL_TEST_URL not set — skipping");
@@ -389,7 +395,7 @@ async fn session_isolation_smart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
+#[ignore = "requires MYSQL_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn prepared_statement_lifecycle_smart() {
     let Some(url) = mysql_url() else {
         println!("MYSQL_TEST_URL not set — skipping");
@@ -434,7 +440,7 @@ async fn prepared_statement_lifecycle_smart() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
+#[ignore = "requires MYSQL_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn prepared_statement_lifecycle() {
     let Some(url) = mysql_url() else {
         println!("MYSQL_TEST_URL not set — skipping");
@@ -496,7 +502,7 @@ async fn prepared_statement_lifecycle() {
 /// `max_connections = 1` makes (3) load-bearing: there is exactly one backend
 /// connection, so the second session provably gets the one the `CALL` ran on.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires MYSQL_TEST_URL — nightly CI only"]
+#[ignore = "requires MYSQL_TEST_URL — see .github/workflows/db-integration.yml"]
 async fn multi_result_call_does_not_desync_the_pooled_backend() {
     let Some(url) = mysql_url() else {
         println!("MYSQL_TEST_URL not set — skipping");

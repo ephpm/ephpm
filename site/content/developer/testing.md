@@ -10,6 +10,7 @@ ePHPm uses a layered testing approach: fast unit tests for inner logic, a dedica
 |-------|------|---------------|-------|
 | Unit | `cargo nextest` | Config parsing, routing logic, SAPI mapping, response building | Seconds |
 | Integration | `cargo nextest` (ignored by default) | PHP execution, WordPress lifecycle — requires libphp | Seconds (with SDK) |
+| DB integration | `cargo nextest` (ignored by default) | MySQL/PG proxy against real servers — requires database containers | Seconds |
 | Local e2e | `cargo test -p ephpm --test <name>` | Real binary spawned as a child against the loopback listener — vhost routing, HTTP correctness | Sub-second per test |
 | Elevated lifecycle | `cargo test --ignored` (env-gated, root/Administrator) | Real SCM / systemd / launchd install → uninstall flow | ~15s per platform |
 | E2E (cluster) | `ephpm-e2e` crate + Tilt + Kind | Full stack against real K8s infrastructure, pod-to-pod networking | Minutes |
@@ -32,6 +33,72 @@ Integration tests that require PHP are `#[ignore]` by default. Run them after bu
 ```bash
 cargo nextest run --workspace --run-ignored all
 ```
+
+---
+
+## Database Integration Tests (`ephpm-db`)
+
+The DB proxy's integration tests need a live server, so they are `#[ignore]`d and
+read a connection URL from the environment:
+
+| Variable | Server | Covers |
+|----------|--------|--------|
+| `MYSQL_TEST_URL` | `mysql:8.0` | Round-trips, pooling, R/W split, reset strategies, prepared statements |
+| `MYSQL_SHA2_TEST_URL` | a **pristine** `mysql:8.0`, admin account | `caching_sha2_password` fast auth and full auth |
+| `PG_TEST_URL` | `postgres:17` | PG handshake (SCRAM-SHA-256), round-trips, pooling |
+
+CI runs them in `.github/workflows/db-integration.yml`, which starts all three
+containers. It is a separate, path-filtered workflow rather than part of `ci.yml`
+— it boots three database servers, and the self-hosted fleet is small — plus a
+daily unconditional run of `main`.
+
+### A missing URL is a failure in CI, not a skip
+
+Locally, an unset variable skips the test. **Under CI it panics.** `db_url()` in
+`crates/ephpm-db/tests/common/mod.rs` enforces this, and
+`tests/db_env_guard.rs` additionally fails the job when a name listed in
+`REQUIRED_DB_URL_VARS` was never provisioned.
+
+This is deliberate. Before it existed, no workflow set any of these variables,
+so the whole suite skipped and reported green — which is how the proxy shipped
+unable to authenticate to a default-configured MySQL 8 (#234, found by a
+benchmark rather than by the tests that cover the proxy). A test that cannot
+fail is indistinguishable from a test that passes.
+
+Adding a test that needs a new database means: read its URL through `db_url()`,
+add the name to `REQUIRED_DB_URL_VARS`, and start the server in the workflow.
+`EPHPM_REQUIRE_DB_TESTS=0` is the explicit opt-out for running a subset on a CI
+machine.
+
+### Running them locally
+
+```bash
+docker run -d --rm --name mysqltest -e MYSQL_ROOT_PASSWORD=test \
+    -e MYSQL_DATABASE=test -p 3307:3306 mysql:8.0
+docker run -d --rm --name pgtest -e POSTGRES_PASSWORD=test \
+    -e POSTGRES_DB=test -p 5433:5432 postgres:17
+
+MYSQL_TEST_URL=mysql://root:test@127.0.0.1:3307/test \
+PG_TEST_URL=postgres://postgres:test@127.0.0.1:5433/test \
+    cargo nextest run -p ephpm-db --run-ignored all
+```
+
+### Do not let the fixture downgrade MySQL authentication
+
+Two workarounds look like harmless setup and silently delete the coverage:
+
+- **`ALTER USER ... IDENTIFIED WITH mysql_native_password`.** This is what hid
+  #234. MySQL 8.4 also drops the plugin from the default set, so tests relying
+  on it stop covering anything at all there.
+- **Authenticating during a readiness check** (`mysqladmin ping -uroot -p...`).
+  `caching_sha2_password` only runs full auth when the server has no cached
+  entry, and one successful root authentication — even over the container's own
+  loopback — is enough for the proxy's later connect to take the fast path.
+  Measured on `mysql:8.0.46`: with a `mysqladmin` readiness probe the proxy
+  tests **pass** against a build that cannot do full auth; with a probe that
+  authenticates nothing they correctly fail. Wait on the server's log line
+  instead (`ready for connections ... port: 3306` — initdb's temporary server
+  logs `port: 0`).
 
 ---
 
@@ -340,6 +407,7 @@ Each job builds ephpm with the specified PHP version, deploys it to a Kind clust
 |------|---------|----------------------|
 | HTTP routing, config, CLI | `cargo build` + `cargo nextest` | None (stub mode) |
 | PHP execution | `cargo xtask release` + `cargo nextest --run-ignored all` | PHP SDK |
+| DB proxy against a real server | `MYSQL_TEST_URL=... PG_TEST_URL=... cargo nextest run -p ephpm-db --run-ignored all` | MySQL 8 + PostgreSQL 17 containers |
 | Local vhost routing | `cargo test -p ephpm --test vhost_routing -- --nocapture` | None — spawns the binary directly |
 | Test a local site in a browser | `ephpm dev --sites ~/sites` | None — `*.localhost` resolves to 127.0.0.1 |
 | Service install lifecycle | `EPHPM_ELEVATED_E2E=1 cargo test -p ephpm --test service_lifecycle -- --ignored` | Root/Administrator + real service manager |

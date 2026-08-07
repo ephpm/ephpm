@@ -41,9 +41,11 @@ use ephpm_db::mysql::{MySqlProxy, RwSplitParams};
 use ephpm_db::pool::PoolConfig;
 use mysql_async::prelude::*;
 
+mod common;
+
 /// Admin URL for a stock `MySQL` 8, or `None` (caller should skip).
 fn admin_url() -> Option<String> {
-    std::env::var("MYSQL_SHA2_TEST_URL").ok()
+    common::db_url("MYSQL_SHA2_TEST_URL")
 }
 
 fn test_pool_config() -> PoolConfig {
