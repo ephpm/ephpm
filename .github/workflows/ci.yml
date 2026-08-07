@@ -25,6 +25,32 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Canary for the release path's core assumption: the fleet can build Docker
+  # images WITHOUT privileged containers, via plain legacy `docker build`
+  # (DOCKER_BUILDKIT=0) against ephemerd's dind shim — the pattern release.yml
+  # and ci-image.yml use. The shim has no daemon-side BuildKit session API, so
+  # every buildx path boots a --privileged moby/buildkit container and dies
+  # ("privileged containers are disabled on this host"): the container driver
+  # did exactly that to all three v0.6.1 Docker legs, and driver:docker was
+  # proven equally dead by an earlier version of this very job (it detects the
+  # missing native BuildKit and falls back to the same privileged container).
+  # release.yml only runs on tag push, so without this canary the next release
+  # is the first test of any change to this assumption. ~30s.
+  docker-driver-smoke:
+    name: Docker build (unprivileged)
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Legacy docker build through the ephemerd shim
+        env:
+          DOCKER_BUILDKIT: "0"
+        run: |
+          dir="$(mktemp -d)"
+          printf 'FROM busybox\nRUN echo unprivileged-build-ok\n' > "$dir/Dockerfile"
+          docker build -t mayfly-smoke:ci "$dir"
+          # No `docker image rm`: the shim doesn't implement image deletion
+          # ("DELETE /images/... is not yet implemented"), and cleanup is
+          # moot anyway — JIT runners are single-use and discarded.
+
   fmt:
     name: Format
     runs-on: [self-hosted, linux, x64]

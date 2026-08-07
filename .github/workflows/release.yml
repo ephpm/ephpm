@@ -24,6 +24,33 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Republish path for an already-pushed tag.
+  #
+  # A tag-triggered run always executes the workflow file as it existed at the
+  # TAGGED COMMIT -- `gh run rerun` replays the same SHA, so a workflow fix
+  # merged to main afterwards does NOT reach it. When a release is stuck on a
+  # CI-side (not code-side) failure, fixing release.yml on main and then
+  # dispatching it here against the existing tag republishes the missing pieces
+  # without deleting/moving the tag and without rebuilding the 12 binary legs.
+  #
+  # On dispatch the four binary build jobs are skipped: `docker-image` rebuilds
+  # from the tag's source (the Dockerfile compiles ephpm itself, so it needs no
+  # prior artifact), and `release` re-assembles the GitHub release from the
+  # archives already attached to the original run (artifacts_run_id).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)publish, e.g. v0.6.1"
+        required: true
+        type: string
+      publish:
+        description: "Push images / create the release. Leave off for a build-only smoke test."
+        type: boolean
+        default: false
+      artifacts_run_id:
+        description: "Run ID holding the binary archives (required to create the release; omit for a Docker-only run)."
+        required: false
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -37,6 +64,9 @@ jobs:
   # pool handled 3 builds + 3 Docker jobs fine.
   build-linux:
     name: Build (PHP ${{ matrix.php.full }}, ${{ matrix.arch.sdk }})
+    # Binary legs run only for a real tag push; the workflow_dispatch
+    # republish path reuses the archives from the original run.
+    if: github.event_name == 'push'
     runs-on: [self-hosted, linux, x64]
     container: "ephpm/ephpm-ci:${{ matrix.arch.image }}"
     strategy:
@@ -112,6 +142,7 @@ jobs:
     # release run put 6 concurrent release builds on that one host and every
     # runner on it died mid-build.
     needs: build-macos
+    if: github.event_name == 'push'
     runs-on: [self-hosted, linux, arm64]
     container: "ephpm/ephpm-ci:latest-arm64"
     strategy:
@@ -175,6 +206,7 @@ jobs:
   # -- macOS binaries ---------------------------------------------------------
   build-macos:
     name: Build (PHP ${{ matrix.php_full }}, macos-aarch64)
+    if: github.event_name == 'push'
     runs-on: [self-hosted, macos, arm64]
     strategy:
       fail-fast: false
@@ -254,6 +286,7 @@ jobs:
   # -- Windows binaries (native on self-hosted Windows runner) --------------
   build-windows:
     name: Build (PHP ${{ matrix.php_full }}, windows-x86_64)
+    if: github.event_name == 'push'
     runs-on: [self-hosted, windows, x64]
     strategy:
       fail-fast: false
@@ -420,10 +453,36 @@ jobs:
             php_full: "8.5.7"
             default: true
     steps:
+      # On a tag push this is the tag; on a workflow_dispatch republish it is
+      # the tag named in the input (the run itself is dispatched from main, so
+      # the default ref would be main's source).
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      # No docker/setup-buildx-action here, by design.
+      #
+      # setup-buildx-action defaults to the `docker-container` driver, which
+      # boots moby/buildkit as a PRIVILEGED container. The ephemerd runner
+      # fleet disables privileged containers (dind.allow_privileged, default
+      # off), so as of the v0.6.1 run every Docker leg died at builder boot:
+      #
+      #   ERROR: Error response from daemon: privileged containers are
+      #   disabled on this host (set dind.allow_privileged = true ...)
+      #
+      # Switching the action to `driver: docker` does not help either: that
+      # driver reaches the daemon's embedded BuildKit over the /grpc hijack
+      # endpoint, and ephemerd's Docker-API shim implements neither /grpc nor
+      # /session -- both return "not yet implemented".
+      #
+      # The path ephemerd actually supports is the classic client-side build:
+      # POST /build with a tar context, served by its in-process BuildKit
+      # solver. That is what ci-image.yml has always used on this fleet.
+      # Nothing here needs the container driver: the build is single-platform
+      # (the runner is native linux/amd64), exports no cache (no
+      # cache-to/cache-from), and requests no insecure entitlements. Multiple
+      # -t tags, --build-arg and --label all translate to BuildKit frontend
+      # attrs on the /build path, so no capability is given up.
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -434,7 +493,7 @@ jobs:
       - name: Compute image tags
         id: tags
         env:
-          VERSION: ${{ github.ref_name }}
+          VERSION: ${{ github.event.inputs.tag || github.ref_name }}
           PHP_MINOR: ${{ matrix.php_minor }}
           PHP_FULL: ${{ matrix.php_full }}
           IS_DEFAULT: ${{ matrix.default }}
@@ -468,36 +527,92 @@ jobs:
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
           echo "semver=${VERSION}+php${PHP_FULL}" >> "$GITHUB_OUTPUT"
 
+      # Plain `docker build` + `docker push` rather than
+      # docker/build-push-action, which always goes through buildx. See the
+      # note above the login step for why buildx cannot work on this fleet.
+      #
+      # Side benefit: the classic path produces no ".dockerbuild" build-record
+      # artifact at all, so the DOCKER_BUILD_RECORD_UPLOAD/DOCKER_BUILD_SUMMARY
+      # opt-outs this step used to carry are moot -- the Create Release job's
+      # artifact download stays at the 12 binary archives it expects.
       - name: Build and push image
-        uses: docker/build-push-action@v6
         env:
-          # Don't upload the ".dockerbuild" build-record artifact. We never
-          # consume it, and it inflates the Create Release download to 15
-          # artifacts, adding parallel connections that the self-hosted
-          # runner's egress to Azure blob storage can't all sustain.
-          DOCKER_BUILD_RECORD_UPLOAD: false
-          DOCKER_BUILD_SUMMARY: false
-        with:
-          context: .
-          file: docker/Dockerfile
-          platforms: linux/amd64
-          build-args: |
-            PHP_SDK_VERSION=${{ matrix.php_full }}
-            EPHPM_RELEASE_VERSION=${{ steps.tags.outputs.release_version }}
-          push: true
-          tags: ${{ steps.tags.outputs.tags }}
-          labels: |
-            org.opencontainers.image.title=ephpm
-            org.opencontainers.image.description=All-in-one PHP application server in a single binary
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.tags.outputs.semver }}
-            org.opencontainers.image.licenses=MIT
+          TAGS: ${{ steps.tags.outputs.tags }}
+          PHP_FULL: ${{ matrix.php_full }}
+          RELEASE_VERSION: ${{ steps.tags.outputs.release_version }}
+          SEMVER: ${{ steps.tags.outputs.semver }}
+          SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
+          # A tag push always publishes; a dispatch publishes only when asked,
+          # so the same job doubles as a build-only smoke test.
+          PUSH: ${{ github.event_name == 'push' || inputs.publish }}
+          # Force the legacy client-side build path. Docker CLI v23+ routes
+          # `docker build` through buildx whenever the daemon advertises
+          # BuilderVersion "2" -- which ephemerd deliberately does -- and that
+          # lands on the unimplemented /grpc endpoint. DOCKER_BUILDKIT=0 keeps
+          # the CLI on POST /build, which ephemerd's embedded BuildKit solver
+          # serves. Same setting, same reason, as ci-image.yml.
+          DOCKER_BUILDKIT: "0"
+        run: |
+          set -euo pipefail
+
+          # Read the revision from the checkout, not github.sha: on a
+          # republish dispatch github.sha is main's commit, while the tree we
+          # actually built is the tag's.
+          REVISION="$(git rev-parse HEAD)"
+
+          IFS=',' read -ra tag_list <<< "$TAGS"
+          tag_args=()
+          for t in "${tag_list[@]}"; do
+            tag_args+=(-t "$t")
+          done
+
+          echo "==> building ${#tag_list[@]} tag(s):"
+          printf '      %s\n' "${tag_list[@]}"
+
+          docker build \
+            -f docker/Dockerfile \
+            --build-arg "PHP_SDK_VERSION=${PHP_FULL}" \
+            --build-arg "EPHPM_RELEASE_VERSION=${RELEASE_VERSION}" \
+            --label "org.opencontainers.image.title=ephpm" \
+            --label "org.opencontainers.image.description=All-in-one PHP application server in a single binary" \
+            --label "org.opencontainers.image.source=${SOURCE_URL}" \
+            --label "org.opencontainers.image.revision=${REVISION}" \
+            --label "org.opencontainers.image.version=${SEMVER}" \
+            --label "org.opencontainers.image.licenses=MIT" \
+            "${tag_args[@]}" \
+            .
+
+          if [ "${PUSH}" != "true" ]; then
+            echo "==> publish not requested; built only, nothing pushed."
+            exit 0
+          fi
+
+          # One push per tag: ephemerd's push endpoint resolves a single ref at
+          # a time (each -t was registered in its image store by the build).
+          for t in "${tag_list[@]}"; do
+            echo "==> pushing ${t}"
+            docker push "$t"
+          done
 
   # -- Release: gather archives, hash them, attach to the GitHub release ------
   release:
     name: Create Release
     needs: [build-linux, build-linux-arm64, build-macos, build-windows, docker-image]
+    # `!cancelled()` overrides the default "skip when a dependency was skipped"
+    # so the republish path (where the four binary legs are intentionally
+    # skipped) can still run. The explicit result checks keep the tag-push
+    # semantics unchanged: every leg must have succeeded.
+    if: >-
+      ${{ !cancelled()
+          && needs.docker-image.result == 'success'
+          && (github.event_name == 'push'
+              && needs.build-linux.result == 'success'
+              && needs.build-linux-arm64.result == 'success'
+              && needs.build-macos.result == 'success'
+              && needs.build-windows.result == 'success'
+              || github.event_name == 'workflow_dispatch'
+                 && inputs.publish
+                 && inputs.artifacts_run_id != '') }}
     runs-on: [self-hosted, linux, x64]
     permissions:
       contents: write
@@ -520,7 +635,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          RUN_ID: ${{ github.run_id }}
+          # Normally this run's own artifacts. On a republish dispatch the
+          # binaries live on the original tag run, named by artifacts_run_id.
+          RUN_ID: ${{ github.event.inputs.artifacts_run_id || github.run_id }}
           OUT_DIR: artifacts
         run: bash .github/scripts/collect_release_artifacts.sh
 
@@ -540,8 +657,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
+          # Explicit rather than inferred from github.ref: a republish dispatch
+          # runs from main, where the inferred tag would be "main".
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           generate_release_notes: true
           # SemVer pre-release tags carry a "-" (e.g. v0.1.0-rc.1, v0.2.0-beta.2).
           # Mark them prerelease so GitHub does not promote them to "Latest"
           # and demote the actual stable release in the Releases UI.
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(github.event.inputs.tag || github.ref_name, '-') }}
