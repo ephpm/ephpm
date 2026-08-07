@@ -1,0 +1,200 @@
+# Build memory probe — opt-in via workflow_dispatch only.
+#
+# Measures PEAK MEMORY of a release build on the two targets with a
+# documented OOM history: linux-aarch64 (rustc SIGKILLed by the OOM killer,
+# #181/#183) and windows-x86_64 ("rustc-LLVM ERROR: out of memory", #183/#193).
+#
+# Why this exists: release.yml disables LTO on both targets, but both still
+# inherit `codegen-units = 1` from the workspace profile.release. Every OOM
+# comment in release.yml names codegen-units=1 as a contributing factor, yet
+# nobody has measured what it actually costs. This workflow makes the two
+# settings dispatch inputs so the same commit, on the same runner pool, can be
+# built under different values and compared — rather than changing release CI
+# on reasoning alone.
+#
+# Deliberately NOT part of release.yml: the binary legs there are gated to
+# `github.event_name == 'push'`, and the release path should not grow knobs
+# that exist only for measurement.
+#
+# The build product is discarded. Nothing is packaged, uploaded, or published.
+
+name: Build memory probe (opt-in)
+
+on:
+  workflow_dispatch:
+    inputs:
+      codegen_units:
+        description: "CARGO_PROFILE_RELEASE_CODEGEN_UNITS (profile default is 1)"
+        required: false
+        default: "1"
+        type: string
+      lto:
+        description: "CARGO_PROFILE_RELEASE_LTO (release CI uses off on both targets)"
+        required: false
+        default: "off"
+        type: choice
+        options: ["off", "thin", "fat"]
+      php_minor:
+        description: "PHP minor to build against"
+        required: false
+        default: "8.5"
+        type: string
+      targets:
+        description: "Which targets to probe"
+        required: false
+        default: "both"
+        type: choice
+        options: ["both", "linux-arm64", "windows"]
+
+# One probe at a time. linux-arm64 runs in the Apple Silicon host's embedded
+# Linux VM — the same physical machine as build-macos — so a concurrent probe
+# would contend for the very memory being measured and invalidate the number.
+concurrency:
+  group: ephpm-build-memory
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  # xtask bakes this into the binary; the value is irrelevant to memory, but
+  # crates/ephpm/build.rs requires it to be present.
+  EPHPM_RELEASE_VERSION: "0.0.0-memprobe"
+
+jobs:
+  linux-arm64:
+    name: Peak memory (linux-aarch64)
+    if: inputs.targets == 'both' || inputs.targets == 'linux-arm64'
+    runs-on: [self-hosted, linux, arm64]
+    container: "ephpm/ephpm-ci:latest-arm64"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build under measurement
+        env:
+          CARGO_PROFILE_RELEASE_LTO: ${{ inputs.lto }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ inputs.codegen_units }}
+          PHP_MINOR: ${{ inputs.php_minor }}
+        run: |
+          set -eu
+
+          echo "=== configuration ==="
+          echo "lto           = ${CARGO_PROFILE_RELEASE_LTO}"
+          echo "codegen-units = ${CARGO_PROFILE_RELEASE_CODEGEN_UNITS}"
+          echo "php           = ${PHP_MINOR}"
+          nproc  || true
+          free -g || true
+
+          # Two independent measurements, because they answer different
+          # questions and either can be unavailable:
+          #
+          #   cgroup memory.peak  — total peak across ALL processes in this
+          #                         container. This is what the OOM killer
+          #                         acts on, so it is the number that decides
+          #                         whether the job survives.
+          #   time -v maxresident — largest single child process. This is the
+          #                         "rustc-LLVM ERROR: out of memory" metric,
+          #                         which is a single-process allocation
+          #                         failure, not a cgroup kill.
+          cg=""
+          for c in /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory/memory.max_usage_in_bytes; do
+            if [ -r "$c" ]; then cg="$c"; break; fi
+          done
+
+          if [ -n "$cg" ]; then
+            # memory.peak is resettable on cgroup v2 (kernel 6.3+); ignore
+            # failure and subtract the baseline instead when it is not.
+            echo 0 > "$cg" 2>/dev/null || true
+            before=$(cat "$cg")
+            echo "cgroup file   = $cg (baseline ${before} bytes)"
+          else
+            echo "cgroup file   = (none readable — total-peak unavailable)"
+          fi
+
+          start=$(date +%s)
+          if command -v /usr/bin/time >/dev/null 2>&1; then
+            /usr/bin/time -v cargo xtask release "${PHP_MINOR}" 2> >(tee /tmp/time.err >&2)
+          else
+            echo "NOTE: /usr/bin/time absent — single-process peak unavailable"
+            cargo xtask release "${PHP_MINOR}"
+          fi
+          end=$(date +%s)
+
+          echo "=== RESULT ==="
+          echo "wall_seconds  = $(( end - start ))"
+
+          if [ -n "$cg" ]; then
+            after=$(cat "$cg")
+            echo "cgroup_peak_bytes = ${after}"
+            echo "cgroup_peak_gib   = $(awk -v b="${after}" 'BEGIN{printf "%.2f", b/1073741824}')"
+          fi
+
+          if [ -f /tmp/time.err ]; then
+            kb=$(awk '/Maximum resident set size/ {print $NF}' /tmp/time.err || true)
+            if [ -n "${kb:-}" ]; then
+              echo "max_single_proc_kb  = ${kb}"
+              echo "max_single_proc_gib = $(awk -v k="${kb}" 'BEGIN{printf "%.2f", k/1048576}')"
+            fi
+          fi
+
+  windows:
+    name: Peak memory (windows-x86_64)
+    if: inputs.targets == 'both' || inputs.targets == 'windows'
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build under measurement
+        shell: powershell
+        env:
+          CARGO_PROFILE_RELEASE_LTO: ${{ inputs.lto }}
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ inputs.codegen_units }}
+          # Deep-recursion guard carried over from release.yml's build-windows
+          # (sqlparser overflows rustc's default thread stack on MSVC). Kept
+          # so this probe builds the same way the release does; whether a
+          # higher codegen-units lets it relax is a separate question.
+          RUST_MIN_STACK: "33554432"
+        run: |
+          Write-Host "=== configuration ==="
+          Write-Host "lto           = $env:CARGO_PROFILE_RELEASE_LTO"
+          Write-Host "codegen-units = $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS"
+          $cs = Get-CimInstance Win32_ComputerSystem
+          Write-Host ("host_ram_gib  = {0:N1}" -f ($cs.TotalPhysicalMemory / 1GB))
+
+          # No cgroups here. Sample the build's process tree instead, tracking
+          # two numbers: the max SUM of working sets (total pressure on the
+          # Hyper-V container) and the max SINGLE process working set (the
+          # rustc-LLVM allocation-failure metric).
+          $proc = Start-Process -FilePath "cargo" `
+            -ArgumentList @("xtask","release","${{ inputs.php_minor }}","--target","windows","--no-sqld") `
+            -NoNewWindow -PassThru
+
+          $maxSum = 0
+          $maxOne = 0
+          $maxOneName = ""
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+
+          while (-not $proc.HasExited) {
+            $ps = Get-Process -Name rustc,cargo,link,lld-link -ErrorAction SilentlyContinue
+            if ($ps) {
+              $sum = ($ps | Measure-Object -Property WorkingSet64 -Sum).Sum
+              if ($sum -gt $maxSum) { $maxSum = $sum }
+              $top = $ps | Sort-Object WorkingSet64 -Descending | Select-Object -First 1
+              if ($top.WorkingSet64 -gt $maxOne) {
+                $maxOne = $top.WorkingSet64
+                $maxOneName = $top.ProcessName
+              }
+            }
+            Start-Sleep -Milliseconds 500
+          }
+          $sw.Stop()
+
+          Write-Host "=== RESULT ==="
+          Write-Host ("wall_seconds         = {0:N0}" -f $sw.Elapsed.TotalSeconds)
+          Write-Host ("max_sum_bytes        = {0}" -f $maxSum)
+          Write-Host ("max_sum_gib          = {0:N2}" -f ($maxSum / 1GB))
+          Write-Host ("max_single_proc_gib  = {0:N2}  ({1})" -f ($maxOne / 1GB), $maxOneName)
+          Write-Host ("exit_code            = {0}" -f $proc.ExitCode)
+
+          if ($proc.ExitCode -ne 0) {
+            Write-Error "build failed with exit code $($proc.ExitCode)"
+            exit $proc.ExitCode
+          }
