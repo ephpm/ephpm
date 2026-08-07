@@ -112,7 +112,7 @@ Windows builds run natively (no cross-compile, no `cargo-xwin`) — you just nee
 cargo xtask release --target windows   # → target\x86_64-pc-windows-msvc\release\ephpm.exe
 ```
 
-The SDK download is the same php-sdk release, with prebuilt `php8embed.dll`/`.lib` for Windows.
+The SDK download is the same php-sdk release, with a prebuilt static `php8embed.lib` for Windows. It links statically, so `ephpm.exe` is a single self-contained binary — there is no DLL to deploy alongside it.
 
 A binary built from source can also self-install:
 
