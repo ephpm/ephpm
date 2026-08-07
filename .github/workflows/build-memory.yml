@@ -163,7 +163,15 @@ jobs:
           # two numbers: the max SUM of working sets (total pressure on the
           # Hyper-V container) and the max SINGLE process working set (the
           # rustc-LLVM allocation-failure metric).
-          $proc = Start-Process -FilePath "cargo" `
+          #
+          # Start-Process does NOT resolve a bare command name through PATH the
+          # way the shell does -- "cargo" fails with "The system cannot find the
+          # file specified" even when `cargo --version` works in the same step.
+          # Resolve to an absolute path first.
+          $cargoCmd = Get-Command cargo -ErrorAction Stop
+          Write-Host "cargo         = $($cargoCmd.Source)"
+
+          $proc = Start-Process -FilePath $cargoCmd.Source `
             -ArgumentList @("xtask","release","${{ inputs.php_minor }}","--target","windows","--no-sqld") `
             -NoNewWindow -PassThru
 
