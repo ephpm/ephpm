@@ -171,7 +171,7 @@ load extensions you trust.
 
 When one does crash, ePHPm writes a fatal-signal report to stderr naming
 the faulting `.so` and function before it dies — see
-[Diagnosing Crashes](../diagnosing-crashes/).
+[Diagnosing Crashes](/guides/diagnosing-crashes/).
 
 ## Relationship to the static set
 

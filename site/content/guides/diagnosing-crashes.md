@@ -4,7 +4,7 @@ weight = 14
 +++
 
 Native code in the ePHPm process — a PHP extension, a
-[native middleware](../native-middleware/) `.so`, or the Zend engine itself —
+[native middleware](/guides/native-middleware/) `.so`, or the Zend engine itself —
 can fault in ways no amount of Rust safety prevents. When that happens the
 whole process dies: there is one address space, and the Zend memory manager,
 the glibc heap and the OPcache shared memory are shared by every thread in it.
@@ -141,7 +141,7 @@ EPHPM_FATAL_HANDLER=0
 
 Crashes then become silent again, exactly as they were before. The exit status
 does not change either way. See
-[Environment Variables](../../reference/environment-variables/).
+[Environment Variables](/reference/environment-variables/).
 
 ## Caveats
 
@@ -168,6 +168,6 @@ where it broke.
 
 ## See also
 
-- [PHP Extensions](../php-extensions/) — loading shared extensions.
-- [Native Middleware](../native-middleware/) — the other `.so` in the process.
-- [Environment Variables](../../reference/environment-variables/) — `EPHPM_FATAL_HANDLER`.
+- [PHP Extensions](/guides/php-extensions/) — loading shared extensions.
+- [Native Middleware](/guides/native-middleware/) — the other `.so` in the process.
+- [Environment Variables](/reference/environment-variables/) — `EPHPM_FATAL_HANDLER`.

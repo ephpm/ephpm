@@ -438,7 +438,7 @@ containment from `declare!`, but that is not a security boundary — a
 
 When a module does fault, ePHPm writes a fatal-signal report to stderr
 naming the faulting `.so` and function before it dies — see
-[Diagnosing Crashes](../diagnosing-crashes/).
+[Diagnosing Crashes](/guides/diagnosing-crashes/).
 
 ## Not implemented (yet)
 

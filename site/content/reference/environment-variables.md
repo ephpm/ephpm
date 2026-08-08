@@ -103,7 +103,7 @@ unaffected.
 Unix only. On Windows the variable is ignored: memory faults arrive as SEH
 exceptions rather than signals, and that path is not implemented.
 
-See [Diagnosing crashes](../../guides/diagnosing-crashes/) for how to read the
+See [Diagnosing crashes](/guides/diagnosing-crashes/) for how to read the
 report.
 
 ## See also
