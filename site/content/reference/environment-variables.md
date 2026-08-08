@@ -84,6 +84,28 @@ EPHPM_SERVER__HTTP3__ALT_SVC_MAX_AGE=86400
 RUST_LOG=info,ephpm_query_stats=debug,ephpm_cluster=trace
 ```
 
+## Crash-diagnostics env var
+
+`EPHPM_FATAL_HANDLER` controls the fatal-signal diagnostic handler. It is **not**
+a config key — it is read once at process start, before the config file is even
+located, because the handler has to be installed before anything can crash.
+
+| Value | Effect |
+|-------|--------|
+| unset (default) | Handler installed. On `SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE`/`SIGABRT`, ePHPm writes a diagnostic block to stderr and then dies with the original exit status. |
+| `0`, `off`, `false`, `no` | Handler not installed. Crashes are silent again, exactly as before v0.7. |
+
+Disabling it does not change the exit status either way — the handler always
+re-raises with the default disposition, so the container still exits 139
+(`SIGSEGV`) or 134 (`SIGABRT`) and Kubernetes CrashLoopBackOff accounting is
+unaffected.
+
+Unix only. On Windows the variable is ignored: memory faults arrive as SEH
+exceptions rather than signals, and that path is not implemented.
+
+See [Diagnosing crashes](../../guides/diagnosing-crashes/) for how to read the
+report.
+
 ## See also
 
 - [Configuration](config/) — every key with type and default

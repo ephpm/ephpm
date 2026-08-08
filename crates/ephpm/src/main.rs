@@ -30,6 +30,7 @@ use tracing_subscriber::{EnvFilter, Layer};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod fatal_signal;
 mod service;
 
 /// ePHPm — All-in-one PHP application server
@@ -275,6 +276,18 @@ enum KvSubcommand {
 }
 
 fn main() -> ExitCode {
+    // First thing, before argument parsing and long before any PHP extension
+    // or native middleware is dlopen'd: a fault inside one of those is the
+    // whole reason this exists, and a fault during their *initialisation* is
+    // the one an operator has least other evidence about.
+    //
+    // Always on, deliberately. It costs one `sigaction` per signal plus a
+    // single warm-up `backtrace()` at startup and nothing at all thereafter,
+    // and a knob would have to be set before the crash nobody predicted. The
+    // `EPHPM_FATAL_HANDLER=0` escape hatch documented on `install` is there
+    // for the case where the handler itself misbehaves.
+    fatal_signal::install();
+
     match run() {
         Ok(code) => code,
         Err(e) => {
@@ -886,7 +899,18 @@ fn run_with_config(
     if config.php.workers > 0 {
         tracing::info!(workers = config.php.workers, "concurrent PHP executions capped");
     }
-    let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    //
+    // Identical to `Runtime::new()` (multi-thread, all drivers enabled) except
+    // for the thread hook, which gives every worker and blocking-pool thread an
+    // alternate signal stack if it lacks one. Without an alternate stack the
+    // fatal-signal handler cannot run for a stack-overflow fault — which is
+    // precisely one of the faults worth diagnosing. PHP executes on this
+    // runtime's blocking pool, so the hook must be on this runtime.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .on_thread_start(fatal_signal::install_thread_altstack)
+        .build()
+        .context("failed to create tokio runtime")?;
     let result = rt.block_on(async { ephpm_server::serve(config).await });
 
     // Shutdown PHP runtime
