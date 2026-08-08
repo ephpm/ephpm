@@ -2,12 +2,20 @@
 #
 # Cache strategy:
 #   base:    System deps + Rust toolchain — changes rarely.
+#   deps:    Workspace manifests + stub sources + `cargo fetch`. Keyed on the
+#            Cargo.toml/Cargo.lock set only, so it survives every source edit.
 #   php-sdk: Single RUN that downloads + extracts the prebuilt PHP SDK from
 #            github.com/ephpm/php-sdk releases. Keyed only on PHP_SDK_VERSION,
 #            so containerd's image layer cache reuses it across all source
 #            changes. Bumping PHP_SDK_VERSION (e.g., 8.5.2 → 8.5.3) is the
 #            only thing that invalidates this ~80 MB layer.
-#   builder: Cargo manifest fetch (cached until Cargo.lock changes) → full source build.
+#   builder: Dependency precompile (from deps) → full source build.
+#
+# Stage ORDER is load-bearing: `deps` sits before `php-sdk` so that
+# `docker build --target deps` — the CI canary in .github/workflows/ci.yml —
+# stops without ever downloading the SDK. The legacy builder (DOCKER_BUILDKIT=0,
+# the only path the runner fleet supports) walks stages top-to-bottom, so a
+# `deps` placed after `php-sdk` would drag the ~80 MB SDK download in with it.
 #
 # Build:
 #   podman build -f docker/Dockerfile --build-arg PHP_SDK_VERSION=8.5.2 -t ephpm:dev .
@@ -67,64 +75,22 @@ ENV RUSTUP_HOME=/usr/local/rustup \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal
 
-# ── Stage 2: php-sdk — download prebuilt SDK ─────────────────────────────────
+# ── Stage 2: deps — workspace manifests + stub sources + `cargo fetch` ───────
 #
-# Pure shell + curl + tar — NO source COPY before the download — so the
-# resulting image layer is keyed only on the base image and PHP_SDK_VERSION.
-# containerd reuses it indefinitely across feature work / refactors / docs
-# changes. Only a version bump invalidates it.
+# Copy only manifest files + create stubs, then `cargo fetch`. This layer is
+# invalidated only when Cargo.lock or a Cargo.toml changes, not on every
+# source edit.
+#
+# This is also the cheapest stage that can fail from manifest/stub drift, which
+# is why it is a NAMED stage rather than a few more lines of `builder`: CI can
+# build `--target deps` and get the whole "does docker/Dockerfile still agree
+# with the workspace manifests?" answer for a fraction of a full image build.
+# See the docker-build-canary job in .github/workflows/ci.yml.
 
-FROM base AS php-sdk
-
-ARG PHP_SDK_VERSION
-
-# Detect arch at build time (works for both x86_64 and aarch64 builders).
-# Layout we extract matches xtask::php_sdk_dir_for() — Linux SDKs carry a
-# `-gnu` libc suffix (glibc-linked libphp.a; the binary must dlopen()):
-#   /opt/php-sdk/<version>-linux-<arch>-gnu/{lib,include}/
-RUN set -eux; \
-    arch=$(uname -m); \
-    sdk_dir="/opt/php-sdk/${PHP_SDK_VERSION}-linux-${arch}-gnu"; \
-    asset="php-sdk-${PHP_SDK_VERSION}-linux-${arch}-gnu.tar.gz"; \
-    url="https://github.com/ephpm/php-sdk/releases/download/v${PHP_SDK_VERSION}/${asset}"; \
-    mkdir -p "${sdk_dir}"; \
-    curl -fSL "${url}" -o /tmp/sdk.tar.gz; \
-    sha256sum /tmp/sdk.tar.gz; \
-    tar xzf /tmp/sdk.tar.gz -C "${sdk_dir}"; \
-    rm /tmp/sdk.tar.gz; \
-    test -f "${sdk_dir}/lib/libphp.a"; \
-    echo "==> SDK lib/ contents:"; \
-    ls -la "${sdk_dir}/lib/"; \
-    echo "==> libz.a archive members:"; \
-    ar t "${sdk_dir}/lib/libz.a"; \
-    echo "==> gz* symbols in libz.a (full):"; \
-    nm "${sdk_dir}/lib/libz.a" 2>/dev/null | grep -E " (T|t|R|D|W) gz" || echo "(no gz* symbols found!)"; \
-    echo "==> sanity: looking for gzerror specifically:"; \
-    nm "${sdk_dir}/lib/libz.a" 2>/dev/null | grep gzerror || echo "(gzerror missing!)"
-
-# ── Stage 3: builder — dep fetch layer then full source build ─────────────────
-
-FROM base AS builder
-
-ARG PHP_SDK_VERSION
-
-# Release-time override forwarded by .github/workflows/release.yml so the
-# in-container `cargo xtask release` bakes the actual tag into the binary
-# (`ephpm --version`). Empty for local `docker build` and `cargo xtask e2e`,
-# in which case crates/ephpm/build.rs falls back to CARGO_PKG_VERSION.
-ARG EPHPM_RELEASE_VERSION=""
-ENV EPHPM_RELEASE_VERSION=${EPHPM_RELEASE_VERSION}
+FROM base AS deps
 
 WORKDIR /src
 
-# Pull the SDK in from the cached php-sdk stage. xtask::release_native
-# checks PHP_SDK_PATH and skips downloading if the directory already
-# contains lib/libphp.a, so the release build below is a pure cargo build.
-COPY --from=php-sdk /opt/php-sdk /src/php-sdk
-
-# Copy only manifest files + create stubs, then `cargo fetch`.
-# This layer is invalidated only when Cargo.lock or a Cargo.toml changes,
-# not on every source edit.
 COPY Cargo.toml Cargo.lock ./
 COPY xtask/Cargo.toml                     xtask/Cargo.toml
 COPY crates/ephpm/Cargo.toml              crates/ephpm/Cargo.toml
@@ -184,7 +150,67 @@ RUN mkdir -p \
     printf 'fn main() {}\n' > crates/ephpm-sqld/build.rs && \
     printf 'fn main() {}\n' > crates/ephpm/build.rs
 
+# The drift tripwire. `cargo fetch` resolves every workspace target before it
+# downloads anything, so a manifest that names a target with no file on disk
+# (the #230 → #252 breakage) hard-errors right here — seconds into the stage,
+# with no dependency traffic and no compilation.
 RUN cargo fetch
+
+# ── Stage 3: php-sdk — download prebuilt SDK ─────────────────────────────────
+#
+# Pure shell + curl + tar — NO source COPY before the download — so the
+# resulting image layer is keyed only on the base image and PHP_SDK_VERSION.
+# containerd reuses it indefinitely across feature work / refactors / docs
+# changes. Only a version bump invalidates it.
+
+FROM base AS php-sdk
+
+ARG PHP_SDK_VERSION
+
+# Detect arch at build time (works for both x86_64 and aarch64 builders).
+# Layout we extract matches xtask::php_sdk_dir_for() — Linux SDKs carry a
+# `-gnu` libc suffix (glibc-linked libphp.a; the binary must dlopen()):
+#   /opt/php-sdk/<version>-linux-<arch>-gnu/{lib,include}/
+RUN set -eux; \
+    arch=$(uname -m); \
+    sdk_dir="/opt/php-sdk/${PHP_SDK_VERSION}-linux-${arch}-gnu"; \
+    asset="php-sdk-${PHP_SDK_VERSION}-linux-${arch}-gnu.tar.gz"; \
+    url="https://github.com/ephpm/php-sdk/releases/download/v${PHP_SDK_VERSION}/${asset}"; \
+    mkdir -p "${sdk_dir}"; \
+    curl -fSL "${url}" -o /tmp/sdk.tar.gz; \
+    sha256sum /tmp/sdk.tar.gz; \
+    tar xzf /tmp/sdk.tar.gz -C "${sdk_dir}"; \
+    rm /tmp/sdk.tar.gz; \
+    test -f "${sdk_dir}/lib/libphp.a"; \
+    echo "==> SDK lib/ contents:"; \
+    ls -la "${sdk_dir}/lib/"; \
+    echo "==> libz.a archive members:"; \
+    ar t "${sdk_dir}/lib/libz.a"; \
+    echo "==> gz* symbols in libz.a (full):"; \
+    nm "${sdk_dir}/lib/libz.a" 2>/dev/null | grep -E " (T|t|R|D|W) gz" || echo "(no gz* symbols found!)"; \
+    echo "==> sanity: looking for gzerror specifically:"; \
+    nm "${sdk_dir}/lib/libz.a" 2>/dev/null | grep gzerror || echo "(gzerror missing!)"
+
+# ── Stage 4: builder — dependency precompile then full source build ──────────
+#
+# Continues from `deps` (manifests + stubs + a populated cargo registry) rather
+# than from `base`, so the manifest/stub block lives in exactly one place.
+
+FROM deps AS builder
+
+ARG PHP_SDK_VERSION
+
+# Release-time override forwarded by .github/workflows/release.yml so the
+# in-container `cargo xtask release` bakes the actual tag into the binary
+# (`ephpm --version`). Empty for local `docker build` and `cargo xtask e2e`,
+# in which case crates/ephpm/build.rs falls back to CARGO_PKG_VERSION.
+ARG EPHPM_RELEASE_VERSION=""
+ENV EPHPM_RELEASE_VERSION=${EPHPM_RELEASE_VERSION}
+
+# Pull the SDK in from the cached php-sdk stage. xtask::release_native
+# checks PHP_SDK_PATH and skips downloading if the directory already
+# contains lib/libphp.a, so the release build below is a pure cargo build.
+COPY --from=php-sdk /opt/php-sdk /src/php-sdk
 
 # Pre-compile all third-party dependencies using the stub sources so their compiled
 # .rlib artifacts are cached in this Docker layer. When real source replaces the stubs
@@ -223,7 +249,7 @@ RUN bash -euo pipefail -c 'cargo xtask release ${PHP_SDK_VERSION} 2>&1 | tee /tm
 RUN cp $(find target -name ephpm -type f -path '*/release/*' | head -1) /ephpm && \
     ls -lh /ephpm
 
-# ── Stage 4: runtime ──────────────────────────────────────────────────────────
+# ── Stage 5: runtime ──────────────────────────────────────────────────────────
 
 # The ephpm binary is glibc-dynamic (it must dlopen() shared PHP extensions
 # and middleware), so the runtime base has to ship glibc — a Debian slim
