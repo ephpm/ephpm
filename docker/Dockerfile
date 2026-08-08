@@ -13,9 +13,12 @@
 #
 # Stage ORDER is load-bearing: `deps` sits before `php-sdk` so that
 # `docker build --target deps` — the CI canary in .github/workflows/ci.yml —
-# stops without ever downloading the SDK. The legacy builder (DOCKER_BUILDKIT=0,
-# the only path the runner fleet supports) walks stages top-to-bottom, so a
-# `deps` placed after `php-sdk` would drag the ~80 MB SDK download in with it.
+# stops without ever downloading the ~80 MB SDK, under ANY builder. A solver
+# that prunes by stage dependency skips php-sdk either way; the classic
+# non-BuildKit builder does not prune, and walks the file linearly to the
+# --target stage, so with the old ordering it would have paid for the SDK.
+# Putting deps first makes the canary cheap without depending on which of
+# those the ephemerd shim's /build endpoint happens to be.
 #
 # Build:
 #   podman build -f docker/Dockerfile --build-arg PHP_SDK_VERSION=8.5.2 -t ephpm:dev .
