@@ -1903,15 +1903,19 @@ impl Router {
             // produces them. No content-length (unknown up front) — chunked
             // transfer. Optionally wrapped in a flush-per-chunk brotli
             // encoder when `[server.response] compression_streaming` says so.
-            ephpm_php::worker_bridge::WorkerResponse::Streaming { status, headers, body_rx } => {
-                build_streamed_worker_response(
-                    status,
-                    headers,
-                    body_rx,
-                    accepts_br,
-                    self.compression,
-                )
-            }
+            ephpm_php::worker_bridge::WorkerResponse::Streaming {
+                status,
+                headers,
+                body_rx,
+                aborted,
+            } => build_streamed_worker_response(
+                status,
+                headers,
+                body_rx,
+                aborted,
+                accepts_br,
+                self.compression,
+            ),
         }
     }
 
@@ -2629,10 +2633,18 @@ fn stream_request_body<B: RequestBody>(
 /// pre-knob code path, no wrapper allocated. Otherwise the channel is wrapped
 /// in a flush-per-chunk brotli encoder task ([`crate::stream_compress`]) and
 /// `Content-Encoding: br` + `Vary: Accept-Encoding` are added.
+///
+/// `aborted` travels with the body all the way to hyper: if the worker dies
+/// before finishing, the body ends in an error rather than a clean EOF, so the
+/// client cannot read the truncation as a successful `200`. It is threaded past
+/// the brotli wrapper unchanged — the wrapper's own channel closes only after
+/// the worker's does, so the flag is already set by the time the outer stream
+/// observes the end.
 fn build_streamed_worker_response(
     status: u16,
     headers: Vec<(String, String)>,
     body_rx: tokio::sync::mpsc::Receiver<Bytes>,
+    aborted: ephpm_php::worker_bridge::StreamAbortFlag,
     accepts_br: bool,
     compression: CompressionSettings,
 ) -> Response<ServerBody> {
@@ -2651,9 +2663,9 @@ fn build_streamed_worker_response(
 
     let body = if compress {
         resp = resp.header("content-encoding", "br").header("vary", "Accept-Encoding");
-        body::channel_body(crate::stream_compress::brotli_stream_body(body_rx))
+        body::channel_body(crate::stream_compress::brotli_stream_body(body_rx), aborted)
     } else {
-        body::channel_body(body_rx)
+        body::channel_body(body_rx, aborted)
     };
     resp.body(body).unwrap_or_else(|_| {
         error_response(StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error")
@@ -4636,6 +4648,12 @@ echo "post response";
         ]
     }
 
+    /// A fresh, un-tripped abort flag — the state `response_begin` hands to
+    /// hyper for a healthy streamed response.
+    fn live_stream() -> ephpm_php::worker_bridge::StreamAbortFlag {
+        Arc::new(std::sync::atomic::AtomicBool::new(false))
+    }
+
     #[test]
     fn streaming_compression_parse() {
         assert_eq!(StreamingCompression::parse("off"), Some(StreamingCompression::Off));
@@ -4684,6 +4702,7 @@ echo "post response";
             200,
             sse_headers(),
             rx,
+            live_stream(),
             true,
             compression_with(StreamingCompression::Off),
         );
@@ -4723,6 +4742,7 @@ data: two
             200,
             sse_headers(),
             rx,
+            live_stream(),
             true,
             compression_with(StreamingCompression::Sse),
         );
@@ -4779,6 +4799,7 @@ data: two
             200,
             headers,
             rx,
+            live_stream(),
             true,
             compression_with(StreamingCompression::Sse),
         );
@@ -4787,6 +4808,105 @@ data: two
         drop(tx);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b" raw");
+    }
+
+    // -- a bailout mid-stream must break the response, not finish it ----
+    //
+    // Once `send_response_stream` has delivered status + headers they are on
+    // the wire and cannot be retracted. The only remaining way to tell the
+    // client "this failed" is to refuse to terminate the body correctly: hyper
+    // must see an error, so it emits no terminating chunk under
+    // `Transfer-Encoding: chunked`. A clean short body and an aborted short
+    // body carry identical bytes — only the terminal item differs, which is
+    // what these tests pin.
+
+    /// Worker dies mid-stream, uncompressed: the body resolves to an **error**.
+    /// Before the fix, dropping the chunk sender was indistinguishable from a
+    /// normal end of body, so the client read a well-formed, truncated `200`.
+    #[tokio::test]
+    async fn streamed_response_aborts_when_worker_bails_mid_body() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let aborted = live_stream();
+        let resp = build_streamed_worker_response(
+            200,
+            sse_headers(),
+            rx,
+            Arc::clone(&aborted),
+            true,
+            compression_with(StreamingCompression::Off),
+        );
+        // The 200 status line already went out. That is the premise here, not
+        // a bug — it cannot be retracted, only contradicted by the framing.
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        tx.send(Bytes::from_static(b"data: one\n\n")).await.unwrap();
+        // Reproduce `clear_in_flight_streams`'s ordering exactly: set the flag,
+        // THEN drop the sender. The reverse order would race.
+        aborted.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(tx);
+
+        let err = resp
+            .into_body()
+            .collect()
+            .await
+            .expect_err("an aborted stream must not collect into a complete body");
+        assert!(
+            err.to_string().contains("incomplete"),
+            "the error should say why the transfer failed, got: {err}"
+        );
+    }
+
+    /// Same, through the brotli streaming wrapper: the flag is read on the
+    /// outer stream, which ends only after the encoder task's upstream does, so
+    /// compression must not swallow the abort.
+    #[tokio::test]
+    async fn streamed_brotli_response_aborts_when_worker_bails_mid_body() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let aborted = live_stream();
+        let resp = build_streamed_worker_response(
+            200,
+            sse_headers(),
+            rx,
+            Arc::clone(&aborted),
+            true,
+            compression_with(StreamingCompression::Sse),
+        );
+        assert_eq!(
+            resp.headers().get("content-encoding").and_then(|v| v.to_str().ok()),
+            Some("br"),
+            "precondition: this test must exercise the compressed path"
+        );
+
+        tx.send(Bytes::from_static(b"data: one\n\n")).await.unwrap();
+        aborted.store(true, std::sync::atomic::Ordering::SeqCst);
+        drop(tx);
+
+        assert!(
+            resp.into_body().collect().await.is_err(),
+            "an aborted brotli stream must not collect into a complete body"
+        );
+    }
+
+    /// The inverse guard: a stream that ends with the flag clear still
+    /// completes normally. Without it, "always error" would satisfy the two
+    /// tests above while breaking every streamed response in the product.
+    #[tokio::test]
+    async fn streamed_response_completes_when_abort_flag_stays_clear() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let aborted = live_stream();
+        let resp = build_streamed_worker_response(
+            200,
+            sse_headers(),
+            rx,
+            Arc::clone(&aborted),
+            true,
+            compression_with(StreamingCompression::Off),
+        );
+        tx.send(Bytes::from_static(b"data: one\n\n")).await.unwrap();
+        drop(tx);
+        assert!(!aborted.load(std::sync::atomic::Ordering::SeqCst));
+        let body = resp.into_body().collect().await.expect("clean EOF").to_bytes();
+        assert_eq!(&body[..], b"data: one\n\n");
     }
 
     // -- metrics label helper (#136) --------------------------------

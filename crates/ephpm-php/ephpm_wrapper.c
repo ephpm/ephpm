@@ -792,6 +792,40 @@ void ephpm_request_set_ini(const char *key, const char *value)
     request_ini_count++;
 }
 
+/* Return codes for ephpm_execute_request(). Must match the match arms in
+ * crates/ephpm-php/src/lib.rs::execute_php. */
+#define EPHPM_EXEC_OK            0
+#define EPHPM_EXEC_STARTUP_FAIL (-1)
+#define EPHPM_EXEC_SCRIPT_EXIT  (-2)
+#define EPHPM_EXEC_BAILOUT      (-3)
+
+/*
+ * Did a zend_bailout() happen since the last ephpm_bailout_reset()?
+ *
+ * This is the ONLY reliable bailout signal available to us, and the reason is
+ * worth spelling out: php_execute_script() wraps the whole compile+execute in
+ * its OWN zend_try/zend_end_try. zend_end_try does not re-raise — it restores
+ * EG(bailout) and falls through — so a bailout raised anywhere inside the
+ * script is fully absorbed there and NEVER reaches a SETJMP we installed
+ * around the call. Our guard only ever fires for a bailout raised outside
+ * php_execute_script.
+ *
+ * PG(last_error_type) covers the fatals that go through zend_error()
+ * (E_ERROR, uncaught Throwable via zend_exception_error, parse errors), but a
+ * bare zend_bailout() — which a C extension, a resource limit, or OPcache can
+ * raise directly — sets no error type at all. Before this check such a request
+ * came back as a clean HTTP 200 carrying a truncated body.
+ *
+ * _zend_bailout() sets CG(unclean_shutdown) = 1 immediately before its
+ * LONGJMP, unconditionally and regardless of which zend_try catches it, and
+ * nothing else in the engine sets that flag. init_compiler() (via
+ * zend_activate() <- php_request_startup()) clears it per request; we clear it
+ * explicitly as well so the signal can never be a leftover from a previous
+ * request on this thread.
+ */
+#define ephpm_bailout_reset()    (CG(unclean_shutdown) = 0)
+#define ephpm_bailout_observed() (CG(unclean_shutdown) != 0)
+
 /*
  * Execute a PHP request.
  *
@@ -808,9 +842,13 @@ void ephpm_request_set_ini(const char *key, const char *value)
  * __thread-local per-request state, so concurrent reuse is safe.
  *
  * Returns:
- *   0  on success
- *  -1  if php_request_startup failed (only on cold start)
- *  -2  if PHP bailed out (fatal error, exit(), die())
+ *   EPHPM_EXEC_OK          (0)  the script ran to completion
+ *   EPHPM_EXEC_STARTUP_FAIL(-1) php_request_startup failed (only on cold start)
+ *   EPHPM_EXEC_SCRIPT_EXIT (-2) the script chose to stop (exit()/die()); the
+ *                               captured response is complete and trustworthy
+ *   EPHPM_EXEC_BAILOUT     (-3) a zend_bailout() unwound the script; the
+ *                               captured response is TRUNCATED and must never
+ *                               be completed as a success (see below)
  */
 int ephpm_execute_request(const char *filename)
 {
@@ -877,7 +915,7 @@ int ephpm_execute_request(const char *filename)
     SG(server_context) = &ephpm_server_context_marker;
 
     if (php_request_startup() != SUCCESS) {
-        return -1;
+        return EPHPM_EXEC_STARTUP_FAIL;
     }
     request_active = 1;
 
@@ -913,11 +951,12 @@ int ephpm_execute_request(const char *filename)
     /* Reset PHP's last-error tracking so we can tell whether THIS script
      * raised a fatal (vs. a value carried over from a prior request). */
     PG(last_error_type) = 0;
+    /* Same for the bailout flag — see ephpm_bailout_observed() above. */
+    ephpm_bailout_reset();
 
     /* Execute the script with bailout protection.
      * PHP's zend_try/zend_catch uses setjmp/longjmp. */
-    int result = 0;
-    int fatal_bailout = 0;
+    int result = EPHPM_EXEC_OK;
     JMP_BUF *__orig_bailout = EG(bailout);
     JMP_BUF __bailout;
 
@@ -933,13 +972,13 @@ int ephpm_execute_request(const char *filename)
          * and should preserve whatever status the script set. */
         if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
             zend_clear_exception();
-            result = -2;
+            result = EPHPM_EXEC_SCRIPT_EXIT;
         }
     } else {
-        /* PHP bailed out via zend_bailout() — out-of-memory, max
-         * execution time, etc. Older fatal classes hit this path. */
-        result = -2;
-        fatal_bailout = 1;
+        /* A zend_bailout() raised OUTSIDE php_execute_script's own zend_try
+         * (rare — that guard absorbs everything raised by the script itself).
+         * The CG(unclean_shutdown) check below covers both cases. */
+        result = EPHPM_EXEC_BAILOUT;
     }
     EG(bailout) = __orig_bailout;
 
@@ -980,10 +1019,14 @@ int ephpm_execute_request(const char *filename)
     capture_response_headers();
     response_status_code = SG(sapi_headers).http_response_code;
 
-    /* Decide whether to override status with 500. There are two paths:
+    /* Decide whether to override status with 500. There are three paths:
      *
-     *   1. zend_bailout() longjmps out of execute (legacy fatal path):
-     *      caught by SETJMP above — fatal_bailout = 1.
+     *   1. zend_bailout() — out of memory, a resource limit, OPcache, or a
+     *      C extension calling zend_bailout() directly. Detected via
+     *      CG(unclean_shutdown); see the ephpm_bailout_observed() comment for
+     *      why the SETJMP above cannot see it. Checked AFTER the shutdown
+     *      functions / ob flush so a bailout in either of those (which also
+     *      truncates the response) counts too.
      *
      *   2. PHP 8.x uncaught Throwable: zend_exception_error() calls
      *      zend_error_va(... | E_DONT_BAIL ...) which prints the fatal
@@ -992,12 +1035,22 @@ int ephpm_execute_request(const char *filename)
      *      catch this case. Without it, "Fatal error: Uncaught Error:
      *      Call to undefined function ..." comes back as 200 OK.
      *
-     * Either way, we only override when the script hasn't already set
-     * an explicit error status (PHP exit() / http_response_code()). */
+     *   3. zend_error(E_ERROR, ...) — sets last_error_type AND bails out, so
+     *      both signals fire. 500 either way.
+     *
+     * A bailout forces 500 UNCONDITIONALLY: it is never something a script
+     * asks for (PHP 8's exit() throws an unwind-exit exception instead), so a
+     * status the script set earlier describes a response it never finished
+     * producing. The last_error_type path keeps its narrower rule — only
+     * override a default 200 — because a framework's own error handler
+     * legitimately sets its status before the engine records the fatal. */
     int fatal_error_mask = E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR
                            | E_USER_ERROR | E_RECOVERABLE_ERROR | E_PARSE;
-    int hit_fatal = fatal_bailout || (PG(last_error_type) & fatal_error_mask);
-    if (hit_fatal && response_status_code == 200) {
+    if (ephpm_bailout_observed()) {
+        result = EPHPM_EXEC_BAILOUT;
+        response_status_code = 500;
+    } else if ((PG(last_error_type) & fatal_error_mask)
+               && response_status_code == 200) {
         response_status_code = 500;
     }
 
@@ -2166,14 +2219,20 @@ void ephpm_worker_set_populate_superglobals(int enable)
  *    2  same, but the request ended on a PHP fatal (uncaught Throwable /
  *       E_ERROR). The synthesized response was forced to 500 unless the script
  *       had already chosen a status
- *   -2  a fatal / zend_bailout unwound out of the framework (recycle + the
- *       Rust supervisor fulfils any parked oneshot with a 500)
+ *   -2  a zend_bailout() killed the worker (recycle; the Rust supervisor
+ *       fulfils any parked oneshot with a 500 and ABORTS an already-begun
+ *       streaming response rather than letting it end cleanly)
  */
 int ephpm_worker_run(const char *script)
 {
     int result = 0;
     JMP_BUF *__orig_bailout = EG(bailout);
     JMP_BUF __bailout;
+
+    /* See ephpm_bailout_observed(): php_execute_script's own zend_try absorbs
+     * every bailout raised inside the worker script, so this SETJMP fires only
+     * for one raised outside it. CG(unclean_shutdown) catches both. */
+    ephpm_bailout_reset();
 
     EG(bailout) = &__bailout;
     if (SETJMP(__bailout) == 0) {
@@ -2194,15 +2253,26 @@ int ephpm_worker_run(const char *script)
             zend_clear_exception();
         }
 
-        /* The script ended with a request still in flight (exit()/die()
-         * mid-request, or a break out of the loop without send_response).
-         * Deliver what the request actually produced — SAPI status, headers
-         * emitted via header()/setcookie(), and the captured echo output —
-         * instead of letting the parked oneshot die with the thread (which
-         * would turn every wp_die()/admin-ajax exit into a bogus 500). This
-         * is safe here: unwind-exit is clean stack unwinding, not a bailout,
-         * so SAPI globals and the capture buffers are intact. */
-        if (req_in_flight && g_worker_ops.send_response) {
+        /* Branch 1 — a bailout absorbed by php_execute_script's own zend_try.
+         * Whatever the capture buffers hold is truncated, so we must NOT
+         * synthesize a response from them: a bare zend_bailout() sets no error
+         * type, so the hit_fatal check further down would see 200 and ship the
+         * partial body as a success. Return -2 with the oneshot still parked —
+         * the Rust supervisor 500s it, or aborts the body stream if the
+         * headers already went out (worker_pool.rs / clear_in_flight_streams).
+         *
+         * Branch 2 — the script ended with a request still in flight
+         * (exit()/die() mid-request, or a break out of the loop without
+         * send_response). Deliver what the request actually produced — SAPI
+         * status, headers emitted via header()/setcookie(), and the captured
+         * echo output — instead of letting the parked oneshot die with the
+         * thread (which would turn every wp_die()/admin-ajax exit into a bogus
+         * 500). That is safe only because unwind-exit is clean stack
+         * unwinding, not a bailout, so SAPI globals and the capture buffers
+         * are intact — which is exactly why branch 1 has to come first. */
+        if (ephpm_bailout_observed()) {
+            result = -2;
+        } else if (req_in_flight && g_worker_ops.send_response) {
             /* Unwind-exit skips the script's own ob_end_* calls, and worker
              * mode has no per-request RSHUTDOWN to flush buffers — content
              * still sitting in userland output buffers (WordPress wraps whole
