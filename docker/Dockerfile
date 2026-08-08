@@ -159,11 +159,21 @@ RUN mkdir -p \
         crates/ephpm-php/src \
         crates/ephpm-query-stats/src \
         crates/ephpm-server/src \
+        crates/ephpm-server/examples \
         crates/ephpm-sqld/src && \
     printf 'fn main() {}\n' > xtask/src/main.rs && \
     printf 'fn main() {}\n' > crates/ephpm/src/main.rs && \
     for d in ephpm-cluster ephpm-config ephpm-db ephpm-kv ephpm-middleware ephpm-middleware-builtins ephpm-middleware-cors ephpm-middleware-jwt ephpm-middleware-ratelimit ephpm-middleware-security-headers ephpm-php ephpm-query-stats ephpm-server ephpm-sqld; do \
         touch crates/$d/src/lib.rs; \
+    done && \
+    # ephpm-server declares three `[[example]] crate-type = ["cdylib"]` targets
+    # (the middleware-ABI probes added in #230). A named [[example]] must exist
+    # as a file or cargo hard-errors during this stub stage with
+    # "can't find 'mw_probe_abi_v2' example at examples/mw_probe_abi_v2.rs" --
+    # before a single dependency is fetched. Keep this list in sync with the
+    # [[example]] blocks in crates/ephpm-server/Cargo.toml.
+    for e in mw_probe_v1 mw_probe_abi_v2 mw_probe_no_invoke; do \
+        printf 'fn main() {}\n' > crates/ephpm-server/examples/$e.rs; \
     done && \
     # ephpm-php Cargo.toml declares `build = "build.rs"` explicitly, so cargo
     # errors out (rather than silently skipping) if the file is missing during
