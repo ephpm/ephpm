@@ -433,7 +433,12 @@ Middleware runs **in-process with the same privileges as ePHPm itself**.
 There is no sandbox: a buggy module can crash the server; a malicious one
 owns it. Only load modules you built or trust — treat a `.so` mount like a
 binary you're executing, because it is. (Rust-authored modules get panic
-containment from `declare!`, but that is not a security boundary.)
+containment from `declare!`, but that is not a security boundary — a
+*memory* fault is not a panic and is not contained.)
+
+When a module does fault, ePHPm writes a fatal-signal report to stderr
+naming the faulting `.so` and function before it dies — see
+[Diagnosing Crashes](/guides/diagnosing-crashes/).
 
 ## Not implemented (yet)
 

@@ -9,6 +9,24 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(php_linked)");
     println!("cargo::rerun-if-env-changed=PHP_SDK_PATH");
 
+    // `backtrace(3)` / `backtrace_symbols_fd(3)` back the fatal-signal
+    // diagnostic handler (src/fatal_signal.rs). They ship with glibc, Apple's
+    // libSystem and FreeBSD's libexecinfo, but NOT with musl — linking against
+    // them there would fail at link time, so the handler degrades to reporting
+    // the signal, fault address and thread without a stack.
+    //
+    // Linux release builds target `<arch>-unknown-linux-gnu` (see CLAUDE.md),
+    // so the stack is present on every shipped Linux artifact.
+    let has_execinfo = match env::var("CARGO_CFG_TARGET_OS").unwrap_or_default().as_str() {
+        "linux" | "android" => env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default() == "gnu",
+        "macos" | "ios" | "freebsd" => true,
+        _ => false,
+    };
+    println!("cargo::rustc-check-cfg=cfg(has_execinfo)");
+    if has_execinfo {
+        println!("cargo::rustc-cfg=has_execinfo");
+    }
+
     // Forward the release tag (set by .github/workflows/release.yml before
     // `cargo xtask release`) into the binary so `ephpm --version` reports
     // the actual published tag instead of the frozen workspace

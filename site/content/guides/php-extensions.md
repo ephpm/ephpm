@@ -169,6 +169,10 @@ Same as vanilla PHP and native middleware: extensions run in-process. A
 buggy extension can crash the whole server; a malicious one owns it. Only
 load extensions you trust.
 
+When one does crash, ePHPm writes a fatal-signal report to stderr naming
+the faulting `.so` and function before it dies — see
+[Diagnosing Crashes](/guides/diagnosing-crashes/).
+
 ## Relationship to the static set
 
 | | Static (baseline) | Shared (escape hatch) |
