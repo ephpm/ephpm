@@ -125,7 +125,11 @@ pub fn install_thread_altstack() {
 
 #[cfg(unix)]
 mod unix {
-    use std::cell::{RefCell, UnsafeCell};
+    use std::cell::RefCell;
+    // Only the backtrace machinery uses `UnsafeCell` (for the frame array), so
+    // on a target without `backtrace(3)` an ungated import is a dead one.
+    #[cfg(has_execinfo)]
+    use std::cell::UnsafeCell;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -207,11 +211,14 @@ mod unix {
     /// be running on an alternate signal stack that Rust std sized at roughly
     /// one page plus `SIGSTKSZ`, and a stack-overflow fault is exactly the case
     /// where that budget is tightest.
+    #[cfg(has_execinfo)]
     const MAX_FRAMES: usize = 64;
 
     /// [`MAX_FRAMES`] in the type `backtrace(3)` wants, without a lossy cast.
+    #[cfg(has_execinfo)]
     const MAX_FRAMES_C: c_int = 64;
 
+    #[cfg(has_execinfo)]
     const _: () = assert!(MAX_FRAMES_C as usize == MAX_FRAMES);
 
     /// Alternate-stack size used only when a thread has none. 32 KiB is
@@ -259,16 +266,23 @@ mod unix {
     /// handler's own frame stays small enough for a cramped alternate stack;
     /// exclusive access is guaranteed by the [`OWNER`] gate, which admits one
     /// thread only.
+    ///
+    /// Gated with the rest of the backtrace machinery: without `backtrace(3)`
+    /// nothing ever fills it, and an ungated dead `static` fails the workspace's
+    /// `-D warnings` on a musl build.
+    #[cfg(has_execinfo)]
     static FRAMES: SyncCell<[*mut c_void; MAX_FRAMES]> =
         SyncCell(UnsafeCell::new([std::ptr::null_mut(); MAX_FRAMES]));
 
     /// `Sync` wrapper for handler-owned mutable statics.
+    #[cfg(has_execinfo)]
     struct SyncCell<T>(UnsafeCell<T>);
 
     // SAFETY: the contained value is only ever touched by the single thread
     // that won the `OWNER` compare-exchange, and that thread never releases
     // ownership — the process terminates instead. No concurrent access is
     // therefore possible, which is what `Sync` requires.
+    #[cfg(has_execinfo)]
     unsafe impl<T> Sync for SyncCell<T> {}
 
     pub(super) fn install() {
@@ -862,6 +876,7 @@ mod unix {
         }
 
         /// Zero-padded two-digit decimal, for frame indices.
+        #[cfg(has_execinfo)]
         fn dec2(&mut self, value: u64) {
             if value < 10 {
                 self.push(b'0');
@@ -950,9 +965,11 @@ mod unix {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     fn thread_id() -> u64 {
         let mut tid: u64 = 0;
-        // SAFETY: a null `pthread_t` means "the calling thread"; `tid` is a
-        // valid out-pointer. Reads the thread struct without locking.
-        unsafe { libc::pthread_threadid_np(std::ptr::null_mut(), &raw mut tid) };
+        // SAFETY: on Apple `pthread_t` is `uintptr_t`, not a pointer type, so
+        // "the calling thread" is the integer 0 rather than a null pointer.
+        // `tid` is a valid out-pointer. Reads the thread struct without
+        // locking or allocating.
+        unsafe { libc::pthread_threadid_np(0, &raw mut tid) };
         tid
     }
 
@@ -1055,6 +1072,7 @@ mod unix {
         }
 
         #[test]
+        #[cfg(has_execinfo)]
         fn buf_pads_frame_indices() {
             let mut b = Buf::<16>::new();
             b.dec2(0);
