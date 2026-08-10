@@ -3649,7 +3649,10 @@ alt_svc_max_age = 3600
 
         let config = Config::load(&file).unwrap();
         assert_eq!(config.server.diagnostics.request_log, Some(true));
-        assert_eq!(config.server.diagnostics.otlp_endpoint.as_deref(), Some("http://127.0.0.1:4318"));
+        assert_eq!(
+            config.server.diagnostics.otlp_endpoint.as_deref(),
+            Some("http://127.0.0.1:4318")
+        );
     }
 
     #[test]

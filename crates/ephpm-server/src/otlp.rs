@@ -109,10 +109,8 @@ where
     let resource =
         opentelemetry_sdk::Resource::builder().with_service_name(service_name.clone()).build();
 
-    let provider = SdkTracerProvider::builder()
-        .with_batch_exporter(exporter)
-        .with_resource(resource)
-        .build();
+    let provider =
+        SdkTracerProvider::builder().with_batch_exporter(exporter).with_resource(resource).build();
 
     // W3C trace-context propagation: the router extracts an incoming
     // `traceparent` through the global propagator, which defaults to a
@@ -161,5 +159,9 @@ pub(crate) fn set_span_parent_from_headers(span: &tracing::Span, headers: &hyper
     let parent = opentelemetry::global::get_text_map_propagator(|propagator| {
         propagator.extract(&HeaderMapExtractor(headers))
     });
-    span.set_parent(parent);
+    if let Err(e) = span.set_parent(parent) {
+        // A span the subscriber never enabled (or a malformed header) is not
+        // worth more than a debug line on a per-request path.
+        tracing::debug!(error = %e, "failed to parent request span to incoming traceparent");
+    }
 }

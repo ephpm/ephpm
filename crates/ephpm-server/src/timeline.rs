@@ -91,8 +91,7 @@ impl RequestLog {
     /// Serialize the buffer as a JSON array, newest entry first.
     pub(crate) fn to_json(&self) -> String {
         let snapshot: Vec<TimelineEntry> = {
-            let entries =
-                self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let entries = self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             entries.iter().rev().cloned().collect()
         };
         // TimelineEntry contains no map keys or non-string keys, so
@@ -107,8 +106,7 @@ impl RequestLog {
 pub(crate) fn unix_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

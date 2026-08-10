@@ -737,13 +737,10 @@ fn run_with_config(
     // The guard flushes the exporter's batch queue on drop — hold it until
     // the server has exited.
     #[cfg(feature = "otlp")]
-    let _otlp_guard = match otlp {
-        Some((otlp_layer, guard, description)) => {
-            layers.push(otlp_layer.boxed());
-            Some((guard, description))
-        }
-        None => None,
-    };
+    let _otlp_guard = otlp.map(|(otlp_layer, guard, description)| {
+        layers.push(otlp_layer.boxed());
+        (guard, description)
+    });
 
     tracing_subscriber::registry().with(layers).init();
 

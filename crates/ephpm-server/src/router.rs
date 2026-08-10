@@ -1181,9 +1181,7 @@ impl Router {
                     queue_wait_ms: timings
                         .and_then(|t| t.queue_wait)
                         .map(|d| d.as_secs_f64() * 1000.0),
-                    php_ms: timings
-                        .and_then(|t| t.execute)
-                        .map(|d| d.as_secs_f64() * 1000.0),
+                    php_ms: timings.and_then(|t| t.execute).map(|d| d.as_secs_f64() * 1000.0),
                     response_bytes,
                 });
             }
@@ -1279,10 +1277,7 @@ impl Router {
             // falls through and behaves like any other unknown /_ephpm/ path.
             if uri_path == "/_ephpm/requests" {
                 if let Some(ref log) = self.request_log {
-                    return Ok((
-                        json_response_owned(StatusCode::OK, log.to_json()),
-                        "diagnostics",
-                    ));
+                    return Ok((json_response_owned(StatusCode::OK, log.to_json()), "diagnostics"));
                 }
             }
         }
@@ -1792,8 +1787,7 @@ impl Router {
         // queue time — same semantics as the histogram below). Created here,
         // inside the `http.request`-instrumented future, so it parents
         // correctly; dropped right after the timer is read.
-        let php_span =
-            tracing::debug_span!(target: crate::OTEL_TRACE_TARGET, "php.execute");
+        let php_span = tracing::debug_span!(target: crate::OTEL_TRACE_TARGET, "php.execute");
         let php_start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             // Scope KV store to this virtual host for multi-tenant isolation.
@@ -1866,10 +1860,9 @@ impl Router {
         // Hand the measurement up to `handle` for the request timeline. No
         // queue wait on this path — spawn_blocking has no worker dispatch
         // queue, so the value is absent, not zero.
-        response.extensions_mut().insert(crate::timeline::PhpTimings {
-            queue_wait: None,
-            execute: Some(php_elapsed),
-        });
+        response
+            .extensions_mut()
+            .insert(crate::timeline::PhpTimings { queue_wait: None, execute: Some(php_elapsed) });
         response
     }
 
@@ -1954,8 +1947,7 @@ impl Router {
         // queue wait, exactly like `ephpm_php_execution_duration_seconds`.
         let queue_span =
             tracing::debug_span!(target: crate::OTEL_TRACE_TARGET, "worker.queue_wait");
-        let php_span =
-            tracing::debug_span!(target: crate::OTEL_TRACE_TARGET, "php.execute");
+        let php_span = tracing::debug_span!(target: crate::OTEL_TRACE_TARGET, "php.execute");
         let php_start = std::time::Instant::now();
         let queue_wait_start = php_start;
         let recv = pool.dispatch(owned).await;
@@ -1967,10 +1959,8 @@ impl Router {
         // Timings handed up to `handle` for the request timeline. The queue
         // wait is known from here on; `execute` is filled in only once the
         // worker actually delivers a response.
-        let queued_only = crate::timeline::PhpTimings {
-            queue_wait: Some(queue_wait),
-            execute: None,
-        };
+        let queued_only =
+            crate::timeline::PhpTimings { queue_wait: Some(queue_wait), execute: None };
 
         // Dispatch channel closed (pool draining / all workers gone) — 503.
         let Ok(rx) = recv else {
@@ -3244,13 +3234,18 @@ mod tests {
 
     // ── Request timeline (/_ephpm/requests) ──────────────────────────
 
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// `(span name, parent span name)` as collected by [`SpanTree`].
+    type SpanRecord = (String, Option<String>);
+
     /// Test layer collecting `(span name, parent span name)` pairs for the
     /// router's request spans (target [`crate::OTEL_TRACE_TARGET`]).
     #[derive(Clone, Default)]
-    struct SpanTree(Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>);
+    struct SpanTree(Arc<std::sync::Mutex<Vec<SpanRecord>>>);
 
     impl SpanTree {
-        fn snapshot(&self) -> Vec<(String, Option<String>)> {
+        fn snapshot(&self) -> Vec<SpanRecord> {
             self.0.lock().unwrap().clone()
         }
     }
@@ -3383,23 +3378,20 @@ mod tests {
         // Short request deadline so the never-answering pool becomes a 504
         // without waiting out the 300s default (paused clock auto-advances).
         config.server.timeouts.request = 1;
-        let pool = Arc::new(crate::worker_pool::WorkerPool::spawn(
+        let pool = crate::worker_pool::WorkerPool::spawn(
             dir.path().join("worker.php"),
             0, // zero workers: dispatch queues, nobody answers
             500,
             4,
             Duration::from_secs(30),
             Duration::from_secs(60),
-        ));
+        );
         let router = Router::new(&config, test_store(), None, None, None, None, Some(pool))
             .with_request_log(Some(Arc::new(crate::timeline::RequestLog::new(8))));
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
 
-        let req = Request::builder()
-            .method("GET")
-            .uri("/index.php")
-            .body(Empty::<Bytes>::new())
-            .unwrap();
+        let req =
+            Request::builder().method("GET").uri("/index.php").body(Empty::<Bytes>::new()).unwrap();
         let resp = router.handle(req, addr, false).await.unwrap();
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
 
@@ -3447,15 +3439,18 @@ mod tests {
             .with_request_log(Some(Arc::new(crate::timeline::RequestLog::new(8))));
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
 
-        let req = Request::builder()
-            .method("GET")
-            .uri("/index.php")
-            .body(Empty::<Bytes>::new())
-            .unwrap();
+        let req =
+            Request::builder().method("GET").uri("/index.php").body(Empty::<Bytes>::new()).unwrap();
         let resp = router.handle(req, addr, false).await.unwrap();
-        // Stub mode: PHP execution fails, the router maps that to a 500. The
-        // timing/span instrumentation sits on the same code path either way.
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // Stub mode: 200 (stub page) when another test already initialized
+        // the process-global stub runtime, 500 (NotInitialized) otherwise.
+        // The timing/span instrumentation sits on the same code path either
+        // way, so accept both rather than depend on test order.
+        assert!(
+            resp.status() == StatusCode::OK || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected stub-mode PHP status: {}",
+            resp.status()
+        );
 
         let entries = fetch_timeline(&router).await;
         assert_eq!(entries.len(), 1, "{entries:?}");
