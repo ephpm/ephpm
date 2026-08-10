@@ -11,6 +11,13 @@ description = "All-in-one PHP application server"
 name = "ephpm"
 path = "src/main.rs"
 
+[features]
+# OTLP trace export (forwards to ephpm-server's `otlp` feature): build with
+# `cargo build --features otlp` to compile the exporter in. At runtime it
+# stays inert until OTEL_EXPORTER_OTLP_ENDPOINT (or
+# [server.diagnostics] otlp_endpoint) is set.
+otlp = ["ephpm-server/otlp"]
+
 [dependencies]
 anyhow.workspace = true
 bytes.workspace = true

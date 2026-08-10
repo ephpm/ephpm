@@ -181,6 +181,10 @@ pub struct ServerConfig {
     #[serde(default)]
     pub metrics: MetricsConfig,
 
+    /// Per-request diagnostics settings.
+    #[serde(default)]
+    pub diagnostics: DiagnosticsConfig,
+
     /// Rate limiting and connection limiting.
     #[serde(default)]
     pub limits: LimitsConfig,
@@ -549,6 +553,57 @@ impl Default for MetricsConfig {
 
 fn default_metrics_path() -> String {
     "/metrics".to_string()
+}
+
+/// Per-request diagnostics configuration (`[server.diagnostics]`).
+#[derive(Debug, Default, Deserialize)]
+pub struct DiagnosticsConfig {
+    /// Enable the in-memory request timeline and its `/_ephpm/requests`
+    /// endpoint. The server keeps the last 256 completed requests (method,
+    /// path, status, total duration, worker-queue wait, PHP execution time,
+    /// response size, timestamp) in a fixed-size ring buffer and serves them
+    /// as JSON, newest first.
+    ///
+    /// Unset resolves per mode (see
+    /// [`DiagnosticsConfig::effective_request_log`]): **on** under
+    /// `ephpm dev` / bare `ephpm`, **off** under `ephpm serve`. Set `true` /
+    /// `false` to force a value in either mode. When off, `/_ephpm/requests`
+    /// is not registered and the path falls through to normal routing (404
+    /// under the default fallback chain).
+    ///
+    /// Env override: `EPHPM_SERVER__DIAGNOSTICS__REQUEST_LOG`.
+    ///
+    /// Default: unset (dev: on, serve: off).
+    #[serde(default)]
+    pub request_log: Option<bool>,
+
+    /// OTLP trace exporter endpoint, e.g. `"http://127.0.0.1:4318"`
+    /// (OTLP/HTTP with protobuf payloads; `/v1/traces` is appended when the
+    /// value does not already end with it). Only acted upon in binaries built
+    /// with the `otlp` cargo feature; without that feature a set value logs a
+    /// startup warning and exports nothing.
+    ///
+    /// The standard `OTEL_EXPORTER_OTLP_ENDPOINT` /
+    /// `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` environment variables take
+    /// precedence over this knob. When neither the env vars nor this knob are
+    /// set, no exporter task is started and no background threads are
+    /// spawned.
+    ///
+    /// Default: unset (no trace export).
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
+}
+
+impl DiagnosticsConfig {
+    /// Resolve the effective request-timeline setting for the given mode.
+    ///
+    /// `dev_mode` is `true` under `ephpm dev` / bare `ephpm` and `false`
+    /// under `ephpm serve`. An explicit `request_log` value wins either way;
+    /// unset means "on in dev, off in serve".
+    #[must_use]
+    pub fn effective_request_log(&self, dev_mode: bool) -> bool {
+        self.request_log.unwrap_or(dev_mode)
+    }
 }
 
 /// Rate limiting and connection limiting (`[server.limits]`).
@@ -2052,6 +2107,7 @@ impl Default for ServerConfig {
             security: None,
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
+            diagnostics: DiagnosticsConfig::default(),
             limits: LimitsConfig::default(),
             file_cache: FileCacheConfig::default(),
             tls: None,
@@ -3533,6 +3589,89 @@ alt_svc_max_age = 3600
         let _env = EnvVars::set("EPHPM_SERVER__HTTP3__ALT_SVC_MAX_AGE", "120");
         let config = Config::load(&file).unwrap();
         assert_eq!(config.server.http3.alt_svc_max_age, 120);
+    }
+
+    // ── [server.diagnostics] ─────────────────────────────────────────
+
+    /// Section absent: both knobs must be unset, and the mode-dependent
+    /// resolution must give dev "on" and serve "off". Also guards the
+    /// hand-written `ServerConfig::default()` against drifting from the
+    /// serde defaults.
+    #[test]
+    fn diagnostics_section_absent_defaults_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.diagnostics.request_log, None);
+        assert_eq!(config.server.diagnostics.otlp_endpoint, None);
+        assert!(
+            config.server.diagnostics.effective_request_log(true),
+            "unset request_log must resolve ON in dev mode"
+        );
+        assert!(
+            !config.server.diagnostics.effective_request_log(false),
+            "unset request_log must resolve OFF in serve mode"
+        );
+
+        // ...and the struct default agrees with what TOML parsing produced.
+        let direct = ServerConfig::default();
+        assert_eq!(direct.diagnostics.request_log, None);
+        assert_eq!(direct.diagnostics.otlp_endpoint, None);
+    }
+
+    /// An explicit value wins over the mode default in both directions.
+    #[test]
+    fn diagnostics_explicit_request_log_beats_mode_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server.diagnostics]\nrequest_log = true\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.diagnostics.request_log, Some(true));
+        assert!(config.server.diagnostics.effective_request_log(false));
+
+        std::fs::write(&file, "[server.diagnostics]\nrequest_log = false\n").unwrap();
+        let config = Config::load(&file).unwrap();
+        assert!(!config.server.diagnostics.effective_request_log(true));
+    }
+
+    #[test]
+    fn diagnostics_section_parses_every_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[server.diagnostics]\nrequest_log = true\notlp_endpoint = \"http://127.0.0.1:4318\"\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.diagnostics.request_log, Some(true));
+        assert_eq!(config.server.diagnostics.otlp_endpoint.as_deref(), Some("http://127.0.0.1:4318"));
+    }
+
+    #[test]
+    fn test_env_var_overrides_diagnostics_request_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server.diagnostics]\nrequest_log = false\n").unwrap();
+
+        let _env = EnvVars::set("EPHPM_SERVER__DIAGNOSTICS__REQUEST_LOG", "true");
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.diagnostics.request_log, Some(true));
+    }
+
+    #[test]
+    fn test_env_var_overrides_diagnostics_otlp_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+
+        let _env = EnvVars::set("EPHPM_SERVER__DIAGNOSTICS__OTLP_ENDPOINT", "http://otel:4318");
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.diagnostics.otlp_endpoint.as_deref(), Some("http://otel:4318"));
     }
 
     #[test]

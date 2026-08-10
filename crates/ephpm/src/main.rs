@@ -686,9 +686,36 @@ fn run_with_config(
         _ => (tracing_subscriber::fmt::layer().boxed(), None),
     };
 
+    // OTLP trace export (compiled with `--features otlp`; runtime activation
+    // is opt-in via OTEL_EXPORTER_OTLP_TRACES_ENDPOINT /
+    // OTEL_EXPORTER_OTLP_ENDPOINT or [server.diagnostics] otlp_endpoint, the
+    // env vars winning). Resolved before the subscriber is built so the
+    // export layer joins the same registry; when nothing requests it, no
+    // exporter is built and no background thread is spawned.
+    #[cfg(feature = "otlp")]
+    let otlp = ephpm_server::otlp::init_layer(config.server.diagnostics.otlp_endpoint.as_deref())
+        .context("failed to initialize OTLP trace export")?;
+
+    #[cfg(feature = "otlp")]
+    let otlp_active = otlp.is_some();
+    #[cfg(not(feature = "otlp"))]
+    let otlp_active = false;
+
+    // Layer stack. Without OTLP the env filter is installed globally (its
+    // `Layer` impl), exactly as before. With the OTLP layer active it must be
+    // scoped to the fmt layer instead: a global info-level filter would
+    // disable the DEBUG-level request spans for every layer, including the
+    // OTLP one (which carries its own target filter).
+    let mut layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> = Vec::new();
+    if otlp_active {
+        layers.push(fmt_layer.with_filter(env_filter).boxed());
+    } else {
+        layers.push(env_filter.boxed());
+        layers.push(fmt_layer);
+    }
+
     // Set up access log file writer if configured.
     let _access_guard = if config.server.logging.access.is_empty() {
-        tracing_subscriber::registry().with(env_filter).with(fmt_layer).init();
         None
     } else {
         let access_path = PathBuf::from(&config.server.logging.access);
@@ -703,9 +730,44 @@ fn run_with_config(
             .with_writer(access_writer)
             .with_target(true)
             .with_filter(EnvFilter::new("access_log=info"));
-        tracing_subscriber::registry().with(env_filter).with(fmt_layer).with(access_layer).init();
+        layers.push(access_layer.boxed());
         Some(guard)
     };
+
+    // The guard flushes the exporter's batch queue on drop — hold it until
+    // the server has exited.
+    #[cfg(feature = "otlp")]
+    let _otlp_guard = match otlp {
+        Some((otlp_layer, guard, description)) => {
+            layers.push(otlp_layer.boxed());
+            Some((guard, description))
+        }
+        None => None,
+    };
+
+    tracing_subscriber::registry().with(layers).init();
+
+    #[cfg(feature = "otlp")]
+    if let Some((_, ref description)) = _otlp_guard {
+        tracing::info!(endpoint = %description, "OTLP trace export enabled (http/protobuf)");
+    }
+
+    // add-config-knob: never let an OTLP request die silently in a binary
+    // compiled without the exporter.
+    #[cfg(not(feature = "otlp"))]
+    {
+        let env_requested = ["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT"]
+            .iter()
+            .any(|var| std::env::var(var).is_ok_and(|v| !v.is_empty()));
+        if config.server.diagnostics.otlp_endpoint.is_some() || env_requested {
+            tracing::warn!(
+                "OTLP trace export requested ([server.diagnostics] otlp_endpoint or an \
+                 OTEL_EXPORTER_OTLP_* env var is set), but this binary was built without \
+                 the `otlp` cargo feature — no spans are exported. Rebuild with \
+                 `cargo build --features otlp`."
+            );
+        }
+    }
 
     tracing::info!(
         listen = %config.server.listen,
@@ -911,7 +973,7 @@ fn run_with_config(
         .on_thread_start(fatal_signal::install_thread_altstack)
         .build()
         .context("failed to create tokio runtime")?;
-    let result = rt.block_on(async { ephpm_server::serve(config).await });
+    let result = rt.block_on(async { ephpm_server::serve(config, dev_mode).await });
 
     // Shutdown PHP runtime
     ephpm_php::PhpRuntime::shutdown().context("failed to shutdown PHP runtime")?;
