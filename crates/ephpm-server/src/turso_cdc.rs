@@ -522,9 +522,11 @@ pub async fn start_clustered_turso_cdc(
             .await?;
     }
 
-    // Start litewire wire frontends. Wire factory is moved in here.
+    // Start litewire wire frontends. Wire factory is moved in here, shared
+    // with the PHP `ephpm_db_*` bridge so in-process queries hit the same
+    // tracked backend as wire clients.
     let tracked = tracked_backend::TrackedBackend::new(wire_factory, query_stats.clone());
-    spawn_litewire_serve(sqlite_config, tracked, handles);
+    spawn_litewire_serve(sqlite_config, crate::share_backend_with_php(tracked), handles);
 
     // Kick off role-appropriate work for the initial role.
     let initial_driver =

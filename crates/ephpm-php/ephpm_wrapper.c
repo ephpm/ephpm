@@ -2593,6 +2593,223 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_wait, 0, 0, 3)
     ZEND_ARG_INFO(0, timeout_ms)
 ZEND_END_ARG_INFO()
 
+/* ===================================================================
+ * Embedded database native PHP functions
+ *
+ * ephpm_db_query() / ephpm_db_execute() execute SQL through a per-thread
+ * litewire Session on the Rust side (db_bridge.rs) — the SAME backend the
+ * MySQL wire frontend serves, so MySQL-dialect SQL, SHOW/DESCRIBE
+ * emulation, SET-NAMES no-ops, and BEGIN/COMMIT/ROLLBACK all behave
+ * exactly as they do over the wire, without a TCP round trip.
+ *
+ * All state lives in Rust thread-locals; g_db_ops is written once at
+ * startup (ephpm_set_db_ops) before any PHP thread runs, then read-only —
+ * same ZTS discipline as g_kv_ops.
+ * =================================================================== */
+
+typedef struct {
+    /* Reset the staged parameter list for this thread. */
+    void (*params_begin)(void);
+    void (*param_null)(void);
+    void (*param_int)(long long v);
+    void (*param_float)(double v);
+    /* Bytes param: valid UTF-8 binds as TEXT, anything else as BLOB
+     * (mirrors the MySQL wire frontend's parameter decoding). */
+    void (*param_bytes)(const char *p, size_t len);
+    /* Execute sql with the staged params through the per-thread Session.
+     * Returns 1 = result set staged, 2 = OK staged, -1 = error staged,
+     * -2 = no backend registered ([db.sqlite] not active). */
+    int  (*run)(const char *sql, size_t sql_len);
+    /* Result-set accessors — valid after run() returned 1, on the same
+     * thread, until the next run()/finish(). */
+    size_t (*row_count)(void);
+    size_t (*col_count)(void);
+    void (*col_name)(size_t col, const char **p, size_t *len);
+    /* Cell accessor: *type = 0 null, 1 int (*ival), 2 float (*fval),
+     * 3 text / 4 blob (*p / *len). */
+    void (*cell)(size_t row, size_t col, int *type, long long *ival,
+                 double *fval, const char **p, size_t *len);
+    /* OK accessor — valid after run() returned 2 (zeros after 1). */
+    void (*ok_info)(unsigned long long *affected_rows,
+                    unsigned long long *last_insert_id);
+    /* Error accessor — valid after run() returned -1. *sqlstate points at
+     * 5 bytes (NOT NUL-terminated). */
+    void (*error_info)(unsigned int *code, const char **sqlstate,
+                       const char **msg, size_t *msg_len);
+    /* Drop the staged result/error, releasing memory.
+     * Must stay LAST-appended: the layout mirrors db_bridge.rs. */
+    void (*finish)(void);
+} EphpmDbOps;
+
+static EphpmDbOps g_db_ops = {0};
+
+/* Stage the optional $params array. Only null, bool, int, float, and
+ * string bind (matching what the MySQL binary protocol can carry); any
+ * other type throws. Returns 0 on success, -1 if an exception was thrown. */
+static int ephpm_db_push_params(HashTable *params)
+{
+    zval *entry;
+    g_db_ops.params_begin();
+    if (!params) { return 0; }
+    ZEND_HASH_FOREACH_VAL(params, entry) {
+        ZVAL_DEREF(entry);
+        switch (Z_TYPE_P(entry)) {
+            case IS_NULL:   g_db_ops.param_null(); break;
+            case IS_TRUE:   g_db_ops.param_int(1); break;
+            case IS_FALSE:  g_db_ops.param_int(0); break;
+            case IS_LONG:   g_db_ops.param_int((long long)Z_LVAL_P(entry)); break;
+            case IS_DOUBLE: g_db_ops.param_float(Z_DVAL_P(entry)); break;
+            case IS_STRING: g_db_ops.param_bytes(Z_STRVAL_P(entry), Z_STRLEN_P(entry)); break;
+            default:
+                zend_throw_exception_ex(zend_ce_exception, 0,
+                    "ephpm_db: unsupported parameter type %s (only null, bool, "
+                    "int, float, and string parameters bind)",
+                    zend_zval_type_name(entry));
+                return -1;
+        }
+    } ZEND_HASH_FOREACH_END();
+    return 0;
+}
+
+/* Sentinel: an exception has been thrown; the PHP_FUNCTION must
+ * RETURN_THROWS(). */
+#define EPHPM_DB_THREW (-1000)
+
+/* Run sql through the bridge, converting error outcomes into PHP
+ * exceptions. Returns the bridge's run() code (1 = rows, 2 = OK) or
+ * EPHPM_DB_THREW after throwing.
+ *
+ * Error shape follows PDO's convention: message "SQLSTATE[xxxxx]: <backend
+ * message>", exception code = the mapped MySQL error code (e.g. 1062). */
+static int ephpm_db_run_or_throw(const char *sql, size_t sql_len, HashTable *params)
+{
+    if (!g_db_ops.run) {
+        zend_throw_exception(zend_ce_exception,
+            "ephpm_db: no embedded database is active (requires [db.sqlite])", 0);
+        return EPHPM_DB_THREW;
+    }
+    if (ephpm_db_push_params(params) != 0) {
+        return EPHPM_DB_THREW;
+    }
+    int rc = g_db_ops.run(sql, sql_len);
+    if (rc == -2) {
+        zend_throw_exception(zend_ce_exception,
+            "ephpm_db: no embedded database is active (requires [db.sqlite])", 0);
+        return EPHPM_DB_THREW;
+    }
+    if (rc < 0) {
+        unsigned int code = 0;
+        const char *sqlstate = NULL;
+        const char *msg = NULL;
+        size_t msg_len = 0;
+        g_db_ops.error_info(&code, &sqlstate, &msg, &msg_len);
+        zend_throw_exception_ex(zend_ce_exception, (zend_long)code,
+            "SQLSTATE[%.5s]: %.*s",
+            sqlstate ? sqlstate : "HY000",
+            (int)msg_len, msg ? msg : "");
+        g_db_ops.finish();
+        return EPHPM_DB_THREW;
+    }
+    return rc;
+}
+
+/* ephpm_db_query(string $sql, array $params = []): array
+ *
+ * Execute SQL and return the rows as a list of associative arrays keyed
+ * by column name (a duplicate column name — SELECT a, a — keeps the last
+ * value, like mysqli_fetch_assoc()). Integer/float columns come back as
+ * PHP int/float, NULL as null, text/blob as string. A statement with no
+ * result set (e.g. SET NAMES routed through the query function) returns
+ * an empty array. Errors throw Exception (see ephpm_db_run_or_throw). */
+PHP_FUNCTION(ephpm_db_query)
+{
+    char *sql; size_t sql_len;
+    HashTable *params = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STRING(sql, sql_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(params)
+    ZEND_PARSE_PARAMETERS_END();
+
+    int rc = ephpm_db_run_or_throw(sql, sql_len, params);
+    if (rc == EPHPM_DB_THREW) { RETURN_THROWS(); }
+
+    array_init(return_value);
+    if (rc != 1) {
+        /* OK result (no rowset) — empty array, not an error. */
+        g_db_ops.finish();
+        return;
+    }
+
+    size_t nrows = g_db_ops.row_count();
+    size_t ncols = g_db_ops.col_count();
+    for (size_t r = 0; r < nrows; r++) {
+        zval rowz;
+        array_init(&rowz);
+        for (size_t c = 0; c < ncols; c++) {
+            const char *name = NULL; size_t name_len = 0;
+            g_db_ops.col_name(c, &name, &name_len);
+
+            int type = 0; long long ival = 0; double fval = 0;
+            const char *bytes = NULL; size_t bytes_len = 0;
+            g_db_ops.cell(r, c, &type, &ival, &fval, &bytes, &bytes_len);
+
+            zval cellz;
+            switch (type) {
+                case 1:  ZVAL_LONG(&cellz, (zend_long)ival); break;
+                case 2:  ZVAL_DOUBLE(&cellz, fval); break;
+                case 3:  /* text */
+                case 4:  /* blob — PHP strings are binary-safe */
+                         ZVAL_STRINGL(&cellz, bytes, bytes_len); break;
+                default: ZVAL_NULL(&cellz); break;
+            }
+            add_assoc_zval_ex(&rowz, name ? name : "", name_len, &cellz);
+        }
+        add_next_index_zval(return_value, &rowz);
+    }
+    g_db_ops.finish();
+}
+
+/* ephpm_db_execute(string $sql, array $params = [])
+ *     : array{affected_rows: int, last_insert_id: int}
+ *
+ * Execute SQL and return the OK metadata. Transactions flow through as
+ * SQL — BEGIN / COMMIT / ROLLBACK here behave exactly as on the wire
+ * path (the per-thread Session tracks the transaction state). A SELECT
+ * routed through execute returns zeros rather than throwing. Errors
+ * throw Exception (see ephpm_db_run_or_throw). */
+PHP_FUNCTION(ephpm_db_execute)
+{
+    char *sql; size_t sql_len;
+    HashTable *params = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STRING(sql, sql_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(params)
+    ZEND_PARSE_PARAMETERS_END();
+
+    int rc = ephpm_db_run_or_throw(sql, sql_len, params);
+    if (rc == EPHPM_DB_THREW) { RETURN_THROWS(); }
+
+    unsigned long long affected = 0, last_id = 0;
+    g_db_ops.ok_info(&affected, &last_id);
+    g_db_ops.finish();
+
+    array_init(return_value);
+    add_assoc_long(return_value, "affected_rows", (zend_long)affected);
+    add_assoc_long(return_value, "last_insert_id", (zend_long)last_id);
+}
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_query, 0, 0, 1)
+    ZEND_ARG_INFO(0, sql)
+    ZEND_ARG_INFO(0, params)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_execute, 0, 0, 1)
+    ZEND_ARG_INFO(0, sql)
+    ZEND_ARG_INFO(0, params)
+ZEND_END_ARG_INFO()
+
 /* ── Function entry table (null-terminated) ──────────────────── */
 
 static const zend_function_entry ephpm_kv_functions[] = {
@@ -2609,6 +2826,9 @@ static const zend_function_entry ephpm_kv_functions[] = {
     PHP_FE(ephpm_kv_pttl,      arginfo_ephpm_kv_pttl)
     PHP_FE(ephpm_kv_flush_all, arginfo_ephpm_kv_flush_all)
     PHP_FE(ephpm_kv_wait,      arginfo_ephpm_kv_wait)
+    /* Embedded database bridge (per-thread litewire Session). */
+    PHP_FE(ephpm_db_query,     arginfo_ephpm_db_query)
+    PHP_FE(ephpm_db_execute,   arginfo_ephpm_db_execute)
     PHP_FE_END
 };
 
@@ -3211,6 +3431,19 @@ void ephpm_set_kv_ops(const EphpmKvOps *ops)
 {
     if (ops) {
         g_kv_ops = *ops;
+    }
+}
+
+/*
+ * Set the DB ops function pointer table backing ephpm_db_query() /
+ * ephpm_db_execute(). Same timing contract as ephpm_set_kv_ops: called
+ * once at startup, before any PHP scripts execute; g_db_ops is read-only
+ * afterwards (ZTS-safe without locking).
+ */
+void ephpm_set_db_ops(const EphpmDbOps *ops)
+{
+    if (ops) {
+        g_db_ops = *ops;
     }
 }
 
