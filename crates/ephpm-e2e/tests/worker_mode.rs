@@ -17,6 +17,10 @@
 //! - boot-once: a boot counter that increments once per worker, not per request
 //! - concurrency: N workers serve N concurrent requests on Linux (ZTS)
 //! - fatal -> 500 + recycle + next request succeeds + server never wedges
+//! - a `zend_bailout` mid-request never delivers the partial output it had
+//!   already produced, and — when the response headers are already on the wire
+//!   (`send_response_stream`) — the body is deliberately broken rather than
+//!   completed, so the client cannot read a truncated download as a success
 //! - worker_max_requests recycle
 //! - issue #116: a `do_blocks()`-shaped nested render never recycles a worker,
 //!   and renders byte-identically on every request of a worker's life
@@ -154,6 +158,104 @@ async fn fatal_500s_then_recovers() {
 /// per-worker "request #R" counter resets after a boot, so across a long run
 /// we must see R values reset (not grow monotonically forever), and the boot
 /// id set must grow (new boots) — but stay bounded per unit time.
+/// A worker request killed by a real `zend_bailout` must not have its partial
+/// output delivered.
+///
+/// `?__bailout=1` echoes a marker and then exhausts the memory limit. The
+/// bailout is absorbed by `php_execute_script`'s own `zend_try`, so the worker
+/// loop returns with the request still in flight and the capture buffers
+/// holding a truncated prefix. The engine used to synthesize a response out of
+/// those buffers; for a bare bailout that produced a **200** carrying half a
+/// document, and even for this memory case it shipped the partial body.
+///
+/// The marker assertion is the substantive one and is unconditional — no
+/// deployment of any worker script may return output from a request that died.
+#[tokio::test]
+async fn bailout_never_delivers_partial_output() {
+    let Some(base) = worker_url() else {
+        eprintln!("EPHPM_WORKER_URL unset — skipping worker-mode bailout test");
+        return;
+    };
+
+    let (status, body) = get(&base, "/trigger?__bailout=1").await;
+
+    assert!(
+        !body.contains("WORKER-BAILOUT-PARTIAL-OUTPUT"),
+        "output echoed before the bailout was delivered to the client \
+         ({status}): {body}"
+    );
+    assert!(
+        !body.contains("WORKER-BAILOUT-UNREACHABLE"),
+        "the script never got this far ({status}): {body}"
+    );
+
+    // A deployment whose worker script ignores the flag answers with the
+    // reference "hello" body; that is not this test's subject, so only the
+    // marker assertions above apply to it.
+    if body.contains("hello /trigger") {
+        eprintln!("deployed worker script ignores ?__bailout — status assertion skipped");
+    } else {
+        assert_eq!(
+            status, 500,
+            "a request that died in a bailout must be a 500, got {status}: {body}"
+        );
+    }
+
+    // ...and the pool recovers: the worker is recycled, not wedged.
+    for i in 0..10 {
+        let (status, body) = get(&base, &format!("/after-bailout-{i}")).await;
+        assert_eq!(status, 200, "request after bailout wedged the server: {status} {body}");
+    }
+}
+
+/// The case where a 500 is no longer available: the worker dies **after**
+/// `send_response_stream` has already put `200 OK` and the headers on the wire.
+///
+/// A status line cannot be retracted, so the only honest signal left is the
+/// framing. ePHPm ends the body with an error instead of closing the channel,
+/// which under `Transfer-Encoding: chunked` means the terminating `0` chunk is
+/// never written — the client's transfer fails. Closing the channel cleanly
+/// (what it did before) is byte-for-byte a *successful* truncated download.
+///
+/// `?__stream_bailout=1` faults inside a userland stream wrapper's second
+/// `stream_read()`, i.e. inside the C pump loop, one chunk into the body.
+#[tokio::test]
+async fn streamed_response_is_broken_not_completed_when_worker_bails() {
+    let Some(base) = worker_url() else {
+        eprintln!("EPHPM_WORKER_URL unset — skipping worker-mode stream-bailout test");
+        return;
+    };
+
+    let url = format!("{base}/s?__stream_bailout=1");
+    let resp = reqwest::get(&url).await.unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
+
+    // A deployment whose worker script ignores the flag answers with the
+    // reference body; nothing to assert about framing then.
+    if resp.status().as_u16() == 200 && !resp.headers().contains_key("transfer-encoding") {
+        eprintln!("deployed worker script ignores ?__stream_bailout — skipping");
+        return;
+    }
+
+    // Reading the body must FAIL. The bytes that did arrive are fine — it is
+    // the clean end-of-body that must not happen.
+    match resp.bytes().await {
+        Ok(body) => panic!(
+            "a streamed response whose worker died completed successfully with {} bytes — \
+             the client cannot tell this from a finished download",
+            body.len()
+        ),
+        Err(e) => {
+            assert!(e.is_body() || e.is_decode(), "expected a body/transfer error, got: {e}");
+        }
+    }
+
+    // ...and the pool recovers.
+    for i in 0..10 {
+        let (status, body) = get(&base, &format!("/after-stream-bailout-{i}")).await;
+        assert_eq!(status, 200, "request after stream bailout wedged the server: {status} {body}");
+    }
+}
+
 #[tokio::test]
 async fn requests_keep_succeeding_across_recycles() {
     let Some(base) = worker_url() else {

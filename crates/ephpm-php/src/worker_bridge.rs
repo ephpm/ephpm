@@ -126,8 +126,28 @@ pub enum WorkerResponse {
         headers: Vec<(String, String)>,
         /// Bounded receiver of body chunks; sender close = end of body.
         body_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+        /// Set when the worker died before finishing this body — see
+        /// [`StreamAbortFlag`].
+        aborted: StreamAbortFlag,
     },
 }
+
+/// Marks a streamed response whose producer died before it was finished.
+///
+/// Once `response_begin` has delivered status + headers, they are on the wire
+/// and cannot be retracted. If the worker then bails out, simply dropping the
+/// chunk sender closes the body channel — and a closed channel is
+/// indistinguishable from a normal end of body, so hyper writes the
+/// terminating chunk and the client reads a well-formed, silently truncated
+/// **200**. That is the failure this flag exists to prevent.
+///
+/// [`clear_in_flight_streams`] sets it before dropping the sender; the body
+/// stream checks it once the channel is exhausted and, if set, ends the body
+/// with an `io::Error` instead of a clean EOF. hyper then abandons the
+/// response — no terminating chunk under `Transfer-Encoding: chunked`, a
+/// short read against a declared `Content-Length` — so the client's transfer
+/// fails rather than succeeding with half a document.
+pub type StreamAbortFlag = std::sync::Arc<std::sync::atomic::AtomicBool>;
 
 impl WorkerResponse {
     /// Build the canonical 500 response used when a worker bailed out before
@@ -336,6 +356,11 @@ thread_local! {
     /// The in-flight streaming-response chunk sender (`send_response_stream`).
     static RESPONSE_TX: RefCell<Option<ResponseChunkTx>> = const { RefCell::new(None) };
 
+    /// The in-flight streaming response's [`StreamAbortFlag`]. Present only
+    /// between `response_begin` and `response_end`; cleared on a clean finish
+    /// so a later bailout cannot retroactively abort a completed stream.
+    static RESPONSE_ABORT: RefCell<Option<StreamAbortFlag>> = const { RefCell::new(None) };
+
     /// Requests handled by this worker since boot (drives `worker_max_requests`).
     static REQUESTS_HANDLED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 
@@ -451,24 +476,41 @@ pub fn take_pending_sender() -> Option<tokio::sync::oneshot::Sender<WorkerRespon
     None
 }
 
-/// Drop any in-flight streaming state left over after a bailout: the response
-/// chunk sender (closing its channel signals end-of-body to the hyper handler,
-/// so a client mid-download gets a truncated-but-not-hung response) and the
-/// body reader. Call from the pool's crash-recovery path before the worker
+/// Tear down any in-flight streaming state left over after a bailout, marking
+/// an unfinished response as aborted so it cannot be mistaken for a complete
+/// one. Call from the pool's crash-recovery path before the worker
 /// resumes/respawns. Idempotent.
+///
+/// Order matters: the [`StreamAbortFlag`] is set **before** the chunk sender is
+/// dropped, because dropping the sender is what closes the channel, and the
+/// body stream only reads the flag after it observes that close. Setting it
+/// first is what makes the flag visible in time.
+///
+/// Returns `true` if a still-open streamed body was aborted — i.e. the response
+/// headers were already on the wire, so the client is receiving a deliberately
+/// broken transfer rather than a 500.
 ///
 /// `CURRENT_REQUEST` is NOT cleared: `worker_thread_shutdown()` runs after
 /// this and its `php_request_shutdown` may still read the `SG(request_info)`
 /// pointers that borrow from it. The thread-local drops at thread exit.
 #[cfg(php_linked)]
-pub fn clear_in_flight_streams() {
-    RESPONSE_TX.with(|cell| *cell.borrow_mut() = None);
+#[must_use]
+pub fn clear_in_flight_streams() -> bool {
+    let aborted = RESPONSE_ABORT.with(|cell| cell.borrow_mut().take());
+    if let Some(flag) = &aborted {
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    let had_stream = RESPONSE_TX.with(|cell| cell.borrow_mut().take()).is_some();
     BODY_READER.with(|cell| *cell.borrow_mut() = BodyReader::Empty);
+    had_stream && aborted.is_some()
 }
 
-/// Stub.
+/// Stub: no worker streams exist without PHP linked.
 #[cfg(not(php_linked))]
-pub fn clear_in_flight_streams() {}
+#[must_use]
+pub fn clear_in_flight_streams() -> bool {
+    false
+}
 
 // ── Callback implementations ─────────────────────────────────────────────
 
@@ -582,8 +624,10 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
     PENDING_SENDER.with(|cell| *cell.borrow_mut() = Some(job.respond_to));
 
     // Any stale streaming-response sender from a prior iteration is dropped
-    // here (closing its channel) so it can never bleed into this request.
+    // here (closing its channel) so it can never bleed into this request. Its
+    // abort flag goes with it, unset — that iteration is over either way.
     RESPONSE_TX.with(|cell| *cell.borrow_mut() = None);
+    RESPONSE_ABORT.with(|cell| *cell.borrow_mut() = None);
 
     // Build owned backing storage + the body reader, and publish the pointers.
     let (current, reader) = build_current_request(job.request);
@@ -677,6 +721,10 @@ fn finish_iteration() {
     // Dropping the streaming-response sender (if any) closes the body channel,
     // signalling end-of-body to the hyper handler.
     RESPONSE_TX.with(|cell| *cell.borrow_mut() = None);
+    // The response finished on its own terms, so release the abort flag
+    // WITHOUT setting it: a bailout later in this worker's life must not
+    // retroactively break a stream that already completed.
+    RESPONSE_ABORT.with(|cell| *cell.borrow_mut() = None);
 }
 
 /// C-callable `body_read`: fill `buf` (capacity `cap`) with the next bytes of
@@ -749,9 +797,20 @@ unsafe extern "C" fn worker_response_begin(
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(BODY_CHANNEL_DEPTH);
     RESPONSE_TX.with(|cell| *cell.borrow_mut() = Some(tx));
 
+    // From here on the status line and headers are unretractable, so the only
+    // way to signal a mid-stream death is to break the body framing. Both ends
+    // of that signal are wired up now: the flag goes to the hyper body stream,
+    // and a clone stays on this thread for clear_in_flight_streams().
+    let aborted: StreamAbortFlag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    RESPONSE_ABORT.with(|cell| *cell.borrow_mut() = Some(std::sync::Arc::clone(&aborted)));
+
     if let Some(sender) = PENDING_SENDER.with(|cell| cell.borrow_mut().take()) {
-        let _ =
-            sender.send(WorkerResponse::Streaming { status, headers: parsed_headers, body_rx: rx });
+        let _ = sender.send(WorkerResponse::Streaming {
+            status,
+            headers: parsed_headers,
+            body_rx: rx,
+            aborted,
+        });
     }
 }
 

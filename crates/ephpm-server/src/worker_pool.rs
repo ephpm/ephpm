@@ -383,27 +383,46 @@ fn worker_main(
                 );
             }
             Ok(ephpm_php::WorkerExit::Fatal) => {
-                // Fatal bailout unwound past send_response. Fulfil the parked
-                // oneshot with a 500 so the in-flight request never hangs, then
-                // recycle (never resume on a possibly-corrupt kernel).
-                if let Some(sender) = ephpm_php::worker_bridge::take_pending_sender() {
+                // A zend_bailout() killed the worker. Nothing was delivered
+                // (the C layer refuses to synthesize a response from truncated
+                // capture buffers), so the request must be terminated here —
+                // and it must not look like a success. Two shapes:
+                let sender = ephpm_php::worker_bridge::take_pending_sender();
+                let had_parked_sender = sender.is_some();
+                //   1. Nothing on the wire yet: the oneshot is still parked, so
+                //      the request becomes a clean 500.
+                if let Some(sender) = sender {
                     let _ = sender.send(WorkerResponse::internal_error());
-                    tracing::warn!(
+                    tracing::error!(
                         worker_id,
-                        "worker bailed out mid-request — 500 sent, recycling"
-                    );
-                } else {
-                    // No parked oneshot: the response was already begun. For a
-                    // mid-stream bailout, closing the chunk channel below
-                    // truncates the body without hanging.
-                    tracing::warn!(
-                        worker_id,
-                        "worker bailed out between/after response — recycling"
+                        "PHP worker terminated in a Zend bailout mid-request — \
+                         500 sent, recycling worker"
                     );
                 }
-                // Close any still-open streaming channels so a mid-download
-                // client sees EOF rather than hanging.
-                ephpm_php::worker_bridge::clear_in_flight_streams();
+                //   2. `send_response_stream` already put status+headers on the
+                //      wire, so the 200 cannot be retracted. Setting the abort
+                //      flag makes the body end in an error instead of a clean
+                //      EOF: the client's transfer fails rather than completing
+                //      with a partial document.
+                let aborted_stream = ephpm_php::worker_bridge::clear_in_flight_streams();
+                if aborted_stream {
+                    counter!("ephpm_worker_stream_aborts_total").increment(1);
+                    tracing::error!(
+                        worker_id,
+                        "PHP worker terminated in a Zend bailout after its response \
+                         headers were already sent — response body deliberately \
+                         aborted (no terminating chunk), recycling worker"
+                    );
+                }
+                //   3. Neither: the bailout landed between requests. No client
+                //      is waiting, but it still must not be silent.
+                if !had_parked_sender && !aborted_stream {
+                    tracing::error!(
+                        worker_id,
+                        "PHP worker terminated in a Zend bailout with no request in \
+                         flight — recycling worker"
+                    );
+                }
                 counter!("ephpm_worker_recycles_total", "reason" => "fatal").increment(1);
             }
             Err(e) => {
@@ -425,7 +444,9 @@ fn worker_main(
         if let Some(sender) = ephpm_php::worker_bridge::take_pending_sender() {
             let _ = sender.send(WorkerResponse::internal_error());
         }
-        ephpm_php::worker_bridge::clear_in_flight_streams();
+        // A worker that never booted cannot have an open stream, but abort
+        // whatever is there rather than letting it end cleanly.
+        let _ = ephpm_php::worker_bridge::clear_in_flight_streams();
         pool.state.boot_failures.fetch_add(1, Ordering::AcqRel);
         counter!("ephpm_worker_boot_failures_total").increment(1);
         match outcome {

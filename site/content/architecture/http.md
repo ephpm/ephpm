@@ -104,15 +104,20 @@ PHP uses `setjmp`/`longjmp` for error handling. All PHP calls go through `ephpm_
 
 ### PHP Fatal → HTTP 500
 
-A PHP fatal error must surface as an HTTP 500 even though the embed SAPI gives us several different ways for one to happen. `ephpm_execute_request()` in `ephpm_wrapper.c` covers two distinct detection paths:
+A PHP fatal error must surface as an HTTP 500 even though the embed SAPI gives us several different ways for one to happen. `ephpm_execute_request()` in `ephpm_wrapper.c` covers two distinct detection paths — and, importantly, **neither of them is the `SETJMP` guard**.
 
-1. **`zend_bailout()` longjmp.** Out-of-memory, max-execution-time, and the older fatal-class errors call `zend_bailout()`, which longjmps out of `php_execute_script`. The `SETJMP(__bailout) == 0` guard in the wrapper catches that case and sets `fatal_bailout = 1`.
+`php_execute_script()` wraps the whole compile-and-execute in its own `zend_try` / `zend_end_try`. `zend_end_try` does not re-raise: it restores `EG(bailout)` and falls through. So a `zend_bailout()` raised anywhere inside the script is absorbed *there* and never reaches a `SETJMP` we installed around the call. Ours fires only for a bailout raised outside `php_execute_script`.
 
-2. **PHP 8.x uncaught `Throwable`.** When a script throws and nothing catches it, `zend_exception_error()` formats the message via `zend_error_va(... | E_DONT_BAIL ...)` and lets `php_execute_script` return normally. `SETJMP` sees nothing — no longjmp ever happens. To catch this path the wrapper also checks `PG(last_error_type)` against a fatal-class mask (`E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR | E_RECOVERABLE_ERROR | E_PARSE`). Without that second check, "Fatal error: Uncaught Error: Call to undefined function …" comes back as `200 OK`.
+1. **`zend_bailout()`.** Out-of-memory, resource limits, OPcache, and a C extension calling `zend_bailout()` directly. Detected by reading `CG(unclean_shutdown)` after `php_execute_script` returns: `_zend_bailout()` sets that flag immediately before its `LONGJMP`, unconditionally and regardless of which `zend_try` catches the jump, and nothing else in the engine writes it. It is cleared before each request (both by `init_compiler()` during request startup and explicitly by the wrapper) so a bailout cannot leak into the next request on the same thread.
 
-`PG(last_error_type)` is reset to `0` before each request so a fatal from a previous reuse of the embed request can't leak into the next one.
+2. **PHP 8.x uncaught `Throwable`.** When a script throws and nothing catches it, `zend_exception_error()` formats the message via `zend_error_va(... | E_DONT_BAIL ...)` and lets `php_execute_script` return normally. No longjmp happens at all, so `CG(unclean_shutdown)` stays clear. To catch this path the wrapper checks `PG(last_error_type)` against a fatal-class mask (`E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR | E_USER_ERROR | E_RECOVERABLE_ERROR | E_PARSE`). Without it, "Fatal error: Uncaught Error: Call to undefined function …" comes back as `200 OK`.
 
-Once a fatal has been detected by either path, the wrapper only overrides the status when it is still the default `200`. Anything the script set explicitly via `http_response_code()` or `exit($status)` is preserved — the contract is "200 → 500 on fatal", not "always 500 on fatal".
+`PG(last_error_type)` is likewise reset to `0` before each request.
+
+The two paths get **different** status policies, because they say different things about the response body:
+
+- A **bailout truncates the response**: the script never finished producing it. So the wrapper forces `500` unconditionally (a status the script set earlier describes a response that does not exist), the partial body and the script's headers are discarded rather than served, and ePHPm logs a `tracing::error!` naming the script, the request, and the tail of the discarded output — the only record of the failure, since a bare `zend_bailout()` prints nothing itself. The governing rule is **never complete a response for a script that bailed out**.
+- An **uncaught `Throwable` leaves a complete response**: `php_execute_script` returned normally, shutdown functions ran, output buffers flushed. So the older, narrower policy still applies — override only a default `200`, and preserve anything the script chose via `http_response_code()` or a framework error handler.
 
 ## SAPI Callbacks
 
