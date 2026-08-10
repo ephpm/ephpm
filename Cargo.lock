@@ -2152,7 +2152,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2624,7 +2624,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 [[package]]
 name = "litewire"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b086ddaa869a#b086ddaa869af8f1ad24d9ed63ed0d924215dc2d"
+source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
 dependencies = [
  "anyhow",
  "futures",
@@ -2632,6 +2632,7 @@ dependencies = [
  "litewire-hrana",
  "litewire-mysql",
  "litewire-postgres",
+ "litewire-session",
  "litewire-tds",
  "litewire-translate",
  "litewire-turso",
@@ -2642,7 +2643,7 @@ dependencies = [
 [[package]]
 name = "litewire-backend"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b086ddaa869a#b086ddaa869af8f1ad24d9ed63ed0d924215dc2d"
+source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2660,7 +2661,7 @@ dependencies = [
 [[package]]
 name = "litewire-hrana"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b086ddaa869a#b086ddaa869af8f1ad24d9ed63ed0d924215dc2d"
+source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2675,10 +2676,11 @@ dependencies = [
 [[package]]
 name = "litewire-mysql"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b086ddaa869a#b086ddaa869af8f1ad24d9ed63ed0d924215dc2d"
+source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
 dependencies = [
  "async-trait",
  "litewire-backend",
+ "litewire-session",
  "litewire-translate",
  "opensrv-mysql",
  "thiserror 2.0.18",
@@ -2689,7 +2691,7 @@ dependencies = [
 [[package]]
 name = "litewire-postgres"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b086ddaa869a#b086ddaa869af8f1ad24d9ed63ed0d924215dc2d"
+source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
 dependencies = [
  "async-trait",
  "futures",
@@ -2702,9 +2704,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "litewire-session"
+version = "0.1.0"
+source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
+dependencies = [
+ "litewire-backend",
+ "litewire-translate",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "litewire-tds"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b086ddaa869a#b086ddaa869af8f1ad24d9ed63ed0d924215dc2d"
+source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
 dependencies = [
  "bytes",
  "litewire-backend",
@@ -2717,7 +2729,7 @@ dependencies = [
 [[package]]
 name = "litewire-translate"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b086ddaa869a#b086ddaa869af8f1ad24d9ed63ed0d924215dc2d"
+source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
 dependencies = [
  "lru 0.12.5",
  "parking_lot",
@@ -2729,7 +2741,7 @@ dependencies = [
 [[package]]
 name = "litewire-turso"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b086ddaa869a#b086ddaa869af8f1ad24d9ed63ed0d924215dc2d"
+source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
 dependencies = [
  "async-trait",
  "litewire-backend",
@@ -3611,7 +3623,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.37",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3648,7 +3660,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.59.0",
 ]
