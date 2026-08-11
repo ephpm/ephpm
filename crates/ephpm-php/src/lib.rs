@@ -2,6 +2,7 @@
 // are documented with comments before each unsafe block.
 #![allow(unsafe_code)]
 
+pub mod db_bridge;
 pub mod kv_bridge;
 pub mod request;
 pub mod response;
@@ -117,6 +118,11 @@ mod ffi {
         /// Set the KV ops function pointer table. Can be called after
         /// `php_embed_init()`, before any PHP scripts execute.
         pub fn ephpm_set_kv_ops(ops: *const crate::kv_bridge::EphpmKvOps);
+
+        /// Set the DB ops function pointer table backing the native
+        /// `ephpm_db_*` functions. Same timing contract as
+        /// `ephpm_set_kv_ops`.
+        pub fn ephpm_set_db_ops(ops: *const crate::db_bridge::EphpmDbOps);
 
         // ── Worker mode ─────────────────────────────────────────────
 
@@ -780,6 +786,44 @@ impl PhpRuntime {
         {
             let _ = store;
             tracing::debug!("KV store set_kv_store no-op (stub mode)");
+        }
+    }
+
+    /// Register the litewire backend that backs the PHP native
+    /// `ephpm_db_*` functions (`ephpm_db_query`, `ephpm_db_execute`).
+    ///
+    /// `backend` must be the **same** erased instance the wire frontends
+    /// serve — including ephpm-server's `TrackedBackend` wrapper — so
+    /// bridge queries land in query-stats exactly like wire queries.
+    /// `handle` is the server's tokio runtime handle, pinned so the sync
+    /// FFI callbacks can `block_on` session work (see the async-boundary
+    /// note in [`db_bridge`]).
+    ///
+    /// Call only when a `[db.sqlite]` backend is active; when never
+    /// called, the PHP functions throw a clean exception instead of
+    /// executing. First registration wins (mirrors [`Self::set_kv_store`]).
+    ///
+    /// In stub mode (no `php_linked`) the Rust-side registration still
+    /// happens (it is used by stub tests) but no PHP wiring occurs.
+    pub fn set_db_backend(
+        backend: litewire::backend::SharedBackend,
+        handle: tokio::runtime::Handle,
+    ) {
+        let registered = db_bridge::set_backend(backend, handle);
+
+        #[cfg(php_linked)]
+        if registered {
+            // Safety: DB_OPS is a static with a stable address.
+            // ephpm_set_db_ops copies the struct into the C global — the
+            // pointer only needs to be valid for the duration of this call.
+            unsafe { ffi::ephpm_set_db_ops(&db_bridge::DB_OPS) };
+
+            tracing::info!("db backend wired to PHP native functions");
+        }
+
+        #[cfg(not(php_linked))]
+        if registered {
+            tracing::debug!("db backend registered (stub mode, no PHP wiring)");
         }
     }
 
