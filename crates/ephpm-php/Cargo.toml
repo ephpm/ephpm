@@ -10,6 +10,9 @@ build = "build.rs"
 
 [dependencies]
 ephpm-kv.workspace = true
+# db_bridge: per-thread litewire Session executing PHP `ephpm_db_*` calls
+# against the same backend the wire frontends serve.
+litewire.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 http.workspace = true

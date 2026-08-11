@@ -25,18 +25,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Canary for the release path's core assumption: the fleet can build Docker
-  # images WITHOUT privileged containers, via plain legacy `docker build`
-  # (DOCKER_BUILDKIT=0) against ephemerd's dind shim — the pattern release.yml
-  # and ci-image.yml use. The shim has no daemon-side BuildKit session API, so
-  # every buildx path boots a --privileged moby/buildkit container and dies
-  # ("privileged containers are disabled on this host"): the container driver
-  # did exactly that to all three v0.6.1 Docker legs, and driver:docker was
-  # proven equally dead by an earlier version of this very job (it detects the
-  # missing native BuildKit and falls back to the same privileged container).
-  # release.yml only runs on tag push, so without this canary the next release
-  # is the first test of any change to this assumption. ~30s.
-  docker-driver-smoke:
+  # Two canaries for the release path, deliberately in ONE job so they share a
+  # single runner slot on a fleet that only has 2-3 Linux x64 runners.
+  #
+  # 1. CAN we build images at all? (always; the step itself is ~1s)
+  #    The fleet can build Docker images WITHOUT privileged containers, via
+  #    plain legacy `docker build` (DOCKER_BUILDKIT=0) against ephemerd's dind
+  #    shim — the pattern release.yml and ci-image.yml use. The shim has no
+  #    daemon-side BuildKit session API, so every buildx path boots a
+  #    --privileged moby/buildkit container and dies ("privileged containers
+  #    are disabled on this host"): the container driver did exactly that to
+  #    all three v0.6.1 Docker legs, and driver:docker was proven equally dead
+  #    by an earlier version of this very job (it detects the missing native
+  #    BuildKit and falls back to the same privileged container). release.yml
+  #    only runs on tag push, so without this canary the next release is the
+  #    first test of any change to this assumption.
+  #
+  # 2. Does OUR Dockerfile build? (on manifest/Dockerfile changes)
+  #    Canary 1 proves *a* build works; it says nothing about docker/Dockerfile.
+  #    #230 added three `[[example]] crate-type = ["cdylib"]` targets to
+  #    crates/ephpm-server/Cargo.toml, and the Dockerfile's dependency stub
+  #    step had no notion of examples/ — a named [[example]] must exist as a
+  #    file, so EVERY `docker build` died at `cargo fetch` with
+  #    "can't find 'mw_probe_abi_v2' example at examples/mw_probe_abi_v2.rs"
+  #    before a single dependency downloaded. Nothing caught it; it was found
+  #    by accident, and it would have parked the v0.6.2 release (Create Release
+  #    `needs:` the docker-image leg). Fixed in #252 — this step is what makes
+  #    the next one impossible to miss.
+  #
+  #    We build `--target deps`, NOT the whole image. A full docker/Dockerfile
+  #    build is ~14-20 min; the `deps` stage stops right after `cargo fetch`,
+  #    which is where this entire class of breakage surfaces. See the stage
+  #    comments in docker/Dockerfile.
+  docker-build-canary:
     name: Docker build (unprivileged)
     runs-on: [self-hosted, linux, x64]
     steps:
@@ -50,6 +71,67 @@ jobs:
           # No `docker image rm`: the shim doesn't implement image deletion
           # ("DELETE /images/... is not yet implemented"), and cleanup is
           # moot anyway — JIT runners are single-use and discarded.
+
+      - uses: actions/checkout@v4
+
+      # GitHub Actions has no per-job `paths:` filter, so the scope decision is
+      # made here. The `deps` stage's outcome is a pure function of the base
+      # image, docker/Dockerfile, .dockerignore, and the workspace manifest set
+      # — nothing else in the tree can change it — so gating on exactly those
+      # paths loses no coverage of the failure class while keeping the step off
+      # the ~70% of PRs that only touch .rs files.
+      #
+      # Fails OPEN: any doubt about the changed-file list means we build. A
+      # gate that silently skips is worse than one that costs a few minutes.
+      - name: Does this change reach docker/Dockerfile's dep stage?
+        id: scope
+        run: |
+          set -eu
+
+          decide() { echo "==> $2"; echo "build=$1" >> "$GITHUB_OUTPUT"; exit 0; }
+
+          case "${{ github.event_name }}" in
+            pull_request) base='${{ github.event.pull_request.base.sha }}' ;;
+            push)         base='${{ github.event.before }}' ;;
+            *)            base='' ;;
+          esac
+
+          case "$base" in
+            ""|0000000000000000000000000000000000000000)
+              decide true "no usable base ref for ${{ github.event_name }} — building" ;;
+          esac
+
+          # actions/checkout@v4 clones shallow; the base commit is usually not
+          # present. Fetching just that one commit is far cheaper than
+          # fetch-depth: 0 on a 600 MB .git.
+          git cat-file -e "${base}^{commit}" 2>/dev/null \
+            || git fetch --no-tags --depth=1 origin "$base" \
+            || decide true "base $base unreachable — building"
+
+          changed="$(git diff --name-only "$base" HEAD)" \
+            || decide true "diff against $base failed — building"
+
+          echo "==> changed files:"
+          echo "$changed" | sed 's/^/    /'
+
+          if echo "$changed" | grep -Eq '^(docker/|\.dockerignore$|Cargo\.(toml|lock)$|crates/[^/]+/Cargo\.toml$|xtask/Cargo\.toml$|\.github/workflows/ci\.yml$)'; then
+            decide true "a Dockerfile / manifest / lockfile path changed — building"
+          fi
+          decide false "no Dockerfile or manifest path changed — skipping the dep-stage build"
+
+      # Same DOCKER_BUILDKIT=0 + plain `docker build` path as canary 1 and as
+      # release.yml — so this also re-proves the unprivileged assumption
+      # against a real multi-stage Dockerfile, not just a busybox one-liner.
+      - name: Build docker/Dockerfile through the dependency-fetch stage
+        if: steps.scope.outputs.build == 'true'
+        env:
+          DOCKER_BUILDKIT: "0"
+        run: |
+          set -eu
+          start=$(date +%s)
+          docker build --target deps -t ephpm-deps:ci -f docker/Dockerfile .
+          echo "==> deps stage built in $(( $(date +%s) - start ))s"
+          # Again no `docker image rm` — the shim has no DELETE /images/.
 
   fmt:
     name: Format

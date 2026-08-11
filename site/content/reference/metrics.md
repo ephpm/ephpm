@@ -80,6 +80,8 @@ These appear when `[php] mode = "worker"`.
 | `ephpm_worker_boot_timeouts_total` | counter | — | Boots still running when `worker_boot_timeout` expired. The thread is not killed; it still becomes ready if the boot completes. |
 | `ephpm_worker_boot_failures_total` | counter | — | Worker boots that failed (thread spawn/TSRM init failure, or the script exited before its first `take_request()`). The pool respawns with exponential backoff. |
 | `ephpm_worker_recycles_total` | counter | `reason` | Workers recycled. `reason` is `max_requests` (hit `worker_max_requests`), `script_exit` (script called `exit()`/`die()` mid-request), `fatal` (fatal error / bailout), or `hung` (never responded within the request timeout; replaced). |
+| `ephpm_worker_stream_stalls_total` | counter | — | Streamed responses (`send_response_stream`) abandoned because the client stopped reading for longer than `stream_send_timeout`. |
+| `ephpm_worker_stream_aborts_total` | counter | — | Streamed responses whose worker died in a bailout after the headers were already sent. The body is deliberately ended with an error (no terminating chunk) so the client sees a failed transfer rather than a truncated 200. Any non-zero value is a PHP crash. |
 
 ## OPcache clustering
 

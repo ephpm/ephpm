@@ -792,6 +792,40 @@ void ephpm_request_set_ini(const char *key, const char *value)
     request_ini_count++;
 }
 
+/* Return codes for ephpm_execute_request(). Must match the match arms in
+ * crates/ephpm-php/src/lib.rs::execute_php. */
+#define EPHPM_EXEC_OK            0
+#define EPHPM_EXEC_STARTUP_FAIL (-1)
+#define EPHPM_EXEC_SCRIPT_EXIT  (-2)
+#define EPHPM_EXEC_BAILOUT      (-3)
+
+/*
+ * Did a zend_bailout() happen since the last ephpm_bailout_reset()?
+ *
+ * This is the ONLY reliable bailout signal available to us, and the reason is
+ * worth spelling out: php_execute_script() wraps the whole compile+execute in
+ * its OWN zend_try/zend_end_try. zend_end_try does not re-raise — it restores
+ * EG(bailout) and falls through — so a bailout raised anywhere inside the
+ * script is fully absorbed there and NEVER reaches a SETJMP we installed
+ * around the call. Our guard only ever fires for a bailout raised outside
+ * php_execute_script.
+ *
+ * PG(last_error_type) covers the fatals that go through zend_error()
+ * (E_ERROR, uncaught Throwable via zend_exception_error, parse errors), but a
+ * bare zend_bailout() — which a C extension, a resource limit, or OPcache can
+ * raise directly — sets no error type at all. Before this check such a request
+ * came back as a clean HTTP 200 carrying a truncated body.
+ *
+ * _zend_bailout() sets CG(unclean_shutdown) = 1 immediately before its
+ * LONGJMP, unconditionally and regardless of which zend_try catches it, and
+ * nothing else in the engine sets that flag. init_compiler() (via
+ * zend_activate() <- php_request_startup()) clears it per request; we clear it
+ * explicitly as well so the signal can never be a leftover from a previous
+ * request on this thread.
+ */
+#define ephpm_bailout_reset()    (CG(unclean_shutdown) = 0)
+#define ephpm_bailout_observed() (CG(unclean_shutdown) != 0)
+
 /*
  * Execute a PHP request.
  *
@@ -808,9 +842,13 @@ void ephpm_request_set_ini(const char *key, const char *value)
  * __thread-local per-request state, so concurrent reuse is safe.
  *
  * Returns:
- *   0  on success
- *  -1  if php_request_startup failed (only on cold start)
- *  -2  if PHP bailed out (fatal error, exit(), die())
+ *   EPHPM_EXEC_OK          (0)  the script ran to completion
+ *   EPHPM_EXEC_STARTUP_FAIL(-1) php_request_startup failed (only on cold start)
+ *   EPHPM_EXEC_SCRIPT_EXIT (-2) the script chose to stop (exit()/die()); the
+ *                               captured response is complete and trustworthy
+ *   EPHPM_EXEC_BAILOUT     (-3) a zend_bailout() unwound the script; the
+ *                               captured response is TRUNCATED and must never
+ *                               be completed as a success (see below)
  */
 int ephpm_execute_request(const char *filename)
 {
@@ -877,7 +915,7 @@ int ephpm_execute_request(const char *filename)
     SG(server_context) = &ephpm_server_context_marker;
 
     if (php_request_startup() != SUCCESS) {
-        return -1;
+        return EPHPM_EXEC_STARTUP_FAIL;
     }
     request_active = 1;
 
@@ -913,11 +951,12 @@ int ephpm_execute_request(const char *filename)
     /* Reset PHP's last-error tracking so we can tell whether THIS script
      * raised a fatal (vs. a value carried over from a prior request). */
     PG(last_error_type) = 0;
+    /* Same for the bailout flag — see ephpm_bailout_observed() above. */
+    ephpm_bailout_reset();
 
     /* Execute the script with bailout protection.
      * PHP's zend_try/zend_catch uses setjmp/longjmp. */
-    int result = 0;
-    int fatal_bailout = 0;
+    int result = EPHPM_EXEC_OK;
     JMP_BUF *__orig_bailout = EG(bailout);
     JMP_BUF __bailout;
 
@@ -933,13 +972,13 @@ int ephpm_execute_request(const char *filename)
          * and should preserve whatever status the script set. */
         if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
             zend_clear_exception();
-            result = -2;
+            result = EPHPM_EXEC_SCRIPT_EXIT;
         }
     } else {
-        /* PHP bailed out via zend_bailout() — out-of-memory, max
-         * execution time, etc. Older fatal classes hit this path. */
-        result = -2;
-        fatal_bailout = 1;
+        /* A zend_bailout() raised OUTSIDE php_execute_script's own zend_try
+         * (rare — that guard absorbs everything raised by the script itself).
+         * The CG(unclean_shutdown) check below covers both cases. */
+        result = EPHPM_EXEC_BAILOUT;
     }
     EG(bailout) = __orig_bailout;
 
@@ -980,10 +1019,14 @@ int ephpm_execute_request(const char *filename)
     capture_response_headers();
     response_status_code = SG(sapi_headers).http_response_code;
 
-    /* Decide whether to override status with 500. There are two paths:
+    /* Decide whether to override status with 500. There are three paths:
      *
-     *   1. zend_bailout() longjmps out of execute (legacy fatal path):
-     *      caught by SETJMP above — fatal_bailout = 1.
+     *   1. zend_bailout() — out of memory, a resource limit, OPcache, or a
+     *      C extension calling zend_bailout() directly. Detected via
+     *      CG(unclean_shutdown); see the ephpm_bailout_observed() comment for
+     *      why the SETJMP above cannot see it. Checked AFTER the shutdown
+     *      functions / ob flush so a bailout in either of those (which also
+     *      truncates the response) counts too.
      *
      *   2. PHP 8.x uncaught Throwable: zend_exception_error() calls
      *      zend_error_va(... | E_DONT_BAIL ...) which prints the fatal
@@ -992,12 +1035,22 @@ int ephpm_execute_request(const char *filename)
      *      catch this case. Without it, "Fatal error: Uncaught Error:
      *      Call to undefined function ..." comes back as 200 OK.
      *
-     * Either way, we only override when the script hasn't already set
-     * an explicit error status (PHP exit() / http_response_code()). */
+     *   3. zend_error(E_ERROR, ...) — sets last_error_type AND bails out, so
+     *      both signals fire. 500 either way.
+     *
+     * A bailout forces 500 UNCONDITIONALLY: it is never something a script
+     * asks for (PHP 8's exit() throws an unwind-exit exception instead), so a
+     * status the script set earlier describes a response it never finished
+     * producing. The last_error_type path keeps its narrower rule — only
+     * override a default 200 — because a framework's own error handler
+     * legitimately sets its status before the engine records the fatal. */
     int fatal_error_mask = E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR
                            | E_USER_ERROR | E_RECOVERABLE_ERROR | E_PARSE;
-    int hit_fatal = fatal_bailout || (PG(last_error_type) & fatal_error_mask);
-    if (hit_fatal && response_status_code == 200) {
+    if (ephpm_bailout_observed()) {
+        result = EPHPM_EXEC_BAILOUT;
+        response_status_code = 500;
+    } else if ((PG(last_error_type) & fatal_error_mask)
+               && response_status_code == 200) {
         response_status_code = 500;
     }
 
@@ -2166,14 +2219,20 @@ void ephpm_worker_set_populate_superglobals(int enable)
  *    2  same, but the request ended on a PHP fatal (uncaught Throwable /
  *       E_ERROR). The synthesized response was forced to 500 unless the script
  *       had already chosen a status
- *   -2  a fatal / zend_bailout unwound out of the framework (recycle + the
- *       Rust supervisor fulfils any parked oneshot with a 500)
+ *   -2  a zend_bailout() killed the worker (recycle; the Rust supervisor
+ *       fulfils any parked oneshot with a 500 and ABORTS an already-begun
+ *       streaming response rather than letting it end cleanly)
  */
 int ephpm_worker_run(const char *script)
 {
     int result = 0;
     JMP_BUF *__orig_bailout = EG(bailout);
     JMP_BUF __bailout;
+
+    /* See ephpm_bailout_observed(): php_execute_script's own zend_try absorbs
+     * every bailout raised inside the worker script, so this SETJMP fires only
+     * for one raised outside it. CG(unclean_shutdown) catches both. */
+    ephpm_bailout_reset();
 
     EG(bailout) = &__bailout;
     if (SETJMP(__bailout) == 0) {
@@ -2194,15 +2253,26 @@ int ephpm_worker_run(const char *script)
             zend_clear_exception();
         }
 
-        /* The script ended with a request still in flight (exit()/die()
-         * mid-request, or a break out of the loop without send_response).
-         * Deliver what the request actually produced — SAPI status, headers
-         * emitted via header()/setcookie(), and the captured echo output —
-         * instead of letting the parked oneshot die with the thread (which
-         * would turn every wp_die()/admin-ajax exit into a bogus 500). This
-         * is safe here: unwind-exit is clean stack unwinding, not a bailout,
-         * so SAPI globals and the capture buffers are intact. */
-        if (req_in_flight && g_worker_ops.send_response) {
+        /* Branch 1 — a bailout absorbed by php_execute_script's own zend_try.
+         * Whatever the capture buffers hold is truncated, so we must NOT
+         * synthesize a response from them: a bare zend_bailout() sets no error
+         * type, so the hit_fatal check further down would see 200 and ship the
+         * partial body as a success. Return -2 with the oneshot still parked —
+         * the Rust supervisor 500s it, or aborts the body stream if the
+         * headers already went out (worker_pool.rs / clear_in_flight_streams).
+         *
+         * Branch 2 — the script ended with a request still in flight
+         * (exit()/die() mid-request, or a break out of the loop without
+         * send_response). Deliver what the request actually produced — SAPI
+         * status, headers emitted via header()/setcookie(), and the captured
+         * echo output — instead of letting the parked oneshot die with the
+         * thread (which would turn every wp_die()/admin-ajax exit into a bogus
+         * 500). That is safe only because unwind-exit is clean stack
+         * unwinding, not a bailout, so SAPI globals and the capture buffers
+         * are intact — which is exactly why branch 1 has to come first. */
+        if (ephpm_bailout_observed()) {
+            result = -2;
+        } else if (req_in_flight && g_worker_ops.send_response) {
             /* Unwind-exit skips the script's own ob_end_* calls, and worker
              * mode has no per-request RSHUTDOWN to flush buffers — content
              * still sitting in userland output buffers (WordPress wraps whole
@@ -2593,6 +2663,223 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_kv_wait, 0, 0, 3)
     ZEND_ARG_INFO(0, timeout_ms)
 ZEND_END_ARG_INFO()
 
+/* ===================================================================
+ * Embedded database native PHP functions
+ *
+ * ephpm_db_query() / ephpm_db_execute() execute SQL through a per-thread
+ * litewire Session on the Rust side (db_bridge.rs) — the SAME backend the
+ * MySQL wire frontend serves, so MySQL-dialect SQL, SHOW/DESCRIBE
+ * emulation, SET-NAMES no-ops, and BEGIN/COMMIT/ROLLBACK all behave
+ * exactly as they do over the wire, without a TCP round trip.
+ *
+ * All state lives in Rust thread-locals; g_db_ops is written once at
+ * startup (ephpm_set_db_ops) before any PHP thread runs, then read-only —
+ * same ZTS discipline as g_kv_ops.
+ * =================================================================== */
+
+typedef struct {
+    /* Reset the staged parameter list for this thread. */
+    void (*params_begin)(void);
+    void (*param_null)(void);
+    void (*param_int)(long long v);
+    void (*param_float)(double v);
+    /* Bytes param: valid UTF-8 binds as TEXT, anything else as BLOB
+     * (mirrors the MySQL wire frontend's parameter decoding). */
+    void (*param_bytes)(const char *p, size_t len);
+    /* Execute sql with the staged params through the per-thread Session.
+     * Returns 1 = result set staged, 2 = OK staged, -1 = error staged,
+     * -2 = no backend registered ([db.sqlite] not active). */
+    int  (*run)(const char *sql, size_t sql_len);
+    /* Result-set accessors — valid after run() returned 1, on the same
+     * thread, until the next run()/finish(). */
+    size_t (*row_count)(void);
+    size_t (*col_count)(void);
+    void (*col_name)(size_t col, const char **p, size_t *len);
+    /* Cell accessor: *type = 0 null, 1 int (*ival), 2 float (*fval),
+     * 3 text / 4 blob (*p / *len). */
+    void (*cell)(size_t row, size_t col, int *type, long long *ival,
+                 double *fval, const char **p, size_t *len);
+    /* OK accessor — valid after run() returned 2 (zeros after 1). */
+    void (*ok_info)(unsigned long long *affected_rows,
+                    unsigned long long *last_insert_id);
+    /* Error accessor — valid after run() returned -1. *sqlstate points at
+     * 5 bytes (NOT NUL-terminated). */
+    void (*error_info)(unsigned int *code, const char **sqlstate,
+                       const char **msg, size_t *msg_len);
+    /* Drop the staged result/error, releasing memory.
+     * Must stay LAST-appended: the layout mirrors db_bridge.rs. */
+    void (*finish)(void);
+} EphpmDbOps;
+
+static EphpmDbOps g_db_ops = {0};
+
+/* Stage the optional $params array. Only null, bool, int, float, and
+ * string bind (matching what the MySQL binary protocol can carry); any
+ * other type throws. Returns 0 on success, -1 if an exception was thrown. */
+static int ephpm_db_push_params(HashTable *params)
+{
+    zval *entry;
+    g_db_ops.params_begin();
+    if (!params) { return 0; }
+    ZEND_HASH_FOREACH_VAL(params, entry) {
+        ZVAL_DEREF(entry);
+        switch (Z_TYPE_P(entry)) {
+            case IS_NULL:   g_db_ops.param_null(); break;
+            case IS_TRUE:   g_db_ops.param_int(1); break;
+            case IS_FALSE:  g_db_ops.param_int(0); break;
+            case IS_LONG:   g_db_ops.param_int((long long)Z_LVAL_P(entry)); break;
+            case IS_DOUBLE: g_db_ops.param_float(Z_DVAL_P(entry)); break;
+            case IS_STRING: g_db_ops.param_bytes(Z_STRVAL_P(entry), Z_STRLEN_P(entry)); break;
+            default:
+                zend_throw_exception_ex(zend_ce_exception, 0,
+                    "ephpm_db: unsupported parameter type %s (only null, bool, "
+                    "int, float, and string parameters bind)",
+                    zend_zval_type_name(entry));
+                return -1;
+        }
+    } ZEND_HASH_FOREACH_END();
+    return 0;
+}
+
+/* Sentinel: an exception has been thrown; the PHP_FUNCTION must
+ * RETURN_THROWS(). */
+#define EPHPM_DB_THREW (-1000)
+
+/* Run sql through the bridge, converting error outcomes into PHP
+ * exceptions. Returns the bridge's run() code (1 = rows, 2 = OK) or
+ * EPHPM_DB_THREW after throwing.
+ *
+ * Error shape follows PDO's convention: message "SQLSTATE[xxxxx]: <backend
+ * message>", exception code = the mapped MySQL error code (e.g. 1062). */
+static int ephpm_db_run_or_throw(const char *sql, size_t sql_len, HashTable *params)
+{
+    if (!g_db_ops.run) {
+        zend_throw_exception(zend_ce_exception,
+            "ephpm_db: no embedded database is active (requires [db.sqlite])", 0);
+        return EPHPM_DB_THREW;
+    }
+    if (ephpm_db_push_params(params) != 0) {
+        return EPHPM_DB_THREW;
+    }
+    int rc = g_db_ops.run(sql, sql_len);
+    if (rc == -2) {
+        zend_throw_exception(zend_ce_exception,
+            "ephpm_db: no embedded database is active (requires [db.sqlite])", 0);
+        return EPHPM_DB_THREW;
+    }
+    if (rc < 0) {
+        unsigned int code = 0;
+        const char *sqlstate = NULL;
+        const char *msg = NULL;
+        size_t msg_len = 0;
+        g_db_ops.error_info(&code, &sqlstate, &msg, &msg_len);
+        zend_throw_exception_ex(zend_ce_exception, (zend_long)code,
+            "SQLSTATE[%.5s]: %.*s",
+            sqlstate ? sqlstate : "HY000",
+            (int)msg_len, msg ? msg : "");
+        g_db_ops.finish();
+        return EPHPM_DB_THREW;
+    }
+    return rc;
+}
+
+/* ephpm_db_query(string $sql, array $params = []): array
+ *
+ * Execute SQL and return the rows as a list of associative arrays keyed
+ * by column name (a duplicate column name — SELECT a, a — keeps the last
+ * value, like mysqli_fetch_assoc()). Integer/float columns come back as
+ * PHP int/float, NULL as null, text/blob as string. A statement with no
+ * result set (e.g. SET NAMES routed through the query function) returns
+ * an empty array. Errors throw Exception (see ephpm_db_run_or_throw). */
+PHP_FUNCTION(ephpm_db_query)
+{
+    char *sql; size_t sql_len;
+    HashTable *params = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STRING(sql, sql_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(params)
+    ZEND_PARSE_PARAMETERS_END();
+
+    int rc = ephpm_db_run_or_throw(sql, sql_len, params);
+    if (rc == EPHPM_DB_THREW) { RETURN_THROWS(); }
+
+    array_init(return_value);
+    if (rc != 1) {
+        /* OK result (no rowset) — empty array, not an error. */
+        g_db_ops.finish();
+        return;
+    }
+
+    size_t nrows = g_db_ops.row_count();
+    size_t ncols = g_db_ops.col_count();
+    for (size_t r = 0; r < nrows; r++) {
+        zval rowz;
+        array_init(&rowz);
+        for (size_t c = 0; c < ncols; c++) {
+            const char *name = NULL; size_t name_len = 0;
+            g_db_ops.col_name(c, &name, &name_len);
+
+            int type = 0; long long ival = 0; double fval = 0;
+            const char *bytes = NULL; size_t bytes_len = 0;
+            g_db_ops.cell(r, c, &type, &ival, &fval, &bytes, &bytes_len);
+
+            zval cellz;
+            switch (type) {
+                case 1:  ZVAL_LONG(&cellz, (zend_long)ival); break;
+                case 2:  ZVAL_DOUBLE(&cellz, fval); break;
+                case 3:  /* text */
+                case 4:  /* blob — PHP strings are binary-safe */
+                         ZVAL_STRINGL(&cellz, bytes, bytes_len); break;
+                default: ZVAL_NULL(&cellz); break;
+            }
+            add_assoc_zval_ex(&rowz, name ? name : "", name_len, &cellz);
+        }
+        add_next_index_zval(return_value, &rowz);
+    }
+    g_db_ops.finish();
+}
+
+/* ephpm_db_execute(string $sql, array $params = [])
+ *     : array{affected_rows: int, last_insert_id: int}
+ *
+ * Execute SQL and return the OK metadata. Transactions flow through as
+ * SQL — BEGIN / COMMIT / ROLLBACK here behave exactly as on the wire
+ * path (the per-thread Session tracks the transaction state). A SELECT
+ * routed through execute returns zeros rather than throwing. Errors
+ * throw Exception (see ephpm_db_run_or_throw). */
+PHP_FUNCTION(ephpm_db_execute)
+{
+    char *sql; size_t sql_len;
+    HashTable *params = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STRING(sql, sql_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(params)
+    ZEND_PARSE_PARAMETERS_END();
+
+    int rc = ephpm_db_run_or_throw(sql, sql_len, params);
+    if (rc == EPHPM_DB_THREW) { RETURN_THROWS(); }
+
+    unsigned long long affected = 0, last_id = 0;
+    g_db_ops.ok_info(&affected, &last_id);
+    g_db_ops.finish();
+
+    array_init(return_value);
+    add_assoc_long(return_value, "affected_rows", (zend_long)affected);
+    add_assoc_long(return_value, "last_insert_id", (zend_long)last_id);
+}
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_query, 0, 0, 1)
+    ZEND_ARG_INFO(0, sql)
+    ZEND_ARG_INFO(0, params)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_execute, 0, 0, 1)
+    ZEND_ARG_INFO(0, sql)
+    ZEND_ARG_INFO(0, params)
+ZEND_END_ARG_INFO()
+
 /* ── Function entry table (null-terminated) ──────────────────── */
 
 static const zend_function_entry ephpm_kv_functions[] = {
@@ -2609,6 +2896,9 @@ static const zend_function_entry ephpm_kv_functions[] = {
     PHP_FE(ephpm_kv_pttl,      arginfo_ephpm_kv_pttl)
     PHP_FE(ephpm_kv_flush_all, arginfo_ephpm_kv_flush_all)
     PHP_FE(ephpm_kv_wait,      arginfo_ephpm_kv_wait)
+    /* Embedded database bridge (per-thread litewire Session). */
+    PHP_FE(ephpm_db_query,     arginfo_ephpm_db_query)
+    PHP_FE(ephpm_db_execute,   arginfo_ephpm_db_execute)
     PHP_FE_END
 };
 
@@ -3211,6 +3501,19 @@ void ephpm_set_kv_ops(const EphpmKvOps *ops)
 {
     if (ops) {
         g_kv_ops = *ops;
+    }
+}
+
+/*
+ * Set the DB ops function pointer table backing ephpm_db_query() /
+ * ephpm_db_execute(). Same timing contract as ephpm_set_kv_ops: called
+ * once at startup, before any PHP scripts execute; g_db_ops is read-only
+ * afterwards (ZTS-safe without locking).
+ */
+void ephpm_set_db_ops(const EphpmDbOps *ops)
+{
+    if (ops) {
+        g_db_ops = *ops;
     }
 }
 

@@ -10,6 +10,8 @@
  * plus three trigger routes the suite drives:
  *
  *   ?__fatal=1     an uncatchable fatal mid-request (bailout -> 500 + recycle)
+ *   ?__bailout=1   output, then a real zend_bailout (memory exhaustion), with
+ *                  the response never sent (-> 500 + recycle, no partial body)
  *   ?__exit=1      output followed by exit() mid-request (exit synthesis)
  *   ?__blocks=<n>  a WordPress-`do_blocks()`-shaped render workload (issue #116)
  *
@@ -67,6 +69,55 @@ function ephpm_e2e_render_blocks(int $depth, int $breadth): string
     return implode('', array_map(static fn (string $s): string => $s, [$level]));
 }
 
+/**
+ * A stream whose SECOND read dies in a Zend bailout.
+ *
+ * `\Ephpm\Worker\send_response_stream()` delivers status + headers first, then
+ * pumps this stream chunk by chunk. Faulting on the second read therefore puts
+ * the bailout *after* the response line is already on the wire — the one case
+ * where a 500 is no longer available, and ePHPm has to break the body framing
+ * instead so the client's transfer fails rather than completing.
+ */
+class EphpmE2eBailoutStream
+{
+    /** @var resource|null set by the stream layer */
+    public $context;
+
+    private int $reads = 0;
+
+    public function stream_open(string $path, string $mode, int $options, ?string &$openedPath): bool
+    {
+        return true;
+    }
+
+    public function stream_read(int $count): string
+    {
+        $this->reads++;
+        if ($this->reads === 1) {
+            return "STREAM-CHUNK-BEFORE-BAILOUT\n";
+        }
+        // Blow the memory limit from inside php_stream_read(), i.e. from
+        // inside the C pump loop of send_response_stream().
+        ini_set('memory_limit', '2M');
+        $chunks = [];
+        for ($i = 0; $i < 100; $i++) {
+            $chunks[] = str_repeat('x', 1024 * 1024);
+        }
+
+        return "STREAM-CHUNK-UNREACHABLE\n";
+    }
+
+    public function stream_eof(): bool
+    {
+        return false;
+    }
+
+    public function stream_stat(): array
+    {
+        return [];
+    }
+}
+
 // ── Request loop ─────────────────────────────────────────────────────
 while (($envelope = \Ephpm\Worker\take_request()) !== null) {
     $requestCount++;
@@ -79,6 +130,39 @@ while (($envelope = \Ephpm\Worker\take_request()) !== null) {
     // recycle this worker without wedging the pool.
     if (isset($query['__fatal'])) {
         ephpm_e2e_this_function_does_not_exist(); // intentional fatal
+    }
+
+    // Bailout trigger: echo a marker, then blow the memory limit. That is a
+    // real zend_bailout, absorbed by php_execute_script's own zend_try, so the
+    // worker loop simply "returns" with this request still in flight and the
+    // capture buffers holding a truncated prefix. The engine must refuse to
+    // synthesize a response from them — the client gets a 500, never the
+    // marker.
+    if (isset($query['__bailout'])) {
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "WORKER-BAILOUT-PARTIAL-OUTPUT\n";
+        ini_set('memory_limit', '2M');
+        $chunks = [];
+        for ($i = 0; $i < 100; $i++) {
+            $chunks[] = str_repeat('x', 1024 * 1024);
+        }
+        echo "WORKER-BAILOUT-UNREACHABLE\n";
+    }
+
+    // Streaming-bailout trigger: status + headers go out first, then the pump
+    // dies mid-body. There is no 500 left to send, so the body must NOT be
+    // terminated cleanly — the client has to see a broken transfer.
+    if (isset($query['__stream_bailout'])) {
+        if (!in_array('ephpmbail', stream_get_wrappers(), true)) {
+            stream_wrapper_register('ephpmbail', EphpmE2eBailoutStream::class);
+        }
+        $fh = fopen('ephpmbail://go', 'r');
+        \Ephpm\Worker\send_response_stream(
+            200,
+            ['Content-Type' => 'text/plain; charset=utf-8'],
+            $fh
+        );
+        continue;
     }
 
     // exit() trigger: output already echoed plus output still sitting in a

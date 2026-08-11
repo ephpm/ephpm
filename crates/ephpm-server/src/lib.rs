@@ -1680,7 +1680,10 @@ async fn start_single_node_sqlite(
         );
         spawn_single_node_litewire(
             sqlite_config,
-            tracked_backend::TrackedBackend::new(backend, query_stats.clone()),
+            share_backend_with_php(tracked_backend::TrackedBackend::new(
+                backend,
+                query_stats.clone(),
+            )),
             handles,
         );
     } else {
@@ -1712,11 +1715,53 @@ async fn start_single_node_sqlite(
         spawn_reuse_stats_logger(&backend, handles);
         spawn_single_node_litewire(
             sqlite_config,
-            tracked_backend::TrackedBackend::new(SharedRusqlite(backend), query_stats.clone()),
+            share_backend_with_php(tracked_backend::TrackedBackend::new(
+                SharedRusqlite(backend),
+                query_stats.clone(),
+            )),
             handles,
         );
     }
     Ok(())
+}
+
+/// Erase `backend` behind an `Arc`, register that same instance as the
+/// target of the PHP native `ephpm_db_*` functions, and return a
+/// forwarding wrapper for the litewire builder.
+///
+/// This is how wire clients and in-process PHP bridge sessions come to
+/// share ONE backend object — including the [`tracked_backend::TrackedBackend`]
+/// wrapper passed in by every SQLite startup path, so bridge queries land
+/// in query-stats exactly like wire queries. Called only from the
+/// `[db.sqlite]` startup paths; when none of them runs, the bridge stays
+/// unregistered and `ephpm_db_*` throws a clean PHP exception.
+///
+/// Must be called from within the server's tokio runtime (it pins
+/// [`tokio::runtime::Handle::current`] for the bridge's sync-to-async
+/// boundary).
+pub(crate) fn share_backend_with_php(backend: impl litewire::backend::Backend) -> PhpSharedBackend {
+    let shared: litewire::backend::SharedBackend = std::sync::Arc::new(backend);
+    ephpm_php::PhpRuntime::set_db_backend(
+        std::sync::Arc::clone(&shared),
+        tokio::runtime::Handle::current(),
+    );
+    PhpSharedBackend(shared)
+}
+
+/// Forwarding wrapper handing an already-erased [`litewire::backend::SharedBackend`]
+/// back to `LiteWire::new`, which insists on taking `impl Backend` by value.
+/// Same shape as [`SharedRusqlite`] below; the default `query`/`execute`
+/// convenience methods route through `connect()`, whose returned connections
+/// carry the stats wrapper.
+pub(crate) struct PhpSharedBackend(litewire::backend::SharedBackend);
+
+#[async_trait::async_trait]
+impl litewire::backend::Backend for PhpSharedBackend {
+    async fn connect(
+        &self,
+    ) -> Result<Box<dyn litewire::backend::BackendConn>, litewire::backend::BackendError> {
+        self.0.connect().await
+    }
 }
 
 /// Shares one [`litewire::backend::Rusqlite`] between litewire — which takes
@@ -1931,8 +1976,10 @@ async fn start_clustered_sqlite(
     }
     let tracked = tracked_backend::TrackedBackend::new(backend, query_stats.clone());
 
-    // Start litewire with the tracked backend.
-    let mut builder = litewire::LiteWire::new(tracked);
+    // Start litewire with the tracked backend, shared with the PHP
+    // `ephpm_db_*` bridge (single-node and clustered sit behind the same
+    // Backend object — no mode-specific bridge paths).
+    let mut builder = litewire::LiteWire::new(share_backend_with_php(tracked));
     builder = builder.mysql(&sqlite_config.proxy.mysql_listen);
     tracing::info!(
         listen = %sqlite_config.proxy.mysql_listen,
@@ -2011,6 +2058,23 @@ fn parse_duration(s: &str) -> anyhow::Result<std::time::Duration> {
 #[cfg(test)]
 mod lib_tests {
     use super::*;
+
+    /// `share_backend_with_php` must register the erased backend with the
+    /// PHP bridge AND hand back a wrapper whose `connect()` reaches the
+    /// same instance. Runs in stub mode — the bridge core is stub-safe.
+    #[tokio::test]
+    async fn share_backend_with_php_registers_and_forwards() {
+        let backend = litewire::backend::Rusqlite::memory().expect("in-memory backend");
+        let wrapper = share_backend_with_php(backend);
+        assert!(ephpm_php::db_bridge::is_configured());
+
+        // The wrapper still opens working sessions for the wire frontends.
+        use litewire::backend::Backend as _;
+        let conn = wrapper.connect().await.expect("connect through wrapper");
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[])
+            .await
+            .expect("execute through wrapper");
+    }
 
     #[test]
     fn parse_memory_size_megabytes() {

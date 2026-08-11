@@ -617,6 +617,38 @@ with the fatal text as its body. `ephpm_worker_run` returns `2` for this case
 than `reason="script_exit"`; the response is already delivered, so the supervisor
 must not send another.
 
+**And a bailout that IS a bailout still does not reach the `SETJMP`.** The point
+above generalises further than it first appeared: `php_execute_script`'s own
+`zend_try` absorbs *every* bailout raised inside the script, including a bare
+`zend_bailout()` from a C extension or an allocator failure — the `SETJMP` in
+`ephpm_worker_run` only ever fires for one raised outside that call. A bare
+`zend_bailout()` sets no `PG(last_error_type)` either, so for a while the
+exit-synthesis branch handled it as a normal end-of-request and shipped the
+truncated capture buffer as a **200**.
+
+The reliable signal is `CG(unclean_shutdown)`: `_zend_bailout()` sets it
+immediately before its `LONGJMP`, unconditionally and regardless of which
+`zend_try` catches the jump, and nothing else in the engine writes it.
+`ephpm_worker_run` clears it before the boot and checks it after
+`php_execute_script` returns; when set it returns `-2` (`WorkerExit::Fatal`)
+**without synthesizing a response**, because the capture buffers hold a prefix of
+a response that was never finished. What the supervisor does then depends on
+whether anything is already on the wire:
+
+- **Nothing sent yet** (the usual case — the parked `oneshot` is still stashed):
+  the request becomes a clean 500.
+- **`send_response_stream` already delivered status + headers**: the 200 cannot
+  be retracted, so the response is *deliberately broken instead of completed*.
+  `clear_in_flight_streams()` sets the response's `StreamAbortFlag` before
+  dropping the chunk sender; the hyper body stream reads the flag when the
+  channel closes and ends the body with an `io::Error`, so hyper writes no
+  terminating chunk and the client's transfer fails. Counted as
+  `ephpm_worker_stream_aborts_total`. Simply dropping the sender — what it did
+  before — was indistinguishable from a normal end of body.
+
+The governing rule for both engines: **never complete a response for a script
+that bailed out.**
+
 ### 5.4 Detecting dead / hung workers; timeouts
 
 - **Hung request (infinite loop / blocked syscall in PHP).** SIGPROF-based

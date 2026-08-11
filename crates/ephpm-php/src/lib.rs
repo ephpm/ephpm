@@ -2,6 +2,7 @@
 // are documented with comments before each unsafe block.
 #![allow(unsafe_code)]
 
+pub mod db_bridge;
 pub mod kv_bridge;
 pub mod request;
 pub mod response;
@@ -72,7 +73,9 @@ mod ffi {
         );
 
         /// Execute a PHP request with full lifecycle management.
-        /// Returns 0 on success, -1 on startup failure, -2 on bailout.
+        ///
+        /// Returns one of the `EPHPM_EXEC_*` codes defined in
+        /// `ephpm_wrapper.c` — mirrored by `super::exec_code`.
         pub fn ephpm_execute_request(
             filename: *const ::std::os::raw::c_char,
         ) -> ::std::os::raw::c_int;
@@ -115,6 +118,11 @@ mod ffi {
         /// Set the KV ops function pointer table. Can be called after
         /// `php_embed_init()`, before any PHP scripts execute.
         pub fn ephpm_set_kv_ops(ops: *const crate::kv_bridge::EphpmKvOps);
+
+        /// Set the DB ops function pointer table backing the native
+        /// `ephpm_db_*` functions. Same timing contract as
+        /// `ephpm_set_kv_ops`.
+        pub fn ephpm_set_db_ops(ops: *const crate::db_bridge::EphpmDbOps);
 
         // ── Worker mode ─────────────────────────────────────────────
 
@@ -192,6 +200,34 @@ pub enum PhpError {
     /// TSRM thread registration failed.
     #[error("PHP thread initialization failed")]
     ThreadInitFailed,
+
+    /// The script was unwound by a `zend_bailout()` — out of memory, a
+    /// resource limit, OPcache, or a C extension calling it directly.
+    ///
+    /// Distinct from every other variant because of what it says about the
+    /// *output*: whatever the SAPI captured is a truncated prefix of a
+    /// response the script never finished producing. It must never be
+    /// completed as a success, so callers discard the partial body and answer
+    /// 500 (`build_php_response`'s error arm) rather than returning it.
+    ///
+    /// PHP 8's `exit()`/`die()` is NOT a bailout — it throws an unwind-exit
+    /// exception, which unwinds cleanly and yields a complete response.
+    #[error("PHP script bailed out (truncated response discarded): {0}")]
+    Bailout(String),
+}
+
+/// The `EPHPM_EXEC_*` return codes of `ephpm_execute_request` (defined in
+/// `crates/ephpm-php/ephpm_wrapper.c` — keep the two in sync).
+#[cfg(php_linked)]
+mod exec_code {
+    /// The script ran to completion.
+    pub const OK: std::os::raw::c_int = 0;
+    /// `php_request_startup()` failed (cold start only).
+    pub const STARTUP_FAIL: std::os::raw::c_int = -1;
+    /// The script chose to stop (`exit()`/`die()`); the response is complete.
+    pub const SCRIPT_EXIT: std::os::raw::c_int = -2;
+    /// A `zend_bailout()` unwound the script; the response is truncated.
+    pub const BAILOUT: std::os::raw::c_int = -3;
 }
 
 /// How a worker's framework loop ended (see [`PhpRuntime::run_worker`]).
@@ -210,8 +246,16 @@ pub enum WorkerExit {
     /// one; it differs only in that the worker died rather than chose to stop,
     /// which is what the recycle-reason metric reports.
     ScriptFatal,
-    /// A fatal bailout unwound out of the framework. The caller must recycle
-    /// the worker and fulfil any parked oneshot with a 500.
+    /// A `zend_bailout()` killed the worker. Nothing was delivered: unlike
+    /// [`WorkerExit::ScriptFatal`], the C layer deliberately does **not**
+    /// synthesize a response, because the capture buffers hold a truncated
+    /// prefix of one the script never finished.
+    ///
+    /// The caller must recycle the worker and make sure the request cannot be
+    /// mistaken for a success — fulfil a still-parked oneshot with a 500, and
+    /// if a streaming response already put headers on the wire, abort the body
+    /// stream instead of closing it cleanly
+    /// ([`worker_bridge::clear_in_flight_streams`]).
     Fatal,
 }
 
@@ -668,17 +712,52 @@ impl PhpRuntime {
         let status = u16::try_from(status_code).unwrap_or(200);
 
         match ret {
-            0 => Ok(PhpResponse { status, headers, body }),
-            -1 => Err(PhpError::ExecutionFailed("php_request_startup failed".into())),
-            _ => {
-                // Bailout (exit/die/fatal): return whatever output was captured
+            exec_code::OK => Ok(PhpResponse { status, headers, body }),
+            exec_code::STARTUP_FAIL => {
+                Err(PhpError::ExecutionFailed("php_request_startup failed".into()))
+            }
+            // A zend_bailout() unwound the script. `body` is a truncated
+            // prefix of a response that was never finished, so it is dropped
+            // here rather than shipped: completing it would hand a caching
+            // proxy, a health probe, or a client half a document labelled as
+            // success. The fpm path buffers the whole response before this
+            // point, so nothing has reached the wire yet and answering 500 is
+            // always possible.
+            //
+            // This is the only place the failure is visible at all — the
+            // engine prints nothing for a bare zend_bailout().
+            exec_code::BAILOUT => {
+                tracing::error!(
+                    script = %request.script_filename.display(),
+                    method = %request.method,
+                    uri = %request.uri,
+                    discarded_body_bytes = body.len(),
+                    output_tail = %truncated_output_tail(&body),
+                    "PHP script terminated in a Zend bailout (out of memory, a \
+                     resource limit, or an extension calling zend_bailout()) — \
+                     truncated response discarded, returning 500"
+                );
+                Err(PhpError::Bailout(format!(
+                    "{} ({} {})",
+                    request.script_filename.display(),
+                    request.method,
+                    request.uri
+                )))
+            }
+            // exit()/die() unwinds cleanly, so the captured response is
+            // complete and is returned as-is, keeping whatever status the
+            // script chose (an empty one is still an error — nothing was
+            // produced).
+            exec_code::SCRIPT_EXIT => {
                 if body.is_empty() {
-                    Err(PhpError::ExecutionFailed("PHP bailout (fatal error or exit)".into()))
+                    Err(PhpError::ExecutionFailed("PHP exited without output".into()))
                 } else {
-                    // exit() and die() are common in PHP — return the output
                     Ok(PhpResponse { status, headers, body })
                 }
             }
+            other => Err(PhpError::ExecutionFailed(format!(
+                "ephpm_execute_request returned an unknown code {other}"
+            ))),
         }
     }
 
@@ -707,6 +786,44 @@ impl PhpRuntime {
         {
             let _ = store;
             tracing::debug!("KV store set_kv_store no-op (stub mode)");
+        }
+    }
+
+    /// Register the litewire backend that backs the PHP native
+    /// `ephpm_db_*` functions (`ephpm_db_query`, `ephpm_db_execute`).
+    ///
+    /// `backend` must be the **same** erased instance the wire frontends
+    /// serve — including ephpm-server's `TrackedBackend` wrapper — so
+    /// bridge queries land in query-stats exactly like wire queries.
+    /// `handle` is the server's tokio runtime handle, pinned so the sync
+    /// FFI callbacks can `block_on` session work (see the async-boundary
+    /// note in [`db_bridge`]).
+    ///
+    /// Call only when a `[db.sqlite]` backend is active; when never
+    /// called, the PHP functions throw a clean exception instead of
+    /// executing. First registration wins (mirrors [`Self::set_kv_store`]).
+    ///
+    /// In stub mode (no `php_linked`) the Rust-side registration still
+    /// happens (it is used by stub tests) but no PHP wiring occurs.
+    pub fn set_db_backend(
+        backend: litewire::backend::SharedBackend,
+        handle: tokio::runtime::Handle,
+    ) {
+        let registered = db_bridge::set_backend(backend, handle);
+
+        #[cfg(php_linked)]
+        if registered {
+            // Safety: DB_OPS is a static with a stable address.
+            // ephpm_set_db_ops copies the struct into the C global — the
+            // pointer only needs to be valid for the duration of this call.
+            unsafe { ffi::ephpm_set_db_ops(&db_bridge::DB_OPS) };
+
+            tracing::info!("db backend wired to PHP native functions");
+        }
+
+        #[cfg(not(php_linked))]
+        if registered {
+            tracing::debug!("db backend registered (stub mode, no PHP wiring)");
         }
     }
 
@@ -936,6 +1053,22 @@ impl PhpRuntime {
     pub fn opcache_invalidate_under(_docroot: &std::path::Path) -> Option<i64> {
         None
     }
+}
+
+/// The last [`TAIL_BYTES`] of a discarded response body, for the bailout log
+/// line.
+///
+/// The body is thrown away rather than served, so this is the only place PHP's
+/// own account of what went wrong (`Fatal error: Allowed memory size ...`,
+/// which is emitted into the output stream when `display_errors` is on)
+/// survives. The tail, not the head: the fatal is always the last thing
+/// written.
+#[cfg(php_linked)]
+fn truncated_output_tail(body: &[u8]) -> String {
+    /// How much of the discarded body to keep in the log line.
+    const TAIL_BYTES: usize = 512;
+    let tail = &body[body.len().saturating_sub(TAIL_BYTES)..];
+    String::from_utf8_lossy(tail).replace(['\n', '\r'], " ")
 }
 
 impl Drop for PhpRuntime {

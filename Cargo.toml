@@ -106,7 +106,15 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire main @ b086ddaa — CDC replay hardening (litewire#17). Two things.
+# litewire main @ 541290c4 — Session extraction (litewire#18). The dialect
+# translation + transaction-state + error-mapping core of the MySQL handler now
+# lives in the public `litewire-session` crate (`Session`), which the ephpm_db_*
+# in-process bridge consumes. Also fixes a silent multi-statement drop: the old
+# handler executed only the FIRST translated statement, so `ALTER TABLE ... ADD
+# KEY` expansions (Laravel schema builder) never created their secondary
+# indexes; Session executes all translated statements in order.
+#
+# Previous pin b086ddaa — CDC replay hardening (litewire#17). Two things.
 # (1) Replayed schema DDL is parsed and allowlisted before it reaches the
 # engine. A CDC batch carrying a `sqlite_schema` row used to have its stored
 # `sql` text executed as-is, so a peer whose frames reached `apply_batch` could
@@ -169,7 +177,7 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 # sqlparser, so a crafted identifier in SHOW CREATE TABLE / SHOW INDEX /
 # DESCRIBE becomes arbitrary SQL. 7a0b59c4 adds sanitize_identifier() and
 # applies it at every extraction site.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "b086ddaa869a", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "541290c446b6", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.0)
