@@ -603,6 +603,14 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
         return 0;
     };
 
+    // Framework terminate hooks may run PHP (including ephpm_db_*) between
+    // send_response and this call — after finish_iteration's per-request
+    // sweep. Sweep again BEFORE parking in recv so a transaction a
+    // terminate hook left open is rolled back now rather than held (with
+    // its SQLite write lock) for however long this worker sits idle.
+    // Idempotent and a cheap flag check when there is nothing to do.
+    crate::db_bridge::on_request_end();
+
     // The worker is idle exactly while it is parked in this recv.
     metrics::gauge!("ephpm_worker_idle").increment(1.0);
     let recv = rx.recv_blocking();
@@ -716,6 +724,16 @@ unsafe extern "C" fn worker_send_response(
 /// thread exit.
 #[cfg(php_linked)]
 fn finish_iteration() {
+    // Per-request DB-bridge teardown (worker-mode seam): runs on the
+    // worker thread, inside send_response / response_end — i.e. at every
+    // normal request end — so a transaction the script left open is rolled
+    // back before the thread parks for its next request, and the staged
+    // result/error memory is released. The crash path (fatal before
+    // send_response) is covered by worker_thread_shutdown, and terminate
+    // hooks that touch the DB after the response are swept at the top of
+    // the next take_request.
+    crate::db_bridge::on_request_end();
+
     REQUESTS_HANDLED.with(|c| c.set(c.get().saturating_add(1)));
     BODY_READER.with(|cell| *cell.borrow_mut() = BodyReader::Empty);
     // Dropping the streaming-response sender (if any) closes the body channel,

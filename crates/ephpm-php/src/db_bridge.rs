@@ -27,10 +27,30 @@
 //! `SET NAMES`, and tracks transaction state — `BEGIN`/`COMMIT`/`ROLLBACK`
 //! flow through as plain SQL, exactly as they do on the wire path.
 //!
-//! v1 caveat: the session (and therefore any transaction PHP left open)
-//! lives for the thread, not the request. Always `COMMIT`/`ROLLBACK`
-//! before the end of a request; an unfinished transaction stays open on
-//! that worker thread until its next `ephpm_db_*` call.
+//! # Transactions end with the request
+//!
+//! The session lives for the thread, but transactions do not. At
+//! per-request teardown ([`on_request_end`], wired into both execution
+//! modes — see its docs for the exact seams) any explicit transaction the
+//! script left open is rolled back with a `tracing::warn!`, and the staged
+//! result/error buffers are released. A script that runs `BEGIN` and then
+//! fatals (or simply forgets to `COMMIT`) therefore cannot leak its open
+//! transaction into the next, unrelated request dispatched to the same
+//! worker thread. Scripts should still `COMMIT`/`ROLLBACK` explicitly —
+//! the automatic rollback is a safety net, not an API.
+//!
+//! # Session recycling on connection failure
+//!
+//! A thread's session holds its `BackendConn` indefinitely. If the
+//! connection dies underneath it (sqld restart on clustered failover), the
+//! failed call is reported to PHP as an error, and — when the error
+//! classifies as connection-shaped (`is_connection_error`) and the
+//! session is **not** inside an explicit transaction — the session is
+//! dropped so the next call lazily reconnects, mirroring how wire clients
+//! recover by reconnecting. SQL-level errors (1062, 1064, ...) never
+//! recycle: that would discard live transaction state on every constraint
+//! violation. See `is_connection_error` for why the classification is
+//! substring-based and deliberately conservative.
 //!
 //! # Async boundary
 //!
@@ -157,7 +177,8 @@ pub fn bytes_to_value(bytes: &[u8]) -> Value {
 }
 
 /// Drop the staged result/error, releasing their memory. Also called
-/// implicitly at the start of every [`run_sql_bytes`].
+/// implicitly at the start of every [`run_sql_bytes`] and at per-request
+/// teardown ([`on_request_end`]).
 pub fn finish() {
     DB_RESULT.with(|r| *r.borrow_mut() = None);
     DB_ERROR.with(|e| *e.borrow_mut() = None);
@@ -168,17 +189,99 @@ fn stage_error(err: BridgeError) -> RunStatus {
     RunStatus::Err
 }
 
+/// Message substrings that mark a [`SessionError`] as connection-shaped —
+/// the backend connection (not the SQL) is what failed.
+///
+/// litewire's `BackendError` is stringly typed (`Sqlite(String)` /
+/// `Other(String)`) and `SessionError::Db` flattens it further into a
+/// `(code, sqlstate, message)` triple, so there is no structured
+/// "connection failure" variant to key off — substring matching against
+/// the known producer sites is the only classification available. Every
+/// marker below is anchored to a concrete error `format!` in
+/// litewire-backend's `hrana_client.rs` (the only backend whose
+/// connections can die independently of the process; the rusqlite backend
+/// is in-process) or to the transport wording reqwest/hyper nest inside
+/// those messages.
+const CONNECTION_ERROR_MARKERS: &[&str] = &[
+    // hrana_client transport failures: the pipeline POST never completed
+    // or returned garbage ("HTTP request failed: {reqwest}", "failed to
+    // parse response: {e}", "empty pipeline response", "unexpected close
+    // response", "health check failed: {e}").
+    "http request failed",
+    "health check failed",
+    "failed to parse response",
+    "empty pipeline response",
+    "unexpected close response",
+    // "sqld returned {status}: {body}" — emitted only for a non-success
+    // HTTP status. SQL errors always come back in-band with HTTP 200, so
+    // an HTTP-level failure is a stream/transport problem by construction
+    // (a restarted sqld rejecting a stale baton answers 4xx here).
+    "sqld returned ",
+    // Hrana stream loss after a sqld restart, surfaced as an in-band
+    // ErrorResponse without a SQLITE code ("Invalid baton", "The stream
+    // has expired ...", stream not found).
+    "baton",
+    "stream has expired",
+    "stream not found",
+    // Transport wording reqwest/hyper nest inside their Display output.
+    "connection refused",
+    "connection reset",
+    "connection closed",
+    "broken pipe",
+    "error sending request",
+    "channel closed",
+];
+
+/// Whether `err` indicates a dead/broken backend connection, as opposed to
+/// a SQL-level error the statement earned on its own.
+///
+/// Conservative on purpose:
+///
+/// * Anything litewire's `error_map` managed to classify (1062 duplicate
+///   key, 1064 parse, 1205 busy, 1290 read-only, 1452 FK, ...) is a SQL
+///   error — never connection-shaped. Only the `ER_UNKNOWN_ERROR` (1105)
+///   fallback is considered further.
+/// * Within 1105, only messages matching [`CONNECTION_ERROR_MARKERS`]
+///   qualify.
+///
+/// Known limitation: the match is substring-based because the underlying
+/// error is stringly typed. A false positive (e.g. `no such column:
+/// baton`) costs one needless reconnect on an autocommit session — cheap
+/// and self-healing. A false negative leaves the session broken until the
+/// thread's next connection-shaped error, which the next call will
+/// produce. Callers additionally refuse to recycle mid-transaction (see
+/// [`run_sql_bytes`]) so a misclassification can never discard live
+/// transaction state.
+fn is_connection_error(err: &SessionError) -> bool {
+    if err.code() != ER_UNKNOWN_ERROR {
+        return false;
+    }
+    let msg = err.to_string().to_ascii_lowercase();
+    CONNECTION_ERROR_MARKERS.iter().any(|marker| msg.contains(marker))
+}
+
 /// Execute `sql` (raw PHP string bytes) with the staged parameters through
 /// this thread's [`Session`], staging the result or error for the
 /// accessors below.
 ///
 /// The staged parameter list is consumed (cleared) whether or not
 /// execution succeeds.
+///
+/// On a connection-shaped failure (`is_connection_error`) outside an
+/// explicit transaction, the thread's session is dropped so the next call
+/// reconnects (see the module docs, `Session recycling`).
 pub fn run_sql_bytes(sql: &[u8]) -> RunStatus {
+    run_on(DB_BRIDGE.get(), sql)
+}
+
+/// [`run_sql_bytes`] against an explicit bridge. Split out so unit tests
+/// can drive a locally-constructed [`DbBridge`] (with a mock backend)
+/// without going through the process-wide, set-once [`DB_BRIDGE`].
+fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
     let params: Vec<Value> = DB_PARAMS.with(|p| std::mem::take(&mut *p.borrow_mut()));
     finish();
 
-    let Some(bridge) = DB_BRIDGE.get() else {
+    let Some(bridge) = bridge else {
         return RunStatus::Unavailable;
     };
 
@@ -215,7 +318,26 @@ pub fn run_sql_bytes(sql: &[u8]) -> RunStatus {
                 }
             }
         };
-        bridge.handle.block_on(session.query(sql, &params)).map_err(BridgeError::from)
+        let result = bridge.handle.block_on(session.query(sql, &params));
+        if let Err(e) = &result {
+            // Recycle a session whose connection looks dead so the NEXT
+            // call reconnects — but never mid-transaction: recycling
+            // there would silently discard the transaction state a
+            // misclassified SQL error (the match is substring-based, see
+            // is_connection_error) may still legitimately own. A
+            // mid-transaction connection death is instead cleaned up at
+            // request end: on_request_end's ROLLBACK fails over the same
+            // dead connection and drops the session then.
+            if !session.in_transaction && is_connection_error(e) {
+                tracing::warn!(
+                    error = %e,
+                    "embedded db session hit a connection-class error — dropping it so the \
+                     next call reconnects"
+                );
+                *slot = None;
+            }
+        }
+        result.map_err(BridgeError::from)
     });
 
     match outcome {
@@ -229,6 +351,74 @@ pub fn run_sql_bytes(sql: &[u8]) -> RunStatus {
         }
         Err(e) => stage_error(e),
     }
+}
+
+/// Per-request teardown for this thread's bridge state.
+///
+/// Must run at the end of **every** PHP request, on the thread that ran
+/// it. The wired seams, per execution mode:
+///
+/// * **fpm mode** — `PhpRuntime::execute()` calls this right after
+///   `execute_php` returns (success, script exit, or bailout alike). That
+///   is the single choke point every fpm-style request passes through on
+///   its own `spawn_blocking` thread.
+/// * **worker mode** — `worker_bridge::finish_iteration()` (runs on the
+///   worker thread inside `send_response` / `response_end`, i.e. at every
+///   normal request end), again at the top of the next `take_request`
+///   (covering framework terminate hooks that touch the DB *after* the
+///   response was delivered), and from
+///   `PhpRuntime::worker_thread_shutdown()` when the thread recycles
+///   after a fatal (the in-flight request never reached `send_response`).
+///
+/// Two jobs:
+///
+/// 1. If the script left an explicit transaction open (`BEGIN` without
+///    `COMMIT`/`ROLLBACK` — a mid-transaction fatal looks identical),
+///    issue a `ROLLBACK` through the session and `tracing::warn!`.
+///    Without this the transaction stays open on the worker thread and
+///    the next unrelated request's writes silently join it.
+/// 2. Release the staged result/error buffers ([`finish`]) so the memory
+///    of a request's last query does not sit around until the thread's
+///    next request.
+///
+/// If the rollback itself fails (typically because the connection under
+/// the transaction died), the session is dropped entirely: the server
+/// side abandons an uncommitted transaction when its connection goes
+/// away, and the next request reconnects with clean state.
+///
+/// Idempotent and cheap when there is nothing to do (no session, or no
+/// open transaction). Safe in stub mode — no PHP types are involved.
+pub fn on_request_end() {
+    finish();
+    let Some(bridge) = DB_BRIDGE.get() else {
+        return;
+    };
+    DB_SESSION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(session) = slot.as_mut() else {
+            return;
+        };
+        if !session.in_transaction {
+            return;
+        }
+        tracing::warn!(
+            "PHP script left a database transaction open at request end — rolling it back \
+             (scripts must COMMIT or ROLLBACK before the request finishes)"
+        );
+        // block_on is legal here for the same reason as the query path:
+        // request teardown runs on a PHP worker OS thread or the tokio
+        // spawn_blocking pool, never on an async task (module docs,
+        // `Async boundary`). On success Session::query clears
+        // `in_transaction` itself.
+        if let Err(e) = bridge.handle.block_on(session.query("ROLLBACK", &[])) {
+            tracing::warn!(
+                error = %e,
+                "rollback of the abandoned transaction failed — dropping the session so \
+                 the next request reconnects with clean state"
+            );
+            *slot = None;
+        }
+    });
 }
 
 /// Number of rows in the staged result set (0 when none is staged).
@@ -566,8 +756,10 @@ mod tests {
 
     /// One shared runtime + in-memory backend for every test in this
     /// process (the bridge's `OnceLock` can only be set once). Tables are
-    /// namespaced per test to avoid cross-test interference.
-    static TEST_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    /// namespaced per test to avoid cross-test interference. `pub(super)`
+    /// so the sibling `recycle_tests` module can borrow the runtime for
+    /// its locally-constructed bridges.
+    pub(super) static TEST_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
     pub(super) fn init_bridge() {
         let rt = TEST_RT.get_or_init(|| {
@@ -751,6 +943,273 @@ mod tests {
         with_col_name(0, |n| assert!(n.is_none()));
         with_cell(0, 0, |c| assert!(c.is_none()));
         with_error(|e| assert!(e.is_none()));
+    }
+
+    // ── Per-request teardown (on_request_end) ──────────────────────────
+
+    /// Whether this thread's session currently believes it is inside an
+    /// explicit transaction (None = no session open).
+    fn thread_in_transaction() -> Option<bool> {
+        DB_SESSION.with(|s| s.borrow().as_ref().map(|sess| sess.in_transaction))
+    }
+
+    #[test]
+    #[serial]
+    fn request_end_rolls_back_an_abandoned_transaction() {
+        init_bridge();
+        assert_eq!(run("CREATE TABLE bridge_req_end (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+
+        // Simulate a script that BEGINs, writes, and never COMMITs.
+        assert_eq!(run("BEGIN"), RunStatus::Ok);
+        assert_eq!(run("INSERT INTO bridge_req_end (id) VALUES (1)"), RunStatus::Ok);
+        assert_eq!(thread_in_transaction(), Some(true));
+
+        on_request_end();
+
+        // The transaction is gone and the write with it; the session (and
+        // its connection) survive for the next request.
+        assert_eq!(thread_in_transaction(), Some(false));
+        assert_eq!(run("SELECT COUNT(*) FROM bridge_req_end"), RunStatus::Rows);
+        with_cell(0, 0, |c| assert_eq!(c, Some(&Value::Integer(0))));
+
+        // And a committed transaction on the recovered session works.
+        assert_eq!(run("BEGIN"), RunStatus::Ok);
+        assert_eq!(run("INSERT INTO bridge_req_end (id) VALUES (2)"), RunStatus::Ok);
+        assert_eq!(run("COMMIT"), RunStatus::Ok);
+        assert_eq!(run("SELECT COUNT(*) FROM bridge_req_end"), RunStatus::Rows);
+        with_cell(0, 0, |c| assert_eq!(c, Some(&Value::Integer(1))));
+        finish();
+    }
+
+    #[test]
+    #[serial]
+    fn request_end_clears_staged_results_and_is_noop_without_a_transaction() {
+        init_bridge();
+        assert_eq!(run("SELECT 1"), RunStatus::Rows);
+        assert_eq!(row_count(), 1);
+
+        on_request_end();
+
+        // Staged result released; autocommit session untouched.
+        assert_eq!(row_count(), 0);
+        assert_eq!(thread_in_transaction(), Some(false));
+        assert_eq!(run("SELECT 1"), RunStatus::Rows);
+        finish();
+    }
+
+    #[test]
+    fn request_end_without_a_session_is_a_noop() {
+        // This test's thread never ran a query, so no session exists.
+        // (Thread-locals are per-test-thread; no #[serial] needed.)
+        assert_eq!(thread_in_transaction(), None);
+        on_request_end();
+        assert_eq!(thread_in_transaction(), None);
+    }
+}
+
+// ── Session-recycling tests (mock backend, local bridge) ────────────────
+//
+// These drive `run_on` with a locally-constructed `DbBridge` wrapping a
+// mock backend, so they never touch the process-wide set-once DB_BRIDGE
+// and need no #[serial]: every thread-local involved (DB_SESSION,
+// DB_PARAMS, DB_RESULT, DB_ERROR) is private to the test's own thread.
+#[cfg(test)]
+mod recycle_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    use litewire::backend::{
+        Backend, BackendConn, BackendError, ExecuteResult, ResultSet, Rusqlite,
+    };
+
+    use super::tests::init_bridge;
+    use super::*;
+
+    /// Counters shared between a test and its [`FlakyBackend`].
+    #[derive(Default)]
+    struct Flags {
+        /// Successful `connect()` calls — proves when a reconnect happened.
+        connects: AtomicUsize,
+        /// While set, every query/execute on existing connections fails
+        /// with a connection-shaped error (the backend is "down").
+        down: AtomicBool,
+    }
+
+    /// A backend whose connections start failing on demand, with a
+    /// counting `connect()` that keeps succeeding — the "counting factory"
+    /// proving that dropping the session makes the next call reconnect.
+    struct FlakyBackend {
+        /// Real in-memory engine serving the non-failing calls.
+        inner: Rusqlite,
+        flags: Arc<Flags>,
+    }
+
+    struct FlakyConn {
+        inner: Box<dyn BackendConn>,
+        flags: Arc<Flags>,
+    }
+
+    impl FlakyConn {
+        fn outage() -> BackendError {
+            // Verbatim shape of hrana_client's pipeline-POST failure with
+            // a reqwest connect error nested inside.
+            BackendError::Other(
+                "HTTP request failed: error sending request for url \
+                 (http://127.0.0.1:8081/v2/pipeline): connection refused"
+                    .to_string(),
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for FlakyBackend {
+        async fn connect(&self) -> Result<Box<dyn BackendConn>, BackendError> {
+            let inner = self.inner.connect().await?;
+            self.flags.connects.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FlakyConn { inner, flags: Arc::clone(&self.flags) }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl BackendConn for FlakyConn {
+        async fn query(&self, sql: &str, params: &[Value]) -> Result<ResultSet, BackendError> {
+            if self.flags.down.load(Ordering::SeqCst) {
+                return Err(Self::outage());
+            }
+            self.inner.query(sql, params).await
+        }
+
+        async fn execute(
+            &self,
+            sql: &str,
+            params: &[Value],
+        ) -> Result<ExecuteResult, BackendError> {
+            if self.flags.down.load(Ordering::SeqCst) {
+                return Err(Self::outage());
+            }
+            self.inner.execute(sql, params).await
+        }
+    }
+
+    /// A local bridge over a [`FlakyBackend`] (plus the shared flags).
+    fn flaky_bridge() -> (DbBridge, Arc<Flags>) {
+        init_bridge(); // ensures the shared test runtime exists
+        let flags = Arc::new(Flags::default());
+        let backend: SharedBackend = Arc::new(FlakyBackend {
+            inner: Rusqlite::memory().expect("in-memory backend"),
+            flags: Arc::clone(&flags),
+        });
+        let handle = super::tests::TEST_RT.get().expect("runtime").handle().clone();
+        (DbBridge { backend, handle, cache: Arc::new(TranslateCache::default()) }, flags)
+    }
+
+    fn run(bridge: &DbBridge, sql: &str) -> RunStatus {
+        run_on(Some(bridge), sql.as_bytes())
+    }
+
+    #[test]
+    fn connection_error_recycles_and_next_call_reconnects() {
+        let (bridge, flags) = flaky_bridge();
+
+        // First call opens the session: one connect.
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Rows);
+        assert_eq!(flags.connects.load(Ordering::SeqCst), 1);
+
+        // Backend "restarts": the existing connection now fails with a
+        // connection-shaped error. The error is surfaced to PHP...
+        flags.down.store(true, Ordering::SeqCst);
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Err);
+        with_error(|e| {
+            let (code, sqlstate, msg) = e.expect("error must be staged");
+            assert_eq!(code, ER_UNKNOWN_ERROR);
+            assert_eq!(sqlstate, b"HY000");
+            assert!(msg.contains("connection refused"), "got: {msg}");
+        });
+        // ...without opening a new connection during the failing call.
+        assert_eq!(flags.connects.load(Ordering::SeqCst), 1);
+
+        // Backend is back: the NEXT call reconnects (counting factory
+        // shows a second connect) and succeeds.
+        flags.down.store(false, Ordering::SeqCst);
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Rows);
+        assert_eq!(flags.connects.load(Ordering::SeqCst), 2);
+        finish();
+    }
+
+    #[test]
+    fn sql_errors_do_not_recycle_the_session() {
+        let (bridge, flags) = flaky_bridge();
+
+        assert_eq!(run(&bridge, "CREATE TABLE rt_keep (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+        assert_eq!(flags.connects.load(Ordering::SeqCst), 1);
+
+        // 1062 duplicate key: classified, never connection-shaped.
+        assert_eq!(run(&bridge, "INSERT INTO rt_keep (id) VALUES (1)"), RunStatus::Ok);
+        assert_eq!(run(&bridge, "INSERT INTO rt_keep (id) VALUES (1)"), RunStatus::Err);
+
+        // 1105 fallback with a non-connection message ("no such table").
+        assert_eq!(run(&bridge, "SELECT * FROM rt_missing"), RunStatus::Err);
+
+        // 1064 translate error: never reaches the backend at all.
+        assert_eq!(run(&bridge, "NOT VALID SQL !!!"), RunStatus::Err);
+
+        // Same session throughout — no reconnect happened, and the
+        // session still sees the table it created.
+        assert_eq!(run(&bridge, "SELECT COUNT(*) FROM rt_keep"), RunStatus::Rows);
+        assert_eq!(flags.connects.load(Ordering::SeqCst), 1);
+        finish();
+    }
+
+    #[test]
+    fn connection_error_inside_a_transaction_does_not_recycle() {
+        let (bridge, flags) = flaky_bridge();
+
+        assert_eq!(run(&bridge, "CREATE TABLE rt_txn (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+        assert_eq!(run(&bridge, "BEGIN"), RunStatus::Ok);
+        assert_eq!(run(&bridge, "INSERT INTO rt_txn (id) VALUES (1)"), RunStatus::Ok);
+
+        // A connection-shaped failure mid-transaction must NOT drop the
+        // session (that would silently discard transaction state on a
+        // possible misclassification).
+        flags.down.store(true, Ordering::SeqCst);
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Err);
+        assert_eq!(flags.connects.load(Ordering::SeqCst), 1);
+
+        // The session survived, still mid-transaction, and recovers once
+        // the backend does.
+        flags.down.store(false, Ordering::SeqCst);
+        assert_eq!(run(&bridge, "ROLLBACK"), RunStatus::Ok);
+        assert_eq!(run(&bridge, "SELECT COUNT(*) FROM rt_txn"), RunStatus::Rows);
+        with_cell(0, 0, |c| assert_eq!(c, Some(&Value::Integer(0))));
+        assert_eq!(flags.connects.load(Ordering::SeqCst), 1);
+        finish();
+    }
+
+    #[test]
+    fn classification_is_conservative() {
+        // Connection-shaped: 1105 + a known transport marker.
+        let conn_err = SessionError::Db {
+            code: ER_UNKNOWN_ERROR,
+            sqlstate: *b"HY000",
+            message: "sqld returned 400 Bad Request: Invalid baton".to_string(),
+        };
+        assert!(is_connection_error(&conn_err));
+
+        // 1105 with an ordinary SQL message: not connection-shaped.
+        let sql_err = SessionError::Db {
+            code: ER_UNKNOWN_ERROR,
+            sqlstate: *b"HY000",
+            message: "no such table: sprockets".to_string(),
+        };
+        assert!(!is_connection_error(&sql_err));
+
+        // A classified code never qualifies, whatever the message says.
+        let classified = SessionError::Db {
+            code: litewire::session::error_map::ER_DUP_ENTRY,
+            sqlstate: *b"23000",
+            message: "UNIQUE constraint failed: connection refused".to_string(),
+        };
+        assert!(!is_connection_error(&classified));
     }
 }
 

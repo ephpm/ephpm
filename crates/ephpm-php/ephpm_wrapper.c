@@ -2845,9 +2845,12 @@ PHP_FUNCTION(ephpm_db_query)
  *
  * Execute SQL and return the OK metadata. Transactions flow through as
  * SQL — BEGIN / COMMIT / ROLLBACK here behave exactly as on the wire
- * path (the per-thread Session tracks the transaction state). A SELECT
- * routed through execute returns zeros rather than throwing. Errors
- * throw Exception (see ephpm_db_run_or_throw). */
+ * path (the per-thread Session tracks the transaction state). A
+ * transaction still open when the request ends is rolled back by the
+ * server with a warning (db_bridge.rs on_request_end) — it never leaks
+ * into the next request served by this thread. A SELECT routed through
+ * execute returns zeros rather than throwing. Errors throw Exception
+ * (see ephpm_db_run_or_throw). */
 PHP_FUNCTION(ephpm_db_execute)
 {
     char *sql; size_t sql_len;
