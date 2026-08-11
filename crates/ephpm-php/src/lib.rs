@@ -170,13 +170,64 @@ mod ffi {
     }
 }
 
-/// Tracks whether the current thread has been registered with TSRM.
+/// Tracks whether the current thread has been registered with TSRM, and
+/// retires the thread's PHP context when the thread exits.
 ///
 /// Each `spawn_blocking` thread must call `ephpm_thread_init()` once
 /// before executing PHP. This thread-local avoids redundant registration.
+///
+/// The [`Drop`] impl is the ZTS retirement seam (issue #266): TSRM's
+/// contract is that every thread that called `ts_resource()` frees its own
+/// slot with `ts_free_thread()` **on itself** before the main thread runs
+/// `php_module_shutdown()`. If a registered thread just dies (tokio
+/// blocking-pool threads idle out after `keep_alive`, and all of them are
+/// joined when the runtime is dropped), its `tsrm_tls_entry` lingers, and
+/// module shutdown's `ts_free_id()` then walks the stale entry and runs the
+/// per-thread globals dtors **on the shutting-down thread** — for pcre that
+/// releases cached, request-lifetime `zend_string`s (named-subpattern
+/// tables) into the wrong thread's Zend MM heap: `zend_mm_heap corrupted`
+/// → SIGABRT. Running `ephpm_thread_shutdown()` from the TLS destructor
+/// performs `php_request_shutdown()` + `ts_free_thread()` on the owning
+/// thread, where every dtor frees into the heap that allocated it.
+#[cfg(php_linked)]
+struct ThreadPhpGuard {
+    registered: std::cell::Cell<bool>,
+}
+
+#[cfg(php_linked)]
+impl Drop for ThreadPhpGuard {
+    fn drop(&mut self) {
+        // Worker-mode threads retire explicitly via `worker_thread_shutdown()`
+        // (the #258 seam), which clears the flag — this guard then no-ops, so
+        // `ts_free_thread()` is never run twice for one thread.
+        if !self.registered.get() {
+            return;
+        }
+        self.registered.set(false);
+        // If the PHP module is already gone (`PhpRuntime::shutdown()` ran
+        // first), TSRM has been torn down and touching it would be UB. In
+        // serve mode this cannot happen: the tokio runtime is dropped —
+        // joining every blocking-pool thread, and running this guard —
+        // before `PhpRuntime::shutdown()` is called.
+        if !PHP_INITIALIZED.load(Ordering::Acquire) {
+            return;
+        }
+        // SAFETY: this thread is TSRM-registered (the flag was set) and is
+        // exiting, so no further PHP executes on it. ephpm_thread_shutdown
+        // runs php_request_shutdown (ending the lazily-kept-open final
+        // request on the thread that owns it — its RSHUTDOWNs free
+        // request-lifetime state, e.g. pcre subpattern-name strings, into
+        // this thread's own Zend MM heap) and then ts_free_thread, which
+        // destroys this thread's TSRM resources in reverse-id order on this
+        // thread. No logging here: tracing's own TLS may already be gone.
+        unsafe { ffi::ephpm_thread_shutdown() };
+    }
+}
+
 #[cfg(php_linked)]
 thread_local! {
-    static THREAD_REGISTERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static THREAD_REGISTERED: ThreadPhpGuard =
+        const { ThreadPhpGuard { registered: std::cell::Cell::new(false) } };
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -372,6 +423,16 @@ impl PhpRuntime {
     /// Shut down the PHP runtime.
     ///
     /// Calls `php_embed_shutdown()` and cleans up.
+    ///
+    /// Mirror of the single-threaded-phase discipline `init()` documents:
+    /// just as `init()` must run before any worker thread exists, this must
+    /// run **after every PHP-registered thread has exited** (fpm mode: drop
+    /// the tokio runtime first so its blocking pool joins; worker mode:
+    /// wait for the pool to drain). Each exiting thread retires its own
+    /// TSRM slot via [`ThreadPhpGuard`]; if a registered thread is still
+    /// alive here, `php_module_shutdown()`'s `ts_free_id()` walks that
+    /// thread's live TSRM entry and frees its per-thread state on *this*
+    /// thread — cross-heap `efree` → `zend_mm_heap corrupted` (issue #266).
     ///
     /// # Errors
     ///
@@ -590,8 +651,8 @@ impl PhpRuntime {
     /// Only the first call on each thread actually registers with TSRM.
     #[cfg(php_linked)]
     fn ensure_thread_registered() -> Result<(), PhpError> {
-        THREAD_REGISTERED.with(|registered| {
-            if registered.get() {
+        THREAD_REGISTERED.with(|guard| {
+            if guard.registered.get() {
                 return Ok(());
             }
 
@@ -604,7 +665,11 @@ impl PhpRuntime {
                 return Err(PhpError::ThreadInitFailed);
             }
 
-            registered.set(true);
+            // Setting the flag arms the guard's Drop: when this thread exits
+            // (idle timeout or runtime shutdown), it retires its own TSRM
+            // slot instead of leaving a stale entry for module shutdown to
+            // trip over (issue #266).
+            guard.registered.set(true);
             tracing::debug!("TSRM thread registered for PHP execution");
             Ok(())
         })
@@ -912,11 +977,13 @@ impl PhpRuntime {
             // and logged instead of incidental.)
             db_bridge::on_request_end();
 
+            // Disarm the TLS guard FIRST so it cannot run a second
+            // ephpm_thread_shutdown at thread exit (double ts_free_thread).
+            THREAD_REGISTERED.with(|guard| guard.registered.set(false));
             // SAFETY: called on a TSRM-registered worker thread that is done
             // executing PHP. ephpm_thread_shutdown runs php_request_shutdown +
             // ts_free_thread and frees the thread-local capture buffers.
             unsafe { ffi::ephpm_thread_shutdown() };
-            THREAD_REGISTERED.with(|registered| registered.set(false));
             tracing::debug!("worker thread PHP context shut down");
         }
     }

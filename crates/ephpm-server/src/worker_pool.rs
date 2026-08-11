@@ -152,6 +152,16 @@ impl WorkerPool {
         self.state.ready.load(Ordering::Acquire)
     }
 
+    /// Number of worker OS threads still alive (including ones mid-boot or
+    /// mid-teardown). Decremented only *after* a worker has released its
+    /// TSRM slot ([`PhpRuntime::worker_thread_shutdown`]), so `0` during a
+    /// drain means every worker thread's PHP context is fully retired and
+    /// `php_embed_shutdown()` is safe to run (issue #266).
+    #[must_use]
+    pub fn live_count(&self) -> usize {
+        self.state.live.load(Ordering::Acquire)
+    }
+
     /// Current dispatch-queue depth (jobs enqueued, not yet pulled by a
     /// worker). Test-only accessor for the counter-pair accounting.
     #[cfg(test)]

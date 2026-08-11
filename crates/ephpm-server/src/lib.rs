@@ -885,6 +885,33 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         }
     }
 
+    // Worker mode: wait (bounded) for the worker OS threads themselves to
+    // finish retiring. They are detached, so nothing else joins them — and
+    // `live` only reaches 0 after every worker has run
+    // `PhpRuntime::worker_thread_shutdown()` (php_request_shutdown +
+    // ts_free_thread on its own thread). php_embed_shutdown() must not run
+    // while any of those TSRM entries are still live (issue #266), so give
+    // the drain a real window before the caller proceeds to PHP teardown.
+    if let Some(pool) = &worker_pool {
+        let deadline = tokio::time::Instant::now() + shutdown_timeout;
+        loop {
+            let live = pool.live_count();
+            if live == 0 {
+                tracing::info!("all worker threads retired");
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    live_workers = live,
+                    "shutdown timeout reached with worker threads still live — \
+                     PHP teardown may be unsafe if a worker is wedged mid-request"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     // The QUIC endpoint sends CONNECTION_CLOSE to its peers as the accept loop
     // exits; give that task a bounded moment to finish so clients see a clean
     // close instead of a timeout.
