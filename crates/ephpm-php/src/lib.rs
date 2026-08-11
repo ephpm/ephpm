@@ -551,7 +551,18 @@ impl PhpRuntime {
 
         #[cfg(php_linked)]
         {
-            Self::execute_php(&request)
+            let result = Self::execute_php(&request);
+            // Per-request DB-bridge teardown (fpm-mode seam). This is the
+            // single choke point every fpm-style request passes through on
+            // the same spawn_blocking thread that ran the script, whatever
+            // the outcome (OK, exit(), bailout, startup failure) — so a
+            // transaction the script left open is rolled back before this
+            // thread can serve an unrelated request, and the staged
+            // result/error memory is released instead of sitting until the
+            // thread's next request. Pure Rust + litewire — no Zend calls,
+            // so no zend_try guard is needed.
+            db_bridge::on_request_end();
+            result
         }
 
         #[cfg(not(php_linked))]
@@ -890,6 +901,17 @@ impl PhpRuntime {
     pub fn worker_thread_shutdown() {
         #[cfg(php_linked)]
         {
+            // Worker-mode crash seam: a fatal kills the worker before its
+            // in-flight request ever reaches send_response, so
+            // finish_iteration's per-request teardown never ran. Roll back
+            // any transaction that request left open (and release staged
+            // bridge buffers) here, on the same thread, before the PHP
+            // context goes away. (The thread-local session would also drop
+            // at thread exit, which closes the connection and abandons the
+            // transaction server-side — this makes the rollback explicit
+            // and logged instead of incidental.)
+            db_bridge::on_request_end();
+
             // SAFETY: called on a TSRM-registered worker thread that is done
             // executing PHP. ephpm_thread_shutdown runs php_request_shutdown +
             // ts_free_thread and frees the thread-local capture buffers.
