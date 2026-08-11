@@ -7,10 +7,13 @@ mod idle;
 pub mod metrics;
 pub mod middleware;
 pub mod opcache;
+#[cfg(feature = "otlp")]
+pub mod otlp;
 pub mod rate_limit;
 pub mod router;
 pub mod static_files;
 pub mod stream_compress;
+mod timeline;
 pub mod tls;
 pub mod tracked_backend;
 pub mod turso_cdc;
@@ -38,7 +41,21 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 
+/// `tracing` target of the request spans (`http.request`,
+/// `worker.queue_wait`, `php.execute`) emitted by the router at DEBUG level.
+///
+/// A dedicated target so the OTLP layer (see the `otlp` feature) can enable
+/// exactly these spans with a `Targets` filter without also exporting every
+/// debug log line — and so the default `info`-level stack leaves the span
+/// callsites disabled (a single static check per request).
+pub const OTEL_TRACE_TARGET: &str = "ephpm_otel";
+
 /// Start the HTTP server with the given configuration.
+///
+/// `dev_mode` is `true` under `ephpm dev` / bare `ephpm` and `false` under
+/// `ephpm serve`. It selects the default for the request-timeline ring
+/// buffer (`/_ephpm/requests`): on in dev, off in serve, unless
+/// `[server.diagnostics] request_log` says otherwise.
 ///
 /// Listens on the configured address and routes requests to either
 /// PHP execution or static file serving based on the request path.
@@ -55,7 +72,7 @@ use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 /// # Errors
 ///
 /// Returns an error if the listen address is invalid or binding fails.
-pub async fn serve(config: Config) -> anyhow::Result<()> {
+pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // Install Prometheus recorder if metrics are enabled.
     let metrics_handle = if config.server.metrics.enabled {
         Some(metrics::init().context("failed to initialize metrics")?)
@@ -260,6 +277,20 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
     // empty and auto-derived), else None (Router falls back to config).
     let effective_node_id = cluster_handle.as_ref().map(|h| h.self_node().id.clone());
 
+    // Request timeline ring buffer (`/_ephpm/requests`): on by default in
+    // dev mode, opt-in via [server.diagnostics] request_log in serve mode.
+    let request_log = config
+        .server
+        .diagnostics
+        .effective_request_log(dev_mode)
+        .then(|| Arc::new(timeline::RequestLog::new(timeline::REQUEST_LOG_CAPACITY)));
+    if request_log.is_some() {
+        tracing::info!(
+            capacity = timeline::REQUEST_LOG_CAPACITY,
+            "request timeline enabled — last requests served at /_ephpm/requests"
+        );
+    }
+
     let listeners = bind_listeners(
         &config,
         kv_store,
@@ -268,6 +299,7 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         middleware_chain,
         effective_node_id,
         Arc::clone(&db_health),
+        request_log,
     )
     .await?;
 
@@ -359,7 +391,11 @@ async fn bind_listeners(
     node_id: Option<String>,
     // Upstream health of the configured SQL proxies, so the readiness probe
     // reports 503 until each one has reached its upstream at least once.
+    // (`request_log` follows below: the dev-mode request timeline buffer,
+    // `None` when disabled — resolved in `serve` from
+    // `[server.diagnostics] request_log` + the mode default.)
     db_health: Arc<db_health::DbProxyHealth>,
+    request_log: Option<Arc<timeline::RequestLog>>,
 ) -> anyhow::Result<Listeners> {
     let addr: SocketAddr = config.server.listen.parse().context("invalid listen address")?;
 
@@ -571,7 +607,8 @@ async fn bind_listeners(
         // Kind). In single-node mode this is None, so Router keeps whatever it
         // derived from `[cluster] node_id`.
         .with_node_id(node_id)
-        .with_db_health(db_health);
+        .with_db_health(db_health)
+        .with_request_log(request_log);
 
         // Only advertise HTTP/3 once its UDP socket is confirmed bound.
         match alt_svc {

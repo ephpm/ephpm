@@ -30,7 +30,7 @@ The controls that exist today, in one place:
 - **Per-vhost `open_basedir`** — in multi-site mode, PHP filesystem access is restricted per-request to the site's directory plus the system temp directory (`std::env::temp_dir()`, so `TMPDIR` is honoured and Windows gets its real temp path). Entries are joined with the platform's `PATH_SEPARATOR` (`:` on Unix, `;` on Windows).
 - **`disable_shell_exec`** — `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec` disabled via the php.ini generated at startup (default on in multi-site mode)
 - **`blocked_paths`** — glob patterns matched against the URI path (patterns must start with `/`); matches return 403
-- **`trusted_hosts`** — Host header validation; non-matching hosts get 421. Internal endpoints (`/_ephpm/health`, `/_ephpm/ready`, the metrics path) are exempt so Kubernetes probes and Prometheus scrapes can address the pod by raw IP
+- **`trusted_hosts`** — Host header validation; non-matching hosts get 421. Internal endpoints (`/_ephpm/health`, `/_ephpm/ready`, `/_ephpm/requests` when the request timeline is enabled, the metrics path) are exempt so Kubernetes probes and Prometheus scrapes can address the pod by raw IP
 - **`trusted_proxies`** — CIDR-based proxy trust for `X-Forwarded-For` / `X-Forwarded-Proto` resolution
 - **Hidden-file modes** — dotfile requests handled per `hidden_files` (`deny`=403, `ignore`=404, `allow`)
 - **Percent-decode traversal hardening** — strict `%XX` decoding before routing; encoded `/` and `\`, truncated or non-hex escapes, and invalid UTF-8 are rejected with 400

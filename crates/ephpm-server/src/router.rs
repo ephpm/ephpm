@@ -360,6 +360,12 @@ pub struct Router {
     /// [`Router::readiness_check`]. `None` when the router was built without
     /// one (tests); readiness then ignores the database entirely.
     db_health: Option<Arc<crate::db_health::DbProxyHealth>>,
+    /// Per-request timeline ring buffer served at `/_ephpm/requests`.
+    /// `None` = disabled: nothing is recorded and the endpoint path falls
+    /// through to normal routing like any other unknown `/_ephpm/` path.
+    /// Enabled by default in dev mode, opt-in via
+    /// `[server.diagnostics] request_log` in serve mode.
+    request_log: Option<Arc<crate::timeline::RequestLog>>,
 }
 
 /// Header names always stripped from inbound requests at ingest, in addition
@@ -686,7 +692,20 @@ impl Router {
             canonical_scripts_swept: std::sync::Mutex::new(Instant::now()),
             ingest_strip_headers: build_ingest_strip_headers(&config.middleware),
             db_health: None,
+            request_log: None,
         }
+    }
+
+    /// Attach (or leave off) the request-timeline ring buffer resolved in
+    /// `serve()`. Kept out of `new()`'s signature so its existing call sites
+    /// stay unchanged; `None` keeps the timeline disabled.
+    #[must_use]
+    pub(crate) fn with_request_log(
+        mut self,
+        request_log: Option<Arc<crate::timeline::RequestLog>>,
+    ) -> Self {
+        self.request_log = request_log;
+        self
     }
 
     /// Canonicalized form of a site's document root, cached with a short
@@ -1076,12 +1095,51 @@ impl Router {
         gauge!("ephpm_http_requests_in_flight").increment(1.0);
         let start = std::time::Instant::now();
 
+        // Timeline capture (dev mode / [server.diagnostics] request_log):
+        // method + path have to be cloned out before `req` is consumed below.
+        // Internal endpoints (`/_ephpm/*`, the metrics path) are excluded so
+        // a dashboard polling `/_ephpm/requests` doesn't fill the buffer with
+        // its own polls. `None` when the timeline is disabled — the shared
+        // (serve-mode) hot path allocates nothing here.
+        let timeline_capture = self.request_log.as_ref().and_then(|_| {
+            let path = req.uri().path();
+            if path.starts_with("/_ephpm/") || path == self.metrics_path {
+                None
+            } else {
+                Some((req.method().as_str().to_owned(), path.to_owned()))
+            }
+        });
+
+        // Request span for OTLP export. DEBUG level under a dedicated target
+        // (`crate::OTEL_TRACE_TARGET`) so the default info-level stack leaves
+        // the callsite disabled — the span only materializes when a layer
+        // opts in (the OTLP layer's Targets filter, or RUST_LOG=debug).
+        // Timing-wise it brackets the same region as `start`/`elapsed`.
+        let span = tracing::debug_span!(
+            target: crate::OTEL_TRACE_TARGET,
+            "http.request",
+            http.request.method = %req.method(),
+            url.path = req.uri().path(),
+            http.response.status_code = tracing::field::Empty,
+        );
+        // W3C trace-context propagation: parent the request span to an
+        // incoming `traceparent` header. Only compiled with the `otlp`
+        // feature (the propagator lives in the opentelemetry crates) and
+        // only paid when the span is enabled and the header is present.
+        #[cfg(feature = "otlp")]
+        if !span.is_disabled() {
+            crate::otlp::set_span_parent_from_headers(&span, req.headers());
+        }
+
         // A `request` timeout of 0 disables the per-request deadline
         // (`[server.timeouts] request = 0`). In that mode we run the inner
         // handler directly rather than paying to arm and disarm a tokio
         // timer on every request (issue #135) - the timer registration is
         // ~0.02ms of pure overhead when the deadline never fires.
-        let inner = self.handle_inner(req, remote_addr, is_tls);
+        let inner = tracing::Instrument::instrument(
+            self.handle_inner(req, remote_addr, is_tls),
+            span.clone(),
+        );
         let (result, handler) = if self.request_timeout.is_zero() {
             let result = inner.await;
             let handler = result.as_ref().map_or("error", |(_, h)| *h);
@@ -1102,6 +1160,31 @@ impl Router {
         let mut result = result;
         if let Ok(ref mut resp) = result {
             self.apply_alt_svc(resp, is_tls);
+
+            span.record("http.response.status_code", resp.status().as_u16());
+
+            // Timeline entry: reuse the values already measured — `elapsed`
+            // (the histogram measurement below) plus the PHP-path timings the
+            // dispatch paths stashed in the response extensions. Nothing is
+            // re-measured here.
+            if let (Some(log), Some((method, path))) =
+                (self.request_log.as_deref(), timeline_capture)
+            {
+                let timings = resp.extensions_mut().remove::<crate::timeline::PhpTimings>();
+                let response_bytes = hyper::body::Body::size_hint(resp.body()).exact();
+                log.record(crate::timeline::TimelineEntry {
+                    timestamp_ms: crate::timeline::unix_now_ms(),
+                    method,
+                    path,
+                    status: resp.status().as_u16(),
+                    total_ms: elapsed * 1000.0,
+                    queue_wait_ms: timings
+                        .and_then(|t| t.queue_wait)
+                        .map(|d| d.as_secs_f64() * 1000.0),
+                    php_ms: timings.and_then(|t| t.execute).map(|d| d.as_secs_f64() * 1000.0),
+                    response_bytes,
+                });
+            }
         }
 
         if let Ok(ref resp) = result {
@@ -1186,6 +1269,16 @@ impl Router {
             // Readiness probe — checks PHP initialization and DB proxy.
             if uri_path == "/_ephpm/ready" {
                 return Ok((self.readiness_check(), "health"));
+            }
+
+            // Request timeline (dev mode / [server.diagnostics] request_log):
+            // the ring buffer as JSON, newest first. Only mounted when the
+            // timeline is enabled — when disabled, the path deliberately
+            // falls through and behaves like any other unknown /_ephpm/ path.
+            if uri_path == "/_ephpm/requests" {
+                if let Some(ref log) = self.request_log {
+                    return Ok((json_response_owned(StatusCode::OK, log.to_json()), "diagnostics"));
+                }
             }
         }
 
@@ -1689,6 +1782,12 @@ impl Router {
             None => None,
         };
 
+        // `php.execute` span: brackets exactly the region `php_start` /
+        // `php_elapsed` measure (the whole spawn_blocking hop, including its
+        // queue time — same semantics as the histogram below). Created here,
+        // inside the `http.request`-instrumented future, so it parents
+        // correctly; dropped right after the timer is read.
+        let php_span = tracing::debug_span!(target: crate::OTEL_TRACE_TARGET, "php.execute");
         let php_start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             // Scope KV store to this virtual host for multi-tenant isolation.
@@ -1744,19 +1843,27 @@ impl Router {
             })
         })
         .await;
-        let php_elapsed = php_start.elapsed().as_secs_f64();
+        let php_elapsed = php_start.elapsed();
+        drop(php_span);
 
-        histogram!("ephpm_php_execution_duration_seconds").record(php_elapsed);
+        histogram!("ephpm_php_execution_duration_seconds").record(php_elapsed.as_secs_f64());
         let exec_status = match &result {
             Ok(Ok(_)) => "ok",
             Ok(Err(_)) | Err(_) => "error",
         };
         counter!("ephpm_php_executions_total", "status" => exec_status).increment(1);
 
-        apply_response_headers(
+        let mut response = apply_response_headers(
             build_php_response(result, accepts_gzip, accepts_br, self.compression),
             &mw_response_headers,
-        )
+        );
+        // Hand the measurement up to `handle` for the request timeline. No
+        // queue wait on this path — spawn_blocking has no worker dispatch
+        // queue, so the value is absent, not zero.
+        response
+            .extensions_mut()
+            .insert(crate::timeline::PhpTimings { queue_wait: None, execute: Some(php_elapsed) });
+        response
     }
 
     /// Dispatch a PHP request to the persistent worker pool (worker mode).
@@ -1831,16 +1938,36 @@ impl Router {
             headers,
         };
 
+        // `worker.queue_wait` and `php.execute` spans, siblings under
+        // `http.request`. Both open at dispatch time — the same instant the
+        // existing timers start. queue_wait closes when the pool hands back
+        // its oneshot receiver; php.execute closes when the response arrives
+        // (or on the early error returns), mirroring the two histograms —
+        // note the worker-mode execution timer deliberately includes the
+        // queue wait, exactly like `ephpm_php_execution_duration_seconds`.
+        let queue_span =
+            tracing::debug_span!(target: crate::OTEL_TRACE_TARGET, "worker.queue_wait");
+        let php_span = tracing::debug_span!(target: crate::OTEL_TRACE_TARGET, "php.execute");
         let php_start = std::time::Instant::now();
         let queue_wait_start = php_start;
         let recv = pool.dispatch(owned).await;
+        let queue_wait = queue_wait_start.elapsed();
+        drop(queue_span);
         #[allow(clippy::cast_precision_loss)]
-        histogram!("ephpm_worker_request_wait_seconds")
-            .record(queue_wait_start.elapsed().as_secs_f64());
+        histogram!("ephpm_worker_request_wait_seconds").record(queue_wait.as_secs_f64());
+
+        // Timings handed up to `handle` for the request timeline. The queue
+        // wait is known from here on; `execute` is filled in only once the
+        // worker actually delivers a response.
+        let queued_only =
+            crate::timeline::PhpTimings { queue_wait: Some(queue_wait), execute: None };
 
         // Dispatch channel closed (pool draining / all workers gone) — 503.
         let Ok(rx) = recv else {
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable");
+            return with_php_timings(
+                error_response(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable"),
+                queued_only,
+            );
         };
 
         gauge!("ephpm_worker_busy").increment(1.0);
@@ -1869,34 +1996,48 @@ impl Router {
             // Sender dropped (worker unwound with no stashed sender) — 500.
             Ok(Err(_)) => {
                 counter!("ephpm_php_executions_total", "status" => "error").increment(1);
-                return build_php_response(
-                    Ok(Err(ephpm_php::PhpError::ExecutionFailed(
-                        "worker dropped response (bailout)".into(),
-                    ))),
-                    accepts_gzip,
-                    accepts_br,
-                    self.compression,
+                return with_php_timings(
+                    build_php_response(
+                        Ok(Err(ephpm_php::PhpError::ExecutionFailed(
+                            "worker dropped response (bailout)".into(),
+                        ))),
+                        accepts_gzip,
+                        accepts_br,
+                        self.compression,
+                    ),
+                    queued_only,
                 );
             }
             // Worker never responded in time — replace it, return 504.
             Err(_) => {
                 pool.note_hung();
                 counter!("ephpm_http_timeouts_total", "stage" => "worker").increment(1);
-                return error_response(StatusCode::GATEWAY_TIMEOUT, "504 Gateway Timeout");
+                return with_php_timings(
+                    error_response(StatusCode::GATEWAY_TIMEOUT, "504 Gateway Timeout"),
+                    queued_only,
+                );
             }
         };
 
-        let php_elapsed = php_start.elapsed().as_secs_f64();
-        histogram!("ephpm_php_execution_duration_seconds").record(php_elapsed);
+        let php_elapsed = php_start.elapsed();
+        drop(php_span);
+        histogram!("ephpm_php_execution_duration_seconds").record(php_elapsed.as_secs_f64());
         counter!("ephpm_php_executions_total", "status" => "ok").increment(1);
 
+        let timings = crate::timeline::PhpTimings {
+            queue_wait: Some(queue_wait),
+            execute: Some(php_elapsed),
+        };
         match worker_resp {
             ephpm_php::worker_bridge::WorkerResponse::Buffered { status, headers, body } => {
-                build_php_response(
-                    Ok(Ok(ephpm_php::response::PhpResponse { status, headers, body })),
-                    accepts_gzip,
-                    accepts_br,
-                    self.compression,
+                with_php_timings(
+                    build_php_response(
+                        Ok(Ok(ephpm_php::response::PhpResponse { status, headers, body })),
+                        accepts_gzip,
+                        accepts_br,
+                        self.compression,
+                    ),
+                    timings,
                 )
             }
             // Streamed response (Phase 3): flush chunks to the client as PHP
@@ -1908,13 +2049,16 @@ impl Router {
                 headers,
                 body_rx,
                 aborted,
-            } => build_streamed_worker_response(
-                status,
-                headers,
-                body_rx,
-                aborted,
-                accepts_br,
-                self.compression,
+            } => with_php_timings(
+                build_streamed_worker_response(
+                    status,
+                    headers,
+                    body_rx,
+                    aborted,
+                    accepts_br,
+                    self.compression,
+                ),
+                timings,
             ),
         }
     }
@@ -2366,6 +2510,17 @@ fn json_response(status: StatusCode, body: &'static str) -> Response<ServerBody>
         .header("content-type", "application/json")
         .body(body::buffered(Full::new(Bytes::from_static(body.as_bytes()))))
         .expect("static json response")
+}
+
+/// Stash PHP-path timings in the response extensions so `Router::handle`
+/// can hand the already-taken measurements to the request timeline without
+/// re-measuring anything.
+fn with_php_timings(
+    mut resp: Response<ServerBody>,
+    timings: crate::timeline::PhpTimings,
+) -> Response<ServerBody> {
+    resp.extensions_mut().insert(timings);
+    resp
 }
 
 /// A JSON response whose body is built at runtime.
@@ -3087,6 +3242,246 @@ mod tests {
         // Legitimate headers are preserved untouched.
         assert!(handed_to_php.iter().any(|(n, _)| n.eq_ignore_ascii_case("host")));
         assert!(handed_to_php.iter().any(|(n, _)| n.eq_ignore_ascii_case("user-agent")));
+    }
+
+    // ── Request timeline (/_ephpm/requests) ──────────────────────────
+
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// `(span name, parent span name)` as collected by [`SpanTree`].
+    type SpanRecord = (String, Option<String>);
+
+    /// Test layer collecting `(span name, parent span name)` pairs for the
+    /// router's request spans (target [`crate::OTEL_TRACE_TARGET`]).
+    #[derive(Clone, Default)]
+    struct SpanTree(Arc<std::sync::Mutex<Vec<SpanRecord>>>);
+
+    impl SpanTree {
+        fn snapshot(&self) -> Vec<SpanRecord> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SpanTree
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().target() != crate::OTEL_TRACE_TARGET {
+                return;
+            }
+            let parent = attrs
+                .parent()
+                .cloned()
+                .or_else(|| {
+                    if attrs.is_contextual() { ctx.current_span().id().cloned() } else { None }
+                })
+                .and_then(|pid| ctx.span(&pid).map(|s| s.name().to_string()));
+            self.0.lock().unwrap().push((attrs.metadata().name().to_string(), parent));
+        }
+    }
+
+    async fn fetch_timeline(router: &Router) -> Vec<serde_json::Value> {
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/_ephpm/requests")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    /// A completed request lands in `/_ephpm/requests` with the shared
+    /// measurements filled in — and the endpoint's own polls (and other
+    /// `/_ephpm/` internals) are excluded from the buffer.
+    #[tokio::test]
+    async fn requests_endpoint_returns_entries_after_request() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let router = test_router(dir.path())
+            .with_request_log(Some(Arc::new(crate::timeline::RequestLog::new(8))));
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // One health poll (must NOT be recorded) and one static hit (must be).
+        let req = Request::builder()
+            .method("GET")
+            .uri("/_ephpm/health")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        router.handle(req, addr, false).await.unwrap();
+        let req =
+            Request::builder().method("GET").uri("/a.txt").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let entries = fetch_timeline(&router).await;
+        assert_eq!(entries.len(), 1, "only /a.txt should be recorded: {entries:?}");
+        assert_eq!(entries[0]["method"], "GET");
+        assert_eq!(entries[0]["path"], "/a.txt");
+        assert_eq!(entries[0]["status"], 200);
+        assert!(entries[0]["total_ms"].as_f64().unwrap() >= 0.0);
+        assert!(entries[0]["timestamp_ms"].as_u64().unwrap() > 0);
+        assert!(entries[0]["queue_wait_ms"].is_null(), "static file has no queue wait");
+        assert!(entries[0]["php_ms"].is_null(), "static file has no PHP time");
+        assert_eq!(entries[0]["response_bytes"], 5);
+    }
+
+    /// With the timeline disabled (the serve-mode default), the endpoint
+    /// must behave like any other unknown `/_ephpm/` path — here a plain
+    /// 404 via the static fallback chain.
+    #[tokio::test]
+    async fn requests_endpoint_is_404_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router_with_404(dir.path());
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/_ephpm/requests")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Worker-mode PHP dispatch: the timeline entry carries the queue wait
+    /// (from the existing `ephpm_worker_request_wait_seconds` measurement)
+    /// with no PHP execution value when the worker never responds, and the
+    /// request produces the 3-span tree `http.request` →
+    /// {`worker.queue_wait`, `php.execute`}.
+    ///
+    /// A zero-worker pool (stub-mode-safe: spawns no PHP threads) accepts
+    /// the dispatch but never answers, so the inner worker timeout fires.
+    #[tokio::test(start_paused = true)]
+    async fn worker_mode_records_queue_wait_and_emits_span_tree() {
+        let tree = SpanTree::default();
+        let subscriber = tracing_subscriber::registry().with(tree.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        // Short request deadline so the never-answering pool becomes a 504
+        // without waiting out the 300s default (paused clock auto-advances).
+        config.server.timeouts.request = 1;
+        let pool = crate::worker_pool::WorkerPool::spawn(
+            dir.path().join("worker.php"),
+            0, // zero workers: dispatch queues, nobody answers
+            500,
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let router = Router::new(&config, test_store(), None, None, None, None, Some(pool))
+            .with_request_log(Some(Arc::new(crate::timeline::RequestLog::new(8))));
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req =
+            Request::builder().method("GET").uri("/index.php").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let entries = fetch_timeline(&router).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["path"], "/index.php");
+        assert_eq!(entries[0]["status"], 504);
+        assert!(
+            entries[0]["queue_wait_ms"].as_f64().unwrap() >= 0.0,
+            "worker mode must record the dispatch-queue wait: {entries:?}"
+        );
+        assert!(
+            entries[0]["php_ms"].is_null(),
+            "a worker that never responded produced no execution measurement: {entries:?}"
+        );
+
+        let spans = tree.snapshot();
+        let find = |name: &str| spans.iter().find(|(n, _)| n == name);
+        let http = find("http.request").expect("http.request span must exist");
+        assert_eq!(http.1, None, "http.request is the root span");
+        assert_eq!(
+            find("worker.queue_wait").expect("worker.queue_wait span must exist").1.as_deref(),
+            Some("http.request")
+        );
+        assert_eq!(
+            find("php.execute").expect("php.execute span must exist").1.as_deref(),
+            Some("http.request")
+        );
+    }
+
+    /// fpm-path PHP dispatch emits `http.request` → `php.execute` (no queue
+    /// span — there is no dispatch queue on the spawn_blocking path) and the
+    /// timeline entry records the execution time with an absent queue wait.
+    /// Runs against the stub PHP runtime, where execution fails with a 500 —
+    /// the measurement points are identical.
+    #[tokio::test]
+    async fn fpm_mode_spans_and_timeline_have_no_queue_wait() {
+        let tree = SpanTree::default();
+        let subscriber = tracing_subscriber::registry().with(tree.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let router = test_router(dir.path())
+            .with_request_log(Some(Arc::new(crate::timeline::RequestLog::new(8))));
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req =
+            Request::builder().method("GET").uri("/index.php").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        // Stub mode: 200 (stub page) when another test already initialized
+        // the process-global stub runtime, 500 (NotInitialized) otherwise.
+        // The timing/span instrumentation sits on the same code path either
+        // way, so accept both rather than depend on test order.
+        assert!(
+            resp.status() == StatusCode::OK || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
+            "unexpected stub-mode PHP status: {}",
+            resp.status()
+        );
+
+        let entries = fetch_timeline(&router).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(entries[0]["queue_wait_ms"].is_null(), "fpm mode has no worker queue");
+        assert!(
+            entries[0]["php_ms"].as_f64().unwrap() >= 0.0,
+            "fpm mode records the spawn_blocking execution time: {entries:?}"
+        );
+
+        let spans = tree.snapshot();
+        assert!(spans.iter().any(|(n, p)| n == "http.request" && p.is_none()), "{spans:?}");
+        assert!(
+            spans.iter().any(|(n, p)| n == "php.execute" && p.as_deref() == Some("http.request")),
+            "{spans:?}"
+        );
+        assert!(
+            !spans.iter().any(|(n, _)| n == "worker.queue_wait"),
+            "no queue span on the fpm path: {spans:?}"
+        );
     }
 
     fn test_router_with_404(dir: &Path) -> Router {

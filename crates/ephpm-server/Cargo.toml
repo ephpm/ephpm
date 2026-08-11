@@ -55,8 +55,30 @@ async-channel.workspace = true
 quinn.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true
+# OTLP trace export — all optional, activated together by the `otlp` feature.
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+# OTLP trace export: `tracing` spans (http.request / worker.queue_wait /
+# php.execute) shipped to an OpenTelemetry collector over OTLP http/protobuf.
+# Runtime activation is still opt-in via OTEL_EXPORTER_OTLP_ENDPOINT /
+# [server.diagnostics] otlp_endpoint — see src/otlp.rs.
+otlp = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:opentelemetry-otlp",
+    "dep:tracing-opentelemetry",
+    "dep:tracing-subscriber",
+]
 
 [dev-dependencies]
+# Span-tree assertions for the router's request spans (tests use a collector
+# Layer over the registry; no OTLP needed).
+tracing-subscriber.workspace = true
 tempfile.workspace = true
 rcgen.workspace = true
 # Paused-clock (`start_paused`) support for the idle-timeout watchdog tests.
