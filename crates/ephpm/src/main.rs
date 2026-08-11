@@ -966,7 +966,19 @@ fn run_with_config(
         .context("failed to create tokio runtime")?;
     let result = rt.block_on(async { ephpm_server::serve(config, dev_mode).await });
 
-    // Shutdown PHP runtime
+    // Drop the runtime BEFORE tearing down PHP (issue #266). Dropping joins
+    // every worker and blocking-pool thread; each PHP-registered blocking
+    // thread's TLS guard then runs php_request_shutdown + ts_free_thread on
+    // the thread itself, freeing its per-thread Zend state into its own heap.
+    // Only after that is php_embed_shutdown() safe: module shutdown's
+    // ts_free_id() walks all remaining TSRM entries on *this* thread, and any
+    // still-live worker entry would make it free another thread's
+    // request-lifetime allocations cross-heap (pcre's cached named-subpattern
+    // strings after WordPress traffic) — zend_mm_heap corrupted → SIGABRT.
+    drop(rt);
+
+    // Shutdown PHP runtime — all PHP threads are gone, only the main
+    // thread's TSRM entry remains.
     ephpm_php::PhpRuntime::shutdown().context("failed to shutdown PHP runtime")?;
 
     result.map(|()| ExitCode::SUCCESS)
