@@ -696,23 +696,17 @@ fn run_with_config(
     let otlp = ephpm_server::otlp::init_layer(config.server.diagnostics.otlp_endpoint.as_deref())
         .context("failed to initialize OTLP trace export")?;
 
-    #[cfg(feature = "otlp")]
-    let otlp_active = otlp.is_some();
-    #[cfg(not(feature = "otlp"))]
-    let otlp_active = false;
-
-    // Layer stack. Without OTLP the env filter is installed globally (its
-    // `Layer` impl), exactly as before. With the OTLP layer active it must be
-    // scoped to the fmt layer instead: a global info-level filter would
-    // disable the DEBUG-level request spans for every layer, including the
-    // OTLP one (which carries its own target filter).
+    // Layer stack. The env filter must be scoped to the fmt layer with
+    // `with_filter`, never pushed into the Vec as a sibling layer: `Vec`'s
+    // `Layer` impl merges per-layer `Interest` by taking the MAX, so an
+    // unfiltered fmt layer (`Interest::always`) bypasses a sibling
+    // `EnvFilter` entirely — RUST_LOG / -v / [server.logging] level were
+    // silently inert in non-OTLP builds when the filter was a sibling.
+    // (Scoping also keeps a global info-level filter from disabling the
+    // DEBUG-level request spans the OTLP layer needs; that layer carries
+    // its own target filter.)
     let mut layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> = Vec::new();
-    if otlp_active {
-        layers.push(fmt_layer.with_filter(env_filter).boxed());
-    } else {
-        layers.push(env_filter.boxed());
-        layers.push(fmt_layer);
-    }
+    layers.push(fmt_layer.with_filter(env_filter).boxed());
 
     // Set up access log file writer if configured.
     let _access_guard = if config.server.logging.access.is_empty() {
