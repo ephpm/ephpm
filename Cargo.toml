@@ -106,7 +106,17 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire main @ 541290c4 — Session extraction (litewire#18). The dialect
+# litewire main @ e34c6392 — WordPress-correctness fixes (litewire#25, #26).
+# Three things, all found by benchmarking real WordPress on ephpm:
+# (1) MySQL LIKE patterns now get the implicit ESCAPE '\' clause SQLite
+# lacks, so wpdb::esc_like()-escaped %/_ match literally (litewire#20).
+# (2) SQL_CALC_FOUND_ROWS / FOUND_ROWS() are emulated via session state —
+# WordPress found_posts / X-WP-Total were 0 site-wide before (litewire#23).
+# (3) A plain `LIMIT n` was silently DELETED from every translated MySQL
+# query (only the `LIMIT offset, count` comma form survived a take());
+# LIMITed queries returned every row. Fixed + regression-pinned.
+#
+# Previous pin 541290c4 — Session extraction (litewire#18). The dialect
 # translation + transaction-state + error-mapping core of the MySQL handler now
 # lives in the public `litewire-session` crate (`Session`), which the ephpm_db_*
 # in-process bridge consumes. Also fixes a silent multi-statement drop: the old
@@ -177,7 +187,7 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 # sqlparser, so a crafted identifier in SHOW CREATE TABLE / SHOW INDEX /
 # DESCRIBE becomes arbitrary SQL. 7a0b59c4 adds sanitize_identifier() and
 # applies it at every extraction site.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "541290c446b6", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "e34c63928ed9", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.0)

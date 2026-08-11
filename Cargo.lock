@@ -1406,6 +1406,7 @@ name = "ephpm-php"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "async-trait",
  "bindgen 0.72.1",
  "bytes",
  "cc",
@@ -2157,7 +2158,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tokio",
  "tower-service",
  "tracing",
@@ -2629,7 +2630,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 [[package]]
 name = "litewire"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
+source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
 dependencies = [
  "anyhow",
  "futures",
@@ -2648,7 +2649,7 @@ dependencies = [
 [[package]]
 name = "litewire-backend"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
+source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2666,7 +2667,7 @@ dependencies = [
 [[package]]
 name = "litewire-hrana"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
+source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2681,7 +2682,7 @@ dependencies = [
 [[package]]
 name = "litewire-mysql"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
+source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
 dependencies = [
  "async-trait",
  "litewire-backend",
@@ -2696,7 +2697,7 @@ dependencies = [
 [[package]]
 name = "litewire-postgres"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
+source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
 dependencies = [
  "async-trait",
  "futures",
@@ -2711,17 +2712,18 @@ dependencies = [
 [[package]]
 name = "litewire-session"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
+source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
 dependencies = [
  "litewire-backend",
  "litewire-translate",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
 name = "litewire-tds"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
+source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
 dependencies = [
  "bytes",
  "litewire-backend",
@@ -2734,7 +2736,7 @@ dependencies = [
 [[package]]
 name = "litewire-translate"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
+source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
 dependencies = [
  "lru 0.12.5",
  "parking_lot",
@@ -2746,7 +2748,7 @@ dependencies = [
 [[package]]
 name = "litewire-turso"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=541290c446b6#541290c446b6e962bab5d37033cb82d8a804884b"
+source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
 dependencies = [
  "async-trait",
  "litewire-backend",
@@ -3698,7 +3700,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.37",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3735,7 +3737,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -4651,6 +4653,18 @@ dependencies = [
  "log",
  "recursive",
  "serde",
+ "sqlparser_derive",
+]
+
+[[package]]
+name = "sqlparser_derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da5fc6819faabb412da764b99d3b713bb55083c11e7e0c00144d386cd6a1939c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
