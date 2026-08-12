@@ -1,0 +1,28 @@
+name: Fleet Maintenance
+
+# Manually dispatched janitorial tasks for the self-hosted runner fleet.
+# First use: purge a corrupted BuildKit/containerd build cache on the
+# shared Linux docker node (v0.6.3 release Docker legs failed twice on
+# `parent snapshot ... does not exist` — stale cache from a fleet outage).
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Maintenance task to run"
+        required: true
+        default: docker-cache-prune
+        type: choice
+        options:
+          - docker-cache-prune
+
+jobs:
+  docker-cache-prune:
+    if: inputs.task == 'docker-cache-prune'
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Purge docker build cache on this node
+        run: |
+          set -eux
+          docker builder prune -af
+          docker buildx prune -af || true
+          docker system df
