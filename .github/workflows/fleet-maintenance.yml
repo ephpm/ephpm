@@ -23,6 +23,13 @@ jobs:
       - name: Purge docker build cache on this node
         run: |
           set -eux
-          docker builder prune -af
-          docker buildx prune -af || true
+          # The default buildx builder's container can be gone while its
+          # state volume (with a corrupted snapshot db) survives — remove
+          # the builder, any orphaned buildkit containers, and their state
+          # volumes so the next build recreates everything fresh.
+          docker buildx ls || true
+          docker buildx rm -f default || true
+          docker ps -aq --filter name=buildx_buildkit | xargs -r docker rm -f
+          docker volume ls -q --filter name=buildx_buildkit | xargs -r docker volume rm -f
+          docker builder prune -af || true
           docker system df
