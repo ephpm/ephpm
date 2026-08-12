@@ -32,4 +32,6 @@ jobs:
           docker ps -aq --filter name=buildx_buildkit | xargs -r docker rm -f
           docker volume ls -q --filter name=buildx_buildkit | xargs -r docker volume rm -f
           docker builder prune -af || true
-          docker system df
+          # NOTE: no `docker system df` here — ephemerd's docker shim does
+          # not implement /system/df and the job would fail on diagnostics.
+          echo "cache purge complete"
