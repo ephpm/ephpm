@@ -569,7 +569,13 @@ jobs:
           echo "==> building ${#tag_list[@]} tag(s):"
           printf '      %s\n' "${tag_list[@]}"
 
+          # --no-cache: release images must never depend on the shared
+          # builder cache — a poisoned parent-snapshot entry on the fleet
+          # (surviving prune AND the ephemerd #146 GC) failed the v0.6.3
+          # Docker legs four times. Cache buys little on release builds;
+          # correctness buys everything.
           docker build \
+            --no-cache \
             -f docker/Dockerfile \
             --build-arg "PHP_SDK_VERSION=${PHP_FULL}" \
             --build-arg "EPHPM_RELEASE_VERSION=${RELEASE_VERSION}" \
