@@ -14,6 +14,7 @@ on:
         type: choice
         options:
           - docker-cache-prune
+          - image-purge
 
 jobs:
   docker-cache-prune:
@@ -35,3 +36,17 @@ jobs:
           # NOTE: no `docker system df` here — ephemerd's docker shim does
           # not implement /system/df and the job would fail on diagnostics.
           echo "cache purge complete"
+
+  image-purge:
+    if: inputs.task == 'image-purge'
+    runs-on: [self-hosted, linux, x64]
+    steps:
+      - name: Remove all images so builds re-pull fresh layers
+        # For image records whose layer snapshots were GC'd out from under
+        # them (ephemerd #146 disk-pressure GC): builds fail with
+        # `parent snapshot sha256:... does not exist` on base-image layers.
+        # Removing the image records forces a clean re-pull.
+        run: |
+          set -eux
+          docker images -aq | sort -u | xargs -r -n1 docker rmi -f || true
+          echo "image purge complete"
