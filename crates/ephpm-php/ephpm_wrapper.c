@@ -187,6 +187,33 @@ static EPHPM_TLS unsigned long req_generation = 0;
  * by our SAPI, so a single shared marker address suffices. */
 static int ephpm_server_context_marker = 0;
 
+#ifdef EPHPM_NATIVE_EXEC_TIMER
+/* Configured max_execution_time (seconds), set once from Rust after
+ * php_embed_init() via ephpm_set_max_execution_time(). This is the arm value
+ * both request paths use.
+ *
+ * Why not read it from the ini? The embed SAPI resets the max_execution_time
+ * ini entry to 0 (unlimited) at request runtime, so INI_INT("max_execution_time")
+ * and EG(timeout_seconds) are 0 by the time a request executes — relying on
+ * PHP's own ini->timer arming would leave the timer disarmed. Arming explicitly
+ * from this process-wide configured value is immune to that reset (and to a
+ * previous request's set_time_limit(0), which alters the ini entry at RUNTIME
+ * stage). set_time_limit() during a request still re-arms live on top of it. */
+static long g_configured_max_exec_secs = 0;
+#endif
+
+/* Record the configured max_execution_time. No-op on builds without per-thread
+ * execution timers. Called once from Rust after php_embed_init(), before the
+ * tokio runtime starts, so no locking is needed. */
+void ephpm_set_max_execution_time(long secs)
+{
+#ifdef EPHPM_NATIVE_EXEC_TIMER
+    g_configured_max_exec_secs = secs;
+#else
+    (void)secs;
+#endif
+}
+
 /* Worker mode — lazy Envelope backing store (Phase 1 fast path).
  *
  * `take_request` stashes borrowed pointers to the Rust-owned request data
@@ -626,9 +653,25 @@ void __wrap_zend_signal_handler_unblock(void)
 }
 
 /*
- * zend_set_timeout() directly calls sigaction(SIGPROF) + setitimer(ITIMER_PROF),
- * bypassing the zend_signal_* system. Must also be a no-op.
+ * Timeout arming.
+ *
+ * On an SDK built WITHOUT --enable-zend-max-execution-timers (macOS, older
+ * builds), zend_set_timeout() arms a process-wide setitimer(ITIMER_PROF) and
+ * installs a SIGPROF handler. That signal is delivered to whichever thread the
+ * kernel picks — including a tokio worker with no PHP state — and PHP's handler
+ * then dereferences per-request globals that don't exist there → SIGSEGV. So on
+ * those builds we --wrap both functions to no-ops (see crates/ephpm/build.rs)
+ * and enforce the request deadline at the HTTP layer instead.
+ *
+ * On an SDK built WITH per-thread execution timers (EPHPM_NATIVE_EXEC_TIMER,
+ * detected from php_config.h), zend_set_timeout() instead calls
+ * zend_max_execution_timer_settime() → timer_settime() on a per-thread POSIX
+ * timer whose SIGRTMIN is delivered only to the owning PHP thread. That is
+ * thread-safe, so we do NOT --wrap it — PHP arms/disarms its own timer per
+ * request (and set_time_limit() re-arms it live). These no-op stubs are then
+ * unreferenced and must not be compiled.
  */
+#ifndef EPHPM_NATIVE_EXEC_TIMER
 void __wrap_zend_set_timeout(long seconds, int reset_signals)
 {
     (void)seconds;
@@ -640,6 +683,7 @@ void __wrap_zend_unset_timeout(void)
 {
     /* no-op */
 }
+#endif /* !EPHPM_NATIVE_EXEC_TIMER */
 
 /*
  * zend_call_stack_init() probes the current thread's stack boundaries
@@ -798,6 +842,12 @@ void ephpm_request_set_ini(const char *key, const char *value)
 #define EPHPM_EXEC_STARTUP_FAIL (-1)
 #define EPHPM_EXEC_SCRIPT_EXIT  (-2)
 #define EPHPM_EXEC_BAILOUT      (-3)
+/* A max_execution_time timeout. Like BAILOUT it unwinds via zend_bailout and
+ * forces a 500, but UNLIKE a memory/resource bailout the captured response is a
+ * legitimate, complete-enough php-fpm-style error page (the "Maximum execution
+ * time exceeded" fatal, any output already produced, and shutdown-function /
+ * flushed-buffer output) — so it is delivered, not discarded. */
+#define EPHPM_EXEC_TIMEOUT      (-4)
 
 /*
  * Did a zend_bailout() happen since the last ephpm_bailout_reset()?
@@ -954,6 +1004,16 @@ int ephpm_execute_request(const char *filename)
     /* Same for the bailout flag — see ephpm_bailout_observed() above. */
     ephpm_bailout_reset();
 
+#ifdef EPHPM_NATIVE_EXEC_TIMER
+    /* Arm PHP's per-thread execution timer for THIS request. php_request_startup
+     * above already created the timer (init_executor) but armed it from
+     * EG(timeout_seconds), which the embed SAPI has reset to 0 (unlimited) — so
+     * we arm explicitly from the configured value here, right before executing
+     * the script. reset_signals = 1 also (re)installs the SIGRTMIN disposition.
+     * A value of 0 means "no limit" and disarms, matching PHP semantics. */
+    zend_set_timeout(g_configured_max_exec_secs, 1);
+#endif
+
     /* Execute the script with bailout protection.
      * PHP's zend_try/zend_catch uses setjmp/longjmp. */
     int result = EPHPM_EXEC_OK;
@@ -1047,8 +1107,22 @@ int ephpm_execute_request(const char *filename)
     int fatal_error_mask = E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR
                            | E_USER_ERROR | E_RECOVERABLE_ERROR | E_PARSE;
     if (ephpm_bailout_observed()) {
-        result = EPHPM_EXEC_BAILOUT;
         response_status_code = 500;
+        /* Distinguish a max_execution_time timeout from a memory/resource
+         * bailout. zend_timeout() raises E_ERROR with a message that always
+         * begins "Maximum execution time of" (Zend/zend_execute_API.c). A
+         * timeout's captured output is a legitimate error page and is
+         * delivered; every other bailout's is truncated garbage and discarded.
+         * EG(timed_out) is not reliable here (zend_timeout may clear it before
+         * the bailout is observed), so key off the recorded error message. */
+        if (PG(last_error_message)
+            && strncmp(ZSTR_VAL(PG(last_error_message)),
+                       "Maximum execution time of", 25)
+                   == 0) {
+            result = EPHPM_EXEC_TIMEOUT;
+        } else {
+            result = EPHPM_EXEC_BAILOUT;
+        }
     } else if ((PG(last_error_type) & fatal_error_mask)
                && response_status_code == 200) {
         response_status_code = 500;
@@ -1615,6 +1689,15 @@ PHP_FUNCTION(ephpm_worker_take_request)
      * the previous response's headers/status/output are already gone. */
     ephpm_worker_reset_request();
 
+#ifdef EPHPM_NATIVE_EXEC_TIMER
+    /* Disarm the per-thread execution timer while the worker is idle. The timer
+     * is wall-clock (CLOCK_BOOTTIME), so an armed timer would keep counting
+     * while we block waiting for the next request and could fire during the
+     * idle wait or the next request's early setup. It is re-armed below, once a
+     * request is actually in hand. */
+    zend_unset_timeout();
+#endif
+
     EphpmWorkerRequest req;
     memset(&req, 0, sizeof(req));
     int have = g_worker_ops.take_request(&req);
@@ -1628,6 +1711,17 @@ PHP_FUNCTION(ephpm_worker_take_request)
      * completes); new generation for bodyStream() isolation. */
     req_in_flight = 1;
     req_generation++;
+
+#ifdef EPHPM_NATIVE_EXEC_TIMER
+    /* Re-arm PHP's per-thread execution timer fresh for THIS request, resetting
+     * both the countdown and EG(timeout_seconds) to the configured value
+     * (reset_signals = 1). Using the process-wide configured baseline — not
+     * INI_INT / EG(timeout_seconds) — is what prevents a previous request's
+     * set_time_limit(0) (which set EG(timeout_seconds)=0 and altered the ini
+     * entry at RUNTIME stage) from leaking into this one. set_time_limit()
+     * during this request still re-arms live on top of this baseline. */
+    zend_set_timeout(g_configured_max_exec_secs, 1);
+#endif
 
     /* Point the SAPI request-info + POST buffers at this request so php://input
      * and any framework that reads them see the right body. These are the same
@@ -2242,6 +2336,13 @@ int ephpm_worker_run(const char *script)
          * BEFORE the first statement — a fatal compile error for any script
          * opening with a namespace/declare statement (composer proxies do). */
         CG(skip_shebang) = 1;
+
+#ifdef EPHPM_NATIVE_EXEC_TIMER
+        /* Disarm PHP's per-thread timer for the boot-once section: framework
+         * bootstrap is not a request and must not be time-limited. take_request()
+         * arms a fresh limit (g_configured_max_exec_secs) for each real request. */
+        zend_unset_timeout();
+#endif
 
         zend_file_handle file_handle;
         zend_stream_init_filename(&file_handle, script);

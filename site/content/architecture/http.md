@@ -94,9 +94,15 @@ HTTP headers are mapped to `HTTP_*` variables, except `Content-Type` -> `CONTENT
 
 PHP is compiled with ZTS (Zend Thread Safety). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown, not request execution. Windows builds use NTS with serialized execution via mutex.
 
-### Signal Handling
+### Signal Handling and `max_execution_time`
 
-PHP installs a `SIGPROF` handler for `max_execution_time`. This signal is process-wide and would crash tokio worker threads (NULL dereference in PHP's handler on non-PHP threads). On Linux we override PHP's signal functions with no-ops via GNU ld's `--wrap` linker flags. macOS's ld64 and MSVC's link.exe don't support `--wrap` (see `crates/ephpm/build.rs`), so the wrapping is not applied there. On all platforms, request timeout enforcement is done at the HTTP layer, not by PHP's signal-based timer.
+ePHPm enforces `max_execution_time` with a **two-layer** model:
+
+1. **PHP-level (inner, catchable).** On Linux ZTS builds whose `libphp` was compiled with per-thread execution timers (`--enable-zend-max-execution-timers`, the default for the shipped Linux SDK), PHP arms its own **per-thread POSIX timer** — `timer_create` with `SIGEV_THREAD_ID` and `SIGRTMIN`, on a `CLOCK_BOOTTIME` (wall-clock) clock. The timeout signal is delivered *only* to the specific PHP thread that armed it, which makes it safe under tokio's `spawn_blocking` pool. ePHPm arms this timer per request from `[php] max_execution_time`; exceeding it raises the catchable "Maximum execution time exceeded" fatal, runs registered shutdown functions, flushes buffered output, and returns HTTP 500 — the request thread is *not* killed. `set_time_limit()` re-arms it at runtime. Because the clock is wall-clock, time spent in `sleep()` counts.
+
+2. **HTTP-level (outer, hard backstop).** `tokio::time::timeout` (from `[server.timeouts] request`) wraps the `spawn_blocking` PHP execution and returns HTTP 504 if the request never completes — the ceiling for a script wedged in a C extension or syscall that never returns to the VM to observe the inner timer.
+
+The legacy process-wide `SIGPROF`/`setitimer` timer (used by PHP builds *without* per-thread timers) is unsafe for a multi-threaded embedder — `SIGPROF` is delivered to an arbitrary thread whose PHP handler dereferences per-request globals that only exist on the PHP thread. On builds without per-thread timers (macOS, Windows NTS, or an SDK built without the flag), ePHPm neuters `zend_set_timeout` via GNU ld's `--wrap` (Linux) and leaves the outer HTTP request timeout as the only ceiling. macOS's ld64 and MSVC's link.exe don't support `--wrap`, so `max_execution_time` is simply not armed there.
 
 ### Bailout Protection
 
@@ -388,7 +394,7 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.tls.email` | string | — | Contact email for ACME registration |
 | `server.tls.cache_dir` | path | `"certs"` | ACME certificate cache directory |
 | `server.tls.staging` | bool | `false` | Use Let's Encrypt staging environment |
-| `php.max_execution_time` | int | `30` | **Parsed, not enforced.** Nothing reads it and it is never written into the generated `php.ini`; setting it logs a startup warning. The enforced per-request deadline is `server.timeouts.request` (default `300`), applied at the HTTP layer — see [Signal Handling](#signal-handling) for why. |
+| `php.max_execution_time` | int | `30` | PHP per-request timeout (seconds). Natively enforced (per-thread timer) on Linux ZTS builds — catchable fatal + 500, `set_time_limit()`-able, wall-clock; bounded by `server.timeouts.request`. See [Signal Handling and `max_execution_time`](#signal-handling-and-max_execution_time). |
 | `php.memory_limit` | string | `"128M"` | PHP memory limit |
 | `php.ini_overrides` | [string, string][] | `[]` | INI directive overrides |
 | `server.metrics.enabled` | bool | `false` | Prometheus metrics endpoint |

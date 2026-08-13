@@ -1553,22 +1553,31 @@ impl Default for KvRedisCompatConfig {
 /// PHP runtime configuration.
 #[derive(Debug, Deserialize)]
 pub struct PhpConfig {
-    /// Planned: not yet implemented — parsed but not acted upon.
+    /// Maximum PHP script execution time, in seconds (`0` = unlimited).
     ///
-    /// Nothing reads this field. It is **not** written into the generated
-    /// php.ini either: that file carries only `extension=` lines, the
-    /// `ini_file` body, the autotuned opcache/engine lines, `ini_overrides`,
-    /// and `disable_functions`.
+    /// Natively enforced on Linux ZTS builds whose libphp was compiled with
+    /// per-thread execution timers (`--enable-zend-max-execution-timers`, the
+    /// default for the shipped Linux SDK). ePHPm writes this value into the
+    /// generated php.ini and PHP arms its own **per-thread POSIX timer**
+    /// (`timer_create` + `SIGRTMIN`, delivered only to the owning PHP thread —
+    /// safe under tokio's `spawn_blocking` pool). The limit is **wall-clock**
+    /// (CLOCK_BOOTTIME, so `sleep()` counts), **catchable**, and overridable at
+    /// runtime with `set_time_limit()`. Exceeding it raises the standard PHP
+    /// fatal ("Maximum execution time exceeded"), runs registered shutdown
+    /// functions, and flushes buffered output — an ordinary HTTP 500, not a
+    /// hard worker kill.
     ///
-    /// Emitting it would not help. PHP enforces `max_execution_time` with a
-    /// `SIGPROF` timer whose handler ePHPm deliberately neutralizes on Linux
-    /// (`crates/ephpm/build.rs` `--wrap`s `zend_signal_*` to no-ops, because
-    /// the signal lands on whichever thread is running and dereferences NULL
-    /// on a tokio worker). So the directive would be advisory at best.
+    /// `[server.timeouts] request` remains the OUTER hard ceiling, enforced at
+    /// the HTTP layer: it still fires (504) for a request wedged in a C
+    /// extension or syscall that never returns to the VM to observe the timer.
+    /// Keep `max_execution_time` below the request timeout, or the outer
+    /// deadline preempts it (startup warns when it does not).
     ///
-    /// The per-request deadline that *is* enforced is
-    /// `[server.timeouts] request` (default `300` seconds), applied at the
-    /// HTTP layer. Setting this knob logs a warning at startup.
+    /// On builds without per-thread timers (macOS, Windows NTS, or an SDK built
+    /// without the flag) PHP's only native mechanism is the process-wide
+    /// setitimer/SIGPROF timer, which is unsafe on tokio worker threads and
+    /// stays disabled — there this value is not natively enforced and the
+    /// request-layer deadline is the only ceiling (startup warns).
     ///
     /// Default: `30`.
     #[serde(default = "default_max_execution_time")]

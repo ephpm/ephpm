@@ -556,6 +556,61 @@ fn warn_if_runtime_extension_flag(args: &[String]) {
     }
 }
 
+/// Startup diagnostics for `[php] max_execution_time`.
+///
+/// Two-layer timeout model:
+///   * `max_execution_time` — the PHP-level limit. On a Linux ZTS build whose
+///     libphp has per-thread execution timers (`php_max_exec_timers`), it is
+///     written into the generated php.ini and PHP arms its own per-thread POSIX
+///     timer. It is wall-clock (CLOCK_BOOTTIME), catchable, and overridable at
+///     runtime via `set_time_limit()`. Exceeding it raises a PHP fatal
+///     ("Maximum execution time exceeded"), runs shutdown functions, and flushes
+///     buffered output — a normal 500, not a hard kill.
+///   * `[server.timeouts] request` — the OUTER hard ceiling enforced at the HTTP
+///     layer. It still fires (504) for a request wedged in a C extension or
+///     syscall that never returns to the VM to observe the timer.
+///
+/// The inner limit can only fire if it is strictly below the outer one, so warn
+/// when `max_execution_time >= request` (excluding `0`, which means "no PHP
+/// limit" — the request backstop is then the only ceiling, by design).
+#[cfg(php_max_exec_timers)]
+fn warn_max_execution_time(config: &ephpm_config::Config) {
+    let inner = config.php.max_execution_time;
+    let outer = config.server.timeouts.request;
+    if inner != 0 && u64::from(inner) >= outer {
+        tracing::warn!(
+            max_execution_time = inner,
+            request_timeout = outer,
+            "[php] max_execution_time ({inner}s) is >= [server.timeouts] request \
+             ({outer}s); the outer hard request deadline will always preempt PHP's \
+             own timeout, so the catchable \"Maximum execution time exceeded\" fatal \
+             can never fire. Lower max_execution_time below the request timeout to \
+             let PHP handle it gracefully."
+        );
+    }
+}
+
+/// Fallback diagnostics when the linked libphp has no per-thread execution
+/// timers (macOS, Windows NTS, or an SDK built without
+/// `--enable-zend-max-execution-timers`). PHP's only native mechanism there is
+/// the process-wide setitimer/SIGPROF timer, which is unsafe on tokio worker
+/// threads and is deliberately neutered — so `max_execution_time` is not
+/// natively enforced and the request-layer deadline is the only ceiling.
+#[cfg(not(php_max_exec_timers))]
+fn warn_max_execution_time(config: &ephpm_config::Config) {
+    let php_defaults = ephpm_config::PhpConfig::default();
+    if config.php.max_execution_time != php_defaults.max_execution_time {
+        tracing::warn!(
+            max_execution_time = config.php.max_execution_time,
+            request_timeout = config.server.timeouts.request,
+            "[php] max_execution_time is not natively enforced on this build \
+             (the linked PHP has no per-thread execution timers; its process-wide \
+             SIGPROF timer is unsafe under tokio and stays disabled). The \
+             per-request deadline actually in force is [server.timeouts] request."
+        );
+    }
+}
+
 /// Warn once at startup for every config knob that is parsed but not acted
 /// upon, so a silently-ignored setting can never look like it took effect.
 ///
@@ -564,18 +619,7 @@ fn warn_if_runtime_extension_flag(args: &[String]) {
 /// one of these knobs gains a real implementation, delete its branch here and
 /// the matching "Planned: not yet implemented" doc comment in `ephpm-config`.
 fn warn_unimplemented_knobs(config: &ephpm_config::Config) {
-    let php_defaults = ephpm_config::PhpConfig::default();
-    if config.php.max_execution_time != php_defaults.max_execution_time {
-        tracing::warn!(
-            max_execution_time = config.php.max_execution_time,
-            request_timeout = config.server.timeouts.request,
-            "[php] max_execution_time is not enforced — the value is not \
-             written into the generated php.ini, and PHP's own SIGPROF-based \
-             timer is deliberately disabled because that handler crashes when \
-             the signal lands on a tokio worker thread. The per-request \
-             deadline actually in force is [server.timeouts] request."
-        );
-    }
+    warn_max_execution_time(config);
 
     let rw_defaults = ephpm_config::ReadWriteSplitConfig::default();
     if config.db.read_write_split.strategy != rw_defaults.strategy {
@@ -801,11 +845,16 @@ fn run_with_config(
     let validate_timestamps = autotune.validate_timestamps.value;
     // [php] extensions also forces ini generation: `extension=` lines only
     // take effect when PHP parses them during MINIT, same as the overrides.
+    // When PHP has per-thread execution timers, we always emit an ini so the
+    // configured max_execution_time is authoritative (PHP arms its own timer
+    // from it). cfg!() is a compile-time constant here — false in stub mode and
+    // on builds without native timers, so this adds no ini on those targets.
     let want_generated_ini = !opcache_ini_lines.is_empty()
         || !config.php.ini_overrides.is_empty()
         || !config.php.extensions.is_empty()
         || vhost_disable_shell
-        || worker_mode;
+        || worker_mode
+        || cfg!(php_max_exec_timers);
 
     let (effective_ini_path, _generated_ini_guard): (Option<PathBuf>, Option<tempfile::TempDir>) =
         if want_generated_ini {
@@ -841,6 +890,15 @@ fn run_with_config(
             // force a different value through ini_overrides if they insist.
             for (k, v) in &opcache_ini_lines {
                 let _ = writeln!(content, "{k}={v}");
+            }
+            // Native max_execution_time (per-thread execution timers only).
+            // Written before ini_overrides and before any per-site ini_overrides
+            // are replayed at request time, so an explicit override still wins.
+            // PHP arms/disarms its own per-thread POSIX timer from this value on
+            // each php_request_startup/shutdown; set_time_limit() re-arms it live.
+            #[cfg(php_max_exec_timers)]
+            {
+                let _ = writeln!(content, "max_execution_time={}", config.php.max_execution_time);
             }
             for [k, v] in &config.php.ini_overrides {
                 let _ = writeln!(content, "{k}={v}");
@@ -942,6 +1000,11 @@ fn run_with_config(
         .context("failed to initialize PHP runtime")?;
     ephpm_php::PhpRuntime::finalize_for_http()
         .context("failed to finalize PHP runtime for HTTP")?;
+    // Arm value for PHP's per-thread execution timer. The request paths call
+    // zend_set_timeout() with this each request because the embed SAPI zeroes
+    // the max_execution_time ini entry at runtime. No-op on builds without
+    // per-thread timers and in stub mode.
+    ephpm_php::PhpRuntime::set_max_execution_time(config.php.max_execution_time);
 
     // Now safe to create the multi-threaded tokio runtime.
     //

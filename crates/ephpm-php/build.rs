@@ -5,6 +5,12 @@ use std::process::Command;
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rustc-check-cfg=cfg(php_linked)");
+    // Set when the linked libphp was built with --enable-zend-max-execution-timers
+    // (per-thread POSIX timers). This is the ZTS-safe timeout mechanism ePHPm
+    // relies on to enforce `max_execution_time` natively; when absent (macOS,
+    // older SDKs) PHP falls back to the process-wide setitimer/SIGPROF timer,
+    // which is unsafe on tokio worker threads, so the feature stays disabled.
+    println!("cargo::rustc-check-cfg=cfg(php_max_exec_timers)");
     println!("cargo::rerun-if-changed=wrapper.h");
     println!("cargo::rerun-if-changed=ephpm_wrapper.c");
     println!("cargo::rerun-if-changed=resolver_shim.c");
@@ -30,8 +36,20 @@ fn main() {
 
     println!("cargo::rustc-cfg=php_linked");
 
+    // Detect the per-thread execution-timer mechanism in the linked SDK. On a
+    // ZTS Linux libphp built with `--enable-zend-max-execution-timers`, PHP's
+    // php_config.h carries `#define ZEND_MAX_EXECUTION_TIMERS 1`. That build
+    // arms a per-thread POSIX timer (timer_create/SIGEV_THREAD_ID + SIGRTMIN,
+    // CLOCK_BOOTTIME) instead of the process-wide setitimer/SIGPROF timer, so
+    // the timeout signal lands on the exact PHP thread and is safe under
+    // tokio's spawn_blocking pool.
+    let has_exec_timers = php_config_has_max_exec_timers(&include_dir);
+    if has_exec_timers {
+        println!("cargo::rustc-cfg=php_max_exec_timers");
+    }
+
     link_php(&lib_dir, &target_os);
-    compile_wrapper(&include_dir, &target_os);
+    compile_wrapper(&include_dir, &target_os, has_exec_timers);
     generate_bindings(&include_dir, &target_os);
 
     // Note: --wrap flags for zend_signal_* are in the binary crate's
@@ -294,8 +312,35 @@ fn link_system_libs(target_os: &str) {
     }
 }
 
+/// Return `true` when the SDK's `php_config.h` declares
+/// `ZEND_MAX_EXECUTION_TIMERS` — i.e. libphp was built with per-thread POSIX
+/// execution timers (`--enable-zend-max-execution-timers`).
+///
+/// This is the single source of truth for whether ePHPm can enforce
+/// `max_execution_time` natively. The binary crate's `build.rs` runs the same
+/// probe to decide whether to `--wrap` (neuter) `zend_set_timeout`.
+fn php_config_has_max_exec_timers(include_dir: &Path) -> bool {
+    let cfg = include_dir.join("main").join("php_config.h");
+    println!("cargo::rerun-if-changed={}", cfg.display());
+    let Ok(text) = std::fs::read_to_string(&cfg) else {
+        println!(
+            "cargo::warning=could not read {} to detect ZEND_MAX_EXECUTION_TIMERS; \
+             native max_execution_time enforcement disabled",
+            cfg.display()
+        );
+        return false;
+    };
+    // Match a real `#define ZEND_MAX_EXECUTION_TIMERS 1` line (not a 0/comment).
+    text.lines().any(|line| {
+        let l = line.trim_start();
+        l.starts_with("#define")
+            && l.contains("ZEND_MAX_EXECUTION_TIMERS")
+            && l.split_whitespace().last() == Some("1")
+    })
+}
+
 /// Compile the C wrapper that provides `zend_try`/`zend_catch` guards.
-fn compile_wrapper(include_dir: &Path, target_os: &str) {
+fn compile_wrapper(include_dir: &Path, target_os: &str, has_exec_timers: bool) {
     let include_main = include_dir.join("main");
     let include_zend = include_dir.join("Zend");
     let include_tsrm = include_dir.join("TSRM");
@@ -350,6 +395,16 @@ fn compile_wrapper(include_dir: &Path, target_os: &str) {
     } else {
         build.define("ZTS", Some("1"));
         build.define("ZEND_ENABLE_STATIC_TSRMLS_CACHE", Some("1"));
+    }
+
+    // When the SDK has per-thread execution timers, ePHPm lets PHP arm its own
+    // timeout (see the binary crate's build.rs, which then does NOT --wrap
+    // zend_set_timeout). In that mode the __wrap_zend_set_timeout /
+    // __wrap_zend_unset_timeout no-op stubs must NOT be compiled — nothing
+    // references them, and defining them would be dead code. This define gates
+    // them out to match.
+    if has_exec_timers {
+        build.define("EPHPM_NATIVE_EXEC_TIMER", None);
     }
 
     build.compile("ephpm_wrapper");

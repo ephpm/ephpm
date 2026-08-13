@@ -127,8 +127,10 @@ int ephpm_execute_script(const char *filename) {
 
 ### Execution time
 
-- PHP's signal-based `max_execution_time` timer is **deliberately neutralized** — its process-wide `SIGPROF` handler would crash tokio worker threads, so the zend signal functions are no-op'd (`--wrap` on Linux)
-- Enforcement happens at the HTTP layer: `tokio::time::timeout` (from `server.timeouts.request`) wraps the `spawn_blocking` PHP execution and surfaces a timeout as HTTP 504
+Two layers bound how long a request can run:
+
+- **`max_execution_time` (PHP-level, catchable).** On Linux ZTS builds with per-thread execution timers (`--enable-zend-max-execution-timers`, the shipped default), PHP arms a **per-thread POSIX timer** (`timer_create` + `SIGRTMIN` via `SIGEV_THREAD_ID`, on a wall-clock `CLOCK_BOOTTIME`) delivered only to the owning PHP thread — safe under tokio's `spawn_blocking` pool. Exceeding it raises the catchable "Maximum execution time exceeded" fatal (500, shutdown functions run, output flushed), and `set_time_limit()` re-arms it at runtime. On builds without per-thread timers (macOS, Windows NTS), PHP's only native mechanism is the process-wide `SIGPROF`/`setitimer` timer, which *would* crash tokio worker threads — so it is neutralized (`--wrap` on Linux) and `max_execution_time` is not enforced there.
+- **`[server.timeouts] request` (HTTP-level, hard backstop).** `tokio::time::timeout` wraps the `spawn_blocking` PHP execution and surfaces a timeout as HTTP 504 — the ceiling for a script wedged where the inner timer cannot interrupt it (a C extension or syscall that never returns to the VM). Keep `max_execution_time` below this value so the inner, graceful limit fires first.
 
 ### Process state
 
