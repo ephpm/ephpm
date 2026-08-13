@@ -34,7 +34,13 @@ pub enum EvictionPolicy {
 }
 
 impl EvictionPolicy {
-    /// Parse from the config string. Falls back to `AllKeysLru` on unknown values.
+    /// Parse from the config string. Falls back to `AllKeysLru` on unknown
+    /// values — it has no error channel, so it cannot reject a typo.
+    ///
+    /// On the `[kv] eviction_policy` path an unknown value never reaches
+    /// here: `Config::validate` in `ephpm-config` rejects anything outside
+    /// its `KV_EVICTION_POLICIES` list at startup. Keep that list in sync
+    /// with the arms below.
     #[must_use]
     pub fn from_str_lossy(s: &str) -> Self {
         match s {

@@ -83,6 +83,18 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 
 **Note:** an explicitly set value always wins. When unset, these two resolve to `true` if either the `[server.security]` section is present (matching earlier releases) or `server.sites_dir` is set — so multi-tenant deployments get filesystem isolation and shell-exec hardening by default, even without a `[server.security]` section. To opt out in multi-tenant mode you must set them to `false` explicitly (ephpm logs a warning at startup when you do).
 
+**Both flags do nothing in single-site mode** (`server.sites_dir` unset). They are implemented only on the vhost request path: `open_basedir` is set per-request from the resolved site's directory, and the `disable_functions` line is only written into the generated php.ini when `sites_dir` is set. Because a single-site `document_root` is the *web root* rather than a site container directory, confining PHP to it would break any application that keeps its code above the web root — so the multi-tenant mechanism is not reused here. ephpm logs a warning at startup for each flag that resolves to `true` while inert, rather than silently doing nothing.
+
+To sandbox a single-site deployment, set PHP's own directives through `[php] ini_overrides` — those lines go into the generated php.ini and are applied at MINIT:
+
+```toml
+[php]
+ini_overrides = [
+  ["open_basedir", "/app:/tmp"],
+  ["disable_functions", "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec"],
+]
+```
+
 ### `[server.logging]`
 
 | Key | Type | Default | Description |
@@ -388,7 +400,7 @@ Notable gaps, all deliberate:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `memory_limit` | string | `"256MB"` | Max memory for **stored key/value payloads**. Per-connection RESP protocol buffers are NOT counted here — bound those with `[kv.redis_compat]` `max_connections` / `max_input_buffer`. |
-| `eviction_policy` | string | `"allkeys-lru"` | `noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-random`. |
+| `eviction_policy` | string | `"allkeys-lru"` | `noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-random`. Case-sensitive; any other value is rejected at startup with an error listing the four valid options. |
 | `compression` | string | `"none"` | `none`, `gzip`, `brotli`, `zstd`. |
 | `compression_level` | u32 | `6` | 1=fastest, 9=best. |
 | `compression_min_size` | usize (bytes) | `1024` | Values below this are stored uncompressed. |

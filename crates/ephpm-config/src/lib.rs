@@ -454,28 +454,55 @@ pub struct SecurityConfig {
 
     /// Restrict PHP filesystem access to each site's document root.
     ///
-    /// When `true` and `sites_dir` is configured, PHP's `open_basedir` is
-    /// set per-request to the site's directory + `/tmp`. PHP cannot read
-    /// or write files outside that directory.
+    /// **Multi-tenant only.** The restriction is applied on the vhost
+    /// request path in `ephpm-server`, which runs only when `sites_dir` is
+    /// set: PHP's `open_basedir` is set per-request to the site's directory
+    /// plus the system temp dir, so a site cannot read or write outside it.
+    ///
+    /// **In single-site mode (`sites_dir` unset) this flag does nothing** —
+    /// no `open_basedir` is applied, whatever it resolves to. The
+    /// multi-tenant value is the *site container* directory
+    /// (`sites_dir/<host>`), which holds the whole application; a
+    /// single-site `document_root` is the *web root*, and confining PHP to
+    /// it would break every framework that keeps its code above the web
+    /// root (Laravel/Symfony `require __DIR__.'/../vendor/autoload.php'`).
+    /// So the mechanism is not transferable as-is, and enabling this knob
+    /// in single-site mode logs a warning at startup instead of silently
+    /// doing nothing. To sandbox a single-site deployment today, set PHP's
+    /// own directive through `[php] ini_overrides` (it is written into the
+    /// generated php.ini and read at MINIT):
+    /// `ini_overrides = [["open_basedir", "/app:/tmp"]]`.
     ///
     /// An explicitly set value always wins. When unset, resolves to `true`
     /// if the `[server.security]` section is present OR `server.sites_dir`
     /// is set (multi-tenant mode); otherwise `false`. Use
-    /// [`ServerConfig::effective_open_basedir`] to read the resolved value.
+    /// [`ServerConfig::effective_open_basedir`] to read the resolved value
+    /// and [`ServerConfig::inert_security_flags`] to detect the
+    /// enabled-but-inert case.
     #[serde(default)]
     pub open_basedir: Option<bool>,
 
     /// Disable dangerous PHP functions in multi-tenant mode.
     ///
-    /// When `true`, `exec`, `shell_exec`, `system`, `passthru`,
-    /// `proc_open`, `popen`, and `pcntl_exec` are disabled via
-    /// `disable_functions`. Prevents shell escape from `open_basedir`.
+    /// **Multi-tenant only.** When `true` *and* `sites_dir` is set,
+    /// `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`,
+    /// and `pcntl_exec` are disabled via a `disable_functions` line in the
+    /// php.ini ePHPm generates at startup. Prevents shell escape from
+    /// `open_basedir`.
+    ///
+    /// **In single-site mode (`sites_dir` unset) this flag does nothing** —
+    /// the `disable_functions` line is not emitted and the functions stay
+    /// callable. Enabling it there logs a warning at startup. The
+    /// equivalent single-site setting is
+    /// `[php] ini_overrides = [["disable_functions", "exec,shell_exec,…"]]`,
+    /// which lands in the same generated php.ini and takes effect at MINIT.
     ///
     /// An explicitly set value always wins. When unset, resolves to `true`
     /// if the `[server.security]` section is present OR `server.sites_dir`
     /// is set (multi-tenant mode); otherwise `false`. Use
     /// [`ServerConfig::effective_disable_shell_exec`] to read the resolved
-    /// value.
+    /// value and [`ServerConfig::inert_security_flags`] to detect the
+    /// enabled-but-inert case.
     #[serde(default)]
     pub disable_shell_exec: Option<bool>,
 }
@@ -488,6 +515,10 @@ impl ServerConfig {
     /// historical present-section default) OR `sites_dir` is set (so a
     /// multi-tenant deployment never silently runs without filesystem
     /// isolation); otherwise `false`.
+    ///
+    /// Resolving to `true` does **not** mean the restriction is applied:
+    /// only the multi-tenant path acts on it. See
+    /// [`Self::inert_security_flags`].
     #[must_use]
     pub fn effective_open_basedir(&self) -> bool {
         self.resolve_security_flag(|s| s.open_basedir)
@@ -497,10 +528,36 @@ impl ServerConfig {
     ///
     /// Same resolution rules as [`Self::effective_open_basedir`]: explicit
     /// value wins; unset resolves to `true` when the `[server.security]`
-    /// section is present or `sites_dir` is set, `false` otherwise.
+    /// section is present or `sites_dir` is set, `false` otherwise. Same
+    /// caveat too — a `true` here is only acted upon in multi-tenant mode.
     #[must_use]
     pub fn effective_disable_shell_exec(&self) -> bool {
         self.resolve_security_flag(|s| s.disable_shell_exec)
+    }
+
+    /// The `[server.security]` isolation flags that resolve to `true` but
+    /// have no effect, because both are implemented only on the
+    /// multi-tenant path and `sites_dir` is unset.
+    ///
+    /// Returns the config key names, in declaration order. Empty in
+    /// multi-tenant mode, and empty in single-site mode when neither flag
+    /// resolves to `true` — so a config that never mentions
+    /// `[server.security]` stays quiet. `ephpm` warns once at startup for
+    /// each name returned here (the no-silent-knob rule): an operator who
+    /// asked for sandboxing must never be left believing they got it.
+    #[must_use]
+    pub fn inert_security_flags(&self) -> Vec<&'static str> {
+        if self.sites_dir.is_some() {
+            return Vec::new();
+        }
+        let mut inert = Vec::new();
+        if self.effective_open_basedir() {
+            inert.push("open_basedir");
+        }
+        if self.effective_disable_shell_exec() {
+            inert.push("disable_shell_exec");
+        }
+        inert
     }
 
     /// Shared resolution for the two isolation flags.
@@ -1365,6 +1422,8 @@ pub struct KvConfig {
     /// Eviction policy when the memory limit is reached.
     ///
     /// Values: `"noeviction"`, `"allkeys-lru"`, `"volatile-lru"`, `"allkeys-random"`.
+    /// Anything else is rejected by [`Config::validate`] at startup — an
+    /// unrecognised value used to fall back to `"allkeys-lru"` silently.
     ///
     /// Default: `"allkeys-lru"`.
     #[serde(default = "default_kv_eviction_policy")]
@@ -1393,8 +1452,10 @@ pub struct KvConfig {
 
     /// Master secret for per-site RESP authentication. When set, per-site
     /// passwords are derived as `HMAC-SHA256(secret, hostname)`. ePHPm injects
-    /// the derived password into PHP `$_ENV` as `EPHPM_REDIS_PASSWORD` for
-    /// each request.
+    /// the derived password into PHP's `$_SERVER` superglobal as
+    /// `EPHPM_REDIS_PASSWORD` for each request. (It is a `$_SERVER` variable,
+    /// registered through the SAPI's `register_server_variables` hook — not a
+    /// process environment variable, so `$_ENV` and `getenv()` do not see it.)
     ///
     /// This secret is **required** to run the RESP listener in multi-tenant
     /// (`sites_dir`) mode: with `[kv.redis_compat] enabled = true` and
@@ -1443,12 +1504,22 @@ impl KvConfig {
 
 /// RESP protocol listener configuration (`[kv.redis_compat]`).
 ///
-/// **Security note for virtual hosting:** The RESP endpoint provides raw
-/// access to the entire KV store — there is no per-tenant namespace
-/// filtering. In multi-tenant (`sites_dir`) deployments, disable RESP
-/// or restrict access to admin use only. PHP applications should use the
-/// `ephpm_kv_*` SAPI functions instead, which are automatically namespaced
-/// per virtual host.
+/// **Security note for virtual hosting:** whether the RESP endpoint is
+/// per-tenant scoped depends entirely on `[kv] secret`.
+///
+/// - **`secret` set, in multi-tenant mode** (`[server] sites_dir` set, which
+///   is what wires the `MultiTenantStore`): a client must send
+///   `AUTH <hostname> <HMAC-SHA256(secret, hostname)>`, and the connection is
+///   then bound to that hostname's own `Store` for its lifetime. That is real
+///   per-tenant isolation — separate stores, not a key-prefix convention — and
+///   it is the same store the site's `ephpm_kv_*` SAPI calls use.
+/// - **`secret` unset:** there is no per-tenant scoping. Every connection
+///   dispatches against the process-wide default store, so any client that can
+///   reach the listener sees every key, including other tenants'. The optional
+///   `password` below gates access but does not scope it. In multi-tenant
+///   deployments, either set `[kv] secret` or leave `enabled = false` and let
+///   PHP use the `ephpm_kv_*` SAPI functions, which are namespaced per vhost
+///   regardless of this listener.
 #[derive(Debug, Deserialize)]
 pub struct KvRedisCompatConfig {
     /// Enable the RESP protocol listener. When `false`, the KV store is
@@ -2042,6 +2113,20 @@ impl Config {
                  deployments (no [server] sites_dir) are unaffected."
                     .to_string(),
             ));
+        }
+
+        // [kv] eviction_policy: `EvictionPolicy::from_str_lossy` maps every
+        // unrecognised string to `allkeys-lru`, so a typo like
+        // "allkey-lru" would silently turn `noeviction` into eviction —
+        // data loss under memory pressure that the operator explicitly
+        // asked not to happen. Reject it here, the same way `[php] mode`
+        // rejects a typo'd mode (the no-silent-knob rule).
+        if !KV_EVICTION_POLICIES.contains(&self.kv.eviction_policy.as_str()) {
+            return Err(ConfigError::Validation(format!(
+                "[kv] eviction_policy must be one of {}, got \"{}\"",
+                KV_EVICTION_POLICIES.join(", "),
+                self.kv.eviction_policy,
+            )));
         }
 
         Ok(())
@@ -3429,6 +3514,15 @@ fn default_kv_memory_limit() -> String {
     "256MB".to_string()
 }
 
+/// Every accepted `[kv] eviction_policy` value.
+///
+/// Must stay in sync with `ephpm_kv::store::EvictionPolicy::from_str_lossy`,
+/// which is the parser the server actually calls. That parser is lossy by
+/// design (it has no error channel), so [`Config::validate`] is what turns a
+/// typo into a startup failure instead of a silent switch to `allkeys-lru`.
+const KV_EVICTION_POLICIES: [&str; 4] =
+    ["noeviction", "allkeys-lru", "volatile-lru", "allkeys-random"];
+
 fn default_kv_eviction_policy() -> String {
     "allkeys-lru".to_string()
 }
@@ -4504,6 +4598,171 @@ sites_dir = "/var/www/sites"
         // The env var materializes the section, so the unset sibling
         // still resolves true (and sites_dir is set anyway).
         assert!(config.server.effective_disable_shell_exec());
+    }
+
+    // ── Enabled-but-inert isolation flags (single-site mode) ───────────
+    //
+    // Both flags are implemented only on the multi-tenant path. Resolving
+    // to `true` without `sites_dir` therefore buys nothing, and `ephpm`
+    // warns at startup for every name `inert_security_flags` returns.
+
+    #[test]
+    fn test_inert_security_flags_quiet_when_nothing_enabled() {
+        let config = Config::default_config().unwrap();
+        assert!(
+            config.server.inert_security_flags().is_empty(),
+            "a config that never mentions [server.security] must not warn"
+        );
+    }
+
+    #[test]
+    fn test_inert_security_flags_empty_in_multi_tenant_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server]
+sites_dir = "/var/www/sites"
+
+[server.security]
+open_basedir = true
+disable_shell_exec = true
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(
+            config.server.inert_security_flags().is_empty(),
+            "with sites_dir set, both flags are actually applied"
+        );
+    }
+
+    #[test]
+    fn test_inert_security_flags_lists_both_in_single_site_mode() {
+        // The audit case: a single-site operator adds [server.security]
+        // for trusted_proxies, both isolation flags silently resolve to
+        // `true`, and nothing sandboxes anything.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server.security]
+trusted_proxies = ["10.0.0.0/8"]
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.sites_dir.is_none());
+        assert_eq!(
+            config.server.inert_security_flags(),
+            vec!["open_basedir", "disable_shell_exec"],
+        );
+    }
+
+    #[test]
+    fn test_inert_security_flags_reports_only_the_enabled_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r"
+[server.security]
+open_basedir = true
+disable_shell_exec = false
+",
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.inert_security_flags(), vec!["open_basedir"]);
+    }
+
+    #[test]
+    fn test_inert_security_flags_quiet_when_explicitly_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r"
+[server.security]
+open_basedir = false
+disable_shell_exec = false
+",
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(
+            config.server.inert_security_flags().is_empty(),
+            "nothing was asked for, so there is nothing to warn about"
+        );
+    }
+
+    // ── [kv] eviction_policy validation ────────────────────────────────
+    //
+    // `EvictionPolicy::from_str_lossy` folds every unknown string into
+    // `allkeys-lru`, so validation is the only thing standing between a
+    // typo and a silent change of eviction behaviour.
+
+    #[test]
+    fn test_kv_eviction_policy_accepts_every_documented_value() {
+        for policy in KV_EVICTION_POLICIES {
+            let mut cfg = Config::default_config().unwrap();
+            cfg.kv.eviction_policy = policy.to_string();
+            cfg.validate().unwrap_or_else(|e| panic!("{policy} must validate, got: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_kv_eviction_policy_default_validates() {
+        let cfg = Config::default_config().unwrap();
+        assert_eq!(cfg.kv.eviction_policy, "allkeys-lru");
+        cfg.validate().expect("the default must validate");
+    }
+
+    #[test]
+    fn test_kv_eviction_policy_typo_is_rejected() {
+        let mut cfg = Config::default_config().unwrap();
+        cfg.kv.eviction_policy = "allkey-lru".to_string();
+        let err = cfg.validate().expect_err("a typo must not silently mean allkeys-lru");
+        assert!(matches!(err, ConfigError::Validation(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("allkey-lru"), "the error must name the bad value: {msg}");
+        for policy in KV_EVICTION_POLICIES {
+            assert!(msg.contains(policy), "the error must list {policy}: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_kv_eviction_policy_is_case_sensitive() {
+        // `from_str_lossy` matches the exact lowercase spellings, so
+        // "AllKeys-LRU" would have fallen through to the default.
+        let mut cfg = Config::default_config().unwrap();
+        cfg.kv.eviction_policy = "AllKeys-LRU".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_kv_eviction_policy_rejected_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[kv]
+eviction_policy = "lru"
+"#,
+        )
+        .unwrap();
+
+        // Parsing still succeeds — the field is a plain String; it is
+        // `validate()` (called by `ephpm` before startup) that rejects it.
+        let config = Config::load(&file).unwrap();
+        assert!(config.validate().is_err());
     }
 
     // ── OPcache timestamp validation ────────────────────────────────────

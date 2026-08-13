@@ -193,7 +193,7 @@ enum Commands {
         password: Option<String>,
     },
 
-    /// Cache management subcommands (OPcache introspection and local reset).
+    /// Cache management subcommands (currently: OPcache reset).
     Cache {
         /// RESP server host (default: 127.0.0.1)
         #[arg(long, default_value = "127.0.0.1")]
@@ -225,9 +225,16 @@ enum Commands {
 
 #[derive(Subcommand, Debug)]
 enum CacheSubcommand {
-    /// Local-only OPcache reset (bypasses KV — does not propagate to peers).
-    /// Behaves identically to `deploy` on a single-node server; use `deploy`
-    /// on a cluster to broadcast the reset.
+    /// Invalidate the OPcache for one vhost, or every vhost via `--all`.
+    ///
+    /// Wire-identical to `deploy`: the reset is written as
+    /// `opcache:version:<vhost>` through the running server's RESP listener,
+    /// so on a cluster gossip replicates it to every peer within seconds.
+    /// `deploy` is the same operation plus an optional `--rev` stamp — use
+    /// whichever names the intent better in shell history and audit logs.
+    ///
+    /// Requires the running server to have `[kv.redis_compat] enabled = true`
+    /// so the CLI (a separate process) can reach the in-process KV store.
     Reset {
         /// Reset the OPcache under one vhost's docroot. Mutually exclusive
         /// with `--all`.
@@ -612,12 +619,20 @@ fn warn_max_execution_time(config: &ephpm_config::Config) {
 }
 
 /// Warn once at startup for every config knob that is parsed but not acted
-/// upon, so a silently-ignored setting can never look like it took effect.
+/// upon *in this configuration*, so a silently-ignored setting can never look
+/// like it took effect.
 ///
-/// Each field is compared against its own section's `Default`, so an untouched
-/// config stays quiet and only a deliberate override produces a line. Whenever
-/// one of these knobs gains a real implementation, delete its branch here and
-/// the matching "Planned: not yet implemented" doc comment in `ephpm-config`.
+/// Two categories:
+/// - **Never implemented** — the knob has no code behind it at all. Each
+///   field is compared against its own section's `Default`, so an untouched
+///   config stays quiet and only a deliberate override produces a line.
+/// - **Implemented, but not on this path** — `[server.security]`
+///   `open_basedir` / `disable_shell_exec` exist only for multi-tenant
+///   deployments and do nothing when `[server] sites_dir` is unset.
+///
+/// Whenever one of these knobs gains a real implementation (or gains one for
+/// the missing mode), delete its branch here and update the matching doc
+/// comment in `ephpm-config`.
 fn warn_unimplemented_knobs(config: &ephpm_config::Config) {
     warn_max_execution_time(config);
 
@@ -654,6 +669,31 @@ fn warn_unimplemented_knobs(config: &ephpm_config::Config) {
             "[db.analysis] auto_explain_target is parsed but not acted upon — \
              EXPLAIN analysis is not implemented, so nothing is written to any \
              target"
+        );
+    }
+
+    // [server.security] open_basedir / disable_shell_exec are implemented
+    // only on the multi-tenant path: the per-request `open_basedir` is set
+    // from the resolved vhost's directory, and `disable_functions` is only
+    // emitted into the generated php.ini when `sites_dir` is set. An
+    // operator who turns either on in single-site mode was getting no
+    // sandbox and no warning — the worst possible combination, because the
+    // config reads as if the process were hardened.
+    for flag in config.server.inert_security_flags() {
+        let remedy = if flag == "disable_shell_exec" {
+            "[[\"disable_functions\", \
+             \"exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec\"]]"
+        } else {
+            "[[\"open_basedir\", \"/app:/tmp\"]]"
+        };
+        tracing::warn!(
+            flag,
+            "[server.security] {flag} is enabled but has no effect — it is \
+             implemented only for multi-tenant deployments ([server] \
+             sites_dir), and this process is single-site. Nothing is \
+             sandboxing PHP here. Set PHP's own directive through [php] \
+             ini_overrides instead (ini_overrides = {remedy}) — those lines \
+             are written into the generated php.ini and applied at MINIT."
         );
     }
 }
@@ -1509,7 +1549,7 @@ async fn run_deploy(
     Ok(ExitCode::SUCCESS)
 }
 
-/// `ephpm cache reset` / `ephpm cache status` dispatcher.
+/// `ephpm cache` subcommand dispatcher (currently only `reset`).
 async fn run_cache(
     host: &str,
     port: u16,
