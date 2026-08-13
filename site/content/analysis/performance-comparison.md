@@ -1,6 +1,18 @@
 # Performance Comparison: ePHPm vs Everything Else
 
-This document breaks down where time is spent serving a PHP request across every major stack, showing exactly where ePHPm eliminates overhead.
+> **Status: ANALYSIS / MODEL — every number on this page is a modelled
+> estimate, not a measurement.** Nothing here was produced by a benchmark
+> harness in this repository: there is no hardware, no fixture, no
+> methodology, and none of it is reproducible. The per-stage figures are
+> reasoned-about costs, and the totals are sums of those estimates.
+> Competitor figures are uncited or come from third-party blog posts.
+>
+> **For measured ePHPm numbers — with commit SHAs, CPU quota, fixture,
+> warmup and repetition counts, and an explicit statement of which claims
+> transfer to other hardware — see [Benchmarking](/benchmarking/).** Treat
+> this page as a map of *where* overhead lives, not as data on how much.
+
+This document breaks down where time is spent serving a PHP request across every major stack, showing where ePHPm eliminates overhead.
 
 ---
 
@@ -73,9 +85,9 @@ The actual application logic — database queries, business logic, template rend
 
 | Stack | Execution Model | Overhead vs Native PHP |
 |---|---|---|
-| All stacks | Same PHP engine (Zend VM) | **0ms** — the PHP code runs at the same speed everywhere |
+| All stacks | Same PHP engine (Zend VM) | Roughly constant — but see the caveat below |
 
-The PHP execution time is the constant. Everything else in this document is overhead on top of it.
+The PHP execution time is *approximately* the constant, and everything else in this document is overhead on top of it. It is not exactly constant: ePHPm runs **ZTS** (thread-safe) PHP on Linux and macOS, while several of these stacks run NTS. ePHPm's own [benchmarking methodology](/benchmarking/methodology/) puts the ZTS tax at roughly 50% on tight hash loops in isolation and 5–10% on realistic scripts. Do not read the rest of this page as if the engine leg were free.
 
 ### Stage 5: Database Access
 
@@ -318,7 +330,7 @@ Raw speed means nothing without features. Here's what each stack actually provid
 | Built-in KV/cache | No | No | Yes (single-node) | No | Yes (single-node) | **Yes (clustered)** |
 | Multi-node clustering | No | No | No | No | No | **Yes** |
 | Query digest/analysis | No | No | No | No | No | **Yes** |
-| Auto-instrumented traces | No | No | No | No | No | **Yes** |
+| Trace export | No | No | No | No | No | **Partial** — a per-request OTLP span with W3C `traceparent` propagation, behind the `otlp` cargo feature. Not auto-instrumentation |
 | Superglobals work | Yes | Yes | **No** | Yes | **No** | **Yes** |
 | Zero code changes | Yes | Yes | **No** (PSR-7) | Yes | **No** (Swoole API) | **Yes** |
 | GC-free server layer | Yes (C) | Yes (C) | No (Go) | No (Go) | Yes (C) | **Yes (Rust)** |
@@ -331,7 +343,7 @@ Raw speed means nothing without features. Here's what each stack actually provid
 
 ### For developers on nginx + php-fpm:
 
-> "ePHPm eliminates 15ms of bootstrap overhead per request, replaces your nginx + php-fpm + Redis stack with a single binary, and adds connection pooling, query analysis, and a built-in observability dashboard. Your existing Laravel/Symfony/WordPress app works with zero code changes."
+> "ePHPm eliminates 15ms of bootstrap overhead per request, replaces your nginx + php-fpm + Redis stack with a single binary, and adds connection pooling, query analysis, and Prometheus metrics. Your existing Laravel/Symfony/WordPress app works with zero code changes."
 
 ### For developers on RoadRunner:
 
@@ -339,7 +351,7 @@ Raw speed means nothing without features. Here's what each stack actually provid
 
 ### For developers on FrankenPHP:
 
-> "ePHPm eliminates 2.2μs of CGO overhead per request, removes Go's GC jitter from your p99 latency, and adds DB connection pooling, clustered KV, query analysis, and a full observability dashboard — features FrankenPHP doesn't have and can't easily add."
+> "ePHPm eliminates 2.2μs of CGO overhead per request, removes Go's GC jitter from your p99 latency, and adds DB connection pooling, clustered KV, and query analysis with Prometheus export — features FrankenPHP doesn't have and can't easily add."
 
 ### For developers on Swoole:
 

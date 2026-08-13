@@ -56,7 +56,7 @@ In one process:
 ## Signals
 
 - `SIGTERM` / `SIGINT` — graceful shutdown. New connections are rejected, in-flight requests run to completion up to `[server.timeouts] shutdown` (default 30s), then connections are force-closed.
-- `SIGHUP` — reserved for future config reload (not yet implemented).
+- `SIGHUP` — **not handled.** ePHPm installs no `SIGHUP` handler, so the default disposition applies and the process terminates immediately with **no graceful drain** — in-flight requests are dropped. Config reload is not implemented. Always use `SIGTERM` to stop the server.
 
 ## Exit codes
 

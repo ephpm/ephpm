@@ -613,9 +613,11 @@ max_replica_lag = "500ms"        # for lag-aware
 
 After a connection performs a write, all subsequent reads from that connection go to the primary for `sticky_duration` seconds. Simple, conservative, slight primary load increase during the sticky window.
 
-**Strategy B: Lag-aware routing** (more complex, better distribution)
+**Strategy B: Lag-aware routing** — **Planned, not yet implemented.**
 
-ePHPm periodically monitors replica lag via `SHOW SLAVE STATUS` (MySQL) or `pg_stat_replication` (Postgres). Only routes reads to replicas with lag below `max_replica_lag`. Replicas that fall behind are temporarily removed from the read pool.
+The design: ePHPm would periodically monitor replica lag via `SHOW SLAVE STATUS` (MySQL) or `pg_stat_replication` (Postgres), route reads only to replicas with lag below `max_replica_lag`, and temporarily drop lagging replicas from the read pool.
+
+**None of that exists today.** `max_replica_lag` is parsed but nothing reads it — setting it logs a startup warning and provides **no stale-read protection whatsoever**. Selecting `strategy = "lag-aware"` does not give you lag awareness. Use sticky-after-write (Strategy A) and assume replicas may serve arbitrarily stale reads.
 
 ---
 
@@ -674,16 +676,24 @@ inject_env = true
 
 When `inject_env` is disabled, the developer manually points their app at the proxy (e.g., `DB_HOST=127.0.0.1` in `.env`).
 
-### Optional: SAPI Direct Access
+### Optional: SAPI direct access — shipped in v0.6.3
 
-For maximum performance, bypass TCP entirely with SAPI-level functions:
+Bypass TCP entirely with the native SAPI functions:
 
 ```php
-// Zero-overhead path via SAPI (no TCP, no wire protocol)
-$result = ephpm_db_query('SELECT * FROM users WHERE id = ?', [42]);
+// In-process path via SAPI (no TCP, no wire protocol)
+$rows = ephpm_db_query('SELECT * FROM users WHERE id = ?', [42]);
+$ok   = ephpm_db_execute('DELETE FROM sessions WHERE expires < ?', [time()]);
 ```
 
-But TCP compatibility is the priority — it means **zero code changes** for existing apps.
+This runs SQL through a per-thread litewire session against the **same**
+backend the wire frontends serve. It requires `[db.sqlite]`; it does not
+proxy to `[db.mysql]` or `[db.postgres]`. Full semantics — return shapes,
+binding rules, error mapping, the transaction model, and the current
+limitations — are in [Database from PHP](/guides/db-from-php/).
+
+TCP compatibility remains the priority and the default: it means **zero code
+changes** for existing apps.
 
 ---
 
@@ -786,7 +796,7 @@ ePHPm parses the SQL, extracts the shard key from the WHERE clause, hashes it, a
 | **9. Session state tracking** | SET variable replay, connection reset on return | Phase 3 |
 | **10. Unix socket frontend** | Listen on socket path for MySQL and PG | Phase 1 |
 | **11. Environment injection** | Auto-wire DB env vars into PHP runtime | Phase 2 |
-| **12. SAPI direct access** | `ephpm_db_query()` bypassing TCP | Phase 2 |
+| **12. SAPI direct access** | `ephpm_db_query()` / `ephpm_db_execute()` bypassing TCP | **Shipped in v0.6.3** (embedded SQLite only) |
 | **13. Node API endpoints** | `/api/db/digests`, `/api/db/slow`, `/api/db/pool` | Phase 4 + 5 |
 
 Phases 1-3 are the MVP: a working MySQL proxy with connection pooling. Phase 8 (PostgreSQL) can start in parallel once the shared analyzer and pool infrastructure exists from phases 4-7.

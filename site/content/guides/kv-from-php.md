@@ -19,9 +19,13 @@ ephpm_kv_set("greeting", "hello");
 $greeting = ephpm_kv_get("greeting");          // "hello"
 $missing  = ephpm_kv_get("nope");              // null
 
-ephpm_kv_exists("greeting");                   // 1
-ephpm_kv_del("greeting");                      // 1
-ephpm_kv_exists("greeting");                   // 0
+ephpm_kv_exists("greeting");                   // true  (bool, not int)
+ephpm_kv_del("greeting");                      // 1     (int — keys deleted)
+ephpm_kv_exists("greeting");                   // false
+
+// setnx is the atomic check-and-set the PHP lock libraries build on
+// (Laravel Cache::lock, Symfony LockFactory)
+ephpm_kv_setnx("lock:job", "owner-1");         // true if it did not exist
 
 // Counters — ephpm_kv_incr takes exactly one argument and always adds 1;
 // use ephpm_kv_incr_by for arbitrary deltas
@@ -30,10 +34,19 @@ ephpm_kv_incr_by("page:views", 5);             // 6
 
 // TTL (in seconds)
 ephpm_kv_set("session:abc", "data");
-ephpm_kv_expire("session:abc", 60);            // 60 seconds
-ephpm_kv_pttl("session:abc");                  // ~60000
-// returns -1 if no expiry, -2 if missing
+ephpm_kv_expire("session:abc", 60);            // 60 seconds; returns bool
+ephpm_kv_ttl("session:abc");                   // ~60      (seconds)
+ephpm_kv_pttl("session:abc");                  // ~60000   (milliseconds)
+// both return -1 if no expiry, -2 if missing
+
+ephpm_kv_decr("page:views");
+ephpm_kv_flush_all();                          // empties the store
 ```
+
+The full set of SAPI functions: `ephpm_kv_get`, `ephpm_kv_set`,
+`ephpm_kv_setnx`, `ephpm_kv_del`, `ephpm_kv_exists`, `ephpm_kv_incr`,
+`ephpm_kv_decr`, `ephpm_kv_incr_by`, `ephpm_kv_expire`, `ephpm_kv_ttl`,
+`ephpm_kv_pttl`, `ephpm_kv_flush_all`, `ephpm_kv_wait`.
 
 ### Blocking waits — `ephpm_kv_wait()`
 
@@ -215,4 +228,6 @@ See [Configuration reference](/reference/config/) for every key.
 
 - [`ephpm kv` CLI](/reference/cli/kv/) — debug the live store
 - [KV store architecture](/architecture/kv-store/) — how it works under the hood
+- [PHP packages](/reference/php-packages/) — PSR-6/PSR-16 caches, WordPress/Laravel/Symfony adapters, and a session handler built on these functions
+- [Database from PHP](/guides/db-from-php/) — the sibling `ephpm_db_*` functions
 - Examples in the repo: [`examples/kv-sapi-basic.php`](https://github.com/ephpm/ephpm/blob/main/examples/kv-sapi-basic.php), [`examples/kv-redis-predis.php`](https://github.com/ephpm/ephpm/blob/main/examples/kv-redis-predis.php)

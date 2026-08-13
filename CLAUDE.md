@@ -16,8 +16,9 @@ cargo xtask release           # → target/release/ephpm (PHP 8.5, sqld auto-dow
 cargo xtask release 8.4       # → target/release/ephpm (PHP 8.4)
 cargo xtask release --no-sqld # skip sqld embedding (single-node SQLite only)
 
-# Windows .exe (cross-compiled from WSL, requires cargo-xwin)
-cargo install cargo-xwin
+# Windows .exe — must be built ON Windows (native MSVC toolchain).
+# The cargo-xwin cross-compile-from-WSL path was REMOVED; `cargo xtask
+# release --target windows` errors out on a non-Windows host.
 cargo xtask release --target windows       # → target/x86_64-pc-windows-msvc/release/ephpm.exe
 # Note: Windows builds never include sqld (no Windows binary available from Turso)
 ```

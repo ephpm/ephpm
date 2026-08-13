@@ -4,7 +4,7 @@ weight = 8
 aliases = ["/roadmap/laravel-octane-driver/"]
 +++
 
-ePHPm 3.0 ships **persistent worker mode** (`[php] mode = "worker"`) and a native
+ePHPm ships **persistent worker mode** (`[php] mode = "worker"`) and a native
 **Laravel Octane driver** — boot the Laravel application once per worker thread,
 then handle requests in a loop with zero per-request bootstrap. Octane's own
 listeners (`FlushArrayCache`, `FlushAuthenticationState`, `DisconnectFromDatabases`,

@@ -1,11 +1,23 @@
 # Turso Engine — One Database Engine for Both Modes
 
-> **Status: DESIGN — gated on upstream GA.** Turso Database is in Beta
-> (latest release `v0.7.0-pre.x` as of July 2026; multiprocess support
-> and vacuum still missing; upstream explicitly does not yet position it
-> as a production SQLite replacement). Nothing here ships until that
-> changes. This page exists so the decision is pre-made and the
-> evidence-gathering starts early.
+> **Status: Phases 1 and 2 have SHIPPED as experimental opt-ins. Phase 3
+> (making Turso the default) is DESIGN, gated on upstream GA.**
+>
+> As of v0.6.3 you can select the Turso engine with
+> `[db.sqlite] engine = "turso"` (single-node), and the CDC-native
+> clustered replication path with
+> `[db.sqlite.replication] cdc_experimental = true`. Both warn loudly at
+> startup and are **not for production data** — Turso Database is Beta
+> upstream, multiprocess support and `VACUUM` are still missing, and
+> upstream does not yet position it as a production SQLite replacement.
+> The default engine is unchanged (`"sqlite"`, the genuine SQLite C
+> engine) and all five [decision gates](#decision-gates--all-of-them-no-exceptions)
+> below remain open.
+>
+> For the user-facing description of what shipped — how to enable it,
+> the exact startup warning, and what is unsupported — see
+> [Database engines](/architecture/database/engines/). This page is the
+> plan, the evidence, and the risks.
 
 ## The thesis
 

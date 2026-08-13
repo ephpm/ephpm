@@ -19,7 +19,8 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 
 [php]
 memory_limit = "256M"
-max_execution_time = 60
+# [php] max_execution_time is parsed but NOT enforced — use
+# [server.timeouts] request (default 300s) for the per-request deadline.
 ini_overrides = [
     ["display_errors", "Off"],
     ["error_reporting", "E_ALL"],

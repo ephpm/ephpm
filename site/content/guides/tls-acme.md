@@ -5,25 +5,24 @@ weight = 4
 
 ePHPm has TLS built in. Two modes: bring your own cert, or have ePHPm fetch one from Let's Encrypt automatically.
 
-> **Known issue — manual `cert` + `key` does not start on v0.1.0 through v0.6.1.**
+> **Historical note — manual `cert` + `key` did not start on v0.1.0 through
+> v0.6.1. Fixed in v0.6.2.**
 >
-> On every released version up to and including v0.6.1, starting ePHPm with
-> `[server.tls] cert` and `key` logs `TLS enabled (manual)` and then **panics
-> before binding a listener**:
+> On releases up to and including v0.6.1, starting ePHPm with
+> `[server.tls] cert` and `key` logged `TLS enabled (manual)` and then
+> **panicked before binding a listener**:
 >
 > ```
 > Could not automatically determine the process-level CryptoProvider
 > ```
 >
-> The process exits with status 101 and serves nothing. This is not a
-> regression — it has never worked in any release; the bug dates to v0.1.0
-> and was found in August 2026 while adding HTTP/3.
+> The process exited with status 101 and served nothing. This was not a
+> regression — it had never worked in any release; the bug dated to v0.1.0
+> and was found in August 2026 while adding HTTP/3. ACME mode was unaffected.
 >
-> **ACME mode is unaffected** and is the only TLS configuration that has ever
-> worked on a released build. If you need TLS today, use ACME (below), or
-> terminate TLS at a proxy and run ePHPm plain-HTTP behind it.
->
-> Fixed on `main`; the fix ships in the next release.
+> **Both modes work on v0.6.2 and newer**
+> ([#243](https://github.com/ephpm/ephpm/pull/243)). If you are still on
+> v0.6.1 or older, upgrade rather than working around it.
 
 ## Manual cert + key
 
@@ -110,6 +109,22 @@ The plain-HTTP listener only serves regular traffic (or 301-redirects when `redi
 ## Clustered ACME
 
 In a cluster, only one node should solve the challenge — the rest read the cert from the gossip-backed KV store. ePHPm does this automatically when `[cluster] enabled = true`. Each node points at the same `cache_dir` (or a shared store) and the leader publishes the cert; replicas pick it up. See [Clustering Setup](clustering-setup/).
+
+Two limitations you must plan around:
+
+- **Challenge traffic has to reach the ACME leader.** Sharing challenge
+  tokens between nodes is **not implemented**. A follower can serve
+  `/.well-known/acme-challenge/<token>` out of the KV store, but nothing
+  populates those keys, and the TLS-ALPN-01 challenge material lives only in
+  the leader's in-memory resolver. If your load balancer can send validation
+  traffic to any node, issuance will fail intermittently.
+- **Followers do not pick up renewed certificates while running.** This is
+  **not implemented**: `rustls-acme` consults its certificate cache once per
+  state machine, so a renewal published by the leader is not injected into a
+  running follower. **A follower serves the certificate it loaded at startup
+  until it restarts.** On a 90-day Let's Encrypt cert this means a rolling
+  restart inside the renewal window, or followers will eventually serve an
+  expired certificate. Watch for it.
 
 ## What's in `cache_dir`?
 

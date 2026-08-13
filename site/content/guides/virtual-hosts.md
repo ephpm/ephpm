@@ -46,7 +46,7 @@ Removing a site: delete the directory. Requests to that domain hit the fallback.
 
 Today, per-site configuration is intentionally minimal. What's discovered per site from `sites_dir` is the document root (the directory itself) plus that site's `index_files` and `fallback`. Everything else — PHP settings, timeouts, security rules, database — comes from the global `ephpm.toml` and is shared by all sites.
 
-A richer per-site override system (a `site.toml` dropped into the site directory with `[php]` and `[db.sqlite]` overrides) is planned for [Phase 2](#phase-2-per-site-databases-and-overrides-future). Until then, if one site needs a larger `memory_limit` or `max_execution_time`, raise the global value in `ephpm.toml`.
+A richer per-site override system (a `site.toml` dropped into the site directory with `[php]` and `[db.sqlite]` overrides) is planned for [Phase 2](#phase-2-per-site-databases-and-overrides-future). Until then, if one site needs a larger `memory_limit`, raise the global value in `ephpm.toml`; if one site needs longer to run, raise the global `[server.timeouts] request` (the `[php] max_execution_time` key is parsed but never enforced).
 
 ### SQLite Database Location
 
@@ -308,7 +308,7 @@ memory_limit = "64M"
 memory_limit = "64MB"
 ```
 
-Put a reverse proxy (Caddy recommended — automatic HTTPS per domain) in front for TLS termination, or use ePHPm's built-in ACME with a wildcard cert.
+Put a reverse proxy (Caddy recommended — automatic HTTPS per domain) in front for TLS termination, or use ePHPm's built-in ACME with every hostname listed explicitly in `[server.tls] domains`. **Wildcard certificates are not possible** — ePHPm's ACME implementation uses TLS-ALPN-01 only, and wildcard issuance requires DNS-01, which is not implemented.
 
 **Capacity:**
 - 20 WordPress blogs

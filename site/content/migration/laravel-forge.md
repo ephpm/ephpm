@@ -83,8 +83,9 @@ redirect_http = true
 
 [php]
 memory_limit = "256M"
-max_execution_time = 60
 workers = 8
+# [php] max_execution_time is parsed but NOT enforced — use
+# [server.timeouts] request (default 300s) for the per-request deadline.
 
 [db.sqlite]
 path = "/home/forge/example.com/database/database.sqlite"

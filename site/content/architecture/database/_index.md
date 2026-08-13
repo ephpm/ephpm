@@ -19,9 +19,33 @@ The primary use case is single-node deployments where running a separate MySQL o
 
 WordPress and Laravel both support SQLite natively. The ephpm binary ships with SQLite compiled in — PHP's existing MySQL drivers connect to it transparently through litewire's protocol translation.
 
-## Two Modes of Operation
+## Two ways in, two modes of operation
 
-ePHPm operates in two modes depending on whether clustering is enabled. The key difference is the SQLite backend: in-process rusqlite for single-node, or sqld child process for clustered replication.
+Two things vary independently, and it helps to keep them apart.
+
+**How PHP reaches the database:**
+
+- **The wire path** — `pdo_mysql` connects to `127.0.0.1:3306` and litewire
+  translates. **This is the default and remains fully supported.** Zero code
+  changes.
+- **The in-process bridge** — the native
+  [`ephpm_db_query()` / `ephpm_db_execute()`](/guides/db-from-php/) functions
+  (v0.6.3+) run SQL through a per-thread litewire session inside the server
+  process, skipping the TCP round trip. Same backend, same dialect, same
+  results. Available whenever `[db.sqlite]` is configured, in every mode
+  below.
+
+**Which engine and topology back it:**
+
+- **[Engine](/architecture/database/engines/)** — `[db.sqlite] engine` selects
+  the genuine SQLite C engine via rusqlite (`"sqlite"`, the default and the
+  only production-supported choice) or the experimental Turso Database engine
+  (`"turso"`, Beta upstream).
+- **Topology** — single-node or clustered, as described next. The key
+  difference is the backend: in-process rusqlite for single-node, or a sqld
+  child process for clustered replication (or, on the experimental
+  Turso + `cdc_experimental` path, CDC-native replication with **no** sidecar
+  at all).
 
 ### Single-Node (CI / Dev / Small Production)
 
@@ -141,6 +165,10 @@ join = ["ephpm-headless.default.svc.cluster.local"]
 | Primary election via gossip KV | **Implemented** | `ephpm-cluster` (sqlite_election) |
 | Failover restart (role change → sqld restart) | **Implemented** | `ephpm-server` |
 | sqld auto-download in release build | **Implemented** | `xtask` (v0.24.32 pinned) |
+| In-process PHP bridge (`ephpm_db_query` / `ephpm_db_execute`) | **Implemented** (v0.6.3) | `ephpm-php` (`db_bridge`) |
+| Turso engine (`[db.sqlite] engine = "turso"`) | **Implemented — experimental**, single-node | `litewire-turso` |
+| CDC-native clustered replication (`cdc_experimental`) | **Implemented — experimental**, no sqld sidecar | `ephpm-server` (`turso_cdc`) |
+| sqld write admission control (`[db.sqlite.sqld] write_permits`) | **Implemented** (v0.6.1) | `litewire-backend` (Hrana) |
 | PostgreSQL wire protocol frontend | Placeholder | `litewire-postgres` (pgwire) |
 | TDS (SQL Server) wire protocol frontend | Placeholder | `litewire-tds` |
 | Windows clustered mode | Not supported | sqld has no Windows binary |
@@ -259,16 +287,33 @@ EPHPM_DB__SQLITE__REPLICATION__ROLE=auto
         │
         └── yes ──► replication.role?
                        │
-                       ├── primary | replica ──► clustered (sqld sidecar)
+                       ├── primary | replica ──► clustered
                        │
                        └── auto ──► [cluster] enabled?
                                        │
                                        ├── yes ──► clustered
-                                       │           (sqld + gossip-elected primary)
                                        │
                                        └── no  ──► single-node
-                                                   (rusqlite in-process)
+
+   single-node ──► engine = "sqlite" ──► rusqlite, in-process (default)
+               └─► engine = "turso"  ──► Turso engine, in-process (experimental)
+
+   clustered   ──► engine = "sqlite" ──► sqld sidecar + gossip-elected primary
+               └─► engine = "turso"  ──► startup ERROR, unless
+                                         cdc_experimental = true, then
+                                         CDC-native replication (no sidecar)
 ```
+
+Full detail on the engine axis, including the startup warning and what the
+Turso engine does not support, is in
+[Database engines](/architecture/database/engines/).
+
+> **Operational note for clustered sqld:** `[db.sqlite.sqld] write_permits`
+> defaults to `0` (unlimited). SQLite has one writer, and past roughly four
+> concurrent writers sqld queues them badly enough that requests stop
+> completing at all. Set `write_permits = 1` on any clustered deployment that
+> takes concurrent writes — see the
+> [configuration reference](/reference/config/#dbsqlitesqld-clustered-mode-only).
 
 ## Platform Support
 

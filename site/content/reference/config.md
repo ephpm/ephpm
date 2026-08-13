@@ -68,8 +68,18 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 | `trusted_proxies` | array of strings | `[]` | CIDR ranges trusted for `X-Forwarded-For`/`X-Forwarded-Proto`. |
 | `blocked_paths` | array of strings | `[]` | Glob patterns blocked with 403. |
 | `allowed_php_paths` | array of strings | `[]` | When non-empty, only matching PHP paths execute. Others get 403. |
-| `open_basedir` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Restrict PHP filesystem access to the site's document root. |
-| `disable_shell_exec` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Disable `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec`. |
+| `open_basedir` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Restrict PHP filesystem access to the site's document root. **Multi-tenant only — see below.** |
+| `disable_shell_exec` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Disable `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec`. **Multi-tenant only — see below.** |
+
+> **Both knobs are enforced only in multi-tenant mode.** They take effect only
+> when `[server] sites_dir` is set. In single-site mode the values resolve
+> normally but nothing acts on them: `open_basedir` is gated on
+> `sites_dir.is_some()` before the per-request ini hook applies it, and
+> `disable_shell_exec` is gated the same way before it is written into the
+> generated `php.ini`. Setting either to `true` on a single-site deployment
+> gives you **no sandboxing and no warning**. To harden a single-site install,
+> use `[php] ini_overrides` to set `open_basedir` / `disable_functions`
+> directly.
 
 **Note:** an explicitly set value always wins. When unset, these two resolve to `true` if either the `[server.security]` section is present (matching earlier releases) or `server.sites_dir` is set — so multi-tenant deployments get filesystem isolation and shell-exec hardening by default, even without a `[server.security]` section. To opt out in multi-tenant mode you must set them to `false` explicitly (ephpm logs a warning at startup when you do).
 
@@ -118,10 +128,11 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 
 Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If both are set, manual wins.
 
-> **Known issue:** manual `cert`+`key` mode panics at startup on every release
-> from v0.1.0 through v0.6.1 — the process exits before binding a listener.
-> ACME mode is unaffected. See [TLS / ACME](/guides/tls-acme/) for details and
-> workarounds. Fixed on `main`.
+> **Fixed in v0.6.2.** Manual `cert`+`key` mode panicked at startup on every
+> release from v0.1.0 through v0.6.1 — the process exited before binding a
+> listener ([#243](https://github.com/ephpm/ephpm/pull/243)). ACME mode was
+> unaffected. If you are on v0.6.2 or newer, both modes work; upgrade rather
+> than working around it. See [TLS / ACME](/guides/tls-acme/).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -164,7 +175,7 @@ alt_svc_max_age = 86400
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `max_execution_time` | u32 (sec) | `30` | PHP `max_execution_time` per request. |
+| `max_execution_time` | u32 (sec) | `30` | **Planned — not yet implemented.** Parsed but not acted upon: nothing reads this field and it is never written into the generated `php.ini`. Setting it to anything other than the default logs a startup warning. PHP enforces `max_execution_time` with a `SIGPROF` timer whose handler ePHPm deliberately neutralizes, so emitting it would not help either. **The enforced per-request deadline is [`[server.timeouts] request`](#servertimeouts-all-in-seconds) (default `300` seconds).** |
 | `memory_limit` | string | `"128M"` | PHP `memory_limit`. Serves as the dev-mode value and the ultimate fallback; in serve mode it is superseded by the auto-derived per-request limit (see `php_memory_limit` and [Resource-aware autotuning](#resource-aware-autotuning)). |
 | `opcache_validate_timestamps` | bool | (mode default) | Override `opcache.validate_timestamps`. Unset resolves per mode: **off** (`0`) under `ephpm serve` (trust the cache — refresh code with `ephpm deploy` / `ephpm cache reset`), **on** (`1`) under `ephpm dev` (instant edit-refresh). Set `true`/`false` to force a value in either mode. See the [deploy guide](/guides/opcache-cluster-invalidation/) for the deploys-are-events contract. |
 | `opcache_revalidate_freq` | u32 (sec) | (none → PHP default `2`) | Override `opcache.revalidate_freq`. Only meaningful when timestamp validation is on: how often (at most) the engine re-`stat()`s a cached script. Raising it (e.g. `60`) cuts `stat()` traffic on overlay/network filesystems at the cost of slower edit pickup. Ignored when validation is off. |
@@ -241,7 +252,7 @@ All three share the same backend config schema. Adding a `[db.mysql]` or `[db.po
 |-----|------|---------|-------------|
 | `url` | string | (required) | Connection URL: `mysql://user:pass@host:port/db`, `postgres://...`. |
 | `listen` | string | `"127.0.0.1:3306"` (mysql), `"127.0.0.1:5432"` (postgres) | TCP address PHP connects to. |
-| `socket` | path | (none) | **Planned** — Unix socket path. Currently only accepted for the MySQL proxy and not yet wired there; PostgreSQL ignores it. |
+| `socket` | path | (none) | **Planned — not yet implemented.** Parsed but unused on **both** proxies: the MySQL and PostgreSQL paths each log a "Unix socket listeners are not yet supported" warning at startup and fall back to the TCP `listen` address. |
 | `min_connections` | u32 | `2` | Warm pool size (idle connections kept open). |
 | `max_connections` | u32 | `20` | Max total backend connections. |
 | `idle_timeout` | duration string | `"300s"` | Close idle backend connections after this. |
@@ -302,7 +313,7 @@ A post-startup outage is reported instead of routed around:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `path` | string | `"ephpm.db"` | SQLite database file path. |
-| `engine` | string | `"sqlite"` | **Experimental knob.** `"sqlite"` = the genuine SQLite C engine (default, production-supported). `"turso"` = the [Turso Database](https://github.com/tursodatabase/turso) engine (Rust rewrite of SQLite, **Beta upstream — experimental, not for production data**; single-node only, rejected at startup in clustered mode; `VACUUM` and multi-process access unsupported). See the [Turso engine roadmap](/roadmap/turso-engine/). |
+| `engine` | string | `"sqlite"` | **Experimental knob.** `"sqlite"` = the genuine SQLite C engine (default, production-supported). `"turso"` = the [Turso Database](https://github.com/tursodatabase/turso) engine (Rust rewrite of SQLite, **Beta upstream — experimental, not for production data**; `VACUUM` and multi-process access unsupported). Single-node only by default: in clustered mode it is rejected at startup **unless** [`[db.sqlite.replication] cdc_experimental = true`](#dbsqlitereplication-clustered-mode-only), which selects the experimental CDC-native replication path. See [Database engines](/architecture/database/engines/) and the [Turso engine roadmap](/roadmap/turso-engine/). |
 
 #### `[db.sqlite.proxy]`
 
@@ -351,7 +362,7 @@ A post-startup outage is reported instead of routed around:
 | `auto_explain` | bool | `false` | **Not yet implemented** — parsed but unused. |
 | `auto_explain_target` | string | `"stderr"` | **Not yet implemented**. |
 | `digest_store_max_entries` | usize | `100_000` | Max in-memory query digests; oldest evicted on overflow. |
-| `metric_label_series_max` | usize | `1000` | Max distinct `digest` label values emitted to Prometheus; overflow folds into `digest="__other__"`. `0` = unlimited. |
+| `metric_label_series_max` | usize | `1000` | Max distinct `digest` label values emitted to Prometheus; overflow folds into `digest="__other__"` (and logs a warning once). **There is no unlimited setting** — admission is `len() < metric_label_series_max`, so `0` admits nothing and folds *every* digest into `digest="__other__"`, effectively turning per-digest labels off. Use a large number if you want a high cap. Internal tracking (`top_queries()`) is unaffected either way and is bounded by `digest_store_max_entries`. |
 
 #### What query stats cover
 

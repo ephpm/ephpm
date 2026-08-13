@@ -92,7 +92,10 @@ ePHPm equivalent:
 [php]
 workers = 8            # replaces pm.max_children (auto-detected from CPU count)
 memory_limit = "256M"
-max_execution_time = 30
+
+[server.timeouts]
+request = 30           # replaces max_execution_time; the [php] key of that
+                       # name is parsed but NOT enforced
 
 [server.request]
 max_body_size = 67108864   # 64 MB
@@ -118,7 +121,7 @@ per_ip_rate = 10.0       # requests/sec per IP
 per_ip_burst = 50
 ```
 
-All limits default to `0` (unlimited). Set them for production to prevent abuse.
+`max_connections`, `per_ip_max_connections` and `per_ip_rate` default to `0` (unlimited); `per_ip_burst` defaults to `50`. Set them for production to prevent abuse.
 
 ### 3. Common Nginx Location Blocks
 

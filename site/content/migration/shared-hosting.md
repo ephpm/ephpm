@@ -117,7 +117,11 @@ document_root = "/var/www/html"
 
 [php]
 memory_limit = "256M"
-max_execution_time = 120
+
+[server.timeouts]
+request = 120                        # the real per-request deadline
+                                     # ([php] max_execution_time is parsed
+                                     # but NOT enforced)
 
 [server.tls]
 listen = "0.0.0.0:443"               # HTTPS listener
