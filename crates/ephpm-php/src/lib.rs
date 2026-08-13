@@ -115,6 +115,14 @@ mod ffi {
         /// `php_embed_init()` so the ini file is loaded during module startup.
         pub fn ephpm_set_ini_file(ini_file: *const ::std::os::raw::c_char);
 
+        /// Set the configured `max_execution_time` (seconds) the request paths
+        /// use to arm PHP's per-thread execution timer. Necessary because the
+        /// embed SAPI resets the `max_execution_time` ini entry to `0`
+        /// (unlimited) at runtime, so we cannot rely on the ini→timer chain and
+        /// must arm explicitly from this value each request. On builds without
+        /// per-thread timers this is a no-op. Call after `php_embed_init()`.
+        pub fn ephpm_set_max_execution_time(secs: ::std::os::raw::c_long);
+
         /// Set the KV ops function pointer table. Can be called after
         /// `php_embed_init()`, before any PHP scripts execute.
         pub fn ephpm_set_kv_ops(ops: *const crate::kv_bridge::EphpmKvOps);
@@ -279,6 +287,10 @@ mod exec_code {
     pub const SCRIPT_EXIT: std::os::raw::c_int = -2;
     /// A `zend_bailout()` unwound the script; the response is truncated.
     pub const BAILOUT: std::os::raw::c_int = -3;
+    /// A `max_execution_time` timeout unwound the script. Like [`BAILOUT`] it
+    /// forces a 500, but the captured response is a legitimate php-fpm-style
+    /// error page and IS delivered rather than discarded.
+    pub const TIMEOUT: std::os::raw::c_int = -4;
 }
 
 /// How a worker's framework loop ended (see [`PhpRuntime::run_worker`]).
@@ -487,6 +499,28 @@ impl PhpRuntime {
         }
 
         Ok(())
+    }
+
+    /// Record the configured `max_execution_time` (seconds) that the request
+    /// paths use to arm PHP's per-thread execution timer.
+    ///
+    /// The embed SAPI resets the `max_execution_time` ini entry to `0`
+    /// (unlimited) at runtime, so the generated-ini value cannot be relied on to
+    /// arm the timer; ePHPm arms it explicitly per request from this value
+    /// instead. On builds without per-thread timers, and in stub mode, this is a
+    /// no-op. Call once after [`PhpRuntime::init`].
+    pub fn set_max_execution_time(secs: u32) {
+        #[cfg(php_linked)]
+        {
+            // SAFETY: ephpm_set_max_execution_time only stores the value into a
+            // C static; it touches no PHP runtime state and is safe to call from
+            // the single-threaded startup path before the tokio runtime exists.
+            unsafe { ffi::ephpm_set_max_execution_time(::std::os::raw::c_long::from(secs)) };
+        }
+        #[cfg(not(php_linked))]
+        {
+            let _ = secs;
+        }
     }
 
     /// Check whether the PHP runtime is initialized and ready.
@@ -791,6 +825,21 @@ impl PhpRuntime {
             exec_code::OK => Ok(PhpResponse { status, headers, body }),
             exec_code::STARTUP_FAIL => {
                 Err(PhpError::ExecutionFailed("php_request_startup failed".into()))
+            }
+            // A max_execution_time timeout. PHP's own timer fired, raised the
+            // catchable "Maximum execution time exceeded" fatal, ran shutdown
+            // functions and flushed buffers — the captured body is a complete
+            // php-fpm-style 500 page (status is already 500 from the C layer),
+            // so it is delivered rather than discarded like a memory bailout.
+            exec_code::TIMEOUT => {
+                tracing::warn!(
+                    script = %request.script_filename.display(),
+                    method = %request.method,
+                    uri = %request.uri,
+                    "PHP script exceeded max_execution_time — returning the PHP \
+                     fatal as a 500 (shutdown functions ran, output flushed)"
+                );
+                Ok(PhpResponse { status, headers, body })
             }
             // A zend_bailout() unwound the script. `body` is a truncated
             // prefix of a response that was never finished, so it is dropped

@@ -7,6 +7,12 @@ fn main() {
     // doesn't produce "unexpected cfg" warnings. The cfg is set by
     // ephpm-php/build.rs when PHP_SDK_PATH is present.
     println!("cargo::rustc-check-cfg=cfg(php_linked)");
+    // Set (in the Linux branch below) when the linked SDK has per-thread
+    // execution timers, so this crate can gate the generated-ini
+    // `max_execution_time` line on native enforceability. rustc-cfg does not
+    // propagate across crates, so ephpm-php setting it for itself is not
+    // enough — this crate must probe and set its own.
+    println!("cargo::rustc-check-cfg=cfg(php_max_exec_timers)");
     println!("cargo::rerun-if-env-changed=PHP_SDK_PATH");
 
     // `backtrace(3)` / `backtrace_symbols_fd(3)` back the fatal-signal
@@ -145,22 +151,41 @@ fn main() {
     // Linux path: GNU ld supports --wrap, --start-group/--end-group, and
     // -Bstatic/-Bdynamic. We rely on all three.
 
-    for func in &[
+    // Whether the linked SDK has per-thread execution timers
+    // (--enable-zend-max-execution-timers). Mirrors the probe in
+    // ephpm-php/build.rs so the two crates agree on the mechanism.
+    let has_exec_timers = php_config_has_max_exec_timers(&sdk_path.join("include").join("php"));
+    if has_exec_timers {
+        // Gate for src/main.rs: the generated php.ini writes max_execution_time
+        // only when PHP can actually enforce it per-thread.
+        println!("cargo::rustc-cfg=php_max_exec_timers");
+    }
+
+    let mut wrap_funcs: Vec<&str> = vec![
         "zend_signal_startup",
         "zend_signal_init",
         "zend_signal_deactivate",
         "zend_signal_activate",
         "zend_signal_handler_unblock",
-        // zend_set_timeout directly calls sigaction(SIGPROF) +
-        // setitimer(ITIMER_PROF), bypassing the zend_signal system.
-        // Must also be wrapped to prevent SIGPROF on worker threads.
-        "zend_set_timeout",
-        "zend_unset_timeout",
         // zend_call_stack_init probes stack boundaries on each request
         // startup. Fails on tokio spawn_blocking threads with small/
         // non-standard stacks. We disable stack checking anyway.
         "zend_call_stack_init",
-    ] {
+    ];
+    if !has_exec_timers {
+        // No per-thread timers: zend_set_timeout() arms a process-wide
+        // setitimer(ITIMER_PROF) + SIGPROF handler, which crashes when the
+        // signal lands on a tokio worker thread. Neuter it and enforce the
+        // request deadline at the HTTP layer instead.
+        wrap_funcs.push("zend_set_timeout");
+        wrap_funcs.push("zend_unset_timeout");
+    }
+    // With per-thread timers we leave zend_set_timeout/zend_unset_timeout
+    // un-wrapped so PHP arms its own thread-local POSIX timer (SIGRTMIN,
+    // delivered only to the owning PHP thread). That is the whole mechanism
+    // behind native `max_execution_time` enforcement and runtime
+    // `set_time_limit()`.
+    for func in &wrap_funcs {
         println!("cargo::rustc-link-arg=-Wl,--wrap={func}");
     }
 
@@ -201,6 +226,25 @@ fn main() {
     // Harmless on a fully static custom build (no dynamic symbol table to
     // populate — dlopen is unavailable there anyway).
     println!("cargo::rustc-link-arg=-Wl,--export-dynamic");
+}
+
+/// Return `true` when the SDK's `php_config.h` declares
+/// `ZEND_MAX_EXECUTION_TIMERS` (libphp built with per-thread POSIX execution
+/// timers). Mirrors the identical probe in `crates/ephpm-php/build.rs`; both
+/// crates must agree, or the `--wrap` set here and the `#ifdef` in the C
+/// wrapper would disagree about whether `zend_set_timeout` is live.
+fn php_config_has_max_exec_timers(include_php_dir: &Path) -> bool {
+    let cfg = include_php_dir.join("main").join("php_config.h");
+    println!("cargo::rerun-if-changed={}", cfg.display());
+    let Ok(text) = std::fs::read_to_string(&cfg) else {
+        return false;
+    };
+    text.lines().any(|line| {
+        let l = line.trim_start();
+        l.starts_with("#define")
+            && l.contains("ZEND_MAX_EXECUTION_TIMERS")
+            && l.split_whitespace().last() == Some("1")
+    })
 }
 
 /// Static lib set the Linux SDK ships.
