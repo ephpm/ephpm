@@ -31,14 +31,15 @@ curl http://localhost:8080/kv-sapi-basic.php
 - `ephpm_kv_set(key, value[, ttl_seconds])` — Store a value, with an optional TTL in seconds
 - `ephpm_kv_setnx(key, value[, ttl_seconds])` — Store a value only if the key doesn't already exist
 - `ephpm_kv_del(key)` — Delete a key (returns 1 if found, 0 if not)
-- `ephpm_kv_exists(key)` — Check if key exists (returns 1 or 0)
+- `ephpm_kv_exists(key)` — Check if key exists (returns a **bool**, not an int)
 - `ephpm_kv_incr(key)` — Increment a numeric value by 1
 - `ephpm_kv_decr(key)` — Decrement a numeric value by 1
 - `ephpm_kv_incr_by(key, delta)` — Increment a numeric value by an arbitrary delta (negative to decrement)
-- `ephpm_kv_expire(key, ttl_seconds)` — Set TTL in seconds
+- `ephpm_kv_expire(key, ttl_seconds)` — Set TTL in seconds (returns a **bool**)
 - `ephpm_kv_ttl(key)` — Get remaining TTL in seconds (-1 = no expiry, -2 = missing)
 - `ephpm_kv_pttl(key)` — Get remaining TTL in milliseconds (-1 = no expiry, -2 = missing)
 - `ephpm_kv_flush_all()` — Delete all keys
+- `ephpm_kv_wait(key, last_version, timeout_ms)` — Block until `key` is written again (or the timeout elapses). Returns `['value' => string|null, 'version' => int]` on change, `false` on timeout. Start with `last_version = 0` to register the watch and get a race-free snapshot.
 
 **Pros:**
 - Zero-copy, direct access to embedded store

@@ -67,7 +67,7 @@ The controls that exist today, in one place:
 ┌─────────────────────────────────────────────────┐
 │         Upstream Services (DB, cache, etc.)       │
 │  • Connected via PHP application code             │
-│  • Or via ePHPm DB proxy (future)                 │
+│  • Or via the ePHPm DB proxy (shipped)            │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -75,7 +75,11 @@ The controls that exist today, in one place:
 
 1. **Internet → Rust**: All input is untrusted. hyper validates HTTP framing. ePHPm enforces size limits on headers and bodies before any allocation.
 2. **Rust → PHP**: The request is mapped to `$_SERVER`, `php://input`, etc. through SAPI callbacks. Rust controls what PHP sees — raw socket data never reaches PHP directly.
-3. **PHP → Upstream**: PHP application code connects to databases/caches. ePHPm does not intercept these connections in the MVP. The planned DB proxy (future) will add a trust boundary here.
+3. **PHP → Upstream**: PHP application code connects to databases and caches. When `[db.mysql]` / `[db.postgres]` (the [DB proxy](/architecture/database/db-proxy/)) or `[db.sqlite]` (embedded) is configured, **ePHPm does intercept these connections** — it terminates the wire protocol in Rust, pools upstream connections, and parses every statement for [query stats](/architecture/query-stats/). Two consequences worth knowing:
+   - **Your SQL is normalized and exported.** Literals are replaced with `?`, the result is truncated to 64 characters and emitted as the `digest` Prometheus label, and slow queries are logged at WARN. Parameter *values* are never included — the normalizer strips them — but table, column, and query shape are visible to anyone who can read `/metrics` or the logs.
+   - **Session state is reset between application connections** according to `[db.*] reset_strategy` (default `"smart"` — reset after any non-SELECT).
+
+   The embedded-SQLite listeners themselves are **unauthenticated** and assume only PHP inside this process reaches them; bind them to loopback. The in-process [`ephpm_db_*` bridge](/guides/db-from-php/) skips the socket entirely and is reachable by any PHP code in the request.
 
 ---
 
@@ -152,21 +156,59 @@ There is no admin interface — ePHPm exposes no admin endpoints, so there is no
 
 ---
 
-## TLS / Certificate Handling (Planned)
+## TLS / Certificate Handling (Implemented)
 
-- ACME automation via `rustls` + certificate management
-- Private keys stored with restrictive file permissions (0600)
-- No custom crypto — relies on `rustls` (audited, no OpenSSL C code)
-- OCSP stapling for certificate revocation checking
+Both modes ship: manual `[server.tls] cert` + `key`, and ACME via
+`[server.tls] domains`. See the [TLS / ACME guide](/guides/tls-acme/).
+
+- **No custom crypto.** Everything goes through `rustls` — no OpenSSL C code
+  in the TLS path.
+- **ACME uses `rustls-acme` with TLS-ALPN-01 challenges only.** DNS-01 and
+  HTTP-01 are not implemented, so **wildcard certificates cannot be issued**
+  (wildcards require DNS-01). Name every host explicitly in `domains`.
+
+Two gaps you must plan around in a cluster:
+
+- **Challenge tokens are not shared between nodes.** A node can serve
+  `/.well-known/acme-challenge/<token>` from the KV store, but nothing
+  populates those keys, and the TLS-ALPN-01 challenge material lives only in
+  the ordering node's in-memory resolver. **Validation traffic must reach the
+  ACME leader.**
+- **Followers do not pick up renewed certificates while running.** The leader
+  writes issued certs to the KV store and followers load them on cache miss at
+  startup — but `rustls-acme` consults its cache once per state machine, so a
+  *renewal* is not injected into a running follower. **Followers serve the
+  certificate they loaded at startup until they are restarted.** Budget a
+  restart inside the renewal window.
+
+**Not implemented:** OCSP stapling. ePHPm does not staple revocation
+responses, and does not set explicit restrictive permissions on the ACME
+cache directory — it inherits the process umask.
 
 ---
 
-## DB Proxy Security (Planned)
+## DB Proxy Security (Implemented)
 
-- Wire protocol parsing (MySQL/Postgres) in Rust — memory-safe by default
-- Connection credentials stored in config (same secret handling as above)
-- Query digest logging must not log sensitive parameter values — hash or redact by default
-- Connection pooling must isolate session state between application connections
+The proxy ships (`[db.mysql]`, `[db.postgres]`). What that means for security:
+
+- **Wire protocol parsing (MySQL/PostgreSQL) is in Rust** — memory-safe by
+  construction, no C parser in the path.
+- **Upstream credentials come from config**, with the same secret handling as
+  above (prefer `EPHPM_DB__MYSQL__URL` over plaintext in `ephpm.toml`).
+- **Query logging is redacted by normalization, not by hashing.** The
+  normalizer replaces every literal with `?` before a statement is used as a
+  metric label or written to the slow-query log, so parameter *values* never
+  reach either. Query *shape* — tables, columns, structure — does reach both.
+  Treat `/metrics` and the logs accordingly.
+- **Pooled connections reset session state between application connections**
+  per `[db.*] reset_strategy` (default `"smart"`: reset after any
+  non-SELECT). `"never"` disables that isolation — do not use it when
+  different tenants share a pool.
+
+**Not implemented:** the embedded-SQLite wire listeners
+(`[db.sqlite.proxy]` — MySQL, Hrana, PostgreSQL, TDS) perform **no
+authentication at all**. They assume only PHP inside this process reaches
+them. A non-loopback bind logs a warning but is not blocked.
 
 ---
 
@@ -175,13 +217,13 @@ There is no admin interface — ePHPm exposes no admin endpoints, so there is no
 ### Build-time
 
 - `cargo deny` checks dependency licenses and known advisories (RUSTSEC database)
-- PHP built from source via `static-php-cli` in a container — reproducible, auditable
+- PHP is **not** built by this repo. `cargo xtask release` downloads a prebuilt SDK tarball (`libphp.a` + headers) from [github.com/ephpm/php-sdk](https://github.com/ephpm/php-sdk) releases, pinned per PHP minor in `xtask/src/main.rs`. That separate pipeline is what uses `static-php-cli`; ePHPm has no dependency on it.
 - CI pins toolchain versions via `rust-toolchain.toml`
 
 ### Runtime
 
 - Single binary — dynamic library loading happens only for what the operator's config explicitly lists (`[[middleware]]` shared-library mounts, `[php] extensions`); nothing is loaded from ambient search paths without a config entry
-- The baseline ~45 PHP extensions are compiled in at build time; additional shared extensions load only via the `[php] extensions` config knob — runtime `dl()` from PHP code remains disabled by default in the embed SAPI
+- The baseline ~45 PHP extensions are compiled in at build time; additional shared extensions load only via the `[php] extensions` config knob. Note that ePHPm does **not** explicitly set `enable_dl` — runtime `dl()` availability is whatever the embed SAPI's own default gives you. If you need it guaranteed off, set `enable_dl=0` through `[php] ini_overrides`.
 
 ---
 

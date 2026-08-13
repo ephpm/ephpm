@@ -182,7 +182,7 @@ under `k8s/opcache-cluster.yaml`.
 Timestamp validation pays a `stat()` per include site per request (bounded
 by `revalidate_freq`), on every node — and still can't make a deploy atomic
 across a cluster. That is why serve mode turns it **off** by default (v0.5.0,
-see [above](#deploys-are-events-ephpm-serve-planned-for-v050)) and uses the
+see [above](#deploys-are-events-ephpm-serve)) and uses the
 KV-driven invalidation event instead. The comparison table and alternatives
 are in the [design document](/roadmap/opcache-clustering/), along with the
 planned Phase 2 (per-vhost preload) and Phase 3 (file watcher).

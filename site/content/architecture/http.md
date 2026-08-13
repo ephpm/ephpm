@@ -388,7 +388,7 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.tls.email` | string | — | Contact email for ACME registration |
 | `server.tls.cache_dir` | path | `"certs"` | ACME certificate cache directory |
 | `server.tls.staging` | bool | `false` | Use Let's Encrypt staging environment |
-| `php.max_execution_time` | int | `30` | PHP per-request timeout (seconds) |
+| `php.max_execution_time` | int | `30` | **Parsed, not enforced.** Nothing reads it and it is never written into the generated `php.ini`; setting it logs a startup warning. The enforced per-request deadline is `server.timeouts.request` (default `300`), applied at the HTTP layer — see [Signal Handling](#signal-handling) for why. |
 | `php.memory_limit` | string | `"128M"` | PHP memory limit |
 | `php.ini_overrides` | [string, string][] | `[]` | INI directive overrides |
 | `server.metrics.enabled` | bool | `false` | Prometheus metrics endpoint |

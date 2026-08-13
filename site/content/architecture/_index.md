@@ -213,6 +213,18 @@ ephpm admin --nodes 10.0.1.1:9090,10.0.1.2:9090,10.0.1.3:9090
 
 ### Node API Specification
 
+> **Status: DESIGN — none of this is implemented.** There is no Node API, no
+> admin UI, and no `[node_api]` or `[admin]` configuration section. None of
+> the `/api/*` endpoints below exist in the router, and neither `secret`,
+> `tls_cert`, `tls_key`, `username` nor `password` is parsed by
+> `ephpm-config` — writing them into `ephpm.toml` does nothing at all.
+> **In particular, do not read the "Authentication" paragraph below as a
+> security control that exists.** The only endpoints ePHPm actually serves
+> beyond your application are `/metrics` (opt-in, read-only, unauthenticated),
+> `/_ephpm/health`, `/_ephpm/ready`, and `/_ephpm/requests`. See
+> [Security → Secrets](/architecture/security/), which correctly states that
+> ePHPm exposes no admin interface.
+
 Every serving node exposes the Node API on a configurable port (default `:9090`). This is a lightweight HTTP/gRPC API — not a web UI. It consumes negligible resources.
 
 | Endpoint | Method | Data |
@@ -301,8 +313,9 @@ password = "changeme"                 # admin UI auth (separate from node API au
 **Implemented:**
 - Single-node in-memory KV store using DashMap (lock-sharded concurrent hash map)
 - RESP2 protocol server accepting Redis-compatible clients
-- ~30 Redis commands: GET, SET, DEL, EXPIRE, TTL, INCR, APPEND, KEYS, MGET, MSET, GETSET, etc.
-- **SAPI bridge** for direct PHP access (zero serialization, zero network hop): `ephpm_kv_get`, `ephpm_kv_set`, `ephpm_kv_del`, `ephpm_kv_exists`, `ephpm_kv_incr_by`, `ephpm_kv_expire`, `ephpm_kv_pttl`
+- ~40 Redis commands across strings, keys, hashes, and connection (see [KV from PHP](/guides/kv-from-php/) for the full table). `SCAN`, `HMSET`, `HMGET`, lists, sets, transactions and pub/sub are **not** implemented.
+- **SAPI bridge** for direct PHP access (zero serialization, zero network hop): `ephpm_kv_get`, `ephpm_kv_set`, `ephpm_kv_setnx`, `ephpm_kv_del`, `ephpm_kv_exists`, `ephpm_kv_incr`, `ephpm_kv_decr`, `ephpm_kv_incr_by`, `ephpm_kv_expire`, `ephpm_kv_ttl`, `ephpm_kv_pttl`, `ephpm_kv_flush_all`, `ephpm_kv_wait`
+- The same SAPI mechanism also carries the **embedded-database bridge** — `ephpm_db_query()` / `ephpm_db_execute()` (v0.6.3), documented in [Database from PHP](/guides/db-from-php/)
 - Hash store (separate DashMap) — `HGET` / `HSET` / `HGETALL` family
 - Transparent value compression — gzip / zstd / brotli, threshold-gated
 - TTL / expiry with background sweeper + lazy expiry on access
@@ -1249,14 +1262,14 @@ $stmt = $pdo->prepare('SELECT * FROM users WHERE id = ?');
 $stmt->execute([42]);
 ```
 
-ePHPm intercepts this because it's listening on the MySQL port. The PHP app doesn't know it's talking to a proxy — whether it's doing connection pooling, read/write splitting, or sharding. For even tighter integration, ePHPm could provide SAPI-level functions that bypass TCP entirely:
+ePHPm intercepts this because it's listening on the MySQL port. The PHP app doesn't know it's talking to a proxy — whether it's doing connection pooling, read/write splitting, or sharding. For tighter integration, ePHPm also provides SAPI-level functions that bypass TCP entirely (shipped in v0.6.3, embedded SQLite only):
 
 ```php
-// Optional: zero-overhead path via SAPI (no TCP, no wire protocol)
-$result = ephpm_db_query('SELECT * FROM users WHERE id = ?', [42]);
+// In-process path via SAPI (no TCP, no wire protocol)
+$rows = ephpm_db_query('SELECT * FROM users WHERE id = ?', [42]);
 ```
 
-But TCP compatibility is the priority — it means **zero code changes** for existing apps.
+See [Database from PHP](/guides/db-from-php/). TCP compatibility remains the priority and the default — it means **zero code changes** for existing apps.
 
 #### Auto-Configuration via Environment Injection
 

@@ -104,8 +104,10 @@ index_files = ["index.php", "index.html"]
 
 [php]
 mode = "fpm"
-max_execution_time = 30
 memory_limit = "128M"
+# Note: [php] max_execution_time is parsed but NOT enforced (PHP's SIGPROF
+# timer is deliberately neutralized). The per-request deadline is
+# [server.timeouts] request — default 300 seconds.
 
 # Load a custom php.ini before applying overrides (optional)
 # ini_file = "/etc/php/php.ini"
@@ -121,10 +123,11 @@ ini_overrides = [
 enabled = true
 # path = "/metrics"   # default
 
-# Embedded SQLite (via litewire)
+# Embedded SQLite (via litewire). The presence of this section IS the
+# enable switch — there is no `enabled` key.
 [db.sqlite]
-enabled = true
 path = "/var/lib/ephpm/app.db"
+# engine = "turso"   # experimental Turso Database engine (Beta upstream)
 ```
 
 Any TOML key can be overridden with an `EPHPM_` prefixed environment variable — e.g. `EPHPM_SERVER__LISTEN=0.0.0.0:9090`, `EPHPM_PHP__MEMORY_LIMIT=256M`. Nesting uses `__`. Arrays use JSON syntax: `EPHPM_CLUSTER__JOIN='["a:7946","b:7946"]'`. See [Environment Variables](https://ephpm.dev/reference/environment-variables/) for the full mapping rules.
@@ -264,7 +267,7 @@ The store is a single `DashMap<String, Entry>` with concurrent reads/writes, asy
 
 Every SQL query — whether it goes through the DB proxy to a real MySQL server or through litewire to SQLite — is tracked automatically. ePHPm normalizes queries (replacing literal values with `?`), groups them by digest, and records timing, throughput, and error rates.
 
-Metrics are emitted via Prometheus at `/metrics`:
+Metrics are exported in Prometheus format at `/metrics` once you enable the endpoint (`[server.metrics] enabled = true` — it is **off** by default):
 
 ```
 # Histogram of query execution times, by digest and kind (query/mutation)
@@ -288,11 +291,15 @@ Slow queries (default: > 1s) are logged at WARN level with the normalized SQL an
 
 ```toml
 [db.analysis]
-query_stats = true            # set to false to disable (zero overhead)
-slow_query_threshold = "500ms"
+query_stats = true            # on by default
+
+[server.metrics]
+enabled = true                # OFF by default — /metrics 404s without this
 ```
 
 Point Grafana, Datadog, or any Prometheus-compatible tool at `http://your-ephpm:8080/metrics` to chart query latency, throughput, error rates, and identify slow queries — no APM agent or database plugin needed.
+
+Query stats are collected by default, but **the `/metrics` endpoint itself is opt-in**: `[server.metrics] enabled` defaults to `false`, and with no recorder installed the metric calls are no-ops.
 
 See [site/content/architecture/query-stats.md](site/content/architecture/query-stats.md) for the full design.
 

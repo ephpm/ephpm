@@ -11,7 +11,7 @@ enabled = true
 # path = "/metrics"          # default
 ```
 
-When `enabled = false`, all metric calls are zero-cost no-ops — there's no overhead from leaving instrumentation in the code paths.
+When `enabled = false`, no Prometheus recorder is installed, so every `metrics` façade call dispatches to a no-op. A handful of call sites still construct their label values first (the query digest, middleware module name, vhost, and upstream labels are cloned before dispatch), so the cost is *near*-zero rather than exactly zero.
 
 Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and exported through [`metrics_exporter_prometheus`](https://docs.rs/metrics-exporter-prometheus/).
 
@@ -31,7 +31,7 @@ Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and ex
 | `ephpm_http_request_body_bytes` | histogram | `method` | Request body size. `method` is bounded the same way as above (standard verb or `OTHER`). |
 | `ephpm_http_response_body_bytes` | histogram | `handler` | Response body size before compression. Recorded on the PHP path only (`handler="php"`). |
 | `ephpm_http_compression_ratio` | histogram | — | Compressed-to-original ratio; covers both Brotli and gzip responses. |
-| `ephpm_http_timeouts_total` | counter | `stage` | Requests killed by the request timeout. Only value: `request`. |
+| `ephpm_http_timeouts_total` | counter | `stage` | Requests killed by the request timeout. Two values: `request` (the fpm-mode request deadline) and `worker` (worker mode — the worker never responded within the request timeout; the request gets a 504 and the worker is marked hung, which also increments `ephpm_worker_recycles_total{reason="hung"}`). |
 | `ephpm_rate_limited_total` | counter | — | Rejections from `[server.limits]`. Incremented only for per-IP rate limiting. |
 
 ## HTTP/3 (QUIC)
@@ -80,7 +80,7 @@ These appear when `[php] mode = "worker"`.
 | `ephpm_worker_boot_timeouts_total` | counter | — | Boots still running when `worker_boot_timeout` expired. The thread is not killed; it still becomes ready if the boot completes. |
 | `ephpm_worker_boot_failures_total` | counter | — | Worker boots that failed (thread spawn/TSRM init failure, or the script exited before its first `take_request()`). The pool respawns with exponential backoff. |
 | `ephpm_worker_recycles_total` | counter | `reason` | Workers recycled. `reason` is `max_requests` (hit `worker_max_requests`), `script_exit` (script called `exit()`/`die()` mid-request), `fatal` (fatal error / bailout), or `hung` (never responded within the request timeout; replaced). |
-| `ephpm_worker_stream_stalls_total` | counter | — | Streamed responses (`send_response_stream`) abandoned because the client stopped reading for longer than `stream_send_timeout`. |
+| `ephpm_worker_stream_stalls_total` | counter | — | Streamed responses (`send_response_stream`) abandoned because the client stopped reading for longer than [`[server.timeouts] idle`](/reference/config/#servertimeouts-all-in-seconds) (default 60 s). Note that `idle` does double duty: it is both the connection idle timeout and the worker-mode streaming send timeout, so changing it moves this threshold too. |
 | `ephpm_worker_stream_aborts_total` | counter | — | Streamed responses whose worker died in a bailout after the headers were already sent. The body is deliberately ended with an error (no terminating chunk) so the client sees a failed transfer rather than a truncated 200. Any non-zero value is a PHP crash. |
 
 ## OPcache clustering
@@ -144,9 +144,13 @@ deployment on sqld or single-node SQLite has no `ephpm_cdc_*` series at all.
 The whole path is **experimental** — see
 [Roadmap → Turso engine](/roadmap/turso-engine/).
 
-Every node registers both the primary-side and replica-side series at startup,
+Every node registers the **counters** and `ephpm_cdc_subscribers` at startup,
 zeroed, so an idle node is distinguishable from a build without the
-instrumentation. Which ones actually move depends on the elected role.
+instrumentation. The four `*_change_id` gauges, the replication-lag gauge, and
+the two histograms are deliberately **not** pre-seeded — they are absent from
+`/metrics` until the first subscriber connects or the first batch is applied,
+so a query against them returns no data on an idle cluster. Which series
+actually move depends on the elected role.
 
 ### Primary (shipping) side
 
@@ -223,7 +227,7 @@ The per-metric `digest` label series is **capped** — by default at 1,000 disti
 
 The internal digest table itself is bounded separately by `[db.analysis] digest_store_max_entries` (default 100,000). That knob controls how many distinct digests are held in memory for `top_queries()`; the label-series cap above controls Prometheus cardinality.
 
-The cap is configurable: `[db.analysis] metric_label_series_max` (default `1000`, `0` = unlimited). If your Prometheus is unhappy regardless, set `query_stats = false` to disable the metrics entirely.
+The cap is configurable: `[db.analysis] metric_label_series_max` (default `1000`). **There is no unlimited setting** — a digest is admitted only while the admitted count is *below* the cap, so `0` admits nothing and folds every digest into `digest="__other__"`. Raise the number if you want a higher cap. If your Prometheus is unhappy regardless, set `query_stats = false` to disable the metrics entirely.
 
 The `path`-style labels you might expect on HTTP metrics (`/users/123`) are deliberately *not* present — Prometheus' best-practice is to keep label cardinality bounded, and request paths in PHP apps explode it. Use the slow-query log + tracing for path-level debugging.
 

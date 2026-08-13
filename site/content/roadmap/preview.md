@@ -1,8 +1,15 @@
 # Preview Deployments
 
-ePHPm offers instant preview deployments for PHP applications via a GitHub bot. Every pull request gets a live preview URL with its own database — deployed in seconds, torn down on merge.
+> **Status: DESIGN — not implemented in this repository.** Nothing on this
+> page ships with the `ephpm` binary. The webhook handler it describes
+> (**switchboard**) is a separate project, not part of ePHPm, and no code in
+> this repository references it. In particular, the per-pull-request database
+> isolation described below is a design goal, not a property ePHPm provides
+> today. Treat the whole page as a sketch of an intended product.
 
-The system has two components: **switchboard** (the webhook handler) and **ephpm** (the runtime). They run side by side on the same VM.
+The design: preview deployments for PHP applications driven by a GitHub bot, where every pull request would get a live preview URL with its own database — deployed in seconds, torn down on merge.
+
+The system would have two components: **switchboard** (the webhook handler) and **ephpm** (the runtime), running side by side on the same VM.
 
 ## How It Works
 

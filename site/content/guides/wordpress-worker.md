@@ -4,7 +4,7 @@ weight = 9
 aliases = ["/roadmap/wordpress-worker-mode/"]
 +++
 
-ePHPm 3.0 ships a **WordPress worker-mode adapter**: boot WordPress core and
+ePHPm ships a **WordPress worker-mode adapter**: boot WordPress core and
 all plugins once per worker thread, then serve requests in a loop — the
 30–80 ms `wp-settings.php` bootstrap happens once per worker, not once per
 request. The adapter lives at

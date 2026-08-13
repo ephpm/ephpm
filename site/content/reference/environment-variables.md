@@ -93,7 +93,7 @@ located, because the handler has to be installed before anything can crash.
 | Value | Effect |
 |-------|--------|
 | unset (default) | Handler installed. On `SIGSEGV`/`SIGBUS`/`SIGILL`/`SIGFPE`/`SIGABRT`, ePHPm writes a diagnostic block to stderr and then dies with the original exit status. |
-| `0`, `off`, `false`, `no` | Handler not installed. Crashes are silent again, exactly as before v0.7. |
+| `0`, `off`, `false`, `no` | Handler not installed. Crashes are silent again, exactly as before v0.6.2 (the release that introduced the handler). |
 
 Disabling it does not change the exit status either way — the handler always
 re-raises with the default disposition, so the container still exits 139

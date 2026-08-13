@@ -64,7 +64,7 @@ After `install`, the same commands work on every platform — they wrap systemd 
 sudo ephpm start          # start the service
 sudo ephpm stop           # stop the service
 sudo ephpm restart        # restart (after editing the config)
-sudo ephpm status         # PID, uptime, last exit code, listen address
+sudo ephpm status         # service name, PID, uptime, listen address, config path
 sudo ephpm logs           # tail the service log
 sudo ephpm logs --follow  # follow new log lines
 ```
