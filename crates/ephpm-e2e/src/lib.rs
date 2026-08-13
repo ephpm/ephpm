@@ -152,8 +152,6 @@ impl ClusterFixture {
                 http: reserve_loopback_port().await?,
                 mysql: reserve_loopback_port().await?,
                 gossip: reserve_loopback_port().await?,
-                grpc: reserve_loopback_port().await?,
-                sqld_http: reserve_loopback_port().await?,
                 kv_data: reserve_loopback_port().await?,
             });
         }
@@ -185,8 +183,6 @@ impl ClusterFixture {
                 .replace("{HTTP_PORT}", &ports.http.to_string())
                 .replace("{MYSQL_PORT}", &ports.mysql.to_string())
                 .replace("{GOSSIP_PORT}", &ports.gossip.to_string())
-                .replace("{GRPC_PORT}", &ports.grpc.to_string())
-                .replace("{SQLD_HTTP_PORT}", &ports.sqld_http.to_string())
                 .replace("{KV_DATA_PORT}", &ports.kv_data.to_string())
                 .replace("{NODE_ID}", &format!("fixture-node-{i}"))
                 .replace("{CLUSTER_JOIN}", &joins)
@@ -251,8 +247,6 @@ struct ClusterPorts {
     http: u16,
     mysql: u16,
     gossip: u16,
-    grpc: u16,
-    sqld_http: u16,
     kv_data: u16,
 }
 
@@ -405,10 +399,6 @@ path = "{DATA_DIR}/wordpress.db"
 
 [db.sqlite.proxy]
 mysql_listen = "127.0.0.1:{MYSQL_PORT}"
-
-[db.sqlite.sqld]
-http_listen = "127.0.0.1:{SQLD_HTTP_PORT}"
-grpc_listen = "127.0.0.1:{GRPC_PORT}"
 
 [db.sqlite.replication]
 role = "auto"

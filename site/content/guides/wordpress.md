@@ -508,11 +508,12 @@ kubectl logs deploy/wordpress | tail -5
 # INFO ephpm_server: HTTP listening addr=0.0.0.0:8080
 ```
 
-> **Note on multi-replica SQLite:** SQLite's WAL mode supports concurrent
-> readers but only one writer. For multi-replica deployments, enable
+> **Note on multi-replica SQLite:** for multi-replica deployments, enable
 > ePHPm's clustered SQLite mode (`[db.sqlite.replication]` + `[cluster]`),
-> which uses sqld for WAL frame replication via gRPC. Clustered mode is
-> not supported on Windows (no sqld binary from Turso).
+> which replicates in-process via the Turso CDC path over the cluster
+> channel — no sqld sidecar. Clustered mode is **experimental** (the Turso
+> engine is Beta upstream) and tested on Linux/macOS; on Windows it is
+> untested.
 
 > **Note on persistence:** the manifests above use `emptyDir` volumes for
 > simplicity. For production, replace with PersistentVolumeClaims and store

@@ -21,7 +21,6 @@ ephpm-middleware = { workspace = true, features = ["host"] }
 ephpm-middleware-builtins.workspace = true
 ephpm-php.workspace = true
 ephpm-query-stats.workspace = true
-ephpm-sqld.workspace = true
 litewire.workspace = true
 turso.workspace = true
 tokio.workspace = true

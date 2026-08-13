@@ -31,7 +31,7 @@ A single `ephpm-query-stats` crate that both runtimes call into. One set of metr
    │     TrackedBackend ──┐                       Real MySQL  │              │
    │           │          │                                   │              │
    │           ▼          │ record                     record │              │
-   │      rusqlite        │                                   │              │
+   │    Turso engine      │                                   │              │
    │                      │                                   │              │
    │                      └───────► QueryStats ◄──────────────┘              │
    │                              (ephpm-query-stats)                        │
@@ -91,7 +91,7 @@ impl QueryStats {
     /// Record a completed query.
     ///
     /// Called by both the DB Proxy (after forwarding) and the TrackedBackend
-    /// (wrapping LiteWire's rusqlite/hrana-client backend).
+    /// (wrapping LiteWire's Turso backend).
     pub fn record(&self, sql: &str, duration: Duration, success: bool);
 
     /// Get the digest entry for a normalized query, if tracked.
@@ -411,7 +411,7 @@ Sort options: `total_time` (default), `count`, `avg_time`, `max_time`, `error_co
    - Slow query detection: threshold comparison
 
 2. **Integration tests** (`ephpm-server`):
-   - `TrackedBackend` wraps rusqlite, queries are recorded
+   - `TrackedBackend` wraps the Turso backend, queries are recorded
    - Stats appear in Prometheus metrics output
    - Slow query threshold triggers warn log
 

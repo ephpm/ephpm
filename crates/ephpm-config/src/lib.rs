@@ -925,16 +925,15 @@ pub struct SqliteConfig {
     #[serde(default = "default_sqlite_path")]
     pub path: String,
 
-    /// Database engine: `"sqlite"` (default) or `"turso"` (**experimental**).
+    /// Database engine. As of v0.7.0 the only value is `"turso"` (the
+    /// default) — the Turso Database engine, a ground-up Rust rewrite of
+    /// `SQLite`.
     ///
-    /// - `"sqlite"` — the genuine `SQLite` C engine (rusqlite, bundled).
-    ///   This is the default and the only production-supported engine.
-    /// - `"turso"` — the Turso Database engine, a ground-up Rust rewrite
-    ///   of `SQLite` that is **Beta upstream**. Single-node mode only:
-    ///   combining `engine = "turso"` with clustered `SQLite` is rejected
-    ///   at startup. Startup logs a warning when this engine is selected.
-    ///
-    /// Any other value is rejected at startup.
+    /// The legacy `"sqlite"` / `"rusqlite"` in-process C engine and the
+    /// `sqld` clustered sidecar were removed in v0.7.0. Setting `engine` to
+    /// either of those legacy values is a hard startup error (with a
+    /// migration message) rather than a silent fallback to a now-absent
+    /// backend. Any other value is likewise rejected at startup.
     #[serde(default = "default_sqlite_engine")]
     pub engine: String,
 
@@ -942,9 +941,15 @@ pub struct SqliteConfig {
     #[serde(default)]
     pub proxy: SqliteProxyConfig,
 
-    /// sqld process settings (clustered mode only).
+    /// DEPRECATED (removed in v0.7.0): the `[db.sqlite.sqld]` block.
+    ///
+    /// sqld and the rusqlite backend were removed in v0.7.0. Clustered
+    /// SQLite now replicates through the in-process Turso CDC path (no sqld
+    /// sidecar), so this section no longer controls anything. It is still
+    /// parsed so upgrading configs do not hard-fail; startup logs a warning
+    /// when it is present. Delete it.
     #[serde(default)]
-    pub sqld: SqldConfig,
+    pub sqld: Option<DeprecatedSqldConfig>,
 
     /// Replication settings (clustered mode only).
     #[serde(default)]
@@ -1008,71 +1013,30 @@ impl Default for SqliteProxyConfig {
     }
 }
 
-/// sqld child process configuration (`[db.sqlite.sqld]`).
+/// DEPRECATED (removed in v0.7.0): `[db.sqlite.sqld]`.
 ///
-/// Controls the internal sqld instance used for replication in clustered mode.
-/// Ignored in single-node mode.
-#[derive(Debug, Deserialize, Clone)]
-pub struct SqldConfig {
-    /// Hrana HTTP listen address for litewire → sqld communication.
-    #[serde(default = "default_sqld_http_listen")]
-    pub http_listen: String,
-
-    /// gRPC listen address for inter-node replication.
-    #[serde(default = "default_sqld_grpc_listen")]
-    pub grpc_listen: String,
-
-    /// Maximum **writes** litewire will have in flight against sqld at
-    /// once.
-    ///
-    /// Default `0` (off) in v0.6.x; planned default `1` in v0.7.0 — a
-    /// single permit already saturates sqld's single writer and prevents
-    /// the c>=8 write collapse (issue #217). `0` means unlimited, which is
-    /// the behavior of every prior release.
-    ///
-    /// SQLite has exactly one writer. Handing sqld more concurrent writes
-    /// than it can absorb makes it queue them so badly that requests stop
-    /// completing at all: past roughly four concurrent writers throughput
-    /// *collapses* rather than plateauing, and it does so by **hanging**,
-    /// not by erroring — the measured sweep produced zero HTTP 500s while
-    /// completing zero requests. Setting this admits `n` writes at a time
-    /// and parks the rest in a FIFO queue, so the excess waits locally
-    /// instead of thrashing inside sqld.
-    ///
-    /// Only the **clustered** SQLite path reads this — it configures
-    /// litewire's Hrana backend, which exists only when sqld is the store.
-    /// Single-node SQLite (in-process rusqlite) and the MySQL DB proxy are
-    /// unaffected, deliberately: they do not have sqld's queueing problem
-    /// and capping them would only lose throughput.
-    ///
-    /// Reads are never capped. Writes are never refused, only queued —
-    /// a queued write fails only if it waits longer than litewire's
-    /// 30-second acquire timeout, which surfaces as a retriable
-    /// `SQLITE_BUSY`.
-    ///
-    /// A workload dominated by multi-statement *explicit* transactions
-    /// wants `1` for a second, independent reason: a transaction holds its
-    /// permit from its first write to `COMMIT`, so anything above `1` lets
-    /// two transactions contend inside sqld again.
-    ///
-    /// Measured: `1` sustains ~598 RPS at c=16 where `0` completes *zero*
-    /// requests, and `8` sits above the cliff and reproduces the collapse.
-    /// One permit already saturates sqld's writer (~1.67 ms per serialized
-    /// write, the same per-write cost a single-client run shows), so higher
-    /// values cannot raise the ceiling. Full data and reasoning:
-    /// <https://ephpm.dev/benchmarking/findings/#from-zero-to-a-plateau-write-admission-for-sqld>
+/// The sqld child process and its Hrana/gRPC listeners were removed in
+/// v0.7.0 along with the rusqlite backend. Clustered SQLite now replicates
+/// through the in-process Turso CDC path — there is no sqld process to
+/// configure. Every field here is parsed-but-ignored purely so an existing
+/// config does not hard-fail on upgrade; startup logs a warning when the
+/// section (or `write_permits`) is present. Delete the section.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct DeprecatedSqldConfig {
+    /// Removed: sqld's Hrana HTTP listen address. Ignored.
     #[serde(default)]
-    pub write_permits: usize,
-}
+    pub http_listen: Option<String>,
 
-impl Default for SqldConfig {
-    fn default() -> Self {
-        Self {
-            http_listen: default_sqld_http_listen(),
-            grpc_listen: default_sqld_grpc_listen(),
-            write_permits: 0,
-        }
-    }
+    /// Removed: sqld's gRPC replication listen address. Ignored.
+    #[serde(default)]
+    pub grpc_listen: Option<String>,
+
+    /// Removed: sqld's single-writer admission semaphore. Turso is MVCC
+    /// (concurrent writers), so there is no single writer to gate — the
+    /// c>=8 write collapse this mitigated (issue #217) cannot occur.
+    /// Ignored.
+    #[serde(default)]
+    pub write_permits: Option<usize>,
 }
 
 /// Replication configuration (`[db.sqlite.replication]`).
@@ -1094,32 +1058,23 @@ pub struct ReplicationConfig {
     #[serde(default)]
     pub primary_grpc_url: String,
 
-    /// **Experimental** — enable CDC-native SQLite replication with
-    /// `[db.sqlite] engine = "turso"` in clustered mode.
+    /// DEPRECATED (removed in v0.7.0): the CDC-native replication opt-in.
     ///
-    /// Default: `false`. Setting this alongside `engine = "turso"` and
-    /// `[cluster] enabled = true` opts in to Phase 2 of the Turso engine
-    /// roadmap: litewire tails the primary's `turso_cdc` stream and
-    /// ships per-transaction batches to replicas over the CDC transport.
-    /// sqld is not spawned in this mode.
-    ///
-    /// Without this flag set, combining `engine = "turso"` with
-    /// clustered mode is a hard startup error — the flag is what
-    /// distinguishes "I know this is experimental" from a config typo.
-    ///
-    /// This knob is **strictly additive**: setting it to `false` (or
-    /// omitting it) preserves every prior release's behavior. Turning
-    /// it on selects the experimental replication path — sqld remains
-    /// the clustered default for `engine = "sqlite"`.
+    /// Default: `false`. In v0.6.x this gated the experimental Turso CDC
+    /// clustered path against the sqld sidecar. As of v0.7.0 sqld is gone
+    /// and CDC is the *only* clustered SQLite replication path, always
+    /// active in clustered mode — so this flag no longer selects anything.
+    /// It is still parsed so upgrading configs do not hard-fail; startup
+    /// logs a warning when it is set. Delete it.
     #[serde(default)]
     pub cdc_experimental: bool,
 
     /// Maximum snapshot-bootstrap payload a cold replica will accept
     /// from the primary, in bytes. Default: 1 GiB.
     ///
-    /// Only consulted on the CDC-native path
-    /// (`cdc_experimental = true`), where a joining replica pulls a
-    /// logical dump of the primary's database over the cluster channel.
+    /// Consulted on the clustered Turso CDC path, where a joining replica
+    /// pulls a logical dump of the primary's database over the cluster
+    /// channel.
     /// The advertised length in the snapshot header is checked against
     /// this before any buffer is reserved, and the running total is
     /// checked as chunks arrive — so a peer that streams forever, or
@@ -2701,19 +2656,11 @@ fn default_sqlite_path() -> String {
 }
 
 fn default_sqlite_engine() -> String {
-    "sqlite".to_string()
+    "turso".to_string()
 }
 
 fn default_sqlite_mysql_listen() -> String {
     "127.0.0.1:3306".to_string()
-}
-
-fn default_sqld_http_listen() -> String {
-    "127.0.0.1:8081".to_string()
-}
-
-fn default_sqld_grpc_listen() -> String {
-    "0.0.0.0:5001".to_string()
 }
 
 fn default_replication_role() -> String {
@@ -4257,16 +4204,13 @@ path = "app.db"
             "max_connections must default to 0 (unlimited) when [db.sqlite.proxy] is absent — \
              a surprise cap would refuse connections on upgrade"
         );
-        assert_eq!(sqlite.sqld.http_listen, "127.0.0.1:8081");
-        assert_eq!(sqlite.sqld.grpc_listen, "0.0.0.0:5001");
-        assert_eq!(
-            sqlite.sqld.write_permits, 0,
-            "write_permits must default to 0 (unlimited) when [db.sqlite.sqld] is absent — \
-             a surprise write cap would throttle every clustered deployment on upgrade"
+        assert!(
+            sqlite.sqld.is_none(),
+            "the [db.sqlite.sqld] block is removed in v0.7.0 and absent by default"
         );
         assert_eq!(sqlite.replication.role, "auto");
         assert!(sqlite.replication.primary_grpc_url.is_empty());
-        assert_eq!(sqlite.engine, "sqlite", "engine must default to the genuine SQLite C engine");
+        assert_eq!(sqlite.engine, "turso", "engine must default to \"turso\" (the only engine)");
     }
 
     #[test]
@@ -4327,10 +4271,6 @@ path = "/var/lib/ephpm/app.db"
 mysql_listen = "0.0.0.0:3307"
 hrana_listen = "0.0.0.0:8080"
 
-[db.sqlite.sqld]
-http_listen = "127.0.0.1:9081"
-grpc_listen = "0.0.0.0:6001"
-
 [db.sqlite.replication]
 role = "replica"
 primary_grpc_url = "http://10.0.1.2:5001"
@@ -4343,19 +4283,16 @@ primary_grpc_url = "http://10.0.1.2:5001"
         assert_eq!(sqlite.path, "/var/lib/ephpm/app.db");
         assert_eq!(sqlite.proxy.mysql_listen, "0.0.0.0:3307");
         assert_eq!(sqlite.proxy.hrana_listen.as_deref(), Some("0.0.0.0:8080"));
-        assert_eq!(sqlite.sqld.http_listen, "127.0.0.1:9081");
-        assert_eq!(sqlite.sqld.grpc_listen, "0.0.0.0:6001");
-        assert_eq!(
-            sqlite.sqld.write_permits, 0,
-            "an explicit [db.sqlite.sqld] section that omits write_permits must still default \
-             to unlimited"
-        );
+        assert!(sqlite.sqld.is_none(), "no [db.sqlite.sqld] block was set");
         assert_eq!(sqlite.replication.role, "replica");
         assert_eq!(sqlite.replication.primary_grpc_url, "http://10.0.1.2:5001");
     }
 
+    /// A stale `[db.sqlite.sqld]` block from a pre-v0.7.0 config must still
+    /// parse (into the deprecated, ignored shim) so upgrading users do not
+    /// hit a hard TOML error; startup warns about it separately.
     #[test]
-    fn test_sqld_write_permits_parses() {
+    fn test_deprecated_sqld_block_still_parses() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("ephpm.toml");
         std::fs::write(
@@ -4366,16 +4303,16 @@ path = "/var/lib/ephpm/app.db"
 
 [db.sqlite.sqld]
 write_permits = 4
+http_listen = "127.0.0.1:9081"
 "#,
         )
         .unwrap();
 
         let config = Config::load(&file).unwrap();
         let sqlite = config.db.sqlite.expect("sqlite should be present");
-        assert_eq!(sqlite.sqld.write_permits, 4);
-        // Setting one key in the section must not disturb the others.
-        assert_eq!(sqlite.sqld.http_listen, "127.0.0.1:8081");
-        assert_eq!(sqlite.sqld.grpc_listen, "0.0.0.0:5001");
+        let sqld = sqlite.sqld.expect("deprecated [db.sqlite.sqld] block should parse");
+        assert_eq!(sqld.write_permits, Some(4));
+        assert_eq!(sqld.http_listen.as_deref(), Some("127.0.0.1:9081"));
     }
 
     #[test]

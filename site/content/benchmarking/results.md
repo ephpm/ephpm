@@ -121,6 +121,13 @@ v0.6.0 ships the [Turso engine](/roadmap/turso-engine/) as an
 experimental CDC-native clustered mode (`cdc_experimental = true`). This
 is the first measurement of both against the shipping SQLite paths.
 
+> **Historical (pre-v0.7.0).** These lanes are a snapshot of v0.6.0, when
+> rusqlite (`engine = "sqlite"`) was the default and sqld backed the
+> clustered path. In v0.7.0 rusqlite and the sqld sidecar were removed and
+> Turso became the only engine; the `engine` and `cdc_experimental` knobs
+> and the sqld lanes below no longer exist. The Turso-vs-SQLite numbers are
+> retained as the parity evidence behind that switch.
+
 **Setup:** one machine, one session, podman on WSL2, four lanes, each
 node `--cpus 1`. `oha`, 8 s warmup then 2 × 20 s measured, best rep
 reported with *its own* p50/p99. 100% `2xx` verified per cell. Fixtures
@@ -269,8 +276,14 @@ a lane that failed it was discarded rather than reported.
 
 ## v0.6.1 — the clustered-sqld write collapse, fixed
 
+> **Historical (pre-v0.7.0).** This section documents the sqld sidecar and
+> its `[db.sqlite.sqld] write_permits` knob, both **removed in v0.7.0**
+> when the sqld path was retired for the in-process Turso CDC path (which
+> is MVCC and has no single-writer collapse). `write_permits` is no longer
+> a config knob. Kept here as the record of why the sqld path was fragile.
+
 v0.6.0's matrix found one outlier: **clustered SQLite via sqld collapsed
-under concurrent writes** while every other path scaled up. v0.6.1 adds
+under concurrent writes** while every other path scaled up. v0.6.1 added
 `[db.sqlite.sqld] write_permits`, an opt-in cap on writes in flight
 against sqld. Full arc in
 [From zero to a plateau](/benchmarking/findings/#from-zero-to-a-plateau-write-admission-for-sqld);

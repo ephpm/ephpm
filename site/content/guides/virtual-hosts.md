@@ -85,7 +85,7 @@ All sites share one ephpm process and tokio's `spawn_blocking` thread pool. A re
    │                  │                                             │
    │   ┌──────────────┴───── Shared Backend ─────────────┐          │
    │   │                                                 │          │
-   │   │   litewire → rusqlite → global [db.sqlite].path │          │
+   │   │   litewire → Turso → global [db.sqlite].path    │          │
    │   │   (all sites, one database)                     │          │
    │   │                                                 │          │
    │   └─────────────────────────────────────────────────┘          │
@@ -97,7 +97,7 @@ This is efficient — 20 sites don't need 20x the threads. Any `spawn_blocking` 
 
 ### Shared litewire Instance
 
-One litewire MySQL frontend and one rusqlite backend serve every site. PHP on any site connects to litewire on `127.0.0.1:3306`, and all queries land in the single global SQLite database. Per-site databases would require routing MySQL wire connections per site (the MySQL protocol doesn't carry a Host header), via `COM_INIT_DB` routing or per-site litewire instances — that's Phase 2 work.
+One litewire MySQL frontend and one Turso backend serve every site. PHP on any site connects to litewire on `127.0.0.1:3306`, and all queries land in the single global SQLite database. Per-site databases would require routing MySQL wire connections per site (the MySQL protocol doesn't carry a Host header), via `COM_INIT_DB` routing or per-site litewire instances — that's Phase 2 work.
 
 ## Resource Usage
 
@@ -128,7 +128,7 @@ Shared across all sites. A 2 vCPU machine handles ~20-40 total req/s across all 
 
 ## Clustered Mode with Virtual Hosts
 
-Virtual hosts work with clustered SQLite. Because every site shares the single global database, each node runs exactly one sqld child process (~40-50 MB) regardless of how many vhosts exist — replication cost does not grow with site count.
+Virtual hosts work with clustered SQLite (experimental Turso CDC replication). Because every site shares the single global database, each node replicates exactly one database's CDC stream in-process regardless of how many vhosts exist — replication cost does not grow with site count, and there is no separate database-server process.
 
 The tradeoff is granularity: the whole shared database replicates as a unit. You can't cluster one site and leave the rest single-node.
 

@@ -71,9 +71,8 @@ that the proxy records a narrower set of statements. See the
 
 ### CDC Replication Metrics (experimental)
 
-Emitted only when the experimental CDC-native Turso replication path is running
-(`[db.sqlite] engine = "turso"` + clustering + `[db.sqlite.replication]
-cdc_experimental = true`). The full table — every series, its labels, and the
+Emitted only when the experimental Turso CDC replication path is running
+(`[db.sqlite]` + clustering). The full table — every series, its labels, and the
 PromQL to alert on — is in the
 [metrics reference](/reference/metrics/#cdc-native-turso-replication).
 

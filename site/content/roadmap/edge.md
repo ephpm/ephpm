@@ -1,6 +1,6 @@
 # Edge Deployment
 
-ePHPm's embedded SQLite + sqld replication makes global edge deployment possible with a single binary per region. Every node has a full local copy of the database — reads are served at disk speed with no cross-ocean round trips.
+ePHPm's embedded Turso engine + in-process CDC replication (**experimental**) makes global edge deployment possible with a single binary per region. Every node has a full local copy of the database — reads are served at disk speed with no cross-ocean round trips.
 
 ## Architecture
 
@@ -13,13 +13,13 @@ ePHPm's embedded SQLite + sqld replication makes global edge deployment possible
               │                     │                     │
      ┌────────▼────────┐  ┌────────▼────────┐  ┌────────▼────────┐
      │  Frankfurt       │  │  Tokyo           │  │  São Paulo      │
-     │  ephpm + sqld    │  │  ephpm + sqld    │  │  ephpm + sqld   │
+     │  ephpm (Turso)   │  │  ephpm (Turso)   │  │  ephpm (Turso)  │
      │  (primary)       │  │  (replica)       │  │  (replica)      │
-     │  app.db ◄────────┼──┼── WAL sync ──────┼──┼── WAL sync     │
+     │  app.db ◄────────┼──┼── CDC sync ──────┼──┼── CDC sync     │
      └─────────────────┘  └─────────────────┘  └─────────────────┘
 ```
 
-Each region runs one ephpm binary with sqld as a sidecar. sqld replicates via async WAL frame streaming over gRPC. GeoDNS or CDN routing sends users to the nearest node.
+Each region runs one ephpm binary — no sidecar. The primary tails its Turso change-data-capture stream and ships per-transaction batches to replicas over the cluster channel. GeoDNS or CDN routing sends users to the nearest node.
 
 ## What Works Well
 
@@ -44,7 +44,7 @@ Served directly from the local node. No replication concern at all.
 
 ## The Write Problem
 
-SQLite is single-writer. sqld has one primary that accepts writes. Replicas forward writes to the primary.
+Clustered Turso has one primary that accepts writes; replicas apply the primary's CDC stream. Writes should be directed to the primary.
 
 **Impact of cross-region write latency:**
 
@@ -86,10 +86,10 @@ role = "primary"
 # Tokyo: /var/www/sites/alice-blog.com/site.toml
 [db.sqlite.replication]
 role = "replica"
-primary_grpc_url = "http://frankfurt:5001"
+primary_grpc_url = "frankfurt:7948"   # the primary's cluster channel address
 ```
 
-Each site writes locally to its own primary. Reads are always local everywhere. The only cross-region traffic is async WAL replication — background, non-blocking.
+Each site writes locally to its own primary. Reads are always local everywhere. The only cross-region traffic is async CDC replication — background, non-blocking.
 
 This is per-site sharding by region. No single write crosses an ocean.
 
@@ -130,7 +130,7 @@ The question is: does the site have writes that are latency-sensitive AND origin
 
 ## Use Case Fit
 
-| Use case | Edge with sqld? | Recommendation |
+| Use case | Edge with clustered Turso? | Recommendation |
 |----------|-----------------|----------------|
 | Read-heavy blog network | **Excellent** | Deploy globally, single primary |
 | Multi-author CMS (writes from one region) | **Good** | Primary in the author's region |
@@ -280,7 +280,7 @@ Start with GeoDNS. It works today with no infrastructure changes. Move to manage
 | Single-region MySQL + CDN | CDN hit: fast, miss: 100-300ms | Low (same region) | Low | $$ |
 | PlanetScale (Vitess) | Low (regional reads) | Low (regional writes) | Medium | $$$$ |
 | CockroachDB | Low (leaseholder reads) | Medium (consensus) | High | $$$$ |
-| **ePHPm + sqld edge** | **< 1ms (local disk)** | **Low (regional primary)** | **Low** | **$** |
+| **ePHPm + Turso edge** | **< 1ms (local disk)** | **Low (regional primary)** | **Low** | **$** |
 | Cloudflare D1 | Low (edge reads) | Medium (primary write) | Low | $$ |
 
 ePHPm's edge story is: the simplicity and cost of SQLite, with the read performance of a local database at every edge, and the write consistency of a single-writer model. It's not for every workload — but for read-heavy WordPress/CMS sites, it's hard to beat on cost and simplicity.
@@ -310,7 +310,8 @@ At scale with owned anycast:
 
 - **Single-writer per database** — SQLite fundamental. One primary per site.
 - **Async replication** — replicas may lag by seconds. Not suitable for strong consistency requirements.
-- **No multi-primary** — sqld doesn't support write-write replication or CRDTs.
+- **No multi-primary** — the Turso CDC path doesn't support write-write replication or CRDTs.
 - **Failover across regions is slow** — re-bootstrapping a new primary from a remote replica transfers the entire database over the internet.
-- **Windows** — sqld not available on Windows. Edge nodes must be Linux or macOS.
+- **Windows** — clustered Turso CDC is untested on Windows. Edge nodes should be Linux or macOS.
+- **Clustering is experimental** — the Turso engine is Beta upstream and the CDC path is manually validated; treat edge clustering as experimental.
 - **Per-site databases required** — edge with regional primaries requires Phase 2 virtual host support (per-site SQLite + per-site replication config).

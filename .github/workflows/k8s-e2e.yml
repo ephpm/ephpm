@@ -2,8 +2,8 @@
 #
 # The default E2E path (.github/workflows/e2e.yml) uses bare processes; this
 # workflow exists so engineers and agents can smoke K8s deployment shape
-# (readiness gates, StatefulSet identity, headless service DNS, sqld PVC
-# behavior) before pushing code that touches k8s/ manifests. Not run on PRs
+# (readiness gates, StatefulSet identity, headless service DNS, per-node
+# Turso DB PVC behavior) before pushing code that touches k8s/ manifests. Not run on PRs
 # because Kind requires --privileged DinD, which is a container-to-container
 # poisoning risk in the shared self-hosted VM.
 

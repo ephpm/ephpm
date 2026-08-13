@@ -7,7 +7,7 @@ ePHPm clusters via SWIM gossip ([chitchat](https://github.com/quickwit-oss/chitc
 
 ## Minimum viable cluster
 
-Three nodes, all reachable from each other on UDP 7946 (gossip) and TCP 7947 (KV data plane). (With experimental CDC replication — `cdc_experimental = true` — also open TCP 7948, the [cluster channel](/architecture/clustering/#cluster-channel-tcp-opt-in).)
+Three nodes, all reachable from each other on UDP 7946 (gossip) and TCP 7947 (KV data plane). Clustered SQLite also uses TCP 7948, the [cluster channel](/architecture/clustering/#cluster-channel-tcp-opt-in) that carries Turso CDC replication.
 
 ```toml
 # Same on every node — only `node_id` should differ (or be left empty for auto)
@@ -25,9 +25,9 @@ cluster_id = "ephpm-prod"          # only nodes with the same id will pair
 
 `join` only needs to list a few seeds — once a node joins, it discovers the rest.
 
-## Clustered SQLite
+## Clustered SQLite (experimental)
 
-Add `[db.sqlite.replication]` so ePHPm spawns sqld and elects a primary via gossip:
+Add `[db.sqlite.replication]` so ePHPm elects a primary via gossip and replicates in-process via the Turso CDC path. As of v0.7.0 there is **no sqld sidecar** — clustering is the in-process Turso change-data-capture stream shipped over the cluster channel. Because the Turso engine is Beta upstream and this path is manually validated, treat clustered mode as **experimental** and run it on Linux/macOS.
 
 ```toml
 [db.sqlite]
@@ -36,20 +36,18 @@ path = "/var/lib/ephpm/app.db"
 [db.sqlite.replication]
 role = "auto"                       # primary chosen by gossip (lowest ordinal alive node wins)
 # role = "primary"                  # force this node — for static topologies
-# role = "replica"                  # force this node, set primary_grpc_url
-
-[db.sqlite.sqld]
-http_listen = "127.0.0.1:8081"     # litewire → sqld
-grpc_listen = "0.0.0.0:5001"       # primary streams WAL frames here
+# role = "replica"                  # force this node, set primary_grpc_url to the primary's cluster channel address
 ```
+
+There is no `cdc_experimental` opt-in flag anymore — enabling `[cluster]` with `[db.sqlite]` selects CDC replication unconditionally.
 
 How it works:
 
 - **Primary election** uses the gossip KV (`kv:sqlite:primary`) with a TTL heartbeat. The lowest-ordinal alive node wins. On failure, the next-lowest takes over within ~10s.
-- The primary spawns sqld in primary mode; replicas spawn sqld in replica mode pointed at the primary's gRPC URL. Before a replica dials that URL it validates the advertised host against the live gossip membership list and refuses to connect to a host that is not a known cluster member -- defense in depth so a forged primary claim cannot redirect replication at an attacker-controlled sqld.
-- A role-change watcher SIGTERMs and re-spawns sqld when the role flips.
+- The primary publishes its Turso `turso_cdc` stream over the cluster channel; replicas connect to the primary's cluster channel address and apply per-transaction batches. Before a replica dials that address it validates the advertised host against the live gossip membership list and refuses to connect to a host that is not a known cluster member -- defense in depth so a forged primary claim cannot redirect replication at an attacker-controlled peer.
+- On a role flip the node reconfigures its CDC role in-process — there is no child process to restart.
 
-> Clustered SQLite isn't supported on Windows — Turso doesn't ship a Windows sqld binary. Use single-node SQLite or a real MySQL backend on Windows.
+> Clustered SQLite is tested on Linux/macOS; on Windows it is untested. Single-node SQLite and the MySQL/PostgreSQL proxy work fine on Windows.
 
 ## KV replication
 
@@ -117,11 +115,11 @@ Prometheus metrics on `/metrics` cover HTTP, PHP, DB, and KV behaviour. Cluster-
 ## Failure modes worth knowing
 
 - **Network partition** — gossip detects partitions in seconds. The minority side will see itself as a smaller cluster; the majority retains the SQLite primary.
-- **Primary crash** — replicas detect via gossip TTL expiry on `kv:sqlite:primary`, the next-lowest-ordinal node grabs it, and sqld restarts in primary mode. Window is ~10s.
+- **Primary crash** — replicas detect via gossip TTL expiry on `kv:sqlite:primary`, and the next-lowest-ordinal node promotes itself and begins publishing its CDC stream. Window is ~10s.
 - **Brief Replica-with-empty-URL window** — between primary death and re-election, `evaluate_role` returns `Replica` with an empty primary URL for one tick. The role watcher sees two transitions (Replica-empty → Primary). Harmless, but logs are loud.
 
 ## See also
 
 - [Architecture → Clustering](/architecture/clustering/) — design rationale and protocol details
-- [Architecture → Database](/architecture/database/) — sqld lifecycle and election internals
+- [Architecture → Database](/architecture/database/) — Turso CDC replication and election internals
 - [TLS / ACME](tls-acme/) — how cert distribution works in a cluster

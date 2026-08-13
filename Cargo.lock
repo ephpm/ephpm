@@ -1450,7 +1450,6 @@ dependencies = [
  "ephpm-middleware-builtins",
  "ephpm-php",
  "ephpm-query-stats",
- "ephpm-sqld",
  "flate2",
  "h3",
  "h3-quinn",
@@ -1486,18 +1485,6 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "turso",
-]
-
-[[package]]
-name = "ephpm-sqld"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libc",
- "reqwest",
- "tempfile",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2652,13 +2639,8 @@ version = "0.1.0"
 source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
- "litewire-translate",
  "parking_lot",
- "reqwest",
  "rusqlite",
- "serde",
- "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4000,7 +3982,6 @@ dependencies = [
  "futures-channel",
  "futures-core",
  "futures-util",
- "h2",
  "http",
  "http-body",
  "http-body-util",

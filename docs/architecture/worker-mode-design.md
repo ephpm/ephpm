@@ -693,7 +693,7 @@ Under NTS there is exactly **one** context, so:
   (dev, low-traffic Windows deployments) and keeps the config surface uniform.
 - Concurrency on Windows therefore = 1 for PHP. Static files etc. remain
   concurrent (they never touch PHP). Document this clearly as a known
-  limitation, same tier as "sqld not supported on Windows".
+  limitation, same tier as "clustered Turso CDC is untested on Windows".
 
 ### 6.2 OPcache / JIT with long-lived workers
 

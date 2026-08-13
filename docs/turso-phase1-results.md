@@ -6,6 +6,12 @@ Phase 1 delivers *data*, not adoption: the experimental backend exists to
 be measured. Everything below is reproducible with the harness shipped in
 litewire (`crates/litewire-turso/examples/phase1_gates.rs`).
 
+> **Historical (pre-v0.7.0).** The `rusqlite` rows below are the SQLite-C
+> baseline this experiment measured Turso against. In v0.7.0 rusqlite was
+> removed and Turso became the only engine; these numbers are retained as
+> the parity evidence behind that switch, not a description of current
+> configuration.
+
 ## Environment
 
 | | |

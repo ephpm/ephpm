@@ -313,7 +313,7 @@ A post-startup outage is reported instead of routed around:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `path` | string | `"ephpm.db"` | SQLite database file path. |
-| `engine` | string | `"sqlite"` | **Experimental knob.** `"sqlite"` = the genuine SQLite C engine (default, production-supported). `"turso"` = the [Turso Database](https://github.com/tursodatabase/turso) engine (Rust rewrite of SQLite, **Beta upstream — experimental, not for production data**; `VACUUM` and multi-process access unsupported). Single-node only by default: in clustered mode it is rejected at startup **unless** [`[db.sqlite.replication] cdc_experimental = true`](#dbsqlitereplication-clustered-mode-only), which selects the experimental CDC-native replication path. See [Database engines](/architecture/database/engines/) and the [Turso engine roadmap](/roadmap/turso-engine/). |
+| `engine` | string | `"turso"` | The embedded SQLite-compatible engine. **`"turso"` is the only accepted value (and the default).** ePHPm embeds the [Turso Database](https://github.com/tursodatabase/turso) engine — a Rust rewrite of SQLite (**Beta upstream**; `VACUUM` and multi-process access unsupported) — through litewire. As of v0.7.0 the rusqlite (genuine SQLite C engine) backend and the sqld sidecar were removed: legacy `engine = "sqlite"` or `engine = "rusqlite"` is now a **hard startup error** with a migration message — it fails closed, never silently falling back. See [Database engines](/architecture/database/engines/) and the [Turso engine roadmap](/roadmap/turso-engine/). |
 
 #### `[db.sqlite.proxy]`
 
@@ -327,22 +327,19 @@ A post-startup outage is reported instead of routed around:
 
 > **These listeners are unauthenticated too.** litewire's MySQL, Hrana, PostgreSQL, and TDS frontends accept any client — the PostgreSQL frontend is explicitly wired to a no-op startup handler, and the others never ask for credentials. The design assumes only PHP inside this process reaches them. As with `[db.mysql]`, each of these four keys is checked at startup and a non-loopback IP literal logs a warning naming the risk; startup is not blocked. Bind loopback unless the port is firewalled from untrusted networks.
 
-#### `[db.sqlite.sqld]` (clustered mode only)
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `http_listen` | string | `"127.0.0.1:8081"` | sqld HTTP listener (litewire → sqld). |
-| `grpc_listen` | string | `"0.0.0.0:5001"` | sqld gRPC listener (inter-node replication). |
-| `write_permits` | integer | `0` (unlimited) | Maximum writes in flight against sqld at once. **Default 0 (off) in v0.6.x; planned default 1 in v0.7.0 — a single permit already saturates sqld's single writer and prevents the c>=8 write collapse ([issue #217](https://github.com/ephpm/ephpm/issues/217)).** SQLite has one writer; past ~4 concurrent writers sqld queues them so badly that requests stop completing altogether. Setting this admits `n` writes and queues the rest FIFO — never refused, only delayed (a queued write fails only after litewire's 30s acquire timeout, as a retriable `SQLITE_BUSY`). Reads are never capped. Clustered SQLite only: single-node SQLite and the MySQL proxy ignore it. Values above `1` do not raise throughput (SQLite serializes writes regardless) and `8` reproduces the collapse; `1` is also required for workloads dominated by multi-statement explicit transactions, since a transaction holds its permit until `COMMIT`. Full measurements and reasoning: [From zero to a plateau](/benchmarking/findings/#from-zero-to-a-plateau-write-admission-for-sqld) and the [v0.6.1 results](/benchmarking/results/#v061--the-clustered-sqld-write-collapse-fixed). |
+> **Removed in v0.7.0:** the `[db.sqlite.sqld]` block (`http_listen`, `grpc_listen`, `write_permits`) is gone along with the sqld sidecar. Clustered SQLite now replicates in-process via the Turso CDC path (see `[db.sqlite.replication]` below) — there is no sqld child process, no gRPC listener, and no write-admission semaphore. A config that still sets these keys logs a deprecation warning at startup; they have no effect.
 
 #### `[db.sqlite.replication]` (clustered mode only)
+
+Clustered SQLite is **experimental** in v0.7.0: it uses the in-process Turso CDC replication path (`turso_cdc`) over the [cluster channel](#clusterchannel), tested on Linux/macOS. The Turso engine is Beta upstream — treat clustered mode accordingly.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `role` | string | `"auto"` | `"auto"` (gossip-elected), `"primary"`, `"replica"`. |
-| `primary_grpc_url` | string | `""` | Primary gRPC URL (set automatically in `auto` mode; required for `replica`). In CDC-native mode (`cdc_experimental = true`) this field carries the primary's **cluster channel address** (e.g. `10.0.0.1:7948` — the channel defaults to the gossip port + 2) instead of a gRPC URL. |
-| `cdc_experimental` | bool | `false` | **Experimental** — opt in to Phase 2 CDC-native replication (`engine = "turso"` only). Setting this to `true` also implicitly enables the [cluster channel](#clusterchannel) on this node. See the [Turso engine roadmap](/roadmap/turso-engine/#phase-2--cdc-native-replication-experimental-implementation-available-gated-on-ga-for-default) and the [cluster channel design](/roadmap/cluster-channel/). Without this flag, `engine = "turso"` + clustered mode is a hard startup error. |
-| `max_snapshot_bytes` | u64 (bytes) | `1073741824` (1 GiB) | Largest snapshot-bootstrap payload a cold replica will accept from the primary. Only used on the CDC-native path. Both the length the primary advertises and the running total of received chunks are checked against it, so a peer cannot exhaust the replica's memory by claiming an absurd size or streaming without an end marker. Bootstrap fails with a message naming this knob when a legitimate dump is larger. |
+| `primary_grpc_url` | string | `""` | The primary's **cluster channel address** (e.g. `10.0.0.1:7948` — the channel defaults to the gossip port + 2). Set automatically in `auto` mode; required for `replica`. Replicas tail the primary's `turso_cdc` stream over this address. (The key name is retained for config compatibility; despite the name there is no gRPC — the sqld/gRPC transport was removed in v0.7.0.) |
+| `max_snapshot_bytes` | u64 (bytes) | `1073741824` (1 GiB) | Largest snapshot-bootstrap payload a cold replica will accept from the primary. Used by the Turso CDC replication path. Both the length the primary advertises and the running total of received chunks are checked against it, so a peer cannot exhaust the replica's memory by claiming an absurd size or streaming without an end marker. Bootstrap fails with a message naming this knob when a legitimate dump is larger. |
+
+> **Removed in v0.7.0:** the `cdc_experimental` opt-in flag is gone. Clustered mode always uses CDC replication now — there is no per-node flag to set. A config that still sets `cdc_experimental` logs a deprecation warning; it has no effect.
 
 ### `[db.read_write_split]`
 
@@ -370,7 +367,7 @@ One collector serves every database path, so proxied and embedded queries land o
 
 | Path | Statements recorded | Duration measured | Row counts |
 |------|--------------------|-------------------|------------|
-| Embedded SQLite (`[db.sqlite]`, any engine or replication mode) | All queries and mutations | In-process execution time | Rows returned / rows affected |
+| Embedded SQLite (`[db.sqlite]`, single-node or clustered) | All queries and mutations | In-process execution time | Rows returned / rows affected |
 | MySQL proxy, single-backend path (any reset strategy) | `COM_QUERY` only | Wire round trip: command written to the backend → last response byte read back | Not available |
 | MySQL proxy, R/W splitting enabled with replicas | `COM_QUERY` and `COM_STMT_EXECUTE` | Same wire round trip | Rows returned, or affected rows from the `OK` packet — summed across every result set of a multi-result command (`CALL`, multi-statement), which is recorded as one statement |
 | PostgreSQL proxy, any reset strategy, with or without replicas | Simple `Query` messages | Wire round trip: message written → `ReadyForQuery` | Rows returned (`DataRow` count); mutations record `0` |
@@ -430,8 +427,9 @@ today). It is **only bound when at least one feature asks for it**: a
 config that ships no channel feature is byte-identical to a config
 without this section — no socket, no task, no startup log noise above
 `debug!`. Adding `[cluster.channel]` to a config is not itself an
-opt-in; a feature elsewhere (today just `[db.sqlite.replication]
-cdc_experimental = true` in clustered mode) has to ask. See the
+opt-in; a feature elsewhere (today just clustered SQLite — i.e.
+`[db.sqlite]` with clustering enabled, which replicates via Turso CDC)
+has to ask. See the
 [cluster channel roadmap](/roadmap/cluster-channel/) for the design.
 
 **Security posture.** Connections complete a mutual challenge/response

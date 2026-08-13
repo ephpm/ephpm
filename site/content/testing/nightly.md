@@ -184,7 +184,7 @@ All stress/integration tests use `#[ignore]` so they never run during `cargo tes
 
 ## 5. SQLite Clustering E2E
 
-**What:** Test the full clustering lifecycle: primary election, write replication, and failover recovery with 3 ephpm nodes running sqld sidecars.
+**What:** Test the full clustering lifecycle: primary election, write replication, and failover recovery with 3 ephpm nodes replicating via the in-process Turso CDC path (no sqld sidecar).
 
 **Infrastructure:** docker-compose with 3 ephpm containers on a shared Docker network.
 
@@ -206,7 +206,7 @@ All stress/integration tests use `#[ignore]` so they never run during `cargo tes
 - Kill the primary container (`docker stop`)
 - Wait for gossip failure detection (heartbeat TTL = 10s, so ≤15s)
 - Verify a new primary is elected (gossip KV updated)
-- Verify the new primary's sqld sidecar restarted in primary mode
+- Verify the new primary begins publishing its Turso CDC stream in primary mode
 - Write new rows to the new primary → verify they replicate to the remaining replica
 
 #### Split-Brain Prevention
@@ -215,12 +215,12 @@ All stress/integration tests use `#[ignore]` so they never run during `cargo tes
 - Verify the two connected nodes maintain a single primary
 - Reconnect the network → verify the cluster reconverges to a single primary
 
-#### Role Change sqld Restart
-- Verify that when a node transitions from replica → primary, its sqld process is SIGTERMed and restarted with `--primary` args
-- Check logs for the expected lifecycle: `"stopping sqld"` → `"starting sqld as primary"`
-- Verify the new sqld instance passes health checks
+#### Role Change (in-process)
+- Verify that when a node transitions from replica → primary, it reconfigures its CDC role in-process (starts publishing its `turso_cdc` stream) with no child process to restart
+- Check logs for the expected role-change lifecycle
+- Verify the new primary's CDC stream is consumable by the remaining replica
 
-**Implementation:** docker-compose file with 3 ephpm services, shared network, volume mounts for config. Test runner is a 4th container or host-side script using `curl`/`mysql` CLI. Requires a release build with sqld embedded.
+**Implementation:** docker-compose file with 3 ephpm services, shared network, volume mounts for config. Test runner is a 4th container or host-side script using `curl`/`mysql` CLI. Requires a standard release build (the Turso engine is compiled in — no extra binary).
 
 ---
 
@@ -330,7 +330,7 @@ All stress/integration tests use `#[ignore]` so they never run during `cargo tes
 
 ## 9. Windows Cross-Compilation
 
-**What:** Verify that `cargo xtask release --target windows --no-sqld` produces a valid Windows executable for PHP 8.4 and 8.5.
+**What:** Verify that `cargo xtask release --target windows` produces a valid Windows executable for PHP 8.4 and 8.5.
 
 **Why nightly:** Requires `cargo-xwin` + MSVC cross-toolchain. Slow to set up, and Windows-specific breakage is rare. The PR CI's stub-mode compile already catches most Rust issues.
 
@@ -343,7 +343,6 @@ All stress/integration tests use `#[ignore]` so they never run during `cargo tes
 **What it catches:**
 - Windows-specific `#[cfg(target_os = "windows")]` compilation errors
 - Linker issues with the Windows PHP SDK
-- Missing sqld guard (must bail gracefully, not compile error)
 
 **Implementation:** Single job, `cargo install cargo-xwin` (cached), matrix over PHP versions. Upload `.exe` as artifact.
 

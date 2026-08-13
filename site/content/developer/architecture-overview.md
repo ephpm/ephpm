@@ -49,7 +49,6 @@ ephpm/
 │   ├── ephpm-db/               # DB proxy — MySQL/PostgreSQL wire, pooling, R/W splitting
 │   ├── ephpm-cluster/          # Gossip clustering (chitchat), KV replication, primary election
 │   ├── ephpm-query-stats/      # SQL normalization, digest tracking, slow query log
-│   ├── ephpm-sqld/             # Embedded sqld binary + child process lifecycle
 │   └── ephpm-e2e/              # E2E test crate — EXCLUDED from the workspace
 ├── xtask/                      # Build & test tooling — release, php-sdk, e2e, e2e-up, e2e-down
 ├── benches/
@@ -74,7 +73,6 @@ ephpm/
 | `ephpm-db` | Library | DB proxy — MySQL/PostgreSQL wire protocols, connection pooling, R/W splitting |
 | `ephpm-cluster` | Library | SWIM gossip via chitchat, KV replication, SQLite primary election |
 | `ephpm-query-stats` | Library | SQL normalization, digest tracking, slow query logging, Prometheus metrics |
-| `ephpm-sqld` | Library | sqld binary embedding and child process lifecycle for clustered SQLite |
 | `ephpm-e2e` | Tests | E2E test crate — excluded from the workspace, runs in Docker via `cargo xtask e2e` |
 | `xtask` | Binary | Build & test tooling — `release`, `php-sdk`, `e2e`, `e2e-up`, `e2e-down` |
 

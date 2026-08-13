@@ -110,7 +110,6 @@ COPY crates/ephpm-middleware-security-headers/Cargo.toml crates/ephpm-middleware
 COPY crates/ephpm-php/Cargo.toml          crates/ephpm-php/Cargo.toml
 COPY crates/ephpm-query-stats/Cargo.toml  crates/ephpm-query-stats/Cargo.toml
 COPY crates/ephpm-server/Cargo.toml       crates/ephpm-server/Cargo.toml
-COPY crates/ephpm-sqld/Cargo.toml         crates/ephpm-sqld/Cargo.toml
 
 RUN mkdir -p \
         xtask/src \
@@ -128,11 +127,10 @@ RUN mkdir -p \
         crates/ephpm-php/src \
         crates/ephpm-query-stats/src \
         crates/ephpm-server/src \
-        crates/ephpm-server/examples \
-        crates/ephpm-sqld/src && \
+        crates/ephpm-server/examples && \
     printf 'fn main() {}\n' > xtask/src/main.rs && \
     printf 'fn main() {}\n' > crates/ephpm/src/main.rs && \
-    for d in ephpm-cluster ephpm-config ephpm-db ephpm-kv ephpm-middleware ephpm-middleware-builtins ephpm-middleware-cors ephpm-middleware-jwt ephpm-middleware-ratelimit ephpm-middleware-security-headers ephpm-php ephpm-query-stats ephpm-server ephpm-sqld; do \
+    for d in ephpm-cluster ephpm-config ephpm-db ephpm-kv ephpm-middleware ephpm-middleware-builtins ephpm-middleware-cors ephpm-middleware-jwt ephpm-middleware-ratelimit ephpm-middleware-security-headers ephpm-php ephpm-query-stats ephpm-server; do \
         touch crates/$d/src/lib.rs; \
     done && \
     # ephpm-server declares three `[[example]] crate-type = ["cdylib"]` targets
@@ -146,11 +144,10 @@ RUN mkdir -p \
     done && \
     # ephpm-php Cargo.toml declares `build = "build.rs"` explicitly, so cargo
     # errors out (rather than silently skipping) if the file is missing during
-    # the stub-precompile step. Other crates with build.rs (ephpm, ephpm-sqld)
-    # rely on auto-detection and tolerate absence, but we stub them too for
-    # consistency — all three real build.rs files arrive with the later COPY.
+    # the stub-precompile step. The other crate with build.rs (ephpm) relies on
+    # auto-detection and tolerates absence, but we stub it too for consistency —
+    # both real build.rs files arrive with the later COPY.
     printf 'fn main() {}\n' > crates/ephpm-php/build.rs && \
-    printf 'fn main() {}\n' > crates/ephpm-sqld/build.rs && \
     printf 'fn main() {}\n' > crates/ephpm/build.rs
 
 # The drift tripwire. `cargo fetch` resolves every workspace target before it

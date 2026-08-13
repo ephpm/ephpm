@@ -5,11 +5,16 @@ Evidence for decision gate 5 of the
 *"WordPress + Laravel e2e suites green on the experimental backend."*
 
 Two identical runs per application: `[db.sqlite] engine = "sqlite"`
-(rusqlite, the production default — the **control**) and
-`engine = "turso"` (experimental, litewire-turso, engine pinned `=0.7.0`).
+(rusqlite, the then-production default — the **control**) and
+`engine = "turso"` (litewire-turso, engine pinned `=0.7.0`).
 Same binary, same image, same scripts, same order; only the `engine` line
 in the config differs. One fresh ePHPm container (fresh DB file) per
 {app} × {engine} cell.
+
+> **Historical (pre-v0.7.0).** This gate compared the Turso engine against
+> the rusqlite control. In v0.7.0 rusqlite was removed and Turso became the
+> only engine (`engine = "sqlite"` now hard-errors) — so the `engine` knob
+> and the control lane below no longer exist. Kept as gate-5 evidence.
 
 ## Verdict
 

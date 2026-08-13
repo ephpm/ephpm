@@ -1,6 +1,10 @@
-//! Primary election for clustered `SQLite` (sqld).
+//! Primary election for clustered `SQLite`.
 //!
-//! Uses the gossip KV tier to elect a primary node for sqld replication.
+//! Uses the gossip KV tier to elect a primary node for replication. As of
+//! v0.7.0 the consumer is the in-process Turso CDC path (`turso_cdc.rs`); the
+//! election itself is engine-agnostic, and `ElectedRole::Replica`'s
+//! `primary_grpc_url` field carries whatever address peers must dial to reach
+//! the primary (the primary's cluster-channel address in the CDC path).
 //! The lowest-ordinal alive node wins. The primary heartbeats its claim
 //! every 5 seconds with a 10-second TTL. On primary failure, the next
 //! lowest-ordinal node promotes itself.

@@ -115,6 +115,13 @@ the test is saturated before concluding it didn't work.
 
 ## `SQLITE_BUSY` is the clustered write ceiling
 
+> **Historical (pre-v0.7.0).** This finding and the write-admission
+> section that follows describe the sqld sidecar and its `write_permits`
+> knob, both **removed in v0.7.0**. The single-writer collapse below is
+> exactly why the clustered path moved to the in-process Turso CDC path
+> (MVCC, concurrent writers) — this is the evidence behind that switch,
+> not current behavior. `write_permits` is no longer a config knob.
+
 Benchmarking the two clustered SQLite paths against each other for
 v0.6.0 turned up a hard limit in the **shipping** one. Clustered SQLite
 (the sqld sidecar) does not degrade gracefully under concurrent writes —

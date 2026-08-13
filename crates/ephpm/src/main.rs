@@ -918,8 +918,8 @@ fn run_with_config(
             // PHP's read is enough to swap in `extension=` or
             // `auto_prepend_file=`.
             //
-            // Same shape as the sqld binary extraction in `ephpm-sqld`:
-            // mkdtemp (O_EXCL, never a reused path), 0700, then `create_new`
+            // Same private-tempdir shape used elsewhere for extracting a
+            // sensitive file: mkdtemp (O_EXCL, never a reused path), 0700, then `create_new`
             // so the open still refuses to follow a symlink or clobber an
             // existing file. The `TempDir` guard owns the cleanup and must
             // outlive PHP's read, so it is what the caller holds on to.

@@ -1,9 +1,10 @@
 # Cluster Channel — the shared cluster data plane
 
 > **Status: EXPERIMENTAL-adjacent, v1 shipped alongside Turso CDC.**
-> The transport is implemented and used by `cdc_experimental`; a
-> config without any opt-in channel feature is byte-identical to a
-> config from before — no socket, no task, no log noise.
+> The transport is implemented and used by clustered SQLite (Turso CDC
+> replication); a single-node config uses no channel feature and is
+> byte-identical to a config from before — no socket, no task, no log
+> noise.
 
 ## The rule ePHPm's cluster stack follows
 
@@ -25,9 +26,9 @@ Concretely: gossip announces *"node A is primary for sqlite:default"*;
 the channel is what ships the actual transaction batches from A to its
 replicas. Gossip carries names; the channel carries payloads.
 
-Every existing feature already implicitly obeys this — the sqld
-integration ships WAL frames over gRPC (not gossip), the KV data plane
-uses a dedicated TCP protocol (not gossip) for large values. The
+Every existing feature already implicitly obeys this — Turso CDC ships
+transaction batches over the cluster channel (not gossip), the KV data
+plane uses a dedicated TCP protocol (not gossip) for large values. The
 cluster channel v1 makes the rule explicit and gives future features a
 single shared transport to reuse instead of each inventing one.
 
@@ -37,8 +38,9 @@ The channel listener is **only bound when at least one feature asks
 for it**. A v0.5.0 config that opts in to no channel feature ships
 the same startup as v0.4.x: no new socket, no background task, no log
 line above `debug!`. Adding `[cluster.channel]` to a config is not
-itself an opt-in — a feature elsewhere (today just
-`[db.sqlite.replication] cdc_experimental = true`) has to ask.
+itself an opt-in — a feature elsewhere (today just clustered SQLite:
+`[db.sqlite]` with clustering enabled, which replicates via Turso CDC)
+has to ask.
 
 The single source of truth is `ChannelFeatureFlags` in
 `crates/ephpm-cluster/src/cluster_channel.rs`. Adding a new
@@ -159,7 +161,7 @@ configured for at most 64 concurrent streams per connection.
 ## What rides the channel today
 
 CDC replication (`cdc/default`) and its cold-replica snapshot bootstrap
-(`snapshot/default`). Opt in with:
+(`snapshot/default`). Turn it on with:
 
 ```toml
 [cluster]
@@ -168,13 +170,12 @@ secret = "..."                # required — channel is fail-closed
 bind = "0.0.0.0:7946"
 
 [db.sqlite]
-engine = "turso"
-
-[db.sqlite.replication]
-cdc_experimental = true       # this is what turns the channel on
+path = "app.db"               # embedded Turso; clustering turns on CDC
 ```
 
-That's the complete opt-in. `[cluster.channel]` needs no entries at
+That's the complete opt-in — enabling `[cluster]` with `[db.sqlite]`
+selects Turso CDC replication, which is what binds the channel (there is
+no `cdc_experimental` flag anymore). `[cluster.channel]` needs no entries at
 all in the common case — the channel listens on `bind_port + 2` by
 (skipping gossip + 1 = 7947, the KV data-plane default)
 default and reuses `[cluster] secret`. Explicit `listen` /

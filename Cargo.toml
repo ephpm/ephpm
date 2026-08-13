@@ -94,7 +94,6 @@ ephpm-middleware-builtins = { path = "crates/ephpm-middleware-builtins" }
 ephpm-php = { path = "crates/ephpm-php" }
 ephpm-query-stats = { path = "crates/ephpm-query-stats" }
 ephpm-server = { path = "crates/ephpm-server" }
-ephpm-sqld = { path = "crates/ephpm-sqld" }
 
 # External — litewire (embedded SQLite wire protocol proxy)
 #
@@ -142,6 +141,13 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 # (2) `TxnBatch::commit_change_id()` returns `Option<i64>` instead of panicking
 # on an empty batch, and `apply_batch` reports an empty batch as an error.
 #
+# NOTE (v0.7.0): the write-admission / Hrana-client changelog entry below is
+# historical. ePHPm no longer enables `backend-hrana-client`, so
+# `HranaClient::write_permits` and the sqld single-writer collapse it mitigated
+# are no longer reachable from the ePHPm binary — the clustered path is Turso
+# CDC, and Turso is MVCC. The entry is retained only to document the pin's
+# lineage.
+#
 # On top of write admission control for the Hrana/sqld backend
 # (litewire#16): an opt-in write-permit semaphore (`HranaClient::write_permits`,
 # 0 = unlimited = default) that queues excess writers instead of letting sqld
@@ -187,7 +193,13 @@ ephpm-sqld = { path = "crates/ephpm-sqld" }
 # sqlparser, so a crafted identifier in SHOW CREATE TABLE / SHOW INDEX /
 # DESCRIBE becomes arbitrary SQL. 7a0b59c4 adds sanitize_identifier() and
 # applies it at every extraction site.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "e34c63928ed9", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "backend-rusqlite", "backend-hrana-client", "turso"] }
+# v0.7.0 is Turso-only: the `backend-rusqlite` (in-process SQLite C engine)
+# and `backend-hrana-client` (the client that talked to the now-removed sqld
+# sidecar) features are DELIBERATELY not enabled. litewire itself still ships
+# both — this is purely ePHPm de-linking them from the binary. The embedded
+# SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
+# frontend, independent of the removed Hrana *client*) is kept.
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "e34c63928ed9", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.0)

@@ -27,9 +27,8 @@ This document describes the full vision for ePHPm. The matrix below tracks what 
 | DB proxy (MySQL) | **Implemented** | Wire protocol, connection pooling, transparent forwarding to upstream MySQL |
 | DB proxy (PostgreSQL) | **Implemented** | Wire protocol, connection pooling, trust/md5/SCRAM auth, R/W splitting |
 | Read/write splitting | **Implemented** | `ephpm-db` routes reads to replicas, writes to primary |
-| Single-node SQLite | **Implemented** | `litewire` + `rusqlite` in-process; `pdo_mysql` clients connect transparently |
-| Clustered SQLite | **Implemented** | `litewire` + embedded `sqld` sidecar; WAL frame replication via gRPC |
-| sqld embedding | **Implemented** | Binary embedded via `include_bytes!()`; spawned per-role; auto-restart on role change |
+| Single-node SQLite | **Implemented** | `litewire` + the Turso engine in-process; `pdo_mysql` clients connect transparently |
+| Clustered SQLite | **Implemented — experimental** | `litewire` + in-process Turso CDC replication over the cluster channel (no sqld sidecar) |
 | Primary election | **Implemented** | Gossip KV tier (`kv:sqlite:primary`), lowest ordinal wins, TTL heartbeat |
 | KV store (single-node) | **Implemented** | RESP2 server (~30 Redis commands), TTL/expiry, DashMap-backed, SAPI bridge for zero-overhead PHP access |
 | KV store (clustering) | **Implemented** | Gossip discovery, `hash % nodes` key ownership, large-value replication (owner + N-1 replicas, async/sync, write-time only) |
@@ -291,8 +290,8 @@ password = "changeme"                 # admin UI auth (separate from node API au
 | Cluster membership | `chitchat` (Quickwit's SWIM gossip lib) |
 | KV key ownership | Custom — `hash(key)` modulo the sorted alive-node list, in `ephpm-cluster` (no external crate) |
 | MySQL/SQLite wire bridge | [`litewire`](https://github.com/ephpm/litewire) (path dep) — MySQL wire protocol → SQLite translation, query parsing via `sqlparser-rs` |
-| Embedded SQLite (single-node) | `rusqlite` (linked into `litewire`'s in-process backend) |
-| Embedded SQLite (clustered HA) | [`sqld`](https://github.com/tursodatabase/libsql) v0.24.32 — binary embedded via `include_bytes!()`, spawned per role, gRPC WAL frame replication |
+| Embedded SQLite (single-node) | [Turso engine](https://github.com/tursodatabase/turso) (linked into `litewire`'s in-process `turso` backend) |
+| Embedded SQLite (clustered HA, experimental) | In-process Turso CDC replication (`turso_cdc`) over the cluster channel — no separate binary |
 | MySQL upstream connection pooling | Custom pool in `ephpm-db` (R/W splitting, health checks) |
 | PostgreSQL protocol | Implemented in `ephpm-db` — wire protocol frontend, connection pooling, trust/md5/SCRAM auth, R/W splitting |
 | Query observability | Custom in `ephpm-query-stats` (digest tracker, normalizer state machine, slow-query log, Prometheus export) |
@@ -1347,47 +1346,34 @@ When `inject_env` is disabled, the developer manually points their app at the pr
 
 ---
 
-## Embedded Database (SQLite, litewire, sqld)
+## Embedded Database (SQLite via litewire + the Turso engine)
 
-ePHPm has three database paths, all transparent to PHP — apps connect to `127.0.0.1:3306` via `pdo_mysql` regardless of which path is active:
+ePHPm has two embedded-database paths, all transparent to PHP — apps connect to `127.0.0.1:3306` via `pdo_mysql` regardless of which is active:
 
-1. **DB Proxy** (`[db.mysql]`) — forwards MySQL wire traffic to a real MySQL/PostgreSQL upstream. Connection pooling, R/W splitting, health checks. (Covered in [§DB Proxy & Connection Pooling](#db-proxy--connection-pooling) above.)
-2. **Single-node SQLite** (`[db.sqlite]`) — `litewire` + `rusqlite` in-process. No external database, no separate process.
-3. **Clustered SQLite** (`[db.sqlite]` + `[cluster]`) — `litewire` plus a managed `sqld` child process. WAL frames replicated to replicas over gRPC.
+1. **DB Proxy** (`[db.mysql]` / `[db.postgres]`) — forwards MySQL/PostgreSQL wire traffic to a real upstream. Connection pooling, R/W splitting, health checks. (Covered in [§DB Proxy & Connection Pooling](#db-proxy--connection-pooling) above.)
+2. **Embedded Turso** (`[db.sqlite]`) — `litewire` + the in-process Turso engine. **Single-node** (one process opens the `.db` file) or **clustered** (Turso CDC replication over the cluster channel — experimental). No external database, no separate process.
 
-The same PHP code (and the same `DB_HOST=127.0.0.1` config) runs against all three.
+As of v0.7.0 the rusqlite (SQLite C engine) backend and the sqld sidecar were removed. The same PHP code (and the same `DB_HOST=127.0.0.1` config) runs against every path.
 
 ### Mode detection
 
-ePHPm picks a mode at startup based on config:
+ePHPm picks single-node vs clustered at startup based on config:
 
 - `replication.role = "primary"` or `"replica"` → clustered
 - `replication.role = "auto"` AND `cluster.enabled = true` → clustered (role chosen by election)
-- otherwise → single-node (rusqlite in-process)
+- otherwise → single-node (Turso in-process)
 
-In clustered/auto mode, ePHPm spawns `sqld` as a child process and watches for role changes via gossip. On failover, the role-change watcher sends `SIGTERM` to the running `sqld`, waits for shutdown, then re-spawns with the new args.
+In clustered/auto mode, ePHPm replicates in-process via the Turso CDC path and watches for role changes via gossip — there is no child process to spawn or restart.
 
 ### litewire — MySQL wire → SQLite translation
 
-[litewire](https://github.com/ephpm/litewire) is a standalone Rust library at `github.com/ephpm/litewire`. It accepts MySQL wire-protocol traffic on `:3306`, parses queries with `sqlparser-rs`, translates dialect-specific constructs to SQLite, and dispatches to a pluggable backend:
+[litewire](https://github.com/ephpm/litewire) is a standalone Rust library at `github.com/ephpm/litewire`. It accepts MySQL wire-protocol traffic on `:3306`, parses queries with `sqlparser-rs`, translates dialect-specific constructs to SQLite, and dispatches to its backend. ePHPm builds litewire with the `turso` backend — the in-process Turso engine holds the database file directly (zero network hops). In clustered mode the same in-process engine additionally exposes a change-data-capture stream that ePHPm ships to replicas.
 
-- **In single-node mode**, the backend is `rusqlite` — direct in-process file access. Zero network hops, zero serialization.
-- **In clustered mode**, the backend is an HTTP/Hrana client pointed at the local `sqld` instance. `sqld` holds the actual database file and replicates writes.
+ePHPm uses litewire as a library: `LiteWire::new(backend).mysql(addr).serve()`. The `TrackedBackend` wrapper in `crates/ephpm-server/src/tracked_backend.rs` decorates the backend with query-stats recording. Disable with `[db.analysis] query_stats = false`.
 
-ePHPm uses litewire as a library: `LiteWire::new(backend).mysql(addr).serve()`. The `TrackedBackend` wrapper in `crates/ephpm-server/src/tracked_backend.rs` decorates any backend with query-stats recording. Disable with `[db.analysis] query_stats = false`.
+### Clustered replication: Turso CDC (experimental)
 
-### sqld binary embedding
-
-`sqld` is Turso's standalone SQLite server binary. ePHPm embeds it directly into the `ephpm` binary via `include_bytes!()` so the single-binary distribution model is preserved.
-
-How it gets there:
-
-1. `cargo xtask release` downloads `sqld` v0.24.32 from Turso's GitHub Releases and exposes the path via `SQLD_BINARY_PATH`.
-2. `crates/ephpm-sqld/build.rs` reads `SQLD_BINARY_PATH` and emits an `include_bytes!()` for that file, plus the `sqld_embedded` cfg flag.
-3. At runtime, `ephpm-sqld` extracts the embedded bytes to a temp file, `chmod +x`'s it, and `Command::spawn()`s it with role-appropriate args.
-4. Health is polled via `/health` until ready before traffic flows.
-
-When `SQLD_BINARY_PATH` is unset (dev / stub builds), `ephpm-sqld` compiles in stub mode — `SqldProcess::spawn()` returns a clear error rather than silently doing nothing. This is gated by `#[cfg(sqld_embedded)]`.
+Clustered mode has no separate database-server binary. The primary's Turso engine exposes a `turso_cdc` change-data-capture stream; ePHPm tails it and ships per-transaction batches to replicas over the multiplexed [cluster channel](/roadmap/cluster-channel/). A cold replica first bootstraps from a snapshot (validated against a `CREATE`/`INSERT` allowlist), then resumes from the live stream. This path is experimental and manually validated on Linux/macOS.
 
 ### Primary election
 
@@ -1396,18 +1382,13 @@ In clustered mode with `role = "auto"`, primary election uses the gossip KV tier
 - Each candidate writes its node ordinal to the KV key `kv:sqlite:primary` with a TTL.
 - The lowest-ordinal live node wins.
 - The winner refreshes the key periodically (heartbeat); on failure, the TTL expires and the next-lowest live node takes over.
-- Followers watch the key; when they see a new owner, they restart `sqld` in replica mode and reconnect.
+- Followers watch the key; when they see a new owner, they reconnect to the new primary's cluster channel address and resume tailing its CDC stream.
 
 This shares the gossip / KV machinery already used for cross-node KV replication — there's no separate Raft cluster or external coordinator.
 
-### Windows note
+### Platform note
 
-`sqld` is not supported on Windows. Turso doesn't publish Windows binaries for it, so:
-
-- `cargo xtask release --target windows` errors out if you try to embed it.
-- `start_clustered_sqlite()` bails with a clear message on `#[cfg(target_os = "windows")]`.
-
-Single-node SQLite (rusqlite in-process) and the MySQL/PG DB proxy work fine on Windows. Only clustered SQLite is Linux/macOS-only.
+Single-node Turso and the MySQL/PG DB proxy work on all platforms, including Windows. Clustered Turso CDC is tested on Linux/macOS; on Windows it is untested.
 
 ---
 
@@ -1655,7 +1636,6 @@ ephpm/
 │   ├── ephpm-kv/               # Embedded KV store — DashMap, RESP2, TTL/expiry, gzip/zstd/brotli compression
 │   ├── ephpm-db/               # DB proxy — MySQL wire, connection pooling, R/W splitting
 │   ├── ephpm-cluster/          # Clustering — SWIM gossip (chitchat), hash%nodes key ownership, KV replication, SQLite primary election
-│   ├── ephpm-sqld/             # sqld embedding — binary extracted via include_bytes!, child process lifecycle, health checks
 │   ├── ephpm-query-stats/      # Query observability — SQL normalizer, digest tracker, slow query log, Prometheus metrics
 │   └── ephpm-e2e/              # E2E test harness — EXCLUDED from the workspace; runs in Docker via `cargo xtask e2e`
 ├── xtask/                      # Build & test tooling — `release`, `php-sdk`, `e2e`, `e2e-up`, `e2e-down`, `docs install/serve/build/check`
@@ -1683,8 +1663,8 @@ The original MVP — single binary, hyper + PHP, TOML config, WordPress demo —
 **Storage and data** — complete:
 
 - DB proxy (MySQL wire, connection pooling, R/W splitting)
-- Single-node SQLite via [litewire](https://github.com/ephpm/litewire) + `rusqlite`, transparent to PHP via `pdo_mysql`
-- Clustered SQLite via litewire + embedded `sqld` sidecar (gRPC WAL frame replication)
+- Single-node SQLite via [litewire](https://github.com/ephpm/litewire) + the in-process Turso engine, transparent to PHP via `pdo_mysql`
+- Clustered SQLite via litewire + in-process Turso CDC replication over the cluster channel (experimental; no sqld sidecar)
 - KV store: DashMap-backed, RESP2 protocol, gzip/zstd/brotli compression, SAPI bridge for in-process PHP access
 - Clustering: SWIM gossip (`chitchat`), `hash % nodes` key ownership, large-value KV replication (owner + N-1 replicas), SQLite primary election
 

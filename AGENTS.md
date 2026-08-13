@@ -186,7 +186,7 @@ The project has a working Cargo workspace. PHP embedding is fully implemented an
 - `ephpm php` subcommand provides a full PHP CLI passthrough (all standard flags work)
 - `ephpm service install|uninstall|start|stop` manages OS service registration on Linux (systemd) and Windows (SCM)
 
-ZTS PHP runs concurrently: each `spawn_blocking` thread auto-registers with TSRM and gets its own PHP context — no dedicated worker pool. Shipped subsystems beyond core embedding: in-process MySQL DB proxy with pooling, in-process KV store (RESP + SETNX), SWIM gossip clustering, single-node and clustered SQLite (litewire + optional sqld sidecar), primary election + failover restart, query stats with Prometheus metrics, and a native PHP session handler backed by the KV tier.
+ZTS PHP runs concurrently: each `spawn_blocking` thread auto-registers with TSRM and gets its own PHP context — no dedicated worker pool. Shipped subsystems beyond core embedding: in-process MySQL DB proxy with pooling, in-process KV store (RESP + SETNX), SWIM gossip clustering, single-node and clustered embedded Turso (litewire + the in-process Turso engine; clustered replicates via the in-process Turso CDC path — no sqld sidecar), primary election + failover, query stats with Prometheus metrics, and a native PHP session handler backed by the KV tier. As of v0.7.0 the rusqlite backend and sqld were removed — Turso is the only embedded SQLite-family engine.
 
 Native middleware shipped: a static builtin registry (`jwt`, `cors`, `ratelimit`, `security-headers` compiled into every binary) plus a dlopen C-ABI lane for out-of-tree modules — the Linux release binary is glibc-dynamic, so the dlopen lane (and `[php] extensions` shared-extension loading) works out of the box. Implementations live in `ephpm-middleware-builtins`; the `ephpm-middleware-*` crates are cdylib shells (their `declare!` exports collide if linked into one binary — never add them as server deps). Active roadmap items (specs landed, no code yet): OPcache clustering with per-vhost preload.
 
@@ -206,8 +206,6 @@ crates/
 │                       # PHP SAPI bindings
 ├── ephpm-cluster/      # Gossip clustering — chitchat (SWIM), consistent hash ring,
 │                       # two-tier KV replication, SQLite primary election
-├── ephpm-sqld/         # sqld binary embedding — include_bytes! extraction,
-│                       # SqldProcess lifecycle, failover restart
 ├── ephpm-query-stats/  # SQL normalizer + digest tracking + Prometheus metrics
 ├── ephpm-middleware/   # Middleware C ABI + Rust authoring kit + host table + builtin adapter
 ├── ephpm-middleware-builtins/  # The four in-tree middleware implementations (rlib, linked into the server)
