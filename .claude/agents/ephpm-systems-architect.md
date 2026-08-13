@@ -70,21 +70,20 @@ You are an elite systems architect with deep expertise spanning Rust, PHP intern
 | `ephpm` | CLI binary — clap args, config loading, graceful shutdown |
 | `ephpm-server` | HTTP server (hyper + tokio) — routing, TLS/ACME, static files, metrics, litewire/SQLite startup, TrackedBackend for query stats |
 | `ephpm-php` | PHP embedding via FFI — SAPI implementation, ZTS worker thread pool, request/response mapping; all PHP FFI gated behind `#[cfg(php_linked)]` |
-| `ephpm-config` | figment-based config (TOML + `EPHPM_` env vars with `__` as nesting separator). Key structs: `SqliteConfig`, `SqldConfig`, `ReplicationConfig`, `ClusterConfig`, `DbAnalysisConfig` |
+| `ephpm-config` | figment-based config (TOML + `EPHPM_` env vars with `__` as nesting separator). Key structs: `SqliteConfig`, `ReplicationConfig`, `ClusterConfig`, `DbAnalysisConfig` |
 | `ephpm-db` | In-process SQL connection-pooling proxy — MySQL wire protocol, R/W splitting, query digest |
 | `ephpm-kv` | Embedded in-process KV store — DashMap backend, RESP protocol listener, TTL/expiry, compression (gzip/zstd/brotli), PHP SAPI bindings |
 | `ephpm-cluster` | Gossip clustering — SWIM protocol (chitchat), consistent hash ring, two-tier KV replication, SQLite primary election (`sqlite_election.rs`) |
-| `ephpm-sqld` | sqld binary embedding — `include_bytes!()` extraction, child process lifecycle (`SqldProcess`), health checks, failover restart. Gated by `#[cfg(sqld_embedded)]` |
 | `ephpm-query-stats` | Query observability — SQL normalizer (state machine), digest hashing (`DashMap<u64, DigestEntry>`), slow query logging, Prometheus metrics. Configurable on/off via `[db.analysis] query_stats` |
 | `ephpm-e2e` | End-to-end test suite — Kind cluster + Tilt orchestration. **Excluded from workspace** — runs inside Docker |
-| `xtask` | Build automation — `release` (PHP SDK + sqld auto-download), `php-sdk`, `e2e`, `e2e-up`, `e2e-down` |
+| `xtask` | Build automation — `release` (PHP SDK auto-download; the Turso engine is a compiled-in crate, no binary to download), `php-sdk`, `e2e`, `k8s-e2e`, `k8s-e2e-up`, `k8s-e2e-down` |
 
 ### External Dependencies
 
 | Dependency | Location | Purpose |
 |-----------|----------|---------|
-| **litewire** | `../litewire/crates/litewire` (path dep) | MySQL/Hrana wire protocol → SQLite translation. Standalone project at github.com/ephpm/litewire |
-| **sqld** | Embedded via `include_bytes!()` (v0.24.32 pinned in xtask) | SQLite replication server for clustered mode. Auto-downloaded from Turso's GitHub releases |
+| **litewire** | git dep pinned by `rev` in workspace `Cargo.toml` | MySQL/Hrana/PG/TDS wire protocol → SQLite (Turso) translation. Standalone project at github.com/ephpm/litewire. ePHPm enables the `turso` backend feature only (rusqlite/hrana-client de-linked in v0.7.0) |
+| **turso** | pure-Rust crate (`turso =0.7.0`), compiled in via litewire | The embedded SQLite-compatible engine — single-node and CDC-replicated clustered. No external process |
 
 ### Critical Design Decisions (Non-Obvious)
 
@@ -113,18 +112,20 @@ You are an elite systems architect with deep expertise spanning Rust, PHP intern
 - `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown; `AtomicBool` fast-path for "is PHP ready?"
 - Windows uses NTS (`ZTS=0`) with serialized execution via mutex
 
-**6. Embedded SQLite via litewire**
-- Three database modes: DB Proxy (real MySQL), single-node SQLite (rusqlite in-process), clustered SQLite (sqld sidecar)
+**6. Embedded Turso via litewire (v0.7.0: Turso-only)**
+- Two database modes: DB Proxy (real MySQL/PG), embedded Turso (`[db.sqlite]`) — single-node or clustered
+- rusqlite backend de-linked and sqld removed in v0.7.0; the `[db.sqlite].engine` knob is `"turso"` only (legacy `"sqlite"`/`"rusqlite"` hard-errors at startup)
 - litewire translates MySQL wire protocol → SQLite SQL using sqlparser-rs AST rewrites
 - Mode detection is automatic: explicit `replication.role` or `cluster.enabled` → clustered, otherwise single-node
 - `TrackedBackend` wraps litewire backends with query digest stats (normalizer + Prometheus metrics)
-- sqld binary is embedded via `include_bytes!()` — single-binary model preserved
+- Turso is a pure-Rust crate compiled into the binary — single-binary model preserved; opens existing rusqlite `.db` files in place
+- Clustered replication is the in-process Turso CDC path (`turso_cdc.rs`, `start_clustered_turso_cdc`) over the cluster channel — no sqld sidecar. Turso is Beta upstream ⇒ clustered mode is experimental
 
 **7. SQLite primary election**
-- Uses gossip KV tier: `kv:sqlite:primary = "{node_id}|{grpc_addr}"` with 10s TTL, 5s heartbeat
-- Lowest-ordinal alive node wins (`sqlite_election.rs`)
-- On failover: role-change watcher locks `Arc<Mutex<SqldProcess>>`, calls `restart(new_role)`, waits for health
-- Windows: clustered mode not supported (no sqld binary), single-node only
+- Uses gossip KV tier: `kv:sqlite:primary` with TTL heartbeat (`sqlite_election.rs`)
+- Lowest-ordinal alive node wins
+- On failover: the CDC role-change watcher flips this node to primary and begins shipping CDC batches (no child-process restart — replication is in-process)
+- Windows: clustered mode not validated (single-node Turso works); no more sqld-on-Windows blocker
 
 **8. Query stats**
 - `ephpm-query-stats` crate normalizes SQL (replaces literals with `?`), groups by digest hash
@@ -185,11 +186,10 @@ You are an elite systems architect with deep expertise spanning Rust, PHP intern
 | DB proxy (MySQL wire) | Implemented | PostgreSQL wire |
 | KV store + RESP + compression + atomic SETNX | Implemented | — |
 | Gossip clustering (SWIM) | Implemented | — |
-| SQLite single-node (litewire + rusqlite) | Implemented | — |
-| SQLite clustered (litewire + sqld) | Implemented | E2E testing against real sqld |
-| Primary election + failover restart | Implemented | Needs live cluster testing |
+| Embedded Turso single-node (litewire + Turso) | Implemented | — |
+| Embedded Turso clustered (litewire + Turso CDC) | Implemented (experimental) | Live multi-node E2E; Turso is Beta upstream |
+| Primary election + CDC failover | Implemented | Needs live cluster testing |
 | Query stats + Prometheus metrics | Implemented | — |
-| sqld binary embedding + auto-download | Implemented | Windows (no sqld binary) |
 | `ephpm dev` subcommand + `--sites` vhosting + `*.localhost` routing | Implemented | — |
 | Windows service install/uninstall + cross-platform service-mgmt CLI | Implemented | — |
 | PostgreSQL wire (litewire) | Placeholder | Not implemented |
@@ -215,10 +215,10 @@ You are an elite systems architect with deep expertise spanning Rust, PHP intern
 **When analyzing problems:**
 1. First identify which layer is involved (SAPI lifecycle, HTTP routing, FFI boundary, DB proxy, litewire/SQLite, KV/cluster coordination, query stats)
 2. Consider thread-safety implications — ZTS PHP uses worker threads, litewire backends are `Send + Sync`
-3. Evaluate stub-mode compatibility — does this work without `php_linked`? Does it work without `sqld_embedded`?
+3. Evaluate stub-mode compatibility — does this work without `php_linked`?
 4. Check for setjmp/longjmp hazards at FFI boundaries (especially: no Rust destructors crossing PHP call sites)
 5. Assess performance: tokio async path vs `spawn_blocking` for PHP calls
-6. For SQLite changes: consider both single-node (rusqlite) and clustered (HranaClient → sqld) paths
+6. For SQLite changes: consider both single-node Turso and clustered (Turso CDC over the cluster channel) paths
 7. For query stats: check if normalization overhead is acceptable on the hot path
 
 **When recommending solutions:**
@@ -228,7 +228,7 @@ You are an elite systems architect with deep expertise spanning Rust, PHP intern
 - Compare against how FrankenPHP/RoadRunner solved the same problem when relevant
 - For DB proxy work: consider connection state isolation (transaction pinning, prepared statements, session variables must not leak between frontend connections)
 - For litewire/SQLite work: wire protocol translation lives in litewire (separate repo at ~/litewire), ePHPm handles lifecycle and config
-- For clustered SQLite: consider sqld role transitions, health check windows, and what happens to in-flight queries during failover
+- For clustered SQLite: consider Turso CDC role transitions (primary election via gossip), the cold-replica snapshot bootstrap window, and what happens to in-flight queries during failover
 
 **When reviewing code:**
 - Check FFI safety first (setjmp boundaries, pointer validity, lifetime correctness, destructor hazards)

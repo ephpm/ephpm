@@ -1,11 +1,14 @@
 # Turso Engine Phase 2 — CDC-Native Replication (implementation notes)
 
 Companion to [turso-phase1-results.md](turso-phase1-results.md) and the
-[roadmap page](../site/content/roadmap/turso-engine.md). Phase 2 is
-gated on upstream GA (roadmap gate 1, currently **not met**) for
-promotion to a default; the **experimental** implementation described
-below has landed behind an opt-in knob so we can gather the operational
-evidence needed for gate 5 (WordPress/Laravel e2e).
+[roadmap page](../site/content/roadmap/turso-engine.md).
+
+> **v0.7.0 update:** the sqld sidecar was removed and this CDC path became
+> the **only** clustered path — the `cdc_experimental` opt-in knob it
+> originally landed behind is gone; enabling clustering with `[db.sqlite]`
+> selects CDC unconditionally. It remains **experimental** (the Turso
+> engine is Beta upstream, gate 1 still not met; clustered CDC is manually
+> validated on Linux/macOS). The notes below describe the design as built.
 
 ## Empirical corrections to the original design (2026-07-14)
 

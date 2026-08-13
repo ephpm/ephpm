@@ -38,10 +38,8 @@ in every one of its modes:
 
 | Configuration | Bridge available |
 |---|---|
-| `[db.sqlite]`, single-node, `engine = "sqlite"` | Yes |
-| `[db.sqlite]`, single-node, `engine = "turso"` | Yes |
-| `[db.sqlite]` + `[cluster]`, sqld path | Yes |
-| `[db.sqlite]` + `[cluster]`, CDC-native path | Yes |
+| `[db.sqlite]`, single-node (Turso, in-process) | Yes |
+| `[db.sqlite]` + `[cluster]`, clustered Turso CDC path | Yes |
 | `[db.mysql]` / `[db.postgres]` proxy only | **No** |
 | No `[db.*]` block at all | **No** |
 
@@ -220,10 +218,10 @@ a warning in the log every time. Commit or roll back explicitly.
 
 ### Recovery from a dead connection
 
-If the backend connection dies underneath a thread — a sqld restart during
-clustered failover, say — the failing call surfaces the error to PHP, and
-the session is dropped so the *next* call reconnects. This mirrors how a
-wire client recovers by reconnecting.
+If the backend connection dies underneath a thread — during a clustered
+failover, say — the failing call surfaces the error to PHP, and the session
+is dropped so the *next* call reconnects. This mirrors how a wire client
+recovers by reconnecting.
 
 Ordinary SQL errors never recycle the session; that would discard live
 transaction state on every constraint violation. Nor does ePHPm recycle
@@ -285,7 +283,7 @@ Nothing about the bridge deprecates `pdo_mysql` on `127.0.0.1:3306`.
 ## See also
 
 - [PHP packages](/reference/php-packages/) — the DB and cache adapters, drop-ins, and shims
-- [Database engines](/architecture/database/engines/) — `engine = "sqlite"` vs `"turso"`
+- [Database engines](/architecture/database/engines/) — the embedded Turso engine
 - [KV from PHP](/guides/kv-from-php/) — the sibling `ephpm_kv_*` functions
 - [Configuration reference → `[db.sqlite]`](/reference/config/#dbsqlite)
 - [Query stats with Prometheus](/guides/query-stats-prometheus/) — bridge queries are recorded too

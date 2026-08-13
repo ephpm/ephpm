@@ -490,7 +490,7 @@ spec:
     - name: data
       port: 7947
       protocol: TCP
-    # Only needed with experimental CDC replication (cdc_experimental):
+    # Only needed with clustered SQLite (Turso CDC replication):
     # - name: cluster-channel
     #   port: 7948
     #   protocol: TCP
@@ -574,9 +574,9 @@ This is **symmetric pre-shared-key authentication, not mutual TLS**. There are n
 
 #### Cluster Channel (TCP, opt-in)
 
-Opt-in cluster features — today, experimental CDC-native Turso replication and its snapshot bootstrap (`[db.sqlite.replication] cdc_experimental = true`) — share one additional multiplexed TCP listener, the [cluster channel](/roadmap/cluster-channel/). It binds **only when a feature asks for it** (default port: gossip port + 2, so `7948`; override with `[cluster.channel] listen`) — configs without such a feature open no extra port and are byte-identical to before.
+Opt-in cluster features — today, clustered SQLite's Turso CDC replication and its snapshot bootstrap (enabled whenever `[db.sqlite]` runs with clustering on) — share one additional multiplexed TCP listener, the [cluster channel](/roadmap/cluster-channel/). It binds **only when a feature asks for it** (default port: gossip port + 2, so `7948`; override with `[cluster.channel] listen`) — configs without such a feature open no extra port and are byte-identical to before.
 
-Security is one step stronger than the KV data plane: before any payload flows, both sides complete a **mutual challenge/response handshake** (each proves possession of the secret by sealing the other's challenge), and every post-handshake byte is sealed under a **per-session key** derived from the handshake transcript — so a recorded session cannot be replayed into a new one. Inbound connections are additionally checked against live gossip membership before the handshake is attempted. Like the other planes this is symmetric PSK, not mTLS: there is no per-node identity, and any holder of the secret is a full peer. `[cluster.channel] secret` can override the key for this plane alone; firewall guidance: open TCP 7948 between nodes only when `cdc_experimental` is enabled.
+Security is one step stronger than the KV data plane: before any payload flows, both sides complete a **mutual challenge/response handshake** (each proves possession of the secret by sealing the other's challenge), and every post-handshake byte is sealed under a **per-session key** derived from the handshake transcript — so a recorded session cannot be replayed into a new one. Inbound connections are additionally checked against live gossip membership before the handshake is attempted. Like the other planes this is symmetric PSK, not mTLS: there is no per-node identity, and any holder of the secret is a full peer. `[cluster.channel] secret` can override the key for this plane alone; firewall guidance: open TCP 7948 between nodes only when clustered SQLite (Turso CDC replication) is in use.
 
 The shared secret is the only security config — one value to set across all nodes, covering every plane.
 

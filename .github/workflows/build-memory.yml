@@ -253,7 +253,7 @@ jobs:
           Write-Host "cargo         = $($cargoCmd.Source)"
 
           $proc = Start-Process -FilePath $cargoCmd.Source `
-            -ArgumentList @("xtask","release","${{ inputs.php_minor }}","--target","windows","--no-sqld") `
+            -ArgumentList @("xtask","release","${{ inputs.php_minor }}","--target","windows") `
             -NoNewWindow -PassThru
 
           # Touch .Handle BEFORE the process exits. .NET can only report

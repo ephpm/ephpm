@@ -407,7 +407,7 @@ jobs:
           # made heavier by codegen-units=1 + opt-level=3. 32 MiB clears it.
           # linux-aarch64 compiles sqlparser fine, so this is windows-only.
           RUST_MIN_STACK: "33554432"
-        run: cargo xtask release ${{ matrix.php_minor }} --target windows --no-sqld
+        run: cargo xtask release ${{ matrix.php_minor }} --target windows
 
       - name: Package archive
         id: pkg

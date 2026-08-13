@@ -53,7 +53,7 @@ Download `ephpm.exe` from [Releases](https://github.com/ephpm/ephpm/releases). I
 
 Installs to `C:\Program Files\ephpm\`, adds to `PATH`, registers a Windows service, and starts it.
 
-> **Note:** Clustered SQLite (sqld) is not available on Windows. Single-node SQLite and the DB proxy work fully.
+> **Note:** Single-node Turso and the DB proxy work fully on Windows. Clustered (Turso CDC replication) mode is experimental and not validated on Windows.
 
 ### Manage the service
 
@@ -160,14 +160,16 @@ Back up with cloud volume snapshots (Kubernetes PVCs, EBS snapshots, disk images
 path = "app.db"
 ```
 
-### 3. Need HA? Use clustered SQLite
+### 3. Need HA? Use clustered Turso replication (experimental)
 
-For multi-node high availability, ePHPm embeds [sqld](https://github.com/tursodatabase/libsql) (Turso's SQLite server) inside the binary. sqld is extracted and spawned as a managed child process at startup — the single-binary model is preserved. Replication happens automatically via WAL frame streaming over gRPC.
+For multi-node high availability, ePHPm replicates the embedded Turso database in-process — no sidecar, no extra binary. The primary's change-data-capture (CDC) stream is tailed and per-transaction batches are shipped to replicas over ePHPm's authenticated cluster channel; cold replicas bootstrap from a logical snapshot. The single-binary model is preserved end to end.
 
-- **Primary node** — accepts writes, streams WAL frames to replicas
-- **Replica nodes** — serve reads locally, forward writes to primary
+- **Primary node** — accepts writes, ships CDC batches to replicas
+- **Replica nodes** — serve reads locally, apply the primary's CDC stream
 - **Primary election** — automatic via ePHPm's gossip layer (lowest-ordinal live node wins)
-- **Failover** — gossip detects failure, next node promotes, sqld restarts in primary mode
+- **Failover** — gossip detects failure, the next node promotes and begins shipping CDC
+
+> The Turso engine is Beta upstream, so clustered mode is **experimental**. Single-node Turso is the stable default.
 
 ```toml
 [db.sqlite]
@@ -184,12 +186,12 @@ join = ["ephpm-headless.default.svc.cluster.local"]
 ### How it works under the hood
 
 ```
-PHP (pdo_mysql) → litewire (MySQL wire :3306) → SQL Translator → SQLite backend
+PHP (pdo_mysql) → litewire (MySQL wire :3306) → SQL Translator → Turso engine (in-process)
 ```
 
 [litewire](https://github.com/ephpm/litewire) translates MySQL wire protocol and SQL dialect to SQLite on the fly using `sqlparser-rs`. It's a standalone open-source project — works outside of ePHPm too.
 
-In single-node mode, the backend is `rusqlite` (in-process, zero overhead). In clustered mode, it switches to an HTTP client talking to the local sqld instance. Either way, PHP sees a MySQL server at `127.0.0.1:3306`.
+The backend is the in-process [Turso](https://github.com/tursodatabase/turso) engine (a pure-Rust SQLite rewrite) in both single-node and clustered mode — PHP always sees a MySQL server at `127.0.0.1:3306`. Existing rusqlite/SQLite `.db` files open in place (a cleanly-shut-down database upgrades with no dump/reload).
 
 See the [database architecture docs](site/content/architecture/database/_index.md) for the full architecture, failover details, and configuration reference.
 
@@ -343,7 +345,6 @@ crates/
 ├── ephpm-config/    Configuration — figment, TOML + env var overrides
 ├── ephpm-kv/        Embedded KV store — DashMap, RESP2 protocol, TTL/expiry, compression
 ├── ephpm-db/        DB proxy — MySQL wire protocol, connection pooling
-├── ephpm-sqld/      sqld embedding — binary extraction, process lifecycle, health checks
 └── ephpm-cluster/   Clustering — SWIM gossip (chitchat), consistent hash ring, SQLite election
 ```
 
@@ -351,7 +352,7 @@ Key design decisions:
 - **Conditional compilation** — All PHP FFI code is gated behind `#[cfg(php_linked)]`. Stub mode compiles and tests without a PHP SDK.
 - **C wrapper for safety** — PHP uses `setjmp`/`longjmp` for error handling. All Rust→PHP calls go through `ephpm_wrapper.c` with `zend_try`/`zend_catch` guards to prevent stack corruption.
 - **Async I/O, blocking PHP** — tokio handles HTTP connections. PHP execution runs on `spawn_blocking` threads (ZTS).
-- **litewire for SQL** — wire protocol translation is a separate concern; litewire handles it as a library, ePHPm manages the sqld lifecycle and config.
+- **litewire for SQL** — wire protocol translation is a separate concern; litewire handles it as a library (MySQL/PG/TDS wire → the in-process Turso engine), ePHPm manages the database lifecycle, replication, and config.
 
 ## Contributing
 
@@ -425,7 +426,7 @@ The default `cargo xtask e2e` spawns bare ephpm processes on 127.0.0.1 — no co
 - [DB proxy](https://ephpm.dev/architecture/db-proxy/) — MySQL wire protocol, connection pooling, query analysis
 - [Kubernetes deployment](https://ephpm.dev/architecture/kubernetes/) — Helm chart, StatefulSet, gossip DNS
 - [Observability](https://ephpm.dev/architecture/metrics/) — Prometheus metrics, histogram buckets, phased rollout
-- [Embedded SQL](https://ephpm.dev/architecture/sql/) — litewire integration, sqld lifecycle, single-node vs HA
+- [Embedded SQL](https://ephpm.dev/architecture/sql/) — litewire integration, Turso engine, single-node vs clustered CDC
 - [Competitive analysis](https://ephpm.dev/analysis/) — FrankenPHP, RoadRunner, Swoole comparisons
 
 ## Related Projects

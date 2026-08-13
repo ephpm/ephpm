@@ -54,7 +54,7 @@ Download the Windows `.tar.gz` archive from [Releases](https://github.com/ephpm/
 
 Installs to `C:\Program Files\ephpm\`, adds the directory to the system `PATH`, registers a Windows service, and starts it.
 
-> Clustered SQLite (sqld) isn't available on Windows — Turso doesn't publish a Windows binary. Single-node SQLite, the MySQL/Postgres proxy, and everything else work normally.
+> Single-node SQLite (the in-process Turso engine), the MySQL/Postgres proxy, and everything else work normally on Windows. Clustered SQLite (Turso CDC replication) is untested on Windows.
 
 ## Manage the service
 

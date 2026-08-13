@@ -61,7 +61,7 @@ WordPress is CPU-bound during PHP execution. SQLite adds minimal overhead.
 
 | Component | Size |
 |-----------|------|
-| ephpm binary (release, with PHP + sqld) | ~35-50 MB |
+| ephpm binary (release, with PHP + embedded Turso engine) | ~35-50 MB |
 | WordPress installation | ~60-80 MB |
 | SQLite database (typical blog) | 10-100 MB |
 | SQLite WAL file (during writes) | Up to DB size |
@@ -215,4 +215,4 @@ Since there's no MySQL server, backups are simpler:
 - **Litestream** — continuous SQLite replication to S3/GCS/Azure Blob. Sub-second RPO. Free, open-source.
 - **Disk-level backups** — rsync, restic, borgbackup on the data directory.
 
-For clustered mode, sqld's "bottomless replication" can continuously stream WAL to S3 for near-zero data loss.
+For clustered mode (experimental Turso CDC replication), each replica holds a full local copy of the database, so the loss of any single node does not lose committed data already shipped downstream.

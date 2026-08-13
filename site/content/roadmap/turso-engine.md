@@ -1,27 +1,30 @@
 # Turso Engine — One Database Engine for Both Modes
 
-> **Status: Phases 1 and 2 have SHIPPED as experimental opt-ins. Phase 3
-> (making Turso the default) is DESIGN, gated on upstream GA.**
+> **Status: SHIPPED in v0.7.0. Turso is now the only embedded engine.**
+> Single-node Turso is the default; clustered replication is the
+> in-process Turso CDC path (**experimental**). The rusqlite (SQLite C
+> engine) backend and the sqld sidecar were **removed** — legacy
+> `[db.sqlite] engine = "sqlite"` / `"rusqlite"` is now a hard startup
+> error, and there is no longer a `cdc_experimental` opt-in flag
+> (clustering always uses CDC).
 >
-> As of v0.6.3 you can select the Turso engine with
-> `[db.sqlite] engine = "turso"` (single-node), and the CDC-native
-> clustered replication path with
-> `[db.sqlite.replication] cdc_experimental = true`. Both warn loudly at
-> startup and are **not for production data** — Turso Database is Beta
-> upstream, multiprocess support and `VACUUM` are still missing, and
-> upstream does not yet position it as a production SQLite replacement.
-> The default engine is unchanged (`"sqlite"`, the genuine SQLite C
-> engine) and all five [decision gates](#decision-gates--all-of-them-no-exceptions)
-> below remain open.
+> The default swap (Phase 3 below) was driven forward in v0.7.0 by the
+> security case — removing the rusqlite backend removes the cross-tenant
+> `ATTACH` primitive from the shipped binary. Turso Database is still Beta
+> upstream (multiprocess and `VACUUM` remain unsupported), so single-node
+> Turso ships "eyes open" and clustered CDC is explicitly experimental. Of
+> the five [decision gates](#decision-gates--all-of-them-no-exceptions)
+> below, the file-format round-trip (gate 3) is now **MET**; the rest are
+> tracked there.
 >
-> For the user-facing description of what shipped — how to enable it,
-> the exact startup warning, and what is unsupported — see
+> For the user-facing description — how it behaves, its limits, and
+> file-format compatibility — see
 > [Database engines](/architecture/database/engines/). This page is the
 > plan, the evidence, and the risks.
 
 ## The thesis
 
-ePHPm currently runs two SQLite lineages:
+Before v0.7.0, ePHPm ran two SQLite lineages:
 
 - **Single-node**: the genuine SQLite C engine, compiled into the binary
   via rusqlite's `bundled` feature, behind litewire's wire-protocol
@@ -30,10 +33,10 @@ ePHPm currently runs two SQLite lineages:
   child process, doing page-level WAL replication over gRPC.
 
 [Turso Database](https://github.com/tursodatabase/turso) — the ground-up
-Rust rewrite of SQLite (MIT) — plausibly replaces **both** with one
-in-process engine:
+Rust rewrite of SQLite (MIT) — replaced **both** with one in-process
+engine, which is what v0.7.0 ships:
 
-| Today | With the Turso engine |
+| Before v0.7.0 | With the Turso engine (v0.7.0) |
 |---|---|
 | SQLite C via FFI, blocking calls on tokio's pool | Rust-native engine, native async I/O |
 | Single writer; per-connection WAL + busy_timeout | MVCC concurrent writes |
@@ -51,8 +54,8 @@ the single-binary story: clustered SQLite with **no child processes**.
 
 Turso has refocused on the rewrite: libSQL/sqld remain maintained but
 feature-frozen, and page-level edge replicas are being discontinued for
-new cloud users. Our pinned sqld (v0.24.32) keeps working, but it is a
-sunset dependency — no new ePHPm feature should deepen it. The
+new cloud users. The old pinned sqld (v0.24.32) still worked, but it was
+a sunset dependency — so v0.7.0 removed it rather than deepening it. The
 replacement primitive Turso built (CDC + open sync protocol) is a better
 foundation for a project that wants to own its cluster layer than the
 black-box sidecar ever was.
@@ -69,27 +72,25 @@ black-box sidecar ever was.
   2026-07-14: `v0.7.0` non-pre is out on crates.io; upstream positioning
   is still Beta and multiprocess/vacuum are still experimental flags —
   gate 1 remains open.)
-- SQLite file-format compatibility is claimed; must be verified by us
-  (see gates) before any migration story is written.
+- SQLite file-format compatibility is claimed by upstream. **Verified by
+  us (gate 3, now MET):** existing rusqlite/sqlite3 `.db` files open in
+  place for cleanly-shut-down databases (WAL and rollback-journal), so the
+  0.6.x → 0.7.0 upgrade needs no dump/reload. Caveats in the gates section.
 
 ## Plan
 
 ### Phase 1 — experimental backend (can start before GA)
 
-> **Status: SHIPPED (experimental), 2026-07.** litewire has a
-> `litewire-turso` backend (facade feature `turso`, off by default;
-> engine pinned `turso =0.7.0`) and ePHPm exposes it as
-> `[db.sqlite] engine = "turso"` — single-node only, rejected in
-> clustered mode, warns at startup. Gate 2–4 evidence lives in
-> `docs/turso-phase1-results.md`; Phase 2 design notes in
-> `docs/turso-phase2-cdc-design.md`. Gates 1 and 5 remain open and the
-> default engine is unchanged.
+> **Status: SHIPPED, 2026-07; became the default and only engine in
+> v0.7.0.** litewire has a `litewire-turso` backend (engine pinned
+> `turso =0.7.0`) and ePHPm builds it as the sole embedded engine.
+> Gate 2–4 evidence lives in `docs/turso-phase1-results.md`; Phase 2
+> design notes in `docs/turso-phase2-cdc-design.md`.
 
-A `turso-backend` crate in litewire beside `rusqlite-backend`, behind a
-feature flag and an explicit opt-in config knob marked **experimental**
-(additive knob: v0.4.x-compatible under the versioning policy). The
-`Backend`/`BackendConn` trait split shipped in July 2026 is exactly the
-seam this needs. Deliverable is *data*, not adoption:
+The `turso-backend` crate in litewire sits beside its other backends
+(rusqlite stays in litewire for other consumers; ePHPm no longer enables
+it). The `Backend`/`BackendConn` trait split shipped in July 2026 was
+exactly the seam this needed. Deliverable was *data*, not adoption:
 
 - The existing DB latency matrix (point SELECT, insert, connect) —
   Turso engine vs rusqlite vs MySQL baselines.
@@ -110,21 +111,24 @@ seam this needs. Deliverable is *data*, not adoption:
   integrity check) — beta engines earn trust here or nowhere.
   **Not started.**
 
-### Phase 2 — CDC-native replication (**experimental implementation available; gated on GA for default**)
+### Phase 2 — CDC-native replication (**shipped; became the only clustered path in v0.7.0**)
 
 Replace the sqld sidecar: litewire tails the engine's CDC stream on the
 primary; ePHPm's cluster layer ships changes to replicas (own transport
 or Turso's open sync protocol — decide on measured simplicity). Election
-and failover machinery is unchanged. sqld support enters deprecation
-with a full release cycle of overlap.
+and failover machinery is unchanged. In v0.7.0 sqld was removed outright
+rather than run through a deprecation-with-overlap cycle, because dropping
+the rusqlite backend in the same release already made `engine = "sqlite"`
+(the config that selected sqld's clustered path) a hard error.
 
-**Status (2026-07-14): experimental implementation landed behind
-`[db.sqlite.replication] cdc_experimental = true`.** Enabling it (with
-`engine = "turso"` + `[cluster] enabled = true`) selects a CDC-native
-replication path that runs a `litewire::litewire_turso::cdc::CdcTailer`
-on the primary and applies batches to replicas via `apply_batch` — no
-sqld sidecar, no child process, no gRPC. sqld remains the production
-clustered default for `engine = "sqlite"`.
+**Status (2026-07-14): experimental implementation landed; in v0.7.0 it
+became the only clustered path.** Enabling clustering with `[db.sqlite]`
+selects a CDC-native replication path that runs a
+`litewire::litewire_turso::cdc::CdcTailer` on the primary and applies
+batches to replicas via `apply_batch` — no sqld sidecar, no child
+process, no gRPC. The old `cdc_experimental` opt-in flag was removed in
+v0.7.0: with sqld gone there is no alternative clustered path to opt out
+to.
 
 **Headline empirical finding (from building this):** Turso 0.7.0 CDC
 captures DDL. `CREATE TABLE`/`CREATE INDEX`/`ALTER TABLE ADD COLUMN`/
@@ -153,16 +157,17 @@ path is a **single ordered stream** with no schema-sync side channel.
   challenge/response handshake and per-connection sealing of every
   post-handshake byte. CDC is registered as stream type `cdc/<vhost>`
   and snapshot bootstrap as `snapshot/<vhost>`. The channel only binds
-  when a feature asks — configs without `cdc_experimental` are
-  byte-identical to before.
+  when a feature asks — single-node configs (no clustering) open no extra
+  port and are byte-identical to before.
 - Cold-replica snapshot bootstrap over `snapshot/<vhost>`: an online
   logical dump captured under one read view, plus the aligned
   watermark. Served only by the elected primary, size-capped by
   `[db.sqlite.replication] max_snapshot_bytes`, and validated against a
   `CREATE`/`INSERT` statement allowlist before it is applied.
-- Additive config knob: `cdc_experimental` defaults to `false`;
-  `engine = "turso"` + clustered mode without it is still a hard startup
-  error pointing at the knob. v0.4.x-compatible under versioning policy.
+- Snapshot size cap: `[db.sqlite.replication] max_snapshot_bytes`
+  bounds the cold-replica bootstrap payload (still used by the CDC
+  path). *(The `cdc_experimental` opt-in knob that originally gated this
+  path was removed in v0.7.0 — clustering always uses CDC now.)*
 - **Schema replay is allowlisted (v0.6.2, litewire#17).** A CDC batch
   carrying a `sqlite_schema` row used to have its stored `sql` text run
   directly, so a peer whose frames reached `apply_batch` could run
@@ -252,10 +257,17 @@ path is a **single ordered stream** with no schema-sync side channel.
 
 ### Phase 3 — default engine (a major-version decision)
 
-Swapping the single-node default off the genuine SQLite C engine is the
-last step and the highest bar: it changes what user data sits on. It
-does not happen before the gates below, and per the versioning policy it
-is a new-minor (or larger) event, never a patch.
+> **Status: SHIPPED in v0.7.0.** Turso is now the default and only
+> embedded engine; the rusqlite backend and sqld sidecar were removed.
+
+Swapping the single-node default off the genuine SQLite C engine changes
+what user data sits on, so per the versioning policy it was a new-minor
+event, not a patch. In v0.7.0 the swap was driven forward by the security
+case (removing the rusqlite `ATTACH` cross-tenant primitive) rather than
+waiting on every gate — single-node Turso ships GA-intent with the
+crash-recovery soak (gate 4) and upstream GA (gate 1) still tracked as
+open, and clustered CDC ships explicitly experimental. See the gates
+below for exactly what is and isn't closed.
 
 ## Decision gates — all of them, no exceptions
 
@@ -273,13 +285,24 @@ is a new-minor (or larger) event, never a patch.
    this harness's run-to-run spread. See
    [Results](/benchmarking/results/#v060--the-turso-engine-measured-against-sqlite).
 3. File-format round-trip verified by us (SQLite-written DB opened by
-   Turso and back, checksummed).
-4. Crash-recovery soak clean.
-5. WordPress + Laravel e2e suites green on the experimental backend.
+   Turso and back, checksummed). **MET.** The Turso engine opens existing
+   rusqlite/sqlite3-created `.db` files **in place** for cleanly-shut-down
+   databases — both WAL and rollback-journal modes; `PRAGMA
+   integrity_check` returns `ok` and rows are intact. So the normal
+   0.6.x → 0.7.0 upgrade of a stopped node is seamless, **no dump/reload**.
+   Two caveats carried into the docs: a database left with an
+   uncheckpointed hot `-wal` from a hard crash was not verified to replay
+   (shut down cleanly before upgrading), and non-UTF-8 TEXT cells may not
+   round-trip (Turso surfaces TEXT as `String` — an upstream limitation).
+4. Crash-recovery soak clean. **Open** — this is why single-node Turso
+   ships "eyes open" rather than declared GA.
+5. WordPress + Laravel e2e suites green on the Turso backend. WordPress
+   front-page + drop-in passed; **automate in CI and confirm Laravel**.
 
-Until all five: rusqlite ships the genuine SQLite C engine as the
-default, and that is a feature, not a compromise — "the most-deployed
-database engine on earth, compiled into the binary."
+v0.7.0 shipped Turso-only despite gates 1 and 4 remaining open, because
+removing rusqlite removes the cross-tenant `ATTACH` RCE primitive from
+the binary — a more dangerous property to keep than a Beta engine is to
+adopt. The remaining gates gate the *GA label*, not the ship.
 
 ## Risks, stated plainly
 

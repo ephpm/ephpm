@@ -1,14 +1,15 @@
-//! **Experimental** Phase 2 CDC-native SQLite replication over the
-//! cluster channel v1.
+//! CDC-native SQLite replication over the cluster channel v1.
 //!
-//! Alternative to `start_clustered_sqlite` (the sqld sidecar path) for
-//! `[db.sqlite] engine = "turso"` combined with clustered mode and the
-//! `[db.sqlite.replication] cdc_experimental = true` opt-in.
+//! As of v0.7.0 this is **the** clustered SQLite replication path: the sqld
+//! sidecar was removed and Turso is the only embedded engine, so any
+//! clustered `[db.sqlite]` configuration (`replication.role` = primary /
+//! replica, or `auto` with `[cluster] enabled = true`) runs through here.
 //!
-//! **Sqld remains the production clustered default.** This module is
-//! evidence-gathering scaffolding for the Turso engine roadmap's Phase 2;
-//! nothing here is used unless the operator explicitly opts in. All
-//! wiring is strictly additive.
+//! Replication tails the primary's `turso_cdc` stream and ships
+//! per-transaction batches to replicas over the cluster channel — no child
+//! process, no gRPC WAL-frame transport. The Turso engine remains Beta
+//! upstream; treat clustered mode as experimental (see the clustered caveats
+//! in `site/content/roadmap/turso-engine.md`).
 //!
 //! # Transport
 //!
@@ -157,8 +158,9 @@
 //!   warning naming any it skipped). This is deliberate: CDC already
 //!   carries the row effects a trigger produced on the primary, so a
 //!   replica that also held the trigger would apply them twice.
-//! - Experimental + gated: the whole path is behind
-//!   `cdc_experimental = true`; sqld stays the production default.
+//! - Experimental: the Turso engine is Beta upstream, so clustered mode is
+//!   experimental — but as of v0.7.0 it is the only clustered SQLite path
+//!   (sqld was removed), no longer gated behind an opt-in flag.
 //!
 //! # Wire format (inside the yamux stream)
 //!
@@ -397,8 +399,9 @@ pub async fn start_clustered_turso_cdc(
     )?;
     let channel = channel_handle.context(
         "clustered Turso CDC replication requires the cluster channel to be bound; \
-         maybe_start_cluster_channel returned None despite cdc_experimental = true \
-         (startup ordering bug)",
+         maybe_start_cluster_channel returned None despite clustered SQLite being \
+         active (startup ordering bug: resolve_channel_features should have enabled \
+         the cdc channel feature)",
     )?;
 
     tracing::warn!(
@@ -1532,8 +1535,8 @@ async fn maybe_bootstrap_cold_replica(
     tracing::warn!(
         primary = %primary_addr,
         "EXPERIMENTAL snapshot bootstrap: local Turso DB is cold; fetching base snapshot \
-         from the primary before serving. This is Phase 2.1 and gated behind \
-         cdc_experimental."
+         from the primary before serving. Clustered Turso replication is experimental \
+         (Turso is Beta upstream)."
     );
 
     const MAX_ATTEMPTS: u32 = 30;

@@ -18,8 +18,8 @@ EXPOSE 8080
 ENTRYPOINT ["ephpm", "serve", "--config", "/etc/ephpm/ephpm.toml"]
 ```
 
-The binary includes PHP and (optionally) sqld — no external PHP-FPM or database
-sidecar is needed.
+The binary includes PHP and the embedded Turso engine — no external PHP-FPM or
+database sidecar is needed.
 
 ---
 
@@ -205,8 +205,8 @@ The `join` list uses these addresses. On startup, each node contacts the seed
 peers via gossip (UDP port 7946). Failure detection converges in ~10-30 seconds.
 
 Primary election uses the gossip KV tier: the lowest-ordinal alive node becomes
-the SQLite primary. On failover, the role-change watcher restarts the sqld
-sidecar in the new mode.
+the SQLite primary. On failover, the role-change watcher reconfigures the node's
+Turso CDC role in-process — there is no sidecar to restart.
 
 ---
 

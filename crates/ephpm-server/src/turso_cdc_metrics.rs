@@ -1,11 +1,10 @@
 //! Prometheus instrumentation for the experimental CDC-native Turso
 //! replication path ([`crate::turso_cdc`]).
 //!
-//! Every series here is emitted **only** when
-//! `[db.sqlite.replication] cdc_experimental = true` actually starts the
-//! CDC path — [`init`] is called from `start_clustered_turso_cdc` and
-//! nothing else registers these names. A deployment on sqld or
-//! single-node SQLite has no `ephpm_cdc_*` series at all.
+//! Every series here is emitted **only** when clustered SQLite actually
+//! starts the CDC path — [`init`] is called from `start_clustered_turso_cdc`
+//! and nothing else registers these names. A single-node Turso deployment
+//! has no `ephpm_cdc_*` series at all.
 //!
 //! # The lag metric, precisely
 //!

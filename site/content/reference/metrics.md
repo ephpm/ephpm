@@ -138,10 +138,9 @@ These series are emitted by both the embedded SQLite paths and the MySQL/Postgre
 
 ## CDC-native Turso replication
 
-These appear only when `[db.sqlite] engine = "turso"` is combined with
-clustering and `[db.sqlite.replication] cdc_experimental = true`. A
-deployment on sqld or single-node SQLite has no `ephpm_cdc_*` series at all.
-The whole path is **experimental** — see
+These appear only when `[db.sqlite]` runs with clustering enabled (the
+Turso CDC replication path). A single-node deployment has no `ephpm_cdc_*`
+series at all. The whole path is **experimental** — see
 [Roadmap → Turso engine](/roadmap/turso-engine/).
 
 Every node registers the **counters** and `ephpm_cdc_subscribers` at startup,

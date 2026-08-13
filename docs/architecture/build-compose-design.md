@@ -55,8 +55,10 @@ they are not this document's subject.
   `php-sdk-<ver>-<os>-<arch>[-gnu].tar.gz` from `github.com/ephpm/php-sdk`
   releases into `php-sdk/<ver>-<os>-<arch>[-gnu]/` (the `-gnu` libc suffix
   applies on Linux) and `release_native()` builds
-  `-p ephpm --target <arch>-unknown-linux-gnu` with `PHP_SDK_PATH` set;
-  `SQLD_BINARY_PATH` embeds sqld the same way.
+  `-p ephpm --target <arch>-unknown-linux-gnu` with `PHP_SDK_PATH` set.
+  (Pre-v0.7.0 this step also set `SQLD_BINARY_PATH` to embed the sqld
+  binary; sqld was removed in v0.7.0 and the Turso engine is a compiled-in
+  Rust crate, so there is no second binary to embed.)
 - The SDK's extension set is **fixed at php-sdk build time** (~45
   extensions listed in the roadmap doc). Changing it today means: edit
   `PHP_EXTENSIONS` in the php-sdk repo workflow → cut an SDK release →
@@ -113,9 +115,8 @@ tested list: redis, intl, imagick+full codec chain, grpc+abseil):
 
 What PR #88 does **not** have: a manifest (imperative flags only), any
 middleware story, ePHPm version pinning (it builds whatever checkout is
-mounted), sqld embedding in the container build, macOS/Windows lanes, or
-a published `ghcr.io/ephpm/builder` image (the CLI probes the tag, but no
-workflow pushes it).
+mounted), macOS/Windows lanes, or a published `ghcr.io/ephpm/builder`
+image (the CLI probes the tag, but no workflow pushes it).
 
 ## 3. Proposed design
 
@@ -221,10 +222,11 @@ forge.toml
    ▼
 [1] SDK: variant download ──or── spc container build   → PHP_SDK_PATH
 [2] generate ephpm-forge-registry (+ ephpm-custom if fallback wiring)
-[3] sqld: download_sqld() as today                      → SQLD_BINARY_PATH
-[4] cargo build --release -p ephpm-custom --target <musl>
+[3] cargo build --release -p ephpm-custom --target <musl>
       (inside the builder container on Linux — same toolchain that
        built libphp.a; natively on macOS)
+      (No sqld step: sqld was removed in v0.7.0; the Turso engine is a
+       compiled-in Rust crate.)
    ▼
 single static binary + build-info.json
 ```

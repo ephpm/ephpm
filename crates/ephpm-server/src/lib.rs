@@ -326,11 +326,12 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
 /// would open a channel listener and only *then* log that
 /// `cdc_experimental` is being ignored.
 fn resolve_channel_features(config: &Config) -> ephpm_cluster::ChannelFeatureFlags {
-    let cdc = config.db.sqlite.as_ref().is_some_and(|s| {
-        s.replication.cdc_experimental
-            && s.engine == "turso"
-            && is_clustered_sqlite(s, config.cluster.enabled)
-    });
+    // Clustered SQLite always replicates over the Turso CDC path as of
+    // v0.7.0 (sqld removed), so the channel is needed exactly when the
+    // SQLite config resolves to clustered mode. Turso is the only engine,
+    // so there is no engine gate.
+    let cdc =
+        config.db.sqlite.as_ref().is_some_and(|s| is_clustered_sqlite(s, config.cluster.enabled));
     ephpm_cluster::ChannelFeatureFlags { cdc }
 }
 
@@ -1599,40 +1600,27 @@ async fn start_db_proxies(
         );
     }
 
-    // Embedded SQLite via litewire
+    // Embedded SQLite via litewire (Turso engine only as of v0.7.0).
     if let Some(sqlite_config) = &config.db.sqlite {
-        let is_clustered = is_clustered_sqlite(sqlite_config, cluster.is_some());
-        let cdc_experimental = sqlite_config.replication.cdc_experimental;
-        validate_sqlite_engine(&sqlite_config.engine, is_clustered, cdc_experimental)?;
+        validate_sqlite_engine(&sqlite_config.engine)?;
+        warn_on_removed_sqlite_knobs(sqlite_config);
 
-        if is_clustered {
-            if sqlite_config.engine == "turso" && cdc_experimental {
-                // Phase 2: CDC-native replication over the cluster
-                // channel, no sqld sidecar. The channel handle is
-                // guaranteed Some by `resolve_channel_features` — if
-                // it's None here, something reordered startup wrong.
-                turso_cdc::start_clustered_turso_cdc(
-                    sqlite_config,
-                    cluster,
-                    channel_handle,
-                    query_stats,
-                    &mut handles,
-                )
-                .await?;
-            } else {
-                start_clustered_sqlite(sqlite_config, cluster, query_stats, &mut handles).await?;
-            }
+        if is_clustered_sqlite(sqlite_config, cluster.is_some()) {
+            // Clustered SQLite replicates through the in-process Turso CDC
+            // path over the cluster channel — no sqld sidecar. The channel
+            // handle is guaranteed Some by `resolve_channel_features` (which
+            // enables the `cdc` channel feature for exactly this
+            // configuration); if it is None here, something reordered
+            // startup wrong and `start_clustered_turso_cdc` fails loudly.
+            turso_cdc::start_clustered_turso_cdc(
+                sqlite_config,
+                cluster,
+                channel_handle,
+                query_stats,
+                &mut handles,
+            )
+            .await?;
         } else {
-            // In single-node mode the cdc_experimental flag is a documented
-            // no-op — CDC only makes sense with a peer to ship batches to.
-            // Warn if it was set so operators don't think it's doing
-            // something.
-            if cdc_experimental {
-                tracing::warn!(
-                    "[db.sqlite.replication] cdc_experimental = true has no effect in \
-                     single-node mode (no cluster peers to replicate to); ignoring."
-                );
-            }
             start_single_node_sqlite(sqlite_config, query_stats, &mut handles).await?;
         }
     }
@@ -1642,32 +1630,54 @@ async fn start_db_proxies(
 
 /// Validate the `[db.sqlite].engine` knob.
 ///
-/// `"sqlite"` is always valid. `"turso"` (experimental) is valid in
-/// single-node mode; in clustered mode it requires
-/// `[db.sqlite.replication] cdc_experimental = true` to opt in to the
-/// Phase 2 CDC-native replication path (sqld is not spawned in that
-/// mode). Anything else is a hard error so a typo can never silently
-/// fall back to a different engine.
-fn validate_sqlite_engine(
-    engine: &str,
-    is_clustered: bool,
-    cdc_experimental: bool,
-) -> anyhow::Result<()> {
+/// As of v0.7.0 the only embedded SQLite-family engine is Turso: the
+/// rusqlite backend and the sqld sidecar were removed. `"turso"` (the
+/// default) is the only accepted value. The legacy `"sqlite"` / `"rusqlite"`
+/// values are rejected with a migration message rather than silently
+/// falling back to a now-absent backend (fail closed).
+fn validate_sqlite_engine(engine: &str) -> anyhow::Result<()> {
     match engine {
-        "turso" if is_clustered && !cdc_experimental => anyhow::bail!(
-            "[db.sqlite] engine = \"turso\" is not supported in clustered mode \
-             without the experimental CDC replication opt-in. \
-             Set [db.sqlite.replication] cdc_experimental = true to enable \
-             Phase 2 CDC-native replication (EXPERIMENTAL — Turso engine is \
-             Beta upstream, sqld remains the production clustered default \
-             for engine = \"sqlite\"), or set engine = \"sqlite\" to use the \
-             production sqld path."
+        "turso" => Ok(()),
+        "sqlite" | "rusqlite" => anyhow::bail!(
+            "[db.sqlite] engine = \"{engine}\" was removed in v0.7.0. The embedded \
+             SQLite-family engine is now Turso only — the rusqlite backend and the \
+             sqld clustered sidecar were dropped. Remove the `engine` key (it now \
+             defaults to \"turso\") or set engine = \"turso\". See the v0.7.0 upgrade \
+             notes for database file-format details before upgrading production data."
         ),
-        "sqlite" | "turso" => Ok(()),
         other => anyhow::bail!(
             "[db.sqlite] engine = \"{other}\" is not a valid engine; \
-             valid values: \"sqlite\" (default), \"turso\" (experimental)"
+             the only supported value is \"turso\" (the default)"
         ),
+    }
+}
+
+/// Warn on `[db.sqlite]` knobs that were removed in v0.7.0 but are still
+/// parsed so upgrading configs do not hard-fail.
+///
+/// Honors the "no silent no-op config knob" rule: a knob that is set but no
+/// longer does anything must be surfaced, not silently ignored.
+fn warn_on_removed_sqlite_knobs(sqlite_config: &ephpm_config::SqliteConfig) {
+    if let Some(sqld) = &sqlite_config.sqld {
+        tracing::warn!(
+            "[db.sqlite.sqld] was removed in v0.7.0 (the sqld sidecar and the rusqlite \
+             backend were dropped). Clustered SQLite now replicates through the in-process \
+             Turso CDC path — no sqld process. This section is ignored; delete it."
+        );
+        if sqld.write_permits.is_some() {
+            tracing::warn!(
+                "[db.sqlite.sqld] write_permits was removed in v0.7.0: it gated sqld's \
+                 single writer, and Turso is MVCC with no single writer to admit against. \
+                 Ignored."
+            );
+        }
+    }
+    if sqlite_config.replication.cdc_experimental {
+        tracing::warn!(
+            "[db.sqlite.replication] cdc_experimental was removed in v0.7.0: CDC is now the \
+             only clustered SQLite replication path and is always active in clustered mode. \
+             This knob is ignored; delete it."
+        );
     }
 }
 
@@ -1677,78 +1687,32 @@ fn is_clustered_sqlite(sqlite_config: &ephpm_config::SqliteConfig, cluster_enabl
     role == "primary" || role == "replica" || (role == "auto" && cluster_enabled)
 }
 
-/// Start single-node SQLite (in-process engine, no sqld).
+/// Start single-node SQLite via the in-process Turso engine.
 ///
-/// The engine is selected by `[db.sqlite].engine` (validated upstream by
-/// `validate_sqlite_engine`): `"sqlite"` uses rusqlite (the genuine SQLite
-/// C engine, the default), `"turso"` uses the experimental Turso Database
-/// engine via `litewire-turso`.
+/// As of v0.7.0 Turso is the only embedded SQLite-family engine
+/// (`validate_sqlite_engine` rejects any other value upstream). Turso is a
+/// factory — one `turso::Database` per file, a `turso::Connection` per
+/// session — so there is no `sqlite3_open`-per-connect cost and no
+/// handle-reuse pool to tune.
 async fn start_single_node_sqlite(
     sqlite_config: &ephpm_config::SqliteConfig,
     query_stats: &ephpm_query_stats::QueryStats,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> anyhow::Result<()> {
     let db_path = &sqlite_config.path;
-    if sqlite_config.engine == "turso" {
-        tracing::warn!(
-            path = %db_path,
-            "[db.sqlite] engine = \"turso\" is EXPERIMENTAL: the Turso Database \
-             engine is Beta upstream and not yet a production SQLite replacement. \
-             Do not use it for data you cannot recreate. VACUUM and multi-process \
-             access are unsupported. See the Turso engine roadmap page."
-        );
-        let backend = litewire::Turso::open(db_path)
-            .await
-            .with_context(|| format!("failed to open database with Turso engine: {db_path}"))?;
-        tracing::info!(
-            path = %db_path,
-            engine = "turso",
-            "opened embedded database (single-node, experimental Turso engine)"
-        );
-        spawn_single_node_litewire(
-            sqlite_config,
-            share_backend_with_php(tracked_backend::TrackedBackend::new(
-                backend,
-                query_stats.clone(),
-            )),
-            handles,
-        );
-    } else {
-        // Handle reuse is opt-in in litewire (it changes cross-session state
-        // semantics for a general-purpose library); ePHPm opts in here
-        // deliberately because PHP's connect-per-request pattern is exactly
-        // the profile it serves — without it every request pays a fresh
-        // sqlite3_open plus WAL-index attach (~280 µs measured) and starts
-        // with a cold prepared-statement cache. Idle cap 16: sessions track
-        // in-flight PHP requests, which the worker pool already bounds far
-        // below this on typical quotas.
-        let backend = std::sync::Arc::new(
-            litewire::backend::Rusqlite::builder(db_path)
-                .handle_reuse(16)
-                .build()
-                .with_context(|| format!("failed to open SQLite database: {db_path}"))?,
-        );
-        tracing::info!(
-            path = %db_path,
-            handle_reuse = true,
-            "opened embedded SQLite database (single-node)"
-        );
-        // Keep a handle to the concrete backend before it is erased, so the
-        // free-list counters stay reachable. `handle_reuse=true` above only
-        // says the feature was *requested*; whether connections actually hit
-        // the free-list is invisible without this — litewire's backend crate
-        // has no logging or metrics of its own, and `reuse_stats()` is its
-        // only observability surface.
-        spawn_reuse_stats_logger(&backend, handles);
-        spawn_single_node_litewire(
-            sqlite_config,
-            share_backend_with_php(tracked_backend::TrackedBackend::new(
-                SharedRusqlite(backend),
-                query_stats.clone(),
-            )),
-            handles,
-        );
-    }
+    let backend = litewire::Turso::open(db_path)
+        .await
+        .with_context(|| format!("failed to open database with Turso engine: {db_path}"))?;
+    tracing::info!(
+        path = %db_path,
+        engine = "turso",
+        "opened embedded database (single-node, Turso engine)"
+    );
+    spawn_single_node_litewire(
+        sqlite_config,
+        share_backend_with_php(tracked_backend::TrackedBackend::new(backend, query_stats.clone())),
+        handles,
+    );
     Ok(())
 }
 
@@ -1777,9 +1741,8 @@ pub(crate) fn share_backend_with_php(backend: impl litewire::backend::Backend) -
 
 /// Forwarding wrapper handing an already-erased [`litewire::backend::SharedBackend`]
 /// back to `LiteWire::new`, which insists on taking `impl Backend` by value.
-/// Same shape as [`SharedRusqlite`] below; the default `query`/`execute`
-/// convenience methods route through `connect()`, whose returned connections
-/// carry the stats wrapper.
+/// The default `query`/`execute` convenience methods route through
+/// `connect()`, whose returned connections carry the stats wrapper.
 pub(crate) struct PhpSharedBackend(litewire::backend::SharedBackend);
 
 #[async_trait::async_trait]
@@ -1789,64 +1752,6 @@ impl litewire::backend::Backend for PhpSharedBackend {
     ) -> Result<Box<dyn litewire::backend::BackendConn>, litewire::backend::BackendError> {
         self.0.connect().await
     }
-}
-
-/// Shares one [`litewire::backend::Rusqlite`] between litewire — which takes
-/// the backend by value and erases it to `Arc<dyn Backend>` — and the stats
-/// logger, which needs the concrete type for `reuse_stats()`.
-///
-/// `Backend` is not implemented for `Arc<T>`, so this newtype forwards the one
-/// required method. Cost is one extra vtable hop per session open, which is
-/// noise against the `sqlite3_open` it guards.
-struct SharedRusqlite(std::sync::Arc<litewire::backend::Rusqlite>);
-
-#[async_trait::async_trait]
-impl litewire::backend::Backend for SharedRusqlite {
-    async fn connect(
-        &self,
-    ) -> Result<Box<dyn litewire::backend::BackendConn>, litewire::backend::BackendError> {
-        self.0.connect().await
-    }
-}
-
-/// Interval between handle-reuse stat lines.
-const REUSE_STATS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-
-/// Periodically log litewire's session free-list counters at debug level.
-///
-/// Reading these is how you tell three failure modes apart, which latency
-/// alone cannot: `discarded` climbing with load means the pool's hygiene pass
-/// is rejecting handles; `misses` climbing with `discarded` at zero means the
-/// park (asynchronous — the session's worker parks after `drop` posts to it)
-/// is losing the race with the next connect; `expired` climbing means the idle
-/// age sweep is retiring handles between bursts.
-fn spawn_reuse_stats_logger(
-    backend: &std::sync::Arc<litewire::backend::Rusqlite>,
-    handles: &mut Vec<tokio::task::JoinHandle<()>>,
-) {
-    let backend = std::sync::Arc::clone(backend);
-    handles.push(tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(REUSE_STATS_INTERVAL);
-        // The first tick fires immediately; skip it so the first line carries
-        // a full interval of traffic rather than an all-zero snapshot.
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            let Some(stats) = backend.reuse_stats() else {
-                // Reuse disabled — nothing to report, and never will be.
-                return;
-            };
-            tracing::debug!(
-                hits = stats.hits,
-                misses = stats.misses,
-                returned = stats.returned,
-                discarded = stats.discarded,
-                expired = stats.expired,
-                idle = stats.idle,
-                "SQLite handle reuse stats"
-            );
-        }
-    }));
 }
 
 /// Wire the configured frontends onto a litewire builder and spawn it.
@@ -1893,172 +1798,6 @@ fn spawn_single_node_litewire(
     }));
 }
 
-/// Start clustered SQLite (sqld sidecar + litewire with Hrana client backend).
-#[allow(unreachable_code, unused_variables)]
-async fn start_clustered_sqlite(
-    sqlite_config: &ephpm_config::SqliteConfig,
-    cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
-    query_stats: &ephpm_query_stats::QueryStats,
-    handles: &mut Vec<tokio::task::JoinHandle<()>>,
-) -> anyhow::Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        anyhow::bail!(
-            "clustered SQLite (sqld sidecar) is not supported on Windows. \
-             Use single-node mode (remove [db.sqlite.replication] or set role = \"auto\" \
-             without clustering), or run on Linux/macOS/WSL."
-        );
-    }
-
-    // Determine the initial sqld role and optional role-change receiver.
-    let (sqld_role, role_rx) = match sqlite_config.replication.role.as_str() {
-        "primary" => {
-            tracing::info!("SQLite replication role forced to primary");
-            (ephpm_sqld::SqldRole::Primary, None)
-        }
-        "replica" => {
-            let url = &sqlite_config.replication.primary_grpc_url;
-            anyhow::ensure!(
-                !url.is_empty(),
-                "replication.primary_grpc_url is required when role = \"replica\""
-            );
-            tracing::info!(primary = %url, "SQLite replication role forced to replica");
-            (ephpm_sqld::SqldRole::Replica { primary_grpc_url: url.clone() }, None)
-        }
-        _ => {
-            // "auto" — use gossip election
-            let cluster_handle =
-                cluster.context("cluster must be enabled for auto SQLite replication")?;
-            let election = ephpm_cluster::SqliteElection::new(
-                Arc::clone(cluster_handle),
-                sqlite_config.sqld.grpc_listen.clone(),
-            );
-            let initial = election.determine_initial_role().await;
-            let rx = election.watch_role();
-
-            // Spawn the election loop.
-            tokio::spawn(election.run());
-
-            (elected_to_sqld_role(&initial), Some(rx))
-        }
-    };
-
-    // Spawn sqld as a child process.
-    let sqld_config = ephpm_sqld::SqldConfig {
-        db_path: sqlite_config.path.clone(),
-        http_listen: sqlite_config.sqld.http_listen.clone(),
-        grpc_listen: sqlite_config.sqld.grpc_listen.clone(),
-    };
-
-    let sqld = ephpm_sqld::SqldProcess::spawn(sqld_config, sqld_role)
-        .await
-        .context("failed to start sqld")?;
-
-    // Wait for sqld to become healthy.
-    sqld.wait_healthy(Duration::from_secs(30)).await.context("sqld did not become healthy")?;
-
-    let sqld_http_url = sqld.http_url();
-    tracing::info!(url = %sqld_http_url, "sqld is healthy, starting litewire with Hrana backend");
-
-    // Shared handle so the role-change watcher can restart sqld on failover.
-    let sqld = Arc::new(tokio::sync::Mutex::new(sqld));
-
-    // Spawn role-change watcher that restarts sqld when the election result changes.
-    if let Some(mut watch_rx) = role_rx {
-        let sqld_for_watcher = Arc::clone(&sqld);
-        handles.push(tokio::spawn(async move {
-            while watch_rx.changed().await.is_ok() {
-                let new_elected = watch_rx.borrow().clone();
-                let new_role = elected_to_sqld_role(&new_elected);
-                tracing::info!(?new_role, "SQLite election: role changed, restarting sqld");
-
-                let mut sqld = sqld_for_watcher.lock().await;
-                if let Err(e) = sqld.restart(new_role).await {
-                    tracing::error!("failed to restart sqld after role change: {e:#}");
-                    continue;
-                }
-
-                // Wait for sqld to become healthy after restart.
-                if let Err(e) = sqld.wait_healthy(Duration::from_secs(30)).await {
-                    tracing::error!("sqld not healthy after restart: {e:#}");
-                }
-            }
-        }));
-    }
-
-    // Create Hrana client backend pointing at local sqld, wrapped with stats tracking.
-    //
-    // Write admission control is scoped to this backend on purpose. sqld is
-    // the only store here with a single write lock behind an HTTP round trip,
-    // and it is the only one that collapses under concurrent writes rather
-    // than plateauing. Applying the same cap to the in-process rusqlite
-    // backend or the MySQL proxy would cost throughput and buy nothing.
-    let mut backend = litewire::backend::HranaClient::new(&sqld_http_url);
-    if sqlite_config.sqld.write_permits > 0 {
-        backend = backend.write_permits(sqlite_config.sqld.write_permits);
-        tracing::info!(
-            write_permits = sqlite_config.sqld.write_permits,
-            "sqld write admission control enabled (reads uncapped; excess writes queue)"
-        );
-    }
-    let tracked = tracked_backend::TrackedBackend::new(backend, query_stats.clone());
-
-    // Start litewire with the tracked backend, shared with the PHP
-    // `ephpm_db_*` bridge (single-node and clustered sit behind the same
-    // Backend object — no mode-specific bridge paths).
-    let mut builder = litewire::LiteWire::new(share_backend_with_php(tracked));
-    builder = builder.mysql(&sqlite_config.proxy.mysql_listen);
-    tracing::info!(
-        listen = %sqlite_config.proxy.mysql_listen,
-        "SQLite MySQL wire protocol enabled (clustered)"
-    );
-
-    if let Some(ref hrana_addr) = sqlite_config.proxy.hrana_listen {
-        builder = builder.hrana(hrana_addr);
-        tracing::info!(listen = %hrana_addr, "SQLite Hrana HTTP API enabled (clustered)");
-    }
-
-    if let Some(ref pg_addr) = sqlite_config.proxy.postgres_listen {
-        builder = builder.postgres(pg_addr);
-        tracing::info!(listen = %pg_addr, "SQLite PostgreSQL wire protocol enabled (clustered)");
-    }
-
-    if let Some(ref tds_addr) = sqlite_config.proxy.tds_listen {
-        builder = builder.tds(tds_addr);
-        tracing::info!(listen = %tds_addr, "SQLite TDS wire protocol enabled (clustered)");
-    }
-
-    if sqlite_config.proxy.max_connections > 0 {
-        builder = builder.max_connections(sqlite_config.proxy.max_connections);
-        tracing::info!(
-            max_connections = sqlite_config.proxy.max_connections,
-            "SQLite wire frontends: connection cap enabled (clustered)"
-        );
-    }
-
-    // Spawn litewire serve task. sqld is kept alive via the Arc.
-    let sqld_guard = Arc::clone(&sqld);
-    handles.push(tokio::spawn(async move {
-        let _sqld_guard = sqld_guard;
-        match builder.serve().await {
-            Ok(()) => tracing::info!("litewire stopped (clustered)"),
-            Err(e) => tracing::error!("litewire error (clustered): {e:#}"),
-        }
-    }));
-
-    Ok(())
-}
-
-/// Convert an [`ElectedRole`] to an [`SqldRole`].
-fn elected_to_sqld_role(elected: &ephpm_cluster::ElectedRole) -> ephpm_sqld::SqldRole {
-    match elected {
-        ephpm_cluster::ElectedRole::Primary => ephpm_sqld::SqldRole::Primary,
-        ephpm_cluster::ElectedRole::Replica { primary_grpc_url } => {
-            ephpm_sqld::SqldRole::Replica { primary_grpc_url: primary_grpc_url.clone() }
-        }
-    }
-}
-
 /// Parse a memory size string (e.g. "256MB", "1GB") to bytes.
 fn parse_memory_size(s: &str) -> anyhow::Result<usize> {
     let s = s.trim().to_uppercase();
@@ -2091,7 +1830,13 @@ mod lib_tests {
     /// same instance. Runs in stub mode — the bridge core is stub-safe.
     #[tokio::test]
     async fn share_backend_with_php_registers_and_forwards() {
-        let backend = litewire::backend::Rusqlite::memory().expect("in-memory backend");
+        // Turso is the only embedded engine as of v0.7.0; open one on a
+        // temp file (rusqlite's in-memory backend is no longer linked).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("share.db");
+        let backend = litewire::Turso::open(db_path.to_str().expect("utf-8 path"))
+            .await
+            .expect("open turso backend");
         let wrapper = share_backend_with_php(backend);
         assert!(ephpm_php::db_bridge::is_configured());
 
@@ -2101,6 +1846,26 @@ mod lib_tests {
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[])
             .await
             .expect("execute through wrapper");
+    }
+
+    #[test]
+    fn validate_sqlite_engine_accepts_turso() {
+        assert!(validate_sqlite_engine("turso").is_ok());
+    }
+
+    #[test]
+    fn validate_sqlite_engine_rejects_legacy_values_with_migration_message() {
+        for legacy in ["sqlite", "rusqlite"] {
+            let err = validate_sqlite_engine(legacy).expect_err("legacy engine must be rejected");
+            let msg = err.to_string();
+            assert!(msg.contains("removed in v0.7.0"), "message should flag removal: {msg}");
+            assert!(msg.contains("turso"), "message should point at turso: {msg}");
+        }
+    }
+
+    #[test]
+    fn validate_sqlite_engine_rejects_unknown_value() {
+        assert!(validate_sqlite_engine("postgres").is_err());
     }
 
     #[test]
@@ -2171,9 +1936,9 @@ mod lib_tests {
     fn make_sqlite_config(role: &str) -> ephpm_config::SqliteConfig {
         ephpm_config::SqliteConfig {
             path: "test.db".into(),
-            engine: "sqlite".into(),
+            engine: "turso".into(),
             proxy: ephpm_config::SqliteProxyConfig::default(),
-            sqld: ephpm_config::SqldConfig::default(),
+            sqld: None,
             replication: ephpm_config::ReplicationConfig {
                 role: role.into(),
                 primary_grpc_url: String::new(),
@@ -2206,39 +1971,6 @@ mod lib_tests {
         let config = make_sqlite_config("replica");
         assert!(is_clustered_sqlite(&config, false));
         assert!(is_clustered_sqlite(&config, true));
-    }
-
-    // ── [db.sqlite].engine validation ───────────────────────────────────────
-
-    #[test]
-    fn sqlite_engine_default_always_valid() {
-        assert!(validate_sqlite_engine("sqlite", false, false).is_ok());
-        assert!(validate_sqlite_engine("sqlite", true, false).is_ok());
-        assert!(validate_sqlite_engine("sqlite", true, true).is_ok());
-    }
-
-    #[test]
-    fn turso_engine_valid_single_node_only() {
-        assert!(validate_sqlite_engine("turso", false, false).is_ok());
-        // cdc_experimental is a no-op in single-node mode but must not error.
-        assert!(validate_sqlite_engine("turso", false, true).is_ok());
-    }
-
-    #[test]
-    fn turso_engine_rejected_in_clustered_mode_without_cdc_optin() {
-        let err = validate_sqlite_engine("turso", true, false).unwrap_err();
-        assert!(err.to_string().contains("cdc_experimental"), "{err}");
-    }
-
-    #[test]
-    fn turso_engine_allowed_in_clustered_mode_with_cdc_optin() {
-        assert!(validate_sqlite_engine("turso", true, true).is_ok());
-    }
-
-    #[test]
-    fn unknown_engine_rejected() {
-        let err = validate_sqlite_engine("sqlite3", false, false).unwrap_err();
-        assert!(err.to_string().contains("not a valid engine"), "{err}");
     }
 
     // ── KV service wiring ───────────────────────────────────────────────────

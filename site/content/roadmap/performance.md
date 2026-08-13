@@ -50,7 +50,7 @@ release notes.
 |---|---|---|
 | PGO for libphp | 10–15% across all PHP execution | upstream static-php-cli `feat/pgo-v3` merging to v3 ([php-sdk#35](https://github.com/ephpm/php-sdk/issues/35)) |
 | NTS prefork | removes the ZTS tax (~50% on allocation-heavy loops, 5–10% typical) | decision rule runs **after** PGO lands — [nts-prefork](/roadmap/nts-prefork/) |
-| Turso engine (MVCC concurrent writes, native async I/O, sqld sidecar elimination) | removes SQLite's single-writer wall; deletes an IPC layer from clustered writes | five gates, upstream GA first — [turso-engine](/roadmap/turso-engine/) |
+| Turso engine (MVCC concurrent writes, native async I/O, sqld sidecar elimination) | removes SQLite's single-writer wall; deletes an IPC layer from clustered writes | **shipped in v0.7.0** (sidecar eliminated); GA label still tracks upstream gates — [turso-engine](/roadmap/turso-engine/) |
 
 ## Unexplored — next audit sweep
 

@@ -18,9 +18,6 @@ const PHP_SDK_VERSIONS: &[(&str, &str)] = &[("8.3", "8.3.31"), ("8.4", "8.4.23")
 /// Default PHP minor when no version is specified on the command line.
 const DEFAULT_PHP_MINOR: &str = "8.5";
 
-/// Pinned version of sqld (libsql-server) for clustered SQLite.
-const SQLD_VERSION: &str = "0.24.32";
-
 /// Pinned version of Hugo (extended) for the documentation site.
 /// Newer versions dropped darwin tarballs in favor of .pkg installers.
 const HUGO_VERSION: &str = "0.150.0";
@@ -76,11 +73,7 @@ shorthand (e.g. \"8.5\") to use the pinned patch release, or a full version
 
 Windows builds:
   --target windows    Build a native Windows .exe (must run on Windows; MSVC build tools required).
-                      Downloads the same prebuilt SDK as Linux/macOS, but for windows-x86_64.
-
-SQLite clustering:
-  --sqld-binary PATH  Override: embed a specific sqld binary (default: auto-download v{SQLD_VERSION}).
-  --no-sqld           Skip sqld embedding entirely (single-node SQLite only)."
+                      Downloads the same prebuilt SDK as Linux/macOS, but for windows-x86_64."
     );
 }
 
@@ -106,27 +99,13 @@ fn parse_target(args: &[String]) -> Option<&str> {
     None
 }
 
-/// Extract `--sqld-binary <path>` from release args.
-fn parse_sqld_binary(args: &[String]) -> Option<&str> {
-    for (i, arg) in args.iter().enumerate() {
-        if arg == "--sqld-binary" {
-            return args.get(i + 1).map(String::as_str);
-        }
-    }
-    None
-}
-
 /// Extract the PHP version from release args, skipping `--target` and its value.
 /// Falls back to "8.5" if no positional version argument is found.
 fn parse_release_php_version(args: &[String]) -> &str {
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--target" || args[i] == "--sqld-binary" {
+        if args[i] == "--target" {
             i += 2; // skip flag and its value
-            continue;
-        }
-        if args[i] == "--no-sqld" {
-            i += 1;
             continue;
         }
         if !args[i].starts_with('-') {
@@ -205,26 +184,8 @@ fn release_native(args: &[String]) -> ExitCode {
     cmd.args(["build", "--release", "--package", "ephpm", "--target", &host_target])
         .env("PHP_SDK_PATH", &sdk_path);
 
-    // Embed sqld binary: use --sqld-binary if provided, otherwise auto-download.
-    // Pass --no-sqld to skip embedding entirely.
-    if !args.iter().any(|a| a == "--no-sqld") {
-        let sqld_path = if let Some(manual_path) = parse_sqld_binary(args) {
-            let abs = std::path::Path::new(manual_path)
-                .canonicalize()
-                .unwrap_or_else(|_| PathBuf::from(manual_path));
-            Some(abs)
-        } else {
-            download_sqld()
-        };
-
-        if let Some(path) = sqld_path {
-            eprintln!("==> Embedding sqld binary from {}", path.display());
-            cmd.env("SQLD_BINARY_PATH", &path);
-        } else {
-            eprintln!("warning: sqld binary not available — clustered SQLite will not work");
-        }
-    }
-
+    // v0.7.0: no sqld embedding. Clustered SQLite replicates through the
+    // in-process Turso CDC path; there is no external binary to embed.
     let status = cmd.status();
 
     if !ran_ok(&status) {
@@ -283,17 +244,6 @@ fn release_windows(args: &[String]) -> ExitCode {
              or run on a Windows workstation locally."
         );
         return ExitCode::FAILURE;
-    }
-
-    // sqld has no Windows binary — error if user tries to embed it.
-    if parse_sqld_binary(args).is_some() {
-        eprintln!("error: sqld is not available for Windows.");
-        eprintln!("       Clustered SQLite requires Linux or macOS.");
-        return ExitCode::FAILURE;
-    }
-    if !args.iter().any(|a| a == "--no-sqld") {
-        eprintln!("note: skipping sqld embedding (not available for Windows)");
-        eprintln!("      The Windows build supports single-node SQLite only.");
     }
 
     let Some(php_version) = resolve_php_version(parse_release_php_version(args)) else {
@@ -689,89 +639,6 @@ fn download_and_extract_tarball(url: &str, dest_dir: &PathBuf, binary_name: &str
 
     make_executable(&dest_dir.join(binary_name));
     true
-}
-
-/// Download a `.tar.xz` archive via curl, extract a specific binary.
-fn download_and_extract_tar_xz(url: &str, dest_dir: &Path, binary_name: &str) -> bool {
-    let curl =
-        Command::new("curl").args(["-fSL", url]).stdout(std::process::Stdio::piped()).spawn();
-
-    let Ok(curl) = curl else {
-        eprintln!("error: failed to run curl");
-        return false;
-    };
-
-    // xz -d | tar x -C <dest_dir> <binary_name>
-    let xz = Command::new("xz")
-        .arg("-d")
-        .stdin(curl.stdout.unwrap())
-        .stdout(std::process::Stdio::piped())
-        .spawn();
-
-    let Ok(xz) = xz else {
-        eprintln!("error: failed to run xz (is xz-utils installed?)");
-        return false;
-    };
-
-    // Turso ships the binary inside a top-level directory:
-    //   libsql-server-x86_64-unknown-linux-gnu/sqld
-    // Strip the prefix so it lands at <dest_dir>/<binary_name>, and use a
-    // wildcard so we don't have to know the exact directory name.
-    let status = Command::new("tar")
-        .args(["x", "--strip-components=1", "--wildcards", "-C"])
-        .arg(dest_dir)
-        .arg(format!("*/{binary_name}"))
-        .stdin(xz.stdout.unwrap())
-        .status();
-
-    if !ran_ok(&status) {
-        eprintln!("error: failed to extract {binary_name} from archive");
-        return false;
-    }
-
-    make_executable(&dest_dir.join(binary_name));
-    true
-}
-
-/// Download the sqld binary for the current platform.
-///
-/// Downloads from Turso's GitHub releases and caches in `sqld-cache/`.
-/// Returns the path to the sqld binary, or `None` on failure.
-fn download_sqld() -> Option<PathBuf> {
-    let cache_dir = workspace_root().join("sqld-cache");
-    let sqld_path = cache_dir.join("sqld");
-
-    if sqld_path.exists() {
-        eprintln!("==> sqld {SQLD_VERSION} already cached, skipping download");
-        return Some(sqld_path);
-    }
-
-    let target = match (std::env::consts::ARCH, std::env::consts::OS) {
-        ("x86_64", "linux") => "x86_64-unknown-linux-gnu",
-        ("aarch64", "linux") => "aarch64-unknown-linux-gnu",
-        ("x86_64", "macos") => "x86_64-apple-darwin",
-        ("aarch64", "macos") => "aarch64-apple-darwin",
-        (arch, os) => {
-            eprintln!("error: no pre-built sqld binary for {arch}-{os}");
-            return None;
-        }
-    };
-
-    let url = format!(
-        "https://github.com/tursodatabase/libsql/releases/download/\
-         libsql-server-v{SQLD_VERSION}/libsql-server-{target}.tar.xz"
-    );
-
-    eprintln!("==> Downloading sqld {SQLD_VERSION} for {target}...");
-    fs::create_dir_all(&cache_dir).ok();
-
-    if !download_and_extract_tar_xz(&url, &cache_dir, "sqld") {
-        eprintln!("error: failed to download sqld from {url}");
-        return None;
-    }
-
-    eprintln!("==> sqld {SQLD_VERSION} cached at {}", sqld_path.display());
-    Some(sqld_path)
 }
 
 /// chmod +x on unix, no-op on windows.

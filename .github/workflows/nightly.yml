@@ -311,7 +311,7 @@ jobs:
 
       - name: Build ephpm.exe
         shell: powershell
-        run: cargo xtask release ${{ matrix.php }} --target windows --no-sqld
+        run: cargo xtask release ${{ matrix.php }} --target windows
 
       - name: Verify binary
         shell: powershell

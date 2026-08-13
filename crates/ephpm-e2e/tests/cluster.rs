@@ -377,10 +377,10 @@ async fn cluster_sqlite_write_on_any_node() {
 
     let client = reqwest::Client::new();
 
-    // Each node runs its own SQLite database. In clustered mode with sqld,
-    // writes replicate. In single-node SQLite mode (no sqld), each node has
-    // an independent database. Either way, each node must be able to write
-    // and read.
+    // Each node runs its own SQLite (Turso) database. In clustered mode
+    // writes replicate over the in-process Turso CDC path; in single-node
+    // mode each node has an independent database. Either way, each node must
+    // be able to write and read.
     for (i, url) in urls.iter().enumerate() {
         // Setup: create table and insert data.
         let setup_url = format!("{url}/sqlite_test.php?action=setup");
