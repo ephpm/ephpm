@@ -984,9 +984,52 @@ pub struct DbConfig {
 pub struct SqliteConfig {
     /// Path to the `SQLite` database file.
     ///
+    /// Used in **single-site** mode (no `[server] sites_dir`). In multi-site
+    /// mode this is ignored in favour of [`dir`](Self::dir) — see below.
+    ///
     /// Default: `"ephpm.db"` in the current working directory.
     #[serde(default = "default_sqlite_path")]
     pub path: String,
+
+    /// Directory holding **per-site** database files (multi-site mode only).
+    ///
+    /// When `[server] sites_dir` is set (multi-site / multi-tenant mode) each
+    /// virtual host gets its **own** database file at `<dir>/<host>.db`, opened
+    /// lazily on that site's first query and cached (bounded by
+    /// [`max_open_dbs`](Self::max_open_dbs)). This is the isolation unit for
+    /// secure multi-tenancy: Turso has no per-schema ACL, so the database file
+    /// is the only tenant boundary — one file per site means one tenant's SQL
+    /// cannot name, read, or write another tenant's data.
+    ///
+    /// The host component is the traversal-safe site key (the same validated
+    /// `[a-z0-9._-]` key that guards the `sites_dir` docroot join); a database
+    /// path is never derived from a raw `Host` header.
+    ///
+    /// **Required in multi-site mode** — startup fails closed if `sites_dir` is
+    /// set, `[db.sqlite]` is present (single-node), and `dir` is unset, rather
+    /// than silently scattering per-site files or falling back to one shared
+    /// database (which would defeat tenant isolation). Ignored (with a startup
+    /// warning) in single-site mode. Not yet supported in clustered mode.
+    ///
+    /// Default: `None`.
+    #[serde(default)]
+    pub dir: Option<String>,
+
+    /// Maximum number of per-site databases held open at once (multi-site
+    /// mode only).
+    ///
+    /// Turso keeps a file open per `Database` factory (roughly `db` + `-wal`,
+    /// so budget ~3 fds each). This bounds the number of simultaneously-open
+    /// site databases: when the cache is full, the least-recently-used **idle**
+    /// site (one with no in-flight request or live bridge session) is closed to
+    /// make room; a later request for it re-opens transparently. A site with a
+    /// live session is never evicted, so this is a *soft* bound on file
+    /// descriptors — size it with headroom under the process `RLIMIT_NOFILE`
+    /// (`max_open_dbs × ~3 + server sockets`).
+    ///
+    /// Default: `256`.
+    #[serde(default = "default_sqlite_max_open_dbs")]
+    pub max_open_dbs: usize,
 
     /// Database engine. As of v0.7.0 the only value is `"turso"` (the
     /// default) — the Turso Database engine, a ground-up Rust rewrite of
@@ -2793,6 +2836,10 @@ fn default_sqlite_engine() -> String {
     "turso".to_string()
 }
 
+fn default_sqlite_max_open_dbs() -> usize {
+    256
+}
+
 fn default_sqlite_mysql_listen() -> String {
     "127.0.0.1:3306".to_string()
 }
@@ -4354,6 +4401,31 @@ path = "app.db"
         assert_eq!(sqlite.replication.role, "auto");
         assert!(sqlite.replication.primary_grpc_url.is_empty());
         assert_eq!(sqlite.engine, "turso", "engine must default to \"turso\" (the only engine)");
+        assert!(sqlite.dir.is_none(), "per-site `dir` must be absent by default (single-site)");
+        assert_eq!(
+            sqlite.max_open_dbs, 256,
+            "max_open_dbs must default to 256 open per-site databases"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_per_site_knobs_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[db.sqlite]
+dir = "/var/lib/ephpm/dbs"
+max_open_dbs = 32
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let sqlite = config.db.sqlite.expect("sqlite should be present");
+        assert_eq!(sqlite.dir.as_deref(), Some("/var/lib/ephpm/dbs"));
+        assert_eq!(sqlite.max_open_dbs, 32);
     }
 
     #[test]

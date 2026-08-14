@@ -11,6 +11,7 @@ pub mod opcache;
 pub mod otlp;
 pub mod rate_limit;
 pub mod router;
+pub mod site_backends;
 pub mod static_files;
 pub mod stream_compress;
 mod timeline;
@@ -259,6 +260,13 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         max_digests: config.db.analysis.digest_store_max_entries,
         metric_label_series_max: config.db.analysis.metric_label_series_max,
     });
+
+    // Per-site database registry (secure multi-tenancy): build and register it
+    // with the PHP `ephpm_db_*` bridge BEFORE the HTTP listeners bind, so the
+    // bridge is wired before any request can run. Fails closed if `[db.sqlite]
+    // dir` is missing in multi-site mode. The router derives the same
+    // per-site flag from config, so no handle needs threading here.
+    let _per_site_db_active = wire_per_site_db(&config, &query_stats, cluster_handle.is_some())?;
 
     // Upstream health for every configured SQL proxy, built BEFORE the HTTP
     // listeners so `/_ephpm/ready` can never report ready in the window
@@ -1626,6 +1634,16 @@ async fn start_db_proxies(
                 &mut handles,
             )
             .await?;
+        } else if is_per_site_sqlite(config, cluster.is_some()) {
+            // Per-site (multi-tenant) mode: the per-site registry was already
+            // built and registered with the PHP bridge in `serve()`. DB access
+            // is exclusively through the in-process `ephpm_db_*` bridge, which
+            // resolves each request's own tenant database. No shared wire
+            // listener is started here: a single litewire listener binds one
+            // backend for all connections, so serving `pdo_mysql` on a shared
+            // port would be one database shared by every tenant — exactly the
+            // cross-tenant hole (issue #274 / pentest C1) this feature closes.
+            warn_wire_disabled_for_multisite(sqlite_config);
         } else {
             start_single_node_sqlite(sqlite_config, query_stats, &mut handles).await?;
         }
@@ -1691,6 +1709,115 @@ fn warn_on_removed_sqlite_knobs(sqlite_config: &ephpm_config::SqliteConfig) {
 fn is_clustered_sqlite(sqlite_config: &ephpm_config::SqliteConfig, cluster_enabled: bool) -> bool {
     let role = sqlite_config.replication.role.as_str();
     role == "primary" || role == "replica" || (role == "auto" && cluster_enabled)
+}
+
+/// Whether the embedded database runs in **per-site** (secure multi-tenant)
+/// mode: `[db.sqlite]` is configured, `[server] sites_dir` is set, and the
+/// database is not clustered.
+///
+/// This is the single source of truth shared by `serve()` (which builds and
+/// registers the per-site registry), `start_db_proxies` (which then skips the
+/// shared wire listener), and `Router::new` (which pushes the per-request site
+/// key to the bridge) — so all three agree on when isolation is active.
+///
+/// Clustered multi-site is intentionally excluded: the Turso CDC path
+/// replicates one database, and per-site isolation for a cluster is a larger
+/// design (see the per-site DB docs). In that configuration the databases are
+/// shared across tenants; `serve()` warns loudly.
+pub(crate) fn is_per_site_sqlite(config: &Config, cluster_enabled: bool) -> bool {
+    config.db.sqlite.as_ref().is_some_and(|s| {
+        config.server.sites_dir.is_some() && !is_clustered_sqlite(s, cluster_enabled)
+    })
+}
+
+/// Build the per-site database registry and register it with the PHP bridge,
+/// when per-site mode is active. Returns whether it is active (for the router
+/// flag). The registry itself is kept alive by the resolver `Arc` handed to
+/// the bridge, so it is dropped here intentionally.
+///
+/// Fails closed: in multi-site mode `[db.sqlite] dir` is **required** — a
+/// single shared database would defeat tenant isolation, so refuse to start
+/// rather than silently share one.
+fn wire_per_site_db(
+    config: &Config,
+    query_stats: &ephpm_query_stats::QueryStats,
+    cluster_enabled: bool,
+) -> anyhow::Result<bool> {
+    // A multi-site + clustered SQLite config cannot get per-site isolation
+    // yet: warn rather than silently pretend it is isolated.
+    if let Some(sqlite) = &config.db.sqlite {
+        if config.server.sites_dir.is_some() && is_clustered_sqlite(sqlite, cluster_enabled) {
+            tracing::warn!(
+                "[db.sqlite] multi-site mode ([server] sites_dir) combined with clustered \
+                 replication does NOT get per-site database isolation — all virtual hosts share \
+                 the clustered database. Per-site isolation is single-node only. Run single-node \
+                 for isolated per-tenant databases, or accept a shared database in clustered mode."
+            );
+        }
+    }
+
+    if !is_per_site_sqlite(config, cluster_enabled) {
+        return Ok(false);
+    }
+
+    let sqlite = config.db.sqlite.as_ref().expect("sqlite present in per-site mode");
+    validate_sqlite_engine(&sqlite.engine)?;
+
+    let dir = sqlite.dir.as_ref().map(std::path::PathBuf::from).ok_or_else(|| {
+        anyhow::anyhow!(
+            "[db.sqlite] dir is required in multi-site mode ([server] sites_dir is set): each \
+             virtual host needs its own database file at <dir>/<host>.db. Set \
+             `[db.sqlite] dir = \"...\"` to enable per-site isolation. Refusing to start with a \
+             single shared database, which would let one tenant read and write another's data \
+             (see issue #274)."
+        )
+    })?;
+
+    let registry = site_backends::SiteBackends::new(
+        dir,
+        sqlite.max_open_dbs,
+        query_stats.clone(),
+        tokio::runtime::Handle::current(),
+    )?;
+    ephpm_php::PhpRuntime::set_db_backend_resolver(
+        registry.as_resolver(),
+        tokio::runtime::Handle::current(),
+    );
+    tracing::info!(
+        max_open_dbs = sqlite.max_open_dbs,
+        "per-site database isolation enabled (one Turso database per virtual host, served via \
+         the in-process ephpm_db_* bridge)"
+    );
+    Ok(true)
+}
+
+/// Log the wire-listener decision for per-site (multi-tenant) mode.
+///
+/// The MySQL/Hrana/PG/TDS handshake carries no virtual-host name, so a single
+/// litewire listener cannot route a connection to the right tenant's database
+/// — one listener means one backend for everyone. Rather than reintroduce the
+/// shared-database hole, per-site mode serves the database only through the
+/// in-process `ephpm_db_*` bridge (where the site is known per request) and
+/// does not start the shared wire listeners. Surface that plainly, and warn if
+/// the operator explicitly configured optional wire frontends that are now
+/// inert.
+fn warn_wire_disabled_for_multisite(sqlite_config: &ephpm_config::SqliteConfig) {
+    let proxy = &sqlite_config.proxy;
+    if proxy.hrana_listen.is_some() || proxy.postgres_listen.is_some() || proxy.tds_listen.is_some()
+    {
+        tracing::warn!(
+            "[db.sqlite.proxy] wire listeners (hrana/postgres/tds) are configured but IGNORED in \
+             multi-site mode: a single wire listener cannot route by virtual host, so it would \
+             serve one shared database to all tenants. Per-site database access is via the PHP \
+             native ephpm_db_* functions instead."
+        );
+    }
+    tracing::info!(
+        "per-site database mode: shared SQLite wire listeners are disabled. PHP reaches its own \
+         per-site database through the native ephpm_db_* functions; connecting via pdo_mysql to a \
+         shared port is intentionally not served in multi-site mode (it would be one database for \
+         all tenants). See the per-site database docs."
+    );
 }
 
 /// Start single-node SQLite via the in-process Turso engine.
@@ -1942,6 +2069,8 @@ mod lib_tests {
     fn make_sqlite_config(role: &str) -> ephpm_config::SqliteConfig {
         ephpm_config::SqliteConfig {
             path: "test.db".into(),
+            dir: None,
+            max_open_dbs: 256,
             engine: "turso".into(),
             proxy: ephpm_config::SqliteProxyConfig::default(),
             sqld: None,
