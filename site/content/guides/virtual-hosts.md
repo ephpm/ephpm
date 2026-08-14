@@ -146,6 +146,26 @@ The tradeoff is granularity: the whole shared database replicates as a unit. You
 - Move high-traffic sites to an external MySQL via the DB proxy
 - Run a separate ephpm instance (with its own database) for sites with different HA needs
 
+## Filesystem Isolation (temp & sessions)
+
+In multi-tenant mode each virtual host also gets its own private temp and session storage, so tenants cannot read, enumerate, or overwrite each other's temp files, uploads, or PHP session files.
+
+### How It Works
+
+For each vhost, ephpm derives a private state root `<system-temp>/ephpm-vhosts/<label>-<digest>` from the resolved (traversal-safe) document root — stable per site across restarts, and distinct for every site. Its `tmp/` and `sessions/` subdirectories are created once per site (`0700` on Unix), and every request routed to that vhost runs with:
+
+| PHP directive | Value | Effect |
+|---|---|---|
+| `open_basedir` | `<document-root>` + `<state-root>` | the **only** temp path in the sandbox is this vhost's own state root — never the shared system temp |
+| `sys_temp_dir` / `upload_tmp_dir` | `<state-root>/tmp` | `tempnam()` and file uploads land in the site's own temp |
+| `session.save_path` | `<state-root>/sessions` | the default `files` session handler writes each site's sessions to its own directory |
+
+Because `open_basedir` no longer contains the shared system temp dir, even an absolute-path read of another tenant's temp or `sess_*` file is denied by PHP. `session.save_path` and `upload_tmp_dir` are re-read per request, so sessions persist correctly within a site across its own requests while staying invisible to other sites. This is the fix for the shared-`/tmp` cross-tenant read/write and session-hijack issue (#276).
+
+Single-site deployments (no `sites_dir`) are unchanged: `open_basedir` stays off and PHP keeps its default system-temp behaviour for temp files and sessions.
+
+> Note: `open_basedir` is an in-process boundary, not a kernel/container boundary. It is the right control for cooperating tenants and defence-in-depth; to host **untrusted** per-PR code you still want a real per-preview isolation boundary (container/VM or per-uid + namespace).
+
 ## KV Store Isolation
 
 In multi-tenant mode, each virtual host gets its own physically separate KV store. Not key prefixing — a completely separate `DashMap`. PHP applications don't need any code changes, and RESP (Redis protocol) connections are also isolated per-site via AUTH.
