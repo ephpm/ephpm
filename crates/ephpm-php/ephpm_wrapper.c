@@ -214,6 +214,55 @@ void ephpm_set_max_execution_time(long secs)
 #endif
 }
 
+#ifdef EPHPM_NATIVE_EXEC_TIMER
+/* Arm PHP's per-thread execution timer for a request AND mirror the effective
+ * limit into the max_execution_time ini entry, so userland ini_get() reports
+ * the value that is actually being enforced instead of the 0 the embed SAPI
+ * leaves behind (#279). Called at the start of every request on both the fpm
+ * and worker paths.
+ *
+ * Two steps, order-sensitive:
+ *
+ *   1. zend_set_timeout(secs, reset_signals=1) is the AUTHORITATIVE arm: it
+ *      (re)installs the SIGRTMIN disposition and starts the countdown from the
+ *      configured baseline. Doing this first means the timer state does not
+ *      depend on what step 2's ini handler does.
+ *
+ *   2. zend_alter_ini_entry_chars(...STAGE_RUNTIME) updates the ini entry so
+ *      ini_get('max_execution_time') reflects reality. This is exactly how PHP's
+ *      own set_time_limit() writes the value. Altering the entry at RUNTIME
+ *      stage re-enters max_execution_time's OnUpdateTimeout handler, which sets
+ *      EG(timeout_seconds) and re-arms via zend_set_timeout(secs, 0). That
+ *      re-entrant re-arm is harmless and does NOT fight step 1 or leak a timer:
+ *      it targets the same per-thread POSIX timer with the same value
+ *      (timer_settime replaces the setting in place — no new timer_create), the
+ *      SIGRTMIN handler is already installed by step 1, and it merely restarts
+ *      the identical countdown microseconds later. secs==0 leaves the entry at
+ *      "0" (genuinely unlimited) and OnUpdateTimeout disarms — preserving #277's
+ *      "0 means only the server backstop applies" semantics.
+ *
+ * A subsequent userland set_time_limit(N) during the request still overrides
+ * both the timer and ini_get, live, on top of this baseline (its own
+ * zend_alter_ini_entry_chars call runs after this one returns).
+ *
+ * No zend_try guard: zend_set_timeout and ini alteration do not zend_bailout
+ * (they return FAILURE on error rather than longjmp'ing), matching the bare
+ * zend_set_timeout calls this replaces and the request_ini replay above. */
+static void ephpm_arm_exec_timer(void)
+{
+    zend_set_timeout(g_configured_max_exec_secs, 1);
+
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%ld", g_configured_max_exec_secs);
+    if (n > 0 && (size_t)n < sizeof(buf)) {
+        zend_string *key = zend_string_init(ZEND_STRL("max_execution_time"), 0);
+        zend_alter_ini_entry_chars(key, buf, (size_t)n, ZEND_INI_USER,
+                                   ZEND_INI_STAGE_RUNTIME);
+        zend_string_release(key);
+    }
+}
+#endif
+
 /* Worker mode — lazy Envelope backing store (Phase 1 fast path).
  *
  * `take_request` stashes borrowed pointers to the Rust-owned request data
@@ -1010,8 +1059,10 @@ int ephpm_execute_request(const char *filename)
      * EG(timeout_seconds), which the embed SAPI has reset to 0 (unlimited) — so
      * we arm explicitly from the configured value here, right before executing
      * the script. reset_signals = 1 also (re)installs the SIGRTMIN disposition.
-     * A value of 0 means "no limit" and disarms, matching PHP semantics. */
-    zend_set_timeout(g_configured_max_exec_secs, 1);
+     * A value of 0 means "no limit" and disarms, matching PHP semantics.
+     * ephpm_arm_exec_timer() also mirrors the value into the ini entry so
+     * ini_get('max_execution_time') reports the enforced limit, not 0 (#279). */
+    ephpm_arm_exec_timer();
 #endif
 
     /* Execute the script with bailout protection.
@@ -1719,8 +1770,11 @@ PHP_FUNCTION(ephpm_worker_take_request)
      * INI_INT / EG(timeout_seconds) — is what prevents a previous request's
      * set_time_limit(0) (which set EG(timeout_seconds)=0 and altered the ini
      * entry at RUNTIME stage) from leaking into this one. set_time_limit()
-     * during this request still re-arms live on top of this baseline. */
-    zend_set_timeout(g_configured_max_exec_secs, 1);
+     * during this request still re-arms live on top of this baseline.
+     * ephpm_arm_exec_timer() also mirrors the value back into the ini entry, so
+     * a prior request's set_time_limit(0) does not leave ini_get() reporting 0
+     * on this fresh request either (#279). */
+    ephpm_arm_exec_timer();
 #endif
 
     /* Point the SAPI request-info + POST buffers at this request so php://input
