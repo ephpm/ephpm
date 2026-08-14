@@ -192,10 +192,9 @@ Two extra guarantees apply on this path:
 - **`ATTACH` / `DETACH` / `VACUUM`, and path-bearing `PRAGMA`s, are rejected**
   before reaching the engine (they would be a cross-database escape). This
   screening is on regardless of mode.
-- Multi-tenant database access is **through these functions only**. The shared
-  `pdo_mysql`/`pdo_pgsql` wire port is not served in multi-site mode, because a
-  single wire listener cannot tell which tenant a connection belongs to and
-  would hand everyone one shared database. Use `ephpm_db_*`.
+- **`pdo_mysql` works here too**, against each site's own database — see
+  [Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/). The bridge is
+  not the only way in.
 
 Per-site isolation is single-node only; see the
 [`[db.sqlite]` reference](/reference/config/#dbsqlite) for `dir` and

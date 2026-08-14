@@ -50,6 +50,7 @@ base64ct = { workspace = true }
 tokio-util.workspace = true
 bytes.workspace = true
 sha2.workspace = true
+getrandom.workspace = true
 async-channel.workspace = true
 quinn.workspace = true
 h3.workspace = true
@@ -80,6 +81,10 @@ otlp = [
 tracing-subscriber.workspace = true
 tempfile.workspace = true
 rcgen.workspace = true
+# Builds the client side of a mysql_native_password handshake, so the per-site
+# wire-auth tests drive the real challenge/response rather than asserting
+# against the verifier's own arithmetic.
+sha1.workspace = true
 # Paused-clock (`start_paused`) support for the idle-timeout watchdog tests.
 tokio = { workspace = true, features = ["test-util"] }
 # Real MySQL client for the handle-reuse experiment: PHP's `pdo_mysql` opens a

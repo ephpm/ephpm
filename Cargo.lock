@@ -1451,6 +1451,7 @@ dependencies = [
  "ephpm-php",
  "ephpm-query-stats",
  "flate2",
+ "getrandom 0.3.4",
  "h3",
  "h3-quinn",
  "http",
@@ -1474,6 +1475,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "sha1",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
@@ -2145,7 +2147,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2617,7 +2619,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 [[package]]
 name = "litewire"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
+source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
 dependencies = [
  "anyhow",
  "futures",
@@ -2636,7 +2638,7 @@ dependencies = [
 [[package]]
 name = "litewire-backend"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
+source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
 dependencies = [
  "async-trait",
  "parking_lot",
@@ -2649,7 +2651,7 @@ dependencies = [
 [[package]]
 name = "litewire-hrana"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
+source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2664,13 +2666,15 @@ dependencies = [
 [[package]]
 name = "litewire-mysql"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
+source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
 dependencies = [
  "async-trait",
+ "getrandom 0.3.4",
  "litewire-backend",
  "litewire-session",
  "litewire-translate",
  "opensrv-mysql",
+ "sha1",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2679,7 +2683,7 @@ dependencies = [
 [[package]]
 name = "litewire-postgres"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
+source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
 dependencies = [
  "async-trait",
  "futures",
@@ -2694,7 +2698,7 @@ dependencies = [
 [[package]]
 name = "litewire-session"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
+source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
 dependencies = [
  "litewire-backend",
  "litewire-translate",
@@ -2705,7 +2709,7 @@ dependencies = [
 [[package]]
 name = "litewire-tds"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
+source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
 dependencies = [
  "bytes",
  "litewire-backend",
@@ -2718,7 +2722,7 @@ dependencies = [
 [[package]]
 name = "litewire-translate"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
+source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
 dependencies = [
  "lru 0.12.5",
  "parking_lot",
@@ -2730,7 +2734,7 @@ dependencies = [
 [[package]]
 name = "litewire-turso"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=e34c63928ed9#e34c63928ed90b6ca67b24d0e45fac5ef9e34674"
+source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
 dependencies = [
  "async-trait",
  "litewire-backend",
@@ -3682,7 +3686,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.37",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3719,7 +3723,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.59.0",
 ]

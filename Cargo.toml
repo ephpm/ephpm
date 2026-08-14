@@ -62,6 +62,10 @@ tokio-util = { version = "0.7", features = ["rt", "compat"] }
 bytes = "1"
 sha1 = "0.10"
 sha2 = "0.10"
+# OS entropy for the per-process per-site database master secret
+# (ephpm-server/src/site_wire_auth.rs). A syscall shim, not a generator — this
+# secret is drawn once at startup, so there is nothing to seed or reseed.
+getrandom = "0.3"
 hmac = "0.12"
 hkdf = "0.12"
 chacha20poly1305 = "0.10"
@@ -105,7 +109,44 @@ ephpm-server = { path = "crates/ephpm-server" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire main @ e34c6392 — WordPress-correctness fixes (litewire#25, #26).
+# litewire main @ b16d874b — per-connection backend selection (litewire#27).
+# Adds `LiteWire::with_authenticator` + the `ConnectionAuthenticator` trait,
+# which is what lets ONE MySQL listener front many per-site databases: the
+# backend is resolved during the handshake from the *authenticated* username,
+# so a tenant that cannot produce another tenant's password cannot reach its
+# database. ePHPm consumes this in `site_wire_auth.rs` to restore multi-tenant
+# `pdo_mysql` (#286) after #284 had to disable the wire listeners.
+#
+# Three parts matter to us:
+# (1) `ConnectionAuthenticator::authenticate` is async and returns
+# `Option<SharedBackend>` — `None` refuses the connection. It runs BEFORE any
+# backend session exists, so a connection that never authenticates has nothing
+# to reach. That "no auth ⇒ no backend" property is structural in the handler
+# (an empty `OnceLock` that only `authenticate()` fills, plus a refusal on
+# every command path), not a check — opensrv-mysql calls `authenticate()`
+# conditionally on `handshake.username.is_some()`, and its parser yields `None`
+# on the pre-TLS CLIENT_SSL branch. That branch is unreachable while
+# opensrv-mysql keeps its default `tls` feature, but `default-features = false`
+# would drop the re-parse that saves it and turn it into an auth bypass.
+# (2) `litewire_mysql::native_password` — server-side mysql_native_password
+# verification (constant-time). Protocol, not policy: which tenant owns which
+# password stays with us.
+# (3) A random per-connection scramble on the authenticating path.
+# opensrv-mysql's default salt is a compile-time CONSTANT shared by every
+# connection ever made, which makes an `auth_response` a static function of the
+# password and replayable forever.
+#
+# Strictly additive: `LiteWire::new(backend)`, `MysqlFrontend::new`, and the
+# single-site path are behaviour-identical — single-site keeps the historical
+# accept-everyone handshake and the upstream constant salt.
+#
+# SECURITY: do not move this pin backwards past b16d874b while multi-site
+# `pdo_mysql` is enabled. Earlier revisions have no `with_authenticator` at
+# all, so the multi-tenant listener cannot be built — but a revision that had
+# a partial form would serve one shared database to every tenant, which is the
+# hole #284/#286 exist to close.
+#
+# Previous pin e34c6392 — WordPress-correctness fixes (litewire#25, #26).
 # Three things, all found by benchmarking real WordPress on ephpm:
 # (1) MySQL LIKE patterns now get the implicit ESCAPE '\' clause SQLite
 # lacks, so wpdb::esc_like()-escaped %/_ match literally (litewire#20).
@@ -199,7 +240,7 @@ ephpm-server = { path = "crates/ephpm-server" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "e34c63928ed9", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "b16d874b73a3", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.0)
