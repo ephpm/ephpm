@@ -61,8 +61,24 @@ const CLUSTER_SUITES: &[&str] = &["cluster"];
 /// functions instead of pdo_mysql. Its rollback-at-request-end assertions
 /// additionally depend on no OTHER suite leaving transactions around,
 /// which the fresh node guarantees.
-const ISOLATED_DB_SUITES: &[&str] =
-    &["sqlite", "sqlite_advanced", "rw_split", "query_stats", "db_bridge"];
+///
+/// `hrana`, `postgres_proxy` and `tds_proxy` are here for a second reason on
+/// top of the state one (they each `CREATE TABLE` through `/db.php` or
+/// `/sqlite_test.php`): they are the suites that assert the *wire listeners*
+/// still work when a second frontend is enabled, and a `sites_dir` node has no
+/// wire listeners at all — per-site database mode deliberately does not start
+/// them, because one listener cannot route by virtual host. They therefore
+/// cannot live on the shared (multi-tenant) node.
+const ISOLATED_DB_SUITES: &[&str] = &[
+    "sqlite",
+    "sqlite_advanced",
+    "rw_split",
+    "query_stats",
+    "db_bridge",
+    "hrana",
+    "postgres_proxy",
+    "tds_proxy",
+];
 
 /// Single-node suites that need a bespoke server config and their own fresh
 /// node (also sequential, also reusing the single-node ports).
@@ -127,6 +143,13 @@ const SKIP_SUITES: &[&str] = &[];
 // long-lived shared single node" is a decision rather than an oversight.
 // Nothing reads this note; it exists so a future reader does not "fix" the
 // omission by moving a suite onto its own fixture.
+//
+// - `vhosts` and `security_p0` — the only readers of `EPHPM_SITES_DIR`, and so
+//   the only reason the shared node runs multi-tenant at all. Everything else
+//   on that node is indifferent to `sites_dir`; nothing else on it touches the
+//   database, which is what makes multi-tenant mode (no SQLite wire listeners)
+//   viable there. If a future suite on the shared node needs `pdo_mysql`, it
+//   belongs in ISOLATED_DB_SUITES, not on this node.
 //
 // - `path_traversal` — drives hand-written request lines over a raw TcpStream
 //   (reqwest normalizes `../` client-side, so the attack is not expressible
@@ -580,29 +603,50 @@ fn recreate_dir(path: &Path) -> io::Result<()> {
 
 // ── config templates ────────────────────────────────────────────────────────
 
-/// Single-node ephpm.toml template. Placeholders: `{HTTP_PORT}`, `{MYSQL_PORT}`,
-/// `{HRANA_PORT}`, `{PG_PORT}`, `{TDS_PORT}`, `{DATA_DIR}`, `{DOCROOT}`,
-/// `{SITES_DIR_LINE}` (the whole `sites_dir = "..."` line, or empty),
-/// `{OPCACHE_BLOCK}` (an optional `[opcache]` section, or empty),
-/// `{MIDDLEWARE_BLOCK}` (an optional `[[middleware]]` mount, or empty),
+/// Single-node ephpm.toml template. Placeholders: `{HTTP_PORT}`, `{DATA_DIR}`,
+/// `{DOCROOT}`, `{SITES_DIR_LINE}` (the whole `sites_dir = "..."` line, or
+/// empty), `{DB_SQLITE_BLOCK}` (the whole `[db.sqlite]` section — see
+/// [`SingleNodeOptions::with_sites_dir`]), `{KV_SECRET_LINE}` (a `[kv] secret`
+/// line, or empty), `{OPCACHE_BLOCK}` (an optional `[opcache]` section, or
+/// empty), `{MIDDLEWARE_BLOCK}` (an optional `[[middleware]]` mount, or empty),
 /// `{KV_SOCKET}`.
 ///
 /// Shape mirrors `tests/ephpm-test.toml` (the config baked into the container
 /// image) as closely as possible. The only intentional divergences are:
-/// (a) `listen`/`sites_dir`/`document_root`/`db.sqlite.path`/`kv.redis_compat.socket`
+/// (a) `listen`/`sites_dir`/`document_root`/`db.sqlite.*`/`kv.redis_compat.socket`
 /// point at per-run scratch paths instead of the container's fixed
 /// `/var/www/...` and `/tmp/...` layout; (b) the HTTP `listen` port is a high
 /// loopback port so a single-node fixture can coexist with the cluster fixture
 /// on the same host.
 ///
-/// The DB proxy listeners deliberately keep the SAME ports as the reference
-/// config (mysql 3306, hrana 8081, postgres 5432, tds 1433). The docroot PHP
-/// scripts (`db.php`, `sqlite_test.php`, `rw_split_test.php`, ...) connect via
-/// `pdo_mysql` to a hardcoded `127.0.0.1:3306` fallback -- `[db.sqlite]` mode
-/// does NOT inject `DB_HOST`/`DB_PORT` into PHP (only `[db.mysql]`/`[db.postgres]`
-/// do, see `build_db_env_vars` in ephpm-server/src/router.rs). Moving the mysql
-/// proxy off 3306 makes every SQLite write 500 with a connection-refused. A
-/// single node owns the loopback here, so the standard ports do not collide.
+/// # Why the `[db.sqlite]` and `[kv] secret` bits are a placeholder
+///
+/// Both are *forced* by `sites_dir`, in opposite directions, so a single
+/// hard-coded shape cannot serve both kinds of node:
+///
+/// - **`[kv] secret`** — `Config::validate` refuses to start when `sites_dir`
+///   is set, `[kv.redis_compat] enabled = true`, and no `[kv] secret` is
+///   configured (the listener would serve one shared KV store to every tenant
+///   unauthenticated). Setting a secret unconditionally is equally wrong: it
+///   makes the RESP listener demand `AUTH`, and `opcache_invalidation` talks to
+///   that listener unauthenticated.
+/// - **`[db.sqlite]`** — with `sites_dir` set, single-node embedded SQLite runs
+///   in per-site mode, where `dir` (one database file per vhost) is REQUIRED
+///   and the shared wire listeners are deliberately NOT started: one listener
+///   means one backend for every tenant, which is the cross-tenant hole
+///   per-site isolation exists to close. So a `sites_dir` node cannot serve
+///   `pdo_mysql` at all, and a node whose suites use `pdo_mysql` cannot have a
+///   `sites_dir`.
+///
+/// On nodes WITHOUT `sites_dir` the DB proxy listeners deliberately keep the
+/// SAME ports as the reference config (mysql 3306, hrana 8081, postgres 5432,
+/// tds 1433). The docroot PHP scripts (`db.php`, `sqlite_test.php`,
+/// `rw_split_test.php`, ...) connect via `pdo_mysql` to a hardcoded
+/// `127.0.0.1:3306` fallback -- `[db.sqlite]` mode does NOT inject
+/// `DB_HOST`/`DB_PORT` into PHP (only `[db.mysql]`/`[db.postgres]` do, see
+/// `build_db_env_vars` in ephpm-server/src/router.rs). Moving the mysql proxy
+/// off 3306 makes every SQLite write 500 with a connection-refused. Only one
+/// single node runs at a time, so the standard ports do not collide.
 const SINGLE_NODE_TEMPLATE: &str = r#"# Auto-generated by `cargo xtask e2e` -- do not edit.
 [server]
 listen = "127.0.0.1:{HTTP_PORT}"
@@ -670,14 +714,7 @@ ini_overrides = [
 max_connections = 100
 {LIMITS_BLOCK}
 
-[db.sqlite]
-path = "{DATA_DIR}/ephpm-test.db"
-
-[db.sqlite.proxy]
-mysql_listen = "127.0.0.1:{MYSQL_PORT}"
-hrana_listen = "127.0.0.1:{HRANA_PORT}"
-postgres_listen = "127.0.0.1:{PG_PORT}"
-tds_listen = "127.0.0.1:{TDS_PORT}"
+{DB_SQLITE_BLOCK}
 
 [server.timeouts]
 header_read = 20
@@ -691,6 +728,7 @@ sticky_duration = "2s"
 [kv]
 memory_limit = "64MB"
 eviction_policy = "allkeys-lru"
+{KV_SECRET_LINE}
 
 [kv.redis_compat]
 enabled = true
@@ -749,6 +787,13 @@ data_port = {KV_DATA_PORT}
 
 // ── single-node fixture ─────────────────────────────────────────────────────
 
+/// `[kv] secret` handed to every multi-tenant (`sites_dir`) node.
+///
+/// A fixed value is fine: these nodes are throwaway and their RESP listener is
+/// bound to loopback plus a scratch unix socket. It exists only because the
+/// server fails closed without it — see [`SingleNodeOptions::with_sites_dir`].
+const E2E_KV_SECRET: &str = "e2e-kv-secret-not-for-production";
+
 /// Per-fixture single-node config knobs.
 ///
 /// The isolated suites need small config divergences from the shared node;
@@ -757,10 +802,28 @@ struct SingleNodeOptions {
     /// Scratch subdirectory name (keeps logs/DBs from stomping each other when
     /// several fresh nodes are spawned sequentially). Also used for log labels.
     slug: String,
-    /// Configure `[server] sites_dir`. The shared node needs it (vhost/security
-    /// suites deploy per-host site dirs); the opcache suite must NOT have it
-    /// (with a sites_dir, the OPcache vhost key for a `127.0.0.1` request is
-    /// the host, not `_default`, and the test writes `opcache:version:_default`).
+    /// Configure `[server] sites_dir` — i.e. run this node **multi-tenant**.
+    ///
+    /// Only the long-lived shared node sets it, because only `vhosts` and
+    /// `security_p0` need it (they are the sole readers of `EPHPM_SITES_DIR`).
+    /// Every isolated node runs single-site.
+    ///
+    /// This one flag decides three things at once, because the server ties them
+    /// together and fails closed on the mismatched combinations:
+    ///
+    /// 1. `[kv] secret` is emitted (required: multi-tenant RESP with no secret
+    ///    is refused at startup) — and NOT emitted otherwise (a secret makes the
+    ///    RESP listener demand `AUTH`, which `opcache_invalidation` does not
+    ///    send).
+    /// 2. `[db.sqlite]` uses `dir` (per-site database files, required in
+    ///    multi-site mode) instead of `path`.
+    /// 3. There are no SQLite wire listeners, because per-site mode does not
+    ///    start them — so no suite that reaches the database over `pdo_mysql`
+    ///    can run on a `sites_dir` node.
+    ///
+    /// It also moves the OPcache vhost key for a `127.0.0.1` request from
+    /// `_default` to the request host, which is why `opcache_invalidation`
+    /// (which writes `opcache:version:_default`) must not have it.
     with_sites_dir: bool,
     /// Emit `[opcache] cluster_invalidation = true`. Off by default in
     /// single-node mode, so the opcache_invalidation suite needs it turned on
@@ -783,6 +846,9 @@ struct SingleNodeOptions {
 
 impl SingleNodeOptions {
     /// Options for the long-lived shared node (all non-isolated suites).
+    ///
+    /// This is the ONLY node with a `sites_dir`, because `vhosts` and
+    /// `security_p0` are the only suites that need one.
     fn shared() -> Self {
         Self {
             slug: "single".to_string(),
@@ -825,7 +891,7 @@ impl SingleNodeOptions {
             // ISOLATED_CONFIG_SUITES for why this can't share the shared node.
             "rate_limit" => Self {
                 slug,
-                with_sites_dir: true,
+                with_sites_dir: false,
                 opcache_invalidation: false,
                 tight_rate_limit: true,
                 middleware_lib: None,
@@ -835,17 +901,21 @@ impl SingleNodeOptions {
             // path, exercising the dlopen lane in a real server.
             "middleware" => Self {
                 slug,
-                with_sites_dir: true,
+                with_sites_dir: false,
                 opcache_invalidation: false,
                 tight_rate_limit: false,
                 middleware_lib: middleware_lib.map(Path::to_path_buf),
                 worker: false,
             },
-            // DB suites: fresh DB, but otherwise the same shape as the shared
-            // node (sites_dir present is harmless; they don't use it).
+            // DB suites: fresh DB, single-site. `sites_dir` is NOT optional
+            // detail here — it would put the node in per-site database mode,
+            // which does not start the SQLite wire listeners at all, and every
+            // one of these suites reaches the database over `pdo_mysql` on
+            // 127.0.0.1:3306 (or, for `db_bridge`, through the process-wide
+            // backend the single-site path registers with the PHP bridge).
             _ => Self {
                 slug,
-                with_sites_dir: true,
+                with_sites_dir: false,
                 opcache_invalidation: false,
                 tight_rate_limit: false,
                 middleware_lib: None,
@@ -965,15 +1035,49 @@ impl SingleNodeSpawn {
             ),
             None => String::new(),
         };
+        // `sites_dir` forces multi-tenant mode, and multi-tenant mode forces
+        // BOTH of the following (see SINGLE_NODE_TEMPLATE's doc comment for the
+        // full reasoning). Deriving them from the same flag is what keeps a node
+        // from being configured into a combination the server fails closed on.
+        let (db_sqlite_block, kv_secret_line) = if opts.with_sites_dir {
+            // Per-site database isolation: one file per vhost under `dir`.
+            // `dir` is REQUIRED here — the server refuses to start multi-site
+            // with only `path`, which would be one shared database for every
+            // tenant. No `[db.sqlite.proxy]`: per-site mode intentionally does
+            // not start the shared wire listeners (a single listener cannot
+            // route by virtual host), so configuring them would only earn a
+            // "configured but IGNORED" warning.
+            (
+                format!("[db.sqlite]\ndir = \"{}\"", escape_toml(&data_dir.join("sites-db"))),
+                format!("secret = \"{E2E_KV_SECRET}\""),
+            )
+        } else {
+            // Single-site: one database file, reachable over the wire
+            // listeners on the reference-config ports.
+            (
+                format!(
+                    "[db.sqlite]\npath = \"{}/ephpm-test.db\"\n\n\
+                     [db.sqlite.proxy]\n\
+                     mysql_listen = \"127.0.0.1:{mysql_port}\"\n\
+                     hrana_listen = \"127.0.0.1:{hrana_port}\"\n\
+                     postgres_listen = \"127.0.0.1:{pg_port}\"\n\
+                     tds_listen = \"127.0.0.1:{tds_port}\"",
+                    escape_toml(&data_dir)
+                ),
+                // Deliberately NO `[kv] secret`: without a `sites_dir` the
+                // shared KV store is the intended behaviour, and a secret would
+                // switch the RESP listener to requiring `AUTH` — which
+                // `opcache_invalidation` (the one suite that speaks RESP
+                // directly) does not send.
+                String::new(),
+            )
+        };
 
         let config = SINGLE_NODE_TEMPLATE
             .replace("{HTTP_PORT}", &http_port.to_string())
-            .replace("{MYSQL_PORT}", &mysql_port.to_string())
-            .replace("{HRANA_PORT}", &hrana_port.to_string())
-            .replace("{PG_PORT}", &pg_port.to_string())
-            .replace("{TDS_PORT}", &tds_port.to_string())
-            .replace("{DATA_DIR}", &escape_toml(&data_dir))
             .replace("{SITES_DIR_LINE}", &sites_dir_line)
+            .replace("{DB_SQLITE_BLOCK}", &db_sqlite_block)
+            .replace("{KV_SECRET_LINE}", &kv_secret_line)
             .replace("{OPCACHE_BLOCK}", &opcache_block)
             .replace("{MIDDLEWARE_BLOCK}", &middleware_block)
             .replace("{LIMITS_BLOCK}", limits_block)
