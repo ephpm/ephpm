@@ -63,7 +63,10 @@
 //! Turso already refusing them. `ATTACH` is the exact cross-tenant primitive
 //! of issue #274 (read/write another site's file, or plant a PHP shell in it):
 //! making the refusal ePHPm's own, not the pinned engine's default, keeps the
-//! property if a future engine bump ever flips that default.
+//! property if a future engine bump ever flips that default. A leading
+//! `EXPLAIN` / `EXPLAIN QUERY PLAN` diagnostic wrapper is seen through before
+//! the check, so `EXPLAIN ATTACH …` is refused just like `ATTACH …` rather
+//! than sliding under a leading-keyword match.
 //!
 //! # Transactions end with the request
 //!
@@ -652,24 +655,27 @@ fn screen_sql(sql: &str) -> Result<(), String> {
 
 /// Reject one statement whose leading keyword is forbidden. Empty /
 /// comment-only statements are allowed.
+///
+/// A leading `EXPLAIN` / `EXPLAIN QUERY PLAN` diagnostic wrapper is seen
+/// through first (see [`strip_explain_prefixes`]), so `EXPLAIN ATTACH …` is
+/// refused for the same reason and with the same error as `ATTACH …`. The
+/// wrapper does not make the inner statement safe, and the point of this
+/// screen is that the refusal is ePHPm's own — not whatever the pinned engine
+/// happens to do with the wrapped verb today.
 fn check_statement(stmt: &str) -> Result<(), String> {
-    let trimmed = strip_leading_noise(stmt);
+    let trimmed = strip_explain_prefixes(stmt)?;
     if trimmed.is_empty() {
         return Ok(());
     }
-    let keyword: String = trimmed
-        .chars()
-        .take_while(char::is_ascii_alphabetic)
-        .collect::<String>()
-        .to_ascii_uppercase();
+    let (keyword, rest) = leading_keyword(trimmed);
 
     if FORBIDDEN_KEYWORDS.contains(&keyword.as_str()) {
         return Err(keyword);
     }
     if keyword == "PRAGMA" {
         // Extract the pragma name (first token after `PRAGMA`), lowercased.
-        let rest = trimmed[keyword.len()..].trim_start();
         let name: String = rest
+            .trim_start()
             .chars()
             .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
             .collect::<String>()
@@ -679,6 +685,58 @@ fn check_statement(stmt: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Split off the leading run of ASCII letters (a SQL keyword) from `s`,
+/// uppercased, and return it together with the remainder that follows it.
+/// The run is ASCII-only, so its byte length equals its character count and
+/// the split point is unambiguous. Returns `("", s)` when `s` does not start
+/// with a letter (e.g. it is empty, or begins with a digit or punctuation).
+fn leading_keyword(s: &str) -> (String, &str) {
+    let len = s.bytes().take_while(u8::is_ascii_alphabetic).count();
+    (s[..len].to_ascii_uppercase(), &s[len..])
+}
+
+/// See through leading `EXPLAIN` / `EXPLAIN QUERY PLAN` prefixes so the
+/// statement they wrap is what [`check_statement`]'s forbidden-verb check
+/// inspects. Both are diagnostic wrappers: `EXPLAIN ATTACH DATABASE '…'`
+/// parses its *first* keyword as `EXPLAIN`, so a screen that only looked at
+/// the leading keyword would wave it through and leave the refusal to the
+/// engine's default — exactly the property this screen exists to own.
+///
+/// It reuses [`strip_leading_noise`] between every token, so it is comment-
+/// and whitespace-aware (`EXPLAIN /* c */ ATTACH`, a leading-tab/newline
+/// `EXPLAIN`), and it is case-insensitive. It peels *repeated* prefixes in a
+/// loop, so a nested `EXPLAIN EXPLAIN ATTACH` (whether or not the engine's
+/// grammar even accepts it) still exposes the inner `ATTACH` to the check
+/// rather than hiding it behind the outer wrapper. `EXPLAIN QUERY PLAN` is
+/// consumed only as the exact three-token unit; a malformed `EXPLAIN QUERY
+/// <not PLAN>` is rejected conservatively rather than passed on.
+///
+/// Legitimate `EXPLAIN SELECT …` / `EXPLAIN QUERY PLAN SELECT …` are
+/// unaffected: once the wrapper is stripped the inner `SELECT` is a permitted
+/// verb and the statement passes.
+fn strip_explain_prefixes(stmt: &str) -> Result<&str, String> {
+    let mut rest = strip_leading_noise(stmt);
+    loop {
+        let (keyword, after) = leading_keyword(rest);
+        if keyword != "EXPLAIN" {
+            return Ok(rest);
+        }
+        rest = strip_leading_noise(after);
+
+        // Optional `QUERY PLAN` — the only valid two-word form of EXPLAIN.
+        let (next, after_next) = leading_keyword(rest);
+        if next == "QUERY" {
+            let after_query = strip_leading_noise(after_next);
+            let (plan, after_plan) = leading_keyword(after_query);
+            if plan != "PLAN" {
+                return Err("EXPLAIN".to_string());
+            }
+            rest = strip_leading_noise(after_plan);
+        }
+        // Loop again: peel any further stacked EXPLAIN prefix.
+    }
 }
 
 /// Drop leading whitespace and leading SQL comments so a statement's first
@@ -1626,6 +1684,49 @@ mod screen_tests {
     fn truncated_quote_or_comment_is_rejected_conservatively() {
         rejected("SELECT 'unterminated");
         rejected("SELECT 1 /* unterminated");
+    }
+
+    #[test]
+    fn explain_wrapped_forbidden_statements_are_rejected() {
+        // `EXPLAIN <forbidden>` parses its first keyword as EXPLAIN, so a
+        // leading-keyword screen would miss it. The wrapper must be seen
+        // through and the inner verb refused with ePHPm's own error — not left
+        // to the engine's ATTACH-disabled default (pentest bypass).
+        rejected("EXPLAIN ATTACH DATABASE 'x.db' AS y");
+        rejected("explain attach database 'x.db' as y");
+        rejected("EXPLAIN QUERY PLAN ATTACH DATABASE 'x.db' AS y");
+        rejected("explain query plan attach database 'x.db' as y");
+        // Comment- and whitespace-aware between EXPLAIN and the inner verb.
+        rejected("EXPLAIN /* c */ ATTACH DATABASE 'x' AS y");
+        rejected("EXPLAIN QUERY /* c */ PLAN ATTACH DATABASE 'x' AS y");
+        rejected("  \t EXPLAIN\nATTACH DATABASE 'x' AS y");
+        rejected("EXPLAIN\t\tVACUUM INTO '/tmp/copy.db'");
+        rejected("EXPLAIN VACUUM");
+        rejected("EXPLAIN DETACH DATABASE y");
+        rejected("EXPLAIN PRAGMA data_store_directory = '/tmp'");
+        rejected("EXPLAIN QUERY PLAN PRAGMA writable_schema = ON");
+        // Stacked / nested EXPLAIN must still expose the inner forbidden verb.
+        rejected("EXPLAIN EXPLAIN ATTACH DATABASE 'x' AS y");
+        // A malformed `EXPLAIN QUERY <not PLAN>` is rejected conservatively.
+        rejected("EXPLAIN QUERY ATTACH DATABASE 'x' AS y");
+        // The wrapper hidden after a benign leading statement is still caught.
+        rejected("SELECT 1; EXPLAIN ATTACH DATABASE 'x' AS y");
+    }
+
+    #[test]
+    fn explain_wrapped_ordinary_statements_pass() {
+        // Legitimate EXPLAIN of a permitted verb must not be broken.
+        allowed("EXPLAIN SELECT 1");
+        allowed("EXPLAIN QUERY PLAN SELECT * FROM t");
+        allowed("explain query plan select * from wp_posts where id = ?");
+        allowed("EXPLAIN INSERT INTO t (a) VALUES (1)");
+        // Ordinary tuning pragmas are fine even when EXPLAINed.
+        allowed("EXPLAIN PRAGMA foreign_keys = ON");
+        // Bare EXPLAIN (no inner statement) is harmless.
+        allowed("EXPLAIN");
+        allowed("EXPLAIN QUERY PLAN");
+        // A forbidden keyword only inside a literal, behind EXPLAIN, is data.
+        allowed("EXPLAIN SELECT 'ATTACH DATABASE' AS note");
     }
 }
 
