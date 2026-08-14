@@ -98,7 +98,7 @@ This means: try the exact file, try as a directory (with index files), fall back
 | `deny from all` on `.env` | Default (dotfiles blocked automatically) |
 | `Header set X-Frame-Options DENY` | `[server.response] headers = [["X-Frame-Options", "DENY"]]` |
 | `php_value upload_max_filesize 10M` | `[server.request] max_body_size = 10485760` |
-| `php_value max_execution_time 60` | `[server.timeouts] request = 60` — **not** `[php] max_execution_time`, which is parsed but never enforced |
+| `php_value max_execution_time 60` | `[php] max_execution_time = 60` (enforced on Linux ZTS; not on macOS/Windows) — set a higher `[server.timeouts] request` above it as the hard 504 backstop |
 
 ### 4. Translate PHP Settings
 
@@ -116,15 +116,16 @@ ePHPm:
 ```toml
 [php]
 memory_limit = "256M"
+max_execution_time = 60
 ini_overrides = [
     ["display_errors", "Off"],
 ]
 
-# max_execution_time has no ePHPm equivalent under [php] — that key is
-# parsed but never enforced, because PHP's SIGPROF-based timer is
-# deliberately neutralized. The enforced deadline is HTTP-layer:
+# max_execution_time is the inner PHP deadline — natively enforced on Linux ZTS
+# (catchable fatal → HTTP 500, wall-clock, set_time_limit()-able); not enforced
+# on macOS/Windows. Put a higher request timeout above it as the hard 504 backstop:
 [server.timeouts]
-request = 60
+request = 90
 
 [server.request]
 max_body_size = 20971520   # 20 MB in bytes

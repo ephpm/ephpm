@@ -651,9 +651,13 @@ that bailed out.**
 
 ### 5.4 Detecting dead / hung workers; timeouts
 
-- **Hung request (infinite loop / blocked syscall in PHP).** SIGPROF-based
-  `max_execution_time` is no-op'd in this codebase (`ephpm_wrapper.c:532-566`)
-  — enforcement is at the HTTP layer. The existing outer
+- **Hung request (infinite loop / blocked syscall in PHP).** On Linux ZTS builds
+  with per-thread execution timers, `max_execution_time` is armed per request and
+  interrupts a pure-PHP infinite loop (catchable fatal → 500); only the legacy
+  process-wide SIGPROF timer is `--wrap`-neutralized (`ephpm_wrapper.c`), which is
+  why macOS/Windows (no per-thread timers) fall back to the HTTP layer alone. A
+  request wedged in a blocked syscall or C extension never returns to the VM to
+  observe the inner timer either way, so the existing outer
   `tokio::time::timeout(request_timeout, ...)` (`router.rs:377-386`) fires and
   returns 504 to the client. **But the worker thread is still stuck** running
   PHP — tokio's timeout cancels the *await*, not the OS thread. So: when the

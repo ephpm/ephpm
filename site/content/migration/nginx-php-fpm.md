@@ -92,10 +92,11 @@ ePHPm equivalent:
 [php]
 workers = 8            # replaces pm.max_children (auto-detected from CPU count)
 memory_limit = "256M"
+max_execution_time = 30   # ← php_admin_value[max_execution_time]. Enforced on
+                          # Linux ZTS (catchable fatal → 500); not on macOS/Windows.
 
 [server.timeouts]
-request = 30           # replaces max_execution_time; the [php] key of that
-                       # name is parsed but NOT enforced
+request = 45           # outer hard 504 backstop — keep it above max_execution_time
 
 [server.request]
 max_body_size = 67108864   # 64 MB

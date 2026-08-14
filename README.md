@@ -105,9 +105,11 @@ index_files = ["index.php", "index.html"]
 [php]
 mode = "fpm"
 memory_limit = "128M"
-# Note: [php] max_execution_time is parsed but NOT enforced (PHP's SIGPROF
-# timer is deliberately neutralized). The per-request deadline is
-# [server.timeouts] request — default 300 seconds.
+max_execution_time = 30       # inner PHP deadline (default). Natively enforced
+                              # on Linux ZTS builds (catchable fatal → HTTP 500,
+                              # wall-clock, set_time_limit()-able); not enforced
+                              # on macOS/Windows. Keep it below the outer 504
+                              # backstop, [server.timeouts] request.
 
 # Load a custom php.ini before applying overrides (optional)
 # ini_file = "/etc/php/php.ini"
