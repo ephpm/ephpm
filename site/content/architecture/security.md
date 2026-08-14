@@ -14,6 +14,7 @@ This document describes the threat model, trust boundaries, and security design 
 | PHP memory exhaustion | PHP `memory_limit` INI enforced inside the runtime; Rust allocator is separate |
 | Malformed HTTP requests | hyper's strict HTTP/1.1 parser rejects protocol violations before reaching PHP |
 | Path traversal in static file serving | Canonicalize paths and reject any resolved path outside `document_root` |
+| Host-header path traversal in multi-site mode | The `Host` header is validated against a strict DNS-label allowlist before it is joined onto `sites_dir`; separators, `..` segments, NUL, and non-DNS characters are rejected with 404 before routing (independent of `trusted_hosts`) |
 | Slowloris / slow-read attacks | hyper's `header_read_timeout` plus tokio-level timeouts from `[server.timeouts]` (no tower middleware is involved) |
 | DB credential exposure in config | Any config value can be overridden via `EPHPM_`-prefixed environment variables (figment), so secrets can come from the environment instead of the TOML |
 
@@ -30,7 +31,8 @@ The controls that exist today, in one place:
 - **Per-vhost `open_basedir`** — in multi-site mode, PHP filesystem access is restricted per-request to the site's directory plus the system temp directory (`std::env::temp_dir()`, so `TMPDIR` is honoured and Windows gets its real temp path). Entries are joined with the platform's `PATH_SEPARATOR` (`:` on Unix, `;` on Windows).
 - **`disable_shell_exec`** — `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec` disabled via the php.ini generated at startup (default on in multi-site mode)
 - **`blocked_paths`** — glob patterns matched against the URI path (patterns must start with `/`); matches return 403
-- **`trusted_hosts`** — Host header validation; non-matching hosts get 421. Internal endpoints (`/_ephpm/health`, `/_ephpm/ready`, `/_ephpm/requests` when the request timeline is enabled, the metrics path) are exempt so Kubernetes probes and Prometheus scrapes can address the pod by raw IP
+- **Multi-site `Host` sanitization** — in multi-site mode (`sites_dir` set) the `Host` header is normalized (port/trailing-dot stripped, lowercased) and validated against a strict DNS-label allowlist (`[a-z0-9._-]`, no empty label) **before** it is used to resolve a document root. Hosts containing `..`, `/`, `\`, NUL, or any other non-DNS character are rejected with 404. This runs independently of `trusted_hosts`, so it protects the default configuration (empty `trusted_hosts`) against Host-header path traversal
+- **`trusted_hosts`** — additional exact-match Host allowlisting; non-matching hosts get 421. Empty by default. Internal endpoints (`/_ephpm/health`, `/_ephpm/ready`, `/_ephpm/requests` when the request timeline is enabled, the metrics path) are exempt so Kubernetes probes and Prometheus scrapes can address the pod by raw IP. Note: exact-match only (no wildcards), so it cannot cover dynamic per-PR preview hostnames — the `Host` sanitization above is what protects those, not `trusted_hosts`
 - **`trusted_proxies`** — CIDR-based proxy trust for `X-Forwarded-For` / `X-Forwarded-Proto` resolution
 - **Hidden-file modes** — dotfile requests handled per `hidden_files` (`deny`=403, `ignore`=404, `allow`)
 - **Percent-decode traversal hardening** — strict `%XX` decoding before routing; encoded `/` and `\`, truncated or non-hex escapes, and invalid UTF-8 are rejected with 400

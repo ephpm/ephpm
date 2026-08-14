@@ -109,6 +109,12 @@ pub struct ServerConfig {
     /// Matched sites use the subdirectory as their document root.
     /// Unmatched hosts fall back to `document_root`.
     ///
+    /// The `Host` value is normalized (port/trailing-dot stripped, lowercased)
+    /// and validated against a strict DNS-label allowlist before it is joined
+    /// onto this directory, so a crafted header cannot escape it via `..` or a
+    /// path separator (see the router's `is_valid_site_key`). Malformed hosts
+    /// are rejected with 404 independently of `[server.request] trusted_hosts`.
+    ///
     /// Omit to disable vhosting (single-site mode).
     #[serde(default)]
     pub sites_dir: Option<PathBuf>,
