@@ -150,7 +150,16 @@ impl SiteBackends {
     /// before it reached here, re-check it — a database path must never be
     /// derived from anything but a traversal-safe `[a-z0-9._-]` key, so the
     /// join can only ever name a direct child of `dir`.
-    fn db_path_for(&self, site_key: &str) -> anyhow::Result<PathBuf> {
+    ///
+    /// `pub(crate)` so the site-key agreement test can assert the *file* this
+    /// registry would open for a key against the other three derivations
+    /// (document root, state root, wire credential) — see
+    /// `router::tests::site_key_agreement`.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `site_key` is not a valid site key.
+    pub(crate) fn db_path_for(&self, site_key: &str) -> anyhow::Result<PathBuf> {
         anyhow::ensure!(
             crate::router::is_valid_site_key(site_key),
             "refusing to derive a database path from an invalid site key: {site_key:?}"

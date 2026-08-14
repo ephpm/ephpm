@@ -128,6 +128,14 @@ pub struct ServerConfig {
     /// directory names while testing with `*.localhost` URLs. Production
     /// deployments typically leave this unset and name directories with
     /// the full FQDN (`~/sites/blog.example.com/`).
+    ///
+    /// The stripped name is the tenant's **whole** identity, not just its
+    /// document-root lookup key: `Host: blog.localhost` and `Host: blog` are
+    /// one tenant and therefore share one database, one private temp/session
+    /// directory, one KV keyspace and one set of `DB_*` credentials. (Before
+    /// issue #290 the database key was derived without stripping the suffix, so
+    /// the same tenant silently used two database files depending on how it was
+    /// addressed.)
     #[serde(default)]
     pub sites_domain_suffix: Option<String>,
 
@@ -994,16 +1002,23 @@ pub struct SqliteConfig {
     /// Directory holding **per-site** database files (multi-site mode only).
     ///
     /// When `[server] sites_dir` is set (multi-site / multi-tenant mode) each
-    /// virtual host gets its **own** database file at `<dir>/<host>.db`, opened
-    /// lazily on that site's first query and cached (bounded by
+    /// virtual host gets its **own** database file at `<dir>/<site-key>.db`,
+    /// opened lazily on that site's first query and cached (bounded by
     /// [`max_open_dbs`](Self::max_open_dbs)). This is the isolation unit for
     /// secure multi-tenancy: Turso has no per-schema ACL, so the database file
     /// is the only tenant boundary — one file per site means one tenant's SQL
     /// cannot name, read, or write another tenant's data.
     ///
-    /// The host component is the traversal-safe site key (the same validated
-    /// `[a-z0-9._-]` key that guards the `sites_dir` docroot join); a database
-    /// path is never derived from a raw `Host` header.
+    /// The filename component is the **canonical site key**: the same validated
+    /// `[a-z0-9._-]` key that selected the document root — `Host` normalized
+    /// (port and trailing dot stripped, lowercased) with
+    /// [`sites_domain_suffix`](ServerConfig::sites_domain_suffix) removed. A
+    /// database path is never derived from a raw `Host` header, and a tenant
+    /// reached by two of its names still has exactly one database (issue #290).
+    ///
+    /// A well-formed but **unknown** host has no site key, so it gets no
+    /// database at all rather than minting one named after the header
+    /// (issue #291).
     ///
     /// **Required in multi-site mode** — startup fails closed if `sites_dir` is
     /// set, `[db.sqlite]` is present (single-node), and `dir` is unset, rather

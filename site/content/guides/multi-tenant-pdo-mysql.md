@@ -66,7 +66,7 @@ Nothing new to set. Multi-tenant `pdo_mysql` turns on with per-site databases:
 sites_dir = "/srv/sites"      # multi-site mode
 
 [db.sqlite]
-dir = "/var/lib/ephpm/dbs"    # one <host>.db per virtual host
+dir = "/var/lib/ephpm/dbs"    # one <site-key>.db per virtual host
 max_open_dbs = 256            # LRU bound on simultaneously-open databases
 
 [db.sqlite.proxy]
@@ -152,9 +152,21 @@ connection cannot be replayed against another.
 
 ### Where each site's password comes from
 
-The router mints it per request from the site key it has already validated —
-the same key that picks the site's document root, its KV keyspace, and its
-database file. Those cannot disagree by construction.
+The router mints it per request from the **canonical site key** — the single
+identity a request resolves to, and the same value that picks the site's
+document root, its private temp/session directory, its KV keyspace, and its
+database file. There is one derivation (`Router::resolve_site`) and everything
+downstream consumes its result, so those cannot disagree.
+
+That matters concretely with `[server] sites_domain_suffix`: `Host: shop.local`
+and `Host: shop` are one tenant, so they get one document root, one session
+directory, one `shop.db`, and one `DB_USER = shop`. Before issue #290 the
+database key was derived separately and did *not* strip the suffix, so the same
+tenant reached `shop.local.db` or `shop.db` depending on how it was addressed.
+
+A `Host` that resolves to no site has no identity at all: it serves the default
+document root and gets **no** `DB_*` variables and no database (issue #291) —
+an unknown name cannot mint `<name>.db`.
 
 `$_SERVER` is rebuilt per request from a thread-local table, so site B's PHP
 never observes the credential injected for site A.
@@ -215,6 +227,7 @@ not its own.
 | `mysql_listen` unparseable or its port in use | **Startup fails** — no listener, no credentials injected |
 | Wrong / missing password | `ERROR 1698 (28000)`, connection closed, no database opened |
 | Username is not a valid site key | Refused before any path is derived from it |
+| Request `Host` matches no vhost | No `DB_*` injected and no database context — the default docroot cannot mint `<host>.db` |
 | A site's database cannot be opened | That connection is refused — never a fallback to another site's |
 | Per-site wire not active | No `DB_*` in `$_SERVER` at all — a visibly absent config, not a shared one |
 
