@@ -646,6 +646,21 @@ whether anything is already on the wire:
   `ephpm_worker_stream_aborts_total`. Simply dropping the sender — what it did
   before — was indistinguishable from a normal end of body.
 
+  "Already delivered status + headers" means delivered *to the router*, which is
+  not the same as delivered *to the socket*: hyper buffers the response head and
+  flushes it in `poll_flush`, which its dispatcher runs only after `poll_write`
+  returns without an error. A body that errors on hyper's very first poll — the
+  case where the worker finishes bailing out before the connection task is next
+  scheduled — therefore used to strand the head in the write buffer and tear the
+  connection down with nothing on the wire, which a client cannot distinguish
+  from a server crash (issue #271). `AbortAwareChunks` closes that hole: on the
+  abort path it yields `Poll::Pending` exactly once (self-waking) before the
+  error, which unwinds `poll_write` *without* an error so the dispatcher reaches
+  `poll_flush` and puts the head on the socket. The error lands on the next poll,
+  against a head the client has already received. So the observable contract is
+  the same regardless of who wins the race: **200 + headers, then a body that
+  never terminates.**
+
 The governing rule for both engines: **never complete a response for a script
 that bailed out.**
 
