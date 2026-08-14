@@ -342,6 +342,44 @@ static char *ephpm_strdup_malloc(const char *s)
     return p;
 }
 
+/* Apply every buffered per-request INI override at PHP_INI_STAGE_ACTIVATE.
+ *
+ * Called TWICE per request, and both calls are load-bearing:
+ *
+ *   1. BEFORE php_request_startup() — php_request_startup() runs
+ *      sapi_activate(), which parses a multipart/form-data body through
+ *      rfc1867 and therefore reads `upload_tmp_dir` (and PHP's temp-dir
+ *      fallback) while writing the uploaded files to disk. That is *before*
+ *      the post-startup replay below, so a per-vhost `upload_tmp_dir` set
+ *      only afterwards arrives too late: uploads land in the shared system
+ *      temp dir, outside the vhost's `open_basedir`, and
+ *      move_uploaded_file() then fails (and the upload temp file is exposed
+ *      to other tenants). At this point the previous request has already
+ *      been shut down, so zend_ini_deactivate() has run and the value we set
+ *      here survives into the request that is about to start.
+ *
+ *   2. AFTER php_request_startup() — request startup re-activates the INI
+ *      table, so entries must be (re)asserted for the script itself; this is
+ *      what makes `open_basedir` / `session.save_path` effective for the
+ *      executed script. Applying twice is idempotent.
+ *
+ * PHP_INI_SYSTEM + STAGE_ACTIVATE is used for the reasons documented on
+ * ephpm_request_set_ini(): STAGE_ACTIVATE skips OnUpdateBaseDir's
+ * "runtime updates may only tighten" check, which a peer vhost path would
+ * otherwise fail. */
+static void ephpm_request_ini_apply(void)
+{
+    for (size_t i = 0; i < request_ini_count; i++) {
+        zend_string *zkey = zend_string_init(request_ini_keys[i],
+                                             strlen(request_ini_keys[i]), 0);
+        zend_string *zval = zend_string_init(request_ini_vals[i],
+                                             strlen(request_ini_vals[i]), 0);
+        zend_alter_ini_entry(zkey, zval, PHP_INI_SYSTEM, PHP_INI_STAGE_ACTIVATE);
+        zend_string_release(zval);
+        zend_string_release(zkey);
+    }
+}
+
 /* Release all buffered per-request INI overrides. */
 static void ephpm_request_ini_reset(void)
 {
@@ -1013,6 +1051,16 @@ int ephpm_execute_request(const char *filename)
      * works because read_post is driven separately). */
     SG(server_context) = &ephpm_server_context_marker;
 
+    /* Apply the buffered per-request INI overrides BEFORE request startup so
+     * that directives consumed *during* startup see the per-vhost values.
+     * The critical one is `upload_tmp_dir`: php_request_startup() ->
+     * sapi_activate() runs the rfc1867 multipart parser, which writes
+     * uploaded files to disk using upload_tmp_dir at that moment. Without
+     * this early pass, uploads land in the shared system temp dir — outside
+     * the vhost's open_basedir — so move_uploaded_file() fails and the temp
+     * file is readable by other tenants. See ephpm_request_ini_apply(). */
+    ephpm_request_ini_apply();
+
     if (php_request_startup() != SUCCESS) {
         return EPHPM_EXEC_STARTUP_FAIL;
     }
@@ -1036,16 +1084,10 @@ int ephpm_execute_request(const char *filename)
      * Applied at STAGE_ACTIVATE (the bucket request_startup itself uses), so
      * open_basedir for vhost isolation takes effect for this request without
      * tripping the runtime "can only tighten" check, and is restored by the
-     * next request's php_request_shutdown(). */
-    for (size_t i = 0; i < request_ini_count; i++) {
-        zend_string *zkey = zend_string_init(request_ini_keys[i],
-                                             strlen(request_ini_keys[i]), 0);
-        zend_string *zval = zend_string_init(request_ini_vals[i],
-                                             strlen(request_ini_vals[i]), 0);
-        zend_alter_ini_entry(zkey, zval, PHP_INI_SYSTEM, PHP_INI_STAGE_ACTIVATE);
-        zend_string_release(zval);
-        zend_string_release(zkey);
-    }
+     * next request's php_request_shutdown(). (The same set was already
+     * applied before startup for directives rfc1867/sapi_activate consume —
+     * see ephpm_request_ini_apply(); re-applying is idempotent.) */
+    ephpm_request_ini_apply();
 
     /* Reset PHP's last-error tracking so we can tell whether THIS script
      * raised a fatal (vs. a value carried over from a prior request). */

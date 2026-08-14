@@ -68,7 +68,7 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 | `trusted_proxies` | array of strings | `[]` | CIDR ranges trusted for `X-Forwarded-For`/`X-Forwarded-Proto`. |
 | `blocked_paths` | array of strings | `[]` | Glob patterns blocked with 403. |
 | `allowed_php_paths` | array of strings | `[]` | When non-empty, only matching PHP paths execute. Others get 403. |
-| `open_basedir` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Restrict PHP filesystem access to the site's document root. **Multi-tenant only — see below.** |
+| `open_basedir` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Restrict PHP filesystem access to the site's document root plus that site's own private temp/session state root (never the shared system temp — see [Virtual Hosts → Filesystem Isolation](/guides/virtual-hosts/#filesystem-isolation-temp-sessions)). **Multi-tenant only — see below.** |
 | `disable_shell_exec` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Disable `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec`. **Multi-tenant only — see below.** |
 
 > **Both knobs are enforced only in multi-tenant mode.** They take effect only
