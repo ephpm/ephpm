@@ -1344,25 +1344,31 @@ fn start_kv_service(config: &Config) -> anyhow::Result<KvService> {
         idle_timeout_secs: config.kv.redis_compat.idle_timeout_secs,
     };
 
-    // Multi-tenant mode with the RESP listener enabled but no master secret:
-    // per-site AUTH cannot be derived, so every tenant (and anything else that
-    // can reach the listener) talks to the shared default store unauthenticated.
-    if config.server.sites_dir.is_some() && secret.is_none() {
-        tracing::warn!(
-            "[kv].secret is not set while server.sites_dir (multi-tenant mode) and \
-             kv.redis_compat are enabled — per-site RESP AUTH is disabled and any \
-             client that can reach the RESP listener can access the default store; \
-             set [kv].secret to enable per-site authentication"
+    // Fail closed: in multi-tenant mode a RESP listener with no master secret
+    // cannot derive per-site AUTH, so every tenant (and anything else that can
+    // reach the listener) would talk to the single shared default store
+    // unauthenticated — cross-tenant KV read/write. `Config::validate` already
+    // rejects this before `serve()`, but guard here too so any embedding or
+    // test path that skips validation still refuses rather than silently
+    // exposing every site's KV.
+    if config.server.sites_dir.is_some() && !config.kv.secret_is_set() {
+        anyhow::bail!(
+            "refusing to start the KV RESP listener: [kv.redis_compat] enabled \
+             with [server] sites_dir (multi-tenant vhosting) but no [kv] secret \
+             — the listener would serve one shared KV store to every tenant \
+             with no authentication. Set [kv] secret to enable per-site RESP \
+             AUTH scoping, or disable the listener with [kv.redis_compat] \
+             enabled = false."
         );
     }
 
     // Hand the RESP listener the *same* multi-tenant handle the router gets,
     // so `AUTH <hostname> <derived>` resolves to the identical `Arc<Store>`
-    // that PHP's `ephpm_kv_*` functions write through for that vhost. Only
-    // wired when a secret exists: without one the listener has no way to
-    // derive per-site credentials and stays on the shared default store
-    // (warned about just above).
-    let resp_multi_tenant = if secret.is_some() { multi_tenant.clone() } else { None };
+    // that PHP's `ephpm_kv_*` functions write through for that vhost. In
+    // single-site mode there is no per-vhost store, so this is `None` and the
+    // listener serves the (correct) shared store; the multi-tenant + no-secret
+    // case never reaches here (rejected just above).
+    let resp_multi_tenant = if config.kv.secret_is_set() { multi_tenant.clone() } else { None };
 
     let store_for_resp = Arc::clone(&store);
     let handle = tokio::spawn(async move {
@@ -2036,6 +2042,69 @@ mod lib_tests {
         let a = router_side.get_site_store("blog.example.com");
         let b = resp_side.get_site_store("blog.example.com");
         assert!(Arc::ptr_eq(&a, &b), "PHP and RESP must share one store per vhost");
+    }
+
+    /// Multi-tenant config with the RESP listener enabled, secret optional.
+    fn kv_resp_config(sites_dir: Option<&std::path::Path>, secret: Option<&str>) -> Config {
+        Config {
+            server: ephpm_config::ServerConfig {
+                sites_dir: sites_dir.map(std::path::Path::to_path_buf),
+                ..ephpm_config::ServerConfig::default()
+            },
+            kv: ephpm_config::KvConfig {
+                secret: secret.map(str::to_string),
+                redis_compat: ephpm_config::KvRedisCompatConfig {
+                    enabled: true,
+                    // Ephemeral port so the Ok path doesn't fight for 6379.
+                    listen: "127.0.0.1:0".to_string(),
+                    ..ephpm_config::KvRedisCompatConfig::default()
+                },
+                ..ephpm_config::KvConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn start_kv_service_refuses_multi_tenant_resp_without_secret() {
+        // Defense in depth: even if `Config::validate` is bypassed (embedding,
+        // tests), startup itself must fail closed rather than serve a shared
+        // global store to every tenant. The bail is before any `tokio::spawn`,
+        // so no runtime is needed here.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = kv_resp_config(Some(dir.path()), None);
+        // `KvService` (the Ok type) isn't `Debug`, so match rather than
+        // `expect_err`.
+        let err = match start_kv_service(&config) {
+            Ok(_) => panic!("must refuse to start a multi-tenant RESP listener without a secret"),
+            Err(e) => e,
+        };
+        let msg = format!("{err:#}");
+        assert!(msg.contains("secret"), "error should point at [kv] secret: {msg}");
+    }
+
+    #[tokio::test]
+    async fn start_kv_service_multi_tenant_resp_with_secret_starts() {
+        // The secure config starts and returns a live RESP listener handle.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = kv_resp_config(Some(dir.path()), Some("s3cret-value"));
+        let (_store, multi_tenant, handle) =
+            start_kv_service(&config).expect("secure multi-tenant config must start");
+        assert!(multi_tenant.is_some(), "sites_dir set → per-vhost stores exist");
+        let handle = handle.expect("RESP listener enabled → a listener task exists");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn start_kv_service_single_tenant_resp_without_secret_starts() {
+        // Single-site is unaffected: the shared store is correct, no secret
+        // required, RESP listener still starts.
+        let config = kv_resp_config(None, None);
+        let (_store, multi_tenant, handle) =
+            start_kv_service(&config).expect("single-tenant RESP must keep working");
+        assert!(multi_tenant.is_none(), "no sites_dir → no per-vhost stores");
+        let handle = handle.expect("RESP listener enabled → a listener task exists");
+        handle.abort();
     }
 
     // ── idle timeout ────────────────────────────────────────────────────────
