@@ -597,7 +597,13 @@ const FORBIDDEN_PRAGMAS: [&str; 3] =
 /// when a forbidden statement is found. An unterminated quote or block comment
 /// is treated conservatively as forbidden (`"malformed SQL"`) so a truncated
 /// `ATTACH` cannot slip through.
-fn screen_sql(sql: &str) -> Result<(), String> {
+///
+/// Public because the tenant path is no longer only this bridge: ephpm-server
+/// applies the same screen to the multi-tenant MySQL wire listener
+/// (`ScreenedBackend`), so both routes to a tenant database refuse the same
+/// statements for ePHPm's own reasons rather than the engine's defaults. Pure
+/// and stub-safe — a string scan with no PHP or backend involvement.
+pub fn screen_sql(sql: &str) -> Result<(), String> {
     let bytes = sql.as_bytes();
     let mut start = 0usize;
     let mut i = 0usize;

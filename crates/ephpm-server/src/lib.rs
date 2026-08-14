@@ -11,7 +11,9 @@ pub mod opcache;
 pub mod otlp;
 pub mod rate_limit;
 pub mod router;
+pub mod screened_backend;
 pub mod site_backends;
+pub mod site_wire_auth;
 pub mod static_files;
 pub mod stream_compress;
 mod timeline;
@@ -264,9 +266,12 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // Per-site database registry (secure multi-tenancy): build and register it
     // with the PHP `ephpm_db_*` bridge BEFORE the HTTP listeners bind, so the
     // bridge is wired before any request can run. Fails closed if `[db.sqlite]
-    // dir` is missing in multi-site mode. The router derives the same
-    // per-site flag from config, so no handle needs threading here.
-    let _per_site_db_active = wire_per_site_db(&config, &query_stats, cluster_handle.is_some())?;
+    // dir` is missing in multi-site mode.
+    //
+    // `Some` also carries the per-site MySQL credentials: the wire listener
+    // verifies against them and the router injects them, so both are handed
+    // this one value rather than deriving their own.
+    let per_site_wire_auth = wire_per_site_db(&config, &query_stats, cluster_handle.is_some())?;
 
     // Upstream health for every configured SQL proxy, built BEFORE the HTTP
     // listeners so `/_ephpm/ready` can never report ready in the window
@@ -299,6 +304,23 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         );
     }
 
+    // Start the multi-tenant MySQL listener BEFORE the router, so the router
+    // only ever injects `DB_*` credentials for an endpoint that is actually
+    // bound. A bind failure here is fatal (same contract as the other DB
+    // proxies) rather than leaving every tenant's `pdo_mysql` pointed at a
+    // dead port with no indication why.
+    let mut per_site_wire_handles = Vec::new();
+    // The `Some`/`Some` arm is the only reachable one when an auth exists —
+    // `wire_per_site_db` returns `Some` only with `[db.sqlite]` present — but
+    // pairing them here avoids asserting that in a way that could panic.
+    let per_site_db_wire = match (per_site_wire_auth, config.db.sqlite.as_ref()) {
+        (Some(auth), Some(sqlite)) => {
+            let listen = start_per_site_wire(sqlite, &auth, &mut per_site_wire_handles).await?;
+            Some((auth, listen))
+        }
+        _ => None,
+    };
+
     let listeners = bind_listeners(
         &config,
         kv_store,
@@ -308,6 +330,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         effective_node_id,
         Arc::clone(&db_health),
         request_log,
+        per_site_db_wire,
     )
     .await?;
 
@@ -319,6 +342,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         &db_health,
     )
     .await?;
+    let _per_site_wire_handles = per_site_wire_handles;
 
     accept_loop(listeners).await
 }
@@ -405,6 +429,11 @@ async fn bind_listeners(
     // `[server.diagnostics] request_log` + the mode default.)
     db_health: Arc<db_health::DbProxyHealth>,
     request_log: Option<Arc<timeline::RequestLog>>,
+    // Per-site `pdo_mysql` credentials, with the address of the listener that
+    // accepts them. `Some` only in per-site mode *and* only once that listener
+    // is confirmed bindable — so the router never advertises a database
+    // endpoint that does not exist.
+    per_site_db_wire: Option<(site_wire_auth::SiteWireAuth, String)>,
 ) -> anyhow::Result<Listeners> {
     let addr: SocketAddr = config.server.listen.parse().context("invalid listen address")?;
 
@@ -618,6 +647,11 @@ async fn bind_listeners(
         .with_node_id(node_id)
         .with_db_health(db_health)
         .with_request_log(request_log);
+
+        let router = match per_site_db_wire {
+            Some((auth, listen)) => router.with_per_site_db_wire(auth, listen),
+            None => router,
+        };
 
         // Only advertise HTTP/3 once its UDP socket is confirmed bound.
         match alt_svc {
@@ -1635,15 +1669,10 @@ async fn start_db_proxies(
             )
             .await?;
         } else if is_per_site_sqlite(config, cluster.is_some()) {
-            // Per-site (multi-tenant) mode: the per-site registry was already
-            // built and registered with the PHP bridge in `serve()`. DB access
-            // is exclusively through the in-process `ephpm_db_*` bridge, which
-            // resolves each request's own tenant database. No shared wire
-            // listener is started here: a single litewire listener binds one
-            // backend for all connections, so serving `pdo_mysql` on a shared
-            // port would be one database shared by every tenant — exactly the
-            // cross-tenant hole (issue #274 / pentest C1) this feature closes.
-            warn_wire_disabled_for_multisite(sqlite_config);
+            // Per-site (multi-tenant) mode. Nothing to do here: `serve()`
+            // already started the one multi-tenant MySQL listener (before the
+            // router, so credentials are never injected for an unbound
+            // endpoint) via `start_per_site_wire`.
         } else {
             start_single_node_sqlite(sqlite_config, query_stats, &mut handles).await?;
         }
@@ -1742,7 +1771,7 @@ fn wire_per_site_db(
     config: &Config,
     query_stats: &ephpm_query_stats::QueryStats,
     cluster_enabled: bool,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<Option<site_wire_auth::SiteWireAuth>> {
     // A multi-site + clustered SQLite config cannot get per-site isolation
     // yet: warn rather than silently pretend it is isolated.
     if let Some(sqlite) = &config.db.sqlite {
@@ -1757,7 +1786,7 @@ fn wire_per_site_db(
     }
 
     if !is_per_site_sqlite(config, cluster_enabled) {
-        return Ok(false);
+        return Ok(None);
     }
 
     let sqlite = config.db.sqlite.as_ref().expect("sqlite present in per-site mode");
@@ -1783,41 +1812,118 @@ fn wire_per_site_db(
         registry.as_resolver(),
         tokio::runtime::Handle::current(),
     );
+
+    // Mint the per-site MySQL credentials over the SAME registry, so a site's
+    // `pdo_mysql` connections and its `ephpm_db_*` bridge queries resolve to
+    // one backend instance and one LRU entry — not two handles on one file.
+    let auth = site_wire_auth::SiteWireAuth::new(registry)?;
+
     tracing::info!(
         max_open_dbs = sqlite.max_open_dbs,
-        "per-site database isolation enabled (one Turso database per virtual host, served via \
-         the in-process ephpm_db_* bridge)"
+        "per-site database isolation enabled (one Turso database per virtual host), reachable \
+         both through the in-process ephpm_db_* bridge and through pdo_mysql via per-site \
+         credentials on the MySQL wire listener"
     );
-    Ok(true)
+    Ok(Some(auth))
 }
 
-/// Log the wire-listener decision for per-site (multi-tenant) mode.
+/// Start the multi-tenant MySQL wire listener for per-site mode.
 ///
-/// The MySQL/Hrana/PG/TDS handshake carries no virtual-host name, so a single
-/// litewire listener cannot route a connection to the right tenant's database
-/// — one listener means one backend for everyone. Rather than reintroduce the
-/// shared-database hole, per-site mode serves the database only through the
-/// in-process `ephpm_db_*` bridge (where the site is known per request) and
-/// does not start the shared wire listeners. Surface that plainly, and warn if
-/// the operator explicitly configured optional wire frontends that are now
-/// inert.
-fn warn_wire_disabled_for_multisite(sqlite_config: &ephpm_config::SqliteConfig) {
+/// One listener, many databases. The connection's tenant is the identity it
+/// authenticates as, not anything it merely claims:
+/// [`SiteWireAuth`](site_wire_auth::SiteWireAuth) verifies a per-site
+/// `mysql_native_password` credential and only then resolves that site's
+/// backend out of the same registry the `ephpm_db_*` bridge uses. A tenant that
+/// cannot produce another tenant's password is refused at the handshake and
+/// never reaches a backend at all.
+///
+/// # Why one listener and not one per site
+///
+/// A listener per site would cost N file descriptors and N ports and buy
+/// **nothing**: every tenant's PHP runs in this process as this OS user, so
+/// neither a port (enumerable) nor a unix socket (identical permissions) can
+/// tell one tenant's connection from another's. The credential has to do that
+/// work either way — so the listener count stays at one, the address stays the
+/// stable, configured `[db.sqlite.proxy] mysql_listen`, and resource use is
+/// O(1) in the number of sites. See `site_wire_auth`'s module docs for the full
+/// argument.
+///
+/// # The other frontends stay off
+///
+/// Hrana, PostgreSQL, and TDS cannot resolve a backend per connection (litewire
+/// refuses to start them under an authenticator, and would otherwise have to
+/// bind one shared backend). They are skipped with a warning rather than served
+/// a single tenant's database.
+///
+/// # Errors
+///
+/// Fails if `mysql_listen` is unparseable or cannot be bound. Both are fatal
+/// on purpose: litewire's builder silently ignores an address it cannot parse
+/// (leaving no frontend at all), and a port already in use would otherwise
+/// surface only as every tenant's `pdo_mysql` getting connection-refused at
+/// runtime. Refusing to start is the same contract the other DB proxies use.
+///
+/// Returns the address tenants should connect to, for injection into `DB_HOST`
+/// / `DB_PORT`.
+async fn start_per_site_wire(
+    sqlite_config: &ephpm_config::SqliteConfig,
+    auth: &site_wire_auth::SiteWireAuth,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<String> {
     let proxy = &sqlite_config.proxy;
+
+    // Validate before spawning. `LiteWire::mysql` does `addr.parse().ok()`, so
+    // a typo becomes a listener that never exists and a "no frontends
+    // configured" error buried in a detached task.
+    let addr: std::net::SocketAddr = proxy.mysql_listen.parse().with_context(|| {
+        format!(
+            "[db.sqlite.proxy] mysql_listen is not a valid socket address: {:?}. In multi-site \
+             mode this is the endpoint every tenant's pdo_mysql connects to.",
+            proxy.mysql_listen
+        )
+    })?;
+    // Probe the bind so a busy port fails startup rather than at first query.
+    // Dropped immediately; litewire binds it for real a moment later. The
+    // window between the two is a race in theory, but the failure it catches
+    // (a port already owned by another process for the whole run) is not.
+    drop(tokio::net::TcpListener::bind(addr).await.with_context(|| {
+        format!("failed to bind the multi-tenant MySQL wire listener on {addr}")
+    })?);
+
     if proxy.hrana_listen.is_some() || proxy.postgres_listen.is_some() || proxy.tds_listen.is_some()
     {
         tracing::warn!(
-            "[db.sqlite.proxy] wire listeners (hrana/postgres/tds) are configured but IGNORED in \
-             multi-site mode: a single wire listener cannot route by virtual host, so it would \
-             serve one shared database to all tenants. Per-site database access is via the PHP \
-             native ephpm_db_* functions instead."
+            "[db.sqlite.proxy] hrana/postgres/tds listeners are configured but NOT started in \
+             multi-site mode: only the MySQL frontend can bind a database per connection, so the \
+             others would serve one shared database to every tenant. Only mysql_listen is served."
         );
     }
+
+    let mut builder =
+        litewire::LiteWire::with_authenticator(auth.as_authenticator()).mysql(&proxy.mysql_listen);
+
+    if proxy.max_connections > 0 {
+        builder = builder.max_connections(proxy.max_connections);
+    }
+
     tracing::info!(
-        "per-site database mode: shared SQLite wire listeners are disabled. PHP reaches its own \
-         per-site database through the native ephpm_db_* functions; connecting via pdo_mysql to a \
-         shared port is intentionally not served in multi-site mode (it would be one database for \
-         all tenants). See the per-site database docs."
+        listen = %proxy.mysql_listen,
+        // A global cap, not a per-tenant one: see the `site_wire_auth` docs on
+        // noisy neighbours.
+        max_connections = proxy.max_connections,
+        "per-site database mode: MySQL wire listener enabled with per-site credentials. Each \
+         virtual host connects with DB_USER = its own hostname and the DB_PASSWORD injected into \
+         its requests, and reaches ONLY its own database."
     );
+
+    handles.push(tokio::spawn(async move {
+        match builder.serve().await {
+            Ok(()) => tracing::info!("litewire (per-site) stopped"),
+            Err(e) => tracing::error!("litewire (per-site) error: {e:#}"),
+        }
+    }));
+
+    Ok(proxy.mysql_listen.clone())
 }
 
 /// Start single-node SQLite via the in-process Turso engine.

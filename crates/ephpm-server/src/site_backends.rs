@@ -172,12 +172,33 @@ impl SiteBackends {
             format!("failed to open per-site database for {site_key}: {path_str}")
         })?;
         tracing::info!(site = site_key, path = path_str, "opened per-site database (Turso engine)");
-        Ok(Arc::new(TrackedBackend::new(turso, self.inner.query_stats.clone())))
+        // Screening sits innermost, against the raw engine: it must see exactly
+        // the SQL the engine would run (the wire path's statements arrive here
+        // already translated out of the MySQL dialect). Both tenant routes —
+        // `pdo_mysql` and the `ephpm_db_*` bridge — go through this backend, so
+        // both refuse `ATTACH` and friends for ePHPm's own reasons rather than
+        // relying on the pinned engine's defaults. See `screened_backend`.
+        let screened = crate::screened_backend::ScreenedBackend::new(turso);
+        Ok(Arc::new(TrackedBackend::new(screened, self.inner.query_stats.clone())))
     }
 
     /// Get-or-open the backend for `site_key`. Serialized under the registry
     /// mutex (held across the open) — see the module docs, invariant 2.
-    async fn get_or_open(&self, site_key: &str) -> anyhow::Result<SharedBackend> {
+    ///
+    /// Shared by both tenant paths: the `ephpm_db_*` bridge (through
+    /// [`SiteBackendResolver::resolve`]) and the multi-tenant MySQL wire
+    /// listener (through
+    /// [`SiteWireAuth`](crate::site_wire_auth::SiteWireAuth)), so a site's
+    /// bridge queries and its `pdo_mysql` connections land on the *same*
+    /// backend instance and the same LRU entry rather than two handles on one
+    /// file.
+    ///
+    /// # Errors
+    ///
+    /// Fails on an invalid site key or if the database cannot be opened. Both
+    /// callers treat that as "no database for this request/connection" — never
+    /// as a reason to fall back to another site's.
+    pub(crate) async fn get_or_open(&self, site_key: &str) -> anyhow::Result<SharedBackend> {
         let mut open = self.inner.open.lock().await;
 
         if let Some(entry) = open.get(site_key) {

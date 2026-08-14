@@ -269,7 +269,19 @@ pub struct Router {
     kv_redis_compat_enabled: bool,
     /// Database environment variables to inject into PHP `$_SERVER`.
     /// Populated from `[db.mysql]` or `[db.postgres]` when `inject_env = true`.
+    ///
+    /// Config-derived and process-global. In per-site mode the DB vars are
+    /// per-request instead — see [`Router::per_site_db_wire`].
     db_env_vars: Vec<(String, String)>,
+    /// Per-site `pdo_mysql` credentials, when the multi-tenant wire listener is
+    /// running (`[server] sites_dir` + `[db.sqlite]`, single-node).
+    ///
+    /// Unlike [`Router::db_env_vars`] this cannot be computed once: each
+    /// virtual host gets its **own** MySQL account, so the DB vars are built
+    /// per request from the site key. Holds the same [`SiteWireAuth`] the
+    /// listener verifies against, so what the router injects and what the
+    /// listener accepts cannot drift.
+    per_site_db_wire: Option<PerSiteDbWire>,
     /// This node's stable cluster identity, injected into PHP `$_SERVER` as
     /// `EPHPM_NODE_ID`. Set from the running gossip node's id (or the
     /// configured `[cluster] node_id` in single-node mode). `None` when no
@@ -324,6 +336,14 @@ pub struct Router {
     /// of that process's lifetime. Sized at whatever the site fleet
     /// naturally produces (one entry per active vhost).
     kv_site_password_cache: dashmap::DashMap<String, String>,
+    /// Cache of per-site derived MySQL passwords, same shape and rationale as
+    /// [`Router::kv_site_password_cache`].
+    ///
+    /// Bounded by the number of *validated* site keys, not by anything a client
+    /// can invent: entries are only inserted for a `server_name` that already
+    /// passed `is_valid_site_key` and resolved to a served vhost, so a flood of
+    /// junk `Host` headers cannot grow this map.
+    per_site_db_password_cache: dashmap::DashMap<String, String>,
     /// Canonicalized document roots, keyed by the as-configured root path,
     /// with the instant they were resolved. Caching removes a
     /// `canonicalize()` syscall from every static-file hit (issue #132),
@@ -670,6 +690,11 @@ impl Router {
             kv_listen: config.kv.redis_compat.listen.clone(),
             kv_redis_compat_enabled: config.kv.redis_compat.enabled,
             db_env_vars: build_db_env_vars(config),
+            // Wired by `serve()` via `with_per_site_db_wire` only if the
+            // multi-tenant wire listener actually starts. Left `None` here so
+            // a router built without it injects no DB credentials at all
+            // rather than credentials nothing is listening for.
+            per_site_db_wire: None,
             // Prefer the explicit `[cluster] node_id`; `serve()` overrides this
             // via `with_node_id` with the effective gossip id once clustering
             // is up (that id is auto-derived per node when config leaves it
@@ -704,6 +729,7 @@ impl Router {
             unknown_site_cache: dashmap::DashMap::new(),
             ensured_vhost_dirs: dashmap::DashSet::new(),
             kv_site_password_cache: dashmap::DashMap::new(),
+            per_site_db_password_cache: dashmap::DashMap::new(),
             canonical_roots: dashmap::DashMap::new(),
             canonical_scripts: dashmap::DashMap::new(),
             canonical_scripts_swept: std::sync::Mutex::new(Instant::now()),
@@ -931,6 +957,31 @@ impl Router {
         self
     }
 
+    /// Inject per-site `pdo_mysql` credentials for the multi-tenant wire
+    /// listener.
+    ///
+    /// `serve()` calls this **only after** `start_per_site_wire` has validated
+    /// and bound that address, and it passes the *same*
+    /// [`SiteWireAuth`](crate::site_wire_auth::SiteWireAuth) instance the
+    /// listener verifies against. That ordering is what keeps the two halves
+    /// honest: the router never advertises a `DB_HOST`/`DB_PASSWORD` for an
+    /// endpoint that could not be bound (that case is a fatal startup error),
+    /// and the listener never sees a credential the router did not mint.
+    ///
+    /// Left unset, a tenant's requests carry no `DB_*` at all — a visibly
+    /// absent database config, never one silently pointed at something shared.
+    ///
+    /// `listen` is the bound MySQL address (`host:port`) tenants connect to.
+    #[must_use]
+    pub fn with_per_site_db_wire(
+        mut self,
+        auth: crate::site_wire_auth::SiteWireAuth,
+        listen: String,
+    ) -> Self {
+        self.per_site_db_wire = Some(PerSiteDbWire { auth, listen });
+        self
+    }
+
     /// Resolve the site configuration from the `Host` header.
     ///
     /// Returns the document root, index files, and fallback chain for the
@@ -940,6 +991,71 @@ impl Router {
     /// Uses lazy discovery: if a host isn't in the startup-scanned registry
     /// but a matching directory exists in `sites_dir`, it is served immediately.
     /// This means new sites can be deployed without restarting ephpm.
+    /// Build the per-site `DB_*` variables that point this request's PHP at
+    /// its **own** database over `pdo_mysql`.
+    ///
+    /// # Why these are per request and not per process
+    ///
+    /// Single-site mode has one database and one account, so `DB_*` is
+    /// config-derived once ([`build_db_env_vars`]). Multi-tenant mode gives
+    /// every virtual host its own database, and therefore its own MySQL
+    /// account: `DB_USER` is the site key and `DB_PASSWORD` is that site's
+    /// derived password. The listener resolves a connection's database from
+    /// the credential it authenticates, so injecting the wrong site's password
+    /// would not cross tenants — it would simply be refused.
+    ///
+    /// # Why this does not leak across tenants
+    ///
+    /// These land in `$_SERVER`, which ePHPm rebuilds per request from a
+    /// thread-local table (`ephpm_request_clear` zeroes it at the top of every
+    /// request). There is no process-global `setenv`, so site B's PHP never
+    /// observes the credential injected for site A.
+    ///
+    /// Note `getenv()` does **not** see these — ePHPm installs no
+    /// `sapi_module.getenv`, deliberately: a process-global environment is
+    /// shared by every worker thread and would be exactly the cross-tenant leak
+    /// this design avoids. Tenants must read `$_SERVER['DB_PASSWORD']`.
+    fn build_per_site_db_env_vars(&self, site_key: &str) -> Vec<(String, String)> {
+        let Some(wire) = &self.per_site_db_wire else {
+            return Vec::new();
+        };
+        // Fail closed: no key means no credential. A site that cannot be named
+        // gets no DB_* variables rather than some default account.
+        if site_key.is_empty() {
+            return Vec::new();
+        }
+
+        // Deterministic per site, so cache it exactly as the KV path does
+        // rather than recomputing an HMAC on every request.
+        let password = if let Some(cached) = self.per_site_db_password_cache.get(site_key) {
+            cached.clone()
+        } else {
+            let derived = wire.auth.password_for(site_key);
+            self.per_site_db_password_cache.insert(site_key.to_string(), derived.clone());
+            derived
+        };
+
+        let (host, port) = wire.listen.rsplit_once(':').unwrap_or(("127.0.0.1", "3306"));
+        // The database name is cosmetic here — the connection's database is
+        // fixed by the credential, and litewire answers `USE <db>` without
+        // switching anything. Set it to the site key so framework config and
+        // logs read sensibly.
+        vec![
+            ("DB_CONNECTION".into(), "mysql".into()),
+            ("DB_HOST".into(), host.into()),
+            ("DB_PORT".into(), port.into()),
+            ("DB_DATABASE".into(), site_key.into()),
+            ("DB_NAME".into(), site_key.into()),
+            ("DB_USER".into(), site_key.into()),
+            ("DB_USERNAME".into(), site_key.into()),
+            ("DB_PASSWORD".into(), password.clone()),
+            (
+                "DATABASE_URL".into(),
+                format!("mysql://{site_key}:{password}@{host}:{port}/{site_key}"),
+            ),
+        ]
+    }
+
     /// Build `EPHPM_REDIS_*` environment variables for PHP injection.
     ///
     /// Only produces variables when all conditions are met:
@@ -1843,6 +1959,12 @@ impl Router {
         // plus DB_* env vars for framework auto-discovery.
         let mut env_vars = self.build_kv_env_vars(&server_name);
         env_vars.extend_from_slice(&self.db_env_vars);
+        // Per-site DB credentials, when the multi-tenant wire listener is up.
+        // Reuses the site key already derived for the bridge, so `pdo_mysql`
+        // and `ephpm_db_*` are guaranteed to name the same tenant.
+        if let Some(key) = db_site_key.as_deref() {
+            env_vars.extend(self.build_per_site_db_env_vars(key));
+        }
         if let Some(ref id) = self.node_id {
             env_vars.push(("EPHPM_NODE_ID".to_string(), id.clone()));
         }
@@ -2015,6 +2137,14 @@ impl Router {
         // content_type on the hot path for no reason.
         let mut env_vars = self.build_kv_env_vars(&server_name);
         env_vars.extend_from_slice(&self.db_env_vars);
+        // Per-site DB credentials — same derivation as the fpm path above.
+        // Worth noting these work here even though the `ephpm_db_*` bridge
+        // does not: the bridge needs a thread-local site key that only the fpm
+        // path sets, whereas a wire connection carries its tenant in its own
+        // credential and needs nothing from the request thread.
+        if self.per_site_db {
+            env_vars.extend(self.build_per_site_db_env_vars(&normalize_host_key(&server_name)));
+        }
         if let Some(ref id) = self.node_id {
             env_vars.push(("EPHPM_NODE_ID".to_string(), id.clone()));
         }
@@ -2767,6 +2897,20 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// What the router needs to hand each tenant its own `pdo_mysql` credentials.
+///
+/// Cheap to hold: [`SiteWireAuth`](crate::site_wire_auth::SiteWireAuth) is an
+/// `Arc` shared with the listener, so this is a pointer plus an address string.
+struct PerSiteDbWire {
+    /// Mints each site's password. The *same* instance the listener verifies
+    /// against — sharing it, rather than deriving twice from a copied secret,
+    /// is what makes "the router injects what the listener accepts" a
+    /// structural property instead of a convention.
+    auth: crate::site_wire_auth::SiteWireAuth,
+    /// The bound MySQL address (`host:port`) tenants connect to.
+    listen: String,
 }
 
 /// Build database environment variables from config for PHP injection.
