@@ -44,8 +44,11 @@ enabled = true                 # exposes /metrics for Prometheus
 
 [php]
 memory_limit = "256M"
-# [php] max_execution_time is parsed but NOT enforced — use
-# [server.timeouts] request (default 300s) for the per-request deadline.
+max_execution_time = 30              # inner PHP deadline (default). Natively
+                                     # enforced on Linux ZTS: catchable fatal →
+                                     # HTTP 500, wall-clock, set_time_limit()-able.
+                                     # Not enforced on macOS/Windows. Keep it below
+                                     # [server.timeouts] request, the 504 backstop.
 ini_overrides = [
     ["display_errors", "Off"],
     ["error_reporting", "E_ALL"],

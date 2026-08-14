@@ -117,11 +117,12 @@ document_root = "/var/www/html"
 
 [php]
 memory_limit = "256M"
+max_execution_time = 90              # inner PHP deadline: catchable fatal → 500
+                                     # on Linux ZTS (not on macOS/Windows)
 
 [server.timeouts]
-request = 120                        # the real per-request deadline
-                                     # ([php] max_execution_time is parsed
-                                     # but NOT enforced)
+request = 120                        # outer hard 504 backstop — keep it above
+                                     # [php] max_execution_time
 
 [server.tls]
 listen = "0.0.0.0:443"               # HTTPS listener
