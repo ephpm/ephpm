@@ -310,6 +310,14 @@ pub struct Router {
     /// deployed after the first probe becomes visible within
     /// [`UNKNOWN_SITE_TTL`].
     unknown_site_cache: dashmap::DashMap<String, std::time::Instant>,
+    /// Set of per-vhost private state roots whose `tmp/` and `sessions/`
+    /// subdirectories have already been created on disk. Populated by
+    /// [`Router::ensure_vhost_private_dirs`] so the filesystem work
+    /// (`create_dir_all` + permission tightening) happens once per site
+    /// rather than on every request. Membership is keyed by the state root
+    /// [`vhost_state_root`] derives from the resolved document root, so two
+    /// requests to the same vhost coalesce onto one entry.
+    ensured_vhost_dirs: dashmap::DashSet<PathBuf>,
     /// Cache of per-hostname derived KV site passwords (HMAC-SHA256 of
     /// `secret + hostname`). The HMAC is deterministic — computed once
     /// per host per process, then served from the DashMap for the rest
@@ -694,6 +702,7 @@ impl Router {
                 crate::opcache::OpcacheWatcher::new(enabled)
             },
             unknown_site_cache: dashmap::DashMap::new(),
+            ensured_vhost_dirs: dashmap::DashSet::new(),
             kv_site_password_cache: dashmap::DashMap::new(),
             canonical_roots: dashmap::DashMap::new(),
             canonical_scripts: dashmap::DashMap::new(),
@@ -1073,6 +1082,45 @@ impl Router {
         }
 
         (self.document_root.clone(), &self.index_files, &self.fallback)
+    }
+
+    /// Resolve, and lazily create, this vhost's private temp + session
+    /// directories, returning the paths to inject into the per-request PHP
+    /// sandbox.
+    ///
+    /// Each tenant gets `<state_root>/tmp` and `<state_root>/sessions` where
+    /// `state_root` is [`vhost_state_root`] of the resolved document root.
+    /// The directories are created once per site (guarded by
+    /// [`Router::ensured_vhost_dirs`]) and, on Unix, tightened to `0700` so
+    /// they are not group/other-readable. Even without OS-level per-tenant
+    /// uids, the security boundary is `open_basedir`: `state_root` is the only
+    /// temp entry in this vhost's basedir, and no other vhost's basedir
+    /// contains it, so cross-tenant temp/session access is denied by PHP.
+    ///
+    /// Creation failures are logged and swallowed — the paths are returned
+    /// regardless so the caller still narrows `open_basedir` away from the
+    /// shared system temp. A missing session/temp dir degrades that tenant's
+    /// own temp/session writes; it never widens another tenant's access.
+    fn ensure_vhost_private_dirs(&self, document_root: &Path) -> VhostPrivateDirs {
+        let state_root = vhost_state_root(document_root);
+        let temp = state_root.join("tmp");
+        let sessions = state_root.join("sessions");
+
+        if !self.ensured_vhost_dirs.contains(&state_root) {
+            for dir in [&temp, &sessions] {
+                if let Err(e) = create_private_dir(dir) {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %e,
+                        "failed to create per-vhost private directory; \
+                         this tenant's temp/session writes may fail"
+                    );
+                }
+            }
+            self.ensured_vhost_dirs.insert(state_root.clone());
+        }
+
+        VhostPrivateDirs { state_root, temp, sessions }
     }
 
     /// Handle an incoming HTTP request.
@@ -1775,6 +1823,17 @@ impl Router {
         // before routing); normalizing it here matches the key the registry
         // derives `<dir>/<key>.db` from.
         let db_site_key = self.per_site_db.then(|| normalize_host_key(&server_name));
+        // In multi-tenant mode, give this vhost its OWN temp + session
+        // directories (issue #276). Resolved and created here, in the async
+        // context, off the resolved (traversal-safe) document root; the paths
+        // are moved into the blocking closure and applied as per-request INI
+        // (open_basedir temp component, sys_temp_dir, upload_tmp_dir,
+        // session.save_path) so no two tenants share `/tmp`.
+        let vhost_dirs = if vhost_open_basedir {
+            Some(self.ensure_vhost_private_dirs(&document_root))
+        } else {
+            None
+        };
         // disable_shell_exec is applied globally via the generated php.ini
         // (zend_disable_functions runs once at MINIT and removes the
         // functions from the function table; runtime ini changes don't
@@ -1839,9 +1898,24 @@ impl Router {
             // uses STAGE_ACTIVATE to bypass OnUpdateBaseDir's
             // "must-be-tighter-than-current" check, since each site's path
             // is a peer rather than a subset of the previous one.
-            if vhost_open_basedir {
-                let basedir = vhost_open_basedir_value(&document_root);
+            //
+            // Alongside open_basedir we point PHP's temp + session storage at
+            // this vhost's OWN directories (issue #276). open_basedir is the
+            // enforcement boundary: its only temp entry is this vhost's
+            // state_root, so a tenant cannot read or write another tenant's
+            // temp/session files even by absolute path. sys_temp_dir /
+            // upload_tmp_dir / session.save_path then make PHP's own temp
+            // writes (uploads, session files, tmpfile fallbacks) land inside
+            // that permitted directory rather than tripping the basedir check.
+            // session.save_path and upload_tmp_dir are re-read per request, so
+            // each tenant's sessions/uploads are physically separated; the
+            // files session handler keeps working, just per-site.
+            if let Some(dirs) = &vhost_dirs {
+                let basedir = vhost_open_basedir_value(&document_root, &dirs.state_root);
                 PhpRuntime::set_request_ini("open_basedir", &basedir);
+                PhpRuntime::set_request_ini("sys_temp_dir", &dirs.temp.to_string_lossy());
+                PhpRuntime::set_request_ini("upload_tmp_dir", &dirs.temp.to_string_lossy());
+                PhpRuntime::set_request_ini("session.save_path", &dirs.sessions.to_string_lossy());
             }
 
             // OPcache clustered invalidation (Phase 1): if the watcher told us
@@ -3060,20 +3134,102 @@ fn build_php_response(
 }
 
 /// Build the per-vhost `open_basedir` value: the site's document root plus
-/// the system temp directory.
+/// that vhost's **private** state root (`state_root`).
+///
+/// Historically the second entry was the shared `std::env::temp_dir()`, which
+/// put the *same* `/tmp` inside every tenant's `open_basedir` — so one tenant
+/// could read and overwrite another tenant's temp files and PHP session files
+/// (issue #276, pentest finding C3: cross-tenant temp read/write and session
+/// hijack). Each vhost now gets its own [`vhost_state_root`] instead, so a
+/// tenant's basedir never overlaps another tenant's temp/session storage.
 ///
 /// PHP splits `open_basedir` on the platform's `PATH_SEPARATOR` — `:` on
 /// Unix, `;` on Windows. Hardcoding `:` produced a single bogus Windows
 /// entry (`C:\sites\blog:/tmp`) that matches no path, so every file access
-/// under a vhost was denied. `/tmp` is Unix-only for the same reason;
-/// `std::env::temp_dir()` is the portable equivalent and honours `TMPDIR`.
+/// under a vhost was denied. Deriving the separator from the platform keeps
+/// the value valid on both.
 ///
 /// `ServerConfig::effective_open_basedir` defaults to `true` whenever
-/// `sites_dir` is set, so this value is what a default Windows vhost
-/// deployment runs with.
-fn vhost_open_basedir_value(document_root: &Path) -> String {
+/// `sites_dir` is set, so this value is what a default vhost deployment runs
+/// with.
+fn vhost_open_basedir_value(document_root: &Path, state_root: &Path) -> String {
     let separator = if cfg!(windows) { ';' } else { ':' };
-    format!("{}{separator}{}", document_root.display(), std::env::temp_dir().display())
+    format!("{}{separator}{}", document_root.display(), state_root.display())
+}
+
+/// Per-vhost private state root — the parent directory that holds this
+/// tenant's `tmp/` and `sessions/` subdirectories.
+///
+/// Derived from the already-resolved, traversal-safe `document_root` (issue
+/// #280 hardened `resolve_site` so the root can never point outside
+/// `sites_dir`), NOT from the raw `Host` header — so it inherits that
+/// safety and needs no separate sanitization. The name combines a readable
+/// label (the document root's final component) with a deterministic 64-bit
+/// digest of the full canonical-ish path, so:
+///   * two sites that happen to share a leaf directory name never collide, and
+///   * the same site maps to the same directory across restarts, so its
+///     sessions and temp files persist (the digest uses fixed hasher keys).
+///
+/// The base lives under the system temp dir (honouring `TMPDIR`) — the same
+/// writable location the shared temp used to point at — but namespaced under
+/// `ephpm-vhosts/` and split per site, so no two tenants share a parent that
+/// would appear in each other's `open_basedir`.
+fn vhost_state_root(document_root: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+
+    // DefaultHasher uses fixed keys, so the digest is stable across processes
+    // and restarts (unlike a randomly-seeded HashMap hasher). This is a
+    // uniqueness/dedup key, not a security primitive, so SipHash's collision
+    // resistance is more than sufficient.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    document_root.hash(&mut hasher);
+    let digest = hasher.finish();
+
+    let label = document_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map_or_else(|| "site".to_string(), sanitize_path_label);
+
+    std::env::temp_dir().join("ephpm-vhosts").join(format!("{label}-{digest:016x}"))
+}
+
+/// Reduce a directory-name label to a conservative `[A-Za-z0-9._-]` set so it
+/// is always a single, benign path component. The digest suffix in
+/// [`vhost_state_root`] guarantees uniqueness, so this only needs to keep the
+/// human-readable prefix from introducing separators or other surprises.
+fn sanitize_path_label(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') { c } else { '_' })
+        .take(64)
+        .collect();
+    if cleaned.is_empty() { "site".to_string() } else { cleaned }
+}
+
+/// Create `dir` (and any missing parents), then, on Unix, tighten it to
+/// `0700` so a tenant's temp/session files are not readable by other OS
+/// users. On Windows the default ACLs are left in place (there is no cheap
+/// portable equivalent, and the tenant boundary is `open_basedir`, not OS
+/// permissions).
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// The three per-vhost private paths injected into a request's PHP sandbox.
+#[derive(Clone, Debug)]
+struct VhostPrivateDirs {
+    /// Parent of `temp`/`sessions`; the entry added to `open_basedir`.
+    state_root: PathBuf,
+    /// `sys_temp_dir` / `upload_tmp_dir` target for this vhost.
+    temp: PathBuf,
+    /// `session.save_path` target for this vhost (files handler).
+    sessions: PathBuf,
 }
 
 /// Check if a filesystem path is a PHP file.
@@ -4425,14 +4581,14 @@ mod tests {
     /// a drive-letter colon — a vhost got one bogus entry matching nothing
     /// and every file access was denied.
     #[test]
-    fn vhost_open_basedir_uses_platform_separator_and_real_temp_dir() {
-        let temp = std::env::temp_dir();
-        let root = temp.join("ephpm-basedir-test");
-        let value = vhost_open_basedir_value(&root);
+    fn vhost_open_basedir_uses_platform_separator_and_per_site_state_root() {
+        let root = std::env::temp_dir().join("ephpm-basedir-test");
+        let state_root = vhost_state_root(&root);
+        let value = vhost_open_basedir_value(&root, &state_root);
 
         let separator = if cfg!(windows) { ';' } else { ':' };
         let parts: Vec<&str> = value.split(separator).collect();
-        assert_eq!(parts.len(), 2, "expected exactly docroot + temp dir, got {value}");
+        assert_eq!(parts.len(), 2, "expected exactly docroot + state root, got {value}");
         assert_eq!(
             parts[0],
             root.display().to_string(),
@@ -4440,8 +4596,104 @@ mod tests {
         );
         assert_eq!(
             parts[1],
-            temp.display().to_string(),
-            "the second entry must be the real temp dir, not a literal /tmp"
+            state_root.display().to_string(),
+            "the second entry must be this vhost's private state root, not the shared temp dir"
+        );
+    }
+
+    #[test]
+    fn vhost_state_root_is_deterministic_and_per_site() {
+        let base = std::env::temp_dir().join("ephpm-sites");
+        let site_a = base.join("site-a.test");
+        let site_b = base.join("site-b.test");
+
+        // Deterministic: same document root → same state root across calls
+        // (so a site's sessions/temp persist across restarts).
+        assert_eq!(vhost_state_root(&site_a), vhost_state_root(&site_a));
+
+        // Distinct sites get distinct state roots — the core of the fix. The
+        // shared system temp dir must NOT be a prefix either would resolve to.
+        let a = vhost_state_root(&site_a);
+        let b = vhost_state_root(&site_b);
+        assert_ne!(a, b, "two tenants must never share a private state root");
+        assert_ne!(a, std::env::temp_dir(), "state root must not be the shared system temp dir");
+
+        // Neither state root is contained in the other, so neither appears in
+        // the other's open_basedir (which would re-open the cross-tenant hole).
+        assert!(!a.starts_with(&b) && !b.starts_with(&a), "state roots must not nest");
+    }
+
+    #[test]
+    fn vhost_state_root_leaf_names_that_collide_still_separate() {
+        // Two sites under different parents sharing a leaf name must not map
+        // to the same state root — the digest suffix disambiguates.
+        let a = vhost_state_root(Path::new("/srv/tenant-a/public"));
+        let b = vhost_state_root(Path::new("/srv/tenant-b/public"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn sanitize_path_label_strips_separators_and_bounds_length() {
+        assert_eq!(sanitize_path_label("blog.localhost"), "blog.localhost");
+        assert_eq!(sanitize_path_label("a/b\\c:d"), "a_b_c_d");
+        assert_eq!(sanitize_path_label(""), "site");
+        assert_eq!(sanitize_path_label("..").len(), 2); // dots are allowed but the digest suffix keeps it unique+bounded
+        assert_eq!(sanitize_path_label(&"x".repeat(200)).len(), 64);
+    }
+
+    #[test]
+    fn ensure_vhost_private_dirs_creates_isolated_tmp_and_sessions() {
+        let sites =
+            std::env::temp_dir().join(format!("ephpm-evd-{}", std::process::id())).join("sites");
+        let site_a = sites.join("site-a.test");
+        let site_b = sites.join("site-b.test");
+        std::fs::create_dir_all(&site_a).unwrap();
+        std::fs::create_dir_all(&site_b).unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                document_root: sites.clone(),
+                sites_dir: Some(sites.clone()),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
+
+        let a = router.ensure_vhost_private_dirs(&site_a);
+        let b = router.ensure_vhost_private_dirs(&site_b);
+
+        assert!(a.temp.is_dir(), "site-a temp dir must be created");
+        assert!(a.sessions.is_dir(), "site-a sessions dir must be created");
+        assert!(b.temp.is_dir() && b.sessions.is_dir());
+
+        // The whole point: no overlap between tenants.
+        assert_ne!(a.state_root, b.state_root);
+        assert!(a.temp.starts_with(&a.state_root) && a.sessions.starts_with(&a.state_root));
+        assert!(!a.temp.starts_with(&b.state_root), "site-a temp must be outside site-b's basedir");
+        assert!(
+            !a.sessions.starts_with(&b.state_root),
+            "site-a sessions must be outside site-b's basedir"
+        );
+
+        // Idempotent + cached: a second call returns the same paths.
+        let a2 = router.ensure_vhost_private_dirs(&site_a);
+        assert_eq!(a.state_root, a2.state_root);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&a.sessions).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "session dir must be private (0700)");
+        }
+
+        let _ = std::fs::remove_dir_all(
+            std::env::temp_dir().join(format!("ephpm-evd-{}", std::process::id())),
         );
     }
 
