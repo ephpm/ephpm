@@ -971,7 +971,7 @@ impl Router {
         if self.sites_dir.is_none() && self.sites.is_empty() {
             return crate::opcache::DEFAULT_VHOST.to_string();
         }
-        let clean = host.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+        let clean = normalize_host_key(host);
         if let Some(suffix) = &self.sites_domain_suffix {
             if let Some(stripped) = clean.strip_suffix(suffix.as_str()) {
                 return stripped.to_string();
@@ -985,8 +985,17 @@ impl Router {
             return (self.document_root.clone(), &self.index_files, &self.fallback);
         }
 
-        // Strip port and trailing dot, lowercase.
-        let clean = host.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+        // Strip port and trailing dot, lowercase (shared normalization).
+        let clean = normalize_host_key(host);
+
+        // Defense-in-depth: never join a host that isn't a valid vhost key
+        // onto `sites_dir`. `handle` already rejects malformed hosts with 404
+        // before routing (see `reject_malformed_host`), but resolving to the
+        // default document root here guarantees the traversal join cannot
+        // happen even if this method is ever reached by another path.
+        if !is_valid_site_key(&clean) {
+            return (self.document_root.clone(), &self.index_files, &self.fallback);
+        }
 
         // Negative-lookup fast path: a host we've already determined
         // has no site directory does not need to re-syscall the
@@ -1284,6 +1293,13 @@ impl Router {
 
         // Validate Host header against trusted hosts list.
         if let Some(resp) = self.check_trusted_host(&req) {
+            return Ok((resp, "error"));
+        }
+
+        // Reject a Host that cannot be a safe `sites_dir` vhost key (path
+        // traversal, separators, NUL, non-DNS characters) before it is used to
+        // resolve a document root. Independent of `trusted_hosts`. See #275.
+        if let Some(resp) = self.reject_malformed_host(&req) {
             return Ok((resp, "error"));
         }
 
@@ -2172,6 +2188,36 @@ impl Router {
         }
     }
 
+    /// Reject a `Host` header that cannot be a valid virtual-host directory
+    /// name **before** it is ever joined onto `sites_dir`.
+    ///
+    /// This closes the unauthenticated Host-header path traversal (issue
+    /// #275). It runs independently of `trusted_hosts` (empty by default), so a
+    /// multi-site deployment is protected out of the box: `Host:
+    /// ../../../../../etc`, `Host: ../single`, encoded/backslash variants, and
+    /// any other non-DNS host resolve to a 404 rather than escaping the sites
+    /// directory. Well-formed but unknown hosts (`random.example.com`) are
+    /// *not* rejected here — they fall through to the normal registry/lazy
+    /// lookup and its `document_root` fallback, preserving existing behavior.
+    ///
+    /// Single-site mode (`sites_dir` unset and no scanned sites) never joins
+    /// the host onto the filesystem, so the header is left untouched.
+    fn reject_malformed_host<B>(&self, req: &Request<B>) -> Option<Response<ServerBody>> {
+        if self.sites_dir.is_none() && self.sites.is_empty() {
+            return None;
+        }
+        // Use the exact value `resolve_site` will normalize, so the gate and
+        // the join can never disagree about what the key is.
+        let host = extract_server_name(req);
+        let key = normalize_host_key(&host);
+        if is_valid_site_key(&key) {
+            None
+        } else {
+            tracing::warn!(host = %host, "rejected malformed Host header — invalid vhost key");
+            Some(error_response(StatusCode::NOT_FOUND, "404 Not Found"))
+        }
+    }
+
     /// Check server readiness for the `/ready` probe.
     ///
     /// Returns 200 if PHP is initialized. Returns 503 with a reason
@@ -2497,6 +2543,71 @@ fn extract_server_name<B>(req: &Request<B>) -> String {
         .next()
         .unwrap_or("localhost")
         .to_string()
+}
+
+/// Normalize a raw `Host` value into the canonical vhost-lookup key: strip the
+/// port, strip a single trailing FQDN-root dot, and lowercase.
+///
+/// This is the one normalization shared by every host-keyed lookup —
+/// [`Router::resolve_site`] (document root), [`Router::opcache_vhost_key`]
+/// (OPcache invalidation), and the [`is_valid_site_key`] gate that guards the
+/// `sites_dir` join. Keeping them on a single function is what stops the
+/// normalizations from drifting apart (a pentest found `resolve_site` and the
+/// SERVER_NAME path lowercasing/suffix-stripping differently).
+fn normalize_host_key(host: &str) -> String {
+    host.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Whether a **normalized** host key (see [`normalize_host_key`]) is safe to
+/// join onto `sites_dir` as a virtual-host directory name.
+///
+/// This is the fix for the unauthenticated `Host`-header path traversal
+/// (issue #275): `sites_dir.join(host)` with an unsanitized `Host` let
+/// `Host: ../../../../../etc` + `GET /passwd` escape `sites_dir` and serve
+/// `/etc/passwd`, and `Host: ../single` point the document root — and PHP
+/// execution — at an arbitrary directory. The downstream containment checks
+/// (`serve_file`'s `starts_with(canonical_root)` and `php_script_contained`)
+/// could not catch it because they are anchored to *this* attacker-chosen
+/// root, which canonicalizes to the escaped directory.
+///
+/// The rule is a strict allowlist rather than a `..` denylist: a key is valid
+/// only if it is a non-empty sequence of DNS-style labels drawn from
+/// `[a-z0-9._-]`, with no empty label. That single "no empty label" test
+/// rejects every dangerous dot combination at once — a bare `.`/`..`, an
+/// embedded `a..b`, and a leading/trailing dot — while `/`, `\`, NUL, and any
+/// other separator or control byte are simply outside the charset. Because no
+/// `..` segment and no path separator can survive, `sites_dir.join(key)` can
+/// only ever name a direct child of `sites_dir` — the escape is closed
+/// lexically, independent of `trusted_hosts` (empty by default).
+///
+/// Note this is a *lexical* guarantee, deliberately not a
+/// `canonicalize().starts_with(sites_dir)` check: the router intentionally
+/// supports a site directory that is a symlink to a release tree outside
+/// `sites_dir` (atomic-deploy layout — see [`Router::canonical_root`]), and a
+/// canonical-containment gate would break that supported pattern. Confining
+/// the join to a direct child is enough, since the label can no longer contain
+/// traversal primitives.
+fn is_valid_site_key(key: &str) -> bool {
+    // Cap length defensively (DNS names max 253; allow a little slack). An
+    // empty key would `join("")` back to `sites_dir` itself — reject it.
+    if key.is_empty() || key.len() > 255 {
+        return false;
+    }
+    // Allowlist charset. `/`, `\`, NUL, `:`, `%`, whitespace, and every other
+    // separator/control byte fall outside it and are rejected here.
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return false;
+    }
+    // With `.` allowed for subdomains, an empty label is the one traversal the
+    // charset check can't see: it means a leading dot, a trailing dot, or a
+    // `..` segment. Any of those would traverse when joined.
+    if key.split('.').any(str::is_empty) {
+        return false;
+    }
+    true
 }
 
 /// Build a JSON response with the given status and body.
@@ -5029,6 +5140,100 @@ echo "post response";
         // Should fall back to default now.
         let (doc_root, _, _) = router.resolve_site("temp-site.com");
         assert_eq!(doc_root, dir.path());
+    }
+
+    // ── Host-header path traversal (issue #275) ────────────────────
+
+    #[test]
+    fn site_key_normalization_strips_port_dot_and_case() {
+        assert_eq!(normalize_host_key("Example.COM:8080"), "example.com");
+        assert_eq!(normalize_host_key("blog.localhost."), "blog.localhost");
+        assert_eq!(normalize_host_key("HOST"), "host");
+        assert_eq!(normalize_host_key(""), "");
+    }
+
+    #[test]
+    fn valid_site_keys_are_accepted() {
+        for key in [
+            "example.com",
+            "site-a.test",
+            "blog",
+            "pr-1234.preview.example.com",
+            "a_b.internal",
+            "123.example",
+            "xn--80ak6aa92e.com", // punycode (already ascii-lowercased)
+        ] {
+            assert!(is_valid_site_key(key), "expected `{key}` to be a valid site key");
+        }
+    }
+
+    #[test]
+    fn malicious_site_keys_are_rejected() {
+        // These are the values AFTER `normalize_host_key`. The raw Host
+        // headers that produce them are the C2 exploit payloads and their
+        // variants.
+        for key in [
+            "",                   // empty Host / bare `..` after trailing-dot strip
+            "..",                 // parent dir
+            "../single",          // sibling docroot (arbitrary-docroot RCE)
+            "../../../../../etc", // deep traversal → /etc
+            "..\\..\\windows",    // backslash separator
+            "a/b",                // embedded slash
+            "/etc",               // absolute
+            ".hidden",            // leading dot / empty first label
+            "a..b",               // embedded double-dot
+            "site.",              // trailing dot survives only if not stripped
+            "a b.com",            // space
+            "sub.%2e%2e",         // percent (never decoded into a key)
+            "host\0name",         // NUL
+            "café.com",           // non-ascii
+            "UPPER.com",          // uppercase (must be normalized first)
+        ] {
+            assert!(!is_valid_site_key(key), "expected `{key:?}` to be rejected");
+        }
+    }
+
+    #[test]
+    fn resolve_site_never_escapes_sites_dir_via_traversal_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        fs::create_dir_all(sites.join("site-a.test")).unwrap();
+        // A secret directory OUTSIDE sites_dir, reachable by `../secret`.
+        let secret = dir.path().join("secret");
+        fs::create_dir_all(&secret).unwrap();
+        fs::write(secret.join("passwd"), "root:x:0:0").unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                sites_dir: Some(sites.clone()),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
+
+        // A legitimate vhost still resolves.
+        let (good, _, _) = router.resolve_site("site-a.test");
+        assert_eq!(good, sites.join("site-a.test"));
+
+        // Every traversal host resolves to the DEFAULT document root, never to
+        // the escaped `../secret` directory (which really exists on disk).
+        for host in ["../secret", "../../secret", "..", "/etc", "..\\secret"] {
+            let (doc_root, _, _) = router.resolve_site(host);
+            assert_eq!(
+                doc_root,
+                dir.path(),
+                "traversal host `{host}` must fall back to default doc root, not escape"
+            );
+            assert_ne!(doc_root, secret, "traversal host `{host}` escaped sites_dir");
+        }
     }
     // ── streaming compression (worker send_response_stream) ────────
 

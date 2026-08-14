@@ -61,7 +61,15 @@ All sites share the single global SQLite database configured via `[db.sqlite] pa
 | `unknown.com` | `/var/www/sites/unknown.com/` | Not found → fallback to `document_root` |
 | No Host header | — | Fallback to `document_root` |
 
-Port numbers and trailing dots are stripped before matching. The match is exact — no wildcard or regex patterns. For `www.` handling, either create a symlink or handle the redirect in your fallback site.
+Port numbers and trailing dots are stripped before matching, and the host is lowercased. The match is exact — no wildcard or regex patterns. For `www.` handling, either create a symlink or handle the redirect in your fallback site.
+
+### Host Sanitization
+
+The `Host` header is used to pick a directory under `sites_dir`, so it is validated before it is ever joined onto that path. A host is only accepted as a vhost key if — after port/trailing-dot stripping and lowercasing — it is a non-empty series of DNS-style labels drawn from `[a-z0-9._-]` with no empty label. Anything else (a `..` segment, a `/` or `\`, a NUL, or any other non-DNS character) is rejected with **404 Not Found** before routing.
+
+This holds independently of `[server.request] trusted_hosts` (which is empty by default), so it cannot be bypassed by leaving that list unset. It prevents a crafted header such as `Host: ../../../../../etc` from escaping `sites_dir` and serving arbitrary host files, and `Host: ../some-dir` from pointing the document root — and PHP execution — at an arbitrary directory. Well-formed but unmatched hosts are unaffected: they still fall back to `document_root` as shown above.
+
+Single-site deployments (no `sites_dir`) never join the `Host` header onto the filesystem, so no host validation is applied there.
 
 ## Architecture
 
