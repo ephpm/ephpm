@@ -181,7 +181,7 @@ When `sites_dir` is not configured, all KV operations go to the global store. No
 
 ### RESP Protocol (Redis-Compatible) with AUTH
 
-The RESP protocol listener supports per-site isolation via the Redis `AUTH` command. Multi-tenant auth requires a `[kv] secret`:
+The RESP protocol listener supports per-site isolation via the Redis `AUTH` command. Multi-tenant auth requires a `[kv] secret` — and in multi-tenant mode it is **mandatory**: enabling `[kv.redis_compat]` with `sites_dir` set but no `[kv] secret` is a **hard startup error** (fail closed). Without the secret, per-site AUTH scoping can't be derived and the listener would serve one shared global store to every tenant, so ePHPm refuses to start rather than expose it. Set the secret, or leave `[kv.redis_compat] enabled = false` (the default) and use the per-vhost `ephpm_kv_*` PHP functions.
 
 ```toml
 [kv]

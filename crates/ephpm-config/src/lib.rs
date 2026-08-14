@@ -1396,10 +1396,14 @@ pub struct KvConfig {
     /// the derived password into PHP `$_ENV` as `EPHPM_REDIS_PASSWORD` for
     /// each request.
     ///
-    /// If unset, per-site RESP AUTH is disabled: in multi-tenant (`sites_dir`)
-    /// deployments with the RESP listener enabled, any client that can reach
-    /// the listener can access the default store (a warning is logged at
-    /// startup). In single-site (no `sites_dir`) mode, AUTH is not required.
+    /// This secret is **required** to run the RESP listener in multi-tenant
+    /// (`sites_dir`) mode: with `[kv.redis_compat] enabled = true` and
+    /// `sites_dir` set but no secret, per-site AUTH cannot be derived and the
+    /// listener would serve one shared global store to every tenant — so
+    /// [`Config::validate`] **refuses to start** (fail closed). In single-site
+    /// (no `sites_dir`) mode the shared store is the intended behavior and a
+    /// secret is not required; RESP AUTH is then a no-op unless a
+    /// `[kv.redis_compat] password` is set.
     ///
     /// Default: `None`.
     #[serde(default)]
@@ -1421,6 +1425,19 @@ impl Default for KvConfig {
             secret: None,
             redis_compat: KvRedisCompatConfig::default(),
         }
+    }
+}
+
+impl KvConfig {
+    /// Whether a usable `[kv] secret` is configured.
+    ///
+    /// A secret that is absent, empty, or whitespace-only cannot derive
+    /// per-site RESP AUTH passwords (`HMAC-SHA256(secret, hostname)`), so it is
+    /// treated as unset. This is the fail-closed signal used to decide whether
+    /// a multi-tenant RESP listener may start — see [`Config::validate`].
+    #[must_use]
+    pub fn secret_is_set(&self) -> bool {
+        self.secret.as_deref().is_some_and(|s| !s.trim().is_empty())
     }
 }
 
@@ -2001,6 +2018,32 @@ impl Config {
                 )));
             }
         }
+
+        // Fail closed: a multi-tenant RESP listener with no `[kv] secret` would
+        // serve ONE shared global KV store to every tenant with no per-site
+        // authentication. The RESP AUTH scoping that isolates tenants
+        // (`AUTH <hostname> <derived-password>` → that vhost's store) can only
+        // be derived from `[kv] secret`; without it every client reaching the
+        // listener talks to the shared default store and can read and write
+        // every site's KV. Refuse to start rather than expose it silently.
+        if self.server.sites_dir.is_some()
+            && self.kv.redis_compat.enabled
+            && !self.kv.secret_is_set()
+        {
+            return Err(ConfigError::Validation(
+                "[kv.redis_compat] enabled = true with [server] sites_dir \
+                 (multi-tenant vhosting) but no [kv] secret: the RESP listener \
+                 would serve a single shared KV store to every tenant with no \
+                 authentication, exposing every site's keys to every other \
+                 site. Set [kv] secret (e.g. `openssl rand -base64 32`) so \
+                 per-site RESP AUTH (`AUTH <hostname> <derived-password>`) \
+                 scopes each connection to its own site store, or disable the \
+                 listener with [kv.redis_compat] enabled = false. Single-site \
+                 deployments (no [server] sites_dir) are unaffected."
+                    .to_string(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -5014,6 +5057,130 @@ worker_stream_threshold = 262144
 
         cfg.php.mode = "fpm".to_string();
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── KV RESP listener fail-closed (multi-tenant needs [kv] secret) ──
+    //
+    // Trigger: sites_dir set (multi-tenant) AND [kv.redis_compat] enabled
+    // AND no usable [kv] secret. Only that exact combination must refuse to
+    // start — every other combination keeps working.
+
+    /// Build a `Config` for the KV fail-closed matrix.
+    fn kv_matrix_config(multi_tenant: bool, resp_enabled: bool, secret: Option<&str>) -> Config {
+        let mut cfg = Config::default();
+        if multi_tenant {
+            cfg.server.sites_dir = Some(PathBuf::from("/var/www/sites"));
+        }
+        cfg.kv.redis_compat.enabled = resp_enabled;
+        cfg.kv.secret = secret.map(str::to_string);
+        cfg
+    }
+
+    #[test]
+    fn kv_multi_tenant_resp_without_secret_fails_closed() {
+        // The vuln: multi-tenant + RESP listener + no secret would serve a
+        // shared global store to all tenants. Must refuse to start.
+        let cfg = kv_matrix_config(true, true, None);
+        let err = cfg.validate().expect_err("must fail closed");
+        assert!(matches!(err, ConfigError::Validation(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("secret"), "error should point at [kv] secret: {msg}");
+        assert!(msg.contains("sites_dir"), "error should mention multi-tenant: {msg}");
+    }
+
+    #[test]
+    fn kv_multi_tenant_resp_empty_secret_fails_closed() {
+        // An empty / whitespace-only secret cannot derive per-site AUTH and
+        // must be treated as unset (fail closed), not accepted.
+        for secret in ["", "   ", "\t"] {
+            let cfg = kv_matrix_config(true, true, Some(secret));
+            let err = cfg.validate().expect_err("empty secret must fail closed like an unset one");
+            assert!(matches!(err, ConfigError::Validation(_)));
+        }
+    }
+
+    #[test]
+    fn kv_multi_tenant_resp_with_secret_starts() {
+        // The secure config: per-site AUTH scoping is derivable — must start.
+        let cfg = kv_matrix_config(true, true, Some("s3cret-value"));
+        assert!(cfg.validate().is_ok(), "multi-tenant + secret is the secure mode");
+    }
+
+    #[test]
+    fn kv_single_tenant_resp_without_secret_starts() {
+        // Single-site: the shared store IS the correct behavior. Unaffected.
+        let cfg = kv_matrix_config(false, true, None);
+        assert!(cfg.validate().is_ok(), "single-tenant RESP must keep working");
+    }
+
+    #[test]
+    fn kv_multi_tenant_resp_disabled_without_secret_starts() {
+        // Multi-tenant but the RESP listener is off — no exposure, no secret
+        // needed (PHP uses the per-vhost ephpm_kv_* functions).
+        let cfg = kv_matrix_config(true, false, None);
+        assert!(cfg.validate().is_ok(), "no RESP listener means no shared-store exposure");
+    }
+
+    #[test]
+    fn kv_fail_closed_survives_absent_kv_section() {
+        // Section-absent guard (the [server.security] serde-default lesson):
+        // sites_dir + [kv.redis_compat] enabled with NO [kv] secret key and no
+        // explicit secret must still fail closed — the serde default (None)
+        // must not mask the exposure.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server]
+sites_dir = "/var/www/sites"
+
+[kv.redis_compat]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&file).unwrap();
+        assert!(cfg.kv.secret.is_none(), "no secret key present");
+        let err = cfg.validate().expect_err("absent [kv] secret must still fail closed");
+        assert!(matches!(err, ConfigError::Validation(_)));
+    }
+
+    #[test]
+    fn kv_fail_closed_secret_present_in_toml_starts() {
+        // Section-present counterpart: same multi-tenant + RESP config but with
+        // the secret set in TOML must validate.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server]
+sites_dir = "/var/www/sites"
+
+[kv]
+secret = "openssl-rand-base64-32-here"
+
+[kv.redis_compat]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&file).unwrap();
+        assert!(cfg.kv.secret_is_set());
+        cfg.validate().expect("multi-tenant + RESP + secret is the secure config");
+    }
+
+    #[test]
+    fn kv_secret_is_set_treats_blank_as_unset() {
+        let mut kv = KvConfig::default();
+        assert!(!kv.secret_is_set(), "None is unset");
+        kv.secret = Some(String::new());
+        assert!(!kv.secret_is_set(), "empty string is unset");
+        kv.secret = Some("   ".to_string());
+        assert!(!kv.secret_is_set(), "whitespace is unset");
+        kv.secret = Some("real".to_string());
+        assert!(kv.secret_is_set(), "non-blank is set");
     }
 
     // ── [db.analysis] metric_label_series_max ─────────────────────────

@@ -392,13 +392,13 @@ Notable gaps, all deliberate:
 | `compression` | string | `"none"` | `none`, `gzip`, `brotli`, `zstd`. |
 | `compression_level` | u32 | `6` | 1=fastest, 9=best. |
 | `compression_min_size` | usize (bytes) | `1024` | Values below this are stored uncompressed. |
-| `secret` | string | (none) | Master secret for per-site RESP AUTH. Not auto-generated — if unset, multi-tenant HMAC AUTH is disabled. |
+| `secret` | string | (none) | Master secret for per-site RESP AUTH (`HMAC-SHA256(secret, hostname)`). Not auto-generated. **Required to run the RESP listener in multi-tenant mode:** with `sites_dir` set and `[kv.redis_compat] enabled = true`, an unset (or empty/whitespace-only) secret is a **hard startup error** — without it every tenant would share one unauthenticated global store. Single-site deployments (no `sites_dir`) don't need it. |
 
 ### `[kv.redis_compat]`
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | bool | `false` | Enable the RESP listener. Off by default; in multi-tenant mode keep it off. |
+| `enabled` | bool | `false` | Enable the RESP listener. Off by default. In multi-tenant (`sites_dir`) mode, enabling it **requires** `[kv] secret` so per-site `AUTH <hostname> <derived-password>` scopes each connection to its own site store; without the secret startup fails closed (see `[kv] secret`). Prefer keeping it off in multi-tenant mode and using the per-vhost `ephpm_kv_*` PHP functions. |
 | `listen` | string | `"127.0.0.1:6379"` | RESP listener address (TCP only). |
 | `socket` | string | (none) | **Not yet implemented** — parsed but unused; startup logs a warning if set. |
 | `password` | string | (none) | RESP `AUTH` password. |
