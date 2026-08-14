@@ -177,13 +177,27 @@ thread, not to the request.**
 ### Per-site databases (multi-tenant mode)
 
 When `[server] sites_dir` is set and `[db.sqlite] dir` points at a directory,
-each virtual host gets its **own** database file at `<dir>/<host>.db`, opened
+each virtual host gets its **own** database file at `<dir>/<site-key>.db`, opened
 lazily on that site's first query. `ephpm_db_query()` / `ephpm_db_execute()`
 automatically resolve to the database of the site that served the current
 request — a script on `site-a.example` and a script on `site-b.example` see
 two physically separate databases and cannot read or write each other's data.
 This is the tenant-isolation boundary (Turso has no per-schema ACL, so the
 file is the boundary).
+
+**Which name is the site key.** It is the vhost key that selected the document
+root — the same one that names the directory under `sites_dir`. The `Host`
+header is normalized (port stripped, trailing dot stripped, lowercased) and, if
+`[server] sites_domain_suffix` is configured, the suffix is stripped, so a site
+served from `sites/shop/` uses `shop.db` whether the client sent
+`Host: shop.local`, `Host: shop`, or `Host: SHOP.LOCAL:8080`. One tenant has one
+database, reachable by every name that reaches its code.
+
+**A `Host` that matches no site gets no database.** A well-formed but unknown
+host still falls back to `[server] document_root`, but it has no tenant
+identity: `ephpm_db_*` returns `no per-site database context for this request`
+rather than creating a database named after the header. Deploy the site (a
+directory under `sites_dir`) and its database appears on the first query.
 
 A worker thread that serves site A and is then dispatched a request for site B
 swaps its session to B's database — it never runs B's query on A's connection.

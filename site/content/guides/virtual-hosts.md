@@ -1,6 +1,6 @@
 # Virtual Hosts
 
-ePHPm supports multi-tenant hosting through directory-based virtual hosts. Each domain gets its own document root and its own isolated KV store. No per-site configuration files needed — the directory structure IS the config. (All sites currently share the single global SQLite database — per-site databases are planned for Phase 2, see below.)
+ePHPm supports multi-tenant hosting through directory-based virtual hosts. Each domain gets its own document root, its own isolated KV store, its own private temp/session directory, and — when `[db.sqlite] dir` is configured — its own database file. No per-site configuration files needed — the directory structure IS the config.
 
 ## How It Works
 
@@ -16,8 +16,11 @@ When a request comes in, ePHPm matches the `Host` header against directories in 
 ```
 Request: Host: alice-blog.com
   → Look for /var/www/sites/alice-blog.com/
-  → Found? Serve from that directory (all sites share the global SQLite database)
-  → Not found? Fall back to server.document_root (or 404 if not configured)
+  → Found? Serve from that directory, with that site's own KV store,
+           temp/session directory and (with [db.sqlite] dir) database
+  → Not found? Fall back to server.document_root (or 404 if not configured).
+               An unmatched host is NOT a tenant: it gets no per-site database
+               and no per-site DB credentials.
 ```
 
 ### Directory Convention
@@ -44,13 +47,15 @@ Removing a site: delete the directory. Requests to that domain hit the fallback.
 
 ### Per-Site Overrides
 
-Today, per-site configuration is intentionally minimal. What's discovered per site from `sites_dir` is the document root (the directory itself) plus that site's `index_files` and `fallback`. Everything else — PHP settings, timeouts, security rules, database — comes from the global `ephpm.toml` and is shared by all sites.
+Today, per-site configuration is intentionally minimal. What's discovered per site from `sites_dir` is the document root (the directory itself) plus that site's `index_files` and `fallback`. Settings — PHP limits, timeouts, security rules — come from the global `ephpm.toml` and apply to every site. Per-site *state* (database, KV keyspace, temp and session storage) is separated automatically; it is not something you configure per site.
 
-A richer per-site override system (a `site.toml` dropped into the site directory with `[php]` and `[db.sqlite]` overrides) is planned for [Phase 2](#phase-2-per-site-databases-and-overrides-future). Until then, if one site needs a larger `memory_limit`, raise the global value in `ephpm.toml`; if one site needs longer to run, raise the global `[php] max_execution_time` (natively enforced on Linux ZTS builds — see [Signal handling and `max_execution_time`](/architecture/http/#signal-handling-and-max_execution_time)) and, above it, the `[server.timeouts] request` hard 504 backstop.
+A richer per-site override system (a `site.toml` dropped into the site directory with `[php]` overrides) is planned for [Phase 2](#phase-2-per-site-overrides-future). Until then, if one site needs a larger `memory_limit`, raise the global value in `ephpm.toml`; if one site needs longer to run, raise the global `[php] max_execution_time` (natively enforced on Linux ZTS builds — see [Signal handling and `max_execution_time`](/architecture/http/#signal-handling-and-max_execution_time)) and, above it, the `[server.timeouts] request` hard 504 backstop.
 
 ### SQLite Database Location
 
-All sites share the single global SQLite database configured via `[db.sqlite] path` in `ephpm.toml`. Per-site databases (an `ephpm.db` inside each site's directory) are planned for Phase 2 — they require litewire `COM_INIT_DB` routing or per-site litewire instances.
+Set `[db.sqlite] dir` and each virtual host gets its **own** database file at `<dir>/<site-key>.db`, opened lazily on that site's first query — the tenant-isolation boundary, since Turso has no per-schema ACL. `dir` is **required** in multi-site single-node mode; ePHPm fails closed rather than share one database between tenants. Both routes reach it: the native `ephpm_db_*` bridge (routed by the request's site) and stock `pdo_mysql` (routed by a per-site credential — see [Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/)).
+
+Per-site databases are **single-node only**. With `[cluster]` enabled the database is clustered and shared across tenants, and startup warns about it.
 
 ### Host Matching
 
@@ -62,6 +67,23 @@ All sites share the single global SQLite database configured via `[db.sqlite] pa
 | No Host header | — | Fallback to `document_root` |
 
 Port numbers and trailing dots are stripped before matching, and the host is lowercased. The match is exact — no wildcard or regex patterns. For `www.` handling, either create a symlink or handle the redirect in your fallback site.
+
+### Site Identity (the canonical site key)
+
+The key that matched above is the tenant's **whole** identity, not just its document-root lookup. Everything per-tenant is derived from that one value:
+
+| Derived from the site key | Where it lands |
+|---|---|
+| Document root | `<sites_dir>/<site-key>/` |
+| Database file | `<[db.sqlite] dir>/<site-key>.db` |
+| Private temp + session directory | `<system temp>/ephpm-vhosts/<label>-<digest>` (from the resolved document root) |
+| `pdo_mysql` credential | `DB_USER = <site-key>`, `DB_PASSWORD` derived per site |
+| KV keyspace and RESP credential | `EPHPM_REDIS_USERNAME = <site-key>` |
+
+Two consequences worth stating explicitly:
+
+- **Every name that reaches a site is the same tenant.** With `[server] sites_domain_suffix = ".localhost"`, `Host: blog.localhost`, `Host: blog` and `Host: BLOG.LOCALHOST:8080` all resolve to `blog` — one document root, one `blog.db`, one session directory, one set of credentials. (Until issue #290 the database key was derived separately and kept the suffix, so a tenant addressed both ways silently used two database files.)
+- **An unmatched host is not a tenant.** It serves `document_root`, but it has no site key, so it gets no per-site database and no `DB_*` credentials — a client cannot create `<anything>.db` by inventing a `Host` header (issue #291). `ephpm_db_*` on the fallback docroot reports `no per-site database context for this request`. If you want the fallback site to have a database, give it a real vhost directory.
 
 ### Host Sanitization
 
@@ -103,9 +125,9 @@ All sites share one ephpm process and tokio's `spawn_blocking` thread pool. A re
 
 This is efficient — 20 sites don't need 20x the threads. Any `spawn_blocking` thread can serve any site.
 
-### Shared litewire Instance
+### One litewire Listener, One Database Per Site
 
-One litewire MySQL frontend and one Turso backend serve every site. PHP on any site connects to litewire on `127.0.0.1:3306`, and all queries land in the single global SQLite database. Per-site databases would require routing MySQL wire connections per site (the MySQL protocol doesn't carry a Host header), via `COM_INIT_DB` routing or per-site litewire instances — that's Phase 2 work.
+One litewire MySQL frontend serves every site; the *backend* is per site. PHP on any site connects to `127.0.0.1:3306` as usual, and the connection's database is fixed by the credential it authenticates with — the MySQL handshake carries no `Host`, so the tenant is proven by a per-site password rather than claimed by a name. A listener per site was rejected deliberately: every tenant runs in one process as one OS user, so neither a port (enumerable) nor a unix socket (identical permissions) separates them. See [Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/).
 
 ## Resource Usage
 
@@ -306,7 +328,14 @@ sites_dir = "/var/www/sites"
 workers = 4
 memory_limit = "128M"
 
-# Global SQLite config (one database, shared by all sites)
+# Per-site databases: one <site-key>.db per virtual host (required in
+# multi-site mode — ePHPm will not share one database between tenants).
+[db.sqlite]
+dir = "/var/lib/ephpm/dbs"
+max_open_dbs = 256
+
+# One MySQL listener for every tenant; the database is fixed by the
+# per-site credential injected into that site's $_SERVER.
 [db.sqlite.proxy]
 mysql_listen = "127.0.0.1:3306"
 ```
@@ -349,7 +378,7 @@ Put a reverse proxy (Caddy recommended — automatic HTTPS per domain) in front 
 
 ### Phase 1: Directory-Based Routing (implemented)
 
-Host header → site directory mapping with per-site document roots, plus per-site KV store isolation (`MultiTenantStore`). All sites share the global SQLite database and PHP thread pool.
+Host header → site directory mapping with per-site document roots, plus per-site KV store isolation (`MultiTenantStore`). All sites share the PHP thread pool. (Per-site databases followed in a later release — see below.)
 
 | Step | Change | File |
 |------|--------|------|
@@ -362,12 +391,19 @@ Host header → site directory mapping with per-site document roots, plus per-si
 
 When `sites_dir` is not configured, the router behaves identically to today (single-site mode). Zero cost path — the `sites` HashMap is empty and `resolve_site()` returns the global defaults.
 
-### Phase 2: Per-Site Databases and Overrides (future)
+### Phase 1b: Per-Site Databases (implemented)
 
 | Feature | Description |
 |---------|-------------|
-| Per-site SQLite | Each site gets its own `ephpm.db` in its directory. Requires litewire COM_INIT_DB routing or per-site litewire instances |
-| Per-site `site.toml` | Optional overrides for `index_files`, `fallback`, `php.memory_limit`, `db.sqlite.path`, etc. Merged with global config |
+| Per-site SQLite | Each site gets its own database file at `<[db.sqlite] dir>/<site-key>.db`, opened lazily and bounded by an LRU (`max_open_dbs`). Single-node only |
+| Per-site `pdo_mysql` | One MySQL listener, per-site credentials (`DB_USER` / `DB_PASSWORD` injected per request); the connection's database is fixed by the credential it authenticates with |
+| Per-site temp + sessions | Each vhost gets a private state root; `open_basedir` contains only that vhost's own directories |
+
+### Phase 2: Per-Site Overrides (future)
+
+| Feature | Description |
+|---------|-------------|
+| Per-site `site.toml` | Optional overrides for `index_files`, `fallback`, `php.memory_limit`, etc. Merged with global config |
 | Per-site metrics | Add `host` label to Prometheus metrics for per-site traffic visibility |
 
 ### Phase 3: Operational Features (future)

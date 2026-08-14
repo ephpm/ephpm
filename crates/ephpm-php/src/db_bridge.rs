@@ -584,6 +584,11 @@ const FORBIDDEN_KEYWORDS: [&str; 3] = ["ATTACH", "DETACH", "VACUUM"];
 /// `PRAGMA` names rejected because they name or move a filesystem path (or
 /// re-open the schema for arbitrary edits). Ordinary tuning pragmas
 /// (`foreign_keys`, `journal_mode`, ...) are unaffected.
+///
+/// Matched against every dot-separated component of the pragma's target (see
+/// [`pragma_name_parts`]), so the schema-qualified and quoted spellings —
+/// `PRAGMA main.data_store_directory`, `PRAGMA "writable_schema"` — are refused
+/// the same way as the bare form.
 const FORBIDDEN_PRAGMAS: [&str; 3] =
     ["writable_schema", "temp_store_directory", "data_store_directory"];
 
@@ -668,6 +673,9 @@ pub fn screen_sql(sql: &str) -> Result<(), String> {
 /// wrapper does not make the inner statement safe, and the point of this
 /// screen is that the refusal is ePHPm's own — not whatever the pinned engine
 /// happens to do with the wrapped verb today.
+///
+/// The `PRAGMA` name is read through [`pragma_name_parts`], which sees through a
+/// schema qualifier and identifier quoting for the same reason.
 fn check_statement(stmt: &str) -> Result<(), String> {
     let trimmed = strip_explain_prefixes(stmt)?;
     if trimmed.is_empty() {
@@ -679,18 +687,104 @@ fn check_statement(stmt: &str) -> Result<(), String> {
         return Err(keyword);
     }
     if keyword == "PRAGMA" {
-        // Extract the pragma name (first token after `PRAGMA`), lowercased.
-        let name: String = rest
-            .trim_start()
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect::<String>()
-            .to_ascii_lowercase();
-        if FORBIDDEN_PRAGMAS.contains(&name.as_str()) {
-            return Err(format!("PRAGMA {name}"));
+        for part in pragma_name_parts(rest) {
+            if FORBIDDEN_PRAGMAS.contains(&part.as_str()) {
+                return Err(format!("PRAGMA {part}"));
+            }
         }
     }
     Ok(())
+}
+
+/// The dot-separated identifier components of a `PRAGMA`'s target, lowercased —
+/// e.g. `main.data_store_directory` yields `["main", "data_store_directory"]`.
+///
+/// # Why not just "the first token"
+///
+/// It used to be exactly that: `take_while(alphanumeric | '_')` over the text
+/// after `PRAGMA`. A pentest found that this stops at the `.` in
+/// `PRAGMA main.data_store_directory`, so the extracted name was `main` — not on
+/// the denylist — and the statement reached the engine (issue #292). SQLite's
+/// grammar is `PRAGMA [schema-name '.'] pragma-name`, so the qualified form is
+/// the same statement with the same effect; the screen has to see through the
+/// qualifier the way #287 taught it to see through an `EXPLAIN` prefix.
+///
+/// Identifiers may also be quoted (`"main"`, `` `main` ``, `[main]`, and — given
+/// SQLite's lenient identifier/string handling — `'main'`), and the quoting
+/// applies to the *name* as much as to the qualifier: `PRAGMA "writable_schema"`
+/// slipped past the old bare-token extractor for the same reason. Both are
+/// handled here.
+///
+/// **Every** component is returned, and the caller matches all of them against
+/// the denylist rather than only the last. A schema legitimately named
+/// `writable_schema` does not exist, so this costs nothing in false positives
+/// and removes the need to reason about which position the engine treats as the
+/// name.
+///
+/// Whitespace and comments between the tokens are skipped
+/// ([`strip_leading_noise`]), so `PRAGMA main /* c */ . writable_schema` is seen.
+/// An unterminated quoted identifier stops the scan: the statement is not valid
+/// SQL, and the outer [`screen_sql`] scanner has already rejected the quote
+/// styles it tracks.
+fn pragma_name_parts(rest: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut s = strip_leading_noise(rest);
+    loop {
+        let Some((ident, after)) = take_identifier(s) else { return parts };
+        parts.push(ident.to_ascii_lowercase());
+        let after = strip_leading_noise(after);
+        let Some(next) = after.strip_prefix('.') else { return parts };
+        s = strip_leading_noise(next);
+    }
+}
+
+/// Split one leading SQL identifier off `s`, returning its unquoted text and the
+/// remainder. Handles the bare form (`[A-Za-z0-9_$]+`) and the quoted forms
+/// `"x"`, `` `x` ``, `[x]` and `'x'`, including the doubled-delimiter escape.
+/// Returns `None` when `s` does not begin with an identifier, or when a quoted
+/// one is unterminated.
+fn take_identifier(s: &str) -> Option<(String, &str)> {
+    let bytes = s.as_bytes();
+    let close = match bytes.first()? {
+        b'"' => b'"',
+        b'`' => b'`',
+        b'\'' => b'\'',
+        b'[' => b']',
+        _ => {
+            let len = bytes
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+                .count();
+            if len == 0 {
+                return None;
+            }
+            return Some((s[..len].to_string(), &s[len..]));
+        }
+    };
+
+    let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == close {
+            // A doubled delimiter escapes itself in the quote styles that have
+            // one (`[x]]` is not an escape — brackets do not nest).
+            if close != b']' && bytes.get(i + 1) == Some(&close) {
+                i += 2;
+                continue;
+            }
+            // `i` and `1` are ASCII delimiter positions, so both are char
+            // boundaries even if the identifier holds multi-byte text.
+            let inner = &s[1..i];
+            let unescaped = match close {
+                b'"' => inner.replace("\"\"", "\""),
+                b'`' => inner.replace("``", "`"),
+                b'\'' => inner.replace("''", "'"),
+                _ => inner.to_string(),
+            };
+            return Some((unescaped, &s[i + 1..]));
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Split off the leading run of ASCII letters (a SQL keyword) from `s`,
@@ -1717,6 +1811,56 @@ mod screen_tests {
         rejected("EXPLAIN QUERY ATTACH DATABASE 'x' AS y");
         // The wrapper hidden after a benign leading statement is still caught.
         rejected("SELECT 1; EXPLAIN ATTACH DATABASE 'x' AS y");
+    }
+
+    #[test]
+    fn schema_qualified_and_quoted_pragmas_are_rejected() {
+        // Issue #292: `PRAGMA <schema>.<name>` used to slip the screen because
+        // name extraction stopped at the `.`, yielding `main` — not on the
+        // denylist. Every qualified spelling of the three forbidden pragmas
+        // must be refused by ePHPm rather than left to the engine.
+        rejected("PRAGMA main.data_store_directory = '/tmp'");
+        rejected("PRAGMA main.temp_store_directory = '/tmp'");
+        rejected("PRAGMA main.writable_schema = ON");
+        rejected("pragma MAIN.DATA_STORE_DIRECTORY = '/tmp'");
+        rejected("PRAGMA temp.writable_schema = 1");
+        // Any schema name, not just `main`/`temp`.
+        rejected("PRAGMA otherdb.writable_schema = 1");
+        // Quoted / backticked / bracketed qualifiers.
+        rejected("PRAGMA \"main\".data_store_directory = '/tmp'");
+        rejected("PRAGMA `main`.writable_schema = 1");
+        rejected("PRAGMA [main].temp_store_directory = '/tmp'");
+        rejected("PRAGMA 'main'.writable_schema = 1");
+        // Quoting the *name* is the same evasion in the other position.
+        rejected("PRAGMA \"writable_schema\" = 1");
+        rejected("PRAGMA `data_store_directory` = '/tmp'");
+        rejected("PRAGMA [temp_store_directory] = '/tmp'");
+        rejected("PRAGMA main.\"writable_schema\" = 1");
+        // Whitespace and comments around the qualifier dot.
+        rejected("PRAGMA main . writable_schema = 1");
+        rejected("PRAGMA main/**/.writable_schema = 1");
+        rejected("PRAGMA main.\n  data_store_directory = '/tmp'");
+        // Stacked with the other wrappers this screen already sees through.
+        rejected("EXPLAIN PRAGMA main.data_store_directory = '/tmp'");
+        rejected("EXPLAIN QUERY PLAN PRAGMA main.writable_schema = ON");
+        rejected("SELECT 1; PRAGMA main.data_store_directory = '/tmp'");
+        rejected("  /* c */ PRAGMA main.writable_schema = 1");
+    }
+
+    #[test]
+    fn schema_qualified_ordinary_pragmas_still_pass() {
+        // The qualifier must not turn every pragma into a refusal.
+        allowed("PRAGMA main.journal_mode = WAL");
+        allowed("PRAGMA main.foreign_keys = ON");
+        allowed("PRAGMA temp.synchronous = NORMAL");
+        allowed("PRAGMA \"main\".journal_mode = WAL");
+        allowed("PRAGMA main.table_info(t)");
+        allowed("PRAGMA table_info(t)");
+        allowed("PRAGMA main.user_version");
+        allowed("EXPLAIN PRAGMA main.foreign_keys = ON");
+        // Bare / malformed pragmas are not the screen's business.
+        allowed("PRAGMA");
+        allowed("PRAGMA .");
     }
 
     #[test]

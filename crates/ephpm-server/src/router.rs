@@ -102,6 +102,73 @@ struct SiteConfig {
     fallback: Vec<String>,
 }
 
+/// The per-request identities derived from a [`ResolvedSite`]'s key: which
+/// database this request may reach, which KV keyspace it sees, and which OPcache
+/// vhost it invalidates against.
+///
+/// One struct, one derivation site ([`Router::site_identities`]), consumed by
+/// both PHP dispatch paths — so "the database, the credential and the keyspace
+/// name the same tenant as the document root" is a property of one function
+/// rather than of four call sites that happen to agree today.
+struct SiteIdentities {
+    /// Site key for the per-site database and the `pdo_mysql` credential.
+    /// `None` outside per-site mode **and** for any host that matched no known
+    /// vhost — such a request gets no database context rather than a fresh
+    /// `<host>.db` (issue #291).
+    db: Option<String>,
+    /// Key for this request's KV keyspace and its RESP credential. Falls back to
+    /// the normalized host for an unknown site, which keeps a catch-all document
+    /// root's per-hostname keyspaces working.
+    kv: String,
+    /// Key for cluster-wide OPcache invalidation (`opcache:version:<key>`).
+    opcache: String,
+}
+
+/// A request's virtual host, resolved once: the tenant's **canonical site key**
+/// together with everything that key selects.
+///
+/// # Why the key is carried rather than re-derived
+///
+/// ePHPm derives four separate per-tenant things from the `Host` header, and
+/// they must name the *same* tenant:
+///
+/// 1. the **document root** (which code runs),
+/// 2. the **per-site database** file, `<[db.sqlite] dir>/<key>.db`,
+/// 3. the **per-vhost state root** — this tenant's private `tmp/` and
+///    `sessions/` (derived from the document root, so it follows 1), and
+/// 4. the **per-site wire credential** (`DB_USER` / `DB_PASSWORD` for the
+///    multi-tenant MySQL listener), plus this vhost's KV keyspace and RESP
+///    credential.
+///
+/// Each of those used to normalize the `Host` header for itself, and a pentest
+/// (issue #290) found the seam: with `[server] sites_domain_suffix = ".local"`,
+/// `Host: shop.local` and `Host: shop` selected the *same* document root and the
+/// *same* session directory but *different* databases (`shop.local.db` vs
+/// `shop.db`) — one tenant, bifurcated data. A disagreement between any two of
+/// these is an isolation or integrity bug; that instance happened to be
+/// integrity.
+///
+/// So there is now exactly one derivation — [`Router::resolve_site`] — and it
+/// hands back the key it actually matched. Everything downstream consumes this
+/// value instead of looking at the `Host` header again.
+///
+/// `key` is `None` when the host matched no known virtual host (see
+/// [`Router::default_site`]): the request still gets the default document root,
+/// but it has no tenant identity, so no per-tenant resource may be minted from
+/// it.
+struct ResolvedSite<'a> {
+    /// The canonical site key — suffix-stripped, port-stripped, lowercased,
+    /// trailing-dot-stripped, and [`is_valid_site_key`]-clean — or `None` when
+    /// no known site matched.
+    key: Option<String>,
+    /// The document root this request is served from.
+    document_root: PathBuf,
+    /// Index files for this site.
+    index_files: &'a [String],
+    /// Fallback chain for this site.
+    fallback: &'a [String],
+}
+
 /// A URI-path glob pattern pre-split into segments at Router
 /// construction. The router's hot path evaluates blocked-path and
 /// allowed-PHP-path lists on every request; the old `glob_match`
@@ -333,16 +400,21 @@ pub struct Router {
     /// Cache of per-hostname derived KV site passwords (HMAC-SHA256 of
     /// `secret + hostname`). The HMAC is deterministic — computed once
     /// per host per process, then served from the DashMap for the rest
-    /// of that process's lifetime. Sized at whatever the site fleet
-    /// naturally produces (one entry per active vhost).
+    /// of that process's lifetime.
+    ///
+    /// Keyed by the request's canonical site key when one matched, and by the
+    /// normalized host otherwise (an unknown host keeps its own keyspace on the
+    /// default document root). The second case is client-controlled, so the map
+    /// is capped at [`SITE_PASSWORD_CACHE_MAX`] and past that point the HMAC is
+    /// recomputed per request rather than stored.
     kv_site_password_cache: dashmap::DashMap<String, String>,
     /// Cache of per-site derived MySQL passwords, same shape and rationale as
     /// [`Router::kv_site_password_cache`].
     ///
     /// Bounded by the number of *validated* site keys, not by anything a client
-    /// can invent: entries are only inserted for a `server_name` that already
-    /// passed `is_valid_site_key` and resolved to a served vhost, so a flood of
-    /// junk `Host` headers cannot grow this map.
+    /// can invent: entries are only inserted for a request that resolved to a
+    /// served vhost (an unknown host gets no per-site database identity at all —
+    /// issue #291), so a flood of junk `Host` headers cannot grow this map.
     per_site_db_password_cache: dashmap::DashMap<String, String>,
     /// Canonicalized document roots, keyed by the as-configured root path,
     /// with the instant they were resolved. Caching removes a
@@ -485,6 +557,17 @@ const CANONICAL_SCRIPT_TTL: Duration = CANONICAL_ROOT_TTL;
 /// 4096 entries is far more than any real site's set of PHP entry points and
 /// costs on the order of a megabyte of paths.
 const CANONICAL_SCRIPT_CACHE_MAX: usize = 4096;
+
+/// Hard cap on [`Router::kv_site_password_cache`] entries.
+///
+/// The derived-password caches are keyed by site identity. For a request that
+/// resolved to a known vhost that is the canonical site key, so the map is
+/// bounded by the fleet; but the KV cache is also consulted for hosts that
+/// matched no site (they keep their own keyspace on the default document root),
+/// and that key is whatever the client sent. Past the cap the HMAC is recomputed
+/// per request instead of cached — cheap, and it keeps an unauthenticated
+/// caller from growing the map by varying `Host`.
+const SITE_PASSWORD_CACHE_MAX: usize = 4096;
 
 /// Scan `sites_dir` for virtual host subdirectories.
 ///
@@ -1075,11 +1158,20 @@ impl Router {
         // it in a DashMap keyed by hostname so we compute the HMAC
         // exactly once per host per process instead of on every
         // request.
+        //
+        // The cap matters: for a *known* vhost this key is the canonical site
+        // key (bounded by the site fleet), but an unknown host that falls
+        // through to the default document root is keyed by its own name, and
+        // that is client-controlled. Past the cap the HMAC is simply recomputed
+        // per request — a few microseconds — rather than growing a map an
+        // unauthenticated caller can drive (the memory-growth half of #291).
         let password = if let Some(cached) = self.kv_site_password_cache.get(hostname) {
             cached.clone()
         } else {
             let derived = ephpm_kv::auth::derive_site_password(secret, hostname);
-            self.kv_site_password_cache.insert(hostname.to_string(), derived.clone());
+            if self.kv_site_password_cache.len() < SITE_PASSWORD_CACHE_MAX {
+                self.kv_site_password_cache.insert(hostname.to_string(), derived.clone());
+            }
             derived
         };
 
@@ -1094,28 +1186,15 @@ impl Router {
         ]
     }
 
-    /// Vhost key used for OPcache clustered invalidation (`opcache:version:<key>`).
+    /// Resolve a request's `Host` to its virtual host: the canonical site key
+    /// and everything that key selects.
     ///
-    /// Mirrors `resolve_site`'s host-normalisation so a request that routes to
-    /// `<sites_dir>/blog/` invalidates against `opcache:version:blog` — matching
-    /// exactly what `ephpm deploy --site blog` writes. When no `sites_dir` is
-    /// configured, uses [`crate::opcache::DEFAULT_VHOST`] (`_default`).
-    fn opcache_vhost_key(&self, host: &str) -> String {
+    /// This is **the** host→tenant derivation. Every other per-tenant value is
+    /// taken from the [`ResolvedSite`] it returns rather than re-derived from
+    /// the `Host` header — see the [`ResolvedSite`] docs for why.
+    fn resolve_site(&self, host: &str) -> ResolvedSite<'_> {
         if self.sites_dir.is_none() && self.sites.is_empty() {
-            return crate::opcache::DEFAULT_VHOST.to_string();
-        }
-        let clean = normalize_host_key(host);
-        if let Some(suffix) = &self.sites_domain_suffix {
-            if let Some(stripped) = clean.strip_suffix(suffix.as_str()) {
-                return stripped.to_string();
-            }
-        }
-        if clean.is_empty() { crate::opcache::DEFAULT_VHOST.to_string() } else { clean }
-    }
-
-    fn resolve_site(&self, host: &str) -> (PathBuf, &[String], &[String]) {
-        if self.sites_dir.is_none() && self.sites.is_empty() {
-            return (self.document_root.clone(), &self.index_files, &self.fallback);
+            return self.default_site();
         }
 
         // Strip port and trailing dot, lowercase (shared normalization).
@@ -1127,7 +1206,7 @@ impl Router {
         // default document root here guarantees the traversal join cannot
         // happen even if this method is ever reached by another path.
         if !is_valid_site_key(&clean) {
-            return (self.document_root.clone(), &self.index_files, &self.fallback);
+            return self.default_site();
         }
 
         // Negative-lookup fast path: a host we've already determined
@@ -1142,7 +1221,7 @@ impl Router {
         // within about a minute of the site coming online.
         if let Some(cached_at) = self.unknown_site_cache.get(&clean) {
             if cached_at.elapsed() < UNKNOWN_SITE_TTL {
-                return (self.document_root.clone(), &self.index_files, &self.fallback);
+                return self.default_site();
             }
             // Cache entry is stale — drop it and fall through to the
             // real lookup so a freshly-deployed site is found.
@@ -1168,7 +1247,12 @@ impl Router {
         for key in lookup_keys {
             if let Some(site) = self.sites.get(*key) {
                 if site.document_root.is_dir() {
-                    return (site.document_root.clone(), &site.index_files, &site.fallback);
+                    return ResolvedSite {
+                        key: Some((*key).to_string()),
+                        document_root: site.document_root.clone(),
+                        index_files: &site.index_files,
+                        fallback: &site.fallback,
+                    };
                 }
             }
         }
@@ -1183,7 +1267,12 @@ impl Router {
                     // (once per host). Bot-probe misses go to `debug`
                     // via the fall-through below.
                     tracing::debug!(host = %clean, key = %key, path = %candidate.display(), "discovered new virtual host (lazy)");
-                    return (candidate, &self.index_files, &self.fallback);
+                    return ResolvedSite {
+                        key: Some((*key).to_string()),
+                        document_root: candidate,
+                        index_files: &self.index_files,
+                        fallback: &self.fallback,
+                    };
                 }
             }
         }
@@ -1197,7 +1286,52 @@ impl Router {
             self.unknown_site_cache.insert(clean, std::time::Instant::now());
         }
 
-        (self.document_root.clone(), &self.index_files, &self.fallback)
+        self.default_site()
+    }
+
+    /// The "no known site matched" outcome: the default document root, and —
+    /// deliberately — **no** site key.
+    ///
+    /// A well-formed but unknown `Host` lands here (as does every request in
+    /// single-site mode). It gets the default document root, exactly as before,
+    /// but it names no tenant: nothing per-tenant may be minted from it. That
+    /// is what stops an unauthenticated caller from creating an arbitrary
+    /// `<key>.db` by varying the `Host` header (issue #291).
+    fn default_site(&self) -> ResolvedSite<'_> {
+        ResolvedSite {
+            key: None,
+            document_root: self.document_root.clone(),
+            index_files: &self.index_files,
+            fallback: &self.fallback,
+        }
+    }
+
+    /// The canonical site key for `host`, or `None` when it names no known
+    /// virtual host.
+    ///
+    /// Thin wrapper over [`Router::resolve_site`] — the point is that there is
+    /// exactly one derivation, so anything that needs "which tenant is this?"
+    /// without needing the document root asks the same function that picked the
+    /// document root.
+    #[cfg(test)]
+    fn canonical_site_key(&self, host: &str) -> Option<String> {
+        self.resolve_site(host).key
+    }
+
+    /// The per-request tenant identities, all derived from the one canonical
+    /// site key [`Router::resolve_site`] matched.
+    ///
+    /// Both PHP dispatch paths (fpm and worker) go through this, so they cannot
+    /// disagree with each other and neither can re-derive a tenant from the
+    /// `Host` header behind the other's back. See [`ResolvedSite`].
+    fn site_identities(&self, site_key: Option<&str>, server_name: &str) -> SiteIdentities {
+        SiteIdentities {
+            // Fail closed twice over: no per-site mode, or no known site, means
+            // no database identity at all (issues #290, #291).
+            db: if self.per_site_db { site_key.map(str::to_owned) } else { None },
+            kv: site_key.map_or_else(|| normalize_host_key(server_name), str::to_owned),
+            opcache: opcache_vhost_key(site_key),
+        }
     }
 
     /// Resolve, and lazily create, this vhost's private temp + session
@@ -1506,9 +1640,17 @@ impl Router {
         let accepts_br = self.compression.enabled && accepts_encoding(&req, "br");
         let accepts_gzip = self.compression.enabled && accepts_encoding(&req, "gzip");
 
-        // Resolve virtual host — determines document root, index files, fallback.
+        // Resolve virtual host — determines the canonical site key, document
+        // root, index files and fallback. This is the ONLY host→tenant
+        // derivation; the key travels with the request from here (see
+        // `ResolvedSite`).
         let host = extract_server_name(&req);
-        let (site_root, site_index, site_fallback) = self.resolve_site(&host);
+        let ResolvedSite {
+            key: site_key,
+            document_root: site_root,
+            index_files: site_index,
+            fallback: site_fallback,
+        } = self.resolve_site(&host);
 
         // Extract If-None-Match for ETag support before consuming the request.
         let if_none_match = if self.etag {
@@ -1568,6 +1710,7 @@ impl Router {
                                 accepts_gzip,
                                 accepts_br,
                                 site_root.clone(),
+                                site_key.clone(),
                             )
                             .await;
 
@@ -1638,6 +1781,7 @@ impl Router {
                             accepts_gzip,
                             accepts_br,
                             site_root.clone(),
+                            site_key.clone(),
                         )
                         .await,
                         "php",
@@ -1730,6 +1874,12 @@ impl Router {
     }
 
     /// Handle a PHP request by executing it in a blocking task.
+    ///
+    /// `site_key` is the canonical site key [`Router::resolve_site`] matched for
+    /// this request (`None` when the host names no known vhost). Every
+    /// per-tenant value below is derived from it rather than from the `Host`
+    /// header, so the database, the wire credential, the KV keyspace and the
+    /// document root cannot name different tenants — see [`ResolvedSite`].
     #[allow(clippy::too_many_arguments)]
     async fn handle_php<B>(
         &self,
@@ -1740,6 +1890,7 @@ impl Router {
         accepts_gzip: bool,
         accepts_br: bool,
         document_root: PathBuf,
+        site_key: Option<String>,
     ) -> Response<ServerBody>
     where
         B: RequestBody,
@@ -1883,6 +2034,7 @@ impl Router {
                     content_type,
                     remote_addr,
                     server_name,
+                    site_key.as_deref(),
                     server_port,
                     is_https,
                     protocol,
@@ -1932,13 +2084,14 @@ impl Router {
 
         let multi_tenant_kv = self.multi_tenant_kv.clone();
         let vhost_open_basedir = self.sites_dir.is_some() && self.open_basedir;
-        // Per-site database routing: the validated, normalized site key the
-        // `ephpm_db_*` bridge resolves this request's tenant database from.
-        // `None` unless per-site DB isolation is active. `server_name` already
-        // passed the `is_valid_site_key` gate (`reject_malformed_host` runs
-        // before routing); normalizing it here matches the key the registry
-        // derives `<dir>/<key>.db` from.
-        let db_site_key = self.per_site_db.then(|| normalize_host_key(&server_name));
+        // Per-request tenant identities, all from the one canonical site key
+        // that also selected `document_root` — so `<dir>/<key>.db`, the injected
+        // `pdo_mysql` credential and the KV keyspace all belong to the vhost
+        // whose code is about to run (issue #290). `db` is `None` for a host
+        // that matched no vhost, so `ephpm_db_*` reports "no per-site database
+        // context" instead of minting `<that host>.db` (issue #291).
+        let SiteIdentities { db: db_site_key, kv: kv_site_key, opcache: vhost_name } =
+            self.site_identities(site_key.as_deref(), &server_name);
         // In multi-tenant mode, give this vhost its OWN temp + session
         // directories (issue #276). Resolved and created here, in the async
         // context, off the resolved (traversal-safe) document root; the paths
@@ -1957,7 +2110,7 @@ impl Router {
 
         // Build EPHPM_REDIS_* env vars for multi-tenant RESP auth injection,
         // plus DB_* env vars for framework auto-discovery.
-        let mut env_vars = self.build_kv_env_vars(&server_name);
+        let mut env_vars = self.build_kv_env_vars(&kv_site_key);
         env_vars.extend_from_slice(&self.db_env_vars);
         // Per-site DB credentials, when the multi-tenant wire listener is up.
         // Reuses the site key already derived for the bridge, so `pdo_mysql`
@@ -1975,7 +2128,6 @@ impl Router {
         // pass the version + vhost name down so the blocking closure can call
         // the FFI invalidator inside the PHP request lifecycle (must run on a
         // TSRM-registered thread with an active request).
-        let vhost_name = self.opcache_vhost_key(&server_name);
         let invalidate_version = match self.opcache_watcher.check(&self.store, &vhost_name) {
             crate::opcache::Decision::NoOp => None,
             crate::opcache::Decision::Invalidate { version } => Some(version),
@@ -2003,8 +2155,11 @@ impl Router {
         let php_start = std::time::Instant::now();
         let result = tokio::task::spawn_blocking(move || {
             // Scope KV store to this virtual host for multi-tenant isolation.
+            // Keyed on the same identity the injected `EPHPM_REDIS_USERNAME`
+            // names, so the in-process bridge and a RESP client reach one
+            // keyspace.
             ephpm_php::kv_bridge::set_site_store(
-                multi_tenant_kv.as_ref().map(|mt| mt.get_site_store(&server_name)),
+                multi_tenant_kv.as_ref().map(|mt| mt.get_site_store(&kv_site_key)),
             );
 
             // Scope the embedded database to this virtual host: the bridge
@@ -2122,6 +2277,7 @@ impl Router {
         content_type: Option<String>,
         remote_addr: SocketAddr,
         server_name: String,
+        site_key: Option<&str>,
         server_port: u16,
         is_https: bool,
         protocol: String,
@@ -2135,15 +2291,18 @@ impl Router {
         // rather than constructing a throwaway `PhpRequest` — that intermediate
         // built $_SERVER a second time and cloned method/uri/query/headers/
         // content_type on the hot path for no reason.
-        let mut env_vars = self.build_kv_env_vars(&server_name);
+        // Same identity derivation as the fpm path — one function, so the two
+        // dispatch modes cannot name different tenants for one request.
+        let identities = self.site_identities(site_key, &server_name);
+        let mut env_vars = self.build_kv_env_vars(&identities.kv);
         env_vars.extend_from_slice(&self.db_env_vars);
-        // Per-site DB credentials — same derivation as the fpm path above.
-        // Worth noting these work here even though the `ephpm_db_*` bridge
-        // does not: the bridge needs a thread-local site key that only the fpm
-        // path sets, whereas a wire connection carries its tenant in its own
-        // credential and needs nothing from the request thread.
-        if self.per_site_db {
-            env_vars.extend(self.build_per_site_db_env_vars(&normalize_host_key(&server_name)));
+        // Per-site DB credentials. Worth noting these work here even though the
+        // `ephpm_db_*` bridge does not: the bridge needs a thread-local site key
+        // that only the fpm path sets, whereas a wire connection carries its
+        // tenant in its own credential and needs nothing from the request
+        // thread.
+        if let Some(key) = identities.db.as_deref() {
+            env_vars.extend(self.build_per_site_db_env_vars(key));
         }
         if let Some(ref id) = self.node_id {
             env_vars.push(("EPHPM_NODE_ID".to_string(), id.clone()));
@@ -2775,13 +2934,38 @@ fn extract_server_name<B>(req: &Request<B>) -> String {
 /// port, strip a single trailing FQDN-root dot, and lowercase.
 ///
 /// This is the one normalization shared by every host-keyed lookup —
-/// [`Router::resolve_site`] (document root), [`Router::opcache_vhost_key`]
-/// (OPcache invalidation), and the [`is_valid_site_key`] gate that guards the
-/// `sites_dir` join. Keeping them on a single function is what stops the
+/// [`Router::resolve_site`] (which turns it into the canonical site key), the
+/// [`is_valid_site_key`] gate that guards the `sites_dir` join, and
+/// [`crate::site_wire_auth::SiteWireAuth`] (which applies it to a client-
+/// asserted MySQL username). Keeping them on a single function is what stops the
 /// normalizations from drifting apart (a pentest found `resolve_site` and the
 /// SERVER_NAME path lowercasing/suffix-stripping differently).
+///
+/// Note this is only *half* of a tenant's identity: it does not strip
+/// `[server] sites_domain_suffix`, so it is not on its own a site key. The
+/// canonical key is what [`Router::resolve_site`] returns — a fixed point of
+/// this function, by construction (already lowercase, port-free, and with no
+/// trailing dot), which is what lets the wire path apply this to a username and
+/// land on the same key the router injected.
 pub(crate) fn normalize_host_key(host: &str) -> String {
     host.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Vhost key used for OPcache clustered invalidation (`opcache:version:<key>`).
+///
+/// Takes the request's already-resolved canonical site key (see
+/// [`ResolvedSite`]) rather than re-normalizing the `Host` header, so a request
+/// served from `<sites_dir>/blog/` invalidates against `opcache:version:blog` —
+/// matching exactly what `ephpm deploy --site blog` writes — no matter which of
+/// that vhost's names (`blog`, `blog.localhost`, `BLOG.`) the client used.
+///
+/// A host that names no known site has no deployable identity, so it maps to
+/// [`crate::opcache::DEFAULT_VHOST`] (`_default`, the default document root)
+/// rather than to a key invented from the header. That also keeps the
+/// invalidation key space bounded by the site fleet instead of by what a client
+/// can type.
+fn opcache_vhost_key(site_key: Option<&str>) -> String {
+    site_key.map_or_else(|| crate::opcache::DEFAULT_VHOST.to_string(), str::to_owned)
 }
 
 /// Whether a **normalized** host key (see [`normalize_host_key`]) is safe to
@@ -5339,7 +5523,7 @@ echo "post response";
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
-        let (doc_root, _, _) = router.resolve_site("example.com");
+        let doc_root = router.resolve_site("example.com").document_root;
         assert_eq!(doc_root, site_dir);
     }
 
@@ -5365,7 +5549,7 @@ echo "post response";
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
-        let (doc_root, _, _) = router.resolve_site("unknown.com");
+        let doc_root = router.resolve_site("unknown.com").document_root;
         assert_eq!(doc_root, dir.path());
     }
 
@@ -5392,7 +5576,7 @@ echo "post response";
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
-        let (doc_root, _, _) = router.resolve_site("example.com:8080");
+        let doc_root = router.resolve_site("example.com:8080").document_root;
         assert_eq!(doc_root, site_dir);
     }
 
@@ -5419,7 +5603,7 @@ echo "post response";
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
-        let (doc_root, _, _) = router.resolve_site("Example.COM");
+        let doc_root = router.resolve_site("Example.COM").document_root;
         assert_eq!(doc_root, site_dir);
     }
 
@@ -5443,7 +5627,7 @@ echo "post response";
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
-        let (doc_root, _, _) = router.resolve_site("anything.com");
+        let doc_root = router.resolve_site("anything.com").document_root;
         assert_eq!(doc_root, dir.path());
     }
 
@@ -5471,7 +5655,8 @@ echo "post response";
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
-        let (doc_root, index_files, fallback) = router.resolve_site("myblog.com");
+        let ResolvedSite { document_root: doc_root, index_files, fallback, .. } =
+            router.resolve_site("myblog.com");
         let resolved = router.resolve_fallback("/", "", &doc_root, index_files, fallback);
         assert!(
             matches!(resolved, Resolved::File(p) if p == site_dir.join("index.php")),
@@ -5503,7 +5688,7 @@ echo "post response";
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         // Host doesn't exist yet — should fall back to default.
-        let (doc_root, _, _) = router.resolve_site("new-site.com");
+        let doc_root = router.resolve_site("new-site.com").document_root;
         assert_eq!(doc_root, dir.path());
 
         // Create the directory AFTER router startup (simulates switchboard deploying).
@@ -5521,7 +5706,7 @@ echo "post response";
         router.unknown_site_cache.clear();
 
         // Now it should be discovered lazily.
-        let (doc_root, _, _) = router.resolve_site("new-site.com");
+        let doc_root = router.resolve_site("new-site.com").document_root;
         assert_eq!(doc_root, new_site);
     }
 
@@ -5549,14 +5734,14 @@ echo "post response";
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         // Site exists — should resolve.
-        let (doc_root, _, _) = router.resolve_site("temp-site.com");
+        let doc_root = router.resolve_site("temp-site.com").document_root;
         assert_eq!(doc_root, site_dir);
 
         // Delete the directory (simulates switchboard tearing down).
         fs::remove_dir_all(&site_dir).unwrap();
 
         // Should fall back to default now.
-        let (doc_root, _, _) = router.resolve_site("temp-site.com");
+        let doc_root = router.resolve_site("temp-site.com").document_root;
         assert_eq!(doc_root, dir.path());
     }
 
@@ -5638,13 +5823,13 @@ echo "post response";
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         // A legitimate vhost still resolves.
-        let (good, _, _) = router.resolve_site("site-a.test");
+        let good = router.resolve_site("site-a.test").document_root;
         assert_eq!(good, sites.join("site-a.test"));
 
         // Every traversal host resolves to the DEFAULT document root, never to
         // the escaped `../secret` directory (which really exists on disk).
         for host in ["../secret", "../../secret", "..", "/etc", "..\\secret"] {
-            let (doc_root, _, _) = router.resolve_site(host);
+            let doc_root = router.resolve_site(host).document_root;
             assert_eq!(
                 doc_root,
                 dir.path(),
@@ -5653,6 +5838,316 @@ echo "post response";
             assert_ne!(doc_root, secret, "traversal host `{host}` escaped sites_dir");
         }
     }
+
+    // ── one canonical site key: the four derivations must agree ──────
+    //
+    // Issue #290. With `sites_domain_suffix` set, `Host: shop.local` and
+    // `Host: shop` selected the same document root and the same temp/session
+    // directory but *different* databases — one tenant, two databases. The
+    // tests below do not re-test that one symptom; they pin the invariant that
+    // makes the whole class impossible: for every legal spelling of a tenant's
+    // `Host`, all four derivations come out of one canonical key.
+    mod site_key_agreement {
+        use std::collections::HashMap;
+
+        use ephpm_config::SqliteConfig;
+        use litewire::backend::{AuthRequest, ConnectionAuthenticator};
+
+        use super::*;
+        use crate::site_backends::SiteBackends;
+        use crate::site_wire_auth::SiteWireAuth;
+
+        const SALT: &[u8] = b"abcdefghijklmnopqrst";
+
+        fn stats() -> ephpm_query_stats::QueryStats {
+            ephpm_query_stats::QueryStats::new(ephpm_query_stats::StatsConfig {
+                enabled: false,
+                slow_query_threshold: Duration::from_secs(1),
+                max_digests: 16,
+                metric_label_series_max: 16,
+            })
+        }
+
+        /// The `mysql_native_password` response a real client would send.
+        fn client_response(password: &str, salt: &[u8]) -> Vec<u8> {
+            use sha1::{Digest, Sha1};
+            let stage1: [u8; 20] = Sha1::digest(password.as_bytes()).into();
+            let stage2: [u8; 20] = Sha1::digest(stage1).into();
+            let mut h = Sha1::new();
+            h.update(salt);
+            h.update(stage2);
+            let mask = h.finalize();
+            stage1.iter().zip(mask).map(|(s, m)| s ^ m).collect()
+        }
+
+        /// A multi-tenant router: `sites_dir`, per-site databases, and the
+        /// multi-tenant wire listener's credential minter attached — i.e. all
+        /// four derivations live.
+        fn router_with(
+            docroot: &Path,
+            sites: &Path,
+            dbdir: &Path,
+            suffix: Option<&str>,
+            auth: &SiteWireAuth,
+        ) -> Router {
+            let config = Config {
+                server: ServerConfig {
+                    listen: "0.0.0.0:8080".to_string(),
+                    document_root: docroot.to_path_buf(),
+                    sites_dir: Some(sites.to_path_buf()),
+                    sites_domain_suffix: suffix.map(str::to_owned),
+                    ..ServerConfig::default()
+                },
+                php: PhpConfig::default(),
+                db: DbConfig {
+                    sqlite: Some(SqliteConfig {
+                        path: "unused-in-per-site-mode.db".to_string(),
+                        dir: Some(dbdir.display().to_string()),
+                        max_open_dbs: 8,
+                        engine: "turso".to_string(),
+                        proxy: ephpm_config::SqliteProxyConfig::default(),
+                        sqld: None,
+                        replication: ephpm_config::ReplicationConfig::default(),
+                    }),
+                    ..DbConfig::default()
+                },
+                kv: KvConfig::default(),
+                cluster: ClusterConfig::default(),
+                middleware: Vec::new(),
+                opcache: ephpm_config::OpcacheConfig::default(),
+            };
+            let router = Router::new(&config, test_store(), None, None, None, None, None);
+            assert!(router.per_site_db, "fixture must run in per-site database mode");
+            router.with_per_site_db_wire(auth.clone(), "127.0.0.1:3306".to_string())
+        }
+
+        /// Everything ePHPm derives per tenant from one request's `Host`.
+        #[derive(Debug, PartialEq, Eq)]
+        struct Derivations {
+            /// The canonical site key itself.
+            key: Option<String>,
+            /// (1) routing — the document root whose code runs.
+            document_root: PathBuf,
+            /// (2) the per-site database file the bridge and the wire listener
+            /// would open.
+            db_path: Option<PathBuf>,
+            /// (3) the per-vhost temp + session state root.
+            state_root: PathBuf,
+            /// (4) the per-site wire credential injected into `$_SERVER`.
+            wire_user: Option<String>,
+            wire_password: Option<String>,
+            /// The KV keyspace / RESP credential identity.
+            kv: String,
+            /// The OPcache invalidation vhost.
+            opcache: String,
+        }
+
+        /// Run every derivation for `host` exactly the way a request does.
+        fn derive(router: &Router, backends: &SiteBackends, host: &str) -> Derivations {
+            let resolved = router.resolve_site(host);
+            let ids = router.site_identities(resolved.key.as_deref(), host);
+            let env: HashMap<String, String> = ids
+                .db
+                .as_deref()
+                .map(|key| router.build_per_site_db_env_vars(key))
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            Derivations {
+                key: resolved.key.clone(),
+                state_root: vhost_state_root(&resolved.document_root),
+                document_root: resolved.document_root,
+                db_path: ids
+                    .db
+                    .as_deref()
+                    .map(|key| backends.db_path_for(key).expect("canonical key must be valid")),
+                wire_user: env.get("DB_USER").cloned(),
+                wire_password: env.get("DB_PASSWORD").cloned(),
+                kv: ids.kv,
+                opcache: ids.opcache,
+            }
+        }
+
+        /// THE regression guard for #290: every legal spelling of one tenant's
+        /// `Host` — with and without the configured suffix, with a port, in
+        /// upper case, with a trailing FQDN dot — must produce byte-identical
+        /// derivations. A difference in any field is an isolation or integrity
+        /// bug; the shipped instance was `shop.local.db` vs `shop.db`.
+        #[tokio::test]
+        async fn every_host_spelling_of_one_tenant_agrees() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            let dbdir = dir.path().join("dbs");
+            fs::create_dir_all(sites.join("shop")).unwrap();
+
+            let backends =
+                SiteBackends::new(dbdir.clone(), 8, stats(), tokio::runtime::Handle::current())
+                    .expect("registry");
+            let auth = SiteWireAuth::new(backends.clone()).expect("secret");
+            let router = router_with(dir.path(), &sites, &dbdir, Some(".local"), &auth);
+
+            let spellings = [
+                "shop.local",      // the suffixed name a browser sends
+                "shop",            // the bare directory name
+                "SHOP.LOCAL",      // upper case
+                "shop.local:8080", // with a port
+                "shop.local.",     // trailing FQDN root dot
+                "SHOP:8080",
+                "shop.",
+            ];
+
+            let expected = derive(&router, &backends, spellings[0]);
+            assert_eq!(expected.key.as_deref(), Some("shop"));
+            assert_eq!(expected.document_root, sites.join("shop"));
+            assert_eq!(expected.db_path, Some(dbdir.join("shop.db")));
+            assert_eq!(expected.wire_user.as_deref(), Some("shop"));
+            assert_eq!(expected.kv, "shop");
+            assert_eq!(expected.opcache, "shop");
+
+            for host in spellings {
+                assert_eq!(
+                    derive(&router, &backends, host),
+                    expected,
+                    "Host: {host} must derive exactly the same tenant identity as \
+                     Host: {} — a disagreement here is issue #290",
+                    spellings[0]
+                );
+            }
+        }
+
+        /// The wire half of the same invariant, checked by actually
+        /// authenticating: the credential the router injects for a request must
+        /// be accepted by the listener under the same key, and must reach the
+        /// same database *file* the bridge would.
+        #[tokio::test]
+        async fn injected_credential_authenticates_to_the_same_database() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            let dbdir = dir.path().join("dbs");
+            fs::create_dir_all(sites.join("shop")).unwrap();
+
+            let backends =
+                SiteBackends::new(dbdir.clone(), 8, stats(), tokio::runtime::Handle::current())
+                    .expect("registry");
+            let auth = SiteWireAuth::new(backends.clone()).expect("secret");
+            let router = router_with(dir.path(), &sites, &dbdir, Some(".local"), &auth);
+
+            // Credentials as injected for a request that arrived suffixed.
+            let d = derive(&router, &backends, "shop.local");
+            let user = d.wire_user.expect("per-site DB_USER");
+            let password = d.wire_password.expect("per-site DB_PASSWORD");
+
+            // The listener accepts them...
+            let backend = auth
+                .authenticate(&AuthRequest {
+                    auth_plugin: "mysql_native_password",
+                    username: user.as_bytes(),
+                    salt: SALT,
+                    auth_response: &client_response(&password, SALT),
+                    local_addr: "127.0.0.1:3306".parse().unwrap(),
+                    peer_addr: "127.0.0.1:40000".parse().unwrap(),
+                })
+                .await
+                .expect("the credential the router injected must authenticate");
+
+            // ...and hands back the same file the bridge would open.
+            backend
+                .connect()
+                .await
+                .expect("connect")
+                .execute("CREATE TABLE t (v TEXT)", &[])
+                .await
+                .expect("write");
+            assert!(dbdir.join("shop.db").exists(), "must be the canonical key's database");
+            assert!(
+                !dbdir.join("shop.local.db").exists(),
+                "the suffixed spelling must not mint a second database — issue #290"
+            );
+        }
+
+        /// Issue #291: a well-formed but unknown `Host` still gets the default
+        /// document root, but no tenant identity — so nothing can mint
+        /// `<that host>.db`.
+        #[tokio::test]
+        async fn unknown_host_gets_no_database_identity() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            let dbdir = dir.path().join("dbs");
+            fs::create_dir_all(sites.join("shop")).unwrap();
+
+            let backends =
+                SiteBackends::new(dbdir.clone(), 8, stats(), tokio::runtime::Handle::current())
+                    .expect("registry");
+            let auth = SiteWireAuth::new(backends.clone()).expect("secret");
+            let router = router_with(dir.path(), &sites, &dbdir, Some(".local"), &auth);
+
+            for host in ["random.example.com", "127.0.0.1:8080", "not-a-site"] {
+                let d = derive(&router, &backends, host);
+                assert_eq!(d.key, None, "`{host}` names no vhost");
+                assert_eq!(d.document_root, dir.path(), "unknown host still serves the default");
+                assert_eq!(d.db_path, None, "`{host}` must not name a database — issue #291");
+                assert_eq!(d.wire_user, None, "`{host}` must get no DB credential");
+                assert_eq!(d.opcache, crate::opcache::DEFAULT_VHOST);
+                // The KV keyspace deliberately still follows the host: a
+                // catch-all document root may legitimately serve many names.
+                assert_eq!(d.kv, normalize_host_key(host));
+            }
+        }
+
+        /// Agreement must not over-merge: with no suffix configured, `shop` and
+        /// `shop.local` are two different vhost directories and therefore two
+        /// different tenants, with everything separate.
+        #[tokio::test]
+        async fn distinct_sites_stay_distinct_without_a_suffix() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            let dbdir = dir.path().join("dbs");
+            fs::create_dir_all(sites.join("shop")).unwrap();
+            fs::create_dir_all(sites.join("shop.local")).unwrap();
+
+            let backends =
+                SiteBackends::new(dbdir.clone(), 8, stats(), tokio::runtime::Handle::current())
+                    .expect("registry");
+            let auth = SiteWireAuth::new(backends.clone()).expect("secret");
+            let router = router_with(dir.path(), &sites, &dbdir, None, &auth);
+
+            let bare = derive(&router, &backends, "shop");
+            let dotted = derive(&router, &backends, "shop.local");
+
+            assert_eq!(bare.key.as_deref(), Some("shop"));
+            assert_eq!(dotted.key.as_deref(), Some("shop.local"));
+            assert_ne!(bare.document_root, dotted.document_root);
+            assert_ne!(bare.db_path, dotted.db_path);
+            assert_ne!(bare.state_root, dotted.state_root);
+            assert_ne!(bare.wire_password, dotted.wire_password);
+        }
+
+        /// The wire path applies [`normalize_host_key`] to the client-asserted
+        /// username. A canonical key must be a **fixed point** of it, or the
+        /// key the router injects and the key the listener resolves would be
+        /// two different tenants.
+        #[tokio::test]
+        async fn canonical_keys_are_fixed_points_of_the_wire_normalization() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            for name in ["shop", "blog.example.com", "a-b_c"] {
+                fs::create_dir_all(sites.join(name)).unwrap();
+            }
+            let dbdir = dir.path().join("dbs");
+            let backends =
+                SiteBackends::new(dbdir.clone(), 8, stats(), tokio::runtime::Handle::current())
+                    .expect("registry");
+            let auth = SiteWireAuth::new(backends).expect("secret");
+            let router = router_with(dir.path(), &sites, &dbdir, Some(".local"), &auth);
+
+            for host in ["shop.local", "SHOP", "blog.example.com.", "a-b_c:8080"] {
+                let key = router.canonical_site_key(host).expect("known site");
+                assert_eq!(normalize_host_key(&key), key, "`{key}` must normalize to itself");
+                assert!(is_valid_site_key(&key), "`{key}` must pass the allowlist gate");
+            }
+        }
+    }
+
     // ── streaming compression (worker send_response_stream) ────────
 
     fn compression_with(streaming: StreamingCompression) -> CompressionSettings {

@@ -1795,7 +1795,7 @@ fn wire_per_site_db(
     let dir = sqlite.dir.as_ref().map(std::path::PathBuf::from).ok_or_else(|| {
         anyhow::anyhow!(
             "[db.sqlite] dir is required in multi-site mode ([server] sites_dir is set): each \
-             virtual host needs its own database file at <dir>/<host>.db. Set \
+             virtual host needs its own database file at <dir>/<site-key>.db. Set \
              `[db.sqlite] dir = \"...\"` to enable per-site isolation. Refusing to start with a \
              single shared database, which would let one tenant read and write another's data \
              (see issue #274)."
