@@ -84,9 +84,11 @@ Supported command groups: strings, hashes (`HSET`, `HGET`, `HDEL`, `HGETALL`, `H
 
 ## Multi-tenant isolation
 
-In vhost mode (`[server] sites_dir = ...`), the RESP listener is a sharp tool: it gives raw access to *every* site's keys. Recommended posture is to leave `[kv.redis_compat] enabled = false` in multi-tenant deployments and let PHP use the SAPI functions, which are automatically namespaced per host.
+In vhost mode (`[server] sites_dir = ...`), whether the RESP listener is isolated per tenant depends entirely on `[kv] secret`.
 
-When the RESP listener is enabled and AUTH is required, ePHPm derives per-site passwords from `[kv] secret`:
+**Without `[kv] secret`**, it is a sharp tool: every connection dispatches against the process-wide default store, so any client that can reach the listener sees *every* site's keys. The optional `[kv.redis_compat] password` gates access but does not scope it. Recommended posture is to leave `[kv.redis_compat] enabled = false` and let PHP use the SAPI functions, which are namespaced per host regardless of this listener.
+
+**With `[kv] secret` set**, a connection must authenticate as a specific host and is then bound to that host's own store for its lifetime — separate `Store` instances, not a key-prefix convention, and the same store the site's `ephpm_kv_*` calls use. ePHPm derives per-site passwords from `[kv] secret`:
 
 ```
 password = HMAC-SHA256(secret, hostname)

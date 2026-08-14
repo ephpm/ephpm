@@ -3,7 +3,10 @@
 //! In multi-tenant deployments, each virtual host receives its own RESP
 //! password derived from a master secret and the hostname. This allows
 //! PHP applications to use standard Redis clients (`predis`, `phpredis`)
-//! with per-site credentials injected via `$_ENV`.
+//! with per-site credentials injected as `$_SERVER` variables
+//! (`EPHPM_REDIS_HOST` / `_PORT` / `_USERNAME` / `_PASSWORD`). They are
+//! registered through the SAPI's `register_server_variables` hook, so they
+//! live in `$_SERVER` only — not in `$_ENV`, and not in `getenv()`.
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;

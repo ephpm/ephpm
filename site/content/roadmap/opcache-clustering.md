@@ -176,9 +176,9 @@ ephpm deploy --site blog --rev a8f13d2
 # Invalidate every vhost via the broadcast key opcache:version:_all
 ephpm deploy --all
 
-# Local-only reset (functionally identical to deploy on a single node;
-# on a cluster, still propagates via gossip because the RESP listener
-# writes to the same in-process store)
+# Same reset, named for a non-deploy context. Wire-identical to `deploy`
+# minus --rev, so on a cluster it still propagates via gossip: the RESP
+# listener writes to the same in-process store.
 ephpm cache reset --site blog
 ephpm cache reset --all
 ```
