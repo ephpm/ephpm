@@ -952,6 +952,40 @@ impl PhpRuntime {
         }
     }
 
+    /// Register a **per-site** backend resolver for the PHP native
+    /// `ephpm_db_*` functions (multi-site secure-multi-tenancy mode).
+    ///
+    /// Unlike [`Self::set_db_backend`] (one global backend), this hands the
+    /// bridge a [`db_bridge::SiteBackendResolver`] (ephpm-server's per-site
+    /// registry). Each request's query is routed to its own tenant's database
+    /// based on the site key set by the router via
+    /// [`db_bridge::set_current_site`] before PHP runs. Mutually exclusive with
+    /// `set_db_backend` — first registration wins.
+    ///
+    /// In stub mode (no `php_linked`) the Rust-side registration still happens
+    /// but no PHP wiring occurs.
+    pub fn set_db_backend_resolver(
+        resolver: std::sync::Arc<dyn db_bridge::SiteBackendResolver>,
+        handle: tokio::runtime::Handle,
+    ) {
+        let registered = db_bridge::set_resolver(resolver, handle);
+
+        #[cfg(php_linked)]
+        if registered {
+            // Safety: DB_OPS is a static with a stable address.
+            // ephpm_set_db_ops copies the struct into the C global — the
+            // pointer only needs to be valid for the duration of this call.
+            unsafe { ffi::ephpm_set_db_ops(&db_bridge::DB_OPS) };
+
+            tracing::info!("per-site db resolver wired to PHP native functions");
+        }
+
+        #[cfg(not(php_linked))]
+        if registered {
+            tracing::debug!("per-site db resolver registered (stub mode, no PHP wiring)");
+        }
+    }
+
     // ── Worker mode ───────────────────────────────────────────────────────
 
     /// Install the worker-mode ops table so `\Ephpm\Worker\take_request()` /

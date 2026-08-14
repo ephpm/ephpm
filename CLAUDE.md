@@ -78,6 +78,8 @@ Mode detection (`is_clustered_sqlite()` in `crates/ephpm-server/src/lib.rs`):
 - If `replication.role = "auto"` AND `cluster.enabled = true` → clustered (election via gossip)
 - Otherwise → single-node (in-process Turso)
 
+**Per-site databases (multi-tenant, `is_per_site_sqlite()`):** when `[server] sites_dir` is set with `[db.sqlite]` (single-node), each virtual host gets its **own** database file at `[db.sqlite].dir`/`<host>.db` — the tenant-isolation boundary (Turso has no per-schema ACL). `dir` is required (fail-closed) and `max_open_dbs` bounds an LRU of open databases (`crates/ephpm-server/src/site_backends.rs`, `SiteBackends`). The `ephpm_db_*` bridge resolves each request's own database via a per-thread session that swaps when the request's site changes (`crates/ephpm-php/src/db_bridge.rs`). The shared MySQL/PG/Hrana/TDS wire listeners are **not started** in multi-site mode (one listener = one shared DB for all tenants), so multi-tenant DB access is bridge-only. `ATTACH`/`DETACH`/`VACUUM`/path-`PRAGMA` are rejected on the tenant path in all modes. Per-site isolation is single-node only.
+
 Note that `replication.role` defaults to `"auto"`. So omitting `[db.sqlite.replication]` entirely is identical to setting `role = "auto"` — clustered mode if `[cluster].enabled = true`, single-node otherwise. To force single-node even with clustering on, set `replication.role` to anything other than `"primary"`, `"replica"`, or `"auto"` (e.g. `"single"`).
 
 The `[db.sqlite].engine` knob defaults to `"turso"` and `"turso"` is the only accepted value. Legacy `engine = "sqlite"` / `"rusqlite"` is a **hard startup error** (with a migration message) rather than a silent fallback.

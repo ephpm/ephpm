@@ -248,6 +248,13 @@ pub struct Router {
     /// `None` outside multi-tenant mode.
     multi_tenant_kv: Option<ephpm_kv::multi_tenant::MultiTenantStore>,
     open_basedir: bool,
+    /// Whether per-site database isolation is active (multi-site + embedded
+    /// Turso, single-node). When true, the request's validated site key is
+    /// pushed to the `ephpm_db_*` bridge before PHP runs, so each tenant's
+    /// queries hit its own database. Derived from config in [`Router::new`] —
+    /// the same condition ephpm-server's `is_per_site_sqlite` uses to register
+    /// the resolver, so the two never disagree.
+    per_site_db: bool,
     php_etag_cache_config: ephpm_config::PhpETagCacheConfig,
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     metrics_path: String,
@@ -643,6 +650,7 @@ impl Router {
             // Filled in by `with_alt_svc` once the QUIC endpoint has bound.
             alt_svc: None,
             open_basedir,
+            per_site_db: crate::is_per_site_sqlite(config, config.cluster.enabled),
             multi_tenant_kv,
             store,
             php_etag_cache_config: config.server.php_etag_cache.clone(),
@@ -1760,6 +1768,13 @@ impl Router {
 
         let multi_tenant_kv = self.multi_tenant_kv.clone();
         let vhost_open_basedir = self.sites_dir.is_some() && self.open_basedir;
+        // Per-site database routing: the validated, normalized site key the
+        // `ephpm_db_*` bridge resolves this request's tenant database from.
+        // `None` unless per-site DB isolation is active. `server_name` already
+        // passed the `is_valid_site_key` gate (`reject_malformed_host` runs
+        // before routing); normalizing it here matches the key the registry
+        // derives `<dir>/<key>.db` from.
+        let db_site_key = self.per_site_db.then(|| normalize_host_key(&server_name));
         // disable_shell_exec is applied globally via the generated php.ini
         // (zend_disable_functions runs once at MINIT and removes the
         // functions from the function table; runtime ini changes don't
@@ -1810,6 +1825,13 @@ impl Router {
             ephpm_php::kv_bridge::set_site_store(
                 multi_tenant_kv.as_ref().map(|mt| mt.get_site_store(&server_name)),
             );
+
+            // Scope the embedded database to this virtual host: the bridge
+            // resolves the tenant's own database from this key (per-site DB
+            // isolation). `None` leaves the bridge on its single global
+            // backend (single-site) — and clears any stale key so per-site
+            // mode never silently reuses a previous request's tenant.
+            ephpm_php::db_bridge::set_current_site(db_site_key.as_deref());
 
             // Apply per-request PHP sandbox for multi-tenant isolation.
             // open_basedir varies per vhost (each site only sees its own
@@ -2554,7 +2576,7 @@ fn extract_server_name<B>(req: &Request<B>) -> String {
 /// `sites_dir` join. Keeping them on a single function is what stops the
 /// normalizations from drifting apart (a pentest found `resolve_site` and the
 /// SERVER_NAME path lowercasing/suffix-stripping differently).
-fn normalize_host_key(host: &str) -> String {
+pub(crate) fn normalize_host_key(host: &str) -> String {
     host.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase()
 }
 
@@ -2587,7 +2609,7 @@ fn normalize_host_key(host: &str) -> String {
 /// canonical-containment gate would break that supported pattern. Confining
 /// the join to a direct child is enough, since the label can no longer contain
 /// traversal primitives.
-fn is_valid_site_key(key: &str) -> bool {
+pub(crate) fn is_valid_site_key(key: &str) -> bool {
     // Cap length defensively (DNS names max 253; allow a little slack). An
     // empty key would `join("")` back to `sites_dir` itself — reject it.
     if key.is_empty() || key.len() > 255 {

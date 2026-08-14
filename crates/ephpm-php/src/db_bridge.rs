@@ -18,14 +18,52 @@
 //! registered, [`run_sql_bytes`] reports [`RunStatus::Unavailable`] and the
 //! C side throws a clean PHP exception instead of crashing.
 //!
-//! # One Session per PHP thread
+//! # Single backend vs. per-site registry
 //!
-//! Each OS thread that executes PHP gets its own lazily-created
-//! [`Session`] (thread-local), opened via `Backend::connect()` on first
-//! use. The session translates MySQL-dialect SQL, runs the metadata
-//! emulation for `SHOW`/`DESCRIBE`, returns OK for dialect no-ops like
-//! `SET NAMES`, and tracks transaction state — `BEGIN`/`COMMIT`/`ROLLBACK`
+//! The bridge resolves the backend for a query from a [`BackendSource`]:
+//!
+//! * [`BackendSource::Single`] — one process-global backend (single-site
+//!   embedded Turso, or the single-node DB-proxy path). The request's site
+//!   is ignored; every query hits the one backend, exactly as before per-site
+//!   isolation existed.
+//! * [`BackendSource::PerSite`] — a [`SiteBackendResolver`] (implemented by
+//!   ephpm-server's site-backend registry) that maps the **current request's
+//!   validated site key** to that site's own database, lazily opening and
+//!   caching it. This is the secure-multi-tenancy path: tenant A and tenant B
+//!   resolve to different database files, so A's SQL cannot reach B's data.
+//!   The site key is set per request by the router via [`set_current_site`]
+//!   before PHP runs; a query with no site context (per-site mode but no key)
+//!   **fails closed** — it never falls back to a shared default database.
+//!
+//! # One Session per (PHP thread, site)
+//!
+//! Each OS thread that executes PHP holds at most one live [`Session`]
+//! (thread-local), keyed by the site it belongs to. A worker thread that
+//! served site A and is then dispatched a request for site B does **not**
+//! reuse A's connection: the held session is swapped for a fresh one against
+//! B's backend (A's session and its pin on A's database are dropped). Within a
+//! single request the site never changes, so the swap only ever happens
+//! between requests. The session translates MySQL-dialect SQL, runs the
+//! metadata emulation for `SHOW`/`DESCRIBE`, returns OK for dialect no-ops
+//! like `SET NAMES`, and tracks transaction state — `BEGIN`/`COMMIT`/`ROLLBACK`
 //! flow through as plain SQL, exactly as they do on the wire path.
+//!
+//! The held session keeps a clone of the registry's backend `Arc`, which
+//! *pins that site's database open*. The registry's LRU eviction is therefore
+//! refcount-aware: it only closes a site whose backend `Arc` has no live
+//! session clone (see ephpm-server's `site_backends`). Swapping away from a
+//! site at the next differing request drops that pin, letting an idle site
+//! become evictable.
+//!
+//! # Defense-in-depth SQL screening
+//!
+//! Every statement on the tenant query path is screened
+//! ([`screen_sql`]) and `ATTACH`/`DETACH`/`VACUUM` plus path-bearing
+//! `PRAGMA`s are rejected before reaching the backend — independently of
+//! Turso already refusing them. `ATTACH` is the exact cross-tenant primitive
+//! of issue #274 (read/write another site's file, or plant a PHP shell in it):
+//! making the refusal ePHPm's own, not the pinned engine's default, keeps the
+//! property if a future engine bump ever flips that default.
 //!
 //! # Transactions end with the request
 //!
@@ -76,11 +114,46 @@ use litewire::{Session, SessionError, SessionResult};
 
 // ── Global bridge handle ────────────────────────────────────────────────
 
+/// Resolves a request's validated site key to that site's backend.
+///
+/// Implemented by ephpm-server's per-site backend registry (`site_backends`).
+/// The registry lazily opens and caches one database per site and evicts idle
+/// ones under an LRU cap. Kept as a trait here so `ephpm-php` stays ignorant of
+/// Turso, config, and on-disk layout — it only needs "give me the backend for
+/// this site key".
+///
+/// `resolve` may block (open a database on first use); it is only ever called
+/// from PHP worker / `spawn_blocking` threads, never async tasks — the same
+/// invariant that licenses the bridge's `block_on` (see the `Async boundary`
+/// module docs).
+pub trait SiteBackendResolver: Send + Sync {
+    /// Return a clone of the shared backend `Arc` for `site_key`, opening and
+    /// caching the site's database if this is its first use. The returned
+    /// clone pins the database open for as long as the caller (a thread-local
+    /// [`Session`]) holds it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when the key is invalid or the
+    /// database cannot be opened. The bridge surfaces it to PHP as an
+    /// exception and **never** falls back to another site's database.
+    fn resolve(&self, site_key: &str) -> Result<SharedBackend, String>;
+}
+
+/// Where the bridge gets the backend for a query.
+enum BackendSource {
+    /// One process-global backend; the request's site is ignored.
+    Single(SharedBackend),
+    /// Per-site registry; the backend is chosen by the current request's
+    /// site key (fails closed when no key is set).
+    PerSite(Arc<dyn SiteBackendResolver>),
+}
+
 /// Everything a thread needs to open and drive a session.
 struct DbBridge {
-    /// The erased backend shared with the wire frontends (including the
-    /// `TrackedBackend` stats wrapper).
-    backend: SharedBackend,
+    /// How to resolve the backend for a query — one global backend, or a
+    /// per-site registry.
+    source: BackendSource,
     /// The server's tokio runtime, pinned so sync FFI callbacks can
     /// `block_on` session work.
     handle: tokio::runtime::Handle,
@@ -90,19 +163,49 @@ struct DbBridge {
     cache: Arc<TranslateCache>,
 }
 
+/// Site key used for the [`BackendSource::Single`] held session. Real
+/// per-site keys are validated `[a-z0-9._-]`, so the empty string can never
+/// collide with one.
+const SINGLE_SITE_KEY: &str = "";
+
 static DB_BRIDGE: OnceLock<DbBridge> = OnceLock::new();
 
-/// Register the backend + runtime handle backing the PHP `ephpm_db_*`
+/// Register a single process-global backend backing the PHP `ephpm_db_*`
 /// functions. First registration wins; later calls are no-ops (mirrors
 /// [`crate::kv_bridge::set_store`]).
 ///
 /// Returns `true` if this call performed the registration.
 pub fn set_backend(backend: SharedBackend, handle: tokio::runtime::Handle) -> bool {
     let registered = DB_BRIDGE
-        .set(DbBridge { backend, handle, cache: Arc::new(TranslateCache::default()) })
+        .set(DbBridge {
+            source: BackendSource::Single(backend),
+            handle,
+            cache: Arc::new(TranslateCache::default()),
+        })
         .is_ok();
     if registered {
-        tracing::debug!("db backend registered for PHP native functions");
+        tracing::debug!("db backend registered for PHP native functions (single-backend mode)");
+    }
+    registered
+}
+
+/// Register a per-site backend resolver backing the PHP `ephpm_db_*`
+/// functions (multi-site secure-multi-tenancy mode). First registration wins.
+///
+/// Returns `true` if this call performed the registration.
+pub fn set_resolver(
+    resolver: Arc<dyn SiteBackendResolver>,
+    handle: tokio::runtime::Handle,
+) -> bool {
+    let registered = DB_BRIDGE
+        .set(DbBridge {
+            source: BackendSource::PerSite(resolver),
+            handle,
+            cache: Arc::new(TranslateCache::default()),
+        })
+        .is_ok();
+    if registered {
+        tracing::debug!("db backend registered for PHP native functions (per-site mode)");
     }
     registered
 }
@@ -113,17 +216,53 @@ pub fn is_configured() -> bool {
     DB_BRIDGE.get().is_some()
 }
 
+/// Set the site key for the current request on this thread (per-site mode).
+///
+/// Called by the request handler before PHP execution, mirroring
+/// [`crate::kv_bridge::set_site_store`]. In single-backend mode this is
+/// unnecessary (the key is ignored) and typically not called. Passing `None`
+/// clears any previous key so a subsequent query in per-site mode fails closed
+/// rather than silently reusing a stale site.
+pub fn set_current_site(site_key: Option<&str>) {
+    DB_CURRENT_SITE.with(|s| {
+        *s.borrow_mut() = site_key.map(Box::from);
+    });
+}
+
 // ── Thread-local state ──────────────────────────────────────────────────
 
 thread_local! {
-    /// The per-thread session, created lazily on first use.
-    static DB_SESSION: RefCell<Option<Session>> = const { RefCell::new(None) };
+    /// The per-thread held session, created lazily on first use and swapped
+    /// when the request's site changes. `None` until the thread's first query.
+    static DB_HELD: RefCell<Option<HeldSession>> = const { RefCell::new(None) };
+    /// The current request's site key on this thread (per-site mode). Set by
+    /// [`set_current_site`] before PHP runs; `None` outside per-site mode or
+    /// before it is set.
+    static DB_CURRENT_SITE: RefCell<Option<Box<str>>> = const { RefCell::new(None) };
     /// Parameters staged by `param_*` calls for the next `run`.
     static DB_PARAMS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
     /// Result of the last successful `run` on this thread.
     static DB_RESULT: RefCell<Option<SessionResult>> = const { RefCell::new(None) };
     /// Error from the last failed `run` on this thread.
     static DB_ERROR: RefCell<Option<BridgeError>> = const { RefCell::new(None) };
+}
+
+/// A thread's live session together with the site it belongs to and a clone
+/// of that site's backend `Arc` (which pins the database open — see the
+/// module docs, `One Session per (PHP thread, site)`).
+struct HeldSession {
+    /// The site this session's connection belongs to ([`SINGLE_SITE_KEY`] in
+    /// single-backend mode).
+    site: Box<str>,
+    /// Clone of the registry backend `Arc`, held so the site's database stays
+    /// open for the session's lifetime and the registry's refcount-aware LRU
+    /// never evicts a site with a live session. Never read — its `Drop` (when
+    /// the session is swapped out or the thread retires) is the whole point,
+    /// as it releases the site's pin.
+    #[allow(dead_code)]
+    _backend: SharedBackend,
+    /// The litewire session driving this thread's queries for `site`.
+    session: Session,
 }
 
 /// The MySQL error triple staged for the C side after a failed `run`.
@@ -274,6 +413,40 @@ pub fn run_sql_bytes(sql: &[u8]) -> RunStatus {
     run_on(DB_BRIDGE.get(), sql)
 }
 
+/// The site key this request's queries belong to, from a bridge's
+/// [`BackendSource`]. In per-site mode this reads the thread-local key set by
+/// [`set_current_site`] and **fails closed** if none is present — it never
+/// substitutes a shared/default database. Cheap: no backend is opened here, so
+/// same-site consecutive queries never touch the registry.
+fn current_site_key(source: &BackendSource) -> Result<Box<str>, BridgeError> {
+    match source {
+        BackendSource::Single(_) => Ok(Box::from(SINGLE_SITE_KEY)),
+        BackendSource::PerSite(_) => {
+            DB_CURRENT_SITE.with(|s| s.borrow().clone()).ok_or_else(|| BridgeError {
+                code: ER_UNKNOWN_ERROR,
+                sqlstate: *b"HY000",
+                message: "no per-site database context for this request — multi-site database \
+                          isolation could not determine the tenant"
+                    .to_string(),
+            })
+        }
+    }
+}
+
+/// Resolve the backend for `site` — only called when a session swap is needed
+/// (a thread's first query, or a site change), so the registry lookup is off
+/// the same-site hot path.
+fn backend_for(source: &BackendSource, site: &str) -> Result<SharedBackend, BridgeError> {
+    match source {
+        BackendSource::Single(backend) => Ok(Arc::clone(backend)),
+        BackendSource::PerSite(resolver) => resolver.resolve(site).map_err(|msg| BridgeError {
+            code: ER_UNKNOWN_ERROR,
+            sqlstate: *b"HY000",
+            message: format!("failed to open the database for this site: {msg}"),
+        }),
+    }
+}
+
 /// [`run_sql_bytes`] against an explicit bridge. Split out so unit tests
 /// can drive a locally-constructed [`DbBridge`] (with a mock backend)
 /// without going through the process-wide, set-once [`DB_BRIDGE`].
@@ -293,32 +466,78 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
         });
     };
 
-    let outcome = DB_SESSION.with(|slot| {
+    // Defense-in-depth: reject cross-database / path primitives on the tenant
+    // query path regardless of what the backend would do on its own.
+    if let Err(offending) = screen_sql(sql) {
+        return stage_error(BridgeError {
+            code: ER_UNKNOWN_ERROR,
+            sqlstate: *b"HY000",
+            message: format!(
+                "statement type `{offending}` is not permitted on the tenant database path"
+            ),
+        });
+    }
+
+    let site = match current_site_key(&bridge.source) {
+        Ok(site) => site,
+        Err(e) => return stage_error(e),
+    };
+
+    let outcome = DB_HELD.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let session = match slot.as_mut() {
-            Some(session) => session,
-            None => {
-                // Lazily open this thread's session against the shared
-                // backend. block_on is legal here — see the module docs
-                // (`Async boundary`): FFI callbacks never run on async
-                // tasks.
-                match bridge.handle.block_on(bridge.backend.connect()) {
-                    Ok(conn) => slot.insert(Session::with_cache(
-                        conn,
-                        Dialect::MySQL,
-                        Arc::clone(&bridge.cache),
-                    )),
-                    Err(e) => {
-                        return Err(BridgeError {
-                            code: ER_UNKNOWN_ERROR,
-                            sqlstate: *b"HY000",
-                            message: format!("failed to open embedded database session: {e}"),
-                        });
-                    }
+
+        // Swap the held session if it belongs to a different site (or none):
+        // a thread that served site A must never run site B's query on A's
+        // connection. Within one request the site is fixed, so this only ever
+        // fires between requests. The registry lookup happens only here — a
+        // same-site consecutive query reuses the held session untouched.
+        let needs_new = slot.as_ref().is_none_or(|held| held.site.as_ref() != site.as_ref());
+        if needs_new {
+            let backend = backend_for(&bridge.source, &site)?;
+            if let Some(old) = slot.as_mut() {
+                // Defensive: the previous site's session should not be
+                // mid-transaction here (on_request_end rolls abandoned
+                // transactions back between requests, and the site never
+                // changes within a request). Roll back before dropping it so
+                // a stray open transaction can't linger on a dropped session.
+                if old.session.in_transaction {
+                    tracing::warn!(
+                        old_site = %old.site,
+                        new_site = %site,
+                        "swapping bridge session to a new site while a transaction was open on \
+                         the previous site — rolling it back"
+                    );
+                    let _ = bridge.handle.block_on(old.session.query("ROLLBACK", &[]));
                 }
             }
-        };
-        let result = bridge.handle.block_on(session.query(sql, &params));
+            // Lazily open this thread's session against the site's backend.
+            // block_on is legal here — see the module docs (`Async boundary`):
+            // FFI callbacks never run on async tasks.
+            match bridge.handle.block_on(backend.connect()) {
+                Ok(conn) => {
+                    *slot = Some(HeldSession {
+                        site: site.clone(),
+                        _backend: backend,
+                        session: Session::with_cache(
+                            conn,
+                            Dialect::MySQL,
+                            Arc::clone(&bridge.cache),
+                        ),
+                    });
+                }
+                Err(e) => {
+                    return Err(BridgeError {
+                        code: ER_UNKNOWN_ERROR,
+                        sqlstate: *b"HY000",
+                        message: format!("failed to open embedded database session: {e}"),
+                    });
+                }
+            }
+        }
+
+        // `slot` is Some here: either it already matched, or we just set it.
+        let held = slot.as_mut().expect("held session was just ensured");
+        let result = bridge.handle.block_on(held.session.query(sql, &params));
         if let Err(e) = &result {
             // Recycle a session whose connection looks dead so the NEXT
             // call reconnects — but never mid-transaction: recycling
@@ -328,7 +547,7 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
             // mid-transaction connection death is instead cleaned up at
             // request end: on_request_end's ROLLBACK fails over the same
             // dead connection and drops the session then.
-            if !session.in_transaction && is_connection_error(e) {
+            if !held.session.in_transaction && is_connection_error(e) {
                 tracing::warn!(
                     error = %e,
                     "embedded db session hit a connection-class error — dropping it so the \
@@ -350,6 +569,134 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
             status
         }
         Err(e) => stage_error(e),
+    }
+}
+
+/// Statement keywords rejected on the tenant query path: cross-database and
+/// whole-file primitives. `ATTACH`/`DETACH` are the issue #274 cross-tenant
+/// read/write/shell-plant primitive; `VACUUM [INTO]` can write a copy of the
+/// database to an arbitrary path.
+const FORBIDDEN_KEYWORDS: [&str; 3] = ["ATTACH", "DETACH", "VACUUM"];
+
+/// `PRAGMA` names rejected because they name or move a filesystem path (or
+/// re-open the schema for arbitrary edits). Ordinary tuning pragmas
+/// (`foreign_keys`, `journal_mode`, ...) are unaffected.
+const FORBIDDEN_PRAGMAS: [&str; 3] =
+    ["writable_schema", "temp_store_directory", "data_store_directory"];
+
+/// Screen a (possibly multi-statement) SQL string for statements that are
+/// forbidden on the tenant path. Quote- and comment-aware so a `;` or keyword
+/// hidden inside a string literal or comment is not mistaken for a statement.
+///
+/// # Errors
+///
+/// Returns the offending keyword (e.g. `"ATTACH"`, `"PRAGMA data_store_directory"`)
+/// when a forbidden statement is found. An unterminated quote or block comment
+/// is treated conservatively as forbidden (`"malformed SQL"`) so a truncated
+/// `ATTACH` cannot slip through.
+fn screen_sql(sql: &str) -> Result<(), String> {
+    let bytes = sql.as_bytes();
+    let mut start = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let quote = bytes[i];
+                i += 1;
+                loop {
+                    if i >= bytes.len() {
+                        return Err("malformed SQL".to_string());
+                    }
+                    if bytes[i] == quote {
+                        // A doubled quote is an escaped quote, not a close.
+                        if i + 1 < bytes.len() && bytes[i + 1] == quote {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                loop {
+                    if i + 1 >= bytes.len() {
+                        return Err("malformed SQL".to_string());
+                    }
+                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b';' => {
+                check_statement(&sql[start..i])?;
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    check_statement(&sql[start..])
+}
+
+/// Reject one statement whose leading keyword is forbidden. Empty /
+/// comment-only statements are allowed.
+fn check_statement(stmt: &str) -> Result<(), String> {
+    let trimmed = strip_leading_noise(stmt);
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let keyword: String = trimmed
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect::<String>()
+        .to_ascii_uppercase();
+
+    if FORBIDDEN_KEYWORDS.contains(&keyword.as_str()) {
+        return Err(keyword);
+    }
+    if keyword == "PRAGMA" {
+        // Extract the pragma name (first token after `PRAGMA`), lowercased.
+        let rest = trimmed[keyword.len()..].trim_start();
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if FORBIDDEN_PRAGMAS.contains(&name.as_str()) {
+            return Err(format!("PRAGMA {name}"));
+        }
+    }
+    Ok(())
+}
+
+/// Drop leading whitespace and leading SQL comments so a statement's first
+/// keyword is what gets checked. Returns `""` when the input is only
+/// whitespace and comments (including an unterminated one).
+fn strip_leading_noise(stmt: &str) -> &str {
+    let mut s = stmt;
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("--") {
+            let Some(nl) = rest.find('\n') else { return "" };
+            s = &rest[nl + 1..];
+        } else if let Some(rest) = s.strip_prefix("/*") {
+            let Some(end) = rest.find("*/") else { return "" };
+            s = &rest[end + 2..];
+        } else {
+            return s;
+        }
     }
 }
 
@@ -393,12 +740,12 @@ pub fn on_request_end() {
     let Some(bridge) = DB_BRIDGE.get() else {
         return;
     };
-    DB_SESSION.with(|slot| {
+    DB_HELD.with(|slot| {
         let mut slot = slot.borrow_mut();
-        let Some(session) = slot.as_mut() else {
+        let Some(held) = slot.as_mut() else {
             return;
         };
-        if !session.in_transaction {
+        if !held.session.in_transaction {
             return;
         }
         tracing::warn!(
@@ -410,7 +757,7 @@ pub fn on_request_end() {
         // spawn_blocking pool, never on an async task (module docs,
         // `Async boundary`). On success Session::query clears
         // `in_transaction` itself.
-        if let Err(e) = bridge.handle.block_on(session.query("ROLLBACK", &[])) {
+        if let Err(e) = bridge.handle.block_on(held.session.query("ROLLBACK", &[])) {
             tracing::warn!(
                 error = %e,
                 "rollback of the abandoned transaction failed — dropping the session so \
@@ -950,7 +1297,7 @@ mod tests {
     /// Whether this thread's session currently believes it is inside an
     /// explicit transaction (None = no session open).
     fn thread_in_transaction() -> Option<bool> {
-        DB_SESSION.with(|s| s.borrow().as_ref().map(|sess| sess.in_transaction))
+        DB_HELD.with(|s| s.borrow().as_ref().map(|held| held.session.in_transaction))
     }
 
     #[test]
@@ -1100,7 +1447,14 @@ mod recycle_tests {
             flags: Arc::clone(&flags),
         });
         let handle = super::tests::TEST_RT.get().expect("runtime").handle().clone();
-        (DbBridge { backend, handle, cache: Arc::new(TranslateCache::default()) }, flags)
+        (
+            DbBridge {
+                source: BackendSource::Single(backend),
+                handle,
+                cache: Arc::new(TranslateCache::default()),
+            },
+            flags,
+        )
     }
 
     fn run(bridge: &DbBridge, sql: &str) -> RunStatus {
@@ -1210,6 +1564,209 @@ mod recycle_tests {
             message: "UNIQUE constraint failed: connection refused".to_string(),
         };
         assert!(!is_connection_error(&classified));
+    }
+}
+
+// ── SQL screening (denylist) tests ──────────────────────────────────────
+//
+// Pure, no bridge/runtime needed: `screen_sql` is a stub-safe string scan.
+#[cfg(test)]
+mod screen_tests {
+    use super::*;
+
+    #[track_caller]
+    fn allowed(sql: &str) {
+        assert!(screen_sql(sql).is_ok(), "expected `{sql}` to be allowed");
+    }
+
+    #[track_caller]
+    fn rejected(sql: &str) {
+        assert!(screen_sql(sql).is_err(), "expected `{sql}` to be rejected");
+    }
+
+    #[test]
+    fn ordinary_statements_pass() {
+        allowed("SELECT * FROM wp_posts WHERE id = ?");
+        allowed("INSERT INTO t (a) VALUES (1)");
+        allowed("UPDATE t SET a = 1");
+        allowed("BEGIN");
+        allowed("COMMIT");
+        allowed("SET NAMES utf8mb4");
+        allowed("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+        // Ordinary tuning pragmas are fine.
+        allowed("PRAGMA foreign_keys = ON");
+        allowed("PRAGMA journal_mode = WAL");
+        // The forbidden keywords appearing only inside a string/identifier or
+        // a comment must NOT trip the screen.
+        allowed("SELECT 'ATTACH DATABASE' AS note");
+        allowed("SELECT * FROM t -- VACUUM everything\n WHERE a = 1");
+        allowed("INSERT INTO t (a) VALUES ('detach me')");
+    }
+
+    #[test]
+    fn cross_database_and_path_primitives_are_rejected() {
+        rejected("ATTACH DATABASE '/etc/passwd' AS steal");
+        rejected("attach database 'x.db' as y");
+        rejected("DETACH DATABASE y");
+        rejected("VACUUM");
+        rejected("VACUUM INTO '/tmp/copy.db'");
+        rejected("PRAGMA writable_schema = ON");
+        rejected("PRAGMA data_store_directory = '/tmp'");
+        rejected("PRAGMA temp_store_directory = '/tmp'");
+    }
+
+    #[test]
+    fn forbidden_hidden_in_a_second_statement_is_caught() {
+        // A leading benign statement must not smuggle a trailing ATTACH.
+        rejected("SELECT 1; ATTACH DATABASE 'x' AS y");
+        rejected("SELECT 1 /* ; */ ; VACUUM");
+    }
+
+    #[test]
+    fn truncated_quote_or_comment_is_rejected_conservatively() {
+        rejected("SELECT 'unterminated");
+        rejected("SELECT 1 /* unterminated");
+    }
+}
+
+// ── Per-site backend routing tests (local PerSite bridge) ───────────────
+//
+// Drive `run_on` with a locally-constructed `DbBridge` whose source is a
+// `PerSite` resolver over two real (file-backed) Turso databases, proving the
+// cross-tenant isolation the whole feature exists for — a query for site B
+// cannot see site A's table — plus the per-thread session swap and the
+// fail-closed behaviour when no site context is set. No PHP runtime needed.
+#[cfg(test)]
+mod per_site_tests {
+    use std::collections::HashMap;
+
+    use super::tests::TEST_RT;
+    use super::*;
+
+    /// Trivial resolver over a fixed `site -> backend` map.
+    struct MapResolver {
+        map: HashMap<String, SharedBackend>,
+    }
+
+    impl SiteBackendResolver for MapResolver {
+        fn resolve(&self, site_key: &str) -> Result<SharedBackend, String> {
+            self.map
+                .get(site_key)
+                .cloned()
+                .ok_or_else(|| format!("no backend for site `{site_key}`"))
+        }
+    }
+
+    fn open_turso(path: &std::path::Path) -> SharedBackend {
+        let rt = TEST_RT.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .expect("test runtime")
+        });
+        let backend = rt
+            .block_on(litewire::Turso::open(path.to_str().expect("utf-8 path")))
+            .expect("open turso db");
+        Arc::new(backend)
+    }
+
+    fn per_site_bridge(map: HashMap<String, SharedBackend>) -> DbBridge {
+        let handle = TEST_RT.get().expect("runtime").handle().clone();
+        DbBridge {
+            source: BackendSource::PerSite(Arc::new(MapResolver { map })),
+            handle,
+            cache: Arc::new(TranslateCache::default()),
+        }
+    }
+
+    fn run(bridge: &DbBridge, sql: &str) -> RunStatus {
+        run_on(Some(bridge), sql.as_bytes())
+    }
+
+    /// The issue-#274 / pentest-C1 exploit, at the bridge level: site A writes
+    /// a secret; site B must NOT be able to read it.
+    #[test]
+    fn cross_tenant_read_is_impossible() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = open_turso(&dir.path().join("site-a.db"));
+        let b = open_turso(&dir.path().join("site-b.db"));
+        let mut map = HashMap::new();
+        map.insert("site-a.test".to_string(), a);
+        map.insert("site-b.test".to_string(), b);
+        let bridge = per_site_bridge(map);
+
+        // Site A creates a table and inserts a secret.
+        set_current_site(Some("site-a.test"));
+        assert_eq!(run(&bridge, "CREATE TABLE tenant_probe (secret TEXT)"), RunStatus::Ok);
+        assert_eq!(
+            run(&bridge, "INSERT INTO tenant_probe (secret) VALUES ('secretA')"),
+            RunStatus::Ok
+        );
+        on_request_end();
+
+        // Site B, on the SAME thread, must not see site A's table at all — its
+        // database is a different file and starts empty.
+        set_current_site(Some("site-b.test"));
+        assert_eq!(
+            run(&bridge, "SELECT secret FROM tenant_probe"),
+            RunStatus::Err,
+            "site B must not see site A's table (cross-tenant isolation)"
+        );
+        with_error(|e| {
+            let (_, _, msg) = e.expect("error staged");
+            assert!(
+                msg.to_ascii_lowercase().contains("tenant_probe")
+                    || msg.to_ascii_lowercase().contains("no such table"),
+                "expected a missing-table error, got: {msg}"
+            );
+        });
+        on_request_end();
+
+        // Swapping back to site A on the same thread sees A's persisted data.
+        set_current_site(Some("site-a.test"));
+        assert_eq!(run(&bridge, "SELECT secret FROM tenant_probe"), RunStatus::Rows);
+        assert_eq!(row_count(), 1);
+        with_cell(0, 0, |c| assert_eq!(c, Some(&Value::Text("secretA".into()))));
+        finish();
+    }
+
+    /// Per-site mode with no site context set fails closed — it never falls
+    /// back to a shared/default database.
+    #[test]
+    fn missing_site_context_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = open_turso(&dir.path().join("only.db"));
+        let mut map = HashMap::new();
+        map.insert("site-a.test".to_string(), a);
+        let bridge = per_site_bridge(map);
+
+        set_current_site(None);
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Err);
+        with_error(|e| {
+            let (_, _, msg) = e.expect("error staged");
+            assert!(msg.contains("per-site database context"), "got: {msg}");
+        });
+        finish();
+    }
+
+    /// An unknown site key surfaces the resolver's error rather than any
+    /// data.
+    #[test]
+    fn unknown_site_key_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = open_turso(&dir.path().join("only.db"));
+        let mut map = HashMap::new();
+        map.insert("site-a.test".to_string(), a);
+        let bridge = per_site_bridge(map);
+
+        set_current_site(Some("stranger.test"));
+        assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Err);
+        with_error(|e| {
+            let (_, _, msg) = e.expect("error staged");
+            assert!(msg.contains("stranger.test"), "got: {msg}");
+        });
+        finish();
     }
 }
 

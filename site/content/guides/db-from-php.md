@@ -39,6 +39,7 @@ in every one of its modes:
 | Configuration | Bridge available |
 |---|---|
 | `[db.sqlite]`, single-node (Turso, in-process) | Yes |
+| `[db.sqlite]` + `[server] sites_dir` (per-site, multi-tenant) | Yes — each vhost gets its **own** database |
 | `[db.sqlite]` + `[cluster]`, clustered Turso CDC path | Yes |
 | `[db.mysql]` / `[db.postgres]` proxy only | **No** |
 | No `[db.*]` block at all | **No** |
@@ -172,6 +173,33 @@ call from that thread goes through that session.
 
 The consequence that matters: **transaction state belongs to the worker
 thread, not to the request.**
+
+### Per-site databases (multi-tenant mode)
+
+When `[server] sites_dir` is set and `[db.sqlite] dir` points at a directory,
+each virtual host gets its **own** database file at `<dir>/<host>.db`, opened
+lazily on that site's first query. `ephpm_db_query()` / `ephpm_db_execute()`
+automatically resolve to the database of the site that served the current
+request — a script on `site-a.example` and a script on `site-b.example` see
+two physically separate databases and cannot read or write each other's data.
+This is the tenant-isolation boundary (Turso has no per-schema ACL, so the
+file is the boundary).
+
+A worker thread that serves site A and is then dispatched a request for site B
+swaps its session to B's database — it never runs B's query on A's connection.
+Two extra guarantees apply on this path:
+
+- **`ATTACH` / `DETACH` / `VACUUM`, and path-bearing `PRAGMA`s, are rejected**
+  before reaching the engine (they would be a cross-database escape). This
+  screening is on regardless of mode.
+- Multi-tenant database access is **through these functions only**. The shared
+  `pdo_mysql`/`pdo_pgsql` wire port is not served in multi-site mode, because a
+  single wire listener cannot tell which tenant a connection belongs to and
+  would hand everyone one shared database. Use `ephpm_db_*`.
+
+Per-site isolation is single-node only; see the
+[`[db.sqlite]` reference](/reference/config/#dbsqlite) for `dir` and
+`max_open_dbs`.
 
 ### Transactions
 
