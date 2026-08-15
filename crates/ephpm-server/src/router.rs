@@ -4003,7 +4003,11 @@ mod tests {
     /// given site directories (each with an `index.php`), the default docroot
     /// gets one too, and `.localhost` is the domain suffix so one tenant is
     /// addressable under two hosts.
-    fn per_site_router(root: &Path, sites: &[&str], limits: ephpm_config::ResolvedLimits) -> Router {
+    fn per_site_router(
+        root: &Path,
+        sites: &[&str],
+        limits: ephpm_config::ResolvedLimits,
+    ) -> Router {
         let sites_dir = root.join("sites");
         fs::create_dir_all(&sites_dir).unwrap();
         for site in sites {
@@ -4053,7 +4057,8 @@ mod tests {
 
         // Success and 404, no limiter involved.
         let router = preview_router(dir.path(), None);
-        for (uri, expect_status) in [("/a.txt", StatusCode::OK), ("/nope.txt", StatusCode::NOT_FOUND)]
+        for (uri, expect_status) in
+            [("/a.txt", StatusCode::OK), ("/nope.txt", StatusCode::NOT_FOUND)]
         {
             let req =
                 Request::builder().method("GET").uri(uri).body(Empty::<Bytes>::new()).unwrap();
@@ -4133,8 +4138,10 @@ mod tests {
 
         // Third hit on the SAME tenant — via either host form — is over
         // budget: both forms drained the one canonical bucket.
-        let resp =
-            router.handle(get_with_host("/index.php", "blog.localhost"), addr, false).await.unwrap();
+        let resp = router
+            .handle(get_with_host("/index.php", "blog.localhost"), addr, false)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
             resp.headers().get(hyper::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
@@ -4143,8 +4150,10 @@ mod tests {
         );
 
         // A different tenant still has its own full budget.
-        let resp =
-            router.handle(get_with_host("/index.php", "other.localhost"), addr, false).await.unwrap();
+        let resp = router
+            .handle(get_with_host("/index.php", "other.localhost"), addr, false)
+            .await
+            .unwrap();
         assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "sibling site must be unaffected");
     }
 
@@ -4192,18 +4201,24 @@ mod tests {
 
         // Many static hits — none consume the (burst = 1) PHP budget.
         for _ in 0..5 {
-            let resp =
-                router.handle(get_with_host("/style.css", "blog.localhost"), addr, false).await.unwrap();
+            let resp = router
+                .handle(get_with_host("/style.css", "blog.localhost"), addr, false)
+                .await
+                .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
         }
 
         // The single PHP token is still available.
-        let resp =
-            router.handle(get_with_host("/index.php", "blog.localhost"), addr, false).await.unwrap();
+        let resp = router
+            .handle(get_with_host("/index.php", "blog.localhost"), addr, false)
+            .await
+            .unwrap();
         assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         // ... and now it is spent.
-        let resp =
-            router.handle(get_with_host("/index.php", "blog.localhost"), addr, false).await.unwrap();
+        let resp = router
+            .handle(get_with_host("/index.php", "blog.localhost"), addr, false)
+            .await
+            .unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 

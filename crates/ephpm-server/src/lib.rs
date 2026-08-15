@@ -1035,11 +1035,8 @@ fn log_preview_preset(server: &ephpm_config::ServerConfig, limits: &ephpm_config
         return;
     }
     let applied = server.preview_preset_applied();
-    let preset_supplied = applied
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let preset_supplied =
+        applied.iter().map(|(key, value)| format!("{key}={value}")).collect::<Vec<_>>().join(", ");
     tracing::info!(
         max_connections = limits.max_connections,
         per_ip_max_connections = limits.per_ip_max_connections,
@@ -1051,7 +1048,11 @@ fn log_preview_preset(server: &ephpm_config::ServerConfig, limits: &ephpm_config
          preset supplied [{}]; every other [server.limits] value above was \
          set explicitly by the operator (explicit values always win, \
          including explicit 0 = that limit off)",
-        if preset_supplied.is_empty() { "nothing — all limits operator-set" } else { &preset_supplied },
+        if preset_supplied.is_empty() {
+            "nothing — all limits operator-set"
+        } else {
+            &preset_supplied
+        },
     );
 }
 

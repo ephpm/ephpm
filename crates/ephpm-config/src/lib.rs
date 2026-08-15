@@ -719,9 +719,7 @@ impl ServerConfig {
         let l = &self.limits;
         ResolvedLimits {
             max_connections: l.max_connections.unwrap_or(base.max_connections),
-            per_ip_max_connections: l
-                .per_ip_max_connections
-                .unwrap_or(base.per_ip_max_connections),
+            per_ip_max_connections: l.per_ip_max_connections.unwrap_or(base.per_ip_max_connections),
             per_ip_rate: l.per_ip_rate.unwrap_or(base.per_ip_rate),
             per_ip_burst: l.per_ip_burst.unwrap_or(base.per_ip_burst),
             per_site_rate: l.per_site_rate.unwrap_or(base.per_site_rate),
