@@ -257,6 +257,16 @@ struct HeldSession {
     /// The site this session's connection belongs to ([`SINGLE_SITE_KEY`] in
     /// single-backend mode).
     site: Box<str>,
+    /// The litewire session driving this thread's queries for `site`.
+    ///
+    /// **Declared before `_backend` on purpose.** Struct fields drop in
+    /// declaration order, so this releases the site's *connection* before the
+    /// pin below releases the site's *database*. The registry treats
+    /// "`strong_count == 1`" as "idle, safe to close" (see ephpm-server's
+    /// `site_backends`, invariant 2); dropping the pin first would open a
+    /// window — however narrow — in which the registry could close and re-open
+    /// the file while this connection was still alive.
+    session: Session,
     /// Clone of the registry backend `Arc`, held so the site's database stays
     /// open for the session's lifetime and the registry's refcount-aware LRU
     /// never evicts a site with a live session. Never read — its `Drop` (when
@@ -264,8 +274,6 @@ struct HeldSession {
     /// as it releases the site's pin.
     #[allow(dead_code)]
     _backend: SharedBackend,
-    /// The litewire session driving this thread's queries for `site`.
-    session: Session,
 }
 
 /// The MySQL error triple staged for the C side after a failed `run`.
@@ -416,23 +424,40 @@ pub fn run_sql_bytes(sql: &[u8]) -> RunStatus {
     run_on(DB_BRIDGE.get(), sql)
 }
 
-/// The site key this request's queries belong to, from a bridge's
-/// [`BackendSource`]. In per-site mode this reads the thread-local key set by
-/// [`set_current_site`] and **fails closed** if none is present — it never
-/// substitutes a shared/default database. Cheap: no backend is opened here, so
-/// same-site consecutive queries never touch the registry.
-fn current_site_key(source: &BackendSource) -> Result<Box<str>, BridgeError> {
+/// The site this thread's session must belong to, compared against the site it
+/// *does* belong to (`held_site`, `None` when the thread has no session yet).
+///
+/// Returns `None` when the held session already matches — the common case, on
+/// which nothing is allocated and the registry is never touched. Returns
+/// `Some(key)` (a fresh owned copy, needed to re-key the session) only when a
+/// swap is required.
+///
+/// In per-site mode the key comes from the thread-local set by
+/// [`set_current_site`] and this **fails closed** if none is present — it never
+/// substitutes a shared/default database.
+fn site_swap_target(
+    source: &BackendSource,
+    held_site: Option<&str>,
+) -> Result<Option<Box<str>>, BridgeError> {
     match source {
-        BackendSource::Single(_) => Ok(Box::from(SINGLE_SITE_KEY)),
-        BackendSource::PerSite(_) => {
-            DB_CURRENT_SITE.with(|s| s.borrow().clone()).ok_or_else(|| BridgeError {
-                code: ER_UNKNOWN_ERROR,
-                sqlstate: *b"HY000",
-                message: "no per-site database context for this request — multi-site database \
-                          isolation could not determine the tenant"
-                    .to_string(),
-            })
-        }
+        BackendSource::Single(_) => Ok(if held_site == Some(SINGLE_SITE_KEY) {
+            None
+        } else {
+            Some(Box::from(SINGLE_SITE_KEY))
+        }),
+        BackendSource::PerSite(_) => DB_CURRENT_SITE.with(|s| {
+            let current = s.borrow();
+            let Some(current) = current.as_deref() else {
+                return Err(BridgeError {
+                    code: ER_UNKNOWN_ERROR,
+                    sqlstate: *b"HY000",
+                    message: "no per-site database context for this request — multi-site \
+                              database isolation could not determine the tenant"
+                        .to_string(),
+                });
+            };
+            Ok(if held_site == Some(current) { None } else { Some(Box::from(current)) })
+        }),
     }
 }
 
@@ -481,11 +506,6 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
         });
     }
 
-    let site = match current_site_key(&bridge.source) {
-        Ok(site) => site,
-        Err(e) => return stage_error(e),
-    };
-
     let outcome = DB_HELD.with(|slot| {
         let mut slot = slot.borrow_mut();
 
@@ -493,9 +513,10 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
         // a thread that served site A must never run site B's query on A's
         // connection. Within one request the site is fixed, so this only ever
         // fires between requests. The registry lookup happens only here — a
-        // same-site consecutive query reuses the held session untouched.
-        let needs_new = slot.as_ref().is_none_or(|held| held.site.as_ref() != site.as_ref());
-        if needs_new {
+        // same-site consecutive query reuses the held session untouched, and
+        // does not even copy the site key.
+        let swap_to = site_swap_target(&bridge.source, slot.as_ref().map(|h| h.site.as_ref()))?;
+        if let Some(site) = swap_to {
             let backend = backend_for(&bridge.source, &site)?;
             if let Some(old) = slot.as_mut() {
                 // Defensive: the previous site's session should not be
@@ -519,13 +540,13 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
             match bridge.handle.block_on(backend.connect()) {
                 Ok(conn) => {
                     *slot = Some(HeldSession {
-                        site: site.clone(),
-                        _backend: backend,
+                        site,
                         session: Session::with_cache(
                             conn,
                             Dialect::MySQL,
                             Arc::clone(&bridge.cache),
                         ),
+                        _backend: backend,
                     });
                 }
                 Err(e) => {
