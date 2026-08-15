@@ -37,6 +37,9 @@ tempfile.workspace = true
 # db_bridge recycle tests: mock Backend/BackendConn impls (litewire's
 # backend traits are async_trait-based).
 async-trait.workspace = true
+# crash_guard tests: install a sigaltstack + SIGSEGV handler and drive a real
+# stack overflow to prove the containment mechanism without libphp.
+libc = "0.2"
 
 [lints]
 workspace = true

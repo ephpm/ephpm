@@ -295,6 +295,13 @@ fn main() -> ExitCode {
     // for the case where the handler itself misbehaves.
     fatal_signal::install();
 
+    // Register the stack-overflow crash-containment hook so the fatal-signal
+    // handler recovers (rather than dying) when a guarded PHP request overflows
+    // the C stack. Harmless in stub mode and until a request arms a guard: the
+    // hook only recovers when the faulting thread is inside `run_guarded` and
+    // the fault address is at this thread's stack guard page.
+    fatal_signal::set_recover_hook(ephpm_php::crash_guard::recover_hook());
+
     match run() {
         Ok(code) => code,
         Err(e) => {
