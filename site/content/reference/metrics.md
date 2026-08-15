@@ -33,6 +33,7 @@ Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and ex
 | `ephpm_http_compression_ratio` | histogram | — | Compressed-to-original ratio; covers both Brotli and gzip responses. |
 | `ephpm_http_timeouts_total` | counter | `stage` | Requests killed by the request timeout. Two values: `request` (the fpm-mode request deadline) and `worker` (worker mode — the worker never responded within the request timeout; the request gets a 504 and the worker is marked hung, which also increments `ephpm_worker_recycles_total{reason="hung"}`). |
 | `ephpm_rate_limited_total` | counter | — | Rejections from `[server.limits]`. Incremented only for per-IP rate limiting. |
+| `ephpm_site_rate_limited_total` | counter | — | 429s from the per-site PHP rate limit (`[server.limits] per_site_rate`; on by default under `[server] preview`). |
 
 ## HTTP/3 (QUIC)
 

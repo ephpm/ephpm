@@ -200,6 +200,29 @@ pub struct ServerConfig {
     #[serde(default = "default_fallback")]
     pub fallback: Vec<String>,
 
+    /// Preview-host preset (`[server] preview = true`).
+    ///
+    /// One switch that makes an instance sane to run as a **not-production**
+    /// PR-preview host. When `true`:
+    ///
+    /// - Every `[server.limits]` knob that the operator did NOT set explicitly
+    ///   resolves to a preview default instead of "off":
+    ///   `max_connections = 256`, `per_ip_max_connections = 32`,
+    ///   `per_ip_rate = 10.0`, `per_ip_burst = 50`, `per_site_rate = 5.0`,
+    ///   `per_site_burst = 20`. An explicitly set value always wins — including
+    ///   an explicit `0`/`0.0`, which disables that limit even under preview.
+    ///   See [`ServerConfig::effective_limits`].
+    /// - Every HTTP response carries `X-Ephpm-Preview: 1`, so a preview
+    ///   instance can never be mistaken for production by tooling or humans.
+    ///
+    /// Startup logs exactly which limits the preset supplied and which were
+    /// operator-set (never silent). Env override: `EPHPM_SERVER__PREVIEW=true`.
+    ///
+    /// Default: `false` (no preset, no marker header; `[server.limits]`
+    /// resolves to its regular all-off defaults).
+    #[serde(default)]
+    pub preview: bool,
+
     /// Request limits.
     #[serde(default)]
     pub request: RequestConfig,
@@ -680,6 +703,68 @@ impl ServerConfig {
             None => self.sites_dir.is_some(),
         }
     }
+
+    /// Resolve `[server.limits]` to the values enforcement runs on.
+    ///
+    /// Each field the operator set explicitly is taken verbatim — including
+    /// explicit `0`/`0.0`, which disables that limit. Each unset field takes
+    /// the preview preset value when `[server] preview = true`
+    /// ([`ResolvedLimits::preview_preset`]), and the regular all-off default
+    /// ([`ResolvedLimits::default`]) otherwise. Section-absent and
+    /// section-present-but-empty behave identically (all fields unset).
+    #[must_use]
+    pub fn effective_limits(&self) -> ResolvedLimits {
+        let base =
+            if self.preview { ResolvedLimits::preview_preset() } else { ResolvedLimits::default() };
+        let l = &self.limits;
+        ResolvedLimits {
+            max_connections: l.max_connections.unwrap_or(base.max_connections),
+            per_ip_max_connections: l
+                .per_ip_max_connections
+                .unwrap_or(base.per_ip_max_connections),
+            per_ip_rate: l.per_ip_rate.unwrap_or(base.per_ip_rate),
+            per_ip_burst: l.per_ip_burst.unwrap_or(base.per_ip_burst),
+            per_site_rate: l.per_site_rate.unwrap_or(base.per_site_rate),
+            per_site_burst: l.per_site_burst.unwrap_or(base.per_site_burst),
+        }
+    }
+
+    /// Which `[server.limits]` fields the preview preset supplied, as
+    /// `(key, resolved_value)` pairs in declaration order — i.e. the fields
+    /// the operator left unset while `[server] preview = true`.
+    ///
+    /// Empty when `preview` is off, and empty when the operator explicitly
+    /// set every limit. Startup logs this so the preset is never silent
+    /// (the no-silent-knob rule); the complement — explicitly set fields —
+    /// is exactly what the log reports as operator-chosen.
+    #[must_use]
+    pub fn preview_preset_applied(&self) -> Vec<(&'static str, String)> {
+        if !self.preview {
+            return Vec::new();
+        }
+        let preset = ResolvedLimits::preview_preset();
+        let l = &self.limits;
+        let mut applied = Vec::new();
+        if l.max_connections.is_none() {
+            applied.push(("max_connections", preset.max_connections.to_string()));
+        }
+        if l.per_ip_max_connections.is_none() {
+            applied.push(("per_ip_max_connections", preset.per_ip_max_connections.to_string()));
+        }
+        if l.per_ip_rate.is_none() {
+            applied.push(("per_ip_rate", preset.per_ip_rate.to_string()));
+        }
+        if l.per_ip_burst.is_none() {
+            applied.push(("per_ip_burst", preset.per_ip_burst.to_string()));
+        }
+        if l.per_site_rate.is_none() {
+            applied.push(("per_site_rate", preset.per_site_rate.to_string()));
+        }
+        if l.per_site_burst.is_none() {
+            applied.push(("per_site_burst", preset.per_site_burst.to_string()));
+        }
+        applied
+    }
 }
 
 /// Logging configuration (`[server.logging]`).
@@ -780,49 +865,122 @@ impl DiagnosticsConfig {
 }
 
 /// Rate limiting and connection limiting (`[server.limits]`).
-#[derive(Clone, Debug, Deserialize)]
+///
+/// Every field is optional so that "the operator set this" is distinguishable
+/// from "left at the default" — the `[server] preview` preset only fills in
+/// fields the operator did NOT set (see [`ServerConfig::effective_limits`]).
+/// Enforcement reads the **resolved** values ([`ResolvedLimits`]), never these
+/// raw options; the effective defaults documented per field below are what an
+/// absent field resolves to without the preview preset.
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct LimitsConfig {
     /// Maximum total concurrent connections. New connections are rejected
-    /// with 503 when at capacity. `0` means unlimited.
+    /// with a raw 503 at accept time (before TLS) when at capacity.
+    /// `0` means unlimited.
     ///
-    /// Default: `0` (unlimited).
+    /// Default: `0` (unlimited). Preview preset: `256`.
     #[serde(default)]
-    pub max_connections: usize,
+    pub max_connections: Option<usize>,
 
     /// Maximum concurrent connections per client IP. `0` means unlimited.
     ///
-    /// Default: `0` (unlimited).
+    /// Default: `0` (unlimited). Preview preset: `32`.
     #[serde(default)]
-    pub per_ip_max_connections: usize,
+    pub per_ip_max_connections: Option<usize>,
 
     /// Maximum requests per second per client IP (token bucket rate).
-    /// `0` means unlimited.
+    /// Over-limit requests get 429. `0` means unlimited.
     ///
-    /// Default: `0.0` (unlimited).
+    /// Default: `0.0` (unlimited). Preview preset: `10.0`.
     #[serde(default)]
-    pub per_ip_rate: f64,
+    pub per_ip_rate: Option<f64>,
 
     /// Burst size for per-IP rate limiting. Allows this many requests
-    /// to be made instantly before the rate limit kicks in.
+    /// to be made instantly before the rate limit kicks in. Only meaningful
+    /// when `per_ip_rate` resolves to a non-zero value.
     ///
-    /// Default: `50`.
-    #[serde(default = "default_per_ip_burst")]
-    pub per_ip_burst: u32,
+    /// Default: `50` (also the preview preset value).
+    #[serde(default)]
+    pub per_ip_burst: Option<u32>,
+
+    /// Maximum PHP executions per second **per virtual host** (token bucket
+    /// rate), keyed by the canonical site key `Router::resolve_site` derives
+    /// (never re-derived from the `Host` header). Caps each tenant so one
+    /// preview going viral cannot starve the whole node. Over-limit requests
+    /// get 429 with a `Retry-After` header, before PHP runs.
+    ///
+    /// Scope: PHP dispatch only — static files and PHP-`ETag`-cache 304s are
+    /// not counted (they are not what eats the box). Requests whose host
+    /// matches no site (key = `None`) are not per-site-capped; in multi-site
+    /// mode they get no per-site database or credentials anyway. In
+    /// single-site mode every request has key = `None`, so this knob only
+    /// acts when `[server] sites_dir` is set. `0` means unlimited.
+    ///
+    /// Default: `0.0` (unlimited). Preview preset: `5.0`.
+    #[serde(default)]
+    pub per_site_rate: Option<f64>,
+
+    /// Burst size for the per-site rate limit: this many PHP executions may
+    /// happen instantly per site before `per_site_rate` kicks in. Only
+    /// meaningful when `per_site_rate` resolves to a non-zero value.
+    ///
+    /// Default: `20` (also the preview preset value).
+    #[serde(default)]
+    pub per_site_burst: Option<u32>,
 }
 
-impl Default for LimitsConfig {
+/// The `[server.limits]` values enforcement actually runs on, after resolving
+/// each optional field against the base defaults or — under
+/// `[server] preview = true` — the preview preset. Built by
+/// [`ServerConfig::effective_limits`]; an explicitly configured value always
+/// wins over either default set.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedLimits {
+    /// See [`LimitsConfig::max_connections`]. `0` = unlimited.
+    pub max_connections: usize,
+    /// See [`LimitsConfig::per_ip_max_connections`]. `0` = unlimited.
+    pub per_ip_max_connections: usize,
+    /// See [`LimitsConfig::per_ip_rate`]. `0.0` = unlimited.
+    pub per_ip_rate: f64,
+    /// See [`LimitsConfig::per_ip_burst`].
+    pub per_ip_burst: u32,
+    /// See [`LimitsConfig::per_site_rate`]. `0.0` = unlimited.
+    pub per_site_rate: f64,
+    /// See [`LimitsConfig::per_site_burst`].
+    pub per_site_burst: u32,
+}
+
+impl Default for ResolvedLimits {
+    /// The no-preset resolution: everything off, standard burst sizes.
     fn default() -> Self {
         Self {
             max_connections: 0,
             per_ip_max_connections: 0,
             per_ip_rate: 0.0,
-            per_ip_burst: default_per_ip_burst(),
+            per_ip_burst: 50,
+            per_site_rate: 0.0,
+            per_site_burst: 20,
         }
     }
 }
 
-fn default_per_ip_burst() -> u32 {
-    50
+impl ResolvedLimits {
+    /// The preview preset: what an unset field resolves to under
+    /// `[server] preview = true`. Sized for a small PR-preview box — a
+    /// 1-vCPU node renders roughly 10 real-WordPress pages/s, so the
+    /// per-site cap (5/s, burst 20) keeps any single tenant at about half
+    /// the node while still absorbing a page-load burst.
+    #[must_use]
+    pub fn preview_preset() -> Self {
+        Self {
+            max_connections: 256,
+            per_ip_max_connections: 32,
+            per_ip_rate: 10.0,
+            per_ip_burst: 50,
+            per_site_rate: 5.0,
+            per_site_burst: 20,
+        }
+    }
 }
 
 /// Open file cache configuration (`[server.file_cache]`).
@@ -2442,6 +2600,7 @@ impl Default for ServerConfig {
             sites_domain_suffix: None,
             index_files: default_index_files(),
             fallback: default_fallback(),
+            preview: false,
             request: RequestConfig::default(),
             timeouts: TimeoutsConfig::default(),
             response: ResponseConfig::default(),
@@ -5214,6 +5373,179 @@ multi_tenant_hardening = false
         .unwrap();
         let config3 = Config::load(&file3).unwrap();
         assert!(!config3.server.effective_multi_tenant_hardening());
+    }
+
+    // ── [server] preview preset + [server.limits] resolution ───────────
+
+    // Exact float equality is intended in these tests: the values either come
+    // verbatim from TOML/env parsing or from `unwrap_or` of a literal — no
+    // arithmetic happens, so bit-exact comparison is the correct assertion.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn test_preview_defaults_off_and_limits_resolve_all_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(!config.server.preview, "preview must default to off");
+        assert_eq!(
+            config.server.effective_limits(),
+            ResolvedLimits::default(),
+            "without preview, absent [server.limits] must resolve to all-off \
+             (max_connections=0, per_ip*=0, per_site_rate=0, bursts 50/20)"
+        );
+        assert!(config.server.preview_preset_applied().is_empty());
+
+        // The worst-case default check the knob checklist requires: the
+        // no-preset resolution must not impose any limit.
+        let limits = config.server.effective_limits();
+        assert_eq!(limits.max_connections, 0);
+        assert_eq!(limits.per_ip_max_connections, 0);
+        assert_eq!(limits.per_ip_rate, 0.0);
+        assert_eq!(limits.per_ip_burst, 50);
+        assert_eq!(limits.per_site_rate, 0.0);
+        assert_eq!(limits.per_site_burst, 20);
+    }
+
+    /// The serde section-default footgun: `[server.limits]` present-but-empty
+    /// must behave exactly like the section being absent.
+    #[test]
+    fn test_limits_section_present_but_empty_equals_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server.limits]\n").unwrap();
+        let present = Config::load(&file).unwrap();
+
+        let file2 = dir.path().join("ephpm2.toml");
+        std::fs::write(&file2, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+        let absent = Config::load(&file2).unwrap();
+
+        assert_eq!(present.server.effective_limits(), absent.server.effective_limits());
+
+        // And the same equivalence under the preview preset.
+        let file3 = dir.path().join("ephpm3.toml");
+        std::fs::write(&file3, "[server]\npreview = true\n\n[server.limits]\n").unwrap();
+        let preview_present = Config::load(&file3).unwrap();
+        let file4 = dir.path().join("ephpm4.toml");
+        std::fs::write(&file4, "[server]\npreview = true\n").unwrap();
+        let preview_absent = Config::load(&file4).unwrap();
+        assert_eq!(
+            preview_present.server.effective_limits(),
+            preview_absent.server.effective_limits()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn test_preview_preset_fills_unset_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\npreview = true\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.preview);
+        assert_eq!(
+            config.server.effective_limits(),
+            ResolvedLimits::preview_preset(),
+            "preview with no explicit limits must resolve to the full preset"
+        );
+
+        // The startup log's source of truth: every field was preset-supplied.
+        let applied = config.server.preview_preset_applied();
+        assert_eq!(
+            applied.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+            vec![
+                "max_connections",
+                "per_ip_max_connections",
+                "per_ip_rate",
+                "per_ip_burst",
+                "per_site_rate",
+                "per_site_burst"
+            ],
+        );
+        assert_eq!(ResolvedLimits::preview_preset().max_connections, 256);
+        assert_eq!(ResolvedLimits::preview_preset().per_site_rate, 5.0);
+        assert_eq!(ResolvedLimits::preview_preset().per_site_burst, 20);
+    }
+
+    /// Explicit operator values always beat the preview preset — including
+    /// explicit `0`, which disables that limit even under preview.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn test_preview_explicit_limits_win_over_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[server]\npreview = true\n\n[server.limits]\n\
+             max_connections = 0\nper_site_rate = 2.5\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let limits = config.server.effective_limits();
+        assert_eq!(limits.max_connections, 0, "explicit 0 must disable, even under preview");
+        assert_eq!(limits.per_site_rate, 2.5, "explicit value must win over the preset 5.0");
+        // Unset fields still take the preset.
+        assert_eq!(limits.per_ip_max_connections, 32);
+        assert_eq!(limits.per_ip_rate, 10.0);
+        assert_eq!(limits.per_site_burst, 20);
+
+        // The applied list reports only the preset-supplied fields.
+        let applied = config.server.preview_preset_applied();
+        let keys: Vec<_> = applied.iter().map(|(k, _)| *k).collect();
+        assert!(!keys.contains(&"max_connections"));
+        assert!(!keys.contains(&"per_site_rate"));
+        assert!(keys.contains(&"per_ip_rate"));
+    }
+
+    /// Without preview, explicitly set limits are enforced verbatim and the
+    /// new per-site knobs parse.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn test_per_site_limits_parse_without_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server.limits]\nper_site_rate = 7.0\nper_site_burst = 3\n")
+            .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let limits = config.server.effective_limits();
+        assert_eq!(limits.per_site_rate, 7.0);
+        assert_eq!(limits.per_site_burst, 3);
+        // Setting the per-site pair alone must not disturb sibling defaults.
+        assert_eq!(limits.max_connections, 0);
+        assert_eq!(limits.per_ip_burst, 50);
+        assert!(config.server.preview_preset_applied().is_empty(), "no preview → nothing applied");
+    }
+
+    #[test]
+    fn test_env_var_overrides_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+
+        let _env = EnvVars::set("EPHPM_SERVER__PREVIEW", "true");
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.preview, "EPHPM_SERVER__PREVIEW=true must enable preview mode");
+        assert_eq!(config.server.effective_limits(), ResolvedLimits::preview_preset());
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn test_env_var_overrides_per_site_rate() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\npreview = true\n").unwrap();
+
+        let _env = EnvVars::set("EPHPM_SERVER__LIMITS__PER_SITE_RATE", "1.5");
+        let config = Config::load(&file).unwrap();
+        assert_eq!(
+            config.server.effective_limits().per_site_rate,
+            1.5,
+            "env override is an explicit value and must beat the preview preset"
+        );
     }
 
     // ── [kv] eviction_policy validation ────────────────────────────────

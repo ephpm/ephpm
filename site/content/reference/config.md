@@ -19,6 +19,7 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 | `run_as_group` | string | (none) | **Unix only.** Numeric gid or group name to drop to alongside `run_as_user`. Defaults to the user's primary group (named user) or the same numeric id as the uid. Only consulted when `run_as_user` is set. |
 | `index_files` | array of strings | `["index.php", "index.html"]` | Index file names to try when a directory is requested. |
 | `fallback` | array of strings | `["$uri", "$uri/", "/index.php?$query_string"]` | URL fallback chain. Variables: `$uri`, `$query_string`. Last entry is the fallback (prefix `=` for status code, e.g. `=404`). |
+| `preview` | bool | `false` | Preview-host preset for **not-production** PR-preview instances. Adds `X-Ephpm-Preview: 1` to every response, and every `[server.limits]` knob you did not set explicitly resolves to a preview default instead of "off": `max_connections = 256`, `per_ip_max_connections = 32`, `per_ip_rate = 10.0`, `per_ip_burst = 50`, `per_site_rate = 5.0`, `per_site_burst = 20`. Explicit values always win — including explicit `0`, which disables that limit even under preview. Startup logs exactly which limits the preset supplied. Env override: `EPHPM_SERVER__PREVIEW=true`. |
 
 ### `[server.request]`
 
@@ -121,12 +122,19 @@ ini_overrides = [
 
 ### `[server.limits]`
 
+Defaults below are the resolved values when the key is absent. Under
+`[server] preview = true`, absent keys resolve to the preview preset instead
+(shown per key); an explicitly set value always wins over either default,
+including explicit `0` = that limit off.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `max_connections` | usize | `0` | Total concurrent connections. `0` = unlimited. New connections beyond limit get 503. |
-| `per_ip_max_connections` | usize | `0` | Per-IP concurrent connections. `0` = unlimited. |
-| `per_ip_rate` | f64 | `0.0` | Per-IP requests/second (token bucket). `0` = unlimited. |
-| `per_ip_burst` | u32 | `50` | Burst allowance for per-IP rate limiting. |
+| `max_connections` | usize | `0` (preview preset: `256`) | Total concurrent connections. `0` = unlimited. Connections beyond the limit get a raw 503 at accept time and are closed, not served. |
+| `per_ip_max_connections` | usize | `0` (preview preset: `32`) | Per-IP concurrent connections. `0` = unlimited. |
+| `per_ip_rate` | f64 | `0.0` (preview preset: `10.0`) | Per-IP requests/second (token bucket). Over-limit requests get 429. `0` = unlimited. |
+| `per_ip_burst` | u32 | `50` (preview preset: `50`) | Burst allowance for per-IP rate limiting. |
+| `per_site_rate` | f64 | `0.0` (preview preset: `5.0`) | Per-virtual-host **PHP executions**/second (token bucket), keyed by the canonical site key from vhost resolution — so one tenant addressed as `blog.localhost` and `blog` drains one bucket. Over-limit requests get 429 with `Retry-After`, before PHP runs. Static files and PHP-ETag-cache 304s are not counted. Only acts when `[server] sites_dir` is set (requests that match no site have no site key and are not per-site-capped). `0` = unlimited. |
+| `per_site_burst` | u32 | `20` (preview preset: `20`) | Burst allowance for the per-site rate limit: PHP executions a site may make instantly before `per_site_rate` applies. |
 
 ### `[server.file_cache]`
 

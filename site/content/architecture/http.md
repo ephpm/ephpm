@@ -403,6 +403,9 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.limits.per_ip_max_connections` | int | `0` | Max concurrent connections per client IP |
 | `server.limits.per_ip_rate` | float | `0.0` | Max requests/second per client IP (token bucket) |
 | `server.limits.per_ip_burst` | int | `50` | Burst size for per-IP rate limiting |
+| `server.limits.per_site_rate` | float | `0.0` | Max PHP executions/second per virtual host (token bucket keyed by the canonical site key; over-limit gets 429 + `Retry-After`) |
+| `server.limits.per_site_burst` | int | `20` | Burst size for per-site rate limiting |
+| `server.preview` | bool | `false` | Preview-host preset: `X-Ephpm-Preview: 1` on every response, plus preview defaults for every `[server.limits]` knob left unset (explicit values win) |
 
 ### CLI Flags
 

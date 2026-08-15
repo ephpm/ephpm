@@ -326,6 +326,14 @@ pub struct Router {
     metrics_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     metrics_path: String,
     limiter: Option<Arc<crate::rate_limit::Limiter>>,
+    /// Preview-host mode (`[server] preview = true`). When set, every
+    /// response — success, error, timeout, rate-limited — carries
+    /// `X-Ephpm-Preview: 1` so a preview instance can never be mistaken for
+    /// production. The limit side of the preset is resolved into the
+    /// [`Router::limiter`] config before the router is built
+    /// (`ServerConfig::effective_limits`); this flag only drives the marker
+    /// header.
+    preview: bool,
     file_cache: Option<Arc<crate::file_cache::FileCache>>,
     /// KV secret for deriving per-site RESP passwords. When set alongside
     /// `multi_tenant_kv`, `EPHPM_REDIS_*` env vars are injected into PHP.
@@ -798,6 +806,7 @@ impl Router {
             metrics_handle,
             metrics_path: config.server.metrics.path.clone(),
             limiter,
+            preview: config.server.preview,
             file_cache,
             kv_secret: config.kv.secret.clone(),
             kv_listen: config.kv.redis_compat.listen.clone(),
@@ -1046,6 +1055,22 @@ impl Router {
         }
         if let Some(value) = &self.alt_svc {
             response.headers_mut().insert(hyper::header::ALT_SVC, value.clone());
+        }
+    }
+
+    /// Add the `X-Ephpm-Preview: 1` marker when `[server] preview = true`.
+    ///
+    /// Applied to EVERY response the router produces — success, 4xx/5xx,
+    /// timeout 504, and both rate-limit 429s — so no path out of a preview
+    /// instance can be mistaken for production. (The accept-time raw 503
+    /// shed in `lib.rs` is the one exception: it is written before HTTP
+    /// parsing exists.)
+    fn apply_preview_marker(&self, response: &mut Response<ServerBody>) {
+        if self.preview {
+            response.headers_mut().insert(
+                hyper::header::HeaderName::from_static("x-ephpm-preview"),
+                hyper::header::HeaderValue::from_static("1"),
+            );
         }
     }
 
@@ -1443,7 +1468,11 @@ impl Router {
             let (effective_addr, _) = self.resolve_proxy_info(&req, remote_addr, is_tls);
             if !limiter.check_rate(effective_addr.ip()) {
                 counter!("ephpm_rate_limited_total").increment(1);
-                return Ok(error_response(StatusCode::TOO_MANY_REQUESTS, "429 Too Many Requests"));
+                let mut resp =
+                    error_response(StatusCode::TOO_MANY_REQUESTS, "429 Too Many Requests");
+                // This early return bypasses the marker application below.
+                self.apply_preview_marker(&mut resp);
+                return Ok(resp);
             }
         }
 
@@ -1515,6 +1544,7 @@ impl Router {
         let mut result = result;
         if let Ok(ref mut resp) = result {
             self.apply_alt_svc(resp, is_tls);
+            self.apply_preview_marker(resp);
 
             span.record("http.response.status_code", resp.status().as_u16());
 
@@ -1935,6 +1965,30 @@ impl Router {
     where
         B: RequestBody,
     {
+        // Per-site PHP rate cap (`[server.limits] per_site_rate`, enabled by
+        // default under `[server] preview`). Enforced HERE — the single point
+        // every PHP dispatch converges on (fpm spawn_blocking, fpm pool, and
+        // worker mode via `handle_php_worker`) — so it runs before any PHP
+        // work but after the cheap non-PHP exits (static files, PHP-ETag-cache
+        // 304s), which are deliberately not counted: PHP CPU is what a viral
+        // preview eats, not sendfile.
+        //
+        // Keyed by the canonical site key `resolve_site` returned, NEVER
+        // re-derived from the Host header (issues #290/#291). No key
+        // (unmatched host, or single-site mode) = no per-site cap.
+        if let (Some(limiter), Some(key)) = (self.limiter.as_deref(), site_key.as_deref()) {
+            if !limiter.check_site_rate(key) {
+                counter!("ephpm_site_rate_limited_total").increment(1);
+                let retry_after = limiter.site_retry_after_secs();
+                let mut resp =
+                    error_response(StatusCode::TOO_MANY_REQUESTS, "429 Too Many Requests");
+                if let Ok(value) = hyper::header::HeaderValue::from_str(&retry_after.to_string()) {
+                    resp.headers_mut().insert(hyper::header::RETRY_AFTER, value);
+                }
+                return resp;
+            }
+        }
+
         let method = req.method().to_string();
         // `method` is the client's raw verb and belongs in PHP's `$_SERVER`,
         // never in a Prometheus label — that is exactly what
@@ -3923,6 +3977,234 @@ mod tests {
         let resp = router.handle(req, addr, true).await.unwrap();
 
         assert!(resp.headers().get(hyper::header::ALT_SVC).is_none());
+    }
+
+    // ── Preview marker + per-site rate cap ───────────────────────────
+
+    fn preview_router(dir: &Path, limiter: Option<Arc<crate::rate_limit::Limiter>>) -> Router {
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.to_path_buf(),
+                preview: true,
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        Router::new(&config, test_store(), None, None, limiter, None, None)
+    }
+
+    /// A multi-site router with a per-site limiter: `sites_dir` holds the
+    /// given site directories (each with an `index.php`), the default docroot
+    /// gets one too, and `.localhost` is the domain suffix so one tenant is
+    /// addressable under two hosts.
+    fn per_site_router(root: &Path, sites: &[&str], limits: ephpm_config::ResolvedLimits) -> Router {
+        let sites_dir = root.join("sites");
+        fs::create_dir_all(&sites_dir).unwrap();
+        for site in sites {
+            let dir = sites_dir.join(site);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("index.php"), "<?php echo 'hi';").unwrap();
+        }
+        let docroot = root.join("docroot");
+        fs::create_dir_all(&docroot).unwrap();
+        fs::write(docroot.join("index.php"), "<?php echo 'default';").unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: docroot,
+                sites_dir: Some(sites_dir),
+                sites_domain_suffix: Some(".localhost".to_string()),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        let limiter = Some(Arc::new(crate::rate_limit::Limiter::new(limits)));
+        Router::new(&config, test_store(), None, None, limiter, None, None)
+    }
+
+    fn get_with_host(uri: &str, host: &str) -> Request<Empty<Bytes>> {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .header("host", host)
+            .body(Empty::<Bytes>::new())
+            .unwrap()
+    }
+
+    /// `[server] preview = true` stamps `X-Ephpm-Preview: 1` on every
+    /// response — success, 404, and the per-IP 429 early-return path.
+    #[tokio::test]
+    async fn preview_marker_on_every_response_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // Success and 404, no limiter involved.
+        let router = preview_router(dir.path(), None);
+        for (uri, expect_status) in [("/a.txt", StatusCode::OK), ("/nope.txt", StatusCode::NOT_FOUND)]
+        {
+            let req =
+                Request::builder().method("GET").uri(uri).body(Empty::<Bytes>::new()).unwrap();
+            let resp = router.handle(req, addr, false).await.unwrap();
+            assert_eq!(resp.status(), expect_status);
+            assert_eq!(
+                resp.headers().get("x-ephpm-preview").and_then(|v| v.to_str().ok()),
+                Some("1"),
+                "marker missing on {uri} ({expect_status})"
+            );
+        }
+
+        // The per-IP 429 early return bypasses the main marker application
+        // and must carry the marker via its own path.
+        let limiter = Arc::new(crate::rate_limit::Limiter::new(ephpm_config::ResolvedLimits {
+            per_ip_rate: 0.001,
+            per_ip_burst: 1,
+            ..ephpm_config::ResolvedLimits::default()
+        }));
+        let router = preview_router(dir.path(), Some(limiter));
+        let req =
+            Request::builder().method("GET").uri("/a.txt").body(Empty::<Bytes>::new()).unwrap();
+        let first = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let req =
+            Request::builder().method("GET").uri("/a.txt").body(Empty::<Bytes>::new()).unwrap();
+        let denied = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            denied.headers().get("x-ephpm-preview").and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "marker missing on the per-IP 429 early return"
+        );
+    }
+
+    /// Without `[server] preview` no marker is emitted anywhere.
+    #[tokio::test]
+    async fn no_preview_marker_when_preview_off() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        let router = test_router(dir.path());
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req =
+            Request::builder().method("GET").uri("/a.txt").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert!(resp.headers().get("x-ephpm-preview").is_none());
+    }
+
+    /// The per-site cap is keyed by the CANONICAL site key from
+    /// `resolve_site`, so one tenant addressed two ways (`blog.localhost`
+    /// and `blog` under the domain suffix) drains ONE bucket — the
+    /// #290/#291 invariant applied to rate limiting. A sibling site keeps
+    /// its own budget, and the 429 carries `Retry-After`.
+    #[tokio::test]
+    async fn per_site_cap_uses_canonical_key_and_sets_retry_after() {
+        let root = tempfile::tempdir().unwrap();
+        // rate 0.5/s: no refill on a test timescale; Retry-After = 2s.
+        let limits = ephpm_config::ResolvedLimits {
+            per_site_rate: 0.5,
+            per_site_burst: 2,
+            ..ephpm_config::ResolvedLimits::default()
+        };
+        let router = per_site_router(root.path(), &["blog", "other"], limits);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // Two PHP requests within the burst — not rate-limited (stub mode has
+        // no PHP engine, so "allowed" is any status but 429).
+        for host in ["blog.localhost", "blog"] {
+            let resp = router.handle(get_with_host("/index.php", host), addr, false).await.unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "burst request via {host} must not be limited"
+            );
+        }
+
+        // Third hit on the SAME tenant — via either host form — is over
+        // budget: both forms drained the one canonical bucket.
+        let resp =
+            router.handle(get_with_host("/index.php", "blog.localhost"), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(hyper::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("2"),
+            "429 must tell the client when a token refills (1/0.5 = 2s)"
+        );
+
+        // A different tenant still has its own full budget.
+        let resp =
+            router.handle(get_with_host("/index.php", "other.localhost"), addr, false).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "sibling site must be unaffected");
+    }
+
+    /// A host that names no site (key = `None`) is never per-site-capped —
+    /// nothing per-tenant may be minted from an unmatched host (issue #291),
+    /// and that includes a rate-limit bucket.
+    #[tokio::test]
+    async fn unmatched_host_is_not_per_site_capped() {
+        let root = tempfile::tempdir().unwrap();
+        let limits = ephpm_config::ResolvedLimits {
+            per_site_rate: 0.5,
+            per_site_burst: 1,
+            ..ephpm_config::ResolvedLimits::default()
+        };
+        let router = per_site_router(root.path(), &["blog"], limits);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        for _ in 0..5 {
+            let resp = router
+                .handle(get_with_host("/index.php", "unknown.example.com"), addr, false)
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "unmatched host has no site key and must not be per-site-capped"
+            );
+        }
+    }
+
+    /// Static files are not counted against the per-site PHP cap: the cap
+    /// protects PHP CPU, and a page's asset fan-out must not eat the budget.
+    #[tokio::test]
+    async fn static_files_do_not_consume_per_site_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let limits = ephpm_config::ResolvedLimits {
+            per_site_rate: 0.5,
+            per_site_burst: 1,
+            ..ephpm_config::ResolvedLimits::default()
+        };
+        let router = per_site_router(root.path(), &["blog"], limits);
+        std::fs::write(root.path().join("sites").join("blog").join("style.css"), b"body{}")
+            .unwrap();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // Many static hits — none consume the (burst = 1) PHP budget.
+        for _ in 0..5 {
+            let resp =
+                router.handle(get_with_host("/style.css", "blog.localhost"), addr, false).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        // The single PHP token is still available.
+        let resp =
+            router.handle(get_with_host("/index.php", "blog.localhost"), addr, false).await.unwrap();
+        assert_ne!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        // ... and now it is spent.
+        let resp =
+            router.handle(get_with_host("/index.php", "blog.localhost"), addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]
