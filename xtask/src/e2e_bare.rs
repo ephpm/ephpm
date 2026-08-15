@@ -175,10 +175,17 @@ fn suite_is_serial(name: &str) -> bool {
     // (`ephpm_fpm_pool_contained_crashes_total`, `..._recycles_total`) before
     // and after, and they assert that a *concurrent* request on another thread
     // is unaffected — which only means anything if this suite owns the pool.
+    //
+    // `rate_limit` is serial for a resource reason: its #299 shed test fills
+    // the node's ENTIRE `max_connections` budget with held-open sockets while
+    // it probes the over-cap behaviour. Run concurrently, the burst test's
+    // connections would be shed too and its "some requests succeed" half
+    // could never hold.
     ISOLATED_DB_SUITES.contains(&name)
         || name == "worker_mode"
         || name == "fpm_pool"
         || name == "crash_containment"
+        || name == "rate_limit"
 }
 
 /// Whether a suite needs its own freshly-spawned, then-torn-down single node

@@ -1086,9 +1086,31 @@ async fn acquire_connection(
             tracing::debug!(%remote_addr, "connection rejected (limit reached)");
             // Best-effort raw HTTP response — the TLS handshake hasn't happened yet
             // for TLS connections, so this only works for plain HTTP.
-            let _ = stream.try_write(
-                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
+            //
+            // The stream was just accepted and has never been polled, so
+            // tokio's cached readiness is empty and a bare `try_write` often
+            // returns `WouldBlock` — silently skipping the 503 (the #299 E2E
+            // pin flaked on exactly this: bare close, no bytes). Await
+            // writability first; on a freshly accepted socket the send
+            // buffer is empty, so this resolves on the next reactor tick.
+            // The timeout is a belt-and-braces bound so a shed connection
+            // can never stall the accept loop.
+            let write_503 = async {
+                loop {
+                    if stream.writable().await.is_err() {
+                        break;
+                    }
+                    match stream.try_write(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    ) {
+                        // Spurious readiness — re-arm and retry (bounded by
+                        // the timeout below).
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        _ => break,
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_millis(100), write_503).await;
             ConnAdmission::Shed
         }
     }
