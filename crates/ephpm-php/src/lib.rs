@@ -2,6 +2,7 @@
 // are documented with comments before each unsafe block.
 #![allow(unsafe_code)]
 
+pub mod crash_guard;
 pub mod db_bridge;
 pub mod kv_bridge;
 pub mod request;
@@ -212,6 +213,7 @@ impl Drop for ThreadPhpGuard {
             return;
         }
         self.registered.set(false);
+        LIVE_PHP_THREADS.fetch_sub(1, Ordering::AcqRel);
         // If the PHP module is already gone (`PhpRuntime::shutdown()` ran
         // first), TSRM has been torn down and touching it would be UB. In
         // serve mode this cannot happen: the tokio runtime is dropped —
@@ -236,6 +238,74 @@ impl Drop for ThreadPhpGuard {
 thread_local! {
     static THREAD_REGISTERED: ThreadPhpGuard =
         const { ThreadPhpGuard { registered: std::cell::Cell::new(false) } };
+}
+
+/// How many threads currently hold a TSRM registration made by
+/// [`PhpRuntime::ensure_thread_registered`].
+///
+/// [`PhpRuntime::shutdown`] refuses to run `php_embed_shutdown()` while this is
+/// non-zero. `php_module_shutdown()`'s `ts_free_id()` walks every live TSRM
+/// entry **on the calling thread**, freeing another thread's request-lifetime
+/// allocations into the wrong heap — `zend_mm_heap corrupted` → `SIGABRT`, the
+/// #266 hazard. The normal shutdown sequence drives this to zero first (drop the
+/// tokio runtime so blocking threads run their [`ThreadPhpGuard`]; drain the
+/// worker/FPM pool so its threads call [`PhpRuntime::worker_thread_shutdown`]),
+/// but an **early return** does not: a startup failure after the pool has
+/// spawned — a failed `TcpListener::bind`, say — leaves pool threads registering
+/// with TSRM while the main thread tears the module down underneath them. That
+/// reproduces as a null-deref SIGSEGV in `zend_activate_modules` on an
+/// `ephpm-fpm-N` thread. Skipping teardown at process exit costs nothing (the
+/// kernel reclaims the memory); aborting costs the exit status and the log.
+#[cfg(php_linked)]
+static LIVE_PHP_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(php_linked)]
+thread_local! {
+    /// Latched once this thread has contained a stack-overflow crash. Its Zend
+    /// context is then poisoned — the recovery `siglongjmp`ed out mid-object-
+    /// destruction, leaving the per-thread ZMM free lists and
+    /// `EG(objects_store)` inconsistent — so the thread must never run PHP
+    /// again and must never be torn down through `php_request_shutdown` /
+    /// `ts_free_thread`.
+    static THREAD_POISONED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Set once any thread in this process has contained a crash and abandoned its
+/// TSRM entry.
+///
+/// [`PhpRuntime::shutdown`] reads it and skips `php_embed_shutdown()`: module
+/// shutdown's `ts_free_id()` walks **every** remaining TSRM entry on the calling
+/// thread, and an abandoned poisoned one is a guaranteed `zend_mm_heap
+/// corrupted` → `SIGABRT` (this is issue #266's hazard, on entries we leaked on
+/// purpose). Skipping is safe because the process is exiting: module shutdown
+/// only frees memory the kernel reclaims anyway.
+#[cfg(php_linked)]
+static CONTEXT_POISONED: AtomicBool = AtomicBool::new(false);
+
+/// Mark the current thread poisoned after a contained crash.
+///
+/// Latches the thread flag (so [`PhpRuntime::execute`] refuses further PHP on
+/// this thread even if a caller ignores the error), disarms the
+/// [`ThreadPhpGuard`] so thread exit does **not** run `ephpm_thread_shutdown()`
+/// — its `php_request_shutdown` + `ts_free_thread` walk the poisoned heap and
+/// would re-crash — and latches [`CONTEXT_POISONED`] so process teardown skips
+/// module shutdown for the same reason. The poisoned per-thread Zend state is
+/// deliberately leaked; abandoning it is the only safe option.
+#[cfg(php_linked)]
+fn mark_thread_poisoned() {
+    THREAD_POISONED.with(|p| p.set(true));
+    THREAD_REGISTERED.with(|g| {
+        if g.registered.replace(false) {
+            LIVE_PHP_THREADS.fetch_sub(1, Ordering::AcqRel);
+        }
+    });
+    CONTEXT_POISONED.store(true, Ordering::Release);
+}
+
+/// Whether the current thread has contained a crash and must not run PHP.
+#[cfg(php_linked)]
+fn is_thread_poisoned() -> bool {
+    THREAD_POISONED.with(std::cell::Cell::get)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -273,6 +343,21 @@ pub enum PhpError {
     /// exception, which unwinds cleanly and yields a complete response.
     #[error("PHP script bailed out (truncated response discarded): {0}")]
     Bailout(String),
+
+    /// A request overflowed the C stack — a deep object-graph free
+    /// (`zend_object_std_dtor` ↔ `zend_objects_store_del` recursion) — and the
+    /// crash guard contained it instead of the process aborting. Produced only
+    /// when `[php] crash_containment` is active (see [`crate::crash_guard`]).
+    ///
+    /// Distinct from [`Self::Bailout`] in both cause and obligation: the fault
+    /// was a hardware `SIGSEGV` recovered via `siglongjmp`, not a PHP-level
+    /// bailout, and the thread that ran it is **poisoned**. The partial response
+    /// is discarded and answered `500`, and the caller MUST retire that OS
+    /// thread without running PHP teardown on it — which is what
+    /// `ephpm-server`'s FPM pool does, and why containment is refused on tokio's
+    /// shared blocking pool.
+    #[error("PHP request contained after a C-stack overflow (thread retired): {0}")]
+    Contained(String),
 }
 
 /// The `EPHPM_EXEC_*` return codes of `ephpm_execute_request` (defined in
@@ -457,10 +542,42 @@ impl PhpRuntime {
 
             #[cfg(php_linked)]
             {
-                // Safety: Paired with php_embed_init in init().
-                // Handles request shutdown + module shutdown.
-                unsafe { ffi::php_embed_shutdown() };
-                tracing::info!("PHP runtime shut down");
+                let live_threads = LIVE_PHP_THREADS.load(Ordering::Acquire);
+                if CONTEXT_POISONED.load(Ordering::Acquire) {
+                    // At least one thread contained a crash and abandoned its
+                    // TSRM entry (see `mark_thread_poisoned`). `ts_free_id()`
+                    // inside php_module_shutdown walks EVERY remaining entry on
+                    // this thread and would free the poisoned thread's
+                    // request-lifetime allocations out of a corrupt heap —
+                    // `zend_mm_heap corrupted` → SIGABRT, i.e. a clean SIGTERM
+                    // would exit 134 instead of 0. The process is on its way
+                    // out and module shutdown only frees memory the kernel
+                    // reclaims regardless, so skipping it is strictly better
+                    // than aborting.
+                    tracing::warn!(
+                        "skipping PHP module shutdown — a crash was contained during this \
+                         process's lifetime and its thread context was abandoned; walking \
+                         that TSRM entry would abort. Process memory is reclaimed by the OS."
+                    );
+                } else if live_threads > 0 {
+                    // A PHP-registered thread is still alive — the caller
+                    // returned early (a startup failure after the pool spawned,
+                    // typically) without draining it. `ts_free_id()` would free
+                    // that thread's request-lifetime state on THIS thread, and
+                    // the thread itself may still be inside php_request_startup.
+                    // Skip rather than race it. See LIVE_PHP_THREADS.
+                    tracing::warn!(
+                        live_threads,
+                        "skipping PHP module shutdown — PHP-registered threads are still \
+                         live, so tearing the module down now would free their per-thread \
+                         state on the wrong thread. Process memory is reclaimed by the OS."
+                    );
+                } else {
+                    // Safety: Paired with php_embed_init in init().
+                    // Handles request shutdown + module shutdown.
+                    unsafe { ffi::php_embed_shutdown() };
+                    tracing::info!("PHP runtime shut down");
+                }
             }
 
             #[cfg(not(php_linked))]
@@ -634,6 +751,17 @@ impl PhpRuntime {
             return Err(PhpError::NotInitialized);
         }
 
+        // Belt-and-braces: a thread that contained a prior crash has a poisoned
+        // Zend context and must never run PHP again. The FPM pool retires such a
+        // thread the moment it sees `Contained`, so in the supported
+        // configuration this never fires — it exists so a caller that ignores
+        // the error cannot turn a contained crash into an uncontained one.
+        // Checked before TSRM is touched.
+        #[cfg(php_linked)]
+        if is_thread_poisoned() {
+            return Err(PhpError::Contained("thread retired after a prior contained crash".into()));
+        }
+
         #[cfg(php_linked)]
         Self::ensure_thread_registered()?;
 
@@ -702,8 +830,11 @@ impl PhpRuntime {
             // Setting the flag arms the guard's Drop: when this thread exits
             // (idle timeout or runtime shutdown), it retires its own TSRM
             // slot instead of leaving a stale entry for module shutdown to
-            // trip over (issue #266).
+            // trip over (issue #266). The counter is the process-wide view of
+            // the same fact, so `shutdown()` can refuse to tear the module down
+            // while any registration is still outstanding.
             guard.registered.set(true);
+            LIVE_PHP_THREADS.fetch_add(1, Ordering::AcqRel);
             tracing::debug!("TSRM thread registered for PHP execution");
             Ok(())
         })
@@ -778,10 +909,70 @@ impl PhpRuntime {
         }
 
         // Execute the PHP request on this thread's TSRM context.
-        // SAFETY: This thread is registered with TSRM. All PHP globals
-        // accessed by ephpm_execute_request are thread-local under ZTS.
-        // The C function uses setjmp/longjmp bailout protection.
-        let ret = unsafe { ffi::ephpm_execute_request(script_filename.as_ptr()) };
+        //
+        // Two shapes, selected by the `[php] crash_containment` master switch:
+        //
+        // - OFF (default): the bare FFI call, byte-identical to every release
+        //   before containment existed. A C-stack overflow aborts the process
+        //   via the fatal-signal handler, as it always has.
+        // - ON: the same call inside the per-thread `sigsetjmp` recovery region.
+        //   The region wraps the WHOLE call deliberately, because the deep free
+        //   that overflows the stack can happen in three places inside it — the
+        //   script's own `$graph = null`, the LAZY `php_request_shutdown` of the
+        //   *previous* request at the top of `ephpm_execute_request`, or a
+        //   registered shutdown function.
+        //
+        // Nothing is allocated inside the guarded closure: on containment the
+        // `siglongjmp` skips every Rust destructor between here and the recovery
+        // point, so the closure body is exactly one FFI call and the CStrings /
+        // Vec above (created OUTSIDE it) still drop normally afterwards.
+        let ret = if crash_guard::enabled() {
+            let filename_ptr = script_filename.as_ptr();
+            let mut ret: std::os::raw::c_int = exec_code::BAILOUT;
+            let guarded = crash_guard::run_guarded(|| {
+                // SAFETY: This thread is registered with TSRM. All PHP globals
+                // accessed by ephpm_execute_request are thread-local under ZTS.
+                // The C function uses setjmp/longjmp bailout protection for
+                // PHP-level bailouts; a hardware stack-overflow SIGSEGV escapes
+                // that and is caught by the crash guard's signal-handler
+                // recovery instead. `script_filename` outlives the call.
+                ret = unsafe { ffi::ephpm_execute_request(filename_ptr) };
+            });
+
+            if guarded == crash_guard::Guarded::Contained {
+                // The recovery jumped out mid-object-destruction: this thread's
+                // ZMM free lists and EG(objects_store) are inconsistent. The
+                // damage is confined to THIS thread, but it must never run PHP
+                // again nor be torn down through php_request_shutdown /
+                // ts_free_thread (both walk the poisoned heap and would
+                // re-crash). mark_thread_poisoned() latches the refusal,
+                // disarms the TLS retirement guard, and makes process teardown
+                // skip module shutdown; the poisoned Zend context is
+                // deliberately leaked. Retiring the OS thread is the caller's
+                // job — see PhpError::Contained.
+                mark_thread_poisoned();
+                tracing::error!(
+                    script = %request.script_filename.display(),
+                    method = %request.method,
+                    uri = %request.uri,
+                    "PHP request overflowed the C stack (deep object-graph free) — \
+                     contained on this thread, returning 500; the thread is poisoned \
+                     and must be retired"
+                );
+                return Err(PhpError::Contained(format!(
+                    "{} ({} {})",
+                    request.script_filename.display(),
+                    request.method,
+                    request.uri
+                )));
+            }
+            ret
+        } else {
+            // SAFETY: This thread is registered with TSRM. All PHP globals
+            // accessed by ephpm_execute_request are thread-local under ZTS.
+            // The C function uses setjmp/longjmp bailout protection.
+            unsafe { ffi::ephpm_execute_request(script_filename.as_ptr()) }
+        };
 
         // Retrieve the captured response from C
         let body = {
@@ -1062,7 +1253,11 @@ impl PhpRuntime {
 
             // Disarm the TLS guard FIRST so it cannot run a second
             // ephpm_thread_shutdown at thread exit (double ts_free_thread).
-            THREAD_REGISTERED.with(|guard| guard.registered.set(false));
+            THREAD_REGISTERED.with(|guard| {
+                if guard.registered.replace(false) {
+                    LIVE_PHP_THREADS.fetch_sub(1, Ordering::AcqRel);
+                }
+            });
             // SAFETY: called on a TSRM-registered worker thread that is done
             // executing PHP. ephpm_thread_shutdown runs php_request_shutdown +
             // ts_free_thread and frees the thread-local capture buffers.

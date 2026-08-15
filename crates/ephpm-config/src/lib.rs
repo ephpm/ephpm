@@ -2073,6 +2073,40 @@ pub struct PhpConfig {
     #[serde(default = "default_fpm_engine")]
     pub fpm_engine: FpmEngine,
 
+    /// **EXPERIMENTAL.** Contain a PHP C-stack overflow instead of letting it
+    /// abort the whole process (`fpm_engine = "pool"` only).
+    ///
+    /// A deep object-graph free (`zend_object_std_dtor` ↔
+    /// `zend_objects_store_del` C recursion) overflows the executing thread's
+    /// stack and the resulting `SIGSEGV` kills the **entire** server — every
+    /// other tenant with it. With this on, that specific fault class is caught
+    /// at the signal handler, the offending request is answered `500`, and the
+    /// thread that ran it is retired and replaced.
+    ///
+    /// **Only stack-overflow faults are contained.** Heap corruption and wild
+    /// writes produce the same `SIGSEGV` but may already have damaged another
+    /// thread's or a shared allocator's memory, so they are deliberately **not**
+    /// caught — the process still dies with the usual fatal-signal diagnostic.
+    /// The two are told apart by the faulting address.
+    ///
+    /// Costs, so it is off by default: each contained crash abandons the
+    /// poisoned thread's Zend context, and once any crash has been contained the
+    /// process **skips** PHP module shutdown at exit (walking an abandoned TSRM
+    /// entry is a certain `SIGABRT`). The abandoned contexts leak, but the leak
+    /// plateaus — measured on a 4-thread pool, RSS rose ~90 MiB over the first
+    /// ~1000 contained crashes and then stopped growing.
+    ///
+    /// Requires `fpm_engine = "pool"`: containment is only safe when ePHPm owns
+    /// the executing thread and can genuinely retire it, which tokio's shared
+    /// `spawn_blocking` pool cannot do. Setting this without the pool engine (or
+    /// in worker mode) logs a WARN at startup and changes nothing.
+    ///
+    /// Env override: `EPHPM_PHP__CRASH_CONTAINMENT=true`.
+    ///
+    /// Default: `false`.
+    #[serde(default = "default_crash_containment")]
+    pub crash_containment: bool,
+
     /// Worker-mode entrypoint script, relative to `document_root`.
     ///
     /// The script is a loop that calls `\Ephpm\Worker\take_request()` /
@@ -2495,6 +2529,7 @@ impl Default for PhpConfig {
             workers: default_php_workers(),
             mode: default_php_mode(),
             fpm_engine: default_fpm_engine(),
+            crash_containment: default_crash_containment(),
             worker_script: None,
             worker_count: default_worker_count(),
             worker_max_requests: default_worker_max_requests(),
@@ -2524,6 +2559,24 @@ impl PhpConfig {
     #[must_use]
     pub fn is_pool_engine(&self) -> bool {
         !self.is_worker_mode() && self.fpm_engine == FpmEngine::Pool
+    }
+
+    /// Whether stack-overflow crash containment is requested **and applicable**
+    /// — i.e. `crash_containment = true` together with the dedicated FPM thread
+    /// pool ([`Self::is_pool_engine`]).
+    ///
+    /// Containment is deliberately gated on the pool engine: recovering from the
+    /// fault leaves the executing thread's Zend context poisoned, so the *only*
+    /// safe follow-up is to retire that OS thread and spawn a replacement —
+    /// which is possible only on threads ePHPm owns. On tokio's shared
+    /// `spawn_blocking` pool a poisoned thread stays in rotation and fails every
+    /// later request, which is worse than the crash it prevented.
+    ///
+    /// Startup warns when `crash_containment` is set but this returns `false`,
+    /// so the no-op is never silent.
+    #[must_use]
+    pub fn is_crash_containment_active(&self) -> bool {
+        self.crash_containment && self.is_pool_engine()
     }
 
     /// Resolve the effective worker-thread count.
@@ -3338,6 +3391,15 @@ fn default_fpm_engine() -> FpmEngine {
     FpmEngine::SpawnBlocking
 }
 
+fn default_crash_containment() -> bool {
+    // OFF. Recovering from a SIGSEGV is only defensible for one narrow fault
+    // class, and it is not free: the recovered thread's Zend context is
+    // abandoned (a bounded leak) and PHP module shutdown must be skipped at
+    // process exit. An operator opts into that trade knowingly, per deployment
+    // — it is never the default.
+    false
+}
+
 fn default_worker_count() -> usize {
     // 0 => derive at startup — cgroup CPU quota if present (Linux), otherwise
     // host parallelism clamped [2, 32]. See `PhpConfig::effective_worker_count`.
@@ -4138,6 +4200,90 @@ alt_svc_max_age = 3600
         let config = Config::default_config().unwrap();
         assert_eq!(config.php.fpm_engine, FpmEngine::Pool);
         assert!(config.php.is_pool_engine());
+    }
+
+    // ── [php] crash_containment ──────────────────────────────────────────
+
+    /// Containment is OFF unless explicitly requested — from the struct
+    /// default, from an empty file, and from a `[php]` section that exists but
+    /// omits the field (the serde section-default trap).
+    #[test]
+    fn crash_containment_defaults_to_off() {
+        assert!(!PhpConfig::default().crash_containment);
+        assert!(!PhpConfig::default().is_crash_containment_active());
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let empty = dir.path().join("empty.toml");
+        std::fs::write(&empty, "").unwrap();
+        assert!(!Config::load(&empty).unwrap().php.crash_containment);
+
+        // `[php]` present, field absent — must still be off.
+        let partial = dir.path().join("partial.toml");
+        std::fs::write(&partial, "[php]\nmemory_limit = \"128M\"\n").unwrap();
+        let config = Config::load(&partial).unwrap();
+        assert!(
+            !config.php.crash_containment,
+            "a present [php] section without the field must not enable containment"
+        );
+        assert!(!config.php.is_crash_containment_active());
+    }
+
+    /// Requested WITH the pool engine → active. This is the only combination
+    /// that arms the guard.
+    #[test]
+    fn crash_containment_active_with_pool_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\nfpm_engine = \"pool\"\ncrash_containment = true\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(config.php.crash_containment);
+        assert!(
+            config.php.is_crash_containment_active(),
+            "containment applies with the pool engine in fpm mode"
+        );
+    }
+
+    /// Requested WITHOUT the pool engine → parsed but inert. Containment needs
+    /// a thread ePHPm can retire; tokio's shared blocking pool cannot provide
+    /// one. Startup warns (see `crates/ephpm/src/main.rs`).
+    #[test]
+    fn crash_containment_is_inert_without_pool_engine() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Default (spawn_blocking) engine.
+        let sb = dir.path().join("sb.toml");
+        std::fs::write(&sb, "[php]\ncrash_containment = true\n").unwrap();
+        let config = Config::load(&sb).unwrap();
+        assert!(config.php.crash_containment, "the field still parses");
+        assert!(
+            !config.php.is_crash_containment_active(),
+            "containment must not arm on the spawn_blocking engine"
+        );
+
+        // Worker mode makes `fpm_engine` inert, so containment is inert too.
+        let worker = dir.path().join("worker.toml");
+        std::fs::write(
+            &worker,
+            "[php]\nmode = \"worker\"\nfpm_engine = \"pool\"\ncrash_containment = true\n",
+        )
+        .unwrap();
+        let config = Config::load(&worker).unwrap();
+        assert!(
+            !config.php.is_crash_containment_active(),
+            "containment must not arm in worker mode"
+        );
+    }
+
+    /// The e2e harness and the lab flip it via env with no config edit.
+    #[test]
+    fn crash_containment_env_override_parses() {
+        let _engine = EnvVars::set("EPHPM_PHP__FPM_ENGINE", "pool");
+        let _env = EnvVars::set("EPHPM_PHP__CRASH_CONTAINMENT", "true");
+        let config = Config::default_config().unwrap();
+        assert!(config.php.crash_containment);
+        assert!(config.php.is_crash_containment_active());
     }
 
     #[test]
