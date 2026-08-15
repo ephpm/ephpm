@@ -119,6 +119,49 @@ pub struct ServerConfig {
     #[serde(default)]
     pub sites_dir: Option<PathBuf>,
 
+    /// Unprivileged user to drop to after binding privileged ports and
+    /// opening root-owned files (Unix only).
+    ///
+    /// Accepts a numeric uid (e.g. `"1000"`) or a username resolved via
+    /// `getpwnam` (e.g. `"www-data"`). When set and the process starts as
+    /// root, ePHPm binds every listener, starts the DB proxies, and opens the
+    /// generated php.ini **as root**, then permanently drops to this uid
+    /// (and [`run_as_group`](Self::run_as_group)) with `setgroups` +
+    /// `setgid` + `setuid` before it begins serving. The drop is
+    /// process-wide (glibc broadcasts it to every thread) and irreversible —
+    /// startup fails closed if the effective uid is still 0 afterwards.
+    ///
+    /// **This is a single non-root uid for the whole process, not a
+    /// per-tenant uid.** It removes the root-escalation blast radius (a
+    /// PHP/FFI compromise no longer runs as root), but every tenant still
+    /// shares this one uid, so cross-tenant isolation still rests on
+    /// `open_basedir` + the `disable_functions` denylist, not on kernel
+    /// permissions. See the multi-tenant guide.
+    ///
+    /// Before dropping, ePHPm `chown`s the directories it must keep writing
+    /// after the drop to the target uid/gid: `[db.sqlite] dir` (per-site
+    /// database files), the per-vhost temp/session base
+    /// (`<tmpdir>/ephpm-vhosts`), and the ACME cache directory when TLS-ACME
+    /// is configured.
+    ///
+    /// Default: unset (no privilege drop — the process keeps whatever uid it
+    /// was started with). Ignored with a startup warning on Windows and when
+    /// the process is not running as root.
+    #[serde(default)]
+    pub run_as_user: Option<String>,
+
+    /// Unprivileged group to drop to alongside
+    /// [`run_as_user`](Self::run_as_user) (Unix only).
+    ///
+    /// Accepts a numeric gid or a group name resolved via `getgrnam`. Only
+    /// consulted when `run_as_user` is set. When omitted, the target group
+    /// is the user's primary group (for a named user) or the same numeric id
+    /// as the uid (for a numeric user). Supplementary groups are dropped.
+    ///
+    /// Default: unset.
+    #[serde(default)]
+    pub run_as_group: Option<String>,
+
     /// Optional domain suffix to strip from incoming `Host` headers when
     /// resolving vhosts. When set (e.g. `.localhost`), a directory named
     /// `~/sites/blog/` matches `Host: blog.localhost` — the suffix is
@@ -513,6 +556,50 @@ pub struct SecurityConfig {
     /// enabled-but-inert case.
     #[serde(default)]
     pub disable_shell_exec: Option<bool>,
+
+    /// Apply the multi-tenant confidentiality/integrity hardening preset.
+    ///
+    /// **Multi-tenant only.** When `true` *and* `sites_dir` is set, ePHPm
+    /// extends the generated php.ini with the denylist a hostile-tenant
+    /// pentest proved closes every cross-tenant read/write channel that the
+    /// shell-exec baseline alone leaves open:
+    ///
+    /// - `disable_functions` gains, on top of the shell-exec family:
+    ///   `pcntl_*`, `posix_kill`/`posix_setuid`/`posix_setgid`/
+    ///   `posix_seteuid`/`posix_setegid`, `pfsockopen`/`fsockopen`
+    ///   (persistent-socket inheritance), the SysV IPC family
+    ///   `shm_*`/`sem_*`/`msg_*`, `opcache_reset`/`opcache_compile_file`,
+    ///   `dl`, and `mail`. The list is composed as a **union** with any
+    ///   operator-supplied `disable_functions` (from `[php] ini_overrides`),
+    ///   never clobbering it.
+    /// - `mysqli.allow_persistent = 0` (persistent mysqli handles are keyed
+    ///   without a tenant component, so one tenant could inherit another's).
+    /// - `opcache.restrict_api` is pointed at an unreachable sentinel path so
+    ///   userland cannot call the remaining OPcache API — **but only when
+    ///   `[opcache] cluster_invalidation` is off**, because ePHPm's own
+    ///   cluster invalidator calls `opcache_get_status`/`opcache_invalidate`
+    ///   through the function table and `restrict_api` would block it too.
+    ///   With cluster invalidation on, those two functions stay callable by
+    ///   tenants (a metadata/per-file-invalidation residual, logged at
+    ///   startup); the DoS-grade `opcache_reset` is disabled either way.
+    ///
+    /// **Cost:** persistent database/socket connections are disabled — Redis
+    /// `pconnect`, mysqli `p:` hosts, and `pfsockopen`/`fsockopen` stop
+    /// working. Non-persistent connections (PDO, `stream_socket_client`,
+    /// curl) are unaffected. See the multi-tenant guide.
+    ///
+    /// **In single-site mode (`sites_dir` unset) this flag does nothing** and
+    /// enabling it logs a warning at startup, exactly like the two flags
+    /// above.
+    ///
+    /// An explicitly set value always wins. When unset, resolves to `true`
+    /// if the `[server.security]` section is present OR `server.sites_dir`
+    /// is set (multi-tenant mode); otherwise `false`. Set it to `false` to
+    /// opt out and keep persistent connections. Use
+    /// [`ServerConfig::effective_multi_tenant_hardening`] to read the
+    /// resolved value.
+    #[serde(default)]
+    pub multi_tenant_hardening: Option<bool>,
 }
 
 impl ServerConfig {
@@ -543,6 +630,18 @@ impl ServerConfig {
         self.resolve_security_flag(|s| s.disable_shell_exec)
     }
 
+    /// Resolved value of `security.multi_tenant_hardening`.
+    ///
+    /// Same resolution rules as [`Self::effective_open_basedir`]: an explicit
+    /// value wins; unset resolves to `true` when the `[server.security]`
+    /// section is present or `sites_dir` is set, `false` otherwise. Same
+    /// caveat — a `true` here is only acted upon in multi-tenant mode
+    /// (`sites_dir` set), where it extends the generated php.ini denylist.
+    #[must_use]
+    pub fn effective_multi_tenant_hardening(&self) -> bool {
+        self.resolve_security_flag(|s| s.multi_tenant_hardening)
+    }
+
     /// The `[server.security]` isolation flags that resolve to `true` but
     /// have no effect, because both are implemented only on the
     /// multi-tenant path and `sites_dir` is unset.
@@ -564,6 +663,9 @@ impl ServerConfig {
         }
         if self.effective_disable_shell_exec() {
             inert.push("disable_shell_exec");
+        }
+        if self.effective_multi_tenant_hardening() {
+            inert.push("multi_tenant_hardening");
         }
         inert
     }
@@ -2252,6 +2354,8 @@ impl Default for ServerConfig {
             listen: default_listen(),
             document_root: default_document_root(),
             sites_dir: None,
+            run_as_user: None,
+            run_as_group: None,
             sites_domain_suffix: None,
             index_files: default_index_files(),
             fallback: default_fallback(),
@@ -4746,7 +4850,7 @@ trusted_proxies = ["10.0.0.0/8"]
         assert!(config.server.sites_dir.is_none());
         assert_eq!(
             config.server.inert_security_flags(),
-            vec!["open_basedir", "disable_shell_exec"],
+            vec!["open_basedir", "disable_shell_exec", "multi_tenant_hardening"],
         );
     }
 
@@ -4760,6 +4864,7 @@ trusted_proxies = ["10.0.0.0/8"]
 [server.security]
 open_basedir = true
 disable_shell_exec = false
+multi_tenant_hardening = false
 ",
         )
         .unwrap();
@@ -4778,6 +4883,7 @@ disable_shell_exec = false
 [server.security]
 open_basedir = false
 disable_shell_exec = false
+multi_tenant_hardening = false
 ",
         )
         .unwrap();
@@ -4787,6 +4893,32 @@ disable_shell_exec = false
             config.server.inert_security_flags().is_empty(),
             "nothing was asked for, so there is nothing to warn about"
         );
+    }
+
+    #[test]
+    fn test_multi_tenant_hardening_resolution() {
+        // Section absent + sites_dir set → on (multi-tenant secure default).
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nsites_dir = \"/var/www/sites\"\n").unwrap();
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.effective_multi_tenant_hardening());
+
+        // Section absent + no sites_dir → off (single-site).
+        let file2 = dir.path().join("ephpm2.toml");
+        std::fs::write(&file2, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+        let config2 = Config::load(&file2).unwrap();
+        assert!(!config2.server.effective_multi_tenant_hardening());
+
+        // Explicit false wins even with sites_dir set.
+        let file3 = dir.path().join("ephpm3.toml");
+        std::fs::write(
+            &file3,
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.security]\nmulti_tenant_hardening = false\n",
+        )
+        .unwrap();
+        let config3 = Config::load(&file3).unwrap();
+        assert!(!config3.server.effective_multi_tenant_hardening());
     }
 
     // ── [kv] eviction_policy validation ────────────────────────────────

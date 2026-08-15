@@ -15,6 +15,8 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 | `document_root` | path | `"."` | Document root for static files and PHP scripts. |
 | `sites_dir` | path | (none) | Virtual host directory. Each subdirectory is named after a domain. Omit for single-site mode. |
 | `sites_domain_suffix` | string | (none) | Suffix stripped from the `Host` header before resolving vhosts against `sites_dir` (e.g. `".localhost"` maps `blog.localhost` → `<sites_dir>/blog`). Used by `ephpm dev --sites`. |
+| `run_as_user` | string | (none) | **Unix only.** Numeric uid or username to drop the whole process to after binding privileged ports and opening root-owned files, before serving. See [Virtual Hosts → Dropping root](/guides/virtual-hosts/#dropping-root-run_as_user). A **single non-root uid for the whole process, not per-tenant.** Ignored (with a warning) when not started as root or on Windows. |
+| `run_as_group` | string | (none) | **Unix only.** Numeric gid or group name to drop to alongside `run_as_user`. Defaults to the user's primary group (named user) or the same numeric id as the uid. Only consulted when `run_as_user` is set. |
 | `index_files` | array of strings | `["index.php", "index.html"]` | Index file names to try when a directory is requested. |
 | `fallback` | array of strings | `["$uri", "$uri/", "/index.php?$query_string"]` | URL fallback chain. Variables: `$uri`, `$query_string`. Last entry is the fallback (prefix `=` for status code, e.g. `=404`). |
 
@@ -70,8 +72,9 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 | `allowed_php_paths` | array of strings | `[]` | When non-empty, only matching PHP paths execute. Others get 403. |
 | `open_basedir` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Restrict PHP filesystem access to the site's document root plus that site's own private temp/session state root (never the shared system temp — see [Virtual Hosts → Filesystem Isolation](/guides/virtual-hosts/#filesystem-isolation-temp-sessions)). **Multi-tenant only — see below.** |
 | `disable_shell_exec` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Disable `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec`. **Multi-tenant only — see below.** |
+| `multi_tenant_hardening` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Apply the [multi-tenant confidentiality/integrity denylist preset](/guides/virtual-hosts/#multi-tenant-hardening-preset) on top of `disable_shell_exec`: `pcntl_*`, `posix_kill`/`posix_set*id`, `pfsockopen`/`fsockopen`, SysV `shm_*`/`sem_*`/`msg_*`, `opcache_reset`/`opcache_compile_file`, `dl`, `mail`, plus `mysqli.allow_persistent=0` and (when `[opcache] cluster_invalidation` is off) `opcache.restrict_api`. Composed as a **union** with any operator `disable_functions`. **Cost: persistent DB/socket connections stop working.** **Multi-tenant only — see below.** |
 
-> **Both knobs are enforced only in multi-tenant mode.** They take effect only
+> **These knobs are enforced only in multi-tenant mode.** They take effect only
 > when `[server] sites_dir` is set. In single-site mode the values resolve
 > normally but nothing acts on them: `open_basedir` is gated on
 > `sites_dir.is_some()` before the per-request ini hook applies it, and
@@ -81,9 +84,9 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 > use `[php] ini_overrides` to set `open_basedir` / `disable_functions`
 > directly.
 
-**Note:** an explicitly set value always wins. When unset, these two resolve to `true` if either the `[server.security]` section is present (matching earlier releases) or `server.sites_dir` is set — so multi-tenant deployments get filesystem isolation and shell-exec hardening by default, even without a `[server.security]` section. To opt out in multi-tenant mode you must set them to `false` explicitly (ephpm logs a warning at startup when you do).
+**Note:** an explicitly set value always wins. When unset, these three resolve to `true` if either the `[server.security]` section is present (matching earlier releases) or `server.sites_dir` is set — so multi-tenant deployments get filesystem isolation, shell-exec hardening, and the full hardening denylist by default, even without a `[server.security]` section. To opt out in multi-tenant mode you must set them to `false` explicitly (ephpm logs a warning at startup when you do). `multi_tenant_hardening = false` keeps persistent DB/socket connections at the cost of the cross-tenant channels the preset closes.
 
-**Both flags do nothing in single-site mode** (`server.sites_dir` unset). They are implemented only on the vhost request path: `open_basedir` is set per-request from the resolved site's directory, and the `disable_functions` line is only written into the generated php.ini when `sites_dir` is set. Because a single-site `document_root` is the *web root* rather than a site container directory, confining PHP to it would break any application that keeps its code above the web root — so the multi-tenant mechanism is not reused here. ephpm logs a warning at startup for each flag that resolves to `true` while inert, rather than silently doing nothing.
+**These flags do nothing in single-site mode** (`server.sites_dir` unset). They are implemented only on the vhost request path: `open_basedir` is set per-request from the resolved site's directory, and the `disable_functions` line (baseline + hardening) is only written into the generated php.ini when `sites_dir` is set. Because a single-site `document_root` is the *web root* rather than a site container directory, confining PHP to it would break any application that keeps its code above the web root — so the multi-tenant mechanism is not reused here. ephpm logs a warning at startup for each flag that resolves to `true` while inert, rather than silently doing nothing.
 
 To sandbox a single-site deployment, set PHP's own directives through `[php] ini_overrides` — those lines go into the generated php.ini and are applied at MINIT:
 

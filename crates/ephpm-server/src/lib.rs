@@ -9,6 +9,7 @@ pub mod middleware;
 pub mod opcache;
 #[cfg(feature = "otlp")]
 pub mod otlp;
+pub mod privdrop;
 pub mod rate_limit;
 pub mod router;
 pub mod screened_backend;
@@ -343,6 +344,14 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     )
     .await?;
     let _per_site_wire_handles = per_site_wire_handles;
+
+    // Everything root is needed for is now done: privileged ports are bound,
+    // DB proxies and per-site wire listeners are up, the generated php.ini has
+    // been read at MINIT, and ACME/sqlite/vhost directories exist. Drop the
+    // whole process to the unprivileged uid (if configured) before we accept a
+    // single request. No PHP has run yet, so no request-carrying thread can
+    // race the process-wide credential change.
+    privdrop::drop_privileges(&config).context("failed to drop privileges")?;
 
     accept_loop(listeners).await
 }

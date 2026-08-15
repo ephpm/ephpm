@@ -188,6 +188,78 @@ Single-site deployments (no `sites_dir`) are unchanged: `open_basedir` stays off
 
 > Note: `open_basedir` is an in-process boundary, not a kernel/container boundary. It is the right control for cooperating tenants and defence-in-depth; to host **untrusted** per-PR code you still want a real per-preview isolation boundary (container/VM or per-uid + namespace).
 
+## Multi-tenant hardening preset
+
+`open_basedir` closes cross-tenant *filesystem* reads, but several other PHP userland channels can cross the tenant boundary inside one shared ZTS process. A hostile-PHP-userland pentest confirmed that, on top of the shell-exec baseline (`disable_shell_exec`), a specific denylist closes **every** cross-tenant confidentiality/integrity channel it found. That denylist is the `multi_tenant_hardening` preset, and it is **on by default in multi-tenant mode** (whenever `[server] sites_dir` is set — same defaulting as `open_basedir` / `disable_shell_exec`).
+
+### What it disables
+
+On top of the shell-exec family, the preset extends the generated `php.ini`'s `disable_functions` with:
+
+| Group | Functions | Channel it closes |
+|---|---|---|
+| Persistent sockets | `pfsockopen`, `fsockopen` | `EG(persistent_list)` is keyed `host:port` with no tenant component — one tenant could reuse (and read/write) another tenant's live, authenticated persistent socket (Redis `pconnect`, mysqli `p:`). |
+| SysV IPC | `shm_attach`, `shm_get_var`, `shm_put_var`, `shm_remove`, `shm_detach`, `shm_has_var`, `sem_get`, `sem_acquire`, `sem_release`, `sem_remove`, `msg_get_queue`, `msg_send`, `msg_receive`, `msg_remove_queue`, `msg_set_queue`, `msg_stat_queue` | A global kernel IPC namespace keyed by integer; one shared uid ⇒ full cross-tenant read/write. |
+| Process control | `pcntl_fork`, `pcntl_signal`, `pcntl_alarm`, `pcntl_wait`, `pcntl_waitpid`, `pcntl_async_signals`, `pcntl_signal_dispatch`, `pcntl_sigprocmask`, `pcntl_sigwaitinfo`, `pcntl_sigtimedwait`, `posix_kill`, `posix_setuid`, `posix_setgid`, `posix_seteuid`, `posix_setegid` | Fork-bomb + fd/secret inheritance into a child, whole-process signals, and process-credential changes. |
+| OPcache flush | `opcache_reset`, `opcache_compile_file` | `opcache_reset()` flushes **every** tenant's bytecode from the shared cache; `opcache_compile_file()` compiles arbitrary files into it. |
+| Misc | `dl`, `mail` | Runtime extension loading; mail relay from the shared identity. |
+
+It also sets two INI directives:
+
+- `mysqli.allow_persistent = 0` — closes the mysqli persistent path the same way disabling `pfsockopen` closes the raw-socket one.
+- `opcache.restrict_api = <unreachable sentinel>` — refuses **all** OPcache userland API calls (including `opcache_invalidate` / `opcache_get_status`, which the `disable_functions` list also removes). **This is emitted only when `[opcache] cluster_invalidation` is off.** ePHPm's own cluster invalidator calls those two functions through the function table, and `restrict_api` keys its check on the executing script path, so it would block ePHPm too. With cluster invalidation **on**, `restrict_api` is not set and `opcache_invalidate`/`opcache_get_status` stay callable by tenants — a metadata/per-file-invalidation residual (never a full `opcache_reset`, which stays disabled). ePHPm logs this residual at startup.
+
+### It composes with your `disable_functions` — it never clobbers it
+
+The effective `disable_functions` is the **union** of the preset (and `disable_shell_exec`) with any `disable_functions` you supply in `[php] ini_overrides`. Add your own entries and they stay disabled *alongside* ePHPm's:
+
+```toml
+[php]
+ini_overrides = [
+  # Disable pcntl_fork AND your own additions; both survive.
+  ["disable_functions", "phpinfo,dl_local"],
+]
+```
+
+> Historically ePHPm appended its own `disable_functions` line *after* the operator's, and PHP's last-wins INI semantics silently discarded the operator's list. That is fixed: a single composed `disable_functions` line is emitted, so operator additions are always kept.
+
+### The cost: persistent connections
+
+Disabling `pfsockopen`/`fsockopen` and setting `mysqli.allow_persistent = 0` **turns off persistent connections** — Redis `pconnect`, mysqli `p:` hosts, and any raw persistent socket. Non-persistent connections are unaffected: `stream_socket_client`, ordinary PDO/mysqli connections, and curl all keep working, and ePHPm's own per-request KV bridge and per-site `pdo_mysql` are unchanged. For most WordPress/Laravel workloads the practical loss is Redis object-cache persistence (each request reconnects). To keep persistent connections at the cost of the cross-tenant channels above, opt out:
+
+```toml
+[server.security]
+multi_tenant_hardening = false
+```
+
+> This is **not** a denylist against bugs real apps depend on: `unserialize`, `preg_*`, etc. are *not* disabled. The one structural residual the denylist cannot close is a whole-process crash (e.g. a deep recursive object-graph free overflowing the C stack) — that is a shared-fate availability problem, not a confidentiality one, and needs per-tenant process isolation, which the single-process model does not provide.
+
+## Dropping root (`run_as_user`)
+
+Every tenant's PHP runs in one process. By default that process keeps whatever uid it was started with — and if you start it as root (to bind :80/:443), **all tenants run as root**, so `open_basedir` is the only confidentiality wall with no kernel behind it. `run_as_user` removes the root-escalation blast radius: ePHPm binds privileged ports, starts the DB proxies, opens the generated `php.ini`, and creates its runtime directories **as root**, then permanently drops the whole process to an unprivileged uid/gid before it serves a single request.
+
+```toml
+[server]
+run_as_user = "www-data"   # numeric uid ("1000") or a username
+run_as_group = "www-data"  # optional; defaults to the user's primary group
+```
+
+Mechanics and limits:
+
+- **Process-wide, not per-thread.** The drop is `setgroups` + `setgid` + `setuid`; glibc broadcasts it to every thread, so all tokio/PHP threads change together. It happens before any request runs, so no request-carrying thread can race it. ePHPm verifies the drop took (fails closed if euid is still 0) and that root cannot be regained.
+- **Single non-root uid — NOT per-tenant.** This removes root escalation, but every tenant still shares this one uid. Cross-tenant isolation still rests on `open_basedir` + the hardening denylist above, not on kernel permissions. Per-tenant uids require per-tenant **processes**, which this model does not have.
+- **Directory ownership.** Before dropping, ePHPm `chown`s the directories it keeps writing to afterwards — `[db.sqlite] dir` (per-site database files), the per-vhost temp/session base (`<tmpdir>/ephpm-vhosts`), and the ACME cache directory — to the target uid/gid.
+- **Unix only.** On Windows, or when the process is not started as root, the setting is ignored with a startup warning (a drop can only happen from root).
+
+## Resource limits (run ePHPm under a cgroup)
+
+The denylist and privilege drop cover cross-tenant confidentiality/integrity. **Availability** (one tenant starving or OOM-killing the shared process) is a resource-limit problem, and because all tenants share one process it must be bounded from **outside** PHP:
+
+- **Memory.** PHP's `memory_limit` is per-request. The aggregate ceiling is `memory_limit × concurrent PHP executions`, which can exceed the pod's memory and OOM-kill everyone. Set a cgroup `memory.max` on the pod/container and size `[php] workers` (the concurrency cap, below) and `[php] memory_limit` so their product stays under it.
+- **Concurrency.** `[php] workers` caps concurrent PHP executions process-wide via a dedicated semaphore (php-fpm `max_children` semantics — requests past the cap queue, subject to the request timeout). This is a **global** cap, not per-tenant: it bounds total memory/CPU but does not stop one busy tenant from monopolizing the slots. A per-tenant concurrency cap is not yet implemented; until it is, give hostile-adjacent tenants their own ePHPm process/pod.
+- **Request timeout.** `[server.timeouts] request` and `[php] max_execution_time` bound how long any one request holds a worker slot, so a slow-loop tenant cannot hold the pool indefinitely.
+- **Process limits.** A cgroup `pids.max` and an `RLIMIT_NOFILE` (`nofile`) ceiling bound fork/fd exhaustion at the OS layer (the process-shared fd table is not per-tenant).
+
 ## KV Store Isolation
 
 In multi-tenant mode, each virtual host gets its own physically separate KV store. Not key prefixing — a completely separate `DashMap`. PHP applications don't need any code changes, and RESP (Redis protocol) connections are also isolated per-site via AUTH.
