@@ -680,11 +680,12 @@ fn warn_unimplemented_knobs(config: &ephpm_config::Config) {
     // sandbox and no warning — the worst possible combination, because the
     // config reads as if the process were hardened.
     for flag in config.server.inert_security_flags() {
-        let remedy = if flag == "disable_shell_exec" {
-            "[[\"disable_functions\", \
-             \"exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec\"]]"
-        } else {
-            "[[\"open_basedir\", \"/app:/tmp\"]]"
+        let remedy = match flag {
+            "disable_shell_exec" | "multi_tenant_hardening" => {
+                "[[\"disable_functions\", \
+                 \"exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,...\"]]"
+            }
+            _ => "[[\"open_basedir\", \"/app:/tmp\"]]",
         };
         tracing::warn!(
             flag,
@@ -694,6 +695,199 @@ fn warn_unimplemented_knobs(config: &ephpm_config::Config) {
              sandboxing PHP here. Set PHP's own directive through [php] \
              ini_overrides instead (ini_overrides = {remedy}) — those lines \
              are written into the generated php.ini and applied at MINIT."
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Multi-tenant PHP function denylist composition
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The shell-execution family disabled by `[server.security] disable_shell_exec`
+/// and always included in the multi-tenant hardening preset. Blocks shell
+/// escape out of `open_basedir`.
+const SHELL_EXEC_FUNCTIONS: &[&str] =
+    &["exec", "passthru", "shell_exec", "system", "proc_open", "popen", "pcntl_exec"];
+
+/// Functions the multi-tenant hardening preset disables on top of the
+/// shell-exec family. Each group closes a cross-tenant channel a
+/// hostile-PHP-userland pentest proved reachable in the shared-process ZTS
+/// model — see `site/content/guides/virtual-hosts.md`.
+const HARDENING_FUNCTIONS: &[&str] = &[
+    // pcntl process control: fork bomb + fd/secret inheritance in the child.
+    "pcntl_fork",
+    "pcntl_signal",
+    "pcntl_alarm",
+    "pcntl_wait",
+    "pcntl_waitpid",
+    "pcntl_async_signals",
+    "pcntl_signal_dispatch",
+    "pcntl_sigprocmask",
+    "pcntl_sigwaitinfo",
+    "pcntl_sigtimedwait",
+    // posix: signal/kill the shared process, or change its credentials.
+    "posix_kill",
+    "posix_setuid",
+    "posix_setgid",
+    "posix_seteuid",
+    "posix_setegid",
+    // Persistent raw sockets: `EG(persistent_list)` is keyed `host:port` with
+    // no tenant component, so a tenant reusing another's host:port inherits its
+    // live, authenticated socket.
+    "pfsockopen",
+    "fsockopen",
+    // SysV IPC: a global kernel namespace keyed by integer; one shared uid ⇒
+    // full cross-tenant read/write.
+    "shm_attach",
+    "shm_get_var",
+    "shm_put_var",
+    "shm_remove",
+    "shm_detach",
+    "shm_has_var",
+    "sem_get",
+    "sem_acquire",
+    "sem_release",
+    "sem_remove",
+    "msg_get_queue",
+    "msg_send",
+    "msg_receive",
+    "msg_remove_queue",
+    "msg_set_queue",
+    "msg_stat_queue",
+    // Runtime extension loading + mail relay from the shared identity.
+    "dl",
+    "mail",
+];
+
+/// OPcache functions the hardening preset disables regardless of cluster
+/// invalidation: a whole-cache flush (`opcache_reset`) and arbitrary-file
+/// compile (`opcache_compile_file`) are pure attack surface that ePHPm never
+/// calls from userland.
+const HARDENING_OPCACHE_ALWAYS: &[&str] = &["opcache_reset", "opcache_compile_file"];
+
+/// OPcache introspection/invalidation the preset additionally disables **only
+/// when `[opcache] cluster_invalidation` is off**. ePHPm's own cluster
+/// invalidator (`ephpm-server/src/opcache.rs`) looks these up in the function
+/// table, so they must stay callable when that feature is on.
+const HARDENING_OPCACHE_WHEN_NO_CLUSTER_INVALIDATION: &[&str] = &[
+    "opcache_invalidate",
+    "opcache_get_status",
+    "opcache_get_configuration",
+    "opcache_is_script_cached",
+];
+
+/// Sentinel `opcache.restrict_api` prefix — a path no tenant script can live
+/// under, so every remaining OPcache userland call is refused by PHP. Only
+/// emitted when ePHPm's own cluster invalidator does not need the API
+/// (`cluster_invalidation` off), because the directive's check keys on the
+/// executing script's path and would block ePHPm's invalidator too.
+const OPCACHE_RESTRICT_API_SENTINEL: &str = "/nonexistent/ephpm-opcache-api-disabled";
+
+/// Split every operator `disable_functions` entry in `ini_overrides` into
+/// individual, trimmed function names. Multiple entries (or a comma list)
+/// are all collected so the composed union below preserves every one.
+fn collect_operator_disable_functions(ini_overrides: &[[String; 2]]) -> Vec<String> {
+    let mut out = Vec::new();
+    for [k, v] in ini_overrides {
+        if k.trim().eq_ignore_ascii_case("disable_functions") {
+            for name in v.split(',') {
+                let name = name.trim();
+                if !name.is_empty() {
+                    out.push(name.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Case-insensitively append `name` to `ordered` if not already present.
+fn push_unique(
+    ordered: &mut Vec<String>,
+    seen: &mut std::collections::HashSet<String>,
+    name: &str,
+) {
+    let name = name.trim();
+    if !name.is_empty() && seen.insert(name.to_ascii_lowercase()) {
+        ordered.push(name.to_string());
+    }
+}
+
+/// Compose the effective `disable_functions` value as the UNION of any
+/// operator-supplied list and ePHPm's baseline, so an operator's additions
+/// (e.g. disabling `unserialize`) are never clobbered by ePHPm's own line.
+///
+/// - `include_shell` — add the shell-exec family (`disable_shell_exec`).
+/// - `include_hardening` — add the full multi-tenant hardening set.
+/// - `cluster_invalidation` — when `false`, also disable the OPcache
+///   introspection/invalidation functions that ePHPm otherwise needs.
+///
+/// Returns `None` when the union is empty (nothing to emit).
+fn compose_disable_functions(
+    operator: &[String],
+    include_shell: bool,
+    include_hardening: bool,
+    cluster_invalidation: bool,
+) -> Option<String> {
+    let mut ordered: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Operator list first: preserve their explicit intent and ordering.
+    for f in operator {
+        push_unique(&mut ordered, &mut seen, f);
+    }
+    if include_shell || include_hardening {
+        for f in SHELL_EXEC_FUNCTIONS {
+            push_unique(&mut ordered, &mut seen, f);
+        }
+    }
+    if include_hardening {
+        for f in HARDENING_FUNCTIONS {
+            push_unique(&mut ordered, &mut seen, f);
+        }
+        for f in HARDENING_OPCACHE_ALWAYS {
+            push_unique(&mut ordered, &mut seen, f);
+        }
+        if !cluster_invalidation {
+            for f in HARDENING_OPCACHE_WHEN_NO_CLUSTER_INVALIDATION {
+                push_unique(&mut ordered, &mut seen, f);
+            }
+        }
+    }
+
+    if ordered.is_empty() { None } else { Some(ordered.join(",")) }
+}
+
+/// Log, at startup, exactly what the multi-tenant hardening preset did — the
+/// denylist it added, the performance it cost, and any residual it could not
+/// close in this configuration. Never silent: an operator who relies on the
+/// preset must be able to see precisely what it bought them.
+fn log_multi_tenant_hardening(vhost_hardening: bool, cluster_invalidation: bool) {
+    if !vhost_hardening {
+        return;
+    }
+    tracing::info!(
+        "multi-tenant hardening ON: disabled pcntl_*/posix process control, \
+         pfsockopen/fsockopen, SysV shm_*/sem_*/msg_*, dl, mail, and \
+         opcache_reset/opcache_compile_file via disable_functions; \
+         mysqli.allow_persistent=0. Cost: persistent DB/socket connections are \
+         off (Redis pconnect, mysqli p:, pfsockopen). Disable with \
+         [server.security] multi_tenant_hardening = false."
+    );
+    if cluster_invalidation {
+        tracing::warn!(
+            "multi-tenant hardening: [opcache] cluster_invalidation is ON, so \
+             opcache_invalidate / opcache_get_status stay callable by tenants \
+             (ePHPm's own cluster invalidator needs them). Residual: a tenant \
+             can invalidate cached scripts and read aggregate OPcache metadata. \
+             opcache.restrict_api is NOT set for the same reason. Turn off \
+             cluster_invalidation to fully lock down the OPcache API."
+        );
+    } else {
+        tracing::info!(
+            "multi-tenant hardening: OPcache userland API fully locked down \
+             (opcache.restrict_api sentinel + opcache_invalidate/get_status/\
+             get_configuration/is_script_cached disabled)."
         );
     }
 }
@@ -868,6 +1062,22 @@ fn run_with_config(
     // along on the generated ini instead of the per-request ini hook.
     let vhost_disable_shell =
         config.server.sites_dir.is_some() && config.server.effective_disable_shell_exec();
+    // Multi-tenant hardening preset: in vhost mode, extend the denylist to the
+    // full set a hostile-tenant pentest proved closes every cross-tenant
+    // read/write channel (SysV IPC, persistent-socket inheritance, pcntl/posix
+    // process control, OPcache flush). Composed as a UNION with any operator
+    // `disable_functions` (never clobbered — see `compose_disable_functions`).
+    let vhost_hardening =
+        config.server.sites_dir.is_some() && config.server.effective_multi_tenant_hardening();
+    // ePHPm's own cluster OPcache invalidator (opcache.rs) calls the userland
+    // `opcache_get_status`/`opcache_invalidate` through the function table, so
+    // the hardening preset may only fully lock down the OPcache API
+    // (opcache.restrict_api + disabling those two) when cluster invalidation is
+    // OFF. When it is on, only the DoS-grade `opcache_reset`/`opcache_compile_file`
+    // are disabled and the residual is logged. Resolve it here so the ini
+    // builder and the startup log agree.
+    let cluster_invalidation =
+        config.opcache.effective_cluster_invalidation(config.cluster.enabled);
     // Always generate the ini in worker mode: log_errors must default On there
     // (see below) or a worker script that dies during boot leaves no
     // diagnostic anywhere — display_errors output is captured into a buffer
@@ -893,6 +1103,7 @@ fn run_with_config(
         || !config.php.ini_overrides.is_empty()
         || !config.php.extensions.is_empty()
         || vhost_disable_shell
+        || vhost_hardening
         || worker_mode
         || cfg!(php_max_exec_timers);
 
@@ -940,14 +1151,40 @@ fn run_with_config(
             {
                 let _ = writeln!(content, "max_execution_time={}", config.php.max_execution_time);
             }
+            // Emit every operator `ini_overrides` line EXCEPT `disable_functions`:
+            // that one is folded into the composed union below so an operator's
+            // additions can never be clobbered by ePHPm's baseline (PHP ini is
+            // last-wins, and historically ePHPm appended its own
+            // `disable_functions` line last — silently discarding the operator's).
             for [k, v] in &config.php.ini_overrides {
+                if k.trim().eq_ignore_ascii_case("disable_functions") {
+                    continue;
+                }
                 let _ = writeln!(content, "{k}={v}");
             }
-            if vhost_disable_shell {
-                let _ = writeln!(
-                    content,
-                    "disable_functions=exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec"
-                );
+            // Compose the effective `disable_functions` as the UNION of ePHPm's
+            // baseline (shell family when disable_shell_exec is on, plus the
+            // full hardening set when the preset is on) and any operator list.
+            let operator_df = collect_operator_disable_functions(&config.php.ini_overrides);
+            if let Some(df) = compose_disable_functions(
+                &operator_df,
+                vhost_disable_shell,
+                vhost_hardening,
+                cluster_invalidation,
+            ) {
+                let _ = writeln!(content, "disable_functions={df}");
+            }
+            // Extra hardening ini (multi-tenant preset only). mysqli persistent
+            // handles are keyed without a tenant component, so disable them; and
+            // point the OPcache userland API at an unreachable sentinel so a
+            // tenant cannot reset/inspect the shared cache — but only when
+            // ePHPm's own cluster invalidator does not itself need that API.
+            if vhost_hardening {
+                let _ = writeln!(content, "mysqli.allow_persistent=0");
+                if !cluster_invalidation {
+                    let _ =
+                        writeln!(content, "opcache.restrict_api={OPCACHE_RESTRICT_API_SENTINEL}");
+                }
             }
             // This file inlines the operator's entire `[php] ini_file` plus
             // every `ini_override`, and PHP reads it back during MINIT — as
@@ -999,6 +1236,10 @@ fn run_with_config(
         } else {
             (config.php.ini_file.clone(), None)
         };
+
+    // Surface exactly what the multi-tenant hardening preset did (or its
+    // residual when cluster invalidation forces the OPcache API to stay open).
+    log_multi_tenant_hardening(vhost_hardening, cluster_invalidation);
 
     // Resource-aware autotuning: log the detected CPU/memory budget and the
     // derived (or explicitly-pinned) PHP/OPcache profile at INFO. Trust
@@ -1606,6 +1847,96 @@ fn resolve_target(site: Option<&str>, all: bool) -> anyhow::Result<String> {
         }
         (None, true) => Ok(OPCACHE_BROADCAST_VHOST.to_string()),
         (None, false) => Ok(OPCACHE_DEFAULT_VHOST.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod disable_functions_tests {
+    use super::*;
+
+    fn ov(pairs: &[(&str, &str)]) -> Vec<[String; 2]> {
+        pairs.iter().map(|(k, v)| [(*k).to_string(), (*v).to_string()]).collect()
+    }
+
+    #[test]
+    fn nothing_to_emit_without_operator_or_baseline() {
+        assert_eq!(compose_disable_functions(&[], false, false, false), None);
+    }
+
+    #[test]
+    fn shell_only_matches_legacy_line() {
+        let df = compose_disable_functions(&[], true, false, false).unwrap();
+        assert_eq!(df, "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec");
+    }
+
+    #[test]
+    fn operator_additions_are_unioned_not_clobbered() {
+        // Bug 1: an operator disabling pcntl_fork alongside disable_shell_exec
+        // must keep BOTH blocked. The old code appended the shell line last and
+        // PHP last-wins discarded the operator's list.
+        let operator = collect_operator_disable_functions(&ov(&[(
+            "disable_functions",
+            "pcntl_fork,mkdir_helper",
+        )]));
+        let df = compose_disable_functions(&operator, true, false, false).unwrap();
+        // Operator entries come first and survive.
+        assert!(df.starts_with("pcntl_fork,mkdir_helper,"));
+        // Shell baseline is still present.
+        assert!(df.split(',').any(|f| f == "system"));
+        assert!(df.split(',').any(|f| f == "pcntl_fork"));
+    }
+
+    #[test]
+    fn hardening_adds_the_proven_channels() {
+        let df = compose_disable_functions(&[], true, true, false).unwrap();
+        for expected in [
+            "system",        // shell family
+            "pcntl_fork",    // pcntl
+            "posix_kill",    // posix process control
+            "pfsockopen",    // persistent socket inheritance
+            "shm_attach",    // SysV shm
+            "sem_get",       // SysV sem
+            "msg_send",      // SysV msg
+            "opcache_reset", // opcache flush
+            "dl",
+            "mail",
+        ] {
+            assert!(df.split(',').any(|f| f == expected), "missing {expected} in {df}");
+        }
+    }
+
+    #[test]
+    fn cluster_invalidation_keeps_opcache_introspection_callable() {
+        // With cluster invalidation ON, ePHPm needs opcache_invalidate/status,
+        // so they must NOT be in the denylist — but opcache_reset always is.
+        let on = compose_disable_functions(&[], true, true, true).unwrap();
+        assert!(on.split(',').any(|f| f == "opcache_reset"));
+        assert!(!on.split(',').any(|f| f == "opcache_invalidate"));
+        assert!(!on.split(',').any(|f| f == "opcache_get_status"));
+
+        // With it OFF, they are disabled too.
+        let off = compose_disable_functions(&[], true, true, false).unwrap();
+        assert!(off.split(',').any(|f| f == "opcache_invalidate"));
+        assert!(off.split(',').any(|f| f == "opcache_get_status"));
+    }
+
+    #[test]
+    fn duplicate_names_are_deduplicated_case_insensitively() {
+        let operator =
+            collect_operator_disable_functions(&ov(&[("disable_functions", "System, PCNTL_FORK")]));
+        let df = compose_disable_functions(&operator, true, true, false).unwrap();
+        assert_eq!(df.split(',').filter(|f| f.eq_ignore_ascii_case("system")).count(), 1);
+        assert_eq!(df.split(',').filter(|f| f.eq_ignore_ascii_case("pcntl_fork")).count(), 1);
+    }
+
+    #[test]
+    fn collect_splits_and_trims_multiple_entries() {
+        let out = collect_operator_disable_functions(&ov(&[
+            ("display_errors", "Off"),
+            ("disable_functions", " a , b "),
+            ("disable_functions", "c"),
+        ]));
+        assert_eq!(out, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
     }
 }
 

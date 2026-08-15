@@ -670,6 +670,7 @@ trusted_hosts = [
     "kv-smoke.test",
     "kv-a.test",
     "kv-b.test",
+    "harden.test",
 ]
 
 [server.response]
@@ -707,6 +708,11 @@ memory_limit = "128M"
 ini_overrides = [
     ["display_errors", "On"],
     ["error_reporting", "E_ALL"],
+    # Operator-supplied denylist entry. With multi_tenant_hardening on (default
+    # in this multi-tenant node), the effective disable_functions must be the
+    # UNION of this and ePHPm's baseline — getmypid stays disabled AND the
+    # hardening set applies. Proves the clobber fix (see multitenant_hardening.rs).
+    ["disable_functions", "getmypid"],
 ]
 {PHP_WORKER_BLOCK}
 

@@ -62,6 +62,12 @@ opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 
+# Privilege drop ([server] run_as_user/run_as_group): setgroups/setgid/setuid
+# and getpwnam/getgrnam name resolution live behind libc on Unix. No-op on
+# other targets (the privdrop module compiles to a warn-only stub there).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 # OTLP trace export: `tracing` spans (http.request / worker.queue_wait /
 # php.execute) shipped to an OpenTelemetry collector over OTLP http/protobuf.
