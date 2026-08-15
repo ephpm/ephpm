@@ -110,8 +110,21 @@ const ISOLATED_DB_SUITES: &[&str] = &[
 /// nothing in the repo ever set `EPHPM_WORKER_URL`, so all of
 /// `crates/ephpm-e2e/tests/worker_mode.rs` self-skipped in every lane —
 /// worker mode had zero end-to-end coverage.
+///
+/// `multitenant_hardening` needs `[server.security] multi_tenant_hardening`
+/// resolved ON, which is a WHOLE-SERVER switch: with it on (and `sites_dir`
+/// set) ePHPm rewrites the generated php.ini to disable `opcache_get_status`/
+/// `opcache_invalidate` (single-node has no `cluster_invalidation`) and points
+/// `opcache.restrict_api` at a sentinel — both make `opcache_get_status()`
+/// return false. That is exactly what the shared node must NOT do, or the
+/// `php_config` suite's `opcache_is_enabled_over_http` (which shares that node)
+/// fails. So hardening gets its OWN node: `sites_dir` set (multi-tenant, which
+/// resolves hardening on), the `harden.test` vhost, and the operator's
+/// `disable_functions = getmypid` override, so `multitenant_hardening.rs` still
+/// proves the union/clobber fix. The shared node keeps hardening explicitly
+/// OFF (see `SingleNodeOptions::shared`).
 const ISOLATED_CONFIG_SUITES: &[&str] =
-    &["opcache_invalidation", "rate_limit", "middleware", "worker_mode"];
+    &["opcache_invalidation", "rate_limit", "middleware", "worker_mode", "multitenant_hardening"];
 
 /// Suites that run single-threaded (a superset of the DB suites). Kept as a
 /// helper so `run_suite` can pick the right `--test-threads` value.
@@ -609,6 +622,9 @@ fn recreate_dir(path: &Path) -> io::Result<()> {
 /// [`SingleNodeOptions::with_sites_dir`]), `{KV_SECRET_LINE}` (a `[kv] secret`
 /// line, or empty), `{OPCACHE_BLOCK}` (an optional `[opcache]` section, or
 /// empty), `{MIDDLEWARE_BLOCK}` (an optional `[[middleware]]` mount, or empty),
+/// `{MTH_LINE}` (the `multi_tenant_hardening = <bool>` line in
+/// `[server.security]`), `{INI_OVERRIDES_EXTRA}` (extra `[php] ini_overrides`
+/// rows — the hardening node's operator `disable_functions`, or empty),
 /// `{KV_SOCKET}`.
 ///
 /// Shape mirrors `tests/ephpm-test.toml` (the config baked into the container
@@ -670,6 +686,8 @@ trusted_hosts = [
     "kv-smoke.test",
     "kv-a.test",
     "kv-b.test",
+    # Consumed only by the isolated `multitenant_hardening` node (which renders
+    # from this same template); inert on every other node.
     "harden.test",
 ]
 
@@ -701,18 +719,14 @@ enabled = true
 blocked_paths = ["/vendor/*"]
 open_basedir = true
 disable_shell_exec = true
+{MTH_LINE}
 
 [php]
 max_execution_time = 30
 memory_limit = "128M"
 ini_overrides = [
     ["display_errors", "On"],
-    ["error_reporting", "E_ALL"],
-    # Operator-supplied denylist entry. With multi_tenant_hardening on (default
-    # in this multi-tenant node), the effective disable_functions must be the
-    # UNION of this and ePHPm's baseline — getmypid stays disabled AND the
-    # hardening set applies. Proves the clobber fix (see multitenant_hardening.rs).
-    ["disable_functions", "getmypid"],
+    ["error_reporting", "E_ALL"],{INI_OVERRIDES_EXTRA}
 ]
 {PHP_WORKER_BLOCK}
 
@@ -848,6 +862,17 @@ struct SingleNodeOptions {
     /// suite; implies `with_sites_dir = false` (the combination hard-errors at
     /// config load) and the `tests/worker-docroot` document root.
     worker: bool,
+    /// Turn the multi-tenant hardening preset ON for this node.
+    ///
+    /// Only the `multitenant_hardening` suite sets it. It does two coupled
+    /// things the hardening test needs and every other node must NOT have:
+    /// emits `[server.security] multi_tenant_hardening = true` (which, with
+    /// `sites_dir` set, disables the OPcache introspection API — the very
+    /// thing the `php_config` suite depends on, so the shared node keeps it
+    /// off) and adds the operator's `disable_functions = getmypid` override to
+    /// `[php] ini_overrides` so the suite can prove the clobber-union fix.
+    /// Implies `with_sites_dir = true` (hardening is inert without it).
+    multi_tenant_hardening: bool,
 }
 
 impl SingleNodeOptions {
@@ -863,6 +888,12 @@ impl SingleNodeOptions {
             tight_rate_limit: false,
             middleware_lib: None,
             worker: false,
+            // Hardening is EXPLICITLY off here even though `sites_dir` is set
+            // (which would otherwise resolve it on). The shared node hosts
+            // `php_config`, whose opcache introspection test breaks under the
+            // preset. Hardening coverage lives on the isolated
+            // `multitenant_hardening` node instead.
+            multi_tenant_hardening: false,
         }
     }
 
@@ -881,6 +912,24 @@ impl SingleNodeOptions {
                 tight_rate_limit: false,
                 middleware_lib: None,
                 worker: false,
+                multi_tenant_hardening: false,
+            },
+            // multitenant_hardening: the ONLY isolated node that runs
+            // multi-tenant (sites_dir set) AND with the hardening preset on.
+            // sites_dir gives it EPHPM_SITES_DIR (the suite deploys the
+            // `harden.test` vhost into it) and resolves hardening on; the flag
+            // additionally injects the operator's `disable_functions=getmypid`
+            // override so the union/clobber fix is exercised. Kept off the
+            // shared node because the preset disables opcache introspection,
+            // which `php_config` asserts is live.
+            "multitenant_hardening" => Self {
+                slug,
+                with_sites_dir: true,
+                opcache_invalidation: false,
+                tight_rate_limit: false,
+                middleware_lib: None,
+                worker: false,
+                multi_tenant_hardening: true,
             },
             // worker_mode: persistent worker pool over tests/worker-docroot.
             // sites_dir MUST stay off — worker mode + sites_dir is rejected at
@@ -892,6 +941,7 @@ impl SingleNodeOptions {
                 tight_rate_limit: false,
                 middleware_lib: None,
                 worker: true,
+                multi_tenant_hardening: false,
             },
             // rate_limit: small bucket, on its own node. See
             // ISOLATED_CONFIG_SUITES for why this can't share the shared node.
@@ -902,6 +952,7 @@ impl SingleNodeOptions {
                 tight_rate_limit: true,
                 middleware_lib: None,
                 worker: false,
+                multi_tenant_hardening: false,
             },
             // middleware: mount the freshly built cors cdylib by explicit
             // path, exercising the dlopen lane in a real server.
@@ -912,6 +963,7 @@ impl SingleNodeOptions {
                 tight_rate_limit: false,
                 middleware_lib: middleware_lib.map(Path::to_path_buf),
                 worker: false,
+                multi_tenant_hardening: false,
             },
             // DB suites: fresh DB, single-site. `sites_dir` is NOT optional
             // detail here — it would put the node in per-site database mode,
@@ -926,6 +978,7 @@ impl SingleNodeOptions {
                 tight_rate_limit: false,
                 middleware_lib: None,
                 worker: false,
+                multi_tenant_hardening: false,
             },
         }
     }
@@ -1007,6 +1060,26 @@ impl SingleNodeSpawn {
         } else {
             String::new()
         };
+        // Multi-tenant hardening: ON only for the `multitenant_hardening`
+        // suite's node. Everywhere else it is EXPLICITLY off, so the preset
+        // never disables OPcache introspection on a node another suite shares.
+        // The `false` line is inert on non-`sites_dir` nodes but load-bearing
+        // on the shared node — that node sets `sites_dir`, so an unset value
+        // would resolve the preset ON and break `php_config`'s opcache test.
+        let mth_line = if opts.multi_tenant_hardening {
+            "multi_tenant_hardening = true"
+        } else {
+            "multi_tenant_hardening = false"
+        };
+        // Operator-supplied `disable_functions` entry, added to the hardening
+        // node ONLY. multitenant_hardening.rs asserts getmypid stays disabled
+        // *alongside* the hardening baseline (the union/clobber fix). Emitting
+        // it on other nodes would strip getmypid from suites that never opt in.
+        let ini_overrides_extra = if opts.multi_tenant_hardening {
+            "\n    [\"disable_functions\", \"getmypid\"],"
+        } else {
+            ""
+        };
         // Only the rate_limit suite runs a bucket small enough to trip. Every
         // other node gets a budget large enough that the whole suite's traffic
         // never reaches it, which is what stops the spurious 429s.
@@ -1087,6 +1160,8 @@ impl SingleNodeSpawn {
             .replace("{OPCACHE_BLOCK}", &opcache_block)
             .replace("{MIDDLEWARE_BLOCK}", &middleware_block)
             .replace("{LIMITS_BLOCK}", limits_block)
+            .replace("{MTH_LINE}", mth_line)
+            .replace("{INI_OVERRIDES_EXTRA}", ini_overrides_extra)
             .replace("{PHP_WORKER_BLOCK}", php_worker_block)
             .replace("{KV_SOCKET}", &escape_toml(&kv_socket))
             .replace("{DOCROOT}", &escape_toml(docroot));
