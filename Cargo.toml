@@ -109,7 +109,27 @@ ephpm-server = { path = "crates/ephpm-server" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire main @ b16d874b — per-connection backend selection (litewire#27).
+# litewire main @ cb707ab9 — WordPress wire-fidelity fixes (litewire#28–#31).
+# Four things, all surfaced by running real WordPress over the MySQL frontend:
+# (1) litewire#28: unparseable/unsupported client commands no longer get a
+# default OK packet from opensrv-mysql's fallthrough — an OK of the wrong
+# shape desynced persistent connections (the client attributed the stray
+# packet to its NEXT command and every later response was off by one).
+# (2) litewire#29: REGEXP / NOT REGEXP and YEAR()/MONTH()/DAYOFMONTH() are
+# translated to SQLite equivalents — WordPress core uses these in date
+# archives and wp_posts date queries.
+# (3) litewire#30: one server version string for the handshake, VERSION() and
+# @@version — they previously disagreed, and WordPress Site Health / wpdb
+# read VERSION() to decide utf8mb4 support.
+# (4) litewire#31: MySQL errno fidelity — no-such-table maps to 1146 (was a
+# generic error) and duplicate-key 1062 carries a MySQL-shaped message, so
+# wpdb/plugin code that matches on errno or message text behaves.
+# Strictly additive on the wire path: no dependency or feature changes, and
+# opensrv-mysql keeps its default features, so the CLIENT_SSL analysis in the
+# b16d874b entry below still holds (litewire#32 tracks pinning that property
+# upstream; still open at this bump).
+#
+# Previous pin b16d874b — per-connection backend selection (litewire#27).
 # Adds `LiteWire::with_authenticator` + the `ConnectionAuthenticator` trait,
 # which is what lets ONE MySQL listener front many per-site databases: the
 # backend is resolved during the handshake from the *authenticated* username,
@@ -240,7 +260,7 @@ ephpm-server = { path = "crates/ephpm-server" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "b16d874b73a3", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "cb707ab98428", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.0)

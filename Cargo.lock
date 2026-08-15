@@ -1459,6 +1459,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ipnet",
+ "libc",
  "libloading",
  "litewire",
  "metrics",
@@ -2147,7 +2148,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tokio",
  "tower-service",
  "tracing",
@@ -2619,7 +2620,7 @@ checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 [[package]]
 name = "litewire"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
+source = "git+https://github.com/ephpm/litewire.git?rev=cb707ab98428#cb707ab98428821eaecdffe33fe3d25e834770dc"
 dependencies = [
  "anyhow",
  "futures",
@@ -2638,10 +2639,11 @@ dependencies = [
 [[package]]
 name = "litewire-backend"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
+source = "git+https://github.com/ephpm/litewire.git?rev=cb707ab98428#cb707ab98428821eaecdffe33fe3d25e834770dc"
 dependencies = [
  "async-trait",
  "parking_lot",
+ "regex",
  "rusqlite",
  "thiserror 2.0.18",
  "tokio",
@@ -2651,7 +2653,7 @@ dependencies = [
 [[package]]
 name = "litewire-hrana"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
+source = "git+https://github.com/ephpm/litewire.git?rev=cb707ab98428#cb707ab98428821eaecdffe33fe3d25e834770dc"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2666,7 +2668,7 @@ dependencies = [
 [[package]]
 name = "litewire-mysql"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
+source = "git+https://github.com/ephpm/litewire.git?rev=cb707ab98428#cb707ab98428821eaecdffe33fe3d25e834770dc"
 dependencies = [
  "async-trait",
  "getrandom 0.3.4",
@@ -2683,7 +2685,7 @@ dependencies = [
 [[package]]
 name = "litewire-postgres"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
+source = "git+https://github.com/ephpm/litewire.git?rev=cb707ab98428#cb707ab98428821eaecdffe33fe3d25e834770dc"
 dependencies = [
  "async-trait",
  "futures",
@@ -2698,7 +2700,7 @@ dependencies = [
 [[package]]
 name = "litewire-session"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
+source = "git+https://github.com/ephpm/litewire.git?rev=cb707ab98428#cb707ab98428821eaecdffe33fe3d25e834770dc"
 dependencies = [
  "litewire-backend",
  "litewire-translate",
@@ -2709,7 +2711,7 @@ dependencies = [
 [[package]]
 name = "litewire-tds"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
+source = "git+https://github.com/ephpm/litewire.git?rev=cb707ab98428#cb707ab98428821eaecdffe33fe3d25e834770dc"
 dependencies = [
  "bytes",
  "litewire-backend",
@@ -2722,7 +2724,7 @@ dependencies = [
 [[package]]
 name = "litewire-translate"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
+source = "git+https://github.com/ephpm/litewire.git?rev=cb707ab98428#cb707ab98428821eaecdffe33fe3d25e834770dc"
 dependencies = [
  "lru 0.12.5",
  "parking_lot",
@@ -2734,7 +2736,7 @@ dependencies = [
 [[package]]
 name = "litewire-turso"
 version = "0.1.0"
-source = "git+https://github.com/ephpm/litewire.git?rev=b16d874b73a3#b16d874b73a376d634e3324fc31405c806489240"
+source = "git+https://github.com/ephpm/litewire.git?rev=cb707ab98428#cb707ab98428821eaecdffe33fe3d25e834770dc"
 dependencies = [
  "async-trait",
  "litewire-backend",
@@ -3686,7 +3688,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.1",
  "rustls 0.23.37",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3723,7 +3725,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.59.0",
 ]
