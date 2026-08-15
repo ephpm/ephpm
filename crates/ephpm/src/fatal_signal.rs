@@ -123,6 +123,28 @@ pub fn install_thread_altstack() {
     unix::install_thread_altstack();
 }
 
+/// Register a stack-overflow crash-containment hook.
+///
+/// The hook is called **first** for every `SIGSEGV`/`SIGBUS`, before any
+/// diagnostic, chaining, or die work — with the faulting address
+/// (`siginfo_t.si_addr`). When the fault is a stack overflow inside a guarded
+/// PHP request the hook recovers via `siglongjmp` and never returns; otherwise
+/// it returns and the handler falls through to its normal report-and-die path,
+/// so a genuine fatal (heap corruption, null deref, a fault outside a guarded
+/// request) still dies with a diagnostic and an unchanged wait status.
+///
+/// The hook **must** be async-signal-safe: it runs in a signal handler that may
+/// be executing on an alternate stack after a stack-overflow fault. ePHPm wires
+/// [`ephpm_php::crash_guard::recover_hook`] here.
+///
+/// Idempotent-ish: the last registration wins. On Windows this is a no-op.
+pub fn set_recover_hook(hook: unsafe extern "C" fn(usize) -> i32) {
+    #[cfg(unix)]
+    unix::set_recover_hook(hook);
+    #[cfg(not(unix))]
+    let _ = hook;
+}
+
 #[cfg(unix)]
 mod unix {
     use std::cell::RefCell;
@@ -261,6 +283,16 @@ mod unix {
 
     /// Installed exactly once.
     static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    /// Stack-overflow crash-containment hook, as a raw
+    /// `unsafe extern "C" fn(usize) -> i32` address (`0` = none). Consulted
+    /// first thing in [`handler`] for SIGSEGV/SIGBUS. An atomic rather than a
+    /// lock because it is read from a signal handler.
+    static RECOVER_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+    pub(super) fn set_recover_hook(hook: unsafe extern "C" fn(usize) -> i32) {
+        RECOVER_HOOK.store(hook as usize, Ordering::SeqCst);
+    }
 
     /// Captured return addresses. A `static` rather than a local so the
     /// handler's own frame stays small enough for a cramped alternate stack;
@@ -476,6 +508,30 @@ mod unix {
     /// terminates the process, or [`die`] re-raises with the default
     /// disposition.
     extern "C" fn handler(sig: c_int, info: *mut siginfo_t, ctx: *mut c_void) {
+        // Stack-overflow crash containment, first thing: give a registered hook
+        // the faulting address for SIGSEGV/SIGBUS. When the fault is a stack
+        // overflow inside a guarded PHP request the hook siglongjmps back into
+        // that request and never returns here; otherwise it returns and we fall
+        // through to the normal report-and-die path below. Checked before the
+        // OWNER gate so a contained fault never touches the shared handler
+        // state and cannot interfere with a concurrent genuine fatal on another
+        // thread.
+        if matches!(sig, libc::SIGSEGV | libc::SIGBUS) && !info.is_null() {
+            let hook = RECOVER_HOOK.load(Ordering::Acquire);
+            if hook != 0 {
+                // SAFETY: `RECOVER_HOOK` holds a valid
+                // `unsafe extern "C" fn(usize) -> i32` installed by
+                // `set_recover_hook`, contractually async-signal-safe. It may
+                // not return (it siglongjmps on a contained stack overflow),
+                // which is why nothing above it has taken a lock or claimed the
+                // OWNER gate yet.
+                let hook: unsafe extern "C" fn(usize) -> i32 = unsafe {
+                    std::mem::transmute::<usize, unsafe extern "C" fn(usize) -> i32>(hook)
+                };
+                unsafe { hook(fault_addr(info)) };
+            }
+        }
+
         let me = thread_id().wrapping_add(1);
 
         match OWNER.compare_exchange(0, me, Ordering::SeqCst, Ordering::SeqCst) {

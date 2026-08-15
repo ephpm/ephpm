@@ -14,12 +14,24 @@ fn main() {
     println!("cargo::rerun-if-changed=wrapper.h");
     println!("cargo::rerun-if-changed=ephpm_wrapper.c");
     println!("cargo::rerun-if-changed=resolver_shim.c");
+    println!("cargo::rerun-if-changed=crash_guard.c");
     println!("cargo::rerun-if-env-changed=PHP_SDK_PATH");
 
     println!(
         "cargo::warning=ephpm-php build.rs running. PHP_SDK_PATH={:?}",
         env::var_os("PHP_SDK_PATH")
     );
+
+    // The stack-overflow crash-containment shim is pure libc (no PHP headers),
+    // so it is compiled on every Unix build — stub AND php_linked — which lets
+    // the mechanism be unit-tested without libphp.
+    let target_family = env::var("CARGO_CFG_TARGET_FAMILY").unwrap_or_default();
+    if target_family == "unix" {
+        cc::Build::new()
+            .file("crash_guard.c")
+            .define("_GNU_SOURCE", None)
+            .compile("ephpm_crash_guard");
+    }
 
     let Some(sdk_path) = env::var_os("PHP_SDK_PATH").map(PathBuf::from) else {
         // No PHP SDK available — build in stub mode.

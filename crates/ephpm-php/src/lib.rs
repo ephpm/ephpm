@@ -2,6 +2,7 @@
 // are documented with comments before each unsafe block.
 #![allow(unsafe_code)]
 
+pub mod crash_guard;
 pub mod db_bridge;
 pub mod kv_bridge;
 pub mod request;
@@ -238,6 +239,37 @@ thread_local! {
         const { ThreadPhpGuard { registered: std::cell::Cell::new(false) } };
 }
 
+#[cfg(php_linked)]
+thread_local! {
+    /// Latched once this thread has contained a stack-overflow crash. Its Zend
+    /// context is then poisoned (the recovery `siglongjmp`ed out mid-object-
+    /// destruction, leaving the per-thread ZMM free lists and
+    /// `EG(objects_store)` inconsistent), so the thread must never run PHP
+    /// again and must never be torn down through `php_request_shutdown` /
+    /// `ts_free_thread`.
+    static THREAD_POISONED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark the current thread poisoned after a contained crash.
+///
+/// Latches the poison flag (so [`PhpRuntime::execute`] refuses further PHP on
+/// this thread) and disarms the [`ThreadPhpGuard`] so thread exit does NOT run
+/// `ephpm_thread_shutdown()` — its `php_request_shutdown` + `ts_free_thread`
+/// walk the poisoned heap and would re-crash. The poisoned per-thread Zend
+/// state is deliberately leaked (a bounded, measured leak per contained crash);
+/// abandoning it is the only safe option.
+#[cfg(php_linked)]
+fn mark_thread_poisoned() {
+    THREAD_POISONED.with(|p| p.set(true));
+    THREAD_REGISTERED.with(|g| g.registered.set(false));
+}
+
+/// Whether the current thread has contained a crash and must not run PHP.
+#[cfg(php_linked)]
+fn is_thread_poisoned() -> bool {
+    THREAD_POISONED.with(std::cell::Cell::get)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PhpError {
     /// PHP module initialization (`php_embed_init`) failed.
@@ -273,6 +305,16 @@ pub enum PhpError {
     /// exception, which unwinds cleanly and yields a complete response.
     #[error("PHP script bailed out (truncated response discarded): {0}")]
     Bailout(String),
+
+    /// A request overflowed the C stack — a deep object-graph free
+    /// (`zend_object_std_dtor` <-> `zend_objects_store_del` recursion) — and
+    /// the crash guard contained it instead of the process aborting. The
+    /// partial response is discarded and answered 500, and the thread that ran
+    /// it is poisoned and retired from PHP service (see
+    /// [`crate::crash_guard`]). Distinct from [`Self::Bailout`]: the fault was a
+    /// hardware SIGSEGV recovered via `siglongjmp`, not a PHP-level bailout.
+    #[error("PHP request contained after a C-stack overflow (thread retired): {0}")]
+    Contained(String),
 }
 
 /// The `EPHPM_EXEC_*` return codes of `ephpm_execute_request` (defined in
@@ -634,6 +676,16 @@ impl PhpRuntime {
             return Err(PhpError::NotInitialized);
         }
 
+        // A thread that contained a prior crash has a poisoned Zend context and
+        // must never run PHP again. Refuse before touching TSRM. (In the tokio
+        // blocking-pool model this thread can still be handed future requests,
+        // which then fail 500 — the structural limitation the crash-containment
+        // design notes call out; a bespoke pool would remove it from rotation.)
+        #[cfg(php_linked)]
+        if is_thread_poisoned() {
+            return Err(PhpError::Contained("worker thread retired after a prior crash".into()));
+        }
+
         #[cfg(php_linked)]
         Self::ensure_thread_registered()?;
 
@@ -777,11 +829,47 @@ impl PhpRuntime {
             }
         }
 
-        // Execute the PHP request on this thread's TSRM context.
-        // SAFETY: This thread is registered with TSRM. All PHP globals
-        // accessed by ephpm_execute_request are thread-local under ZTS.
-        // The C function uses setjmp/longjmp bailout protection.
-        let ret = unsafe { ffi::ephpm_execute_request(script_filename.as_ptr()) };
+        // Execute the PHP request inside the stack-overflow crash-containment
+        // guard. The recovery point wraps the whole ephpm_execute_request call,
+        // so a C-stack overflow during object destruction — the script's own
+        // (`$x = null` on a deep graph), the lazy php_request_shutdown of the
+        // previous request at the top of ephpm_execute_request, or a shutdown
+        // function — is contained here instead of aborting the process.
+        let filename_ptr = script_filename.as_ptr();
+        let mut ret: std::os::raw::c_int = exec_code::BAILOUT;
+        let guarded = crash_guard::run_guarded(|| {
+            // SAFETY: This thread is registered with TSRM. All PHP globals
+            // accessed by ephpm_execute_request are thread-local under ZTS. The
+            // C function uses setjmp/longjmp bailout protection for PHP-level
+            // bailouts; a hardware stack-overflow SIGSEGV escapes that and is
+            // caught by the crash guard's signal-handler recovery instead.
+            ret = unsafe { ffi::ephpm_execute_request(filename_ptr) };
+        });
+
+        if guarded == crash_guard::Guarded::Contained {
+            // The recovery jumped out mid-object-destruction: this thread's ZMM
+            // free lists and EG(objects_store) are inconsistent. The damage is
+            // confined to THIS thread, but it must never run PHP again nor be
+            // torn down through php_request_shutdown / ts_free_thread (both walk
+            // the poisoned heap and would re-crash). mark_thread_poisoned()
+            // latches the refusal and disarms the TLS retirement guard; the
+            // poisoned Zend context is deliberately leaked.
+            mark_thread_poisoned();
+            tracing::error!(
+                script = %request.script_filename.display(),
+                method = %request.method,
+                uri = %request.uri,
+                "PHP request overflowed the C stack (deep object-graph free) — \
+                 contained on this thread, returning 500; thread retired from \
+                 PHP service"
+            );
+            return Err(PhpError::Contained(format!(
+                "{} ({} {})",
+                request.script_filename.display(),
+                request.method,
+                request.uri
+            )));
+        }
 
         // Retrieve the captured response from C
         let body = {
