@@ -2,6 +2,7 @@ pub mod acme;
 pub mod body;
 pub mod db_health;
 pub mod file_cache;
+pub mod fpm_pool;
 pub mod http3;
 mod idle;
 pub mod metrics;
@@ -568,6 +569,13 @@ async fn bind_listeners(
             );
         }
 
+        if config.php.fpm_engine == ephpm_config::FpmEngine::Pool {
+            tracing::warn!(
+                "[php] fpm_engine = \"pool\" is ignored in worker mode — the \
+                 persistent worker pool already owns concurrency here"
+            );
+        }
+
         // Windows / NTS: a single PHP context, so force one worker (design §6.1).
         let (mut worker_count, wc_source) = config.php.effective_worker_count_with_source();
         match wc_source {
@@ -910,6 +918,14 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         pool.drain();
     }
 
+    // FPM pool engine (`[php] fpm_engine = "pool"`): same contract — close the
+    // dispatch queue so pool threads finish any in-flight request and exit.
+    // Mutually exclusive with `worker_pool` (pool engine is fpm-mode only).
+    let fpm_pool = router.fpm_pool();
+    if let Some(pool) = &fpm_pool {
+        pool.drain();
+    }
+
     // Graceful shutdown: wait for in-flight connections to drain.
     let active = in_flight.load(Ordering::Relaxed);
     if active > 0 {
@@ -957,6 +973,29 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
                     live_workers = live,
                     "shutdown timeout reached with worker threads still live — \
                      PHP teardown may be unsafe if a worker is wedged mid-request"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    // FPM pool engine: same #266 wait — `live` reaches 0 only after every pool
+    // thread has released its TSRM slot (worker_thread_shutdown), so
+    // php_embed_shutdown() is safe once it does.
+    if let Some(pool) = &fpm_pool {
+        let deadline = tokio::time::Instant::now() + shutdown_timeout;
+        loop {
+            let live = pool.live_count();
+            if live == 0 {
+                tracing::info!("all fpm pool threads retired");
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    live_threads = live,
+                    "shutdown timeout reached with fpm pool threads still live — \
+                     PHP teardown may be unsafe if a thread is wedged mid-request"
                 );
                 break;
             }

@@ -369,6 +369,13 @@ pub struct Router {
     /// When set, PHP requests are dispatched to the pool instead of running on
     /// the `spawn_blocking` path.
     worker_pool: Option<Arc<crate::worker_pool::WorkerPool>>,
+    /// Dedicated FPM execution pool when `[php] fpm_engine = "pool"` (fpm mode
+    /// only). `None` on the default `spawn_blocking` engine and in worker mode.
+    /// When set, per-request PHP execution is dispatched to this pool instead of
+    /// tokio's `spawn_blocking`, and the `php_semaphore` cap is bypassed (the
+    /// pool size is the cap). Built in [`Router::new`]; drained on shutdown via
+    /// [`Router::fpm_pool`].
+    fpm_pool: Option<Arc<crate::fpm_pool::FpmPool>>,
     /// Request-body size (bytes) at/above which worker mode streams the body
     /// instead of buffering it (Phase 3). See `[php] worker_stream_threshold`.
     worker_stream_threshold: u64,
@@ -681,7 +688,30 @@ impl Router {
             &config.server.fallback,
         );
 
-        let php_semaphore = (config.php.workers > 0)
+        // Experimental dedicated FPM thread pool (`[php] fpm_engine = "pool"`,
+        // fpm mode only). The pool size IS the concurrency cap for this engine,
+        // so the `workers` semaphore below is redundant and deliberately
+        // bypassed. `is_pool_engine()` is already false in worker mode, so the
+        // worker pool and this pool can never both be active.
+        let fpm_pool = if config.php.is_pool_engine() {
+            let thread_count = config.php.effective_worker_count();
+            let backlog = config.php.effective_worker_backlog();
+            if config.php.workers > 0 {
+                tracing::warn!(
+                    workers = config.php.workers,
+                    "[php] workers is ignored when [php] fpm_engine = \"pool\" — the pool \
+                     size ({thread_count}) is the concurrency cap",
+                    thread_count = thread_count,
+                );
+            }
+            Some(crate::fpm_pool::FpmPool::spawn(thread_count, backlog))
+        } else {
+            None
+        };
+
+        // The `workers` semaphore caps the default `spawn_blocking` engine only.
+        // In pool mode the pool itself is the cap, so leave it `None`.
+        let php_semaphore = (fpm_pool.is_none() && config.php.workers > 0)
             .then(|| Arc::new(tokio::sync::Semaphore::new(config.php.workers)));
 
         Self {
@@ -788,6 +818,7 @@ impl Router {
             },
             php_semaphore,
             worker_pool,
+            fpm_pool,
             worker_stream_threshold: config.php.worker_stream_threshold,
             middleware_chain: None,
             opcache_watcher: {
@@ -968,6 +999,15 @@ impl Router {
     ) -> Self {
         self.middleware_chain = chain;
         self
+    }
+
+    /// The dedicated FPM execution pool, when `[php] fpm_engine = "pool"` built
+    /// one. `serve()` uses this to drain the pool on shutdown (close dispatch,
+    /// wait for threads to release their TSRM slots) before PHP teardown, the
+    /// same way it drains the worker pool. `None` on the default engine.
+    #[must_use]
+    pub fn fpm_pool(&self) -> Option<Arc<crate::fpm_pool::FpmPool>> {
+        self.fpm_pool.clone()
     }
 
     /// Advertise an HTTP/3 endpoint via `Alt-Svc` on TLS responses.
@@ -2134,26 +2174,14 @@ impl Router {
         };
         let opcache_watcher = invalidate_version.map(|_| self.opcache_watcher.clone());
 
-        // Cap concurrent PHP executions when [php].workers is set. The permit
-        // is held for the whole execution (php-fpm max_children semantics):
-        // requests past the cap queue here until a worker frees up, still
-        // subject to the outer request timeout. Acquire never fails — the
-        // semaphore is never closed.
-        let _php_permit = match &self.php_semaphore {
-            Some(sem) => {
-                Some(Arc::clone(sem).acquire_owned().await.expect("PHP semaphore never closed"))
-            }
-            None => None,
-        };
-
-        // `php.execute` span: brackets exactly the region `php_start` /
-        // `php_elapsed` measure (the whole spawn_blocking hop, including its
-        // queue time — same semantics as the histogram below). Created here,
-        // inside the `http.request`-instrumented future, so it parents
-        // correctly; dropped right after the timer is read.
-        let php_span = tracing::debug_span!(target: crate::OTEL_TRACE_TARGET, "php.execute");
-        let php_start = std::time::Instant::now();
-        let result = tokio::task::spawn_blocking(move || {
+        // The per-request execution body — IDENTICAL for both fpm engines.
+        // Both the default `spawn_blocking` path and the dedicated pool run this
+        // exact closure, so per-request parity (per-site DB session, KV
+        // keyspace, `open_basedir`/temp/session INI, OPcache invalidation, and
+        // the `PhpRuntime::execute` bailout crash guard) is guaranteed by
+        // construction — the same code runs; only the thread it lands on
+        // differs.
+        let run_php = move || -> Result<ephpm_php::response::PhpResponse, ephpm_php::PhpError> {
             // Scope KV store to this virtual host for multi-tenant isolation.
             // Keyed on the same identity the injected `EPHPM_REDIS_USERNAME`
             // names, so the in-process bridge and a RESP client reach one
@@ -2230,8 +2258,94 @@ impl Router {
                 protocol,
                 env_vars,
             })
-        })
-        .await;
+        };
+
+        // `php.execute` span: brackets exactly the region `php_start` /
+        // `php_elapsed` measure (execution plus, on the pool engine, the
+        // dispatch-queue wait). Created inside the `http.request`-instrumented
+        // future so it parents correctly; dropped right after the timer is read.
+        let php_span = tracing::debug_span!(target: crate::OTEL_TRACE_TARGET, "php.execute");
+        let php_start = std::time::Instant::now();
+
+        // Engine selection. DEFAULT (`fpm_engine = "spawn_blocking"`): the
+        // `else` arm is byte-identical to the historical path (workers
+        // semaphore + spawn_blocking). POOL (`fpm_engine = "pool"`): dispatch
+        // the same closure to ePHPm's dedicated thread pool, whose size is the
+        // concurrency cap (the semaphore is bypassed). Backpressure → 504 via
+        // the outer timeout; a closed pool → 503; a wedged thread → 504 + a
+        // replacement, mirroring the worker-mode dispatch path.
+        let (result, queue_wait): (
+            Result<
+                Result<ephpm_php::response::PhpResponse, ephpm_php::PhpError>,
+                tokio::task::JoinError,
+            >,
+            Option<Duration>,
+        ) = if let Some(pool) = self.fpm_pool.clone() {
+            let recv = pool.dispatch(Box::new(run_php)).await;
+            let queue_wait = php_start.elapsed();
+            let Ok(rx) = recv else {
+                // Pool draining / all threads gone — 503.
+                drop(php_span);
+                let mut resp = apply_response_headers(
+                    error_response(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable"),
+                    &mw_response_headers,
+                );
+                resp.extensions_mut().insert(crate::timeline::PhpTimings {
+                    queue_wait: Some(queue_wait),
+                    execute: None,
+                });
+                return resp;
+            };
+            // Bound the wait so a wedged thread becomes a 504 AND signals the
+            // pool to replace it. A `request` timeout of 0 disables the deadline
+            // (issue #135). `rx` awaited bare yields `Result<_, RecvError>`;
+            // wrap it as `Ok(_)` to match the `timeout` arm's shape.
+            let awaited = if self.request_timeout.is_zero() {
+                Ok(rx.await)
+            } else {
+                tokio::time::timeout(self.request_timeout, rx).await
+            };
+            match awaited {
+                Ok(Ok(exec_output)) => (Ok(exec_output), Some(queue_wait)),
+                // Thread dropped its sender (retired without replying) — 500,
+                // via the same `build_php_response` error arm as a bailout.
+                Ok(Err(_)) => (
+                    Ok(Err(ephpm_php::PhpError::ExecutionFailed(
+                        "fpm pool thread dropped response".into(),
+                    ))),
+                    Some(queue_wait),
+                ),
+                // No reply within the request timeout — replace the thread, 504.
+                Err(_) => {
+                    pool.note_hung();
+                    counter!("ephpm_http_timeouts_total", "stage" => "fpm_pool").increment(1);
+                    drop(php_span);
+                    let mut resp = apply_response_headers(
+                        error_response(StatusCode::GATEWAY_TIMEOUT, "504 Gateway Timeout"),
+                        &mw_response_headers,
+                    );
+                    resp.extensions_mut().insert(crate::timeline::PhpTimings {
+                        queue_wait: Some(queue_wait),
+                        execute: None,
+                    });
+                    return resp;
+                }
+            }
+        } else {
+            // Cap concurrent PHP executions when [php].workers is set. The
+            // permit is held for the whole execution (php-fpm max_children
+            // semantics): requests past the cap queue here until a worker frees
+            // up, still subject to the outer request timeout. Acquire never
+            // fails — the semaphore is never closed.
+            let _php_permit = match &self.php_semaphore {
+                Some(sem) => {
+                    Some(Arc::clone(sem).acquire_owned().await.expect("PHP semaphore never closed"))
+                }
+                None => None,
+            };
+            (tokio::task::spawn_blocking(run_php).await, None)
+        };
+
         let php_elapsed = php_start.elapsed();
         drop(php_span);
 
@@ -2246,12 +2360,13 @@ impl Router {
             build_php_response(result, accepts_gzip, accepts_br, self.compression),
             &mw_response_headers,
         );
-        // Hand the measurement up to `handle` for the request timeline. No
-        // queue wait on this path — spawn_blocking has no worker dispatch
-        // queue, so the value is absent, not zero.
+        // Hand the measurement up to `handle` for the request timeline. On the
+        // default `spawn_blocking` engine there is no dispatch queue, so
+        // `queue_wait` is `None` (absent, not zero); on the pool engine it holds
+        // the dispatch wait.
         response
             .extensions_mut()
-            .insert(crate::timeline::PhpTimings { queue_wait: None, execute: Some(php_elapsed) });
+            .insert(crate::timeline::PhpTimings { queue_wait, execute: Some(php_elapsed) });
         response
     }
 
@@ -4099,6 +4214,73 @@ mod tests {
             !spans.iter().any(|(n, _)| n == "worker.queue_wait"),
             "no queue span on the fpm path: {spans:?}"
         );
+    }
+
+    /// The experimental pool engine (`[php] fpm_engine = "pool"`) dispatches a
+    /// PHP request through ePHPm's dedicated thread pool and returns its
+    /// response — the same stub 200 the spawn_blocking path yields — proving the
+    /// dispatch → execute → oneshot round-trip and the router wiring. Runs in
+    /// stub mode: `PhpRuntime::init()` sets the stub-runtime flag so pool
+    /// threads register and `execute()` returns the stub page. The pool path
+    /// records a (>= 0) dispatch-queue wait, unlike the spawn_blocking path.
+    #[tokio::test]
+    async fn fpm_pool_engine_dispatches_php_request() {
+        ephpm_php::PhpRuntime::init().expect("stub runtime init");
+
+        let tree = SpanTree::default();
+        let subscriber = tracing_subscriber::registry().with(tree.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        // Opt into the pool engine with a small, deterministic pool size.
+        config.php.fpm_engine = ephpm_config::FpmEngine::Pool;
+        config.php.worker_count = 2;
+        // Also set the (now-bypassed) semaphore cap to confirm it is ignored.
+        config.php.workers = 4;
+
+        let router = Router::new(&config, test_store(), None, None, None, None, None)
+            .with_request_log(Some(Arc::new(crate::timeline::RequestLog::new(8))));
+        assert!(router.fpm_pool().is_some(), "pool engine must build the fpm pool");
+        assert!(router.php_semaphore.is_none(), "the workers semaphore is bypassed in pool mode");
+
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let req =
+            Request::builder().method("GET").uri("/index.php").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "pool must return the stub PHP response");
+
+        let entries = fetch_timeline(&router).await;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["status"], 200);
+        assert!(
+            entries[0]["queue_wait_ms"].as_f64().unwrap() >= 0.0,
+            "pool mode records the dispatch-queue wait: {entries:?}"
+        );
+        assert!(
+            entries[0]["php_ms"].as_f64().unwrap() >= 0.0,
+            "pool mode records the execution time: {entries:?}"
+        );
+
+        // Drain retires the pool threads so the test leaves no live PHP context.
+        if let Some(pool) = router.fpm_pool() {
+            pool.drain();
+        }
     }
 
     fn test_router_with_404(dir: &Path) -> Router {

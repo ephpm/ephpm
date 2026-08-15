@@ -1759,6 +1759,35 @@ impl Default for KvRedisCompatConfig {
     }
 }
 
+/// FPM request-execution engine (fpm mode only).
+///
+/// Selects **how** a per-request (php-fpm-shaped) PHP execution is scheduled
+/// onto an OS thread. Both engines run the byte-for-byte identical per-request
+/// setup/teardown (per-site DB session, KV keyspace, `open_basedir`,
+/// `max_execution_time`, the bailout crash guard) — they differ only in which
+/// thread pool the blocking PHP call lands on. Ignored in worker mode
+/// (`mode = "worker"`), where concurrency is bounded by the persistent worker
+/// pool instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FpmEngine {
+    /// **Default.** Dispatch each PHP request onto tokio's shared
+    /// `spawn_blocking` pool. Behaviour is unchanged from every release before
+    /// this knob existed. Concurrency is bounded (optionally) by the `[php]
+    /// workers` semaphore; the blocking pool itself is never capped, so static
+    /// file I/O cannot be starved by slow PHP.
+    SpawnBlocking,
+
+    /// **Experimental / opt-in.** Dispatch each PHP request onto ePHPm's OWN
+    /// fixed pool of dedicated OS threads (not `spawn_blocking`). The pool size
+    /// equals [`PhpConfig::effective_worker_count`] and IS the concurrency cap
+    /// for this engine, so the `[php] workers` semaphore is redundant and
+    /// bypassed (a full dispatch queue applies backpressure → 504 via the
+    /// request timeout; a draining/empty pool → 503). Benchmark before enabling
+    /// in production.
+    Pool,
+}
+
 /// PHP runtime configuration.
 #[derive(Debug, Deserialize)]
 pub struct PhpConfig {
@@ -2023,6 +2052,26 @@ pub struct PhpConfig {
     /// Default: `"fpm"`.
     #[serde(default = "default_php_mode")]
     pub mode: String,
+
+    /// FPM request-execution engine (fpm mode only).
+    ///
+    /// - `"spawn_blocking"` (**default**) — run each PHP request on tokio's
+    ///   shared blocking pool. Unchanged from every prior release.
+    /// - `"pool"` (**EXPERIMENTAL, opt-in**) — run each PHP request on ePHPm's
+    ///   own dedicated OS-thread pool sized to
+    ///   [`Self::effective_worker_count`]. The pool size is the concurrency cap,
+    ///   so `[php] workers` is bypassed. Benchmark-it-first: intended to be
+    ///   flipped on in the lab and compared against the default.
+    ///
+    /// An unrecognised value is a **startup error** (serde rejects it), never a
+    /// silent fallback. Ignored in worker mode (`mode = "worker"`); startup logs
+    /// a WARN if `pool` is requested there so the no-op is never silent.
+    ///
+    /// Env override: `EPHPM_PHP__FPM_ENGINE=pool`.
+    ///
+    /// Default: `"spawn_blocking"`.
+    #[serde(default = "default_fpm_engine")]
+    pub fpm_engine: FpmEngine,
 
     /// Worker-mode entrypoint script, relative to `document_root`.
     ///
@@ -2445,6 +2494,7 @@ impl Default for PhpConfig {
             extensions: Vec::new(),
             workers: default_php_workers(),
             mode: default_php_mode(),
+            fpm_engine: default_fpm_engine(),
             worker_script: None,
             worker_count: default_worker_count(),
             worker_max_requests: default_worker_max_requests(),
@@ -2463,6 +2513,17 @@ impl PhpConfig {
     #[must_use]
     pub fn is_worker_mode(&self) -> bool {
         self.mode.eq_ignore_ascii_case("worker")
+    }
+
+    /// Whether the experimental dedicated FPM thread-pool engine is requested
+    /// **and applicable** — i.e. `fpm_engine = "pool"` in fpm mode. Always
+    /// `false` in worker mode (the persistent worker pool owns concurrency
+    /// there, so `fpm_engine` is inert). This is the single predicate the server
+    /// uses to decide whether to build the pool and bypass the `workers`
+    /// semaphore, so the two decisions can never disagree.
+    #[must_use]
+    pub fn is_pool_engine(&self) -> bool {
+        !self.is_worker_mode() && self.fpm_engine == FpmEngine::Pool
     }
 
     /// Resolve the effective worker-thread count.
@@ -3273,6 +3334,10 @@ fn default_php_mode() -> String {
     "fpm".to_string()
 }
 
+fn default_fpm_engine() -> FpmEngine {
+    FpmEngine::SpawnBlocking
+}
+
 fn default_worker_count() -> usize {
     // 0 => derive at startup — cgroup CPU quota if present (Linux), otherwise
     // host parallelism clamped [2, 32]. See `PhpConfig::effective_worker_count`.
@@ -3989,6 +4054,90 @@ alt_svc_max_age = 3600
         assert_eq!(config.php.max_execution_time, 30);
         assert_eq!(config.php.memory_limit, "128M");
         assert_eq!(config.server.index_files, vec!["index.php", "index.html"]);
+    }
+
+    // ── [php] fpm_engine ─────────────────────────────────────────────────
+
+    /// The struct default is the safe, unchanged engine.
+    #[test]
+    fn fpm_engine_defaults_to_spawn_blocking() {
+        assert_eq!(PhpConfig::default().fpm_engine, FpmEngine::SpawnBlocking);
+        assert!(!PhpConfig::default().is_pool_engine());
+        let config = Config::default_config().expect("default config should load");
+        assert_eq!(config.php.fpm_engine, FpmEngine::SpawnBlocking);
+    }
+
+    /// `[php]` section present but `fpm_engine` absent must resolve to the
+    /// default, not be zeroed by a section-level derive.
+    #[test]
+    fn fpm_engine_section_present_absent_field_is_spawn_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\nmax_execution_time = 60\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(
+            config.php.fpm_engine,
+            FpmEngine::SpawnBlocking,
+            "a partial [php] section must not flip the engine"
+        );
+        assert!(!config.php.is_pool_engine());
+    }
+
+    /// A whole config with no `[php]` section at all still defaults the engine.
+    #[test]
+    fn fpm_engine_section_absent_is_spawn_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.fpm_engine, FpmEngine::SpawnBlocking);
+    }
+
+    /// Explicit `pool` parses and is applicable in fpm mode.
+    #[test]
+    fn fpm_engine_pool_parses_and_is_applicable_in_fpm_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\nfpm_engine = \"pool\"\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.fpm_engine, FpmEngine::Pool);
+        assert!(config.php.is_pool_engine(), "pool engine applies in fpm mode");
+    }
+
+    /// `fpm_engine` is inert in worker mode: `is_pool_engine()` is false even
+    /// when `pool` is requested, so the server never builds the fpm pool there.
+    #[test]
+    fn fpm_engine_pool_is_inert_in_worker_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\nmode = \"worker\"\nfpm_engine = \"pool\"\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.fpm_engine, FpmEngine::Pool);
+        assert!(!config.php.is_pool_engine(), "fpm_engine is ignored in worker mode");
+    }
+
+    /// An unrecognised value is a hard startup error, never a silent fallback.
+    #[test]
+    fn fpm_engine_invalid_value_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\nfpm_engine = \"threads\"\n").unwrap();
+
+        assert!(Config::load(&file).is_err(), "an unknown fpm_engine must fail to load");
+    }
+
+    /// The lab flips the engine via env with no code change:
+    /// `EPHPM_PHP__FPM_ENGINE=pool` must parse.
+    #[test]
+    fn fpm_engine_env_override_parses() {
+        let _env = EnvVars::set("EPHPM_PHP__FPM_ENGINE", "pool");
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.php.fpm_engine, FpmEngine::Pool);
+        assert!(config.php.is_pool_engine());
     }
 
     #[test]

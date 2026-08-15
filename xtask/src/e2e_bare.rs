@@ -123,8 +123,22 @@ const ISOLATED_DB_SUITES: &[&str] = &[
 /// `disable_functions = getmypid` override, so `multitenant_hardening.rs` still
 /// proves the union/clobber fix. The shared node keeps hardening explicitly
 /// OFF (see `SingleNodeOptions::shared`).
-const ISOLATED_CONFIG_SUITES: &[&str] =
-    &["opcache_invalidation", "rate_limit", "middleware", "worker_mode", "multitenant_hardening"];
+///
+/// `fpm_pool` needs `[php] fpm_engine = "pool"`, a WHOLE-SERVER switch that
+/// moves PHP execution off tokio's `spawn_blocking` pool onto ePHPm's dedicated
+/// FPM thread pool. Every other suite must stay on the default engine, so — like
+/// `worker_mode` — it gets its own node. It reuses the standard single-site
+/// `[db.sqlite]` docroot so the suite can prove the pool runs real PHP AND the
+/// `ephpm_db_*` bridge, and reads `ephpm_fpm_pool_size` from `/metrics` to
+/// confirm the engine is actually active (not silently falling back).
+const ISOLATED_CONFIG_SUITES: &[&str] = &[
+    "opcache_invalidation",
+    "rate_limit",
+    "middleware",
+    "worker_mode",
+    "multitenant_hardening",
+    "fpm_pool",
+];
 
 /// Suites that run single-threaded (a superset of the DB suites). Kept as a
 /// helper so `run_suite` can pick the right `--test-threads` value.
@@ -135,7 +149,9 @@ const ISOLATED_CONFIG_SUITES: &[&str] =
 /// `ephpm_worker_recycles_total` counter before and after. That counter is
 /// process-global, so a concurrent sibling test would make the assertion flap.
 fn suite_is_serial(name: &str) -> bool {
-    ISOLATED_DB_SUITES.contains(&name) || name == "worker_mode"
+    // `fpm_pool` mutates shared DB state (creates/drops `bridge_e2e`) the same
+    // way the DB suites do, so it must not run its own tests concurrently.
+    ISOLATED_DB_SUITES.contains(&name) || name == "worker_mode" || name == "fpm_pool"
 }
 
 /// Whether a suite needs its own freshly-spawned, then-torn-down single node
@@ -625,7 +641,8 @@ fn recreate_dir(path: &Path) -> io::Result<()> {
 /// `{MTH_LINE}` (the `multi_tenant_hardening = <bool>` line in
 /// `[server.security]`), `{INI_OVERRIDES_EXTRA}` (extra `[php] ini_overrides`
 /// rows — the hardening node's operator `disable_functions`, or empty),
-/// `{KV_SOCKET}`.
+/// `{FPM_ENGINE_LINE}` (the `[php] fpm_engine = "pool"` line for the `fpm_pool`
+/// node, or empty), `{KV_SOCKET}`.
 ///
 /// Shape mirrors `tests/ephpm-test.toml` (the config baked into the container
 /// image) as closely as possible. The only intentional divergences are:
@@ -728,6 +745,7 @@ ini_overrides = [
     ["display_errors", "On"],
     ["error_reporting", "E_ALL"],{INI_OVERRIDES_EXTRA}
 ]
+{FPM_ENGINE_LINE}
 {PHP_WORKER_BLOCK}
 
 [server.limits]
@@ -873,6 +891,14 @@ struct SingleNodeOptions {
     /// `[php] ini_overrides` so the suite can prove the clobber-union fix.
     /// Implies `with_sites_dir = true` (hardening is inert without it).
     multi_tenant_hardening: bool,
+    /// Emit `[php] fpm_engine = "pool"` — run this node on the experimental
+    /// dedicated FPM thread pool instead of the default `spawn_blocking` path.
+    ///
+    /// Only the `fpm_pool` suite sets it. Every other node leaves it `false`, so
+    /// the rendered `{FPM_ENGINE_LINE}` is empty and their behaviour is
+    /// byte-identical to before this knob existed — the pool engine is opt-in
+    /// and must not perturb any suite that does not select it.
+    fpm_engine_pool: bool,
 }
 
 impl SingleNodeOptions {
@@ -894,6 +920,7 @@ impl SingleNodeOptions {
             // preset. Hardening coverage lives on the isolated
             // `multitenant_hardening` node instead.
             multi_tenant_hardening: false,
+            fpm_engine_pool: false,
         }
     }
 
@@ -913,6 +940,7 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: false,
                 multi_tenant_hardening: false,
+                fpm_engine_pool: false,
             },
             // multitenant_hardening: the ONLY isolated node that runs
             // multi-tenant (sites_dir set) AND with the hardening preset on.
@@ -930,6 +958,7 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: false,
                 multi_tenant_hardening: true,
+                fpm_engine_pool: false,
             },
             // worker_mode: persistent worker pool over tests/worker-docroot.
             // sites_dir MUST stay off — worker mode + sites_dir is rejected at
@@ -942,6 +971,7 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: true,
                 multi_tenant_hardening: false,
+                fpm_engine_pool: false,
             },
             // rate_limit: small bucket, on its own node. See
             // ISOLATED_CONFIG_SUITES for why this can't share the shared node.
@@ -953,6 +983,7 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: false,
                 multi_tenant_hardening: false,
+                fpm_engine_pool: false,
             },
             // middleware: mount the freshly built cors cdylib by explicit
             // path, exercising the dlopen lane in a real server.
@@ -964,6 +995,26 @@ impl SingleNodeOptions {
                 middleware_lib: middleware_lib.map(Path::to_path_buf),
                 worker: false,
                 multi_tenant_hardening: false,
+                fpm_engine_pool: false,
+            },
+            // fpm_pool: the ONLY node on the experimental dedicated FPM thread
+            // pool (`[php] fpm_engine = "pool"`). Single-site so it gets the
+            // standard `[db.sqlite]` path + wire listeners and the default
+            // docroot's `db_bridge_test.php`, letting the suite prove the pool
+            // runs the full per-request path (PHP + the `ephpm_db_*` bridge)
+            // end to end — not just plumbing. It gets its OWN node because
+            // `fpm_engine` is a whole-server switch; bolting it onto the shared
+            // template would silently move every other suite off the default
+            // engine (the #295 lesson: never mutate the shared node's config).
+            "fpm_pool" => Self {
+                slug,
+                with_sites_dir: false,
+                opcache_invalidation: false,
+                tight_rate_limit: false,
+                middleware_lib: None,
+                worker: false,
+                multi_tenant_hardening: false,
+                fpm_engine_pool: true,
             },
             // DB suites: fresh DB, single-site. `sites_dir` is NOT optional
             // detail here — it would put the node in per-site database mode,
@@ -979,6 +1030,7 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: false,
                 multi_tenant_hardening: false,
+                fpm_engine_pool: false,
             },
         }
     }
@@ -1087,6 +1139,12 @@ impl SingleNodeSpawn {
         // the suite can tell "no worker was recycled" from "a worker rebooted".
         // worker_max_requests is left generous on purpose — the recycle test
         // asserts requests keep succeeding, not that a recycle happens.
+        // Experimental FPM engine selector. Empty (default `spawn_blocking`)
+        // on every node except the `fpm_pool` suite's, so no other suite is
+        // perturbed. `fpm_engine = "pool"` and `mode = "worker"` are mutually
+        // exclusive (pool is fpm-mode only), so this never combines with the
+        // worker block below.
+        let fpm_engine_line = if opts.fpm_engine_pool { "fpm_engine = \"pool\"" } else { "" };
         let php_worker_block = if opts.worker {
             "mode = \"worker\"\nworker_script = \"worker.php\"\nworker_count = 3\n\
              worker_max_requests = 10000\nworker_boot_timeout = 60"
@@ -1162,6 +1220,7 @@ impl SingleNodeSpawn {
             .replace("{LIMITS_BLOCK}", limits_block)
             .replace("{MTH_LINE}", mth_line)
             .replace("{INI_OVERRIDES_EXTRA}", ini_overrides_extra)
+            .replace("{FPM_ENGINE_LINE}", fpm_engine_line)
             .replace("{PHP_WORKER_BLOCK}", php_worker_block)
             .replace("{KV_SOCKET}", &escape_toml(&kv_socket))
             .replace("{DOCROOT}", &escape_toml(docroot));
