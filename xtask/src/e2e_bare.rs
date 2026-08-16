@@ -131,6 +131,13 @@ const ISOLATED_DB_SUITES: &[&str] = &[
 /// `[db.sqlite]` docroot so the suite can prove the pool runs real PHP AND the
 /// `ephpm_db_*` bridge, and reads `ephpm_fpm_pool_size` from `/metrics` to
 /// confirm the engine is actually active (not silently falling back).
+///
+/// `crash_containment` needs `[php] fpm_engine = "pool"` AND
+/// `[php] crash_containment = true`, and — unlike every other suite — it
+/// deliberately **crashes PHP**: it drives a C-stack overflow that poisons and
+/// retires a pool thread. That is destructive to whatever node it runs on
+/// (threads are retired, PHP module shutdown is skipped at exit), so it gets its
+/// own throwaway node and must never share one.
 const ISOLATED_CONFIG_SUITES: &[&str] = &[
     "opcache_invalidation",
     "rate_limit",
@@ -138,6 +145,7 @@ const ISOLATED_CONFIG_SUITES: &[&str] = &[
     "worker_mode",
     "multitenant_hardening",
     "fpm_pool",
+    "crash_containment",
 ];
 
 /// Suites that run single-threaded (a superset of the DB suites). Kept as a
@@ -151,7 +159,16 @@ const ISOLATED_CONFIG_SUITES: &[&str] = &[
 fn suite_is_serial(name: &str) -> bool {
     // `fpm_pool` mutates shared DB state (creates/drops `bridge_e2e`) the same
     // way the DB suites do, so it must not run its own tests concurrently.
-    ISOLATED_DB_SUITES.contains(&name) || name == "worker_mode" || name == "fpm_pool"
+    //
+    // `crash_containment` is serial for the `worker_mode` reason squared: its
+    // tests crash PHP on purpose and read process-global counters
+    // (`ephpm_fpm_pool_contained_crashes_total`, `..._recycles_total`) before
+    // and after, and they assert that a *concurrent* request on another thread
+    // is unaffected — which only means anything if this suite owns the pool.
+    ISOLATED_DB_SUITES.contains(&name)
+        || name == "worker_mode"
+        || name == "fpm_pool"
+        || name == "crash_containment"
 }
 
 /// Whether a suite needs its own freshly-spawned, then-torn-down single node
@@ -642,7 +659,9 @@ fn recreate_dir(path: &Path) -> io::Result<()> {
 /// `[server.security]`), `{INI_OVERRIDES_EXTRA}` (extra `[php] ini_overrides`
 /// rows — the hardening node's operator `disable_functions`, or empty),
 /// `{FPM_ENGINE_LINE}` (the `[php] fpm_engine = "pool"` line for the `fpm_pool`
-/// node, or empty), `{KV_SOCKET}`.
+/// and `crash_containment` nodes, or empty), `{CRASH_CONTAINMENT_LINE}` (the
+/// `[php] crash_containment = true` line for the `crash_containment` node, or
+/// empty), `{KV_SOCKET}`.
 ///
 /// Shape mirrors `tests/ephpm-test.toml` (the config baked into the container
 /// image) as closely as possible. The only intentional divergences are:
@@ -746,6 +765,7 @@ ini_overrides = [
     ["error_reporting", "E_ALL"],{INI_OVERRIDES_EXTRA}
 ]
 {FPM_ENGINE_LINE}
+{CRASH_CONTAINMENT_LINE}
 {PHP_WORKER_BLOCK}
 
 [server.limits]
@@ -899,6 +919,15 @@ struct SingleNodeOptions {
     /// byte-identical to before this knob existed — the pool engine is opt-in
     /// and must not perturb any suite that does not select it.
     fpm_engine_pool: bool,
+    /// Emit `[php] crash_containment = true` — contain a PHP C-stack overflow
+    /// (500 + retire the pool thread) instead of aborting the process.
+    ///
+    /// Only the `crash_containment` suite sets it, and only together with
+    /// `fpm_engine_pool` (the server refuses to arm containment without the
+    /// pool, since retiring the crashed thread is what makes it safe). Its node
+    /// is deliberately destroyed after the suite: threads are abandoned and PHP
+    /// module shutdown is skipped once a crash has been contained.
+    crash_containment: bool,
 }
 
 impl SingleNodeOptions {
@@ -921,6 +950,7 @@ impl SingleNodeOptions {
             // `multitenant_hardening` node instead.
             multi_tenant_hardening: false,
             fpm_engine_pool: false,
+            crash_containment: false,
         }
     }
 
@@ -941,6 +971,7 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: false,
+                crash_containment: false,
             },
             // multitenant_hardening: the ONLY isolated node that runs
             // multi-tenant (sites_dir set) AND with the hardening preset on.
@@ -959,6 +990,7 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: true,
                 fpm_engine_pool: false,
+                crash_containment: false,
             },
             // worker_mode: persistent worker pool over tests/worker-docroot.
             // sites_dir MUST stay off — worker mode + sites_dir is rejected at
@@ -972,6 +1004,7 @@ impl SingleNodeOptions {
                 worker: true,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: false,
+                crash_containment: false,
             },
             // rate_limit: small bucket, on its own node. See
             // ISOLATED_CONFIG_SUITES for why this can't share the shared node.
@@ -984,6 +1017,7 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: false,
+                crash_containment: false,
             },
             // middleware: mount the freshly built cors cdylib by explicit
             // path, exercising the dlopen lane in a real server.
@@ -996,6 +1030,7 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: false,
+                crash_containment: false,
             },
             // fpm_pool: the ONLY node on the experimental dedicated FPM thread
             // pool (`[php] fpm_engine = "pool"`). Single-site so it gets the
@@ -1015,6 +1050,27 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: true,
+                crash_containment: false,
+            },
+            // crash_containment: the ONLY node with `[php] crash_containment =
+            // true` (which additionally REQUIRES the pool engine — the server
+            // refuses to arm containment without a thread pool it can retire
+            // from). This suite deliberately crashes PHP: it drives a C-stack
+            // overflow that poisons a pool thread, so the node ends its life
+            // with abandoned TSRM entries and skips PHP module shutdown at
+            // exit. Nothing else may share it, and it must be torn down after.
+            // Single-site (no sites_dir) so the standard docroot — including
+            // `stack_overflow.php` and `sleep.php` — is served.
+            "crash_containment" => Self {
+                slug,
+                with_sites_dir: false,
+                opcache_invalidation: false,
+                tight_rate_limit: false,
+                middleware_lib: None,
+                worker: false,
+                multi_tenant_hardening: false,
+                fpm_engine_pool: true,
+                crash_containment: true,
             },
             // DB suites: fresh DB, single-site. `sites_dir` is NOT optional
             // detail here — it would put the node in per-site database mode,
@@ -1031,6 +1087,7 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: false,
+                crash_containment: false,
             },
         }
     }
@@ -1145,6 +1202,12 @@ impl SingleNodeSpawn {
         // exclusive (pool is fpm-mode only), so this never combines with the
         // worker block below.
         let fpm_engine_line = if opts.fpm_engine_pool { "fpm_engine = \"pool\"" } else { "" };
+        // Stack-overflow crash containment. Empty everywhere except the
+        // `crash_containment` node, so no other suite's crash semantics change
+        // (a PHP segfault still kills the process for everyone else, which is
+        // what several suites' expectations are built on).
+        let crash_containment_line =
+            if opts.crash_containment { "crash_containment = true" } else { "" };
         let php_worker_block = if opts.worker {
             "mode = \"worker\"\nworker_script = \"worker.php\"\nworker_count = 3\n\
              worker_max_requests = 10000\nworker_boot_timeout = 60"
@@ -1221,6 +1284,7 @@ impl SingleNodeSpawn {
             .replace("{MTH_LINE}", mth_line)
             .replace("{INI_OVERRIDES_EXTRA}", ini_overrides_extra)
             .replace("{FPM_ENGINE_LINE}", fpm_engine_line)
+            .replace("{CRASH_CONTAINMENT_LINE}", crash_containment_line)
             .replace("{PHP_WORKER_BLOCK}", php_worker_block)
             .replace("{KV_SOCKET}", &escape_toml(&kv_socket))
             .replace("{DOCROOT}", &escape_toml(docroot));

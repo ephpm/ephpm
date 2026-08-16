@@ -57,6 +57,19 @@ A rising `ephpm_http3_connection_errors_total{stage="handshake"}` with `ephpm_ht
 | `ephpm_php_execution_duration_seconds` | histogram | — | Time spent inside the PHP runtime, per request. |
 | `ephpm_php_output_bytes` | histogram | — | Bytes emitted by PHP per request. |
 
+## FPM pool engine
+
+These appear when `[php] fpm_engine = "pool"` in fpm mode.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_fpm_pool_size` | gauge | — | Configured number of dedicated FPM pool threads, set at pool startup. Also the concurrency cap for this engine. |
+| `ephpm_fpm_pool_queue_depth` | gauge | — | Requests enqueued on the dispatch queue but not yet pulled by a thread. |
+| `ephpm_fpm_pool_boot_failures_total` | counter | — | Pool threads that failed to start (thread spawn or TSRM registration failure). The pool respawns with exponential backoff. |
+| `ephpm_fpm_pool_panics_total` | counter | — | Rust panics escaping a PHP job. The request still gets a 500 and the thread is retired. A PHP bailout is *not* a panic and is not counted here. |
+| `ephpm_fpm_pool_contained_crashes_total` | counter | — | PHP C-stack overflows contained instead of aborting the process. Requires [`[php] crash_containment`](/reference/config/#php); always `0` without it. Any non-zero value means a request crashed PHP and a thread was poisoned. |
+| `ephpm_fpm_pool_recycles_total` | counter | `reason` | Pool threads retired and replaced. `reason` is `hung` (never responded within the request timeout; abandoned and replaced), `panic` (a Rust panic escaped the job), or `poisoned` (a crash was contained on it — abandoned **without** PHP teardown, since its Zend context is corrupt). |
+
 ## Native middleware
 
 These appear when at least one `[[middleware]]` mount is configured.

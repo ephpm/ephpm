@@ -43,17 +43,50 @@
 //!   thread's `recv_blocking` then returns `Err`, the loop ends, and the thread
 //!   releases its TSRM slot ([`PhpRuntime::worker_thread_shutdown`]) before
 //!   exiting so `php_embed_shutdown()` is safe once `live` reaches 0 (#266).
+//! - **Rust panic mid-job → 500 + retire:** a PHP bailout is caught in C and
+//!   returned as `Err(PhpError::Bailout)`, an ordinary outcome. A *Rust* panic
+//!   is not: it leaves the context in an unknown state, so the thread retires
+//!   (with normal PHP teardown) and a replacement is spawned.
 //!
-//! Actual poison-thread *retirement* — replacing a thread whose PHP context is
-//! corrupt after a contained crash — is a deferred follow-up. For now a
-//! contained bailout is surfaced to the caller as a 500 exactly as the
-//! `spawn_blocking` path does (via `PhpRuntime::execute`'s `Result`), and the
-//! thread keeps serving. The one exception is a *Rust* panic inside the job
-//! (not a PHP bailout, which is caught in C): that leaves the context in an
-//! unknown state, so the thread retires and a replacement is spawned.
+//! # Poison-thread retirement (`[php] crash_containment`)
+//!
+//! Owning the threads is what makes crash containment safe, and this is the
+//! part tokio's shared blocking pool could not provide. When
+//! [`PhpRuntime::execute`] contains a C-stack overflow it answers
+//! [`PhpError::Contained`] and the thread's Zend context is **poisoned** — its
+//! ZMM free lists and `EG(objects_store)` were abandoned mid-mutation. This
+//! pool then, in order: delivers the 500 to the waiting request, runs **no**
+//! further job on that thread, exits the job loop, and spawns a replacement.
+//!
+//! **A poisoned thread never runs [`PhpRuntime::worker_thread_shutdown`].**
+//! That call is `php_request_shutdown()` + `ts_free_thread()`, both of which
+//! walk the poisoned per-thread heap and would turn a contained crash straight
+//! back into a process abort. The thread is therefore *abandoned* — its TSRM
+//! slot and Zend context are leaked deliberately, exactly as the
+//! [`FpmPool::note_hung`] path abandons a wedged thread rather than killing it.
+//! The invariant that follows: **once any crash has been contained, this
+//! process must never run `php_embed_shutdown()`** — `ts_free_id()` would walk
+//! the abandoned entry and `SIGABRT`. `ephpm-php` enforces that end of the
+//! bargain by latching a flag that makes `PhpRuntime::shutdown()` skip module
+//! teardown.
+//!
+//! The cost is a leak that **plateaus** rather than growing without bound:
+//! measured on a 4-thread pool (PHP 8.5.7 ZTS), RSS rose about 90 MiB over the
+//! first ~1000 contained crashes and then stopped moving over 400 more — the
+//! allocator reuses the abandoned thread stacks and ZMM chunks. Live thread
+//! count stayed flat throughout, so retired threads really do exit. The
+//! alternative is the whole server dying on crash number one.
+//!
+//! Respawning after a poison is rate-limited ([`FpmPool::note_poisoned`]): a
+//! crash costs a thread teardown plus a fresh TSRM registration, far more than a
+//! normal request, so an attacker looping the crash script would otherwise get
+//! free CPU amplification. Consecutive poisons inside a 10 s window back off
+//! exponentially to a 500 ms ceiling — low enough that the pool refills quickly,
+//! high enough to cap the respawn rate.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use ephpm_php::response::PhpResponse;
 use ephpm_php::{PhpError, PhpRuntime};
@@ -97,7 +130,22 @@ pub struct FpmPool {
     state: Arc<PoolState>,
     /// Target number of live pool threads (the concurrency cap).
     thread_count: usize,
+    /// Pool start time — the epoch the crash-storm backoff measures against.
+    /// An `Instant` cannot live in an atomic, so poison timestamps are stored as
+    /// milliseconds elapsed from here.
+    started: Instant,
 }
+
+/// Sliding window for the crash-storm backoff: poisons further apart than this
+/// are unrelated events and reset the streak.
+const POISON_WINDOW: Duration = Duration::from_secs(10);
+
+/// Base and ceiling of the per-poison respawn backoff. Small enough that the
+/// pool refills promptly after an isolated crash, large enough that a sustained
+/// crash storm cannot spin thread-spawn + TSRM-registration work at request rate.
+const POISON_BACKOFF_BASE: Duration = Duration::from_millis(25);
+/// Upper bound on the respawn backoff (reached after ~5 consecutive poisons).
+const POISON_BACKOFF_MAX: Duration = Duration::from_millis(500);
 
 /// Shared, atomically-updated pool state.
 struct PoolState {
@@ -109,6 +157,13 @@ struct PoolState {
     live: AtomicUsize,
     /// Consecutive TSRM-init failures, for respawn backoff.
     boot_failures: AtomicUsize,
+    /// Consecutive contained-crash retirements inside [`POISON_WINDOW`], for
+    /// the crash-storm respawn backoff. Reset by the first poison that arrives
+    /// after a quiet window.
+    poison_streak: AtomicUsize,
+    /// Milliseconds (from [`FpmPool::started`]) of the most recent poison,
+    /// stored **biased by +1** so `0` unambiguously means "none yet".
+    last_poison_ms: AtomicU64,
     /// Set when draining — supervisors stop respawning.
     draining: AtomicBool,
     /// Monotonic id source for threads (logging / metric context).
@@ -129,6 +184,8 @@ impl FpmPool {
             ready: AtomicUsize::new(0),
             live: AtomicUsize::new(0),
             boot_failures: AtomicUsize::new(0),
+            poison_streak: AtomicUsize::new(0),
+            last_poison_ms: AtomicU64::new(0),
             draining: AtomicBool::new(false),
             next_id: AtomicUsize::new(0),
         });
@@ -143,6 +200,7 @@ impl FpmPool {
             queue_depth: Arc::new(AtomicUsize::new(0)),
             state,
             thread_count,
+            started: Instant::now(),
         });
 
         for _ in 0..thread_count {
@@ -176,6 +234,14 @@ impl FpmPool {
     #[cfg(test)]
     fn queue_depth(&self) -> usize {
         self.queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// Total pool threads spawned since startup, including replacements.
+    /// Monotonic, so a test can wait for a respawn without racing the
+    /// `ready`/`live` counters as they dip through the retirement. Test-only.
+    #[cfg(test)]
+    fn threads_spawned(&self) -> usize {
+        self.state.next_id.load(Ordering::Acquire)
     }
 
     /// Dispatch one request to the pool and return the receiver for its
@@ -227,6 +293,39 @@ impl FpmPool {
         }
     }
 
+    /// Record a contained-crash retirement and return how long the retiring
+    /// thread should wait before its replacement is spawned.
+    ///
+    /// Crash-storm rate limit. A contained crash is expensive on both sides —
+    /// the poisoned context is abandoned and the replacement pays a fresh
+    /// `ts_resource()` + `php_request_startup()` — so a script that crashes on
+    /// every hit would otherwise buy an attacker a large CPU multiplier for a
+    /// cheap request. Consecutive poisons inside [`POISON_WINDOW`] double the
+    /// wait from [`POISON_BACKOFF_BASE`] up to [`POISON_BACKOFF_MAX`]; a quiet
+    /// window resets the streak so an isolated crash costs almost nothing.
+    ///
+    /// Returns the backoff and the current streak length (for logging).
+    fn note_poisoned(&self) -> (Duration, usize) {
+        // Stored biased by +1 so that `0` unambiguously means "no poison yet".
+        // Without the bias two crashes inside the same millisecond as pool
+        // startup would both read `0` and each look like the first.
+        let now_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+        let last_raw = self.state.last_poison_ms.swap(now_ms + 1, Ordering::AcqRel);
+
+        let window_ms = u64::try_from(POISON_WINDOW.as_millis()).unwrap_or(u64::MAX);
+        let streak = if last_raw == 0 || now_ms.saturating_sub(last_raw - 1) > window_ms {
+            self.state.poison_streak.store(1, Ordering::Release);
+            1
+        } else {
+            self.state.poison_streak.fetch_add(1, Ordering::AcqRel) + 1
+        };
+
+        // 25ms, 50, 100, 200, 400, then pinned at the 500ms ceiling.
+        let shift = u32::try_from(streak.saturating_sub(1).min(5)).unwrap_or(5);
+        let backoff = POISON_BACKOFF_BASE.saturating_mul(1u32 << shift).min(POISON_BACKOFF_MAX);
+        (backoff, streak)
+    }
+
     /// Begin graceful drain: stop accepting new jobs and let threads exit once
     /// their in-flight request (if any) completes. Idempotent.
     pub fn drain(&self) {
@@ -264,9 +363,25 @@ impl FpmPool {
     }
 }
 
+/// Why a pool thread left its job loop. Determines whether PHP teardown is safe
+/// on the way out and how the replacement is scheduled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadExit {
+    /// Dispatch closed — graceful drain. Normal PHP teardown.
+    Drain,
+    /// A Rust panic escaped the job. The Zend context is in an unknown but not
+    /// known-corrupt state, so normal PHP teardown still runs.
+    Panicked,
+    /// A C-stack overflow was contained on this thread ([`PhpError::Contained`]).
+    /// The Zend context is KNOWN corrupt: teardown is skipped and the thread is
+    /// abandoned. See the module docs.
+    Poisoned,
+}
+
 /// Body of one pool thread: register with TSRM, then loop pulling jobs and
-/// running one PHP request each, until the dispatch channel closes (drain) or a
-/// job panics (retire). On every exit it releases its TSRM slot and lets the
+/// running one PHP request each, until the dispatch channel closes (drain), a
+/// job panics, or a crash is contained on this thread. On exit it releases its
+/// TSRM slot — unless poisoned, where doing so would re-crash — and lets the
 /// supervisor respawn a replacement unless draining.
 fn thread_main(pool: &Arc<FpmPool>, thread_id: usize, rx: &async_channel::Receiver<FpmJob>) {
     // `live` was incremented in spawn_thread before this thread started; every
@@ -287,7 +402,7 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize, rx: &async_channel::Receiv
     pool.state.boot_failures.store(0, Ordering::Release);
     tracing::debug!(thread_id, "fpm pool thread ready");
 
-    let mut retire = false;
+    let mut exit = ThreadExit::Drain;
     loop {
         let job = match rx.recv_blocking() {
             Ok(job) => job,
@@ -306,9 +421,26 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize, rx: &async_channel::Receiv
         // `live` slot on a half-unwound stack.
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
             Ok(out) => {
+                // A contained C-stack overflow poisons this thread's Zend
+                // context. Deliver the 500 first — the request is still waiting
+                // and the answer costs nothing — then leave the loop so this
+                // thread runs no further PHP. Detected here rather than inside
+                // `PhpRuntime` because retirement is the pool's job.
+                let poisoned = matches!(&out, Err(PhpError::Contained(_)));
                 // The receiver is gone only if the router already timed out this
                 // request (504) and moved on; dropping the response is correct.
                 let _ = respond_to.send(out);
+                if poisoned {
+                    counter!("ephpm_fpm_pool_contained_crashes_total").increment(1);
+                    tracing::error!(
+                        thread_id,
+                        "fpm pool thread contained a PHP C-stack overflow — 500 delivered, \
+                         thread poisoned; abandoning it (no PHP teardown) and spawning a \
+                         replacement"
+                    );
+                    exit = ThreadExit::Poisoned;
+                    break;
+                }
             }
             Err(_) => {
                 counter!("ephpm_fpm_pool_panics_total").increment(1);
@@ -319,21 +451,48 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize, rx: &async_channel::Receiv
                     thread_id,
                     "fpm pool thread panicked mid-request — 500 delivered, retiring thread"
                 );
-                retire = true;
+                exit = ThreadExit::Panicked;
                 break;
             }
         }
     }
 
     pool.state.ready.fetch_sub(1, Ordering::AcqRel);
-    // Release this thread's TSRM slot (php_request_shutdown + ts_free_thread)
-    // and roll back any transaction a bailed-out request left open, on this
-    // thread, before the PHP context goes away.
-    PhpRuntime::worker_thread_shutdown();
+    if exit == ThreadExit::Poisoned {
+        // DO NOT run worker_thread_shutdown() here. It is php_request_shutdown()
+        // + ts_free_thread(), and both walk this thread's ZMM free lists and
+        // EG(objects_store) — which the contained `siglongjmp` left mid-mutation.
+        // Running them would free out of a corrupt heap and abort the process,
+        // undoing the containment. The TSRM slot and Zend context are abandoned
+        // instead (a bounded leak); `ephpm-php` correspondingly skips
+        // php_embed_shutdown() at process exit so module teardown never walks
+        // this entry either. Same trade as the hung-thread path: a wedged or
+        // poisoned PHP thread is replaced, never cleaned up.
+        counter!("ephpm_fpm_pool_recycles_total", "reason" => "poisoned").increment(1);
+    } else {
+        // Release this thread's TSRM slot (php_request_shutdown + ts_free_thread)
+        // and roll back any transaction a bailed-out request left open, on this
+        // thread, before the PHP context goes away.
+        PhpRuntime::worker_thread_shutdown();
+        if exit == ThreadExit::Panicked {
+            counter!("ephpm_fpm_pool_recycles_total", "reason" => "panic").increment(1);
+        }
+    }
     pool.state.live.fetch_sub(1, Ordering::AcqRel);
 
-    if retire {
-        counter!("ephpm_fpm_pool_recycles_total", "reason" => "panic").increment(1);
+    if exit == ThreadExit::Poisoned {
+        // Rate-limit the replacement so a crash-looping client cannot spin
+        // thread-spawn + TSRM-registration work at request rate.
+        let (backoff, streak) = pool.note_poisoned();
+        tracing::warn!(
+            thread_id,
+            streak,
+            backoff_ms = u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+            "backing off before replacing a poisoned fpm pool thread"
+        );
+        if !pool.state.draining.load(Ordering::Acquire) {
+            std::thread::sleep(backoff);
+        }
     }
     respawn_if_running(pool);
 }
@@ -365,6 +524,25 @@ fn respawn_if_running(pool: &Arc<FpmPool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wait (bounded) for `cond` to hold, polling on the tokio timer.
+    async fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+        for _ in 0..400 {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        cond()
+    }
+
+    /// A task that reports a contained C-stack overflow — exactly what
+    /// `PhpRuntime::execute` returns when the crash guard recovers. Lets the
+    /// retirement path be exercised in stub mode, with no libphp and no real
+    /// crash.
+    fn contained_task() -> FpmTask {
+        Box::new(|| Err(PhpError::Contained("stack_overflow.php (GET /boom)".into())))
+    }
 
     fn ok_task(status: u16) -> FpmTask {
         Box::new(move || {
@@ -449,5 +627,73 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
         assert_eq!(pool.live_count(), 0, "drain retires every thread");
+    }
+
+    /// Poison-thread retirement, end to end in stub mode. A job that reports a
+    /// contained crash must (1) still answer the waiting request, (2) take that
+    /// thread out of service, and (3) be replaced, leaving the pool serving at
+    /// full strength.
+    #[tokio::test]
+    async fn contained_crash_retires_thread_and_pool_recovers() {
+        PhpRuntime::init().expect("stub init");
+        let pool = FpmPool::spawn(1, 4);
+        assert!(wait_for(|| pool.ready_count() == 1).await, "thread should register");
+        let spawned_before = pool.threads_spawned();
+
+        let rx = pool.dispatch(contained_task()).await.expect("dispatch ok");
+        let out = rx.await.expect("the 500 must reach the waiting request");
+        assert!(
+            matches!(out, Err(PhpError::Contained(_))),
+            "a contained crash is delivered to the caller, not swallowed"
+        );
+
+        // The poisoned thread exits and a replacement is spawned (after the
+        // crash-storm backoff, ~25ms for an isolated crash).
+        assert!(
+            wait_for(|| pool.threads_spawned() > spawned_before).await,
+            "a replacement thread must be spawned for the poisoned one"
+        );
+        assert!(wait_for(|| pool.ready_count() == 1).await, "the pool must refill to its size");
+        assert_eq!(pool.live_count(), 1, "exactly one live thread — the replacement");
+
+        // And the pool serves normally again on the fresh thread.
+        let rx = pool.dispatch(ok_task(200)).await.expect("dispatch ok");
+        let resp = rx.await.expect("replacement replied").expect("stub task returns Ok");
+        assert_eq!(resp.status, 200);
+
+        pool.drain();
+        assert!(wait_for(|| pool.live_count() == 0).await, "drain retires the replacement");
+    }
+
+    /// The crash-storm backoff grows with consecutive poisons and is capped, so
+    /// a client looping a crash script cannot spin thread-spawn + TSRM work at
+    /// request rate. Pure bookkeeping — no threads involved.
+    #[tokio::test]
+    async fn poison_backoff_escalates_and_caps() {
+        let pool = FpmPool::spawn(0, 1);
+
+        let (first, streak) = pool.note_poisoned();
+        assert_eq!(streak, 1, "the first poison starts a streak");
+        assert_eq!(first, POISON_BACKOFF_BASE, "an isolated crash barely waits");
+
+        let mut previous = first;
+        for expected_streak in 2..=5 {
+            let (backoff, streak) = pool.note_poisoned();
+            assert_eq!(streak, expected_streak, "poisons inside the window accumulate");
+            assert!(
+                backoff > previous,
+                "backoff must grow while crashes keep coming: {backoff:?} <= {previous:?}"
+            );
+            previous = backoff;
+        }
+
+        // Sustained storm: pinned at the ceiling, never unbounded.
+        for _ in 0..10 {
+            let (backoff, _) = pool.note_poisoned();
+            assert!(backoff <= POISON_BACKOFF_MAX, "backoff must stay capped: {backoff:?}");
+        }
+        let (backoff, streak) = pool.note_poisoned();
+        assert!(streak > 5);
+        assert_eq!(backoff, POISON_BACKOFF_MAX, "a long storm sits at the ceiling");
     }
 }

@@ -1287,6 +1287,33 @@ fn run_with_config(
     // per-thread timers and in stub mode.
     ephpm_php::PhpRuntime::set_max_execution_time(config.php.max_execution_time);
 
+    // Stack-overflow crash containment (experimental `[php] crash_containment`).
+    //
+    // Armed here, on the single-threaded startup path, before any PHP request
+    // exists — and the recovery hook is registered BEFORE the guard is enabled,
+    // so a guard can never be armed with no hook to recover it. Left entirely
+    // alone when the knob is off: no hook is registered, no guard is ever armed,
+    // and a C-stack overflow aborts the process exactly as it always has.
+    if config.php.is_crash_containment_active() {
+        fatal_signal::set_recover_hook(ephpm_php::crash_guard::recover_hook());
+        ephpm_php::crash_guard::set_enabled(true);
+        tracing::warn!(
+            "[php] crash_containment is ON (experimental): a PHP C-stack overflow \
+             will be contained — the request gets a 500 and its pool thread is \
+             retired — instead of killing the process. Heap corruption is NOT \
+             contained and still aborts. Each contained crash leaks the poisoned \
+             thread's PHP context and makes this process skip PHP module shutdown \
+             at exit."
+        );
+    } else if config.php.crash_containment {
+        tracing::warn!(
+            "[php] crash_containment = true is IGNORED unless [php] fpm_engine = \
+             \"pool\" in fpm mode — containment must be able to retire the thread \
+             that crashed, which only ePHPm's own FPM pool can do. Crashes will \
+             abort the process as usual."
+        );
+    }
+
     // Now safe to create the multi-threaded tokio runtime.
     //
     // Note: [php].workers is enforced by a semaphore around PHP execution in
