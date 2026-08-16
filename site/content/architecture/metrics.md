@@ -41,7 +41,8 @@ EPHPM_SERVER__METRICS__PATH="/metrics"
 | `ephpm_http_request_body_bytes` | histogram | `method` | Request body size in bytes. `method` is a standard verb or `OTHER`, never the client's raw verb. |
 | `ephpm_http_response_body_bytes` | histogram | `handler` | Response body size in bytes (before compression). |
 | `ephpm_http_compression_ratio` | histogram | — | Compression ratio (compressed / original). Values near 0 = excellent compression. |
-| `ephpm_rate_limited_total` | counter | — | Requests rejected by rate limiting. |
+| `ephpm_rate_limited_total` | counter | — | Requests rejected by per-IP rate limiting. |
+| `ephpm_site_rate_limited_total` | counter | — | PHP requests rejected by the per-site rate limit (`[server.limits] per_site_rate`). |
 
 ### PHP Execution Metrics
 

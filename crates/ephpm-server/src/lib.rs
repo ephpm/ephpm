@@ -447,8 +447,13 @@ async fn bind_listeners(
 ) -> anyhow::Result<Listeners> {
     let addr: SocketAddr = config.server.listen.parse().context("invalid listen address")?;
 
+    // `[server.limits]` resolved against the `[server] preview` preset:
+    // explicit operator values win; unset fields take the preview defaults
+    // when preview mode is on, the regular all-off defaults otherwise.
+    let limits = config.server.effective_limits();
+    log_preview_preset(&config.server, &limits);
     let limiter = {
-        let l = rate_limit::Limiter::new(config.server.limits.clone());
+        let l = rate_limit::Limiter::new(limits);
         if l.is_enabled() {
             tracing::info!("rate limiting enabled");
             Some(Arc::new(l))
@@ -875,7 +880,12 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
                 // not set this; the KV RESP listener already does for the same
                 // reason (ephpm-kv server.rs).
                 let _ = stream.set_nodelay(true);
-                let guard = acquire_connection(&limiter, &stream, remote_addr).await;
+                let guard = match acquire_connection(&limiter, &stream, remote_addr).await {
+                    ConnAdmission::Admit(guard) => guard,
+                    // Over the connection cap: the 503 was written; dropping
+                    // the stream closes it instead of serving it anyway.
+                    ConnAdmission::Shed => continue,
+                };
                 dispatch_main_connection(
                     stream, remote_addr, &tls_mode, tls_listener.is_some(),
                     redirect_http, conn, &router, guard, &in_flight,
@@ -897,7 +907,10 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
                 // Same rationale as the plain-HTTP accept above; set on the raw
                 // TCP stream before the TLS handshake wraps it.
                 let _ = stream.set_nodelay(true);
-                let guard = acquire_connection(&limiter, &stream, remote_addr).await;
+                let guard = match acquire_connection(&limiter, &stream, remote_addr).await {
+                    ConnAdmission::Admit(guard) => guard,
+                    ConnAdmission::Shed => continue,
+                };
                 dispatch_tls_connection(stream, remote_addr, &tls_mode, conn, &router, guard, &in_flight);
             }
 
@@ -1013,25 +1026,92 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Try to acquire a connection slot. On rejection, send a raw 503 and return `None`.
+/// Log, at startup, exactly what the `[server] preview` preset did — which
+/// `[server.limits]` fields it supplied and which the operator set — plus the
+/// marker header. Never silent (the no-silent-knob rule, same pattern as the
+/// multi-tenant hardening preset log).
+fn log_preview_preset(server: &ephpm_config::ServerConfig, limits: &ephpm_config::ResolvedLimits) {
+    if !server.preview {
+        return;
+    }
+    let applied = server.preview_preset_applied();
+    let preset_supplied =
+        applied.iter().map(|(key, value)| format!("{key}={value}")).collect::<Vec<_>>().join(", ");
+    tracing::info!(
+        max_connections = limits.max_connections,
+        per_ip_max_connections = limits.per_ip_max_connections,
+        per_ip_rate = limits.per_ip_rate,
+        per_ip_burst = limits.per_ip_burst,
+        per_site_rate = limits.per_site_rate,
+        per_site_burst = limits.per_site_burst,
+        "preview mode ON: every response carries X-Ephpm-Preview: 1; \
+         preset supplied [{}]; every other [server.limits] value above was \
+         set explicitly by the operator (explicit values always win, \
+         including explicit 0 = that limit off)",
+        if preset_supplied.is_empty() {
+            "nothing — all limits operator-set"
+        } else {
+            &preset_supplied
+        },
+    );
+}
+
+/// Outcome of the accept-time connection-limit check.
+enum ConnAdmission {
+    /// Serve the connection. The guard is `Some` when a limiter is active
+    /// (it holds the connection slot until drop) and `None` when no limiter
+    /// is configured.
+    Admit(Option<rate_limit::ConnectionGuard>),
+    /// Over the global or per-IP connection cap: a raw 503 was already
+    /// written; the caller must drop the stream, not serve it.
+    Shed,
+}
+
+/// Try to acquire a connection slot. On rejection, send a raw 503 and return
+/// [`ConnAdmission::Shed`] so the accept loop drops the connection — the shed
+/// must actually shed. (It previously returned the same `None` for "no
+/// limiter" and "rejected", so rejected connections were served anyway after
+/// the 503 bytes, and the cap protected nothing.)
 async fn acquire_connection(
     limiter: &Option<Arc<rate_limit::Limiter>>,
     stream: &TcpStream,
     remote_addr: SocketAddr,
-) -> Option<rate_limit::ConnectionGuard> {
+) -> ConnAdmission {
     let Some(l) = limiter else {
-        return None;
+        return ConnAdmission::Admit(None);
     };
     match l.try_acquire_connection(remote_addr.ip()) {
-        Some(guard) => Some(guard),
+        Some(guard) => ConnAdmission::Admit(Some(guard)),
         None => {
             tracing::debug!(%remote_addr, "connection rejected (limit reached)");
             // Best-effort raw HTTP response — the TLS handshake hasn't happened yet
             // for TLS connections, so this only works for plain HTTP.
-            let _ = stream.try_write(
-                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            );
-            None
+            //
+            // The stream was just accepted and has never been polled, so
+            // tokio's cached readiness is empty and a bare `try_write` often
+            // returns `WouldBlock` — silently skipping the 503 (the #299 E2E
+            // pin flaked on exactly this: bare close, no bytes). Await
+            // writability first; on a freshly accepted socket the send
+            // buffer is empty, so this resolves on the next reactor tick.
+            // The timeout is a belt-and-braces bound so a shed connection
+            // can never stall the accept loop.
+            let write_503 = async {
+                loop {
+                    if stream.writable().await.is_err() {
+                        break;
+                    }
+                    match stream.try_write(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    ) {
+                        // Spurious readiness — re-arm and retry (bounded by
+                        // the timeout below).
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        _ => break,
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_millis(100), write_503).await;
+            ConnAdmission::Shed
         }
     }
 }
