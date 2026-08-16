@@ -2749,15 +2749,12 @@ impl Router {
             // downstream arm — only admission differs.
             let recv = match self.overload_policy {
                 ephpm_config::OverloadPolicy::Wait => {
-                    pool.dispatch(Box::new(run_php)).await.map_err(|_| ShedReason::Closed)
+                    pool.dispatch(Box::new(run_php)).await.map_err(ShedReason::from)
                 }
-                ephpm_config::OverloadPolicy::Shed => {
-                    pool.try_dispatch(Box::new(run_php), self.shed_after).await.map_err(|e| match e
-                    {
-                        crate::fpm_pool::DispatchRejected::Full => ShedReason::Overloaded,
-                        crate::fpm_pool::DispatchRejected::Closed => ShedReason::Closed,
-                    })
-                }
+                ephpm_config::OverloadPolicy::Shed => pool
+                    .try_dispatch(Box::new(run_php), self.shed_after)
+                    .await
+                    .map_err(ShedReason::from),
             };
             let queue_wait = php_start.elapsed();
             let rx = match recv {
@@ -2881,7 +2878,10 @@ impl Router {
         // Hand the measurement up to `handle` for the request timeline. On the
         // default `spawn_blocking` engine there is no dispatch queue, so
         // `queue_wait` is `None` (absent, not zero); on the pool engine it holds
-        // the dispatch wait.
+        // the dispatch wait. (The one `spawn_blocking` request that does report
+        // a wait is a shed one — it never reaches here, and its admission wait
+        // on the `workers` semaphore is exactly the "how long before we gave up"
+        // number worth showing in the timeline.)
         response
             .extensions_mut()
             .insert(crate::timeline::PhpTimings { queue_wait, execute: Some(php_elapsed) });
@@ -3868,6 +3868,21 @@ enum ShedReason {
     /// behaviour, unchanged; kept distinct so an overload 503 and a
     /// shutting-down 503 are not conflated in metrics or logs.
     Closed,
+}
+
+impl From<crate::fpm_pool::DispatchClosed> for ShedReason {
+    fn from(_: crate::fpm_pool::DispatchClosed) -> Self {
+        Self::Closed
+    }
+}
+
+impl From<crate::fpm_pool::DispatchRejected> for ShedReason {
+    fn from(rejected: crate::fpm_pool::DispatchRejected) -> Self {
+        match rejected {
+            crate::fpm_pool::DispatchRejected::Full => Self::Overloaded,
+            crate::fpm_pool::DispatchRejected::Closed => Self::Closed,
+        }
+    }
 }
 
 /// The 503 for a request that never reached PHP.

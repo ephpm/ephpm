@@ -68,6 +68,18 @@ ini_overrides = [
     ["error_reporting", "E_ALL"],
 ]
 
+# Load shedding (fpm mode). Default "wait": excess requests queue, and the
+# client's own timeout is what ends them. "shed" answers 503 + Retry-After once
+# a request has waited shed_after_ms for an execution slot, so an overloaded
+# server fails fast and countably instead of going quiet.
+#   NOTE: this needs an admission queue to reject from. With the default
+#   fpm_engine = "spawn_blocking" that queue is the `workers` semaphore, so
+#   shedding does nothing unless `workers` is set (startup WARNs if so). With
+#   fpm_engine = "pool" it is the dispatch backlog and needs no extra config.
+# overload_policy = "shed"
+# shed_after_ms = 0               # grace window; 0 = shed as soon as no slot is free
+# workers = 32                    # concurrency cap the shed policy rejects against
+
 # Worker mode settings (only used when mode = "worker"):
 # worker_script = "vendor/ephpm/worker.php"  # worker loop script (required)
 # worker_count = 0                # persistent workers; 0 derives from CPU quota

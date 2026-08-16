@@ -321,9 +321,11 @@ struct HeldSession {
     session: Session,
     /// Clone of the registry backend `Arc`, held so the site's database stays
     /// open for the session's lifetime and the registry's refcount-aware LRU
-    /// never evicts a site with a live session. Never read — its `Drop` (when
-    /// the session is swapped out or the thread retires) is the whole point,
-    /// as it releases the site's pin.
+    /// never evicts a site with a live session. Never read — its `Drop` is the
+    /// whole point, as it releases the site's pin. That happens when the session
+    /// is swapped out (immediately, in-band) or when a retired thread's parked
+    /// session is drained ([`drain_parked_sessions`]) — never at thread teardown
+    /// itself, which is the #300 abort.
     #[allow(dead_code)]
     _backend: SharedBackend,
 }
