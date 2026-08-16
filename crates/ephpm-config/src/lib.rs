@@ -186,6 +186,28 @@ pub struct ServerConfig {
     #[serde(default = "default_index_files")]
     pub index_files: Vec<String>,
 
+    /// Entrypoint script names to try, in order, when a WebSocket upgrade
+    /// request arrives — the `index_files` of the WebSocket path.
+    ///
+    /// Resolved against the **vhost's** document root, so each virtual host has
+    /// its own WebSocket handler (or none). The first name that exists on disk
+    /// wins and receives every event for connections upgraded on that vhost:
+    /// `connect`, `message` and `disconnect`, distinguished by
+    /// `$_SERVER['WS_EVENT']`.
+    ///
+    /// If **no** name in this list exists in the resolved document root, the
+    /// upgrade request is answered `404` — it never falls through to static
+    /// files, `index.php`, or the `[server] fallback` chain. A vhost that has
+    /// not opted into WebSockets therefore cannot accidentally serve one.
+    ///
+    /// Only consulted when `[server.websocket] enabled = true`; with the
+    /// feature off, upgrade requests are routed exactly as any other GET.
+    ///
+    /// Default: `["websocket.php"]`. Env override:
+    /// `EPHPM_SERVER__WEBSOCKET_FILES`.
+    #[serde(default = "default_websocket_files")]
+    pub websocket_files: Vec<String>,
+
     /// Fallback chain for URL resolution. Checked in order for each request.
     ///
     /// Supported variables:
@@ -280,6 +302,10 @@ pub struct ServerConfig {
     /// HTTP/3 (QUIC) settings.
     #[serde(default)]
     pub http3: Http3Config,
+
+    /// Native WebSocket support (experimental, off by default).
+    #[serde(default)]
+    pub websocket: WebSocketConfig,
 }
 
 /// Request limits configuration (`[server.request]`).
@@ -1202,6 +1228,118 @@ pub struct Http3Config {
 impl Default for Http3Config {
     fn default() -> Self {
         Self { enabled: false, listen: None, alt_svc_max_age: default_alt_svc_max_age() }
+    }
+}
+
+/// Native WebSocket configuration (`[server.websocket]`) — **experimental**.
+///
+/// ePHPm terminates WebSockets in Rust and invokes PHP **per event**, never
+/// per connection: a `connect` / `message` / `disconnect` event runs the
+/// vhost's `[server] websocket_files` entrypoint through the ordinary PHP
+/// request path and then returns. Idle connections cost reactor memory and a
+/// registry entry — no PHP thread, no worker, no process.
+///
+/// The whole feature is off unless [`WebSocketConfig::enabled`] is `true`. With
+/// it off, an upgrade request is routed exactly like any other GET (which is
+/// what ePHPm did before this section existed), so turning the section on is
+/// the only behaviour change.
+///
+/// WebSockets are negotiated over **HTTP/1.1** only. An upgrade cannot be
+/// expressed on the HTTP/2 or HTTP/3 request paths ePHPm serves (RFC 8441
+/// extended CONNECT is not implemented), and browsers open a dedicated
+/// HTTP/1.1 connection for `ws:`/`wss:` regardless — so this is not a
+/// limitation clients encounter in practice.
+#[derive(Debug, Deserialize, Clone)]
+pub struct WebSocketConfig {
+    /// Enable native WebSocket support.
+    ///
+    /// Default: `false`. Experimental and opt-in: it changes how upgrade
+    /// requests route (they resolve `[server] websocket_files` and 404 when no
+    /// entrypoint exists) and it admits long-lived connections that outlive
+    /// their HTTP request, so it is never on implicitly.
+    ///
+    /// Env override: `EPHPM_SERVER__WEBSOCKET__ENABLED`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Maximum concurrent WebSocket connections across every virtual host.
+    ///
+    /// Default: `10000`. `0` = unlimited. An upgrade beyond the cap is refused
+    /// with `503`, before the handshake completes.
+    ///
+    /// This is a **separate** budget from `[server.limits] max_connections`: an
+    /// upgraded socket is handed off to its own task and stops occupying an
+    /// HTTP connection slot, so the HTTP cap cannot bound it.
+    #[serde(default = "default_ws_max_connections")]
+    pub max_connections: usize,
+
+    /// Maximum concurrent WebSocket connections for any single virtual host.
+    ///
+    /// Default: `1000`. `0` = unlimited. Enforced in addition to
+    /// [`WebSocketConfig::max_connections`] so one tenant on a shared
+    /// deployment cannot consume the whole budget. Refused upgrades get `503`.
+    #[serde(default = "default_ws_max_connections_per_site")]
+    pub max_connections_per_site: usize,
+
+    /// Maximum size, in bytes, of a single inbound WebSocket **message**
+    /// (after reassembling continuation frames).
+    ///
+    /// Default: `1048576` (1 MiB). A message larger than this closes the
+    /// connection rather than allocating for it. This is the value PHP could be
+    /// asked to read as a request body, so it is deliberately independent of
+    /// `[server.request] max_body_size`.
+    #[serde(default = "default_ws_max_message_size")]
+    pub max_message_size: usize,
+
+    /// Maximum size, in bytes, of a single inbound WebSocket **frame**.
+    ///
+    /// Default: `1048576` (1 MiB). Bounds one read; `max_message_size` bounds
+    /// the reassembled total.
+    #[serde(default = "default_ws_max_frame_size")]
+    pub max_frame_size: usize,
+
+    /// Depth, in frames, of each connection's outbound queue.
+    ///
+    /// Default: `64`. When a connection's queue is full, the frame is **not**
+    /// buffered: `ephpm_ws_send` / `ephpm_ws_broadcast` return failure for that
+    /// connection and the socket is closed with WebSocket status `1013`. A slow
+    /// reader costs one connection, never the server's memory.
+    ///
+    /// `0` is not a valid depth and is normalized to `1` with a warning.
+    #[serde(default = "default_ws_send_queue")]
+    pub send_queue: usize,
+
+    /// Seconds between server-initiated WebSocket pings.
+    ///
+    /// Default: `30`. `0` disables keepalive pings. Pings are what keep an
+    /// otherwise-idle connection's [`WebSocketConfig::idle_timeout_secs`] from
+    /// expiring, so disabling them means idle connections are dropped.
+    #[serde(default = "default_ws_ping_interval_secs")]
+    pub ping_interval_secs: u64,
+
+    /// Seconds a connection may go without receiving **any** frame (including a
+    /// pong) before it is closed.
+    ///
+    /// Default: `120`. `0` disables the check. Keep this comfortably larger
+    /// than [`WebSocketConfig::ping_interval_secs`] — a client that answers
+    /// pings refreshes the timer, so the timeout only fires for a peer that has
+    /// genuinely gone away without a TCP reset.
+    #[serde(default = "default_ws_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
+}
+
+impl Default for WebSocketConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_connections: default_ws_max_connections(),
+            max_connections_per_site: default_ws_max_connections_per_site(),
+            max_message_size: default_ws_max_message_size(),
+            max_frame_size: default_ws_max_frame_size(),
+            send_queue: default_ws_send_queue(),
+            ping_interval_secs: default_ws_ping_interval_secs(),
+            idle_timeout_secs: default_ws_idle_timeout_secs(),
+        }
     }
 }
 
@@ -2441,6 +2579,40 @@ impl Config {
             )));
         }
 
+        // Native WebSockets dispatch each event through the fpm per-request
+        // path (a fresh entrypoint execution per event). Worker mode routes
+        // every request into the persistent worker's PSR-7 envelope loop
+        // instead, so the entrypoint would never run. Hard error rather than a
+        // warning: ePHPm does not come up quietly without the WebSocket support
+        // an operator asked for (the `[server.http3]` precedent).
+        //
+        // Checked BEFORE the worker-mode block below so the incompatibility is
+        // what the operator is told about, rather than a downstream complaint
+        // about the worker script.
+        if self.server.websocket.enabled && self.php.is_worker_mode() {
+            return Err(ConfigError::Validation(
+                "[server.websocket] enabled = true is not supported together with \
+                 [php] mode = \"worker\". WebSocket events are dispatched through \
+                 the fpm per-request path; in worker mode every request is served \
+                 by the persistent worker loop, so the `websocket_files` \
+                 entrypoint would never execute. Use fpm mode (the default) for \
+                 WebSockets."
+                    .to_string(),
+            ));
+        }
+
+        // An entrypoint name is what makes a vhost WebSocket-capable at all —
+        // an empty list means every upgrade request 404s, which is a silently
+        // disabled feature rather than a configuration.
+        if self.server.websocket.enabled && self.server.websocket_files.is_empty() {
+            return Err(ConfigError::Validation(
+                "[server] websocket_files is empty but [server.websocket] enabled = \
+                 true — every upgrade request would 404. Name at least one \
+                 entrypoint (default: [\"websocket.php\"])."
+                    .to_string(),
+            ));
+        }
+
         if self.php.is_worker_mode() {
             if self.server.sites_dir.is_some() {
                 return Err(ConfigError::Validation(
@@ -2597,6 +2769,7 @@ impl Default for ServerConfig {
             run_as_group: None,
             sites_domain_suffix: None,
             index_files: default_index_files(),
+            websocket_files: default_websocket_files(),
             fallback: default_fallback(),
             preview: false,
             request: RequestConfig::default(),
@@ -2612,6 +2785,7 @@ impl Default for ServerConfig {
             file_cache: FileCacheConfig::default(),
             tls: None,
             http3: Http3Config::default(),
+            websocket: WebSocketConfig::default(),
         }
     }
 }
@@ -3875,6 +4049,49 @@ fn default_index_files() -> Vec<String> {
     vec!["index.php".to_string(), "index.html".to_string()]
 }
 
+/// Default WebSocket entrypoint names — one, mirroring `index.php`'s role on
+/// the HTTP path.
+fn default_websocket_files() -> Vec<String> {
+    vec!["websocket.php".to_string()]
+}
+
+/// Global WebSocket connection ceiling. Chosen to be large enough that no
+/// ordinary deployment meets it, but finite: the whole point of terminating
+/// sockets in Rust is cheap idle connections, and "cheap" is not "free".
+fn default_ws_max_connections() -> usize {
+    10_000
+}
+
+/// Per-vhost WebSocket ceiling — a tenth of the global default, so a
+/// multi-tenant node needs ten busy tenants before the global cap is the
+/// binding constraint.
+fn default_ws_max_connections_per_site() -> usize {
+    1_000
+}
+
+fn default_ws_max_message_size() -> usize {
+    1024 * 1024 // 1 MiB
+}
+
+fn default_ws_max_frame_size() -> usize {
+    1024 * 1024 // 1 MiB
+}
+
+/// Outbound queue depth per connection. Deep enough to absorb a burst from one
+/// broadcast, shallow enough that a stalled reader is detected in frames rather
+/// than megabytes.
+fn default_ws_send_queue() -> usize {
+    64
+}
+
+fn default_ws_ping_interval_secs() -> u64 {
+    30
+}
+
+fn default_ws_idle_timeout_secs() -> u64 {
+    120
+}
+
 fn default_fallback() -> Vec<String> {
     vec!["$uri".to_string(), "$uri/".to_string(), "/index.php?$query_string".to_string()]
 }
@@ -4138,6 +4355,177 @@ alt_svc_max_age = 3600
         let _env = EnvVars::set("EPHPM_SERVER__HTTP3__ALT_SVC_MAX_AGE", "120");
         let config = Config::load(&file).unwrap();
         assert_eq!(config.server.http3.alt_svc_max_age, 120);
+    }
+
+    // ── [server.websocket] + [server] websocket_files ────────────────
+
+    /// Section absent: the feature is off and every bound resolves to its
+    /// documented default. Also guards against the `[server.security]` lesson —
+    /// a missing section must not zero the carefully chosen field defaults.
+    #[test]
+    fn websocket_section_absent_is_off_with_documented_bounds() {
+        let config = Config::default_config().expect("default config should load");
+        let ws = &config.server.websocket;
+        assert!(!ws.enabled, "native websockets must be opt-in");
+        assert_eq!(ws.max_connections, 10_000);
+        assert_eq!(ws.max_connections_per_site, 1_000);
+        assert_eq!(ws.max_message_size, 1024 * 1024);
+        assert_eq!(ws.max_frame_size, 1024 * 1024);
+        assert_eq!(ws.send_queue, 64);
+        assert_eq!(ws.ping_interval_secs, 30);
+        assert_eq!(ws.idle_timeout_secs, 120);
+        // The hand-written Default must not drift from the serde defaults.
+        let hand_written = WebSocketConfig::default();
+        assert_eq!(hand_written.max_connections, ws.max_connections);
+        assert_eq!(hand_written.send_queue, ws.send_queue);
+        assert_eq!(hand_written.idle_timeout_secs, ws.idle_timeout_secs);
+    }
+
+    /// `websocket_files` mirrors `index_files`: absent means one documented
+    /// name, and setting it replaces the list wholesale.
+    #[test]
+    fn websocket_files_defaults_to_one_entrypoint() {
+        let config = Config::default_config().expect("default config should load");
+        assert_eq!(config.server.websocket_files, vec!["websocket.php"]);
+    }
+
+    #[test]
+    fn websocket_files_is_configurable_as_an_ordered_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nwebsocket_files = [\"ws.php\", \"public/ws.php\"]\n")
+            .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.websocket_files, vec!["ws.php", "public/ws.php"]);
+    }
+
+    /// Section present but partial: the one named field takes effect and every
+    /// other bound keeps its default rather than collapsing to zero.
+    #[test]
+    fn websocket_section_partial_keeps_other_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server.websocket]\nenabled = true\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.websocket.enabled);
+        assert_eq!(config.server.websocket.send_queue, 64);
+        assert_eq!(config.server.websocket.max_connections, 10_000);
+        assert_eq!(config.server.websocket.idle_timeout_secs, 120);
+    }
+
+    #[test]
+    fn websocket_bounds_are_configurable() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r"
+[server.websocket]
+enabled = true
+max_connections = 50
+max_connections_per_site = 5
+max_message_size = 4096
+max_frame_size = 2048
+send_queue = 8
+ping_interval_secs = 5
+idle_timeout_secs = 15
+",
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let ws = &config.server.websocket;
+        assert!(ws.enabled);
+        assert_eq!(ws.max_connections, 50);
+        assert_eq!(ws.max_connections_per_site, 5);
+        assert_eq!(ws.max_message_size, 4096);
+        assert_eq!(ws.max_frame_size, 2048);
+        assert_eq!(ws.send_queue, 8);
+        assert_eq!(ws.ping_interval_secs, 5);
+        assert_eq!(ws.idle_timeout_secs, 15);
+    }
+
+    /// Worker mode never runs the entrypoint, so the combination must fail at
+    /// startup rather than serving upgrades that silently do nothing.
+    #[test]
+    fn websockets_with_worker_mode_is_a_startup_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[server.websocket]\nenabled = true\n\n[php]\nmode = \"worker\"\nworker_script = \"w.php\"\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let err = config.validate().expect_err("worker + websocket must not validate");
+        let msg = err.to_string();
+        assert!(msg.contains("websocket"), "unhelpful error: {msg}");
+        assert!(msg.contains("worker"), "unhelpful error: {msg}");
+    }
+
+    /// An enabled feature with no entrypoint name would 404 every upgrade —
+    /// a silently disabled feature, which is exactly what the no-silent-no-op
+    /// rule forbids.
+    #[test]
+    fn websockets_enabled_with_no_entrypoint_names_is_a_startup_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[server]\nwebsocket_files = []\n\n[server.websocket]\nenabled = true\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let err = config.validate().expect_err("empty websocket_files must not validate");
+        assert!(err.to_string().contains("websocket_files"), "unhelpful error: {err}");
+    }
+
+    /// The feature being off must not make an empty list an error, and must
+    /// not make worker mode an error.
+    #[test]
+    fn websocket_validation_is_inert_when_the_feature_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        let script = dir.path().join("w.php");
+        std::fs::write(&script, "<?php\n").unwrap();
+        std::fs::write(
+            &file,
+            format!(
+                "[server]\ndocument_root = {:?}\nwebsocket_files = []\n\n[php]\nmode = \"worker\"\nworker_script = \"w.php\"\n",
+                dir.path().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(!config.server.websocket.enabled);
+        config.validate().expect("websocket checks must not fire when the feature is off");
+    }
+
+    #[test]
+    fn test_env_var_overrides_websocket_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server.websocket]\nenabled = false\n").unwrap();
+
+        let _env = EnvVars::set("EPHPM_SERVER__WEBSOCKET__ENABLED", "true");
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.websocket.enabled);
+    }
+
+    #[test]
+    fn test_env_var_overrides_websocket_send_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+
+        let _env = EnvVars::set("EPHPM_SERVER__WEBSOCKET__SEND_QUEUE", "4");
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.websocket.send_queue, 4);
     }
 
     // ── [server.diagnostics] ─────────────────────────────────────────

@@ -52,6 +52,7 @@ The `ephpm-e2e` crate is **excluded from the workspace** and has different depen
 | `ephpm-db` | DB proxy — MySQL wire protocol, connection pooling, R/W splitting |
 | `ephpm-cluster` | Clustering — SWIM gossip (chitchat), hashed large-value ownership (`hash(key)` mod sorted alive nodes — not a consistent-hash ring), KV replication, SQLite primary election |
 | `ephpm-query-stats` | Query observability — SQL normalization, digest tracking, slow query logging, Prometheus metrics |
+| `ephpm-ws` | Site-scoped WebSocket connection registry — connection/channel maps, bounded per-connection outbound queues, capability-style connection IDs. Protocol-free (no framing), so both `ephpm-php` and `ephpm-server` depend on it |
 | `xtask` | Build & test tooling — `release`, `php-sdk`, `e2e` (bare-process default), `k8s-e2e`/`k8s-e2e-up`/`k8s-e2e-down` (opt-in Kind path) |
 
 ## External Dependencies
@@ -121,6 +122,8 @@ The `TrackedBackend` wrapper in `ephpm-server/src/tracked_backend.rs` wraps any 
 | `ephpm-server/src/turso_cdc.rs` | `start_clustered_turso_cdc()` — the in-process Turso CDC clustered replication path |
 | `ephpm-server/src/tracked_backend.rs` | `TrackedBackend<B>` — wraps litewire `Backend` with query stats |
 | `ephpm-server/src/router.rs` | HTTP request routing, PHP dispatch, static file serving |
+| `ephpm-server/src/websocket.rs` | Native WebSocket upgrade + per-connection session task (`[server.websocket]`, experimental) |
+| `ephpm-php/src/ws_bridge.rs` | `ephpm_ws_*` native functions — per-thread site scope + current-connection context |
 | `ephpm-config/src/lib.rs` | All config structs: `SqliteConfig`, `ReplicationConfig`, `ClusterConfig`, `DbAnalysisConfig` |
 | `ephpm-cluster/src/sqlite_election.rs` | Primary election via gossip KV (lowest ordinal wins, TTL heartbeat) |
 | `ephpm-query-stats/src/digest.rs` | SQL normalizer (state machine replacing literals with `?`) |

@@ -10,6 +10,10 @@ build = "build.rs"
 
 [dependencies]
 ephpm-kv.workspace = true
+# ws_bridge: the site-scoped WebSocket connection registry the `ephpm_ws_*`
+# native functions push into. Protocol-free, so this adds no wire-format
+# dependency to the PHP crate.
+ephpm-ws.workspace = true
 # db_bridge: per-thread litewire Session executing PHP `ephpm_db_*` calls
 # against the same backend the wire frontends serve.
 litewire.workspace = true
