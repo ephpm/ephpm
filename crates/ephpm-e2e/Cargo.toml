@@ -21,3 +21,10 @@ urlencoding = "2"
 brotli = "7"
 anyhow = "1"
 tempfile = "3"
+# A real WebSocket client for the `websockets` suite. `client_async` (not
+# `connect_async`) is what the suite uses: it does the RFC 6455 handshake over
+# a socket we opened ourselves, so the request can carry `Host: ws-a.test`
+# while actually connecting to 127.0.0.1 — which is how one loopback server
+# gets tested as two virtual hosts.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }

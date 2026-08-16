@@ -147,6 +147,14 @@ const ISOLATED_DB_SUITES: &[&str] = &[
 /// requests that resolve to a site key) with the template's generous explicit
 /// per-IP limits and explicit `max_connections = 100`, which doubles as an
 /// end-to-end proof that explicit `[server.limits]` values beat the preset.
+///
+/// `websockets` needs `[server.websocket] enabled = true`, which changes how
+/// **every** upgrade request routes (they resolve `[server] websocket_files`
+/// and 404 when no entrypoint exists). That is a whole-server switch, so — like
+/// `fpm_pool` — it gets its own node rather than being bolted onto the shared
+/// template. It runs multi-tenant (`sites_dir`) so the suite can prove
+/// cross-site isolation with two real vhosts on one server, which is the
+/// property most worth an end-to-end test.
 const ISOLATED_CONFIG_SUITES: &[&str] = &[
     "opcache_invalidation",
     "rate_limit",
@@ -156,6 +164,7 @@ const ISOLATED_CONFIG_SUITES: &[&str] = &[
     "fpm_pool",
     "crash_containment",
     "preview",
+    "websockets",
 ];
 
 /// Suites that run single-threaded (a superset of the DB suites). Kept as a
@@ -181,11 +190,17 @@ fn suite_is_serial(name: &str) -> bool {
     // it probes the over-cap behaviour. Run concurrently, the burst test's
     // connections would be shed too and its "some requests succeed" half
     // could never hold.
+    //
+    // `websockets` deploys two vhost directories into `sites_dir` and shares
+    // one KV keyspace per vhost across its tests. Running serially means each
+    // test can assert on absolute connection counts and KV state instead of
+    // having to name every key uniquely and hope.
     ISOLATED_DB_SUITES.contains(&name)
         || name == "worker_mode"
         || name == "fpm_pool"
         || name == "crash_containment"
         || name == "rate_limit"
+        || name == "websockets"
 }
 
 /// Whether a suite needs its own freshly-spawned, then-torn-down single node
@@ -671,6 +686,7 @@ fn recreate_dir(path: &Path) -> io::Result<()> {
 /// empty), `{DB_SQLITE_BLOCK}` (the whole `[db.sqlite]` section — see
 /// [`SingleNodeOptions::with_sites_dir`]), `{KV_SECRET_LINE}` (a `[kv] secret`
 /// line, or empty), `{OPCACHE_BLOCK}` (an optional `[opcache]` section, or
+/// empty), `{WEBSOCKET_BLOCK}` (an optional `[server.websocket]` section, or
 /// empty), `{MIDDLEWARE_BLOCK}` (an optional `[[middleware]]` mount, or empty),
 /// `{MTH_LINE}` (the `multi_tenant_hardening = <bool>` line in
 /// `[server.security]`), `{INI_OVERRIDES_EXTRA}` (extra `[php] ini_overrides`
@@ -746,6 +762,10 @@ trusted_hosts = [
     # Consumed only by the isolated `multitenant_hardening` node (which renders
     # from this same template); inert on every other node.
     "harden.test",
+    # Consumed only by the isolated `websockets` node. Two vhosts, so the suite
+    # can prove one tenant's connections are unreachable from the other.
+    "ws-a.test",
+    "ws-b.test",
 ]
 
 [server.response]
@@ -813,6 +833,7 @@ eviction_policy = "allkeys-lru"
 enabled = true
 socket = "{KV_SOCKET}"
 {OPCACHE_BLOCK}
+{WEBSOCKET_BLOCK}
 {MIDDLEWARE_BLOCK}
 "#;
 
@@ -883,9 +904,12 @@ struct SingleNodeOptions {
     slug: String,
     /// Configure `[server] sites_dir` — i.e. run this node **multi-tenant**.
     ///
-    /// Only the long-lived shared node sets it, because only `vhosts` and
-    /// `security_p0` need it (they are the sole readers of `EPHPM_SITES_DIR`).
-    /// Every isolated node runs single-site.
+    /// Set on the long-lived shared node (for `vhosts` and `security_p0`) and
+    /// on the isolated nodes that run multi-tenant: `multitenant_hardening`
+    /// and `websockets` (whose subject *is* multi-tenancy) plus `preview`
+    /// (whose per-site rate cap only acts on requests that resolve to a site
+    /// key). Every other isolated node runs single-site. `EPHPM_SITES_DIR` is
+    /// exported to the suite exactly when this is set.
     ///
     /// This one flag decides three things at once, because the server ties them
     /// together and fails closed on the mismatched combinations:
@@ -958,6 +982,20 @@ struct SingleNodeOptions {
     /// `with_sites_dir = true`: the per-site cap only acts on requests that
     /// resolve to a site key.
     preview: bool,
+    /// Emit `[server.websocket] enabled = true` — turn on native WebSockets.
+    ///
+    /// Only the `websockets` suite sets it. Every other node leaves it `false`,
+    /// so `{WEBSOCKET_BLOCK}` renders empty and their behaviour is
+    /// byte-identical to before this knob existed. That matters more here than
+    /// for most flags: with the feature ON, **every** `Connection: Upgrade` +
+    /// `Upgrade: websocket` request stops falling through to the fallback chain
+    /// and 404s unless the vhost has a `websocket_files` entrypoint.
+    ///
+    /// Implies `with_sites_dir = true`. The suite's most valuable assertion is
+    /// that one tenant cannot reach another's sockets, which needs two real
+    /// vhosts on one server; running the whole suite multi-tenant is what makes
+    /// that a single-node test rather than a second fixture.
+    websocket: bool,
 }
 
 impl SingleNodeOptions {
@@ -982,6 +1020,7 @@ impl SingleNodeOptions {
             fpm_engine_pool: false,
             crash_containment: false,
             preview: false,
+            websocket: false,
         }
     }
 
@@ -1004,6 +1043,7 @@ impl SingleNodeOptions {
                 fpm_engine_pool: false,
                 crash_containment: false,
                 preview: false,
+                websocket: false,
             },
             // multitenant_hardening: the ONLY isolated node that runs
             // multi-tenant (sites_dir set) AND with the hardening preset on.
@@ -1024,6 +1064,7 @@ impl SingleNodeOptions {
                 fpm_engine_pool: false,
                 crash_containment: false,
                 preview: false,
+                websocket: false,
             },
             // worker_mode: persistent worker pool over tests/worker-docroot.
             // sites_dir MUST stay off — worker mode + sites_dir is rejected at
@@ -1039,6 +1080,7 @@ impl SingleNodeOptions {
                 fpm_engine_pool: false,
                 crash_containment: false,
                 preview: false,
+                websocket: false,
             },
             // rate_limit: small bucket, on its own node. See
             // ISOLATED_CONFIG_SUITES for why this can't share the shared node.
@@ -1053,6 +1095,7 @@ impl SingleNodeOptions {
                 fpm_engine_pool: false,
                 crash_containment: false,
                 preview: false,
+                websocket: false,
             },
             // middleware: mount the freshly built cors cdylib by explicit
             // path, exercising the dlopen lane in a real server.
@@ -1067,6 +1110,7 @@ impl SingleNodeOptions {
                 fpm_engine_pool: false,
                 crash_containment: false,
                 preview: false,
+                websocket: false,
             },
             // fpm_pool: the ONLY node on the experimental dedicated FPM thread
             // pool (`[php] fpm_engine = "pool"`). Single-site so it gets the
@@ -1088,6 +1132,7 @@ impl SingleNodeOptions {
                 fpm_engine_pool: true,
                 crash_containment: false,
                 preview: false,
+                websocket: false,
             },
             // crash_containment: the ONLY node with `[php] crash_containment =
             // true` (which additionally REQUIRES the pool engine — the server
@@ -1109,6 +1154,7 @@ impl SingleNodeOptions {
                 fpm_engine_pool: true,
                 crash_containment: true,
                 preview: false,
+                websocket: false,
             },
             // preview: the ONLY node with `[server] preview = true`. Runs
             // multi-tenant (sites_dir set) because the per-site PHP rate cap —
@@ -1129,6 +1175,26 @@ impl SingleNodeOptions {
                 fpm_engine_pool: false,
                 crash_containment: false,
                 preview: true,
+                websocket: false,
+            },
+            // websockets: the ONLY node with `[server.websocket] enabled`.
+            // Multi-tenant (`sites_dir`) so the suite gets two real vhosts and
+            // can prove a connection opened on one is unreachable from the
+            // other — the property the whole site-scoped registry exists for.
+            // Hardening stays off: it is orthogonal here, and leaving it on
+            // would couple this suite to the preset's behaviour.
+            "websockets" => Self {
+                slug,
+                with_sites_dir: true,
+                opcache_invalidation: false,
+                tight_rate_limit: false,
+                middleware_lib: None,
+                worker: false,
+                multi_tenant_hardening: false,
+                fpm_engine_pool: false,
+                crash_containment: false,
+                preview: false,
+                websocket: true,
             },
             // DB suites: fresh DB, single-site. `sites_dir` is NOT optional
             // detail here — it would put the node in per-site database mode,
@@ -1147,6 +1213,7 @@ impl SingleNodeOptions {
                 fpm_engine_pool: false,
                 crash_containment: false,
                 preview: false,
+                websocket: false,
             },
         }
     }
@@ -1284,6 +1351,18 @@ impl SingleNodeSpawn {
         } else {
             ""
         };
+        // Native WebSockets: ON only for the `websockets` suite's node. The
+        // bounds are deliberately small so the suite can reach them cheaply —
+        // a 4-frame send queue and a 64 KiB message cap — while the ping/idle
+        // pair stays wide enough that a slow test run never trips the keepalive
+        // and produces a flake.
+        let websocket_block = if opts.websocket {
+            "\n[server.websocket]\nenabled = true\nsend_queue = 4\n\
+             max_message_size = 65536\nmax_frame_size = 65536\n\
+             ping_interval_secs = 5\nidle_timeout_secs = 120"
+        } else {
+            ""
+        };
         let limits_block = if opts.tight_rate_limit {
             "per_ip_rate = 500.0\nper_ip_burst = 100"
         } else {
@@ -1350,6 +1429,7 @@ impl SingleNodeSpawn {
             .replace("{DB_SQLITE_BLOCK}", &db_sqlite_block)
             .replace("{KV_SECRET_LINE}", &kv_secret_line)
             .replace("{OPCACHE_BLOCK}", &opcache_block)
+            .replace("{WEBSOCKET_BLOCK}", websocket_block)
             .replace("{MIDDLEWARE_BLOCK}", &middleware_block)
             .replace("{LIMITS_BLOCK}", limits_block)
             .replace("{MTH_LINE}", mth_line)

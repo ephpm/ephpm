@@ -3080,6 +3080,346 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_execute, 0, 0, 1)
     ZEND_ARG_INFO(0, params)
 ZEND_END_ARG_INFO()
 
+/* ===================================================================
+ * WebSocket native PHP functions
+ *
+ * ePHPm owns every WebSocket socket in Rust; PHP never holds one. These
+ * functions push into a Rust-side registry (ws_bridge.rs -> ephpm-ws),
+ * which hands the frame to the target connection's session task.
+ *
+ * They are callable from ANY PHP execution, not just a websocket
+ * entrypoint event — an ordinary HTTP request handler pushing to a live
+ * socket is the point of the design.
+ *
+ * TWO FORMS. Each operation comes in an implicit and an explicit form:
+ *
+ *   ephpm_ws_send($payload)                  -> the connection that fired
+ *                                               THIS event
+ *   ephpm_ws_connection_send($id, $payload)  -> any connection in this site
+ *
+ * The implicit form reads a per-thread "current connection" the router
+ * installs for the duration of a websocket event dispatch (the same
+ * pattern as db_bridge's per-thread site session, and cleared the same
+ * way — every PHP execution sets it, to the event's connection or to
+ * nothing, so it can never leak into the next request on a reused
+ * thread). Called from an ordinary HTTP request there is no current
+ * connection, and the implicit form THROWS rather than silently doing
+ * nothing.
+ *
+ * SITE SCOPE. Every one of these is scoped to the CALLING request's
+ * virtual host, read from a Rust thread-local the router installs before
+ * PHP runs (exactly like ephpm_db_*). The scope is never taken from an
+ * argument: a connection id names a connection only within the site that
+ * created it, so site A cannot reach site B's sockets or channels even
+ * holding a valid id. A request whose Host matched no vhost has no scope
+ * and every call below throws.
+ *
+ * All state lives in Rust; g_ws_ops is written once at startup
+ * (ephpm_set_ws_ops) before any PHP thread runs, then read-only — same
+ * ZTS discipline as g_kv_ops and g_db_ops.
+ * =================================================================== */
+
+/* Bridge status codes. Non-negative is a result (0/1 for the boolean
+ * operations, a receiver count for broadcast); negative is a condition
+ * that must reach the script as an exception rather than as `false`. */
+#define EPHPM_WS_NO_CONN     (-1)
+#define EPHPM_WS_NO_SITE     (-2)
+#define EPHPM_WS_NO_REGISTRY (-3)
+
+typedef struct {
+    /* Queue one frame. `conn_id == NULL` means "the connection that
+     * fired the current event"; otherwise the id names a connection in
+     * the calling request's site. Returns 1 on success, 0 when the
+     * connection is unknown to this site, gone, or its bounded outbound
+     * queue is full (which also closes that connection with 1013), or a
+     * negative EPHPM_WS_* status. */
+    long (*send)(const char *conn_id, size_t conn_id_len,
+                 const char *payload, size_t payload_len, int binary);
+    /* Subscribe / unsubscribe a connection to a site-scoped channel.
+     * Same `conn_id == NULL` convention and same return contract. */
+    long (*subscribe)(const char *conn_id, size_t conn_id_len,
+                      const char *channel, size_t channel_len);
+    long (*unsubscribe)(const char *conn_id, size_t conn_id_len,
+                        const char *channel, size_t channel_len);
+    /* Queue one frame to every member of a site-scoped channel. Returns
+     * the number of connections it was queued to, or a negative
+     * EPHPM_WS_* status. Needs no current connection. */
+    long (*broadcast)(const char *channel, size_t channel_len,
+                      const char *payload, size_t payload_len, int binary);
+    /* Ask a connection's session task to close with `code`. Same
+     * `conn_id == NULL` convention and same return contract.
+     * Must stay LAST-appended: the layout mirrors ws_bridge.rs. */
+    long (*close)(const char *conn_id, size_t conn_id_len, int code);
+} EphpmWsOps;
+
+static EphpmWsOps g_ws_ops = {0};
+
+/* Turn a negative bridge status into a PHP exception. Returns 1 if it
+ * threw (the caller must RETURN_THROWS()), 0 otherwise.
+ *
+ * These are all misuse or misconfiguration, never an ordinary outcome —
+ * an unreachable connection is `false`, but "there is no websocket
+ * subsystem" / "this request has no tenant" / "there is no current
+ * connection here" are bugs the script must not be able to ignore. Same
+ * reasoning as ephpm_db_*'s exception on a missing backend. */
+static int ephpm_ws_threw(long rc)
+{
+    switch (rc) {
+        case EPHPM_WS_NO_REGISTRY:
+            zend_throw_exception(zend_ce_exception,
+                "ephpm_ws: native websockets are not enabled on this server "
+                "(set [server.websocket] enabled = true)", 0);
+            return 1;
+        case EPHPM_WS_NO_SITE:
+            zend_throw_exception(zend_ce_exception,
+                "ephpm_ws: no websocket context for this request — its Host "
+                "matched no virtual host, so it has no websocket capability", 0);
+            return 1;
+        case EPHPM_WS_NO_CONN:
+            zend_throw_exception(zend_ce_exception,
+                "ephpm_ws: no current websocket connection. The implicit form "
+                "is only valid inside a websocket event; from an ordinary HTTP "
+                "request use the ephpm_ws_connection_*() form with an explicit "
+                "connection id", 0);
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* Guard for a never-installed ops table: identical to the registry being
+ * absent, so it produces the same exception. */
+#define EPHPM_WS_REQUIRE(fn)                                   \
+    do {                                                       \
+        if (!(fn)) {                                           \
+            (void)ephpm_ws_threw(EPHPM_WS_NO_REGISTRY);        \
+            RETURN_THROWS();                                   \
+        }                                                      \
+    } while (0)
+
+/* ephpm_ws_send(string $payload, bool $binary = false): bool
+ *
+ * Push one frame to the connection that fired the current event.
+ * Returns false if that connection has gone or its outbound queue is
+ * full — the latter sheds it with WebSocket status 1013 rather than
+ * buffering. Throws outside a websocket event. */
+PHP_FUNCTION(ephpm_ws_send)
+{
+    char *payload; size_t payload_len;
+    bool binary = 0;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STRING(payload, payload_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL(binary)
+    ZEND_PARSE_PARAMETERS_END();
+
+    EPHPM_WS_REQUIRE(g_ws_ops.send);
+    long rc = g_ws_ops.send(NULL, 0, payload, payload_len, binary ? 1 : 0);
+    if (ephpm_ws_threw(rc)) { RETURN_THROWS(); }
+    RETURN_BOOL(rc);
+}
+
+/* ephpm_ws_connection_send(string $connection_id, string $payload,
+ *                          bool $binary = false): bool
+ *
+ * The explicit form: push to any connection in the calling request's
+ * site. This is what an ordinary HTTP handler uses after looking the id
+ * up (see the websockets guide's HTTP-pushes-to-socket pattern). */
+PHP_FUNCTION(ephpm_ws_connection_send)
+{
+    char *conn_id; size_t conn_id_len;
+    char *payload; size_t payload_len;
+    bool binary = 0;
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_STRING(conn_id, conn_id_len)
+        Z_PARAM_STRING(payload, payload_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL(binary)
+    ZEND_PARSE_PARAMETERS_END();
+
+    EPHPM_WS_REQUIRE(g_ws_ops.send);
+    long rc = g_ws_ops.send(conn_id, conn_id_len, payload, payload_len,
+                            binary ? 1 : 0);
+    if (ephpm_ws_threw(rc)) { RETURN_THROWS(); }
+    RETURN_BOOL(rc);
+}
+
+/* ephpm_ws_subscribe(string $channel): bool
+ *
+ * Join the current event's connection to a channel. Channels are
+ * site-scoped: `chat` on one vhost and `chat` on another are different
+ * channels. Throws outside a websocket event. */
+PHP_FUNCTION(ephpm_ws_subscribe)
+{
+    char *channel; size_t channel_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(channel, channel_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    EPHPM_WS_REQUIRE(g_ws_ops.subscribe);
+    long rc = g_ws_ops.subscribe(NULL, 0, channel, channel_len);
+    if (ephpm_ws_threw(rc)) { RETURN_THROWS(); }
+    RETURN_BOOL(rc);
+}
+
+/* ephpm_ws_connection_subscribe(string $connection_id,
+ *                               string $channel): bool */
+PHP_FUNCTION(ephpm_ws_connection_subscribe)
+{
+    char *conn_id; size_t conn_id_len;
+    char *channel; size_t channel_len;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(conn_id, conn_id_len)
+        Z_PARAM_STRING(channel, channel_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    EPHPM_WS_REQUIRE(g_ws_ops.subscribe);
+    long rc = g_ws_ops.subscribe(conn_id, conn_id_len, channel, channel_len);
+    if (ephpm_ws_threw(rc)) { RETURN_THROWS(); }
+    RETURN_BOOL(rc);
+}
+
+/* ephpm_ws_unsubscribe(string $channel): bool */
+PHP_FUNCTION(ephpm_ws_unsubscribe)
+{
+    char *channel; size_t channel_len;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(channel, channel_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    EPHPM_WS_REQUIRE(g_ws_ops.unsubscribe);
+    long rc = g_ws_ops.unsubscribe(NULL, 0, channel, channel_len);
+    if (ephpm_ws_threw(rc)) { RETURN_THROWS(); }
+    RETURN_BOOL(rc);
+}
+
+/* ephpm_ws_connection_unsubscribe(string $connection_id,
+ *                                 string $channel): bool */
+PHP_FUNCTION(ephpm_ws_connection_unsubscribe)
+{
+    char *conn_id; size_t conn_id_len;
+    char *channel; size_t channel_len;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_STRING(conn_id, conn_id_len)
+        Z_PARAM_STRING(channel, channel_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    EPHPM_WS_REQUIRE(g_ws_ops.unsubscribe);
+    long rc = g_ws_ops.unsubscribe(conn_id, conn_id_len, channel, channel_len);
+    if (ephpm_ws_threw(rc)) { RETURN_THROWS(); }
+    RETURN_BOOL(rc);
+}
+
+/* ephpm_ws_broadcast(string $channel, string $payload,
+ *                    bool $binary = false): int
+ *
+ * Push one frame to every member of a channel in the calling request's
+ * site. Returns the number of connections the frame was queued to;
+ * subscribers whose queue was full are not counted (and are shed).
+ *
+ * Needs no current connection, so it works identically inside a
+ * websocket event and inside an ordinary HTTP request. */
+PHP_FUNCTION(ephpm_ws_broadcast)
+{
+    char *channel; size_t channel_len;
+    char *payload; size_t payload_len;
+    bool binary = 0;
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_STRING(channel, channel_len)
+        Z_PARAM_STRING(payload, payload_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_BOOL(binary)
+    ZEND_PARSE_PARAMETERS_END();
+
+    EPHPM_WS_REQUIRE(g_ws_ops.broadcast);
+    long rc = g_ws_ops.broadcast(channel, channel_len, payload, payload_len,
+                                 binary ? 1 : 0);
+    if (ephpm_ws_threw(rc)) { RETURN_THROWS(); }
+    RETURN_LONG((zend_long)rc);
+}
+
+/* ephpm_ws_close(int $code = 1000): bool
+ *
+ * Ask the current event's connection to close. Asynchronous: the socket
+ * is closed by the task that owns it, not inside this call, so any frame
+ * already queued ahead of the close is still delivered. Throws outside a
+ * websocket event. */
+PHP_FUNCTION(ephpm_ws_close)
+{
+    zend_long code = 1000;
+    ZEND_PARSE_PARAMETERS_START(0, 1)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(code)
+    ZEND_PARSE_PARAMETERS_END();
+
+    EPHPM_WS_REQUIRE(g_ws_ops.close);
+    long rc = g_ws_ops.close(NULL, 0, (int)code);
+    if (ephpm_ws_threw(rc)) { RETURN_THROWS(); }
+    RETURN_BOOL(rc);
+}
+
+/* ephpm_ws_connection_close(string $connection_id,
+ *                           int $code = 1000): bool */
+PHP_FUNCTION(ephpm_ws_connection_close)
+{
+    char *conn_id; size_t conn_id_len;
+    zend_long code = 1000;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STRING(conn_id, conn_id_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_LONG(code)
+    ZEND_PARSE_PARAMETERS_END();
+
+    EPHPM_WS_REQUIRE(g_ws_ops.close);
+    long rc = g_ws_ops.close(conn_id, conn_id_len, (int)code);
+    if (ephpm_ws_threw(rc)) { RETURN_THROWS(); }
+    RETURN_BOOL(rc);
+}
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_ws_send, 0, 0, 1)
+    ZEND_ARG_INFO(0, payload)
+    ZEND_ARG_INFO(0, binary)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_ws_connection_send, 0, 0, 2)
+    ZEND_ARG_INFO(0, connection_id)
+    ZEND_ARG_INFO(0, payload)
+    ZEND_ARG_INFO(0, binary)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_ws_subscribe, 0, 0, 1)
+    ZEND_ARG_INFO(0, channel)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_ws_connection_subscribe, 0, 0, 2)
+    ZEND_ARG_INFO(0, connection_id)
+    ZEND_ARG_INFO(0, channel)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_ws_unsubscribe, 0, 0, 1)
+    ZEND_ARG_INFO(0, channel)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_ws_connection_unsubscribe, 0, 0, 2)
+    ZEND_ARG_INFO(0, connection_id)
+    ZEND_ARG_INFO(0, channel)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_ws_broadcast, 0, 0, 2)
+    ZEND_ARG_INFO(0, channel)
+    ZEND_ARG_INFO(0, payload)
+    ZEND_ARG_INFO(0, binary)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_ws_close, 0, 0, 0)
+    ZEND_ARG_INFO(0, code)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_ws_connection_close, 0, 0, 1)
+    ZEND_ARG_INFO(0, connection_id)
+    ZEND_ARG_INFO(0, code)
+ZEND_END_ARG_INFO()
+
 /* ── Function entry table (null-terminated) ──────────────────── */
 
 static const zend_function_entry ephpm_kv_functions[] = {
@@ -3099,6 +3439,18 @@ static const zend_function_entry ephpm_kv_functions[] = {
     /* Embedded database bridge (per-thread litewire Session). */
     PHP_FE(ephpm_db_query,     arginfo_ephpm_db_query)
     PHP_FE(ephpm_db_execute,   arginfo_ephpm_db_execute)
+    /* WebSocket bridge (site-scoped connection registry). Implicit forms
+     * act on the connection that fired the current event; the
+     * ephpm_ws_connection_* forms take an explicit id. */
+    PHP_FE(ephpm_ws_send,                    arginfo_ephpm_ws_send)
+    PHP_FE(ephpm_ws_connection_send,         arginfo_ephpm_ws_connection_send)
+    PHP_FE(ephpm_ws_subscribe,               arginfo_ephpm_ws_subscribe)
+    PHP_FE(ephpm_ws_connection_subscribe,    arginfo_ephpm_ws_connection_subscribe)
+    PHP_FE(ephpm_ws_unsubscribe,             arginfo_ephpm_ws_unsubscribe)
+    PHP_FE(ephpm_ws_connection_unsubscribe,  arginfo_ephpm_ws_connection_unsubscribe)
+    PHP_FE(ephpm_ws_broadcast,               arginfo_ephpm_ws_broadcast)
+    PHP_FE(ephpm_ws_close,                   arginfo_ephpm_ws_close)
+    PHP_FE(ephpm_ws_connection_close,        arginfo_ephpm_ws_connection_close)
     PHP_FE_END
 };
 
@@ -3714,6 +4066,26 @@ void ephpm_set_db_ops(const EphpmDbOps *ops)
 {
     if (ops) {
         g_db_ops = *ops;
+    }
+}
+
+/*
+ * Set the WebSocket ops function pointer table backing ephpm_ws_send() and
+ * friends. Same timing contract as ephpm_set_kv_ops / ephpm_set_db_ops:
+ * called once at startup, before any PHP scripts execute; g_ws_ops is
+ * read-only afterwards (ZTS-safe without locking).
+ *
+ * Left NULL when [server.websocket] is disabled. The PHP functions still
+ * exist — so a script can feature-detect with function_exists() rather
+ * than fataling on an undefined function — but calling one throws
+ * "native websockets are not enabled". Deliberately an exception rather
+ * than a `false`: a silent no-op here would look exactly like a
+ * delivered frame.
+ */
+void ephpm_set_ws_ops(const EphpmWsOps *ops)
+{
+    if (ops) {
+        g_ws_ops = *ops;
     }
 }
 

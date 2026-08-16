@@ -1,0 +1,35 @@
+[package]
+name = "ephpm-ws"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Site-scoped WebSocket connection registry for ePHPm"
+
+[dependencies]
+# Lock-free connection + channel maps. `ephpm_ws_send` is called from PHP on a
+# blocking thread while the session tasks run on the reactor, so every map is
+# touched from both worlds concurrently.
+dashmap.workspace = true
+# Guards the per-connection channel-membership set. Never held across an await
+# and never across a PHP call.
+parking_lot.workspace = true
+# Bounded per-connection outbound queue (`try_send`, never `send().await` —
+# a PHP thread must never park on a slow socket).
+tokio = { workspace = true, features = ["sync"] }
+# Frame payloads are refcounted, so a broadcast to N subscribers clones a
+# pointer N times rather than the payload.
+bytes.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+metrics.workspace = true
+# OS entropy for connection IDs. These are capability tokens — a guessable ID
+# is a cross-connection send, so this is a syscall shim, never a PRNG.
+getrandom.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
+
+[lints]
+workspace = true

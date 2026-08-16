@@ -50,6 +50,28 @@ Emitted only when `[server.http3] enabled = true`; the series are absent otherwi
 
 A rising `ephpm_http3_connection_errors_total{stage="handshake"}` with `ephpm_http3_connections_total` flat usually means UDP is being blocked on the path — clients are trying HTTP/3 and falling back to TCP.
 
+## WebSockets
+
+Emitted only when `[server.websocket] enabled = true`; the series are absent otherwise. See the [WebSockets guide](/guides/websockets/).
+
+The upgrade request itself also increments the `ephpm_http_*` metrics above with `handler="websocket"` — everything after the `101` is accounted for here instead, because an upgraded socket is no longer an HTTP request.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_ws_connections_total` | counter | — | Connections admitted to the registry. Counted at admission, which is *before* the `connect` handler runs — so this exceeds the number of established sockets by however many `connect` handlers refused. |
+| `ephpm_ws_connections_active` | gauge | — | Currently registered connections, across all vhosts. |
+| `ephpm_ws_connections_rejected_total` | counter | `reason` | Upgrades refused by a capacity cap. `reason="server_full"` (`max_connections`) or `reason="site_full"` (`max_connections_per_site`). |
+| `ephpm_ws_handshake_rejected_total` | counter | `reason` | Upgrades refused before any PHP ran. `reason="handshake"` (missing `Sec-WebSocket-Key`, or a `Sec-WebSocket-Version` other than 13), `reason="transport"` (no upgrade handle — not an HTTP/1.1 connection), `reason="capacity"` (the `503` companion to `ephpm_ws_connections_rejected_total`). |
+| `ephpm_ws_connect_rejected_total` | counter | — | Upgrades refused by the application's `connect` handler returning a non-2xx. This is the auth-rejection counter; a sudden rise usually means expired tokens, not an attack. |
+| `ephpm_ws_events_total` | counter | `event` | PHP executions dispatched. `event` is `connect`, `message`, or `disconnect`. |
+| `ephpm_ws_event_timeouts_total` | counter | — | `message` handlers that exceeded `[server.timeouts] request`. Each one also closes its connection with `1011`. Non-zero means a handler is blocking; the socket cannot be abandoned the way an HTTP request can. |
+| `ephpm_ws_frames_received_total` | counter | — | Inbound data frames (text and binary). Ping/pong are not counted. |
+| `ephpm_ws_frames_queued_total` | counter | — | Frames accepted into a connection's outbound queue by `ephpm_ws_send()` / `ephpm_ws_broadcast()`. A broadcast to N subscribers counts N. |
+| `ephpm_ws_frames_sent_total` | counter | — | Frames actually written to a socket. The gap between this and `ephpm_ws_frames_queued_total` is what is sitting in outbound queues (plus anything dropped by a connection that died before its queue drained). |
+| `ephpm_ws_frames_rejected_total` | counter | `reason` | Frames dropped before the wire. `reason="too_large"` (payload over `max_message_size`; the connection is **not** shed — an oversized payload is the caller's bug, not back-pressure) or `reason="invalid_utf8"` (a text frame whose payload is not valid UTF-8, which RFC 6455 §5.6 forbids). |
+| `ephpm_ws_send_queue_overflow_total` | counter | — | Sends refused because a connection's outbound queue was full. Each one also closes that connection with `1013`. **Worth alerting on**: it means clients are not draining and connections are being shed. |
+| `ephpm_ws_cross_site_denied_total` | counter | — | Attempts to reach a connection or channel belonging to a different virtual host. **Should be flat at zero.** Anything else is a bug or an attempt — the operation is refused either way, and reported to PHP as "not found" so it is not an existence oracle. |
+
 ## PHP
 
 | Metric | Type | Labels | Description |

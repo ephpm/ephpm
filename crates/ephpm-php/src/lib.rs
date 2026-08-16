@@ -9,6 +9,7 @@ pub mod request;
 pub mod response;
 pub mod sapi;
 pub mod worker_bridge;
+pub mod ws_bridge;
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -132,6 +133,11 @@ mod ffi {
         /// `ephpm_db_*` functions. Same timing contract as
         /// `ephpm_set_kv_ops`.
         pub fn ephpm_set_db_ops(ops: *const crate::db_bridge::EphpmDbOps);
+
+        /// Set the WebSocket ops function pointer table backing the native
+        /// `ephpm_ws_*` functions. Same timing contract as
+        /// `ephpm_set_kv_ops`.
+        pub fn ephpm_set_ws_ops(ops: *const crate::ws_bridge::EphpmWsOps);
 
         // ── Worker mode ─────────────────────────────────────────────
 
@@ -1174,6 +1180,38 @@ impl PhpRuntime {
         #[cfg(not(php_linked))]
         if registered {
             tracing::debug!("per-site db resolver registered (stub mode, no PHP wiring)");
+        }
+    }
+
+    /// Register the WebSocket connection registry backing the PHP native
+    /// `ephpm_ws_*` functions.
+    ///
+    /// Call only when `[server.websocket] enabled = true`. When never called,
+    /// the functions still **exist** (so `function_exists()` and a portable
+    /// script both behave) but every call reports failure rather than reaching
+    /// a socket.
+    ///
+    /// Must be called after [`init()`] and before any PHP request executes.
+    /// First registration wins, mirroring [`Self::set_kv_store`].
+    ///
+    /// In stub mode (no `php_linked`) the Rust-side registration still happens
+    /// (stub tests use it) but no PHP wiring occurs.
+    pub fn set_ws_registry(registry: std::sync::Arc<ephpm_ws::Registry>) {
+        let registered = ws_bridge::set_registry(registry);
+
+        #[cfg(php_linked)]
+        if registered {
+            // Safety: WS_OPS is a static with a stable address.
+            // ephpm_set_ws_ops copies the struct into the C global — the
+            // pointer only needs to be valid for the duration of this call.
+            unsafe { ffi::ephpm_set_ws_ops(&ws_bridge::WS_OPS) };
+
+            tracing::info!("websocket registry wired to PHP native functions");
+        }
+
+        #[cfg(not(php_linked))]
+        if registered {
+            tracing::debug!("websocket registry registered (stub mode, no PHP wiring)");
         }
     }
 

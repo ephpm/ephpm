@@ -21,6 +21,12 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 | `fallback` | array of strings | `["$uri", "$uri/", "/index.php?$query_string"]` | URL fallback chain. Variables: `$uri`, `$query_string`. Last entry is the fallback (prefix `=` for status code, e.g. `=404`). |
 | `preview` | bool | `false` | Preview-host preset for **not-production** PR-preview instances. Adds `X-Ephpm-Preview: 1` to every response, and every `[server.limits]` knob you did not set explicitly resolves to a preview default instead of "off": `max_connections = 256`, `per_ip_max_connections = 32`, `per_ip_rate = 10.0`, `per_ip_burst = 50`, `per_site_rate = 5.0`, `per_site_burst = 20`. Explicit values always win — including explicit `0`, which disables that limit even under preview. Startup logs exactly which limits the preset supplied. Env override: `EPHPM_SERVER__PREVIEW=true`. |
 
+### `[server]` — WebSocket entrypoint
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `websocket_files` | array of strings | `["websocket.php"]` | Entrypoint script names tried, in order, when a WebSocket upgrade request arrives — the `index_files` of the WebSocket path. Resolved against the **vhost's** document root, so each virtual host has its own handler or none. The first name that exists wins and receives every event for connections upgraded on that vhost (`connect`, `message`, `disconnect`, distinguished by `$_SERVER['WS_EVENT']`). If **no** name exists in that document root, the upgrade request is answered `404` — it never falls through to static files, `index.php`, or the `[server] fallback` chain. Only consulted when `[server.websocket] enabled = true`. Env override: `EPHPM_SERVER__WEBSOCKET_FILES`. |
+
 ### `[server.request]`
 
 | Key | Type | Default | Description |
@@ -183,6 +189,25 @@ HTTP/3 runs over **UDP**, *in addition to* the TCP listeners — HTTP/1.1 and HT
 **Limitation — ACME is not supported on HTTP/3 yet.** QUIC bakes its certificate into the endpoint at bind time, whereas `rustls-acme` rotates certificates during the process lifetime. `enabled = true` together with ACME TLS is a startup error, deliberately: ePHPm refuses to come up quietly without the HTTP/3 listener you asked for. Use a static `cert`/`key` for now; ACME support is planned.
 
 **Firewalls:** QUIC is UDP. Opening TCP/443 is not enough — UDP on the same port must also be reachable, or clients will try HTTP/3, fail, and silently fall back to TCP.
+
+### `[server.websocket]`
+
+**Experimental.** Native WebSocket termination: Rust owns the sockets, PHP runs per event via the vhost's `[server] websocket_files` entrypoint. See the [WebSockets guide](/guides/websockets/).
+
+With `enabled = false` (the default) an upgrade request routes exactly like any other `GET`, so turning this section on is the only thing that changes upgrade routing.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable native WebSocket support. Opt-in: it changes how upgrade requests route and admits long-lived connections that outlive their HTTP request. Env override: `EPHPM_SERVER__WEBSOCKET__ENABLED`. **Startup error** when combined with `[php] mode = "worker"` (WebSocket events dispatch through the fpm per-request path), or when `[server] websocket_files` is empty. |
+| `max_connections` | usize | `10000` | Total concurrent WebSocket connections across all vhosts. `0` = unlimited. Upgrades beyond the cap get `503`. A **separate** budget from `[server.limits] max_connections`: an upgraded socket is handed to its own task and stops occupying an HTTP connection slot, so the HTTP cap cannot bound it. |
+| `max_connections_per_site` | usize | `1000` | Per-vhost cap, enforced in addition to `max_connections` so one tenant cannot consume a shared node's whole budget. `0` = unlimited. Rejected upgrades get `503`. |
+| `max_message_size` | usize (bytes) | `1048576` (1 MiB) | Largest inbound message (after reassembling continuation frames), and largest payload PHP may push with `ephpm_ws_send()` / `ephpm_ws_broadcast()`. Deliberately independent of `[server.request] max_body_size` — a WebSocket event's payload is bounded by this knob, not the HTTP body limit. |
+| `max_frame_size` | usize (bytes) | `1048576` (1 MiB) | Largest single inbound frame. `max_message_size` bounds the reassembled total. |
+| `send_queue` | usize (frames) | `64` | Depth of each connection's outbound queue. When full, the frame is **not** buffered: the send reports failure and the socket is closed with WebSocket status `1013`. A slow reader costs one connection, never the server's memory. `0` is normalized to `1` with a warning. |
+| `ping_interval_secs` | u64 | `30` | Seconds between server-initiated pings. `0` disables keepalive — which also means idle connections will be dropped, since pings are what refresh `idle_timeout_secs`. |
+| `idle_timeout_secs` | u64 | `120` | Seconds a connection may receive **nothing** (including a pong) before it is closed with `1001`. `0` disables the check. Keep comfortably larger than `ping_interval_secs`; a warning is logged if it is not. |
+
+Two ceilings are fixed rather than configurable: 64 channel subscriptions per connection and 256-byte channel names. They bound what one misbehaving script can pin.
 
 ```toml
 [server.tls]

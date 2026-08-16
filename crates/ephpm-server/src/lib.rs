@@ -23,6 +23,7 @@ pub mod tls;
 pub mod tracked_backend;
 pub mod turso_cdc;
 pub mod turso_cdc_metrics;
+pub mod websocket;
 pub mod worker_pool;
 
 use std::net::SocketAddr;
@@ -650,7 +651,18 @@ async fn bind_listeners(
         None
     };
 
-    let router = Arc::new({
+    // Native WebSockets (experimental). `None` when `[server.websocket]` is
+    // disabled, which also means the PHP bridge stays unwired: `ephpm_ws_*`
+    // then throws "not enabled" instead of silently pretending to deliver.
+    let websocket = crate::websocket::WsRuntime::new(&config.server.websocket).map(Arc::new);
+    if let Some(ref runtime) = websocket {
+        ephpm_php::PhpRuntime::set_ws_registry(Arc::clone(&runtime.registry));
+    }
+
+    // `Router::share` rather than `Arc::new`: a WebSocket session outlives the
+    // request that created it and keeps dispatching PHP events through this
+    // router, so the Arc has to be reachable from the router itself.
+    let router = {
         let router = Router::new(
             config,
             kv_store,
@@ -668,6 +680,7 @@ async fn bind_listeners(
         // derived from `[cluster] node_id`.
         .with_node_id(node_id)
         .with_db_health(db_health)
+        .with_websocket(websocket)
         .with_request_log(request_log);
 
         let router = match per_site_db_wire {
@@ -680,7 +693,8 @@ async fn bind_listeners(
             Some((port, max_age)) => router.with_alt_svc(port, max_age),
             None => router,
         }
-    });
+        .share()
+    };
 
     let has_tls = !matches!(tls_mode, TlsMode::None);
 

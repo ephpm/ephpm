@@ -86,6 +86,12 @@ metrics-exporter-prometheus = "0.16"
 async-channel = "2"
 libloading = "0.8"
 yamux = "0.14"
+# WebSocket framing for the native `[server.websocket]` path. `tungstenite`'s
+# default features pull in a TLS stack we already have (rustls) and a URL
+# parser only a *client* needs; ePHPm is server-side only, and hyper has
+# already done the HTTP handshake by the time we hand the socket over, so the
+# codec is all we want.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
 
 # Internal crates
@@ -98,6 +104,7 @@ ephpm-middleware-builtins = { path = "crates/ephpm-middleware-builtins" }
 ephpm-php = { path = "crates/ephpm-php" }
 ephpm-query-stats = { path = "crates/ephpm-query-stats" }
 ephpm-server = { path = "crates/ephpm-server" }
+ephpm-ws = { path = "crates/ephpm-ws" }
 
 # External — litewire (embedded SQLite wire protocol proxy)
 #

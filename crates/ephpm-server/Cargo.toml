@@ -21,6 +21,13 @@ ephpm-middleware = { workspace = true, features = ["host"] }
 ephpm-middleware-builtins.workspace = true
 ephpm-php.workspace = true
 ephpm-query-stats.workspace = true
+ephpm-ws.workspace = true
+# WebSocket framing for the upgraded socket. hyper has already done the HTTP
+# handshake, so only the codec is used (`from_raw_socket`).
+tokio-tungstenite.workspace = true
+# `StreamExt`/`SinkExt` on the WebSocket stream. Already in the graph via
+# yamux/litewire.
+futures.workspace = true
 litewire.workspace = true
 turso.workspace = true
 tokio.workspace = true

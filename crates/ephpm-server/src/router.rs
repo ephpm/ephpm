@@ -99,6 +99,11 @@ const UNKNOWN_SITE_TTL: Duration = Duration::from_secs(2);
 struct SiteConfig {
     document_root: PathBuf,
     index_files: Vec<String>,
+    /// WebSocket entrypoint names for this vhost, in try-order — the
+    /// `index_files` of the upgrade path. Carried per-site for exactly the same
+    /// reason `index_files` is: the resolution has to happen against the
+    /// vhost's own document root.
+    websocket_files: Vec<String>,
     fallback: Vec<String>,
 }
 
@@ -122,6 +127,15 @@ struct SiteIdentities {
     kv: String,
     /// Key for cluster-wide OPcache invalidation (`opcache:version:<key>`).
     opcache: String,
+    /// Scope for this request's WebSocket capability — which connections and
+    /// channels `ephpm_ws_*` may reach.
+    ///
+    /// `None` on a multi-tenant node for a host that matched no vhost: such a
+    /// request gets no WebSocket capability at all, the same way it gets no
+    /// database context (issue #291). On a single-site node it is the
+    /// [`ephpm_php::ws_bridge::SINGLE_SITE_SCOPE`] sentinel, because there is
+    /// exactly one tenant and nothing to isolate it from.
+    ws: Option<String>,
 }
 
 /// A request's virtual host, resolved once: the tenant's **canonical site key**
@@ -165,6 +179,10 @@ struct ResolvedSite<'a> {
     document_root: PathBuf,
     /// Index files for this site.
     index_files: &'a [String],
+    /// WebSocket entrypoint names for this site, in try-order. Travels with the
+    /// resolved site so the upgrade path never re-reads config or re-derives a
+    /// document root.
+    websocket_files: &'a [String],
     /// Fallback chain for this site.
     fallback: &'a [String],
 }
@@ -276,6 +294,31 @@ pub struct Router {
     /// short directory names while their browser uses `*.localhost`.
     sites_domain_suffix: Option<String>,
     index_files: Vec<String>,
+    /// Default WebSocket entrypoint names (`[server] websocket_files`), used
+    /// for the default document root and for lazily-discovered vhosts.
+    websocket_files: Vec<String>,
+    /// Whether this node serves more than one tenant — `sites_dir` is set, or
+    /// static vhosts were configured.
+    ///
+    /// Decides the WebSocket registry scope: multi-tenant nodes scope by the
+    /// canonical site key (and a host that matched no vhost gets **no** scope),
+    /// single-site nodes share one sentinel scope because there is exactly one
+    /// tenant to isolate.
+    multi_site: bool,
+    /// Native WebSocket runtime, or `None` when `[server.websocket]` is
+    /// disabled — in which case an upgrade request is routed like any other
+    /// GET, exactly as before the feature existed.
+    websocket: Option<Arc<crate::websocket::WsRuntime>>,
+    /// Weak self-reference, installed by [`Router::share`].
+    ///
+    /// A WebSocket session outlives the request that created it, and every
+    /// event it dispatches goes back through this router. `Weak` rather than a
+    /// clone of the `Arc` so the router is still dropped at shutdown even with
+    /// sessions live, and `Arc::new_cyclic` rather than a post-construction
+    /// setter so it cannot be forgotten. A `Router` that was never shared (unit
+    /// tests build one on the stack) simply cannot serve an upgrade — see
+    /// [`Router::handle_websocket_upgrade`].
+    self_weak: std::sync::Weak<Router>,
     fallback: Vec<String>,
     server_port: u16,
     max_body_size: u64,
@@ -591,6 +634,7 @@ const SITE_PASSWORD_CACHE_MAX: usize = 4096;
 fn scan_sites_dir(
     sites_dir: Option<&Path>,
     default_index_files: &[String],
+    default_websocket_files: &[String],
     default_fallback: &[String],
 ) -> HashMap<String, SiteConfig> {
     let Some(dir) = sites_dir else {
@@ -621,6 +665,7 @@ fn scan_sites_dir(
             SiteConfig {
                 document_root: path,
                 index_files: default_index_files.to_vec(),
+                websocket_files: default_websocket_files.to_vec(),
                 fallback: default_fallback.to_vec(),
             },
         );
@@ -693,6 +738,7 @@ impl Router {
         let sites = scan_sites_dir(
             config.server.sites_dir.as_deref(),
             &config.server.index_files,
+            &config.server.websocket_files,
             &config.server.fallback,
         );
 
@@ -722,9 +768,18 @@ impl Router {
         let php_semaphore = (fpm_pool.is_none() && config.php.workers > 0)
             .then(|| Arc::new(tokio::sync::Semaphore::new(config.php.workers)));
 
+        // Multi-tenant iff a sites_dir is configured or vhost directories were
+        // found. Resolved once here so the WebSocket scope derivation in
+        // `site_identities` is a field read, not a re-scan.
+        let multi_site = config.server.sites_dir.is_some() || !sites.is_empty();
+
         Self {
             document_root: config.server.document_root.clone(),
             sites,
+            multi_site,
+            websocket: None,
+            self_weak: std::sync::Weak::new(),
+            websocket_files: config.server.websocket_files.clone(),
             sites_dir: config.server.sites_dir.clone(),
             sites_domain_suffix: config
                 .server
@@ -1074,6 +1129,30 @@ impl Router {
         }
     }
 
+    /// Wrap the finished router in the `Arc` the server shares across
+    /// connections, recording the weak self-reference WebSocket sessions need.
+    ///
+    /// Use this instead of `Arc::new(router)`: a session task keeps dispatching
+    /// PHP events long after the request that created it returned, so it needs
+    /// a handle on the router that does not borrow from a request.
+    /// `Arc::new_cyclic` makes that handle a construction-time guarantee rather
+    /// than a step someone can forget.
+    #[must_use]
+    pub fn share(self) -> Arc<Self> {
+        Arc::new_cyclic(|weak| Self { self_weak: weak.clone(), ..self })
+    }
+
+    /// Attach the native WebSocket runtime.
+    ///
+    /// `None` (the default) leaves the feature off: an upgrade request is then
+    /// routed exactly like any other GET, so enabling `[server.websocket]` is
+    /// the only thing that changes upgrade routing.
+    #[must_use]
+    pub fn with_websocket(mut self, websocket: Option<Arc<crate::websocket::WsRuntime>>) -> Self {
+        self.websocket = websocket;
+        self
+    }
+
     /// Override this node's `EPHPM_NODE_ID` (injected into PHP `$_SERVER`)
     /// with the effective runtime cluster identity.
     ///
@@ -1316,6 +1395,7 @@ impl Router {
                         key: Some((*key).to_string()),
                         document_root: site.document_root.clone(),
                         index_files: &site.index_files,
+                        websocket_files: &site.websocket_files,
                         fallback: &site.fallback,
                     };
                 }
@@ -1336,6 +1416,7 @@ impl Router {
                         key: Some((*key).to_string()),
                         document_root: candidate,
                         index_files: &self.index_files,
+                        websocket_files: &self.websocket_files,
                         fallback: &self.fallback,
                     };
                 }
@@ -1367,6 +1448,7 @@ impl Router {
             key: None,
             document_root: self.document_root.clone(),
             index_files: &self.index_files,
+            websocket_files: &self.websocket_files,
             fallback: &self.fallback,
         }
     }
@@ -1396,6 +1478,17 @@ impl Router {
             db: if self.per_site_db { site_key.map(str::to_owned) } else { None },
             kv: site_key.map_or_else(|| normalize_host_key(server_name), str::to_owned),
             opcache: opcache_vhost_key(site_key),
+            // Unlike `kv`, this does NOT fall back to the request host. A
+            // client-controlled scope would let anyone mint a fresh WebSocket
+            // namespace by varying `Host`, and — worse — two requests that
+            // *should* be one tenant could end up in different scopes and lose
+            // sight of each other's connections. Multi-tenant: the canonical
+            // key or nothing. Single-site: one sentinel scope for everything.
+            ws: if self.multi_site {
+                site_key.map(str::to_owned)
+            } else {
+                Some(ephpm_php::ws_bridge::SINGLE_SITE_SCOPE.to_string())
+            },
         }
     }
 
@@ -1720,7 +1813,46 @@ impl Router {
             document_root: site_root,
             index_files: site_index,
             fallback: site_fallback,
+            websocket_files: site_websocket_files,
         } = self.resolve_site(&host);
+
+        // WebSocket upgrade. Positioned deliberately:
+        //
+        // * AFTER the security gates above (trusted host, malformed host,
+        //   hidden files, blocked paths) — an upgrade is not a way around them.
+        // * AFTER `resolve_site`, because the entrypoint is resolved against
+        //   THIS vhost's document root and the connection's tenant identity is
+        //   the canonical key that resolution produced.
+        // * BEFORE `resolve_fallback`, because an upgrade request must never
+        //   fall through to a static file, `index.php`, or the fallback chain.
+        //   A vhost with no entrypoint gets a 404, full stop.
+        //
+        // With `[server.websocket]` disabled this is one `Option::is_none()`
+        // and an upgrade request routes exactly as it did before the feature
+        // existed.
+        if let Some(ref runtime) = self.websocket {
+            if crate::websocket::is_upgrade_request(&req) {
+                let mut resp = self
+                    .handle_websocket_upgrade(
+                        req,
+                        runtime,
+                        effective_addr,
+                        is_https,
+                        &site_root,
+                        site_websocket_files,
+                        site_key,
+                    )
+                    .await;
+                // Configured response headers belong on the error paths (404 /
+                // 400 / 503) but not on a 101 — a Switching Protocols response
+                // hands the socket over, and anything appended to it is bytes
+                // the client will read as WebSocket framing.
+                if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+                    self.apply_response_headers(&mut resp);
+                }
+                return Ok((resp, "websocket"));
+            }
+        }
 
         // Extract If-None-Match for ETag support before consuming the request.
         let if_none_match = if self.etag {
@@ -1781,6 +1913,7 @@ impl Router {
                                 accepts_br,
                                 site_root.clone(),
                                 site_key.clone(),
+                                None,
                             )
                             .await;
 
@@ -1852,6 +1985,7 @@ impl Router {
                             accepts_br,
                             site_root.clone(),
                             site_key.clone(),
+                            None,
                         )
                         .await,
                         "php",
@@ -1950,6 +2084,227 @@ impl Router {
     /// per-tenant value below is derived from it rather than from the `Host`
     /// header, so the database, the wire credential, the KV keyspace and the
     /// document root cannot name different tenants — see [`ResolvedSite`].
+    /// Resolve this vhost's WebSocket entrypoint — `index_files` semantics for
+    /// the upgrade path.
+    ///
+    /// Tries `[server] websocket_files` in order against the **resolved**
+    /// document root and returns the first that exists. `None` means this vhost
+    /// has not opted into WebSockets, which the caller turns into a 404.
+    ///
+    /// Each candidate is containment-checked even though the names are
+    /// operator-supplied rather than client-supplied: an entry may legitimately
+    /// contain a separator (`"public/ws.php"`), so `..` or an absolute path
+    /// must not be able to escape the vhost. A name that resolves outside the
+    /// document root is skipped with a warning rather than silently served.
+    fn resolve_websocket_script(&self, site_root: &Path, names: &[String]) -> Option<PathBuf> {
+        for name in names {
+            let candidate = site_root.join(name);
+            if !candidate.is_file() {
+                continue;
+            }
+            if !self.php_script_contained(&candidate, site_root) {
+                tracing::warn!(
+                    entry = %name,
+                    root = %site_root.display(),
+                    "ignoring a [server] websocket_files entry that resolves outside the \
+                     document root"
+                );
+                continue;
+            }
+            return Some(candidate);
+        }
+        None
+    }
+
+    /// Answer a WebSocket upgrade request.
+    ///
+    /// Order matters, and every step before the handshake is a refusal that
+    /// costs no socket:
+    ///
+    /// 1. **Entrypoint** — no `websocket_files` entry on disk ⇒ `404`, never a
+    ///    fallthrough.
+    /// 2. **Handshake** — a missing key or a `Sec-WebSocket-Version` other than
+    ///    13 ⇒ `400` advertising version 13.
+    /// 3. **Transport** — no `OnUpgrade` extension (HTTP/2, HTTP/3) ⇒ `400`.
+    /// 4. **Tenant** — no canonical site key on a multi-vhost node ⇒ `404`. A
+    ///    connection with no tenant identity would have no registry scope, so
+    ///    it is refused rather than created unreachable.
+    /// 5. **Capacity** — registry caps ⇒ `503`.
+    /// 6. **`connect`** — the entrypoint runs with the real request. Non-2xx is
+    ///    returned to the client verbatim and the reserved connection is
+    ///    released. This is the only point at which an upgrade can be refused
+    ///    by application code, which is why authentication belongs here.
+    /// 7. **`101`** — the socket is handed to a session task.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_websocket_upgrade<B>(
+        &self,
+        mut req: Request<B>,
+        runtime: &Arc<crate::websocket::WsRuntime>,
+        remote_addr: SocketAddr,
+        is_https: bool,
+        site_root: &Path,
+        websocket_files: &[String],
+        site_key: Option<String>,
+    ) -> Response<ServerBody>
+    where
+        B: RequestBody,
+    {
+        let Some(script) = self.resolve_websocket_script(site_root, websocket_files) else {
+            tracing::debug!(
+                root = %site_root.display(),
+                "websocket upgrade refused: this vhost has no [server] websocket_files entrypoint"
+            );
+            return error_response(StatusCode::NOT_FOUND, "404 Not Found");
+        };
+
+        let Some(handshake_key) = crate::websocket::handshake_key(req.headers()) else {
+            return crate::websocket::bad_handshake("handshake");
+        };
+
+        // Only the HTTP/1.1 path carries an upgrade handle. HTTP/2 and HTTP/3
+        // requests never reach here (`is_upgrade_request` requires HTTP/1.1),
+        // but the check is what makes that a fact rather than an assumption.
+        let Some(upgrade) = crate::websocket::take_upgrade(&mut req) else {
+            return crate::websocket::bad_handshake("transport");
+        };
+
+        // The router must be shared (`Router::share`) for a session to outlive
+        // this request. Unreachable in a real server; a stack-allocated router
+        // in a unit test would land here.
+        let Some(router) = self.self_weak.upgrade() else {
+            tracing::error!(
+                "websocket upgrade refused: this router was not created with Router::share()"
+            );
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable");
+        };
+
+        let server_name = extract_server_name(&req);
+        // The registry scope comes from the SAME derivation as the database,
+        // KV and OPcache identities — one canonical site key (issue #293),
+        // pinned here and carried by the connection for its whole life.
+        let Some(site_scope) = self.site_identities(site_key.as_deref(), &server_name).ws else {
+            tracing::debug!(
+                host = %server_name,
+                "websocket upgrade refused: host matched no virtual host, so the connection \
+                 would have no tenant identity"
+            );
+            return error_response(StatusCode::NOT_FOUND, "404 Not Found");
+        };
+
+        let registered = match runtime.registry.register(&site_scope) {
+            Ok(registered) => registered,
+            Err(e) => {
+                tracing::warn!(site = %site_scope, %e, "websocket upgrade refused");
+                return crate::websocket::registry_full(e);
+            }
+        };
+
+        // Captured before `handle_php` consumes the request, and replayed on
+        // every later event so `$_SERVER` stays stable for the connection.
+        let uri = req.uri().clone();
+        let headers = req.headers().clone();
+
+        let session = crate::websocket::WsSession {
+            router,
+            site_key: site_key.clone(),
+            connection_id: registered.id.clone(),
+            script: script.clone(),
+            document_root: site_root.to_path_buf(),
+            remote_addr,
+            is_https,
+            uri,
+            headers,
+        };
+
+        // `connect` runs BEFORE the handshake completes, on the real request —
+        // so it sees the cookies, query string and headers that authentication
+        // needs. Compression is off: this response is either a refusal (small)
+        // or discarded.
+        let connect = self
+            .handle_php(
+                req,
+                remote_addr,
+                is_https,
+                script,
+                false,
+                false,
+                site_root.to_path_buf(),
+                site_key,
+                Some(crate::websocket::WsEvent {
+                    kind: crate::websocket::WsEventKind::Connect,
+                    connection_id: registered.id.clone(),
+                    opcode: None,
+                }),
+            )
+            .await;
+        counter!("ephpm_ws_events_total", "event" => "connect").increment(1);
+
+        if !connect.status().is_success() {
+            // Application-level refusal (API-Gateway `$connect` semantics).
+            // Release the reservation and hand the script's own response back
+            // to the client — status, headers and body — so a 401 with a
+            // WWW-Authenticate header works exactly as it does over HTTP.
+            runtime.registry.unregister(&registered.id);
+            counter!("ephpm_ws_connect_rejected_total").increment(1);
+            tracing::debug!(
+                status = connect.status().as_u16(),
+                "websocket upgrade refused by the connect handler"
+            );
+            return connect;
+        }
+
+        tracing::debug!(conn = %registered.id, "websocket connection established");
+        tokio::spawn(crate::websocket::run_session(
+            session,
+            upgrade,
+            Arc::clone(runtime),
+            registered.rx,
+            registered.control,
+            self.request_timeout,
+        ));
+
+        crate::websocket::switching_protocols(&handshake_key)
+    }
+
+    /// Dispatch one WebSocket lifecycle event through the ordinary PHP path.
+    ///
+    /// The entry point session tasks use. Compression is disabled (nothing
+    /// reads the response body) and the event's `$_SERVER` context rides along
+    /// in `ws_event`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn handle_php_event(
+        &self,
+        req: Request<http_body_util::Full<Bytes>>,
+        remote_addr: SocketAddr,
+        is_https: bool,
+        script: PathBuf,
+        document_root: PathBuf,
+        site_key: Option<String>,
+        event: crate::websocket::WsEvent,
+    ) -> Response<ServerBody> {
+        self.handle_php(
+            req,
+            remote_addr,
+            is_https,
+            script,
+            false,
+            false,
+            document_root,
+            site_key,
+            Some(event),
+        )
+        .await
+    }
+
+    ///
+    /// `ws_event` marks this execution as a WebSocket lifecycle event rather
+    /// than an HTTP request. It changes exactly two things and nothing else —
+    /// the `$_SERVER` entries it contributes (`WS_EVENT`, `WS_CONNECTION_ID`,
+    /// `WS_OPCODE`) and which limit bounds the body — so a WebSocket event and
+    /// an HTTP request are the same execution in every way that affects
+    /// isolation: same per-site database session, same KV keyspace, same
+    /// `open_basedir` / temp / session sandbox, same OPcache vhost, same crash
+    /// guard, same engine.
     #[allow(clippy::too_many_arguments)]
     async fn handle_php<B>(
         &self,
@@ -1961,6 +2316,7 @@ impl Router {
         accepts_br: bool,
         document_root: PathBuf,
         site_key: Option<String>,
+        ws_event: Option<crate::websocket::WsEvent>,
     ) -> Response<ServerBody>
     where
         B: RequestBody,
@@ -2006,9 +2362,18 @@ impl Router {
             req.headers().get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
         let server_name = extract_server_name(&req);
 
-        // Reject oversized request bodies before reading
-        if let Some(resp) = self.check_body_size(&req) {
-            return resp;
+        // Reject oversized request bodies before reading.
+        //
+        // Skipped for WebSocket events: their payload is a frame the codec
+        // already bounded by `[server.websocket] max_message_size`, and it is
+        // in an in-memory body we built ourselves. Applying
+        // `[server.request] max_body_size` on top would silently cap WebSocket
+        // messages at the HTTP body limit — two unrelated knobs, one of which
+        // the operator did not think they were setting.
+        if ws_event.is_none() {
+            if let Some(resp) = self.check_body_size(&req) {
+                return resp;
+            }
         }
 
         let server_port = self.server_port;
@@ -2153,8 +2518,10 @@ impl Router {
         }
 
         // fpm path buffers the whole body; cap chunked / lying clients the same
-        // way the Content-Length pre-check caps declared bodies.
-        let body = if self.max_body_size > 0 {
+        // way the Content-Length pre-check caps declared bodies. A WebSocket
+        // event's body was bounded by the codec, not by this knob (see the
+        // `check_body_size` skip above), so it takes the uncapped branch.
+        let body = if self.max_body_size > 0 && ws_event.is_none() {
             let cap = usize::try_from(self.max_body_size).unwrap_or(usize::MAX);
             match http_body_util::Limited::new(req, cap).collect().await {
                 Ok(collected) => collected.to_bytes().to_vec(),
@@ -2184,8 +2551,12 @@ impl Router {
         // whose code is about to run (issue #290). `db` is `None` for a host
         // that matched no vhost, so `ephpm_db_*` reports "no per-site database
         // context" instead of minting `<that host>.db` (issue #291).
-        let SiteIdentities { db: db_site_key, kv: kv_site_key, opcache: vhost_name } =
-            self.site_identities(site_key.as_deref(), &server_name);
+        let SiteIdentities {
+            db: db_site_key,
+            kv: kv_site_key,
+            opcache: vhost_name,
+            ws: ws_site_scope,
+        } = self.site_identities(site_key.as_deref(), &server_name);
         // In multi-tenant mode, give this vhost its OWN temp + session
         // directories (issue #276). Resolved and created here, in the async
         // context, off the resolved (traversal-safe) document root; the paths
@@ -2215,6 +2586,17 @@ impl Router {
         if let Some(ref id) = self.node_id {
             env_vars.push(("EPHPM_NODE_ID".to_string(), id.clone()));
         }
+        // WebSocket lifecycle context. Present only for a WebSocket event, so
+        // an ordinary request can distinguish the two with
+        // `isset($_SERVER['WS_EVENT'])`.
+        if let Some(ref event) = ws_event {
+            env_vars.extend(event.server_vars());
+        }
+        // The connection the implicit `ephpm_ws_send($payload)` form acts on.
+        // `None` for an ordinary HTTP request — and it is set either way, so
+        // an event's id can never survive onto the next request that lands on
+        // this blocking thread.
+        let ws_connection_id = ws_event.as_ref().map(|event| event.connection_id.clone());
 
         // Phase-1 OPcache clustered invalidation: fast-path check outside the
         // spawn_blocking hop so a no-op costs one atomic load + one KV get and
@@ -2250,6 +2632,20 @@ impl Router {
             // backend (single-site) — and clears any stale key so per-site
             // mode never silently reuses a previous request's tenant.
             ephpm_php::db_bridge::set_current_site(db_site_key.as_deref());
+
+            // Scope `ephpm_ws_*` to this virtual host. Derived from the SAME
+            // canonical site key as the database and KV identities above, so a
+            // script cannot reach a socket belonging to a tenant whose code it
+            // is not running. `None` — a host that matched no vhost — clears
+            // the scope, leaving this thread with no WebSocket capability at
+            // all rather than the previous request's.
+            ephpm_php::ws_bridge::set_current_site(ws_site_scope.as_deref());
+
+            // And which connection the implicit `ephpm_ws_*` forms mean.
+            // Cleared (`None`) for every non-WebSocket execution, so a
+            // reused blocking thread cannot carry a previous event's
+            // connection into an unrelated request.
+            ephpm_php::ws_bridge::set_current_connection(ws_connection_id.as_deref());
 
             // Apply per-request PHP sandbox for multi-tenant isolation.
             // open_basedir varies per vhost (each site only sees its own
