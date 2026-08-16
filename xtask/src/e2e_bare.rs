@@ -155,6 +155,7 @@ const ISOLATED_DB_SUITES: &[&str] = &[
 /// template. It runs multi-tenant (`sites_dir`) so the suite can prove
 /// cross-site isolation with two real vhosts on one server, which is the
 /// property most worth an end-to-end test.
+///
 /// `load_shedding` needs `[php] overload_policy = "shed"` on a **deliberately
 /// tiny** execution pool (`worker_count = 1`, `worker_backlog = 1`) so that
 /// saturation is reachable with a handful of concurrent requests. Both halves
