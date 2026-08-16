@@ -140,21 +140,35 @@ try {
 /// A vhost that is deliberately WebSocket-incapable: no entrypoint at all.
 const INDEX_PHP: &str = "<?php echo 'index'; ?>";
 
+/// Reads the `disconnect`-event counter out of this vhost's KV keyspace.
+const DISCONNECTS_PHP: &str = "<?php echo (int)(ephpm_kv_get('ws:disconnects') ?? 0);";
+
 fn sites_dir() -> PathBuf {
     PathBuf::from(required_env("EPHPM_SITES_DIR"))
 }
 
 /// Deploy both vhosts. Idempotent — the suite is serial, so every test can
 /// call this and get the same state.
+///
+/// The actual filesystem work happens **once** per test binary. Re-deploying
+/// per test is not merely wasted work — it republishes files the server may be
+/// compiling at that instant, and this node runs with OPcache timestamp
+/// validation OFF (the `serve`-mode default), so a bad compile is cached for
+/// the life of the process. See [`write`].
 async fn deploy_sites() {
-    for host in [SITE_A, SITE_B] {
-        let dir = sites_dir().join(host);
-        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
-        write(&dir, "websocket.php", WEBSOCKET_PHP);
-        write(&dir, "push.php", PUSH_PHP);
-        write(&dir, "push_implicit.php", PUSH_IMPLICIT_PHP);
-        write(&dir, "index.php", INDEX_PHP);
-    }
+    static DEPLOYED: std::sync::Once = std::sync::Once::new();
+    DEPLOYED.call_once(|| {
+        for host in [SITE_A, SITE_B] {
+            let dir = sites_dir().join(host);
+            std::fs::create_dir_all(&dir)
+                .unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+            write(&dir, "websocket.php", WEBSOCKET_PHP);
+            write(&dir, "push.php", PUSH_PHP);
+            write(&dir, "push_implicit.php", PUSH_IMPLICIT_PHP);
+            write(&dir, "index.php", INDEX_PHP);
+            write(&dir, "disconnects.php", DISCONNECTS_PHP);
+        }
+    });
     // Lazy vhost discovery has a short negative-lookup cache; poll until both
     // hosts actually resolve rather than racing it.
     for host in [SITE_A, SITE_B] {
@@ -162,9 +176,31 @@ async fn deploy_sites() {
     }
 }
 
+/// Publish a fixture file **atomically**: write a sibling temp file, then
+/// `rename` it into place.
+///
+/// A plain `fs::write` truncates first, so there is a window in which the path
+/// exists but is empty. That window is not theoretical here: connections leak
+/// out of every test (the client just drops the socket), and the server
+/// dispatches each one's `disconnect` event asynchronously — so PHP can be
+/// compiling `websocket.php` at the exact moment the next test rewrites it.
+///
+/// With OPcache timestamp validation off (this node runs `ephpm serve`, where
+/// that is the default), compiling the empty file caches an **inert script for
+/// the rest of the process**: upgrades still succeed with 200, and no event
+/// ever emits a frame again. That is precisely how this suite failed on a
+/// loaded CI runner while passing locally — every later test that needed
+/// `websocket.php` to send something timed out, while the one test that only
+/// touches `push_implicit.php` kept passing.
+///
+/// `rename` is atomic within a filesystem, so a concurrent compile sees either
+/// the old complete file or the new complete file — never an empty one.
 fn write(dir: &Path, name: &str, body: &str) {
     let path = dir.join(name);
-    std::fs::write(&path, body).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    let tmp = dir.join(format!(".{name}.tmp"));
+    std::fs::write(&tmp, body).unwrap_or_else(|e| panic!("write {}: {e}", tmp.display()));
+    std::fs::rename(&tmp, &path)
+        .unwrap_or_else(|e| panic!("rename {} -> {}: {e}", tmp.display(), path.display()));
 }
 
 async fn wait_for_site(host: &str) {
@@ -541,11 +577,11 @@ async fn closing_a_socket_dispatches_the_disconnect_event() {
     }
 }
 
-/// Reads `ws:disconnects` out of the vhost's KV keyspace via a tiny fixture
-/// deployed on demand.
+/// Reads `ws:disconnects` out of the vhost's KV keyspace. The fixture is
+/// deployed once with the rest (never rewritten inside the poll loop below —
+/// republishing a script the server may be compiling is exactly the hazard
+/// [`write`] documents).
 async fn disconnect_count() -> i64 {
-    let dir = sites_dir().join(SITE_A);
-    write(&dir, "disconnects.php", "<?php echo (int)(ephpm_kv_get('ws:disconnects') ?? 0);");
     let (status, body) = http_get(SITE_A, "/disconnects.php").await;
     assert_eq!(status, 200, "disconnects.php should serve: {body}");
     body.trim().parse().unwrap_or_else(|e| panic!("unparseable counter {body:?}: {e}"))
