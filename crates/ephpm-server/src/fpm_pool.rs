@@ -34,6 +34,12 @@
 //! - **Backpressure → 504:** the dispatch queue is bounded. When it is full,
 //!   [`FpmPool::dispatch`] suspends; the outer request timeout turns a starved
 //!   queue into a 504.
+//! - **Shed → 503 + `Retry-After`:** with `[php] overload_policy = "shed"` the
+//!   router calls [`FpmPool::try_dispatch`] instead, which refuses to queue
+//!   behind a full backlog (after an optional `[php] shed_after_ms` grace) and
+//!   returns [`DispatchRejected::Full`]. Overload then costs one cheap 503
+//!   rather than a request that occupies a client until its own timeout
+//!   (issue #301).
 //! - **Draining / no live threads → 503:** [`DispatchClosed`] from `dispatch`.
 //! - **Wedged thread → 504 + replace:** the router bounds the `oneshot` wait; a
 //!   timeout calls [`FpmPool::note_hung`], which spawns a replacement and
@@ -107,6 +113,18 @@ pub type FpmTask = Box<dyn FnOnce() -> FpmExecOutput + Send + 'static>;
 /// router turns this into a 503.
 #[derive(Debug, Clone, Copy)]
 pub struct DispatchClosed;
+
+/// Why [`FpmPool::try_dispatch`] refused to enqueue a request
+/// (`[php] overload_policy = "shed"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchRejected {
+    /// Dispatch closed — pool draining or all threads gone. Same condition
+    /// [`DispatchClosed`] reports; the router answers 503 either way.
+    Closed,
+    /// The bounded backlog was still full after the configured grace window.
+    /// The router answers 503 + `Retry-After` — this is the load-shed arm.
+    Full,
+}
 
 /// One queued request: the work to run plus where to send its response.
 struct FpmJob {
@@ -273,6 +291,65 @@ impl FpmPool {
                 // will pull it, so undo the accounting.
                 self.queue_depth.fetch_sub(1, Ordering::Relaxed);
                 Err(DispatchClosed)
+            }
+        }
+    }
+
+    /// Dispatch one request, refusing to queue behind a full backlog
+    /// (`[php] overload_policy = "shed"`).
+    ///
+    /// The load-shedding counterpart to [`FpmPool::dispatch`]. Where `dispatch`
+    /// awaits a send permit for as long as it takes — turning overload into
+    /// latency, and then into a client timeout with no server-side error ever
+    /// emitted (issue #301) — this waits at most `grace` and then gives up so
+    /// the caller can answer `503` immediately.
+    ///
+    /// `grace` of zero is a plain non-blocking `try_send`: the backlog
+    /// (`[php] worker_backlog`, default = pool size) is already the buffer, so
+    /// "full" means every thread is busy *and* the queue behind them is full.
+    ///
+    /// Cancelling the wait is sound because a queued-but-unstarted job is
+    /// genuinely never run: nothing has been handed to a pool thread yet, so
+    /// dropping the send future removes it from the channel's waiter list and
+    /// no PHP work leaks. That is precisely what the `spawn_blocking` engine
+    /// cannot do with tokio's blocking queue.
+    ///
+    /// # Errors
+    ///
+    /// [`DispatchRejected::Full`] when the backlog stayed full for `grace`
+    /// (shed), [`DispatchRejected::Closed`] when the pool is draining.
+    pub async fn try_dispatch(
+        &self,
+        run: FpmTask,
+        grace: Duration,
+    ) -> Result<oneshot::Receiver<FpmExecOutput>, DispatchRejected> {
+        let (tx, rx) = oneshot::channel();
+        let job = FpmJob { run, respond_to: tx };
+        // Same accounting discipline as `dispatch`: count the enqueue before
+        // the attempt, roll it back on every path that does not enqueue.
+        let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        #[allow(clippy::cast_precision_loss)]
+        gauge!("ephpm_fpm_pool_queue_depth").set(depth as f64);
+
+        let outcome = if grace.is_zero() {
+            match self.dispatch_tx.try_send(job) {
+                Ok(()) => Ok(()),
+                Err(async_channel::TrySendError::Full(_)) => Err(DispatchRejected::Full),
+                Err(async_channel::TrySendError::Closed(_)) => Err(DispatchRejected::Closed),
+            }
+        } else {
+            match tokio::time::timeout(grace, self.dispatch_tx.send(job)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(_)) => Err(DispatchRejected::Closed),
+                Err(_elapsed) => Err(DispatchRejected::Full),
+            }
+        };
+
+        match outcome {
+            Ok(()) => Ok(rx),
+            Err(reason) => {
+                self.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                Err(reason)
             }
         }
     }
@@ -663,6 +740,108 @@ mod tests {
 
         pool.drain();
         assert!(wait_for(|| pool.live_count() == 0).await, "drain retires the replacement");
+    }
+
+    // ── Load shedding (`[php] overload_policy = "shed"`, issue #301) ────
+
+    /// The shed contract: with no grace window, a request that finds the
+    /// bounded backlog full is rejected immediately instead of queueing. A
+    /// 0-thread pool never drains, so "full" is deterministic here.
+    #[tokio::test]
+    async fn try_dispatch_sheds_when_the_backlog_is_full() {
+        let pool = FpmPool::spawn(0, 1);
+
+        assert!(
+            pool.try_dispatch(ok_task(200), Duration::ZERO).await.is_ok(),
+            "the first request fills the single backlog slot"
+        );
+        assert_eq!(
+            pool.try_dispatch(ok_task(200), Duration::ZERO).await.err(),
+            Some(DispatchRejected::Full),
+            "a full backlog must reject, not queue — this is the 503 the client sees"
+        );
+    }
+
+    /// A non-zero `shed_after_ms` is a grace window, not a queue: it waits for a
+    /// slot and *then* sheds. Nothing drains a 0-thread pool, so the wait must
+    /// actually elapse before the rejection.
+    #[tokio::test]
+    async fn try_dispatch_grace_waits_then_sheds() {
+        let pool = FpmPool::spawn(0, 1);
+        assert!(pool.try_dispatch(ok_task(200), Duration::ZERO).await.is_ok());
+
+        let grace = Duration::from_millis(120);
+        let started = Instant::now();
+        assert_eq!(
+            pool.try_dispatch(ok_task(200), grace).await.err(),
+            Some(DispatchRejected::Full),
+            "the grace window ends in a shed, not an unbounded wait"
+        );
+        assert!(
+            started.elapsed() >= grace,
+            "the grace window must actually be honoured before shedding: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A drained pool reports `Closed`, not `Full` — a shutting-down server and
+    /// a saturated one are different conditions and must stay distinguishable
+    /// (only the latter is load shedding).
+    #[tokio::test]
+    async fn try_dispatch_after_drain_reports_closed() {
+        let pool = FpmPool::spawn(0, 4);
+        pool.drain();
+
+        assert_eq!(
+            pool.try_dispatch(ok_task(200), Duration::ZERO).await.err(),
+            Some(DispatchRejected::Closed)
+        );
+        assert_eq!(
+            pool.try_dispatch(ok_task(200), Duration::from_millis(20)).await.err(),
+            Some(DispatchRejected::Closed),
+            "a closed channel short-circuits the grace window"
+        );
+    }
+
+    /// A shed request never entered the queue, so it must not leave an
+    /// increment behind in the depth gauge — the same accounting invariant
+    /// `failed_dispatch_does_not_leak_queue_depth` pins for the waiting path.
+    #[tokio::test]
+    async fn shed_dispatch_does_not_leak_queue_depth() {
+        let pool = FpmPool::spawn(0, 1);
+        assert!(pool.try_dispatch(ok_task(200), Duration::ZERO).await.is_ok());
+        assert_eq!(pool.queue_depth(), 1);
+
+        for _ in 0..5 {
+            assert_eq!(
+                pool.try_dispatch(ok_task(200), Duration::ZERO).await.err(),
+                Some(DispatchRejected::Full)
+            );
+        }
+        assert_eq!(pool.queue_depth(), 1, "shed requests must not inflate the queue depth");
+
+        pool.drain();
+        assert_eq!(
+            pool.try_dispatch(ok_task(200), Duration::ZERO).await.err(),
+            Some(DispatchRejected::Closed)
+        );
+        assert_eq!(pool.queue_depth(), 1, "a closed-channel rejection must not inflate it either");
+    }
+
+    /// Shedding is admission-only: a request that *does* get a slot is served
+    /// exactly as the waiting path serves it.
+    #[tokio::test]
+    async fn shed_policy_still_serves_requests_that_fit() {
+        PhpRuntime::init().expect("stub init");
+        let pool = FpmPool::spawn(1, 2);
+        assert!(wait_for(|| pool.ready_count() == 1).await, "thread should register");
+
+        let rx = pool.try_dispatch(ok_task(204), Duration::ZERO).await.expect("slot available");
+        let resp = rx.await.expect("thread replied").expect("stub task returns Ok");
+        assert_eq!(resp.status, 204);
+
+        pool.drain();
+        assert!(wait_for(|| pool.live_count() == 0).await, "drain retires the thread");
     }
 
     /// The crash-storm backoff grows with consecutive poisons and is capped, so

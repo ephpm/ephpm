@@ -427,6 +427,16 @@ pub struct Router {
     /// pool size is the cap). Built in [`Router::new`]; drained on shutdown via
     /// [`Router::fpm_pool`].
     fpm_pool: Option<Arc<crate::fpm_pool::FpmPool>>,
+    /// What a PHP-bound request does when no execution slot is available
+    /// (`[php] overload_policy`, resolved against the `[server] preview`
+    /// preset). [`OverloadPolicy::Wait`] is the historical behaviour — queue and
+    /// wait; [`OverloadPolicy::Shed`] answers 503 + `Retry-After` instead
+    /// (issue #301).
+    overload_policy: ephpm_config::OverloadPolicy,
+    /// Grace window a request may spend waiting for an execution slot before
+    /// [`OverloadPolicy::Shed`] rejects it (`[php] shed_after_ms`). Zero = do not
+    /// wait at all. Inert under [`OverloadPolicy::Wait`].
+    shed_after: Duration,
     /// Request-body size (bytes) at/above which worker mode streams the body
     /// instead of buffering it (Phase 3). See `[php] worker_stream_threshold`.
     worker_stream_threshold: u64,
@@ -883,6 +893,8 @@ impl Router {
             php_semaphore,
             worker_pool,
             fpm_pool,
+            overload_policy: config.effective_overload_policy(),
+            shed_after: Duration::from_millis(config.php.shed_after_ms),
             worker_stream_threshold: config.php.worker_stream_threshold,
             middleware_chain: None,
             opcache_watcher: {
@@ -2731,20 +2743,35 @@ impl Router {
             >,
             Option<Duration>,
         ) = if let Some(pool) = self.fpm_pool.clone() {
-            let recv = pool.dispatch(Box::new(run_php)).await;
+            // `wait` (default) queues behind a full backlog; `shed` refuses to,
+            // after an optional `shed_after` grace, so overload becomes a fast
+            // 503 instead of a client timeout (issue #301). Both share every
+            // downstream arm — only admission differs.
+            let recv = match self.overload_policy {
+                ephpm_config::OverloadPolicy::Wait => {
+                    pool.dispatch(Box::new(run_php)).await.map_err(ShedReason::from)
+                }
+                ephpm_config::OverloadPolicy::Shed => pool
+                    .try_dispatch(Box::new(run_php), self.shed_after)
+                    .await
+                    .map_err(ShedReason::from),
+            };
             let queue_wait = php_start.elapsed();
-            let Ok(rx) = recv else {
-                // Pool draining / all threads gone — 503.
-                drop(php_span);
-                let mut resp = apply_response_headers(
-                    error_response(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable"),
-                    &mw_response_headers,
-                );
-                resp.extensions_mut().insert(crate::timeline::PhpTimings {
-                    queue_wait: Some(queue_wait),
-                    execute: None,
-                });
-                return resp;
+            let rx = match recv {
+                Ok(rx) => rx,
+                // Backlog full (shed) or pool draining / all threads gone.
+                // Both answer 503; only the shed arm advertises Retry-After and
+                // counts as shedding.
+                Err(reason) => {
+                    drop(php_span);
+                    let mut resp =
+                        apply_response_headers(shed_response(reason, "pool"), &mw_response_headers);
+                    resp.extensions_mut().insert(crate::timeline::PhpTimings {
+                        queue_wait: Some(queue_wait),
+                        execute: None,
+                    });
+                    return resp;
+                }
             };
             // Bound the wait so a wedged thread becomes a 504 AND signals the
             // pool to replace it. A `request` timeout of 0 disables the deadline
@@ -2787,9 +2814,47 @@ impl Router {
             // semantics): requests past the cap queue here until a worker frees
             // up, still subject to the outer request timeout. Acquire never
             // fails — the semaphore is never closed.
+            //
+            // Under `overload_policy = "shed"` the acquire is bounded by
+            // `shed_after` and a request that does not get a permit in time is
+            // answered 503 rather than queued (issue #301). This is the ONLY
+            // shed point available on this engine: once the closure reaches
+            // `spawn_blocking` it is committed to tokio's unbounded,
+            // uncancellable blocking queue, where ePHPm can neither reject nor
+            // withdraw it. Cancelling the *acquire* is safe — tokio's
+            // `acquire_owned` future removes itself from the wait list when
+            // dropped and no permit is leaked — and no PHP has run yet.
+            //
+            // With `workers = 0` (the default) there is no semaphore, so there
+            // is nothing to bound and nothing is shed. `serve()` WARNs about
+            // that combination at startup so the inertness is never silent.
             let _php_permit = match &self.php_semaphore {
                 Some(sem) => {
-                    Some(Arc::clone(sem).acquire_owned().await.expect("PHP semaphore never closed"))
+                    let acquire = Arc::clone(sem).acquire_owned();
+                    let permit = match self.overload_policy {
+                        ephpm_config::OverloadPolicy::Wait => {
+                            Some(acquire.await.expect("PHP semaphore never closed"))
+                        }
+                        ephpm_config::OverloadPolicy::Shed => {
+                            match tokio::time::timeout(self.shed_after, acquire).await {
+                                Ok(permit) => Some(permit.expect("PHP semaphore never closed")),
+                                Err(_elapsed) => None,
+                            }
+                        }
+                    };
+                    let Some(permit) = permit else {
+                        drop(php_span);
+                        let mut resp = apply_response_headers(
+                            shed_response(ShedReason::Overloaded, "spawn_blocking"),
+                            &mw_response_headers,
+                        );
+                        resp.extensions_mut().insert(crate::timeline::PhpTimings {
+                            queue_wait: Some(php_start.elapsed()),
+                            execute: None,
+                        });
+                        return resp;
+                    };
+                    Some(permit)
                 }
                 None => None,
             };
@@ -2813,7 +2878,10 @@ impl Router {
         // Hand the measurement up to `handle` for the request timeline. On the
         // default `spawn_blocking` engine there is no dispatch queue, so
         // `queue_wait` is `None` (absent, not zero); on the pool engine it holds
-        // the dispatch wait.
+        // the dispatch wait. (The one `spawn_blocking` request that does report
+        // a wait is a shed one — it never reaches here, and its admission wait
+        // on the `workers` semaphore is exactly the "how long before we gave up"
+        // number worth showing in the timeline.)
         response
             .extensions_mut()
             .insert(crate::timeline::PhpTimings { queue_wait, execute: Some(php_elapsed) });
@@ -3787,6 +3855,64 @@ fn error_response(status: StatusCode, body: &'static str) -> Response<ServerBody
         .header("content-type", "text/plain")
         .body(body::buffered(Full::new(Bytes::from_static(body.as_bytes()))))
         .expect("static error response")
+}
+
+/// Why a PHP-bound request was answered 503 without ever running PHP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShedReason {
+    /// No execution slot within the shed budget (`[php] overload_policy =
+    /// "shed"`). The server is up and healthy — it is *saturated*, and saying so
+    /// immediately is the point.
+    Overloaded,
+    /// The execution pool is draining or has no live threads. Pre-existing
+    /// behaviour, unchanged; kept distinct so an overload 503 and a
+    /// shutting-down 503 are not conflated in metrics or logs.
+    Closed,
+}
+
+impl From<crate::fpm_pool::DispatchClosed> for ShedReason {
+    fn from(_: crate::fpm_pool::DispatchClosed) -> Self {
+        Self::Closed
+    }
+}
+
+impl From<crate::fpm_pool::DispatchRejected> for ShedReason {
+    fn from(rejected: crate::fpm_pool::DispatchRejected) -> Self {
+        match rejected {
+            crate::fpm_pool::DispatchRejected::Full => Self::Overloaded,
+            crate::fpm_pool::DispatchRejected::Closed => Self::Closed,
+        }
+    }
+}
+
+/// The 503 for a request that never reached PHP.
+///
+/// Built and returned through the ordinary response path — the response hyper
+/// is already waiting on for this request — never a bare `try_write` on the
+/// socket. That distinction is the #299 lesson: a 503 written behind hyper's
+/// back races the connection state machine and can be dropped, so the shed
+/// would be invisible to the client it was meant to protect.
+///
+/// An overload shed carries `Retry-After: 1`: the condition is transient by
+/// construction (a slot frees up as soon as an in-flight request finishes), and
+/// a concrete value is what makes a proxy or client back off instead of
+/// hot-looping the retry.
+fn shed_response(reason: ShedReason, engine: &'static str) -> Response<ServerBody> {
+    match reason {
+        ShedReason::Overloaded => {
+            counter!("ephpm_php_shed_total", "engine" => engine).increment(1);
+            let mut resp = error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "503 Service Unavailable (overloaded)",
+            );
+            resp.headers_mut()
+                .insert(hyper::header::RETRY_AFTER, hyper::header::HeaderValue::from_static("1"));
+            resp
+        }
+        ShedReason::Closed => {
+            error_response(StatusCode::SERVICE_UNAVAILABLE, "503 Service Unavailable")
+        }
+    }
 }
 
 /// Build a simple error response with a dynamically-owned text body.
@@ -4974,6 +5100,129 @@ mod tests {
         if let Some(pool) = router.fpm_pool() {
             pool.drain();
         }
+    }
+
+    // ── Load shedding (`[php] overload_policy`, issue #301) ─────────────
+
+    /// A router on the default `spawn_blocking` engine with a `[php] workers`
+    /// cap and the requested shed policy.
+    fn shed_router(dir: &Path, policy: ephpm_config::OverloadPolicy, shed_after_ms: u64) -> Router {
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        // One slot, so "the semaphore is held" == "the server is saturated".
+        config.php.workers = 1;
+        config.php.overload_policy = Some(policy);
+        config.php.shed_after_ms = shed_after_ms;
+        Router::new(&config, test_store(), None, None, None, None, None)
+    }
+
+    fn php_request() -> Request<Empty<Bytes>> {
+        Request::builder().method("GET").uri("/index.php").body(Empty::<Bytes>::new()).unwrap()
+    }
+
+    /// The #301 fix on the default engine: with every `[php] workers` slot
+    /// taken, an arriving PHP request is answered `503` + `Retry-After`
+    /// immediately instead of queueing until the client gives up.
+    ///
+    /// Saturation is produced by holding the only permit, so the assertion does
+    /// not depend on PHP timing (stub execution is instantaneous).
+    #[tokio::test]
+    async fn shed_policy_rejects_when_every_worker_slot_is_taken() {
+        ephpm_php::PhpRuntime::init().expect("stub runtime init");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let router = shed_router(dir.path(), ephpm_config::OverloadPolicy::Shed, 0);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let sem =
+            Arc::clone(router.php_semaphore.as_ref().expect("workers cap builds a semaphore"));
+        let held = sem.acquire_owned().await.expect("permit");
+
+        let resp = router.handle(php_request(), addr, false).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a saturated server must answer, not queue"
+        );
+        assert_eq!(
+            resp.headers().get(hyper::header::RETRY_AFTER).and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "an overload shed must tell the client when to come back"
+        );
+
+        // Releasing the slot restores normal service — shedding is transient
+        // admission control, not a latched failure state.
+        drop(held);
+        let resp = router.handle(php_request(), addr, false).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the server must recover the moment a slot frees up"
+        );
+    }
+
+    /// `shed_after_ms` is a grace window: a slot that frees up inside it is used
+    /// rather than shed, so a microburst does not turn into 503s.
+    #[tokio::test]
+    async fn shed_after_ms_grace_admits_a_slot_that_frees_up() {
+        ephpm_php::PhpRuntime::init().expect("stub runtime init");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let router = shed_router(dir.path(), ephpm_config::OverloadPolicy::Shed, 2_000);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let sem =
+            Arc::clone(router.php_semaphore.as_ref().expect("workers cap builds a semaphore"));
+        let held = sem.acquire_owned().await.expect("permit");
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(held);
+        });
+
+        let resp = router.handle(php_request(), addr, false).await.unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a slot freed inside the grace window must be used, not shed"
+        );
+    }
+
+    /// The default policy is unchanged: `wait` still queues. Proven by the
+    /// request completing only *after* the held permit is released — under
+    /// `shed` the same setup returns 503 immediately (test above).
+    #[tokio::test]
+    async fn wait_policy_queues_instead_of_shedding() {
+        ephpm_php::PhpRuntime::init().expect("stub runtime init");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let router = shed_router(dir.path(), ephpm_config::OverloadPolicy::Wait, 0);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let sem =
+            Arc::clone(router.php_semaphore.as_ref().expect("workers cap builds a semaphore"));
+        let held = sem.acquire_owned().await.expect("permit");
+
+        let handle = tokio::spawn(async move { router.handle(php_request(), addr, false).await });
+        // Still queued after a beat — `wait` does not answer a saturated server.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!handle.is_finished(), "the wait policy must queue, not shed");
+
+        drop(held);
+        let resp = handle.await.unwrap().unwrap();
+        assert_ne!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "the queued request is served");
     }
 
     fn test_router_with_404(dir: &Path) -> Router {

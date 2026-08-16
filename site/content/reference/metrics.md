@@ -79,6 +79,7 @@ The upgrade request itself also increments the `ephpm_http_*` metrics above with
 | `ephpm_php_executions_total` | counter | `status` | PHP requests executed. `status` is `ok` or `error`. Timeouts surface as HTTP 504 in the HTTP metrics, not here. |
 | `ephpm_php_execution_duration_seconds` | histogram | — | Time spent inside the PHP runtime, per request. |
 | `ephpm_php_output_bytes` | histogram | — | Bytes emitted by PHP per request. |
+| `ephpm_php_shed_total` | counter | `engine` | PHP requests rejected with `503` + `Retry-After` because no execution slot came free within `[php] shed_after_ms`. Only recorded under [`[php] overload_policy = "shed"`](/reference/config/#php); always `0` on the default `"wait"` policy. `engine` is `pool` (the dispatch backlog was full) or `spawn_blocking` (no `[php] workers` permit). A 503 from a *draining* pool is not counted here — that is shutdown, not overload. Rising values mean the server is saturated and saying so, which is the healthy failure mode; the alternative is client timeouts with no server-side signal at all. |
 
 ## FPM pool engine
 
