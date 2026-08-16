@@ -2082,6 +2082,32 @@ pub enum FpmEngine {
     Pool,
 }
 
+/// What a PHP-bound request does when there is no execution slot for it
+/// (`[php] overload_policy`).
+///
+/// Overload has to end *somewhere*. Before this knob existed the only two
+/// endings were "wait until a slot frees up" and "the client gives up" — an
+/// overloaded ePHPm returned no error status of any kind, just 200s and client
+/// timeouts (issue #301, measured under open-loop flood at 1.5-3x capacity).
+/// [`Self::Shed`] adds the third, honest ending: an immediate `503` with
+/// `Retry-After`, cheap enough to answer at any arrival rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverloadPolicy {
+    /// **Default.** Queue and wait for an execution slot. Historical behaviour,
+    /// unchanged: the pool engine's bounded dispatch backlog applies
+    /// backpressure and the `[php] workers` semaphore makes requests line up,
+    /// with the outer `[server.timeouts] request` deadline as the only bound.
+    Wait,
+
+    /// Reject with `503 Service Unavailable` + `Retry-After` once a request has
+    /// waited `[php] shed_after_ms` for an execution slot, instead of waiting
+    /// further. Turns overload into fast, countable errors rather than client
+    /// timeouts — the load-shedding behaviour a proxy or load balancer expects
+    /// to see from a saturated backend.
+    Shed,
+}
+
 /// PHP runtime configuration.
 #[derive(Debug, Deserialize)]
 pub struct PhpConfig {
@@ -2401,6 +2427,56 @@ pub struct PhpConfig {
     #[serde(default = "default_crash_containment")]
     pub crash_containment: bool,
 
+    /// What to do with a PHP-bound request that cannot get an execution slot
+    /// (fpm mode). See [`OverloadPolicy`].
+    ///
+    /// - `"wait"` (**default**) — queue and wait. Historical behaviour.
+    /// - `"shed"` — answer `503` + `Retry-After` after `shed_after_ms` of
+    ///   waiting.
+    ///
+    /// **Unset is not the same as `"wait"`**: an unset value takes the preview
+    /// preset (`"shed"`) under `[server] preview = true`, and `"wait"`
+    /// otherwise — resolved by [`Config::effective_overload_policy`], the same
+    /// explicit-wins rule `[server.limits]` uses. Startup logs which one is in
+    /// force and what it will actually do on the active engine.
+    ///
+    /// What `"shed"` bounds depends on the engine, because that is where the
+    /// admission queue lives:
+    ///
+    /// - `fpm_engine = "pool"` — the bounded dispatch backlog
+    ///   (`worker_backlog`, default = pool size). Full backlog → shed.
+    /// - `fpm_engine = "spawn_blocking"` (default) — the `[php] workers`
+    ///   semaphore. **With `workers = 0` (the default) there is no admission
+    ///   queue to bound and nothing is shed**; tokio's blocking queue itself is
+    ///   unbounded and its entries are uncancellable, so ePHPm cannot reject
+    ///   from there. Startup WARNs about exactly this combination.
+    ///
+    /// Ignored in worker mode (`mode = "worker"`), which has its own bounded
+    /// worker pool; startup WARNs if it is set there.
+    ///
+    /// Env override: `EPHPM_PHP__OVERLOAD_POLICY=shed`.
+    ///
+    /// Default: unset (`"wait"`, or `"shed"` under `[server] preview`).
+    #[serde(default)]
+    pub overload_policy: Option<OverloadPolicy>,
+
+    /// How long, in milliseconds, a request may wait for a PHP execution slot
+    /// before `overload_policy = "shed"` answers `503`. Ignored when the policy
+    /// is `"wait"`.
+    ///
+    /// `0` (the default) means "do not wait at all": take a slot if one is
+    /// immediately available, otherwise shed. On the pool engine that is the
+    /// natural reading of #301's ask — the `worker_backlog` queue is *already*
+    /// the buffer, so a full backlog means saturated. On the `spawn_blocking`
+    /// engine it makes `[php] workers` a strict concurrency cap with no queue.
+    /// Raise it to buy a grace window that absorbs bursts before shedding.
+    ///
+    /// Env override: `EPHPM_PHP__SHED_AFTER_MS=250`.
+    ///
+    /// Default: `0` (shed as soon as there is no free slot).
+    #[serde(default = "default_shed_after_ms")]
+    pub shed_after_ms: u64,
+
     /// Worker-mode entrypoint script, relative to `document_root`.
     ///
     /// The script is a loop that calls `\Ephpm\Worker\take_request()` /
@@ -2552,6 +2628,35 @@ impl Config {
             .extract()
             .map_err(Box::new)?;
         Ok(config)
+    }
+
+    /// Resolve `[php] overload_policy` against the `[server] preview` preset.
+    ///
+    /// An explicit value always wins — including an explicit `"wait"` under
+    /// preview, which is how an operator opts *out* of the preset. An unset
+    /// value is [`OverloadPolicy::Shed`] under `[server] preview = true` and
+    /// [`OverloadPolicy::Wait`] otherwise: a preview box is exactly the place
+    /// where a fast, honest `503` beats a request that quietly eats the node
+    /// for the client's whole timeout.
+    ///
+    /// Cross-section on purpose (`[php]` knob, `[server]` preset), which is why
+    /// it lives here and not on [`PhpConfig`] — there is one resolution and one
+    /// place to find it, mirroring [`ServerConfig::effective_limits`].
+    #[must_use]
+    pub fn effective_overload_policy(&self) -> OverloadPolicy {
+        self.php.overload_policy.unwrap_or(if self.server.preview {
+            OverloadPolicy::Shed
+        } else {
+            OverloadPolicy::Wait
+        })
+    }
+
+    /// Whether [`Self::effective_overload_policy`] came from the preview preset
+    /// rather than from an operator-set value. Startup logging uses it to name
+    /// the source, so the preset is never silent.
+    #[must_use]
+    pub fn overload_policy_from_preview_preset(&self) -> bool {
+        self.server.preview && self.php.overload_policy.is_none()
     }
 
     /// Validate cross-field invariants that serde cannot express.
@@ -2861,6 +2966,8 @@ impl Default for PhpConfig {
             mode: default_php_mode(),
             fpm_engine: default_fpm_engine(),
             crash_containment: default_crash_containment(),
+            overload_policy: None,
+            shed_after_ms: default_shed_after_ms(),
             worker_script: None,
             worker_count: default_worker_count(),
             worker_max_requests: default_worker_max_requests(),
@@ -3711,6 +3818,15 @@ fn default_php_workers() -> usize {
     // dangerous: PHP scripts that block without I/O (sleep, long queries)
     // hold their slot past the HTTP request timeout, and a small cap lets a
     // handful of them starve all PHP traffic. Opt into a cap explicitly.
+    0
+}
+
+fn default_shed_after_ms() -> u64 {
+    // No grace window. The admission queue a shed decision looks at is already
+    // a buffer (`worker_backlog` on the pool engine, `workers` slots on the
+    // spawn_blocking one), so "full" already means saturated — waiting on top
+    // of it is the backpressure-into-client-timeout behaviour issue #301 is
+    // about. Operators who want a burst absorber set this explicitly.
     0
 }
 
@@ -4745,6 +4861,102 @@ idle_timeout_secs = 15
         let config = Config::default_config().unwrap();
         assert_eq!(config.php.fpm_engine, FpmEngine::Pool);
         assert!(config.php.is_pool_engine());
+    }
+
+    // ── [php] overload_policy / shed_after_ms (issue #301) ───────────────
+
+    /// Shedding is OFF unless asked for — from the struct default, from an
+    /// empty file, and from a `[php]` section that exists but omits the field
+    /// (the serde section-default trap). Behaviour must be byte-identical to
+    /// releases before the knob existed.
+    #[test]
+    fn overload_policy_defaults_to_wait() {
+        assert_eq!(PhpConfig::default().overload_policy, None);
+        assert_eq!(PhpConfig::default().shed_after_ms, 0);
+
+        let dir = tempfile::tempdir().unwrap();
+
+        let empty = dir.path().join("empty.toml");
+        std::fs::write(&empty, "").unwrap();
+        let config = Config::load(&empty).unwrap();
+        assert_eq!(config.effective_overload_policy(), OverloadPolicy::Wait);
+        assert!(!config.overload_policy_from_preview_preset());
+
+        // `[php]` present, field absent.
+        let partial = dir.path().join("partial.toml");
+        std::fs::write(&partial, "[php]\nmemory_limit = \"128M\"\n").unwrap();
+        assert_eq!(
+            Config::load(&partial).unwrap().effective_overload_policy(),
+            OverloadPolicy::Wait
+        );
+
+        // `[server]` present without `preview` must not flip it either.
+        let server_only = dir.path().join("server.toml");
+        std::fs::write(&server_only, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+        assert_eq!(
+            Config::load(&server_only).unwrap().effective_overload_policy(),
+            OverloadPolicy::Wait
+        );
+    }
+
+    /// Explicit values parse, and an unknown one is a hard startup error rather
+    /// than a silent fallback to `wait` (which would look like working config
+    /// while shedding nothing).
+    #[test]
+    fn overload_policy_parses_and_rejects_unknown_values() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let shed = dir.path().join("shed.toml");
+        std::fs::write(&shed, "[php]\noverload_policy = \"shed\"\nshed_after_ms = 250\n").unwrap();
+        let config = Config::load(&shed).unwrap();
+        assert_eq!(config.php.overload_policy, Some(OverloadPolicy::Shed));
+        assert_eq!(config.php.shed_after_ms, 250);
+        assert_eq!(config.effective_overload_policy(), OverloadPolicy::Shed);
+
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "[php]\noverload_policy = \"drop\"\n").unwrap();
+        assert!(Config::load(&bad).is_err(), "an unknown overload_policy must fail to load");
+    }
+
+    /// `[server] preview = true` supplies `shed` for an unset policy — a
+    /// preview box should answer a saturating client rather than absorb it —
+    /// and an explicit value still wins, including an explicit `"wait"` (the
+    /// documented way to opt out of the preset).
+    #[test]
+    fn preview_preset_supplies_shed_but_explicit_wins() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let preview = dir.path().join("preview.toml");
+        std::fs::write(&preview, "[server]\npreview = true\n").unwrap();
+        let config = Config::load(&preview).unwrap();
+        assert_eq!(config.effective_overload_policy(), OverloadPolicy::Shed);
+        assert!(config.overload_policy_from_preview_preset(), "startup must name the preset");
+
+        let opted_out = dir.path().join("opted-out.toml");
+        std::fs::write(
+            &opted_out,
+            "[server]\npreview = true\n\n[php]\noverload_policy = \"wait\"\n",
+        )
+        .unwrap();
+        let config = Config::load(&opted_out).unwrap();
+        assert_eq!(
+            config.effective_overload_policy(),
+            OverloadPolicy::Wait,
+            "an explicit value must beat the preview preset"
+        );
+        assert!(!config.overload_policy_from_preview_preset());
+    }
+
+    /// Both knobs are reachable from the environment, which is how the overload
+    /// lab and container deployments set them.
+    #[test]
+    fn overload_policy_env_override_parses() {
+        let _policy = EnvVars::set("EPHPM_PHP__OVERLOAD_POLICY", "shed");
+        let _after = EnvVars::set("EPHPM_PHP__SHED_AFTER_MS", "150");
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.php.overload_policy, Some(OverloadPolicy::Shed));
+        assert_eq!(config.php.shed_after_ms, 150);
+        assert_eq!(config.effective_overload_policy(), OverloadPolicy::Shed);
     }
 
     // ── [php] crash_containment ──────────────────────────────────────────

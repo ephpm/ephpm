@@ -452,7 +452,8 @@ async fn bind_listeners(
     // explicit operator values win; unset fields take the preview defaults
     // when preview mode is on, the regular all-off defaults otherwise.
     let limits = config.server.effective_limits();
-    log_preview_preset(&config.server, &limits);
+    log_preview_preset(config, &limits);
+    log_overload_policy(config);
     let limiter = {
         let l = rate_limit::Limiter::new(limits);
         if l.is_enabled() {
@@ -1044,11 +1045,19 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
 /// `[server.limits]` fields it supplied and which the operator set — plus the
 /// marker header. Never silent (the no-silent-knob rule, same pattern as the
 /// multi-tenant hardening preset log).
-fn log_preview_preset(server: &ephpm_config::ServerConfig, limits: &ephpm_config::ResolvedLimits) {
+fn log_preview_preset(config: &ephpm_config::Config, limits: &ephpm_config::ResolvedLimits) {
+    let server = &config.server;
     if !server.preview {
         return;
     }
-    let applied = server.preview_preset_applied();
+    let mut applied = server.preview_preset_applied();
+    // The preset reaches outside `[server.limits]` for exactly one knob: the
+    // request-granularity shed policy (issue #301). Reported in the same list so
+    // "what did preview change?" has one answer. `log_overload_policy` then says
+    // what the resulting policy actually does on the active engine.
+    if config.overload_policy_from_preview_preset() {
+        applied.push(("php.overload_policy", "shed".to_string()));
+    }
     let preset_supplied =
         applied.iter().map(|(key, value)| format!("{key}={value}")).collect::<Vec<_>>().join(", ");
     tracing::info!(
@@ -1068,6 +1077,73 @@ fn log_preview_preset(server: &ephpm_config::ServerConfig, limits: &ephpm_config
             &preset_supplied
         },
     );
+}
+
+/// Log what `[php] overload_policy` resolved to, where that came from, and —
+/// the part that actually matters — what it will do on the *active* execution
+/// engine.
+///
+/// Shedding is not a property of the knob alone: it needs an admission queue to
+/// reject from, and on the default `spawn_blocking` engine that queue exists
+/// only when `[php] workers` is set. Setting the policy without it changes
+/// nothing, which is exactly the silent-no-op this project forbids — so that
+/// combination WARNs, naming the two ways out.
+fn log_overload_policy(config: &ephpm_config::Config) {
+    use ephpm_config::OverloadPolicy;
+
+    let policy = config.effective_overload_policy();
+    if policy == OverloadPolicy::Wait {
+        // The historical behaviour and the default. Nothing to announce; an
+        // operator who explicitly chose it under preview is opting out of the
+        // preset, which the preview log already covers.
+        return;
+    }
+
+    let source = if config.overload_policy_from_preview_preset() {
+        "[server] preview preset"
+    } else {
+        "[php] overload_policy"
+    };
+    let shed_after_ms = config.php.shed_after_ms;
+
+    if config.php.is_worker_mode() {
+        tracing::warn!(
+            source,
+            "[php] overload_policy = \"shed\" is ignored in worker mode — the persistent \
+             worker pool bounds concurrency with its own queue ([php] worker_backlog) and \
+             answers 504 on a starved queue"
+        );
+        return;
+    }
+
+    if config.php.is_pool_engine() {
+        tracing::info!(
+            source,
+            shed_after_ms,
+            backlog = config.php.effective_worker_backlog(),
+            pool_threads = config.php.effective_worker_count(),
+            "load shedding ON: a PHP request that cannot get a pool slot within \
+             shed_after_ms of a full dispatch backlog is answered 503 + Retry-After \
+             instead of queueing"
+        );
+    } else if config.php.workers > 0 {
+        tracing::info!(
+            source,
+            shed_after_ms,
+            workers = config.php.workers,
+            "load shedding ON: a PHP request that cannot get one of the [php] workers \
+             slots within shed_after_ms is answered 503 + Retry-After instead of queueing"
+        );
+    } else {
+        tracing::warn!(
+            source,
+            "load shedding is requested but INERT: the default [php] fpm_engine = \
+             \"spawn_blocking\" sheds against the [php] workers semaphore, and workers = 0 \
+             means there is no admission queue to reject from (tokio's blocking queue is \
+             unbounded and its entries cannot be withdrawn). Set [php] workers to a \
+             concurrency cap, or [php] fpm_engine = \"pool\", for shedding to take effect"
+        );
+    }
 }
 
 /// Outcome of the accept-time connection-limit check.

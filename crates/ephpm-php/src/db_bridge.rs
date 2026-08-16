@@ -93,6 +93,53 @@
 //! violation. See `is_connection_error` for why the classification is
 //! substring-based and deliberately conservative.
 //!
+//! # Thread teardown must never drop a session (issue #300)
+//!
+//! The held session lives in a `thread_local!`. It is **never dropped by that
+//! thread-local's destructor**: at thread teardown the session is *parked* in a
+//! process-global graveyard ([`park_session`]) and dropped later, from ordinary
+//! code, by [`drain_parked_sessions`].
+//!
+//! This is not defensive tidiness — dropping it at teardown aborted the process.
+//! The mechanism, exactly:
+//!
+//! 1. A thread's first `ephpm_db_*` call enters `DB_HELD.with(…)`, which
+//!    initializes the thread-local and **registers its destructor** with the
+//!    platform (`__cxa_thread_atexit_impl` on glibc).
+//! 2. *Inside that same call*, the query reaches the Turso engine, which
+//!    allocates a scratch page buffer through its own `thread_local!`
+//!    (`turso_core::io::TEMP_BUFFER_CACHE`) — registering **that** destructor
+//!    strictly *after* ours.
+//! 3. TLS destructors run in reverse registration order, so on thread exit
+//!    `TEMP_BUFFER_CACHE` is destroyed **first** and marked inaccessible. Ours
+//!    runs next, drops the [`Session`] → the backend connection → the pager's
+//!    live `turso_core::io::Buffer`s — and `Buffer::drop` calls
+//!    `TEMP_BUFFER_CACHE.with(…)` to recycle each buffer.
+//! 4. `LocalKey::with` on a destroyed value panics
+//!    (`cannot access a Thread Local Storage value during or after
+//!    destruction`), and a panic inside a TLS destructor is a hard
+//!    `fatal runtime error: thread local panicked on drop` → **`SIGABRT`**.
+//!
+//! Every tenant in the process dies, minutes after the burst that caused it —
+//! tokio reaps idle blocking threads long after a load spike, which is when this
+//! was observed (three of ten flooded instances, mid-flood, in post-flood
+//! cooldown, and at `SIGTERM`).
+//!
+//! Note what does **not** fix it: using `try_with` in *this* module. The
+//! panicking `with` is Turso's, several frames below our drop glue, and we
+//! cannot reach it. Nor does field ordering inside [`HeldSession`] — both fields
+//! own engine state. The only fix available to an embedder is to not run that
+//! drop on a dying thread at all, which is what parking does. It mirrors the
+//! `[php] crash_containment` philosophy (see `ephpm-server`'s `fpm_pool`):
+//! **when teardown is unsafe, abandon the state rather than tear it down.**
+//!
+//! The cost is bounded and temporary, not a leak: a parked session holds its
+//! site's backend `Arc` (so that database stays open, and un-evictable, a little
+//! longer) until the next [`on_request_end`] on any PHP thread drains and drops
+//! it. The graveyard therefore holds at most "sessions of threads that retired
+//! since the last request", and the drain is a single relaxed atomic load when
+//! it is empty — which it is on every request in a steady-state server.
+//!
 //! # Async boundary
 //!
 //! `Session::query` is async but PHP FFI callbacks are synchronous, so the
@@ -107,7 +154,8 @@
 //! (`clustered_store.rs`).
 
 use std::cell::RefCell;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use litewire::backend::{SharedBackend, Value};
 use litewire::session::ER_PARSE_ERROR;
@@ -237,7 +285,11 @@ pub fn set_current_site(site_key: Option<&str>) {
 thread_local! {
     /// The per-thread held session, created lazily on first use and swapped
     /// when the request's site changes. `None` until the thread's first query.
-    static DB_HELD: RefCell<Option<HeldSession>> = const { RefCell::new(None) };
+    ///
+    /// Wrapped in [`HeldCell`] so that thread teardown **parks** the session
+    /// instead of dropping it — see the module docs, `Thread teardown must
+    /// never drop a session`.
+    static DB_HELD: HeldCell = const { HeldCell(RefCell::new(None)) };
     /// The current request's site key on this thread (per-site mode). Set by
     /// [`set_current_site`] before PHP runs; `None` outside per-site mode or
     /// before it is set.
@@ -275,6 +327,103 @@ struct HeldSession {
     #[allow(dead_code)]
     _backend: SharedBackend,
 }
+
+/// Thread-local home of [`HeldSession`], whose whole purpose is its [`Drop`]:
+/// it hands the session to the graveyard instead of dropping it on a dying
+/// thread (issue #300 — see the module docs for why that abort happens).
+///
+/// Only *thread teardown* runs this destructor. The ordinary in-band paths
+/// (`*slot = None` on a site swap or a dead connection) assign through the inner
+/// `RefCell` and drop the session immediately, on a live thread, exactly as
+/// before — this wrapper does not defer those.
+struct HeldCell(RefCell<Option<HeldSession>>);
+
+impl Drop for HeldCell {
+    fn drop(&mut self) {
+        // Reached only from the thread-local destructor. `take()` moves the
+        // session out without touching any of its fields, so no engine drop
+        // glue — and therefore no foreign `LocalKey::with` — runs here.
+        if let Some(held) = self.0.get_mut().take() {
+            park_session(held);
+        }
+    }
+}
+
+/// Sessions rescued from retiring threads, waiting to be dropped from ordinary
+/// code. Drained by [`drain_parked_sessions`].
+///
+/// `Mutex<Vec<_>>` is chosen for what it does *not* do on the park side: locking
+/// a `std::sync::Mutex` and pushing to a `Vec` touch no Rust thread-local (the
+/// futex/SRWLOCK fast path and the system allocator only), so the whole park
+/// operation is safe from inside a TLS destructor — which is the one place it is
+/// ever called from.
+static PARKED_SESSIONS: Mutex<Vec<HeldSession>> = Mutex::new(Vec::new());
+
+/// Number of sessions in [`PARKED_SESSIONS`], so the per-request drain is a
+/// relaxed load rather than a lock acquisition in the (overwhelmingly common)
+/// empty case.
+static PARKED_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Hand a retiring thread's session to the graveyard. Infallible by
+/// construction: a poisoned lock is recovered rather than unwrapped, because a
+/// panic here is a process abort (this runs inside a TLS destructor).
+fn park_session(held: HeldSession) {
+    let mut parked = match PARKED_SESSIONS.lock() {
+        Ok(guard) => guard,
+        // Poisoned only if some other thread panicked while draining. The Vec is
+        // still structurally sound and the alternative — unwinding out of a TLS
+        // destructor — is the very abort this function exists to prevent.
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    parked.push(held);
+    PARKED_COUNT.store(parked.len(), Ordering::Release);
+    #[cfg(test)]
+    PARKED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Drop every parked session, on the calling (live) thread.
+///
+/// Called from [`on_request_end`], i.e. from ordinary code on a PHP worker
+/// thread whose thread-locals are all alive — so the engine drop glue that
+/// aborts at teardown runs harmlessly here. Cheap when there is nothing parked:
+/// one relaxed atomic load.
+///
+/// Public so a future shutdown path can flush the graveyard explicitly; nothing
+/// outside this module needs to call it for correctness.
+pub fn drain_parked_sessions() {
+    if PARKED_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let parked = {
+        let mut guard = match PARKED_SESSIONS.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        PARKED_COUNT.store(0, Ordering::Release);
+        std::mem::take(&mut *guard)
+    };
+    if parked.is_empty() {
+        return;
+    }
+    #[cfg(test)]
+    DRAINED_TOTAL.fetch_add(parked.len(), Ordering::Relaxed);
+    tracing::debug!(
+        count = parked.len(),
+        "dropping database sessions parked by retired PHP threads"
+    );
+    // Dropped outside the lock: a session's drop reaches into the storage
+    // engine, and holding the graveyard mutex across that would serialize
+    // retiring threads behind it for no reason.
+    drop(parked);
+}
+
+/// Sessions ever parked / ever drained. Monotonic, so a test can assert
+/// "the park path fired" without racing other tests that share these globals
+/// (every libtest thread that ran a query parks its own session on exit).
+#[cfg(test)]
+static PARKED_TOTAL: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static DRAINED_TOTAL: AtomicUsize = AtomicUsize::new(0);
 
 /// The MySQL error triple staged for the C side after a failed `run`.
 struct BridgeError {
@@ -506,8 +655,8 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
         });
     }
 
-    let outcome = DB_HELD.with(|slot| {
-        let mut slot = slot.borrow_mut();
+    let outcome = DB_HELD.with(|cell| {
+        let mut slot = cell.0.borrow_mut();
 
         // Swap the held session if it belongs to a different site (or none):
         // a thread that served site A must never run site B's query on A's
@@ -916,11 +1065,17 @@ fn strip_leading_noise(stmt: &str) -> &str {
 /// open transaction). Safe in stub mode — no PHP types are involved.
 pub fn on_request_end() {
     finish();
+    // Safe point for the sessions of threads that have retired since the last
+    // request: this is ordinary code on a live thread, so the engine drop glue
+    // that would abort inside a TLS destructor runs harmlessly here (issue
+    // #300). Unconditional — parked sessions exist whether or not this process
+    // has a bridge registered, and it costs one relaxed load when empty.
+    drain_parked_sessions();
     let Some(bridge) = DB_BRIDGE.get() else {
         return;
     };
-    DB_HELD.with(|slot| {
-        let mut slot = slot.borrow_mut();
+    DB_HELD.with(|cell| {
+        let mut slot = cell.0.borrow_mut();
         let Some(held) = slot.as_mut() else {
             return;
         };
@@ -1476,7 +1631,7 @@ mod tests {
     /// Whether this thread's session currently believes it is inside an
     /// explicit transaction (None = no session open).
     fn thread_in_transaction() -> Option<bool> {
-        DB_HELD.with(|s| s.borrow().as_ref().map(|held| held.session.in_transaction))
+        DB_HELD.with(|cell| cell.0.borrow().as_ref().map(|held| held.session.in_transaction))
     }
 
     #[test]
@@ -1929,7 +2084,7 @@ mod per_site_tests {
         }
     }
 
-    fn open_turso(path: &std::path::Path) -> SharedBackend {
+    pub(super) fn open_turso(path: &std::path::Path) -> SharedBackend {
         let rt = TEST_RT.get_or_init(|| {
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -1943,7 +2098,7 @@ mod per_site_tests {
         Arc::new(backend)
     }
 
-    fn per_site_bridge(map: HashMap<String, SharedBackend>) -> DbBridge {
+    pub(super) fn per_site_bridge(map: HashMap<String, SharedBackend>) -> DbBridge {
         let handle = TEST_RT.get().expect("runtime").handle().clone();
         DbBridge {
             source: BackendSource::PerSite(Arc::new(MapResolver { map })),
@@ -2039,6 +2194,207 @@ mod per_site_tests {
             assert!(msg.contains("stranger.test"), "got: {msg}");
         });
         finish();
+    }
+}
+
+// ── Thread-teardown safety (issue #300) ─────────────────────────────────
+//
+// The abort these guard against is: a retiring PHP-tainted thread runs the
+// `DB_HELD` destructor, which drops a `Session`, which drops the storage
+// engine's live page buffers, whose own `Drop` calls `LocalKey::with` on a
+// thread-local that was registered LATER and is therefore ALREADY destroyed —
+// panic in a TLS destructor, `SIGABRT`, whole process gone.
+//
+// These run against a real Turso backend on purpose: a mock connection has no
+// engine buffers to drop and would pass no matter what.
+#[cfg(test)]
+mod teardown_tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+
+    use super::per_site_tests::{open_turso, per_site_bridge};
+    use super::*;
+
+    fn parked_total() -> usize {
+        PARKED_TOTAL.load(Ordering::Acquire)
+    }
+
+    fn drained_total() -> usize {
+        DRAINED_TOTAL.load(Ordering::Acquire)
+    }
+
+    /// Build a one-site bridge over a fresh on-disk Turso database.
+    ///
+    /// Shared as an `Arc` so worker threads can be `spawn`ed and `join`ed
+    /// rather than scoped. That is deliberate: `std::thread::scope` releases as
+    /// soon as each closure *returns*, which is **before** that thread's TLS
+    /// destructors run — so a scoped harness races the very teardown these
+    /// tests are about (observed: 3 of 4 parks visible at scope exit).
+    /// `JoinHandle::join` waits for full thread termination, dtors included.
+    fn one_site_bridge(dir: &std::path::Path, site: &str) -> Arc<DbBridge> {
+        let mut map = HashMap::new();
+        map.insert(site.to_string(), open_turso(&dir.join(format!("{site}.db"))));
+        Arc::new(per_site_bridge(map))
+    }
+
+    /// The core guarantee: a thread that used the bridge and then exits does
+    /// **not** drop its session on the way out — the session is parked, and a
+    /// later `on_request_end()` on a live thread drops it.
+    ///
+    /// If the park path ever regresses, this test does not fail — the whole
+    /// test binary aborts with `fatal runtime error: thread local panicked on
+    /// drop`, which is exactly the production failure.
+    #[test]
+    fn retiring_thread_parks_its_session_instead_of_dropping_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bridge = one_site_bridge(dir.path(), "park.test");
+
+        let parked_before = parked_total();
+        let worker = Arc::clone(&bridge);
+        std::thread::spawn(move || {
+            set_current_site(Some("park.test"));
+            assert_eq!(
+                run_on(Some(&worker), b"CREATE TABLE park_probe (id INTEGER PRIMARY KEY)"),
+                RunStatus::Ok
+            );
+            assert_eq!(
+                run_on(Some(&worker), b"INSERT INTO park_probe (id) VALUES (1)"),
+                RunStatus::Ok
+            );
+            finish();
+            // Thread ends here: TLS teardown must park, not drop.
+        })
+        .join()
+        .expect("worker thread must exit cleanly, not abort");
+        assert!(
+            parked_total() > parked_before,
+            "the retiring thread's session must be parked, not dropped at teardown"
+        );
+
+        // Draining happens on a live thread, where the engine's drop glue is
+        // harmless.
+        let drained_before = drained_total();
+        drain_parked_sessions();
+        assert!(
+            drained_total() > drained_before,
+            "drain_parked_sessions must drop what thread teardown parked"
+        );
+
+        // The parked session's writes are durable and the database is usable
+        // afterwards — parking defers a drop, it does not abandon data.
+        set_current_site(Some("park.test"));
+        assert_eq!(run_on(Some(&bridge), b"SELECT COUNT(*) FROM park_probe"), RunStatus::Rows);
+        with_cell(0, 0, |c| assert_eq!(c, Some(&Value::Integer(1))));
+        finish();
+    }
+
+    /// `on_request_end()` is the wired drain point, so ordinary request
+    /// teardown reclaims the sessions of threads that retired since the last
+    /// request. Also the churn test: many short-lived PHP-tainted threads in a
+    /// row is precisely the tokio blocking-pool reaping pattern that produced
+    /// the abort under load.
+    #[test]
+    fn thread_churn_is_reclaimed_by_request_end() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bridge = one_site_bridge(dir.path(), "churn.test");
+
+        for round in 0..8 {
+            let parked_before = parked_total();
+            let workers: Vec<_> = (0..4)
+                .map(|_| {
+                    let bridge = Arc::clone(&bridge);
+                    std::thread::spawn(move || {
+                        set_current_site(Some("churn.test"));
+                        assert_eq!(run_on(Some(&bridge), b"SELECT 1"), RunStatus::Rows);
+                        finish();
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().expect("worker thread must exit cleanly, not abort");
+            }
+            assert!(
+                parked_total() >= parked_before + 4,
+                "round {round}: every retiring thread must park its session"
+            );
+
+            let drained_before = drained_total();
+            // The seam production uses — no special-case teardown call.
+            on_request_end();
+            assert!(
+                drained_total() > drained_before,
+                "round {round}: on_request_end must drain the graveyard"
+            );
+        }
+    }
+
+    /// Draining an empty graveyard is a cheap no-op, and repeated drains are
+    /// idempotent — it sits on the per-request path.
+    #[test]
+    fn draining_nothing_is_a_noop() {
+        drain_parked_sessions();
+        let drained_before = drained_total();
+        drain_parked_sessions();
+        drain_parked_sessions();
+        assert_eq!(drained_total(), drained_before, "empty drains must not account anything");
+    }
+
+    // ── The platform behavior that makes #300 possible ──────────────────
+
+    thread_local! {
+        /// Stands in for `DB_HELD`: initialized FIRST, so its destructor runs
+        /// LAST.
+        static PROBE_EARLY: RefCell<Option<ProbeValue>> = const { RefCell::new(None) };
+        /// Stands in for Turso's `TEMP_BUFFER_CACHE`: initialized SECOND, so
+        /// its destructor runs FIRST and it is already gone when `ProbeValue`
+        /// reaches for it.
+        static PROBE_LATE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    }
+
+    static PROBE_DROPPED: AtomicBool = AtomicBool::new(false);
+    static PROBE_SAW_DESTROYED_TLS: AtomicBool = AtomicBool::new(false);
+
+    /// Reaches for another thread-local from its `Drop`, exactly as
+    /// `turso_core::io::Buffer::drop` does — except with `try_with`, so it
+    /// *observes* the failure the engine *panics* on.
+    struct ProbeValue;
+
+    impl Drop for ProbeValue {
+        fn drop(&mut self) {
+            PROBE_DROPPED.store(true, Ordering::Release);
+            if PROBE_LATE.try_with(|c| c.borrow_mut().push(1)).is_err() {
+                PROBE_SAW_DESTROYED_TLS.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Pins the assumption the whole fix rests on: thread-local destructors run
+    /// in **reverse** registration order, so a value dropped at teardown can
+    /// find a thread-local it depends on already destroyed. `LocalKey::with`
+    /// there panics, and a panic in a TLS destructor aborts the process — which
+    /// is #300 in one sentence.
+    ///
+    /// If this ever fails, the platform stopped inverting and the module docs
+    /// need re-reading; the fix (park, never drop) stays correct either way.
+    #[test]
+    fn tls_destructors_run_in_reverse_registration_order() {
+        std::thread::spawn(|| {
+            // Registration order: early first...
+            PROBE_EARLY.with(|c| *c.borrow_mut() = Some(ProbeValue));
+            // ...then late, mimicking the engine allocating a scratch buffer
+            // inside the very call that created the session.
+            PROBE_LATE.with(|c| c.borrow_mut().push(0));
+        })
+        .join()
+        .expect("probe thread must exit cleanly, not abort");
+
+        assert!(PROBE_DROPPED.load(Ordering::Acquire), "the probe value must be dropped at exit");
+        assert!(
+            PROBE_SAW_DESTROYED_TLS.load(Ordering::Acquire),
+            "the later-registered thread-local must already be destroyed when an \
+             earlier-registered one drops — this inversion is what aborts the process when \
+             the drop belongs to a database session (issue #300)"
+        );
     }
 }
 

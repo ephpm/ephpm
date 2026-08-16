@@ -405,7 +405,9 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.limits.per_ip_burst` | int | `50` | Burst size for per-IP rate limiting |
 | `server.limits.per_site_rate` | float | `0.0` | Max PHP executions/second per virtual host (token bucket keyed by the canonical site key; over-limit gets 429 + `Retry-After`) |
 | `server.limits.per_site_burst` | int | `20` | Burst size for per-site rate limiting |
-| `server.preview` | bool | `false` | Preview-host preset: `X-Ephpm-Preview: 1` on every response, plus preview defaults for every `[server.limits]` knob left unset (explicit values win) |
+| `server.preview` | bool | `false` | Preview-host preset: `X-Ephpm-Preview: 1` on every response, plus preview defaults for every `[server.limits]` knob left unset and `[php] overload_policy = "shed"` (explicit values win) |
+| `php.overload_policy` | string | unset (`wait`; `shed` under preview) | Request-granularity load shedding. `shed` answers `503` + `Retry-After` when no PHP execution slot frees up within `php.shed_after_ms`, instead of queueing until the client times out |
+| `php.shed_after_ms` | int (ms) | `0` | Grace window before `overload_policy = "shed"` rejects. `0` = shed as soon as there is no free slot |
 
 ### CLI Flags
 

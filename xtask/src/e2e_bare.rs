@@ -155,6 +155,19 @@ const ISOLATED_DB_SUITES: &[&str] = &[
 /// template. It runs multi-tenant (`sites_dir`) so the suite can prove
 /// cross-site isolation with two real vhosts on one server, which is the
 /// property most worth an end-to-end test.
+/// `load_shedding` needs `[php] overload_policy = "shed"` on a **deliberately
+/// tiny** execution pool (`worker_count = 1`, `worker_backlog = 1`) so that
+/// saturation is reachable with a handful of concurrent requests. Both halves
+/// are whole-server switches and both are hostile to every other suite: a
+/// one-thread pool serialises all PHP, and the shed policy answers 503 to
+/// anything that arrives while that thread is busy — which is exactly what
+/// `fpm_pool`'s `pool_handles_concurrent_requests` (40 in-flight, all must be
+/// 200) asserts must NOT happen. So it cannot be bolted onto the `fpm_pool`
+/// node, and certainly not the shared one (the #295 lesson). It runs the pool
+/// engine because that is where shedding works without further configuration;
+/// the `spawn_blocking` shed path (bounded `[php] workers` acquire) is covered
+/// by `ephpm-server`'s router unit tests instead, since making it shed
+/// end-to-end needs a `workers` cap that would equally perturb any shared node.
 const ISOLATED_CONFIG_SUITES: &[&str] = &[
     "opcache_invalidation",
     "rate_limit",
@@ -165,6 +178,7 @@ const ISOLATED_CONFIG_SUITES: &[&str] = &[
     "crash_containment",
     "preview",
     "websockets",
+    "load_shedding",
 ];
 
 /// Suites that run single-threaded (a superset of the DB suites). Kept as a
@@ -195,12 +209,17 @@ fn suite_is_serial(name: &str) -> bool {
     // one KV keyspace per vhost across its tests. Running serially means each
     // test can assert on absolute connection counts and KV state instead of
     // having to name every key uniquely and hope.
+    // `load_shedding` is serial for the `rate_limit` reason: its whole method is
+    // saturating a one-thread pool and reading the process-global
+    // `ephpm_php_shed_total` counter around the burst. A concurrent sibling
+    // would both consume the slot it means to occupy and move the counter.
     ISOLATED_DB_SUITES.contains(&name)
         || name == "worker_mode"
         || name == "fpm_pool"
         || name == "crash_containment"
         || name == "rate_limit"
         || name == "websockets"
+        || name == "load_shedding"
 }
 
 /// Whether a suite needs its own freshly-spawned, then-torn-down single node
@@ -694,7 +713,8 @@ fn recreate_dir(path: &Path) -> io::Result<()> {
 /// `{FPM_ENGINE_LINE}` (the `[php] fpm_engine = "pool"` line for the `fpm_pool`
 /// and `crash_containment` nodes, or empty), `{CRASH_CONTAINMENT_LINE}` (the
 /// `[php] crash_containment = true` line for the `crash_containment` node, or
-/// empty), `{KV_SOCKET}`.
+/// empty), `{OVERLOAD_BLOCK}` (the load-shedding policy plus the tiny pool
+/// sizing for the `load_shedding` node, or empty), `{KV_SOCKET}`.
 ///
 /// Shape mirrors `tests/ephpm-test.toml` (the config baked into the container
 /// image) as closely as possible. The only intentional divergences are:
@@ -807,6 +827,7 @@ ini_overrides = [
 ]
 {FPM_ENGINE_LINE}
 {CRASH_CONTAINMENT_LINE}
+{OVERLOAD_BLOCK}
 {PHP_WORKER_BLOCK}
 
 [server.limits]
@@ -964,6 +985,16 @@ struct SingleNodeOptions {
     /// byte-identical to before this knob existed — the pool engine is opt-in
     /// and must not perturb any suite that does not select it.
     fpm_engine_pool: bool,
+    /// Emit `[php] overload_policy = "shed"` together with a one-thread,
+    /// one-slot execution pool — the smallest configuration in which saturation
+    /// (and therefore a 503) is reachable from a test with a handful of
+    /// concurrent requests.
+    ///
+    /// Only the `load_shedding` suite sets it, and only together with
+    /// `fpm_engine_pool`. Every other node leaves it `false`, so the rendered
+    /// `{OVERLOAD_BLOCK}` is empty and their admission behaviour is the
+    /// historical "queue and wait".
+    overload_shed: bool,
     /// Emit `[php] crash_containment = true` — contain a PHP C-stack overflow
     /// (500 + retire the pool thread) instead of aborting the process.
     ///
@@ -1018,6 +1049,7 @@ impl SingleNodeOptions {
             // `multitenant_hardening` node instead.
             multi_tenant_hardening: false,
             fpm_engine_pool: false,
+            overload_shed: false,
             crash_containment: false,
             preview: false,
             websocket: false,
@@ -1041,6 +1073,7 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: false,
+                overload_shed: false,
                 crash_containment: false,
                 preview: false,
                 websocket: false,
@@ -1062,6 +1095,7 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: true,
                 fpm_engine_pool: false,
+                overload_shed: false,
                 crash_containment: false,
                 preview: false,
                 websocket: false,
@@ -1078,6 +1112,7 @@ impl SingleNodeOptions {
                 worker: true,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: false,
+                overload_shed: false,
                 crash_containment: false,
                 preview: false,
                 websocket: false,
@@ -1093,6 +1128,7 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: false,
+                overload_shed: false,
                 crash_containment: false,
                 preview: false,
                 websocket: false,
@@ -1108,6 +1144,7 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: false,
+                overload_shed: false,
                 crash_containment: false,
                 preview: false,
                 websocket: false,
@@ -1130,6 +1167,7 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: true,
+                overload_shed: false,
                 crash_containment: false,
                 preview: false,
                 websocket: false,
@@ -1152,6 +1190,7 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: true,
+                overload_shed: false,
                 crash_containment: true,
                 preview: false,
                 websocket: false,
@@ -1173,6 +1212,7 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: false,
+                overload_shed: false,
                 crash_containment: false,
                 preview: true,
                 websocket: false,
@@ -1192,9 +1232,31 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: false,
+                overload_shed: false,
                 crash_containment: false,
                 preview: false,
                 websocket: true,
+            },
+            // load_shedding: the ONLY node with `[php] overload_policy =
+            // "shed"`. Runs the pool engine deliberately undersized — one
+            // thread, one backlog slot — so a burst of concurrent requests
+            // reaches saturation (and therefore a real 503 over a real socket)
+            // in a couple of seconds instead of needing a load generator.
+            // Single-site so the docroot's `sleep.php` is reachable and no
+            // per-site rate cap can produce a 429 that masquerades as shedding.
+            "load_shedding" => Self {
+                slug,
+                with_sites_dir: false,
+                opcache_invalidation: false,
+                tight_rate_limit: false,
+                middleware_lib: None,
+                worker: false,
+                multi_tenant_hardening: false,
+                fpm_engine_pool: true,
+                overload_shed: true,
+                crash_containment: false,
+                preview: false,
+                websocket: false,
             },
             // DB suites: fresh DB, single-site. `sites_dir` is NOT optional
             // detail here — it would put the node in per-site database mode,
@@ -1211,6 +1273,7 @@ impl SingleNodeOptions {
                 worker: false,
                 multi_tenant_hardening: false,
                 fpm_engine_pool: false,
+                overload_shed: false,
                 crash_containment: false,
                 preview: false,
                 websocket: false,
@@ -1345,6 +1408,17 @@ impl SingleNodeSpawn {
         // cap must not perturb suites that assert exact header sets or fire
         // bursts of PHP requests.
         let preview_line = if opts.preview { "preview = true" } else { "" };
+        // Load shedding: ON only for the `load_shedding` suite's node, and
+        // deliberately at the smallest possible scale. One pool thread plus one
+        // backlog slot means the third concurrent request has nowhere to go, so
+        // the suite can observe a genuine overload 503 without a load generator.
+        // `shed_after_ms = 0` keeps it deterministic: no grace window means no
+        // timing race between "shed" and "a slot freed up in the meantime".
+        let overload_block = if opts.overload_shed {
+            "overload_policy = \"shed\"\nshed_after_ms = 0\nworker_count = 1\nworker_backlog = 1"
+        } else {
+            ""
+        };
         let php_worker_block = if opts.worker {
             "mode = \"worker\"\nworker_script = \"worker.php\"\nworker_count = 3\n\
              worker_max_requests = 10000\nworker_boot_timeout = 60"
@@ -1436,6 +1510,7 @@ impl SingleNodeSpawn {
             .replace("{INI_OVERRIDES_EXTRA}", ini_overrides_extra)
             .replace("{FPM_ENGINE_LINE}", fpm_engine_line)
             .replace("{CRASH_CONTAINMENT_LINE}", crash_containment_line)
+            .replace("{OVERLOAD_BLOCK}", overload_block)
             .replace("{PHP_WORKER_BLOCK}", php_worker_block)
             .replace("{KV_SOCKET}", &escape_toml(&kv_socket))
             .replace("{DOCROOT}", &escape_toml(docroot));
