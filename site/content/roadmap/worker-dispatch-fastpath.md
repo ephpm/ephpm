@@ -107,7 +107,7 @@ because the Rust edge (TLS/ACME, static files, security filtering,
 clustering, KV) is the product. The design ceiling is roughly 1.5–2× on
 empty-request microbenchmarks — and on any request doing ≥1 ms of real
 PHP work, the residual boundary cost is under 5%. The [rate-160
-pressure result](https://github.com/tinfoyle/ePHPm-lab) (worker mode
+pressure result](https://github.com/ephpm/lab) (worker mode
 holding 159/160 req/s while fpm+Redis collapsed to 100) is what the
 fast path is defending and extending.
 
