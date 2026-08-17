@@ -42,4 +42,4 @@ Apply ON TOP of a normal correctness review. Each item has bitten this repo at l
 
 - Preserve outside contributors' authorship: prefer building on their branch/commits (merge-commit if squash would erase attribution - ask the owner).
 - `ephpm-e2e` is workspace-excluded - don't add it to workspace ops; its Cargo.lock drifts by design.
-- Gates: clippy pedantic `-D warnings`, `cargo +nightly fmt`, cargo-deny, MSRV 1.85.
+- Gates: clippy pedantic `-D warnings`, `cargo +nightly fmt`, cargo-deny, MSRV 1.88.

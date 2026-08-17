@@ -76,7 +76,7 @@ sudo ephpm uninstall --keep-data  # keep config and SQLite databases
 
 ### Build from Source
 
-For contributors or custom builds. Requires Rust 1.85+.
+For contributors or custom builds. Requires Rust 1.88+.
 
 ```bash
 # Stub mode (no PHP, fast iteration on HTTP/routing logic)
@@ -360,7 +360,7 @@ Key design decisions:
 
 ### Prerequisites
 
-- **Rust 1.85+** — https://rustup.rs (on Windows, also install [C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/))
+- **Rust 1.88+** — https://rustup.rs (on Windows, also install [C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/))
 - **Nightly Rust** — `rustup toolchain install nightly` (required for `cargo +nightly fmt`)
 - **cargo-nextest** — `cargo install cargo-nextest --locked`
 - **cargo-deny** — `cargo install cargo-deny --locked`

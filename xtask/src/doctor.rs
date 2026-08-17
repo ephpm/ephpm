@@ -14,7 +14,7 @@ use std::{env, fs};
 
 /// Minimum supported Rust version — keep in sync with `rust-version` in the
 /// workspace `Cargo.toml`.
-const MSRV: (u32, u32) = (1, 85);
+const MSRV: (u32, u32) = (1, 88);
 
 /// Remedy shared by all Linux C-toolchain checks (matches the README and
 /// CLAUDE.md prerequisites list).

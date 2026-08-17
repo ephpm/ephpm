@@ -7,7 +7,7 @@ Contributions are welcome. The bar is high but the path is short — most change
 
 ## Prerequisites
 
-- **Rust 1.85+** via [rustup](https://rustup.rs). On Windows, also install [C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
+- **Rust 1.88+** via [rustup](https://rustup.rs). On Windows, also install [C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/).
 - **Nightly toolchain** — `rustup toolchain install nightly` (used for `cargo +nightly fmt` only)
 - **cargo-nextest** — `cargo install cargo-nextest --locked`
 - **cargo-deny** — `cargo install cargo-deny --locked`
@@ -66,7 +66,7 @@ E2E commands require Podman or Docker. `cargo xtask e2e-install` downloads kind/
 - All PHP FFI code is gated with `#[cfg(php_linked)]`. **Stub mode must always compile and pass tests** without a PHP SDK.
 - PHP uses `setjmp`/`longjmp` for error handling. Never call PHP functions directly from Rust — always go through `ephpm_wrapper.c` and its `zend_try`/`zend_catch` guards.
 - Crate names are kebab-case (`ephpm-*`).
-- MSRV is Rust 1.85. Don't use features from newer editions without checking.
+- MSRV is Rust 1.88. Don't use features from newer editions without checking.
 
 ## Pull request flow
 
