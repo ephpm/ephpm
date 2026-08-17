@@ -216,7 +216,7 @@ docker run -d \
 # PHP version and SAPI name
 docker exec wordpress ephpm php -- -r "phpinfo();" | grep -E "PHP Version|Server API"
 # PHP Version => 8.5.7
-# Server API => ePHPm Embedded Server
+# Server API => Command Line Interface
 
 # KV keys after serving a few requests
 docker exec wordpress ephpm kv keys "*"

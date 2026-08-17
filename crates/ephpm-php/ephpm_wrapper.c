@@ -42,6 +42,7 @@ static char *ephpm_strtok_r(char *str, const char *delim, char **saveptr) {
 #include "main/php_output.h"
 #include "Zend/zend.h"
 #include "Zend/zend_ini.h"
+#include "Zend/zend_constants.h"
 #include "Zend/zend_stream.h"
 #include "Zend/zend_call_stack.h"
 #include "Zend/zend_exceptions.h"
@@ -784,6 +785,33 @@ void __wrap_zend_call_stack_init(void)
 }
 
 /*
+ * CLI-mode flag. When set (via ephpm_enable_cli_mode() before php_embed_init),
+ * the SAPI reports itself as "cli" so php_sapi_name() / the PHP_SAPI constant
+ * return "cli" — exactly what stock php-cli reports. This makes `ephpm php` a
+ * drop-in for `php`: the near-universal `if (PHP_SAPI !== 'cli') die(...)` guard
+ * and tools like wp-cli that gate on the SAPI name behave identically.
+ *
+ * `ephpm php` and `ephpm serve` are SEPARATE process invocations, so setting
+ * this in the CLI process cannot affect the server (which never calls the
+ * enabling function and keeps reporting "ephpm").
+ */
+static int g_cli_mode = 0;
+
+/*
+ * Switch the SAPI into CLI identity. MUST be called before php_embed_init()
+ * so ephpm_pre_init() (which runs during init) picks the "cli" name up — the
+ * name is copied into OPcache's startup verdict and cannot be changed later.
+ */
+void ephpm_enable_cli_mode(void)
+{
+    g_cli_mode = 1;
+}
+
+/* SAPI name/pretty-name pair for the active mode. */
+#define EPHPM_SAPI_NAME        (g_cli_mode ? "cli" : "ephpm")
+#define EPHPM_SAPI_PRETTY_NAME (g_cli_mode ? "Command Line Interface" : "ePHPm Embedded Server")
+
+/*
  * Override the default embed SAPI callbacks with our implementations.
  * Must be called once after php_embed_init().
  */
@@ -797,9 +825,17 @@ void ephpm_install_sapi(void)
     sapi_module.register_server_variables = ephpm_sapi_register_server_variables;
     sapi_module.log_message = ephpm_sapi_log_message;
 
-    /* Update SAPI name visible to phpinfo() and $_SERVER['SERVER_SOFTWARE'] */
-    sapi_module.name = "ephpm";
-    sapi_module.pretty_name = "ePHPm Embedded Server";
+    /* Update SAPI name visible to phpinfo() and $_SERVER['SERVER_SOFTWARE'].
+     * "cli" in the `ephpm php` process, "ephpm" in the server. */
+    sapi_module.name = (char *)EPHPM_SAPI_NAME;
+    sapi_module.pretty_name = (char *)EPHPM_SAPI_PRETTY_NAME;
+
+    /* php-cli renders phpinfo() (and `php -i`) as plain text, not HTML. Match
+     * that in CLI mode so `ephpm php -i` / userland phpinfo() output is a
+     * drop-in for `php -i`. The server keeps the default (HTML) behaviour. */
+    if (g_cli_mode) {
+        sapi_module.phpinfo_as_text = 1;
+    }
 }
 
 /*
@@ -3963,6 +3999,17 @@ void ephpm_set_ini_file(const char *ini_file)
 }
 
 /*
+ * CLI `-n` — do not load any php.ini file. Mirrors php-cli's php_ini_ignore.
+ * Must be called BEFORE php_embed_init() (the ini search happens during module
+ * startup), so it is driven from the Rust CLI pre-scan alongside cli-mode.
+ */
+void ephpm_cli_set_no_ini(void)
+{
+    php_embed_module.php_ini_ignore = 1;
+    php_embed_module.php_ini_ignore_cwd = 1;
+}
+
+/*
  * Custom startup callback installed in place of php_embed_module.startup.
  *
  * Why this is necessary, and why post-init registration cannot work:
@@ -4033,16 +4080,21 @@ void ephpm_pre_init(void)
 {
     php_embed_module.startup = ephpm_module_startup;
 
-    /* The SAPI name must be "ephpm" BEFORE php_embed_init():
+    /* The SAPI name must be settled BEFORE php_embed_init():
      * sapi_startup() struct-copies php_embed_module into sapi_module, and
      * OPcache's accel_startup() (inside php_module_startup) checks
      * sapi_module.name against its supported-SAPIs allowlist on PHP < 8.5,
      * caching the verdict for the process lifetime. Renaming only in
      * ephpm_install_sapi() (post-init) left OPcache seeing "embed" at
      * startup — permanently "Startup Failed" even though the SDK
-     * whitelists "ephpm". */
-    php_embed_module.name = "ephpm";
-    php_embed_module.pretty_name = "ePHPm Embedded Server";
+     * whitelists "ephpm".
+     *
+     * In `ephpm php` (g_cli_mode set by ephpm_enable_cli_mode() just before
+     * init) the name is "cli", so PHP_SAPI === "cli" — the drop-in identity.
+     * "cli" is the SAPI OPcache is built to accept, so this is at least as
+     * safe as "ephpm" here. */
+    php_embed_module.name = (char *)EPHPM_SAPI_NAME;
+    php_embed_module.pretty_name = (char *)EPHPM_SAPI_PRETTY_NAME;
 }
 
 /*
@@ -4219,6 +4271,220 @@ static int cli_execute_protected(const char *code, const char *filename)
     return result;
 }
 
+/*
+ * Define one of the STDIN / STDOUT / STDERR constants as an open stream
+ * resource. Built from the process FILE* (not the php://std* wrappers, which do
+ * not open in this embed build) and flagged NO_FCLOSE so the shared fd survives
+ * the resource being freed at request shutdown. Mirrors stock php-cli's
+ * cli_register_file_handles (sapi/cli/php_cli.c).
+ */
+static void cli_register_file_handle(
+    FILE *fp, const char *mode, const char *name, size_t name_len)
+{
+    php_stream *stream = php_stream_fopen_from_file(fp, mode);
+    if (!stream) {
+        return;
+    }
+    stream->flags |= PHP_STREAM_FLAG_NO_FCLOSE;
+
+    zend_constant c;
+    php_stream_to_zval(stream, &c.value);
+    ZEND_CONSTANT_SET_FLAGS(&c, CONST_CS, 0);
+    c.name = zend_string_init_interned(name, name_len, 0);
+    zend_register_constant(&c);
+}
+
+/*
+ * Register the STDIN / STDOUT / STDERR constants, exactly as php-cli does.
+ * Many CLI tools reference these directly (wp-cli's isPiped(), phpunit,
+ * fwrite(STDERR, …), fgets(STDIN)) and fatal with "Undefined constant STDOUT"
+ * without them — the embed SAPI never defines them, so `ephpm php` must.
+ */
+static void cli_register_file_handles(void)
+{
+    cli_register_file_handle(stdin, "rb", "STDIN", sizeof("STDIN") - 1);
+    cli_register_file_handle(stdout, "wb", "STDOUT", sizeof("STDOUT") - 1);
+    cli_register_file_handle(stderr, "wb", "STDERR", sizeof("STDERR") - 1);
+}
+
+/*
+ * Execute a program read from stdin, with bailout protection. Reads through
+ * the C `stdin` FILE* via zend_stream_init_fp — the same mechanism php-cli
+ * uses ("Standard input code"), which works in the embed build where the
+ * `php://stdin` stream wrapper does not open for compilation. The program is
+ * a real script (expects `<?php` tags), unlike -r's raw code.
+ */
+static int cli_execute_stdin_protected(void)
+{
+    int result = 0;
+    JMP_BUF *__orig_bailout = EG(bailout);
+    JMP_BUF __bailout;
+
+    EG(bailout) = &__bailout;
+    if (SETJMP(__bailout) == 0) {
+        zend_file_handle file_handle;
+        zend_stream_init_fp(&file_handle, stdin, "Standard input code");
+        file_handle.primary_script = 1;
+        php_execute_script(&file_handle);
+        zend_destroy_file_handle(&file_handle);
+
+        if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
+            zend_clear_exception();
+            result = EG(exit_status);
+        }
+    } else {
+        result = EG(exit_status);
+        if (result == 0) result = 1;
+    }
+    EG(bailout) = __orig_bailout;
+    return result;
+}
+
+/*
+ * Apply a single `-d name[=value]` ini directive, matching php-cli semantics:
+ * a bare `-d name` sets it to "1". Applied after startup via
+ * zend_alter_ini_entry_chars at SYSTEM/ACTIVATE privilege so PHP_INI_ALL and
+ * PHP_INI_SYSTEM-at-activate entries (memory_limit, error_reporting,
+ * disable_functions, …) take effect for the executed script. Entries that are
+ * only settable at MINIT (e.g. most opcache.* / extension=) cannot be changed
+ * post-startup in the embed model — the same limitation the `-d extension=`
+ * warning in the Rust layer documents.
+ */
+static void cli_apply_ini_define(const char *def)
+{
+    const char *eq = strchr(def, '=');
+    size_t name_len = eq ? (size_t)(eq - def) : strlen(def);
+    const char *value = eq ? eq + 1 : "1";
+    size_t value_len = strlen(value);
+    if (name_len == 0) {
+        return;
+    }
+    zend_string *key = zend_string_init(def, name_len, 0);
+    zend_alter_ini_entry_chars(
+        key, (char *)value, value_len, ZEND_INI_SYSTEM, ZEND_INI_STAGE_ACTIVATE);
+    zend_string_release(key);
+}
+
+/*
+ * Portable line reader for the -R/-F/-B/-E stdin line processor and REPL-free
+ * stdin execution. Reads one line (including any trailing newline) from `fp`
+ * into a malloc'd buffer. Returns the buffer (caller frees) and sets *out_len,
+ * or NULL at EOF with no data. Uses fgetc so it needs no POSIX getline (absent
+ * on MSVC).
+ */
+static char *cli_read_line(FILE *fp, size_t *out_len)
+{
+    size_t cap = 256;
+    size_t len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        return NULL;
+    }
+    int ch;
+    while ((ch = fgetc(fp)) != EOF) {
+        if (len + 2 >= cap) {
+            size_t ncap = cap * 2;
+            char *nbuf = (char *)realloc(buf, ncap);
+            if (!nbuf) {
+                free(buf);
+                return NULL;
+            }
+            buf = nbuf;
+            cap = ncap;
+        }
+        buf[len++] = (char)ch;
+        if (ch == '\n') {
+            break;
+        }
+    }
+    if (len == 0 && ch == EOF) {
+        free(buf);
+        return NULL;
+    }
+    buf[len] = '\0';
+    *out_len = len;
+    return buf;
+}
+
+/*
+ * Install $argn (current line, trailing CR/LF stripped) and $argi (zero-based
+ * line index) into the global symbol table for the -R/-F line processor, the
+ * same variables php-cli exposes.
+ */
+static void cli_set_line_vars(const char *line, size_t len, zend_long argi)
+{
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+        len--;
+    }
+    zval zn;
+    ZVAL_STRINGL(&zn, line, len);
+    zend_hash_str_update(&EG(symbol_table), "argn", sizeof("argn") - 1, &zn);
+
+    zval zi;
+    ZVAL_LONG(&zi, argi);
+    zend_hash_str_update(&EG(symbol_table), "argi", sizeof("argi") - 1, &zi);
+}
+
+/*
+ * The awk-like -B/-R/-F/-E line processor. Runs `begin_code` once, then for
+ * each stdin line sets $argn/$argi and runs either `per_line_code` (-R) or
+ * `per_line_file` (-F), then `end_code` once. The whole run is wrapped in one
+ * bailout so a fatal aborts it exactly as php-cli does. Returns the exit code.
+ */
+static int cli_process_stdin_lines(
+    const char *begin_code,
+    const char *per_line_code,
+    const char *per_line_file,
+    const char *end_code)
+{
+    int result = 0;
+    JMP_BUF *__orig_bailout = EG(bailout);
+    JMP_BUF __bailout;
+
+    EG(bailout) = &__bailout;
+    if (SETJMP(__bailout) == 0) {
+        if (begin_code) {
+            zend_eval_string((char *)begin_code, NULL, "ephpm php -B");
+        }
+        if (!(EG(exception) && zend_is_unwind_exit(EG(exception)))) {
+            zend_long argi = 0;
+            char *line;
+            size_t len;
+            while ((line = cli_read_line(stdin, &len)) != NULL) {
+                cli_set_line_vars(line, len, argi);
+                free(line);
+                if (per_line_code) {
+                    zend_eval_string((char *)per_line_code, NULL, "ephpm php -R");
+                } else if (per_line_file) {
+                    zend_file_handle fh;
+                    zend_stream_init_filename(&fh, per_line_file);
+                    php_execute_script(&fh);
+                    zend_destroy_file_handle(&fh);
+                }
+                if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
+                    break;
+                }
+                argi++;
+            }
+        }
+        if (end_code && !(EG(exception) && zend_is_unwind_exit(EG(exception)))) {
+            zend_eval_string((char *)end_code, NULL, "ephpm php -E");
+        }
+
+        if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
+            zend_clear_exception();
+            result = EG(exit_status);
+        }
+    } else {
+        result = EG(exit_status);
+        if (result == 0) {
+            result = 1;
+        }
+    }
+    EG(bailout) = __orig_bailout;
+    return result;
+}
+
 /* PHP CLI option table — matches the real PHP CLI SAPI options.
  * Used by php_getopt() to parse argc/argv. */
 static const opt_struct cli_options[] = {
@@ -4240,6 +4506,7 @@ static const opt_struct cli_options[] = {
     {'R', 1, "process-code"},
     {'H', 0, "hide-args"},
     {'r', 1, "run"},
+    {'S', 1, "server"},
     {'s', 0, "syntax-highlight"},
     {'t', 1, "docroot"},
     {'w', 0, "strip"},
@@ -4296,15 +4563,37 @@ int ephpm_cli_main(int argc, char **argv)
     char *script_file = NULL;   /* -f file or positional */
     int mode = 0;               /* 0=standard, 'r'=run, 'l'=lint, etc. */
 
+    char *begin_code = NULL;    /* -B */
+    char *end_code = NULL;      /* -E */
+    char *line_code = NULL;     /* -R */
+    char *line_file = NULL;     /* -F */
+    char *server_addr = NULL;   /* -S <addr> */
+    int want_interactive = 0;   /* -a */
+    int read_stdin = 0;         /* script/program comes from stdin */
+
+    /* Collected -d name[=value] directives (applied after startup). Bounded;
+     * a CLI invocation with hundreds of -d is pathological, and extra ones are
+     * silently dropped rather than risk an unbounded stack array. */
+    const char *ini_defines[128];
+    int n_ini_defines = 0;
+
     /* First pass: handle flags that print info and exit immediately */
     while ((c = php_getopt(argc, argv, cli_options, &php_optarg, &php_optind, 0, 2)) != -1) {
         switch (c) {
         case 'v': /* version */
             sapi_module.ub_write = ephpm_sapi_ub_write_stdout;
-            php_printf("PHP %s (ephpm) (built: %s %s)\n"
+            /* Match stock php-cli's shape: `PHP x.y.z (cli) (built: …) (NTS)`.
+             * The SAPI token is "cli" in `ephpm php` (g_cli_mode) so scripts
+             * and tooling that scrape `php -v` see the CLI they expect. */
+            php_printf("PHP %s (%s) (built: %s %s) (%s)\n"
                        "Copyright (c) The PHP Group\n"
                        "Zend Engine v%s, Copyright (c) Zend Technologies\n",
-                       PHP_VERSION, __DATE__, __TIME__,
+                       PHP_VERSION, EPHPM_SAPI_NAME, __DATE__, __TIME__,
+#ifdef ZTS
+                       "ZTS",
+#else
+                       "NTS",
+#endif
                        ZEND_VERSION);
             fflush(stdout);
             return 0;
@@ -4380,6 +4669,32 @@ int ephpm_cli_main(int argc, char **argv)
             cli_end(orig_ub_write);
             return 0;
 
+        case 10: /* --rf / --rfunction  <name> */
+        case 11: /* --rc / --rclass     <name> */
+        case 12: /* --re / --rextension <name> */
+        case 13: /* --rz / --rzendextension <name> */
+        case 14: /* --ri / --rextinfo   <name> */
+        {
+            /* Reflection info flags, matching php-cli. Implemented via the
+             * always-compiled Reflection extension; a bad name surfaces the
+             * ReflectionException, and the whole thing is bailout-protected. */
+            const char *expr;
+            switch (c) {
+            case 10: expr = "echo new ReflectionFunction('%s'), \"\\n\";"; break;
+            case 11: expr = "echo new ReflectionClass('%s'), \"\\n\";"; break;
+            case 12: expr = "echo new ReflectionExtension('%s'), \"\\n\";"; break;
+            case 13: expr = "echo new ReflectionZendExtension('%s'), \"\\n\";"; break;
+            default: expr = "(new ReflectionExtension('%s'))->info();"; break; /* --ri */
+            }
+            char code[1024];
+            snprintf(code, sizeof(code), expr, php_optarg ? php_optarg : "");
+            cli_begin(&orig_ub_write);
+            cli_execute_protected(code, NULL);
+            php_output_end_all();
+            cli_end(orig_ub_write);
+            return 0;
+        }
+
         default:
             break;
         }
@@ -4406,22 +4721,96 @@ int ephpm_cli_main(int argc, char **argv)
         case 's':
             mode = 's';
             break;
+        case 'd':
+            if (n_ini_defines < (int)(sizeof(ini_defines) / sizeof(ini_defines[0]))) {
+                ini_defines[n_ini_defines++] = php_optarg;
+            }
+            break;
+        case 'B':
+            begin_code = php_optarg;
+            break;
+        case 'R':
+            line_code = php_optarg;
+            break;
+        case 'F':
+            line_file = php_optarg;
+            break;
+        case 'E':
+            end_code = php_optarg;
+            break;
+        case 'a':
+            want_interactive = 1;
+            break;
+        case 'S':
+            server_addr = php_optarg;
+            break;
+        /* -c and -n are init-time (which ini to load) and are handled by the
+         * Rust pre-scan before php_embed_init; php_getopt still consumes their
+         * arguments here so positional detection stays correct. */
         default:
             break;
         }
     }
 
-    /* Positional argument: if no -f and no -r, first non-option arg is the script */
-    if (!script_file && !exec_direct && php_optind < argc && argv[php_optind][0] != '-') {
-        script_file = argv[php_optind];
-        php_optind++; /* consume it: what follows are the script's args */
+    /* -a interactive shell: the PHP interactive shell lives in the standalone
+     * cli SAPI (sapi/cli + the readline shell), which is not linked into the
+     * embed build ePHPm uses. Rather than a silent no-op or a half-working
+     * bespoke REPL that diverges from php-cli, refuse honestly. */
+    if (want_interactive) {
+        fprintf(stderr,
+            "ephpm php: interactive shell (-a) is not supported in this build.\n"
+            "The PHP interactive shell is part of the standalone php-cli SAPI, which\n"
+            "is not linked into ePHPm's embedded runtime. Use `ephpm php -r <code>`,\n"
+            "`ephpm php <file>`, or pipe a script to stdin instead.\n");
+        return 1;
+    }
+
+    /* -S built-in server: deliberately NOT aliased to `ephpm serve`. A user who
+     * asks for php's genuine built-in dev server should get exactly that or an
+     * honest error — never a different server wearing its flag. The cli-server
+     * SAPI (php_cli_server.c) is not part of the embed build, so it cannot be
+     * provided here. */
+    if (server_addr) {
+        fprintf(stderr,
+            "ephpm php: the PHP built-in server (-S) SAPI is not linked in this build.\n"
+            "Use a full php-cli for `php -S`, or run `ephpm serve` / `ephpm dev` for\n"
+            "ePHPm's own HTTP server.\n");
+        return 1;
+    }
+
+    /* Apply -d directives now that the runtime is up (see cli_apply_ini_define). */
+    for (int i = 0; i < n_ini_defines; i++) {
+        cli_apply_ini_define(ini_defines[i]);
+    }
+
+    /* Define STDIN/STDOUT/STDERR before any script runs, like php-cli. */
+    cli_register_file_handles();
+
+    /* Determine whether the program/script comes from stdin. php-cli reads a
+     * program from stdin when no -r/-f/positional/line-mode is given, and `-`
+     * as the script name is the explicit stdin sentinel. Line mode (-R/-F)
+     * consumes stdin itself, so it is handled separately below. */
+    int want_lines = (line_code != NULL || line_file != NULL);
+    if (!script_file && !exec_direct && !want_lines) {
+        if (php_optind < argc && strcmp(argv[php_optind], "-") == 0) {
+            read_stdin = 1;
+            php_optind++; /* consume the "-" */
+        } else if (php_optind < argc && argv[php_optind][0] != '-') {
+            script_file = argv[php_optind];
+            php_optind++; /* consume it: what follows are the script's args */
+        } else if (php_optind >= argc) {
+            /* Nothing to run and nothing named — read the program from stdin. */
+            read_stdin = 1;
+        }
     }
 
     /* Make script arguments visible to userland ($argv/$argc/$_SERVER).
      * argv[php_optind - 1] is repurposed as $argv[0] (php-cli does the
-     * same slot trick); "-" stands in for -r code, matching php-cli. */
-    if (script_file || exec_direct) {
-        cli_register_argv(argc, argv, php_optind - 1, script_file ? script_file : "-");
+     * same slot trick); "-" stands in for -r code and for stdin, matching
+     * php-cli (`echo '<?php var_dump($argv);' | php` → $argv[0] === "-"). */
+    if (script_file || exec_direct || read_stdin || want_lines) {
+        cli_register_argv(
+            argc, argv, php_optind - 1, script_file ? script_file : "-");
     }
 
     /* CLI scripts routinely start with a shebang (artisan, composer, …);
@@ -4429,22 +4818,36 @@ int ephpm_cli_main(int argc, char **argv)
     CG(skip_shebang) = 1;
 
     /* Execute based on mode */
-    if (mode == 'r' && exec_direct) {
+    if (want_lines) {
+        /* -B/-R/-F/-E awk-like stdin line processor */
+        cli_begin(&orig_ub_write);
+        result = cli_process_stdin_lines(begin_code, line_code, line_file, end_code);
+        php_output_end_all();
+        cli_end(orig_ub_write);
+    } else if (mode == 'r' && exec_direct) {
         /* -r "code" */
         cli_begin(&orig_ub_write);
         result = cli_execute_protected(exec_direct, NULL);
         cli_end(orig_ub_write);
-    } else if (mode == 'l' && script_file) {
-        /* -l file (syntax check) */
+    } else if (mode == 'l') {
+        /* -l file | -l < stdin (syntax check) */
         cli_begin(&orig_ub_write);
         {
             zend_file_handle file_handle;
-            zend_stream_init_filename(&file_handle, script_file);
+            const char *lint_label;
+            if (script_file) {
+                zend_stream_init_filename(&file_handle, script_file);
+                lint_label = script_file;
+            } else {
+                zend_stream_init_fp(&file_handle, stdin, "Standard input code");
+                lint_label = "-";
+            }
             if (php_lint_script(&file_handle) == SUCCESS) {
-                php_printf("No syntax errors detected in %s\n", script_file);
+                php_printf("No syntax errors detected in %s\n", lint_label);
             } else {
                 result = 255;
             }
+            zend_destroy_file_handle(&file_handle);
         }
         php_output_end_all();
         cli_end(orig_ub_write);
@@ -4466,6 +4869,13 @@ int ephpm_cli_main(int argc, char **argv)
         } else {
             result = cli_execute_protected(NULL, script_file);
         }
+        cli_end(orig_ub_write);
+    } else if (read_stdin) {
+        /* Program read from stdin (piped or `-`). Executed as a real script
+         * (with <?php tags), so $argv[0] === "-" and file semantics match
+         * php-cli — unlike -r, which is raw code. */
+        cli_begin(&orig_ub_write);
+        result = cli_execute_stdin_protected();
         cli_end(orig_ub_write);
     } else {
         /* No script or code provided */
