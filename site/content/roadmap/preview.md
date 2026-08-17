@@ -1,11 +1,18 @@
 # Preview Deployments
 
-> **Status: DESIGN — not implemented in this repository.** Nothing on this
-> page ships with the `ephpm` binary. The webhook handler it describes
-> (**switchboard**) is a separate project, not part of ePHPm, and no code in
-> this repository references it. In particular, the per-pull-request database
-> isolation described below is a design goal, not a property ePHPm provides
-> today. Treat the whole page as a sketch of an intended product.
+> **Status: DESIGN — the bot is not implemented in this repository.** The
+> webhook handler this page describes (**switchboard**) is a separate
+> project, not part of ePHPm, and no code in this repository references it.
+> Treat the bot workflow below as a sketch of an intended product.
+>
+> The **runtime side has shipped**, though: as of v0.7.0 ePHPm provides
+> per-site database isolation (each vhost gets its own Turso database file —
+> [`[db.sqlite] dir`](/reference/config/#dbsqlite)) and a preview-host preset
+> ([`[server] preview = true`](/reference/config/#server)) that applies safe
+> per-IP/per-site rate and connection limits, load shedding, and an
+> `X-Ephpm-Preview: 1` marker header. What is still design-only is
+> everything switchboard would do: webhooks, cloning, framework detection,
+> PR comments, and teardown.
 
 The design: preview deployments for PHP applications driven by a GitHub bot, where every pull request would get a live preview URL with its own database — deployed in seconds, torn down on merge.
 

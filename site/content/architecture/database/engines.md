@@ -61,9 +61,9 @@ Because the engine is Beta upstream, take its limits literally:
 
 The Turso engine opens existing SQLite3/rusqlite-created `.db` files **in
 place** for cleanly-shut-down databases — both WAL and rollback-journal modes.
-Verified this session: `PRAGMA integrity_check` returns `ok` and rows are
-intact. So the normal 0.6.x → 0.7.0 upgrade of a stopped node is seamless:
-**no dump/reload is required.**
+This was verified during the v0.7.0 engine swap: `PRAGMA integrity_check`
+returns `ok` and rows are intact. So the normal 0.6.x → 0.7.0 upgrade of a
+stopped node is seamless: **no dump/reload is required.**
 
 Two honest caveats:
 

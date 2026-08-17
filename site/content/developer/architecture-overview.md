@@ -961,7 +961,7 @@ This is the hardest crate and the core of the project.
 | Milestone | Key Features | Status |
 |-----------|-------------|--------|
 | **v0.2: ZTS + Workers** | Thread-safe PHP, multiple concurrent requests | **Implemented** (ZTS via `spawn_blocking` + TSRM) |
-| **v0.3: TLS** | Automatic HTTPS via `rustls-acme`, Let's Encrypt | Planned |
+| **v0.3: TLS** | Automatic HTTPS via `rustls-acme`, Let's Encrypt | **Implemented** — see [TLS & ACME](/guides/tls-acme/) |
 | **v0.4: DB Proxy** | **Implemented (partial)**: MySQL transparent proxy, connection pooling, reset strategy; **Missing**: read/write splitting, replication, slow query analysis | Ahead of schedule |
 | **v0.5: KV Store** | **Implemented**: Single-node RESP2 server, strings + hashes, TTL/expiry, eviction policies (`noeviction`/`allkeys-lru`/`volatile-lru`/`allkeys-random`) with memory-limit enforcement, compression, SAPI bridge for direct PHP access, clustering; **Missing**: lists/sets/sorted sets, persistence | Shipped |
 | **Future: Admin UI** | Embedded web dashboard, request inspector | Planned |
