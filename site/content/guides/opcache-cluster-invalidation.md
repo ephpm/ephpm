@@ -174,7 +174,7 @@ kubectl exec app-0 -- ephpm deploy --site blog
 ```
 
 A complete, tested manifest pair (demo + php-fpm comparison benchmark)
-lives in the [ePHPm-lab repository](https://github.com/tinfoyle/ePHPm-lab)
+lives in the [ePHPm-lab repository](https://github.com/ephpm/lab)
 under `k8s/opcache-cluster.yaml`.
 
 ## Why not rely on `opcache.validate_timestamps`?

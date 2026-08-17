@@ -13,7 +13,7 @@ Two complementary setups are used:
 - **Local single-node** (podman/Docker): one container per runtime, a load
   generator container on the same network, fixtures mounted read-only.
   Fast to iterate; used for A/B comparisons between ePHPm versions and
-  against php-fpm. The [ePHPm-lab](https://github.com/tinfoyle/ePHPm-lab)
+  against php-fpm. The [ePHPm lab](https://github.com/ephpm/lab)
   `RUNTIMES-BENCH` recipe is the reference form.
 - **Kubernetes (LKE)**: the lab's k6 suites for realistic app workloads
   (Krayin CRM, Laravel, WordPress/WooCommerce). Not locally reproducible;
