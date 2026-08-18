@@ -292,13 +292,13 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "defab22f0c2d", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "10345a869d27", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.0)
 # so the two resolve to a single crate instance and TursoConnection
 # (re-exported by litewire) is the same turso::Connection.
-turso = { version = "=0.7.0", default-features = false }
+turso = { version = "=0.7.2", default-features = false }
 
 # Release-profile tuning for v0.4.2 perf release.
 #
