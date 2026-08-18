@@ -83,7 +83,7 @@ You are an elite systems architect with deep expertise spanning Rust, PHP intern
 | Dependency | Location | Purpose |
 |-----------|----------|---------|
 | **litewire** | git dep pinned by `rev` in workspace `Cargo.toml` | MySQL/Hrana/PG/TDS wire protocol → SQLite (Turso) translation. Standalone project at github.com/ephpm/litewire. ePHPm enables the `turso` backend feature only (rusqlite/hrana-client de-linked in v0.7.0) |
-| **turso** | pure-Rust crate (`turso =0.7.0`), compiled in via litewire | The embedded SQLite-compatible engine — single-node and CDC-replicated clustered. No external process |
+| **turso** | pure-Rust crate (`turso =0.7.2`), compiled in via litewire | The embedded SQLite-compatible engine — single-node and CDC-replicated clustered. No external process |
 
 ### Critical Design Decisions (Non-Obvious)
 

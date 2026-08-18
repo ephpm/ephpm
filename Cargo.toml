@@ -295,7 +295,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 litewire = { git = "https://github.com/ephpm/litewire.git", rev = "10345a869d27", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
-# in its signatures. Pinned to the exact version litewire pins (=0.7.0)
+# in its signatures. Pinned to the exact version litewire pins (=0.7.2)
 # so the two resolve to a single crate instance and TursoConnection
 # (re-exported by litewire) is the same turso::Connection.
 turso = { version = "=0.7.2", default-features = false }
