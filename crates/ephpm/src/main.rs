@@ -308,7 +308,7 @@ fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Php { args }) => run_php(&args),
+        Some(Commands::Php { args }) => run_php(&php_cli_args(&args)),
         Some(Commands::Kv { host, port, password, user, subcommand }) => {
             let auth = KvAuth::resolve(user, password)?;
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
@@ -523,6 +523,37 @@ fn find_free_port(host: &str, start_port: u16) -> anyhow::Result<u16> {
         }
     }
     anyhow::bail!("no free port in range {start_port}..={}", start_port.saturating_add(49))
+}
+
+/// The verbatim argument list for `ephpm php`, including any `--` separator.
+///
+/// `--` is *meaningful* to php-cli: it ends option parsing, so
+/// `… | php -- a b` reads the program from stdin and passes `a b` to it
+/// rather than running a script named `a`. clap consumes the first `--` it
+/// sees, so the parsed `Vec<String>` cannot express the difference. `ephpm`
+/// declares no global options before its subcommand, so argv[1] is always the
+/// `php` token and argv[2..] is exactly what the user typed after it.
+///
+/// Falls back to clap's view for any argv shape that doesn't match that
+/// expectation (including non-UTF-8 arguments), so this can only ever restore
+/// a separator — never invent arguments.
+fn php_cli_args(parsed: &[String]) -> Vec<String> {
+    let raw =
+        std::env::args_os().skip(2).map(|a| a.into_string().ok()).collect::<Option<Vec<String>>>();
+    restore_php_separator(raw, parsed)
+}
+
+/// Pure half of [`php_cli_args`]: `raw` is argv[2..] when it was all valid
+/// UTF-8. Returns `raw` only when it differs from `parsed` by exactly the one
+/// `--` clap swallowed.
+fn restore_php_separator(raw: Option<Vec<String>>, parsed: &[String]) -> Vec<String> {
+    let Some(raw) = raw else { return parsed.to_vec() };
+
+    let mut without_separator = raw.clone();
+    if let Some(i) = without_separator.iter().position(|a| a == "--") {
+        without_separator.remove(i);
+    }
+    if without_separator == parsed { raw } else { parsed.to_vec() }
 }
 
 /// Run the `ephpm php` subcommand — pass args through to the embedded PHP CLI.
@@ -1874,6 +1905,46 @@ fn resolve_target(site: Option<&str>, all: bool) -> anyhow::Result<String> {
         }
         (None, true) => Ok(OPCACHE_BROADCAST_VHOST.to_string()),
         (None, false) => Ok(OPCACHE_DEFAULT_VHOST.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod php_arg_tests {
+    use super::*;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn separator_clap_swallowed_is_restored() {
+        // `… | ephpm php -- a b`: php-cli needs the `--` to know that `a` is an
+        // argument and the program comes from stdin, not that `a` is a script.
+        let raw = v(&["--", "a", "b"]);
+        let parsed = v(&["a", "b"]);
+        assert_eq!(restore_php_separator(Some(raw.clone()), &parsed), raw);
+    }
+
+    #[test]
+    fn only_the_first_separator_is_clap_s() {
+        // clap strips one `--`; a second is a real PHP argument and stays put.
+        let raw = v(&["--", "-r", "echo 1;", "--", "x"]);
+        let parsed = v(&["-r", "echo 1;", "--", "x"]);
+        assert_eq!(restore_php_separator(Some(raw.clone()), &parsed), raw);
+    }
+
+    #[test]
+    fn args_without_a_separator_are_unchanged() {
+        let raw = v(&["-r", "echo 1;"]);
+        assert_eq!(restore_php_separator(Some(raw.clone()), &raw), raw);
+    }
+
+    #[test]
+    fn unexpected_argv_shape_keeps_the_parsed_view() {
+        // Raw tail that is not "parsed plus one separator" is not trusted.
+        let parsed = v(&["-r", "echo 1;"]);
+        assert_eq!(restore_php_separator(Some(v(&["something", "else"])), &parsed), parsed);
+        assert_eq!(restore_php_separator(None, &parsed), parsed);
     }
 }
 
