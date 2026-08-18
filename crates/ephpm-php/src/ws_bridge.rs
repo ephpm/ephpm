@@ -94,6 +94,29 @@ impl Status {
         }
     }
 
+    /// The wire value narrowed to the C ABI's `long`, as the ops table
+    /// declares it (`long (*send)(...)` etc. in `ephpm_wrapper.c`).
+    ///
+    /// `long` is 64-bit on LP64 (Linux, macOS) but **32-bit on Windows**
+    /// (LLP64), so [`Status::code`]'s `i64` has to narrow at the boundary —
+    /// without this the Windows build fails to compile (and it did: the
+    /// v0.7.0 release's `build-windows` leg was the first thing to ever
+    /// type-check this code, because `php_linked` is only set when
+    /// `PHP_SDK_PATH` is present, which PR CI never does).
+    ///
+    /// The narrowing cannot lose information: the error variants are
+    /// `-1..=-3`, and `Ok(v)` carries either a boolean or a count of
+    /// connections a frame was queued to, which the registry's per-site and
+    /// global connection caps bound far below `i32::MAX`.
+    #[cfg(php_linked)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "every reachable value fits in 32 bits; see doc comment"
+    )]
+    fn code_c(self) -> std::os::raw::c_long {
+        self.code() as std::os::raw::c_long
+    }
+
     /// Shorthand for a boolean result.
     fn boolean(ok: bool) -> Self {
         Self::Ok(i64::from(ok))
@@ -354,7 +377,7 @@ unsafe extern "C" fn ws_send(
 ) -> std::os::raw::c_long {
     // SAFETY: both pairs are live zend_string buffers (or NULL) for this call.
     let (id, body) = unsafe { (opt_slice(conn_id, conn_id_len), slice(payload, payload_len)) };
-    send(id, body, binary != 0).code()
+    send(id, body, binary != 0).code_c()
 }
 
 #[cfg(php_linked)]
@@ -366,7 +389,7 @@ unsafe extern "C" fn ws_subscribe(
 ) -> std::os::raw::c_long {
     // SAFETY: both pairs are live zend_string buffers (or NULL) for this call.
     let (id, chan) = unsafe { (opt_slice(conn_id, conn_id_len), slice(channel, channel_len)) };
-    subscribe(id, chan).code()
+    subscribe(id, chan).code_c()
 }
 
 #[cfg(php_linked)]
@@ -378,7 +401,7 @@ unsafe extern "C" fn ws_unsubscribe(
 ) -> std::os::raw::c_long {
     // SAFETY: both pairs are live zend_string buffers (or NULL) for this call.
     let (id, chan) = unsafe { (opt_slice(conn_id, conn_id_len), slice(channel, channel_len)) };
-    unsubscribe(id, chan).code()
+    unsubscribe(id, chan).code_c()
 }
 
 #[cfg(php_linked)]
@@ -391,7 +414,7 @@ unsafe extern "C" fn ws_broadcast(
 ) -> std::os::raw::c_long {
     // SAFETY: both pairs are live zend_string buffers for this call.
     let (chan, body) = unsafe { (slice(channel, channel_len), slice(payload, payload_len)) };
-    broadcast(chan, body, binary != 0).code()
+    broadcast(chan, body, binary != 0).code_c()
 }
 
 #[cfg(php_linked)]
@@ -406,7 +429,7 @@ unsafe extern "C" fn ws_close(
     // clamped to "normal closure" rather than silently truncated into a
     // different, meaningful code.
     let code = u16::try_from(code).unwrap_or(ephpm_ws::CLOSE_NORMAL);
-    close(id, code).code()
+    close(id, code).code_c()
 }
 
 /// The ops table handed to the C wrapper.
