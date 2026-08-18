@@ -628,7 +628,8 @@ async fn a_slow_consumer_is_shed_with_1013_not_buffered() {
 
     // Stop reading `ws` and flood it from an ordinary HTTP request.
     const FRAMES: i64 = 1000;
-    let (status, body) = http_get(SITE_A, &format!("/flood.php?id={id}&n={FRAMES}&size=60000")).await;
+    let (status, body) =
+        http_get(SITE_A, &format!("/flood.php?id={id}&n={FRAMES}&size=60000")).await;
     assert_eq!(status, 200, "flood.php should serve: {body}");
     let (ok, failed) = body
         .trim()

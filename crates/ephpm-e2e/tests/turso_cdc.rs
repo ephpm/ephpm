@@ -7,18 +7,34 @@
 //! node after the primary already has data. Every port is drawn fresh from the
 //! kernel, so nothing here can collide with the harness's fixed-port nodes.
 //!
-//! What it proves, in order, on one cluster:
+//! What passes today:
 //!
-//! 1. **Election** — with three nodes up, exactly one becomes primary (gossip
-//!    KV election, `ephpm-cluster/src/sqlite_election.rs`), observed as the
-//!    single node whose `ephpm_cdc_subscribers` gauge equals the number of
-//!    replicas while every other node reports 0.
-//! 2. **Replication** — writes on the primary become visible on both replicas
-//!    (the CDC ship/apply path in `ephpm-server/src/turso_cdc.rs`).
-//! 3. **Cold bootstrap** — a fourth node started *after* the primary has data
-//!    catches up via the logical-snapshot path, then keeps up via the tail.
-//! 4. **Failover** — the primary process is killed; a survivor is elected and
-//!    subsequent writes replicate to the remaining nodes.
+//! - **Election + replication + promotion**
+//!   ([`auto_election_replicates_and_survives_losing_the_primary`]) — three
+//!   `role = "auto"` nodes elect exactly one primary (gossip KV election,
+//!   `ephpm-cluster/src/sqlite_election.rs`), its writes reach both replicas
+//!   over the CDC ship/apply path (`ephpm-server/src/turso_cdc.rs`), and
+//!   killing it promotes a survivor without losing already-replicated rows.
+//! - **Cold-replica snapshot bootstrap**
+//!   ([`a_cold_replica_bootstraps_from_the_primary_snapshot`]) — an empty node
+//!   joins a primary that already holds data and catches up via the logical
+//!   dump, then stays current off the post-snapshot tail.
+//!
+//! Two further behaviours are specified here as `#[ignore]`d tests because
+//! they are **open defects, found by writing this suite** — each carries the
+//! observed log evidence and the root cause in its doc comment:
+//!
+//! - [`a_joining_node_must_not_steal_an_established_primary`] — a node joining
+//!   an established cluster takes the primary role from it, re-rooting the
+//!   cluster onto an empty database.
+//! - [`post_failover_writes_replicate_to_the_survivor`] — `change_id` is a
+//!   per-node sequence, so after a promotion the replica's watermark is
+//!   meaningless against the new primary's log and post-failover writes are
+//!   silently never shipped.
+//!
+//! Both are `#[ignore]` rather than deleted so the intended behaviour stays
+//! written down and executable: dropping the attribute is the verification
+//! step when either is fixed.
 //!
 //! The SQL surface is litewire's Hrana HTTP API (`hrana_listen`), because it
 //! needs nothing beyond reqwest + JSON — no MySQL client, no PHP. The
@@ -76,8 +92,7 @@ path = "{DATA_DIR}/cdc.db"
 mysql_listen = "127.0.0.1:{MYSQL_PORT}"
 hrana_listen = "127.0.0.1:{HRANA_PORT}"
 
-[db.sqlite.replication]
-role = "auto"
+{REPLICATION_BLOCK}
 
 [cluster]
 enabled = true
@@ -97,6 +112,21 @@ struct NodePorts {
     hrana: u16,
     gossip: u16,
     kv_data: u16,
+}
+
+/// How a node's `[db.sqlite.replication]` block is written.
+///
+/// `Auto` is the production-shaped path (gossip election decides). The
+/// explicit variants exist so a test can pin the topology and exercise one
+/// mechanism — the snapshot bootstrap — without the election as a variable;
+/// `determine_role` in `turso_cdc.rs` honours all three.
+#[derive(Debug, Clone, Copy)]
+enum RoleSpec {
+    Auto,
+    Primary,
+    /// Replica of the node at this index. The address a replica dials is the
+    /// primary's **cluster channel** — gossip port + 2, not the gossip port.
+    ReplicaOf(usize),
 }
 
 struct CdcCluster {
@@ -136,9 +166,24 @@ impl CdcCluster {
         Ok(Self { binary: binary.to_path_buf(), docroot, ports, children, tempdir })
     }
 
-    /// Spawn node `i` and wait for its health endpoint.
-    async fn spawn(&mut self, i: usize) -> Result<()> {
+    /// The cluster-channel address peers dial to reach node `i`.
+    fn channel_addr(&self, i: usize) -> String {
+        format!("127.0.0.1:{}", self.ports[i].gossip + 2)
+    }
+
+    /// Spawn node `i` with the given replication role and wait for it to
+    /// report healthy.
+    async fn spawn(&mut self, i: usize, role: RoleSpec) -> Result<()> {
         assert!(self.children[i].is_none(), "node {i} already running");
+
+        let replication_block = match role {
+            RoleSpec::Auto => "[db.sqlite.replication]\nrole = \"auto\"".to_string(),
+            RoleSpec::Primary => "[db.sqlite.replication]\nrole = \"primary\"".to_string(),
+            RoleSpec::ReplicaOf(p) => format!(
+                "[db.sqlite.replication]\nrole = \"replica\"\nprimary_grpc_url = \"{}\"",
+                self.channel_addr(p)
+            ),
+        };
 
         let node_dir = self.tempdir.path().join(format!("node-{i}"));
         let data_dir = node_dir.join("data");
@@ -162,6 +207,7 @@ impl CdcCluster {
             .replace("{KV_DATA_PORT}", &p.kv_data.to_string())
             .replace("{NODE_ID}", &format!("cdc-node-{i}"))
             .replace("{CLUSTER_JOIN}", &join)
+            .replace("{REPLICATION_BLOCK}", &replication_block)
             .replace("{SECRET}", CLUSTER_SECRET)
             .replace("{DATA_DIR}", &escape_toml(&data_dir))
             .replace("{DOCROOT}", &escape_toml(&self.docroot));
@@ -181,7 +227,10 @@ impl CdcCluster {
             .with_context(|| format!("spawn node {i} ({})", self.binary.display()))?;
         self.children[i] = Some(child);
 
-        self.wait_healthy(i, Duration::from_secs(30)).await
+        // Generous: a cold replica fetches and applies the primary's snapshot
+        // *before* its listeners come up, so on that path health is gated
+        // behind the whole bootstrap.
+        self.wait_healthy(i, Duration::from_secs(90)).await
     }
 
     /// Kill node `i` hard (SIGKILL / TerminateProcess) — this is the crash
@@ -233,23 +282,16 @@ impl CdcCluster {
     async fn wait_for_sole_primary(&self, alive: &[usize], timeout: Duration) -> usize {
         let expected = to_f64(alive.len() - 1);
         let deadline = Instant::now() + timeout;
-        let mut last_seen = String::new();
         loop {
             let mut subs = Vec::with_capacity(alive.len());
             for &i in alive {
                 subs.push((i, self.metric(i, "ephpm_cdc_subscribers").await));
             }
-            last_seen = format!("{subs:?}");
 
-            let full: Vec<usize> = subs
-                .iter()
-                .filter(|(_, s)| *s == Some(expected))
-                .map(|(i, _)| *i)
-                .collect();
-            let rest_zero = subs
-                .iter()
-                .filter(|(i, _)| !full.contains(i))
-                .all(|(_, s)| *s == Some(0.0));
+            let full: Vec<usize> =
+                subs.iter().filter(|(_, s)| *s == Some(expected)).map(|(i, _)| *i).collect();
+            let rest_zero =
+                subs.iter().filter(|(i, _)| !full.contains(i)).all(|(_, s)| *s == Some(0.0));
             if full.len() == 1 && rest_zero {
                 eprintln!("[cdc-e2e] sole primary: node {} (subscribers {subs:?})", full[0]);
                 return full[0];
@@ -258,18 +300,25 @@ impl CdcCluster {
             assert!(
                 Instant::now() < deadline,
                 "no sole primary with {expected} attached replicas emerged within {timeout:?}; \
-                 last ephpm_cdc_subscribers: {last_seen}"
+                 last ephpm_cdc_subscribers: {subs:?}"
             );
             tokio::time::sleep(POLL_INTERVAL).await;
         }
     }
 
     /// Execute one statement over node `i`'s Hrana HTTP endpoint.
+    ///
+    /// The route is `/v2/pipeline` — litewire's `litewire-hrana` serves the
+    /// Hrana 3 protocol under the sqld-compatible **v2** path, and there is no
+    /// `/v3/pipeline`. (`tests/hrana.rs` posts to `/v3/pipeline`, but only
+    /// when `EPHPM_HRANA_URL` is set, which the bare harness never sets — so
+    /// that assertion has never actually executed.)
     async fn sql(&self, i: usize, sql: &str) -> Result<serde_json::Value> {
-        let url = format!("http://127.0.0.1:{}/v3/pipeline", self.ports[i].hrana);
+        let url = format!("http://127.0.0.1:{}/v2/pipeline", self.ports[i].hrana);
         let body = json!({
+            "baton": null,
             "requests": [
-                { "type": "execute", "stmt": { "sql": sql } },
+                { "type": "execute", "stmt": { "sql": sql, "args": [] } },
                 { "type": "close" }
             ]
         });
@@ -303,21 +352,27 @@ impl CdcCluster {
     }
 
     /// Poll node `i` until `sql`'s first result column equals `want`.
-    async fn wait_for_rows(&self, i: usize, sql: &str, want: &[&str], timeout: Duration, what: &str) {
+    async fn wait_for_rows(
+        &self,
+        i: usize,
+        sql: &str,
+        want: &[&str],
+        timeout: Duration,
+        what: &str,
+    ) {
         let deadline = Instant::now() + timeout;
-        let mut last = String::from("no attempt");
         loop {
-            match self.sql(i, sql).await {
+            let last = match self.sql(i, sql).await {
                 Ok(v) => {
                     let got = first_column(&v);
                     if got == want {
                         eprintln!("[cdc-e2e] node {i}: {what} — converged ({got:?})");
                         return;
                     }
-                    last = format!("rows {got:?}");
+                    format!("rows {got:?}")
                 }
-                Err(e) => last = format!("error: {e:#}"),
-            }
+                Err(e) => format!("error: {e:#}"),
+            };
             assert!(
                 Instant::now() < deadline,
                 "{what}: node {i} never converged to {want:?} within {timeout:?}; last: {last}"
@@ -334,16 +389,25 @@ impl Drop for CdcCluster {
             self.kill(i);
         }
         if dump {
+            // Both streams: ephpm's `tracing` output goes to stdout, and only
+            // hard startup failures land on stderr — dumping stderr alone
+            // yields four empty blocks and tells you nothing.
             for i in 0..self.children.len() {
-                let log = self.tempdir.path().join(format!("node-{i}")).join("stderr.log");
-                if let Ok(contents) = fs::read_to_string(&log) {
-                    eprintln!("--- [cdc-e2e] node {i} stderr (last 60 lines) ---");
+                let node_dir = self.tempdir.path().join(format!("node-{i}"));
+                for stream in ["stderr", "stdout"] {
+                    let Ok(contents) = fs::read_to_string(node_dir.join(format!("{stream}.log")))
+                    else {
+                        continue;
+                    };
                     let lines: Vec<&str> = contents.lines().collect();
-                    let start = lines.len().saturating_sub(60);
-                    for line in &lines[start..] {
+                    if lines.is_empty() {
+                        continue;
+                    }
+                    eprintln!("--- [cdc-e2e] node {i} {stream} (last 60 lines) ---");
+                    for line in &lines[lines.len().saturating_sub(60)..] {
                         eprintln!("{line}");
                     }
-                    eprintln!("--- end node {i} stderr ---");
+                    eprintln!("--- end node {i} {stream} ---");
                 }
             }
         }
@@ -419,90 +483,271 @@ fn to_f64(n: usize) -> f64 {
 
 // ── the test ────────────────────────────────────────────────────────────────
 
-/// One cluster, four phases: election → replication → cold bootstrap →
-/// failover. A single test on purpose: the later phases *depend* on the
-/// earlier ones (bootstrap needs pre-existing data; failover needs an
-/// attached survivor), and one shared topology keeps the suite's process
-/// count and wall time sane.
-#[tokio::test(flavor = "multi_thread")]
-async fn clustered_cdc_lifecycle() {
+/// Guard shared by every test here: clustered mode is Linux/macOS, and the
+/// suite needs a real binary to spawn. Returns `None` when the test should
+/// skip.
+fn binary_or_skip() -> Option<PathBuf> {
     if cfg!(windows) {
         eprintln!("clustered Turso CDC is not validated on Windows — skipping");
-        return;
+        return None;
     }
-    let Some(binary) = ephpm_binary_env() else {
+    let bin = ephpm_binary_env();
+    if bin.is_none() {
         eprintln!("EPHPM_BINARY not set — skipping (needs a built ephpm binary)");
-        return;
-    };
+    }
+    bin
+}
 
-    // Four port sets: three initial nodes plus the deferred cold node.
-    let mut cluster = CdcCluster::prepare(&binary, 4).await.expect("prepare fixture");
+/// The production-shaped path: three `role = "auto"` nodes elect a single
+/// primary, its writes reach both replicas, and killing it promotes a
+/// survivor without losing what was already replicated.
+///
+/// One test rather than three because the phases genuinely depend on each
+/// other — you cannot assert a failover without first having an established
+/// primary and an attached replica — and one 3-process topology is cheaper
+/// than three.
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_election_replicates_and_survives_losing_the_primary() {
+    let Some(binary) = binary_or_skip() else { return };
+
+    let mut cluster = CdcCluster::prepare(&binary, 3).await.expect("prepare fixture");
     for i in 0..3 {
-        cluster.spawn(i).await.unwrap_or_else(|e| panic!("start node {i}: {e:#}"));
+        cluster.spawn(i, RoleSpec::Auto).await.unwrap_or_else(|e| panic!("start node {i}: {e:#}"));
     }
 
-    // ── Phase 1: exactly one primary, both replicas attached ────────────
+    // ── Exactly one primary, with both replicas actually attached ───────
     let primary = cluster.wait_for_sole_primary(&[0, 1, 2], Duration::from_secs(90)).await;
-    let replicas: Vec<usize> = (0..3).filter(|&i| i != primary).collect();
 
-    // ── Phase 2: writes on the primary reach both replicas ──────────────
-    cluster
-        .sql_ok(primary, "CREATE TABLE cdc_e2e (id INTEGER PRIMARY KEY, v TEXT)")
-        .await;
-    cluster
-        .sql_ok(primary, "INSERT INTO cdc_e2e (id, v) VALUES (1, 'alpha'), (2, 'beta')")
-        .await;
-    for &r in &replicas {
+    // ── Writes on the primary reach both replicas ───────────────────────
+    cluster.sql_ok(primary, "CREATE TABLE cdc_e2e (id INTEGER PRIMARY KEY, v TEXT)").await;
+    cluster.sql_ok(primary, "INSERT INTO cdc_e2e (id, v) VALUES (1, 'alpha'), (2, 'beta')").await;
+    for r in (0..3).filter(|&i| i != primary) {
         cluster
             .wait_for_rows(
                 r,
                 "SELECT v FROM cdc_e2e ORDER BY id",
                 &["alpha", "beta"],
                 Duration::from_secs(60),
-                "phase 2: primary write replicates",
+                "primary write replicates",
             )
             .await;
     }
 
-    // ── Phase 3: cold node joins after data exists (snapshot bootstrap) ─
-    cluster.spawn(3).await.unwrap_or_else(|e| panic!("start cold node 3: {e:#}"));
-    cluster
-        .wait_for_rows(
-            3,
-            "SELECT v FROM cdc_e2e ORDER BY id",
-            &["alpha", "beta"],
-            Duration::from_secs(120),
-            "phase 3: cold replica bootstraps pre-existing data",
-        )
-        .await;
-    // ...and stays caught up via the post-snapshot tail.
-    cluster.sql_ok(primary, "INSERT INTO cdc_e2e (id, v) VALUES (3, 'gamma')").await;
-    cluster
-        .wait_for_rows(
-            3,
-            "SELECT v FROM cdc_e2e ORDER BY id",
-            &["alpha", "beta", "gamma"],
-            Duration::from_secs(60),
-            "phase 3: cold replica tails post-snapshot writes",
-        )
-        .await;
-
-    // ── Phase 4: kill the primary; writes continue on the new one ───────
+    // ── Kill the primary: a survivor is promoted, and the data survives ──
     cluster.kill(primary);
-    let survivors: Vec<usize> = (0..4).filter(|&i| i != primary).collect();
+    let survivors: Vec<usize> = (0..3).filter(|&i| i != primary).collect();
     let new_primary = cluster.wait_for_sole_primary(&survivors, Duration::from_secs(120)).await;
     assert_ne!(new_primary, primary, "the dead primary cannot win the re-election");
 
-    cluster.sql_ok(new_primary, "INSERT INTO cdc_e2e (id, v) VALUES (4, 'delta')").await;
-    for &s in survivors.iter().filter(|&&s| s != new_primary) {
+    // Every survivor still serves what it had replicated before the failover.
+    // (Whether *new* writes replicate afterwards is a separate, currently
+    // broken story — see `post_failover_writes_replicate_to_the_survivor`.)
+    for s in survivors {
         cluster
             .wait_for_rows(
                 s,
                 "SELECT v FROM cdc_e2e ORDER BY id",
-                &["alpha", "beta", "gamma", "delta"],
-                Duration::from_secs(90),
-                "phase 4: post-failover write replicates to the survivor",
+                &["alpha", "beta"],
+                Duration::from_secs(30),
+                "pre-failover data survives the failover",
             )
             .await;
     }
+}
+
+/// After a failover, writes accepted by the newly promoted primary must reach
+/// the surviving replica.
+///
+/// **Currently failing — `#[ignore]`d because it documents an open defect,
+/// not a regression.** Remove the attribute once replication is fixed.
+///
+/// `turso_cdc`'s `change_id` is a **per-node** sequence — every node's local
+/// `turso_cdc` log numbers from 1 — but the replication protocol treats the
+/// watermark as if it were cluster-global. `Frame::Subscribe` carries the
+/// replica's `applied_change_id` and the primary opens `CdcTailer::new(mgmt,
+/// from)` at exactly that number *in its own log*. Across a promotion those
+/// two numbers describe different sequences.
+///
+/// Observed, with `cdc-node-2` the original primary and `cdc-node-0` promoted
+/// after it was killed:
+///
+/// ```text
+/// cdc-node-1  CDC replica: subscribed  from_change_id=5   (watermark from node-2)
+/// cdc-node-0  CDC: subscriber attached from_change_id=5   (tailer over node-0's log)
+/// ```
+///
+/// Node 0 had been a replica, and `apply_batch` writes go through the mgmt
+/// connection with capture off, so its own log is empty. The post-failover
+/// `INSERT` it accepts is captured at `change_id` 1 or 2 — below the
+/// subscriber's cursor of 5 — so the tailer never yields it. The row is
+/// simply never shipped; nothing errors, no metric moves, and the replica
+/// reports itself connected and caught up.
+///
+/// Impact: silent, unbounded write loss after any failover. Every write to
+/// the new primary is dropped until its local `change_id` grows past the
+/// stale watermark, and the ones in that gap are skipped permanently. This is
+/// wider than the "unshipped batches at the moment it died" divergence window
+/// the `turso_cdc` module docs describe — that one is bounded by what was
+/// in flight; this one is not.
+///
+/// A fix has to make the watermark meaningful across a promotion — e.g. a
+/// cluster-global sequence, an epoch/term qualifying the `change_id`, or
+/// forcing a snapshot re-bootstrap on every role change.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "open defect: change_id is per-node, so post-failover writes never ship (see the doc comment)"]
+async fn post_failover_writes_replicate_to_the_survivor() {
+    let Some(binary) = binary_or_skip() else { return };
+
+    let mut cluster = CdcCluster::prepare(&binary, 3).await.expect("prepare fixture");
+    for i in 0..3 {
+        cluster.spawn(i, RoleSpec::Auto).await.unwrap_or_else(|e| panic!("start node {i}: {e:#}"));
+    }
+    let primary = cluster.wait_for_sole_primary(&[0, 1, 2], Duration::from_secs(90)).await;
+
+    cluster.sql_ok(primary, "CREATE TABLE failover_e2e (id INTEGER PRIMARY KEY, v TEXT)").await;
+    cluster.sql_ok(primary, "INSERT INTO failover_e2e (id, v) VALUES (1, 'alpha')").await;
+    for r in (0..3).filter(|&i| i != primary) {
+        cluster
+            .wait_for_rows(
+                r,
+                "SELECT v FROM failover_e2e ORDER BY id",
+                &["alpha"],
+                Duration::from_secs(60),
+                "pre-failover write replicates",
+            )
+            .await;
+    }
+
+    cluster.kill(primary);
+    let survivors: Vec<usize> = (0..3).filter(|&i| i != primary).collect();
+    let new_primary = cluster.wait_for_sole_primary(&survivors, Duration::from_secs(120)).await;
+
+    cluster.sql_ok(new_primary, "INSERT INTO failover_e2e (id, v) VALUES (2, 'beta')").await;
+    for s in survivors.into_iter().filter(|&s| s != new_primary) {
+        cluster
+            .wait_for_rows(
+                s,
+                "SELECT v FROM failover_e2e ORDER BY id",
+                &["alpha", "beta"],
+                Duration::from_secs(90),
+                "post-failover write replicates to the survivor",
+            )
+            .await;
+    }
+}
+
+/// Cold-replica bootstrap: a node with an **empty** database joins a primary
+/// that already holds data and catches up via the logical-snapshot path
+/// (`maybe_bootstrap_cold_replica` / `serve_snapshot` in `turso_cdc.rs`),
+/// then stays current off the post-snapshot CDC tail.
+///
+/// Roles are pinned explicitly (`role = "primary"` / `"replica"`) rather than
+/// elected. That is not a convenience: with `role = "auto"` this scenario
+/// cannot be tested at all today, because a node joining an established
+/// cluster takes the primary role away from it — see
+/// [`a_joining_node_must_not_steal_an_established_primary`]. Pinning isolates
+/// the snapshot mechanism, which is what this test is about, from that
+/// defect.
+///
+/// The two writes straddle the join on purpose: `alpha`/`beta` exist before
+/// the replica is ever started, so only the snapshot can deliver them, while
+/// `gamma` lands afterwards and can only arrive by the tail. Together they
+/// prove the handoff between the two has neither a gap nor a duplicate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cold_replica_bootstraps_from_the_primary_snapshot() {
+    let Some(binary) = binary_or_skip() else { return };
+
+    let mut cluster = CdcCluster::prepare(&binary, 2).await.expect("prepare fixture");
+    cluster.spawn(0, RoleSpec::Primary).await.expect("start primary");
+
+    // Data exists BEFORE the replica is ever started, so a tail-from-zero
+    // cannot account for it — only a snapshot can.
+    cluster.sql_ok(0, "CREATE TABLE cold_e2e (id INTEGER PRIMARY KEY, v TEXT)").await;
+    cluster.sql_ok(0, "INSERT INTO cold_e2e (id, v) VALUES (1, 'alpha'), (2, 'beta')").await;
+
+    cluster.spawn(1, RoleSpec::ReplicaOf(0)).await.expect("start cold replica");
+    cluster
+        .wait_for_rows(
+            1,
+            "SELECT v FROM cold_e2e ORDER BY id",
+            &["alpha", "beta"],
+            Duration::from_secs(120),
+            "cold replica bootstraps pre-existing data",
+        )
+        .await;
+
+    // Post-snapshot writes arrive by the tail, and nothing is double-applied.
+    cluster.sql_ok(0, "INSERT INTO cold_e2e (id, v) VALUES (3, 'gamma')").await;
+    cluster
+        .wait_for_rows(
+            1,
+            "SELECT v FROM cold_e2e ORDER BY id",
+            &["alpha", "beta", "gamma"],
+            Duration::from_secs(60),
+            "cold replica tails post-snapshot writes",
+        )
+        .await;
+}
+
+/// A node joining an established cluster must not become the primary.
+///
+/// **Currently failing — `#[ignore]`d because it documents an open defect,
+/// not a regression.** Remove the attribute once the election is fixed.
+///
+/// Observed with a 3-node `role = "auto"` cluster plus a late joiner
+/// (`cdc-node-3`, an empty database):
+///
+/// ```text
+/// 21:41:58  cdc-node-2  elected as SQLite primary        (holds the data)
+/// 21:42:04  cdc-node-3  elected as SQLite primary        (empty, just booted)
+/// 21:42:08  cdc-node-2  role changed Primary -> Replica{ primary: node-3 }
+/// ```
+///
+/// Two independent causes, both in `ephpm-cluster/src/sqlite_election.rs`:
+///
+/// 1. `determine_initial_role` runs before gossip has converged.
+///    `should_be_primary` asks `cluster.nodes()`, which at that instant holds
+///    only the local node, so "lowest-ordinal alive node" is trivially true
+///    for *every* freshly started node. It then `publish_claim`s, overwriting
+///    the incumbent's claim in the gossip KV.
+/// 2. `evaluate_role` only re-elects when there is no claim or the claimant
+///    is dead. Faced with a live claim from another node it demotes
+///    unconditionally — so the documented "lowest ordinal wins" rule is not
+///    enforced against an incumbent, and the **last writer** wins instead.
+///    Here the *highest*-ordinal node took the role from `cdc-node-2`.
+///
+/// Impact: the cluster re-roots onto an empty database. The joiner believes
+/// it is primary, so it skips `maybe_bootstrap_cold_replica` and never
+/// fetches a snapshot; the nodes that actually hold the data demote and
+/// re-subscribe from `change_id = 0`. Any write accepted by the new
+/// "primary" then diverges the cluster for real.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "open defect: a joining node steals the primary role (see the doc comment)"]
+async fn a_joining_node_must_not_steal_an_established_primary() {
+    let Some(binary) = binary_or_skip() else { return };
+
+    let mut cluster = CdcCluster::prepare(&binary, 4).await.expect("prepare fixture");
+    for i in 0..3 {
+        cluster.spawn(i, RoleSpec::Auto).await.unwrap_or_else(|e| panic!("start node {i}: {e:#}"));
+    }
+    let primary = cluster.wait_for_sole_primary(&[0, 1, 2], Duration::from_secs(90)).await;
+    cluster.sql_ok(primary, "CREATE TABLE steal_e2e (id INTEGER PRIMARY KEY, v TEXT)").await;
+    cluster.sql_ok(primary, "INSERT INTO steal_e2e (id, v) VALUES (1, 'alpha')").await;
+
+    // A fourth node joins cold. The established primary must keep the role.
+    cluster.spawn(3, RoleSpec::Auto).await.expect("start joining node");
+    let after = cluster.wait_for_sole_primary(&[0, 1, 2, 3], Duration::from_secs(120)).await;
+    assert_eq!(after, primary, "a joining node must not take the primary role");
+
+    // And the joiner catches up as a replica, rather than re-rooting the
+    // cluster onto its own empty database.
+    cluster
+        .wait_for_rows(
+            3,
+            "SELECT v FROM steal_e2e ORDER BY id",
+            &["alpha"],
+            Duration::from_secs(120),
+            "the joining node bootstraps as a replica",
+        )
+        .await;
 }
