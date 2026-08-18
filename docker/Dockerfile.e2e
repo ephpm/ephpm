@@ -9,7 +9,7 @@
 # Build:
 #   podman build -f docker/Dockerfile.e2e -t ephpm-e2e:dev .
 
-FROM rust:1.85-bookworm
+FROM rust:1.88-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

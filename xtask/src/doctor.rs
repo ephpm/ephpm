@@ -14,7 +14,7 @@ use std::{env, fs};
 
 /// Minimum supported Rust version — keep in sync with `rust-version` in the
 /// workspace `Cargo.toml`.
-const MSRV: (u32, u32) = (1, 85);
+const MSRV: (u32, u32) = (1, 88);
 
 /// Remedy shared by all Linux C-toolchain checks (matches the README and
 /// CLAUDE.md prerequisites list).
@@ -613,10 +613,10 @@ mod tests {
 
     #[test]
     fn msrv_comparison() {
-        assert!(meets_msrv((1, 85)));
+        assert!(meets_msrv((1, 88)));
         assert!(meets_msrv((1, 94)));
         assert!(meets_msrv((2, 0)));
-        assert!(!meets_msrv((1, 84)));
+        assert!(!meets_msrv((1, 87)));
         assert!(!meets_msrv((0, 99)));
     }
 

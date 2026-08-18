@@ -7,7 +7,10 @@ resolver = "3"
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.88 is forced by the litewire dependency (its 0.2.0 workspace declares
+# rust-version = "1.88"); cargo refuses to compile a dep whose rust-version
+# exceeds the active toolchain, so 1.85–1.87 cannot build this workspace.
+rust-version = "1.88"
 license = "MIT"
 repository = "https://github.com/ephpm/ephpm"
 
@@ -116,7 +119,29 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire main @ cb707ab9 — WordPress wire-fidelity fixes (litewire#28–#31).
+# litewire main @ defab22f0c2d — 0.2.0 (litewire#33–#35). Three batches:
+# (1) litewire#34 SECURITY: lru 0.12.5 → 0.18.2, fixing RUSTSEC-2026-0253 — a
+# use-after-free reachable through the production TranslateCache. Do not move
+# this pin backwards past litewire#34. Same PR adds a server-side
+# tenant-session SQL screen (litewire-backend/tenant_screen.rs): sessions
+# established through a `ConnectionAuthenticator` reject ATTACH/DETACH/
+# VACUUM-with-target/path-PRAGMA inside litewire itself, layered UNDER ePHPm's
+# own screen (ours stays — defence in depth, and it also covers the
+# non-authenticated single-site path). Also pins the opensrv-mysql `tls`
+# feature fence upstream (litewire#32 closed): the CLIENT_SSL auth-bypass
+# analysis in the b16d874b entry below is now enforced by litewire's own
+# Cargo.toml rather than by our reliance on default features.
+# (2) litewire#33: docs truth pass + 0.2.0 scaffolding — workspace version
+# 0.2.0, MSRV 1.88 (which is why ePHPm's rust-version moved 1.85 → 1.88 in the
+# same PR as this bump: cargo refuses to compile a dependency whose declared
+# rust-version exceeds the toolchain, so a 1.85 toolchain can no longer build
+# the workspace regardless of what ePHPm declares).
+# (3) litewire#35 perf: TranslateCache borrowed-key lookup + Arc'd entries
+# (~2.9x on the translate hit path — no API change), and an opt-in Turso
+# handle-reuse pool (`.handle_reuse(N)`), OFF by default. ePHPm does not call
+# `.handle_reuse`, so no behavior change from that half.
+#
+# Previous pin cb707ab9 — WordPress wire-fidelity fixes (litewire#28–#31).
 # Four things, all surfaced by running real WordPress over the MySQL frontend:
 # (1) litewire#28: unparseable/unsupported client commands no longer get a
 # default OK packet from opensrv-mysql's fallthrough — an OK of the wrong
@@ -267,13 +292,13 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "cb707ab98428", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "10345a869d27", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.0)
 # so the two resolve to a single crate instance and TursoConnection
 # (re-exported by litewire) is the same turso::Connection.
-turso = { version = "=0.7.0", default-features = false }
+turso = { version = "=0.7.2", default-features = false }
 
 # Release-profile tuning for v0.4.2 perf release.
 #

@@ -108,7 +108,7 @@ sudo ephpm uninstall --keep-data
 
 ## Build from source
 
-For contributors or custom builds. Requires Rust 1.85+.
+For contributors or custom builds. Requires Rust 1.88+.
 
 ```bash
 # Stub mode — no PHP, fast iteration on HTTP/routing logic

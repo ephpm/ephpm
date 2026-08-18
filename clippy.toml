@@ -1,3 +1,7 @@
 # Clippy configuration
 # Most lint configuration is in workspace Cargo.toml [workspace.lints.clippy]
+# Intentionally trails the workspace `rust-version` (1.88). Raising this to
+# 1.88 enables msrv-gated lints — notably `collapsible_if`, since let-chains
+# stabilized in 1.88 — which flags ~50 sites across the tree. That sweep is
+# tracked separately for v0.7.1 rather than bundled into a dependency bump.
 msrv = "1.85"

@@ -8,7 +8,7 @@ Everything you need to set up a development environment for ePHPm.
 
 ### Rust (required)
 
-ePHPm requires **Rust 1.85+** (edition 2024). Install via [rustup](https://rustup.rs):
+ePHPm requires **Rust 1.88+** (edition 2024). Install via [rustup](https://rustup.rs):
 
 **Linux / macOS / WSL:**
 
@@ -23,7 +23,7 @@ Download and run the installer from https://rustup.rs. You'll also need the [Vis
 
 ```bash
 # Verify installation
-rustc --version   # should be >= 1.85
+rustc --version   # should be >= 1.88
 cargo --version
 ```
 
