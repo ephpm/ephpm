@@ -127,6 +127,27 @@ $ok = ephpm_ws_connection_send($id, $_GET['msg'] ?? 'ping');
 echo $ok ? 'sent' : 'not-sent';
 "#;
 
+/// Floods a connection from an ordinary HTTP request and reports how many
+/// sends were accepted vs refused. This is the slow-consumer probe: with the
+/// client not reading, the bounded outbound queue must start refusing (and
+/// shed the connection) instead of buffering without limit.
+const FLOOD_PHP: &str = r#"<?php
+$id   = $_GET['id'] ?? '';
+$n    = (int)($_GET['n'] ?? 0);
+$size = (int)($_GET['size'] ?? 1024);
+$payload = str_repeat('x', $size);
+$ok = 0;
+$failed = 0;
+for ($i = 0; $i < $n; $i++) {
+    if (ephpm_ws_connection_send($id, $payload)) {
+        $ok++;
+    } else {
+        $failed++;
+    }
+}
+echo $ok . ':' . $failed;
+"#;
+
 /// The implicit form from an ordinary HTTP request must throw, not no-op.
 const PUSH_IMPLICIT_PHP: &str = r#"<?php
 try {
@@ -164,6 +185,7 @@ async fn deploy_sites() {
                 .unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
             write(&dir, "websocket.php", WEBSOCKET_PHP);
             write(&dir, "push.php", PUSH_PHP);
+            write(&dir, "flood.php", FLOOD_PHP);
             write(&dir, "push_implicit.php", PUSH_IMPLICIT_PHP);
             write(&dir, "index.php", INDEX_PHP);
             write(&dir, "disconnects.php", DISCONNECTS_PHP);
@@ -585,4 +607,98 @@ async fn disconnect_count() -> i64 {
     let (status, body) = http_get(SITE_A, "/disconnects.php").await;
     assert_eq!(status, 200, "disconnects.php should serve: {body}");
     body.trim().parse().unwrap_or_else(|e| panic!("unparseable counter {body:?}: {e}"))
+}
+
+/// The bounded outbound queue, end to end: a consumer that stops reading is
+/// shed with close code 1013 (`CLOSE_QUEUE_OVERFLOW`), and sends into the full
+/// queue are *refused* — never buffered without limit.
+///
+/// This node runs `send_queue = 4` (see the websocket block in
+/// `xtask/src/e2e_bare.rs`), so the server-side buffer for the connection is
+/// four frames; everything beyond that plus whatever the kernel socket
+/// buffers absorb must come back as a failed send. The flood is 1000 frames
+/// of ~60 KB (≈ 60 MB) — far past any plausible socket buffering, so if every
+/// send were accepted the server would demonstrably be buffering unboundedly.
+#[tokio::test]
+async fn a_slow_consumer_is_shed_with_1013_not_buffered() {
+    deploy_sites().await;
+    let mut ws = connect_ok(SITE_A, &format!("token={TOKEN}")).await;
+    send(&mut ws, "whoami").await;
+    let id = recv(&mut ws).await.strip_prefix("id:").expect("id: prefix").to_string();
+
+    // Stop reading `ws` and flood it from an ordinary HTTP request.
+    const FRAMES: i64 = 1000;
+    let (status, body) = http_get(SITE_A, &format!("/flood.php?id={id}&n={FRAMES}&size=60000")).await;
+    assert_eq!(status, 200, "flood.php should serve: {body}");
+    let (ok, failed) = body
+        .trim()
+        .split_once(':')
+        .and_then(|(a, b)| Some((a.parse::<i64>().ok()?, b.parse::<i64>().ok()?)))
+        .unwrap_or_else(|| panic!("unparseable flood report {body:?}"));
+
+    assert_eq!(ok + failed, FRAMES, "every send must be accounted for: {body}");
+    assert!(
+        failed >= 1,
+        "with the client not reading, sends must start failing at the bound — \
+         all {FRAMES} were accepted, which means the server buffered ~60 MB"
+    );
+    assert!(ok < FRAMES, "the queue bound must refuse part of the flood: {body}");
+
+    // Now drain: whatever was already in flight arrives, then the shed close.
+    // The overflow schedules a 1013 that beats the queued backlog (the session
+    // task's select is biased towards the close), so the count of data frames
+    // that still arrive must stay below what was accepted, let alone the flood.
+    let mut received: i64 = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let close_code = loop {
+        let next = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .expect("timed out waiting for the shed close frame")
+            .expect("stream ended without a close frame");
+        match next.expect("websocket read error while draining") {
+            Message::Text(_) | Message::Binary(_) => received += 1,
+            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+            Message::Close(frame) => {
+                break u16::from(frame.expect("close frame should carry a code").code);
+            }
+        }
+    };
+    assert_eq!(close_code, 1013, "queue overflow must shed with 1013 (try again later)");
+    assert!(
+        received < FRAMES,
+        "client received {received} of {FRAMES} frames — nothing was dropped, so the \
+         server must have buffered the whole flood"
+    );
+
+    // The shed was scoped to that connection: a fresh one works immediately.
+    let mut fresh = connect_ok(SITE_A, &format!("token={TOKEN}")).await;
+    send(&mut fresh, "echo:still-alive").await;
+    assert_eq!(recv(&mut fresh).await, "echo:still-alive");
+}
+
+/// The other half of the bound, and the distinction that makes it coherent: a
+/// payload over `[server.websocket] max_message_size` is refused *without*
+/// shedding the connection.
+///
+/// An oversized frame is the calling script's bug, not back-pressure from a
+/// slow peer — so it must not cost the client its socket. Asserted right next
+/// to the 1013 test above because the two failure modes share one return
+/// value (`false` from `ephpm_ws_connection_send`) and only the connection's
+/// fate tells them apart.
+#[tokio::test]
+async fn an_oversized_payload_is_refused_without_shedding_the_connection() {
+    deploy_sites().await;
+    let mut ws = connect_ok(SITE_A, &format!("token={TOKEN}")).await;
+    send(&mut ws, "whoami").await;
+    let id = recv(&mut ws).await.strip_prefix("id:").expect("id: prefix").to_string();
+
+    // The node runs `max_message_size = 65536`; 70000 is over it.
+    let (status, body) = http_get(SITE_A, &format!("/flood.php?id={id}&n=1&size=70000")).await;
+    assert_eq!(status, 200, "flood.php should serve: {body}");
+    assert_eq!(body.trim(), "0:1", "an over-cap payload must be refused, not queued");
+
+    // Nothing was delivered, and — the point — the connection is still alive.
+    expect_silence(&mut ws, Duration::from_secs(2)).await;
+    send(&mut ws, "echo:survived").await;
+    assert_eq!(recv(&mut ws).await, "echo:survived");
 }
