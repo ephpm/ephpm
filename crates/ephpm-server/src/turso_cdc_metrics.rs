@@ -370,6 +370,8 @@ pub fn init() {
 
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
 
     /// The registry is process-global, so these tests must not run
@@ -377,6 +379,26 @@ mod tests {
     /// the gauges (which is deterministic) rather than on recorded metric
     /// values (which need an installed recorder — that coverage lives in
     /// `tests/turso_cdc_metrics_e2e.rs`, where a real scrape is parsed).
+    ///
+    /// ── Why `#[serial(cdc_registry)]` and not a module-local `Mutex` ──
+    ///
+    /// A module-local lock only excluded these four tests from *each other*,
+    /// which is not the whole population: `turso_cdc::tests::
+    /// cold_primary_holds_subscriber_open_until_first_write` drives the
+    /// **production** `serve_subscriber`, which calls `attach_subscriber` on
+    /// this same global registry. Its subscriber attaching at change_id 0
+    /// concurrently pulls `shipped` down to 0 and adds a row to `cursors` —
+    /// which is exactly what the `shipped`/`cursors.len()` assertions below
+    /// read. That was the crate's dominant test flake: 13 of 100 full-suite
+    /// runs of `cargo test -p ephpm-server` failed here, spread across three
+    /// of these tests, while each passed in isolation every time.
+    ///
+    /// The named `cdc_registry` group therefore has to include that test too —
+    /// it is tagged at its own definition in `turso_cdc.rs`. **Invariant: any
+    /// test that attaches a CDC subscriber, samples the head, or resets the
+    /// registry must join this group.** A named key (rather than the default)
+    /// keeps unrelated future `#[serial]` tests in this crate from being
+    /// serialized against CDC work for no reason.
     fn reset() {
         REGISTRY.cursors.clear();
         REGISTRY.head.store(0, Ordering::Relaxed);
@@ -387,8 +409,8 @@ mod tests {
     /// Lag is head minus the *slowest* subscriber, not the fastest: one
     /// caught-up replica must not mask another that is far behind.
     #[test]
+    #[serial(cdc_registry)]
     fn lag_tracks_the_slowest_subscriber() {
-        let _s = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset();
 
         let fast = attach_subscriber(0);
@@ -411,8 +433,8 @@ mod tests {
     /// shipped cursor is *retained* so lag keeps growing against a dead
     /// replica rather than freezing or resetting to zero.
     #[test]
+    #[serial(cdc_registry)]
     fn detached_subscriber_retains_cursor_so_lag_keeps_growing() {
-        let _s = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset();
 
         {
@@ -435,8 +457,8 @@ mod tests {
     /// (the sampler reads `0` when `turso_cdc` does not exist yet) must
     /// never walk the head backwards and invent negative lag.
     #[test]
+    #[serial(cdc_registry)]
     fn head_is_monotonic_and_lag_never_negative() {
-        let _s = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset();
 
         let sub = attach_subscriber(0);
@@ -455,8 +477,8 @@ mod tests {
     /// shipped cursor — its backlog is real, and reporting the caught-up
     /// replica's position instead would hide it.
     #[test]
+    #[serial(cdc_registry)]
     fn a_new_cold_subscriber_lowers_the_shipped_cursor() {
-        let _s = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         reset();
 
         let warm = attach_subscriber(0);
@@ -470,6 +492,4 @@ mod tests {
         // ...and once it leaves, the remaining replica's position stands.
         assert_eq!(REGISTRY.shipped.load(Ordering::Relaxed), 1000);
     }
-
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

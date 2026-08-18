@@ -100,6 +100,12 @@ rcgen.workspace = true
 sha1.workspace = true
 # Paused-clock (`start_paused`) support for the idle-timeout watchdog tests.
 tokio = { workspace = true, features = ["test-util"] }
+# Excludes the CDC-metrics tests from running alongside anything else that
+# mutates the process-global subscriber registry (turso_cdc_metrics::REGISTRY).
+# Already a workspace dependency (ephpm-php uses it), so this adds no new crate
+# to the tree. Works on `#[tokio::test]`, which a bare Mutex guard held across
+# an await does not.
+serial_test.workspace = true
 # Real MySQL client for the handle-reuse experiment: PHP's `pdo_mysql` opens a
 # connection per request, and the only way to observe what that does to
 # litewire's session-worker free-list is to drive the wire frontend with a
