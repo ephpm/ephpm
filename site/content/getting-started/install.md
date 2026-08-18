@@ -75,6 +75,25 @@ To run the server in the foreground without registering a service (useful for de
 sudo ephpm serve --config /etc/ephpm/ephpm.toml
 ```
 
+## Upgrading from 0.6.x
+
+v0.7.0 replaced the embedded SQLite engine: the rusqlite (SQLite C engine)
+backend and the sqld sidecar were removed, and the in-process
+[Turso engine](/architecture/database/engines/) is now the only embedded
+engine. For an upgrading node:
+
+- **Your `.db` files open in place** — a cleanly-shut-down 0.6.x database
+  (WAL or rollback journal) needs no dump/reload. **Stop the old node cleanly
+  before upgrading**: a hot `-wal` left by a hard crash was not verified to
+  replay through Turso.
+- **`[db.sqlite] engine = "sqlite"` (or `"rusqlite"`) is now a hard startup
+  error** with a migration message — remove the `engine` key or set it to
+  `"turso"`. The removed `[db.sqlite.sqld]` block and `cdc_experimental` flag
+  log deprecation warnings and have no effect.
+
+Details and caveats (including non-UTF-8 `TEXT`):
+[Database Engines → Opening existing `.db` files](/architecture/database/engines/#opening-existing-sqlite--rusqlite-db-files).
+
 ## Uninstall
 
 ```bash

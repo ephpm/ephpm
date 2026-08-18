@@ -296,8 +296,14 @@ below for exactly what is and isn't closed.
    round-trip (Turso surfaces TEXT as `String` — an upstream limitation).
 4. Crash-recovery soak clean. **Open** — this is why single-node Turso
    ships "eyes open" rather than declared GA.
-5. WordPress + Laravel e2e suites green on the Turso backend. WordPress
-   front-page + drop-in passed; **automate in CI and confirm Laravel**.
+5. WordPress + Laravel e2e suites green on the Turso backend. **Open as
+   an automated gate**, but WordPress-on-Turso now has real informal
+   validation beyond the original front-page + drop-in pass: the live
+   WooCommerce demo store runs WordPress + WooCommerce on the per-site
+   Turso path, and the lab's `wp-real` workload drives full WordPress
+   installs against per-site Turso databases. Those are demos and
+   benchmarks, not an e2e suite — **automate in CI and confirm Laravel**
+   before calling this gate met.
 
 v0.7.0 shipped Turso-only despite gates 1 and 4 remaining open, because
 removing rusqlite removes the cross-tenant `ATTACH` RCE primitive from

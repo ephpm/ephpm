@@ -129,7 +129,7 @@ enabled = true
 # enable switch — there is no `enabled` key.
 [db.sqlite]
 path = "/var/lib/ephpm/app.db"
-# engine = "turso"   # experimental Turso Database engine (Beta upstream)
+# engine = "turso"   # the default and only engine as of v0.7.0 — the Turso Database engine (Beta upstream); may be omitted
 ```
 
 Any TOML key can be overridden with an `EPHPM_` prefixed environment variable — e.g. `EPHPM_SERVER__LISTEN=0.0.0.0:9090`, `EPHPM_PHP__MEMORY_LIMIT=256M`. Nesting uses `__`. Arrays use JSON syntax: `EPHPM_CLUSTER__JOIN='["a:7946","b:7946"]'`. See [Environment Variables](https://ephpm.dev/reference/environment-variables/) for the full mapping rules.
@@ -347,7 +347,7 @@ crates/
 ├── ephpm-config/    Configuration — figment, TOML + env var overrides
 ├── ephpm-kv/        Embedded KV store — DashMap, RESP2 protocol, TTL/expiry, compression
 ├── ephpm-db/        DB proxy — MySQL wire protocol, connection pooling
-└── ephpm-cluster/   Clustering — SWIM gossip (chitchat), consistent hash ring, SQLite election
+└── ephpm-cluster/   Clustering — SWIM gossip (chitchat), hashed key ownership, SQLite election
 ```
 
 Key design decisions:
@@ -424,7 +424,7 @@ The default `cargo xtask e2e` spawns bare ephpm processes on 127.0.0.1 — no co
 - [Implementation guide](https://ephpm.dev/architecture/implementation/) — Build system, CI, MVP spec
 - [CLI design](https://ephpm.dev/architecture/cli/) — Command structure, UX principles
 - [Security model](https://ephpm.dev/architecture/security/) — Threat model, FFI safety, trust boundaries
-- [Clustering](https://ephpm.dev/architecture/clustering/) — SWIM gossip, consistent hash ring, two-tier KV
+- [Clustering](https://ephpm.dev/architecture/clustering/) — SWIM gossip, hashed key ownership, two-tier KV
 - [DB proxy](https://ephpm.dev/architecture/db-proxy/) — MySQL wire protocol, connection pooling, query analysis
 - [Kubernetes deployment](https://ephpm.dev/architecture/kubernetes/) — Helm chart, StatefulSet, gossip DNS
 - [Observability](https://ephpm.dev/architecture/metrics/) — Prometheus metrics, histogram buckets, phased rollout

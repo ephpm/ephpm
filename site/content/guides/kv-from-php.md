@@ -5,10 +5,10 @@ weight = 6
 
 ePHPm's built-in KV store is reachable two ways from PHP:
 
-1. **SAPI functions** — `ephpm_kv_*` calls into the embedded store directly. ~100 ns per op, zero serialization.
-2. **RESP protocol** — any Redis client (Predis, phpredis) connects to the embedded RESP listener. ~10–100 µs per op.
+1. **SAPI functions** — `ephpm_kv_*` calls into the embedded store directly: an in-process function call with no socket and no serialization. Measured: **~100–220 ns per op for small values** (64 B `get` ≈ 116 ns, `set` ≈ 160 ns, `incr` ≈ 162 ns), rising to ~1–2 µs at 64 KB where the value copy dominates.
+2. **RESP protocol** — any Redis client (Predis, phpredis) connects to the embedded RESP listener: one loopback TCP round trip per operation. Measured: **~80–110 µs per round trip** (c=1, raw socket), nearly independent of value size — client libraries add their own overhead on top, and bare-metal loopback can be faster than the bench box.
 
-The store is the same in both cases. Use SAPI for hot paths; use RESP when you need portability or Redis-style commands.
+The store is the same in both cases; only the path differs — by roughly **500×**, because the SAPI path skips the network stack entirely. The numbers are medians from the lab's `kv-micro` suite ([ephpm/lab](https://github.com/ephpm/lab), `kv/`, results in `docs/kv-micro-v070.md`), measured 2026-08-17 against a from-source v0.7.0 build (PHP 8.5 ZTS, WSL2, compression off). Use SAPI for hot paths; use RESP when you need portability or Redis-style commands.
 
 ## SAPI functions
 

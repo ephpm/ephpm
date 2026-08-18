@@ -9,8 +9,16 @@ can fault in ways no amount of Rust safety prevents. When that happens the
 whole process dies: there is one address space, and the Zend memory manager,
 the glibc heap and the OPcache shared memory are shared by every thread in it.
 
-ePHPm cannot recover from that, and does not try. What it does is **tell you
-what happened** before it goes.
+ePHPm cannot recover from that in general, and does not try. What it does is
+**tell you what happened** before it goes.
+
+There is one narrow, opt-in exception as of v0.7.0: with
+[`[php] crash_containment = true`](/reference/config/#php) (which requires
+`fpm_engine = "pool"`), a PHP **C-stack overflow** — and only that fault
+class — is contained instead of fatal: the offending request is answered
+`500` and the pool thread that ran it is retired and replaced. Heap
+corruption and wild writes still kill the process exactly as described on
+this page.
 
 ## What you get
 
@@ -114,6 +122,12 @@ The backtrace for this case is honest but not very useful: every captured frame
 is the same recursing function, so you get its name and a repeat count and
 nothing about the caller. `backtrace(3)` unwinds inward-out and stops at 64
 frames, which a runaway recursion consumes entirely.
+
+If PHP request code (a deep object-graph free) is what overflows the stack, you
+can opt in to surviving it instead of dying: `[php] crash_containment = true`
+with `fpm_engine = "pool"` answers that request `500` and retires the poisoned
+thread. See the note at the top of this page and the
+[configuration reference](/reference/config/#php) for the costs.
 
 ## Exit status is unchanged
 
