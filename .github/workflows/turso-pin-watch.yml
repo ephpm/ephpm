@@ -1,0 +1,142 @@
+name: Turso Pin Watch
+
+# Watches crates.io for a new stable `turso` release and opens (or updates) a
+# single tracking issue when ePHPm's exact pin falls behind.
+#
+# Why an ISSUE and not a PR: ePHPm cannot bump turso on its own. The version is
+# chosen by litewire — ePHPm pins `turso = "=X.Y.Z"` only so it resolves to the
+# same crate instance litewire uses (see the comment above the pin in the
+# workspace Cargo.toml). A bump is therefore a two-repo chain that a human has
+# to shepherd, which the issue body spells out.
+#
+# Idempotent by construction: at most ONE open issue carries the `turso-pin`
+# label. A later run that finds a still-newer version comments on that issue
+# instead of opening a second one.
+
+on:
+  schedule:
+    # Mondays, 09:00 UTC — quiet slot, well clear of the nightly and
+    # sdk-bump jobs.
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: turso-pin-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    # Pure API calls (crates.io + gh) — no toolchain, no self-hosted runner
+    # needed. Matches sdk-bump.yml, the other lightweight polling job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Compare the turso pin against crates.io
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: turso-pin
+          # crates.io rejects requests without a descriptive User-Agent.
+          UA: "ephpm-turso-pin-watch (+https://github.com/ephpm/ephpm)"
+        run: |
+          set -euo pipefail
+
+          fail() { echo "::error::$*"; exit 1; }
+
+          # ── 1. Latest stable turso on crates.io ──────────────────────────
+          api=$(curl -fsSL --retry 3 --retry-delay 5 \
+                  -H "User-Agent: $UA" \
+                  https://crates.io/api/v1/crates/turso) \
+            || fail "crates.io query failed"
+          latest=$(jq -r '.crate.max_stable_version // empty' <<<"$api")
+          [ -n "$latest" ] || fail "crates.io returned no max_stable_version"
+          grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+' <<<"$latest" \
+            || fail "crates.io returned a non-semver version: '$latest'"
+
+          # ── 2. The exact pin in the workspace Cargo.toml ─────────────────
+          # Matches `turso = { version = "=X.Y.Z"` at the start of a line,
+          # tolerating whitespace around `=` and inside the braces.
+          current=$(sed -nE \
+            's/^[[:space:]]*turso[[:space:]]*=[[:space:]]*\{[^}]*version[[:space:]]*=[[:space:]]*"=?([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' \
+            Cargo.toml | head -1)
+          [ -n "$current" ] || fail "could not parse the turso pin from Cargo.toml"
+
+          echo "pinned=$current latest=$latest"
+
+          # ── 3. Newer? (`sort -V`: highest last, and they must differ) ────
+          if [ "$current" = "$latest" ] \
+             || [ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -1)" != "$latest" ]; then
+            echo "turso pin $current is up to date (crates.io latest stable: $latest)"
+            exit 0
+          fi
+
+          echo "::notice::turso $latest is newer than the pinned $current"
+
+          # ── 4. One tracking issue, reused ────────────────────────────────
+          # The label is the idempotency key. Create it if this is the first run.
+          gh label create "$LABEL" \
+            --description "Tracks a turso version bump (litewire → ephpm)" \
+            --color BFD4F2 2>/dev/null || true
+
+          title="chore(deps): turso $latest is available (pinned: $current)"
+          body=$(cat <<EOF
+          crates.io now publishes **turso $latest**; the workspace \`Cargo.toml\`
+          pins \`turso = "=$current"\`.
+
+          ePHPm cannot bump this on its own — the version is chosen by litewire,
+          and ePHPm's exact pin exists so both resolve to a **single** crate
+          instance (\`TursoConnection\` re-exported by litewire must be the same
+          \`turso::Connection\`). Bumping is a two-step chain:
+
+          **(a) ephpm/litewire** — bump its \`turso = "=$latest"\` pin, open a PR,
+          merge it. Note the merge commit SHA.
+
+          **(b) ephpm/ephpm** — in the workspace \`Cargo.toml\`, bump the litewire
+          git \`rev\` to that SHA **and** \`turso = { version = "=$latest" }\`, then:
+
+          \`\`\`bash
+          cargo update -p litewire -p turso -p turso_core
+          \`\`\`
+
+          …and open a PR. The two pins must move together; bumping only one
+          resolves two turso instances and breaks the CDC/backend types.
+
+          **Before bumping:** check the turso changelog for changes to the
+          pragma-TVF/vtab path and to CDC. ePHPm's clustered replication tails
+          \`turso_cdc\` (\`crates/ephpm-server/src/turso_cdc.rs\`) and the tenant
+          SQL screen depends on how PRAGMAs are parsed and dispatched
+          (\`crates/ephpm-php/src/db_bridge.rs\`) — both are the parts of the
+          engine most likely to shift under a minor bump.
+
+          <sub>Opened automatically by \`.github/workflows/turso-pin-watch.yml\`.</sub>
+          EOF
+          )
+
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" \
+                       --label "$LABEL" --state open \
+                       --json number,title --jq '.[0].number // empty')
+
+          if [ -z "$existing" ]; then
+            url=$(gh issue create --repo "$GITHUB_REPOSITORY" \
+                    --title "$title" --label "$LABEL" --body "$body")
+            echo "::notice::opened $url"
+            exit 0
+          fi
+
+          # An issue is already open. If it already tracks THIS version, say
+          # nothing — a weekly "still behind" comment would be pure noise.
+          existing_title=$(gh issue view "$existing" --repo "$GITHUB_REPOSITORY" --json title --jq .title)
+          if [[ "$existing_title" == *"turso $latest "* ]]; then
+            echo "issue #$existing already tracks turso $latest — nothing to do"
+            exit 0
+          fi
+
+          gh issue edit "$existing" --repo "$GITHUB_REPOSITORY" --title "$title"
+          gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          echo "::notice::updated existing tracking issue #$existing to turso $latest"
