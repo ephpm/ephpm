@@ -130,19 +130,19 @@ fn main() {
         // Ask the active Apple clang for its resource dir and link the
         // builtins archive explicitly. Harmless when no object references
         // the symbol (8.3/8.4 SDKs) — ld64 dead-strips it.
-        if let Ok(out) = Command::new("cc").arg("--print-resource-dir").output() {
-            if out.status.success() {
-                let resource_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let builtins = Path::new(&resource_dir).join("lib/darwin/libclang_rt.osx.a");
-                if builtins.exists() {
-                    println!("cargo::rustc-link-arg={}", builtins.display());
-                } else {
-                    println!(
-                        "cargo::warning=libclang_rt.osx.a not found under {resource_dir}; \
+        if let Ok(out) = Command::new("cc").arg("--print-resource-dir").output()
+            && out.status.success()
+        {
+            let resource_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let builtins = Path::new(&resource_dir).join("lib/darwin/libclang_rt.osx.a");
+            if builtins.exists() {
+                println!("cargo::rustc-link-arg={}", builtins.display());
+            } else {
+                println!(
+                    "cargo::warning=libclang_rt.osx.a not found under {resource_dir}; \
                          linking may fail with undefined __isPlatformVersionAtLeast \
                          (PHP 8.5 SDK sqlite @available guards)"
-                    );
-                }
+                );
             }
         }
         return;

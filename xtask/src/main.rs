@@ -83,10 +83,10 @@ Windows builds:
 /// Parse `--php-version <ver>` from args, defaulting to "8.5".
 fn parse_php_version(args: &[String]) -> &str {
     for (i, arg) in args.iter().enumerate() {
-        if arg == "--php-version" {
-            if let Some(ver) = args.get(i + 1) {
-                return ver;
-            }
+        if arg == "--php-version"
+            && let Some(ver) = args.get(i + 1)
+        {
+            return ver;
         }
     }
     "8.5"
@@ -1069,14 +1069,14 @@ PREV_REASON:.status.containerStatuses[*].lastState.terminated.reason",
     if let Ok(o) = out {
         let codes = String::from_utf8_lossy(&o.stdout);
         for tok in codes.split_whitespace() {
-            if let Ok(code) = tok.parse::<i64>() {
-                if let Some(sig) = decode_fatal_signal(code) {
-                    eprintln!(
-                        "!!! ephpm container exited {code} = {sig} — the SERVER UNDER TEST \
+            if let Ok(code) = tok.parse::<i64>()
+                && let Some(sig) = decode_fatal_signal(code)
+            {
+                eprintln!(
+                    "!!! ephpm container exited {code} = {sig} — the SERVER UNDER TEST \
 crashed; this is a server bug, not a test/infra flake. Check the 'previous \
 container' logs above for the last output before death."
-                    );
-                }
+                );
             }
         }
     }

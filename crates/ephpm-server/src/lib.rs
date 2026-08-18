@@ -1492,10 +1492,9 @@ async fn serve_http_redirect(stream: TcpStream, remote_addr: SocketAddr, setting
         .timer(hyper_util::rt::TokioTimer::new())
         .serve_connection(io, service)
         .await
+        && !err.is_incomplete_message()
     {
-        if !err.is_incomplete_message() {
-            tracing::debug!(%remote_addr, %err, "redirect connection error");
-        }
+        tracing::debug!(%remote_addr, %err, "redirect connection error");
     }
 }
 
@@ -1989,15 +1988,16 @@ fn wire_per_site_db(
 ) -> anyhow::Result<Option<site_wire_auth::SiteWireAuth>> {
     // A multi-site + clustered SQLite config cannot get per-site isolation
     // yet: warn rather than silently pretend it is isolated.
-    if let Some(sqlite) = &config.db.sqlite {
-        if config.server.sites_dir.is_some() && is_clustered_sqlite(sqlite, cluster_enabled) {
-            tracing::warn!(
-                "[db.sqlite] multi-site mode ([server] sites_dir) combined with clustered \
+    if let Some(sqlite) = &config.db.sqlite
+        && config.server.sites_dir.is_some()
+        && is_clustered_sqlite(sqlite, cluster_enabled)
+    {
+        tracing::warn!(
+            "[db.sqlite] multi-site mode ([server] sites_dir) combined with clustered \
                  replication does NOT get per-site database isolation — all virtual hosts share \
                  the clustered database. Per-site isolation is single-node only. Run single-node \
                  for isolated per-tenant databases, or accept a shared database in clustered mode."
-            );
-        }
+        );
     }
 
     if !is_per_site_sqlite(config, cluster_enabled) {

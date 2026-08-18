@@ -50,14 +50,11 @@ pub async fn serve_file(
 
     // Try the file cache first. Returns `None` for metadata-only entries
     // (large files without inlined content) so we fall through to streaming.
-    if let Some(cache) = file_cache {
-        if let Some(entry) = cache.lookup(&canonical_file).await {
-            if let Some(resp) =
-                serve_cached_entry(entry, accepts_gzip, cache_control, if_none_match)
-            {
-                return resp;
-            }
-        }
+    if let Some(cache) = file_cache
+        && let Some(entry) = cache.lookup(&canonical_file).await
+        && let Some(resp) = serve_cached_entry(entry, accepts_gzip, cache_control, if_none_match)
+    {
+        return resp;
     }
 
     // Check file size — stream large files instead of reading into memory.
@@ -83,72 +80,70 @@ pub async fn serve_file(
 
     // Insert into cache if enabled. For small files (which are inlined),
     // serve directly from the cache entry.
-    if let Some(cache) = file_cache {
-        if let Ok(mtime) = metadata.modified() {
-            let entry = cache.insert(&canonical_file, &content, mtime, mime, compression);
-            if let Some(resp) =
-                serve_cached_entry(entry, accepts_gzip, cache_control, if_none_match)
-            {
-                return resp;
-            }
+    if let Some(cache) = file_cache
+        && let Ok(mtime) = metadata.modified()
+    {
+        let entry = cache.insert(&canonical_file, &content, mtime, mime, compression);
+        if let Some(resp) = serve_cached_entry(entry, accepts_gzip, cache_control, if_none_match) {
+            return resp;
         }
     }
 
     // Uncached path — compute ETag from content hash.
     let etag_value = if etag { Some(compute_etag(&content)) } else { None };
 
-    if let (Some(tag), Some(client_tag)) = (&etag_value, if_none_match) {
-        if etag_matches(tag, client_tag) {
-            let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
-            builder = builder.header("ETag", tag.as_str());
-            if !cache_control.is_empty() {
-                builder = builder.header("Cache-Control", cache_control);
-            }
-            return builder
-                .body(body::buffered(Full::new(Bytes::new())))
-                .unwrap_or_else(|_| internal_error());
+    if let (Some(tag), Some(client_tag)) = (&etag_value, if_none_match)
+        && etag_matches(tag, client_tag)
+    {
+        let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+        builder = builder.header("ETag", tag.as_str());
+        if !cache_control.is_empty() {
+            builder = builder.header("Cache-Control", cache_control);
         }
+        return builder
+            .body(body::buffered(Full::new(Bytes::new())))
+            .unwrap_or_else(|_| internal_error());
     }
 
     // Prefer Brotli over gzip — better compression ratio for text assets.
-    if accepts_br {
-        if let Some(compressed) = crate::router::brotli_compress(&content, mime, compression) {
-            let mut builder = Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", mime)
-                .header("Content-Length", compressed.len())
-                .header("Content-Encoding", "br")
-                .header("Vary", "Accept-Encoding");
-            if !cache_control.is_empty() {
-                builder = builder.header("Cache-Control", cache_control);
-            }
-            if let Some(ref tag) = etag_value {
-                builder = builder.header("ETag", tag.as_str());
-            }
-            return builder
-                .body(body::buffered(Full::new(Bytes::from(compressed))))
-                .unwrap_or_else(|_| internal_error());
+    if accepts_br
+        && let Some(compressed) = crate::router::brotli_compress(&content, mime, compression)
+    {
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", mime)
+            .header("Content-Length", compressed.len())
+            .header("Content-Encoding", "br")
+            .header("Vary", "Accept-Encoding");
+        if !cache_control.is_empty() {
+            builder = builder.header("Cache-Control", cache_control);
         }
+        if let Some(ref tag) = etag_value {
+            builder = builder.header("ETag", tag.as_str());
+        }
+        return builder
+            .body(body::buffered(Full::new(Bytes::from(compressed))))
+            .unwrap_or_else(|_| internal_error());
     }
 
-    if accepts_gzip {
-        if let Some(compressed) = crate::router::gzip_compress(&content, mime, compression) {
-            let mut builder = Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", mime)
-                .header("Content-Length", compressed.len())
-                .header("Content-Encoding", "gzip")
-                .header("Vary", "Accept-Encoding");
-            if !cache_control.is_empty() {
-                builder = builder.header("Cache-Control", cache_control);
-            }
-            if let Some(ref tag) = etag_value {
-                builder = builder.header("ETag", tag.as_str());
-            }
-            return builder
-                .body(body::buffered(Full::new(Bytes::from(compressed))))
-                .unwrap_or_else(|_| internal_error());
+    if accepts_gzip
+        && let Some(compressed) = crate::router::gzip_compress(&content, mime, compression)
+    {
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", mime)
+            .header("Content-Length", compressed.len())
+            .header("Content-Encoding", "gzip")
+            .header("Vary", "Accept-Encoding");
+        if !cache_control.is_empty() {
+            builder = builder.header("Cache-Control", cache_control);
         }
+        if let Some(ref tag) = etag_value {
+            builder = builder.header("ETag", tag.as_str());
+        }
+        return builder
+            .body(body::buffered(Full::new(Bytes::from(compressed))))
+            .unwrap_or_else(|_| internal_error());
     }
 
     let mut builder = Response::builder()
@@ -178,40 +173,38 @@ fn serve_cached_entry(
     if_none_match: Option<&str>,
 ) -> Option<Response<ServerBody>> {
     // ETag check — works even for metadata-only entries.
-    if let Some(client_tag) = if_none_match {
-        if etag_matches(&entry.etag, client_tag) {
-            let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
-            builder = builder.header("ETag", entry.etag.as_str());
-            if !cache_control.is_empty() {
-                builder = builder.header("Cache-Control", cache_control);
-            }
-            return Some(
-                builder
-                    .body(body::buffered(Full::new(Bytes::new())))
-                    .unwrap_or_else(|_| internal_error()),
-            );
+    if let Some(client_tag) = if_none_match
+        && etag_matches(&entry.etag, client_tag)
+    {
+        let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+        builder = builder.header("ETag", entry.etag.as_str());
+        if !cache_control.is_empty() {
+            builder = builder.header("Cache-Control", cache_control);
         }
+        return Some(
+            builder
+                .body(body::buffered(Full::new(Bytes::new())))
+                .unwrap_or_else(|_| internal_error()),
+        );
     }
 
     // Serve pre-compressed gzip variant if available.
-    if accepts_gzip {
-        if let Some(ref gzip) = entry.gzip_content {
-            let mut builder = Response::builder()
-                .status(StatusCode::OK)
-                .header("Content-Type", entry.mime.as_str())
-                .header("Content-Length", gzip.len())
-                .header("Content-Encoding", "gzip")
-                .header("Vary", "Accept-Encoding")
-                .header("ETag", entry.etag.as_str());
-            if !cache_control.is_empty() {
-                builder = builder.header("Cache-Control", cache_control);
-            }
-            return Some(
-                builder
-                    .body(body::buffered(Full::new(gzip.clone())))
-                    .unwrap_or_else(|_| internal_error()),
-            );
+    if accepts_gzip && let Some(ref gzip) = entry.gzip_content {
+        let mut builder = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", entry.mime.as_str())
+            .header("Content-Length", gzip.len())
+            .header("Content-Encoding", "gzip")
+            .header("Vary", "Accept-Encoding")
+            .header("ETag", entry.etag.as_str());
+        if !cache_control.is_empty() {
+            builder = builder.header("Cache-Control", cache_control);
         }
+        return Some(
+            builder
+                .body(body::buffered(Full::new(gzip.clone())))
+                .unwrap_or_else(|_| internal_error()),
+        );
     }
 
     // Serve from cached content if inlined.
@@ -260,17 +253,17 @@ async fn serve_streamed(
     });
 
     // ETag check.
-    if let (Some(tag), Some(client_tag)) = (&etag_value, if_none_match) {
-        if etag_matches(tag, client_tag) {
-            let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
-            builder = builder.header("ETag", tag.as_str());
-            if !cache_control.is_empty() {
-                builder = builder.header("Cache-Control", cache_control);
-            }
-            return builder
-                .body(body::buffered(Full::new(Bytes::new())))
-                .unwrap_or_else(|_| internal_error());
+    if let (Some(tag), Some(client_tag)) = (&etag_value, if_none_match)
+        && etag_matches(tag, client_tag)
+    {
+        let mut builder = Response::builder().status(StatusCode::NOT_MODIFIED);
+        builder = builder.header("ETag", tag.as_str());
+        if !cache_control.is_empty() {
+            builder = builder.header("Cache-Control", cache_control);
         }
+        return builder
+            .body(body::buffered(Full::new(Bytes::new())))
+            .unwrap_or_else(|_| internal_error());
     }
 
     let Ok(file) = tokio::fs::File::open(path).await else {

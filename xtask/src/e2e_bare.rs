@@ -379,10 +379,10 @@ pub fn run(args: &[String]) -> ExitCode {
         if SKIP_SUITES.contains(&name.as_str()) {
             continue;
         }
-        if let Some(only) = only_suite.as_deref() {
-            if name != only {
-                continue;
-            }
+        if let Some(only) = only_suite.as_deref()
+            && name != only
+        {
+            continue;
         }
         if CLUSTER_SUITES.contains(&name.as_str()) {
             cluster_suites.push((name, path));

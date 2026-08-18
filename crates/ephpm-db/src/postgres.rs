@@ -1259,15 +1259,15 @@ async fn pg_proxy_bidirectional_sniff(
                         // turn carries no SQL but still owns this
                         // `ReadyForQuery`, and leaving its entry behind would
                         // misattribute every later statement on the session.
-                        if let Some(turn) = turns.lock().pop_front() {
-                            if let Some(sql) = turn.sql {
-                                collector.record(
-                                    &sql,
-                                    turn.started.elapsed(),
-                                    outcome.ok,
-                                    outcome.rows,
-                                );
-                            }
+                        if let Some(turn) = turns.lock().pop_front()
+                            && let Some(sql) = turn.sql
+                        {
+                            collector.record(
+                                &sql,
+                                turn.started.elapsed(),
+                                outcome.ok,
+                                outcome.rows,
+                            );
                         }
                     }
                     outcome = ResponseOutcome { ok: true, rows: 0 };
@@ -1374,10 +1374,10 @@ fn pg_select_pool<'a>(
     if state.in_transaction {
         return primary;
     }
-    if let Some(sticky_until) = state.sticky_until {
-        if std::time::Instant::now() < sticky_until {
-            return primary;
-        }
+    if let Some(sticky_until) = state.sticky_until
+        && std::time::Instant::now() < sticky_until
+    {
+        return primary;
     }
     if matches!(kind, PgQueryKind::Read) {
         let idx = replica_rr.fetch_add(1, Ordering::Relaxed) % replicas.len();

@@ -613,10 +613,10 @@ impl Store {
         // entry() lock below is fine — the locked check below catches
         // it; the peek just saves an unnecessary `ensure_memory` call
         // for the common "already taken" case.
-        if let Some(existing) = self.data.get(&key) {
-            if !existing.is_expired() {
-                return false;
-            }
+        if let Some(existing) = self.data.get(&key)
+            && !existing.is_expired()
+        {
+            return false;
         }
 
         // Build the candidate entry first so we can compute its size

@@ -458,13 +458,11 @@ fn read_listen_address(config: &Path) -> Option<String> {
             in_server = rest.starts_with("server]");
             continue;
         }
-        if in_server {
-            if let Some(value) = trimmed.strip_prefix("listen") {
-                let value = value.trim_start().trim_start_matches('=').trim();
-                let value = value.trim_matches('"').trim_matches('\'');
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
+        if in_server && let Some(value) = trimmed.strip_prefix("listen") {
+            let value = value.trim_start().trim_start_matches('=').trim();
+            let value = value.trim_matches('"').trim_matches('\'');
+            if !value.is_empty() {
+                return Some(value.to_string());
             }
         }
     }

@@ -132,7 +132,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
             Frame::Array(results)
         }
         "MSET" => {
-            if argv.len() < 2 || argv.len() % 2 != 0 {
+            if argv.len() < 2 || !argv.len().is_multiple_of(2) {
                 return Frame::error("ERR wrong number of arguments for 'mset' command");
             }
             for pair in argv.chunks(2) {
@@ -334,7 +334,7 @@ fn execute(store: &Arc<Store>, cmd: &str, argv: &[&[u8]]) -> Frame {
 
         // ── Hash operations ──────────────────────────────────────
         "HSET" => {
-            if argv.len() < 3 || argv.len() % 2 == 0 {
+            if argv.len() < 3 || argv.len().is_multiple_of(2) {
                 return Frame::error("ERR wrong number of arguments for 'hset' command");
             }
             let key = str_from(argv[0]);
@@ -441,10 +441,10 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
                 if i + 1 >= argv.len() {
                     return Frame::error("ERR syntax error");
                 }
-                if let Ok(sec) = parse_i64(argv[i + 1]) {
-                    if sec > 0 {
-                        ttl = Some(Duration::from_secs(u64::try_from(sec).unwrap_or(u64::MAX)));
-                    }
+                if let Ok(sec) = parse_i64(argv[i + 1])
+                    && sec > 0
+                {
+                    ttl = Some(Duration::from_secs(u64::try_from(sec).unwrap_or(u64::MAX)));
                 }
                 i += 2;
             }
@@ -452,10 +452,10 @@ fn cmd_set(store: &Arc<Store>, argv: &[&[u8]]) -> Frame {
                 if i + 1 >= argv.len() {
                     return Frame::error("ERR syntax error");
                 }
-                if let Ok(ms) = parse_i64(argv[i + 1]) {
-                    if ms > 0 {
-                        ttl = Some(Duration::from_millis(u64::try_from(ms).unwrap_or(u64::MAX)));
-                    }
+                if let Ok(ms) = parse_i64(argv[i + 1])
+                    && ms > 0
+                {
+                    ttl = Some(Duration::from_millis(u64::try_from(ms).unwrap_or(u64::MAX)));
                 }
                 i += 2;
             }

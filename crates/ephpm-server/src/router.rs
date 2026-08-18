@@ -574,10 +574,9 @@ fn build_ingest_strip_headers(mounts: &[MiddlewareMount]) -> Vec<String> {
             .as_ref()
             .and_then(|c| c.get("claims_header"))
             .and_then(serde_json::Value::as_str)
+            && !name.is_empty()
         {
-            if !name.is_empty() {
-                names.push(name.to_ascii_lowercase());
-            }
+            names.push(name.to_ascii_lowercase());
         }
     }
     names.sort_unstable();
@@ -1401,16 +1400,16 @@ impl Router {
         // Check the startup-scanned registry first for each candidate key.
         // Verify the directory still exists — it may have been removed (teardown).
         for key in lookup_keys {
-            if let Some(site) = self.sites.get(*key) {
-                if site.document_root.is_dir() {
-                    return ResolvedSite {
-                        key: Some((*key).to_string()),
-                        document_root: site.document_root.clone(),
-                        index_files: &site.index_files,
-                        websocket_files: &site.websocket_files,
-                        fallback: &site.fallback,
-                    };
-                }
+            if let Some(site) = self.sites.get(*key)
+                && site.document_root.is_dir()
+            {
+                return ResolvedSite {
+                    key: Some((*key).to_string()),
+                    document_root: site.document_root.clone(),
+                    index_files: &site.index_files,
+                    websocket_files: &site.websocket_files,
+                    fallback: &site.fallback,
+                };
             }
         }
 
@@ -1745,10 +1744,10 @@ impl Router {
         // raw IP, so a `Host`-gated probe would 421 and the pod would never
         // become ready.
         if method_ref == hyper::Method::GET {
-            if let Some(ref handle) = self.metrics_handle {
-                if uri_path == self.metrics_path {
-                    return Ok((metrics::render(handle), "metrics"));
-                }
+            if let Some(ref handle) = self.metrics_handle
+                && uri_path == self.metrics_path
+            {
+                return Ok((metrics::render(handle), "metrics"));
             }
 
             // Liveness probe — always 200 if the server is running.
@@ -1765,10 +1764,10 @@ impl Router {
             // the ring buffer as JSON, newest first. Only mounted when the
             // timeline is enabled — when disabled, the path deliberately
             // falls through and behaves like any other unknown /_ephpm/ path.
-            if uri_path == "/_ephpm/requests" {
-                if let Some(ref log) = self.request_log {
-                    return Ok((json_response_owned(StatusCode::OK, log.to_json()), "diagnostics"));
-                }
+            if uri_path == "/_ephpm/requests"
+                && let Some(ref log) = self.request_log
+            {
+                return Ok((json_response_owned(StatusCode::OK, log.to_json()), "diagnostics"));
             }
         }
 
@@ -1842,28 +1841,28 @@ impl Router {
         // With `[server.websocket]` disabled this is one `Option::is_none()`
         // and an upgrade request routes exactly as it did before the feature
         // existed.
-        if let Some(ref runtime) = self.websocket {
-            if crate::websocket::is_upgrade_request(&req) {
-                let mut resp = self
-                    .handle_websocket_upgrade(
-                        req,
-                        runtime,
-                        effective_addr,
-                        is_https,
-                        &site_root,
-                        site_websocket_files,
-                        site_key,
-                    )
-                    .await;
-                // Configured response headers belong on the error paths (404 /
-                // 400 / 503) but not on a 101 — a Switching Protocols response
-                // hands the socket over, and anything appended to it is bytes
-                // the client will read as WebSocket framing.
-                if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-                    self.apply_response_headers(&mut resp);
-                }
-                return Ok((resp, "websocket"));
+        if let Some(ref runtime) = self.websocket
+            && crate::websocket::is_upgrade_request(&req)
+        {
+            let mut resp = self
+                .handle_websocket_upgrade(
+                    req,
+                    runtime,
+                    effective_addr,
+                    is_https,
+                    &site_root,
+                    site_websocket_files,
+                    site_key,
+                )
+                .await;
+            // Configured response headers belong on the error paths (404 /
+            // 400 / 503) but not on a 101 — a Switching Protocols response
+            // hands the socket over, and anything appended to it is bytes
+            // the client will read as WebSocket framing.
+            if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+                self.apply_response_headers(&mut resp);
             }
+            return Ok((resp, "websocket"));
         }
 
         // Extract If-None-Match for ETag support before consuming the request.
@@ -1890,26 +1889,24 @@ impl Router {
                             && self.php_etag_cache_config.enabled;
 
                         // Pre-check: bypass PHP if client's ETag matches stored value.
-                        if is_cacheable {
-                            if let Some(client_tag) = &if_none_match {
-                                let key = php_etag_cache_key(
-                                    &self.php_etag_cache_config.key_prefix,
-                                    method,
-                                    &uri_path,
-                                    &query_string,
-                                );
-                                if let Some(stored) = self.store.get(&key) {
-                                    let stored_etag = String::from_utf8_lossy(&stored);
-                                    if etag_matches_value(&stored_etag, client_tag) {
-                                        return Ok((
-                                            Response::builder()
-                                                .status(StatusCode::NOT_MODIFIED)
-                                                .header("etag", stored_etag.as_ref())
-                                                .body(body::buffered(Full::new(Bytes::new())))
-                                                .expect("304 builder"),
-                                            "php",
-                                        ));
-                                    }
+                        if is_cacheable && let Some(client_tag) = &if_none_match {
+                            let key = php_etag_cache_key(
+                                &self.php_etag_cache_config.key_prefix,
+                                method,
+                                &uri_path,
+                                &query_string,
+                            );
+                            if let Some(stored) = self.store.get(&key) {
+                                let stored_etag = String::from_utf8_lossy(&stored);
+                                if etag_matches_value(&stored_etag, client_tag) {
+                                    return Ok((
+                                        Response::builder()
+                                            .status(StatusCode::NOT_MODIFIED)
+                                            .header("etag", stored_etag.as_ref())
+                                            .body(body::buffered(Full::new(Bytes::new())))
+                                            .expect("304 builder"),
+                                        "php",
+                                    ));
                                 }
                             }
                         }
@@ -1930,26 +1927,25 @@ impl Router {
                             .await;
 
                         // Post-store: cache any ETag PHP set in the response.
-                        if is_cacheable {
-                            if let Some(etag_val) =
+                        if is_cacheable
+                            && let Some(etag_val) =
                                 resp.headers().get("etag").and_then(|v| v.to_str().ok())
-                            {
-                                let key = php_etag_cache_key(
-                                    &self.php_etag_cache_config.key_prefix,
-                                    method,
-                                    &uri_path,
-                                    &query_string,
-                                );
-                                #[allow(clippy::cast_sign_loss)]
-                                let ttl = if self.php_etag_cache_config.ttl_secs > 0 {
-                                    Some(Duration::from_secs(
-                                        self.php_etag_cache_config.ttl_secs as u64,
-                                    ))
-                                } else {
-                                    None
-                                };
-                                self.store.set(key, etag_val.as_bytes().to_vec(), ttl);
-                            }
+                        {
+                            let key = php_etag_cache_key(
+                                &self.php_etag_cache_config.key_prefix,
+                                method,
+                                &uri_path,
+                                &query_string,
+                            );
+                            #[allow(clippy::cast_sign_loss)]
+                            let ttl = if self.php_etag_cache_config.ttl_secs > 0 {
+                                Some(Duration::from_secs(
+                                    self.php_etag_cache_config.ttl_secs as u64,
+                                ))
+                            } else {
+                                None
+                            };
+                            self.store.set(key, etag_val.as_bytes().to_vec(), ttl);
                         }
 
                         (resp, "php")
@@ -2344,17 +2340,16 @@ impl Router {
         // Keyed by the canonical site key `resolve_site` returned, NEVER
         // re-derived from the Host header (issues #290/#291). No key
         // (unmatched host, or single-site mode) = no per-site cap.
-        if let (Some(limiter), Some(key)) = (self.limiter.as_deref(), site_key.as_deref()) {
-            if !limiter.check_site_rate(key) {
-                counter!("ephpm_site_rate_limited_total").increment(1);
-                let retry_after = limiter.site_retry_after_secs();
-                let mut resp =
-                    error_response(StatusCode::TOO_MANY_REQUESTS, "429 Too Many Requests");
-                if let Ok(value) = hyper::header::HeaderValue::from_str(&retry_after.to_string()) {
-                    resp.headers_mut().insert(hyper::header::RETRY_AFTER, value);
-                }
-                return resp;
+        if let (Some(limiter), Some(key)) = (self.limiter.as_deref(), site_key.as_deref())
+            && !limiter.check_site_rate(key)
+        {
+            counter!("ephpm_site_rate_limited_total").increment(1);
+            let retry_after = limiter.site_retry_after_secs();
+            let mut resp = error_response(StatusCode::TOO_MANY_REQUESTS, "429 Too Many Requests");
+            if let Ok(value) = hyper::header::HeaderValue::from_str(&retry_after.to_string()) {
+                resp.headers_mut().insert(hyper::header::RETRY_AFTER, value);
             }
+            return resp;
         }
 
         let method = req.method().to_string();
@@ -2382,10 +2377,10 @@ impl Router {
         // `[server.request] max_body_size` on top would silently cap WebSocket
         // messages at the HTTP body limit — two unrelated knobs, one of which
         // the operator did not think they were setting.
-        if ws_event.is_none() {
-            if let Some(resp) = self.check_body_size(&req) {
-                return resp;
-            }
+        if ws_event.is_none()
+            && let Some(resp) = self.check_body_size(&req)
+        {
+            return resp;
         }
 
         let server_port = self.server_port;
@@ -2518,13 +2513,13 @@ impl Router {
             // the truncated body, the request as sent was over the limit — the
             // client gets a 413, exactly as the Content-Length pre-check would
             // have produced.
-            if let Some(flag) = body_overflow {
-                if flag.load(std::sync::atomic::Ordering::Acquire) {
-                    return apply_response_headers(
-                        error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large"),
-                        &mw_response_headers,
-                    );
-                }
+            if let Some(flag) = body_overflow
+                && flag.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return apply_response_headers(
+                    error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large"),
+                    &mw_response_headers,
+                );
             }
             return apply_response_headers(resp, &mw_response_headers);
         }
@@ -3250,13 +3245,13 @@ impl Router {
         // Worker mode: not ready until at least one worker has booted its
         // framework and reached take_request() — prevents load balancers from
         // routing before the framework is up (design §4.5).
-        if let Some(pool) = &self.worker_pool {
-            if pool.ready_count() == 0 {
-                return json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    r#"{"status":"not_ready","reason":"no worker has finished booting"}"#,
-                );
-            }
+        if let Some(pool) = &self.worker_pool
+            && pool.ready_count() == 0
+        {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"status":"not_ready","reason":"no worker has finished booting"}"#,
+            );
         }
         // A configured SQL proxy that has never reached its upstream cannot
         // serve a single query — the process must stay out of rotation and a
@@ -3310,10 +3305,10 @@ impl Router {
     /// the (typically 1-3 element) proxy chain on this per-request path.
     fn resolve_xff(&self, xff: &str) -> Option<IpAddr> {
         for ip_str in xff.rsplit(',') {
-            if let Ok(ip) = ip_str.trim().parse::<IpAddr>() {
-                if !self.is_trusted_proxy(ip) {
-                    return Some(ip);
-                }
+            if let Ok(ip) = ip_str.trim().parse::<IpAddr>()
+                && !self.is_trusted_proxy(ip)
+            {
+                return Some(ip);
             }
         }
         // All IPs in the chain are trusted (or unparseable) — use the leftmost.
@@ -3737,17 +3732,17 @@ struct PerSiteDbWire {
 /// pointing at the proxy listener. PHP frameworks auto-discover these.
 fn build_db_env_vars(config: &Config) -> Vec<(String, String)> {
     // MySQL takes precedence (most common for PHP).
-    if let Some(ref mysql) = config.db.mysql {
-        if mysql.inject_env {
-            let listen = mysql.listen.as_deref().unwrap_or("127.0.0.1:3306");
-            return db_env_from_url(listen, &mysql.url, "mysql");
-        }
+    if let Some(ref mysql) = config.db.mysql
+        && mysql.inject_env
+    {
+        let listen = mysql.listen.as_deref().unwrap_or("127.0.0.1:3306");
+        return db_env_from_url(listen, &mysql.url, "mysql");
     }
-    if let Some(ref pg) = config.db.postgres {
-        if pg.inject_env {
-            let listen = pg.listen.as_deref().unwrap_or("127.0.0.1:5432");
-            return db_env_from_url(listen, &pg.url, "pgsql");
-        }
+    if let Some(ref pg) = config.db.postgres
+        && pg.inject_env
+    {
+        let listen = pg.listen.as_deref().unwrap_or("127.0.0.1:5432");
+        return db_env_from_url(listen, &pg.url, "pgsql");
     }
     Vec::new()
 }

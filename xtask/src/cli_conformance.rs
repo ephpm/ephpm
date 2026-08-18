@@ -561,22 +561,23 @@ fn strip_versions(input: &[u8]) -> Vec<u8> {
     let mut i = 0;
     while i < input.len() {
         // `(built: Jul 16 2026 18:56:38)` — replace the payload.
-        if input[i..].starts_with(b"(built: ") {
-            if let Some(close) = input[i..].iter().position(|&b| b == b')') {
-                out.extend_from_slice(b"(built: <DATE>)");
-                i += close + 1;
-                continue;
-            }
+        if input[i..].starts_with(b"(built: ")
+            && let Some(close) = input[i..].iter().position(|&b| b == b')')
+        {
+            out.extend_from_slice(b"(built: <DATE>)");
+            i += close + 1;
+            continue;
         }
         // A version token must not start mid-number: letters before it are
         // fine (`Zend Engine v4.5.7`), digits or dots are not.
         let at_boundary = i == 0 || (!input[i - 1].is_ascii_digit() && input[i - 1] != b'.');
-        if at_boundary && input[i].is_ascii_digit() {
-            if let Some(len) = match_version(&input[i..]) {
-                out.extend_from_slice(b"<VERSION>");
-                i += len;
-                continue;
-            }
+        if at_boundary
+            && input[i].is_ascii_digit()
+            && let Some(len) = match_version(&input[i..])
+        {
+            out.extend_from_slice(b"<VERSION>");
+            i += len;
+            continue;
         }
         out.push(input[i]);
         i += 1;

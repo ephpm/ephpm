@@ -347,10 +347,11 @@ fn libclang_check_linux() -> Check {
         return check;
     }
     // Best-effort: ldconfig cache, then the Debian/Ubuntu llvm layout.
-    if let Ok(out) = Command::new("ldconfig").arg("-p").output() {
-        if out.status.success() && String::from_utf8_lossy(&out.stdout).contains("libclang") {
-            return Check::new("libclang", Status::Ok, "found via ldconfig -p");
-        }
+    if let Ok(out) = Command::new("ldconfig").arg("-p").output()
+        && out.status.success()
+        && String::from_utf8_lossy(&out.stdout).contains("libclang")
+    {
+        return Check::new("libclang", Status::Ok, "found via ldconfig -p");
     }
     if let Some(dir) = find_llvm_lib_dir() {
         return Check::new("libclang", Status::Ok, dir.display().to_string());
