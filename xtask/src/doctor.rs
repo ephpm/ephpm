@@ -613,10 +613,10 @@ mod tests {
 
     #[test]
     fn msrv_comparison() {
-        assert!(meets_msrv((1, 85)));
+        assert!(meets_msrv((1, 88)));
         assert!(meets_msrv((1, 94)));
         assert!(meets_msrv((2, 0)));
-        assert!(!meets_msrv((1, 84)));
+        assert!(!meets_msrv((1, 87)));
         assert!(!meets_msrv((0, 99)));
     }
 

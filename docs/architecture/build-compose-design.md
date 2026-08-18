@@ -200,7 +200,7 @@ consults a process-global extra table. Two candidate wirings:
   contributes entries. Merely depending on the crate registers it —
   the closest analogue of xcaddy's "import = plugged in". Cost: a new
   dependency (`linkme`), MSRV/platform check needed (it supports the
-  tier-1 targets and musl; verify against Rust 1.85 before committing).
+  tier-1 targets and musl; verify against Rust 1.88 before committing).
 - **Fallback: generated `fn main`.** `crates/ephpm` exposes its `main` as
   `ephpm::run(extra: Option<ExtraRegistry>)`; forge generates a two-line
   binary crate `ephpm-custom` calling
