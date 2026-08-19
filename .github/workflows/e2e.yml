@@ -44,8 +44,8 @@ on:
 # both died mid-step with "The self-hosted runner lost communication with the
 # server" — on two separate attempts, with no logs uploaded — while its 8.4 leg
 # and all nine legs of the three earlier runs passed. Nothing about the commit
-# was at fault: that same tree is green locally on 8.3/8.4/8.5, and its own PR
-# run passed all three legs.
+# was at fault: that exact tree is green locally on 8.3/8.4/8.5, and every file
+# it changed is byte-identical to its PR head, whose own run passed all three.
 #
 # Grouping by ref means a burst of merges to main queues instead of piling up.
 # `cancel-in-progress` stays false on push so every commit on main still gets
