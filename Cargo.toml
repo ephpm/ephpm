@@ -119,7 +119,29 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire main @ defab22f0c2d — 0.2.0 (litewire#33–#35). Three batches:
+# litewire @ 344d2c23bf4e — PERF: the MySQL command filter now hands
+# opensrv-mysql a whole command packet per `poll_read` (litewire#37, ePHPm #322).
+#
+# The filter added in litewire#28 (pin cb707ab9) returned the four-byte packet
+# header plus the command byte on their own and made opensrv-mysql poll again
+# for the body. `PacketReader::next_async` loops until a packet parses and
+# escalates its scratch buffer from 4 KiB to 1 MiB on the SECOND iteration, so
+# splitting the header off guaranteed a `Vec::resize(1_048_576, 0)` — a 1 MiB
+# zeroing memset — for every command packet. That is the whole of the v0.7.0
+# wire regression measured in #322: 12.8% of cycles in
+# `__memset_avx2_unaligned_erms`, and −15.7% on a fresh-connection +
+# ten-point-SELECT wire benchmark, recovered to −0.5% of the v0.6.3 shape by
+# this pin. The in-process `ephpm_db_*` bridge never touches the MySQL frontend,
+# which is why the bridge half of the lab suite stayed flat throughout.
+#
+# Do not move this pin backwards past litewire#37 without re-measuring the wire
+# path: every pin from cb707ab9 to 10345a869d27 carries the 1 MiB memset.
+#
+# Previous pin 10345a869d27 — turso 0.7.0 → 0.7.2 (litewire#36). Code-identical
+# to defab22f0c2d; the only change is the engine pin. Measured neutral for the
+# wire path (±1% on the same benchmark), so it is NOT the #322 regression.
+#
+# Previous pin defab22f0c2d — 0.2.0 (litewire#33–#35). Three batches:
 # (1) litewire#34 SECURITY: lru 0.12.5 → 0.18.2, fixing RUSTSEC-2026-0253 — a
 # use-after-free reachable through the production TranslateCache. Do not move
 # this pin backwards past litewire#34. Same PR adds a server-side
@@ -292,7 +314,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "10345a869d27", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "ce52816ff842", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.0)
