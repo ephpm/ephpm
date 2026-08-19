@@ -386,18 +386,23 @@ CONTAINER_ENGINE=docker cargo xtask e2e --php-version 8.4
 
 ## GitHub Actions
 
-The E2E workflow (`.github/workflows/e2e.yml`) runs a matrix of PHP 8.4 and 8.5:
+The E2E workflow (`.github/workflows/e2e.yml`) runs a matrix of PHP 8.3, 8.4 and 8.5:
 
 ```yaml
+concurrency:
+  group: ephpm-e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 strategy:
+  fail-fast: false
   matrix:
-    php: ["8.4", "8.5"]
+    php: ["8.3", "8.5", "8.4"]
 steps:
-  - cargo xtask e2e-install
   - cargo xtask e2e --php-version ${{ matrix.php }}
 ```
 
-Each job builds ephpm with the specified PHP version, deploys it to a Kind cluster, and validates that `/index.php` reports the correct PHP version and embedded SAPI.
+Each job builds ephpm with the specified PHP version, spawns it as a bare process on 127.0.0.1, and runs the `ephpm-e2e` suites against it. No Kind cluster is involved — that path is opt-in via `cargo xtask k8s-e2e` and `.github/workflows/k8s-e2e.yml`.
+
+The concurrency group caps how many of these land on the self-hosted fleet at once: each leg is a full `lto = "fat"` release build with PHP statically linked, so a burst of merges could otherwise put a dozen of them on the box simultaneously and starve the runners. Pushes to main queue rather than cancel, so every commit keeps its own E2E result.
 
 ---
 
