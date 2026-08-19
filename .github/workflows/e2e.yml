@@ -28,15 +28,49 @@ on:
       - "docs/**"
       - "**.md"
 
-# NOTE: no `concurrency` group. Bare-process runs are independent - each job
-# spawns ephpm processes on high, per-run loopback ports and cleans up on exit.
-# Multiple E2E runs can share the runner without stepping on each other, and
-# the matrix legs can run in parallel.
+# Cap how many of these land on the ephemerd fleet at once.
+#
+# Bare-process runs are independent *of each other* — each job spawns ephpm on
+# high, per-run loopback ports and cleans up on exit, so there is no port or
+# state collision. That was the original reason this workflow had no
+# `concurrency` group at all. What that reasoning missed is the host: every leg
+# does a full `lto = "fat"`, `codegen-units = 1` release build of the whole
+# workspace plus a statically linked PHP (~2.3 GB peak RSS in the final rustc
+# invocation alone, on top of `-j$(nproc)` parallel rustc before it) into a
+# fresh ephemeral runner workspace.
+#
+# On 2026-08-19 four commits landed on main inside 74 seconds. That put twelve
+# of these legs on the fleet simultaneously; the last run's 8.3 and 8.5 legs
+# both died mid-step with "The self-hosted runner lost communication with the
+# server" — on two separate attempts, with no logs uploaded — while its 8.4 leg
+# and all nine legs of the three earlier runs passed. Nothing about the commit
+# was at fault: that exact tree is green locally on 8.3/8.4/8.5, and every file
+# it changed is byte-identical to its PR head, whose own run passed all three.
+#
+# Grouping by ref means a burst of merges to main queues instead of piling up.
+# `cancel-in-progress` stays false on push so every commit on main still gets
+# its own E2E result — that per-commit signal is what makes `git bisect` over CI
+# history possible, and it is how the 2026-08-19 incident was localized in the
+# first place. Pull requests do cancel superseded runs: only the head commit of
+# a PR needs to be green, and a force-push otherwise leaves a doomed run holding
+# three runners.
+#
+# Sibling precedent for capping fleet load: `build-memory.yml` and
+# `k8s-e2e.yml` both serialize repo-wide, and `nightly.yml` caps its macOS
+# matrix at 2 "to leave headroom on the Apple Silicon host".
+concurrency:
+  group: ephpm-e2e-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   e2e-bare:
     name: E2E bare-process (PHP ${{ matrix.php }})
     runs-on: [self-hosted, linux, x64]
+    # A healthy leg is 10-20 minutes (cold cache, full release build included).
+    # The GitHub default is 360, which turns a wedged runner into a six-hour
+    # hold on a fleet slot. Generous enough not to fire on a slow-but-working
+    # run, tight enough that a stuck one frees the runner the same hour.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

@@ -7,6 +7,22 @@ description: Diagnose a failing ephpm CI run (E2E, unit, deny, release). Use whe
 
 Work the ladder top-down. Each step either identifies the failure class or rules it out.
 
+## 0. No logs? Read the job's *annotation* before assuming a test failed
+
+The fleet regularly returns `BlobNotFound` / `log not found` for a failed job. That absence is itself a signal, and there is a second channel that still works:
+
+```bash
+gh api repos/ephpm/ephpm/actions/runs/<RUN_ID>/jobs \
+  --jq '.jobs[] | .name, ([.steps[] | "  \(.number). \(.name) => \(.conclusion//"null")"] | join("\n"))'
+gh api repos/ephpm/ephpm/check-runs/<JOB_ID>/annotations --jq '.[] | "\(.annotation_level): \(.message)"'
+```
+
+**A step with `conclusion: null` and `completed_at: null` did not fail — it never finished.** GitHub only records a step conclusion when the runner reports one, so a null conclusion on the step that was executing means the runner process died underneath it. A genuine test failure always leaves `conclusion: failure` on that step plus a completed `Complete job` step.
+
+- **Known signature — runner death**: annotation reads `The self-hosted runner lost communication with the server. Verify the machine is running and has a healthy network connection. Anything in your workflow that terminates the runner process, starves it for CPU/Memory, or blocks its network access can cause this error.` This is **infra, not your commit.** Missing logs follow from it: the runner never lived to upload them.
+- Corroborate before believing it — the cheap checks, in order: does the same tree pass on other matrix legs? Did the PR's own run of the identical tree pass? How many heavy jobs were on the fleet in that window (`gh run list --workflow=e2e.yml --limit 15` and compare `created_at`)? Precedent (2026-08-19): four commits landed on main in 74 seconds, twelve E2E legs hit the fleet at once, and the last run's 8.3/8.5 legs died this way on two attempts while its 8.4 leg and all nine earlier legs passed. The commit was innocent; `.github/workflows/e2e.yml` now carries a concurrency group to cap the pile-up.
+- Do **not** start bisecting a commit until this step rules runner death out. "Deterministic across re-runs" is not evidence of a code bug when the fleet stays saturated or degraded between attempts.
+
 ## 1. Read the failure summary FIRST (bottom of the E2E job log)
 
 Default path is `cargo xtask e2e` (bare-process). On failure it dumps each node's stderr file and prints a `==== FAILED E2E SUITES (bare-process) ====` block with the per-suite names.
@@ -47,7 +63,8 @@ The Windows/Linux runners are **ephemerd** JIT runners on Luther's box; macOS ru
 ## 4. Rerun rules
 
 - `gh run rerun <RUN_ID> --failed` is refused while any job in the run is still running/queued. **Cancel first, then rerun-failed** - completed-successful jobs (Linux legs, Docker) are preserved, only failed/cancelled legs re-execute. This also applies to release runs: never re-tag to retry.
-- E2E runs are serialized repo-wide via a concurrency group - "pending" E2E often just means another run holds the lock.
+- E2E runs are serialized **per ref** via a concurrency group (`ephpm-e2e-${{ github.ref }}`) - "pending" E2E often just means an earlier run on that same ref holds the lock. Pushes to main queue (every commit keeps its own result, so CI history stays bisectable); pull-request runs cancel in progress when superseded.
+- A re-run that dies the same way is not automatically a code bug. If step 0 said "lost communication", check the fleet box before re-running again - a host left short on memory or disk by an earlier burst will kill the next runner too. `.github/workflows/fleet-maintenance.yml` purges docker build cache/images on a node.
 
 ## 5. Repo-wide sudden failures
 
