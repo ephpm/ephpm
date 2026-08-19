@@ -744,10 +744,17 @@ impl PhpRuntime {
     pub fn set_max_execution_time(secs: u32) {
         #[cfg(php_linked)]
         {
+            // `c_long` is 64-bit on LP64 (Linux, macOS) but 32-bit on Windows
+            // (LLP64), so `u32` has no infallible conversion on every target —
+            // `i32: From<u32>` does not exist. Saturate instead: a configured
+            // limit above `c_long::MAX` seconds is ~68 years at 32-bit, which
+            // is indistinguishable from "no limit" for a request timeout.
+            let secs =
+                ::std::os::raw::c_long::try_from(secs).unwrap_or(::std::os::raw::c_long::MAX);
             // SAFETY: ephpm_set_max_execution_time only stores the value into a
             // C static; it touches no PHP runtime state and is safe to call from
             // the single-threaded startup path before the tokio runtime exists.
-            unsafe { ffi::ephpm_set_max_execution_time(::std::os::raw::c_long::from(secs)) };
+            unsafe { ffi::ephpm_set_max_execution_time(secs) };
         }
         #[cfg(not(php_linked))]
         {
