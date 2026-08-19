@@ -229,6 +229,22 @@ fn suite_needs_fresh_node(name: &str) -> bool {
     ISOLATED_DB_SUITES.contains(&name) || ISOLATED_CONFIG_SUITES.contains(&name)
 }
 
+/// Suites that need **no ephpm server at all** — they exec the release binary
+/// directly and assert on its stdout/stderr/exit status.
+///
+/// `cli` covers `ephpm php` (issue #321: fatals were silent and exited 0).
+/// Spawning an HTTP node for it would be pure waste, and worse, it would have
+/// to be a node whose config could never perturb — or be perturbed by — a
+/// suite that only ever runs a subprocess. So these run first, before any
+/// port is claimed, with just `EPHPM_CLI_BINARY` in the environment.
+///
+/// Note this is the ONLY place the binary path is handed to a suite that
+/// doesn't mount middleware; it deliberately uses a distinct variable name
+/// rather than `EPHPM_BINARY`, which `ephpm-e2e`'s self-managed fixtures treat
+/// as an opt-in switch (see `SingleNodeSpawn::env` for why exporting that one
+/// broadly breaks `bare_process_smoke`).
+const NO_NODE_SUITES: &[&str] = &["cli"];
+
 /// Test suites that must be excluded from bare-process runs entirely.
 ///
 /// A few historical suites were Kind-only (they poke Kubernetes services,
@@ -359,7 +375,24 @@ pub fn run(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // Suites that need no server run first and cheapest: no node, no ports.
+    let (no_node_suites, single_suites): (Vec<_>, Vec<_>) =
+        single_suites.into_iter().partition(|(name, _)| NO_NODE_SUITES.contains(&name.as_str()));
+
     let mut failed: Vec<String> = Vec::new();
+
+    if !no_node_suites.is_empty() {
+        eprintln!(
+            "==> Running {} server-less suite(s) directly against the binary...",
+            no_node_suites.len()
+        );
+        let env = vec![("EPHPM_CLI_BINARY".to_string(), ephpm_bin.to_string_lossy().into_owned())];
+        for (name, path) in &no_node_suites {
+            if !run_suite(name, path, &env) {
+                failed.push((*name).clone());
+            }
+        }
+    }
 
     // The `middleware` suite mounts a real loadable module by path, so a
     // cdylib has to exist before its node starts. Nothing else in the build

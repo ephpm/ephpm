@@ -4212,7 +4212,8 @@ static void cli_end(size_t (*orig_ub_write)(const char *, size_t))
  * SG(request_info).path_translated is deliberately left NULL: SAPI
  * deactivation efree()s it, so it must never point at C argv memory.
  */
-static void cli_register_argv(int argc, char **argv, int script_ind, const char *script_name)
+static void cli_register_argv(
+    int argc, char **argv, int script_ind, const char *script_name, int is_file)
 {
     argv[script_ind] = (char *)script_name;
     SG(request_info).argc = argc - script_ind;
@@ -4223,24 +4224,33 @@ static void cli_register_argv(int argc, char **argv, int script_ind, const char 
     php_build_argv(NULL, Z_TYPE_P(server) == IS_ARRAY ? server : NULL);
 
     if (Z_TYPE_P(server) == IS_ARRAY) {
-        static const char *const keys[] = {
-            "PHP_SELF", "SCRIPT_NAME", "SCRIPT_FILENAME", "PATH_TRANSLATED"
-        };
-        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        /* php-cli sets PHP_SELF/SCRIPT_NAME to the script identity in every
+         * mode, but SCRIPT_FILENAME/PATH_TRANSLATED only when a real file is
+         * being executed — for stdin programs and -r they are "" (verified
+         * against php 8.5 cli). */
+        static const char *const self_keys[] = { "PHP_SELF", "SCRIPT_NAME" };
+        static const char *const file_keys[] = { "SCRIPT_FILENAME", "PATH_TRANSLATED" };
+        for (size_t i = 0; i < sizeof(self_keys) / sizeof(self_keys[0]); i++) {
             zval tmp;
             ZVAL_STRING(&tmp, script_name);
-            zend_hash_str_update(Z_ARRVAL_P(server), keys[i], strlen(keys[i]), &tmp);
+            zend_hash_str_update(
+                Z_ARRVAL_P(server), self_keys[i], strlen(self_keys[i]), &tmp);
+        }
+        for (size_t i = 0; i < sizeof(file_keys) / sizeof(file_keys[0]); i++) {
+            zval tmp;
+            ZVAL_STRING(&tmp, is_file ? script_name : "");
+            zend_hash_str_update(
+                Z_ARRVAL_P(server), file_keys[i], strlen(file_keys[i]), &tmp);
         }
     }
 }
 
 /*
- * Helper: execute code or a file with bailout protection.
- * If `code` is non-NULL, evaluates it via zend_eval_string.
- * If `filename` is non-NULL, executes it via php_execute_script.
- * Returns the PHP exit status.
+ * Helper: evaluate raw code (-r, and the --rf/--rc/--re/--rz/--ri reflection
+ * flags) with bailout protection. Returns the PHP exit status. Scripts go
+ * through cli_execute_script_protected instead.
  */
-static int cli_execute_protected(const char *code, const char *filename)
+static int cli_eval_protected(const char *code, const char *label)
 {
     int result = 0;
     JMP_BUF *__orig_bailout = EG(bailout);
@@ -4248,20 +4258,22 @@ static int cli_execute_protected(const char *code, const char *filename)
 
     EG(bailout) = &__bailout;
     if (SETJMP(__bailout) == 0) {
-        if (code) {
-            zend_eval_string((char *)code, NULL, "ephpm php -r");
-        } else if (filename) {
-            zend_file_handle file_handle;
-            zend_stream_init_filename(&file_handle, filename);
-            php_execute_script(&file_handle);
-        }
+        /* handle_exceptions=1: an uncaught exception becomes the same
+         * E_ERROR php-cli reports ("Uncaught … in Command line code"),
+         * which sets EG(exit_status) = 255 — plain zend_eval_string would
+         * leave the exception pending and unreported. -r passes php-cli's
+         * own label so error messages are byte-identical. */
+        zend_eval_string_ex((char *)code, NULL, (char *)label, 1);
 
         /* PHP 8.x: exit() throws an unwind exit exception instead of
-         * calling zend_bailout(). Check for it after normal return. */
+         * calling zend_bailout(); clear it if still pending. Then take
+         * EG(exit_status) unconditionally — the engine catches fatals
+         * internally (its error handler already set exit_status to 255),
+         * so "0 unless we bailed" would drop exit()/fatal codes. */
         if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
             zend_clear_exception();
-            result = EG(exit_status);
         }
+        result = (int)EG(exit_status);
     } else {
         /* PHP bailed out (fatal error) */
         result = EG(exit_status);
@@ -4308,13 +4320,48 @@ static void cli_register_file_handles(void)
 }
 
 /*
- * Execute a program read from stdin, with bailout protection. Reads through
- * the C `stdin` FILE* via zend_stream_init_fp — the same mechanism php-cli
- * uses ("Standard input code"), which works in the embed build where the
- * `php://stdin` stream wrapper does not open for compilation. The program is
- * a real script (expects `<?php` tags), unlike -r's raw code.
+ * php-cli's name for a program that came from stdin. It is used verbatim as
+ * the compiled file name, the lint label, $argv[0] and $_SERVER['PHP_SELF'],
+ * exactly as stock php-cli does (php_cli.c: `php_self = "Standard input
+ * code"`), so error messages and script self-identification match.
  */
-static int cli_execute_stdin_protected(void)
+#define CLI_STDIN_NAME "Standard input code"
+
+/*
+ * Open the primary script source, mirroring php-cli's cli_seek_file_begin.
+ *
+ * A named file is fopen'd in binary mode and wrapped with zend_stream_init_fp
+ * — the same FILE*-backed handle php-cli compiles from, so reading is
+ * byte-exact (binary-safe, no CRLF translation) and the exact path is used
+ * with no include_path search. A NULL filename means the program comes from
+ * the process's stdin, which is how `php < script.php` and `… | php` work;
+ * that path also works in the embed build, where the `php://stdin` stream
+ * wrapper does not open for compilation.
+ *
+ * On failure prints php-cli's exact message and returns 0; the caller exits 1.
+ */
+static int cli_open_script(zend_file_handle *fh, const char *filename)
+{
+    if (filename) {
+        FILE *fp = VCWD_FOPEN(filename, "rb");
+        if (!fp) {
+            fprintf(stderr, "Could not open input file: %s\n", filename);
+            return 0;
+        }
+        zend_stream_init_fp(fh, fp, filename);
+    } else {
+        zend_stream_init_fp(fh, stdin, CLI_STDIN_NAME);
+    }
+    fh->primary_script = 1;
+    return 1;
+}
+
+/*
+ * Execute the primary script with bailout protection. `filename` NULL means
+ * "read the program from stdin". The program is a real script (expects
+ * `<?php` tags), unlike -r's raw code.
+ */
+static int cli_execute_script_protected(const char *filename)
 {
     int result = 0;
     JMP_BUF *__orig_bailout = EG(bailout);
@@ -4323,15 +4370,71 @@ static int cli_execute_stdin_protected(void)
     EG(bailout) = &__bailout;
     if (SETJMP(__bailout) == 0) {
         zend_file_handle file_handle;
-        zend_stream_init_fp(&file_handle, stdin, "Standard input code");
-        file_handle.primary_script = 1;
+        if (!cli_open_script(&file_handle, filename)) {
+            EG(bailout) = __orig_bailout;
+            return 1;
+        }
         php_execute_script(&file_handle);
         zend_destroy_file_handle(&file_handle);
 
+        /* See cli_eval_protected: exit()/fatal codes live in
+         * EG(exit_status) after php_execute_script returns. */
         if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
             zend_clear_exception();
-            result = EG(exit_status);
         }
+        result = (int)EG(exit_status);
+    } else {
+        result = EG(exit_status);
+        if (result == 0) result = 1;
+    }
+    EG(bailout) = __orig_bailout;
+    return result;
+}
+
+/*
+ * -l (lint), -w (strip) and -s (highlight), all bailout-protected and all
+ * accepting the program on stdin when `filename` is NULL — php-cli routes
+ * every one of these modes through the same file handle, so `php -l < f.php`
+ * and `… | php -w` work there and must work here. `mode` is the CLI option
+ * letter. Returns the exit code (255 for a lint failure, 1 if the file can't
+ * be opened, matching php-cli).
+ */
+static int cli_scan_protected(int mode, const char *filename, const char *php_self)
+{
+    /* volatile: assigned between SETJMP and a possible longjmp, then read
+     * after it — without this the value is indeterminate (and gcc warns
+     * -Wclobbered). */
+    volatile int result = 0;
+    JMP_BUF *__orig_bailout = EG(bailout);
+    JMP_BUF __bailout;
+
+    EG(bailout) = &__bailout;
+    if (SETJMP(__bailout) == 0) {
+        zend_file_handle file_handle;
+        if (!cli_open_script(&file_handle, filename)) {
+            EG(bailout) = __orig_bailout;
+            return 1;
+        }
+        if (mode == 'l') {
+            if (php_lint_script(&file_handle) == SUCCESS) {
+                php_printf("No syntax errors detected in %s\n", php_self);
+            } else {
+                php_printf("Errors parsing %s\n", php_self);
+                result = 255;
+            }
+        } else if (open_file_for_scanning(&file_handle) == SUCCESS) {
+            if (mode == 'w') {
+                zend_strip();
+            } else {
+                zend_syntax_highlighter_ini syntax_highlighter_ini;
+                php_get_highlight_struct(&syntax_highlighter_ini);
+                zend_highlight(&syntax_highlighter_ini);
+            }
+        }
+        /* php-cli destroys the handle once, after the mode has run
+         * (php_cli.c's `out:` label); the dtor NULLs the FILE* so this is
+         * safe whether or not the scanner already consumed it. */
+        zend_destroy_file_handle(&file_handle);
     } else {
         result = EG(exit_status);
         if (result == 0) result = 1;
@@ -4407,9 +4510,11 @@ static char *cli_read_line(FILE *fp, size_t *out_len)
 }
 
 /*
- * Install $argn (current line, trailing CR/LF stripped) and $argi (zero-based
- * line index) into the global symbol table for the -R/-F line processor, the
- * same variables php-cli exposes.
+ * Install $argn (current line, trailing CR/LF stripped) and $argi (line
+ * number) into the global symbol table for the -R/-F line processor, the
+ * same variables php-cli exposes. $argi is **1-based**: php-cli increments
+ * before assigning, so the first line is 1 (verified against php 8.5:
+ * `printf 'a\nb\n' | php -R 'echo $argi;'` prints 1 then 2).
  */
 static void cli_set_line_vars(const char *line, size_t len, zend_long argi)
 {
@@ -4444,17 +4549,19 @@ static int cli_process_stdin_lines(
     EG(bailout) = &__bailout;
     if (SETJMP(__bailout) == 0) {
         if (begin_code) {
-            zend_eval_string((char *)begin_code, NULL, "ephpm php -B");
+            zend_eval_string_ex(
+                (char *)begin_code, NULL, "Command line begin code", 1);
         }
         if (!(EG(exception) && zend_is_unwind_exit(EG(exception)))) {
             zend_long argi = 0;
             char *line;
             size_t len;
             while ((line = cli_read_line(stdin, &len)) != NULL) {
-                cli_set_line_vars(line, len, argi);
+                cli_set_line_vars(line, len, ++argi);
                 free(line);
                 if (per_line_code) {
-                    zend_eval_string((char *)per_line_code, NULL, "ephpm php -R");
+                    zend_eval_string_ex(
+                        (char *)per_line_code, NULL, "Command line run code", 1);
                 } else if (per_line_file) {
                     zend_file_handle fh;
                     zend_stream_init_filename(&fh, per_line_file);
@@ -4464,17 +4571,18 @@ static int cli_process_stdin_lines(
                 if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
                     break;
                 }
-                argi++;
             }
         }
         if (end_code && !(EG(exception) && zend_is_unwind_exit(EG(exception)))) {
-            zend_eval_string((char *)end_code, NULL, "ephpm php -E");
+            zend_eval_string_ex((char *)end_code, NULL, "Command line end code", 1);
         }
 
+        /* See cli_eval_protected: take EG(exit_status) unconditionally
+         * so exit() inside -B/-R/-F/-E code keeps its code. */
         if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
             zend_clear_exception();
-            result = EG(exit_status);
         }
+        result = (int)EG(exit_status);
     } else {
         result = EG(exit_status);
         if (result == 0) {
@@ -4643,7 +4751,6 @@ int ephpm_cli_main(int argc, char **argv)
                 "  -s               Output HTML syntax highlighted source\n"
                 "  -v               Version number\n"
                 "  -w               Output source with stripped comments and whitespace\n"
-                "  -z <file>        Load Zend extension <file>\n"
                 "\n"
                 "  args...          Arguments passed to script. Use -- args when first argument\n"
                 "                   starts with - or script is read from stdin\n"
@@ -4676,20 +4783,41 @@ int ephpm_cli_main(int argc, char **argv)
         case 14: /* --ri / --rextinfo   <name> */
         {
             /* Reflection info flags, matching php-cli. Implemented via the
-             * always-compiled Reflection extension; a bad name surfaces the
-             * ReflectionException, and the whole thing is bailout-protected. */
+             * always-compiled Reflection extension, and bailout-protected.
+             *
+             * The name is bound as $__ephpm_r rather than interpolated into
+             * the snippet: a name containing a quote would otherwise change
+             * the code being evaluated.
+             *
+             * A bad name is caught and reported as php-cli reports it —
+             * `Exception: <message>` on stdout with exit status 0, not an
+             * uncaught-exception fatal. --ri has its own message for an
+             * absent extension ("Extension 'x' not present."), also php-cli's.
+             */
+            zval reflect_name;
+            ZVAL_STRING(&reflect_name, php_optarg ? php_optarg : "");
+            zend_hash_str_update(
+                &EG(symbol_table), "__ephpm_r", sizeof("__ephpm_r") - 1, &reflect_name);
+
             const char *expr;
             switch (c) {
-            case 10: expr = "echo new ReflectionFunction('%s'), \"\\n\";"; break;
-            case 11: expr = "echo new ReflectionClass('%s'), \"\\n\";"; break;
-            case 12: expr = "echo new ReflectionExtension('%s'), \"\\n\";"; break;
-            case 13: expr = "echo new ReflectionZendExtension('%s'), \"\\n\";"; break;
-            default: expr = "(new ReflectionExtension('%s'))->info();"; break; /* --ri */
+            case 10: expr = "echo new ReflectionFunction($__ephpm_r), \"\\n\";"; break;
+            case 11: expr = "echo new ReflectionClass($__ephpm_r), \"\\n\";"; break;
+            case 12: expr = "echo new ReflectionExtension($__ephpm_r), \"\\n\";"; break;
+            case 13: expr = "echo new ReflectionZendExtension($__ephpm_r), \"\\n\";"; break;
+            default: /* --ri */
+                expr = "if (!extension_loaded($__ephpm_r)) {"
+                       "  echo \"Extension '\", $__ephpm_r, \"' not present.\\n\";"
+                       "} else { (new ReflectionExtension($__ephpm_r))->info(); }";
+                break;
             }
             char code[1024];
-            snprintf(code, sizeof(code), expr, php_optarg ? php_optarg : "");
+            snprintf(code, sizeof(code),
+                "try { %s } catch (Throwable $e) {"
+                "  echo 'Exception: ', $e->getMessage(), \"\\n\"; }",
+                expr);
             cli_begin(&orig_ub_write);
-            cli_execute_protected(code, NULL);
+            cli_eval_protected(code, "ephpm php reflection");
             php_output_end_all();
             cli_end(orig_ub_write);
             return 0;
@@ -4786,31 +4914,43 @@ int ephpm_cli_main(int argc, char **argv)
     /* Define STDIN/STDOUT/STDERR before any script runs, like php-cli. */
     cli_register_file_handles();
 
-    /* Determine whether the program/script comes from stdin. php-cli reads a
-     * program from stdin when no -r/-f/positional/line-mode is given, and `-`
-     * as the script name is the explicit stdin sentinel. Line mode (-R/-F)
-     * consumes stdin itself, so it is handled separately below. */
-    int want_lines = (line_code != NULL || line_file != NULL);
-    if (!script_file && !exec_direct && !want_lines) {
-        if (php_optind < argc && strcmp(argv[php_optind], "-") == 0) {
-            read_stdin = 1;
-            php_optind++; /* consume the "-" */
-        } else if (php_optind < argc && argv[php_optind][0] != '-') {
-            script_file = argv[php_optind];
-            php_optind++; /* consume it: what follows are the script's args */
-        } else if (php_optind >= argc) {
-            /* Nothing to run and nothing named — read the program from stdin. */
-            read_stdin = 1;
-        }
+    /* Pick up a positional script name, mirroring php-cli's condition
+     * (php_cli.c): only when no script is set yet, the mode is not -r or
+     * line-mode (both of which take no script file), and the previous argv
+     * slot is not "--" — everything after "--" belongs to the script, so
+     * `… | ephpm php -- a b` keeps reading the program from stdin. */
+    /* Any of -B/-R/-F/-E selects php-cli's stdin line-processing mode, so
+     * stdin is consumed as input lines rather than compiled as a program.
+     * (Verified: `printf 'a\n' | php -B 'echo "S\n";'` prints only S — the
+     * lines are read and discarded, not executed.) */
+    int want_lines =
+        (line_code != NULL || line_file != NULL || begin_code != NULL || end_code != NULL);
+    if (argc > php_optind && !script_file && !exec_direct && !want_lines
+        && strcmp(argv[php_optind - 1], "--") != 0) {
+        script_file = argv[php_optind];
+        php_optind++; /* consume it: what follows are the script's args */
     }
+
+    /* No script named and no -r/line-mode: the program comes from stdin.
+     * php-cli does this unconditionally (it does not test isatty), so an
+     * interactive `ephpm php` waits on stdin exactly as `php` does. Note
+     * php-cli has no `-` stdin sentinel: `php -` reports "Could not open
+     * input file: -", and so does this. */
+    if (!script_file && !exec_direct && !want_lines) {
+        read_stdin = 1;
+    }
+
+    /* Script identity, following php-cli: the script path when one was
+     * named, otherwise "Standard input code" — for stdin programs AND for
+     * -r (verified against php 8.5: `php -r 'var_dump($argv);'` prints
+     * $argv[0] === "Standard input code"). */
+    const char *php_self = script_file ? script_file : CLI_STDIN_NAME;
 
     /* Make script arguments visible to userland ($argv/$argc/$_SERVER).
      * argv[php_optind - 1] is repurposed as $argv[0] (php-cli does the
-     * same slot trick); "-" stands in for -r code and for stdin, matching
-     * php-cli (`echo '<?php var_dump($argv);' | php` → $argv[0] === "-"). */
+     * same slot trick). */
     if (script_file || exec_direct || read_stdin || want_lines) {
-        cli_register_argv(
-            argc, argv, php_optind - 1, script_file ? script_file : "-");
+        cli_register_argv(argc, argv, php_optind - 1, php_self, script_file != NULL);
     }
 
     /* CLI scripts routinely start with a shebang (artisan, composer, …);
@@ -4827,61 +4967,23 @@ int ephpm_cli_main(int argc, char **argv)
     } else if (mode == 'r' && exec_direct) {
         /* -r "code" */
         cli_begin(&orig_ub_write);
-        result = cli_execute_protected(exec_direct, NULL);
+        result = cli_eval_protected(exec_direct, "Command line code");
         cli_end(orig_ub_write);
-    } else if (mode == 'l') {
-        /* -l file | -l < stdin (syntax check) */
+    } else if (mode == 'l' || mode == 'w' || mode == 's') {
+        /* -l (lint), -w (strip), -s (highlight): a named file, or the
+         * program on stdin when none was named. */
         cli_begin(&orig_ub_write);
-        {
-            zend_file_handle file_handle;
-            const char *lint_label;
-            if (script_file) {
-                zend_stream_init_filename(&file_handle, script_file);
-                lint_label = script_file;
-            } else {
-                zend_stream_init_fp(&file_handle, stdin, "Standard input code");
-                lint_label = "-";
-            }
-            if (php_lint_script(&file_handle) == SUCCESS) {
-                php_printf("No syntax errors detected in %s\n", lint_label);
-            } else {
-                result = 255;
-            }
-            zend_destroy_file_handle(&file_handle);
-        }
+        result = cli_scan_protected(mode, script_file, php_self);
         php_output_end_all();
         cli_end(orig_ub_write);
-    } else if (script_file) {
-        /* Execute a file (standard mode, -w, -s) */
-        cli_begin(&orig_ub_write);
-        if (mode == 'w') {
-            char code[4096];
-            snprintf(code, sizeof(code),
-                "echo php_strip_whitespace('%s');", script_file);
-            cli_execute_protected(code, NULL);
-            php_output_end_all();
-        } else if (mode == 's') {
-            char code[4096];
-            snprintf(code, sizeof(code),
-                "highlight_file('%s');", script_file);
-            cli_execute_protected(code, NULL);
-            php_output_end_all();
-        } else {
-            result = cli_execute_protected(NULL, script_file);
-        }
-        cli_end(orig_ub_write);
-    } else if (read_stdin) {
-        /* Program read from stdin (piped or `-`). Executed as a real script
-         * (with <?php tags), so $argv[0] === "-" and file semantics match
-         * php-cli — unlike -r, which is raw code. */
-        cli_begin(&orig_ub_write);
-        result = cli_execute_stdin_protected();
-        cli_end(orig_ub_write);
     } else {
-        /* No script or code provided */
-        fprintf(stderr, "ephpm php: no input file\n"
-                        "Run 'ephpm php -h' for usage information.\n");
-        return 1;
+        /* Standard mode: execute a named script, or the program read from
+         * stdin (`ephpm php < file.php`, `… | ephpm php`). Both compile from
+         * a FILE*-backed handle, so `<?php` tags, $argv[0] and file
+         * semantics match php-cli — unlike -r, which is raw code. */
+        cli_begin(&orig_ub_write);
+        result = cli_execute_script_protected(script_file);
+        cli_end(orig_ub_write);
     }
 
     return result;
