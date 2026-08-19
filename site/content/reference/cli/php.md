@@ -102,12 +102,26 @@ ephpm php -l < src/Controller.php      # No syntax errors detected in Standard i
 cat src/Controller.php | ephpm php -w  # stripped source on stdout
 ```
 
-### Exit codes
+### Errors and exit codes
+
+Diagnostics go where php-cli sends them. `display_errors` defaults to on and
+routes to **stdout** (php-cli's CLI default), so a fatal error, an uncaught
+exception or a parse error prints the same `Fatal error:` / `Parse error:`
+block php-cli prints — including the file/line and the stack trace — whether
+the code came from `-r`, a script file, or stdin. Set `-d display_errors=stderr`
+to route them to stderr instead.
 
 Exit codes match php-cli: `exit(N)` yields `N`; an uncaught exception or fatal
 error yields `255`; a syntax error under `-l` yields `255` (with
 `Errors parsing <name>` on stdout); a script file that cannot be opened prints
 `Could not open input file: <path>` and yields `1`.
+
+> **Fixed in v0.7.1.** Up to and including v0.7.0, a fatal error or uncaught
+> exception under `ephpm php -r` printed **nothing** and exited `0`
+> ([#321](https://github.com/ephpm/ephpm/issues/321)) — the snippet was
+> evaluated without exception handling, so the thrown `Error`/`Exception` was
+> never reported and never set the exit status. Both halves are now pinned by
+> the `cli` E2E suite.
 
 ### Not supported
 
