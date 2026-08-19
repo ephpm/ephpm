@@ -1681,9 +1681,13 @@ mod tests {
     }
 
     #[test]
+    // Its own assertions are thread-local and would not need serializing, but
+    // `on_request_end()` also drains the process-global session graveyard —
+    // which would steal the sessions `teardown_tests` is asserting on. See the
+    // invariant documented above `mod teardown_tests`.
+    #[serial]
     fn request_end_without_a_session_is_a_noop() {
         // This test's thread never ran a query, so no session exists.
-        // (Thread-locals are per-test-thread; no #[serial] needed.)
         assert_eq!(thread_in_transaction(), None);
         on_request_end();
         assert_eq!(thread_in_transaction(), None);
@@ -2069,6 +2073,8 @@ mod screen_tests {
 mod per_site_tests {
     use std::collections::HashMap;
 
+    use serial_test::serial;
+
     use super::tests::TEST_RT;
     use super::*;
 
@@ -2115,7 +2121,12 @@ mod per_site_tests {
 
     /// The issue-#274 / pentest-C1 exploit, at the bridge level: site A writes
     /// a secret; site B must NOT be able to read it.
+    ///
+    /// Serialized because it calls `on_request_end()`, which drains the
+    /// process-global session graveyard `teardown_tests` asserts on — see the
+    /// invariant documented above `mod teardown_tests`.
     #[test]
+    #[serial]
     fn cross_tenant_read_is_impossible() {
         let dir = tempfile::tempdir().expect("tempdir");
         let a = open_turso(&dir.path().join("site-a.db"));
@@ -2209,10 +2220,40 @@ mod per_site_tests {
 //
 // These run against a real Turso backend on purpose: a mock connection has no
 // engine buffers to drop and would pass no matter what.
+//
+// ── Why every drain-touching test here is `#[serial]` ──────────────────
+//
+// The graveyard ([`PARKED_SESSIONS`]) and its accounting ([`PARKED_TOTAL`],
+// [`DRAINED_TOTAL`]) are **process-global by design**: any thread's request-end
+// must be able to reclaim any *other* retired thread's session, whatever bridge
+// it came from. `cargo test` runs the whole crate's tests as threads inside one
+// process, so a sibling test calling `on_request_end()` drains this test's
+// parked sessions first; this test's own drain then finds an empty graveyard
+// and its `DRAINED_TOTAL` delta stays at zero. That is a shared-state race, not
+// timing noise — it reproduced at ~32% of full-suite runs, and it is invisible
+// under `cargo nextest` (process per test) and `--test-threads=1`, which is why
+// CI mostly escaped it.
+//
+// Injecting a per-test graveyard was considered and rejected: the park path
+// runs *inside a TLS destructor*, where touching any Rust thread-local is
+// precisely the abort (#300) this machinery exists to prevent — so the
+// graveyard cannot be selected from thread-local state — and parks also
+// originate on libtest's own threads, which a test cannot instrument. Making
+// the graveyard per-bridge instead would break the global-reclaim property
+// that is the whole point of the design.
+//
+// So the exclusion is explicit instead. **Invariant: every test in this crate
+// that calls `on_request_end()` or `drain_parked_sessions()` must be
+// `#[serial]`** — a non-serial drainer anywhere in the crate re-opens this race.
+// Note that `#[serial]` is only needed against *drains*; a sibling thread
+// merely *parking* a session can never make these assertions fail, because
+// parks only ever add.
 #[cfg(test)]
 mod teardown_tests {
     use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
+
+    use serial_test::serial;
 
     use super::per_site_tests::{open_turso, per_site_bridge};
     use super::*;
@@ -2247,6 +2288,7 @@ mod teardown_tests {
     /// test binary aborts with `fatal runtime error: thread local panicked on
     /// drop`, which is exactly the production failure.
     #[test]
+    #[serial]
     fn retiring_thread_parks_its_session_instead_of_dropping_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bridge = one_site_bridge(dir.path(), "park.test");
@@ -2296,6 +2338,7 @@ mod teardown_tests {
     /// row is precisely the tokio blocking-pool reaping pattern that produced
     /// the abort under load.
     #[test]
+    #[serial]
     fn thread_churn_is_reclaimed_by_request_end() {
         let dir = tempfile::tempdir().expect("tempdir");
         let bridge = one_site_bridge(dir.path(), "churn.test");
@@ -2331,14 +2374,32 @@ mod teardown_tests {
     }
 
     /// Draining an empty graveyard is a cheap no-op, and repeated drains are
-    /// idempotent — it sits on the per-request path.
+    /// idempotent — it sits on the per-request path, so a back-to-back drain
+    /// must neither panic, deadlock, nor invent accounting.
+    ///
+    /// Asserted as the cumulative invariant (`drained <= parked`) rather than a
+    /// per-window delta. `#[serial]` excludes concurrent *drains*, but it
+    /// cannot stop an unrelated test's thread from retiring and *parking*
+    /// mid-test, and such a session can be counted as parked before this
+    /// window while being reclaimed inside it — which is correct behavior that
+    /// a delta assertion reads as a violation. (That is not theoretical: the
+    /// delta form failed 1 run in 150.) The cumulative form has no such window:
+    /// every drained session was parked first, and both totals only grow, so
+    /// reading `drained` before `parked` can never observe an inversion.
     #[test]
+    #[serial]
     fn draining_nothing_is_a_noop() {
         drain_parked_sessions();
-        let drained_before = drained_total();
         drain_parked_sessions();
         drain_parked_sessions();
-        assert_eq!(drained_total(), drained_before, "empty drains must not account anything");
+        // Read order matters: `drained` first, so a park+drain racing between
+        // the two loads can only widen the gap, never invert it.
+        let drained = drained_total();
+        let parked = parked_total();
+        assert!(
+            drained <= parked,
+            "a drain accounted a session that was never parked ({drained} drained > {parked} parked)"
+        );
     }
 
     // ── The platform behavior that makes #300 possible ──────────────────

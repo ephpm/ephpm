@@ -1963,7 +1963,16 @@ mod tests {
     ///
     /// The assertion is two-part on purpose: staying alive is not enough,
     /// the subscriber must still deliver the first real batch afterwards.
+    ///
+    /// `#[serial(cdc_registry)]` because this drives the production
+    /// `serve_subscriber`, which attaches to the process-global subscriber
+    /// registry in `turso_cdc_metrics`. Left concurrent, its subscriber
+    /// (attached at change_id 0) pulls that registry's `shipped` cursor to 0
+    /// and adds a `cursors` row underneath the gauge tests asserting on both —
+    /// the crate's dominant flake at 13/100 full-suite runs. See the group's
+    /// invariant documented on `turso_cdc_metrics::tests`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial(cdc_registry)]
     async fn cold_primary_holds_subscriber_open_until_first_write() {
         let db = tempfile::NamedTempFile::new().unwrap();
         let path = db.path().to_str().unwrap().to_string();

@@ -4813,6 +4813,46 @@ mod tests {
         }
     }
 
+    /// Makes the router's span callsites enabled **process-wide**, so a span
+    /// test's thread-local collector can actually see them.
+    ///
+    /// Without this, the span tests are order-dependent flakes. `tracing`
+    /// caches each callsite's `Interest` **globally and once**, at the callsite's
+    /// first hit: `DefaultCallsite::register` asks `DISPATCHERS.rebuilder()`,
+    /// which — with no global dispatcher installed — takes the `JustOne` path
+    /// and consults `dispatcher::get_default`, i.e. *whatever subscriber was
+    /// current on the thread that happened to hit the callsite first*. In this
+    /// crate's test binary that is almost always a plain router test with no
+    /// subscriber at all, whose `NoSubscriber` answers `Interest::never()` — and
+    /// that verdict is then cached for every thread, forever. A span test that
+    /// later installs a collector with `set_default` records nothing, and its
+    /// `spans` snapshot comes back empty.
+    ///
+    /// `set_default` alone does not fix it. It does trigger a full interest
+    /// rebuild (via `Dispatch::new` → `callsite::register_dispatch`), which
+    /// repairs callsites already registered by then — which is why the common
+    /// `http.request` callsite usually survives. But `php.execute` and
+    /// `worker.queue_wait` are hit by only a handful of tests, so they are
+    /// frequently *still unregistered* at that moment, and a concurrent
+    /// no-subscriber thread can register them — latching `never` — in the window
+    /// between the rebuild and the span test's own request.
+    ///
+    /// Installing a global default closes the window from both ends: the
+    /// `set_global_default` call rebuilds the cache (repairing anything already
+    /// latched `never`), and from then on the `JustOne` path resolves to this
+    /// `Registry` — which enables everything — no matter which thread registers
+    /// a callsite first. Collection stays per-test and thread-local; this
+    /// subscriber only exists to keep the callsites alive.
+    fn enable_span_callsites() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // A plain `Registry` enables every callsite and collects nothing.
+            // The error case (a global default already set) is not reachable
+            // here, and would be harmless anyway.
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
+    }
+
     impl<S> tracing_subscriber::Layer<S> for SpanTree
     where
         S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
@@ -4917,6 +4957,7 @@ mod tests {
     /// the dispatch but never answers, so the inner worker timeout fires.
     #[tokio::test(start_paused = true)]
     async fn worker_mode_records_queue_wait_and_emits_span_tree() {
+        enable_span_callsites();
         let tree = SpanTree::default();
         let subscriber = tracing_subscriber::registry().with(tree.clone());
         let _guard = tracing::subscriber::set_default(subscriber);
@@ -4992,6 +5033,7 @@ mod tests {
     /// the measurement points are identical.
     #[tokio::test]
     async fn fpm_mode_spans_and_timeline_have_no_queue_wait() {
+        enable_span_callsites();
         let tree = SpanTree::default();
         let subscriber = tracing_subscriber::registry().with(tree.clone());
         let _guard = tracing::subscriber::set_default(subscriber);
@@ -5046,6 +5088,7 @@ mod tests {
     async fn fpm_pool_engine_dispatches_php_request() {
         ephpm_php::PhpRuntime::init().expect("stub runtime init");
 
+        enable_span_callsites();
         let tree = SpanTree::default();
         let subscriber = tracing_subscriber::registry().with(tree.clone());
         let _guard = tracing::subscriber::set_default(subscriber);
