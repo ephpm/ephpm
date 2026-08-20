@@ -1,0 +1,178 @@
+# Windows PHP-linked compile check — the PR gate for LLP64 width bugs (#319).
+#
+# `php_linked` is only set by crates/ephpm-php/build.rs when PHP_SDK_PATH is
+# present, so regular PR CI (stub mode, Linux/macOS) never type-checks the FFI
+# code on Windows. Before this workflow, the only Windows PHP-linked compile
+# was release.yml's build-windows leg — which runs exclusively on a `v*` tag
+# push, so a Windows-only compile error (c_long is 32-bit on LLP64, 64-bit on
+# LP64) could not surface until a release was already tagged and parked on it.
+# That cost the v0.7.0 tag two cut cycles: 5x E0308 in ws_bridge (#318) and an
+# E0277 on `c_long::from(u32)` (#320).
+#
+# `cargo check -p ephpm-php` with PHP_SDK_PATH set is sufficient to catch that
+# class: it runs ephpm-php's build.rs for real (cl.exe compiles
+# ephpm_wrapper.c, bindgen parses the SDK headers) and type-checks every
+# #[cfg(php_linked)] path in the crate. No final-binary link, no LTO, no
+# release profile — the expensive parts of the release leg that a type error
+# never reaches anyway.
+#
+# Cost note: the ephemerd Windows runners are ephemeral and bare, so the VS
+# Build Tools install alone can take up to 20 minutes (the same install block
+# release.yml uses). The `paths:` filter below keeps that tax off every PR
+# that cannot introduce this bug class — only the FFI crate itself, the binary
+# crate's build.rs (it probes the same SDK), the SDK-download tooling, and
+# this workflow can.
+#
+# One PHP minor is enough: the LLP64 width-bug class is PHP-version-
+# independent, and 8.3 matches the first pin in xtask::PHP_SDK_VERSIONS and
+# the release matrix.
+
+name: Windows PHP Check
+
+on:
+  pull_request:
+    # `main` plus long-lived feature branches that other PRs stack onto — see
+    # the matching note in ci.yml.
+    branches: [main, "feat/**"]
+    # Everything OUTSIDE these paths skips the job entirely (no run, not a
+    # skipped-but-green run) — the 20-minute toolchain install is only paid
+    # when the change could actually break the Windows PHP-linked build.
+    paths:
+      - "crates/ephpm-php/**"
+      - "crates/ephpm/build.rs"
+      - "xtask/**"
+      - ".github/workflows/windows-php-check.yml"
+  # Manual escape hatch: exercise the job without opening a PR that touches a
+  # filtered path — e.g. to validate this workflow itself or a change to the
+  # Windows runner fleet.
+  workflow_dispatch:
+
+# Cap fleet pile-up per ref — same shape as e2e.yml (#324) and release.yml
+# (#325). Only a PR's head commit needs this signal, so a superseded PR run
+# cancels instead of holding the (small) Windows pool; a manual dispatch runs
+# on its own ref and is never cancelled by PR traffic.
+concurrency:
+  group: ephpm-windows-php-check-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-windows:
+    name: PHP-linked cargo check (PHP 8.3, windows-x86_64)
+    runs-on: [self-hosted, windows, x64]
+    # Toolchain provisioning dominates (up to ~20 min for VS Build Tools on a
+    # bare runner); the check itself is single-digit minutes. The GitHub
+    # default of 360 would turn a wedged runner into a six-hour hold on the
+    # only Windows pool.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- Toolchain provisioning ----------------------------------------
+      # The three steps below are copied from release.yml's build-windows job
+      # — keep them in sync with it. They stay separate, named steps on
+      # purpose: a red "Install ..." / "Enter ..." step is a runner or infra
+      # problem; only a red "cargo check" step is a real compile error in the
+      # change under test.
+
+      - name: Install Rust toolchain
+        shell: powershell
+        run: |
+          $cargoBin = "$env:USERPROFILE\.cargo\bin"
+          if (-not (Test-Path "$cargoBin\rustup.exe")) {
+            Write-Host "Installing rustup..."
+            Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+            .\rustup-init.exe -y --default-toolchain stable --profile minimal
+            Remove-Item rustup-init.exe
+          }
+          $env:PATH = "$cargoBin;$env:PATH"
+          $cargoBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          & "$cargoBin\rustup.exe" show
+
+      - name: Install Visual Studio Build Tools
+        shell: powershell
+        # Mirrors php-sdk's install block; runner image is bare so each
+        # job installs VS Build Tools fresh via the official bootstrapper.
+        run: |
+          $installPath = "C:\BuildTools"
+          $msbuild = "$installPath\MSBuild\Current\Bin\MSBuild.exe"
+          if (Test-Path $msbuild) {
+            Write-Host "VS Build Tools already present at $installPath"
+          } else {
+            Write-Host "Downloading VS Build Tools bootstrapper..."
+            Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_buildtools.exe" -OutFile vs_buildtools.exe
+            $proc = Start-Process -FilePath .\vs_buildtools.exe `
+              -ArgumentList @(
+                '--quiet', '--wait', '--norestart', '--nocache',
+                '--installPath', $installPath,
+                '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+                '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang',
+                '--includeRecommended'
+              ) -Wait -PassThru -NoNewWindow
+            Write-Host "Bootstrapper exit code: $($proc.ExitCode)"
+            Remove-Item vs_buildtools.exe
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            while (-not (Test-Path $msbuild) -and $sw.Elapsed.TotalMinutes -lt 20) {
+              Start-Sleep -Seconds 30
+              Write-Host ("  ...waiting for VS install ({0:F0}s)" -f $sw.Elapsed.TotalSeconds)
+            }
+            if (-not (Test-Path $msbuild)) {
+              Write-Host "::error::VS install timed out - $msbuild never appeared"
+              exit 1
+            }
+            Write-Host ("MSBuild.exe found after {0:F0}s" -f $sw.Elapsed.TotalSeconds)
+          }
+
+      - name: Enter MSVC developer environment
+        shell: powershell
+        run: |
+          $vcvars = "C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { Write-Error "vcvars64.bat not found"; exit 1 }
+          $envBefore = @{}
+          foreach ($e in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+            $envBefore[$e.Key] = $e.Value
+          }
+          $cmdLine = 'call "' + $vcvars + '" >NUL & set'
+          $output = & cmd /c $cmdLine
+          foreach ($line in $output) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              if ($envBefore[$matches[1]] -ne $matches[2]) {
+                "$($matches[1])=$($matches[2])" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+              }
+            }
+          }
+          $libclangDir = "C:\BuildTools\VC\Tools\Llvm\x64\bin"
+          if (Test-Path "$libclangDir\libclang.dll") {
+            "LIBCLANG_PATH=$libclangDir" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          } else {
+            Write-Warning "libclang.dll not found at $libclangDir -- bindgen may panic"
+          }
+
+      # ---- PHP SDK ---------------------------------------------------------
+      # Separate step for the same reason as the toolchain ones: a download
+      # failure (github.com/ephpm/php-sdk release missing, network) must not
+      # read as a compile failure.
+      - name: Download PHP SDK (8.3)
+        shell: powershell
+        run: cargo xtask php-sdk 8.3
+
+      # ---- The actual gate ---------------------------------------------------
+      - name: cargo check -p ephpm-php (PHP-linked)
+        shell: powershell
+        env:
+          # xtask's cache layout is php-sdk/<full-version>-<os>-<arch>/ with no
+          # libc suffix on Windows (php_sdk_dir_for in xtask/src/main.rs). The
+          # full version must match xtask::PHP_SDK_VERSIONS["8.3"] — same
+          # keep-in-sync rule as the release.yml matrix pins.
+          PHP_SDK_PATH: ${{ github.workspace }}\php-sdk\8.3.31-windows-x86_64
+          # sqlparser (a turso dependency, in this crate's graph via litewire)
+          # has deeply recursive AST types that overflow the Windows
+          # toolchain's default rustc thread stack in release.yml's build
+          # (STATUS_STACK_OVERFLOW, 0xc00000fd). A dev-profile check has not
+          # been observed to hit it, but the env var costs nothing and keeps
+          # this job's environment aligned with the release leg it stands in
+          # for.
+          RUST_MIN_STACK: "33554432"
+        run: cargo check -p ephpm-php

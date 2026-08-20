@@ -20,6 +20,7 @@ ephpm/
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml              # Lint, test, deny
+│       ├── windows-php-check.yml # PR-gated Windows PHP-linked cargo check
 │       └── release.yml         # Build matrix (PHP 8.3/8.4 × linux/mac/windows)
 ├── crates/
 │   ├── ephpm/                  # Binary crate (main entry point)
@@ -252,6 +253,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: cargo check --workspace
 ```
+
+### GitHub Actions: windows-php-check.yml
+
+Regular CI builds in stub mode (no `PHP_SDK_PATH`), so nothing above compiles
+the `#[cfg(php_linked)]` FFI code — and `c_long` width bugs (32-bit on
+Windows LLP64, 64-bit on Linux/macOS LP64) used to surface only in the
+release build matrix, after a tag was already pushed (#318, #320, tracked as
+#319).
+
+`windows-php-check.yml` closes that gap: on pull requests that touch
+`crates/ephpm-php/**`, `crates/ephpm/build.rs`, `xtask/**`, or the workflow
+itself, it runs `cargo check -p ephpm-php` on a `[self-hosted, windows, x64]`
+runner with `PHP_SDK_PATH` pointing at the PHP 8.3 SDK (downloaded via
+`cargo xtask php-sdk 8.3`). That runs the crate's `build.rs` for real —
+cl.exe compiles `ephpm_wrapper.c`, bindgen parses the SDK headers — and
+type-checks every PHP-linked code path, without the release build's linking
+or LTO cost. PRs not touching those paths skip the job entirely (the bare
+ephemeral Windows runners pay up to ~20 minutes of VS Build Tools install per
+job, so the filter matters). One PHP minor suffices: the LLP64 width-bug
+class is PHP-version-independent.
 
 ### GitHub Actions: release.yml
 
