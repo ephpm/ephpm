@@ -3766,8 +3766,10 @@ impl AutoTune {
                 "[php] opcache_jit = \"{}\" with sites_dir set: per-vhost OPcache \
                  invalidation does NOT reclaim JIT buffer, so each deploy permanently \
                  consumes some of the {}MB jit_buffer_size until the JIT silently stops \
-                 compiling new code (watch ephpm_opcache_jit_buffer_free_bytes; only a \
-                 full opcache_reset or a restart reclaims it)",
+                 compiling new code; only a restart (or full opcache_reset) reclaims it. \
+                 Watch ephpm_opcache_jit_buffer_free_bytes — note the multi-tenant \
+                 hardening preset removes the OPcache status API the gauge samples \
+                 unless [opcache] cluster_invalidation keeps it open",
                 self.jit.value.as_ini(),
                 self.jit_buffer_size.value
             ));

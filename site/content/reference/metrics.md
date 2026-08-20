@@ -132,7 +132,9 @@ These appear when a cluster-wide OPcache invalidation actually fires. When
 
 ## OPcache JIT
 
-The JIT buffer gauges are **sampled on the PHP request path** (the fpm dispatch closure and the worker-mode `take_request` loop), at most once per 10 s process-wide — `opcache_get_status()` needs a TSRM-registered PHP thread, so there is no background sampler. Consequences: the series **appear only after the first PHP request** on a PHP-linked build with OPcache loaded (stub builds and `opcache.enable=0` never record them), and with zero traffic they hold their last value (with zero traffic the JIT state cannot change). They are recorded whether the JIT is on or off, so "JIT off" reads as an honest `buffer_size = 0` rather than a missing series.
+The JIT buffer gauges are **sampled on the PHP request path** (the fpm dispatch closure and the worker-mode `take_request` loop), at most once per 10 s process-wide — `opcache_get_status()` needs a TSRM-registered PHP thread, so there is no background sampler. Consequences: the series **appear only after the first PHP request** in fpm mode (in worker mode, as soon as a worker boots and parks) on a PHP-linked build with OPcache active (stub builds and `opcache.enable=0` never record them), and with zero traffic they hold their last value (with zero traffic the JIT state cannot change). They are recorded whether the JIT is on or off, so "JIT off" reads as an honest `buffer_size = 0` rather than a missing series.
+
+**Multi-tenant caveat:** the multi-tenant hardening preset (default with `sites_dir`) removes `opcache_get_status` from the function table unless [`[opcache] cluster_invalidation`](/reference/config/#opcache) keeps the OPcache API open — with the API removed, the sampler has nothing to call and these gauges never record. If you force the JIT on in multi-tenant mode (the case where `buffer_free` matters most), enable cluster invalidation to keep the gauge alive, or accept flying blind — the startup WARN spells this out.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
