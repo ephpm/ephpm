@@ -2,4 +2,3 @@
 # zend_extension at all, so the upstream side needs its normal ini to have
 # opcache present; enable_cli/jit are then forced by -d on both sides.
 no_default_ini = true
-xfail = "opcache never activates in ephpm one-shot CLI: opcache_get_status(false) === false despite opcache.enable_cli=1, JIT flags silently no-op (#331; fix in flight — when this XPASSes, remove the marker)"

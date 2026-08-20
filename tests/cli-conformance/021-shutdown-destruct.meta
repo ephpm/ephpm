@@ -1,1 +1,0 @@
-xfail = "register_shutdown_function callbacks and end-of-script object destructors never run in ephpm php (#334; when this XPASSes, remove the marker)"
