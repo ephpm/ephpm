@@ -2014,8 +2014,6 @@ mod disable_functions_tests {
 
 #[cfg(test)]
 mod cli_tests {
-    use clap::Parser as _;
-
     use super::*;
 
     #[test]
