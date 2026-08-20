@@ -13,8 +13,7 @@ This document describes the full vision for ePHPm. The matrix below tracks what 
 | HTTP/1.1 | **Implemented** | hyper server, async accept loop |
 | HTTP/2 | **Implemented** | Negotiated over TLS via ALPN (`h2` + `http/1.1`); plain TCP listeners are HTTP/1.1 only |
 | TLS / ACME | **Implemented** | `rustls` + `rustls-acme` in `ephpm-server` |
-| PHP embedding (ZTS) | **Implemented** | Full SAPI, concurrent via `spawn_blocking` + per-thread TSRM |
-| PHP embedding (NTS / Windows) | **Implemented** | Serialized execution; Windows DLL constraints prevent ZTS |
+| PHP embedding (ZTS) | **Implemented** | Full SAPI, concurrent via `spawn_blocking` + per-thread TSRM — every platform, Windows included (#326) |
 | Static file serving | **Implemented** | MIME detection, path traversal protection |
 | Request routing | **Implemented** | `.php` → PHP, pretty permalinks → `index.php`, else static |
 | Configuration | **Implemented** | Figment — TOML + `EPHPM_` env var overrides |
@@ -1656,7 +1655,7 @@ The original MVP — single binary, hyper + PHP, TOML config, WordPress demo —
 **Foundations** — complete:
 
 - HTTP/1.1 (hyper + tokio), static files, `.php` routing, pretty-permalink fallback
-- PHP embedding via custom SAPI: ZTS on Linux/macOS (concurrent via `spawn_blocking` + per-thread TSRM), NTS on Windows (serialized, due to DLL constraints)
+- PHP embedding via custom SAPI: ZTS on every platform, Windows included (concurrent via `spawn_blocking` + per-thread TSRM; #326)
 - Figment-based config: TOML + `EPHPM_*` env var overrides
 - TLS + ACME (`rustls` + `rustls-acme`)
 
@@ -1759,8 +1758,7 @@ PHP is statically linked into the binary via FFI — zero IPC overhead, Rust cal
 
 | Variant | Concurrency | Status |
 |---------|-------------|--------|
-| ZTS | `spawn_blocking` + per-thread TSRM — concurrent PHP execution | **Implemented** |
-| NTS (Windows) | `Mutex` + `spawn_blocking` — serialized execution | **Implemented** |
+| ZTS (every platform, Windows included — #326) | `spawn_blocking` + per-thread TSRM — concurrent PHP execution | **Implemented** |
 
 ### Thread Safety: ZTS
 
