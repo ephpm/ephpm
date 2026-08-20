@@ -9,6 +9,7 @@
 //! Locally an unset `MYSQL_TEST_URL` skips; in CI it is a failure. See
 //! `tests/common/mod.rs` for why.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ephpm_db::ResetStrategy;
@@ -37,6 +38,13 @@ fn test_pool_config() -> PoolConfig {
 
 /// Boot a [`MySqlProxy`] on a random OS-assigned port and return the listen
 /// address (e.g. `127.0.0.1:XXXXX`).
+///
+/// The listener is bound exactly once and handed to [`MySqlProxy::run_on`] —
+/// never dropped and rebound. Dropping a `:0` listener and rebinding its port
+/// races other test processes doing the same, and the old ready-poll would
+/// then happily connect to *their* proxy (see `caching_sha2_auth.rs`). No
+/// readiness poll is needed: the listener is live before this function
+/// returns; early clients queue in the kernel accept backlog.
 async fn start_proxy(
     backend_url: &str,
     pool_config: PoolConfig,
@@ -44,8 +52,7 @@ async fn start_proxy(
 ) -> String {
     // Bind to port 0 so the OS assigns a free port.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let listen_addr = addr.to_string();
+    let listen_addr = listener.local_addr().unwrap().to_string();
 
     // Build the proxy pointed at the real backend.
     let proxy = MySqlProxy::new(
@@ -63,27 +70,14 @@ async fn start_proxy(
     .await
     .expect("failed to create MySqlProxy");
 
-    // Drop the listener we used for port discovery — the proxy will re-bind.
-    drop(listener);
-
-    // Give the OS a moment to release the port before the proxy re-binds.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Run the proxy in the background.
+    // Run the proxy in the background on the listener bound above.
     tokio::spawn(async move {
-        if let Err(e) = proxy.run().await {
+        if let Err(e) = proxy.run_on(Arc::new(listener)).await {
             eprintln!("proxy stopped: {e}");
         }
     });
 
-    // Wait for the proxy listener to be ready.
-    for _ in 0..50 {
-        if tokio::net::TcpStream::connect(&listen_addr).await.is_ok() {
-            return listen_addr;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("proxy did not become ready at {listen_addr}");
+    listen_addr
 }
 
 /// Boot a [`MySqlProxy`] with read/write splitting enabled and one replica
@@ -113,22 +107,14 @@ async fn start_proxy_rw_split(
     .await
     .expect("failed to create MySqlProxy");
 
-    drop(listener);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
+    // Same single-bind pattern as `start_proxy` — see the comment there.
     tokio::spawn(async move {
-        if let Err(e) = proxy.run().await {
+        if let Err(e) = proxy.run_on(Arc::new(listener)).await {
             eprintln!("proxy stopped: {e}");
         }
     });
 
-    for _ in 0..50 {
-        if tokio::net::TcpStream::connect(&listen_addr).await.is_ok() {
-            return listen_addr;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("proxy did not become ready at {listen_addr}");
+    listen_addr
 }
 
 /// Build a `mysql_async` connection opts that route through the proxy.

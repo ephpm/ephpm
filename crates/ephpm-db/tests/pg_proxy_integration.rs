@@ -30,6 +30,7 @@
 //!     cargo test -p ephpm-db --test pg_proxy_integration -- --ignored
 //! ```
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use ephpm_db::ResetStrategy;
@@ -58,14 +59,20 @@ fn test_pool_config() -> PoolConfig {
 
 /// Boot a [`PgProxy`] on a random OS-assigned port and return the listen
 /// address (e.g. `127.0.0.1:XXXXX`).
+///
+/// The listener is bound exactly once and handed to [`PgProxy::run_on`] —
+/// never dropped and rebound. Dropping a `:0` listener and rebinding its port
+/// races other test processes doing the same, and the old ready-poll would
+/// then happily connect to *their* proxy (see `caching_sha2_auth.rs`). No
+/// readiness poll is needed: the listener is live before this function
+/// returns; early clients queue in the kernel accept backlog.
 async fn start_proxy(
     backend_url: &str,
     pool_config: PoolConfig,
     reset_strategy: ResetStrategy,
 ) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let listen_addr = addr.to_string();
+    let listen_addr = listener.local_addr().unwrap().to_string();
 
     let proxy = PgProxy::new(
         backend_url,
@@ -81,22 +88,13 @@ async fn start_proxy(
     .await
     .expect("failed to create PgProxy — backend handshake failed");
 
-    drop(listener);
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
     tokio::spawn(async move {
-        if let Err(e) = proxy.run().await {
+        if let Err(e) = proxy.run_on(Arc::new(listener)).await {
             eprintln!("proxy stopped: {e}");
         }
     });
 
-    for _ in 0..50 {
-        if tokio::net::TcpStream::connect(&listen_addr).await.is_ok() {
-            return listen_addr;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("proxy did not become ready at {listen_addr}");
+    listen_addr
 }
 
 /// Build a `tokio_postgres` config that routes through the proxy.

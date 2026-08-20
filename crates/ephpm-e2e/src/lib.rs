@@ -87,7 +87,7 @@ impl SingleNodeFixture {
         let stdout = fs::File::create(tmp.path().join("stdout.log")).context("open stdout log")?;
         let stderr = fs::File::create(tmp.path().join("stderr.log")).context("open stderr log")?;
 
-        let child = Command::new(ephpm_binary)
+        let mut child = Command::new(ephpm_binary)
             .args(["serve", "--config"])
             .arg(&config_path)
             .stdout(Stdio::from(stdout))
@@ -95,7 +95,7 @@ impl SingleNodeFixture {
             .spawn()
             .with_context(|| format!("spawn ephpm ({})", ephpm_binary.display()))?;
 
-        wait_for_health(http_port, Duration::from_secs(15)).await.with_context(|| {
+        wait_for_health(&mut child, http_port, Duration::from_secs(15)).await.with_context(|| {
             format!(
                 "ephpm on 127.0.0.1:{http_port} never healthy — check {}",
                 tmp.path().join("stderr.log").display()
@@ -211,14 +211,15 @@ impl ClusterFixture {
             });
         }
 
-        for (i, node) in nodes.iter().enumerate() {
+        for (i, node) in nodes.iter_mut().enumerate() {
             let port: u16 = node
                 .base_url
                 .rsplit(':')
                 .next()
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| anyhow!("could not parse port from {}", node.base_url))?;
-            wait_for_health(port, Duration::from_secs(20))
+            let child = node.child.as_mut().ok_or_else(|| anyhow!("node {i} has no child"))?;
+            wait_for_health(child, port, Duration::from_secs(20))
                 .await
                 .with_context(|| format!("cluster node {i} never healthy"))?;
         }
@@ -256,8 +257,15 @@ struct ClusterPorts {
 /// then dropping the listener.
 ///
 /// There is an inherent TOCTOU here — the port may be re-issued before ephpm
-/// binds it — but for a test fixture that only ever runs one topology at a
-/// time this is acceptable in practice.
+/// binds it — and unlike the in-process proxy tests (which now bind once and
+/// hand the live listener to `run_on`) it cannot be engineered away: the
+/// ports cross a process boundary through a generated config file, and
+/// `ephpm serve` has no way to inherit an already-bound socket. The race
+/// fails closed rather than cross-wired: a stolen port makes the child's own
+/// bind fail and the child exit, which `wait_for_health` detects and reports
+/// immediately instead of health-probing a port someone else may now own.
+/// For a fixture that runs one topology at a time this is acceptable in
+/// practice.
 async fn reserve_loopback_port() -> Result<u16> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind :0")?;
     let port = listener.local_addr().context("local_addr")?.port();
@@ -265,10 +273,23 @@ async fn reserve_loopback_port() -> Result<u16> {
     Ok(port)
 }
 
-async fn wait_for_health(port: u16, timeout: Duration) -> Result<()> {
+/// Poll `child`'s health endpoint until it answers 200, the child exits, or
+/// `timeout` elapses.
+///
+/// The child-exit check is load-bearing for the reserved-port TOCTOU (see
+/// [`reserve_loopback_port`]): a stolen port makes the child fail its bind
+/// and exit, and without the check the poll could get a 200 from whatever
+/// *else* is listening there and hand the test a stranger's server.
+async fn wait_for_health(child: &mut Child, port: u16, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut last_err = String::from("no attempts made");
     while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().context("try_wait on ephpm child")? {
+            return Err(anyhow!(
+                "ephpm exited ({status}) before reporting healthy — \
+                 possibly its reserved port was taken; check its stderr log"
+            ));
+        }
         match tokio::task::spawn_blocking(move || tcp_get(port, "/_ephpm/health"))
             .await
             .map_err(|e| anyhow!("join error: {e}"))?
