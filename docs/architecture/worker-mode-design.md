@@ -730,12 +730,15 @@ The original (now historical) decision text:
   *even more* favorable: the framework is compiled once at boot and every
   subsequent request hits warm opcache with zero recompilation. This is a large
   part of the win.
-- **JIT:** the JIT buffer is process-wide (SHM). Long-lived workers are ideal
-  for JIT — hot paths get traced/compiled once and stay hot. No special
-  handling needed; ensure `opcache.jit_buffer_size` is set via the generated
+- **JIT:** the JIT buffer is process-wide (SHM). Long-lived workers are in
+  theory ideal for JIT — hot paths get traced/compiled once and stay hot.
+  Ensure `opcache.jit_buffer_size` is set via the generated
   ini (the ini-file-via-MINIT path, `main.rs:506-517`) not runtime
   `ini_set`, since runtime ini changes don't propagate to TSRM threads
-  (that comment, `:505-511`).
+  (that comment, `:505-511`). *Status (v0.7.3):* the shaped `[php]
+  opcache_jit` default keeps the JIT **off** in worker mode until the
+  combination is positively verified against the persistent-worker request
+  lifecycle; it is an explicit opt-in there.
 - **Preloading (`opcache.preload`):** runs once at module startup, before any
   worker boots — fully compatible and a natural pairing with worker mode
   (per-vhost preload is a roadmap item, out of Phase 1).

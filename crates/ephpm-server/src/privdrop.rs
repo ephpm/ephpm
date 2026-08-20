@@ -156,6 +156,11 @@ pub fn drop_privileges(config: &Config) -> anyhow::Result<()> {
 }
 
 /// Windows / non-Unix stub: privilege drop is not supported.
+///
+/// # Errors
+///
+/// Never fails on non-Unix — the `run_as_*` knobs are ignored with a WARN.
+/// (The `Result` shape matches the Unix implementation.)
 #[cfg(not(unix))]
 pub fn drop_privileges(config: &Config) -> anyhow::Result<()> {
     if config.server.run_as_user.is_some() || config.server.run_as_group.is_some() {

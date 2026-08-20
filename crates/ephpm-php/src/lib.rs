@@ -4,6 +4,7 @@
 
 pub mod crash_guard;
 pub mod db_bridge;
+pub mod jit_metrics;
 pub mod kv_bridge;
 pub mod request;
 pub mod response;
@@ -202,6 +203,15 @@ mod ffi {
         /// Class+message of the last exception observed by the invalidator
         /// on this thread ("Class: msg"; empty string when none).
         pub fn ephpm_opcache_last_exception() -> *const ::std::os::raw::c_char;
+
+        /// Read `opcache_get_status(false)['jit']` buffer stats (bytes).
+        /// Returns `0` on success (outputs written), or the same negative
+        /// failure codes as `ephpm_opcache_invalidate_under`. Same calling
+        /// contract: TSRM-registered thread with an active request context.
+        pub fn ephpm_opcache_jit_stats(
+            buffer_size: *mut ::std::os::raw::c_ulonglong,
+            buffer_free: *mut ::std::os::raw::c_ulonglong,
+        ) -> ::std::os::raw::c_long;
     }
 }
 
@@ -1651,6 +1661,50 @@ impl PhpRuntime {
     #[cfg(not(php_linked))]
     #[must_use]
     pub fn opcache_invalidate_under(_docroot: &std::path::Path) -> Option<i64> {
+        None
+    }
+
+    /// Read the OPcache JIT buffer stats: `(buffer_size, buffer_free)` in
+    /// bytes, from `opcache_get_status(false)['jit']`.
+    ///
+    /// Returns `None` when OPcache is unavailable (extension missing /
+    /// disabled), PHP is not initialized, or a bailout/exception occurred
+    /// inside the status call. A JIT that is merely *disabled* still returns
+    /// `Some((0, 0))`-shaped honest values (`buffer_size` is 0 with no
+    /// `opcache.jit_buffer_size`).
+    ///
+    /// Same calling contract as [`Self::opcache_invalidate_under`]: safe on a
+    /// TSRM-registered `spawn_blocking` thread (the router's PHP dispatch
+    /// closure) and on a worker-mode thread inside its long-lived request.
+    ///
+    /// In stub mode (no `php_linked`) always returns `None`.
+    #[cfg(php_linked)]
+    #[must_use]
+    pub fn opcache_jit_stats() -> Option<(u64, u64)> {
+        if !PHP_INITIALIZED.load(Ordering::Acquire) {
+            return None;
+        }
+        if Self::ensure_thread_registered().is_err() {
+            return None;
+        }
+        let mut size: std::os::raw::c_ulonglong = 0;
+        let mut free: std::os::raw::c_ulonglong = 0;
+        // SAFETY: both pointers reference live stack locals; the FFI helper
+        // runs under a SETJMP bailout guard, writes the outputs only on
+        // success, and does not retain the pointers past the call.
+        let rc = unsafe { ffi::ephpm_opcache_jit_stats(&raw mut size, &raw mut free) };
+        if rc == 0 {
+            Some((u64::from(size), u64::from(free)))
+        } else {
+            tracing::trace!(code = rc, "opcache jit stats unavailable");
+            None
+        }
+    }
+
+    /// Stub when PHP is not linked.
+    #[cfg(not(php_linked))]
+    #[must_use]
+    pub fn opcache_jit_stats() -> Option<(u64, u64)> {
         None
     }
 }

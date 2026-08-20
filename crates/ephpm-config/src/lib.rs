@@ -2221,16 +2221,59 @@ pub struct PhpConfig {
     /// Override `opcache.jit_buffer_size` (MB reserved for the JIT).
     ///
     /// When unset, ePHPm auto-derives a buffer size (~1/64 of the memory
-    /// budget, clamped `[32, 64]` MB) and emits it in serve mode. **This does
-    /// NOT enable JIT.** `opcache.jit` is left at PHP's default (opt-in via
-    /// `ini_overrides`): JIT helps CPU-bound workloads but can regress the
-    /// I/O-bound request path typical of web apps, so auto-enabling it is a
-    /// separate benched decision. The buffer is merely pre-sized so enabling
-    /// JIT later needs no config change.
+    /// budget, clamped `[32, 64]` MB) and emits it in serve mode. This sizes
+    /// the buffer only — whether the JIT *uses* it is governed by
+    /// [`Self::opcache_jit`] (shaped default: tracing in single-site serve,
+    /// disable elsewhere). When the JIT is on and no size was derived (dev
+    /// mode), the same derivation is forced so an enabled JIT is never
+    /// silently bufferless. An explicit `0` is respected but makes the JIT
+    /// inert — startup warns.
     ///
-    /// Default: `None` (auto-derived buffer in serve; JIT still off).
+    /// Default: `None` (auto-derived buffer in serve; JIT state is governed
+    /// by [`Self::opcache_jit`]).
     #[serde(default)]
     pub opcache_jit_buffer_size: Option<u32>,
+
+    /// OPcache JIT mode (`opcache.jit`): `"tracing"`, `"function"`, or
+    /// `"disable"`.
+    ///
+    /// When set explicitly it wins in **every** mode (dev, serve, worker,
+    /// multi-tenant) and is written into the generated php.ini as
+    /// `opcache.jit=<value>`; a non-`disable` value also guarantees a
+    /// non-zero `opcache.jit_buffer_size` (the autotune-derived size, see
+    /// [`Self::opcache_jit_buffer_size`]).
+    ///
+    /// When **absent**, ePHPm picks a shaped default:
+    ///
+    /// - **Single-site `ephpm serve`** (no `[server] sites_dir`, `[php] mode`
+    ///   not `"worker"`): **`tracing`** — measured ~2.4x on CPU-bound PHP
+    ///   (Windows CPU loop 5.56 ms → 2.33 ms) and verified working in the
+    ///   ZTS embed serve mode. The single-process embed avoids the classic
+    ///   multi-process SHM JIT failure modes.
+    /// - **Multi-tenant serve** (`[server] sites_dir` set): **`disable`** —
+    ///   per-vhost deploys invalidate OPcache via `opcache_invalidate`, and
+    ///   invalidation **never reclaims JIT buffer** (measured: `buffer_free`
+    ///   is untouched; only a full `opcache_reset` reclaims, and that is
+    ///   disabled by the multi-tenant hardening preset). Deploy churn would
+    ///   silently fill the buffer until the JIT stops compiling with no
+    ///   error. Set the knob explicitly to accept that cost.
+    /// - **Worker mode** (`[php] mode = "worker"`): **`disable`** — the JIT
+    ///   has not been positively verified against the persistent-worker
+    ///   request lifecycle (one long-lived PHP request per worker). Opt in
+    ///   explicitly if your workload benefits.
+    /// - **Dev mode**: **`disable`** via PHP's own defaults (no
+    ///   `opcache.jit` line is emitted).
+    ///
+    /// Escape hatch: a suspected JIT miscompile is turned off with
+    /// `opcache_jit = "disable"` — no other change required. Watch the
+    /// `ephpm_opcache_jit_buffer_free_bytes` gauge for buffer exhaustion.
+    ///
+    /// Env override: `EPHPM_PHP__OPCACHE_JIT`.
+    ///
+    /// Default: `None` (shaped: `tracing` in single-site serve, `disable`
+    /// in multi-tenant / worker / dev).
+    #[serde(default)]
+    pub opcache_jit: Option<JitMode>,
 
     /// Override `opcache.max_accelerated_files` (cap on cached script slots).
     ///
@@ -2987,6 +3030,7 @@ impl Default for PhpConfig {
             opcache_memory_consumption: None,
             opcache_interned_strings_buffer: None,
             opcache_jit_buffer_size: None,
+            opcache_jit: None,
             opcache_max_accelerated_files: None,
             php_memory_limit: None,
             realpath_cache_size: None,
@@ -3109,7 +3153,9 @@ impl PhpConfig {
     /// the derivation.
     #[must_use]
     pub fn effective_memory_limit(&self, dev_mode: bool) -> String {
-        self.autotune(dev_mode).memory_limit.value
+        // memory_limit does not depend on the tenancy shape, so the
+        // multi-tenant flag is irrelevant here.
+        self.autotune(dev_mode, false).memory_limit.value
     }
 
     /// Compute the full resource-aware tuning profile for this run.
@@ -3125,8 +3171,13 @@ impl PhpConfig {
     /// values from the detected resources; dev mode keeps PHP-friendly defaults
     /// (timestamp validation on, assertions on, loose realpath) so the
     /// edit-refresh loop stays tight. Explicit config still wins in either mode.
+    ///
+    /// `multi_tenant` is `true` when `[server] sites_dir` is set — it shapes
+    /// the `opcache.jit` default (JIT off in multi-tenant mode, because
+    /// per-vhost invalidation never reclaims JIT buffer; see
+    /// [`Self::opcache_jit`]).
     #[must_use]
-    pub fn autotune(&self, dev_mode: bool) -> AutoTune {
+    pub fn autotune(&self, dev_mode: bool, multi_tenant: bool) -> AutoTune {
         let (mem_budget, mem_source) = detect_memory_budget();
         let cpu_quota = read_cgroup_cpu_quota();
         let (workers, worker_source) = self.effective_worker_count_with_source();
@@ -3154,6 +3205,45 @@ impl PhpConfig {
             },
         };
 
+        // opcache.jit: explicit knob wins everywhere; otherwise the shaped
+        // default — tracing in single-site serve, disable in multi-tenant
+        // (invalidation never reclaims JIT buffer), worker mode (not
+        // positively verified against the persistent-worker lifecycle), and
+        // dev (line omitted, PHP defaults keep the JIT off).
+        let worker_mode = self.mode == "worker";
+        let (jit_mode, jit_reason) = match self.opcache_jit {
+            Some(mode) => {
+                (TunedValue { value: mode, origin: Origin::Explicit }, JitReason::Explicit)
+            }
+            None if dev_mode => {
+                (TunedValue { value: JitMode::Disable, origin: Origin::Default }, JitReason::Dev)
+            }
+            None if multi_tenant => (
+                TunedValue { value: JitMode::Disable, origin: Origin::Derived },
+                JitReason::MultiTenant,
+            ),
+            None if worker_mode => (
+                TunedValue { value: JitMode::Disable, origin: Origin::Derived },
+                JitReason::WorkerMode,
+            ),
+            None => (
+                TunedValue { value: JitMode::Tracing, origin: Origin::Derived },
+                JitReason::SingleSiteServe,
+            ),
+        };
+
+        // A JIT that is on needs a non-zero buffer. Serve mode always derives
+        // one; the remaining case is an explicit `opcache_jit` in dev mode,
+        // where no derivation ran and the bottom tier is 0 (PHP ≤8.3's stock
+        // default) — force the same memory-shaped derivation so an explicit
+        // "tracing" can never be silently bufferless.
+        let mut jit_buffer_size =
+            resolve(self.opcache_jit_buffer_size, derived.opcache_jit_buffer_size, 0);
+        if jit_mode.value.is_on() && jit_buffer_size.origin == Origin::Default {
+            jit_buffer_size =
+                TunedValue { value: derive_jit_buffer_mb(mem_budget), origin: Origin::Derived };
+        }
+
         AutoTune {
             cpu_quota,
             mem_budget,
@@ -3161,6 +3251,7 @@ impl PhpConfig {
             workers,
             worker_source,
             dev_mode,
+            multi_tenant,
             validate_timestamps: validate,
             revalidate_freq: self
                 .opcache_revalidate_freq
@@ -3176,11 +3267,9 @@ impl PhpConfig {
                 derived.opcache_interned_strings_buffer,
                 8,
             ),
-            jit_buffer_size: resolve(
-                self.opcache_jit_buffer_size,
-                derived.opcache_jit_buffer_size,
-                0,
-            ),
+            jit: jit_mode,
+            jit_reason,
+            jit_buffer_size,
             max_accelerated_files: resolve(
                 self.opcache_max_accelerated_files,
                 derived.opcache_max_accelerated_files,
@@ -3212,9 +3301,64 @@ impl PhpConfig {
     /// All lines are emitted *before* user `ini_overrides`, so an operator can
     /// still override any of them through `ini_overrides` as the final lever.
     #[must_use]
-    pub fn opcache_ini_lines(&self, dev_mode: bool) -> Vec<(String, String)> {
-        self.autotune(dev_mode).ini_lines()
+    pub fn opcache_ini_lines(&self, dev_mode: bool, multi_tenant: bool) -> Vec<(String, String)> {
+        self.autotune(dev_mode, multi_tenant).ini_lines()
     }
+}
+
+/// OPcache JIT mode (`[php] opcache_jit` / `opcache.jit`).
+///
+/// Deliberately restricted to the three named modes — PHP's raw CRTO digit
+/// syntax is not accepted (an operator who needs it can still set
+/// `opcache.jit` through `ini_overrides`, which is applied after these
+/// lines and therefore wins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JitMode {
+    /// Tracing JIT (`opcache.jit=tracing`) — traces hot loops/calls; the
+    /// recommended and default-on mode for single-site serve.
+    Tracing,
+    /// Function JIT (`opcache.jit=function`) — compiles whole hot functions;
+    /// usually slower than tracing, offered for A/B comparison.
+    Function,
+    /// JIT off (`opcache.jit=disable`).
+    Disable,
+}
+
+impl JitMode {
+    /// The literal `opcache.jit` ini value.
+    #[must_use]
+    pub fn as_ini(self) -> &'static str {
+        match self {
+            Self::Tracing => "tracing",
+            Self::Function => "function",
+            Self::Disable => "disable",
+        }
+    }
+
+    /// Whether this mode actually compiles code (anything but `disable`).
+    #[must_use]
+    pub fn is_on(self) -> bool {
+        !matches!(self, Self::Disable)
+    }
+}
+
+/// Why the resolved JIT mode is what it is — feeds the dedicated startup log
+/// line so the JIT state is never silent (see [`AutoTune::jit_line`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JitReason {
+    /// `[php] opcache_jit` was set explicitly — operator's choice, any mode.
+    Explicit,
+    /// Shaped default: single-site serve mode → `tracing`.
+    SingleSiteServe,
+    /// Shaped default: multi-tenant serve (`sites_dir` set) → `disable`,
+    /// because per-vhost `opcache_invalidate` never reclaims JIT buffer.
+    MultiTenant,
+    /// Shaped default: `[php] mode = "worker"` → `disable` (not positively
+    /// verified against the persistent-worker lifecycle).
+    WorkerMode,
+    /// Shaped default: dev mode → off (no line emitted; PHP defaults apply).
+    Dev,
 }
 
 /// Where a resolved tunable's value came from — surfaced in the autotune log
@@ -3260,7 +3404,8 @@ pub struct DerivedTuning {
     pub opcache_memory_consumption: Option<u32>,
     /// Derived `opcache.interned_strings_buffer` (MB).
     pub opcache_interned_strings_buffer: Option<u32>,
-    /// Derived `opcache.jit_buffer_size` (MB). JIT itself stays off.
+    /// Derived `opcache.jit_buffer_size` (MB). The JIT mode itself is
+    /// resolved in [`PhpConfig::autotune`] (`opcache_jit` / shaped default).
     pub opcache_jit_buffer_size: Option<u32>,
     /// Derived `opcache.max_accelerated_files` (fixed, not resource-shaped).
     pub opcache_max_accelerated_files: Option<u32>,
@@ -3277,6 +3422,16 @@ pub struct DerivedTuning {
 /// One mebibyte in bytes.
 const MIB: u64 = 1024 * 1024;
 
+/// Derive `opcache.jit_buffer_size` (MB) from the memory budget: ~1/64 of the
+/// budget, clamped `[32, 64]` MB; the 32 MB floor also covers an undetectable
+/// budget. Shared by the serve-mode derivation and the "explicit JIT in dev
+/// mode" forcing path so both produce the same size.
+#[must_use]
+pub fn derive_jit_buffer_mb(mem_bytes: Option<u64>) -> u32 {
+    let by_ratio = mem_bytes.map_or(32, |b| (b / 64) / MIB) as u32;
+    by_ratio.clamp(32, 64)
+}
+
 /// Derive the resource-aware serve-mode tuning profile from the detected CPU
 /// quota, memory budget, and effective worker count.
 ///
@@ -3290,7 +3445,8 @@ const MIB: u64 = 1024 * 1024;
 /// - `opcache.interned_strings_buffer` = ~1 MB per 16 MB of opcache SHM,
 ///   clamped `[8, 64]` MB.
 /// - `opcache.jit_buffer_size` = ~1/64 of the memory budget, clamped
-///   `[32, 64]` MB (buffer only — JIT is **not** auto-enabled).
+///   `[32, 64]` MB (buffer sizing only — the JIT mode is resolved in
+///   [`PhpConfig::autotune`]).
 /// - `opcache.max_accelerated_files` = a generous fixed `20000` (app-file-count
 ///   shaped, not resource-shaped — see the field doc).
 /// - `memory_limit` = `(budget − opcache_shm − 64 MB overhead) / workers`,
@@ -3306,7 +3462,8 @@ pub fn derive_tuning(
     dev_mode: bool,
 ) -> DerivedTuning {
     // CPU quota is detected and logged, but no serve tunable is CPU-shaped
-    // today (JIT stays off, and worker_count already consumes the quota). Bind
+    // today (the JIT default is tenancy-shaped, not CPU-shaped, and
+    // worker_count already consumes the quota). Bind
     // it so the signature documents the input and a future CPU-shaped knob has
     // it to hand.
     let _ = cpu_quota;
@@ -3327,11 +3484,10 @@ pub fn derive_tuning(
     // interned_strings_buffer: ~1 MB per 16 MB of opcache SHM, clamped [8, 64].
     let interned_mb: u32 = (opcache_mb / 16).clamp(8, 64);
 
-    // jit_buffer_size: ~1/64 of the budget, clamped [32, 64] MB. Buffer only.
-    let jit_mb: u32 = {
-        let by_ratio = mem_bytes.map_or(32, |b| (b / 64) / MIB) as u32;
-        by_ratio.clamp(32, 64)
-    };
+    // jit_buffer_size: ~1/64 of the budget, clamped [32, 64] MB. Whether the
+    // JIT actually uses it is governed by the `opcache.jit` resolution in
+    // `PhpConfig::autotune` (shaped default / `[php] opcache_jit`).
+    let jit_mb: u32 = derive_jit_buffer_mb(mem_bytes);
 
     // Per-request memory_limit: only derived when we actually know the budget —
     // otherwise keep PHP's 128M (returned as None). Reserve the opcache SHM and
@@ -3380,6 +3536,9 @@ pub struct AutoTune {
     pub worker_source: WorkerCountSource,
     /// Whether this is the dev-mode profile (vs serve).
     pub dev_mode: bool,
+    /// Whether `[server] sites_dir` is set (multi-tenant vhosting) — shapes
+    /// the `opcache.jit` default and its startup log line.
+    pub multi_tenant: bool,
     /// Resolved `opcache.validate_timestamps`.
     pub validate_timestamps: TunedValue<bool>,
     /// Resolved `opcache.revalidate_freq` (only present when explicitly set).
@@ -3388,7 +3547,16 @@ pub struct AutoTune {
     pub memory_consumption: TunedValue<u32>,
     /// Resolved `opcache.interned_strings_buffer` (MB).
     pub interned_strings_buffer: TunedValue<u32>,
-    /// Resolved `opcache.jit_buffer_size` (MB). JIT stays off.
+    /// Resolved `opcache.jit` mode (see [`PhpConfig::opcache_jit`] for the
+    /// shaped default). [`Origin::Default`] means no line is emitted (dev
+    /// mode with the knob absent) and PHP's own defaults keep the JIT off.
+    pub jit: TunedValue<JitMode>,
+    /// Why [`Self::jit`] resolved the way it did — drives the dedicated
+    /// startup log line ([`Self::jit_line`]).
+    pub jit_reason: JitReason,
+    /// Resolved `opcache.jit_buffer_size` (MB). Guaranteed non-zero-capable
+    /// (derived) whenever [`Self::jit`] is on, unless the operator explicitly
+    /// pinned `opcache_jit_buffer_size = 0` (see [`Self::jit_warning`]).
     pub jit_buffer_size: TunedValue<u32>,
     /// Resolved `opcache.max_accelerated_files`.
     pub max_accelerated_files: TunedValue<u32>,
@@ -3442,6 +3610,12 @@ impl AutoTune {
             self.interned_strings_buffer.origin,
             format!("{}", self.interned_strings_buffer.value),
         );
+        // `opcache.jit` — emitted whenever resolved (explicit or shaped).
+        // Emitting the `disable` default explicitly is load-bearing: PHP
+        // ≤8.3's stock `opcache.jit` is `tracing`, so once a jit_buffer_size
+        // line is present (it always is in serve mode), omitting this line
+        // would silently ENABLE the JIT on those versions.
+        push_if_set("opcache.jit", self.jit.origin, self.jit.value.as_ini().to_string());
         push_if_set(
             "opcache.jit_buffer_size",
             self.jit_buffer_size.origin,
@@ -3497,10 +3671,12 @@ impl AutoTune {
         let cpu = self.cpu_quota.map_or_else(|| "unlimited".to_string(), |q| format!("{q:.2}"));
         let mem =
             self.mem_budget.map_or_else(|| "unknown".to_string(), |b| format!("{}MiB", b / MIB));
-        let jit_state = if self.jit_buffer_size.origin == Origin::Default {
-            "off"
+        // `off (php default)` = no opcache.jit line emitted at all (dev mode,
+        // knob absent) — PHP's own defaults keep the JIT off.
+        let jit_state = if self.jit.origin == Origin::Default {
+            "jit=off (php default)".to_string()
         } else {
-            "buffer-only, jit off"
+            format!("jit={}{}", self.jit.value.as_ini(), self.jit.origin.marker())
         };
         format!(
             "autotune ({mode}): cpu_quota={cpu} mem={mem} ({}) -> workers={}[{}] \
@@ -3529,6 +3705,74 @@ impl AutoTune {
             self.zend_assertions.value,
             self.zend_assertions.origin.marker(),
         )
+    }
+
+    /// The dedicated startup INFO line stating the JIT state **and why** —
+    /// the JIT default is shaped (mode-dependent), so it must never be
+    /// silent. Companion to [`Self::summary_line`], same pattern as the
+    /// timestamp-validation contract lines in the CLI.
+    #[must_use]
+    pub fn jit_line(&self) -> String {
+        match self.jit_reason {
+            JitReason::Explicit => format!(
+                "opcache JIT {} ([php] opcache_jit set explicitly)",
+                if self.jit.value.is_on() {
+                    format!("ON ({})", self.jit.value.as_ini())
+                } else {
+                    "OFF".to_string()
+                }
+            ),
+            JitReason::SingleSiteServe => format!(
+                "opcache JIT ON (tracing, buffer {}MB) — single-site serve default; \
+                 set [php] opcache_jit = \"disable\" to turn it off",
+                self.jit_buffer_size.value
+            ),
+            JitReason::MultiTenant => "opcache JIT OFF — multi-tenant default (sites_dir set): \
+                 per-vhost OPcache invalidation never reclaims JIT buffer, so deploy churn \
+                 would silently exhaust it; set [php] opcache_jit = \"tracing\" to override"
+                .to_string(),
+            JitReason::WorkerMode => "opcache JIT OFF — worker-mode default ([php] mode = \
+                 \"worker\"); set [php] opcache_jit = \"tracing\" to opt in"
+                .to_string(),
+            JitReason::Dev => {
+                "opcache JIT OFF (dev mode default; PHP's own defaults apply)".to_string()
+            }
+        }
+    }
+
+    /// A startup WARN for JIT configurations that work but carry a documented
+    /// operational hazard. `None` when there is nothing to warn about.
+    ///
+    /// - JIT explicitly enabled in multi-tenant mode: per-vhost
+    ///   `opcache_invalidate` never reclaims JIT buffer (measured), so every
+    ///   deploy leaks buffer until the JIT silently stops compiling; only a
+    ///   full `opcache_reset` (disabled by the hardening preset) reclaims it.
+    /// - JIT enabled with an explicitly pinned `opcache_jit_buffer_size = 0`:
+    ///   the JIT will never compile anything.
+    #[must_use]
+    pub fn jit_warning(&self) -> Option<String> {
+        if !self.jit.value.is_on() || self.jit.origin != Origin::Explicit {
+            return None;
+        }
+        if self.jit_buffer_size.value == 0 {
+            return Some(
+                "[php] opcache_jit is on but opcache_jit_buffer_size = 0 — the JIT has no \
+                 buffer and will never compile anything"
+                    .to_string(),
+            );
+        }
+        if self.multi_tenant {
+            return Some(format!(
+                "[php] opcache_jit = \"{}\" with sites_dir set: per-vhost OPcache \
+                 invalidation does NOT reclaim JIT buffer, so each deploy permanently \
+                 consumes some of the {}MB jit_buffer_size until the JIT silently stops \
+                 compiling new code (watch ephpm_opcache_jit_buffer_free_bytes; only a \
+                 full opcache_reset or a restart reclaims it)",
+                self.jit.value.as_ini(),
+                self.jit_buffer_size.value
+            ));
+        }
+        None
     }
 }
 
@@ -6450,7 +6694,7 @@ eviction_policy = "lru"
         // the host's detected memory budget, so assert on the *keys* present
         // and the environment-independent ones (assertions, realpath, files).
         let cfg = PhpConfig::default();
-        let lines = cfg.opcache_ini_lines(false);
+        let lines = cfg.opcache_ini_lines(false, false);
         let keys: Vec<&str> = lines.iter().map(|(k, _)| k.as_str()).collect();
         assert!(keys.contains(&"opcache.validate_timestamps"));
         assert!(keys.contains(&"opcache.memory_consumption"));
@@ -6475,7 +6719,7 @@ eviction_policy = "lru"
         // validate_timestamps line plus the always-emitted memory_limit,
         // keeping the dev php.ini minimal.
         let cfg = PhpConfig::default();
-        let lines = cfg.opcache_ini_lines(true);
+        let lines = cfg.opcache_ini_lines(true, false);
         assert_eq!(
             lines,
             vec![
@@ -6493,7 +6737,7 @@ eviction_policy = "lru"
             opcache_revalidate_freq: Some(60),
             ..PhpConfig::default()
         };
-        let lines = cfg.opcache_ini_lines(true);
+        let lines = cfg.opcache_ini_lines(true, false);
         assert_eq!(
             lines,
             vec![
@@ -6511,7 +6755,7 @@ eviction_policy = "lru"
         // filtered out of the generated php.ini as `Origin::Default`. Dev mode
         // derives nothing, so this is where the drop always bit.
         let cfg = PhpConfig { memory_limit: "512M".to_string(), ..PhpConfig::default() };
-        let lines = cfg.opcache_ini_lines(true);
+        let lines = cfg.opcache_ini_lines(true, false);
         assert!(
             lines.contains(&("memory_limit".to_string(), "512M".to_string())),
             "dev-mode php.ini must carry [php] memory_limit, got: {lines:?}"
@@ -6525,7 +6769,7 @@ eviction_policy = "lru"
         // reach the generated ini. This is the serve-mode path on macOS, where
         // `read_total_system_memory()` returns `None` so `derive_tuning`
         // produces no `memory_limit`.
-        let mut at = PhpConfig::default().autotune(true);
+        let mut at = PhpConfig::default().autotune(true, false);
         at.memory_limit = TunedValue { value: "384M".to_string(), origin: Origin::Default };
         let lines = at.ini_lines();
         assert!(
@@ -6543,7 +6787,7 @@ eviction_policy = "lru"
         // regression. Linux (cgroup/meminfo) and Windows (GlobalMemoryStatusEx)
         // both detect a budget and therefore derive over it.
         let cfg = PhpConfig { memory_limit: "512M".to_string(), ..PhpConfig::default() };
-        let lines = cfg.opcache_ini_lines(false);
+        let lines = cfg.opcache_ini_lines(false, false);
         assert!(
             lines.contains(&("memory_limit".to_string(), "512M".to_string())),
             "serve-mode php.ini must carry [php] memory_limit when nothing is \
@@ -6713,7 +6957,7 @@ eviction_policy = "lru"
     #[cfg(windows)]
     #[test]
     fn test_windows_serve_autotune_derives_memory_shaped_knobs() {
-        let at = PhpConfig::default().autotune(false);
+        let at = PhpConfig::default().autotune(false, false);
         assert_eq!(at.memory_consumption.origin, Origin::Derived);
         assert_eq!(at.memory_limit.origin, Origin::Derived);
         assert_ne!(at.mem_source, MemorySource::Unknown);
@@ -6791,7 +7035,7 @@ eviction_policy = "lru"
             zend_assertions: Some(0),
             ..PhpConfig::default()
         };
-        let at = cfg.autotune(false);
+        let at = cfg.autotune(false, false);
         assert_eq!(at.memory_consumption.value, 256);
         assert_eq!(at.memory_consumption.origin, Origin::Explicit);
         assert_eq!(at.memory_limit.value, "777M");
@@ -6811,13 +7055,13 @@ eviction_policy = "lru"
         // Dev mode derives nothing, so unset knobs resolve to the PHP default
         // and are omitted from the ini (Origin::Default).
         let cfg = PhpConfig::default();
-        let at = cfg.autotune(true);
+        let at = cfg.autotune(true, false);
         assert_eq!(at.memory_consumption.origin, Origin::Default);
         assert_eq!(at.max_accelerated_files.origin, Origin::Default);
         assert_eq!(at.zend_assertions.origin, Origin::Default);
         // But an explicit knob still wins in dev.
         let cfg2 = PhpConfig { zend_assertions: Some(-1), ..PhpConfig::default() };
-        let at2 = cfg2.autotune(true);
+        let at2 = cfg2.autotune(true, false);
         assert_eq!(at2.zend_assertions.value, -1);
         assert_eq!(at2.zend_assertions.origin, Origin::Explicit);
     }
@@ -6825,7 +7069,7 @@ eviction_policy = "lru"
     #[test]
     fn test_autotune_summary_line_marks_explicit() {
         let cfg = PhpConfig { opcache_memory_consumption: Some(200), ..PhpConfig::default() };
-        let line = cfg.autotune(false).summary_line();
+        let line = cfg.autotune(false, false).summary_line();
         assert!(line.contains("autotune (serve)"));
         // Explicit memory_consumption is marked with a `*` (after the MB unit).
         assert!(line.contains("opcache.memory_consumption=200MB*"), "got: {line}");
@@ -6878,6 +7122,224 @@ opcache_revalidate_freq = 60
         let config = Config::load(&file).unwrap();
         assert_eq!(config.php.opcache_validate_timestamps, Some(true));
         assert_eq!(config.php.opcache_revalidate_freq, Some(60));
+    }
+
+    // ── OPcache JIT: shaped default + `[php] opcache_jit` ──────────────
+
+    #[test]
+    fn test_opcache_jit_defaults_to_none() {
+        assert_eq!(PhpConfig::default().opcache_jit, None);
+    }
+
+    #[test]
+    fn test_jit_shaped_default_single_site_serve_is_tracing() {
+        let at = PhpConfig::default().autotune(false, false);
+        assert_eq!(at.jit.value, JitMode::Tracing);
+        assert_eq!(at.jit.origin, Origin::Derived);
+        assert_eq!(at.jit_reason, JitReason::SingleSiteServe);
+        assert!(at.jit_warning().is_none(), "the shaped default must not warn");
+
+        let lines = at.ini_lines();
+        assert!(
+            lines.contains(&("opcache.jit".to_string(), "tracing".to_string())),
+            "single-site serve must emit opcache.jit=tracing, got: {lines:?}"
+        );
+        // JIT on requires a buffer: the derived jit_buffer_size line must ride
+        // along (serve mode always derives one).
+        let buffer = lines.iter().find(|(k, _)| k == "opcache.jit_buffer_size");
+        assert!(buffer.is_some(), "opcache.jit_buffer_size must be emitted, got: {lines:?}");
+        assert_ne!(buffer.unwrap().1, "0M");
+    }
+
+    #[test]
+    fn test_jit_shaped_default_multi_tenant_is_disable() {
+        let at = PhpConfig::default().autotune(false, true);
+        assert_eq!(at.jit.value, JitMode::Disable);
+        assert_eq!(at.jit.origin, Origin::Derived);
+        assert_eq!(at.jit_reason, JitReason::MultiTenant);
+        assert!(at.jit_warning().is_none());
+        // Emitting `disable` explicitly is load-bearing: PHP <=8.3's stock
+        // opcache.jit is `tracing`, and serve mode always emits a non-zero
+        // jit_buffer_size — omitting the line would enable the JIT there.
+        let lines = at.ini_lines();
+        assert!(
+            lines.contains(&("opcache.jit".to_string(), "disable".to_string())),
+            "multi-tenant serve must emit opcache.jit=disable, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_jit_shaped_default_worker_mode_is_disable() {
+        let cfg = PhpConfig { mode: "worker".to_string(), ..PhpConfig::default() };
+        let at = cfg.autotune(false, false);
+        assert_eq!(at.jit.value, JitMode::Disable);
+        assert_eq!(at.jit_reason, JitReason::WorkerMode);
+        assert!(
+            at.ini_lines().contains(&("opcache.jit".to_string(), "disable".to_string())),
+            "worker mode must emit opcache.jit=disable"
+        );
+    }
+
+    #[test]
+    fn test_jit_shaped_default_dev_mode_emits_nothing() {
+        // Dev keeps the generated ini minimal: no opcache.jit line at all —
+        // PHP's own defaults keep the JIT off (8.3: buffer 0; 8.4+: disable).
+        let at = PhpConfig::default().autotune(true, false);
+        assert_eq!(at.jit.value, JitMode::Disable);
+        assert_eq!(at.jit.origin, Origin::Default);
+        assert_eq!(at.jit_reason, JitReason::Dev);
+        let lines = at.ini_lines();
+        let keys: Vec<&str> = lines.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(!keys.contains(&"opcache.jit"), "dev mode must not emit opcache.jit");
+        assert!(!keys.contains(&"opcache.jit_buffer_size"));
+    }
+
+    #[test]
+    fn test_jit_explicit_overrides_shaped_default() {
+        // Explicit disable in single-site serve (the "JIT miscompile" escape
+        // hatch — must always win).
+        let off = PhpConfig { opcache_jit: Some(JitMode::Disable), ..PhpConfig::default() };
+        let at = off.autotune(false, false);
+        assert_eq!(at.jit.value, JitMode::Disable);
+        assert_eq!(at.jit.origin, Origin::Explicit);
+        assert_eq!(at.jit_reason, JitReason::Explicit);
+        assert!(at.ini_lines().contains(&("opcache.jit".to_string(), "disable".to_string())));
+
+        // Explicit tracing in multi-tenant: operator's documented-cost choice —
+        // applied, but with the buffer-exhaustion warning.
+        let on = PhpConfig { opcache_jit: Some(JitMode::Tracing), ..PhpConfig::default() };
+        let at = on.autotune(false, true);
+        assert_eq!(at.jit.value, JitMode::Tracing);
+        assert_eq!(at.jit.origin, Origin::Explicit);
+        assert!(at.ini_lines().contains(&("opcache.jit".to_string(), "tracing".to_string())));
+        let warning = at.jit_warning().expect("explicit JIT in multi-tenant mode must warn");
+        assert!(warning.contains("reclaim"), "got: {warning}");
+
+        // Explicit function mode in worker mode: applied, no warning.
+        let func = PhpConfig {
+            opcache_jit: Some(JitMode::Function),
+            mode: "worker".to_string(),
+            ..PhpConfig::default()
+        };
+        let at = func.autotune(false, false);
+        assert_eq!(at.jit.value, JitMode::Function);
+        assert!(at.jit_warning().is_none());
+        assert!(at.ini_lines().contains(&("opcache.jit".to_string(), "function".to_string())));
+    }
+
+    #[test]
+    fn test_jit_explicit_in_dev_mode_forces_a_buffer() {
+        // Dev derives no jit_buffer_size and the bottom tier is 0 (PHP <=8.3's
+        // stock default) — an explicit "tracing" must still get a buffer or it
+        // silently does nothing on 8.3.
+        let cfg = PhpConfig { opcache_jit: Some(JitMode::Tracing), ..PhpConfig::default() };
+        let at = cfg.autotune(true, false);
+        assert_eq!(at.jit.value, JitMode::Tracing);
+        assert_eq!(at.jit_buffer_size.origin, Origin::Derived);
+        assert!(at.jit_buffer_size.value >= 32);
+        let lines = at.ini_lines();
+        assert!(lines.contains(&("opcache.jit".to_string(), "tracing".to_string())));
+        assert!(
+            lines.iter().any(|(k, _)| k == "opcache.jit_buffer_size"),
+            "explicit JIT in dev must emit a jit_buffer_size, got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn test_jit_warns_on_explicitly_zero_buffer() {
+        let cfg = PhpConfig {
+            opcache_jit: Some(JitMode::Tracing),
+            opcache_jit_buffer_size: Some(0),
+            ..PhpConfig::default()
+        };
+        let at = cfg.autotune(false, false);
+        // Explicit 0 is respected (never overridden)…
+        assert_eq!(at.jit_buffer_size.value, 0);
+        assert_eq!(at.jit_buffer_size.origin, Origin::Explicit);
+        // …but it means the JIT can never compile, which must warn.
+        let warning = at.jit_warning().expect("jit on + zero buffer must warn");
+        assert!(warning.contains("buffer"), "got: {warning}");
+    }
+
+    #[test]
+    fn test_jit_line_states_the_why() {
+        let single = PhpConfig::default().autotune(false, false);
+        assert!(single.jit_line().contains("single-site serve default"), "{}", single.jit_line());
+
+        let multi = PhpConfig::default().autotune(false, true);
+        assert!(multi.jit_line().contains("multi-tenant default"), "{}", multi.jit_line());
+
+        let worker =
+            PhpConfig { mode: "worker".to_string(), ..PhpConfig::default() }.autotune(false, false);
+        assert!(worker.jit_line().contains("worker-mode default"), "{}", worker.jit_line());
+
+        let dev = PhpConfig::default().autotune(true, false);
+        assert!(dev.jit_line().contains("dev mode default"), "{}", dev.jit_line());
+
+        let explicit = PhpConfig { opcache_jit: Some(JitMode::Tracing), ..PhpConfig::default() }
+            .autotune(false, false);
+        assert!(explicit.jit_line().contains("explicitly"), "{}", explicit.jit_line());
+    }
+
+    #[test]
+    fn test_jit_summary_line_shows_mode() {
+        let line = PhpConfig::default().autotune(false, false).summary_line();
+        assert!(line.contains("(jit=tracing)"), "got: {line}");
+        let line = PhpConfig::default().autotune(false, true).summary_line();
+        assert!(line.contains("(jit=disable)"), "got: {line}");
+        // Explicit values carry the `*` pin marker like every other tunable.
+        let line = PhpConfig { opcache_jit: Some(JitMode::Disable), ..PhpConfig::default() }
+            .autotune(false, false)
+            .summary_line();
+        assert!(line.contains("(jit=disable*)"), "got: {line}");
+        // Dev, knob absent: no line emitted — PHP defaults.
+        let line = PhpConfig::default().autotune(true, false).summary_line();
+        assert!(line.contains("(jit=off (php default))"), "got: {line}");
+    }
+
+    #[test]
+    fn test_jit_loads_from_toml_and_rejects_unknown_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\nopcache_jit = \"tracing\"\n").unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.opcache_jit, Some(JitMode::Tracing));
+
+        std::fs::write(&file, "[php]\nopcache_jit = \"function\"\n").unwrap();
+        assert_eq!(Config::load(&file).unwrap().php.opcache_jit, Some(JitMode::Function));
+
+        std::fs::write(&file, "[php]\nopcache_jit = \"disable\"\n").unwrap();
+        assert_eq!(Config::load(&file).unwrap().php.opcache_jit, Some(JitMode::Disable));
+
+        // PHP's raw CRTO syntax (and typos) are a hard config error, not a
+        // silent fallback.
+        std::fs::write(&file, "[php]\nopcache_jit = \"1254\"\n").unwrap();
+        assert!(Config::load(&file).is_err(), "unknown opcache_jit value must be rejected");
+    }
+
+    #[test]
+    fn test_jit_env_override() {
+        let _env = test_env::EnvVars::set("EPHPM_PHP__OPCACHE_JIT", "disable");
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.php.opcache_jit, Some(JitMode::Disable));
+    }
+
+    #[test]
+    fn test_jit_default_survives_section_absent_and_present() {
+        // The `[server.security]` lesson: a section-level serde default must
+        // not zero the field default. Absent `[php]` section…
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nlisten = \"127.0.0.1:0\"\n").unwrap();
+        let absent = Config::load(&file).unwrap();
+        assert_eq!(absent.php.opcache_jit, None);
+        assert_eq!(absent.php.autotune(false, false).jit.value, JitMode::Tracing);
+
+        // …and `[php]` present without the knob must resolve identically.
+        std::fs::write(&file, "[server]\nlisten = \"127.0.0.1:0\"\n[php]\nworkers = 2\n").unwrap();
+        let present = Config::load(&file).unwrap();
+        assert_eq!(present.php.opcache_jit, None);
+        assert_eq!(present.php.autotune(false, false).jit.value, JitMode::Tracing);
     }
 
     // ── Worker mode config ──────────────────────────────────────────────

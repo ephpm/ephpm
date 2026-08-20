@@ -2698,6 +2698,13 @@ impl Router {
                 );
             }
 
+            // JIT buffer gauges: piggyback on the request path (same thread
+            // state the invalidator above relies on — TSRM-registered, inside
+            // the thread's still-active request). One relaxed atomic load per
+            // request; the FFI status call runs at most once per sampling
+            // interval process-wide. No-op in stub mode.
+            ephpm_php::jit_metrics::maybe_sample();
+
             PhpRuntime::execute(PhpRequest {
                 method,
                 uri,
