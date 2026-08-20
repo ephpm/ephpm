@@ -2196,7 +2196,8 @@ pub struct PhpConfig {
     /// Override `opcache.memory_consumption` (MB of shared opcode cache).
     ///
     /// When unset, ePHPm **auto-derives** this from the detected memory budget
-    /// (container cgroup limit, else host `MemTotal`): ~18% of memory, clamped
+    /// (container cgroup limit or Windows job-object limit, else total physical
+    /// RAM — `MemTotal` / `GlobalMemoryStatusEx`): ~18% of memory, clamped
     /// to `[64, 512]` MB. Set explicitly to pin the SHM size regardless of the
     /// detected budget. Only takes effect in serve mode (dev keeps PHP's
     /// default of 128 MB unless you set this).
@@ -3951,11 +3952,17 @@ pub enum MemorySource {
     CgroupV2,
     /// A cgroup **v1** `memory.limit_in_bytes` limit (bytes).
     CgroupV1,
-    /// No cgroup limit — total system memory (`/proc/meminfo` `MemTotal`) is
-    /// used instead. On non-Linux platforms this is the only source.
+    /// A **Windows job-object** memory limit (`JOB_OBJECT_LIMIT_JOB_MEMORY` /
+    /// `JOB_OBJECT_LIMIT_PROCESS_MEMORY`) — the closest Windows analogue of a
+    /// cgroup limit. Only reported when it is strictly below physical RAM.
+    JobObject,
+    /// No container limit — total physical system memory is used instead
+    /// (`/proc/meminfo` `MemTotal` on Linux, `GlobalMemoryStatusEx`'s
+    /// `ullTotalPhys` on Windows).
     SystemTotal,
-    /// Neither a cgroup limit nor a readable system total — nothing to derive
-    /// from, so memory-shaped tunables keep their PHP-stock defaults.
+    /// Neither a container limit nor a readable system total — nothing to
+    /// derive from, so memory-shaped tunables keep their PHP-stock defaults.
+    /// This is the only outcome on platforms with no probe (macOS today).
     Unknown,
 }
 
@@ -3966,6 +3973,7 @@ impl MemorySource {
         match self {
             Self::CgroupV2 => "cgroup v2",
             Self::CgroupV1 => "cgroup v1",
+            Self::JobObject => "job-object",
             Self::SystemTotal => "system-total",
             Self::Unknown => "unknown",
         }
@@ -3980,10 +3988,16 @@ impl MemorySource {
 /// 2. cgroup **v1** `/sys/fs/cgroup/memory/memory.limit_in_bytes`.
 /// 3. `/proc/meminfo` `MemTotal` (total host memory — no container limit).
 ///
+/// Resolution order (Windows):
+/// 1. The calling process's **job object** memory limit
+///    (`QueryInformationJobObject` / `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`) —
+///    used only when it is strictly below physical RAM.
+/// 2. Physical RAM (`GlobalMemoryStatusEx`'s `ullTotalPhys`).
+///
 /// A cgroup limit of `"max"` (v2) or an absurdly-large sentinel (v1) means "no
 /// limit set" and is skipped so we fall through to the system total. On
-/// non-Linux platforms only the (unavailable) system-total path applies, so
-/// this returns `(None, MemorySource::Unknown)` and callers keep PHP defaults.
+/// platforms with no probe at all (macOS today) this returns
+/// `(None, MemorySource::Unknown)` and callers keep PHP defaults.
 #[must_use]
 pub fn detect_memory_budget() -> (Option<u64>, MemorySource) {
     if let Some(bytes) = read_cgroup_memory_limit() {
@@ -3996,10 +4010,30 @@ pub fn detect_memory_budget() -> (Option<u64>, MemorySource) {
         };
         return (Some(bytes), source);
     }
-    if let Some(total) = read_total_system_memory() {
-        return (Some(total), MemorySource::SystemTotal);
+    // Off Windows `read_job_object_memory_limit()` is a `None` stub, so this
+    // reduces to exactly the previous "system total, else unknown" behaviour.
+    select_memory_budget(read_job_object_memory_limit(), read_total_system_memory())
+}
+
+/// Pick between a job-object (container-ish) limit and physical RAM.
+///
+/// A job limit only wins when it is a **real restriction** — strictly below
+/// physical RAM, or physical RAM is unknown. A job limit at or above physical
+/// RAM caps nothing that the hardware doesn't already cap, so reporting it
+/// would overstate the budget; physical RAM is the honest figure there.
+///
+/// Split out as a pure function so it is unit-testable on every platform
+/// without a real job object.
+fn select_memory_budget(
+    job_limit: Option<u64>,
+    physical: Option<u64>,
+) -> (Option<u64>, MemorySource) {
+    match (job_limit, physical) {
+        (Some(job), Some(phys)) if job < phys => (Some(job), MemorySource::JobObject),
+        (Some(job), None) => (Some(job), MemorySource::JobObject),
+        (_, Some(phys)) => (Some(phys), MemorySource::SystemTotal),
+        (None, None) => (None, MemorySource::Unknown),
     }
-    (None, MemorySource::Unknown)
 }
 
 /// Read the cgroup memory limit in bytes (v2 preferred, v1 fallback).
@@ -4059,20 +4093,160 @@ fn parse_cgroup_v1_memory_limit(raw: &str) -> Option<u64> {
 }
 
 /// Read total system memory in bytes from `/proc/meminfo` (`MemTotal`, which
-/// is reported in kibibytes). Returns `None` on non-Linux platforms or if the
-/// field is missing/unparseable — callers then keep PHP-stock defaults.
+/// is reported in kibibytes). Returns `None` if the field is missing or
+/// unparseable — callers then keep PHP-stock defaults.
 #[cfg(target_os = "linux")]
 fn read_total_system_memory() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     parse_meminfo_memtotal(&meminfo)
 }
 
-/// Non-Linux: no `/proc/meminfo`. We keep the dependency footprint minimal
-/// (no `sysinfo` crate) rather than pull a platform abstraction just for the
-/// fallback, so memory-shaped tunables keep PHP defaults off-Linux.
-#[cfg(not(target_os = "linux"))]
+/// Read total physical RAM in bytes via `GlobalMemoryStatusEx` (`ullTotalPhys`).
+///
+/// This is the Windows counterpart of `/proc/meminfo`'s `MemTotal`: the amount
+/// of physical memory the OS reports for this machine (or, inside a Windows
+/// container, whatever the silo reports to it). Returns `None` if the call
+/// fails or reports zero, so the caller falls back to `MemorySource::Unknown`
+/// and PHP-stock defaults rather than inventing a number.
+#[cfg(windows)]
+#[allow(unsafe_code)] // One Win32 call; every unsafe block carries a SAFETY note.
+fn read_total_system_memory() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    // SAFETY: `MEMORYSTATUSEX` is a plain-old-data struct of integers with no
+    // padding invariants, pointers, or niches, so an all-zero bit pattern is a
+    // valid value. The only field the API reads on input (`dwLength`) is
+    // assigned immediately below, before the struct is handed to the kernel.
+    let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    status.dwLength = u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?;
+
+    // SAFETY: `status` is a live, correctly-aligned `MEMORYSTATUSEX` owned by
+    // this frame, and `dwLength` tells the kernel exactly how many bytes it may
+    // write, so the write stays inside the buffer. `GlobalMemoryStatusEx` has
+    // no other preconditions and cannot fail in a way that leaves `status`
+    // partially-initialized in an invalid state (it is POD either way).
+    let ok = unsafe { GlobalMemoryStatusEx(&raw mut status) };
+    if ok == 0 {
+        return None;
+    }
+    if status.ullTotalPhys == 0 { None } else { Some(status.ullTotalPhys) }
+}
+
+/// Platforms with no implemented probe (macOS today): report nothing rather
+/// than guess. We keep the dependency footprint minimal (no `sysinfo` crate)
+/// rather than pull a platform abstraction, so memory-shaped tunables keep PHP
+/// defaults there.
+#[cfg(not(any(target_os = "linux", windows)))]
 fn read_total_system_memory() -> Option<u64> {
     None
+}
+
+/// `JOB_OBJECT_LIMIT_PROCESS_MEMORY` — a per-process committed-memory cap is
+/// in force, so `ProcessMemoryLimit` is meaningful.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+const JOB_OBJECT_LIMIT_PROCESS_MEMORY_FLAG: u32 = 0x0000_0100;
+/// `JOB_OBJECT_LIMIT_JOB_MEMORY` — a job-wide committed-memory cap is in force,
+/// so `JobMemoryLimit` is meaningful.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+const JOB_OBJECT_LIMIT_JOB_MEMORY_FLAG: u32 = 0x0000_0200;
+
+// The two constants above are re-declared (rather than imported) so the pure
+// selection logic below compiles — and is unit-tested — on every platform.
+// Pin them to the real Win32 values at compile time on Windows so they can
+// never drift from the header.
+#[cfg(windows)]
+const _: () = {
+    use windows_sys::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    };
+    assert!(JOB_OBJECT_LIMIT_PROCESS_MEMORY_FLAG == JOB_OBJECT_LIMIT_PROCESS_MEMORY);
+    assert!(JOB_OBJECT_LIMIT_JOB_MEMORY_FLAG == JOB_OBJECT_LIMIT_JOB_MEMORY);
+};
+
+/// Read the memory limit of the job object the current process belongs to.
+///
+/// Windows has no cgroups; the equivalent restriction is a **job object**, which
+/// is what Windows containers and job-based sandboxes use. A `NULL` job handle
+/// asks about the job the *calling process* is in; when the process is not in a
+/// job (the normal desktop/service case) the call fails and we return `None`.
+///
+/// Only the limits whose `LimitFlags` bit is set are meaningful — an unset
+/// limit leaves its field at zero, which is emphatically *not* "0 bytes".
+#[cfg(windows)]
+#[allow(unsafe_code)] // One Win32 call; every unsafe block carries a SAFETY note.
+fn read_job_object_memory_limit() -> Option<u64> {
+    use windows_sys::Win32::System::JobObjects::{
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        QueryInformationJobObject,
+    };
+
+    // SAFETY: `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` is a plain-old-data struct
+    // of integers and nested POD structs; an all-zero bit pattern is valid. It
+    // is a pure out-parameter — the kernel overwrites it on success and we
+    // ignore its contents on failure.
+    let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    let size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()).ok()?;
+
+    // SAFETY: a NULL `hJob` is documented as "the job associated with the
+    // calling process"; if there is none the call simply returns FALSE (it does
+    // not write through the pointer). The buffer is a live, correctly-aligned
+    // `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` owned by this frame and `size` is
+    // its exact size, so the kernel's write stays in bounds. The optional
+    // return-length out-parameter is allowed to be NULL.
+    let ok = unsafe {
+        QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            (&raw mut info).cast(),
+            size,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    select_job_memory_limit(
+        info.BasicLimitInformation.LimitFlags,
+        u64::try_from(info.ProcessMemoryLimit).unwrap_or(u64::MAX),
+        u64::try_from(info.JobMemoryLimit).unwrap_or(u64::MAX),
+    )
+}
+
+/// Non-Windows: no job objects. The cgroup path covers Linux; everything else
+/// falls through to the system total.
+#[cfg(not(windows))]
+fn read_job_object_memory_limit() -> Option<u64> {
+    None
+}
+
+/// Pick the effective job-object memory cap from the queried limit block.
+///
+/// Both `JOB_OBJECT_LIMIT_PROCESS_MEMORY` (per process) and
+/// `JOB_OBJECT_LIMIT_JOB_MEMORY` (whole job) can be set; the smaller of the
+/// enabled ones is the ceiling this process actually lives under. Fields whose
+/// flag is clear are ignored, and a zero value is treated as "not set" rather
+/// than a literal zero-byte cap.
+///
+/// Compiled everywhere so the unit tests exercise it without a real job object.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn select_job_memory_limit(
+    limit_flags: u32,
+    process_memory_limit: u64,
+    job_memory_limit: u64,
+) -> Option<u64> {
+    let mut limit: Option<u64> = None;
+    let mut consider = |bytes: u64| {
+        if bytes > 0 {
+            limit = Some(limit.map_or(bytes, |cur: u64| cur.min(bytes)));
+        }
+    };
+    if limit_flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY_FLAG != 0 {
+        consider(process_memory_limit);
+    }
+    if limit_flags & JOB_OBJECT_LIMIT_JOB_MEMORY_FLAG != 0 {
+        consider(job_memory_limit);
+    }
+    limit
 }
 
 /// Parse `MemTotal:` (kibibytes) out of `/proc/meminfo` contents and convert to
@@ -6316,9 +6490,9 @@ eviction_policy = "lru"
     fn test_memory_limit_emitted_when_origin_is_default() {
         // Platform-independent form of the same regression: whatever the host
         // detects, a memory_limit that resolved to the bottom tier must still
-        // reach the generated ini. This is the serve-mode path on macOS and
-        // Windows, where `read_total_system_memory()` returns `None` so
-        // `derive_tuning` produces no `memory_limit`.
+        // reach the generated ini. This is the serve-mode path on macOS, where
+        // `read_total_system_memory()` returns `None` so `derive_tuning`
+        // produces no `memory_limit`.
         let mut at = PhpConfig::default().autotune(true);
         at.memory_limit = TunedValue { value: "384M".to_string(), origin: Origin::Default };
         let lines = at.ini_lines();
@@ -6328,12 +6502,14 @@ eviction_policy = "lru"
         );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     #[test]
     fn test_memory_limit_emitted_in_serve_mode_without_memory_budget() {
-        // On non-Linux hosts `detect_memory_budget()` yields `None`, so serve
-        // mode derives no memory_limit and the configured value lands in the
-        // bottom tier — the second half of the same regression.
+        // On hosts with no memory probe (macOS) `detect_memory_budget()` yields
+        // `None`, so serve mode derives no memory_limit and the configured
+        // value lands in the bottom tier — the second half of the same
+        // regression. Linux (cgroup/meminfo) and Windows (GlobalMemoryStatusEx)
+        // both detect a budget and therefore derive over it.
         let cfg = PhpConfig { memory_limit: "512M".to_string(), ..PhpConfig::default() };
         let lines = cfg.opcache_ini_lines(false);
         assert!(
@@ -6382,6 +6558,133 @@ eviction_policy = "lru"
         // 4028860 KiB -> bytes.
         assert_eq!(parse_meminfo_memtotal(sample), Some(4_028_860 * 1024));
         assert_eq!(parse_meminfo_memtotal("MemFree: 1 kB"), None);
+    }
+
+    // --- Resource-aware autotuning: job-object / physical-RAM selection ---
+
+    #[test]
+    fn test_select_memory_budget_prefers_a_restricting_job_limit() {
+        let gib = 1024 * MIB;
+        // A 2 GiB job limit on a 128 GiB box is a real restriction.
+        assert_eq!(
+            select_memory_budget(Some(2 * gib), Some(128 * gib)),
+            (Some(2 * gib), MemorySource::JobObject)
+        );
+    }
+
+    #[test]
+    fn test_select_memory_budget_ignores_a_non_restricting_job_limit() {
+        let gib = 1024 * MIB;
+        // A job limit at or above physical RAM caps nothing the hardware does
+        // not already cap — report the honest physical figure instead.
+        assert_eq!(
+            select_memory_budget(Some(256 * gib), Some(128 * gib)),
+            (Some(128 * gib), MemorySource::SystemTotal)
+        );
+        assert_eq!(
+            select_memory_budget(Some(128 * gib), Some(128 * gib)),
+            (Some(128 * gib), MemorySource::SystemTotal)
+        );
+    }
+
+    #[test]
+    fn test_select_memory_budget_without_a_job_limit() {
+        let gib = 1024 * MIB;
+        assert_eq!(
+            select_memory_budget(None, Some(64 * gib)),
+            (Some(64 * gib), MemorySource::SystemTotal)
+        );
+    }
+
+    #[test]
+    fn test_select_memory_budget_job_limit_only() {
+        let gib = 1024 * MIB;
+        // Physical RAM unreadable but a job limit is known: still better than
+        // nothing, and labelled as what it is.
+        assert_eq!(
+            select_memory_budget(Some(4 * gib), None),
+            (Some(4 * gib), MemorySource::JobObject)
+        );
+    }
+
+    #[test]
+    fn test_select_memory_budget_nothing_detectable_stays_unknown() {
+        // The fallback must remain "unknown" + PHP-stock floors, never a guess.
+        assert_eq!(select_memory_budget(None, None), (None, MemorySource::Unknown));
+        assert_eq!(MemorySource::Unknown.label(), "unknown");
+        assert_eq!(MemorySource::JobObject.label(), "job-object");
+        assert_eq!(MemorySource::SystemTotal.label(), "system-total");
+    }
+
+    #[test]
+    fn test_select_job_memory_limit_requires_the_flag() {
+        let gib = 1024 * MIB;
+        // Fields are only meaningful when their LimitFlags bit is set; a stale
+        // non-zero value with no flag must not be read as a limit.
+        assert_eq!(select_job_memory_limit(0, 2 * gib, 4 * gib), None);
+        // Flag set but the value is zero => not a 0-byte cap, just unset.
+        assert_eq!(select_job_memory_limit(JOB_OBJECT_LIMIT_JOB_MEMORY_FLAG, 0, 0), None);
+    }
+
+    #[test]
+    fn test_select_job_memory_limit_picks_the_smaller_enabled_cap() {
+        let gib = 1024 * MIB;
+        assert_eq!(
+            select_job_memory_limit(JOB_OBJECT_LIMIT_PROCESS_MEMORY_FLAG, 2 * gib, 4 * gib),
+            Some(2 * gib)
+        );
+        assert_eq!(
+            select_job_memory_limit(JOB_OBJECT_LIMIT_JOB_MEMORY_FLAG, 2 * gib, 4 * gib),
+            Some(4 * gib)
+        );
+        // Both set => the process actually lives under the smaller of the two.
+        assert_eq!(
+            select_job_memory_limit(
+                JOB_OBJECT_LIMIT_PROCESS_MEMORY_FLAG | JOB_OBJECT_LIMIT_JOB_MEMORY_FLAG,
+                6 * gib,
+                4 * gib,
+            ),
+            Some(4 * gib)
+        );
+        // Other job limits (e.g. JOB_OBJECT_LIMIT_ACTIVE_PROCESS = 0x8) must
+        // not be mistaken for memory limits.
+        assert_eq!(select_job_memory_limit(0x0000_0008, 2 * gib, 4 * gib), None);
+    }
+
+    /// Behavioural: on a real Windows host the physical-RAM probe must return a
+    /// plausible figure, not `None` — this is the bug this coverage exists for
+    /// (`mem=unknown` on Windows regardless of installed RAM).
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_physical_memory_probe_reports_a_real_figure() {
+        let phys = read_total_system_memory().expect("GlobalMemoryStatusEx must report total RAM");
+        // Any machine that can run ePHPm has >= 256 MiB; nothing has 1 PiB.
+        assert!(phys >= 256 * MIB, "implausibly small physical RAM: {phys} bytes");
+        assert!(phys < 1024 * 1024 * MIB, "implausibly large physical RAM: {phys} bytes");
+    }
+
+    /// Behavioural: the whole detection chain must produce a budget on Windows,
+    /// with a source label that matches which probe won.
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_detect_memory_budget_is_never_unknown() {
+        let (budget, source) = detect_memory_budget();
+        assert!(budget.is_some(), "Windows memory budget must be detectable, got {source:?}");
+        assert!(
+            matches!(source, MemorySource::SystemTotal | MemorySource::JobObject),
+            "unexpected Windows memory source: {source:?}"
+        );
+    }
+
+    /// Behavioural: with a budget in hand, serve mode must derive the
+    /// memory-shaped knobs instead of falling back to the PHP-stock floors.
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_serve_autotune_derives_memory_shaped_knobs() {
+        let at = PhpConfig::default().autotune(false);
+        assert_eq!(at.memory_consumption.origin, Origin::Derived);
+        assert_eq!(at.memory_limit.origin, Origin::Derived);
+        assert_ne!(at.mem_source, MemorySource::Unknown);
     }
 
     // --- Resource-aware autotuning: derivation formulas ---

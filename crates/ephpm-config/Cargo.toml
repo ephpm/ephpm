@@ -13,6 +13,19 @@ serde_json.workspace = true
 figment.workspace = true
 thiserror.workspace = true
 
+# Serve-mode autotuning probes physical RAM (`GlobalMemoryStatusEx`) and the
+# job-object memory limit (`QueryInformationJobObject`) on Windows, the way it
+# reads cgroupfs/`/proc/meminfo` on Linux. Same 0.59 line the `ephpm` crate
+# already depends on, so this adds no new crate to the tree.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_JobObjects",
+    "Win32_System_SystemInformation",
+    # JOBOBJECT_EXTENDED_LIMIT_INFORMATION lives behind this feature.
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true
 
