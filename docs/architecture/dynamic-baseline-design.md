@@ -138,13 +138,14 @@ With `[php] extensions = ["/mw/pivot_ping.so"]`:
 - CLI: `PHPRC=/mw/cli-php.ini ephpm php -r 'var_dump(pivot_ping());'` →
   same string.
 
-Caveat found: `ephpm php -d extension=...` does **not** load the
-extension — PHP is initialized before CLI args are parsed, and
-`extension=` only takes effect at MINIT. `ephpm php` now **warns** when a
-runtime `-d extension=` is passed (rather than silently ignoring it) and
-points at `[php] extensions`. The CLI does not read `ephpm.toml` either;
-for a CLI-only load use `PHPRC` pointing at an ini with the `extension=`
-line.
+Caveat found at the time: `ephpm php -d extension=...` did **not** load
+the extension — PHP was initialized before CLI args were parsed, and
+`extension=` only takes effect at MINIT. **Resolved by #331** (v0.7.2):
+the CLI pre-scan now splices `-d` directives into
+`sapi_module.ini_entries` before module startup, exactly as php-cli
+does, so `-d extension=` loads for real and the interim warning was
+removed. The CLI still does not read `ephpm.toml`; `PHPRC` pointing at
+an ini with the `extension=` line also remains an option.
 
 ### 3.3 ABI rules
 
@@ -243,5 +244,5 @@ consecutive requests return `boot #1, request #N` with N climbing
    validated" rows in §6.
 5. **macOS runner group** — bring macos-arm64 release validation onto
    the native runner pool.
-6. **CLI ergonomics** — `ephpm php -d extension=` now warns rather than
-   silently ignoring the flag (§3.2).
+6. **CLI ergonomics** — resolved: `ephpm php -d extension=` loads the
+   extension at module startup since #331 (§3.2).

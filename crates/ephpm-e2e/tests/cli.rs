@@ -1,4 +1,6 @@
-//! `ephpm php` CLI conformance — fatal-error reporting and exit statuses.
+//! `ephpm php` CLI conformance — fatal-error reporting, exit statuses,
+//! startup-time `-d` (OPcache/JIT activation, issue #331) and the cli-SAPI
+//! process-title functions (issue #316).
 //!
 //! Regression cover for **issue #321**: on v0.7.0 a fatal error or an uncaught
 //! exception under `ephpm php -r` produced **no output at all and exit 0**,
@@ -230,6 +232,192 @@ fn stdin_program_fatal_reports_and_exits_255() {
         "stdin fatal should use php-cli's \"Standard input code\" label:\n{}",
         run.output()
     );
+}
+
+// ─── Issue #331: `-d` must apply at module startup (OPcache / JIT) ────────
+//
+// The observable defect: `-d opcache.enable_cli=1` made `ini_get()` report 1
+// while `opcache_get_status()` stayed `false`, because OPcache decides once —
+// in its MINIT-time startup hook — whether it will ever activate, and `-d`
+// used to be applied after init. The JIT (which lives in OPcache SHM) was
+// silently dead the same way. These assert the *activation*, not the ini
+// value, so the old failure mode cannot pass.
+
+/// `-d opcache.enable_cli=1` must actually activate OPcache, as in php-cli.
+#[test]
+fn opcache_activates_with_enable_cli() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(
+        &bin,
+        &[
+            "-d",
+            "opcache.enable_cli=1",
+            "-r",
+            // `?? false` so an inactive opcache (status === false) prints
+            // bool(false) instead of a bool-offset warning.
+            "var_dump(opcache_get_status(false)['opcache_enabled'] ?? false);",
+        ],
+        "",
+    );
+    assert_eq!(run.code, 0, "unexpected exit {} (output: {})", run.code, run.output());
+    assert_eq!(
+        run.stdout, "bool(true)\n",
+        "OPcache did not activate under -d opcache.enable_cli=1 (issue #331)\n\
+         --- stdout ---\n{}\n--- stderr ---\n{}",
+        run.stdout, run.stderr
+    );
+}
+
+/// Without the flag OPcache must stay inactive — the php-cli default. Pins
+/// that the fix didn't force opcache on unconditionally.
+#[test]
+fn opcache_stays_inactive_without_enable_cli() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(&bin, &["-r", "var_dump(opcache_get_status(false));"], "");
+    assert_eq!(run.code, 0, "unexpected exit {} (output: {})", run.code, run.output());
+    assert_eq!(
+        run.stdout, "bool(false)\n",
+        "OPcache should be inactive without opcache.enable_cli, like php-cli\n\
+         --- stdout ---\n{}\n--- stderr ---\n{}",
+        run.stdout, run.stderr
+    );
+}
+
+/// The JIT flags must reach OPcache's startup: `jit.on === true` and a
+/// non-zero buffer. This is the "CLI benchmarks vs real php are unfair" half
+/// of #331 — before the fix these flags silently no-oped.
+#[test]
+fn jit_activates_with_tracing_flags() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(
+        &bin,
+        &[
+            "-d",
+            "opcache.enable_cli=1",
+            "-d",
+            "opcache.jit=tracing",
+            "-d",
+            "opcache.jit_buffer_size=64M",
+            "-r",
+            "$s = opcache_get_status(false); \
+             var_dump($s['jit']['on'] ?? false, ($s['jit']['buffer_size'] ?? 0) > 0);",
+        ],
+        "",
+    );
+    assert_eq!(run.code, 0, "unexpected exit {} (output: {})", run.code, run.output());
+    assert_eq!(
+        run.stdout,
+        "bool(true)\nbool(true)\n",
+        "JIT did not come up under -d opcache.jit=tracing (issue #331)\n\
+         --- stdout ---\n{}\n--- stderr ---\n{}",
+        run.stdout, run.stderr
+    );
+}
+
+/// `-d` must override the embed SAPI's HARDCODED_INI defaults (the merge
+/// order pin: defines are spliced *after* the hardcoded block). The embed
+/// hardcodes max_execution_time=0, so a `-d` for it only wins if the order
+/// is right.
+#[test]
+fn ini_define_overrides_embed_hardcoded_defaults() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(
+        &bin,
+        &["-d", "max_execution_time=17", "-r", "var_dump(ini_get('max_execution_time'));"],
+        "",
+    );
+    assert_eq!(
+        run.stdout,
+        "string(2) \"17\"\n",
+        "-d must beat the embed SAPI's hardcoded ini defaults\n--- output ---\n{}",
+        run.output()
+    );
+    assert_eq!(run.code, 0);
+}
+
+/// A value starting with a non-alphanumeric goes through php-cli's
+/// quote-wrapping path (php_ini_builder_define); a path value is the
+/// canonical case.
+#[test]
+fn ini_define_quotes_non_alnum_values_like_php_cli() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run =
+        run_php(&bin, &["-d", "include_path=/e2e/one", "-r", "echo ini_get('include_path');"], "");
+    assert_eq!(
+        run.stdout,
+        "/e2e/one",
+        "quoted -d value did not round-trip\n--- output ---\n{}",
+        run.output()
+    );
+    assert_eq!(run.code, 0);
+}
+
+// ─── Issue #316: cli_set_process_title / cli_get_process_title ────────────
+
+/// The functions must exist under `ephpm php` on every platform — the `cli`
+/// SAPI identity promises them (PsySH calls cli_set_process_title, so
+/// `artisan tinker <file>` fataled while they were missing).
+#[test]
+fn process_title_functions_exist() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(
+        &bin,
+        &[
+            "-r",
+            "var_dump(function_exists('cli_set_process_title'), \
+             function_exists('cli_get_process_title'));",
+        ],
+        "",
+    );
+    assert_eq!(
+        run.stdout,
+        "bool(true)\nbool(true)\n",
+        "cli process-title functions missing (issue #316)\n--- output ---\n{}",
+        run.output()
+    );
+    assert_eq!(run.code, 0);
+}
+
+/// On Linux the title must genuinely change: set → true, get round-trips,
+/// and /proc/self/cmdline (what `ps` shows) begins with the new title —
+/// php-src's PS_USE_CLOBBER_ARGV behavior, not a stored-string fake.
+#[cfg(target_os = "linux")]
+#[test]
+fn process_title_round_trips_and_reaches_proc_cmdline() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(
+        &bin,
+        &[
+            "-r",
+            "$t = 'ephpm-e2e-title-316'; \
+             var_dump(cli_set_process_title($t)); \
+             var_dump(cli_get_process_title() === $t); \
+             var_dump(strpos(file_get_contents('/proc/self/cmdline'), $t) === 0);",
+        ],
+        "",
+    );
+    assert_eq!(
+        run.stdout,
+        "bool(true)\nbool(true)\nbool(true)\n",
+        "process title did not set / round-trip / reach /proc/self/cmdline\n\
+         --- stdout ---\n{}\n--- stderr ---\n{}",
+        run.stdout, run.stderr
+    );
+    assert_eq!(run.code, 0);
 }
 
 /// Non-fatal diagnostics were never broken — warnings printed fine on v0.7.0,
