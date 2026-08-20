@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <setjmp.h>
+#include <ctype.h>
 
 /* MSVC has no POSIX strtok_r; its strtok_s has the same 3-arg semantics. */
 #ifdef _MSC_VER
@@ -3456,39 +3457,378 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_ws_connection_close, 0, 0, 1)
     ZEND_ARG_INFO(0, code)
 ZEND_END_ARG_INFO()
 
+/* ===================================================================
+ * CLI process title — cli_set_process_title() / cli_get_process_title()
+ *
+ * php-src registers these two functions from the cli SAPI (sapi/cli/
+ * php_cli_process_title.c on top of ps_title.c, itself lifted from
+ * PostgreSQL's ps_status.c). The embed SAPI never registers them, so
+ * `ephpm php` — which deliberately reports PHP_SAPI === "cli" — fataled
+ * on code that keys on the SAPI name instead of function_exists()
+ * (PsySH calls cli_set_process_title(), so `artisan tinker <file>`
+ * died with "Call to undefined function"). Issue #316.
+ *
+ * This is a condensed port of ps_title.c for the platforms ePHPm ships:
+ *
+ *   Linux (glibc)  — PS_USE_CLOBBER_ARGV: overwrite the original argv
+ *                    (+ contiguous environ) area so /proc/self/cmdline
+ *                    and `ps` show the title. php-cli captures argv in
+ *                    main(); our main() is Rust, so a glibc `.init_array`
+ *                    constructor (which glibc calls with main's argc/
+ *                    argv/envp) captures it instead, and the environment
+ *                    is deep-copied out of the clobber area there —
+ *                    single-threaded, pre-main, exactly when php-cli's
+ *                    save_ps_args() would run. Unlike save_ps_args() we
+ *                    do NOT rewrite the argv[i] pointer slots or hand
+ *                    out an argv copy: Rust (clap, std::env::args) still
+ *                    reads the original argv, which stays intact until
+ *                    the first cli_set_process_title() call. After that
+ *                    call std::env::args() would read the title — the
+ *                    same property php-cli itself has for anything
+ *                    reading its clobbered argv — and the CLI parses its
+ *                    arguments long before any PHP script runs.
+ *   Windows        — PS_USE_WIN32: SetConsoleTitleW / GetConsoleTitleW
+ *                    with UTF-8 <-> UTF-16 conversion (php-src converts
+ *                    via php_win32_cp_any_to_w; the runtime codepage is
+ *                    UTF-8 in these builds). Fails honestly (false /
+ *                    "Windows error code: N") when no console exists.
+ *   elsewhere      — PS_TITLE_NOT_AVAILABLE, reported exactly as php's
+ *                    ps_title.c reports an unsupported OS ("Not
+ *                    available on this OS"): warning + false/NULL, never
+ *                    fake success. (macOS could adopt the clobber path +
+ *                    _NSGetArgv fix later; it is left honest-unsupported
+ *                    rather than shipped unverified.)
+ *
+ * Return-value contract matches php_cli_process_title.c byte for byte:
+ * set → true, or E_WARNING "cli_set_process_title had an error: <why>"
+ * + false; get → the stored title, or the same-shaped warning + null.
+ * PHP 8.5 changed set() to reject an over-long title ("Too long")
+ * instead of truncating; mirrored under PHP_VERSION_ID.
+ * =================================================================== */
+
+/* Status codes, mirroring sapi/cli/ps_title.h. */
+#define EPHPM_PS_TITLE_SUCCESS         0
+#define EPHPM_PS_TITLE_NOT_AVAILABLE   1
+#define EPHPM_PS_TITLE_NOT_INITIALIZED 2
+#define EPHPM_PS_TITLE_WINDOWS_ERROR   4
+#define EPHPM_PS_TITLE_TOO_LONG        5
+
+#if defined(__linux__) && defined(__GLIBC__)
+#define EPHPM_PS_USE_CLOBBER_ARGV 1
+
+extern char **environ;
+
+static char *g_ps_buffer = NULL;      /* the original argv area */
+static size_t g_ps_buffer_size = 0;   /* clobberable bytes at g_ps_buffer */
+static size_t g_ps_buffer_cur_len = 0;
+static int g_ps_args_saved = 0;
+
+/*
+ * Capture the process argv area before Rust's main() runs. glibc invokes
+ * `.init_array` constructors with (argc, argv, envp), which is the only way
+ * to reach the REAL argv from a program whose main() is Rust. Gated to the
+ * `ephpm php` invocation (argv[1] == "php"): only the CLI registers the
+ * title functions, and the serve-mode process should not have its
+ * environment relocated behind Rust's back. If the gate or the contiguity
+ * check misses, the functions degrade to php's honest "Not initialized
+ * correctly" failure instead of guessing at memory layout.
+ *
+ * The environ deep-copy-and-swap is verbatim save_ps_args() logic: the
+ * kernel places environ strings directly after argv strings, so clobbering
+ * a long title into the area would corrupt the environment unless it has
+ * been moved first. Copying here is safe — pre-main is single-threaded, and
+ * both glibc (getenv/setenv) and Rust std::env read the live `environ`
+ * global rather than caching the startup block. The copies are process-
+ * lifetime by design (php frees its own only for valgrind's benefit, from
+ * a cleanup hook we don't have).
+ */
+__attribute__((constructor)) static void ephpm_ps_capture_argv(
+    int argc, char **argv, char **envp)
+{
+    (void)envp;
+    if (argc < 2 || !argv || !argv[0] || !argv[1] || strcmp(argv[1], "php") != 0) {
+        return;
+    }
+
+    /* Contiguity check over argv, exactly as save_ps_args(). */
+    char *end_of_area = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (!argv[i] || (i != 0 && end_of_area + 1 != argv[i])) {
+            return; /* unexpected layout — leave the title unsupported */
+        }
+        end_of_area = argv[i] + strlen(argv[i]);
+    }
+
+    /* Extend the clobber area over contiguous environ strings, then move
+     * the environment out of it. */
+    int n = 0;
+    while (environ[n] != NULL) {
+        n++;
+    }
+    char **new_environ = (char **)malloc(((size_t)n + 1) * sizeof(char *));
+    if (!new_environ) {
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        if (end_of_area + 1 == environ[i]) {
+            end_of_area = environ[i] + strlen(environ[i]);
+        }
+        new_environ[i] = strdup(environ[i]);
+        if (!new_environ[i]) {
+            for (int j = 0; j < i; j++) {
+                free(new_environ[j]);
+            }
+            free(new_environ);
+            return;
+        }
+    }
+    new_environ[n] = NULL;
+    environ = new_environ;
+
+    g_ps_buffer = argv[0];
+    g_ps_buffer_size = (size_t)(end_of_area - argv[0]);
+    g_ps_buffer_cur_len = 0;
+    g_ps_args_saved = 1;
+}
+
+#elif defined(_WIN32)
+#define EPHPM_PS_USE_WIN32 1
+
+/* UTF-8 rendering of the console title; MAX_PATH UTF-16 units can need up
+ * to 3 bytes each. Mirrors ps_title.c's MAX_PATH-sized ps_buffer. */
+static char g_ps_buffer[MAX_PATH * 3];
+static size_t g_ps_buffer_cur_len = 0;
+static char g_ps_windows_error[64];
+#endif
+
+/* is_ps_title_available(), condensed. */
+static int ephpm_ps_title_available(void)
+{
+#if defined(EPHPM_PS_USE_CLOBBER_ARGV)
+    return g_ps_args_saved ? EPHPM_PS_TITLE_SUCCESS : EPHPM_PS_TITLE_NOT_INITIALIZED;
+#elif defined(EPHPM_PS_USE_WIN32)
+    /* php-cli's save_ps_args() runs unconditionally in main(), so Windows
+     * is always "initialized" there; the CLI-mode flag is our equivalent. */
+    return g_cli_mode ? EPHPM_PS_TITLE_SUCCESS : EPHPM_PS_TITLE_NOT_INITIALIZED;
+#else
+    return EPHPM_PS_TITLE_NOT_AVAILABLE;
+#endif
+}
+
+/* ps_title_errno(), same strings as sapi/cli/ps_title.c. */
+static const char *ephpm_ps_title_errno(int rc)
+{
+    switch (rc) {
+    case EPHPM_PS_TITLE_SUCCESS:
+        return "Success";
+    case EPHPM_PS_TITLE_NOT_AVAILABLE:
+        return "Not available on this OS";
+    case EPHPM_PS_TITLE_NOT_INITIALIZED:
+        return "Not initialized correctly";
+    case EPHPM_PS_TITLE_TOO_LONG:
+        return "Too long";
+#ifdef EPHPM_PS_USE_WIN32
+    case EPHPM_PS_TITLE_WINDOWS_ERROR:
+        snprintf(g_ps_windows_error, sizeof(g_ps_windows_error),
+                 "Windows error code: %lu", GetLastError());
+        return g_ps_windows_error;
+#endif
+    default:
+        break;
+    }
+    return "Unknown error code";
+}
+
+/* set_ps_title(). PHP 8.5 rejects an over-long title; earlier truncate. */
+static int ephpm_set_ps_title(const char *title, size_t title_len)
+{
+    int rc = ephpm_ps_title_available();
+    if (rc != EPHPM_PS_TITLE_SUCCESS) {
+        return rc;
+    }
+
+#if defined(EPHPM_PS_USE_CLOBBER_ARGV)
+#if PHP_VERSION_ID >= 80500
+    if (title_len >= g_ps_buffer_size) {
+        return EPHPM_PS_TITLE_TOO_LONG;
+    }
+    /* Includes the final NUL: zend strings are NUL-terminated. */
+    memcpy(g_ps_buffer, title, title_len + 1);
+    g_ps_buffer_cur_len = title_len;
+#else
+    strncpy(g_ps_buffer, title, g_ps_buffer_size);
+    g_ps_buffer[g_ps_buffer_size - 1] = '\0';
+    g_ps_buffer_cur_len = strlen(g_ps_buffer);
+    (void)title_len;
+#endif
+    /* Pad the rest of the area with NULs (PS_PADDING on Linux) so stale
+     * argv/environ bytes never leak into /proc/self/cmdline. */
+    if (g_ps_buffer_cur_len < g_ps_buffer_size) {
+        memset(g_ps_buffer + g_ps_buffer_cur_len, '\0',
+               g_ps_buffer_size - g_ps_buffer_cur_len);
+    }
+    return EPHPM_PS_TITLE_SUCCESS;
+#elif defined(EPHPM_PS_USE_WIN32)
+#if PHP_VERSION_ID >= 80500
+    if (title_len >= sizeof(g_ps_buffer)) {
+        return EPHPM_PS_TITLE_TOO_LONG;
+    }
+#else
+    if (title_len >= sizeof(g_ps_buffer)) {
+        title_len = sizeof(g_ps_buffer) - 1; /* pre-8.5: truncate like strncpy */
+    }
+#endif
+    {
+        wchar_t wide[MAX_PATH];
+        char truncated[sizeof(g_ps_buffer)];
+        memcpy(truncated, title, title_len);
+        truncated[title_len] = '\0';
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, truncated, -1, wide, MAX_PATH);
+        if (wlen == 0 || !SetConsoleTitleW(wide)) {
+            return EPHPM_PS_TITLE_WINDOWS_ERROR;
+        }
+        memcpy(g_ps_buffer, truncated, title_len + 1);
+        g_ps_buffer_cur_len = title_len;
+    }
+    return EPHPM_PS_TITLE_SUCCESS;
+#else
+    (void)title;
+    (void)title_len;
+    return EPHPM_PS_TITLE_NOT_AVAILABLE; /* unreachable: available() failed */
+#endif
+}
+
+/* get_ps_title(). On Windows the console is re-queried, as php-src does. */
+static int ephpm_get_ps_title(size_t *displen, const char **string)
+{
+    int rc = ephpm_ps_title_available();
+    if (rc != EPHPM_PS_TITLE_SUCCESS) {
+        return rc;
+    }
+
+#if defined(EPHPM_PS_USE_WIN32)
+    {
+        wchar_t wide[MAX_PATH];
+        if (!GetConsoleTitleW(wide, MAX_PATH)) {
+            return EPHPM_PS_TITLE_WINDOWS_ERROR;
+        }
+        int bytes = WideCharToMultiByte(
+            CP_UTF8, 0, wide, -1, g_ps_buffer, (int)sizeof(g_ps_buffer), NULL, NULL);
+        if (bytes == 0) {
+            return EPHPM_PS_TITLE_WINDOWS_ERROR;
+        }
+        g_ps_buffer_cur_len = (size_t)bytes - 1; /* bytes includes the NUL */
+    }
+#endif
+#if defined(EPHPM_PS_USE_CLOBBER_ARGV) || defined(EPHPM_PS_USE_WIN32)
+    *displen = g_ps_buffer_cur_len;
+    *string = g_ps_buffer;
+    return EPHPM_PS_TITLE_SUCCESS;
+#else
+    (void)displen;
+    (void)string;
+    return EPHPM_PS_TITLE_NOT_AVAILABLE; /* unreachable: available() failed */
+#endif
+}
+
+/* PHP_FUNCTION bodies: verbatim php_cli_process_title.c semantics. */
+PHP_FUNCTION(cli_set_process_title)
+{
+    char *title = NULL;
+    size_t title_len;
+    int rc;
+
+    if (zend_parse_parameters(ZEND_NUM_ARGS(), "s", &title, &title_len) == FAILURE) {
+        RETURN_THROWS();
+    }
+
+    rc = ephpm_set_ps_title(title, title_len);
+    if (rc == EPHPM_PS_TITLE_SUCCESS) {
+        RETURN_TRUE;
+    }
+
+    php_error_docref(NULL, E_WARNING, "cli_set_process_title had an error: %s",
+                     ephpm_ps_title_errno(rc));
+    RETURN_FALSE;
+}
+
+PHP_FUNCTION(cli_get_process_title)
+{
+    size_t length = 0;
+    const char *title = NULL;
+    int rc;
+
+    if (zend_parse_parameters_none() == FAILURE) {
+        RETURN_THROWS();
+    }
+
+    rc = ephpm_get_ps_title(&length, &title);
+    if (rc != EPHPM_PS_TITLE_SUCCESS) {
+        php_error_docref(NULL, E_WARNING, "cli_get_process_title had an error: %s",
+                         ephpm_ps_title_errno(rc));
+        RETURN_NULL();
+    }
+
+    RETURN_STRINGL(title, length);
+}
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_cli_set_process_title, 0, 0, 1)
+    ZEND_ARG_INFO(0, title)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_cli_get_process_title, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
 /* ── Function entry table (null-terminated) ──────────────────── */
 
-static const zend_function_entry ephpm_kv_functions[] = {
-    PHP_FE(ephpm_kv_get,       arginfo_ephpm_kv_get)
-    PHP_FE(ephpm_kv_set,       arginfo_ephpm_kv_set)
-    PHP_FE(ephpm_kv_setnx,     arginfo_ephpm_kv_setnx)
-    PHP_FE(ephpm_kv_del,       arginfo_ephpm_kv_del)
-    PHP_FE(ephpm_kv_exists,    arginfo_ephpm_kv_exists)
-    PHP_FE(ephpm_kv_incr,      arginfo_ephpm_kv_incr)
-    PHP_FE(ephpm_kv_decr,      arginfo_ephpm_kv_decr)
-    PHP_FE(ephpm_kv_incr_by,   arginfo_ephpm_kv_incr_by)
-    PHP_FE(ephpm_kv_expire,    arginfo_ephpm_kv_expire)
-    PHP_FE(ephpm_kv_ttl,       arginfo_ephpm_kv_ttl)
-    PHP_FE(ephpm_kv_pttl,      arginfo_ephpm_kv_pttl)
-    PHP_FE(ephpm_kv_flush_all, arginfo_ephpm_kv_flush_all)
-    PHP_FE(ephpm_kv_wait,      arginfo_ephpm_kv_wait)
-    /* Embedded database bridge (per-thread litewire Session). */
-    PHP_FE(ephpm_db_query,     arginfo_ephpm_db_query)
-    PHP_FE(ephpm_db_execute,   arginfo_ephpm_db_execute)
-    /* WebSocket bridge (site-scoped connection registry). Implicit forms
-     * act on the connection that fired the current event; the
-     * ephpm_ws_connection_* forms take an explicit id. */
-    PHP_FE(ephpm_ws_send,                    arginfo_ephpm_ws_send)
-    PHP_FE(ephpm_ws_connection_send,         arginfo_ephpm_ws_connection_send)
-    PHP_FE(ephpm_ws_subscribe,               arginfo_ephpm_ws_subscribe)
-    PHP_FE(ephpm_ws_connection_subscribe,    arginfo_ephpm_ws_connection_subscribe)
-    PHP_FE(ephpm_ws_unsubscribe,             arginfo_ephpm_ws_unsubscribe)
-    PHP_FE(ephpm_ws_connection_unsubscribe,  arginfo_ephpm_ws_connection_unsubscribe)
-    PHP_FE(ephpm_ws_broadcast,               arginfo_ephpm_ws_broadcast)
-    PHP_FE(ephpm_ws_close,                   arginfo_ephpm_ws_close)
+/* The entries every mode gets. Kept as a macro so the serve-mode table and
+ * the CLI table (which adds the cli-SAPI-only functions) share one list —
+ * a new native function added here lands in both automatically. */
+#define EPHPM_COMMON_FUNCTION_ENTRIES \
+    PHP_FE(ephpm_kv_get,       arginfo_ephpm_kv_get) \
+    PHP_FE(ephpm_kv_set,       arginfo_ephpm_kv_set) \
+    PHP_FE(ephpm_kv_setnx,     arginfo_ephpm_kv_setnx) \
+    PHP_FE(ephpm_kv_del,       arginfo_ephpm_kv_del) \
+    PHP_FE(ephpm_kv_exists,    arginfo_ephpm_kv_exists) \
+    PHP_FE(ephpm_kv_incr,      arginfo_ephpm_kv_incr) \
+    PHP_FE(ephpm_kv_decr,      arginfo_ephpm_kv_decr) \
+    PHP_FE(ephpm_kv_incr_by,   arginfo_ephpm_kv_incr_by) \
+    PHP_FE(ephpm_kv_expire,    arginfo_ephpm_kv_expire) \
+    PHP_FE(ephpm_kv_ttl,       arginfo_ephpm_kv_ttl) \
+    PHP_FE(ephpm_kv_pttl,      arginfo_ephpm_kv_pttl) \
+    PHP_FE(ephpm_kv_flush_all, arginfo_ephpm_kv_flush_all) \
+    PHP_FE(ephpm_kv_wait,      arginfo_ephpm_kv_wait) \
+    /* Embedded database bridge (per-thread litewire Session). */ \
+    PHP_FE(ephpm_db_query,     arginfo_ephpm_db_query) \
+    PHP_FE(ephpm_db_execute,   arginfo_ephpm_db_execute) \
+    /* WebSocket bridge (site-scoped connection registry). Implicit forms \
+     * act on the connection that fired the current event; the \
+     * ephpm_ws_connection_* forms take an explicit id. */ \
+    PHP_FE(ephpm_ws_send,                    arginfo_ephpm_ws_send) \
+    PHP_FE(ephpm_ws_connection_send,         arginfo_ephpm_ws_connection_send) \
+    PHP_FE(ephpm_ws_subscribe,               arginfo_ephpm_ws_subscribe) \
+    PHP_FE(ephpm_ws_connection_subscribe,    arginfo_ephpm_ws_connection_subscribe) \
+    PHP_FE(ephpm_ws_unsubscribe,             arginfo_ephpm_ws_unsubscribe) \
+    PHP_FE(ephpm_ws_connection_unsubscribe,  arginfo_ephpm_ws_connection_unsubscribe) \
+    PHP_FE(ephpm_ws_broadcast,               arginfo_ephpm_ws_broadcast) \
+    PHP_FE(ephpm_ws_close,                   arginfo_ephpm_ws_close) \
     PHP_FE(ephpm_ws_connection_close,        arginfo_ephpm_ws_connection_close)
+
+static const zend_function_entry ephpm_kv_functions[] = {
+    EPHPM_COMMON_FUNCTION_ENTRIES
     PHP_FE_END
 };
+
+/* CLI-mode table: everything above plus the functions the cli SAPI itself
+ * registers in php-src (issue #316). Selected by ephpm_module_startup()
+ * when g_cli_mode is set, so a web request never sees them. */
+static const zend_function_entry ephpm_cli_functions[] = {
+    EPHPM_COMMON_FUNCTION_ENTRIES
+    PHP_FE(cli_set_process_title, arginfo_cli_set_process_title)
+    PHP_FE(cli_get_process_title, arginfo_cli_get_process_title)
+    PHP_FE_END
+};
+
 
 /* ===================================================================
  * Native session save handler — `session.save_handler = ephpm`.
@@ -4009,6 +4349,100 @@ void ephpm_cli_set_no_ini(void)
     php_embed_module.php_ini_ignore_cwd = 1;
 }
 
+/* ===== CLI `-d` directives (startup-time, issue #331) =====
+ *
+ * php-cli applies `-d name[=value]` by appending "name=value\n" lines to
+ * sapi_module.ini_entries BEFORE php_module_startup(), so the values are in
+ * the configuration hash when every extension's MINIT runs. That timing is
+ * load-bearing: OPcache decides once, in accel_startup() (a MINIT-time hook),
+ * whether it will ever be active — on 8.3/8.4 accel_find_sapi() requires
+ * `opcache.enable_cli=1` for the "cli" SAPI, and 8.5 keeps the same
+ * enable_cli-at-startup check without the allowlist. The JIT is likewise
+ * wired up at startup (its buffer lives in OPcache SHM). Applying `-d` after
+ * php_embed_init() — the pre-#331 behavior — changed the ini entry (visible
+ * to ini_get()) but could never re-run that decision, so
+ * `-d opcache.enable_cli=1` reported 1 while opcache_get_status() stayed
+ * false and `-d opcache.jit=…` silently did nothing.
+ *
+ * The buffer below accumulates directives in exactly the format php-cli's
+ * php_ini_builder_define() produces (value double-quoted when it starts with
+ * a non-alphanumeric that isn't already a quote; bare `-d name` = "name=1").
+ * ephpm_module_startup() splices it AFTER the embed SAPI's HARDCODED_INI so
+ * `-d` wins over those defaults, exactly as php-cli's `-d` wins over its
+ * ini_defaults. Because the whole string is parsed during php_init_config()
+ * this also restores php-cli's `-d extension=…` / `-d zend_extension=…`
+ * behavior: the ini parser routes those to the extension lists that
+ * php_ini_register_extensions() loads during module startup.
+ *
+ * Not implemented with PHP's own php_ini_builder API on purpose: these
+ * helpers run BEFORE php_embed_init(), and keeping them libc-only avoids
+ * depending on PHPAPI symbol export differences across the per-platform SDK
+ * builds. The buffer intentionally lives for the process lifetime (php-cli
+ * frees its builder only at exit; ours is handed to sapi_module.ini_entries).
+ */
+static char *g_cli_ini_defines = NULL;
+static size_t g_cli_ini_defines_len = 0;
+static size_t g_cli_ini_defines_cap = 0;
+
+/* Append `len` bytes to the define buffer, growing it as needed. Returns 0
+ * on allocation failure (the directive is then dropped — matching the spirit
+ * of php-cli, where a failed realloc aborts; we degrade instead because this
+ * runs before PHP's own error machinery exists). */
+static int cli_ini_defines_append(const char *src, size_t len)
+{
+    if (g_cli_ini_defines_len + len + 1 > g_cli_ini_defines_cap) {
+        size_t ncap = g_cli_ini_defines_cap ? g_cli_ini_defines_cap : 256;
+        while (g_cli_ini_defines_len + len + 1 > ncap) {
+            ncap *= 2;
+        }
+        char *nbuf = (char *)realloc(g_cli_ini_defines, ncap);
+        if (!nbuf) {
+            return 0;
+        }
+        g_cli_ini_defines = nbuf;
+        g_cli_ini_defines_cap = ncap;
+    }
+    memcpy(g_cli_ini_defines + g_cli_ini_defines_len, src, len);
+    g_cli_ini_defines_len += len;
+    g_cli_ini_defines[g_cli_ini_defines_len] = '\0';
+    return 1;
+}
+
+/*
+ * Record one CLI `-d name[=value]` directive for startup-time application.
+ * Must be called BEFORE php_embed_init() — driven from the Rust CLI pre-scan
+ * alongside ephpm_enable_cli_mode()/-c/-n. The string is copied immediately;
+ * the caller's pointer need not outlive the call.
+ *
+ * Quoting mirrors php-cli's php_ini_builder_define() exactly: a value whose
+ * first character is non-alphanumeric and not already a quote is wrapped in
+ * double quotes (so `-d error_reporting=E_ALL & ~E_NOTICE` parses as one
+ * value), and a bare `-d name` becomes `name=1`.
+ */
+void ephpm_cli_add_ini_define(const char *def)
+{
+    if (!def || !*def) {
+        return;
+    }
+    size_t len = strlen(def);
+    const char *val = strchr(def, '=');
+
+    if (val != NULL) {
+        val++;
+        if (!isalnum((unsigned char)*val) && *val != '"' && *val != '\'' && *val != '\0') {
+            /* name= + "value" + \n */
+            (void)(cli_ini_defines_append(def, (size_t)(val - def))
+                && cli_ini_defines_append("\"", 1)
+                && cli_ini_defines_append(val, len - (size_t)(val - def))
+                && cli_ini_defines_append("\"\n", 2));
+        } else {
+            (void)(cli_ini_defines_append(def, len) && cli_ini_defines_append("\n", 1));
+        }
+    } else {
+        (void)(cli_ini_defines_append(def, len) && cli_ini_defines_append("=1\n", 3));
+    }
+}
+
 /*
  * Custom startup callback installed in place of php_embed_module.startup.
  *
@@ -4038,7 +4472,33 @@ void ephpm_cli_set_no_ini(void)
  */
 static int ephpm_module_startup(sapi_module_struct *sm)
 {
-    sm->additional_functions = ephpm_kv_functions;
+    /* In CLI mode the table additionally carries the cli-SAPI-only functions
+     * (cli_set_process_title / cli_get_process_title, issue #316) — the `cli`
+     * SAPI identity promises them, but a web request must never see them
+     * (php-fpm has its own fastcgi_* equivalents; ours reports "ephpm"). */
+    sm->additional_functions = g_cli_mode ? ephpm_cli_functions : ephpm_kv_functions;
+
+    /* Splice CLI `-d` directives into the SAPI's startup ini (issue #331).
+     * php_embed_init() has just set sm->ini_entries to the embed SAPI's
+     * HARDCODED_INI; php_module_startup() re-copies *sm into sapi_module and
+     * php_init_config() parses ini_entries LAST (after any php.ini), so this
+     * is the exact window php-cli's `-d` handling occupies. Our entries go
+     * AFTER the hardcoded ones so `-d` overrides them, and after-the-file
+     * parsing means `-d` overrides php.ini — both php-cli behaviors. The
+     * merged buffer must outlive module startup; like php-cli's ini string it
+     * is left to the process teardown. */
+    if (g_cli_ini_defines) {
+        size_t base_len = sm->ini_entries ? strlen(sm->ini_entries) : 0;
+        char *merged = (char *)malloc(base_len + g_cli_ini_defines_len + 1);
+        if (merged) {
+            if (base_len) {
+                memcpy(merged, sm->ini_entries, base_len);
+            }
+            memcpy(merged + base_len, g_cli_ini_defines, g_cli_ini_defines_len);
+            merged[base_len + g_cli_ini_defines_len] = '\0';
+            sm->ini_entries = merged;
+        }
+    }
     /* Register the worker module as php_module_startup's `additional_module` so
      * its functions (Ephpm\Worker\take_request/send_response) and its MINIT
      * (the Envelope class) land in CG(function_table)/CG(class_table) DURING
@@ -4444,31 +4904,6 @@ static int cli_scan_protected(int mode, const char *filename, const char *php_se
 }
 
 /*
- * Apply a single `-d name[=value]` ini directive, matching php-cli semantics:
- * a bare `-d name` sets it to "1". Applied after startup via
- * zend_alter_ini_entry_chars at SYSTEM/ACTIVATE privilege so PHP_INI_ALL and
- * PHP_INI_SYSTEM-at-activate entries (memory_limit, error_reporting,
- * disable_functions, …) take effect for the executed script. Entries that are
- * only settable at MINIT (e.g. most opcache.* / extension=) cannot be changed
- * post-startup in the embed model — the same limitation the `-d extension=`
- * warning in the Rust layer documents.
- */
-static void cli_apply_ini_define(const char *def)
-{
-    const char *eq = strchr(def, '=');
-    size_t name_len = eq ? (size_t)(eq - def) : strlen(def);
-    const char *value = eq ? eq + 1 : "1";
-    size_t value_len = strlen(value);
-    if (name_len == 0) {
-        return;
-    }
-    zend_string *key = zend_string_init(def, name_len, 0);
-    zend_alter_ini_entry_chars(
-        key, (char *)value, value_len, ZEND_INI_SYSTEM, ZEND_INI_STAGE_ACTIVATE);
-    zend_string_release(key);
-}
-
-/*
  * Portable line reader for the -R/-F/-B/-E stdin line processor and REPL-free
  * stdin execution. Reads one line (including any trailing newline) from `fp`
  * into a malloc'd buffer. Returns the buffer (caller frees) and sets *out_len,
@@ -4679,12 +5114,6 @@ int ephpm_cli_main(int argc, char **argv)
     int want_interactive = 0;   /* -a */
     int read_stdin = 0;         /* script/program comes from stdin */
 
-    /* Collected -d name[=value] directives (applied after startup). Bounded;
-     * a CLI invocation with hundreds of -d is pathological, and extra ones are
-     * silently dropped rather than risk an unbounded stack array. */
-    const char *ini_defines[128];
-    int n_ini_defines = 0;
-
     /* First pass: handle flags that print info and exit immediately */
     while ((c = php_getopt(argc, argv, cli_options, &php_optarg, &php_optind, 0, 2)) != -1) {
         switch (c) {
@@ -4850,9 +5279,13 @@ int ephpm_cli_main(int argc, char **argv)
             mode = 's';
             break;
         case 'd':
-            if (n_ini_defines < (int)(sizeof(ini_defines) / sizeof(ini_defines[0]))) {
-                ini_defines[n_ini_defines++] = php_optarg;
-            }
+            /* Already applied. `-d` must take effect at module startup (the
+             * OPcache/JIT decision is made in MINIT — issue #331), so the
+             * Rust pre-scan collected these and ephpm_cli_add_ini_define()
+             * spliced them into sapi_module.ini_entries before
+             * php_module_startup(), exactly as php-cli does. php_getopt still
+             * consumes the argument here so positional detection stays
+             * correct. */
             break;
         case 'B':
             begin_code = php_optarg;
@@ -4872,9 +5305,10 @@ int ephpm_cli_main(int argc, char **argv)
         case 'S':
             server_addr = php_optarg;
             break;
-        /* -c and -n are init-time (which ini to load) and are handled by the
-         * Rust pre-scan before php_embed_init; php_getopt still consumes their
-         * arguments here so positional detection stays correct. */
+        /* -c, -n and -d are init-time (which ini to load, and startup ini
+         * overrides) and are handled by the Rust pre-scan before
+         * php_embed_init; php_getopt still consumes their arguments here so
+         * positional detection stays correct. */
         default:
             break;
         }
@@ -4904,11 +5338,6 @@ int ephpm_cli_main(int argc, char **argv)
             "Use a full php-cli for `php -S`, or run `ephpm serve` / `ephpm dev` for\n"
             "ePHPm's own HTTP server.\n");
         return 1;
-    }
-
-    /* Apply -d directives now that the runtime is up (see cli_apply_ini_define). */
-    for (int i = 0; i < n_ini_defines; i++) {
-        cli_apply_ini_define(ini_defines[i]);
     }
 
     /* Define STDIN/STDOUT/STDERR before any script runs, like php-cli. */

@@ -127,6 +127,16 @@ mod ffi {
         /// `php_embed_init()` (the ini search happens during module startup).
         pub fn ephpm_cli_set_no_ini();
 
+        /// CLI `-d name[=value]` — record one ini directive for startup-time
+        /// application (spliced into `sapi_module.ini_entries` before
+        /// `php_module_startup()`, exactly as php-cli applies `-d`). Must be
+        /// called BEFORE `php_embed_init()`: MINIT-time consumers (OPcache's
+        /// enable/enable_cli/JIT decision, `extension=` loading) read the
+        /// value during module startup and never again (issue #331). The
+        /// string is copied immediately; the pointer need not outlive the
+        /// call.
+        pub fn ephpm_cli_add_ini_define(def: *const ::std::os::raw::c_char);
+
         /// Set the configured `max_execution_time` (seconds) the request paths
         /// use to arm PHP's per-thread execution timer. Necessary because the
         /// embed SAPI resets the `max_execution_time` ini entry to `0`
@@ -436,26 +446,33 @@ pub struct PhpRuntime {
     initialized: bool,
 }
 
-/// Pre-scan `ephpm php` arguments for the two ini-loading flags that must be
-/// decided *before* `php_embed_init()` runs: `-c <path>` (use this php.ini) and
-/// `-n` (load no ini at all). The C option parser (`php_getopt`) only runs
-/// after init, which is too late to influence which ini PHP loads at module
-/// startup — so this lightweight, `php_getopt`-aware scan mirrors its short-
-/// option semantics (bundled flags, attached-or-separate arguments) closely
-/// enough to locate `-c`/`-n` without ever mistaking an option *argument* (e.g.
-/// the code after `-r`) for one of them.
+/// Pre-scan `ephpm php` arguments for the ini flags that must be decided
+/// *before* `php_embed_init()` runs: `-c <path>` (use this php.ini), `-n`
+/// (load no ini at all), and every `-d name[=value]` directive. The C option
+/// parser (`php_getopt`) only runs after init, which is too late to influence
+/// which ini PHP loads — or which values MINIT-time consumers see: OPcache
+/// decides at module startup whether it will ever activate
+/// (`opcache.enable_cli`, the JIT knobs) and `extension=` lines load there
+/// too, so `-d` has to reach `sapi_module.ini_entries` before startup exactly
+/// as it does in php-cli (issue #331). This lightweight, `php_getopt`-aware
+/// scan mirrors its short-option semantics (bundled flags,
+/// attached-or-separate arguments) closely enough to locate them without ever
+/// mistaking an option *argument* (e.g. the code after `-r`) for one of them.
 ///
-/// Returns `(ini_path, no_ini)`. `-n` takes precedence over `-c`, matching
-/// php-cli. Scanning stops at the first positional (the script), at `--`, or at
-/// the `-` stdin sentinel — everything after those is script arguments, not
+/// Returns `(ini_path, no_ini, ini_defines)`. `-n` takes precedence over
+/// `-c`, matching php-cli (but does not suppress `-d`, also matching).
+/// Scanning stops at the first positional (the script), at `--`, or at the
+/// `-` stdin sentinel — everything after those is script arguments, not
 /// interpreter options.
 #[cfg(any(php_linked, test))]
-fn precscan_cli_ini_flags(args: &[String]) -> (Option<String>, bool) {
+#[allow(clippy::too_many_lines)]
+fn precscan_cli_ini_flags(args: &[String]) -> (Option<String>, bool, Vec<String>) {
     /// Short options that consume a following argument (from `cli_options`).
     const TAKES_ARG: &[char] = &['B', 'c', 'd', 'E', 'F', 'f', 'R', 'r', 'S', 't'];
 
     let mut ini_path: Option<String> = None;
     let mut no_ini = false;
+    let mut ini_defines: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -511,6 +528,21 @@ fn precscan_cli_ini_flags(args: &[String]) -> (Option<String>, bool) {
                     }
                     break;
                 }
+                if ch == 'd' {
+                    // Same value shapes as `-c`: attached (`-dfoo=1`) or the
+                    // next token (`-d foo=1`). Order is preserved — a later
+                    // `-d` for the same key wins, as in php-cli.
+                    let rest: String = chars[j + 1..].iter().collect();
+                    if rest.is_empty() {
+                        if let Some(next) = args.get(i + 1) {
+                            ini_defines.push(next.clone());
+                            consumed_next = true;
+                        }
+                    } else {
+                        ini_defines.push(rest);
+                    }
+                    break;
+                }
                 if TAKES_ARG.contains(&ch) {
                     // Some other arg-taking option (r, f, d, …). Its argument is
                     // the rest of this token, or the next token — skip it so its
@@ -532,7 +564,8 @@ fn precscan_cli_ini_flags(args: &[String]) -> (Option<String>, bool) {
         break;
     }
     // `-n` (ignore all ini) subsumes `-c` (choose an ini), matching php-cli.
-    (if no_ini { None } else { ini_path }, no_ini)
+    // `-d` directives survive `-n` — `php -n -d x=y` applies them there too.
+    (if no_ini { None } else { ini_path }, no_ini, ini_defines)
 }
 
 /// Whether the PHP module has been initialized (set once by `init()`).
@@ -809,11 +842,14 @@ impl PhpRuntime {
     /// Returns `PhpError::LockPoisoned` or `PhpError::InitFailed` on failure.
     pub fn cli_main(args: &[String]) -> Result<i32, PhpError> {
         // Init-time CLI decisions that must be settled BEFORE php_embed_init()
-        // runs (inside `Self::init()`): the SAPI identity ("cli"), and which
-        // php.ini to load (`-c <path>` / `-n`). Parsed from a lightweight,
-        // php_getopt-aware pre-scan because the C option parser only runs
-        // afterwards. The `-c` path CString is bound for the rest of this
-        // function so its pointer stays valid until init completes.
+        // runs (inside `Self::init()`): the SAPI identity ("cli"), which
+        // php.ini to load (`-c <path>` / `-n`), and the `-d` ini directives —
+        // those must be in `sapi_module.ini_entries` when module startup runs
+        // so MINIT-time consumers (OPcache/JIT activation, `extension=`) see
+        // them, exactly as php-cli applies them (issue #331). Parsed from a
+        // lightweight, php_getopt-aware pre-scan because the C option parser
+        // only runs afterwards. The `-c` path CString is bound for the rest of
+        // this function so its pointer stays valid until init completes.
         #[cfg(php_linked)]
         let _cli_ini_path_cstring = {
             use std::ffi::CString;
@@ -823,7 +859,19 @@ impl PhpRuntime {
             // startup; no PHP runtime state exists yet.
             unsafe { ffi::ephpm_enable_cli_mode() };
 
-            let (ini_override, no_ini) = precscan_cli_ini_flags(args);
+            let (ini_override, no_ini, ini_defines) = precscan_cli_ini_flags(args);
+
+            for define in &ini_defines {
+                // A `-d` value containing a NUL cannot be a valid ini
+                // directive; skip it rather than truncate it silently.
+                if let Ok(cstr) = CString::new(define.as_str()) {
+                    // SAFETY: before-init timing contract as above. The C side
+                    // copies the string immediately, so the CString may drop
+                    // at the end of this iteration.
+                    unsafe { ffi::ephpm_cli_add_ini_define(cstr.as_ptr()) };
+                }
+            }
+
             if no_ini {
                 // SAFETY: same before-init timing contract.
                 unsafe { ffi::ephpm_cli_set_no_ini() };
@@ -1640,23 +1688,30 @@ mod tests {
     use super::*;
 
     /// Convenience: build the `Vec<String>` `precscan_cli_ini_flags` expects.
-    fn scan(args: &[&str]) -> (Option<String>, bool) {
+    fn scan(args: &[&str]) -> (Option<String>, bool, Vec<String>) {
         let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
         precscan_cli_ini_flags(&owned)
     }
 
+    /// Convenience for the `-d` collection assertions.
+    fn defines(args: &[&str]) -> Vec<String> {
+        scan(args).2
+    }
+
+    const NO_DEFINES: Vec<String> = Vec::new();
+
     #[test]
     fn precscan_no_ini_flags() {
-        assert_eq!(scan(&["-r", "echo 1;"]), (None, false));
-        assert_eq!(scan(&["script.php", "arg"]), (None, false));
-        assert_eq!(scan(&[]), (None, false));
+        assert_eq!(scan(&["-r", "echo 1;"]), (None, false, NO_DEFINES));
+        assert_eq!(scan(&["script.php", "arg"]), (None, false, NO_DEFINES));
+        assert_eq!(scan(&[]), (None, false, NO_DEFINES));
     }
 
     #[test]
     fn precscan_finds_no_ini() {
-        assert_eq!(scan(&["-n", "script.php"]), (None, true));
+        assert_eq!(scan(&["-n", "script.php"]), (None, true, NO_DEFINES));
         // Bundled with another no-arg flag.
-        assert_eq!(scan(&["-nl", "script.php"]), (None, true));
+        assert_eq!(scan(&["-nl", "script.php"]), (None, true, NO_DEFINES));
     }
 
     #[test]
@@ -1668,37 +1723,67 @@ mod tests {
     #[test]
     fn precscan_n_beats_c() {
         // `-n` wins regardless of `-c` also being present, matching php-cli.
-        assert_eq!(scan(&["-c", "/etc/alt.ini", "-n", "s.php"]), (None, true));
+        assert_eq!(scan(&["-c", "/etc/alt.ini", "-n", "s.php"]), (None, true, NO_DEFINES));
     }
 
     #[test]
     fn precscan_does_not_read_option_arguments() {
         // The `-n`/`-c` inside -r code or -d value must NOT be treated as flags.
-        assert_eq!(scan(&["-r", "-n"]), (None, false));
-        assert_eq!(scan(&["-r", "echo '-c x';", "arg"]), (None, false));
-        assert_eq!(scan(&["-d", "auto_prepend_file=-n", "s.php"]), (None, false));
+        assert_eq!(scan(&["-r", "-n"]), (None, false, NO_DEFINES));
+        assert_eq!(scan(&["-r", "echo '-c x';", "arg"]), (None, false, NO_DEFINES));
+        let run = scan(&["-d", "auto_prepend_file=-n", "s.php"]);
+        assert_eq!((run.0, run.1), (None, false));
+        assert_eq!(run.2, vec!["auto_prepend_file=-n".to_string()]);
     }
 
     #[test]
     fn precscan_stops_at_positional_and_dashes() {
         // A `-n` that appears after the script name is a script argument.
-        assert_eq!(scan(&["script.php", "-n"]), (None, false));
-        assert_eq!(scan(&["--", "-n"]), (None, false));
-        assert_eq!(scan(&["-", "-n"]), (None, false));
+        assert_eq!(scan(&["script.php", "-n"]), (None, false, NO_DEFINES));
+        assert_eq!(scan(&["--", "-n"]), (None, false, NO_DEFINES));
+        assert_eq!(scan(&["-", "-n"]), (None, false, NO_DEFINES));
+        // Same for a `-d`: after the script it belongs to the script.
+        assert_eq!(defines(&["script.php", "-d", "foo=1"]), NO_DEFINES);
     }
 
     #[test]
     fn precscan_composer_invocation() {
-        // The canonical composer form must be seen as "no ini flags".
-        assert_eq!(scan(&["-d", "memory_limit=-1", "composer.phar", "--version"]), (None, false));
+        // The canonical composer form: memory_limit collected, no ini flags.
+        assert_eq!(
+            scan(&["-d", "memory_limit=-1", "composer.phar", "--version"]),
+            (None, false, vec!["memory_limit=-1".to_string()])
+        );
     }
 
     #[test]
     fn precscan_skips_long_reflection_arg() {
         // `--rf name` takes a separate arg; a trailing `-n` after it is not
         // reached because the reflection arg is the terminal token here.
-        assert_eq!(scan(&["--rf", "strlen"]), (None, false));
-        assert_eq!(scan(&["--ini", "-n", "s.php"]), (None, true));
+        assert_eq!(scan(&["--rf", "strlen"]), (None, false, NO_DEFINES));
+        assert_eq!(scan(&["--ini", "-n", "s.php"]), (None, true, NO_DEFINES));
+    }
+
+    #[test]
+    fn precscan_collects_defines_separate_attached_and_ordered() {
+        // Separate and attached forms, order preserved (later `-d` for the
+        // same key must stay later — php-cli lets it win at parse time).
+        assert_eq!(
+            defines(&["-d", "opcache.enable_cli=1", "-dopcache.jit=tracing", "-r", "echo 1;"]),
+            vec!["opcache.enable_cli=1".to_string(), "opcache.jit=tracing".to_string()]
+        );
+        // Bare `-d name` (value defaults to 1 on the C side) and bundling
+        // after no-arg flags (`-qd foo`).
+        assert_eq!(defines(&["-d", "opcache.enable_cli", "s.php"]), vec!["opcache.enable_cli"]);
+        assert_eq!(defines(&["-qd", "foo=bar", "s.php"]), vec!["foo=bar"]);
+    }
+
+    #[test]
+    fn precscan_defines_survive_no_ini() {
+        // `php -n -d x=y` still applies the define, matching php-cli.
+        assert_eq!(
+            scan(&["-n", "-d", "memory_limit=64M", "s.php"]),
+            (None, true, vec!["memory_limit=64M".to_string()])
+        );
     }
 
     fn make_test_request() -> PhpRequest {

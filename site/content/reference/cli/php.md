@@ -58,6 +58,12 @@ tools that gate on the SAPI name run normally:
 - **WP-CLI** (`wp-cli.phar`) — runs; `STDIN`/`STDOUT`/`STDERR` are defined.
 - **Laravel artisan** / any Symfony Console app — `$argv`/`$argc` are
   registered, so subcommands and options are parsed.
+- **cli-SAPI-only functions** — `cli_set_process_title()` /
+  `cli_get_process_title()` exist (PsySH calls them, so `artisan tinker`
+  works). The title genuinely changes on Linux (`/proc/self/cmdline`, `ps`)
+  and sets the console title on Windows, mirroring php-src's `ps_title.c`; on
+  other platforms the functions exist but honestly return `false`/`null` with
+  php's own "Not available on this OS" warning.
 
 The server (`ephpm serve` / `ephpm dev`) is a separate process invocation and
 keeps reporting `PHP_SAPI === "ephpm"` — only the `ephpm php` process is `cli`.
@@ -65,13 +71,14 @@ keeps reporting `PHP_SAPI === "ephpm"` — only the `ephpm php` process is `cli`
 ### Ini flags
 
 - `-d key[=value]` — set an ini directive for this run (`-d key` means
-  `key=1`). Applied after startup, so `PHP_INI_ALL`/`PHP_INI_SYSTEM` directives
-  such as `memory_limit`, `error_reporting`, and `disable_functions` take
-  effect. Directives that only apply at module startup (most `opcache.*`, and
-  `-d extension=`) cannot be set this way — register extensions via `[php]
-  extensions` in your config instead.
+  `key=1`). Applied at module startup exactly as php-cli applies it, so it
+  overrides `php.ini` and works for startup-only directives too:
+  `-d opcache.enable_cli=1` activates OPcache, the `opcache.jit*` knobs enable
+  the JIT, and `-d extension=` / `-d zend_extension=` load extensions — in
+  addition to the runtime-changeable directives (`memory_limit`,
+  `error_reporting`, `disable_functions`, …).
 - `-c <path>` — load `php.ini` from this path.
-- `-n` — load no `php.ini` at all.
+- `-n` — load no `php.ini` at all (`-d` still applies, as in php-cli).
 
 ### Programs on stdin
 
