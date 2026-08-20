@@ -2131,8 +2131,9 @@ pub struct PhpConfig {
     /// Keep `max_execution_time` below the request timeout, or the outer
     /// deadline preempts it (startup warns when it does not).
     ///
-    /// On builds without per-thread timers (macOS, Windows NTS, or an SDK built
-    /// without the flag) PHP's only native mechanism is the process-wide
+    /// On builds without per-thread timers (macOS, Windows — ZTS but its SDK
+    /// lacks `ZEND_MAX_EXECUTION_TIMERS` — or a Linux SDK built without the
+    /// flag) PHP's only native mechanism is the process-wide
     /// setitimer/SIGPROF timer, which is unsafe on tokio worker threads and
     /// stays disabled — there this value is not natively enforced and the
     /// request-layer deadline is the only ceiling (startup warns).
@@ -2317,18 +2318,18 @@ pub struct PhpConfig {
     /// settings.
     ///
     /// The extension binary must match the embedded PHP's ABI: same PHP
-    /// minor version, same thread-safety mode (ZTS on Linux/macOS, NTS on
-    /// Windows), and — on Linux — glibc (the release binary is
-    /// glibc-dynamic). PHP verifies this at startup and rejects a mismatch
-    /// with a clear "Unable to load dynamic library" error instead of
-    /// crashing (verified: an NTS build fails with `undefined symbol:
+    /// minor version, ZTS thread-safety mode (every ePHPm platform is ZTS,
+    /// Windows included — #326), and — on Linux — glibc (the release binary
+    /// is glibc-dynamic). PHP verifies this at startup and rejects a
+    /// mismatch with a clear "Unable to load dynamic library" error instead
+    /// of crashing (verified: an NTS build fails with `undefined symbol:
     /// compiler_globals`). Note that Debian/Sury `php8.5-<ext>` packages
     /// are NTS-only (no `-zts` variants exist as of 2026-07), so on Linux a
     /// shared extension must currently be compiled for ZTS — e.g. `phpize`
     /// against a ZTS PHP of the same minor, or `gcc -shared` against the
-    /// matching php-sdk headers. Windows (NTS `.dll`) and macOS (ZTS
-    /// `.dylib`) work the same way via their dynamically-capable release
-    /// binaries.
+    /// matching php-sdk headers. macOS (ZTS `.dylib`) works the same way;
+    /// Windows `.dll` loading is not yet validated (a DLL would also need
+    /// to be a ZTS build).
     ///
     /// Empty entries fail validation (`validate()`): PHP would silently
     /// ignore a bare `extension=` line, which would make the knob a silent
@@ -2499,8 +2500,10 @@ pub struct PhpConfig {
     /// concrete count. `0` derives it from the CPU count, clamped to
     /// `[2, 32]`. Heavy frameworks (WordPress ~40MB/worker) may want it lower.
     ///
-    /// On NTS builds (Windows) this is forced to `1` with a WARN — there is a
-    /// single PHP context, so requests serialize through one booted framework.
+    /// Applies on every platform: Windows is ZTS like Linux/macOS (#326), so
+    /// multiple workers serve concurrently there too. (Historically this was
+    /// forced to `1` on Windows on the wrong belief that Windows builds were
+    /// NTS.)
     ///
     /// Ignored in fpm mode.
     ///
@@ -2861,8 +2864,37 @@ impl Config {
             }
         }
 
-        Ok(canon_script)
+        // On Windows, `canonicalize()` returns an extended-length *verbatim*
+        // path (`\\?\C:\...`). PHP's stream layer cannot open verbatim paths —
+        // the worker boot's `require` fails with "Failed to open stream: No
+        // such file or directory", so every worker dies before reaching
+        // take_request() and worker mode never comes up on Windows. Simplify
+        // back to a normal path before handing it to PHP. The containment
+        // check above already ran on the verbatim forms (both sides
+        // canonicalized, so their prefixes agree).
+        Ok(strip_verbatim_prefix(canon_script))
     }
+}
+
+/// Strip Windows' verbatim (extended-length) `\\?\` prefix from a
+/// canonicalized path so it can be consumed by PHP's stream layer, which
+/// cannot open verbatim paths.
+///
+/// `\\?\C:\dir\file` becomes `C:\dir\file`, and `\\?\UNC\server\share\p`
+/// becomes `\\server\share\p`. Non-verbatim paths — and every path on
+/// non-Windows targets — are returned unchanged.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.as_os_str().to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest.to_string());
+        }
+    }
+    path
 }
 
 impl Default for ServerConfig {

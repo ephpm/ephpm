@@ -43,5 +43,5 @@ ePHPm stands on the shoulders of some excellent open-source projects.
 
 ### Embedded at build time
 
-- [PHP](https://www.php.net/) — embedded via FFI as a statically linked library (ZTS on Linux/macOS, NTS on Windows)
+- [PHP](https://www.php.net/) — embedded via FFI as a statically linked library (ZTS on every platform, Windows included)
 - [static-php-cli](https://github.com/crazywhalecc/static-php-cli) — builds PHP and its extensions as a single static archive that gets linked into the ephpm binary

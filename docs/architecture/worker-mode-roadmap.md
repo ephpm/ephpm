@@ -152,5 +152,5 @@ registered at boot). Required before shipping:
 - **State leakage** between requests → minimal-but-complete per-iteration reset built from the exact fpm-hardening lines; N+1-sees-nothing-from-N integration test.
 - **Memory growth** in the long-lived kernel → `worker_max_requests` recycle + telemetry.
 - **Fatal wedges the server** → two-net 500 guarantee (TLS sender check + dropped-sender→`RecvError`), mandatory recycle after any bailout, hung-worker → replace-not-kill + existing 504 timeout.
-- **TSRM correctness** → single `ephpm_thread_init` per worker; long request never shut down mid-life; ZTS-only concurrency, NTS forced to 1 worker.
+- **TSRM correctness** → single `ephpm_thread_init` per worker; long request never shut down mid-life; ZTS concurrency on every platform (Windows included — #326; the historical NTS single-worker clamp was removed).
 - **Superglobal UAF** (WordPress mode) → default off; never hand-rebuild `PG(http_globals)`; fuzz before shipping the WP adapter.

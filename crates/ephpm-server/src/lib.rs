@@ -583,8 +583,7 @@ async fn bind_listeners(
             );
         }
 
-        // Windows / NTS: a single PHP context, so force one worker (design §6.1).
-        let (mut worker_count, wc_source) = config.php.effective_worker_count_with_source();
+        let (worker_count, wc_source) = config.php.effective_worker_count_with_source();
         match wc_source {
             ephpm_config::WorkerCountSource::Explicit => {
                 tracing::info!(
@@ -610,14 +609,12 @@ async fn bind_listeners(
                 );
             }
         }
-        if cfg!(target_os = "windows") && worker_count > 1 {
-            tracing::warn!(
-                "worker mode on Windows (NTS) uses a single PHP context — \
-                 forcing worker_count = 1 (requests serialize through one \
-                 booted framework)"
-            );
-            worker_count = 1;
-        }
+        // Historical note: worker_count used to be forced to 1 on Windows on
+        // the belief that Windows builds were NTS (single PHP context). The
+        // Windows php-sdk's `php8embed.lib` is in fact ZTS (#326) — same
+        // TSRM-per-thread model as Linux/macOS — and multi-worker mode was
+        // verified behaviorally on Windows (3 workers, overlapping wall-clock
+        // sleeps + fatal/recycle), so the clamp was removed.
 
         ephpm_php::PhpRuntime::install_worker_ops(config.php.worker_populate_superglobals);
 

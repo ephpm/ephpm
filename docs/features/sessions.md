@@ -100,9 +100,9 @@ exposure window requires a >30s session hold plus overlapping competitors,
 and the worst case is the same lost-update race that existed before locking.
 
 In multi-tenant mode the lock key lives in the same per-site store as the
-session data, so tenants cannot contend with each other. On Windows (NTS,
-serialized PHP execution) the lock is uncontended in-process but keeps the
-same acquire/release semantics.
+session data, so tenants cannot contend with each other. Windows builds are
+ZTS like Linux/macOS (#326), so the same concurrent-request locking semantics
+apply there.
 
 The lock is **node-local**: the `SETNX` runs against the in-process store,
 not the cluster tier. In clustered deployments, concurrent requests for the

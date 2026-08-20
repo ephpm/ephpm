@@ -118,8 +118,10 @@ static void ephpm_sapi_read_post_data_compat(void) {
 /* ===== Per-thread state =====
  *
  * With ZTS, multiple threads execute PHP concurrently. All per-request
- * state must be thread-local to avoid races. On non-ZTS builds (Windows),
- * thread-local storage is harmless (single thread executes PHP).
+ * state must be thread-local to avoid races. Every shipped platform is ZTS
+ * — including Windows, whose php8embed.lib is a ZTS build (#326). On a
+ * hypothetical non-ZTS build, thread-local storage is harmless (a single
+ * thread executes PHP).
  *
  * EPHPM_TLS picks the right keyword per compiler:
  *   - GCC / Clang: __thread (the long-standing extension; works pre-C11)
@@ -3600,8 +3602,10 @@ static long long ephpm_session_ttl_ms(void)
  * the failure mode is the same lost-update race that exists without
  * locking at all.
  *
- * On NTS builds (Windows) PHP execution is serialized in-process, so the
- * lock is simply uncontended — the SETNX/DEL pair still balances.
+ * Windows is ZTS like Linux/macOS (#326), so the same concurrent-request
+ * locking applies there. On a hypothetical NTS build PHP execution is
+ * serialized in-process and the lock is simply uncontended — the SETNX/DEL
+ * pair still balances.
  */
 
 #define EPHPM_SESSION_LOCK_PREFIX "session_lock:"

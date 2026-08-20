@@ -92,7 +92,7 @@ HTTP headers are mapped to `HTTP_*` variables, except `Content-Type` -> `CONTENT
 
 ### Thread Safety
 
-PHP is compiled with ZTS (Zend Thread Safety). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown, not request execution. Windows builds use NTS with serialized execution via mutex.
+PHP is compiled with ZTS (Zend Thread Safety). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown, not request execution. Windows builds are ZTS as well — the Windows php-sdk's static `php8embed.lib` is a ZTS build and requests execute concurrently there too.
 
 ### Signal Handling and `max_execution_time`
 
@@ -102,7 +102,7 @@ ePHPm enforces `max_execution_time` with a **two-layer** model:
 
 2. **HTTP-level (outer, hard backstop).** `tokio::time::timeout` (from `[server.timeouts] request`) wraps the `spawn_blocking` PHP execution and returns HTTP 504 if the request never completes — the ceiling for a script wedged in a C extension or syscall that never returns to the VM to observe the inner timer.
 
-The legacy process-wide `SIGPROF`/`setitimer` timer (used by PHP builds *without* per-thread timers) is unsafe for a multi-threaded embedder — `SIGPROF` is delivered to an arbitrary thread whose PHP handler dereferences per-request globals that only exist on the PHP thread. On builds without per-thread timers (macOS, Windows NTS, or an SDK built without the flag), ePHPm neuters `zend_set_timeout` via GNU ld's `--wrap` (Linux) and leaves the outer HTTP request timeout as the only ceiling. macOS's ld64 and MSVC's link.exe don't support `--wrap`, so `max_execution_time` is simply not armed there.
+The legacy process-wide `SIGPROF`/`setitimer` timer (used by PHP builds *without* per-thread timers) is unsafe for a multi-threaded embedder — `SIGPROF` is delivered to an arbitrary thread whose PHP handler dereferences per-request globals that only exist on the PHP thread. On builds without per-thread timers (macOS, Windows — the Windows SDK is ZTS but built without `ZEND_MAX_EXECUTION_TIMERS` — or a Linux SDK built without the flag), ePHPm neuters `zend_set_timeout` via GNU ld's `--wrap` (Linux) and leaves the outer HTTP request timeout as the only ceiling. macOS's ld64 and MSVC's link.exe don't support `--wrap`, so `max_execution_time` is simply not armed there.
 
 ### Bailout Protection
 

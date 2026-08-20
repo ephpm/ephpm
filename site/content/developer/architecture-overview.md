@@ -352,15 +352,9 @@ Release artifacts are named per platform. One binary per PHP version per platfor
 
 ## PHP Embedding Strategy
 
-### Thread Safety: NTS for MVP, ZTS for v1
+### Thread Safety: ZTS everywhere
 
-PHP is compiled with ZTS (Zend Thread Safety) via `--enable-zts`. Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently without interference.
-
-| | Current (ZTS) | Windows (NTS fallback) |
-|---|---|---|
-| **PHP build** | ZTS (Zend Thread-Safe) | NTS (Non-Thread-Safe) |
-| **Concurrency model** | `spawn_blocking` + per-thread TSRM | `Mutex` + `spawn_blocking` (serialized) |
-| **Throughput** | N concurrent PHP requests per process | One PHP request at a time per process |
+PHP is compiled with ZTS (Zend Thread Safety) via `--enable-zts` on every platform — the Windows php-sdk's static `php8embed.lib` is a ZTS build too (#326). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently without interference.
 
 The `Mutex<Option<PhpRuntime>>` only protects one-time `init()`/`shutdown()`. An `AtomicBool` fast-path check avoids the mutex for the common "is PHP ready?" path. Per-request C statics use `__thread` for thread isolation.
 
@@ -918,7 +912,7 @@ This is the hardest crate and the core of the project.
 - Request/response mapping:
   - `HttpRequest` (from hyper) → PHP SAPI request info
   - PHP output → `HttpResponse` (status, headers, body)
-- Safety: `Mutex<PhpRuntime>` for NTS mode
+- Safety: `Mutex<Option<PhpRuntime>>` guards one-time init/shutdown (requests run lock-free on per-thread TSRM contexts)
 
 ### Step 4: Implement `ephpm-server`
 
