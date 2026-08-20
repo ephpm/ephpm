@@ -92,6 +92,23 @@ fn handshake_response() -> Vec<u8> {
 /// Reserve a loopback port and release it, so a backend can be bound there
 /// later. Between the release and the late `start_mock_backend_on`, the
 /// address is exactly what the bug needs: routable but refusing connections.
+///
+/// This is a deliberate bind-drop pattern, unlike the rebind race fixed in
+/// the proxy integration tests (`run_on` with a held listener): these tests
+/// *require* an address with nothing listening, and a held listener would
+/// accept connections into its backlog. There is no portable way to reserve
+/// a TCP port as "refusing". The residual cross-process TOCTOU — another
+/// test binding `:0` could be issued this port before the late rebind —
+/// fails closed on both rebind paths: `spawn_deferred` refuses to start on
+/// an occupied listen port (see `bind_failure_is_an_error_not_a_warning`)
+/// and `start_mock_backend_on` panics if its bind fails, so neither silently
+/// proceeds against another test's socket. What remains is a theoretical
+/// assertion flake — a stranger binding a reserved *upstream* port and
+/// speaking MySQL could flip `ever_connected` early — which the kernel's
+/// aversion to immediate ephemeral-port reuse makes vanishingly rare, and
+/// which cannot reproduce the wrong-backend mid-session failure mode the
+/// proxy tests had: nothing here ever exchanges application traffic with a
+/// socket it did not bind or verify by handshake.
 async fn reserve_addr() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("reserve port");
     let addr = listener.local_addr().expect("reserved addr");

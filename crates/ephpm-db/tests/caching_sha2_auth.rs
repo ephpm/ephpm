@@ -33,6 +33,7 @@
 //! Set `MYSQL_SHA2_TEST_URL` to an admin connection string against a stock
 //! `MySQL` 8 (e.g. `mysql://root:secret@127.0.0.1:3306/mysql`) to enable these.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -61,13 +62,21 @@ fn test_pool_config() -> PoolConfig {
 
 /// Boot a [`MySqlProxy`] against `backend_url` on an OS-assigned port.
 ///
-/// Returns `Err` with the proxy's own error text when the backend handshake
-/// fails, so a test can assert on an auth failure instead of hanging.
+/// The listener is bound exactly once and handed to [`MySqlProxy::run_on`]
+/// — never dropped and rebound. The old bind-drop-rebind dance raced other
+/// test processes binding `127.0.0.1:0`: a stolen port made the proxy's
+/// rebind fail while the ready-check connected to the *other* test's proxy,
+/// so the session died mid-stream with `ConnectionReset` (the intermittent
+/// `DB Integration` CI failure).
+///
+/// Panics with the proxy's own error text when the backend handshake fails
+/// (`MySqlProxy::new` dials the backend), so a test fails fast instead of
+/// hanging. No readiness poll is needed: the listener is live before this
+/// function returns, and early clients queue in the kernel accept backlog
+/// until `run_on` starts accepting.
 async fn start_proxy(backend_url: &str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let listen_addr = listener.local_addr().unwrap().to_string();
-    drop(listener);
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
     let proxy = MySqlProxy::new(
         backend_url,
@@ -83,18 +92,12 @@ async fn start_proxy(backend_url: &str) -> String {
     .expect("MySqlProxy::new failed — backend handshake did not complete");
 
     tokio::spawn(async move {
-        if let Err(e) = proxy.run().await {
+        if let Err(e) = proxy.run_on(Arc::new(listener)).await {
             eprintln!("proxy stopped: {e}");
         }
     });
 
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(&listen_addr).await.is_ok() {
-            return listen_addr;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("proxy did not become ready at {listen_addr}");
+    listen_addr
 }
 
 /// `mysql_async` opts pointed at the proxy. The proxy accepts any client

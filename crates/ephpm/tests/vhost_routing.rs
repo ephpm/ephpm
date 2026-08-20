@@ -24,6 +24,15 @@ const BIN: &str = env!("CARGO_BIN_EXE_ephpm");
 
 /// Pick a free port on 127.0.0.1 by binding to port 0 and reading back the
 /// kernel-assigned port. Mirrors what `ephpm dev` does internally.
+///
+/// This is only a *starting hint* for `ephpm dev`'s own free-port scan, not
+/// a reservation: another process may grab the port between the drop here
+/// and the server's bind, in which case `run_dev`'s `find_free_port` moves
+/// on to the next free port. That is why `spawn_dev` reports back the port
+/// the server actually bound (parsed from its `HTTP listening` log line)
+/// instead of trusting this one — the bind-drop-rebind race can shift the
+/// server onto a neighboring port, but it can no longer point the test's
+/// requests at a stranger's socket.
 fn pick_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
     let port = listener.local_addr().expect("local_addr").port();
@@ -31,12 +40,25 @@ fn pick_port() -> u16 {
     port
 }
 
+/// Extract the bound port from an `HTTP listening` log line, e.g.
+/// `... HTTP listening addr=127.0.0.1:43121`. Parses the digits after the
+/// literal `127.0.0.1:` — matching on the value rather than `addr=` so that
+/// ANSI styling around the field name cannot break the parse.
+fn parse_listening_port(line: &str) -> Option<u16> {
+    let tail = &line[line.rfind("127.0.0.1:")? + "127.0.0.1:".len()..];
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
 /// Spawn `ephpm dev --sites <sites> --document-root <doc_root> --port <port>`
-/// and block until it logs `HTTP listening` (or 15 seconds elapse).
+/// and block until it logs `HTTP listening` (or 15 seconds elapse), returning
+/// the child and the port the server **actually** bound — which is `port`
+/// unless something else claimed it first, in which case the dev server's
+/// free-port scan picked a nearby one.
 ///
 /// Both stdout (banner) and stderr (tracing) must be drained — otherwise a
 /// piped child blocks on its first write past the pipe buffer.
-fn spawn_dev(sites: &PathBuf, doc_root: &PathBuf, port: u16) -> Child {
+fn spawn_dev(sites: &PathBuf, doc_root: &PathBuf, port: u16) -> (Child, u16) {
     let mut cmd = Command::new(BIN);
     cmd.arg("dev")
         .arg("--sites")
@@ -49,14 +71,14 @@ fn spawn_dev(sites: &PathBuf, doc_root: &PathBuf, port: u16) -> Child {
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn ephpm dev");
 
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let (tx, rx) = std::sync::mpsc::channel::<Option<u16>>();
     let tx_stdout = tx.clone();
     let stdout = child.stdout.take().expect("stdout piped");
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             eprintln!("ephpm[out]: {line}");
             if line.contains("HTTP listening") {
-                let _ = tx_stdout.send(());
+                let _ = tx_stdout.send(parse_listening_port(&line));
             }
         }
     });
@@ -66,15 +88,20 @@ fn spawn_dev(sites: &PathBuf, doc_root: &PathBuf, port: u16) -> Child {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             eprintln!("ephpm[err]: {line}");
             if line.contains("HTTP listening") {
-                let _ = tx.send(());
+                let _ = tx.send(parse_listening_port(&line));
             }
         }
     });
 
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
-        if rx.try_recv().is_ok() {
-            return child;
+        if let Ok(parsed) = rx.try_recv() {
+            let Some(bound_port) = parsed else {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("'HTTP listening' was logged but no 127.0.0.1:<port> could be parsed");
+            };
+            return (child, bound_port);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -126,8 +153,8 @@ fn dev_sites_routes_localhost_subdomains() {
     std::fs::create_dir_all(&doc_root).expect("mkdir doc_root");
     std::fs::write(doc_root.join("index.html"), "<h1>fallback</h1>").expect("write fallback");
 
-    let port = pick_port();
-    let _server = ServerGuard(spawn_dev(&sites, &doc_root, port));
+    let (child, port) = spawn_dev(&sites, &doc_root, pick_port());
+    let _server = ServerGuard(child);
     let base = format!("http://127.0.0.1:{port}/");
 
     // Each named vhost serves its own content.
