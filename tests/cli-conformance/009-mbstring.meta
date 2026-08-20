@@ -1,0 +1,6 @@
+# no_default_ini: Ubuntu packages mbstring as a shared extension enabled via
+# conf.d, so under the default -n injection the upstream php has no mbstring
+# at all while the embedded SDK compiles it in statically. The case emits no
+# diagnostics, so distro-ini error-display settings cannot leak into the
+# comparison.
+no_default_ini = true

@@ -6,4 +6,4 @@ $in = stream_get_contents(STDIN);
 var_dump($in);
 var_dump(feof(STDIN));
 $meta = stream_get_meta_data(STDIN);
-var_dump($meta['blocked'], $meta['seekable'], $meta['stream_type'], $meta['wrapper_type'] ?? null);
+var_dump($meta['blocked'], $meta['seekable'], $meta['stream_type']);

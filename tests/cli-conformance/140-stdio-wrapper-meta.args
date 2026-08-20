@@ -1,0 +1,2 @@
+-r
+$m = stream_get_meta_data(STDIN); var_dump($m['wrapper_type'] ?? null, $m['uri'] ?? null);

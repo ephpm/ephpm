@@ -1,0 +1,3 @@
+# no_default_ini: Ubuntu packages ctype as a shared extension enabled via
+# conf.d — see 009-mbstring.meta for the full rationale.
+no_default_ini = true

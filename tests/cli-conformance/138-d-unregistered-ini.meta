@@ -1,0 +1,1 @@
+xfail = "-d of unregistered/user-namespace ini entries never reaches the cfg hash, so get_cfg_var() returns false where php-cli returns the value (#337; when this XPASSes, remove the marker)"

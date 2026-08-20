@@ -1,2 +1,2 @@
 -r
-var_dump(getenv('CONFORMANCE_TEST_VAR'), getenv('NO_SUCH_VAR_SET_EVER'), getenv('TZ'), getenv('LC_ALL')); var_dump($_ENV['CONFORMANCE_TEST_VAR'] ?? '(unset in _ENV)', $_SERVER['CONFORMANCE_TEST_VAR'] ?? '(unset in _SERVER)');
+var_dump(getenv('CONFORMANCE_TEST_VAR'), getenv('NO_SUCH_VAR_SET_EVER'), getenv('TZ'), getenv('LC_ALL')); var_dump($_ENV['CONFORMANCE_TEST_VAR'] ?? '(unset in _ENV)');

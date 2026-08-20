@@ -1,5 +1,5 @@
-# The two sides are different executables by definition, so the literal
-# PHP_BINARY value can never match: each side's own binary path is folded
-# to <BINARY>. What the case still proves: PHP_BINARY is a non-empty string
-# pointing at the invoked binary on BOTH sides.
+# strip-binary-path: the two sides are different executables by definition,
+# so each side's own binary path is folded to <BINARY>; the case then proves
+# PHP_BINARY is a non-empty string naming the invoked binary on BOTH sides.
 normalize = ["strip-binary-path"]
+xfail = "PHP_BINARY is an empty string in ephpm php; php-cli sets the executable path (#339; when this XPASSes, remove the marker)"

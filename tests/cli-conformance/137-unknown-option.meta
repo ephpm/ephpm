@@ -1,0 +1,1 @@
+xfail = "unknown option -Z is silently ignored: no error, no usage, exit 0 (#336). Note: after #336 lands this stays xfail on the legitimate usage-text difference (binary is named 'ephpm php'), so re-point the reason then instead of removing the case."

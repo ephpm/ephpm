@@ -71,10 +71,11 @@ const NORMALIZERS: &[&str] = &[
     // php-cli is almost always NTS. A real, permanent build-flavor
     // difference, not drift.
     "strip-zts-marker",
-    // Drops `with Zend OPcache ...` banner lines. Distro php loads opcache
-    // as a zend_extension and advertises it in `-v`; the embedded build
-    // does not print this line.
-    "strip-opcache-banner",
+    // Drops distro-decoration banner lines: `with Zend OPcache ...` (distro
+    // php loads opcache as a zend_extension and advertises it in `-v`) and
+    // `Built by ...` (Ubuntu's packaging stamp). The embedded build prints
+    // neither; both are packaging facts, not CLI behavior.
+    "strip-distro-banner",
     // Replaces each side's own binary path with `<BINARY>`. For PHP_BINARY
     // and friends: the two processes are by definition different files.
     "strip-binary-path",
@@ -610,12 +611,12 @@ fn match_version(s: &[u8]) -> Option<usize> {
     Some(i)
 }
 
-/// `strip-opcache-banner`: drop whole lines that mention the Zend OPcache
-/// `-v` banner.
-fn strip_opcache_banner(input: &[u8]) -> Vec<u8> {
+/// `strip-distro-banner`: drop whole `-v` banner lines that only a distro
+/// build prints (`with Zend OPcache ...`, `Built by Ubuntu`).
+fn strip_distro_banner(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len());
     for line in input.split_inclusive(|&b| b == b'\n') {
-        if !contains_bytes(line, b"with Zend OPcache") {
+        if !contains_bytes(line, b"with Zend OPcache") && !line.starts_with(b"Built by ") {
             out.extend_from_slice(line);
         }
     }
@@ -637,7 +638,7 @@ fn normalize(input: &[u8], names: &[String], ctx: &NormCtx<'_>) -> Vec<u8> {
                 let t = replace_bytes(&out, b"(ZTS)", b"(TS)");
                 replace_bytes(&t, b"(NTS)", b"(TS)")
             }
-            "strip-opcache-banner" => strip_opcache_banner(&out),
+            "strip-distro-banner" => strip_distro_banner(&out),
             "strip-binary-path" => replace_bytes(&out, ctx.binary.as_bytes(), b"<BINARY>"),
             // Unknown names are rejected at meta-parse time.
             other => unreachable!("unvalidated normalizer {other}"),
@@ -1166,10 +1167,9 @@ mod tests {
     }
 
     #[test]
-    fn opcache_banner_normalizer() {
-        let input =
-            b"PHP 8.5.4 (cli)\n    with Zend OPcache v8.5.4, by Zend Technologies\nZend Engine\n";
-        let out = strip_opcache_banner(input);
+    fn distro_banner_normalizer() {
+        let input = b"PHP 8.5.4 (cli)\n    with Zend OPcache v8.5.4, by Zend Technologies\nBuilt by Ubuntu\nZend Engine\n";
+        let out = strip_distro_banner(input);
         assert_eq!(String::from_utf8(out).unwrap(), "PHP 8.5.4 (cli)\nZend Engine\n");
     }
 

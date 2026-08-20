@@ -1,0 +1,1 @@
+xfail = "shutdown functions never run in ephpm php, so exit() inside one can neither print nor set the exit status (#334; when this XPASSes, remove the marker)"

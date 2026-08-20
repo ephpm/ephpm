@@ -1,0 +1,2 @@
+-r
+var_dump($_SERVER['CONFORMANCE_TEST_VAR'] ?? '(env var unset in _SERVER)', $_SERVER['DOCUMENT_ROOT'] ?? '(DOCUMENT_ROOT absent)');

@@ -1,4 +1,8 @@
 <?php
+if (!extension_loaded('ctype')) {
+    echo "ctype: MISSING\n";
+    exit(0);
+}
 foreach (["abc", "ABC1", "123", " ", "\t\n", "", "\u{E1}\u{E9}"] as $s) {
     printf(
         "%s: alpha=%d alnum=%d digit=%d space=%d upper=%d punct=%d xdigit=%d\n",
