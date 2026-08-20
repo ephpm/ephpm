@@ -17,7 +17,7 @@ Apply ON TOP of a normal correctness review. Each item has bitten this repo at l
 - All PHP calls go through the C wrapper's `zend_try`/SETJMP guards - never call PHP functions directly from Rust.
 - Stub mode (`cargo build` without `PHP_SDK_PATH`) must compile and pass tests - all FFI behind `#[cfg(php_linked)]`.
 - New SAPI userland functions must be registered via the MINIT shim (`ephpm_pre_init`) - post-init registration is invisible to new ZTS threads.
-- Thread-local (`EPHPM_TLS`) for all per-request C state; ZTS on Linux/macOS, **NTS on Windows** (single PHP context - watch for concurrency assumptions).
+- Thread-local (`EPHPM_TLS`) for all per-request C state; ZTS on **every** platform - the Windows php-sdk's `php8embed.lib` is a ZTS build and the wrapper/bindings compile with `ZTS=1` (#326). Do not treat Windows as a single PHP context; do watch that new code never uses `#if ZTS` (headers/wrapper use `#ifdef ZTS`, so any defined value enables ZTS).
 
 ## Concurrency / server
 

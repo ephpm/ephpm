@@ -135,13 +135,13 @@ int ephpm_execute_script(const char *filename) {
 
 Two layers bound how long a request can run:
 
-- **`max_execution_time` (PHP-level, catchable).** On Linux ZTS builds with per-thread execution timers (`--enable-zend-max-execution-timers`, the shipped default), PHP arms a **per-thread POSIX timer** (`timer_create` + `SIGRTMIN` via `SIGEV_THREAD_ID`, on a wall-clock `CLOCK_BOOTTIME`) delivered only to the owning PHP thread — safe under tokio's `spawn_blocking` pool. Exceeding it raises the catchable "Maximum execution time exceeded" fatal (500, shutdown functions run, output flushed), and `set_time_limit()` re-arms it at runtime. On builds without per-thread timers (macOS, Windows NTS), PHP's only native mechanism is the process-wide `SIGPROF`/`setitimer` timer, which *would* crash tokio worker threads — so it is neutralized (`--wrap` on Linux) and `max_execution_time` is not enforced there.
+- **`max_execution_time` (PHP-level, catchable).** On Linux ZTS builds with per-thread execution timers (`--enable-zend-max-execution-timers`, the shipped default), PHP arms a **per-thread POSIX timer** (`timer_create` + `SIGRTMIN` via `SIGEV_THREAD_ID`, on a wall-clock `CLOCK_BOOTTIME`) delivered only to the owning PHP thread — safe under tokio's `spawn_blocking` pool. Exceeding it raises the catchable "Maximum execution time exceeded" fatal (500, shutdown functions run, output flushed), and `set_time_limit()` re-arms it at runtime. On builds without per-thread timers (macOS, and Windows — ZTS but built without `ZEND_MAX_EXECUTION_TIMERS`), the inner timer cannot be armed safely, so `max_execution_time` is not enforced there (on Linux the unsafe process-wide `SIGPROF`/`setitimer` fallback is additionally neutralized via `--wrap`).
 - **`[server.timeouts] request` (HTTP-level, hard backstop).** `tokio::time::timeout` wraps the `spawn_blocking` PHP execution and surfaces a timeout as HTTP 504 — the ceiling for a script wedged where the inner timer cannot interrupt it (a C extension or syscall that never returns to the VM). Keep `max_execution_time` below this value so the inner, graceful limit fires first.
 
 ### Process state
 
 - ZTS PHP: Concurrent execution via `spawn_blocking` + TSRM. Each thread gets isolated globals (symbol tables, memory arena, extension state). Per-request C statics use `__thread` for thread isolation. Rust must ensure no cross-thread access to PHP data.
-- Windows (NTS fallback): Serialized execution via `Mutex<Option<PhpRuntime>>`. One request at a time.
+- Windows: also ZTS (#326) — same concurrent execution model as Linux/macOS; the mutex only guards one-time init/shutdown there too.
 
 ### Request isolation
 

@@ -81,7 +81,7 @@ ephpm admin --nodes 10.0.1.1:9090,10.0.1.2:9090
 - C wrapper (`ephpm_wrapper.c`) is required for all PHP calls due to PHP's `setjmp`/`longjmp` error handling — never call PHP APIs directly from Rust
 - Superglobals (`$_GET`, `$_POST`, `$_SERVER`) work — this is critical for adoption
 - Concurrent PHP execution via ZTS — each `spawn_blocking` thread auto-registers with TSRM and gets its own isolated PHP context. Mutex only protects one-time init/shutdown.
-- Windows builds use NTS (`ZTS=0`) due to DLL constraints
+- Windows builds are ZTS too — the php-sdk's static `php8embed.lib` is a ZTS build and the wrapper/bindgen compile with `ZTS=1` (#326). Windows-specific gaps: no per-thread execution timers (`max_execution_time` not natively enforced) and no Unix crash containment
 - Reference implementations: FrankenPHP's `frankenphp.c`, Pasir's ext-php-rs integration, `ripht-php-sapi` crate
 
 ### 2. HTTP Layer
@@ -255,4 +255,4 @@ Key files:
 6. **Conditional compilation**: All PHP FFI code is gated with `#[cfg(php_linked)]`. The stub mode (no `PHP_SDK_PATH`) must always compile and pass tests. See `CLAUDE.md` for the full conventions.
 7. **Build**: `cargo xtask release` downloads the prebuilt PHP SDK (`libphp.a` + headers; the glibc-linked `-gnu` variant on Linux) from `github.com/ephpm/php-sdk` releases and compiles a glibc-dynamic release binary (gnu target, `--export-dynamic`) that can dlopen shared PHP extensions and middleware. No system PHP, Composer, or static-php-cli required — just curl, tar, build-essential, pkg-config, and libclang-dev on Linux.
 8. **CLI**: `ephpm serve` starts the HTTP server. `ephpm php [args...]` is a full PHP CLI passthrough — all standard PHP flags work (`-v`, `-r`, `-f`, `-m`, `-i`, `-l`, etc.).
-9. **ZTS is implemented.** PHP is compiled with `--enable-zts`; each `spawn_blocking` thread auto-registers with TSRM and gets its own isolated PHP context. The `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown; an `AtomicBool` fast-path handles the "is PHP ready?" hot check. Windows uses NTS (`ZTS=0`) due to DLL constraints. See the roadmap docs in `docs/architecture/` for what's next (OPcache clustering, build-time composition of extensions/middleware, etc.).
+9. **ZTS is implemented.** PHP is compiled with `--enable-zts`; each `spawn_blocking` thread auto-registers with TSRM and gets its own isolated PHP context. The `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown; an `AtomicBool` fast-path handles the "is PHP ready?" hot check. Windows is ZTS as well — the Windows php-sdk ships a ZTS `php8embed.lib` and the build compiles the wrapper/bindings with `ZTS=1` (#326). See the roadmap docs in `docs/architecture/` for what's next (OPcache clustering, build-time composition of extensions/middleware, etc.).

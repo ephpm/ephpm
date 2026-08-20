@@ -21,12 +21,14 @@ forking the codebase?
 
 ## Feasibility: the codebase already compiles both
 
-**Windows ships NTS today** — `ZTS=0`, one request at a time behind a
-mutex. The C wrapper, the `EPHPM_TLS` per-request statics, and the
-build plumbing are all bi-modal already. The php-sdk pipeline builds
-NTS for Windows; a `linux-<arch>-nts-gnu` tarball is one matrix entry.
-Nothing about an NTS Linux artifact is destructive; it is additive
-`cfg` + artifacts.
+The C wrapper's NTS branches (`#ifdef ZTS` stubs), the `EPHPM_TLS`
+per-request statics, and the build plumbing are all bi-modal already —
+though note **no shipped platform exercises the NTS side today**: Windows
+ships ZTS like Linux/macOS (#326; the earlier claim here that "Windows
+ships NTS" was wrong). An NTS build would be a new `linux-<arch>-nts-gnu`
+php-sdk matrix entry. Nothing about an NTS Linux artifact is destructive;
+it is additive `cfg` + artifacts, but its wrapper NTS paths would need
+first-time validation.
 
 The hard part is not the build — it is that NTS means **one PHP
 request at a time per process**, so a useful NTS Linux mode is

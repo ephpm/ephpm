@@ -1764,7 +1764,7 @@ PHP is statically linked into the binary via FFI — zero IPC overhead, Rust cal
 
 ### Thread Safety: ZTS
 
-PHP is compiled with ZTS (`--enable-zts`). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The mutex only protects one-time init/shutdown. Windows builds use NTS with serialized execution.
+PHP is compiled with ZTS (`--enable-zts`). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The mutex only protects one-time init/shutdown. Windows builds are ZTS as well (the Windows php-sdk's `php8embed.lib` is a ZTS build) and execute concurrently too.
 
 **Known ZTS caveats from spc / upstream PHP:**
 

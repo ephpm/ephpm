@@ -397,17 +397,33 @@ fn compile_wrapper(include_dir: &Path, target_os: &str, has_exec_timers: bool) {
         build.define("_GNU_SOURCE", None);
     }
 
-    // ZTS (Zend Thread Safety) — enables thread-local storage in PHP headers.
-    // All non-Windows builds use ZTS=1 for concurrent PHP execution.
-    // Windows uses NTS (ZTS=0) because the Windows PHP DLL is NTS.
+    // ZTS (Zend Thread Safety) — enables TSRM-based globals access in PHP
+    // headers. EVERY platform is ZTS: the php-sdk's Windows `php8embed.lib`
+    // is a ZTS build just like the Unix `libphp.a` (verified at the artifact
+    // level, issue #326: it exports `tsrm_startup`/`ts_resource_ex`,
+    // `executor_globals_id`/`_offset` and `_tsrm_ls_cache`, and has NO
+    // NTS-style direct `executor_globals`/`core_globals` data symbols;
+    // `ephpm php -v` reports ZTS and ZEND_THREAD_SAFE=1).
+    //
+    // History note: this used to pass `ZTS=0` on Windows on the (wrong)
+    // belief the Windows lib was NTS. PHP's headers and ephpm_wrapper.c test
+    // `#ifdef ZTS` — never `#if ZTS` — so `ZTS=0` still *defined* ZTS and
+    // compiled every ZTS path; the Windows build was always ZTS-coherent
+    // by accident. `ZTS=1` states the truth. Never test `#if ZTS` in new
+    // code, and never "disable" ZTS by defining it to 0.
+    //
+    // ZEND_ENABLE_STATIC_TSRMLS_CACHE makes EG()/CG()/SG() resolve through
+    // the extern thread-local `_tsrm_ls_cache` (which libphp defines,
+    // exports, and updates in `ts_resource`) instead of a
+    // `tsrm_get_ls_cache()` call per access — same as the Unix build. Safe
+    // on Windows because php8embed.lib is linked statically into the same
+    // module (no cross-DLL __declspec(thread) import involved).
+    build.define("ZTS", Some("1"));
+    build.define("ZEND_ENABLE_STATIC_TSRMLS_CACHE", Some("1"));
     if target_os == "windows" {
         build.define("ZEND_WIN32", None);
         build.define("PHP_WIN32", None);
         build.define("ZEND_DEBUG", Some("0"));
-        build.define("ZTS", Some("0"));
-    } else {
-        build.define("ZTS", Some("1"));
-        build.define("ZEND_ENABLE_STATIC_TSRMLS_CACHE", Some("1"));
     }
 
     // When the SDK has per-thread execution timers, ePHPm lets PHP arm its own
@@ -466,13 +482,15 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
     // platform #ifdef in PHP's headers (and reports "unknown type
     // sigjmp_buf" / "'syslog.h' not found" because it's parsing the
     // Unix branches with no Unix headers present).
+    // ZTS on every platform — the Windows SDK lib is ZTS too (see the
+    // matching defines in compile_wrapper; issue #326).
+    builder = builder.clang_arg("-DZTS=1").clang_arg("-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
     if target_os == "windows" {
         builder = builder
             .clang_arg("--target=x86_64-pc-windows-msvc")
             .clang_arg("-DZEND_WIN32")
             .clang_arg("-DPHP_WIN32")
             .clang_arg("-DZEND_DEBUG=0")
-            .clang_arg("-DZTS=0")
             // MSVC's <stddef.h> does not define C11 `max_align_t` — a real,
             // long-standing gap in the Windows CRT (it's missing even under
             // /std:c17 on current Windows SDKs). zend_portability.h's
@@ -563,9 +581,6 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
                 );
             }
         }
-    } else {
-        // ZTS builds: define ZTS for bindgen so PHP headers use thread-safe macros.
-        builder = builder.clang_arg("-DZTS=1").clang_arg("-DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
     }
 
     let bindings = builder

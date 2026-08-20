@@ -496,8 +496,9 @@ users flipping to worker mode.
   resolve to a file under `document_root` → hard error at config load, before
   the runtime starts. (Reuse the existing config-load error path in
   `crates/ephpm/src/main.rs`.)
-- `mode="worker"` on a **NTS build (Windows)** → see §6.1. Either degrade to
-  `worker_count=1` with a WARN, or hard-error, per the decision there.
+- ~~`mode="worker"` on a **NTS build (Windows)** → see §6.1.~~ Superseded:
+  Windows is ZTS (#326) and runs multi-worker like Linux/macOS; the
+  single-worker clamp was removed. See §6.1.
 - `mode="worker"` with `sites_dir` (multi-tenant vhosting) → **Phase-1
   unsupported**, hard error. Worker mode boots *one* framework per worker;
   per-host frameworks need per-host worker pools (a Phase-N item). Multi-tenant
@@ -694,25 +695,33 @@ that bailed out.**
 
 ## 6. Platform reality
 
-### 6.1 Windows (NTS — one PHP context)
+### 6.1 Windows
 
-Windows builds are NTS (`ZTS=0`) — a **single** PHP interpreter context,
-serialized (CLAUDE.md "PHP threading"; `ephpm_wrapper.c:496-501` NTS stubs).
-Worker mode's whole premise is multiple parked contexts, one per worker thread.
-Under NTS there is exactly **one** context, so:
+> **Superseded (issue #326).** This section was written on the belief that
+> Windows builds are NTS (`ZTS=0`, one PHP context). That was wrong: the
+> Windows php-sdk's `php8embed.lib` is a **ZTS** build (TSRM exports,
+> `executor_globals_id`, `_tsrm_ls_cache`), and the wrapper/bindings now
+> compile with `ZTS=1` to match. Windows has the same
+> one-TSRM-context-per-worker-thread model as Linux/macOS.
 
-- **Decision: NTS worker mode = single worker (`worker_count` forced to 1),
-  with a WARN.** One booted framework, requests serialized through it — this is
-  still a real win over NTS fpm (which re-boots the framework every request),
-  just without concurrency. This matches the NTS story elsewhere in the
-  codebase: NTS "falls back to serialized execution via mutex" (session locking
-  note `ephpm_wrapper.c:1319-1321`). A single worker needs no cross-thread
-  TSRM; the dispatch channel still works (one consumer).
+- The `worker_count`-forced-to-1 clamp described below was **removed**.
+  Multi-worker mode on Windows was verified behaviorally (3 workers,
+  overlapping wall-clock sleeps served concurrently, fatal → 500 → recycle).
+- Two real Windows worker-mode caveats remain:
+  - `resolve_worker_script()` must strip the `\\?\` verbatim prefix that
+    `canonicalize()` produces on Windows — PHP's stream layer cannot
+    `require` a verbatim path, so without the strip every worker died at
+    boot (fixed in the same PR as the clamp removal).
+  - No per-thread execution timers on the Windows SDK: a wedged worker is
+    bounded only by `[server.timeouts] request`, as in fpm mode.
+
+The original (now historical) decision text:
+
+- ~~**Decision: NTS worker mode = single worker (`worker_count` forced to 1),
+  with a WARN.**~~ One booted framework, requests serialized through it —
+  based on the NTS premise that no longer holds.
 - *Rejected:* hard-erroring on Windows. Single-worker worker mode is useful
   (dev, low-traffic Windows deployments) and keeps the config surface uniform.
-- Concurrency on Windows therefore = 1 for PHP. Static files etc. remain
-  concurrent (they never touch PHP). Document this clearly as a known
-  limitation, same tier as "clustered Turso CDC is untested on Windows".
 
 ### 6.2 OPcache / JIT with long-lived workers
 
@@ -823,7 +832,9 @@ lifecycle, config knobs, metrics, and the reference `worker.php`.
   serves "hello world" with **zero per-request bootstrap** (prove via a boot
   counter that increments once, not per request).
 - Concurrency: N workers serve N concurrent requests in parallel on Linux
-  (ZTS), verified under load; NTS/Windows serves with 1 worker.
+  (ZTS), verified under load. (Windows is ZTS too and serves multi-worker —
+  #326; the original "NTS/Windows serves with 1 worker" criterion is
+  superseded, see §6.1.)
 - Fatal in a request → that request 500s, worker recycles, next request
   succeeds on a fresh boot, server never wedges (the marquee fault-tolerance
   test).
@@ -858,10 +869,10 @@ thread (not a request worker — `laravel-octane-driver.md:240-243`).
 | **State leakage between requests** | The framework or the SAPI leaks per-request state into the next request on the same booted kernel (stale `$_SERVER`, leftover response headers, an unclosed session). | Minimal-but-complete per-iteration reset (§3.5) built from the *exact* lines the fpm hardening already proved (`:823-825`, `:844`); adapters own app-state reset; an integration test that asserts request N+1 sees none of request N's superglobals/headers/status. |
 | **Memory growth** | Long-lived framework accumulates references (event listeners, static caches, DI singletons) → OOM over hours. | `worker_max_requests` recycle (§5.2) + `ephpm_worker_recycles_total` telemetry; document tuning; recommend adapters flush their own caches (Octane does this via listeners). |
 | **Fatal kills the kernel / wedges server** | A `zend_bailout` unwinds past the response send; a hung script parks a worker forever. | Two-net response guarantee (TLS sender check + dropped-sender→500, §5.3); mandatory worker recycle after any bailout; hung-worker → replace-not-kill + 504 via existing outer timeout (§5.4). |
-| **TSRM correctness** | Worker registers TSRM once and keeps the request open for its life; a mistake here corrupts per-thread globals across workers. | `ephpm_thread_init` is the *only* TSRM entry, guarded by the existing `thread_local!` bool (`lib.rs:482-502`); the long request is never shut down mid-life; `ts_free_thread` only at drain (§5.4); ZTS-only concurrency, NTS forced to 1 worker (§6.1). |
+| **TSRM correctness** | Worker registers TSRM once and keeps the request open for its life; a mistake here corrupts per-thread globals across workers. | `ephpm_thread_init` is the *only* TSRM entry, guarded by the existing `thread_local!` bool (`lib.rs:482-502`); the long request is never shut down mid-life; `ts_free_thread` only at drain (§5.4); every shipped platform is ZTS, Windows included (§6.1, #326). |
 | **`--wrap` / signal reinit** | Worker relies on signal no-ops for its single boot-time `php_request_startup`. | Fewer calls than fpm (once vs per-request) → strictly less exposure; verify link map on macOS as a Phase-1 exit check (§6.3). |
 | **Superglobal UAF re-introduction** | If WordPress mode hand-rebuilds superglobals it can re-trigger the `php_default_treat_data` UAF (`:773-789`). | Default off; when on, drive population through the normal treat_data path at a quiescent point, never hand-rebuild `PG(http_globals)`; fuzz the WordPress path before shipping the WP adapter (Phase 5). |
-| **Config foot-guns** | Flipping `mode="worker"` silently ignores `[php] workers`, or worker mode silently no-ops on Windows/multi-tenant. | `add-config-knob` discipline: WARN when `workers>0` under worker mode; hard-error on `sites_dir`+worker (§4.3); explicit NTS single-worker WARN (§6.1). |
+| **Config foot-guns** | Flipping `mode="worker"` silently ignores `[php] workers`, or worker mode silently no-ops on Windows/multi-tenant. | `add-config-knob` discipline: WARN when `workers>0` under worker mode; hard-error on `sites_dir`+worker (§4.3). (The historical NTS single-worker WARN was removed with the clamp — §6.1, #326.) |
 
 ---
 

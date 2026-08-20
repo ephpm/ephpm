@@ -207,7 +207,7 @@ consecutive requests return `boot #1, request #N` with N climbing
 | Linux x86_64 | Shipped: glibc-dynamic gnu binary, floor glibc 2.28 (§2.1). All of §3–§5 verified. |
 | Linux aarch64 | Same design; the `linux-aarch64-gnu` SDK tarball is **published** (8.5.7 / 8.4.22 / 8.3.31), rebuilt on the glibc-2.28 base. End-to-end release-lane validation on aarch64 is still to be confirmed. |
 | Alpine / musl hosts | Not a binary target — run the container image (`debian:12-slim` base). A self-built fully static musl binary still cannot dlopen; that use case is `forge` territory (`build-compose-design.md`). |
-| Windows | **NTS**, PHP statically linked from `php8embed.lib`. `extension=` `.dll` loading is the intended mechanism but is **not yet validated** — stock PECL DLLs import `php8*.dll`, which a static embed does not provide; treat Windows shared-extension support as unproven until smoke-tested. |
+| Windows | **ZTS** (the php-sdk's `php8embed.lib` is a ZTS build, #326), PHP statically linked. `extension=` `.dll` loading is the intended mechanism but is **not yet validated** — stock PECL DLLs import `php8*.dll`, which a static embed does not provide (and PECL Windows DLLs would also have to be ZTS variants); treat Windows shared-extension support as unproven until smoke-tested. |
 | macOS (arm64) | ZTS `.dylib` loading is the intended mechanism; **not yet validated** (ld64 exports symbols by default, so no `--export-dynamic` analog should be needed). |
 
 ## 7. What changed in the release matrix

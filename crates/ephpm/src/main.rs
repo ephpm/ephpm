@@ -629,8 +629,8 @@ fn warn_max_execution_time(config: &ephpm_config::Config) {
 }
 
 /// Fallback diagnostics when the linked libphp has no per-thread execution
-/// timers (macOS, Windows NTS, or an SDK built without
-/// `--enable-zend-max-execution-timers`). PHP's only native mechanism there is
+/// timers (macOS, Windows — its ZTS SDK lacks `ZEND_MAX_EXECUTION_TIMERS` —
+/// or a Linux SDK built without `--enable-zend-max-execution-timers`). PHP's only native mechanism there is
 /// the process-wide setitimer/SIGPROF timer, which is unsafe on tokio worker
 /// threads and is deliberately neutered — so `max_execution_time` is not
 /// natively enforced and the request-layer deadline is the only ceiling.
