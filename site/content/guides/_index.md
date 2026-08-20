@@ -23,3 +23,4 @@ Task-oriented walkthroughs for common deployments.
 - **[PHP Extensions](php-extensions/)** — loading prebuilt shared extensions beyond the compiled-in set.
 - **[Cluster-Wide OPcache Invalidation](opcache-cluster-invalidation/)** — `ephpm deploy` and the deploys-are-events contract.
 - **[Diagnosing Crashes](diagnosing-crashes/)** — reading the fatal-signal report when an extension, a middleware, or PHP itself faults.
+- **[Getting the Most from PHP on a Windows Box](windows-performance/)** — workload-honest Windows tuning: the TAILCALL build and the JIT for CPU-bound work, serve-mode defaults and fewer file operations for real apps.

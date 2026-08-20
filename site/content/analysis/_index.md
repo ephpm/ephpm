@@ -19,6 +19,7 @@ No single existing product covers the full ePHPm feature set. The closest compet
 - **[CertMagic](certmagic/)** — TLS & ACME — CertMagic (Go) vs Rust stack (rustls, rustls-acme, instant-acme)
 - **[Laravel Octane](laravel-octane/)** — adapter layer, not a server, backend comparison
 - **[Popularity](popularity/)** — GitHub stars, Docker pulls, Packagist downloads, business adoption, estimated MAU
+- **[Why PHP Is Slower on Windows](php-on-windows/)** — measured + source-verified: the MSVC CALL-VM interpreter penalty, the ~10x filesystem-metadata cost, and what actually closes the gap
 
 ---
 
