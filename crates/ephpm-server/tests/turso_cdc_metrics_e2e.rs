@@ -31,7 +31,8 @@ use ephpm_cluster::{
 };
 use ephpm_config::{ClusterChannelConfig, ClusterConfig};
 use ephpm_server::turso_cdc::{
-    fetch_and_apply_snapshot, run_replica, serve_snapshot, serve_subscriber, subscribe_and_consume,
+    ensure_log_id, fetch_and_apply_snapshot, run_replica, serve_snapshot, serve_subscriber,
+    subscribe_and_consume,
 };
 use ephpm_server::turso_cdc_metrics as cdc_metrics;
 use litewire::backend::Backend;
@@ -153,11 +154,16 @@ async fn start_channel(node_id: &str) -> (Arc<ephpm_cluster::ClusterHandle>, Cha
 fn spawn_primary(mgmt: Arc<Turso>, channel: &ChannelHandle) -> std::net::SocketAddr {
     let mut cdc_streams = channel.register_exact(CDC_STREAM_TYPE);
     tokio::spawn(async move {
+        let log_id = {
+            let conn = mgmt.raw_connection().expect("mgmt connection for log id");
+            ensure_log_id(&conn).await.expect("establish log id")
+        };
         while let Some(incoming) = cdc_streams.recv().await {
             let IncomingStream { stream, .. } = incoming;
             let mgmt = Arc::clone(&mgmt);
+            let log_id = log_id.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_subscriber(stream, &mgmt).await {
+                if let Err(e) = serve_subscriber(stream, &mgmt, &log_id).await {
                     eprintln!("serve subscriber ended: {e:#}");
                 }
             });
@@ -198,8 +204,9 @@ fn spawn_replica(
         let apply_conn = mgmt.raw_connection().unwrap();
         loop {
             if let Ok(mut stream) = channel.dial(primary_addr, CDC_STREAM_TYPE).await {
-                let wm = read_watermark(&apply_conn).await.unwrap_or(0);
-                if let Err(e) = subscribe_and_consume(&mut stream, &apply_conn, wm).await {
+                // Watermark resolution happens inside subscribe_and_consume,
+                // scoped to the log the primary's Hello names (issue #315).
+                if let Err(e) = subscribe_and_consume(&mut stream, &apply_conn).await {
                     eprintln!("replica stream ended: {e:#}");
                 }
             }
@@ -462,10 +469,20 @@ async fn a_failed_apply_increments_the_error_counter_and_freezes_the_watermark()
     // Production consume loop under test.
     let consumer = tokio::spawn(async move {
         let conn = apply_conn;
-        subscribe_and_consume(&mut replica_side, &conn, 0).await
+        subscribe_and_consume(&mut replica_side, &conn).await
     });
 
-    // Drain the Subscribe frame the consumer sends first.
+    // The primary speaks first (issue #315): a Hello naming its log, so
+    // the consumer can resolve its watermark before subscribing.
+    {
+        let hello = br#"{"Hello":{"log_id":"poison-log"}}"#;
+        let len = u32::try_from(hello.len()).unwrap();
+        fake_primary.write_all(&len.to_be_bytes()).await.unwrap();
+        fake_primary.write_all(hello).await.unwrap();
+        fake_primary.flush().await.unwrap();
+    }
+
+    // Drain the Subscribe frame the consumer sends next.
     {
         use tokio::io::AsyncReadExt;
         let mut len = [0u8; 4];
@@ -642,10 +659,15 @@ async fn snapshot_bootstrap_records_bytes_outcome_and_watermark() {
     let primary_mgmt = Arc::new(Turso::open(primary_file.path().to_str().unwrap()).await.unwrap());
     let mut snapshot_streams = primary_channel.register_exact("snapshot/default");
     tokio::spawn(async move {
+        let log_id = {
+            let conn = primary_mgmt.raw_connection().expect("mgmt connection for log id");
+            ensure_log_id(&conn).await.expect("establish log id")
+        };
         while let Some(incoming) = snapshot_streams.recv().await {
             let mgmt = Arc::clone(&primary_mgmt);
+            let log_id = log_id.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_snapshot(incoming.stream, &mgmt).await {
+                if let Err(e) = serve_snapshot(incoming.stream, &mgmt, &log_id).await {
                     eprintln!("serve snapshot: {e:#}");
                 }
             });

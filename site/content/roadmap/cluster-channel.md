@@ -17,7 +17,7 @@ the design encodes that split as two separate protocols:
   `[cluster.kv] small_key_threshold`). Gossip is a UDP-native chatter
   protocol; it must stay small and bounded regardless of write volume.
 - **Cluster channel = data plane for LOGS.** CDC transaction batches
-  today, snapshot bootstrap and watermark sync in future phases, any
+  and snapshot bootstrap today, any
   future bulk stream feature after that. The channel is a
   yamux-multiplexed TCP protocol; it never carries elections,
   membership, or KV state.
@@ -185,18 +185,12 @@ default and reuses `[cluster] secret`. Explicit `listen` /
 
 Roughly in priority order:
 
-1. **Watermark sync stream.** Persist subscriber watermarks
-   cluster-wide so a subscriber that reconnects to a *different*
-   primary (post-failover) resumes at a cursor that means the same
-   thing on the new primary. Within one primary, resume already works:
-   the subscriber names its watermark in the first frame and the
-   primary tails from exactly there.
-2. **TLS wrap.** Optional TLS layer between the TCP
+1. **TLS wrap.** Optional TLS layer between the TCP
    handshake and yamux, using ACME-issued certs from the existing
    `rustls-acme` integration. Reuses the per-cluster secret as the
    handshake fallback so mixed-version rollouts don't need coordinated
    flips.
-3. **Bulk log stream (unfixed schema).** A generic
+2. **Bulk log stream (unfixed schema).** A generic
    `log/<feature>/<vhost>` stream for future features that need
    ordered, backpressured, authenticated cluster-wide log distribution
    without inventing a fresh transport.

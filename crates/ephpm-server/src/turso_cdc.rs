@@ -66,15 +66,48 @@
 //! mode, so v1 cannot enforce this; the replica logs a warning at
 //! startup. Point application traffic at the primary.
 //!
-//! # Failover
+//! # Failover, and why watermarks are scoped to a *log identity*
 //!
-//! The sqlite election machinery (`ephpm_cluster::SqliteElection`) is
-//! unchanged. On role change the previous role's driver task is
+//! The sqlite election machinery (`ephpm_cluster::SqliteElection`) decides
+//! who is primary. On role change the previous role's driver task is
 //! aborted and a driver for the new role is spawned, so a flapping
 //! election does not accumulate drivers.
-//! **The divergence window is the same class as sqld async replication:**
-//! a former primary that had unshipped batches at the moment it died
-//! has lost those writes.
+//!
+//! `turso_cdc.change_id` is a **per-database** sequence: every node's local
+//! CDC log numbers from 1, and a replica's log stays empty because
+//! [`apply_batch`] bypasses capture. A watermark is therefore only
+//! meaningful *against the specific log it was read from*. Treating it as
+//! cluster-global was issue #315: after a failover, a survivor would
+//! subscribe to the promoted node with the watermark it had accumulated
+//! against the dead primary's log (say 5), the promoted node's own writes
+//! landed at `change_id` 1‑2 — below that cursor — and were **silently
+//! never shipped**. Not an in-flight window: unbounded, silent write loss
+//! after any failover, with the replica reporting itself caught up.
+//!
+//! The fix gives every node's CDC log a persistent random identity
+//! (`__ephpm_cdc_log_id`, generated once per database file). The primary
+//! announces it as the first frame of every replication stream
+//! ([`Frame::Hello`]) and in the snapshot header. The replica tracks which
+//! log its litewire watermark refers to (`__ephpm_cdc_source`) plus a
+//! per-log history (`__ephpm_cdc_watermarks`); on connecting to a
+//! *different* log than the one it was following, it saves the old log's
+//! cursor, re-seeds litewire's watermark table to whatever it has applied
+//! from the new log (usually 0), and subscribes from there — so a promoted
+//! node's writes can never land below the cursor. See
+//! [`resolve_subscribe_watermark`].
+//!
+//! **The remaining divergence window is the same class as sqld async
+//! replication:** a former primary that had unshipped batches at the
+//! moment it died has lost those writes (they exist on it and nowhere
+//! else), and writes made directly against a replica's wire frontend are
+//! never replicated. Both are documented caveats of the experimental
+//! clustered mode, not silent — the first is bounded by what was in
+//! flight, the second warns at startup.
+//!
+//! The Hello handshake and the snapshot `log_id` field are **wire protocol
+//! changes** (v0.7.2). Mixed-version clustered nodes are not supported;
+//! a replica that never receives a Hello fails its stream loudly after a
+//! timeout instead of hanging.
 //!
 //! # Bootstrap of a fresh replica (Phase 2.1, task #97)
 //!
@@ -130,9 +163,10 @@
 //!    (`watermark = N`) followed by the chunked SQL body.
 //! 3. Apply the dump to the local DB, then seed the replica watermark
 //!    to `N` (write `__litewire_cdc_watermark.applied_change_id = N`,
-//!    the same table [`apply_batch`] maintains). This all completes
-//!    before the litewire wire frontends start serving, so a client
-//!    read never observes partial snapshot state.
+//!    the same table [`apply_batch`] maintains) and record the header's
+//!    `log_id` as this replica's source log (issue #315). This all
+//!    completes before the litewire wire frontends start serving, so a
+//!    client read never observes partial snapshot state.
 //! 4. Subscribe to CDC. The subscribe frame carries the replica's
 //!    watermark, so the primary starts a tailer at exactly `N` and the
 //!    first batch the replica sees is `N + 1`. [`apply_batch`] remains
@@ -260,6 +294,21 @@ const HEAD_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 /// Heartbeat interval on primary-side subscribers.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
+/// How long a replica waits for the primary's [`Frame::Hello`] before
+/// declaring the stream broken. Generous — the Hello is the primary's
+/// first write after accepting the stream — but bounded, so a peer that
+/// never sends one (a pre-v0.7.2 primary, or a wedged process) fails the
+/// stream loudly instead of hanging it forever.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an auto-role node waits at startup for the election to
+/// resolve (an existing primary's claim to arrive, or — on a fresh
+/// cluster — its own post-grace self-election) before giving up and
+/// starting unresolved. Must comfortably exceed the election's startup
+/// grace (~15s) plus gossip convergence; see `determine_role` /
+/// `wait_for_initial_role`.
+const RESOLVE_ROLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Frame types carried on the CDC replication wire.
 ///
 /// The stream is not symmetric: [`Frame::Subscribe`] only ever travels
@@ -268,11 +317,19 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// replica. They share one enum so both directions share one codec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Frame {
-    /// **Replica → primary, first frame only.** The replica's applied
-    /// watermark. The primary starts this subscriber's tailer at
-    /// exactly this `change_id`, so nothing between the watermark and
-    /// "now" can be skipped — which is what makes a reconnect (or a
-    /// warm restart) safe without a snapshot.
+    /// **Primary → replica, first frame on every stream.** Identifies
+    /// which CDC log the primary is about to serve (see the module docs
+    /// on log identity, issue #315). The replica resolves its watermark
+    /// *for that log* before subscribing, so a cursor accumulated against
+    /// a dead primary's log can never be applied to a promoted node's
+    /// (differently-numbered) log.
+    Hello { log_id: String },
+    /// **Replica → primary, sent after [`Frame::Hello`].** The replica's
+    /// applied watermark **in the log the Hello named**. The primary
+    /// starts this subscriber's tailer at exactly this `change_id`, so
+    /// nothing between the watermark and "now" can be skipped — which is
+    /// what makes a reconnect (or a warm restart) safe without a
+    /// snapshot.
     Subscribe { from_change_id: i64 },
     /// A committed transaction batch. `rows` mirrors
     /// [`litewire_turso::cdc::TxnBatch::rows`].
@@ -433,6 +490,21 @@ pub async fn start_clustered_turso_cdc(
     )?;
     let (initial_role, role_rx) = determine_role(sqlite_config, cluster, channel_advertise).await?;
 
+    // In auto mode the initial role is deliberately unresolved until the
+    // election has actually seen the cluster (issue #314: deciding
+    // "primary" before gossip converges is how a joining node stole the
+    // role and skipped its snapshot bootstrap). Wait — bounded — for the
+    // election to deliver a definite role before wiring anything up, so a
+    // cold node that turns out to be a replica still takes the snapshot
+    // bootstrap path below.
+    let (initial_role, role_rx) = match role_rx {
+        Some(mut rx) => {
+            let resolved = wait_for_initial_role(initial_role, &mut rx).await;
+            (resolved, Some(rx))
+        }
+        None => (initial_role, None),
+    };
+
     // Tracks whether this node is currently the primary. Read by the
     // stream handlers, written by the role-change watcher. `Relaxed` is
     // right here: a handler that reads a stale value for a few
@@ -468,6 +540,18 @@ pub async fn start_clustered_turso_cdc(
 
     let max_snapshot_bytes = sqlite_config.replication.max_snapshot_bytes;
 
+    // Establish this database's persistent CDC log identity (issue #315).
+    // Done on EVERY node, not just the primary: any node can be promoted
+    // later, and the identity must already exist when the first subscriber
+    // dials in. Written through the mgmt connection so it is never
+    // captured into the CDC log itself.
+    let local_log_id = {
+        let conn =
+            mgmt_factory.raw_connection().context("CDC: open mgmt connection for log identity")?;
+        ensure_log_id(&conn).await.context("CDC: establish local log identity")?
+    };
+    tracing::info!(log_id = %local_log_id, "CDC: local log identity established");
+
     // Seed the zero-valued CDC series before anything can record. An
     // operator scraping a freshly booted node must be able to tell
     // "replication is on and idle" from "this build has no CDC
@@ -484,7 +568,13 @@ pub async fn start_clustered_turso_cdc(
     // soon as we win an election. Serving is gated on actually being
     // primary — a replica must never hand a peer a full logical dump of
     // the database.
-    spawn_snapshot_server(channel, Arc::clone(&mgmt_factory), Arc::clone(&is_primary), handles);
+    spawn_snapshot_server(
+        channel,
+        Arc::clone(&mgmt_factory),
+        Arc::clone(&is_primary),
+        local_log_id.clone(),
+        handles,
+    );
 
     // Register the CDC subscriber handler NOW even if we start as
     // replica, so it is already in place after a promotion. Each
@@ -493,6 +583,7 @@ pub async fn start_clustered_turso_cdc(
     let mut cdc_streams = channel.register_exact(CDC_STREAM_TYPE);
     let subs_mgmt = Arc::clone(&mgmt_factory);
     let subs_is_primary = Arc::clone(&is_primary);
+    let subs_log_id = local_log_id.clone();
     handles.push(tokio::spawn(async move {
         while let Some(incoming) = cdc_streams.recv().await {
             let IncomingStream { stream, peer, .. } = incoming;
@@ -506,8 +597,9 @@ pub async fn start_clustered_turso_cdc(
                 continue;
             }
             let mgmt = Arc::clone(&subs_mgmt);
+            let log_id = subs_log_id.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_subscriber(stream, &mgmt).await {
+                if let Err(e) = serve_subscriber(stream, &mgmt, &log_id).await {
                     tracing::info!(peer = %peer, "CDC subscriber disconnected: {e:#}");
                 }
             });
@@ -520,9 +612,27 @@ pub async fn start_clustered_turso_cdc(
     // observe partial state. This is awaited (blocking startup) on
     // purpose; the wire frontends spin up only after it completes. A
     // primary, or a replica whose DB is already populated, skips this.
-    if let Role::Replica { primary_addr } = &initial_role {
-        maybe_bootstrap_cold_replica(&mgmt_factory, *primary_addr, channel, max_snapshot_bytes)
-            .await?;
+    match &initial_role {
+        Role::Replica { primary_addr } => {
+            maybe_bootstrap_cold_replica(&mgmt_factory, *primary_addr, channel, max_snapshot_bytes)
+                .await?;
+        }
+        Role::Awaiting => {
+            // Only reachable when the election never resolved within
+            // RESOLVE_ROLE_TIMEOUT (e.g. every seed is down). Starting
+            // anyway matches the pre-#314 behaviour for an unresolved
+            // replica, minus the bogus 127.0.0.1:0 dials — but a COLD node
+            // on this path never fetched a snapshot, so if it later
+            // becomes a replica it will miss any pre-CDC rows. Loud, not
+            // silent:
+            tracing::warn!(
+                "CDC: starting with an UNRESOLVED replication role (no primary elected \
+                 within the startup window). If this node's database is cold and it later \
+                 becomes a replica, rows written before the primary enabled CDC will be \
+                 missing here — restart this node once the cluster has a primary."
+            );
+        }
+        Role::Primary => {}
     }
 
     // Start litewire wire frontends. Wire factory is moved in here, shared
@@ -563,13 +673,28 @@ pub async fn start_clustered_turso_cdc(
 #[derive(Debug, Clone)]
 enum Role {
     Primary,
-    Replica { primary_addr: SocketAddr },
+    Replica {
+        primary_addr: SocketAddr,
+    },
+    /// The election has not resolved to a definite role yet: no primary
+    /// claim is visible (or the claim's address was unusable). There is
+    /// nothing to drive in this state — no primary to dial, nothing to
+    /// serve — so its driver is a no-op and the role watcher swaps it
+    /// out when the election delivers a real role.
+    Awaiting,
 }
 
 fn elected_to_role(elected: ephpm_cluster::ElectedRole) -> Role {
     match elected {
         ephpm_cluster::ElectedRole::Primary => Role::Primary,
         ephpm_cluster::ElectedRole::Replica { primary_grpc_url } => {
+            // An empty URL is the election's explicit "no primary known
+            // yet" state (fresh cluster pre-election, or an incumbent's
+            // claim not yet gossiped over). Not an error — just nothing
+            // to dial yet.
+            if primary_grpc_url.is_empty() {
+                return Role::Awaiting;
+            }
             // In CDC-native mode the election broadcasts the primary's
             // *cluster channel* address in the `primary_grpc_url`
             // field. Note: the election machinery is shared with the
@@ -589,11 +714,49 @@ fn elected_to_role(elected: ephpm_cluster::ElectedRole) -> Role {
                         primary = %primary_grpc_url,
                         "CDC replica: primary address is not a valid SocketAddr: {e}"
                     );
-                    // Fall back to a bogus address; the replica loop
-                    // will fail to connect and just log — this is
-                    // preferable to panicking a background task.
-                    Role::Replica { primary_addr: SocketAddr::from(([127, 0, 0, 1], 0)) }
+                    // Treat as unresolved; the election loop re-publishes
+                    // and the role watcher will pick up a usable address.
+                    // (This used to fall back to dialing a bogus
+                    // 127.0.0.1:0 forever.)
+                    Role::Awaiting
                 }
+            }
+        }
+    }
+}
+
+/// Wait — bounded by [`RESOLVE_ROLE_TIMEOUT`] — for the election to turn
+/// an [`Role::Awaiting`] initial role into a definite one.
+///
+/// Startup blocks on this deliberately. The cold-replica snapshot
+/// bootstrap runs before the wire frontends come up, and it needs to know
+/// *whether* this node is a replica and *whom* to dial; deciding either
+/// before the election has seen the cluster is issue #314. On timeout the
+/// node starts unresolved (the caller warns) and the role watcher takes
+/// over when the election eventually resolves.
+async fn wait_for_initial_role(
+    initial: Role,
+    rx: &mut tokio::sync::watch::Receiver<ephpm_cluster::ElectedRole>,
+) -> Role {
+    let mut role = initial;
+    let deadline = tokio::time::Instant::now() + RESOLVE_ROLE_TIMEOUT;
+    loop {
+        if !matches!(role, Role::Awaiting) {
+            return role;
+        }
+        match tokio::time::timeout_at(deadline, rx.changed()).await {
+            Ok(Ok(())) => {
+                role = elected_to_role(rx.borrow_and_update().clone());
+            }
+            // Election task gone — nothing more will arrive.
+            Ok(Err(_)) => return role,
+            Err(_) => {
+                tracing::warn!(
+                    timeout_secs = RESOLVE_ROLE_TIMEOUT.as_secs(),
+                    "CDC: election did not resolve a primary within the startup window; \
+                     starting with an unresolved role"
+                );
+                return role;
             }
         }
     }
@@ -695,6 +858,11 @@ async fn start_role(role: Role, mgmt: Arc<Turso>, channel: ephpm_cluster::Channe
                 tracing::error!("CDC replica loop exited: {e:#}");
             }
         }
+        Role::Awaiting => {
+            // Nothing to drive until the election resolves; the role
+            // watcher replaces this driver when it does.
+            tracing::info!("CDC: no primary elected yet; awaiting election result");
+        }
     }
 }
 
@@ -745,9 +913,13 @@ fn spawn_head_sampler(
 
 /// Serve one replica's `cdc/default` stream.
 ///
-/// The replica's first frame is [`Frame::Subscribe`], carrying the
-/// `change_id` it has already applied. We open a [`CdcTailer`] at
-/// exactly that cursor and pump batches into the stream from there.
+/// The first frame on the wire is ours: [`Frame::Hello`], naming
+/// `local_log_id` — the persistent identity of the CDC log this stream
+/// will serve — so the replica can resolve its watermark for *this* log
+/// before announcing it (issue #315). The replica answers with
+/// [`Frame::Subscribe`], carrying the `change_id` it has already applied
+/// from this log. We open a [`CdcTailer`] at exactly that cursor and pump
+/// batches into the stream from there.
 ///
 /// This is deliberately **not** a fan-out from one shared cursor. An
 /// earlier version broadcast a single primary-wide tailer to all
@@ -779,7 +951,11 @@ fn spawn_head_sampler(
 pub async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     mut stream: S,
     mgmt: &Turso,
+    local_log_id: &str,
 ) -> anyhow::Result<()> {
+    write_frame(&mut stream, &Frame::Hello { log_id: local_log_id.to_string() })
+        .await
+        .context("send hello frame")?;
     let from = match read_frame(&mut stream).await.context("read subscribe frame")? {
         Frame::Subscribe { from_change_id } => from_change_id,
         other => anyhow::bail!("expected Subscribe as the first CDC frame, got {other:?}"),
@@ -860,6 +1036,19 @@ pub async fn serve_subscriber<S: AsyncReadExt + AsyncWriteExt + Unpin>(
 // Replica: dial the cluster channel + read + apply.
 // ---------------------------------------------------------------------------
 
+/// Context marker attached to watermark-resolution failures inside
+/// [`subscribe_and_consume`], so [`run_replica`] can attribute them to the
+/// `watermark_error` connect outcome instead of the generic
+/// `stream_error` (anyhow context types are downcastable).
+#[derive(Debug, Clone, Copy)]
+struct WatermarkResolution;
+
+impl std::fmt::Display for WatermarkResolution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("local watermark resolution failed")
+    }
+}
+
 /// The replica driver: dial the primary's `cdc/default` stream, announce
 /// the local watermark, apply what arrives, and retry forever.
 ///
@@ -892,27 +1081,25 @@ pub async fn run_replica(
     loop {
         match channel.dial(primary_addr, CDC_STREAM_TYPE).await {
             Ok(mut stream) => {
-                // Resume from exactly what we have applied. Read it
-                // fresh on every connect: a previous session may have
-                // advanced it. A read failure must not kill the driver —
-                // subscribing from a stale or default cursor would be
-                // worse than waiting for the next attempt.
-                let watermark = match read_watermark(&apply_conn).await {
-                    Ok(w) => w,
-                    Err(e) => {
-                        cdc_metrics::record_connect_outcome("watermark_error");
-                        tracing::warn!("CDC replica: cannot read local watermark: {e}");
-                        tokio::time::sleep(REPLICA_RECONNECT_DELAY).await;
-                        continue;
-                    }
-                };
-                match subscribe_and_consume(&mut stream, &apply_conn, watermark).await {
+                // Watermark resolution happens INSIDE subscribe_and_consume,
+                // after the primary's Hello: the cursor is only meaningful
+                // against the specific log the Hello names (issue #315), so
+                // it cannot be read up front any more.
+                match subscribe_and_consume(&mut stream, &apply_conn).await {
                     Ok(()) => {
                         cdc_metrics::record_connect_outcome("closed");
                         tracing::info!("CDC replica: primary closed stream cleanly");
                     }
                     Err(e) => {
-                        cdc_metrics::record_connect_outcome("stream_error");
+                        // Failures of the local watermark bookkeeping keep
+                        // their own outcome label — they mean "this node
+                        // cannot ground a cursor", which an operator debugs
+                        // very differently from a broken network stream.
+                        if e.downcast_ref::<WatermarkResolution>().is_some() {
+                            cdc_metrics::record_connect_outcome("watermark_error");
+                        } else {
+                            cdc_metrics::record_connect_outcome("stream_error");
+                        }
                         tracing::warn!("CDC replica stream error: {e:#}");
                     }
                 }
@@ -926,7 +1113,8 @@ pub async fn run_replica(
     }
 }
 
-/// Announce our watermark, then apply everything the primary sends.
+/// Read the primary's [`Frame::Hello`], resolve our watermark **for that
+/// log**, announce it, then apply everything the primary sends.
 ///
 /// Generic over the stream, and public, for the same reason
 /// [`serve_subscriber`] is: the two-node e2e suites drive this exact
@@ -935,13 +1123,32 @@ pub async fn run_replica(
 ///
 /// # Errors
 ///
-/// Returns an error if the subscribe frame cannot be sent, if the primary
-/// sends a malformed or wrong-direction frame, or if `apply_batch` fails.
+/// Returns an error if the Hello does not arrive within
+/// [`HELLO_TIMEOUT`] (protocol mismatch — mixed-version clusters are
+/// unsupported), if the watermark cannot be resolved for the announced
+/// log, if the subscribe frame cannot be sent, if the primary sends a
+/// malformed or wrong-direction frame, or if `apply_batch` fails.
 pub async fn subscribe_and_consume<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     stream: &mut S,
     apply_conn: &litewire::litewire_turso::TursoConnection,
-    watermark: i64,
 ) -> anyhow::Result<()> {
+    let hello = tokio::time::timeout(HELLO_TIMEOUT, read_frame(stream)).await.map_err(|_| {
+        anyhow::anyhow!(
+            "primary sent no Hello within {HELLO_TIMEOUT:?} — wire protocol mismatch? \
+             mixed-version clustered nodes are not supported"
+        )
+    })?;
+    let source_log_id = match hello.context("read hello frame")? {
+        Frame::Hello { log_id } => log_id,
+        other => anyhow::bail!("expected Hello as the first CDC frame, got {other:?}"),
+    };
+    anyhow::ensure!(!source_log_id.is_empty(), "primary announced an empty log id");
+
+    let watermark = resolve_subscribe_watermark(apply_conn, &source_log_id)
+        .await
+        .with_context(|| format!("resolve watermark for source log {source_log_id}"))
+        .context(WatermarkResolution)?;
+
     write_frame(stream, &Frame::Subscribe { from_change_id: watermark })
         .await
         .context("send subscribe frame")?;
@@ -949,7 +1156,11 @@ pub async fn subscribe_and_consume<S: AsyncReadExt + AsyncWriteExt + Unpin>(
     // the watermark gauge reflects durable local state rather than only
     // what this process has applied since it started.
     cdc_metrics::record_applied_watermark(watermark);
-    tracing::info!(from_change_id = watermark, "CDC replica: subscribed");
+    tracing::info!(
+        from_change_id = watermark,
+        source_log = %source_log_id,
+        "CDC replica: subscribed"
+    );
     consume_frames(stream, apply_conn).await
 }
 
@@ -1007,6 +1218,246 @@ async fn consume_frames<S: AsyncReadExt + AsyncWriteExt + Unpin>(
             Frame::Subscribe { .. } => {
                 anyhow::bail!("primary sent a Subscribe frame; wrong direction");
             }
+            Frame::Hello { .. } => {
+                anyhow::bail!("primary sent a second Hello frame; only valid as the first frame");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CDC log identity + per-log watermarks (issue #315).
+//
+// `turso_cdc.change_id` is a per-database sequence, so a watermark is only
+// meaningful against the specific log it was read from. Three tiny local
+// tables make that explicit:
+//
+//   __ephpm_cdc_log_id     — this database's own log identity (random,
+//                            generated once, announced in Hello/snapshot).
+//   __ephpm_cdc_source     — which log litewire's __litewire_cdc_watermark
+//                            currently refers to.
+//   __ephpm_cdc_watermarks — per-log history: the cursor we had reached in
+//                            each log we ever followed, saved when we
+//                            switch away and restored if we switch back
+//                            (a re-promotion cycle).
+//
+// All three are written through the mgmt/apply connection (capture off, so
+// they never enter the CDC log), are `__`-prefixed (so the snapshot dump
+// and the cold-start check both exclude them), and mirror litewire's
+// watermark-table shape conventions.
+// ---------------------------------------------------------------------------
+
+/// Table holding this database's persistent CDC log identity.
+const LOG_ID_TABLE: &str = "__ephpm_cdc_log_id";
+
+/// Table recording which source log [`WATERMARK_TABLE`] currently refers to.
+const SOURCE_LOG_TABLE: &str = "__ephpm_cdc_source";
+
+/// Table holding the per-source-log watermark history.
+const LOG_WATERMARKS_TABLE: &str = "__ephpm_cdc_watermarks";
+
+/// Read this database's persistent CDC log identity, generating and
+/// storing a fresh random one if none exists yet.
+///
+/// The identity is per database *file*, not per node: wiping a node's
+/// data directory yields a new identity, so peers' stale cursors for the
+/// old log can never be misapplied to the rebuilt one.
+///
+/// Public so the cross-node integration tests can establish identities on
+/// their fixture databases the exact way production does. Not part of a
+/// stable API.
+///
+/// # Errors
+///
+/// Returns an error if the table cannot be created, read, or seeded.
+pub async fn ensure_log_id(conn: &turso::Connection) -> anyhow::Result<String> {
+    conn.execute(
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {LOG_ID_TABLE} (\
+                id INTEGER PRIMARY KEY CHECK (id = 0), \
+                log_id TEXT NOT NULL)"
+        ),
+        (),
+    )
+    .await
+    .context("cdc: create log-id table")?;
+
+    if let Some(existing) = read_single_text(conn, LOG_ID_TABLE, "log_id").await? {
+        return Ok(existing);
+    }
+
+    let fresh = generate_log_id()?;
+    // INSERT OR IGNORE: if two connections race here, the first write
+    // wins and the re-read below returns the winner for both.
+    conn.execute(
+        &format!("INSERT OR IGNORE INTO {LOG_ID_TABLE} (id, log_id) VALUES (0, ?)"),
+        (fresh,),
+    )
+    .await
+    .context("cdc: seed log id")?;
+    read_single_text(conn, LOG_ID_TABLE, "log_id")
+        .await?
+        .context("cdc: log id missing immediately after seeding it")
+}
+
+/// 32 hex chars from the OS CSPRNG — 128 bits, no coordination needed.
+fn generate_log_id() -> anyhow::Result<String> {
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf)
+        .map_err(|e| anyhow::anyhow!("cdc: OS randomness unavailable for log id: {e}"))?;
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(32);
+    for b in buf {
+        write!(s, "{b:02x}").expect("writing to a String is infallible");
+    }
+    Ok(s)
+}
+
+/// Read the single row-0 text value of a `(id=0, <col>)`-shaped table.
+/// `None` when the table or row is absent.
+async fn read_single_text(
+    conn: &turso::Connection,
+    table: &str,
+    col: &str,
+) -> anyhow::Result<Option<String>> {
+    let mut stmt = match conn.prepare(&format!("SELECT {col} FROM {table} WHERE id = 0")).await {
+        Ok(s) => s,
+        Err(_) => return Ok(None), // table absent
+    };
+    let mut rows = stmt.query(()).await.with_context(|| format!("cdc: query {table}"))?;
+    match rows.next().await.with_context(|| format!("cdc: read {table}"))? {
+        Some(row) => match row.get_value(0).with_context(|| format!("cdc: {table} value"))? {
+            turso::Value::Text(s) => Ok(Some(s)),
+            _ => Ok(None),
+        },
+        None => Ok(None),
+    }
+}
+
+/// Record which source log [`WATERMARK_TABLE`] refers to from now on.
+async fn set_source_log(conn: &turso::Connection, log_id: &str) -> anyhow::Result<()> {
+    conn.execute(
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {SOURCE_LOG_TABLE} (\
+                id INTEGER PRIMARY KEY CHECK (id = 0), \
+                log_id TEXT NOT NULL)"
+        ),
+        (),
+    )
+    .await
+    .context("cdc: create source-log table")?;
+    conn.execute(
+        &format!("INSERT OR REPLACE INTO {SOURCE_LOG_TABLE} (id, log_id) VALUES (0, ?)"),
+        (log_id,),
+    )
+    .await
+    .context("cdc: write source log")?;
+    Ok(())
+}
+
+/// The watermark we had reached in `log_id`, from the per-log history.
+/// `0` when we have never followed that log.
+async fn read_log_watermark(conn: &turso::Connection, log_id: &str) -> anyhow::Result<i64> {
+    let mut stmt = match conn
+        .prepare(&format!("SELECT applied_change_id FROM {LOG_WATERMARKS_TABLE} WHERE log_id = ?"))
+        .await
+    {
+        Ok(s) => s,
+        Err(_) => return Ok(0), // table absent
+    };
+    let mut rows = stmt.query((log_id,)).await.context("cdc: query per-log watermark")?;
+    match rows.next().await.context("cdc: read per-log watermark")? {
+        Some(row) => match row.get_value(0).context("cdc: per-log watermark value")? {
+            turso::Value::Integer(i) => Ok(i),
+            _ => Ok(0),
+        },
+        None => Ok(0),
+    }
+}
+
+/// Upsert the per-log history entry for `log_id`.
+async fn store_log_watermark(
+    conn: &turso::Connection,
+    log_id: &str,
+    watermark: i64,
+) -> anyhow::Result<()> {
+    conn.execute(
+        &format!(
+            "CREATE TABLE IF NOT EXISTS {LOG_WATERMARKS_TABLE} (\
+                log_id TEXT PRIMARY KEY, \
+                applied_change_id INTEGER NOT NULL)"
+        ),
+        (),
+    )
+    .await
+    .context("cdc: create per-log watermark table")?;
+    conn.execute(
+        &format!(
+            "INSERT OR REPLACE INTO {LOG_WATERMARKS_TABLE} (log_id, applied_change_id) \
+             VALUES (?, ?)"
+        ),
+        (log_id, watermark),
+    )
+    .await
+    .context("cdc: write per-log watermark")?;
+    Ok(())
+}
+
+/// Resolve the watermark to subscribe with, given the log the primary
+/// announced in its [`Frame::Hello`]. This is the issue #315 fix's core:
+///
+/// - **Same log as last time** → litewire's own watermark table is
+///   authoritative (it advances transactionally with every applied batch).
+/// - **Different log** (we are following a *new* primary after a
+///   failover) → save the old log's cursor into the history, restore
+///   whatever cursor we had for the new log (0 if we never followed it —
+///   a promoted ex-replica's log is new to us), re-seed litewire's table
+///   to that value so [`apply_batch`]'s idempotency guard is aligned with
+///   the new sequence, and record the switch.
+/// - **No source recorded** (a database from before this fix, or one
+///   populated without a snapshot) → adopt litewire's current watermark
+///   as belonging to the announced log and record that. This matches the
+///   pre-fix behaviour for the one legacy transition; every switch after
+///   it is tracked.
+///
+/// # Errors
+///
+/// Returns an error if any of the local bookkeeping reads/writes fail —
+/// the caller must fail the stream rather than subscribe from a cursor it
+/// could not ground.
+pub async fn resolve_subscribe_watermark(
+    conn: &turso::Connection,
+    source_log_id: &str,
+) -> anyhow::Result<i64> {
+    match read_single_text(conn, SOURCE_LOG_TABLE, "log_id").await? {
+        Some(current) if current == source_log_id => {
+            read_watermark(conn).await.map_err(|e| anyhow::anyhow!("read local watermark: {e}"))
+        }
+        Some(previous) => {
+            let old_wm = read_watermark(conn)
+                .await
+                .map_err(|e| anyhow::anyhow!("read local watermark: {e}"))?;
+            store_log_watermark(conn, &previous, old_wm).await?;
+            let new_wm = read_log_watermark(conn, source_log_id).await?;
+            seed_watermark(conn, new_wm).await.context("re-seed litewire watermark")?;
+            set_source_log(conn, source_log_id).await?;
+            tracing::warn!(
+                previous_log = %previous,
+                previous_watermark = old_wm,
+                new_log = %source_log_id,
+                new_watermark = new_wm,
+                "CDC replica: switching source log (failover) — watermark re-seeded for \
+                 the new primary's log so its writes cannot land below our cursor"
+            );
+            Ok(new_wm)
+        }
+        None => {
+            let wm = read_watermark(conn)
+                .await
+                .map_err(|e| anyhow::anyhow!("read local watermark: {e}"))?;
+            store_log_watermark(conn, source_log_id, wm).await?;
+            set_source_log(conn, source_log_id).await?;
+            Ok(wm)
         }
     }
 }
@@ -1041,6 +1492,11 @@ struct SnapshotHeader {
     /// for logging/progress; the authoritative end signal is the
     /// zero-length end-marker chunk.
     total_len: u64,
+    /// Identity of the CDC log `watermark` belongs to — the serving
+    /// primary's [`LOG_ID_TABLE`] value (issue #315). The replica records
+    /// it as its source log so a later failover to a *different* log is
+    /// detected and the cursor is not misapplied.
+    log_id: String,
 }
 
 /// Spawn the primary-side snapshot server. The handler is registered
@@ -1053,6 +1509,7 @@ fn spawn_snapshot_server(
     channel: &ephpm_cluster::ChannelHandle,
     mgmt: Arc<Turso>,
     is_primary: Arc<AtomicBool>,
+    local_log_id: String,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
     let mut snapshot_streams = channel.register_exact(SNAPSHOT_STREAM_TYPE);
@@ -1070,8 +1527,9 @@ fn spawn_snapshot_server(
                 continue;
             }
             let mgmt = Arc::clone(&mgmt);
+            let log_id = local_log_id.clone();
             tokio::spawn(async move {
-                match serve_snapshot(stream, &mgmt).await {
+                match serve_snapshot(stream, &mgmt, &log_id).await {
                     Ok(n) => {
                         tracing::info!(peer = %peer, watermark = n, "served snapshot bootstrap");
                     }
@@ -1096,12 +1554,16 @@ fn spawn_snapshot_server(
 ///
 /// Returns an error if the dump cannot be produced or the stream write
 /// fails.
-pub async fn serve_snapshot(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::Result<i64> {
+pub async fn serve_snapshot(
+    mut stream: ChannelStream,
+    mgmt: &Turso,
+    local_log_id: &str,
+) -> anyhow::Result<i64> {
     // Recorded here rather than at the call site so a test that drives
     // `serve_snapshot` directly still exercises the instrumentation, and
     // so both outcomes are counted in one place.
     let started = std::time::Instant::now();
-    match serve_snapshot_inner(&mut stream, mgmt).await {
+    match serve_snapshot_inner(&mut stream, mgmt, local_log_id).await {
         Ok((watermark, bytes)) => {
             cdc_metrics::record_snapshot_served("ok", bytes, started.elapsed());
             Ok(watermark)
@@ -1118,11 +1580,16 @@ pub async fn serve_snapshot(mut stream: ChannelStream, mgmt: &Turso) -> anyhow::
 async fn serve_snapshot_inner(
     stream: &mut ChannelStream,
     mgmt: &Turso,
+    local_log_id: &str,
 ) -> anyhow::Result<(i64, u64)> {
     let conn = mgmt.raw_connection().context("snapshot: open mgmt connection")?;
     let (watermark, dump) = produce_snapshot(&conn).await.context("snapshot: produce dump")?;
 
-    let header = SnapshotHeader { watermark, total_len: dump.len() as u64 };
+    let header = SnapshotHeader {
+        watermark,
+        total_len: dump.len() as u64,
+        log_id: local_log_id.to_string(),
+    };
     write_snapshot_header(stream, &header).await?;
 
     for chunk in dump.as_bytes().chunks(SNAPSHOT_CHUNK_TARGET) {
@@ -1322,7 +1789,9 @@ async fn table_columns(conn: &turso::Connection, table: &str) -> anyhow::Result<
 }
 
 /// Apply a received snapshot dump to the local (cold) DB, then seed the
-/// watermark to `N` so the CDC tail resumes exactly past it.
+/// watermark to `N` so the CDC tail resumes exactly past it, and record
+/// which log `N` belongs to (issue #315) so a later failover to a
+/// different primary is detected as a source switch.
 ///
 /// The dump arrives from the network and is only UTF-8 checked before
 /// this point, so it is validated against a statement allowlist first
@@ -1330,14 +1799,19 @@ async fn table_columns(conn: &turso::Connection, table: &str) -> anyhow::Result<
 /// `execute_batch`.
 async fn apply_snapshot(
     conn: &turso::Connection,
-    watermark: i64,
+    header: &SnapshotHeader,
     dump: &str,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(!header.log_id.is_empty(), "snapshot: peer announced an empty log id");
     validate_snapshot_dump(dump).context("snapshot: dump rejected by the statement allowlist")?;
     // Execute the whole dump as a batch. It is self-consistent DDL+DML
     // captured under one read view on the primary.
     conn.execute_batch(dump).await.context("snapshot: apply dump")?;
-    seed_watermark(conn, watermark).await.context("snapshot: seed watermark")?;
+    seed_watermark(conn, header.watermark).await.context("snapshot: seed watermark")?;
+    store_log_watermark(conn, &header.log_id, header.watermark)
+        .await
+        .context("snapshot: record per-log watermark")?;
+    set_source_log(conn, &header.log_id).await.context("snapshot: record source log")?;
     Ok(())
 }
 
@@ -1662,7 +2136,7 @@ pub async fn fetch_and_apply_snapshot(
         body.extend_from_slice(&chunk);
     }
     let dump = String::from_utf8(body).context("snapshot: dump body is not valid utf-8")?;
-    apply_snapshot(conn, header.watermark, &dump).await?;
+    apply_snapshot(conn, &header, &dump).await?;
     // Only counted once the dump is durably applied: bytes received into
     // a buffer that then failed validation are not a bootstrap.
     cdc_metrics::record_snapshot_received(received, started.elapsed());
@@ -1992,8 +2466,16 @@ mod tests {
 
         let (mut client, server) = tokio::io::duplex(1 << 20);
         let mgmt_for_task = Arc::clone(&mgmt);
-        let task = tokio::spawn(async move { serve_subscriber(server, &mgmt_for_task).await });
+        let task =
+            tokio::spawn(
+                async move { serve_subscriber(server, &mgmt_for_task, "test-log-id").await },
+            );
 
+        // The primary speaks first: its Hello names the log it serves.
+        match read_frame(&mut client).await.unwrap() {
+            Frame::Hello { log_id } => assert_eq!(log_id, "test-log-id"),
+            other => panic!("expected Hello as the first frame, got {other:?}"),
+        }
         // Subscribe from the very beginning, as a cold replica does.
         write_frame(&mut client, &Frame::Subscribe { from_change_id: 0 }).await.unwrap();
 
@@ -2047,7 +2529,8 @@ mod tests {
     async fn snapshot_codec_header_chunks_end_marker_roundtrip() {
         let (mut client, mut server) = tokio::io::duplex(1 << 20);
 
-        let header = SnapshotHeader { watermark: 42, total_len: 11 };
+        let header =
+            SnapshotHeader { watermark: 42, total_len: 11, log_id: "snap-log-id".to_string() };
         let chunk_a = b"hello ".to_vec();
         let chunk_b = b"world".to_vec();
 
@@ -2062,6 +2545,7 @@ mod tests {
         let got_header = read_snapshot_header(&mut server).await.unwrap();
         assert_eq!(got_header.watermark, 42);
         assert_eq!(got_header.total_len, 11);
+        assert_eq!(got_header.log_id, "snap-log-id");
 
         let mut body = Vec::new();
         loop {
@@ -2199,6 +2683,12 @@ mod tests {
         assert!(is_internal_object("sqlite_sequence"));
         assert!(is_internal_object("turso_cdc"));
         assert!(is_internal_object(WATERMARK_TABLE));
+        // The log-identity bookkeeping must never ship in a snapshot: a
+        // replica that inherited the primary's log id would corrupt the
+        // per-log watermark scoping the moment it was promoted.
+        assert!(is_internal_object(LOG_ID_TABLE));
+        assert!(is_internal_object(SOURCE_LOG_TABLE));
+        assert!(is_internal_object(LOG_WATERMARKS_TABLE));
         // turso 0.7.0's autoincrement backing table for turso_cdc: its
         // sqlite_schema.sql is a real CREATE the engine refuses to
         // replay, so it must be filtered.
@@ -2207,6 +2697,94 @@ mod tests {
         ));
         assert!(!is_internal_object("posts"));
         assert!(!is_internal_object("users"));
+    }
+
+    // -----------------------------------------------------------------
+    // CDC log identity + per-log watermark scoping (issue #315).
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn hello_frame_roundtrips() {
+        let (mut client, mut server) = tokio::io::duplex(65536);
+        write_frame(&mut client, &Frame::Hello { log_id: "abc123".into() }).await.unwrap();
+        match read_frame(&mut server).await.unwrap() {
+            Frame::Hello { log_id } => assert_eq!(log_id, "abc123"),
+            other => panic!("expected Hello, got {other:?}"),
+        }
+    }
+
+    /// A database's log identity is generated once and survives reopening
+    /// the file; two databases never share one.
+    #[tokio::test]
+    async fn log_identity_is_persistent_and_distinct() {
+        let db_a = tempfile::NamedTempFile::new().unwrap();
+        let db_b = tempfile::NamedTempFile::new().unwrap();
+        let path_a = db_a.path().to_str().unwrap().to_string();
+        let path_b = db_b.path().to_str().unwrap().to_string();
+
+        let id_a = {
+            let t = Turso::open(&path_a).await.unwrap();
+            let conn = t.raw_connection().unwrap();
+            let first = ensure_log_id(&conn).await.unwrap();
+            // Idempotent on the same connection...
+            assert_eq!(first, ensure_log_id(&conn).await.unwrap());
+            first
+        };
+        // ...and stable across a full reopen (this is what makes it a
+        // *log* identity rather than a process identity).
+        {
+            let t = Turso::open(&path_a).await.unwrap();
+            let conn = t.raw_connection().unwrap();
+            assert_eq!(id_a, ensure_log_id(&conn).await.unwrap());
+        }
+        let t_b = Turso::open(&path_b).await.unwrap();
+        let id_b = ensure_log_id(&t_b.raw_connection().unwrap()).await.unwrap();
+        assert_ne!(id_a, id_b, "two databases must never share a log identity");
+        assert_eq!(id_a.len(), 32, "128-bit hex identity");
+    }
+
+    /// The issue #315 core, as a state-machine walk: a cursor accumulated
+    /// against one log must never be presented to (or guard applies from)
+    /// a different log, and switching back to a previously-followed log
+    /// restores its saved cursor — the primary → replica → re-promotion
+    /// cycle.
+    #[tokio::test]
+    async fn watermark_resolution_is_scoped_to_the_source_log() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        let t = Turso::open(&path).await.unwrap();
+        let conn = t.raw_connection().unwrap();
+
+        // Legacy/unknown source: adopt the current litewire watermark (0
+        // here) as belonging to the announced log.
+        assert_eq!(resolve_subscribe_watermark(&conn, "log-A").await.unwrap(), 0);
+
+        // Apply progress against log-A (what apply_batch would do).
+        seed_watermark(&conn, 5).await.unwrap();
+        // Reconnect to the same log: litewire's table is authoritative.
+        assert_eq!(resolve_subscribe_watermark(&conn, "log-A").await.unwrap(), 5);
+
+        // FAILOVER: the new primary announces a different log. Before the
+        // fix the replica would have subscribed at 5 and apply_batch would
+        // have skipped everything <= 5 — silent write loss. Now the cursor
+        // for the new log starts at 0 and litewire's guard is re-seeded to
+        // match.
+        assert_eq!(resolve_subscribe_watermark(&conn, "log-B").await.unwrap(), 0);
+        assert_eq!(
+            read_watermark(&conn).await.unwrap(),
+            0,
+            "litewire's idempotency guard must follow the source switch, or every \
+             batch from the new log would be skipped as 'already applied'"
+        );
+
+        // Apply progress against log-B, then switch back to log-A (the
+        // old primary restarted and was re-elected): its saved cursor is
+        // restored, so nothing already applied is re-requested.
+        seed_watermark(&conn, 3).await.unwrap();
+        assert_eq!(resolve_subscribe_watermark(&conn, "log-A").await.unwrap(), 5);
+        assert_eq!(read_watermark(&conn).await.unwrap(), 5);
+        // And log-B's progress was saved for a potential switch back.
+        assert_eq!(resolve_subscribe_watermark(&conn, "log-B").await.unwrap(), 3);
     }
 
     /// The `cdc/` prefix constant this module uses matches the well-known
@@ -2288,7 +2866,22 @@ mod tests {
             Role::Replica { primary_addr } => {
                 assert_eq!(primary_addr, "0.0.0.0:8094".parse::<SocketAddr>().unwrap());
             }
-            Role::Primary => panic!("expected Role::Replica, got Primary"),
+            other @ (Role::Primary | Role::Awaiting) => {
+                panic!("expected Role::Replica, got {other:?}")
+            }
         }
+    }
+
+    /// The election's explicit "no primary known yet" state (empty URL)
+    /// and an unparseable address both map to `Role::Awaiting` — there is
+    /// nothing to dial, and the old bogus `127.0.0.1:0` fallback dialed
+    /// a dead loopback port forever.
+    #[test]
+    fn elected_to_role_maps_unknown_primary_to_awaiting() {
+        let empty = ephpm_cluster::ElectedRole::Replica { primary_grpc_url: String::new() };
+        assert!(matches!(elected_to_role(empty), Role::Awaiting));
+        let garbage =
+            ephpm_cluster::ElectedRole::Replica { primary_grpc_url: "not-a-host-port".into() };
+        assert!(matches!(elected_to_role(garbage), Role::Awaiting));
     }
 }

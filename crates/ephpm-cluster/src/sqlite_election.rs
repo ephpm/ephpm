@@ -8,6 +8,31 @@
 //! The lowest-ordinal alive node wins. The primary heartbeats its claim
 //! every 5 seconds with a 10-second TTL. On primary failure, the next
 //! lowest-ordinal node promotes itself.
+//!
+//! # Incumbent protection (issue #314)
+//!
+//! Two rules keep a node that *joins* a running cluster from taking the
+//! primary role away from a healthy incumbent (observed in the wild: a cold
+//! node re-rooted the cluster onto its own empty database):
+//!
+//! 1. **Startup grace.** A freshly started node must not publish a first
+//!    primary claim until [`STARTUP_GRACE`] has elapsed since boot. At boot,
+//!    gossip has not converged: `cluster.nodes()` holds only the local node
+//!    (so "lowest-ordinal alive" is trivially true for everyone) and an
+//!    incumbent's claim may not have gossiped over yet. The grace window is
+//!    longer than claim TTL + heartbeat, so a live incumbent's claim is
+//!    guaranteed multiple opportunities to arrive before this node may
+//!    self-elect. A restarting incumbent whose own (unexpired) claim is
+//!    still in gossip reclaims immediately — that is not a theft.
+//! 2. **Deterministic conflict resolution.** The gossip KV tier is
+//!    last-write-wins, so two simultaneous claimants would otherwise
+//!    flip-flop on every heartbeat. If this node currently holds the
+//!    primary role and sees a *live* foreign claim, the tie is broken by
+//!    node id — lowest wins (the documented election rule) — instead of
+//!    silently yielding to whoever wrote last. With rule 1 in place this
+//!    only triggers when two nodes genuinely elected concurrently (e.g.
+//!    a symmetric partition heal), where either database is as good as
+//!    the other and determinism is what matters.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,6 +50,18 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// TTL for the primary claim. If not refreshed, the key expires and
 /// triggers re-election.
 const PRIMARY_TTL: Duration = Duration::from_secs(10);
+
+/// How long a freshly started node must wait before it may publish its
+/// *first* primary claim (issue #314 — see the module docs).
+///
+/// Must exceed `PRIMARY_TTL + HEARTBEAT_INTERVAL`: a live incumbent
+/// refreshes its claim every [`HEARTBEAT_INTERVAL`], and gossip delivers a
+/// KV write in low single-digit seconds, so within this window a joining
+/// node is guaranteed to observe the incumbent's claim if one exists.
+/// The cost is that a genuinely fresh cluster elects its first primary
+/// ~15s after boot instead of immediately.
+const STARTUP_GRACE: Duration =
+    Duration::from_secs(PRIMARY_TTL.as_secs() + HEARTBEAT_INTERVAL.as_secs());
 
 /// The elected role for this node's sqld instance.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +105,9 @@ pub struct SqliteElection {
     grpc_listen: String,
     role_tx: watch::Sender<ElectedRole>,
     role_rx: watch::Receiver<ElectedRole>,
+    /// When this election manager was created. Gates the first
+    /// self-election behind [`STARTUP_GRACE`] (issue #314).
+    boot: tokio::time::Instant,
 }
 
 impl SqliteElection {
@@ -81,7 +121,7 @@ impl SqliteElection {
         let (role_tx, role_rx) =
             watch::channel(ElectedRole::Replica { primary_grpc_url: String::new() });
 
-        Self { cluster, grpc_listen, role_tx, role_rx }
+        Self { cluster, grpc_listen, role_tx, role_rx, boot: tokio::time::Instant::now() }
     }
 
     /// Get a receiver for role changes.
@@ -96,29 +136,52 @@ impl SqliteElection {
     /// Determine the initial role by checking existing gossip state.
     ///
     /// Should be called once before starting the election loop.
+    ///
+    /// A fresh node never returns `Primary` from here unless the existing
+    /// gossip claim already names *this* node (a fast restart of the
+    /// incumbent, within the claim TTL). At boot, gossip has not converged
+    /// — the membership view may hold only the local node and an
+    /// incumbent's claim may not have arrived yet — so deciding "I am the
+    /// lowest-ordinal alive node, therefore primary" here is exactly the
+    /// role-theft bug of issue #314. The election loop ([`run`](Self::run))
+    /// makes the first claim instead, after [`STARTUP_GRACE`].
+    ///
+    /// The decision is also published to the role watch channel so
+    /// [`watch_role`](Self::watch_role) receivers and the loop's own
+    /// current-role view agree with the value returned here.
     pub async fn determine_initial_role(&self) -> ElectedRole {
+        let role = self.initial_role_inner().await;
+        self.role_tx.send_replace(role.clone());
+        role
+    }
+
+    async fn initial_role_inner(&self) -> ElectedRole {
         // Check if there's already a primary claim in gossip.
         if let Some(bytes) = self.cluster.gossip_get(PRIMARY_KEY).await {
             if let Some(claim) = PrimaryClaim::decode(&bytes) {
-                if claim.node_id != self.cluster.self_node().id {
-                    if let Some(url) = self.replica_url_for(&claim).await {
-                        return ElectedRole::Replica { primary_grpc_url: url };
-                    }
-                    // Claim points at a host that is not a known member.
-                    // Refuse to dial it (defense in depth against a forged
-                    // gossip claim) and wait for a valid one.
-                    return ElectedRole::Replica { primary_grpc_url: String::new() };
+                if claim.node_id == self.cluster.self_node().id {
+                    // Our own (unexpired) claim survived a restart —
+                    // reclaiming is not a theft; refresh and carry on.
+                    self.publish_claim().await;
+                    tracing::info!("SQLite election: reclaiming our own surviving primary claim");
+                    return ElectedRole::Primary;
                 }
+                if let Some(url) = self.replica_url_for(&claim).await {
+                    return ElectedRole::Replica { primary_grpc_url: url };
+                }
+                // Claim points at a host that is not a known member.
+                // Refuse to dial it (defense in depth against a forged
+                // gossip claim) and wait for a valid one.
+                return ElectedRole::Replica { primary_grpc_url: String::new() };
             }
         }
 
-        // No valid claim exists — check if we should be primary.
-        if self.should_be_primary().await {
-            ElectedRole::Primary
-        } else {
-            // No primary yet and we're not lowest ordinal — wait.
-            ElectedRole::Replica { primary_grpc_url: String::new() }
-        }
+        // No valid claim visible. That means either the cluster genuinely
+        // has no primary, or gossip simply has not delivered the
+        // incumbent's claim yet — indistinguishable this early. Do NOT
+        // claim: start as an unresolved replica and let the election loop
+        // claim after the startup grace (issue #314).
+        ElectedRole::Replica { primary_grpc_url: String::new() }
     }
 
     /// Run the election loop. This should be spawned as a tokio task.
@@ -133,7 +196,7 @@ impl SqliteElection {
             interval.tick().await;
 
             let current_role = self.role_rx.borrow().clone();
-            let new_role = self.evaluate_role().await;
+            let new_role = self.evaluate_role(&current_role).await;
 
             if new_role != current_role {
                 tracing::info!(
@@ -148,7 +211,12 @@ impl SqliteElection {
     }
 
     /// Evaluate what role this node should have right now.
-    async fn evaluate_role(&self) -> ElectedRole {
+    ///
+    /// `current` is the role this node currently holds (from the watch
+    /// channel). It matters in exactly one place: when a *live* foreign
+    /// claim conflicts with our own primary role, the tie is broken
+    /// deterministically instead of by whoever gossiped last (issue #314).
+    async fn evaluate_role(&self, current: &ElectedRole) -> ElectedRole {
         let self_node = self.cluster.self_node();
 
         // Check existing primary claim.
@@ -169,6 +237,29 @@ impl SqliteElection {
                     nodes.iter().any(|n| n.id == claim.node_id && n.state == NodeState::Alive);
 
                 if primary_alive {
+                    // Conflict: we hold the primary role, yet a live peer
+                    // claims it too (gossip KV is last-write-wins, so its
+                    // newer write shadows ours). Do not yield
+                    // unconditionally — that is how a joining node stole
+                    // the role from a healthy incumbent. Break the tie by
+                    // the documented rule: lowest node id wins.
+                    if matches!(current, ElectedRole::Primary) {
+                        if incumbent_wins_tie(&self_node.id, &claim.node_id) {
+                            tracing::warn!(
+                                claimant = %claim.node_id,
+                                "SQLite election: live conflicting primary claim from a \
+                                 higher-ordinal node; keeping the primary role and \
+                                 re-asserting our claim (lowest node id wins)"
+                            );
+                            self.publish_claim().await;
+                            return ElectedRole::Primary;
+                        }
+                        tracing::warn!(
+                            claimant = %claim.node_id,
+                            "SQLite election: live conflicting primary claim from a \
+                             lower-ordinal node; stepping down (lowest node id wins)"
+                        );
+                    }
                     if let Some(url) = self.replica_url_for(&claim).await {
                         return ElectedRole::Replica { primary_grpc_url: url };
                     }
@@ -183,6 +274,22 @@ impl SqliteElection {
                     "primary node is dead, triggering re-election"
                 );
             }
+        }
+
+        // No valid primary claim visible. If this node started recently,
+        // that absence is not evidence there is no primary — gossip may
+        // simply not have delivered the incumbent's claim yet. Defer the
+        // first self-election until the startup grace has passed
+        // (issue #314). A node that already holds the primary role is by
+        // definition past its first election and is not gated.
+        if !matches!(current, ElectedRole::Primary) && self.boot.elapsed() < STARTUP_GRACE {
+            tracing::debug!(
+                elapsed_ms = self.boot.elapsed().as_millis(),
+                grace_ms = STARTUP_GRACE.as_millis(),
+                "SQLite election: no primary claim visible, but within the startup \
+                 grace window — deferring self-election until gossip has converged"
+            );
+            return ElectedRole::Replica { primary_grpc_url: String::new() };
         }
 
         // No valid primary claim — elect.
@@ -248,6 +355,14 @@ impl SqliteElection {
         };
         self.cluster.gossip_set(PRIMARY_KEY, &claim.encode(), Some(PRIMARY_TTL)).await;
     }
+}
+
+/// Deterministic resolution for two live, conflicting primary claims:
+/// the incumbent keeps the role iff its node id sorts strictly lower than
+/// the claimant's — the same "lowest ordinal wins" rule the election uses
+/// for a fresh cluster, applied to conflicts (issue #314).
+fn incumbent_wins_tie(self_id: &str, claimant_id: &str) -> bool {
+    self_id < claimant_id
 }
 
 /// Extract the host portion of a `host:port` (or `[ipv6]:port`) address.
@@ -430,5 +545,31 @@ mod tests {
         assert!(PRIMARY_TTL > HEARTBEAT_INTERVAL);
         // The ratio should allow at least one missed heartbeat.
         assert!(PRIMARY_TTL >= HEARTBEAT_INTERVAL * 2);
+    }
+
+    /// The startup grace must outlast a full claim TTL plus one heartbeat:
+    /// only then is a joining node guaranteed to have had the chance to
+    /// observe a live incumbent's (re-published) claim before it may
+    /// self-elect. Issue #314.
+    #[test]
+    fn startup_grace_covers_claim_ttl_and_a_heartbeat() {
+        assert!(STARTUP_GRACE >= PRIMARY_TTL + HEARTBEAT_INTERVAL);
+    }
+
+    /// Conflicting live claims resolve by node id, lowest wins — in both
+    /// directions, so exactly one of the two conflicting nodes keeps the
+    /// role. Issue #314.
+    #[test]
+    fn conflicting_claims_resolve_to_lowest_node_id() {
+        // Observed field failure: cdc-node-3 (joiner) took the role from
+        // cdc-node-2 (incumbent). The incumbent must win this tie...
+        assert!(incumbent_wins_tie("cdc-node-2", "cdc-node-3"));
+        // ...and symmetrically, if the *joiner* somehow held the role, it
+        // must yield to the lower-ordinal claimant.
+        assert!(!incumbent_wins_tie("cdc-node-3", "cdc-node-2"));
+        // Equal ids never conflict (that is the refresh-own-claim path),
+        // but the tie-break must not let an equal id "win" as incumbent
+        // AND as claimant on two nodes at once.
+        assert!(!incumbent_wins_tie("cdc-node-1", "cdc-node-1"));
     }
 }

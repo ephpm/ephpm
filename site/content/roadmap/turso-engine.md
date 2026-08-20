@@ -200,6 +200,29 @@ path is a **single ordered stream** with no schema-sync side channel.
   than the pinned revision's, and rejecting at decode time keeps the
   diagnostics legible (every failure past that point is reported "at
   change_id N", which an empty batch has no value for).
+- **Failover-safe watermarks (v0.7.2, issue #315).** `turso_cdc.change_id`
+  is a per-database sequence, and the replication watermark used to be
+  treated as if it were cluster-global — so after a failover, a survivor
+  subscribed to the promoted node with a cursor from the *dead* primary's
+  log, the promoted node's own writes landed below it, and they were
+  silently never shipped (unbounded post-failover write loss, with the
+  replica reporting itself caught up). Every database now carries a
+  persistent random **log identity**; the primary announces it as the
+  first frame of every replication stream and in the snapshot header, and
+  a replica keeps its cursor **per log** (saving/restoring across source
+  switches, including primary → replica → re-promotion cycles). This is a
+  CDC wire-protocol change: mixed-version clustered nodes are not
+  supported.
+- **Election incumbent protection (v0.7.2, issue #314).** A node joining
+  a running cluster used to take the primary role from a healthy
+  incumbent (its pre-convergence membership view made "lowest-ordinal
+  alive" trivially true, and the last claim written to gossip won),
+  re-rooting the cluster onto an empty database. A freshly started node
+  now waits out a startup grace (longer than claim TTL + heartbeat)
+  before its first self-election, and live claim conflicts resolve
+  deterministically to the lowest node id instead of the last writer.
+  The cost: a genuinely fresh cluster elects its first primary ~15–20s
+  after boot instead of immediately.
 - Prometheus instrumentation for the whole path — batches and rows
   shipped and applied, subscriber count, the applied watermark, apply and
   tail-poll errors, reconnects by outcome, snapshot bytes and outcome,
@@ -218,10 +241,6 @@ path is a **single ordered stream** with no schema-sync side channel.
   but litewire's `CdcRow` does not expose it, so this needs a litewire
   PR adding the field plus a matching CDC wire-format change here. Not
   fakeable from row counts, so nothing is published in the meantime.
-- Subscriber watermarks that survive a *primary change*. Resume works
-  within one primary (the subscriber names its cursor); after a
-  failover the new primary's `change_id` space is its own, so a
-  cross-primary cursor needs a cluster-wide watermark scheme.
 - TLS wrapping of the cluster channel. The channel is authenticated and
   encrypted with the operator's shared secret, but there is no PKI peer
   identity — see the [cluster channel

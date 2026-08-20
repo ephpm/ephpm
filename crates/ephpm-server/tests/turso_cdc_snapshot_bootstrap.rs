@@ -30,7 +30,7 @@ use ephpm_cluster::{
     start_gossip,
 };
 use ephpm_config::{ClusterChannelConfig, ClusterConfig};
-use ephpm_server::turso_cdc::{fetch_and_apply_snapshot, serve_snapshot};
+use ephpm_server::turso_cdc::{ensure_log_id, fetch_and_apply_snapshot, serve_snapshot};
 use litewire::backend::{Backend, Value};
 use litewire::litewire_turso::Turso;
 use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, read_watermark};
@@ -166,15 +166,21 @@ async fn spawn_primary(
 ) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
     let mut handles = Vec::new();
 
-    // Snapshot handler: the production serve path.
+    // Snapshot handler: the production serve path (including the log
+    // identity the production startup establishes, issue #315).
     let mut snapshot_streams = channel.register_exact(SNAPSHOT_STREAM_TYPE);
     let snap_mgmt = Arc::clone(&mgmt);
     handles.push(tokio::spawn(async move {
+        let log_id = {
+            let conn = snap_mgmt.raw_connection().expect("mgmt connection for log id");
+            ensure_log_id(&conn).await.expect("establish log id")
+        };
         while let Some(incoming) = snapshot_streams.recv().await {
             let mgmt = Arc::clone(&snap_mgmt);
+            let log_id = log_id.clone();
             let IncomingStream { stream, .. } = incoming;
             tokio::spawn(async move {
-                if let Err(e) = serve_snapshot(stream, &mgmt).await {
+                if let Err(e) = serve_snapshot(stream, &mgmt, &log_id).await {
                     eprintln!("serve_snapshot: {e:#}");
                 }
             });

@@ -100,11 +100,18 @@ fn spawn_primary_on_channel(
 ) -> (std::net::SocketAddr, Vec<tokio::task::JoinHandle<()>>) {
     let mut cdc_streams = channel.register_exact(CDC_STREAM_TYPE);
     let dispatch = tokio::spawn(async move {
+        // Production establishes the log identity at startup; do the same
+        // here so every subscriber gets a real Hello.
+        let log_id = {
+            let conn = mgmt.raw_connection().expect("mgmt connection for log id");
+            ephpm_server::turso_cdc::ensure_log_id(&conn).await.expect("establish log id")
+        };
         while let Some(incoming) = cdc_streams.recv().await {
             let IncomingStream { stream, .. } = incoming;
             let mgmt = Arc::clone(&mgmt);
+            let log_id = log_id.clone();
             tokio::spawn(async move {
-                if let Err(e) = serve_subscriber(stream, &mgmt).await {
+                if let Err(e) = serve_subscriber(stream, &mgmt, &log_id).await {
                     eprintln!("serve subscriber: {e:#}");
                 }
             });
