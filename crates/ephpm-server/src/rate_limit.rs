@@ -172,10 +172,10 @@ pub struct ConnectionGuard {
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         self.limiter.global_connections.fetch_sub(1, Ordering::Relaxed);
-        if self.counted {
-            if let Some(state) = self.limiter.per_ip.get(&self.ip) {
-                state.connections.fetch_sub(1, Ordering::Relaxed);
-            }
+        if self.counted
+            && let Some(state) = self.limiter.per_ip.get(&self.ip)
+        {
+            state.connections.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }

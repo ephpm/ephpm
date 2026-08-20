@@ -127,15 +127,15 @@ impl WsRuntime {
 
         let ping_interval = non_zero_secs(config.ping_interval_secs);
         let idle_timeout = non_zero_secs(config.idle_timeout_secs);
-        if let (Some(ping), Some(idle)) = (ping_interval, idle_timeout) {
-            if ping >= idle {
-                tracing::warn!(
-                    ping_interval_secs = config.ping_interval_secs,
-                    idle_timeout_secs = config.idle_timeout_secs,
-                    "[server.websocket] ping_interval_secs >= idle_timeout_secs — idle \
+        if let (Some(ping), Some(idle)) = (ping_interval, idle_timeout)
+            && ping >= idle
+        {
+            tracing::warn!(
+                ping_interval_secs = config.ping_interval_secs,
+                idle_timeout_secs = config.idle_timeout_secs,
+                "[server.websocket] ping_interval_secs >= idle_timeout_secs — idle \
                      connections will be closed before a ping can refresh them"
-                );
-            }
+            );
         }
 
         tracing::info!(
@@ -449,16 +449,16 @@ pub(crate) async fn run_session(
             }
 
             _ = ticker.tick() => {
-                if let Some(idle) = runtime.idle_timeout {
-                    if last_rx.elapsed() >= idle {
-                        tracing::debug!(
-                            conn = %session.connection_id,
-                            idle_secs = idle.as_secs(),
-                            "closing idle websocket connection"
-                        );
-                        closing = Some(CLOSE_GOING_AWAY);
-                        break;
-                    }
+                if let Some(idle) = runtime.idle_timeout
+                    && last_rx.elapsed() >= idle
+                {
+                    tracing::debug!(
+                        conn = %session.connection_id,
+                        idle_secs = idle.as_secs(),
+                        "closing idle websocket connection"
+                    );
+                    closing = Some(CLOSE_GOING_AWAY);
+                    break;
                 }
                 // A failed ping means the socket is already gone; stop rather
                 // than waiting for the read half to notice.

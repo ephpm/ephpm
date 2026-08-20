@@ -633,13 +633,13 @@ fn generate_bindings(include_dir: &Path, target_os: &str) {
 /// install locations on Debian/Ubuntu.
 fn find_clang_resource_include() -> Option<PathBuf> {
     // Try clang --print-resource-dir
-    if let Ok(output) = Command::new("clang").arg("--print-resource-dir").output() {
-        if output.status.success() {
-            let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            let include = PathBuf::from(&dir).join("include");
-            if include.join("stddef.h").exists() {
-                return Some(include);
-            }
+    if let Ok(output) = Command::new("clang").arg("--print-resource-dir").output()
+        && output.status.success()
+    {
+        let dir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let include = PathBuf::from(&dir).join("include");
+        if include.join("stddef.h").exists() {
+            return Some(include);
         }
     }
 

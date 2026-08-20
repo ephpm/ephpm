@@ -748,11 +748,11 @@ fn build_handshake_response(
     // Lenenc-encoded auth response.
     encode_lenenc_bytes(&mut buf, &auth_response);
 
-    if let Some(db) = database {
-        if !db.is_empty() {
-            buf.extend_from_slice(db.as_bytes());
-            buf.push(0);
-        }
+    if let Some(db) = database
+        && !db.is_empty()
+    {
+        buf.extend_from_slice(db.as_bytes());
+        buf.push(0);
     }
 
     let plugin_name = if use_caching_sha2 {
@@ -1824,10 +1824,10 @@ fn select_pool<'a>(
     }
 
     // Sticky after write: check if still in sticky window.
-    if let Some(sticky_until) = state.sticky_until {
-        if std::time::Instant::now() < sticky_until {
-            return primary;
-        }
+    if let Some(sticky_until) = state.sticky_until
+        && std::time::Instant::now() < sticky_until
+    {
+        return primary;
     }
 
     // Read queries can use replicas via round-robin.
@@ -2075,12 +2075,11 @@ async fn proxy_routing_loop(
                 stmt_pool_map.insert(stmt_id, PreparedStmt { target: pool_target, sql });
                 debug!(stmt_id, ?pool_target, "prepared statement registered");
             }
-        } else if cmd == COM_STMT_CLOSE {
-            if let Some(stmt_id) = parse_stmt_id(&payload) {
-                if let Some(removed) = stmt_pool_map.remove(&stmt_id) {
-                    debug!(stmt_id, ?removed, "prepared statement closed");
-                }
-            }
+        } else if cmd == COM_STMT_CLOSE
+            && let Some(stmt_id) = parse_stmt_id(&payload)
+            && let Some(removed) = stmt_pool_map.remove(&stmt_id)
+        {
+            debug!(stmt_id, ?removed, "prepared statement closed");
         }
 
         // Record after the statement-id map is up to date, so a
@@ -2089,10 +2088,9 @@ async fn proxy_routing_loop(
         // which is a recordable execution.
         if let (Some(collector), Some(started), Some(outcome)) =
             (recorder, started, relayed.response)
+            && let Some(sql) = routing_recordable_sql(&payload, &stmt_pool_map)
         {
-            if let Some(sql) = routing_recordable_sql(&payload, &stmt_pool_map) {
-                collector.record(sql, started.elapsed(), outcome.ok, outcome.rows);
-            }
+            collector.record(sql, started.elapsed(), outcome.ok, outcome.rows);
         }
 
         // Return backend to pool.

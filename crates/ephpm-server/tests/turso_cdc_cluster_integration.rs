@@ -248,10 +248,10 @@ async fn wait_for_non_empty_replica_url(
     loop {
         {
             let role = rx.borrow().clone();
-            if let ElectedRole::Replica { primary_grpc_url } = &role {
-                if !primary_grpc_url.is_empty() {
-                    return Some(primary_grpc_url.clone());
-                }
+            if let ElectedRole::Replica { primary_grpc_url } = &role
+                && !primary_grpc_url.is_empty()
+            {
+                return Some(primary_grpc_url.clone());
             }
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

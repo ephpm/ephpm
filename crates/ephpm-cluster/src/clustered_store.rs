@@ -995,10 +995,10 @@ pub async fn start_gossip_applier(
 /// and subsequent v1 echoes for the same key are skipped, which is the
 /// desired behavior.
 fn should_apply(applied: &AppliedWriteMap, key: &str, write_ms: u64) -> bool {
-    if let Some(prev) = applied.get(key) {
-        if write_ms <= *prev {
-            return false;
-        }
+    if let Some(prev) = applied.get(key)
+        && write_ms <= *prev
+    {
+        return false;
     }
     applied.insert(key.to_string(), write_ms);
     true

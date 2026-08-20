@@ -203,10 +203,10 @@ impl ClusterHandle {
                 }
                 return;
             }
-            if let Some((value, write_ms)) = decode_value_with_write_ms(encoded) {
-                if best.as_ref().is_none_or(|(seen, _)| write_ms > *seen) {
-                    *best = Some((write_ms, Some(value)));
-                }
+            if let Some((value, write_ms)) = decode_value_with_write_ms(encoded)
+                && best.as_ref().is_none_or(|(seen, _)| write_ms > *seen)
+            {
+                *best = Some((write_ms, Some(value)));
             }
         };
 
@@ -214,10 +214,10 @@ impl ClusterHandle {
             consider(encoded, &mut best);
         }
         for node_id in guard.live_nodes().cloned().collect::<Vec<_>>() {
-            if let Some(state) = guard.node_state(&node_id) {
-                if let Some(encoded) = state.get(&chitchat_key) {
-                    consider(encoded, &mut best);
-                }
+            if let Some(state) = guard.node_state(&node_id)
+                && let Some(encoded) = state.get(&chitchat_key)
+            {
+                consider(encoded, &mut best);
             }
         }
         best.and_then(|(_, value)| value)
@@ -286,10 +286,10 @@ impl ClusterHandle {
             consider(encoded, &mut best);
         }
         for node_id in guard.live_nodes().cloned().collect::<Vec<_>>() {
-            if let Some(state) = guard.node_state(&node_id) {
-                if let Some(encoded) = state.get(&chitchat_key) {
-                    consider(encoded, &mut best);
-                }
+            if let Some(state) = guard.node_state(&node_id)
+                && let Some(encoded) = state.get(&chitchat_key)
+            {
+                consider(encoded, &mut best);
             }
         }
         best.and_then(|(_, ttl)| ttl)

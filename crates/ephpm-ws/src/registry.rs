@@ -452,10 +452,10 @@ impl Registry {
             // is the authority. A connection that vanished mid-broadcast, or
             // (impossibly, but checked anyway) one whose site no longer
             // matches, is skipped rather than trusted.
-            if let Some(entry) = self.scoped(site, &id) {
-                if self.enqueue(&entry, frame.clone()) {
-                    delivered += 1;
-                }
+            if let Some(entry) = self.scoped(site, &id)
+                && self.enqueue(&entry, frame.clone())
+            {
+                delivered += 1;
             }
         }
         delivered

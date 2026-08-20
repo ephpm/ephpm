@@ -157,23 +157,23 @@ impl SqliteElection {
 
     async fn initial_role_inner(&self) -> ElectedRole {
         // Check if there's already a primary claim in gossip.
-        if let Some(bytes) = self.cluster.gossip_get(PRIMARY_KEY).await {
-            if let Some(claim) = PrimaryClaim::decode(&bytes) {
-                if claim.node_id == self.cluster.self_node().id {
-                    // Our own (unexpired) claim survived a restart —
-                    // reclaiming is not a theft; refresh and carry on.
-                    self.publish_claim().await;
-                    tracing::info!("SQLite election: reclaiming our own surviving primary claim");
-                    return ElectedRole::Primary;
-                }
-                if let Some(url) = self.replica_url_for(&claim).await {
-                    return ElectedRole::Replica { primary_grpc_url: url };
-                }
-                // Claim points at a host that is not a known member.
-                // Refuse to dial it (defense in depth against a forged
-                // gossip claim) and wait for a valid one.
-                return ElectedRole::Replica { primary_grpc_url: String::new() };
+        if let Some(bytes) = self.cluster.gossip_get(PRIMARY_KEY).await
+            && let Some(claim) = PrimaryClaim::decode(&bytes)
+        {
+            if claim.node_id == self.cluster.self_node().id {
+                // Our own (unexpired) claim survived a restart —
+                // reclaiming is not a theft; refresh and carry on.
+                self.publish_claim().await;
+                tracing::info!("SQLite election: reclaiming our own surviving primary claim");
+                return ElectedRole::Primary;
             }
+            if let Some(url) = self.replica_url_for(&claim).await {
+                return ElectedRole::Replica { primary_grpc_url: url };
+            }
+            // Claim points at a host that is not a known member.
+            // Refuse to dial it (defense in depth against a forged
+            // gossip claim) and wait for a valid one.
+            return ElectedRole::Replica { primary_grpc_url: String::new() };
         }
 
         // No valid claim visible. That means either the cluster genuinely
@@ -220,60 +220,60 @@ impl SqliteElection {
         let self_node = self.cluster.self_node();
 
         // Check existing primary claim.
-        if let Some(bytes) = self.cluster.gossip_get(PRIMARY_KEY).await {
-            if let Some(claim) = PrimaryClaim::decode(&bytes) {
-                if claim.node_id == self_node.id {
-                    // We are the primary — refresh heartbeat.
-                    self.publish_claim().await;
-                    return ElectedRole::Primary;
-                }
+        if let Some(bytes) = self.cluster.gossip_get(PRIMARY_KEY).await
+            && let Some(claim) = PrimaryClaim::decode(&bytes)
+        {
+            if claim.node_id == self_node.id {
+                // We are the primary — refresh heartbeat.
+                self.publish_claim().await;
+                return ElectedRole::Primary;
+            }
 
-                // Someone else claims primary -- check if they're alive AND
-                // that the advertised gRPC address belongs to a known member
-                // (defense in depth: a forged claim from a plaintext gossip
-                // injection must not make us dial an arbitrary host).
-                let nodes = self.cluster.nodes().await;
-                let primary_alive =
-                    nodes.iter().any(|n| n.id == claim.node_id && n.state == NodeState::Alive);
+            // Someone else claims primary -- check if they're alive AND
+            // that the advertised gRPC address belongs to a known member
+            // (defense in depth: a forged claim from a plaintext gossip
+            // injection must not make us dial an arbitrary host).
+            let nodes = self.cluster.nodes().await;
+            let primary_alive =
+                nodes.iter().any(|n| n.id == claim.node_id && n.state == NodeState::Alive);
 
-                if primary_alive {
-                    // Conflict: we hold the primary role, yet a live peer
-                    // claims it too (gossip KV is last-write-wins, so its
-                    // newer write shadows ours). Do not yield
-                    // unconditionally — that is how a joining node stole
-                    // the role from a healthy incumbent. Break the tie by
-                    // the documented rule: lowest node id wins.
-                    if matches!(current, ElectedRole::Primary) {
-                        if incumbent_wins_tie(&self_node.id, &claim.node_id) {
-                            tracing::warn!(
-                                claimant = %claim.node_id,
-                                "SQLite election: live conflicting primary claim from a \
-                                 higher-ordinal node; keeping the primary role and \
-                                 re-asserting our claim (lowest node id wins)"
-                            );
-                            self.publish_claim().await;
-                            return ElectedRole::Primary;
-                        }
+            if primary_alive {
+                // Conflict: we hold the primary role, yet a live peer
+                // claims it too (gossip KV is last-write-wins, so its
+                // newer write shadows ours). Do not yield
+                // unconditionally — that is how a joining node stole
+                // the role from a healthy incumbent. Break the tie by
+                // the documented rule: lowest node id wins.
+                if matches!(current, ElectedRole::Primary) {
+                    if incumbent_wins_tie(&self_node.id, &claim.node_id) {
                         tracing::warn!(
                             claimant = %claim.node_id,
                             "SQLite election: live conflicting primary claim from a \
-                             lower-ordinal node; stepping down (lowest node id wins)"
+                             higher-ordinal node; keeping the primary role and \
+                             re-asserting our claim (lowest node id wins)"
                         );
+                        self.publish_claim().await;
+                        return ElectedRole::Primary;
                     }
-                    if let Some(url) = self.replica_url_for(&claim).await {
-                        return ElectedRole::Replica { primary_grpc_url: url };
-                    }
-                    // Alive primary but the gRPC host is not a known member --
-                    // refuse to dial it and wait for a valid claim.
-                    return ElectedRole::Replica { primary_grpc_url: String::new() };
+                    tracing::warn!(
+                        claimant = %claim.node_id,
+                        "SQLite election: live conflicting primary claim from a \
+                         lower-ordinal node; stepping down (lowest node id wins)"
+                    );
                 }
-
-                // Primary is dead — fall through to re-election.
-                tracing::warn!(
-                    dead_primary = %claim.node_id,
-                    "primary node is dead, triggering re-election"
-                );
+                if let Some(url) = self.replica_url_for(&claim).await {
+                    return ElectedRole::Replica { primary_grpc_url: url };
+                }
+                // Alive primary but the gRPC host is not a known member --
+                // refuse to dial it and wait for a valid claim.
+                return ElectedRole::Replica { primary_grpc_url: String::new() };
             }
+
+            // Primary is dead — fall through to re-election.
+            tracing::warn!(
+                dead_primary = %claim.node_id,
+                "primary node is dead, triggering re-election"
+            );
         }
 
         // No valid primary claim visible. If this node started recently,

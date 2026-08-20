@@ -42,10 +42,11 @@ pub struct Jwt {
 /// with nothing after it yields the empty string (= missing token).
 fn strip_bearer(value: &str) -> &str {
     let trimmed = value.trim();
-    if let (Some(scheme), Some(rest)) = (trimmed.get(..6), trimmed.get(6..)) {
-        if scheme.eq_ignore_ascii_case("bearer") && (rest.is_empty() || rest.starts_with(' ')) {
-            return rest.trim_start();
-        }
+    if let (Some(scheme), Some(rest)) = (trimmed.get(..6), trimmed.get(6..))
+        && scheme.eq_ignore_ascii_case("bearer")
+        && (rest.is_empty() || rest.starts_with(' '))
+    {
+        return rest.trim_start();
     }
     trimmed
 }
@@ -87,15 +88,15 @@ impl Jwt {
         if exp <= now {
             return None;
         }
-        if let Some(nbf) = claims.get("nbf") {
-            if numeric_date(nbf)? > now {
-                return None;
-            }
+        if let Some(nbf) = claims.get("nbf")
+            && numeric_date(nbf)? > now
+        {
+            return None;
         }
-        if let Some(expected) = &self.issuer {
-            if claims.get("iss").and_then(serde_json::Value::as_str) != Some(expected.as_str()) {
-                return None;
-            }
+        if let Some(expected) = &self.issuer
+            && claims.get("iss").and_then(serde_json::Value::as_str) != Some(expected.as_str())
+        {
+            return None;
         }
         if let Some(expected) = &self.audience {
             let ok = match claims.get("aud") {

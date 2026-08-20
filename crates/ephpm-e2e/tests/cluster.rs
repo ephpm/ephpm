@@ -196,16 +196,14 @@ async fn cluster_nodes_discover_each_other() {
                 l.contains("ephpm_cluster_nodes") && !l.starts_with('#')
             }) {
                 // Parse the gauge value (last token on the line).
-                if let Some(val_str) = line.split_whitespace().last() {
-                    if let Ok(count) = val_str.parse::<f64>() {
-                        if (count as usize) < expected {
-                            last_error = format!(
-                                "node {i}: ephpm_cluster_nodes = {count}, want >= {expected}"
-                            );
-                            all_converged = false;
-                            break;
-                        }
-                    }
+                if let Some(val_str) = line.split_whitespace().last()
+                    && let Ok(count) = val_str.parse::<f64>()
+                    && (count as usize) < expected
+                {
+                    last_error =
+                        format!("node {i}: ephpm_cluster_nodes = {count}, want >= {expected}");
+                    all_converged = false;
+                    break;
                 }
             }
         }

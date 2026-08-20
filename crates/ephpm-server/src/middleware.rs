@@ -201,10 +201,10 @@ impl MiddlewareChain {
         let mut response_headers: Vec<(String, String)> = Vec::new();
 
         for module in &self.modules {
-            if let Some(pattern) = &module.match_pattern {
-                if !path_matches(pattern, path) {
-                    continue;
-                }
+            if let Some(pattern) = &module.match_pattern
+                && !path_matches(pattern, path)
+            {
+                continue;
             }
 
             let verdict = match &module.backend {
@@ -389,10 +389,10 @@ fn resolve_library(library: &str) -> anyhow::Result<PathBuf> {
     ];
 
     let mut dirs = vec![PathBuf::from(".")];
-    if let Ok(dir) = std::env::var("EPHPM_MIDDLEWARE_DIR") {
-        if !dir.is_empty() {
-            dirs.push(PathBuf::from(dir));
-        }
+    if let Ok(dir) = std::env::var("EPHPM_MIDDLEWARE_DIR")
+        && !dir.is_empty()
+    {
+        dirs.push(PathBuf::from(dir));
     }
     dirs.push(PathBuf::from("/usr/local/lib/ephpm/middleware"));
 

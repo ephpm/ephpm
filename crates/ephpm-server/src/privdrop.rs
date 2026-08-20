@@ -196,16 +196,16 @@ fn chown_runtime_dirs(config: &Config, uid: u32, gid: u32) -> anyhow::Result<()>
     }
 
     // ACME certificate cache: rustls-acme writes renewed certs here at runtime.
-    if let Some(tls) = config.server.tls.as_ref() {
-        if tls.is_acme() {
-            let dir = &tls.cache_dir;
-            // start_acme already created it during bind; create_dir_all is a
-            // harmless idempotent guard.
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("failed to create ACME cache dir {}", dir.display()))?;
-            chown_tree(dir, uid, gid)
-                .with_context(|| format!("failed to chown ACME cache dir {}", dir.display()))?;
-        }
+    if let Some(tls) = config.server.tls.as_ref()
+        && tls.is_acme()
+    {
+        let dir = &tls.cache_dir;
+        // start_acme already created it during bind; create_dir_all is a
+        // harmless idempotent guard.
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("failed to create ACME cache dir {}", dir.display()))?;
+        chown_tree(dir, uid, gid)
+            .with_context(|| format!("failed to chown ACME cache dir {}", dir.display()))?;
     }
 
     Ok(())

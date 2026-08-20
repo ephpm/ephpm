@@ -2854,14 +2854,14 @@ impl Config {
         }
 
         // Enforce containment under document_root when the root itself exists.
-        if let Ok(canon_root) = doc_root.canonicalize() {
-            if !canon_script.starts_with(&canon_root) {
-                return Err(ConfigError::Validation(format!(
-                    "[php] worker_script {} resolves outside document_root {}",
-                    canon_script.display(),
-                    canon_root.display(),
-                )));
-            }
+        if let Ok(canon_root) = doc_root.canonicalize()
+            && !canon_script.starts_with(&canon_root)
+        {
+            return Err(ConfigError::Validation(format!(
+                "[php] worker_script {} resolves outside document_root {}",
+                canon_script.display(),
+                canon_root.display(),
+            )));
         }
 
         // On Windows, `canonicalize()` returns an extended-length *verbatim*
