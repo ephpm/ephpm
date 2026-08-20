@@ -1,0 +1,2 @@
+-r
+echo PHP_BINARY === '' ? "(empty)" : PHP_BINARY, "\n"; var_dump(is_string(PHP_BINARY));

@@ -1,0 +1,1 @@
+xfail = "cli_set_process_title()/cli_get_process_title() are missing from ephpm php despite PHP_SAPI === 'cli' — breaks artisan tinker (#316; fix in flight — when this XPASSes, remove the marker)"

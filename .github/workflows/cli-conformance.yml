@@ -1,0 +1,132 @@
+# Nightly CLI conformance — `ephpm php` vs upstream php-cli.
+#
+# Builds a PHP-linked ephpm for each supported minor, obtains an upstream
+# `php` CLI of the same minor, and runs `cargo xtask cli-conformance`: every
+# case in tests/cli-conformance/ executes against BOTH binaries with an
+# identical minimal environment, and stdout/stderr/exit-code are compared
+# byte-for-byte. Unexplained mismatches (or stale xfail markers) fail the leg.
+#
+# Matrix note: only PHP *minors* are pinned here. The exact patch the ephpm
+# side uses comes from xtask::PHP_SDK_VERSIONS via `cargo xtask release
+# <minor>` — this workflow deliberately does NOT duplicate those full-version
+# pins (that would create a pin site `cargo xtask bump-php-pin` doesn't
+# rewrite). The runner itself detects and reports any upstream-vs-SDK patch
+# skew at run time.
+#
+# Upstream php acquisition — best-effort exact-patch, documented preference
+# order (the brief for this harness):
+#   1. php.net publishes no official prebuilt Linux CLI binaries, so an
+#      exact-patch binary would mean compiling PHP from source every night
+#      (10+ minutes) — rejected while option 3 works.
+#   2. shivammathur/setup-php resolves only the latest patch of a minor on
+#      Linux (no exact-patch pinning) and wants passwordless sudo, which not
+#      every fleet runner has — no better than the PPA, more moving parts.
+#   3. CHOSEN: the ondrej/php PPA — latest patch of every supported minor on
+#      the Ubuntu bare runners, one apt call, cacheable. Patch skew against
+#      the SDK pin is expected occasionally and is surfaced LOUDLY by the
+#      runner (report header, stderr banner, and a ::warning:: annotation);
+#      a skewed patch never silently changes the pass/fail signal — diffs
+#      still fail, the warning tells the reader to rule out upstream patch
+#      changes before filing an ephpm bug.
+#
+# glibc note: `cargo xtask release` links on this same runner, and the binary
+# runs here too — so the shipped binary's glibc floor (set by the almalinux:8
+# CI image used in release.yml, currently 2.28) is irrelevant to this job; a
+# bare ubuntu-24.04 runner satisfies anything it can link.
+
+name: CLI Conformance
+
+on:
+  schedule:
+    # 05:30 UTC — offset from nightly.yml's 04:00 so the two full-matrix
+    # release builds don't pile onto the fleet at the same time.
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+# Serialize runs: each leg does a full release build, and the fleet dies
+# under pile-up (see e2e.yml's concurrency comment for the 2026-08-19
+# incident). Nightly + dispatch runs queue rather than stack; nothing is
+# cancelled so a manual dispatch can't destroy an in-flight nightly signal.
+concurrency:
+  group: ephpm-cli-conformance
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  conformance:
+    name: CLI conformance (PHP ${{ matrix.php }})
+    runs-on: [self-hosted, linux, x64]
+    # A leg is a full release build (10-20 min warm, longer cold) plus a few
+    # minutes of conformance runs. Tight enough that a wedged runner frees
+    # its fleet slot within the hour.
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.3", "8.4", "8.5"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build prerequisites
+        # See ci.yml/e2e.yml: some fleet runners are root without `sudo`.
+        run: |
+          set -eu
+          if ! command -v apt-get >/dev/null 2>&1; then
+            echo "::error::apt-get unavailable — this job needs the Ubuntu bare runners (ondrej PPA)"
+            exit 1
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            SUDO=""
+          elif command -v sudo >/dev/null 2>&1; then
+            SUDO="sudo"
+          else
+            echo "::error::not running as root and sudo is unavailable"
+            exit 1
+          fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends build-essential libclang-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install upstream php ${{ matrix.php }} (ondrej PPA)
+        # php<minor>-mbstring is installed because the corpus exercises mb_*
+        # functions (the embedded SDK compiles mbstring in; a distro php
+        # without the package would report "mbstring: MISSING" and fail the
+        # case honestly rather than skipping it silently).
+        run: |
+          set -eu
+          if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+          if ! command -v "php${{ matrix.php }}" >/dev/null 2>&1; then
+            $SUDO apt-get install -y --no-install-recommends software-properties-common ca-certificates gnupg
+            $SUDO add-apt-repository -y ppa:ondrej/php
+            $SUDO apt-get update
+            $SUDO apt-get install -y --no-install-recommends "php${{ matrix.php }}-cli" "php${{ matrix.php }}-mbstring"
+          fi
+          "php${{ matrix.php }}" -v
+
+      - name: Build ephpm (release, PHP ${{ matrix.php }})
+        # Resolves the exact patch from xtask::PHP_SDK_VERSIONS — the single
+        # source of truth — and downloads the matching SDK. Binary lands at
+        # target/x86_64-unknown-linux-gnu/release/ephpm, which the
+        # cli-conformance runner finds by default.
+        run: cargo xtask release ${{ matrix.php }}
+
+      - name: Run CLI conformance
+        # Non-zero exit on any unexplained mismatch or stale xfail marker.
+        # The runner refuses to start if --php and the ephpm binary differ in
+        # minor, and prints a loud warning on patch skew.
+        run: |
+          cargo xtask cli-conformance \
+            --php "$(command -v php${{ matrix.php }})" \
+            --report "cli-conformance-report-php${{ matrix.php }}.txt"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-conformance-report-php${{ matrix.php }}
+          path: cli-conformance-report-php${{ matrix.php }}.txt
+          if-no-files-found: ignore

@@ -1,0 +1,4 @@
+# The extension inventory of the embedded static SDK and a distro php are
+# legitimately different (different packagers, different defaults). There
+# is no normalization that keeps this comparison meaningful.
+skip = "extension inventory legitimately differs between the embedded SDK build and a distro php"

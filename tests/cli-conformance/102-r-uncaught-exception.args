@@ -1,0 +1,2 @@
+-r
+throw new Exception("boom");

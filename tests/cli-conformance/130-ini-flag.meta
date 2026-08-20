@@ -1,0 +1,3 @@
+# --ini prints ini search paths, which are environment/packaging facts
+# (ephpm has no compiled-in /etc/php path), not CLI behavior.
+skip = "ini file search paths are packaging-specific by definition"

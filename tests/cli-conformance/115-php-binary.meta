@@ -1,0 +1,5 @@
+# The two sides are different executables by definition, so the literal
+# PHP_BINARY value can never match: each side's own binary path is folded
+# to <BINARY>. What the case still proves: PHP_BINARY is a non-empty string
+# pointing at the invoked binary on BOTH sides.
+normalize = ["strip-binary-path"]

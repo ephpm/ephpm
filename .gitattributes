@@ -1,0 +1,5 @@
+# CLI conformance corpus fixtures are byte-exact: both PHP binaries read and
+# emit these bytes, so CRLF conversion on a Windows checkout would change the
+# comparison. Force LF; stdin fixtures are treated as binary.
+tests/cli-conformance/** text eol=lf
+tests/cli-conformance/*.stdin -text

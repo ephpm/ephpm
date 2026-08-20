@@ -1,0 +1,13 @@
+# The literal banner can never match: the embedded SDK and a distro php
+# differ in patch/build metadata by definition. Each normalizer below is
+# justified individually:
+#  - strip-versions: PHP x.y.z + Zend Engine vX.Y.Z + distro suffixes, and
+#    the `(built: ...)` timestamp, are build facts, not CLI behavior.
+#  - strip-zts-marker: the embedded Linux libphp is ZTS, distro cli is NTS —
+#    a permanent build-flavor difference (see CLAUDE.md, PHP threading).
+#  - strip-opcache-banner: distro php loads opcache as a zend_extension and
+#    advertises it in -v; robustness in case the runner's php does so even
+#    under -n.
+# What the case still proves: the 3-line banner SHAPE (PHP line, copyright
+# line, Zend Engine line) and exit 0 match.
+normalize = ["strip-versions", "strip-zts-marker", "strip-opcache-banner"]

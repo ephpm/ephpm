@@ -1,0 +1,2 @@
+-r
+var_dump(PHP_SAPI, php_sapi_name(), PHP_EOL, DIRECTORY_SEPARATOR, PATH_SEPARATOR, PHP_OS_FAMILY); var_dump(defined('STDIN'), defined('STDOUT'), defined('STDERR')); var_dump(PHP_VERSION === phpversion(), PHP_MAJOR_VERSION, PHP_INT_SIZE, PHP_FLOAT_DIG, PHP_DEBUG === 0);

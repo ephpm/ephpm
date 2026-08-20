@@ -1,0 +1,2 @@
+-r
+echo "o1\n"; fwrite(STDERR, "e1\n"); echo "o2\n"; fwrite(STDERR, "e2\n"); echo "o3";

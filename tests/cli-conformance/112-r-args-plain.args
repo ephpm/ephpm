@@ -1,0 +1,4 @@
+-r
+var_dump($argv, $argc);
+plain1
+plain2

@@ -1,0 +1,8 @@
+-d
+opcache.enable_cli=1
+-d
+opcache.jit=tracing
+-d
+opcache.jit_buffer_size=16M
+-r
+var_dump(function_exists('opcache_get_status')); if (function_exists('opcache_get_status')) { $s = opcache_get_status(false); if ($s === false) { echo "opcache_get_status: false\n"; } else { var_dump($s['opcache_enabled'], $s['jit']['enabled'] ?? null, $s['jit']['on'] ?? null); } }
