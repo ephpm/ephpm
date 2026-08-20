@@ -214,6 +214,10 @@ fn suite_is_serial(name: &str) -> bool {
     // saturating a one-thread pool and reading the process-global
     // `ephpm_php_shed_total` counter around the burst. A concurrent sibling
     // would both consume the slot it means to occupy and move the counter.
+    // `turso_cdc` is serial as a resource matter: each test spawns a
+    // multi-process cluster, and running two topologies at once would double
+    // the process count and the CPU noise its election-timing deadlines have
+    // to absorb.
     ISOLATED_DB_SUITES.contains(&name)
         || name == "worker_mode"
         || name == "fpm_pool"
@@ -221,6 +225,7 @@ fn suite_is_serial(name: &str) -> bool {
         || name == "rate_limit"
         || name == "websockets"
         || name == "load_shedding"
+        || name == "turso_cdc"
 }
 
 /// Whether a suite needs its own freshly-spawned, then-torn-down single node
@@ -244,6 +249,25 @@ fn suite_needs_fresh_node(name: &str) -> bool {
 /// as an opt-in switch (see `SingleNodeSpawn::env` for why exporting that one
 /// broadly breaks `bare_process_smoke`).
 const NO_NODE_SUITES: &[&str] = &["cli"];
+
+/// Suites that manage their own ephpm topology entirely — the harness starts
+/// **no** node for them and hands them only `EPHPM_BINARY` (plus
+/// `EXPECTED_PHP_VERSION`). Each such suite spawns, kills, and restarts its
+/// own processes on freshly-reserved loopback ports, so it cannot collide
+/// with the fixed-port fixtures spawned later in the run.
+///
+/// `turso_cdc` is here because its scenarios are process-lifecycle tests:
+/// electing a primary among nodes it can kill, and cold-bootstrapping a node
+/// it starts *after* data exists. Neither is expressible against the
+/// long-lived 3-node cluster fixture (killing one of its nodes would break
+/// the sibling `cluster` suite), and per the #288/#295 lesson its clustered
+/// `hrana_listen` config must live in the suite's own template, not the
+/// shared one.
+///
+/// NOTE: `EPHPM_BINARY` goes to exactly these suites and the `middleware`
+/// node — see the warning in [`SingleNodeSpawn::env`] about why it must not
+/// be exported globally (`bare_process_smoke` wakes up and fails).
+const SELF_MANAGED_SUITES: &[&str] = &["turso_cdc"];
 
 /// Test suites that must be excluded from bare-process runs entirely.
 ///
@@ -411,6 +435,31 @@ pub fn run(args: &[String]) -> ExitCode {
     } else {
         None
     };
+
+    // Self-managed suites next (after the server-less ones): the harness
+    // spawns nothing for them either, they
+    // just need the binary path. They use freshly-reserved ports, so ordering
+    // relative to the fixed-port fixtures is a non-issue — running them first
+    // simply keeps all "one at a time" phases together.
+    let (self_managed_suites, single_suites): (Vec<_>, Vec<_>) = single_suites
+        .into_iter()
+        .partition(|(name, _)| SELF_MANAGED_SUITES.contains(&name.as_str()));
+
+    if !self_managed_suites.is_empty() {
+        eprintln!(
+            "==> Running {} self-managed suite(s), each spawning its own ephpm topology...",
+            self_managed_suites.len()
+        );
+        let env = vec![
+            ("EPHPM_BINARY".to_string(), ephpm_bin.to_string_lossy().into_owned()),
+            ("EXPECTED_PHP_VERSION".to_string(), php_version.clone()),
+        ];
+        for (name, path) in &self_managed_suites {
+            if !run_suite(name, path, &env) {
+                failed.push((*name).clone());
+            }
+        }
+    }
 
     // Split the single-node suites into "isolated" (each needs its own fresh
     // node -- for DB state isolation or a bespoke config) and "shared" (all
