@@ -1,6 +1,7 @@
 //! `ephpm php` CLI conformance — fatal-error reporting, exit statuses,
-//! startup-time `-d` (OPcache/JIT activation, issue #331) and the cli-SAPI
-//! process-title functions (issue #316).
+//! startup-time `-d` (OPcache/JIT activation, issue #331), the cli-SAPI
+//! process-title functions (issue #316), and the end-of-request lifecycle
+//! (shutdown functions / destructors / exit-status-from-shutdown, issue #334).
 //!
 //! Regression cover for **issue #321**: on v0.7.0 a fatal error or an uncaught
 //! exception under `ephpm php -r` produced **no output at all and exit 0**,
@@ -417,6 +418,185 @@ fn process_title_round_trips_and_reaches_proc_cmdline() {
          --- stdout ---\n{}\n--- stderr ---\n{}",
         run.stdout, run.stderr
     );
+    assert_eq!(run.code, 0);
+}
+
+// ─── Issue #334: shutdown functions and end-of-script destructors ─────────
+//
+// The observable defect: `ephpm php` never ran php_request_shutdown() while
+// its stdout writer was installed — the request was left for
+// php_embed_shutdown() at process exit, after the exit code was captured and
+// the CLI output path was torn down. So register_shutdown_function()
+// callbacks and destructors of objects alive at script end ran invisibly
+// (output into a discarded buffer), and exit() inside a shutdown function
+// could not set the exit status. Every expectation below is verified
+// byte-identical against real php-cli (8.5.4 and 8.3).
+
+/// php-cli's end-of-request order, in one script: shutdown functions in
+/// registration order (including one registered *during* shutdown), THEN
+/// destructors of objects still alive at script end — with every byte
+/// reaching stdout. Asserted as one exact stdout string so an ordering
+/// regression (destructors before shutdown functions, missing nested
+/// registration, dropped output) cannot pass.
+#[test]
+fn shutdown_functions_then_destructors_run_in_php_cli_order() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(
+        &bin,
+        &[],
+        "<?php\n\
+         class D { public function __construct(private string $n) {}\n\
+                   public function __destruct() { echo \"destruct {$this->n}\\n\"; } }\n\
+         register_shutdown_function(function () { echo \"shutdown 1\\n\"; });\n\
+         register_shutdown_function(function () {\n\
+             echo \"shutdown 2\\n\";\n\
+             register_shutdown_function(function () { echo \"shutdown nested\\n\"; });\n\
+         });\n\
+         $global = new D('global');\n\
+         $a = new D('a');\n\
+         $b = new D('b');\n\
+         unset($a);\n\
+         echo \"end of script\\n\";\n",
+    );
+    assert_eq!(
+        run.stdout,
+        "destruct a\nend of script\nshutdown 1\nshutdown 2\nshutdown nested\n\
+         destruct b\ndestruct global\n",
+        "shutdown/destructor order diverges from php-cli (issue #334)\n\
+         --- stderr ---\n{}",
+        run.stderr
+    );
+    assert_eq!(run.code, 0, "unexpected exit {}", run.code);
+}
+
+/// `exit(7)` inside a shutdown function must both print (output during
+/// shutdown reaches stdout) and set the process exit status — the second
+/// observable half of #334.
+#[test]
+fn exit_in_shutdown_function_sets_exit_status() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(
+        &bin,
+        &[],
+        "<?php\n\
+         register_shutdown_function(function () { echo \"in shutdown\\n\"; exit(7); });\n\
+         echo \"main\\n\";\n",
+    );
+    assert_eq!(run.stdout, "main\nin shutdown\n", "stderr: {}", run.stderr);
+    assert_eq!(run.code, 7, "exit() in a shutdown function must set the exit status");
+}
+
+/// The status read after request shutdown wins over the script's own exit()
+/// — php-cli's do_cli returns EG(exit_status) *after* php_request_shutdown.
+/// Both directions verified against real php-cli: exit(1)→exit(7) exits 7,
+/// and exit(3)→exit(0) exits 0 (a shutdown function can clear the status).
+#[test]
+fn exit_in_shutdown_overrides_script_exit_status() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let seven = run_php(
+        &bin,
+        &[],
+        "<?php\n\
+         register_shutdown_function(function () { echo \"in shutdown\\n\"; exit(7); });\n\
+         echo \"main\\n\";\nexit(1);\n",
+    );
+    assert_eq!(seven.stdout, "main\nin shutdown\n", "stderr: {}", seven.stderr);
+    assert_eq!(seven.code, 7, "shutdown exit(7) must override the script's exit(1)");
+
+    let zero = run_php(
+        &bin,
+        &[],
+        "<?php\n\
+         register_shutdown_function(function () { echo \"s1\\n\"; exit(0); });\n\
+         echo \"main\\n\";\nexit(3);\n",
+    );
+    assert_eq!(zero.stdout, "main\ns1\n", "stderr: {}", zero.stderr);
+    assert_eq!(zero.code, 0, "shutdown exit(0) must clear the script's exit(3), like php-cli");
+}
+
+/// After an uncaught exception php-cli still runs shutdown functions and
+/// destructors (WordPress' fatal handler and most loggers rely on this),
+/// and the exit status stays 255.
+#[test]
+fn shutdown_and_destructors_run_after_uncaught_exception() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(
+        &bin,
+        &[],
+        "<?php\n\
+         register_shutdown_function(function () { echo \"shutdown after exception\\n\"; });\n\
+         class D { public function __destruct() { echo \"destruct\\n\"; } }\n\
+         $d = new D();\n\
+         throw new RuntimeException('boom');\n",
+    );
+    assert_fatal(&run, "Uncaught RuntimeException: boom", "uncaught exception before shutdown");
+    assert!(
+        run.stdout.contains("shutdown after exception"),
+        "shutdown function did not run after the uncaught exception:\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        run.stdout,
+        run.stderr
+    );
+    assert!(
+        run.stdout.contains("destruct"),
+        "destructor did not run after the uncaught exception:\n--- stdout ---\n{}",
+        run.stdout
+    );
+}
+
+/// A fatal *inside* a shutdown function: the diagnostic is reported, the
+/// remaining shutdown functions are skipped, destructors still run, and the
+/// exit status is 255 — verified identical on real php-cli 8.5 and 8.3.
+#[test]
+fn fatal_inside_shutdown_function_matches_php_cli() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(
+        &bin,
+        &[],
+        "<?php\n\
+         register_shutdown_function(function () { echo \"sf1\\n\"; nosuchfunc(); });\n\
+         register_shutdown_function(function () { echo \"sf2\\n\"; });\n\
+         class D { public function __destruct() { echo \"destruct\\n\"; } }\n\
+         $d = new D();\n\
+         echo \"main\\n\";\n",
+    );
+    assert_fatal(&run, "Call to undefined function nosuchfunc()", "fatal in shutdown function");
+    assert!(run.stdout.contains("sf1"), "first shutdown function did not run:\n{}", run.stdout);
+    assert!(
+        !run.output().contains("sf2"),
+        "php-cli skips the remaining shutdown functions after a fatal in one:\n{}",
+        run.output()
+    );
+    assert!(
+        run.stdout.contains("destruct"),
+        "destructors must still run after a fatal in a shutdown function:\n{}",
+        run.stdout
+    );
+}
+
+/// `-r` code goes through a different execute path (zend_eval_string_ex, not
+/// php_execute_script); its shutdown functions must fire too.
+#[test]
+fn shutdown_functions_run_for_r_code() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(
+        &bin,
+        &["-r", "register_shutdown_function(function () { echo 'SD'; }); echo 'M';"],
+        "",
+    );
+    assert_eq!(run.stdout, "MSD", "-r shutdown function output (stderr: {})", run.stderr);
     assert_eq!(run.code, 0);
 }
 
