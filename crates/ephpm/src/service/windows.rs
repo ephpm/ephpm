@@ -399,10 +399,10 @@ fn service_main_inner(
     let mut config_path: PathBuf = paths.config.clone();
     let mut iter = arguments.iter().skip(1);
     while let Some(arg) = iter.next() {
-        if arg == OsStr::new("--config") {
-            if let Some(v) = iter.next() {
-                config_path = PathBuf::from(v);
-            }
+        if arg == OsStr::new("--config")
+            && let Some(v) = iter.next()
+        {
+            config_path = PathBuf::from(v);
         }
     }
 

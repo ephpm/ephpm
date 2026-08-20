@@ -130,6 +130,17 @@ These appear when a cluster-wide OPcache invalidation actually fires. When
 |--------|------|--------|-------------|
 | `ephpm_opcache_invalidations_total` | counter | `vhost`, `trigger` | Cluster-wide OPcache invalidations run for a vhost. `trigger` is always `kv` today — both `ephpm deploy` and `ephpm cache reset` arrive via the KV version key. The planned file watcher (roadmap Phase 3) will add a second value. |
 
+## OPcache JIT
+
+The JIT buffer gauges are **sampled on the PHP request path** (the fpm dispatch closure and the worker-mode `take_request` loop), at most once per 10 s process-wide — `opcache_get_status()` needs a TSRM-registered PHP thread, so there is no background sampler. Consequences: the series **appear only after the first PHP request** in fpm mode (in worker mode, as soon as a worker boots and parks) on a PHP-linked build with OPcache active (stub builds and `opcache.enable=0` never record them), and with zero traffic they hold their last value (with zero traffic the JIT state cannot change). They are recorded whether the JIT is on or off, so "JIT off" reads as an honest `buffer_size = 0` rather than a missing series.
+
+**Multi-tenant caveat:** the multi-tenant hardening preset (default with `sites_dir`) removes `opcache_get_status` from the function table unless [`[opcache] cluster_invalidation`](/reference/config/#opcache) keeps the OPcache API open — with the API removed, the sampler has nothing to call and these gauges never record. If you force the JIT on in multi-tenant mode (the case where `buffer_free` matters most), enable cluster invalidation to keep the gauge alive, or accept flying blind — the startup WARN spells this out.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `ephpm_opcache_jit_buffer_size_bytes` | gauge | — | `opcache.jit_buffer_size` in bytes; `0` when no JIT buffer is configured. |
+| `ephpm_opcache_jit_buffer_free_bytes` | gauge | — | Free bytes remaining in the JIT code buffer. Trending to 0 means the JIT is about to **silently** stop compiling new code — its only failure mode has no error or log. Watch this especially with the JIT forced on in multi-tenant mode: per-vhost `opcache_invalidate` never returns buffer to the free pool, so every deploy consumes some for good (see the [config reference](/reference/config/#opcache-jit)). |
+
 ## Database (proxy upstream health)
 
 These appear when `[db.mysql]` or `[db.postgres]` is configured. Labels: `db`

@@ -80,9 +80,13 @@ Enabling `opcache.jit=tracing` on `cpu.php` produced **−17% RPS** (p50
 *bytecode*, so it can't touch the hot code and its tracing/compilation
 overhead is pure cost. Conclusions:
 
-- **Never auto-enable JIT.** ePHPm's resource-aware autotuning sizes the
-  JIT buffer but leaves JIT *off* by default — this result is the
-  justification. Auto-on would regress builtin-heavy apps.
+- **JIT is workload-shaped, not universally good.** This result kept the
+  JIT off by default through v0.7.2. *Update (v0.7.3):* the default is now
+  **shaped** — `opcache.jit=tracing` in single-site serve (a pure-PHP CPU
+  loop measured 5.56 ms → 2.33 ms on Windows), still off in multi-tenant,
+  worker, and dev modes — with `[php] opcache_jit = "disable"` as the
+  one-knob escape hatch for exactly the builtin-heavy case measured here.
+  See [OPcache JIT](/reference/config/#opcache-jit).
 - JIT is a per-application decision that helps *pure-PHP compute*
   (arithmetic, arrays, tight interpreter loops). Bench your app.
 - **JIT is not the lever for the cpu-vs-Swoole gap** — see below.

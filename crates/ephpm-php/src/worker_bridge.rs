@@ -611,6 +611,13 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
     // Idempotent and a cheap flag check when there is nothing to do.
     crate::db_bridge::on_request_end();
 
+    // JIT buffer gauges: this thread sits inside its long-lived worker
+    // request, which is exactly the context `opcache_get_status` needs, and
+    // worker requests never pass through the router's fpm dispatch closure —
+    // so worker mode samples here. Rate-limited process-wide; one relaxed
+    // atomic load when it is not due.
+    crate::jit_metrics::maybe_sample();
+
     // The worker is idle exactly while it is parked in this recv.
     metrics::gauge!("ephpm_worker_idle").increment(1.0);
     let recv = rx.recv_blocking();

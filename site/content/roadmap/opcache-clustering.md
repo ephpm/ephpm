@@ -450,10 +450,14 @@ changes mid-run).
   CLI already records `--rev` separately at
   `opcache:revision:<vhost>` for display; the version key stays
   numeric. Confirmed sound; documenting for clarity.
-- **Interaction with JIT.** OPcache JIT (PHP 8+) compiles hot paths
-  to machine code on first hit. After invalidation, the JIT cache is
-  also dropped (same OPcache process). No special handling needed,
-  but worth a confirmation pass once Phase 1 lands.
+- **Interaction with JIT.** ~~After invalidation, the JIT cache is
+  also dropped (same OPcache process). No special handling needed.~~
+  The confirmation pass **falsified** this: `opcache_invalidate` does
+  NOT reclaim JIT buffer (`buffer_free` is untouched by invalidation;
+  only a full `opcache_reset` reclaims). This is why the shaped
+  `opcache.jit` default is `disable` in multi-tenant mode — see
+  [OPcache JIT](/reference/config/#opcache-jit) and the
+  `ephpm_opcache_jit_buffer_free_bytes` gauge.
 - **Cluster bootstrap.** A node joining a cluster mid-day inherits
   the current `opcache:version:<vhost>` values via gossip. First
   request after join will trigger an invalidation (last-seen-version

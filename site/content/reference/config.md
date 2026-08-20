@@ -229,7 +229,8 @@ alt_svc_max_age = 86400
 | `opcache_revalidate_freq` | u32 (sec) | (none → PHP default `2`) | Override `opcache.revalidate_freq`. Only meaningful when timestamp validation is on: how often (at most) the engine re-`stat()`s a cached script. Raising it (e.g. `60`) cuts `stat()` traffic on overlay/network filesystems at the cost of slower edit pickup. Ignored when validation is off. |
 | `opcache_memory_consumption` | u32 (MB) | (auto-derived) | Override `opcache.memory_consumption`. Unset → auto-derived in serve mode (~18% of the detected memory budget, clamped `[64, 512]` MB); dev keeps PHP's 128 MB. See [Resource-aware autotuning](#resource-aware-autotuning). |
 | `opcache_interned_strings_buffer` | u32 (MB) | (auto-derived) | Override `opcache.interned_strings_buffer`. Unset → auto-derived (~1 MB per 16 MB of opcache SHM, clamped `[8, 64]` MB) in serve mode; PHP default in dev. |
-| `opcache_jit_buffer_size` | u32 (MB) | (auto-derived) | Override `opcache.jit_buffer_size`. Unset → auto-sized (~1/64 of memory, clamped `[32, 64]` MB) in serve mode. **Sizes the buffer only — JIT is NOT auto-enabled** (`opcache.jit` stays at PHP's default; opt in via `ini_overrides`). JIT helps CPU-bound work but can regress I/O-bound web apps, so auto-enable is a separate benched decision. |
+| `opcache_jit_buffer_size` | u32 (MB) | (auto-derived) | Override `opcache.jit_buffer_size`. Unset → auto-sized (~1/64 of memory, clamped `[32, 64]` MB) in serve mode. Whether the JIT *uses* the buffer is governed by `opcache_jit` (below). When the JIT is on and no size was derived (dev mode), the same derivation is forced so an enabled JIT is never silently bufferless. An explicit `0` is respected — and warned about — because it makes the JIT inert. |
+| `opcache_jit` | string | (shaped — see [OPcache JIT](#opcache-jit)) | `opcache.jit` mode: `"tracing"`, `"function"`, or `"disable"` (anything else is a startup error; raw CRTO digits are deliberately not accepted — use `ini_overrides` if you truly need them). Set explicitly, it wins in **every** mode. **Unset, the default is shaped:** `tracing` in single-site `ephpm serve`; `disable` in multi-tenant serve (`sites_dir` set — per-vhost invalidation never reclaims JIT buffer), in worker mode (not positively verified against the persistent-worker lifecycle), and in dev. Startup always logs the effective state and why. Env: `EPHPM_PHP__OPCACHE_JIT=disable`. |
 | `opcache_max_accelerated_files` | u32 | `20000` (serve) | Override `opcache.max_accelerated_files`. A generous **fixed** default in serve mode (PHP default in dev). Deliberately *not* derived from memory — the right value is shaped by how many `.php` files the app has, not the machine size. |
 | `php_memory_limit` | string | (auto-derived) | Override the per-request `memory_limit`, taking precedence over `memory_limit` **and** the derivation. Unset → serve mode derives `(memory_budget − opcache_shm − ~64 MB overhead) / worker_count`, floored at `128 MB`; with no detectable memory budget it keeps PHP's `128M`. Dev keeps `memory_limit`. |
 | `realpath_cache_size` | string | `16M` (serve) | Override `realpath_cache_size`. Serve uses `16M` (vs PHP's `256K`) to cut `realpath()`/`stat()` traffic on deep autoload trees; dev keeps the PHP default so new files resolve instantly. |
@@ -278,7 +279,7 @@ The source label in the startup line says which probe won — `cgroup v2`, `cgro
 |-----------|---------|-------|
 | `opcache.memory_consumption` | ~18% of memory budget | `[64, 512]` MB |
 | `opcache.interned_strings_buffer` | ~1 MB per 16 MB of opcache SHM | `[8, 64]` MB |
-| `opcache.jit_buffer_size` | ~1/64 of memory budget (**JIT stays off**) | `[32, 64]` MB |
+| `opcache.jit_buffer_size` | ~1/64 of memory budget (used when the JIT is on — see [OPcache JIT](#opcache-jit)) | `[32, 64]` MB |
 | `opcache.max_accelerated_files` | fixed `20000` (app-shaped, not memory-shaped) | — |
 | `memory_limit` (per request) | `(budget − opcache_shm − ~64 MB overhead) / worker_count` | floor `128` MB |
 | `realpath_cache_size` | `16M` | — |
@@ -292,14 +293,33 @@ Dev mode (`ephpm dev` / bare `ephpm`) derives none of these: it keeps PHP-friend
 **Transparency:** serve startup logs one INFO line summarizing what was detected and derived, marking any explicitly-pinned value with a `*`. Example for a 320 MiB / 0.25-CPU pod:
 
 ```
-autotune (serve): cpu_quota=0.25 mem=320MiB (cgroup v2) -> workers=1[cgroup_quota] opcache.memory_consumption=64MB memory_limit=192M interned=8MB jit_buffer=32MB (buffer-only, jit off) max_files=20000 realpath=16M/ttl=600 validate_timestamps=0 assertions=-1
+autotune (serve): cpu_quota=0.25 mem=320MiB (cgroup v2) -> workers=1[cgroup_quota] opcache.memory_consumption=64MB memory_limit=192M interned=8MB jit_buffer=32MB (jit=tracing) max_files=20000 realpath=16M/ttl=600 validate_timestamps=0 assertions=-1
 ```
 
 and for a 4 GiB / 4-CPU node:
 
 ```
-autotune (serve): cpu_quota=4.00 mem=4096MiB (cgroup v2) -> workers=4[cgroup_quota] opcache.memory_consumption=512MB memory_limit=880M interned=32MB jit_buffer=64MB (buffer-only, jit off) max_files=20000 realpath=16M/ttl=600 validate_timestamps=0 assertions=-1
+autotune (serve): cpu_quota=4.00 mem=4096MiB (cgroup v2) -> workers=4[cgroup_quota] opcache.memory_consumption=512MB memory_limit=880M interned=32MB jit_buffer=64MB (jit=tracing) max_files=20000 realpath=16M/ttl=600 validate_timestamps=0 assertions=-1
 ```
+
+(The `jit=` segment shows the resolved `opcache.jit` mode — `tracing` here because these are single-site serve runs; multi-tenant shows `jit=disable`, and an explicitly pinned mode carries the `*` marker like every other tunable. Dev mode with the knob unset shows `jit=off (php default)` — no line is emitted at all.)
+
+### OPcache JIT
+
+`ephpm serve` enables the **tracing JIT by default in single-site mode** and disables it everywhere else; `[php] opcache_jit` overrides the default in any mode. A dedicated startup INFO line always states the effective JIT state and the reason (and risky explicit combinations WARN) — the state is never silent.
+
+| Mode | `opcache_jit` unset | Why |
+|------|--------------------|-----|
+| Single-site serve (no `sites_dir`, `mode = "fpm"`) | **`tracing`** | Measured ~2.4x on CPU-bound PHP (Windows CPU loop 5.56 ms → 2.33 ms); verified working in the ZTS embed serve mode. The single-process embed sidesteps the classic multi-process SHM JIT failure modes. |
+| Multi-tenant serve (`sites_dir` set) | **`disable`** | Per-vhost deploys invalidate OPcache with `opcache_invalidate`, and invalidation **never reclaims JIT buffer** (measured: `buffer_free` is untouched). Each deploy would permanently consume buffer until the JIT silently stops compiling — no error, no log. Only a full `opcache_reset` reclaims it, and the multi-tenant hardening preset disables `opcache_reset`; a restart is the practical reset. |
+| Worker mode (`mode = "worker"`) | **`disable`** | Long-lived workers are *theoretically* ideal for the JIT (compile once, stay hot — see the worker-mode design doc), but the combination has not been positively verified against the persistent-worker request lifecycle, so it stays off until it is. Opt in explicitly if your workload benefits. |
+| Dev (`ephpm dev` / bare `ephpm`) | off (nothing emitted) | Dev keeps the generated ini minimal; PHP's own defaults keep the JIT off. |
+
+Caveats, honestly stated:
+
+- **JIT helps CPU-bound *PHP* code, not builtins or I/O.** A workload dominated by C builtins (e.g. `hash()`) measured **−17% RPS** with the JIT on — tracing overhead with nothing compilable to win back (see [benchmarking findings](/benchmarking/findings/)). Real filesystem-bound apps measure roughly flat. The `disable` knob is the benched answer for such workloads.
+- **A JIT miscompile has no crash containment.** The JIT emits native code; a miscompiled trace that faults is a process-level `SIGSEGV`/access violation, and (unlike the contained PHP stack-overflow case on Linux) there is **no** containment for it — on Windows none at all. This is exactly why the escape hatch is a single trivially set knob: `opcache_jit = "disable"` (or `EPHPM_PHP__OPCACHE_JIT=disable`) and nothing else changes.
+- **Forcing the JIT on in multi-tenant mode** (`opcache_jit = "tracing"` with `sites_dir`) works and is the operator's call, but inherits the buffer-leak-on-deploy cost above; startup WARNs, and the `ephpm_opcache_jit_buffer_free_bytes` gauge ([metrics reference](/reference/metrics/#opcache-jit)) is the thing to watch — when it flatlines near 0, newly deployed code runs interpreted. Note the gauge samples `opcache_get_status`, which the multi-tenant hardening preset removes unless `[opcache] cluster_invalidation` keeps the OPcache API open — enable it if you want the gauge in this configuration.
 
 ## `[db]`
 

@@ -1095,7 +1095,10 @@ fn run_with_config(
     // Resolve the full resource-aware autotuning profile once: it feeds both
     // the generated php.ini (opcache/memory/realpath/assertions lines) and the
     // startup autotune summary log below.
-    let autotune = config.php.autotune(dev_mode);
+    // The JIT default is shaped by tenancy: tracing in single-site serve,
+    // disable when `sites_dir` is set (per-vhost invalidation never reclaims
+    // JIT buffer) — so autotune needs to know whether this is a vhost run.
+    let autotune = config.php.autotune(dev_mode, config.server.sites_dir.is_some());
     let opcache_ini_lines = autotune.ini_lines();
     let validate_timestamps = autotune.validate_timestamps.value;
     // [php] extensions also forces ini generation: `extension=` lines only
@@ -1251,6 +1254,16 @@ fn run_with_config(
     // requires visibility — an operator must be able to see exactly what
     // ePHPm sized itself to and which values they overrode (marked `*`).
     tracing::info!("{}", autotune.summary_line());
+
+    // State the JIT contract at startup: the default is shaped (tracing in
+    // single-site serve, off in multi-tenant/worker/dev), so the effective
+    // state and its reason must never be silent. A config that works but
+    // carries a documented hazard (JIT forced on in multi-tenant mode; JIT on
+    // with a zero buffer) additionally warns.
+    tracing::info!("{}", autotune.jit_line());
+    if let Some(warning) = autotune.jit_warning() {
+        tracing::warn!("{warning}");
+    }
 
     // State the OPcache staleness contract at startup so operators know how
     // code changes reach a running server. Under serve mode with validation

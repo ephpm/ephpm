@@ -67,9 +67,13 @@ profile:
   / worker_count`, floored at `128 MB`, so N concurrent requests can't
   collectively exceed the pod's cgroup limit and get OOM-killed.
 - **Interned-strings** and **JIT buffers** scale with the SHM / budget
-  (clamped). The JIT *buffer* is sized but **JIT is left off** — it helps
-  CPU-bound work and can regress the I/O-bound request path typical of web
-  apps, so enabling it stays a deliberate, benched opt-in via `ini_overrides`.
+  (clamped). Whether the JIT uses the buffer is shaped by tenancy
+  (`[php] opcache_jit`): **`tracing` by default in single-site serve**, but
+  **`disable` by default in the multi-vhost deployments this guide covers** —
+  per-vhost `opcache_invalidate` never reclaims JIT buffer, so deploy churn
+  would silently exhaust it. Forcing it on is an explicit, warned-about
+  opt-in; watch `ephpm_opcache_jit_buffer_free_bytes` if you do. See
+  [OPcache JIT](/reference/config/#opcache-jit).
 - **`realpath_cache_size=16M` / `ttl=600`** and **`zend.assertions=-1`**
   (compiled out) are the standard production values; dev keeps PHP-friendly
   defaults.
@@ -81,7 +85,7 @@ default**, so you can pin exactly the one knob you care about
 showing what was detected and derived (pinned values marked `*`):
 
 ```
-autotune (serve): cpu_quota=0.25 mem=320MiB (cgroup v2) -> workers=1[cgroup_quota] opcache.memory_consumption=64MB memory_limit=192M interned=8MB jit_buffer=32MB (buffer-only, jit off) max_files=20000 realpath=16M/ttl=600 validate_timestamps=0 assertions=-1
+autotune (serve): cpu_quota=0.25 mem=320MiB (cgroup v2) -> workers=1[cgroup_quota] opcache.memory_consumption=64MB memory_limit=192M interned=8MB jit_buffer=32MB (jit=disable) max_files=20000 realpath=16M/ttl=600 validate_timestamps=0 assertions=-1
 ```
 
 See the [config reference](/reference/config/#resource-aware-autotuning) for

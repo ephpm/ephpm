@@ -1497,6 +1497,102 @@ done:
     return count;
 }
 
+/*
+ * Read the OPcache JIT buffer stats: opcache_get_status(false)['jit']
+ * ['buffer_size' / 'buffer_free'], in bytes.
+ *
+ * Returns 0 on success (outputs written), or the EPHPM_OPCACHE_* failure
+ * codes above (-1 unavailable / unrecognised shape, -2 bailout, -3 userland
+ * exception — stashed for ephpm_opcache_last_exception()). When the JIT is
+ * disabled the call still succeeds and reports buffer_size = 0.
+ *
+ * Same calling contract as ephpm_opcache_invalidate_under: TSRM-registered
+ * thread, inside the thread's active request context (the router calls it on
+ * the PHP dispatch thread, and worker mode from the worker's own long-lived
+ * request). opcache_get_status(false) excludes the per-script table, so a
+ * call is cheap — callers additionally rate-limit (ephpm-php jit_metrics).
+ */
+long ephpm_opcache_jit_stats(unsigned long long *buffer_size,
+                             unsigned long long *buffer_free)
+{
+    opcache_exc_buf[0] = '\0';
+    if (!buffer_size || !buffer_free) {
+        return EPHPM_OPCACHE_UNAVAILABLE;
+    }
+
+    zend_function *fn_status = zend_hash_str_find_ptr(
+        EG(function_table), "opcache_get_status", sizeof("opcache_get_status") - 1);
+    if (!fn_status) {
+        return EPHPM_OPCACHE_UNAVAILABLE;
+    }
+
+    long rc = EPHPM_OPCACHE_UNAVAILABLE;
+
+    /* SETJMP guard: a bailout inside opcache_get_status must not unwind
+     * through Rust (same shape as the invalidator above). */
+    JMP_BUF *__orig_bailout = EG(bailout);
+    JMP_BUF __bailout;
+    EG(bailout) = &__bailout;
+
+    zval status_ret;
+    ZVAL_UNDEF(&status_ret);
+
+    if (SETJMP(__bailout) == 0) {
+        /* status_ret = opcache_get_status(false); — no per-script table. */
+        zval status_args[1];
+        ZVAL_FALSE(&status_args[0]);
+        zend_call_known_function(
+            fn_status, NULL, NULL, &status_ret, 1, status_args, NULL);
+
+        if (EG(exception)) {
+            ephpm_opcache_capture_exception();
+            rc = EPHPM_OPCACHE_EXCEPTION;
+            goto done;
+        }
+
+        if (Z_TYPE(status_ret) != IS_ARRAY) {
+            /* opcache.enable=0 returns false. */
+            rc = EPHPM_OPCACHE_UNAVAILABLE;
+            goto done;
+        }
+
+        zval *jit_zv = zend_hash_str_find(
+            Z_ARRVAL(status_ret), "jit", sizeof("jit") - 1);
+        if (!jit_zv || Z_TYPE_P(jit_zv) != IS_ARRAY) {
+            rc = EPHPM_OPCACHE_UNAVAILABLE;
+            goto done;
+        }
+
+        zval *size_zv = zend_hash_str_find(
+            Z_ARRVAL_P(jit_zv), "buffer_size", sizeof("buffer_size") - 1);
+        zval *free_zv = zend_hash_str_find(
+            Z_ARRVAL_P(jit_zv), "buffer_free", sizeof("buffer_free") - 1);
+        if (!size_zv || Z_TYPE_P(size_zv) != IS_LONG
+            || !free_zv || Z_TYPE_P(free_zv) != IS_LONG) {
+            rc = EPHPM_OPCACHE_UNAVAILABLE;
+            goto done;
+        }
+
+        /* zend_long is signed; the engine never reports negative sizes, but
+         * clamp defensively rather than wrap on cast. */
+        *buffer_size = Z_LVAL_P(size_zv) < 0
+            ? 0ULL : (unsigned long long)Z_LVAL_P(size_zv);
+        *buffer_free = Z_LVAL_P(free_zv) < 0
+            ? 0ULL : (unsigned long long)Z_LVAL_P(free_zv);
+        rc = 0;
+    } else {
+        rc = EPHPM_OPCACHE_BAILOUT;
+    }
+
+done:
+    EG(bailout) = __orig_bailout;
+    if (EG(exception) && !zend_is_unwind_exit(EG(exception))) {
+        ephpm_opcache_capture_exception();
+    }
+    zval_ptr_dtor(&status_ret);
+    return rc;
+}
+
 /* ===================================================================
  * Worker mode — persistent-worker engine (design: worker-mode-design.md)
  *
