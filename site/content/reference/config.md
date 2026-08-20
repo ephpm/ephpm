@@ -263,7 +263,14 @@ On boot, `ephpm serve` detects the container's CPU and memory limits (cgroup-awa
 1. **CPU quota** — cgroup v2 `cpu.max`, else v1 `cpu.cfs_quota_us`/`cpu.cfs_period_us`. `None` when unlimited. (Already drives `worker_count`.)
 2. **Memory budget** — cgroup v2 `/sys/fs/cgroup/memory.max`, else v1 `memory.limit_in_bytes`; `"max"`/the unlimited sentinel means no limit, in which case ePHPm falls back to total system memory (`/proc/meminfo` `MemTotal`). No new crate — it reads the same cgroupfs/`/proc` files as the CPU path.
 
-Non-Linux platforms have no cgroup limit and keep PHP defaults for memory-shaped knobs.
+**Detection (Windows):**
+
+1. **CPU quota** — no cgroup equivalent is read; `worker_count` derives from host parallelism.
+2. **Memory budget** — the calling process's **job-object** memory limit (`QueryInformationJobObject` with `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`; the smaller of `JOB_OBJECT_LIMIT_PROCESS_MEMORY` / `JOB_OBJECT_LIMIT_JOB_MEMORY` when set), else **total physical RAM** (`GlobalMemoryStatusEx` → `ullTotalPhys`). A job limit is only used when it is strictly below physical RAM — one that isn't restricts nothing, so the physical figure is reported instead.
+
+macOS has no memory probe: it reports `mem=unknown (unknown)` and keeps PHP defaults for memory-shaped knobs.
+
+The source label in the startup line says which probe won — `cgroup v2`, `cgroup v1`, `job-object`, `system-total`, or `unknown`. A budget is never guessed: if every probe fails the label is `unknown` and the derivation falls back to the floors in the table below.
 
 **Derivation (serve mode):**
 
