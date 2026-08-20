@@ -3561,6 +3561,9 @@ __attribute__((constructor)) static void ephpm_ps_capture_argv(
 
     /* Extend the clobber area over contiguous environ strings, then move
      * the environment out of it. */
+    if (!environ) {
+        return;
+    }
     int n = 0;
     while (environ[n] != NULL) {
         n++;
