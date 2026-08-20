@@ -52,6 +52,27 @@ on:
         required: false
         type: string
 
+# One release run at a time, and never cancel one.
+#
+# A release is 16 legs across four platforms, several of them fat-LTO builds
+# with PHP statically linked. Two concurrent runs saturate the ephemerd fleet,
+# and a saturated fleet kills runners outright (see the E2E concurrency group
+# in e2e.yml and the `runner-death-not-test-failure` triage note).
+#
+# `cancel-in-progress: false` is deliberate and NOT the usual choice: a release
+# that is half-way through pushing Docker tags or uploading archives must not be
+# interrupted, so a superseding run queues behind it rather than killing it.
+#
+# The group is keyed on the workflow only, not the ref, so a re-cut tag also
+# queues. That is the case that bit us on v0.7.0: the tag was deleted and
+# re-pushed twice while superseded runs sat in `queued`, and the new run could
+# not dispatch until they were cleared with the force-cancel API
+# (`gh run cancel` alone does not clear a run whose jobs are queued waiting for
+# a self-hosted runner).
+concurrency:
+  group: ephpm-release
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
