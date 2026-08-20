@@ -22,7 +22,7 @@ The `v*` push triggers `.github/workflows/release.yml`. `EPHPM_RELEASE_VERSION` 
 
 ## 3. What the matrix produces
 
-- Binaries: `ephpm-vX.Y.Z+php<FULL>-<os>-<arch>.tar.gz` for linux-x86_64, linux-aarch64, macos-aarch64, windows-x86_64 x PHP pins (see `matrix.php` in release.yml; keep in sync with `xtask::PHP_SDK_VERSIONS`). Plus `SHA256SUMS`.
+- Binaries: `ephpm-vX.Y.Z+php<FULL>-<os>-<arch>.tar.gz` for linux-x86_64, linux-aarch64, macos-aarch64, windows-x86_64 x PHP pins (see `matrix.php` in release.yml; keep in sync with `xtask::PHP_SDK_VERSIONS`). Plus `SHA256SUMS`. Optionally `ephpm-vX.Y.Z+php8.5.7-windows-x86_64-tailcall.tar.gz` from the experimental non-gating `build-windows-tailcall` leg — its absence never blocks or fails a release, and when its leg finishes after Create Release it self-attaches (and updates SHA256SUMS) best-effort.
 - Docker: `ephpm/ephpm:vX.Y.Z-php<FULL>`, `:vX.Y.Z-php<MINOR>`, `:<MINOR>`, `:vX.Y.Z`, `:latest` (rolling tags skip pre-releases; a `-` in the tag = prerelease, marked so on GitHub).
 - `Create Release` publishes ONLY after build-linux + build-linux-arm64 + build-macos + build-windows + docker-image all succeed. (arm64 is the leg that historically parks a release — OOM on the self-hosted runner — so when publish never fires, check it first.)
 
@@ -39,7 +39,7 @@ Known leg-specific failures: see `triage-ci` (macOS llvm@17/libclang, Windows ep
 ## 5. Verify the release (always, before announcing)
 
 ```bash
-gh release view vX.Y.Z --json isDraft,isPrerelease,assets   # expect 13 assets (12 tarballs + SHA256SUMS)
+gh release view vX.Y.Z --json isDraft,isPrerelease,assets   # expect 13 assets (12 tarballs + SHA256SUMS); 14 if the non-gating windows-tailcall leg landed its archive
 gh release download vX.Y.Z --pattern "*php<DEFAULT_PHP>-linux-x86_64.tar.gz" --pattern "*windows-x86_64.tar.gz"
 ```
 Smoke each downloaded binary: `ephpm --version` reports the tag; serve a one-line `<?php echo "PHPOK ".PHP_VERSION;` docroot and curl it (Linux binary is glibc-dynamic with a glibc >= 2.39 floor - run it in `debian:13-slim` via podman, NOT alpine and NOT debian:12; Windows runs natively). Expect HTTP 200 + `PHPOK <php-version>`.

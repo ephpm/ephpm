@@ -4,10 +4,11 @@
 //! that must stay in lockstep:
 //!
 //! 1. `xtask/src/main.rs` — the `PHP_SDK_VERSIONS` table (source of truth)
-//! 2. `.github/workflows/release.yml` — 5 matrix sites, one entry per minor
+//! 2. `.github/workflows/release.yml` — matrix sites, one entry per minor
 //!    in each: two inline-map matrices (`build-linux`, `build-linux-arm64`)
 //!    and three `php_minor`/`php_full` include blocks (`build-macos`,
-//!    `build-windows`, `docker-image`)
+//!    `build-windows`, `docker-image`); minors in `TAILCALL_MINORS`
+//!    additionally appear in the `build-windows-tailcall` include block
 //! 3. `docker/Dockerfile` — `ARG PHP_SDK_VERSION` default (+ its inline
 //!    example), only for the default minor
 //! 4. `site/content/developer/architecture-overview.md` — the support table
@@ -22,6 +23,11 @@ use std::fs;
 use std::process::ExitCode;
 
 use crate::{DEFAULT_PHP_MINOR, PHP_SDK_VERSIONS, workspace_root};
+
+/// Minors that also appear in release.yml's experimental
+/// `build-windows-tailcall` job (one extra `php_full:` include-block pin
+/// site each). 8.5-only today: the TAILCALL VM does not exist in 8.3/8.4.
+const TAILCALL_MINORS: &[&str] = &["8.5"];
 
 /// One exact-substring substitution in one file, with a required match count.
 struct Substitution {
@@ -65,11 +71,12 @@ fn substitutions(minor: &str, old_full: &str, new_full: &str) -> Vec<Substitutio
         // docker-image:
         //   - php_minor: "8.3"
         //     php_full: "8.3.31"
+        // TAILCALL minors also pin the build-windows-tailcall include block.
         Substitution {
             path: ".github/workflows/release.yml",
             needle: format!("php_full: \"{old_full}\""),
             replacement: format!("php_full: \"{new_full}\""),
-            expected: 3,
+            expected: if TAILCALL_MINORS.contains(&minor) { 4 } else { 3 },
         },
         // The PHP support table ("Supported — in CI (pinned X.Y.Z)").
         Substitution {
@@ -343,6 +350,22 @@ mod tests {
         let err = apply(fixture, inline).unwrap_err();
         assert!(err.contains("expected exactly 2"), "unexpected message: {err}");
         assert!(err.contains("found 3"), "unexpected message: {err}");
+    }
+
+    /// TAILCALL minors carry one extra `php_full:` include-block pin site
+    /// (the build-windows-tailcall job); every other minor keeps three.
+    #[test]
+    fn tailcall_minor_expects_extra_windows_include_site() {
+        let php_full_expected = |minor: &str, full: &str| {
+            substitutions(minor, full, full)
+                .iter()
+                .find(|s| s.path.ends_with("release.yml") && s.needle.starts_with("php_full"))
+                .unwrap()
+                .expected
+        };
+        assert_eq!(php_full_expected("8.5", "8.5.7"), 4, "8.5 pins build-windows-tailcall too");
+        assert_eq!(php_full_expected("8.4", "8.4.23"), 3);
+        assert_eq!(php_full_expected("8.3", "8.3.31"), 3);
     }
 
     #[test]

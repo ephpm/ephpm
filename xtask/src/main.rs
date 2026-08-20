@@ -60,6 +60,7 @@ Usage: cargo xtask <command> [options]
 Commands:
   release [8.5] [--target windows]  Build ephpm with PHP linked (default: 8.5)
   php-sdk [8.5]                     Download the PHP SDK (libphp.a + headers) for the current platform
+                                    (--target windows: fetch the Windows SDK from any host)
   e2e [--php-version 8.5]           Run bare-process E2E tests (spawns ephpm on 127.0.0.1, no Kind/Tilt)
   cli-conformance --php <path>      Diff `ephpm php` against an upstream php CLI over tests/cli-conformance/
   k8s-e2e [--php-version 8.5]       Run K8s E2E tests (opt-in; creates Kind cluster, builds images, tilt ci)
@@ -76,7 +77,12 @@ shorthand (e.g. \"8.5\") to use the pinned patch release, or a full version
 
 Windows builds:
   --target windows    Build a native Windows .exe (must run on Windows; MSVC build tools required).
-                      Downloads the same prebuilt SDK as Linux/macOS, but for windows-x86_64."
+                      Downloads the same prebuilt SDK as Linux/macOS, but for windows-x86_64.
+  --variant clang     (with --target windows, PHP 8.5 only) Use the clang-cl-built PHP SDK whose
+                      interpreter is the TAILCALL VM — 1.6-1.7x faster on CPU-bound PHP than the
+                      default MSVC build's CALL VM. Experimental. The SDK asset is
+                      php-sdk-<ver>-windows-x86_64-clang.tar.gz, cached side-by-side with the
+                      default; the produced ephpm.exe is verified to contain the TAILCALL VM."
     );
 }
 
@@ -102,12 +108,13 @@ fn parse_target(args: &[String]) -> Option<&str> {
     None
 }
 
-/// Extract the PHP version from release args, skipping `--target` and its value.
-/// Falls back to "8.5" if no positional version argument is found.
+/// Extract the positional PHP version from `release`/`php-sdk` args, skipping
+/// the value-taking flags (`--target`, `--variant`) and their values.
+/// Falls back to the default minor if no positional argument is found.
 fn parse_release_php_version(args: &[String]) -> &str {
     let mut i = 0;
     while i < args.len() {
-        if args[i] == "--target" {
+        if args[i] == "--target" || args[i] == "--variant" {
             i += 2; // skip flag and its value
             continue;
         }
@@ -116,7 +123,51 @@ fn parse_release_php_version(args: &[String]) -> &str {
         }
         i += 1;
     }
-    "8.5"
+    DEFAULT_PHP_MINOR
+}
+
+/// Parse `--variant <value>` from args. `None` when the flag is absent.
+///
+/// The value is validated at the use sites via `validate_variant` so each
+/// command can hard-error in its own context (release vs. download).
+fn parse_variant(args: &[String]) -> Option<&str> {
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--variant" {
+            return args.get(i + 1).map(String::as_str);
+        }
+    }
+    None
+}
+
+/// Validate a `--variant` request against the SDK platform and PHP version.
+///
+/// The only SDK build variant besides the default toolchain is `clang`: PHP
+/// built with clang-cl (MSVC-ABI-compatible) so the interpreter is PHP 8.5's
+/// TAILCALL VM (`[[clang::musttail]]` + `preserve_none`) instead of the slow
+/// `ZEND_VM_KIND_CALL` interpreter every MSVC-built PHP falls back to. The
+/// artifact only exists for windows-x86_64 and PHP 8.5 — the TAILCALL VM does
+/// not exist in PHP 8.3/8.4, so those minors hard-error here with an
+/// explanation instead of a confusing 404 at download time (issue #329).
+fn validate_variant(variant: &str, version: &str, os: &str, arch: &str) -> Result<(), ()> {
+    if variant != "clang" {
+        eprintln!("error: unsupported --variant '{variant}' (supported: clang)");
+        eprintln!("       omit --variant for the default-toolchain SDK");
+        return Err(());
+    }
+    if os != "windows" || arch != "x86_64" {
+        eprintln!("error: --variant clang is only published for windows-x86_64");
+        eprintln!(
+            "       (Linux/macOS SDKs already ship the fast HYBRID VM — there is no clang variant)"
+        );
+        return Err(());
+    }
+    if !version.starts_with("8.5.") {
+        eprintln!("error: --variant clang requires PHP 8.5 (got {version})");
+        eprintln!("       The TAILCALL VM does not exist in PHP 8.3/8.4; those minors ship");
+        eprintln!("       only the default MSVC (CALL VM) Windows build.");
+        return Err(());
+    }
+    Ok(())
 }
 
 /// Dispatch release builds based on `--target` flag.
@@ -126,7 +177,14 @@ fn parse_release_php_version(args: &[String]) -> &str {
 /// path applies its own host guard.
 fn release(args: &[String]) -> ExitCode {
     match parse_target(args) {
-        None => require_unix(|| release_native(args)),
+        None => {
+            if parse_variant(args).is_some() {
+                eprintln!("error: --variant is only supported with --target windows");
+                eprintln!("       (the clang/TAILCALL SDK variant is a Windows-only artifact)");
+                return ExitCode::FAILURE;
+            }
+            require_unix(|| release_native(args))
+        }
         Some("windows") => release_windows(args),
         Some(other) => {
             eprintln!("error: unsupported target '{other}' (supported: windows)");
@@ -254,10 +312,29 @@ fn release_windows(args: &[String]) -> ExitCode {
     };
     let target = "x86_64-pc-windows-msvc";
 
-    if ensure_php_sdk_for(&php_version, "windows", "x86_64").is_err() {
+    // Optional `--variant clang`: link against the clang-cl / TAILCALL SDK
+    // instead of the default MSVC one. Same Rust target, same MSVC link step
+    // — clang-cl is MSVC-ABI-compatible, so the only difference is which
+    // php8embed.lib PHP_SDK_PATH points at.
+    let variant = parse_variant(args);
+    if let Some(v) = variant
+        && validate_variant(v, &php_version, "windows", "x86_64").is_err()
+    {
         return ExitCode::FAILURE;
     }
-    let sdk_dir = php_sdk_dir_for(&php_version, "windows", "x86_64");
+
+    if ensure_php_sdk_variant(&php_version, "windows", "x86_64", variant).is_err() {
+        return ExitCode::FAILURE;
+    }
+    let sdk_dir = php_sdk_dir_variant(&php_version, "windows", "x86_64", variant);
+
+    // Hard gate for the clang variant: prove the SDK's php8embed.lib really
+    // contains the TAILCALL interpreter BEFORE linking it into ephpm.exe. An
+    // artifact advertised as TAILCALL that silently ships the CALL VM is the
+    // exact failure this build path exists to prevent.
+    if variant.is_some() && verify_tailcall_vm(&sdk_dir).is_err() {
+        return ExitCode::FAILURE;
+    }
 
     eprintln!("==> Ensuring Rust target {target} is installed...");
     let status = Command::new("rustup").args(["target", "add", target]).status();
@@ -337,26 +414,48 @@ fn resolve_php_version(input: &str) -> Option<String> {
 
 /// Download the prebuilt PHP SDK for the host platform.
 ///
-/// `cargo xtask php-sdk [version]` — pulls `libphp.a` (Linux/macOS) or
-/// `php8embed.{dll,lib}` (Windows) plus the PHP headers from
-/// github.com/ephpm/php-sdk releases and extracts them into
-/// `<workspace>/php-sdk/<full-version>/`.
+/// `cargo xtask php-sdk [version] [--target windows] [--variant clang]` —
+/// pulls `libphp.a` (Linux/macOS) or `php8embed.lib` (Windows) plus the PHP
+/// headers from github.com/ephpm/php-sdk releases and extracts them into
+/// `<workspace>/php-sdk/<full-version>-<os>-<arch>[suffix]/`.
+///
+/// `--target windows` overrides host detection so any host with curl + tar
+/// can prefetch the Windows SDK (the download itself is platform-neutral).
+/// `--variant clang` selects the clang-cl / TAILCALL Windows SDK
+/// (PHP 8.5 only — see `validate_variant`).
 fn php_sdk(args: &[String]) -> ExitCode {
-    let input = args.first().map_or(DEFAULT_PHP_MINOR, String::as_str);
-    let Some(version) = resolve_php_version(input) else {
+    let Some(version) = resolve_php_version(parse_release_php_version(args)) else {
         return ExitCode::FAILURE;
     };
 
-    let (os, arch) = match host_php_sdk_platform() {
-        Some(p) => p,
-        None => return ExitCode::FAILURE,
+    let (os, arch) = match parse_target(args) {
+        None => match host_php_sdk_platform() {
+            Some(p) => p,
+            None => return ExitCode::FAILURE,
+        },
+        Some("windows") => ("windows", "x86_64"),
+        Some(other) => {
+            eprintln!("error: unsupported target '{other}' (supported: windows)");
+            eprintln!("       omit --target to download the SDK for the current platform");
+            return ExitCode::FAILURE;
+        }
     };
 
-    if ensure_php_sdk_for(&version, os, arch).is_err() {
+    let variant = parse_variant(args);
+    if let Some(v) = variant
+        && validate_variant(v, &version, os, arch).is_err()
+    {
         return ExitCode::FAILURE;
     }
 
-    eprintln!("==> PHP SDK ready at {}", php_sdk_dir_for(&version, os, arch).display());
+    if ensure_php_sdk_variant(&version, os, arch, variant).is_err() {
+        return ExitCode::FAILURE;
+    }
+
+    eprintln!(
+        "==> PHP SDK ready at {}",
+        php_sdk_dir_variant(&version, os, arch, variant).display()
+    );
     ExitCode::SUCCESS
 }
 
@@ -409,7 +508,19 @@ fn ensure_php_sdk(version: &str) -> Result<(), ()> {
 /// The cache is keyed by `(version, os, arch)` so cross-compiled builds can
 /// hold multiple SDKs side-by-side without trampling each other.
 fn ensure_php_sdk_for(version: &str, os: &str, arch: &str) -> Result<(), ()> {
-    let dest = php_sdk_dir_for(version, os, arch);
+    ensure_php_sdk_variant(version, os, arch, None)
+}
+
+/// Variant-aware form of `ensure_php_sdk_for`. `variant = Some("clang")`
+/// selects the clang-cl / TAILCALL Windows SDK; `None` is the default
+/// toolchain and behaves exactly like `ensure_php_sdk_for` always has.
+fn ensure_php_sdk_variant(
+    version: &str,
+    os: &str,
+    arch: &str,
+    variant: Option<&str>,
+) -> Result<(), ()> {
+    let dest = php_sdk_dir_variant(version, os, arch, variant);
 
     // Layout we expect inside `dest/`:
     //   lib/libphp.a            (Linux + macOS)
@@ -423,7 +534,8 @@ fn ensure_php_sdk_for(version: &str, os: &str, arch: &str) -> Result<(), ()> {
 
     if already_present {
         eprintln!(
-            "==> PHP SDK {version} ({os}-{arch}) already cached at {} — skipping download",
+            "==> PHP SDK {version} ({os}-{arch}{}) already cached at {} — skipping download",
+            php_sdk_variant_suffix(variant),
             dest.display()
         );
         return Ok(());
@@ -433,15 +545,26 @@ fn ensure_php_sdk_for(version: &str, os: &str, arch: &str) -> Result<(), ()> {
         eprintln!("error: failed to create {}: {e}", dest.display());
     })?;
 
-    let suffix = php_sdk_libc_suffix(os);
+    let suffix = format!("{}{}", php_sdk_libc_suffix(os), php_sdk_variant_suffix(variant));
     let asset = format!("php-sdk-{version}-{os}-{arch}{suffix}.tar.gz");
     let url = format!("https://github.com/ephpm/php-sdk/releases/download/v{version}/{asset}");
 
     eprintln!("==> Downloading {asset}...");
     if !download_and_extract_full_tarball(&url, &dest) {
+        // Drop whatever partially extracted so nothing half-populated
+        // lingers in the cache directory.
+        let _ = fs::remove_dir_all(&dest);
         eprintln!("error: failed to download or extract PHP SDK from {url}");
         eprintln!("       Verify that release v{version} exists at:");
         eprintln!("         https://github.com/ephpm/php-sdk/releases/tag/v{version}");
+        if variant.is_some() {
+            eprintln!(
+                "       The -clang (TAILCALL) asset is experimental and may not be attached to"
+            );
+            eprintln!(
+                "       every SDK release yet — the default MSVC SDK (omit --variant) always is."
+            );
+        }
         return Err(());
     }
 
@@ -459,9 +582,27 @@ fn php_sdk_libc_suffix(os: &str) -> &'static str {
     if os == "linux" { "-gnu" } else { "" }
 }
 
+/// Toolchain-variant suffix used in SDK release-asset and cache-directory
+/// names. The default toolchain (MSVC on Windows, gcc/clang elsewhere) has no
+/// suffix; the clang-cl / TAILCALL Windows SDK is published as `-clang` and
+/// cached under its own directory so the two variants never trample each
+/// other (the cache-hit check is just "does `lib/php8embed.lib` exist").
+fn php_sdk_variant_suffix(variant: Option<&str>) -> &'static str {
+    match variant {
+        Some("clang") => "-clang",
+        _ => "",
+    }
+}
+
 /// Workspace-relative cache path for a PHP SDK pinned to `(version, os, arch)`.
 fn php_sdk_dir_for(version: &str, os: &str, arch: &str) -> PathBuf {
-    let suffix = php_sdk_libc_suffix(os);
+    php_sdk_dir_variant(version, os, arch, None)
+}
+
+/// Variant-aware form of `php_sdk_dir_for` (e.g. the clang/TAILCALL Windows
+/// SDK caches at `php-sdk/<version>-windows-x86_64-clang/`).
+fn php_sdk_dir_variant(version: &str, os: &str, arch: &str, variant: Option<&str>) -> PathBuf {
+    let suffix = format!("{}{}", php_sdk_libc_suffix(os), php_sdk_variant_suffix(variant));
     workspace_root().join("php-sdk").join(format!("{version}-{os}-{arch}{suffix}"))
 }
 
@@ -477,19 +618,140 @@ fn php_sdk_dir(version: &str) -> PathBuf {
 ///
 /// Uses `tar --strip-components=1` if the archive nests under a top-level
 /// directory (the php-sdk archives use `./lib/...`, so strip is harmless).
+///
+/// Both pipeline stages are checked: tar alone is not enough, because
+/// Windows bsdtar exits 0 on empty stdin, which used to turn a curl 404
+/// (missing release asset) into a phantom "SDK ready" success.
 fn download_and_extract_full_tarball(url: &str, dest: &Path) -> bool {
     let curl =
         Command::new("curl").args(["-fSL", url]).stdout(std::process::Stdio::piped()).spawn();
 
-    let Ok(curl) = curl else {
+    let Ok(mut curl) = curl else {
         eprintln!("error: failed to spawn curl");
         return false;
     };
 
-    let status =
-        Command::new("tar").args(["xz", "-C"]).arg(dest).stdin(curl.stdout.unwrap()).status();
+    let stdout = curl.stdout.take().expect("curl stdout was piped");
+    let tar_status = Command::new("tar").args(["xz", "-C"]).arg(dest).stdin(stdout).status();
+    let curl_status = curl.wait();
 
-    ran_ok(&status)
+    ran_ok(&tar_status) && matches!(curl_status, Ok(s) if s.success())
+}
+
+/// Hard gate for the clang/TAILCALL Windows SDK: prove `php8embed.lib`
+/// actually contains the TAILCALL interpreter before linking it into
+/// `ephpm.exe`.
+///
+/// `zend_vm_kind()` compiles to a constant return, so its disassembly is a
+/// truthful, dependency-free witness of which interpreter was generated:
+/// `mov eax,5` is `ZEND_VM_KIND_TAILCALL`, `mov eax,1` is the slow MSVC
+/// `ZEND_VM_KIND_CALL`. The function lives in `Zend/zend_execute.obj`
+/// (`zend_vm_execute.h` is `#include`d by `zend_execute.c` — there is no
+/// separate `zend_vm_execute.obj`), so: list the lib's members, extract that
+/// object, disassemble it, and require `mov eax,5` in the `zend_vm_kind`
+/// body. This is the same gate the php-sdk clang lane runs before
+/// publishing, repeated on the consumer side so an ephpm artifact named
+/// "-tailcall" can never silently ship the CALL VM even if a mislabeled SDK
+/// tarball slips through. Costs ~3 s and ~11 MB of scratch disassembly.
+///
+/// Requires `lib.exe` and `dumpbin.exe` on PATH — part of the same MSVC
+/// developer environment `cargo xtask release --target windows` already
+/// requires for the build itself.
+fn verify_tailcall_vm(sdk_dir: &Path) -> Result<(), ()> {
+    let lib_path = sdk_dir.join("lib").join("php8embed.lib");
+    if !lib_path.exists() {
+        eprintln!("error: {} not found — SDK cache is incomplete", lib_path.display());
+        return Err(());
+    }
+
+    eprintln!("==> Verifying the SDK's interpreter is the TAILCALL VM...");
+
+    // 1. Find the archive member that defines zend_vm_kind. Member names are
+    //    full paths from the SDK build tree, so match on the trailing
+    //    `Zend\zend_execute.obj` (never `zend_execute_API.obj`).
+    let list = Command::new("lib").args(["/nologo", "/list"]).arg(&lib_path).output();
+    let Ok(list) = list else {
+        eprintln!("error: failed to run lib.exe — is the MSVC developer environment active?");
+        return Err(());
+    };
+    if !list.status.success() {
+        eprintln!("error: lib /list failed on {}", lib_path.display());
+        return Err(());
+    }
+    let members = String::from_utf8_lossy(&list.stdout);
+    let member = members.lines().map(str::trim).find(|line| {
+        let norm = line.replace('/', "\\").to_ascii_lowercase();
+        norm.ends_with("zend\\zend_execute.obj")
+    });
+    let Some(member) = member else {
+        eprintln!(
+            "error: Zend\\zend_execute.obj not found among the members of {}",
+            lib_path.display()
+        );
+        return Err(());
+    };
+
+    // 2. Extract it and disassemble to a scratch file (the full disasm of
+    //    the VM object is ~11 MB — stream it from disk, don't buffer stdout).
+    let scratch = env::temp_dir().join(format!("ephpm-vm-kind-probe-{}", std::process::id()));
+    let obj = scratch.with_extension("obj");
+    let txt = scratch.with_extension("txt");
+    let cleanup = || {
+        let _ = fs::remove_file(&obj);
+        let _ = fs::remove_file(&txt);
+    };
+
+    let status = Command::new("lib")
+        .arg("/nologo")
+        .arg(format!("/extract:{member}"))
+        .arg(format!("/out:{}", obj.display()))
+        .arg(&lib_path)
+        .status();
+    if !ran_ok(&status) || !obj.exists() {
+        eprintln!("error: lib /extract:{member} failed");
+        cleanup();
+        return Err(());
+    }
+
+    let status = Command::new("dumpbin")
+        .args(["/nologo", "/disasm:nobytes"])
+        .arg(&obj)
+        .arg(format!("/out:{}", txt.display()))
+        .status();
+    if !ran_ok(&status) {
+        eprintln!("error: dumpbin /disasm failed on the extracted zend_execute.obj");
+        cleanup();
+        return Err(());
+    }
+
+    // 3. Find the `zend_vm_kind:` label and require `mov eax,5` right after.
+    let Ok(disasm) = fs::read_to_string(&txt) else {
+        eprintln!("error: failed to read the dumpbin disassembly at {}", txt.display());
+        cleanup();
+        return Err(());
+    };
+    cleanup();
+
+    let mut lines = disasm.lines();
+    let found = lines.by_ref().any(|l| l.trim() == "zend_vm_kind:");
+    if !found {
+        eprintln!("error: zend_vm_kind not found in the disassembly — cannot verify VM kind");
+        return Err(());
+    }
+    let body: Vec<&str> = lines.by_ref().take(4).collect();
+    let is_tailcall = body.iter().any(|l| l.replace(' ', "").ends_with("moveax,5"));
+    if is_tailcall {
+        eprintln!("==> VM kind verified: ZEND_VM_KIND_TAILCALL (5)");
+        Ok(())
+    } else {
+        eprintln!("error: the SDK's VM kind is NOT TAILCALL. zend_vm_kind() disassembles to:");
+        for l in &body {
+            eprintln!("         {l}");
+        }
+        eprintln!("       (mov eax,1 = the MSVC CALL VM — a mislabeled default SDK.)");
+        eprintln!("       Refusing to build a '-tailcall' binary from it.");
+        Err(())
+    }
 }
 
 // ── K8s E2E testing (Kind + Tilt) — opt-in only ──────────────────────────────

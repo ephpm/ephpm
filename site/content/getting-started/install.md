@@ -56,6 +56,28 @@ Installs to `C:\Program Files\ephpm\`, adds the directory to the system `PATH`, 
 
 > Single-node SQLite (the in-process Turso engine), the MySQL/Postgres proxy, and everything else work normally on Windows. Clustered SQLite (Turso CDC replication) is untested on Windows.
 
+### TAILCALL build — experimental, PHP 8.5 only
+
+A release may additionally carry a second Windows archive:
+
+```text
+ephpm-vX.Y.Z+php8.5.7-windows-x86_64-tailcall.tar.gz
+```
+
+Every PHP built with MSVC — including the default ePHPm Windows binary — falls back to the interpreter's slow `CALL` VM. The `-tailcall` archive contains the same `ephpm.exe`, but with PHP 8.5 compiled by clang-cl so the interpreter is the new TAILCALL VM (`[[clang::musttail]]` + `preserve_none`), which recovers roughly the performance of the HYBRID VM that Linux/macOS builds have always had.
+
+Measured against the default MSVC Windows binary, end-to-end through ePHPm (Ryzen 9 5950X):
+
+- **1.6–1.7x faster on CPU-bound PHP** (reference loop 2.73 ms vs 4.43 ms).
+- **~3% on the Symfony demo app** — real applications are dominated by the filesystem tier, matching upstream's ~5.5% Symfony figure for the VM-kind delta. If your workload is I/O-bound, expect the small number, not the big one.
+
+Status and caveats:
+
+- **Experimental.** Its release-CI leg is non-gating, so a given release can ship without this archive. The MSVC binary remains the default and supported Windows build.
+- **PHP 8.5 only** — the TAILCALL VM does not exist in PHP 8.3/8.4.
+- Install is identical: extract and run `.\ephpm.exe install`.
+- The build pipeline hard-gates on the VM kind (it disassembles `zend_vm_kind()` out of the PHP static lib and requires `ZEND_VM_KIND_TAILCALL`), so an archive named `-tailcall` cannot silently contain the CALL VM.
+
 ## Manage the service
 
 After `install`, the same commands work on every platform — they wrap systemd / launchd / the Windows service controller:
@@ -132,6 +154,14 @@ cargo xtask release --target windows   # → target\x86_64-pc-windows-msvc\relea
 ```
 
 The SDK download is the same php-sdk release, with a prebuilt static `php8embed.lib` for Windows. It links statically, so `ephpm.exe` is a single self-contained binary — there is no DLL to deploy alongside it.
+
+To build the experimental [TAILCALL variant](#tailcall-build--experimental-php-85-only) from source (PHP 8.5 only):
+
+```powershell
+cargo xtask release --target windows --variant clang
+```
+
+This downloads the clang-cl-built SDK asset (`php-sdk-<ver>-windows-x86_64-clang.tar.gz`, cached at `php-sdk/<ver>-windows-x86_64-clang/` next to the default SDK) and verifies the SDK's interpreter is the TAILCALL VM before linking. `cargo xtask php-sdk 8.5 --target windows --variant clang` fetches the SDK alone.
 
 A binary built from source can also self-install:
 
