@@ -4,8 +4,10 @@
 //! that must stay in lockstep:
 //!
 //! 1. `xtask/src/main.rs` — the `PHP_SDK_VERSIONS` table (source of truth)
-//! 2. `.github/workflows/release.yml` — 4 matrix sites (linux / macos /
-//!    windows / docker), one entry per minor in each
+//! 2. `.github/workflows/release.yml` — 5 matrix sites, one entry per minor
+//!    in each: two inline-map matrices (`build-linux`, `build-linux-arm64`)
+//!    and three `php_minor`/`php_full` include blocks (`build-macos`,
+//!    `build-windows`, `docker-image`)
 //! 3. `docker/Dockerfile` — `ARG PHP_SDK_VERSION` default (+ its inline
 //!    example), only for the default minor
 //! 4. `site/content/developer/architecture-overview.md` — the support table
@@ -45,15 +47,29 @@ fn substitutions(minor: &str, old_full: &str, new_full: &str) -> Vec<Substitutio
             replacement: format!("(\"{minor}\", \"{new_full}\")"),
             expected: 1,
         },
-        // The 4 release matrix sites (build-linux inline map, build-macos,
-        // build-windows, docker-image). Matching the bare quoted version is
-        // unambiguous — a full version string can only belong to one minor —
-        // and the count assert catches any structural change to the matrix.
+        // The 5 release matrix sites, matched by their structured pin keys
+        // rather than the bare quoted version so that prose (a comment or a
+        // step name that happens to mention a version) can never be counted
+        // as — or rewritten like — a pin. The count asserts still catch any
+        // structural change to the matrices (a job added or removed).
+        //
+        // Shape 1: the inline-map matrices in build-linux and build-linux-arm64:
+        //   - { minor: "8.3", full: "8.3.31" }
         Substitution {
             path: ".github/workflows/release.yml",
-            needle: format!("\"{old_full}\""),
-            replacement: format!("\"{new_full}\""),
-            expected: 4,
+            needle: format!("{{ minor: \"{minor}\", full: \"{old_full}\" }}"),
+            replacement: format!("{{ minor: \"{minor}\", full: \"{new_full}\" }}"),
+            expected: 2,
+        },
+        // Shape 2: the `include:` blocks in build-macos, build-windows and
+        // docker-image:
+        //   - php_minor: "8.3"
+        //     php_full: "8.3.31"
+        Substitution {
+            path: ".github/workflows/release.yml",
+            needle: format!("php_full: \"{old_full}\""),
+            replacement: format!("php_full: \"{new_full}\""),
+            expected: 3,
         },
         // The PHP support table ("Supported — in CI (pinned X.Y.Z)").
         Substitution {
@@ -276,22 +292,57 @@ mod tests {
         assert_eq!(apply(input, &sub).unwrap(), input);
     }
 
+    /// Mirrors the current release.yml shape: two inline-map matrices
+    /// (build-linux, build-linux-arm64) plus three `php_minor`/`php_full`
+    /// include blocks (build-macos, build-windows, docker-image), and a prose
+    /// comment that mentions a full version — which must NOT count as a pin.
     #[test]
-    fn release_yml_fixture_hits_all_four_matrix_sites() {
+    fn release_yml_fixture_hits_all_five_matrix_sites() {
         let fixture = r#"
+          - { minor: "8.4", full: "8.4.23" }
           - { minor: "8.4", full: "8.4.23" }
           - php_minor: "8.4"
             php_full: "8.4.23"
+          # PHP SDK 8.4.23 macOS objects are built with a newer Xcode that
           - php_minor: "8.4"
             php_full: "8.4.23"
           - php_minor: "8.4"
             php_full: "8.4.23"
+            default: true
 "#;
         let subs = substitutions("8.4", "8.4.23", "8.4.30");
-        let yml = subs.iter().find(|s| s.path.ends_with("release.yml")).unwrap();
-        let out = apply(fixture, yml).unwrap();
-        assert_eq!(out.matches("\"8.4.30\"").count(), 4);
-        assert!(!out.contains("8.4.23"));
+        let yml_subs: Vec<_> = subs.iter().filter(|s| s.path.ends_with("release.yml")).collect();
+        assert_eq!(yml_subs.len(), 2, "inline-map + php_full shapes");
+        let mut out = fixture.to_string();
+        for sub in yml_subs {
+            out = apply(&out, sub).unwrap();
+        }
+        assert_eq!(out.matches("\"8.4.30\"").count(), 5);
+        // The comment is prose, not a pin site — it must survive untouched
+        // and must not have been counted toward either expected total.
+        assert!(out.contains("# PHP SDK 8.4.23 macOS objects"));
+        assert!(!out.contains("\"8.4.23\""));
+    }
+
+    /// A structural change to the matrices (a job added or removed) must be
+    /// refused, not silently half-applied — the fail-safe that caught the
+    /// build-linux-arm64 job split in the first place.
+    #[test]
+    fn release_yml_shape_change_is_refused() {
+        // One extra inline-map job (3 instead of the expected 2).
+        let fixture = r#"
+          - { minor: "8.4", full: "8.4.23" }
+          - { minor: "8.4", full: "8.4.23" }
+          - { minor: "8.4", full: "8.4.23" }
+"#;
+        let subs = substitutions("8.4", "8.4.23", "8.4.30");
+        let inline = subs
+            .iter()
+            .find(|s| s.path.ends_with("release.yml") && s.needle.contains("{ minor:"))
+            .unwrap();
+        let err = apply(fixture, inline).unwrap_err();
+        assert!(err.contains("expected exactly 2"), "unexpected message: {err}");
+        assert!(err.contains("found 3"), "unexpected message: {err}");
     }
 
     #[test]
