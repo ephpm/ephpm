@@ -130,6 +130,24 @@ error yields `255`; a syntax error under `-l` yields `255` (with
 > never reported and never set the exit status. Both halves are now pinned by
 > the `cli` E2E suite.
 
+### End of script
+
+Script teardown follows php-cli's end-of-request order: callbacks registered
+with `register_shutdown_function()` run first (in registration order,
+including callbacks registered *during* shutdown), then destructors of
+objects still alive at script end, then output is flushed. Shutdown functions
+run even after an uncaught exception or fatal error, exactly as in php-cli.
+`exit(N)` inside a shutdown function sets the process exit status and
+overrides the script's own `exit()` — including `exit(0)` clearing a nonzero
+status.
+
+> **Fixed in v0.7.2.** Up to and including v0.7.1, `ephpm php` skipped its
+> end-of-request teardown while the CLI output path was live
+> ([#334](https://github.com/ephpm/ephpm/issues/334)): shutdown functions and
+> end-of-script destructors ran invisibly at process exit, and `exit()` inside
+> a shutdown function could not set the exit status. Pinned by the `cli` E2E
+> suite and the CLI conformance corpus (cases 021/036).
+
 ### Not supported
 
 - `-a` (interactive shell) — the PHP interactive shell is part of the standalone
