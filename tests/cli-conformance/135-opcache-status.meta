@@ -1,0 +1,4 @@
+# no_default_ini: with -n the distro php would not load the opcache
+# zend_extension at all, so the upstream side needs its normal ini to have
+# opcache present; enable_cli/jit are then forced by -d on both sides.
+no_default_ini = true

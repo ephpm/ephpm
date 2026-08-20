@@ -1,0 +1,21 @@
+<?php
+mt_srand(42);
+echo mt_rand(), " ", mt_rand(), " ", mt_rand(1, 100), "\n";
+mt_srand(42, MT_RAND_MT19937);
+echo mt_rand(), "\n";
+srand(7);
+echo rand(), " ", rand(0, 9), "\n";
+mt_srand(1);
+$a = range(1, 10);
+shuffle($a);
+echo implode(",", $a), "\n";
+mt_srand(1);
+$keys = array_flip(range('a', 'j'));
+echo var_export(array_rand($keys, 3), true), "\n";
+mt_srand(9);
+$s = "abcdefgh";
+echo str_shuffle($s), "\n";
+$r = new \Random\Randomizer(new \Random\Engine\Mt19937(2024));
+echo $r->getBytesFromString('abcdef', 8), "\n";
+echo implode(",", $r->shuffleArray([1, 2, 3, 4, 5])), "\n";
+echo $r->getInt(1, 1000), "\n";

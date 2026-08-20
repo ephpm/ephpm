@@ -1,0 +1,2 @@
+-R
+echo strtoupper($argn), ":", $argi, "\n";

@@ -1,0 +1,2 @@
+-r
+foreach (['max_execution_time', 'output_buffering', 'implicit_flush', 'display_errors', 'display_startup_errors', 'error_reporting', 'html_errors', 'memory_limit', 'register_argc_argv', 'variables_order', 'short_open_tag', 'zend.assertions', 'precision', 'serialize_precision', 'default_charset', 'max_input_time', 'log_errors', 'ignore_repeated_errors', 'error_log'] as $k) { printf("%s=%s\n", $k, var_export(ini_get($k), true)); }

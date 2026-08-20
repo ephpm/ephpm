@@ -1,0 +1,32 @@
+<?php
+var_dump(array_map(null, [1, 2], ["a", "b"]));
+var_dump(array_filter([0, 1, "", "0", null, false, [], "a"]));
+var_dump(array_filter([1, 2, 3, 4], fn($x) => $x % 2));
+var_dump(array_reduce([1, 2, 3], fn($c, $x) => $c + $x, 10));
+var_dump(array_slice([1, 2, 3, 4, 5], 1, 3), array_slice(["a" => 1, "b" => 2], 1, null, true));
+$sp = [1, 2, 3, 4];
+var_dump(array_splice($sp, 1, 2, ["x"]), $sp);
+var_dump(array_unique([1, "1", 1.0, true, "a", "a"]));
+var_dump(array_flip(["a" => 1, "b" => "two", "c" => 1]));
+var_dump(in_array("1", [1, 2]), in_array("1", [1, 2], true), in_array(0, ["a"]), in_array(null, [""]));
+var_dump(array_search("0", [0 => null, 1 => 0, 2 => "0"]), array_search(0, ["a", 0]), array_search(null, [0, null], true));
+var_dump(array_keys(["a" => 1, "b" => 2, "c" => 1], 1), array_values([3 => "x", "k" => "y"]));
+var_dump(array_combine(["x", "y"], [1, 2]), array_fill(5, 3, "v"), array_fill_keys(["a", "b"], 0));
+var_dump(array_merge([1, 2], ["k" => "v", 3]), [1, 2] + [9, 8, 7]);
+var_dump(array_merge_recursive(["k" => [1]], ["k" => [2]]), array_replace([1, 2, 3], [1 => "x"]));
+var_dump(array_diff([1, 2, 3, 4], [2, 4]), array_intersect_key(["a" => 1, "b" => 2], ["a" => null]));
+var_dump(array_column([["id" => 1, "n" => "a"], ["id" => 2, "n" => "b"]], "n", "id"));
+var_dump(array_chunk([1, 2, 3, 4, 5], 2, true), array_pad([1], 3, 0), array_pad([1], -3, 0));
+var_dump(range(1, 10, 3), range('a', 'e'), range(0, 1, 0.25));
+var_dump(array_sum([1, 2.5, "3"]), array_product([2, "3", 4]), count([1, [2, 3]], COUNT_RECURSIVE));
+var_dump(array_key_first(["x" => 1, "y" => 2]), array_key_last(["x" => 1]), array_is_list([1, 2]), array_is_list([1 => 1]));
+list($p, $q) = [1, 2];
+[$r, ["s" => $s]] = [3, ["s" => 4]];
+var_dump($p, $q, $r, $s);
+var_dump([...[1, 2], ...["a" => 3]]);
+var_dump(array_reverse([1, 2, 3]), array_reverse(["a" => 1, 5 => 2], true));
+$w = [1, 2, 3];
+array_walk($w, function (&$v, $k) {
+    $v = "$k:$v";
+});
+var_dump($w);

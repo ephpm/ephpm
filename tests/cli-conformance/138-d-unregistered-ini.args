@@ -1,0 +1,6 @@
+-d
+user.custom=hello
+-d
+bare_flag
+-r
+var_dump(ini_get('user.custom'), get_cfg_var('user.custom'), get_cfg_var('bare_flag'));

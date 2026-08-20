@@ -1,0 +1,4 @@
+-d
+display_errors=stderr
+-r
+trigger_error("routed to stderr", E_USER_WARNING); echo "on stdout\n";

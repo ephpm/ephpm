@@ -1,0 +1,1 @@
+xfail = "--rf on a missing function prints the identical Exception line but exits 0 where php-cli exits 1 (#335; when this XPASSes, remove the marker)"

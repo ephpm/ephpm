@@ -1,0 +1,20 @@
+<?php
+$s = "h\u{E9}llo\x00w\u{F6}rld \u{2713} <tag> &amp; 'q' \"d\"";
+echo base64_encode($s), "\n";
+var_dump(base64_decode(base64_encode($s)) === $s);
+var_dump(base64_decode("!!!invalid!!!", true));
+echo urlencode("a b+c/d?e=f&g#h"), "\n";
+echo rawurlencode("a b+c/d?e=f&g#h"), "\n";
+echo urldecode("a%20b%2Bc+d"), " | ", rawurldecode("a%20b+c"), "\n";
+echo http_build_query(["a" => 1, "b" => [1, 2], "c" => ["d" => "x y"]]), "\n";
+parse_str("a=1&b[]=2&b[]=3&c[d]=4", $out);
+var_dump($out);
+echo quoted_printable_encode("h\u{E9}llo=world"), "\n";
+echo bin2hex("\x01\xAB"), " ", hex2bin("01ab") === "\x01\xab" ? "ok" : "no", "\n";
+echo addcslashes("foo[bar]", 'A..Z'), "\n";
+echo var_export(str_getcsv('a,"b,c",d', ',', '"', '\\'), true), "\n";
+echo strip_tags("<p>Hello <b>world</b><br/></p>", "<b>"), "\n";
+echo htmlentities("h\u{E9}llo <b>"), " | ", htmlspecialchars_decode("&lt;b&gt;"), "\n";
+var_dump(parse_url("https://user:pw@host.example:8080/p/a?q=1#frag"));
+var_dump(pathinfo("/dir/sub/file.tar.gz"));
+var_dump(basename("/a/b/c.txt", ".txt"), dirname("/a/b/c.txt"), dirname("/a/b/c", 2));

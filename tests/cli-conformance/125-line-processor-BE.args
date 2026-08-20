@@ -1,0 +1,6 @@
+-B
+echo "BEGIN\n"; $t = 0;
+-R
+$t += strlen($argn);
+-E
+echo "TOTAL=$t\n";

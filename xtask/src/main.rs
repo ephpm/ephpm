@@ -3,6 +3,7 @@ use std::process::{Command, ExitCode};
 use std::{env, fs};
 
 mod bump;
+mod cli_conformance;
 mod doctor;
 mod e2e_bare;
 
@@ -31,6 +32,7 @@ fn main() -> ExitCode {
         // php-sdk is a pure download — works on any platform with curl + tar.
         Some("php-sdk") => php_sdk(&args[1..]),
         Some("e2e") => e2e_bare::run(&args[1..]),
+        Some("cli-conformance") => cli_conformance::run(&args[1..]),
         Some("k8s-e2e") => e2e(&args[1..]),
         Some("k8s-e2e-up") => e2e_up(&args[1..]),
         Some("k8s-e2e-down") => e2e_down(),
@@ -59,6 +61,7 @@ Commands:
   release [8.5] [--target windows]  Build ephpm with PHP linked (default: 8.5)
   php-sdk [8.5]                     Download the PHP SDK (libphp.a + headers) for the current platform
   e2e [--php-version 8.5]           Run bare-process E2E tests (spawns ephpm on 127.0.0.1, no Kind/Tilt)
+  cli-conformance --php <path>      Diff `ephpm php` against an upstream php CLI over tests/cli-conformance/
   k8s-e2e [--php-version 8.5]       Run K8s E2E tests (opt-in; creates Kind cluster, builds images, tilt ci)
   k8s-e2e-up [--php-version 8.5]    Start K8s E2E dev environment (opt-in; tilt dashboard at localhost:10350)
   k8s-e2e-down                      Tear down Kind cluster and all resources

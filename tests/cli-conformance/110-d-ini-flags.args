@@ -1,0 +1,6 @@
+-d
+display_errors=0
+-d
+precision=5
+-r
+var_dump(ini_get('display_errors'), ini_get('precision')); echo 1/3, "\n";

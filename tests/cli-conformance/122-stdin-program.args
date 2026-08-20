@@ -1,0 +1,2 @@
+# No args: the program arrives on stdin (php < file). php-cli has no `-`
+# sentinel and neither does ephpm.

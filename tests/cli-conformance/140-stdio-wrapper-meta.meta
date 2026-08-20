@@ -1,0 +1,1 @@
+xfail = "STDIN/STDOUT/STDERR constants are built from raw FILE* handles, so php://stdin wrapper metadata (wrapper_type/uri) is missing (#340; when this XPASSes, remove the marker)"

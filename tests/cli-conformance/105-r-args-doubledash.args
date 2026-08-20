@@ -1,0 +1,6 @@
+-r
+var_dump($argv, $argc, $argv[0]);
+--
+alpha
+-x
+--beta
