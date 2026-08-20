@@ -7,7 +7,7 @@
 //! node after the primary already has data. Every port is drawn fresh from the
 //! kernel, so nothing here can collide with the harness's fixed-port nodes.
 //!
-//! What passes today:
+//! The lifecycle coverage:
 //!
 //! - **Election + replication + promotion**
 //!   ([`auto_election_replicates_and_survives_losing_the_primary`]) — three
@@ -20,21 +20,20 @@
 //!   joins a primary that already holds data and catches up via the logical
 //!   dump, then stays current off the post-snapshot tail.
 //!
-//! Two further behaviours are specified here as `#[ignore]`d tests because
-//! they are **open defects, found by writing this suite** — each carries the
-//! observed log evidence and the root cause in its doc comment:
+//! Two further tests pin defects that were **found by writing this suite**
+//! and have since been fixed — each keeps the original observed log
+//! evidence and root cause in its doc comment, plus the fix mechanism:
 //!
-//! - [`a_joining_node_must_not_steal_an_established_primary`] — a node joining
-//!   an established cluster takes the primary role from it, re-rooting the
-//!   cluster onto an empty database.
-//! - [`post_failover_writes_replicate_to_the_survivor`] — `change_id` is a
-//!   per-node sequence, so after a promotion the replica's watermark is
-//!   meaningless against the new primary's log and post-failover writes are
-//!   silently never shipped.
+//! - [`a_joining_node_must_not_steal_an_established_primary`] — issue #314,
+//!   fixed by the election's startup grace + deterministic conflict
+//!   resolution (`ephpm-cluster/src/sqlite_election.rs`).
+//! - [`post_failover_writes_replicate_to_the_survivor`] — issue #315,
+//!   fixed by scoping replication watermarks to a per-database CDC log
+//!   identity (`Frame::Hello` / `resolve_subscribe_watermark` in
+//!   `ephpm-server/src/turso_cdc.rs`).
 //!
-//! Both are `#[ignore]` rather than deleted so the intended behaviour stays
-//! written down and executable: dropping the attribute is the verification
-//! step when either is fixed.
+//! They started life as `#[ignore]`d executable specifications; dropping
+//! the attribute was the designed verification step for the fixes.
 //!
 //! The SQL surface is litewire's Hrana HTTP API (`hrana_listen`), because it
 //! needs nothing beyond reqwest + JSON — no MySQL client, no PHP. The
@@ -540,8 +539,8 @@ async fn auto_election_replicates_and_survives_losing_the_primary() {
     assert_ne!(new_primary, primary, "the dead primary cannot win the re-election");
 
     // Every survivor still serves what it had replicated before the failover.
-    // (Whether *new* writes replicate afterwards is a separate, currently
-    // broken story — see `post_failover_writes_replicate_to_the_survivor`.)
+    // (Whether *new* writes replicate afterwards is covered separately by
+    // `post_failover_writes_replicate_to_the_survivor`.)
     for s in survivors {
         cluster
             .wait_for_rows(
@@ -558,15 +557,16 @@ async fn auto_election_replicates_and_survives_losing_the_primary() {
 /// After a failover, writes accepted by the newly promoted primary must reach
 /// the surviving replica.
 ///
-/// **Currently failing — `#[ignore]`d because it documents an open defect,
-/// not a regression.** Remove the attribute once replication is fixed.
+/// **Pins issue #315** (fixed; this test began life `#[ignore]`d as the
+/// executable spec of the defect).
 ///
-/// `turso_cdc`'s `change_id` is a **per-node** sequence — every node's local
-/// `turso_cdc` log numbers from 1 — but the replication protocol treats the
-/// watermark as if it were cluster-global. `Frame::Subscribe` carries the
-/// replica's `applied_change_id` and the primary opens `CdcTailer::new(mgmt,
-/// from)` at exactly that number *in its own log*. Across a promotion those
-/// two numbers describe different sequences.
+/// The defect: `turso_cdc`'s `change_id` is a **per-node** sequence — every
+/// node's local `turso_cdc` log numbers from 1 — but the replication
+/// protocol treated the watermark as if it were cluster-global.
+/// `Frame::Subscribe` carried the replica's `applied_change_id` and the
+/// primary opened `CdcTailer::new(mgmt, from)` at exactly that number *in
+/// its own log*. Across a promotion those two numbers describe different
+/// sequences.
 ///
 /// Observed, with `cdc-node-2` the original primary and `cdc-node-0` promoted
 /// after it was killed:
@@ -577,24 +577,18 @@ async fn auto_election_replicates_and_survives_losing_the_primary() {
 /// ```
 ///
 /// Node 0 had been a replica, and `apply_batch` writes go through the mgmt
-/// connection with capture off, so its own log is empty. The post-failover
-/// `INSERT` it accepts is captured at `change_id` 1 or 2 — below the
-/// subscriber's cursor of 5 — so the tailer never yields it. The row is
-/// simply never shipped; nothing errors, no metric moves, and the replica
-/// reports itself connected and caught up.
+/// connection with capture off, so its own log was empty. The post-failover
+/// `INSERT` it accepted was captured at `change_id` 1 or 2 — below the
+/// subscriber's cursor of 5 — so the tailer never yielded it: silent,
+/// unbounded write loss after any failover.
 ///
-/// Impact: silent, unbounded write loss after any failover. Every write to
-/// the new primary is dropped until its local `change_id` grows past the
-/// stale watermark, and the ones in that gap are skipped permanently. This is
-/// wider than the "unshipped batches at the moment it died" divergence window
-/// the `turso_cdc` module docs describe — that one is bounded by what was
-/// in flight; this one is not.
-///
-/// A fix has to make the watermark meaningful across a promotion — e.g. a
-/// cluster-global sequence, an epoch/term qualifying the `change_id`, or
-/// forcing a snapshot re-bootstrap on every role change.
+/// The fix scopes every watermark to a persistent per-database *log
+/// identity*: the primary announces its log id as the first frame of every
+/// stream (`Frame::Hello`), and the replica keeps its cursor per log id —
+/// on a source switch it re-seeds litewire's watermark table so the
+/// promoted node's writes cannot land below the cursor. See the module
+/// docs in `ephpm-server/src/turso_cdc.rs`.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "open defect: change_id is per-node, so post-failover writes never ship (see the doc comment)"]
 async fn post_failover_writes_replicate_to_the_survivor() {
     let Some(binary) = binary_or_skip() else { return };
 
@@ -642,12 +636,11 @@ async fn post_failover_writes_replicate_to_the_survivor() {
 /// then stays current off the post-snapshot CDC tail.
 ///
 /// Roles are pinned explicitly (`role = "primary"` / `"replica"`) rather than
-/// elected. That is not a convenience: with `role = "auto"` this scenario
-/// cannot be tested at all today, because a node joining an established
-/// cluster takes the primary role away from it — see
-/// [`a_joining_node_must_not_steal_an_established_primary`]. Pinning isolates
-/// the snapshot mechanism, which is what this test is about, from that
-/// defect.
+/// elected, isolating the snapshot mechanism — which is what this test is
+/// about — from election timing. (Historically this was forced: with
+/// `role = "auto"`, a joining node used to take the primary role away from
+/// the incumbent — issue #314, since fixed and pinned by
+/// [`a_joining_node_must_not_steal_an_established_primary`].)
 ///
 /// The two writes straddle the join on purpose: `alpha`/`beta` exist before
 /// the replica is ever started, so only the snapshot can deliver them, while
@@ -691,8 +684,8 @@ async fn a_cold_replica_bootstraps_from_the_primary_snapshot() {
 
 /// A node joining an established cluster must not become the primary.
 ///
-/// **Currently failing — `#[ignore]`d because it documents an open defect,
-/// not a regression.** Remove the attribute once the election is fixed.
+/// **Pins issue #314** (fixed; this test began life `#[ignore]`d as the
+/// executable spec of the defect).
 ///
 /// Observed with a 3-node `role = "auto"` cluster plus a late joiner
 /// (`cdc-node-3`, an empty database):
@@ -705,24 +698,28 @@ async fn a_cold_replica_bootstraps_from_the_primary_snapshot() {
 ///
 /// Two independent causes, both in `ephpm-cluster/src/sqlite_election.rs`:
 ///
-/// 1. `determine_initial_role` runs before gossip has converged.
+/// 1. `determine_initial_role` ran before gossip had converged.
 ///    `should_be_primary` asks `cluster.nodes()`, which at that instant holds
-///    only the local node, so "lowest-ordinal alive node" is trivially true
-///    for *every* freshly started node. It then `publish_claim`s, overwriting
-///    the incumbent's claim in the gossip KV.
-/// 2. `evaluate_role` only re-elects when there is no claim or the claimant
-///    is dead. Faced with a live claim from another node it demotes
-///    unconditionally — so the documented "lowest ordinal wins" rule is not
-///    enforced against an incumbent, and the **last writer** wins instead.
+///    only the local node, so "lowest-ordinal alive node" was trivially true
+///    for *every* freshly started node. It then `publish_claim`ed,
+///    overwriting the incumbent's claim in the gossip KV.
+/// 2. `evaluate_role` only re-elected when there was no claim or the claimant
+///    was dead. Faced with a live claim from another node it demoted
+///    unconditionally — so the documented "lowest ordinal wins" rule was not
+///    enforced against an incumbent, and the **last writer** won instead.
 ///    Here the *highest*-ordinal node took the role from `cdc-node-2`.
 ///
-/// Impact: the cluster re-roots onto an empty database. The joiner believes
-/// it is primary, so it skips `maybe_bootstrap_cold_replica` and never
-/// fetches a snapshot; the nodes that actually hold the data demote and
-/// re-subscribe from `change_id = 0`. Any write accepted by the new
-/// "primary" then diverges the cluster for real.
+/// Impact of the defect: the cluster re-rooted onto an empty database. The
+/// joiner believed it was primary, so it skipped
+/// `maybe_bootstrap_cold_replica` and never fetched a snapshot; the nodes
+/// that actually held the data demoted and re-subscribed from
+/// `change_id = 0`.
+///
+/// The fix: a freshly started node may not publish a *first* primary claim
+/// until a startup grace (> claim TTL + heartbeat) has elapsed, so a live
+/// incumbent's claim always arrives first; and a live-claim conflict is
+/// resolved deterministically (lowest node id) instead of last-writer-wins.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "open defect: a joining node steals the primary role (see the doc comment)"]
 async fn a_joining_node_must_not_steal_an_established_primary() {
     let Some(binary) = binary_or_skip() else { return };
 

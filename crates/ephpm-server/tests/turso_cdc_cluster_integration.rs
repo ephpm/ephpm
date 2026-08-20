@@ -395,22 +395,42 @@ async fn two_node_cross_endpoint_cdc_replication_via_real_election() {
         "cluster did not converge to 2 nodes in 10s"
     );
 
-    // Kick both elections. Lowest-id (`ephpm-a`) will win.
+    // Kick both elections. Lowest-id (`ephpm-a`) will win — but only
+    // AFTER the startup grace: since issue #314, a fresh node never
+    // decides "primary" before gossip has had a chance to deliver an
+    // incumbent's claim, so `determine_initial_role` returns an
+    // unresolved replica here and the election loop claims later.
     let initial_a = node_a.election.determine_initial_role().await;
-    let a_rx = node_a.election.watch_role();
+    let mut a_rx = node_a.election.watch_role();
     let mut b_rx = node_b.election.watch_role();
     tokio::spawn(node_a.election.run());
     tokio::spawn(node_b.election.run());
 
-    // Verify A is primary; wait for B's watcher to observe the
-    // published claim. The election heartbeat is 5s and the initial
-    // determine_initial_role races the peer publish; we wait up to
-    // 20s for gossip to propagate + the election tick to fire on B.
-    assert!(matches!(initial_a, ElectedRole::Primary), "A must be primary, got {initial_a:?}");
+    assert!(
+        matches!(initial_a, ElectedRole::Replica { ref primary_grpc_url } if primary_grpc_url.is_empty()),
+        "a fresh node must not self-elect at startup (issue #314), got {initial_a:?}"
+    );
 
-    let primary_url = wait_for_non_empty_replica_url(&mut b_rx, Duration::from_secs(20))
+    // A promotes itself once the grace (~15s) elapses; wait for it.
+    let a_promoted = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+        loop {
+            if matches!(*a_rx.borrow(), ElectedRole::Primary) {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(250), a_rx.changed()).await;
+        }
+    };
+    assert!(a_promoted, "A (lowest id) must win the election after the startup grace");
+
+    // Wait for B's watcher to observe the published claim. The election
+    // heartbeat is 5s; allow for gossip propagation + B's next tick.
+    let primary_url = wait_for_non_empty_replica_url(&mut b_rx, Duration::from_secs(30))
         .await
-        .expect("B must observe primary URL via election within 20s");
+        .expect("B must observe primary URL via election within 30s");
     assert!(
         primary_url.starts_with("http://"),
         "election KV format regression: expected 'http://addr' scheme, got {primary_url:?}"

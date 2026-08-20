@@ -1379,9 +1379,9 @@ Clustered mode has no separate database-server binary. The primary's Turso engin
 In clustered mode with `role = "auto"`, primary election uses the gossip KV tier. Logic lives in `crates/ephpm-cluster/src/sqlite_election.rs`:
 
 - Each candidate writes its node ordinal to the KV key `kv:sqlite:primary` with a TTL.
-- The lowest-ordinal live node wins.
+- The lowest-ordinal live node wins. A freshly started node defers its first claim behind a startup grace (~15s) so it always sees a live incumbent's claim before self-electing (issue #314), and simultaneous live claims resolve deterministically to the lowest node id.
 - The winner refreshes the key periodically (heartbeat); on failure, the TTL expires and the next-lowest live node takes over.
-- Followers watch the key; when they see a new owner, they reconnect to the new primary's cluster channel address and resume tailing its CDC stream.
+- Followers watch the key; when they see a new owner, they reconnect to the new primary's cluster channel address and resume tailing its CDC stream — with the replication cursor re-scoped to the new primary's per-database CDC log identity (issue #315).
 
 This shares the gossip / KV machinery already used for cross-node KV replication — there's no separate Raft cluster or external coordinator.
 
