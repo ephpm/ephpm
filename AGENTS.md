@@ -221,7 +221,7 @@ Key files:
 - `crates/ephpm-php/ephpm_wrapper.c` — C bridge for all PHP FFI calls (required for setjmp/longjmp safety)
 - `crates/ephpm-php/build.rs` — bindgen configuration and link flags
 - `.github/workflows/ci.yml` — Lint, test, deny checks on every PR
-- `.github/workflows/release.yml` — Tag-triggered release build matrix (PHP 8.4/8.5 × linux-x86_64/macos-aarch64/windows-x86_64), produces tarballs + Docker Hub images
+- `.github/workflows/release.yml` — Tag-triggered release build matrix (PHP 8.4/8.5 × linux-x86_64/macos-aarch64/windows-x86_64), produces tarballs + Docker Hub images, plus an experimental non-gating `build-windows-tailcall` leg (PHP 8.5, clang/TAILCALL VM, `-tailcall` tarball)
 - `.github/workflows/nightly.yml` — Scheduled comprehensive build with the same matrix plus fuzz, E2E, smoke, audit jobs
 
 ## Documentation

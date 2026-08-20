@@ -19,11 +19,18 @@ cargo xtask release 8.4       # → target/release/ephpm (PHP 8.4)
 # The cargo-xwin cross-compile-from-WSL path was REMOVED; `cargo xtask
 # release --target windows` errors out on a non-Windows host.
 cargo xtask release --target windows       # → target/x86_64-pc-windows-msvc/release/ephpm.exe
+
+# Experimental TAILCALL Windows build (PHP 8.5 only): links the clang-cl-built
+# SDK (php-sdk-<ver>-windows-x86_64-clang.tar.gz) whose interpreter is the
+# TAILCALL VM — 1.6-1.7x faster on CPU-bound PHP than the MSVC CALL VM.
+# xtask hard-gates on the SDK's VM kind (disassembles zend_vm_kind, requires
+# ZEND_VM_KIND_TAILCALL) before linking. Same output path as the MSVC exe.
+cargo xtask release --target windows --variant clang
 ```
 
 Prerequisites for `cargo xtask release`: git, curl, tar, `build-essential`, `pkg-config`, and `libclang-dev` (for bindgen). On Linux the build targets the host-default `<arch>-unknown-linux-gnu` triple against the glibc-linked (`-gnu`) `libphp.a` — the resulting binary is a single glibc-dynamic file that can `dlopen()` shared PHP extensions and middleware; no musl toolchain is involved. The xtask downloads only the PHP SDK from `github.com/ephpm/php-sdk` releases — no PHP CLI, Composer, static-php-cli, or sqld binary needed (the Turso engine is a pure-Rust crate compiled into the binary).
 
-The PHP SDK is cached at `php-sdk/<version>-<os>-<arch>[-gnu]/` (the `-gnu` libc suffix applies on Linux, e.g. `php-sdk/8.5.7-linux-x86_64-gnu/`). Delete that directory to force a re-download.
+The PHP SDK is cached at `php-sdk/<version>-<os>-<arch>[-gnu][-clang]/` (the `-gnu` libc suffix applies on Linux, e.g. `php-sdk/8.5.7-linux-x86_64-gnu/`; the `-clang` variant suffix applies to the experimental Windows TAILCALL SDK, e.g. `php-sdk/8.5.7-windows-x86_64-clang/`). Delete that directory to force a re-download.
 
 ## Testing
 

@@ -6,6 +6,12 @@ name: Release
 #       ephpm-vX.Y.Z+php<PHP_FULL>-<os>-<arch>.tar.gz   (one per PHP minor x OS/arch)
 #       SHA256SUMS                                       (covers all archives)
 #
+#   * EXPERIMENTAL, may be absent from a given release (its leg is
+#     non-gating -- see build-windows-tailcall):
+#       ephpm-vX.Y.Z+php8.5.7-windows-x86_64-tailcall.tar.gz
+#         (PHP 8.5 built with clang-cl: the TAILCALL VM instead of MSVC's
+#          CALL VM -- 1.6-1.7x faster on CPU-bound PHP)
+#
 #   * Docker images pushed to Docker Hub at docker.io/ephpm/ephpm:
 #       :vX.Y.Z-php<PHP_FULL>     pinned ephpm release x pinned PHP patch
 #       :vX.Y.Z-php<PHP_MINOR>    pinned ephpm release x rolling PHP minor
@@ -455,6 +461,253 @@ jobs:
           name: ephpm-${{ github.ref_name }}-php${{ matrix.php_full }}-windows-x86_64
           path: ${{ steps.pkg.outputs.archive }}
 
+  # -- Windows TAILCALL binary (EXPERIMENTAL, NON-GATING) ---------------------
+  # PHP 8.5 built with clang-cl so the interpreter is the TAILCALL VM
+  # ([[clang::musttail]] + preserve_none) instead of the slow CALL VM every
+  # MSVC-built PHP falls back to -- measured 1.6-1.7x faster on CPU-bound PHP
+  # through ePHPm, ~3% on the Symfony demo (issue #329). PHP 8.5 only: the
+  # TAILCALL VM does not exist in 8.3/8.4.
+  #
+  # NON-GATING BY DESIGN: the `release` job does NOT `needs:` this job, and
+  # `continue-on-error: true` keeps a red leg from failing the run -- the
+  # release publishes with or without this artifact. Two ways the tarball
+  # reaches the release page:
+  #   1. This job finishes before `Create Release` collects artifacts -> the
+  #      REST collect script picks it up like any other archive and it lands
+  #      in SHA256SUMS.
+  #   2. (The common case -- this job starts only after all three MSVC legs
+  #      finish, which is usually the release's critical path.) The release is
+  #      already published; the final step here attaches the tarball to it and
+  #      appends its hash to SHA256SUMS, best-effort.
+  # If the -clang SDK asset is missing from the php-sdk release, or anything
+  # else fails, the leg goes red and nothing downstream notices.
+  build-windows-tailcall:
+    name: Build (PHP ${{ matrix.php_full }}, windows-x86_64, TAILCALL)
+    if: github.event_name == 'push'
+    # Serialized behind the MSVC Windows legs: one release build per Windows
+    # worker at a time (the v0.5.1 run's concurrent legs took the pool down).
+    # Side effect: if build-windows fails this leg is skipped -- fine, the
+    # release is not publishing in that case anyway.
+    needs: build-windows
+    runs-on: [self-hosted, windows, x64]
+    continue-on-error: true
+    # VS Build Tools install (~20 min on a cold ephemerd VM) + a full
+    # PHP-linked release build. Generous ceiling so a slow fleet day does not
+    # kill an otherwise-good leg; depends on the self-hosted Windows
+    # (ephemerd) fleet being up, same as build-windows.
+    timeout-minutes: 200
+    permissions:
+      # For the best-effort late attach of the tarball to the GitHub release.
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - php_minor: "8.5"
+            php_full: "8.5.7"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        shell: powershell
+        run: |
+          $cargoBin = "$env:USERPROFILE\.cargo\bin"
+          if (-not (Test-Path "$cargoBin\rustup.exe")) {
+            Write-Host "Installing rustup..."
+            Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+            .\rustup-init.exe -y --default-toolchain stable --profile minimal
+            Remove-Item rustup-init.exe
+          }
+          $env:PATH = "$cargoBin;$env:PATH"
+          $cargoBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          & "$cargoBin\rustup.exe" show
+
+      - name: Install Visual Studio Build Tools
+        shell: powershell
+        # Same fresh-VM install as build-windows. The MSVC toolset is still
+        # what links ephpm.exe; only the PHP SDK inside is clang-built
+        # (clang-cl is MSVC-ABI-compatible, so nothing else changes).
+        run: |
+          $installPath = "C:\BuildTools"
+          $msbuild = "$installPath\MSBuild\Current\Bin\MSBuild.exe"
+          if (Test-Path $msbuild) {
+            Write-Host "VS Build Tools already present at $installPath"
+          } else {
+            Write-Host "Downloading VS Build Tools bootstrapper..."
+            Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_buildtools.exe" -OutFile vs_buildtools.exe
+            $proc = Start-Process -FilePath .\vs_buildtools.exe `
+              -ArgumentList @(
+                '--quiet', '--wait', '--norestart', '--nocache',
+                '--installPath', $installPath,
+                '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+                '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang',
+                '--includeRecommended'
+              ) -Wait -PassThru -NoNewWindow
+            Write-Host "Bootstrapper exit code: $($proc.ExitCode)"
+            Remove-Item vs_buildtools.exe
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            while (-not (Test-Path $msbuild) -and $sw.Elapsed.TotalMinutes -lt 20) {
+              Start-Sleep -Seconds 30
+              Write-Host ("  ...waiting for VS install ({0:F0}s)" -f $sw.Elapsed.TotalSeconds)
+            }
+            if (-not (Test-Path $msbuild)) {
+              Write-Host "::error::VS install timed out - $msbuild never appeared"
+              exit 1
+            }
+            Write-Host ("MSBuild.exe found after {0:F0}s" -f $sw.Elapsed.TotalSeconds)
+          }
+
+      - name: Enter MSVC developer environment
+        shell: powershell
+        run: |
+          $vcvars = "C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { Write-Error "vcvars64.bat not found"; exit 1 }
+          $envBefore = @{}
+          foreach ($e in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+            $envBefore[$e.Key] = $e.Value
+          }
+          $cmdLine = 'call "' + $vcvars + '" >NUL & set'
+          $output = & cmd /c $cmdLine
+          foreach ($line in $output) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              if ($envBefore[$matches[1]] -ne $matches[2]) {
+                "$($matches[1])=$($matches[2])" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+              }
+            }
+          }
+          $libclangDir = "C:\BuildTools\VC\Tools\Llvm\x64\bin"
+          if (Test-Path "$libclangDir\libclang.dll") {
+            "LIBCLANG_PATH=$libclangDir" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          } else {
+            Write-Warning "libclang.dll not found at $libclangDir -- bindgen may panic"
+          }
+
+      - name: Compute release version
+        # See build-linux for rationale; strips leading "v" from the git ref.
+        shell: powershell
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $version = $env:REF_NAME -replace '^v',''
+          "EPHPM_RELEASE_VERSION=$version" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+
+      - name: Build ephpm.exe (clang/TAILCALL SDK)
+        shell: powershell
+        env:
+          # Same LTO/stack settings as build-windows -- see its comments.
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          RUST_MIN_STACK: "33554432"
+        # --variant clang downloads php-sdk-<ver>-windows-x86_64-clang.tar.gz
+        # and hard-gates on the SDK's VM kind: xtask disassembles
+        # zend_vm_kind() out of php8embed.lib and requires mov eax,5
+        # (ZEND_VM_KIND_TAILCALL) before linking. A mislabeled CALL-VM SDK
+        # fails the build here rather than shipping under a -tailcall name.
+        run: cargo xtask release ${{ matrix.php_minor }} --target windows --variant clang
+
+      - name: Assert the produced binary is the TAILCALL build
+        shell: powershell
+        env:
+          PHP_FULL: ${{ matrix.php_full }}
+        # Belt over the xtask gate's suspenders, this time on the built exe:
+        # the embedded PHP must report the exact pinned version + ZTS, and the
+        # clang SDK cache dir must be the one the build populated. (The VM
+        # kind itself was proven by the xtask disassembly gate above.)
+        run: |
+          $exe = "target\x86_64-pc-windows-msvc\release\ephpm.exe"
+          if (-not (Test-Path $exe)) { Write-Host "::error::$exe not found"; exit 1 }
+          $v = (& $exe php -v) -join "`n"
+          Write-Host $v
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::ephpm php -v exited $LASTEXITCODE"; exit 1 }
+          if ($v -notmatch [regex]::Escape("PHP $env:PHP_FULL")) {
+            Write-Host "::error::embedded PHP is not $env:PHP_FULL"; exit 1
+          }
+          if ($v -notmatch 'ZTS') { Write-Host "::error::embedded PHP is not a ZTS build"; exit 1 }
+          $clangLib = "php-sdk\$env:PHP_FULL-windows-x86_64-clang\lib\php8embed.lib"
+          if (-not (Test-Path $clangLib)) {
+            Write-Host "::error::clang SDK cache $clangLib missing -- wrong SDK linked?"; exit 1
+          }
+          Write-Host "==> TAILCALL build asserted: PHP $env:PHP_FULL ZTS, clang SDK cache present"
+
+      - name: Package archive
+        id: pkg
+        shell: powershell
+        env:
+          VERSION: ${{ github.ref_name }}
+          PHP_FULL: ${{ matrix.php_full }}
+        # The artifact name says what the binary IS (-tailcall: the TAILCALL
+        # VM), not how it is built (clang) -- consumers care about the former.
+        run: |
+          $name = "ephpm-$env:VERSION+php$env:PHP_FULL-windows-x86_64-tailcall"
+          $stage = "dist\$name"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\ephpm.exe "$stage\ephpm.exe"
+          Copy-Item LICENSE "$stage\LICENSE"
+          Copy-Item .github\release-readme.txt "$stage\README.txt"
+          tar -C dist -czf "dist\$name.tar.gz" $name
+          Remove-Item -Recurse -Force $stage
+          "archive=dist/$name.tar.gz" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+          "archive_name=$name.tar.gz" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-${{ github.ref_name }}-php${{ matrix.php_full }}-windows-x86_64-tailcall
+          path: ${{ steps.pkg.outputs.archive }}
+
+      - name: Attach to the GitHub release if it already exists (best effort)
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          ARCHIVE: ${{ steps.pkg.outputs.archive }}
+          ARCHIVE_NAME: ${{ steps.pkg.outputs.archive_name }}
+        # This leg usually finishes AFTER `Create Release` (it queues behind
+        # all three MSVC legs on the same serialized worker pool), so the
+        # normal artifact-collect path misses it. If the release for this tag
+        # is already published, attach the tarball and append its hash to
+        # SHA256SUMS via the REST API. If the release does not exist yet, do
+        # nothing: we finished early enough that the collect script will pick
+        # the workflow artifact up. Never fails the job -- the artifact also
+        # remains downloadable from the workflow run either way.
+        run: |
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+          try {
+            $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:REPO/releases/tags/$env:TAG" -Headers $headers
+          } catch {
+            Write-Host "==> Release for $env:TAG not published yet -- the Create Release job will collect the workflow artifact instead."
+            exit 0
+          }
+          try {
+            # Drop any stale same-named asset (e.g. a rerun of this leg).
+            $rel.assets | Where-Object { $_.name -eq $env:ARCHIVE_NAME } | ForEach-Object {
+              Invoke-RestMethod -Method Delete -Uri "https://api.github.com/repos/$env:REPO/releases/assets/$($_.id)" -Headers $headers | Out-Null
+            }
+            $uploadUrl = ($rel.upload_url -replace '\{.*\}$','') + "?name=$([uri]::EscapeDataString($env:ARCHIVE_NAME))"
+            Invoke-RestMethod -Method Post -Uri $uploadUrl -Headers ($headers + @{ "Content-Type" = "application/gzip" }) -InFile $env:ARCHIVE | Out-Null
+            Write-Host "==> Attached $env:ARCHIVE_NAME to release $env:TAG"
+
+            # Append our line to SHA256SUMS (same `<sha256>  <name>` shape as
+            # `sha256sum`, sorted) and replace the asset.
+            $hash = (Get-FileHash -Algorithm SHA256 $env:ARCHIVE).Hash.ToLower()
+            $sums = $rel.assets | Where-Object { $_.name -eq 'SHA256SUMS' } | Select-Object -First 1
+            $lines = @()
+            if ($sums) {
+              $raw = Invoke-RestMethod -Uri "https://api.github.com/repos/$env:REPO/releases/assets/$($sums.id)" -Headers @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/octet-stream" }
+              $lines = ($raw -split "`n") | Where-Object { $_.Trim() -ne '' -and ($_ -notmatch [regex]::Escape($env:ARCHIVE_NAME)) }
+              Invoke-RestMethod -Method Delete -Uri "https://api.github.com/repos/$env:REPO/releases/assets/$($sums.id)" -Headers $headers | Out-Null
+            }
+            $lines += "$hash  $env:ARCHIVE_NAME"
+            $content = (($lines | Sort-Object) -join "`n") + "`n"
+            $tmp = "SHA256SUMS.tailcall"
+            [System.IO.File]::WriteAllText("$PWD\$tmp", $content)
+            $sumsUrl = ($rel.upload_url -replace '\{.*\}$','') + "?name=SHA256SUMS"
+            Invoke-RestMethod -Method Post -Uri $sumsUrl -Headers ($headers + @{ "Content-Type" = "text/plain" }) -InFile "$PWD\$tmp" | Out-Null
+            Write-Host "==> SHA256SUMS updated with $hash  $env:ARCHIVE_NAME"
+          } catch {
+            Write-Host "::warning::best-effort release attach failed: $($_.Exception.Message)"
+            exit 0
+          }
+
   # -- Docker images on Docker Hub --------------------------------------------
   docker-image:
     name: Docker (PHP ${{ matrix.php_full }})
@@ -555,7 +808,9 @@ jobs:
       # Side benefit: the classic path produces no ".dockerbuild" build-record
       # artifact at all, so the DOCKER_BUILD_RECORD_UPLOAD/DOCKER_BUILD_SUMMARY
       # opt-outs this step used to carry are moot -- the Create Release job's
-      # artifact download stays at the 12 binary archives it expects.
+      # artifact download stays at just the binary archives it expects (the 12
+      # gating ones, plus the optional windows-tailcall archive if that leg
+      # finished in time).
       - name: Build and push image
         env:
           TAGS: ${{ steps.tags.outputs.tags }}
@@ -624,6 +879,11 @@ jobs:
   # -- Release: gather archives, hash them, attach to the GitHub release ------
   release:
     name: Create Release
+    # build-windows-tailcall is deliberately ABSENT from `needs`: it is an
+    # experimental, non-gating leg and the release must publish with or
+    # without its artifact (which self-attaches late when it lands after
+    # this job -- see that job's comments). Do not add it here until the
+    # TAILCALL artifact is promoted to a supported, gating deliverable.
     needs: [build-linux, build-linux-arm64, build-macos, build-windows, docker-image]
     # `!cancelled()` overrides the default "skip when a dependency was skipped"
     # so the republish path (where the four binary legs are intentionally
