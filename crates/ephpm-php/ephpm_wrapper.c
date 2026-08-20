@@ -5031,6 +5031,79 @@ static int cli_process_stdin_lines(
     return result;
 }
 
+/*
+ * End the CLI request exactly as php-cli's do_cli() does at its `out:` label
+ * (sapi/cli/php_cli.c): run php_request_shutdown() while the CLI stdout
+ * ub_write is still installed, and (re)read the exit status from
+ * EG(exit_status) AFTERWARDS.
+ *
+ * php_request_shutdown() is what fires PHP's end-of-request userland
+ * machinery, in its documented order: registered shutdown functions first
+ * (registration order, including ones registered during shutdown), then
+ * end-of-script object destructors (zend_call_destructors), then the output
+ * flush. This CLI used to skip the call entirely and leave the request for
+ * php_embed_shutdown() at process exit — by which point cli_end() had
+ * restored the HTTP capture ub_write and the exit code had been captured, so
+ * shutdown functions and destructors ran invisibly and exit() inside a
+ * shutdown function could not set the status (issue #334).
+ *
+ * exit() inside a shutdown function throws/longjmps again (a nested
+ * bailout). php_request_shutdown() guards each phase with its own zend_try
+ * internally, but a bailout must never escape into the CLI teardown with the
+ * request half torn down, so the call carries a guard of its own — the role
+ * php-cli's zend_first_try in main() plays.
+ *
+ * Exit-status contract (verified against php-cli 8.5.4): do_cli returns
+ * EG(exit_status) read after request shutdown, so exit(N) in a shutdown
+ * function overrides even the script's own exit() — including exit(0)
+ * clearing a nonzero status. When shutdown did NOT change EG(exit_status),
+ * the pre-shutdown `result` is kept; that preserves the two statuses that
+ * live outside EG(exit_status) in this CLI: the lint-failure 255 from
+ * cli_scan_protected and the bailed-with-status-0 → 1 fallback (#317/#321).
+ * (php-cli 8.5 keeps those inside EG(exit_status), so the pre/post
+ * comparison is observably identical to its unconditional read.)
+ *
+ * Finally, the embed lifecycle expects one active request when
+ * php_embed_shutdown() runs (it unconditionally calls php_request_shutdown),
+ * so a fresh, empty request is started before returning — the same
+ * shutdown→startup pairing ephpm_execute_request uses per HTTP request.
+ * $argv/$argc in SG(request_info) are cleared first so nothing in the
+ * throwaway request (or its eventual teardown, which outlives the caller's
+ * argv memory) ever reads the CLI argv pointers again. It runs no user code
+ * and produces no output; the capture ub_write restored by cli_end() would
+ * swallow anything it did produce.
+ */
+static int cli_shutdown_request(int result)
+{
+    int pre_status = (int)EG(exit_status);
+
+    zend_try {
+        php_request_shutdown(NULL);
+    } zend_catch {
+        /* A bailout escaped php_request_shutdown's internal phase guards;
+         * the request is as torn down as it will get — carry on so the
+         * exit status is still captured and cli_end() still runs. */
+    } zend_end_try();
+
+    int post_status = (int)EG(exit_status);
+    if (post_status != pre_status) {
+        result = post_status;
+    }
+
+    /* Restore the embed invariant: one active request left open for
+     * php_embed_shutdown() to close at process exit. If startup fails
+     * there is nothing to recover — the process is about to exit. */
+    SG(request_info).argc = 0;
+    SG(request_info).argv = NULL;
+    if (php_request_startup() == SUCCESS) {
+        SG(headers_sent) = 1;
+        SG(request_info).no_headers = 1;
+        EG(max_allowed_stack_size) = 0;
+    }
+
+    return result;
+}
+
 /* PHP CLI option table — matches the real PHP CLI SAPI options.
  * Used by php_getopt() to parse argc/argv. */
 static const opt_struct cli_options[] = {
@@ -5390,33 +5463,32 @@ int ephpm_cli_main(int argc, char **argv)
     CG(skip_shebang) = 1;
 
     /* Execute based on mode */
+    cli_begin(&orig_ub_write);
     if (want_lines) {
         /* -B/-R/-F/-E awk-like stdin line processor */
-        cli_begin(&orig_ub_write);
         result = cli_process_stdin_lines(begin_code, line_code, line_file, end_code);
-        php_output_end_all();
-        cli_end(orig_ub_write);
     } else if (mode == 'r' && exec_direct) {
         /* -r "code" */
-        cli_begin(&orig_ub_write);
         result = cli_eval_protected(exec_direct, "Command line code");
-        cli_end(orig_ub_write);
     } else if (mode == 'l' || mode == 'w' || mode == 's') {
         /* -l (lint), -w (strip), -s (highlight): a named file, or the
          * program on stdin when none was named. */
-        cli_begin(&orig_ub_write);
         result = cli_scan_protected(mode, script_file, php_self);
-        php_output_end_all();
-        cli_end(orig_ub_write);
     } else {
         /* Standard mode: execute a named script, or the program read from
          * stdin (`ephpm php < file.php`, `… | ephpm php`). Both compile from
          * a FILE*-backed handle, so `<?php` tags, $argv[0] and file
          * semantics match php-cli — unlike -r, which is raw code. */
-        cli_begin(&orig_ub_write);
         result = cli_execute_script_protected(script_file);
-        cli_end(orig_ub_write);
     }
+
+    /* php-cli parity (#334): request shutdown — user shutdown functions,
+     * then destructors, then the output flush (which also ends any output
+     * buffers the mode left open) — runs BEFORE the stdout ub_write is torn
+     * down, and the exit status is re-read afterwards so exit() inside a
+     * shutdown function sets it. See cli_shutdown_request. */
+    result = cli_shutdown_request(result);
+    cli_end(orig_ub_write);
 
     return result;
 }
