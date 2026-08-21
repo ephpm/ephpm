@@ -246,7 +246,13 @@ impl WorkerPool {
         // spawn failure below, and by worker_main on normal exit.
         pool.state.live.fetch_add(1, Ordering::AcqRel);
 
-        let builder = std::thread::Builder::new().name(format!("ephpm-worker-{worker_id}"));
+        // An explicit stack size, not Rust's 2 MiB default: PHP's C-stack guard
+        // bounds recursion at this thread's stack, so the size is what decides
+        // how deep a nested render may go before PHP raises `Maximum call stack
+        // size ... reached`. `PHP_THREAD_STACK` matches php-fpm (#116).
+        let builder = std::thread::Builder::new()
+            .name(format!("ephpm-worker-{worker_id}"))
+            .stack_size(ephpm_php::PHP_THREAD_STACK);
         let spawn_result = builder.spawn(move || {
             worker_main(&pool, worker_id, &rx, &script, max_requests, boot_timeout);
         });

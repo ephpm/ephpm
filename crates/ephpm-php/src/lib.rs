@@ -18,6 +18,32 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use request::PhpRequest;
 use response::PhpResponse;
 
+/// Stack size, in bytes, for every OS thread that is allowed to execute PHP.
+///
+/// PHP 8.3+ guards its own C stack: `zend_call_stack_init()` reads the running
+/// thread's real bounds at request startup and the VM raises the catchable
+/// `Error: Maximum call stack size of N bytes ... reached` before the guard page
+/// is hit. **N is the thread's stack**, so the thread's size directly sets how
+/// deep a PHP program may recurse through internal functions (`array_map`,
+/// `preg_replace_callback`, `call_user_func_array` — the re-entry shape a
+/// template/block renderer produces once per nesting level).
+///
+/// Rust's default thread stack (and tokio's) is 2 MiB; stock `php-fpm` and
+/// `php-cli` run on the process main thread, which is `ulimit -s` — 8 MiB on
+/// every mainstream Linux and macOS. Leaving the default would have made ePHPm
+/// fatal at roughly a quarter of the recursion depth the same code survives
+/// under php-fpm, i.e. traded a crash for a spurious error. 8 MiB restores
+/// parity.
+///
+/// This is *reserved* address space, not resident memory — thread stacks are
+/// committed lazily a page at a time on every platform ePHPm targets, so the
+/// cost of a raised ceiling is virtual address space, which is free on 64-bit.
+///
+/// Applied in three places, all of which run PHP: the tokio runtime's threads
+/// (`ephpm`'s `main`), the dedicated FPM pool (`ephpm-server`'s `fpm_pool`), and
+/// the worker pool (`ephpm-server`'s `worker_pool`).
+pub const PHP_THREAD_STACK: usize = 8 * 1024 * 1024;
+
 // When PHP_SDK_PATH is set at build time, build.rs enables the `php_linked` cfg
 // and generates FFI bindings. This module includes them.
 #[cfg(php_linked)]
@@ -42,9 +68,6 @@ mod ffi {
         /// Must be called after `ephpm_install_sapi()` so HTTP requests
         /// start from a clean state.
         pub fn ephpm_finalize_init();
-
-        /// Apply INI settings (disable stack size checking).
-        pub fn ephpm_apply_ini_settings() -> ::std::os::raw::c_int;
 
         /// Set a PHP INI directive for the current request.
         pub fn ephpm_request_set_ini(
@@ -657,10 +680,6 @@ impl PhpRuntime {
             // Install our custom SAPI callbacks (ub_write, read_post, etc.)
             // Safety: Must be called after php_embed_init, before any requests.
             unsafe { ffi::ephpm_install_sapi() };
-
-            // Apply INI settings (disable stack size checking for tokio threads)
-            // Safety: Must be called after php_embed_init.
-            unsafe { ffi::ephpm_apply_ini_settings() };
 
             tracing::info!("PHP runtime initialized (libphp linked)");
         }
@@ -1753,6 +1772,39 @@ mod tests {
     }
 
     const NO_DEFINES: Vec<String> = Vec::new();
+
+    /// Issue #116: the PHP thread stack is a *behavioural* constant, not a
+    /// tuning preference — PHP's C-stack guard derives its
+    /// `Maximum call stack size of N bytes` ceiling from it, so lowering it
+    /// lowers the recursion depth a template or block renderer may reach.
+    ///
+    /// 8 MiB is the stock `ulimit -s` a `php-fpm` worker runs on, and the two
+    /// e2e assertions in `ephpm-e2e/tests/errors.rs` are calibrated against it
+    /// (5 000 levels must complete; 60 000 must not). A change here without a
+    /// matching change there silently moves the ceiling, so pin it.
+    #[test]
+    fn php_thread_stack_matches_stock_php() {
+        assert_eq!(
+            PHP_THREAD_STACK,
+            8 * 1024 * 1024,
+            "PHP threads must get a stock php-fpm-sized stack; if this is \
+             deliberate, re-calibrate ephpm-e2e/tests/errors.rs (issue #116)"
+        );
+    }
+
+    /// The constant is only worth anything if the platform honours it. Spawn a
+    /// thread the same way the pools do and prove it comes back — a rejected
+    /// `stack_size` would surface here rather than as a mysteriously shallow
+    /// recursion ceiling in production.
+    #[test]
+    fn php_thread_stack_is_accepted_by_the_platform() {
+        let handle = std::thread::Builder::new()
+            .name("ephpm-stack-probe".into())
+            .stack_size(PHP_THREAD_STACK)
+            .spawn(|| 0xefefu16)
+            .expect("a thread with a stock-PHP-sized stack must be spawnable");
+        assert_eq!(handle.join().expect("probe thread panicked"), 0xefef);
+    }
 
     #[test]
     fn precscan_no_ini_flags() {

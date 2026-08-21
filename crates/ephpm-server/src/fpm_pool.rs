@@ -427,7 +427,12 @@ impl FpmPool {
         // failure below, and by thread_main on every exit path.
         pool.state.live.fetch_add(1, Ordering::AcqRel);
 
-        let builder = std::thread::Builder::new().name(format!("ephpm-fpm-{thread_id}"));
+        // Explicit stack size — see `ephpm_php::PHP_THREAD_STACK`. PHP's own
+        // C-stack guard is bounded by the running thread's stack, so this is
+        // what makes the pool's recursion ceiling match php-fpm's (#116).
+        let builder = std::thread::Builder::new()
+            .name(format!("ephpm-fpm-{thread_id}"))
+            .stack_size(ephpm_php::PHP_THREAD_STACK);
         let spawn_result = builder.spawn(move || {
             thread_main(&pool, thread_id, &rx);
         });

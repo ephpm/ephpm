@@ -121,3 +121,86 @@ async fn php_syntax_error_returns_500() {
     assert_fatal_returns_500_and_server_recovers(&url, "syntax_error").await;
     assert_server_still_alive(&base_url, "syntax_error").await;
 }
+
+/// Runaway recursion through an internal function must be a per-request fatal,
+/// not a process kill (issue #116).
+///
+/// This is the strongest test in the suite, because it is the one failure mode
+/// where the *server* — not the request — used to lose. ePHPm overrode PHP's
+/// `zend_call_stack_init()` with a no-op on Linux, which left `EG(stack_limit)`
+/// NULL and PHP's C-stack overflow guard permanently disabled. A
+/// `do_blocks()`-shaped render (`array_map` / `preg_replace_callback` /
+/// `apply_filters` re-entering userland once per nesting level, one C frame
+/// each) then ran off the end of the thread stack and SIGSEGV'd, aborting the
+/// whole process and every other tenant's in-flight request with it.
+///
+/// A regression therefore does NOT show up as a wrong status code — it shows up
+/// as a transport error here and cascading failures in every other suite, which
+/// is why both the crash request and the recovery check assert on their own.
+#[tokio::test]
+async fn deep_recursion_returns_500_and_the_server_survives() {
+    let base_url = required_env("EPHPM_URL");
+    // ~6x the measured ceiling (see `moderate_recursion_still_completes`), deep
+    // enough that no plausible per-frame cost lets it through, shallow enough
+    // that PHP can still render the resulting stack trace quickly.
+    let url = format!("{base_url}/deep_recursion.php?depth=60000");
+
+    let resp = reqwest::get(&url).await.unwrap_or_else(|e| {
+        panic!(
+            "GET {url} failed: {e} — a transport error here means the SERVER DIED: \
+             PHP's C-stack guard is disabled again and the overflow was a SIGSEGV, \
+             not a fatal (issue #116)"
+        )
+    });
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+
+    assert_eq!(
+        status, 500,
+        "runaway recursion must be answered 500 (PHP raises `Maximum call stack size \
+         ... reached`); body was: {body}"
+    );
+    assert!(
+        !body.contains("survived depth="),
+        "the fixture must actually exhaust the stack — if it completed, the depth is \
+         no longer deep enough to prove anything; body: {body}"
+    );
+
+    assert_server_still_alive(&base_url, "deep_recursion").await;
+}
+
+/// The companion to the test above: the ceiling PHP enforces must be roughly
+/// php-fpm's, not a quarter of it.
+///
+/// Restoring the stack guard without also sizing the PHP threads would have
+/// swapped a crash for a spurious `Maximum call stack size` on code that php-fpm
+/// runs happily — a regression dressed as a fix. ePHPm gives every
+/// PHP-executing thread `ephpm_php::PHP_THREAD_STACK` (8 MiB, matching a stock
+/// `ulimit -s` main thread).
+///
+/// The depth is chosen from a measured sweep of this fixture (PHP 8.5.7 ZTS,
+/// x86-64): it completes to ~10 000 levels on an 8 MiB stack and fatals by
+/// 12 000, so the ceiling is ~750 bytes of C stack per level. 5 000 therefore
+/// sits at roughly half the 8 MiB ceiling — comfortable margin for a different
+/// PHP minor or VM — while still being about twice the ~2 600-level ceiling a
+/// 2 MiB thread would have. That is what makes this a real assertion about the
+/// thread stack size rather than a tautology.
+#[tokio::test]
+async fn moderate_recursion_still_completes() {
+    let base_url = required_env("EPHPM_URL");
+    let url = format!("{base_url}/deep_recursion.php?depth=5000");
+
+    let resp = reqwest::get(&url).await.unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+
+    assert_eq!(
+        status, 200,
+        "5 000 levels fits in a php-fpm-sized stack; a 500 here means PHP threads \
+         were left on Rust's 2 MiB default (issue #116). Body: {body}"
+    );
+    assert!(
+        body.contains("survived depth=5000"),
+        "the render must complete and report its depth; body: {body}"
+    );
+}

@@ -23,7 +23,9 @@
 //!   completed, so the client cannot read a truncated download as a success
 //! - worker_max_requests recycle
 //! - issue #116: a `do_blocks()`-shaped nested render never recycles a worker,
-//!   and renders byte-identically on every request of a worker's life
+//!   and renders byte-identically on every request of a worker's life; the same
+//!   render taken past the C-stack ceiling costs at most that one worker (500 +
+//!   recycle) instead of the process, and is catchable in userland
 //! - `exit()` mid-request delivers the request's output and leaves the server
 //!   serving
 //!
@@ -377,6 +379,106 @@ async fn nested_block_render_never_recycles_the_worker() {
         assert_eq!(status, 200, "post-render request {i} failed: {body}");
         assert!(body.contains("hello /after-blocks-"), "post-render body wrong: {body}");
     }
+}
+
+/// Issue #116, the crash half: a render nested past the C-stack ceiling must
+/// cost at most the worker that ran it — never the process.
+///
+/// `nested_block_render_never_recycles_the_worker` above proves a *reasonable*
+/// nesting depth is fine. This proves the cliff on the other side of it is a
+/// cliff and not a crater. ePHPm used to override PHP's `zend_call_stack_init()`
+/// with a no-op on Linux, leaving `EG(stack_limit)` NULL and PHP's C-stack
+/// overflow guard permanently off; a deep enough `do_blocks()`-shaped render
+/// then SIGSEGV'd the worker thread and aborted the whole server. With the guard
+/// restored, PHP raises `Error: Maximum call stack size ... reached` — an
+/// ordinary uncatchable-at-engine-level fatal, so: 500, worker recycled, pool
+/// still serving.
+///
+/// A regression shows up as a transport error, not a status mismatch: there is
+/// no server left to answer. The assertion messages say so, because a bare
+/// "connection refused" in CI is otherwise very hard to attribute.
+#[tokio::test]
+async fn deep_recursion_costs_a_worker_not_the_process() {
+    let Some(base) = worker_url() else {
+        eprintln!("EPHPM_WORKER_URL unset — skipping worker-mode deep-recursion test");
+        return;
+    };
+
+    // Prove the pool is healthy first, so a failure below cannot be blamed on a
+    // node that never came up.
+    let (status, body) = get(&base, "/pre-deep").await;
+    assert_eq!(status, 200, "the worker pool must be healthy before the overflow: {body}");
+
+    let url = format!("{base}/deep?__deep=60000");
+    let resp = reqwest::get(&url).await.unwrap_or_else(|e| {
+        panic!(
+            "GET {url} failed: {e} — a transport error here means the SERVER DIED. \
+             PHP's C-stack guard is disabled again, so the overflow was a SIGSEGV \
+             rather than a fatal (issue #116)"
+        )
+    });
+    let status = resp.status().as_u16();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 500,
+        "an overflowing render must be answered 500, not 200 and not a dropped \
+         connection; body: {body}"
+    );
+    assert!(
+        !body.contains("deep-survived"),
+        "the fixture must actually exhaust the stack — if it completed, the depth no \
+         longer proves anything; body: {body}"
+    );
+
+    // The whole point: the pool is still there and still serving.
+    for i in 0..10 {
+        let (status, body) = get(&base, &format!("/post-deep-{i}")).await;
+        assert_eq!(
+            status, 200,
+            "request {i} after the overflow must succeed — the pool has to replace the \
+             worker that died, not lose the process: {body}"
+        );
+        assert!(body.contains("hello /post-deep-"), "post-overflow body wrong: {body}");
+    }
+}
+
+/// The overflow arrives as a *catchable* `Error`, so a worker that handles it
+/// keeps serving without a recycle at all.
+///
+/// This is the strongest statement of the fix and the one that maps directly to
+/// issue #116's acceptance criterion ("the worker survives and serves the next
+/// request"): the fault is back inside PHP's own error model, where an adapter
+/// can turn a runaway template into a 500 page and carry on. Nothing in ePHPm's
+/// engine can offer that for a real SIGSEGV.
+#[tokio::test]
+async fn a_caught_overflow_leaves_the_worker_booted() {
+    let Some(base) = worker_url() else {
+        eprintln!("EPHPM_WORKER_URL unset — skipping worker-mode caught-overflow test");
+        return;
+    };
+
+    let recycles_before = worker_recycles(&base).await;
+
+    let (status, body) = get(&base, "/deep-caught?__deep=60000&catch=1").await;
+    assert_eq!(status, 200, "a caught overflow is an ordinary handled request: {body}");
+    assert!(
+        body.contains("deep-caught Error:"),
+        "the overflow must surface as a catchable Error (PHP's `Maximum call stack \
+         size ... reached`), not as a crash; body: {body}"
+    );
+    assert!(
+        body.contains("Maximum call stack size"),
+        "the Error must be PHP's stack-limit one, not some other failure that happens \
+         to be catchable; body: {body}"
+    );
+
+    // Catching it means the worker never left its loop, so nothing recycled.
+    let recycles_after = worker_recycles(&base).await;
+    assert!(
+        recycles_after <= recycles_before,
+        "catching the overflow still cost {} worker(s) — the Error escaped the handler",
+        recycles_after - recycles_before
+    );
 }
 
 /// `exit()` mid-request must deliver that request's output — including bytes

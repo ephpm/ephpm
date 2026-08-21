@@ -18,11 +18,16 @@
 header('Content-Type: text/plain');
 
 // Deep enough to blow a thread stack with margin (the recursion needs well
-// under 100 bytes per node, and pool threads get Rust's 2 MiB default), while
-// staying far below any sane memory_limit — a memory bailout would ALSO produce
-// a 500 and would silently pass a test that meant to prove containment.
-// Overridable so the threshold can be probed by hand.
-$depth = (int) ($_GET['depth'] ?? 200000);
+// under 100 bytes per node, and pool threads get ephpm_php::PHP_THREAD_STACK =
+// 8 MiB), while staying far below any sane memory_limit — a memory bailout
+// would ALSO produce a 500 and would silently pass a test that meant to prove
+// containment. Overridable so the threshold can be probed by hand.
+//
+// NOTE: this fixture targets the destructor-cascade class specifically, which
+// PHP's own C-stack guard cannot see (no VM / zend_call_function checkpoint
+// runs between zend_object_std_dtor frames). Runaway *recursion* is a different
+// class and is now caught by PHP itself — see deep_recursion.php.
+$depth = (int) ($_GET['depth'] ?? 400000);
 $depth = max(1000, min($depth, 5000000));
 
 final class EphpmCrashNode
