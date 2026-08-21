@@ -178,13 +178,13 @@ async fn deep_recursion_returns_500_and_the_server_survives() {
 /// PHP-executing thread `ephpm_php::PHP_THREAD_STACK` (8 MiB, matching a stock
 /// `ulimit -s` main thread).
 ///
-/// The depth is chosen from a measured sweep of this fixture (PHP 8.5.7 ZTS,
-/// x86-64): it completes to ~10 000 levels on an 8 MiB stack and fatals by
-/// 12 000, so the ceiling is ~750 bytes of C stack per level. 5 000 therefore
-/// sits at roughly half the 8 MiB ceiling — comfortable margin for a different
-/// PHP minor or VM — while still being about twice the ~2 600-level ceiling a
-/// 2 MiB thread would have. That is what makes this a real assertion about the
-/// thread stack size rather than a tautology.
+/// The depth is chosen from a measured sweep of this fixture on an 8 MiB stack,
+/// x86-64: 11 000 levels complete and 13 000 fatal, on **PHP 8.3.31 and 8.5.7
+/// alike** (the ceiling is ~750 bytes of C stack per level, and it did not move
+/// between those minors — so a per-minor recalibration is not expected). 5 000
+/// therefore sits at well under half the ceiling, while still being about twice
+/// the ~2 800-level ceiling a 2 MiB thread would have. That gap is what makes
+/// this a real assertion about the thread stack size rather than a tautology.
 #[tokio::test]
 async fn moderate_recursion_still_completes() {
     let base_url = required_env("EPHPM_URL");
