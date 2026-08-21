@@ -4452,6 +4452,61 @@ void ephpm_cli_set_no_ini(void)
     php_embed_module.php_ini_ignore_cwd = 1;
 }
 
+/* ===== CLI PHP_BINARY (issue #339) =====
+ *
+ * php_module_startup() calls php_binary_init(), which fills PG(php_binary) —
+ * the value the PHP_BINARY constant is registered from. On Windows that
+ * function asks the OS (GetModuleFileName) and so has always been right here.
+ * On every other platform it reads sapi_module.executable_location and, when
+ * that has no '/' in it, searches PATH for a matching executable.
+ *
+ * That is precisely why PHP_BINARY was "" on Linux/macOS: php_embed_init()
+ * assigns `php_embed_module.executable_location = argv[0]`
+ * (sapi/embed/php_embed.c), and ePHPm hands it the bare string "ephpm" — so
+ * php_binary_init() went hunting on PATH for something called "ephpm",
+ * usually found nothing, and left PG(php_binary) NULL. The field was never
+ * unset; it was set to a name that cannot be resolved.
+ *
+ * So the value cannot be installed before php_embed_init() — embed overwrites
+ * it — and cannot be installed after, since php_module_startup() has already
+ * struct-copied the module (`sapi_module = *sf`) and called php_binary_init().
+ * The one window is inside ephpm_module_startup(), our startup shim, just
+ * before it hands off to php_module_startup(); see the assignment there.
+ *
+ * The stored value is an already-resolved absolute path (Rust's
+ * std::env::current_exe()) rather than an argv[0]-style name: `ephpm php` is
+ * reached through a subcommand, so resolving a bare "ephpm" against PATH would
+ * find *some* ephpm rather than *this* one. php_binary_init() still realpath()s
+ * it and requires it to be executable, so a bad path degrades to the old ""
+ * rather than to a lie.
+ *
+ * Left NULL in server mode (only the CLI path calls the setter), so
+ * `ephpm serve` keeps its current PHP_BINARY behavior exactly.
+ *
+ * Owned for the process lifetime: sapi_module holds the pointer, exactly as
+ * php-cli's own value (argv[0]) outlives startup.
+ */
+static char *cli_executable_location = NULL;
+
+/*
+ * Record the running executable's path for PHP_BINARY. Must be called BEFORE
+ * php_embed_init() — ephpm_module_startup() consumes it during module startup.
+ * The string is copied immediately; the caller's pointer need not outlive the
+ * call.
+ */
+void ephpm_cli_set_executable_location(const char *path)
+{
+    if (!path || !*path) {
+        return;
+    }
+    char *copy = ephpm_strdup_malloc(path);
+    if (!copy) {
+        return;
+    }
+    free(cli_executable_location);
+    cli_executable_location = copy;
+}
+
 /* ===== CLI `-d` directives (startup-time, issue #331) =====
  *
  * php-cli applies `-d name[=value]` by appending "name=value\n" lines to
@@ -4580,6 +4635,17 @@ static int ephpm_module_startup(sapi_module_struct *sm)
      * SAPI identity promises them, but a web request must never see them
      * (php-fpm has its own fastcgi_* equivalents; ours reports "ephpm"). */
     sm->additional_functions = g_cli_mode ? ephpm_cli_functions : ephpm_kv_functions;
+
+    /* PHP_BINARY (issue #339). This is the only window: php_embed_init() has
+     * just overwritten executable_location with argv[0] ("ephpm" — a bare name
+     * php_binary_init() would fruitlessly hunt for on PATH), and
+     * php_module_startup() below both struct-copies *sm into sapi_module and
+     * calls php_binary_init(). NULL outside `ephpm php`, so the server's
+     * PHP_BINARY is unchanged. See the ephpm_cli_set_executable_location
+     * block for the full derivation. */
+    if (cli_executable_location) {
+        sm->executable_location = cli_executable_location;
+    }
 
     /* Splice CLI `-d` directives into the SAPI's startup ini (issue #331).
      * php_embed_init() has just set sm->ini_entries to the embed SAPI's
@@ -4784,6 +4850,25 @@ static void cli_register_argv(
 
     zend_is_auto_global_str("_SERVER", sizeof("_SERVER") - 1);
     zval *server = &PG(http_globals)[TRACK_VARS_SERVER];
+
+    /* php-cli's sapi_cli_register_variables() imports the whole process
+     * environment into $_SERVER first (its default variables_order is EGPCS,
+     * and the "S" of a CLI process is its environment), then layers the
+     * script-identity keys on top. Composer, PHPUnit and friends read
+     * $_SERVER['HOME'] / $_SERVER['PATH'] / $_SERVER['APPDATA'] directly, so
+     * without this they see nothing (issue #338).
+     *
+     * Deliberately done HERE — on the CLI-only path — and not in
+     * ephpm_sapi_register_server_variables(): in serve mode $_SERVER is
+     * per-request and multi-tenant, and the process environment holds
+     * cross-tenant material (see the site-key/credential model in
+     * ephpm-server). It must never leak into a web request's $_SERVER.
+     * Ordering matches php-cli: environment first, so the explicit keys
+     * below win over any same-named environment variable. */
+    if (Z_TYPE_P(server) == IS_ARRAY) {
+        php_import_environment_variables(server);
+    }
+
     php_build_argv(NULL, Z_TYPE_P(server) == IS_ARRAY ? server : NULL);
 
     if (Z_TYPE_P(server) == IS_ARRAY) {
@@ -4805,6 +4890,15 @@ static void cli_register_argv(
             zend_hash_str_update(
                 Z_ARRVAL_P(server), file_keys[i], strlen(file_keys[i]), &tmp);
         }
+
+        /* php-cli registers DOCUMENT_ROOT as an empty string ("just make it
+         * available", sapi/cli/php_cli.c) — there is no document root in CLI
+         * mode, but code that reads the key unconditionally must not warn
+         * (issue #338). */
+        zval docroot;
+        ZVAL_EMPTY_STRING(&docroot);
+        zend_hash_str_update(
+            Z_ARRVAL_P(server), "DOCUMENT_ROOT", sizeof("DOCUMENT_ROOT") - 1, &docroot);
     }
 }
 
@@ -4848,19 +4942,34 @@ static int cli_eval_protected(const char *code, const char *label)
 
 /*
  * Define one of the STDIN / STDOUT / STDERR constants as an open stream
- * resource. Built from the process FILE* (not the php://std* wrappers, which do
- * not open in this embed build) and flagged NO_FCLOSE so the shared fd survives
- * the resource being freed at request shutdown. Mirrors stock php-cli's
- * cli_register_file_handles (sapi/cli/php_cli.c).
+ * resource, opened through the `php://std*` wrapper exactly as stock php-cli's
+ * cli_register_file_handles does (sapi/cli/php_cli.c).
+ *
+ * Going through the wrapper — rather than wrapping the process FILE* directly —
+ * is what gives the constants their `php://` provenance: without it
+ * stream_get_meta_data(STDIN) reports no `wrapper_type` and no `uri`, and code
+ * that sniffs those to tell real stdio from an arbitrary stream misbehaves
+ * (issue #340). The wrapper is not a different handle: for the "cli" SAPI name
+ * — which `ephpm php` uses — ext/standard/php_fopen_wrapper.c hands the very
+ * first php://stdin / php://stdout / php://stderr open the process's own
+ * stdin/stdout/stderr FILE*, so this is the same handle the old FILE*-based
+ * code used, now carrying the metadata php-cli's does.
+ *
+ * Both no-close flags are set:
+ *   * NO_RSCR_DTOR_CLOSE is php-cli's own (its comment: extensions writing to
+ *     stderr during MSHUTDOWN still need it open), and
+ *   * NO_FCLOSE additionally guarantees the shared FILE* is never fclose()d if
+ *     the stream is closed some other way — ePHPm keeps writing diagnostics to
+ *     stderr after the CLI request ends, so losing the handle is not survivable.
  */
-static void cli_register_file_handle(
-    FILE *fp, const char *mode, const char *name, size_t name_len)
+static void cli_register_file_handle(const char *url, const char *mode,
+                                     const char *name, size_t name_len)
 {
-    php_stream *stream = php_stream_fopen_from_file(fp, mode);
+    php_stream *stream = php_stream_open_wrapper_ex(url, mode, 0, NULL, NULL);
     if (!stream) {
         return;
     }
-    stream->flags |= PHP_STREAM_FLAG_NO_FCLOSE;
+    stream->flags |= PHP_STREAM_FLAG_NO_RSCR_DTOR_CLOSE | PHP_STREAM_FLAG_NO_FCLOSE;
 
     zend_constant c;
     php_stream_to_zval(stream, &c.value);
@@ -4877,9 +4986,9 @@ static void cli_register_file_handle(
  */
 static void cli_register_file_handles(void)
 {
-    cli_register_file_handle(stdin, "rb", "STDIN", sizeof("STDIN") - 1);
-    cli_register_file_handle(stdout, "wb", "STDOUT", sizeof("STDOUT") - 1);
-    cli_register_file_handle(stderr, "wb", "STDERR", sizeof("STDERR") - 1);
+    cli_register_file_handle("php://stdin", "rb", "STDIN", sizeof("STDIN") - 1);
+    cli_register_file_handle("php://stdout", "wb", "STDOUT", sizeof("STDOUT") - 1);
+    cli_register_file_handle("php://stderr", "wb", "STDERR", sizeof("STDERR") - 1);
 }
 
 /*
@@ -5205,7 +5314,16 @@ static int cli_shutdown_request(int result)
 }
 
 /* PHP CLI option table — matches the real PHP CLI SAPI options.
- * Used by php_getopt() to parse argc/argv. */
+ * Used by php_getopt() to parse argc/argv.
+ *
+ * Keeping this in step with php-cli's OPTIONS[] became load-bearing with
+ * issue #336: an option missing from this table is now a hard error (usage +
+ * exit 1) rather than a silent no-op, so an entry php-cli has and this one
+ * lacks would turn a working command line into a failure. The one deliberate
+ * omission is php-cli's `{16, 1, "repeat"}`, which php-src itself labels
+ * "internal testing option -- may be changed or removed without notice":
+ * accepting and ignoring it would silently run a script once where the caller
+ * asked for N. */
 static const opt_struct cli_options[] = {
     {'a', 0, "interactive"},
     {'B', 1, "process-begin"},
@@ -5227,6 +5345,7 @@ static const opt_struct cli_options[] = {
     {'r', 1, "run"},
     {'S', 1, "server"},
     {'s', 0, "syntax-highlight"},
+    {'s', 0, "syntax-highlighting"}, /* php-cli carries both spellings */
     {'t', 1, "docroot"},
     {'w', 0, "strip"},
     {'?', 0, "usage"},
@@ -5260,6 +5379,56 @@ static void cli_print_extension(zend_extension *ext)
 }
 
 /*
+ * Usage text for `-h`/`--usage` and for an unrecognized option, mirroring
+ * php-cli's php_cli_usage(): stdout, not stderr, in both cases.
+ *
+ * It deliberately does NOT reproduce php-cli's text verbatim. The program name
+ * is `ephpm php`, and the options list omits the ones this build honestly does
+ * not implement (-S/-t built-in server, --repeat, --ini=diff), because a usage
+ * screen advertising flags that then refuse to run is worse than a shorter one.
+ * The CLI conformance corpus therefore keeps 137-unknown-option xfail'd on the
+ * stdout text while the stderr diagnostic and the exit status match exactly.
+ */
+static void cli_usage(void)
+{
+    fprintf(stdout,
+        "Usage: ephpm php [options] [-f] <file> [--] [args...]\n"
+        "       ephpm php [options] -r <code> [--] [args...]\n"
+        "       ephpm php [options] -- [args...]\n"
+        "\n"
+        "  -a               Run as interactive shell\n"
+        "  -c <path>|<file> Look for php.ini file in this directory\n"
+        "  -n               No configuration (ini) files will be used\n"
+        "  -d foo[=bar]     Define INI entry foo with value 'bar'\n"
+        "  -e               Generate extended information for debugger/profiler\n"
+        "  -f <file>        Parse and execute <file>\n"
+        "  -h               This help\n"
+        "  -i               PHP information\n"
+        "  -l               Syntax check only (lint)\n"
+        "  -m               Show compiled in modules\n"
+        "  -r <code>        Run PHP <code> without using script tags <?..?>\n"
+        "  -B <begin_code>  Run PHP <begin_code> before processing input lines\n"
+        "  -R <code>        Run PHP <code> for every input line\n"
+        "  -F <file>        Parse and execute <file> for every input line\n"
+        "  -E <end_code>    Run PHP <end_code> after processing all input lines\n"
+        "  -H               Hide any passed arguments from external tools\n"
+        "  -s               Output HTML syntax highlighted source\n"
+        "  -v               Version number\n"
+        "  -w               Output source with stripped comments and whitespace\n"
+        "\n"
+        "  args...          Arguments passed to script. Use -- args when first argument\n"
+        "                   starts with - or script is read from stdin\n"
+        "\n"
+        "  --ini            Show configuration file names\n"
+        "  --rf <name>      Show information about function <name>\n"
+        "  --rc <name>      Show information about class <name>\n"
+        "  --re <name>      Show information about extension <name>\n"
+        "  --rz <name>      Show information about Zend extension <name>\n"
+        "  --ri <name>      Show configuration for extension <name>\n"
+    );
+}
+
+/*
  * PHP CLI main entry point. Parses argc/argv using php_getopt with
  * the same option table as the real PHP CLI, then dispatches to the
  * appropriate PHP APIs.
@@ -5290,8 +5459,15 @@ int ephpm_cli_main(int argc, char **argv)
     int want_interactive = 0;   /* -a */
     int read_stdin = 0;         /* script/program comes from stdin */
 
-    /* First pass: handle flags that print info and exit immediately */
-    while ((c = php_getopt(argc, argv, cli_options, &php_optarg, &php_optind, 0, 2)) != -1) {
+    /* First pass: handle flags that print info and exit immediately.
+     *
+     * show_err = 1 (php-cli passes 1 here too, and 0 in its later passes):
+     * php_getopt itself writes the "Error in argument N, char M: …" diagnostic
+     * to stderr and returns PHP_GETOPT_INVALID_ARG, which the switch below
+     * turns into usage + exit 1 (issue #336). The second pass keeps show_err
+     * = 0 so a bad option is never reported twice — it can't be reached
+     * anyway, since this pass returns first. */
+    while ((c = php_getopt(argc, argv, cli_options, &php_optarg, &php_optind, 1, 2)) != -1) {
         switch (c) {
         case 'v': /* version */
             sapi_module.ub_write = ephpm_sapi_ub_write_stdout;
@@ -5332,42 +5508,21 @@ int ephpm_cli_main(int argc, char **argv)
         case 'h':
         case '?':
             /* Print a help message */
-            fprintf(stdout,
-                "Usage: ephpm php [options] [-f] <file> [--] [args...]\n"
-                "       ephpm php [options] -r <code> [--] [args...]\n"
-                "       ephpm php [options] -- [args...]\n"
-                "\n"
-                "  -a               Run as interactive shell\n"
-                "  -c <path>|<file> Look for php.ini file in this directory\n"
-                "  -n               No configuration (ini) files will be used\n"
-                "  -d foo[=bar]     Define INI entry foo with value 'bar'\n"
-                "  -e               Generate extended information for debugger/profiler\n"
-                "  -f <file>        Parse and execute <file>\n"
-                "  -h               This help\n"
-                "  -i               PHP information\n"
-                "  -l               Syntax check only (lint)\n"
-                "  -m               Show compiled in modules\n"
-                "  -r <code>        Run PHP <code> without using script tags <?..?>\n"
-                "  -B <begin_code>  Run PHP <begin_code> before processing input lines\n"
-                "  -R <code>        Run PHP <code> for every input line\n"
-                "  -F <file>        Parse and execute <file> for every input line\n"
-                "  -E <end_code>    Run PHP <end_code> after processing all input lines\n"
-                "  -H               Hide any passed arguments from external tools\n"
-                "  -s               Output HTML syntax highlighted source\n"
-                "  -v               Version number\n"
-                "  -w               Output source with stripped comments and whitespace\n"
-                "\n"
-                "  args...          Arguments passed to script. Use -- args when first argument\n"
-                "                   starts with - or script is read from stdin\n"
-                "\n"
-                "  --ini            Show configuration file names\n"
-                "  --rf <name>      Show information about function <name>\n"
-                "  --rc <name>      Show information about class <name>\n"
-                "  --re <name>      Show information about extension <name>\n"
-                "  --rz <name>      Show information about Zend extension <name>\n"
-                "  --ri <name>      Show configuration for extension <name>\n"
-            );
+            cli_usage();
             return 0;
+
+        case PHP_GETOPT_INVALID_ARG:
+            /* Unrecognized option, a `-:` flag, or a missing required option
+             * argument. php_getopt already put the diagnostic on stderr (see
+             * the show_err note above); php-cli then prints usage to stdout
+             * and exits 1, and so do we (issue #336).
+             *
+             * Before this, an unknown flag fell through both getopt passes,
+             * selected no mode, and left the CLI reading (empty) stdin as a
+             * program — a typo'd flag silently ran nothing and reported
+             * success, the worst possible outcome for a script. */
+            cli_usage();
+            return 1;
 
         case 15: /* --ini */
             cli_begin(&orig_ub_write);
@@ -5395,9 +5550,22 @@ int ephpm_cli_main(int argc, char **argv)
              * the code being evaluated.
              *
              * A bad name is caught and reported as php-cli reports it —
-             * `Exception: <message>` on stdout with exit status 0, not an
-             * uncaught-exception fatal. --ri has its own message for an
-             * absent extension ("Extension 'x' not present."), also php-cli's.
+             * `Exception: <message>` on stdout, NOT an uncaught-exception
+             * fatal — and, like php-cli, the process then exits 1 (issue
+             * #335: php_cli.c sets EG(exit_status) = 1 in exactly this
+             * branch; the previous comment here claimed status 0 was
+             * php-cli's, which was wrong).
+             *
+             * The status is carried out of PHP by exit(1) in the catch block
+             * rather than by a C-side sentinel: cli_eval_protected already
+             * unwraps PHP 8's unwind-exit and returns EG(exit_status), which
+             * is the same path `-r 'exit(1);'` takes.
+             *
+             * --ri keeps its own message for an absent extension ("Extension
+             * 'x' not present."), also php-cli's. php-cli exits 1 there too,
+             * but that is a different php_cli.c branch (PHP_CLI_MODE_-
+             * REFLECTION_EXT_INFO) whose `--ri main` special case ePHPm does
+             * not implement, so it is left alone here rather than half-matched.
              */
             zval reflect_name;
             ZVAL_STRING(&reflect_name, php_optarg ? php_optarg : "");
@@ -5419,13 +5587,13 @@ int ephpm_cli_main(int argc, char **argv)
             char code[1024];
             snprintf(code, sizeof(code),
                 "try { %s } catch (Throwable $e) {"
-                "  echo 'Exception: ', $e->getMessage(), \"\\n\"; }",
+                "  echo 'Exception: ', $e->getMessage(), \"\\n\"; exit(1); }",
                 expr);
             cli_begin(&orig_ub_write);
-            cli_eval_protected(code, "ephpm php reflection");
+            result = cli_eval_protected(code, "ephpm php reflection");
             php_output_end_all();
             cli_end(orig_ub_write);
-            return 0;
+            return result;
         }
 
         default:
