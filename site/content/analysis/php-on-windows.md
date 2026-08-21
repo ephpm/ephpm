@@ -256,9 +256,11 @@ because each is a common misconception:
    cannot serve: Clang-only targets, where the fallback is the slow CALL VM.
    Windows/MSVC is exactly such a platform, which is why the `-tailcall`
    (clang-cl) build is a Windows artifact and not a Linux one. (macOS builds
-   with Clang and already picks up a fast VM on 8.5, so no separate macOS
-   variant is published either.) [VERIFIED bench; JUDGEMENT on the toolchain
-   trade-off]
+   with Clang too: on PHP 8.5 it already picks up TAILCALL, so a variant would
+   add nothing; on 8.3/8.4 it falls back to the same slow CALL VM as MSVC —
+   clang cannot emit HYBRID and TAILCALL does not exist there — so no faster
+   macOS variant is possible to publish. Use macOS 8.5 for CPU-bound work.)
+   [VERIFIED bench; JUDGEMENT on the toolchain trade-off]
 
 ---
 

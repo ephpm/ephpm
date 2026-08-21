@@ -156,9 +156,9 @@ fn validate_variant(variant: &str, version: &str, os: &str, arch: &str) -> Resul
     }
     if os != "windows" || arch != "x86_64" {
         eprintln!("error: --variant clang is only published for windows-x86_64");
-        eprintln!(
-            "       (Linux/macOS SDKs already ship the fast HYBRID VM — there is no clang variant)"
-        );
+        eprintln!("       only Windows's default SDK is the slow MSVC CALL VM, so only Windows");
+        eprintln!("       needs a clang/TAILCALL variant. Linux builds with GCC (HYBRID VM);");
+        eprintln!("       macOS is already clang - 8.5 gets TAILCALL, but 8.3/8.4 fall to CALL.");
         return Err(());
     }
     if !version.starts_with("8.5.") {
