@@ -186,7 +186,12 @@ async fn bring_up_node(node_id: &str, seed: Option<&str>) -> Node {
     // the channel's `advertise_addr()` — not `listen_addr()` — which
     // is Bug 2's fix on the caller side.
     let advertise = channel.advertise_addr().expect("advertise resolved (loopback bind)");
-    let election = SqliteElection::new(Arc::clone(&cluster), advertise.to_string());
+    // A stable synthetic CDC log identity per node — this test does not
+    // wipe a database mid-flight, so each node keeps one identity for its
+    // lifetime (the #344 log-identity reclaim guard is unit-tested in
+    // ephpm-cluster::sqlite_election).
+    let log_id = format!("logid-{node_id}");
+    let election = SqliteElection::new(Arc::clone(&cluster), advertise.to_string(), log_id);
 
     Node { cluster, channel, election, _gossip_port: gossip_port }
 }

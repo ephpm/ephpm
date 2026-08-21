@@ -117,6 +117,7 @@ Prometheus metrics on `/metrics` cover HTTP, PHP, DB, and KV behaviour. Cluster-
 - **Network partition** — gossip detects partitions in seconds. The minority side will see itself as a smaller cluster; the majority retains the SQLite primary.
 - **Primary crash** — replicas detect via gossip TTL expiry on `kv:sqlite:primary`, and the next-lowest-ordinal node promotes itself and begins publishing its CDC stream. Window is ~10s.
 - **Brief Replica-with-empty-URL window** — between primary death and re-election, `evaluate_role` returns `Replica` with an empty primary URL for one tick. The role watcher sees two transitions (Replica-empty → Primary). Harmless, but logs are loud.
+- **Primary restart with a wiped/replaced database** — a fast restart of the incumbent normally reclaims the primary role immediately (its own claim on `kv:sqlite:primary` is still unexpired within the ~10s TTL), which avoids bouncing the role. If that restart also *replaced the database* — a redeploy onto an empty volume — the node comes back with an empty database and a fresh CDC log identity. The primary claim carries the node's CDC log identity, and the fast reclaim requires it to match, so the wiped node **refuses** the reclaim and defers to the normal grace + election instead of re-rooting the cluster onto its empty database (issue #344). You will see a `WARN` naming the mismatched log identity. Persist the SQLite data directory across restarts (a `StatefulSet` volume claim) so a legitimate restart keeps its data and reclaims fast.
 
 ## See also
 

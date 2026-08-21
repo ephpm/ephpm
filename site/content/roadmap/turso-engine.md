@@ -223,6 +223,20 @@ path is a **single ordered stream** with no schema-sync side channel.
   deterministically to the lowest node id instead of the last writer.
   The cost: a genuinely fresh cluster elects its first primary ~15–20s
   after boot instead of immediately.
+- **Data-identity guard on the fast reclaim (issue #344).** The startup
+  grace deliberately exempts a *restarting incumbent* whose own claim is
+  still unexpired in gossip (TTL ~10s), so a fast restart does not bounce
+  the role. But "same node id" is not "same data": a redeploy onto an
+  empty volume brings the same node back with an empty database and a
+  fresh CDC log identity, and it would win that fast reclaim inside the
+  TTL window — re-rooting the cluster onto the empty database (#314's
+  blast radius through a narrower door). The primary claim now carries the
+  node's **CDC log identity** (the same per-database fingerprint from the
+  log-identity fix above), and the fast reclaim requires *both* the node
+  id and the log id to match. A node that comes back with a different log
+  identity refuses the reclaim and falls through to the normal grace +
+  election; a genuine fast restart with unchanged data still reclaims
+  immediately.
 - Prometheus instrumentation for the whole path — batches and rows
   shipped and applied, subscriber count, the applied watermark, apply and
   tail-poll errors, reconnects by outcome, snapshot bytes and outcome,

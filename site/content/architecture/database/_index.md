@@ -198,12 +198,13 @@ Clustered mode replicates in-process — there is no separate database server bi
 ePHPm uses its gossip clustering (SWIM protocol via chitchat) to elect the primary:
 
 1. On cluster formation, the lowest-ordinal alive node becomes primary — after a short startup grace (~15s, longer than claim TTL + heartbeat), so a node joining an *existing* cluster always observes the incumbent's claim before it may elect itself (a joining node used to steal the role — issue #314)
-2. The primary's identity is stored in gossip KV (`kv:sqlite:primary`)
+2. The primary's identity is stored in gossip KV (`kv:sqlite:primary`) — the claim carries the node id, the cluster-channel address peers dial, and the node's **CDC log identity** (the per-database fingerprint from issue #315)
 3. The primary heartbeats this key every 5s with a 10s TTL
 4. If the primary dies, gossip detects it (phi-accrual failure detector)
 5. Next lowest-ordinal node promotes itself and begins publishing its CDC stream
 6. Replicas detect the KV change and reconnect to the new primary's cluster channel address, re-scoping their replication cursor to the new primary's CDC log identity (`change_id` is per-database, not cluster-global — issue #315)
 7. If two live nodes ever claim simultaneously (e.g. a partition heal), the conflict resolves deterministically to the lowest node id
+8. A restarting incumbent whose own claim is still unexpired reclaims the primary role immediately (avoiding a role bounce) — but *only* if its CDC log identity still matches the claim. A node that restarted with a wiped/replaced database (empty volume) presents a fresh log identity, fails this match, and defers to the normal grace + election rather than re-rooting the cluster onto its empty database (issue #344)
 
 ### Failover
 
