@@ -33,6 +33,27 @@
 //!    only triggers when two nodes genuinely elected concurrently (e.g.
 //!    a symmetric partition heal), where either database is as good as
 //!    the other and determinism is what matters.
+//!
+//! # Data-identity guard on the fast reclaim (issue #344)
+//!
+//! Rule 1 deliberately lets a *restarting incumbent* reclaim primary
+//! immediately when its own claim is still unexpired in gossip (TTL ~10s),
+//! so a fast restart does not bounce the role. But "same node id" is not
+//! "same data": if the node's database was wiped or replaced between stop
+//! and start (a redeploy onto an empty volume), it comes back with an
+//! **empty database and a fresh CDC log identity** yet the same node id,
+//! wins that fast-reclaim inside the TTL window, and re-roots the cluster
+//! onto the empty database — #314's blast radius through a narrower door.
+//!
+//! The fix stamps the primary's **CDC log identity** (`__ephpm_cdc_log_id`,
+//! issue #315 — a stable per-database-file fingerprint) into the claim and
+//! requires the fast reclaim to match on **both** node id and log id. When
+//! the node id matches but the log id does not, the claim describes data
+//! this node no longer holds: it refuses the fast path, stops refreshing
+//! the stale claim (letting it expire), and falls through to the normal
+//! startup grace + election so a node that still has the data can win. When
+//! the data identity is unchanged the deliberate fast-restart behaviour is
+//! preserved unchanged.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,22 +98,46 @@ pub enum ElectedRole {
 
 /// Value stored in gossip KV for the primary claim.
 ///
-/// Format: `"{node_id}|{grpc_addr}"`.
+/// Format: `"{node_id}|{grpc_addr}|{log_id}"`.
+///
+/// `log_id` is the primary's CDC log identity (`__ephpm_cdc_log_id`, issue
+/// #315) — a stable per-database-file fingerprint. It is what distinguishes
+/// "the same node restarting with the same data" from "the same node id
+/// coming back with a *different* (wiped/replaced) database" (issue #344).
+/// The `grpc_addr` and `log_id` fields never contain a `|` (an address has
+/// none, and the log id is 32 hex chars), so a plain three-way split is
+/// unambiguous.
 #[derive(Debug, Clone)]
 struct PrimaryClaim {
     node_id: String,
     grpc_addr: String,
+    /// CDC log identity of the primary's database (issue #315/#344). Empty
+    /// when decoded from a legacy two-field claim written by an older node
+    /// mid-rolling-upgrade; an empty local/claimed log id never matches a
+    /// real one, so the reclaim guard errs safe (defers to election).
+    log_id: String,
 }
 
 impl PrimaryClaim {
     fn encode(&self) -> Vec<u8> {
-        format!("{}|{}", self.node_id, self.grpc_addr).into_bytes()
+        format!("{}|{}|{}", self.node_id, self.grpc_addr, self.log_id).into_bytes()
     }
 
     fn decode(bytes: &[u8]) -> Option<Self> {
         let s = std::str::from_utf8(bytes).ok()?;
-        let (node_id, grpc_addr) = s.split_once('|')?;
-        Some(Self { node_id: node_id.to_string(), grpc_addr: grpc_addr.to_string() })
+        // `node_id|grpc_addr|log_id`. Tolerate a legacy two-field claim
+        // (`node_id|grpc_addr`) from a node that has not yet upgraded: the
+        // missing log id decodes as empty, which fails the #344 identity
+        // match and so defers to election rather than fast-reclaiming.
+        let mut parts = s.splitn(3, '|');
+        let node_id = parts.next()?;
+        let grpc_addr = parts.next()?;
+        let log_id = parts.next().unwrap_or("");
+        Some(Self {
+            node_id: node_id.to_string(),
+            grpc_addr: grpc_addr.to_string(),
+            log_id: log_id.to_string(),
+        })
     }
 }
 
@@ -103,6 +148,11 @@ impl PrimaryClaim {
 pub struct SqliteElection {
     cluster: Arc<ClusterHandle>,
     grpc_listen: String,
+    /// This node's CDC log identity (`__ephpm_cdc_log_id`, issue #315) — a
+    /// stable fingerprint of the database file this node currently holds.
+    /// Stamped into every published claim and compared against a surviving
+    /// claim's log id before the fast-restart reclaim (issue #344).
+    log_id: String,
     role_tx: watch::Sender<ElectedRole>,
     role_rx: watch::Receiver<ElectedRole>,
     /// When this election manager was created. Gates the first
@@ -114,14 +164,17 @@ impl SqliteElection {
     /// Create a new election manager.
     ///
     /// `grpc_listen` is this node's sqld gRPC address that replicas will
-    /// connect to if this node becomes primary.
+    /// connect to if this node becomes primary. `log_id` is this node's CDC
+    /// log identity (issue #315) — the fingerprint of the database this node
+    /// currently holds, used to reject a fast reclaim after the data was
+    /// wiped/replaced (issue #344).
     #[must_use]
-    pub fn new(cluster: Arc<ClusterHandle>, grpc_listen: String) -> Self {
+    pub fn new(cluster: Arc<ClusterHandle>, grpc_listen: String, log_id: String) -> Self {
         // Start as replica with empty URL — will be resolved on first tick.
         let (role_tx, role_rx) =
             watch::channel(ElectedRole::Replica { primary_grpc_url: String::new() });
 
-        Self { cluster, grpc_listen, role_tx, role_rx, boot: tokio::time::Instant::now() }
+        Self { cluster, grpc_listen, log_id, role_tx, role_rx, boot: tokio::time::Instant::now() }
     }
 
     /// Get a receiver for role changes.
@@ -160,20 +213,45 @@ impl SqliteElection {
         if let Some(bytes) = self.cluster.gossip_get(PRIMARY_KEY).await
             && let Some(claim) = PrimaryClaim::decode(&bytes)
         {
-            if claim.node_id == self.cluster.self_node().id {
-                // Our own (unexpired) claim survived a restart —
-                // reclaiming is not a theft; refresh and carry on.
-                self.publish_claim().await;
-                tracing::info!("SQLite election: reclaiming our own surviving primary claim");
-                return ElectedRole::Primary;
+            match classify_claim(&claim, &self.cluster.self_node().id, &self.log_id) {
+                ClaimKind::OwnFresh => {
+                    // Our own (unexpired) claim survived a restart AND the
+                    // database it describes is the one we still hold —
+                    // reclaiming is not a theft; refresh and carry on.
+                    self.publish_claim().await;
+                    tracing::info!("SQLite election: reclaiming our own surviving primary claim");
+                    return ElectedRole::Primary;
+                }
+                ClaimKind::OwnStale => {
+                    // Same node id, DIFFERENT CDC log identity: this node
+                    // came back with a wiped/replaced database (empty volume
+                    // on redeploy) inside the claim TTL. The surviving claim
+                    // describes data we no longer have, so fast-reclaiming
+                    // would re-root the cluster onto an empty database
+                    // (issue #344 — #314's blast radius through a narrower
+                    // door). Refuse the fast path: do not reclaim; return
+                    // unresolved so the election loop applies the startup
+                    // grace + election and a node that still holds the data
+                    // can win.
+                    tracing::warn!(
+                        claimed_log = %claim.log_id,
+                        local_log = %self.log_id,
+                        "SQLite election: a surviving primary claim names this node but its CDC \
+                         log identity does not match our current database (wiped/replaced across \
+                         restart, issue #344); refusing the fast reclaim and deferring to election"
+                    );
+                    return ElectedRole::Replica { primary_grpc_url: String::new() };
+                }
+                ClaimKind::Foreign => {
+                    if let Some(url) = self.replica_url_for(&claim).await {
+                        return ElectedRole::Replica { primary_grpc_url: url };
+                    }
+                    // Claim points at a host that is not a known member.
+                    // Refuse to dial it (defense in depth against a forged
+                    // gossip claim) and wait for a valid one.
+                    return ElectedRole::Replica { primary_grpc_url: String::new() };
+                }
             }
-            if let Some(url) = self.replica_url_for(&claim).await {
-                return ElectedRole::Replica { primary_grpc_url: url };
-            }
-            // Claim points at a host that is not a known member.
-            // Refuse to dial it (defense in depth against a forged
-            // gossip claim) and wait for a valid one.
-            return ElectedRole::Replica { primary_grpc_url: String::new() };
         }
 
         // No valid claim visible. That means either the cluster genuinely
@@ -223,57 +301,80 @@ impl SqliteElection {
         if let Some(bytes) = self.cluster.gossip_get(PRIMARY_KEY).await
             && let Some(claim) = PrimaryClaim::decode(&bytes)
         {
-            if claim.node_id == self_node.id {
-                // We are the primary — refresh heartbeat.
-                self.publish_claim().await;
-                return ElectedRole::Primary;
-            }
-
-            // Someone else claims primary -- check if they're alive AND
-            // that the advertised gRPC address belongs to a known member
-            // (defense in depth: a forged claim from a plaintext gossip
-            // injection must not make us dial an arbitrary host).
-            let nodes = self.cluster.nodes().await;
-            let primary_alive =
-                nodes.iter().any(|n| n.id == claim.node_id && n.state == NodeState::Alive);
-
-            if primary_alive {
-                // Conflict: we hold the primary role, yet a live peer
-                // claims it too (gossip KV is last-write-wins, so its
-                // newer write shadows ours). Do not yield
-                // unconditionally — that is how a joining node stole
-                // the role from a healthy incumbent. Break the tie by
-                // the documented rule: lowest node id wins.
-                if matches!(current, ElectedRole::Primary) {
-                    if incumbent_wins_tie(&self_node.id, &claim.node_id) {
-                        tracing::warn!(
-                            claimant = %claim.node_id,
-                            "SQLite election: live conflicting primary claim from a \
-                             higher-ordinal node; keeping the primary role and \
-                             re-asserting our claim (lowest node id wins)"
-                        );
-                        self.publish_claim().await;
-                        return ElectedRole::Primary;
-                    }
+            match classify_claim(&claim, &self_node.id, &self.log_id) {
+                ClaimKind::OwnFresh => {
+                    // We are the primary and the claim describes the database
+                    // we still hold — refresh heartbeat.
+                    self.publish_claim().await;
+                    return ElectedRole::Primary;
+                }
+                ClaimKind::OwnStale => {
+                    // Same node id, DIFFERENT CDC log identity (issue #344): a
+                    // stale claim from a previous incarnation whose database
+                    // is gone. Do NOT reclaim and do NOT refresh it — that is
+                    // what re-roots the cluster onto an empty database. Treat
+                    // it as absent and fall through to the startup grace +
+                    // election tail below (the grace still gates a first
+                    // self-election while current != Primary), letting the
+                    // claim expire so a node that still holds the data can win.
                     tracing::warn!(
-                        claimant = %claim.node_id,
-                        "SQLite election: live conflicting primary claim from a \
-                         lower-ordinal node; stepping down (lowest node id wins)"
+                        claimed_log = %claim.log_id,
+                        local_log = %self.log_id,
+                        "SQLite election: surviving primary claim names this node but its CDC log \
+                         identity no longer matches our database (wiped/replaced, issue #344); not \
+                         reclaiming — deferring to election"
                     );
                 }
-                if let Some(url) = self.replica_url_for(&claim).await {
-                    return ElectedRole::Replica { primary_grpc_url: url };
-                }
-                // Alive primary but the gRPC host is not a known member --
-                // refuse to dial it and wait for a valid claim.
-                return ElectedRole::Replica { primary_grpc_url: String::new() };
-            }
+                ClaimKind::Foreign => {
+                    // Someone else claims primary -- check if they're alive
+                    // AND that the advertised gRPC address belongs to a known
+                    // member (defense in depth: a forged claim from a
+                    // plaintext gossip injection must not make us dial an
+                    // arbitrary host).
+                    let nodes = self.cluster.nodes().await;
+                    let primary_alive =
+                        nodes.iter().any(|n| n.id == claim.node_id && n.state == NodeState::Alive);
 
-            // Primary is dead — fall through to re-election.
-            tracing::warn!(
-                dead_primary = %claim.node_id,
-                "primary node is dead, triggering re-election"
-            );
+                    if primary_alive {
+                        // Conflict: we hold the primary role, yet a live peer
+                        // claims it too (gossip KV is last-write-wins, so its
+                        // newer write shadows ours). Do not yield
+                        // unconditionally — that is how a joining node stole
+                        // the role from a healthy incumbent. Break the tie by
+                        // the documented rule: lowest node id wins.
+                        if matches!(current, ElectedRole::Primary) {
+                            if incumbent_wins_tie(&self_node.id, &claim.node_id) {
+                                tracing::warn!(
+                                    claimant = %claim.node_id,
+                                    "SQLite election: live conflicting primary claim from a \
+                                     higher-ordinal node; keeping the primary role and \
+                                     re-asserting our claim (lowest node id wins)"
+                                );
+                                self.publish_claim().await;
+                                return ElectedRole::Primary;
+                            }
+                            tracing::warn!(
+                                claimant = %claim.node_id,
+                                "SQLite election: live conflicting primary claim from a \
+                                 lower-ordinal node; stepping down (lowest node id wins)"
+                            );
+                        }
+                        if let Some(url) = self.replica_url_for(&claim).await {
+                            return ElectedRole::Replica { primary_grpc_url: url };
+                        }
+                        // Alive primary but the gRPC host is not a known
+                        // member -- refuse to dial it and wait for a valid
+                        // claim.
+                        return ElectedRole::Replica { primary_grpc_url: String::new() };
+                    }
+
+                    // Primary is dead — fall through to re-election.
+                    tracing::warn!(
+                        dead_primary = %claim.node_id,
+                        "primary node is dead, triggering re-election"
+                    );
+                }
+            }
         }
 
         // No valid primary claim visible. If this node started recently,
@@ -352,8 +453,43 @@ impl SqliteElection {
         let claim = PrimaryClaim {
             node_id: self.cluster.self_node().id.clone(),
             grpc_addr: self.grpc_listen.clone(),
+            log_id: self.log_id.clone(),
         };
         self.cluster.gossip_set(PRIMARY_KEY, &claim.encode(), Some(PRIMARY_TTL)).await;
+    }
+}
+
+/// How a surviving primary claim relates to *this* node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimKind {
+    /// Names this node AND describes the database this node still holds
+    /// (node id and CDC log identity both match). Eligible for the
+    /// fast-restart reclaim.
+    OwnFresh,
+    /// Names this node but with a *different* CDC log identity — a stale
+    /// claim from a previous incarnation whose database was wiped/replaced
+    /// (issue #344). Must NOT be fast-reclaimed; defer to grace + election.
+    OwnStale,
+    /// Names a different node.
+    Foreign,
+}
+
+/// Classify a surviving primary claim against this node's identity.
+///
+/// The fast-restart reclaim (issue #314) must fire only for
+/// [`ClaimKind::OwnFresh`]: a matching node id is not enough, because a
+/// redeploy onto an empty volume brings the same node id back with a
+/// *different* database and a fresh CDC log identity. Requiring the log id
+/// to match too is what closes the issue #344 window — the same node
+/// returning with wiped data classifies as [`ClaimKind::OwnStale`] and is
+/// denied the fast path.
+fn classify_claim(claim: &PrimaryClaim, self_id: &str, self_log_id: &str) -> ClaimKind {
+    if claim.node_id != self_id {
+        ClaimKind::Foreign
+    } else if claim.log_id == self_log_id {
+        ClaimKind::OwnFresh
+    } else {
+        ClaimKind::OwnStale
     }
 }
 
@@ -395,11 +531,16 @@ mod tests {
 
     #[test]
     fn primary_claim_roundtrip() {
-        let claim = PrimaryClaim { node_id: "ephpm-0".into(), grpc_addr: "10.0.1.2:5001".into() };
+        let claim = PrimaryClaim {
+            node_id: "ephpm-0".into(),
+            grpc_addr: "10.0.1.2:5001".into(),
+            log_id: "0123456789abcdef0123456789abcdef".into(),
+        };
         let encoded = claim.encode();
         let decoded = PrimaryClaim::decode(&encoded).unwrap();
         assert_eq!(decoded.node_id, "ephpm-0");
         assert_eq!(decoded.grpc_addr, "10.0.1.2:5001");
+        assert_eq!(decoded.log_id, "0123456789abcdef0123456789abcdef");
     }
 
     #[test]
@@ -410,9 +551,25 @@ mod tests {
 
     #[test]
     fn primary_claim_encode_format() {
-        let claim = PrimaryClaim { node_id: "node-1".into(), grpc_addr: "0.0.0.0:5001".into() };
+        let claim = PrimaryClaim {
+            node_id: "node-1".into(),
+            grpc_addr: "0.0.0.0:5001".into(),
+            log_id: "cafef00d".into(),
+        };
         let bytes = claim.encode();
-        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "node-1|0.0.0.0:5001");
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "node-1|0.0.0.0:5001|cafef00d");
+    }
+
+    /// A legacy two-field claim (`node_id|grpc_addr`, no log id) written by
+    /// a node that has not yet upgraded must still decode — with an empty
+    /// log id, which the #344 reclaim guard treats as "does not match" and
+    /// so safely defers to election.
+    #[test]
+    fn primary_claim_decode_legacy_two_field() {
+        let decoded = PrimaryClaim::decode(b"ephpm-0|10.0.1.2:5001").unwrap();
+        assert_eq!(decoded.node_id, "ephpm-0");
+        assert_eq!(decoded.grpc_addr, "10.0.1.2:5001");
+        assert_eq!(decoded.log_id, "");
     }
 
     #[test]
@@ -438,27 +595,39 @@ mod tests {
 
     #[test]
     fn primary_claim_with_ipv6() {
-        let claim = PrimaryClaim { node_id: "node-v6".into(), grpc_addr: "[::1]:5001".into() };
+        let claim = PrimaryClaim {
+            node_id: "node-v6".into(),
+            grpc_addr: "[::1]:5001".into(),
+            log_id: "deadbeef".into(),
+        };
         let encoded = claim.encode();
         let decoded = PrimaryClaim::decode(&encoded).unwrap();
         assert_eq!(decoded.node_id, "node-v6");
         assert_eq!(decoded.grpc_addr, "[::1]:5001");
+        assert_eq!(decoded.log_id, "deadbeef");
     }
 
     #[test]
-    fn primary_claim_decode_multiple_pipes() {
-        // Only the first pipe is the separator.
-        let decoded = PrimaryClaim::decode(b"a|b|c").unwrap();
+    fn primary_claim_decode_three_fields() {
+        // node_id | grpc_addr | log_id — a plain three-way split (neither an
+        // address nor a hex log id contains a pipe).
+        let decoded = PrimaryClaim::decode(b"a|10.0.1.2:5001|abc123").unwrap();
         assert_eq!(decoded.node_id, "a");
-        assert_eq!(decoded.grpc_addr, "b|c");
+        assert_eq!(decoded.grpc_addr, "10.0.1.2:5001");
+        assert_eq!(decoded.log_id, "abc123");
     }
 
     #[test]
     fn primary_claim_with_long_node_id() {
         let long_id = "ephpm-".to_string() + &"x".repeat(200);
-        let claim = PrimaryClaim { node_id: long_id.clone(), grpc_addr: "10.0.1.2:5001".into() };
+        let claim = PrimaryClaim {
+            node_id: long_id.clone(),
+            grpc_addr: "10.0.1.2:5001".into(),
+            log_id: "abcdef".into(),
+        };
         let roundtripped = PrimaryClaim::decode(&claim.encode()).unwrap();
         assert_eq!(roundtripped.node_id, long_id);
+        assert_eq!(roundtripped.log_id, "abcdef");
     }
 
     /// Verify that lowest-ordinal wins: when comparing node IDs
@@ -571,5 +740,84 @@ mod tests {
         // but the tie-break must not let an equal id "win" as incumbent
         // AND as claimant on two nodes at once.
         assert!(!incumbent_wins_tie("cdc-node-1", "cdc-node-1"));
+    }
+
+    fn claim_with_log(node_id: &str, log_id: &str) -> PrimaryClaim {
+        PrimaryClaim {
+            node_id: node_id.into(),
+            grpc_addr: "10.0.1.2:5001".into(),
+            log_id: log_id.into(),
+        }
+    }
+
+    /// The issue #344 window: node N was primary with CDC log identity A and
+    /// published a claim; N is redeployed onto an empty volume and restarts
+    /// within the claim TTL, now holding a *fresh, empty* database with log
+    /// identity B. Its own surviving claim (node N, log A) is still in
+    /// gossip. The claim-mine fast reclaim must NOT fire — the claim names
+    /// data N no longer has, and reclaiming would re-root the cluster onto
+    /// the empty database. It must classify as `OwnStale` (defer to
+    /// election), not `OwnFresh` (fast reclaim).
+    #[test]
+    fn wiped_restart_does_not_take_fast_reclaim() {
+        let self_id = "ephpm-0";
+        let log_before_wipe = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let log_after_wipe = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let surviving_claim = claim_with_log(self_id, log_before_wipe);
+
+        // Same node id, different (fresh) log identity → stale, must defer.
+        assert_eq!(
+            classify_claim(&surviving_claim, self_id, log_after_wipe),
+            ClaimKind::OwnStale,
+            "a wiped-DB restart must not be eligible for the fast reclaim"
+        );
+    }
+
+    /// The deliberate fast-restart behaviour (issue #314) is preserved when
+    /// the data identity is unchanged: same node id AND same CDC log
+    /// identity classifies as `OwnFresh`, so a genuine fast restart still
+    /// reclaims immediately without bouncing the role.
+    #[test]
+    fn genuine_fast_restart_still_reclaims() {
+        let self_id = "ephpm-0";
+        let log = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let surviving_claim = claim_with_log(self_id, log);
+        assert_eq!(
+            classify_claim(&surviving_claim, self_id, log),
+            ClaimKind::OwnFresh,
+            "an unchanged-data fast restart must still reclaim"
+        );
+    }
+
+    /// A claim naming a different node is `Foreign` regardless of log id —
+    /// the log-identity guard only gates our *own* claim's fast reclaim.
+    #[test]
+    fn foreign_claim_is_foreign_regardless_of_log_id() {
+        let claim = claim_with_log("ephpm-1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        // Even if the log ids happened to collide, a different node id is
+        // always foreign.
+        assert_eq!(
+            classify_claim(&claim, "ephpm-0", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ClaimKind::Foreign
+        );
+        assert_eq!(
+            classify_claim(&claim, "ephpm-0", "cccccccccccccccccccccccccccccccc"),
+            ClaimKind::Foreign
+        );
+    }
+
+    /// A legacy two-field claim (empty log id after decode) from a node that
+    /// has not yet upgraded must never satisfy the fast reclaim against a
+    /// node holding a real (non-empty) log id — it classifies as `OwnStale`
+    /// and defers, which is the safe direction during a rolling upgrade.
+    #[test]
+    fn legacy_empty_log_claim_defers() {
+        let legacy = PrimaryClaim::decode(b"ephpm-0|10.0.1.2:5001").unwrap();
+        assert_eq!(legacy.log_id, "");
+        assert_eq!(
+            classify_claim(&legacy, "ephpm-0", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            ClaimKind::OwnStale
+        );
     }
 }

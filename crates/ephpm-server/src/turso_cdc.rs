@@ -488,7 +488,40 @@ pub async fn start_clustered_turso_cdc(
          \"10.0.1.5:7946\"), or set [cluster.channel] listen to a specific \
          host:port explicitly.",
     )?;
-    let (initial_role, role_rx) = determine_role(sqlite_config, cluster, channel_advertise).await?;
+
+    // Mgmt factory: used by the per-subscriber tailers and the snapshot
+    // dumper on the primary, and by the apply loop on the replica. Never
+    // opts into CDC-on-connect — the tailer reads turso_cdc explicitly,
+    // and the applier's writes must NOT be re-captured (that would make
+    // a replica echo the primary's changes into its own CDC log).
+    //
+    // Opened BEFORE the election (moved up from below) so this node's CDC
+    // log identity is available to the election: the primary claim carries
+    // that identity, and the fast-restart reclaim must match on it (issue
+    // #344).
+    let mgmt_factory = Arc::new(
+        Turso::open(db_path)
+            .await
+            .with_context(|| format!("failed to open mgmt Turso factory at {db_path}"))?,
+    );
+
+    // Establish this database's persistent CDC log identity (issue #315)
+    // BEFORE the election runs. Done on EVERY node, not just the primary:
+    // any node can be promoted later, and the identity must already exist
+    // when the first subscriber dials in. Written through the mgmt
+    // connection so it is never captured into the CDC log itself. Passing it
+    // to the election is what lets a node whose database was wiped/replaced
+    // across a restart (fresh identity) refuse to fast-reclaim its own stale
+    // primary claim (issue #344).
+    let local_log_id = {
+        let conn =
+            mgmt_factory.raw_connection().context("CDC: open mgmt connection for log identity")?;
+        ensure_log_id(&conn).await.context("CDC: establish local log identity")?
+    };
+    tracing::info!(log_id = %local_log_id, "CDC: local log identity established");
+
+    let (initial_role, role_rx) =
+        determine_role(sqlite_config, cluster, channel_advertise, local_log_id.clone()).await?;
 
     // In auto mode the initial role is deliberately unresolved until the
     // election has actually seen the cluster (issue #314: deciding
@@ -527,30 +560,11 @@ pub async fn start_clustered_turso_cdc(
         .await
         .with_context(|| format!("failed to open wire Turso factory at {db_path}"))?;
 
-    // Mgmt factory: used by the per-subscriber tailers and the snapshot
-    // dumper on the primary, and by the apply loop on the replica. Never
-    // opts into CDC-on-connect — the tailer reads turso_cdc explicitly,
-    // and the applier's writes must NOT be re-captured (that would make
-    // a replica echo the primary's changes into its own CDC log).
-    let mgmt_factory = Arc::new(
-        Turso::open(db_path)
-            .await
-            .with_context(|| format!("failed to open mgmt Turso factory at {db_path}"))?,
-    );
+    // Mgmt factory and this node's CDC log identity are established above,
+    // before the election, so the primary claim can carry the identity
+    // (issue #344).
 
     let max_snapshot_bytes = sqlite_config.replication.max_snapshot_bytes;
-
-    // Establish this database's persistent CDC log identity (issue #315).
-    // Done on EVERY node, not just the primary: any node can be promoted
-    // later, and the identity must already exist when the first subscriber
-    // dials in. Written through the mgmt connection so it is never
-    // captured into the CDC log itself.
-    let local_log_id = {
-        let conn =
-            mgmt_factory.raw_connection().context("CDC: open mgmt connection for log identity")?;
-        ensure_log_id(&conn).await.context("CDC: establish local log identity")?
-    };
-    tracing::info!(log_id = %local_log_id, "CDC: local log identity established");
 
     // Seed the zero-valued CDC series before anything can record. An
     // operator scraping a freshly booted node must be able to tell
@@ -801,6 +815,7 @@ async fn determine_role(
     sqlite_config: &SqliteConfig,
     cluster: &Arc<ephpm_cluster::ClusterHandle>,
     channel_advertise: SocketAddr,
+    local_log_id: String,
 ) -> anyhow::Result<(Role, Option<tokio::sync::watch::Receiver<ephpm_cluster::ElectedRole>>)> {
     match sqlite_config.replication.role.as_str() {
         "primary" => Ok((Role::Primary, None)),
@@ -836,6 +851,7 @@ async fn determine_role(
             let election = ephpm_cluster::SqliteElection::new(
                 Arc::clone(cluster),
                 channel_advertise.to_string(),
+                local_log_id,
             );
             let initial = election.determine_initial_role().await;
             let rx = election.watch_role();
