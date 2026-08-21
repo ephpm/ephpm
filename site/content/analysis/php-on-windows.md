@@ -217,6 +217,49 @@ build/link/flag differences explain Windows-vs-Windows.** The 22% spread is
 empirical proof that ~20%-scale build effects are real while remaining far
 too small to bridge the 2x to Linux.
 
+### 2.5 How the TAILCALL VM works — three clarifications [VERIFIED]
+
+TAILCALL comes up often enough that three points are worth stating plainly,
+because each is a common misconception:
+
+1. **The VM kind is chosen at *compile time*, not by a runtime setting.** The
+   selection above (`ZEND_VM_KIND_CALL` / `HYBRID` / `TAILCALL` / …) is
+   resolved by the C preprocessor when php-src is built — from
+   [`Zend/zend_vm_opcodes.h`](https://github.com/php/php-src/blob/PHP-8.5/Zend/zend_vm_opcodes.h)
+   and the
+   [`Zend/zend_vm_gen.php`](https://github.com/php/php-src/blob/PHP-8.5/Zend/zend_vm_gen.php)
+   generator. There is **no `opcache.vm_kind`, no `php.ini` toggle, and no
+   CLI flag** that switches it: which VM a binary runs is baked in by *how it
+   was compiled*. That is exactly why ePHPm ships a **separate** `-tailcall`
+   Windows binary (built with clang-cl) rather than a config option — you
+   cannot turn TAILCALL "on" in a running MSVC build. [VERIFIED — the §2.1
+   selection logic is preprocessor-only]
+
+2. **TAILCALL is shipped, not a future feature — but only in PHP 8.5, only
+   under Clang.** It landed in PHP 8.5
+   ([PR #17849](https://github.com/php/php-src/pull/17849)) and requires
+   Clang's `[[clang::musttail]]` (`HAVE_MUSTTAIL`) plus the `preserve_none`
+   calling convention (`HAVE_PRESERVE_NONE`) on x86-64/aarch64. It **does not
+   exist in PHP 8.3 or 8.4**, and it never compiles under MSVC or GCC. So
+   ePHPm's `-tailcall` artifact is PHP-8.5-only by construction, not by
+   policy. [VERIFIED]
+
+3. **Every platform already runs the fastest interpreter its compiler can
+   emit — TAILCALL is how *Clang* platforms reach that bar, not a
+   project-wide switch.** On Linux, GCC produces HYBRID, and HYBRID is
+   already as fast as TAILCALL: upstream's own `bench.php` has them within
+   noise, HYBRID marginally *ahead* (**1.006 s HYBRID vs 1.017 s TAILCALL**,
+   [PR #17849](https://github.com/php/php-src/pull/17849)). Switching Linux
+   to TAILCALL would therefore gain nothing and cost the GCC toolchain
+   (HYBRID's register pinning is GCC-only) — there is no "make everything
+   TAILCALL for cohesion" upside. TAILCALL exists for the platforms GCC
+   cannot serve: Clang-only targets, where the fallback is the slow CALL VM.
+   Windows/MSVC is exactly such a platform, which is why the `-tailcall`
+   (clang-cl) build is a Windows artifact and not a Linux one. (macOS builds
+   with Clang and already picks up a fast VM on 8.5, so no separate macOS
+   variant is published either.) [VERIFIED bench; JUDGEMENT on the toolchain
+   trade-off]
+
 ---
 
 ## 3. The filesystem half: why metadata ops cost ~10x
@@ -321,35 +364,49 @@ exclusion.
 
 ## 5. What closes the gap, and by how much [MEASURED]
 
-The interpreter half has two real fixes, and we measured both end-to-end
-through ePHPm (serve mode, c=1, same CPU loop as §1 — a separate run from
-the §1 matrix, hence the ±0.01 ms wobble on the baseline):
+The interpreter half has two real fixes — the TAILCALL VM (§2.5) and the
+JIT — and after v0.7.3 shipped we re-measured both end-to-end through the
+**released** Windows binaries (serve mode, c=1, matched opcache ini, quiet
+box, 100% HTTP 200). The result is more nuanced than a flat "TAILCALL is
+~1.7x". (The v0.7.3 release notes quote the JIT-off interpreter figure,
+~1.7x; the JIT-on picture below is the fuller story.)
 
-| Arm | Time | vs MSVC baseline |
-|---|---|---|
-| MSVC build, CALL VM (baseline) | 5.56 ms | — |
-| clang build, TAILCALL VM | 3.14 ms | **1.77x faster** |
-| MSVC build + JIT (`opcache.jit=tracing`) | 2.33 ms | **2.39x faster** |
-| clang build + JIT | 2.53 ms | 2.20x faster |
-| Linux, HYBRID interpreter (reference) | 2.55 ms | — |
+| Arm (released v0.7.3 binaries) | MSVC (CALL) | TAILCALL | TAILCALL vs MSVC |
+|---|---|---|---|
+| Interpreter only, JIT **off** — CPU loop | 4.795 ms | 2.791 ms | **1.72x faster** |
+| Warm hot loop, JIT **on** (`opcache.jit=tracing`) | 1.835 ms | 1.976 ms | gap closed — MSVC edges ahead |
+| Cold / short code, JIT on (`cpu.php`, c=1) | 5.33 ms | 3.44 ms | **1.55x faster** |
 
-- **The TAILCALL VM** (PHP 8.5's Clang-only dispatch, §2.1) recovers almost
-  exactly the 1.77x upstream measured — because clang-cl targets the MSVC
-  ABI, the clang-built `php8embed.lib` links into ePHPm's unchanged MSVC
-  Rust pipeline with zero source changes. ePHPm v0.7.3 ships this as an
-  **experimental** `-tailcall` Windows artifact (PHP 8.5 only — TAILCALL
-  does not exist in 8.3/8.4). See
-  [the guide](/guides/windows-performance/#the-tailcall-build) for status
-  and caveats.
-- **The JIT** sidesteps the dispatch question entirely: JIT-emitted native
-  code doesn't run on the C-compiled VM at all, so the MSVC penalty
-  dissolves where the JIT lands. With `opcache.jit=tracing`, the *MSVC*
-  build beats the Linux HYBRID *interpreter* on this loop.
-- **Neither moves a filesystem-bound app much.** On the Symfony demo (dev
-  mode, c=16) TAILCALL was worth **+3%** and the JIT **~0%** — the workload
-  is metadata-bound, exactly as §2.3's calibration predicts. The levers for
-  real apps are the filesystem levers (§3.3, and the
-  [guide](/guides/windows-performance/)).
+Read those three rows as one story:
+
+- **JIT off → TAILCALL's 1.72x is the full, durable win.** This is the pure
+  interpreter number, and it is exactly what runs whenever the JIT is off:
+  in ePHPm's **multi-tenant serve** mode (where the JIT is disabled by
+  default — per-vhost `opcache_invalidate` never reclaims JIT buffer, #350),
+  in worker mode, in dev, and anywhere an operator sets
+  `opcache_jit = "disable"`. **Multi-tenant serve is TAILCALL's best
+  real-world case**: there the interpreter is the whole game, so the ~1.72x
+  lands in full.
+- **JIT on, warm hot path → the gap essentially closes.** With
+  `opcache.jit=tracing` (ePHPm's **single-site serve** default since v0.7.3,
+  #350) hot code is compiled to native machine code that never touches the
+  C interpreter's dispatch — so the host VM's dispatch quality stops
+  mattering, and MSVC+JIT and TAILCALL+JIT land on top of each other (MSVC
+  even edges ahead, and both beat the ~2.5 ms Linux HYBRID *interpreter*
+  from §1). **Do not read the 1.6–1.7x as a JIT-on single-site hot-path
+  number** — it is the *interpreter* number.
+- **JIT on, cold/short code → TAILCALL still wins (~1.55x).** The JIT only
+  helps code it has already traced and compiled; first-request paths,
+  framework bootstrap, and short-lived scripts run the interpreter even with
+  the JIT enabled, and there TAILCALL keeps a real edge (cold `cpu.php`:
+  3.44 ms vs 5.33 ms). TAILCALL's marginal value in a JIT-on single-site
+  deployment is this cold-path latency, not steady-state throughput.
+- **Neither moves a filesystem-bound app much.** On the Symfony demo (JIT
+  off) TAILCALL was worth **+4.9%** on `/en` and **+3.1%** on `/en/blog`,
+  and the app is filesystem-bound either way — ~80 req/s on Windows vs ~580
+  on Linux ext4, a 5–7x gap that holds regardless of VM, exactly as §2.3's
+  calibration predicts. The levers for real apps are the filesystem levers
+  (§3.3, and the [guide](/guides/windows-performance/)).
 
 What does **not** work: MinGW-GCC (the only compiler that yields HYBRID) is
 explicitly unsupported by PHP's Windows build system, and MSYS2 ships no PHP
