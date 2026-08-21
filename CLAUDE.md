@@ -145,7 +145,7 @@ The `TrackedBackend` wrapper in `ephpm-server/src/tracked_backend.rs` wraps any 
 
 ## CI Pipeline
 
-Runs on push/PR to main: fmt check → clippy → test → cargo-deny. Release builds triggered by `v*` tags across PHP 8.3/8.4/8.5 × linux-x64/linux-arm64/macos/windows, plus the Docker image; `Create Release` publishes only after all build legs succeed.
+Runs on push/PR to main: fmt check → clippy → test → cargo-deny. PRs touching `crates/ephpm-php/**`, `crates/ephpm/build.rs`, `xtask/**`, or `windows-php-check.yml` additionally get a Windows PHP-linked `cargo check -p ephpm-php` (`.github/workflows/windows-php-check.yml`, PHP 8.3 SDK) — the LLP64 compile gate that stub-mode CI can't provide (#318/#320/#319). Release builds triggered by `v*` tags across PHP 8.3/8.4/8.5 × linux-x64/linux-arm64/macos/windows, plus the Docker image; `Create Release` publishes only after all build legs succeed.
 
 ## Truthfulness: Docs Must Match Code
 
