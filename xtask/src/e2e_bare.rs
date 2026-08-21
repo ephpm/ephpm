@@ -243,11 +243,10 @@ fn suite_needs_fresh_node(name: &str) -> bool {
 /// suite that only ever runs a subprocess. So these run first, before any
 /// port is claimed, with just `EPHPM_CLI_BINARY` in the environment.
 ///
-/// Note this is the ONLY place the binary path is handed to a suite that
-/// doesn't mount middleware; it deliberately uses a distinct variable name
-/// rather than `EPHPM_BINARY`, which `ephpm-e2e`'s self-managed fixtures treat
-/// as an opt-in switch (see `SingleNodeSpawn::env` for why exporting that one
-/// broadly breaks `bare_process_smoke`).
+/// It deliberately uses a distinct variable name rather than `EPHPM_BINARY`,
+/// which `ephpm-e2e`'s self-managed fixtures treat as an opt-in switch to
+/// spawn their own topology (see `SELF_MANAGED_SUITES`). A `cli` suite that
+/// saw `EPHPM_BINARY` would gain that behaviour for free, which it must not.
 const NO_NODE_SUITES: &[&str] = &["cli"];
 
 /// Suites that manage their own ephpm topology entirely — the harness starts
@@ -264,10 +263,21 @@ const NO_NODE_SUITES: &[&str] = &["cli"];
 /// `hrana_listen` config must live in the suite's own template, not the
 /// shared one.
 ///
+/// `bare_process_smoke` is here because it is the only coverage `ephpm-e2e`'s
+/// own [`ClusterFixture`](../../crates/ephpm-e2e/src/lib.rs) has: it spawns a
+/// 2-node cluster from the library fixture and asserts both nodes serve PHP.
+/// That fixture writes its own config template and reserves its own loopback
+/// ports, so — exactly like `turso_cdc` — it needs no node from the harness
+/// and cannot collide with the fixed-port fixtures spawned later. Until #239
+/// it was dormant (nothing set `EPHPM_BINARY`, so it self-skipped and reported
+/// `ok`) *and* broken (it derived its docroot from `CARGO_MANIFEST_DIR`, which
+/// is xtask's under this harness). `EPHPM_DOCROOT` below fixes the second half.
+///
 /// NOTE: `EPHPM_BINARY` goes to exactly these suites and the `middleware`
-/// node — see the warning in [`SingleNodeSpawn::env`] about why it must not
-/// be exported globally (`bare_process_smoke` wakes up and fails).
-const SELF_MANAGED_SUITES: &[&str] = &["turso_cdc"];
+/// node — see the note in [`SingleNodeSpawn::env`]. It stays scoped rather
+/// than global because it is an opt-in switch for `ephpm-e2e`'s self-managed
+/// fixtures, and a suite that gets it starts spawning real processes.
+const SELF_MANAGED_SUITES: &[&str] = &["turso_cdc", "bare_process_smoke"];
 
 /// Test suites that must be excluded from bare-process runs entirely.
 ///
@@ -450,8 +460,15 @@ pub fn run(args: &[String]) -> ExitCode {
             "==> Running {} self-managed suite(s), each spawning its own ephpm topology...",
             self_managed_suites.len()
         );
+        // `EPHPM_DOCROOT` is the harness-supplied document root for suites
+        // that spawn their own nodes. It exists because a pre-built test
+        // binary exec'd from here inherits *xtask's* `CARGO_MANIFEST_DIR`, so
+        // a suite cannot derive the repo's `tests/docroot` for itself (#239).
+        // `turso_cdc` ignores it and builds a throwaway docroot in its own
+        // tempdir; `bare_process_smoke` serves this one.
         let env = vec![
             ("EPHPM_BINARY".to_string(), ephpm_bin.to_string_lossy().into_owned()),
+            ("EPHPM_DOCROOT".to_string(), docroot.to_string_lossy().into_owned()),
             ("EXPECTED_PHP_VERSION".to_string(), php_version.clone()),
         ];
         for (name, path) in &self_managed_suites {
@@ -1675,14 +1692,13 @@ impl SingleNodeSpawn {
         //
         // Do NOT hoist `EPHPM_BINARY` out of this branch and set it for every
         // suite. `ephpm-e2e`'s self-managed fixtures treat it as an opt-in
-        // switch -- `bare_process_smoke` reads it and, when present, spawns its
-        // own 2-node cluster. Exporting it globally woke that suite up for the
-        // first time ever, and it failed immediately: it derives its docroot
-        // from `CARGO_MANIFEST_DIR`, which under `cargo xtask e2e` is *xtask's*
-        // manifest dir (the harness execs pre-built test binaries, which
-        // inherit xtask's environment), so it looked for `xtask/tests/docroot`.
-        // That suite is dormant *and* broken under this harness; un-dormanting
-        // it is separate work.
+        // switch -- a suite that sees it starts spawning real ephpm processes.
+        // `bare_process_smoke` is the one that does; since #239 it gets the
+        // variable deliberately, via SELF_MANAGED_SUITES, together with the
+        // `EPHPM_DOCROOT` it needs (it cannot derive the docroot itself --
+        // pre-built test binaries inherit *xtask's* `CARGO_MANIFEST_DIR`).
+        // Setting `EPHPM_BINARY` globally would hand that switch to every
+        // suite instead, including ones that share this node.
         if let Some(lib) = &self.middleware_lib {
             env.push(("EPHPM_BINARY".to_string(), self.binary.to_string_lossy().into_owned()));
             env.push(("EPHPM_MIDDLEWARE_LIB".to_string(), lib.to_string_lossy().into_owned()));

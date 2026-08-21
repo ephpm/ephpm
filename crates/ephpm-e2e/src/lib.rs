@@ -18,10 +18,11 @@
 //!   skip gracefully when it is unset so the whole crate still compile-checks
 //!   without a built binary.
 
+use std::collections::BTreeSet;
+use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::fs;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -124,6 +125,20 @@ impl Drop for SingleNodeFixture {
     }
 }
 
+/// How long each cluster node gets to answer `/_ephpm/health`.
+///
+/// Sized against measured cold-start, not guessed: two ephpm processes
+/// starting at once take ~18-25s from `spawn` to first 200 on a Windows host
+/// (a ~120 MB binary to page in, plus PHP runtime init), and the previous 20s
+/// sat inside that spread — which showed up as intermittent "never healthy"
+/// with an *empty* stderr, i.e. a node that was fine and merely slow.
+///
+/// A generous deadline costs nothing on a healthy node (the poll returns as
+/// soon as it gets a 200) and nothing on a genuinely broken one either:
+/// [`wait_for_health`] returns immediately when the child exits, which is how
+/// a bind clash reports. Only the "hung but alive" case waits this long.
+const CLUSTER_HEALTH_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// A cluster of ephpm processes on 127.0.0.1 (each on its own port set).
 pub struct ClusterFixture {
     nodes: Vec<ClusterFixtureNode>,
@@ -146,15 +161,7 @@ impl ClusterFixture {
         }
 
         // Reserve all port sets before spawning so overlap is impossible.
-        let mut port_sets = Vec::with_capacity(size);
-        for _ in 0..size {
-            port_sets.push(ClusterPorts {
-                http: reserve_loopback_port().await?,
-                mysql: reserve_loopback_port().await?,
-                gossip: reserve_loopback_port().await?,
-                kv_data: reserve_loopback_port().await?,
-            });
-        }
+        let port_sets = reserve_cluster_ports(size).await?;
 
         let join_addrs: Vec<String> =
             port_sets.iter().map(|p| format!("127.0.0.1:{}", p.gossip)).collect();
@@ -219,9 +226,20 @@ impl ClusterFixture {
                 .and_then(|s| s.parse().ok())
                 .ok_or_else(|| anyhow!("could not parse port from {}", node.base_url))?;
             let child = node.child.as_mut().ok_or_else(|| anyhow!("node {i} has no child"))?;
-            wait_for_health(child, port, Duration::from_secs(20))
-                .await
-                .with_context(|| format!("cluster node {i} never healthy"))?;
+            if let Err(e) = wait_for_health(child, port, CLUSTER_HEALTH_TIMEOUT).await {
+                // Inline the child's stderr rather than pointing at it: the
+                // tempdir is deleted when this `Err` unwinds the fixture, so a
+                // path in the message would name a file the reader can never
+                // open. A bind clash — the failure mode this fixture is most
+                // prone to, see `GOSSIP_PORT_SPAN` — says so in one line.
+                let log = tmp.path().join(format!("node-{i}")).join("stderr.log");
+                let detail = fs::read_to_string(&log)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|e| format!("(stderr.log unreadable: {e})"));
+                return Err(e.context(format!(
+                    "cluster node {i} (http {port}) never healthy; its stderr said: {detail}"
+                )));
+            }
         }
 
         Ok(Self { nodes, _tempdir: tmp })
@@ -271,6 +289,119 @@ async fn reserve_loopback_port() -> Result<u16> {
     let port = listener.local_addr().context("local_addr")?.port();
     drop(listener);
     Ok(port)
+}
+
+/// Ports past `[cluster] bind` that a node claims without anyone reserving
+/// them.
+///
+/// `ephpm-cluster` derives the cluster-channel listener from the gossip bind
+/// address as `gossip_socket_addr().port() + 2` (see `cluster_channel.rs`), so
+/// a node with gossip on `G` also owns `G + 2`. Reserving `G..=G + 2` keeps
+/// that derived port out of every other node's port set.
+///
+/// This is what made `bare_process_smoke` fail the first time it ever ran
+/// (issue #239): the kernel hands out ephemeral ports consecutively, so node
+/// 0's gossip `G` put its channel on `G + 2` — which had already been handed
+/// to node 1 as its HTTP port. Node 1 then died with "failed to bind ...
+/// (os error 10048 / EADDRINUSE)" and the fixture reported "never healthy".
+const CLUSTER_CHANNEL_PORT_OFFSET: u16 = 2;
+
+/// Size of the port window a gossip port claims: the bind port itself through
+/// its derived cluster-channel port inclusive.
+const GOSSIP_PORT_SPAN: u16 = CLUSTER_CHANNEL_PORT_OFFSET + 1;
+
+/// Probe sockets held open while a port plan is being assembled.
+///
+/// Holding them is load-bearing: dropping a probe returns its port to the
+/// ephemeral pool, and the kernel walks that pool in order, so an early
+/// release is exactly how a rejected port comes back as the answer to the
+/// next request.
+#[derive(Default)]
+struct PortProbes {
+    tcp: Vec<tokio::net::TcpListener>,
+    udp: Vec<tokio::net::UdpSocket>,
+}
+
+/// Reserve a non-overlapping port set per node.
+///
+/// Two things here are easy to get wrong, and both did (issue #239):
+///
+/// - **Protocol.** Gossip is **UDP**; every other listener is TCP. A port that
+///   accepts a TCP bind can still refuse a UDP one — on Windows, Hyper-V/WinNAT
+///   reserve large UDP-only ranges and the bind fails with `WSAEACCES`. So the
+///   gossip port is probed with a real UDP socket.
+/// - **Derived ports.** The cluster channel is never configured, only derived
+///   (`gossip + 2`), so it has to be probed and claimed explicitly or a sibling
+///   node gets handed it.
+async fn reserve_cluster_ports(size: usize) -> Result<Vec<ClusterPorts>> {
+    let mut probes = PortProbes::default();
+    let mut claimed: BTreeSet<u16> = BTreeSet::new();
+    let mut sets = Vec::with_capacity(size);
+
+    for _ in 0..size {
+        let http = claim_tcp_port(&mut probes, &mut claimed).await?;
+        let mysql = claim_tcp_port(&mut probes, &mut claimed).await?;
+        let kv_data = claim_tcp_port(&mut probes, &mut claimed).await?;
+        let gossip = claim_gossip_port(&mut probes, &mut claimed).await?;
+        sets.push(ClusterPorts { http, mysql, gossip, kv_data });
+    }
+
+    // Release every probe now that the assignment is fixed; the children bind
+    // these ports themselves a moment later.
+    drop(probes);
+    Ok(sets)
+}
+
+/// Number of attempts any single port claim gets before giving up.
+const MAX_PORT_ATTEMPTS: usize = 64;
+
+/// Claim one unclaimed loopback TCP port.
+async fn claim_tcp_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>) -> Result<u16> {
+    for _ in 0..MAX_PORT_ATTEMPTS {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind :0")?;
+        let port = listener.local_addr().context("local_addr")?.port();
+        probes.tcp.push(listener);
+        if claimed.insert(port) {
+            return Ok(port);
+        }
+    }
+    Err(anyhow!("could not reserve a free loopback TCP port in {MAX_PORT_ATTEMPTS} attempts"))
+}
+
+/// Claim a gossip port `G` that is genuinely bindable as **UDP**, and whose
+/// derived cluster-channel port `G + 2` is genuinely bindable as **TCP**.
+///
+/// Claims the whole `G..G + GOSSIP_PORT_SPAN` window so no other node can be
+/// handed the channel port.
+async fn claim_gossip_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>) -> Result<u16> {
+    for _ in 0..MAX_PORT_ATTEMPTS {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.context("bind udp :0")?;
+        let port = socket.local_addr().context("local_addr")?.port();
+        probes.udp.push(socket);
+
+        let span: Vec<u16> = match (0..GOSSIP_PORT_SPAN)
+            .map(|off| port.checked_add(off))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(ports) if !ports.iter().any(|p| claimed.contains(p)) => ports,
+            _ => continue,
+        };
+
+        // The channel port is TCP and nobody probes it but us. If it is taken
+        // (or excluded), this whole gossip port is unusable — try another.
+        let channel = port + CLUSTER_CHANNEL_PORT_OFFSET;
+        let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", channel)).await else {
+            continue;
+        };
+        probes.tcp.push(listener);
+
+        claimed.extend(span);
+        return Ok(port);
+    }
+    Err(anyhow!(
+        "could not reserve a loopback UDP gossip port with a free TCP channel port \
+         (gossip + {CLUSTER_CHANNEL_PORT_OFFSET}) in {MAX_PORT_ATTEMPTS} attempts"
+    ))
 }
 
 /// Poll `child`'s health endpoint until it answers 200, the child exits, or
