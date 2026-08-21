@@ -9,9 +9,8 @@ When ePHPm has an embedded database configured, PHP can reach it two ways:
    `127.0.0.1:3306` and litewire translates. **This is the default and
    remains fully supported.** Zero code changes; every framework driver,
    ORM, and tool already speaks it.
-2. **The in-process bridge** — the native `ephpm_db_query()` /
-   `ephpm_db_execute()` functions run SQL through a per-thread litewire
-   session *inside the server process*.
+2. **The in-process bridge** — the native `ephpm_db_*` functions run SQL
+   through a per-thread litewire session *inside the server process*.
 
 Both hit the **same** backend object. MySQL-dialect SQL, `SHOW`/`DESCRIBE`
 emulation, `SET NAMES` no-ops, and `BEGIN`/`COMMIT`/`ROLLBACK` behave
@@ -24,7 +23,28 @@ Queries made through the bridge are recorded in
 bridge is handed the same stats-wrapping backend the wire frontends serve.
 
 > **Requires ePHPm v0.6.3 or newer.** The `ephpm_db_*` functions first
-> shipped in v0.6.3.
+> shipped in v0.6.3. `ephpm_db_run()`, `ephpm_db_columns()`,
+> `ephpm_db_in_transaction()`, `ephpm_db_available()`, `ephpm_db_errno()`
+> and `ephpm_db_error()` were added in **v0.7.4**; use
+> `function_exists()` to feature-detect them if you support older servers.
+
+## The function surface
+
+| Function | Returns | Runs SQL |
+|---|---|---|
+| `ephpm_db_query(string $sql, array $params = [])` | list of assoc rows | yes |
+| `ephpm_db_execute(string $sql, array $params = [])` | `affected_rows` / `last_insert_id` | yes |
+| `ephpm_db_run(string $sql, array $params = [])` | rows **and** OK metadata **and** `has_rowset` | yes |
+| `ephpm_db_columns()` | last statement's column metadata | no |
+| `ephpm_db_in_transaction()` | `bool` | no |
+| `ephpm_db_available()` | `bool` | no |
+| `ephpm_db_errno()` | `int` (0 = last statement succeeded) | no |
+| `ephpm_db_error()` | `?array{code, sqlstate, message}` | no |
+
+The five introspection functions never throw, never run SQL, and never
+disturb what the executing functions left behind. They describe the last
+statement **on the current worker thread**, and are reset at the end of every
+request.
 
 ## When the functions exist
 
@@ -32,6 +52,20 @@ The functions are registered by the SAPI unconditionally, so
 `function_exists('ephpm_db_query')` is `true` for any script running inside
 ePHPm — it tells you that you are on ePHPm, **not** that a database is
 available.
+
+`ephpm_db_available()` is the question you actually want answered:
+
+```php
+if (function_exists('ephpm_db_available') && ephpm_db_available()) {
+    // a statement issued now will reach a database
+}
+```
+
+It returns `true` when a backend is wired up **and**, in per-site mode, the
+current request has a tenant identity. It does not open the database, so a
+`true` can still be followed by a connection failure if the storage
+underneath is broken — but it rules out the two conditions you can act on
+in advance (no `[db.sqlite]` at all; a `Host` that matches no site).
 
 A backend is wired to the bridge whenever **`[db.sqlite]` is configured**,
 in every one of its modes:
@@ -44,14 +78,21 @@ in every one of its modes:
 | `[db.mysql]` / `[db.postgres]` proxy only | **No** |
 | No `[db.*]` block at all | **No** |
 
-Where it is not available, both functions throw:
+Where it is not available, the executing functions throw:
 
 ```
 Exception: ephpm_db: no embedded database is active (requires [db.sqlite])
 ```
 
-with exception code `0`. The bridge does not proxy to `[db.mysql]` or
-`[db.postgres]`; for those, use the wire path.
+with exception code **`2000`** (`ephpm_db_errno()` reports the same). The
+bridge does not proxy to `[db.mysql]` or `[db.postgres]`; for those, use the
+wire path.
+
+> **Changed in v0.7.4.** This exception previously carried code `0`. The
+> message text is unchanged — adapters that match on the wording are
+> unaffected — but the code is now a documented, reserved value so it can be
+> told apart from a SQL error without parsing text. See
+> [Errors](#errors).
 
 ## `ephpm_db_query()`
 
@@ -111,6 +152,123 @@ A `SELECT` routed through `ephpm_db_execute()` returns **zeros** rather than
 throwing — it is defined that way deliberately, so an adapter that
 misclassifies a statement degrades instead of failing.
 
+`last_insert_id` is the **connection's** most recent insert rowid, not
+"what this statement inserted" — exactly like `mysqli_insert_id()` on the
+wire. After an `UPDATE`, a `COMMIT`, or any other non-`INSERT` OK it still
+reports the id of the last `INSERT` on that thread's session. Read
+`affected_rows` to learn whether the statement changed anything, and capture
+`last_insert_id` immediately after the `INSERT` that produced it. A statement
+that returned a **result set** reports zero for both.
+
+## `ephpm_db_run()`
+
+```php
+ephpm_db_run(string $sql, array $params = []): array{
+    has_rowset: bool,
+    rows: array,
+    columns: array,
+    affected_rows: int,
+    last_insert_id: int,
+}
+```
+
+**Added in v0.7.4.** The unified entry point: it runs the statement and tells
+you what the statement actually did.
+
+```php
+$r = ephpm_db_run($sql, $params);
+
+if ($r['has_rowset']) {
+    foreach ($r['rows'] as $row) { /* ... */ }
+} else {
+    $n = $r['affected_rows'];
+}
+```
+
+This exists so an adapter implementing a *single* `query()` API —
+`mysqli::query()`, `wpdb::query()`, Laravel's
+`statement()`/`affectingStatement()`, DBAL — never has to guess which of
+`ephpm_db_query()` / `ephpm_db_execute()` to call by inspecting the SQL's
+first significant keyword. `has_rowset` comes from the executed statement,
+not from the SQL text.
+
+Shapes worth knowing:
+
+- **`rows` is always an array**, never `null`. When `has_rowset` is `false`
+  it is `[]`, so you can `foreach` unconditionally. `has_rowset` is the
+  discriminator — a zero-row `SELECT` also gives you `[]`.
+- **`columns` is present even for a zero-row result set** (see
+  [`ephpm_db_columns()`](#ephpm_db_columns)). It is `[]` when the statement
+  produced no result set.
+- **`affected_rows` / `last_insert_id` are zero for a result set**, matching
+  `ephpm_db_execute()`'s long-standing contract.
+- Errors throw exactly as the other two functions do.
+
+`ephpm_db_query()` and `ephpm_db_execute()` are unchanged and are not
+deprecated. Use them when you already know the statement's shape;
+`ephpm_db_run()` is for when you do not.
+
+## `ephpm_db_columns()`
+
+```php
+ephpm_db_columns(): array   // list of ['name' => string, 'type' => ?string]
+```
+
+**Added in v0.7.4.** Column metadata of the last `ephpm_db_*` statement on
+this thread.
+
+```php
+$rows = ephpm_db_query('SELECT id, label FROM t WHERE id = ?', [999]);
+// $rows === []  — no rows, and therefore no column names in the result
+
+$cols = ephpm_db_columns();
+// [ ['name' => 'id', 'type' => 'INTEGER'], ['name' => 'label', 'type' => 'TEXT'] ]
+```
+
+That is the point: a zero-row result has no rows to carry its column names,
+so `wpdb::get_col_info()`, `mysqli_result::fetch_fields()` and DBAL's
+`columnCount()` had nothing to report after a `SELECT` that matched nothing.
+
+- Returns `[]` when the last statement produced no result set, when nothing
+  has run yet, or when no embedded database is active.
+- `type` is the column's **declared schema type**. It is `null` both for a
+  column with no declared type and for an expression (`SELECT a + 1`) —
+  SQLite draws no distinction between those, so neither can this.
+- It is not affected by reading the rows first; call it before or after.
+
+## `ephpm_db_in_transaction()`
+
+```php
+ephpm_db_in_transaction(): bool
+```
+
+**Added in v0.7.4.** Whether **this worker thread's** session is inside an
+explicit transaction — read from the session's own flag, the same state the
+MySQL wire frontend reports as `SERVER_STATUS_IN_TRANS`.
+
+```php
+ephpm_db_execute('BEGIN');
+try {
+    // ...
+    ephpm_db_execute('COMMIT');
+} catch (\Throwable $e) {
+    if (ephpm_db_in_transaction()) {
+        ephpm_db_execute('ROLLBACK');
+    }
+    throw $e;
+}
+```
+
+Without it, a `transaction()` helper has to fire `ROLLBACK` blind after any
+failure and swallow the resulting error, because it cannot know whether a
+transaction is actually open — the failing statement may have been the
+`BEGIN` itself, or the [request-end rollback](#the-request-end-rollback-safety-net)
+may already have run.
+
+Returns `false` when the thread has no session yet or no embedded database is
+active. In both cases nothing can be open, so it is an answer and not a
+guess. Never throws.
+
 ## Parameter binding
 
 Placeholders are positional `?`. Parameters are bound, never interpolated —
@@ -135,8 +293,9 @@ Exception: ephpm_db: unsupported parameter type array (only null, bool,
 int, float, and string parameters bind)
 ```
 
-with exception code `0`. Convert objects yourself (`DateTimeInterface` →
-formatted string, enum → its backing value) before binding.
+with exception code **`2003`** (changed from `0` in v0.7.4; the message is
+unchanged). Convert objects yourself (`DateTimeInterface` → formatted string,
+enum → its backing value) before binding.
 
 ## Errors
 
@@ -161,6 +320,68 @@ error, `1205` lock timeout, `1290` read-only, `1452` foreign key. Anything
 the mapper cannot classify arrives as `1105` with SQLSTATE `HY000`.
 
 Catch `\Exception` (or `\Throwable`); do not catch `PDOException`.
+
+### Telling a bridge problem from a SQL problem
+
+**Since v0.7.4**, every `ephpm_db_*` exception carries a **nonzero** code, and
+infrastructure failures use reserved values so they can be distinguished from
+a SQL error without matching message text:
+
+| Code | Meaning | SQLSTATE |
+|---|---|---|
+| `2000` | No embedded database is active (`[db.sqlite]` not configured) | `HY000` |
+| `2001` | Per-site mode, and this request has no tenant identity | `HY000` |
+| `2002` | The database for this request could not be opened | `HY000` |
+| `2003` | A parameter's PHP type cannot bind (thrown before the statement runs) | — |
+
+These sit in MySQL's **client**-error range (2000–2999, the `CR_*` codes),
+which a server never emits. A SQL error always carries a **server**-range
+code, so the two can never collide:
+
+```php
+try {
+    ephpm_db_run($sql, $params);
+} catch (\Exception $e) {
+    if ($e->getCode() >= 2000 && $e->getCode() < 3000) {
+        // the bridge could not run this — infrastructure, not your SQL
+    } else {
+        // a genuine SQL error; $e->getCode() is the MySQL error number
+    }
+}
+```
+
+Codes `2000` and `2003` were `0` before v0.7.4, and `2001`/`2002` were the
+generic `1105`. **All four messages are unchanged**, so adapters that
+currently detect these cases by matching the message text keep working.
+
+### `ephpm_db_errno()` and `ephpm_db_error()`
+
+```php
+ephpm_db_errno(): int
+ephpm_db_error(): ?array{code: int, sqlstate: string, message: string}
+```
+
+**Added in v0.7.4.** The last error on this thread, in parts — for
+`mysqli_errno()` / `mysqli_error()` / `mysqli_sqlstate()` /
+`PDO::errorInfo()`-shaped adapter APIs. Both survive the exception being
+caught:
+
+```php
+try {
+    ephpm_db_query($sql);
+} catch (\Exception $e) {
+    ephpm_db_errno();   // 1062
+    ephpm_db_error();   // ['code' => 1062, 'sqlstate' => '23000',
+                        //  'message' => 'UNIQUE constraint failed: users.id']
+}
+```
+
+- `ephpm_db_errno()` returns `0` and `ephpm_db_error()` returns `null` when
+  the last statement **succeeded** — not "when no error has ever occurred".
+  Both are cleared by the next statement on the thread and at request end.
+- `message` is the backend message alone. The `SQLSTATE[xxxxx]: ` prefix
+  belongs to the exception's composed message, not to this array.
+- Neither ever throws.
 
 ## The session model
 
@@ -257,6 +478,10 @@ silently join it. That is the bug this prevents.
 Treat it as a safety net, not an API. Abandoned writes are lost, and you get
 a warning in the log every time. Commit or roll back explicitly.
 
+Once it has run, `ephpm_db_in_transaction()` reports `false` — so a wrapper
+that checks before rolling back will not fire a second, pointless `ROLLBACK`
+against a session that has already been cleaned up.
+
 ### Recovery from a dead connection
 
 If the backend connection dies underneath a thread — during a clustered
@@ -272,26 +497,27 @@ cleaned up by the request-end rollback above instead.
 
 ## What the bridge does not do
 
-These are real, current limitations. Each has an open issue.
+These are real, current limitations.
 
 - **No streaming cursor.** `ephpm_db_query()` buffers the entire result set
   before returning it. Correct, but not constant-memory — a Laravel
   `cursor()`/`lazy()` call over the bridge is buffered underneath. Do not
   stream a million rows through it.
   ([#264](https://github.com/ephpm/ephpm/issues/264))
-- **No column metadata on empty results.** A zero-row `SELECT` returns `[]`,
-  which cannot carry column names. Column-introspection APIs
-  (`wpdb::get_col_info()`, `mysqli_result::fetch_fields()`, DBAL's
-  `columnCount()`) therefore cannot report anything after a zero-row query.
-  ([#262](https://github.com/ephpm/ephpm/issues/262))
-- **No has-rowset signal.** Rows and OK metadata are split across two
-  functions, so an adapter implementing a *unified* `query()` API must
-  decide which one to call by inspecting the SQL's first significant
-  keyword. That heuristic has edges — `WITH … INSERT` hybrids and
-  `INSERT … RETURNING` are the known ones. If you write your own adapter,
-  be aware you are inheriting this; the maintained adapters below already
-  handle the common cases.
-  ([#263](https://github.com/ephpm/ephpm/issues/263))
+- **`WITH … SELECT` and `INSERT … RETURNING` do not work.** Not a bridge
+  limitation — litewire routes a statement to the engine's query or execute
+  path by matching its first keyword, and neither of these matches. Both
+  fail with `SQLSTATE[HY000]: SQLite error: unexpected row during execution`,
+  on the **wire path too**. Two things to know:
+
+  - `ephpm_db_run()`'s `has_rowset` cannot rescue them. It reports what the
+    statement *did*, and these statements do not run.
+  - **`INSERT … RETURNING` still writes its row** before failing. Retrying
+    on that error double-inserts. Split it into an `INSERT` followed by a
+    `SELECT` instead.
+
+  Fixing this means teaching litewire's statement classifier about CTEs and
+  `RETURNING`.
 - **No named placeholders**, no prepared-statement handles, no multi-result
   iteration API.
 

@@ -48,9 +48,13 @@ Every package requires **PHP 8.2+**.
 ## Database adapters
 
 These route SQL through the in-process
-[`ephpm_db_query()` / `ephpm_db_execute()`](/guides/db-from-php/) bridge — no
-socket, no wire protocol, no PDO. They need an ePHPm build that provides those
-functions (**v0.6.3 or newer**) with `[db.sqlite]` configured.
+[`ephpm_db_*`](/guides/db-from-php/) bridge — no socket, no wire protocol, no
+PDO. They need an ePHPm build that provides those functions (**v0.6.3 or
+newer**) with `[db.sqlite]` configured. The adapter-facing additions of
+**v0.7.4** — `ephpm_db_run()`, `ephpm_db_columns()`,
+`ephpm_db_in_transaction()`, `ephpm_db_available()`, `ephpm_db_errno()`,
+`ephpm_db_error()` — are additive; an adapter written against v0.6.3 keeps
+working unchanged.
 
 | Package | Repository | What it is |
 |---|---|---|
