@@ -3433,7 +3433,11 @@ PHP_FUNCTION(ephpm_db_available)
  *
  * Cleared by the next statement on this thread and at request end, so 0
  * means "the last statement succeeded", not "no error has ever occurred".
- * Never throws. */
+ *
+ * Reports on the last statement that REACHED the bridge. A parameter-binding
+ * refusal (EPHPM_DB_ERR_BAD_PARAM) is thrown by ephpm_db_push_params before
+ * anything is executed, so it leaves errno untouched — the thrown exception's
+ * code is the signal for that case. Never throws. */
 PHP_FUNCTION(ephpm_db_errno)
 {
     ZEND_PARSE_PARAMETERS_NONE();

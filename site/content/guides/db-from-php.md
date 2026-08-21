@@ -379,6 +379,9 @@ try {
 - `ephpm_db_errno()` returns `0` and `ephpm_db_error()` returns `null` when
   the last statement **succeeded** — not "when no error has ever occurred".
   Both are cleared by the next statement on the thread and at request end.
+- They report on the last statement that *reached the bridge*. A
+  parameter-binding refusal (code `2003`) is thrown before anything runs, so
+  it leaves them untouched; the exception's own code is the signal there.
 - `message` is the backend message alone. The `SQLSTATE[xxxxx]: ` prefix
   belongs to the exception's composed message, not to this array.
 - Neither ever throws.
