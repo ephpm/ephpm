@@ -20,13 +20,15 @@ see the [analysis page](/analysis/php-on-windows/) for setup):
 
 | Your workload | Windows penalty | What helps | Measured effect |
 |---|---|---|---|
-| CPU-bound PHP (loops, crypto, image math, parsers) | ~2.0–2.2x | TAILCALL build, JIT | **1.77x / 2.39x** on our CPU loop |
+| CPU-bound PHP (loops, crypto, image math, parsers) | ~2.0–2.2x | JIT (on by default single-site), TAILCALL build | JIT **~2.4x**; TAILCALL **1.72x** interpreter-only (JIT off), **~1.55x** on cold code with JIT on, ≈0 marginal on the JIT-on hot path |
 | Typical web app (framework, autoloader, templates) | mixed, mostly filesystem | serve-mode defaults, fewer file ops | single digits from runtime levers; the win is cutting file operations |
 | File-metadata-heavy (dev mode, deep `vendor/`, cache-miss storms) | ~10x on the metadata itself | fewer `stat`s: prod opcache settings, classmaps, Dev Drive | eliminates *repeat* cost; first touch stays expensive |
 
-For calibration: on the Symfony demo (dev mode, c=16) the TAILCALL build was
-worth **+3%** end-to-end and the JIT **~0%** — real apps are
-filesystem-bound on Windows, and no interpreter lever changes that.
+For calibration: on the Symfony demo the TAILCALL build was worth **+3–5%**
+end-to-end (+4.9% on `/en`, +3.1% on `/en/blog`, JIT off) and the JIT ~0% —
+real apps are filesystem-bound on Windows (~80 req/s vs ~580 on Linux ext4,
+a 5–7x gap that holds regardless of VM), and no interpreter lever changes
+that.
 
 ---
 
@@ -47,9 +49,31 @@ and compiles under clang-cl — which is MSVC-ABI-compatible, so a clang-built
 `php8embed.lib` links into ePHPm's unchanged Rust pipeline.
 ([Full mechanism.](/analysis/php-on-windows/#2-the-interpreter-half-msvc-gets-a-slower-virtual-machine))
 
-Measured end-to-end through ePHPm on Windows: **1.6–1.7x faster on
-CPU-bound PHP** than the MSVC artifact (serve-mode CPU loop: 3.14 ms vs
-5.56 ms; reference loops in #329 agree).
+Measured end-to-end through ePHPm on Windows: **1.72x faster on the pure
+interpreter** than the MSVC artifact (CPU loop, JIT off: 2.79 ms vs 4.80 ms;
+reference loops in #329 agree). Read that number precisely — it is the
+*interpreter* win, and it lands in full exactly where the interpreter does
+the work:
+
+- **Multi-tenant serve**, where ePHPm ships the JIT off by default (see
+  [The JIT](#the-jit)) — the interpreter is the whole game, so the ~1.72x is
+  the entire benefit. This is TAILCALL's strongest real-world case.
+- **Cold / short / first-request code** — framework bootstrap, first hits,
+  short scripts — which run the interpreter even when the JIT is enabled
+  (~1.55x there).
+
+Where it is a *smaller* win: a **single-site** serve deployment, which since
+v0.7.3 runs the tracing JIT **on** by default. JIT-compiled hot code
+sidesteps the interpreter's dispatch entirely, so on a warm hot loop
+MSVC+JIT and TAILCALL+JIT are neck-and-neck (see §5 of the
+[analysis](/analysis/php-on-windows/)) — TAILCALL's remaining edge there is
+cold-path latency, not steady-state throughput. Don't expect 1.72x on a
+JIT-on single-site hot path.
+
+And note *why* it is a separate binary rather than a config flag: the Zend VM
+kind is fixed when PHP is compiled — there is no `opcache.vm_kind` or
+`php.ini` toggle
+([how the TAILCALL VM works, §2.5](/analysis/php-on-windows/#2-the-interpreter-half-msvc-gets-a-slower-virtual-machine)).
 
 - It ships as a separate, suffixed download:
   `ephpm-vX.Y.Z+php8.5.7-windows-x86_64-tailcall.tar.gz` alongside the
@@ -67,38 +91,51 @@ CPU-bound PHP** than the MSVC artifact (serve-mode CPU loop: 3.14 ms vs
 
 The opcache JIT compiles hot code to native machine code, which doesn't run
 on the C-compiled interpreter loop at all — so the MSVC dispatch penalty
-dissolves wherever the JIT lands. On our CPU loop it was the single biggest
-lever: **2.39x** (5.56 ms → 2.33 ms), faster than Linux's HYBRID
-*interpreter* on the same workload.
+dissolves wherever the JIT lands. On our CPU loop it is the single biggest
+lever: **~2.4x**, faster than Linux's HYBRID *interpreter* on the same
+workload. Because it emits its own machine code, the JIT also makes the
+choice of interpreter (CALL vs TAILCALL) largely moot on hot paths — see
+[the TAILCALL section](#the-tailcall-build) above.
 
-PHP leaves the JIT off by default (`opcache.jit=disable`), and so does ePHPm
-— it helps CPU-bound work and can regress the I/O-bound request path typical
-of web apps, so it is a deliberate opt-in. Enable it through
-`[php] ini_overrides`:
+Since v0.7.3, ePHPm's JIT default is **shaped by mode** (#350), not a blanket
+off:
+
+| Mode | `[php] opcache_jit` unset → | Why |
+|---|---|---|
+| Single-site `ephpm serve` | **`tracing` (on)** | measured ~2.4x on CPU-bound PHP; single-process embed avoids the multi-process SHM JIT bugs |
+| Multi-tenant (`[server] sites_dir`) | `disable` | per-vhost `opcache_invalidate` never reclaims JIT buffer, so deploy churn would silently exhaust it |
+| Worker mode (`[php] mode = "worker"`) | `disable` | JIT works there but the recycle lifecycle isn't soaked — opt in explicitly |
+| Dev | `disable` | PHP's own default |
+
+So on a single-site box you already get the JIT with no config change. To
+pin it explicitly in any mode, set the `[php] opcache_jit` knob — an explicit
+value wins everywhere, and a dedicated startup line always states the
+effective JIT state and why:
 
 ```toml
 [php]
-ini_overrides = [["opcache.jit", "tracing"]]
+opcache_jit = "tracing"   # "tracing" | "function" | "disable"
+                          # env override: EPHPM_PHP__OPCACHE_JIT
 
-# Optional: pin the JIT code buffer (MB). When unset, ePHPm pre-sizes a
-# buffer automatically in serve mode (~1/64 of the memory budget, clamped
-# 32–64 MB), so enabling JIT needs no other config change.
+# Optional: pin the JIT code buffer (MB). When unset, ePHPm auto-sizes it in
+# serve mode (~1/64 of the memory budget, clamped 32–64 MB), so an enabled
+# JIT is never silently bufferless.
 opcache_jit_buffer_size = 128
 ```
 
-`ini_overrides` is a list of `[directive, value]` pairs applied after
-`ini_file` (if set), so it wins over both. Two caveats, both measured or
-verified:
+See the [config reference](/reference/config/#opcache-jit) for the full
+shaped-default table. Two caveats, both measured or verified:
 
-- **Expect ~0% on filesystem-bound apps.** Symfony demo, dev mode, c=16:
-  no measurable change. The JIT is a CPU lever, not a web-app lever.
-- **Multi-tenant deploys never reclaim JIT buffer.** In multi-site mode,
-  a per-vhost `ephpm deploy` / `opcache_invalidate()` invalidates the
-  opcode cache entries but the JIT'd code they produced stays resident —
-  the JIT buffer only grows until process restart (measured). On a
-  many-tenant box with frequent deploys, either size
-  `opcache_jit_buffer_size` for the accumulation and restart on a schedule,
-  or leave the JIT off.
+- **Expect ~0% on filesystem-bound apps.** Symfony demo: no measurable
+  change. The JIT is a CPU lever, not a web-app lever.
+- **Multi-tenant deploys never reclaim JIT buffer — which is why the
+  multi-tenant default is off.** A per-vhost `ephpm deploy` /
+  `opcache_invalidate()` invalidates the opcode cache entries but the JIT'd
+  code they produced stays resident — the JIT buffer only grows until
+  process restart (measured). If you override the default and enable the JIT
+  on a many-tenant box, watch the `ephpm_opcache_jit_buffer_free_bytes`
+  gauge for exhaustion, size `opcache_jit_buffer_size` for the accumulation,
+  and restart on a schedule.
 
 ---
 
@@ -238,8 +275,9 @@ request = 60          # the only runaway-request ceiling on Windows
 # intent survives someone running the same config under `ephpm dev`:
 opcache_validate_timestamps = false
 
-# Opt-in JIT — only if your workload is CPU-bound (see caveats above):
-# ini_overrides = [["opcache.jit", "tracing"]]
+# Single-site serve already runs the tracing JIT by default (since v0.7.3).
+# Turn it off with:   opcache_jit = "disable"
+# Or pin it on:       opcache_jit = "tracing"
 ```
 
 Run it with `ephpm serve --config ephpm.toml`, deploy code with
