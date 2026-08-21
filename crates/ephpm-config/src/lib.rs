@@ -2108,6 +2108,32 @@ pub enum OverloadPolicy {
     Shed,
 }
 
+/// How the in-memory PHP **code bundle** is built (`[php] code_bundle`).
+///
+/// The bundle is a transparent, read-only overlay in front of the filesystem
+/// for `.php` source discovery, reads, and `stat` — apps require nothing. On a
+/// hit, `require`/`file_exists`/`is_file`/`filemtime` are answered from RAM with
+/// **no syscall**; a miss falls through to the real filesystem. It exists to
+/// reclaim the Windows filesystem-metadata tax (~50 µs/`stat` vs ~1–3 µs on
+/// Linux). See `site/content/roadmap/in-memory-code-bundle.md`.
+///
+/// **Experimental (POC).** Single document-root only; multi-site
+/// (`[server] sites_dir`) is not yet bundled and is treated as `off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeBundleMode {
+    /// **Default.** No bundle; every code probe/read hits the filesystem exactly
+    /// as before. Zero overhead.
+    Off,
+
+    /// Scan `document_root` recursively at startup and index every `.php` file
+    /// into RAM. Convenient for dev/container boot; re-scans every start.
+    Scan,
+    // Note: a prebuilt `.ebundle` artifact (`"file"`) is a documented follow-on
+    // (image-build-time bundle) and is intentionally NOT a variant yet — serde
+    // rejects `file` as an unknown value rather than silently no-op'ing.
+}
+
 /// PHP runtime configuration.
 #[derive(Debug, Deserialize)]
 pub struct PhpConfig {
@@ -2632,6 +2658,66 @@ pub struct PhpConfig {
     /// Default: `1048576` (1 MiB).
     #[serde(default = "default_worker_stream_threshold")]
     pub worker_stream_threshold: u64,
+
+    /// **EXPERIMENTAL (POC).** In-memory code bundle mode ([`CodeBundleMode`]).
+    ///
+    /// A transparent, read-only overlay that answers `.php` source discovery,
+    /// reads, and `stat` from RAM so the code path never touches the filesystem
+    /// — apps need no changes (`require`/`file_exists`/`filemtime` on ordinary
+    /// paths just get answered faster; misses fall through to disk). Reclaims
+    /// the Windows filesystem tax (~50 µs/`stat`); on Linux the win is small.
+    ///
+    /// - `"off"` (**default**) — no bundle, zero overhead.
+    /// - `"scan"` — scan `document_root` at startup and index every `.php` file.
+    ///
+    /// **Interaction:** when on, also set
+    /// [`opcache_validate_timestamps`](Self::opcache_validate_timestamps)`= false`
+    /// or OPcache keeps `stat`-ing cached files and the main warm-path win is
+    /// left on the table — startup **warns** if the bundle is on with validation
+    /// still on. Single-docroot only; ignored (treated as `off`) in multi-site
+    /// mode (`[server] sites_dir`), with a startup warning.
+    ///
+    /// Env override: `EPHPM_PHP__CODE_BUNDLE=scan`.
+    ///
+    /// Default: `"off"`.
+    #[serde(default = "default_code_bundle")]
+    pub code_bundle: CodeBundleMode,
+
+    /// Hard cap on the bytes the code bundle may hold resident in RAM.
+    ///
+    /// If indexing would push the resident total past this cap, ePHPm **refuses
+    /// to build the bundle** and falls through to normal disk access (no partial
+    /// bundle is ever installed), logging a WARN. This bounds the blast radius
+    /// of pointing `code_bundle = "scan"` at a pathological monorepo. With
+    /// compression on, the *compressed* resident size is what counts against the
+    /// cap.
+    ///
+    /// Ignored when `code_bundle = "off"`.
+    ///
+    /// Env override: `EPHPM_PHP__CODE_BUNDLE_MAX_BYTES=536870912`.
+    ///
+    /// Default: `268435456` (256 MiB).
+    #[serde(default = "default_code_bundle_max_bytes")]
+    pub code_bundle_max_bytes: u64,
+
+    /// Optional compression for bundled source held in RAM
+    /// (`"none"`/`"gzip"`/`"zstd"`/`"brotli"`).
+    ///
+    /// Selecting a codec is **Model B**: source is kept *compressed* in RAM and
+    /// decompressed on every open — smallest footprint, a per-open CPU cost.
+    /// `"none"` (the default) keeps raw source resident: no per-open cost, larger
+    /// footprint. (Model A — decompress once at load — is runtime-identical to
+    /// `"none"` and differs only in image size/load time, so it is not a separate
+    /// knob.)
+    ///
+    /// Ignored when `code_bundle = "off"`. An unrecognised value is a startup
+    /// error.
+    ///
+    /// Env override: `EPHPM_PHP__CODE_BUNDLE_COMPRESSION=zstd`.
+    ///
+    /// Default: `"none"`.
+    #[serde(default = "default_code_bundle_compression")]
+    pub code_bundle_compression: String,
 }
 
 impl Config {
@@ -3052,6 +3138,9 @@ impl Default for PhpConfig {
             worker_boot_timeout: default_worker_boot_timeout(),
             worker_populate_superglobals: false,
             worker_stream_threshold: default_worker_stream_threshold(),
+            code_bundle: default_code_bundle(),
+            code_bundle_max_bytes: default_code_bundle_max_bytes(),
+            code_bundle_compression: default_code_bundle_compression(),
         }
     }
 }
@@ -3074,6 +3163,12 @@ impl PhpConfig {
     #[must_use]
     pub fn is_pool_engine(&self) -> bool {
         !self.is_worker_mode() && self.fpm_engine == FpmEngine::Pool
+    }
+
+    /// Whether an in-memory code bundle is requested (`code_bundle != "off"`).
+    #[must_use]
+    pub fn is_code_bundle_enabled(&self) -> bool {
+        self.code_bundle != CodeBundleMode::Off
     }
 
     /// Whether stack-overflow crash containment is requested **and applicable**
@@ -4115,6 +4210,18 @@ fn default_php_mode() -> String {
 
 fn default_fpm_engine() -> FpmEngine {
     FpmEngine::SpawnBlocking
+}
+
+fn default_code_bundle() -> CodeBundleMode {
+    CodeBundleMode::Off
+}
+
+fn default_code_bundle_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn default_code_bundle_compression() -> String {
+    "none".to_string()
 }
 
 fn default_crash_containment() -> bool {
@@ -5229,6 +5336,59 @@ idle_timeout_secs = 15
         assert_eq!(config.php.max_execution_time, 30);
         assert_eq!(config.php.memory_limit, "128M");
         assert_eq!(config.server.index_files, vec!["index.php", "index.html"]);
+    }
+
+    // ── [php] code_bundle ────────────────────────────────────────────────
+
+    /// Off by default, both at the struct default and through a loaded config.
+    #[test]
+    fn code_bundle_defaults_to_off() {
+        assert_eq!(PhpConfig::default().code_bundle, CodeBundleMode::Off);
+        assert!(!PhpConfig::default().is_code_bundle_enabled());
+        assert_eq!(PhpConfig::default().code_bundle_max_bytes, 256 * 1024 * 1024);
+        assert_eq!(PhpConfig::default().code_bundle_compression, "none");
+        let config = Config::default_config().expect("default config should load");
+        assert_eq!(config.php.code_bundle, CodeBundleMode::Off);
+    }
+
+    /// `[php]` present but the bundle fields absent must still resolve to the
+    /// defaults (no section-level derive zeroing them).
+    #[test]
+    fn code_bundle_section_present_absent_fields_are_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\nmax_execution_time = 60\n").unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.code_bundle, CodeBundleMode::Off);
+        assert_eq!(config.php.code_bundle_max_bytes, 256 * 1024 * 1024);
+    }
+
+    /// `scan` parses and flips the enabled predicate; the companion knobs parse.
+    #[test]
+    fn code_bundle_scan_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[php]\ncode_bundle = \"scan\"\ncode_bundle_max_bytes = 1048576\n\
+             code_bundle_compression = \"zstd\"\n",
+        )
+        .unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.code_bundle, CodeBundleMode::Scan);
+        assert!(config.php.is_code_bundle_enabled());
+        assert_eq!(config.php.code_bundle_max_bytes, 1_048_576);
+        assert_eq!(config.php.code_bundle_compression, "zstd");
+    }
+
+    /// An unknown mode (e.g. the not-yet-implemented `file`) is a load error,
+    /// never a silent no-op.
+    #[test]
+    fn code_bundle_unknown_mode_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\ncode_bundle = \"file\"\n").unwrap();
+        assert!(Config::load(&file).is_err(), "unknown code_bundle mode must fail to load");
     }
 
     // ── [php] fpm_engine ─────────────────────────────────────────────────

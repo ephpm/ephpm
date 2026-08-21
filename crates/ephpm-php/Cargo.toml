@@ -30,6 +30,11 @@ bytes.workspace = true
 # Worker idle gauge, recorded where it is actually observable (the dispatch
 # recv in worker_bridge).
 metrics.workspace = true
+# Code bundle (code_bundle.rs): optional per-open decompression of bundled PHP
+# source. Same codecs the KV store uses — already in the workspace lockfile.
+flate2.workspace = true
+zstd.workspace = true
+brotli.workspace = true
 
 [build-dependencies]
 bindgen = "0.72"

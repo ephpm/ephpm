@@ -13,6 +13,7 @@ fn main() {
     println!("cargo::rustc-check-cfg=cfg(php_max_exec_timers)");
     println!("cargo::rerun-if-changed=wrapper.h");
     println!("cargo::rerun-if-changed=ephpm_wrapper.c");
+    println!("cargo::rerun-if-changed=code_bundle_hooks.c");
     println!("cargo::rerun-if-changed=resolver_shim.c");
     println!("cargo::rerun-if-changed=crash_guard.c");
     println!("cargo::rerun-if-env-changed=PHP_SDK_PATH");
@@ -362,6 +363,11 @@ fn compile_wrapper(include_dir: &Path, target_os: &str, has_exec_timers: bool) {
     let mut build = cc::Build::new();
     build
         .file("ephpm_wrapper.c")
+        // In-memory code bundle C hooks (zend_resolve_path /
+        // zend_stream_open_function / plain-files url_stat overrides). Needs the
+        // PHP headers, so it compiles only in php_linked mode alongside the
+        // wrapper. Inert until ephpm_bundle_install_hooks() is called from Rust.
+        .file("code_bundle_hooks.c")
         // Bundles the __cpu_indicator_init_local → __cpu_indicator_init
         // thunk for GCC 13.x hosts linking against an SDK compiled with
         // GCC 14+. See cpu_compat.c for the full rationale.

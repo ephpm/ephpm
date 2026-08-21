@@ -2,6 +2,7 @@
 // are documented with comments before each unsafe block.
 #![allow(unsafe_code)]
 
+pub mod code_bundle;
 pub mod crash_guard;
 pub mod db_bridge;
 pub mod jit_metrics;
@@ -365,6 +366,10 @@ pub enum PhpError {
     /// TSRM thread registration failed.
     #[error("PHP thread initialization failed")]
     ThreadInitFailed,
+
+    /// A code bundle was already installed for this process.
+    #[error("a code bundle is already installed")]
+    BundleAlreadyInstalled,
 
     /// The script was unwound by a `zend_bailout()` — out of memory, a
     /// resource limit, OPcache, or a C extension calling it directly.
@@ -803,6 +808,28 @@ impl PhpRuntime {
         {
             let _ = secs;
         }
+    }
+
+    /// Install an in-memory code bundle as a transparent overlay in front of the
+    /// filesystem for `.php` source discovery, reads, and `stat`.
+    ///
+    /// Must be called **once**, after [`init`](Self::init) and before serving
+    /// requests (the single-threaded startup path). Swaps PHP's
+    /// `zend_resolve_path`, `zend_stream_open_function`, and the plain-files
+    /// `url_stat` op so bundle hits are answered from RAM and misses fall
+    /// through to the real filesystem. In stub mode the bundle is stored but no
+    /// PHP hooks are installed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PhpError::NotInitialized`] if the runtime is not yet
+    /// initialized, or [`PhpError::BundleAlreadyInstalled`] if a bundle was
+    /// already installed.
+    pub fn install_code_bundle(bundle: code_bundle::Bundle) -> Result<(), PhpError> {
+        if !PHP_INITIALIZED.load(Ordering::Acquire) {
+            return Err(PhpError::NotInitialized);
+        }
+        code_bundle::install(bundle).map_err(|_| PhpError::BundleAlreadyInstalled)
     }
 
     /// Check whether the PHP runtime is initialized and ready.

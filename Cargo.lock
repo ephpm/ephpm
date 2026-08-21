@@ -1409,10 +1409,12 @@ dependencies = [
  "async-channel",
  "async-trait",
  "bindgen 0.72.1",
+ "brotli",
  "bytes",
  "cc",
  "ephpm-kv",
  "ephpm-ws",
+ "flate2",
  "http",
  "libc",
  "litewire",
@@ -1422,6 +1424,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "zstd",
 ]
 
 [[package]]

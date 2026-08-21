@@ -1305,6 +1305,74 @@ fn run_with_config(
     // per-thread timers and in stub mode.
     ephpm_php::PhpRuntime::set_max_execution_time(config.php.max_execution_time);
 
+    // In-memory code bundle (experimental `[php] code_bundle`). Built here on the
+    // single-threaded startup path — after PHP init (the hooks patch PHP's C
+    // function pointers) and before the tokio runtime exists (the bundle is
+    // immutable-after-install and read concurrently by every PHP thread with no
+    // lock). A build failure or an over-cap corpus is non-fatal: ePHPm logs and
+    // falls through to normal disk access.
+    if config.php.is_code_bundle_enabled() {
+        if config.server.sites_dir.is_some() {
+            tracing::warn!(
+                "[php] code_bundle is set but multi-site mode ([server] sites_dir) is \
+                 active — the code bundle is single-docroot only in this POC and is \
+                 IGNORED. Code reads fall through to disk."
+            );
+        } else {
+            let algo = ephpm_php::code_bundle::BundleCompression::parse(
+                &config.php.code_bundle_compression,
+            )
+            .with_context(|| {
+                format!(
+                    "invalid [php] code_bundle_compression = {:?} (expected \
+                     none|gzip|zstd|brotli)",
+                    config.php.code_bundle_compression
+                )
+            })?;
+            let docroot = config.server.document_root.clone();
+            let max = usize::try_from(config.php.code_bundle_max_bytes).unwrap_or(usize::MAX);
+            let started = std::time::Instant::now();
+            match ephpm_php::code_bundle::Bundle::from_scan(&docroot, algo, max) {
+                Ok(bundle) => {
+                    let files = bundle.file_count();
+                    let raw = bundle.raw_bytes();
+                    let resident = bundle.resident_bytes();
+                    let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    match ephpm_php::PhpRuntime::install_code_bundle(bundle) {
+                        Ok(()) => {
+                            tracing::info!(
+                                entries = files,
+                                raw_bytes = raw,
+                                resident_bytes = resident,
+                                compression = algo.label(),
+                                validate_timestamps,
+                                load_ms,
+                                "code bundle loaded: {files} .php files, {resident} bytes \
+                                 resident; code reads served from memory"
+                            );
+                            if validate_timestamps {
+                                tracing::warn!(
+                                    "[php] code_bundle is ON but opcache.validate_timestamps \
+                                     is ON — OPcache keeps stat-ing cached files, leaving the \
+                                     bundle's main warm-path win unrealized. Set [php] \
+                                     opcache_validate_timestamps = false to reclaim it."
+                                );
+                            }
+                        }
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            "failed to install code bundle — falling through to disk"
+                        ),
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "code bundle NOT built — falling through to normal disk access"
+                ),
+            }
+        }
+    }
+
     // Stack-overflow crash containment (experimental `[php] crash_containment`).
     //
     // Armed here, on the single-threaded startup path, before any PHP request
