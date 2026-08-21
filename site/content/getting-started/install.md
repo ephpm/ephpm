@@ -64,7 +64,7 @@ A release may additionally carry a second Windows archive:
 ephpm-vX.Y.Z+php8.5.7-windows-x86_64-tailcall.tar.gz
 ```
 
-Every PHP built with MSVC — including the default ePHPm Windows binary — falls back to the interpreter's slow `CALL` VM. The `-tailcall` archive contains the same `ephpm.exe`, but with PHP 8.5 compiled by clang-cl so the interpreter is the new TAILCALL VM (`[[clang::musttail]]` + `preserve_none`), which recovers roughly the performance of the HYBRID VM that Linux/macOS builds have always had.
+Every PHP built with MSVC — including the default ePHPm Windows binary — falls back to the interpreter's slow `CALL` VM. The `-tailcall` archive contains the same `ephpm.exe`, but with PHP 8.5 compiled by clang-cl so the interpreter is the new TAILCALL VM (`[[clang::musttail]]` + `preserve_none`), which recovers roughly the performance of the HYBRID VM that Linux (GCC) builds get. macOS is a clang build, not GCC, so it never gets HYBRID: PHP 8.5 there runs the TAILCALL VM, while 8.3/8.4 fall back to the same slow `CALL` VM.
 
 Measured against the default MSVC Windows binary, end-to-end through ePHPm (Ryzen 9 5950X):
 
