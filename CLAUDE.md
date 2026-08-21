@@ -143,6 +143,38 @@ The `TrackedBackend` wrapper in `ephpm-server/src/tracked_backend.rs` wraps any 
 - Local `main` tracks `origin/main`
 - The old `luthermonson/ephpm.git` remote was removed
 
+## ePHPm Organization Repositories
+
+Quick-reference map of the **public** repos in the `github.com/ephpm` org (`origin` = this repo, the source of truth). Verify against a repo's own README before relying on details — the "Docs Must Match Code" rule applies here too. The **DB-bridge** and **KV/cache** and **worker-mode** rows are PHP Composer packages that apps *install*, distributed via their GitHub repos (Composer `vcs` repositories), **not Packagist**; they are consumers of ePHPm's SAPI functions, not part of this Rust workspace. See **External Dependencies** above for the fuller story on `litewire` and `php-sdk`.
+
+| Repo | What it is | Relationship to ePHPm |
+|------|-----------|-----------------------|
+| `ephpm` | This repo — the Rust application server. | Source of truth (`origin`). |
+| `litewire` | Rust wire-protocol proxy (MySQL/PG/TDS/Hrana → SQLite/Turso). | **Dependency** — git dep pinned by `rev` in workspace `Cargo.toml`; used as a library. |
+| `php-sdk` | Prebuilt PHP embed static libs (`libphp.a` / `php8embed.lib`) + headers, per OS/arch/PHP-version; built with static-php-cli. | **Dependency** — tarballs downloaded by `cargo xtask php-sdk`, pinned per-minor in `xtask/src/main.rs`. Separate build pipeline. |
+| `ephemerd` | Ephemeral GitHub Actions runner daemon (Go). Containers on Linux, Hyper-V on Windows, VMs on macOS. | **CI infra** — the self-hosted runner fleet that runs ePHPm's Actions (incl. Windows/macOS legs). Not linked into the binary. |
+| `db` | Base PHP library for the in-process DB bridge — typed `Connection`, exceptions, IDE stubs over `ephpm_db_*`. | **Consumer (PHP pkg)** — base dep of the DB-driver packages below. Requires ePHPm `main` (`ephpm_db_*` not in any tagged release ≤ v0.6.2). |
+| `db-wordpress` | WordPress `wp-content/db.php` drop-in (wpdb) over `ephpm_db_*`. | **Consumer (PHP pkg)** — WordPress on per-site Turso, no mysqli/socket. Falls back to stock mysqli off-ePHPm. |
+| `db-laravel` | Laravel database driver (`'driver' => 'ephpm'`) over `ephpm_db_*`. | **Consumer (PHP pkg)** — Laravel query builder/Eloquent, no PDO/socket. |
+| `db-doctrine` | Doctrine DBAL 4 driver over `ephpm_db_*`. | **Consumer (PHP pkg)** — DBAL 4 only (not DBAL 3). |
+| `mysqli-shim` | Userland `mysqli` compatibility shim over `ephpm_db_*`. | **Consumer (PHP pkg)** — global `mysqli_*` surface active only when ext-mysqli is absent (stock SDK builds compile mysqli in, so it's inert there); namespaced API always available. |
+| `cache` | PSR-16 + PSR-6 cache over the embedded KV (`ephpm_kv_*`). | **Consumer (PHP pkg)** — in-process KV, gossip-replicated when clustered. |
+| `cache-symfony` | Symfony Cache adapter (PSR-6/Contracts) over `ephpm_kv_*`. | **Consumer (PHP pkg)**. |
+| `cache-laravel` | Laravel cache store over `ephpm_kv_*`. | **Consumer (PHP pkg)**. |
+| `cache-wordpress` | WordPress `object-cache.php` drop-in over `ephpm_kv_*` (real `wp_cache_flush()`). | **Consumer (PHP pkg)**. |
+| `predis-connection` | Predis `Connection` backend routing to `ephpm_kv_*`. | **Consumer (PHP pkg)** — drop-in for `Predis\Client`. |
+| `session-handler` | PHP session save handler storing `$_SESSION` in the KV via `ephpm_kv_*`. | **Consumer (PHP pkg)** — framework-agnostic (`session_start()`). |
+| `php-worker` | Base SDK for persistent worker mode — worker primitives + IDE stubs + runtime guard. | **Consumer (PHP pkg)** — base dep of the worker adapters below; most users install an adapter, not this. |
+| `psr15-worker` | Runs any PSR-15 app (Mezzio/Slim 4/…) under worker mode. | **Consumer (PHP pkg)** — depends on `php-worker`. |
+| `octane-driver` | **Laravel Octane server driver** — runs Laravel under ePHPm worker mode via Octane's `Client` contract. | **Consumer (PHP pkg / framework integration)** — the official Octane driver. **Check here before assuming Laravel integration is missing.** |
+| `wordpress-worker` | WordPress adapter for persistent worker mode (boot once, reset per request). | **Consumer (PHP pkg)** — experimental; classic themes only (block themes documented limitation). |
+| `wordpress-sample` | Deployable real WordPress for PR previews — per-site Turso (`db-wordpress`) + KV object cache (`cache-wordpress`) + native WebSockets. | **Example app** — the PR-preview showcase. |
+| `wordpress-datastar` | Live WordPress demo: realtime comments + admin dashboard via Datastar SSE, KV as the event bus. | **Example app / demo.** |
+| `datastar-demo` | Pixelboard — multiplayer realtime Datastar demo on worker mode + native KV. | **Example app / demo.** |
+| `lab` | Benchmark lab (Kubernetes) — ePHPm vs php-fpm/Swoole/RoadRunner, app workloads, DB-path tier. Now also hosts the multitenant `scale/` tier. | **Benchmark/standalone** — some suites pin old images (pre-v0.7.0 machinery). Author: Benjamin Pace. |
+| `multitenant-scalebench` | Multi-tenant scaling benchmark (1 instance × N WordPress sites). | **Benchmark/standalone (historical)** — harness moved into `lab/scale/`; this repo is now the historical results record. |
+| `turso-cluster-e2e` | Two-node clustered-SQLite ePHPm fixture/demo (WordPress + wp-cli). | **Example/e2e fixture (historical)** — README predates v0.7.0; describes the now-removed sqld path and `cdc_experimental` knob alongside Turso CDC. |
+
 ## CI Pipeline
 
 Runs on push/PR to main: fmt check → clippy → test → cargo-deny. PRs touching `crates/ephpm-php/**`, `crates/ephpm/build.rs`, `xtask/**`, or `windows-php-check.yml` additionally get a Windows PHP-linked `cargo check -p ephpm-php` (`.github/workflows/windows-php-check.yml`, PHP 8.3 SDK) — the LLP64 compile gate that stub-mode CI can't provide (#318/#320/#319). Release builds triggered by `v*` tags across PHP 8.3/8.4/8.5 × linux-x64/linux-arm64/macos/windows, plus the Docker image; `Create Release` publishes only after all build legs succeed.
