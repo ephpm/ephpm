@@ -499,6 +499,11 @@ implemented.
 
 ## Writing your own module in Rust
 
+A complete worked example — all three verdicts, the KV host callbacks, a demo
+site and a build-and-verify walkthrough — lives in the repository at
+[`examples/rust-middleware/`](https://github.com/ephpm/ephpm/tree/main/examples/rust-middleware).
+The sketch below is the minimum.
+
 Add the authoring crate and implement one trait:
 
 ```toml

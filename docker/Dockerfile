@@ -146,6 +146,11 @@ COPY crates/ephpm-php/Cargo.toml          crates/ephpm-php/Cargo.toml
 COPY crates/ephpm-query-stats/Cargo.toml  crates/ephpm-query-stats/Cargo.toml
 COPY crates/ephpm-server/Cargo.toml       crates/ephpm-server/Cargo.toml
 COPY crates/ephpm-ws/Cargo.toml           crates/ephpm-ws/Cargo.toml
+# `examples/rust-middleware` is a workspace member (see the root Cargo.toml),
+# so `cargo fetch` below loads its manifest. It declares an explicit `[lib]`,
+# which cargo hard-errors on if src/lib.rs is missing — copy the manifest and
+# stub the lib source below, exactly like the crates above.
+COPY examples/rust-middleware/Cargo.toml  examples/rust-middleware/Cargo.toml
 
 RUN mkdir -p \
         xtask/src \
@@ -164,12 +169,18 @@ RUN mkdir -p \
         crates/ephpm-query-stats/src \
         crates/ephpm-server/src \
         crates/ephpm-ws/src \
-        crates/ephpm-server/examples && \
+        crates/ephpm-server/examples \
+        examples/rust-middleware/src && \
     printf 'fn main() {}\n' > xtask/src/main.rs && \
     printf 'fn main() {}\n' > crates/ephpm/src/main.rs && \
     for d in ephpm-cluster ephpm-config ephpm-db ephpm-kv ephpm-middleware ephpm-middleware-builtins ephpm-middleware-cors ephpm-middleware-jwt ephpm-middleware-ratelimit ephpm-middleware-security-headers ephpm-php ephpm-query-stats ephpm-server ephpm-ws; do \
         touch crates/$d/src/lib.rs; \
     done && \
+    # examples/rust-middleware declares an explicit [lib] (name = "api_gate");
+    # cargo errors during `cargo fetch` below if src/lib.rs is absent. Its
+    # examples/abi_probe.rs is auto-discovered (no [[example]] block) so it is
+    # NOT needed here — only the lib source is.
+    touch examples/rust-middleware/src/lib.rs && \
     # ephpm-server declares several `[[example]] crate-type = ["cdylib"]`
     # targets (the middleware-ABI probes added in #230, plus the response-phase
     # proof modules). A named [[example]] must exist as a file or cargo
