@@ -151,7 +151,7 @@ There is no `cdc_experimental` opt-in flag anymore — enabling `[cluster]` with
 | SQL dialect translation (MySQL → SQLite) | **Implemented** | `litewire-translate` (sqlparser-rs) |
 | Turso backend (in-process) | **Implemented** | `litewire-turso` |
 | Primary election via gossip KV | **Implemented** | `ephpm-cluster` (sqlite_election) |
-| In-process PHP bridge (`ephpm_db_query` / `ephpm_db_execute`) | **Implemented** (v0.6.3) | `ephpm-php` (`db_bridge`) |
+| In-process PHP bridge (`ephpm_db_*`) | **Implemented** (v0.6.3; adapter introspection surface v0.7.4) | `ephpm-php` (`db_bridge`) |
 | Turso engine (`[db.sqlite]`, single-node) | **Implemented — Beta engine upstream** | `litewire-turso` |
 | Clustered Turso CDC replication (no sqld sidecar) | **Implemented — experimental** | `ephpm-server` (`turso_cdc`) |
 | PostgreSQL wire protocol frontend | Placeholder | `litewire-postgres` (pgwire) |
