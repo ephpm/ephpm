@@ -4,8 +4,8 @@ weight = 20
 +++
 
 ePHPm can export a span per HTTP request to any OpenTelemetry collector over
-OTLP **http/protobuf**. This guide sets up a local trace UI, points ePHPm at
-it, and covers what your IDE can and cannot do for you.
+OTLP — either **gRPC** or **http/protobuf**. This guide sets up a local trace
+UI, points ePHPm at it, and covers what your IDE can and cannot do for you.
 
 Set expectations first, because "tracing" means different things:
 
@@ -43,6 +43,50 @@ is deliberate. The consequence in multi-tenant mode (`[server] sites_dir`) is
 that traces from different vhosts are currently indistinguishable — see
 [Known rough edges](#known-rough-edges).
 
+## Choosing a transport
+
+OTLP has two wire protocols and ePHPm speaks both. The choice is made at
+runtime by the standard environment variable — there is no rebuild and no
+cargo feature involved:
+
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | Transport | Conventional port | Endpoint form |
+|---|---|---|---|
+| unset (default) | http/protobuf | 4318 | base URL; `/v1/traces` appended |
+| `http/protobuf` | http/protobuf | 4318 | base URL; `/v1/traces` appended |
+| `grpc` | OTLP/gRPC | 4317 | base URL, **no path appended** |
+
+`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` overrides it for traces specifically, the
+same way the `_TRACES_ENDPOINT` variable overrides the endpoint.
+
+If you would rather keep everything in one file, there is a config knob with
+the same meaning — the environment variables above win over it:
+
+```toml
+[server.diagnostics]
+otlp_endpoint = "http://127.0.0.1:4317"
+otlp_protocol = "grpc"
+```
+
+**Which should you use?** For a collector, either — they carry identical data.
+Pick gRPC when the consumer only accepts gRPC, which is the case for
+[PhpStorm's OpenTelemetry plugin](#phpstorm). Pick http/protobuf when
+something between you and the collector is an HTTP proxy that does not speak
+HTTP/2. `http/json` is not supported, and asking for it is a startup error
+rather than a silent fallback.
+
+**Mind the port.** 4317 and 4318 differ by one character and a collector
+usually listens on both, so pointing gRPC at 4318 is the single most common
+way to end up with no traces. ePHPm warns when the endpoint uses the other
+transport's conventional port:
+
+```text
+WARN ephpm: OTLP endpoint http://127.0.0.1:4318 uses port 4318, the
+     conventional port for http/protobuf, but the exporter is configured for
+     grpc (the conventional port for which is 4317). ...
+```
+
+It is a warning, not an error — running either transport on any port is legal.
+
 ## Step 1: run a collector
 
 Two options. Both were verified against ePHPm while writing this guide.
@@ -70,6 +114,8 @@ way to answer "what exactly is ePHPm sending?". Save as `otelcol.yaml`:
 receivers:
   otlp:
     protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
       http:
         endpoint: 0.0.0.0:4318
 
@@ -87,33 +133,46 @@ service:
 ```
 
 ```bash
-docker run --rm -p 4318:4318 \
+docker run --rm -p 4317:4317 -p 4318:4318 \
   -v "$PWD/otelcol.yaml:/etc/otelcol/config.yaml" -v "$PWD/out:/out" \
   otel/opentelemetry-collector-contrib:0.135.0 --config /etc/otelcol/config.yaml
 ```
+
+With both receivers enabled you can switch `OTEL_EXPORTER_OTLP_PROTOCOL`
+between `grpc` and `http/protobuf` (and the endpoint between 4317 and 4318)
+without touching the collector.
 
 You can also run both: add an `otlphttp` exporter pointing at Jaeger and get
 the UI and the JSON from one pipeline.
 
 ## Step 2: point ePHPm at it
 
+For **http/protobuf** (the default), a base URL is enough — `/v1/traces` is
+appended when missing:
+
 ```toml
 [server.diagnostics]
 otlp_endpoint = "http://127.0.0.1:4318"
 ```
 
-`/v1/traces` is appended when missing, so the base URL is enough. Then:
+For **gRPC**, use the gRPC port and set the protocol. No path is appended,
+because on gRPC the signal is the method name, not the URL:
+
+```toml
+[server.diagnostics]
+otlp_endpoint = "http://127.0.0.1:4317"
+```
 
 ```bash
-ephpm serve --config ephpm.toml
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc ephpm serve --config ephpm.toml
 ```
 
 Startup confirms it, and this line is your first checkpoint — if it is absent,
-nothing downstream matters:
+nothing downstream matters. Note it names the transport in use:
 
 ```text
-INFO ephpm: OTLP trace export enabled (http/protobuf)
-     endpoint=config: http://127.0.0.1:4318/v1/traces (service.name = ephpm; ...)
+INFO ephpm: OTLP trace export enabled
+     endpoint=config: http://127.0.0.1:4317 (service.name = ephpm; ...) protocol="grpc"
 ```
 
 Drive a request or two, wait a few seconds for the batch to flush, and open
@@ -126,7 +185,9 @@ The standard OTel variables work and **take precedence over the config knob**:
 | Variable | Effect |
 |----------|--------|
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Used verbatim. Highest precedence. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Base URL; `/v1/traces` appended. Beats the config knob. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Base URL; `/v1/traces` appended on http/protobuf, used as-is on gRPC. Beats the config knob. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` or `http/protobuf`. Default `http/protobuf`. |
+| `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | Same, traces only. Highest precedence. |
 | `OTEL_SERVICE_NAME` | Service name in the trace UI. Default `ephpm`. |
 | `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` | Sampler. Default `parentbased_always_on`. |
 | `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` / `OTEL_EXPORTER_OTLP_TIMEOUT` | Export timeout in ms. Default `10000`. |
@@ -175,9 +236,11 @@ a broken exporter.
 
 ## HTTPS collectors
 
-An `https://` endpoint works with no extra configuration. TLS is rustls (the
-same crypto provider the HTTPS listener uses), and the trust anchors are the
-union of the OS trust store and a bundled Mozilla root set.
+An `https://` endpoint works with no extra configuration, on **both**
+transports. TLS is rustls (the same crypto provider the HTTPS listener uses —
+never OpenSSL and never a second TLS stack), and the trust anchors are the
+union of the OS trust store and a bundled Mozilla root set, identically for
+gRPC and http/protobuf.
 
 For a collector behind a private CA, point the standard `SSL_CERT_FILE` (a PEM
 bundle) or `SSL_CERT_DIR` at it. Note that doing so **replaces** the OS trust
@@ -188,7 +251,7 @@ description.
 
 ## PhpStorm
 
-### The in-IDE trace viewer, and why it needs a bridge
+### The in-IDE trace viewer — no bridge needed
 
 JetBrains ships a **free, first-party** plugin called
 [OpenTelemetry](https://plugins.jetbrains.com/plugin/27488-opentelemetry)
@@ -196,39 +259,52 @@ JetBrains ships a **free, first-party** plugin called
 is a genuine trace viewer: a Traces tab, and *"Double-click a trace, or select
 it and click Examine Trace, to open its span hierarchy."*
 
-There is a catch that matters here. Per
-[JetBrains' documentation](https://www.jetbrains.com/help/rider/OpenTelemetry.html):
-*"The built-in receiver accepts OTLP over gRPC."* **ePHPm only speaks OTLP
-http/protobuf**, so it cannot feed the plugin directly. To use it you need a
-local OpenTelemetry Collector receiving http/protobuf on 4318 and re-exporting
-over gRPC to the plugin's port (enable *Use fixed OTLP server port* in
-Settings → Tools → OpenTelemetry; the documented default is 17011):
+Per [JetBrains' documentation](https://www.jetbrains.com/help/rider/OpenTelemetry.html),
+*"the built-in receiver accepts OTLP over gRPC."* ePHPm speaks gRPC, so you
+can point it straight at the IDE — **no OpenTelemetry Collector in between**.
 
-```yaml
-receivers:
-  otlp:
-    protocols:
-      http:
-        endpoint: 0.0.0.0:4318
-exporters:
-  otlp/ide:
-    endpoint: localhost:17011
-    tls:
-      insecure: true
-service:
-  pipelines:
-    traces:
-      receivers: [otlp]
-      exporters: [otlp/ide]
-```
+1. **Install the plugin.** Settings → Plugins → Marketplace → search
+   *OpenTelemetry* (vendor JetBrains) → Install → restart.
+2. **Pin the receiver port.** Settings → Tools → OpenTelemetry → enable
+   *Use fixed OTLP server port*. The documented default is **17011**. Without
+   this the IDE picks a fresh port per run and there is nothing stable to
+   configure ePHPm against.
+3. **Point ePHPm at the IDE:**
 
-Also note the plugin has no PHP module — its automatic
-`OTEL_EXPORTER_OTLP_*` injection covers other languages' run configurations,
-not PHP. For ePHPm you set the endpoint in `ephpm.toml` anyway, so this costs
-you nothing.
+   ```toml
+   [server.diagnostics]
+   otlp_endpoint = "http://127.0.0.1:17011"
+   ```
 
-If you would rather not run the bridge, use Jaeger in a browser tab. That is
-the simpler setup and loses nothing but the tab.
+   ```bash
+   OTEL_EXPORTER_OTLP_PROTOCOL=grpc OTEL_SERVICE_NAME=my-app \
+     ephpm serve --config ephpm.toml
+   ```
+
+   `http://`, not `https://` — the IDE receiver is plaintext on loopback.
+
+4. **Check the startup line** says `protocol="grpc"` and names port 17011.
+5. **Drive a request**, wait a few seconds for the batch to flush, and open
+   the **OpenTelemetry** tool window → *Traces*. Double-click a trace (or
+   *Examine Trace*) to get the span hierarchy: `http.request` with
+   `php.execute` — and `worker.queue_wait` too, in worker mode — nested under
+   it.
+
+Set `OTEL_SERVICE_NAME` per project; it is what the plugin labels traces with.
+
+Note the plugin has no PHP module — its automatic `OTEL_EXPORTER_OTLP_*`
+injection covers other languages' run configurations, not PHP. For ePHPm you
+set the endpoint in `ephpm.toml` anyway, so this costs you nothing.
+
+If the Traces tab stays empty, work down this list: is the startup line
+present and does it say `grpc`; does it name 17011; is *Use fixed OTLP server
+port* actually enabled; and is there an `ERROR ... BatchSpanProcessor.
+ExportError` in the ePHPm log (a refused connection means the IDE is not
+listening on that port). Export failures are logged — see
+[Known rough edges](#known-rough-edges).
+
+Jaeger in a browser tab remains a perfectly good alternative, and is what to
+fall back to if the plugin misbehaves.
 
 ### What PhpStorm contributes either way
 
@@ -322,11 +398,21 @@ flushes the batch queue before exiting — verified. `SIGKILL` does not, and the
 last few seconds of spans are gone. If your last request never shows up, check
 how you stopped the server before you check anything else.
 
-**Export failures are silent.** If the endpoint is wrong, unreachable, or
-presents a certificate ePHPm does not trust, nothing is logged — the startup
-line still says export is enabled and then the server goes quiet. Check the
-collector's own log. Tracked in
-[#378](https://github.com/ephpm/ephpm/issues/378).
+**Export failures are logged, and repeat.** A wrong endpoint, an unreachable
+collector or an untrusted certificate produces an error line naming the cause,
+on the `opentelemetry_sdk` target:
+
+```text
+ERROR opentelemetry_sdk: name="BatchSpanProcessor.ExportError"
+      error="Operation failed: ... tcp connect error ... Connection refused"
+```
+
+This was silent before ([#378](https://github.com/ephpm/ephpm/issues/378)).
+Two things to know: the message is emitted **once per failed batch**, so a
+collector that stays down produces a steady trickle of error lines rather than
+one; and a `[server.logging] level` / `RUST_LOG` filter strict enough to
+exclude the `opentelemetry_sdk` target will hide it again. Serving is never
+affected — requests keep returning normally while export fails.
 
 **Spans are `SPAN_KIND_INTERNAL`, including `http.request`.** Backends that
 build service graphs or RED metrics from span kind will not recognise ePHPm as

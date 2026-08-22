@@ -2,16 +2,16 @@
 //!
 //! Exports the router's request spans (`http.request` with children
 //! `worker.queue_wait` and `php.execute`, all emitted under
-//! [`crate::OTEL_TRACE_TARGET`]) to an OpenTelemetry collector over
-//! OTLP/HTTP with protobuf payloads.
+//! [`crate::OTEL_TRACE_TARGET`]) to an OpenTelemetry collector, over either
+//! OTLP transport — see [Transports](#transports).
 //!
 //! Activation is strictly opt-in at runtime, in precedence order:
 //!
 //! 1. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT`
 //!    environment variables (standard OTel semantics — the exporter builder
-//!    reads them itself, so `.../v1/traces` handling follows the spec).
-//! 2. `[server.diagnostics] otlp_endpoint` from config (a base URL;
-//!    `/v1/traces` is appended when missing).
+//!    reads them itself, so signal-path handling follows the spec).
+//! 2. `[server.diagnostics] otlp_endpoint` from config (a base URL; see
+//!    [`normalize_endpoint`] for the per-transport path rules).
 //!
 //! When none of these are set, [`init_layer`] returns `Ok(None)`: no
 //! exporter is built, no background thread is spawned, and no global
@@ -153,29 +153,42 @@ impl Transport {
     }
 }
 
-/// Resolve the transport from the standard environment variables.
+/// Resolve the transport, environment first.
 ///
-/// `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` wins over
-/// `OTEL_EXPORTER_OTLP_PROTOCOL`, matching the endpoint variables' precedence.
-/// Unset means `http/protobuf`, which is both the OTel default and what ePHPm
-/// did before gRPC existed — so this stays additive.
+/// Precedence, highest to lowest — the same shape as the endpoint's:
+///
+/// 1. `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`
+/// 2. `OTEL_EXPORTER_OTLP_PROTOCOL`
+/// 3. `config_protocol` — `[server.diagnostics] otlp_protocol`, which itself
+///    already reflects `EPHPM_SERVER__DIAGNOSTICS__OTLP_PROTOCOL`
+///
+/// All unset means `http/protobuf`, which is both the OTel default and what
+/// ePHPm did before gRPC existed — so this stays additive.
 ///
 /// # Errors
 ///
 /// Returns an error for a value this build cannot honour, rather than falling
 /// back to a transport the operator did not ask for. Silently exporting over
 /// the wrong protocol is exactly the class of failure #378 is about.
-fn resolve_transport() -> anyhow::Result<Transport> {
-    let Some((var, value)) = ["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "OTEL_EXPORTER_OTLP_PROTOCOL"]
+fn resolve_transport(config_protocol: Option<&str>) -> anyhow::Result<Transport> {
+    let from_env = ["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "OTEL_EXPORTER_OTLP_PROTOCOL"]
         .iter()
         .find_map(|var| {
-            std::env::var(var).ok().map(|v| (*var, v)).filter(|(_, v)| !v.trim().is_empty())
-        })
-    else {
+            std::env::var(var)
+                .ok()
+                .map(|v| ((*var).to_string(), v))
+                .filter(|(_, v)| !v.trim().is_empty())
+        });
+
+    let Some((var, value)) = from_env.or_else(|| {
+        config_protocol
+            .filter(|v| !v.trim().is_empty())
+            .map(|v| ("[server.diagnostics] otlp_protocol".to_string(), v.to_string()))
+    }) else {
         return Ok(Transport::HttpBinary);
     };
 
-    parse_transport(var, &value)
+    parse_transport(&var, &value)
 }
 
 /// The pure half of [`resolve_transport`], so the mapping can be tested
@@ -556,6 +569,7 @@ fn build_grpc_exporter(
 /// [`build_http_client`] and [`build_grpc_exporter`]).
 pub fn init_layer<S>(
     config_endpoint: Option<&str>,
+    config_protocol: Option<&str>,
 ) -> anyhow::Result<Option<(impl Layer<S>, OtlpGuard, OtlpStartupInfo)>>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
@@ -572,7 +586,7 @@ where
 
     // Resolved before any client is built so an unsupported protocol fails
     // fast, with a message, instead of exporting over the wrong one.
-    let transport = resolve_transport()?;
+    let transport = resolve_transport(config_protocol)?;
 
     // The endpoint the *exporter* will use, for the port sanity check. When it
     // comes from the environment we leave the actual value to the builder's own
@@ -600,7 +614,8 @@ where
     // standard semantics (`OTEL_EXPORTER_OTLP_ENDPOINT` is a base URL that
     // gets `/v1/traces` appended on http/protobuf and is used as-is on gRPC;
     // the TRACES variant is verbatim on both).
-    let builder_endpoint = if env_endpoint.is_some() { None } else { effective_endpoint.as_deref() };
+    let builder_endpoint =
+        if env_endpoint.is_some() { None } else { effective_endpoint.as_deref() };
 
     let service_name = std::env::var("OTEL_SERVICE_NAME")
         .ok()
@@ -632,8 +647,7 @@ where
             if let Some(endpoint) = builder_endpoint {
                 builder = builder.with_endpoint(endpoint);
             }
-            let exporter =
-                builder.build().context("failed to build the OTLP span exporter")?;
+            let exporter = builder.build().context("failed to build the OTLP span exporter")?;
             let provider = SdkTracerProvider::builder()
                 .with_batch_exporter(exporter)
                 .with_resource(resource)
@@ -657,8 +671,7 @@ where
 
     let description =
         format!("{endpoint_source} (service.name = {service_name}; {transport_description})");
-    let info =
-        OtlpStartupInfo { protocol: transport.as_str(), description, warnings };
+    let info = OtlpStartupInfo { protocol: transport.as_str(), description, warnings };
     Ok(Some((layer, OtlpGuard { provider, _grpc_runtime: grpc_runtime }, info)))
 }
 
@@ -726,6 +739,35 @@ mod tests {
 
         let err = parse_transport(var, "gprc").unwrap_err().to_string();
         assert!(err.contains("not a valid OTLP protocol"), "unexpected error: {err}");
+    }
+
+    /// The config knob is honoured, and an invalid one still errors.
+    ///
+    /// Only the config path is exercised here: asserting that
+    /// `OTEL_EXPORTER_OTLP_PROTOCOL` beats it would require setting a
+    /// process-global variable that any concurrently running test could
+    /// observe. The precedence itself is a one-line `or_else` in
+    /// `resolve_transport`, and the env-vs-config order is verified end to end
+    /// in the lab rather than here.
+    #[test]
+    fn config_protocol_is_used_when_no_env_var_is_set() {
+        // The env vars are not set in a normal test run; if a future test
+        // leaks one, this assertion is what will catch it.
+        for var in ["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "OTEL_EXPORTER_OTLP_PROTOCOL"] {
+            assert!(
+                std::env::var(var).is_err(),
+                "{var} leaked into the test process; this test cannot be trusted"
+            );
+        }
+
+        assert_eq!(resolve_transport(Some("grpc")).unwrap(), Transport::Grpc);
+        assert_eq!(resolve_transport(Some("http/protobuf")).unwrap(), Transport::HttpBinary);
+        // Unset and empty both mean "the default", never an error.
+        assert_eq!(resolve_transport(None).unwrap(), Transport::HttpBinary);
+        assert_eq!(resolve_transport(Some("   ")).unwrap(), Transport::HttpBinary);
+
+        let err = resolve_transport(Some("http/json")).unwrap_err().to_string();
+        assert!(err.contains("otlp_protocol"), "error must name the config key: {err}");
     }
 
     /// gRPC takes a base URL; http/protobuf takes a signal URL.
