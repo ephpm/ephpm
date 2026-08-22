@@ -3,7 +3,7 @@
  * bundle (see crates/ephpm-php/src/code_bundle.rs and
  * site/content/roadmap/in-memory-code-bundle.md).
  *
- * We interpose on three PHP indirection points that are *designed* to be
+ * We interpose on four PHP indirection points that are *designed* to be
  * overridden (OPcache itself overrides zend_compile_file / zend_resolve_path),
  * install them once at SAPI init, and delegate to the saved originals on a
  * bundle MISS so behaviour for anything not in the bundle is byte-for-byte
@@ -13,31 +13,55 @@
  *                                 return the bundle's canonical absolute path so
  *                                 __FILE__/__DIR__/realpath() math stays correct.
  *   2. zend_stream_open_function — the compiler's source open (primary script +
- *                                 every include/require). On a hit we serve the
- *                                 source from RAM via a zend_stream reader; the
- *                                 filesystem is never touched.
+ *                                 every include/require) when OPcache is off.
  *   3. php_plain_files_wrapper.url_stat — userland file_exists / is_file /
  *                                 stat / filemtime and OPcache's own probing.
- *                                 On a hit we fill php_stream_statbuf from the
- *                                 bundle manifest.
+ *   4. php_plain_files_wrapper.stream_opener — the source read OPcache reaches
+ *                                 through (it calls the *saved original*
+ *                                 zend_stream_open_function, so #2 alone does
+ *                                 not cover the OPcache-on path).
+ *
+ * ── Two lookup outcomes, three answers ────────────────────────────────────
+ *
+ * Every callback is tri-state (EPHPM_BUNDLE_HIT / _UNKNOWN / _ABSENT):
+ *
+ *   HIT     — answer from RAM.
+ *   UNKNOWN — delegate to the saved original (overlay semantics; the default).
+ *   ABSENT  — answer "does not exist" from RAM with **zero syscalls**. Only ever
+ *             returned in `sealed` mode, and only for a path that is (a) under
+ *             the bundled document root and (b) carries the extension the
+ *             scanner indexes exhaustively. Rust owns that predicate — see
+ *             `Bundle::lookup` — so the correctness boundary lives in one place.
+ *
+ * ── Bundle-backed streams ─────────────────────────────────────────────────
+ *
+ * Both source-serving hooks (#2 and #4) return a *real* `php_stream` built on
+ * `ephpm_bundle_stream_ops`, whose `stat` op reports the index's recorded mtime
+ * and size. That matters beyond tidiness: OPcache's
+ * `zend_get_file_handle_timestamp()` casts `zend_file_handle.handle.stream.handle`
+ * to `php_stream *` and dereferences `stream->ops->stat`. Handing it anything
+ * that is not a php_stream is a wild-pointer call; handing it a stream whose
+ * stat reports mtime 0 makes OPcache refuse to cache the script at all
+ * (`timestamp == 0` → "possibly a socket" → never cached).
  *
  * The bundle data lives in Rust (immutable, process-lifetime). These hooks
  * query it through a small callback vtable installed by
  * ephpm_bundle_install_hooks(). CRITICAL FFI invariant (CLAUDE.md rule 3): the
  * Rust callbacks return plain pointers/scalars and hold NO live Rust destructor
  * across any subsequent PHP call that could zend_bailout(); the only heap buffer
- * we hold (a Model-B decompress) is freed through free_source in the stream
- * closer, never across a bailout-capable emalloc.
+ * we hold (a Model-B decompress) is malloc-owned by the stream's abstract and
+ * released through free_source in the stream's close op.
  */
 
+#include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
 #include "main/php.h"
 #include "main/php_streams.h"
-#include "main/php_memory_streams.h"
 #include "main/streams/php_stream_plain_wrapper.h"
 #include "Zend/zend.h"
 #include "Zend/zend_stream.h"
@@ -50,6 +74,11 @@
 # define S_IFDIR 0040000
 #endif
 
+/* Tri-state lookup result. Mirrors the Rust constants in code_bundle.rs. */
+#define EPHPM_BUNDLE_HIT      1
+#define EPHPM_BUNDLE_UNKNOWN  0
+#define EPHPM_BUNDLE_ABSENT (-1)
+
 /* Mirror of Rust `BundleStat` (#[repr(C)]). */
 typedef struct {
     int      is_dir;
@@ -58,14 +87,28 @@ typedef struct {
     uint64_t inode;
 } ephpm_bundle_stat_t;
 
-/* Mirror of Rust `BundleCallbacks` (#[repr(C)]). */
+/* Mirror of Rust `BundleSource` (#[repr(C)]). */
+typedef struct {
+    const unsigned char *data;
+    size_t               len;
+    int                  needs_free; /* release `data` via free_source */
+    int64_t              mtime;
+    uint64_t             inode;
+} ephpm_bundle_source_t;
+
+/* Mirror of Rust `BundleCallbacks` (#[repr(C)]).
+ * resolve/stat/get_source all return HIT / UNKNOWN / ABSENT and only write
+ * through their out-parameter on HIT. */
 typedef struct {
     int (*enabled)(void);
-    const char *(*resolve)(const char *path, size_t len);
+    int (*resolve)(const char *path, size_t len, const char **out_canon);
     int (*stat)(const char *path, size_t len, ephpm_bundle_stat_t *out);
-    const unsigned char *(*get_source)(const char *path, size_t len,
-                                       size_t *out_len, int *needs_free);
+    int (*get_source)(const char *path, size_t len, ephpm_bundle_source_t *out);
     void (*free_source)(const unsigned char *ptr, size_t len);
+    /* Breadcrumb only: the plain-files wrapper is about to open this path for
+     * WRITING. Never changes what PHP does; Rust logs the sealed-mode contract
+     * violation. */
+    void (*note_write)(const char *path, size_t len);
 } ephpm_bundle_callbacks_t;
 
 /* Installed vtable + saved originals. Written once on the single-threaded
@@ -94,9 +137,9 @@ static int ephpm_bundle_active(void)
 }
 
 /* One-shot per-hook diagnostic, gated on EPHPM_BUNDLE_TRACE=1. Prints the first
- * few calls of each hook with the path and hit/miss so we can tell whether a
- * hook fires at all and whether the first probe keys match the bundle. Zero cost
- * when the env var is unset (checked once). */
+ * few calls of each hook with the path and the lookup outcome so we can tell
+ * whether a hook fires at all and whether the first probe keys match the bundle.
+ * Zero cost when the env var is unset (checked once). */
 static int ephpm_bundle_trace(void)
 {
     static int cached = -1;
@@ -107,15 +150,202 @@ static int ephpm_bundle_trace(void)
     return cached;
 }
 
-static void ephpm_bundle_trace_line(const char *hook, const char *url, int hit)
+static void ephpm_bundle_trace_line(const char *hook, const char *url, int rc)
 {
     static int n = 0;
     if (!ephpm_bundle_trace() || n >= 12) {
         return;
     }
     n++;
-    fprintf(stderr, "[bundle-trace] hook=%s hit=%d url=%s\n", hook, hit,
+    fprintf(stderr, "[bundle-trace] hook=%s rc=%s url=%s\n", hook,
+            rc == EPHPM_BUNDLE_HIT ? "hit"
+                : (rc == EPHPM_BUNDLE_ABSENT ? "absent" : "unknown"),
             url ? url : "(null)");
+}
+
+/* ---- bundle-backed php_stream ------------------------------------------- *
+ * A read-only stream over a bundle source buffer. The abstract is malloc'd
+ * (never emalloc'd) so its lifetime is decoupled from the Zend request
+ * allocator; it is released in the close op, which is also where a Model-B
+ * decompress buffer goes back to Rust. */
+
+typedef struct {
+    const unsigned char *data;
+    size_t               len;
+    size_t               pos;
+    int                  needs_free;
+    int64_t              mtime;
+    uint64_t             inode;
+} ephpm_bundle_stream_data;
+
+static ssize_t ephpm_bundle_sop_write(php_stream *stream, const char *buf, size_t count)
+{
+    (void)stream; (void)buf; (void)count;
+    return -1; /* the bundle is immutable */
+}
+
+static ssize_t ephpm_bundle_sop_read(php_stream *stream, char *buf, size_t count)
+{
+    ephpm_bundle_stream_data *d = (ephpm_bundle_stream_data *)stream->abstract;
+    size_t remain, n;
+    if (!d) {
+        return -1;
+    }
+    remain = d->len - d->pos;
+    n = remain < count ? remain : count;
+    if (n == 0) {
+        stream->eof = 1;
+        return 0;
+    }
+    memcpy(buf, d->data + d->pos, n);
+    d->pos += n;
+    return (ssize_t)n;
+}
+
+static int ephpm_bundle_sop_close(php_stream *stream, int close_handle)
+{
+    ephpm_bundle_stream_data *d = (ephpm_bundle_stream_data *)stream->abstract;
+    (void)close_handle;
+    if (d) {
+        if (d->needs_free && d->data && g_cb.free_source) {
+            g_cb.free_source(d->data, d->len);
+        }
+        free(d);
+        stream->abstract = NULL;
+    }
+    return 0;
+}
+
+static int ephpm_bundle_sop_flush(php_stream *stream)
+{
+    (void)stream;
+    return 0;
+}
+
+static int ephpm_bundle_sop_seek(php_stream *stream, zend_off_t offset, int whence,
+                                 zend_off_t *newoffset)
+{
+    ephpm_bundle_stream_data *d = (ephpm_bundle_stream_data *)stream->abstract;
+    zend_off_t base, target;
+    if (!d) {
+        return -1;
+    }
+    switch (whence) {
+        case SEEK_SET: base = 0; break;
+        case SEEK_CUR: base = (zend_off_t)d->pos; break;
+        case SEEK_END: base = (zend_off_t)d->len; break;
+        default: return -1;
+    }
+    target = base + offset;
+    if (target < 0 || (size_t)target > d->len) {
+        return -1;
+    }
+    d->pos = (size_t)target;
+    stream->eof = 0;
+    if (newoffset) {
+        *newoffset = target;
+    }
+    return 0;
+}
+
+/* The reason this whole ops table exists: OPcache reads a script's timestamp
+ * through stream->ops->stat, and refuses to cache anything whose timestamp it
+ * cannot obtain (mtime 0 → treated as a socket → never cached). We report the
+ * index's recorded mtime, which is the real on-disk source mtime captured at
+ * scan time, so OPcache caches normally with file_update_protection left at its
+ * default. */
+static int ephpm_bundle_sop_stat(php_stream *stream, php_stream_statbuf *ssb)
+{
+    ephpm_bundle_stream_data *d = (ephpm_bundle_stream_data *)stream->abstract;
+    if (!d || !ssb) {
+        return -1;
+    }
+    memset(ssb, 0, sizeof(*ssb));
+    /* Direct assignment: C implicitly converts to each field's platform type
+     * (off_t/time_t/ino_t on Unix, __int64 variants on Win64). No typeof —
+     * MSVC lacks it pre-C23. */
+    ssb->sb.st_mode = S_IFREG | 0444;
+    ssb->sb.st_size = d->len;
+    ssb->sb.st_mtime = d->mtime;
+    ssb->sb.st_atime = d->mtime;
+    ssb->sb.st_ctime = d->mtime;
+    ssb->sb.st_ino = d->inode;
+    ssb->sb.st_nlink = 1;
+    return 0;
+}
+
+static const php_stream_ops ephpm_bundle_stream_ops = {
+    ephpm_bundle_sop_write,
+    ephpm_bundle_sop_read,
+    ephpm_bundle_sop_close,
+    ephpm_bundle_sop_flush,
+    "ephpm-code-bundle",
+    ephpm_bundle_sop_seek,
+    NULL, /* cast: a bundle entry has no file descriptor */
+    ephpm_bundle_sop_stat,
+    NULL, /* set_option */
+};
+
+/* Wrap an already-fetched bundle source in a php_stream. Takes ownership of
+ * `src->data` when `src->needs_free` is set: on success the stream's close op
+ * releases it, on failure this function releases it before returning NULL.
+ *
+ * OOM note: php_stream_alloc emalloc's and can therefore zend_bailout(). If it
+ * does, `d` (and a Model-B decompress buffer) leak. That window is unavoidable
+ * without a zend_try around an allocation that is itself the OOM, and the
+ * request is being torn down anyway. No Rust *destructor* is live across it —
+ * only a raw pointer — so the bailout itself is safe (CLAUDE.md rule 3). */
+static php_stream *ephpm_bundle_stream_from_source(const ephpm_bundle_source_t *src)
+{
+    ephpm_bundle_stream_data *d;
+    php_stream *stream;
+
+    d = (ephpm_bundle_stream_data *)malloc(sizeof(*d));
+    if (!d) {
+        if (src->needs_free && src->data && g_cb.free_source) {
+            g_cb.free_source(src->data, src->len);
+        }
+        return NULL;
+    }
+    d->data = src->data;
+    d->len = src->len;
+    d->pos = 0;
+    d->needs_free = src->needs_free;
+    d->mtime = src->mtime;
+    d->inode = src->inode;
+
+    stream = php_stream_alloc(&ephpm_bundle_stream_ops, d, NULL, "rb");
+    if (!stream) {
+        if (d->needs_free && d->data && g_cb.free_source) {
+            g_cb.free_source(d->data, d->len);
+        }
+        free(d);
+        return NULL;
+    }
+    return stream;
+}
+
+/* zend_stream_* trampolines for a zend_file_handle backed by a php_stream.
+ * PHP's own php_stream_open_for_zend_ex() installs equivalents, but they are
+ * `static` in main/main.c, so we provide our own. */
+
+static ssize_t ephpm_bundle_zend_reader(void *handle, char *buf, size_t len)
+{
+    return php_stream_read((php_stream *)handle, buf, len);
+}
+
+static size_t ephpm_bundle_zend_fsizer(void *handle)
+{
+    php_stream_statbuf ssb;
+    if (php_stream_stat((php_stream *)handle, &ssb) == 0 && ssb.sb.st_size >= 0) {
+        return (size_t)ssb.sb.st_size;
+    }
+    return 0;
+}
+
+static void ephpm_bundle_zend_closer(void *handle)
+{
+    php_stream_close((php_stream *)handle);
 }
 
 /* ---- 1. zend_resolve_path ------------------------------------------------ */
@@ -123,13 +353,19 @@ static void ephpm_bundle_trace_line(const char *hook, const char *url, int hit)
 static zend_string *ephpm_bundle_resolve_path_hook(zend_string *filename)
 {
     if (ephpm_bundle_active() && filename) {
-        const char *canon = g_cb.resolve(ZSTR_VAL(filename), ZSTR_LEN(filename));
-        ephpm_bundle_trace_line("resolve", ZSTR_VAL(filename), canon ? 1 : 0);
-        if (canon) {
+        const char *canon = NULL;
+        int rc = g_cb.resolve(ZSTR_VAL(filename), ZSTR_LEN(filename), &canon);
+        ephpm_bundle_trace_line("resolve", ZSTR_VAL(filename), rc);
+        if (rc == EPHPM_BUNDLE_HIT && canon) {
             /* zend_string_init can zend_bailout() on OOM — but no Rust
              * destructor is live here (canon is a stable pointer into the
              * immutable bundle), so a longjmp is safe. */
             return zend_string_init(canon, strlen(canon), 0);
+        }
+        if (rc == EPHPM_BUNDLE_ABSENT) {
+            /* Sealed: the bundle is the authority for this path. NULL is
+             * "cannot resolve", answered without a single syscall. */
+            return NULL;
         }
     }
     return g_orig_resolve_path ? g_orig_resolve_path(filename) : NULL;
@@ -137,79 +373,36 @@ static zend_string *ephpm_bundle_resolve_path_hook(zend_string *filename)
 
 /* ---- 2. zend_stream_open_function ---------------------------------------- */
 
-/* Per-open cursor over a bundle source buffer. malloc'd (never emalloc), so it
- * survives independently of the Zend request allocator and its lifetime is the
- * zend_file_handle's — freed in the closer. */
-typedef struct {
-    const unsigned char *data;
-    size_t               len;
-    size_t               pos;
-    int                  needs_free; /* release data via free_source on close */
-} ephpm_bundle_stream_ctx;
-
-static ssize_t ephpm_bundle_stream_reader(void *h, char *buf, size_t len)
-{
-    ephpm_bundle_stream_ctx *c = (ephpm_bundle_stream_ctx *)h;
-    size_t remain = c->len - c->pos;
-    size_t n = remain < len ? remain : len;
-    if (n) {
-        memcpy(buf, c->data + c->pos, n);
-        c->pos += n;
-    }
-    return (ssize_t)n;
-}
-
-static size_t ephpm_bundle_stream_fsizer(void *h)
-{
-    return ((ephpm_bundle_stream_ctx *)h)->len;
-}
-
-static void ephpm_bundle_stream_closer(void *h)
-{
-    ephpm_bundle_stream_ctx *c = (ephpm_bundle_stream_ctx *)h;
-    if (c->needs_free && c->data && g_cb.free_source) {
-        g_cb.free_source(c->data, c->len);
-    }
-    free(c);
-}
-
 static zend_result ephpm_bundle_stream_open_hook(zend_file_handle *handle)
 {
     if (ephpm_bundle_active() && handle && handle->filename) {
-        size_t src_len = 0;
-        int needs_free = 0;
-        const unsigned char *src = g_cb.get_source(
-            ZSTR_VAL(handle->filename), ZSTR_LEN(handle->filename),
-            &src_len, &needs_free);
-        ephpm_bundle_trace_line("stream_open", ZSTR_VAL(handle->filename), src ? 1 : 0);
-        if (src) {
-            ephpm_bundle_stream_ctx *ctx =
-                (ephpm_bundle_stream_ctx *)malloc(sizeof(*ctx));
-            if (!ctx) {
-                if (needs_free && g_cb.free_source) {
-                    g_cb.free_source(src, src_len);
+        ephpm_bundle_source_t src;
+        int rc = g_cb.get_source(ZSTR_VAL(handle->filename),
+                                 ZSTR_LEN(handle->filename), &src);
+        ephpm_bundle_trace_line("stream_open", ZSTR_VAL(handle->filename), rc);
+        if (rc == EPHPM_BUNDLE_HIT) {
+            php_stream *stream = ephpm_bundle_stream_from_source(&src);
+            if (stream) {
+                /* Serve via a zend_stream reader (not by pre-filling
+                 * handle->buf): zend_stream_fixup only consults handle->buf
+                 * BEFORE calling the open function, so the reader path is the
+                 * correct, version-robust layer. handle.stream.handle is a
+                 * genuine php_stream — OPcache's timestamp read casts it to one
+                 * and calls ops->stat. */
+                handle->type = ZEND_HANDLE_STREAM;
+                handle->handle.stream.handle = stream;
+                handle->handle.stream.isatty = 0;
+                handle->handle.stream.reader = ephpm_bundle_zend_reader;
+                handle->handle.stream.fsizer = ephpm_bundle_zend_fsizer;
+                handle->handle.stream.closer = ephpm_bundle_zend_closer;
+                if (!handle->opened_path) {
+                    handle->opened_path = zend_string_copy(handle->filename);
                 }
-                return g_orig_stream_open(handle);
+                return SUCCESS;
             }
-            ctx->data = src;
-            ctx->len = src_len;
-            ctx->pos = 0;
-            ctx->needs_free = needs_free;
-
-            /* Serve via a zend_stream reader (not by pre-filling handle->buf):
-             * zend_stream_fixup only consults handle->buf BEFORE calling the
-             * open function, so the reader path is the correct, version-robust
-             * layer. This is FrankenPHP's proven technique. */
-            handle->type = ZEND_HANDLE_STREAM;
-            handle->handle.stream.handle = ctx;
-            handle->handle.stream.isatty = 0;
-            handle->handle.stream.reader = ephpm_bundle_stream_reader;
-            handle->handle.stream.fsizer = ephpm_bundle_stream_fsizer;
-            handle->handle.stream.closer = ephpm_bundle_stream_closer;
-            if (!handle->opened_path) {
-                handle->opened_path = zend_string_copy(handle->filename);
-            }
-            return SUCCESS;
+            /* Stream construction failed (OOM); fall through to disk. */
+        } else if (rc == EPHPM_BUNDLE_ABSENT) {
+            return FAILURE;
         }
     }
     return g_orig_stream_open(handle);
@@ -224,9 +417,9 @@ static int ephpm_bundle_url_stat_hook(php_stream_wrapper *wrapper,
 {
     if (ephpm_bundle_active() && url && ssb) {
         ephpm_bundle_stat_t st;
-        int hit = g_cb.stat(url, strlen(url), &st);
-        ephpm_bundle_trace_line("url_stat", url, hit);
-        if (hit) {
+        int rc = g_cb.stat(url, strlen(url), &st);
+        ephpm_bundle_trace_line("url_stat", url, rc);
+        if (rc == EPHPM_BUNDLE_HIT) {
             memset(ssb, 0, sizeof(*ssb));
             /* Direct assignment: C implicitly converts int64_t to each field's
              * platform type (off_t/time_t/ino_t on Unix, __int64 variants on
@@ -244,6 +437,11 @@ static int ephpm_bundle_url_stat_hook(php_stream_wrapper *wrapper,
             ssb->sb.st_nlink = 1;
             return 0; /* success */
         }
+        if (rc == EPHPM_BUNDLE_ABSENT) {
+            /* Sealed: answer "no such file" from RAM. This is the hot path —
+             * a PSR-4 autoloader's misses are the bulk of its probes. */
+            return -1;
+        }
     }
     return g_orig_url_stat
         ? g_orig_url_stat(wrapper, url, flags, ssb, context)
@@ -256,37 +454,41 @@ static int ephpm_bundle_url_stat_hook(php_stream_wrapper *wrapper,
  * cold-compile source read reaches disk through php_stream_open_wrapper -> this
  * plain-wrapper stream_opener. Overriding it here catches opcache's read (and
  * userland fopen/file_get_contents of a bundled file) and serves it from a
- * read-only in-memory php_stream. Only read modes are fronted; writes and every
- * miss delegate to the original opener (overlay semantics). */
+ * read-only bundle stream. Only strictly read-only modes are fronted; writes
+ * (including "r+", which mode[0]=='r' alone would wrongly admit) and every
+ * UNKNOWN delegate to the original opener (overlay semantics). */
+static int ephpm_bundle_mode_is_readonly(const char *mode)
+{
+    return mode && mode[0] == 'r' && strchr(mode, '+') == NULL;
+}
+
 static php_stream *ephpm_bundle_stream_opener(php_stream_wrapper *wrapper,
                                               const char *filename, const char *mode,
                                               int options, zend_string **opened_path,
                                               php_stream_context *context STREAMS_DC)
 {
-    if (ephpm_bundle_active() && filename && mode && mode[0] == 'r') {
-        size_t src_len = 0;
-        int needs_free = 0;
-        const unsigned char *src =
-            g_cb.get_source(filename, strlen(filename), &src_len, &needs_free);
-        ephpm_bundle_trace_line("stream_opener", filename, src ? 1 : 0);
-        if (src) {
-            /* zend_string_init copies the bytes, so the decompress buffer can be
-             * released immediately — nothing Rust-owned outlives this call. */
-            zend_string *buf = zend_string_init((const char *)src, src_len, 0);
-            if (needs_free && g_cb.free_source) {
-                g_cb.free_source(src, src_len);
+    if (ephpm_bundle_active() && filename && !ephpm_bundle_mode_is_readonly(mode)
+        && g_cb.note_write) {
+        /* Diagnostic only — the open itself always proceeds to the real
+         * filesystem below. */
+        g_cb.note_write(filename, strlen(filename));
+    }
+    if (ephpm_bundle_active() && filename && ephpm_bundle_mode_is_readonly(mode)) {
+        ephpm_bundle_source_t src;
+        int rc = g_cb.get_source(filename, strlen(filename), &src);
+        ephpm_bundle_trace_line("stream_opener", filename, rc);
+        if (rc == EPHPM_BUNDLE_HIT) {
+            php_stream *stream = ephpm_bundle_stream_from_source(&src);
+            if (stream) {
+                if (opened_path) {
+                    *opened_path = zend_string_init(filename, strlen(filename), 0);
+                }
+                return stream;
             }
-            /* READONLY: the memory stream takes ownership of buf. */
-            php_stream *stream = php_stream_memory_open(TEMP_STREAM_READONLY, buf);
-            if (!stream) {
-                zend_string_release(buf);
-                return g_orig_stream_opener(wrapper, filename, mode, options,
-                                            opened_path, context STREAMS_REL_CC);
-            }
-            if (opened_path) {
-                *opened_path = zend_string_init(filename, strlen(filename), 0);
-            }
-            return stream;
+            /* OOM building the stream; fall through to disk. */
+        } else if (rc == EPHPM_BUNDLE_ABSENT) {
+            errno = ENOENT;
+            return NULL;
         }
     }
     return g_orig_stream_opener(wrapper, filename, mode, options, opened_path,
@@ -310,10 +512,9 @@ void ephpm_bundle_install_hooks(const ephpm_bundle_callbacks_t *cb)
     g_orig_stream_open = zend_stream_open_function;
     zend_stream_open_function = ephpm_bundle_stream_open_hook;
 
-    /* Copy the plain-files wrapper ops, swap url_stat, repoint the wrapper. The
-     * other ops (stream_opener/dir_opener/unlink/...) keep delegating to the
-     * originals, so userland fopen/scandir/writes still hit disk (overlay
-     * semantics: bundle-first for stat, fall through for everything else). */
+    /* Copy the plain-files wrapper ops, swap url_stat + stream_opener, repoint
+     * the wrapper. The other ops (dir_opener/unlink/...) keep delegating to the
+     * originals, so userland scandir/writes still hit disk. */
     if (php_plain_files_wrapper.wops) {
         g_orig_url_stat = php_plain_files_wrapper.wops->url_stat;
         g_orig_stream_opener = php_plain_files_wrapper.wops->stream_opener;

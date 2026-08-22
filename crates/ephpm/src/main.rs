@@ -1305,13 +1305,41 @@ fn run_with_config(
     // per-thread timers and in stub mode.
     ephpm_php::PhpRuntime::set_max_execution_time(config.php.max_execution_time);
 
-    // In-memory code bundle (experimental `[php] code_bundle`). Built here on the
-    // single-threaded startup path — after PHP init (the hooks patch PHP's C
-    // function pointers) and before the tokio runtime exists (the bundle is
-    // immutable-after-install and read concurrently by every PHP thread with no
-    // lock). A build failure or an over-cap corpus is non-fatal: ePHPm logs and
-    // falls through to normal disk access.
+    // In-memory code bundle (experimental `[php] code_bundle`).
+    //
+    // Two steps with very different threading requirements:
+    //
+    //  1. The C hooks are armed HERE, on the single-threaded startup path, right
+    //     after PHP init — they overwrite PHP's global function pointers, which
+    //     must not race a reader. They are inert while no index is published:
+    //     every hook delegates to the saved original, i.e. exactly
+    //     `code_bundle = "off"` behaviour.
+    //  2. The scan itself runs on ONE background thread and publishes the
+    //     finished index with a single atomic `set`. Startup never blocks on it
+    //     (the scan measured 45 ms warm but 3.7 s cold on Windows), and there is
+    //     no half-built state — which is what keeps sealed roots safe, since a
+    //     partially scanned index would report "does not exist" for files it had
+    //     not reached yet.
+    //
+    // Every pre-final state is fail-safe: not-ready → fall through to disk;
+    // scan complete → overlay; sealed roots declared → authoritative, and only
+    // then. A scan failure never publishes, so the process simply stays on the
+    // fall-through path.
     if config.php.is_code_bundle_enabled() {
+        if dev_mode {
+            // The bundle freezes source bytes AND mtimes at scan time, so an
+            // in-place edit is invisible for the life of the process — the exact
+            // opposite of what `ephpm dev` is for. Hard error rather than a
+            // silent downgrade: a dev server that ignores your edits is a much
+            // worse experience than a startup message telling you why.
+            anyhow::bail!(
+                "[php] code_bundle = {:?} is not supported by `ephpm dev`. The bundle serves \
+                 source and mtimes captured at startup, so edits to .php files would be \
+                 invisible until restart. Remove the setting (or set code_bundle = \"off\") \
+                 for development.",
+                config.php.code_bundle_label()
+            );
+        }
         if config.server.sites_dir.is_some() {
             tracing::warn!(
                 "[php] code_bundle is set but multi-site mode ([server] sites_dir) is \
@@ -1331,44 +1359,134 @@ fn run_with_config(
             })?;
             let docroot = config.server.document_root.clone();
             let max = usize::try_from(config.php.code_bundle_max_bytes).unwrap_or(usize::MAX);
-            let started = std::time::Instant::now();
-            match ephpm_php::code_bundle::Bundle::from_scan(&docroot, algo, max) {
-                Ok(bundle) => {
-                    let files = bundle.file_count();
-                    let raw = bundle.raw_bytes();
-                    let resident = bundle.resident_bytes();
-                    let load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    match ephpm_php::PhpRuntime::install_code_bundle(bundle) {
-                        Ok(()) => {
-                            tracing::info!(
+            // `sealed` promotes a bundle MISS from "ask the filesystem" to
+            // "answer 'no such file' from RAM" — but only inside the subtrees
+            // named by code_bundle_sealed_paths, which is empty by default. It
+            // is the one setting that can change an answer rather than just its
+            // latency, hence the explicit startup line stating what is live.
+            let semantics = if config.php.is_code_bundle_sealed() {
+                ephpm_php::code_bundle::BundleSemantics::Sealed
+            } else {
+                ephpm_php::code_bundle::BundleSemantics::Overlay
+            };
+            // The verify knob only has anything to confirm in sealed mode. Never
+            // silently ignore it: say so at startup.
+            let verify_negatives =
+                config.php.code_bundle_verify_negatives && config.php.is_code_bundle_sealed();
+            if config.php.code_bundle_verify_negatives && !verify_negatives {
+                tracing::warn!(
+                    "[php] code_bundle_verify_negatives is set but code_bundle is not \
+                     \"sealed\" — there are no authoritative negatives to verify, so the \
+                     setting is IGNORED."
+                );
+            }
+            if !config.php.code_bundle_sealed_paths.is_empty()
+                && !config.php.is_code_bundle_sealed()
+            {
+                tracing::warn!(
+                    "[php] code_bundle_sealed_paths is set but code_bundle is not \
+                     \"sealed\" — the setting is IGNORED and every miss still falls \
+                     through to the filesystem."
+                );
+            }
+            // Sealed roots are validated NOW, on the startup path, so a bad path
+            // is a startup error rather than a surprise from a background thread.
+            let spec = ephpm_php::code_bundle::BundleSpec::new(
+                docroot.clone(),
+                algo,
+                max,
+                semantics,
+                &config.php.code_bundle_sealed_paths,
+                verify_negatives,
+            )
+            .context("invalid [php] code_bundle_sealed_paths")?;
+
+            ephpm_php::PhpRuntime::arm_code_bundle_hooks()
+                .context("failed to arm code bundle hooks")?;
+
+            let sealed_roots: Vec<String> = spec.sealed_roots().to_vec();
+            tracing::info!(
+                compression = algo.label(),
+                semantics = semantics.label(),
+                verify_negatives,
+                sealed_roots = ?sealed_roots,
+                document_root = %docroot.display(),
+                validate_timestamps,
+                "code bundle: scanning in the background; until it completes, code reads \
+                 fall through to the filesystem exactly as with code_bundle = \"off\""
+            );
+            if verify_negatives {
+                tracing::warn!(
+                    "[php] code_bundle_verify_negatives is ON — every authoritative \
+                     negative is confirmed against disk and mismatches are logged. This \
+                     gives back the syscalls sealed mode removes; it is a DIAGNOSTIC \
+                     mode, not a production setting."
+                );
+            }
+            if validate_timestamps {
+                tracing::warn!(
+                    "[php] code_bundle is ON but opcache.validate_timestamps is ON — the \
+                     bundle serves the mtime captured at scan time, so OPcache's \
+                     revalidation can never observe an edit. Code changes are invisible \
+                     until restart either way; set [php] opcache_validate_timestamps = \
+                     false to at least stop paying for the stat."
+                );
+            }
+
+            // ONE background thread — not a rayon fan-out, which would compete
+            // with early requests for CPU and IO.
+            let builder = std::thread::Builder::new().name("ephpm-code-bundle".into());
+            // (No thread-priority call: `std::thread` exposes none portably, and
+            // the `nice`/`SetThreadPriority` FFI is not worth an `unsafe` block
+            // in the binary crate. The substance is that this is ONE thread, not
+            // a fan-out competing with early requests for CPU and IO.)
+            let spawned = builder.spawn(move || {
+                let started = std::time::Instant::now();
+                match ephpm_php::code_bundle::Bundle::from_scan(&spec) {
+                    Ok(bundle) => {
+                        let files = bundle.file_count();
+                        let raw = bundle.raw_bytes();
+                        let resident = bundle.resident_bytes();
+                        let semantics_note = if sealed_roots.is_empty() {
+                            "overlay — hits are served from memory, misses fall through to \
+                             the filesystem unchanged"
+                        } else {
+                            "SEALED roots armed — an unindexed .php path inside a sealed \
+                             root is reported MISSING without touching disk, until the \
+                             first write into that root permanently disarms it"
+                        };
+                        let load_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        match ephpm_php::PhpRuntime::publish_code_bundle(bundle) {
+                            Ok(()) => tracing::info!(
                                 entries = files,
                                 raw_bytes = raw,
                                 resident_bytes = resident,
-                                compression = algo.label(),
-                                validate_timestamps,
+                                sealed_roots = ?sealed_roots,
                                 load_ms,
-                                "code bundle loaded: {files} .php files, {resident} bytes \
-                                 resident; code reads served from memory"
-                            );
-                            if validate_timestamps {
-                                tracing::warn!(
-                                    "[php] code_bundle is ON but opcache.validate_timestamps \
-                                     is ON — OPcache keeps stat-ing cached files, leaving the \
-                                     bundle's main warm-path win unrealized. Set [php] \
-                                     opcache_validate_timestamps = false to reclaim it."
-                                );
-                            }
+                                "code bundle published: {files} .php files, {resident} bytes \
+                                 resident; {semantics_note}"
+                            ),
+                            Err(e) => tracing::error!(
+                                error = %e,
+                                "failed to publish code bundle — code reads keep falling \
+                                 through to disk"
+                            ),
                         }
-                        Err(e) => tracing::error!(
-                            error = %e,
-                            "failed to install code bundle — falling through to disk"
-                        ),
                     }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "code bundle NOT built — code reads keep falling through to normal \
+                         disk access for the life of this process"
+                    ),
                 }
-                Err(e) => tracing::warn!(
+            });
+            if let Err(e) = spawned {
+                tracing::warn!(
                     error = %e,
-                    "code bundle NOT built — falling through to normal disk access"
-                ),
+                    "could not spawn the code bundle scan thread — code reads fall through \
+                     to disk"
+                );
             }
         }
     }

@@ -2128,7 +2128,41 @@ pub enum CodeBundleMode {
 
     /// Scan `document_root` recursively at startup and index every `.php` file
     /// into RAM. Convenient for dev/container boot; re-scans every start.
+    ///
+    /// **Overlay semantics** — a bundle *hit* is served from RAM; a *miss*
+    /// falls through to the real filesystem. Always safe: the bundle can only
+    /// make things faster, never change an answer.
     Scan,
+
+    /// Same scan as [`Scan`](Self::Scan), plus **authoritative negatives**
+    /// inside the subtrees listed in
+    /// [`code_bundle_sealed_paths`](PhpConfig::code_bundle_sealed_paths): a
+    /// `.php` path under a declared sealed root that is not in the index is
+    /// answered "does not exist" from RAM, with **no syscall at all**.
+    ///
+    /// This is what makes the bundle worth having. A PSR-4 autoloader's probes
+    /// are mostly *misses* — one per candidate directory that does not hold the
+    /// class — and under `"scan"` every one of them still costs a real `stat`.
+    /// Measured on a 400-class Composer-model autoload, those misses were 88%
+    /// of the warm request.
+    ///
+    /// **`sealed_paths` is empty by default, and with it empty this mode
+    /// behaves exactly like `"scan"`.** The authoritative half is unreachable
+    /// without naming the subtrees you are willing to freeze.
+    ///
+    /// **Correctness contract — read before declaring a sealed root.** Sealing
+    /// a subtree declares that its set of `.php` files is *fixed at startup*.
+    /// It is **wrong** for a tree an application writes into at runtime (a
+    /// compiled-container or template cache): the freshly written file is not in
+    /// the index, so `is_file()` would report it missing. The win and the risk
+    /// live in disjoint directories — the probes worth eliminating are under
+    /// `vendor/`, while framework writes go to `var/cache/`,
+    /// `bootstrap/cache/`, `storage/framework/views/` — so sealing only
+    /// `vendor/` removes the failure mode by construction. Authority is also a
+    /// one-way latch: any write into a sealed root, or any negative that turns
+    /// out to be wrong, **permanently disarms** that root (it degrades to
+    /// `"scan"` semantics for the rest of the process's life) with a `WARN`.
+    Sealed,
     // Note: a prebuilt `.ebundle` artifact (`"file"`) is a documented follow-on
     // (image-build-time bundle) and is intentionally NOT a variant yet — serde
     // rejects `file` as an unknown value rather than silently no-op'ing.
@@ -2668,7 +2702,15 @@ pub struct PhpConfig {
     /// the Windows filesystem tax (~50 µs/`stat`); on Linux the win is small.
     ///
     /// - `"off"` (**default**) — no bundle, zero overhead.
-    /// - `"scan"` — scan `document_root` at startup and index every `.php` file.
+    /// - `"scan"` — scan `document_root` at startup and index every `.php`
+    ///   file. Overlay semantics: hits are served from RAM, **misses still hit
+    ///   disk**.
+    /// - `"sealed"` — same scan, plus authoritative negatives **inside the
+    ///   subtrees named by [`code_bundle_sealed_paths`](Self::code_bundle_sealed_paths)**
+    ///   (empty by default, in which case this is identical to `"scan"`). This
+    ///   is where the real win is — a PSR-4 autoloader's probes are mostly
+    ///   misses — but it requires that no `.php` file is created inside a sealed
+    ///   root after startup. See [`CodeBundleMode::Sealed`].
     ///
     /// **Interaction:** when on, also set
     /// [`opcache_validate_timestamps`](Self::opcache_validate_timestamps)`= false`
@@ -2718,6 +2760,61 @@ pub struct PhpConfig {
     /// Default: `"none"`.
     #[serde(default = "default_code_bundle_compression")]
     pub code_bundle_compression: String,
+
+    /// Subtrees the sealed index is allowed to answer **authoritative
+    /// negatives** for, relative to `document_root` (absolute paths are
+    /// accepted but must still land inside it).
+    ///
+    /// **Empty by default, and an empty list makes `code_bundle = "sealed"`
+    /// behave exactly like `"scan"`.** The half of the feature that can change
+    /// an answer rather than just its latency is unreachable until you name the
+    /// trees you are willing to freeze.
+    ///
+    /// Recommended value: `["vendor"]`. That is where the probes worth
+    /// eliminating are (a PSR-4 autoloader misses once per candidate directory),
+    /// and it is disjoint from every directory a framework writes into at
+    /// runtime (`var/cache`, `bootstrap/cache`, `storage/framework/views`) — so
+    /// the failure mode is removed by construction rather than detected later.
+    ///
+    /// An entry that resolves **outside** `document_root` is a hard startup
+    /// error, not a warning: the index must never claim authority over a tree it
+    /// did not scan.
+    ///
+    /// Ignored unless `code_bundle = "sealed"`.
+    ///
+    /// Env override: `EPHPM_PHP__CODE_BUNDLE_SEALED_PATHS=["vendor"]`.
+    ///
+    /// Default: `[]`.
+    #[serde(default)]
+    pub code_bundle_sealed_paths: Vec<String>,
+
+    /// **Diagnostic.** Confirm every `code_bundle = "sealed"` authoritative
+    /// negative against the real filesystem, and log a `WARN` naming any path
+    /// the index was wrong about.
+    ///
+    /// Sealed mode answers "this `.php` file does not exist" from RAM with no
+    /// syscall. If the index is stale (something wrote a `.php` file under the
+    /// document root after startup) that answer is *wrong*, and the symptom —
+    /// a class or template that mysteriously cannot be found — is hard to
+    /// attribute. Turning this on gives back the syscalls sealed mode removed,
+    /// in exchange for naming the offending path in the log.
+    ///
+    /// Source opens and `include`/`require` resolution are **always** confirmed
+    /// regardless of this setting (they are rare, and a wrong answer there is
+    /// fatal); this knob extends confirmation to the hot
+    /// `is_file`/`file_exists`/`stat` probes as well.
+    ///
+    /// Turn it on to diagnose a suspected sealed-mode breakage, then turn it
+    /// off. It is **not** a production setting — with it on, sealed mode has
+    /// roughly the cost of `"scan"`.
+    ///
+    /// Ignored (with a startup warning) unless `code_bundle = "sealed"`.
+    ///
+    /// Env override: `EPHPM_PHP__CODE_BUNDLE_VERIFY_NEGATIVES=true`.
+    ///
+    /// Default: `false`.
+    #[serde(default)]
+    pub code_bundle_verify_negatives: bool,
 }
 
 impl Config {
@@ -3141,6 +3238,8 @@ impl Default for PhpConfig {
             code_bundle: default_code_bundle(),
             code_bundle_max_bytes: default_code_bundle_max_bytes(),
             code_bundle_compression: default_code_bundle_compression(),
+            code_bundle_sealed_paths: Vec::new(),
+            code_bundle_verify_negatives: false,
         }
     }
 }
@@ -3165,10 +3264,29 @@ impl PhpConfig {
         !self.is_worker_mode() && self.fpm_engine == FpmEngine::Pool
     }
 
+    /// The configured `code_bundle` value as it is spelled in TOML, for log and
+    /// error messages (the derived `Debug` prints `Sealed`, not `"sealed"`).
+    #[must_use]
+    pub fn code_bundle_label(&self) -> &'static str {
+        match self.code_bundle {
+            CodeBundleMode::Off => "off",
+            CodeBundleMode::Scan => "scan",
+            CodeBundleMode::Sealed => "sealed",
+        }
+    }
+
     /// Whether an in-memory code bundle is requested (`code_bundle != "off"`).
     #[must_use]
     pub fn is_code_bundle_enabled(&self) -> bool {
         self.code_bundle != CodeBundleMode::Off
+    }
+
+    /// Whether the code bundle should answer **authoritative negatives**
+    /// (`code_bundle = "sealed"`) — an unindexed `.php` path under the document
+    /// root is reported missing without a syscall.
+    #[must_use]
+    pub fn is_code_bundle_sealed(&self) -> bool {
+        self.code_bundle == CodeBundleMode::Sealed
     }
 
     /// Whether stack-overflow crash containment is requested **and applicable**
@@ -5377,8 +5495,101 @@ idle_timeout_secs = 15
         let config = Config::load(&file).unwrap();
         assert_eq!(config.php.code_bundle, CodeBundleMode::Scan);
         assert!(config.php.is_code_bundle_enabled());
+        assert!(
+            !config.php.is_code_bundle_sealed(),
+            "scan keeps overlay semantics — a miss must still reach the filesystem"
+        );
         assert_eq!(config.php.code_bundle_max_bytes, 1_048_576);
         assert_eq!(config.php.code_bundle_compression, "zstd");
+    }
+
+    /// `sealed` is a distinct, strictly opt-in mode: it enables the bundle *and*
+    /// authoritative negatives. Neither `off` nor `scan` may imply it.
+    #[test]
+    fn code_bundle_sealed_parses_and_is_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\ncode_bundle = \"sealed\"\n").unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.code_bundle, CodeBundleMode::Sealed);
+        assert!(config.php.is_code_bundle_enabled());
+        assert!(config.php.is_code_bundle_sealed());
+
+        // The safe modes never claim authority.
+        assert!(!PhpConfig::default().is_code_bundle_sealed());
+        for mode in [CodeBundleMode::Off, CodeBundleMode::Scan] {
+            let php = PhpConfig { code_bundle: mode, ..PhpConfig::default() };
+            assert!(!php.is_code_bundle_sealed(), "{mode:?} must not be sealed");
+        }
+
+        // And `sealed` alone declares NO roots: with the list empty the mode is
+        // behaviourally identical to `scan`. The dangerous half needs a second,
+        // explicit opt-in.
+        assert!(
+            config.php.code_bundle_sealed_paths.is_empty(),
+            "sealed must not imply any sealed root"
+        );
+    }
+
+    /// `code_bundle_sealed_paths` is empty by default and parses as a list.
+    #[test]
+    fn code_bundle_sealed_paths_default_empty_and_parses() {
+        assert!(PhpConfig::default().code_bundle_sealed_paths.is_empty());
+        let config = Config::default_config().expect("default config should load");
+        assert!(config.php.code_bundle_sealed_paths.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[php]\ncode_bundle = \"sealed\"\n\
+             code_bundle_sealed_paths = [\"vendor\", \"lib/third-party\"]\n",
+        )
+        .unwrap();
+        let loaded = Config::load(&file).unwrap();
+        assert_eq!(loaded.php.code_bundle_sealed_paths, vec!["vendor", "lib/third-party"]);
+
+        // `[php]` present without the field must still default to empty.
+        let file2 = dir.path().join("b.toml");
+        std::fs::write(&file2, "[php]\ncode_bundle = \"sealed\"\n").unwrap();
+        assert!(Config::load(&file2).unwrap().php.code_bundle_sealed_paths.is_empty());
+    }
+
+    /// The verify-negatives diagnostic is off by default and parses when set.
+    /// It is meaningful only in sealed mode — `run_with_config` warns and
+    /// ignores it otherwise rather than silently no-op'ing.
+    #[test]
+    fn code_bundle_verify_negatives_defaults_off_and_parses() {
+        assert!(!PhpConfig::default().code_bundle_verify_negatives);
+        let config = Config::default_config().expect("default config should load");
+        assert!(!config.php.code_bundle_verify_negatives);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[php]\ncode_bundle = \"sealed\"\ncode_bundle_verify_negatives = true\n",
+        )
+        .unwrap();
+        let loaded = Config::load(&file).unwrap();
+        assert!(loaded.php.code_bundle_verify_negatives);
+        assert!(loaded.php.is_code_bundle_sealed());
+
+        // `[php]` present without the field must still default to off.
+        let file2 = dir.path().join("b.toml");
+        std::fs::write(&file2, "[php]\ncode_bundle = \"sealed\"\n").unwrap();
+        assert!(!Config::load(&file2).unwrap().php.code_bundle_verify_negatives);
+    }
+
+    /// The env override reaches the knob with the documented `__` nesting.
+    #[test]
+    fn code_bundle_env_override_selects_sealed() {
+        let _env = crate::test_env::EnvVars::set("EPHPM_PHP__CODE_BUNDLE", "sealed");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\ncode_bundle = \"off\"\n").unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.code_bundle, CodeBundleMode::Sealed);
     }
 
     /// An unknown mode (e.g. the not-yet-implemented `file`) is a load error,

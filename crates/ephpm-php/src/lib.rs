@@ -810,26 +810,37 @@ impl PhpRuntime {
         }
     }
 
-    /// Install an in-memory code bundle as a transparent overlay in front of the
-    /// filesystem for `.php` source discovery, reads, and `stat`.
+    /// Arm the in-memory code bundle's C overrides — a transparent overlay in
+    /// front of the filesystem for `.php` source discovery, reads, and `stat`.
     ///
     /// Must be called **once**, after [`init`](Self::init) and before serving
-    /// requests (the single-threaded startup path). Swaps PHP's
-    /// `zend_resolve_path`, `zend_stream_open_function`, and the plain-files
-    /// `url_stat` op so bundle hits are answered from RAM and misses fall
-    /// through to the real filesystem. In stub mode the bundle is stored but no
-    /// PHP hooks are installed.
+    /// requests (the single-threaded startup path), because it overwrites PHP's
+    /// `zend_resolve_path` / `zend_stream_open_function` / plain-files wrapper
+    /// pointers. The hooks are **inert** until an index is published, so calling
+    /// this costs nothing and changes no behaviour on its own. In stub mode it
+    /// is a no-op.
     ///
     /// # Errors
     ///
-    /// Returns [`PhpError::NotInitialized`] if the runtime is not yet
-    /// initialized, or [`PhpError::BundleAlreadyInstalled`] if a bundle was
-    /// already installed.
-    pub fn install_code_bundle(bundle: code_bundle::Bundle) -> Result<(), PhpError> {
+    /// [`PhpError::NotInitialized`] if the runtime is not yet initialized.
+    pub fn arm_code_bundle_hooks() -> Result<(), PhpError> {
         if !PHP_INITIALIZED.load(Ordering::Acquire) {
             return Err(PhpError::NotInitialized);
         }
-        code_bundle::install(bundle).map_err(|_| PhpError::BundleAlreadyInstalled)
+        code_bundle::install_code_bundle_hooks();
+        Ok(())
+    }
+
+    /// Publish a fully built index, in one atomic step. Safe to call from a
+    /// background scan thread while requests are already being served: before
+    /// it, every lookup falls through to disk; after it, every lookup consults a
+    /// complete immutable index.
+    ///
+    /// # Errors
+    ///
+    /// [`PhpError::BundleAlreadyInstalled`] if a bundle was already published.
+    pub fn publish_code_bundle(bundle: code_bundle::Bundle) -> Result<(), PhpError> {
+        code_bundle::publish(bundle).map_err(|_| PhpError::BundleAlreadyInstalled)
     }
 
     /// Check whether the PHP runtime is initialized and ready.

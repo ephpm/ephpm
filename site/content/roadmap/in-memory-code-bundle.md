@@ -1,44 +1,71 @@
 # In-Memory Application Code Bundle
 
 > **Status: EXPERIMENTAL POC (measured).** A working proof-of-concept exists
-> behind `[php] code_bundle = "scan"` (off by default) — C-level overrides of
+> behind `[php] code_bundle` (`off` by default) — C-level overrides of
 > `zend_resolve_path`, `zend_stream_open_function`, and the plain-files
-> `stream_opener` + `url_stat` ops, backed by an immutable `Arc`-style Rust index
+> `stream_opener` + `url_stat` ops, backed by an immutable Rust index
 > (`crates/ephpm-php/src/code_bundle.rs`, `code_bundle_hooks.c`). It is **not
-> production-hardened**. See the POC-findings box below for what the portable
-> hooks can and cannot front on Windows — the result revises the feasibility
-> verdict.
+> production-hardened**.
 >
-> ### POC findings (Windows 11, PHP 8.5.7 ZTS, this host)
+> ### POC findings (Windows 11 + WSL2 Linux, same host, PHP 8.5.7 ZTS)
 >
 > - **The source-read path works and is opcache-safe.** `require`/`include` and
->   the cold compile read serve from RAM even with OPcache enabled — proven by
->   deleting the source off disk after boot and still serving a 400-class
->   autoloader (`files_ok=1`). This required overriding the plain-files
->   **`stream_opener`**, not just `zend_stream_open_function`: OPcache captures
->   the *original* `zend_stream_open_function` at startup and calls its saved
->   copy, bypassing a late override of the live global.
+>   the cold compile serve from RAM even with OPcache enabled — proven by
+>   deleting every autoloaded source off disk after boot and still cold-compiling
+>   a 400-class autoloader (`files_ok=1`, so `__FILE__`/`__DIR__` still resolve).
+>   This required overriding the plain-files **`stream_opener`**, not just
+>   `zend_stream_open_function`: OPcache captures the *original*
+>   `zend_stream_open_function` at startup and calls its saved copy.
 > - **`is_file`/`stat`/`filemtime` are frontable** via the plain-files `url_stat`
->   op — served from RAM, proven with disk deleted.
-> - **`file_exists()` is NOT frontable by portable hooks on Windows.** It uses
->   `VCWD_ACCESS` (access-check), not the stream wrapper, so it bypasses
->   `url_stat` and still hits disk. **Real Composer's PSR-4 autoloader probes
->   with `file_exists`,** so its steady-state stat tax — the feature's main
->   motivation — is *not* reclaimed by the portable C-hook approach. Fronting it
->   requires the SDK patch (`win32/ioutil.c` / `TSRM/tsrm_virtual_cwd.c`) that
->   this doc had scoped as optional "last few percent" hardening; on Windows it
->   turns out to be load-bearing, not residual.
-> - **Measured (stat-heavy 400-class Composer-model autoload, warm p50):** with
->   an `is_file`-based probe (frontable) the bundle roughly **halves** warm
->   latency (~24–33 ms → ~13 ms). With a `file_exists`-based probe (real
->   Composer) the bundle gives **no meaningful warm win**. TAILCALL ≈ CALL for
->   this FS/discovery-bound workload (the VM-dispatch win is orthogonal and does
->   not show here). Compression (zstd) leaves warm latency unchanged and adds
->   only a small one-time cold decompress cost. Full table in the POC PR.
+>   op. **`file_exists()` is not** — on *both* Windows and Linux it short-circuits
+>   through `VCWD_ACCESS` (an access check), which never reaches the stream
+>   wrapper. Real Composer's PSR-4 autoloader probes with `file_exists`, so that
+>   path still needs the SDK patch; the earlier claim that this was a
+>   Windows-only quirk was wrong.
+> - **The overlay's dominant cost was misses, not hits.** On a warm 400-class
+>   autoload with two decoy directories, **88% of the request was filesystem
+>   probes for paths that do not exist**. `"scan"` accelerated the 400 hits and
+>   did nothing for the 800 misses. Answering those from the index — sealed
+>   roots — is what actually pays.
+> - **OPcache was silently refusing to cache anything on Linux.** The file handle
+>   the bundle handed the compiler claimed `ZEND_HANDLE_STREAM` but was not a
+>   `php_stream`, so `zend_get_file_handle_timestamp()` could not obtain a
+>   timestamp and (via `file_update_protection`, which applies even with
+>   `validate_timestamps=0`) refused to cache the script at all:
+>   `num_cached_scripts=0`, every file recompiled on every request. Serving a
+>   real `php_stream` whose `stat` op reports the index's mtime fixed it, and
+>   removed a latent wild-pointer dereference at the same time.
 >
-> The original design text below is preserved. No `[php] code_bundle` value
-> other than `"off"`/`"scan"` is accepted; `"file"` (prebuilt `.ebundle`) and
-> multi-site bundles remain unimplemented.
+> ### Measured, warm p50 (400-class Composer-model autoload, 2 decoy dirs)
+>
+> Same host, quiet machine, 40 warm + 60 measured keep-alive requests per cell,
+> one server process per cell. "syscalls" = Windows per-process I/O operations
+> per request / Linux `strace -c` file-metadata calls per request.
+>
+> | | bundle **off** | `"scan"` (overlay) | `"sealed"` (`vendor`) |
+> |---|---|---|---|
+> | Windows, `is_file` probe | 20.60 ms / 2414 | 11.03 ms / 814 | **1.47 ms / 14** |
+> | Windows, `file_exists` probe | 17.96 ms / 1614 | 18.17 ms / 1614 | 18.30 ms / 1614 |
+> | Linux (WSL2, ext4), `is_file` | 2.51 ms / 2403 | 3.75 ms / 1603 | **0.93 ms / 3** |
+> | Linux, `file_exists` | 2.36 ms | 4.06 ms | 2.42 ms |
+>
+> - **Windows overtakes the Linux baseline.** On the frontable probe the gap to
+>   Linux went from 8.2× (20.60 vs 2.51 ms) to 1.6× (1.47 vs 0.93 ms), and
+>   Windows-sealed is *faster than Linux with the bundle off*. Metadata syscalls
+>   per request fall to 14 on Windows and 3 on Linux — the floor.
+> - **`file_exists` does not move at all**, on either platform. That row is
+>   gated on the SDK patch, not on anything the portable hooks can do.
+> - The `"scan"` column above is the *fixed* build. Before the OPcache fix,
+>   `"scan"` on Linux was **net-negative** (3.75 ms vs 2.51 ms off) purely
+>   because nothing was being cached; `num_cached_scripts` was 0 and
+>   `opcache_get_status()` misses climbed by one per file per request (81 804
+>   over a 203-request run) instead of staying flat at 403. Windows was never
+>   affected, because its OPcache reads the timestamp from the real file first
+>   (`zend_get_file_handle_timestamp_win`) — an accidental dependency that a
+>   prebuilt-bundle mode, with no sources on disk, would fall straight off.
+>
+> The original design text below is preserved. `"file"` (prebuilt `.ebundle`)
+> and multi-site bundles remain unimplemented.
 
 ## Problem
 
@@ -204,6 +231,10 @@ Laravel/Symfony/WordPress break. Design rules:
    filesystem** (config `.env`/`.yaml`, templates, translations, uploads,
    session files, generated caches all live on disk). All writes go to disk.
 
+   **Sealed mode (`code_bundle = "sealed"`) deliberately breaks this rule** for
+   one narrow class of path, and that makes it a *correctness* setting rather
+   than a speed setting. See the sealed-mode contract below.
+
 4. **Stable synthetic stat fields.** Carry a stable `mtime` per entry (deploy
    timestamp or original mtime) and a synthetic-stable `inode`. Apps use
    `filemtime` for cache-busting (asset versioning, Twig cache keys); a
@@ -218,6 +249,100 @@ Laravel/Symfony/WordPress break. Design rules:
    respect it. In multi-site mode (`[server] sites_dir`) each site needs its
    **own** bundle keyed by the *resolved site root* (`Router::resolve_site`),
    never re-derived from the `Host` header — same invariant as per-site DBs.
+
+### The sealed-root contract (`code_bundle = "sealed"`)
+
+Overlay's "a miss falls through" rule is what makes the bundle safe — but it is
+also why plain `"scan"` reclaims so little. A PSR-4 autoloader's probes are
+mostly **misses** (one per candidate directory that does not hold the class),
+and under overlay every one of them still costs a real `stat`. Measured on a
+400-class Composer-model autoload, those misses were **88% of the warm
+request**; the bundle sped up the hits and did nothing at all for the misses.
+
+Sealed mode fixes that by making absence authoritative *inside subtrees you name
+explicitly*: within a sealed root the scan has enumerated every `.php` file, so
+"not in the index" means "does not exist" — answered from RAM with **zero
+syscalls**.
+
+Three properties keep that from being a footgun.
+
+**1. Declared roots, not the whole docroot.** The win and the risk live in
+*disjoint directories*. The misses worth eliminating are decoy probes under
+`vendor/`; every framework write that could break us goes to `var/cache/`,
+`bootstrap/cache/`, `storage/framework/views/`. Sealing only `vendor/` removes
+the failure mode **by construction** rather than by detection.
+`[php] code_bundle_sealed_paths` is **empty by default**, and with it empty
+`"sealed"` behaves exactly like `"scan"` — the half of the feature that can
+change an answer is unreachable without a second, explicit opt-in. A declared
+path that resolves outside the document root is a **hard startup error**.
+
+Within a declared root, the predicate is still narrow: authoritative only for a
+path carrying the one extension the scan enumerates exhaustively (`.php`), and
+only via a component-aware prefix test (`vendor-backup/x.php` is not inside
+`vendor`). Everything else falls through exactly as under `"scan"`. The
+predicate lives in one function (`Bundle::lookup`), and the scan filter and the
+scope predicate share one constant, pinned by a test.
+
+**2. Authority is a one-way latch.** A sealed root starts armed and is
+**permanently disarmed** the first time anything proves the index could be wrong
+about it — a write open of a `.php` file inside it, or a negative that a
+disk-confirmation showed to exist. A disarmed root reverts to overlay semantics:
+correct, slower, forever. Because there is no re-arm there is no
+stale-generation race and no lost-event window, and the index itself is never
+mutated, so every FFI pointer-lifetime contract stays valid unchanged.
+
+**3. It fails loudly.** `include`/`require` resolution and source opens
+**always confirm a negative against disk before returning it**, regardless of
+settings — these are rare, and a wrong answer there is a hard failure, so the
+syscall is worth paying. A mismatch logs `WARN` naming the path, disarms the
+root, and falls through to the correct answer.
+`[php] code_bundle_verify_negatives = true` extends confirmation to the hot
+`is_file`/`file_exists`/`stat` probes too (diagnostic only — it gives back the
+syscalls sealed mode exists to remove).
+
+### Build and publication: async, atomic, fail-safe
+
+The scan is **not** on the startup critical path — it measured 45 ms warm but
+**3.7 s cold** on Windows, which is a lot of dead time on a container's first
+boot. The C hooks are armed synchronously at startup (they are inert while no
+index exists: every hook delegates to the saved original, which is byte-for-byte
+`code_bundle = "off"` behaviour), and one low-priority background thread scans
+and publishes the finished index with a single atomic `OnceLock::set`.
+
+The resulting state machine is one-way and every pre-final state is fail-safe:
+
+```
+not-ready (fall through to disk)  →  scanned (overlay)  →  sealed roots armed
+                                                              ↓ (never back)
+                                                           disarmed (overlay)
+```
+
+There is **no incremental fill**. That matters most for sealed roots: a
+half-built index answering negatives authoritatively would report "does not
+exist" for files it merely had not reached yet — non-deterministic
+class-not-found errors during warmup, the worst possible bug class. Roots are
+armed only inside the constructor of a *completed* scan. If the scan fails
+(permissions, tree changed mid-scan), nothing is ever published, a `WARN` is
+logged, and the process stays on the fall-through path for its whole life.
+
+### Known POC defect: `"scan"` freezes mtimes as well as bytes
+
+Independent of the fixes above, `"scan"` mode is less safe than the original
+design text implies. `url_stat` reports the **scan-time** mtime and the source
+hooks serve **scan-time bytes**, so an in-place edit to a bundled file is
+invisible for the life of the process — and with
+`opcache.validate_timestamps = 1`, OPcache stats *through our hook*, sees the
+frozen mtime, and never recompiles. The net effect is that turning the bundle on
+silently disables timestamp validation. Two consequences:
+
+- **`ephpm dev` refuses to start with the bundle enabled** (hard startup error).
+  A dev server that ignores your edits is far worse than a message saying why.
+- Startup warns when the bundle is on together with
+  `opcache.validate_timestamps = 1`, because that combination is paying for
+  `stat`s that can never observe a change.
+
+A real fix (invalidating on write, or serving the live mtime for files whose
+bytes we did not freeze) belongs with the watcher work, not here.
 
 ### Failure modes to test explicitly
 
@@ -234,6 +359,11 @@ Laravel/Symfony/WordPress break. Design rules:
   result.
 - **File added at runtime then included** (generated config, session) → bundle
   miss → disk fall-through. Correct as long as bundle-first-miss is cheap.
+  **This holds everywhere except inside a declared sealed root**, where a
+  runtime-created `.php` file is reported missing by metadata probes until the
+  first write or wrong negative disarms that root. Keep sealed roots disjoint
+  from anything the app writes into (the reason the recommended value is
+  `["vendor"]`).
 - **`glob()`/`scandir` set or order mismatch** → framework cache invalidation
   or asset manifests break silently.
 - **Zero/one mtime** → asset-version or Twig cache-key churn.
@@ -297,9 +427,16 @@ default **in the same PR** (per the repo's add-config-knob checklist), with a
 startup `warn` if set-but-unenforced.
 
 - **Key:** `[php] code_bundle` — values `"off"` (**default**), `"scan"` (build
-  the index by scanning the docroot at boot), `"file"` (load a prebuilt
-  `.ebundle`). Companion `[php] code_bundle_path` for the `"file"` form.
-- **Default off.** On for prod/container images.
+  the index by scanning the docroot at boot, overlay semantics), `"sealed"`
+  (same scan plus authoritative negatives inside declared roots), `"file"` (load
+  a prebuilt `.ebundle` — **not implemented**). Companions:
+  `[php] code_bundle_sealed_paths` (default `[]`, recommended `["vendor"]`),
+  `[php] code_bundle_verify_negatives` (diagnostic), `[php] code_bundle_path`
+  for the `"file"` form.
+- **Default off**, and `"sealed"` with the default empty root list is
+  behaviourally `"scan"`. Use `"scan"` for prod/container images; add sealed
+  roots only for trees the app never writes into.
+- **Rejected by `ephpm dev`** with a startup error.
 - **Interaction:** bundle mode should **imply/recommend
   `opcache.validate_timestamps=0`** — otherwise opcache keeps stat-ing and the
   main warm-path win is left on the table. Startup **must `warn`** when
@@ -337,14 +474,17 @@ above is the pre-registered expectation the syscall count should confirm.
 extrapolating to ~15 ms/request warm (default opcache) and ~29 ms cold for a
 ~300-file app.
 
-**Linux expectation.** Linux `statx` is ~10–50× cheaper, so the same 300 stats
-are ~0.3–0.9 ms warm and single-digit-ms cold — a much smaller absolute win,
-and `opcache.preload` already covers the compiled-class case. Predicted Linux
-win: **sub-millisecond to low-single-digit ms per request**, i.e. usually not
-worth the correctness risk. It becomes worth enabling on Linux only at **very
-high RPS** (syscalls × request rate) or on **slow/networked filesystems**
-(NFS/EFS, container overlayfs) where per-stat cost balloons back toward Windows
-levels. State that honestly in the docs when shipping.
+**Linux expectation — measured, and partly wrong.** The prediction was
+"sub-millisecond to low-single-digit ms per request, i.e. usually not worth the
+correctness risk." The absolute-win half held (2.51 ms → 0.93 ms on the
+frontable probe); the *relative* half did not. Sealed roots cut warm latency
+**2.7×** on Linux and took file-metadata syscalls from 2403 per request to 3,
+because the cost that dominates is not the price of one `statx` but the *count*
+— an autoloader with two decoy directories issues 2400 of them. Linux is
+cheaper per syscall, not cheaper per syscall-count. The honest statement is: the
+win is proportionally similar on both platforms and much larger in absolute
+terms on Windows, and `opcache.preload` still covers the compiled-class case on
+Linux while doing nothing for the probe count.
 
 ## Prior art
 
@@ -369,8 +509,13 @@ levels. State that honestly in the docs when shipping.
 ## Feasibility verdict: YELLOW (green-leaning for the POC)
 
 Worth building **on Windows**, where the measured ceiling (~15 ms/request warm,
-~29 ms cold) is large. Yellow overall because the value is concentrated on
-Windows and the correctness surface is wide.
+~29 ms cold) is large — and, on the measured evidence above, worth it on Linux
+too: the win is proportionally similar there (2.7× on the frontable probe), just
+smaller in absolute milliseconds. Still yellow, because the value depends on an
+`is_file`-style probe (real Composer uses `file_exists`, which needs the SDK
+patch) and because the correctness surface is wide. Sealed roots narrow that
+surface deliberately — declared subtrees only, one-way authority latch, disk
+confirmation on every source-path negative — but they do not eliminate it.
 
 - **Effort.** POC ~1–2 weeks (override `zend_stream_open_function` +
   `zend_resolve_path` + a C `file://` stat/open replacement reading from
