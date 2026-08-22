@@ -644,8 +644,12 @@ int ephpm_thread_init(void)
         return -1;
     }
 
-    /* Disable stack size checking (tokio threads have small stacks) */
-    EG(max_allowed_stack_size) = 0;
+    /* php_request_startup() -> zend_activate() -> zend_call_stack_init() has
+     * already computed EG(stack_limit) from THIS thread's stack bounds, so the
+     * C-stack overflow guard is armed for every request this thread serves
+     * (worker mode runs its whole loop inside this one request). Nothing to do
+     * here: zend.max_allowed_stack_size is left at PHP's default of 0, which
+     * means "auto-detect from the real stack", not "disabled" (that is -1). */
 
     request_active = 1;
     return 0;
@@ -777,15 +781,22 @@ void __wrap_zend_unset_timeout(void)
 #endif /* !EPHPM_NATIVE_EXEC_TIMER */
 
 /*
- * zend_call_stack_init() probes the current thread's stack boundaries
- * on every request startup. It can fail on tokio's spawn_blocking threads
- * which have non-standard stack layouts. Since we disable stack checking
- * (EG(max_allowed_stack_size) = 0), this init is unnecessary.
+ * NOTE (issue #116): there is deliberately no __wrap_zend_call_stack_init here.
+ *
+ * PHP's zend_call_stack_init() runs from zend_activate() on every request
+ * startup and computes EG(stack_limit) from the CURRENT thread's real stack
+ * bounds. That value is what powers PHP 8.3+'s C-stack overflow guard: the VM
+ * and zend_call_function check zend_call_stack_overflowed(EG(stack_limit)) and
+ * raise the catchable `Error: Maximum call stack size of N bytes ... reached`
+ * instead of walking off the end of the stack.
+ *
+ * ePHPm used to override this function with a no-op (via --wrap, Linux only),
+ * which left EG(stack_limit) NULL and the guard permanently off. Recursion that
+ * re-enters the VM through an internal function then SIGSEGV'd the process.
+ * The override is gone; the guard is on, on every platform, and every thread
+ * that runs PHP is given a stock-PHP-sized stack (ephpm_php::PHP_THREAD_STACK)
+ * so the depth it allows matches php-fpm.
  */
-void __wrap_zend_call_stack_init(void)
-{
-    /* no-op — stack checking is disabled */
-}
 
 /*
  * CLI-mode flag. When set (via ephpm_enable_cli_mode() before php_embed_init),
@@ -839,32 +850,6 @@ void ephpm_install_sapi(void)
     if (g_cli_mode) {
         sapi_module.phpinfo_as_text = 1;
     }
-}
-
-/*
- * Apply INI settings after php_embed_init().
- *
- * Disables stack size checking which fails on tokio's spawn_blocking
- * threads (small default stack). The embed SAPI doesn't process -d
- * command-line flags, so we set INI entries programmatically.
- */
-int ephpm_apply_ini_settings(void)
-{
-    zend_string *key;
-    zend_string *val;
-
-    /* Disable stack size checking — fails on tokio's spawn_blocking
-     * threads which have a small default stack. */
-    key = zend_string_init(
-        "zend.max_allowed_stack_size",
-        sizeof("zend.max_allowed_stack_size") - 1, 1);
-    val = zend_string_init("0", 1, 1);
-    zend_alter_ini_entry(key, val, PHP_INI_SYSTEM, PHP_INI_STAGE_RUNTIME);
-    zend_string_release(val);
-    zend_string_release(key);
-    EG(max_allowed_stack_size) = 0;
-
-    return 0;
 }
 
 /*
@@ -1105,9 +1090,11 @@ int ephpm_execute_request(const char *filename)
     }
     request_active = 1;
 
-    /* tokio spawn_blocking threads have small stacks; request startup may
-     * reset this guard, so clear it afterwards. */
-    EG(max_allowed_stack_size) = 0;
+    /* php_request_startup() has just re-armed PHP's C-stack overflow guard for
+     * THIS thread (zend_activate -> zend_call_stack_init -> EG(stack_limit)).
+     * Leave it armed — that is what turns runaway recursion into a catchable
+     * `Error: Maximum call stack size ... reached` instead of a SIGSEGV that
+     * takes the whole process with it (#116). */
 
     /* Reset per-request response status. php_request_startup()/sapi_activate()
      * does NOT reset SG(sapi_headers).http_response_code on this embed reuse
@@ -4748,7 +4735,6 @@ static void cli_begin(size_t (**orig_ub_write)(const char *, size_t))
     sapi_module.ub_write = ephpm_sapi_ub_write_stdout;
     SG(headers_sent) = 1;
     SG(request_info).no_headers = 1;
-    EG(max_allowed_stack_size) = 0;
 }
 
 /*
@@ -5198,7 +5184,6 @@ static int cli_shutdown_request(int result)
     if (php_request_startup() == SUCCESS) {
         SG(headers_sent) = 1;
         SG(request_info).no_headers = 1;
-        EG(max_allowed_stack_size) = 0;
     }
 
     return result;

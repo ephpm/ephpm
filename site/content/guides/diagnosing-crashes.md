@@ -123,11 +123,44 @@ is the same recursing function, so you get its name and a repeat count and
 nothing about the caller. `backtrace(3)` unwinds inward-out and stops at 64
 frames, which a runaway recursion consumes entirely.
 
-If PHP request code (a deep object-graph free) is what overflows the stack, you
-can opt in to surviving it instead of dying: `[php] crash_containment = true`
-with `fpm_engine = "pool"` answers that request `500` and retires the poisoned
-thread. See the note at the top of this page and the
-[configuration reference](/reference/config/#php) for the costs.
+### Runaway recursion is not one of these
+
+If your PHP **recursed** too deeply, you should never see this report at all.
+PHP's own C-stack guard catches that before the guard page does, and raises a
+normal, catchable error:
+
+```
+Fatal error: Uncaught Error: Maximum call stack size of 8339456 bytes
+(zend.max_allowed_stack_size - zend.reserved_stack_size) reached.
+Infinite recursion? in /srv/app/render.php:12
+```
+
+That is a per-request `500`, identical to what `php-fpm` gives you, and the
+server keeps serving. The 8 MiB ceiling comes from the stack size ePHPm gives
+every thread that runs PHP, chosen to match a stock `ulimit -s` main thread so
+the depth a template or block renderer may reach is the same as under
+`php-fpm`. You can lower it per site with `zend.max_allowed_stack_size` in your
+`php.ini`; raising it above the real thread stack is unsafe and PHP will not
+protect you there.
+
+(Before v0.7.4 ePHPm disabled this guard on Linux, and deep recursion through
+internal functions — the shape `do_blocks()` / `apply_filters()` produces, one
+C frame per nesting level — showed up here as a process-killing stack overflow
+instead. See [issue #116](https://github.com/ephpm/ephpm/issues/116).)
+
+### What still lands here
+
+A **destructor cascade** — freeing a very large plain-object graph recurses in
+C (`zend_object_std_dtor` ↔ `zend_objects_store_del`) with no VM checkpoint in
+between, so PHP's guard never gets a chance to fire. That is the fault class the
+report above is for, and the one you can opt in to surviving:
+`[php] crash_containment = true` with `fpm_engine = "pool"` answers that request
+`500` and retires the poisoned thread. See the note at the top of this page and
+the [configuration reference](/reference/config/#php) for the costs.
+
+Containment is **not** available in worker mode (`[php] mode = "worker"`); there
+a destructor cascade deep enough to exhaust the stack still takes the process
+down.
 
 ## Exit status is unchanged
 

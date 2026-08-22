@@ -152,7 +152,6 @@ PHP must be initialized **before** the tokio runtime to avoid signal conflicts:
 3. Init PHP runtime                    (single-threaded)
    - php_embed_init()
    - ephpm_install_sapi()
-   - ephpm_apply_ini_settings()
    - ephpm_finalize_for_http()
 4. Create tokio runtime                (spawns worker threads)
 5. Run HTTP server

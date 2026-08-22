@@ -1354,8 +1354,16 @@ fn run_with_config(
     // fatal-signal handler cannot run for a stack-overflow fault — which is
     // precisely one of the faults worth diagnosing. PHP executes on this
     // runtime's blocking pool, so the hook must be on this runtime.
+    //
+    // `thread_stack_size` covers the blocking pool as well as the async
+    // workers, and the blocking pool is where PHP runs in the default fpm
+    // engine. PHP's own C-stack guard bounds recursion at the *thread's* stack
+    // size, so leaving tokio's 2 MiB default would make deep-but-legal PHP
+    // (a nested template/block render) fail at a quarter of the depth php-fpm
+    // allows. See `ephpm_php::PHP_THREAD_STACK` (issue #116).
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .thread_stack_size(ephpm_php::PHP_THREAD_STACK)
         .on_thread_start(fatal_signal::install_thread_altstack)
         .build()
         .context("failed to create tokio runtime")?;

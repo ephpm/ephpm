@@ -14,10 +14,15 @@
 //! (`zend_object_std_dtor` <-> `zend_objects_store_del`), overflows the thread
 //! stack, and the resulting SIGSEGV aborts the process. No `disable_functions`
 //! or ini reaches it, because the trigger is ordinary object creation + scope
-//! exit and the fault is in the C runtime below the VM's stack guard. (ePHPm
-//! disables that guard anyway — `EG(max_allowed_stack_size) = 0` — and even
-//! enabled it would not fire, because a plain-object destructor cascade passes
-//! no VM/`zend_call_function` checkpoint.)
+//! exit and the fault is in the C runtime below the VM's stack guard.
+//!
+//! PHP 8.3+'s own C-stack guard (`EG(stack_limit)`, armed on every ePHPm thread
+//! since #116) does **not** overlap with this. That guard is a checkpoint test
+//! in the VM and in `zend_call_function`, so it catches runaway *recursion*
+//! — the `do_blocks()` / `apply_filters()` shape — and turns it into a
+//! catchable `Error`. A plain-object destructor cascade passes no such
+//! checkpoint: it recurses purely through C dtors. The signal path below stays
+//! the only interception point for that class, which is why both exist.
 //!
 //! # The mechanism
 //!

@@ -161,16 +161,29 @@ fn main() {
         println!("cargo::rustc-cfg=php_max_exec_timers");
     }
 
+    // NOTE: `zend_call_stack_init` is deliberately NOT wrapped (issue #116).
+    //
+    // It used to be, on the theory that probing stack boundaries "fails on
+    // tokio spawn_blocking threads". It does not: `zend_call_stack_get()` reads
+    // the bounds with `pthread_getattr_np`, which is exact on every thread
+    // glibc creates, and a probe that *did* fail would simply leave
+    // `EG(stack_limit)` NULL — the guard off, never a crash.
+    //
+    // What the wrap actually did was disable PHP 8.3+'s C-stack overflow guard
+    // on Linux only (macOS and Windows never had `--wrap` and so always kept
+    // it). With `EG(stack_limit)` left NULL, `zend_call_stack_overflowed()` is
+    // permanently false, so recursion that re-enters the VM through an internal
+    // function — `array_map`, `preg_replace_callback`, `call_user_func_array`,
+    // i.e. exactly what WordPress' `do_blocks()` -> `render_block()` ->
+    // `apply_filters()` chain does per nesting level — ran off the end of the
+    // thread stack and SIGSEGV'd the whole process instead of raising the
+    // catchable `Error: Maximum call stack size ... reached` stock PHP raises.
     let mut wrap_funcs: Vec<&str> = vec![
         "zend_signal_startup",
         "zend_signal_init",
         "zend_signal_deactivate",
         "zend_signal_activate",
         "zend_signal_handler_unblock",
-        // zend_call_stack_init probes stack boundaries on each request
-        // startup. Fails on tokio spawn_blocking threads with small/
-        // non-standard stacks. We disable stack checking anyway.
-        "zend_call_stack_init",
     ];
     if !has_exec_timers {
         // No per-thread timers: zend_set_timeout() arms a process-wide
