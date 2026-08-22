@@ -293,6 +293,53 @@ impl MiddlewareChain {
         self.php.iter().map(|m| m.name.as_str()).collect()
     }
 
+    /// Check that every `php:` mount's script exists, as far as that can be
+    /// known at startup.
+    ///
+    /// A missing script fails the request closed (500) rather than being
+    /// skipped — the right call for a policy layer, but a brutal way to learn
+    /// about a typo. So the determinable case is caught here instead:
+    ///
+    /// * **Single-site** — one `document_root`, so the path is fully
+    ///   determined. A missing file is a **startup error**, matching how an
+    ///   unresolvable shared library aborts startup.
+    /// * **Multi-site** — the path resolves per request against each tenant's
+    ///   own document root, and sites can appear after startup, so there is no
+    ///   single path to check. Startup warns instead, naming the consequence.
+    ///
+    /// # Errors
+    ///
+    /// Single-site only: returns an error naming the mount and the absolute
+    /// path that did not exist.
+    pub fn check_php_mount_scripts(
+        &self,
+        document_root: &Path,
+        multi_site: bool,
+    ) -> anyhow::Result<()> {
+        if multi_site {
+            tracing::warn!(
+                php_mounts = ?self.php_mount_names(),
+                "PHP middleware in multi-site mode resolves per site against each site's own \
+                 document root — a site that does not ship the script answers 500 for every \
+                 matching request (fail-closed). Startup cannot verify this for sites that do \
+                 not exist yet."
+            );
+            return Ok(());
+        }
+        for mount in &self.php {
+            let path = document_root.join(&mount.script);
+            anyhow::ensure!(
+                path.is_file(),
+                "middleware \"{}\": script not found at {} (paths are relative to the document \
+                 root, {})",
+                mount.name,
+                path.display(),
+                document_root.display(),
+            );
+        }
+        Ok(())
+    }
+
     /// Number of loaded modules.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -1255,6 +1302,38 @@ mod tests {
         let other: Vec<&str> =
             chain.php_mounts("/index.php").iter().map(|m| m.name.as_str()).collect();
         assert_eq!(other, ["php:second.php"]);
+    }
+
+    /// Single-site: the path is fully determined at startup, so a typo is an
+    /// immediate startup error rather than a 500 per request in production.
+    #[test]
+    fn php_mount_missing_script_aborts_startup_in_single_site_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = MiddlewareChain::load(&[php_mount("php:auth/mw.php", None, 10)]).expect("load");
+
+        let err = chain
+            .check_php_mount_scripts(dir.path(), false)
+            .expect_err("a missing script must abort startup");
+        let msg = err.to_string();
+        assert!(msg.contains("php:auth/mw.php"), "{msg}");
+        assert!(msg.contains("script not found"), "{msg}");
+        assert!(msg.contains("document root"), "the error must explain what it is relative to");
+
+        // Create it, and startup is happy.
+        std::fs::create_dir_all(dir.path().join("auth")).unwrap();
+        std::fs::write(dir.path().join("auth/mw.php"), "<?php\n").unwrap();
+        chain.check_php_mount_scripts(dir.path(), false).expect("present script passes");
+    }
+
+    /// Multi-site: there is no single path to check (each tenant has its own,
+    /// and sites can appear after startup), so this must NOT fail startup.
+    #[test]
+    fn php_mount_missing_script_does_not_abort_startup_in_multi_site_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = MiddlewareChain::load(&[php_mount("php:mw.php", None, 10)]).expect("load");
+        chain
+            .check_php_mount_scripts(dir.path(), true)
+            .expect("multi-site cannot verify per-tenant scripts and must not fail startup");
     }
 
     #[test]

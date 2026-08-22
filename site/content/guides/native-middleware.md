@@ -804,9 +804,15 @@ with `..`, `\`, and drive prefixes, rejected everywhere.
 
 ### Failure semantics — fail closed, always
 
+Startup catches the case it can: in **single-site** mode the path is fully
+determined, so a mount whose script is missing is a **startup error** naming
+the mount and the absolute path — the same fail-fast an unresolvable shared
+library gets. In **multi-site** mode the path resolves per tenant and sites can
+appear later, so startup warns instead and the per-request rule below applies.
+
 | Failure | Result |
 |---|---|
-| Missing file | 500; the application script does **not** run |
+| Missing file | 500; the application script does **not** run (startup error instead, in single-site mode) |
 | Parse error | 500; application script does not run |
 | Uncaught exception | 500; application script does not run |
 | Fatal (`E_ERROR`) | 500; application script does not run |

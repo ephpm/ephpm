@@ -654,7 +654,7 @@ resolved two-phase plan.
 | Mount config | `json_decode(ephpm_middleware_config() ?? '{}', true)` — returns `null` outside a middleware file |
 | Path resolution | Relative to the **request's** document root. Absolute paths, `..`, `\`, and drive prefixes are rejected at startup. |
 | Multi-tenancy | In `sites_dir` mode each site supplies its own file, which runs in that site's PHP context (its `open_basedir`, OPcache vhost, database session, KV keyspace). A mount has no more reach than that tenant's own `index.php`. Sharing one operator-owned file across tenants is **not** supported — it would need a hole in every vhost's `open_basedir`. |
-| Failure | Fail-closed, always. A missing file, parse error, uncaught exception, or fatal returns 500 and the application script does **not** run. |
+| Failure | Fail-closed, always. A missing file, parse error, uncaught exception, or fatal returns 500 and the application script does **not** run. In single-site mode a missing script is caught earlier still — it aborts **startup**, naming the mount and the path. |
 | Worker mode | **Rejected at startup.** The worker script owns the request loop; use the framework's own middleware (PSR-15 / Octane). |
 | Limit | At most 16 `php:` mounts may run for one request (rejected at startup, not silently dropped). |
 | Metrics | `ephpm_middleware_invocations_total{module,action}` with `action` = `continue`, `respond`, or `error`. There is no `rewrite` action for this lane — PHP expresses a rewrite by assigning to `$_SERVER`, which is not observable without diffing the superglobal. |

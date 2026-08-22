@@ -125,6 +125,10 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
                  after the request body has been read and after every native module, so they \
                  cannot reject before the body transfer the way a native module can"
             );
+            chain.check_php_mount_scripts(
+                &config.server.document_root,
+                config.server.sites_dir.is_some(),
+            )?;
         }
         // In cluster mode, the built-in ratelimit middleware uses local KV
         // INCR to track the request count per window. SET/DEL and EXPIRE
