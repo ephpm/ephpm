@@ -70,11 +70,13 @@ profile:
   collectively exceed the pod's cgroup limit and get OOM-killed.
 - **Interned-strings** and **JIT buffers** scale with the SHM / budget
   (clamped). Whether the JIT uses the buffer is shaped by tenancy
-  (`[php] opcache_jit`): **`tracing` by default in single-site serve**, but
-  **`disable` by default in the multi-vhost deployments this guide covers** —
-  per-vhost `opcache_invalidate` never reclaims JIT buffer, so deploy churn
-  would silently exhaust it. Forcing it on is an explicit, warned-about
-  opt-in; watch `ephpm_opcache_jit_buffer_free_bytes` if you do. See
+  (`[php] opcache_jit`): **`disable` by default in every mode**, including the
+  multi-vhost deployments this guide covers — here because per-vhost
+  `opcache_invalidate` never reclaims JIT buffer, so deploy churn would
+  silently exhaust it, and in single-site serve because of the unfixed
+  upstream tracing-JIT crash (#365). Forcing it on is an explicit,
+  warned-about opt-in; watch `ephpm_opcache_jit_buffer_free_bytes` if you do.
+  See
   [OPcache JIT](/reference/config/#opcache-jit).
 - **`realpath_cache_size=16M` / `ttl=600`** and **`zend.assertions=-1`**
   (compiled out) are the standard production values; dev keeps PHP-friendly

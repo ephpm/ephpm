@@ -2250,24 +2250,20 @@ pub struct PhpConfig {
     ///
     /// When **absent**, ePHPm picks a shaped default:
     ///
-    /// - **Single-site `ephpm serve` on Unix** (no `[server] sites_dir`,
-    ///   `[php] mode` not `"worker"`): **`tracing`** — measured ~2.4x on
-    ///   CPU-bound PHP (Windows CPU loop 5.56 ms → 2.33 ms) and verified
-    ///   working in the ZTS embed serve mode. The single-process embed avoids
-    ///   the classic multi-process SHM JIT failure modes.
-    /// - **Windows** (any single-site serve): **`disable`** — PHP's tracing
-    ///   JIT dereferences a freed `op_array` when it compiles a **side trace**
-    ///   in a *later* request than the one that compiled the parent trace, and
-    ///   kills the process with `0xC0000005`. A stock Laravel app dies after
-    ///   three requests, deterministically, with no PHP error and nothing in
-    ///   the ePHPm log. This is an upstream php-src defect, not an ePHPm one —
-    ///   it reproduces on **stock `php.exe -S`** with no ePHPm involved
-    ///   (8.5.5 / 8.5.7 / 8.5.9 all die; 8.5.4 and 8.4.24 survive 150
-    ///   requests). Tracked at php-src PR
+    /// - **Single-site `ephpm serve`** (no `[server] sites_dir`, `[php] mode`
+    ///   not `"worker"`): **`disable`** — PHP's tracing JIT dereferences a
+    ///   freed `op_array` when it compiles a **side trace** in a *later*
+    ///   request than the one that compiled the parent trace, and kills the
+    ///   process: `0xC0000005` on Windows, `SIGSEGV` on Unix, with no PHP
+    ///   error and nothing in the ePHPm log. This is an upstream php-src
+    ///   defect, not an ePHPm one — it reproduces on **stock `php -S`** with
+    ///   no ePHPm involved, on Windows *and* Linux. Tracked at php-src PR
     ///   <https://github.com/php/php-src/pull/21710> (open); introduced by
-    ///   php-src PR 21368, first released in PHP 8.5.5. Revisit this default
-    ///   when the fix ships and the pinned SDK is bumped. See
-    ///   [`JitReason::WindowsTraceBug`] for the mechanism.
+    ///   php-src PR 21368, first released in PHP 8.4.24 / 8.5.5. Was
+    ///   Windows-only in #372 and extended to every platform once the Linux
+    ///   reproduction landed; revisit when the fix ships and the pinned SDK is
+    ///   bumped past it. See [`JitReason::TracingJitBug`] for the mechanism
+    ///   and the measured request counts.
     /// - **Multi-tenant serve** (`[server] sites_dir` set): **`disable`** —
     ///   per-vhost deploys invalidate OPcache via `opcache_invalidate`, and
     ///   invalidation **never reclaims JIT buffer** (measured: `buffer_free`
@@ -2285,14 +2281,15 @@ pub struct PhpConfig {
     /// Escape hatch: a suspected JIT miscompile is turned off with
     /// `opcache_jit = "disable"` — no other change required. Watch the
     /// `ephpm_opcache_jit_buffer_free_bytes` gauge for buffer exhaustion.
-    /// `"function"` is the middle setting: it compiles whole hot functions and
-    /// never builds traces, so it cannot hit the Windows side-trace defect
-    /// above (verified: 150 requests clean where `"tracing"` dies at 3).
+    /// `"function"` is the middle setting for anyone who still wants a JIT: it
+    /// compiles whole hot functions and never builds traces, so it cannot hit
+    /// the side-trace defect above (verified clean on Windows over 150
+    /// requests and on Linux over 300 where `"tracing"` dies at 2–3).
     ///
     /// Env override: `EPHPM_PHP__OPCACHE_JIT`.
     ///
-    /// Default: `None` (shaped: `tracing` in single-site serve on Unix,
-    /// `disable` on Windows and in multi-tenant / worker / dev).
+    /// Default: `None` (shaped: `disable` in every mode — see above for the
+    /// per-mode reason).
     #[serde(default)]
     pub opcache_jit: Option<JitMode>,
 
@@ -3227,11 +3224,14 @@ impl PhpConfig {
         };
 
         // opcache.jit: explicit knob wins everywhere; otherwise the shaped
-        // default — tracing in single-site serve, disable in multi-tenant
-        // (invalidation never reclaims JIT buffer), worker mode (not
-        // positively verified against the persistent-worker lifecycle),
-        // Windows (upstream tracing-JIT use-after-free, see below), and
-        // dev (line omitted, PHP defaults keep the JIT off).
+        // default is `disable` in every mode, for a different reason in each —
+        // multi-tenant (invalidation never reclaims JIT buffer), worker mode
+        // (not positively verified against the persistent-worker lifecycle),
+        // dev (line omitted, PHP defaults keep the JIT off), and single-site
+        // serve (upstream tracing-JIT use-after-free, #365 — see
+        // `JitReason::TracingJitBug`). The order of these arms is the order
+        // the reasons are reported in, not a precedence over behaviour: they
+        // all resolve to the same mode.
         let worker_mode = self.mode == "worker";
         let (jit_mode, jit_reason) = match self.opcache_jit {
             Some(mode) => {
@@ -3248,13 +3248,9 @@ impl PhpConfig {
                 TunedValue { value: JitMode::Disable, origin: Origin::Derived },
                 JitReason::WorkerMode,
             ),
-            None if cfg!(windows) => (
-                TunedValue { value: JitMode::Disable, origin: Origin::Derived },
-                JitReason::WindowsTraceBug,
-            ),
             None => (
-                TunedValue { value: JitMode::Tracing, origin: Origin::Derived },
-                JitReason::SingleSiteServe,
+                TunedValue { value: JitMode::Disable, origin: Origin::Derived },
+                JitReason::TracingJitBug,
             ),
         };
 
@@ -3375,33 +3371,49 @@ impl JitMode {
 pub enum JitReason {
     /// `[php] opcache_jit` was set explicitly — operator's choice, any mode.
     Explicit,
-    /// Shaped default: single-site serve mode → `tracing`.
-    SingleSiteServe,
     /// Shaped default: multi-tenant serve (`sites_dir` set) → `disable`,
     /// because per-vhost `opcache_invalidate` never reclaims JIT buffer.
     MultiTenant,
     /// Shaped default: `[php] mode = "worker"` → `disable` (not positively
     /// verified against the persistent-worker lifecycle).
     WorkerMode,
-    /// Shaped default: **Windows** → `disable`, because PHP's tracing JIT
-    /// crashes a long-lived multi-request process (issue #365).
+    /// Shaped default on **every platform**: single-site serve → `disable`,
+    /// because PHP's tracing JIT kills a long-lived multi-request process
+    /// (issue #365).
     ///
     /// `zend_jit_escape_if_undef()` resolves the original VM handler through
     /// `ZEND_FUNC_INFO(exit_info->op_array)` at side-trace compile time. That
-    /// `op_array` can be a **heap** op_array (a method of a linked class that
-    /// the inheritance cache could not persist back into SHM), which is freed
-    /// at request shutdown while the parent trace's `exit_info` lives on in
-    /// shared memory. Compiling a side trace for that exit in a later request
-    /// then reads a dangling pointer — `0xC0000005`, no PHP error, process
-    /// gone. Upstream: php-src PR
-    /// <https://github.com/php/php-src/pull/21710> (open), regression from
-    /// php-src PR 21368, first released in PHP 8.5.5.
+    /// `op_array` can be a **heap** op_array — a method of a linked class that
+    /// the inheritance cache could not persist back into SHM, so it is copied
+    /// to the heap during linking and never written back, yet is still
+    /// JIT-instrumented. It is freed at request shutdown while the parent
+    /// trace's `exit_info` lives on in shared memory, so compiling a side
+    /// trace for that exit in a *later* request reads a dangling pointer:
+    /// `0xC0000005` on Windows, `SIGSEGV` on Unix, no PHP error, process gone.
+    /// Upstream: php-src PR <https://github.com/php/php-src/pull/21710>
+    /// (open), regression from php-src PR 21368, first released in PHP 8.5.5.
     ///
-    /// Verified against **stock** `php.exe -S` (no ePHPm): 8.5.4 and 8.4.24
-    /// clean over 150 requests of a stock Laravel app; 8.5.5, 8.5.7 and 8.5.9
-    /// die after 2–3 requests. Windows is hit far harder than Unix because
-    /// class linking fails to reach the inheritance cache more often there.
-    WindowsTraceBug,
+    /// **Not Windows-only.** Windows is hit harder — a *stock* Laravel app
+    /// dies there after three requests, because class linking misses the
+    /// inheritance cache more often on that platform — but the defect is
+    /// engine-level and reproduces on Linux just as hard once any class in the
+    /// app links against a parent that is not in SHM. Measured on Linux
+    /// x86_64 with the pinned SDKs, ePHPm serve + Laravel 13, default config:
+    /// **SIGSEGV at request 2, 5/5 runs**, in the identical faulting frames
+    /// (`zend_jit_trace_hot_side` → `zend_jit_compile_side_trace` →
+    /// `zend_jit_trace` → `zend_jit_trace_deoptimization` →
+    /// `zend_jit_escape_if_undef`). It reproduces the same way on stock
+    /// `php -S` with no ePHPm involved, on both 8.4.23 and 8.5.7. Keeping a
+    /// parent out of SHM needs nothing exotic — an `eval()`-defined parent
+    /// (PHPUnit/Mockery mocks, proxy generators) and an OPcache-blacklisted
+    /// parent file both do it, and a full or restarting OPcache has the same
+    /// effect. PHP 8.3 predates the regression and is unaffected.
+    ///
+    /// `"function"` is the JIT mode that stays available: it never builds
+    /// traces, so it cannot reach this path (verified clean where `"tracing"`
+    /// dies at request 2). Revisit this default when php-src PR 21710 merges
+    /// and the pinned SDK is bumped past it.
+    TracingJitBug,
     /// Shaped default: dev mode → off (no line emitted; PHP defaults apply).
     Dev,
 }
@@ -3844,11 +3856,6 @@ impl AutoTune {
                     "OFF".to_string()
                 }
             ),
-            JitReason::SingleSiteServe => format!(
-                "opcache JIT ON (tracing, buffer {}MB) — single-site serve default; \
-                 set [php] opcache_jit = \"disable\" to turn it off",
-                self.jit_buffer_size.value
-            ),
             JitReason::MultiTenant => "opcache JIT OFF — multi-tenant default (sites_dir set): \
                  per-vhost OPcache invalidation never reclaims JIT buffer, so deploy churn \
                  would silently exhaust it; set [php] opcache_jit = \"tracing\" to override"
@@ -3856,12 +3863,12 @@ impl AutoTune {
             JitReason::WorkerMode => "opcache JIT OFF — worker-mode default ([php] mode = \
                  \"worker\"); set [php] opcache_jit = \"tracing\" to opt in"
                 .to_string(),
-            JitReason::WindowsTraceBug => "opcache JIT OFF — Windows default: PHP's tracing \
-                 JIT (8.5.5+) reads a freed op_array when it compiles a side trace in a \
-                 later request and kills the process with 0xC0000005 (php-src PR 21710, \
-                 unfixed as of 8.5.9; reproduces on stock php.exe too). \
-                 Set [php] opcache_jit = \"function\" for the unaffected JIT mode, or \
-                 \"tracing\" to accept the risk"
+            JitReason::TracingJitBug => "opcache JIT OFF — default since #365: PHP's tracing \
+                 JIT (8.5.5+, and 8.4.24+) reads a freed op_array when it compiles a side \
+                 trace in a later request and kills the process — no PHP error, no log line \
+                 (php-src PR 21710, still open; reproduces on stock php too, on Linux and \
+                 Windows alike). Set [php] opcache_jit = \"function\" for the unaffected JIT \
+                 mode, or \"tracing\" to accept the risk"
                 .to_string(),
             JitReason::Dev => {
                 "opcache JIT OFF (dev mode default; PHP's own defaults apply)".to_string()
@@ -3890,15 +3897,17 @@ impl AutoTune {
                     .to_string(),
             );
         }
-        if cfg!(windows) && self.jit.value == JitMode::Tracing {
+        if self.jit.value == JitMode::Tracing {
             return Some(
-                "[php] opcache_jit = \"tracing\" on Windows: PHP's tracing JIT (8.5.5+) \
+                "[php] opcache_jit = \"tracing\": PHP's tracing JIT (8.4.24+ / 8.5.5+) \
                  dereferences a freed op_array when it compiles a side trace in a later \
-                 request, killing the process with 0xC0000005 after as few as three \
-                 requests of a stock Laravel app — with no PHP error and nothing in the \
-                 ePHPm log. Upstream php-src PR 21710 is open and unfixed as of 8.5.9. \
-                 Use opcache_jit = \"function\" (unaffected) unless you have measured \
-                 that your workload survives"
+                 request, killing the process with no PHP error and nothing in the ePHPm \
+                 log. A stock Laravel app dies after 3 requests on Windows; on Linux it \
+                 takes 2 requests once any class links against a parent that is not in \
+                 OPcache SHM (an eval()-defined or non-cached parent — mock/proxy \
+                 generators and a full OPcache both do it). Upstream php-src PR 21710 is \
+                 open. Use opcache_jit = \"function\" (never builds traces, unaffected) \
+                 unless you have measured that your workload survives"
                     .to_string(),
             );
         }
@@ -7421,62 +7430,44 @@ opcache_revalidate_freq = 60
         assert_eq!(at.jit.origin, Origin::Derived);
         assert!(at.jit_warning().is_none(), "the shaped default must not warn");
 
+        // Issue #365: PHP's tracing JIT (8.4.24+ / 8.5.5+) kills the process
+        // when a side trace compiles in a later request than its parent. A
+        // stock Laravel app dies after 3 requests on Windows; on Linux it dies
+        // at request 2 once any class links against a parent that is not in
+        // OPcache SHM. Same faulting frames on both, and on stock `php -S`
+        // with no ePHPm involved — so the default is off on every platform.
+        //
+        // The `disable` line must be emitted, not omitted: PHP <=8.3's stock
+        // opcache.jit is `tracing` and serve mode always emits a non-zero
+        // jit_buffer_size, so omitting it would leave the JIT on.
+        assert_eq!(at.jit.value, JitMode::Disable);
+        assert_eq!(at.jit_reason, JitReason::TracingJitBug);
         let lines = at.ini_lines();
-        if cfg!(windows) {
-            // Issue #365: PHP's tracing JIT (8.5.5+) kills the process with
-            // 0xC0000005 when a side trace compiles in a later request than
-            // its parent — a stock Laravel app dies after 3 requests. The
-            // `disable` line must be emitted, not omitted: PHP <=8.3's stock
-            // opcache.jit is `tracing` and serve mode always emits a non-zero
-            // jit_buffer_size, so omitting it would leave the JIT on.
-            assert_eq!(at.jit.value, JitMode::Disable);
-            assert_eq!(at.jit_reason, JitReason::WindowsTraceBug);
-            assert!(
-                lines.contains(&("opcache.jit".to_string(), "disable".to_string())),
-                "Windows single-site serve must emit opcache.jit=disable, got: {lines:?}"
-            );
-        } else {
-            assert_eq!(at.jit.value, JitMode::Tracing);
-            assert_eq!(at.jit_reason, JitReason::SingleSiteServe);
-            assert!(
-                lines.contains(&("opcache.jit".to_string(), "tracing".to_string())),
-                "single-site serve must emit opcache.jit=tracing, got: {lines:?}"
-            );
-            // JIT on requires a buffer: the derived jit_buffer_size line must
-            // ride along (serve mode always derives one).
-            let buffer = lines.iter().find(|(k, _)| k == "opcache.jit_buffer_size");
-            assert!(buffer.is_some(), "opcache.jit_buffer_size must be emitted, got: {lines:?}");
-            assert_ne!(buffer.unwrap().1, "0M");
-        }
+        assert!(
+            lines.contains(&("opcache.jit".to_string(), "disable".to_string())),
+            "single-site serve must emit opcache.jit=disable, got: {lines:?}"
+        );
     }
 
     #[test]
-    fn test_jit_windows_default_off_and_explicit_tracing_warns() {
-        // The Windows shaped default and its warning are a matched pair: the
-        // default protects an operator who never touches the knob, and the
-        // warning tells one who overrides it exactly what they are buying.
-        // Both arms compile on every platform (`cfg!`, not `#[cfg]`) so the
-        // Linux CI legs still typecheck and lint the Windows branch.
+    fn test_jit_default_off_and_explicit_tracing_warns() {
+        // The shaped default and its warning are a matched pair: the default
+        // protects an operator who never touches the knob, and the warning
+        // tells one who overrides it exactly what they are buying.
         let at = PhpConfig::default().autotune(false, false);
+        assert_eq!(at.jit.value, JitMode::Disable);
+        assert!(at.jit_line().contains("21710"), "got: {}", at.jit_line());
+
         let explicit = PhpConfig { opcache_jit: Some(JitMode::Tracing), ..PhpConfig::default() }
             .autotune(false, false);
         assert_eq!(explicit.jit.value, JitMode::Tracing, "an explicit knob must always win");
         assert_eq!(explicit.jit_reason, JitReason::Explicit);
+        let warning =
+            explicit.jit_warning().expect("explicit tracing JIT must warn about php-src PR 21710");
+        assert!(warning.contains("21710"), "got: {warning}");
 
-        if cfg!(windows) {
-            assert_eq!(at.jit.value, JitMode::Disable);
-            assert!(at.jit_line().contains("0xC0000005"), "got: {}", at.jit_line());
-            let warning = explicit
-                .jit_warning()
-                .expect("explicit tracing JIT on Windows must warn about php-src PR 21710");
-            assert!(warning.contains("21710"), "got: {warning}");
-        } else {
-            assert_eq!(at.jit.value, JitMode::Tracing);
-            assert!(explicit.jit_warning().is_none(), "no Windows warning off Windows");
-        }
-
-        // `function` never builds traces, so it is unaffected on every
-        // platform and must never carry the tracing warning.
+        // `function` never builds traces, so it cannot reach the side-trace
+        // path and must never carry the tracing warning.
         let func = PhpConfig { opcache_jit: Some(JitMode::Function), ..PhpConfig::default() }
             .autotune(false, false);
         assert_eq!(func.jit.value, JitMode::Function);
@@ -7602,8 +7593,7 @@ opcache_revalidate_freq = 60
     #[test]
     fn test_jit_line_states_the_why() {
         let single = PhpConfig::default().autotune(false, false);
-        let expected = if cfg!(windows) { "Windows default" } else { "single-site serve default" };
-        assert!(single.jit_line().contains(expected), "{}", single.jit_line());
+        assert!(single.jit_line().contains("default since #365"), "{}", single.jit_line());
 
         let multi = PhpConfig::default().autotune(false, true);
         assert!(multi.jit_line().contains("multi-tenant default"), "{}", multi.jit_line());
@@ -7622,10 +7612,9 @@ opcache_revalidate_freq = 60
 
     #[test]
     fn test_jit_summary_line_shows_mode() {
-        // Single-site serve: `tracing` on Unix, `disable` on Windows (#365).
+        // Single-site serve: `disable` on every platform (#365).
         let line = PhpConfig::default().autotune(false, false).summary_line();
-        let shaped = if cfg!(windows) { "(jit=disable)" } else { "(jit=tracing)" };
-        assert!(line.contains(shaped), "got: {line}");
+        assert!(line.contains("(jit=disable)"), "got: {line}");
         let line = PhpConfig::default().autotune(false, true).summary_line();
         assert!(line.contains("(jit=disable)"), "got: {line}");
         // Explicit values carry the `*` pin marker like every other tunable.
