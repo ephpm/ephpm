@@ -1476,8 +1476,10 @@ dependencies = [
  "opentelemetry_sdk",
  "quinn",
  "rcgen",
+ "reqwest",
  "rustls 0.23.37",
  "rustls-acme",
+ "rustls-native-certs",
  "rustls-pemfile",
  "serde",
  "serde_json",
@@ -1495,6 +1497,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "turso",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
