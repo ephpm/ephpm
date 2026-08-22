@@ -16,7 +16,8 @@ When a request comes in, ePHPm matches the `Host` header against directories in 
 ```
 Request: Host: alice-blog.com
   → Look for /var/www/sites/alice-blog.com/
-  → Found? Serve from that directory, with that site's own KV store,
+  → Found? Serve from that directory (or the web root its override
+           declares), with that site's own KV store,
            temp/session directory and (with [db.sqlite] dir) database
   → Not found? Fall back to server.document_root (or 404 if not configured).
                An unmatched host is NOT a tenant: it gets no per-site database
@@ -31,13 +32,13 @@ Request: Host: alice-blog.com
     index.php
     wp-content/
   sites/
-    alice-blog.com/               # docroot for alice-blog.com
+    alice-blog.com/               # site container for alice-blog.com
+      index.php                   # ...which is also its docroot, because
+      wp-content/                 #    WordPress's web root IS its app root
+    bobs-recipes.com/             # site container for bobs-recipes.com
       index.php
       wp-content/
-    bobs-recipes.com/             # docroot for bobs-recipes.com
-      index.php
-      wp-content/
-    cool-photos.net/              # docroot for cool-photos.net
+    cool-photos.net/              # site container for cool-photos.net
       index.php
       wp-content/
 ```
@@ -45,9 +46,82 @@ Request: Host: alice-blog.com
 Adding a site: create a directory named after the domain, drop WordPress in it.
 Removing a site: delete the directory. Requests to that domain hit the fallback.
 
-### Per-Site Overrides
+### Per-site document root (frameworks with a `public/` directory)
 
-Today, per-site configuration is intentionally minimal. What's discovered per site from `sites_dir` is the document root (the directory itself) plus that site's `index_files` and `fallback`. Settings — PHP limits, timeouts, security rules — come from the global `ephpm.toml` and apply to every site. Per-site *state* (database, KV keyspace, temp and session storage) is separated automatically; it is not something you configure per site.
+By default a vhost directory **is** the web root, which is right for WordPress — its web root and its application root are the same directory. It is wrong for every framework that keeps code above the web root. A Laravel or Symfony checkout served this way publishes `composer.json`, `vendor/`, `config/` and `storage/logs/laravel.log` over HTTP, and a Laravel log routinely contains stack traces carrying env values and database credentials. (`.env` and `.git` happen to be covered because `[server.static_files] hidden_files` defaults to `"deny"`; nothing else is.)
+
+Point `[server] site_overrides_dir` at a directory and drop one file per site into it:
+
+```toml
+[server]
+sites_dir          = "/var/www/sites"
+site_overrides_dir = "/var/lib/ephpm/site-overrides"   # NOT inside sites_dir
+```
+
+```toml
+# /var/lib/ephpm/site-overrides/alice-blog.com.toml
+document_root = "public"    # relative to the site container
+```
+
+```
+/var/www/sites/alice-blog.com/     ← the site CONTAINER
+  composer.json                    ← no longer reachable over HTTP
+  vendor/                          ← no longer reachable over HTTP
+  storage/logs/laravel.log         ← no longer reachable over HTTP
+  public/                          ← the WEB ROOT
+    index.php
+```
+
+A site with no override file is completely unaffected: the container stays its document root, exactly as before. Nothing changes for an existing deployment until you write an override.
+
+**`open_basedir` stays the site container — this is the point.** PHP served from `public/index.php` still does `require __DIR__.'/../vendor/autoload.php'` on its first line, and that must keep working. So an override moves the **HTTP surface** only; the **PHP sandbox** remains the whole container:
+
+| | Without an override | With `document_root = "public"` |
+|---|---|---|
+| Served over HTTP | the whole container | `public/` only |
+| `$_SERVER['DOCUMENT_ROOT']` | the container | `<container>/public` |
+| `open_basedir` | the container + its private state root | **the container** + its private state root (unchanged) |
+| `require '../vendor/autoload.php'` | works | **works** |
+| Per-site database, KV keyspace, sessions, temp | keyed by site key | unchanged — they follow the tenant, not its web root |
+
+The per-vhost temp/session state root is derived from the container too, so adding an override to a live site does **not** orphan its existing sessions and uploads.
+
+#### The override directory must not be tenant-writable
+
+This is the whole security property. A vhost's `open_basedir` includes its own container by design, so a file placed *inside* a site container can be rewritten by that site's own PHP — a tenant would be choosing its own routing. ePHPm therefore **refuses to start** if `site_overrides_dir` is inside `sites_dir`, and never reads anything from inside a tenant's checkout to decide routing. Keep the directory owned by the operator (or the provisioning daemon), not by the deployed application.
+
+For the same reason ePHPm does not read an application's own manifest (`ephpm.yaml` or similar). A provisioning daemon that consumes such a manifest is welcome to *derive* these override files from it; ePHPm only ever reads the derived, operator-owned artifact.
+
+#### Naming: the filename is the canonical site key
+
+The file must be `<site-key>.toml`, where `<site-key>` is the [canonical site key](#site-identity-the-canonical-site-key) — the same validated `[a-z0-9._-]` string that names the vhost directory, selects `<dir>/<key>.db` and derives the `pdo_mysql` credential. For `Host: alice-blog.com` served from `/var/www/sites/alice-blog.com/`, that is `alice-blog.com.toml`.
+
+**An override under any other name is silently ignored** and the site serves its container. If you are generating these files from a provisioning system, make sure it uses the same identifier it used for the vhost directory — a daemon writing `preview-1234.toml` for a vhost named `pr-42-owner-repo` produces a site that works but ignores its override, with no error anywhere.
+
+#### Failure modes, all of which serve the container
+
+Every way an override can go wrong degrades to "serve the site container" — the pre-override behaviour — with a `WARN` naming the site and the reason:
+
+| Situation | Result |
+|---|---|
+| No override file for this site | Container is the web root (the normal case) |
+| Provisioning daemon down or lagging, override not yet written | **Container is the web root** — the site serves its whole checkout until the override lands |
+| Override is malformed TOML, or half-written | Container, with a warning |
+| `document_root` is absolute, contains `..`, or has a drive prefix | Container, with a warning |
+| `document_root` names a missing directory, or a file | Container, with a warning |
+| `document_root` is a symlink resolving outside the container | Container, with a warning |
+| `document_root = "."` | Container (the explicit spelling of "no separate web root") |
+| Override contains keys this ePHPm version doesn't know | Ignored; known keys still apply |
+
+The second row is the one to recognise in production: **a site unexpectedly serving `composer.json` and `vendor/` means its override is missing**, not that the feature is broken. Startup logs every site whose root an override moved, so `grep` the boot log for `per-site document root overrides applied` to see what is actually in effect.
+
+Overrides are re-read at most every 2 seconds, so writing, editing or removing one takes effect on a running server within that window — on sites discovered at startup as well as previews created later. No restart, no filesystem watcher.
+
+Note that the declared path is validated as if hostile — relative only, no `..`, canonicalized and required to resolve inside the container — even though the writer is trusted. "The provisioning daemon validated it" is a claim about another program's current behaviour, not something ePHPm can enforce.
+
+### Other per-site configuration
+
+Beyond the document root, per-site configuration is intentionally minimal. What's discovered per site from `sites_dir` is the site container plus that site's `index_files` and `fallback`. Settings — PHP limits, timeouts, security rules — come from the global `ephpm.toml` and apply to every site. Per-site *state* (database, KV keyspace, temp and session storage) is separated automatically; it is not something you configure per site.
 
 A richer per-site override system (a `site.toml` dropped into the site directory with `[php]` overrides) is planned for [Phase 2](#phase-2-per-site-overrides-future). Until then, if one site needs a larger `memory_limit`, raise the global value in `ephpm.toml`; if one site needs longer to run, raise the global `[php] max_execution_time` (natively enforced on Linux ZTS builds — see [Signal handling and `max_execution_time`](/architecture/http/#signal-handling-and-max_execution_time)) and, above it, the `[server.timeouts] request` hard 504 backstop.
 
@@ -74,9 +148,11 @@ The key that matched above is the tenant's **whole** identity, not just its docu
 
 | Derived from the site key | Where it lands |
 |---|---|
-| Document root | `<sites_dir>/<site-key>/` |
+| Site container | `<sites_dir>/<site-key>/` |
+| Document root | the container, or the subdirectory its [override](#per-site-document-root-frameworks-with-a-public-directory) declares |
+| Per-site override file | `<[server] site_overrides_dir>/<site-key>.toml` |
 | Database file | `<[db.sqlite] dir>/<site-key>.db` |
-| Private temp + session directory | `<system temp>/ephpm-vhosts/<label>-<digest>` (from the resolved document root) |
+| Private temp + session directory | `<system temp>/ephpm-vhosts/<label>-<digest>` (from the site container) |
 | `pdo_mysql` credential | `DB_USER = <site-key>`, `DB_PASSWORD` derived per site |
 | KV keyspace and RESP credential | `EPHPM_REDIS_USERNAME = <site-key>` |
 
@@ -174,11 +250,11 @@ In multi-tenant mode each virtual host also gets its own private temp and sessio
 
 ### How It Works
 
-For each vhost, ephpm derives a private state root `<system-temp>/ephpm-vhosts/<label>-<digest>` from the resolved (traversal-safe) document root — stable per site across restarts, and distinct for every site. Its `tmp/` and `sessions/` subdirectories are created once per site (`0700` on Unix), and every request routed to that vhost runs with:
+For each vhost, ephpm derives a private state root `<system-temp>/ephpm-vhosts/<label>-<digest>` from the resolved (traversal-safe) **site container** — stable per site across restarts, distinct for every site, and unchanged by a [document-root override](#per-site-document-root-frameworks-with-a-public-directory). Its `tmp/` and `sessions/` subdirectories are created once per site (`0700` on Unix), and every request routed to that vhost runs with:
 
 | PHP directive | Value | Effect |
 |---|---|---|
-| `open_basedir` | `<document-root>` + `<state-root>` | the **only** temp path in the sandbox is this vhost's own state root — never the shared system temp |
+| `open_basedir` | `<site-container>` + `<state-root>` | the **only** temp path in the sandbox is this vhost's own state root — never the shared system temp. The container, not the web root, so PHP can `require` from above the web root |
 | `sys_temp_dir` / `upload_tmp_dir` | `<state-root>/tmp` | `tempnam()` and file uploads land in the site's own temp |
 | `session.save_path` | `<state-root>/sessions` | the default `files` session handler writes each site's sessions to its own directory |
 

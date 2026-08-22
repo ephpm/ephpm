@@ -95,9 +95,74 @@ impl StreamingCompression {
 /// the cache is for; a stat every 2s per unique host is noise.
 const UNKNOWN_SITE_TTL: Duration = Duration::from_secs(2);
 
+/// A virtual host's two roots, which are **not** the same directory once an
+/// operator-supplied override declares a `document_root`
+/// (`[server] site_overrides_dir`, see [`crate::site_overrides`]).
+///
+/// # Why two
+///
+/// A vhost directory under `sites_dir` is the site *container*: the whole
+/// checkout, including `vendor/`, `composer.json`, `config/` and
+/// `storage/logs/`. Modern PHP frameworks put their front controller in a
+/// subdirectory (`public/`, `web/`, `htdocs/`) exactly so those files sit above
+/// the web root. Before this struct existed the two collapsed into one
+/// `document_root`, and a Laravel vhost served its own logs — which routinely
+/// carry stack traces containing env values and database credentials — over HTTP.
+///
+/// # The invariant
+///
+/// * `document_root` is the **web root**: what URLs resolve against, what static
+///   files and PHP entrypoints are contained within, and `$_SERVER['DOCUMENT_ROOT']`.
+/// * `container` is the **`open_basedir` boundary** and the identity the
+///   per-vhost temp/session state root is derived from.
+///
+/// `container` must never follow `document_root` into the web root, for two
+/// separate reasons:
+///
+/// 1. **It would break every framework.** PHP served from `public/index.php`
+///    does `require __DIR__.'/../vendor/autoload.php'` on its first line; a
+///    sandbox narrowed to the web root fails on request one.
+/// 2. **It would make the sandbox override-controlled.** `open_basedir` is the
+///    primary cross-tenant boundary in a model where all tenants share one
+///    process and one uid, so it is derived solely from the container ePHPm
+///    placed the tenant in. An override may narrow what is *served*; it can
+///    never widen what PHP may *read*.
+///
+/// Pinned by [`tests::site_override_open_basedir_stays_the_container`] and
+/// [`tests::site_override_cannot_widen_open_basedir`].
+///
+/// When no declaration applies — no override file, a rejected declaration, the
+/// mechanism disabled, an unmatched host, or single-site mode — both fields hold
+/// the same path and behaviour is byte-identical to before.
+#[derive(Clone, Debug)]
+pub(crate) struct SiteRoots {
+    /// The web root: URL resolution, static-file and PHP-script containment,
+    /// and `$_SERVER['DOCUMENT_ROOT']`.
+    pub(crate) document_root: PathBuf,
+    /// The site container: the `open_basedir` entry, the OPcache invalidation
+    /// scope, and the input to [`vhost_state_root`]. Equal to `document_root`
+    /// whenever no per-site declaration applies. **Never override-controlled.**
+    pub(crate) container: PathBuf,
+}
+
+impl SiteRoots {
+    /// Both roots are the same directory — the shape that predates per-site
+    /// overrides, used for the default document root and wherever no container
+    /// is distinguishable.
+    fn flat(root: PathBuf) -> Self {
+        Self { container: root.clone(), document_root: root }
+    }
+
+    /// `true` when a per-site override actually moved this site's web root.
+    fn declared(&self) -> bool {
+        self.document_root != self.container
+    }
+}
+
 /// Per-site configuration resolved at startup from `sites_dir`.
 struct SiteConfig {
-    document_root: PathBuf,
+    /// The vhost directory itself. Always the `open_basedir` boundary.
+    container: PathBuf,
     index_files: Vec<String>,
     /// WebSocket entrypoint names for this vhost, in try-order — the
     /// `index_files` of the upgrade path. Carried per-site for exactly the same
@@ -175,8 +240,11 @@ struct ResolvedSite<'a> {
     /// trailing-dot-stripped, and [`is_valid_site_key`]-clean — or `None` when
     /// no known site matched.
     key: Option<String>,
-    /// The document root this request is served from.
-    document_root: PathBuf,
+    /// This request's web root and site container. The web root is what the
+    /// request resolves against; the container is the `open_basedir` boundary
+    /// and stays the vhost directory even when the web root moved into
+    /// `public/`. See [`SiteRoots`].
+    roots: SiteRoots,
     /// Index files for this site.
     index_files: &'a [String],
     /// WebSocket entrypoint names for this site, in try-order. Travels with the
@@ -289,6 +357,26 @@ pub struct Router {
     /// Optional path to the sites directory for lazy vhost discovery.
     /// When set, unknown hosts are checked against the filesystem.
     sites_dir: Option<PathBuf>,
+    /// Directory of operator-supplied per-site overrides
+    /// (`[server] site_overrides_dir`), or `None` when the mechanism is off or
+    /// this is single-site mode.
+    ///
+    /// Applied on **both** discovery paths — the startup scan and the lazy
+    /// unknown-host lookup — because they share one resolver
+    /// ([`Router::site_roots`]). Fixing only one would present as "works after a
+    /// restart, ignores the override when the preview is created", which is
+    /// precisely the provisioning flow this exists for.
+    site_overrides_dir: Option<PathBuf>,
+    /// Resolved per-site roots, keyed by **canonical site key**, expiring after
+    /// [`SITE_CONFIG_TTL`].
+    ///
+    /// Keyed by site key rather than container path because the key *is* the
+    /// tenant identity — the same string that names the override file, the vhost
+    /// directory and `<dir>/<key>.db`. This is what makes an override take
+    /// effect without a restart on an *already-discovered* site, and what keeps
+    /// the file from being re-read and re-canonicalized on every request. Seeded
+    /// at startup by [`Router::seed_site_roots`].
+    site_roots_cache: dashmap::DashMap<String, CachedSiteRoots>,
     /// Lowercased domain suffix (e.g. `.localhost`) stripped from incoming
     /// `Host` headers before vhost resolution. Lets dev-mode users keep
     /// short directory names while their browser uses `*.localhost`.
@@ -636,10 +724,76 @@ const CANONICAL_SCRIPT_CACHE_MAX: usize = 4096;
 /// caller from growing the map by varying `Host`.
 const SITE_PASSWORD_CACHE_MAX: usize = 4096;
 
+/// How long a resolved per-site override is cached before the file is read again.
+///
+/// # Why a TTL rather than an mtime check or a watcher
+///
+/// The requirement is that an override takes effect without a server restart, on
+/// an *already-discovered* site as well as a new one, and without a filesystem
+/// watcher.
+///
+/// An mtime check does not actually cover it: it still costs a stat per request,
+/// and it only detects changes to the *file*. The expensive and
+/// security-relevant half of resolution is the canonicalization that proves
+/// containment, and a symlink swap under the declared directory changes nothing
+/// about the override file's mtime. A TTL re-does both, uniformly.
+///
+/// Deliberately **derived from** [`CANONICAL_ROOT_TTL`] rather than written as
+/// its own number, for the same reason [`CANONICAL_SCRIPT_TTL`] is: this window
+/// and the canonical-docroot window bound the same containment guarantee from
+/// two sides, and letting them drift apart would make the weaker one invisible.
+///
+/// What the window costs, stated plainly: an operator who writes or fixes an
+/// override sees it take effect within two seconds, not instantly. Requests in
+/// that window use the previous (already validated, already contained)
+/// resolution. Nothing unvalidated is ever served.
+const SITE_CONFIG_TTL: Duration = CANONICAL_ROOT_TTL;
+
+/// Hard cap on [`Router::site_roots_cache`] entries.
+///
+/// Unlike [`CANONICAL_SCRIPT_CACHE_MAX`], the key here is not client-driven: an
+/// entry is only ever created for a canonical site key that resolved to a real
+/// directory under `sites_dir`, so the map is bounded by the fleet the operator
+/// deployed. The cap is defence in depth against a `sites_dir` with a pathological
+/// number of entries; past it, resolution simply happens per request.
+const SITE_ROOTS_CACHE_MAX: usize = 4096;
+
+/// A resolved [`SiteRoots`] plus when it was resolved, for [`SITE_CONFIG_TTL`].
+struct CachedSiteRoots {
+    roots: SiteRoots,
+    resolved_at: Instant,
+}
+
+/// Resolve one vhost's [`SiteRoots`] from its operator-supplied override file.
+///
+/// `overrides_dir` is `[server] site_overrides_dir` — a directory outside
+/// `sites_dir`, so no tenant can write it (see [`crate::site_overrides`] for why
+/// that placement is the whole design). Every failure mode (absent, unreadable,
+/// malformed, or declaring a `document_root` that escapes its container)
+/// collapses to "serve the container", which is the behaviour that predates this
+/// mechanism.
+///
+/// Note what this function structurally cannot do: it returns a [`SiteRoots`]
+/// whose `container` is the argument it was given. There is no path by which an
+/// override file influences the container, and therefore none by which it
+/// influences `open_basedir`.
+fn resolve_site_roots(container: PathBuf, overrides_dir: &Path, site_key: &str) -> SiteRoots {
+    match crate::site_overrides::load(overrides_dir, site_key, &container).document_root {
+        Some(document_root) => SiteRoots { document_root, container },
+        None => SiteRoots::flat(container),
+    }
+}
+
 /// Scan `sites_dir` for virtual host subdirectories.
 ///
 /// Each subdirectory becomes a virtual host keyed by its name (lowercased).
 /// Returns an empty map if `sites_dir` is `None`.
+///
+/// Per-site overrides are **not** read here — [`Router::site_roots`] owns that,
+/// so the startup path and the lazy path share one implementation and one
+/// freshness window. `Router::new` seeds the cache immediately afterwards, which
+/// is also what produces the startup log naming every site serving from an
+/// overridden root.
 fn scan_sites_dir(
     sites_dir: Option<&Path>,
     default_index_files: &[String],
@@ -672,7 +826,7 @@ fn scan_sites_dir(
         sites.insert(
             host,
             SiteConfig {
-                document_root: path,
+                container: path,
                 index_files: default_index_files.to_vec(),
                 websocket_files: default_websocket_files.to_vec(),
                 fallback: default_fallback.to_vec(),
@@ -743,6 +897,20 @@ impl Router {
             }
         }
 
+        // Operator-supplied per-site overrides. `None` in single-site mode and
+        // when `site_overrides_dir` is unset.
+        let site_overrides_dir =
+            config.server.effective_site_overrides_dir().map(Path::to_path_buf);
+        // Never a silent no-op: the knob only acts in multi-tenant mode, and
+        // `ephpm-config` has no `tracing` dependency to say so itself.
+        if config.server.site_overrides_dir.is_some() && config.server.sites_dir.is_none() {
+            tracing::warn!(
+                "[server] site_overrides_dir is set but [server] sites_dir is not — per-site \
+                 overrides only apply to virtual hosts, so this is ignored. In single-site \
+                 mode point [server] document_root at the web root directly."
+            );
+        }
+
         // Scan sites_dir for virtual host directories.
         let sites = scan_sites_dir(
             config.server.sites_dir.as_deref(),
@@ -782,7 +950,7 @@ impl Router {
         // `site_identities` is a field read, not a re-scan.
         let multi_site = config.server.sites_dir.is_some() || !sites.is_empty();
 
-        Self {
+        let router = Self {
             document_root: config.server.document_root.clone(),
             sites,
             multi_site,
@@ -790,6 +958,8 @@ impl Router {
             self_weak: std::sync::Weak::new(),
             websocket_files: config.server.websocket_files.clone(),
             sites_dir: config.server.sites_dir.clone(),
+            site_overrides_dir,
+            site_roots_cache: dashmap::DashMap::new(),
             sites_domain_suffix: config
                 .server
                 .sites_domain_suffix
@@ -925,7 +1095,111 @@ impl Router {
             ingest_strip_headers: build_ingest_strip_headers(&config.middleware),
             db_health: None,
             request_log: None,
+        };
+
+        // Read every known site's override once, now: it seeds the cache (so the
+        // first request to each vhost does not pay the read) and it produces the
+        // startup log naming the sites that serve from an overridden root.
+        // Lazily discovered sites log the same line on first resolution.
+        router.seed_site_roots();
+        router
+    }
+
+    /// Resolve and cache the override for every startup-scanned site, then name
+    /// the ones that moved in a single log line.
+    ///
+    /// Operators need to see, without making a request, which overrides are in
+    /// effect and where they point. An override that names a directory which
+    /// does not exist presents as a 404 with no other symptom, and "check
+    /// whether the provisioning daemon wrote the override" is not an obvious
+    /// first hypothesis.
+    fn seed_site_roots(&self) {
+        if self.site_overrides_dir.is_none() || self.sites.is_empty() {
+            return;
         }
+        let mut declared: Vec<String> = Vec::new();
+        // Collect keys first: `site_roots` takes its own map guards, and holding
+        // an iteration guard over `self.sites` across that is fine (different
+        // map), but the borrow of `site.container` is not — clone the pairs.
+        let scanned: Vec<(String, PathBuf)> =
+            self.sites.iter().map(|(host, site)| (host.clone(), site.container.clone())).collect();
+        for (host, container) in scanned {
+            let roots = self.site_roots(&host, container);
+            if roots.declared() {
+                declared.push(format!("{host} -> {}", roots.document_root.display()));
+            }
+        }
+        if !declared.is_empty() {
+            declared.sort_unstable();
+            tracing::info!(
+                overrides_dir = %self.site_overrides_dir.as_deref().unwrap_or(Path::new("")).display(),
+                count = declared.len(),
+                sites = %declared.join("; "),
+                "per-site document root overrides applied — these vhosts serve from a \
+                 subdirectory of their site container; open_basedir still resolves to the \
+                 container, so PHP can require from above the web root"
+            );
+        }
+    }
+
+    /// This vhost's [`SiteRoots`], reading its override file at most once per
+    /// [`SITE_CONFIG_TTL`].
+    ///
+    /// The single resolution point for both discovery paths. `container` is
+    /// always a directory ePHPm chose (a child of `sites_dir`); an override can
+    /// only narrow `document_root` within it, never touch `container`.
+    fn site_roots(&self, site_key: &str, container: PathBuf) -> SiteRoots {
+        let Some(overrides_dir) = self.site_overrides_dir.as_deref() else {
+            return SiteRoots::flat(container);
+        };
+
+        if let Some(hit) = self.site_roots_cache.get(site_key)
+            && hit.resolved_at.elapsed() < SITE_CONFIG_TTL
+            // Guard against a container that changed under a stable key (a
+            // reconfigured `sites_dir`): the cached roots must still describe
+            // the directory we were asked about.
+            && hit.roots.container == container
+        {
+            return hit.roots.clone();
+        }
+
+        let roots = resolve_site_roots(container, overrides_dir, site_key);
+
+        // Log a transition rather than every re-read: once when a site first
+        // resolves to an overridden root, and again whenever it changes. A 2s
+        // TTL means the unconditional version would emit a line every two
+        // seconds per site, forever.
+        let previous =
+            self.site_roots_cache.get(site_key).map(|hit| hit.roots.document_root.clone());
+        if previous.as_ref() != Some(&roots.document_root) {
+            if roots.declared() {
+                tracing::info!(
+                    site = site_key,
+                    container = %roots.container.display(),
+                    document_root = %roots.document_root.display(),
+                    "site serves from an overridden document root"
+                );
+            } else if previous.is_some() {
+                tracing::info!(
+                    site = site_key,
+                    container = %roots.container.display(),
+                    "per-site document root override removed — serving the site container"
+                );
+            }
+        }
+
+        // Only grow the map up to the cap; past it, resolve per request rather
+        // than let a pathological `sites_dir` grow it without bound. Existing
+        // keys are always refreshed so a cached entry cannot go stale forever.
+        if self.site_roots_cache.len() < SITE_ROOTS_CACHE_MAX
+            || self.site_roots_cache.contains_key(site_key)
+        {
+            self.site_roots_cache.insert(
+                site_key.to_string(),
+                CachedSiteRoots { roots: roots.clone(), resolved_at: Instant::now() },
+            );
+        }
+        roots
     }
 
     /// Attach (or leave off) the request-timeline ring buffer resolved in
@@ -1401,11 +1675,14 @@ impl Router {
         // Verify the directory still exists — it may have been removed (teardown).
         for key in lookup_keys {
             if let Some(site) = self.sites.get(*key)
-                && site.document_root.is_dir()
+                && site.container.is_dir()
             {
                 return ResolvedSite {
                     key: Some((*key).to_string()),
-                    document_root: site.document_root.clone(),
+                    // Through the same TTL-cached resolver the lazy path uses,
+                    // so a newly written override is picked up without a restart
+                    // on an already-scanned site too.
+                    roots: self.site_roots(key, site.container.clone()),
                     index_files: &site.index_files,
                     websocket_files: &site.websocket_files,
                     fallback: &site.fallback,
@@ -1419,13 +1696,24 @@ impl Router {
             for key in lookup_keys {
                 let candidate = sites_dir.join(key);
                 if candidate.is_dir() {
+                    // The override applies here too, and it must: a preview
+                    // created while the server is running never goes through
+                    // `scan_sites_dir`. Same resolver, same TTL as the registry
+                    // path above.
+                    let roots = self.site_roots(key, candidate);
                     // Discovery of a real vhost is worth an info line
                     // (once per host). Bot-probe misses go to `debug`
                     // via the fall-through below.
-                    tracing::debug!(host = %clean, key = %key, path = %candidate.display(), "discovered new virtual host (lazy)");
+                    tracing::debug!(
+                        host = %clean,
+                        key = %key,
+                        path = %roots.container.display(),
+                        document_root = %roots.document_root.display(),
+                        "discovered new virtual host (lazy)"
+                    );
                     return ResolvedSite {
                         key: Some((*key).to_string()),
-                        document_root: candidate,
+                        roots,
                         index_files: &self.index_files,
                         websocket_files: &self.websocket_files,
                         fallback: &self.fallback,
@@ -1457,7 +1745,12 @@ impl Router {
     fn default_site(&self) -> ResolvedSite<'_> {
         ResolvedSite {
             key: None,
-            document_root: self.document_root.clone(),
+            // The default document root is a web root, not a site container —
+            // there is no directory above it that ePHPm owns — so the two roots
+            // are the same path and the web-root convention does not apply. Its
+            // `open_basedir` (when `sites_dir` is set and a host matched no
+            // vhost) is unchanged from before this convention existed.
+            roots: SiteRoots::flat(self.document_root.clone()),
             index_files: &self.index_files,
             websocket_files: &self.websocket_files,
             fallback: &self.fallback,
@@ -1821,11 +2114,16 @@ impl Router {
         let host = extract_server_name(&req);
         let ResolvedSite {
             key: site_key,
-            document_root: site_root,
+            roots: site_roots,
             index_files: site_index,
             fallback: site_fallback,
             websocket_files: site_websocket_files,
         } = self.resolve_site(&host);
+        // Everything below routes against the WEB root: index files, the
+        // fallback chain, static-file containment and PHP-script containment.
+        // The container travels separately inside `site_roots` and is what
+        // `handle_php` turns into `open_basedir` — see `SiteRoots`.
+        let site_root = site_roots.document_root.clone();
 
         // WebSocket upgrade. Positioned deliberately:
         //
@@ -1850,7 +2148,7 @@ impl Router {
                     runtime,
                     effective_addr,
                     is_https,
-                    &site_root,
+                    &site_roots,
                     site_websocket_files,
                     site_key,
                 )
@@ -1920,7 +2218,7 @@ impl Router {
                                 fs_path,
                                 accepts_gzip,
                                 accepts_br,
-                                site_root.clone(),
+                                site_roots.clone(),
                                 site_key.clone(),
                                 None,
                             )
@@ -1991,7 +2289,7 @@ impl Router {
                             script,
                             accepts_gzip,
                             accepts_br,
-                            site_root.clone(),
+                            site_roots.clone(),
                             site_key.clone(),
                             None,
                         )
@@ -2150,13 +2448,17 @@ impl Router {
         runtime: &Arc<crate::websocket::WsRuntime>,
         remote_addr: SocketAddr,
         is_https: bool,
-        site_root: &Path,
+        site_roots: &SiteRoots,
         websocket_files: &[String],
         site_key: Option<String>,
     ) -> Response<ServerBody>
     where
         B: RequestBody,
     {
+        // The entrypoint is resolved against the WEB root, same as an HTTP
+        // request's index files — a `websocket.php` above the web root is not
+        // publicly routable and must not become one over an upgrade.
+        let site_root = site_roots.document_root.as_path();
         let Some(script) = self.resolve_websocket_script(site_root, websocket_files) else {
             tracing::debug!(
                 root = %site_root.display(),
@@ -2217,7 +2519,7 @@ impl Router {
             site_key: site_key.clone(),
             connection_id: registered.id.clone(),
             script: script.clone(),
-            document_root: site_root.to_path_buf(),
+            roots: site_roots.clone(),
             remote_addr,
             is_https,
             uri,
@@ -2236,7 +2538,7 @@ impl Router {
                 script,
                 false,
                 false,
-                site_root.to_path_buf(),
+                site_roots.clone(),
                 site_key,
                 Some(crate::websocket::WsEvent {
                     kind: crate::websocket::WsEventKind::Connect,
@@ -2286,7 +2588,7 @@ impl Router {
         remote_addr: SocketAddr,
         is_https: bool,
         script: PathBuf,
-        document_root: PathBuf,
+        roots: SiteRoots,
         site_key: Option<String>,
         event: crate::websocket::WsEvent,
     ) -> Response<ServerBody> {
@@ -2297,7 +2599,7 @@ impl Router {
             script,
             false,
             false,
-            document_root,
+            roots,
             site_key,
             Some(event),
         )
@@ -2322,13 +2624,19 @@ impl Router {
         script_filename: PathBuf,
         accepts_gzip: bool,
         accepts_br: bool,
-        document_root: PathBuf,
+        roots: SiteRoots,
         site_key: Option<String>,
         ws_event: Option<crate::websocket::WsEvent>,
     ) -> Response<ServerBody>
     where
         B: RequestBody,
     {
+        // Split the two roots apart exactly once. `document_root` is what PHP
+        // sees as `$_SERVER['DOCUMENT_ROOT']` (the web root — frameworks resolve
+        // asset URLs against it); `site_container` is the isolation boundary. The
+        // two are the same path unless the per-site web-root convention moved
+        // this vhost's root — see `SiteRoots`.
+        let SiteRoots { document_root, container: site_container } = roots;
         // Per-site PHP rate cap (`[server.limits] per_site_rate`, enabled by
         // default under `[server] preview`). Enforced HERE — the single point
         // every PHP dispatch converges on (fpm spawn_blocking, fpm pool, and
@@ -2570,8 +2878,13 @@ impl Router {
         // are moved into the blocking closure and applied as per-request INI
         // (open_basedir temp component, sys_temp_dir, upload_tmp_dir,
         // session.save_path) so no two tenants share `/tmp`.
+        //
+        // Derived from the site **container**, not the web root: the state root
+        // must name the tenant, and it must keep naming the same tenant when a
+        // site gains or loses a `public/` directory — otherwise adding a web
+        // root would silently orphan that site's existing sessions and uploads.
         let vhost_dirs = if vhost_open_basedir {
-            Some(self.ensure_vhost_private_dirs(&document_root))
+            Some(self.ensure_vhost_private_dirs(&site_container))
         } else {
             None
         };
@@ -2672,8 +2985,15 @@ impl Router {
             // session.save_path and upload_tmp_dir are re-read per request, so
             // each tenant's sessions/uploads are physically separated; the
             // files session handler keeps working, just per-site.
+            //
+            // THE invariant of the per-site web-root convention: the basedir
+            // entry is the site **container**, never the web root. A Laravel
+            // front controller's first statement is
+            // `require __DIR__.'/../vendor/autoload.php'`; a sandbox narrowed to
+            // `public/` fails it on request one. What the convention moves is the
+            // HTTP surface (`document_root`, above) — not the sandbox.
             if let Some(dirs) = &vhost_dirs {
-                let basedir = vhost_open_basedir_value(&document_root, &dirs.state_root);
+                let basedir = vhost_open_basedir_value(&site_container, &dirs.state_root);
                 PhpRuntime::set_request_ini("open_basedir", &basedir);
                 PhpRuntime::set_request_ini("sys_temp_dir", &dirs.temp.to_string_lossy());
                 PhpRuntime::set_request_ini("upload_tmp_dir", &dirs.temp.to_string_lossy());
@@ -2689,9 +3009,13 @@ impl Router {
             // mark_invalidated deduplicates so concurrent requests coalesce on
             // the per-vhost mutex.
             if let (Some(watcher), Some(version)) = (opcache_watcher, invalidate_version) {
+                // Scoped to the container, not the web root: a framework's
+                // compiled bytecode overwhelmingly lives in `vendor/` and `app/`
+                // *above* `public/`, so invalidating only under the web root
+                // would leave the stale code cached and defeat the purpose.
                 watcher.mark_invalidated(
                     &vhost_name,
-                    &document_root,
+                    &site_container,
                     version,
                     crate::opcache::InvalidationTrigger::Kv,
                     PhpRuntime::opcache_invalidate_under,
@@ -5739,7 +6063,7 @@ mod tests {
         std::fs::write(dir.path().join("index.php"), "<?php echo 'a';").unwrap();
         let router = test_router(dir.path());
 
-        let canon = dir.path().canonicalize().unwrap();
+        let canon = dir.path().canonicalize().map(ephpm_config::strip_verbatim_prefix).unwrap();
         for i in 0..CANONICAL_SCRIPT_CACHE_MAX {
             router
                 .canonical_scripts
@@ -6692,7 +7016,7 @@ echo "post response";
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
-        let doc_root = router.resolve_site("example.com").document_root;
+        let doc_root = router.resolve_site("example.com").roots.document_root;
         assert_eq!(doc_root, site_dir);
     }
 
@@ -6718,7 +7042,7 @@ echo "post response";
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
-        let doc_root = router.resolve_site("unknown.com").document_root;
+        let doc_root = router.resolve_site("unknown.com").roots.document_root;
         assert_eq!(doc_root, dir.path());
     }
 
@@ -6745,7 +7069,7 @@ echo "post response";
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
-        let doc_root = router.resolve_site("example.com:8080").document_root;
+        let doc_root = router.resolve_site("example.com:8080").roots.document_root;
         assert_eq!(doc_root, site_dir);
     }
 
@@ -6772,7 +7096,7 @@ echo "post response";
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
-        let doc_root = router.resolve_site("Example.COM").document_root;
+        let doc_root = router.resolve_site("Example.COM").roots.document_root;
         assert_eq!(doc_root, site_dir);
     }
 
@@ -6796,7 +7120,7 @@ echo "post response";
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
-        let doc_root = router.resolve_site("anything.com").document_root;
+        let doc_root = router.resolve_site("anything.com").roots.document_root;
         assert_eq!(doc_root, dir.path());
     }
 
@@ -6824,8 +7148,8 @@ echo "post response";
         };
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
-        let ResolvedSite { document_root: doc_root, index_files, fallback, .. } =
-            router.resolve_site("myblog.com");
+        let ResolvedSite { roots, index_files, fallback, .. } = router.resolve_site("myblog.com");
+        let doc_root = roots.document_root;
         let resolved = router.resolve_fallback("/", "", &doc_root, index_files, fallback);
         assert!(
             matches!(resolved, Resolved::File(p) if p == site_dir.join("index.php")),
@@ -6857,7 +7181,7 @@ echo "post response";
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         // Host doesn't exist yet — should fall back to default.
-        let doc_root = router.resolve_site("new-site.com").document_root;
+        let doc_root = router.resolve_site("new-site.com").roots.document_root;
         assert_eq!(doc_root, dir.path());
 
         // Create the directory AFTER router startup (simulates switchboard deploying).
@@ -6875,7 +7199,7 @@ echo "post response";
         router.unknown_site_cache.clear();
 
         // Now it should be discovered lazily.
-        let doc_root = router.resolve_site("new-site.com").document_root;
+        let doc_root = router.resolve_site("new-site.com").roots.document_root;
         assert_eq!(doc_root, new_site);
     }
 
@@ -6903,15 +7227,399 @@ echo "post response";
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         // Site exists — should resolve.
-        let doc_root = router.resolve_site("temp-site.com").document_root;
+        let doc_root = router.resolve_site("temp-site.com").roots.document_root;
         assert_eq!(doc_root, site_dir);
 
         // Delete the directory (simulates switchboard tearing down).
         fs::remove_dir_all(&site_dir).unwrap();
 
         // Should fall back to default now.
-        let doc_root = router.resolve_site("temp-site.com").document_root;
+        let doc_root = router.resolve_site("temp-site.com").roots.document_root;
         assert_eq!(doc_root, dir.path());
+    }
+
+    // ── Per-site overrides (`[server] site_overrides_dir`) ─────────
+
+    /// A multi-tenant fleet: `sites/` for tenant checkouts and `overrides/`
+    /// **beside** it (never inside), which is the placement the whole design
+    /// rests on.
+    struct Fleet {
+        dir: tempfile::TempDir,
+        sites: PathBuf,
+        overrides: PathBuf,
+    }
+
+    fn fleet() -> Fleet {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        let overrides = dir.path().join("overrides");
+        fs::create_dir_all(&sites).unwrap();
+        fs::create_dir_all(&overrides).unwrap();
+        Fleet { dir, sites, overrides }
+    }
+
+    impl Fleet {
+        /// Create a vhost directory with the given subdirectories.
+        fn site(&self, key: &str, subdirs: &[&str]) -> PathBuf {
+            let container = self.sites.join(key);
+            fs::create_dir_all(&container).unwrap();
+            for sub in subdirs {
+                fs::create_dir_all(container.join(sub)).unwrap();
+            }
+            container
+        }
+
+        /// Write the operator-owned override for `key`.
+        fn override_for(&self, key: &str, text: &str) {
+            fs::write(self.overrides.join(format!("{key}.toml")), text).unwrap();
+        }
+
+        fn remove_override(&self, key: &str) {
+            fs::remove_file(self.overrides.join(format!("{key}.toml"))).unwrap();
+        }
+
+        /// Router with overrides enabled.
+        fn router(&self) -> Router {
+            self.build(Some(self.overrides.clone()))
+        }
+
+        /// Router with the mechanism switched off.
+        fn router_without_overrides(&self) -> Router {
+            self.build(None)
+        }
+
+        fn build(&self, overrides_dir: Option<PathBuf>) -> Router {
+            let config = Config {
+                server: ServerConfig {
+                    listen: "0.0.0.0:8080".to_string(),
+                    document_root: self.dir.path().to_path_buf(),
+                    sites_dir: Some(self.sites.clone()),
+                    site_overrides_dir: overrides_dir,
+                    ..ServerConfig::default()
+                },
+                php: PhpConfig::default(),
+                db: DbConfig::default(),
+                kv: KvConfig::default(),
+                cluster: ClusterConfig::default(),
+                middleware: Vec::new(),
+                opcache: ephpm_config::OpcacheConfig::default(),
+            };
+            Router::new(&config, test_store(), None, None, None, None, None)
+        }
+    }
+
+    /// A site whose override declares `document_root = "web"` serves from it —
+    /// and its container is still the vhost directory.
+    #[test]
+    fn site_override_moves_document_root_and_keeps_container() {
+        let f = fleet();
+        let site = f.site("laravel.test", &["web", "vendor"]);
+        f.override_for("laravel.test", "document_root = \"web\"\n");
+
+        let router = f.router();
+        let resolved = router.resolve_site("laravel.test");
+
+        assert_eq!(
+            resolved.roots.document_root,
+            site.join("web").canonicalize().map(ephpm_config::strip_verbatim_prefix).unwrap(),
+            "web root must be the declared subdirectory"
+        );
+        assert_eq!(
+            resolved.roots.container, site,
+            "the container must stay the vhost directory — it is the open_basedir boundary"
+        );
+        assert_eq!(resolved.key.as_deref(), Some("laravel.test"));
+    }
+
+    /// THE invariant: `open_basedir` follows the container, so PHP served from
+    /// the overridden root can still `require '../vendor/autoload.php'`. If this
+    /// regresses, every framework vhost fails on its front controller's first
+    /// statement.
+    #[test]
+    fn site_override_open_basedir_stays_the_container() {
+        let f = fleet();
+        let site = f.site("laravel.test", &["web", "vendor"]);
+        f.override_for("laravel.test", "document_root = \"web\"\n");
+
+        let roots = f.router().resolve_site("laravel.test").roots;
+
+        // Exactly the derivation `handle_php` performs.
+        let state_root = vhost_state_root(&roots.container);
+        let basedir = vhost_open_basedir_value(&roots.container, &state_root);
+
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        let entries: Vec<&str> = basedir.split(separator).collect();
+        assert_eq!(entries[0], site.display().to_string(), "basedir entry must be the container");
+        assert_ne!(
+            entries[0],
+            roots.document_root.display().to_string(),
+            "basedir must NOT follow document_root into the overridden web root"
+        );
+        // vendor/ lives above the web root and must be inside the sandbox.
+        assert!(site.join("vendor").starts_with(entries[0]));
+    }
+
+    /// An override may NARROW what is served; it can never WIDEN what PHP may
+    /// read. Whatever the file says — including keys naming the sandbox itself —
+    /// the `open_basedir` entry is the container ePHPm chose, byte for byte.
+    #[test]
+    fn site_override_cannot_widen_open_basedir() {
+        let f = fleet();
+        let site = f.site("hostile.test", &["web"]);
+
+        for declaration in [
+            "document_root = \"web\"\n",
+            "document_root = \"/\"\n",
+            "document_root = \"../../\"\n",
+            "open_basedir = \"/\"\n",
+            "container = \"/\"\n",
+            "",
+        ] {
+            f.override_for("hostile.test", declaration);
+            let roots = f.router().resolve_site("hostile.test").roots;
+            assert_eq!(
+                roots.container, site,
+                "no override may change the container: {declaration:?}"
+            );
+            let basedir =
+                vhost_open_basedir_value(&roots.container, &vhost_state_root(&roots.container));
+            assert!(
+                basedir.starts_with(&site.display().to_string()),
+                "open_basedir must stay the container for {declaration:?}, got {basedir}"
+            );
+        }
+    }
+
+    /// The per-vhost temp/session state root is derived from the container, so a
+    /// site that gains an override keeps its existing sessions and uploads
+    /// instead of silently orphaning them.
+    #[test]
+    fn site_override_does_not_move_the_vhost_state_root() {
+        let f = fleet();
+        f.site("app.test", &["web"]);
+
+        let before = vhost_state_root(&f.router().resolve_site("app.test").roots.container);
+        f.override_for("app.test", "document_root = \"web\"\n");
+        let after = vhost_state_root(&f.router().resolve_site("app.test").roots.container);
+
+        assert_eq!(before, after, "state root must follow the tenant, not its web root");
+    }
+
+    /// A vhost with no override — every site that predates this mechanism — is
+    /// untouched: container and web root are the same directory.
+    #[test]
+    fn site_without_override_is_unchanged() {
+        let f = fleet();
+        let site = f.site("wordpress.test", &["wp-content"]);
+
+        let roots = f.router().resolve_site("wordpress.test").roots;
+
+        assert_eq!(roots.document_root, site);
+        assert_eq!(roots.container, site);
+        assert!(!roots.declared());
+    }
+
+    /// Mixed fleet, one router, one process: each site's own override decides.
+    #[test]
+    fn site_override_is_decided_per_site() {
+        let f = fleet();
+        let laravel = f.site("laravel.test", &["public"]);
+        let wordpress = f.site("wordpress.test", &[]);
+        f.override_for("laravel.test", "document_root = \"public\"\n");
+
+        let router = f.router();
+        assert_eq!(
+            router.resolve_site("laravel.test").roots.document_root,
+            laravel.join("public").canonicalize().map(ephpm_config::strip_verbatim_prefix).unwrap()
+        );
+        assert_eq!(router.resolve_site("wordpress.test").roots.document_root, wordpress);
+    }
+
+    /// Any directory name works — `web/`, `htdocs/`, `public_html/` — which is
+    /// the point of a declaration over a fixed convention.
+    #[test]
+    fn site_override_accepts_any_declared_directory_name() {
+        for name in ["web", "htdocs", "public_html", "www"] {
+            let f = fleet();
+            let site = f.site("app.test", &[name]);
+            f.override_for("app.test", &format!("document_root = {name:?}\n"));
+
+            assert_eq!(
+                f.router().resolve_site("app.test").roots.document_root,
+                site.join(name).canonicalize().map(ephpm_config::strip_verbatim_prefix).unwrap(),
+                "declared {name} must be honoured"
+            );
+        }
+    }
+
+    /// The override must apply on the LAZY path too. A PR-preview host creates
+    /// site directories while the server is running; they never go through
+    /// `scan_sites_dir`. Missing this would present as "works after a restart,
+    /// ignores the override when the preview is created".
+    #[test]
+    fn site_override_applies_to_lazy_discovery() {
+        let f = fleet();
+
+        // Router starts with an EMPTY sites_dir — nothing scanned.
+        let router = f.router();
+        assert_eq!(router.resolve_site("pr-42.preview.test").roots.document_root, f.dir.path());
+
+        // Preview provisioned — checkout and override — while the server runs.
+        let site = f.site("pr-42.preview.test", &["web"]);
+        f.override_for("pr-42.preview.test", "document_root = \"web\"\n");
+        router.unknown_site_cache.clear();
+
+        let roots = router.resolve_site("pr-42.preview.test").roots;
+        assert_eq!(
+            roots.document_root,
+            site.join("web").canonicalize().map(ephpm_config::strip_verbatim_prefix).unwrap(),
+            "lazy discovery must read the override too"
+        );
+        assert_eq!(roots.container, site);
+    }
+
+    /// An override written for an ALREADY-DISCOVERED site takes effect without a
+    /// restart, once `SITE_CONFIG_TTL` has elapsed. The registry path is the one
+    /// that would otherwise be pinned to whatever was true at startup.
+    #[test]
+    fn site_override_change_is_picked_up_without_restart() {
+        let f = fleet();
+        let site = f.site("app.test", &["web"]);
+
+        // Scanned at startup with NO override.
+        let router = f.router();
+        assert_eq!(router.resolve_site("app.test").roots.document_root, site);
+
+        // Daemon writes the override while the server runs. Expire the cache
+        // rather than sleeping for the TTL — the point under test is that the
+        // registry path re-resolves, not how long two seconds is.
+        f.override_for("app.test", "document_root = \"web\"\n");
+        router.site_roots_cache.clear();
+
+        assert_eq!(
+            router.resolve_site("app.test").roots.document_root,
+            site.join("web").canonicalize().map(ephpm_config::strip_verbatim_prefix).unwrap(),
+            "an already-discovered site must pick up a new override"
+        );
+
+        // And removing it reverts, likewise without a restart.
+        f.remove_override("app.test");
+        router.site_roots_cache.clear();
+        assert_eq!(router.resolve_site("app.test").roots.document_root, site);
+    }
+
+    /// Within the TTL the previous (already validated) resolution is reused —
+    /// the override file is not read per request.
+    #[test]
+    fn site_override_resolution_is_cached_within_the_ttl() {
+        let f = fleet();
+        let site = f.site("app.test", &["web"]);
+        f.override_for("app.test", "document_root = \"web\"\n");
+
+        let router = f.router();
+        let declared =
+            site.join("web").canonicalize().map(ephpm_config::strip_verbatim_prefix).unwrap();
+        assert_eq!(router.resolve_site("app.test").roots.document_root, declared);
+
+        // Remove the override but do NOT expire the cache: the previous
+        // resolution stands until the window closes.
+        f.remove_override("app.test");
+        assert_eq!(
+            router.resolve_site("app.test").roots.document_root,
+            declared,
+            "within SITE_CONFIG_TTL the cached resolution is reused"
+        );
+    }
+
+    /// `site_overrides_dir` unset switches the mechanism off entirely.
+    #[test]
+    fn site_override_disabled_serves_the_container() {
+        let f = fleet();
+        let site = f.site("laravel.test", &["web"]);
+        f.override_for("laravel.test", "document_root = \"web\"\n");
+
+        let roots = f.router_without_overrides().resolve_site("laravel.test").roots;
+
+        assert_eq!(roots.document_root, site, "disabled: the container is the web root");
+        assert_eq!(roots.container, site);
+    }
+
+    /// Bad declarations are rejected at the router boundary, not just in
+    /// `site_overrides`' own tests — the site keeps serving its container.
+    /// The writer is trusted, but ePHPm does not take that on faith.
+    #[test]
+    fn site_override_bad_declarations_serve_the_container() {
+        let f = fleet();
+        let site = f.site("evil.test", &[]);
+
+        for bad in ["../../etc", "..", "/etc", "/", r"C:\Windows", "nope", "web/../.."] {
+            f.override_for("evil.test", &format!("document_root = {bad:?}\n"));
+            assert_eq!(
+                f.router().resolve_site("evil.test").roots.document_root,
+                site,
+                "bad declaration {bad:?} must fall back to the container"
+            );
+        }
+    }
+
+    /// A half-written or malformed override must not break the site — a daemon
+    /// interrupted mid-write is a real state.
+    #[test]
+    fn site_override_malformed_serves_the_container() {
+        let f = fleet();
+        let site = f.site("broken.test", &["web"]);
+
+        for text in ["document_root =\n", "[[[\n", "not toml at all: {{{\n"] {
+            f.override_for("broken.test", text);
+            assert_eq!(f.router().resolve_site("broken.test").roots.document_root, site);
+        }
+    }
+
+    /// The override filename MUST be the canonical site key. A daemon writing
+    /// `preview-1234.toml` while the vhost is `pr-42.preview.test` fails open —
+    /// the site serves its container — which is safe but silent, and is exactly
+    /// why the docs spell the naming requirement out.
+    #[test]
+    fn site_override_named_for_another_key_is_ignored() {
+        let f = fleet();
+        let site = f.site("pr-42.preview.test", &["web"]);
+        f.override_for("preview-1234", "document_root = \"web\"\n");
+
+        assert_eq!(f.router().resolve_site("pr-42.preview.test").roots.document_root, site);
+    }
+
+    /// One tenant's override cannot move another tenant's web root, even though
+    /// both files live in one directory: the filename is the tenant identity.
+    #[test]
+    fn site_override_cannot_affect_another_tenant() {
+        let f = fleet();
+        let a = f.site("a.test", &["web"]);
+        let b = f.site("b.test", &["web"]);
+        f.override_for("a.test", "document_root = \"web\"\n");
+
+        let router = f.router();
+        assert_eq!(
+            router.resolve_site("a.test").roots.document_root,
+            a.join("web").canonicalize().map(ephpm_config::strip_verbatim_prefix).unwrap()
+        );
+        assert_eq!(router.resolve_site("b.test").roots.document_root, b, "b is untouched");
+    }
+
+    /// A host that matched no vhost is not affected: it serves the default
+    /// document root, which is a web root with no container above it, and no
+    /// override is consulted for it.
+    #[test]
+    fn unmatched_host_is_unaffected_by_site_overrides() {
+        let f = fleet();
+        fs::create_dir_all(f.dir.path().join("web")).unwrap();
+        // An override named for the unmatched host must not be read — an
+        // unmatched host is not a tenant and has no site key (issue #291).
+        f.override_for("nobody.test", "document_root = \"web\"\n");
+
+        let roots = f.router().resolve_site("nobody.test").roots;
+
+        assert_eq!(roots.document_root, f.dir.path());
+        assert_eq!(roots.container, f.dir.path());
     }
 
     // ── Host-header path traversal (issue #275) ────────────────────
@@ -6992,13 +7700,13 @@ echo "post response";
         let router = Router::new(&config, test_store(), None, None, None, None, None);
 
         // A legitimate vhost still resolves.
-        let good = router.resolve_site("site-a.test").document_root;
+        let good = router.resolve_site("site-a.test").roots.document_root;
         assert_eq!(good, sites.join("site-a.test"));
 
         // Every traversal host resolves to the DEFAULT document root, never to
         // the escaped `../secret` directory (which really exists on disk).
         for host in ["../secret", "../../secret", "..", "/etc", "..\\secret"] {
-            let doc_root = router.resolve_site(host).document_root;
+            let doc_root = router.resolve_site(host).roots.document_root;
             assert_eq!(
                 doc_root,
                 dir.path(),
@@ -7124,8 +7832,11 @@ echo "post response";
                 .collect();
             Derivations {
                 key: resolved.key.clone(),
-                state_root: vhost_state_root(&resolved.document_root),
-                document_root: resolved.document_root,
+                // The state root follows the site CONTAINER, matching
+                // `handle_php` — so it names the tenant, not the tenant's web
+                // root, and does not move when a site gains a `public/`.
+                state_root: vhost_state_root(&resolved.roots.container),
+                document_root: resolved.roots.document_root,
                 db_path: ids
                     .db
                     .as_deref()
