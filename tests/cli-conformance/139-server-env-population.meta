@@ -1,1 +1,0 @@
-xfail = "CLI $_SERVER lacks environment variables (variables_order EGPCS not honored for S) and the empty-string DOCUMENT_ROOT php-cli registers (#338; when this XPASSes, remove the marker)"

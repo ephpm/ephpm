@@ -86,6 +86,27 @@ fn run_php(bin: &PathBuf, args: &[&str], stdin_data: &str) -> Run {
     }
 }
 
+/// Run `ephpm php <args…>` with extra environment variables and empty stdin.
+/// The parent environment is inherited (PATH and the loader's variables are
+/// needed to start the process at all); `env` is layered on top.
+fn run_php_env(bin: &PathBuf, args: &[&str], env: &[(&str, &str)]) -> Run {
+    let mut cmd = Command::new(bin);
+    cmd.arg("php").args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child =
+        cmd.spawn().unwrap_or_else(|e| panic!("spawn {} php {args:?}: {e}", bin.display()));
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().unwrap_or_else(|e| panic!("wait for {args:?}: {e}"));
+    Run {
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        code: out.status.code().unwrap_or(-1),
+    }
+}
+
 /// Assert the run produced a fatal diagnostic containing `needle` AND exited
 /// 255 — the two halves of #321, checked separately so a regression in either
 /// one is named precisely.
@@ -613,4 +634,206 @@ fn warning_is_reported_and_execution_continues() {
     assert!(combined.contains("Undefined variable"), "warning not reported:\n{combined}");
     assert!(combined.contains("END"), "execution did not continue past the warning:\n{combined}");
     assert_eq!(run.code, 0, "a warning must not change the exit status, got {}", run.code);
+}
+
+// ── php-cli conformance cluster: #335 / #336 / #338 / #339 / #340 ───────────
+//
+// Each of these was found by the nightly CLI conformance harness
+// (tests/cli-conformance/, `cargo xtask cli-conformance`) diffing `ephpm php`
+// against a real php-cli. The corpus proves *sameness* but only runs on Linux
+// with an upstream php installed; these assertions pin the same behavior from
+// the ephpm side alone, on every platform the e2e suite runs on.
+
+/// `--rf`/`--rc` on a name that doesn't resolve: php-cli prints
+/// `Exception: <message>` and exits **1** (php_cli.c sets
+/// `EG(exit_status) = 1` in that branch). ePHPm printed the identical line and
+/// exited 0, so `php --rf … || handle_error` never fired (issue #335).
+#[test]
+fn reflection_of_missing_symbol_exits_one() {
+    let Some(bin) = cli_binary() else {
+        eprintln!("EPHPM_CLI_BINARY unset — skipping ephpm php CLI tests");
+        return;
+    };
+
+    let func = run_php(&bin, &["-n", "--rf", "no_such_function_xyz"], "");
+    assert!(
+        func.stdout.contains("Exception: Function no_such_function_xyz() does not exist"),
+        "--rf on a missing function lost php-cli's diagnostic:\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        func.stdout,
+        func.stderr
+    );
+    assert_eq!(func.code, 1, "--rf on a missing function must exit 1 like php-cli");
+
+    let class = run_php(&bin, &["-n", "--rc", "NoSuchClass_xyz"], "");
+    assert!(
+        class.stdout.contains("Exception: Class \"NoSuchClass_xyz\" does not exist"),
+        "--rc on a missing class lost php-cli's diagnostic:\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        class.stdout,
+        class.stderr
+    );
+    assert_eq!(class.code, 1, "--rc on a missing class must exit 1 like php-cli");
+}
+
+/// The other half of #335: a reflection flag that *succeeds* must still exit 0.
+/// Without this, "make the failure exit 1" could regress into "always exit 1"
+/// and no test would notice.
+#[test]
+fn reflection_of_present_symbol_exits_zero() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(&bin, &["-n", "--rf", "strlen"], "");
+    assert!(
+        run.stdout.contains("Function [ <internal"),
+        "--rf strlen did not print the reflection dump:\n--- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        run.stdout,
+        run.stderr
+    );
+    assert_eq!(run.code, 0, "a successful --rf must exit 0");
+}
+
+/// An unrecognized option: php-cli's `php_getopt(…, show_err = 1)` writes
+/// `Error in argument N, char M: option not found X` to stderr, `main()` then
+/// prints usage on stdout and exits 1. ePHPm ignored the flag entirely, ran
+/// nothing, and exited 0 — a typo'd flag silently succeeded (issue #336).
+///
+/// The argument index is 2 because the C-side argv is
+/// `["ephpm", "-n", "-Z"]`, exactly as php-cli's is `["php", "-n", "-Z"]`.
+#[test]
+fn unknown_option_reports_and_exits_one() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(&bin, &["-n", "-Z"], "");
+    assert_eq!(
+        run.stderr.trim_end(),
+        "Error in argument 2, char 2: option not found Z",
+        "unknown-option diagnostic did not match php-cli's byte-for-byte\n\
+         --- stdout ---\n{}",
+        run.stdout
+    );
+    assert!(
+        run.stdout.starts_with("Usage: ephpm php"),
+        "usage text must go to stdout, as php-cli's does:\n--- stdout ---\n{}",
+        run.stdout
+    );
+    assert_eq!(run.code, 1, "an unknown option must exit 1, not succeed silently");
+}
+
+/// A *missing required argument* takes the same `PHP_GETOPT_INVALID_ARG`
+/// return, so it must also fail loudly rather than fall through to "read the
+/// program from stdin".
+#[test]
+fn option_missing_its_argument_exits_one() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(&bin, &["-n", "-r"], "");
+    assert!(
+        run.stderr.contains("no argument for option r"),
+        "missing -r argument lost php_getopt's diagnostic:\n--- stderr ---\n{}",
+        run.stderr
+    );
+    assert_eq!(run.code, 1, "a missing option argument must exit 1");
+}
+
+/// php-cli's CLI `$_SERVER` contains the process environment (its
+/// `variables_order` is `EGPCS`, and a CLI process's "S" is its environment)
+/// plus an empty-string `DOCUMENT_ROOT`. Composer, PHPUnit and friends read
+/// `$_SERVER['HOME']` / `$_SERVER['PATH']` directly; ePHPm's was missing both
+/// (issue #338).
+#[test]
+fn server_superglobal_carries_environment_and_document_root() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php_env(
+        &bin,
+        &[
+            "-n",
+            "-r",
+            "echo $_SERVER['EPHPM_CLI_TEST_VAR'] ?? '(unset)', '|', \
+             var_export($_SERVER['DOCUMENT_ROOT'] ?? '(absent)', true);",
+        ],
+        &[("EPHPM_CLI_TEST_VAR", "hello-from-env")],
+    );
+    assert_eq!(
+        run.stdout, "hello-from-env|''",
+        "CLI $_SERVER must carry the environment and an empty DOCUMENT_ROOT\n\
+         --- stderr ---\n{}",
+        run.stderr
+    );
+    assert_eq!(run.code, 0);
+}
+
+/// `PHP_BINARY` must name the running executable. On Windows this always
+/// worked by accident — php-src's `php_binary_init()` asks the OS there — but
+/// on Linux/macOS it reads `sapi_module.executable_location`, which the embed
+/// SAPI left NULL, so the constant registered as `""` (issue #339).
+#[test]
+fn php_binary_names_the_running_executable() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(&bin, &["-n", "-r", "echo PHP_BINARY;"], "");
+    assert!(!run.stdout.is_empty(), "PHP_BINARY is empty (stderr: {})", run.stderr);
+
+    let reported = std::fs::canonicalize(run.stdout.trim())
+        .unwrap_or_else(|e| panic!("PHP_BINARY {:?} is not a real path: {e}", run.stdout));
+    let expected =
+        std::fs::canonicalize(&bin).unwrap_or_else(|e| panic!("canonicalize {bin:?}: {e}"));
+    assert_eq!(
+        reported, expected,
+        "PHP_BINARY must be the ephpm binary that is running, not another file"
+    );
+}
+
+/// `STDIN`/`STDOUT`/`STDERR` are opened through the `php://std*` wrappers by
+/// php-cli, so `stream_get_meta_data()` reports `wrapper_type = "PHP"` and a
+/// `php://…` uri. ePHPm built them from raw `FILE*`s, leaving both absent, so
+/// code that sniffs the wrapper to tell real stdio apart misbehaved (#340).
+#[test]
+fn stdio_constants_carry_php_wrapper_metadata() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(
+        &bin,
+        &[
+            "-n",
+            "-r",
+            "foreach (['stdin' => STDIN, 'stdout' => STDOUT, 'stderr' => STDERR] as $n => $h) {\
+               $m = stream_get_meta_data($h);\
+               echo $n, '=', $m['wrapper_type'] ?? 'NONE', ',', $m['uri'] ?? 'NONE', ';';\
+             }",
+        ],
+        "",
+    );
+    assert_eq!(
+        run.stdout, "stdin=PHP,php://stdin;stdout=PHP,php://stdout;stderr=PHP,php://stderr;",
+        "stdio constants lost their php:// wrapper metadata\n--- stderr ---\n{}",
+        run.stderr
+    );
+    assert_eq!(run.code, 0);
+}
+
+/// The stdio constants must still be usable handles, not just well-labeled
+/// ones: reading STDIN and writing STDOUT/STDERR has to keep working after
+/// the switch to the wrapper (#340).
+#[test]
+fn stdio_constants_still_do_io() {
+    let Some(bin) = cli_binary() else {
+        return;
+    };
+    let run = run_php(
+        &bin,
+        &["-n", "-r", "fwrite(STDOUT, 'out:' . trim(fgets(STDIN))); fwrite(STDERR, 'err');"],
+        "piped-line\n",
+    );
+    assert_eq!(run.stdout, "out:piped-line", "STDIN/STDOUT I/O broke");
+    assert_eq!(run.stderr, "err", "STDERR I/O broke");
+    assert_eq!(run.code, 0);
 }
