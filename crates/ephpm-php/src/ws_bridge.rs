@@ -143,6 +143,9 @@ pub fn is_configured() -> bool {
 /// scope so a request with no tenant identity gets **no** WebSocket capability
 /// rather than inheriting the last request's.
 pub fn set_current_site(scope: Option<&str>) {
+    // Plain `with` on purpose (issue #269): Rust-side per-request setup on a
+    // live thread, unreachable from a PHP shutdown function. The read side
+    // ([`site_scope`]) is reachable and uses `try_with`.
     WS_CURRENT_SITE.with(|s| {
         *s.borrow_mut() = scope.map(Box::from);
     });
@@ -156,19 +159,31 @@ pub fn set_current_site(scope: Option<&str>) {
 /// a stale id would make an unrelated HTTP request silently push frames to
 /// whichever socket happened to run last on that thread.
 pub fn set_current_connection(connection_id: Option<&str>) {
+    // Plain `with` on purpose — see [`set_current_site`].
     WS_CURRENT_CONN.with(|c| {
         *c.borrow_mut() = connection_id.map(Box::from);
     });
 }
 
 /// The site scope for this thread's request, or `None`.
+///
+/// `try_with` (issue #269): a `register_shutdown_function` callback or an
+/// object destructor calling `ephpm_ws_*` runs during `php_request_shutdown()`
+/// on a retiring thread, where this cell may already be destroyed — `with`
+/// would panic inside a TLS destructor and abort the process. A destroyed cell
+/// degrades to "no scope", which the callers turn into [`Status::NoSite`] and
+/// the wrapper into a clean exception. That is the correct answer either way:
+/// without a scope there is no capability to act on.
 fn site_scope() -> Option<Box<str>> {
-    WS_CURRENT_SITE.with(|s| s.borrow().clone())
+    WS_CURRENT_SITE.try_with(|s| s.borrow().clone()).unwrap_or(None)
 }
 
 /// The current event's connection id, or `None` outside an event.
+///
+/// `try_with` for the same reason as [`site_scope`]; a destroyed cell degrades
+/// to [`Status::NoConnection`].
 fn current_connection() -> Option<Box<str>> {
-    WS_CURRENT_CONN.with(|c| c.borrow().clone())
+    WS_CURRENT_CONN.try_with(|c| c.borrow().clone()).unwrap_or(None)
 }
 
 /// Resolve the registry and this request's site scope.
@@ -646,5 +661,69 @@ mod tests {
         assert_eq!(Status::NoRegistry.code(), -3);
         assert_eq!(Status::Ok(0).code(), 0);
         assert_eq!(Status::Ok(7).code(), 7);
+    }
+
+    // ── #269: PHP userland running during thread teardown ───────────────
+
+    thread_local! {
+        /// Stands in for `ThreadPhpGuard`: touched before the scope cells, so
+        /// its destructor runs last and they are already destroyed when
+        /// [`WsShutdownHook::drop`] calls back into the bridge.
+        static WS_SHUTDOWN_HOOK: RefCell<Option<WsShutdownHook>> = const { RefCell::new(None) };
+    }
+
+    static WS_HOOK_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static WS_HOOK_SEND: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    static WS_HOOK_BROADCAST: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    static WS_HOOK_IMPLICIT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+
+    /// A `register_shutdown_function()` callback calling `ephpm_ws_*` from
+    /// inside a thread-local destructor — the issue #269 seam.
+    struct WsShutdownHook;
+
+    impl Drop for WsShutdownHook {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+
+            let unknown = b"00000000000000000000000000000000";
+            WS_HOOK_SEND.store(send(Some(unknown), b"bye", false).code(), Ordering::Release);
+            WS_HOOK_BROADCAST.store(broadcast(b"room", b"bye", false).code(), Ordering::Release);
+            WS_HOOK_IMPLICIT.store(send(None, b"bye", false).code(), Ordering::Release);
+            WS_HOOK_RAN.store(true, Ordering::Release);
+        }
+    }
+
+    /// A shutdown function pushing frames while its thread retires loses its
+    /// scope cleanly rather than aborting the process (issue #269).
+    ///
+    /// Losing the scope is the *correct* degraded answer, not a compromise: a
+    /// capability that cannot be re-derived must not be assumed. Without
+    /// `try_with` this does not fail — the test binary dies with `fatal
+    /// runtime error: thread local panicked on drop`.
+    #[test]
+    fn shutdown_hook_during_thread_teardown_loses_its_scope_cleanly() {
+        use std::sync::atomic::Ordering;
+
+        on_thread(|| {
+            let _ = shared_registry();
+            // 1. The guard-equivalent, before the scope cells exist.
+            WS_SHUTDOWN_HOOK.with(|c| *c.borrow_mut() = Some(WsShutdownHook));
+            // 2. Then the scope cells — registered later, destroyed earlier.
+            set_current_site(Some("hook.test"));
+            set_current_connection(Some("deadbeef"));
+        });
+
+        assert!(WS_HOOK_RAN.load(Ordering::Acquire), "the shutdown hook must have run at teardown");
+        assert_eq!(
+            WS_HOOK_SEND.load(Ordering::Acquire),
+            Status::NoSite.code(),
+            "an explicit-id send from a retiring thread must fail closed on the lost scope"
+        );
+        assert_eq!(WS_HOOK_BROADCAST.load(Ordering::Acquire), Status::NoSite.code());
+        assert_eq!(
+            WS_HOOK_IMPLICIT.load(Ordering::Acquire),
+            Status::NoSite.code(),
+            "the scope is checked before the connection, so the implicit form reports NoSite too"
+        );
     }
 }

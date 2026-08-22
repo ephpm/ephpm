@@ -6,6 +6,23 @@
 //!
 //! The `get` result is stored in a thread-local buffer to avoid malloc/free
 //! across the FFI boundary. The C side copies the data via `RETURN_STRINGL`.
+//!
+//! # Thread teardown (issue #269)
+//!
+//! `ThreadPhpGuard`'s destructor runs `php_request_shutdown()` on a retiring
+//! worker thread, which executes userland `register_shutdown_function()`
+//! callbacks and object destructors — and those can call `ephpm_kv_*`. By then
+//! [`KV_GET_BUF`] is already destroyed ( it is first touched *inside* a
+//! request, i.e. registered after the guard, and destructors run in reverse
+//! registration order), so every access made from a PHP native uses
+//! `LocalKey::try_with`: `with` would panic inside a TLS destructor, which is
+//! an unconditional `SIGABRT` for the whole process.
+//!
+//! The degraded answer is always the store's own "nothing here" answer — `get`
+//! reports a miss, `wait` reports a timeout, the site store resolves to
+//! `None`, which makes every op return failure. No silent success and no
+//! cross-tenant fallback. See `db_bridge`'s module docs for the full
+//! mechanism.
 
 #[cfg(php_linked)]
 use std::cell::RefCell;
@@ -42,6 +59,9 @@ thread_local! {
 /// pass `None` to use the global store.
 #[cfg(php_linked)]
 pub fn set_site_store(store: Option<Arc<Store>>) {
+    // Plain `with` on purpose (issue #269): Rust-side per-request setup on a
+    // live thread, never reachable from a PHP shutdown function. The *read*
+    // side ([`effective_store`]) is reachable and does use `try_with`.
     KV_SITE_STORE.with(|s| {
         *s.borrow_mut() = store;
     });
@@ -53,12 +73,23 @@ pub fn set_site_store(_store: Option<std::sync::Arc<ephpm_kv::store::Store>>) {}
 
 /// Get the effective store for the current request.
 /// Returns the site-specific store if set, otherwise the global store.
+///
+/// Returns `None` when the per-thread site slot has already been destroyed
+/// (issue #269) — **fail closed**, not "fall back to the global store". In
+/// multi-tenant mode that fallback would let a tenant's shutdown function
+/// write into a keyspace that is not its own; a KV miss is the safe answer.
 #[cfg(php_linked)]
 fn effective_store() -> Option<Arc<Store>> {
-    KV_SITE_STORE.with(|s| {
-        let site = s.borrow();
-        if let Some(ref store) = *site { Some(Arc::clone(store)) } else { KV_STORE.get().cloned() }
-    })
+    KV_SITE_STORE
+        .try_with(|s| {
+            let site = s.borrow();
+            if let Some(ref store) = *site {
+                Some(Arc::clone(store))
+            } else {
+                KV_STORE.get().cloned()
+            }
+        })
+        .unwrap_or(None)
 }
 
 // ── C-compatible ops struct ─────────────────────────────────────────────
@@ -175,12 +206,16 @@ unsafe extern "C" fn kv_get(key: *const std::os::raw::c_char) -> std::os::raw::c
 
     match store.get(key_str) {
         Some(val) => {
-            KV_GET_BUF.with(|buf| {
+            // `try_with` (issue #269): reachable from a shutdown function on
+            // an exiting thread. Without the buffer there is nowhere to hand
+            // the value to C, so report a miss rather than returning 1 with a
+            // stale/empty buffer behind it.
+            let staged = KV_GET_BUF.try_with(|buf| {
                 let mut buf = buf.borrow_mut();
                 buf.clear();
                 buf.extend_from_slice(&val);
             });
-            1
+            i32::from(staged.is_ok())
         }
         None => 0,
     }
@@ -192,13 +227,24 @@ unsafe extern "C" fn kv_get_result(ptr: *mut *const std::os::raw::c_char, len: *
     // in `PHP_FUNCTION(ephpm_kv_get)`. The buffer remains valid because this
     // is called on the same thread immediately after `kv_get`, and the
     // thread-local buffer is not modified until the next `kv_get` call.
-    KV_GET_BUF.with(|buf| {
+    // `try_with` (issue #269). A destroyed buffer reports an empty result;
+    // the C side sees len 0 and returns an empty string rather than reading a
+    // pointer that no longer has a buffer behind it. Unreachable in practice
+    // because `kv_get` would have returned 0, but the pointer contract must
+    // hold on its own.
+    let staged = KV_GET_BUF.try_with(|buf| {
         let buf = buf.borrow();
         unsafe {
             *ptr = buf.as_ptr().cast();
             *len = buf.len();
         }
     });
+    if staged.is_err() {
+        unsafe {
+            *ptr = std::ptr::null();
+            *len = 0;
+        }
+    }
 }
 
 #[cfg(php_linked)]
@@ -384,27 +430,32 @@ unsafe extern "C" fn kv_wait(
     let last = u64::try_from(last_version).unwrap_or(0);
     let timeout = Duration::from_millis(u64::try_from(timeout_ms).unwrap_or(0));
 
-    match store.wait_for_change(key_str, last, timeout) {
-        Some((version, value)) => {
-            // Safety: `new_version` points to a valid `long long` local in
-            // our C wrapper code (PHP_FUNCTION(ephpm_kv_wait)).
-            unsafe {
-                *new_version = std::os::raw::c_longlong::try_from(version).unwrap_or(i64::MAX)
-            };
-            match value {
-                Some(val) => {
-                    KV_GET_BUF.with(|buf| {
-                        let mut buf = buf.borrow_mut();
-                        buf.clear();
-                        buf.extend_from_slice(&val);
-                    });
-                    1
-                }
-                None => 2,
-            }
+    let Some((version, value)) = store.wait_for_change(key_str, last, timeout) else {
+        return 0;
+    };
+
+    // Stage the value BEFORE reporting success. `try_with` (issue #269): a
+    // shutdown function on an exiting thread has no get buffer left, and the
+    // documented contract says `*new_version` is untouched when this returns
+    // 0 — so the write below must not happen on the degraded path.
+    let rc = match value {
+        Some(val) => {
+            let staged = KV_GET_BUF.try_with(|buf| {
+                let mut buf = buf.borrow_mut();
+                buf.clear();
+                buf.extend_from_slice(&val);
+            });
+            if staged.is_ok() { 1 } else { 0 }
         }
-        None => 0,
+        None => 2,
+    };
+    if rc == 0 {
+        return 0;
     }
+    // Safety: `new_version` points to a valid `long long` local in
+    // our C wrapper code (PHP_FUNCTION(ephpm_kv_wait)).
+    unsafe { *new_version = std::os::raw::c_longlong::try_from(version).unwrap_or(i64::MAX) };
+    rc
 }
 
 // ── Static ops table ────────────────────────────────────────────────────
@@ -918,5 +969,96 @@ mod tests {
 
         assert_eq!(t1.join().unwrap(), b"thread1");
         assert_eq!(t2.join().unwrap(), b"thread2");
+    }
+
+    // ── #269: PHP userland running during thread teardown ───────────────
+
+    thread_local! {
+        /// Stands in for `ThreadPhpGuard`: touched before [`KV_GET_BUF`] and
+        /// [`KV_SITE_STORE`], so its destructor runs last and both are already
+        /// destroyed when [`KvShutdownHook::drop`] calls back into the bridge.
+        static KV_SHUTDOWN_HOOK: RefCell<Option<KvShutdownHook>> = const { RefCell::new(None) };
+    }
+
+    static KV_HOOK_RAN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static KV_HOOK_GET: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    static KV_HOOK_SET: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+    static KV_HOOK_RESULT_LEN: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+    /// A `register_shutdown_function()` callback calling `ephpm_kv_*` from
+    /// inside a thread-local destructor — the issue #269 seam.
+    struct KvShutdownHook;
+
+    impl Drop for KvShutdownHook {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+
+            let key = cstr("bridge_hook_teardown");
+            let val = b"written-by-a-dying-thread";
+            // Safety: `key` and `val` are valid for the duration of the calls.
+            unsafe {
+                KV_HOOK_GET.store(kv_get(key.as_ptr()), Ordering::Release);
+                KV_HOOK_SET.store(
+                    kv_set(key.as_ptr(), val.as_ptr().cast(), val.len(), 0),
+                    Ordering::Release,
+                );
+                let mut ptr: *const std::os::raw::c_char = std::ptr::null();
+                let mut len: usize = usize::MAX;
+                kv_get_result(&mut ptr, &mut len);
+                KV_HOOK_RESULT_LEN.store(len, Ordering::Release);
+            }
+            KV_HOOK_RAN.store(true, Ordering::Release);
+        }
+    }
+
+    /// A shutdown function touching the KV store while its thread retires gets
+    /// a clean miss, not a process abort (issue #269).
+    ///
+    /// `effective_store()` fails **closed** on a destroyed site slot rather
+    /// than falling back to the process-global store: in multi-tenant mode
+    /// that fallback would let a tenant's shutdown code write into a keyspace
+    /// that is not its own. So the write below must not land anywhere.
+    ///
+    /// Without `try_with` this does not fail — the test binary dies with
+    /// `fatal runtime error: thread local panicked on drop`.
+    #[test]
+    #[serial]
+    fn shutdown_hook_during_thread_teardown_misses_cleanly() {
+        use std::sync::atomic::Ordering;
+
+        let store = init_store();
+        store.set("bridge_hook_teardown".into(), b"seed".to_vec(), None);
+
+        thread::spawn(|| {
+            // 1. The guard-equivalent, before the bridge cells exist.
+            KV_SHUTDOWN_HOOK.with(|c| *c.borrow_mut() = Some(KvShutdownHook));
+            // 2. Then the bridge cells — registered later, destroyed earlier.
+            set_site_store(None);
+            let key = cstr("bridge_hook_teardown");
+            // Safety: `key` is valid for the duration of the call.
+            assert_eq!(unsafe { kv_get(key.as_ptr()) }, 1);
+        })
+        .join()
+        .expect("worker thread must exit cleanly, not abort");
+
+        assert!(KV_HOOK_RAN.load(Ordering::Acquire), "the shutdown hook must have run");
+        assert_eq!(
+            KV_HOOK_GET.load(Ordering::Acquire),
+            0,
+            "a get from a retiring thread must report a miss — there is no buffer to hand \
+             the value back through"
+        );
+        assert_eq!(KV_HOOK_SET.load(Ordering::Acquire), 0, "a set must fail closed");
+        assert_eq!(
+            KV_HOOK_RESULT_LEN.load(Ordering::Acquire),
+            0,
+            "get_result must report an empty buffer, not a stale pointer"
+        );
+        assert_eq!(
+            store.get("bridge_hook_teardown").as_deref(),
+            Some(&b"seed"[..]),
+            "the refused write must not have reached the store"
+        );
     }
 }
