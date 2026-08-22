@@ -113,6 +113,19 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
             modules = ?chain.module_names(),
             "middleware chain loaded"
         );
+        // The two lanes are two PHASES, and saying so at startup is the only
+        // way `order` is not a quiet lie: native modules run before the request
+        // body is read and outside PHP; `php:` mounts run inside the PHP
+        // request, after the body, immediately before the application script.
+        // `order` sorts within each phase and cannot interleave them.
+        if chain.has_php_mounts() {
+            tracing::info!(
+                php_mounts = ?chain.php_mount_names(),
+                "PHP middleware mounted (EXPERIMENTAL) — these run INSIDE the PHP request, \
+                 after the request body has been read and after every native module, so they \
+                 cannot reject before the body transfer the way a native module can"
+            );
+        }
         // In cluster mode, the built-in ratelimit middleware uses local KV
         // INCR to track the request count per window. SET/DEL and EXPIRE
         // now replicate across the cluster (KV replication v1.1), but

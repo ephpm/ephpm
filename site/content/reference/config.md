@@ -618,10 +618,54 @@ at startup) — see the guide's
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `library` | string | **required** | Builtin name (`jwt`, `cors`, `ratelimit`/`rate-limit`, `security-headers`, `api-key`, `ip-allowlist`, `maintenance-mode`, `redirect`, `request-id`, `header-transform`, or their `ephpm-middleware-*` long forms; `-`/`_` interchangeable), a bare module name resolved through the middleware search path (`<name>.<os>-<arch>.<ext>`, `lib<name>.<ext>`, `<name>.<ext>` in the working directory, `$EPHPM_MIDDLEWARE_DIR`, then `/usr/local/lib/ephpm/middleware`), or an explicit path (any value containing a path separator or file extension). Must not be empty. |
+| `library` | string | **required** | A `php:`-prefixed script path (**experimental PHP lane** — see below), a builtin name (`jwt`, `cors`, `ratelimit`/`rate-limit`, `security-headers`, `api-key`, `ip-allowlist`, `maintenance-mode`, `redirect`, `request-id`, `header-transform`, or their `ephpm-middleware-*` long forms; `-`/`_` interchangeable), a bare module name resolved through the middleware search path (`<name>.<os>-<arch>.<ext>`, `lib<name>.<ext>`, `<name>.<ext>` in the working directory, `$EPHPM_MIDDLEWARE_DIR`, then `/usr/local/lib/ephpm/middleware`), or an explicit path (any value containing a path separator or file extension). Must not be empty. |
 | `match` | string | (none) | Glob the request path must match for the mount to run. `*` matches any character sequence, including `/`. Unset = every PHP-bound request. |
-| `order` | u32 | **required** | Chain position; lower runs first. Equal orders keep declaration order. |
-| `config` | inline table | (none) | Arbitrary module configuration, serialised to JSON and passed to the module's `init`. |
+| `order` | u32 | **required** | Chain position; lower runs first. Equal orders keep declaration order. Orders sort **within a lane**, not across the two lanes — see the PHP lane below. |
+| `config` | inline table | (none) | Arbitrary module configuration, serialised to JSON and passed to the module's `init` (native lanes) or returned by `ephpm_middleware_config()` (PHP lane). |
+
+### PHP middleware — `library = "php:<path>"` (EXPERIMENTAL)
+
+Middleware written in plain PHP: no compiler, no shared library, no C. The
+script runs **inside the same PHP request** as the application script,
+immediately before it — the position PHP's own `auto_prepend_file` occupies,
+except there can be several, each with its own `match` glob and `config`.
+
+```toml
+[[middleware]]
+library = "php:middleware.php"   # relative to the request's document root
+match   = "/api/*"
+order   = 30
+config  = { realm = "admin" }
+```
+
+**This is a different chain position from the native lanes, not a third
+implementation of the same one.** Native modules run before the request body
+is read and outside PHP; a `php:` mount runs after the body has been read and
+after every native module. So a `php:` mount **cannot reject before the body
+transfer**, which is the main reason the native lane exists. Startup logs the
+resolved two-phase plan.
+
+| Aspect | Behaviour |
+|---|---|
+| Verdict: continue | Fall off the end of the script, or `return;` |
+| Verdict: respond | `http_response_code(403); echo '...'; exit;` — remaining mounts and the application script are skipped |
+| Verdict: rewrite | Assign to `$_SERVER` (e.g. `$_SERVER['HTTP_X_USER']`). As in the native lane, a `REQUEST_URI` change does not re-resolve the script in fpm mode. |
+| Response headers | `header()`, as in any PHP script |
+| Mount config | `json_decode(ephpm_middleware_config() ?? '{}', true)` — returns `null` outside a middleware file |
+| Path resolution | Relative to the **request's** document root. Absolute paths, `..`, `\`, and drive prefixes are rejected at startup. |
+| Multi-tenancy | In `sites_dir` mode each site supplies its own file, which runs in that site's PHP context (its `open_basedir`, OPcache vhost, database session, KV keyspace). A mount has no more reach than that tenant's own `index.php`. Sharing one operator-owned file across tenants is **not** supported — it would need a hole in every vhost's `open_basedir`. |
+| Failure | Fail-closed, always. A missing file, parse error, uncaught exception, or fatal returns 500 and the application script does **not** run. |
+| Worker mode | **Rejected at startup.** The worker script owns the request loop; use the framework's own middleware (PSR-15 / Octane). |
+| Limit | At most 16 `php:` mounts may run for one request (rejected at startup, not silently dropped). |
+| Metrics | `ephpm_middleware_invocations_total{module,action}` with `action` = `continue`, `respond`, or `error`. There is no `rewrite` action for this lane — PHP expresses a rewrite by assigning to `$_SERVER`, which is not observable without diffing the superglobal. |
+| Working directory | Unchanged (unlike `auto_prepend_file`). Use `__DIR__` for relative filesystem paths; relative `include`/`require` still resolves against the including file's own directory. |
+| Cost | ~12 µs for one mount, ~7 µs per additional mount, vs ~3.5 µs for a Rust builtin — measured over HTTP on a ~366 µs baseline request. See the guide. |
+
+Scripts execute at global scope, so their variables are visible to the
+application script — same as `auto_prepend_file`. Wrap logic in a function or
+`return` early. See the
+[Native Middleware guide](/guides/native-middleware/#the-php-lane-experimental)
+for the cost measurements.
 
 ## `[opcache]`
 
