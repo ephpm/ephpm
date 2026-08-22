@@ -330,7 +330,7 @@ Raw speed means nothing without features. Here's what each stack actually provid
 | Built-in KV/cache | No | No | Yes (single-node) | No | Yes (single-node) | **Yes (clustered)** |
 | Multi-node clustering | No | No | No | No | No | **Yes** |
 | Query digest/analysis | No | No | No | No | No | **Yes** |
-| Trace export | No | No | No | No | No | **Partial** — a per-request OTLP span with W3C `traceparent` propagation, behind the `otlp` cargo feature. Not auto-instrumentation |
+| Trace export | No | No | No | No | No | **Partial** — a per-request OTLP span with W3C `traceparent` propagation, compiled into release binaries. Not auto-instrumentation |
 | Superglobals work | Yes | Yes | **No** | Yes | **No** | **Yes** |
 | Zero code changes | Yes | Yes | **No** (PSR-7) | Yes | **No** (Swoole API) | **Yes** |
 | GC-free server layer | Yes (C) | Yes (C) | No (Go) | No (Go) | Yes (C) | **Yes (Rust)** |
