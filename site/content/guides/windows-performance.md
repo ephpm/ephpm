@@ -155,7 +155,7 @@ is worth far more than on Linux because each avoided `stat` costs more:
 |---|---|---|
 | `opcache.validate_timestamps` | `1` — re-`stat` cached scripts so edits appear instantly | `0` — trust the cache; **no per-include stat storm** |
 | `realpath_cache_size` | PHP default (`4M`) | `16M` |
-| `opcache.memory_consumption` | PHP default (128 MB) | auto-sized ~18% of memory budget, clamped 64–512 MB |
+| `opcache.memory_consumption` | PHP default (128 MB) | auto-sized ~18% of memory budget, clamped 64–**256** MB on Windows (see below) |
 | `opcache.max_accelerated_files` | PHP default | `20000` |
 | `zend.assertions` | `1` (active) | `-1` (compiled out) |
 
@@ -164,6 +164,23 @@ All of these are `[php]` knobs (`opcache_validate_timestamps`,
 `opcache_max_accelerated_files`, `zend_assertions`) if you need to pin a
 value explicitly in either mode — see the
 [config reference](/reference/config/).
+
+The OPcache shared segment is sized more conservatively on Windows than on
+Linux (256 MB rather than 512 MB) because PHP creates it as a pagefile-backed
+section whose full size is charged against the system commit limit at startup,
+instead of an anonymous mapping that commits lazily as the cache fills. The
+smaller ceiling costs nothing in practice — 256 MB holds far more compiled
+script than a large WordPress or Laravel install produces. An explicit
+`opcache_memory_consumption` is still honoured; a value above 256 MB just logs
+a startup warning, because a failed reservation aborts the PHP process rather
+than degrading to no-OPcache.
+
+ePHPm also gives each process a private OPcache namespace on Windows
+(`opcache.cache_id = ephpm-<pid>`). Without it, a second ePHPm process can
+reattach to a first one's shared segment and die at startup with `Opcode
+handlers are unusable due to ASLR` — see the
+[config reference](/reference/config/#resource-aware-autotuning) for the
+mechanism.
 
 With `validate_timestamps` off, code changes go live via `ephpm deploy` /
 `ephpm cache reset`, which invalidate OPcache through the RESP listener
