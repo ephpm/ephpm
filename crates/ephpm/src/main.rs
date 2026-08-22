@@ -902,6 +902,27 @@ fn exit_code_from(code: i32) -> ExitCode {
     if code == 0 { ExitCode::SUCCESS } else { ExitCode::from(u8::try_from(code).unwrap_or(1)) }
 }
 
+/// Say plainly, at startup, when the code bundle cannot reach the one function a
+/// real Composer autoloader probes with.
+///
+/// `file_exists` does not go through the stream wrapper, so without the
+/// internal-function handler override the bundle is measurably indistinguishable
+/// from `code_bundle = "off"` on a Composer application (1223 filesystem
+/// syscalls per request either way). A feature that silently does nothing is
+/// worse than one that says so.
+fn warn_if_file_exists_unfronted(fronted: &[&'static str]) {
+    if fronted.contains(&"file_exists") {
+        return;
+    }
+    tracing::warn!(
+        "[php] code_bundle is NOT fronting file_exists — the function a real Composer \
+         autoloader probes with. It does not go through the stream wrapper, so the bundle \
+         will accelerate almost nothing on a Composer application (measured: \
+         indistinguishable from code_bundle = \"off\"). Unset \
+         EPHPM_BUNDLE_FRONT_FILE_EXISTS=0 to re-enable it."
+    );
+}
+
 /// Initialize PHP and start the HTTP server.
 ///
 /// PHP must be initialized BEFORE the tokio runtime is created. PHP's
@@ -1412,14 +1433,7 @@ fn run_with_config(
                  filesystem and populate the cache; nothing is ever answered \"missing\" \
                  from the cache itself."
             );
-            if fronted.is_empty() {
-                tracing::warn!(
-                    "[php] code_bundle could not override file_exists/realpath. \
-                     file_exists is what a real Composer autoloader probes with, and it \
-                     does NOT go through the stream wrapper — without the override the \
-                     bundle accelerates almost nothing on a Composer app."
-                );
-            }
+            warn_if_file_exists_unfronted(&fronted);
             if validate_timestamps {
                 tracing::warn!(
                     "[php] code_bundle is ON but opcache.validate_timestamps is ON — the \
@@ -1523,6 +1537,7 @@ fn run_with_config(
                 .context("failed to arm code bundle hooks")?;
 
             let sealed_roots: Vec<String> = spec.sealed_roots().to_vec();
+            let fronted = ephpm_php::code_bundle::function_overrides();
             tracing::info!(
                 compression = algo.label(),
                 semantics = semantics.label(),
@@ -1530,9 +1545,11 @@ fn run_with_config(
                 sealed_roots = ?sealed_roots,
                 document_root = %docroot.display(),
                 validate_timestamps,
+                function_overrides = ?fronted,
                 "code bundle: scanning in the background; until it completes, code reads \
                  fall through to the filesystem exactly as with code_bundle = \"off\""
             );
+            warn_if_file_exists_unfronted(&fronted);
             if verify_negatives {
                 tracing::warn!(
                     "[php] code_bundle_verify_negatives is ON — every authoritative \

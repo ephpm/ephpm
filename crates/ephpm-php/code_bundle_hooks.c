@@ -556,6 +556,25 @@ static php_stream *ephpm_bundle_stream_opener(php_stream_wrapper *wrapper,
 static zif_handler g_orig_file_exists = NULL;
 static zif_handler g_orig_realpath = NULL;
 
+/* Kill switch for the handler overrides: EPHPM_BUNDLE_FRONT_FILE_EXISTS=0 turns
+ * them off, anything else (including unset) leaves them on.
+ *
+ * ON by default because without them the bundle does not accelerate a real
+ * Composer autoloader AT ALL — measured on real Laravel, one binary, this one
+ * variable: 1223 filesystem syscalls per request with them off versus 161
+ * (sealed) / 397 (lazy) with them on. Turning them off by default would ship a
+ * feature that measurably does nothing.
+ *
+ * An env var rather than a config field: it exists to bisect an interaction on
+ * a binary you did not build, not as a tuning knob. See the roadmap page for
+ * the separate, PRE-EXISTING Windows tracing-JIT crash that these overrides
+ * were initially — and wrongly — blamed for. */
+static int ephpm_bundle_fn_overrides_requested(void)
+{
+    const char *v = getenv("EPHPM_BUNDLE_FRONT_FILE_EXISTS");
+    return !(v && v[0] == '0');
+}
+
 /* Non-zero when the fast path is allowed to answer at all. */
 static int ephpm_bundle_fn_fastpath_ok(void)
 {
@@ -563,34 +582,42 @@ static int ephpm_bundle_fn_fastpath_ok(void)
         && (PG(open_basedir) == NULL || PG(open_basedir)[0] == '\0');
 }
 
-/* The single string argument, or NULL when this call is not one we handle. */
-static zend_string *ephpm_bundle_single_path_arg(zend_execute_data *execute_data)
-{
-    zval *arg;
-    if (ZEND_NUM_ARGS() != 1) {
-        return NULL;
-    }
-    arg = ZEND_CALL_ARG(execute_data, 1);
-    if (!arg || Z_TYPE_P(arg) != IS_STRING) {
-        return NULL;
-    }
-    return Z_STR_P(arg);
-}
+/* Read the single path argument.
+ *
+ * MUST go through ZEND_PARSE_PARAMETERS, not a hand-rolled
+ * ZEND_NUM_ARGS()/ZEND_CALL_ARG() peek. Reading the frame directly is only
+ * valid for a frame the VM built the ordinary way; once OPcache's tracing JIT
+ * compiles a hot trace containing this call it sets the frame up differently,
+ * and the raw peek reads garbage and dereferences it. Measured: with
+ * `opcache_jit = "disable"` a server survived 150 consecutive requests, and
+ * with the JIT on (the ePHPm serve default) the identical binary and config
+ * died with 0xC0000005 after 3 — precisely once the trace went hot.
+ *
+ * This is also exactly what OPcache's own accel_common_file_func() does for the
+ * same set of functions: parse first, then delegate with PASSTHRU. Re-parsing
+ * in the original handler is harmless (it only re-reads the frame).
+ */
+#define EPHPM_BUNDLE_PARSE_PATH(dest)                                          \
+    do {                                                                       \
+        ZEND_PARSE_PARAMETERS_START(1, 1)                                      \
+            Z_PARAM_PATH_STR(dest)                                             \
+        ZEND_PARSE_PARAMETERS_END();                                           \
+    } while (0)
 
 static void ZEND_FASTCALL ephpm_bundle_zif_file_exists(INTERNAL_FUNCTION_PARAMETERS)
 {
-    if (ephpm_bundle_fn_fastpath_ok()) {
-        zend_string *p = ephpm_bundle_single_path_arg(execute_data);
-        if (p) {
-            ephpm_bundle_stat_t st;
-            int rc = g_cb.stat(ZSTR_VAL(p), ZSTR_LEN(p), &st);
-            ephpm_bundle_trace_line("zif_file_exists", ZSTR_VAL(p), rc);
-            if (rc == EPHPM_BUNDLE_HIT) {
-                RETURN_TRUE;
-            }
-            if (rc == EPHPM_BUNDLE_ABSENT) {
-                RETURN_FALSE;
-            }
+    zend_string *p;
+    EPHPM_BUNDLE_PARSE_PATH(p);
+
+    if (p && ephpm_bundle_fn_fastpath_ok()) {
+        ephpm_bundle_stat_t st;
+        int rc = g_cb.stat(ZSTR_VAL(p), ZSTR_LEN(p), &st);
+        ephpm_bundle_trace_line("zif_file_exists", ZSTR_VAL(p), rc);
+        if (rc == EPHPM_BUNDLE_HIT) {
+            RETURN_TRUE;
+        }
+        if (rc == EPHPM_BUNDLE_ABSENT) {
+            RETURN_FALSE;
         }
     }
     g_orig_file_exists(INTERNAL_FUNCTION_PARAM_PASSTHRU);
@@ -609,19 +636,19 @@ static void ZEND_FASTCALL ephpm_bundle_zif_file_exists(INTERNAL_FUNCTION_PARAMET
 
 static void ZEND_FASTCALL ephpm_bundle_zif_realpath(INTERNAL_FUNCTION_PARAMETERS)
 {
-    if (ephpm_bundle_fn_fastpath_ok()) {
-        zend_string *p = ephpm_bundle_single_path_arg(execute_data);
-        if (p) {
-            const char *canon = NULL;
-            int rc = g_cb.resolve(ZSTR_VAL(p), ZSTR_LEN(p), &canon);
-            ephpm_bundle_trace_line("zif_realpath", ZSTR_VAL(p), rc);
-            if (rc == EPHPM_BUNDLE_HIT && canon) {
-                RETVAL_STRING(canon);
-                return;
-            }
-            if (rc == EPHPM_BUNDLE_ABSENT) {
-                RETURN_FALSE;
-            }
+    zend_string *p;
+    EPHPM_BUNDLE_PARSE_PATH(p);
+
+    if (p && ephpm_bundle_fn_fastpath_ok()) {
+        const char *canon = NULL;
+        int rc = g_cb.resolve(ZSTR_VAL(p), ZSTR_LEN(p), &canon);
+        ephpm_bundle_trace_line("zif_realpath", ZSTR_VAL(p), rc);
+        if (rc == EPHPM_BUNDLE_HIT && canon) {
+            RETVAL_STRING(canon);
+            return;
+        }
+        if (rc == EPHPM_BUNDLE_ABSENT) {
+            RETURN_FALSE;
         }
     }
     g_orig_realpath(INTERNAL_FUNCTION_PARAM_PASSTHRU);
@@ -675,11 +702,19 @@ void ephpm_bundle_install_hooks(const ephpm_bundle_callbacks_t *cb)
      * functions without patching PHP. Done last, so the handlers we save are
      * whatever OPcache (or any other extension) installed during MINIT, and our
      * miss path delegates to them. Single-threaded startup: no reader can
-     * observe a torn function pointer. */
-    ephpm_bundle_swap_handler("file_exists", sizeof("file_exists") - 1,
-                              ephpm_bundle_zif_file_exists, &g_orig_file_exists);
-    ephpm_bundle_swap_handler("realpath", sizeof("realpath") - 1,
-                              ephpm_bundle_zif_realpath, &g_orig_realpath);
+     * observe a torn function pointer.
+     *
+     * Behind a kill switch (default ON) purely so the interaction can be
+     * bisected in the field. They were initially blamed for a Windows
+     * 0xC0000005 under the tracing JIT; the control run disproved that — the
+     * same crash reproduces with `code_bundle = "off"`, i.e. with every line of
+     * this file inert. See the roadmap page. */
+    if (ephpm_bundle_fn_overrides_requested()) {
+        ephpm_bundle_swap_handler("file_exists", sizeof("file_exists") - 1,
+                                  ephpm_bundle_zif_file_exists, &g_orig_file_exists);
+        ephpm_bundle_swap_handler("realpath", sizeof("realpath") - 1,
+                                  ephpm_bundle_zif_realpath, &g_orig_realpath);
+    }
 
     g_cb_installed = 1;
 }

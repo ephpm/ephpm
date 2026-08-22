@@ -34,7 +34,20 @@
 > same struct.
 >
 > **This overturns the previous round's headline finding that 0 % of a real
-> Composer request was frontable.**
+> Composer request was frontable.** Isolated on a single binary with a single
+> env var, against real Laravel on Linux:
+>
+> | | file syscalls / request | p50 |
+> |---|---|---|
+> | `sealed`, override **off** | 1222.6 | 7.24 ms |
+> | `sealed`, override **on** | **160.6** | 6.38 ms |
+> | `lazy`, override **off** | 1222.6 | 7.42 ms |
+> | `lazy`, override **on** | **396.6** | 6.65 ms |
+>
+> The overrides are **on** whenever the bundle is on, with
+> `EPHPM_BUNDLE_FRONT_FILE_EXISTS=0` as a field kill switch. (They were briefly
+> suspected of causing a Windows crash; §7b has the control run that exonerated
+> them.)
 >
 > `is_readable`/`is_writable`/`is_executable` are deliberately **not** overridden:
 > their answer depends on the process's effective uid, the only correct way to
@@ -172,6 +185,66 @@
 > `validate_timestamps=0` never corrects it). Verified end-to-end. An in-process
 > write to a `.php` file invalidates just that entry, which the immutable index
 > could never do.
+>
+> ### 7b. A Windows tracing-JIT crash found along the way — **not** the bundle's
+>
+> Worth recording in full, because it was wrongly attributed twice before the
+> control run settled it, and because it is a live robustness problem for ePHPm
+> on Windows independent of this feature.
+>
+> **Symptom.** `0xC0000005` in `ephpm.exe` after **exactly 3 requests** of a real
+> Laravel application on Windows. Deterministic. ePHPm logs nothing — the only
+> evidence is Windows Event Log `Application` / Id 1000 (faulting module and
+> offset), matching the known "ePHPm logs NOTHING on a segfault" behaviour.
+>
+> **The control that settled it:** `code_bundle = "off"` — every line of the
+> bundle inert, no hooks armed, no handler overrides installed — **crashes 3/3
+> on the same binary**, while the pre-change binary (`902fec1`) runs the same
+> tree and config **3/3 clean at 150 requests each**.
+>
+> | binary | config | app | result |
+> |---|---|---|---|
+> | `902fec1` | `sealed`, JIT on | `-o` classmap | 3/3 alive, 150 req |
+> | this build | **`off`**, JIT on | `-o` classmap | **3/3 crashed after 3 req** |
+> | this build | `off`, JIT on | PSR-4 | alive, 150 req |
+> | this build | `sealed`/`scan`/`lazy`, **JIT off** | `-o` classmap | alive, 150 req |
+> | this build | any mode, JIT on/off, overrides on/off | Linux | alive, 300 req, answers identical |
+>
+> So it is **not** the code bundle, **not** the handler overrides, and **not**
+> Linux. It depends on (a) the JIT being on, (b) which application code goes hot,
+> and (c) *which binary* — i.e. it is a code-layout/codegen lottery, the same
+> family as the already-known per-binary Windows failure where some ePHPm builds
+> die at startup with PHP's *"Opcode handlers are unusable due to ASLR"*. A
+> release build can lose this lottery and crash-loop on a customer's application
+> with the default `opcache_jit = "tracing"`. **That deserves its own issue.**
+>
+> Every performance number in this document was taken from a run verified alive
+> at the end of its measured window, and the JIT-off cross-check agrees with the
+> JIT-on figures (`-o` classmap, JIT off: `sealed` 189 ops vs `off` 321).
+>
+> **Hypotheses eliminated on the way (all cost real time):**
+> * *Hand-rolled frame access.* The first cut of the overrides read the argument
+>   with `ZEND_NUM_ARGS()` + `ZEND_CALL_ARG(execute_data, 1)`. Switching to
+>   `ZEND_PARSE_PARAMETERS` — what OPcache's own `accel_common_file_func()` does
+>   — **did not change the crash**. The change was kept anyway: it is the correct
+>   way to write an internal-function handler.
+> * *Frameless internal calls* (PHP 8.4+ `ZEND_FRAMELESS_ICALL_*`). `file_exists`
+>   has no frameless variant in this build; only `class_exists` and
+>   `property_exists` do.
+> * *Calling convention.* `zif_handler` carries `ZEND_FASTCALL` (`__vectorcall`
+>   on MSVC); a mismatch is a hard compile error there, which is how the first
+>   version was caught by the Windows PHP-linked CI gate.
+>
+> **Method note worth keeping:** the first A/B (pre-change binary, n=1) pointed
+> the wrong way, and a config bisect *within* the feature (sealed/scan/lazy) kept
+> agreeing with the wrong conclusion because every one of those cells has the
+> bundle on. **The control that mattered was turning the feature off entirely on
+> the same binary.** When bisecting inside a feature keeps confirming your
+> hypothesis, test the feature-off case on the same binary before believing it.
+>
+> The overrides remain **on** by default when the bundle is on (without them the
+> bundle measurably does nothing), with `EPHPM_BUNDLE_FRONT_FILE_EXISTS=0` as a
+> field kill switch.
 >
 > ### 8. Go / no-go
 >

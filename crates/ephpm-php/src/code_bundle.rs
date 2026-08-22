@@ -573,9 +573,6 @@ impl Bundle {
                 if meta.is_dir() {
                     let real = canonical_root(&path);
                     let real_key = normalize_key(&real.to_string_lossy());
-                    if !visited.insert(real_key.clone()) {
-                        continue; // already walked (symlink loop or alias)
-                    }
                     let spelled_key = normalize_key(&path.to_string_lossy());
                     if spelled_key != real_key {
                         // A symlinked directory. We index its contents under the
@@ -586,9 +583,18 @@ impl Bundle {
                         // through — correct, but it means the index cannot claim
                         // to have enumerated this subtree exhaustively, so a
                         // sealed root containing one is refused below.
+                        //
+                        // Recorded BEFORE the `visited` check: if the walk reached
+                        // the link's target first (directory order is arbitrary),
+                        // the cycle guard would `continue` and the taint would
+                        // never be recorded — making sealed-root arming depend on
+                        // `read_dir` ordering.
                         tainted.push(spelled_key.clone());
                     }
                     dirs.insert(spelled_key);
+                    if !visited.insert(real_key.clone()) {
+                        continue; // already walked (symlink loop or alias)
+                    }
                     dirs.insert(real_key);
                     stack.push(real);
                     continue;
