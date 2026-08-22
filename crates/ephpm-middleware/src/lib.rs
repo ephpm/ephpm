@@ -146,6 +146,24 @@ impl Request<'_> {
         self.str_of(unsafe { (self.host.request_vhost_id)(self.raw) })
     }
 
+    /// Whether this request reached ePHPm over an encrypted channel — the
+    /// same determination PHP sees as `$_SERVER['HTTPS']`.
+    ///
+    /// This is **not** a raw "was this socket TLS" flag. When the peer is
+    /// inside `[server.security] trusted_proxies`, an `X-Forwarded-Proto`
+    /// header decides; when it is not, that header is ignored. So `false`
+    /// does not prove the client's connection was cleartext: ePHPm behind a
+    /// TLS-terminating proxy with no `trusted_proxies` configured reports
+    /// `false` for traffic that reached the proxy over HTTPS. Modules that
+    /// refuse to operate without transport security must say so in their own
+    /// docs and offer a way to relax it.
+    #[must_use]
+    pub fn is_https(&self) -> bool {
+        // SAFETY: contract of `from_raw`.
+        let raw = unsafe { (self.host.request_is_https)(self.raw) };
+        raw != 0
+    }
+
     /// Host services (KV store, logging) scoped to the table this request
     /// was invoked with. Equivalent to `Host::new(__ephpm_mw_host())` but
     /// also works in unit tests that build a [`Request`] by hand.

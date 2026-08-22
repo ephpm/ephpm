@@ -120,14 +120,15 @@ mod tests {
     #![allow(unsafe_code)] // tests build the FFI Request view by hand.
 
     use ephpm_middleware::abi::{ACTION_CONTINUE, ACTION_RESPOND};
-    use ephpm_middleware::host::{RequestCtx, host_table, set_kv_store};
+    use ephpm_middleware::host::{RequestCtx, host_table};
 
     use super::*;
 
-    /// Wire a real in-memory Store into the host table (first call wins;
-    /// all tests in this binary share it, so each uses a unique vhost).
+    /// Wire the crate-shared in-memory Store into the host table. All tests in
+    /// this binary share one store (see [`crate::test_kv`]), so each uses a
+    /// unique vhost to keep its counters apart.
     fn setup_kv() {
-        set_kv_store(&ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default()));
+        let _ = crate::test_kv::wire();
     }
 
     fn invoke(mw: &RateLimit, vhost: &str, ip: &str, headers: &[(String, String)]) -> Response {

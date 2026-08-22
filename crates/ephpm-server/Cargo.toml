@@ -14,7 +14,7 @@ ephpm-config.workspace = true
 ephpm-db.workspace = true
 ephpm-kv.workspace = true
 ephpm-middleware = { workspace = true, features = ["host"] }
-# Builtin middleware registry: the four in-tree module implementations
+# Builtin middleware registry: the five in-tree module implementations
 # linked in as a plain rlib (no C ABI exports), so `library = "jwt"` works
 # in every binary — including custom fully static builds, where dlopen
 # does not exist.

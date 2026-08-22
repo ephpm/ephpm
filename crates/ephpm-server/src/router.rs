@@ -2400,7 +2400,11 @@ impl Router {
                 &remote_addr.ip().to_string(),
                 &server_name,
                 &headers,
-            );
+            )
+            // The router's resolved HTTPS determination, not the raw socket
+            // state: `is_https` already went through `resolve_proxy_info`, so
+            // a module sees exactly what PHP sees in `$_SERVER['HTTPS']`.
+            .with_https(is_https);
             match chain.evaluate(&ctx, &path) {
                 crate::middleware::ChainVerdict::Respond { status, body, headers } => {
                     return middleware_response(status, body, &headers);

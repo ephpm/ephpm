@@ -177,6 +177,24 @@ pub struct EphpmHostV1 {
         ttl_secs: i64,
         out: *mut i64,
     ) -> c_int,
+
+    /// Whether this request reached ePHPm over an encrypted channel: `1` for
+    /// yes, `0` for no. This is the SAME determination PHP sees as
+    /// `$_SERVER['HTTPS']`, not a raw "was this socket TLS" flag — when the
+    /// peer is inside `[server.security] trusted_proxies`, an
+    /// `X-Forwarded-Proto` header overrides the local socket state, and when
+    /// it is not, the header is ignored entirely.
+    ///
+    /// The practical consequence for a module: **`0` does not prove the
+    /// client's connection was cleartext.** ePHPm behind a TLS-terminating
+    /// proxy with no `trusted_proxies` configured reports `0` for traffic that
+    /// reached the proxy over HTTPS. A module that refuses to operate on `0`
+    /// must document that its strict mode requires `trusted_proxies`.
+    ///
+    /// Appended after [`EphpmHostV1::kv_incr_ttl`]: older middleware built
+    /// against a table without this field never reads past the offsets it
+    /// knows, so growing the table at the end is ABI-compatible.
+    pub request_is_https: unsafe extern "C" fn(*const EphpmRequest) -> c_int,
 }
 
 /// Symbol names the loader looks up.

@@ -3,7 +3,7 @@
 //! resolutions, the ABI major-version handshake, and `init`/`invoke`/
 //! `shutdown` across the C boundary.
 //!
-//! Why this file exists: the four in-tree modules are well covered, but they
+//! Why this file exists: the five in-tree modules are well covered, but they
 //! all take the *static registry* path (`Backend::Builtin`), which never
 //! touches dlopen. The dynamic lane — the one the docs promise "works out of
 //! the box with the stock release binaries on every platform" — had no

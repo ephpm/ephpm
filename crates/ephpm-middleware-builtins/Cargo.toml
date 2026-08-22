@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The in-tree ePHPm middleware implementations (jwt, cors, ratelimit, security-headers) as plain Rust types — compiled into every ePHPm binary via the static registry"
+description = "The in-tree ePHPm middleware implementations (jwt, cors, ratelimit, security-headers, basic-auth) as plain Rust types — compiled into every ePHPm binary via the static registry"
 
 # Deliberately rlib-only and free of C ABI exports: `ephpm-server` links this
 # crate into the (possibly fully static) binary. The loadable cdylib shells
@@ -17,9 +17,19 @@ description = "The in-tree ePHPm middleware implementations (jwt, cors, ratelimi
 ephpm-middleware.workspace = true
 serde_json.workspace = true
 # jwt: HS256 via hmac/sha2 — no heavyweight JWT dependency.
+# basic-auth: the same hmac/sha2 pair keys its verification cache.
 hmac.workspace = true
 sha2.workspace = true
 base64ct.workspace = true
+# basic-auth: PBKDF2-HMAC-SHA256 password hashing. aws-lc-rs is ALREADY in the
+# dependency graph (rustls-acme's crypto provider, and ephpm-db's RSA-OAEP), so
+# this adds nothing to Cargo.lock and nothing for cargo-deny to weigh — which
+# is why it won over adding argon2/bcrypt. See crate::password_hash.
+aws-lc-rs.workspace = true
+# basic-auth: random salts, the verification-cache key, and the decoy credential.
+getrandom.workspace = true
+# basic-auth: the bounded verification cache.
+dashmap.workspace = true
 
 [dev-dependencies]
 ephpm-middleware = { workspace = true, features = ["host"] }

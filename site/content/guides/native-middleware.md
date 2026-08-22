@@ -16,10 +16,10 @@ counter is a single `kv_incr`.
 
 There are **two ways a module runs**:
 
-- **Built-in (static registry).** Four modules — `jwt`, `cors`,
-  `ratelimit`, `security-headers` — are compiled into **every** ePHPm
-  binary. `library = "jwt"` just works: no shared library on disk, no
-  `dlopen`, no special build.
+- **Built-in (static registry).** Five modules — `jwt`, `cors`,
+  `ratelimit`, `security-headers`, `basic-auth` — are compiled into
+  **every** ePHPm binary. `library = "jwt"` just works: no shared library on
+  disk, no `dlopen`, no special build.
 - **Dynamic (shared library).** Custom out-of-tree modules are `.so` /
   `.dylib` / `.dll` files speaking a small, versioned C ABI, loaded once at
   startup via `dlopen` (`LoadLibrary` on Windows). This works out of the
@@ -185,7 +185,7 @@ chain sees everything — static, dynamic, and error paths alike.
 
 ## The built-in modules
 
-All four are compiled into every ePHPm binary and run in-process — the
+All five are compiled into every ePHPm binary and run in-process — the
 sections below apply identically whether you mount them by short name
 (built-in) or dlopen their cdylib builds on a dynamic binary.
 
@@ -276,6 +276,201 @@ Note this is a *fixed-window* limiter (a full window's allowance can be
 consumed instantly at a window boundary), and it is distinct from the
 built-in connection-level limiter in `[server.limits]` — the two are
 independent.
+
+### `basic-auth`
+
+HTTP Basic authentication (RFC 7617) in front of PHP. Gates a **whole site**
+rather than a route: an unauthenticated request is answered with `401` from
+native code and never reaches the interpreter.
+
+| key | default | meaning |
+|-----|---------|---------|
+| `users` (table) | `{}` | static `username = "<hash>"` table, applied to every vhost |
+| `kv_prefix` (string) | unset | look up `<kv_prefix><vhost>` in the KV store for a per-site credential table |
+| `realm` (string) | `"Restricted"` | `WWW-Authenticate` realm. Must not be empty or contain `"`, `\` or control characters |
+| `require_https` (string) | `"warn"` | `"enforce"` / `"warn"` / `"off"` — what a non-HTTPS request gets |
+| `missing_credentials` (string) | `"deny"` | `"deny"` / `"allow"` — what a vhost with no credential table gets |
+| `forward_user_header` (string) | unset | on success, set this request header to the authenticated username |
+| `cache_ttl_secs` (integer) | `300` | how long a successful verification is remembered; `0` disables the cache |
+| `cache_max_entries` (integer) | `4096` | hard ceiling on cached verifications |
+
+At least one of `users` or `kv_prefix` is **required** — a mount with no
+credential source can never authenticate anyone, so it fails startup rather
+than locking the site out silently.
+
+#### Passwords are stored hashed
+
+Both sources hold **PBKDF2-HMAC-SHA256** hashes, never plaintext. Mint one
+with `ephpm hash-password`, which reads the password from stdin so it never
+lands in shell history:
+
+```bash
+$ echo -n 'preview-pw' | ephpm hash-password
+$pbkdf2-sha256$i=100000$Xy9k…$Qm5s…
+```
+
+```toml
+[[middleware]]
+library = "basic-auth"
+order   = 20
+config  = { realm = "Staging", users = { dev = "$pbkdf2-sha256$i=100000$Xy9k…$Qm5s…" } }
+```
+
+A value that is not a valid hash is a **startup error**. There is no
+plaintext fallback, so a mistyped credential fails loudly instead of
+silently weakening the gate.
+
+Verification uses `aws-lc-rs`'s constant-time `pbkdf2::verify`. An unknown
+username still performs a full derivation against a decoy, so response
+latency does not reveal which usernames exist.
+
+#### Per-site credentials for preview hosting
+
+`[[middleware]]` mounts match on **path glob only** — there is no host
+matcher — so per-site credentials come from a single global mount that
+resolves them at request time. Set `kv_prefix` and write one KV key per
+site:
+
+```toml
+[[middleware]]
+library = "basic-auth"
+order   = 20
+config  = { kv_prefix = "basicauth:", realm = "Preview" }
+```
+
+```bash
+# Lock preview-42.example.com; the value is a JSON credential table.
+$ echo -n 'preview-pw' | ephpm hash-password --user dev --json
+{"dev":"$pbkdf2-sha256$i=100000$Xy9k…$Qm5s…"}
+
+$ ephpm kv set 'basicauth:preview-42.example.com' '{"dev":"$pbkdf2-sha256$…"}'
+```
+
+The key is `<kv_prefix>` plus the request's vhost identity (its server name),
+**normalised**: lowercased, with the port and any trailing FQDN-root dot
+stripped. `Host` is case-insensitive and client-controlled, so
+`Host: Preview-42.Example.com` resolves to the same credential as
+`preview-42.example.com`.
+
+Creating and deleting a preview is two KV writes — no `ephpm.toml` edit, no
+restart. **Deleting the key revokes access on the very next request**: the
+verification cache commits to the stored hash, so rotating or removing a
+credential invalidates its cache entry immediately. `cache_ttl_secs` bounds
+memory, not revocation.
+
+When both sources are configured, a vhost's KV entry **replaces** the static
+`users` table — it does not merge with it. A KV document that fails to parse
+is logged and treated as no credentials at all; it never falls back to the
+static table, which would silently open the site to whoever holds the global
+credential.
+
+The middleware's KV callbacks read the **process-global** store (issue
+#376), not the per-vhost store PHP's `ephpm_kv_*` sees. For an operator
+credential store that is the property you want: in `sites_dir` mode a tenant
+cannot read or rewrite its own credential from PHP.
+
+> **Seeding the credential store in `sites_dir` mode.** With
+> `[server] sites_dir` set and `[kv.redis_compat] enabled = true`, ePHPm
+> requires `[kv] secret` and the RESP listener then scopes **every**
+> authenticated connection to a single site's store (`AUTH <host>
+> <derived>`). There is currently no RESP path to the process-global store
+> that this middleware reads, so `ephpm kv set` cannot seed it in
+> multi-tenant mode — see issue #384. Until that is addressed, KV-sourced
+> credentials are usable in single-site mode; multi-tenant deployments must
+> use the static `users` table.
+
+#### Marking a managed site public
+
+Write the exact value `public` (not JSON) instead of a credential table:
+
+```bash
+$ ephpm kv set 'basicauth:open-preview.example.com' public
+OK
+```
+
+That lets one mount front a fleet mixing public and private previews while
+keeping the fail-closed `missing_credentials = "deny"` default. The marker is
+deliberately an exact literal rather than "an empty credential table": a
+control plane that writes an empty or truncated document through a *bug* must
+fail closed, and it does — `{}`, `""`, `PUBLIC` and `publicX` are all
+rejected, not read as public.
+
+#### Unconfigured sites: `missing_credentials`
+
+`"deny"` (the default) answers `403` for a vhost with no credential table —
+an unconfigured site is not an open site. It deliberately carries **no**
+`WWW-Authenticate` header, because no credential could ever satisfy it.
+
+`"allow"` passes such a vhost through to PHP unauthenticated.
+
+> **`"allow"` trusts the `Host` header.** The vhost identity comes from the
+> request's `Host`, which the client controls. Under `"allow"`, a request
+> carrying a `Host` that has no credential entry is served **unauthenticated** —
+> so on a deployment where an unrecognised `Host` still reaches content (any
+> single-site deployment, and `sites_dir` deployments where an unmatched host
+> falls back to `[server] document_root`), `curl -H 'Host: anything.invalid'`
+> bypasses the gate entirely.
+>
+> Prefer the `public` marker above, which keeps the default `"deny"`. If you
+> do need `"allow"`, constrain the accepted hosts with
+> [`[server.request] trusted_hosts`](/reference/config/) so an unrecognised
+> `Host` is rejected with `421` before the chain runs.
+
+#### `require_https`, and why it defaults to `warn`
+
+Basic sends base64, which is not encryption, so the honest thing would be to
+refuse on plain HTTP. The problem is that **ePHPm cannot always tell**.
+`require_https` is evaluated against the same determination PHP sees in
+`$_SERVER['HTTPS']`, which honours `X-Forwarded-Proto` **only** from a peer
+inside [`[server.security] trusted_proxies`](/reference/config/). ePHPm
+behind a TLS-terminating proxy with no `trusted_proxies` configured
+therefore reports "not HTTPS" for traffic that reached the proxy over
+HTTPS — a very common and perfectly secure deployment.
+
+Defaulting to `"enforce"` would `403` those deployments, and the natural
+operator response would be to switch the check off entirely. So:
+
+| value | behaviour on a request that is not HTTPS |
+|-------|------------------------------------------|
+| `"warn"` (default) | issue the challenge, log a throttled warning naming the vhost (at most one line per minute) |
+| `"enforce"` | `403` with **no** `WWW-Authenticate` header — refuse to invite credentials onto a channel we believe is cleartext |
+| `"off"` | issue the challenge, log nothing |
+
+Once TLS terminates at ePHPm, or the terminating proxy is listed in
+`trusted_proxies`, set `require_https = "enforce"`.
+
+#### Brute force: compose with `ratelimit`
+
+A failed password always pays the full KDF — successes are cached, failures
+never are — so guessing is expensive by construction. Bound it properly by
+mounting `ratelimit` at a **lower `order`** so it runs first:
+
+```toml
+[[middleware]]
+library = "ratelimit"
+order   = 10
+config  = { per_ip_rps = 2, burst = 10 }
+
+[[middleware]]
+library = "basic-auth"
+order   = 20
+config  = { kv_prefix = "basicauth:", realm = "Preview" }
+```
+
+An over-budget client gets `429` before `basic-auth` spends any CPU on it.
+Note `ratelimit`'s own per-node caveat above.
+
+#### Forwarding the authenticated user
+
+`forward_user_header = "X-Auth-User"` makes a successful request REWRITE
+with that request header set to the verified username, readable from PHP as
+`$_SERVER['HTTP_X_AUTH_USER']`. Header overrides **replace** any same-named
+header the client sent, so a forged value cannot survive.
+
+> ePHPm's SAPI does not currently populate `PHP_AUTH_USER` / `PHP_AUTH_PW` /
+> `AUTH_TYPE` (issue #386). `forward_user_header` is the supported way to get
+> the authenticated identity into PHP today. The raw header is still visible
+> as `$_SERVER['HTTP_AUTHORIZATION']`.
 
 ## The dynamic lane
 
@@ -376,9 +571,13 @@ cargo build --release -p my-auth
 
 The artifact lands at `target/release/lib<crate_name>.so`; a bare
 `library = "<crate_name>"` mount finds the `lib<name>.so` form through
-the search path. The four in-tree modules build exactly the same way
+the search path. The five in-tree modules build exactly the same way
 (`-p ephpm-middleware-jwt -p ephpm-middleware-cors
--p ephpm-middleware-ratelimit -p ephpm-middleware-security-headers`).
+-p ephpm-middleware-ratelimit -p ephpm-middleware-security-headers
+-p ephpm-middleware-basicauth`). The `basicauth` cdylib is noticeably
+larger than the others — it statically links `aws-lc-rs` for PBKDF2, which
+the ePHPm binary already carries and shares. Prefer the built-in lane
+unless you specifically need a loadable module.
 
 Build on a distro whose glibc is not newer than the deployment target's
 (the usual glibc forward-compatibility rule — a module built on Debian 12

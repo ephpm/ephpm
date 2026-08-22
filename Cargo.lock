@@ -1249,6 +1249,7 @@ dependencies = [
  "ephpm-config",
  "ephpm-db",
  "ephpm-kv",
+ "ephpm-middleware-builtins",
  "ephpm-php",
  "ephpm-server",
  "libc",
@@ -1358,12 +1359,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ephpm-middleware-basicauth"
+version = "0.1.0"
+dependencies = [
+ "ephpm-middleware",
+ "ephpm-middleware-builtins",
+]
+
+[[package]]
 name = "ephpm-middleware-builtins"
 version = "0.1.0"
 dependencies = [
+ "aws-lc-rs",
  "base64ct",
+ "dashmap",
  "ephpm-kv",
  "ephpm-middleware",
+ "getrandom 0.3.4",
  "hmac 0.12.1",
  "serde_json",
  "sha2 0.10.9",

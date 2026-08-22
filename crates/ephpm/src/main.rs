@@ -127,6 +127,30 @@ enum Commands {
         subcommand: KvSubcommand,
     },
 
+    /// Hash a password for the `basic-auth` middleware
+    ///
+    /// Prints a PBKDF2-HMAC-SHA256 hash in the form the middleware's `users`
+    /// table and its KV credential documents expect. The password is read
+    /// from stdin so it never reaches your shell history or the process list.
+    ///
+    ///   echo -n 'my-password' | ephpm hash-password
+    HashPassword {
+        /// PBKDF2 iteration count. Higher is slower to verify and slower to
+        /// crack; clamped into the range the middleware will accept.
+        #[arg(long, default_value_t = ephpm_middleware_builtins::password_hash::DEFAULT_ITERATIONS)]
+        iterations: u32,
+
+        /// Print `<user>:<hash>` instead of the bare hash.
+        #[arg(long)]
+        user: Option<String>,
+
+        /// Print a ready-to-store JSON credential document
+        /// (`{"<user>":"<hash>"}`) for the middleware's `kv_prefix` lookup.
+        /// Requires --user.
+        #[arg(long, requires = "user")]
+        json: bool,
+    },
+
     /// Install ephpm as a system service and start it
     Install,
 
@@ -304,11 +328,52 @@ fn main() -> ExitCode {
     }
 }
 
+/// `ephpm hash-password` — mint a credential for the `basic-auth` middleware.
+///
+/// The password comes from **stdin**, not an argument: an argument would land
+/// in shell history and, on Unix, in every other process's view of the
+/// command line for as long as this runs. A single trailing newline is
+/// stripped so `echo 'pw' | ephpm hash-password` and
+/// `echo -n 'pw' | ephpm hash-password` agree; any other whitespace is part
+/// of the password.
+fn run_hash_password(iterations: u32, user: Option<&str>, json: bool) -> anyhow::Result<ExitCode> {
+    use std::io::Read as _;
+
+    let mut password = String::new();
+    std::io::stdin()
+        .read_to_string(&mut password)
+        .context("failed to read the password from stdin")?;
+    // Exactly one trailing newline (and its CR on Windows), nothing more.
+    let password = password.strip_suffix('\n').unwrap_or(&password);
+    let password = password.strip_suffix('\r').unwrap_or(password);
+    anyhow::ensure!(
+        !password.is_empty(),
+        "no password on stdin — pipe one in, e.g. `echo -n 'my-password' | ephpm hash-password`"
+    );
+
+    let hash =
+        ephpm_middleware_builtins::password_hash::PasswordHash::generate(password, iterations)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    match (user, json) {
+        (Some(user), true) => {
+            let doc = serde_json::json!({ user: hash.to_phc_string() });
+            println!("{doc}");
+        }
+        (Some(user), false) => println!("{user}:{hash}"),
+        (None, _) => println!("{hash}"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
 
     match cli.command {
         Some(Commands::Php { args }) => run_php(&php_cli_args(&args)),
+        Some(Commands::HashPassword { iterations, user, json }) => {
+            run_hash_password(iterations, user.as_deref(), json)
+        }
         Some(Commands::Kv { host, port, password, user, subcommand }) => {
             let auth = KvAuth::resolve(user, password)?;
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
@@ -2042,6 +2107,45 @@ mod disable_functions_tests {
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+
+    #[test]
+    fn parses_hash_password_defaults() {
+        let cli = Cli::try_parse_from(["ephpm", "hash-password"]).unwrap();
+        match cli.command {
+            Some(Commands::HashPassword { iterations, user, json }) => {
+                assert_eq!(
+                    iterations,
+                    ephpm_middleware_builtins::password_hash::DEFAULT_ITERATIONS
+                );
+                assert_eq!(user, None);
+                assert!(!json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_hash_password_flags() {
+        let args = ["ephpm", "hash-password", "--iterations", "50000", "--user", "dev", "--json"];
+        let cli = Cli::try_parse_from(args).unwrap();
+        match cli.command {
+            Some(Commands::HashPassword { iterations, user, json }) => {
+                assert_eq!(iterations, 50_000);
+                assert_eq!(user.as_deref(), Some("dev"));
+                assert!(json);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hash_password_json_requires_a_user() {
+        // `--json` alone would print `{"":"<hash>"}`, which is not a usable
+        // credential document — clap rejects it instead.
+        let err = Cli::try_parse_from(["ephpm", "hash-password", "--json"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--user"), "expected a requires error, got: {msg}");
+    }
 
     #[test]
     fn parses_install_subcommand() {

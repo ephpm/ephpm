@@ -174,6 +174,39 @@ $ ephpm kv del counter temp
 
 ---
 
+## `ephpm hash-password`
+
+Mint a credential for the [`basic-auth` middleware](/guides/native-middleware/#basic-auth). Prints a PBKDF2-HMAC-SHA256 hash in the form the middleware's `users` table and its KV credential documents expect.
+
+The password is read from **stdin**, never from an argument — an argument would land in shell history and, on Unix, in every other process's view of the command line. Exactly one trailing newline is stripped; any other whitespace is part of the password.
+
+```bash
+ephpm hash-password [--iterations <N>] [--user <NAME>] [--json]
+```
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--iterations <N>` | `100000` | PBKDF2 iteration count. Clamped into the range the middleware accepts (1 000–5 000 000) |
+| `--user <NAME>` | — | Print `<user>:<hash>` instead of the bare hash |
+| `--json` | off | Print a ready-to-store JSON credential document `{"<user>":"<hash>"}`. Requires `--user` |
+
+```bash
+# Bare hash — paste into a `users` table in ephpm.toml
+$ echo -n 'preview-pw' | ephpm hash-password
+$pbkdf2-sha256$i=100000$Xy9k…$Qm5s…
+
+# JSON document — write straight into the KV store for a per-site credential
+$ echo -n 'preview-pw' | ephpm hash-password --user dev --json
+{"dev":"$pbkdf2-sha256$i=100000$Xy9k…$Qm5s…"}
+
+$ ephpm kv set 'basicauth:preview-42.example.com' '{"dev":"$pbkdf2-sha256$…"}'
+OK
+```
+
+The iteration count is stored **inside** the hash, so raising `--iterations` for new credentials does not invalidate existing ones and needs no config change.
+
+---
+
 ## Service Lifecycle
 
 Install and manage ePHPm as a system service — systemd on Linux, launchd on macOS, SCM on Windows.
@@ -236,6 +269,7 @@ ephpm serve          Start the production server (--config/--listen/--document-r
 ephpm dev            Development server (--port/--document-root/--sites)
 ephpm php            Run the embedded PHP CLI (pure passthrough)
 ephpm kv             KV store client (keys/get/set/del/incr/ttl/ping)
+ephpm hash-password  Hash a password for the basic-auth middleware (reads stdin)
 
 ephpm install        Install + start the system service
 ephpm uninstall      Remove the system service (--keep-data)

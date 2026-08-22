@@ -19,6 +19,10 @@ pub struct RequestCtx {
     vhost: CString,
     /// Lower-cased name → value (values pre-joined per HTTP list semantics).
     headers: Vec<(CString, CString)>,
+    /// The router's resolved HTTPS determination — the same value PHP gets as
+    /// `$_SERVER['HTTPS']`, i.e. already through trusted-proxy resolution.
+    /// Defaults to `false`; set with [`RequestCtx::with_https`].
+    https: bool,
 }
 
 impl RequestCtx {
@@ -43,7 +47,22 @@ impl RequestCtx {
             remote_ip: c(remote_ip),
             vhost: c(vhost),
             headers: headers.iter().map(|(n, v)| (c(&n.to_ascii_lowercase()), c(v))).collect(),
+            https: false,
         }
+    }
+
+    /// Record the router's resolved HTTPS determination for this request —
+    /// the value PHP would see as `$_SERVER['HTTPS']`, i.e. after
+    /// trusted-proxy `X-Forwarded-Proto` resolution.
+    ///
+    /// A builder method rather than a `new` parameter so existing callers
+    /// (and out-of-tree code constructing a context in tests) keep compiling;
+    /// the default is `false`, which is the conservative answer for a context
+    /// built without transport information.
+    #[must_use]
+    pub fn with_https(mut self, https: bool) -> Self {
+        self.https = https;
+        self
     }
 
     /// The opaque pointer to pass through the ABI. Valid while `self` lives.
@@ -79,6 +98,11 @@ unsafe extern "C" fn request_remote_ip(req: *const EphpmRequest) -> *const c_cha
 unsafe extern "C" fn request_vhost_id(req: *const EphpmRequest) -> *const c_char {
     // SAFETY: ABI contract.
     unsafe { ctx(req) }.map_or(std::ptr::null(), |c| c.vhost.as_ptr())
+}
+unsafe extern "C" fn request_is_https(req: *const EphpmRequest) -> c_int {
+    // SAFETY: ABI contract. A null/unrecognised context reports "not HTTPS",
+    // matching the conservative default a bare RequestCtx carries.
+    c_int::from(unsafe { ctx(req) }.is_some_and(|c| c.https))
 }
 unsafe extern "C" fn request_header(
     req: *const EphpmRequest,
@@ -286,6 +310,7 @@ static HOST_TABLE: EphpmHostV1 = EphpmHostV1 {
     kv_free,
     log: host_log,
     kv_incr_ttl,
+    request_is_https,
 };
 
 /// Wire the embedded KV store into the host table. Call once at startup,

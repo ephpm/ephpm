@@ -25,6 +25,10 @@ clap.workspace = true
 ephpm-config.workspace = true
 ephpm-db.workspace = true
 ephpm-kv.workspace = true
+# `ephpm hash-password` mints credentials for the basic-auth middleware
+# through the same PBKDF2 code the middleware verifies with — a second
+# implementation here would be a way for the two to silently disagree.
+ephpm-middleware-builtins.workspace = true
 ephpm-php.workspace = true
 ephpm-server.workspace = true
 # mimalloc as the global allocator for the ephpm binary. Non-Windows only.
@@ -50,6 +54,7 @@ ephpm-server.workspace = true
 # `run_with_config`), because a predictable path under a shared /tmp is
 # attacker-plantable.
 tempfile = "3"
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

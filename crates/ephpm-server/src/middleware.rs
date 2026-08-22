@@ -7,7 +7,7 @@
 //!
 //! Each mount resolves through two lanes, in order:
 //!
-//! 1. **Builtin registry** ([`builtin`]) — the four in-tree modules compiled
+//! 1. **Builtin registry** ([`builtin`]) — the five in-tree modules compiled
 //!    into this binary and invoked in-process (no FFI, no dlopen). Works in
 //!    every binary, including custom fully static builds where `dlopen` does
 //!    not exist.
@@ -91,7 +91,8 @@ pub type BuiltinBuilder = fn(&serde_json::Value) -> Result<BuiltinModule, String
 /// names fall through to the shared-library search path. Accepted spellings
 /// per module: the short name and the crate name, with `-` and `_`
 /// interchangeable — e.g. `"jwt"`, `"ephpm-middleware-jwt"`,
-/// `"ephpm_middleware_jwt"`. (`"ratelimit"` also answers to `"rate-limit"`.)
+/// `"ephpm_middleware_jwt"`. (`"ratelimit"` also answers to `"rate-limit"`,
+/// and `"basic-auth"` to `"basicauth"`.)
 #[must_use]
 pub fn builtin(name: &str) -> Option<BuiltinBuilder> {
     let canonical = name.replace('_', "-");
@@ -107,6 +108,9 @@ pub fn builtin(name: &str) -> Option<BuiltinBuilder> {
         }
         "security-headers" | "ephpm-middleware-security-headers" => {
             BuiltinModule::init::<ephpm_middleware_builtins::security_headers::SecurityHeaders>
+        }
+        "basic-auth" | "basicauth" | "ephpm-middleware-basicauth" => {
+            BuiltinModule::init::<ephpm_middleware_builtins::basicauth::BasicAuth>
         }
         _ => return None,
     })
@@ -714,6 +718,11 @@ mod tests {
             "ephpm_middleware_ratelimit",
             "ephpm-middleware-security-headers",
             "ephpm_middleware_security_headers",
+            "basic-auth",
+            "basic_auth",
+            "basicauth",
+            "ephpm-middleware-basicauth",
+            "ephpm_middleware_basicauth",
         ] {
             assert!(builtin(name).is_some(), "\"{name}\" should resolve as builtin");
         }
@@ -855,6 +864,90 @@ mod tests {
             .parse()
             .expect("numeric Retry-After");
         assert!((1..=10).contains(&retry), "retry_after = {retry}");
+    }
+
+    /// `basic-auth` through the real chain: 401 with the RFC 7617 challenge
+    /// when nothing is presented, 200-path CONTINUE when the credential is
+    /// right, and — the composition the guide documents — `ratelimit` at a
+    /// lower `order` turning a client away with 429 *before* `basic-auth`
+    /// spends a KDF on it.
+    #[test]
+    fn builtin_basic_auth_chains_with_ratelimit_by_order() {
+        wire_kv();
+        // `MIN_ITERATIONS` keeps the test fast; the shipped default is 100k.
+        let hash = ephpm_middleware_builtins::password_hash::PasswordHash::generate(
+            "preview-pw",
+            ephpm_middleware_builtins::password_hash::MIN_ITERATIONS,
+        )
+        .expect("hash")
+        .to_phc_string();
+
+        let mounts = vec![
+            builtin_mount(
+                "ratelimit",
+                None,
+                10,
+                serde_json::json!({ "per_ip_rps": 1, "burst": 0 }),
+            ),
+            builtin_mount(
+                "basic-auth",
+                None,
+                20,
+                serde_json::json!({ "users": { "dev": hash }, "realm": "Preview" }),
+            ),
+        ];
+        let chain = MiddlewareChain::load(&mounts).expect("basic-auth loads from the registry");
+        assert_eq!(chain.module_names(), ["ratelimit", "basic-auth"]);
+
+        let vhost = "vhost-basicauth-chain";
+        let ctx = |headers: &[(String, String)]| {
+            RequestCtx::new("GET", "/index.php", "", "198.51.100.9", vhost, headers)
+                .with_https(true)
+        };
+
+        // No credentials: 401 carrying the challenge. PHP never runs.
+        match chain.evaluate(&ctx(&[]), "/index.php") {
+            ChainVerdict::Respond { status, headers, .. } => {
+                assert_eq!(status, 401);
+                assert_eq!(
+                    find_header(&headers, "WWW-Authenticate"),
+                    Some("Basic realm=\"Preview\", charset=\"UTF-8\"")
+                );
+            }
+            ChainVerdict::Continue { .. } => {
+                panic!("an unauthenticated request must not reach PHP")
+            }
+        }
+
+        // Correct credentials: the chain continues to PHP dispatch.
+        let encoded = {
+            use base64ct::Encoding as _;
+            base64ct::Base64::encode_string(b"dev:preview-pw")
+        };
+        let auth = [("Authorization".to_owned(), format!("Basic {encoded}"))];
+        assert!(
+            matches!(chain.evaluate(&ctx(&auth), "/index.php"), ChainVerdict::Continue { .. }),
+            "a correct credential must continue to PHP"
+        );
+
+        // Keep going and `ratelimit` (order 10) trips first: 429, not 401, so
+        // brute-force protection is genuinely a chain decision.
+        let mut limited = None;
+        for _ in 0..40 {
+            if let ChainVerdict::Respond { status, headers, .. } =
+                chain.evaluate(&ctx(&[]), "/index.php")
+                && status == 429
+            {
+                limited = Some(headers);
+                break;
+            }
+        }
+        let headers = limited.expect("ratelimit never tripped ahead of basic-auth");
+        assert!(find_header(&headers, "Retry-After").is_some());
+        assert!(
+            find_header(&headers, "WWW-Authenticate").is_none(),
+            "the 429 is ratelimit's response — basic-auth must not have run"
+        );
     }
 
     #[test]
