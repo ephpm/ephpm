@@ -19,6 +19,27 @@ const PHP_SDK_VERSIONS: &[(&str, &str)] = &[("8.3", "8.3.31"), ("8.4", "8.4.23")
 /// Default PHP minor when no version is specified on the command line.
 const DEFAULT_PHP_MINOR: &str = "8.5";
 
+/// Cargo features every *shipped* `ephpm` binary is built with.
+///
+/// This is deliberately not the same set a bare `cargo build` gets. Optional
+/// features live here rather than in `[features] default` so the stub-mode
+/// inner loop (`cargo build`, `cargo nextest run --workspace`) stays lean,
+/// while the artifact a user actually downloads has them compiled in.
+///
+/// `otlp` — OTLP trace export. Without it, `[server.diagnostics]
+/// otlp_endpoint` is a documented knob that no released binary can honour: it
+/// only logs a startup warning (see the `#[cfg(not(feature = "otlp"))]` block
+/// in `crates/ephpm/src/main.rs`), and the only way to get traces was to build
+/// from source with the PHP SDK. The feature is inert at runtime until an
+/// endpoint is configured — no exporter is built, no background thread is
+/// spawned (measured: identical thread count with the endpoint unset), so the
+/// cost of shipping it is binary size and nothing else.
+///
+/// Anything added here must also be added to the CI lanes that lint and test
+/// it (`.github/workflows/ci.yml`) and to the Docker builder's dependency
+/// warm-up stage (`docker/Dockerfile`), or it ships uncompiled by CI.
+const RELEASE_FEATURES: &str = "otlp";
+
 /// Pinned version of Hugo (extended) for the documentation site.
 /// Newer versions dropped darwin tarballs in favor of .pkg installers.
 const HUGO_VERSION: &str = "0.150.0";
@@ -242,8 +263,17 @@ fn release_native(args: &[String]) -> ExitCode {
 
     eprintln!("==> Building ephpm (release, target: {host_target})...");
     let mut cmd = Command::new("cargo");
-    cmd.args(["build", "--release", "--package", "ephpm", "--target", &host_target])
-        .env("PHP_SDK_PATH", &sdk_path);
+    cmd.args([
+        "build",
+        "--release",
+        "--package",
+        "ephpm",
+        "--target",
+        &host_target,
+        "--features",
+        RELEASE_FEATURES,
+    ])
+    .env("PHP_SDK_PATH", &sdk_path);
 
     // v0.7.0: no sqld embedding. Clustered SQLite replicates through the
     // in-process Turso CDC path; there is no external binary to embed.
@@ -359,8 +389,17 @@ fn release_windows(args: &[String]) -> ExitCode {
     // who previously inherited fat from Cargo.toml. Linux/macOS release
     // artifacts are unaffected: this is set here, not in Cargo.toml.
     let mut cmd = Command::new("cargo");
-    cmd.args(["build", "--release", "--package", "ephpm", "--target", target])
-        .env("PHP_SDK_PATH", &sdk_dir);
+    cmd.args([
+        "build",
+        "--release",
+        "--package",
+        "ephpm",
+        "--target",
+        target,
+        "--features",
+        RELEASE_FEATURES,
+    ])
+    .env("PHP_SDK_PATH", &sdk_dir);
     if env::var_os("CARGO_PROFILE_RELEASE_LTO").is_none() {
         cmd.env("CARGO_PROFILE_RELEASE_LTO", "thin");
     }
