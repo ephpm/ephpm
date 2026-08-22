@@ -18,11 +18,41 @@
 //! propagator is installed — the only remaining cost is the disabled-span
 //! callsite check in the router.
 //!
-//! The exporter uses a blocking `reqwest` client driven by the OTel SDK's
-//! own batch-export thread, deliberately avoiding any dependency on the
-//! tokio runtime: the tracing subscriber (and therefore this layer) is
+//! # Transports
+//!
+//! Both OTLP transports are compiled in and the choice is made at **runtime**
+//! by the standard `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` /
+//! `OTEL_EXPORTER_OTLP_PROTOCOL` variables:
+//!
+//! | value | transport | default port |
+//! |---|---|---|
+//! | `http/protobuf` (default) | OTLP/HTTP, protobuf payloads | 4318 |
+//! | `grpc` | OTLP/gRPC | 4317 |
+//!
+//! Runtime selection rather than a second cargo feature is deliberate. ePHPm
+//! ships **one** release binary (`xtask`'s `RELEASE_FEATURES`), so a
+//! compile-time switch would have to pick a transport on behalf of every user
+//! — and since the feature would then always be on in releases, it would cost
+//! exactly what compiling both costs anyway. Runtime selection is also the
+//! behaviour the OTel ecosystem expects, so a user's existing
+//! `OTEL_EXPORTER_OTLP_PROTOCOL` just works.
+//!
+//! `http/json` is *not* supported; it is rejected with a clear error rather
+//! than silently falling back to a transport the operator did not ask for.
+//!
+//! # Runtimes
+//!
+//! The http/protobuf transport uses a blocking `reqwest` client driven by the
+//! OTel SDK's own batch-export thread, deliberately avoiding any dependency on
+//! the tokio runtime: the tracing subscriber (and therefore this layer) is
 //! initialized in `main` *before* the runtime exists, because PHP must be
 //! initialized single-threaded.
+//!
+//! The gRPC transport cannot avoid tokio — tonic is async to the core. It gets
+//! its own small runtime, owned by [`OtlpGuard`], rather than borrowing the
+//! server's: the server's does not exist yet at this point in `main`. See
+//! [`RuntimeBoundExporter`] for how the SDK's synchronous batch thread drives
+//! it.
 //!
 //! # TLS
 //!
@@ -61,6 +91,11 @@ use tracing_subscriber::registry::LookupSpan;
 /// sitting in the batch queue — hold it for the whole server lifetime.
 pub struct OtlpGuard {
     provider: SdkTracerProvider,
+    /// The gRPC transport's dedicated tokio runtime, `None` on the
+    /// http/protobuf path. Declared after `provider` so it outlives the
+    /// explicit `provider.shutdown()` in [`Drop`] — that shutdown performs the
+    /// final flush, which for gRPC still needs this runtime alive.
+    _grpc_runtime: Option<tokio::runtime::Runtime>,
 }
 
 impl Drop for OtlpGuard {
@@ -71,6 +106,148 @@ impl Drop for OtlpGuard {
             tracing::debug!(error = %e, "OTLP tracer provider shutdown reported an error");
         }
     }
+}
+
+/// What [`init_layer`] resolved, for the caller to log.
+///
+/// `init_layer` runs *before* the tracing subscriber is installed, so it
+/// cannot log anything itself — everything it wants to say comes back here.
+pub struct OtlpStartupInfo {
+    /// The wire protocol in OTel's own spelling: `"http/protobuf"` or `"grpc"`.
+    pub protocol: &'static str,
+    /// The resolved endpoint, its source, and the transport's TLS/timeout
+    /// details.
+    pub description: String,
+    /// Misconfigurations worth an operator's attention that are nonetheless
+    /// legal, so they must not fail startup. Log each at WARN.
+    pub warnings: Vec<String>,
+}
+
+/// The OTLP transport, chosen at runtime. See the module docs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Transport {
+    /// OTLP/HTTP with protobuf payloads — the default, and what every
+    /// pre-existing ePHPm deployment uses.
+    HttpBinary,
+    /// OTLP/gRPC.
+    Grpc,
+}
+
+impl Transport {
+    /// OTel's spelling of this transport, as used by
+    /// `OTEL_EXPORTER_OTLP_PROTOCOL` and in log lines.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::HttpBinary => "http/protobuf",
+            Self::Grpc => "grpc",
+        }
+    }
+
+    /// The IANA-registered default collector port for this transport. Used
+    /// only to spot an endpoint that names the *other* transport's port.
+    const fn default_port(self) -> u16 {
+        match self {
+            Self::HttpBinary => 4318,
+            Self::Grpc => 4317,
+        }
+    }
+}
+
+/// Resolve the transport from the standard environment variables.
+///
+/// `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` wins over
+/// `OTEL_EXPORTER_OTLP_PROTOCOL`, matching the endpoint variables' precedence.
+/// Unset means `http/protobuf`, which is both the OTel default and what ePHPm
+/// did before gRPC existed — so this stays additive.
+///
+/// # Errors
+///
+/// Returns an error for a value this build cannot honour, rather than falling
+/// back to a transport the operator did not ask for. Silently exporting over
+/// the wrong protocol is exactly the class of failure #378 is about.
+fn resolve_transport() -> anyhow::Result<Transport> {
+    let Some((var, value)) = ["OTEL_EXPORTER_OTLP_TRACES_PROTOCOL", "OTEL_EXPORTER_OTLP_PROTOCOL"]
+        .iter()
+        .find_map(|var| {
+            std::env::var(var).ok().map(|v| (*var, v)).filter(|(_, v)| !v.trim().is_empty())
+        })
+    else {
+        return Ok(Transport::HttpBinary);
+    };
+
+    parse_transport(var, &value)
+}
+
+/// The pure half of [`resolve_transport`], so the mapping can be tested
+/// without mutating process-global environment state.
+fn parse_transport(var: &str, value: &str) -> anyhow::Result<Transport> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "http/protobuf" | "http/proto" => Ok(Transport::HttpBinary),
+        "grpc" => Ok(Transport::Grpc),
+        "http/json" => Err(anyhow::anyhow!(
+            "{var}=http/json is not supported by ePHPm's OTLP exporter; use \
+             `grpc` or `http/protobuf`"
+        )),
+        other => Err(anyhow::anyhow!(
+            "{var}={other} is not a valid OTLP protocol; expected `grpc` or \
+             `http/protobuf`"
+        )),
+    }
+}
+
+/// Normalize `[server.diagnostics] otlp_endpoint` for the chosen transport.
+///
+/// The two transports disagree about paths, and getting this wrong is silent:
+///
+/// - **http/protobuf** takes a *signal* URL, so `/v1/traces` is appended when
+///   the configured value does not already end with it.
+/// - **gRPC** takes a *base* URL and no signal path — the signal is the gRPC
+///   method name. Appending `/v1/traces` here produces a 404-equivalent from
+///   the collector and no spans.
+fn normalize_endpoint(transport: Transport, endpoint: &str) -> String {
+    let trimmed = endpoint.trim_end_matches('/');
+    match transport {
+        Transport::Grpc => trimmed.to_string(),
+        Transport::HttpBinary => {
+            if endpoint.ends_with("/v1/traces") {
+                endpoint.to_string()
+            } else {
+                format!("{trimmed}/v1/traces")
+            }
+        }
+    }
+}
+
+/// Warn when an endpoint names the *other* transport's default port.
+///
+/// This is the single most likely OTLP misconfiguration: 4317 and 4318 are one
+/// character apart and a collector accepts both, on different protocols. The
+/// symptom is silence, which is precisely what #378 is about.
+///
+/// Deliberately a **warning, not an error**. Nothing stops an operator running
+/// a gRPC receiver on 4318, so failing startup here would reject a legal
+/// configuration. The goal is that the log says why, not that the server
+/// refuses to run.
+fn port_mismatch_warning(transport: Transport, endpoint: &str) -> Option<String> {
+    let other = match transport {
+        Transport::HttpBinary => Transport::Grpc,
+        Transport::Grpc => Transport::HttpBinary,
+    };
+    let port = endpoint.parse::<http::Uri>().ok()?.port_u16()?;
+    if port != other.default_port() {
+        return None;
+    }
+
+    Some(format!(
+        "OTLP endpoint {endpoint} uses port {port}, the conventional port for \
+         {other_proto}, but the exporter is configured for {this_proto} (the \
+         conventional port for which is {this_port}). If no spans arrive, \
+         either set OTEL_EXPORTER_OTLP_PROTOCOL={other_proto} or point the \
+         endpoint at port {this_port}.",
+        other_proto = other.as_str(),
+        this_proto = transport.as_str(),
+        this_port = transport.default_port(),
+    ))
 }
 
 /// The OTLP spec's default export timeout when no env var overrides it
@@ -167,6 +344,193 @@ fn build_http_client() -> anyhow::Result<(reqwest::blocking::Client, String)> {
     Ok((client, description))
 }
 
+/// Adapts an async [`SpanExporter`] to the SDK's synchronous batch thread.
+///
+/// [`opentelemetry_sdk::trace::BatchSpanProcessor`] runs on a plain
+/// `std::thread` and drives exports with `futures_executor::block_on`
+/// (`opentelemetry_sdk-0.31.0/src/trace/span_processor.rs`, the thread at
+/// `:316` and the `block_on` at `:507`). That executor provides no tokio
+/// reactor, so tonic's hyper connection would fail with "no reactor running".
+///
+/// So the export future is handed to our own runtime with
+/// [`tokio::runtime::Handle::block_on`], which polls it on the calling thread
+/// while the runtime's worker drives the IO. Blocking that thread is correct
+/// and not a regression: it is the batch exporter's own dedicated thread, and
+/// the http/protobuf transport already blocks it the same way via
+/// `reqwest::blocking`.
+///
+/// `Handle::block_on` panics only when called from *inside* a runtime, which
+/// the paragraph above rules out — the batch processor never runs on a tokio
+/// worker. Keeping `inner` by value (rather than behind an `Arc`, as a
+/// `Handle::spawn` implementation would require) is what lets the `&mut`
+/// methods below forward directly; `set_resource` in particular carries
+/// `service.name`, and silently dropping it would be a real defect.
+#[derive(Debug)]
+struct RuntimeBoundExporter<E> {
+    inner: E,
+    handle: tokio::runtime::Handle,
+}
+
+impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanExporter
+    for RuntimeBoundExporter<E>
+{
+    fn export(
+        &self,
+        batch: Vec<opentelemetry_sdk::trace::SpanData>,
+    ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
+        let handle = self.handle.clone();
+        let export = self.inner.export(batch);
+        async move { handle.block_on(export) }
+    }
+
+    fn shutdown_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        let _entered = self.handle.enter();
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn force_flush(&mut self) -> opentelemetry_sdk::error::OTelSdkResult {
+        let _entered = self.handle.enter();
+        self.inner.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) {
+        self.inner.set_resource(resource);
+    }
+}
+
+/// Make [`crate::tls::crypto_provider`] the process-default rustls provider.
+///
+/// Unlike reqwest, tonic offers no `use_preconfigured_tls` escape hatch — it
+/// builds the [`rustls::ClientConfig`] itself. What it *does* do is consult
+/// `CryptoProvider::get_default()` **first**, ahead of any crate-feature
+/// fallback (`tonic-0.14.5/src/transport/channel/service/tls.rs`, the `match`
+/// at the top of `TlsConnector::new`). Installing our provider as the process
+/// default is therefore the supported way to keep gRPC on the same provider as
+/// the HTTPS listener.
+///
+/// Without this, the `tls-provider-agnostic` build reaches tonic's final arm,
+/// a bare `ClientConfig::builder()`, which resolves via
+/// `from_crate_features()` — `None` in a binary that has had two providers
+/// linked — and panics. That is the same trap #371 hit with reqwest.
+///
+/// Installing a default is inert for the rest of the server: every other call
+/// site names its provider explicitly with `builder_with_provider`.
+///
+/// Returns a warning when some *other* provider was already installed, which
+/// would mean gRPC TLS silently uses it.
+fn install_default_crypto_provider() -> Option<String> {
+    let ours = crate::tls::crypto_provider();
+
+    if rustls::crypto::CryptoProvider::install_default((*ours).clone()).is_ok() {
+        return None;
+    }
+
+    // Err means one was already installed. Ours is installed exactly here, so
+    // an existing one is either ours (idempotent, fine) or a foreign one.
+    let installed = rustls::crypto::CryptoProvider::get_default();
+    match installed {
+        Some(p) if std::ptr::eq(std::ptr::from_ref(&**p), std::ptr::from_ref(&*ours)) => None,
+        _ => Some(
+            "a rustls crypto provider was already installed as the process \
+             default before the OTLP gRPC exporter was built; gRPC TLS will \
+             use that provider, which may differ from the HTTPS listener's"
+                .to_string(),
+        ),
+    }
+}
+
+/// Build the OTLP/gRPC exporter together with the runtime that drives it.
+///
+/// `endpoint` is the already-normalized endpoint, or `None` to let
+/// `opentelemetry-otlp` apply its own `OTEL_EXPORTER_OTLP_*` handling.
+///
+/// # TLS
+///
+/// The trust anchors match the http/protobuf transport's policy — the union of
+/// the OS trust store and the bundled Mozilla set — so switching protocol does
+/// not silently change which collectors are reachable. The two are configured
+/// differently only because tonic owns its `ClientConfig`: it reads the OS
+/// store itself (honouring `SSL_CERT_FILE` / `SSL_CERT_DIR` via the same
+/// `rustls-native-certs`) rather than being handed one.
+///
+/// Native roots are requested only when the OS store actually has certificates
+/// in it: tonic's `with_native_roots` fails the whole handshake with
+/// `NativeCertsNotFound` on an empty store, which would make a
+/// `scratch`/distroless image unable to reach even a publicly trusted
+/// collector that the bundled roots cover.
+///
+/// # Errors
+///
+/// Returns an error when the runtime or the exporter cannot be built.
+fn build_grpc_exporter(
+    endpoint: Option<&str>,
+) -> anyhow::Result<(
+    // `use<>`: the exporter captures nothing from `endpoint` (the builder
+    // copies it), and the SDK requires `'static` to hand it to the batch
+    // processor. Without this, Rust 2024's capture rules infer a borrow.
+    impl opentelemetry_sdk::trace::SpanExporter + use<>,
+    tokio::runtime::Runtime,
+    String,
+)> {
+    use opentelemetry_otlp::{WithExportConfig as _, WithTonicConfig as _};
+
+    let provider_warning = install_default_crypto_provider();
+
+    let native_count = rustls_native_certs::load_native_certs().certs.len();
+    let bundled = webpki_roots::TLS_SERVER_ROOTS.len();
+
+    let mut tls = tonic::transport::ClientTlsConfig::new().with_webpki_roots();
+    if native_count > 0 {
+        tls = tls.with_native_roots();
+    }
+
+    let timeout = export_timeout();
+
+    // One worker is plenty: this runtime carries a single gRPC stream of
+    // batched spans, and every export is serialized by the SDK anyway ("this
+    // function will never be called concurrently for the same exporter
+    // instance"). It costs one thread — the same order as the
+    // `reqwest-internal-sync-runtime` thread the http transport spawns.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .thread_name("ephpm-otlp-grpc")
+        .build()
+        .context("failed to build the OTLP gRPC exporter's tokio runtime")?;
+
+    // tonic's `connect_lazy` builds the channel without connecting, but it
+    // still expects to be inside a runtime context. Building here rather than
+    // relying on that being optional keeps it correct by construction.
+    let exporter = {
+        let _entered = runtime.enter();
+
+        let mut builder =
+            opentelemetry_otlp::SpanExporter::builder().with_tonic().with_tls_config(tls);
+        if let Some(endpoint) = endpoint {
+            builder = builder.with_endpoint(endpoint);
+        }
+        builder
+            .with_timeout(timeout)
+            .build()
+            .context("failed to build the OTLP gRPC span exporter")?
+    };
+
+    let handle = runtime.handle().clone();
+    let mut description = format!(
+        "TLS trust anchors: {native_count} from the OS store + {bundled} bundled; timeout {}ms",
+        timeout.as_millis()
+    );
+    if let Some(warning) = provider_warning {
+        description.push_str("; ");
+        description.push_str(&warning);
+    }
+
+    Ok((RuntimeBoundExporter { inner: exporter, handle }, runtime, description))
+}
+
 /// Resolve the endpoint and build the OTLP tracing layer.
 ///
 /// `config_endpoint` is `[server.diagnostics] otlp_endpoint`. The standard
@@ -179,17 +543,20 @@ fn build_http_client() -> anyhow::Result<(reqwest::blocking::Client, String)> {
 ///
 /// The service name is `OTEL_SERVICE_NAME` when set, else `"ephpm"`.
 ///
-/// The returned `String` describes the resolved endpoint and its source for
-/// the caller to log — this function runs *before* the tracing subscriber is
-/// installed, so it cannot log anything itself.
+/// The returned [`OtlpStartupInfo`] describes the resolved transport,
+/// endpoint and its source for the caller to log — this function runs *before*
+/// the tracing subscriber is installed, so it cannot log anything itself. Its
+/// `warnings` must be logged at WARN.
 ///
 /// # Errors
 ///
-/// Returns an error when the exporter cannot be built (malformed endpoint),
-/// or when its HTTP client cannot be built (see [`build_http_client`]).
+/// Returns an error when `OTEL_EXPORTER_OTLP_PROTOCOL` names a protocol this
+/// build cannot honour, when the exporter cannot be built (malformed
+/// endpoint), or when its transport client cannot be built (see
+/// [`build_http_client`] and [`build_grpc_exporter`]).
 pub fn init_layer<S>(
     config_endpoint: Option<&str>,
-) -> anyhow::Result<Option<(impl Layer<S>, OtlpGuard, String)>>
+) -> anyhow::Result<Option<(impl Layer<S>, OtlpGuard, OtlpStartupInfo)>>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
 {
@@ -197,41 +564,43 @@ where
         .iter()
         .find_map(|var| std::env::var(var).ok().filter(|v| !v.is_empty()));
 
-    // Resolve the endpoint before building the client: when nothing is
+    // Resolve the endpoint before building anything: when nothing is
     // configured we return early and never touch the OS trust store.
     if env_endpoint.is_none() && config_endpoint.is_none() {
         return Ok(None);
     }
 
-    use opentelemetry_otlp::WithHttpConfig as _;
-    let (http_client, tls_description) = build_http_client()?;
+    // Resolved before any client is built so an unsupported protocol fails
+    // fast, with a message, instead of exporting over the wrong one.
+    let transport = resolve_transport()?;
 
-    let builder = opentelemetry_otlp::SpanExporter::builder()
-        .with_http()
-        .with_http_client(http_client)
-        .with_protocol(opentelemetry_otlp::Protocol::HttpBinary);
+    // The endpoint the *exporter* will use, for the port sanity check. When it
+    // comes from the environment we leave the actual value to the builder's own
+    // env handling (standard OTel semantics) and only inspect it here.
+    let effective_endpoint = env_endpoint
+        .clone()
+        .or_else(|| config_endpoint.map(|ep| normalize_endpoint(transport, ep)));
+    let mut warnings = Vec::new();
+    if let Some(ref endpoint) = effective_endpoint
+        && let Some(warning) = port_mismatch_warning(transport, endpoint)
+    {
+        warnings.push(warning);
+    }
 
-    let (builder, endpoint_source) = if let Some(ref env_ep) = env_endpoint {
-        // Leave the endpoint to the builder's own env handling so the
-        // standard semantics apply (OTEL_EXPORTER_OTLP_ENDPOINT is a base
-        // URL that gets `/v1/traces` appended; the TRACES variant is used
-        // verbatim).
-        (builder, format!("env: {env_ep}"))
-    } else if let Some(cfg_ep) = config_endpoint {
-        let url = if cfg_ep.ends_with("/v1/traces") {
-            cfg_ep.to_string()
-        } else {
-            format!("{}/v1/traces", cfg_ep.trim_end_matches('/'))
-        };
-        (builder.with_endpoint(&url), format!("config: {url}"))
-    } else {
+    let endpoint_source = match (&env_endpoint, &effective_endpoint) {
+        (Some(env_ep), _) => format!("env: {env_ep}"),
+        (None, Some(endpoint)) => format!("config: {endpoint}"),
         // Unreachable: the guard above already returned for "no endpoint
         // configured anywhere". Kept so the arm structure stays total.
-        return Ok(None);
+        (None, None) => return Ok(None),
     };
 
-    use opentelemetry_otlp::WithExportConfig as _;
-    let exporter = builder.build().context("failed to build the OTLP span exporter")?;
+    // `with_endpoint` is applied only for the config source: for the env
+    // source the builder reads the variables itself, which is what keeps the
+    // standard semantics (`OTEL_EXPORTER_OTLP_ENDPOINT` is a base URL that
+    // gets `/v1/traces` appended on http/protobuf and is used as-is on gRPC;
+    // the TRACES variant is verbatim on both).
+    let builder_endpoint = if env_endpoint.is_some() { None } else { effective_endpoint.as_deref() };
 
     let service_name = std::env::var("OTEL_SERVICE_NAME")
         .ok()
@@ -241,8 +610,37 @@ where
     let resource =
         opentelemetry_sdk::Resource::builder().with_service_name(service_name.clone()).build();
 
-    let provider =
-        SdkTracerProvider::builder().with_batch_exporter(exporter).with_resource(resource).build();
+    // The two transports produce different exporter types, so each branch
+    // builds its own provider and they converge on `SdkTracerProvider`.
+    let (provider, grpc_runtime, transport_description) = match transport {
+        Transport::Grpc => {
+            let (exporter, runtime, description) = build_grpc_exporter(builder_endpoint)?;
+            let provider = SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(resource)
+                .build();
+            (provider, Some(runtime), description)
+        }
+        Transport::HttpBinary => {
+            use opentelemetry_otlp::{WithExportConfig as _, WithHttpConfig as _};
+
+            let (http_client, description) = build_http_client()?;
+            let mut builder = opentelemetry_otlp::SpanExporter::builder()
+                .with_http()
+                .with_http_client(http_client)
+                .with_protocol(opentelemetry_otlp::Protocol::HttpBinary);
+            if let Some(endpoint) = builder_endpoint {
+                builder = builder.with_endpoint(endpoint);
+            }
+            let exporter =
+                builder.build().context("failed to build the OTLP span exporter")?;
+            let provider = SdkTracerProvider::builder()
+                .with_batch_exporter(exporter)
+                .with_resource(resource)
+                .build();
+            (provider, None, description)
+        }
+    };
 
     // W3C trace-context propagation: the router extracts an incoming
     // `traceparent` through the global propagator, which defaults to a
@@ -258,8 +656,10 @@ where
     );
 
     let description =
-        format!("{endpoint_source} (service.name = {service_name}; {tls_description})");
-    Ok(Some((layer, OtlpGuard { provider }, description)))
+        format!("{endpoint_source} (service.name = {service_name}; {transport_description})");
+    let info =
+        OtlpStartupInfo { protocol: transport.as_str(), description, warnings };
+    Ok(Some((layer, OtlpGuard { provider, _grpc_runtime: grpc_runtime }, info)))
 }
 
 /// Parent `span` to the trace context carried in an incoming W3C
@@ -304,6 +704,104 @@ mod tests {
     use std::io::{Read as _, Write as _};
 
     use super::*;
+
+    /// Every protocol spelling the OTel spec allows, plus the rejections.
+    ///
+    /// Pure over `parse_transport` rather than the env-reading wrapper: the
+    /// test suite shares one process, so mutating `OTEL_EXPORTER_OTLP_*` here
+    /// would leak into any sibling test that builds an exporter.
+    #[test]
+    fn protocol_values_map_to_transports() {
+        let var = "OTEL_EXPORTER_OTLP_PROTOCOL";
+        assert_eq!(parse_transport(var, "grpc").unwrap(), Transport::Grpc);
+        assert_eq!(parse_transport(var, "http/protobuf").unwrap(), Transport::HttpBinary);
+        // Case and surrounding whitespace are not the operator's problem.
+        assert_eq!(parse_transport(var, "  GRPC \n").unwrap(), Transport::Grpc);
+
+        // http/json is a real OTLP protocol we deliberately do not implement,
+        // so it must say so rather than silently exporting over another one.
+        let err = parse_transport(var, "http/json").unwrap_err().to_string();
+        assert!(err.contains("not supported"), "unexpected error: {err}");
+        assert!(err.contains("http/protobuf"), "error must name the alternatives: {err}");
+
+        let err = parse_transport(var, "gprc").unwrap_err().to_string();
+        assert!(err.contains("not a valid OTLP protocol"), "unexpected error: {err}");
+    }
+
+    /// gRPC takes a base URL; http/protobuf takes a signal URL.
+    ///
+    /// Appending `/v1/traces` on the gRPC path is silent — the collector
+    /// simply never sees a recognised method — so the asymmetry is pinned.
+    #[test]
+    fn endpoint_normalization_differs_by_transport() {
+        let base = "http://127.0.0.1:4317";
+        assert_eq!(normalize_endpoint(Transport::Grpc, base), base);
+        assert_eq!(normalize_endpoint(Transport::Grpc, "http://127.0.0.1:4317/"), base);
+
+        assert_eq!(
+            normalize_endpoint(Transport::HttpBinary, "http://127.0.0.1:4318"),
+            "http://127.0.0.1:4318/v1/traces"
+        );
+        assert_eq!(
+            normalize_endpoint(Transport::HttpBinary, "http://127.0.0.1:4318/"),
+            "http://127.0.0.1:4318/v1/traces"
+        );
+        // Already-suffixed values must not be doubled.
+        assert_eq!(
+            normalize_endpoint(Transport::HttpBinary, "http://127.0.0.1:4318/v1/traces"),
+            "http://127.0.0.1:4318/v1/traces"
+        );
+    }
+
+    /// The 4317/4318 mix-up must produce a message, and nothing else must.
+    #[test]
+    fn port_mismatch_is_reported_only_when_it_is_a_mismatch() {
+        let warning = port_mismatch_warning(Transport::Grpc, "http://127.0.0.1:4318")
+            .expect("gRPC pointed at 4318 must warn");
+        assert!(warning.contains("4318"), "warning must name the port: {warning}");
+        assert!(warning.contains("grpc"), "warning must name the configured protocol: {warning}");
+
+        let warning =
+            port_mismatch_warning(Transport::HttpBinary, "http://127.0.0.1:4317/v1/traces")
+                .expect("http/protobuf pointed at 4317 must warn");
+        assert!(warning.contains("http/protobuf"), "unexpected warning: {warning}");
+
+        // Matching ports, and any unrelated port, are silent — an operator is
+        // free to run either transport anywhere.
+        assert!(port_mismatch_warning(Transport::Grpc, "http://127.0.0.1:4317").is_none());
+        assert!(
+            port_mismatch_warning(Transport::HttpBinary, "http://127.0.0.1:4318/v1/traces")
+                .is_none()
+        );
+        assert!(port_mismatch_warning(Transport::Grpc, "http://collector:9999").is_none());
+        // A port-less endpoint has nothing to compare.
+        assert!(port_mismatch_warning(Transport::Grpc, "https://collector.example").is_none());
+    }
+
+    /// The gRPC exporter must build offline, with its own runtime.
+    ///
+    /// This is the guard on the crypto-provider wiring: with
+    /// `tls-provider-agnostic` and nothing installed as the process default,
+    /// tonic falls through to a bare `ClientConfig::builder()` and **panics**
+    /// in a binary that has had two providers linked (#241). Building the
+    /// exporter is enough to exercise that path because tonic's
+    /// `connect_lazy` constructs the TLS connector eagerly.
+    #[test]
+    fn grpc_exporter_builds_with_its_own_runtime() {
+        let (_exporter, runtime, description) =
+            build_grpc_exporter(Some("http://127.0.0.1:4317")).expect("build gRPC exporter");
+
+        assert!(description.contains("trust anchors"), "unexpected description: {description}");
+        // A foreign provider would mean gRPC TLS silently diverges from the
+        // HTTPS listener; the description carries that warning when it happens.
+        assert!(
+            !description.contains("already installed"),
+            "another crypto provider won the process default: {description}"
+        );
+
+        // The runtime is real and usable — this is what drives every export.
+        assert_eq!(runtime.block_on(async { 1 + 1 }), 2);
+    }
 
     /// The client must speak plaintext exactly as before TLS was added.
     ///

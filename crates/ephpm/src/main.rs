@@ -1040,16 +1040,25 @@ fn run_with_config(
     // The guard flushes the exporter's batch queue on drop — hold it until
     // the server has exited.
     #[cfg(feature = "otlp")]
-    let _otlp_guard = otlp.map(|(otlp_layer, guard, description)| {
+    let _otlp_guard = otlp.map(|(otlp_layer, guard, info)| {
         layers.push(otlp_layer.boxed());
-        (guard, description)
+        (guard, info)
     });
 
     tracing_subscriber::registry().with(layers).init();
 
     #[cfg(feature = "otlp")]
-    if let Some((_, ref description)) = _otlp_guard {
-        tracing::info!(endpoint = %description, "OTLP trace export enabled (http/protobuf)");
+    if let Some((_, ref info)) = _otlp_guard {
+        tracing::info!(
+            endpoint = %info.description,
+            protocol = info.protocol,
+            "OTLP trace export enabled"
+        );
+        // Legal-but-probably-wrong configuration (e.g. the other transport's
+        // conventional port). Never fatal — see `otlp::port_mismatch_warning`.
+        for warning in &info.warnings {
+            tracing::warn!("{warning}");
+        }
     }
 
     // add-config-knob: never let an OTLP request die silently in a binary

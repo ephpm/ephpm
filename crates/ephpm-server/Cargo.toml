@@ -76,6 +76,11 @@ tracing-subscriber = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
+# The gRPC transport's TLS config type (`ClientTlsConfig`) and its root-store
+# switches. tonic is already in the graph via opentelemetry-proto; naming it
+# here is what enables the two `tls-*-roots` features — neither of which pulls
+# a crypto provider. See the workspace manifest.
+tonic = { workspace = true, optional = true }
 
 # Privilege drop ([server] run_as_user/run_as_group): setgroups/setgid/setuid
 # and getpwnam/getgrnam name resolution live behind libc on Unix. No-op on
@@ -85,9 +90,11 @@ libc = "0.2"
 
 [features]
 # OTLP trace export: `tracing` spans (http.request / worker.queue_wait /
-# php.execute) shipped to an OpenTelemetry collector over OTLP http/protobuf.
-# Runtime activation is still opt-in via OTEL_EXPORTER_OTLP_ENDPOINT /
-# [server.diagnostics] otlp_endpoint — see src/otlp.rs.
+# php.execute) shipped to an OpenTelemetry collector over OTLP. Both
+# transports — http/protobuf and gRPC — are compiled in; the choice is made at
+# runtime by OTEL_EXPORTER_OTLP_PROTOCOL. Runtime activation is still opt-in
+# via OTEL_EXPORTER_OTLP_ENDPOINT / [server.diagnostics] otlp_endpoint — see
+# src/otlp.rs.
 otlp = [
     "dep:opentelemetry",
     "dep:opentelemetry_sdk",
@@ -97,6 +104,10 @@ otlp = [
     "dep:reqwest",
     "dep:rustls-native-certs",
     "dep:webpki-roots",
+    "dep:tonic",
+    # The gRPC exporter is async; `otlp.rs` drives it on a dedicated
+    # single-worker runtime built in `main`, before the server's own.
+    "tokio/rt-multi-thread",
 ]
 
 [dev-dependencies]
