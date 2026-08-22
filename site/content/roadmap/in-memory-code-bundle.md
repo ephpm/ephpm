@@ -212,11 +212,21 @@
 >
 > So it is **not** the code bundle, **not** the handler overrides, and **not**
 > Linux. It depends on (a) the JIT being on, (b) which application code goes hot,
-> and (c) *which binary* — i.e. it is a code-layout/codegen lottery, the same
-> family as the already-known per-binary Windows failure where some ePHPm builds
-> die at startup with PHP's *"Opcode handlers are unusable due to ASLR"*. A
-> release build can lose this lottery and crash-loop on a customer's application
-> with the default `opcache_jit = "tracing"`. **That deserves its own issue.**
+> and (c) apparently *which binary*. A release build can therefore crash-loop on
+> a customer's application with the default `opcache_jit = "tracing"`.
+> **This deserves its own issue; it is not tracked by anything in this PR.**
+>
+> It resembles the documented per-binary Windows OPcache-SHM/ASLR lottery
+> (`ZendOPcache.SharedMemoryArea@…`, issue #362 / PR #363), where a second
+> process reattaches to a segment created by an image at a different base. That
+> would explain the JIT dependence (JIT'd code in SHM holds absolute addresses)
+> and the per-binary determinism. **But the cheap test for it came back
+> negative:** giving each process a unique `opcache.cache_id` via
+> `ini_overrides` — which should change the segment name and force the create
+> path — did **not** stop the crash (4/4 still died after 3 requests). Either the
+> mechanism is different, or `ini_overrides` does not reach OPcache's MINIT in
+> time to affect segment naming; that was not resolved. **Do not assume #363
+> fixes this.**
 >
 > Every performance number in this document was taken from a run verified alive
 > at the end of its measured window, and the JIT-off cross-check agrees with the
