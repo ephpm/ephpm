@@ -100,7 +100,7 @@ jobs:
       fail-fast: false
       matrix:
         php:
-          - { minor: "8.3", full: "8.3.31" }
+          - { minor: "8.3", full: "8.3.33" }
           - { minor: "8.4", full: "8.4.23" }
           - { minor: "8.5", full: "8.5.7" }
         arch:
@@ -177,7 +177,7 @@ jobs:
       max-parallel: 1
       matrix:
         php:
-          - { minor: "8.3", full: "8.3.31" }
+          - { minor: "8.3", full: "8.3.33" }
           - { minor: "8.4", full: "8.4.23" }
           - { minor: "8.5", full: "8.5.7" }
     steps:
@@ -244,7 +244,7 @@ jobs:
       matrix:
         include:
           - php_minor: "8.3"
-            php_full: "8.3.31"
+            php_full: "8.3.33"
           - php_minor: "8.4"
             php_full: "8.4.23"
           - php_minor: "8.5"
@@ -324,7 +324,7 @@ jobs:
       matrix:
         include:
           - php_minor: "8.3"
-            php_full: "8.3.31"
+            php_full: "8.3.33"
           - php_minor: "8.4"
             php_full: "8.4.23"
           - php_minor: "8.5"
@@ -719,7 +719,7 @@ jobs:
       matrix:
         include:
           - php_minor: "8.3"
-            php_full: "8.3.31"
+            php_full: "8.3.33"
           - php_minor: "8.4"
             php_full: "8.4.23"
             default: false
