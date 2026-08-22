@@ -14,6 +14,8 @@
  *                  the response never sent (-> 500 + recycle, no partial body)
  *   ?__exit=1      output followed by exit() mid-request (exit synthesis)
  *   ?__blocks=<n>  a WordPress-`do_blocks()`-shaped render workload (issue #116)
+ *   ?__deep=<n>    the same shape taken past the C-stack ceiling (issue #116);
+ *                  add &catch=1 to handle the resulting Error in userland
  *
  * This is a fixture, not a framework adapter — the shipped reference script is
  * `examples/worker/worker.php`. It is deliberately kept close to that one so a
@@ -67,6 +69,30 @@ function ephpm_e2e_render_blocks(int $depth, int $breadth): string
     $level = (string) ob_get_clean();
 
     return implode('', array_map(static fn (string $s): string => $s, [$level]));
+}
+
+/**
+ * The same nesting shape as ephpm_e2e_render_blocks(), stripped to the one
+ * thing that consumes C stack — a userland recursion that re-enters through an
+ * *internal* function — and driven past the thread's stack ceiling (issue #116).
+ *
+ * PHP 8.3+ tests `zend_call_stack_overflowed(EG(stack_limit))` at exactly these
+ * re-entry points and raises a catchable
+ * `Error: Maximum call stack size ... reached`. ePHPm used to override
+ * `zend_call_stack_init()` with a no-op on Linux, so `EG(stack_limit)` stayed
+ * NULL, the checkpoint never fired, and this walked off the end of the worker
+ * thread's stack: SIGSEGV, whole process gone — not just the worker.
+ */
+function ephpm_e2e_deep_render(int $level): string
+{
+    if ($level <= 0) {
+        return '<p>leaf</p>';
+    }
+
+    return array_map(
+        static fn (int $ignored): string => '<div>' . ephpm_e2e_deep_render($level - 1) . '</div>',
+        [1],
+    )[0];
 }
 
 /**
@@ -174,6 +200,46 @@ while (($envelope = \Ephpm\Worker\take_request()) !== null) {
         ob_start();
         echo "exit-route buffered\n";
         exit;
+    }
+
+    // Runaway-recursion trigger (issue #116). Two shapes:
+    //
+    //   ?__deep=<n>            let the Error escape — the engine must turn it
+    //                          into a 500 and recycle this worker, and the POOL
+    //                          must keep serving (before the fix the process
+    //                          died, so there was no pool left).
+    //   ?__deep=<n>&catch=1    catch it in userland — proof that the overflow
+    //                          now arrives as an ordinary catchable Error, so
+    //                          this worker answers 200 and stays booted.
+    if (isset($query['__deep'])) {
+        $levels = max(1, min(2000000, (int) $query['__deep']));
+        if (isset($query['catch'])) {
+            try {
+                $html = ephpm_e2e_deep_render($levels);
+                \Ephpm\Worker\send_response(
+                    200,
+                    ['Content-Type' => 'text/plain; charset=utf-8'],
+                    "deep-survived levels={$levels} len=" . strlen($html)
+                        . " boot={$myBoot} request={$requestCount}\n"
+                );
+            } catch (\Throwable $e) {
+                \Ephpm\Worker\send_response(
+                    200,
+                    ['Content-Type' => 'text/plain; charset=utf-8'],
+                    'deep-caught ' . get_class($e) . ': ' . $e->getMessage()
+                        . " boot={$myBoot} request={$requestCount}\n"
+                );
+            }
+            continue;
+        }
+
+        $html = ephpm_e2e_deep_render($levels);
+        \Ephpm\Worker\send_response(
+            200,
+            ['Content-Type' => 'text/plain; charset=utf-8'],
+            "deep-survived levels={$levels} len=" . strlen($html) . "\n"
+        );
+        continue;
     }
 
     // Block-render-shaped workload (issue #116).

@@ -325,6 +325,17 @@ enum BodyReader {
 #[cfg(php_linked)]
 type ResponseChunkTx = tokio::sync::mpsc::Sender<bytes::Bytes>;
 
+// Per-worker-thread state for the `ephpm_worker_*` natives.
+//
+// These deliberately keep plain `LocalKey::with`, unlike the `db_bridge` /
+// `kv_bridge` / `ws_bridge` cells that issue #269 converted to `try_with`.
+// The #269 hazard is `ThreadPhpGuard`'s TLS destructor running
+// `php_request_shutdown()` — and therefore userland shutdown functions —
+// after these cells are gone. A worker thread never retires that way: it
+// retires through `PhpRuntime::worker_thread_shutdown`, which disarms the
+// guard and calls `ephpm_thread_shutdown()` itself, as ordinary code on a live
+// thread where every cell below is still alive. `worker_pool` and `fpm_pool`
+// are the only callers and both do exactly that.
 #[cfg(php_linked)]
 thread_local! {
     /// The dispatch receiver for this worker thread. Installed by the pool via

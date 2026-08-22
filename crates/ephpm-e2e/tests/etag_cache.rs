@@ -12,13 +12,59 @@
 //! - `EPHPM_URL` — base URL of the ephpm instance (e.g. `http://ephpm:8080`)
 //!
 //! Requires `server.php_etag_cache.enabled = true` in the ephpm configuration.
+//!
+//! # Why every test builds its own URL (issue #246)
+//!
+//! The server keys its PHP `ETag` cache by `{prefix}{method}:{path}?{query}`
+//! (`php_etag_cache_key` in `ephpm-server/src/router.rs`) in the **KV store**,
+//! which lives as long as the server process — not as long as one test binary
+//! run. When every test hit the same bare `/etag_test.php`, all six shared one
+//! cache entry, which made this suite both:
+//!
+//! - **order-dependent** — with `--test-threads=4` the six tests interleave
+//!   arbitrarily on one key, so what a test observes depends on which sibling
+//!   touched the entry last; and
+//! - **history-dependent** — `php_etag_different_query_strings_independent`
+//!   asserts that `?v=2` is *not* cached, but its own previous run left exactly
+//!   that entry behind. Against a server that outlives one suite run it fails
+//!   from the second run onward (measured: 39/40 runs against a warm server;
+//!   0/40 against a fresh one).
+//!
+//! The fix is isolation, not serialization: [`etag_url`] gives each test a
+//! query string unique to that test *and* to this process, so each test owns a
+//! private cache key that no sibling and no earlier run can reach. The PHP
+//! fixture ignores the query string, so the `ETag` value is unchanged.
+
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ephpm_e2e::required_env;
 
+/// Identifier unique to this test-binary process.
+///
+/// Combines the pid with the wall-clock nanosecond it was first read, so two
+/// runs against the same long-lived server cannot collide even if the OS
+/// recycles the pid.
+fn run_id() -> &'static str {
+    static RUN_ID: OnceLock<String> = OnceLock::new();
+    RUN_ID.get_or_init(|| {
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        format!("{}-{nanos}", std::process::id())
+    })
+}
+
+/// URL of the ETag fixture with a cache key private to `case`.
+///
+/// `case` names the test; the run id makes the key unique per process. See the
+/// module docs for why this matters.
+fn etag_url(case: &str) -> String {
+    let base_url = required_env("EPHPM_URL");
+    format!("{base_url}/etag_test.php?case={case}.{}", run_id())
+}
+
 #[tokio::test]
 async fn php_etag_first_request_returns_200_with_etag() {
-    let base_url = required_env("EPHPM_URL");
-    let url = format!("{base_url}/etag_test.php");
+    let url = etag_url("first_request");
 
     let resp = reqwest::get(&url)
         .await
@@ -49,8 +95,7 @@ async fn php_etag_first_request_returns_200_with_etag() {
 
 #[tokio::test]
 async fn php_etag_matching_returns_304() {
-    let base_url = required_env("EPHPM_URL");
-    let url = format!("{base_url}/etag_test.php");
+    let url = etag_url("matching_304");
     let client = reqwest::Client::new();
 
     // First request — get the ETag
@@ -92,8 +137,7 @@ async fn php_etag_matching_returns_304() {
 
 #[tokio::test]
 async fn php_etag_mismatched_returns_200() {
-    let base_url = required_env("EPHPM_URL");
-    let url = format!("{base_url}/etag_test.php");
+    let url = etag_url("mismatched");
     let client = reqwest::Client::new();
 
     // Prime the cache
@@ -123,8 +167,7 @@ async fn php_etag_mismatched_returns_200() {
 
 #[tokio::test]
 async fn php_etag_post_requests_not_cached() {
-    let base_url = required_env("EPHPM_URL");
-    let url = format!("{base_url}/etag_test.php");
+    let url = etag_url("post_not_cached");
     let client = reqwest::Client::new();
 
     // Prime the cache with a GET
@@ -160,8 +203,7 @@ async fn php_etag_post_requests_not_cached() {
 
 #[tokio::test]
 async fn php_etag_no_if_none_match_returns_200() {
-    let base_url = required_env("EPHPM_URL");
-    let url = format!("{base_url}/etag_test.php");
+    let url = etag_url("no_inm");
     let client = reqwest::Client::new();
 
     // Prime the cache
@@ -184,11 +226,12 @@ async fn php_etag_no_if_none_match_returns_200() {
 
 #[tokio::test]
 async fn php_etag_different_query_strings_independent() {
-    let base_url = required_env("EPHPM_URL");
     let client = reqwest::Client::new();
 
-    // GET with ?v=1 — cache the ETag
-    let url_v1 = format!("{base_url}/etag_test.php?v=1");
+    // Two query strings that differ only in `v`, both private to this run —
+    // `v=2` must be an unseen cache key, which is the whole point of the test
+    // and exactly what a shared `?v=2` could not guarantee (see module docs).
+    let url_v1 = format!("{}&v=1", etag_url("query_independent"));
     let resp = client.get(&url_v1).send().await.unwrap();
     assert_eq!(resp.status().as_u16(), 200);
     let etag_v1 = resp
@@ -199,7 +242,7 @@ async fn php_etag_different_query_strings_independent() {
         .to_owned();
 
     // Same ETag against a different query string — must NOT match
-    let url_v2 = format!("{base_url}/etag_test.php?v=2");
+    let url_v2 = format!("{}&v=2", etag_url("query_independent"));
     let resp = client
         .get(&url_v2)
         .header("If-None-Match", &etag_v1)

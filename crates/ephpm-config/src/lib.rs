@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process;
 
 use figment::Figment;
 use figment::providers::{Env, Format, Toml};
@@ -2199,9 +2200,13 @@ pub struct PhpConfig {
     /// When unset, ePHPm **auto-derives** this from the detected memory budget
     /// (container cgroup limit or Windows job-object limit, else total physical
     /// RAM — `MemTotal` / `GlobalMemoryStatusEx`): ~18% of memory, clamped
-    /// to `[64, 512]` MB. Set explicitly to pin the SHM size regardless of the
-    /// detected budget. Only takes effect in serve mode (dev keeps PHP's
-    /// default of 128 MB unless you set this).
+    /// to `[64, 512]` MB on Unix and `[64, 256]` MB on Windows, where the
+    /// segment is pagefile-backed and commit-charged in full at startup (see
+    /// [`opcache_shm_ceiling_mb`]). Set explicitly to pin the SHM size
+    /// regardless of the detected budget — an explicit value is honoured on
+    /// every platform, though on Windows one above the ceiling also warns at
+    /// startup ([`AutoTune::shm_warning`]). Only takes effect in serve mode
+    /// (dev keeps PHP's default of 128 MB unless you set this).
     ///
     /// Default: `None` (auto-derived in serve, PHP default in dev).
     #[serde(default)]
@@ -3422,6 +3427,41 @@ pub struct DerivedTuning {
 /// One mebibyte in bytes.
 const MIB: u64 = 1024 * 1024;
 
+/// Ceiling on the **derived** `opcache.memory_consumption` (MB) on Windows.
+///
+/// Lower than [`UNIX_OPCACHE_SHM_CEILING_MB`] because the two platforms charge
+/// the OPcache shared segment very differently — see
+/// [`opcache_shm_ceiling_mb`]. 256 MB still holds tens of thousands of cached
+/// scripts, comfortably more than WordPress-plus-plugins or a large Laravel
+/// app compiles, so the lower ceiling costs no realistic cache capacity.
+pub const WINDOWS_OPCACHE_SHM_CEILING_MB: u32 = 256;
+
+/// Ceiling on the **derived** `opcache.memory_consumption` (MB) on Unix.
+pub const UNIX_OPCACHE_SHM_CEILING_MB: u32 = 512;
+
+/// The derived-`opcache.memory_consumption` ceiling for the current target.
+///
+/// The two platforms differ because their shared-memory backends differ:
+///
+/// - **Unix** (`ext/opcache/shared_alloc_mmap.c`) maps an anonymous
+///   `MAP_SHARED` region. Pages are committed lazily as the cache fills, so a
+///   generous ceiling costs address space rather than memory.
+/// - **Windows** (`ext/opcache/shared_alloc_win32.c`) creates a pagefile-backed
+///   section with `CreateFileMapping(INVALID_HANDLE_VALUE, …)`. Windows charges
+///   the **entire** segment against the system commit limit the moment it is
+///   created, before a single script has been cached. A failure there is not a
+///   degradation: PHP calls `zend_accel_error(ACCEL_LOG_FATAL, …)`, which
+///   `exit(-2)`s the process from inside `php_module_startup`.
+///
+/// This ceiling bounds the **derived** value only. An explicit
+/// `[php] opcache_memory_consumption` is always honoured as written; on Windows
+/// an explicit value above the ceiling additionally warns (see
+/// [`AutoTune::shm_warning`]).
+#[must_use]
+pub const fn opcache_shm_ceiling_mb() -> u32 {
+    if cfg!(windows) { WINDOWS_OPCACHE_SHM_CEILING_MB } else { UNIX_OPCACHE_SHM_CEILING_MB }
+}
+
 /// Derive `opcache.jit_buffer_size` (MB) from the memory budget: ~1/64 of the
 /// budget, clamped `[32, 64]` MB; the 32 MB floor also covers an undetectable
 /// budget. Shared by the serve-mode derivation and the "explicit JIT in dev
@@ -3440,8 +3480,9 @@ pub fn derive_jit_buffer_mb(mem_bytes: Option<u64>) -> u32 {
 /// In serve mode:
 ///
 /// - `opcache.memory_consumption` = ~18% of the memory budget, clamped
-///   `[64, 512]` MB. (Always derived in serve, even with no memory budget:
-///   the floor gives a sane 64 MB.)
+///   `[64, opcache_shm_ceiling_mb()]` MB — 512 on Unix, 256 on Windows (see
+///   [`opcache_shm_ceiling_mb`]). (Always derived in serve, even with no memory
+///   budget: the floor gives a sane 64 MB.)
 /// - `opcache.interned_strings_buffer` = ~1 MB per 16 MB of opcache SHM,
 ///   clamped `[8, 64]` MB.
 /// - `opcache.jit_buffer_size` = ~1/64 of the memory budget, clamped
@@ -3473,12 +3514,14 @@ pub fn derive_tuning(
         return DerivedTuning::default();
     }
 
-    // opcache.memory_consumption: ~18% of the budget, clamped [64, 512] MB.
+    // opcache.memory_consumption: ~18% of the budget, clamped to
+    // [64, opcache_shm_ceiling_mb()] MB — 512 on Unix, 256 on Windows, where
+    // the segment is pagefile-backed and fully commit-charged up front.
     // With no detectable budget, the floor (64 MB) still gives a sane serve
     // value — opcache SHM is fixed-size and cheap relative to a modern host.
     let opcache_mb: u32 = {
         let by_ratio = mem_bytes.map_or(64, |b| (b * 18 / 100) / MIB) as u32;
-        by_ratio.clamp(64, 512)
+        by_ratio.clamp(64, opcache_shm_ceiling_mb())
     };
 
     // interned_strings_buffer: ~1 MB per 16 MB of opcache SHM, clamped [8, 64].
@@ -3591,6 +3634,45 @@ impl AutoTune {
         ));
         if let Some(freq) = &self.revalidate_freq {
             lines.push(("opcache.revalidate_freq".to_string(), freq.value.to_string()));
+        }
+
+        // Windows only: give this process a PRIVATE OPcache shared-memory
+        // namespace, so ePHPm always takes the segment-*create* path and never
+        // the cross-process *reattach* path.
+        //
+        // PHP's Windows SHM backend names its section object
+        //   ZendOPcache.SharedMemoryArea@<md5(user + opcache.cache_id)>
+        //                               @<sapi_name>@<zend_system_id><size_hex>
+        // (`shared_alloc_win32.c`, `create_name_with_username`) in the
+        // per-session object namespace. Any second process computing the same
+        // name therefore *reattaches* to the first one's segment instead of
+        // creating its own. Reattach then demands that `execute_ex` sit at the
+        // identical address in both images — cached op_arrays store absolute
+        // opcode-handler pointers into the loaded image — and refuses when it
+        // has moved:
+        //
+        //     execute_ex_moved = (void *)execute_ex != execute_ex_base;
+        //
+        // Two ePHPm images at different paths get different ASLR bases, so the
+        // second one fails that check and PHP calls `zend_accel_error(
+        // ACCEL_LOG_FATAL, "Opcode handlers are unusable due to ASLR…")`, which
+        // `exit(-2)`s the process from inside `php_module_startup` — the server
+        // dies at launch having served nothing (issue #362). Because the size is
+        // part of the object name, this presented as a size lottery: whichever
+        // `opcache.memory_consumption` collided with an already-running
+        // instance was fatal while every other size worked.
+        //
+        // A per-process `cache_id` makes the name unique, so the collision
+        // cannot occur. Nothing is lost: ePHPm is a single multi-threaded (ZTS)
+        // process that never forks workers, so it had no use for a shared
+        // segment, and this is exactly how it already behaves on Unix, where
+        // cross-process reattachment does not exist at all
+        // (`ZEND_OPCACHE_SHM_REATTACHMENT` is Windows-only).
+        //
+        // Emitted before `ini_overrides`, so an operator who genuinely wants a
+        // shared segment can still pin their own `opcache.cache_id`.
+        if cfg!(windows) {
+            lines.push(("opcache.cache_id".to_string(), format!("ephpm-{}", process::id())));
         }
 
         // Emit a `<key>=<value>` line only when the value is pinned or derived.
@@ -3775,6 +3857,39 @@ impl AutoTune {
             ));
         }
         None
+    }
+
+    /// A startup WARN when an operator has explicitly pinned an
+    /// `opcache.memory_consumption` above the platform ceiling on Windows.
+    ///
+    /// The explicit value is still honoured verbatim — [`opcache_shm_ceiling_mb`]
+    /// bounds only the *derived* value. This warns because the Windows failure
+    /// mode is unusually harsh: the segment is pagefile-backed and charged
+    /// against the system commit limit in full at startup, and if PHP cannot
+    /// create it the engine calls `zend_accel_error(ACCEL_LOG_FATAL, …)`, which
+    /// `exit(-2)`s the process from inside `php_module_startup`. There is no
+    /// return value to inspect and no way to fall back to a smaller size in
+    /// process, so the only useful thing ePHPm can do is say so in advance.
+    ///
+    /// Returns `None` on Unix, where the mapping is anonymous and lazily
+    /// committed and a large explicit value is unremarkable.
+    #[must_use]
+    pub fn shm_warning(&self) -> Option<String> {
+        if !cfg!(windows) || self.memory_consumption.origin != Origin::Explicit {
+            return None;
+        }
+        let ceiling = opcache_shm_ceiling_mb();
+        if self.memory_consumption.value <= ceiling {
+            return None;
+        }
+        Some(format!(
+            "[php] opcache_memory_consumption = {} exceeds the {}MB ePHPm derives on Windows. \
+             The Windows OPcache segment is pagefile-backed and its full size is charged against \
+             the system commit limit at startup; if that reservation fails, PHP aborts the \
+             process (exit -2) from module startup rather than starting without OPcache. Lower \
+             it if ePHPm fails to start.",
+            self.memory_consumption.value, ceiling
+        ))
     }
 }
 
@@ -6715,20 +6830,31 @@ eviction_policy = "lru"
         assert_eq!(get("zend.assertions"), Some("-1"));
     }
 
+    /// The Windows-only per-process `opcache.cache_id` line, in the position
+    /// [`AutoTune::ini_lines`] emits it — after `validate_timestamps` /
+    /// `revalidate_freq`, before every derived tunable. Empty on Unix, where
+    /// the directive does not exist in PHP at all.
+    fn cache_id_lines() -> Vec<(String, String)> {
+        if cfg!(windows) {
+            vec![("opcache.cache_id".to_string(), format!("ephpm-{}", process::id()))]
+        } else {
+            Vec::new()
+        }
+    }
+
     #[test]
     fn test_opcache_ini_lines_dev_default() {
         // Dev mode derives nothing — only the mode-appropriate
         // validate_timestamps line plus the always-emitted memory_limit,
-        // keeping the dev php.ini minimal.
+        // keeping the dev php.ini minimal. (On Windows the per-process
+        // opcache.cache_id rides along: the ASLR reattach collision kills
+        // `ephpm dev` just as dead as `ephpm serve`.)
         let cfg = PhpConfig::default();
         let lines = cfg.opcache_ini_lines(true, false);
-        assert_eq!(
-            lines,
-            vec![
-                ("opcache.validate_timestamps".to_string(), "1".to_string()),
-                ("memory_limit".to_string(), "128M".to_string()),
-            ]
-        );
+        let mut expected = vec![("opcache.validate_timestamps".to_string(), "1".to_string())];
+        expected.extend(cache_id_lines());
+        expected.push(("memory_limit".to_string(), "128M".to_string()));
+        assert_eq!(lines, expected);
     }
 
     #[test]
@@ -6740,14 +6866,13 @@ eviction_policy = "lru"
             ..PhpConfig::default()
         };
         let lines = cfg.opcache_ini_lines(true, false);
-        assert_eq!(
-            lines,
-            vec![
-                ("opcache.validate_timestamps".to_string(), "1".to_string()),
-                ("opcache.revalidate_freq".to_string(), "60".to_string()),
-                ("memory_limit".to_string(), "128M".to_string()),
-            ]
-        );
+        let mut expected = vec![
+            ("opcache.validate_timestamps".to_string(), "1".to_string()),
+            ("opcache.revalidate_freq".to_string(), "60".to_string()),
+        ];
+        expected.extend(cache_id_lines());
+        expected.push(("memory_limit".to_string(), "128M".to_string()));
+        assert_eq!(lines, expected);
     }
 
     #[test]
@@ -6997,14 +7122,112 @@ eviction_policy = "lru"
     fn test_derive_tuning_large_4gi_4cpu() {
         let mem = 4u64 * 1024 * 1024 * 1024; // 4 GiB
         let d = derive_tuning(Some(4.0), Some(mem), 4, false);
-        // 18% of 4096 MiB = 737 MiB -> clamps down to the 512 MB ceiling.
-        assert_eq!(d.opcache_memory_consumption, Some(512));
-        // interned: 512/16 = 32 (within [8,64]).
-        assert_eq!(d.opcache_interned_strings_buffer, Some(32));
-        // jit: 4096/64 = 64 MB (at the ceiling).
+        // 18% of 4096 MiB = 737 MiB -> clamps down to the platform ceiling:
+        // 512 MB on Unix, 256 MB on Windows (pagefile-backed, commit-charged
+        // in full at startup).
+        let ceiling = opcache_shm_ceiling_mb();
+        assert_eq!(d.opcache_memory_consumption, Some(ceiling));
+        // interned: ceiling/16 -> 32 on Unix, 16 on Windows (both within [8,64]).
+        assert_eq!(d.opcache_interned_strings_buffer, Some(ceiling / 16));
+        // jit: 4096/64 = 64 MB (at the ceiling) — not platform-shaped.
         assert_eq!(d.opcache_jit_buffer_size, Some(64));
-        // memory_limit: (4096 - 512 - 64)/4 = 880 MiB.
-        assert_eq!(d.memory_limit.as_deref(), Some("880M"));
+        // memory_limit: (4096 - ceiling - 64)/4 -> 880M on Unix, 944M on Windows.
+        let expected_limit = format!("{}M", (4096 - u64::from(ceiling) - 64) / 4);
+        assert_eq!(d.memory_limit.as_deref(), Some(expected_limit.as_str()));
+    }
+
+    // --- Windows OPcache SHM: ASLR reattach collision (issue #362) ---
+
+    #[test]
+    fn test_windows_opcache_shm_ceiling_is_pinned() {
+        // The Windows ceiling is load-bearing, not cosmetic: PHP's Windows SHM
+        // segment is pagefile-backed and commit-charged in full at startup, and
+        // a create failure is a hard exit(-2) inside php_module_startup. Pin
+        // both constants so a future tuning sweep cannot quietly raise them.
+        assert_eq!(WINDOWS_OPCACHE_SHM_CEILING_MB, 256);
+        assert_eq!(UNIX_OPCACHE_SHM_CEILING_MB, 512);
+        if cfg!(windows) {
+            assert_eq!(opcache_shm_ceiling_mb(), 256);
+        } else {
+            assert_eq!(opcache_shm_ceiling_mb(), 512);
+        }
+    }
+
+    #[test]
+    fn test_derived_opcache_shm_never_exceeds_platform_ceiling() {
+        // Sweep budgets from tiny to absurd; the derived value must always stay
+        // inside [64, ceiling] on whatever platform this is compiled for.
+        let ceiling = opcache_shm_ceiling_mb();
+        for gib in [0u64, 1, 2, 4, 8, 16, 64, 128, 512] {
+            let mem = if gib == 0 { None } else { Some(gib * 1024 * MIB) };
+            let d = derive_tuning(Some(4.0), mem, 4, false);
+            let mb = d.opcache_memory_consumption.expect("serve mode always derives a value");
+            assert!(
+                (64..=ceiling).contains(&mb),
+                "budget {gib}GiB derived {mb}MB, outside [64, {ceiling}]"
+            );
+        }
+    }
+
+    #[test]
+    fn test_explicit_opcache_shm_is_honoured_above_the_ceiling() {
+        // The ceiling bounds the DERIVED value only — an operator who pins a
+        // larger size still gets exactly what they asked for on every platform.
+        let cfg = PhpConfig { opcache_memory_consumption: Some(1024), ..PhpConfig::default() };
+        let at = cfg.autotune(false, false);
+        assert_eq!(at.memory_consumption.value, 1024);
+        assert_eq!(at.memory_consumption.origin, Origin::Explicit);
+        assert!(
+            at.ini_lines()
+                .contains(&("opcache.memory_consumption".to_string(), "1024".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_shm_warning_only_fires_for_explicit_over_ceiling_on_windows() {
+        // Derived values never warn (they are already capped).
+        assert_eq!(PhpConfig::default().autotune(false, false).shm_warning(), None);
+
+        // An explicit value at or below the ceiling never warns.
+        let at_low = PhpConfig {
+            opcache_memory_consumption: Some(opcache_shm_ceiling_mb()),
+            ..PhpConfig::default()
+        }
+        .autotune(false, false);
+        assert_eq!(at_low.shm_warning(), None);
+
+        // An explicit value above it warns on Windows, and stays silent on
+        // Unix where the mapping is anonymous and lazily committed.
+        let at_high = PhpConfig { opcache_memory_consumption: Some(2048), ..PhpConfig::default() }
+            .autotune(false, false);
+        if cfg!(windows) {
+            let w = at_high.shm_warning().expect("windows warns above the ceiling");
+            assert!(w.contains("2048"), "warning should name the value: {w}");
+        } else {
+            assert_eq!(at_high.shm_warning(), None);
+        }
+    }
+
+    #[test]
+    fn test_windows_emits_private_opcache_cache_id() {
+        // The real fix for the "Opcode handlers are unusable due to ASLR"
+        // startup abort: a per-process `opcache.cache_id` puts this process in
+        // its own SHM namespace, so PHP always takes the segment-create path
+        // and never the cross-process reattach path that performs the
+        // execute_ex address check. `opcache.cache_id` is a Windows-only PHP
+        // directive (the struct field does not exist on POSIX), so it must
+        // NOT be emitted elsewhere.
+        for (dev, multi) in [(false, false), (true, false), (false, true)] {
+            let lines = PhpConfig::default().opcache_ini_lines(dev, multi);
+            let found: Vec<&String> =
+                lines.iter().filter(|(k, _)| k == "opcache.cache_id").map(|(_, v)| v).collect();
+            if cfg!(windows) {
+                assert_eq!(found.len(), 1, "dev={dev} multi={multi}: expected one cache_id");
+                assert_eq!(found[0], &format!("ephpm-{}", process::id()));
+            } else {
+                assert!(found.is_empty(), "dev={dev} multi={multi}: cache_id is Windows-only");
+            }
+        }
     }
 
     #[test]

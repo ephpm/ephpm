@@ -149,6 +149,30 @@ authoritative details:
   failures are never silent.
 - **Shebang lines are fine**: `#!/usr/bin/env php` at the top of a worker
   script (including Composer `vendor/bin` proxies) is skipped by the engine.
+- **Runaway recursion** is a normal error, not a crash. Every thread that runs
+  PHP gets an 8 MiB stack — the same size a stock `php-fpm` worker gets from
+  `ulimit -s` — and PHP's own C-stack guard raises a catchable
+  `Error: Maximum call stack size of 8339456 bytes ... reached` before the
+  thread runs out. Catch it in your loop and the worker keeps serving without
+  even a recycle; let it escape and it is an ordinary fatal (500 + recycle).
+  This matters for template/block renderers, which spend a C frame per nesting
+  level whenever the recursion passes through an internal function
+  (`array_map`, `preg_replace_callback`, `call_user_func_array`).
+
+  ```php
+  try {
+      $body = $app->handle($envelope);
+  } catch (\Throwable $e) {          // includes the stack-limit Error
+      $body = '500';
+  }
+  ```
+
+- **Known limitation.** One fault class is still fatal to the *process*:
+  exhausting the stack inside PHP's **destructor cascade** (freeing a very large
+  plain-object graph), which recurses purely in C and passes no checkpoint PHP
+  can test. `[php] crash_containment` contains that, but it requires
+  `fpm_engine = "pool"` and is therefore **not available in worker mode**. See
+  [Diagnosing crashes](/guides/diagnosing-crashes/).
 
 ## Observability
 

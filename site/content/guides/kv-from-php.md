@@ -206,6 +206,21 @@ ephpm_kv_set("session:{$id}", json_encode($data));
 ephpm_kv_expire("session:{$id}", 3600);         // 1 hour (seconds)
 ```
 
+## Shutdown functions and destructors
+
+**Do not put KV calls in `register_shutdown_function()` callbacks or in
+`__destruct()`.** ePHPm keeps one long-lived SAPI request open per worker
+thread, so a shutdown function does not run at the end of *your* request —
+it runs when the worker thread itself retires, by which point that thread's
+per-request KV state is gone.
+
+Calls made from there fail closed rather than crashing the server: a `get`
+reports a miss, a `set` returns `false`, and in multi-tenant mode nothing
+falls back to another site's keyspace. Do your KV work inside the request.
+
+The same rule applies to [`ephpm_db_*`](/guides/db-from-php/), which throws
+a distinct exception in that situation.
+
 ## Configuration
 
 ```toml

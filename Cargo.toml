@@ -36,6 +36,20 @@ opentelemetry = { version = "0.31", default-features = false, features = ["trace
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 tracing-opentelemetry = { version = "0.32", default-features = false }
+# The OTLP exporter's HTTP client, so an `https://` collector endpoint works
+# (without these features reqwest is built with no TLS backend at all and
+# every https:// export fails at connect time).
+#
+# `rustls-tls-manual-roots-no-provider` is the ONLY correct feature here.
+# Every other `rustls-tls-*` feature ALSO enables reqwest's `__rustls-ring`,
+# which links `ring` and reintroduces the multi-provider bug tracked in #241
+# (see `ephpm-server/src/tls.rs::crypto_provider`). "manual roots" +
+# "no provider" means reqwest supplies neither a crypto provider nor a root
+# store; `otlp.rs` hands it a fully-built `rustls::ClientConfig` instead.
+# That is also why the roots are our own dependencies below.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-manual-roots-no-provider"] }
+rustls-native-certs = "0.8"
+webpki-roots = "0.26"
 thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

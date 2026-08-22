@@ -527,11 +527,33 @@ fn run_side(
 
 /// Per-side context handed to normalizers.
 struct NormCtx<'a> {
-    /// The binary path exactly as invoked (for `strip-binary-path`).
-    binary: &'a str,
+    /// Every spelling of this side's binary path (for `strip-binary-path`):
+    /// the path exactly as invoked, plus its canonical form when that differs.
+    ///
+    /// Both are needed because the two sides report the path differently:
+    /// php-cli's `PHP_BINARY` is `realpath(argv[0])`, so a symlinked or
+    /// non-canonical invocation path would survive folding on one side and
+    /// not the other, and the case would fail on a difference that is purely
+    /// how the harness spelled the path.
+    binary: &'a [String],
     /// The per-side scratch dir (always normalized — it is harness-provided
     /// and definitionally differs between the sides).
     tmpdir: &'a str,
+}
+
+/// The spellings of `bin` that `strip-binary-path` folds: as given, plus the
+/// canonical path when it is different. Longest first, so folding the longer
+/// spelling can't be pre-empted by a shorter one that is its prefix.
+fn binary_spellings(bin: &Path) -> Vec<String> {
+    let mut out = vec![bin.to_string_lossy().into_owned()];
+    if let Ok(real) = bin.canonicalize() {
+        let real = real.to_string_lossy().into_owned();
+        if !out.contains(&real) {
+            out.push(real);
+        }
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    out
 }
 
 /// Replace every occurrence of `needle` with `replacement` (byte-level).
@@ -640,7 +662,13 @@ fn normalize(input: &[u8], names: &[String], ctx: &NormCtx<'_>) -> Vec<u8> {
                 replace_bytes(&t, b"(NTS)", b"(TS)")
             }
             "strip-distro-banner" => strip_distro_banner(&out),
-            "strip-binary-path" => replace_bytes(&out, ctx.binary.as_bytes(), b"<BINARY>"),
+            "strip-binary-path" => {
+                let mut folded = out;
+                for spelling in ctx.binary {
+                    folded = replace_bytes(&folded, spelling.as_bytes(), b"<BINARY>");
+                }
+                folded
+            }
             // Unknown names are rejected at meta-parse time.
             other => unreachable!("unvalidated normalizer {other}"),
         };
@@ -948,14 +976,10 @@ fn run_conformance(opts: &Options, ephpm_bin: &Path) -> Result<bool, String> {
         let up_cap = run_side(upstream_side.bin, &up_argv, &case.stdin, &up_dir)?;
         let ep_cap = run_side(ephpm_side.bin, &ep_argv, &case.stdin, &ep_dir)?;
 
-        let up_ctx = NormCtx {
-            binary: &upstream_side.bin.to_string_lossy(),
-            tmpdir: &up_dir.to_string_lossy(),
-        };
-        let ep_ctx = NormCtx {
-            binary: &ephpm_side.bin.to_string_lossy(),
-            tmpdir: &ep_dir.to_string_lossy(),
-        };
+        let up_bin = binary_spellings(upstream_side.bin);
+        let ep_bin = binary_spellings(ephpm_side.bin);
+        let up_ctx = NormCtx { binary: &up_bin, tmpdir: &up_dir.to_string_lossy() };
+        let ep_ctx = NormCtx { binary: &ep_bin, tmpdir: &ep_dir.to_string_lossy() };
         let (mismatch, up_norm, ep_norm) =
             compare(&up_cap, &ep_cap, &case.meta.normalize, &up_ctx, &ep_ctx);
 
@@ -1158,13 +1182,40 @@ mod tests {
 
     #[test]
     fn zts_and_binary_normalizers() {
-        let ctx = NormCtx { binary: "/usr/bin/php8.5", tmpdir: "/tmp/x" };
+        let bin = ["/usr/bin/php8.5".to_string()];
+        let ctx = NormCtx { binary: &bin, tmpdir: "/tmp/x" };
         let out = normalize(
             b"PHP (ZTS) at /usr/bin/php8.5 in /tmp/x/file",
             &["strip-zts-marker".to_string(), "strip-binary-path".to_string()],
             &ctx,
         );
         assert_eq!(String::from_utf8(out).unwrap(), "PHP (TS) at <BINARY> in <TMPDIR>/file");
+    }
+
+    /// A side whose binary was invoked through one path but reports another
+    /// (php-cli's PHP_BINARY is `realpath(argv[0])`) must have BOTH spellings
+    /// folded, or the case fails on how the harness spelled the path.
+    #[test]
+    fn binary_normalizer_folds_every_spelling() {
+        let bin = ["/usr/bin/php8.5".to_string(), "/opt/php85/bin/php".to_string()];
+        let ctx = NormCtx { binary: &bin, tmpdir: "/tmp/x" };
+        let out = normalize(
+            b"invoked /usr/bin/php8.5 reported /opt/php85/bin/php",
+            &["strip-binary-path".to_string()],
+            &ctx,
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), "invoked <BINARY> reported <BINARY>");
+    }
+
+    /// Longest-first ordering: folding `/bin/php` first would leave `8.5`
+    /// dangling out of `/bin/php8.5`.
+    #[test]
+    fn binary_spellings_are_longest_first() {
+        let mut spellings = vec!["/bin/php".to_string(), "/bin/php8.5".to_string()];
+        spellings.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        let ctx = NormCtx { binary: &spellings, tmpdir: "/tmp/x" };
+        let out = normalize(b"/bin/php8.5", &["strip-binary-path".to_string()], &ctx);
+        assert_eq!(String::from_utf8(out).unwrap(), "<BINARY>");
     }
 
     #[test]
@@ -1176,8 +1227,9 @@ mod tests {
 
     #[test]
     fn compare_detects_channel_mismatches() {
-        let ctx_a = NormCtx { binary: "a", tmpdir: "/ta" };
-        let ctx_b = NormCtx { binary: "b", tmpdir: "/tb" };
+        let (bin_a, bin_b) = (["a".to_string()], ["b".to_string()]);
+        let ctx_a = NormCtx { binary: &bin_a, tmpdir: "/ta" };
+        let ctx_b = NormCtx { binary: &bin_b, tmpdir: "/tb" };
         let up =
             Capture { stdout: b"same".to_vec(), stderr: b"warn".to_vec(), exit: ExitKind::Code(0) };
         let ep =
@@ -1191,8 +1243,9 @@ mod tests {
 
     #[test]
     fn tmpdir_always_normalized() {
-        let ctx_a = NormCtx { binary: "a", tmpdir: "/scratch/up" };
-        let ctx_b = NormCtx { binary: "b", tmpdir: "/scratch/ep" };
+        let (bin_a, bin_b) = (["a".to_string()], ["b".to_string()]);
+        let ctx_a = NormCtx { binary: &bin_a, tmpdir: "/scratch/up" };
+        let ctx_b = NormCtx { binary: &bin_b, tmpdir: "/scratch/ep" };
         let up = Capture {
             stdout: b"cwd=/scratch/up".to_vec(),
             stderr: vec![],

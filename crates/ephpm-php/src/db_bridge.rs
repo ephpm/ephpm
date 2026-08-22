@@ -140,6 +140,63 @@
 //! since the last request", and the drain is a single relaxed atomic load when
 //! it is empty — which it is on every request in a steady-state server.
 //!
+//! # Thread teardown calls *back into* the bridge (issue #269)
+//!
+//! Parking the session (above) keeps thread exit from dropping engine state.
+//! The mirror-image hazard is that thread exit *runs PHP*, and that PHP can
+//! call back in here after this module's own thread-locals are gone.
+//!
+//! [`ThreadPhpGuard`](crate)'s destructor (issue #266) calls
+//! `php_request_shutdown()` on the retiring thread, which executes every
+//! `register_shutdown_function()` callback and every object destructor the
+//! script left behind. A callback that calls `ephpm_db_*` reaches a thread
+//! whose bridge cells have already been destroyed:
+//!
+//! 1. `THREAD_REGISTERED` (the guard) is first touched by
+//!    `PhpRuntime::ensure_thread_registered()`, i.e. **before** the thread's
+//!    first query.
+//! 2. [`DB_PARAMS`], [`DB_ROWS`], [`DB_LAST`], [`DB_ERROR`] and [`DB_HELD`]
+//!    are first touched *inside* that first query — registered strictly later,
+//!    in that order (see [`run_on`], which reaches them through
+//!    [`reset_staged`]).
+//! 3. Destructors run in reverse registration order, so the guard's runs
+//!    **last** and all five are already destroyed when the shutdown function
+//!    executes. This is the ordinary case, not a race.
+//!
+//! `LocalKey::with` on a destroyed value panics, and that panic is raised
+//! inside a TLS destructor: `fatal runtime error: thread local panicked on
+//! drop` → **`SIGABRT`**. Same process-wide abort as #300, from the other
+//! direction.
+//!
+//! Every access reachable from a PHP native therefore uses
+//! [`LocalKey::try_with`](std::thread::LocalKey::try_with) and degrades:
+//!
+//! * a `run` becomes [`RunStatus::Gone`], which the C wrapper turns into a
+//!   clean, distinctly-worded `\Exception` — never a panic, never a silent
+//!   success;
+//! * the row accessors report "nothing staged", exactly as they already do
+//!   after [`finish`], and the metadata accessors report [`LastCall::EMPTY`] —
+//!   what a thread that has run nothing yet reports;
+//! * [`in_transaction`] and [`is_available`] report `false`, which is what
+//!   holds: a statement issued from here reaches no database;
+//! * [`params_reset`] / [`param_push`] / [`finish`] become no-ops.
+//!
+//! **A statement never runs on a half-destroyed thread.** [`run_on`] reaches
+//! [`DB_HELD`] — the last cell a query touches, and therefore the *first* of
+//! the five to be destroyed — before it touches the backend, so a parameter
+//! lost by a no-op [`param_push`] can never become a silently wrong query. It
+//! additionally probes *both* result cells ([`DB_ROWS`] and [`DB_LAST`]) before
+//! executing, so a run can never stage half a result.
+//!
+//! Accesses that are *not* reachable from PHP keep plain `with`: it is
+//! clearer, and the fallible form would be unreachable code. [`set_current_site`]
+//! is called by the Rust router on a live thread before PHP runs, and the test
+//! helpers run on live libtest threads.
+//!
+//! Nothing on the degraded path logs. `tracing`'s own per-thread state may be
+//! destroyed as well (`ThreadPhpGuard::drop` notes the same), and a panic out
+//! of the logger would be the abort this exists to prevent.
+//!
 //! # Async boundary
 //!
 //! `Session::query` is async but PHP FFI callbacks are synchronous, so the
@@ -350,6 +407,11 @@ pub fn is_configured() -> bool {
 /// clears any previous key so a subsequent query in per-site mode fails closed
 /// rather than silently reusing a stale site.
 pub fn set_current_site(site_key: Option<&str>) {
+    // Plain `with` on purpose (issue #269): this is Rust-side per-request
+    // setup, called by the router on a live thread before PHP executes — it
+    // is unreachable from a shutdown function or destructor, so a `try_with`
+    // here would only add an unreachable branch. The *read* side
+    // (`site_swap_target`) is reachable from PHP and does use `try_with`.
     DB_CURRENT_SITE.with(|s| {
         *s.borrow_mut() = site_key.map(Box::from);
     });
@@ -568,16 +630,58 @@ pub enum RunStatus {
     Err,
     /// No backend registered — `[db.sqlite]` is not active.
     Unavailable,
+    /// This thread's bridge state has already been destroyed: the thread is
+    /// exiting and PHP is running shutdown functions / destructors on the way
+    /// out (issue #269 — see the module docs). Distinct from
+    /// [`RunStatus::Unavailable`], which means the *server* has no embedded
+    /// database at all; here one exists and this thread simply can no longer
+    /// reach it.
+    ///
+    /// **No statement was executed.** [`run_on`] establishes that every cell
+    /// the execution path needs is still reachable *before* it touches the
+    /// backend, so this is a guarantee rather than a likelihood — a caller
+    /// that retries cannot double-apply a write.
+    Gone,
+}
+
+/// Why a [`run_on`] could not produce a result.
+enum RunFailure {
+    /// A MySQL-shaped error was (or can be) staged for the C side to read.
+    Error(BridgeError),
+    /// A bridge thread-local was already destroyed — see [`RunStatus::Gone`].
+    Gone,
+}
+
+impl From<BridgeError> for RunFailure {
+    fn from(e: BridgeError) -> Self {
+        Self::Error(e)
+    }
+}
+
+impl From<std::thread::AccessError> for RunFailure {
+    fn from(_: std::thread::AccessError) -> Self {
+        Self::Gone
+    }
 }
 
 /// Clear the staged parameter list for this thread.
+///
+/// A no-op once the cell is destroyed (issue #269): the [`run_sql_bytes`] that
+/// would have consumed the list reaches the same teardown and reports
+/// [`RunStatus::Gone`], so a skipped reset cannot leak stale parameters into a
+/// statement.
 pub fn params_reset() {
-    DB_PARAMS.with(|p| p.borrow_mut().clear());
+    let _ = DB_PARAMS.try_with(|p| p.borrow_mut().clear());
 }
 
 /// Stage one parameter for the next [`run_sql_bytes`] on this thread.
+///
+/// A no-op once the cell is destroyed (issue #269). Dropping a parameter
+/// cannot produce a wrong query: [`run_on`] gates on [`DB_HELD`], which is
+/// destroyed *before* [`DB_PARAMS`], so the statement is refused rather than
+/// run with a short parameter list.
 pub fn param_push(v: Value) {
-    DB_PARAMS.with(|p| p.borrow_mut().push(v));
+    let _ = DB_PARAMS.try_with(|p| p.borrow_mut().push(v));
 }
 
 /// Convert PHP string bytes to a bind [`Value`]: valid UTF-8 binds as
@@ -600,23 +704,36 @@ pub fn bytes_to_value(bytes: &[u8]) -> Value {
 /// [`ok_info`]) and the staged error ([`with_error`]) deliberately **survive**
 /// this — see the module docs, `What survives finish()`. They are cleared by
 /// the next [`run_sql_bytes`] on this thread, or by [`on_request_end`].
+///
+/// A no-op once the cell is destroyed (issue #269) — thread teardown is
+/// releasing exactly the memory this would have released.
 pub fn finish() {
     // `clear()` rather than assigning a fresh Vec: the row buffer's capacity is
     // reused by the next statement on this thread, which is the common case.
-    DB_ROWS.with(|r| r.borrow_mut().clear());
+    let _ = DB_ROWS.try_with(|r| r.borrow_mut().clear());
 }
 
 /// Discard everything staged for this thread — rows, last-call record, and
 /// error alike. The full reset that [`finish`] deliberately is not.
+///
+/// Every cell is reached with `try_with` for the same reason [`finish`] is
+/// (issue #269): this runs at the top of every [`run_sql_bytes`] and from
+/// [`on_request_end`], both of which a shutdown function can reach on a
+/// retiring thread.
 fn reset_staged() {
     finish();
-    DB_LAST.with(|l| *l.borrow_mut() = LastCall::EMPTY);
-    DB_ERROR.with(|e| *e.borrow_mut() = None);
+    let _ = DB_LAST.try_with(|l| *l.borrow_mut() = LastCall::EMPTY);
+    let _ = DB_ERROR.try_with(|e| *e.borrow_mut() = None);
 }
 
 fn stage_error(err: BridgeError) -> RunStatus {
-    DB_ERROR.with(|e| *e.borrow_mut() = Some(err));
-    RunStatus::Err
+    match DB_ERROR.try_with(|e| *e.borrow_mut() = Some(err)) {
+        Ok(()) => RunStatus::Err,
+        // The error has nowhere to be read back from, and the C side would
+        // format the empty accessor output into `SQLSTATE[HY000]: `. Report
+        // the condition that actually holds instead (issue #269).
+        Err(_) => RunStatus::Gone,
+    }
 }
 
 /// Build an infrastructure failure: one of the reserved codes from the module
@@ -724,25 +841,29 @@ pub fn run_sql_bytes(sql: &[u8]) -> RunStatus {
 fn site_swap_target(
     source: &BackendSource,
     held_site: Option<&str>,
-) -> Result<Option<Box<str>>, BridgeError> {
+) -> Result<Option<Box<str>>, RunFailure> {
     match source {
         BackendSource::Single(_) => Ok(if held_site == Some(SINGLE_SITE_KEY) {
             None
         } else {
             Some(Box::from(SINGLE_SITE_KEY))
         }),
-        BackendSource::PerSite(_) => DB_CURRENT_SITE.with(|s| {
+        // `try_with`, not `with` (issue #269): reachable from a shutdown
+        // function on an exiting thread. A destroyed key fails the whole run
+        // rather than degrading to "no site", which would be indistinguishable
+        // from a genuinely untenanted request.
+        BackendSource::PerSite(_) => DB_CURRENT_SITE.try_with(|s| {
             let current = s.borrow();
             let Some(current) = current.as_deref() else {
-                return Err(infra_error(
+                return Err(RunFailure::Error(infra_error(
                     ERR_NO_SITE_CONTEXT,
                     "no per-site database context for this request — multi-site \
                      database isolation could not determine the tenant"
                         .to_string(),
-                ));
+                )));
             };
             Ok(if held_site == Some(current) { None } else { Some(Box::from(current)) })
-        }),
+        })?,
     }
 }
 
@@ -762,18 +883,28 @@ fn backend_for(source: &BackendSource, site: &str) -> Result<SharedBackend, Brid
 /// can drive a locally-constructed [`DbBridge`] (with a mock backend)
 /// without going through the process-wide, set-once [`DB_BRIDGE`].
 fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
-    let params: Vec<Value> = DB_PARAMS.with(|p| std::mem::take(&mut *p.borrow_mut()));
+    // `try_with` throughout (issue #269): a `register_shutdown_function`
+    // callback running inside `php_request_shutdown()` on an exiting thread
+    // lands here with these cells already destroyed.
+    let Ok(params) = DB_PARAMS.try_with(|p| std::mem::take::<Vec<Value>>(&mut p.borrow_mut()))
+    else {
+        return RunStatus::Gone;
+    };
     reset_staged();
 
     let Some(bridge) = bridge else {
         // Staged as well as signalled: the C side throws from the RunStatus,
         // but `ephpm_db_errno()` / `ephpm_db_error()` read the staged triple,
         // and an adapter must see the same reserved code either way (#259).
-        stage_error(infra_error(
+        //
+        // If the error cell is already gone (issue #269) the reserved code
+        // could not be read back, so report the condition that actually holds
+        // rather than an `Unavailable` whose errno would read 0.
+        let staged = stage_error(infra_error(
             ERR_UNAVAILABLE,
             "no embedded database is active (requires [db.sqlite])".to_string(),
         ));
-        return RunStatus::Unavailable;
+        return if staged == RunStatus::Gone { RunStatus::Gone } else { RunStatus::Unavailable };
     };
 
     let Ok(sql) = std::str::from_utf8(sql) else {
@@ -796,7 +927,24 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
         });
     }
 
-    let outcome = DB_HELD.with(|cell| {
+    // The gate (issue #269). Every cell the execution path still needs is
+    // checked HERE, before anything runs — which is what makes "`Gone` means
+    // no statement was executed" unconditional rather than probable. Only this
+    // thread destroys its own thread-locals, and this thread is executing
+    // here, so a cell that is live at this line stays live for the rest of the
+    // call: the staging `with`es in [`stage_result`] cannot panic.
+    //
+    // BOTH result cells are probed, not just one: a successful run stages rows
+    // into `DB_ROWS` and metadata into `DB_LAST`, and half a staged result is
+    // worse than none.
+    //
+    // `DB_HELD` is the last cell a query touches and therefore the FIRST of
+    // this module's cells to be destroyed, so on a retiring thread this is
+    // where a shutdown-function call actually stops.
+    if !is_live(&DB_ROWS) || !is_live(&DB_LAST) {
+        return RunStatus::Gone;
+    }
+    let Ok(outcome) = DB_HELD.try_with(|cell| {
         let mut slot = cell.0.borrow_mut();
 
         // Swap the held session if it belongs to a different site (or none):
@@ -840,10 +988,10 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
                     });
                 }
                 Err(e) => {
-                    return Err(infra_error(
+                    return Err(RunFailure::Error(infra_error(
                         ERR_CONNECT,
                         format!("failed to open embedded database session: {e}"),
-                    ));
+                    )));
                 }
             }
         }
@@ -869,12 +1017,15 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
                 *slot = None;
             }
         }
-        result.map_err(BridgeError::from)
-    });
+        result.map_err(|e| RunFailure::Error(BridgeError::from(e)))
+    }) else {
+        return RunStatus::Gone;
+    };
 
     match outcome {
         Ok(result) => stage_result(result),
-        Err(e) => stage_error(e),
+        Err(RunFailure::Error(e)) => stage_error(e),
+        Err(RunFailure::Gone) => RunStatus::Gone,
     }
 }
 
@@ -883,6 +1034,10 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
 /// (which outlives it).
 ///
 /// Nothing is cloned — `columns` and `rows` are moved out of the `ResultSet`.
+///
+/// Plain `with` throughout: the only caller is [`run_on`], whose gate has
+/// established that both cells are live, and only this thread can destroy
+/// them — it has been running that function ever since (issue #269).
 fn stage_result(result: SessionResult) -> RunStatus {
     match result {
         SessionResult::Rows(rs) => {
@@ -1221,9 +1376,12 @@ fn strip_leading_noise(stmt: &str) -> &str {
 ///    issue a `ROLLBACK` through the session and `tracing::warn!`.
 ///    Without this the transaction stays open on the worker thread and
 ///    the next unrelated request's writes silently join it.
-/// 2. Release the staged result/error buffers ([`finish`]) so the memory
-///    of a request's last query does not sit around until the thread's
-///    next request.
+/// 2. Discard everything staged for this thread — rows, last-call record,
+///    and error ([`reset_staged`]) — so the memory of a request's last
+///    query does not sit around until the thread's next request, and so the
+///    record can never be read by the *next* request on this thread. This is
+///    the full reset, not [`finish`]: the record and error outlive `finish()`
+///    on purpose, but must not outlive their request.
 ///
 /// If the rollback itself fails (typically because the connection under
 /// the transaction died), the session is dropped entirely: the server
@@ -1232,12 +1390,27 @@ fn strip_leading_noise(stmt: &str) -> &str {
 ///
 /// Idempotent and cheap when there is nothing to do (no session, or no
 /// open transaction). Safe in stub mode — no PHP types are involved.
+///
+/// Safe to call on a thread that is already tearing down (issue #269): it does
+/// nothing there rather than panicking or draining the graveyard from a TLS
+/// destructor.
 pub fn on_request_end() {
     // The full reset, not `finish()`: the last-call record and staged error
     // outlive `finish()` on purpose, but must never outlive the request that
     // produced them — the next request on this thread would otherwise read
-    // another request's `ephpm_db_errno()`.
+    // another request's `ephpm_db_errno()`. Inert on a retiring thread
+    // (issue #269): every cell it touches is reached with `try_with`.
     reset_staged();
+    // Everything below needs a LIVE thread. [`DB_HELD`] being unreachable is
+    // the precise signal that this thread is inside its TLS-destructor phase —
+    // where `HeldCell::drop` has already parked this thread's session, and
+    // where draining the graveyard would run engine drop glue against
+    // already-destroyed foreign thread-locals: the #300 abort, reintroduced
+    // from the #269 direction (a shutdown function reaching `send_response`).
+    // Some other request, on a live thread, will drain what this one skipped.
+    if !is_live(&DB_HELD) {
+        return;
+    }
     // Safe point for the sessions of threads that have retired since the last
     // request: this is ordinary code on a live thread, so the engine drop glue
     // that would abort inside a TLS destructor runs harmlessly here (issue
@@ -1247,7 +1420,12 @@ pub fn on_request_end() {
     let Some(bridge) = DB_BRIDGE.get() else {
         return;
     };
-    DB_HELD.with(|cell| {
+    // `try_with` (issue #269): worker mode reaches this from inside the
+    // `ephpm_worker_send_response` native, so a shutdown function can too. A
+    // destroyed cell means `HeldCell::drop` has already parked the session —
+    // the rollback is moot, and the parked session's connection abandons the
+    // transaction when the next request drains the graveyard.
+    let _ = DB_HELD.try_with(|cell| {
         let mut slot = cell.0.borrow_mut();
         let Some(held) = slot.as_mut() else {
             return;
@@ -1275,11 +1453,47 @@ pub fn on_request_end() {
     });
 }
 
+/// Whether a thread-local cell can still be reached from the current thread.
+///
+/// `try_with` with an empty closure: it reports the cell's state without
+/// borrowing the value, and only *this* thread can destroy its own
+/// thread-locals — so a `false` cannot become `true` (or a `true` become
+/// `false`) between the probe and the access that follows it. That is what
+/// lets the accessors below hand a closure to a plain `with` and still be
+/// panic-free on a retiring thread (issue #269).
+fn is_live<T: 'static>(key: &'static std::thread::LocalKey<T>) -> bool {
+    key.try_with(|_| ()).is_ok()
+}
+
+/// Run `f` against this thread's staged rows.
+///
+/// A destroyed cell is reported to `f` as an empty slice — the same "nothing
+/// staged" it already sees after [`finish`] (issue #269). Every row accessor
+/// goes through here, so the degraded answer is defined in exactly one place.
+fn with_rows<R>(f: impl FnOnce(&[Vec<Value>]) -> R) -> R {
+    if !is_live(&DB_ROWS) {
+        return f(&[]);
+    }
+    DB_ROWS.with(|r| f(&r.borrow()))
+}
+
+/// Run `f` against this thread's last-call record.
+///
+/// A destroyed cell is reported to `f` as [`LastCall::EMPTY`] — the same
+/// "nothing has run on this thread" a fresh thread sees (issue #269). Every
+/// metadata accessor goes through here, the counterpart of [`with_rows`].
+fn with_last<R>(f: impl FnOnce(&LastCall) -> R) -> R {
+    if !is_live(&DB_LAST) {
+        return f(&LastCall::EMPTY);
+    }
+    DB_LAST.with(|l| f(&l.borrow()))
+}
+
 /// Number of rows currently staged. Zero once [`finish`] has released them,
 /// and zero for a statement that produced no result set.
 #[must_use]
 pub fn row_count() -> usize {
-    DB_ROWS.with(|r| r.borrow().len())
+    with_rows(<[Vec<Value>]>::len)
 }
 
 /// Whether the last statement on this thread produced a result set.
@@ -1289,7 +1503,7 @@ pub fn row_count() -> usize {
 /// false before this thread's first statement.
 #[must_use]
 pub fn had_rowset() -> bool {
-    DB_LAST.with(|l| l.borrow().had_rowset)
+    with_last(|l| l.had_rowset)
 }
 
 /// Number of columns the last statement's result set had (0 when it produced
@@ -1299,13 +1513,13 @@ pub fn had_rowset() -> bool {
 /// `SELECT` still reports its columns (issue #262).
 #[must_use]
 pub fn col_count() -> usize {
-    DB_LAST.with(|l| l.borrow().columns.len())
+    with_last(|l| l.columns.len())
 }
 
 /// Look at a column name of the last statement's result set. `None` when
 /// `col` is out of range or the statement produced no result set.
 pub fn with_col_name<R>(col: usize, f: impl FnOnce(Option<&str>) -> R) -> R {
-    DB_LAST.with(|l| f(l.borrow().columns.get(col).map(|c| c.name.as_str())))
+    with_last(|l| f(l.columns.get(col).map(|c| c.name.as_str())))
 }
 
 /// Look at a column's declared schema type (`INTEGER`, `TEXT`, ...).
@@ -1314,13 +1528,13 @@ pub fn with_col_name<R>(col: usize, f: impl FnOnce(Option<&str>) -> R) -> R {
 /// expression with no declared type (`SELECT a + 1`) — SQLite reports no
 /// decltype for either, and the distinction is not one the engine can make.
 pub fn with_col_decltype<R>(col: usize, f: impl FnOnce(Option<&str>) -> R) -> R {
-    DB_LAST.with(|l| f(l.borrow().columns.get(col).and_then(|c| c.decltype.as_deref())))
+    with_last(|l| f(l.columns.get(col).and_then(|c| c.decltype.as_deref())))
 }
 
 /// Look at a cell of the staged rows. `None` once [`finish`] has released
 /// them, or when `row`/`col` is out of range.
 pub fn with_cell<R>(row: usize, col: usize, f: impl FnOnce(Option<&Value>) -> R) -> R {
-    DB_ROWS.with(|r| f(r.borrow().get(row).and_then(|cells| cells.get(col))))
+    with_rows(|r| f(r.get(row).and_then(|cells| cells.get(col))))
 }
 
 /// `(affected_rows, last_insert_id)` of the last statement.
@@ -1338,10 +1552,7 @@ pub fn with_cell<R>(row: usize, col: usize, f: impl FnOnce(Option<&Value>) -> R)
 /// after the `INSERT` that produced it.
 #[must_use]
 pub fn ok_info() -> (u64, u64) {
-    DB_LAST.with(|l| {
-        let last = l.borrow();
-        (last.affected_rows, last.last_insert_id)
-    })
+    with_last(|l| (l.affected_rows, l.last_insert_id))
 }
 
 /// Whether this thread's session is currently inside an explicit transaction
@@ -1351,8 +1562,15 @@ pub fn ok_info() -> (u64, u64) {
 /// in both cases no transaction can be open, so the answer is not a guess.
 /// Reads the session's own flag, the same one the wire frontends report as
 /// `SERVER_STATUS_IN_TRANS`.
+///
+/// Also `false` on a retiring thread (issue #269): a destroyed [`DB_HELD`]
+/// means `HeldCell::drop` has already parked this thread's session, so there
+/// is no session here to be in a transaction — the same answer, not a guess.
 #[must_use]
 pub fn in_transaction() -> bool {
+    if !is_live(&DB_HELD) {
+        return false;
+    }
     DB_HELD.with(|cell| cell.0.borrow().as_ref().is_some_and(|held| held.session.in_transaction))
 }
 
@@ -1379,7 +1597,13 @@ fn available_on(bridge: Option<&DbBridge>) -> bool {
     };
     match &bridge.source {
         BackendSource::Single(_) => true,
-        BackendSource::PerSite(_) => DB_CURRENT_SITE.with(|s| s.borrow().is_some()),
+        // A destroyed key reports "not available" (issue #269) rather than
+        // panicking. That is the truthful answer: a statement issued from a
+        // retiring thread reports [`RunStatus::Gone`] and reaches no database,
+        // which is exactly what a `false` here promises.
+        BackendSource::PerSite(_) => {
+            is_live(&DB_CURRENT_SITE) && DB_CURRENT_SITE.with(|s| s.borrow().is_some())
+        }
     }
 }
 
@@ -1390,7 +1614,15 @@ fn available_on(bridge: Option<&DbBridge>) -> bool {
 /// the next [`run_sql_bytes`] on this thread and by [`on_request_end`], so a
 /// `None` here means "the last statement on this thread succeeded", not
 /// "an error was never staged".
+///
+/// A destroyed cell also reports `None` (issue #269) — the C side then formats
+/// no exception, which is correct: the only way to reach this after a destroyed
+/// cell is a `run` that already reported [`RunStatus::Gone`] and threw its own
+/// message.
 pub fn with_error<R>(f: impl FnOnce(Option<(u16, &[u8; 5], &str)>) -> R) -> R {
+    if !is_live(&DB_ERROR) {
+        return f(None);
+    }
     DB_ERROR.with(|e| match &*e.borrow() {
         Some(err) => f(Some((err.code, &err.sqlstate, err.message.as_str()))),
         None => f(None),
@@ -1399,9 +1631,12 @@ pub fn with_error<R>(f: impl FnOnce(Option<(u16, &[u8; 5], &str)>) -> R) -> R {
 
 /// Code of the staged error, or 0 when the last statement on this thread
 /// succeeded (or none has run). Backs `ephpm_db_errno()`.
+///
+/// Routed through [`with_error`] so the destroyed-cell degradation of issue
+/// #269 is defined once: a retiring thread reads 0, the same as "succeeded".
 #[must_use]
 pub fn error_code() -> u16 {
-    DB_ERROR.with(|e| e.borrow().as_ref().map_or(0, |err| err.code))
+    with_error(|e| e.map_or(0, |(code, _, _)| code))
 }
 
 // ── C-compatible ops struct (php_linked only) ───────────────────────────
@@ -1426,7 +1661,8 @@ pub struct EphpmDbOps {
     pub param_bytes: Option<unsafe extern "C" fn(p: *const std::os::raw::c_char, len: usize)>,
     /// Execute SQL with the staged parameters. Returns 1 = result set
     /// staged, 2 = OK staged, -1 = error staged, -2 = no backend
-    /// registered.
+    /// registered, -3 = this thread's bridge state is already destroyed
+    /// (thread exiting; nothing was executed — issue #269).
     pub run: Option<
         unsafe extern "C" fn(
             sql: *const std::os::raw::c_char,
@@ -1537,6 +1773,7 @@ unsafe extern "C" fn db_run(
         RunStatus::Ok => 2,
         RunStatus::Err => -1,
         RunStatus::Unavailable => -2,
+        RunStatus::Gone => -3,
     }
 }
 
@@ -2248,8 +2485,8 @@ mod tests {
 //
 // These drive `run_on` with a locally-constructed `DbBridge` wrapping a
 // mock backend, so they never touch the process-wide set-once DB_BRIDGE
-// and need no #[serial]: every thread-local involved (DB_SESSION,
-// DB_PARAMS, DB_RESULT, DB_ERROR) is private to the test's own thread.
+// and need no #[serial]: every thread-local involved (DB_HELD, DB_PARAMS,
+// DB_ROWS, DB_LAST, DB_ERROR) is private to the test's own thread.
 #[cfg(test)]
 mod recycle_tests {
     use std::sync::Arc;
@@ -3123,6 +3360,238 @@ mod teardown_tests {
              earlier-registered one drops — this inversion is what aborts the process when \
              the drop belongs to a database session (issue #300)"
         );
+    }
+
+    // ── #269: PHP userland running *during* thread teardown ─────────────
+    //
+    // The mirror image of the tests above. There, thread exit must not drop
+    // engine state; here, thread exit RUNS PHP — `ThreadPhpGuard::drop` calls
+    // `php_request_shutdown()`, which executes every
+    // `register_shutdown_function()` callback and object destructor the script
+    // left behind — and that PHP can call `ephpm_db_*` after this module's
+    // cells are already destroyed.
+    //
+    // The harness reproduces the production registration order exactly:
+    // the guard-equivalent is touched FIRST (so its destructor runs LAST), the
+    // bridge cells during the thread's first query (so they are destroyed
+    // FIRST). No mocking of the TLS state machine is involved — these are real
+    // destroyed thread-locals on a real retiring thread.
+
+    thread_local! {
+        /// Stands in for `ThreadPhpGuard`: touched before any query, so its
+        /// destructor is the last to run and every `db_bridge` cell is gone by
+        /// the time [`ShutdownHook::drop`] executes.
+        static SHUTDOWN_HOOK: RefCell<Option<ShutdownHook>> = const { RefCell::new(None) };
+    }
+
+    /// What the simulated shutdown function observed. Plain statics rather
+    /// than thread-locals — the observing thread is the one that no longer has
+    /// any.
+    static HOOK_RAN: AtomicBool = AtomicBool::new(false);
+    static HOOK_STATUS: Mutex<Option<RunStatus>> = Mutex::new(None);
+    static HOOK_ROW_COUNT: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static HOOK_COL_COUNT: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static HOOK_SAW_ERROR: AtomicBool = AtomicBool::new(true);
+    static HOOK_SAW_CELL: AtomicBool = AtomicBool::new(true);
+    // The adapter API of #259/#260/#262/#263 — every one of these reads a
+    // thread-local that issue #269 predates (`DB_LAST`, `DB_ROWS`, `DB_HELD`,
+    // `DB_CURRENT_SITE`), so each is its own way to abort the process.
+    static HOOK_HAD_ROWSET: AtomicBool = AtomicBool::new(true);
+    static HOOK_SAW_DECLTYPE: AtomicBool = AtomicBool::new(true);
+    static HOOK_ERRNO: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static HOOK_OK_INFO: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+    static HOOK_IN_TRANSACTION: AtomicBool = AtomicBool::new(true);
+    static HOOK_AVAILABLE: AtomicBool = AtomicBool::new(true);
+
+    /// A `register_shutdown_function()` callback, in Rust. Its `Drop` is the
+    /// exact seam issue #269 describes: userland code calling into the bridge
+    /// from inside a thread-local destructor.
+    struct ShutdownHook {
+        bridge: Arc<DbBridge>,
+    }
+
+    impl Drop for ShutdownHook {
+        fn drop(&mut self) {
+            HOOK_RAN.store(true, Ordering::Release);
+
+            // Parameter staging must be inert rather than panic.
+            params_reset();
+            param_push(Value::Integer(7));
+
+            // ...and the statement itself must be REFUSED. If it ran, the row
+            // would land in `hook_probe` and the test below would see it.
+            let status = run_on(Some(&self.bridge), b"INSERT INTO hook_probe (id) VALUES (?)");
+            *HOOK_STATUS.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(status);
+
+            // Every accessor degrades to "nothing staged".
+            HOOK_ROW_COUNT.store(row_count(), Ordering::Release);
+            HOOK_COL_COUNT.store(col_count(), Ordering::Release);
+            HOOK_SAW_ERROR.store(with_error(|e| e.is_some()), Ordering::Release);
+            HOOK_SAW_CELL.store(with_cell(0, 0, |c| c.is_some()), Ordering::Release);
+
+            // ...including the adapter surface added after #269 was fixed.
+            // `had_rowset`/`col_decltype`/`ok_info` read `DB_LAST`, `errno`
+            // reads `DB_ERROR`, `in_transaction` reads `DB_HELD`, and
+            // `available` reads `DB_CURRENT_SITE` — five cells, all destroyed
+            // by now, none of which may panic.
+            HOOK_HAD_ROWSET.store(had_rowset(), Ordering::Release);
+            HOOK_SAW_DECLTYPE.store(with_col_decltype(0, |d| d.is_some()), Ordering::Release);
+            HOOK_ERRNO.store(usize::from(error_code()), Ordering::Release);
+            *HOOK_OK_INFO.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(ok_info());
+            HOOK_IN_TRANSACTION.store(in_transaction(), Ordering::Release);
+            HOOK_AVAILABLE.store(available_on(Some(&self.bridge)), Ordering::Release);
+
+            // The per-request seams a framework `terminate` hook would reach.
+            // `on_request_end` must NOT drain the graveyard from here: this
+            // thread already parked its own session moments ago, and dropping
+            // a parked session on a dying thread is the #300 abort.
+            on_request_end();
+            finish();
+        }
+    }
+
+    /// A shutdown function that touches the bridge while its thread is
+    /// retiring gets a clean refusal, not a process abort (issue #269).
+    ///
+    /// Without `try_with` this test does not *fail* — the whole test binary
+    /// dies with `fatal runtime error: thread local panicked on drop`, which
+    /// is precisely the production symptom.
+    #[test]
+    #[serial]
+    fn shutdown_hook_during_thread_teardown_is_refused_not_aborted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bridge = one_site_bridge(dir.path(), "hook.test");
+
+        // Seed the target table on a live thread. The hook's INSERT is valid
+        // SQL against a real, open database — so if the refusal were cosmetic,
+        // the row count at the end would be 1.
+        set_current_site(Some("hook.test"));
+        assert_eq!(
+            run_on(Some(&bridge), b"CREATE TABLE hook_probe (id INTEGER PRIMARY KEY)"),
+            RunStatus::Ok
+        );
+        finish();
+
+        let worker = Arc::clone(&bridge);
+        std::thread::spawn(move || {
+            // 1. The guard-equivalent, before any PHP runs.
+            let hook = ShutdownHook { bridge: Arc::clone(&worker) };
+            SHUTDOWN_HOOK.with(|c| *c.borrow_mut() = Some(hook));
+            // 2. Then the bridge cells, inside this thread's first query —
+            //    registered later, therefore destroyed earlier.
+            set_current_site(Some("hook.test"));
+            assert_eq!(run_on(Some(&worker), b"SELECT 1"), RunStatus::Rows);
+            finish();
+        })
+        .join()
+        .expect("worker thread must exit cleanly, not abort");
+
+        assert!(HOOK_RAN.load(Ordering::Acquire), "the shutdown hook must have run at teardown");
+        assert_eq!(
+            *HOOK_STATUS.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some(RunStatus::Gone),
+            "a statement issued from a retiring thread must report Gone — not Err (there is \
+             no error to read back), not Unavailable (a database IS configured), and above \
+             all not execute"
+        );
+        assert_eq!(HOOK_ROW_COUNT.load(Ordering::Acquire), 0);
+        assert_eq!(HOOK_COL_COUNT.load(Ordering::Acquire), 0);
+        assert!(!HOOK_SAW_ERROR.load(Ordering::Acquire), "no error may be staged after Gone");
+        assert!(!HOOK_SAW_CELL.load(Ordering::Acquire), "no cell may be readable after Gone");
+
+        // The last-call record degrades to `LastCall::EMPTY` — what a thread
+        // that has run nothing reports — rather than to a stale record or a
+        // panic. The hook ran a `SELECT 1` on this thread moments before it
+        // retired, so a cell read without the liveness gate would be a use of
+        // destroyed state, not merely a wrong answer.
+        assert!(
+            !HOOK_HAD_ROWSET.load(Ordering::Acquire),
+            "had_rowset must report the empty record on a retiring thread"
+        );
+        assert!(!HOOK_SAW_DECLTYPE.load(Ordering::Acquire), "no column metadata after Gone");
+        assert_eq!(HOOK_ERRNO.load(Ordering::Acquire), 0, "errno must read 0, not a stale code");
+        assert_eq!(
+            *HOOK_OK_INFO.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some((0, 0))
+        );
+        assert!(
+            !HOOK_IN_TRANSACTION.load(Ordering::Acquire),
+            "a parked session cannot be in a transaction this thread can see"
+        );
+        assert!(
+            !HOOK_AVAILABLE.load(Ordering::Acquire),
+            "availability must be false once the site key is gone — a statement issued here \
+             reports Gone and reaches no database, which is exactly what false promises"
+        );
+
+        // The refusal is real: nothing was written.
+        drain_parked_sessions();
+        set_current_site(Some("hook.test"));
+        assert_eq!(run_on(Some(&bridge), b"SELECT COUNT(*) FROM hook_probe"), RunStatus::Rows);
+        with_cell(0, 0, |c| {
+            assert_eq!(
+                c,
+                Some(&Value::Integer(0)),
+                "the refused INSERT must not have reached the database"
+            );
+        });
+        finish();
+    }
+
+    /// The staging/teardown entry points are individually inert on a retiring
+    /// thread — none of them may panic even when called with no prior query on
+    /// that thread, which is the shape a `__destruct()` on a cold worker takes.
+    #[test]
+    #[serial]
+    fn staging_entry_points_are_inert_during_teardown() {
+        static COLD_RAN: AtomicBool = AtomicBool::new(false);
+
+        thread_local! {
+            static COLD_HOOK: RefCell<Option<ColdHook>> = const { RefCell::new(None) };
+        }
+
+        struct ColdHook;
+        impl Drop for ColdHook {
+            fn drop(&mut self) {
+                params_reset();
+                param_push(Value::Null);
+                finish();
+                on_request_end();
+                assert_eq!(row_count(), 0);
+                assert_eq!(col_count(), 0);
+                assert_eq!(ok_info(), (0, 0));
+                with_col_name(0, |n| assert!(n.is_none()));
+                // The rest of the read surface, individually — every one of
+                // these reaches a different destroyed cell.
+                assert!(!had_rowset());
+                with_col_decltype(0, |d| assert!(d.is_none()));
+                with_cell(0, 0, |c| assert!(c.is_none()));
+                with_error(|e| assert!(e.is_none()));
+                assert_eq!(error_code(), 0);
+                assert!(!in_transaction());
+                // Panic-freedom only: `is_available()` reads the process-wide
+                // `DB_BRIDGE`, which an earlier test in this binary may have
+                // registered — the *value* is not this test's business. The
+                // deterministic per-site assertion lives in the hook test above.
+                let _ = is_available();
+                COLD_RAN.store(true, Ordering::Release);
+            }
+        }
+
+        std::thread::spawn(|| {
+            COLD_HOOK.with(|c| *c.borrow_mut() = Some(ColdHook));
+            // Touch the bridge cells so they are registered — and destroyed —
+            // before the hook runs. No bridge is passed, so nothing connects.
+            params_reset();
+            param_push(Value::Integer(1));
+            assert_eq!(run_on(None, b"SELECT 1"), RunStatus::Unavailable);
+            finish();
+        })
+        .join()
+        .expect("cold-hook thread must exit cleanly, not abort");
+
+        assert!(COLD_RAN.load(Ordering::Acquire), "the cold hook must have run at teardown");
     }
 }
 

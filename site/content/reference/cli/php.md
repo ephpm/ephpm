@@ -56,6 +56,11 @@ tools that gate on the SAPI name run normally:
 
 - **Composer** (`composer.phar`) — runs; `-d memory_limit=-1` is honored.
 - **WP-CLI** (`wp-cli.phar`) — runs; `STDIN`/`STDOUT`/`STDERR` are defined.
+  They are opened through the `php://stdin` / `php://stdout` / `php://stderr`
+  wrappers exactly as php-cli opens them, so `stream_get_meta_data()` reports
+  `wrapper_type = "PHP"` and the matching `php://…` uri — what code that
+  sniffs a handle's provenance expects
+  ([#340](https://github.com/ephpm/ephpm/issues/340), fixed in v0.7.4).
 - **Laravel artisan** / any Symfony Console app — `$argv`/`$argc` are
   registered, so subcommands and options are parsed.
 - **cli-SAPI-only functions** — `cli_set_process_title()` /
@@ -67,6 +72,34 @@ tools that gate on the SAPI name run normally:
 
 The server (`ephpm serve` / `ephpm dev`) is a separate process invocation and
 keeps reporting `PHP_SAPI === "ephpm"` — only the `ephpm php` process is `cli`.
+
+### `$_SERVER`, the environment, and `PHP_BINARY`
+
+Like php-cli, the CLI `$_SERVER` **contains the whole process environment**
+(php-cli's default `variables_order` is `EGPCS`, and a CLI process's "S" is its
+environment), plus an empty-string `DOCUMENT_ROOT` — there is no document root
+in CLI mode, but code that reads the key unconditionally must not warn. This
+matters in practice: Composer probes `$_SERVER['HOME']` / `$_SERVER['APPDATA']`
+before falling back to `getenv()`.
+
+`PHP_BINARY` is the path of the running `ephpm` executable. Note the
+consequence for tools that *re-invoke* PHP through it (PHPUnit's process
+isolation, Symfony's `PhpExecutableFinder`): the path is `ephpm`, and running
+it without the `php` subcommand is not a PHP CLI. Point such tools at a
+wrapper script that execs `ephpm php "$@"` if you need re-invocation.
+
+This applies to `ephpm php` only. In the server the process environment is
+deliberately **not** merged into a request's `$_SERVER`: `ephpm serve` is
+multi-tenant, and the process environment holds cross-tenant material.
+
+> **Fixed in v0.7.4.** Up to and including v0.7.3, CLI `$_SERVER` carried
+> neither the environment nor `DOCUMENT_ROOT`
+> ([#338](https://github.com/ephpm/ephpm/issues/338)), and `PHP_BINARY` was an
+> empty string on Linux and macOS
+> ([#339](https://github.com/ephpm/ephpm/issues/339) — the embed SAPI's
+> `executable_location` was the bare name `ephpm`, which php-src then hunted
+> for on `PATH` and did not find; Windows was unaffected because php-src asks
+> the OS there instead).
 
 ### Ini flags
 
@@ -121,7 +154,30 @@ to route them to stderr instead.
 Exit codes match php-cli: `exit(N)` yields `N`; an uncaught exception or fatal
 error yields `255`; a syntax error under `-l` yields `255` (with
 `Errors parsing <name>` on stdout); a script file that cannot be opened prints
-`Could not open input file: <path>` and yields `1`.
+`Could not open input file: <path>` and yields `1`; a reflection flag whose
+subject does not resolve (`--rf nosuchfunc`, `--rc NoSuchClass`) prints
+`Exception: <message>` on stdout and yields `1`.
+
+An **unrecognized option** — or one missing its required argument — is a hard
+error, again as in php-cli: the diagnostic
+(`Error in argument 2, char 2: option not found Z`) goes to stderr, the usage
+screen to stdout, and the process exits `1`. Nothing is executed.
+
+```bash
+ephpm php -Z; echo $?     # usage on stdout, "option not found Z" on stderr, 1
+```
+
+> **Fixed in v0.7.4.** Up to and including v0.7.3, an unknown option was
+> silently ignored: no mode was selected, the CLI fell through to reading
+> (empty) stdin as a program, and a typo'd flag ran nothing while reporting
+> success ([#336](https://github.com/ephpm/ephpm/issues/336)). In the same
+> release, `--rf`/`--rc` on a missing symbol stopped exiting `0`
+> ([#335](https://github.com/ephpm/ephpm/issues/335)).
+
+The usage screen itself is not byte-identical to php-cli's: it names the
+program `ephpm php`, and it lists only the options this build implements — the
+built-in server (`-S`/`-t`), `--repeat` and `--ini=diff` are absent because
+they are [not supported](#not-supported).
 
 > **Fixed in v0.7.1.** Up to and including v0.7.0, a fatal error or uncaught
 > exception under `ephpm php -r` printed **nothing** and exited `0`

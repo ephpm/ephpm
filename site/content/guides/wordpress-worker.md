@@ -121,9 +121,13 @@ requests and workers, and replicates across nodes in cluster mode. See the
   the engine's — until the adapter does it, serve block themes in fpm mode.
   (The engine itself renders blocks fine: `do_blocks()`, nested template parts,
   the Query loop, the Interactivity API and REST all survive a persistent
-  worker. This was previously reported as an engine crash in
-  [ephpm#116](https://github.com/ephpm/ephpm/issues/116); it no longer
-  reproduces.)
+  worker. [ephpm#116](https://github.com/ephpm/ephpm/issues/116) also reported
+  an engine *crash* here. That half was real — a block tree nested deeply enough
+  overflowed the worker thread's C stack and killed the whole server, because
+  ePHPm had PHP's own stack guard switched off on Linux — and is fixed in
+  v0.7.4. Runaway nesting is now the ordinary catchable
+  `Error: Maximum call stack size ... reached`, so it costs one request, not the
+  process.)
 - Worker mode is a whole-server switch; it is **not supported with
   `[server] sites_dir`** (config load hard-errors), so multi-tenant vhosting —
   including WordPress multisite behind vhosts — stays on fpm mode for now.

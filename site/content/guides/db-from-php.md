@@ -333,6 +333,7 @@ a SQL error without matching message text:
 | `2001` | Per-site mode, and this request has no tenant identity | `HY000` |
 | `2002` | The database for this request could not be opened | `HY000` |
 | `2003` | A parameter's PHP type cannot bind (thrown before the statement runs) | — |
+| `2004` | This thread is retiring and can no longer reach the database — nothing was executed (see [Shutdown functions and destructors](#shutdown-functions-and-destructors)) | — |
 
 These sit in MySQL's **client**-error range (2000–2999, the `CR_*` codes),
 which a server never emits. A SQL error always carries a **server**-range
@@ -352,7 +353,8 @@ try {
 
 Codes `2000` and `2003` were `0` before v0.7.4, and `2001`/`2002` were the
 generic `1105`. **All four messages are unchanged**, so adapters that
-currently detect these cases by matching the message text keep working.
+currently detect these cases by matching the message text keep working. Code
+`2004` is new in v0.7.4 along with the condition it reports.
 
 ### `ephpm_db_errno()` and `ephpm_db_error()`
 
@@ -381,10 +383,54 @@ try {
   Both are cleared by the next statement on the thread and at request end.
 - They report on the last statement that *reached the bridge*. A
   parameter-binding refusal (code `2003`) is thrown before anything runs, so
-  it leaves them untouched; the exception's own code is the signal there.
+  it leaves them untouched; the exception's own code is the signal there. The
+  same applies to a retiring-thread refusal (code `2004`): the per-thread
+  error slot is gone too, so `ephpm_db_errno()` reads `0` there and the
+  exception's code is again the only signal.
 - `message` is the backend message alone. The `SQLSTATE[xxxxx]: ` prefix
   belongs to the exception's composed message, not to this array.
 - Neither ever throws.
+
+## Shutdown functions and destructors
+
+**Do not put queries in `register_shutdown_function()` callbacks or in
+`__destruct()`.** They are not guaranteed to reach the database, and the
+reason is specific to how ePHPm runs PHP.
+
+ePHPm does not call `php_request_shutdown()` between HTTP requests — the
+embedded SAPI keeps one long-lived request open per worker thread. So a
+shutdown function you register does **not** run at the end of *your*
+request. It runs later, when the worker thread itself retires (the tokio
+blocking pool reaps an idle thread, or the server shuts down) — by which
+point that thread's per-request database state has already been released.
+
+A query issued from there is **refused, not executed**, and throws:
+
+```
+Exception: ephpm_db: the database bridge is no longer available on this
+thread (it is shutting down) — a shutdown function or destructor ran after
+per-thread database state was released; no statement was executed
+```
+
+The wording is deliberately different from the "no embedded database is
+active" case above, and so is the code: this throws **`2004`**, not `2000`. A
+database *is* configured; that particular thread just cannot reach it any
+more. Nothing is half-applied — the statement never reaches the engine, so a
+write cannot land and then fail to report.
+
+The read-only functions do not throw there either. `ephpm_db_columns()`
+returns an empty list, `ephpm_db_errno()` returns `0`,
+`ephpm_db_in_transaction()` and `ephpm_db_available()` return `false` — the
+same answers a thread that has run nothing reports.
+
+Do your database work inside the request. If you need end-of-request
+cleanup, do it explicitly (a `finally` block, or your framework's terminate
+hook, which runs while the request is still live) rather than relying on
+PHP's shutdown handlers.
+
+The same rule applies to [`ephpm_kv_*`](/guides/kv-from-php/) (reads miss
+and writes are refused) and [`ephpm_ws_*`](/guides/websockets/) (the site
+scope is gone, so sends report no capability).
 
 ## The session model
 
