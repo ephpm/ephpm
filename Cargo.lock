@@ -1378,6 +1378,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ephpm-middleware-example"
+version = "0.1.0"
+dependencies = [
+ "ephpm-kv",
+ "ephpm-middleware",
+ "libloading",
+ "serde_json",
+]
+
+[[package]]
 name = "ephpm-middleware-jwt"
 version = "0.1.0"
 dependencies = [

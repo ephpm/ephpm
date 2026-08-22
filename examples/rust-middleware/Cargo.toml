@@ -1,0 +1,34 @@
+[package]
+name = "ephpm-middleware-example"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Worked example: an ePHPm native middleware written in Rust — API-key gate with a cluster-wide rate limiter, loaded through the dlopen lane"
+
+[lib]
+# `name` decides the artifact name: libapi_gate.so / libapi_gate.dylib /
+# api_gate.dll. Mount that file in `[[middleware]] library = "..."`.
+name = "api_gate"
+# cdylib = the loadable module. The rlib is only so `cargo test` can link the
+# unit tests below against the same code; a real module needs cdylib alone.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ephpm-middleware.workspace = true
+serde_json.workspace = true
+
+# The `host` feature pulls in the host-side request context and callback table
+# so the unit tests can build a `Request` and a real KV store without a running
+# server. A shipped module never enables it.
+[dev-dependencies]
+ephpm-middleware = { workspace = true, features = ["host"] }
+ephpm-kv.workspace = true
+# Used only by `examples/abi_probe.rs`, which dlopens the built cdylib the way
+# the ePHPm loader does.
+libloading.workspace = true
+
+[lints]
+workspace = true

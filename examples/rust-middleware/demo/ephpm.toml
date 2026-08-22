@@ -1,0 +1,36 @@
+# Demo config for the api-gate native middleware example.
+#
+# Run from this directory:
+#   ephpm serve --config ephpm.toml
+#
+# `document_root` and the `library` path below are relative to your shell's
+# working directory, so either run from here or make them absolute.
+
+[server]
+listen = "127.0.0.1:8099"
+document_root = "public"
+
+# Left at the default on purpose:
+#   fallback = ["$uri", "$uri/", "/index.php?$query_string"]
+# That is what routes /api/v1/users (no such file) to the front controller
+# public/index.php, which is the request the REWRITE verdict acts on.
+
+[php]
+mode = "fpm"
+
+# ── the middleware mount ──────────────────────────────────────────────────
+#
+# `library` is an explicit PATH here, which is what forces the dlopen lane:
+# the loader checks bare names against the compiled-in builtin registry first,
+# so a bare name would silently test something else.
+#
+# Adjust the path for your platform after `cargo build --release -p
+# ephpm-middleware-example`:
+#   Linux   ../../../target/release/libapi_gate.so
+#   macOS   ../../../target/release/libapi_gate.dylib
+#   Windows ../../../target/release/api_gate.dll
+# (add /<triple> after target/ if you built with --target)
+[[middleware]]
+library = "../../../target/release/libapi_gate.so"
+order = 10
+config = { keys = { k-alpha = "alpha", k-beta = "beta", k-gamma = "gamma" }, prefix = "/api/", strip_prefix = "/api/v1", requests_per_window = 5 }
