@@ -124,7 +124,24 @@ ini_overrides = [
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `request_log` | bool | (mode default) | Per-request timeline: the last 256 completed requests (method, path, status, total/queue-wait/PHP durations in ms, response bytes, timestamp) served as JSON at `GET /_ephpm/requests`, newest first. Unset resolves per mode: **on** under `ephpm dev` / bare `ephpm`, **off** under `ephpm serve`. `queue_wait_ms` is `null` outside worker mode (there is no dispatch queue on the fpm path); in worker mode `php_ms` includes the queue wait, matching `ephpm_php_execution_duration_seconds`. Requests to `/_ephpm/*` and the metrics path are not recorded. When off, `/_ephpm/requests` is not registered and the path falls through to normal routing. Env override: `EPHPM_SERVER__DIAGNOSTICS__REQUEST_LOG`. |
-| `otlp_endpoint` | string | (none) | OTLP trace-export endpoint, e.g. `"http://127.0.0.1:4318"` (OTLP **http/protobuf**; `/v1/traces` is appended when missing). Exports one `http.request` span per request (attrs: method, path, status) with `worker.queue_wait` and `php.execute` children, and honors an incoming W3C `traceparent` header. Requires a binary built with the `otlp` cargo feature — without it, a set value only logs a startup warning. The standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT` env vars take precedence over this knob, and `OTEL_SERVICE_NAME` overrides the default service name `ephpm`. Unset (and no env vars): no exporter is built and no background export thread runs. |
+| `otlp_endpoint` | string | (none) | OTLP trace-export endpoint, e.g. `"http://127.0.0.1:4318"` (OTLP **http/protobuf**; `/v1/traces` is appended when missing). Exports one `http.request` span per request (attrs: method, path, status) with `worker.queue_wait` and `php.execute` children, and honors an incoming W3C `traceparent` header. Requires a binary built with the `otlp` cargo feature — without it, a set value only logs a startup warning. The standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT` env vars take precedence over this knob, and `OTEL_SERVICE_NAME` overrides the default service name `ephpm`. Unset (and no env vars): no exporter is built and no background export thread runs. Both `http://` and `https://` endpoints are supported — see the note below. |
+
+**OTLP over HTTPS.** An `https://` endpoint works with no extra configuration.
+TLS is rustls (the same crypto provider the HTTPS listener uses — never
+OpenSSL or a second TLS stack), and the exporter trusts the **union of the
+operating system's trust store and the bundled Mozilla root set**. The OS
+store is what lets ePHPm reach an internal collector fronted by a corporate or
+private CA; the bundled set is a fallback so a publicly trusted endpoint still
+works from a `scratch`/distroless image that ships no CA bundle. To trust a
+private CA that is not installed system-wide, point the standard
+`SSL_CERT_FILE` (a PEM bundle) or `SSL_CERT_DIR` environment variable at it —
+there is no ePHPm-specific trust-store setting. Note that setting either
+variable *replaces* the OS trust store rather than adding to it (the bundled
+Mozilla set is still trusted), so such a bundle must contain every CA the
+exporter needs. `http://` endpoints are
+unaffected and remain the zero-config default for a collector on localhost.
+Export timeout follows the standard `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` /
+`OTEL_EXPORTER_OTLP_TIMEOUT` variables (milliseconds, default `10000`).
 
 ### `[server.limits]`
 

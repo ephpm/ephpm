@@ -84,7 +84,14 @@ pub fn build_server_config(
 /// whole server uses one provider" is checkable by pointer identity — which
 /// is exactly how the HTTP/3 tests assert that QUIC and HTTPS-over-TCP did
 /// not diverge.
-fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+///
+/// The OTLP exporter's HTTPS client ([`crate::otlp`]) calls this too. It has
+/// to: reqwest is compiled with no crypto-provider feature, so its own path
+/// would call `CryptoProvider::get_default()` and `panic!("No provider set")`
+/// — the exporter is built in `main`, before anything installs a process
+/// default. Naming the provider here sidesteps both that panic and the
+/// ambiguity described above.
+pub(crate) fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     static PROVIDER: std::sync::OnceLock<Arc<rustls::crypto::CryptoProvider>> =
         std::sync::OnceLock::new();
     Arc::clone(PROVIDER.get_or_init(|| Arc::new(rustls::crypto::ring::default_provider())))
