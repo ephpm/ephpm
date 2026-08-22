@@ -13,6 +13,9 @@
 //!    example), only for the default minor
 //! 4. `site/content/developer/architecture-overview.md` — the support table
 //!    listing the CI-pinned full versions
+//! 5. `.github/workflows/windows-php-check.yml` — the `PHP_SDK_PATH` cache
+//!    path for the Windows PHP-linked compile gate, only for
+//!    `WINDOWS_CHECK_MINOR`
 //!
 //! A missed pin site has broken a release before, so every substitution
 //! asserts its exact expected match count and the command refuses to write
@@ -28,6 +31,15 @@ use crate::{DEFAULT_PHP_MINOR, PHP_SDK_VERSIONS, workspace_root};
 /// `build-windows-tailcall` job (one extra `php_full:` include-block pin
 /// site each). 8.5-only today: the TAILCALL VM does not exist in 8.3/8.4.
 const TAILCALL_MINORS: &[&str] = &["8.5"];
+
+/// The PHP minor pinned by `.github/workflows/windows-php-check.yml`.
+///
+/// That workflow spells one SDK cache path out in full
+/// (`php-sdk\<full>-windows-x86_64`) instead of deriving it from
+/// `PHP_SDK_VERSIONS`, so it is a pin site for exactly this minor and drifts
+/// silently when the minor moves. Keep in sync with the `cargo xtask php-sdk
+/// <minor>` argument in that workflow.
+const WINDOWS_CHECK_MINOR: &str = "8.3";
 
 /// One exact-substring substitution in one file, with a required match count.
 struct Substitution {
@@ -86,6 +98,17 @@ fn substitutions(minor: &str, old_full: &str, new_full: &str) -> Vec<Substitutio
             expected: 1,
         },
     ];
+    // The Windows PHP-linked compile gate hardcodes one SDK cache path for
+    // WINDOWS_CHECK_MINOR. Missing this site left that job checking against a
+    // stale SDK after a bump — see the module docs on why that matters.
+    if minor == WINDOWS_CHECK_MINOR {
+        subs.push(Substitution {
+            path: ".github/workflows/windows-php-check.yml",
+            needle: format!("php-sdk\\{old_full}-windows-x86_64"),
+            replacement: format!("php-sdk\\{new_full}-windows-x86_64"),
+            expected: 1,
+        });
+    }
     // The Dockerfile only pins the default minor: once as the ARG default
     // and once in the comment example right above it ("e.g., v8.5.7").
     if minor == DEFAULT_PHP_MINOR {
@@ -115,6 +138,41 @@ fn apply(contents: &str, sub: &Substitution) -> Result<String, String> {
             sub.path, sub.expected, sub.needle, found
         ))
     }
+}
+
+/// Apply every substitution, composing the ones that target the same file.
+///
+/// `read` yields a file's on-disk contents by workspace-relative path; keeping
+/// I/O in the caller's closure makes the composition rule unit-testable.
+///
+/// Several substitutions can name one file — release.yml carries two distinct
+/// pin shapes. Each must be applied *on top of* the previous result. Reading
+/// the file fresh per substitution and staging each as its own pending write
+/// makes the last write win and silently discards the earlier substitution:
+/// a partial bump, which is the exact failure this command exists to prevent.
+///
+/// Returns one staged write per file, or every error encountered (all-or-
+/// nothing: the caller writes only when this returns `Ok`).
+fn apply_all(
+    subs: &[Substitution],
+    read: impl Fn(&str) -> Result<String, String>,
+) -> Result<Vec<(&'static str, String)>, Vec<String>> {
+    let mut staged: Vec<(&'static str, String)> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for sub in subs {
+        let current = match staged.iter().find(|(path, _)| *path == sub.path) {
+            Some((_, pending)) => Ok(pending.clone()),
+            None => read(sub.path),
+        };
+        match current.and_then(|contents| apply(&contents, sub)) {
+            Ok(updated) => match staged.iter_mut().find(|(path, _)| *path == sub.path) {
+                Some((_, pending)) => *pending = updated,
+                None => staged.push((sub.path, updated)),
+            },
+            Err(e) => errors.push(e),
+        }
+    }
+    if errors.is_empty() { Ok(staged) } else { Err(errors) }
 }
 
 /// Validate that `full` is a plausible patch release of `minor`
@@ -180,27 +238,21 @@ pub fn bump_php_pin(args: &[String]) -> ExitCode {
     // matched. A partial bump (some files moved, some not) is exactly the
     // broken state this command exists to prevent.
     let root = workspace_root();
-    let mut staged: Vec<(std::path::PathBuf, &'static str, String)> = Vec::new();
-    let mut errors: Vec<String> = Vec::new();
-    for sub in substitutions(minor, old_full, new_full) {
-        let path = root.join(sub.path);
-        match fs::read_to_string(&path) {
-            Ok(contents) => match apply(&contents, &sub) {
-                Ok(updated) => staged.push((path, sub.path, updated)),
-                Err(e) => errors.push(e),
-            },
-            Err(e) => errors.push(format!("{}: cannot read: {e}", sub.path)),
+    let subs = substitutions(minor, old_full, new_full);
+    let staged = match apply_all(&subs, |rel| {
+        fs::read_to_string(root.join(rel)).map_err(|e| format!("{rel}: cannot read: {e}"))
+    }) {
+        Ok(staged) => staged,
+        Err(errors) => {
+            eprintln!("error: refusing to bump — no files were modified:");
+            for e in &errors {
+                eprintln!("  - {e}");
+            }
+            return ExitCode::FAILURE;
         }
-    }
-    if !errors.is_empty() {
-        eprintln!("error: refusing to bump — no files were modified:");
-        for e in &errors {
-            eprintln!("  - {e}");
-        }
-        return ExitCode::FAILURE;
-    }
-    for (path, rel, contents) in staged {
-        if let Err(e) = fs::write(&path, contents) {
+    };
+    for (rel, contents) in staged {
+        if let Err(e) = fs::write(root.join(rel), contents) {
             eprintln!("error: failed to write {rel}: {e}");
             return ExitCode::FAILURE;
         }
@@ -258,6 +310,76 @@ mod tests {
         };
         let input = "a: \"1.2.3\"\nb: \"1.2.3\"\n";
         assert_eq!(apply(input, &sub).unwrap(), "a: \"1.2.4\"\nb: \"1.2.4\"\n");
+    }
+
+    /// Regression: two substitutions naming the same file must compose.
+    ///
+    /// The bug this pins: each substitution was applied to a fresh read of the
+    /// file and staged as its own write, so the last write won and the first
+    /// substitution vanished. Live effect — `bump-php-pin 8.3 8.3.33` moved
+    /// release.yml's three `php_full:` sites but silently left both
+    /// `{ minor: "8.3", full: "8.3.31" }` inline-map sites behind, so the two
+    /// Linux release legs kept building the old SDK. `--check` then failed on
+    /// the tool's own output.
+    #[test]
+    fn apply_all_composes_substitutions_targeting_one_file() {
+        let subs = substitutions("8.3", "8.3.31", "8.3.33");
+        let release: Vec<&Substitution> =
+            subs.iter().filter(|s| s.path == ".github/workflows/release.yml").collect();
+        assert_eq!(release.len(), 2, "release.yml should carry both pin shapes");
+
+        let file = concat!(
+            "          - { minor: \"8.3\", full: \"8.3.31\" }\n",
+            "          - { minor: \"8.3\", full: \"8.3.31\" }\n",
+            "            php_full: \"8.3.31\"\n",
+            "            php_full: \"8.3.31\"\n",
+            "            php_full: \"8.3.31\"\n",
+        );
+        let staged = apply_all(&subs, |path| {
+            if path == ".github/workflows/release.yml" {
+                Ok(file.to_string())
+            } else {
+                // Every other pin site: a minimal body carrying its own needle.
+                Ok(subs
+                    .iter()
+                    .filter(|s| s.path == path)
+                    .map(|s| s.needle.repeat(s.expected))
+                    .collect::<String>())
+            }
+        })
+        .expect("all sites should match");
+
+        let (_, out) = staged
+            .iter()
+            .find(|(path, _)| *path == ".github/workflows/release.yml")
+            .expect("release.yml must be staged");
+        assert!(!out.contains("8.3.31"), "no 8.3.31 may survive, got:\n{out}");
+        assert_eq!(out.matches("{ minor: \"8.3\", full: \"8.3.33\" }").count(), 2);
+        assert_eq!(out.matches("php_full: \"8.3.33\"").count(), 3);
+        assert_eq!(
+            staged.iter().filter(|(path, _)| *path == ".github/workflows/release.yml").count(),
+            1,
+            "one file must stage exactly one write"
+        );
+    }
+
+    /// The Windows PHP-linked compile gate is a pin site for its own minor.
+    #[test]
+    fn windows_php_check_path_is_a_pin_site() {
+        let subs = substitutions(WINDOWS_CHECK_MINOR, "8.3.31", "8.3.33");
+        let sub = subs
+            .iter()
+            .find(|s| s.path == ".github/workflows/windows-php-check.yml")
+            .expect("windows-php-check.yml must be a pin site for WINDOWS_CHECK_MINOR");
+        assert_eq!(sub.needle, r"php-sdk\8.3.31-windows-x86_64");
+        assert_eq!(sub.replacement, r"php-sdk\8.3.33-windows-x86_64");
+
+        // ...and only for that minor.
+        assert!(
+            substitutions("8.5", "8.5.7", "8.5.9")
+                .iter()
+                .all(|s| s.path != ".github/workflows/windows-php-check.yml"),
+        );
     }
 
     #[test]
