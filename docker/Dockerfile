@@ -222,8 +222,13 @@ COPY --from=php-sdk /opt/php-sdk /src/php-sdk
 # the same PHP_SDK_PATH so the feature flags and cfg(php_linked) match exactly.
 # The -Wl,--export-dynamic link arg is emitted by crates/ephpm/build.rs, so the
 # in-container build gets it for free — nothing to mirror here.
+#
+# `--features otlp` must match xtask::RELEASE_FEATURES for the same reason as
+# --target and PHP_SDK_PATH: a feature the warm-up stage did not enable is a
+# feature whose .rlibs are missing from this layer, so the real build below
+# recompiles them and the cache buys nothing.
 RUN PHP_SDK_PATH=/src/php-sdk/${PHP_SDK_VERSION}-linux-$(uname -m)-gnu \
-    cargo build --release --package ephpm \
+    cargo build --release --package ephpm --features otlp \
         --target $(uname -m)-unknown-linux-gnu 2>&1 | grep -v "^warning:"
 
 # Real source — invalidates from here, but the dep .rlib layer above is cached.
