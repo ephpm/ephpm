@@ -1378,6 +1378,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ephpm-middleware-github-auth"
+version = "0.1.0"
+dependencies = [
+ "base64ct",
+ "ephpm-middleware",
+ "getrandom 0.3.4",
+ "hmac 0.12.1",
+ "reqwest",
+ "rustls 0.23.37",
+ "rustls-native-certs",
+ "serde_json",
+ "sha2 0.10.9",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
 name = "ephpm-middleware-jwt"
 version = "0.1.0"
 dependencies = [

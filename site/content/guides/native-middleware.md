@@ -296,6 +296,11 @@ The module's libc must match the host binary's: on Linux, build modules
 for the gnu target (the default on every mainstream distro toolchain) —
 see [Building modules on Linux](#building-modules-on-linux).
 
+A worked, shipped example of this lane lives in the workspace:
+[the GitHub OAuth gate](/guides/github-auth-middleware/)
+(`crates/ephpm-middleware-github-auth`), which authenticates a browser user
+against GitHub and issues a stateless signed session.
+
 **Building a fully static binary yourself:** you can still produce a
 fully static musl ePHPm (`x86_64-unknown-linux-musl` with `crt-static`)
 if your deployment demands it, but be aware that a fully static binary
