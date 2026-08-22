@@ -3,11 +3,12 @@ title = "GitHub OAuth Gate (native middleware)"
 weight = 11
 +++
 
-> **Status.** The module is implemented and tested. The OAuth round trip is
-> exercised end to end against a stub GitHub over real sockets; **a round trip
-> against the real `github.com` with a real GitHub App has not been performed**
-> and needs a human. See [Verification status](#verification-status) — nothing
-> on this page is claimed beyond what is tested.
+> **Status.** The module is implemented and tested. The complete login has
+> been driven over real HTTP through a running ePHPm against a **stub** GitHub;
+> **a round trip against the real `github.com` with a registered GitHub App has
+> not been performed** and needs a human. See
+> [Verification status](#verification-status) — nothing on this page is claimed
+> beyond what was actually observed.
 
 `github-auth` gates a private preview site on **GitHub identity**: *does the
 person at this browser have access, on GitHub, to the repository (or org, or
@@ -305,13 +306,15 @@ used during the login and dropped. **Rotate `client_secret` and
 
 | Behaviour | How it was verified |
 |---|---|
-| No cookie → 302 to GitHub with a `state`, PHP never runs | real HTTP against a running ePHPm with the module `dlopen`ed |
-| Session cookie → `CONTINUE`, PHP dispatched, no headers added | same |
+| **The whole login, cold: no cookie → 302 → callback → 3 GitHub calls → session → the app** | **real HTTP through a running ePHPm with the module `dlopen`ed**, against a stub GitHub in its own process, driven with `curl` and a cookie jar |
+| The callback emits **both** `Set-Cookie` headers (session issued, `state` cleared) | same run — two `set-cookie` lines on the wire |
+| No cookie → 302 to GitHub carrying a `state`, PHP never runs | same run: `content-length: 0`, no PHP output; the same URL *with* a cookie reaches PHP |
+| Session cookie → `CONTINUE`, PHP dispatched, gate adds no headers | same run |
+| A request with a session makes **zero** outbound calls | 21 live requests after login left the stub GitHub's log unchanged; the integration test asserts the same across 50 |
 | Callback with missing / forged / empty / wrong-host / expired `state` → 400 | real HTTP + unit tests |
 | Hostile return-to values (27 shapes) collapse to `/` | real HTTP, decoding the signed state cookie |
-| Bypass token accepted / a wrong one falls through to GitHub | real HTTP |
+| Bypass token accepted; a wrong one is indistinguishable from none | real HTTP |
 | Code exchange, `/user`, and all three access checks | integration test against a stub GitHub over real sockets, using the module's own reqwest/rustls client |
-| A request with a session makes **zero** outbound calls | integration test asserting the stub's request counter does not move across 50 requests |
 | Denials: no repo access, `pull: false`, `pending` org membership, missing team | integration test |
 | GitHub unreachable → 502, no session issued | integration test |
-| **A round trip against real `github.com` with a real GitHub App** | **not done — needs a human.** Register an App, set `client_id`/`client_secret`, log in, confirm the `Set-Cookie` and the landing page |
+| **A round trip against real `github.com` with a real GitHub App** | **not done — needs a human.** Register an App, set `client_id`/`client_secret`, log in with a browser, confirm the `Set-Cookie` and the landing page |
