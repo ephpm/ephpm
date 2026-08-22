@@ -1264,6 +1264,12 @@ fn run_with_config(
     if let Some(warning) = autotune.jit_warning() {
         tracing::warn!("{warning}");
     }
+    // Windows: an explicit opcache SHM size above the derived ceiling is
+    // honoured, but its failure mode is a hard exit(-2) inside PHP's module
+    // startup, so it must not be silent.
+    if let Some(warning) = autotune.shm_warning() {
+        tracing::warn!("{warning}");
+    }
 
     // State the OPcache staleness contract at startup so operators know how
     // code changes reach a running server. Under serve mode with validation

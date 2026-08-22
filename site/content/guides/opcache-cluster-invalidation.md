@@ -62,7 +62,9 @@ profile:
 
 - **OPcache SHM** (`opcache.memory_consumption`) tracks ~18% of the memory
   budget, clamped `[64, 512]` MB — big enough for large frameworks, never
-  starving a tiny pod's page cache.
+  starving a tiny pod's page cache. (On Windows the ceiling is `256` MB
+  instead, because the segment is pagefile-backed and commit-charged in full
+  at startup — see the [config reference](/reference/config/#resource-aware-autotuning).)
 - **Per-request `memory_limit`** is `(budget − opcache_shm − ~64 MB overhead)
   / worker_count`, floored at `128 MB`, so N concurrent requests can't
   collectively exceed the pod's cgroup limit and get OOM-killed.
