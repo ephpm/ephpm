@@ -19,11 +19,24 @@ pub struct RequestCtx {
     vhost: CString,
     /// Lower-cased name → value (values pre-joined per HTTP list semantics).
     headers: Vec<(CString, CString)>,
+    /// Secure-transport verdict for this request; see
+    /// [`abi::EphpmHostV1::request_is_https`].
+    https: bool,
 }
 
 impl RequestCtx {
     /// Build the context. Interior NULs are stripped (invalid in HTTP
     /// metadata anyway) rather than failing the request.
+    ///
+    /// Repeated header lines are joined into one value, as the ABI promises
+    /// modules: `"; "` for `Cookie` (HTTP/2 may split it across field lines —
+    /// RFC 9113 §8.2.3 — and the reassembled value must use the cookie-string
+    /// separator), `", "` for everything else (RFC 9110 §5.3). Without this a
+    /// module doing `req.header("cookie")` would silently see only the first
+    /// line and could miss the very cookie it authenticates on.
+    ///
+    /// Defaults to `https = false`; the host sets the real verdict with
+    /// [`RequestCtx::with_https`].
     #[must_use]
     pub fn new(
         method: &str,
@@ -36,14 +49,34 @@ impl RequestCtx {
         fn c(s: &str) -> CString {
             CString::new(s.replace('\0', "")).unwrap_or_default()
         }
+        let mut joined: Vec<(String, String)> = Vec::with_capacity(headers.len());
+        for (name, value) in headers {
+            let lower = name.to_ascii_lowercase();
+            if let Some((_, existing)) = joined.iter_mut().find(|(n, _)| *n == lower) {
+                existing.push_str(if lower == "cookie" { "; " } else { ", " });
+                existing.push_str(value);
+            } else {
+                joined.push((lower, value.clone()));
+            }
+        }
         Self {
             method: c(method),
             path: c(path),
             query: c(query),
             remote_ip: c(remote_ip),
             vhost: c(vhost),
-            headers: headers.iter().map(|(n, v)| (c(&n.to_ascii_lowercase()), c(v))).collect(),
+            headers: joined.iter().map(|(n, v)| (c(n), c(v))).collect(),
+            https: false,
         }
+    }
+
+    /// Record whether this request arrived over a secure transport. The host
+    /// passes its own trusted-proxy-aware verdict (the value PHP sees as
+    /// `$_SERVER['HTTPS']`), never a raw client header.
+    #[must_use]
+    pub fn with_https(mut self, https: bool) -> Self {
+        self.https = https;
+        self
     }
 
     /// The opaque pointer to pass through the ABI. Valid while `self` lives.
@@ -79,6 +112,10 @@ unsafe extern "C" fn request_remote_ip(req: *const EphpmRequest) -> *const c_cha
 unsafe extern "C" fn request_vhost_id(req: *const EphpmRequest) -> *const c_char {
     // SAFETY: ABI contract.
     unsafe { ctx(req) }.map_or(std::ptr::null(), |c| c.vhost.as_ptr())
+}
+unsafe extern "C" fn request_is_https(req: *const EphpmRequest) -> c_int {
+    // SAFETY: ABI contract.
+    c_int::from(unsafe { ctx(req) }.is_some_and(|c| c.https))
 }
 unsafe extern "C" fn request_header(
     req: *const EphpmRequest,
@@ -286,6 +323,7 @@ static HOST_TABLE: EphpmHostV1 = EphpmHostV1 {
     kv_free,
     log: host_log,
     kv_incr_ttl,
+    request_is_https,
 };
 
 /// Wire the embedded KV store into the host table. Call once at startup,
@@ -298,4 +336,53 @@ pub fn set_kv_store(store: &Arc<ephpm_kv::store::Store>) {
 #[must_use]
 pub fn host_table() -> &'static EphpmHostV1 {
     &HOST_TABLE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Request;
+
+    fn view(ctx: &RequestCtx) -> Request<'_> {
+        // SAFETY: `ctx` outlives the returned view; host_table() is 'static.
+        unsafe { Request::from_raw(ctx.as_abi(), host_table()) }
+    }
+
+    fn ctx(headers: &[(String, String)]) -> RequestCtx {
+        RequestCtx::new("GET", "/x.php", "", "203.0.113.5", "t.example", headers)
+    }
+
+    fn h(name: &str, value: &str) -> (String, String) {
+        (name.to_owned(), value.to_owned())
+    }
+
+    #[test]
+    fn repeated_cookie_lines_are_joined_with_the_cookie_separator() {
+        // HTTP/2 may split `Cookie` across field lines (RFC 9113 §8.2.3) and
+        // hyper surfaces them separately. A module reading `cookie` must see
+        // ALL of them, or it can miss the very cookie it authenticates on.
+        let ctx = ctx(&[h("cookie", "a=1"), h("Cookie", "b=2"), h("COOKIE", "c=3")]);
+        assert_eq!(view(&ctx).header("cookie"), Some("a=1; b=2; c=3"));
+    }
+
+    #[test]
+    fn repeated_ordinary_headers_are_joined_as_a_comma_list() {
+        let ctx = ctx(&[h("accept", "text/html"), h("Accept", "application/json")]);
+        assert_eq!(view(&ctx).header("Accept"), Some("text/html, application/json"));
+    }
+
+    #[test]
+    fn a_single_header_is_unchanged_and_lookup_is_case_insensitive() {
+        let ctx = ctx(&[h("X-Api-Key", "k1")]);
+        assert_eq!(view(&ctx).header("x-api-key"), Some("k1"));
+        assert_eq!(view(&ctx).header("X-API-KEY"), Some("k1"));
+        assert_eq!(view(&ctx).header("absent"), None);
+    }
+
+    #[test]
+    fn https_defaults_off_and_is_set_only_by_the_host() {
+        assert!(!view(&ctx(&[])).is_https(), "default must be the cleartext (safe) verdict");
+        let secure = ctx(&[]).with_https(true);
+        assert!(view(&secure).is_https());
+    }
 }

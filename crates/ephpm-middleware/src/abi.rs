@@ -112,8 +112,10 @@ pub struct EphpmHostV1 {
     pub request_query: unsafe extern "C" fn(*const EphpmRequest) -> *const c_char,
     /// Client IP after trusted-proxy resolution.
     pub request_remote_ip: unsafe extern "C" fn(*const EphpmRequest) -> *const c_char,
-    /// Header lookup by case-insensitive name; NULL when absent. Multi-value
-    /// headers return the values pre-joined per HTTP list semantics.
+    /// Header lookup by case-insensitive name; NULL when absent. Repeated
+    /// header lines are pre-joined per HTTP list semantics — `", "` for
+    /// ordinary headers (RFC 9110 §5.3) and `"; "` for `Cookie`, which HTTP/2
+    /// is explicitly allowed to split across field lines (RFC 9113 §8.2.3).
     pub request_header:
         unsafe extern "C" fn(*const EphpmRequest, name: *const c_char) -> *const c_char,
     /// Request body view. v1: bodies are not read before the middleware chain
@@ -177,6 +179,21 @@ pub struct EphpmHostV1 {
         ttl_secs: i64,
         out: *mut i64,
     ) -> c_int,
+
+    /// Whether this request reached the server over a secure transport:
+    /// `1` for HTTPS, `0` for cleartext.
+    ///
+    /// This is the host's own, trusted-proxy-aware verdict — the same value
+    /// PHP sees as `$_SERVER['HTTPS']`. It is the TLS state of the accepted
+    /// connection, overridden by `X-Forwarded-Proto` **only** when the peer
+    /// matches `[server.proxy] trusted_proxies`. A module must use this
+    /// rather than reading `X-Forwarded-Proto` itself: that header reaches
+    /// modules exactly as the client sent it, so any client can set it.
+    ///
+    /// Appended after [`EphpmHostV1::kv_incr_ttl`] — same major version, so
+    /// modules built against the shorter table never read past the offsets
+    /// they know.
+    pub request_is_https: unsafe extern "C" fn(*const EphpmRequest) -> c_int,
 }
 
 /// Symbol names the loader looks up.

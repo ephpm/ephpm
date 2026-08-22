@@ -65,7 +65,8 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 pub struct MiddlewareMount {
     /// Module to run. Checked against the builtin registry first (`jwt`,
-    /// `cors`, `ratelimit`/`rate-limit`, `security-headers` and their
+    /// `cors`, `ratelimit`/`rate-limit`, `security-headers`,
+    /// `session-cookie` and their
     /// `ephpm-middleware-*` long forms are compiled into every binary — no
     /// dlopen). Anything else is a shared library: either a bare name
     /// (resolved through the middleware search path with a platform suffix,

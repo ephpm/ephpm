@@ -7,10 +7,16 @@
 //! claims JSON in a request header (`claims_header`) so PHP can read them
 //! without re-verifying.
 //!
-//! Verification: constant-time HMAC check (`hmac::Mac::verify_slice`), the
-//! token's `alg` must be `HS256`, `exp` is **required** and must be in the
-//! future, `nbf` is honoured when present, and `iss`/`aud` are enforced when
-//! configured.
+//! Verification lives in [`crate::hs256`] and is shared with the
+//! `session-cookie` builtin: constant-time HMAC check
+//! (`hmac::Mac::verify_slice`), the token's `alg` must be `HS256`, `exp` is
+//! **required** and must be in the future, `nbf` is honoured when present,
+//! and `iss`/`aud` are enforced when configured.
+//!
+//! This module is for **API clients**: the token arrives in a header and a
+//! failure is a `401` the caller is expected to handle. Gating a *browser*
+//! on a signed session cookie is [`crate::session_cookie`] — same crypto,
+//! different threat model and a redirect instead of a `401`.
 //!
 //! Configuration (`[[middleware]] config = { ... }`):
 //!
@@ -22,18 +28,14 @@
 //! | `header` (string) | `"Authorization"` | request header carrying the token; a `Bearer ` prefix is stripped |
 //! | `claims_header` (string) | unset | when set, REWRITE with this request header = the raw claims JSON |
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use base64ct::{Base64UrlUnpadded, Encoding};
 use ephpm_middleware::{Middleware, Request, Response};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+
+use crate::hs256::{Hs256Policy, now_unix, opt_str};
 
 /// JWT validation policy, built once at `init`.
 pub struct Jwt {
-    secret: Vec<u8>,
-    issuer: Option<String>,
-    audience: Option<String>,
+    /// Signature + registered-claim policy, shared with `session-cookie`.
+    policy: Hs256Policy,
     header: String,
     claims_header: Option<String>,
 }
@@ -51,117 +53,12 @@ fn strip_bearer(value: &str) -> &str {
     trimmed
 }
 
-impl Jwt {
-    /// Verify `token` against this policy at time `now` (unix seconds).
-    /// Returns the raw claims JSON on success, `None` on any failure.
-    fn verify(&self, token: &str, now: u64) -> Option<String> {
-        let mut parts = token.split('.');
-        let (header_b64, payload_b64, sig_b64) = (parts.next()?, parts.next()?, parts.next()?);
-        if parts.next().is_some() {
-            return None;
-        }
-
-        // Signature first — never parse unauthenticated JSON.
-        let sig = Base64UrlUnpadded::decode_vec(sig_b64).ok()?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret).ok()?;
-        mac.update(header_b64.as_bytes());
-        mac.update(b".");
-        mac.update(payload_b64.as_bytes());
-        // Constant-time comparison via the hmac crate.
-        mac.verify_slice(&sig).ok()?;
-
-        // The signature is ours, but still pin the algorithm: HS256 only.
-        let header: serde_json::Value =
-            serde_json::from_slice(&Base64UrlUnpadded::decode_vec(header_b64).ok()?).ok()?;
-        if header.get("alg").and_then(serde_json::Value::as_str) != Some("HS256") {
-            return None;
-        }
-
-        let payload = Base64UrlUnpadded::decode_vec(payload_b64).ok()?;
-        let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
-
-        // `exp` is required — a token that cannot expire is a config bug.
-        // RFC 7519 NumericDate allows non-integer values, so accept a JSON
-        // float (floored) as well as an integer rather than 401-ing a valid
-        // token.
-        let exp = claims.get("exp").and_then(numeric_date)?;
-        if exp <= now {
-            return None;
-        }
-        if let Some(nbf) = claims.get("nbf")
-            && numeric_date(nbf)? > now
-        {
-            return None;
-        }
-        if let Some(expected) = &self.issuer
-            && claims.get("iss").and_then(serde_json::Value::as_str) != Some(expected.as_str())
-        {
-            return None;
-        }
-        if let Some(expected) = &self.audience {
-            let ok = match claims.get("aud") {
-                Some(serde_json::Value::String(aud)) => aud == expected,
-                Some(serde_json::Value::Array(auds)) => {
-                    auds.iter().any(|a| a.as_str() == Some(expected.as_str()))
-                }
-                _ => false,
-            };
-            if !ok {
-                return None;
-            }
-        }
-
-        String::from_utf8(payload).ok()
-    }
-}
-
-/// Parse an RFC 7519 NumericDate claim (`exp`/`nbf`) as seconds since the
-/// epoch. Accepts a JSON integer or a JSON float (floored to whole seconds,
-/// negatives rejected); returns `None` for any other JSON type. This keeps
-/// enforcement identical while tolerating the non-integer NumericDates the
-/// spec permits.
-fn numeric_date(v: &serde_json::Value) -> Option<u64> {
-    if let Some(u) = v.as_u64() {
-        return Some(u);
-    }
-    let f = v.as_f64()?;
-    // floor() keeps the "not valid until this whole second" semantics; only
-    // finite, non-negative values within u64 range map to a NumericDate.
-    if f.is_finite() && (0.0..18_446_744_073_709_551_616.0).contains(&f) {
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "bounds checked: finite, in [0, u64::MAX), floored"
-        )]
-        Some(f.floor() as u64)
-    } else {
-        None
-    }
-}
-
 impl Middleware for Jwt {
     fn init(config: &serde_json::Value) -> Result<Self, String> {
-        let secret = config
-            .get("secret")
-            .ok_or("`secret` is required (HS256 shared secret)")?
-            .as_str()
-            .ok_or("`secret` must be a string")?;
-        if secret.is_empty() {
-            return Err("`secret` must not be empty".into());
-        }
-        let opt_str = |key: &str| -> Result<Option<String>, String> {
-            match config.get(key) {
-                Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(Some(s.clone())),
-                None | Some(serde_json::Value::Null | serde_json::Value::String(_)) => Ok(None),
-                Some(other) => Err(format!("`{key}` must be a string, got {other}")),
-            }
-        };
         Ok(Self {
-            secret: secret.as_bytes().to_vec(),
-            issuer: opt_str("issuer")?,
-            audience: opt_str("audience")?,
-            header: opt_str("header")?.unwrap_or_else(|| "Authorization".to_owned()),
-            claims_header: opt_str("claims_header")?,
+            policy: Hs256Policy::from_config(config)?,
+            header: opt_str(config, "header")?.unwrap_or_else(|| "Authorization".to_owned()),
+            claims_header: opt_str(config, "claims_header")?,
         })
     }
 
@@ -173,8 +70,7 @@ impl Middleware for Jwt {
         if token.is_empty() {
             return Response::respond(401, "missing bearer token");
         }
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        match self.verify(token, now) {
+        match self.policy.verify(token, now_unix()) {
             Some(claims_json) => match &self.claims_header {
                 Some(name) => Response::rewrite().header(name.as_str(), claims_json),
                 None => Response::cont(),
@@ -188,8 +84,13 @@ impl Middleware for Jwt {
 mod tests {
     #![allow(unsafe_code)] // tests build the FFI Request view by hand.
 
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use base64ct::{Base64UrlUnpadded, Encoding};
     use ephpm_middleware::abi::{ACTION_CONTINUE, ACTION_RESPOND, ACTION_REWRITE};
     use ephpm_middleware::host::{RequestCtx, host_table};
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
 
     use super::*;
 

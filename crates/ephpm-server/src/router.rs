@@ -552,21 +552,24 @@ const ALWAYS_STRIPPED_INGEST_HEADERS: &[&str] = &["proxy"];
 /// Build the lowercased list of inbound headers to strip at ingest.
 ///
 /// Combines [`ALWAYS_STRIPPED_INGEST_HEADERS`] with the `claims_header` of
-/// every configured `jwt` middleware mount. Because the claims header is only
-/// sanitized by the jwt module when that module actually runs (and in fpm
-/// mode it only runs on `match`-glob paths), stripping it up-front guarantees
-/// a client can never forge it on a path the module skips. Names are
-/// deduplicated and lowercased for the case-insensitive compare in
-/// [`extract_headers`].
+/// every configured `jwt` and `session-cookie` middleware mount. Because the
+/// claims header is only sanitized by those modules when they actually run
+/// (and in fpm mode they only run on `match`-glob paths), stripping it
+/// up-front guarantees a client can never forge it on a path the module
+/// skips. Names are deduplicated and lowercased for the case-insensitive
+/// compare in [`extract_headers`].
 fn build_ingest_strip_headers(mounts: &[MiddlewareMount]) -> Vec<String> {
     let mut names: Vec<String> =
         ALWAYS_STRIPPED_INGEST_HEADERS.iter().map(|s| (*s).to_owned()).collect();
     for mount in mounts {
-        // Only the builtin `jwt` module (and its long-form spellings) forwards
-        // a claims header; match the same canonicalization the middleware
-        // registry uses.
+        // Only the builtin `jwt` and `session-cookie` modules (and their
+        // long-form spellings) forward a claims header; match the same
+        // canonicalization the middleware registry uses.
         let canonical = mount.library.replace('_', "-");
-        if !matches!(canonical.as_str(), "jwt" | "ephpm-middleware-jwt") {
+        if !matches!(
+            canonical.as_str(),
+            "jwt" | "ephpm-middleware-jwt" | "session-cookie" | "ephpm-middleware-session-cookie"
+        ) {
             continue;
         }
         if let Some(name) = mount
@@ -2400,7 +2403,12 @@ impl Router {
                 &remote_addr.ip().to_string(),
                 &server_name,
                 &headers,
-            );
+            )
+            // The host's own trusted-proxy-aware verdict — the same value PHP
+            // sees as `$_SERVER['HTTPS']`. Modules must not re-derive this
+            // from `X-Forwarded-Proto`, which reaches them exactly as the
+            // client sent it.
+            .with_https(is_https);
             match chain.evaluate(&ctx, &path) {
                 crate::middleware::ChainVerdict::Respond { status, body, headers } => {
                     return middleware_response(status, body, &headers);
@@ -4755,9 +4763,28 @@ mod tests {
     }
 
     #[test]
+    fn ingest_strip_list_includes_configured_session_cookie_claims_header() {
+        // `session-cookie` forwards verified claims exactly like `jwt` does,
+        // so its claims header needs the same ingest strip — otherwise a
+        // client can forge it on a path the mount's `match` glob skips.
+        let mount = MiddlewareMount {
+            library: "session_cookie".to_string(),
+            match_pattern: Some("/app/*".to_owned()),
+            order: 10,
+            config: Some(serde_json::json!({
+                "secret": "s",
+                "login_url": "https://login.example/start",
+                "claims_header": "X-Session-Claims",
+            })),
+        };
+        let strip = build_ingest_strip_headers(&[mount]);
+        assert!(strip.iter().any(|h| h == "x-session-claims"), "{strip:?}");
+    }
+
+    #[test]
     fn ingest_strip_list_ignores_non_jwt_mounts() {
         // A cors mount carrying an incidental `claims_header` key must not
-        // contribute — only the jwt module forwards claims.
+        // contribute — only the claims-forwarding modules do.
         let cors = MiddlewareMount {
             library: "cors".to_string(),
             match_pattern: None,

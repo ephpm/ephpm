@@ -16,10 +16,10 @@ counter is a single `kv_incr`.
 
 There are **two ways a module runs**:
 
-- **Built-in (static registry).** Four modules — `jwt`, `cors`,
-  `ratelimit`, `security-headers` — are compiled into **every** ePHPm
-  binary. `library = "jwt"` just works: no shared library on disk, no
-  `dlopen`, no special build.
+- **Built-in (static registry).** Five modules — `jwt`, `cors`,
+  `ratelimit`, `security-headers`, `session-cookie` — are compiled into
+  **every** ePHPm binary. `library = "jwt"` just works: no shared library
+  on disk, no `dlopen`, no special build.
 - **Dynamic (shared library).** Custom out-of-tree modules are `.so` /
   `.dylib` / `.dll` files speaking a small, versioned C ABI, loaded once at
   startup via `dlopen` (`LoadLibrary` on Windows). This works out of the
@@ -121,8 +121,9 @@ the mount.
 The `library` value is checked against the **builtin registry first**.
 Each built-in answers to its short name and its crate name, with `-` and
 `_` interchangeable: `jwt`, `cors`, `ratelimit` (also `rate-limit`),
-`security-headers`, and the `ephpm-middleware-*` / `ephpm_middleware_*`
-long forms. Builtin mounts never touch the filesystem.
+`security-headers`, `session-cookie`, and the `ephpm-middleware-*` /
+`ephpm_middleware_*` long forms. Builtin mounts never touch the
+filesystem.
 
 Anything else is resolved as a shared library. A value containing a path
 separator or a file extension is used as-is. A bare name tries, in each
@@ -185,7 +186,7 @@ chain sees everything — static, dynamic, and error paths alike.
 
 ## The built-in modules
 
-All four are compiled into every ePHPm binary and run in-process — the
+All five are compiled into every ePHPm binary and run in-process — the
 sections below apply identically whether you mount them by short name
 (built-in) or dlopen their cdylib builds on a dynamic binary.
 
@@ -246,6 +247,175 @@ therefore trust `HTTP_X_JWT_CLAIMS` regardless of request path.
 > defense), so it never surfaces as `$_SERVER['HTTP_PROXY']`.
 
 v1 is HS256 only — RS256/JWKS is not implemented.
+
+### `session-cookie`
+
+Gates a whole site in a **browser** on a signed session cookie minted by an
+external identity service, and redirects unauthenticated visitors to that
+service. Same crypto as `jwt` (they share one verification core), different
+threat model: a token in a cookie instead of a header, and a redirect
+instead of a `401`, because a browser can do nothing useful with a `401`.
+
+They are separate modules on purpose. Mounting `jwt` in front of an API and
+`session-cookie` in front of a UI keeps each one's failure behaviour where
+it belongs — no key in the `jwt` config can turn its `401`s into redirects,
+and no key here can silently stop redirecting.
+
+**ePHPm never calls the identity provider.** Verification is one HMAC over
+bytes already in the request: no network call on the request path, no
+provider rate limits, and no OAuth client secret on the serving nodes. The
+nodes hold one shared HMAC secret; compromising a node lets an attacker mint
+sessions for that deployment, and gets them nothing at the provider.
+
+| key | default | meaning |
+|-----|---------|---------|
+| `secret` (string) | **required** | HS256 shared secret — the same key the login service signs with |
+| `login_url` (string) | **required** | where to send unauthenticated browsers. Must be an `https://`/`http://` URL or a same-origin absolute path; anything else (`javascript:`, `//host`) fails startup |
+| `cookie` (string) | `"ephpm_session"` | name of the cookie carrying the token |
+| `return_to_param` (string) | unset — **no return-to is sent** | query parameter on `login_url` carrying the validated return path |
+| `site_param` (string) | unset | query parameter carrying this request's vhost id, so one login service can serve many sites |
+| `issuer` (string) | unset | required `iss` claim value |
+| `audience` (string) | unset | required `aud` claim value (string or array member) |
+| `claims_header` (string) | unset | forward the verified claims JSON to PHP in this request header |
+| `require_https` (bool) | `true` | refuse to accept a session cookie on a cleartext request (loopback exempt) |
+
+```toml
+[[middleware]]
+library = "session-cookie"
+order   = 10
+config  = {
+  secret          = "shared-with-the-login-service",
+  login_url       = "https://previews.example/auth/start",
+  cookie          = "preview_session",
+  return_to_param = "next",
+  site_param      = "site",
+  claims_header   = "X-Session-Claims",
+}
+```
+
+What the module does per request:
+
+- **No cookie, wrong cookie name, expired, tampered, wrong signing key, or
+  `alg: none`** → a redirect to `login_url`, and **PHP never runs**. Every
+  rejection produces the same response, so a client cannot learn *why* it
+  was refused.
+- **Valid cookie** → the request continues to PHP. With `claims_header` set,
+  the module REWRITEs that request header to the verified claims JSON and
+  PHP reads it from `$_SERVER['HTTP_X_SESSION_CLAIMS']`.
+
+The redirect is `302` for `GET`/`HEAD` and `303` for every other method —
+after an unauthenticated `POST`, `303` is what tells the browser to *GET*
+the login page rather than re-submit the form body to the identity service.
+It carries `Cache-Control: no-store` and `Vary: Cookie` so no shared cache
+serves one visitor's redirect to another.
+
+Verification is exactly `jwt`'s: signature checked **first** (constant-time
+HMAC, so no unauthenticated JSON is ever parsed), `alg` pinned to HS256,
+`exp` **required** and in the future, `nbf` honoured, `iss`/`aud` enforced
+when configured. **A session token with no `exp` is rejected** — a session
+that cannot expire is a configuration bug, not a session.
+
+#### Return-to, and why it is not `?next=`
+
+With `return_to_param`, the redirect tells the login service where to send
+the visitor afterwards. That value is taken from **the path the browser
+actually requested**, never from a client-supplied parameter — an
+unvalidated `?next=` is an open redirect and a ready-made phishing
+primitive, so this module does not read one.
+
+The request line is still client-controlled, so the target is validated
+anyway before it is emitted. It must be an absolute path and nothing else:
+
+- starts with a single `/` — `//evil.example` and `///evil.example` are
+  protocol-relative URLs, not paths, and are rejected;
+- no `\` anywhere — browsers normalise `\` to `/`, so `/\evil.example`
+  behaves exactly like `//evil.example`;
+- no ASCII control character, space, `DEL`, `#`, or non-ASCII byte
+  (anything that could split a header or truncate a URL);
+- at most 2048 bytes.
+
+Anything that fails is **dropped**, not sanitised: the visitor still reaches
+the login page, just without a return-to. The value that does survive is
+percent-encoded aggressively (everything outside `A-Za-z0-9-._~`), so it
+cannot introduce a parameter, a fragment, or a second URL into the login
+URL's query.
+
+This is one half of the defence. **The login service must validate the
+return-to it receives as well** — it is the component that actually issues
+the final `Location`, and it must not follow one off its own origin.
+
+#### HTTPS
+
+A session cookie is a bearer credential: anyone who reads it is the user. On
+a cleartext connection it is readable in transit, so with the default
+`require_https = true` the module refuses such a request outright with a
+`403` rather than accepting the cookie.
+
+- The verdict is **the host's**, not a header the module read. ePHPm uses
+  the accepted connection's TLS state, overridden by `X-Forwarded-Proto`
+  only for peers matching `[server.proxy] trusted_proxies` — the same value
+  PHP sees as `$_SERVER['HTTPS']`. A client-set `X-Forwarded-Proto: https`
+  from an untrusted peer does **not** satisfy this. If ePHPm sits behind a
+  TLS-terminating proxy, that proxy's address must be in `trusted_proxies`
+  or every request will look like cleartext.
+- **Loopback clients are exempt**, so `http://127.0.0.1:8080` works for
+  local development. This mirrors the web platform's own treatment of
+  `localhost` as a secure context, and it means you never have to ship a
+  `require_https = false` you meant only for your laptop.
+- It is a hard `403`, not a redirect: bouncing to an HTTPS login service
+  that sets a cookie the browser then returns over HTTP would loop forever,
+  and a loop is a worse diagnostic than a message.
+- What the module **cannot** do is make the cookie itself secure. Only the
+  issuer can, with the cookie's own attributes — see below.
+
+#### The other half: what the login service must do
+
+ePHPm validates; something else must issue. A login service ("switchboard"
+in the preview-hosting case) has to:
+
+1. **Authenticate the visitor** however it likes — OAuth, SSO, a magic link
+   — and decide whether they may see this site. It knows which site to
+   decide about from the `site_param` value on the redirect. This is where
+   all provider-specific work lives, and it happens **once per session**,
+   not once per request.
+2. **Mint an HS256 JWT** signed with the same `secret`, with an `exp` in the
+   future (required) and whatever `sub`/`iss`/`aud`/custom claims the app
+   needs. Keep it short-lived: this module has no revocation list, so
+   `exp` is the only thing that ends a session early.
+3. **Set it as a cookie** on the site's domain, under the name in `cookie`,
+   with `Secure` (so the browser never sends it over cleartext),
+   `HttpOnly` (so page JavaScript cannot read it), a `SameSite` value the
+   flow tolerates, and a `Path`/`Domain` no broader than necessary. These
+   attributes are the issuer's job — ePHPm never sets the cookie and cannot
+   add them after the fact.
+4. **Validate the return-to** it was handed and redirect the visitor back
+   to it, refusing anything that is not a path on the site it is returning
+   the user to.
+
+Both halves must be configured with the same secret and the same cookie
+name, and the login service must be able to set cookies on the site's
+domain (typically a parent domain of the preview hostnames).
+
+#### Claims forwarding
+
+With `claims_header = "X-Session-Claims"`, PHP reads the verified claims
+from `$_SERVER['HTTP_X_SESSION_CLAIMS']` without re-verifying. As with
+`jwt`'s `claims_header`, any client-sent header of that name is **stripped
+at ingest** — before the chain runs and before any header crosses to PHP —
+so a request on a path this mount's `match` glob skips can never smuggle a
+forged claims value through.
+
+#### Limits worth knowing
+
+- **HS256 only**, like `jwt` — no RS256/JWKS, so the signing key is a shared
+  secret and every serving node can mint tokens as well as verify them.
+- **No revocation.** A token is valid until its `exp`. Rotating `secret`
+  invalidates every outstanding session at once, which is the only
+  bulk revocation available.
+- **Coverage follows the chain's** (see below): in fpm mode the gate runs on
+  PHP-dispatched requests only, so static assets under the document root are
+  **not** gated. Gate a site whose static files are also confidential with
+  worker mode, or in front of ePHPm.
 
 ### `ratelimit`
 
@@ -350,7 +520,10 @@ declare!(MyAuth);
 config JSON parsing, response marshaling, and panic containment (a panicking
 `invoke` becomes a fail-closed 500).
 
-Inside `invoke`, `req.host()` exposes host services:
+Inside `invoke`, `req` exposes the request (`method()`, `path()`,
+`query()`, `remote_ip()`, `vhost_id()`, `header()`, and `is_https()` — the
+host's trusted-proxy-aware secure-transport verdict), and `req.host()`
+exposes host services:
 
 ```rust
 let host = req.host();
@@ -378,7 +551,8 @@ The artifact lands at `target/release/lib<crate_name>.so`; a bare
 `library = "<crate_name>"` mount finds the `lib<name>.so` form through
 the search path. The four in-tree modules build exactly the same way
 (`-p ephpm-middleware-jwt -p ephpm-middleware-cors
--p ephpm-middleware-ratelimit -p ephpm-middleware-security-headers`).
+-p ephpm-middleware-ratelimit -p ephpm-middleware-security-headers
+-p ephpm-middleware-session-cookie`).
 
 Build on a distro whose glibc is not newer than the deployment target's
 (the usual glibc forward-compatibility rule — a module built on Debian 12
@@ -407,8 +581,15 @@ const char* ephpm_middleware_describe(void);   /* optional, nullable */
   for the process lifetime — modules do not `dlsym` host symbols (that
   would need `-rdynamic` on Linux and has no clean Windows analogue). It
   contains request accessors (method, path, query, remote IP, header
-  lookup, vhost id), the KV operations (`kv_get`/`kv_set`/`kv_set_nx`/
-  `kv_incr`/`kv_free`) and `log`.
+  lookup, vhost id, secure-transport flag), the KV operations
+  (`kv_get`/`kv_set`/`kv_set_nx`/`kv_incr`/`kv_incr_ttl`/`kv_free`) and
+  `log`.
+- Repeated request-header lines are pre-joined before a module sees them:
+  `", "` for ordinary headers, `"; "` for `Cookie` (HTTP/2 is allowed to
+  split it across field lines).
+- `request_is_https` is the **host's** trusted-proxy-aware verdict, the
+  same value PHP sees as `$_SERVER['HTTPS']`. Use it instead of reading
+  `X-Forwarded-Proto`, which reaches modules exactly as the client sent it.
 - The request pointer is only valid during `invoke`; never store it.
   Everything a module writes into `response_out` must stay valid until its
   `invoke` returns — the host copies before unwinding.

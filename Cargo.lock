@@ -1403,6 +1403,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ephpm-middleware-session-cookie"
+version = "0.1.0"
+dependencies = [
+ "ephpm-middleware",
+ "ephpm-middleware-builtins",
+]
+
+[[package]]
 name = "ephpm-php"
 version = "0.1.0"
 dependencies = [

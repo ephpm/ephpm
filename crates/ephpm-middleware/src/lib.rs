@@ -146,6 +146,19 @@ impl Request<'_> {
         self.str_of(unsafe { (self.host.request_vhost_id)(self.raw) })
     }
 
+    /// Whether this request reached the server over a secure transport.
+    ///
+    /// This is the host's own verdict: the accepted connection's TLS state,
+    /// overridden by `X-Forwarded-Proto` **only** for peers matching
+    /// `[server.proxy] trusted_proxies`. Prefer it over reading
+    /// `X-Forwarded-Proto` yourself — that header arrives exactly as the
+    /// client sent it, so any client can claim `https`.
+    #[must_use]
+    pub fn is_https(&self) -> bool {
+        // SAFETY: contract of `from_raw`.
+        unsafe { (self.host.request_is_https)(self.raw) != 0 }
+    }
+
     /// Host services (KV store, logging) scoped to the table this request
     /// was invoked with. Equivalent to `Host::new(__ephpm_mw_host())` but
     /// also works in unit tests that build a [`Request`] by hand.
