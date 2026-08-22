@@ -717,7 +717,17 @@ that transfer is the main reason the native lane exists, so if your
 middleware's job is to shed load or reject uploads cheaply, write it against
 the native lane. `order` sorts mounts *within* a lane; it cannot interleave
 the two, because no ordering can put PHP before the body read. Startup logs
-the resolved two-phase plan so this is never silent.
+the two lanes as separate lines — `middleware chain loaded` for the native
+modules, then a `PHP middleware mounted (EXPERIMENTAL)` line naming the `php:`
+mounts and restating where they run — so the split is never silent:
+
+```
+INFO ephpm_server: middleware chain loaded count=1 modules=["security-headers"]
+INFO ephpm_server: PHP middleware mounted (EXPERIMENTAL) — these run INSIDE the PHP
+     request, after the request body has been read and after every native module, so
+     they cannot reject before the body transfer the way a native module can
+     php_mounts=["php:middleware.php"]
+```
 
 ### What it costs
 
