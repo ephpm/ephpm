@@ -642,11 +642,13 @@ mod tests {
 
     /// The single-crypto-provider invariant, asserted rather than assumed.
     ///
-    /// `ring` and `aws-lc-rs` are both compiled into this binary, so "which
-    /// provider does TLS use?" has a real answer that could differ per
-    /// transport. `tls::build_server_config` hands out one cached `Arc`, so
-    /// pointer identity is a genuine check that HTTP/3 and HTTPS-over-TCP got
-    /// the *same* provider instance — not merely two equivalent ones.
+    /// Since #241 the tree carries a single rustls provider (aws-lc-rs), so
+    /// the two transports can no longer disagree by crate feature. They could
+    /// still disagree by *code* — one of them naming a provider directly
+    /// instead of going through `tls::build_server_config`. That function
+    /// hands out one cached `Arc`, so pointer identity is a genuine check
+    /// that HTTP/3 and HTTPS-over-TCP got the *same* provider instance, not
+    /// merely two equivalent ones.
     #[test]
     fn http3_and_tcp_tls_share_one_crypto_provider() {
         crate::tls::tests_support::init_crypto();

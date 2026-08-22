@@ -123,6 +123,14 @@ impl Drop for ServerGuard {
 /// client because the rest of the test is synchronous and we don't need a
 /// tokio runtime just for three GETs.
 fn get_with_host(url: &str, host: &str) -> (u16, String) {
+    // The reqwest dev-dependency is built with
+    // `rustls-tls-webpki-roots-no-provider` so it cannot pull a second crypto
+    // provider into the graph (#241); in exchange it panics with "No provider
+    // set" unless a process default is installed. Use the server's own entry
+    // point so the client and the server can never disagree on the provider.
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(ephpm_server::tls::install_default_crypto_provider);
+
     let rt =
         tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime");
     rt.block_on(async {
