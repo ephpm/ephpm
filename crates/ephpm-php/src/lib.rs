@@ -161,6 +161,16 @@ mod ffi {
         /// call.
         pub fn ephpm_cli_add_ini_define(def: *const ::std::os::raw::c_char);
 
+        /// CLI `PHP_BINARY` — record the running executable's resolved path.
+        /// Must be called BEFORE `php_embed_init()`; the C side installs it
+        /// into `sapi_module.executable_location` during module startup, the
+        /// one window where it survives (`php_embed_init()` overwrites the
+        /// field with `argv[0]`, and `php_module_startup()` consumes it via
+        /// `php_binary_init()`). Without it `PHP_BINARY` registers as `""` on
+        /// every non-Windows platform (issue #339). The string is copied
+        /// immediately; the pointer need not outlive the call.
+        pub fn ephpm_cli_set_executable_location(path: *const ::std::os::raw::c_char);
+
         /// Set the configured `max_execution_time` (seconds) the request paths
         /// use to arm PHP's per-thread execution timer. Necessary because the
         /// embed SAPI resets the `max_execution_time` ini entry to `0`
@@ -887,6 +897,28 @@ impl PhpRuntime {
             // php_embed_init(). Sets a process global read during module
             // startup; no PHP runtime state exists yet.
             unsafe { ffi::ephpm_enable_cli_mode() };
+
+            // PHP_BINARY (#339). php-cli assigns argv[0] here; ePHPm passes
+            // the already-resolved current_exe() instead, because `ephpm php`
+            // is reached through a subcommand and argv[0] may be a bare name
+            // that php_binary_init() would resolve against PATH to *some*
+            // ephpm rather than this one. A path that can't be determined or
+            // holds a NUL is simply not set — PHP_BINARY then stays "", the
+            // pre-fix behavior, rather than naming the wrong file.
+            //
+            // `into_encoded_bytes()` is the platform's own path bytes (exact
+            // on Unix, WTF-8 on Windows — identical to UTF-8 for any real
+            // path), which is what the C side needs; a `to_str()` round-trip
+            // would instead drop non-UTF-8 Unix paths on the floor.
+            if let Some(exe) = std::env::current_exe()
+                .ok()
+                .and_then(|p| CString::new(p.into_os_string().into_encoded_bytes()).ok())
+            {
+                // SAFETY: same before-init timing contract as above. The C
+                // side strdup()s the string immediately, so the CString may
+                // drop at the end of this block.
+                unsafe { ffi::ephpm_cli_set_executable_location(exe.as_ptr()) };
+            }
 
             let (ini_override, no_ini, ini_defines) = precscan_cli_ini_flags(args);
 
