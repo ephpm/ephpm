@@ -20,7 +20,7 @@ see the [analysis page](/analysis/php-on-windows/) for setup):
 
 | Your workload | Windows penalty | What helps | Measured effect |
 |---|---|---|---|
-| CPU-bound PHP (loops, crypto, image math, parsers) | ~2.0–2.2x | JIT (on by default single-site), TAILCALL build | JIT **~2.4x**; TAILCALL **1.72x** interpreter-only (JIT off), **~1.55x** on cold code with JIT on, ≈0 marginal on the JIT-on hot path |
+| CPU-bound PHP (loops, crypto, image math, parsers) | ~2.0–2.2x | TAILCALL build (the JIT is **off by default on Windows** — see [The JIT](#the-jit)) | TAILCALL **1.72x** interpreter-only (JIT off), **~1.55x** on cold code with JIT on; the JIT itself measured **~2.4x** but is currently unsafe on Windows |
 | Typical web app (framework, autoloader, templates) | mixed, mostly filesystem | serve-mode defaults, fewer file ops | single digits from runtime levers; the win is cutting file operations |
 | File-metadata-heavy (dev mode, deep `vendor/`, cache-miss storms) | ~10x on the metadata itself | fewer `stat`s: prod opcache settings, classmaps, Dev Drive | eliminates *repeat* cost; first touch stays expensive |
 
@@ -55,20 +55,20 @@ reference loops in #329 agree). Read that number precisely — it is the
 *interpreter* win, and it lands in full exactly where the interpreter does
 the work:
 
-- **Multi-tenant serve**, where ePHPm ships the JIT off by default (see
-  [The JIT](#the-jit)) — the interpreter is the whole game, so the ~1.72x is
-  the entire benefit. This is TAILCALL's strongest real-world case.
+- **Every serve deployment on Windows**, where ePHPm now ships the JIT off by
+  default in *all* modes (see [The JIT](#the-jit)) — the interpreter is the
+  whole game, so the ~1.72x is the entire benefit. On Windows this is
+  TAILCALL's headline case, not a niche one.
 - **Cold / short / first-request code** — framework bootstrap, first hits,
   short scripts — which run the interpreter even when the JIT is enabled
   (~1.55x there).
 
-Where it is a *smaller* win: a **single-site** serve deployment, which since
-v0.7.3 runs the tracing JIT **on** by default. JIT-compiled hot code
-sidesteps the interpreter's dispatch entirely, so on a warm hot loop
+Where it would be a *smaller* win is a deployment running the JIT: JIT-compiled
+hot code sidesteps the interpreter's dispatch entirely, so on a warm hot loop
 MSVC+JIT and TAILCALL+JIT are neck-and-neck (see §5 of the
 [analysis](/analysis/php-on-windows/)) — TAILCALL's remaining edge there is
-cold-path latency, not steady-state throughput. Don't expect 1.72x on a
-JIT-on single-site hot path.
+cold-path latency, not steady-state throughput. That case is currently
+hypothetical on Windows, since the tracing JIT is off by default there.
 
 And note *why* it is a separate binary rather than a config flag: the Zend VM
 kind is fixed when PHP is compiled — there is no `opcache.vm_kind` or
@@ -97,18 +97,45 @@ workload. Because it emits its own machine code, the JIT also makes the
 choice of interpreter (CALL vs TAILCALL) largely moot on hot paths — see
 [the TAILCALL section](#the-tailcall-build) above.
 
-Since v0.7.3, ePHPm's JIT default is **shaped by mode** (#350), not a blanket
-off:
+**The tracing JIT is off by default on Windows, and you should leave it off**
+(issue #365). PHP's tracing JIT resolves an opcode handler through
+`ZEND_FUNC_INFO(exit_info->op_array)` when it compiles a **side trace**. That
+`op_array` can be a heap copy — a method of a linked class the inheritance
+cache could not persist into shared memory — which is freed at request
+shutdown while the parent trace's exit info lives on in SHM. Compiling that
+side trace in a *later* request dereferences freed memory: `0xC0000005`, no
+PHP error, no ePHPm log line, process gone. A stock Laravel app dies after
+**three requests**, deterministically.
+
+This is an upstream PHP defect, not an ePHPm one — it reproduces on **stock
+`php.exe -S`** with no ePHPm involved. Measured here against a stock Laravel
+13 app: 8.5.5, 8.5.7 and 8.5.9 all die after 2–3 requests; 8.5.4 and 8.4.24
+survive 150. The regression comes from
+[php-src PR 21368](https://github.com/php/php-src/pull/21368) (first released
+in PHP 8.5.5) and the fix is
+[php-src PR 21710](https://github.com/php/php-src/pull/21710), still open.
+Windows is hit hardest because class linking misses the inheritance cache
+more often there, but upstream has reproduced the root cause on Linux too.
+
+ePHPm's JIT default is **shaped by mode and platform** (#350, #365), not a
+blanket off:
 
 | Mode | `[php] opcache_jit` unset → | Why |
 |---|---|---|
-| Single-site `ephpm serve` | **`tracing` (on)** | measured ~2.4x on CPU-bound PHP; single-process embed avoids the multi-process SHM JIT bugs |
+| Single-site `ephpm serve`, **Linux/macOS** | **`tracing` (on)** | measured ~2.4x on CPU-bound PHP; single-process embed avoids the multi-process SHM JIT bugs |
+| Single-site `ephpm serve`, **Windows** | `disable` | upstream tracing-JIT use-after-free kills the process after ~3 requests — see the warning above |
 | Multi-tenant (`[server] sites_dir`) | `disable` | per-vhost `opcache_invalidate` never reclaims JIT buffer, so deploy churn would silently exhaust it |
 | Worker mode (`[php] mode = "worker"`) | `disable` | JIT works there but the recycle lifecycle isn't soaked — opt in explicitly |
 | Dev | `disable` | PHP's own default |
 
-So on a single-site box you already get the JIT with no config change. To
-pin it explicitly in any mode, set the `[php] opcache_jit` knob — an explicit
+If you want *some* JIT on Windows today, `opcache_jit = "function"` is the
+safe setting: the function JIT compiles whole hot functions and never builds
+traces, so it cannot reach the defective path (verified: 150 requests clean
+where `"tracing"` dies at 3). Its measured benefit on a real web app is close
+to zero, though — the Windows win is in cutting file operations, not in the
+interpreter.
+
+To pin the mode explicitly, set the `[php] opcache_jit` knob — an explicit
 value wins everywhere, and a dedicated startup line always states the
 effective JIT state and why:
 
