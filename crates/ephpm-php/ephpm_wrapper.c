@@ -3020,7 +3020,11 @@ typedef struct {
     void (*param_bytes)(const char *p, size_t len);
     /* Execute sql with the staged params through the per-thread Session.
      * Returns 1 = result set staged, 2 = OK staged, -1 = error staged,
-     * -2 = no backend registered ([db.sqlite] not active). */
+     * -2 = no backend registered ([db.sqlite] not active),
+     * -3 = this thread's bridge thread-locals are already destroyed because
+     *      the thread is exiting, so nothing was executed (issue #269 — a
+     *      register_shutdown_function callback or destructor running inside
+     *      php_request_shutdown() on a retiring worker thread). */
     int  (*run)(const char *sql, size_t sql_len);
     /* Result-set accessors — valid after run() returned 1, on the same
      * thread, until the next run()/finish(). */
@@ -3097,6 +3101,18 @@ static int ephpm_db_run_or_throw(const char *sql, size_t sql_len, HashTable *par
     if (rc == -2) {
         zend_throw_exception(zend_ce_exception,
             "ephpm_db: no embedded database is active (requires [db.sqlite])", 0);
+        return EPHPM_DB_THREW;
+    }
+    if (rc == -3) {
+        /* Issue #269. The thread is exiting and the Rust bridge's per-thread
+         * state has already been destroyed, so no statement ran. Deliberately
+         * worded differently from the -2 case: a database IS configured, this
+         * thread just cannot reach it any more. Adapters that key on the -2
+         * wording must not treat this as "no database configured". */
+        zend_throw_exception(zend_ce_exception,
+            "ephpm_db: the database bridge is no longer available on this thread "
+            "(it is shutting down) — a shutdown function or destructor ran after "
+            "per-thread database state was released; no statement was executed", 0);
         return EPHPM_DB_THREW;
     }
     if (rc < 0) {

@@ -162,6 +162,41 @@ the mapper cannot classify arrives as `1105` with SQLSTATE `HY000`.
 
 Catch `\Exception` (or `\Throwable`); do not catch `PDOException`.
 
+## Shutdown functions and destructors
+
+**Do not put queries in `register_shutdown_function()` callbacks or in
+`__destruct()`.** They are not guaranteed to reach the database, and the
+reason is specific to how ePHPm runs PHP.
+
+ePHPm does not call `php_request_shutdown()` between HTTP requests — the
+embedded SAPI keeps one long-lived request open per worker thread. So a
+shutdown function you register does **not** run at the end of *your*
+request. It runs later, when the worker thread itself retires (the tokio
+blocking pool reaps an idle thread, or the server shuts down) — by which
+point that thread's per-request database state has already been released.
+
+A query issued from there is **refused, not executed**, and throws:
+
+```
+Exception: ephpm_db: the database bridge is no longer available on this
+thread (it is shutting down) — a shutdown function or destructor ran after
+per-thread database state was released; no statement was executed
+```
+
+The wording is deliberately different from the "no embedded database is
+active" case above: a database *is* configured; that particular thread just
+cannot reach it any more. Nothing is half-applied — the statement never
+reaches the engine, so a write cannot land and then fail to report.
+
+Do your database work inside the request. If you need end-of-request
+cleanup, do it explicitly (a `finally` block, or your framework's terminate
+hook, which runs while the request is still live) rather than relying on
+PHP's shutdown handlers.
+
+The same rule applies to [`ephpm_kv_*`](/guides/kv-from-php/) (reads miss
+and writes are refused) and [`ephpm_ws_*`](/guides/websockets/) (the site
+scope is gone, so sends report no capability).
+
 ## The session model
 
 There is **no connection object**. Nothing to open, close, pool, or pass
