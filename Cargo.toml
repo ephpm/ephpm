@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/*", "xtask"]
+# `examples/rust-middleware` is the worked example for the native-middleware
+# C ABI. It is a workspace member so `cargo clippy --workspace` and
+# `cargo +nightly fmt --all` keep it compiling against the current ABI — an
+# example that has drifted out of tree is worse than no example. It is kept
+# OUT of `default-members` so a plain `cargo build` does not pay for it.
+members = ["crates/*", "examples/rust-middleware", "xtask"]
 default-members = ["crates/*"]
 exclude = ["crates/ephpm-e2e"]
 resolver = "3"
