@@ -7,9 +7,9 @@
 //! i.e. the application script does not run.
 //!
 //! The fail-open hazard being closed here is specific and easy to reintroduce:
-//! PHP 8 reports an uncaught `Throwable` with `E_DONT_BAIL`, so
-//! `php_execute_script()` returns normally and the naive loop would happily
-//! continue to the app script. For an auth middleware that is an auth bypass.
+//! PHP 8 reports an uncaught `Throwable` with `E_DONT_BAIL`, so execution
+//! returns normally and the naive loop would happily continue to the app
+//! script. For an auth middleware that is an auth bypass.
 //!
 //! Requires a real libphp link (`php_linked`); in stub mode the file compiles
 //! to nothing.
@@ -212,7 +212,7 @@ fn exit_skips_later_mounts() {
 // ── Failure semantics — all fail CLOSED ───────────────────────────────
 
 /// An uncaught exception is the fail-open trap: `zend_exception_error` reports
-/// it with `E_DONT_BAIL`, so `php_execute_script` returns normally and only
+/// it with `E_DONT_BAIL`, so execution returns normally and only
 /// `PG(last_error_type)` records it. The app script must still not run.
 #[test]
 #[serial]

@@ -343,8 +343,10 @@ static EPHPM_TLS int request_active = 0;
  * the OPcache vhost, the per-site DB session, the execution timer and the crash
  * guard are all already correct for this request, so a middleware file inherits
  * every isolation and safety property the app script has instead of needing a
- * parallel set. The marginal cost is one extra (OPcache-cached)
- * php_execute_script() per matching mount.
+ * parallel set. The marginal cost is one extra OPcache-cached script execution
+ * per matching mount — measured at ~7-12 us over HTTP, against ~366 us for a
+ * trivial request. See ephpm_run_one_middleware() for why that execution does
+ * NOT go through php_execute_script().
  *
  * Pointers are borrowed from Rust and must stay valid until
  * ephpm_execute_request() returns — same contract as server_vars above. */
