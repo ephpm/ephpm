@@ -346,6 +346,13 @@ impl GithubAuth {
 
     /// Handle GitHub's redirect: verify `state`, exchange the code, check
     /// access, issue the session.
+    ///
+    /// **Every local rejection happens before the first network call** — the
+    /// `state` cookie, its signature, its expiry, the nonce comparison, the
+    /// vhost binding and the shape of `code` are all checked first. An
+    /// attacker without a valid `state` cookie therefore cannot make this
+    /// module talk to GitHub at all, which is what keeps the callback from
+    /// being an amplification endpoint.
     #[allow(clippy::too_many_lines, reason = "one linear flow, each step guarded")]
     fn handle_callback(&self, req: &Request<'_>, vhost: &str, now: u64) -> Response {
         let query = req.query();

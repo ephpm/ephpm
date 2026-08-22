@@ -316,6 +316,14 @@ used during the login and dropped. **Rotate `client_secret` and
 - **The `state` cookie is replayable within its 10-minute window** by whoever
   holds it — i.e. by the user themselves. Reuse of an authorization *code* is
   refused by GitHub, not here.
+- **The callback is not rate-limited by this module.** Every check that can
+  reject a callback locally — the `state` cookie, its signature, its expiry,
+  the nonce comparison, the vhost binding, and the shape of `code` — runs
+  *before* any network call, so an attacker with no valid `state` cookie
+  cannot make this module talk to GitHub at all. A user who has started a
+  real login can replay their own callback within its 10-minute window,
+  though, and each replay costs one exchange attempt. Mount the `ratelimit`
+  builtin on `match = "/_ephpm/auth/*"` if that matters to you.
 - **No `dlopen`, no module** — see [Requirements](#requirements).
 
 ## Verification status
