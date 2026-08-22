@@ -378,6 +378,11 @@ impl BundleSpec {
         sealed_paths: &[String],
         verify_negatives: bool,
     ) -> Result<Self, BundleError> {
+        // Resolve the docroot the same way the scan does, so a sealed root key
+        // derived here matches the file keys `from_scan` produces. Without this a
+        // `.`/`..`/symlinked/relative docroot yields sealed roots that contain
+        // nothing — silently disabling the whole feature.
+        let docroot = canonical_root(&docroot);
         let docroot_key = normalize_key(&docroot.to_string_lossy());
         let mut sealed_roots = Vec::new();
         if semantics == BundleSemantics::Sealed {
@@ -523,11 +528,27 @@ impl Bundle {
         let mut resident_bytes = 0usize;
         let mut next_inode: u64 = 1;
 
+        // CANONICALIZE THE WALK ROOT, not just the lookup key. Every path this
+        // scan stores is `walk_root` + the components `read_dir` reports, so
+        // rooting the walk at the OS-canonical docroot is what makes every
+        // `FileEntry::canon` canonical. See `canonical_path_string`.
+        let walk_root = canonical_root(docroot);
+
         // Always index the docroot itself as a directory.
-        let docroot_key = normalize_key(&docroot.to_string_lossy());
+        let docroot_key = normalize_key(&walk_root.to_string_lossy());
         dirs.insert(docroot_key.clone());
 
-        let mut stack = vec![docroot.to_path_buf()];
+        // Canonical keys of directories already walked — the cycle guard that
+        // lets the scan follow symlinked directories at all.
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(docroot_key.clone());
+        // Keys the scan could NOT enumerate exhaustively under the spelling an
+        // application might probe with: directories reached through a symlink,
+        // and files that exist but could not be read. A sealed root containing
+        // any of them must not answer authoritative negatives.
+        let mut tainted: Vec<String> = Vec::new();
+
+        let mut stack = vec![walk_root];
         while let Some(dir) = stack.pop() {
             let rd = std::fs::read_dir(&dir).map_err(|source| BundleError::Scan {
                 path: dir.to_string_lossy().into_owned(),
@@ -539,13 +560,37 @@ impl Bundle {
                     source,
                 })?;
                 let path = entry.path();
-                let meta = match entry.metadata() {
+                // `DirEntry::metadata()` does NOT traverse symlinks, so using it
+                // made every symlinked directory invisible to the scan — which
+                // is the Composer path-repository / monorepo `vendor/` layout,
+                // and in sealed mode meant answering an authoritative "does not
+                // exist" for files that do. `fs::metadata` follows, and the
+                // `visited` set below keeps a symlink loop finite.
+                let meta = match std::fs::metadata(&path) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
                 if meta.is_dir() {
-                    dirs.insert(normalize_key(&path.to_string_lossy()));
-                    stack.push(path);
+                    let real = canonical_root(&path);
+                    let real_key = normalize_key(&real.to_string_lossy());
+                    if !visited.insert(real_key.clone()) {
+                        continue; // already walked (symlink loop or alias)
+                    }
+                    let spelled_key = normalize_key(&path.to_string_lossy());
+                    if spelled_key != real_key {
+                        // A symlinked directory. We index its contents under the
+                        // RESOLVED path, because that is what PHP's realpath-based
+                        // `__FILE__`/`__DIR__` produce and therefore what every
+                        // subsequent probe is spelled with. A probe that somehow
+                        // still uses the symlink spelling simply misses and falls
+                        // through — correct, but it means the index cannot claim
+                        // to have enumerated this subtree exhaustively, so a
+                        // sealed root containing one is refused below.
+                        tainted.push(spelled_key.clone());
+                    }
+                    dirs.insert(spelled_key);
+                    dirs.insert(real_key);
+                    stack.push(real);
                     continue;
                 }
                 if !meta.is_file() {
@@ -561,7 +606,17 @@ impl Bundle {
 
                 let raw = match std::fs::read(&path) {
                     Ok(b) => b,
-                    Err(_) => continue,
+                    Err(_) => {
+                        // The file EXISTS but could not be read (mode 000, a
+                        // lock, a permission the server does not hold). Leaving
+                        // it merely unindexed is fine for overlay, but in sealed
+                        // mode it would make the index assert "does not exist"
+                        // about a file that does — and now that `file_exists`
+                        // itself is fronted, that lie is visible to every
+                        // autoloader, not just `is_file`. Taint the subtree.
+                        tainted.push(normalize_key(&path.to_string_lossy()));
+                        continue;
+                    }
                 };
                 let raw_len = raw.len();
                 let mtime = meta
@@ -588,7 +643,23 @@ impl Bundle {
                 }
                 raw_bytes += raw_len;
 
-                let canon_str = path.to_string_lossy().into_owned();
+                // The path handed to PHP must be the OS-CANONICAL spelling, not
+                // the walk path — which inherits whatever the operator typed for
+                // `document_root`. See `canonical_path_string` for what goes
+                // wrong otherwise (it is not cosmetic: it costs a
+                // "Cannot redeclare" fatal and a 100 % OPcache miss rate).
+                // The walk root is canonical and every directory is pushed in its
+                // resolved form, so `path` is already canonical unless this entry
+                // is itself a symlinked FILE. `DirEntry::file_type` is answered
+                // from the directory entry on both platforms, so this test costs
+                // no syscall and keeps the scan from paying a `canonicalize` per
+                // file (~15 µs each on Windows).
+                let is_link = entry.file_type().is_ok_and(|t| t.is_symlink());
+                let canon_str = if is_link {
+                    canonical_path_string(&path)
+                } else {
+                    path.to_string_lossy().into_owned()
+                };
                 let key = normalize_key(&canon_str);
                 // Record ancestor directories so is_dir answers from the bundle.
                 register_ancestors(&mut dirs, &key);
@@ -606,6 +677,30 @@ impl Bundle {
         let sealed_roots = if semantics == BundleSemantics::Sealed {
             spec.sealed_roots
                 .iter()
+                .filter(|key| {
+                    // A root the scan could not enumerate exhaustively — it
+                    // reached part of the subtree through a symlink (so files
+                    // are indexed under one spelling but may be probed under
+                    // another), or it holds a `.php` file that exists but could
+                    // not be read. Either way absence from the index no longer
+                    // proves absence from disk, so refuse to arm rather than
+                    // answer a silent wrong "no".
+                    let is_tainted = tainted.iter().any(|d| {
+                        d.starts_with(key.as_str()) || key.as_str().starts_with(d.as_str())
+                    });
+                    if is_tainted {
+                        tracing::warn!(
+                            sealed_root = %key,
+                            "[php] code_bundle sealed root NOT ARMED: the scan could not \
+                             enumerate it exhaustively (it contains a symlinked directory, \
+                             or a .php file that exists but could not be read). Absence \
+                             from the index would therefore not prove absence from disk. \
+                             This root falls through to the filesystem — correct, but \
+                             without the syscall saving sealed mode exists for."
+                        );
+                    }
+                    !is_tainted
+                })
                 .map(|key| SealedRoot {
                     key: key.clone(),
                     armed: std::sync::atomic::AtomicBool::new(true),
@@ -755,6 +850,68 @@ fn disarm(root: &SealedRoot, path: &str, cause: DisarmCause) {
     );
 }
 
+/// Resolve `p` to the OS-canonical absolute path, in the spelling PHP itself
+/// would produce.
+///
+/// # Why this is not cosmetic
+///
+/// The string this returns becomes [`FileEntry::canon`], which the hooks hand to
+/// PHP as the resolved include path. PHP then uses it as `__FILE__`, `__DIR__`,
+/// the entry in `get_included_files()`, the `require_once`/`include_once`
+/// de-duplication key, **and** OPcache's `opened_path` — the key OPcache
+/// revalidates a cached script against.
+///
+/// Storing the *walk* path instead propagated whatever the operator happened to
+/// type for `document_root` into all five. Measured, varying only the
+/// `document_root` spelling and nothing else:
+///
+/// * `require_once <absolute>` followed by `require_once '<relative>'` in one
+///   request executed the file **twice** — a `Cannot redeclare` fatal — because
+///   the two spellings produced two different de-dup keys.
+/// * With `opcache.validate_timestamps` on (the `ephpm dev` default) every
+///   script missed OPcache on **every** request (402 misses / 0 hits), because
+///   the `opened_path` never matched, making the bundle roughly 11× *slower*
+///   than leaving it off.
+///
+/// Both failures are silent. `normalize_key` already canonicalizes the *lookup*
+/// side lexically; this is the **output** side, and it needs the filesystem
+/// because only the filesystem knows the true case and the symlink targets.
+///
+/// Falls back to the lexical spelling if the path cannot be canonicalized (it
+/// was deleted between the directory read and here, or the platform refuses) —
+/// degraded, but never worse than before this existed.
+fn canonical_path_string(p: &Path) -> String {
+    std::fs::canonicalize(p).map_or_else(
+        |_| p.to_string_lossy().into_owned(),
+        |c| strip_verbatim_prefix(&c.to_string_lossy()),
+    )
+}
+
+/// [`canonical_path_string`] as a `PathBuf`, for use as a walk root.
+fn canonical_root(p: &Path) -> std::path::PathBuf {
+    std::path::PathBuf::from(canonical_path_string(p))
+}
+
+/// Strip Windows' extended-length (`\\?\`) prefix, which `fs::canonicalize`
+/// always adds and which PHP never produces.
+///
+/// Leaving it in would make `__FILE__` read `\\?\C:\app\x.php`, break every
+/// userland string comparison against a path the app built itself, and defeat
+/// `normalize_key`'s job of collapsing both spellings to one key. `\\?\UNC\` is
+/// mapped back to its `\\server\share` form. A no-op on non-Windows.
+fn strip_verbatim_prefix(s: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    s.to_string()
+}
+
 /// Whether a normalized key names a file with the [indexed
 /// extension](INDEXED_EXTENSION).
 ///
@@ -889,19 +1046,475 @@ fn decompress(data: &[u8], algo: BundleCompression, hint: usize) -> Option<Vec<u
 }
 
 // ===================================================================
+// Lazy read-through cache (`code_bundle = "lazy"`)
+// ===================================================================
+
+/// A **read-through cache** of PHP source and metadata: a lookup that misses
+/// does exactly the I/O PHP was about to do, answers from that, and keeps the
+/// result for next time.
+///
+/// # Why this exists next to [`Bundle`] rather than replacing it
+///
+/// [`Bundle`] is complete-by-construction and immutable, which is what lets
+/// `sealed` treat absence as authoritative and lets [`cb_get_source`] hand C a
+/// borrowed pointer that stays valid for the whole life of a `php_stream`.
+/// Lazy population destroys both properties, so it gets its own type rather than
+/// a mode flag on the old one. The two never mix: [`Index`] holds exactly one.
+///
+/// # Authoritative negatives are impossible here, by construction
+///
+/// A cache that is filled on demand and can evict cannot prove anything from
+/// absence — "never populated" and "populated then evicted" are the same state,
+/// and neither means "does not exist". So this type has **no** `Absent` answer
+/// derived from the index. It returns
+/// [`BUNDLE_ABSENT`] only for a negative it has *just confirmed with a live
+/// syscall*, which costs exactly the syscall PHP would have made anyway and is
+/// never cached. `sealed` is therefore unavailable in lazy mode, and the config
+/// layer rejects the combination rather than silently downgrading it.
+///
+/// # Never speculative: a miss substitutes for PHP's I/O, it does not add to it
+///
+/// Every populate happens on a path where PHP was *already* going to touch the
+/// filesystem — a `stat` probe or a source open. The cache performs that one
+/// operation instead of PHP and keeps the result. It never pre-reads, never
+/// re-checks, and never issues an operation PHP would not have issued. That is
+/// what makes "lazy is never worse than off" a structural property rather than a
+/// benchmark result.
+///
+/// # Lifetimes across FFI
+///
+/// Two escapes leave Rust and must survive eviction and refresh:
+///
+/// * **`canon`** — handed to `zend_string_init` as the resolved include path.
+///   Interned in [`LazyIndex::paths`], which is append-only and **never**
+///   cleared, so the pointer is process-lifetime exactly as in the immutable
+///   design. Interning is bounded by the number of distinct paths ever resolved.
+/// * **source bytes** — [`cb_get_source`] in lazy mode always sets
+///   `needs_free = 1` and hands C its **own copy**. That costs one `memcpy` per
+///   *cold compile* (OPcache serves every subsequent request without calling us
+///   at all) and in exchange the cache may evict a buffer while a `php_stream`
+///   is still reading an older copy of it. No retain/release protocol, no
+///   generation counter, no way to get it wrong.
+pub struct LazyIndex {
+    /// Per-file metadata. Append-only within a generation (cleared only by
+    /// [`LazyIndex::refresh`]); small enough that bounding it is not the point —
+    /// [`Self::sources`] is where the bytes are.
+    meta: dashmap::DashMap<String, MetaEntry>,
+    /// Directory keys seen so far, so `is_dir` can answer without a syscall
+    /// once a directory has been observed.
+    dirs: dashmap::DashSet<String>,
+    /// Interned canonical paths. **Never cleared** — see the lifetime note above.
+    paths: dashmap::DashMap<String, PathPtr>,
+    /// Source bytes, bounded by `max_bytes` with LRU eviction. Behind a plain
+    /// `Mutex` on purpose: a source open happens once per file per OPcache
+    /// generation, so this lock is off the hot path by two orders of magnitude,
+    /// and a mutex makes the byte accounting and the eviction order trivially
+    /// consistent.
+    sources: std::sync::Mutex<SourceCache>,
+    /// Active compression model for cached source.
+    algo: BundleCompression,
+    /// Normalized key of the document root. Nothing outside it is ever cached.
+    docroot_key: String,
+    /// Synthetic inode allocator.
+    next_inode: std::sync::atomic::AtomicU64,
+    /// Observability — all `Relaxed`; they are counters, not synchronisation.
+    stats: LazyStats,
+}
+
+/// A `'static` NUL-terminated canonical path, leaked on purpose.
+///
+/// `&'static CStr` is `Send + Sync`; the newtype exists only to give the leak a
+/// name that shows up in the type signature.
+#[derive(Clone, Copy)]
+struct PathPtr(&'static std::ffi::CStr);
+
+/// Cached metadata for one path. Deliberately `Copy`-cheap: the hot path clones
+/// this out of the map and drops the shard guard immediately.
+#[derive(Clone, Copy)]
+struct MetaEntry {
+    /// Interned canonical path (process-lifetime).
+    canon: PathPtr,
+    /// Size in bytes.
+    raw_len: usize,
+    /// Modification time, Unix seconds, as observed when this entry was filled.
+    mtime: i64,
+    /// Synthetic stable inode.
+    inode: u64,
+    /// `true` when the source was read-only on disk. Used so `fileperms()` and
+    /// `is_writable()` agree instead of contradicting each other.
+    readonly: bool,
+}
+
+/// LRU-bounded store of cached source bytes.
+struct SourceCache {
+    /// key → bytes as stored (raw or compressed, per [`LazyIndex::algo`]).
+    map: HashMap<String, std::sync::Arc<[u8]>>,
+    /// Least-recently-used first. Touch = push to the back.
+    order: std::collections::VecDeque<String>,
+    /// Resident bytes currently held by [`Self::map`].
+    bytes: usize,
+    /// Eviction bound. This is the whole point of the redesign: exceeding it
+    /// evicts the coldest entry instead of refusing the entire bundle.
+    max_bytes: usize,
+}
+
+/// Counters exposed by [`LazyIndex::snapshot`].
+#[derive(Default)]
+struct LazyStats {
+    /// Lookups answered from the cache with no syscall.
+    hits: std::sync::atomic::AtomicU64,
+    /// Lookups that fell through and populated the cache.
+    fills: std::sync::atomic::AtomicU64,
+    /// Live-confirmed negatives (one syscall, nothing cached).
+    negatives: std::sync::atomic::AtomicU64,
+    /// Source buffers dropped to stay under `max_bytes`.
+    evictions: std::sync::atomic::AtomicU64,
+    /// Whole-cache clears (`ephpm deploy` / `ephpm cache reset`).
+    refreshes: std::sync::atomic::AtomicU64,
+}
+
+/// A point-in-time read of [`LazyIndex`]'s counters, for logging and tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LazyStatsSnapshot {
+    /// Entries currently holding metadata.
+    pub entries: usize,
+    /// Source buffers currently resident.
+    pub cached_sources: usize,
+    /// Bytes held by cached source.
+    pub resident_bytes: usize,
+    /// See [`LazyStats::hits`].
+    pub hits: u64,
+    /// See [`LazyStats::fills`].
+    pub fills: u64,
+    /// See [`LazyStats::negatives`].
+    pub negatives: u64,
+    /// See [`LazyStats::evictions`].
+    pub evictions: u64,
+    /// See [`LazyStats::refreshes`].
+    pub refreshes: u64,
+}
+
+impl LazyIndex {
+    /// Build an empty cache for `docroot`.
+    ///
+    /// `max_bytes` bounds cached **source bytes** and is enforced by eviction,
+    /// not by refusal: unlike the eager path, no configuration of this cache can
+    /// decline to serve.
+    #[must_use]
+    pub fn new(docroot: &Path, algo: BundleCompression, max_bytes: usize) -> Self {
+        let docroot_key = normalize_key(&canonical_path_string(docroot));
+        Self {
+            meta: dashmap::DashMap::new(),
+            dirs: dashmap::DashSet::new(),
+            paths: dashmap::DashMap::new(),
+            sources: std::sync::Mutex::new(SourceCache {
+                map: HashMap::new(),
+                order: std::collections::VecDeque::new(),
+                bytes: 0,
+                max_bytes,
+            }),
+            algo,
+            docroot_key,
+            next_inode: std::sync::atomic::AtomicU64::new(1),
+            stats: LazyStats::default(),
+        }
+    }
+
+    /// The document-root key this cache is scoped to.
+    #[must_use]
+    pub fn docroot_key(&self) -> &str {
+        &self.docroot_key
+    }
+
+    /// Read the counters.
+    #[must_use]
+    pub fn snapshot(&self) -> LazyStatsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (cached_sources, resident_bytes) =
+            self.sources.lock().map_or((0, 0), |g| (g.map.len(), g.bytes));
+        LazyStatsSnapshot {
+            entries: self.meta.len(),
+            cached_sources,
+            resident_bytes,
+            hits: self.stats.hits.load(Relaxed),
+            fills: self.stats.fills.load(Relaxed),
+            negatives: self.stats.negatives.load(Relaxed),
+            evictions: self.stats.evictions.load(Relaxed),
+            refreshes: self.stats.refreshes.load(Relaxed),
+        }
+    }
+
+    /// Whether this cache is allowed to speak for `key` at all.
+    ///
+    /// Only indexed-extension files under the document root. Everything else —
+    /// uploads, session files, `.env`, templates, anything outside the docroot —
+    /// falls through untouched, so the cache can never change the answer for a
+    /// path that is not application code.
+    fn in_scope(&self, key: &str) -> bool {
+        if !is_indexed_extension(key) {
+            return false;
+        }
+        key.strip_prefix(self.docroot_key.as_str())
+            .is_some_and(|rest| rest.starts_with(['/', '\\']))
+    }
+
+    /// Intern `canon` and return a process-lifetime pointer to it.
+    fn intern(&self, key: &str, canon: &str) -> PathPtr {
+        if let Some(p) = self.paths.get(key) {
+            return *p;
+        }
+        let owned = CString::new(canon.replace('\0', "")).unwrap_or_default();
+        // Leaking is the design: this pointer is handed across FFI and must
+        // outlive eviction, refresh, and the entry itself. Bounded by the number
+        // of distinct paths ever resolved, which is bounded by the tree.
+        let leaked: &'static std::ffi::CStr = Box::leak(owned.into_boxed_c_str());
+        let ptr = PathPtr(leaked);
+        self.paths.insert(key.to_string(), ptr);
+        ptr
+    }
+
+    /// Record a directory key (called by the boot scan and by [`Self::fill`]).
+    fn note_dir(&self, key: &str) {
+        if !self.dirs.contains(key) {
+            self.dirs.insert(key.to_string());
+        }
+    }
+
+    /// Populate metadata for `key` from disk. Returns `None` when the path does
+    /// not exist — a **live** answer, never cached.
+    ///
+    /// This is the one syscall PHP was about to make; it is not an extra one.
+    fn fill(&self, key: &str) -> Option<MetaEntry> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let md = std::fs::metadata(key).ok()?;
+        if !md.is_file() {
+            if md.is_dir() {
+                self.note_dir(key);
+            }
+            return None;
+        }
+        let canon = canonical_path_string(Path::new(key));
+        let entry = MetaEntry {
+            canon: self.intern(key, &canon),
+            raw_len: usize::try_from(md.len()).unwrap_or(usize::MAX),
+            mtime: md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0)),
+            inode: self.next_inode.fetch_add(1, Relaxed),
+            readonly: md.permissions().readonly(),
+        };
+        if let Some(parent) = Path::new(key).parent() {
+            self.note_dir(&normalize_key(&parent.to_string_lossy()));
+        }
+        self.meta.insert(key.to_string(), entry);
+        self.stats.fills.fetch_add(1, Relaxed);
+        Some(entry)
+    }
+
+    /// Metadata for `key`, from cache or by filling it. `None` means "does not
+    /// exist, confirmed just now".
+    fn meta_for(&self, key: &str) -> Option<MetaEntry> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Some(e) = self.meta.get(key) {
+            self.stats.hits.fetch_add(1, Relaxed);
+            return Some(*e);
+        }
+        let filled = self.fill(key);
+        if filled.is_none() {
+            self.stats.negatives.fetch_add(1, Relaxed);
+        }
+        filled
+    }
+
+    /// Source bytes for `key`, reading and caching them on a miss.
+    ///
+    /// Returns the **stored** representation; the caller decompresses if
+    /// [`Self::algo`] is not [`BundleCompression::None`].
+    fn source_for(&self, key: &str) -> Option<std::sync::Arc<[u8]>> {
+        if let Ok(mut g) = self.sources.lock()
+            && let Some(bytes) = g.map.get(key).cloned()
+        {
+            g.touch(key);
+            return Some(bytes);
+        }
+        // The read PHP was about to do. Doing it here rather than letting the
+        // original handler do it is what makes this a read-through cache and not
+        // a second, redundant filesystem hit.
+        let raw = std::fs::read(key).ok()?;
+        let stored: std::sync::Arc<[u8]> = match self.algo {
+            BundleCompression::None => std::sync::Arc::from(raw.into_boxed_slice()),
+            other => std::sync::Arc::from(compress(&raw, other).into_boxed_slice()),
+        };
+        if let Ok(mut g) = self.sources.lock() {
+            let evicted = g.insert(key.to_string(), std::sync::Arc::clone(&stored));
+            if evicted > 0 {
+                self.stats.evictions.fetch_add(evicted, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Some(stored)
+    }
+
+    /// Bulk-fill the cache by walking the document root, **publishing each entry
+    /// as it is discovered**.
+    ///
+    /// This is an optimization, not a correctness dependency. The eager index
+    /// had to withhold everything until the walk finished, because a
+    /// half-complete index that answered authoritative negatives would report
+    /// "does not exist" for files it merely had not reached yet. A read-through
+    /// cache has no such state: *not scanned yet* and *not cached yet* are the
+    /// same thing, and both mean "fall through to disk". So the walk can publish
+    /// incrementally, and it costs nothing extra to do so — it uses exactly the
+    /// [`Self::fill`] path a lazy miss uses.
+    ///
+    /// Runs on **one** thread by design. Fanning it out would win a second of
+    /// wall time and spend it competing with the first real requests for CPU and
+    /// disk, which is the opposite of the trade this feature is making.
+    ///
+    /// A failure part-way through is a warning and a stop, never an error: every
+    /// entry already filled stays valid, and everything else is served lazily.
+    /// Returns `(files, bytes)` actually cached.
+    pub fn boot_scan(&self, load_source: bool) -> (usize, usize) {
+        let root = std::path::PathBuf::from(&self.docroot_key);
+        let mut stack = vec![root];
+        let mut visited: HashSet<String> = HashSet::new();
+        let (mut files, mut bytes) = (0usize, 0usize);
+        while let Some(dir) = stack.pop() {
+            let rd = match std::fs::read_dir(&dir) {
+                Ok(rd) => rd,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        error = %e,
+                        "[php] code_bundle boot scan could not read a directory; skipping it. \
+                         Anything under it is still served lazily on first use."
+                    );
+                    continue;
+                }
+            };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                let Ok(md) = std::fs::metadata(&path) else { continue };
+                if md.is_dir() {
+                    let real = canonical_root(&path);
+                    let real_key = normalize_key(&real.to_string_lossy());
+                    if visited.insert(real_key.clone()) {
+                        self.note_dir(&real_key);
+                        self.note_dir(&normalize_key(&path.to_string_lossy()));
+                        stack.push(real);
+                    }
+                    continue;
+                }
+                if !md.is_file() {
+                    continue;
+                }
+                let key = normalize_key(&canonical_path_string(&path));
+                if !self.in_scope(&key) {
+                    continue;
+                }
+                if self.fill(&key).is_none() {
+                    continue;
+                }
+                files += 1;
+                if load_source && let Some(s) = self.source_for(&key) {
+                    bytes += s.len();
+                }
+            }
+        }
+        (files, bytes)
+    }
+
+    /// Drop everything the cache learned, so the next lookup re-reads from disk.
+    ///
+    /// This is the **whole-world refresh** — the deliberate, non-default escape
+    /// hatch for a deploy that replaced files under a running server. It is
+    /// wired to the existing `ephpm deploy` / `ephpm cache reset` path rather
+    /// than a second mechanism, because a bundle and an OPcache that disagree
+    /// about what "current" means is worse than either being stale.
+    ///
+    /// Interned paths are deliberately **not** freed: pointers already handed to
+    /// PHP must stay valid, and re-resolving the same path reuses the same
+    /// interned pointer rather than leaking a second copy.
+    pub fn refresh(&self) {
+        self.meta.clear();
+        self.dirs.clear();
+        if let Ok(mut g) = self.sources.lock() {
+            g.map.clear();
+            g.order.clear();
+            g.bytes = 0;
+        }
+        self.stats.refreshes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl SourceCache {
+    /// Mark `key` most-recently-used.
+    fn touch(&mut self, key: &str) {
+        if let Some(pos) = self.order.iter().position(|k| k == key) {
+            let k = self.order.remove(pos).unwrap_or_default();
+            self.order.push_back(k);
+        }
+    }
+
+    /// Insert and evict down to `max_bytes`. Returns how many entries were
+    /// evicted.
+    fn insert(&mut self, key: String, bytes: std::sync::Arc<[u8]>) -> u64 {
+        if let Some(prev) = self.map.insert(key.clone(), std::sync::Arc::clone(&bytes)) {
+            self.bytes = self.bytes.saturating_sub(prev.len());
+            self.touch(&key);
+        } else {
+            self.order.push_back(key);
+        }
+        self.bytes += bytes.len();
+        let mut evicted = 0;
+        // Never evict the entry just inserted, even if it alone exceeds the cap:
+        // refusing to serve is exactly the all-or-nothing cliff this replaces.
+        while self.bytes > self.max_bytes && self.order.len() > 1 {
+            let Some(victim) = self.order.pop_front() else { break };
+            if let Some(v) = self.map.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(v.len());
+                evicted += 1;
+            }
+        }
+        evicted
+    }
+}
+
+// ===================================================================
 // Global bundle + FFI vtable (queried by code_bundle_hooks.c)
 // ===================================================================
 
-/// The process-wide bundle. Set once at startup, immutable thereafter, read
-/// concurrently by every PHP thread with no lock.
-static BUNDLE: OnceLock<Bundle> = OnceLock::new();
+/// Which kind of index this process published.
+///
+/// The two are genuinely different data structures with different correctness
+/// arguments, so they are separate types rather than one type with a mode flag —
+/// nothing about lazy population can weaken the completeness that `sealed`
+/// depends on, because `sealed` cannot be built on [`LazyIndex`] at all.
+pub enum Index {
+    /// Complete, immutable index (`code_bundle = "scan"` / `"sealed"`).
+    Eager(Bundle),
+    /// Read-through cache (`code_bundle = "lazy"`).
+    Lazy(LazyIndex),
+}
+
+/// The process-wide index. Set once at startup; the *contents* of a
+/// [`Index::Lazy`] mutate under their own concurrency control.
+static BUNDLE: OnceLock<Index> = OnceLock::new();
 
 /// Metadata answer for the C `url_stat` hook. `#[repr(C)]` — mirrored by
 /// `ephpm_bundle_stat_t` in `code_bundle_hooks.c`.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct BundleStat {
     /// Non-zero if the path is a bundled directory.
     pub is_dir: c_int,
+    /// Non-zero if the file was read-only on disk. The C hook turns this into
+    /// the mode bits, so that `fileperms()` and `is_writable()` report the same
+    /// thing instead of contradicting each other (the index used to hardcode
+    /// `0100444` while `is_writable()` — which never reaches this hook — said
+    /// the file was writable).
+    pub readonly: c_int,
     /// File size in bytes (uncompressed). Zero for directories.
     pub size: i64,
     /// Modification time, Unix seconds.
@@ -965,6 +1578,36 @@ unsafe extern "C" {
     /// originals for miss-delegation. Idempotent; call once after
     /// `php_embed_init()`.
     fn ephpm_bundle_install_hooks(cb: *const BundleCallbacks);
+
+    /// Bitmask of the internal-function handler overrides that actually took:
+    /// 1 = `file_exists`, 2 = `realpath`. A function removed by
+    /// `disable_functions` is skipped rather than faked, so this is the honest
+    /// answer to "is the Composer probe path fronted?".
+    fn ephpm_bundle_fn_overrides_installed() -> c_int;
+}
+
+/// Which VCWD-layer PHP functions this process managed to front, as a
+/// human-readable list.
+///
+/// Empty means the [only mechanism that can reach them](install_code_bundle_hooks)
+/// did not take, and a `file_exists`-probing autoloader (which is what real
+/// Composer uses) gets **no** acceleration at all — worth an explicit startup
+/// line rather than a silent nothing.
+#[must_use]
+pub fn function_overrides() -> Vec<&'static str> {
+    #[cfg(php_linked)]
+    {
+        // SAFETY: a plain read of a C `int` computed from static pointers that
+        // were written once on the startup path. No arguments, no allocation.
+        let mask = unsafe { ephpm_bundle_fn_overrides_installed() };
+        [(1, "file_exists"), (2, "realpath")]
+            .into_iter()
+            .filter(|(bit, _)| mask & bit != 0)
+            .map(|(_, name)| name)
+            .collect()
+    }
+    #[cfg(not(php_linked))]
+    Vec::new()
 }
 
 /// Borrow a byte slice from a C `(ptr, len)` pair as a normalized key.
@@ -984,80 +1627,153 @@ extern "C" fn cb_enabled() -> c_int {
 }
 
 extern "C" fn cb_resolve(path: *const c_char, len: usize, out_canon: *mut *const c_char) -> c_int {
-    let Some(bundle) = BUNDLE.get() else { return BUNDLE_UNKNOWN };
+    let Some(index) = BUNDLE.get() else { return BUNDLE_UNKNOWN };
     let Some(key) = key_from_c(path, len) else { return BUNDLE_UNKNOWN };
     if out_canon.is_null() {
         return BUNDLE_UNKNOWN;
     }
-    // Include/require resolution: a wrong negative is fatal, so it is confirmed.
-    match bundle.lookup(&key, Probe::Source) {
-        Lookup::File(entry) => {
-            // SAFETY: `out_canon` is a valid writable pointer supplied by the C
-            // hook; `entry.canon` lives as long as the process-lifetime bundle.
-            unsafe { *out_canon = entry.canon.as_ptr() };
-            BUNDLE_HIT
+    let canon = match index {
+        // Include/require resolution: a wrong negative is fatal, so it is
+        // confirmed against disk before `Absent` can be returned.
+        Index::Eager(bundle) => match bundle.lookup(&key, Probe::Source) {
+            Lookup::File(entry) => entry.canon.as_ptr(),
+            Lookup::Absent => return BUNDLE_ABSENT,
+            Lookup::Dir | Lookup::Unknown => return BUNDLE_UNKNOWN,
+        },
+        Index::Lazy(lazy) => {
+            if !lazy.in_scope(&key) {
+                return BUNDLE_UNKNOWN;
+            }
+            match lazy.meta_for(&key) {
+                Some(entry) => entry.canon.0.as_ptr(),
+                // A negative confirmed by the syscall PHP was about to make. It
+                // is not cached, so it says nothing about any later lookup.
+                None => return BUNDLE_ABSENT,
+            }
         }
-        Lookup::Absent => BUNDLE_ABSENT,
-        Lookup::Dir | Lookup::Unknown => BUNDLE_UNKNOWN,
-    }
+    };
+    // SAFETY: `out_canon` is a valid writable pointer supplied by the C hook.
+    // Both arms yield a process-lifetime pointer — the eager bundle is immutable,
+    // and the lazy cache interns paths in a map it never clears — so it stays
+    // valid for the `zend_string_init` copy the caller makes from it.
+    unsafe { *out_canon = canon };
+    BUNDLE_HIT
 }
 
 extern "C" fn cb_stat(path: *const c_char, len: usize, out: *mut BundleStat) -> c_int {
-    let Some(bundle) = BUNDLE.get() else { return BUNDLE_UNKNOWN };
+    let Some(index) = BUNDLE.get() else { return BUNDLE_UNKNOWN };
     let Some(key) = key_from_c(path, len) else { return BUNDLE_UNKNOWN };
     if out.is_null() {
         return BUNDLE_UNKNOWN;
     }
-    // The hot path: hundreds of these per request. Negatives are answered from
-    // RAM with no syscall unless `verify_negatives` is on.
-    match bundle.lookup(&key, Probe::Metadata) {
-        Lookup::File(entry) => {
-            // SAFETY: `out` is a valid, writable BundleStat provided by the C hook.
-            unsafe {
-                (*out).is_dir = 0;
-                (*out).size = i64::try_from(entry.raw_len).unwrap_or(i64::MAX);
-                (*out).mtime = entry.mtime;
-                (*out).inode = entry.inode;
+    // The hot path: hundreds of these per request.
+    let filled = match index {
+        // Eager: negatives come from the index with no syscall (sealed only).
+        Index::Eager(bundle) => match bundle.lookup(&key, Probe::Metadata) {
+            Lookup::File(entry) => {
+                BundleStat {
+                    is_dir: 0,
+                    size: i64::try_from(entry.raw_len).unwrap_or(i64::MAX),
+                    mtime: entry.mtime,
+                    inode: entry.inode,
+                    // The eager scan does not record the on-disk permission bit;
+                    // reporting "read-only" here is what made `fileperms()` say
+                    // 0100444 while `is_writable()` said true. Report writable
+                    // and let the two agree; the bundle is not a permission
+                    // authority.
+                    readonly: 0,
+                }
             }
-            BUNDLE_HIT
-        }
-        Lookup::Dir => {
-            // SAFETY: as above.
-            unsafe {
-                (*out).is_dir = 1;
-                (*out).size = 0;
-                (*out).mtime = 0;
-                (*out).inode = 0;
+            // A directory is answered by the real filesystem. The index knows a
+            // directory EXISTS (which is what keeps a sealed root from claiming
+            // it is absent) but records nothing else about it, and answering
+            // from that made `filemtime()` on a directory return 0. Directories
+            // are a rounding error in the probe mix, so paying the stat is the
+            // right trade for not inventing metadata.
+            Lookup::Dir | Lookup::Unknown => return BUNDLE_UNKNOWN,
+            Lookup::Absent => return BUNDLE_ABSENT,
+        },
+        Index::Lazy(lazy) => {
+            if lazy.dirs.contains(&key) || !lazy.in_scope(&key) {
+                return BUNDLE_UNKNOWN;
             }
-            BUNDLE_HIT
+            match lazy.meta_for(&key) {
+                Some(e) => BundleStat {
+                    is_dir: 0,
+                    size: i64::try_from(e.raw_len).unwrap_or(i64::MAX),
+                    mtime: e.mtime,
+                    inode: e.inode,
+                    readonly: c_int::from(e.readonly),
+                },
+                // Live-confirmed, not cached. See `LazyIndex`'s type docs.
+                None => return BUNDLE_ABSENT,
+            }
         }
-        Lookup::Absent => BUNDLE_ABSENT,
-        Lookup::Unknown => BUNDLE_UNKNOWN,
-    }
+    };
+    // SAFETY: `out` is a valid, writable BundleStat provided by the C hook.
+    unsafe { *out = filled };
+    BUNDLE_HIT
+}
+
+/// Hand a freshly allocated copy of `bytes` to C, transferring ownership (the
+/// caller releases it through `free_source`).
+fn leak_source(bytes: Vec<u8>) -> (*const u8, usize) {
+    let boxed = bytes.into_boxed_slice();
+    let n = boxed.len();
+    (Box::into_raw(boxed).cast::<u8>().cast_const(), n)
 }
 
 extern "C" fn cb_get_source(path: *const c_char, len: usize, out: *mut BundleSource) -> c_int {
-    let Some(bundle) = BUNDLE.get() else { return BUNDLE_UNKNOWN };
+    let Some(index) = BUNDLE.get() else { return BUNDLE_UNKNOWN };
     let Some(key) = key_from_c(path, len) else { return BUNDLE_UNKNOWN };
     if out.is_null() {
         return BUNDLE_UNKNOWN;
     }
-    // A source read: confirmed against disk before any negative is returned.
-    let entry = match bundle.lookup(&key, Probe::Source) {
-        Lookup::File(entry) => entry,
-        Lookup::Absent => return BUNDLE_ABSENT,
-        // A directory has no source; let PHP produce its own error for it.
-        Lookup::Dir | Lookup::Unknown => return BUNDLE_UNKNOWN,
-    };
-    let (data, data_len, needs_free) = match &entry.data {
-        StoredData::Raw(v) => (v.as_ptr(), v.len(), 0),
-        StoredData::Compressed(v) => {
-            let Some(plain) = decompress(v, bundle.algo, entry.raw_len) else {
-                return BUNDLE_UNKNOWN;
+    let (data, data_len, needs_free, mtime, inode) = match index {
+        Index::Eager(bundle) => {
+            // A source read: confirmed against disk before any negative.
+            let entry = match bundle.lookup(&key, Probe::Source) {
+                Lookup::File(entry) => entry,
+                Lookup::Absent => return BUNDLE_ABSENT,
+                // A directory has no source; let PHP produce its own error.
+                Lookup::Dir | Lookup::Unknown => return BUNDLE_UNKNOWN,
             };
-            let boxed = plain.into_boxed_slice();
-            let out_bytes = boxed.len();
-            (Box::into_raw(boxed).cast::<u8>().cast_const(), out_bytes, 1)
+            let (d, n, f) = match &entry.data {
+                // Zero-copy borrow into the immutable bundle. Sound *only*
+                // because the eager index never mutates: the pointer is held for
+                // the whole life of the php_stream, i.e. across a full compile.
+                StoredData::Raw(v) => (v.as_ptr(), v.len(), 0),
+                StoredData::Compressed(v) => {
+                    let Some(plain) = decompress(v, bundle.algo, entry.raw_len) else {
+                        return BUNDLE_UNKNOWN;
+                    };
+                    let (p, n) = leak_source(plain);
+                    (p, n, 1)
+                }
+            };
+            (d, n, f, entry.mtime, entry.inode)
+        }
+        Index::Lazy(lazy) => {
+            if !lazy.in_scope(&key) {
+                return BUNDLE_UNKNOWN;
+            }
+            let Some(meta) = lazy.meta_for(&key) else { return BUNDLE_ABSENT };
+            let Some(stored) = lazy.source_for(&key) else { return BUNDLE_UNKNOWN };
+            let plain = match lazy.algo {
+                BundleCompression::None => stored.to_vec(),
+                other => {
+                    let Some(p) = decompress(&stored, other, meta.raw_len) else {
+                        return BUNDLE_UNKNOWN;
+                    };
+                    p
+                }
+            };
+            // ALWAYS a copy in lazy mode. The cache can evict this buffer while
+            // the php_stream built from it is still being read, so C must own
+            // its own bytes. One memcpy per COLD COMPILE — OPcache serves every
+            // subsequent request without reaching this hook at all.
+            let (p, n) = leak_source(plain);
+            (p, n, 1, meta.mtime, meta.inode)
         }
     };
     // SAFETY: `out` is a valid, writable BundleSource provided by the C hook.
@@ -1067,19 +1783,43 @@ extern "C" fn cb_get_source(path: *const c_char, len: usize, out: *mut BundleSou
         (*out).data = data;
         (*out).len = data_len;
         (*out).needs_free = needs_free;
-        (*out).mtime = entry.mtime;
-        (*out).inode = entry.inode;
+        (*out).mtime = mtime;
+        (*out).inode = inode;
     }
     BUNDLE_HIT
 }
 
 extern "C" fn cb_note_write(path: *const c_char, len: usize) {
-    let Some(bundle) = BUNDLE.get() else { return };
-    if bundle.semantics != BundleSemantics::Sealed {
-        return;
+    let Some(index) = BUNDLE.get() else { return };
+    match index {
+        Index::Eager(bundle) => {
+            if bundle.semantics != BundleSemantics::Sealed {
+                return;
+            }
+            let Some(key) = key_from_c(path, len) else { return };
+            bundle.note_write(&key);
+        }
+        Index::Lazy(lazy) => {
+            // An in-process write to a cached .php file makes the cached copy
+            // stale immediately, and unlike the eager index we CAN fix it: drop
+            // the entry so the next lookup re-reads. This closes the in-process
+            // half of the staleness hole; an out-of-process overwrite is still
+            // invisible until `ephpm deploy` / `ephpm cache reset`.
+            let Some(key) = key_from_c(path, len) else { return };
+            if !lazy.in_scope(&key) {
+                return;
+            }
+            lazy.meta.remove(&key);
+            if let Ok(mut g) = lazy.sources.lock()
+                && let Some(v) = g.map.remove(&key)
+            {
+                g.bytes = g.bytes.saturating_sub(v.len());
+                if let Some(pos) = g.order.iter().position(|k| *k == key) {
+                    g.order.remove(pos);
+                }
+            }
+        }
     }
-    let Some(key) = key_from_c(path, len) else { return };
-    bundle.note_write(&key);
 }
 
 extern "C" fn cb_free_source(ptr: *const c_uchar, len: usize) {
@@ -1144,11 +1884,59 @@ pub fn install_code_bundle_hooks() {
 ///
 /// Returns the rejected bundle (boxed) if one was already published.
 pub fn publish(bundle: Bundle) -> Result<(), Box<Bundle>> {
-    BUNDLE.set(bundle).map_err(Box::new)
+    BUNDLE.set(Index::Eager(bundle)).map_err(|rejected| match rejected {
+        Index::Eager(b) => Box::new(b),
+        Index::Lazy(_) => unreachable!("only the Eager variant is constructed here"),
+    })
 }
 
-/// Whether a bundle has been published (test/introspection helper). `false`
-/// while a background scan is still running — the fall-through state.
+/// Publish an empty [`LazyIndex`] and start serving from it **immediately**.
+///
+/// Unlike [`publish`], this happens on the startup path with nothing in the
+/// cache: an empty read-through cache is not a degraded state, it is the normal
+/// cold state, and every lookup against it does exactly what
+/// `code_bundle = "off"` would have done while filling itself in.
+///
+/// Returns a handle to the published index so the optional boot scan (and the
+/// deploy-driven refresh) can reach it.
+///
+/// # Errors
+///
+/// Returns `None` if an index was already published.
+pub fn publish_lazy(index: LazyIndex) -> Option<&'static LazyIndex> {
+    BUNDLE.set(Index::Lazy(index)).ok()?;
+    lazy_index()
+}
+
+/// The published lazy cache, if this process runs one.
+#[must_use]
+pub fn lazy_index() -> Option<&'static LazyIndex> {
+    match BUNDLE.get()? {
+        Index::Lazy(l) => Some(l),
+        Index::Eager(_) => None,
+    }
+}
+
+/// Drop everything the lazy cache learned. No-op in every other mode.
+///
+/// Wired to `ephpm deploy` / `ephpm cache reset` — the same trigger that
+/// invalidates OPcache, and deliberately **before** it: reversed, an in-flight
+/// request can repopulate OPcache from bytes this cache is about to discard, and
+/// with `validate_timestamps = 0` nothing would ever correct it.
+#[must_use]
+pub fn refresh_lazy() -> bool {
+    match lazy_index() {
+        Some(l) => {
+            l.refresh();
+            true
+        }
+        None => false,
+    }
+}
+
+/// Whether an index has been published (test/introspection helper). `false`
+/// while a background scan is still running in eager mode — the fall-through
+/// state.
 #[must_use]
 pub fn is_installed() -> bool {
     BUNDLE.get().is_some()
@@ -1174,6 +1962,467 @@ mod tests {
                 normalize_key(r"C:\app\vendor\Foo.php")
             );
         }
+    }
+
+    // ── lazy read-through cache ──────────────────────────────────────────
+
+    fn lazy_for(dir: &tempfile::TempDir, max: usize) -> LazyIndex {
+        LazyIndex::new(dir.path(), BundleCompression::None, max)
+    }
+
+    /// What `cb_get_source` does: metadata first (for mtime/inode), then bytes.
+    fn lazy_open(lazy: &LazyIndex, key: &str) -> Option<std::sync::Arc<[u8]>> {
+        lazy.meta_for(key)?;
+        lazy.source_for(key)
+    }
+
+    /// The defining property: a miss reads through to disk, and the result is
+    /// there for next time. Also pins that a fill is not speculative — nothing
+    /// is cached until something asks for it.
+    #[test]
+    fn lazy_miss_reads_through_and_caches() {
+        let dir = fixture_dir();
+        let lazy = lazy_for(&dir, usize::MAX);
+        let key = key_under(&dir, "src/Foo.php");
+
+        assert_eq!(lazy.snapshot().entries, 0, "nothing is cached before it is asked for");
+
+        let first = lazy.meta_for(&key).expect("the file exists on disk");
+        assert_eq!(lazy.snapshot().fills, 1);
+        assert_eq!(lazy.snapshot().hits, 0);
+
+        let second = lazy.meta_for(&key).expect("still there");
+        assert_eq!(lazy.snapshot().fills, 1, "the second lookup must not re-read");
+        assert_eq!(lazy.snapshot().hits, 1);
+        assert_eq!(first.inode, second.inode, "a re-lookup must be the same entry");
+
+        let src = lazy.source_for(&key).expect("source reads through too");
+        assert_eq!(&*src, b"<?php class Foo {}");
+    }
+
+    /// **The central limitation of lazy population, pinned as a test.**
+    ///
+    /// A cache that fills on demand and can evict cannot treat absence as proof,
+    /// so a negative must never be remembered. A file that does not exist is
+    /// re-checked on every single lookup — which is exactly why `lazy` cannot
+    /// eliminate a PSR-4 autoloader's *miss* probes the way `sealed` can.
+    #[test]
+    fn lazy_never_caches_a_negative() {
+        let dir = fixture_dir();
+        let lazy = lazy_for(&dir, usize::MAX);
+        let key = key_under(&dir, "src/Later.php");
+
+        assert!(lazy.meta_for(&key).is_none());
+        assert!(lazy.meta_for(&key).is_none());
+        assert_eq!(lazy.snapshot().negatives, 2, "every negative costs a fresh syscall");
+        assert_eq!(lazy.snapshot().entries, 0, "a negative must leave nothing behind");
+
+        // Because nothing was remembered, a file created afterwards is visible
+        // immediately — the property `sealed` gives up and `lazy` keeps.
+        std::fs::write(dir.path().join("src/Later.php"), b"<?php class Later {}").unwrap();
+        assert!(lazy.meta_for(&key).is_some(), "a file created after the miss must be found");
+    }
+
+    /// `max_bytes` is an eviction bound, not a refusal. The old eager index
+    /// declined to build *at all* past the cap; this one keeps serving.
+    #[test]
+    fn lazy_evicts_instead_of_refusing() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..8 {
+            std::fs::write(dir.path().join(format!("f{i}.php")), vec![b'x'; 1000]).unwrap();
+        }
+        // Room for ~2 files.
+        let lazy = LazyIndex::new(dir.path(), BundleCompression::None, 2500);
+        for i in 0..8 {
+            let key = key_under(&dir, &format!("f{i}.php"));
+            assert!(lazy_open(&lazy, &key).is_some(), "the cache must always serve");
+        }
+        let snap = lazy.snapshot();
+        assert!(snap.resident_bytes <= 2500, "resident {} exceeds the cap", snap.resident_bytes);
+        assert!(snap.evictions > 0, "the cap must evict, not refuse");
+        assert_eq!(snap.entries, 8, "metadata is not evicted — only the bytes are");
+    }
+
+    /// The cache is a **code** cache: it must not answer for anything else, or a
+    /// stale upload/session/`.env` would be served from RAM.
+    #[test]
+    fn lazy_scope_is_php_under_the_docroot_only() {
+        let dir = fixture_dir();
+        let lazy = lazy_for(&dir, usize::MAX);
+        assert!(lazy.in_scope(&key_under(&dir, "src/Foo.php")));
+        assert!(!lazy.in_scope(&key_under(&dir, "readme.txt")), "non-.php must fall through");
+        assert!(!lazy.in_scope(&normalize_key("/elsewhere/Foo.php")), "outside the docroot");
+        assert!(!lazy.in_scope(&lazy.docroot_key), "the docroot itself is not a file");
+    }
+
+    /// `canon` must be canonical in lazy mode for exactly the reasons it must be
+    /// in eager mode — it is the same `__FILE__` / `opened_path`.
+    #[test]
+    fn lazy_canon_is_canonical() {
+        let dir = fixture_dir();
+        let spelled = format!("{}/./src/../src/Foo.php", dir.path().to_string_lossy());
+        let lazy = LazyIndex::new(
+            &std::path::PathBuf::from(format!("{}/.", dir.path().to_string_lossy())),
+            BundleCompression::None,
+            usize::MAX,
+        );
+        let entry = lazy.meta_for(&normalize_key(&spelled)).expect("resolves");
+        assert_eq!(
+            entry.canon.0.to_str().unwrap(),
+            canonical_path_string(&dir.path().join("src/Foo.php"))
+        );
+    }
+
+    /// **Staleness, stated honestly.** Lazy population does not fix the stale-hit
+    /// bug — it relocates the freeze from "boot" to "first touch", which is
+    /// arguably worse because different files freeze at different times. An
+    /// out-of-process overwrite stays invisible until an explicit refresh, and
+    /// that refresh is the whole-world one wired to `ephpm deploy` /
+    /// `ephpm cache reset`.
+    #[test]
+    fn lazy_serves_stale_bytes_until_refresh() {
+        let dir = fixture_dir();
+        let lazy = lazy_for(&dir, usize::MAX);
+        let key = key_under(&dir, "src/Foo.php");
+        assert_eq!(&*lazy.source_for(&key).unwrap(), b"<?php class Foo {}");
+
+        std::fs::write(dir.path().join("src/Foo.php"), b"<?php class Foo { const V = 2; }")
+            .unwrap();
+        assert_eq!(
+            &*lazy.source_for(&key).unwrap(),
+            b"<?php class Foo {}",
+            "an out-of-process overwrite is invisible to the cache — this is the \
+             documented limitation, not an accident"
+        );
+
+        lazy.refresh();
+        assert_eq!(
+            &*lazy.source_for(&key).unwrap(),
+            b"<?php class Foo { const V = 2; }",
+            "the whole-world refresh is the escape hatch and must actually work"
+        );
+        assert_eq!(lazy.snapshot().refreshes, 1);
+    }
+
+    /// The in-process half of staleness the eager index could never fix: a PHP
+    /// script that writes a `.php` file invalidates just that entry.
+    #[test]
+    fn lazy_write_invalidates_only_that_entry() {
+        let dir = fixture_dir();
+        let lazy = lazy_for(&dir, usize::MAX);
+        let foo = key_under(&dir, "src/Foo.php");
+        let bar = key_under(&dir, "vendor/acme/lib/Bar.php");
+        lazy_open(&lazy, &foo).unwrap();
+        lazy_open(&lazy, &bar).unwrap();
+        assert_eq!(lazy.snapshot().cached_sources, 2);
+
+        std::fs::write(dir.path().join("src/Foo.php"), b"<?php class Foo { const V = 3; }")
+            .unwrap();
+        // What cb_note_write does on a write open.
+        lazy.meta.remove(&foo);
+        if let Ok(mut g) = lazy.sources.lock() {
+            g.map.remove(&foo);
+        }
+        assert_eq!(&*lazy.source_for(&foo).unwrap(), b"<?php class Foo { const V = 3; }");
+        assert!(lazy.meta.contains_key(&bar), "an unrelated entry must survive");
+    }
+
+    /// **The FFI lifetime contract.** `canon` is handed to C as a raw pointer.
+    /// Refresh clears the cache but must not invalidate a path already handed
+    /// out — and re-resolving the same path must reuse the same interned pointer
+    /// rather than leaking a fresh copy on every refresh.
+    #[test]
+    fn lazy_interned_paths_survive_refresh_and_are_not_re_leaked() {
+        let dir = fixture_dir();
+        let lazy = lazy_for(&dir, usize::MAX);
+        let key = key_under(&dir, "src/Foo.php");
+        let before = lazy.meta_for(&key).unwrap().canon.0.as_ptr();
+
+        lazy.refresh();
+        // The pointer C may still be holding must still be readable and correct.
+        // SAFETY: interned paths are leaked on purpose and `paths` is never
+        // cleared, so this pointer is valid for the life of the process.
+        let still = unsafe { std::ffi::CStr::from_ptr(before) };
+        assert_eq!(still.to_str().unwrap(), canonical_path_string(&dir.path().join("src/Foo.php")));
+
+        let after = lazy.meta_for(&key).unwrap().canon.0.as_ptr();
+        assert_eq!(before, after, "re-resolving must reuse the interned path, not leak another");
+    }
+
+    /// Progressive fill: the boot scan uses the same `fill` path a lazy miss
+    /// uses, so entries become visible as it walks rather than all at once. The
+    /// observable version of that is simply "the scan populates the cache".
+    #[test]
+    fn lazy_boot_scan_prefills() {
+        let dir = fixture_dir();
+        let lazy = lazy_for(&dir, usize::MAX);
+        let (scanned, cached_bytes) = lazy.boot_scan(true);
+        assert_eq!(scanned, 3, "3 .php files in the fixture");
+        assert!(cached_bytes > 0);
+        let snap = lazy.snapshot();
+        assert_eq!(snap.entries, 3);
+        assert_eq!(snap.cached_sources, 3);
+
+        // Everything the scan filled is now a hit, with no further disk reads.
+        let fills = snap.fills;
+        lazy.meta_for(&key_under(&dir, "src/Foo.php")).unwrap();
+        assert_eq!(lazy.snapshot().fills, fills, "a prefilled entry must not re-read");
+    }
+
+    /// A boot scan that cannot read a directory warns and keeps going; it is an
+    /// optimization, not a correctness dependency.
+    #[test]
+    fn lazy_boot_scan_failure_is_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.php"), b"<?php").unwrap();
+        let lazy =
+            LazyIndex::new(&dir.path().join("does-not-exist"), BundleCompression::None, 1024);
+        let (files, _) = lazy.boot_scan(true);
+        assert_eq!(files, 0, "an unreadable root yields nothing, and does not panic");
+        assert_eq!(lazy.snapshot().entries, 0);
+        // A path outside the (bogus) docroot is simply out of scope, so the
+        // hooks delegate — the process keeps serving with no bundle at all.
+        assert!(
+            !lazy.in_scope(&key_under(&dir, "ok.php")),
+            "out of scope, so the hook falls through"
+        );
+    }
+
+    /// A `.php` file that EXISTS but cannot be read is skipped by the scan, so
+    /// it is missing from the index for a reason that has nothing to do with
+    /// whether it is on disk. In sealed mode that would make the index assert
+    /// "does not exist" about a file that does — and since `file_exists` is now
+    /// fronted by an internal-function handler override, every autoloader would
+    /// see the lie, not just `is_file`. The root must refuse to arm.
+    #[cfg(unix)]
+    #[test]
+    fn sealed_root_with_an_unreadable_file_is_not_armed() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            // root reads mode-000 files, so the condition cannot be created.
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor/acme")).unwrap();
+        let secret = dir.path().join("vendor/acme/Secret.php");
+        std::fs::write(&secret, b"<?php class Secret {}").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let owned = vec!["vendor".to_string()];
+        let spec = BundleSpec::new(
+            dir.path().to_path_buf(),
+            BundleCompression::None,
+            usize::MAX,
+            BundleSemantics::Sealed,
+            &owned,
+            false,
+        )
+        .unwrap();
+        let bundle = Bundle::from_scan(&spec).unwrap();
+        assert!(
+            bundle.sealed_roots.is_empty(),
+            "a sealed root holding an unreadable .php must not arm"
+        );
+        let key = normalize_key(&secret.to_string_lossy());
+        assert!(
+            matches!(bundle.lookup(&key, Probe::Metadata), Lookup::Unknown),
+            "the unreadable file must fall through, never be reported Absent"
+        );
+        // Leave the fixture removable.
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// **The canon regression test.** `FileEntry::canon` becomes `__FILE__`,
+    /// `__DIR__`, the `get_included_files()` entry, the `require_once` de-dup
+    /// key and OPcache's `opened_path`. It must therefore depend only on where
+    /// the file *is*, never on how the operator spelled `document_root`.
+    ///
+    /// Before the fix it was `entry.path().to_string_lossy()` from a walk rooted
+    /// at the raw config string, so a forward-slash / `.` / `..` / trailing-sep /
+    /// symlinked / relative docroot each produced a *different* `canon` for the
+    /// same file on disk. Measured consequences of exactly that: `require_once`
+    /// running a file twice ("Cannot redeclare"), and a 100 % OPcache miss rate
+    /// that made the bundle ~11× slower than leaving it off. Both silent.
+    ///
+    /// Every spelling below names the same directory, so every bundle must yield
+    /// byte-identical canon strings — and they must equal what the OS says.
+    #[test]
+    fn canon_is_independent_of_docroot_spelling() {
+        let dir = fixture_dir();
+        let base = dir.path().to_string_lossy().into_owned();
+
+        let mut spellings: Vec<String> = vec![
+            base.clone(),
+            base.replace('\\', "/"),
+            format!("{base}{}", std::path::MAIN_SEPARATOR),
+            format!("{base}{}.", std::path::MAIN_SEPARATOR),
+            format!("{base}{sep}src{sep}..", sep = std::path::MAIN_SEPARATOR),
+            format!("{base}{sep}.{sep}vendor{sep}..", sep = std::path::MAIN_SEPARATOR),
+        ];
+        if cfg!(windows) {
+            // std::fs::canonicalize hands back the verbatim form; PHP never
+            // produces it, so it must not leak into __FILE__ either.
+            spellings.push(format!(r"\\?\{base}"));
+            spellings.push(base.to_uppercase());
+        }
+
+        // A symlinked docroot is the Composer path-repository / deploy-symlink
+        // layout ("current" -> "releases/N"), and is Unix-only in this test
+        // because creating one on Windows needs elevation.
+        #[cfg(unix)]
+        let _link_holder = {
+            let holder = tempfile::tempdir().unwrap();
+            let link = holder.path().join("current");
+            std::os::unix::fs::symlink(dir.path(), &link).unwrap();
+            spellings.push(link.to_string_lossy().into_owned());
+            holder
+        };
+
+        // Ground truth: what the OS says the file's path is, in PHP's spelling.
+        let expected_canon = canonical_path_string(&dir.path().join("src/Foo.php"));
+        assert!(
+            !expected_canon.starts_with(r"\\?\"),
+            "the verbatim prefix must be stripped or it becomes __FILE__: {expected_canon}"
+        );
+
+        let mut seen: Option<Vec<String>> = None;
+        for spelling in &spellings {
+            let spec = BundleSpec::new(
+                std::path::PathBuf::from(spelling),
+                BundleCompression::None,
+                usize::MAX,
+                BundleSemantics::Overlay,
+                &[],
+                false,
+            )
+            .unwrap();
+            let bundle = Bundle::from_scan(&spec).unwrap();
+
+            // The one file every spelling must agree on, looked up by canonical
+            // key so the assertion cannot be satisfied by an inconsistent index.
+            let entry = bundle
+                .files
+                .get(&normalize_key(&expected_canon))
+                .unwrap_or_else(|| panic!("src/Foo.php missing for docroot spelling {spelling:?}"));
+            assert_eq!(
+                entry.canon.to_str().unwrap(),
+                expected_canon,
+                "canon leaked the docroot spelling {spelling:?}"
+            );
+
+            let mut canons: Vec<String> =
+                bundle.files.values().map(|e| e.canon.to_str().unwrap().to_string()).collect();
+            canons.sort();
+            match &seen {
+                None => seen = Some(canons),
+                Some(first) => assert_eq!(
+                    first, &canons,
+                    "docroot spelling {spelling:?} produced different canon paths"
+                ),
+            }
+        }
+        assert!(seen.is_some_and(|c| c.len() == 3), "fixture has 3 .php files");
+    }
+
+    /// A relative `document_root` must key and canon exactly like its absolute
+    /// form. Separate from the sweep above because it mutates process-global CWD.
+    #[test]
+    #[serial_test::serial]
+    fn canon_is_absolute_for_a_relative_docroot() {
+        let dir = fixture_dir();
+        let expected = canonical_path_string(&dir.path().join("src/Foo.php"));
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let built = (|| {
+            let spec = BundleSpec::new(
+                std::path::PathBuf::from("."),
+                BundleCompression::None,
+                usize::MAX,
+                BundleSemantics::Overlay,
+                &[],
+                false,
+            )
+            .ok()?;
+            Bundle::from_scan(&spec).ok()
+        })();
+        std::env::set_current_dir(prev).unwrap();
+
+        let bundle = built.expect("relative docroot must scan");
+        let entry = bundle.files.get(&normalize_key(&expected)).expect("keyed by absolute path");
+        assert_eq!(entry.canon.to_str().unwrap(), expected);
+        assert!(
+            !entry.canon.to_str().unwrap().starts_with('.'),
+            "a relative docroot must not produce a relative __FILE__"
+        );
+    }
+
+    /// Symlinked directories are the Composer path-repository / monorepo
+    /// `vendor/` layout. `DirEntry::metadata()` does not traverse them, so the
+    /// scan used to skip the subtree entirely — a missed optimization in overlay
+    /// mode but a **silent wrong answer** in sealed mode.
+    #[cfg(unix)]
+    #[test]
+    fn scan_follows_symlinked_directories_and_canons_through_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("packages/acme");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("Real.php"), b"<?php class Real {}").unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("vendor/acme")).unwrap();
+
+        let spec = BundleSpec::new(
+            dir.path().to_path_buf(),
+            BundleCompression::None,
+            usize::MAX,
+            BundleSemantics::Overlay,
+            &[],
+            false,
+        )
+        .unwrap();
+        let bundle = Bundle::from_scan(&spec).unwrap();
+
+        // One entry, canon'd through to the real path — which is what PHP's
+        // realpath-based __FILE__ reports, so it is what every derived probe
+        // will be spelled with.
+        let want = canonical_path_string(&real.join("Real.php"));
+        assert!(bundle.files.contains_key(&normalize_key(&want)), "symlinked subtree was skipped");
+        assert_eq!(bundle.files.len(), 1, "the symlink must not double-index");
+    }
+
+    /// A sealed root whose subtree is reached through a symlink cannot claim
+    /// exhaustive enumeration, so it must refuse to arm rather than answer a
+    /// silent wrong "does not exist".
+    #[cfg(unix)]
+    #[test]
+    fn sealed_root_containing_a_symlink_is_not_armed() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("packages/acme");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("Real.php"), b"<?php class Real {}").unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("vendor/acme")).unwrap();
+
+        let owned = vec!["vendor".to_string()];
+        let spec = BundleSpec::new(
+            dir.path().to_path_buf(),
+            BundleCompression::None,
+            usize::MAX,
+            BundleSemantics::Sealed,
+            &owned,
+            false,
+        )
+        .unwrap();
+        assert_eq!(spec.sealed_roots().len(), 1, "the root is declared");
+        let bundle = Bundle::from_scan(&spec).unwrap();
+        assert!(
+            bundle.sealed_roots.is_empty(),
+            "a sealed root containing a symlinked directory must not arm"
+        );
+        let ghost = normalize_key(&format!("{}/vendor/acme/Ghost.php", dir.path().display()));
+        assert!(
+            matches!(bundle.lookup(&ghost, Probe::Metadata), Lookup::Unknown),
+            "an unarmed root must fall through, never answer Absent"
+        );
     }
 
     /// Fixture docroot laid out like a real app: `vendor/` (the tree worth

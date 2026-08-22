@@ -2126,12 +2126,41 @@ pub enum CodeBundleMode {
     /// as before. Zero overhead.
     Off,
 
+    /// **Read-through cache.** Nothing is indexed up front: a lookup that misses
+    /// performs exactly the filesystem operation PHP was about to perform,
+    /// answers from it, and keeps the result for next time.
+    ///
+    /// This is the mode to use. Compared with [`Scan`](Self::Scan) it removes
+    /// the boot-scan-before-useful dependency, removes the all-or-nothing
+    /// [`code_bundle_max_bytes`](PhpConfig::code_bundle_max_bytes) cliff (the cap
+    /// becomes an LRU eviction bound instead of a refusal), and bounds memory by
+    /// the working set rather than by the size of the tree.
+    ///
+    /// A boot scan still runs by default
+    /// ([`code_bundle_boot_scan`](PhpConfig::code_bundle_boot_scan)) to bulk-fill
+    /// the likely working set, but it is now purely an optimization: it
+    /// publishes entries **as it discovers them**, and turning it off changes
+    /// only how quickly the cache warms.
+    ///
+    /// **No authoritative negatives, ever.** A cache that fills on demand and
+    /// can evict cannot prove anything from absence, so `lazy` never answers
+    /// "does not exist" from the index — only from a live syscall it just made.
+    /// That means `lazy` cannot eliminate an autoloader's *miss* probes the way
+    /// [`Sealed`](Self::Sealed) can; it accelerates hits only.
+    /// `lazy` + `code_bundle_sealed_paths` is a startup **error**, not a silent
+    /// downgrade.
+    Lazy,
+
     /// Scan `document_root` recursively at startup and index every `.php` file
     /// into RAM. Convenient for dev/container boot; re-scans every start.
     ///
     /// **Overlay semantics** — a bundle *hit* is served from RAM; a *miss*
     /// falls through to the real filesystem. Always safe: the bundle can only
     /// make things faster, never change an answer.
+    ///
+    /// Superseded by [`Lazy`](Self::Lazy) for everything except being the
+    /// no-sealed-roots form of [`Sealed`](Self::Sealed): unlike `lazy` this index
+    /// is complete and immutable, which is the property `sealed` is built on.
     Scan,
 
     /// Same scan as [`Scan`](Self::Scan), plus **authoritative negatives**
@@ -2725,14 +2754,22 @@ pub struct PhpConfig {
     #[serde(default = "default_code_bundle")]
     pub code_bundle: CodeBundleMode,
 
-    /// Hard cap on the bytes the code bundle may hold resident in RAM.
+    /// Cap on the bytes of PHP source the code bundle may hold resident in RAM.
     ///
-    /// If indexing would push the resident total past this cap, ePHPm **refuses
-    /// to build the bundle** and falls through to normal disk access (no partial
-    /// bundle is ever installed), logging a WARN. This bounds the blast radius
-    /// of pointing `code_bundle = "scan"` at a pathological monorepo. With
-    /// compression on, the *compressed* resident size is what counts against the
-    /// cap.
+    /// **What exceeding it does depends on the mode**, and this is the main
+    /// practical difference between them:
+    ///
+    /// * `code_bundle = "lazy"` — an **LRU eviction bound**. The coldest cached
+    ///   source is dropped to stay under the cap; the cache always serves.
+    ///   Memory is bounded by the working set, not by the size of the tree.
+    /// * `code_bundle = "scan"`/`"sealed"` — an **all-or-nothing refusal**. If
+    ///   indexing would exceed the cap, ePHPm declines to build the bundle at all
+    ///   and falls through to normal disk access, logging a WARN. The eager index
+    ///   must be complete to be correct, so it cannot drop anything.
+    ///
+    /// With compression on, the *compressed* resident size is what counts.
+    /// Metadata (paths, sizes, mtimes) is not counted and is not evicted; it is a
+    /// small fraction of the bytes and dropping it would only force a re-`stat`.
     ///
     /// Ignored when `code_bundle = "off"`.
     ///
@@ -2741,6 +2778,29 @@ pub struct PhpConfig {
     /// Default: `268435456` (256 MiB).
     #[serde(default = "default_code_bundle_max_bytes")]
     pub code_bundle_max_bytes: u64,
+
+    /// Whether `code_bundle = "lazy"` also walks `document_root` at startup to
+    /// bulk-fill the cache.
+    ///
+    /// Purely an optimization — it decides how quickly the cache warms, never
+    /// whether an answer is correct. It runs on one background thread and
+    /// publishes entries **as it discovers them**, so requests served during the
+    /// walk see a partially filled cache, which is indistinguishable from a
+    /// partially *warmed* one. A read failure part-way through is a warning, not
+    /// a startup failure: everything not reached is simply served lazily.
+    ///
+    /// Turn it **off** when the document root is large, on network storage, or
+    /// mostly cold — a full walk of a big `vendor/` costs real I/O at boot to
+    /// pre-load files the process may never execute.
+    ///
+    /// Ignored unless `code_bundle = "lazy"` (`"scan"`/`"sealed"` are defined by
+    /// their scan and cannot skip it); setting it elsewhere warns at startup.
+    ///
+    /// Env override: `EPHPM_PHP__CODE_BUNDLE_BOOT_SCAN=false`.
+    ///
+    /// Default: `true`.
+    #[serde(default = "default_code_bundle_boot_scan")]
+    pub code_bundle_boot_scan: bool,
 
     /// Optional compression for bundled source held in RAM
     /// (`"none"`/`"gzip"`/`"zstd"`/`"brotli"`).
@@ -3238,6 +3298,7 @@ impl Default for PhpConfig {
             code_bundle: default_code_bundle(),
             code_bundle_max_bytes: default_code_bundle_max_bytes(),
             code_bundle_compression: default_code_bundle_compression(),
+            code_bundle_boot_scan: default_code_bundle_boot_scan(),
             code_bundle_sealed_paths: Vec::new(),
             code_bundle_verify_negatives: false,
         }
@@ -3270,6 +3331,7 @@ impl PhpConfig {
     pub fn code_bundle_label(&self) -> &'static str {
         match self.code_bundle {
             CodeBundleMode::Off => "off",
+            CodeBundleMode::Lazy => "lazy",
             CodeBundleMode::Scan => "scan",
             CodeBundleMode::Sealed => "sealed",
         }
@@ -3279,6 +3341,13 @@ impl PhpConfig {
     #[must_use]
     pub fn is_code_bundle_enabled(&self) -> bool {
         self.code_bundle != CodeBundleMode::Off
+    }
+
+    /// Whether the code bundle is the **read-through cache**
+    /// (`code_bundle = "lazy"`) rather than a complete startup index.
+    #[must_use]
+    pub fn is_code_bundle_lazy(&self) -> bool {
+        self.code_bundle == CodeBundleMode::Lazy
     }
 
     /// Whether the code bundle should answer **authoritative negatives**
@@ -4340,6 +4409,10 @@ fn default_code_bundle_max_bytes() -> u64 {
 
 fn default_code_bundle_compression() -> String {
     "none".to_string()
+}
+
+fn default_code_bundle_boot_scan() -> bool {
+    true
 }
 
 fn default_crash_containment() -> bool {
@@ -5479,6 +5552,53 @@ idle_timeout_secs = 15
         let config = Config::load(&file).unwrap();
         assert_eq!(config.php.code_bundle, CodeBundleMode::Off);
         assert_eq!(config.php.code_bundle_max_bytes, 256 * 1024 * 1024);
+    }
+
+    /// `lazy` parses, is enabled, and is **never** sealed — the predicate that
+    /// keeps a lazily populated cache from ever answering an authoritative
+    /// negative.
+    #[test]
+    fn code_bundle_lazy_parses_and_is_never_sealed() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\ncode_bundle = \"lazy\"\n").unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.code_bundle, CodeBundleMode::Lazy);
+        assert!(config.php.is_code_bundle_enabled());
+        assert!(config.php.is_code_bundle_lazy());
+        assert!(
+            !config.php.is_code_bundle_sealed(),
+            "lazy must never report sealed — eviction and authoritative negatives are \
+             mutually exclusive"
+        );
+        assert_eq!(config.php.code_bundle_label(), "lazy");
+        assert!(config.php.code_bundle_boot_scan, "the boot scan is on by default");
+    }
+
+    /// The boot scan is a knob, and `lazy` is the only mode it applies to.
+    #[test]
+    fn code_bundle_boot_scan_defaults_on_and_parses_off() {
+        assert!(PhpConfig::default().code_bundle_boot_scan);
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\ncode_bundle = \"lazy\"\ncode_bundle_boot_scan = false\n")
+            .unwrap();
+        let config = Config::load(&file).unwrap();
+        assert!(!config.php.code_bundle_boot_scan);
+        assert!(config.php.is_code_bundle_lazy());
+    }
+
+    /// Every mode other than `sealed` must report not-sealed, so adding `lazy`
+    /// cannot have widened the authoritative-negative surface.
+    #[test]
+    fn only_sealed_is_sealed() {
+        for mode in [CodeBundleMode::Off, CodeBundleMode::Lazy, CodeBundleMode::Scan] {
+            let php = PhpConfig { code_bundle: mode, ..PhpConfig::default() };
+            assert!(!php.is_code_bundle_sealed(), "{mode:?} must not be sealed");
+        }
+        let php = PhpConfig { code_bundle: CodeBundleMode::Sealed, ..PhpConfig::default() };
+        assert!(php.is_code_bundle_sealed());
+        assert!(!php.is_code_bundle_lazy());
     }
 
     /// `scan` parses and flips the enabled predicate; the companion knobs parse.

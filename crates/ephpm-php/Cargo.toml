@@ -35,6 +35,11 @@ metrics.workspace = true
 flate2.workspace = true
 zstd.workspace = true
 brotli.workspace = true
+# Code bundle, lazy mode: the read-through cache is written by every PHP thread
+# that takes a miss, so its index is a sharded concurrent map rather than the
+# immutable HashMap the eager (scan/sealed) index uses. Same crate the KV store
+# and the OPcache watcher already use — no new lockfile entry.
+dashmap.workspace = true
 
 [build-dependencies]
 bindgen = "0.72"

@@ -1346,6 +1346,115 @@ fn run_with_config(
                  active — the code bundle is single-docroot only in this POC and is \
                  IGNORED. Code reads fall through to disk."
             );
+        } else if config.php.is_code_bundle_lazy() {
+            // ── code_bundle = "lazy": read-through cache ──────────────────
+            //
+            // Nothing is indexed up front. The hooks are armed and an EMPTY
+            // cache is published immediately: a lookup that misses does exactly
+            // the filesystem operation PHP was about to do, answers from it, and
+            // keeps the result. There is no "not ready yet" state to wait out
+            // and no all-or-nothing size cliff — `code_bundle_max_bytes` evicts
+            // instead of refusing.
+            //
+            // Authoritative negatives are structurally impossible here, so
+            // `code_bundle_sealed_paths` is rejected rather than ignored.
+            if !config.php.code_bundle_sealed_paths.is_empty() {
+                anyhow::bail!(
+                    "[php] code_bundle = \"lazy\" cannot be combined with \
+                     code_bundle_sealed_paths. Sealing declares that absence from the \
+                     index PROVES a file does not exist — a lazily populated, evictable \
+                     cache can never prove that, because \"never populated\" and \
+                     \"populated then evicted\" are the same state. Use code_bundle = \
+                     \"sealed\" (a complete, immutable startup scan) or drop \
+                     code_bundle_sealed_paths."
+                );
+            }
+            if config.php.code_bundle_verify_negatives {
+                tracing::warn!(
+                    "[php] code_bundle_verify_negatives is IGNORED with code_bundle = \
+                     \"lazy\" — lazy mode never answers a negative from the index, only \
+                     from a live syscall, so there is nothing to verify."
+                );
+            }
+            let algo = ephpm_php::code_bundle::BundleCompression::parse(
+                &config.php.code_bundle_compression,
+            )
+            .with_context(|| {
+                format!(
+                    "invalid [php] code_bundle_compression = {:?} (expected \
+                     none|gzip|zstd|brotli)",
+                    config.php.code_bundle_compression
+                )
+            })?;
+            let docroot = config.server.document_root.clone();
+            let max = usize::try_from(config.php.code_bundle_max_bytes).unwrap_or(usize::MAX);
+            let boot_scan = config.php.code_bundle_boot_scan;
+
+            ephpm_php::PhpRuntime::arm_code_bundle_hooks()
+                .context("failed to arm code bundle hooks")?;
+            let index = ephpm_php::code_bundle::LazyIndex::new(&docroot, algo, max);
+            let published = ephpm_php::code_bundle::publish_lazy(index);
+            if published.is_none() {
+                tracing::error!(
+                    "failed to publish the lazy code cache — code reads fall through to \
+                     disk for the life of this process"
+                );
+            }
+            let fronted = ephpm_php::code_bundle::function_overrides();
+            tracing::info!(
+                compression = algo.label(),
+                max_bytes = max,
+                boot_scan,
+                document_root = %docroot.display(),
+                validate_timestamps,
+                function_overrides = ?fronted,
+                "code bundle: lazy read-through cache active. Misses fall through to the \
+                 filesystem and populate the cache; nothing is ever answered \"missing\" \
+                 from the cache itself."
+            );
+            if fronted.is_empty() {
+                tracing::warn!(
+                    "[php] code_bundle could not override file_exists/realpath. \
+                     file_exists is what a real Composer autoloader probes with, and it \
+                     does NOT go through the stream wrapper — without the override the \
+                     bundle accelerates almost nothing on a Composer app."
+                );
+            }
+            if validate_timestamps {
+                tracing::warn!(
+                    "[php] code_bundle is ON but opcache.validate_timestamps is ON — the \
+                     cache serves the mtime it observed when it first read each file, so \
+                     OPcache's revalidation cannot see a later edit. Use `ephpm deploy` / \
+                     `ephpm cache reset` after replacing files, or set [php] \
+                     opcache_validate_timestamps = false to stop paying for the stat."
+                );
+            }
+
+            // The boot scan is now an OPTIMIZATION, not a correctness step: it
+            // bulk-fills the likely working set while the server is already
+            // answering requests from the same cache, publishing entries as it
+            // finds them. One thread on purpose — a fan-out would win a second
+            // of wall time and spend it competing with the first real requests.
+            if boot_scan && let Some(idx) = published {
+                let builder = std::thread::Builder::new().name("ephpm-code-bundle".into());
+                let spawned = builder.spawn(move || {
+                    let started = std::time::Instant::now();
+                    let (files, bytes) = idx.boot_scan(true);
+                    tracing::info!(
+                        entries = files,
+                        resident_bytes = bytes,
+                        load_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "code bundle: boot scan finished pre-filling the lazy cache"
+                    );
+                });
+                if let Err(e) = spawned {
+                    tracing::warn!(
+                        error = %e,
+                        "could not spawn the code bundle boot scan — the cache still fills \
+                         lazily on first use, which is the normal path"
+                    );
+                }
+            }
         } else {
             let algo = ephpm_php::code_bundle::BundleCompression::parse(
                 &config.php.code_bundle_compression,
@@ -1359,6 +1468,15 @@ fn run_with_config(
             })?;
             let docroot = config.server.document_root.clone();
             let max = usize::try_from(config.php.code_bundle_max_bytes).unwrap_or(usize::MAX);
+
+            if !config.php.code_bundle_boot_scan {
+                tracing::warn!(
+                    "[php] code_bundle_boot_scan = false is IGNORED with code_bundle = \
+                     {:?} — that mode IS its startup scan and cannot skip it. The setting \
+                     only applies to code_bundle = \"lazy\".",
+                    config.php.code_bundle_label()
+                );
+            }
             // `sealed` promotes a bundle MISS from "ask the filesystem" to
             // "answer 'no such file' from RAM" — but only inside the subtrees
             // named by code_bundle_sealed_paths, which is empty by default. It

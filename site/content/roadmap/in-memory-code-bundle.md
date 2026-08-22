@@ -1,13 +1,204 @@
 # In-Memory Application Code Bundle
 
-> **Status: EXPERIMENTAL POC (measured).** A working proof-of-concept exists
-> behind `[php] code_bundle` (`off` by default) — C-level overrides of
-> `zend_resolve_path`, `zend_stream_open_function`, and the plain-files
-> `stream_opener` + `url_stat` ops, backed by an immutable Rust index
-> (`crates/ephpm-php/src/code_bundle.rs`, `code_bundle_hooks.c`). It is **not
-> production-hardened**.
+> **Status: PLANNED — EXPERIMENTAL POC, not production-hardened, `off` by
+> default.** A working proof-of-concept exists behind `[php] code_bundle`
+> (`crates/ephpm-php/src/code_bundle.rs`, `code_bundle_hooks.c`).
 >
-> ### POC findings (Windows 11 + WSL2 Linux, same host, PHP 8.5.7 ZTS)
+> ## Round 3 (2026-08-22): measured against a REAL Composer application
+>
+> Everything before this section was measured against a **synthetic** 400-class
+> fixture whose autoloader probed with `is_file`. Real Composer probes with
+> `file_exists`, so those numbers never described a real application. This round
+> replaces them with **Laravel 13.26.1** installed by real Composer (163
+> packages, 8104 `.php` files, 38 MB of source, the genuine
+> `vendor/composer/ClassLoader.php` whose `findFileWithExtension` probes with
+> `file_exists` at line 506).
+>
+> ### 1. The `VCWD_*` wall is not a wall — `file_exists` IS frontable
+>
+> The previous round concluded that `file_exists`, `is_readable`, `realpath` and
+> `glob` were unreachable without patching PHP, because they call the `VCWD_*`
+> macros directly rather than going through a swappable stream-wrapper op. That
+> reasoning was about the *streams* layer and missed the layer above it: **PHP
+> stores every internal function's `handler` as a plain function pointer in
+> `CG(function_table)`, and it can be swapped at runtime.** OPcache itself does
+> exactly this in `zend_accel_override_file_functions()` to implement
+> `opcache.enable_file_override`. No SDK patch is involved.
+>
+> ePHPm now does the same for **`file_exists` and `realpath`**, installed once on
+> the single-threaded startup path *after* every MINIT — so the handler we save
+> and delegate to on a miss is whatever OPcache installed, and the two
+> accelerations compose instead of clobbering each other. ZTS is safe because the
+> function table stores *pointers* to shared `zend_internal_function` structs, so
+> one swap at startup is process-wide; a new thread's table copy points at the
+> same struct.
+>
+> **This overturns the previous round's headline finding that 0 % of a real
+> Composer request was frontable.**
+>
+> `is_readable`/`is_writable`/`is_executable` are deliberately **not** overridden:
+> their answer depends on the process's effective uid, the only correct way to
+> get it is `access(2)` — which is the syscall we are trying to remove — and
+> answering from the index would claim a mode-000 file is readable.
+> `glob`/`opendir` are analysed below and are **not** implemented.
+>
+> ### 2. Lazy read-through cache (`code_bundle = "lazy"`)
+>
+> The index is no longer built up front. A lookup that misses performs exactly
+> the filesystem operation PHP was about to perform, answers from it, and keeps
+> the result. Consequences:
+>
+> * `code_bundle_max_bytes` is an **LRU eviction bound**, not an
+>   all-or-nothing refusal. Memory is bounded by the working set.
+> * The boot scan survives as an **optimization** (`code_bundle_boot_scan`,
+>   default on) that publishes entries progressively as it walks. It is no longer
+>   a correctness dependency: "not scanned yet" and "not cached yet" are the same
+>   state and both mean "fall through to disk". A scan failure warns and stops.
+> * **`sealed` is impossible under `lazy` and the combination is a startup
+>   error.** A cache that fills on demand and can evict cannot prove anything
+>   from absence. `lazy` therefore never eliminates an autoloader's *miss*
+>   probes — it accelerates hits only, and a miss costs a fresh syscall every
+>   time.
+>
+> ### 3. Correctness fix that lands regardless: `FileEntry::canon`
+>
+> The index stored the **raw config-spelled** document-root path, not the
+> OS-canonical one, and that string becomes `__FILE__`, `__DIR__`,
+> `get_included_files()`, the `require_once` de-dup key and OPcache's
+> `opened_path`. Varying *only* the `document_root` spelling: a forward-slash
+> spelling made `require_once` run a file **twice** ("Cannot redeclare"), and with
+> timestamp validation on produced **402 OPcache misses / 0 hits per request**
+> (~11× *slower* than leaving the bundle off) — silently. Now canonicalized once
+> at the walk root, pinned by `canon_is_independent_of_docroot_spelling` across
+> eight docroot spellings plus a relative and a symlinked one.
+>
+> ### 4. Measured: real Laravel 13, warm p50 and filesystem ops per request
+>
+> Same host, quiet machine, one server **process per cell** (running cells in one
+> harness process reproducibly killed every server after the first), 60 warm +
+> 60 measured keep-alive requests, and the measured window never starts before
+> the index is live. Windows "ops" = per-process `OtherOperationCount` delta per
+> request; Linux "ops" = `strace -c -e trace=%file` calls per request. Response
+> body md5 verified **identical** across `off`/`lazy`/`scan`/`sealed` on both
+> platforms.
+>
+> **Default Composer autoloader (`composer dump-autoload`, PSR-4 probing):**
+>
+> | | Windows p50 / ops | Linux p50 / ops | Windows RSS |
+> |---|---|---|---|
+> | `code_bundle = "off"` | 25.50 ms / 1433 | 6.65 ms / 1283 | 58 MB |
+> | `sealed`, **without** the function override | 25.40 ms / 1313 | 6.79 ms / 1223 | 116 MB |
+> | `opcache.enable_file_override=1`, bundle **off** | 14.07 ms / 603 | 5.19 ms / 457 | 58 MB |
+> | `lazy` (boot scan on) | 14.52 ms / 297 | 5.93 ms / 397 | 109 MB |
+> | `lazy` (boot scan **off**) | 13.52 ms / 297 | 5.98 ms / 397 | 65 MB |
+> | `scan` | — | 5.78 ms / 397 | — |
+> | `sealed` (`vendor`) | **13.07 ms / 189** | **5.63 ms / 161** | 102 MB |
+> | `sealed` + `enable_file_override` | 12.64 ms / 189 | 5.52 ms / 161 | 102 MB |
+>
+> The `sealed`-without-override row is the control that proves the point: it is
+> indistinguishable from `off` (25.40 vs 25.50 ms). **Every bit of the bundle's
+> effect on a real Composer application comes from the `file_exists` handler
+> override.** With it, Windows drops 25.50 → 13.07 ms (−49 %) and 1433 → 189 ops
+> (−87 %).
+>
+> ### 5. …but two zero-code alternatives already get you there
+>
+> **`composer dump-autoload -o`** replaces PSR-4 probing with a classmap, so
+> there is almost nothing left to front:
+>
+> | Autoloader | mode | Windows p50 / ops | Linux p50 / ops |
+> |---|---|---|---|
+> | default PSR-4 | `off` | 25.50 ms / 1433 | 6.65 ms / 1283 |
+> | default PSR-4 | `sealed` | 13.07 ms / 189 | 5.63 ms / 161 |
+> | **`-o` classmap** | **`off`** | **12.54 ms / 321** | **5.03 ms / 233** |
+> | `-o` classmap | `lazy` | see below | 5.13 ms / 161 |
+> | `-o` classmap | `sealed` | see below | **4.62 ms / 161** |
+> | classmap-authoritative | `off` | — | 4.88 ms / 233 |
+> | classmap-authoritative | `sealed` | — | 4.61 ms / 161 |
+> | classmap-authoritative | `enable_file_override` | — | 4.57 ms / 221 |
+>
+> On Windows, **one `composer dump-autoload -o` (12.54 ms) matches the entire
+> feature in its best configuration (13.07 ms) and costs 40 MB less RAM.** On
+> Linux it is outright faster (5.03 vs 5.63 ms). `opcache.enable_file_override=1`
+> — one stock ini line — gets most of the rest.
+>
+> ### 6. What lazy actually bought, measured
+>
+> * **Memory bounded by the working set.** `lazy` with the boot scan **off** used
+>   65 MB on Windows / 114 MB on Linux versus 102–116 MB / 153–183 MB for the
+>   eager index, and produced **identical** ops per request (297 Windows,
+>   397 Linux). The full 38 MB index is ~55 MB of RSS that the request path never
+>   needed.
+> * **No cold-start cliff.** The eager scan of this 8104-file tree took
+>   **78–111 s on Windows with a cold OS file cache** (1–2 s warm), during which
+>   `scan`/`sealed` serve entirely unaccelerated. `lazy` with the boot scan off is
+>   ready in 4 ms and warms as it serves.
+> * **The cost of never caching a negative.** Because absence proves nothing,
+>   `lazy` re-checks every non-existent path on every request. Per-operation on
+>   Linux (`file_exists` on a path that does not exist): 1.055 µs `off` →
+>   1.270 µs `lazy` — **20 % slower**, since the bundle lookup is added on top of
+>   the syscall that still happens. This is exactly why `lazy` lands at 397 ops
+>   and `sealed` at 161.
+> * **Read-path cost of making the index mutable**, measured not assumed:
+>   a `file_exists` hit costs **0.080 µs** against the immutable `HashMap`
+>   (`scan`) and **0.146 µs** against the sharded concurrent map (`lazy`) —
+>   **+66 ns per lookup**. Against a 14–50 µs Windows metadata syscall that is
+>   noise; against a 1 µs Linux one it is 7 %.
+> * **The `require_once` tax is real and slightly worse under lazy**: 0.016 µs
+>   `off` → 0.107 µs `scan` → 0.188 µs `lazy`, because `zend_resolve_path` runs
+>   before the already-included short-circuit. Zero syscalls, so syscall-based
+>   measurement misses it entirely; ~0.17 µs/call only matters at 10^5 calls.
+>
+> ### 7. Correctness: what got fixed, and what is still true
+>
+> Fixed and pinned by tests: the `canon` docroot-spelling bug (§3); `fileperms()`
+> reporting `0100444` while `is_writable()` said writable (the index now carries
+> the real read-only bit, and reports `0644` when it does not know); `filemtime()`
+> on a directory returning 0 (directories now fall through to a real stat);
+> symlinked directories being skipped by the scan entirely (now followed, with a
+> cycle guard); and a `sealed` root refusing to arm when the scan could not
+> enumerate it exhaustively (it contains a symlinked directory, or a `.php` file
+> that exists but could not be read — which, now that `file_exists` is fronted,
+> would otherwise be a lie visible to every autoloader).
+>
+> **Still true, and inherent:** a bundled file replaced by an out-of-process
+> deploy keeps serving the bytes and mtime captured when it was first read.
+> **Lazy does not fix this — it relocates the freeze from "boot" to "first
+> touch", which is arguably worse**, because different files freeze at different
+> times and a deploy can be observed half-applied. The escape hatch is the
+> existing `ephpm deploy` / `ephpm cache reset` path, which now clears the code
+> cache **before** invalidating OPcache (reversed, an in-flight request
+> repopulates OPcache from bytes about to be discarded and
+> `validate_timestamps=0` never corrects it). Verified end-to-end. An in-process
+> write to a `.php` file invalidates just that entry, which the immutable index
+> could never do.
+>
+> ### 8. Go / no-go
+>
+> **No-go as a default, no-go as a headline feature. Keep it experimental and
+> off.** The mechanism now works — the function-handler override is a real and
+> reusable discovery, and 1433 → 189 filesystem ops on a real Laravel request is
+> not a small number. But the honest comparison is against what an operator can
+> do for free:
+>
+> * On a **correctly configured** app (`composer dump-autoload -o`, which is
+>   standard production practice) the bundle's remaining headroom is small, and
+>   on Windows a plain `-o` already matches the bundle's best case using 40 MB
+>   less memory.
+> * The one configuration where the bundle wins decisively — `sealed` — is
+>   exactly the one that trades correctness for speed, cannot be combined with
+>   lazy population, and has to refuse to arm in several real-world layouts.
+> * `lazy` is the right *shape* for a cache (bounded memory, no cold-start
+>   cliff, no all-or-nothing cliff) but by construction cannot eliminate the miss
+>   probes that are the whole cost.
+>
+> **What is worth keeping regardless of the feature's fate:** the `canon` fix
+> (a live correctness bug), the function-handler override mechanism (useful
+> anywhere ePHPm wants to interpose on a PHP builtin), and the finding that
+> `composer dump-autoload -o` plus `opcache.enable_file_override=1` is the
+> advice to give Windows users today.
+>
+> ### POC findings from earlier rounds (synthetic fixture — superseded above)
 >
 > - **The source-read path works and is opcache-safe.** `require`/`include` and
 >   the cold compile serve from RAM even with OPcache enabled — proven by
@@ -187,23 +378,66 @@ preload set, and has app-compat constraints (preloaded files can't be
 unlinked; some frameworks don't preload cleanly). Preload fixes the *compile*
 layer for a subset; the bundle fixes the *filesystem* layer for everything.
 
-### The residual leak, and the optional SDK patch.
-Even with Option B, `tsrm_virtual_cwd`'s realpath cache calls
-`php_sys_lstat` / the win32 ioutil accessors directly in some canonicalization
-paths (`VCWD_REALPATH`). To close realpath fully and squeeze the last few
-percent on Windows, a **build-time patch to the shipped PHP SDK**
-(`win32/ioutil.c` stat/open + `TSRM/tsrm_virtual_cwd.c` realpath) that consults
-an ePHPm callback before hitting Win32 is the complete-coverage option. This is
-the *same php-sdk patch pipeline* that already produces the TAILCALL VM (xtask
-only *verifies* the VM kind by disassembling `zend_vm_kind`; the patch itself
-lives upstream in `github.com/ephpm/php-sdk`). It is deferred to a late phase
-because it is a recurring per-PHP-minor maintenance cost — reserve it for the
-realpath-cache leak that Option B can't reach, not for the bulk of the win.
+### Option B2 — override the internal function *handlers*. **Implemented; this is what unlocked real Composer.**
 
-**Recommendation:** ship Option B (portable C hooks) as core, driven by
-`opcache.validate_timestamps=0`, optionally fed into `opcache.preload`; treat
-the Option C preload wiring as a complement and the Option B→SDK-patch upgrade
-for realpath as a final hardening phase.
+Option B's stream-wrapper hooks cannot reach `file_exists`, `is_readable`,
+`is_writable`, `is_executable`, `realpath` or `glob`, because those call the
+`VCWD_*` macros directly. An earlier round concluded that closing them required
+patching the PHP SDK. **That was wrong.** There is a swappable layer *above* the
+streams layer: every internal function's `handler` is a plain function pointer
+in `CG(function_table)`, and OPcache already swaps exactly these functions in
+`zend_accel_override_file_functions()` to implement
+`opcache.enable_file_override`.
+
+ePHPm now installs the same kind of override for **`file_exists` and
+`realpath`**, in `ephpm_bundle_install_hooks()`:
+
+* **Ordering.** Installed *after* `php_embed_init()`, i.e. after every MINIT, so
+  the handler saved for miss-delegation is whatever OPcache (or any other
+  extension) installed. Bundle → OPcache's SHM-cache-first version → the real
+  syscall. The two accelerations compose; neither clobbers the other.
+* **ZTS.** The function table stores *pointers* to shared
+  `zend_internal_function` structs and a new thread's table is copied by
+  pointer, so a single swap on the single-threaded startup path is
+  process-wide — and no other thread can observe a torn pointer.
+* **Fail-safe conditions.** The fast path is taken only when a bundle is
+  published, exactly one already-string argument was passed, and `open_basedir`
+  is not in force (the real handlers enforce it; answering from RAM would leak
+  the existence of paths outside it). Everything else delegates unchanged, so a
+  stream URL, a relative path, or anything outside the document root is
+  byte-for-byte untouched.
+* **Deliberately excluded.** `is_readable`/`is_writable`/`is_executable` depend
+  on the process's effective uid; the only correct implementation is `access(2)`,
+  which is the syscall we are removing, and an index answer would call a mode-000
+  file readable. Real Composer probes with `file_exists`, so nothing measurable
+  is lost.
+
+**`glob` and `opendir` are viable but NOT implemented, and are incompatible with
+`lazy`.** The earlier "unreachable by any mechanism" verdict on `glob` was also
+wrong: this SDK builds PHP's *bundled* glob (`php_glob`/`php_globfree` are
+`PHPAPI`-exported on both Linux and Windows — `HAVE_GLOB` is not defined), and it
+supports `PHP_GLOB_ALTDIRFUNC` with `gl_opendir`/`gl_readdir`/`gl_stat`
+callbacks that `ext/standard/dir.c` simply never sets. Overriding `zif_glob` to
+call `php_glob` with that flag and our own directory callbacks would work. The
+blocker is not the mechanism, it is the *data*: serving a directory listing
+requires the index to have enumerated that directory **exhaustively**, which a
+lazily populated cache by definition has not. So directory fronting is a
+`scan`/`sealed`-only feature. On the measured real-app workload `glob` did not
+appear in the request path at all, so it is not on the critical path for a
+Composer application.
+
+### The SDK patch is no longer required.
+With B2 in place there is no remaining function on the measured Composer request
+path that needs a patched PHP. The `win32/ioutil.c` / `tsrm_virtual_cwd.c` patch
+idea is **withdrawn as a requirement** — it remains an option only for
+`is_readable`-class functions we chose not to front and for the realpath cache's
+internal canonicalization, neither of which showed up as a cost on a real app.
+Avoiding it also avoids a recurring per-PHP-minor maintenance cost.
+
+**Recommendation:** Option B (stream-wrapper hooks) + Option B2 (function-handler
+overrides) as core, driven by `opcache.validate_timestamps=0`. Option C
+(preload) remains a complement. See the go/no-go at the end for whether the
+result justifies shipping any of it.
 
 ## Correctness model — the make-or-break
 

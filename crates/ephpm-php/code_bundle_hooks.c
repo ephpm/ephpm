@@ -61,9 +61,14 @@
 #include <sys/stat.h>
 
 #include "main/php.h"
+#include "main/php_globals.h"
 #include "main/php_streams.h"
 #include "main/streams/php_stream_plain_wrapper.h"
 #include "Zend/zend.h"
+#include "Zend/zend_API.h"
+#include "Zend/zend_compile.h"
+#include "Zend/zend_globals.h"
+#include "Zend/zend_hash.h"
 #include "Zend/zend_stream.h"
 #include "Zend/zend_string.h"
 
@@ -82,6 +87,7 @@
 /* Mirror of Rust `BundleStat` (#[repr(C)]). */
 typedef struct {
     int      is_dir;
+    int      readonly; /* 1 => 0444, 0 => 0644 (keeps fileperms/is_writable consistent) */
     int64_t  size;
     int64_t  mtime;
     uint64_t inode;
@@ -427,7 +433,11 @@ static int ephpm_bundle_url_stat_hook(php_stream_wrapper *wrapper,
             if (st.is_dir) {
                 ssb->sb.st_mode = S_IFDIR | 0555;
             } else {
-                ssb->sb.st_mode = S_IFREG | 0444;
+                /* Report the real writability. Hardcoding 0444 made
+                 * fileperms() claim read-only for a file is_writable() (which
+                 * goes through VCWD_ACCESS and never reaches this hook) said
+                 * was writable — two answers about one file in one request. */
+                ssb->sb.st_mode = S_IFREG | (st.readonly ? 0444 : 0644);
                 ssb->sb.st_size = st.size;
             }
             ssb->sb.st_mtime = st.mtime;
@@ -495,6 +505,143 @@ static php_stream *ephpm_bundle_stream_opener(php_stream_wrapper *wrapper,
                                context STREAMS_REL_CC);
 }
 
+/* ---- 5. internal FUNCTION HANDLER overrides ------------------------------ *
+ *
+ * The four access functions (file_exists / is_readable / is_writable /
+ * is_executable) and realpath() do NOT go through the stream wrapper. They
+ * reach the filesystem through the VCWD_* macros, which are direct calls with
+ * no pointer to swap — which is why hooks 1-4 above never front them, and why
+ * a real Composer autoloader (which probes with file_exists) got zero benefit
+ * from this feature.
+ *
+ * There is, however, a layer ABOVE the streams layer that IS swappable: the
+ * internal function's own handler. PHP keeps every internal function in
+ * CG(function_table) as a pointer to a heap-allocated zend_internal_function,
+ * and the `handler` field of that struct is just a function pointer. OPcache
+ * itself does exactly this in zend_accel_override_file_functions() to implement
+ * opcache.enable_file_override — no source patch, no SDK change.
+ *
+ * ── ZTS ────────────────────────────────────────────────────────────────────
+ * The table stores POINTERS to shared zend_internal_function structs; a new
+ * thread's compiler_globals_ctor copies the table by pointer, so mutating
+ * `handler` is a PROCESS-WIDE change, not a per-thread one. We therefore swap
+ * exactly once, on the single-threaded startup path (before any tokio blocking
+ * thread has registered with TSRM), so no thread can observe a torn pointer.
+ * Empirical confirmation that this works on this exact ZTS build: turning on
+ * opcache.enable_file_override — which uses this same mechanism — measurably
+ * changes behaviour process-wide.
+ *
+ * ── Composing with OPcache rather than fighting it ─────────────────────────
+ * We install AFTER php_embed_init(), i.e. after every MINIT including
+ * OPcache's. So when enable_file_override is also on, the handler we save is
+ * OPcache's accel_file_exists, and our miss path delegates to it: bundle first,
+ * then OPcache's SHM-cache-first version, then the real syscall. Both
+ * accelerations compose. When it is off we save the genuine zif_file_exists.
+ * Either way the saved pointer is whatever was installed last before us.
+ *
+ * ── Correctness ────────────────────────────────────────────────────────────
+ * A fast answer is taken ONLY when all of the following hold, otherwise we
+ * delegate and behaviour is byte-for-byte unchanged:
+ *   - a bundle is published;
+ *   - exactly one argument was passed and it is already a string (no coercion,
+ *     no named-argument reshuffling to reason about);
+ *   - open_basedir is NOT in force. The real handlers enforce it and emit its
+ *     warning; answering from RAM would leak the existence of paths outside it.
+ *     The check is a pointer test, not a syscall.
+ * Rust owns the scope predicate (docroot + indexed extension), so a stream URL
+ * ("phar://…"), a relative path, or anything outside the document root can only
+ * ever come back UNKNOWN.
+ */
+
+static zif_handler g_orig_file_exists = NULL;
+static zif_handler g_orig_realpath = NULL;
+
+/* Non-zero when the fast path is allowed to answer at all. */
+static int ephpm_bundle_fn_fastpath_ok(void)
+{
+    return ephpm_bundle_active()
+        && (PG(open_basedir) == NULL || PG(open_basedir)[0] == '\0');
+}
+
+/* The single string argument, or NULL when this call is not one we handle. */
+static zend_string *ephpm_bundle_single_path_arg(zend_execute_data *execute_data)
+{
+    zval *arg;
+    if (ZEND_NUM_ARGS() != 1) {
+        return NULL;
+    }
+    arg = ZEND_CALL_ARG(execute_data, 1);
+    if (!arg || Z_TYPE_P(arg) != IS_STRING) {
+        return NULL;
+    }
+    return Z_STR_P(arg);
+}
+
+static void ZEND_FASTCALL ephpm_bundle_zif_file_exists(INTERNAL_FUNCTION_PARAMETERS)
+{
+    if (ephpm_bundle_fn_fastpath_ok()) {
+        zend_string *p = ephpm_bundle_single_path_arg(execute_data);
+        if (p) {
+            ephpm_bundle_stat_t st;
+            int rc = g_cb.stat(ZSTR_VAL(p), ZSTR_LEN(p), &st);
+            ephpm_bundle_trace_line("zif_file_exists", ZSTR_VAL(p), rc);
+            if (rc == EPHPM_BUNDLE_HIT) {
+                RETURN_TRUE;
+            }
+            if (rc == EPHPM_BUNDLE_ABSENT) {
+                RETURN_FALSE;
+            }
+        }
+    }
+    g_orig_file_exists(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
+/* is_readable / is_writable / is_executable are deliberately NOT overridden.
+ *
+ * They are the three access checks whose answer depends on the calling
+ * process's effective uid/gid, not on the file's existence. The only correct
+ * way to answer them is access(2) — which IS the syscall we are trying to
+ * remove, so there is nothing to win — and answering them from the index would
+ * report "readable" for a mode-000 file that the server cannot actually open.
+ * Real Composer probes with file_exists (ClassLoader.php findFileWithExtension),
+ * so nothing measurable is given up by leaving these alone.
+ */
+
+static void ZEND_FASTCALL ephpm_bundle_zif_realpath(INTERNAL_FUNCTION_PARAMETERS)
+{
+    if (ephpm_bundle_fn_fastpath_ok()) {
+        zend_string *p = ephpm_bundle_single_path_arg(execute_data);
+        if (p) {
+            const char *canon = NULL;
+            int rc = g_cb.resolve(ZSTR_VAL(p), ZSTR_LEN(p), &canon);
+            ephpm_bundle_trace_line("zif_realpath", ZSTR_VAL(p), rc);
+            if (rc == EPHPM_BUNDLE_HIT && canon) {
+                RETVAL_STRING(canon);
+                return;
+            }
+            if (rc == EPHPM_BUNDLE_ABSENT) {
+                RETURN_FALSE;
+            }
+        }
+    }
+    g_orig_realpath(INTERNAL_FUNCTION_PARAM_PASSTHRU);
+}
+
+/* Swap one internal function's handler, saving the previous one. Returns 1 on
+ * success. A function that is not registered (disabled via disable_functions,
+ * or removed by another extension) is simply left alone. */
+static int ephpm_bundle_swap_handler(const char *name, size_t name_len,
+                                     zif_handler replacement, zif_handler *saved)
+{
+    zend_function *fn = zend_hash_str_find_ptr(CG(function_table), name, name_len);
+    if (!fn || fn->type != ZEND_INTERNAL_FUNCTION || !fn->internal_function.handler) {
+        return 0;
+    }
+    *saved = fn->internal_function.handler;
+    fn->internal_function.handler = replacement;
+    return 1;
+}
+
 /* ---- install ------------------------------------------------------------- */
 
 void ephpm_bundle_install_hooks(const ephpm_bundle_callbacks_t *cb)
@@ -524,5 +671,23 @@ void ephpm_bundle_install_hooks(const ephpm_bundle_callbacks_t *cb)
         php_plain_files_wrapper.wops = &g_plain_ops;
     }
 
+    /* Internal-function handler overrides — the ONLY way to reach the VCWD_*
+     * functions without patching PHP. Done last, so the handlers we save are
+     * whatever OPcache (or any other extension) installed during MINIT, and our
+     * miss path delegates to them. Single-threaded startup: no reader can
+     * observe a torn function pointer. */
+    ephpm_bundle_swap_handler("file_exists", sizeof("file_exists") - 1,
+                              ephpm_bundle_zif_file_exists, &g_orig_file_exists);
+    ephpm_bundle_swap_handler("realpath", sizeof("realpath") - 1,
+                              ephpm_bundle_zif_realpath, &g_orig_realpath);
+
     g_cb_installed = 1;
+}
+
+/* Diagnostic for the Rust side: which handler overrides actually took. A
+ * function removed by disable_functions is skipped rather than faked. */
+int ephpm_bundle_fn_overrides_installed(void)
+{
+    return (g_orig_file_exists ? 1 : 0)
+         | (g_orig_realpath ? 2 : 0);
 }

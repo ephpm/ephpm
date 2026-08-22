@@ -2694,7 +2694,26 @@ impl Router {
                     &document_root,
                     version,
                     crate::opcache::InvalidationTrigger::Kv,
-                    PhpRuntime::opcache_invalidate_under,
+                    |docroot| {
+                        // Whole-world refresh of the lazy code cache, reusing the
+                        // deploy trigger rather than inventing a second
+                        // mechanism — a code cache and an OPcache that disagree
+                        // about what "current" means is worse than either being
+                        // stale.
+                        //
+                        // ORDER MATTERS: drop the cached source FIRST. Reversed,
+                        // a request in flight can repopulate OPcache from bytes
+                        // we are about to discard, and with
+                        // `validate_timestamps = 0` nothing would ever correct
+                        // it. No-op in every mode except `code_bundle = "lazy"`.
+                        if ephpm_php::code_bundle::refresh_lazy() {
+                            tracing::info!(
+                                "code bundle: lazy cache cleared by deploy/cache-reset; \
+                                 the next lookup for each path re-reads from disk"
+                            );
+                        }
+                        PhpRuntime::opcache_invalidate_under(docroot)
+                    },
                 );
             }
 
