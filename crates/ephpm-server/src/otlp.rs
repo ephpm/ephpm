@@ -435,24 +435,27 @@ impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanEx
 /// Returns a warning when some *other* provider was already installed, which
 /// would mean gRPC TLS silently uses it.
 fn install_default_crypto_provider() -> Option<String> {
-    let ours = crate::tls::crypto_provider();
+    // `install_default` is a one-shot for the whole process, so the attempt is
+    // memoized: a second call (two tests in one binary, or any future second
+    // exporter) must report the same answer as the first rather than seeing
+    // its own earlier installation and mistaking it for a foreign one.
+    static INSTALLED_OURS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-    if rustls::crypto::CryptoProvider::install_default((*ours).clone()).is_ok() {
+    let ours_won = *INSTALLED_OURS.get_or_init(|| {
+        let ours = crate::tls::crypto_provider();
+        rustls::crypto::CryptoProvider::install_default((*ours).clone()).is_ok()
+    });
+
+    if ours_won {
         return None;
     }
 
-    // Err means one was already installed. Ours is installed exactly here, so
-    // an existing one is either ours (idempotent, fine) or a foreign one.
-    let installed = rustls::crypto::CryptoProvider::get_default();
-    match installed {
-        Some(p) if std::ptr::eq(std::ptr::from_ref(&**p), std::ptr::from_ref(&*ours)) => None,
-        _ => Some(
-            "a rustls crypto provider was already installed as the process \
-             default before the OTLP gRPC exporter was built; gRPC TLS will \
-             use that provider, which may differ from the HTTPS listener's"
-                .to_string(),
-        ),
-    }
+    Some(
+        "a rustls crypto provider was already installed as the process default \
+         before the OTLP gRPC exporter was built; gRPC TLS will use that \
+         provider, which may differ from the HTTPS listener's"
+            .to_string(),
+    )
 }
 
 /// Build the OTLP/gRPC exporter together with the runtime that drives it.
@@ -843,6 +846,24 @@ mod tests {
 
         // The runtime is real and usable — this is what drives every export.
         assert_eq!(runtime.block_on(async { 1 + 1 }), 2);
+    }
+
+    /// Building a second gRPC exporter must not report a foreign provider.
+    ///
+    /// `CryptoProvider::install_default` is a process-wide one-shot, so the
+    /// second call necessarily fails. Reading that as "somebody else installed
+    /// one" would emit a bogus warning — and, since the test binary shares one
+    /// process, would make whichever gRPC test ran second fail depending on
+    /// ordering.
+    #[test]
+    fn building_a_second_grpc_exporter_is_idempotent() {
+        let (_e1, _r1, first) =
+            build_grpc_exporter(Some("http://127.0.0.1:4317")).expect("first exporter");
+        let (_e2, _r2, second) =
+            build_grpc_exporter(Some("http://127.0.0.1:4317")).expect("second exporter");
+
+        assert!(!first.contains("already installed"), "first: {first}");
+        assert!(!second.contains("already installed"), "second: {second}");
     }
 
     /// The client must speak plaintext exactly as before TLS was added.
