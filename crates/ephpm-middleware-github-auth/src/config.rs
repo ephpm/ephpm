@@ -372,7 +372,7 @@ impl Config {
             None | Some(serde_json::Value::Null) => {}
             Some(serde_json::Value::Object(map)) => {
                 for (host, entry) in map {
-                    let host_key = host.trim().to_ascii_lowercase();
+                    let host_key = normalize_vhost(host);
                     validate_vhost(&host_key)?;
                     let check = parse_check(entry, &format!("sites.{host}"))?
                         .ok_or_else(|| format!("sites.{host}: no repo/org/team configured"))?;
@@ -522,6 +522,10 @@ impl Config {
 
     /// The access check that applies to `vhost`.
     ///
+    /// `vhost` must already have been through [`normalize_vhost`]; the keys
+    /// of `sites` were normalised at parse time, so anything else silently
+    /// misses.
+    ///
     /// When a `sites` table is configured it is authoritative: a vhost with
     /// no entry gets **no** check and therefore no access, even if a
     /// top-level `repo` is also set. Falling back would mean a hostname
@@ -531,7 +535,7 @@ impl Config {
         if self.sites.is_empty() {
             return self.default_check.as_ref();
         }
-        self.sites.get(&vhost.trim().to_ascii_lowercase())
+        self.sites.get(vhost)
     }
 
     /// Paths the gate owns, for the return-to loop check.
@@ -539,6 +543,30 @@ impl Config {
     pub fn reserved_paths(&self) -> [&str; 2] {
         [self.login_path.as_str(), self.callback_path.as_str()]
     }
+}
+
+/// Canonicalise the middleware ABI's `request_vhost_id` before it is used as
+/// a key or written into a token.
+///
+/// **This is not cosmetic.** `request_vhost_id` is the router's `SERVER_NAME`
+/// — the raw `Host` header with the port split off and *nothing else*. It is
+/// **not** lowercased, the FQDN-root dot is not stripped, and it is not the
+/// canonical site key that `Router::resolve_site` produces. `Host` is
+/// case-insensitive per RFC 9110 and entirely client-controlled, so without
+/// this a `sites` lookup misses on `Host: PR-1.Preview.Test`, and — worse —
+/// two spellings of the same host would mint sessions with two different
+/// `site` claims and two different derived `redirect_uri`s.
+///
+/// The port is deliberately **not** split off here: the server already
+/// removed it, and splitting on `:` would corrupt an IPv6 literal
+/// (`[::1]` → `[`). If a future ABI change reintroduced the port, the key
+/// would simply stop matching, which fails closed.
+///
+/// `ephpm-server`'s own `normalize_host_key` is `pub(crate)`, so a module
+/// cannot call it; the duplication is forced.
+#[must_use]
+pub fn normalize_vhost(raw: &str) -> String {
+    raw.trim().trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// Reject a vhost id that could not appear in a URL authority.
@@ -703,14 +731,39 @@ mod tests {
             c.check_for("pr-1.preview.example.com"),
             Some(&Check::Repo { owner: "acme".into(), name: "web".into() })
         );
-        // Host matching is case-insensitive in both directions.
+        // A `sites` KEY written in mixed case is normalised at parse time.
         assert_eq!(
-            c.check_for("pr-2.PREVIEW.example.com"),
+            c.check_for("pr-2.preview.example.com"),
             Some(&Check::Org { org: "acme".into() })
         );
         // An unmapped vhost gets nothing — it does NOT inherit the top-level
         // `repo`, which is also set in this config.
         assert_eq!(c.check_for("pr-99.preview.example.com"), None);
+    }
+
+    #[test]
+    fn vhost_normalisation_closes_the_case_bypass() {
+        // `request_vhost_id` is the RAW `Host` header. Without normalisation
+        // a client picks its own key by changing a letter's case, and mints
+        // sessions whose `site` claim disagrees with everyone else's.
+        for raw in [
+            "PR-1.Preview.Example.COM",
+            "pr-1.preview.example.com.",
+            "  pr-1.preview.example.com  ",
+            "PR-1.PREVIEW.EXAMPLE.COM.",
+        ] {
+            assert_eq!(normalize_vhost(raw), "pr-1.preview.example.com", "{raw:?}");
+        }
+        // An IPv6 literal survives: the port is already gone, and splitting
+        // on ':' here would truncate it to "[".
+        assert_eq!(normalize_vhost("[::1]"), "[::1]");
+        assert!(validate_vhost(&normalize_vhost("[::1]")).is_ok());
+
+        let mut v = base();
+        v["sites"] = serde_json::json!({ "PR-1.Preview.Example.COM": { "repo": "acme/web" } });
+        let c = parse(v).expect("parse");
+        assert!(c.check_for(&normalize_vhost("pr-1.PREVIEW.example.com")).is_some());
+        assert!(c.check_for(&normalize_vhost("PR-1.preview.example.com.")).is_some());
     }
 
     #[test]

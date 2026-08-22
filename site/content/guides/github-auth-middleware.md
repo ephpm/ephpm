@@ -35,6 +35,10 @@ that does — that is the verifier's job, and doing it in two places would give
 you two subtly different verifiers. The module logs this at startup on its
 first request.
 
+The verifier this is designed to pair with is the **`session-cookie` builtin**
+(ephpm#388) — same HS256 verification as the `jwt` builtin, but reading a
+cookie and redirecting instead of answering `401`:
+
 ```toml
 [[middleware]]
 library = "/opt/ephpm/modules/libgithub_auth.so"
@@ -45,11 +49,23 @@ config  = { client_id = "Iv1.0123456789abcdef",
             repo = "acme/web" }
 
 [[middleware]]
-library = "…session verifier…"    # hot path — verifies, redirects to login
+library = "session-cookie"       # hot path — verifies, redirects to login
 order   = 20
-config  = { session_secret = "env:EPHPM_SESSION_SECRET",
-            login_path = "/_ephpm/auth/github/login" }
+config  = { secret = "env:EPHPM_SESSION_SECRET",
+            cookie = "ephpm_session",
+            login_url = "/_ephpm/auth/github/login",
+            return_to_param = "next" }
 ```
+
+Three things must line up, and only three:
+
+| this module | `session-cookie` | note |
+|---|---|---|
+| `session_secret` | `secret` | the same HMAC key — that is what makes the token verify |
+| `cookie_name` (`ephpm_session`) | `cookie` (`ephpm_session`) | defaults already match |
+| `login_path` | `login_url` + `return_to_param = "next"` | this module reads the return-to from `?next=` and sanitizes it |
+
+`issuer` / `audience` are optional on both sides; set them on both or neither.
 
 ## What happens per request
 

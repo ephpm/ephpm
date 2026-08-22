@@ -17,7 +17,10 @@
 //! | Owns | issuing tokens | the token format and its verification |
 //! | Verdict when unhappy | `RESPOND` 302 → GitHub | `RESPOND` 302 → `login_path` |
 //!
-//! Mount them in that order and they compose into a complete gate:
+//! Mount them in that order and they compose into a complete gate. The
+//! verifier this is designed to pair with is the **`session-cookie` builtin**
+//! (ephpm#388), which performs exactly the HS256 verification this module's
+//! tokens are minted for:
 //!
 //! ```toml
 //! [[middleware]]
@@ -27,11 +30,18 @@
 //!             session_secret = "env:EPHPM_SESSION_SECRET", repo = "acme/web" }
 //!
 //! [[middleware]]
-//! library = "…the session verifier…"  # hot path: verifies, redirects to login
+//! library = "session-cookie"          # hot path: verifies, redirects to login
 //! order   = 20
-//! config  = { session_secret = "env:EPHPM_SESSION_SECRET",
-//!             login_path = "/_ephpm/auth/github/login" }
+//! config  = { secret = "env:EPHPM_SESSION_SECRET", cookie = "ephpm_session",
+//!             login_url = "/_ephpm/auth/github/login",
+//!             return_to_param = "next" }
 //! ```
+//!
+//! Exactly three things have to line up: the HMAC key
+//! (`session_secret` ↔ `secret`), the cookie name (`cookie_name` ↔ `cookie`,
+//! whose defaults already match), and the login path (`login_path` ↔
+//! `login_url`, with `return_to_param = "next"` because this module reads the
+//! return-to from `?next=`).
 //!
 //! **This module performs no signature verification of a session cookie, by
 //! design.** On a request that already carries the session cookie it returns
@@ -532,7 +542,12 @@ impl Middleware for GithubAuth {
     fn invoke(&self, req: &Request<'_>) -> Response {
         self.banner(req);
 
-        let vhost = req.vhost_id();
+        // Canonicalise ONCE, here, and use only this value below — as the
+        // `sites` key, in the `site` claim, in the state binding and in the
+        // derived `redirect_uri`. `request_vhost_id` is the raw `Host`
+        // header; see `config::normalize_vhost` for why that matters.
+        let vhost = config::normalize_vhost(req.vhost_id());
+        let vhost = vhost.as_str();
         if config::validate_vhost(vhost).is_err() {
             log(req, LOG_WARN, "github-auth: request with an unusable Host header — rejected");
             return deny(400, "Bad request.");
@@ -1057,6 +1072,33 @@ mod tests {
         assert_eq!(resp.__action(), ACTION_CONTINUE);
         assert!(resp.__headers().is_empty());
         assert!(resp.__response_headers().is_empty());
+    }
+
+    #[test]
+    fn the_host_header_is_normalised_before_it_becomes_an_identity() {
+        // `request_vhost_id` hands over the RAW `Host` header. Two spellings
+        // of one host must not produce two identities, or a session minted
+        // under one would not match the other's `site` claim — and a `sites`
+        // lookup would be bypassable by changing a letter's case.
+        let mw = gate(serde_json::json!({}));
+        let mut seen = std::collections::BTreeSet::new();
+        for host in ["pr-1.preview.test", "PR-1.Preview.TEST", "pr-1.preview.test."] {
+            let ctx = RequestCtx::new("GET", "/", "", "203.0.113.9", host, &[]);
+            // SAFETY: `ctx` outlives the borrow; `host_table()` is 'static.
+            let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
+            let resp = mw.invoke(&req);
+            assert_eq!(resp.__status(), 302);
+            let loc = header(&resp, "Location").expect("Location");
+            let redirect_uri = loc
+                .split("redirect_uri=")
+                .nth(1)
+                .and_then(|s| s.split('&').next())
+                .expect("redirect_uri")
+                .to_owned();
+            seen.insert(redirect_uri);
+        }
+        assert_eq!(seen.len(), 1, "every spelling must derive one redirect_uri: {seen:?}");
+        assert!(seen.iter().next().expect("one").contains("pr-1.preview.test"));
     }
 
     #[test]
