@@ -69,7 +69,18 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `rustls-tls-webpki-roots-no-provider`, NOT `rustls-tls`: the latter implies
+# reqwest's `__rustls-ring`, which enables `rustls/ring` and would put a second
+# crypto provider back into the graph (issue #241). The `-no-provider` variant
+# builds its `ClientConfig` from `CryptoProvider::get_default()` instead, so
+# these tests exercise the outbound TLS client on the *same* provider the
+# server uses — but they must call
+# `ephpm_server::tls::install_default_crypto_provider()` first, because reqwest
+# panics with "No provider set" if none is installed.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls-webpki-roots-no-provider",
+] }
 serde_json = "1"
 tokio = { workspace = true, features = ["macros", "rt"] }
 

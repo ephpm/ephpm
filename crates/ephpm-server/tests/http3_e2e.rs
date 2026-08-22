@@ -73,13 +73,12 @@ fn issue_certs() -> TestCa {
     }
 }
 
-/// Install the process-wide rustls provider. Both `ring` and `aws-lc-rs` are
-/// linked into this binary, so pin one rather than letting rustls guess.
+/// Install the process-wide rustls provider through the same entry point the
+/// server uses, so the QUIC client in these tests cannot end up on a
+/// different provider than the endpoint it is dialling.
 fn init_crypto() {
     static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
+    ONCE.call_once(ephpm_server::tls::install_default_crypto_provider);
 }
 
 fn test_config(document_root: &std::path::Path, max_body_size: u64) -> Config {

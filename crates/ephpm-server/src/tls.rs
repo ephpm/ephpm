@@ -62,23 +62,53 @@ pub fn build_server_config(
     Ok(config)
 }
 
-/// The rustls crypto provider this server uses.
+/// Install this process's rustls crypto provider, exactly once.
 ///
-/// **This must be named explicitly, and `ServerConfig::builder()` must never
-/// be called.** Both `ring` and `aws-lc-rs` end up compiled in: the workspace
-/// pins `rustls` to `ring`, while `rustls-acme`, `rcgen` and `hyper-rustls`
-/// (via `metrics-exporter-prometheus`) enable `aws-lc-rs`, and Cargo unions
-/// features. With both features on, rustls' `from_crate_features()` returns
-/// `None` — it does not pick one — so the bare builder panics at runtime:
+/// Call this once at startup, before anything can build a rustls config.
+/// It is idempotent and never panics: `install_default` returns `Err` when a
+/// provider is already installed, and that is a normal outcome (a test
+/// harness, an embedding host, or a second call), not a failure.
+///
+/// ePHPm's own configs do not depend on this — they name the provider
+/// explicitly through `crypto_provider()`. It exists for the *third-party*
+/// rustls users in the tree that call the bare `builder()` and therefore
+/// consult the process default: `hyper-rustls` behind
+/// `metrics-exporter-prometheus`, and `reqwest` in the integration tests.
+/// Installing deliberately means those all land on the same provider ePHPm's
+/// listeners use, instead of whichever one a crate feature happened to pick.
+pub fn install_default_crypto_provider() {
+    // `install_default` consumes a `CryptoProvider`; clone out of the shared
+    // `Arc` so the installed default and `crypto_provider()` are the same
+    // configuration.
+    let _ = crypto_provider().as_ref().clone().install_default();
+}
+
+/// The rustls crypto provider this server uses: **aws-lc-rs**.
+///
+/// The provider is named explicitly here and `ServerConfig::builder()` is
+/// never called. Why both halves of that matter:
+///
+/// rustls picks a provider from its crate features only when *exactly one*
+/// of `ring` / `aws_lc_rs` is enabled. Cargo unions features across the whole
+/// graph, so for a long time this binary had both on; in that state
+/// `from_crate_features()` returns `None` rather than choosing, and the bare
+/// builder panics at runtime:
 ///
 /// > Could not automatically determine the process-level CryptoProvider from
 /// > Rustls crate features.
 ///
-/// That is not hypothetical: it made every `[server.tls]` static-certificate
-/// startup abort with exit 101. See `tests/tls_provider_independence.rs`.
+/// That is not hypothetical — it made every `[server.tls]` static-certificate
+/// startup abort with exit 101, in every release from v0.1.0 through v0.6.1,
+/// while the ACME path kept working because `rustls-acme` names its provider.
+/// #243 fixed the call site; **#241 removed the ambiguity itself** by
+/// converging the tree on aws-lc-rs (see the `rustls` pin in the workspace
+/// `Cargo.toml` for why aws-lc-rs and not ring).
 ///
-/// `ring` is chosen to match the workspace `rustls` pin. Consolidating the
-/// stack on a single provider is tracked in issue #241.
+/// Naming the provider is kept anyway, as defence in depth: it is a one-line
+/// dependency change to re-introduce `rustls/ring`, and if that happens the
+/// explicit name is the difference between a lint-visible duplicate and a
+/// startup panic. `tests/tls_single_crypto_provider.rs` guards the feature
+/// state; `tests/tls_provider_independence.rs` guards the call sites.
 ///
 /// The `OnceLock` means every config built here shares one `Arc`, so "the
 /// whole server uses one provider" is checkable by pointer identity — which
@@ -87,7 +117,7 @@ pub fn build_server_config(
 fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     static PROVIDER: std::sync::OnceLock<Arc<rustls::crypto::CryptoProvider>> =
         std::sync::OnceLock::new();
-    Arc::clone(PROVIDER.get_or_init(|| Arc::new(rustls::crypto::ring::default_provider())))
+    Arc::clone(PROVIDER.get_or_init(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider())))
 }
 
 /// Load PEM-encoded certificates from a file.
@@ -132,14 +162,12 @@ pub(crate) mod tests_support {
 
     /// Install the process-wide rustls crypto provider exactly once.
     ///
-    /// Both `ring` and `aws-lc-rs` are compiled into this binary (the TLS pin
-    /// selects ring; `rustls-acme` pulls aws-lc-rs), so rustls refuses to pick
-    /// one implicitly in some configurations. Tests pin it explicitly and
-    /// ignore an `Err` — another test module may have won the race.
+    /// Goes through the same entry point production startup uses, so a test
+    /// can never install a *different* provider than the server would. The
+    /// `Once` is belt-and-braces: `install_default_crypto_provider` is itself
+    /// idempotent.
     pub(crate) fn init_crypto() {
-        CRYPTO_INIT.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
-        });
+        CRYPTO_INIT.call_once(super::install_default_crypto_provider);
     }
 
     /// Generate a self-signed RSA cert+key pair using rcgen.

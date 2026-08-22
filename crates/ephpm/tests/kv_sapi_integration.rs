@@ -26,8 +26,21 @@ fn wait_for_port(port: u16, timeout_secs: u64) -> bool {
     }
 }
 
+/// Install the rustls crypto provider reqwest will look for.
+///
+/// The dev-dependency uses `rustls-tls-webpki-roots-no-provider` so it cannot
+/// drag a second crypto provider into the graph (#241); the cost is that
+/// reqwest panics with "No provider set" unless a process default exists. Go
+/// through the server's own entry point rather than naming a provider here,
+/// so the test client and the server can never disagree.
+fn init_crypto() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(ephpm_server::tls::install_default_crypto_provider);
+}
+
 /// Helper to make HTTP GET request and parse JSON response.
 async fn get_json(url: &str) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    init_crypto();
     let resp = reqwest::get(url).await?;
     let status = resp.status();
     let body = resp.text().await?;
