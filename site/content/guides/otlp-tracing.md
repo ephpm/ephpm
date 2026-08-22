@@ -146,7 +146,8 @@ WARN ephpm: OTLP trace export requested ... but this binary was built without
      the `otlp` cargo feature — no spans are exported.
 ```
 
-Rebuild with `cargo build --release --features otlp`, or use a release binary.
+Rebuild with `cargo build --release -p ephpm --features otlp`, or use a
+release binary.
 
 The feature is inert until an endpoint is configured: with `otlp_endpoint`
 unset, no exporter is built and no background thread is spawned (measured —
