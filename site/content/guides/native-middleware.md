@@ -273,7 +273,7 @@ sessions for that deployment, and gets them nothing at the provider.
 | `login_url` (string) | **required** | where to send unauthenticated browsers. Must be an `https://`/`http://` URL or a same-origin absolute path; anything else (`javascript:`, `//host`) fails startup |
 | `cookie` (string) | `"ephpm_session"` | name of the cookie carrying the token |
 | `return_to_param` (string) | unset — **no return-to is sent** | query parameter on `login_url` carrying the validated return path |
-| `site_param` (string) | unset | query parameter carrying this request's vhost id, so one login service can serve many sites |
+| `site_param` (string) | unset | query parameter carrying this request's site identity, so one login service can serve many sites |
 | `issuer` (string) | unset | required `iss` claim value |
 | `audience` (string) | unset | required `aud` claim value (string or array member) |
 | `claims_header` (string) | unset | forward the verified claims JSON to PHP in this request header |
@@ -378,6 +378,14 @@ in the preview-hosting case) has to:
    decide about from the `site_param` value on the redirect. This is where
    all provider-specific work lives, and it happens **once per session**,
    not once per request.
+
+   The site identity is derived from the request's `Host` header, so it is
+   normalised (port and any trailing dot removed, lowercased) but **not
+   trusted**: ePHPm does not reject unrecognised hosts by default, so a
+   client can present one the operator never configured. The login service
+   must look the identity up in its own registry and refuse anything it does
+   not recognise — never mint a session for a site simply because a request
+   named one.
 2. **Mint an HS256 JWT** signed with the same `secret`, with an `exp` in the
    future (required) and whatever `sub`/`iss`/`aud`/custom claims the app
    needs. Keep it short-lived: this module has no revocation list, so

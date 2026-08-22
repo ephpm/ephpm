@@ -83,13 +83,14 @@ impl SessionCookie {
             url.push_str(&percent_encode(target));
             sep = '&';
         }
-        if let Some(param) = self.site_param.as_deref()
-            && !vhost.is_empty()
-        {
-            url.push(sep);
-            url.push_str(&percent_encode(param));
-            url.push('=');
-            url.push_str(&percent_encode(vhost));
+        if let Some(param) = self.site_param.as_deref() {
+            let site = normalize_vhost(vhost);
+            if !site.is_empty() {
+                url.push(sep);
+                url.push_str(&percent_encode(param));
+                url.push('=');
+                url.push_str(&percent_encode(&site));
+            }
         }
         url
     }
@@ -277,6 +278,27 @@ fn percent_encode(value: &str) -> String {
         }
     }
     out
+}
+
+/// Normalise the ABI's vhost id into a stable site identity.
+///
+/// `request_vhost_id` is the router's `SERVER_NAME`: the `Host` header with
+/// the port removed and **nothing else** — not lowercased, trailing
+/// FQDN-root dot not stripped. `Host` is case-insensitive per RFC 9110 and
+/// entirely client-controlled, so `Site.Example`, `site.example.` and
+/// `site.example` are one site sending three different strings. Emitting
+/// them raw would hand the login service three identities for one site, and
+/// any exact-match lookup it does would miss for two of them.
+///
+/// This duplicates `ephpm-server`'s `normalize_host_key`, which is
+/// `pub(crate)` and so unreachable from here; the duplication is deliberate
+/// and must stay in step with it.
+///
+/// Normalising does **not** make the value trustworthy: an unrecognised
+/// `Host` still reaches the middleware chain, so the login service must
+/// validate the identity against its own registry rather than trusting it.
+fn normalize_vhost(vhost: &str) -> String {
+    vhost.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase()
 }
 
 /// Whether a client-IP string is a loopback address.
@@ -708,6 +730,28 @@ mod tests {
         let mw = gate(serde_json::json!({ "site_param": "site" }));
         let resp = invoke(&mw, &[]);
         assert_eq!(assert_redirect(&resp), format!("{LOGIN}?site=pr-42.preview.example"));
+    }
+
+    #[test]
+    fn the_site_identity_is_normalized_before_it_is_emitted() {
+        // `request_vhost_id` is the raw `Host` minus the port: not
+        // lowercased, trailing FQDN-root dot not stripped. `Host` is
+        // case-insensitive and client-controlled, so without normalising,
+        // one site would present the login service with several identities
+        // and any exact-match lookup there would miss.
+        for raw in [
+            "PR-42.Preview.Example",
+            "pr-42.preview.example.",
+            "PR-42.PREVIEW.EXAMPLE.",
+            "pr-42.preview.example",
+        ] {
+            assert_eq!(normalize_vhost(raw), "pr-42.preview.example", "{raw}");
+        }
+        // A vhost that normalises away emits no parameter at all rather than
+        // an empty one.
+        let mw = gate(serde_json::json!({ "site_param": "site" }));
+        assert_eq!(mw.login_location(None, ""), LOGIN);
+        assert_eq!(mw.login_location(None, "."), LOGIN);
     }
 
     // ── transport ────────────────────────────────────────────────────────
