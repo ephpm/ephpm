@@ -7529,20 +7529,27 @@ opcache_revalidate_freq = 60
         assert!(at.ini_lines().contains(&("opcache.jit".to_string(), "disable".to_string())));
 
         // Explicit tracing in multi-tenant: operator's documented-cost choice —
-        // applied, but with the buffer-exhaustion warning.
+        // applied, but warned about. The tracing-JIT crash (#365) is the louder
+        // hazard and is reported first on **every** platform — a dead process
+        // beats a leaking buffer. Not platform-shaped: `jit_warning` checks the
+        // tracing hazard before the multi-tenant one with no `cfg!` involved.
         let on = PhpConfig { opcache_jit: Some(JitMode::Tracing), ..PhpConfig::default() };
         let at = on.autotune(false, true);
         assert_eq!(at.jit.value, JitMode::Tracing);
         assert_eq!(at.jit.origin, Origin::Explicit);
         assert!(at.ini_lines().contains(&("opcache.jit".to_string(), "tracing".to_string())));
         let warning = at.jit_warning().expect("explicit JIT in multi-tenant mode must warn");
-        if cfg!(windows) {
-            // On Windows the tracing-JIT crash (#365) is the louder hazard and
-            // is reported first — a dead process beats a leaking buffer.
-            assert!(warning.contains("21710"), "got: {warning}");
-        } else {
-            assert!(warning.contains("reclaim"), "got: {warning}");
-        }
+        assert!(warning.contains("21710"), "got: {warning}");
+
+        // Explicit *function* mode in multi-tenant: never builds traces, so the
+        // crash hazard does not apply and the buffer-exhaustion warning is the
+        // one that surfaces. This keeps that branch covered — it used to be
+        // reachable only through the non-Windows half of a `cfg!(windows)`.
+        let on_fn = PhpConfig { opcache_jit: Some(JitMode::Function), ..PhpConfig::default() };
+        let at = on_fn.autotune(false, true);
+        assert_eq!(at.jit.value, JitMode::Function);
+        let warning = at.jit_warning().expect("explicit JIT in multi-tenant mode must warn");
+        assert!(warning.contains("reclaim"), "got: {warning}");
 
         // Explicit function mode in worker mode: applied, no warning.
         let func = PhpConfig {
