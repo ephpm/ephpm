@@ -176,21 +176,87 @@ v1 rules worth knowing:
   the body is read (rejecting before the transfer is the point);
   the ABI's body accessor currently always returns length 0.
 
-**Coverage.** The chain runs on **PHP-dispatched requests only**, **in every
-mode**: static-file responses and router error responses (403/404) do **not**
-pass through middleware. This includes worker mode — a request for a file that
-exists on disk still takes the static branch and is never routed to the worker
-(only a missing-file fallback reaches PHP), so the chain does not see it.
+**Coverage.** The request phase runs on **both** the PHP path and the
+**static-file** path, in every mode — so a `RESPOND` verdict gates a static
+asset just as it gates a PHP request, and it does so *before the file is read
+from disk*. Only the router's own pre-routing replies (internal
+`/_ephpm/*` and `/metrics` endpoints, ACME challenges, and the
+trusted-host / hidden-file / blocked-path 4xx gates) answer ahead of the chain
+and are never seen by it.
 
-> **Security note.** A middleware mount — including the `basic-auth`,
-> `session-cookie`, and `github-auth` gates — **does not protect static files**.
-> If confidential assets live in a web-served document root (media,
-> `wp-content/uploads/*`, JS/CSS bundles and their `.map` source maps, CSV/SQL/ZIP
-> exports), they are served to unauthenticated clients regardless of any mounted
-> middleware and regardless of `[php] mode`. Do not rely on the chain to gate
-> them: keep confidential files out of the document root, or enforce the rule in
-> a proxy in front of ePHPm. (Making the chain gate the static branch is tracked
-> as a separate design decision in issue #395 and is not implemented.)
+> **Static assets are gated too.** A gating mount (`basic-auth`,
+> `session-cookie`, `github-auth`, `jwt`, …) that matches a static asset's path
+> now denies it before the bytes leave disk — scope the mount's `match` glob to
+> cover the asset paths you mean to protect (e.g. `match = "/wp-content/uploads/*"`).
+> Defense in depth still applies: keep truly confidential files out of a
+> web-served document root where practical.
+
+See **[Response phase](#response-phase-transforming-the-response)** below for
+the *second* phase, which runs after the response is generated.
+
+## Response phase (transforming the response)
+
+The verdicts above are the **request phase** — they decide what to do *before*
+a request is served. A module may also implement an optional **response
+phase** that runs *after* the response is generated (PHP output, a static
+file, an error page, or a request-phase `RESPOND`), to **transform** it:
+compression, ETag / conditional-GET, response-header injection based on the
+body. This is the mechanism that lets those features be middleware at all, and
+it is what makes them apply to **static** files, not just PHP.
+
+Key properties:
+
+- **Runs in reverse chain order** (onion model): the last request-phase module
+  unwinds first.
+- **Buffered responses only.** A streamed response (worker-mode
+  `send_response_stream`, large files streamed from disk) bypasses the response
+  phase untouched — a stream is never buffered or corrupted to transform it.
+- **Fails safe.** Unlike the request phase (which fails *closed*), a response
+  handler that errors or panics leaves the response **unchanged**. A response
+  module is a transform, **not a security gate** — do your gating in the
+  request phase.
+- **May run without a request phase.** On the static path no request phase ran
+  for this module, and an upstream `RESPOND` can short-circuit before it — so a
+  response handler must not assume state its own request phase would have set.
+- **Opt-in per module.** Only modules that export the optional
+  `ephpm_middleware_invoke_response` symbol participate; every existing v1
+  module is unaffected (see [The C ABI](#the-c-abi-for-non-rust-modules)).
+
+In Rust, implement the `ResponseMiddleware` trait *in addition* to
+`Middleware`, and opt in with `declare!(Type, response)`:
+
+```rust
+use ephpm_middleware::{Middleware, Request, Response, ResponseMiddleware, ResponseView};
+
+struct Stamp;
+
+impl Middleware for Stamp {
+    fn init(_c: &serde_json::Value) -> Result<Self, String> { Ok(Self) }
+    fn invoke(&self, _req: &Request<'_>) -> Response { Response::cont() }
+}
+
+impl ResponseMiddleware for Stamp {
+    fn invoke_response(&self, req: &Request<'_>, resp: &mut ResponseView<'_>) {
+        // Read the generated response…
+        let _status = resp.status();
+        let _ctype = resp.header("Content-Type");
+        let _body: &[u8] = resp.body();
+        // …and stage edits (applied by the host: removes, then sets, then
+        // status, then body; Content-Length is recomputed if you replace the
+        // body).
+        resp.set_header("X-Served-By", "ephpm");
+        resp.remove_header("X-Powered-By");
+        // resp.set_status(203);
+        // resp.set_body(transformed);
+    }
+}
+
+declare!(Stamp, response);   // note the extra `, response`
+```
+
+A complete, real example — a gzip response compressor that runs on static
+files too — ships as
+[`crates/ephpm-server/examples/mw_response_gzip.rs`](https://github.com/ephpm/ephpm/blob/main/crates/ephpm-server/examples/mw_response_gzip.rs).
 
 ## The built-in modules
 
@@ -355,9 +421,11 @@ impl Middleware for MyAuth {
 declare!(MyAuth);
 ```
 
-`declare!` generates the four C ABI exports, the ABI major-version check,
-config JSON parsing, response marshaling, and panic containment (a panicking
-`invoke` becomes a fail-closed 500).
+`declare!(MyAuth)` generates the four C ABI exports, the ABI major-version
+check, config JSON parsing, response marshaling, and panic containment (a
+panicking `invoke` becomes a fail-closed 500). To add the optional response
+phase, implement `ResponseMiddleware` and write `declare!(MyAuth, response)` —
+see [Response phase](#response-phase-transforming-the-response).
 
 Inside `invoke`, `req.host()` exposes host services:
 
@@ -405,11 +473,22 @@ int32_t ephpm_middleware_invoke(const ephpm_request_t* request,
                                 ephpm_response_t* response_out);
 void    ephpm_middleware_shutdown(void);
 const char* ephpm_middleware_describe(void);   /* optional, nullable */
+
+/* Optional response phase (ABI minor 1). A module that does not export it is
+   unaffected; the host skips it after generating the response. Return 0 to
+   apply the edit, non-zero to leave the response unchanged (fail-safe). */
+int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
+                                         const ephpm_response_ctx_t* response,
+                                         ephpm_response_edit_t* edit_out);
 ```
 
-- `abi_version` is `0x01_00_00_00` for v1; the **major byte** gates
-  compatibility. Modules must refuse to init (return non-zero) when the
-  host's major is newer than they were built for.
+- `abi_version` is `0x01_00_00_01` — major **1**, minor **1**. The **major
+  byte** gates compatibility; modules must refuse to init (return non-zero)
+  when the host's major is newer than they were built for. The lower three
+  bytes are an additive **minor** level: growth (new host-table fields, the
+  optional response symbol) bumps the minor and keeps the major, so existing
+  major-1 modules keep loading. A module that uses a newer field must check
+  the host's advertised minor (`host->abi_version & 0x00FFFFFF`) first.
 - `config_json` is the mount's `config` table serialised to JSON (NULL when
   the mount has no config).
 - The host callback table is passed **by pointer at `init`** and is valid
@@ -417,24 +496,30 @@ const char* ephpm_middleware_describe(void);   /* optional, nullable */
   would need `-rdynamic` on Linux and has no clean Windows analogue). It
   contains request accessors (method, path, query, remote IP, header
   lookup, vhost id), the KV operations (`kv_get`/`kv_set`/`kv_set_nx`/
-  `kv_incr`/`kv_free`) and `log`.
+  `kv_incr`/`kv_incr_ttl`/`kv_free`), `log`, and — for the response phase
+  (minor 1) — the response accessors (`response_status`/`response_headers`/
+  `response_body`).
 - The request pointer is only valid during `invoke`; never store it.
   Everything a module writes into `response_out` must stay valid until its
-  `invoke` returns — the host copies before unwinding.
+  `invoke` returns — the host copies before unwinding. The same rule applies
+  to the response phase: the `ephpm_response_ctx_t*` and everything a module
+  writes into `ephpm_response_edit_t` are valid only until
+  `ephpm_middleware_invoke_response` returns.
 - New host capabilities append to the end of the table under the same major
-  version.
+  version (bumping the minor).
 
 The authoritative definition is
 [`crates/ephpm-middleware/src/abi.rs`](https://github.com/ephpm/ephpm/blob/main/crates/ephpm-middleware/src/abi.rs).
 
 ## Observability
 
-Each module invocation increments
+Each request-phase invocation increments
 `ephpm_middleware_invocations_total{module, action}` where `action` is the
 verdict (`continue` / `respond` / `rewrite`; module errors count as
-`respond` since they fail closed as 500s). Module `log` calls surface
-through the host's `tracing` subscriber under the `ephpm_middleware`
-target.
+`respond` since they fail closed as 500s). Each response-phase invocation
+increments `ephpm_middleware_response_invocations_total{module}`. Module `log`
+calls surface through the host's `tracing` subscriber under the
+`ephpm_middleware` target.
 
 ## Trust model
 

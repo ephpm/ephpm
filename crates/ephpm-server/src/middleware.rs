@@ -16,18 +16,28 @@
 //!    stock release binaries on every platform (the Linux release is
 //!    glibc-dynamic).
 //!
-//! **Coverage:** the chain runs only for PHP-dispatched requests (inside
-//! `Router::handle_php`). Static-file responses and error responses (403/404
-//! from the router) do NOT pass through middleware, **in any mode**. This is
-//! true of worker mode too: a request for a file that exists on disk still
-//! takes the static branch and never reaches the worker (only a missing-file
-//! fallback is routed to PHP), so the chain does **not** see it. A middleware
-//! mount therefore cannot gate confidential static assets — media, JS/CSS
-//! bundles and their source maps, CSV/SQL/ZIP exports left in the document
-//! root are served without consulting the chain. To keep such files private,
-//! do not place them in a web-served document root. Making the chain gate the
-//! static branch is a separate, deliberate design decision (issue #395) and is
-//! not implemented.
+//! **Coverage (two phases):**
+//!
+//! - The **request phase** ([`MiddlewareChain::evaluate`], `CONTINUE`/
+//!   `RESPOND`/`REWRITE`) runs before a request is served. It runs on the PHP
+//!   path (inside `Router::handle_php`) **and**, as of the response-phase work
+//!   (issue #395), on the **static-file** path — before the file is read —
+//!   through `Router::static_request_phase`. A `RESPOND` there (e.g. an auth
+//!   denial) short-circuits, so a middleware mount CAN now gate confidential
+//!   static assets: the file's bytes never leave disk. It fails **closed**.
+//! - The **response phase** ([`MiddlewareChain::run_response_phase`]) runs
+//!   *after* the response is generated, in **reverse** chain order, letting
+//!   response-capable modules transform status/headers/body (compression,
+//!   ETag, header injection). It runs on PHP, static, worker-buffered, and
+//!   error responses alike, but only on **buffered** bodies — a streamed
+//!   response (worker `send_response_stream`, large files streamed from disk)
+//!   bypasses it. It fails **safe**: a broken transform leaves the response
+//!   unchanged. Only modules that export `ephpm_middleware_invoke_response`
+//!   (Rust: `declare!(Type, response)`) participate.
+//!
+//! Internal endpoints and the security gates that answer before routing
+//! (metrics/health/ACME, trusted-host/hidden-file/blocked-path 4xx) return
+//! ahead of both phases and are never seen by the chain.
 //!
 //! v1 chain semantics: `RESPOND` short-circuits the chain immediately.
 //! `REWRITE` accumulates a path override (last writer wins) and header
@@ -50,7 +60,7 @@ use anyhow::Context;
 use ephpm_config::MiddlewareMount;
 use ephpm_middleware::abi;
 use ephpm_middleware::builtin::{BuiltinModule, Verdict};
-use ephpm_middleware::host::RequestCtx;
+use ephpm_middleware::host::{RequestCtx, ResponseCtx};
 
 /// An ordered chain of loaded middleware modules.
 ///
@@ -82,11 +92,25 @@ enum Backend {
     Dynamic {
         /// Per-request entrypoint resolved from the library.
         invoke: abi::InvokeFn,
+        /// Optional response-phase entrypoint (`ephpm_middleware_invoke_response`).
+        /// `None` when the module does not export it — the host then skips this
+        /// module during the response phase (v1-module compatibility).
+        invoke_response: Option<abi::InvokeResponseFn>,
         /// Shutdown entrypoint resolved from the library.
         shutdown: abi::ShutdownFn,
         /// Keeps the library (and thus the fn pointers) alive.
         _lib: libloading::Library,
     },
+}
+
+impl Loaded {
+    /// Whether this module participates in the response phase.
+    fn has_response_phase(&self) -> bool {
+        match &self.backend {
+            Backend::Builtin(builtin) => builtin.has_response_phase(),
+            Backend::Dynamic { invoke_response, .. } => invoke_response.is_some(),
+        }
+    }
 }
 
 /// Constructor signature for a middleware compiled into this binary.
@@ -141,6 +165,20 @@ pub enum ChainVerdict {
         /// Extra response headers set by the module.
         headers: Vec<(String, String)>,
     },
+}
+
+/// Result of running the response phase over a generated response.
+pub struct ResponsePhaseOutcome {
+    /// Final HTTP status.
+    pub status: u16,
+    /// Final response headers (UTF-8-decodable set the router handed in,
+    /// after every module's edits).
+    pub headers: Vec<(String, String)>,
+    /// Final response body.
+    pub body: Vec<u8>,
+    /// Whether any module replaced the body — the router recomputes
+    /// `Content-Length` when true.
+    pub body_replaced: bool,
 }
 
 impl MiddlewareChain {
@@ -255,6 +293,66 @@ impl MiddlewareChain {
 
         ChainVerdict::Continue { rewrite_path, header_overrides, response_headers }
     }
+
+    /// Whether any loaded module participates in the response phase — the
+    /// router uses this to skip the whole response-phase machinery (including
+    /// the body collect) when no module can transform a response.
+    #[must_use]
+    pub fn has_response_phase(&self) -> bool {
+        self.modules.iter().any(Loaded::has_response_phase)
+    }
+
+    /// Run the **response phase** over an already-generated response.
+    ///
+    /// Response-capable modules whose `match` glob matches `path` run in
+    /// **reverse** chain order (onion unwind). Each transforms the response in
+    /// place — status, headers, body — via its staged edit, applied in the
+    /// order remove-headers → set-headers → status → body. A module that
+    /// replaced the body has `Content-Length` recomputed for it by the router
+    /// when the response is rebuilt.
+    ///
+    /// Unlike [`evaluate`](Self::evaluate) this runs even when no request phase
+    /// ran (the static-file path) or an upstream request-phase module
+    /// short-circuited — hence the documented contract that a response handler
+    /// must not assume paired per-request state. It fails **safe**: a module
+    /// error or panic leaves the response untouched.
+    #[must_use]
+    pub fn run_response_phase(
+        &self,
+        req_ctx: &RequestCtx,
+        path: &str,
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) -> ResponsePhaseOutcome {
+        let mut ctx = ResponseCtx::new(status, headers, body);
+        for module in self.modules.iter().rev() {
+            if !module.has_response_phase() {
+                continue;
+            }
+            if let Some(pattern) = &module.match_pattern
+                && !path_matches(pattern, path)
+            {
+                continue;
+            }
+            counter!(
+                "ephpm_middleware_response_invocations_total",
+                "module" => module.name.clone()
+            )
+            .increment(1);
+            match &module.backend {
+                Backend::Builtin(builtin) => builtin.invoke_response(req_ctx, &mut ctx),
+                Backend::Dynamic { invoke_response: Some(invoke_response), .. } => {
+                    invoke_response_dynamic(*invoke_response, req_ctx, &mut ctx, &module.name);
+                }
+                // Filtered out by `has_response_phase` above.
+                Backend::Dynamic { invoke_response: None, .. } => {}
+            }
+        }
+        let body_replaced = ctx.body_replaced();
+        let (status, headers, body) = ctx.into_parts();
+        ResponsePhaseOutcome { status, headers, body, body_replaced }
+    }
 }
 
 impl Drop for MiddlewareChain {
@@ -351,6 +449,89 @@ fn invoke_dynamic(invoke: abi::InvokeFn, ctx: &RequestCtx, name: &str) -> Verdic
             Verdict::Continue { response_headers: Vec::new() }
         }
     }
+}
+
+/// Call a dlopened module's `invoke_response`, copy its staged edit into owned
+/// host memory, and apply it to `ctx` in the canonical order (remove → set →
+/// status → body). Fails **safe**: a non-zero return leaves `ctx` untouched
+/// (a broken transform must not corrupt an already-authorized response).
+fn invoke_response_dynamic(
+    invoke_response: abi::InvokeResponseFn,
+    req_ctx: &RequestCtx,
+    ctx: &mut ResponseCtx,
+    name: &str,
+) {
+    // Zero-initialised edit: keep status, keep body, no header ops — the
+    // documented pre-call state.
+    let mut edit = abi::EphpmResponseEdit {
+        status: 0,
+        body: std::ptr::null(),
+        body_len: 0,
+        set_headers: std::ptr::null(),
+        set_headers_len: 0,
+        remove_headers: std::ptr::null(),
+        remove_headers_len: 0,
+    };
+    // SAFETY: `req_ctx.as_abi()` and `ctx.as_ptr()` are live for this call
+    // (`ctx` is only read through the const handle here — it is mutated below,
+    // strictly after the call returns), `edit` is a valid zero-initialised
+    // out-struct, and `invoke_response` points into a library kept alive by
+    // the owning `Backend::Dynamic`.
+    let rc = unsafe { invoke_response(req_ctx.as_abi(), ctx.as_ptr(), &raw mut edit) };
+    if rc != 0 {
+        tracing::warn!(
+            module = %name,
+            rc,
+            "response middleware returned an error — leaving the response unchanged"
+        );
+        return;
+    }
+
+    // Copy everything the module pointed at before it can reuse the buffers —
+    // the ABI only guarantees the edit pointers until invoke_response's caller
+    // returns, and we are still inside that window.
+    let status = (edit.status != 0).then_some(edit.status);
+    // SAFETY: a non-null `body` is valid for `body_len` bytes in this window.
+    let body = (!edit.body.is_null()).then(|| unsafe { copy_bytes(edit.body, edit.body_len) });
+    // SAFETY: `set_headers` is null or a live array of `set_headers_len` KVs.
+    let set_headers = unsafe { copy_headers(edit.set_headers, edit.set_headers_len) };
+    // SAFETY: `remove_headers` is null or a live array of `remove_headers_len`
+    // NUL-terminated name pointers.
+    let remove_headers =
+        unsafe { copy_remove_headers(edit.remove_headers, edit.remove_headers_len) };
+
+    for header in &remove_headers {
+        ctx.remove_header(header);
+    }
+    for (header, value) in &set_headers {
+        ctx.set_header(header, value);
+    }
+    if let Some(status) = status {
+        ctx.set_status(status);
+    }
+    if let Some(body) = body {
+        ctx.replace_body(body);
+    }
+}
+
+/// Copy a nullable module-owned array of NUL-terminated header-name pointers
+/// into host memory. Entries with a null pointer are skipped.
+///
+/// # Safety
+///
+/// `p` must be null or valid for reads of `len` `*const c_char` entries whose
+/// non-null members are NUL-terminated strings.
+unsafe fn copy_remove_headers(p: *const *const c_char, len: usize) -> Vec<String> {
+    if p.is_null() || len == 0 {
+        return Vec::new();
+    }
+    // SAFETY: caller contract — `(p, len)` is a live array of name pointers.
+    let names = unsafe { std::slice::from_raw_parts(p, len) };
+    names
+        .iter()
+        // SAFETY: caller contract — each non-null entry is a C string.
+        .filter_map(|&name| unsafe { copy_c_str(name) })
+        .collect()
 }
 
 /// Mounts sorted by ascending `order` (stable: equal orders keep declaration
@@ -456,6 +637,11 @@ fn load_module(mount: &MiddlewareMount, path: &Path) -> anyhow::Result<Loaded> {
     // SAFETY: as above. `describe` is optional — absence is not an error.
     let describe: Option<abi::DescribeFn> =
         unsafe { lib.get::<abi::DescribeFn>(abi::SYM_DESCRIBE) }.ok().map(|sym| *sym);
+    // SAFETY: as above. `invoke_response` is optional (minor 1) — a module
+    // that does not export it has no response phase and the host skips it
+    // there. This is the primary v1-module compatibility mechanism.
+    let invoke_response: Option<abi::InvokeResponseFn> =
+        unsafe { lib.get::<abi::InvokeResponseFn>(abi::SYM_INVOKE_RESPONSE) }.ok().map(|sym| *sym);
 
     // Serialise the mount's config table to JSON for the module's init.
     let config_json: Option<CString> = mount
@@ -509,7 +695,7 @@ fn load_module(mount: &MiddlewareMount, path: &Path) -> anyhow::Result<Loaded> {
     Ok(Loaded {
         name: mount.library.clone(),
         match_pattern: mount.match_pattern.clone(),
-        backend: Backend::Dynamic { invoke, shutdown, _lib: lib },
+        backend: Backend::Dynamic { invoke, invoke_response, shutdown, _lib: lib },
     })
 }
 
@@ -1011,5 +1197,194 @@ mod tests {
             ChainVerdict::Continue { .. } => panic!("preflight must short-circuit through dlopen"),
         }
         drop(chain);
+    }
+
+    // ── Response phase (builtin lane) ─────────────────────────────────────
+
+    use ephpm_middleware::{Middleware, Request, Response, ResponseMiddleware, ResponseView};
+
+    /// Appends its `id` to the running `X-Seq` header, so the final value
+    /// records the order the response phase visited modules in.
+    struct SeqTag {
+        id: String,
+    }
+    impl Middleware for SeqTag {
+        fn init(config: &serde_json::Value) -> Result<Self, String> {
+            Ok(Self { id: config["id"].as_str().unwrap_or("?").to_owned() })
+        }
+        fn invoke(&self, _req: &Request<'_>) -> Response {
+            Response::cont()
+        }
+    }
+    impl ResponseMiddleware for SeqTag {
+        fn invoke_response(&self, _req: &Request<'_>, resp: &mut ResponseView<'_>) {
+            let next = match resp.header("X-Seq") {
+                Some(cur) if !cur.is_empty() => format!("{cur},{}", self.id),
+                _ => self.id.clone(),
+            };
+            resp.set_header("X-Seq", next);
+        }
+    }
+
+    /// Rewrites status, body, and headers — the buffered transform surface.
+    struct Transformer;
+    impl Middleware for Transformer {
+        fn init(_config: &serde_json::Value) -> Result<Self, String> {
+            Ok(Self)
+        }
+        fn invoke(&self, _req: &Request<'_>) -> Response {
+            Response::cont()
+        }
+    }
+    impl ResponseMiddleware for Transformer {
+        fn invoke_response(&self, _req: &Request<'_>, resp: &mut ResponseView<'_>) {
+            resp.set_status(201);
+            let upper = resp.body().to_ascii_uppercase();
+            resp.set_body(upper);
+            resp.set_header("X-Transformed", "1");
+            resp.remove_header("X-Remove-Me");
+        }
+    }
+
+    /// Panics in the response phase — must be contained (fail-safe).
+    struct Panicker;
+    impl Middleware for Panicker {
+        fn init(_config: &serde_json::Value) -> Result<Self, String> {
+            Ok(Self)
+        }
+        fn invoke(&self, _req: &Request<'_>) -> Response {
+            Response::cont()
+        }
+    }
+    impl ResponseMiddleware for Panicker {
+        fn invoke_response(&self, _req: &Request<'_>, _resp: &mut ResponseView<'_>) {
+            panic!("boom in the response phase");
+        }
+    }
+
+    /// Request-phase only — no `ResponseMiddleware`, so no response phase.
+    struct RequestOnly;
+    impl Middleware for RequestOnly {
+        fn init(_config: &serde_json::Value) -> Result<Self, String> {
+            Ok(Self)
+        }
+        fn invoke(&self, _req: &Request<'_>) -> Response {
+            Response::cont()
+        }
+    }
+
+    fn loaded_response<T: ResponseMiddleware>(
+        name: &str,
+        pattern: Option<&str>,
+        config: serde_json::Value,
+    ) -> Loaded {
+        Loaded {
+            name: name.to_owned(),
+            match_pattern: pattern.map(str::to_owned),
+            backend: Backend::Builtin(BuiltinModule::init_response::<T>(&config).expect("init")),
+        }
+    }
+
+    fn loaded_request<T: Middleware>(name: &str) -> Loaded {
+        Loaded {
+            name: name.to_owned(),
+            match_pattern: None,
+            backend: Backend::Builtin(
+                BuiltinModule::init::<T>(&serde_json::Value::Null).expect("init"),
+            ),
+        }
+    }
+
+    fn resp_ctx() -> RequestCtx {
+        RequestCtx::new("GET", "/x", "", "203.0.113.9", "resp.test", &[])
+    }
+
+    #[test]
+    fn response_phase_runs_in_reverse_chain_order() {
+        // Chain order a, b -> response phase visits b then a (onion unwind).
+        let chain = MiddlewareChain {
+            modules: vec![
+                loaded_response::<SeqTag>("a", None, serde_json::json!({ "id": "a" })),
+                loaded_response::<SeqTag>("b", None, serde_json::json!({ "id": "b" })),
+            ],
+        };
+        let out = chain.run_response_phase(&resp_ctx(), "/x", 200, Vec::new(), Vec::new());
+        assert_eq!(
+            out.headers.iter().find(|(n, _)| n == "X-Seq").map(|(_, v)| v.as_str()),
+            Some("b,a"),
+            "last request-phase module (b) unwinds first"
+        );
+    }
+
+    #[test]
+    fn response_phase_transforms_status_body_and_headers() {
+        let chain = MiddlewareChain {
+            modules: vec![loaded_response::<Transformer>("t", None, serde_json::Value::Null)],
+        };
+        let headers = vec![
+            ("Content-Type".to_owned(), "text/plain".to_owned()),
+            ("X-Remove-Me".to_owned(), "gone".to_owned()),
+        ];
+        let out = chain.run_response_phase(&resp_ctx(), "/x", 200, headers, b"hello".to_vec());
+        assert_eq!(out.status, 201);
+        assert_eq!(out.body, b"HELLO");
+        assert!(out.body_replaced);
+        assert!(out.headers.iter().any(|(n, v)| n == "X-Transformed" && v == "1"));
+        assert!(!out.headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("X-Remove-Me")));
+        // Untouched headers survive.
+        assert!(out.headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("Content-Type")));
+    }
+
+    #[test]
+    fn response_phase_fails_safe_on_module_panic() {
+        let chain = MiddlewareChain {
+            modules: vec![loaded_response::<Panicker>("p", None, serde_json::Value::Null)],
+        };
+        let headers = vec![("X-Keep".to_owned(), "yes".to_owned())];
+        let out = chain.run_response_phase(&resp_ctx(), "/x", 200, headers, b"body".to_vec());
+        // A panicking transform leaves the response exactly as it was.
+        assert_eq!(out.status, 200);
+        assert_eq!(out.body, b"body");
+        assert!(!out.body_replaced);
+        assert_eq!(out.headers, vec![("X-Keep".to_owned(), "yes".to_owned())]);
+    }
+
+    #[test]
+    fn modules_without_a_response_phase_are_skipped() {
+        // A request-only module reports no response phase.
+        let request_only = MiddlewareChain { modules: vec![loaded_request::<RequestOnly>("r")] };
+        assert!(!request_only.has_response_phase());
+
+        // Mixed: the request-only module is skipped, the transformer still runs.
+        let mixed = MiddlewareChain {
+            modules: vec![
+                loaded_request::<RequestOnly>("r"),
+                loaded_response::<Transformer>("t", None, serde_json::Value::Null),
+            ],
+        };
+        assert!(mixed.has_response_phase());
+        let out = mixed.run_response_phase(&resp_ctx(), "/x", 200, Vec::new(), b"go".to_vec());
+        assert_eq!(out.body, b"GO");
+        assert!(out.body_replaced);
+    }
+
+    #[test]
+    fn response_phase_respects_the_match_glob() {
+        let chain = MiddlewareChain {
+            modules: vec![loaded_response::<Transformer>(
+                "t",
+                Some("/api/*"),
+                serde_json::Value::Null,
+            )],
+        };
+        // Off-glob: untouched.
+        let out =
+            chain.run_response_phase(&resp_ctx(), "/index.php", 200, Vec::new(), b"x".to_vec());
+        assert!(!out.body_replaced);
+        assert_eq!(out.body, b"x");
+        // On-glob: transformed.
+        let out = chain.run_response_phase(&resp_ctx(), "/api/v1", 200, Vec::new(), b"x".to_vec());
+        assert!(out.body_replaced);
+        assert_eq!(out.body, b"X");
     }
 }

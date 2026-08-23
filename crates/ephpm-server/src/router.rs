@@ -28,6 +28,17 @@ use ipnet::IpNet;
 use crate::body::{self, ServerBody};
 use crate::{metrics, static_files};
 
+/// Outcome of running the middleware **request** phase ahead of a static-file
+/// response (issue #395, security half): either short-circuit with a module
+/// response, or continue serving the file with any appended response headers.
+enum StaticGate {
+    /// A request-phase module answered (e.g. a 401/403 auth denial); serve
+    /// this instead of the file — the file is never read.
+    Respond(Response<ServerBody>),
+    /// Serve the file; append these `CONTINUE`/`REWRITE` response headers.
+    Continue(Vec<(String, String)>),
+}
+
 /// Result of resolving a request through `fallback`.
 enum Resolved {
     /// A file on disk (static or PHP).
@@ -2212,6 +2223,15 @@ impl Router {
         // `handle_php` turns into `open_basedir` — see `SiteRoots`.
         let site_root = site_roots.document_root.clone();
 
+        // Snapshot the request headers for the middleware phases before `req`
+        // is consumed downstream: the static-path request phase (issue #395,
+        // security half) and the response phase (the choke point below) both
+        // build a `RequestCtx` from this. Only taken when a chain exists.
+        let mw_req_headers: Option<Vec<(String, String)>> = self
+            .middleware_chain
+            .as_ref()
+            .map(|_| extract_headers(req.headers(), &self.ingest_strip_headers));
+
         // WebSocket upgrade. Positioned deliberately:
         //
         // * AFTER the security gates above (trusted host, malformed host,
@@ -2338,21 +2358,39 @@ impl Router {
                         (error_response(StatusCode::FORBIDDEN, "403 Forbidden"), "error")
                     }
                 } else if let Some(canonical_root) = self.contained_canonical_root(&site_roots) {
-                    (
-                        static_files::serve_file(
-                            &canonical_root,
-                            &fs_path,
-                            accepts_gzip,
-                            accepts_br,
-                            &self.cache_control,
-                            self.compression,
-                            self.etag,
-                            if_none_match.as_deref(),
-                            self.file_cache.as_deref(),
-                        )
-                        .await,
-                        "static",
-                    )
+                    // #395 (security half): run the request phase (fail-closed)
+                    // BEFORE the file is read, so an auth/gate module can deny a
+                    // static asset — the sensitive bytes never leave disk. On
+                    // the PHP path this happens inside `handle_php`; the static
+                    // path had no request phase at all before this. A REWRITE's
+                    // path/header overrides are ignored here (the file is
+                    // already resolved and no PHP runs); only RESPOND and
+                    // appended response headers apply.
+                    match self.static_request_phase(
+                        mw_req_headers.as_deref(),
+                        method,
+                        &uri_path,
+                        &query_string,
+                        effective_addr,
+                        &host,
+                    ) {
+                        StaticGate::Respond(resp) => (resp, "middleware"),
+                        StaticGate::Continue(extra_headers) => {
+                            let resp = static_files::serve_file(
+                                &canonical_root,
+                                &fs_path,
+                                accepts_gzip,
+                                accepts_br,
+                                &self.cache_control,
+                                self.compression,
+                                self.etag,
+                                if_none_match.as_deref(),
+                                self.file_cache.as_deref(),
+                            )
+                            .await;
+                            (apply_response_headers(resp, &extra_headers), "static")
+                        }
+                    }
                 } else {
                     (error_response(StatusCode::NOT_FOUND, "404 Not Found"), "error")
                 }
@@ -2398,6 +2436,28 @@ impl Router {
 
         // Apply custom response headers to all responses.
         self.apply_response_headers(&mut response);
+
+        // Response phase: let response-capable middleware transform the
+        // generated response (compression, ETag, header injection) in reverse
+        // chain order. Runs on PHP, static, worker-buffered, and error
+        // responses alike — this is what makes those transforms (and #395's
+        // transform half) apply to static files, not just PHP. Buffered
+        // responses only; a streamed body bypasses it (see the method).
+        // Applied AFTER the server's configured headers so a module can see
+        // and override them.
+        if self.middleware_chain.as_ref().is_some_and(|c| c.has_response_phase()) {
+            response = self
+                .run_response_phase(
+                    response,
+                    mw_req_headers.as_deref(),
+                    method,
+                    &uri_path,
+                    &query_string,
+                    effective_addr,
+                    &host,
+                )
+                .await;
+        }
 
         Ok((response, handler))
     }
@@ -3713,6 +3773,159 @@ impl Router {
         }
     }
 
+    /// Run the middleware **request** phase for a static-file request, before
+    /// the file is read (issue #395, security half). Fail-closed, exactly like
+    /// the PHP path's request phase: a `RESPOND` verdict (e.g. an auth denial)
+    /// short-circuits and the file is never served. A `REWRITE`'s path/header
+    /// overrides are ignored on this branch (the file is already resolved and
+    /// no PHP runs); only its appended response headers are carried through.
+    #[allow(clippy::too_many_arguments)]
+    fn static_request_phase(
+        &self,
+        req_headers: Option<&[(String, String)]>,
+        method: &str,
+        path: &str,
+        query: &str,
+        remote_addr: SocketAddr,
+        server_name: &str,
+    ) -> StaticGate {
+        let Some(chain) = self.middleware_chain.as_ref() else {
+            return StaticGate::Continue(Vec::new());
+        };
+        let ctx = ephpm_middleware::host::RequestCtx::new(
+            method,
+            path,
+            query,
+            &remote_addr.ip().to_string(),
+            server_name,
+            req_headers.unwrap_or(&[]),
+        );
+        match chain.evaluate(&ctx, path) {
+            crate::middleware::ChainVerdict::Respond { status, body, headers } => {
+                StaticGate::Respond(middleware_response(status, body, &headers))
+            }
+            crate::middleware::ChainVerdict::Continue { response_headers, .. } => {
+                StaticGate::Continue(response_headers)
+            }
+        }
+    }
+
+    /// Run the middleware **response** phase over a generated response, letting
+    /// response-capable modules transform it (compression, ETag, header
+    /// injection) in reverse chain order.
+    ///
+    /// Only **buffered** responses are transformed: a streamed body
+    /// (worker-mode `send_response_stream`, large files streamed from disk)
+    /// has no exact `size_hint` — only a fully-in-memory `Full<Bytes>` reports
+    /// one — and bypasses the phase untouched, so a stream is never buffered
+    /// or corrupted. Header values that are not valid UTF-8 are invisible to
+    /// modules and pass through unchanged. When a module replaced the body,
+    /// `Content-Length` is recomputed here.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_response_phase(
+        &self,
+        response: Response<ServerBody>,
+        req_headers: Option<&[(String, String)]>,
+        method: &str,
+        path: &str,
+        query: &str,
+        remote_addr: SocketAddr,
+        server_name: &str,
+    ) -> Response<ServerBody> {
+        use hyper::body::Body as _;
+
+        let Some(chain) = self.middleware_chain.as_ref() else {
+            return response;
+        };
+        let (mut parts, body) = response.into_parts();
+
+        // Buffered-only: a streamed body has no exact size_hint. Bypass rather
+        // than risk buffering (or corrupting) a stream.
+        if body.size_hint().exact().is_none() {
+            static STREAM_BYPASS_LOG: std::sync::Once = std::sync::Once::new();
+            STREAM_BYPASS_LOG.call_once(|| {
+                tracing::debug!(
+                    "response-phase middleware skipped for streamed responses (v1: buffered only)"
+                );
+            });
+            return Response::from_parts(parts, body);
+        }
+
+        // The body's exact size_hint guarantees it is already in memory, so
+        // this collect resolves immediately without blocking.
+        let collected = match body.collect().await {
+            Ok(buf) => buf.to_bytes(),
+            Err(err) => {
+                // Unreachable for a buffered `Full<Bytes>` (uninhabited error
+                // type); handle defensively rather than panic.
+                tracing::error!(%err, "response-phase body collect failed; returning 500");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "500 Internal Server Error",
+                );
+            }
+        };
+
+        // Split headers: UTF-8-decodable ones are visible to (and mutable by)
+        // modules; any non-decodable value passes through untouched so a rare
+        // binary header is never lost in the round-trip.
+        let mut decodable: Vec<(String, String)> = Vec::new();
+        let mut opaque: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> = Vec::new();
+        for (name, value) in &parts.headers {
+            match value.to_str() {
+                Ok(text) => decodable.push((name.as_str().to_owned(), text.to_owned())),
+                Err(_) => opaque.push((name.clone(), value.clone())),
+            }
+        }
+
+        let ctx = ephpm_middleware::host::RequestCtx::new(
+            method,
+            path,
+            query,
+            &remote_addr.ip().to_string(),
+            server_name,
+            req_headers.unwrap_or(&[]),
+        );
+        let outcome = chain.run_response_phase(
+            &ctx,
+            path,
+            parts.status.as_u16(),
+            decodable,
+            collected.to_vec(),
+        );
+
+        parts.status = StatusCode::from_u16(outcome.status).unwrap_or(parts.status);
+        parts.headers.clear();
+        for (name, value) in &outcome.headers {
+            match (
+                hyper::header::HeaderName::from_bytes(name.as_bytes()),
+                hyper::header::HeaderValue::from_str(value),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    parts.headers.append(name, value);
+                }
+                _ => tracing::warn!(
+                    header = %name,
+                    "response-phase header is not valid HTTP — skipped"
+                ),
+            }
+        }
+        for (name, value) in opaque {
+            parts.headers.append(name, value);
+        }
+        if outcome.body_replaced {
+            // The body changed — make Content-Length authoritative so a
+            // transform (compression, rewrite) can't desync framing.
+            parts.headers.remove(hyper::header::CONTENT_LENGTH);
+            if let Ok(value) = hyper::header::HeaderValue::from_str(&outcome.body.len().to_string())
+            {
+                parts.headers.insert(hyper::header::CONTENT_LENGTH, value);
+            }
+        }
+
+        Response::from_parts(parts, body::buffered(Full::new(Bytes::from(outcome.body))))
+    }
+
     /// Check if an IP address matches any trusted proxy CIDR.
     fn is_trusted_proxy(&self, ip: IpAddr) -> bool {
         self.trusted_proxies.iter().any(|net| net.contains(&ip))
@@ -4816,6 +5029,103 @@ mod tests {
             opcache: ephpm_config::OpcacheConfig::default(),
         };
         Router::new(&config, test_store(), None, None, None, None, None)
+    }
+
+    // ── Middleware response phase + static-path request phase (#395) ──────
+
+    /// Locate a built cdylib example (mirrors `tests/middleware_dlopen.rs`).
+    /// Fails loudly rather than skipping: `cargo test -p ephpm-server` builds
+    /// examples, so an absent artifact is a wiring regression.
+    fn example_lib(stem: &str) -> PathBuf {
+        let exe = std::env::current_exe().expect("test binary has a path");
+        let dir = exe
+            .parent()
+            .and_then(Path::parent)
+            .expect("test binary at <target>/<profile>/deps/<name>")
+            .join("examples");
+        let file =
+            format!("{}{stem}.{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_EXTENSION);
+        let path = dir.join(&file);
+        assert!(
+            path.is_file(),
+            "example cdylib `{file}` missing at {} — build with \
+             `cargo build -p ephpm-server --examples`",
+            path.display()
+        );
+        path
+    }
+
+    fn chain_with(mounts: Vec<MiddlewareMount>) -> Arc<crate::middleware::MiddlewareChain> {
+        Arc::new(crate::middleware::MiddlewareChain::load(&mounts).expect("chain loads"))
+    }
+
+    /// The response phase MUST run on the **static-file** path, not just PHP —
+    /// that is half of #395's value. A header-injection module mounted on a
+    /// static site stamps its header onto a served `.html` file.
+    #[tokio::test]
+    async fn response_phase_runs_on_static_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("page.html"), b"<h1>hi</h1>").unwrap();
+        let mount = MiddlewareMount {
+            library: example_lib("mw_response_header").to_string_lossy().into_owned(),
+            match_pattern: None,
+            order: 10,
+            config: Some(serde_json::json!({ "header": "X-Resp-Phase", "value": "static" })),
+        };
+        let router = test_router(dir.path()).with_middleware_chain(Some(chain_with(vec![mount])));
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req =
+            Request::builder().method("GET").uri("/page.html").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-resp-phase").and_then(|v| v.to_str().ok()),
+            Some("static"),
+            "the response phase must run on the static-file path (#395 transform half)"
+        );
+    }
+
+    /// The **request** phase (fail-closed) MUST run on the static path too, so
+    /// an auth module can deny a static asset *before the file is read* — the
+    /// security half of #395. A gated file is answered 401 and its bytes never
+    /// reach the client; an ungated sibling is served normally.
+    #[tokio::test]
+    async fn request_phase_gates_static_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("secret.txt"), b"TOPSECRET").unwrap();
+        std::fs::write(dir.path().join("public.txt"), b"public").unwrap();
+        // jwt (builtin) scoped to the secret asset; no response phase.
+        let jwt = MiddlewareMount {
+            library: "jwt".to_string(),
+            match_pattern: Some("/secret.txt".to_string()),
+            order: 10,
+            config: Some(serde_json::json!({ "secret": "s3cret" })),
+        };
+        let router = test_router(dir.path()).with_middleware_chain(Some(chain_with(vec![jwt])));
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // Gated asset, no bearer token -> denied; the file is never served.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/secret.txt")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_ne!(&body[..], b"TOPSECRET", "the gated file's bytes must never leave disk");
+
+        // Ungated sibling: served normally (glob does not match it).
+        let req = Request::builder()
+            .method("GET")
+            .uri("/public.txt")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"public");
     }
 
     // ── Ingest header hygiene (Finding 3) ────────────────────────────────

@@ -1,9 +1,15 @@
 //! Native middleware for ePHPm: the C ABI plus a safe Rust authoring kit.
 //!
-//! ePHPm runs middleware per request **before PHP dispatch** — reject,
+//! ePHPm middleware runs in two phases. The **request phase**
+//! ([`Middleware::invoke`]) runs *before* a request is served — reject,
 //! rewrite, or annotate requests at native speed, with direct access to the
-//! embedded (cluster-replicated) KV store. See `site/content/` middleware
-//! docs for the operator view.
+//! embedded (cluster-replicated) KV store; it runs on the PHP path and the
+//! static-file path, and fails closed. The optional **response phase**
+//! ([`ResponseMiddleware::invoke_response`], opted into with
+//! `declare!(Type, response)`) runs *after* the response is generated, in
+//! reverse chain order, to transform it (compression, ETag, header
+//! injection); it fails safe and is not a security gate. See `site/content/`
+//! middleware docs for the operator view.
 //!
 //! There are two execution lanes for the same [`Middleware`] trait:
 //!
@@ -51,7 +57,7 @@ pub mod host;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
-use abi::{EphpmHostV1, EphpmRequest};
+use abi::{EphpmHeaderKv, EphpmHostV1, EphpmRequest, EphpmResponseCtx};
 
 /// The trait a Rust-authored middleware implements. [`declare!`] generates
 /// the C ABI exports around it.
@@ -79,6 +85,40 @@ pub trait Middleware: Sized + Send + Sync + 'static {
     fn describe() -> &'static str {
         ""
     }
+}
+
+/// The optional **response phase** of a middleware. A module implements this
+/// *in addition* to [`Middleware`] and opts in with `declare!(Type, response)`
+/// — the plain `declare!(Type)` does not export the response symbol, so the
+/// host skips such a module during the response phase.
+///
+/// The response phase runs **after** the response is generated (PHP output,
+/// a static file, an error page, or a request-phase `RESPOND` short-circuit),
+/// in **reverse** chain order, and — unlike the request phase — it runs on
+/// **static** responses too. Its purpose is to *transform* a response:
+/// compression, ETag / conditional-GET, response-header injection.
+///
+/// Two hard contracts, both consequences of where and how it runs:
+///
+/// - **It may run without a preceding [`Middleware::invoke`].** On the static
+///   path no request phase runs at all, and an upstream request-phase
+///   `RESPOND` can short-circuit before this module's `invoke`. A response
+///   handler must therefore not assume any per-request state its own `invoke`
+///   would have set.
+/// - **It is not a security gate.** The phase fails *safe*: a panic or an
+///   error leaves the response unchanged rather than failing closed. Gate
+///   requests in [`Middleware::invoke`] (which fails closed); use this only to
+///   transform an already-authorized response.
+///
+/// The phase applies to **buffered** responses only. A streamed response
+/// (worker-mode `send_response_stream`, large files served straight from
+/// disk) bypasses it entirely in this ABI version.
+pub trait ResponseMiddleware: Middleware {
+    /// Inspect and transform the generated response via `resp`. Staged edits
+    /// (status / body / header changes) are applied by the host after this
+    /// returns, in the documented order. Must not panic (a panic is caught
+    /// and the response is left unchanged).
+    fn invoke_response(&self, req: &Request<'_>, resp: &mut ResponseView<'_>);
 }
 
 // ── Safe request view ─────────────────────────────────────────────────────
@@ -343,6 +383,139 @@ impl<'a> Host<'a> {
     }
 }
 
+// ── Response view (response phase) ────────────────────────────────────────
+
+/// The edits a [`ResponseView`] staged, drained for the host to apply:
+/// `(new status, replacement body, set-or-replace headers, remove headers)`.
+#[doc(hidden)]
+pub type StagedEdit = (Option<u16>, Option<Vec<u8>>, Vec<(String, String)>, Vec<String>);
+
+/// Mutable view of the generated response, handed to
+/// [`ResponseMiddleware::invoke_response`]. Reads reflect the response as it
+/// stands on entry (already carrying any edits from later-in-reverse modules);
+/// writes are *staged* and applied by the host after `invoke_response`
+/// returns, in the order: remove headers, set headers, status, body.
+///
+/// Valid only inside `invoke_response`. Borrowed slices returned by
+/// [`body`](Self::body) / [`headers`](Self::headers) point into host memory
+/// live only for that call — never store them.
+pub struct ResponseView<'a> {
+    ctx: *const EphpmResponseCtx,
+    host: &'a EphpmHostV1,
+    new_status: Option<u16>,
+    new_body: Option<Vec<u8>>,
+    set_headers: Vec<(String, String)>,
+    remove_headers: Vec<String>,
+}
+
+impl ResponseView<'_> {
+    /// Wrap the raw response handle + host table. Used by [`declare!`] glue
+    /// and by unit tests that drive a module directly.
+    ///
+    /// # Safety
+    ///
+    /// `ctx` must be the live response handle passed to `invoke_response` and
+    /// `host` the table given at init, both outliving the returned view. The
+    /// host must advertise minor >= [`abi::ABI_MINOR_RESPONSE_PHASE`] so the
+    /// `response_*` accessors are present.
+    #[must_use]
+    pub unsafe fn from_raw(ctx: *const EphpmResponseCtx, host: &EphpmHostV1) -> ResponseView<'_> {
+        ResponseView {
+            ctx,
+            host,
+            new_status: None,
+            new_body: None,
+            set_headers: Vec::new(),
+            remove_headers: Vec::new(),
+        }
+    }
+
+    /// Current HTTP status of the response.
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        // SAFETY: contract of `from_raw` — `ctx` is live for this call.
+        unsafe { (self.host.response_status)(self.ctx) }
+    }
+
+    /// Current response body bytes (borrowed; valid only for this call).
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        let mut ptr: *const u8 = std::ptr::null();
+        // SAFETY: contract of `from_raw`; `ptr` points at a local.
+        let len = unsafe { (self.host.response_body)(self.ctx, &raw mut ptr) };
+        if ptr.is_null() || len == 0 {
+            return &[];
+        }
+        // SAFETY: the host returned a live `(ptr, len)` byte slice valid for
+        // the duration of this call.
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    }
+
+    /// Iterate the response headers as `(name, value)` (borrowed; valid only
+    /// for this call). Duplicate headers appear as separate items.
+    #[must_use]
+    pub fn headers(&self) -> Vec<(&str, &str)> {
+        let mut ptr: *const EphpmHeaderKv = std::ptr::null();
+        // SAFETY: contract of `from_raw`; `ptr` points at a local.
+        let len = unsafe { (self.host.response_headers)(self.ctx, &raw mut ptr) };
+        if ptr.is_null() || len == 0 {
+            return Vec::new();
+        }
+        // SAFETY: the host returned a live array of `len` header KVs valid for
+        // the duration of this call.
+        let kvs = unsafe { std::slice::from_raw_parts(ptr, len) };
+        kvs.iter()
+            .filter_map(|kv| {
+                if kv.name.is_null() || kv.value.is_null() {
+                    return None;
+                }
+                // SAFETY: non-null name/value are NUL-terminated per the ABI.
+                let name = unsafe { CStr::from_ptr(kv.name) }.to_str().ok()?;
+                // SAFETY: as above.
+                let value = unsafe { CStr::from_ptr(kv.value) }.to_str().ok()?;
+                Some((name, value))
+            })
+            .collect()
+    }
+
+    /// First value of `name` (case-insensitive), if present.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<String> {
+        self.headers()
+            .into_iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.to_owned())
+    }
+
+    /// Stage a new HTTP status.
+    pub fn set_status(&mut self, status: u16) {
+        self.new_status = Some(status);
+    }
+
+    /// Stage a replacement body.
+    pub fn set_body(&mut self, body: impl Into<Vec<u8>>) {
+        self.new_body = Some(body.into());
+    }
+
+    /// Stage a header, replacing any existing occurrences (case-insensitive)
+    /// or adding it when absent.
+    pub fn set_header(&mut self, name: impl Into<String>, value: impl Into<String>) {
+        self.set_headers.push((name.into(), value.into()));
+    }
+
+    /// Stage removal of every header named `name` (case-insensitive).
+    pub fn remove_header(&mut self, name: impl Into<String>) {
+        self.remove_headers.push(name.into());
+    }
+
+    /// Internal: drain the staged edits for the [`declare!`] glue to marshal.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __into_parts(self) -> StagedEdit {
+        (self.new_status, self.new_body, self.set_headers, self.remove_headers)
+    }
+}
+
 // ── declare! ──────────────────────────────────────────────────────────────
 
 /// Generate the four C ABI exports around a [`Middleware`] implementation.
@@ -354,7 +527,17 @@ impl<'a> Host<'a> {
 /// fail-closed).
 #[macro_export]
 macro_rules! declare {
+    // Request phase only — no response symbol is exported, so the host skips
+    // this module during the response phase.
     ($ty:ty) => {
+        $crate::declare!(@inner $ty,);
+    };
+    // Request + response phase — also exports `ephpm_middleware_invoke_response`
+    // (requires `$ty: ResponseMiddleware`).
+    ($ty:ty, response) => {
+        $crate::declare!(@inner $ty, response);
+    };
+    (@inner $ty:ty, $($response:ident)?) => {
         mod __ephpm_mw_glue {
             #![allow(unsafe_code)]
             use super::*;
@@ -504,6 +687,93 @@ macro_rules! declare {
                     })
                     .as_ptr()
             }
+
+            // Optional response-phase export, emitted only for
+            // `declare!($ty, response)`. `$response` is the literal token
+            // `response`; referencing it in the doc attribute keeps the `?`
+            // repetition well-formed while gating the whole block.
+            $(
+                thread_local! {
+                    // Backing storage for the pointers handed to the host in
+                    // EphpmResponseEdit; alive until the next invoke_response
+                    // on this thread (the host applies the edit before then).
+                    static RESP_OUT: std::cell::RefCell<(
+                        Option<Vec<u8>>,
+                        Vec<CString>,
+                        Vec<abi::EphpmHeaderKv>,
+                        Vec<*const c_char>,
+                    )> = std::cell::RefCell::new((None, Vec::new(), Vec::new(), Vec::new()));
+                }
+
+                #[doc = concat!("Response phase (`", stringify!($response), "`) enabled.")]
+                #[unsafe(no_mangle)]
+                unsafe extern "C" fn ephpm_middleware_invoke_response(
+                    request: *const abi::EphpmRequest,
+                    response: *const abi::EphpmResponseCtx,
+                    edit_out: *mut abi::EphpmResponseEdit,
+                ) -> c_int {
+                    if edit_out.is_null() {
+                        return -1;
+                    }
+                    let (Some(instance), Some(host)) = (INSTANCE.get(), HOST.get()) else {
+                        return -1;
+                    };
+
+                    let parts = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        // SAFETY: `request`/`response` are live for this call;
+                        // `host` is the init-time table.
+                        let req = unsafe { $crate::Request::from_raw(request, host) };
+                        let mut view =
+                            unsafe { $crate::ResponseView::from_raw(response, host) };
+                        <$ty as $crate::ResponseMiddleware>::invoke_response(
+                            instance, &req, &mut view,
+                        );
+                        view.__into_parts()
+                    }));
+
+                    // Fail-safe: a panicking transform leaves the response
+                    // unchanged (rc != 0 => host applies no edit).
+                    let (status, body, set_headers, remove_headers) = match parts {
+                        Ok(p) => p,
+                        Err(_) => return -1,
+                    };
+
+                    RESP_OUT.with(|cell| {
+                        let mut out = cell.borrow_mut();
+                        let out = &mut *out;
+                        let ((body_ptr, body_len), set_kvs, remove_ptrs) =
+                            $crate::__marshal_edit(
+                                body,
+                                &set_headers,
+                                &remove_headers,
+                                &mut out.0,
+                                &mut out.1,
+                            );
+                        out.2 = set_kvs;
+                        out.3 = remove_ptrs;
+                        // SAFETY: edit_out is a valid, host-owned,
+                        // zero-initialised out-struct.
+                        unsafe {
+                            (*edit_out).status = status.unwrap_or(0);
+                            (*edit_out).body = body_ptr;
+                            (*edit_out).body_len = body_len;
+                            (*edit_out).set_headers = if out.2.is_empty() {
+                                std::ptr::null()
+                            } else {
+                                out.2.as_ptr()
+                            };
+                            (*edit_out).set_headers_len = out.2.len();
+                            (*edit_out).remove_headers = if out.3.is_empty() {
+                                std::ptr::null()
+                            } else {
+                                out.3.as_ptr()
+                            };
+                            (*edit_out).remove_headers_len = out.3.len();
+                        }
+                    });
+                    0
+                }
+            )?
         }
         pub use __ephpm_mw_glue::__ephpm_mw_host;
     };
@@ -602,4 +872,45 @@ fn marshal_headers(
         });
     }
     kvs
+}
+
+/// Internal marshaling helper for the [`declare!`] response-phase glue: stages
+/// the response edit into thread-local storage and returns the raw pointers
+/// for [`abi::EphpmResponseEdit`]. The body pointer is null when the module
+/// did not replace the body (`None`); a `Some(empty)` replacement yields a
+/// non-null pointer with length 0 (the host's length-0 guard never
+/// dereferences it), so "replace with empty body" is distinguishable from
+/// "keep body".
+///
+/// Every returned pointer borrows `body_buf` / `str_buf`, which the caller
+/// keeps alive in thread-local storage until the next `invoke_response` on the
+/// same thread — long enough for the host to apply the edit.
+#[doc(hidden)]
+#[must_use]
+pub fn __marshal_edit(
+    body: Option<Vec<u8>>,
+    set_headers: &[(String, String)],
+    remove_headers: &[String],
+    body_buf: &mut Option<Vec<u8>>,
+    str_buf: &mut Vec<CString>,
+) -> ((*const u8, usize), Vec<abi::EphpmHeaderKv>, Vec<*const c_char>) {
+    *body_buf = body;
+    let body_parts = match body_buf.as_ref() {
+        Some(b) => (b.as_ptr(), b.len()),
+        None => (std::ptr::null(), 0),
+    };
+
+    str_buf.clear();
+    let set_kvs = marshal_headers(set_headers, str_buf);
+
+    let mut remove_ptrs = Vec::with_capacity(remove_headers.len());
+    for name in remove_headers {
+        let Ok(n) = CString::new(name.as_str()) else {
+            continue;
+        };
+        str_buf.push(n);
+        remove_ptrs.push(str_buf[str_buf.len() - 1].as_ptr());
+    }
+
+    (body_parts, set_kvs, remove_ptrs)
 }
