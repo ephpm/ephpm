@@ -7,10 +7,12 @@ gossip clustering, and environment-based configuration.
 
 ## Container Image
 
-ePHPm ships as a single self-contained binary (glibc-dynamic on Linux). A minimal Dockerfile:
+ePHPm ships as a single self-contained binary (glibc-dynamic on Linux, glibc
+floor 2.28 — any glibc ≥ 2.28 base works; this matches the official image's
+`debian:12-slim` runtime). A minimal Dockerfile:
 
 ```dockerfile
-FROM debian:trixie-slim
+FROM debian:12-slim
 COPY ephpm /usr/local/bin/ephpm
 COPY ephpm.toml /etc/ephpm/ephpm.toml
 COPY /var/www/html /var/www/html

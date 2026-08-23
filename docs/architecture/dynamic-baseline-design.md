@@ -222,8 +222,12 @@ consecutive requests return `boot #1, request #N` with N climbing
 - SDK assets gained the `-gnu` libc suffix
   (`php-sdk-<ver>-linux-<arch>-gnu.tar.gz`); the cache dir carries the
   suffix too, so stale musl-era caches are never reused.
-- Container runtime base: `debian:13-slim` (was `debian:12-slim` in the
-  pivot draft — changed for the glibc floor, §2.1).
+- Container runtime base: `debian:12-slim` (bookworm, glibc 2.36). An
+  interim pivot draft moved this to `debian:13-slim` to clear a **2.39**
+  floor that came from building on `ubuntu:24.04`; once both build
+  environments moved to `almalinux:8` and the floor dropped to **2.28**
+  (§2.1), the runtime returned to `debian:12-slim` (its 2.36 comfortably
+  clears 2.28). Any glibc ≥ 2.28 runtime works.
 - Windows and macOS release lanes are untouched by the pivot.
 
 ## 8. Phasing / remaining work

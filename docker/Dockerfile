@@ -31,6 +31,39 @@
 # xtask::PHP_SDK_VERSIONS — keep them in sync if you bump.
 ARG PHP_SDK_VERSION=8.5.7
 
+# ── Base image digest pins ───────────────────────────────────────────────────
+#
+# Every base below is pinned to an immutable content digest (image:tag@sha256:…)
+# so a rebuild is reproducible and cannot drift when an upstream tag is
+# republished. The human-readable tag is kept alongside the digest for clarity;
+# the digest is authoritative.
+#
+# CRITICAL — these images are built on BOTH x86_64 and aarch64 (release.yml has
+# a linux-x86_64 leg and a linux-aarch64 leg; the RUN steps below `uname -m` at
+# build time). The pinned digest MUST be the multi-arch MANIFEST-LIST / OCI-INDEX
+# digest (the one that resolves per-arch), NOT a single-arch manifest digest.
+# A single-arch pin breaks the other arch's build ("no match for platform").
+#
+# To refresh a pin (upstream security update, new base, etc.):
+#
+#   docker buildx imagetools inspect docker.io/library/almalinux:8
+#
+# The FIRST "Digest:" it prints (Manifest MediaType:
+# application/vnd.oci.image.index.v1+json or …manifest.list.v2+json) is the
+# index digest to pin. Confirm its children list BOTH linux/amd64 and
+# linux/arm64 before copying it in. Without a local docker, the same digest
+# comes from the registry HEAD:
+#
+#   TOK=$(curl -s "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/almalinux:pull" | jq -r .token)
+#   curl -sI -H "Authorization: Bearer $TOK" \
+#     -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
+#     https://registry-1.docker.io/v2/library/almalinux/manifests/8 | grep -i docker-content-digest
+#
+# These pins go stale as upstreams ship security fixes; bumping them is a manual
+# step today. Dependabot (docker ecosystem) and Renovate BOTH understand the
+# `image:tag@sha256:…` form and can open automated digest-bump PRs — not wired
+# up here, but either would automate the refresh if enabled.
+
 # ── Stage 1: base — system deps + Rust toolchain ─────────────────────────────
 #
 # GLIBC FLOOR: the builder stage links the release binary, so its base sets the
@@ -44,8 +77,10 @@ ARG PHP_SDK_VERSION=8.5.7
 # Docker-format so it's pullable on the runner fleet (the manylinux OCI-index
 # format is not). gcc-toolset-13 (not 14): GCC 14 makes implicit-function-
 # declaration a hard error; 13 matches php-sdk's toolchain. Mirrors Dockerfile.gha.
-
-ARG BASE_IMAGE=docker.io/library/almalinux:8
+#
+# Pinned to the multi-arch OCI-index digest (resolves per-arch on the x64 and
+# arm64 legs). See the "Base image digest pins" block above to refresh.
+ARG BASE_IMAGE=docker.io/library/almalinux:8@sha256:4a87d2615a770506e204c27d6248ac97f4df67f4e41e2e9c47c81f0ed0be98cb
 FROM ${BASE_IMAGE} AS base
 
 # System tools needed by the ephpm Rust build (dnf / AlmaLinux 8). Stock
@@ -266,7 +301,10 @@ RUN cp $(find target -name ephpm -type f -path '*/release/*' | head -1) /ephpm &
 # requirement was an artifact of the 2.39 floor from building on ubuntu:24.04;
 # see docs/architecture/dynamic-baseline-design.md §2.1.) debian:11-slim
 # (bullseye, glibc 2.31) would also work if an even older runtime is wanted.
-FROM debian:12-slim
+#
+# Pinned to the multi-arch OCI-index digest (resolves per-arch). See the
+# "Base image digest pins" block near the top of this file to refresh.
+FROM debian:12-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     tini ca-certificates \

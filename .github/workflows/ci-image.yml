@@ -22,12 +22,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Pinned to the multi-arch OCI-index digest — resolves per-arch even
+          # on these native single-arch builds (docker picks the arch-matching
+          # child of the index), and cannot drift when almalinux:8 is
+          # republished. Keep in sync with docker/Dockerfile.gha's pinned
+          # default (its "Base image digest pins" refresh note). To bump:
+          # `docker buildx imagetools inspect docker.io/library/almalinux:8`.
           - arch: x64
             suffix: ""
-            base_image: docker.io/library/almalinux:8
+            base_image: docker.io/library/almalinux:8@sha256:4a87d2615a770506e204c27d6248ac97f4df67f4e41e2e9c47c81f0ed0be98cb
           - arch: arm64
             suffix: "-arm64"
-            base_image: docker.io/library/almalinux:8
+            base_image: docker.io/library/almalinux:8@sha256:4a87d2615a770506e204c27d6248ac97f4df67f4e41e2e9c47c81f0ed0be98cb
     steps:
       - uses: actions/checkout@v4
 

@@ -860,12 +860,12 @@ Dev suites include Zend extensions (xdebug, pcov, spx) that are statically compi
 ### Container Images
 
 ```dockerfile
-FROM debian:13-slim
+FROM debian:12-slim
 COPY ephpm /usr/local/bin/ephpm
 ENTRYPOINT ["ephpm"]
 ```
 
-Linux binaries are glibc-dynamic (so they can `dlopen` shared PHP extensions and middleware), so images use a slim glibc base (`debian:13-slim` — the binary's glibc floor is 2.39, set by the php-sdk build toolchain, so Debian 12's glibc 2.36 is too old) rather than Alpine or `FROM scratch`. Multi-arch images support both `linux/amd64` and `linux/arm64`.
+Linux binaries are glibc-dynamic (so they can `dlopen` shared PHP extensions and middleware), so images use a slim glibc base (`debian:12-slim` — the binary's glibc floor is **2.28**, set by the `almalinux:8` build toolchain both the release tarball and the Docker image link on, so Debian 12's glibc 2.36 comfortably clears it) rather than Alpine or `FROM scratch`. Any glibc ≥ 2.28 runtime works. Multi-arch images support both `linux/amd64` and `linux/arm64`.
 
 Tags follow the suite model:
 
