@@ -166,7 +166,7 @@ jobs:
           # libc suffix on Windows (php_sdk_dir_for in xtask/src/main.rs). The
           # full version must match xtask::PHP_SDK_VERSIONS["8.3"] — same
           # keep-in-sync rule as the release.yml matrix pins.
-          PHP_SDK_PATH: ${{ github.workspace }}\php-sdk\8.3.31-windows-x86_64
+          PHP_SDK_PATH: ${{ github.workspace }}\php-sdk\8.3.33-windows-x86_64
           # sqlparser (a turso dependency, in this crate's graph via litewire)
           # has deeply recursive AST types that overflow the Windows
           # toolchain's default rustc thread stack in release.yml's build
