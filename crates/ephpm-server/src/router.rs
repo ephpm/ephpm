@@ -1733,10 +1733,25 @@ impl Router {
         // If a domain suffix is configured (e.g. `.localhost`), peel it off
         // first so `blog.localhost` looks up the `blog/` directory. Falls
         // back to the literal name if the host doesn't end with the suffix.
+        //
+        // Security (issue #397): the stripped result is a fresh candidate vhost
+        // key and MUST pass `is_valid_site_key` in its own right — the check at
+        // the top of this function validated `clean`, NOT what remains after the
+        // suffix is removed. A misconfigured (dotless) `sites_domain_suffix`
+        // lets `Host: <suffix>` strip to the empty string, and `sites_dir.join("")`
+        // is `sites_dir` itself — one vhost whose document root and `open_basedir`
+        // become the entire fleet (cross-tenant read AND write). Dropping any
+        // stripped candidate that fails the allowlist closes that: the empty (or
+        // otherwise invalid) key is discarded and the request falls through to
+        // the literal `clean` lookup, then to `default_site()` — never to a
+        // `sites_dir`-rooted document root. `sites_domain_suffix` is additionally
+        // rejected at config load when it lacks a leading dot, but this is the
+        // load-bearing backstop and holds for any suffix shape.
         let stripped = self
             .sites_domain_suffix
             .as_deref()
             .and_then(|suffix| clean.strip_suffix(suffix))
+            .filter(|s| is_valid_site_key(s))
             .map(str::to_owned);
         let lookup_keys: &[&str] = match stripped.as_deref() {
             Some(s) => &[s, clean.as_str()][..],
@@ -7943,6 +7958,104 @@ echo "post response";
             );
             assert_ne!(doc_root, secret, "traversal host `{host}` escaped sites_dir");
         }
+    }
+
+    /// Issue #397 (F2, released in v0.7.3). A `sites_domain_suffix` without a
+    /// leading dot lets `Host: <suffix>` strip to the empty string; the empty
+    /// key must NOT widen the document root (and hence `open_basedir`) to the
+    /// whole `sites_dir` fleet. Before the fix `resolve_site` validated only the
+    /// pre-strip host, pushed the empty stripped key into the lookup set, and
+    /// `sites_dir.join("")` resolved to `sites_dir` itself — cross-tenant read
+    /// and write from any tenant's PHP. The stripped key is now re-validated, so
+    /// an empty (or otherwise invalid) stripped candidate is dropped and the
+    /// request falls through to `default_site()`.
+    ///
+    /// This test builds the `Router` directly with the misconfigured suffix
+    /// (bypassing `Config::validate`, which is the *second* layer of defense and
+    /// now rejects a dotless suffix at load) to prove the routing layer fails
+    /// closed on its own even if a dotless suffix were ever reached.
+    #[test]
+    fn dotless_suffix_empty_stripped_key_does_not_widen_open_basedir() {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        // Two tenants side by side under sites_dir.
+        fs::create_dir_all(sites.join("alpha")).unwrap();
+        fs::create_dir_all(sites.join("bravo")).unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                sites_dir: Some(sites.clone()),
+                // The trigger: a suffix with NO leading dot.
+                sites_domain_suffix: Some("localhost".to_string()),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
+
+        // `Host: localhost` strips to the empty key. It must resolve to the
+        // DEFAULT document root with NO tenant identity — never to `sites_dir`
+        // (which would put every tenant's container inside one `open_basedir`).
+        let resolved = router.resolve_site("localhost");
+        assert_eq!(
+            resolved.key, None,
+            "empty stripped key must name no tenant, got {:?}",
+            resolved.key
+        );
+        assert_eq!(
+            resolved.roots.document_root,
+            dir.path(),
+            "empty stripped key must fall back to the default document root"
+        );
+        assert_ne!(
+            resolved.roots.document_root, sites,
+            "empty stripped key must not resolve the whole sites_dir as one vhost's root"
+        );
+
+        // A real tenant whose bare name equals a directory still resolves via
+        // the literal (`clean`) fallback — the fix only drops the *stripped*
+        // candidate, never the literal one.
+        let alpha = router.resolve_site("alpha");
+        assert_eq!(alpha.key.as_deref(), Some("alpha"));
+        assert_eq!(alpha.roots.document_root, sites.join("alpha"));
+    }
+
+    /// The good path is untouched: a correctly *dotted* suffix still strips to a
+    /// valid key. `blog.preview.ephpm.dev` with suffix `.preview.ephpm.dev`
+    /// resolves the `blog/` container.
+    #[test]
+    fn dotted_suffix_still_strips_to_the_vhost_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        fs::create_dir_all(sites.join("blog")).unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                sites_dir: Some(sites.clone()),
+                sites_domain_suffix: Some(".preview.ephpm.dev".to_string()),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
+
+        let resolved = router.resolve_site("blog.preview.ephpm.dev");
+        assert_eq!(resolved.key.as_deref(), Some("blog"));
+        assert_eq!(resolved.roots.document_root, sites.join("blog"));
     }
 
     // ── one canonical site key: the four derivations must agree ──────
