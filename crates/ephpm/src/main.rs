@@ -128,7 +128,27 @@ enum Commands {
     },
 
     /// Install ephpm as a system service and start it
-    Install,
+    Install {
+        /// Run the service as this dedicated user instead of the elevated
+        /// installing account (root/Administrator). Implemented on Linux
+        /// (systemd `User=` plus a conservative hardening profile —
+        /// `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`,
+        /// `CAP_NET_BIND_SERVICE` so a non-root service can still bind
+        /// port 80/443, and `ReadWritePaths` for the data dir, log dir, and
+        /// document root) and macOS (launchd `UserName`). Not yet supported
+        /// on Windows — the SCM needs a stored account password ephpm has no
+        /// secure way to collect, so passing this flag there is a hard error
+        /// rather than a silent no-op. Omit for the historical default
+        /// (root, no sandboxing) — that behavior is unchanged.
+        #[arg(long)]
+        user: Option<String>,
+
+        /// Group to run the service as. Defaults to the same name as
+        /// `--user` when omitted. Ignored (with a parse error) unless
+        /// `--user` is also given.
+        #[arg(long, requires = "user")]
+        group: Option<String>,
+    },
 
     /// Uninstall the system service
     Uninstall {
@@ -324,7 +344,13 @@ fn run() -> anyhow::Result<ExitCode> {
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
             rt.block_on(run_cache(&host, port, &auth, subcommand))
         }
-        Some(Commands::Install) => run_service_cmd(service::install),
+        Some(Commands::Install { user, group }) => {
+            let owner = user.map(|user| {
+                let group = group.unwrap_or_else(|| user.clone());
+                service::ServiceOwner { user, group }
+            });
+            run_service_cmd(move || service::install(owner.as_ref()))
+        }
         Some(Commands::Uninstall { keep_data }) => {
             run_service_cmd(|| service::uninstall(keep_data))
         }
@@ -2046,7 +2072,45 @@ mod cli_tests {
     #[test]
     fn parses_install_subcommand() {
         let cli = Cli::try_parse_from(["ephpm", "install"]).unwrap();
-        assert!(matches!(cli.command, Some(Commands::Install)));
+        match cli.command {
+            Some(Commands::Install { user, group }) => {
+                assert!(user.is_none());
+                assert!(group.is_none());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_install_with_user_and_group() {
+        let cli =
+            Cli::try_parse_from(["ephpm", "install", "--user", "ephpm-web", "--group", "www"])
+                .unwrap();
+        match cli.command {
+            Some(Commands::Install { user, group }) => {
+                assert_eq!(user.as_deref(), Some("ephpm-web"));
+                assert_eq!(group.as_deref(), Some("www"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_install_with_user_only() {
+        let cli = Cli::try_parse_from(["ephpm", "install", "--user", "ephpm-web"]).unwrap();
+        match cli.command {
+            Some(Commands::Install { user, group }) => {
+                assert_eq!(user.as_deref(), Some("ephpm-web"));
+                assert!(group.is_none());
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_install_group_without_user() {
+        let err = Cli::try_parse_from(["ephpm", "install", "--group", "www"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
     }
 
     #[test]

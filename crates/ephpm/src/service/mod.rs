@@ -14,6 +14,14 @@
 //! | Windows  | `C:\Program Files\ephpm\ephpm.exe` | `C:\ProgramData\ephpm\ephpm.toml` | Windows service `ephpm` | `C:\ProgramData\ephpm\data\` | `C:\ProgramData\ephpm\logs\ephpm.log` |
 //!
 //! All lifecycle commands require elevated privileges (root / Administrator).
+//!
+//! `install` optionally takes a [`ServiceOwner`] (`ephpm install --user
+//! --group`) so the installed service runs as a dedicated non-root account
+//! instead of the elevated installer. Currently implemented on Linux
+//! (systemd `User=`/`Group=` plus a conservative hardening profile) and
+//! macOS (launchd `UserName`/`GroupName`); the Windows SCM backend rejects
+//! `Some(owner)` rather than silently ignoring it, since it has no secure way
+//! to collect and store the account password SCM requires.
 
 #![cfg_attr(unix, allow(unsafe_code))]
 #![allow(clippy::module_name_repetitions)]
@@ -251,6 +259,30 @@ fn copy_binary(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Recursively `chown` `path` to `owner.user:owner.group` by shelling out to
+/// the `chown` binary — present on every Unix ePHPm supports, and it accepts
+/// names directly so this needs no `getpwnam`/`getgrnam` FFI. Matches the
+/// existing pattern in this module of shelling out to platform CLIs
+/// (`systemctl`, `launchctl`) rather than linking their APIs directly.
+#[cfg(unix)]
+fn chown_path(path: &Path, owner: &ServiceOwner) -> Result<()> {
+    let spec = format!("{}:{}", owner.user, owner.group);
+    let out = std::process::Command::new("chown")
+        .arg("-R")
+        .arg(&spec)
+        .arg(path)
+        .output()
+        .map_err(|e| ServiceError::command("chown", e.to_string()))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(ServiceError::command(
+            format!("chown {spec} {}", path.display()),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        ))
+    }
+}
+
 /// Write the default config to `path` unless the file already exists. Returns
 /// `true` if a fresh file was written, `false` if an existing config was left
 /// untouched.
@@ -269,12 +301,18 @@ fn write_default_config(path: &Path, document_root: &Path) -> Result<bool> {
 
 /// Install the binary, write a default config, register the service, and start it.
 ///
+/// `owner` is `None` for the historical default (service runs as the elevated
+/// installing account, unit has no sandboxing) or `Some` to run the service as
+/// a dedicated non-root user/group — see [`ServiceOwner`].
+///
 /// # Errors
 ///
 /// Returns [`ServiceError::NotElevated`] if the caller lacks root /
 /// Administrator rights, or an I/O / backend error if any step (binary copy,
-/// config write, service registration, start) fails.
-pub fn install() -> Result<()> {
+/// config write, service registration, start) fails. On Windows, returns
+/// [`ServiceError::Other`] if `owner` is `Some` — the SCM backend does not
+/// yet support installing under a specific account (see `windows::register`).
+pub fn install(owner: Option<&ServiceOwner>) -> Result<()> {
     require_elevation()?;
     let paths = Paths::for_current_platform();
 
@@ -291,7 +329,22 @@ pub fn install() -> Result<()> {
         std::fs::create_dir_all(parent).map_err(|e| ServiceError::io(parent, e))?;
     }
 
-    backend::register(&paths)?;
+    // The directories above were just created by `require_elevation()`'s
+    // caller — root/Administrator — so they're root-owned. That's the
+    // "root-only assumption" `owner: Some` needs to skip: once the unit runs
+    // as a non-root `User=`, that account needs write access to the data and
+    // log directories itself (ePHPm's own tracing layer opens the log file
+    // directly, not just via systemd's `StandardOutput=append:`). Chowning
+    // is a no-op for `owner: None`, and idempotent on re-install.
+    #[cfg(unix)]
+    if let Some(owner) = owner {
+        chown_path(&paths.data_dir, owner)?;
+        if let Some(parent) = paths.log_file.parent() {
+            chown_path(parent, owner)?;
+        }
+    }
+
+    backend::register(&paths, owner)?;
     backend::start(&paths)?;
     tracing::info!("ephpm service installed and started");
     Ok(())
@@ -430,6 +483,23 @@ pub fn status() -> Result<()> {
 pub fn logs(follow: bool) -> Result<()> {
     let paths = Paths::for_current_platform();
     backend::logs(&paths, follow)
+}
+
+/// Non-root identity the installed service should run as.
+///
+/// When `install()` is called with `None`, the generated unit is byte-for-byte
+/// identical to the pre-#XXX output: no `User=`/`Group=`, no sandboxing
+/// directives, service runs as whatever account performed the (elevated)
+/// install — historically root. Passing `Some` opts into running the service
+/// as `user`/`group` plus a conservative systemd hardening profile (see
+/// `systemd::unit_body`). This is what lets a multi-tenant deployment run
+/// ePHPm under a dedicated non-root account instead of hand-rolling the unit.
+#[derive(Debug, Clone)]
+pub struct ServiceOwner {
+    /// Unix user (or Windows/macOS equivalent) the service process runs as.
+    pub user: String,
+    /// Primary group the service process runs as.
+    pub group: String,
 }
 
 /// Snapshot of service state returned by platform backends.
