@@ -1,21 +1,22 @@
 //! `cargo xtask bump-php-pin` — update or verify every PHP SDK pin site.
 //!
-//! The pinned full PHP version for a given minor lives in several places
-//! that must stay in lockstep:
+//! The pinned full PHP version for a given minor lives in a few places that
+//! must stay in lockstep:
 //!
 //! 1. `xtask/src/main.rs` — the `PHP_SDK_VERSIONS` table (source of truth)
-//! 2. `.github/workflows/release.yml` — matrix sites, one entry per minor
-//!    in each: two inline-map matrices (`build-linux`, `build-linux-arm64`)
-//!    and three `php_minor`/`php_full` include blocks (`build-macos`,
-//!    `build-windows`, `docker-image`); minors in `TAILCALL_MINORS`
-//!    additionally appear in the `build-windows-tailcall` include block
-//! 3. `docker/Dockerfile` — `ARG PHP_SDK_VERSION` default (+ its inline
+//! 2. `docker/Dockerfile` — `ARG PHP_SDK_VERSION` default (+ its inline
 //!    example), only for the default minor
-//! 4. `site/content/developer/architecture-overview.md` — the support table
+//! 3. `site/content/developer/architecture-overview.md` — the support table
 //!    listing the CI-pinned full versions
-//! 5. `.github/workflows/windows-php-check.yml` — the `PHP_SDK_PATH` cache
-//!    path for the Windows PHP-linked compile gate, only for
-//!    `WINDOWS_CHECK_MINOR`
+//!
+//! No `.github/workflows/` file is a pin site any more (issue #374).
+//! `release.yml` derives its build matrix at runtime from `PHP_SDK_VERSIONS`
+//! via `cargo xtask php-versions` (so a bump no longer rewrites five matrix
+//! sites), and `windows-php-check.yml` resolves its SDK cache path from a
+//! minor glob instead of the hardcoded full version. That is what makes a bump
+//! pushable by the default `GITHUB_TOKEN`, which the GitHub API forbids from
+//! modifying files under `.github/workflows/` — the exact coupling that used
+//! to make the automated bump PR fail at `git push` every night.
 //!
 //! A missed pin site has broken a release before, so every substitution
 //! asserts its exact expected match count and the command refuses to write
@@ -26,20 +27,6 @@ use std::fs;
 use std::process::ExitCode;
 
 use crate::{DEFAULT_PHP_MINOR, PHP_SDK_VERSIONS, workspace_root};
-
-/// Minors that also appear in release.yml's experimental
-/// `build-windows-tailcall` job (one extra `php_full:` include-block pin
-/// site each). 8.5-only today: the TAILCALL VM does not exist in 8.3/8.4.
-const TAILCALL_MINORS: &[&str] = &["8.5"];
-
-/// The PHP minor pinned by `.github/workflows/windows-php-check.yml`.
-///
-/// That workflow spells one SDK cache path out in full
-/// (`php-sdk\<full>-windows-x86_64`) instead of deriving it from
-/// `PHP_SDK_VERSIONS`, so it is a pin site for exactly this minor and drifts
-/// silently when the minor moves. Keep in sync with the `cargo xtask php-sdk
-/// <minor>` argument in that workflow.
-const WINDOWS_CHECK_MINOR: &str = "8.3";
 
 /// One exact-substring substitution in one file, with a required match count.
 struct Substitution {
@@ -58,37 +45,12 @@ struct Substitution {
 /// `--check` (counting only, replacement is a no-op).
 fn substitutions(minor: &str, old_full: &str, new_full: &str) -> Vec<Substitution> {
     let mut subs = vec![
-        // The PHP_SDK_VERSIONS table entry itself.
+        // The PHP_SDK_VERSIONS table entry itself — the source of truth.
         Substitution {
             path: "xtask/src/main.rs",
             needle: format!("(\"{minor}\", \"{old_full}\")"),
             replacement: format!("(\"{minor}\", \"{new_full}\")"),
             expected: 1,
-        },
-        // The 5 release matrix sites, matched by their structured pin keys
-        // rather than the bare quoted version so that prose (a comment or a
-        // step name that happens to mention a version) can never be counted
-        // as — or rewritten like — a pin. The count asserts still catch any
-        // structural change to the matrices (a job added or removed).
-        //
-        // Shape 1: the inline-map matrices in build-linux and build-linux-arm64:
-        //   - { minor: "8.3", full: "8.3.31" }
-        Substitution {
-            path: ".github/workflows/release.yml",
-            needle: format!("{{ minor: \"{minor}\", full: \"{old_full}\" }}"),
-            replacement: format!("{{ minor: \"{minor}\", full: \"{new_full}\" }}"),
-            expected: 2,
-        },
-        // Shape 2: the `include:` blocks in build-macos, build-windows and
-        // docker-image:
-        //   - php_minor: "8.3"
-        //     php_full: "8.3.31"
-        // TAILCALL minors also pin the build-windows-tailcall include block.
-        Substitution {
-            path: ".github/workflows/release.yml",
-            needle: format!("php_full: \"{old_full}\""),
-            replacement: format!("php_full: \"{new_full}\""),
-            expected: if TAILCALL_MINORS.contains(&minor) { 4 } else { 3 },
         },
         // The PHP support table ("Supported — in CI (pinned X.Y.Z)").
         Substitution {
@@ -98,17 +60,13 @@ fn substitutions(minor: &str, old_full: &str, new_full: &str) -> Vec<Substitutio
             expected: 1,
         },
     ];
-    // The Windows PHP-linked compile gate hardcodes one SDK cache path for
-    // WINDOWS_CHECK_MINOR. Missing this site left that job checking against a
-    // stale SDK after a bump — see the module docs on why that matters.
-    if minor == WINDOWS_CHECK_MINOR {
-        subs.push(Substitution {
-            path: ".github/workflows/windows-php-check.yml",
-            needle: format!("php-sdk\\{old_full}-windows-x86_64"),
-            replacement: format!("php-sdk\\{new_full}-windows-x86_64"),
-            expected: 1,
-        });
-    }
+    // NOTE (issue #374): `.github/workflows/release.yml` is deliberately NOT a
+    // pin site any more. Its build matrix is derived at runtime from
+    // `PHP_SDK_VERSIONS` (via `cargo xtask php-versions`), so a bump never
+    // rewrites the workflow. `windows-php-check.yml` likewise resolves its SDK
+    // path from a minor glob, not the full version. Both changes keep every
+    // remaining pin site (Rust + docs) pushable by `GITHUB_TOKEN`.
+    //
     // The Dockerfile only pins the default minor: once as the ARG default
     // and once in the comment example right above it ("e.g., v8.5.7").
     if minor == DEFAULT_PHP_MINOR {
@@ -316,70 +274,36 @@ mod tests {
     ///
     /// The bug this pins: each substitution was applied to a fresh read of the
     /// file and staged as its own write, so the last write won and the first
-    /// substitution vanished. Live effect — `bump-php-pin 8.3 8.3.33` moved
-    /// release.yml's three `php_full:` sites but silently left both
-    /// `{ minor: "8.3", full: "8.3.31" }` inline-map sites behind, so the two
-    /// Linux release legs kept building the old SDK. `--check` then failed on
-    /// the tool's own output.
+    /// substitution vanished. No real pin file carries two distinct shapes any
+    /// more (release.yml stopped being a pin site in #374), but `apply_all`'s
+    /// compose-per-file logic is still load-bearing, so this exercises it with
+    /// two synthetic substitutions targeting one file.
     #[test]
     fn apply_all_composes_substitutions_targeting_one_file() {
-        let subs = substitutions("8.3", "8.3.31", "8.3.33");
-        let release: Vec<&Substitution> =
-            subs.iter().filter(|s| s.path == ".github/workflows/release.yml").collect();
-        assert_eq!(release.len(), 2, "release.yml should carry both pin shapes");
+        let subs = vec![
+            Substitution {
+                path: "same.txt",
+                needle: "alpha-1.0".into(),
+                replacement: "alpha-2.0".into(),
+                expected: 1,
+            },
+            Substitution {
+                path: "same.txt",
+                needle: "beta-1.0".into(),
+                replacement: "beta-2.0".into(),
+                expected: 1,
+            },
+        ];
+        let file = "alpha-1.0\nbeta-1.0\n";
+        let staged = apply_all(&subs, |_| Ok(file.to_string())).expect("both sites should match");
 
-        let file = concat!(
-            "          - { minor: \"8.3\", full: \"8.3.31\" }\n",
-            "          - { minor: \"8.3\", full: \"8.3.31\" }\n",
-            "            php_full: \"8.3.31\"\n",
-            "            php_full: \"8.3.31\"\n",
-            "            php_full: \"8.3.31\"\n",
-        );
-        let staged = apply_all(&subs, |path| {
-            if path == ".github/workflows/release.yml" {
-                Ok(file.to_string())
-            } else {
-                // Every other pin site: a minimal body carrying its own needle.
-                Ok(subs
-                    .iter()
-                    .filter(|s| s.path == path)
-                    .map(|s| s.needle.repeat(s.expected))
-                    .collect::<String>())
-            }
-        })
-        .expect("all sites should match");
-
-        let (_, out) = staged
-            .iter()
-            .find(|(path, _)| *path == ".github/workflows/release.yml")
-            .expect("release.yml must be staged");
-        assert!(!out.contains("8.3.31"), "no 8.3.31 may survive, got:\n{out}");
-        assert_eq!(out.matches("{ minor: \"8.3\", full: \"8.3.33\" }").count(), 2);
-        assert_eq!(out.matches("php_full: \"8.3.33\"").count(), 3);
-        assert_eq!(
-            staged.iter().filter(|(path, _)| *path == ".github/workflows/release.yml").count(),
-            1,
-            "one file must stage exactly one write"
-        );
-    }
-
-    /// The Windows PHP-linked compile gate is a pin site for its own minor.
-    #[test]
-    fn windows_php_check_path_is_a_pin_site() {
-        let subs = substitutions(WINDOWS_CHECK_MINOR, "8.3.31", "8.3.33");
-        let sub = subs
-            .iter()
-            .find(|s| s.path == ".github/workflows/windows-php-check.yml")
-            .expect("windows-php-check.yml must be a pin site for WINDOWS_CHECK_MINOR");
-        assert_eq!(sub.needle, r"php-sdk\8.3.31-windows-x86_64");
-        assert_eq!(sub.replacement, r"php-sdk\8.3.33-windows-x86_64");
-
-        // ...and only for that minor.
-        assert!(
-            substitutions("8.5", "8.5.7", "8.5.9")
-                .iter()
-                .all(|s| s.path != ".github/workflows/windows-php-check.yml"),
-        );
+        assert_eq!(staged.len(), 1, "one file must stage exactly one write");
+        let (_, out) = &staged[0];
+        // Both substitutions survived — neither was clobbered by the other's
+        // fresh read of the original file.
+        assert!(out.contains("alpha-2.0"), "first substitution lost: {out}");
+        assert!(out.contains("beta-2.0"), "second substitution lost: {out}");
+        assert!(!out.contains("1.0"), "no old version may survive: {out}");
     }
 
     #[test]
@@ -421,73 +345,23 @@ mod tests {
         assert_eq!(apply(input, &sub).unwrap(), input);
     }
 
-    /// Mirrors the current release.yml shape: two inline-map matrices
-    /// (build-linux, build-linux-arm64) plus three `php_minor`/`php_full`
-    /// include blocks (build-macos, build-windows, docker-image), and a prose
-    /// comment that mentions a full version — which must NOT count as a pin.
+    /// Invariant for #374: no `.github/workflows/` file is a pin site for ANY
+    /// minor. That is what keeps a bump pushable by `GITHUB_TOKEN` (which may
+    /// not modify files under `.github/workflows/`). If a future change
+    /// re-introduces a workflow pin, this fails loudly.
     #[test]
-    fn release_yml_fixture_hits_all_five_matrix_sites() {
-        let fixture = r#"
-          - { minor: "8.4", full: "8.4.23" }
-          - { minor: "8.4", full: "8.4.23" }
-          - php_minor: "8.4"
-            php_full: "8.4.23"
-          # PHP SDK 8.4.23 macOS objects are built with a newer Xcode that
-          - php_minor: "8.4"
-            php_full: "8.4.23"
-          - php_minor: "8.4"
-            php_full: "8.4.23"
-            default: true
-"#;
-        let subs = substitutions("8.4", "8.4.23", "8.4.30");
-        let yml_subs: Vec<_> = subs.iter().filter(|s| s.path.ends_with("release.yml")).collect();
-        assert_eq!(yml_subs.len(), 2, "inline-map + php_full shapes");
-        let mut out = fixture.to_string();
-        for sub in yml_subs {
-            out = apply(&out, sub).unwrap();
+    fn no_workflow_file_is_a_pin_site() {
+        for (minor, full) in PHP_SDK_VERSIONS {
+            // Use a same-minor patch target so the substitution set is valid.
+            let bumped = format!("{full}9");
+            for sub in substitutions(minor, full, &bumped) {
+                assert!(
+                    !sub.path.contains(".github/workflows/"),
+                    "{minor}: {} is a workflow pin site — #374 requires none",
+                    sub.path
+                );
+            }
         }
-        assert_eq!(out.matches("\"8.4.30\"").count(), 5);
-        // The comment is prose, not a pin site — it must survive untouched
-        // and must not have been counted toward either expected total.
-        assert!(out.contains("# PHP SDK 8.4.23 macOS objects"));
-        assert!(!out.contains("\"8.4.23\""));
-    }
-
-    /// A structural change to the matrices (a job added or removed) must be
-    /// refused, not silently half-applied — the fail-safe that caught the
-    /// build-linux-arm64 job split in the first place.
-    #[test]
-    fn release_yml_shape_change_is_refused() {
-        // One extra inline-map job (3 instead of the expected 2).
-        let fixture = r#"
-          - { minor: "8.4", full: "8.4.23" }
-          - { minor: "8.4", full: "8.4.23" }
-          - { minor: "8.4", full: "8.4.23" }
-"#;
-        let subs = substitutions("8.4", "8.4.23", "8.4.30");
-        let inline = subs
-            .iter()
-            .find(|s| s.path.ends_with("release.yml") && s.needle.contains("{ minor:"))
-            .unwrap();
-        let err = apply(fixture, inline).unwrap_err();
-        assert!(err.contains("expected exactly 2"), "unexpected message: {err}");
-        assert!(err.contains("found 3"), "unexpected message: {err}");
-    }
-
-    /// TAILCALL minors carry one extra `php_full:` include-block pin site
-    /// (the build-windows-tailcall job); every other minor keeps three.
-    #[test]
-    fn tailcall_minor_expects_extra_windows_include_site() {
-        let php_full_expected = |minor: &str, full: &str| {
-            substitutions(minor, full, full)
-                .iter()
-                .find(|s| s.path.ends_with("release.yml") && s.needle.starts_with("php_full"))
-                .unwrap()
-                .expected
-        };
-        assert_eq!(php_full_expected("8.5", "8.5.7"), 4, "8.5 pins build-windows-tailcall too");
-        assert_eq!(php_full_expected("8.4", "8.4.23"), 3);
-        assert_eq!(php_full_expected("8.3", "8.3.31"), 3);
     }
 
     #[test]

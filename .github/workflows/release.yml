@@ -24,8 +24,13 @@ name: Release
 # trade-off k3s and rke2 make. The real SemVer string is preserved on each
 # image via the org.opencontainers.image.version label.
 #
-# PHP version pins must match xtask::PHP_SDK_VERSIONS -- keep the matrix
-# entries below in sync if you bump a pin.
+# PHP version pins are NOT hardcoded in this file. The `setup` job below
+# derives every build matrix at runtime from xtask::PHP_SDK_VERSIONS (via
+# `cargo xtask php-versions`), and each build job consumes it with
+# `strategy.matrix: ${{ fromJSON(needs.setup.outputs.<matrix>) }}`. So a PHP
+# bump touches only xtask/src/main.rs + docs -- never this workflow -- which is
+# what lets the automated bump PR be pushed with the default GITHUB_TOKEN
+# (forbidden by the API from modifying .github/workflows/). See issue #374.
 
 on:
   push:
@@ -83,6 +88,36 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # -- Derive the PHP build matrix from the single source of truth -------------
+  # The pinned PHP versions live ONLY in xtask/src/main.rs (PHP_SDK_VERSIONS).
+  # This job reads that table and emits the build matrices as JSON on its
+  # outputs; every downstream build job consumes one via
+  # `strategy.matrix: ${{ fromJSON(needs.setup.outputs.<matrix>) }}`. Keeping
+  # the pins out of this workflow file is what makes a bump pushable by
+  # GITHUB_TOKEN (issue #374) -- see the header comment above.
+  #
+  # Runs for BOTH a tag push and the workflow_dispatch republish path, because
+  # docker-image (which runs on dispatch too) needs docker_matrix either way.
+  setup:
+    name: Derive PHP matrix
+    runs-on: [self-hosted, linux, x64]
+    container: "ephpm/ephpm-ci:latest"
+    outputs:
+      # JSON arrays of {minor, full} (php/tailcall) and {minor, full, default}
+      # (docker). See `cargo xtask php-versions --github-matrix`.
+      php_matrix: ${{ steps.matrix.outputs.php_matrix }}
+      tailcall_matrix: ${{ steps.matrix.outputs.tailcall_matrix }}
+      docker_matrix: ${{ steps.matrix.outputs.docker_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Emit PHP build matrix from xtask PHP_SDK_VERSIONS
+        id: matrix
+        # xtask prints three `key=value` lines (each value a single-line JSON
+        # array) straight into $GITHUB_OUTPUT. cargo's own progress goes to
+        # stderr, so stdout carries only those lines.
+        run: cargo run --quiet -p xtask -- php-versions --github-matrix >> "$GITHUB_OUTPUT"
+
   # -- Linux x86_64 binaries ---------------------------------------------------
   # arm64 lives in its own job (build-linux-arm64) so it can be throttled
   # independently: the v0.5.1 release run proved that firing every leg at
@@ -94,15 +129,14 @@ jobs:
     # Binary legs run only for a real tag push; the workflow_dispatch
     # republish path reuses the archives from the original run.
     if: github.event_name == 'push'
+    needs: setup
     runs-on: [self-hosted, linux, x64]
     container: "ephpm/ephpm-ci:${{ matrix.arch.image }}"
     strategy:
       fail-fast: false
       matrix:
-        php:
-          - { minor: "8.3", full: "8.3.33" }
-          - { minor: "8.4", full: "8.4.23" }
-          - { minor: "8.5", full: "8.5.7" }
+        # {minor, full} per supported PHP minor, from xtask::PHP_SDK_VERSIONS.
+        php: ${{ fromJSON(needs.setup.outputs.php_matrix) }}
         arch:
           - runner: x64
             image: latest
@@ -168,7 +202,7 @@ jobs:
     # keeps the VM to one heavy link at a time. Without both, the v0.5.1
     # release run put 6 concurrent release builds on that one host and every
     # runner on it died mid-build.
-    needs: build-macos
+    needs: [build-macos, setup]
     if: github.event_name == 'push'
     runs-on: [self-hosted, linux, arm64]
     container: "ephpm/ephpm-ci:latest-arm64"
@@ -176,10 +210,8 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        php:
-          - { minor: "8.3", full: "8.3.33" }
-          - { minor: "8.4", full: "8.4.23" }
-          - { minor: "8.5", full: "8.5.7" }
+        # {minor, full} per supported PHP minor, from xtask::PHP_SDK_VERSIONS.
+        php: ${{ fromJSON(needs.setup.outputs.php_matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -232,8 +264,9 @@ jobs:
 
   # -- macOS binaries ---------------------------------------------------------
   build-macos:
-    name: Build (PHP ${{ matrix.php_full }}, macos-aarch64)
+    name: Build (PHP ${{ matrix.php.full }}, macos-aarch64)
     if: github.event_name == 'push'
+    needs: setup
     runs-on: [self-hosted, macos, arm64]
     strategy:
       fail-fast: false
@@ -242,13 +275,8 @@ jobs:
       # to 2 only after a release proves real headroom.
       max-parallel: 1
       matrix:
-        include:
-          - php_minor: "8.3"
-            php_full: "8.3.33"
-          - php_minor: "8.4"
-            php_full: "8.4.23"
-          - php_minor: "8.5"
-            php_full: "8.5.7"
+        # {minor, full} per supported PHP minor, from xtask::PHP_SDK_VERSIONS.
+        php: ${{ fromJSON(needs.setup.outputs.php_matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -285,13 +313,13 @@ jobs:
           # dropped support for anything older) resolves it and matches the
           # SDK's build environment. 8.3/8.4 SDKs also link cleanly at 12.0.
           MACOSX_DEPLOYMENT_TARGET: "12.0"
-        run: cargo xtask release ${{ matrix.php_minor }}
+        run: cargo xtask release ${{ matrix.php.minor }}
 
       - name: Package archive
         id: pkg
         env:
           VERSION: ${{ github.ref_name }}
-          PHP_FULL: ${{ matrix.php_full }}
+          PHP_FULL: ${{ matrix.php.full }}
         run: |
           set -eu
           name="ephpm-${VERSION}+php${PHP_FULL}-macos-aarch64"
@@ -307,13 +335,14 @@ jobs:
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
-          name: ephpm-${{ github.ref_name }}-php${{ matrix.php_full }}-macos-aarch64
+          name: ephpm-${{ github.ref_name }}-php${{ matrix.php.full }}-macos-aarch64
           path: ${{ steps.pkg.outputs.archive }}
 
   # -- Windows binaries (native on self-hosted Windows runner) --------------
   build-windows:
-    name: Build (PHP ${{ matrix.php_full }}, windows-x86_64)
+    name: Build (PHP ${{ matrix.php.full }}, windows-x86_64)
     if: github.event_name == 'push'
+    needs: setup
     runs-on: [self-hosted, windows, x64]
     strategy:
       fail-fast: false
@@ -322,13 +351,8 @@ jobs:
       # vanished under the runner). Loosen only with proven headroom.
       max-parallel: 1
       matrix:
-        include:
-          - php_minor: "8.3"
-            php_full: "8.3.33"
-          - php_minor: "8.4"
-            php_full: "8.4.23"
-          - php_minor: "8.5"
-            php_full: "8.5.7"
+        # {minor, full} per supported PHP minor, from xtask::PHP_SDK_VERSIONS.
+        php: ${{ fromJSON(needs.setup.outputs.php_matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -434,14 +458,14 @@ jobs:
           # made heavier by codegen-units=1 + opt-level=3. 32 MiB clears it.
           # linux-aarch64 compiles sqlparser fine, so this is windows-only.
           RUST_MIN_STACK: "33554432"
-        run: cargo xtask release ${{ matrix.php_minor }} --target windows
+        run: cargo xtask release ${{ matrix.php.minor }} --target windows
 
       - name: Package archive
         id: pkg
         shell: powershell
         env:
           VERSION: ${{ github.ref_name }}
-          PHP_FULL: ${{ matrix.php_full }}
+          PHP_FULL: ${{ matrix.php.full }}
         run: |
           $name = "ephpm-$env:VERSION+php$env:PHP_FULL-windows-x86_64"
           $stage = "dist\$name"
@@ -458,7 +482,7 @@ jobs:
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
-          name: ephpm-${{ github.ref_name }}-php${{ matrix.php_full }}-windows-x86_64
+          name: ephpm-${{ github.ref_name }}-php${{ matrix.php.full }}-windows-x86_64
           path: ${{ steps.pkg.outputs.archive }}
 
   # -- Windows TAILCALL binary (EXPERIMENTAL, NON-GATING) ---------------------
@@ -482,13 +506,14 @@ jobs:
   # If the -clang SDK asset is missing from the php-sdk release, or anything
   # else fails, the leg goes red and nothing downstream notices.
   build-windows-tailcall:
-    name: Build (PHP ${{ matrix.php_full }}, windows-x86_64, TAILCALL)
+    name: Build (PHP ${{ matrix.php.full }}, windows-x86_64, TAILCALL)
     if: github.event_name == 'push'
     # Serialized behind the MSVC Windows legs: one release build per Windows
     # worker at a time (the v0.5.1 run's concurrent legs took the pool down).
     # Side effect: if build-windows fails this leg is skipped -- fine, the
-    # release is not publishing in that case anyway.
-    needs: build-windows
+    # release is not publishing in that case anyway. `setup` supplies the
+    # tailcall_matrix (the TAILCALL-capable minors -- 8.5-only today).
+    needs: [build-windows, setup]
     runs-on: [self-hosted, windows, x64]
     continue-on-error: true
     # VS Build Tools install (~20 min on a cold ephemerd VM) + a full
@@ -500,10 +525,10 @@ jobs:
       # For the best-effort late attach of the tarball to the GitHub release.
       contents: write
     strategy:
+      # {minor, full} for the TAILCALL-capable minors, from
+      # xtask::PHP_SDK_VERSIONS filtered by xtask::TAILCALL_MINORS (8.5 today).
       matrix:
-        include:
-          - php_minor: "8.5"
-            php_full: "8.5.7"
+        php: ${{ fromJSON(needs.setup.outputs.tailcall_matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -601,12 +626,12 @@ jobs:
         # zend_vm_kind() out of php8embed.lib and requires mov eax,5
         # (ZEND_VM_KIND_TAILCALL) before linking. A mislabeled CALL-VM SDK
         # fails the build here rather than shipping under a -tailcall name.
-        run: cargo xtask release ${{ matrix.php_minor }} --target windows --variant clang
+        run: cargo xtask release ${{ matrix.php.minor }} --target windows --variant clang
 
       - name: Assert the produced binary is the TAILCALL build
         shell: powershell
         env:
-          PHP_FULL: ${{ matrix.php_full }}
+          PHP_FULL: ${{ matrix.php.full }}
         # Belt over the xtask gate's suspenders, this time on the built exe:
         # the embedded PHP must report the exact pinned version + ZTS, and the
         # clang SDK cache dir must be the one the build populated. (The VM
@@ -632,7 +657,7 @@ jobs:
         shell: powershell
         env:
           VERSION: ${{ github.ref_name }}
-          PHP_FULL: ${{ matrix.php_full }}
+          PHP_FULL: ${{ matrix.php.full }}
         # The artifact name says what the binary IS (-tailcall: the TAILCALL
         # VM), not how it is built (clang) -- consumers care about the former.
         run: |
@@ -650,7 +675,7 @@ jobs:
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
-          name: ephpm-${{ github.ref_name }}-php${{ matrix.php_full }}-windows-x86_64-tailcall
+          name: ephpm-${{ github.ref_name }}-php${{ matrix.php.full }}-windows-x86_64-tailcall
           path: ${{ steps.pkg.outputs.archive }}
 
       - name: Attach to the GitHub release if it already exists (best effort)
@@ -710,22 +735,18 @@ jobs:
 
   # -- Docker images on Docker Hub --------------------------------------------
   docker-image:
-    name: Docker (PHP ${{ matrix.php_full }})
+    name: Docker (PHP ${{ matrix.php.full }})
+    needs: setup
     runs-on: [self-hosted, linux, x64]
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - php_minor: "8.3"
-            php_full: "8.3.33"
-          - php_minor: "8.4"
-            php_full: "8.4.23"
-            default: false
-          - php_minor: "8.5"
-            php_full: "8.5.7"
-            default: true
+        # {minor, full, default} per supported PHP minor, from
+        # xtask::PHP_SDK_VERSIONS. `default` is true for exactly the default
+        # minor (xtask::DEFAULT_PHP_MINOR) and drives the rolling :latest tags.
+        php: ${{ fromJSON(needs.setup.outputs.docker_matrix) }}
     steps:
       # On a tag push this is the tag; on a workflow_dispatch republish it is
       # the tag named in the input (the run itself is dispatched from main, so
@@ -768,9 +789,9 @@ jobs:
         id: tags
         env:
           VERSION: ${{ github.event.inputs.tag || github.ref_name }}
-          PHP_MINOR: ${{ matrix.php_minor }}
-          PHP_FULL: ${{ matrix.php_full }}
-          IS_DEFAULT: ${{ matrix.default }}
+          PHP_MINOR: ${{ matrix.php.minor }}
+          PHP_FULL: ${{ matrix.php.full }}
+          IS_DEFAULT: ${{ matrix.php.default }}
         run: |
           set -eu
           # Strip leading "v" so EPHPM_RELEASE_VERSION matches clap formatting
@@ -814,7 +835,7 @@ jobs:
       - name: Build and push image
         env:
           TAGS: ${{ steps.tags.outputs.tags }}
-          PHP_FULL: ${{ matrix.php_full }}
+          PHP_FULL: ${{ matrix.php.full }}
           RELEASE_VERSION: ${{ steps.tags.outputs.release_version }}
           SEMVER: ${{ steps.tags.outputs.semver }}
           SOURCE_URL: ${{ github.server_url }}/${{ github.repository }}
