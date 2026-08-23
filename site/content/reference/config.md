@@ -125,9 +125,28 @@ ini_overrides = [
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `request_log` | bool | (mode default) | Per-request timeline: the last 256 completed requests (method, path, status, total/queue-wait/PHP durations in ms, response bytes, timestamp) served as JSON at `GET /_ephpm/requests`, newest first. Unset resolves per mode: **on** under `ephpm dev` / bare `ephpm`, **off** under `ephpm serve`. `queue_wait_ms` is `null` outside worker mode (there is no dispatch queue on the fpm path); in worker mode `php_ms` includes the queue wait, matching `ephpm_php_execution_duration_seconds`. Requests to `/_ephpm/*` and the metrics path are not recorded. When off, `/_ephpm/requests` is not registered and the path falls through to normal routing. Env override: `EPHPM_SERVER__DIAGNOSTICS__REQUEST_LOG`. |
-| `otlp_endpoint` | string | (none) | OTLP trace-export endpoint, e.g. `"http://127.0.0.1:4318"` (OTLP **http/protobuf**; `/v1/traces` is appended when missing). Exports one `http.request` span per request (attrs: method, path, status) with `worker.queue_wait` and `php.execute` children, and honors an incoming W3C `traceparent` header. Requires a binary built with the `otlp` cargo feature. **Official release binaries and the Docker image have it** (`cargo xtask release` builds with it); a plain `cargo build` does not, and there a set value only logs a startup warning. The standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT` env vars take precedence over this knob, and `OTEL_SERVICE_NAME` overrides the default service name `ephpm`. Unset (and no env vars): no exporter is built and no background export thread runs (verified — thread count is identical to a binary without the feature). Both `http://` and `https://` endpoints are supported — see the note below. |
+| `otlp_endpoint` | string | (none) | OTLP trace-export endpoint, e.g. `"http://127.0.0.1:4318"`. The transport is chosen by `OTEL_EXPORTER_OTLP_PROTOCOL` — **http/protobuf** by default (`/v1/traces` appended when missing, conventional port 4318) or **grpc** (used as-is, no path appended, conventional port 4317). Exports one `http.request` span per request (attrs: method, path, status) with `worker.queue_wait` and `php.execute` children, and honors an incoming W3C `traceparent` header. Requires a binary built with the `otlp` cargo feature. **Official release binaries and the Docker image have it** (`cargo xtask release` builds with it); a plain `cargo build` does not, and there a set value only logs a startup warning. The standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT` env vars take precedence over this knob, and `OTEL_SERVICE_NAME` overrides the default service name `ephpm`. Unset (and no env vars): no exporter is built and no background export thread runs (verified — thread count is identical to a binary without the feature). Both `http://` and `https://` endpoints are supported on both transports — see the notes below. |
+| `otlp_protocol` | string | (none → `http/protobuf`) | OTLP wire protocol for `otlp_endpoint`: `"grpc"` or `"http/protobuf"`. `"http/json"` is rejected at startup. The standard `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` / `OTEL_EXPORTER_OTLP_PROTOCOL` env vars take precedence over this knob. Setting it without an endpoint logs a startup warning and does nothing. Env override: `EPHPM_SERVER__DIAGNOSTICS__OTLP_PROTOCOL`. |
 
-**OTLP over HTTPS.** An `https://` endpoint works with no extra configuration.
+**OTLP transport selection.** `OTEL_EXPORTER_OTLP_PROTOCOL` (or
+`OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, which wins for traces) selects the wire
+protocol: `http/protobuf` (the default, and what every release before this one
+used) or `grpc`. `http/json` is rejected at startup rather than silently
+falling back. Both transports are compiled into the same binary — there is no
+rebuild and no separate cargo feature. The endpoint's path handling differs:
+http/protobuf gets `/v1/traces` appended when missing, gRPC uses the value
+as-is. When the configured endpoint uses the *other* transport's conventional
+port (4317 vs 4318) ePHPm logs a WARN naming both, since that mix-up otherwise
+presents as silence; it is a warning rather than an error because running
+either transport on any port is legal.
+
+**OTLP export failures are logged**, once per failed batch, on the
+`opentelemetry_sdk` target (`name="BatchSpanProcessor.ExportError"`). Serving
+is never affected by a failing exporter. A `[server.logging] level` or
+`RUST_LOG` filter that excludes that target will hide them.
+
+**OTLP over HTTPS.** An `https://` endpoint works with no extra configuration,
+on either transport.
 TLS is rustls (the same crypto provider the HTTPS listener uses — never
 OpenSSL or a second TLS stack), and the exporter trusts the **union of the
 operating system's trust store and the bundled Mozilla root set**. The OS

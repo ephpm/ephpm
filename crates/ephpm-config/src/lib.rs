@@ -964,6 +964,31 @@ pub struct DiagnosticsConfig {
     /// Default: unset (no trace export).
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
+
+    /// OTLP wire protocol for [`Self::otlp_endpoint`]: `"grpc"` or
+    /// `"http/protobuf"`.
+    ///
+    /// The two differ in more than encoding, so this must match what the
+    /// collector expects: `http/protobuf` takes a *signal* URL and gets
+    /// `/v1/traces` appended when missing (conventional port 4318), while
+    /// `grpc` takes a *base* URL used verbatim (conventional port 4317).
+    /// Pointing one at the other's port is the usual cause of "no traces
+    /// arrive"; ePHPm logs a startup warning when it detects that.
+    ///
+    /// `"http/json"` is a real OTLP protocol that ePHPm does **not**
+    /// implement, and is rejected at startup rather than silently falling
+    /// back to another one.
+    ///
+    /// The standard `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` /
+    /// `OTEL_EXPORTER_OTLP_PROTOCOL` environment variables take precedence
+    /// over this knob, mirroring how the endpoint variables behave.
+    ///
+    /// Env override: `EPHPM_SERVER__DIAGNOSTICS__OTLP_PROTOCOL`.
+    ///
+    /// Default: unset, meaning `http/protobuf` — the OTel default, and what
+    /// ePHPm used before gRPC was supported.
+    #[serde(default)]
+    pub otlp_protocol: Option<String>,
 }
 
 impl DiagnosticsConfig {
@@ -5468,6 +5493,7 @@ idle_timeout_secs = 15
         let config = Config::load(&file).unwrap();
         assert_eq!(config.server.diagnostics.request_log, None);
         assert_eq!(config.server.diagnostics.otlp_endpoint, None);
+        assert_eq!(config.server.diagnostics.otlp_protocol, None);
         assert!(
             config.server.diagnostics.effective_request_log(true),
             "unset request_log must resolve ON in dev mode"
@@ -5481,6 +5507,7 @@ idle_timeout_secs = 15
         let direct = ServerConfig::default();
         assert_eq!(direct.diagnostics.request_log, None);
         assert_eq!(direct.diagnostics.otlp_endpoint, None);
+        assert_eq!(direct.diagnostics.otlp_protocol, None);
     }
 
     /// An explicit value wins over the mode default in both directions.
@@ -5505,7 +5532,8 @@ idle_timeout_secs = 15
         let file = dir.path().join("ephpm.toml");
         std::fs::write(
             &file,
-            "[server.diagnostics]\nrequest_log = true\notlp_endpoint = \"http://127.0.0.1:4318\"\n",
+            "[server.diagnostics]\nrequest_log = true\notlp_endpoint = \"http://127.0.0.1:4318\"\n\
+             otlp_protocol = \"grpc\"\n",
         )
         .unwrap();
 
@@ -5515,6 +5543,18 @@ idle_timeout_secs = 15
             config.server.diagnostics.otlp_endpoint.as_deref(),
             Some("http://127.0.0.1:4318")
         );
+        assert_eq!(config.server.diagnostics.otlp_protocol.as_deref(), Some("grpc"));
+    }
+
+    #[test]
+    fn test_env_var_overrides_diagnostics_otlp_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server.diagnostics]\notlp_protocol = \"http/protobuf\"\n").unwrap();
+
+        let _env = EnvVars::set("EPHPM_SERVER__DIAGNOSTICS__OTLP_PROTOCOL", "grpc");
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.diagnostics.otlp_protocol.as_deref(), Some("grpc"));
     }
 
     #[test]

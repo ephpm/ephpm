@@ -1002,8 +1002,11 @@ fn run_with_config(
     // export layer joins the same registry; when nothing requests it, no
     // exporter is built and no background thread is spawned.
     #[cfg(feature = "otlp")]
-    let otlp = ephpm_server::otlp::init_layer(config.server.diagnostics.otlp_endpoint.as_deref())
-        .context("failed to initialize OTLP trace export")?;
+    let otlp = ephpm_server::otlp::init_layer(
+        config.server.diagnostics.otlp_endpoint.as_deref(),
+        config.server.diagnostics.otlp_protocol.as_deref(),
+    )
+    .context("failed to initialize OTLP trace export")?;
 
     // Layer stack. The env filter must be scoped to the fmt layer with
     // `with_filter`, never pushed into the Vec as a sibling layer: `Vec`'s
@@ -1040,16 +1043,37 @@ fn run_with_config(
     // The guard flushes the exporter's batch queue on drop — hold it until
     // the server has exited.
     #[cfg(feature = "otlp")]
-    let _otlp_guard = otlp.map(|(otlp_layer, guard, description)| {
+    let _otlp_guard = otlp.map(|(otlp_layer, guard, info)| {
         layers.push(otlp_layer.boxed());
-        (guard, description)
+        (guard, info)
     });
 
     tracing_subscriber::registry().with(layers).init();
 
     #[cfg(feature = "otlp")]
-    if let Some((_, ref description)) = _otlp_guard {
-        tracing::info!(endpoint = %description, "OTLP trace export enabled (http/protobuf)");
+    if let Some((_, ref info)) = _otlp_guard {
+        tracing::info!(
+            endpoint = %info.description,
+            protocol = info.protocol,
+            "OTLP trace export enabled"
+        );
+        // Legal-but-probably-wrong configuration (e.g. the other transport's
+        // conventional port). Never fatal — see `otlp::port_mismatch_warning`.
+        for warning in &info.warnings {
+            tracing::warn!("{warning}");
+        }
+    }
+
+    // add-config-knob: `otlp_protocol` only means anything alongside an
+    // endpoint. Setting it alone exports nothing, which must not look like it
+    // took effect.
+    #[cfg(feature = "otlp")]
+    if _otlp_guard.is_none() && config.server.diagnostics.otlp_protocol.is_some() {
+        tracing::warn!(
+            "[server.diagnostics] otlp_protocol is set but no OTLP endpoint is configured \
+             (otlp_endpoint / OTEL_EXPORTER_OTLP_*), so no spans are exported and the \
+             protocol has no effect."
+        );
     }
 
     // add-config-knob: never let an OTLP request die silently in a binary

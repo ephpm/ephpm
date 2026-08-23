@@ -34,13 +34,39 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # ephpm-server (forwarded by the ephpm binary's `otlp` feature). The
 # opentelemetry / tracing-opentelemetry pair must be bumped in lockstep:
 # tracing-opentelemetry 0.32.x targets the opentelemetry 0.31.x line.
-# http-proto + reqwest-blocking-client keeps the exporter off the tokio
-# runtime (the subscriber is initialized before the runtime exists, because
-# PHP must init single-threaded).
+#
+# BOTH OTLP transports are compiled in, and the one used is chosen at runtime
+# by `OTEL_EXPORTER_OTLP_PROTOCOL` (`grpc` | `http/protobuf`), per the OTel
+# spec. See `ephpm-server/src/otlp.rs` for why runtime selection rather than a
+# cargo feature: ePHPm ships one release binary, so a compile-time choice would
+# have to pick a transport for every user.
+#
+# - `http-proto` + `reqwest-blocking-client`: the http/protobuf transport, on a
+#   blocking client so it needs no tokio runtime.
+# - `grpc-tonic`: the OTLP/gRPC transport. tonic is async, so `otlp.rs` owns a
+#   small dedicated tokio runtime for it — the tracing subscriber is built in
+#   `main` before the server's runtime exists (PHP must init single-threaded).
+# - `internal-logs`: routes the SDK's own export failures into `tracing`.
+#   It is in this crate's DEFAULT feature set, and turning defaults off without
+#   restoring it is what made every export failure silent (#378).
+#
+# `tls-provider-agnostic` is the ONLY correct TLS feature here, for exactly the
+# reason spelled out for reqwest below: `tls`, `tls-ring`, `tls-roots` and
+# `tls-webpki-roots` all expand to `tonic/tls-ring` and link `ring`. The
+# provider-agnostic variant enables no provider at all, and tonic then resolves
+# one via `CryptoProvider::get_default()` — which `otlp.rs` installs from
+# `tls::crypto_provider()`, so gRPC follows the same provider as everything
+# else by construction.
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "grpc-tonic", "tls-provider-agnostic", "internal-logs"] }
 tracing-opentelemetry = { version = "0.32", default-features = false }
+# Depended on directly only for the gRPC exporter's root store: the two
+# `tls-*-roots` features are what make `ClientTlsConfig::with_enabled_roots()`
+# exist. Neither pulls a crypto provider (`tls-native-roots` and
+# `tls-webpki-roots` expand to `_tls-any` + `channel` + the roots crate), which
+# is what makes them safe here where `tonic/tls` is not.
+tonic = { version = "0.14", default-features = false, features = ["tls-native-roots", "tls-webpki-roots"] }
 # The OTLP exporter's HTTP client, so an `https://` collector endpoint works
 # (without these features reqwest is built with no TLS backend at all and
 # every https:// export fails at connect time).

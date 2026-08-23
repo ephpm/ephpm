@@ -43,6 +43,10 @@ const TAILCALL_MINORS: &[&str] = &["8.5"];
 /// spawned (measured: identical thread count with the endpoint unset), so the
 /// cost of shipping it is binary size and nothing else.
 ///
+/// It covers **both** OTLP transports, gRPC and http/protobuf; the choice is
+/// made at runtime by `OTEL_EXPORTER_OTLP_PROTOCOL`, not by a cargo feature,
+/// so there is nothing further to add here for gRPC.
+///
 /// Anything added here must also be added to the CI lanes that lint and test
 /// it (`.github/workflows/ci.yml`) and to the Docker builder's dependency
 /// warm-up stage (`docker/Dockerfile`), or it ships uncompiled by CI.
