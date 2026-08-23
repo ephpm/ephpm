@@ -1233,6 +1233,68 @@ impl Router {
         Some(canon)
     }
 
+    /// Canonicalize a site's document root and re-assert, on **every** resolve,
+    /// that it still lies within the site container.
+    ///
+    /// This is the containment re-check for #394. [`crate::site_overrides`]'s
+    /// `validate_declared_root` checks `starts_with(container)` exactly once,
+    /// when the override file is read, but the resolved `document_root` is
+    /// dereferenced live and cached by value: a tenant can pass validation with
+    /// a real `web/` directory and then, post-boot, replace it with a symlink
+    /// out of its container (`rmdir web; symlink('/', 'web')` — PHP's
+    /// `symlink()` only `open_basedir`-checks the link, never its target). The
+    /// next `canonicalize()` follows the symlink out, and the **static path has
+    /// no `open_basedir` backstop** — [`static_files::serve_file`]'s only
+    /// boundary is the root this returns. So containment is recomputed here,
+    /// against the container (which is never override-controlled), every time —
+    /// not trusted from load time and not cached as a verdict.
+    ///
+    /// Fails **closed**: returns `None` when the document root cannot be
+    /// resolved, or when it has escaped its container. The static caller turns
+    /// `None` into a 404 and the PHP caller into a 403 — the escaped path is
+    /// never served. When no override moved the web root
+    /// (`document_root == container`) containment holds by construction and the
+    /// second `canonicalize` is skipped, so every non-override site and
+    /// single-site mode pays nothing new.
+    ///
+    /// Both sides come from [`Router::canonical_root`], i.e. both from
+    /// `canonicalize()`, so on Windows they share the same `\\?\` verbatim form
+    /// and `starts_with` compares like with like — a verbatim/non-verbatim
+    /// mismatch would itself be a bypass.
+    fn contained_canonical_root(&self, roots: &SiteRoots) -> Option<PathBuf> {
+        let canonical_root = self.canonical_root(&roots.document_root)?;
+
+        // No override in effect: the document root IS the container, so
+        // containment is definitional. The hot path — every site without an
+        // override file, and single-site mode.
+        if roots.document_root == roots.container {
+            return Some(canonical_root);
+        }
+
+        // An override moved the web root. The container is operator-chosen and
+        // cannot be swapped by the tenant, so its canonical form is the
+        // trustworthy boundary to re-check against.
+        let Some(canonical_container) = self.canonical_root(&roots.container) else {
+            tracing::warn!(
+                document_root = %roots.document_root.display(),
+                container = %roots.container.display(),
+                "per-site container did not resolve — refusing the overridden document root"
+            );
+            return None;
+        };
+        if !canonical_root.starts_with(&canonical_container) {
+            tracing::warn!(
+                document_root = %roots.document_root.display(),
+                resolved = %canonical_root.display(),
+                container = %canonical_container.display(),
+                "per-site document root escaped its container after validation \
+                 (symlink swap) — refusing (404/403), not serving the escaped path"
+            );
+            return None;
+        }
+        Some(canonical_root)
+    }
+
     /// Require a resolved PHP script to live inside its site's document root.
     ///
     /// The static branch gets this for free from `static_files::serve_file`,
@@ -1243,17 +1305,19 @@ impl Router {
     /// pointing out of the docroot executed anyway, which under `sites_dir`
     /// vhosting is cross-tenant code execution.
     ///
-    /// Both sides are cached: the root through [`Router::canonical_root`], the
-    /// script through [`Router::canonical_scripts`]. `canonicalize()` is a
-    /// `realpath()` walk — one `lstat` per path component, so an
-    /// O(path-depth) burst of syscalls — and paying it uncached on every PHP
-    /// request would undo the same syscall the docroot cache was added to
-    /// remove. What is *not* cached is the decision: the
-    /// `starts_with(canonical_root)` comparison below runs on every request
-    /// against the root resolved for that request, so a cache entry can only
-    /// ever save work, never grant reach.
-    fn php_script_contained(&self, fs_path: &Path, site_root: &Path) -> bool {
-        let Some(canonical_root) = self.canonical_root(site_root) else {
+    /// Both sides are cached: the root through
+    /// [`Router::contained_canonical_root`], the script through
+    /// [`Router::canonical_scripts`]. `canonicalize()` is a `realpath()` walk —
+    /// one `lstat` per path component, so an O(path-depth) burst of syscalls —
+    /// and paying it uncached on every PHP request would undo the same syscall
+    /// the docroot cache was added to remove. What is *not* cached is the
+    /// decision: `contained_canonical_root` re-asserts the root is inside the
+    /// container (fix for #394), and the `starts_with(canonical_root)`
+    /// comparison below runs on every request against the root resolved for
+    /// that request, so a cache entry can only ever save work, never grant
+    /// reach.
+    fn php_script_contained(&self, fs_path: &Path, roots: &SiteRoots) -> bool {
+        let Some(canonical_root) = self.contained_canonical_root(roots) else {
             return false;
         };
 
@@ -1278,6 +1342,14 @@ impl Router {
         // bounded cache quite as easily.
         self.remember_canonical_script(fs_path, canonical_script);
         true
+    }
+
+    /// Test helper: containment against a flat site (`document_root ==
+    /// container`, the no-override shape), so the script-containment suite reads
+    /// `(script, root)` without constructing a [`SiteRoots`] each time.
+    #[cfg(test)]
+    fn php_script_contained_flat(&self, fs_path: &Path, root: &Path) -> bool {
+        self.php_script_contained(fs_path, &SiteRoots::flat(root.to_path_buf()))
     }
 
     /// Single place the containment failure is logged, so the cached and
@@ -2180,7 +2252,7 @@ impl Router {
             Resolved::File(fs_path) => {
                 if is_php_file(&fs_path) {
                     if self.is_php_allowed(&uri_path)
-                        && self.php_script_contained(&fs_path, &site_root)
+                        && self.php_script_contained(&fs_path, &site_roots)
                     {
                         let is_cacheable = (method_ref == hyper::Method::GET
                             || method_ref == hyper::Method::HEAD)
@@ -2250,7 +2322,7 @@ impl Router {
                     } else {
                         (error_response(StatusCode::FORBIDDEN, "403 Forbidden"), "error")
                     }
-                } else if let Some(canonical_root) = self.canonical_root(&site_root) {
+                } else if let Some(canonical_root) = self.contained_canonical_root(&site_roots) {
                     (
                         static_files::serve_file(
                             &canonical_root,
@@ -2402,13 +2474,14 @@ impl Router {
     /// contain a separator (`"public/ws.php"`), so `..` or an absolute path
     /// must not be able to escape the vhost. A name that resolves outside the
     /// document root is skipped with a warning rather than silently served.
-    fn resolve_websocket_script(&self, site_root: &Path, names: &[String]) -> Option<PathBuf> {
+    fn resolve_websocket_script(&self, roots: &SiteRoots, names: &[String]) -> Option<PathBuf> {
+        let site_root = roots.document_root.as_path();
         for name in names {
             let candidate = site_root.join(name);
             if !candidate.is_file() {
                 continue;
             }
-            if !self.php_script_contained(&candidate, site_root) {
+            if !self.php_script_contained(&candidate, roots) {
                 tracing::warn!(
                     entry = %name,
                     root = %site_root.display(),
@@ -2459,7 +2532,7 @@ impl Router {
         // request's index files — a `websocket.php` above the web root is not
         // publicly routable and must not become one over an upgrade.
         let site_root = site_roots.document_root.as_path();
-        let Some(script) = self.resolve_websocket_script(site_root, websocket_files) else {
+        let Some(script) = self.resolve_websocket_script(site_roots, websocket_files) else {
             tracing::debug!(
                 root = %site_root.display(),
                 "websocket upgrade refused: this vhost has no [server] websocket_files entrypoint"
@@ -5940,12 +6013,12 @@ mod tests {
         let escaped = docroot.join("../site-b/index.php");
         assert!(escaped.is_file(), "traversal target must exist for this test to mean anything");
         assert!(
-            !router.php_script_contained(&escaped, &docroot),
+            !router.php_script_contained_flat(&escaped, &docroot),
             "a PHP script resolving outside the document root must not execute"
         );
 
         assert!(
-            router.php_script_contained(&docroot.join("index.php"), &docroot),
+            router.php_script_contained_flat(&docroot.join("index.php"), &docroot),
             "a PHP script inside the document root must still execute"
         );
     }
@@ -5956,7 +6029,7 @@ mod tests {
         let router = test_router(dir.path());
         // `canonicalize()` fails on a nonexistent path; treat that as
         // "not contained" rather than trusting the unresolved join.
-        assert!(!router.php_script_contained(&dir.path().join("nope.php"), dir.path()));
+        assert!(!router.php_script_contained_flat(&dir.path().join("nope.php"), dir.path()));
     }
 
     /// The regression that would actually hurt: `php_script_contained` now
@@ -5981,12 +6054,15 @@ mod tests {
         // Warm every cache the check touches (docroot and script) with a
         // legitimate hit first, so the traversal below runs against a
         // populated cache rather than a cold one.
-        assert!(router.php_script_contained(&legit, &docroot));
-        assert!(router.php_script_contained(&legit, &docroot), "cached hit must still be allowed");
+        assert!(router.php_script_contained_flat(&legit, &docroot));
+        assert!(
+            router.php_script_contained_flat(&legit, &docroot),
+            "cached hit must still be allowed"
+        );
 
         for attempt in 0..3 {
             assert!(
-                !router.php_script_contained(&escaped, &docroot),
+                !router.php_script_contained_flat(&escaped, &docroot),
                 "traversal must stay rejected on attempt {attempt} with a warm cache"
             );
         }
@@ -5998,7 +6074,7 @@ mod tests {
         );
 
         // And the legitimate path is still allowed after the rejections.
-        assert!(router.php_script_contained(&legit, &docroot));
+        assert!(router.php_script_contained_flat(&legit, &docroot));
     }
 
     /// The cache stores the canonicalized path, never the verdict. Proving it:
@@ -6016,13 +6092,13 @@ mod tests {
         let router = test_router(&root_a);
         let script = root_a.join("index.php");
 
-        assert!(router.php_script_contained(&script, &root_a));
+        assert!(router.php_script_contained_flat(&script, &root_a));
         assert!(
             router.canonical_scripts.contains_key(&script),
             "the contained resolution should have been cached"
         );
         assert!(
-            !router.php_script_contained(&script, &root_b),
+            !router.php_script_contained_flat(&script, &root_b),
             "a cache entry from one vhost must never authorize a script under another"
         );
     }
@@ -6048,8 +6124,8 @@ mod tests {
 
         // Cold and warm: `canonicalize()` follows the symlink out of the
         // docroot both times, and the rejection is never cached as an allow.
-        assert!(!router.php_script_contained(&link, &docroot));
-        assert!(!router.php_script_contained(&link, &docroot));
+        assert!(!router.php_script_contained_flat(&link, &docroot));
+        assert!(!router.php_script_contained_flat(&link, &docroot));
         assert!(!router.canonical_scripts.contains_key(&link));
     }
 
@@ -6074,7 +6150,7 @@ mod tests {
         // At the cap the entries are all live and the sweep is throttled, so
         // the new path is simply not remembered — the check still answers
         // correctly, it just pays the `canonicalize()` it already paid.
-        assert!(router.php_script_contained(&dir.path().join("index.php"), dir.path()));
+        assert!(router.php_script_contained_flat(&dir.path().join("index.php"), dir.path()));
         assert!(
             router.canonical_scripts.len() <= CANONICAL_SCRIPT_CACHE_MAX,
             "the cache must never exceed its cap"
@@ -7388,6 +7464,159 @@ echo "post response";
                 "open_basedir must stay the container for {declaration:?}, got {basedir}"
             );
         }
+    }
+
+    /// Create a directory symlink, or return `false` when the platform refuses
+    /// (Windows without the symlink privilege). Same skip-not-fail contract as
+    /// the `site_overrides` suite: a host that cannot create a symlink cannot
+    /// mount this attack either.
+    fn try_symlink_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link).is_ok()
+        }
+    }
+
+    /// Remove a directory symlink cross-platform: on Windows a directory
+    /// symlink is unlinked with `remove_dir`, on Unix a symlink with
+    /// `remove_file`.
+    fn unlink_dir_symlink(link: &Path) {
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(link).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            std::fs::remove_dir(link).unwrap();
+        }
+    }
+
+    /// #394, the TOCTOU: `validate_declared_root` checks containment once, at
+    /// load, but the resolved `document_root` is dereferenced live. A tenant
+    /// deploys a valid `web/` (passes validation, seeds `site_roots`), then
+    /// post-boot does `rmdir web; symlink('/', 'web')`. Because the **static
+    /// path has no `open_basedir` backstop**, the only thing between the client
+    /// and the escaped path is the root [`Router::contained_canonical_root`]
+    /// returns — which must re-assert containment against the container on
+    /// every resolve, not trust the load-time verdict.
+    ///
+    /// Note the ordering: the site is resolved (seeding `site_roots` with a
+    /// valid resolution) *before* the swap, and `canonical_root` is never warmed
+    /// on the pre-swap `web`, so the first resolve after the swap is exactly the
+    /// escape window the pentester hit.
+    #[test]
+    fn site_override_symlink_swap_after_validation_is_refused() {
+        let f = fleet();
+        let container = f.site("attacker.test", &["web"]);
+        f.override_for("attacker.test", "document_root = \"web\"\n");
+
+        // A secret directory outside the site container — a stand-in for another
+        // tenant's directory or the filesystem root.
+        let outside = f.dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"CROSS-TENANT").unwrap();
+
+        let router = f.router();
+        // Resolve once with a valid `web` — this seeds `site_roots` exactly as
+        // `seed_site_roots()` does at boot, without touching `canonical_roots`.
+        let roots = router.resolve_site("attacker.test").roots;
+        assert!(roots.declared(), "precondition: the override moved the web root");
+
+        // The tenant swaps its validated `web` for a symlink escaping the
+        // container (post-validation, from inside its own open_basedir).
+        let web = container.join("web");
+        std::fs::remove_dir_all(&web).unwrap();
+        if !try_symlink_dir(&outside, &web) {
+            return; // platform refuses symlinks
+        }
+
+        // The escape is real: a bare `canonicalize()` of the (unchanged)
+        // document_root path now follows the symlink out of the container. This
+        // is the value the pre-fix static path handed to `serve_file` as its
+        // only boundary.
+        assert_eq!(
+            router.canonical_root(&roots.document_root),
+            outside.canonicalize().ok(),
+            "canonicalize must follow the swapped symlink out — the escape exists"
+        );
+
+        // The fix: containment is re-asserted against the container, so the
+        // escaped root is refused (caller → 404/403), not served. Twice, to
+        // prove a cached escaped `canonical_root` is still refused.
+        assert_eq!(
+            router.contained_canonical_root(&roots),
+            None,
+            "an escaped document root must be refused on every resolve (#394)"
+        );
+        assert_eq!(
+            router.contained_canonical_root(&roots),
+            None,
+            "a cached escaped canonical_root must stay refused"
+        );
+
+        // And the PHP path is closed too (defense in depth; open_basedir only
+        // partially contains it).
+        std::fs::write(outside.join("index.php"), b"<?php echo 'pwned';").unwrap();
+        assert!(
+            !router.php_script_contained(&web.join("index.php"), &roots),
+            "a PHP script reached through the escaped root must not execute"
+        );
+    }
+
+    /// The mechanism self-heals and re-arms without ever serving the escape.
+    /// Whether the swap is caught at load (`validate_declared_root`, when the
+    /// symlink is present at resolve time) or at serve time
+    /// ([`Router::contained_canonical_root`], the TOCTOU window), the resolved
+    /// root is **never** the escaped `outside` directory; and restoring a real
+    /// `web/` serves from it again. Fresh routers per phase so the outcome is a
+    /// pure function of current filesystem state, not any cache TTL window.
+    #[test]
+    fn site_override_symlink_present_at_resolve_serves_container_not_escape() {
+        let f = fleet();
+        let container = f.site("app.test", &["web"]);
+        f.override_for("app.test", "document_root = \"web\"\n");
+        let web = container.join("web");
+        let outside = f.dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let canonical_container = container.canonicalize().unwrap();
+        let canonical_outside = outside.canonicalize().unwrap();
+        let canonical_web = web.canonicalize().unwrap();
+
+        // Phase 1: legitimate real web → served from web.
+        let r1 = f.router();
+        let roots1 = r1.resolve_site("app.test").roots;
+        assert_eq!(r1.contained_canonical_root(&roots1), Some(canonical_web.clone()));
+
+        // Phase 2: the symlink is present when the site is (re-)resolved, so
+        // the override is rejected at load and the site serves its CONTAINER —
+        // never the escape. (The TOCTOU window where site_roots is already
+        // cached valid is covered by the test above.)
+        std::fs::remove_dir_all(&web).unwrap();
+        if !try_symlink_dir(&outside, &web) {
+            return;
+        }
+        let r2 = f.router();
+        let roots2 = r2.resolve_site("app.test").roots;
+        assert!(!roots2.declared(), "an escaping override must be rejected at load");
+        let resolved2 = r2.contained_canonical_root(&roots2);
+        assert_eq!(resolved2, Some(canonical_container), "must fall back to the container");
+        assert_ne!(
+            resolved2,
+            Some(canonical_outside),
+            "the escaped directory must never be the served root"
+        );
+
+        // Phase 3: restore a real web → served from web again (re-armed).
+        unlink_dir_symlink(&web);
+        std::fs::create_dir_all(&web).unwrap();
+        let r3 = f.router();
+        let roots3 = r3.resolve_site("app.test").roots;
+        assert_eq!(r3.contained_canonical_root(&roots3), Some(canonical_web));
     }
 
     /// The per-vhost temp/session state root is derived from the container, so a
