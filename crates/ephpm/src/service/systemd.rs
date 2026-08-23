@@ -8,10 +8,53 @@
 
 use std::process::Command;
 
-use super::{Paths, Result, ServiceError, StatusReport};
+use super::{Paths, Result, ServiceError, ServiceOwner, StatusReport};
 
-/// Render the systemd unit file body.
-fn unit_body(paths: &Paths) -> String {
+/// Render the `[Service]`-section lines that opt the unit into running as a
+/// dedicated non-root user, plus a conservative sandboxing profile.
+///
+/// `AmbientCapabilities`/`CapabilityBoundingSet` grant exactly
+/// `CAP_NET_BIND_SERVICE` so a non-root `ExecStart` can still bind `[server]
+/// listen` on a privileged port (80/443) — without it, opting into `--user`
+/// would silently break the common "web service on port 80" case.
+/// `ProtectSystem=strict` makes the whole filesystem read-only except `/dev`,
+/// `/proc`, `/sys`, and the paths listed in `ReadWritePaths`; those are the
+/// three directories ePHPm's own code needs to write after startup — the
+/// data dir (per-site SQLite files, ACME cache), the log directory, and the
+/// document root (multi-tenant `sites_dir` installs typically nest under or
+/// equal `document_root`; a `sites_dir` configured elsewhere needs adding to
+/// `ReadWritePaths` by hand). Each entry is `-`-prefixed (systemd's
+/// ignore-if-missing marker) because `install()` never creates
+/// `document_root`, and a caller providing their own pre-seeded config with a
+/// `sites_dir` outside it may not create it either — an absent path would
+/// otherwise make the unit fail to start instead of just not getting that one
+/// extra write target. Returns an empty string when `owner` is `None` so the
+/// default unit is unaffected.
+fn owner_directives(paths: &Paths, owner: Option<&ServiceOwner>) -> String {
+    let Some(ServiceOwner { user, group }) = owner else {
+        return String::new();
+    };
+    let log_dir = paths.log_file.parent().unwrap_or(&paths.log_file);
+    format!(
+        "User={user}\n\
+Group={group}\n\
+AmbientCapabilities=CAP_NET_BIND_SERVICE\n\
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n\
+NoNewPrivileges=true\n\
+ProtectSystem=strict\n\
+ProtectHome=true\n\
+ReadWritePaths=-{data_dir} -{log_dir} -{document_root}\n",
+        data_dir = paths.data_dir.display(),
+        log_dir = log_dir.display(),
+        document_root = paths.document_root.display(),
+    )
+}
+
+/// Render the systemd unit file body. `owner` is `None` for the historical
+/// root-with-no-sandboxing unit (byte-identical to the pre-`--user` output)
+/// or `Some` to run the service as a dedicated non-root user/group — see
+/// [`owner_directives`].
+fn unit_body(paths: &Paths, owner: Option<&ServiceOwner>) -> String {
     format!(
         "[Unit]\n\
 Description=ePHPm — embedded PHP application server\n\
@@ -24,6 +67,7 @@ ExecStart={binary} serve --config {config}\n\
 Restart=on-failure\n\
 RestartSec=2s\n\
 LimitNOFILE=65536\n\
+{owner_directives}\
 StandardOutput=append:{log}\n\
 StandardError=append:{log}\n\
 \n\
@@ -32,15 +76,16 @@ WantedBy=multi-user.target\n",
         binary = paths.binary.display(),
         config = paths.config.display(),
         log = paths.log_file.display(),
+        owner_directives = owner_directives(paths, owner),
     )
 }
 
 /// Write the unit file and reload systemd so the new unit is visible.
-pub(super) fn register(paths: &Paths) -> Result<()> {
+pub(super) fn register(paths: &Paths, owner: Option<&ServiceOwner>) -> Result<()> {
     if let Some(parent) = paths.service_unit.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ServiceError::io(parent, e))?;
     }
-    std::fs::write(&paths.service_unit, unit_body(paths))
+    std::fs::write(&paths.service_unit, unit_body(paths, owner))
         .map_err(|e| ServiceError::io(&paths.service_unit, e))?;
     run_systemctl(&["daemon-reload"])?;
     run_systemctl(&["enable", "ephpm.service"])?;
@@ -141,21 +186,58 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn unit_body_renders_paths() {
-        let paths = Paths {
+    fn test_paths() -> Paths {
+        Paths {
             binary: PathBuf::from("/usr/local/bin/ephpm"),
             config: PathBuf::from("/etc/ephpm/ephpm.toml"),
             service_unit: PathBuf::from("/etc/systemd/system/ephpm.service"),
             data_dir: PathBuf::from("/var/lib/ephpm"),
             document_root: PathBuf::from("/var/www/html"),
             log_file: PathBuf::from("/var/log/ephpm/ephpm.log"),
-        };
-        let body = unit_body(&paths);
+        }
+    }
+
+    #[test]
+    fn unit_body_renders_paths() {
+        let paths = test_paths();
+        let body = unit_body(&paths, None);
         assert!(
             body.contains("ExecStart=/usr/local/bin/ephpm serve --config /etc/ephpm/ephpm.toml")
         );
         assert!(body.contains("StandardOutput=append:/var/log/ephpm/ephpm.log"));
+        assert!(body.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn unit_body_without_owner_omits_user_and_hardening() {
+        // Backward compatibility: no `--user` must produce exactly what
+        // pre-#XXX callers got — root, no `User=`/`Group=`, no sandboxing.
+        let paths = test_paths();
+        let body = unit_body(&paths, None);
+        assert!(!body.contains("User="));
+        assert!(!body.contains("Group="));
+        assert!(!body.contains("ProtectSystem"));
+        assert!(!body.contains("NoNewPrivileges"));
+        assert!(!body.contains("AmbientCapabilities"));
+    }
+
+    #[test]
+    fn unit_body_with_owner_sets_user_group_and_hardening() {
+        let paths = test_paths();
+        let owner = ServiceOwner { user: "ephpm-web".to_string(), group: "ephpm-web".to_string() };
+        let body = unit_body(&paths, Some(&owner));
+        assert!(body.contains("User=ephpm-web"));
+        assert!(body.contains("Group=ephpm-web"));
+        assert!(body.contains("AmbientCapabilities=CAP_NET_BIND_SERVICE"));
+        assert!(body.contains("CapabilityBoundingSet=CAP_NET_BIND_SERVICE"));
+        assert!(body.contains("NoNewPrivileges=true"));
+        assert!(body.contains("ProtectSystem=strict"));
+        assert!(body.contains("ProtectHome=true"));
+        assert!(body.contains("ReadWritePaths=-/var/lib/ephpm -/var/log/ephpm -/var/www/html"));
+        // Unaffected by the owner directives.
+        assert!(
+            body.contains("ExecStart=/usr/local/bin/ephpm serve --config /etc/ephpm/ephpm.toml")
+        );
         assert!(body.contains("WantedBy=multi-user.target"));
     }
 }

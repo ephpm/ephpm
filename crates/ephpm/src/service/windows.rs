@@ -25,7 +25,7 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-use super::{Paths, Result, ServiceError, StatusReport};
+use super::{Paths, Result, ServiceError, ServiceOwner, StatusReport};
 
 /// SCM service name.
 const SERVICE_NAME: &str = "ephpm";
@@ -69,7 +69,25 @@ pub fn is_elevated() -> bool {
     }
 }
 
-pub(super) fn register(paths: &Paths) -> Result<()> {
+/// Registers the service with the SCM, always as `LocalSystem`.
+///
+/// # Errors
+///
+/// Returns [`ServiceError::Other`] if `owner` is `Some` — the SCM requires a
+/// stored account password to run a service under a specific account, which
+/// this CLI has no secure way to collect or persist yet. Failing loudly here
+/// (instead of silently installing as `LocalSystem` anyway) keeps `--user` an
+/// honest cross-platform flag: a Windows caller finds out immediately that it
+/// isn't honored here, rather than discovering it later via `services.msc`.
+pub(super) fn register(paths: &Paths, owner: Option<&ServiceOwner>) -> Result<()> {
+    if let Some(ServiceOwner { user, group }) = owner {
+        return Err(ServiceError::Other(format!(
+            "ephpm install --user {user} --group {group} is not supported on Windows yet — the \
+             SCM requires a stored account password to run a service under a specific account, \
+             and there's no secure way to collect one from this CLI. Omit --user to install \
+             running as LocalSystem."
+        )));
+    }
     let manager = ServiceManager::local_computer(
         None::<&OsStr>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,

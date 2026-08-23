@@ -5,16 +5,34 @@
 
 use std::process::Command;
 
-use super::{Paths, Result, ServiceError, StatusReport};
+use super::{Paths, Result, ServiceError, ServiceOwner, StatusReport};
 
 /// launchd service label used in the plist.
 const LABEL: &str = "dev.ephpm";
 
-/// Render the launchd plist body for the daemon.
-fn plist_body(paths: &Paths) -> String {
+/// Render the `UserName`/`GroupName` plist keys. Empty when `owner` is `None`
+/// so the default plist is unaffected — see the `systemd::owner_directives`
+/// doc comment for the same backward-compatibility contract.
+fn owner_keys(owner: Option<&ServiceOwner>) -> String {
+    let Some(ServiceOwner { user, group }) = owner else {
+        return String::new();
+    };
+    format!(
+        "    <key>UserName</key>\n\
+    <string>{user}</string>\n\
+    <key>GroupName</key>\n\
+    <string>{group}</string>\n"
+    )
+}
+
+/// Render the launchd plist body for the daemon. `owner` is `None` for the
+/// historical root-with-no-`UserName` plist, or `Some` to run the daemon as a
+/// dedicated non-root user/group.
+fn plist_body(paths: &Paths, owner: Option<&ServiceOwner>) -> String {
     let binary = paths.binary.display();
     let config = paths.config.display();
     let log = paths.log_file.display();
+    let owner_keys = owner_keys(owner);
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -29,6 +47,7 @@ fn plist_body(paths: &Paths) -> String {
         <string>--config</string>\n\
         <string>{config}</string>\n\
     </array>\n\
+{owner_keys}\
     <key>RunAtLoad</key>\n\
     <true/>\n\
     <key>KeepAlive</key>\n\
@@ -42,11 +61,11 @@ fn plist_body(paths: &Paths) -> String {
     )
 }
 
-pub(super) fn register(paths: &Paths) -> Result<()> {
+pub(super) fn register(paths: &Paths, owner: Option<&ServiceOwner>) -> Result<()> {
     if let Some(parent) = paths.service_unit.parent() {
         std::fs::create_dir_all(parent).map_err(|e| ServiceError::io(parent, e))?;
     }
-    std::fs::write(&paths.service_unit, plist_body(paths))
+    std::fs::write(&paths.service_unit, plist_body(paths, owner))
         .map_err(|e| ServiceError::io(&paths.service_unit, e))?;
     run_launchctl(&["bootstrap", "system", &paths.service_unit.display().to_string()])
 }
@@ -130,11 +149,28 @@ mod tests {
             document_root: PathBuf::from("/var/www/html"),
             log_file: PathBuf::from("/var/log/ephpm/ephpm.log"),
         };
-        let body = plist_body(&paths);
+        let body = plist_body(&paths, None);
         assert!(body.contains("<string>dev.ephpm</string>"));
         assert!(body.contains("<string>/usr/local/bin/ephpm</string>"));
         assert!(body.contains("<string>--config</string>"));
         assert!(body.contains("<string>/var/log/ephpm/ephpm.log</string>"));
         assert!(body.contains("<key>RunAtLoad</key>"));
+        assert!(!body.contains("UserName"));
+    }
+
+    #[test]
+    fn plist_body_with_owner_sets_username_groupname() {
+        let paths = Paths {
+            binary: PathBuf::from("/usr/local/bin/ephpm"),
+            config: PathBuf::from("/etc/ephpm/ephpm.toml"),
+            service_unit: PathBuf::from("/Library/LaunchDaemons/dev.ephpm.plist"),
+            data_dir: PathBuf::from("/var/lib/ephpm"),
+            document_root: PathBuf::from("/var/www/html"),
+            log_file: PathBuf::from("/var/log/ephpm/ephpm.log"),
+        };
+        let owner = ServiceOwner { user: "ephpm-web".to_string(), group: "ephpm-web".to_string() };
+        let body = plist_body(&paths, Some(&owner));
+        assert!(body.contains("<key>UserName</key>\n    <string>ephpm-web</string>"));
+        assert!(body.contains("<key>GroupName</key>\n    <string>ephpm-web</string>"));
     }
 }
