@@ -31,6 +31,7 @@ use tracing_subscriber::{EnvFilter, Layer};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod fatal_signal;
+mod middleware_cli;
 mod service;
 
 /// ePHPm — All-in-one PHP application server
@@ -233,6 +234,22 @@ enum Commands {
         subcommand: CacheSubcommand,
     },
 
+    /// Fetch prebuilt native-middleware modules from the ephpm/middleware
+    /// GitHub releases, into the loader's search path.
+    ///
+    /// Downloads are verified against the release's `SHA256SUMS` before being
+    /// written (a middleware `.so` is dlopen'd with the server's privileges —
+    /// a bad asset is RCE), and refused when the module's ABI major does not
+    /// match this binary's.
+    Middleware {
+        /// Source repository (`owner/name`) to fetch releases from.
+        #[arg(long, default_value = "ephpm/middleware", global = true)]
+        repo: String,
+
+        #[command(subcommand)]
+        subcommand: MiddlewareSubcommand,
+    },
+
     /// Internal: run as a Windows service (invoked by SCM, not by users)
     #[cfg(windows)]
     #[command(hide = true)]
@@ -265,6 +282,39 @@ enum CacheSubcommand {
         #[arg(long, group = "reset-target")]
         all: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum MiddlewareSubcommand {
+    /// List the modules and versions available in the middleware releases.
+    List,
+    /// Download a module for THIS platform into the loader's search path.
+    ///
+    /// `name` may carry a version: `jwt@v0.1.0`. Without one, the latest
+    /// release is used. The file lands under its loader name
+    /// (`<name>.<platform>.<ext>`) so a bare `library = "<name>"` mount then
+    /// resolves.
+    Get {
+        /// Module name, optionally `@version` (e.g. `jwt` or `jwt@v0.1.0`).
+        name: String,
+
+        /// Destination directory (default: `$EPHPM_MIDDLEWARE_DIR` if set,
+        /// else `/usr/local/lib/ephpm/middleware`).
+        #[arg(long)]
+        dest: Option<PathBuf>,
+
+        /// Fetch the musl-libc build instead of the gnu one (Linux only; for
+        /// a musl-*dynamic* host). The gnu build is the default.
+        #[arg(long)]
+        musl: bool,
+
+        /// Proceed even if the release's ABI major differs from this binary's.
+        /// The module will still refuse to load at runtime on a real mismatch.
+        #[arg(long)]
+        allow_abi_mismatch: bool,
+    },
+    /// Print where the loader looks for modules (and the platform file names).
+    SearchPath,
 }
 
 #[derive(Subcommand, Debug)]
@@ -343,6 +393,10 @@ fn run() -> anyhow::Result<ExitCode> {
             let auth = KvAuth::resolve(None, password)?;
             let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
             rt.block_on(run_cache(&host, port, &auth, subcommand))
+        }
+        Some(Commands::Middleware { repo, subcommand }) => {
+            let rt = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+            rt.block_on(middleware_cli::run(&repo, subcommand))
         }
         Some(Commands::Install { user, group }) => {
             let owner = user.map(|user| {

@@ -286,6 +286,41 @@ consumed instantly at a window boundary), and it is distinct from the
 built-in connection-level limiter in `[server.limits]` — the two are
 independent.
 
+## Fetching prebuilt modules with `ephpm middleware`
+
+The four official modules are also published as prebuilt, versioned shared
+libraries at [github.com/ephpm/middleware](https://github.com/ephpm/middleware).
+The `ephpm middleware` subcommand fetches the right one for the current
+platform straight into the loader's search path, so a pipeline can install a
+module and mount it by bare name:
+
+```bash
+ephpm middleware search-path        # print where the loader looks
+ephpm middleware list               # modules + versions in the releases
+ephpm middleware get jwt            # download jwt for THIS platform
+ephpm middleware get jwt@v0.1.0 --dest /opt/ephpm/mw   # pin a version + dir
+```
+
+`get` writes the module under its loader name (`<name>.<platform>.<ext>`), so
+`library = "jwt"` then resolves with no further configuration. The default
+destination is `$EPHPM_MIDDLEWARE_DIR` when set, otherwise
+`/usr/local/lib/ephpm/middleware`.
+
+**Verification is not optional.** Downloading and `dlopen`-ing a `.so` is code
+execution, so `get`:
+
+- fetches over HTTPS on the same crypto provider the server uses,
+- verifies the download against the release's `SHA256SUMS` **before** writing
+  anything — a mismatch or a missing checksum aborts with nothing written, and
+- refuses a module whose ABI major (recorded in the release's `manifest.json`)
+  differs from this binary's, unless `--allow-abi-mismatch` is passed.
+
+No token is needed for the public download path. On Linux the **gnu** build is
+installed by default; the musl build (for a musl-*dynamic* host) is published
+under a `-musl` asset name and fetched with `--musl` — the loader has no libc
+distinction in its file names, so place it with `--dest` and mount it by
+explicit path.
+
 ## The dynamic lane
 
 Custom out-of-tree modules load through `dlopen` (`LoadLibrary` on

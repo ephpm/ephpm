@@ -363,9 +363,32 @@ fn sorted_by_order(mounts: &[MiddlewareMount]) -> Vec<&MiddlewareMount> {
 
 /// `<os>-<arch>` tag used in platform-suffixed library file names
 /// (`linux-x86_64`, `linux-aarch64`, `darwin-aarch64`, `windows-x86_64`).
-fn platform_tag() -> String {
+///
+/// Public so the `ephpm middleware` CLI computes the download asset name from
+/// the SAME function the loader resolves against — one source of truth for the
+/// platform suffix (`crates/ephpm/src/middleware_cli.rs`).
+#[must_use]
+pub fn platform_tag() -> String {
     let os = if std::env::consts::OS == "macos" { "darwin" } else { std::env::consts::OS };
     format!("{os}-{}", std::env::consts::ARCH)
+}
+
+/// The directories the loader searches for a bare `library` name, in order:
+/// the current working directory, `$EPHPM_MIDDLEWARE_DIR` (when set and
+/// non-empty), then `/usr/local/lib/ephpm/middleware`.
+///
+/// Public so the `ephpm middleware` CLI's `search-path` verb and its default
+/// install destination match exactly where the loader looks.
+#[must_use]
+pub fn search_dirs() -> Vec<PathBuf> {
+    let mut dirs = vec![PathBuf::from(".")];
+    if let Ok(dir) = std::env::var("EPHPM_MIDDLEWARE_DIR")
+        && !dir.is_empty()
+    {
+        dirs.push(PathBuf::from(dir));
+    }
+    dirs.push(PathBuf::from("/usr/local/lib/ephpm/middleware"));
+    dirs
 }
 
 /// Resolve a mount's `library` string to a file on disk.
@@ -396,13 +419,7 @@ fn resolve_library(library: &str) -> anyhow::Result<PathBuf> {
         format!("{library}.{ext}"),
     ];
 
-    let mut dirs = vec![PathBuf::from(".")];
-    if let Ok(dir) = std::env::var("EPHPM_MIDDLEWARE_DIR")
-        && !dir.is_empty()
-    {
-        dirs.push(PathBuf::from(dir));
-    }
-    dirs.push(PathBuf::from("/usr/local/lib/ephpm/middleware"));
+    let dirs = search_dirs();
 
     let mut tried = Vec::new();
     for dir in &dirs {
