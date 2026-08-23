@@ -296,45 +296,55 @@ fn dynamic_init_failure_aborts_startup() {
     assert!(err.contains("init returned -3"), "{err}");
 }
 
-// ── chain composition across both lanes ───────────────────────────────────
+// ── chain composition ─────────────────────────────────────────────────────
 
-/// A builtin (static registry) mount and a dlopened mount in one chain,
-/// ordered, with both contributing response headers. Proves the two backends
-/// compose — the router sees one uniform `ChainVerdict` regardless of lane.
+/// Two dlopened mounts in one chain, ordered, with globs. Proves multiple
+/// dynamic modules compose — the router sees one uniform `ChainVerdict`, and an
+/// off-glob mount is skipped. (The static builtin registry is empty in stock
+/// binaries; the official modules load through this same dlopen lane, so
+/// "compose two dynamic mounts" is the realistic chain.)
 #[test]
-fn builtin_and_dynamic_modules_compose_in_one_chain() {
-    let lib = fixture("mw_probe_v1");
+fn multiple_dynamic_modules_compose_in_one_chain() {
+    // Separate temp copies so dlopen's (device, inode) cache does not collapse
+    // the two mounts into one shared, first-config-wins instance.
+    let always = fixture("mw_probe_v1");
+    let api_only = fixture("mw_probe_v1");
     let mounts = vec![
         MiddlewareMount {
-            library: "security-headers".to_owned(),
+            library: always.path().to_string_lossy().into_owned(),
             match_pattern: None,
             order: 10,
-            config: Some(serde_json::json!({ "csp": "default-src 'none'" })),
+            config: Some(serde_json::json!({ "tag": "always" })),
         },
         MiddlewareMount {
-            library: lib.path().to_string_lossy().into_owned(),
+            library: api_only.path().to_string_lossy().into_owned(),
             match_pattern: Some("/api/*".to_owned()),
             order: 20,
-            config: Some(serde_json::json!({ "tag": "mixed-chain" })),
+            config: Some(serde_json::json!({ "tag": "api-only" })),
         },
     ];
-    let chain = MiddlewareChain::load(&mounts).expect("mixed builtin + dynamic chain loads");
+    let chain = MiddlewareChain::load(&mounts).expect("two dynamic mounts load");
     assert_eq!(chain.len(), 2);
 
-    // Off-glob: only the builtin contributes; the dynamic mount is skipped.
+    let tags = |rh: &[(String, String)]| -> Vec<String> {
+        rh.iter()
+            .filter(|(n, _)| n.eq_ignore_ascii_case("X-Probe-Tag"))
+            .map(|(_, v)| v.clone())
+            .collect()
+    };
+
+    // Off-glob: only the no-glob mount contributes; the /api/* mount is skipped.
     let ctx = RequestCtx::new("GET", "/index.php", "", "203.0.113.1", "mixed", &[]);
     let ChainVerdict::Continue { response_headers, .. } = chain.evaluate(&ctx, "/index.php") else {
         panic!("expected CONTINUE off-glob");
     };
-    assert_eq!(find(&response_headers, "Content-Security-Policy"), Some("default-src 'none'"));
-    assert!(find(&response_headers, "X-Probe-Tag").is_none(), "dynamic mount must be skipped");
+    assert_eq!(tags(&response_headers), vec!["always".to_owned()]);
 
-    // On-glob: both lanes run, in `order`.
+    // On-glob: both mounts run, in `order`.
     let ctx = RequestCtx::new("GET", "/api/v1.php", "", "203.0.113.1", "mixed", &[]);
     let ChainVerdict::Continue { response_headers, .. } = chain.evaluate(&ctx, "/api/v1.php")
     else {
         panic!("expected CONTINUE on-glob");
     };
-    assert_eq!(find(&response_headers, "Content-Security-Policy"), Some("default-src 'none'"));
-    assert_eq!(find(&response_headers, "X-Probe-Tag"), Some("mixed-chain"));
+    assert_eq!(tags(&response_headers), vec!["always".to_owned(), "api-only".to_owned()]);
 }

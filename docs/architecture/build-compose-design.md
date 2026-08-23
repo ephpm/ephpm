@@ -15,6 +15,79 @@
 > dlopen is genuinely unavailable) with extra extensions/middleware baked
 > in at build time.
 
+## 0. Vendoring the official middleware into a static build (works today)
+
+The four official middleware modules (`jwt`, `cors`, `ratelimit`,
+`security-headers`) ship prebuilt from
+[github.com/ephpm/middleware](https://github.com/ephpm/middleware) and are
+loaded by `dlopen` on the stock (glibc-dynamic) binaries. A **fully-static
+(musl)** binary cannot `dlopen`, so to have those modules there you compile
+them **in**, through the in-process builtin registry
+(`crates/ephpm-server/src/middleware.rs::builtin`).
+
+This is intentionally **not** a committed cargo feature. A cargo optional
+dependency is resolved into `Cargo.lock` on *every* build regardless of which
+features are enabled, so declaring `ephpm-middleware-modules` as an optional
+git dependency would couple every stock build — and CI — to fetching that
+external repo for a crate it never compiles. It is a deliberate local edit
+instead:
+
+1. **Add the modules crate + unify the ABI crate.** In the workspace
+   `Cargo.toml`:
+
+   ```toml
+   [workspace.dependencies]
+   ephpm-middleware-modules = { git = "https://github.com/ephpm/middleware.git", rev = "<pin>" }
+
+   # ephpm-middleware-modules depends on ephpm-middleware by git; core uses it
+   # by path. Cargo treats those as distinct crates (a trait mismatch at the
+   # builtin registry) unless you unify them:
+   [patch."https://github.com/ephpm/ephpm.git"]
+   ephpm-middleware = { path = "crates/ephpm-middleware" }
+   ```
+
+2. **Make it an optional dep + feature of `ephpm-server`** (`crates/ephpm-server/Cargo.toml`):
+
+   ```toml
+   [dependencies]
+   ephpm-middleware-modules = { workspace = true, optional = true }
+
+   [features]
+   vendor-middleware = ["dep:ephpm-middleware-modules"]
+   ```
+
+   and forward it from the `ephpm` binary crate
+   (`vendor-middleware = ["ephpm-server/vendor-middleware"]`).
+
+3. **Wire the registry.** Replace the `builtin` body in
+   `crates/ephpm-server/src/middleware.rs` with a `#[cfg(feature =
+   "vendor-middleware")]` variant that maps names to the module types:
+
+   ```rust
+   #[cfg(feature = "vendor-middleware")]
+   #[must_use]
+   pub fn builtin(name: &str) -> Option<BuiltinBuilder> {
+       let canonical = name.replace('_', "-");
+       Some(match canonical.as_str() {
+           "jwt" | "ephpm-middleware-jwt" =>
+               BuiltinModule::init::<ephpm_middleware_modules::jwt::Jwt>,
+           "cors" | "ephpm-middleware-cors" =>
+               BuiltinModule::init::<ephpm_middleware_modules::cors::Cors>,
+           "ratelimit" | "rate-limit" | "ephpm-middleware-ratelimit" =>
+               BuiltinModule::init::<ephpm_middleware_modules::ratelimit::RateLimit>,
+           "security-headers" | "ephpm-middleware-security-headers" =>
+               BuiltinModule::init::<ephpm_middleware_modules::security_headers::SecurityHeaders>,
+           _ => return None,
+       })
+   }
+   ```
+
+4. **Build with the feature:** `cargo build --release --features
+   vendor-middleware` (plus your musl target). `library = "jwt"` now resolves
+   in-process, no `.so` on disk.
+
+Everything below is the older, broader `forge` design (still future work).
+
 ## 1. Problem and constraint
 
 > *Historical premise — see the superseded note above. Kept because it

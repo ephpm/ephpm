@@ -1358,51 +1358,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ephpm-middleware-builtins"
-version = "0.1.0"
-dependencies = [
- "base64ct",
- "ephpm-kv",
- "ephpm-middleware",
- "hmac 0.12.1",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
-name = "ephpm-middleware-cors"
-version = "0.1.0"
-dependencies = [
- "ephpm-middleware",
- "ephpm-middleware-builtins",
-]
-
-[[package]]
-name = "ephpm-middleware-jwt"
-version = "0.1.0"
-dependencies = [
- "ephpm-middleware",
- "ephpm-middleware-builtins",
-]
-
-[[package]]
-name = "ephpm-middleware-ratelimit"
-version = "0.1.0"
-dependencies = [
- "ephpm-middleware",
- "ephpm-middleware-builtins",
- "serde_json",
-]
-
-[[package]]
-name = "ephpm-middleware-security-headers"
-version = "0.1.0"
-dependencies = [
- "ephpm-middleware",
- "ephpm-middleware-builtins",
-]
-
-[[package]]
 name = "ephpm-php"
 version = "0.1.0"
 dependencies = [
@@ -1450,7 +1405,6 @@ dependencies = [
  "ephpm-db",
  "ephpm-kv",
  "ephpm-middleware",
- "ephpm-middleware-builtins",
  "ephpm-php",
  "ephpm-query-stats",
  "ephpm-ws",

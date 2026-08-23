@@ -208,8 +208,7 @@ crates/
 │                       # two-tier KV replication, SQLite primary election
 ├── ephpm-query-stats/  # SQL normalizer + digest tracking + Prometheus metrics
 ├── ephpm-middleware/   # Middleware C ABI + Rust authoring kit + host table + builtin adapter
-├── ephpm-middleware-builtins/  # The four in-tree middleware implementations (rlib, linked into the server)
-├── ephpm-middleware-{jwt,cors,ratelimit,security-headers}/  # cdylib shells for the dlopen lane
+│                       # (the 4 official modules moved OUT to github.com/ephpm/middleware; fetched via `ephpm middleware get`)
 ├── ephpm-e2e/          # E2E test suite — excluded from workspace; runs bare-process via `cargo xtask e2e` (opt-in Kind path is `cargo xtask k8s-e2e`)
 └── xtask/              # Build tooling — release, php-sdk, e2e (bare-process default), k8s-e2e/k8s-e2e-up/k8s-e2e-down (opt-in)
 ```

@@ -14,22 +14,37 @@ KV store and the `tracing` logger are one function call away. That's what
 makes a cluster-wide rate limiter a ~100-line module — the replicated
 counter is a single `kv_incr`.
 
-There are **two ways a module runs**:
+Modules run through a small, versioned **C ABI**: a module is a `.so` /
+`.dylib` / `.dll` loaded at startup via `dlopen` (`LoadLibrary` on Windows).
+The stock release binaries are dynamically linked and load modules out of the
+box on every platform — see [the dynamic lane](#the-dynamic-lane).
 
-- **Built-in (static registry).** Four modules — `jwt`, `cors`,
-  `ratelimit`, `security-headers` — are compiled into **every** ePHPm
-  binary. `library = "jwt"` just works: no shared library on disk, no
-  `dlopen`, no special build.
-- **Dynamic (shared library).** Custom out-of-tree modules are `.so` /
-  `.dylib` / `.dll` files speaking a small, versioned C ABI, loaded once at
-  startup via `dlopen` (`LoadLibrary` on Windows). This works out of the
-  box with the stock release binaries on every platform — see
-  [the dynamic lane](#the-dynamic-lane).
+The four **official modules** — `jwt`, `cors`, `ratelimit`,
+`security-headers` — ship prebuilt from
+[github.com/ephpm/middleware](https://github.com/ephpm/middleware). Fetch the
+one for your platform into the loader's search path and mount it by name:
+
+```bash
+ephpm middleware get jwt        # downloads jwt.<platform>.<ext>, verified
+```
+
+> **Changed in v0.8.0.** Earlier releases compiled these four modules into
+> every binary (`library = "jwt"` with nothing on disk). They are now fetched,
+> not built in — a smaller server binary, and modules that version and update
+> independently. A fully-static (musl) build that cannot `dlopen` can still
+> compile them in; see [static binaries](#the-dynamic-lane).
 
 ## Quick start
 
-Built-ins need nothing but configuration — this works with the stock
-release binary on every platform:
+Fetch the official modules for your platform, then mount them by name. This
+works with the stock release binary on every platform:
+
+```bash
+ephpm middleware get security-headers
+ephpm middleware get cors
+ephpm middleware get jwt
+ephpm middleware get ratelimit
+```
 
 ```toml
 # /etc/ephpm/ephpm.toml
@@ -60,10 +75,11 @@ order   = 40
 config  = { per_ip_rps = 1, burst = 2 }
 ```
 
-Startup logs each module as it initialises, then the whole chain:
+Startup logs each module as it initialises (with the path it loaded from),
+then the whole chain:
 
 ```
-INFO ephpm_server::middleware: middleware initialised (builtin) module=security-headers describe=...
+INFO ephpm_server::middleware: middleware initialised module=security-headers path=... describe=...
 ...
 INFO ephpm_server: middleware chain loaded count=4 modules=[...]
 ```
@@ -89,7 +105,7 @@ Mounts are `[[middleware]]` blocks in `ephpm.toml`, ordered explicitly:
 
 ```toml
 [[middleware]]
-library = "security-headers"                    # built-in (compiled in)
+library = "security-headers"                    # a fetched official module
 order   = 10
 config  = { csp = "default-src 'self'" }
 
@@ -102,7 +118,7 @@ config  = { api_key = "..." }
 
 | Key | Required | Meaning |
 |-----|----------|---------|
-| `library` | yes | Built-in name or shared library to load — bare name or explicit path (see below). Must not be empty. |
+| `library` | yes | Module to load — a bare name (resolved through the search path, see below) or an explicit path. Must not be empty. |
 | `match` | no | Path glob; the mount only runs when the request path matches. `*` matches any character sequence, **including `/`**. Unset = every PHP-bound request. |
 | `order` | yes | Chain position. Lower runs first; equal orders keep declaration order. |
 | `config` | no | Arbitrary table, serialised to JSON and handed to the module's `init`. |
@@ -111,22 +127,17 @@ Mounts are **global** — they apply to every vhost. A module that needs
 per-tenant behavior reads the request's vhost id (the server name) and
 decides itself.
 
-Loading is **fail-fast**: a builtin whose `init` rejects its config, a
-library that can't be found, a missing ABI symbol, or a dynamic module
-whose `init` returns an error aborts server startup with a message naming
-the mount.
+Loading is **fail-fast**: a library that can't be found, a missing ABI
+symbol, or a module whose `init` returns an error aborts server startup with
+a message naming the mount (and, for a bare name, every path it tried).
 
 ### Library resolution
 
-The `library` value is checked against the **builtin registry first**.
-Each built-in answers to its short name and its crate name, with `-` and
-`_` interchangeable: `jwt`, `cors`, `ratelimit` (also `rate-limit`),
-`security-headers`, and the `ephpm-middleware-*` / `ephpm_middleware_*`
-long forms. Builtin mounts never touch the filesystem.
-
-Anything else is resolved as a shared library. A value containing a path
-separator or a file extension is used as-is. A bare name tries, in each
-search directory:
+Every `library` value resolves to a shared library on disk (the built-in
+registry is empty in stock binaries — see [static binaries](#the-dynamic-lane)
+for the one exception). A value containing a path separator or a file
+extension is used as-is. A bare name — including an official module name like
+`jwt` — tries, in each search directory:
 
 1. `<name>.<os>-<arch>.<ext>` — e.g. `my-auth.linux-x86_64.so`
 2. `lib<name>.<ext>` — cargo's own artifact naming
@@ -192,11 +203,12 @@ exists on disk still takes the static branch and is never routed to the worker
 > a proxy in front of ePHPm. (Making the chain gate the static branch is tracked
 > as a separate design decision in issue #395 and is not implemented.)
 
-## The built-in modules
+## The official modules
 
-All four are compiled into every ePHPm binary and run in-process — the
-sections below apply identically whether you mount them by short name
-(built-in) or dlopen their cdylib builds on a dynamic binary.
+The four official modules ship prebuilt from
+[github.com/ephpm/middleware](https://github.com/ephpm/middleware) — fetch
+them with `ephpm middleware get <name>` and mount them by name. The sections
+below document their configuration.
 
 ### `security-headers`
 
@@ -310,10 +322,17 @@ fully static musl ePHPm (`x86_64-unknown-linux-musl` with `crt-static`)
 if your deployment demands it, but be aware that a fully static binary
 **cannot `dlopen()` anything** — every `[[middleware]]` mount that
 resolves to a shared library (and every `[php] extensions` entry) fails
-startup with `Dynamic loading not supported`. Built-ins keep working;
-custom static composition tooling for that scenario is future work
-(`docs/architecture/build-compose-design.md`). Planned — not yet
-implemented.
+startup with `Dynamic loading not supported`. Since the official modules
+are loaded by `dlopen`, a static binary has **no middleware by default**.
+
+To use them there, compile the official modules **into** the static binary
+(the in-process builtin registry, so `library = "jwt"` resolves with no
+`dlopen`). This is a deliberate, documented compile-time step — not a cargo
+feature, because an optional git dependency is resolved on every build and
+would couple stock builds to fetching an external repo. The recipe (add the
+`ephpm-middleware-modules` dependency, unify the ABI crate with a `[patch]`,
+and wire the registry) lives in
+[`docs/architecture/build-compose-design.md`](https://github.com/ephpm/ephpm/blob/main/docs/architecture/build-compose-design.md).
 
 ## Writing your own module in Rust
 
@@ -385,9 +404,9 @@ cargo build --release -p my-auth
 
 The artifact lands at `target/release/lib<crate_name>.so`; a bare
 `library = "<crate_name>"` mount finds the `lib<name>.so` form through
-the search path. The four in-tree modules build exactly the same way
-(`-p ephpm-middleware-jwt -p ephpm-middleware-cors
--p ephpm-middleware-ratelimit -p ephpm-middleware-security-headers`).
+the search path. The four official modules build the same way from the
+[`ephpm/middleware`](https://github.com/ephpm/middleware) repo — or just
+fetch the prebuilt ones with `ephpm middleware get <name>`.
 
 Build on a distro whose glibc is not newer than the deployment target's
 (the usual glibc forward-compatibility rule — a module built on Debian 12

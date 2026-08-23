@@ -2,19 +2,22 @@
 //!
 //! Builds the chain declared in `[[middleware]]` at startup (fail-fast: a
 //! broken mount aborts server startup) and evaluates it per PHP-bound
-//! request — before any body bytes are read, so a `RESPOND` verdict never
+//! request â€” before any body bytes are read, so a `RESPOND` verdict never
 //! pays for the body transfer.
 //!
 //! Each mount resolves through two lanes, in order:
 //!
-//! 1. **Builtin registry** ([`builtin`]) — the four in-tree modules compiled
-//!    into this binary and invoked in-process (no FFI, no dlopen). Works in
-//!    every binary, including custom fully static builds where `dlopen` does
-//!    not exist.
-//! 2. **Shared library** — everything else goes through the dlopen path and
-//!    the versioned C ABI host table, for out-of-tree modules. Works with the
-//!    stock release binaries on every platform (the Linux release is
-//!    glibc-dynamic).
+//! 1. **Builtin registry** ([`builtin`]) â€” modules compiled into this binary
+//!    and invoked in-process (no FFI, no dlopen). This registry is **empty
+//!    unless the binary is built with the `vendor-middleware` feature**, which
+//!    exists only for fully-static (musl) builds that cannot `dlopen`. Stock
+//!    (glibc-dynamic) release binaries use lane 2 for everything.
+//! 2. **Shared library** â€” the dlopen path and the versioned C ABI host table.
+//!    The default (and only, in stock binaries) lane: the four official
+//!    modules are fetched as prebuilt cdylibs (`ephpm middleware get <name>`,
+//!    from the `ephpm/middleware` releases) and loaded here, alongside any
+//!    out-of-tree module. Works with the stock release binaries on every
+//!    platform (the Linux release is glibc-dynamic).
 //!
 //! **Coverage:** the chain runs only for PHP-dispatched requests (inside
 //! `Router::handle_php`). Static-file responses and error responses (403/404
@@ -63,7 +66,7 @@ pub struct MiddlewareChain {
 
 /// One mounted module: its identity plus the execution backend.
 struct Loaded {
-    /// Mount name (the config `library` string) — used in logs and metrics.
+    /// Mount name (the config `library` string) â€” used in logs and metrics.
     name: String,
     /// Glob the request path must match (None = run on every request).
     match_pattern: Option<String>,
@@ -73,11 +76,11 @@ struct Loaded {
 
 /// The two execution lanes a mounted module can run through.
 enum Backend {
-    /// Compiled into this binary via the static [`builtin`] registry —
+    /// Compiled into this binary via the static [`builtin`] registry â€”
     /// invoked directly, no FFI round-trip. Works in fully static binaries.
     Builtin(BuiltinModule),
     /// dlopened shared library speaking the versioned C ABI. `_lib` must
-    /// outlive the fn pointers — [`Drop`] on [`MiddlewareChain`] calls
+    /// outlive the fn pointers â€” [`Drop`] on [`MiddlewareChain`] calls
     /// `shutdown` while every library is still loaded.
     Dynamic {
         /// Per-request entrypoint resolved from the library.
@@ -92,32 +95,28 @@ enum Backend {
 /// Constructor signature for a middleware compiled into this binary.
 pub type BuiltinBuilder = fn(&serde_json::Value) -> Result<BuiltinModule, String>;
 
-/// Static registry of middleware compiled into every ePHPm binary —
-/// including custom fully static builds, where `dlopen` does not exist.
+/// Static registry of modules compiled into this binary â€” **empty in stock
+/// binaries**, so this returns `None` and every `library` value goes to the
+/// dlopen lane. The four official modules are fetched as prebuilt cdylibs at
+/// runtime (`ephpm middleware get <name>`, from the `ephpm/middleware`
+/// releases), not compiled in.
 ///
-/// `[[middleware]] library` values are checked here FIRST; only unmatched
-/// names fall through to the shared-library search path. Accepted spellings
-/// per module: the short name and the crate name, with `-` and `_`
-/// interchangeable — e.g. `"jwt"`, `"ephpm-middleware-jwt"`,
-/// `"ephpm_middleware_jwt"`. (`"ratelimit"` also answers to `"rate-limit"`.)
+/// The registry machinery below ([`BuiltinBuilder`], [`load_builtin`],
+/// [`Backend::Builtin`]) is retained because compiling the modules in-process
+/// is still the answer for a fully-static (musl) build that cannot `dlopen` â€”
+/// a documented advanced recipe wires this function to the `ephpm/middleware`
+/// repo's `ephpm-middleware-modules` crate. See
+/// `docs/architecture/build-compose-design.md`. It is not a committed cargo
+/// feature: an optional git dependency is resolved on every build regardless
+/// of features, which would couple every default build to fetching that
+/// external repo.
+///
+/// When a registry IS wired in, `[[middleware]] library` values are checked
+/// here FIRST; only unmatched names fall through to the shared-library search
+/// path.
 #[must_use]
-pub fn builtin(name: &str) -> Option<BuiltinBuilder> {
-    let canonical = name.replace('_', "-");
-    Some(match canonical.as_str() {
-        "jwt" | "ephpm-middleware-jwt" => {
-            BuiltinModule::init::<ephpm_middleware_builtins::jwt::Jwt>
-        }
-        "cors" | "ephpm-middleware-cors" => {
-            BuiltinModule::init::<ephpm_middleware_builtins::cors::Cors>
-        }
-        "ratelimit" | "rate-limit" | "ephpm-middleware-ratelimit" => {
-            BuiltinModule::init::<ephpm_middleware_builtins::ratelimit::RateLimit>
-        }
-        "security-headers" | "ephpm-middleware-security-headers" => {
-            BuiltinModule::init::<ephpm_middleware_builtins::security_headers::SecurityHeaders>
-        }
-        _ => return None,
-    })
+pub fn builtin(_name: &str) -> Option<BuiltinBuilder> {
+    None
 }
 
 /// Outcome of evaluating the middleware chain for one request.
@@ -144,7 +143,7 @@ pub enum ChainVerdict {
 }
 
 impl MiddlewareChain {
-    /// Load and initialise every mount, sorted by `order` (stable — equal
+    /// Load and initialise every mount, sorted by `order` (stable â€” equal
     /// orders keep declaration order). Each `library` value is resolved
     /// against the [`builtin`] registry first; only unmatched names hit the
     /// shared-library search path and dlopen.
@@ -198,7 +197,7 @@ impl MiddlewareChain {
     ///
     /// Walks modules in `order`, skipping those whose `match` glob does not
     /// match `path`. `RESPOND` short-circuits; `REWRITE` accumulates path and
-    /// header overrides. Every module sees the ORIGINAL `ctx` (v1 semantics —
+    /// header overrides. Every module sees the ORIGINAL `ctx` (v1 semantics â€”
     /// rewrites are applied by the router after the chain completes).
     /// Failures fail closed as a 500: a non-zero dynamic `invoke` return, or
     /// a builtin module panic (caught in [`BuiltinModule::invoke`]).
@@ -266,7 +265,7 @@ impl Drop for MiddlewareChain {
                 Backend::Dynamic { shutdown, .. } => {
                     let shutdown = *shutdown;
                     // SAFETY: `shutdown` points into the module's `_lib`,
-                    // which is still loaded — the Library handles drop after
+                    // which is still loaded â€” the Library handles drop after
                     // this loop, when the struct's fields are dropped.
                     unsafe { shutdown() };
                 }
@@ -276,12 +275,12 @@ impl Drop for MiddlewareChain {
 }
 
 /// Call a dlopened module's `invoke` and copy its verdict into owned host
-/// memory. Failures are normalised here — a non-zero return code fails
+/// memory. Failures are normalised here â€” a non-zero return code fails
 /// closed as a 500 `RESPOND`, an unknown action is treated as a bare
-/// `CONTINUE` — so the chain loop handles both backends identically.
+/// `CONTINUE` â€” so the chain loop handles both backends identically.
 fn invoke_dynamic(invoke: abi::InvokeFn, ctx: &RequestCtx, name: &str) -> Verdict {
     // Zero-initialised verdict struct: action = CONTINUE, all pointers
-    // null — the documented pre-call state.
+    // null â€” the documented pre-call state.
     let mut resp = abi::EphpmResponse {
         action: abi::ACTION_CONTINUE,
         status: 0,
@@ -301,7 +300,7 @@ fn invoke_dynamic(invoke: abi::InvokeFn, ctx: &RequestCtx, name: &str) -> Verdic
         tracing::error!(
             module = %name,
             rc,
-            "middleware invoke returned an error — failing closed with 500"
+            "middleware invoke returned an error â€” failing closed with 500"
         );
         return Verdict::Respond {
             status: 500,
@@ -310,13 +309,13 @@ fn invoke_dynamic(invoke: abi::InvokeFn, ctx: &RequestCtx, name: &str) -> Verdic
         };
     }
 
-    // Copy EVERYTHING the module pointed at before this call returns — the
+    // Copy EVERYTHING the module pointed at before this call returns â€” the
     // ABI only guarantees the pointers until invoke's caller returns, and
     // the next invoke may reuse the same buffers.
     match resp.action {
         abi::ACTION_RESPOND => {
             // SAFETY: RESPOND pointers are valid until invoke's caller
-            // returns — we are still inside that window.
+            // returns â€” we are still inside that window.
             let body = unsafe { copy_bytes(resp.body, resp.body_len) };
             // SAFETY: same validity window as above.
             let headers = unsafe { copy_headers(resp.header_overrides, resp.header_overrides_len) };
@@ -324,7 +323,7 @@ fn invoke_dynamic(invoke: abi::InvokeFn, ctx: &RequestCtx, name: &str) -> Verdic
         }
         abi::ACTION_REWRITE => Verdict::Rewrite {
             // SAFETY: REWRITE pointers are valid until invoke's caller
-            // returns — we are still inside that window.
+            // returns â€” we are still inside that window.
             path: unsafe { copy_c_str(resp.rewrite_path) },
             // SAFETY: same validity window as above.
             header_overrides: unsafe {
@@ -337,7 +336,7 @@ fn invoke_dynamic(invoke: abi::InvokeFn, ctx: &RequestCtx, name: &str) -> Verdic
         },
         abi::ACTION_CONTINUE => Verdict::Continue {
             // SAFETY: CONTINUE pointers are valid until invoke's caller
-            // returns — we are still inside that window.
+            // returns â€” we are still inside that window.
             response_headers: unsafe {
                 copy_headers(resp.response_headers, resp.response_headers_len)
             },
@@ -346,7 +345,7 @@ fn invoke_dynamic(invoke: abi::InvokeFn, ctx: &RequestCtx, name: &str) -> Verdic
             tracing::warn!(
                 module = %name,
                 action = other,
-                "middleware returned an unknown action — treating as continue"
+                "middleware returned an unknown action â€” treating as continue"
             );
             Verdict::Continue { response_headers: Vec::new() }
         }
@@ -438,7 +437,7 @@ fn load_builtin(mount: &MiddlewareMount, build: BuiltinBuilder) -> anyhow::Resul
 /// dlopen a module, resolve the four ABI symbols, and run `init`.
 fn load_module(mount: &MiddlewareMount, path: &Path) -> anyhow::Result<Loaded> {
     // SAFETY: loading a middleware library runs its initialisers with the
-    // host's privileges — that is the documented v1 trust model (middleware
+    // host's privileges â€” that is the documented v1 trust model (middleware
     // is as trusted as ePHPm itself; there is no sandbox).
     let lib = unsafe { libloading::Library::new(path) }
         .with_context(|| format!("dlopen failed for {}", path.display()))?;
@@ -453,7 +452,7 @@ fn load_module(mount: &MiddlewareMount, path: &Path) -> anyhow::Result<Loaded> {
     // SAFETY: as above.
     let shutdown: abi::ShutdownFn = *unsafe { lib.get::<abi::ShutdownFn>(abi::SYM_SHUTDOWN) }
         .context("missing required symbol ephpm_middleware_shutdown")?;
-    // SAFETY: as above. `describe` is optional — absence is not an error.
+    // SAFETY: as above. `describe` is optional â€” absence is not an error.
     let describe: Option<abi::DescribeFn> =
         unsafe { lib.get::<abi::DescribeFn>(abi::SYM_DESCRIBE) }.ok().map(|sym| *sym);
 
@@ -522,7 +521,7 @@ unsafe fn copy_c_str(p: *const c_char) -> Option<String> {
     if p.is_null() {
         return None;
     }
-    // SAFETY: caller contract — non-null `p` is NUL-terminated and live.
+    // SAFETY: caller contract â€” non-null `p` is NUL-terminated and live.
     Some(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned())
 }
 
@@ -535,7 +534,7 @@ unsafe fn copy_bytes(p: *const u8, len: usize) -> Vec<u8> {
     if p.is_null() || len == 0 {
         return Vec::new();
     }
-    // SAFETY: caller contract — `(p, len)` is a live byte slice.
+    // SAFETY: caller contract â€” `(p, len)` is a live byte slice.
     unsafe { std::slice::from_raw_parts(p, len) }.to_vec()
 }
 
@@ -550,11 +549,11 @@ unsafe fn copy_headers(p: *const abi::EphpmHeaderKv, len: usize) -> Vec<(String,
     if p.is_null() || len == 0 {
         return Vec::new();
     }
-    // SAFETY: caller contract — `(p, len)` is a live array of header KVs.
+    // SAFETY: caller contract â€” `(p, len)` is a live array of header KVs.
     let kvs = unsafe { std::slice::from_raw_parts(p, len) };
     kvs.iter()
         .filter_map(|kv| {
-            // SAFETY: caller contract — each entry follows the C-string rule.
+            // SAFETY: caller contract â€” each entry follows the C-string rule.
             let name = unsafe { copy_c_str(kv.name) }?;
             // SAFETY: as above.
             let value = unsafe { copy_c_str(kv.value) }?;
@@ -676,340 +675,24 @@ mod tests {
         assert_eq!(resolved, file);
     }
 
-    // ── Builtin registry (static, no dlopen) ─────────────────────────────
+    // â”€â”€ Builtin registry (empty in stock binaries) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    /// Wire a real in-memory KV store into the process-global host table
-    /// (first call wins; every test in this binary shares it).
-    fn wire_kv() {
-        ephpm_middleware::host::set_kv_store(&ephpm_kv::store::Store::new(
-            ephpm_kv::store::StoreConfig::default(),
-        ));
-    }
-
-    fn builtin_mount(
-        library: &str,
-        pattern: Option<&str>,
-        order: u32,
-        config: serde_json::Value,
-    ) -> MiddlewareMount {
-        MiddlewareMount {
-            library: library.to_string(),
-            match_pattern: pattern.map(str::to_owned),
-            order,
-            config: Some(config),
-        }
-    }
-
-    fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-        headers.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
-    }
-
+    /// The builtin registry is empty: every `library` value â€” even a known
+    /// module name â€” goes to the dlopen lane, where it is resolved from a
+    /// fetched cdylib. (The four official modules ship from the
+    /// `ephpm/middleware` repo; see `ephpm middleware get`.)
     #[test]
-    fn builtin_registry_resolves_every_documented_spelling() {
+    fn builtin_registry_is_empty() {
         for name in [
             "jwt",
             "cors",
             "ratelimit",
             "rate-limit",
-            "rate_limit",
             "security-headers",
-            "security_headers",
             "ephpm-middleware-jwt",
-            "ephpm_middleware_jwt",
-            "ephpm-middleware-cors",
             "ephpm_middleware_cors",
-            "ephpm-middleware-ratelimit",
-            "ephpm_middleware_ratelimit",
-            "ephpm-middleware-security-headers",
-            "ephpm_middleware_security_headers",
         ] {
-            assert!(builtin(name).is_some(), "\"{name}\" should resolve as builtin");
+            assert!(builtin(name).is_none(), "\"{name}\" must not resolve as a builtin");
         }
-        // Unknown names and anything path-like fall through to the dlopen lane.
-        for name in ["", "jwtx", "my-auth", "jwt.so", "./jwt", "middleware/jwt", "JWT"] {
-            assert!(builtin(name).is_none(), "\"{name}\" should NOT resolve as builtin");
-        }
-    }
-
-    /// The full four-module chain, loaded purely from the static registry —
-    /// no cdylib on disk, no dlopen. This is exactly what a fully static
-    /// release binary executes.
-    #[test]
-    fn builtin_chain_all_four_modules_end_to_end() {
-        wire_kv();
-        let mounts = vec![
-            builtin_mount(
-                "security-headers",
-                None,
-                10,
-                serde_json::json!({ "csp": "default-src 'self'" }),
-            ),
-            builtin_mount(
-                "cors",
-                None,
-                20,
-                serde_json::json!({ "allow_origins": ["https://app.example"] }),
-            ),
-            builtin_mount("jwt", Some("/api/*"), 30, serde_json::json!({ "secret": "s3cret" })),
-            builtin_mount(
-                "ratelimit",
-                Some("/api/*"),
-                40,
-                serde_json::json!({ "per_ip_rps": 1, "burst": 0 }),
-            ),
-        ];
-        let chain = MiddlewareChain::load(&mounts).expect("builtin chain loads without dlopen");
-        assert_eq!(chain.len(), 4);
-        assert_eq!(chain.module_names(), ["security-headers", "cors", "jwt", "ratelimit"]);
-
-        // Non-API path: jwt/ratelimit are skipped by their globs; the chain
-        // continues with security + CORS headers accumulated in order.
-        let ctx = RequestCtx::new(
-            "GET",
-            "/index.php",
-            "",
-            "203.0.113.7",
-            "vhost-builtin-chain",
-            &[("Origin".to_owned(), "https://app.example".to_owned())],
-        );
-        match chain.evaluate(&ctx, "/index.php") {
-            ChainVerdict::Continue { rewrite_path, header_overrides, response_headers } => {
-                assert!(rewrite_path.is_none());
-                assert!(header_overrides.is_empty());
-                assert_eq!(
-                    find_header(&response_headers, "Content-Security-Policy"),
-                    Some("default-src 'self'")
-                );
-                assert_eq!(find_header(&response_headers, "X-Frame-Options"), Some("DENY"));
-                assert_eq!(
-                    find_header(&response_headers, "Access-Control-Allow-Origin"),
-                    Some("https://app.example")
-                );
-                assert_eq!(find_header(&response_headers, "Vary"), Some("Origin"));
-            }
-            ChainVerdict::Respond { status, .. } => {
-                panic!("expected CONTINUE for the non-API path, got RESPOND {status}")
-            }
-        }
-
-        // API path without a token: jwt short-circuits — ratelimit never runs.
-        let ctx =
-            RequestCtx::new("GET", "/api/x.php", "", "203.0.113.7", "vhost-builtin-chain", &[]);
-        match chain.evaluate(&ctx, "/api/x.php") {
-            ChainVerdict::Respond { status, body, .. } => {
-                assert_eq!(status, 401);
-                assert_eq!(body, b"missing bearer token");
-            }
-            ChainVerdict::Continue { .. } => panic!("jwt must reject a token-less API request"),
-        }
-    }
-
-    #[test]
-    fn builtin_cors_preflight_short_circuits() {
-        let mounts = vec![builtin_mount(
-            "cors",
-            None,
-            10,
-            serde_json::json!({ "allow_origins": ["*"], "max_age": 600 }),
-        )];
-        let chain = MiddlewareChain::load(&mounts).expect("load builtin cors");
-        let ctx = RequestCtx::new(
-            "OPTIONS",
-            "/api/x.php",
-            "",
-            "203.0.113.7",
-            "vhost-builtin-cors",
-            &[
-                ("Origin".to_owned(), "https://any.example".to_owned()),
-                ("Access-Control-Request-Method".to_owned(), "PUT".to_owned()),
-            ],
-        );
-        match chain.evaluate(&ctx, "/api/x.php") {
-            ChainVerdict::Respond { status, body, headers } => {
-                assert_eq!(status, 204);
-                assert!(body.is_empty());
-                assert_eq!(find_header(&headers, "Access-Control-Allow-Origin"), Some("*"));
-                assert_eq!(find_header(&headers, "Access-Control-Max-Age"), Some("600"));
-            }
-            ChainVerdict::Continue { .. } => panic!("preflight must short-circuit"),
-        }
-    }
-
-    #[test]
-    fn builtin_ratelimit_trips_429_via_embedded_kv() {
-        wire_kv();
-        let mounts = vec![builtin_mount(
-            "ratelimit",
-            None,
-            10,
-            serde_json::json!({ "per_ip_rps": 1, "burst": 0 }),
-        )];
-        let chain = MiddlewareChain::load(&mounts).expect("load builtin ratelimit");
-        // Allowance is 10/window; even if a window boundary lands mid-loop,
-        // 3x the allowance must trip the limit.
-        let mut limited = None;
-        for _ in 0..30 {
-            let ctx =
-                RequestCtx::new("GET", "/x.php", "", "198.51.100.77", "vhost-builtin-rl", &[]);
-            if let ChainVerdict::Respond { status, headers, .. } = chain.evaluate(&ctx, "/x.php") {
-                limited = Some((status, headers));
-                break;
-            }
-        }
-        let (status, headers) = limited.expect("rate limit never tripped within 3x allowance");
-        assert_eq!(status, 429);
-        let retry: u64 = find_header(&headers, "Retry-After")
-            .expect("Retry-After present")
-            .parse()
-            .expect("numeric Retry-After");
-        assert!((1..=10).contains(&retry), "retry_after = {retry}");
-    }
-
-    #[test]
-    fn builtin_init_error_aborts_startup() {
-        // jwt without the required `secret` — fail-fast, naming the mount.
-        let mounts = vec![MiddlewareMount {
-            library: "jwt".to_owned(),
-            match_pattern: None,
-            order: 10,
-            config: None,
-        }];
-        let err = match MiddlewareChain::load(&mounts) {
-            Ok(_) => panic!("jwt without a secret must fail startup"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("\"jwt\""), "{err}");
-        assert!(err.contains("secret"), "{err}");
-    }
-
-    /// Locate a built middleware cdylib in the workspace target directory.
-    ///
-    /// These are the *shipped* module artifacts, produced only by an explicit
-    /// `cargo build` of the crate — `cargo test --workspace` does not emit a
-    /// library crate's `cdylib` output, so on a fresh tree they are absent.
-    fn built_module_path(stem: &str) -> Option<PathBuf> {
-        let target_root = std::env::var("CARGO_TARGET_DIR").map_or_else(
-            |_| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"),
-            PathBuf::from,
-        );
-        let (prefix, ext) = (std::env::consts::DLL_PREFIX, std::env::consts::DLL_EXTENSION);
-        ["debug", "release"]
-            .iter()
-            .map(|profile| target_root.join(profile).join(format!("{prefix}{stem}.{ext}")))
-            .find(|candidate| candidate.is_file())
-    }
-
-    /// Resolve a shipped cdylib, or decide what an absent artifact means.
-    ///
-    /// Locally, absent means "not built yet" and the test skips. In CI it
-    /// means the build wiring regressed, and skipping is exactly the failure
-    /// being closed here: this lane was *never* exercised, because nothing
-    /// built the artifact and the skip fired silently on every run. CI sets
-    /// `MIDDLEWARE_CDYLIB_REQUIRED=1` alongside the build step that
-    /// produces them, which turns the skip into a hard failure.
-    ///
-    /// Deliberately NOT `EPHPM_`-prefixed: that prefix is figment's config
-    /// namespace, so an `EPHPM_*` variable exported for the whole
-    /// `cargo nextest run --workspace` invocation is also visible to
-    /// `ephpm-config`'s own tests as a config key.
-    fn require_module_path(stem: &str) -> Option<PathBuf> {
-        if let Some(path) = built_module_path(stem) {
-            return Some(path);
-        }
-        assert!(
-            std::env::var_os("MIDDLEWARE_CDYLIB_REQUIRED").is_none(),
-            "shipped middleware cdylib `{stem}` is missing but \
-             MIDDLEWARE_CDYLIB_REQUIRED is set — build it with `cargo build --workspace`"
-        );
-        eprintln!("skipping: {stem} cdylib not built (run `cargo build --workspace`)");
-        None
-    }
-
-    /// Full dlopen → init → invoke → shutdown lifecycle against the real
-    /// `ephpm-middleware-security-headers` cdylib — the artifact operators
-    /// actually deploy, as opposed to the purpose-built fixtures in
-    /// `tests/middleware_dlopen.rs`. Runs on every CI platform, which is what
-    /// gives the dlopen lane macOS `dyld` coverage (the E2E suite is
-    /// Linux-only).
-    #[test]
-    fn load_real_module_end_to_end() {
-        let Some(path) = require_module_path("ephpm_middleware_security_headers") else {
-            return;
-        };
-        let mounts = vec![MiddlewareMount {
-            library: path.to_string_lossy().into_owned(),
-            match_pattern: None,
-            order: 10,
-            config: Some(serde_json::json!({ "csp": "default-src 'self'" })),
-        }];
-        let chain = MiddlewareChain::load(&mounts).expect("load real security-headers module");
-        assert_eq!(chain.len(), 1);
-
-        let ctx = RequestCtx::new("GET", "/index.php", "", "127.0.0.1", "test", &[]);
-        match chain.evaluate(&ctx, "/index.php") {
-            ChainVerdict::Continue { rewrite_path, header_overrides, response_headers } => {
-                assert!(rewrite_path.is_none());
-                assert!(header_overrides.is_empty());
-                let find = |name: &str| {
-                    response_headers
-                        .iter()
-                        .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                        .map(|(_, v)| v.as_str())
-                };
-                assert_eq!(find("Content-Security-Policy"), Some("default-src 'self'"));
-                assert_eq!(find("X-Frame-Options"), Some("DENY"));
-                assert_eq!(find("X-Content-Type-Options"), Some("nosniff"));
-            }
-            ChainVerdict::Respond { status, .. } => {
-                panic!("expected CONTINUE from security-headers, got RESPOND {status}")
-            }
-        }
-        // Dropping the chain exercises shutdown + dlclose.
-        drop(chain);
-    }
-
-    /// The shipped `ephpm-middleware-cors` cdylib, dlopened and driven through
-    /// a preflight — the `RESPOND` short-circuit marshaled back across the C
-    /// ABI (status, body, headers), which the `CONTINUE`-only security-headers
-    /// test above never touches.
-    ///
-    /// This is the same module and the same verdict the E2E suite asserts over
-    /// real HTTP, so a divergence between "the chain decided 204" and "the
-    /// client saw 204" localises to the router rather than to the loader.
-    #[test]
-    fn load_real_cors_module_preflight_short_circuits() {
-        let Some(path) = require_module_path("ephpm_middleware_cors") else {
-            return;
-        };
-        let mounts = vec![MiddlewareMount {
-            library: path.to_string_lossy().into_owned(),
-            match_pattern: None,
-            order: 10,
-            config: Some(serde_json::json!({ "allow_origins": ["*"], "max_age": 600 })),
-        }];
-        let chain = MiddlewareChain::load(&mounts).expect("load real cors module");
-        assert_eq!(chain.len(), 1);
-
-        let ctx = RequestCtx::new(
-            "OPTIONS",
-            "/api/x.php",
-            "",
-            "203.0.113.7",
-            "vhost-dynamic-cors",
-            &[
-                ("Origin".to_owned(), "https://any.example".to_owned()),
-                ("Access-Control-Request-Method".to_owned(), "PUT".to_owned()),
-            ],
-        );
-        match chain.evaluate(&ctx, "/api/x.php") {
-            ChainVerdict::Respond { status, body, headers } => {
-                assert_eq!(status, 204);
-                assert!(body.is_empty());
-                assert_eq!(find_header(&headers, "Access-Control-Allow-Origin"), Some("*"));
-                assert_eq!(find_header(&headers, "Access-Control-Max-Age"), Some("600"));
-            }
-            ChainVerdict::Continue { .. } => panic!("preflight must short-circuit through dlopen"),
-        }
-        drop(chain);
     }
 }

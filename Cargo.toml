@@ -178,11 +178,21 @@ ephpm-config = { path = "crates/ephpm-config" }
 ephpm-db = { path = "crates/ephpm-db" }
 ephpm-kv = { path = "crates/ephpm-kv" }
 ephpm-middleware = { path = "crates/ephpm-middleware" }
-ephpm-middleware-builtins = { path = "crates/ephpm-middleware-builtins" }
 ephpm-php = { path = "crates/ephpm-php" }
 ephpm-query-stats = { path = "crates/ephpm-query-stats" }
 ephpm-server = { path = "crates/ephpm-server" }
 ephpm-ws = { path = "crates/ephpm-ws" }
+
+# NOTE: the four official middleware modules used to live here as
+# `ephpm-middleware-*` crates. They now ship prebuilt from the standalone
+# `github.com/ephpm/middleware` repo and are loaded via `dlopen`
+# (`ephpm middleware get <name>`). They are deliberately NOT declared as a
+# dependency: an optional git dependency is still resolved on EVERY build (cargo
+# resolves the whole graph, feature-gated or not), which would couple every
+# default build — and CI — to fetching that external repo for a crate it never
+# compiles. Compiling the modules into a fully-static (musl) binary that cannot
+# dlopen is a documented advanced recipe instead — see
+# `docs/architecture/build-compose-design.md`.
 
 # External — litewire (embedded SQLite wire protocol proxy)
 #
