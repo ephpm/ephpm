@@ -2228,8 +2228,8 @@ pub struct PhpConfig {
     /// When unset, ePHPm auto-derives a buffer size (~1/64 of the memory
     /// budget, clamped `[32, 64]` MB) and emits it in serve mode. This sizes
     /// the buffer only — whether the JIT *uses* it is governed by
-    /// [`Self::opcache_jit`] (shaped default: tracing in single-site serve,
-    /// disable elsewhere). When the JIT is on and no size was derived (dev
+    /// [`Self::opcache_jit`] (shaped default: `disable` in every mode, on
+    /// every platform). When the JIT is on and no size was derived (dev
     /// mode), the same derivation is forced so an enabled JIT is never
     /// silently bufferless. An explicit `0` is respected but makes the JIT
     /// inert — startup warns.
@@ -7669,10 +7669,12 @@ opcache_revalidate_freq = 60
         let present = Config::load(&file).unwrap();
         assert_eq!(present.php.opcache_jit, None);
 
-        // Same shaped default either way. Which one it is, is platform-shaped
-        // (Windows defaults off — issue #365); what this test pins is that the
+        // Same shaped default either way, and it is no longer platform-shaped:
+        // `disable` everywhere (issue #365 — the upstream tracing-JIT
+        // side-trace defect reproduces on Linux too, see
+        // `JitReason::TracingJitBug`). What this test pins is that the
         // section's presence cannot change it.
-        let shaped = if cfg!(windows) { JitMode::Disable } else { JitMode::Tracing };
+        let shaped = JitMode::Disable;
         assert_eq!(absent.php.autotune(false, false).jit.value, shaped);
         assert_eq!(present.php.autotune(false, false).jit.value, shaped);
     }
