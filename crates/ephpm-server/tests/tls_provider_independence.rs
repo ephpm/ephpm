@@ -3,20 +3,19 @@
 //! **This file must live in its own integration-test binary and must never
 //! call `CryptoProvider::install_default()`.** That is the entire point.
 //!
-//! Both `ring` and `aws-lc-rs` end up compiled in — the workspace pins
-//! `rustls` to `ring`, while `rustls-acme`, `rcgen` and `hyper-rustls` (via
-//! `metrics-exporter-prometheus`) enable `aws-lc-rs`, and Cargo unions
-//! features. In that configuration rustls' `from_crate_features()` returns
-//! `None` rather than picking one, so `rustls::ServerConfig::builder()`
-//! panics unless something already installed a provider:
+//! Historically both `ring` and `aws-lc-rs` were compiled in, because Cargo
+//! unions features across the graph. In that state rustls'
+//! `from_crate_features()` returns `None` rather than picking one, so
+//! `rustls::ServerConfig::builder()` panics unless something already
+//! installed a provider:
 //!
 //! > Could not automatically determine the process-level CryptoProvider from
 //! > Rustls crate features.
 //!
-//! `crates/ephpm-server/src/tls.rs` did exactly that, so every server
-//! configured with a static `[server.tls]` cert/key aborted at startup with
-//! exit 101 — reproduced on v0.6.1 and on main. It survived review and CI
-//! because:
+//! `crates/ephpm-server/src/tls.rs` called exactly that builder, so every
+//! server configured with a static `[server.tls]` cert/key aborted at startup
+//! with exit 101 — reproduced on v0.6.1 and on main. It survived review and
+//! CI because:
 //!
 //! - `rustls-acme` always calls `builder_with_provider`, so the ACME path was
 //!   unaffected and kept working; and
@@ -27,7 +26,18 @@
 //! `install_default()` call anywhere in this binary, or folding these tests
 //! into one that has such a call, silently disarms them.
 //!
-//! Provider consolidation is tracked in issue #241.
+//! # Relationship to `tls_single_crypto_provider.rs`
+//!
+//! #241 removed the ambiguity at its source: the tree now compiles exactly
+//! one provider (aws-lc-rs), and `tests/tls_single_crypto_provider.rs` fails
+//! if that ever stops being true. So these tests are no longer the *primary*
+//! guard — with one provider, even a bare `builder()` would pass here.
+//!
+//! They are kept because the two failures are independent. Re-introducing
+//! `rustls/ring` is a one-line dependency change that any PR could make, and
+//! on the day it happens these tests are what decide whether static-cert
+//! HTTPS still starts. Keeping the call sites provider-independent is what
+//! makes that a duplicate-dependency nuisance instead of a startup panic.
 
 use std::path::{Path, PathBuf};
 

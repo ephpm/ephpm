@@ -64,13 +64,38 @@ brotli = "7"
 zstd = "0.13"
 ipnet = "2"
 tracing-appender = "0.2"
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# ONE rustls crypto provider for the whole tree: aws-lc-rs (issue #241).
+#
+# rustls only auto-selects a provider when EXACTLY ONE of its `ring` /
+# `aws_lc_rs` features is enabled; with both on, `from_crate_features()`
+# returns `None` and every bare `ServerConfig::builder()` /
+# `ClientConfig::builder()` panics at runtime with "Could not automatically
+# determine the process-level CryptoProvider". That is what broke static
+# `[server.tls]` startup in every release from v0.1.0 to v0.6.1 (#243).
+#
+# aws-lc-rs rather than ring, because ring cannot be the sink:
+#   - `ephpm-db` needs RSA-OAEP for the caching_sha2_password full-auth
+#     handshake and ring has no public-key *encryption* at all (see the
+#     aws-lc-rs pin below);
+#   - `rustls-acme` + `rcgen` (ACME/TLS-ALPN-01) and `pgwire` (via litewire)
+#     enable aws-lc-rs unconditionally.
+# So aws-lc-rs is compiled in no matter what we choose, and picking ring
+# would leave BOTH providers linked. Choosing aws-lc-rs costs no new build
+# toolchain either: it is already built in every release lane (Linux gnu,
+# macOS, Windows MSVC) as a direct dependency of ephpm-db.
+#
+# Cargo features are additive and cannot be turned off from here, so the
+# only way to keep this true is to keep every rustls consumer off `ring`.
+# The guard is `crates/ephpm-server/tests/tls_single_crypto_provider.rs`,
+# which fails the moment anything re-introduces `rustls/ring`.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "logging", "std", "tls12"] }
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
-# HTTP/3 (QUIC). The rustls-ring feature keeps QUIC on the SAME rustls
-# crypto provider the TCP TLS path installs as the process default (see
-# the rustls pin above) - mixing providers is a runtime panic risk.
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+# HTTP/3 (QUIC). `rustls-aws-lc-rs` keeps QUIC on the SAME rustls crypto
+# provider the TCP TLS path uses (see the rustls pin above) - mixing
+# providers is a runtime panic risk. It also keeps quinn-proto's own
+# packet-protection crypto on aws-lc-rs instead of dragging `ring` back in.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs", "log"] }
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 rustls-acme = { version = "0.15", default-features = false, features = ["tokio", "aws-lc-rs", "tls12", "webpki-roots"] }
@@ -97,6 +122,11 @@ md5 = "0.8"
 # rustls-acme and rcgen, so this pulls in nothing new — and it lets us avoid the
 # pure-Rust `rsa` crate, which still carries the unpatched RUSTSEC-2023-0071
 # (Marvin timing sidechannel).
+#
+# This is also why `ring` cannot be the workspace's single crypto provider:
+# ring exposes RSA *signing* and verification but no public-key encryption,
+# so there is no ring equivalent of `aws_lc_rs::rsa::OaepPublicEncryptingKey`.
+# See the rustls pin above (issue #241).
 aws-lc-rs = "1.16"
 base64ct = { version = "1", features = ["alloc"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp"] }

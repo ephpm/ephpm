@@ -80,6 +80,15 @@ pub const OTEL_TRACE_TARGET: &str = "ephpm_otel";
 ///
 /// Returns an error if the listen address is invalid or binding fails.
 pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
+    // Install the process-wide rustls crypto provider before anything can
+    // build a TLS config. ePHPm's own listeners name the provider explicitly
+    // and do not need this, but third-party rustls users in the tree
+    // (hyper-rustls behind the Prometheus push gateway, for one) call the
+    // bare `builder()` and consult the process default. Installing it here,
+    // deliberately and once, is what keeps every TLS config in the process on
+    // the same provider. Idempotent — see `tls::install_default_crypto_provider`.
+    tls::install_default_crypto_provider();
+
     // Install Prometheus recorder if metrics are enabled.
     let metrics_handle = if config.server.metrics.enabled {
         Some(metrics::init().context("failed to initialize metrics")?)
