@@ -1,524 +1,327 @@
 # Preview Deployments
 
-> **Status: DESIGN — the bot is not implemented in this repository.** The
-> webhook handler this page describes (**switchboard**) is a separate
-> project, not part of ePHPm, and no code in this repository references it.
-> Treat the bot workflow below as a sketch of an intended product.
+> **Status: PARTLY SHIPPED.** Every pull request gets a live preview URL with
+> its own database, deployed in seconds and torn down on merge.
 >
-> The **runtime side has shipped**, though: as of v0.7.0 ePHPm provides
-> per-site database isolation (each vhost gets its own Turso database file —
-> [`[db.sqlite] dir`](/reference/config/#dbsqlite)) and a preview-host preset
-> ([`[server] preview = true`](/reference/config/#server)) that applies safe
-> per-IP/per-site rate and connection limits, load shedding, and an
-> `X-Ephpm-Preview: 1` marker header. What is still design-only is
-> everything switchboard would do: webhooks, cloning, framework detection,
-> PR comments, and teardown.
+> - **The ePHPm runtime half has shipped.** Per-site databases
+>   ([`[db.sqlite] dir`](/reference/config/#dbsqlite)), per-site document roots
+>   ([`[server] site_overrides_dir`](/reference/config/#server)), lazy vhost
+>   discovery, per-site KV keyspaces and the
+>   [`[server] preview`](/reference/config/#server) limits preset are all in the
+>   binary. See [Virtual Hosts](/guides/virtual-hosts/) for how they behave.
+> - **The bot exists and is public.** [`ephpm/switchboard`](https://github.com/ephpm/switchboard)
+>   is a separate Rust project (not part of this workspace) that receives
+>   GitHub webhooks, clones, builds, and writes into ePHPm's `sites_dir`. It is
+>   young — several contract pieces below are open issues on that repo.
+> - **What is still design:** wildcard-certificate issuance from inside ePHPm,
+>   multi-PHP-version routing, teardown/GC policy, and scale-out past one VM.
+>
+> This page is the plan and the open questions. It is not a reference for the
+> shipped knobs — those live in [Configuration](/reference/config/) and
+> [Virtual Hosts](/guides/virtual-hosts/) — and it is not the app-developer
+> guide, which lives in switchboard alongside the schema it documents.
 
-The design: preview deployments for PHP applications driven by a GitHub bot, where every pull request would get a live preview URL with its own database — deployed in seconds, torn down on merge.
+## The two halves
 
-The system would have two components: **switchboard** (the webhook handler) and **ephpm** (the runtime), running side by side on the same VM.
+| Component | Repo | Language | Role |
+|-----------|------|----------|------|
+| **ephpm** | `ephpm/ephpm` | Rust | Serves every preview as a vhost. Owns TLS, routing, per-site DB/KV/sessions. |
+| **switchboard** (daemon) | [`ephpm/switchboard`](https://github.com/ephpm/switchboard) | Rust | Clones the PR, runs `build:`, materializes env, atomically swaps the checkout into `sites_dir`, runs `seed:`, health-gates. |
+| **switchboard-api** | `ephpm/switchboard-api` | PHP | **In progress.** The webhook receiver and GitHub App surface, split out of the daemon so the HTTP/GitHub side is a PHP app running *on* ePHPm. |
 
-## How It Works
+The daemon is being reduced to `deployer.rs` / `manifest.rs` / `secrets.rs` —
+the deployment mechanics — with the webhook, signature verification and PR
+commenting moving to the PHP API. Dogfooding: the thing that ships previews
+should itself be a PHP app on ePHPm.
+
+Both halves share the filesystem. Switchboard writes a directory under
+`sites_dir`; ePHPm discovers it on the next request. No IPC, no reload signal,
+no coordination protocol — the filesystem is the interface. Removal is
+symmetric: delete the directory and the host falls back to
+`[server] document_root`.
+
+## Architecture as settled
+
+One ePHPm process, PHP 8.5, serving every preview as a virtual host, with TLS
+terminating in ePHPm. **No reverse proxy.** Multi-version support is deferred;
+if it comes back it will be port-based (`:8083`/`:8084`/`:8085`), one process
+per PHP version, rather than a proxy in front.
 
 ```
-Developer pushes PR
-       │
-       ▼
-GitHub sends webhook ──────────────────────────────► switchboard (:9090)
-                                                        │
-                                                        ├─ Verify signature
-                                                        ├─ git clone --depth 1
-                                                        ├─ Detect framework
-                                                        ├─ composer install
-                                                        ├─ mkdir sites/<hostname>/
-                                                        ├─ Copy files in
-                                                        └─ Post PR comment via GitHub API
-                                                              │
-                                                              ▼
-                                                    ┌─────────────────────┐
-                                                    │  PR Comment:        │
-                                                    │  ePHPm Preview      │
-                                                    │  https://pr-42...   │
-                                                    │  WordPress · 14s    │
-                                                    └─────────────────────┘
-
-User clicks preview link
-       │
-       ▼
-DNS: *.preview.ephpm.dev ──► VM IP ──► ephpm (:8080)
+GitHub webhook ──► switchboard-api (PHP, on ePHPm)
+                        │
+                        ▼
+                   switchboard daemon
+                        ├─ git clone --depth 1
+                        ├─ detect framework / load ephpm.yaml
+                        ├─ run build:
+                        ├─ materialize env:
+                        ├─ atomic swap ──► /var/www/sites/<host>/
+                        ├─ run seed:
+                        └─ poll health:  ─┐
                                           │
-                                          ├─ Host header → lazy vhost lookup
-                                          ├─ Directory exists? Serve from it
-                                          ├─ ACME cert issued on first HTTPS request
-                                          └─ PHP executes against local SQLite
+Browser ──► ephpm (:443, wildcard cert) ──┘
+                        ├─ Host header → site key → vhost
+                        ├─ site_overrides_dir → document root
+                        ├─ per-site Turso file, KV keyspace, sessions
+                        └─ X-Ephpm-Preview: 1 on every response
 ```
 
-No restart. No config reload. Switchboard writes a directory, ephpm discovers it on the next request.
-
-## Architecture
-
-### Components
-
-| Component | Repo | Language | What it does |
-|-----------|------|----------|-------------|
-| **ephpm** | `ephpm/ephpm` | Rust | PHP runtime + HTTP server with lazy vhost discovery |
-| **switchboard** | `ephpm/switchboard` (private) | Rust | GitHub webhook handler, clones repos, deploys to ephpm's `sites_dir` |
-
-### Runtime Flow
+### Preview host format
 
 ```
-                    ┌──────────────────────────────────────────┐
-                    │                  VM                       │
-                    │                                          │
-  GitHub ──webhook──┤► switchboard (:9090)                     │
-  webhooks          │    │                                     │
-                    │    ├─ git clone                          │
-                    │    ├─ composer install                    │
-                    │    └─ write to /var/www/sites/            │
-                    │                    │                      │
-                    │                    ▼                      │
-  HTTP ─────────────┤► ephpm (:8080)                           │
-  requests          │    ├─ Host header → sites_dir lookup     │
-                    │    ├─ Lazy discovery (filesystem check)  │
-                    │    ├─ PHP execution (ZTS, spawn_blocking) │
-                    │    └─ SQLite database (per-site file)    │
-                    │                                          │
-                    └──────────────────────────────────────────┘
+<owner>-<repo>-pr-<N>.preview.ephpm.dev
 ```
 
-Both processes share the filesystem. Switchboard writes to `sites_dir`, ephpm reads from it. No IPC, no API calls between them, no coordination protocol. The filesystem is the interface.
+for example `ephpm-wordpress-sample-pr-1.preview.ephpm.dev`.
 
-### Switchboard Internals
+The PR identity is a **single DNS label** — this is deliberate and load-bearing.
+A wildcard certificate for `*.preview.ephpm.dev` covers exactly one label; a
+multi-label host like `pr-42.my-blog.preview.ephpm.dev` would need a
+per-hostname certificate. Switchboard sanitizes the label and appends a short
+identity hash when sanitization would collide or the label runs long
+(`preview_label` in switchboard's `webhook.rs`).
 
-```
-switchboard/
-  src/
-    main.rs         # axum HTTP server, webhook dispatcher
-    config.rs       # CLI args + env vars
-    webhook.rs      # GitHub webhook parsing, HMAC-SHA256 signature verification
-    deployer.rs     # git clone → detect framework → composer install → deploy
-    github.rs       # Post/update PR comments, set deployment status
-```
+That hostname is also the vhost directory name, which makes it the
+[canonical site key](/guides/virtual-hosts/) — the string that selects
+`<dir>/<key>.db`, the KV keyspace, the private temp/session root, the
+`pdo_mysql` credential, and the name any `site_overrides_dir` file must use.
+Leave [`[server] sites_domain_suffix`](/reference/config/#server) unset on a
+preview host: switchboard names directories with the full FQDN, and setting a
+suffix would strip it, producing a key that no longer matches the directory.
 
-**Webhook handler flow:**
+## What ePHPm already gives a preview host
 
-1. Receive `POST /webhook` from GitHub
-2. Verify `X-Hub-Signature-256` against shared secret
-3. Parse `pull_request` event (opened/synchronize/reopened/closed)
-4. Respond 200 immediately (async processing)
-5. If deploy: clone repo → detect framework → `composer install` → copy to `sites_dir`
-6. If teardown: `rm -rf` the site directory
-7. Post/update PR comment with preview URL via GitHub API
+Rather than re-describe shipped behaviour, the short version with links:
 
-**GitHub App authentication:**
+- **Lazy vhost discovery** — a directory that appears after startup is served
+  on the next request. A missing host is negatively cached for 2 seconds, so a
+  fresh deploy goes live within that window. No restart, no reload, no signal.
+- **Per-site database** — `[db.sqlite] dir` gives every vhost its own Turso
+  file at `<dir>/<site-key>.db`, opened lazily and bounded by an LRU
+  (`max_open_dbs`, default 256). `dir` is **required** in multi-site mode;
+  ePHPm fails closed rather than share one database between tenants.
+  Reachable from both the native `ephpm_db_*` bridge and stock `pdo_mysql`
+  via injected per-site `DB_*` credentials
+  ([Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/)).
+- **Per-site document root** — `[server] site_overrides_dir` and one
+  operator-owned `<site-key>.toml` per site move the HTTP surface to `public/`
+  while `open_basedir` stays the whole container, so
+  `require '../vendor/autoload.php'` keeps working
+  ([Virtual Hosts](/guides/virtual-hosts/)).
+- **Preview preset** — `[server] preview = true` resolves every unset
+  `[server.limits]` knob to a preview default (`max_connections = 256`,
+  `per_ip_max_connections = 32`, `per_ip_rate = 10.0`, `per_ip_burst = 50`,
+  `per_site_rate = 5.0`, `per_site_burst = 20`), switches an unset
+  `[php] overload_policy` from `wait` to `shed`, and stamps
+  `X-Ephpm-Preview: 1` on every response so a preview instance can never be
+  mistaken for production. Explicit operator values always win, and startup
+  logs exactly which values the preset supplied.
 
-1. Switchboard holds the GitHub App's private key (PEM)
-2. On each webhook, creates a JWT signed with the private key
-3. Exchanges JWT for a short-lived installation access token
-4. Uses the token to post comments and set deployment statuses
-5. Tokens are scoped to the repos the user authorized — no access beyond that
+Coverage for the discovery lifecycle is real, not aspirational:
+`vhost_lazy_discovery_finds_new_directory` and `vhost_lazy_discovery_teardown`
+(unit, `ephpm-server`'s `router.rs`), plus `unknown_host_returns_fallback`,
+`lazy_discovered_site_serves_content` and `multiple_sites_isolated` (e2e,
+`ephpm-e2e/tests/vhosts.rs`).
 
-### Framework Detection
+## The app contract: `ephpm.yaml`
 
-Switchboard auto-detects the PHP framework to configure ephpm correctly:
-
-| Signal | Framework |
-|--------|-----------|
-| `wp-config.php` or `wp-config-sample.php` exists | WordPress |
-| `composer.json` contains `laravel/framework` | Laravel |
-| `artisan` file exists | Laravel |
-| `composer.json` contains `drupal/core` | Drupal |
-| `composer.json` contains `symfony/framework-bundle` | Symfony |
-| None of the above | Generic PHP |
-
-### Lazy Vhost Discovery
-
-ephpm's router checks the filesystem when a hostname isn't in its startup cache:
-
-```rust
-// In resolve_site():
-// 1. Check HashMap (startup-scanned sites) — verify dir still exists
-// 2. Check filesystem: sites_dir/<hostname>/ exists?
-//    → Yes: serve from it (logged as "discovered new virtual host (lazy)")
-//    → No: fall back to default document_root
-```
-
-This means:
-- **Deploy:** switchboard creates `sites_dir/pr-42.app.preview.ephpm.dev/` → next HTTP request serves it
-- **Teardown:** switchboard deletes the directory → next HTTP request falls back to default
-- **No restart, no reload, no signal** between switchboard and ephpm
-
-### Preview URL Format
-
-```
-pr-{number}.{repo}.preview.ephpm.dev
-```
-
-Examples:
-- `pr-42.my-blog.preview.ephpm.dev`
-- `pr-7.laravel-app.preview.ephpm.dev`
-
-DNS: wildcard `*.preview.ephpm.dev` → VM IP address.
-
-TLS: ephpm's built-in ACME issues a Let's Encrypt cert on the first HTTPS request to each preview URL.
-
-## GitHub Integration
-
-### GitHub App Setup
-
-1. Register at `github.com/organizations/ephpm/settings/apps`
-2. Set webhook URL: `https://switchboard.ephpm.dev:9090/webhook`
-3. Permissions:
-   - `pull_requests: write` — post/edit comments
-   - `deployments: write` — create deployment statuses
-4. Subscribe to events: `pull_request`
-5. Generate private key (PEM file)
-6. Make the app public for external users
-
-### Installation
-
-**For the ephpm team (internal):**
-
-Install the app on repos in the `ephpm` org.
-
-**For external users (beta):**
-
-Share the direct install URL:
-```
-https://github.com/apps/ephpm/installations/new
-```
-
-User clicks → authorizes → selects repos → webhooks start flowing. No marketplace approval needed.
-
-**For external users (GA):**
-
-Publish to GitHub Marketplace. Users find it at `github.com/marketplace/ephpm`.
-
-### PR Comment
-
-When a preview deploys, switchboard posts (or updates) a comment:
-
-```markdown
-**ePHPm Preview** — deployed
-
-| | |
-|---|---|
-| URL | https://pr-42.my-blog.preview.ephpm.dev |
-| Framework | WordPress |
-| Deployed in | 14.3s |
-
-Preview updates automatically on each push to this PR.
-```
-
-On teardown (PR closed/merged), the comment is updated:
-
-```markdown
-**ePHPm Preview** — removed
-
-Preview deployment has been torn down.
-```
-
-### Deployment Status
-
-Switchboard also creates a GitHub deployment with an environment URL. This shows up in the PR's "Environments" section with a green checkmark and a "View deployment" link.
-
-## Repository Config: `.ephpm.yaml`
-
-Developers can place an `.ephpm.yaml` file in their repo root to configure how previews are built and seeded. The file is optional — without it, switchboard auto-detects everything.
+An app repo ships an `ephpm.yaml` at its root describing how its preview is
+built and served. **ePHPm does not parse it.** The schema is owned by
+switchboard — `src/manifest.rs` is the authority, and its module docs are
+explicit that the schema is a contract: parse to these fields, do not invent
+new ones. The app-developer guide lives there too.
 
 ```yaml
-# .ephpm.yaml
-
-# Run after composer install to seed the database.
-# Can be any executable: shell script, PHP script, artisan command.
-seed: scripts/seed.sh
-
-# PHP version (default: latest, currently 8.5)
-# Determines which ephpm instance handles requests.
-php: "8.4"
+version: 1                  # required; only version 1 is understood
+php: "8.5"
+docroot: "."                # relative to the repo root
+build:                      # list, run in the checkout BEFORE the site goes live
+  - "composer install --no-dev --optimize-autoloader --no-interaction"
+services:
+  database: "turso"         # "turso" | false
+  kv: true
+  websocket: true           # default: auto-detect websocket.php at the docroot
+seed:                       # list, run AFTER the site serves and its DB exists
+  - "wp core install --url=$PREVIEW_URL ..."
+env:
+  WP_ENVIRONMENT_TYPE: "staging"
+  SOME_KEY: "${secret.some_key}"
+health: "/"                 # polled for a 200 before the deploy reports ready
+ini:
+  memory_limit: "256M"      # advisory in v1 — surfaced, not enforced
 ```
 
-### Database Seeding
+A repo with no manifest is not rejected: switchboard synthesizes one from the
+detected framework (WordPress, Laravel, Symfony, Drupal, or generic), so an
+unconfigured repo still gets a useful preview.
 
-Every preview gets its own SQLite database file. Three ways to seed it:
+### Why ePHPm refuses to read it
 
-**1. Seed script (recommended)**
+The manifest lives inside the tenant's checkout, and a vhost's `open_basedir`
+includes its own container by design — so a file in there is writable by that
+site's own PHP. Letting ePHPm route on it would let a tenant choose its own
+routing. ePHPm therefore reads only the **operator-owned** derived artifact in
+`site_overrides_dir`, and refuses to start if that directory is inside
+`sites_dir`. Untrusted YAML never reaches the server: nothing in the workspace
+parses YAML at all.
 
-```yaml
-seed: scripts/seed.sh
-```
+Switchboard is welcome to *derive* an override file from a manifest it has
+validated. Wiring that up is the open work below.
 
-Switchboard runs this after `composer install`. The script can do anything:
+## Known gaps
 
-```bash
-#!/bin/bash
-# scripts/seed.sh — Laravel example
-php artisan migrate --seed
+Filed on switchboard:
 
-# WordPress example
-# wp core install --url="$PREVIEW_URL" --title="Preview" --admin_user=admin --admin_password=admin --admin_email=dev@example.com
-# wp import fixtures.xml
-```
+- **[`switchboard#3`](https://github.com/ephpm/switchboard/issues/3) —
+  `docroot:` is not honoured.** The repo root is served, so front-controller
+  apps 404 and `vendor/` plus `storage/logs/` are publicly reachable. The fix
+  is now available on the ePHPm side: write
+  `<site_overrides_dir>/<site-key>.toml` with `document_root = "<docroot>"` at
+  deploy time. The filename must be the canonical site key — an override under
+  any other name is silently ignored and the site serves its whole container
+  with no error anywhere.
+- **[`switchboard#4`](https://github.com/ephpm/switchboard/issues/4) —
+  `env:` does not reach PHP when `docroot: "."`.** Switchboard generates a PHP
+  auto-prepend file and (when the docroot is not the project root) a `.env`,
+  but the prepend is not actually auto-loaded. ePHPm's PHP ini is
+  process-global (`[php] ini_file` / `ini_overrides`), so an
+  `auto_prepend_file` set there would apply to every tenant at a fixed path. A
+  per-site prepend needs either per-site ini support in ePHPm or a different
+  injection point — the same Phase 2 dependency as `ini:` below.
 
-Switchboard sets `PREVIEW_URL` as an environment variable so the seed script knows the preview hostname.
+Documented but unfiled:
 
-**2. Template database**
+- **`build:` and `seed:` have no database access.** Both run as plain `sh -c`
+  children of the daemon. The per-site database lives inside the ePHPm process
+  and is reachable only over that site's HTTP surface or its `pdo_mysql`
+  credential, neither of which a bare shell has. `php artisan migrate` cannot
+  work from a seed script as written. The current workaround, visible in
+  [`ephpm/wordpress-sample`](https://github.com/ephpm/wordpress-sample)'s
+  `ephpm.yaml`, is to have `seed:` drive in-docroot PHP generators **over
+  HTTP** so every insert runs inside the site. That works but is a workaround,
+  not a design. Candidates: hand the seed step the site's `DB_*` credentials so
+  a CLI can connect over `pdo_mysql`, or give switchboard a first-class
+  "run this PHP inside the site" primitive.
+- **`ini:` is advisory.** The manifest field is surfaced in the sidecar and
+  otherwise ignored. ePHPm's PHP settings are global, so honouring it needs
+  per-site `[php]` overrides — see the Phase 2 note in
+  [Virtual Hosts](/guides/virtual-hosts/).
 
-```yaml
-seed: cp .ephpm/template.db ephpm.db
-```
+## TLS: the wildcard certificate problem
 
-Ship a pre-built SQLite snapshot in the repo. The seed script just copies it. Instant — no migrations, no seeding delay.
+The settled architecture wants one wildcard certificate for
+`*.preview.ephpm.dev`, obtained via a DNS-01 challenge. **ePHPm cannot issue
+that itself today.** Its built-in ACME (`rustls-acme`) solves **TLS-ALPN-01
+only** — there is no DNS-01 solver, and without DNS-01 there is no wildcard.
+Worse for previews, the ACME domain set is the fixed
+[`[server.tls] domains`](/reference/config/#servertls) list read at startup, so
+a hostname invented by a webhook five minutes ago cannot get a certificate on
+demand.
 
-**3. Fork from production (future)**
+So the shipped path is: obtain the wildcard out of band (certbot, lego, or any
+DNS-01 client), and point `[server.tls] cert` / `key` at the resulting PEMs —
+ePHPm's manual TLS mode. Two consequences to plan around:
 
-Copy the production site's `ephpm.db` into the preview. Developer tests against real data. Since SQLite is a file, this is a millisecond `cp` operation.
+- ePHPm does not watch those files, so a renewal needs a restart to take
+  effect.
+- Clustered ACME is not the answer either. Certificate *distribution* through
+  the gossip KV is implemented, but challenge-token propagation is not, and a
+  follower does not pick up a renewed certificate while running
+  ([TLS & ACME](/guides/tls-acme/)).
 
-### Future `.ephpm.yaml` Fields
+**Planned — not yet implemented:** a DNS-01 solver behind a provider trait
+(Cloudflare first), which would make the wildcard self-service and remove the
+restart-on-renewal step. This is the single largest missing piece for a
+self-contained preview host.
 
-```yaml
-# .ephpm.yaml — full spec (most fields are future)
+## Deployment shape
 
-seed: scripts/seed.sh         # database seeding (implemented)
-php: "8.4"                     # PHP version (implemented)
-# framework: laravel           # override auto-detection
-# root: public                 # override document root
-# env:                         # environment variables for the preview
-#   APP_ENV: staging
-#   APP_DEBUG: "true"
-```
-
-## Multi-PHP Version Support
-
-Multiple PHP versions run simultaneously on the same VM. Each version is a separate ephpm binary built with `cargo xtask release <version>`. All instances share one `sites_dir` — the same files are served by whichever PHP version the request hits.
-
-```
-/var/www/sites/
-  pr-42.my-blog.preview.ephpm.dev/    ← same files, served by any PHP version
-      index.php
-      ephpm.db
-
-ephpm-85 (:443)  → PHP 8.5 (default, latest)
-ephpm-84 (:8084) → PHP 8.4
-ephpm-83 (:8083) → PHP 8.3
-```
-
-### How It Works
-
-1. Developer sets `php: "8.4"` in `.ephpm.yaml`
-2. Switchboard deploys files to the shared `sites_dir` (same as always)
-3. Switchboard posts the PR comment with the port for PHP 8.4
-
-**Default (no `php` field or `php: "8.5"`):**
-```
-https://pr-42.my-blog.preview.ephpm.dev
-```
-
-**Explicit older version (`php: "8.4"`):**
-```
-https://pr-42.my-blog.preview.ephpm.dev:8084
-```
-
-Port 443 is the latest version — no port in the URL. Older versions get their own port. The version-to-port mapping in switchboard:
-
-| PHP Version | Port | URL |
-|-------------|------|-----|
-| 8.5 (latest) | 443 | `https://hostname` |
-| 8.4 | 8084 | `https://hostname:8084` |
-| 8.3 | 8083 | `https://hostname:8083` |
-
-### Shared ACME Certificates via Cluster
-
-All ephpm instances on the same VM join a gossip cluster on localhost. They share a KV store, and ACME certificates are stored in the KV store. One instance handles the Let's Encrypt challenge, all instances serve the same cert.
-
-```toml
-# ephpm-85.toml (latest, port 443)
-[server]
-listen = "0.0.0.0:443"
-sites_dir = "/var/www/sites"
-
-[cluster]
-enabled = true
-bind = "0.0.0.0:7946"
-node_id = "php85"
-cluster_id = "previews"
-
-# ephpm-84.toml (port 8084)
-[server]
-listen = "0.0.0.0:8084"
-sites_dir = "/var/www/sites"
-
-[cluster]
-enabled = true
-bind = "0.0.0.0:7947"
-join = ["127.0.0.1:7946"]
-node_id = "php84"
-cluster_id = "previews"
-```
-
-This gives you:
-- **Shared ACME certs** — one cert issuance, all instances serve HTTPS
-- **Shared KV store** — session data, object cache available across PHP versions
-- **Shared sites_dir** — one deploy, accessible from any PHP version
-- **No reverse proxy needed** — DNS + port routing, no nginx/caddy
-
-The gossip cluster was designed for multi-node deployments across machines, but it works identically on localhost for multi-version setups.
-
-### Resource Usage (Multi-PHP)
-
-Each additional ephpm instance adds its own PHP thread pool:
-
-| Instances | Workers (total) | Memory overhead |
-|-----------|----------------|-----------------|
-| 1 (PHP 8.5 only) | 4 | ~270 MB baseline |
-| 2 (8.5 + 8.4) | 8 | ~470 MB |
-| 3 (8.5 + 8.4 + 8.3) | 12 | ~670 MB |
-
-On a 4 GB VM, two PHP versions is comfortable. Three is tight. Most users only need the latest — older versions are for testing compatibility before upgrading.
-
-## Deployment
-
-### Single VM Setup
-
-One VM runs both ephpm and switchboard. This handles hundreds of preview sites.
-
-**Prerequisites:**
-- VM with public IP (Hetzner CAX11 recommended: $3.69/mo)
-- Wildcard DNS: `*.preview.ephpm.dev → VM IP`
-- `git`, `composer` installed on the VM
-- GitHub App registered with private key
-
-**Environment:**
-
-```bash
-# switchboard
-SWITCHBOARD_LISTEN=0.0.0.0:9090
-SWITCHBOARD_WEBHOOK_SECRET=<from github app settings>
-SWITCHBOARD_APP_ID=<github app id>
-SWITCHBOARD_APP_KEY=/etc/switchboard/app-key.pem
-SWITCHBOARD_SITES_DIR=/var/www/sites
-SWITCHBOARD_PREVIEW_DOMAIN=preview.ephpm.dev
-
-# ephpm
-EPHPM_SERVER__LISTEN=0.0.0.0:8080
-EPHPM_SERVER__DOCUMENT_ROOT=/var/www/default
-EPHPM_SERVER__SITES_DIR=/var/www/sites
-```
-
-**Directory layout:**
+One VM runs ePHPm and switchboard. Wildcard DNS `*.preview.ephpm.dev → VM IP`;
+`git` and `composer` on the VM; the GitHub App private key in switchboard's
+config.
 
 ```
 /var/www/
-  default/                                    # fallback (marketing page)
-    index.html
-  sites/                                      # shared between switchboard and ephpm
-    pr-42.my-blog.preview.ephpm.dev/          # live preview
-      index.php
-      wp-content/
-      ephpm.db
-    pr-7.laravel-app.preview.ephpm.dev/       # another preview
-      public/
-      artisan
-      ephpm.db
+  default/                                       # fallback (marketing page)
+  sites/                                         # written by switchboard, read by ephpm
+    ephpm-wordpress-sample-pr-1.preview.ephpm.dev/
+    ephpm-my-blog-pr-42.preview.ephpm.dev/
+/var/lib/ephpm/
+  site-overrides/                                # operator-owned, NOT under sites_dir
+    ephpm-my-blog-pr-42.preview.ephpm.dev.toml   # document_root = "public"
+  db/
+    ephpm-my-blog-pr-42.preview.ephpm.dev.db     # one Turso file per preview
 ```
 
-**Systemd units:**
-
-```ini
-# /etc/systemd/system/ephpm-85.service (latest, port 443)
-[Service]
-ExecStart=/usr/local/bin/ephpm-85 --config /etc/ephpm/ephpm-85.toml
-Restart=always
-
-# /etc/systemd/system/ephpm-84.service (optional, port 8084)
-[Service]
-ExecStart=/usr/local/bin/ephpm-84 --config /etc/ephpm/ephpm-84.toml
-Restart=always
-
-# /etc/systemd/system/switchboard.service
-[Service]
-ExecStart=/usr/local/bin/switchboard
-EnvironmentFile=/etc/switchboard/env
-Restart=always
-```
+The override directory must live outside `sites_dir` — ePHPm refuses to start
+otherwise, because a tenant can rewrite anything inside its own container.
 
 ### Capacity
 
-On one Hetzner CAX11 ($3.69/mo, 2 ARM cores, 4 GB RAM, 40 GB SSD):
+Idle previews cost disk and nothing else: no process, no connection, no
+resident PHP state. A preview only consumes memory while a request is in
+flight, out of the shared pool. Disk is therefore the scaling constraint, at
+roughly 70 MB per WordPress checkout — a few hundred previews on a small VM.
 
-| Metric | Capacity |
-|--------|----------|
-| Concurrent preview sites | ~500 (limited by disk: 70 MB each) |
-| Active requests across all sites | ~20-40 req/s (shared 4 PHP workers) |
-| Memory for idle previews | ~0 MB each (just files on disk) |
-| Memory for active requests | ~50 MB per concurrent request (shared pool) |
-| Deploy time (WordPress) | ~15-30s (git clone + composer install) |
-| Deploy time (Laravel) | ~10-20s |
-| Teardown time | < 1s (rm -rf) |
+Deploy time is dominated by `git clone` plus `composer install`; teardown is an
+`rm -rf`. Concrete per-worker memory figures deliberately are not quoted here:
+`[php] workers` defaults to `0` (unlimited, bounded by the tokio blocking
+pool), and worker mode's `worker_count` is derived from the cgroup CPU quota or
+host parallelism, so there is no fixed worker count to multiply by. See
+[Hosting & Resource Requirements](/roadmap/hosting/) for the memory model.
 
-### Scaling Beyond One VM
+### Scaling past one VM — future
 
-When one VM fills up (disk or CPU), add more:
+Multiple VMs, each running ePHPm plus a switchboard; the API routes a deploy to
+the VM with the most free disk; GeoDNS or a load balancer spreads requests.
+Each VM keeps its own `sites_dir`, so no shared filesystem is required.
 
-1. Multiple VMs, each running ephpm + switchboard
-2. Switchboard routes deploys to the VM with the most free disk
-3. GeoDNS or load balancer distributes requests
-4. Each VM has its own `sites_dir` — no shared filesystem needed
+Note the constraint this design has to respect: **per-site database isolation
+is single-node only.** Multi-site mode combined with clustered replication does
+not give per-site databases — every vhost shares the clustered database. A
+preview fleet therefore scales by sharding previews across independent nodes,
+not by clustering one preview host.
 
-This is future work. One VM handles the beta and early growth.
+## Multi-PHP versions — deferred
+
+The manifest carries `php:` and switchboard records it, but nothing routes on
+it: one running instance serves one PHP version. If this returns it will be
+port-based — `ephpm-85` on 443, `ephpm-84` on 8084, `ephpm-83` on 8083, all
+sharing one `sites_dir`, with the preview URL carrying the port for
+non-default versions. That is strictly cheaper than a reverse proxy and keeps
+the "ePHPm terminates TLS" property.
+
+Two things would need solving first: certificate sharing across the instances
+(the same wildcard PEM can simply be pointed at by each, once the DNS-01 story
+lands), and the fact that each instance is a separate process with its own PHP
+memory footprint, which is what makes this a poor default for a small VM.
 
 ## Security
 
-| Concern | Mitigation |
-|---------|-----------|
-| Webhook spoofing | HMAC-SHA256 signature verification on every webhook |
-| Malicious code in PR | Previews run as the ephpm process user — no root. PHP sandbox applies. |
-| Cross-site data leakage | Each preview is a separate directory with its own SQLite database |
-| Resource exhaustion | Build timeout, max concurrent deploys, disk quota monitoring |
-| Token scope | GitHub installation tokens are scoped to authorized repos only |
-| Private repos | Switchboard clones via the installation token — respects repo permissions |
+| Concern | Where it stands |
+|---------|-----------------|
+| Webhook spoofing | HMAC-SHA256 signature verification on every webhook (switchboard). |
+| Malicious code in a PR | Previews run as the ePHPm process user. All tenants share one process and one uid — the isolation boundary is the per-site database file, KV keyspace and `open_basedir`, not an OS boundary. |
+| Cross-tenant data access | One Turso file per site; `ATTACH`/`DETACH`/`VACUUM`/path-`PRAGMA` rejected on the tenant path; unknown hosts get no database and no credentials. |
+| Tenant self-routing | ePHPm never reads routing config from inside a tenant's checkout; `site_overrides_dir` must be outside `sites_dir` or startup fails. |
+| Resource exhaustion | `[server] preview = true` caps connections and request rate per IP and per site, and sheds rather than queues under overload. |
+| Secrets | Resolved by switchboard from its own store; `${secret.NAME}` references are logged by name, never by value. |
 
-### Future Hardening
+**Planned — not yet implemented:** running `build:` in a container or namespace
+(today it is a plain `sh -c` child of the daemon with the daemon's privileges),
+per-preview disk quotas, stale-preview GC, and per-installation deploy rate
+limiting.
 
-- **Build sandbox:** Run `composer install` in a container or namespace for isolation
-- **Disk quotas:** Per-preview disk limit, auto-teardown if exceeded
-- **Stale preview cleanup:** Cron job that removes previews older than N days
-- **Rate limiting:** Max deploys per hour per installation
+## Open questions
 
-## Testing
-
-### Unit Tests (switchboard)
-
-| Module | Tests | What they cover |
-|--------|-------|----------------|
-| `webhook.rs` | 5 | Signature verification (valid/invalid/missing), preview host format, deploy/teardown detection |
-| `deployer.rs` | 4 | Framework detection (WordPress, Laravel, generic) |
-| `github.rs` | 1 | PR comment formatting |
-
-### Unit Tests (ephpm)
-
-| Test | What it covers |
-|------|---------------|
-| `vhost_lazy_discovery_finds_new_directory` | Directory created after startup is discovered |
-| `vhost_lazy_discovery_teardown` | Directory deleted after startup falls back to default |
-
-### E2E Tests (ephpm-e2e)
-
-| Test | What it covers |
-|------|---------------|
-| `unknown_host_returns_fallback` | Unmatched Host header gets fallback response |
-| `lazy_discovered_site_serves_content` | Full lifecycle: create dir → serve → delete dir → fallback |
-| `multiple_sites_isolated` | Two sites serve different content independently |
-
-## Cost Model
-
-Previews are effectively free to operate:
-
-| State | Cost |
-|-------|------|
-| Idle preview (no traffic) | ~70 MB disk, 0 MB RAM, 0% CPU |
-| Active preview (developer clicking) | Shared PHP worker (~50 MB, returned to pool after) |
-| 500 idle previews on one VM | ~35 GB disk, $3.69/mo total |
-| Per preview (marginal cost) | ~$0.007/mo |
-
-The preview infrastructure costs less than a cup of coffee per month regardless of how many previews exist. The only scaling constraint is disk space, which is the cheapest resource in cloud computing.
+1. **Who writes the override file?** The daemon has the manifest and the site
+   key; wiring `docroot:` → `<site-key>.toml` closes `switchboard#3` with no
+   ePHPm change. Worth doing before anything else on this list.
+2. **How does a seed step reach the database?** Handing it `DB_*` credentials
+   is the smallest change; a "run this inside the site" primitive is the
+   better one.
+3. **DNS-01 in ePHPm, or permanently out of band?** Out of band works and is
+   shipping; in-band removes a moving part and a restart.
+4. **What is the teardown policy for a PR that is never closed?** Nothing
+   currently reaps abandoned previews.
