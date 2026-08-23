@@ -155,11 +155,12 @@
 //! 1. `THREAD_REGISTERED` (the guard) is first touched by
 //!    `PhpRuntime::ensure_thread_registered()`, i.e. **before** the thread's
 //!    first query.
-//! 2. [`DB_PARAMS`], [`DB_RESULT`], [`DB_ERROR`] and [`DB_HELD`] are first
-//!    touched *inside* that first query — registered strictly later, in that
-//!    order (see [`run_on`]).
+//! 2. [`DB_PARAMS`], [`DB_ROWS`], [`DB_LAST`], [`DB_ERROR`] and [`DB_HELD`]
+//!    are first touched *inside* that first query — registered strictly later,
+//!    in that order (see [`run_on`], which reaches them through
+//!    [`reset_staged`]).
 //! 3. Destructors run in reverse registration order, so the guard's runs
-//!    **last** and all four are already destroyed when the shutdown function
+//!    **last** and all five are already destroyed when the shutdown function
 //!    executes. This is the ordinary case, not a race.
 //!
 //! `LocalKey::with` on a destroyed value panics, and that panic is raised
@@ -173,14 +174,19 @@
 //! * a `run` becomes [`RunStatus::Gone`], which the C wrapper turns into a
 //!   clean, distinctly-worded `\Exception` — never a panic, never a silent
 //!   success;
-//! * the result accessors report "nothing staged", exactly as they already do
-//!   after [`finish`];
+//! * the row accessors report "nothing staged", exactly as they already do
+//!   after [`finish`], and the metadata accessors report [`LastCall::EMPTY`] —
+//!   what a thread that has run nothing yet reports;
+//! * [`in_transaction`] and [`is_available`] report `false`, which is what
+//!   holds: a statement issued from here reaches no database;
 //! * [`params_reset`] / [`param_push`] / [`finish`] become no-ops.
 //!
 //! **A statement never runs on a half-destroyed thread.** [`run_on`] reaches
 //! [`DB_HELD`] — the last cell a query touches, and therefore the *first* of
-//! the four to be destroyed — before it touches the backend, so a parameter
-//! lost by a no-op [`param_push`] can never become a silently wrong query.
+//! the five to be destroyed — before it touches the backend, so a parameter
+//! lost by a no-op [`param_push`] can never become a silently wrong query. It
+//! additionally probes *both* result cells ([`DB_ROWS`] and [`DB_LAST`]) before
+//! executing, so a run can never stage half a result.
 //!
 //! Accesses that are *not* reachable from PHP keep plain `with`: it is
 //! clearer, and the fallible form would be unreachable code. [`set_current_site`]
@@ -203,16 +209,91 @@
 //! never async tasks"). The same pinned-`Handle` sync bridge is the
 //! established precedent in `ephpm-cluster`'s `KvReplicator`
 //! (`clustered_store.rs`).
+//!
+//! # What survives `finish()` — the last-call record (issues #259/#262/#263)
+//!
+//! A statement's *rows* are large and short-lived; its *metadata* is small and
+//! wanted afterwards. The two are therefore staged separately:
+//!
+//! * [`DB_ROWS`] holds `Vec<Vec<Value>>` — released by [`finish`], which the C
+//!   side calls as soon as it has copied the cells into PHP zvals.
+//! * [`DB_LAST`] holds the [`LastCall`] record — "did the statement produce a
+//!   rowset", the column metadata, and `affected_rows`/`last_insert_id`. It is
+//!   **not** released by [`finish`]; it lives until the next statement on this
+//!   thread or [`on_request_end`].
+//! * [`DB_ERROR`] holds the error triple under the same rule.
+//!
+//! The split is free rather than a copy: a `SessionResult::Rows` is
+//! destructured and its `columns` **moved** into the record while its `rows`
+//! move into [`DB_ROWS`].
+//!
+//! Three adapter-facing gaps close as a direct consequence:
+//!
+//! * **Has-rowset (#263).** Adapters no longer classify SQL by its first
+//!   keyword to choose between `ephpm_db_query` and `ephpm_db_execute` — the
+//!   record says what actually happened, which is what `ephpm_db_run()`
+//!   returns.
+//! * **Empty-set metadata (#262).** A zero-row `SELECT` returns `[]` rows but
+//!   its columns are still in the record, so `ephpm_db_columns()` can describe
+//!   a result that has no rows to describe it with.
+//! * **Error classification (#259).** The staged error outliving the throw is
+//!   what lets `ephpm_db_errno()` / `ephpm_db_error()` report on a statement
+//!   after its exception was caught.
+//!
+//! # Reserved error codes
+//!
+//! Every `ephpm_db_*` failure carries a nonzero code. SQL failures carry the
+//! MySQL **server** error code litewire's `error_map` assigned (1062, 1064,
+//! 1105, ...). Infrastructure failures — the bridge is not there, or this
+//! request has no database to reach — carry one of the reserved codes below,
+//! which is what makes the two distinguishable without parsing message text.
+//!
+//! The reserved values sit in MySQL's **client**-error range (2000-2999,
+//! `CR_*`), which a server never emits: `error_map` can only ever produce a
+//! server-range code, so a reserved code can never collide with a real SQL
+//! error. See [`ERR_UNAVAILABLE`], [`ERR_NO_SITE_CONTEXT`], [`ERR_CONNECT`],
+//! and (C-side only) `EPHPM_DB_ERR_BAD_PARAM`.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use litewire::backend::{SharedBackend, Value};
+use litewire::backend::{Column, SharedBackend, Value};
 use litewire::session::ER_PARSE_ERROR;
 use litewire::session::error_map::ER_UNKNOWN_ERROR;
 use litewire::translate::{Dialect, TranslateCache};
 use litewire::{Session, SessionError, SessionResult};
+
+// ── Reserved infrastructure error codes (issue #259) ────────────────────
+
+/// No embedded database is active at all — `[db.sqlite]` is not configured,
+/// so no backend was ever registered with the bridge.
+///
+/// This is an *infrastructure* condition, not a SQL error: the statement never
+/// reached a database. Adapters key on this to fall back to another driver (or
+/// to report "not running under ePHPm with an embedded database") instead of
+/// reporting a broken query.
+pub const ERR_UNAVAILABLE: u16 = 2000;
+
+/// A backend is registered, but this request has no tenant identity, so the
+/// bridge cannot decide *which* per-site database to use — and deliberately
+/// refuses to guess (see the module docs, `Single backend vs. per-site
+/// registry`).
+///
+/// Reached in per-site mode when the `Host` matched no configured site.
+pub const ERR_NO_SITE_CONTEXT: u16 = 2001;
+
+/// The database for this request is known but could not be opened, or the
+/// session against it could not be established.
+///
+/// Distinct from [`ERR_UNAVAILABLE`]: the bridge is configured and the tenant
+/// is known — the storage underneath failed.
+pub const ERR_CONNECT: u16 = 2002;
+
+/// SQLSTATE reported alongside every reserved infrastructure code. `HY000`
+/// ("general error") is what a MySQL client library reports for its own
+/// client-side failures, which is exactly what these are.
+const INFRA_SQLSTATE: [u8; 5] = *b"HY000";
 
 // ── Global bridge handle ────────────────────────────────────────────────
 
@@ -352,10 +433,49 @@ thread_local! {
     static DB_CURRENT_SITE: RefCell<Option<Box<str>>> = const { RefCell::new(None) };
     /// Parameters staged by `param_*` calls for the next `run`.
     static DB_PARAMS: RefCell<Vec<Value>> = const { RefCell::new(Vec::new()) };
-    /// Result of the last successful `run` on this thread.
-    static DB_RESULT: RefCell<Option<SessionResult>> = const { RefCell::new(None) };
-    /// Error from the last failed `run` on this thread.
+    /// Rows of the last successful `run` on this thread. Released by
+    /// [`finish`] as soon as the C side has copied them into PHP zvals — this
+    /// is the large, short-lived half of a result.
+    static DB_ROWS: RefCell<Vec<Vec<Value>>> = const { RefCell::new(Vec::new()) };
+    /// Metadata about the last `run` on this thread. Deliberately **outlives**
+    /// [`finish`] — see the module docs, `What survives finish()`.
+    static DB_LAST: RefCell<LastCall> = const { RefCell::new(LastCall::EMPTY) };
+    /// Error from the last failed `run` on this thread. Outlives [`finish`]
+    /// under the same rule as [`DB_LAST`], which is what lets
+    /// `ephpm_db_errno()` report on a statement whose exception was caught.
     static DB_ERROR: RefCell<Option<BridgeError>> = const { RefCell::new(None) };
+}
+
+/// What is remembered about the last statement executed on this thread once
+/// its rows have been released.
+///
+/// Small by construction — column metadata and two counters — so retaining it
+/// across [`finish`] costs a few hundred bytes per PHP thread, not a copy of
+/// the result set.
+struct LastCall {
+    /// Whether the statement produced a result set (as opposed to an OK).
+    ///
+    /// This is the authoritative has-rowset signal of issue #263: it comes
+    /// from the executed [`SessionResult`], not from inspecting the SQL, so
+    /// `WITH ... INSERT`, `INSERT ... RETURNING`, `CALL`, and any future
+    /// dialect surprise classify correctly for free.
+    had_rowset: bool,
+    /// Column metadata of the result set, **moved** out of the `ResultSet`
+    /// rather than cloned. Present even when the set had zero rows — the
+    /// point of issue #262. Empty when `had_rowset` is false.
+    columns: Vec<Column>,
+    /// `affected_rows` of the OK result (0 for a result set).
+    affected_rows: u64,
+    /// `last_insert_id` of the OK result (0 for a result set).
+    last_insert_id: u64,
+}
+
+impl LastCall {
+    /// The "nothing has run on this thread yet" value. A `const` rather than
+    /// a `Default` impl so the thread-local can be initialized without
+    /// allocating (`Vec::new` does not allocate).
+    const EMPTY: Self =
+        Self { had_rowset: false, columns: Vec::new(), affected_rows: 0, last_insert_id: 0 };
 }
 
 /// A thread's live session together with the site it belongs to and a clone
@@ -575,14 +695,34 @@ pub fn bytes_to_value(bytes: &[u8]) -> Value {
     }
 }
 
-/// Drop the staged result/error, releasing their memory. Also called
-/// implicitly at the start of every [`run_sql_bytes`] and at per-request
-/// teardown ([`on_request_end`]).
+/// Release the staged **rows**, the large half of a result.
 ///
-/// A no-op once the cells are destroyed (issue #269) — thread teardown is
+/// Called by the C side the moment it has copied the cells into PHP zvals, and
+/// again at per-request teardown ([`on_request_end`]).
+///
+/// The last-call record ([`had_rowset`], [`col_count`], [`with_col_name`],
+/// [`ok_info`]) and the staged error ([`with_error`]) deliberately **survive**
+/// this — see the module docs, `What survives finish()`. They are cleared by
+/// the next [`run_sql_bytes`] on this thread, or by [`on_request_end`].
+///
+/// A no-op once the cell is destroyed (issue #269) — thread teardown is
 /// releasing exactly the memory this would have released.
 pub fn finish() {
-    let _ = DB_RESULT.try_with(|r| *r.borrow_mut() = None);
+    // `clear()` rather than assigning a fresh Vec: the row buffer's capacity is
+    // reused by the next statement on this thread, which is the common case.
+    let _ = DB_ROWS.try_with(|r| r.borrow_mut().clear());
+}
+
+/// Discard everything staged for this thread — rows, last-call record, and
+/// error alike. The full reset that [`finish`] deliberately is not.
+///
+/// Every cell is reached with `try_with` for the same reason [`finish`] is
+/// (issue #269): this runs at the top of every [`run_sql_bytes`] and from
+/// [`on_request_end`], both of which a shutdown function can reach on a
+/// retiring thread.
+fn reset_staged() {
+    finish();
+    let _ = DB_LAST.try_with(|l| *l.borrow_mut() = LastCall::EMPTY);
     let _ = DB_ERROR.try_with(|e| *e.borrow_mut() = None);
 }
 
@@ -594,6 +734,12 @@ fn stage_error(err: BridgeError) -> RunStatus {
         // the condition that actually holds instead (issue #269).
         Err(_) => RunStatus::Gone,
     }
+}
+
+/// Build an infrastructure failure: one of the reserved codes from the module
+/// docs, `Reserved error codes`, always with SQLSTATE `HY000`.
+fn infra_error(code: u16, message: String) -> BridgeError {
+    BridgeError { code, sqlstate: INFRA_SQLSTATE, message }
 }
 
 /// Message substrings that mark a [`SessionError`] as connection-shaped —
@@ -709,13 +855,12 @@ fn site_swap_target(
         BackendSource::PerSite(_) => DB_CURRENT_SITE.try_with(|s| {
             let current = s.borrow();
             let Some(current) = current.as_deref() else {
-                return Err(RunFailure::Error(BridgeError {
-                    code: ER_UNKNOWN_ERROR,
-                    sqlstate: *b"HY000",
-                    message: "no per-site database context for this request — multi-site \
-                              database isolation could not determine the tenant"
+                return Err(RunFailure::Error(infra_error(
+                    ERR_NO_SITE_CONTEXT,
+                    "no per-site database context for this request — multi-site \
+                     database isolation could not determine the tenant"
                         .to_string(),
-                }));
+                )));
             };
             Ok(if held_site == Some(current) { None } else { Some(Box::from(current)) })
         })?,
@@ -728,10 +873,8 @@ fn site_swap_target(
 fn backend_for(source: &BackendSource, site: &str) -> Result<SharedBackend, BridgeError> {
     match source {
         BackendSource::Single(backend) => Ok(Arc::clone(backend)),
-        BackendSource::PerSite(resolver) => resolver.resolve(site).map_err(|msg| BridgeError {
-            code: ER_UNKNOWN_ERROR,
-            sqlstate: *b"HY000",
-            message: format!("failed to open the database for this site: {msg}"),
+        BackendSource::PerSite(resolver) => resolver.resolve(site).map_err(|msg| {
+            infra_error(ERR_CONNECT, format!("failed to open the database for this site: {msg}"))
         }),
     }
 }
@@ -747,10 +890,21 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
     else {
         return RunStatus::Gone;
     };
-    finish();
+    reset_staged();
 
     let Some(bridge) = bridge else {
-        return RunStatus::Unavailable;
+        // Staged as well as signalled: the C side throws from the RunStatus,
+        // but `ephpm_db_errno()` / `ephpm_db_error()` read the staged triple,
+        // and an adapter must see the same reserved code either way (#259).
+        //
+        // If the error cell is already gone (issue #269) the reserved code
+        // could not be read back, so report the condition that actually holds
+        // rather than an `Unavailable` whose errno would read 0.
+        let staged = stage_error(infra_error(
+            ERR_UNAVAILABLE,
+            "no embedded database is active (requires [db.sqlite])".to_string(),
+        ));
+        return if staged == RunStatus::Gone { RunStatus::Gone } else { RunStatus::Unavailable };
     };
 
     let Ok(sql) = std::str::from_utf8(sql) else {
@@ -773,17 +927,21 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
         });
     }
 
-    // The gate (issue #269). Both cells the execution path still needs are
+    // The gate (issue #269). Every cell the execution path still needs is
     // checked HERE, before anything runs — which is what makes "`Gone` means
     // no statement was executed" unconditional rather than probable. Only this
     // thread destroys its own thread-locals, and this thread is executing
     // here, so a cell that is live at this line stays live for the rest of the
-    // call: the staging `with` below cannot panic.
+    // call: the staging `with`es in [`stage_result`] cannot panic.
+    //
+    // BOTH result cells are probed, not just one: a successful run stages rows
+    // into `DB_ROWS` and metadata into `DB_LAST`, and half a staged result is
+    // worse than none.
     //
     // `DB_HELD` is the last cell a query touches and therefore the FIRST of
     // this module's cells to be destroyed, so on a retiring thread this is
     // where a shutdown-function call actually stops.
-    if !is_live(&DB_RESULT) {
+    if !is_live(&DB_ROWS) || !is_live(&DB_LAST) {
         return RunStatus::Gone;
     }
     let Ok(outcome) = DB_HELD.try_with(|cell| {
@@ -830,11 +988,10 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
                     });
                 }
                 Err(e) => {
-                    return Err(RunFailure::Error(BridgeError {
-                        code: ER_UNKNOWN_ERROR,
-                        sqlstate: *b"HY000",
-                        message: format!("failed to open embedded database session: {e}"),
-                    }));
+                    return Err(RunFailure::Error(infra_error(
+                        ERR_CONNECT,
+                        format!("failed to open embedded database session: {e}"),
+                    )));
                 }
             }
         }
@@ -866,19 +1023,49 @@ fn run_on(bridge: Option<&DbBridge>, sql: &[u8]) -> RunStatus {
     };
 
     match outcome {
-        Ok(result) => {
-            let status = match result {
-                SessionResult::Rows(_) => RunStatus::Rows,
-                SessionResult::Ok(_) => RunStatus::Ok,
-            };
-            // Plain `with`: the gate above established `DB_RESULT` is live,
-            // and only this thread can destroy it — it has been running this
-            // function ever since.
-            DB_RESULT.with(|r| *r.borrow_mut() = Some(result));
-            status
-        }
+        Ok(result) => stage_result(result),
         Err(RunFailure::Error(e)) => stage_error(e),
         Err(RunFailure::Gone) => RunStatus::Gone,
+    }
+}
+
+/// Split a successful [`SessionResult`] into the two staging areas: rows into
+/// [`DB_ROWS`] (released by [`finish`]) and everything else into [`DB_LAST`]
+/// (which outlives it).
+///
+/// Nothing is cloned — `columns` and `rows` are moved out of the `ResultSet`.
+///
+/// Plain `with` throughout: the only caller is [`run_on`], whose gate has
+/// established that both cells are live, and only this thread can destroy
+/// them — it has been running that function ever since (issue #269).
+fn stage_result(result: SessionResult) -> RunStatus {
+    match result {
+        SessionResult::Rows(rs) => {
+            DB_LAST.with(|l| {
+                *l.borrow_mut() = LastCall {
+                    had_rowset: true,
+                    columns: rs.columns,
+                    // A result set carries no OK counters. Reporting zeros
+                    // (rather than erroring) is the long-standing contract of
+                    // `ephpm_db_execute()` on a SELECT — see `ok_info`.
+                    affected_rows: 0,
+                    last_insert_id: 0,
+                };
+            });
+            DB_ROWS.with(|r| *r.borrow_mut() = rs.rows);
+            RunStatus::Rows
+        }
+        SessionResult::Ok(ok) => {
+            DB_LAST.with(|l| {
+                *l.borrow_mut() = LastCall {
+                    had_rowset: false,
+                    columns: Vec::new(),
+                    affected_rows: ok.affected_rows,
+                    last_insert_id: ok.last_insert_id,
+                };
+            });
+            RunStatus::Ok
+        }
     }
 }
 
@@ -1189,9 +1376,12 @@ fn strip_leading_noise(stmt: &str) -> &str {
 ///    issue a `ROLLBACK` through the session and `tracing::warn!`.
 ///    Without this the transaction stays open on the worker thread and
 ///    the next unrelated request's writes silently join it.
-/// 2. Release the staged result/error buffers ([`finish`]) so the memory
-///    of a request's last query does not sit around until the thread's
-///    next request.
+/// 2. Discard everything staged for this thread — rows, last-call record,
+///    and error ([`reset_staged`]) — so the memory of a request's last
+///    query does not sit around until the thread's next request, and so the
+///    record can never be read by the *next* request on this thread. This is
+///    the full reset, not [`finish`]: the record and error outlive `finish()`
+///    on purpose, but must not outlive their request.
 ///
 /// If the rollback itself fails (typically because the connection under
 /// the transaction died), the session is dropped entirely: the server
@@ -1205,7 +1395,12 @@ fn strip_leading_noise(stmt: &str) -> &str {
 /// nothing there rather than panicking or draining the graveyard from a TLS
 /// destructor.
 pub fn on_request_end() {
-    finish();
+    // The full reset, not `finish()`: the last-call record and staged error
+    // outlive `finish()` on purpose, but must never outlive the request that
+    // produced them — the next request on this thread would otherwise read
+    // another request's `ephpm_db_errno()`. Inert on a retiring thread
+    // (issue #269): every cell it touches is reached with `try_with`.
+    reset_staged();
     // Everything below needs a LIVE thread. [`DB_HELD`] being unreachable is
     // the precise signal that this thread is inside its TLS-destructor phase —
     // where `HeldCell::drop` has already parked this thread's session, and
@@ -1270,69 +1465,160 @@ fn is_live<T: 'static>(key: &'static std::thread::LocalKey<T>) -> bool {
     key.try_with(|_| ()).is_ok()
 }
 
-/// Run `f` against this thread's staged result.
+/// Run `f` against this thread's staged rows.
 ///
-/// A destroyed cell is reported to `f` as `None` — the same "nothing staged"
-/// it already sees after [`finish`] (issue #269). Every public accessor below
+/// A destroyed cell is reported to `f` as an empty slice — the same "nothing
+/// staged" it already sees after [`finish`] (issue #269). Every row accessor
 /// goes through here, so the degraded answer is defined in exactly one place.
-fn with_staged<R>(f: impl FnOnce(Option<&SessionResult>) -> R) -> R {
-    if !is_live(&DB_RESULT) {
-        return f(None);
+fn with_rows<R>(f: impl FnOnce(&[Vec<Value>]) -> R) -> R {
+    if !is_live(&DB_ROWS) {
+        return f(&[]);
     }
-    DB_RESULT.with(|r| f(r.borrow().as_ref()))
+    DB_ROWS.with(|r| f(&r.borrow()))
 }
 
-/// Number of rows in the staged result set (0 when none is staged).
+/// Run `f` against this thread's last-call record.
+///
+/// A destroyed cell is reported to `f` as [`LastCall::EMPTY`] — the same
+/// "nothing has run on this thread" a fresh thread sees (issue #269). Every
+/// metadata accessor goes through here, the counterpart of [`with_rows`].
+fn with_last<R>(f: impl FnOnce(&LastCall) -> R) -> R {
+    if !is_live(&DB_LAST) {
+        return f(&LastCall::EMPTY);
+    }
+    DB_LAST.with(|l| f(&l.borrow()))
+}
+
+/// Number of rows currently staged. Zero once [`finish`] has released them,
+/// and zero for a statement that produced no result set.
 #[must_use]
 pub fn row_count() -> usize {
-    with_staged(|r| match r {
-        Some(SessionResult::Rows(rs)) => rs.rows.len(),
-        _ => 0,
-    })
+    with_rows(<[Vec<Value>]>::len)
 }
 
-/// Number of columns in the staged result set (0 when none is staged).
+/// Whether the last statement on this thread produced a result set.
+///
+/// The has-rowset signal of issue #263 — read from the executed
+/// [`SessionResult`], never inferred from the SQL text. Survives [`finish`];
+/// false before this thread's first statement.
+#[must_use]
+pub fn had_rowset() -> bool {
+    with_last(|l| l.had_rowset)
+}
+
+/// Number of columns the last statement's result set had (0 when it produced
+/// none).
+///
+/// Survives [`finish`], and is **independent of the row count** — a zero-row
+/// `SELECT` still reports its columns (issue #262).
 #[must_use]
 pub fn col_count() -> usize {
-    with_staged(|r| match r {
-        Some(SessionResult::Rows(rs)) => rs.columns.len(),
-        _ => 0,
-    })
+    with_last(|l| l.columns.len())
 }
 
-/// Look at a column name of the staged result set.
+/// Look at a column name of the last statement's result set. `None` when
+/// `col` is out of range or the statement produced no result set.
 pub fn with_col_name<R>(col: usize, f: impl FnOnce(Option<&str>) -> R) -> R {
-    with_staged(|r| match r {
-        Some(SessionResult::Rows(rs)) => f(rs.columns.get(col).map(|c| c.name.as_str())),
-        _ => f(None),
-    })
+    with_last(|l| f(l.columns.get(col).map(|c| c.name.as_str())))
 }
 
-/// Look at a cell of the staged result set.
+/// Look at a column's declared schema type (`INTEGER`, `TEXT`, ...).
+///
+/// `None` both when `col` is out of range and when the column is an
+/// expression with no declared type (`SELECT a + 1`) — SQLite reports no
+/// decltype for either, and the distinction is not one the engine can make.
+pub fn with_col_decltype<R>(col: usize, f: impl FnOnce(Option<&str>) -> R) -> R {
+    with_last(|l| f(l.columns.get(col).and_then(|c| c.decltype.as_deref())))
+}
+
+/// Look at a cell of the staged rows. `None` once [`finish`] has released
+/// them, or when `row`/`col` is out of range.
 pub fn with_cell<R>(row: usize, col: usize, f: impl FnOnce(Option<&Value>) -> R) -> R {
-    with_staged(|r| match r {
-        Some(SessionResult::Rows(rs)) => f(rs.rows.get(row).and_then(|cells| cells.get(col))),
-        _ => f(None),
-    })
+    with_rows(|r| f(r.get(row).and_then(|cells| cells.get(col))))
 }
 
-/// `(affected_rows, last_insert_id)` of the staged result. A staged result
-/// set (or nothing staged) reports `(0, 0)` — `ephpm_db_execute` on a
-/// SELECT is defined to return zeros rather than error.
+/// `(affected_rows, last_insert_id)` of the last statement.
+///
+/// A statement that produced a **result set** reports `(0, 0)` —
+/// `ephpm_db_execute` on a SELECT is defined to return zeros rather than
+/// error. So does a thread that has not run anything yet. Survives [`finish`].
+///
+/// `last_insert_id` is whatever the backend reported for the statement
+/// (issue #260 asked for this to be pinned down): litewire clamps a missing or
+/// negative `last_insert_rowid` to 0, but a non-`INSERT` OK — an `UPDATE`, a
+/// `COMMIT` — carries the connection's *most recent* insert rowid, exactly as
+/// `mysqli_insert_id()` does on the wire. Do not read it as "this statement
+/// inserted something"; read `affected_rows`, or capture the id immediately
+/// after the `INSERT` that produced it.
 #[must_use]
 pub fn ok_info() -> (u64, u64) {
-    with_staged(|r| match r {
-        Some(SessionResult::Ok(ok)) => (ok.affected_rows, ok.last_insert_id),
-        _ => (0, 0),
-    })
+    with_last(|l| (l.affected_rows, l.last_insert_id))
+}
+
+/// Whether this thread's session is currently inside an explicit transaction
+/// (issue #260).
+///
+/// `false` when the thread has no session yet, or no bridge is registered —
+/// in both cases no transaction can be open, so the answer is not a guess.
+/// Reads the session's own flag, the same one the wire frontends report as
+/// `SERVER_STATUS_IN_TRANS`.
+///
+/// Also `false` on a retiring thread (issue #269): a destroyed [`DB_HELD`]
+/// means `HeldCell::drop` has already parked this thread's session, so there
+/// is no session here to be in a transaction — the same answer, not a guess.
+#[must_use]
+pub fn in_transaction() -> bool {
+    if !is_live(&DB_HELD) {
+        return false;
+    }
+    DB_HELD.with(|cell| cell.0.borrow().as_ref().is_some_and(|held| held.session.in_transaction))
+}
+
+/// Whether an `ephpm_db_*` statement issued right now would reach a database
+/// (issue #259).
+///
+/// True when a backend is registered **and** — in per-site mode — this request
+/// has a tenant identity. It is deliberately a pure check: it never opens a
+/// database, so a `true` here can still be followed by an [`ERR_CONNECT`]
+/// failure if the storage underneath is broken. What it rules out is the two
+/// conditions an adapter can act on before running anything:
+/// [`ERR_UNAVAILABLE`] and [`ERR_NO_SITE_CONTEXT`].
+#[must_use]
+pub fn is_available() -> bool {
+    available_on(DB_BRIDGE.get())
+}
+
+/// [`is_available`] against an explicit bridge. Split out for the same reason
+/// as [`run_on`]: unit tests drive a locally-constructed [`DbBridge`] rather
+/// than the process-wide, set-once [`DB_BRIDGE`].
+fn available_on(bridge: Option<&DbBridge>) -> bool {
+    let Some(bridge) = bridge else {
+        return false;
+    };
+    match &bridge.source {
+        BackendSource::Single(_) => true,
+        // A destroyed key reports "not available" (issue #269) rather than
+        // panicking. That is the truthful answer: a statement issued from a
+        // retiring thread reports [`RunStatus::Gone`] and reaches no database,
+        // which is exactly what a `false` here promises.
+        BackendSource::PerSite(_) => {
+            is_live(&DB_CURRENT_SITE) && DB_CURRENT_SITE.with(|s| s.borrow().is_some())
+        }
+    }
 }
 
 /// Look at the staged error, if any.
 ///
-/// A destroyed cell reports `None`, exactly as "no error staged" does
-/// (issue #269) — the C side then formats no exception, which is correct:
-/// the only way to reach this after a destroyed cell is a `run` that already
-/// reported [`RunStatus::Gone`] and threw its own message.
+/// Survives [`finish`] (see the module docs) so the error of a statement whose
+/// exception has already been thrown and caught is still readable. Cleared by
+/// the next [`run_sql_bytes`] on this thread and by [`on_request_end`], so a
+/// `None` here means "the last statement on this thread succeeded", not
+/// "an error was never staged".
+///
+/// A destroyed cell also reports `None` (issue #269) — the C side then formats
+/// no exception, which is correct: the only way to reach this after a destroyed
+/// cell is a `run` that already reported [`RunStatus::Gone`] and threw its own
+/// message.
 pub fn with_error<R>(f: impl FnOnce(Option<(u16, &[u8; 5], &str)>) -> R) -> R {
     if !is_live(&DB_ERROR) {
         return f(None);
@@ -1341,6 +1627,16 @@ pub fn with_error<R>(f: impl FnOnce(Option<(u16, &[u8; 5], &str)>) -> R) -> R {
         Some(err) => f(Some((err.code, &err.sqlstate, err.message.as_str()))),
         None => f(None),
     })
+}
+
+/// Code of the staged error, or 0 when the last statement on this thread
+/// succeeded (or none has run). Backs `ephpm_db_errno()`.
+///
+/// Routed through [`with_error`] so the destroyed-cell degradation of issue
+/// #269 is defined once: a retiring thread reads 0, the same as "succeeded".
+#[must_use]
+pub fn error_code() -> u16 {
+    with_error(|e| e.map_or(0, |(code, _, _)| code))
 }
 
 // ── C-compatible ops struct (php_linked only) ───────────────────────────
@@ -1415,8 +1711,23 @@ pub struct EphpmDbOps {
             msg_len: *mut usize,
         ),
     >,
-    /// Drop the staged result/error, releasing memory.
+    /// Release the staged rows. The last-call record and staged error
+    /// survive — see the module docs, `What survives finish()`.
     pub finish: Option<unsafe extern "C" fn()>,
+    /// Whether the last statement produced a result set (1) or an OK (0).
+    /// Valid after `run`, and after `finish`.
+    pub had_rowset: Option<unsafe extern "C" fn() -> std::os::raw::c_int>,
+    /// Column declared type; `*p` is NULL when the column has none.
+    /// Same pointer-lifetime rule as `col_name`, but valid after `finish`
+    /// too (the metadata outlives the rows).
+    pub col_decltype: Option<
+        unsafe extern "C" fn(col: usize, p: *mut *const std::os::raw::c_char, len: *mut usize),
+    >,
+    /// Whether this thread's session is inside an explicit transaction.
+    pub in_transaction: Option<unsafe extern "C" fn() -> std::os::raw::c_int>,
+    /// Whether a statement issued now would reach a database (1) or fail for
+    /// an infrastructure reason (0).
+    pub available: Option<unsafe extern "C" fn() -> std::os::raw::c_int>,
 }
 
 // ── C shims (php_linked only) ───────────────────────────────────────────
@@ -1585,6 +1896,41 @@ unsafe extern "C" fn db_finish() {
     finish();
 }
 
+#[cfg(php_linked)]
+unsafe extern "C" fn db_had_rowset() -> std::os::raw::c_int {
+    std::os::raw::c_int::from(had_rowset())
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn db_col_decltype(
+    col: usize,
+    p: *mut *const std::os::raw::c_char,
+    len: *mut usize,
+) {
+    with_col_decltype(col, |decltype| {
+        let (ptr, n) = decltype.map_or((std::ptr::null(), 0), |s| (s.as_ptr().cast(), s.len()));
+        // SAFETY: `p` and `len` are valid pointers to locals in our C wrapper
+        // (`PHP_FUNCTION(ephpm_db_columns)` / `ephpm_db_run`). The returned
+        // pointer aims into the thread-local last-call record, which is not
+        // dropped or mutated until the next `run` or request end on this same
+        // thread — the C side copies the bytes before returning to PHP.
+        unsafe {
+            *p = ptr;
+            *len = n;
+        }
+    });
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn db_in_transaction() -> std::os::raw::c_int {
+    std::os::raw::c_int::from(in_transaction())
+}
+
+#[cfg(php_linked)]
+unsafe extern "C" fn db_available() -> std::os::raw::c_int {
+    std::os::raw::c_int::from(is_available())
+}
+
 // ── Static ops table ────────────────────────────────────────────────────
 
 /// The C-compatible function pointer table, ready to pass to
@@ -1604,6 +1950,10 @@ pub static DB_OPS: EphpmDbOps = EphpmDbOps {
     ok_info: Some(db_ok_info),
     error_info: Some(db_error_info),
     finish: Some(db_finish),
+    had_rowset: Some(db_had_rowset),
+    col_decltype: Some(db_col_decltype),
+    in_transaction: Some(db_in_transaction),
+    available: Some(db_available),
 };
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -1807,12 +2157,261 @@ mod tests {
     #[test]
     #[serial]
     fn accessors_are_inert_without_a_staged_result() {
-        finish();
+        reset_staged();
         assert_eq!(row_count(), 0);
         assert_eq!(col_count(), 0);
         assert_eq!(ok_info(), (0, 0));
+        assert!(!had_rowset());
+        assert_eq!(error_code(), 0);
+        assert!(!in_transaction());
         with_col_name(0, |n| assert!(n.is_none()));
+        with_col_decltype(0, |t| assert!(t.is_none()));
         with_cell(0, 0, |c| assert!(c.is_none()));
+        with_error(|e| assert!(e.is_none()));
+    }
+
+    // ── The last-call record: has-rowset, empty-set metadata, errno ────
+    //
+    // Issues #263 / #262 / #259. The shared mechanism is that a statement's
+    // metadata outlives `finish()` while its rows do not, so each of these
+    // asserts the same fact twice: before the rows are released and after.
+
+    /// #263: the has-rowset signal comes from the executed statement, so it
+    /// is right for statement shapes that defeat first-keyword sniffing —
+    /// a `WITH` CTE reads as a SELECT, and a bare `SET NAMES` never reaches
+    /// the backend at all.
+    #[test]
+    #[serial]
+    fn had_rowset_reflects_the_executed_statement_not_the_sql_text() {
+        init_bridge();
+        assert_eq!(run("CREATE TABLE bridge_hr (id INTEGER PRIMARY KEY, n TEXT)"), RunStatus::Ok);
+        assert!(!had_rowset(), "DDL produces no rowset");
+
+        assert_eq!(run("INSERT INTO bridge_hr (n) VALUES ('a')"), RunStatus::Ok);
+        assert!(!had_rowset(), "INSERT produces no rowset");
+
+        assert_eq!(run("SELECT id FROM bridge_hr"), RunStatus::Rows);
+        assert!(had_rowset());
+
+        // A dialect no-op never reaches the backend, and still classifies.
+        assert_eq!(run("SET NAMES utf8mb4"), RunStatus::Ok);
+        assert!(!had_rowset());
+        reset_staged();
+    }
+
+    /// #262: a zero-row result set still knows its columns — the whole point,
+    /// since the rows that would otherwise carry the names do not exist.
+    #[test]
+    #[serial]
+    fn zero_row_result_set_keeps_its_column_metadata() {
+        init_bridge();
+        assert_eq!(
+            run("CREATE TABLE bridge_empty (id INTEGER PRIMARY KEY, label TEXT)"),
+            RunStatus::Ok
+        );
+        assert_eq!(run("SELECT id, label FROM bridge_empty WHERE id = 12345"), RunStatus::Rows);
+
+        assert_eq!(row_count(), 0, "the point of the test: no rows");
+        assert!(had_rowset(), "but it WAS a result set");
+        assert_eq!(col_count(), 2);
+        with_col_name(0, |n| assert_eq!(n, Some("id")));
+        with_col_name(1, |n| assert_eq!(n, Some("label")));
+
+        // And the metadata is what `ephpm_db_columns()` reads — i.e. it is
+        // still there once the C side has released the (empty) rows.
+        finish();
+        assert_eq!(col_count(), 2);
+        with_col_name(1, |n| assert_eq!(n, Some("label")));
+        reset_staged();
+    }
+
+    /// Declared schema types reach the accessor, and an expression column
+    /// correctly reports none.
+    #[test]
+    #[serial]
+    fn column_decltypes_are_exposed() {
+        init_bridge();
+        assert_eq!(
+            run("CREATE TABLE bridge_decl (id INTEGER PRIMARY KEY, label TEXT)"),
+            RunStatus::Ok
+        );
+        assert_eq!(run("SELECT id, label, id + 1 FROM bridge_decl"), RunStatus::Rows);
+        assert_eq!(col_count(), 3);
+        with_col_decltype(0, |t| {
+            assert_eq!(t.map(str::to_ascii_uppercase).as_deref(), Some("INTEGER"));
+        });
+        with_col_decltype(1, |t| {
+            assert_eq!(t.map(str::to_ascii_uppercase).as_deref(), Some("TEXT"));
+        });
+        with_col_decltype(2, |t| assert!(t.is_none(), "an expression has no declared type"));
+        reset_staged();
+    }
+
+    /// The rows are the only thing `finish()` releases. Everything an
+    /// introspection native reads — has-rowset, columns, OK counters — is
+    /// still there afterwards, which is what makes those natives callable
+    /// after `ephpm_db_query()` has already returned.
+    #[test]
+    #[serial]
+    fn finish_releases_rows_but_keeps_the_last_call_record() {
+        init_bridge();
+        assert_eq!(run("CREATE TABLE bridge_fin (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+        assert_eq!(run("INSERT INTO bridge_fin (id) VALUES (1)"), RunStatus::Ok);
+        assert_eq!(ok_info(), (1, 1));
+
+        finish();
+        assert_eq!(ok_info(), (1, 1), "OK counters survive finish()");
+        assert!(!had_rowset());
+
+        assert_eq!(run("SELECT id FROM bridge_fin"), RunStatus::Rows);
+        assert_eq!(row_count(), 1);
+        assert_eq!(ok_info(), (0, 0), "a result set reports zero OK counters");
+
+        finish();
+        assert_eq!(row_count(), 0, "rows ARE released");
+        with_cell(0, 0, |c| assert!(c.is_none()));
+        assert!(had_rowset(), "but the classification survives");
+        assert_eq!(col_count(), 1);
+        reset_staged();
+    }
+
+    /// #259: the staged error outlives the throw, so `ephpm_db_errno()` can
+    /// still describe a failure whose exception was caught — and the next
+    /// successful statement clears it, so 0 means "the last one succeeded".
+    #[test]
+    #[serial]
+    fn error_survives_finish_and_is_cleared_by_the_next_statement() {
+        init_bridge();
+        assert_eq!(run("CREATE TABLE bridge_errno (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+        assert_eq!(error_code(), 0);
+
+        assert_eq!(run("INSERT INTO bridge_errno (id) VALUES (1)"), RunStatus::Ok);
+        assert_eq!(run("INSERT INTO bridge_errno (id) VALUES (1)"), RunStatus::Err);
+        assert_eq!(error_code(), litewire::session::error_map::ER_DUP_ENTRY);
+
+        // This is what the C side does immediately after throwing.
+        finish();
+        assert_eq!(
+            error_code(),
+            litewire::session::error_map::ER_DUP_ENTRY,
+            "errno must still be readable once the exception has been thrown"
+        );
+        with_error(|e| assert!(e.expect("still staged").2.to_ascii_lowercase().contains("unique")));
+
+        assert_eq!(run("SELECT id FROM bridge_errno"), RunStatus::Rows);
+        assert_eq!(error_code(), 0, "a successful statement clears the error");
+        with_error(|e| assert!(e.is_none()));
+        reset_staged();
+    }
+
+    /// A SQL error's code always stays in the MySQL **server** range, which
+    /// is what makes the reserved client-range codes a usable discriminator.
+    #[test]
+    #[serial]
+    fn sql_errors_never_use_a_reserved_code() {
+        init_bridge();
+        for sql in ["NOT VALID SQL !!!", "SELECT * FROM bridge_no_such_table_at_all"] {
+            assert_eq!(run(sql), RunStatus::Err, "{sql}");
+            let code = error_code();
+            assert!(code != 0 && !(2000..3000).contains(&code), "{sql} reported code {code}");
+        }
+        reset_staged();
+    }
+
+    /// #259: no bridge at all is an infrastructure failure, staged with the
+    /// reserved code rather than left for the caller to infer from a message.
+    #[test]
+    #[serial]
+    fn unavailable_bridge_stages_the_reserved_code() {
+        reset_staged();
+        assert_eq!(run_on(None, b"SELECT 1"), RunStatus::Unavailable);
+        assert_eq!(error_code(), ERR_UNAVAILABLE);
+        with_error(|e| {
+            let (code, sqlstate, msg) = e.expect("unavailable must stage an error");
+            assert_eq!(code, ERR_UNAVAILABLE);
+            assert_eq!(sqlstate, b"HY000");
+            assert!(msg.contains("[db.sqlite]"), "got: {msg}");
+        });
+        assert!(!available_on(None));
+        reset_staged();
+    }
+
+    /// #260: transaction state is read from the session, not inferred.
+    #[test]
+    #[serial]
+    fn in_transaction_tracks_the_session_state() {
+        init_bridge();
+        assert_eq!(run("CREATE TABLE bridge_intx (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+        assert!(!in_transaction());
+
+        assert_eq!(run("BEGIN"), RunStatus::Ok);
+        assert!(in_transaction(), "BEGIN opens one");
+        assert_eq!(run("INSERT INTO bridge_intx (id) VALUES (1)"), RunStatus::Ok);
+        assert!(in_transaction(), "a statement inside it does not close it");
+
+        assert_eq!(run("COMMIT"), RunStatus::Ok);
+        assert!(!in_transaction(), "COMMIT closes it");
+
+        assert_eq!(run("BEGIN"), RunStatus::Ok);
+        assert!(in_transaction());
+        assert_eq!(run("ROLLBACK"), RunStatus::Ok);
+        assert!(!in_transaction(), "ROLLBACK closes it");
+        reset_staged();
+    }
+
+    /// The safety net and the introspection agree: after the request-end
+    /// rollback there is nothing open, which is exactly what lets a wrapper's
+    /// `transaction()` helper stop firing a blind ROLLBACK.
+    #[test]
+    #[serial]
+    fn in_transaction_is_false_after_the_request_end_rollback() {
+        init_bridge();
+        assert_eq!(run("CREATE TABLE bridge_intx_end (id INTEGER PRIMARY KEY)"), RunStatus::Ok);
+        assert_eq!(run("BEGIN"), RunStatus::Ok);
+        assert!(in_transaction());
+
+        on_request_end();
+        assert!(!in_transaction());
+    }
+
+    /// A single-backend bridge is always available; introspection reads never
+    /// disturb the record the executing statements staged.
+    #[test]
+    #[serial]
+    fn availability_and_introspection_do_not_disturb_the_record() {
+        init_bridge();
+        assert!(is_available(), "single-backend mode is always available");
+
+        assert_eq!(run("SELECT 1 AS one"), RunStatus::Rows);
+        // Every introspection read, back to back.
+        assert!(is_available());
+        assert!(!in_transaction());
+        assert!(had_rowset());
+        assert_eq!(col_count(), 1);
+        assert_eq!(error_code(), 0);
+        // ...and the rows are still there.
+        assert_eq!(row_count(), 1);
+        with_cell(0, 0, |c| assert_eq!(c, Some(&Value::Integer(1))));
+        reset_staged();
+    }
+
+    /// A record must never outlive the request that produced it: the next
+    /// request on this worker thread would otherwise read the previous one's
+    /// `ephpm_db_errno()`.
+    #[test]
+    #[serial]
+    fn request_end_clears_the_last_call_record() {
+        init_bridge();
+        assert_eq!(run("SELECT 1 AS one"), RunStatus::Rows);
+        assert_eq!(run("NOT VALID SQL !!!"), RunStatus::Err);
+        assert_ne!(error_code(), 0);
+
+        on_request_end();
+
+        assert_eq!(error_code(), 0);
+        assert!(!had_rowset());
+        assert_eq!(col_count(), 0);
+        assert_eq!(ok_info(), (0, 0));
         with_error(|e| assert!(e.is_none()));
     }
 
@@ -1886,8 +2485,8 @@ mod tests {
 //
 // These drive `run_on` with a locally-constructed `DbBridge` wrapping a
 // mock backend, so they never touch the process-wide set-once DB_BRIDGE
-// and need no #[serial]: every thread-local involved (DB_SESSION,
-// DB_PARAMS, DB_RESULT, DB_ERROR) is private to the test's own thread.
+// and need no #[serial]: every thread-local involved (DB_HELD, DB_PARAMS,
+// DB_ROWS, DB_LAST, DB_ERROR) is private to the test's own thread.
 #[cfg(test)]
 mod recycle_tests {
     use std::sync::Arc;
@@ -2370,12 +2969,124 @@ mod per_site_tests {
         let bridge = per_site_bridge(map);
 
         set_current_site(None);
+        // The pre-flight form (#259): an adapter can see this coming without
+        // running a probe query and catching an exception.
+        assert!(!available_on(Some(&bridge)), "no tenant context — nothing to reach");
+
         assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Err);
         with_error(|e| {
-            let (_, _, msg) = e.expect("error staged");
+            let (code, sqlstate, msg) = e.expect("error staged");
             assert!(msg.contains("per-site database context"), "got: {msg}");
+            // Reserved code, distinct from any SQL error the tenant could
+            // provoke (#259) — this is infrastructure, not bad SQL.
+            assert_eq!(code, ERR_NO_SITE_CONTEXT);
+            assert_eq!(sqlstate, b"HY000");
         });
-        finish();
+        reset_staged();
+    }
+
+    /// The boundary of the has-rowset signal (#263), pinned against the
+    /// **production** backend rather than the rusqlite test one.
+    ///
+    /// `had_rowset` is authoritative for every statement litewire *runs*,
+    /// because it reads the executed `SessionResult`. It cannot rescue a
+    /// statement litewire never runs correctly: `Session::query` picks
+    /// `BackendConn::query` vs `BackendConn::execute` from
+    /// `litewire_translate::classify()`, which is itself a first-keyword
+    /// match (`litewire-translate/src/lib.rs`). `WITH` falls through to
+    /// `StatementKind::Other` and `INSERT ... RETURNING` matches `INSERT`, so
+    /// both are sent to `execute()` and the engine rejects them.
+    ///
+    /// They **error** rather than silently returning nothing, which is the
+    /// tolerable failure mode — and they fail identically on the wire path,
+    /// so this is not a bridge regression. Fixing it means teaching
+    /// litewire's `classify()` about CTEs and `RETURNING`; this test will
+    /// start failing the moment that lands, which is the intent.
+    #[test]
+    fn litewire_classification_bounds_the_has_rowset_signal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bridge = single_turso_bridge(&dir.path().join("classify.db"));
+
+        assert_eq!(
+            run(&bridge, "CREATE TABLE cls (id INTEGER PRIMARY KEY, n TEXT)"),
+            RunStatus::Ok
+        );
+        assert_eq!(run(&bridge, "INSERT INTO cls (n) VALUES ('a')"), RunStatus::Ok);
+        assert!(!had_rowset());
+
+        for sql in [
+            "WITH r AS (SELECT id FROM cls) SELECT id FROM r",
+            "INSERT INTO cls (n) VALUES ('b') RETURNING id",
+        ] {
+            assert_eq!(
+                run(&bridge, sql),
+                RunStatus::Err,
+                "{sql} is expected to fail until litewire's classify() handles it"
+            );
+            // A SQL-range code, not a reserved one: from the adapter's point
+            // of view this is "the statement failed", not "the bridge is
+            // broken" — which is the correct classification (#259).
+            let code = error_code();
+            assert!(!(2000..3000).contains(&code), "{sql} reported reserved code {code}");
+        }
+
+        // A plain SELECT over the same table still works, so the failure is
+        // the classifier, not the data.
+        assert_eq!(run(&bridge, "SELECT id FROM cls"), RunStatus::Rows);
+        assert!(had_rowset());
+        // BOTH rows are present: the `INSERT ... RETURNING` above reported an
+        // error to the caller and *still wrote its row*. The engine performs
+        // the insert and only then trips over the returned row that
+        // `execute()` has nowhere to put. Pinned deliberately — a caller that
+        // retries on that error double-inserts, which is the sharpest edge of
+        // this limitation and the reason it is documented rather than merely
+        // known.
+        assert_eq!(row_count(), 2, "INSERT ... RETURNING errors but is NOT rolled back");
+        reset_staged();
+    }
+
+    /// A single-backend bridge over a real Turso database file.
+    fn single_turso_bridge(path: &std::path::Path) -> DbBridge {
+        let handle = super::tests::TEST_RT
+            .get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+            })
+            .handle()
+            .clone();
+        DbBridge {
+            source: BackendSource::Single(open_turso(path)),
+            handle,
+            cache: Arc::new(TranslateCache::default()),
+        }
+    }
+
+    /// With a tenant context the same bridge reports available.
+    #[test]
+    fn availability_follows_the_site_context() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = open_turso(&dir.path().join("site-a.db"));
+        let mut map = HashMap::new();
+        map.insert("site-a.test".to_string(), a);
+        let bridge = per_site_bridge(map);
+
+        set_current_site(None);
+        assert!(!available_on(Some(&bridge)));
+
+        set_current_site(Some("site-a.test"));
+        assert!(available_on(Some(&bridge)));
+
+        // Availability is about having a tenant identity, not about that
+        // tenant's database being openable — an unknown key still reads as
+        // available and fails later with ERR_CONNECT.
+        set_current_site(Some("stranger.test"));
+        assert!(available_on(Some(&bridge)));
+
+        set_current_site(None);
+        reset_staged();
     }
 
     /// An unknown site key surfaces the resolver's error rather than any
@@ -2391,10 +3102,13 @@ mod per_site_tests {
         set_current_site(Some("stranger.test"));
         assert_eq!(run(&bridge, "SELECT 1"), RunStatus::Err);
         with_error(|e| {
-            let (_, _, msg) = e.expect("error staged");
+            let (code, _, msg) = e.expect("error staged");
             assert!(msg.contains("stranger.test"), "got: {msg}");
+            // The tenant is known but its storage could not be opened —
+            // ERR_CONNECT, not ERR_NO_SITE_CONTEXT (#259).
+            assert_eq!(code, ERR_CONNECT);
         });
-        finish();
+        reset_staged();
     }
 }
 
@@ -2679,6 +3393,15 @@ mod teardown_tests {
     static HOOK_COL_COUNT: AtomicUsize = AtomicUsize::new(usize::MAX);
     static HOOK_SAW_ERROR: AtomicBool = AtomicBool::new(true);
     static HOOK_SAW_CELL: AtomicBool = AtomicBool::new(true);
+    // The adapter API of #259/#260/#262/#263 — every one of these reads a
+    // thread-local that issue #269 predates (`DB_LAST`, `DB_ROWS`, `DB_HELD`,
+    // `DB_CURRENT_SITE`), so each is its own way to abort the process.
+    static HOOK_HAD_ROWSET: AtomicBool = AtomicBool::new(true);
+    static HOOK_SAW_DECLTYPE: AtomicBool = AtomicBool::new(true);
+    static HOOK_ERRNO: AtomicUsize = AtomicUsize::new(usize::MAX);
+    static HOOK_OK_INFO: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+    static HOOK_IN_TRANSACTION: AtomicBool = AtomicBool::new(true);
+    static HOOK_AVAILABLE: AtomicBool = AtomicBool::new(true);
 
     /// A `register_shutdown_function()` callback, in Rust. Its `Drop` is the
     /// exact seam issue #269 describes: userland code calling into the bridge
@@ -2705,6 +3428,19 @@ mod teardown_tests {
             HOOK_COL_COUNT.store(col_count(), Ordering::Release);
             HOOK_SAW_ERROR.store(with_error(|e| e.is_some()), Ordering::Release);
             HOOK_SAW_CELL.store(with_cell(0, 0, |c| c.is_some()), Ordering::Release);
+
+            // ...including the adapter surface added after #269 was fixed.
+            // `had_rowset`/`col_decltype`/`ok_info` read `DB_LAST`, `errno`
+            // reads `DB_ERROR`, `in_transaction` reads `DB_HELD`, and
+            // `available` reads `DB_CURRENT_SITE` — five cells, all destroyed
+            // by now, none of which may panic.
+            HOOK_HAD_ROWSET.store(had_rowset(), Ordering::Release);
+            HOOK_SAW_DECLTYPE.store(with_col_decltype(0, |d| d.is_some()), Ordering::Release);
+            HOOK_ERRNO.store(usize::from(error_code()), Ordering::Release);
+            *HOOK_OK_INFO.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(ok_info());
+            HOOK_IN_TRANSACTION.store(in_transaction(), Ordering::Release);
+            HOOK_AVAILABLE.store(available_on(Some(&self.bridge)), Ordering::Release);
 
             // The per-request seams a framework `terminate` hook would reach.
             // `on_request_end` must NOT drain the graveyard from here: this
@@ -2764,6 +3500,31 @@ mod teardown_tests {
         assert!(!HOOK_SAW_ERROR.load(Ordering::Acquire), "no error may be staged after Gone");
         assert!(!HOOK_SAW_CELL.load(Ordering::Acquire), "no cell may be readable after Gone");
 
+        // The last-call record degrades to `LastCall::EMPTY` — what a thread
+        // that has run nothing reports — rather than to a stale record or a
+        // panic. The hook ran a `SELECT 1` on this thread moments before it
+        // retired, so a cell read without the liveness gate would be a use of
+        // destroyed state, not merely a wrong answer.
+        assert!(
+            !HOOK_HAD_ROWSET.load(Ordering::Acquire),
+            "had_rowset must report the empty record on a retiring thread"
+        );
+        assert!(!HOOK_SAW_DECLTYPE.load(Ordering::Acquire), "no column metadata after Gone");
+        assert_eq!(HOOK_ERRNO.load(Ordering::Acquire), 0, "errno must read 0, not a stale code");
+        assert_eq!(
+            *HOOK_OK_INFO.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            Some((0, 0))
+        );
+        assert!(
+            !HOOK_IN_TRANSACTION.load(Ordering::Acquire),
+            "a parked session cannot be in a transaction this thread can see"
+        );
+        assert!(
+            !HOOK_AVAILABLE.load(Ordering::Acquire),
+            "availability must be false once the site key is gone — a statement issued here \
+             reports Gone and reaches no database, which is exactly what false promises"
+        );
+
         // The refusal is real: nothing was written.
         drain_parked_sessions();
         set_current_site(Some("hook.test"));
@@ -2801,6 +3562,19 @@ mod teardown_tests {
                 assert_eq!(col_count(), 0);
                 assert_eq!(ok_info(), (0, 0));
                 with_col_name(0, |n| assert!(n.is_none()));
+                // The rest of the read surface, individually — every one of
+                // these reaches a different destroyed cell.
+                assert!(!had_rowset());
+                with_col_decltype(0, |d| assert!(d.is_none()));
+                with_cell(0, 0, |c| assert!(c.is_none()));
+                with_error(|e| assert!(e.is_none()));
+                assert_eq!(error_code(), 0);
+                assert!(!in_transaction());
+                // Panic-freedom only: `is_available()` reads the process-wide
+                // `DB_BRIDGE`, which an earlier test in this binary may have
+                // registered — the *value* is not this test's business. The
+                // deterministic per-site assertion lives in the hook test above.
+                let _ = is_available();
                 COLD_RAN.store(true, Ordering::Release);
             }
         }
@@ -2922,5 +3696,115 @@ mod ffi_tests {
         assert!(msg_len > 0);
         // SAFETY: no arguments.
         unsafe { db_finish() };
+    }
+
+    /// The pointer contract that changed: `col_name` / `col_decltype` /
+    /// `error_info` stay valid **after** `finish()`, because the C side reads
+    /// them there (`ephpm_db_columns()` runs long after the rows are gone).
+    /// Only the cell pointers die with the rows.
+    #[test]
+    #[serial]
+    fn ffi_metadata_pointers_survive_finish_but_cells_do_not() {
+        init_bridge();
+        // SAFETY: valid pointer + length.
+        assert_eq!(
+            unsafe { run_c("CREATE TABLE bridge_ffi_meta (id INTEGER PRIMARY KEY, tag TEXT)") },
+            2
+        );
+        // Zero rows on purpose — the #262 case.
+        // SAFETY: valid pointer + length.
+        assert_eq!(unsafe { run_c("SELECT id, tag FROM bridge_ffi_meta WHERE id = 999") }, 1);
+
+        // SAFETY: no arguments.
+        assert_eq!(unsafe { db_had_rowset() }, 1);
+        // SAFETY: no arguments.
+        assert_eq!(unsafe { db_row_count() }, 0);
+        // SAFETY: no arguments.
+        assert_eq!(unsafe { db_col_count() }, 2);
+
+        // SAFETY: no arguments — releases the rows, keeps the metadata.
+        unsafe { db_finish() };
+
+        // SAFETY: no arguments.
+        assert_eq!(unsafe { db_had_rowset() }, 1, "classification survives finish");
+        // SAFETY: no arguments.
+        assert_eq!(unsafe { db_col_count() }, 2, "column count survives finish");
+
+        let mut p: *const std::os::raw::c_char = std::ptr::null();
+        let mut len: usize = 0;
+        // SAFETY: valid out-pointers.
+        unsafe { db_col_name(1, &mut p, &mut len) };
+        assert!(!p.is_null(), "column name pointer must be live after finish");
+        // SAFETY: p/len aim into the last-call record, live until the next run.
+        assert_eq!(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), len) }, b"tag");
+
+        // SAFETY: valid out-pointers.
+        unsafe { db_col_decltype(1, &mut p, &mut len) };
+        assert!(!p.is_null(), "declared type must be live after finish");
+        // SAFETY: p/len aim into the last-call record, live until the next run.
+        let decl = unsafe { std::slice::from_raw_parts(p.cast::<u8>(), len) };
+        assert_eq!(decl.to_ascii_uppercase(), b"TEXT");
+
+        // An out-of-range column yields a NULL pointer, not a dangling one.
+        // SAFETY: valid out-pointers.
+        unsafe { db_col_name(99, &mut p, &mut len) };
+        assert!(p.is_null());
+        assert_eq!(len, 0);
+
+        // The cells, by contrast, are gone.
+        let mut ty: std::os::raw::c_int = -1;
+        let mut ival: std::os::raw::c_longlong = 0;
+        let mut fval: f64 = 0.0;
+        // SAFETY: valid out-pointers.
+        unsafe { db_cell(0, 0, &mut ty, &mut ival, &mut fval, &mut p, &mut len) };
+        assert_eq!(ty, 0, "released rows read as NULL, never as a dangling pointer");
+        assert!(p.is_null());
+
+        reset_staged();
+    }
+
+    /// `error_info` after `finish()` is what `ephpm_db_errno()` reads (#259),
+    /// and `in_transaction` / `available` answer without running SQL (#260,
+    /// #259).
+    #[test]
+    #[serial]
+    fn ffi_error_survives_finish_and_state_shims_answer() {
+        init_bridge();
+        // SAFETY: no arguments.
+        assert_eq!(unsafe { db_available() }, 1, "single-backend mode is available");
+        // SAFETY: no arguments.
+        assert_eq!(unsafe { db_in_transaction() }, 0);
+
+        // SAFETY: valid pointer + length.
+        assert_eq!(unsafe { run_c("TOTALLY ((( not sql") }, -1);
+        // SAFETY: no arguments — the C side calls this right after throwing.
+        unsafe { db_finish() };
+
+        let mut code: std::os::raw::c_uint = 0;
+        let mut state: *const std::os::raw::c_char = std::ptr::null();
+        let mut msg: *const std::os::raw::c_char = std::ptr::null();
+        let mut msg_len: usize = 0;
+        // SAFETY: valid out-pointers.
+        unsafe { db_error_info(&mut code, &mut state, &mut msg, &mut msg_len) };
+        assert_eq!(code, u32::from(ER_PARSE_ERROR), "errno readable after the throw");
+        assert!(!state.is_null());
+
+        // BEGIN / COMMIT move the flag the shim reports.
+        // SAFETY: valid pointer + length.
+        assert_eq!(unsafe { run_c("BEGIN") }, 2);
+        // SAFETY: no arguments.
+        assert_eq!(unsafe { db_in_transaction() }, 1);
+        // SAFETY: valid pointer + length.
+        assert_eq!(unsafe { run_c("ROLLBACK") }, 2);
+        // SAFETY: no arguments.
+        assert_eq!(unsafe { db_in_transaction() }, 0);
+
+        // A successful statement clears the error the C side reads.
+        // SAFETY: valid out-pointers.
+        unsafe { db_error_info(&mut code, &mut state, &mut msg, &mut msg_len) };
+        assert_eq!(code, 0);
+        assert!(state.is_null(), "NULL sqlstate is the C side's `no error` signal");
+
+        reset_staged();
     }
 }

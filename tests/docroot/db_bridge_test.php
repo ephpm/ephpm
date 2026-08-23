@@ -23,17 +23,35 @@
  *   - check:       count 'leaked' rows (must be 0 after a leak) and prove
  *                  the connection is healthy with a write+read+delete probe
  *   - cleanup:     DROP TABLE bridge_e2e
+ *
+ * v0.7.4 adapter surface (issues #259/#260/#262/#263):
+ *   - run_shapes:    ephpm_db_run() over a SELECT, an INSERT and a zero-row
+ *                    SELECT — proves has_rowset comes from the statement
+ *   - empty_columns: ephpm_db_columns() after a zero-row SELECT
+ *   - txn_state:     ephpm_db_in_transaction() around BEGIN/COMMIT/ROLLBACK
+ *   - errno:         ephpm_db_errno()/ephpm_db_error() after a caught
+ *                    exception, and their reset by the next statement
+ *   - available:     ephpm_db_available()
  */
 
 header('Content-Type: application/json');
 
 $action = $_GET['action'] ?? 'query';
 
-if (!function_exists('ephpm_db_query') || !function_exists('ephpm_db_execute')) {
+// Fail loudly rather than skip (#244): a missing native means the build
+// under test does not have the surface these tests exist to cover.
+$required = [
+    'ephpm_db_query', 'ephpm_db_execute',
+    // v0.7.4 adapter surface.
+    'ephpm_db_run', 'ephpm_db_columns', 'ephpm_db_in_transaction',
+    'ephpm_db_available', 'ephpm_db_errno', 'ephpm_db_error',
+];
+$missing = array_values(array_filter($required, static fn (string $f) => !function_exists($f)));
+if ($missing !== []) {
     http_response_code(500);
     echo json_encode([
         'status' => 'error',
-        'message' => 'ephpm_db_query/ephpm_db_execute native functions are not registered',
+        'message' => 'native functions are not registered: ' . implode(', ', $missing),
     ]);
     return;
 }
@@ -150,6 +168,110 @@ try {
         case 'cleanup':
             ephpm_db_execute('DROP TABLE IF EXISTS bridge_e2e');
             echo json_encode(['status' => 'ok', 'action' => 'cleanup']);
+            break;
+
+        // ── v0.7.4 adapter surface ──────────────────────────────────────
+
+        case 'run_shapes':
+            // One entry point, three statement shapes. An adapter reads
+            // has_rowset instead of classifying the SQL (#263).
+            $sel = ephpm_db_run('SELECT id, name FROM bridge_e2e ORDER BY id');
+            $ins = ephpm_db_run(
+                'INSERT INTO bridge_e2e (name, value) VALUES (?, ?)',
+                ['run_shapes', 'v']
+            );
+            $none = ephpm_db_run('SELECT id, name FROM bridge_e2e WHERE id = ?', [-1]);
+            $noop = ephpm_db_run('SET NAMES utf8mb4');
+            ephpm_db_execute('DELETE FROM bridge_e2e WHERE name = ?', ['run_shapes']);
+            echo json_encode(['status' => 'ok', 'detail' => [
+                'select_has_rowset'  => $sel['has_rowset'],
+                'select_row_count'   => count($sel['rows']),
+                'select_columns'     => array_column($sel['columns'], 'name'),
+                'insert_has_rowset'  => $ins['has_rowset'],
+                'insert_rows_is_arr' => is_array($ins['rows']),
+                'insert_rows_count'  => count($ins['rows']),
+                'insert_affected'    => $ins['affected_rows'],
+                'insert_last_id_pos' => $ins['last_insert_id'] > 0,
+                // The #262 case reached through the unified entry point:
+                // no rows, but the columns are still described.
+                'empty_has_rowset'   => $none['has_rowset'],
+                'empty_row_count'    => count($none['rows']),
+                'empty_columns'      => array_column($none['columns'], 'name'),
+                'noop_has_rowset'    => $noop['has_rowset'],
+                'noop_columns_count' => count($noop['columns']),
+            ]]);
+            break;
+
+        case 'empty_columns':
+            // A zero-row SELECT through the ORIGINAL entry point: the rows
+            // are [] and cannot carry the names, so they come from the
+            // companion native instead (#262).
+            $rows = ephpm_db_query('SELECT id, name, value FROM bridge_e2e WHERE id = ?', [-1]);
+            $cols = ephpm_db_columns();
+            echo json_encode(['status' => 'ok', 'detail' => [
+                'row_count'    => count($rows),
+                'column_names' => array_column($cols, 'name'),
+                // Declared types survive too; 'id' is the INTEGER PK.
+                'id_type'      => strtoupper((string) ($cols[0]['type'] ?? '')),
+            ]]);
+            break;
+
+        case 'txn_state':
+            // #260: read the session's flag rather than tracking it in
+            // userland or firing a blind ROLLBACK.
+            $before = ephpm_db_in_transaction();
+            ephpm_db_execute('BEGIN');
+            $inside = ephpm_db_in_transaction();
+            ephpm_db_execute(
+                'INSERT INTO bridge_e2e (name, value) VALUES (?, ?)',
+                ['txn_state', 'v']
+            );
+            $mid = ephpm_db_in_transaction();
+            ephpm_db_execute('ROLLBACK');
+            $after = ephpm_db_in_transaction();
+            echo json_encode(['status' => 'ok', 'detail' => [
+                'before' => $before,
+                'inside' => $inside,
+                'mid'    => $mid,
+                'after'  => $after,
+            ]]);
+            break;
+
+        case 'errno':
+            // #259: the error is still readable after the exception has
+            // been caught, and a later success clears it.
+            $clean = ephpm_db_errno();
+            $caught = null;
+            try {
+                ephpm_db_query('SELECT FROM WHERE (((');
+            } catch (Exception $e) {
+                $caught = $e->getCode();
+            }
+            $after_throw = ephpm_db_errno();
+            $err = ephpm_db_error();
+            ephpm_db_query('SELECT 1');
+            echo json_encode(['status' => 'ok', 'detail' => [
+                'errno_when_clean'    => $clean,
+                'exception_code'      => $caught,
+                'errno_after_throw'   => $after_throw,
+                // The structured form agrees with the exception's code and
+                // carries the SQLSTATE the message only embeds as text.
+                'error_code'          => $err['code'] ?? null,
+                'error_sqlstate'      => $err['sqlstate'] ?? null,
+                'error_has_message'   => isset($err['message']) && $err['message'] !== '',
+                'errno_after_success' => ephpm_db_errno(),
+                'error_after_success' => ephpm_db_error(),
+                // A SQL error never lands in the reserved client range.
+                'code_is_reserved'    => $after_throw >= 2000 && $after_throw < 3000,
+            ]]);
+            break;
+
+        case 'available':
+            echo json_encode(['status' => 'ok', 'detail' => [
+                'available' => ephpm_db_available(),
+                // Distinct question from "am I on ePHPm".
+                'declared'  => function_exists('ephpm_db_available'),
+            ]]);
             break;
 
         default:

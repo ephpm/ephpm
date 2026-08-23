@@ -2985,11 +2985,23 @@ ZEND_END_ARG_INFO()
 /* ===================================================================
  * Embedded database native PHP functions
  *
- * ephpm_db_query() / ephpm_db_execute() execute SQL through a per-thread
- * litewire Session on the Rust side (db_bridge.rs) — the SAME backend the
- * MySQL wire frontend serves, so MySQL-dialect SQL, SHOW/DESCRIBE
- * emulation, SET-NAMES no-ops, and BEGIN/COMMIT/ROLLBACK all behave
- * exactly as they do over the wire, without a TCP round trip.
+ * ephpm_db_query() / ephpm_db_execute() / ephpm_db_run() execute SQL
+ * through a per-thread litewire Session on the Rust side (db_bridge.rs) —
+ * the SAME backend the MySQL wire frontend serves, so MySQL-dialect SQL,
+ * SHOW/DESCRIBE emulation, SET-NAMES no-ops, and BEGIN/COMMIT/ROLLBACK all
+ * behave exactly as they do over the wire, without a TCP round trip.
+ *
+ * Executing functions:
+ *   ephpm_db_query(sql, params)   -> rows
+ *   ephpm_db_execute(sql, params) -> OK metadata
+ *   ephpm_db_run(sql, params)     -> both, plus has_rowset (issue #263)
+ *
+ * Introspection functions — none of them throw, none of them run SQL, and
+ * none of them disturb what the executing functions staged:
+ *   ephpm_db_columns()            -> last statement's column metadata (#262)
+ *   ephpm_db_in_transaction()     -> this thread's transaction state (#260)
+ *   ephpm_db_available()          -> can a statement reach a database? (#259)
+ *   ephpm_db_errno() / ephpm_db_error() -> last error, classified (#259)
  *
  * All state lives in Rust thread-locals; g_db_ops is written once at
  * startup (ephpm_set_db_ops) before any PHP thread runs, then read-only —
@@ -3026,13 +3038,54 @@ typedef struct {
     void (*ok_info)(unsigned long long *affected_rows,
                     unsigned long long *last_insert_id);
     /* Error accessor — valid after run() returned -1. *sqlstate points at
-     * 5 bytes (NOT NUL-terminated). */
+     * 5 bytes (NOT NUL-terminated). Survives finish(). */
     void (*error_info)(unsigned int *code, const char **sqlstate,
                        const char **msg, size_t *msg_len);
-    /* Drop the staged result/error, releasing memory.
-     * Must stay LAST-appended: the layout mirrors db_bridge.rs. */
+    /* Release the staged ROWS. The last-call record (had_rowset, col_*,
+     * ok_info) and the staged error deliberately survive this — see
+     * db_bridge.rs, "What survives finish()". */
     void (*finish)(void);
+    /* Did the last statement produce a result set (1) or an OK (0)? The
+     * authoritative has-rowset signal (issue #263) — read from the executed
+     * statement, never inferred from the SQL text. Valid after finish(). */
+    int (*had_rowset)(void);
+    /* Column declared type ("INTEGER", "TEXT", ...); *p is NULL when the
+     * column has none (an expression). Valid after finish(). */
+    void (*col_decltype)(size_t col, const char **p, size_t *len);
+    /* Is this thread's session inside an explicit transaction? (issue #260) */
+    int (*in_transaction)(void);
+    /* Would a statement issued right now reach a database? (issue #259)
+     * Must stay LAST-appended: the layout mirrors db_bridge.rs. */
+    int (*available)(void);
 } EphpmDbOps;
+
+/* Reserved error codes for infrastructure failures — the stable signal that
+ * tells an adapter "the bridge could not run this", as opposed to "your SQL
+ * was wrong" (issue #259).
+ *
+ * They live in MySQL's CLIENT-error range (2000-2999, CR_*), which a server
+ * never emits: litewire's error_map can only produce a server-range code, so
+ * a reserved code can never collide with a real SQL error. Every ephpm_db_*
+ * exception carries a nonzero code — code 0 is not used by this surface.
+ *
+ * Keep in sync with db_bridge.rs (ERR_UNAVAILABLE / ERR_NO_SITE_CONTEXT /
+ * ERR_CONNECT). EPHPM_DB_ERR_BAD_PARAM and EPHPM_DB_ERR_GONE are thrown here
+ * only: the first is a parameter-binding refusal that never reaches the Rust
+ * side, the second is the run() == -3 case, where the Rust side deliberately
+ * stages NO error (its error cell is gone too — issue #269), so the exception
+ * code is the only signal a catch block gets. ephpm_db_errno() reads 0 after
+ * it, exactly as it does after a success. */
+#define EPHPM_DB_ERR_UNAVAILABLE     2000
+#define EPHPM_DB_ERR_NO_SITE_CONTEXT 2001
+#define EPHPM_DB_ERR_CONNECT         2002
+#define EPHPM_DB_ERR_BAD_PARAM       2003
+#define EPHPM_DB_ERR_GONE            2004
+
+/* The one message text for "no embedded database is active". Adapters in the
+ * wild match on it, so it is API: change the wording only with the same care
+ * as a function signature. */
+#define EPHPM_DB_UNAVAILABLE_MSG \
+    "ephpm_db: no embedded database is active (requires [db.sqlite])"
 
 static EphpmDbOps g_db_ops = {0};
 
@@ -3054,7 +3107,7 @@ static int ephpm_db_push_params(HashTable *params)
             case IS_DOUBLE: g_db_ops.param_float(Z_DVAL_P(entry)); break;
             case IS_STRING: g_db_ops.param_bytes(Z_STRVAL_P(entry), Z_STRLEN_P(entry)); break;
             default:
-                zend_throw_exception_ex(zend_ce_exception, 0,
+                zend_throw_exception_ex(zend_ce_exception, EPHPM_DB_ERR_BAD_PARAM,
                     "ephpm_db: unsupported parameter type %s (only null, bool, "
                     "int, float, and string parameters bind)",
                     zend_zval_type_name(entry));
@@ -3073,12 +3126,15 @@ static int ephpm_db_push_params(HashTable *params)
  * EPHPM_DB_THREW after throwing.
  *
  * Error shape follows PDO's convention: message "SQLSTATE[xxxxx]: <backend
- * message>", exception code = the mapped MySQL error code (e.g. 1062). */
+ * message>", exception code = the mapped MySQL error code (e.g. 1062).
+ * Infrastructure failures instead carry one of the reserved EPHPM_DB_ERR_*
+ * codes above, with their message text unchanged from before those codes
+ * existed — adapters that match on the wording keep working (issue #259). */
 static int ephpm_db_run_or_throw(const char *sql, size_t sql_len, HashTable *params)
 {
     if (!g_db_ops.run) {
-        zend_throw_exception(zend_ce_exception,
-            "ephpm_db: no embedded database is active (requires [db.sqlite])", 0);
+        zend_throw_exception(zend_ce_exception, EPHPM_DB_UNAVAILABLE_MSG,
+                             EPHPM_DB_ERR_UNAVAILABLE);
         return EPHPM_DB_THREW;
     }
     if (ephpm_db_push_params(params) != 0) {
@@ -3086,8 +3142,8 @@ static int ephpm_db_run_or_throw(const char *sql, size_t sql_len, HashTable *par
     }
     int rc = g_db_ops.run(sql, sql_len);
     if (rc == -2) {
-        zend_throw_exception(zend_ce_exception,
-            "ephpm_db: no embedded database is active (requires [db.sqlite])", 0);
+        zend_throw_exception(zend_ce_exception, EPHPM_DB_UNAVAILABLE_MSG,
+                             EPHPM_DB_ERR_UNAVAILABLE);
         return EPHPM_DB_THREW;
     }
     if (rc == -3) {
@@ -3099,7 +3155,8 @@ static int ephpm_db_run_or_throw(const char *sql, size_t sql_len, HashTable *par
         zend_throw_exception(zend_ce_exception,
             "ephpm_db: the database bridge is no longer available on this thread "
             "(it is shutting down) — a shutdown function or destructor ran after "
-            "per-thread database state was released; no statement was executed", 0);
+            "per-thread database state was released; no statement was executed",
+            EPHPM_DB_ERR_GONE);
         return EPHPM_DB_THREW;
     }
     if (rc < 0) {
@@ -3112,10 +3169,77 @@ static int ephpm_db_run_or_throw(const char *sql, size_t sql_len, HashTable *par
             "SQLSTATE[%.5s]: %.*s",
             sqlstate ? sqlstate : "HY000",
             (int)msg_len, msg ? msg : "");
+        /* Releases the rows only — the error triple survives on purpose, so
+         * ephpm_db_errno() / ephpm_db_error() can still describe this failure
+         * after the exception has been caught (issue #259). */
         g_db_ops.finish();
         return EPHPM_DB_THREW;
     }
     return rc;
+}
+
+/* Append the staged rows to `out` as a list of associative arrays keyed by
+ * column name. Must be called BEFORE finish() (the rows do not survive it).
+ * Shared by ephpm_db_query() and ephpm_db_run() so the two can never drift. */
+static void ephpm_db_append_rows(zval *out)
+{
+    size_t nrows = g_db_ops.row_count();
+    size_t ncols = g_db_ops.col_count();
+    for (size_t r = 0; r < nrows; r++) {
+        zval rowz;
+        array_init(&rowz);
+        for (size_t c = 0; c < ncols; c++) {
+            const char *name = NULL; size_t name_len = 0;
+            g_db_ops.col_name(c, &name, &name_len);
+
+            int type = 0; long long ival = 0; double fval = 0;
+            const char *bytes = NULL; size_t bytes_len = 0;
+            g_db_ops.cell(r, c, &type, &ival, &fval, &bytes, &bytes_len);
+
+            zval cellz;
+            switch (type) {
+                case 1:  ZVAL_LONG(&cellz, (zend_long)ival); break;
+                case 2:  ZVAL_DOUBLE(&cellz, fval); break;
+                case 3:  /* text */
+                case 4:  /* blob — PHP strings are binary-safe */
+                         ZVAL_STRINGL(&cellz, bytes, bytes_len); break;
+                default: ZVAL_NULL(&cellz); break;
+            }
+            add_assoc_zval_ex(&rowz, name ? name : "", name_len, &cellz);
+        }
+        add_next_index_zval(out, &rowz);
+    }
+}
+
+/* Initialize `out` to the last statement's column metadata: a list of
+ * ['name' => string, 'type' => ?string]. Empty list when the statement
+ * produced no result set.
+ *
+ * Unlike the rows, this is valid both before and after finish() — which is
+ * the whole point of issue #262: a zero-row SELECT has no rows to carry its
+ * column names, but the names are still known. */
+static void ephpm_db_init_columns(zval *out)
+{
+    array_init(out);
+    if (!g_db_ops.col_count) { return; }
+    size_t ncols = g_db_ops.col_count();
+    for (size_t c = 0; c < ncols; c++) {
+        const char *name = NULL; size_t name_len = 0;
+        g_db_ops.col_name(c, &name, &name_len);
+
+        const char *decl = NULL; size_t decl_len = 0;
+        if (g_db_ops.col_decltype) { g_db_ops.col_decltype(c, &decl, &decl_len); }
+
+        zval colz;
+        array_init(&colz);
+        add_assoc_stringl(&colz, "name", name ? name : "", name_len);
+        if (decl) {
+            add_assoc_stringl(&colz, "type", decl, decl_len);
+        } else {
+            add_assoc_null(&colz, "type");
+        }
+        add_next_index_zval(out, &colz);
+    }
 }
 
 /* ephpm_db_query(string $sql, array $params = []): array
@@ -3146,32 +3270,7 @@ PHP_FUNCTION(ephpm_db_query)
         return;
     }
 
-    size_t nrows = g_db_ops.row_count();
-    size_t ncols = g_db_ops.col_count();
-    for (size_t r = 0; r < nrows; r++) {
-        zval rowz;
-        array_init(&rowz);
-        for (size_t c = 0; c < ncols; c++) {
-            const char *name = NULL; size_t name_len = 0;
-            g_db_ops.col_name(c, &name, &name_len);
-
-            int type = 0; long long ival = 0; double fval = 0;
-            const char *bytes = NULL; size_t bytes_len = 0;
-            g_db_ops.cell(r, c, &type, &ival, &fval, &bytes, &bytes_len);
-
-            zval cellz;
-            switch (type) {
-                case 1:  ZVAL_LONG(&cellz, (zend_long)ival); break;
-                case 2:  ZVAL_DOUBLE(&cellz, fval); break;
-                case 3:  /* text */
-                case 4:  /* blob — PHP strings are binary-safe */
-                         ZVAL_STRINGL(&cellz, bytes, bytes_len); break;
-                default: ZVAL_NULL(&cellz); break;
-            }
-            add_assoc_zval_ex(&rowz, name ? name : "", name_len, &cellz);
-        }
-        add_next_index_zval(return_value, &rowz);
-    }
+    ephpm_db_append_rows(return_value);
     g_db_ops.finish();
 }
 
@@ -3208,6 +3307,192 @@ PHP_FUNCTION(ephpm_db_execute)
     add_assoc_long(return_value, "last_insert_id", (zend_long)last_id);
 }
 
+/* ephpm_db_run(string $sql, array $params = [])
+ *     : array{has_rowset: bool, rows: array, columns: array,
+ *             affected_rows: int, last_insert_id: int}
+ *
+ * The unified entry point (issue #263). Runs the statement and reports what
+ * it actually did, so an adapter implementing a single query() API —
+ * mysqli::query, wpdb::query, Laravel statement/affectingStatement, DBAL —
+ * never has to classify the SQL by its first significant keyword to choose
+ * between ephpm_db_query() and ephpm_db_execute(). WITH ... INSERT hybrids,
+ * INSERT ... RETURNING, CALL, and anything a future dialect adds classify
+ * correctly for free, because the answer comes from the executed statement.
+ *
+ * 'has_rowset' is the discriminator. 'rows' is always an array (empty, never
+ * null, when has_rowset is false) so a caller can foreach unconditionally.
+ * 'columns' carries the column metadata even for a zero-row result set
+ * (issue #262). 'affected_rows'/'last_insert_id' are zero for a result set,
+ * the same contract ephpm_db_execute() has always had on a SELECT.
+ *
+ * Errors throw exactly as ephpm_db_query()/ephpm_db_execute() do. */
+PHP_FUNCTION(ephpm_db_run)
+{
+    char *sql; size_t sql_len;
+    HashTable *params = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STRING(sql, sql_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(params)
+    ZEND_PARSE_PARAMETERS_END();
+
+    int rc = ephpm_db_run_or_throw(sql, sql_len, params);
+    if (rc == EPHPM_DB_THREW) { RETURN_THROWS(); }
+
+    /* Rows first: they are the only part that does not survive finish(). */
+    zval rowsz;
+    array_init(&rowsz);
+    if (rc == 1) { ephpm_db_append_rows(&rowsz); }
+
+    zval colsz;
+    ephpm_db_init_columns(&colsz);
+
+    unsigned long long affected = 0, last_id = 0;
+    g_db_ops.ok_info(&affected, &last_id);
+    /* Prefer the bridge's own answer; fall back to the run() code for an ops
+     * table that predates had_rowset (it cannot happen in a build where C and
+     * Rust ship together, but the table is read through a pointer). */
+    int has_rowset = g_db_ops.had_rowset ? g_db_ops.had_rowset() : (rc == 1);
+    g_db_ops.finish();
+
+    array_init(return_value);
+    add_assoc_bool(return_value, "has_rowset", has_rowset);
+    add_assoc_zval(return_value, "rows", &rowsz);
+    add_assoc_zval(return_value, "columns", &colsz);
+    add_assoc_long(return_value, "affected_rows", (zend_long)affected);
+    add_assoc_long(return_value, "last_insert_id", (zend_long)last_id);
+}
+
+/* ephpm_db_columns(): array
+ *
+ * Column metadata of the LAST ephpm_db_* statement on this thread, as a list
+ * of ['name' => string, 'type' => ?string]. Empty list when that statement
+ * produced no result set, or when nothing has run yet.
+ *
+ * Exists because a zero-row result cannot carry its own column names
+ * (issue #262): ephpm_db_query() returns [] and the names go with it. This
+ * reads them from the metadata the bridge keeps after the rows are released,
+ * so wpdb::get_col_info(), mysqli_result::fetch_fields() and DBAL's
+ * columnCount() work after a SELECT that matched nothing.
+ *
+ * 'type' is the column's DECLARED schema type. It is null both for a column
+ * with no declared type and for an expression (SELECT a + 1) — SQLite makes
+ * no distinction between those two, so neither can this.
+ *
+ * Never throws: with no embedded database it returns an empty list. Reading
+ * metadata does not disturb it — this and the other introspection functions
+ * leave the last-call record and errno alone. */
+PHP_FUNCTION(ephpm_db_columns)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    ephpm_db_init_columns(return_value);
+}
+
+/* ephpm_db_in_transaction(): bool
+ *
+ * Whether THIS THREAD's session is inside an explicit transaction
+ * (issue #260). Reads the session's own flag — the same state the MySQL wire
+ * frontend reports as SERVER_STATUS_IN_TRANS — rather than guessing from the
+ * statements that have gone past.
+ *
+ * Lets a transaction() helper stop firing ROLLBACK blind after a failure and
+ * swallowing the resulting error: after a failed BEGIN, or after the
+ * request-end rollback safety net has already run, there is nothing to roll
+ * back and this says so.
+ *
+ * False when the thread has no session yet or no embedded database is active
+ * — in both cases no transaction can be open, so it is not a guess. Never
+ * throws. */
+PHP_FUNCTION(ephpm_db_in_transaction)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    RETURN_BOOL(g_db_ops.in_transaction ? g_db_ops.in_transaction() : 0);
+}
+
+/* ephpm_db_available(): bool
+ *
+ * Whether an ephpm_db_* statement issued right now would reach a database
+ * (issue #259) — a backend is registered AND, in per-site mode, this request
+ * has a tenant identity.
+ *
+ * The pre-flight form of the reserved-code contract: it rules out
+ * EPHPM_DB_ERR_UNAVAILABLE and EPHPM_DB_ERR_NO_SITE_CONTEXT without running a
+ * probe query and catching an exception. It does NOT open the database, so a
+ * true here can still be followed by an EPHPM_DB_ERR_CONNECT failure if the
+ * storage underneath is broken.
+ *
+ * Distinct from function_exists('ephpm_db_query'), which only tells you that
+ * you are running inside ePHPm. Never throws. */
+PHP_FUNCTION(ephpm_db_available)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    RETURN_BOOL(g_db_ops.available ? g_db_ops.available() : 0);
+}
+
+/* ephpm_db_errno(): int
+ *
+ * Error code of the last ephpm_db_* statement on this thread, or 0 if it
+ * succeeded (or none has run). Survives the exception being caught.
+ *
+ * A SQL failure reports the mapped MySQL SERVER error code (1062, 1064,
+ * 1105, ...). An infrastructure failure reports one of the reserved
+ * EPHPM_DB_ERR_* codes from the CLIENT range (2000-2999), which a server
+ * never emits — that separation is the stable "bridge problem vs. your SQL"
+ * signal, replacing message-text matching.
+ *
+ * Cleared by the next statement on this thread and at request end, so 0
+ * means "the last statement succeeded", not "no error has ever occurred".
+ *
+ * Reports on the last statement that REACHED the bridge. A parameter-binding
+ * refusal (EPHPM_DB_ERR_BAD_PARAM) is thrown by ephpm_db_push_params before
+ * anything is executed, so it leaves errno untouched — the thrown exception's
+ * code is the signal for that case. Never throws. */
+PHP_FUNCTION(ephpm_db_errno)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    if (!g_db_ops.error_info) { RETURN_LONG(EPHPM_DB_ERR_UNAVAILABLE); }
+
+    unsigned int code = 0;
+    const char *sqlstate = NULL, *msg = NULL;
+    size_t msg_len = 0;
+    g_db_ops.error_info(&code, &sqlstate, &msg, &msg_len);
+    RETURN_LONG((zend_long)code);
+}
+
+/* ephpm_db_error(): ?array{code: int, sqlstate: string, message: string}
+ *
+ * The last error in parts, or null when the last statement succeeded. The
+ * structured companion to ephpm_db_errno(), for mysqli_error() /
+ * mysqli_sqlstate() / PDO::errorInfo()-shaped adapter APIs.
+ *
+ * 'message' is the backend message on its own — the "SQLSTATE[xxxxx]: "
+ * prefix belongs to the exception's composed message, not to this. Never
+ * throws. */
+PHP_FUNCTION(ephpm_db_error)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+    if (!g_db_ops.error_info) {
+        array_init(return_value);
+        add_assoc_long(return_value, "code", EPHPM_DB_ERR_UNAVAILABLE);
+        add_assoc_string(return_value, "sqlstate", "HY000");
+        add_assoc_string(return_value, "message", EPHPM_DB_UNAVAILABLE_MSG);
+        return;
+    }
+
+    unsigned int code = 0;
+    const char *sqlstate = NULL, *msg = NULL;
+    size_t msg_len = 0;
+    g_db_ops.error_info(&code, &sqlstate, &msg, &msg_len);
+    /* The Rust shim signals "nothing staged" with a NULL sqlstate pointer;
+     * every staged error carries a nonzero code and five sqlstate bytes. */
+    if (sqlstate == NULL) { RETURN_NULL(); }
+
+    array_init(return_value);
+    add_assoc_long(return_value, "code", (zend_long)code);
+    add_assoc_stringl(return_value, "sqlstate", sqlstate ? sqlstate : "HY000", 5);
+    add_assoc_stringl(return_value, "message", msg ? msg : "", msg_len);
+}
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_query, 0, 0, 1)
     ZEND_ARG_INFO(0, sql)
     ZEND_ARG_INFO(0, params)
@@ -3216,6 +3501,14 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_execute, 0, 0, 1)
     ZEND_ARG_INFO(0, sql)
     ZEND_ARG_INFO(0, params)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_run, 0, 0, 1)
+    ZEND_ARG_INFO(0, sql)
+    ZEND_ARG_INFO(0, params)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_db_noargs, 0, 0, 0)
 ZEND_END_ARG_INFO()
 
 /* ===================================================================
@@ -3902,9 +4195,18 @@ ZEND_END_ARG_INFO()
     PHP_FE(ephpm_kv_pttl,      arginfo_ephpm_kv_pttl) \
     PHP_FE(ephpm_kv_flush_all, arginfo_ephpm_kv_flush_all) \
     PHP_FE(ephpm_kv_wait,      arginfo_ephpm_kv_wait) \
-    /* Embedded database bridge (per-thread litewire Session). */ \
-    PHP_FE(ephpm_db_query,     arginfo_ephpm_db_query) \
-    PHP_FE(ephpm_db_execute,   arginfo_ephpm_db_execute) \
+    /* Embedded database bridge (per-thread litewire Session). \
+     * ephpm_db_run is the unified entry point; the five introspection \
+     * functions (columns / in_transaction / available / errno / error) \
+     * never throw and never disturb the last-call record. */ \
+    PHP_FE(ephpm_db_query,          arginfo_ephpm_db_query) \
+    PHP_FE(ephpm_db_execute,        arginfo_ephpm_db_execute) \
+    PHP_FE(ephpm_db_run,            arginfo_ephpm_db_run) \
+    PHP_FE(ephpm_db_columns,        arginfo_ephpm_db_noargs) \
+    PHP_FE(ephpm_db_in_transaction, arginfo_ephpm_db_noargs) \
+    PHP_FE(ephpm_db_available,      arginfo_ephpm_db_noargs) \
+    PHP_FE(ephpm_db_errno,          arginfo_ephpm_db_noargs) \
+    PHP_FE(ephpm_db_error,          arginfo_ephpm_db_noargs) \
     /* WebSocket bridge (site-scoped connection registry). Implicit forms \
      * act on the connection that fired the current event; the \
      * ephpm_ws_connection_* forms take an explicit id. */ \
@@ -4741,8 +5043,9 @@ void ephpm_set_kv_ops(const EphpmKvOps *ops)
 }
 
 /*
- * Set the DB ops function pointer table backing ephpm_db_query() /
- * ephpm_db_execute(). Same timing contract as ephpm_set_kv_ops: called
+ * Set the DB ops function pointer table backing ephpm_db_query(),
+ * ephpm_db_execute(), ephpm_db_run(), and the introspection functions.
+ * Same timing contract as ephpm_set_kv_ops: called
  * once at startup, before any PHP scripts execute; g_db_ops is read-only
  * afterwards (ZTS-safe without locking).
  */
