@@ -235,6 +235,12 @@ pub struct ServerConfig {
     /// `~/sites/blog/` matches `Host: blog.localhost` — the suffix is
     /// stripped before the registry lookup and the on-disk lazy fallback.
     ///
+    /// **Must begin with a dot.** `Config::validate` rejects a dotless suffix at
+    /// startup (issue #397): the leading dot is what makes only a genuine
+    /// subdomain match. A dotless suffix would let the apex host `Host: <suffix>`
+    /// strip to the empty vhost key, which resolves the whole `sites_dir` as one
+    /// virtual host — collapsing every tenant into a single `open_basedir`.
+    ///
     /// Primarily used by `ephpm dev --sites` so developers can keep short
     /// directory names while testing with `*.localhost` URLs. Production
     /// deployments typically leave this unset and name directories with
@@ -2864,6 +2870,33 @@ impl Config {
                  entrypoint (default: [\"websocket.php\"])."
                     .to_string(),
             ));
+        }
+
+        // Fail closed (issue #397): a `sites_domain_suffix` without a leading
+        // dot is an operator error with a critical consequence. The suffix is
+        // stripped off the incoming `Host` to derive the vhost key, so a dotless
+        // suffix lets `Host: <suffix>` strip to the EMPTY key — and an empty key
+        // joined onto `sites_dir` is `sites_dir` itself, i.e. one vhost whose
+        // document root and `open_basedir` become the entire tenant fleet
+        // (cross-tenant read AND write). A legitimate suffix always begins with
+        // `.` (`.localhost`, `.preview.ephpm.dev`) so that only a genuine
+        // subdomain — never the apex — matches. There is no legitimate dotless
+        // suffix, so reject rather than silently normalize: normalizing would
+        // hide the mistake, and the operator should see it at startup. (The
+        // router re-validates the stripped key as a second, load-bearing layer;
+        // this check surfaces the misconfiguration before it can matter.)
+        if let Some(suffix) = self.server.sites_domain_suffix.as_deref()
+            && !suffix.starts_with('.')
+        {
+            return Err(ConfigError::Validation(format!(
+                "[server] sites_domain_suffix ({suffix:?}) must begin with a dot \
+                 (e.g. \".localhost\" or \".preview.ephpm.dev\"). Without the leading \
+                 dot the apex host `Host: {suffix}` strips to the empty vhost key, \
+                 which resolves the entire sites_dir as a single virtual host — every \
+                 tenant's files would share one open_basedir. Prefix the suffix with \
+                 a dot so only subdomains match, or remove the setting to name \
+                 directories with their full host.",
+            )));
         }
 
         // Fail closed: per-site overrides are trusted because they live where no
@@ -6577,6 +6610,36 @@ path = "test.db"
                 msg.contains("site_overrides_dir"),
                 "error should name the knob for {overrides}: {msg}"
             );
+        }
+    }
+
+    /// Issue #397: a `sites_domain_suffix` without a leading dot is rejected at
+    /// startup — it is the operator error that lets `Host: <suffix>` strip to
+    /// the empty vhost key and collapse the whole `sites_dir` into one
+    /// `open_basedir`.
+    #[test]
+    fn test_dotless_sites_domain_suffix_is_rejected() {
+        for suffix in ["localhost", "example.com", "preview.ephpm.dev", ""] {
+            let mut cfg = Config::default_config().unwrap();
+            cfg.server.sites_domain_suffix = Some(suffix.to_string());
+            let err = cfg.validate().expect_err("a dotless sites_domain_suffix must be rejected");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("sites_domain_suffix"),
+                "error should name the knob for {suffix:?}: {msg}"
+            );
+        }
+    }
+
+    /// The good path: a correctly *dotted* suffix passes validation, and an
+    /// unset suffix is fine too.
+    #[test]
+    fn test_dotted_sites_domain_suffix_is_accepted() {
+        for suffix in [Some(".localhost"), Some(".preview.ephpm.dev"), None] {
+            let mut cfg = Config::default_config().unwrap();
+            cfg.server.sites_domain_suffix = suffix.map(str::to_owned);
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("dotted/unset suffix {suffix:?} must validate: {e}"));
         }
     }
 

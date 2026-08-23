@@ -16,10 +16,18 @@
 //!    stock release binaries on every platform (the Linux release is
 //!    glibc-dynamic).
 //!
-//! **Coverage (FPM mode):** the chain runs only for PHP-dispatched requests
-//! (inside `Router::handle_php`). Static-file responses and error responses
-//! (403/404 from the router) do NOT pass through middleware. Worker mode
-//! routes every request through PHP, so there the chain sees everything.
+//! **Coverage:** the chain runs only for PHP-dispatched requests (inside
+//! `Router::handle_php`). Static-file responses and error responses (403/404
+//! from the router) do NOT pass through middleware, **in any mode**. This is
+//! true of worker mode too: a request for a file that exists on disk still
+//! takes the static branch and never reaches the worker (only a missing-file
+//! fallback is routed to PHP), so the chain does **not** see it. A middleware
+//! mount therefore cannot gate confidential static assets — media, JS/CSS
+//! bundles and their source maps, CSV/SQL/ZIP exports left in the document
+//! root are served without consulting the chain. To keep such files private,
+//! do not place them in a web-served document root. Making the chain gate the
+//! static branch is a separate, deliberate design decision (issue #395) and is
+//! not implemented.
 //!
 //! v1 chain semantics: `RESPOND` short-circuits the chain immediately.
 //! `REWRITE` accumulates a path override (last writer wins) and header

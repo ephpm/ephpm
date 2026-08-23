@@ -176,12 +176,21 @@ v1 rules worth knowing:
   the body is read (rejecting before the transfer is the point);
   the ABI's body accessor currently always returns length 0.
 
-**Coverage.** In **fpm mode** the chain runs on **PHP-dispatched requests
-only**: static-file responses and router error responses (403/404) do **not**
-pass through middleware. If you need a rule (rate limit, auth, security
-headers) to cover static assets or error pages under fpm mode, enforce it in
-front of ePHPm. In **worker mode** every request is routed through PHP, so the
-chain sees everything — static, dynamic, and error paths alike.
+**Coverage.** The chain runs on **PHP-dispatched requests only**, **in every
+mode**: static-file responses and router error responses (403/404) do **not**
+pass through middleware. This includes worker mode — a request for a file that
+exists on disk still takes the static branch and is never routed to the worker
+(only a missing-file fallback reaches PHP), so the chain does not see it.
+
+> **Security note.** A middleware mount — including the `basic-auth`,
+> `session-cookie`, and `github-auth` gates — **does not protect static files**.
+> If confidential assets live in a web-served document root (media,
+> `wp-content/uploads/*`, JS/CSS bundles and their `.map` source maps, CSV/SQL/ZIP
+> exports), they are served to unauthenticated clients regardless of any mounted
+> middleware and regardless of `[php] mode`. Do not rely on the chain to gate
+> them: keep confidential files out of the document root, or enforce the rule in
+> a proxy in front of ePHPm. (Making the chain gate the static branch is tracked
+> as a separate design decision in issue #395 and is not implemented.)
 
 ## The built-in modules
 
