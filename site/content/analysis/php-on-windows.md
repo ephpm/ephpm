@@ -383,15 +383,15 @@ Read those three rows as one story:
 
 - **JIT off → TAILCALL's 1.72x is the full, durable win.** This is the pure
   interpreter number, and it is exactly what runs whenever the JIT is off:
-  in ePHPm's **multi-tenant serve** mode (where the JIT is disabled by
-  default — per-vhost `opcache_invalidate` never reclaims JIT buffer, #350),
-  in worker mode, in dev, and anywhere an operator sets
-  `opcache_jit = "disable"`. **Multi-tenant serve is TAILCALL's best
-  real-world case**: there the interpreter is the whole game, so the ~1.72x
-  lands in full.
+  in **every** ePHPm mode as shipped, since the JIT is disabled by default
+  everywhere — multi-tenant because per-vhost `opcache_invalidate` never
+  reclaims JIT buffer (#350), single-site serve because of the upstream
+  tracing-JIT use-after-free (#365) — as well as in worker mode and dev.
+  **This is TAILCALL's best real-world case**: with the JIT off the
+  interpreter is the whole game, so the ~1.72x lands in full.
 - **JIT on, warm hot path → the gap essentially closes.** With
-  `opcache.jit=tracing` (ePHPm's **single-site serve** default since v0.7.3,
-  #350) hot code is compiled to native machine code that never touches the
+  `opcache.jit=tracing` (ePHPm's single-site serve default in v0.7.3 only,
+  #350; reverted to `disable` by #365) hot code is compiled to native machine code that never touches the
   C interpreter's dispatch — so the host VM's dispatch quality stops
   mattering, and MSVC+JIT and TAILCALL+JIT land on top of each other (MSVC
   even edges ahead, and both beat the ~2.5 ms Linux HYBRID *interpreter*

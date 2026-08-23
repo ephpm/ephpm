@@ -81,12 +81,13 @@ Enabling `opcache.jit=tracing` on `cpu.php` produced **−17% RPS** (p50
 overhead is pure cost. Conclusions:
 
 - **JIT is workload-shaped, not universally good.** This result kept the
-  JIT off by default through v0.7.2. *Update (v0.7.3):* the default is now
-  **shaped** — `opcache.jit=tracing` in single-site serve (a pure-PHP CPU
-  loop measured 5.56 ms → 2.33 ms on Windows), still off in multi-tenant,
-  worker, and dev modes — with `[php] opcache_jit = "disable"` as the
-  one-knob escape hatch for exactly the builtin-heavy case measured here.
-  See [OPcache JIT](/reference/config/#opcache-jit).
+  JIT off by default through v0.7.2. It was briefly turned on for single-site
+  serve in v0.7.3 (a pure-PHP CPU loop measured 5.56 ms → 2.33 ms on
+  Windows), then turned **back off on every platform** by #365: PHP's tracing
+  JIT kills the process when it compiles a side trace in a later request than
+  its parent, and no ePHPm-side lever avoids it. `[php] opcache_jit =
+  "tracing"` opts back in, and `"function"` is the mode that is not exposed to
+  that defect. See [OPcache JIT](/reference/config/#opcache-jit).
 - JIT is a per-application decision that helps *pure-PHP compute*
   (arithmetic, arrays, tight interpreter loops). Bench your app.
 - **JIT is not the lever for the cpu-vs-Swoole gap** — see below.
