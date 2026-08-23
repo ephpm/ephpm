@@ -1,18 +1,22 @@
 //! Native middleware end-to-end — the **dlopen lane**, in a real server.
 //!
-//! What this suite proves that nothing else does: a shared library built the
-//! way the docs tell operators to build one (`cargo build -p
-//! ephpm-middleware-cors` → a real `.so`), mounted by absolute path in a
-//! `[[middleware]]` block, is dlopened at startup, passes the ABI handshake,
-//! and actually decides real HTTP requests. Every other middleware test in the
-//! tree either takes the *static registry* path (no dlopen at all) or drives
-//! `MiddlewareChain` in-process without a server around it.
+//! What this suite proves that nothing else does: a real shared-library module,
+//! mounted by absolute path in a `[[middleware]]` block, is dlopened at
+//! startup, passes the ABI handshake, and actually decides real HTTP requests.
+//! Every other middleware test in the tree drives `MiddlewareChain` in-process
+//! without a server around it.
+//!
+//! **Currently skipped by the bare-process harness (v0.8.0):** the `cors`
+//! module it built moved OUT of this repo to github.com/ephpm/middleware, so
+//! `xtask/src/e2e_bare.rs` no longer produces a cdylib here and drops this
+//! suite from the run. Re-point it at a fetched module (`ephpm middleware get
+//! cors`) once the CLI has landed and the middleware repo is public; the
+//! module's own dlopen coverage lives in that repo's CI meanwhile.
 //!
 //! The mount is deliberately an explicit **path**, not the bare name `"cors"`:
-//! `resolve_library` sends bare names to the builtin registry first, so
-//! `library = "cors"` would quietly test the static lane and prove nothing
-//! about dlopen. See `xtask/src/e2e_bare.rs` (`SingleNodeOptions::for_suite`)
-//! for the generated config.
+//! the builtin registry is empty in stock binaries, so a bare name would fail
+//! to resolve rather than test dlopen. See `xtask/src/e2e_bare.rs`
+//! (`SingleNodeOptions::for_suite`) for the generated config.
 //!
 //! The module is configured with a single allowed origin rather than `"*"`, so
 //! the suite can distinguish "the module ran and made a decision" from

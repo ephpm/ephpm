@@ -429,21 +429,31 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 
     // The `middleware` suite mounts a real loadable module by path, so a
-    // cdylib has to exist before its node starts. Nothing else in the build
-    // produces one: `cargo xtask release` builds the `ephpm` binary only, and
-    // the shipped middleware crates' `cdylib` output comes exclusively from an
-    // explicit `cargo build -p <crate>`. Build it here, and only when that
-    // suite is actually selected, so `--tests basic` stays cheap.
-    let middleware_lib = if single_suites.iter().any(|(name, _)| name == "middleware") {
+    // cdylib has to exist before its node starts. The four official modules
+    // moved OUT of this repo to github.com/ephpm/middleware, so there is no
+    // in-tree cdylib to build any more. If the suite was selected but a module
+    // can't be produced, SKIP it (dropping it from the run) rather than fail
+    // the whole E2E — its coverage now lives in the middleware repo's own CI.
+    // TODO(v0.8.0): repoint this suite at a fetched module (`ephpm middleware
+    // get cors`) once the CLI lands and the middleware repo is public.
+    let (single_suites, middleware_lib) = if single_suites
+        .iter()
+        .any(|(name, _)| name == "middleware")
+    {
         match build_middleware_cdylib() {
-            Some(path) => Some(path),
+            Some(path) => (single_suites, Some(path)),
             None => {
-                eprintln!("error: could not build the middleware cdylib for the e2e suite");
-                return ExitCode::FAILURE;
+                eprintln!(
+                    "==> SKIP: no in-tree middleware cdylib (modules moved to \
+                         github.com/ephpm/middleware); dropping the `middleware` e2e suite"
+                );
+                let filtered: Vec<_> =
+                    single_suites.into_iter().filter(|(name, _)| name != "middleware").collect();
+                (filtered, None)
             }
         }
     } else {
-        None
+        (single_suites, None)
     };
 
     // Self-managed suites next (after the server-less ones): the harness
@@ -670,57 +680,21 @@ fn resolve_ephpm_binary(args: &[String], php_version: &str) -> Option<PathBuf> {
     None
 }
 
-/// Build the shipped `ephpm-middleware-cors` cdylib and return its path.
+/// Produce a loadable middleware cdylib for the `middleware` e2e suite, or
+/// `None` if one can't be built in this checkout.
 ///
-/// This is the artifact the `middleware` suite mounts by path, and it is the
-/// whole point of that suite: it proves the dlopen lane works with a module
-/// built exactly the way the docs tell operators to build one — not with a
-/// purpose-made test fixture.
-///
-/// Built with the same `--release --target <triple>` shape as
-/// `crate::release()` so it shares that build's dependency artifacts; the
-/// alternative (a bare `--release`) would recompile the dependency graph into
-/// a second output directory for no benefit.
+/// The four official modules (including the `cors` module this suite used to
+/// build) moved OUT of this repo to github.com/ephpm/middleware, so there is
+/// no in-tree crate to build any more. Returning `None` makes the caller skip
+/// the suite rather than fail the whole run. Re-point this at a fetched module
+/// (`ephpm middleware get cors`) or a sibling `../middleware` checkout once the
+/// CLI has landed and the middleware repo is public (v0.8.0 follow-up).
 fn build_middleware_cdylib() -> Option<PathBuf> {
-    let host_target = if cfg!(target_os = "macos") {
-        format!("{}-apple-darwin", std::env::consts::ARCH)
-    } else {
-        format!("{}-unknown-linux-gnu", std::env::consts::ARCH)
-    };
-
-    eprintln!("==> Building middleware cdylib (ephpm-middleware-cors, release)...");
-    let status = Command::new("cargo")
-        .args([
-            "build",
-            "--release",
-            "--package",
-            "ephpm-middleware-cors",
-            "--target",
-            &host_target,
-        ])
-        .current_dir(workspace_root())
-        .status();
-    if !matches!(&status, Ok(s) if s.success()) {
-        eprintln!("error: cargo build -p ephpm-middleware-cors failed");
-        return None;
-    }
-
-    let file = format!(
-        "{}ephpm_middleware_cors.{}",
-        std::env::consts::DLL_PREFIX,
-        std::env::consts::DLL_EXTENSION
+    eprintln!(
+        "==> middleware modules are no longer in this repo (moved to \
+         github.com/ephpm/middleware); the `middleware` e2e suite has no cdylib to load here"
     );
-    // Honour CARGO_TARGET_DIR: containerised runs mount a shared target volume
-    // outside the checkout, where `<root>/target` does not exist at all.
-    let target_root = std::env::var_os("CARGO_TARGET_DIR")
-        .map_or_else(|| workspace_root().join("target"), PathBuf::from);
-    let path = target_root.join(&host_target).join("release").join(&file);
-    if !path.is_file() {
-        eprintln!("error: middleware cdylib not found at {}", path.display());
-        return None;
-    }
-    eprintln!("    middleware cdylib ready: {}", path.display());
-    Some(path)
+    None
 }
 
 /// Enumerate `<deps>/<suite>-<hash>[.exe]`, keeping only the newest binary per
