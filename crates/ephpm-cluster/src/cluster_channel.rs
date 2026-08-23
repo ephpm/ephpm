@@ -1183,13 +1183,9 @@ mod tests {
 
     /// The lazy-bind proof. When no feature is enabled, `maybe_start`
     /// must return `Ok(None)` and MUST NOT touch the network — no
-    /// listener appears on the port derived from the gossip address.
+    /// listener appears on the configured channel port.
     #[tokio::test]
     async fn channel_stays_off_when_no_features_enabled() {
-        // Bring up a real gossip listener so we have a real
-        // ClusterHandle to derive from. The bound gossip port dictates
-        // what "port + 2" would be — we then confirm nothing is
-        // listening on that port after `maybe_start`.
         let gossip_bind = pick_free_port_addr();
 
         let cfg = ephpm_config::ClusterConfig {
@@ -1200,10 +1196,17 @@ mod tests {
         };
         let cluster = Arc::new(crate::start_gossip(&cfg).await.expect("gossip start"));
 
-        let derived_port = cluster.gossip_socket_addr().port() + 2;
-        let derived_addr = format!("127.0.0.1:{derived_port}");
-
-        let channel_cfg = ephpm_config::ClusterChannelConfig::default();
+        // Pin the channel to an explicit, freshly-reserved ephemeral port
+        // rather than the derived `gossip_port + 2`. A derived port is not
+        // reserved from the OS, so a sibling test (or the e2e suite) can be
+        // holding it and this "prove nothing is bound" probe then fails
+        // spuriously — issue #383. An OS-assigned port carries no such
+        // correlation.
+        let channel_addr = reserve_free_tcp_addr();
+        let channel_cfg = ephpm_config::ClusterChannelConfig {
+            listen: Some(channel_addr.clone()),
+            ..ephpm_config::ClusterChannelConfig::default()
+        };
         let features = FeatureFlags::default(); // NOTHING enabled
 
         let result =
@@ -1211,22 +1214,24 @@ mod tests {
 
         assert!(result.is_none(), "channel handle must be None when no feature is enabled");
 
-        // Prove nothing is bound: we should be able to bind the
-        // derived port ourselves. If maybe_start had bound it in
-        // violation of the contract, this would fail with EADDRINUSE.
-        let probe = TcpListener::bind(&derived_addr).await;
+        // Prove nothing is bound: we should be able to bind the configured
+        // port ourselves. If maybe_start had bound it in violation of the
+        // contract, this would fail with EADDRINUSE.
+        let probe = TcpListener::bind(&channel_addr).await;
         assert!(
             probe.is_ok(),
-            "the channel port {derived_addr} must be unbound when no feature is enabled \
+            "the channel port {channel_addr} must be unbound when no feature is enabled \
              (got: {probe:?})"
         );
     }
 
-    /// When a feature IS enabled, the channel must bind. Also confirms
-    /// the derived-address rule (`gossip_port + 2`) is honored when
-    /// `[cluster.channel] listen` is unset.
+    /// The derived-address rule (`gossip_port + 2`) is honored when
+    /// `[cluster.channel] listen` is unset. Checked against the pure
+    /// [`resolve_listen_addr`] helper so nothing binds the derived port —
+    /// a derived port isn't reserved from the OS and racing to bind it
+    /// flakes under parallelism (issue #383).
     #[tokio::test]
-    async fn channel_binds_when_a_feature_is_enabled_and_derives_port_from_gossip() {
+    async fn channel_listen_addr_derives_from_gossip_port() {
         let gossip_bind = pick_free_port_addr();
 
         let cfg = ephpm_config::ClusterConfig {
@@ -1239,12 +1244,37 @@ mod tests {
         let expected_port = cluster.gossip_socket_addr().port() + 2;
 
         let channel_cfg = ephpm_config::ClusterChannelConfig::default();
+        let derived = resolve_listen_addr(&channel_cfg, &cluster).expect("derive listen addr");
+
+        assert_eq!(derived.port(), expected_port);
+    }
+
+    /// When a feature IS enabled, the channel actually binds a listener.
+    /// Binds an OS-assigned port (`listen = 127.0.0.1:0`) and reads the
+    /// bound address back, mirroring the QUIC listener's bind-0-then-read
+    /// pattern — no derived port to race (issue #383).
+    #[tokio::test]
+    async fn channel_binds_when_a_feature_is_enabled() {
+        let gossip_bind = pick_free_port_addr();
+
+        let cfg = ephpm_config::ClusterConfig {
+            enabled: true,
+            bind: gossip_bind.clone(),
+            secret: "a-secret-value-for-tests".to_string(),
+            ..ephpm_config::ClusterConfig::default()
+        };
+        let cluster = Arc::new(crate::start_gossip(&cfg).await.expect("gossip start"));
+
+        let channel_cfg = ephpm_config::ClusterChannelConfig {
+            listen: Some("127.0.0.1:0".to_string()),
+            ..ephpm_config::ClusterChannelConfig::default()
+        };
         let handle = maybe_start(&channel_cfg, &cfg.secret, &cluster, FeatureFlags { cdc: true })
             .await
             .expect("maybe_start")
             .expect("channel handle");
 
-        assert_eq!(handle.listen_addr().port(), expected_port);
+        assert_ne!(handle.listen_addr().port(), 0, "channel must bind a real, non-zero port");
     }
 
     /// When a feature is enabled but no secret is configured anywhere,
@@ -1443,6 +1473,16 @@ mod tests {
         s.local_addr().unwrap().to_string()
     }
 
+    /// Reserve a free loopback **TCP** port by binding then dropping, and
+    /// return its `127.0.0.1:PORT` string. Inherently TOCTOU, but an
+    /// OS-assigned port is uncorrelated with any other listener — unlike a
+    /// port derived from a base (`gossip_port + 2`), which is what flaked in
+    /// issue #383.
+    fn reserve_free_tcp_addr() -> String {
+        let s = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        s.local_addr().unwrap().to_string()
+    }
+
     // -----------------------------------------------------------------
     // advertise_addr — the "don't publish 0.0.0.0 to peers" contract.
     //
@@ -1513,15 +1553,17 @@ mod tests {
             ..ephpm_config::ClusterConfig::default()
         };
         let cluster = Arc::new(crate::start_gossip(&cfg).await.expect("gossip start"));
-        let handle = maybe_start(
-            &ephpm_config::ClusterChannelConfig::default(),
-            &cfg.secret,
-            &cluster,
-            FeatureFlags { cdc: true },
-        )
-        .await
-        .expect("maybe_start")
-        .expect("channel handle");
+        // Bind an OS-assigned loopback port (bind-0-then-read) rather than the
+        // derived `gossip_port + 2`, which is unreserved and races under
+        // parallelism (issue #383).
+        let channel_cfg = ephpm_config::ClusterChannelConfig {
+            listen: Some("127.0.0.1:0".to_string()),
+            ..ephpm_config::ClusterChannelConfig::default()
+        };
+        let handle = maybe_start(&channel_cfg, &cfg.secret, &cluster, FeatureFlags { cdc: true })
+            .await
+            .expect("maybe_start")
+            .expect("channel handle");
         assert_eq!(handle.advertise_addr(), Some(handle.listen_addr()));
     }
 
@@ -1548,13 +1590,13 @@ mod tests {
         };
         let cluster = Arc::new(crate::start_gossip(&cfg).await.expect("gossip start"));
 
-        // Pick a free TCP port for the channel by binding and dropping.
-        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let chan_port = probe.local_addr().unwrap().port();
-        drop(probe);
-
+        // Bind a wildcard address on an OS-assigned port (`0.0.0.0:0`) and read
+        // the bound port back, rather than reserving a concrete port up front —
+        // the assertions below only care that the bind is wildcard and that
+        // advertise swaps in a routable IP, not which port it landed on. This
+        // avoids racing to bind a specific port (issue #383).
         let channel_cfg = ephpm_config::ClusterChannelConfig {
-            listen: Some(format!("0.0.0.0:{chan_port}")),
+            listen: Some("0.0.0.0:0".to_string()),
             secret: None,
         };
         let handle = maybe_start(&channel_cfg, &cfg.secret, &cluster, FeatureFlags { cdc: true })

@@ -652,14 +652,20 @@ mod tests {
     /// The bucket refills at `per_site_rate`, so a denied site recovers.
     #[test]
     fn site_bucket_refills_over_time() {
-        // 1000 tokens/s → one token per millisecond; a short sleep is enough.
-        let limiter = Limiter::new(site_config(1000.0, 2));
+        // 10 tokens/s → one token every 100 ms. The refill interval is chosen
+        // so this test never races the wall clock (issue #392): the three
+        // back-to-back `check_site_rate` calls below complete in microseconds,
+        // far inside a single 100 ms interval, so no scheduler hiccup can sneak
+        // an extra token across a refill boundary and spuriously satisfy the
+        // "burst exhausted" assertion. The deliberate sleep then clears more
+        // than one full interval, guaranteeing at least one token has refilled.
+        let limiter = Limiter::new(site_config(10.0, 2));
 
         assert!(limiter.check_site_rate("s.example.com"));
         assert!(limiter.check_site_rate("s.example.com"));
         assert!(!limiter.check_site_rate("s.example.com"), "burst exhausted");
 
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(std::time::Duration::from_millis(250));
         assert!(limiter.check_site_rate("s.example.com"), "refilled after waiting");
     }
 

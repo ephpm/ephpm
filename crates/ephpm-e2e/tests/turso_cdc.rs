@@ -101,6 +101,9 @@ node_id = "{NODE_ID}"
 cluster_id = "ephpm-e2e-turso-cdc"
 secret = "{SECRET}"
 
+[cluster.channel]
+listen = "127.0.0.1:{CHANNEL_PORT}"
+
 [cluster.kv]
 data_port = {KV_DATA_PORT}
 "#;
@@ -110,6 +113,11 @@ struct NodePorts {
     mysql: u16,
     hrana: u16,
     gossip: u16,
+    /// Cluster-channel (CDC transport) listen port. Reserved as its own
+    /// OS-assigned ephemeral port and pinned via `[cluster.channel] listen`
+    /// rather than derived as `gossip + 2` — a derived port is not reserved
+    /// from the kernel and collided under parallelism (issue #383).
+    channel: u16,
     kv_data: u16,
 }
 
@@ -124,7 +132,7 @@ enum RoleSpec {
     Auto,
     Primary,
     /// Replica of the node at this index. The address a replica dials is the
-    /// primary's **cluster channel** — gossip port + 2, not the gossip port.
+    /// primary's **cluster channel** (`channel_addr`), not its gossip port.
     ReplicaOf(usize),
 }
 
@@ -155,7 +163,8 @@ impl CdcCluster {
                 http: reserve_port().await?,
                 mysql: reserve_port().await?,
                 hrana: reserve_port().await?,
-                gossip: reserve_gossip_port().await?,
+                gossip: reserve_port().await?,
+                channel: reserve_port().await?,
                 kv_data: reserve_port().await?,
             });
         }
@@ -165,9 +174,10 @@ impl CdcCluster {
         Ok(Self { binary: binary.to_path_buf(), docroot, ports, children, tempdir })
     }
 
-    /// The cluster-channel address peers dial to reach node `i`.
+    /// The cluster-channel address peers dial to reach node `i` — the
+    /// explicit `[cluster.channel] listen` port, not a `gossip + 2` derivation.
     fn channel_addr(&self, i: usize) -> String {
-        format!("127.0.0.1:{}", self.ports[i].gossip + 2)
+        format!("127.0.0.1:{}", self.ports[i].channel)
     }
 
     /// Spawn node `i` with the given replication role and wait for it to
@@ -203,6 +213,7 @@ impl CdcCluster {
             .replace("{MYSQL_PORT}", &p.mysql.to_string())
             .replace("{HRANA_PORT}", &p.hrana.to_string())
             .replace("{GOSSIP_PORT}", &p.gossip.to_string())
+            .replace("{CHANNEL_PORT}", &p.channel.to_string())
             .replace("{KV_DATA_PORT}", &p.kv_data.to_string())
             .replace("{NODE_ID}", &format!("cdc-node-{i}"))
             .replace("{CLUSTER_JOIN}", &join)
@@ -420,22 +431,6 @@ impl Drop for CdcCluster {
 async fn reserve_port() -> Result<u16> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind :0")?;
     Ok(listener.local_addr().context("local_addr")?.port())
-}
-
-/// Reserve a gossip port whose derived cluster-channel port (`gossip + 2` —
-/// see `ephpm_cluster::cluster_channel`) is also currently free, so the CDC
-/// transport can bind.
-async fn reserve_gossip_port() -> Result<u16> {
-    for _ in 0..16 {
-        let p = reserve_port().await?;
-        if p >= u16::MAX - 2 {
-            continue;
-        }
-        if tokio::net::TcpListener::bind(("127.0.0.1", p + 2)).await.is_ok() {
-            return Ok(p);
-        }
-    }
-    bail!("could not reserve a gossip port with a free channel port (+2)")
 }
 
 fn escape_toml(path: &Path) -> String {
