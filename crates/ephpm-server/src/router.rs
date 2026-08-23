@@ -408,6 +408,11 @@ pub struct Router {
     /// disabled — in which case an upgrade request is routed like any other
     /// GET, exactly as before the feature existed.
     websocket: Option<Arc<crate::websocket::WsRuntime>>,
+    /// Built-in reverse-proxy engine (`[[server.proxy]]`), or `None` when no
+    /// rules are configured — in which case the proxy check on the request path
+    /// is one `Option::is_none()`. A matched rule short-circuits all local
+    /// serving.
+    proxy: Option<crate::proxy::ProxyEngine>,
     /// Weak self-reference, installed by [`Router::share`].
     ///
     /// A WebSocket session outlives the request that created it, and every
@@ -970,6 +975,7 @@ impl Router {
             sites,
             multi_site,
             websocket: None,
+            proxy: crate::proxy::ProxyEngine::new(&config.server.proxy),
             self_weak: std::sync::Weak::new(),
             websocket_files: config.server.websocket_files.clone(),
             sites_dir: config.server.sites_dir.clone(),
@@ -2206,6 +2212,40 @@ impl Router {
 
         // Resolve real client IP and HTTPS status from trusted proxy headers
         let (effective_addr, is_https) = self.resolve_proxy_info(&req, remote_addr, is_tls);
+
+        // Built-in reverse proxy (`[[server.proxy]]`). Positioned deliberately:
+        //
+        // * AFTER the host-validation gates (trusted host, malformed host) and
+        //   the hidden-file / blocked-path gates above — an operator's global
+        //   blocks still apply to proxied paths, so a proxy rule can never be a
+        //   way around them (documented precedence: gates outrank proxy).
+        // * AFTER `resolve_proxy_info`, so the `X-Forwarded-*` headers carry the
+        //   resolved client identity.
+        // * BEFORE `resolve_site` and the native WebSocket block, so a matched
+        //   rule short-circuits ALL local serving (static, PHP, native WS
+        //   termination) — a proxied host/path belongs to the backend.
+        //
+        // With no rules configured this is one `Option::is_none()`.
+        if let Some(ref proxy) = self.proxy {
+            let proxy_host = extract_server_name(&req).trim_end_matches('.').to_ascii_lowercase();
+            if let Some(idx) = proxy.match_index(&proxy_host, &uri_path) {
+                let original_host = req
+                    .headers()
+                    .get(http::header::HOST)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let mut resp =
+                    proxy.forward(idx, req, &original_host, effective_addr, is_https).await;
+                // Configured response headers belong on error/normal responses
+                // but not on a 101 — that hands the socket to the WS tunnel and
+                // anything appended would be read as frame bytes.
+                if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+                    self.apply_response_headers(&mut resp);
+                }
+                return Ok((resp, "proxy"));
+            }
+        }
 
         let accepts_br = self.compression.enabled && accepts_encoding(&req, "br");
         let accepts_gzip = self.compression.enabled && accepts_encoding(&req, "gzip");

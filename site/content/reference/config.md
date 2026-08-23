@@ -247,6 +247,45 @@ With `enabled = false` (the default) an upgrade request routes exactly like any 
 
 Two ceilings are fixed rather than configurable: 64 channel subscriptions per connection and 256-byte channel names. They bound what one misbehaving script can pin.
 
+### `[[server.proxy]]` — built-in reverse proxy
+
+An **ordered rule list**. Each rule matches on host and path and forwards a matched request to **one** upstream. Rules are tried top-to-bottom and the **first match wins**. A matched rule **short-circuits all local serving** — static files, PHP, and native WebSocket termination — so a proxied host/path belongs entirely to the backend. An empty list (the default) turns the feature off.
+
+It is deliberately a **single-hop forwarder, not an edge load balancer**. See the [reverse-proxy guide](/guides/reverse-proxy/) for the multi-PHP-version and strangler-migration use cases.
+
+**Precedence:** the global host-validation gates (`[server.request] trusted_hosts`) and the `[server.security]` hidden-file / `blocked_paths` gates run **before** the proxy match, so an operator's blocks still apply to proxied paths — a proxy rule can never be used to bypass them.
+
+```toml
+# Route pr-A's host to the PHP 8.4 backend, pr-B's to the 8.5 backend.
+[[server.proxy]]
+host = "pr-a.preview.example.com"
+upstream = "http://127.0.0.1:9084"
+
+[[server.proxy]]
+host = "pr-b.preview.example.com"
+upstream = "http://127.0.0.1:9085"
+
+# Strangler migration: send /api to a legacy backend, keep the rest local.
+[[server.proxy]]
+path = "/api"
+upstream = "http://127.0.0.1:8000"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `host` | string | *(any)* | Host matcher. `"app.example.com"` = exact (case-insensitive; port/trailing-dot ignored); `"*.example.com"` = wildcard over exactly one leftmost label; `".example.com"` = suffix matching the apex and any subdomain; `"*"` or omitted = any host. A non-leftmost `*` is a **startup error**. |
+| `path` | string | `"/"` | Path matcher. A **segment-aware prefix** by default (`/api` matches `/api`, `/api/`, `/api/x` but not `/apiary`); `/` matches every path. Must begin with `/`. |
+| `path_exact` | bool | `false` | When `true`, `path` must equal the request path exactly rather than being a prefix. |
+| `upstream` | string | *(required)* | `http://host[:port]` — scheme + authority only. `https://` upstreams and any path/query/fragment are **startup errors in v1** (see below). |
+| `connect_timeout_secs` | u64 | `5` | TCP connect deadline to the upstream. A matched but unreachable upstream returns `502 Bad Gateway` within this bound rather than hanging. `0` = OS default. |
+| `read_timeout_secs` | u64 | `60` | Time to receive the upstream **response head** (time-to-first-byte). Deliberately does **not** bound the streamed response body, so SSE and long downloads are not cut off. `0` disables the head-read deadline. |
+
+**Streaming and WebSockets.** Both directions stream unbuffered (uploads, SSE, large downloads). An RFC 6455 WebSocket **upgrade** on a matched rule is tunnelled to the upstream (raw byte passthrough), distinct from the native WebSocket *termination* of `[server.websocket]`.
+
+**Forwarded headers.** The original `Host` is preserved. `X-Forwarded-For` is set to the resolved client IP (the inbound proxy chain has already been collapsed to that IP by `[server.security] trusted_proxies`), `X-Forwarded-Proto` to the client-facing scheme, and `X-Forwarded-Host` to the original `Host`. Hop-by-hop headers are stripped in both directions.
+
+**Not in v1 (documented as out of scope):** load balancing, multiple upstreams per route, health checks, retries, circuit breaking, dynamic upstreams, response-body/redirect rewriting, canary/percentage routing — and, specifically, **`https://` upstreams** (terminate TLS at this instance and proxy plaintext to a loopback backend) and **request-path rewriting** (the original request path is forwarded unchanged; there is no prefix strip/prepend). These are v2+.
+
 ```toml
 [server.tls]
 cert = "/etc/ephpm/fullchain.pem"

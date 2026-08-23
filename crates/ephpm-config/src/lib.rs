@@ -380,6 +380,230 @@ pub struct ServerConfig {
     /// Native WebSocket support (experimental, off by default).
     #[serde(default)]
     pub websocket: WebSocketConfig,
+
+    /// Built-in reverse-proxy rules (`[[server.proxy]]`), evaluated in order.
+    ///
+    /// Each rule matches on host and path and forwards a matched request to a
+    /// single upstream (a single-hop forwarder, **not** an edge load balancer).
+    /// Rules are tried top-to-bottom and the **first match wins**; a matched
+    /// rule short-circuits all local serving (static files, PHP, native
+    /// WebSocket termination). An empty list (the default) disables the feature
+    /// entirely — the request path pays one `slice::is_empty()`.
+    ///
+    /// See [`ProxyRuleConfig`] for the per-rule fields and their validation.
+    #[serde(default)]
+    pub proxy: Vec<ProxyRuleConfig>,
+}
+
+/// One reverse-proxy rule (`[[server.proxy]]`).
+///
+/// A rule matches on **host** and **path** and forwards the request to one
+/// **upstream**. Matching, precedence and the "single-hop forwarder, not a load
+/// balancer" scope are described on [`ServerConfig::proxy`].
+///
+/// # Host matcher (`host`)
+///
+/// One string, whose syntax selects the match kind (unambiguous on sight):
+///
+/// | `host` value            | matches                                            |
+/// |-------------------------|----------------------------------------------------|
+/// | `"app.example.com"`     | exact (case-insensitive; port/trailing-dot ignored)|
+/// | `"*.example.com"`       | wildcard — exactly one leftmost label              |
+/// | `".example.com"`        | suffix — the apex and any subdomain                |
+/// | `"*"` or omitted        | any host                                           |
+///
+/// # Path matcher (`path` + `path_exact`)
+///
+/// `path` is a **prefix** by default (`/api` matches `/api`, `/api/v1`, …); the
+/// default `"/"` matches every path. Set `path_exact = true` to require the
+/// request path to equal `path` exactly. Two explicit fields — never a marker
+/// smuggled into the string.
+///
+/// # Upstream (`upstream`)
+///
+/// A `http://host[:port]` URL — **scheme + authority only**. Validated at
+/// startup (fail-closed, so a mistake never becomes a silent no-op):
+///
+/// * `https://` upstreams are a **hard error in v1** — TLS to the upstream
+///   (client cert stores, SNI) is out of scope; v1 targets loopback plaintext
+///   backends. Terminate TLS at this instance and proxy plaintext.
+/// * A **path/query/fragment** in the URL is a **hard error in v1** — v1
+///   forwards the original request path unchanged and does **no** request-path
+///   rewriting (prefix strip/prepend). Give host+port only.
+///
+/// # Timeouts
+///
+/// `connect_timeout_secs` bounds the TCP connect to the upstream; a rule that
+/// matches an unreachable upstream returns `502 Bad Gateway` within this bound
+/// rather than hanging. `read_timeout_secs` bounds the time to receive the
+/// upstream **response head** (time-to-first-byte); it deliberately does **not**
+/// bound the streamed response body, so Server-Sent Events and long downloads
+/// are not cut off. The outer `[server.timeouts] request` ceiling still applies
+/// to the whole request exactly as it does to every handler.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProxyRuleConfig {
+    /// Host matcher. `None` (omitted) or `"*"` matches any host. See the type
+    /// docs for the exact/wildcard/suffix syntax.
+    #[serde(default)]
+    pub host: Option<String>,
+
+    /// Path matcher. A prefix by default (see [`path_exact`](Self::path_exact)).
+    ///
+    /// Default: `"/"` (every path). Must begin with `/`.
+    #[serde(default = "default_proxy_path")]
+    pub path: String,
+
+    /// When `true`, [`path`](Self::path) must equal the request path exactly
+    /// rather than being a prefix.
+    ///
+    /// Default: `false` (prefix match).
+    #[serde(default)]
+    pub path_exact: bool,
+
+    /// Upstream URL — `http://host[:port]`, scheme + authority only.
+    ///
+    /// Required. `https://` and any path/query/fragment are startup errors in
+    /// v1 (see the type docs).
+    pub upstream: String,
+
+    /// TCP connect timeout to the upstream, in seconds.
+    ///
+    /// A matched-but-unreachable upstream returns `502` within this bound. `0`
+    /// means no explicit connect deadline (the OS default applies).
+    ///
+    /// Default: 5 seconds.
+    #[serde(default = "default_proxy_connect_timeout")]
+    pub connect_timeout_secs: u64,
+
+    /// Time-to-first-byte timeout for the upstream response head, in seconds.
+    ///
+    /// Bounds how long ePHPm waits for the upstream to begin responding; it does
+    /// **not** bound the streamed body (so SSE/long downloads are unaffected).
+    /// `0` disables the head-read deadline (the outer `[server.timeouts] request`
+    /// ceiling still applies).
+    ///
+    /// Default: 60 seconds.
+    #[serde(default = "default_proxy_read_timeout")]
+    pub read_timeout_secs: u64,
+}
+
+impl ProxyRuleConfig {
+    /// Validate and normalize the [`upstream`](Self::upstream) URL, returning
+    /// the bare `host[:port]` authority ePHPm forwards to.
+    ///
+    /// This is the single source of truth for the v1 upstream rules; both
+    /// [`Config::validate`] (fail-closed at startup) and the server's rule
+    /// compiler call it, so they can never disagree about what a valid upstream
+    /// is.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable message when the URL is not `http://`, uses
+    /// `https://`, carries a path/query/fragment or userinfo, or has an empty
+    /// or malformed authority — all of which are v1 scope errors, not no-ops.
+    pub fn upstream_authority(&self) -> Result<String, String> {
+        let raw = self.upstream.trim();
+        if raw.strip_prefix("https://").is_some() {
+            return Err(format!(
+                "upstream {raw:?} uses https:// — TLS to the upstream is not supported in v1 \
+                 (v1 targets loopback plaintext backends). Terminate TLS at this instance and \
+                 use an http:// upstream."
+            ));
+        }
+        let authority = raw.strip_prefix("http://").ok_or_else(|| {
+            format!(
+                "upstream {raw:?} must be an absolute http:// URL \
+                 (e.g. \"http://127.0.0.1:9000\")"
+            )
+        })?;
+        if authority.is_empty() {
+            return Err(format!("upstream {raw:?} has no host"));
+        }
+        if let Some(pos) = authority.find(['/', '?', '#']) {
+            return Err(format!(
+                "upstream {raw:?} has a path/query/fragment ({rest:?}) — request-path \
+                 rewriting (prefix strip/prepend) is not supported in v1; the original request \
+                 path is forwarded unchanged. Give scheme + host + port only.",
+                rest = &authority[pos..],
+            ));
+        }
+        if authority.contains('@') {
+            return Err(format!(
+                "upstream {raw:?} contains userinfo ('@'), which is not supported"
+            ));
+        }
+        // A lightweight authority sanity check (ephpm-config deliberately has no
+        // `http` dependency): non-empty host, and if a port is present it must be
+        // a valid `u16`. The server re-parses with `http::uri::Authority` as a
+        // strict second gate.
+        let host_part = if let Some(rest) = authority.strip_prefix('[') {
+            // IPv6 literal: `[::1]` or `[::1]:9000`.
+            let (inside, after) = rest
+                .split_once(']')
+                .ok_or_else(|| format!("upstream {raw:?} has an unterminated IPv6 literal"))?;
+            if inside.is_empty() {
+                return Err(format!("upstream {raw:?} has an empty IPv6 literal"));
+            }
+            if let Some(port) = after.strip_prefix(':') {
+                validate_proxy_port(raw, port)?;
+            } else if !after.is_empty() {
+                return Err(format!("upstream {raw:?} has trailing junk after the IPv6 literal"));
+            }
+            inside
+        } else if let Some((host, port)) = authority.rsplit_once(':') {
+            validate_proxy_port(raw, port)?;
+            host
+        } else {
+            authority
+        };
+        if host_part.is_empty() {
+            return Err(format!("upstream {raw:?} has an empty host"));
+        }
+        Ok(authority.to_string())
+    }
+
+    /// Validate the [`host`](Self::host) matcher syntax.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when a wildcard host is not a single leftmost `*.`
+    /// label, or when the host is otherwise empty.
+    pub fn validate_host(&self) -> Result<(), String> {
+        let Some(host) = self.host.as_deref() else { return Ok(()) };
+        let host = host.trim();
+        if host.is_empty() {
+            return Err("host is empty — omit the key or use \"*\" to match any host".to_string());
+        }
+        if host == "*" || host.starts_with('.') {
+            return Ok(());
+        }
+        if let Some(rest) = host.strip_prefix("*.") {
+            if rest.is_empty() || rest.contains('*') {
+                return Err(format!(
+                    "host {host:?} is not a valid wildcard — a wildcard matches exactly one \
+                     leftmost label, so it must look like \"*.example.com\""
+                ));
+            }
+            return Ok(());
+        }
+        if host.contains('*') {
+            return Err(format!(
+                "host {host:?} contains a '*' that is not a leftmost \"*.\" label — the only \
+                 wildcard form is a single leftmost label (\"*.example.com\")"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Validate a proxy upstream port component.
+fn validate_proxy_port(raw: &str, port: &str) -> Result<(), String> {
+    if port.is_empty() {
+        return Err(format!("upstream {raw:?} has an empty port after ':'"));
+    }
+    port.parse::<u16>()
+        .map(|_| ())
+        .map_err(|_| format!("upstream {raw:?} has an invalid port {port:?} (must be 0-65535)"))
 }
 
 /// Request limits configuration (`[server.request]`).
@@ -3061,6 +3285,22 @@ impl Config {
             )));
         }
 
+        // [[server.proxy]]: validate every rule at startup so a bad upstream,
+        // an out-of-scope-for-v1 URL (https/path), or a malformed host matcher
+        // fails closed rather than being silently dropped from the rule list.
+        for (i, rule) in self.server.proxy.iter().enumerate() {
+            if !rule.path.starts_with('/') {
+                return Err(ConfigError::Validation(format!(
+                    "[[server.proxy]] rule {i}: path {:?} must begin with '/'",
+                    rule.path,
+                )));
+            }
+            rule.validate_host()
+                .map_err(|e| ConfigError::Validation(format!("[[server.proxy]] rule {i}: {e}")))?;
+            rule.upstream_authority()
+                .map_err(|e| ConfigError::Validation(format!("[[server.proxy]] rule {i}: {e}")))?;
+        }
+
         Ok(())
     }
 
@@ -3184,6 +3424,7 @@ impl Default for ServerConfig {
             tls: None,
             http3: Http3Config::default(),
             websocket: WebSocketConfig::default(),
+            proxy: Vec::new(),
         }
     }
 }
@@ -5097,6 +5338,18 @@ fn default_request_timeout() -> u64 {
     300
 }
 
+fn default_proxy_path() -> String {
+    "/".to_string()
+}
+
+fn default_proxy_connect_timeout() -> u64 {
+    5
+}
+
+fn default_proxy_read_timeout() -> u64 {
+    60
+}
+
 fn default_shutdown_timeout() -> u64 {
     30
 }
@@ -5313,6 +5566,140 @@ alt_svc_max_age = 3600
         assert!(config.server.http3.enabled);
         assert_eq!(config.server.http3.listen.as_deref(), Some("0.0.0.0:8443"));
         assert_eq!(config.server.http3.alt_svc_max_age, 3600);
+    }
+
+    // ── [[server.proxy]] ─────────────────────────────────────────────
+
+    /// No `[[server.proxy]]` section: the rule list is empty (feature off).
+    #[test]
+    fn proxy_absent_defaults_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert!(config.server.proxy.is_empty(), "no proxy section means no rules");
+        assert!(ServerConfig::default().proxy.is_empty(), "the hand-written Default agrees");
+    }
+
+    /// A full rule parses every field; the per-rule field defaults hold for a
+    /// partial rule.
+    #[test]
+    fn proxy_rule_parses_fields_and_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[[server.proxy]]
+host = "pr-a.example.com"
+path = "/api"
+path_exact = true
+upstream = "http://127.0.0.1:9084"
+connect_timeout_secs = 3
+read_timeout_secs = 45
+
+[[server.proxy]]
+upstream = "http://127.0.0.1:9085"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        config.validate().expect("valid proxy rules must pass validate()");
+        assert_eq!(config.server.proxy.len(), 2, "array-of-tables order preserved");
+
+        let first = &config.server.proxy[0];
+        assert_eq!(first.host.as_deref(), Some("pr-a.example.com"));
+        assert_eq!(first.path, "/api");
+        assert!(first.path_exact);
+        assert_eq!(first.connect_timeout_secs, 3);
+        assert_eq!(first.read_timeout_secs, 45);
+
+        // Partial rule: host/path/timeouts fall back to their field defaults.
+        let second = &config.server.proxy[1];
+        assert_eq!(second.host, None, "omitted host matches any");
+        assert_eq!(second.path, "/", "default path is the catch-all prefix");
+        assert!(!second.path_exact);
+        assert_eq!(second.connect_timeout_secs, 5);
+        assert_eq!(second.read_timeout_secs, 60);
+    }
+
+    #[test]
+    fn proxy_https_upstream_is_a_v1_startup_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[[server.proxy]]\nupstream = \"https://backend.example.com\"\n")
+            .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let err = config.validate().expect_err("https upstream must be rejected in v1");
+        assert!(err.to_string().contains("https"), "{err}");
+    }
+
+    #[test]
+    fn proxy_upstream_with_path_is_a_v1_startup_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[[server.proxy]]\nupstream = \"http://127.0.0.1:9000/api\"\n")
+            .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let err = config.validate().expect_err("a path in the upstream must be rejected in v1");
+        assert!(err.to_string().contains("rewriting"), "{err}");
+    }
+
+    #[test]
+    fn proxy_bad_host_wildcard_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[[server.proxy]]\nhost = \"a.*.example.com\"\nupstream = \"http://127.0.0.1:9000\"\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let err = config.validate().expect_err("a non-leftmost wildcard must be rejected");
+        assert!(err.to_string().contains("wildcard"), "{err}");
+    }
+
+    #[test]
+    fn proxy_relative_path_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[[server.proxy]]\npath = \"api\"\nupstream = \"http://127.0.0.1:9000\"\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let err = config.validate().expect_err("a path not starting with / must be rejected");
+        assert!(err.to_string().contains("must begin with '/'"), "{err}");
+    }
+
+    #[test]
+    fn proxy_upstream_authority_forms() {
+        let ok = |u: &str| {
+            ProxyRuleConfig {
+                host: None,
+                path: "/".to_string(),
+                path_exact: false,
+                upstream: u.to_string(),
+                connect_timeout_secs: 5,
+                read_timeout_secs: 60,
+            }
+            .upstream_authority()
+        };
+
+        assert_eq!(ok("http://127.0.0.1:9000").unwrap(), "127.0.0.1:9000");
+        assert_eq!(ok("http://backend").unwrap(), "backend");
+        assert_eq!(ok("http://[::1]:9000").unwrap(), "[::1]:9000");
+        assert!(ok("ftp://x").is_err(), "non-http scheme");
+        assert!(ok("http://host:70000").is_err(), "port out of range");
+        assert!(ok("http://host:").is_err(), "empty port");
+        assert!(ok("http://").is_err(), "no host");
     }
 
     #[test]
