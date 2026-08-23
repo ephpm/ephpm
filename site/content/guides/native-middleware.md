@@ -664,7 +664,9 @@ The authoritative definition is
 ## The PHP lane (experimental)
 
 **Status: experimental.** Middleware written in plain PHP — no compiler, no
-`.so`, no C:
+`.so`, no C. A complete, runnable version of the gate below — config, the
+middleware script, an app front controller and `curl` commands for each verdict
+— ships in [`examples/php-middleware`](https://github.com/ephpm/ephpm/tree/main/examples/php-middleware).
 
 ```toml
 [[middleware]]
