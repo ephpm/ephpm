@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process;
 
 use figment::Figment;
@@ -119,6 +119,73 @@ pub struct ServerConfig {
     /// Omit to disable vhosting (single-site mode).
     #[serde(default)]
     pub sites_dir: Option<PathBuf>,
+
+    /// **Multi-tenant only.** Directory of **operator-supplied per-site
+    /// overrides**, one file per virtual host.
+    ///
+    /// A vhost directory under [`sites_dir`](Self::sites_dir) is the site
+    /// **container** — the whole checkout, including the parts that must not be
+    /// reachable over HTTP. Modern PHP frameworks keep their front controller in
+    /// a subdirectory (`public/`, `web/`, `htdocs/`, `public_html/`) precisely so
+    /// that `composer.json`, `vendor/`, `config/` and `storage/logs/` sit *above*
+    /// the web root; serving the container itself publishes all of them. An
+    /// override file is how the *operator* (or the provisioning daemon that laid
+    /// out the checkout) tells ePHPm a site's real web root:
+    ///
+    /// ```toml
+    /// # <site_overrides_dir>/<site-key>.toml
+    /// document_root = "web"   # relative to the site container
+    /// ```
+    ///
+    /// A site with no override file behaves **exactly** as it always has: the
+    /// container is the document root. Nothing about an existing deployment
+    /// changes until an override is written.
+    ///
+    /// # This directory is operator-owned and MUST NOT be tenant-writable
+    ///
+    /// That is the entire security property, so it is worth stating bluntly:
+    ///
+    /// * **This is not the application manifest.** It is not `ephpm.yaml`, and
+    ///   ePHPm never reads anything from inside a tenant's checkout to decide
+    ///   routing. A provisioning daemon that consumes an application manifest is
+    ///   welcome to *derive* these files from it; ePHPm only ever reads the
+    ///   derived, operator-owned artifact.
+    /// * **It must live outside `sites_dir`.** A file inside a site container is
+    ///   inside that tenant's `open_basedir` by construction, so the tenant's own
+    ///   PHP can rewrite it. Startup fails closed if this path is inside
+    ///   `sites_dir`.
+    /// * Ordinary filesystem permissions are what keep it operator-owned; ePHPm
+    ///   cannot verify that for you beyond the containment check above.
+    ///
+    /// # It can never widen `open_basedir`
+    ///
+    /// An override may only *narrow* which files are served. `open_basedir`
+    /// stays the site container, and is structurally unreachable from these
+    /// files. All tenants share one process and one uid (see
+    /// [`run_as_user`](Self::run_as_user)), so `open_basedir` is the primary
+    /// cross-tenant boundary and is not per-site configurable.
+    ///
+    /// The declared `document_root` is still validated as if hostile — relative,
+    /// no `..`, canonicalized and required to resolve inside the site container.
+    /// "The daemon validated it" is a claim about another codebase's current
+    /// behaviour, not an invariant ePHPm can enforce. A rejected or malformed
+    /// override logs a warning and the site serves its container.
+    ///
+    /// # File naming
+    ///
+    /// `<site_overrides_dir>/<site-key>.toml`, where `<site-key>` is the
+    /// **canonical site key** — the same validated `[a-z0-9._-]` string that
+    /// names the vhost directory under `sites_dir`, selects `<dir>/<key>.db`, and
+    /// derives the `pdo_mysql` credential. A file whose name does not match a
+    /// site key is simply never read: the site serves its container, silently.
+    ///
+    /// Unset (the default) disables the mechanism entirely. Ignored in
+    /// single-site mode (`sites_dir` unset), where `document_root` already *is*
+    /// the web root and there are no tenants to distinguish.
+    ///
+    /// Default: unset. Env: `EPHPM_SERVER__SITE_OVERRIDES_DIR`.
+    #[serde(default)]
+    pub site_overrides_dir: Option<PathBuf>,
 
     /// Unprivileged user to drop to after binding privileged ports and
     /// opening root-owned files (Unix only).
@@ -653,6 +720,22 @@ pub struct SecurityConfig {
 }
 
 impl ServerConfig {
+    /// The directory of operator-supplied per-site overrides, or `None` when the
+    /// mechanism is switched off.
+    ///
+    /// `None` when `site_overrides_dir` is unset and in single-site mode, where
+    /// there are no tenants to distinguish and `document_root` is already the
+    /// web root. Callers that get `None` must treat the vhost directory itself
+    /// as the document root — the behaviour that predates this mechanism.
+    ///
+    /// [`Config::validate`] has already refused to start if this path is inside
+    /// `sites_dir`, so a `Some` here is a directory no tenant can write.
+    #[must_use]
+    pub fn effective_site_overrides_dir(&self) -> Option<&Path> {
+        self.sites_dir.as_ref()?;
+        self.site_overrides_dir.as_deref()
+    }
+
     /// Resolved value of `security.open_basedir`.
     ///
     /// An explicitly set value always wins. When unset, resolves to `true`
@@ -2770,6 +2853,34 @@ impl Config {
             ));
         }
 
+        // Fail closed: per-site overrides are trusted because they live where no
+        // tenant can write. A `site_overrides_dir` inside `sites_dir` is inside
+        // some tenant's container, hence inside that tenant's `open_basedir`,
+        // hence rewritable by that tenant's own PHP — at which point ePHPm would
+        // be taking routing instructions from the code it is sandboxing. Refuse
+        // to start rather than serve with the property quietly absent.
+        if let (Some(overrides), Some(sites)) =
+            (self.server.site_overrides_dir.as_deref(), self.server.sites_dir.as_deref())
+            && overrides_dir_is_inside_sites_dir(overrides, sites)
+        {
+            return Err(ConfigError::Validation(format!(
+                "[server] site_overrides_dir ({}) is inside [server] sites_dir ({}). \
+                 Per-site overrides are trusted precisely because tenants cannot write \
+                 them; a directory inside sites_dir is inside a tenant's own \
+                 open_basedir, so its PHP could rewrite its own routing. Put the \
+                 override directory somewhere no tenant checkout lives, e.g. \
+                 /var/lib/ephpm/site-overrides.",
+                overrides.display(),
+                sites.display(),
+            )));
+        }
+
+        // Never a silent no-op: `site_overrides_dir` only acts in multi-tenant
+        // mode. `ephpm-config` has no `tracing` dependency (config returns data;
+        // the binary and the server log), so the inert case is surfaced by
+        // `Router::new` at startup — the same shape as the inert
+        // `[server.security]` flags.
+
         if self.php.is_worker_mode() {
             if self.server.sites_dir.is_some() {
                 return Err(ConfigError::Validation(
@@ -2931,7 +3042,14 @@ impl Config {
 /// `\\?\C:\dir\file` becomes `C:\dir\file`, and `\\?\UNC\server\share\p`
 /// becomes `\\server\share\p`. Non-verbatim paths — and every path on
 /// non-Windows targets — are returned unchanged.
-fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+///
+/// Public because **every** path that reaches PHP after a `canonicalize()` needs
+/// this, not just `worker_script`: the per-site document-root override
+/// (`ephpm-server`'s `site_overrides`) canonicalizes to prove containment and
+/// then hands the result to PHP as `DOCUMENT_ROOT`/`SCRIPT_FILENAME`. Two copies
+/// of this would be two places to forget the `UNC` case.
+#[must_use]
+pub fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
         let s = path.as_os_str().to_string_lossy();
@@ -2951,6 +3069,7 @@ impl Default for ServerConfig {
             listen: default_listen(),
             document_root: default_document_root(),
             sites_dir: None,
+            site_overrides_dir: None,
             run_as_user: None,
             run_as_group: None,
             sites_domain_suffix: None,
@@ -4732,6 +4851,28 @@ fn default_index_files() -> Vec<String> {
     vec!["index.php".to_string(), "index.html".to_string()]
 }
 
+/// Whether `overrides` is lexically inside `sites`.
+///
+/// Used to fail startup closed when `[server] site_overrides_dir` points inside
+/// `[server] sites_dir`: an override file inside a site container sits inside
+/// that tenant's own `open_basedir`, so the tenant's PHP can rewrite it and the
+/// "operator-owned" property — the entire basis for trusting these files — is
+/// gone.
+///
+/// Deliberately **lexical**: neither directory is required to exist at config
+/// load time, so `canonicalize` is not available. It catches the realistic
+/// mistake (`sites_dir = "/var/www/sites"`, `site_overrides_dir =
+/// "/var/www/sites/_overrides"`), not a determined operator using symlinks to
+/// defeat their own guard rail.
+fn overrides_dir_is_inside_sites_dir(overrides: &Path, sites: &Path) -> bool {
+    let normalize = |p: &Path| -> PathBuf {
+        // Drop `.` segments so `./sites` and `sites` compare equal; keep
+        // everything else verbatim.
+        p.components().filter(|c| !matches!(c, Component::CurDir)).collect()
+    };
+    normalize(overrides).starts_with(normalize(sites))
+}
+
 /// Default WebSocket entrypoint names — one, mirroring `index.php`'s role on
 /// the HTTP path.
 fn default_websocket_files() -> Vec<String> {
@@ -6291,6 +6432,101 @@ path = "test.db"
         let config = Config::load(&file).unwrap();
         let sqlite = config.db.sqlite.expect("sqlite should be present");
         assert_eq!(sqlite.replication.role, "primary");
+    }
+
+    // ── [server] site_overrides_dir (operator per-site overrides) ──────
+
+    /// The `[server]` section is ABSENT entirely — the case where a
+    /// `#[derive(Default)]` on the parent could zero a carefully chosen field
+    /// default. Unset is the intended default here, and it must stay unset.
+    #[test]
+    fn test_site_overrides_dir_defaults_unset_with_section_absent() {
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.server.site_overrides_dir, None);
+        assert_eq!(config.server.effective_site_overrides_dir(), None);
+    }
+
+    /// The `[server]` section is PRESENT but does not mention the field.
+    #[test]
+    fn test_site_overrides_dir_defaults_unset_with_section_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nsites_dir = \"/var/www/sites\"\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.server.effective_site_overrides_dir(), None);
+    }
+
+    #[test]
+    fn test_site_overrides_dir_set_alongside_sites_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[server]\nsites_dir = \"/var/www/sites\"\n\
+             site_overrides_dir = \"/var/lib/ephpm/site-overrides\"\n",
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.server.effective_site_overrides_dir(),
+            Some(Path::new("/var/lib/ephpm/site-overrides"))
+        );
+    }
+
+    /// Per-site overrides only act in multi-tenant mode. Without `sites_dir` the
+    /// knob resolves inert (and `Router::new` warns) rather than silently
+    /// pretending to work.
+    #[test]
+    fn test_site_overrides_dir_is_inert_without_sites_dir() {
+        let mut cfg = Config::default_config().unwrap();
+        cfg.server.site_overrides_dir = Some(PathBuf::from("/var/lib/ephpm/site-overrides"));
+        assert!(cfg.server.sites_dir.is_none());
+        cfg.validate().unwrap();
+        assert_eq!(cfg.server.effective_site_overrides_dir(), None);
+    }
+
+    /// Fail closed: an override directory inside `sites_dir` is inside some
+    /// tenant's `open_basedir`, so that tenant's PHP could rewrite its own
+    /// routing. This is the security property the whole design rests on.
+    #[test]
+    fn test_site_overrides_dir_inside_sites_dir_is_rejected() {
+        for (sites, overrides) in [
+            ("/var/www/sites", "/var/www/sites/_overrides"),
+            ("/var/www/sites", "/var/www/sites"),
+            ("/var/www/sites", "/var/www/sites/blog.example.com/conf"),
+            ("./sites", "sites/_overrides"),
+        ] {
+            let mut cfg = Config::default_config().unwrap();
+            cfg.server.sites_dir = Some(PathBuf::from(sites));
+            cfg.server.site_overrides_dir = Some(PathBuf::from(overrides));
+            let err = cfg.validate().expect_err("must reject overrides inside sites_dir");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("site_overrides_dir"),
+                "error should name the knob for {overrides}: {msg}"
+            );
+        }
+    }
+
+    /// A sibling directory whose path merely *starts with the same characters*
+    /// is not inside `sites_dir` — the check is component-wise, not textual.
+    #[test]
+    fn test_site_overrides_dir_sibling_path_is_accepted() {
+        let mut cfg = Config::default_config().unwrap();
+        cfg.server.sites_dir = Some(PathBuf::from("/var/www/sites"));
+        cfg.server.site_overrides_dir = Some(PathBuf::from("/var/www/sites-overrides"));
+        cfg.validate().expect("a sibling directory is not inside sites_dir");
+    }
+
+    #[test]
+    fn test_site_overrides_dir_env_override() {
+        let _env = EnvVars::set("EPHPM_SERVER__SITE_OVERRIDES_DIR", "/srv/overrides");
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.server.site_overrides_dir, Some(PathBuf::from("/srv/overrides")));
     }
 
     // ── Security isolation default resolution ──────────────────────────

@@ -287,7 +287,11 @@ pub struct WsSession {
     pub(crate) site_key: Option<String>,
     pub(crate) connection_id: String,
     pub(crate) script: PathBuf,
-    pub(crate) document_root: PathBuf,
+    /// The vhost's web root and site container, pinned at upgrade time exactly
+    /// like `site_key`. Every event runs with the same `open_basedir` (the
+    /// container) and the same `$_SERVER['DOCUMENT_ROOT']` (the web root) the
+    /// upgrade request had — see [`crate::router::SiteRoots`].
+    pub(crate) roots: crate::router::SiteRoots,
     pub(crate) remote_addr: SocketAddr,
     pub(crate) is_https: bool,
     /// The upgrade request's URI, replayed on every event so `$_SERVER`
@@ -353,7 +357,7 @@ impl WsSession {
                 self.remote_addr,
                 self.is_https,
                 self.script.clone(),
-                self.document_root.clone(),
+                self.roots.clone(),
                 self.site_key.clone(),
                 event,
             )

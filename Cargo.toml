@@ -23,6 +23,11 @@ http = "1"
 tower = { version = "0.5", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 figment = { version = "0.10", features = ["toml", "env"] }
+# Parser for the per-site config file a tenant commits to its own repository
+# (`crates/ephpm-server/src/site_config.rs`). Already in the graph via figment,
+# so this pins the same crate rather than adding one — deliberate: that file is
+# untrusted input, and TOML has no anchor/alias expansion to defend against.
+toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # OTLP trace export — only compiled behind the `otlp` cargo feature on
