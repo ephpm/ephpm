@@ -44,6 +44,11 @@ impl Middleware for Probe {
             .response_header("X-Probe-Remote-Ip", req.remote_ip())
             .response_header("X-Probe-Vhost", req.vhost_id())
             .response_header("X-Probe-Accept", req.header("Accept").unwrap_or("<none>"))
+            // Minor-2 request accessors, echoed for the dlopen round-trip test.
+            .response_header("X-Probe-Scheme", req.scheme())
+            .response_header("X-Probe-Secure", if req.is_secure() { "1" } else { "0" })
+            .response_header("X-Probe-Host", req.http_host())
+            .response_header("X-Probe-Body", String::from_utf8_lossy(req.body()).into_owned())
     }
 
     fn describe() -> &'static str {

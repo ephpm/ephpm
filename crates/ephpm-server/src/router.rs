@@ -421,6 +421,10 @@ pub struct Router {
     fallback: Vec<String>,
     server_port: u16,
     max_body_size: u64,
+    /// `[server.request] middleware_body_limit` — max body bytes buffered and
+    /// exposed to request-phase middleware via `request_body`. `0` = disabled
+    /// (the chain runs before the body is read).
+    middleware_body_limit: u64,
     compression: CompressionSettings,
     hidden_files: String,
     cache_control: String,
@@ -980,6 +984,7 @@ impl Router {
             fallback: config.server.fallback.clone(),
             server_port: port,
             max_body_size: config.server.request.max_body_size,
+            middleware_body_limit: config.server.request.middleware_body_limit,
             compression: CompressionSettings {
                 enabled: config.server.response.compression,
                 level: config.server.response.compression_level,
@@ -2373,6 +2378,7 @@ impl Router {
                         &query_string,
                         effective_addr,
                         &host,
+                        is_https,
                     ) {
                         StaticGate::Respond(resp) => (resp, "middleware"),
                         StaticGate::Continue(extra_headers) => {
@@ -2455,6 +2461,7 @@ impl Router {
                     &query_string,
                     effective_addr,
                     &host,
+                    is_https,
                 )
                 .await;
         }
@@ -2841,14 +2848,59 @@ impl Router {
 
         let server_port = self.server_port;
 
-        // Native middleware chain — evaluated BEFORE any body bytes are read,
-        // so a RESPOND verdict (auth reject, rate limit, ...) never pays for
-        // the body transfer. v1: every module sees the original request;
+        // Content-Length (if declared) drives the worker-mode buffer-vs-stream
+        // decision below. Read here — before the body may be consumed for
+        // middleware buffering.
+        let content_length: Option<u64> = req
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok());
+
+        // Optional request-body buffering for middleware (`[server.request]
+        // middleware_body_limit`). When enabled AND a chain is mounted, buffer
+        // the body up front so the chain's `request_body` accessor can inspect
+        // it (webhook/HMAC, CSRF-with-body); the SAME bytes are then handed to
+        // PHP, so the body still arrives intact. When disabled (the default)
+        // the chain runs before the body is read — a RESPOND never pays for the
+        // transfer — and `req` flows unbuffered to the dispatch below.
+        //
+        // `req` becomes an `Option` so it can be consumed conditionally: taken
+        // for buffering, or left intact for the streaming/buffered dispatch.
+        // WebSocket events (synthetic, codec-bounded bodies) skip this.
+        let mut req = Some(req);
+        let buffer_body =
+            self.middleware_body_limit > 0 && self.middleware_chain.is_some() && ws_event.is_none();
+        let mut prebuffered: Option<Vec<u8>> = if buffer_body {
+            let taken = req.take().expect("request present before body buffering");
+            match self.collect_body_capped(taken).await {
+                Ok(bytes) => {
+                    #[allow(clippy::cast_precision_loss)]
+                    histogram!("ephpm_http_request_body_bytes", "method" => method_label)
+                        .record(bytes.len() as f64);
+                    Some(bytes)
+                }
+                Err(()) => {
+                    counter!("ephpm_http_body_overflow_total").increment(1);
+                    return error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large");
+                }
+            }
+        } else {
+            None
+        };
+
+        // Native middleware chain. v1: every module sees the original request;
         // accumulated REWRITE overrides are applied here, after the chain.
         // CONTINUE/REWRITE response headers are appended to whatever response
-        // this request ultimately produces (PHP output or an error page).
+        // this request ultimately produces (PHP output or an error page). The
+        // `request_body` accessor exposes up to `middleware_body_limit` bytes of
+        // the buffered body (empty when buffering is off).
         let mut mw_response_headers: Vec<(String, String)> = Vec::new();
         if let Some(ref chain) = self.middleware_chain {
+            let body_view: &[u8] = prebuffered.as_deref().map_or(&[], |b| {
+                let cap = usize::try_from(self.middleware_body_limit).unwrap_or(usize::MAX);
+                &b[..b.len().min(cap)]
+            });
             let ctx = ephpm_middleware::host::RequestCtx::new(
                 &method,
                 &path,
@@ -2856,7 +2908,10 @@ impl Router {
                 &remote_addr.ip().to_string(),
                 &server_name,
                 &headers,
-            );
+            )
+            .with_scheme(is_https)
+            .with_host(&normalize_host_key(&server_name))
+            .with_body(body_view);
             match chain.evaluate(&ctx, &path) {
                 crate::middleware::ChainVerdict::Respond { status, body, headers } => {
                     return middleware_response(status, body, &headers);
@@ -2888,14 +2943,6 @@ impl Router {
             }
         }
 
-        // Content-Length (if declared) drives the worker-mode buffer-vs-stream
-        // decision below.
-        let content_length: Option<u64> = req
-            .headers()
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse().ok());
-
         // Worker mode: dispatch to the persistent worker pool instead of the
         // spawn_blocking fpm path. The whole handler is already wrapped in the
         // outer request timeout, so a starved queue becomes a 504.
@@ -2903,43 +2950,54 @@ impl Router {
         // Large / unknown-length bodies STREAM into the worker (Phase 3): the
         // hyper `Incoming` body is read frame-by-frame by a task feeding a
         // bounded channel the worker drains, so ePHPm never holds the whole
-        // body in memory. Small bodies keep the cheaper buffered path.
+        // body in memory. Small bodies keep the cheaper buffered path. A body
+        // already buffered for middleware skips streaming and is handed over
+        // directly (its histogram was recorded when it was buffered).
         if let Some(pool) = self.worker_pool.clone() {
-            let should_stream = self.worker_stream_threshold > 0
-                && content_length.is_none_or(|len| len >= self.worker_stream_threshold);
-
-            let (worker_body, body_overflow) = if should_stream {
-                let (body, overflow) = stream_request_body(req, content_length, self.max_body_size);
-                (body, Some(overflow))
-            } else {
-                // The Content-Length pre-check already 413'd declared-large
-                // bodies; `Limited` catches chunked / lying clients on the
-                // buffered path (`Err` on exceeding the cap).
-                let bytes = if self.max_body_size > 0 {
-                    let cap = usize::try_from(self.max_body_size).unwrap_or(usize::MAX);
-                    match http_body_util::Limited::new(req, cap).collect().await {
-                        Ok(collected) => collected.to_bytes().to_vec(),
-                        Err(_) => {
-                            counter!("ephpm_http_body_overflow_total").increment(1);
-                            return apply_response_headers(
-                                error_response(
-                                    StatusCode::PAYLOAD_TOO_LARGE,
-                                    "413 Payload Too Large",
-                                ),
-                                &mw_response_headers,
-                            );
-                        }
-                    }
-                } else {
-                    match req.collect().await {
-                        Ok(collected) => collected.to_bytes().to_vec(),
-                        Err(_) => Vec::new(),
-                    }
-                };
-                #[allow(clippy::cast_precision_loss)]
-                histogram!("ephpm_http_request_body_bytes", "method" => method_label)
-                    .record(bytes.len() as f64);
+            let (worker_body, body_overflow) = if let Some(bytes) = prebuffered.take() {
                 (ephpm_php::worker_bridge::WorkerBody::Buffered(bytes), None)
+            } else {
+                let should_stream = self.worker_stream_threshold > 0
+                    && content_length.is_none_or(|len| len >= self.worker_stream_threshold);
+                if should_stream {
+                    let (body, overflow) = stream_request_body(
+                        req.take().expect("request present for streaming"),
+                        content_length,
+                        self.max_body_size,
+                    );
+                    (body, Some(overflow))
+                } else {
+                    // The Content-Length pre-check already 413'd declared-large
+                    // bodies; `Limited` catches chunked / lying clients on the
+                    // buffered path (`Err` on exceeding the cap).
+                    let bytes = if self.max_body_size > 0 {
+                        let cap = usize::try_from(self.max_body_size).unwrap_or(usize::MAX);
+                        let taken = req.take().expect("request present for buffered worker body");
+                        match http_body_util::Limited::new(taken, cap).collect().await {
+                            Ok(collected) => collected.to_bytes().to_vec(),
+                            Err(_) => {
+                                counter!("ephpm_http_body_overflow_total").increment(1);
+                                return apply_response_headers(
+                                    error_response(
+                                        StatusCode::PAYLOAD_TOO_LARGE,
+                                        "413 Payload Too Large",
+                                    ),
+                                    &mw_response_headers,
+                                );
+                            }
+                        }
+                    } else {
+                        let taken = req.take().expect("request present for buffered worker body");
+                        match taken.collect().await {
+                            Ok(collected) => collected.to_bytes().to_vec(),
+                            Err(_) => Vec::new(),
+                        }
+                    };
+                    #[allow(clippy::cast_precision_loss)]
+                    histogram!("ephpm_http_request_body_bytes", "method" => method_label)
+                        .record(bytes.len() as f64);
+                    (ephpm_php::worker_bridge::WorkerBody::Buffered(bytes), None)
+                }
             };
 
             let resp = self
@@ -2983,28 +3041,37 @@ impl Router {
         // fpm path buffers the whole body; cap chunked / lying clients the same
         // way the Content-Length pre-check caps declared bodies. A WebSocket
         // event's body was bounded by the codec, not by this knob (see the
-        // `check_body_size` skip above), so it takes the uncapped branch.
-        let body = if self.max_body_size > 0 && ws_event.is_none() {
-            let cap = usize::try_from(self.max_body_size).unwrap_or(usize::MAX);
-            match http_body_util::Limited::new(req, cap).collect().await {
-                Ok(collected) => collected.to_bytes().to_vec(),
-                Err(_) => {
-                    counter!("ephpm_http_body_overflow_total").increment(1);
-                    return apply_response_headers(
-                        error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large"),
-                        &mw_response_headers,
-                    );
-                }
-            }
+        // `check_body_size` skip above), so it takes the uncapped branch. A body
+        // already buffered for middleware is reused as-is (its histogram was
+        // recorded when it was buffered).
+        let body = if let Some(bytes) = prebuffered.take() {
+            bytes
         } else {
-            match req.collect().await {
-                Ok(collected) => collected.to_bytes().to_vec(),
-                Err(_) => Vec::new(),
-            }
+            let bytes = if self.max_body_size > 0 && ws_event.is_none() {
+                let cap = usize::try_from(self.max_body_size).unwrap_or(usize::MAX);
+                let taken = req.take().expect("request present for fpm body");
+                match http_body_util::Limited::new(taken, cap).collect().await {
+                    Ok(collected) => collected.to_bytes().to_vec(),
+                    Err(_) => {
+                        counter!("ephpm_http_body_overflow_total").increment(1);
+                        return apply_response_headers(
+                            error_response(StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large"),
+                            &mw_response_headers,
+                        );
+                    }
+                }
+            } else {
+                let taken = req.take().expect("request present for fpm body");
+                match taken.collect().await {
+                    Ok(collected) => collected.to_bytes().to_vec(),
+                    Err(_) => Vec::new(),
+                }
+            };
+            #[allow(clippy::cast_precision_loss)]
+            histogram!("ephpm_http_request_body_bytes", "method" => method_label)
+                .record(bytes.len() as f64);
+            bytes
         };
-        #[allow(clippy::cast_precision_loss)]
-        histogram!("ephpm_http_request_body_bytes", "method" => method_label)
-            .record(body.len() as f64);
 
         let multi_tenant_kv = self.multi_tenant_kv.clone();
         let vhost_open_basedir = self.sites_dir.is_some() && self.open_basedir;
@@ -3571,6 +3638,28 @@ impl Router {
         }
     }
 
+    /// Collect the full request body into a `Vec<u8>`, enforcing
+    /// `max_body_size` (the same cap the fpm/worker buffered paths apply):
+    /// `Err(())` when the cap is exceeded (the caller turns it into a 413),
+    /// `Ok` otherwise. Used to buffer the body up front for middleware
+    /// (`[server.request] middleware_body_limit`); the same bytes are then
+    /// handed to PHP, so the body still arrives intact.
+    async fn collect_body_capped<B>(&self, req: Request<B>) -> Result<Vec<u8>, ()>
+    where
+        B: RequestBody,
+    {
+        if self.max_body_size > 0 {
+            let cap = usize::try_from(self.max_body_size).unwrap_or(usize::MAX);
+            http_body_util::Limited::new(req, cap)
+                .collect()
+                .await
+                .map(|c| c.to_bytes().to_vec())
+                .map_err(|_| ())
+        } else {
+            req.collect().await.map(|c| c.to_bytes().to_vec()).map_err(|_| ())
+        }
+    }
+
     /// Return 413 if Content-Length exceeds the limit.
     fn check_body_size<B>(&self, req: &Request<B>) -> Option<Response<ServerBody>> {
         if self.max_body_size == 0 {
@@ -3788,10 +3877,14 @@ impl Router {
         query: &str,
         remote_addr: SocketAddr,
         server_name: &str,
+        is_https: bool,
     ) -> StaticGate {
         let Some(chain) = self.middleware_chain.as_ref() else {
             return StaticGate::Continue(Vec::new());
         };
+        // Static requests carry no buffered body, but scheme/host are still
+        // authoritative from the connection (a `force_https` gate on static
+        // assets needs the real scheme).
         let ctx = ephpm_middleware::host::RequestCtx::new(
             method,
             path,
@@ -3799,7 +3892,9 @@ impl Router {
             &remote_addr.ip().to_string(),
             server_name,
             req_headers.unwrap_or(&[]),
-        );
+        )
+        .with_scheme(is_https)
+        .with_host(&normalize_host_key(server_name));
         match chain.evaluate(&ctx, path) {
             crate::middleware::ChainVerdict::Respond { status, body, headers } => {
                 StaticGate::Respond(middleware_response(status, body, &headers))
@@ -3831,6 +3926,7 @@ impl Router {
         query: &str,
         remote_addr: SocketAddr,
         server_name: &str,
+        is_https: bool,
     ) -> Response<ServerBody> {
         use hyper::body::Body as _;
 
@@ -3885,7 +3981,9 @@ impl Router {
             &remote_addr.ip().to_string(),
             server_name,
             req_headers.unwrap_or(&[]),
-        );
+        )
+        .with_scheme(is_https)
+        .with_host(&normalize_host_key(server_name));
         let outcome = chain.run_response_phase(
             &ctx,
             path,

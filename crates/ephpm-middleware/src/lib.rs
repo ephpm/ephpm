@@ -186,6 +186,85 @@ impl Request<'_> {
         self.str_of(unsafe { (self.host.request_vhost_id)(self.raw) })
     }
 
+    /// The host's advertised ABI minor (low three bytes of `abi_version`).
+    /// Trailing accessors added in a later minor must be gated on this so a
+    /// module built against a newer ABI never reads past an older host's
+    /// (shorter) table.
+    fn host_minor(&self) -> u32 {
+        self.host.abi_version & 0x00FF_FFFF
+    }
+
+    /// Request URL scheme — `"https"` when TLS terminated at ePHPm for this
+    /// connection, `"http"` otherwise. Authoritative from the connection, not
+    /// from a forwarded header: the correct basis for a `force_https` redirect.
+    ///
+    /// Falls back to `"http"` on a host older than
+    /// [`abi::ABI_MINOR_REQUEST_ACCESSORS`] (the accessor is absent there).
+    #[must_use]
+    pub fn scheme(&self) -> &str {
+        if self.host_minor() < abi::ABI_MINOR_REQUEST_ACCESSORS {
+            return "http";
+        }
+        // SAFETY: contract of `from_raw`; the minor gate above guarantees the
+        // `request_scheme` field is present on this host's table.
+        self.str_of(unsafe { (self.host.request_scheme)(self.raw) })
+    }
+
+    /// Whether the request arrived over a secure (HTTPS/TLS) connection — the
+    /// boolean form of [`scheme`](Self::scheme).
+    ///
+    /// Falls back to `false` on a host older than
+    /// [`abi::ABI_MINOR_REQUEST_ACCESSORS`].
+    #[must_use]
+    pub fn is_secure(&self) -> bool {
+        if self.host_minor() < abi::ABI_MINOR_REQUEST_ACCESSORS {
+            return false;
+        }
+        // SAFETY: contract of `from_raw`; minor-gated as above.
+        (unsafe { (self.host.request_is_secure)(self.raw) }) != 0
+    }
+
+    /// Normalized request `Host` — port stripped, trailing dot stripped,
+    /// lowercased (the router's own vhost-key normalization). Distinct from
+    /// [`vhost_id`](Self::vhost_id) (the un-normalized server name); empty when
+    /// the request carried no usable `Host`.
+    ///
+    /// Falls back to `""` on a host older than
+    /// [`abi::ABI_MINOR_REQUEST_ACCESSORS`].
+    #[must_use]
+    pub fn http_host(&self) -> &str {
+        if self.host_minor() < abi::ABI_MINOR_REQUEST_ACCESSORS {
+            return "";
+        }
+        // SAFETY: contract of `from_raw`; minor-gated as above.
+        self.str_of(unsafe { (self.host.request_host)(self.raw) })
+    }
+
+    /// Bounded, read-only view of the buffered request body (borrowed; valid
+    /// only inside `invoke`).
+    ///
+    /// Non-empty only when the operator opted in with `[server.request]
+    /// middleware_body_limit > 0`, in which case up to that many body bytes are
+    /// exposed here (a longer body is truncated to the limit for this view —
+    /// PHP still receives the full body). Empty otherwise, and always empty on
+    /// the static-file path. Use it for webhook/HMAC signature checks,
+    /// CSRF-with-body, and payload validation.
+    ///
+    /// The `request_body` slot has existed since minor 0, so no minor gate is
+    /// needed.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        let mut ptr: *const u8 = std::ptr::null();
+        // SAFETY: contract of `from_raw`; `ptr` points at a local.
+        let len = unsafe { (self.host.request_body)(self.raw, &raw mut ptr) };
+        if ptr.is_null() || len == 0 {
+            return &[];
+        }
+        // SAFETY: the host returned a live `(ptr, len)` byte slice valid for
+        // the duration of this call (the request).
+        unsafe { std::slice::from_raw_parts(ptr, len) }
+    }
+
     /// Host services (KV store, logging) scoped to the table this request
     /// was invoked with. Equivalent to `Host::new(__ephpm_mw_host())` but
     /// also works in unit tests that build a [`Request`] by hand.

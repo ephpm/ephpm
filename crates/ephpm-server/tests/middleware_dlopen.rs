@@ -126,9 +126,12 @@ fn dynamic_module_loads_and_round_trips_request_context() {
         "/app/index.php",
         "a=1&b=2",
         "198.51.100.9",
-        "probe.example",
+        "Probe.Example.:8443",
         &[("Accept".to_owned(), "text/html".to_owned())],
-    );
+    )
+    .with_scheme(true)
+    .with_host("probe.example")
+    .with_body(b"payload-bytes");
     match chain.evaluate(&ctx, "/app/index.php") {
         ChainVerdict::Continue { rewrite_path, header_overrides, response_headers } => {
             assert!(rewrite_path.is_none());
@@ -140,8 +143,15 @@ fn dynamic_module_loads_and_round_trips_request_context() {
             assert_eq!(find(&response_headers, "X-Probe-Path"), Some("/app/index.php"));
             assert_eq!(find(&response_headers, "X-Probe-Query"), Some("a=1&b=2"));
             assert_eq!(find(&response_headers, "X-Probe-Remote-Ip"), Some("198.51.100.9"));
-            assert_eq!(find(&response_headers, "X-Probe-Vhost"), Some("probe.example"));
+            // vhost_id is the un-normalized server name…
+            assert_eq!(find(&response_headers, "X-Probe-Vhost"), Some("Probe.Example.:8443"));
             assert_eq!(find(&response_headers, "X-Probe-Accept"), Some("text/html"));
+            // …minor-2 accessors: scheme/secure from the connection, normalized
+            // host, and the bounded buffered body — all across the C ABI.
+            assert_eq!(find(&response_headers, "X-Probe-Scheme"), Some("https"));
+            assert_eq!(find(&response_headers, "X-Probe-Secure"), Some("1"));
+            assert_eq!(find(&response_headers, "X-Probe-Host"), Some("probe.example"));
+            assert_eq!(find(&response_headers, "X-Probe-Body"), Some("payload-bytes"));
         }
         ChainVerdict::Respond { status, .. } => {
             panic!("expected CONTINUE from the probe fixture, got RESPOND {status}")

@@ -172,9 +172,13 @@ v1 rules worth knowing:
   non-zero, a Rust panic caught by the authoring kit, or a panicking
   built-in (caught by the host) all produce a plain 500, never a silent
   pass-through.
-- **Request bodies are not visible** to middleware. The chain runs before
-  the body is read (rejecting before the transfer is the point);
-  the ABI's body accessor currently always returns length 0.
+- **Request bodies are hidden by default.** The chain runs before the body is
+  read (rejecting before the transfer is the point), so `req.body()` is empty
+  unless the operator opts in with `[server.request] middleware_body_limit`
+  (bytes) `> 0`. When set, the body is buffered up front and `req.body()`
+  returns up to that many bytes — for webhook/HMAC signature checks,
+  CSRF-with-body, and payload validation — while the full body still reaches
+  PHP intact. See the [config reference](../../reference/config/).
 
 **Coverage.** The request phase runs on **both** the PHP path and the
 **static-file** path, in every mode — so a `RESPOND` verdict gates a static
@@ -441,6 +445,32 @@ host.log(ephpm_middleware::abi::LOG_INFO, "hello from middleware");
 The KV operations hit the same embedded store PHP sees through
 `ephpm_kv_*` — replicated across the cluster when clustering is enabled.
 
+The `Request` also exposes the connection and (optional) body:
+
+```rust
+fn invoke(&self, req: &Request<'_>) -> Response {
+    // Scheme is authoritative from the connection (ePHPm terminates TLS) —
+    // no X-Forwarded-Proto sniffing. This is the correct force-https basis.
+    if !req.is_secure() {
+        let target = format!("https://{}{}", req.http_host(), req.path());
+        return Response::respond(301, "").header("Location", target);
+    }
+    // req.body() is empty unless `[server.request] middleware_body_limit > 0`.
+    // Verify an HMAC signature over the buffered body:
+    let sig = req.header("X-Signature").unwrap_or("");
+    if !verify_hmac(req.body(), sig) {
+        return Response::respond(401, "bad signature");
+    }
+    Response::cont()
+}
+```
+
+`req.scheme()` returns `"http"`/`"https"`, `req.http_host()` the normalized
+`Host` (port/trailing-dot stripped, lowercased — distinct from
+`req.vhost_id()`, the raw server name), and `req.body()` the bounded buffered
+body. Against an older host that predates these (ABI minor < 2) they fall back
+to `"http"` / `false` / `""` rather than reading past a shorter table.
+
 ### Building modules on Linux
 
 The module must match the host binary's libc. The release binary is
@@ -482,23 +512,26 @@ int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
                                          ephpm_response_edit_t* edit_out);
 ```
 
-- `abi_version` is `0x01_00_00_01` — major **1**, minor **1**. The **major
+- `abi_version` is `0x01_00_00_02` — major **1**, minor **2**. The **major
   byte** gates compatibility; modules must refuse to init (return non-zero)
   when the host's major is newer than they were built for. The lower three
   bytes are an additive **minor** level: growth (new host-table fields, the
   optional response symbol) bumps the minor and keeps the major, so existing
   major-1 modules keep loading. A module that uses a newer field must check
-  the host's advertised minor (`host->abi_version & 0x00FFFFFF`) first.
+  the host's advertised minor (`host->abi_version & 0x00FFFFFF`) first —
+  minor **1** added the response phase, minor **2** the appended request
+  accessors (`request_scheme`/`request_is_secure`/`request_host`).
 - `config_json` is the mount's `config` table serialised to JSON (NULL when
   the mount has no config).
 - The host callback table is passed **by pointer at `init`** and is valid
   for the process lifetime — modules do not `dlsym` host symbols (that
   would need `-rdynamic` on Linux and has no clean Windows analogue). It
   contains request accessors (method, path, query, remote IP, header
-  lookup, vhost id), the KV operations (`kv_get`/`kv_set`/`kv_set_nx`/
-  `kv_incr`/`kv_incr_ttl`/`kv_free`), `log`, and — for the response phase
-  (minor 1) — the response accessors (`response_status`/`response_headers`/
-  `response_body`).
+  lookup, vhost id, and — minor 2 — scheme/`is_secure`, normalized host, and
+  the bounded buffered body), the KV operations (`kv_get`/`kv_set`/
+  `kv_set_nx`/`kv_incr`/`kv_incr_ttl`/`kv_free`), `log`, and — for the
+  response phase (minor 1) — the response accessors (`response_status`/
+  `response_headers`/`response_body`).
 - The request pointer is only valid during `invoke`; never store it.
   Everything a module writes into `response_out` must stay valid until its
   `invoke` returns — the host copies before unwinding. The same rule applies
