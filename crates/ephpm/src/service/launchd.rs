@@ -17,11 +17,12 @@ fn owner_keys(owner: Option<&ServiceOwner>) -> String {
     let Some(ServiceOwner { user, group }) = owner else {
         return String::new();
     };
+    // NOTE: no `\` line-continuations here — a trailing backslash swallows the
+    // next source line's leading whitespace, which previously left the
+    // `<string>`/`<key>` lines unindented (the launchd test caught it). Keep
+    // every indent explicit as `\n    ` inside a single literal.
     format!(
-        "    <key>UserName</key>\n\
-    <string>{user}</string>\n\
-    <key>GroupName</key>\n\
-    <string>{group}</string>\n"
+        "    <key>UserName</key>\n    <string>{user}</string>\n    <key>GroupName</key>\n    <string>{group}</string>\n"
     )
 }
 
