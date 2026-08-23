@@ -42,7 +42,7 @@ Known leg-specific failures: see `triage-ci` (macOS llvm@17/libclang, Windows ep
 gh release view vX.Y.Z --json isDraft,isPrerelease,assets   # expect 13 assets (12 tarballs + SHA256SUMS); 14 if the non-gating windows-tailcall leg landed its archive
 gh release download vX.Y.Z --pattern "*php<DEFAULT_PHP>-linux-x86_64.tar.gz" --pattern "*windows-x86_64.tar.gz"
 ```
-Smoke each downloaded binary: `ephpm --version` reports the tag; serve a one-line `<?php echo "PHPOK ".PHP_VERSION;` docroot and curl it (Linux binary is glibc-dynamic with a glibc >= 2.39 floor - run it in `debian:13-slim` via podman, NOT alpine and NOT debian:12; Windows runs natively). Expect HTTP 200 + `PHPOK <php-version>`.
+Smoke each downloaded binary: `ephpm --version` reports the tag; serve a one-line `<?php echo "PHPOK ".PHP_VERSION;` docroot and curl it (Linux binary is glibc-dynamic with a glibc >= 2.28 floor, built on `almalinux:8` - run it in `debian:12-slim` via podman, the shipped runtime base, or any glibc >= 2.28 host, NOT alpine; Windows runs natively). Expect HTTP 200 + `PHPOK <php-version>`.
 
 ## 6. After
 

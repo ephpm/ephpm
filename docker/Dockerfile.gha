@@ -42,7 +42,15 @@
 # almalinux:8 base (glibc 2.28). A single image serves both arches — the
 # runner pulls the arch-matching manifest natively (x86_64 on the x64 runner,
 # aarch64 on the arm64 runner), so ci-image.yml passes the same value for both.
-ARG BASE_IMAGE=docker.io/library/almalinux:8
+#
+# Pinned to the multi-arch OCI-index digest (NOT a single-arch manifest digest),
+# so it resolves per-arch on both runners and cannot drift when almalinux:8 is
+# republished. To refresh: `docker buildx imagetools inspect
+# docker.io/library/almalinux:8` and pin the top-level index "Digest:" (confirm
+# its children list both linux/amd64 and linux/arm64). Dependabot (docker) and
+# Renovate both understand this `tag@sha256:…` form and can automate the bump.
+# Mirrors the pin in docker/Dockerfile's "Base image digest pins" block.
+ARG BASE_IMAGE=docker.io/library/almalinux:8@sha256:4a87d2615a770506e204c27d6248ac97f4df67f4e41e2e9c47c81f0ed0be98cb
 FROM ${BASE_IMAGE}
 
 # ── System build tools (dnf, AlmaLinux 8) ────────────────────────────────────
