@@ -6,6 +6,7 @@ mod bump;
 mod cli_conformance;
 mod doctor;
 mod e2e_bare;
+mod php_versions;
 
 /// Pinned full PHP versions per supported minor.
 ///
@@ -18,6 +19,13 @@ const PHP_SDK_VERSIONS: &[(&str, &str)] = &[("8.3", "8.3.33"), ("8.4", "8.4.23")
 
 /// Default PHP minor when no version is specified on the command line.
 const DEFAULT_PHP_MINOR: &str = "8.5";
+
+/// PHP minors that additionally get the experimental clang-cl / TAILCALL VM
+/// Windows build (`release.yml`'s `build-windows-tailcall` job, and the
+/// `tailcall_matrix` that `php-versions` derives for it). 8.5-only today: the
+/// TAILCALL VM does not exist in PHP 8.3/8.4. Single source of truth — both the
+/// matrix generator (`php_versions`) and any future pin tooling read this.
+const TAILCALL_MINORS: &[&str] = &["8.5"];
 
 /// Pinned version of Hugo (extended) for the documentation site.
 /// Newer versions dropped darwin tarballs in favor of .pkg installers.
@@ -40,6 +48,7 @@ fn main() -> ExitCode {
         Some("docs") => docs(&args[1..]),
         Some("doctor") => doctor::doctor(&args[1..]),
         Some("bump-php-pin") => bump::bump_php_pin(&args[1..]),
+        Some("php-versions") => php_versions::run(&args[1..]),
         Some("help" | "--help" | "-h") | None => {
             print_usage();
             ExitCode::SUCCESS
@@ -70,6 +79,7 @@ Commands:
   docs <subcommand>                 Build/serve the Hugo + Hextra documentation site
   doctor [--target windows]         Check build prerequisites (toolchains, PHP SDK cache, optional tools)
   bump-php-pin <minor> <full>       Update every PHP SDK pin site for <minor> (--check: verify pin drift)
+  php-versions [--github-matrix]    Emit the pinned PHP build matrix as JSON (release.yml's source of truth)
 
 The PHP SDK is downloaded from github.com/ephpm/php-sdk releases. Pass a minor
 shorthand (e.g. \"8.5\") to use the pinned patch release, or a full version

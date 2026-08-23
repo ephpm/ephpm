@@ -156,17 +156,32 @@ jobs:
       # read as a compile failure.
       - name: Download PHP SDK (8.3)
         shell: powershell
-        run: cargo xtask php-sdk 8.3
+        # Download the 8.3 SDK, then resolve its cache dir by MINOR glob and
+        # export PHP_SDK_PATH. Globbing on the minor (never the patch version)
+        # means a PHP patch bump -- which edits only xtask::PHP_SDK_VERSIONS --
+        # never has to touch this workflow file, so the automated bump PR stays
+        # pushable by GITHUB_TOKEN (issue #374). xtask's Windows cache layout is
+        # php-sdk/<full>-windows-x86_64 (php_sdk_dir_for in xtask/src/main.rs);
+        # the clang/TAILCALL variant carries a trailing -clang suffix and is
+        # never downloaded here, so it can't match the glob.
+        run: |
+          cargo xtask php-sdk 8.3
+          $sdk = Get-ChildItem "$env:GITHUB_WORKSPACE\php-sdk" -Directory |
+            Where-Object { $_.Name -like '8.3.*-windows-x86_64' } |
+            Select-Object -First 1
+          if (-not $sdk) {
+            Write-Host "::error::no 8.3.*-windows-x86_64 SDK cache dir found under php-sdk\"
+            exit 1
+          }
+          Write-Host "Resolved PHP SDK: $($sdk.FullName)"
+          "PHP_SDK_PATH=$($sdk.FullName)" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 
       # ---- The actual gate ---------------------------------------------------
       - name: cargo check -p ephpm-php (PHP-linked)
         shell: powershell
         env:
-          # xtask's cache layout is php-sdk/<full-version>-<os>-<arch>/ with no
-          # libc suffix on Windows (php_sdk_dir_for in xtask/src/main.rs). The
-          # full version must match xtask::PHP_SDK_VERSIONS["8.3"] — same
-          # keep-in-sync rule as the release.yml matrix pins.
-          PHP_SDK_PATH: ${{ github.workspace }}\php-sdk\8.3.33-windows-x86_64
+          # PHP_SDK_PATH is exported by the download step above (resolved by
+          # minor glob, so no full patch version is pinned in this file).
           # sqlparser (a turso dependency, in this crate's graph via litewire)
           # has deeply recursive AST types that overflow the Windows
           # toolchain's default rustc thread stack in release.yml's build
