@@ -15,6 +15,7 @@ Task-oriented walkthroughs for common deployments.
 - **[KV from PHP](kv-from-php/)** — the `ephpm_kv_*` SAPI functions.
 - **[WebSockets](websockets/)** — *experimental*: Rust owns the sockets, PHP runs per event via `websocket.php`, and any HTTP request can push a frame.
 - **[Query Stats with Prometheus](query-stats-prometheus/)** — observability for your database queries.
+- **[Distributed Tracing with OTLP](otlp-tracing/)** — export request spans to Jaeger or an OpenTelemetry Collector, and what PhpStorm and VS Code can actually do for the loop.
 - **[Worker Mode (Write Your Own Worker)](worker-mode/)** — the engine primitives: boot once, loop on `take_request()`/`send_response()`.
 - **[Laravel Octane (Worker Mode)](laravel-octane/)** — boot Laravel once per worker with the native Octane driver.
 - **[WordPress Worker Mode](wordpress-worker/)** — boot WordPress once per worker with the `ephpm/wordpress-worker` adapter.

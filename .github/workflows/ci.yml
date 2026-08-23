@@ -175,6 +175,11 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `--workspace` does not enable optional features, so the default lint
+      # above never compiles `crates/ephpm-server/src/otlp.rs` at all. Now that
+      # `cargo xtask release` ships the feature (xtask::RELEASE_FEATURES), the
+      # shipped code has to be linted like the rest of the tree.
+      - run: cargo clippy --workspace --all-targets --features ephpm/otlp -- -D warnings
 
   test-linux:
     name: Test (linux-x64)
@@ -221,6 +226,13 @@ jobs:
           # Turns "cdylib missing → skip" into a hard failure, so a regression
           # in the step above reds the build instead of silently un-testing it.
           MIDDLEWARE_CDYLIB_REQUIRED: "1"
+      # The `otlp` module's own tests — including the one asserting a plaintext
+      # `http://` collector still works — live behind an optional feature that
+      # `--workspace` does not enable, so nothing here ever ran them. Only the
+      # linux leg carries this: it is a build-configuration gate, not a
+      # platform one, and doubling it onto macOS buys nothing for the runtime.
+      - name: Test the shipped feature set
+        run: cargo nextest run -p ephpm-server --features otlp
 
   test-macos:
     name: Test (macos-arm64)
