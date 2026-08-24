@@ -1658,6 +1658,7 @@ mod tests {
                 loaded_response::<SeqTag>("a", None, serde_json::json!({ "id": "a" })),
                 loaded_response::<SeqTag>("b", None, serde_json::json!({ "id": "b" })),
             ],
+            php: Vec::new(),
         };
         let out = chain.run_response_phase(&resp_ctx(), "/x", 200, Vec::new(), Vec::new());
         assert_eq!(
@@ -1671,6 +1672,7 @@ mod tests {
     fn response_phase_transforms_status_body_and_headers() {
         let chain = MiddlewareChain {
             modules: vec![loaded_response::<Transformer>("t", None, serde_json::Value::Null)],
+            php: Vec::new(),
         };
         let headers = vec![
             ("Content-Type".to_owned(), "text/plain".to_owned()),
@@ -1690,6 +1692,7 @@ mod tests {
     fn response_phase_fails_safe_on_module_panic() {
         let chain = MiddlewareChain {
             modules: vec![loaded_response::<Panicker>("p", None, serde_json::Value::Null)],
+            php: Vec::new(),
         };
         let headers = vec![("X-Keep".to_owned(), "yes".to_owned())];
         let out = chain.run_response_phase(&resp_ctx(), "/x", 200, headers, b"body".to_vec());
@@ -1703,7 +1706,8 @@ mod tests {
     #[test]
     fn modules_without_a_response_phase_are_skipped() {
         // A request-only module reports no response phase.
-        let request_only = MiddlewareChain { modules: vec![loaded_request::<RequestOnly>("r")] };
+        let request_only =
+            MiddlewareChain { modules: vec![loaded_request::<RequestOnly>("r")], php: Vec::new() };
         assert!(!request_only.has_response_phase());
 
         // Mixed: the request-only module is skipped, the transformer still runs.
@@ -1712,6 +1716,7 @@ mod tests {
                 loaded_request::<RequestOnly>("r"),
                 loaded_response::<Transformer>("t", None, serde_json::Value::Null),
             ],
+            php: Vec::new(),
         };
         assert!(mixed.has_response_phase());
         let out = mixed.run_response_phase(&resp_ctx(), "/x", 200, Vec::new(), b"go".to_vec());
@@ -1727,6 +1732,7 @@ mod tests {
                 Some("/api/*"),
                 serde_json::Value::Null,
             )],
+            php: Vec::new(),
         };
         // Off-glob: untouched.
         let out =
