@@ -44,30 +44,51 @@ use std::os::raw::{c_char, c_int};
 /// Current ABI version (`0xMMmmmmmm`: major byte gates compatibility, the
 /// lower three bytes are an additive minor level).
 ///
-/// `0x0100_0001` = major **1**, minor **1**. Minor 1 added the optional
-/// response phase (the [`SYM_INVOKE_RESPONSE`] symbol and the three appended
-/// `response_*` accessors on [`EphpmHostV1`]). The major byte is unchanged
-/// from minor 0, so **every** module built against major 1 still loads:
-/// growth is additive.
-pub const ABI_V1: u32 = 0x0100_0001;
+/// `0x0100_0002` = major **1**, minor **2**.
+///
+/// - Minor 1 added the optional response phase (the [`SYM_INVOKE_RESPONSE`]
+///   symbol and the three appended `response_*` accessors on [`EphpmHostV1`]).
+/// - Minor 2 added three appended request accessors — [`request_scheme`],
+///   [`request_is_secure`], and [`request_host`] — and gave the pre-existing
+///   [`request_body`] slot real (bounded, buffered) semantics.
+///
+/// The major byte is unchanged across every minor, so **every** module built
+/// against major 1 still loads: growth is additive.
+///
+/// [`request_scheme`]: EphpmHostV1::request_scheme
+/// [`request_is_secure`]: EphpmHostV1::request_is_secure
+/// [`request_host`]: EphpmHostV1::request_host
+/// [`request_body`]: EphpmHostV1::request_body
+pub const ABI_V1: u32 = 0x0100_0002;
 
 /// Major version — the compatibility gate. A module refuses to init when the
 /// host's major (`host.abi_version >> 24`) is newer than its own.
 pub const ABI_MAJOR: u32 = 1;
 
 /// Minor version — the additive feature level in the low three bytes of
-/// [`ABI_V1`]. A *response-capable* module checks the host's advertised minor
-/// (`host.abi_version & 0x00FF_FFFF`) is at least
-/// [`ABI_MINOR_RESPONSE_PHASE`] before calling any `response_*` accessor: an
-/// older host's table does not have those trailing fields, and reading past a
-/// shorter table is undefined behaviour.
-pub const ABI_MINOR: u32 = 1;
+/// [`ABI_V1`]. A module that reaches for a trailing accessor checks the host's
+/// advertised minor (`host.abi_version & 0x00FF_FFFF`) is at least the minor
+/// that introduced it before calling: an older host's table does not have
+/// those trailing fields, and reading past a shorter table is undefined
+/// behaviour. See [`ABI_MINOR_RESPONSE_PHASE`] and
+/// [`ABI_MINOR_REQUEST_ACCESSORS`].
+pub const ABI_MINOR: u32 = 2;
 
 /// The minor version that introduced the response phase — the three
 /// `response_*` accessors on [`EphpmHostV1`] and the [`SYM_INVOKE_RESPONSE`]
 /// symbol. A module needs `host.abi_version & 0x00FF_FFFF >=` this before
 /// using the response-side host callbacks.
 pub const ABI_MINOR_RESPONSE_PHASE: u32 = 1;
+
+/// The minor version that introduced the appended request accessors —
+/// [`EphpmHostV1::request_scheme`], [`EphpmHostV1::request_is_secure`], and
+/// [`EphpmHostV1::request_host`]. A module needs
+/// `host.abi_version & 0x00FF_FFFF >=` this before calling any of them: on an
+/// older host those trailing table fields are absent and reading them is
+/// undefined behaviour. ([`EphpmHostV1::request_body`] is **not** gated by
+/// this — its slot has existed since minor 0; only its buffered semantics are
+/// new — so a minor-0 module that already called it stays correct.)
+pub const ABI_MINOR_REQUEST_ACCESSORS: u32 = 2;
 
 /// Middleware verdicts for one request.
 pub const ACTION_CONTINUE: c_int = 0;
@@ -200,9 +221,21 @@ pub struct EphpmHostV1 {
     /// headers return the values pre-joined per HTTP list semantics.
     pub request_header:
         unsafe extern "C" fn(*const EphpmRequest, name: *const c_char) -> *const c_char,
-    /// Request body view. v1: bodies are not read before the middleware chain
-    /// runs (rejecting BEFORE the body transfer is the point), so this
-    /// returns length 0. Reserved for a future buffered-body option.
+    /// Bounded, read-only view of the buffered request body. Writes the byte
+    /// slice base into `*out_ptr` and returns its length; the slice is valid
+    /// only for the duration of the request (`invoke`) — never store it.
+    ///
+    /// The body is buffered by the host ONLY when the operator opts in with
+    /// `[server.request] middleware_body_limit > 0`; that knob also caps how
+    /// many bytes are exposed here (a longer body is truncated to the limit for
+    /// this view — PHP still receives the complete body). When the knob is `0`
+    /// (the default) the chain runs before any body byte is read — rejecting
+    /// BEFORE the body transfer is the point — and this returns length 0 with
+    /// `*out_ptr` set null. It is also 0 on the static-file and response-phase
+    /// paths, which carry no request body.
+    ///
+    /// This slot has existed since minor 0 (it returned 0 then); only the
+    /// buffered semantics are new in minor 2, so it needs no minor gate.
     pub request_body: unsafe extern "C" fn(*const EphpmRequest, out_ptr: *mut *const u8) -> usize,
     /// Identity of the vhost/site serving this request (server name).
     pub request_vhost_id: unsafe extern "C" fn(*const EphpmRequest) -> *const c_char,
@@ -281,6 +314,30 @@ pub struct EphpmHostV1 {
     /// and returns its length; valid only for the duration of the call.
     pub response_body:
         unsafe extern "C" fn(*const EphpmResponseCtx, out_ptr: *mut *const u8) -> usize,
+
+    // ── Request accessors (minor 2; valid only during `invoke`) ───────────
+    //
+    // Appended after `response_body`: a module built against minor 0 or 1
+    // never reads these offsets, so the growth is ABI-compatible. A module
+    // that DOES read them must first confirm `abi_version & 0x00FF_FFFF >=
+    // ABI_MINOR_REQUEST_ACCESSORS`, otherwise it would read past a shorter
+    // (older-host) table.
+    /// Request URL scheme, authoritative from the connection: `"https"` when
+    /// the client's TLS terminated here, `"http"` otherwise. Derived from the
+    /// real connection TLS state (after trusted-proxy resolution), NOT from a
+    /// client-supplied `X-Forwarded-Proto` header — so a `force_https` gate can
+    /// trust it. Never null.
+    pub request_scheme: unsafe extern "C" fn(*const EphpmRequest) -> *const c_char,
+    /// Whether the request arrived over a secure (HTTPS/TLS) connection — the
+    /// boolean form of [`request_scheme`](Self::request_scheme). `1` = secure,
+    /// `0` = plaintext.
+    pub request_is_secure: unsafe extern "C" fn(*const EphpmRequest) -> c_int,
+    /// Normalized request `Host` — port stripped, one trailing FQDN-root dot
+    /// stripped, lowercased (the same normalization the router uses to key a
+    /// vhost). Distinct from [`request_vhost_id`](Self::request_vhost_id),
+    /// which is the un-normalized server name. Empty (never null) when the
+    /// request carried no usable `Host`.
+    pub request_host: unsafe extern "C" fn(*const EphpmRequest) -> *const c_char,
 }
 
 /// Symbol names the loader looks up.

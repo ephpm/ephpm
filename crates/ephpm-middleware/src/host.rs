@@ -17,13 +17,34 @@ pub struct RequestCtx {
     query: CString,
     remote_ip: CString,
     vhost: CString,
+    /// Normalized request host (port/trailing-dot stripped, lowercased) — the
+    /// `request_host` accessor. Empty when the request had no usable `Host`.
+    host: CString,
+    /// Whether the connection was secure (HTTPS/TLS) — drives `request_scheme`
+    /// and `request_is_secure`. Authoritative from the connection.
+    is_secure: bool,
+    /// Bounded, buffered request body exposed by `request_body`. Empty unless
+    /// the operator opted into body buffering (`[server.request]
+    /// middleware_body_limit`); already truncated to that limit by the caller.
+    body: Vec<u8>,
     /// Lower-cased name → value (values pre-joined per HTTP list semantics).
     headers: Vec<(CString, CString)>,
+}
+
+/// Convert a string to a C string, stripping interior NULs (invalid in HTTP
+/// metadata anyway) rather than failing.
+fn cstr(s: &str) -> CString {
+    CString::new(s.replace('\0', "")).unwrap_or_default()
 }
 
 impl RequestCtx {
     /// Build the context. Interior NULs are stripped (invalid in HTTP
     /// metadata anyway) rather than failing the request.
+    ///
+    /// The connection-derived extras — scheme/secure, normalized host, and the
+    /// buffered body — default to "insecure / empty / no body" and are set by
+    /// the router via [`with_scheme`](Self::with_scheme),
+    /// [`with_host`](Self::with_host), and [`with_body`](Self::with_body).
     #[must_use]
     pub fn new(
         method: &str,
@@ -33,17 +54,44 @@ impl RequestCtx {
         vhost: &str,
         headers: &[(String, String)],
     ) -> Self {
-        fn c(s: &str) -> CString {
-            CString::new(s.replace('\0', "")).unwrap_or_default()
-        }
         Self {
-            method: c(method),
-            path: c(path),
-            query: c(query),
-            remote_ip: c(remote_ip),
-            vhost: c(vhost),
-            headers: headers.iter().map(|(n, v)| (c(&n.to_ascii_lowercase()), c(v))).collect(),
+            method: cstr(method),
+            path: cstr(path),
+            query: cstr(query),
+            remote_ip: cstr(remote_ip),
+            vhost: cstr(vhost),
+            host: CString::default(),
+            is_secure: false,
+            body: Vec::new(),
+            headers: headers
+                .iter()
+                .map(|(n, v)| (cstr(&n.to_ascii_lowercase()), cstr(v)))
+                .collect(),
         }
+    }
+
+    /// Set the connection security (drives `request_scheme` /
+    /// `request_is_secure`). `true` = the request arrived over HTTPS/TLS.
+    #[must_use]
+    pub fn with_scheme(mut self, is_secure: bool) -> Self {
+        self.is_secure = is_secure;
+        self
+    }
+
+    /// Set the normalized request host (`request_host`). Pass the router's
+    /// canonical, already-normalized host key.
+    #[must_use]
+    pub fn with_host(mut self, host: &str) -> Self {
+        self.host = cstr(host);
+        self
+    }
+
+    /// Set the buffered request body exposed by `request_body`. The caller is
+    /// responsible for truncating `body` to the configured limit first.
+    #[must_use]
+    pub fn with_body(mut self, body: &[u8]) -> Self {
+        self.body = body.to_vec();
+        self
     }
 
     /// The opaque pointer to pass through the ABI. Valid while `self` lives.
@@ -99,14 +147,34 @@ unsafe extern "C" fn request_header(
     }
     std::ptr::null()
 }
-unsafe extern "C" fn request_body(_req: *const EphpmRequest, out_ptr: *mut *const u8) -> usize {
-    // v1: the chain runs BEFORE the body is read (rejecting before the
-    // transfer is the point) — no body view yet.
+unsafe extern "C" fn request_body(req: *const EphpmRequest, out_ptr: *mut *const u8) -> usize {
+    // The body is non-empty only when the operator opted into buffering
+    // (`[server.request] middleware_body_limit`); it is already bounded to
+    // that limit by the router. Empty otherwise (the chain ran before the body
+    // was read — rejecting before the transfer is the point) and on the
+    // static/response-phase paths, which carry no request body.
+    // SAFETY: ABI contract (pointer from as_abi, live during invoke).
+    let body = unsafe { ctx(req) }.map(|c| c.body.as_slice()).unwrap_or_default();
     if !out_ptr.is_null() {
+        let base = if body.is_empty() { std::ptr::null() } else { body.as_ptr() };
         // SAFETY: module passes a valid out-pointer.
-        unsafe { *out_ptr = std::ptr::null() };
+        unsafe { *out_ptr = base };
     }
-    0
+    body.len()
+}
+unsafe extern "C" fn request_scheme(req: *const EphpmRequest) -> *const c_char {
+    // SAFETY: ABI contract. Both branches point at 'static C-string literals.
+    unsafe { ctx(req) }.map_or(c"http".as_ptr(), |c| {
+        if c.is_secure { c"https".as_ptr() } else { c"http".as_ptr() }
+    })
+}
+unsafe extern "C" fn request_is_secure(req: *const EphpmRequest) -> c_int {
+    // SAFETY: ABI contract.
+    c_int::from(unsafe { ctx(req) }.is_some_and(|c| c.is_secure))
+}
+unsafe extern "C" fn request_host(req: *const EphpmRequest) -> *const c_char {
+    // SAFETY: ABI contract.
+    unsafe { ctx(req) }.map_or(std::ptr::null(), |c| c.host.as_ptr())
 }
 
 // ── Response context (response phase) ─────────────────────────────────────
@@ -459,6 +527,9 @@ static HOST_TABLE: EphpmHostV1 = EphpmHostV1 {
     response_status,
     response_headers,
     response_body,
+    request_scheme,
+    request_is_secure,
+    request_host,
 };
 
 /// Wire the embedded KV store into the host table. Call once at startup,
@@ -471,4 +542,59 @@ pub fn set_kv_store(store: &Arc<ephpm_kv::store::Store>) {
 #[must_use]
 pub fn host_table() -> &'static EphpmHostV1 {
     &HOST_TABLE
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Request;
+    use crate::abi::{self, EphpmHostV1};
+    use crate::host::{RequestCtx, host_table};
+
+    fn ctx() -> RequestCtx {
+        RequestCtx::new("GET", "/hook", "", "203.0.113.4", "srv", &[])
+    }
+
+    #[test]
+    fn defaults_are_insecure_empty_host_no_body() {
+        let ctx = ctx();
+        // SAFETY: ctx and the real host table outlive the view.
+        let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
+        assert_eq!(req.scheme(), "http");
+        assert!(!req.is_secure());
+        assert_eq!(req.http_host(), "");
+        assert!(req.body().is_empty());
+    }
+
+    #[test]
+    fn builders_set_scheme_host_and_body() {
+        let ctx = ctx().with_scheme(true).with_host("blog.example").with_body(b"payload");
+        // SAFETY: as above.
+        let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
+        assert_eq!(req.scheme(), "https");
+        assert!(req.is_secure());
+        assert_eq!(req.http_host(), "blog.example");
+        assert_eq!(req.body(), b"payload");
+    }
+
+    /// A module built against minor 2 talking to a host advertising an OLDER
+    /// minor must NOT read the appended fields — the safe wrapper falls back.
+    /// (The `request_body` slot predates the gate, so it still works.)
+    #[test]
+    fn minor_gate_hides_appended_accessors_on_older_host() {
+        // A downgraded copy of the real table: every field identical, only the
+        // advertised minor rolled back below ABI_MINOR_REQUEST_ACCESSORS. All
+        // fields are Copy (fn pointers + u32), so struct-update copies them.
+        let old = EphpmHostV1 { abi_version: 0x0100_0001, ..*host_table() };
+        assert!((old.abi_version & 0x00FF_FFFF) < abi::ABI_MINOR_REQUEST_ACCESSORS);
+
+        let ctx = ctx().with_scheme(true).with_host("blog.example").with_body(b"payload");
+        // SAFETY: ctx and `old` outlive the view.
+        let req = unsafe { Request::from_raw(ctx.as_abi(), &old) };
+        // Appended (minor-2) accessors fall back rather than read a short table.
+        assert_eq!(req.scheme(), "http");
+        assert!(!req.is_secure());
+        assert_eq!(req.http_host(), "");
+        // request_body has existed since minor 0 — not gated, still readable.
+        assert_eq!(req.body(), b"payload");
+    }
 }

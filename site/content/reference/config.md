@@ -35,6 +35,7 @@ All sections and keys are optional. Missing sections use defaults; `Config::defa
 | `max_body_size` | u64 (bytes) | `10_485_760` (10 MiB) | Max request body. `0` = unlimited. Exceeding sends 413. |
 | `max_header_size` | usize (bytes) | `8192` | Max total request header size. |
 | `trusted_hosts` | array of strings | `[]` | Allowed `Host` header values. Empty = allow all. Mismatched hosts get 421. `/_ephpm/health`, `/_ephpm/ready`, `/_ephpm/requests` (when the request timeline is enabled), and the metrics path are exempt (probes/scrapes address pods by IP). |
+| `middleware_body_limit` | u64 (bytes) | `0` (disabled) | Max request-body bytes buffered and exposed to **request-phase** native middleware via the `request_body` ABI accessor. `0` (default) disables buffering — the chain runs before the body is read, so a `RESPOND` never pays for the transfer. When `> 0` **and** a `[[middleware]]` chain is mounted, the body is buffered up front so middleware can inspect up to this many bytes (a longer body is truncated *for the middleware view only*; the full body, subject to `max_body_size`, still reaches PHP). Enables webhook/HMAC verification, CSRF-with-body, and payload validation. Buffering bypasses worker-mode request streaming for such requests. |
 
 ### `[server.timeouts]` (all in seconds)
 

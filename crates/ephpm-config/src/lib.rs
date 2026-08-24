@@ -407,6 +407,28 @@ pub struct RequestConfig {
     /// Default: `[]` (all hosts allowed).
     #[serde(default)]
     pub trusted_hosts: Vec<String>,
+
+    /// Maximum number of request-body bytes buffered and exposed to
+    /// **request-phase** native middleware through the `request_body` ABI
+    /// accessor.
+    ///
+    /// `0` (the default) **disables** body buffering: the middleware chain runs
+    /// before any body byte is read — so a `RESPOND` verdict (auth deny, rate
+    /// limit) never pays for the body transfer — and `request_body` returns
+    /// empty. This preserves the reject-before-transfer property by default.
+    ///
+    /// When `> 0` **and** a `[[middleware]]` chain is mounted, the request body
+    /// is buffered before the chain so middleware can inspect up to this many
+    /// bytes (a longer body is truncated to this limit *for the middleware
+    /// view only* — the complete body, subject to `max_body_size`, still
+    /// reaches PHP unchanged). Enables webhook/HMAC signature verification,
+    /// CSRF-with-body, and payload validation. Note: buffering the body up
+    /// front bypasses worker-mode request streaming for such requests.
+    ///
+    /// Independent of `max_body_size`, which remains the hard cap that 413s an
+    /// oversized body. Env override: `EPHPM_SERVER_REQUEST__MIDDLEWARE_BODY_LIMIT`.
+    #[serde(default = "default_middleware_body_limit")]
+    pub middleware_body_limit: u64,
 }
 
 /// Connection timeout configuration (`[server.timeouts]`).
@@ -3172,6 +3194,7 @@ impl Default for RequestConfig {
             max_body_size: default_max_body_size(),
             max_header_size: default_max_header_size(),
             trusted_hosts: Vec::new(),
+            middleware_body_limit: default_middleware_body_limit(),
         }
     }
 }
@@ -5050,6 +5073,13 @@ fn default_max_body_size() -> u64 {
     10 * 1024 * 1024 // 10 MiB
 }
 
+/// Request-body buffering for middleware is opt-in: `0` disables it, preserving
+/// the reject-before-body-transfer property. Operators that need `request_body`
+/// (webhook/HMAC, CSRF-with-body) set an explicit byte cap.
+fn default_middleware_body_limit() -> u64 {
+    0
+}
+
 /// Default `Alt-Svc` max-age: 24 hours, the value nginx and Caddy advertise.
 fn default_alt_svc_max_age() -> u64 {
     86400
@@ -6098,6 +6128,33 @@ config = { per_ip_rps = 50, burst = 100 }
         // The loader serialises this value back to JSON for the module's init.
         let json = serde_json::to_string(mount_config).unwrap();
         assert!(json.contains("per_ip_rps"));
+    }
+
+    #[test]
+    fn test_middleware_body_limit_defaults_to_disabled() {
+        // Opt-in by design: 0 preserves the reject-before-body-transfer
+        // property. Both the field default and the whole-section-absent path
+        // (RequestConfig::default) must land on 0.
+        assert_eq!(default_middleware_body_limit(), 0);
+        assert_eq!(RequestConfig::default().middleware_body_limit, 0);
+    }
+
+    #[test]
+    fn test_middleware_body_limit_parses_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r"
+[server.request]
+middleware_body_limit = 1048576
+",
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.server.request.middleware_body_limit, 1_048_576);
     }
 
     #[test]
