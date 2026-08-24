@@ -7,7 +7,7 @@ use std::os::raw::{c_char, c_int};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use crate::abi::{self, EphpmHostV1, EphpmRequest};
+use crate::abi::{self, EphpmHeaderKv, EphpmHostV1, EphpmRequest, EphpmResponseCtx};
 
 /// Owned, C-string-backed request context. Built by the router per request;
 /// the opaque `EphpmRequest*` handed to modules is a pointer to this.
@@ -107,6 +107,176 @@ unsafe extern "C" fn request_body(_req: *const EphpmRequest, out_ptr: *mut *cons
         unsafe { *out_ptr = std::ptr::null() };
     }
     0
+}
+
+// ── Response context (response phase) ─────────────────────────────────────
+
+/// Host-owned, mutable representation of the response being transformed by the
+/// response phase. The opaque `EphpmResponseCtx*` handed to modules is a
+/// pointer to this; the host drives it across the reverse chain, applying each
+/// module's staged edit before handing it to the next module.
+///
+/// Headers are kept as owned Rust strings (easy case-insensitive mutation) and
+/// mirrored into a `CString`-backed [`EphpmHeaderKv`] array rebuilt on every
+/// mutation, so the `response_headers` accessor can hand back a stable
+/// borrowed pointer for the duration of a call.
+pub struct ResponseCtx {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+    body_replaced: bool,
+    kv_strs: Vec<CString>,
+    kvs: Vec<EphpmHeaderKv>,
+}
+
+impl ResponseCtx {
+    /// Build from the response the host just generated.
+    #[must_use]
+    pub fn new(status: u16, headers: Vec<(String, String)>, body: Vec<u8>) -> Self {
+        let mut ctx = Self {
+            status,
+            headers,
+            body,
+            body_replaced: false,
+            kv_strs: Vec::new(),
+            kvs: Vec::new(),
+        };
+        ctx.rebuild_kvs();
+        ctx
+    }
+
+    /// Rebuild the C-string mirror of `headers`. Interior-NUL header names or
+    /// values are dropped (invalid in HTTP anyway).
+    fn rebuild_kvs(&mut self) {
+        self.kv_strs.clear();
+        self.kvs.clear();
+        for (name, value) in &self.headers {
+            let (Ok(n), Ok(v)) = (CString::new(name.as_str()), CString::new(value.as_str())) else {
+                continue;
+            };
+            self.kv_strs.push(n);
+            self.kv_strs.push(v);
+            let len = self.kv_strs.len();
+            self.kvs.push(EphpmHeaderKv {
+                name: self.kv_strs[len - 2].as_ptr(),
+                value: self.kv_strs[len - 1].as_ptr(),
+            });
+        }
+    }
+
+    /// The opaque pointer to pass through the ABI. Valid while `self` lives.
+    #[must_use]
+    pub fn as_ptr(&self) -> *const EphpmResponseCtx {
+        std::ptr::from_ref(self).cast::<EphpmResponseCtx>()
+    }
+
+    /// Current status.
+    #[must_use]
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    /// Current headers.
+    #[must_use]
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
+    /// Current body.
+    #[must_use]
+    pub fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Replace the status.
+    pub fn set_status(&mut self, status: u16) {
+        self.status = status;
+    }
+
+    /// Replace the body. Marks the response body as replaced so the host can
+    /// recompute `Content-Length`.
+    pub fn replace_body(&mut self, body: Vec<u8>) {
+        self.body = body;
+        self.body_replaced = true;
+    }
+
+    /// Whether any module replaced the body during the phase.
+    #[must_use]
+    pub fn body_replaced(&self) -> bool {
+        self.body_replaced
+    }
+
+    /// Replace-or-add a header (removes every case-insensitive occurrence,
+    /// then appends the new one).
+    pub fn set_header(&mut self, name: &str, value: &str) {
+        self.headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self.rebuild_kvs();
+    }
+
+    /// Remove every case-insensitive occurrence of `name`.
+    pub fn remove_header(&mut self, name: &str) {
+        let before = self.headers.len();
+        self.headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
+        if self.headers.len() != before {
+            self.rebuild_kvs();
+        }
+    }
+
+    /// Consume the context back into owned response parts.
+    #[must_use]
+    pub fn into_parts(self) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        (self.status, self.headers, self.body)
+    }
+}
+
+// SAFETY: the opaque pointer is only turned back into &ResponseCtx by the
+// accessors below, on the thread running the response phase, while it lives.
+unsafe fn resp_ctx<'a>(p: *const EphpmResponseCtx) -> Option<&'a ResponseCtx> {
+    // SAFETY: see above — `p` originates from ResponseCtx::as_ptr.
+    unsafe { p.cast::<ResponseCtx>().as_ref() }
+}
+
+unsafe extern "C" fn response_status(p: *const EphpmResponseCtx) -> u16 {
+    // SAFETY: ABI contract (pointer from as_ptr, live during invoke_response).
+    unsafe { resp_ctx(p) }.map_or(0, ResponseCtx::status)
+}
+
+unsafe extern "C" fn response_headers(
+    p: *const EphpmResponseCtx,
+    out_ptr: *mut *const EphpmHeaderKv,
+) -> usize {
+    // SAFETY: ABI contract.
+    let Some(ctx) = (unsafe { resp_ctx(p) }) else {
+        if !out_ptr.is_null() {
+            // SAFETY: module passes a valid out-pointer.
+            unsafe { *out_ptr = std::ptr::null() };
+        }
+        return 0;
+    };
+    if !out_ptr.is_null() {
+        let base = if ctx.kvs.is_empty() { std::ptr::null() } else { ctx.kvs.as_ptr() };
+        // SAFETY: module passes a valid out-pointer.
+        unsafe { *out_ptr = base };
+    }
+    ctx.kvs.len()
+}
+
+unsafe extern "C" fn response_body(p: *const EphpmResponseCtx, out_ptr: *mut *const u8) -> usize {
+    // SAFETY: ABI contract.
+    let Some(ctx) = (unsafe { resp_ctx(p) }) else {
+        if !out_ptr.is_null() {
+            // SAFETY: module passes a valid out-pointer.
+            unsafe { *out_ptr = std::ptr::null() };
+        }
+        return 0;
+    };
+    if !out_ptr.is_null() {
+        let base = if ctx.body.is_empty() { std::ptr::null() } else { ctx.body.as_ptr() };
+        // SAFETY: module passes a valid out-pointer.
+        unsafe { *out_ptr = base };
+    }
+    ctx.body.len()
 }
 
 // ── KV callbacks ─────────────────────────────────────────────────────────
@@ -286,6 +456,9 @@ static HOST_TABLE: EphpmHostV1 = EphpmHostV1 {
     kv_free,
     log: host_log,
     kv_incr_ttl,
+    response_status,
+    response_headers,
+    response_body,
 };
 
 /// Wire the embedded KV store into the host table. Call once at startup,

@@ -131,26 +131,54 @@ async fn request_without_origin_is_untouched() {
     assert_eq!(header(&resp, "vary"), None);
 }
 
-/// Documented coverage boundary, pinned: in FPM mode the chain runs only for
-/// PHP-dispatched requests, so a static file does NOT pass through middleware.
-/// If that ever changes, this test should be updated deliberately rather than
-/// discovered by an operator whose CORS policy silently started applying to
-/// assets.
+/// Coverage boundary, updated for #395: the middleware chain now runs on the
+/// **static-file** path too, not just PHP-dispatched requests.
+///
+/// Why this is the correct behavior, not a loosened test: the whole point of
+/// #395 is that a gating module (`basic-auth`, `jwt`, `github-auth`, …) must be
+/// able to deny a *static asset* before its bytes leave disk — which requires
+/// running the request phase ahead of static serving. Once the chain runs on
+/// static, a `CONTINUE` module that appends response headers (CORS here,
+/// security headers, compression) necessarily applies to static responses as
+/// well. That is a feature, not a leak: a CORS policy SHOULD cover static
+/// assets a browser fetches cross-origin. This test therefore asserts the new
+/// behavior AND still proves the module makes a real decision on the static
+/// path (an unlisted origin gets nothing).
 #[tokio::test]
-async fn static_files_bypass_the_middleware_chain() {
+async fn middleware_chain_runs_on_static_files() {
     let base_url = required_env("EPHPM_URL");
+
+    // Allowed origin: the CORS module's request phase runs on the static file
+    // and appends its headers to the served asset.
     let resp = client()
         .get(format!("{base_url}/test.html"))
         .header("Origin", ALLOWED_ORIGIN)
         .send()
         .await
         .expect("request /test.html");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header(&resp, "access-control-allow-origin"),
+        Some(ALLOWED_ORIGIN),
+        "the chain now runs on static files (#395), so an allowed origin gets CORS headers — \
+         headers: {:?}",
+        resp.headers()
+    );
+    assert_eq!(header(&resp, "vary"), Some("Origin"));
 
+    // The decision is real on the static path too: an unlisted origin gets no
+    // CORS headers (a module unconditionally stamping headers would fail here).
+    let resp = client()
+        .get(format!("{base_url}/test.html"))
+        .header("Origin", "https://not-allowed.e2e.test")
+        .send()
+        .await
+        .expect("request /test.html");
     assert_eq!(resp.status(), 200);
     assert_eq!(
         header(&resp, "access-control-allow-origin"),
         None,
-        "static-file responses are documented as bypassing the middleware chain"
+        "an unlisted origin must not receive CORS headers, even on a static file"
     );
 }
 

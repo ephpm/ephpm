@@ -156,5 +156,18 @@ crate-type = ["cdylib"]
 name = "mw_probe_no_invoke"
 crate-type = ["cdylib"]
 
+# Response-phase proof module (tests/middleware_response_phase.rs). Opts into
+# the response phase via `declare!(Type, response)`, so it exports the optional
+# `ephpm_middleware_invoke_response` symbol the mw_probe_* fixtures do not.
+[[example]]
+name = "mw_response_gzip"
+crate-type = ["cdylib"]
+
+# Minimal header-injection response-phase module — used by the router
+# integration tests to prove the phase runs on the static-file path (#395).
+[[example]]
+name = "mw_response_header"
+crate-type = ["cdylib"]
+
 [lints]
 workspace = true

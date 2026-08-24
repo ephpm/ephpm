@@ -16,8 +16,11 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use crate::host::{RequestCtx, host_table};
-use crate::{Middleware, Response, abi};
+use crate::host::{RequestCtx, ResponseCtx, host_table};
+use crate::{Middleware, Response, ResponseMiddleware, StagedEdit, abi};
+
+/// Boxed response-phase handler stored on a [`BuiltinModule`].
+type ResponseRunner = Box<dyn Fn(&RequestCtx, &mut ResponseCtx) + Send + Sync>;
 
 /// One middleware compiled into the host binary, adapted behind object-safe
 /// closures so a chain can hold heterogeneous modules.
@@ -26,6 +29,10 @@ use crate::{Middleware, Response, abi};
 /// trait a cdylib module implements; only the transport differs.
 pub struct BuiltinModule {
     run: Box<dyn Fn(&RequestCtx) -> Response + Send + Sync>,
+    /// Optional response-phase handler — present only for modules built via
+    /// [`BuiltinModule::init_response`] (the in-process equivalent of a module
+    /// that opted in with `declare!(Type, response)`).
+    run_response: Option<ResponseRunner>,
     stop: Box<dyn Fn() + Send + Sync>,
     description: &'static str,
 }
@@ -113,7 +120,57 @@ impl BuiltinModule {
             "" => std::any::type_name::<T>(),
             d => d,
         };
-        Ok(Self { run, stop, description })
+        Ok(Self { run, run_response: None, stop, description })
+    }
+
+    /// Construct a `T` that also implements [`ResponseMiddleware`], wiring up
+    /// the response-phase handler in addition to the request-phase one. The
+    /// in-process equivalent of `declare!(Type, response)`.
+    ///
+    /// # Errors
+    ///
+    /// As [`BuiltinModule::init`] — the module's `init` error, or a synthetic
+    /// message when `init` panicked.
+    pub fn init_response<T: ResponseMiddleware>(
+        config: &serde_json::Value,
+    ) -> Result<Self, String> {
+        let instance = catch_unwind(AssertUnwindSafe(|| T::init(config)))
+            .map_err(|_| "middleware init panicked".to_owned())??;
+        let instance = Arc::new(instance);
+        let run = {
+            let instance = Arc::clone(&instance);
+            Box::new(move |ctx: &RequestCtx| {
+                // SAFETY: `ctx` is live for this call; `host_table()` is 'static.
+                let req = unsafe { crate::Request::from_raw(ctx.as_abi(), host_table()) };
+                instance.invoke(&req)
+            }) as Box<dyn Fn(&RequestCtx) -> Response + Send + Sync>
+        };
+        let run_response = {
+            let instance = Arc::clone(&instance);
+            Box::new(move |req_ctx: &RequestCtx, resp: &mut ResponseCtx| {
+                // SAFETY: `req_ctx`/`resp` are live for this call and
+                // `host_table()` is 'static — the same invariants the dlopen
+                // lane provides. The read-through-`as_ptr` borrow ends before
+                // `resp` is mutated by `apply_staged_edit`.
+                let staged = {
+                    let req = unsafe { crate::Request::from_raw(req_ctx.as_abi(), host_table()) };
+                    let mut view =
+                        unsafe { crate::ResponseView::from_raw(resp.as_ptr(), host_table()) };
+                    instance.invoke_response(&req, &mut view);
+                    view.__into_parts()
+                };
+                apply_staged_edit(resp, staged);
+            }) as ResponseRunner
+        };
+        let stop = {
+            let instance = Arc::clone(&instance);
+            Box::new(move || instance.shutdown())
+        };
+        let description = match T::describe() {
+            "" => std::any::type_name::<T>(),
+            d => d,
+        };
+        Ok(Self { run, run_response: Some(run_response), stop, description })
     }
 
     /// Run the module for one request. A panic fails closed as a 500 —
@@ -127,6 +184,23 @@ impl BuiltinModule {
         }
     }
 
+    /// Whether this module has a response-phase handler (built via
+    /// [`BuiltinModule::init_response`]).
+    #[must_use]
+    pub fn has_response_phase(&self) -> bool {
+        self.run_response.is_some()
+    }
+
+    /// Run the module's response phase, mutating `resp` in place. A no-op when
+    /// the module has no response handler. A panic is caught and leaves `resp`
+    /// unchanged (fail-safe — a broken transform must not corrupt a good
+    /// response), matching the `declare!` glue's response contract.
+    pub fn invoke_response(&self, req_ctx: &RequestCtx, resp: &mut ResponseCtx) {
+        if let Some(run_response) = &self.run_response {
+            let _ = catch_unwind(AssertUnwindSafe(|| run_response(req_ctx, resp)));
+        }
+    }
+
     /// Call the module's `shutdown`; panics are swallowed (as in `declare!`).
     pub fn shutdown(&self) {
         let _ = catch_unwind(AssertUnwindSafe(|| (self.stop)()));
@@ -137,6 +211,26 @@ impl BuiltinModule {
     #[must_use]
     pub fn describe(&self) -> &'static str {
         self.description
+    }
+}
+
+/// Apply a drained [`ResponseView`](crate::ResponseView) edit to a
+/// [`ResponseCtx`] in the canonical order: remove headers, then set headers
+/// (replace-or-add), then status, then body. Shared by the in-process lane;
+/// the dlopen lane applies the same order in `ephpm-server`'s host driver.
+fn apply_staged_edit(resp: &mut ResponseCtx, staged: StagedEdit) {
+    let (status, body, set_headers, remove_headers) = staged;
+    for name in &remove_headers {
+        resp.remove_header(name);
+    }
+    for (name, value) in &set_headers {
+        resp.set_header(name, value);
+    }
+    if let Some(status) = status {
+        resp.set_status(status);
+    }
+    if let Some(body) = body {
+        resp.replace_body(body);
     }
 }
 
