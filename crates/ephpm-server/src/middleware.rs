@@ -7,10 +7,11 @@
 //!
 //! Each mount resolves through two lanes, in order:
 //!
-//! 1. **Builtin registry** ([`builtin`]) — the four in-tree modules compiled
-//!    into this binary and invoked in-process (no FFI, no dlopen). Works in
-//!    every binary, including custom fully static builds where `dlopen` does
-//!    not exist.
+//! 1. **Builtin registry** ([`builtin`]) — the ten in-tree official modules
+//!    compiled into this binary and invoked in-process (no FFI, no dlopen).
+//!    Works in every binary, including custom fully static builds where
+//!    `dlopen` does not exist. Two of them (`request-id`, `header-transform`)
+//!    also run in the response phase, via [`BuiltinModule::init_response`].
 //! 2. **Shared library** — everything else goes through the dlopen path and
 //!    the versioned C ABI host table, for out-of-tree modules. Works with the
 //!    stock release binaries on every platform (the Linux release is
@@ -139,6 +140,29 @@ pub fn builtin(name: &str) -> Option<BuiltinBuilder> {
         }
         "security-headers" | "ephpm-middleware-security-headers" => {
             BuiltinModule::init::<ephpm_middleware_builtins::security_headers::SecurityHeaders>
+        }
+        "api-key" | "ephpm-middleware-api-key" => {
+            BuiltinModule::init::<ephpm_middleware_builtins::api_key::ApiKey>
+        }
+        "ip-allowlist" | "ephpm-middleware-ip-allowlist" => {
+            BuiltinModule::init::<ephpm_middleware_builtins::ip_allowlist::IpAllowlist>
+        }
+        "maintenance-mode" | "ephpm-middleware-maintenance-mode" => {
+            BuiltinModule::init::<ephpm_middleware_builtins::maintenance_mode::MaintenanceMode>
+        }
+        "redirect" | "ephpm-middleware-redirect" => {
+            BuiltinModule::init::<ephpm_middleware_builtins::redirect::Redirect>
+        }
+        // Response-phase modules: registered via `init_response` so the
+        // static-registry lane runs their response phase too (mirrors a
+        // dlopened module built with `declare!(Type, response)`).
+        "request-id" | "ephpm-middleware-request-id" => {
+            BuiltinModule::init_response::<ephpm_middleware_builtins::request_id::RequestId>
+        }
+        "header-transform" | "ephpm-middleware-header-transform" => {
+            BuiltinModule::init_response::<
+                ephpm_middleware_builtins::header_transform::HeaderTransform,
+            >
         }
         _ => return None,
     })
@@ -908,6 +932,24 @@ mod tests {
             "ephpm_middleware_ratelimit",
             "ephpm-middleware-security-headers",
             "ephpm_middleware_security_headers",
+            "api-key",
+            "api_key",
+            "ephpm-middleware-api-key",
+            "ephpm_middleware_api_key",
+            "ip-allowlist",
+            "ip_allowlist",
+            "ephpm-middleware-ip-allowlist",
+            "maintenance-mode",
+            "maintenance_mode",
+            "ephpm-middleware-maintenance-mode",
+            "redirect",
+            "ephpm-middleware-redirect",
+            "request-id",
+            "request_id",
+            "ephpm-middleware-request-id",
+            "header-transform",
+            "header_transform",
+            "ephpm-middleware-header-transform",
         ] {
             assert!(builtin(name).is_some(), "\"{name}\" should resolve as builtin");
         }
@@ -1386,5 +1428,37 @@ mod tests {
         let out = chain.run_response_phase(&resp_ctx(), "/api/v1", 200, Vec::new(), b"x".to_vec());
         assert!(out.body_replaced);
         assert_eq!(out.body, b"X");
+    }
+
+    /// The compiled-in `header-transform` module, loaded purely from the static
+    /// registry (no cdylib on disk, no dlopen), runs its RESPONSE phase and
+    /// mutates the outgoing response. This proves the builtin lane — not just
+    /// the dlopen lane — drives `ephpm_middleware_invoke_response`-equivalent
+    /// behaviour end to end, which the fully static release binary relies on.
+    #[test]
+    fn builtin_response_phase_runs_via_registry() {
+        let mounts = vec![builtin_mount(
+            "header-transform",
+            None,
+            10,
+            serde_json::json!({
+                "response": { "set": { "X-Served-By": "ephpm" }, "remove": ["X-Powered-By"] }
+            }),
+        )];
+        let chain = MiddlewareChain::load(&mounts).expect("builtin header-transform loads");
+        assert_eq!(chain.len(), 1);
+        // The registry registered it as a response-phase module.
+        assert!(chain.has_response_phase(), "header-transform must expose a response phase");
+
+        let headers = vec![
+            ("Content-Type".to_owned(), "text/html".to_owned()),
+            ("X-Powered-By".to_owned(), "PHP/8.5".to_owned()),
+        ];
+        let out =
+            chain.run_response_phase(&resp_ctx(), "/index.php", 200, headers, b"body".to_vec());
+        // set → header added; remove → header stripped; untouched header kept.
+        assert_eq!(find_header(&out.headers, "X-Served-By"), Some("ephpm"));
+        assert!(!out.headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("X-Powered-By")));
+        assert_eq!(find_header(&out.headers, "Content-Type"), Some("text/html"));
     }
 }

@@ -89,6 +89,13 @@ flate2 = "1"
 brotli = "7"
 zstd = "0.13"
 ipnet = "2"
+# CIDR membership for the `ip-allowlist` builtin middleware (IPv4 + IPv6).
+# Default features only (`serde` is opt-in and not enabled), so no extra
+# transitive deps beyond std IP parsing.
+ipnetwork = "0.21"
+# Constant-time key comparison for the `api-key` builtin middleware. Tiny,
+# no_std, no transitive deps.
+subtle = "2"
 tracing-appender = "0.2"
 # ONE rustls crypto provider for the whole tree: aws-lc-rs (issue #241).
 #

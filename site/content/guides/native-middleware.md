@@ -16,10 +16,12 @@ counter is a single `kv_incr`.
 
 There are **two ways a module runs**:
 
-- **Built-in (static registry).** Four modules — `jwt`, `cors`,
-  `ratelimit`, `security-headers` — are compiled into **every** ePHPm
-  binary. `library = "jwt"` just works: no shared library on disk, no
-  `dlopen`, no special build.
+- **Built-in (static registry).** Ten official modules — `jwt`, `cors`,
+  `ratelimit`, `security-headers`, `api-key`, `ip-allowlist`,
+  `maintenance-mode`, `redirect`, `request-id`, and `header-transform` — are
+  compiled into **every** ePHPm binary. `library = "jwt"` just works: no
+  shared library on disk, no `dlopen`, no special build. Two of them
+  (`request-id`, `header-transform`) also run in the **response phase**.
 - **Dynamic (shared library).** Custom out-of-tree modules are `.so` /
   `.dylib` / `.dll` files speaking a small, versioned C ABI, loaded once at
   startup via `dlopen` (`LoadLibrary` on Windows). This works out of the
@@ -121,8 +123,10 @@ the mount.
 The `library` value is checked against the **builtin registry first**.
 Each built-in answers to its short name and its crate name, with `-` and
 `_` interchangeable: `jwt`, `cors`, `ratelimit` (also `rate-limit`),
-`security-headers`, and the `ephpm-middleware-*` / `ephpm_middleware_*`
-long forms. Builtin mounts never touch the filesystem.
+`security-headers`, `api-key`, `ip-allowlist`, `maintenance-mode`,
+`redirect`, `request-id`, `header-transform`, and the
+`ephpm-middleware-*` / `ephpm_middleware_*` long forms. Builtin mounts
+never touch the filesystem.
 
 Anything else is resolved as a shared library. A value containing a path
 separator or a file extension is used as-is. A bare name tries, in each
@@ -260,9 +264,12 @@ files too — ships as
 
 ## The built-in modules
 
-All four are compiled into every ePHPm binary and run in-process — the
-sections below apply identically whether you mount them by short name
-(built-in) or dlopen their cdylib builds on a dynamic binary.
+All ten are compiled into every ePHPm binary and run in-process — mount
+them by short name (`library = "jwt"`) with no shared library on disk.
+`request-id` and `header-transform` additionally run in the response phase.
+Loadable cdylib builds of the same implementations (for the dlopen lane, or
+as authoring templates) live in the
+[`ephpm/middleware-examples`](https://github.com/ephpm/middleware) repo.
 
 ### `security-headers`
 
@@ -351,6 +358,111 @@ Note this is a *fixed-window* limiter (a full window's allowance can be
 consumed instantly at a window boundary), and it is distinct from the
 built-in connection-level limiter in `[server.limits]` — the two are
 independent.
+
+### `api-key`
+
+Validates an API key on the request before PHP runs, then forwards the
+resolved **consumer identity** to PHP. A recognised key `REWRITE`s the
+request, injecting the consumer id in a header PHP reads; a missing or
+unrecognised key short-circuits with `401` (PHP never runs). Static keys are
+compared **constant-time** (`subtle`), and the presented key is never logged.
+At least one of `keys` / `kv_key_template` must be configured.
+
+| key | default | meaning |
+|-----|---------|---------|
+| `header` (string) | `"X-Api-Key"` | request header carrying the key |
+| `query_param` (string) | unset (disabled) | also accept the key from this query parameter — off by default, since URLs leak into logs |
+| `keys` (object) | unset | static `key → consumer-id` map |
+| `kv_key_template` (string) | unset | KV lookup key with a `<key>` placeholder (e.g. `apikey:<key>`); the stored value is the consumer id |
+| `consumer_header` (string) | `"X-Consumer-Id"` | header injected for PHP with the resolved consumer id |
+
+### `ip-allowlist`
+
+Allows or denies requests by client IP against CIDR lists (IPv4 + IPv6).
+The client IP is taken from the host's trusted-proxy-resolved value — this
+module never parses `X-Forwarded-For` itself. **Fail-closed:** a malformed
+CIDR fails startup, and an unparseable client IP is denied unless
+`default = "allow"`. `deny` always wins over `allow`.
+
+| key | default | meaning |
+|-----|---------|---------|
+| `allow` (array of CIDR strings) | `[]` | client IPs allowed through; a bare address is `/32` (v4) or `/128` (v6) |
+| `deny` (array of CIDR strings) | `[]` | client IPs rejected with `403`; takes precedence over `allow` |
+| `default` (string) | `"deny"` | verdict when no rule matches: `"allow"` or `"deny"` |
+
+### `maintenance-mode`
+
+Flips a tenant into a `503` holding page the instant a per-site flag appears
+in the embedded (cluster-replicated) KV store — no redeploy. Per request it
+builds a per-site key from `key_template` (default `mw:maintenance:<vhost>`)
+and reads it; a truthy value serves the holding page. **Fail-open by
+design:** a KV blip means CONTINUE, so a transient hiccup can't black-hole
+every tenant. Never use it as an access-control gate.
+
+| key | default | meaning |
+|-----|---------|---------|
+| `key_template` (string) | `"mw:maintenance:<vhost>"` | KV key checked per request; `<vhost>` is substituted |
+| `retry_after` (integer seconds) | `300` | `Retry-After` header on the 503 |
+| `body` (string) | built-in minimal HTML | holding-page body |
+| `content_type` (string) | `"text/html; charset=utf-8"` | holding-page `Content-Type` |
+| `bypass_ips` (array of strings) | unset | exact IPs or CIDR ranges whose requests continue during maintenance |
+| `bypass_paths` (array of strings) | unset | path prefixes kept live (e.g. `/healthz`) |
+
+### `redirect`
+
+Enforces canonical URLs with a single `301`/`308` **before** PHP runs.
+Composes scheme, host, and trailing-slash rules, computes the canonical URL
+once, and redirects only when the request is not already canonical (so it
+can never loop). Since the v1 ABI exposes no request scheme, the current
+scheme is read from `forwarded_proto_header` (default `X-Forwarded-Proto`).
+
+| key | default | meaning |
+|-----|---------|---------|
+| `force_https` (bool) | `false` | redirect `http` → `https` |
+| `canonical_host` (string) | unset | `"www"` forces apex → `www.`; `"apex"` (alias `"non-www"`) strips a leading `www.` |
+| `host_map` (object) | unset | explicit `source-host` → `canonical-host` map; wins over `canonical_host` |
+| `trailing_slash` (string) | unset | `"add"` or `"strip"` (root and file-like paths are left alone) |
+| `status` (integer) | `308` | redirect status — `301` or `308` |
+| `forwarded_proto_header` (string) | `"X-Forwarded-Proto"` | header the current scheme is derived from |
+
+### `request-id`
+
+**Request + response phase.** Gives every request a stable correlation id,
+injects it for PHP (`$_SERVER['HTTP_X_REQUEST_ID']`), and echoes it on the
+response — so the access log, the application log, and the client all share
+one id. The response phase guarantees the header even on responses no request
+phase touched (static files), and is idempotent on the PHP path. An inbound
+id is trusted only when `trust_inbound` is on **and** it is a short, printable
+ASCII token (no CR/LF smuggling).
+
+| key | default | meaning |
+|-----|---------|---------|
+| `header` (string) | `"X-Request-Id"` | request/response header carrying the id |
+| `trust_inbound` (bool) | `false` | reuse a well-formed inbound value instead of generating |
+
+### `header-transform`
+
+**Request + response phase.** Sets request headers PHP sees (before PHP runs)
+and sets/removes response headers on the way out — on **every** response (PHP,
+static file, error page). Both request and response `set` are replace-or-add;
+header **removal is response-side only** (the v1 ABI request phase can only
+override a request header, not delete one — a request-side `remove` is
+rejected at `init` rather than silently ignored).
+
+```toml
+[middleware.config.request]
+set = { "X-Env" = "prod" }
+
+[middleware.config.response]
+set    = { "X-Served-By" = "ephpm" }
+remove = ["Server", "X-Powered-By"]
+```
+
+| section | key | effect |
+|---------|-----|--------|
+| `request` | `set` (object) | replace-or-add each request header PHP sees |
+| `response` | `set` (object) | replace-or-add each response header |
+| `response` | `remove` (array) | delete each response header (case-insensitive) |
 
 ## The dynamic lane
 
@@ -453,9 +565,11 @@ cargo build --release -p my-auth
 
 The artifact lands at `target/release/lib<crate_name>.so`; a bare
 `library = "<crate_name>"` mount finds the `lib<name>.so` form through
-the search path. The four in-tree modules build exactly the same way
-(`-p ephpm-middleware-jwt -p ephpm-middleware-cors
--p ephpm-middleware-ratelimit -p ephpm-middleware-security-headers`).
+the search path. The ten official modules are already compiled into every
+ePHPm binary (mount them by short name); loadable cdylib builds of the same
+implementations, useful as authoring templates, live in the
+[`ephpm/middleware-examples`](https://github.com/ephpm/middleware) repo and
+build exactly the same way.
 
 Build on a distro whose glibc is not newer than the deployment target's
 (the usual glibc forward-compatibility rule — a module built on Debian 12
@@ -539,6 +653,5 @@ naming the faulting `.so` and function before it dies — see
 Planned — not yet implemented: request-body access from middleware, an
 async `invoke` variant, hot reload of modules, per-vhost mounts, a WASM
 loader for sandboxed modules, and the wider module catalog (basic-auth,
-IP lists, webhook signatures, GeoIP, response cache, OpenTelemetry,
-request-id). The design notes live in the git history of the roadmap page
-this guide replaced.
+webhook signatures, GeoIP, response cache, OpenTelemetry). The design notes
+live in the git history of the roadmap page this guide replaced.

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The in-tree ePHPm middleware implementations (jwt, cors, ratelimit, security-headers) as plain Rust types — compiled into every ePHPm binary via the static registry"
+description = "The in-tree ePHPm official middleware implementations (jwt, cors, ratelimit, security-headers, api-key, ip-allowlist, maintenance-mode, redirect, request-id, header-transform) as plain Rust types — compiled into every ePHPm binary via the static registry"
 
 # Deliberately rlib-only and free of C ABI exports: `ephpm-server` links this
 # crate into the (possibly fully static) binary. The loadable cdylib shells
@@ -20,6 +20,12 @@ serde_json.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 base64ct.workspace = true
+# ip-allowlist: CIDR containment for v4+v6. Tiny, MIT/Apache-2.0; std handles
+# IP parsing, ipnetwork only does the network-membership test.
+ipnetwork.workspace = true
+# api-key: constant-time key comparison (no_std, no transitive deps) — closes
+# the timing oracle a naive `==` would open.
+subtle.workspace = true
 
 [dev-dependencies]
 ephpm-middleware = { workspace = true, features = ["host"] }

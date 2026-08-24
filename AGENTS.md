@@ -188,7 +188,7 @@ The project has a working Cargo workspace. PHP embedding is fully implemented an
 
 ZTS PHP runs concurrently: each `spawn_blocking` thread auto-registers with TSRM and gets its own PHP context — no dedicated worker pool. Shipped subsystems beyond core embedding: in-process MySQL DB proxy with pooling, in-process KV store (RESP + SETNX), SWIM gossip clustering, single-node and clustered embedded Turso (litewire + the in-process Turso engine; clustered replicates via the in-process Turso CDC path — no sqld sidecar), primary election + failover, query stats with Prometheus metrics, and a native PHP session handler backed by the KV tier. As of v0.7.0 the rusqlite backend and sqld were removed — Turso is the only embedded SQLite-family engine.
 
-Native middleware shipped: a static builtin registry (`jwt`, `cors`, `ratelimit`, `security-headers` compiled into every binary) plus a dlopen C-ABI lane for out-of-tree modules — the Linux release binary is glibc-dynamic, so the dlopen lane (and `[php] extensions` shared-extension loading) works out of the box. Implementations live in `ephpm-middleware-builtins`; the `ephpm-middleware-*` crates are cdylib shells (their `declare!` exports collide if linked into one binary — never add them as server deps). Active roadmap items (specs landed, no code yet): OPcache clustering with per-vhost preload.
+Native middleware shipped: a static builtin registry (ten official modules — `jwt`, `cors`, `ratelimit`, `security-headers`, `api-key`, `ip-allowlist`, `maintenance-mode`, `redirect`, `request-id`, `header-transform` — compiled into every binary; `request-id`/`header-transform` also run the response phase via `BuiltinModule::init_response`) plus a dlopen C-ABI lane for out-of-tree modules — the Linux release binary is glibc-dynamic, so the dlopen lane (and `[php] extensions` shared-extension loading) works out of the box. Implementations live in `ephpm-middleware-builtins`; the in-repo `ephpm-middleware-{jwt,cors,ratelimit,security-headers}` crates are cdylib shells kept as the cross-platform dlopen CI fixtures (their `declare!` exports collide if linked into one binary — never add them as server deps), and cdylib shells for the other six live in the `ephpm/middleware` (examples) repo. Active roadmap items (specs landed, no code yet): OPcache clustering with per-vhost preload.
 
 ## Repository Structure
 
@@ -208,8 +208,8 @@ crates/
 │                       # two-tier KV replication, SQLite primary election
 ├── ephpm-query-stats/  # SQL normalizer + digest tracking + Prometheus metrics
 ├── ephpm-middleware/   # Middleware C ABI + Rust authoring kit + host table + builtin adapter
-├── ephpm-middleware-builtins/  # The four in-tree middleware implementations (rlib, linked into the server)
-├── ephpm-middleware-{jwt,cors,ratelimit,security-headers}/  # cdylib shells for the dlopen lane
+├── ephpm-middleware-builtins/  # The ten official middleware implementations (rlib, linked into the server)
+├── ephpm-middleware-{jwt,cors,ratelimit,security-headers}/  # cdylib shells kept as the dlopen CI fixtures (other six shells live in the examples repo)
 ├── ephpm-e2e/          # E2E test suite — excluded from workspace; runs bare-process via `cargo xtask e2e` (opt-in Kind path is `cargo xtask k8s-e2e`)
 └── xtask/              # Build tooling — release, php-sdk, e2e (bare-process default), k8s-e2e/k8s-e2e-up/k8s-e2e-down (opt-in)
 ```
