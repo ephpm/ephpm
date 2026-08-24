@@ -1365,8 +1365,10 @@ dependencies = [
  "ephpm-kv",
  "ephpm-middleware",
  "hmac 0.12.1",
+ "ipnetwork",
  "serde_json",
  "sha2 0.10.9",
+ "subtle",
 ]
 
 [[package]]
@@ -2453,6 +2455,12 @@ name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+
+[[package]]
+name = "ipnetwork"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
 
 [[package]]
 name = "iri-string"

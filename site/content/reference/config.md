@@ -593,9 +593,12 @@ and the membership check is per-host and trusts the TCP source address.
 ## `[[middleware]]`
 
 Native middleware mounts — repeatable array-of-tables. Each mount resolves
-against the **builtin registry first**: the four in-tree modules (`jwt`,
-`cors`, `ratelimit`, `security-headers`) are compiled into every binary and
-run in-process — no shared library on disk, no `dlopen`. Any other name
+against the **builtin registry first**: the ten official modules (`jwt`,
+`cors`, `ratelimit`, `security-headers`, `api-key`, `ip-allowlist`,
+`maintenance-mode`, `redirect`, `request-id`, `header-transform`) are
+compiled into every binary and run in-process — no shared library on disk,
+no `dlopen`. `request-id` and `header-transform` also run in the response
+phase. Any other name
 loads a shared library (`.so`/`.dylib`/`.dll`) at startup. Loading is
 fail-fast: a builtin rejecting its config, an unresolvable library, a
 missing ABI symbol, or a failing module `init` aborts server startup. The
@@ -614,7 +617,7 @@ at startup) — see the guide's
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `library` | string | **required** | Builtin name (`jwt`, `cors`, `ratelimit`/`rate-limit`, `security-headers`, or their `ephpm-middleware-*` long forms; `-`/`_` interchangeable), a bare module name resolved through the middleware search path (`<name>.<os>-<arch>.<ext>`, `lib<name>.<ext>`, `<name>.<ext>` in the working directory, `$EPHPM_MIDDLEWARE_DIR`, then `/usr/local/lib/ephpm/middleware`), or an explicit path (any value containing a path separator or file extension). Must not be empty. |
+| `library` | string | **required** | Builtin name (`jwt`, `cors`, `ratelimit`/`rate-limit`, `security-headers`, `api-key`, `ip-allowlist`, `maintenance-mode`, `redirect`, `request-id`, `header-transform`, or their `ephpm-middleware-*` long forms; `-`/`_` interchangeable), a bare module name resolved through the middleware search path (`<name>.<os>-<arch>.<ext>`, `lib<name>.<ext>`, `<name>.<ext>` in the working directory, `$EPHPM_MIDDLEWARE_DIR`, then `/usr/local/lib/ephpm/middleware`), or an explicit path (any value containing a path separator or file extension). Must not be empty. |
 | `match` | string | (none) | Glob the request path must match for the mount to run. `*` matches any character sequence, including `/`. Unset = every PHP-bound request. |
 | `order` | u32 | **required** | Chain position; lower runs first. Equal orders keep declaration order. |
 | `config` | inline table | (none) | Arbitrary module configuration, serialised to JSON and passed to the module's `init`. |

@@ -66,8 +66,10 @@ they are not this document's subject.
 
 ### 2.2 The static middleware registry (PR #123, this branch)
 
-- `ephpm-middleware-builtins` holds the four in-tree middleware as plain
-  Rust types; `ephpm-server` links it as an rlib and maps names via
+- `ephpm-middleware-builtins` holds the ten official middleware as plain
+  Rust types (`request-id` / `header-transform` also implement the response
+  phase, registered via `BuiltinModule::init_response`); `ephpm-server` links
+  it as an rlib and maps names via
   `fn builtin(name) -> Option<BuiltinBuilder>`; execution goes through
   `ephpm_middleware::builtin::BuiltinModule` (no FFI, works fully static).
 - **Hard-won constraint:** the C-ABI `declare!` exports
