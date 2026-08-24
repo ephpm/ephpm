@@ -11,6 +11,7 @@ pub mod opcache;
 #[cfg(feature = "otlp")]
 pub mod otlp;
 pub mod privdrop;
+pub mod proxy;
 pub mod rate_limit;
 pub mod router;
 pub mod screened_backend;
