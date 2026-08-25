@@ -1,31 +1,34 @@
-# ePHPm — Embedded PHP Manager
+# ePHPm (Embedded PHP Manager)
 
-Run PHP applications without the infrastructure. No PHP-FPM, no MySQL server, no Redis, no reverse proxy, no certbot. One binary, one config file. Drop in WordPress or Laravel and go. When you need more, it's already built in: MySQL connection pooling, read/write splitting, a Redis-compatible KV store, clustered SQLite with automatic failover, TLS, and Prometheus metrics. One binary from `localhost` to production — same runtime in development, CI, staging, and prod. No environment drift, no deployment surprises.
+Designed by [@luthermonson](https://github.com/luthermonson) in Arizona 🌵 Assembled in [Claude Opus](https://claude.ai).
 
-Designed by [@luthermonson](https://github.com/luthermonson) in Arizona 🌵 Assembled in [Claude Opus 4.6](https://claude.ai).
+I began my software career using PHP and like many I wasn't skilled enough about systems to know how to improve the speed in my PHP applications and just used common practices in the community to bolt on extra products and use shared memory caches. I moved on from PHP and entered cloud-native and have been writing a lot of go and working on massive products like managed kubernetes services. Now, 10yrs later I'm stretching my legs with AI and combining the last 20yrs of my software career to try and improve the things I didn't like about the bolt on deployments in PHP and combine it with the simplicity I enjoyed producing go binaries.
 
-## Why ePHPm?
+### What ePHPm is NOT:
+Core functionality is an opinionated stack with sane defaults but it's not opinionated, everything can be overridden using config and php.ini to tune your PHP applications as they all have their own nuances. ePHPm will never be closed source or under a business license and all repos in the organization will remain 100% MIT, the PHP community is very opensource first and that is a position this project will respect.
 
-How ePHPm compares to other ways of running PHP with a webserver.
+### What ePHPm IS:
+The simplest way to convey this project is to name what it is trying to replace and outline our primary engineering goals. 
 
-| | ePHPm | FrankenPHP | RoadRunner | Swoole | Apache + mod_php | Nginx + php-fpm |
-|---|---|---|---|---|---|---|
-| Language | Rust | Go (CGO) | Go | PHP + C | C | C |
-| Dispatch to PHP | <1 μs (in-process C call) | ~2–3 μs (CGO crossings) | ~10–50 μs (IPC to worker) | <1 μs (in-process) | <1 μs (in-process) | ~50–100 μs (FastCGI socket) |
-| Worker mode (boot app once) | Built-in (`mode = "worker"`; native Octane + WordPress adapters) | Built-in | Built-in (core model) | Built-in (requires app rewrite) | No | No |
-| Server GC pauses | None | Go GC | Go GC | None | None | None |
-| Binary | Single static binary | Caddy module | Go binary + PHP workers | PHP + extension | Apache + modules | Nginx + separate FPM |
-| DB proxy + connection pooling | Built-in (MySQL wire, R/W split) | No | No | No | No | No |
-| Embedded DB | SQLite via litewire | No | No | No | No | No |
-| Built-in KV store | Yes (RESP compatible, in-process) | No | No | No | No | No |
-| Query stats (Prometheus) | Built-in | No | No | No | No | No |
-| Auto TLS (ACME) | Built-in | Via Caddy | No | No | No | No |
-| Clustering | Gossip (SWIM) | No | No | Multi-process (single node) | No | No |
-| Virtual hosts | Built-in (directory-based) | Via Caddy | No | No | `<VirtualHost>` | `server` blocks |
-| Install size | ~40 MB (varies by PHP extensions) | ~150 MB | ~60–70 MB (rr + PHP) | ~35–45 MB (PHP + .so) | ~50–60 MB (Apache + PHP) | ~40–50 MB (Nginx + PHP) |
-| PHP compatibility | Drop-in | Drop-in | Drop-in (worker mode requires PSR-7) | Drop-in (async features require rewrite) | Native (100%) | Native (100%) |
-| Deployment | Single binary | Requires Caddy | Multi-process | Requires PHP + Swoole extension | Apache + modules | Separate services |
-| Container-friendly | ✓ (single binary) | ✓ (Caddy module) | ✓ | ⚠️ (PHP + extension) | ⚠️ (heavier) | ⚠️ (two services) |
+First, it needed to be written in Rust to completely avoid the heavy `cgo` execution tax that platforms like FrankenPHP face when embedding `libphp.a`. Crossing the Go-to-C runtime boundary introduces structural latency and if you want to achieve peak performance then Rust is the ideal modern language to combine with C using zero-overhead and native FFI pointers. 
+
+Second, it completely eliminates localhost loopback network hops. While local TCP connections and Unix sockets (used by PHP-FPM and RoadRunner) are fast, they still incur unavoidable OS kernel context-switching and protocol serialization taxes. 
+
+* **Web Server:** Replaces Nginx by binding an in-process, high-concurrency [Tokio](https://tokio.rs) + [Hyper](https://docs.rs) network stack.
+* **Process Manager:** Replaces PHP-FPM with our custom, resource-aware `fpm_engine` thread manager.
+* **Shared Memory Cache:** Replaces standalone Redis with a concurrent, thread-safe [DashMap](https://docs.rs) key-value store (supports clustering)
+* **Database:** Replaces external MySQL with an embedded, zero-dependency combination of [Turso](https://turso.tech/) and its underlying [libSQL](https://github.com/tursodatabase/libsql) relational engine (supports clustering)
+
+ePHPm has also packed a highly robust and cloud-native feature set by drawing direct inspiration from other modern runtimes. This includes automatic ACME TLS certificate management and server-level middleware handlers (similar to RoadRunner and FrankenPHP), alongside an in-process SQL proxy with connection pooling and slow query logging inspired directly by ProxySQL. Combined with native cluster synchronization, OpenTelemetry tracing (OTLP), and container-aware runtime autotuning, ePHPm is fully prepared for modern cloud environments.
+
+### How to use it:
+Run `ephpm dev` locally from your laptop (with native macOS and Windows support) and drop it straight into your CI/CD pipelines using our off-the-shelf OCI container images. You can also safely alias the binary to act as your global system PHP CLI with 100% scripting compatibility:
+
+```bash
+alias php="ephpm php"
+```
+
+When you are ready to scale to production, you can deploy high-availability clusters using the exact same code paths running seamlessly from your local development machine, through CI, and straight into production. Need to use an external database just configure the SQL proxy and point your app to localhost:3306 to gain performance boosts from connection pooling.
 
 ## Install
 
@@ -72,25 +75,6 @@ sudo ephpm logs           # tail the service log (--follow to follow)
 ```bash
 sudo ephpm uninstall              # remove binary, service, and data dir
 sudo ephpm uninstall --keep-data  # keep config and SQLite databases
-```
-
-### Build from Source
-
-For contributors or custom builds. Requires Rust 1.88+.
-
-```bash
-# Stub mode (no PHP, fast iteration on HTTP/routing logic)
-cargo build
-cargo run -- serve --config ephpm.toml
-
-# Release binary with PHP embedded
-# Prerequisites: git, curl, tar, build-essential, pkg-config, libclang-dev
-# The PHP SDK (libphp.a + headers) is downloaded from github.com/ephpm/php-sdk releases —
-# no PHP CLI, Composer, or static-php-cli toolchain required.
-cargo xtask release       # → target/release/ephpm
-
-# A locally built binary can self-install too
-sudo ./target/release/ephpm install
 ```
 
 ## Configuration
@@ -182,20 +166,62 @@ role = "auto"
 
 [cluster]
 enabled = true
-join = ["ephpm-headless.default.svc.cluster.local"]
+cluster_id = "ephpm-prod"  # Required: Only nodes with matching IDs will pair
+secret = "YOUR_HIGH_ENTROPY_BASE64_SECRET_HERE"  # Required: Enforces encrypted transport
+join = ["ephpm.default.svc.cluster.local"]
 ```
 
-### How it works under the hood
+### How the in-process database works under the hood
+Single node is very simple and accessed via SAPI functions added to the runtime by ePHPm.
 
 ```
-PHP (pdo_mysql) → litewire (MySQL wire :3306) → SQL Translator → Turso engine (in-process)
+PHP Framework (ephpm driver) ──(Direct FFI)──> SAPI Functions (ephpm_db_query) ──> libSQL/Turso (In-Process)
 ```
 
-[litewire](https://github.com/ephpm/litewire) translates MySQL wire protocol and SQL dialect to SQLite on the fly using `sqlparser-rs`. It's a standalone open-source project — works outside of ePHPm too.
+In a distributed ePHPm cluster, relational data replication is handled at the engine layer by leveraging libSQL’s built-in Change Data Capture (CDC) architecture, completely removing the need for a separate heavy database replication service. Here is exactly how the CDC pipeline coordinates with the gossip protocol and the TCP data plane to maintain a high-availability database cluster and the request with the write shows up on the primary Turso node.
 
-The backend is the in-process [Turso](https://github.com/tursodatabase/turso) engine (a pure-Rust SQLite rewrite) in both single-node and clustered mode — PHP always sees a MySQL server at `127.0.0.1:3306`. Existing rusqlite/SQLite `.db` files open in place (a cleanly-shut-down database upgrades with no dump/reload).
+```
+[ PHP Write Query ] ──(SAPI/Proxy)──> [ Node A (Elected Primary) ]
+                                                │
+                                       (Local WAL Commit)
+                                                │
+                                     [ libSQL CDC Generator ]
+                                                │
+                                                ▼  (Binary Transaction Log Stream)
+                                       [ Cluster TCP Plane ]
+                                          /           \
+                                         ▼             ▼
+                           [ Node B (Replica) ]   [ Node C (Replica) ]
+                             (Apply Log Page)       (Apply Log Page)
+```
 
-See the [database architecture docs](site/content/architecture/database/_index.md) for the full architecture, failover details, and configuration reference.
+If the request is to a read replica Turso node the write will fix itself by syncing the data to the primary.
+
+```
+[ PHP SAPI Write Call ]
+          │
+          ▼
+┌─────────────────────────────────┐
+│        Node B (Replica)         │
+│  ┌───────────────────────────┐  │
+│  │   ePHPm Gossip Layer      │  │ ◄─── Says: "Node A is Primary"
+│  └─────────────┬─────────────┘  │
+│                ▼                │
+│  ┌───────────────────────────┐  │
+│  │ libSQL Client (Replica)   │  │
+│  │  • url: "local.db"        │  │
+│  │  • sync_url: "Node A"     │  │
+│  └─────────────┬─────────────┘  │
+└────────────────┼────────────────┘
+                 │
+                 ▼ (Natively forwarded via libSQL gRPC)
+┌─────────────────────────────────┐
+│        Node A (Primary)         │
+│  ┌───────────────────────────┐  │
+│  │ libSQL Server (Primary)   │  │ ───► Commits to local disk
+│  └───────────────────────────┘  │
+└─────────────────────────────────┘
+```
 
 ## KV Store: Three Ways to Use It, Zero External Services
 
@@ -337,104 +363,24 @@ sites_dir = "/var/www/sites"           # vhost directory
 
 A $3.69/mo Hetzner VM (2 ARM cores, 4 GB RAM) comfortably runs 20 WordPress blogs at ~$0.18/site. See [site/content/guides/virtual-hosts.md](site/content/guides/virtual-hosts.md) and [site/content/roadmap/hosting.md](site/content/roadmap/hosting.md) for full details.
 
-## Project Structure
-
-```
-crates/
-├── ephpm/           CLI binary — clap args, config loading, server boot
-├── ephpm-server/    HTTP server — hyper + tokio, routing, static files, metrics
-├── ephpm-php/       PHP embedding — FFI bindings, SAPI, request/response
-├── ephpm-config/    Configuration — figment, TOML + env var overrides
-├── ephpm-kv/        Embedded KV store — DashMap, RESP2 protocol, TTL/expiry, compression
-├── ephpm-db/        DB proxy — MySQL wire protocol, connection pooling
-└── ephpm-cluster/   Clustering — SWIM gossip (chitchat), hashed key ownership, SQLite election
-```
-
-Key design decisions:
-- **Conditional compilation** — All PHP FFI code is gated behind `#[cfg(php_linked)]`. Stub mode compiles and tests without a PHP SDK.
-- **C wrapper for safety** — PHP uses `setjmp`/`longjmp` for error handling. All Rust→PHP calls go through `ephpm_wrapper.c` with `zend_try`/`zend_catch` guards to prevent stack corruption.
-- **Async I/O, blocking PHP** — tokio handles HTTP connections. PHP execution runs on `spawn_blocking` threads (ZTS).
-- **litewire for SQL** — wire protocol translation is a separate concern; litewire handles it as a library (MySQL/PG/TDS wire → the in-process Turso engine), ePHPm manages the database lifecycle, replication, and config.
-
-## Contributing
-
-### Prerequisites
-
-- **Rust 1.88+** — https://rustup.rs (on Windows, also install [C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/))
-- **Nightly Rust** — `rustup toolchain install nightly` (required for `cargo +nightly fmt`)
-- **cargo-nextest** — `cargo install cargo-nextest --locked`
-- **cargo-deny** — `cargo install cargo-deny --locked`
-- **WSL + Ubuntu** (Windows only) — needed for `cargo xtask release` (see Quick Start above)
-
-See [site/content/developer/getting-started.md](site/content/developer/getting-started.md) for detailed setup instructions including per-platform Rust installation.
-
-### Workflow
-
-Most development uses stub mode — no PHP SDK or container engine needed:
-
-```bash
-# Build (stub mode)
-cargo build
-
-# Run tests (prefer single-crate runs)
-cargo nextest run -p ephpm-server
-
-# Lint (must pass with zero warnings)
-cargo clippy --workspace --all-targets -- -D warnings
-
-# Format (requires nightly)
-cargo +nightly fmt --all
-
-# Dependency audit
-cargo deny check
-```
-
-### Build & test tooling (xtask)
-
-```bash
-cargo xtask doctor          # Check build prerequisites (toolchains, PHP SDK cache, optional tools)
-cargo xtask release         # Download PHP SDK + build ephpm binary (release mode)
-cargo xtask php-sdk         # Download only the prebuilt PHP SDK for the host platform
-cargo xtask e2e             # Run bare-process E2E tests (spawns ephpm on 127.0.0.1, no Kind/Tilt)
-cargo xtask k8s-e2e-install # Opt-in: download kind, tilt, kubectl to ./bin
-cargo xtask k8s-e2e         # Opt-in: run E2E in a Kind cluster via tilt ci
-cargo xtask k8s-e2e-up      # Opt-in: start K8s dev env (tilt dashboard at localhost:10350)
-cargo xtask k8s-e2e-down    # Opt-in: tear down Kind cluster
-```
-
-On Windows, `release` re-invokes itself inside WSL (building a Linux binary from native Windows isn't supported). `php-sdk` is a plain tarball download and works directly on any platform with curl + tar. The PHP SDK is cached at `php-sdk/<version>-<os>-<arch>[-gnu]/` (the `-gnu` libc suffix applies on Linux) — delete that directory to force a re-download.
-
-The default `cargo xtask e2e` spawns bare ephpm processes on 127.0.0.1 — no container engine required. The opt-in `k8s-e2e*` commands require Podman or Docker; run `cargo xtask k8s-e2e-install` to download kind/tilt/kubectl to `./bin/`. See [site/content/developer/testing.md](site/content/developer/testing.md) for details.
-
-### Code conventions
-
-- **Clippy**: Pedantic + all warnings denied. Zero warnings policy.
-- **Formatting**: 2024 edition style, grouped imports. Run `cargo +nightly fmt --all`.
-- **Error handling**: `thiserror` in library crates, `anyhow` in the binary. Always add `.context()`.
-- **Logging**: `tracing` crate — debug for requests, info for lifecycle, warn/error for problems.
-- **Unsafe code**: Safety comment (`// SAFETY:`) before every `unsafe` block explaining invariants.
-- **Documentation**: `///` on public items, `//!` at module level.
-
 ## Docs
 
 - [Getting started](https://ephpm.dev/developer/getting-started/) — Prerequisites, building, IDE setup
-- [Testing strategy](https://ephpm.dev/developer/testing/) — Unit tests, Tilt + Kind E2E, database testing
-- [E2E test coverage](https://ephpm.dev/testing/e2e/) — 170+ tests across single-node and cluster
 - [Architecture decisions](https://ephpm.dev/architecture/) — Language choice, crate design, PHP execution modes
-- [Implementation guide](https://ephpm.dev/architecture/implementation/) — Build system, CI, MVP spec
-- [CLI design](https://ephpm.dev/architecture/cli/) — Command structure, UX principles
-- [Security model](https://ephpm.dev/architecture/security/) — Threat model, FFI safety, trust boundaries
+- [HTTP Server Architecture](https://ephpm.dev) — ZTS concurrency model, Tokio thread integration
 - [Clustering](https://ephpm.dev/architecture/clustering/) — SWIM gossip, hashed key ownership, two-tier KV
-- [DB proxy](https://ephpm.dev/architecture/db-proxy/) — MySQL wire protocol, connection pooling, query analysis
-- [Kubernetes deployment](https://ephpm.dev/architecture/kubernetes/) — Helm chart, StatefulSet, gossip DNS
-- [Observability](https://ephpm.dev/architecture/metrics/) — Prometheus metrics, histogram buckets, phased rollout
-- [Embedded SQL](https://ephpm.dev/architecture/sql/) — litewire integration, Turso engine, single-node vs clustered CDC
-- [Competitive analysis](https://ephpm.dev/analysis/) — FrankenPHP, RoadRunner, Swoole comparisons
+- [KV Store](https://ephpm.dev/architecture/kv-store/) — DashMap design, RESP2 integration, eviction loops
+- [Embedded SQL](https://ephpm.dev) — Litewire integration, Turso engine, zero-dependency data files
+- [DB Proxy & Pooling](https://ephpm.devdb-proxy/) — MySQL wire protocol routing, connection metrics
+- [CLI design](https://ephpm.dev/reference/cli/) — Command structure, clap routing, subcommand definitions
+- [Configuration Reference](https://ephpm.dev) — Exhaustive ephpm.toml key mapping and overrides
+- [Metrics Reference](https://ephpm.dev) — Prometheus endpoint specs and histogram allocation
+- [Competitive Analysis](https://ephpm.dev/analysis/) — Feature map versus historical execution runtimes
+- [Performance Comparison](https://ephpm.dev/analysis/performance-comparison/) — In-process latency models vs FPM, RoadRunner, and Swoole
 
 ## Related Projects
 
 - **[litewire](https://github.com/ephpm/litewire)** — MySQL/PG/TDS wire protocol → SQLite translation proxy. Used by ePHPm for embedded SQL, also works standalone.
 
 ## License
-
 MIT
