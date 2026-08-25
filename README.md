@@ -5,7 +5,7 @@ Designed by [@luthermonson](https://github.com/luthermonson) in Arizona 🌵 Ass
 I began my software career using PHP and like many I wasn't skilled enough about systems to know how to improve the speed in my PHP applications and just used common practices in the community to bolt on extra products and use shared memory caches. I moved on from PHP and entered cloud-native and have been writing a lot of go and working on massive products like managed kubernetes services. Now, 10yrs later I'm stretching my legs with AI and combining the last 20yrs of my software career to try and improve the things I didn't like about the bolt on deployments in PHP and combine it with the simplicity I enjoyed producing go binaries.
 
 ### What ePHPm is NOT:
-Core functionality is an opinionated stack with sane defaults but it's not opinionated, everything can be overridden using config and php.ini to tune your PHP applications as they all have their own nuances. ePHPm will never be closed source or under a business license and all repos in the organization will remain 100% MIT, the PHP community is very opensource first and that is a position this project will respect.
+Core functionality is an opinionated stack with sane defaults but it's not an opinionated project, everything can be overridden using config and php.ini to tune your PHP applications as they all have their own nuances. ePHPm will never be closed source or under a business license and all repos in the organization will remain 100% MIT, the PHP community is very opensource first and that is a position this project will respect.
 
 ### What ePHPm IS:
 The simplest way to convey this project is to name what it is trying to replace and outline our primary engineering goals. 
