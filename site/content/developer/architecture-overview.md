@@ -821,7 +821,7 @@ This is the same approach FrankenPHP uses.
 | PHP 8.2 | Security-only (until Dec 2026) | Best-effort |
 | PHP 8.3 | Active support (until Dec 2026) | **Supported — in CI (pinned 8.3.33)** |
 | PHP 8.4 | Active support (until Dec 2027) | **Supported — in CI (pinned 8.4.23)** |
-| PHP 8.5 | Active support | **Supported — in CI (pinned 8.5.7)** |
+| PHP 8.5 | Active support | **Supported — in CI (pinned 8.5.9)** |
 
 ### Release Naming
 

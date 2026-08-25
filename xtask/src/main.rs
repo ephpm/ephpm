@@ -15,7 +15,7 @@ mod php_versions;
 /// shorthand (e.g. "8.5") to the specific patch release we publish SDKs for.
 /// Users may also pass a full version explicitly (e.g. "8.5.6") and the
 /// resolver will accept it as-is.
-const PHP_SDK_VERSIONS: &[(&str, &str)] = &[("8.3", "8.3.33"), ("8.4", "8.4.23"), ("8.5", "8.5.7")];
+const PHP_SDK_VERSIONS: &[(&str, &str)] = &[("8.3", "8.3.33"), ("8.4", "8.4.23"), ("8.5", "8.5.9")];
 
 /// Default PHP minor when no version is specified on the command line.
 const DEFAULT_PHP_MINOR: &str = "8.5";
