@@ -377,7 +377,7 @@ spec:
               mountPath: /etc/ephpm
 
         - name: wordpress-install
-          image: ephpm/ephpm:v0.7.5-php8.5.7
+          image: ephpm/ephpm:v0.8.0-php8.5.7
           command:
             - sh
             - -c
@@ -405,7 +405,7 @@ spec:
 
       containers:
         - name: ephpm
-          image: ephpm/ephpm:v0.7.5-php8.5.7
+          image: ephpm/ephpm:v0.8.0-php8.5.7
           command: [ephpm, serve, --config, /etc/ephpm/ephpm.toml]
           ports:
             - name: http
