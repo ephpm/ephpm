@@ -102,6 +102,13 @@ These appear when at least one `[[middleware]]` mount is configured.
 |--------|------|--------|-------------|
 | `ephpm_middleware_invocations_total` | counter | `module`, `action` | Middleware invocations, one per module per matching request. `action` is the verdict: `continue`, `respond`, or `rewrite`. A module `invoke` error (non-zero return, including a caught panic) counts as `respond` — the host fails closed with a 500. |
 
+**PHP mounts** (`library = "php:<path>"`, experimental) share this counter,
+with `module` set to the full `library` string. Their `action` is `continue`,
+`respond` (the mount called `exit()`), or `error` (the mount fataled) — never
+`rewrite`, because PHP expresses a rewrite by assigning to `$_SERVER` and
+detecting that would mean diffing the superglobal on the hot path. Mounts that
+never ran because an earlier one short-circuited are not counted.
+
 ## Worker mode
 
 These appear when `[php] mode = "worker"`.

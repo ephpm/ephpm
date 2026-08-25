@@ -3185,6 +3185,42 @@ impl Router {
         };
         let opcache_watcher = invalidate_version.map(|_| self.opcache_watcher.clone());
 
+        // PHP middleware lane (`library = "php:<path>"`, EXPERIMENTAL).
+        //
+        // Resolved against THIS request's `document_root` — the one
+        // `resolve_site` returned — so in multi-tenant mode the mount names the
+        // tenant's own file, executes in the tenant's own PHP context, and has
+        // exactly the reach the tenant's `index.php` already has. There is no
+        // path here by which a mount could read or run another tenant's code.
+        //
+        // The glob is matched against the post-native-chain `path`: PHP mounts
+        // are the later phase, so they see the request as the native modules
+        // left it.
+        // Walked ONCE: `php_mounts` allocates, and the metric labels ride along
+        // in the same pass so the closure can name a mount without reaching
+        // back into the router. The `has_php_mounts` guard keeps all of it off
+        // the hot path for every server that mounts no PHP middleware — the
+        // default, and for now the overwhelming majority.
+        let (php_middleware, php_middleware_names): (
+            Vec<ephpm_php::request::PhpMiddleware>,
+            Vec<String>,
+        ) = match self.middleware_chain.as_ref() {
+            Some(chain) if chain.has_php_mounts() => chain
+                .php_mounts(&path)
+                .into_iter()
+                .map(|mount| {
+                    (
+                        ephpm_php::request::PhpMiddleware {
+                            script: document_root.join(&mount.script),
+                            config_json: mount.config_json.clone(),
+                        },
+                        mount.name.clone(),
+                    )
+                })
+                .unzip(),
+            _ => (Vec::new(), Vec::new()),
+        };
+
         // The per-request execution body — IDENTICAL for both fpm engines.
         // Both the default `spawn_blocking` path and the dedicated pool run this
         // exact closure, so per-request parity (per-site DB session, KV
@@ -3284,7 +3320,8 @@ impl Router {
             // interval process-wide. No-op in stub mode.
             ephpm_php::jit_metrics::maybe_sample();
 
-            PhpRuntime::execute(PhpRequest {
+            let had_php_middleware = !php_middleware.is_empty();
+            let result = PhpRuntime::execute(PhpRequest {
                 method,
                 uri,
                 path,
@@ -3300,7 +3337,38 @@ impl Router {
                 is_https,
                 protocol,
                 env_vars,
-            })
+                middleware: php_middleware,
+            });
+
+            // The chain outcome lives in a `__thread` int in the C wrapper, so
+            // it has to be read here — on the blocking thread that just ran the
+            // request — not back in the async handler.
+            //
+            // Mounts that ran and fell through are counted `continue`; the one
+            // that ended the chain gets `respond` (it called `exit()`) or
+            // `error` (it fataled); mounts that never ran are not counted at
+            // all. There is deliberately no `rewrite` action for this lane —
+            // PHP expresses a rewrite by assigning to `$_SERVER`, and detecting
+            // that would mean diffing the superglobal on the hot path, so a
+            // `rewrite` label here would be invented rather than observed.
+            if had_php_middleware {
+                let (outcome, ran) = PhpRuntime::middleware_outcome();
+                for (i, name) in php_middleware_names.iter().take(ran).enumerate() {
+                    let terminal = i + 1 == ran;
+                    let action = if terminal {
+                        outcome.label()
+                    } else {
+                        ephpm_php::request::MiddlewareOutcome::Continue.label()
+                    };
+                    counter!(
+                        "ephpm_middleware_invocations_total",
+                        "module" => name.clone(),
+                        "action" => action
+                    )
+                    .increment(1);
+                }
+            }
+            result
         };
 
         // `php.execute` span: brackets exactly the region `php_start` /

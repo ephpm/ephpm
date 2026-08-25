@@ -92,6 +92,7 @@ fn make_request(script: PathBuf, sid: Option<&str>) -> PhpRequest {
             // session.use_strict_mode mirrors what the task spec asked for.
             ("PHP_INI_SCAN_DIR".into(), String::new()),
         ],
+        middleware: Vec::new(),
     }
 }
 

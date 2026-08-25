@@ -1,0 +1,40 @@
+# Demo config for the PHP middleware lane (`library = "php:<path>"`).
+#
+# EXPERIMENTAL. Middleware written in plain PHP — no compiler, no `.so`, no C.
+# The script runs INSIDE the PHP request, immediately before the application
+# script (auto_prepend_file's position), so it inherits the request's
+# superglobals, open_basedir, session/temp roots, OPcache vhost, per-site DB
+# session and KV keyspace by construction.
+#
+# Run from this directory:
+#   ephpm serve --config ephpm.toml
+#
+# `document_root` is relative to your shell's working directory, so either run
+# from here or make it absolute.
+
+[server]
+listen = "127.0.0.1:8099"
+document_root = "public"
+
+# Left at the default on purpose:
+#   fallback = ["$uri", "$uri/", "/index.php?$query_string"]
+# That is what routes /api/v1/whoami (no such file) to the front controller
+# public/index.php — the request the middleware guards and REWRITEs.
+
+[php]
+mode = "fpm"
+
+# ── the middleware mount ───────────────────────────────────────────────────
+#
+# `library = "php:<path>"` selects the PHP lane. The path is relative to the
+# REQUEST's document root — here public/middleware.php. No build step: PHP
+# compiles it (and OPcache caches it) on first use.
+#
+# `match` scopes the mount to /api/*; other paths skip the lane entirely.
+# `config` is handed to the script verbatim as JSON via
+# `ephpm_middleware_config()`.
+[[middleware]]
+library = "php:middleware.php"
+match = "/api/*"
+order = 30
+config = { realm = "admin" }

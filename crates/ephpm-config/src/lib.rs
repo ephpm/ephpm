@@ -53,7 +53,7 @@ pub struct Config {
     pub opcache: OpcacheConfig,
 }
 
-/// One native middleware mount (`[[middleware]]`).
+/// One middleware mount (`[[middleware]]`).
 ///
 /// ```toml
 /// [[middleware]]
@@ -61,16 +61,29 @@ pub struct Config {
 /// match = "/api/*"
 /// order = 20
 /// config = { per_ip_rps = 50, burst = 100 }
+///
+/// # EXPERIMENTAL: plain-PHP middleware, no compiler and no shared library.
+/// [[middleware]]
+/// library = "php:middleware.php"
+/// match = "/api/*"
+/// order = 30
 /// ```
 #[derive(Debug, Deserialize)]
 pub struct MiddlewareMount {
-    /// Module to run. Checked against the builtin registry first (`jwt`,
-    /// `cors`, `ratelimit`/`rate-limit`, `security-headers` and their
-    /// `ephpm-middleware-*` long forms are compiled into every binary — no
-    /// dlopen). Anything else is a shared library: either a bare name
-    /// (resolved through the middleware search path with a platform suffix,
-    /// e.g. `auth-jwt` → `auth-jwt.linux-x86_64.so`) or an explicit path — a
-    /// value containing a path separator or a file extension is used as-is.
+    /// Module to run. Resolved in three steps:
+    ///
+    /// 1. A `php:` prefix selects the **PHP middleware lane** (EXPERIMENTAL) —
+    ///    the rest of the value is a path to a `.php` file, relative to the
+    ///    request's document root. See [`MiddlewareMount::php_script`].
+    /// 2. Otherwise the value is checked against the builtin registry (`jwt`,
+    ///    `cors`, `ratelimit`/`rate-limit`, `security-headers` and their
+    ///    `ephpm-middleware-*` long forms are compiled into every binary — no
+    ///    dlopen).
+    /// 3. Anything else is a shared library: either a bare name (resolved
+    ///    through the middleware search path with a platform suffix, e.g.
+    ///    `auth-jwt` → `auth-jwt.linux-x86_64.so`) or an explicit path — a
+    ///    value containing a path separator or a file extension is used as-is.
+    ///
     /// Must not be empty (enforced by [`Config::validate`]).
     pub library: String,
 
@@ -86,11 +99,37 @@ pub struct MiddlewareMount {
     pub order: u32,
 
     /// Arbitrary configuration table for the module, serialised to JSON and
-    /// passed to its `init`.
+    /// passed to its `init`. On a `php:` mount the same JSON is what
+    /// `ephpm_middleware_config()` returns to the script.
     ///
-    /// Default: unset (the module's `init` receives NULL).
+    /// Default: unset (the module's `init` receives NULL; a `php:` mount's
+    /// `ephpm_middleware_config()` returns `null`).
     #[serde(default)]
     pub config: Option<serde_json::Value>,
+}
+
+/// Prefix that selects the PHP middleware lane in `library`.
+pub const PHP_MIDDLEWARE_PREFIX: &str = "php:";
+
+/// Maximum PHP middleware mounts that may run for one request.
+///
+/// Matches `MAX_REQUEST_MIDDLEWARE` in `crates/ephpm-php/ephpm_wrapper.c`;
+/// [`Config::validate`] refuses a config that declares more so the C-side cap
+/// can never silently drop a mount.
+pub const MAX_PHP_MIDDLEWARE: usize = 16;
+
+impl MiddlewareMount {
+    /// The document-root-relative script path when this is a `php:` mount.
+    ///
+    /// `None` for builtin and shared-library mounts. The returned path is the
+    /// raw configured value; [`Config::validate`] has already rejected the
+    /// unsafe shapes (empty, absolute, `..`, backslash, Windows drive prefix),
+    /// so a value that survives validation can be joined onto a document root
+    /// without escaping it.
+    #[must_use]
+    pub fn php_script(&self) -> Option<&str> {
+        self.library.strip_prefix(PHP_MIDDLEWARE_PREFIX)
+    }
 }
 
 /// HTTP server configuration.
@@ -3237,6 +3276,7 @@ impl Config {
 
         // Native middleware: an empty `library` can never resolve, and
         // silently skipping the mount would be a silent no-op config knob.
+        let mut php_mounts = 0usize;
         for (i, mount) in self.middleware.iter().enumerate() {
             if mount.library.is_empty() {
                 return Err(ConfigError::Validation(format!(
@@ -3244,6 +3284,66 @@ impl Config {
                     mount.order,
                 )));
             }
+
+            let Some(script) = mount.php_script() else { continue };
+            php_mounts += 1;
+            let bad = |why: &str| {
+                Err(ConfigError::Validation(format!(
+                    "[[middleware]] entry {i} (library = \"{}\"): {why}",
+                    mount.library,
+                )))
+            };
+
+            if script.is_empty() {
+                return bad("\"php:\" must be followed by a script path");
+            }
+            // A `php:` path is joined onto the REQUEST's document root, which
+            // in multi-tenant mode is the tenant's own directory. Every shape
+            // that could make that join land somewhere else is refused here,
+            // at startup, rather than being re-checked per request:
+            //
+            //   - absolute paths and Windows drive prefixes escape the join
+            //     entirely, and would additionally sit outside every vhost's
+            //     `open_basedir`, so PHP could not load them anyway;
+            //   - `..` walks out of the document root;
+            //   - a backslash is a separator on Windows but an ordinary
+            //     filename character on Unix, so allowing it would make the
+            //     same config mean two different things.
+            if script.starts_with('/') || script.starts_with('\\') {
+                return bad(
+                    "the script path must be relative to the document root, not absolute — \
+                     an operator-owned file shared by every tenant would need a hole in each \
+                     vhost's open_basedir, which this lane deliberately does not create",
+                );
+            }
+            if script.contains('\\') {
+                return bad("the script path must use `/` as its separator, not `\\`");
+            }
+            if script.len() >= 2 && script.as_bytes()[1] == b':' {
+                return bad(
+                    "the script path must be relative to the document root, not a drive path",
+                );
+            }
+            if script.split('/').any(|seg| seg == "..") {
+                return bad("the script path must not contain `..`");
+            }
+            // Worker mode boots the framework once and owns the request loop;
+            // there is no per-request `php_request_startup` to prepend into, so
+            // the mount would never run. Refuse rather than mount a policy
+            // layer that silently does nothing.
+            if self.php.mode == "worker" {
+                return bad(
+                    "PHP middleware is not supported in worker mode (`[php] mode = \"worker\"`) — \
+                     the worker script owns the request loop; use the framework's own middleware \
+                     (PSR-15 / Octane) there",
+                );
+            }
+        }
+        if php_mounts > MAX_PHP_MIDDLEWARE {
+            return Err(ConfigError::Validation(format!(
+                "{php_mounts} `php:` [[middleware]] mounts declared, but at most \
+                 {MAX_PHP_MIDDLEWARE} can run per request",
+            )));
         }
 
         // Fail closed: a multi-tenant RESP listener with no `[kv] secret` would
@@ -5507,6 +5607,117 @@ mod tests {
     // must install it with `EnvVars` — see `crate::test_env`; nothing else in
     // this module may touch `std::env` directly.
     use crate::test_env::EnvVars;
+
+    // ── [[middleware]] library = "php:<path>" ────────────────────────
+
+    /// Load a config from TOML and run `validate`, returning the message.
+    fn validation_error(toml: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, toml).unwrap();
+        match Config::load(&file).unwrap().validate() {
+            Ok(()) => panic!("expected a validation error for:\n{toml}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// A single `php:` mount. Uses a TOML *literal* string so a backslash in
+    /// `library` reaches validation verbatim instead of being an escape.
+    fn php_mount_toml(library: &str) -> String {
+        format!("[[middleware]]\nlibrary = '{library}'\norder = 10\n")
+    }
+
+    #[test]
+    fn php_mount_is_recognised_and_yields_its_script_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, php_mount_toml("php:auth/middleware.php")).unwrap();
+
+        let config = Config::load(&file).unwrap();
+        config.validate().expect("a plain relative path is valid");
+        assert_eq!(config.middleware[0].php_script(), Some("auth/middleware.php"));
+        // Non-`php:` mounts are untouched by the new lane.
+        assert_eq!(
+            MiddlewareMount { library: "jwt".into(), match_pattern: None, order: 0, config: None }
+                .php_script(),
+            None
+        );
+    }
+
+    /// The whole tenant-isolation story rests on the path being joined onto the
+    /// REQUEST's document root. Every shape that could escape that join is
+    /// refused at startup rather than re-checked per request.
+    #[test]
+    fn php_mount_rejects_paths_that_escape_the_document_root() {
+        for (library, expect) in [
+            ("php:", "must be followed by a script path"),
+            ("php:/etc/ephpm/mw.php", "not absolute"),
+            ("php:\\etc\\mw.php", "not absolute"),
+            ("php:C:/mw.php", "not a drive path"),
+            ("php:../../etc/mw.php", "must not contain `..`"),
+            ("php:app/../../mw.php", "must not contain `..`"),
+            ("php:app\\mw.php", "must use `/` as its separator"),
+        ] {
+            let err = validation_error(&php_mount_toml(library));
+            assert!(
+                err.contains(expect),
+                "\"{library}\" should be rejected with {expect:?}: {err}"
+            );
+            assert!(err.contains(library), "the error must name the mount: {err}");
+        }
+    }
+
+    /// A dot-segment that merely *starts* with `..` is a legal filename and
+    /// must not be caught by the traversal check.
+    #[test]
+    fn php_mount_allows_filenames_that_start_with_dots() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, php_mount_toml("php:..hidden/..mw.php")).unwrap();
+        Config::load(&file).unwrap().validate().expect("`..hidden` is a filename, not a traversal");
+    }
+
+    /// Worker mode owns the request loop, so there is no per-request
+    /// `php_request_startup` to prepend into. Refuse rather than mount a policy
+    /// layer that silently never runs.
+    #[test]
+    fn php_mount_is_rejected_in_worker_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let docroot = dir.path().join("public");
+        std::fs::create_dir_all(&docroot).unwrap();
+        std::fs::write(docroot.join("worker.php"), "<?php\n").unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            format!(
+                "[server]\ndocument_root = {docroot:?}\n\
+                 [php]\nmode = \"worker\"\nworker_script = \"worker.php\"\n\
+                 {}",
+                php_mount_toml("php:middleware.php"),
+            ),
+        )
+        .unwrap();
+
+        let err = match Config::load(&file).unwrap().validate() {
+            Ok(()) => panic!("a php: mount under worker mode must be rejected"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("worker mode"), "{err}");
+        assert!(err.contains("PSR-15"), "the error should point at the alternative: {err}");
+    }
+
+    /// The Rust-side cap must match the C wrapper's `MAX_REQUEST_MIDDLEWARE`,
+    /// so a mount can never be silently dropped at request time.
+    #[test]
+    fn php_mounts_beyond_the_per_request_cap_are_rejected() {
+        let mut toml = String::new();
+        for i in 0..=MAX_PHP_MIDDLEWARE {
+            use std::fmt::Write as _;
+            let _ = writeln!(toml, "[[middleware]]\nlibrary = 'php:mw{i}.php'\norder = {i}");
+        }
+        let err = validation_error(&toml);
+        assert!(err.contains(&MAX_PHP_MIDDLEWARE.to_string()), "{err}");
+    }
 
     // ── [server.http3] ───────────────────────────────────────────────
 

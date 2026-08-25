@@ -14,7 +14,10 @@ KV store and the `tracing` logger are one function call away. That's what
 makes a cluster-wide rate limiter a ~100-line module — the replicated
 counter is a single `kv_incr`.
 
-There are **two ways a module runs**:
+There are **two ways a compiled module runs** — plus an experimental
+[PHP lane](#the-php-lane-experimental) for middleware written in plain PHP,
+which trades the "before PHP, before the body" position for not needing a
+compiler at all:
 
 - **Built-in (static registry).** Ten official modules — `jwt`, `cors`,
   `ratelimit`, `security-headers`, `api-key`, `ip-allowlist`,
@@ -663,6 +666,198 @@ int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
 The authoritative definition is
 [`crates/ephpm-middleware/src/abi.rs`](https://github.com/ephpm/ephpm/blob/main/crates/ephpm-middleware/src/abi.rs).
 
+## The PHP lane (experimental)
+
+**Status: experimental.** Middleware written in plain PHP — no compiler, no
+`.so`, no C. A complete, runnable version of the gate below — config, the
+middleware script, an app front controller and `curl` commands for each verdict
+— ships in [`examples/php-middleware`](https://github.com/ephpm/ephpm/tree/main/examples/php-middleware).
+
+```toml
+[[middleware]]
+library = "php:middleware.php"   # relative to the request's document root
+match   = "/api/*"
+order   = 30
+config  = { realm = "admin" }
+```
+
+```php
+<?php
+// middleware.php
+$cfg  = json_decode(ephpm_middleware_config() ?? '{}', true);
+$auth = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+
+if (!str_starts_with($auth, 'Bearer ')) {
+    http_response_code(401);
+    header('WWW-Authenticate: Bearer realm="' . $cfg['realm'] . '"');
+    echo 'missing bearer token';
+    exit;                                    // RESPOND — the app never runs
+}
+
+$_SERVER['HTTP_X_TOKEN'] = substr($auth, 7); // REWRITE
+header('X-Auth-Checked: 1');                 // response header
+// falling off the end = CONTINUE
+```
+
+### Where it runs, and what that costs you
+
+A `php:` mount executes **inside the same PHP request as the application
+script**, immediately before it. That is the position PHP's own
+`auto_prepend_file` occupies; this lane is essentially a first-class,
+multi-file, glob-scoped, config-carrying `auto_prepend_file`.
+
+Running in-request is the entire design. The mount inherits — by
+construction, not by re-implementation — the request's superglobals, its
+`open_basedir`, its `sys_temp_dir` / `session.save_path`, its OPcache vhost,
+its per-site database session, its KV keyspace, its execution timer and its
+crash guard. There is no second PHP context to configure, and therefore no
+second PHP context to get wrong.
+
+The price is the chain position:
+
+```
+native chain (pre-body, outside PHP) → body read → php: mounts → app script
+```
+
+**A `php:` mount cannot reject before the request body transfer.** Avoiding
+that transfer is the main reason the native lane exists, so if your
+middleware's job is to shed load or reject uploads cheaply, write it against
+the native lane. `order` sorts mounts *within* a lane; it cannot interleave
+the two, because no ordering can put PHP before the body read. Startup logs
+the two lanes as separate lines — `middleware chain loaded` for the native
+modules, then a `PHP middleware mounted (EXPERIMENTAL)` line naming the `php:`
+mounts and restating where they run — so the split is never silent:
+
+```
+INFO ephpm_server: middleware chain loaded count=1 modules=["security-headers"]
+INFO ephpm_server: PHP middleware mounted (EXPERIMENTAL) — these run INSIDE the PHP
+     request, after the request body has been read and after every native module, so
+     they cannot reject before the body transfer the way a native module can
+     php_mounts=["php:middleware.php"]
+```
+
+### What it costs
+
+Measured end-to-end over HTTP against a release build (Windows, PHP 8.5,
+OPcache on), 1000 sequential keep-alive requests to a trivial
+`<?php echo 'ok';`, best of 11 rounds. Each middleware does the same work as
+the `security-headers` builtin: three response headers.
+
+| Configuration | Per request | Δ vs baseline |
+|---|---|---|
+| No middleware | 365.7 µs | — |
+| 1 Rust builtin mount | 369.2 µs | **+3.5 µs** |
+| 1 `php:` mount | 377.6 µs | **+11.9 µs** |
+| 3 `php:` mounts | 387.5 µs | **+21.8 µs** (≈ 7 µs/mount) |
+
+Measured in isolation rather than over HTTP, the Rust builtin's marginal cost
+is **476 ns** — the +3.5 µs above is mostly measurement noise on a 366 µs
+baseline. So the two framings, both true:
+
+- **Relative to each other:** a `php:` mount is roughly **20x** a Rust
+  builtin mount. If you are counting microseconds, that gap is real and
+  inherent — one is a direct function call, the other loads and executes a
+  cached op_array.
+- **Relative to the request:** a `php:` mount is about **3% of a trivial PHP
+  request**, and scales linearly per mount. It is nowhere near the "a PHP
+  mount means a second PHP request" cost the lane was designed to avoid —
+  because it isn't a second request; it is one more OPcache-cached script
+  inside the request already running.
+
+Two caveats worth stating plainly:
+
+- **These numbers include HTTP and client overhead**, so the *absolute*
+  baseline is not the cost of PHP alone. The deltas are the meaningful part.
+- **The cost is dominated by fixed per-mount work, not by your PHP.** An
+  empty middleware file measured the same as one setting three headers. What
+  you pay for is engaging the lane and executing a cached op_array; what your
+  middleware actually does is on top.
+
+Two benchmarks ship with the tree. Both are `#[ignore]`d, print timings, and
+assert nothing:
+
+```bash
+cargo test -p ephpm-php    --test php_middleware bench_php_mount -- --ignored --nocapture
+cargo test -p ephpm-server --lib bench_builtin                   -- --ignored --nocapture
+```
+
+The `ephpm-php` one runs **without OPcache** (the bare embed harness has no
+`php.ini`), so it recompiles every mounted file on every request. Treat it as
+an upper bound for a cold cache, not as the steady-state cost — the table
+above is the steady state.
+
+**Historical note, because it is the useful part.** The first implementation
+matched PHP's `auto_prepend_file` exactly by `chdir`-ing to the application
+script's directory around the chain. That single getcwd + chdir + restore
+measured **~55 µs per request on Windows** — nearly 5x the cost of everything
+else the lane does — so it was removed. The consequence is the `__DIR__` rule
+below. None of this was visible from reading the code; it took the benchmark.
+
+### Writing a mount
+
+- **Use `__DIR__` for file paths.** The chain does not change the working
+  directory (see above). A relative `include`/`require` still resolves against
+  the *including file's* own directory, which is PHP's normal rule — but a
+  bare relative path handed to `fopen()`, `file_get_contents()`, etc. resolves
+  against the server's working directory, not the document root.
+- Keep it short. Every mount runs on every matching request, before the
+  application. If the logic needs the framework booted, it belongs in the
+  framework, not here.
+
+### Multi-tenancy
+
+`php:` paths resolve against the **request's** document root — the one
+`resolve_site` returned — never against the `Host` header and never against a
+server-wide directory. In `sites_dir` mode that means each site supplies its
+own `middleware.php`, and it runs in that site's own PHP context. A mount
+therefore has exactly the reach that tenant's `index.php` already has, and no
+more.
+
+Sharing one operator-owned file across every tenant is **not supported**:
+that file would have to be inside each vhost's `open_basedir`, and punching
+that hole is a tenant-isolation regression this lane declines to make.
+Absolute paths are rejected at startup when `sites_dir` is set — and, along
+with `..`, `\`, and drive prefixes, rejected everywhere.
+
+### Failure semantics — fail closed, always
+
+Startup catches the case it can: in **single-site** mode the path is fully
+determined, so a mount whose script is missing is a **startup error** naming
+the mount and the absolute path — the same fail-fast an unresolvable shared
+library gets. In **multi-site** mode the path resolves per tenant and sites can
+appear later, so startup warns instead and the per-request rule below applies.
+
+| Failure | Result |
+|---|---|
+| Missing file | 500; the application script does **not** run (startup error instead, in single-site mode) |
+| Parse error | 500; application script does not run |
+| Uncaught exception | 500; application script does not run |
+| Fatal (`E_ERROR`) | 500; application script does not run |
+| `exit()` | The mount's own status/headers/body are returned; remaining mounts and the application script are skipped |
+| Infinite loop | `max_execution_time` (where natively enforced) then `[server.timeouts] request` — unchanged, because it is the same PHP request |
+
+The uncaught-exception row is the one that took work. PHP 8 reports an
+uncaught `Throwable` with `E_DONT_BAIL`: execution returns *normally* and
+only `PG(last_error_type)` records it. A naive implementation would print the
+fatal and then run the application script anyway — for an auth mount, an auth
+bypass. ePHPm checks for it explicitly after every mount.
+
+Likewise, a mounted file that has gone missing 500s rather than being skipped.
+A policy layer that silently vanishes is how bypasses ship.
+
+### Limits
+
+- **Worker mode is rejected at startup.** The worker script owns the request
+  loop, so there is no per-request prepend point. Use the framework's own
+  middleware (PSR-15 / Octane) there.
+- At most **16** `php:` mounts may run for one request; more is a startup
+  error, never a silent drop.
+- Scripts run at **global scope**, so their variables are visible to the
+  application script — same as `auto_prepend_file`. Wrap logic in a function
+  or `return` early.
+- The lane runs only where the native chain runs: PHP-dispatched requests.
+  Static files and router error responses do not pass through it.
+
 ## Observability
 
 Each request-phase invocation increments
@@ -672,6 +867,13 @@ verdict (`continue` / `respond` / `rewrite`; module errors count as
 increments `ephpm_middleware_response_invocations_total{module}`. Module `log`
 calls surface through the host's `tracing` subscriber under the
 `ephpm_middleware` target.
+
+`php:` mounts use the same counter, with `action` ∈ `continue` / `respond` /
+`error`. Mounts that never ran (because an earlier one short-circuited) are
+not counted. There is deliberately **no** `rewrite` action for the PHP lane:
+PHP expresses a rewrite by assigning to `$_SERVER`, and reporting that would
+mean diffing the superglobal on the hot path — so the label would be invented
+rather than observed.
 
 ## Trust model
 

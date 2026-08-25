@@ -98,6 +98,23 @@ mod ffi {
             value: *const ::std::os::raw::c_char,
         );
 
+        /// Queue one PHP middleware script for this request, in chain order.
+        /// `config_json` may be null. Pointers must stay valid until
+        /// `ephpm_execute_request` returns.
+        pub fn ephpm_request_add_middleware(
+            path: *const ::std::os::raw::c_char,
+            config_json: *const ::std::os::raw::c_char,
+        );
+
+        /// How the PHP middleware chain ended for the request just executed:
+        /// 0 = every mount continued, 1 = a mount short-circuited via `exit()`,
+        /// 2 = a mount raised a fatal.
+        pub fn ephpm_middleware_outcome() -> ::std::os::raw::c_int;
+
+        /// How many queued PHP middleware mounts actually executed. The last
+        /// one is the mount `ephpm_middleware_outcome` describes.
+        pub fn ephpm_middleware_ran() -> ::std::os::raw::c_int;
+
         /// Execute a PHP request with full lifecycle management.
         ///
         /// Returns one of the `EPHPM_EXEC_*` codes defined in
@@ -1170,6 +1187,43 @@ impl PhpRuntime {
             }
         }
 
+        // PHP middleware lane: queue the mounts the router matched for this
+        // request. They execute inside this same PHP request, immediately
+        // before the application script — see ephpm_run_middleware_chain().
+        //
+        // A path or config that cannot be a C string is dropped rather than
+        // silently mounting a *different* script: the router only ever produces
+        // paths under the request's document root, so an interior NUL here
+        // means something upstream is wrong and skipping is the safe read.
+        // The strings are bound to locals that outlive ephpm_execute_request.
+        let c_middleware: Vec<(CString, Option<CString>)> = request
+            .middleware
+            .iter()
+            .filter_map(|mw| {
+                let path = CString::new(mw.script.to_str()?).ok()?;
+                let config = match mw.config_json.as_deref() {
+                    Some(json) => Some(CString::new(json).ok()?),
+                    None => None,
+                };
+                Some((path, config))
+            })
+            .collect();
+        if c_middleware.len() != request.middleware.len() {
+            tracing::error!(
+                mounted = request.middleware.len(),
+                usable = c_middleware.len(),
+                "a PHP middleware mount had an unrepresentable path or config and was skipped"
+            );
+        }
+        for (path, config) in &c_middleware {
+            let config_ptr = config.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+            // Safety: both CStrings live until this function returns, which is
+            // after ephpm_execute_request has consumed them.
+            unsafe {
+                ffi::ephpm_request_add_middleware(path.as_ptr(), config_ptr);
+            }
+        }
+
         // Execute the PHP request on this thread's TSRM context.
         //
         // Two shapes, selected by the `[php] crash_containment` master switch:
@@ -1606,6 +1660,35 @@ impl PhpRuntime {
         }
     }
 
+    /// How the PHP middleware chain ended for the request this thread just
+    /// executed, and how many mounts actually ran.
+    ///
+    /// Thread-local: must be read on the same blocking thread that called
+    /// [`PhpRuntime::execute`], before that thread runs another request.
+    /// The count is the 1-based position of the mount the outcome belongs to;
+    /// mounts before it all continued and mounts after it never ran.
+    #[cfg(php_linked)]
+    #[must_use]
+    pub fn middleware_outcome() -> (crate::request::MiddlewareOutcome, usize) {
+        // SAFETY: each call reads one `__thread` int in the C wrapper. No PHP
+        // state is touched, so no TSRM registration or bailout guard is needed.
+        #[allow(unsafe_code)]
+        let (raw, ran) = unsafe { (ffi::ephpm_middleware_outcome(), ffi::ephpm_middleware_ran()) };
+        let outcome = match raw {
+            1 => crate::request::MiddlewareOutcome::Respond,
+            2 => crate::request::MiddlewareOutcome::Error,
+            _ => crate::request::MiddlewareOutcome::Continue,
+        };
+        (outcome, usize::try_from(ran).unwrap_or(0))
+    }
+
+    /// Stub when PHP is not linked — no middleware ran, so nothing happened.
+    #[cfg(not(php_linked))]
+    #[must_use]
+    pub fn middleware_outcome() -> (crate::request::MiddlewareOutcome, usize) {
+        (crate::request::MiddlewareOutcome::Continue, 0)
+    }
+
     /// Set a PHP INI directive for the current request.
     ///
     /// Must be called on a TSRM-registered thread (inside `spawn_blocking`)
@@ -1941,6 +2024,7 @@ mod tests {
             is_https: false,
             protocol: "HTTP/1.1".into(),
             env_vars: Vec::new(),
+            middleware: Vec::new(),
         }
     }
 

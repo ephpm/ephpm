@@ -331,6 +331,49 @@ static EPHPM_TLS size_t request_ini_count = 0;
 /* Track whether a PHP request is currently active on this thread */
 static EPHPM_TLS int request_active = 0;
 
+/* PHP middleware lane (`[[middleware]] library = "php:<path>"`, EXPERIMENTAL).
+ *
+ * These scripts run inside the SAME PHP request as the application script,
+ * immediately before it — the position PHP's own `auto_prepend_file` occupies,
+ * except there can be several, each scoped by its mount's `match` glob and
+ * carrying its own `config`.
+ *
+ * Running them in-request rather than as their own ephpm_execute_request() is
+ * the whole design: superglobals, open_basedir, sys_temp_dir/session.save_path,
+ * the OPcache vhost, the per-site DB session, the execution timer and the crash
+ * guard are all already correct for this request, so a middleware file inherits
+ * every isolation and safety property the app script has instead of needing a
+ * parallel set. The marginal cost is one extra OPcache-cached script execution
+ * per matching mount — measured at ~7-12 us over HTTP, against ~366 us for a
+ * trivial request. See ephpm_run_one_middleware() for why that execution does
+ * NOT go through php_execute_script().
+ *
+ * Pointers are borrowed from Rust and must stay valid until
+ * ephpm_execute_request() returns — same contract as server_vars above. */
+#define MAX_REQUEST_MIDDLEWARE 16
+
+static EPHPM_TLS const char *req_middleware_paths[MAX_REQUEST_MIDDLEWARE];
+static EPHPM_TLS const char *req_middleware_configs[MAX_REQUEST_MIDDLEWARE];
+static EPHPM_TLS size_t req_middleware_count = 0;
+
+/* Index of the middleware file currently executing, -1 when none. Drives
+ * ephpm_middleware_config(), which therefore returns NULL when called from
+ * anywhere other than a middleware file. */
+static EPHPM_TLS int req_middleware_active = -1;
+
+/* How the chain ended for the request just executed, read back by Rust for the
+ * `ephpm_middleware_invocations_total{action=...}` label. */
+#define EPHPM_MW_CONTINUE 0
+#define EPHPM_MW_EXIT     1
+#define EPHPM_MW_FATAL    2
+static EPHPM_TLS int req_middleware_outcome = EPHPM_MW_CONTINUE;
+
+/* How many mounts actually executed. Equals req_middleware_count when the whole
+ * chain continued; otherwise the 1-based position of the mount that ended it,
+ * so the metric can attribute `respond`/`error` to the right mount instead of
+ * smearing it across every mount that matched. */
+static EPHPM_TLS int req_middleware_ran = 0;
+
 /* Duplicate a C string with plain malloc (must outlive the Zend per-request
  * allocator, so estrdup is unsuitable). Returns NULL on OOM or NULL input. */
 static char *ephpm_strdup_malloc(const char *s)
@@ -870,6 +913,10 @@ void ephpm_request_clear(void)
     req_post_data_offset = 0;
     req_path_translated = NULL;
     server_var_count = 0;
+    req_middleware_count = 0;
+    req_middleware_active = -1;
+    req_middleware_outcome = EPHPM_MW_CONTINUE;
+    req_middleware_ran = 0;
 }
 
 /*
@@ -908,6 +955,48 @@ void ephpm_request_add_server_var(const char *key, const char *value)
         server_vars[server_var_count].value = value;
         server_var_count++;
     }
+}
+
+/*
+ * Queue one PHP middleware script for this request, in chain order.
+ *
+ * `path` is an absolute filesystem path already resolved (and confined to the
+ * request's document root) by the router; `config_json` is the mount's `config`
+ * table serialised to JSON, or NULL when the mount declares none. Both pointers
+ * are borrowed and must outlive ephpm_execute_request().
+ *
+ * Mounts beyond MAX_REQUEST_MIDDLEWARE are dropped rather than growing an
+ * unbounded per-request array; the Rust side enforces the same cap at startup
+ * so this can only fire if the two ever disagree.
+ *
+ * Call before ephpm_execute_request().
+ */
+void ephpm_request_add_middleware(const char *path, const char *config_json)
+{
+    if (!path || req_middleware_count >= MAX_REQUEST_MIDDLEWARE) {
+        return;
+    }
+    req_middleware_paths[req_middleware_count] = path;
+    req_middleware_configs[req_middleware_count] = config_json;
+    req_middleware_count++;
+}
+
+/*
+ * How the middleware chain ended for the request just executed:
+ * EPHPM_MW_CONTINUE / EPHPM_MW_EXIT / EPHPM_MW_FATAL.
+ */
+int ephpm_middleware_outcome(void)
+{
+    return req_middleware_outcome;
+}
+
+/*
+ * How many queued middleware mounts actually executed for the request just
+ * executed. The last one is the mount the outcome above belongs to.
+ */
+int ephpm_middleware_ran(void)
+{
+    return req_middleware_ran;
 }
 
 /*
@@ -986,6 +1075,153 @@ void ephpm_request_set_ini(const char *key, const char *value)
  */
 #define ephpm_bailout_reset()    (CG(unclean_shutdown) = 0)
 #define ephpm_bailout_observed() (CG(unclean_shutdown) != 0)
+
+/*
+ * Run one middleware script and classify how it ended.
+ *
+ * This is php-src's own `zend_execute_scripts()` loop body (Zend/zend.c),
+ * inlined for ONE file, with exactly one change: an unwind-exit exception is
+ * recognised and reported instead of being handed to zend_exception_error().
+ *
+ * That change is the whole reason this is not simply `php_execute_script()`.
+ * PHP 8 implements exit()/die() by throwing an unwind-exit exception, and both
+ * `zend_execute_scripts()` and `php_execute_script()` funnel EVERY pending
+ * exception through `zend_exception_error()`, which clears `EG(exception)` and
+ * — for an unwind exit — returns SUCCESS. By the time either of them returns,
+ * "the script called exit()" and "the script ran to completion" are
+ * indistinguishable. Measured, not assumed: the first cut of this lane used
+ * php_execute_script() and its exit()-short-circuit tests failed with the
+ * application script's output appended to the middleware's.
+ *
+ * Everything else is deliberately identical to upstream, including adding the
+ * resolved path to EG(included_files) (so a middleware file that the app also
+ * `require_once`s is not compiled twice) and the op_array teardown order.
+ * zend_compile_file() is OPcache's hook, so the file is cached in SHM like any
+ * other script — the marginal cost of a mount is a cache lookup plus its own
+ * opcodes, not a compile.
+ *
+ * Returns EPHPM_MW_CONTINUE / EPHPM_MW_EXIT / EPHPM_MW_FATAL. A compile failure
+ * (missing file, parse error) raises E_COMPILE_ERROR, which bails out through
+ * the caller's SETJMP rather than returning here — also fail-closed.
+ */
+static int ephpm_run_one_middleware(const char *path)
+{
+    zend_file_handle fh;
+    zend_op_array *op_array;
+    int outcome = EPHPM_MW_CONTINUE;
+
+    zend_stream_init_filename(&fh, path);
+    op_array = zend_compile_file(&fh, ZEND_REQUIRE);
+    if (fh.opened_path) {
+        zend_hash_add_empty_element(&EG(included_files), fh.opened_path);
+    }
+    zend_destroy_file_handle(&fh);
+
+    if (!op_array) {
+        /* A syntax error is a thrown ParseError in PHP 7+, NOT a bailout:
+         * zend_compile_file returns NULL with EG(exception) still pending and
+         * nothing recorded in PG(last_error_type). Reporting it here is what
+         * turns it into the 500 the caller's last_error_type check produces —
+         * and, just as importantly, clears the exception so it cannot surface
+         * inside a shutdown function later in this request. (A file that is
+         * simply missing takes the other route: ZEND_REQUIRE raises
+         * E_COMPILE_ERROR, which bails out before reaching here.) */
+        if (EG(exception)) {
+            zend_exception_error(EG(exception), E_ERROR);
+        }
+        return EPHPM_MW_FATAL;
+    }
+
+    zend_execute(op_array, NULL);
+    zend_exception_restore();
+
+    if (UNEXPECTED(EG(exception))) {
+        if (zend_is_unwind_exit(EG(exception))) {
+            /* exit()/die() — the lane's ACTION_RESPOND. */
+            zend_clear_exception();
+            outcome = EPHPM_MW_EXIT;
+        } else {
+            if (Z_TYPE(EG(user_exception_handler)) != IS_UNDEF) {
+                zend_user_exception_handler();
+            }
+            if (EG(exception)) {
+                /* Reports the uncaught Throwable as a fatal exactly as
+                 * zend_execute_scripts would, and clears it. */
+                zend_exception_error(EG(exception), E_ERROR);
+            }
+            outcome = EPHPM_MW_FATAL;
+        }
+    }
+
+    zend_destroy_static_vars(op_array);
+    destroy_op_array(op_array);
+    efree_size(op_array, sizeof(zend_op_array));
+    return outcome;
+}
+
+/*
+ * Run the queued PHP middleware scripts, in order, inside the live request.
+ *
+ * The working directory is deliberately NOT changed first, which is the one
+ * place this lane diverges from PHP's `auto_prepend_file` (php_execute_script
+ * chdirs to the primary script's directory, then runs prepend + primary inside
+ * that). Doing the same here — one getcwd + one chdir + one restore — measured
+ * **~55 us per request on Windows**, against ~6 us for actually executing a
+ * mount. That is an order of magnitude of pure overhead for a guarantee PHP
+ * mostly provides anyway: a relative `include` resolves against the *including
+ * script's own directory* before it ever consults the cwd, so
+ * `include 'helper.php'` from a middleware file still finds the file beside it.
+ * What does change is a bare relative path handed to a filesystem call
+ * (`fopen('data.txt')`), which resolves against the server's working directory
+ * — so the guide tells middleware authors to use `__DIR__`. The application
+ * script is unaffected: php_execute_script still does its own chdir for it.
+ *
+ * Three ways a mount ends the chain, all fail-closed:
+ *
+ *   1. exit()/die() — ACTION_RESPOND. Remaining mounts and the app script are
+ *      skipped; whatever the middleware emitted becomes the response.
+ *
+ *   2. An uncaught Throwable or a fatal that does not bail out. Without the
+ *      explicit check the app script would run anyway — a middleware that
+ *      throws would fail OPEN, which for an auth mount is precisely the bug
+ *      that must not exist.
+ *
+ *   3. A zend_bailout (missing file, parse error, OOM, resource limit).
+ *      Nothing here catches it: it longjmps to the SETJMP in
+ *      ephpm_execute_request, which skips the app script and 500s.
+ */
+static int ephpm_run_middleware_chain(void)
+{
+    const int fatal_error_mask = E_ERROR | E_CORE_ERROR | E_COMPILE_ERROR
+                                 | E_USER_ERROR | E_RECOVERABLE_ERROR | E_PARSE;
+    int outcome = EPHPM_MW_CONTINUE;
+
+    /* The overwhelmingly common case: no mounts. A server with no `php:`
+     * middleware pays one predictable branch for this lane existing. */
+    if (req_middleware_count == 0) {
+        return EPHPM_MW_CONTINUE;
+    }
+
+    for (size_t i = 0; i < req_middleware_count; i++) {
+        req_middleware_active = (int)i;
+        outcome = ephpm_run_one_middleware(req_middleware_paths[i]);
+        req_middleware_active = -1;
+        req_middleware_ran = (int)i + 1;
+
+        /* A bailout absorbed elsewhere, or a fatal reported with E_DONT_BAIL,
+         * both mean "do not continue" even when the call above returned
+         * CONTINUE. */
+        if (outcome == EPHPM_MW_CONTINUE
+            && (ephpm_bailout_observed() || (PG(last_error_type) & fatal_error_mask))) {
+            outcome = EPHPM_MW_FATAL;
+        }
+        if (outcome != EPHPM_MW_CONTINUE) {
+            break;
+        }
+    }
+
+    return outcome;
+}
 
 /*
  * Execute a PHP request.
@@ -1141,22 +1377,51 @@ int ephpm_execute_request(const char *filename)
 
     EG(bailout) = &__bailout;
     if (SETJMP(__bailout) == 0) {
-        zend_file_handle file_handle;
-        zend_stream_init_filename(&file_handle, filename);
-        php_execute_script(&file_handle);
+        /* PHP middleware lane: mounts matching this request run first, in the
+         * same request, immediately before the application script. A mount that
+         * exits short-circuits (the lane's RESPOND); a mount that fatals aborts
+         * the request rather than falling through to the app — fail closed. */
+        req_middleware_outcome = ephpm_run_middleware_chain();
 
-        /* PHP 8.x: exit()/die() throws an unwind exit exception instead
-         * of calling zend_bailout(). Treat it like the old bailout path,
-         * but DO NOT mark it as a fatal bailout — exit() is intentional
-         * and should preserve whatever status the script set. */
-        if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
-            zend_clear_exception();
+        if (req_middleware_outcome == EPHPM_MW_EXIT) {
             result = EPHPM_EXEC_SCRIPT_EXIT;
+        } else if (req_middleware_outcome == EPHPM_MW_CONTINUE) {
+            zend_file_handle file_handle;
+            zend_stream_init_filename(&file_handle, filename);
+            php_execute_script(&file_handle);
+
+            /* PHP 8.x: exit()/die() throws an unwind exit exception instead
+             * of calling zend_bailout(). Treat it like the old bailout path,
+             * but DO NOT mark it as a fatal bailout — exit() is intentional
+             * and should preserve whatever status the script set. */
+            if (EG(exception) && zend_is_unwind_exit(EG(exception))) {
+                zend_clear_exception();
+                result = EPHPM_EXEC_SCRIPT_EXIT;
+            }
         }
+        /* EPHPM_MW_FATAL falls through with result still EPHPM_EXEC_OK: the
+         * bailout / last_error_type checks below turn it into the 500 the app
+         * script's own fatal would have produced. */
     } else {
         /* A zend_bailout() raised OUTSIDE php_execute_script's own zend_try
          * (rare — that guard absorbs everything raised by the script itself).
-         * The CG(unclean_shutdown) check below covers both cases. */
+         * The CG(unclean_shutdown) check below covers both cases.
+         *
+         * The middleware chain, unlike the app script, is NOT wrapped in
+         * php_execute_script's zend_try, so a bailout inside a mount (a missing
+         * file, a parse error, OOM) lands HERE — with the app script skipped,
+         * which is the fail-closed answer.
+         *
+         * `req_middleware_active >= 0` says the jump came from inside a mount
+         * rather than from anywhere else in the request, so the outcome is only
+         * rewritten when it really belongs to the chain. Clearing the cursor
+         * also stops a later ephpm_middleware_config() on this thread from
+         * reading a stale index. */
+        if (req_middleware_active >= 0) {
+            req_middleware_ran = req_middleware_active + 1;
+            req_middleware_outcome = EPHPM_MW_FATAL;
+            req_middleware_active = -1;
+        }
         result = EPHPM_EXEC_BAILOUT;
     }
     EG(bailout) = __orig_bailout;
@@ -4176,6 +4441,37 @@ ZEND_END_ARG_INFO()
 ZEND_BEGIN_ARG_INFO_EX(arginfo_cli_get_process_title, 0, 0, 0)
 ZEND_END_ARG_INFO()
 
+/* ── PHP middleware lane ─────────────────────────────────────────
+ *
+ * ephpm_middleware_config(): ?string
+ *
+ * Returns the running mount's `config` table from `[[middleware]]`, serialised
+ * to JSON, or NULL when the mount declares no `config` — and NULL from anywhere
+ * that is not a middleware file, which is what makes
+ * `json_decode(ephpm_middleware_config() ?? '{}', true)` safe to call
+ * unconditionally.
+ *
+ * JSON rather than a PHP array on purpose: decoding here would mean linking
+ * ext/json's C API out of a static embed build (PHP_JSON_API is dllimport on
+ * Windows), and `json_decode()` is one idiomatic PHP call away. This is the
+ * ONLY native function the lane adds — verdicts are expressed in stock PHP
+ * (`exit`, `header()`, `$_SERVER`), not through a bespoke API.
+ */
+PHP_FUNCTION(ephpm_middleware_config)
+{
+    ZEND_PARSE_PARAMETERS_NONE();
+
+    if (req_middleware_active < 0
+        || (size_t)req_middleware_active >= req_middleware_count
+        || !req_middleware_configs[req_middleware_active]) {
+        RETURN_NULL();
+    }
+    RETURN_STRING(req_middleware_configs[req_middleware_active]);
+}
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_ephpm_middleware_config, 0, 0, 0)
+ZEND_END_ARG_INFO()
+
 /* ── Function entry table (null-terminated) ──────────────────── */
 
 /* The entries every mode gets. Kept as a macro so the serve-mode table and
@@ -4218,7 +4514,9 @@ ZEND_END_ARG_INFO()
     PHP_FE(ephpm_ws_connection_unsubscribe,  arginfo_ephpm_ws_connection_unsubscribe) \
     PHP_FE(ephpm_ws_broadcast,               arginfo_ephpm_ws_broadcast) \
     PHP_FE(ephpm_ws_close,                   arginfo_ephpm_ws_close) \
-    PHP_FE(ephpm_ws_connection_close,        arginfo_ephpm_ws_connection_close)
+    PHP_FE(ephpm_ws_connection_close,        arginfo_ephpm_ws_connection_close) \
+    /* PHP middleware lane: the running mount's `config` table as JSON. */ \
+    PHP_FE(ephpm_middleware_config,          arginfo_ephpm_middleware_config)
 
 static const zend_function_entry ephpm_kv_functions[] = {
     EPHPM_COMMON_FUNCTION_ENTRIES

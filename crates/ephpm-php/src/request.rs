@@ -6,6 +6,48 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+/// One PHP middleware mount resolved for a single request.
+///
+/// Produced by the router from a `[[middleware]] library = "php:<path>"` mount
+/// whose `match` glob accepted this request. `script` is already resolved
+/// against the request's own document root, so in multi-tenant mode it names
+/// the tenant's own file and nothing else.
+#[derive(Debug, Clone)]
+pub struct PhpMiddleware {
+    /// Absolute path to the middleware script.
+    pub script: PathBuf,
+
+    /// The mount's `config` table serialised to JSON, surfaced to the script as
+    /// `ephpm_middleware_config()`. `None` when the mount declares no `config`.
+    pub config_json: Option<String>,
+}
+
+/// How the PHP middleware chain ended for one request.
+///
+/// Mirrors the C `EPHPM_MW_*` codes; used for the
+/// `ephpm_middleware_invocations_total{action=...}` label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiddlewareOutcome {
+    /// Every mount ran and fell through to the application script.
+    Continue,
+    /// A mount short-circuited with `exit()` — the lane's `RESPOND`.
+    Respond,
+    /// A mount raised a fatal; the application script never ran (fail closed).
+    Error,
+}
+
+impl MiddlewareOutcome {
+    /// Metric label for this outcome.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Respond => "respond",
+            Self::Error => "error",
+        }
+    }
+}
+
 /// A PHP request, constructed from an incoming HTTP request.
 ///
 /// Contains all the information needed to set up a PHP execution context
@@ -60,6 +102,13 @@ pub struct PhpRequest {
     /// so they can override built-in values if needed. Used for injecting
     /// `EPHPM_REDIS_*` credentials in multi-tenant mode.
     pub env_vars: Vec<(String, String)>,
+
+    /// PHP middleware scripts to run — in chain order — inside this request,
+    /// immediately before `script_filename`.
+    ///
+    /// Empty for every request that has no `php:` mount, which is the default
+    /// and costs nothing. See [`PhpMiddleware`].
+    pub middleware: Vec<PhpMiddleware>,
 }
 
 impl PhpRequest {
@@ -256,6 +305,7 @@ mod tests {
             is_https: false,
             protocol: "HTTP/1.1".into(),
             env_vars: Vec::new(),
+            middleware: Vec::new(),
         }
     }
 

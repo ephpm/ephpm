@@ -70,6 +70,29 @@ use ephpm_middleware::host::{RequestCtx, ResponseCtx};
 /// any library is unloaded.
 pub struct MiddlewareChain {
     modules: Vec<Loaded>,
+    php: Vec<PhpMount>,
+}
+
+/// One `library = "php:<path>"` mount (EXPERIMENTAL).
+///
+/// PHP mounts are deliberately NOT part of [`MiddlewareChain::evaluate`]: that
+/// runs on the tokio task before the request body is read and outside any PHP
+/// context, where there is no engine to execute a script in. They are collected
+/// here at startup and handed to the router, which passes the matching ones
+/// into the PHP request itself — see [`MiddlewareChain::php_mounts`].
+#[derive(Debug)]
+pub struct PhpMount {
+    /// Mount name (the full `library` string, `php:` prefix included) — used in
+    /// logs and metrics.
+    pub name: String,
+    /// Script path relative to the request's document root. Validated at config
+    /// load: relative, no `..`, no drive prefix, `/`-separated.
+    pub script: String,
+    /// Glob the request path must match (`None` = every PHP-bound request).
+    match_pattern: Option<String>,
+    /// The mount's `config` table as JSON, surfaced to the script through
+    /// `ephpm_middleware_config()`.
+    pub config_json: Option<String>,
 }
 
 /// One mounted module: its identity plus the execution backend.
@@ -219,7 +242,15 @@ impl MiddlewareChain {
     /// non-zero.
     pub fn load(mounts: &[MiddlewareMount]) -> anyhow::Result<Self> {
         let mut modules = Vec::with_capacity(mounts.len());
+        let mut php = Vec::new();
         for mount in sorted_by_order(mounts) {
+            // `php:` mounts resolve first: they are neither a builtin name nor
+            // a library path, and letting them fall through to the dlopen
+            // search would produce a baffling "library not found" error.
+            if let Some(script) = mount.php_script() {
+                php.push(load_php_mount(mount, script)?);
+                continue;
+            }
             let loaded = match builtin(&mount.library) {
                 Some(build) => load_builtin(mount, build)?,
                 None => {
@@ -235,7 +266,78 @@ impl MiddlewareChain {
             };
             modules.push(loaded);
         }
-        Ok(Self { modules })
+        Ok(Self { modules, php })
+    }
+
+    /// The `php:` mounts whose `match` glob accepts `path`, in chain order.
+    ///
+    /// Empty for every request when no `php:` mount is configured, which is the
+    /// default — the router skips the whole lane on an empty slice.
+    #[must_use]
+    pub fn php_mounts(&self, path: &str) -> Vec<&PhpMount> {
+        self.php
+            .iter()
+            .filter(|mount| mount.match_pattern.as_ref().is_none_or(|p| path_matches(p, path)))
+            .collect()
+    }
+
+    /// Whether any `php:` mount is configured at all.
+    #[must_use]
+    pub fn has_php_mounts(&self) -> bool {
+        !self.php.is_empty()
+    }
+
+    /// `php:` mount names in chain order (for the startup log line).
+    #[must_use]
+    pub fn php_mount_names(&self) -> Vec<&str> {
+        self.php.iter().map(|m| m.name.as_str()).collect()
+    }
+
+    /// Check that every `php:` mount's script exists, as far as that can be
+    /// known at startup.
+    ///
+    /// A missing script fails the request closed (500) rather than being
+    /// skipped — the right call for a policy layer, but a brutal way to learn
+    /// about a typo. So the determinable case is caught here instead:
+    ///
+    /// * **Single-site** — one `document_root`, so the path is fully
+    ///   determined. A missing file is a **startup error**, matching how an
+    ///   unresolvable shared library aborts startup.
+    /// * **Multi-site** — the path resolves per request against each tenant's
+    ///   own document root, and sites can appear after startup, so there is no
+    ///   single path to check. Startup warns instead, naming the consequence.
+    ///
+    /// # Errors
+    ///
+    /// Single-site only: returns an error naming the mount and the absolute
+    /// path that did not exist.
+    pub fn check_php_mount_scripts(
+        &self,
+        document_root: &Path,
+        multi_site: bool,
+    ) -> anyhow::Result<()> {
+        if multi_site {
+            tracing::warn!(
+                php_mounts = ?self.php_mount_names(),
+                "PHP middleware in multi-site mode resolves per site against each site's own \
+                 document root — a site that does not ship the script answers 500 for every \
+                 matching request (fail-closed). Startup cannot verify this for sites that do \
+                 not exist yet."
+            );
+            return Ok(());
+        }
+        for mount in &self.php {
+            let path = document_root.join(&mount.script);
+            anyhow::ensure!(
+                path.is_file(),
+                "middleware \"{}\": script not found at {} (paths are relative to the document \
+                 root, {})",
+                mount.name,
+                path.display(),
+                document_root.display(),
+            );
+        }
+        Ok(())
     }
 
     /// Number of loaded modules.
@@ -620,6 +722,36 @@ fn resolve_library(library: &str) -> anyhow::Result<PathBuf> {
         }
     }
     anyhow::bail!("middleware library \"{library}\" not found; tried: {}", tried.join(", "))
+}
+
+/// Prepare a `php:` mount. There is nothing to load — the script is compiled by
+/// PHP (and cached by OPcache) on first use inside a real request — so this only
+/// serialises the mount's `config` and records the glob.
+///
+/// The script's *existence* is deliberately not checked here: the path is
+/// resolved per request against that request's document root, so in
+/// multi-tenant mode there is one file per site and no single path to stat. A
+/// missing file fails closed at request time (`ZEND_REQUIRE` → 500), which is
+/// the same answer a missing dlopen library gives, just later.
+fn load_php_mount(mount: &MiddlewareMount, script: &str) -> anyhow::Result<PhpMount> {
+    let config_json = mount
+        .config
+        .as_ref()
+        .map(|v| serde_json::to_string(v).context("middleware config is not serialisable to JSON"))
+        .transpose()?;
+    tracing::info!(
+        module = %mount.library,
+        script,
+        r#match = mount.match_pattern.as_deref().unwrap_or("*"),
+        "middleware initialised (php, experimental) — runs inside the PHP request, \
+         after the body has been read"
+    );
+    Ok(PhpMount {
+        name: mount.library.clone(),
+        script: script.to_owned(),
+        match_pattern: mount.match_pattern.clone(),
+        config_json,
+    })
 }
 
 /// Initialise a builtin-registry mount in-process (no dlopen anywhere).
@@ -1110,6 +1242,183 @@ mod tests {
         assert!(err.contains("secret"), "{err}");
     }
 
+    // ── PHP lane (`library = "php:<path>"`) ──────────────────────────────
+
+    fn php_mount(library: &str, pattern: Option<&str>, order: u32) -> MiddlewareMount {
+        MiddlewareMount {
+            library: library.to_string(),
+            match_pattern: pattern.map(str::to_owned),
+            order,
+            config: None,
+        }
+    }
+
+    /// A `php:` mount must never reach the builtin registry or the dlopen
+    /// search path — there is no library to find, and falling through would
+    /// produce a "library not found" error naming file names that were never
+    /// meant to exist.
+    #[test]
+    fn php_mounts_never_hit_the_builtin_or_dlopen_lanes() {
+        assert!(builtin("php:middleware.php").is_none());
+        let chain = MiddlewareChain::load(&[php_mount("php:middleware.php", None, 10)])
+            .expect("a php: mount loads without touching the filesystem");
+        assert_eq!(chain.len(), 0, "php mounts are not in the native chain");
+        assert!(chain.has_php_mounts());
+        assert_eq!(chain.php_mount_names(), ["php:middleware.php"]);
+    }
+
+    /// PHP mounts are their own phase: `evaluate` (which runs before the body
+    /// is read, with no PHP context in reach) must not try to run them.
+    #[test]
+    fn php_mounts_are_invisible_to_the_native_chain_evaluation() {
+        let chain = MiddlewareChain::load(&[php_mount("php:mw.php", None, 10)]).expect("load");
+        let ctx = RequestCtx::new("GET", "/x.php", "", "127.0.0.1", "t.example", &[]);
+        match chain.evaluate(&ctx, "/x.php") {
+            ChainVerdict::Continue { rewrite_path, header_overrides, response_headers } => {
+                assert!(rewrite_path.is_none());
+                assert!(header_overrides.is_empty());
+                assert!(response_headers.is_empty());
+            }
+            ChainVerdict::Respond { status, .. } => {
+                panic!("a php: mount must not produce a native verdict (got {status})")
+            }
+        }
+    }
+
+    #[test]
+    fn php_mounts_are_filtered_by_their_match_glob_and_kept_in_order() {
+        let chain = MiddlewareChain::load(&[
+            php_mount("php:second.php", None, 20),
+            php_mount("php:first.php", Some("/api/*"), 10),
+        ])
+        .expect("load");
+
+        // Ordered by `order`, not declaration.
+        let api: Vec<&str> =
+            chain.php_mounts("/api/x.php").iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(api, ["php:first.php", "php:second.php"]);
+
+        // The globbed mount drops out off its path; the unglobbed one stays.
+        let other: Vec<&str> =
+            chain.php_mounts("/index.php").iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(other, ["php:second.php"]);
+    }
+
+    /// Single-site: the path is fully determined at startup, so a typo is an
+    /// immediate startup error rather than a 500 per request in production.
+    #[test]
+    fn php_mount_missing_script_aborts_startup_in_single_site_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = MiddlewareChain::load(&[php_mount("php:auth/mw.php", None, 10)]).expect("load");
+
+        let err = chain
+            .check_php_mount_scripts(dir.path(), false)
+            .expect_err("a missing script must abort startup");
+        let msg = err.to_string();
+        assert!(msg.contains("php:auth/mw.php"), "{msg}");
+        assert!(msg.contains("script not found"), "{msg}");
+        assert!(msg.contains("document root"), "the error must explain what it is relative to");
+
+        // Create it, and startup is happy.
+        std::fs::create_dir_all(dir.path().join("auth")).unwrap();
+        std::fs::write(dir.path().join("auth/mw.php"), "<?php\n").unwrap();
+        chain.check_php_mount_scripts(dir.path(), false).expect("present script passes");
+    }
+
+    /// Multi-site: there is no single path to check (each tenant has its own,
+    /// and sites can appear after startup), so this must NOT fail startup.
+    #[test]
+    fn php_mount_missing_script_does_not_abort_startup_in_multi_site_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let chain = MiddlewareChain::load(&[php_mount("php:mw.php", None, 10)]).expect("load");
+        chain
+            .check_php_mount_scripts(dir.path(), true)
+            .expect("multi-site cannot verify per-tenant scripts and must not fail startup");
+    }
+
+    #[test]
+    fn php_mount_config_is_serialised_to_json_for_the_script() {
+        let chain = MiddlewareChain::load(&[MiddlewareMount {
+            library: "php:mw.php".to_string(),
+            match_pattern: None,
+            order: 10,
+            config: Some(serde_json::json!({ "realm": "admin" })),
+        }])
+        .expect("load");
+        let mounts = chain.php_mounts("/x.php");
+        assert_eq!(mounts[0].config_json.as_deref(), Some(r#"{"realm":"admin"}"#));
+        assert_eq!(mounts[0].script, "mw.php");
+    }
+
+    /// The two lanes coexist: native modules keep producing native verdicts
+    /// while PHP mounts are collected separately.
+    #[test]
+    fn native_and_php_mounts_coexist_in_one_chain() {
+        let chain = MiddlewareChain::load(&[
+            builtin_mount("security-headers", None, 10, serde_json::json!({})),
+            php_mount("php:audit.php", None, 20),
+        ])
+        .expect("load");
+        assert_eq!(chain.module_names(), ["security-headers"]);
+        assert_eq!(chain.php_mount_names(), ["php:audit.php"]);
+
+        let ctx = RequestCtx::new("GET", "/x.php", "", "127.0.0.1", "t.example", &[]);
+        match chain.evaluate(&ctx, "/x.php") {
+            ChainVerdict::Continue { response_headers, .. } => {
+                assert_eq!(find_header(&response_headers, "X-Frame-Options"), Some("DENY"));
+            }
+            ChainVerdict::Respond { .. } => panic!("expected CONTINUE"),
+        }
+    }
+
+    /// The Rust half of the PHP-lane cost comparison.
+    ///
+    /// Measures `MiddlewareChain::evaluate` for the `security-headers` builtin
+    /// — the in-process lane, no FFI round-trip, no dlopen — doing the same
+    /// work the PHP benchmark's mount does (three response headers). Pair it
+    /// with `ephpm-php`'s `bench_php_mount_marginal_cost`, which cannot live
+    /// here because `ephpm-php` does not depend on the middleware crates.
+    ///
+    /// `#[ignore]`d: a measurement, not an assertion. Absolute numbers are
+    /// machine-specific; the ratio is the point.
+    ///
+    /// Run with:
+    /// `cargo test -p ephpm-server --lib bench_builtin -- --ignored --nocapture`
+    #[test]
+    #[ignore = "benchmark: prints timings, asserts nothing"]
+    fn bench_builtin_chain_marginal_cost() {
+        const ITERATIONS: u32 = 200_000;
+
+        let chain = MiddlewareChain::load(&[builtin_mount(
+            "security-headers",
+            None,
+            10,
+            serde_json::json!({}),
+        )])
+        .expect("load security-headers");
+        let empty = MiddlewareChain::load(&[]).expect("empty chain");
+
+        let measure = |label: &str, chain: &MiddlewareChain| {
+            // A fresh ctx per iteration, as the router builds one per request.
+            for _ in 0..1000 {
+                let ctx = RequestCtx::new("GET", "/x.php", "", "127.0.0.1", "bench", &[]);
+                std::hint::black_box(chain.evaluate(&ctx, "/x.php"));
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                let ctx = RequestCtx::new("GET", "/x.php", "", "127.0.0.1", "bench", &[]);
+                std::hint::black_box(chain.evaluate(&ctx, "/x.php"));
+            }
+            let per_request = start.elapsed() / ITERATIONS;
+            println!("{label:<28} {per_request:?} / request");
+            per_request
+        };
+
+        let baseline = measure("empty chain (ctx only)", &empty);
+        let builtin = measure("1 builtin mount", &chain);
+        println!("\nmarginal cost of the builtin: {:?}", builtin.saturating_sub(baseline));
+    }
+
     /// Locate a built middleware cdylib in the workspace target directory.
     ///
     /// These are the *shipped* module artifacts, produced only by an explicit
@@ -1349,6 +1658,7 @@ mod tests {
                 loaded_response::<SeqTag>("a", None, serde_json::json!({ "id": "a" })),
                 loaded_response::<SeqTag>("b", None, serde_json::json!({ "id": "b" })),
             ],
+            php: Vec::new(),
         };
         let out = chain.run_response_phase(&resp_ctx(), "/x", 200, Vec::new(), Vec::new());
         assert_eq!(
@@ -1362,6 +1672,7 @@ mod tests {
     fn response_phase_transforms_status_body_and_headers() {
         let chain = MiddlewareChain {
             modules: vec![loaded_response::<Transformer>("t", None, serde_json::Value::Null)],
+            php: Vec::new(),
         };
         let headers = vec![
             ("Content-Type".to_owned(), "text/plain".to_owned()),
@@ -1381,6 +1692,7 @@ mod tests {
     fn response_phase_fails_safe_on_module_panic() {
         let chain = MiddlewareChain {
             modules: vec![loaded_response::<Panicker>("p", None, serde_json::Value::Null)],
+            php: Vec::new(),
         };
         let headers = vec![("X-Keep".to_owned(), "yes".to_owned())];
         let out = chain.run_response_phase(&resp_ctx(), "/x", 200, headers, b"body".to_vec());
@@ -1394,7 +1706,8 @@ mod tests {
     #[test]
     fn modules_without_a_response_phase_are_skipped() {
         // A request-only module reports no response phase.
-        let request_only = MiddlewareChain { modules: vec![loaded_request::<RequestOnly>("r")] };
+        let request_only =
+            MiddlewareChain { modules: vec![loaded_request::<RequestOnly>("r")], php: Vec::new() };
         assert!(!request_only.has_response_phase());
 
         // Mixed: the request-only module is skipped, the transformer still runs.
@@ -1403,6 +1716,7 @@ mod tests {
                 loaded_request::<RequestOnly>("r"),
                 loaded_response::<Transformer>("t", None, serde_json::Value::Null),
             ],
+            php: Vec::new(),
         };
         assert!(mixed.has_response_phase());
         let out = mixed.run_response_phase(&resp_ctx(), "/x", 200, Vec::new(), b"go".to_vec());
@@ -1418,6 +1732,7 @@ mod tests {
                 Some("/api/*"),
                 serde_json::Value::Null,
             )],
+            php: Vec::new(),
         };
         // Off-glob: untouched.
         let out =
