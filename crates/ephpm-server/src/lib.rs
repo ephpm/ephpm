@@ -1,6 +1,7 @@
 pub mod acme;
 pub mod body;
 pub mod db_health;
+pub mod dns01;
 pub mod file_cache;
 pub mod fpm_pool;
 pub mod http3;
@@ -518,6 +519,18 @@ async fn bind_listeners(
             );
             let acceptor = tls::build_tls_acceptor(cert, key)?;
             TlsMode::Manual(acceptor)
+        }
+        // DNS-01 wildcard lane (opt-in via `challenge = "dns-01"`). Checked
+        // before the general ACME arm because it is the more specific case.
+        // It shares the TLS *serving* path with manual mode: the resolver
+        // inside the acceptor is hot-swapped by the renewal task, so no ACME
+        // ClientHello inspection is needed (the challenge is answered over DNS,
+        // not on the TLS socket).
+        Some(tls_config) if tls_config.is_dns01() => {
+            let acme_store =
+                if config.cluster.enabled { Some(Arc::clone(&kv_store)) } else { None };
+            let setup = dns01::start_dns01_acme(tls_config, acme_store)?;
+            TlsMode::Manual(setup.acceptor)
         }
         Some(tls_config) if tls_config.is_acme() => {
             let acme_store =

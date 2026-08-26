@@ -70,6 +70,13 @@ EPHPM_SERVER__TLS__DOMAINS='["example.com"]'
 EPHPM_SERVER__TLS__EMAIL=admin@example.com
 EPHPM_SERVER__TLS__CACHE_DIR=/data/certs
 
+# DNS-01 wildcard ACME (Cloudflare). The token is a secret, so this is the
+# preferred way to supply it — keep it out of ephpm.toml.
+EPHPM_SERVER__TLS__DOMAINS='["*.preview.example.com","preview.example.com"]'
+EPHPM_SERVER__TLS__CHALLENGE=dns-01
+EPHPM_SERVER__TLS__DNS_PROVIDER=cloudflare
+EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN=$CF_DNS_EDIT_TOKEN   # zone-scoped Zone.DNS:Edit
+
 # HTTP/3 (QUIC). Needs a static [server.tls] cert+key — enabling this with
 # ACME is a startup error, not a silent downgrade to TCP-only.
 EPHPM_SERVER__HTTP3__ENABLED=true

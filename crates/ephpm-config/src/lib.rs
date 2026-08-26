@@ -1543,6 +1543,66 @@ pub struct TlsConfig {
     #[serde(default)]
     pub staging: bool,
 
+    // --- ACME challenge selection ---
+    /// ACME challenge type: `"tls-alpn-01"` (default) or `"dns-01"`.
+    ///
+    /// - `"tls-alpn-01"` — the zero-config default. The server answers the
+    ///   challenge inline on the TLS listener (via `rustls-acme`); no DNS
+    ///   credentials are needed, but **wildcard certificates are impossible**
+    ///   (the CA cannot prove wildcard control over a single hostname).
+    /// - `"dns-01"` — provisions the challenge as a `_acme-challenge` TXT
+    ///   record through a [`Self::dns_provider`]. This is the **only** way to
+    ///   obtain a wildcard certificate (`*.example.com`), and it works for
+    ///   hosts that never accept inbound TLS. Requires `dns_provider` and a
+    ///   provider credential (see [`Self::cloudflare_api_token_file`]).
+    ///
+    /// Default: `"tls-alpn-01"` (preserves the previous behaviour exactly).
+    /// Any other value is rejected at startup by `Config::validate`.
+    #[serde(default = "default_tls_challenge")]
+    pub challenge: String,
+
+    /// DNS provider used to satisfy `dns-01` challenges.
+    ///
+    /// Currently the only accepted value is `"cloudflare"`. Ignored unless
+    /// `challenge = "dns-01"`. `Config::validate` requires it in that mode and
+    /// rejects unknown providers rather than silently doing nothing.
+    #[serde(default)]
+    pub dns_provider: Option<String>,
+
+    /// Path to a file containing the Cloudflare API token (preferred).
+    ///
+    /// The token must be **zone-scoped** with the `Zone.DNS:Edit` permission on
+    /// the zone(s) that hold the challenge records. Keeping the secret in a
+    /// `0600` file (or a mounted secret) keeps it out of `ephpm.toml`.
+    ///
+    /// Precedence when both are present: this file wins over
+    /// [`Self::cloudflare_api_token`]. The token may instead be supplied
+    /// entirely via the environment as
+    /// `EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN` (which populates
+    /// `cloudflare_api_token`). Only read when `dns_provider = "cloudflare"`.
+    #[serde(default)]
+    pub cloudflare_api_token_file: Option<PathBuf>,
+
+    /// Cloudflare API token supplied inline (discouraged).
+    ///
+    /// Prefer [`Self::cloudflare_api_token_file`] or the
+    /// `EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN` environment variable so the
+    /// secret does not live in the config file. This field exists primarily as
+    /// the landing spot for that env var. Only read when
+    /// `dns_provider = "cloudflare"`; the token file takes precedence.
+    #[serde(default)]
+    pub cloudflare_api_token: Option<String>,
+
+    /// Explicit Cloudflare zone id for the challenge records.
+    ///
+    /// Optional. When absent, the zone is resolved from the challenge FQDN by
+    /// walking its parent domains against the Cloudflare `zones` API. Set it to
+    /// skip that lookup (one fewer API round-trip, and it removes the
+    /// `Zone:Read` requirement from the token). Only used when
+    /// `dns_provider = "cloudflare"`.
+    #[serde(default)]
+    pub cloudflare_zone_id: Option<String>,
+
     // --- Shared ---
     /// Optional separate listen address for HTTPS (e.g. `"0.0.0.0:443"`).
     ///
@@ -1570,6 +1630,22 @@ impl TlsConfig {
     #[must_use]
     pub fn is_acme(&self) -> bool {
         !self.domains.is_empty() && !self.is_manual()
+    }
+
+    /// Returns `true` if ACME is configured to use the `dns-01` challenge.
+    ///
+    /// This selects the [`crate::TlsConfig::dns_provider`]-driven wildcard lane
+    /// instead of the default TLS-ALPN-01 path. Only meaningful when
+    /// [`Self::is_acme`] is also `true`.
+    #[must_use]
+    pub fn is_dns01(&self) -> bool {
+        self.is_acme() && self.challenge.eq_ignore_ascii_case("dns-01")
+    }
+
+    /// Returns `true` if any configured domain is a wildcard (`*.example.com`).
+    #[must_use]
+    pub fn has_wildcard_domain(&self) -> bool {
+        self.domains.iter().any(|d| d.starts_with("*."))
     }
 }
 
@@ -3180,6 +3256,87 @@ impl Config {
                  entrypoint (default: [\"websocket.php\"])."
                     .to_string(),
             ));
+        }
+
+        // TLS / ACME challenge validation. All fail-closed: a wildcard cert
+        // that cannot be issued, or a dns-01 lane with no credential, must stop
+        // startup rather than come up serving no certificate.
+        if let Some(tls) = self.server.tls.as_ref() {
+            let challenge = tls.challenge.to_ascii_lowercase();
+            if challenge != "tls-alpn-01" && challenge != "dns-01" {
+                return Err(ConfigError::Validation(format!(
+                    "[server.tls] challenge must be \"tls-alpn-01\" or \"dns-01\", got \
+                     \"{}\". (tls-alpn-01 is the default; dns-01 is required for wildcard \
+                     certificates.)",
+                    tls.challenge,
+                )));
+            }
+
+            // A wildcard identifier can only be validated over DNS-01: the CA
+            // has no single host to answer a TLS-ALPN-01 or HTTP-01 challenge
+            // for `*.example.com`. Reject the combination loudly rather than
+            // let ACME fail opaquely at order time.
+            if tls.has_wildcard_domain() && challenge != "dns-01" {
+                return Err(ConfigError::Validation(
+                    "[server.tls] a wildcard domain (\"*.example.com\") requires \
+                     challenge = \"dns-01\". TLS-ALPN-01 cannot prove control of a \
+                     wildcard. Set challenge = \"dns-01\" and configure a dns_provider."
+                        .to_string(),
+                ));
+            }
+
+            // dns-01 needs somewhere to put the TXT record and something to
+            // request it for. Enforce the full triple: domains, a known
+            // provider, and a credential source.
+            if challenge == "dns-01" {
+                if tls.is_manual() {
+                    return Err(ConfigError::Validation(
+                        "[server.tls] challenge = \"dns-01\" is an ACME (automatic) mode \
+                         but cert/key were also provided. Remove cert/key to use ACME, or \
+                         drop the challenge setting to serve the static certificate."
+                            .to_string(),
+                    ));
+                }
+                if tls.domains.is_empty() {
+                    return Err(ConfigError::Validation(
+                        "[server.tls] challenge = \"dns-01\" requires at least one entry in \
+                         `domains` (e.g. [\"*.preview.example.com\"])."
+                            .to_string(),
+                    ));
+                }
+                match tls.dns_provider.as_deref() {
+                    Some(p) if p.eq_ignore_ascii_case("cloudflare") => {
+                        let has_token = tls.cloudflare_api_token_file.is_some()
+                            || tls
+                                .cloudflare_api_token
+                                .as_deref()
+                                .is_some_and(|t| !t.trim().is_empty());
+                        if !has_token {
+                            return Err(ConfigError::Validation(
+                                "[server.tls] dns_provider = \"cloudflare\" requires an API \
+                                 token: set `cloudflare_api_token_file` (a path to a file \
+                                 holding a zone-scoped Zone.DNS:Edit token) or provide it via \
+                                 the EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN environment \
+                                 variable."
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    Some(other) => {
+                        return Err(ConfigError::Validation(format!(
+                            "[server.tls] dns_provider = \"{other}\" is not supported; the \
+                             only implemented provider is \"cloudflare\".",
+                        )));
+                    }
+                    None => {
+                        return Err(ConfigError::Validation(
+                            "[server.tls] challenge = \"dns-01\" requires `dns_provider` \
+                             (currently only \"cloudflare\")."
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
         }
 
         // Fail closed (issue #397): a `sites_domain_suffix` without a leading
@@ -5502,6 +5659,13 @@ fn default_cache_dir() -> PathBuf {
     PathBuf::from("certs")
 }
 
+/// Default ACME challenge type — TLS-ALPN-01, the zero-config path that
+/// predates the DNS-01 lane. Chosen so an existing `[server.tls]` with
+/// `domains` behaves exactly as before this knob existed.
+fn default_tls_challenge() -> String {
+    "tls-alpn-01".to_string()
+}
+
 fn default_max_execution_time() -> u32 {
     30
 }
@@ -5642,6 +5806,116 @@ mod tests {
                 .php_script(),
             None
         );
+    }
+
+    // ── [server.tls] DNS-01 challenge validation ────────────────────────
+
+    /// Load a config from TOML and validate, expecting success. Returns it.
+    fn load_ok(toml: &str) -> Config {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, toml).unwrap();
+        let config = Config::load(&file).unwrap();
+        config.validate().unwrap_or_else(|e| panic!("expected valid config, got: {e}\n{toml}"));
+        config
+    }
+
+    #[test]
+    fn tls_challenge_defaults_to_tls_alpn_01() {
+        let config = load_ok("[server.tls]\ndomains = [\"example.com\"]\n");
+        let tls = config.server.tls.expect("tls section present");
+        assert_eq!(tls.challenge, "tls-alpn-01");
+        assert!(tls.is_acme());
+        assert!(!tls.is_dns01(), "the default must not select the dns-01 lane");
+    }
+
+    #[test]
+    fn dns01_without_token_is_rejected() {
+        let err = validation_error(
+            "[server.tls]\n\
+             domains = [\"*.preview.example.com\"]\n\
+             challenge = \"dns-01\"\n\
+             dns_provider = \"cloudflare\"\n",
+        );
+        assert!(err.contains("requires an API token"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn dns01_without_provider_is_rejected() {
+        let err =
+            validation_error("[server.tls]\ndomains = [\"example.com\"]\nchallenge = \"dns-01\"\n");
+        assert!(err.contains("requires `dns_provider`"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn dns01_unknown_provider_is_rejected() {
+        let err = validation_error(
+            "[server.tls]\n\
+             domains = [\"example.com\"]\n\
+             challenge = \"dns-01\"\n\
+             dns_provider = \"route53\"\n\
+             cloudflare_api_token = \"x\"\n",
+        );
+        assert!(err.contains("not supported"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn unknown_challenge_is_rejected() {
+        let err = validation_error(
+            "[server.tls]\ndomains = [\"example.com\"]\nchallenge = \"http-01\"\n",
+        );
+        assert!(err.contains("challenge must be"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn wildcard_under_tls_alpn_01_is_rejected() {
+        let err = validation_error("[server.tls]\ndomains = [\"*.preview.example.com\"]\n");
+        assert!(err.contains("requires challenge = \"dns-01\""), "unexpected: {err}");
+    }
+
+    #[test]
+    fn dns01_wildcard_with_inline_token_validates() {
+        let config = load_ok(
+            "[server.tls]\n\
+             domains = [\"*.preview.example.com\", \"preview.example.com\"]\n\
+             challenge = \"dns-01\"\n\
+             dns_provider = \"cloudflare\"\n\
+             cloudflare_api_token = \"tok\"\n",
+        );
+        let tls = config.server.tls.expect("tls present");
+        assert!(tls.is_dns01());
+        assert!(tls.has_wildcard_domain());
+    }
+
+    #[test]
+    fn dns01_with_token_file_validates() {
+        // The file need not exist at validate() time — its readability is a
+        // runtime (fail-closed at startup) concern; presence of the path is
+        // what validate() checks.
+        let config = load_ok(
+            "[server.tls]\n\
+             domains = [\"example.com\"]\n\
+             challenge = \"dns-01\"\n\
+             dns_provider = \"cloudflare\"\n\
+             cloudflare_api_token_file = \"/run/secrets/cf-token\"\n",
+        );
+        assert!(config.server.tls.expect("tls present").is_dns01());
+    }
+
+    #[test]
+    fn dns01_token_via_env_satisfies_validation() {
+        // The env var lands in `cloudflare_api_token`, so no file/inline token
+        // is needed in the TOML.
+        let _env = EnvVars::set("EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN", "env-token");
+        let config = load_ok(
+            "[server.tls]\n\
+             domains = [\"example.com\"]\n\
+             challenge = \"dns-01\"\n\
+             dns_provider = \"cloudflare\"\n",
+        );
+        let tls = config.server.tls.expect("tls present");
+        assert_eq!(tls.cloudflare_api_token.as_deref(), Some("env-token"));
+        assert!(tls.is_dns01());
     }
 
     /// The whole tenant-isolation story rests on the path being joined onto the

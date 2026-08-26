@@ -177,9 +177,12 @@ async fn drive_acme_events<EC: Debug + 'static, EA: Debug + 'static>(mut state: 
 /// ACME leader key in the KV store.
 const ACME_LEADER_KEY: &str = "acme:leader";
 /// TTL for the ACME leader lock.
-const ACME_LEADER_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const ACME_LEADER_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Heartbeat interval for the ACME leader (must be less than TTL).
-const ACME_LEADER_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(10);
+///
+/// Shared with the DNS-01 renewal loop ([`crate::dns01`]) so both ACME lanes
+/// elect their leader on the same cadence.
+pub(crate) const ACME_LEADER_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Consecutive confirmed heartbeats required before a node acts as leader.
 ///
 /// The gossip KV tier is eventually consistent, so during the second or so it
@@ -187,7 +190,7 @@ const ACME_LEADER_HEARTBEAT: std::time::Duration = std::time::Duration::from_sec
 /// Requiring the claim to survive another heartbeat gives the deterministic
 /// tie-break in [`try_acquire_acme_leadership`] time to settle before anything
 /// talks to Let's Encrypt.
-const ACME_LEADER_CONFIRMATIONS: u32 = 2;
+pub(crate) const ACME_LEADER_CONFIRMATIONS: u32 = 2;
 /// How often a follower re-checks the KV store for the leader's certificate
 /// while holding a `load_cert` open.
 const ACME_FOLLOWER_CERT_POLL: std::time::Duration = std::time::Duration::from_secs(5);
@@ -197,7 +200,10 @@ const ACME_CHALLENGE_PREFIX: &str = "acme:challenge:";
 const ACME_CERT_PREFIX: &str = "acme:cert:";
 
 /// Generate a unique node identifier for ACME leader election.
-fn acme_node_id() -> String {
+///
+/// Shared with [`crate::dns01`] so both ACME lanes derive their node identity
+/// (and therefore the lowest-id tie-break) the same way.
+pub(crate) fn acme_node_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let pid = std::process::id();
@@ -326,7 +332,7 @@ async fn drive_clustered_acme_events<EC: Debug + 'static, EA: Debug + 'static>(
 /// The caller additionally waits [`ACME_LEADER_CONFIRMATIONS`] heartbeats
 /// before acting on a claim, so the pre-convergence window cannot turn into
 /// duplicate certificate orders.
-fn try_acquire_acme_leadership(store: &Store, node_id: &str) -> bool {
+pub(crate) fn try_acquire_acme_leadership(store: &Store, node_id: &str) -> bool {
     let key = ACME_LEADER_KEY.to_string();
     let claim = node_id.as_bytes().to_vec();
 
@@ -1062,6 +1068,11 @@ mod tests {
             domains: vec!["example.com".into()],
             cache_dir: tmp.path().to_path_buf(),
             staging: true,
+            challenge: "tls-alpn-01".into(),
+            dns_provider: None,
+            cloudflare_api_token_file: None,
+            cloudflare_api_token: None,
+            cloudflare_zone_id: None,
             listen: None,
             redirect_http: false,
         };
