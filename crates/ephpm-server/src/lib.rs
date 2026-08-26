@@ -20,6 +20,7 @@ mod site_overrides;
 pub mod site_wire_auth;
 pub mod static_files;
 pub mod stream_compress;
+pub mod tenant_ebpf;
 mod timeline;
 pub mod tls;
 pub mod tracked_backend;
@@ -700,6 +701,60 @@ async fn bind_listeners(
         ephpm_php::PhpRuntime::set_ws_registry(Arc::clone(&runtime.registry));
     }
 
+    // Per-vhost eBPF network policy ([server.tenant_network] ebpf_policy).
+    // Load + attach BEFORE the router is built, then hand the Arc to it. Fail
+    // closed: with ebpf_policy = true a load/attach, range, or overlap failure
+    // aborts startup — ePHPm must never come up with the policy the operator
+    // asked for silently absent (docs-must-match-code).
+    let tenant_ebpf: Option<Arc<tenant_ebpf::TenantEbpf>> =
+        if config.server.tenant_network.ebpf_policy {
+            let port_of = |addr: &str| -> Option<u16> {
+                addr.rsplit_once(':').and_then(|(_, p)| p.trim().parse().ok())
+            };
+            let range = config
+                .server
+                .tenant_network
+                .parse_range()
+                .map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
+            // The sidecar range must not overlap the kernel ephemeral range, or an
+            // outbound source port could collide with a handed-out real port.
+            tenant_ebpf::TenantEbpf::assert_no_ephemeral_overlap(range)?;
+            // ePHPm's own loopback infra ports every tagged vhost may reach: the
+            // stock pdo_mysql wire listener and the KV RESP listener.
+            let mut infra_ports: Vec<u16> = Vec::new();
+            if let Some((_, listen)) = per_site_db_wire.as_ref()
+                && let Some(p) = port_of(listen)
+            {
+                infra_ports.push(p);
+            }
+            if config.kv.redis_compat.enabled
+                && let Some(p) = port_of(&config.kv.redis_compat.listen)
+            {
+                infra_ports.push(p);
+            }
+            let handle = tenant_ebpf::TenantEbpf::load_and_attach(
+                config.server.tenant_network.cgroup_path.as_deref(),
+                &infra_ports,
+            )
+            .context(
+                "loading the eBPF per-vhost network policy ([server.tenant_network] ebpf_policy = \
+             true). Requires Linux >= 5.10 with CONFIG_CGROUP_BPF + BTF and CAP_BPF + \
+             CAP_NET_ADMIN. Also confirm any external nft egress floor drops its blanket \
+             loopback-DROP for the ePHPm cgroup, or every sidecar connect will fail.",
+            )?;
+            handle.fill_pool(range, config.server.tenant_network.max_sidecar_ports_per_vhost)?;
+            tracing::info!(
+                cgroup = ?config.server.tenant_network.cgroup_path,
+                sidecar_port_range = %config.server.tenant_network.sidecar_port_range,
+                max_per_vhost = config.server.tenant_network.max_sidecar_ports_per_vhost,
+                ?infra_ports,
+                "tenant_network: eBPF per-vhost policy loaded and attached"
+            );
+            Some(handle)
+        } else {
+            None
+        };
+
     // `Router::share` rather than `Arc::new`: a WebSocket session outlives the
     // request that created it and keeps dispatching PHP events through this
     // router, so the Arc has to be reachable from the router itself.
@@ -713,6 +768,7 @@ async fn bind_listeners(
             file_cache.clone(),
             worker_pool.clone(),
         )
+        .with_tenant_ebpf(tenant_ebpf)
         .with_middleware_chain(middleware_chain)
         // Expose the effective gossip node id to PHP (EPHPM_NODE_ID). When
         // clustering is on this is the runtime id -- distinct per node even
