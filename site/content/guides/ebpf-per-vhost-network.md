@@ -97,7 +97,17 @@ Add a drop-in (`/etc/systemd/system/ephpm.service.d/ebpf.conf`):
 [Service]
 AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_BPF CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_BPF CAP_NET_ADMIN
+LimitMEMLOCK=infinity
 ```
+
+`LimitMEMLOCK=infinity` is required, not optional. BPF maps are charged against
+`RLIMIT_MEMLOCK`, and the default limit (8 MB) is too small for the policy's
+maps. ePHPm tries to raise the limit itself at load time, but under
+`NoNewPrivileges` (which the hardened unit sets) it cannot without
+`CAP_SYS_RESOURCE` — so the raise is refused and map creation fails with
+`failed to create map ... Operation not permitted` **even when `CAP_BPF` and
+`CAP_NET_ADMIN` are both present**. Setting the limit in the unit sidesteps the
+in-process raise entirely.
 
 Then `systemctl daemon-reload && systemctl restart ephpm`. These are granted
 only to the hardened multi-tenant profile that opts into `ebpf_policy`; a

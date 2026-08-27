@@ -739,8 +739,12 @@ async fn bind_listeners(
             .context(
                 "loading the eBPF per-vhost network policy ([server.tenant_network] ebpf_policy = \
              true). Requires Linux >= 5.10 with CONFIG_CGROUP_BPF + BTF and CAP_BPF + \
-             CAP_NET_ADMIN. Also confirm any external nft egress floor drops its blanket \
-             loopback-DROP for the ePHPm cgroup, or every sidecar connect will fail.",
+             CAP_NET_ADMIN. It also needs a raised RLIMIT_MEMLOCK (LimitMEMLOCK=infinity in the \
+             systemd unit): BPF maps are charged against memlock and the loader cannot raise the \
+             limit itself under NoNewPrivileges (no CAP_SYS_RESOURCE), so its absence surfaces as \
+             'failed to create map ... Operation not permitted' even when the capabilities are \
+             correct. Also confirm any external nft egress floor drops its blanket loopback-DROP \
+             for the ePHPm cgroup, or every sidecar connect will fail.",
             )?;
             handle.fill_pool(range, config.server.tenant_network.max_sidecar_ports_per_vhost)?;
             tracing::info!(
