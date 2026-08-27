@@ -1,5 +1,17 @@
 name: Release
 
+# NODE24 / DE-CONTAINERIZATION NOTE ------------------------------------------
+# GitHub now runs JavaScript actions (actions/checkout, actions/upload-artifact)
+# on node24. node24 does NOT start on glibc 2.28, which is exactly what our
+# ephpm-ci build image is (almalinux8 -- chosen to pin the shipped Linux
+# binary's glibc floor at 2.28; see docker/Dockerfile.gha). A `container:` job
+# execs the runner's node INSIDE that container, so every JS action began to
+# silently no-op (empty checkout -> "could not find Cargo.toml"), which blocked
+# releases. Fix: the Linux jobs (setup, build-linux, build-linux-arm64) run on
+# the BARE host (modern glibc -> node24 fine) and run only the build in ephpm-ci
+# via `docker run`, which preserves the 2.28 link floor. Do NOT re-add
+# `container:` to these jobs, and do NOT raise the ephpm-ci base image.
+#
 # Release artifacts produced per tag:
 #
 #   * Per-platform binary archives uploaded to the GitHub release:
@@ -100,8 +112,15 @@ jobs:
   # docker-image (which runs on dispatch too) needs docker_matrix either way.
   setup:
     name: Derive PHP matrix
+    # NOT a `container:` job — see the node24 note in the workflow header.
+    # GitHub runs JS actions (checkout, upload-artifact) on node24, which cannot
+    # start on the ephpm-ci image's glibc 2.28 (almalinux8). In a container job
+    # the runner execs those JS actions INSIDE the container, where node24
+    # silently no-ops (empty checkout -> "could not find Cargo.toml"). So the
+    # job runs on the bare host (modern glibc, node24 fine) and only the build
+    # runs in the container via `docker run`, preserving the 2.28 link floor.
+    # Same pattern in build-linux / build-linux-arm64.
     runs-on: [self-hosted, linux, x64]
-    container: "ephpm/ephpm-ci:latest"
     outputs:
       # JSON arrays of {minor, full} (php/tailcall) and {minor, full, default}
       # (docker). See `cargo xtask php-versions --github-matrix`.
@@ -113,10 +132,14 @@ jobs:
 
       - name: Emit PHP build matrix from xtask PHP_SDK_VERSIONS
         id: matrix
-        # xtask prints three `key=value` lines (each value a single-line JSON
-        # array) straight into $GITHUB_OUTPUT. cargo's own progress goes to
-        # stderr, so stdout carries only those lines.
-        run: cargo run --quiet -p xtask -- php-versions --github-matrix >> "$GITHUB_OUTPUT"
+        # xtask prints three `key=value` lines (each a single-line JSON array)
+        # to stdout; cargo progress goes to stderr. The `>>` redirect runs on the
+        # HOST, capturing the container's stdout into the host $GITHUB_OUTPUT
+        # (a container step can't write the host output file directly).
+        run: |
+          docker run --rm -v "$PWD":/w -w /w \
+            ephpm/ephpm-ci:latest \
+            cargo run --quiet -p xtask -- php-versions --github-matrix >> "$GITHUB_OUTPUT"
 
   # -- Linux x86_64 binaries ---------------------------------------------------
   # arm64 lives in its own job (build-linux-arm64) so it can be throttled
@@ -131,7 +154,8 @@ jobs:
     if: github.event_name == 'push'
     needs: setup
     runs-on: [self-hosted, linux, x64]
-    container: "ephpm/ephpm-ci:${{ matrix.arch.image }}"
+    # No `container:` — de-containerized so node24 JS actions run on the host;
+    # only the build runs in ephpm-ci (glibc 2.28 floor). See the setup job.
     strategy:
       fail-fast: false
       matrix:
@@ -146,44 +170,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute release version
-        # Strip the leading "v" from the git ref name so EPHPM_RELEASE_VERSION
-        # is a bare SemVer string ("v0.1.1" -> "0.1.1") matching clap's
-        # default `<bin> <version>` formatting. crates/ephpm/build.rs forwards
-        # this into the binary so `ephpm --version` reports the actual tag
-        # instead of the frozen workspace version in Cargo.toml.
-        env:
-          REF_NAME: ${{ github.ref_name }}
+      - name: Build ephpm in the ephpm-ci container
+        # Version + clang-install + build run in ONE `docker run` in ephpm-ci
+        # (almalinux8, glibc 2.28 link floor). What were $GITHUB_ENV values are
+        # passed as -e. The workspace is bind-mounted at /w, so target/ lands on
+        # the host for the packaging step below.
+        #   - EPHPM_RELEASE_VERSION: bare SemVer ("v0.1.1" -> "0.1.1"), forwarded
+        #     into the binary by crates/ephpm/build.rs so `ephpm --version` reports
+        #     the tag, not the frozen Cargo.toml version. Expanded on the HOST.
+        #   - CARGO_PROFILE_RELEASE_LTO: overrides Cargo.toml's profile.release.lto
+        #     per-arch (x64 keeps fat LTO; it builds fine on the x64 hosts).
         run: |
           set -eu
-          echo "EPHPM_RELEASE_VERSION=${REF_NAME#v}" >> "$GITHUB_ENV"
-
-      - name: Install clang for the eBPF object (best-effort)
-        # The ephpm-ci container carries libclang-dev (for the PHP SAPI's
-        # bindgen) but not the `clang` binary that crates/ephpm-server/build.rs
-        # uses to compile the per-vhost network-policy BPF program. Install it
-        # here. Non-fatal: build.rs stubs the feature (fail-closed; ebpf_policy
-        # is off by default) if clang is unavailable, so a transient apt failure
-        # logs a warning instead of parking the release.
-        run: |
-          set -u
-          if command -v clang >/dev/null 2>&1; then
-            echo "clang already present: $(clang --version | head -1)"
-          else
-            (apt-get update && apt-get install -y --no-install-recommends clang llvm) \
-              || echo "::warning::clang/llvm install failed; ebpf_policy will be stubbed in this build"
-          fi
-          clang --version 2>/dev/null | head -1 \
-            || echo "::warning::clang still unavailable; eBPF object will be stubbed"
-
-      - name: Build ephpm
-        env:
-          # Overrides profile.release.lto from Cargo.toml per-arch (see the
-          # matrix `lto` value). linux-x64 keeps fat LTO -- it builds fine on
-          # the x64 hosts. The memory-constrained targets (linux-aarch64,
-          # windows) run in their own jobs below with LTO disabled.
-          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.arch.lto }}
-        run: cargo xtask release ${{ matrix.php.minor }}
+          docker run --rm -v "$PWD":/w -w /w \
+            -e EPHPM_RELEASE_VERSION="${GITHUB_REF_NAME#v}" \
+            -e CARGO_PROFILE_RELEASE_LTO="${{ matrix.arch.lto }}" \
+            -e CARGO_TERM_COLOR=always \
+            "ephpm/ephpm-ci:${{ matrix.arch.image }}" \
+            sh -euc '
+              # ephpm-ci has libclang-dev (bindgen) but not the clang binary
+              # crates/ephpm-server/build.rs needs for the BPF object. Non-fatal:
+              # build.rs stubs the feature (fail-closed; ebpf_policy off by default).
+              command -v clang >/dev/null 2>&1 \
+                || (apt-get update && apt-get install -y --no-install-recommends clang llvm) \
+                || echo "::warning::clang install failed; ebpf_policy will be stubbed"
+              cargo xtask release ${{ matrix.php.minor }}
+            '
 
       - name: Package archive
         id: pkg
@@ -223,7 +235,8 @@ jobs:
     needs: [build-macos, setup]
     if: github.event_name == 'push'
     runs-on: [self-hosted, linux, arm64]
-    container: "ephpm/ephpm-ci:latest-arm64"
+    # No `container:` — de-containerized like build-linux (node24 JS actions on
+    # the host; build in ephpm-ci:latest-arm64 for the glibc 2.28 floor).
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -233,42 +246,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute release version
-        # See build-linux for rationale; strips leading "v" from the git ref.
-        env:
-          REF_NAME: ${{ github.ref_name }}
+      - name: Build ephpm in the ephpm-ci container
+        # See build-linux. LTO off on arm64: the fat-LTO final link of the ephpm
+        # binary (libphp.a + ICU + everything, codegen-units=1 per #171) exceeds
+        # the arm64 build host's memory -- rustc gets OOM-SIGKILLed even as the
+        # only job (#181/#183). Disabling LTO cuts link-time memory the most for
+        # a low single-digit perf delta. Revisit once the VM memory is raised.
         run: |
           set -eu
-          echo "EPHPM_RELEASE_VERSION=${REF_NAME#v}" >> "$GITHUB_ENV"
-
-      - name: Install clang for the eBPF object (best-effort)
-        # See build-linux: the arm64 ephpm-ci container likewise carries
-        # libclang-dev but not the clang binary build.rs needs for the BPF
-        # object. Non-fatal — build.rs stubs the feature if clang is missing.
-        run: |
-          set -u
-          if command -v clang >/dev/null 2>&1; then
-            echo "clang already present: $(clang --version | head -1)"
-          else
-            (apt-get update && apt-get install -y --no-install-recommends clang llvm) \
-              || echo "::warning::clang/llvm install failed; ebpf_policy will be stubbed in this build"
-          fi
-          clang --version 2>/dev/null | head -1 \
-            || echo "::warning::clang still unavailable; eBPF object will be stubbed"
-
-      - name: Build ephpm
-        env:
-          # LTO off on arm64: the fat-LTO final link of the ephpm binary
-          # (libphp.a + ICU + everything, codegen-units=1 from profile.release
-          # per #171) exceeds the arm64 build host's memory -- rustc gets
-          # SIGKILLed by the OOM killer even running as the only job. Thin LTO
-          # (#181) held for a while, but the turso engine (#183, linked by
-          # default) grew the binary past what thin-LTO fits on this host in
-          # the v0.5.1 arc. Disabling LTO cuts link-time memory the most, for
-          # a low single-digit perf delta on a target with no published
-          # benchmark numbers. Revisit thin/fat once the VM memory is raised.
-          CARGO_PROFILE_RELEASE_LTO: "off"
-        run: cargo xtask release ${{ matrix.php.minor }}
+          docker run --rm -v "$PWD":/w -w /w \
+            -e EPHPM_RELEASE_VERSION="${GITHUB_REF_NAME#v}" \
+            -e CARGO_PROFILE_RELEASE_LTO="off" \
+            -e CARGO_TERM_COLOR=always \
+            ephpm/ephpm-ci:latest-arm64 \
+            sh -euc '
+              command -v clang >/dev/null 2>&1 \
+                || (apt-get update && apt-get install -y --no-install-recommends clang llvm) \
+                || echo "::warning::clang install failed; ebpf_policy will be stubbed"
+              cargo xtask release ${{ matrix.php.minor }}
+            '
 
       - name: Package archive
         id: pkg
