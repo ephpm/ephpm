@@ -16,6 +16,7 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=bpf/vhostnet.bpf.c");
+    println!("cargo:rerun-if-changed=bpf/include");
     println!("cargo:rerun-if-changed=build.rs");
 
     // Non-Linux hosts: nothing to compile. The Linux-only `cfg` in
@@ -31,9 +32,11 @@ fn main() {
     // to mirror `$CLANG`.
     let strip = std::env::var("LLVM_STRIP").unwrap_or_else(|_| "llvm-strip".to_string());
 
-    // Multiarch include path (needed for <asm/types.h> under -target bpf, which
-    // has no default system include search of its own). Derived from the target
-    // arch so cross-compiles pick the right tree.
+    // Multiarch include path (Debian/Ubuntu) for <asm/types.h> under -target bpf.
+    // Only Debian-family puts the kernel UAPI asm headers under a multiarch
+    // subdir; RHEL-family (almalinux -- our release image) has them on the
+    // default path, where this `-idirafter` is a harmless no-op. Derived from the
+    // target arch so cross-compiles pick the right tree.
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".into());
     let (multiarch_inc, target_def) = match arch.as_str() {
         "aarch64" => ("/usr/include/aarch64-linux-gnu", "-D__TARGET_ARCH_arm64"),
@@ -49,6 +52,14 @@ fn main() {
             "-target",
             "bpf",
             target_def,
+            // libbpf program-side headers (<bpf/bpf_helpers.h> etc.) are VENDORED
+            // under bpf/include, not taken from the build host: they ship with
+            // libbpf-dev on Debian/Ubuntu but are not packaged for almalinux8
+            // (our glibc-2.28 release image), so relying on the host silently
+            // stubbed the eBPF object there. Vendoring makes the compile
+            // distro-independent. See bpf/include/NOTICE for provenance/license.
+            "-I",
+            "bpf/include",
             "-idirafter",
             multiarch_inc,
             "-c",

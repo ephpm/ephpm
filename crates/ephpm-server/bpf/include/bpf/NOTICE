@@ -1,0 +1,21 @@
+Vendored libbpf program-side (BPF-target) headers
+==================================================
+
+These headers are copied verbatim from libbpf (https://github.com/libbpf/libbpf,
+src/), the standard, upstream-sanctioned way to make a BPF C program compile
+without depending on the build host having libbpf-dev/libbpf-devel installed.
+
+Why vendored: `libbpf-dev` ships them on Debian/Ubuntu, but `libbpf-devel` is
+not packaged for almalinux8 (the glibc-2.28 image ePHPm's Linux release binary
+links against). Relying on the host therefore compiled the eBPF object fine on
+Ubuntu but silently stubbed it in the release container. Vendoring makes
+crates/ephpm-server/build.rs's `clang -target bpf` compile distro-independent.
+
+Files (each carries its own SPDX header):
+  bpf_helpers.h, bpf_helper_defs.h, bpf_endian.h, bpf_core_read.h, bpf_tracing.h
+
+License: (LGPL-2.1-only OR BSD-2-Clause) -- see the SPDX-License-Identifier line
+at the top of each file. ePHPm uses them under BSD-2-Clause.
+
+These are compile-time-only headers for the BPF object; they are not linked into
+the ephpm binary and are not Cargo dependencies (cargo-deny does not see them).
