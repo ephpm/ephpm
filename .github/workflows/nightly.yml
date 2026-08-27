@@ -31,7 +31,14 @@ jobs:
     # fleet's dedicated arm64 runner node (ephemerd dispatches
     # `[self-hosted, linux, arm64]`). Each uses the matching CI image.
     runs-on: [self-hosted, linux, "${{ matrix.arch.runner }}"]
-    container: "ephpm/ephpm-ci:${{ matrix.arch.image }}"
+    # De-containerized for node24: GitHub runs JS actions (checkout,
+    # upload-artifact) on node24, which cannot start on the ephpm-ci image's
+    # glibc 2.28 (almalinux8). In a `container:` job the runner execs those JS
+    # actions INSIDE the container, where node24 silently no-ops (empty checkout
+    # -> "could not find Cargo.toml"). So the job runs on the bare host (modern
+    # glibc, node24 fine) and only the build/tests run in ephpm-ci via
+    # `docker run`, preserving the 2.28 link floor. See release.yml's header for
+    # the full rationale. Do NOT re-add `container:` here.
     strategy:
       fail-fast: false
       matrix:
@@ -55,49 +62,69 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build ephpm
-        env:
-          # Per-arch LTO, mirroring release.yml's build-linux-arm64 step.
-          #
-          # The fat-LTO final link of the ephpm binary (libphp.a + ICU +
-          # everything, codegen-units=1 from profile.release) exceeds the
-          # arm64 build host's memory -- rustc gets SIGKILLed by the OOM
-          # killer. That killed every linux-aarch64 nightly leg for 8+
-          # consecutive runs; often the OOM killer took the runner agent
-          # too, surfacing as "the self-hosted runner lost communication
-          # with the server" rather than a build error.
-          #
-          # Thin LTO is NOT enough here: release.yml tried it (#181) and
-          # had to drop to off once the turso engine (#183) grew the
-          # binary. Match release.yml so nightly and release build the
-          # arm64 artifact the same way. Revisit once the arm64 node's
-          # memory is raised.
-          CARGO_PROFILE_RELEASE_LTO: ${{ matrix.arch.lto }}
-        run: cargo xtask release ${{ matrix.php }}
+        # Per-arch LTO, mirroring release.yml's build-linux-arm64 step.
+        #
+        # The fat-LTO final link of the ephpm binary (libphp.a + ICU +
+        # everything, codegen-units=1 from profile.release) exceeds the
+        # arm64 build host's memory -- rustc gets SIGKILLed by the OOM
+        # killer. That killed every linux-aarch64 nightly leg for 8+
+        # consecutive runs; often the OOM killer took the runner agent
+        # too, surfacing as "the self-hosted runner lost communication
+        # with the server" rather than a build error.
+        #
+        # Thin LTO is NOT enough here: release.yml tried it (#181) and
+        # had to drop to off once the turso engine (#183) grew the
+        # binary. Match release.yml so nightly and release build the
+        # arm64 artifact the same way. Revisit once the arm64 node's
+        # memory is raised.
+        #
+        # Build runs in ephpm-ci via `docker run` (glibc 2.28 floor; see the
+        # de-containerization note on this job). The workspace is bind-mounted
+        # at /w so target/ is readable by the steps below; the former
+        # $GITHUB_ENV LTO override is passed as -e.
+        run: |
+          set -eu
+          docker run --rm -v "$PWD":/w -w /w \
+            -e CARGO_PROFILE_RELEASE_LTO="${{ matrix.arch.lto }}" \
+            -e CARGO_TERM_COLOR=always \
+            "ephpm/ephpm-ci:${{ matrix.arch.image }}" \
+            sh -euc 'cargo xtask release ${{ matrix.php }}'
 
       - name: Run ignored integration tests
         # Auxiliary -- does not gate the release path. Currently broken due to
         # a libphp+libxml2 link-order issue when building debug test binaries
         # (release builds dodge it via --gc-sections). Tracked as a separate
         # task; meanwhile keep running it so we can observe the error change.
+        # Runs in ephpm-ci via `docker run`; the SDK downloaded by the build
+        # above and target/ are read back through the /w bind mount.
         continue-on-error: true
         run: |
-          # Linux SDK cache dirs carry the -gnu libc suffix (see
-          # xtask::php_sdk_libc_suffix).
-          PHP_SDK_PATH=$(find "$(pwd)/php-sdk" -mindepth 1 -maxdepth 1 -type d -name '*-${{ matrix.arch.sdk }}-gnu' | head -1)
-          test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
-          PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run \
-            --target ${{ matrix.arch.triple }} \
-            --workspace --run-ignored ignored-only
+          docker run --rm -v "$PWD":/w -w /w \
+            "ephpm/ephpm-ci:${{ matrix.arch.image }}" \
+            sh -euc '
+              # Linux SDK cache dirs carry the -gnu libc suffix (see
+              # xtask::php_sdk_libc_suffix).
+              PHP_SDK_PATH=$(find "$(pwd)/php-sdk" -mindepth 1 -maxdepth 1 -type d -name "*-${{ matrix.arch.sdk }}-gnu" | head -1)
+              test -n "$PHP_SDK_PATH" || { echo "::error::PHP SDK not found"; exit 1; }
+              PHP_SDK_PATH="$PHP_SDK_PATH" cargo nextest run \
+                --target ${{ matrix.arch.triple }} \
+                --workspace --run-ignored ignored-only
+            '
 
       - name: Verify binary
         # cargo xtask release passes the gnu triple explicitly on Linux
         # (glibc-dynamic binary, dlopen-capable), so the artifact lives
-        # under target/<triple>/release/, not target/release/.
+        # under target/<triple>/release/, not target/release/. Runs in
+        # ephpm-ci via `docker run` -- the bare host has no `file` utility.
         run: |
-          FILE="target/${{ matrix.arch.triple }}/release/ephpm"
-          test -f "$FILE" || { echo "::error::Binary not found at $FILE"; exit 1; }
-          file "$FILE"
-          ls -lh "$FILE"
+          docker run --rm -v "$PWD":/w -w /w \
+            "ephpm/ephpm-ci:${{ matrix.arch.image }}" \
+            sh -euc '
+              FILE="target/${{ matrix.arch.triple }}/release/ephpm"
+              test -f "$FILE" || { echo "::error::Binary not found at $FILE"; exit 1; }
+              file "$FILE"
+              ls -lh "$FILE"
+            '
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -343,9 +370,13 @@ jobs:
   fuzz:
     name: Fuzz (${{ matrix.target }})
     runs-on: [self-hosted, linux, x64]
-    # Run inside the CI image: `cargo install cargo-fuzz` and the fuzz
-    # targets themselves need a C linker, and bare runners only ship rustup.
-    container: ephpm/ephpm-ci:latest
+    # De-containerized for node24 (JS actions no-op on the ephpm-ci image's
+    # glibc 2.28 -- see release.yml's header). checkout / rust-toolchain /
+    # rust-cache / upload-artifact run on the bare host; the fuzz build+run
+    # still happens in ephpm-ci via `docker run` because `cargo install
+    # cargo-fuzz` and the fuzz targets need the image's C linker (bare runners
+    # only ship rustup). Swatinem caches fuzz/target, which is inside the /w
+    # bind mount and so visible to the container build.
     # Auxiliary -- does not gate the release path.
     continue-on-error: true
     strategy:
@@ -364,14 +395,22 @@ jobs:
         with:
           workspaces: fuzz -> target
 
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked || true
-
-      - name: Run fuzzer (5 minutes)
+      - name: Install cargo-fuzz and run fuzzer (5 minutes)
+        # install + run share ONE `docker run`: `cargo install` lands in the
+        # container's ~/.cargo/bin, which does not survive to a second
+        # container. nightly is installed inside the image (what dtolnay did
+        # in-container before de-containerization); the host toolchain step
+        # above is now belt-and-braces.
         run: |
-          cd fuzz
-          cargo +nightly fuzz run ${{ matrix.target }} \
-            -- -max_total_time=300 -print_final_stats=1
+          docker run --rm -v "$PWD":/w -w /w \
+            ephpm/ephpm-ci:latest \
+            sh -euc '
+              rustup toolchain install nightly --profile minimal >/dev/null 2>&1 || true
+              cargo install cargo-fuzz --locked || true
+              cd fuzz
+              cargo +nightly fuzz run ${{ matrix.target }} \
+                -- -max_total_time=300 -print_final_stats=1
+            '
 
       - name: Upload corpus
         if: always()
@@ -393,14 +432,15 @@ jobs:
     name: E2E (PHP ${{ matrix.php }})
     needs: [build-linux]
     runs-on: [self-hosted, linux, x64]
-    # Run inside the CI image so cargo has a C linker available
-    # (xtask needs `cc` to compile; bare runners only ship rustup).
-    # Same image as build-linux. `cargo xtask e2e` dispatches to
-    # xtask/src/e2e_bare.rs, which spawns ephpm processes directly on
-    # 127.0.0.1 -- no Kind, no Tilt, no docker socket, no privileged
-    # DinD. The Kind path lives behind `cargo xtask k8s-e2e` and is
+    # De-containerized for node24 (JS actions no-op on the ephpm-ci image's
+    # glibc 2.28 -- see release.yml's header). checkout runs on the bare host;
+    # the E2E run itself goes in ephpm-ci via `docker run` so cargo has a C
+    # linker available (xtask needs `cc` to compile; bare runners only ship
+    # rustup). `cargo xtask e2e` dispatches to xtask/src/e2e_bare.rs, which
+    # spawns ephpm processes directly on 127.0.0.1 -- no Kind, no Tilt, no
+    # docker socket, no privileged DinD -- so it is fully self-contained inside
+    # the one container. The Kind path lives behind `cargo xtask k8s-e2e` and is
     # only reachable from k8s-e2e.yml (workflow_dispatch only).
-    container: ephpm/ephpm-ci:latest
     # Auxiliary -- does not gate the release path.
     continue-on-error: true
     strategy:
@@ -411,7 +451,11 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Run bare-process E2E tests
-        run: cargo xtask e2e --php-version ${{ matrix.php }}
+        run: |
+          docker run --rm -v "$PWD":/w -w /w \
+            -e CARGO_TERM_COLOR=always \
+            ephpm/ephpm-ci:latest \
+            sh -euc 'cargo xtask e2e --php-version ${{ matrix.php }}'
 
   # -- 4. App smoke tests (WordPress, Laravel, Symfony on litewire SQLite) --
 
@@ -419,10 +463,29 @@ jobs:
     name: Smoke Tests (PHP ${{ matrix.php }})
     needs: [build-linux]
     runs-on: [self-hosted, linux, x64]
-    # Run inside the CI image: the bare runner has no `file` utility and
-    # its docker CLI lacks the compose v2 plugin. The image ships both,
-    # and ephemerd's host docker socket is reachable from inside.
-    container: ephpm/ephpm-ci:latest
+    # De-containerized for node24 (JS actions no-op on the ephpm-ci image's
+    # glibc 2.28 -- see release.yml's header). checkout / download-artifact /
+    # upload-artifact run on the bare host; the smoke run itself goes in
+    # ephpm-ci via `docker run` because the bare runner has no `file` utility
+    # and its docker CLI lacks the compose v2 plugin -- the image ships both.
+    #
+    # Every containerized smoke step uses the SAME flag set so it behaves like
+    # the old `container:` job did:
+    #   --network host                       reach compose's published ports at
+    #                                        localhost:808x (what the smoke
+    #                                        scripts curl), same as the job
+    #                                        container's host networking.
+    #   -v /var/run/docker.sock:...          drive the HOST docker daemon
+    #                                        (docker compose / exec / logs),
+    #                                        reachable from the job before.
+    #   -v "$PWD":"$PWD" -w "$PWD"           mount the workspace at its HOST
+    #                                        path so docker-compose.smoke.yml's
+    #                                        relative bind mounts (./tests/...,
+    #                                        ${EPHPM_BINARY}) resolve to real
+    #                                        host paths for that host daemon.
+    #   -e EPHPM_BINARY                      forward the path computed on the
+    #                                        host (a container step cannot write
+    #                                        the host $GITHUB_ENV).
     # Auxiliary -- does not gate the release path.
     continue-on-error: true
     strategy:
@@ -439,6 +502,9 @@ jobs:
           path: artifact
 
       - name: Prepare binary
+        # Runs on the host: it writes EPHPM_BINARY to $GITHUB_ENV, a host file a
+        # container step cannot touch. All coreutils; `file` is guarded because
+        # the bare runner may not ship it.
         run: |
           # The artifact contains target/<triple>/release/ephpm -- find and flatten it
           BINARY=$(find artifact -name ephpm -type f | head -1)
@@ -450,7 +516,7 @@ jobs:
           mkdir -p target
           cp "$BINARY" target/ephpm
           chmod +x target/ephpm
-          file target/ephpm
+          command -v file >/dev/null 2>&1 && file target/ephpm || true
           echo "EPHPM_BINARY=./target/ephpm" >> "$GITHUB_ENV"
 
       - name: Make scripts executable
@@ -458,47 +524,80 @@ jobs:
 
       - name: Start smoke test containers
         run: |
-          docker compose -f docker/docker-compose.smoke.yml up -d
-          echo "==> Waiting for containers to initialize..."
-          # Give containers time to download dependencies and set up apps
-          sleep 30
+          docker run --rm --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":"$PWD" -w "$PWD" -e EPHPM_BINARY \
+            ephpm/ephpm-ci:latest \
+            sh -euc '
+              docker compose -f docker/docker-compose.smoke.yml up -d
+              echo "==> Waiting for containers to initialize..."
+              # Give containers time to download dependencies and set up apps
+              sleep 30
+            '
 
       - name: Wait for containers healthy
         timeout-minutes: 10
         run: |
-          for svc in wordpress laravel symfony; do
-            echo "==> Waiting for ${svc}..."
-            timeout 300 bash -c "
-              until docker compose -f docker/docker-compose.smoke.yml ps ${svc} \
-                | grep -q healthy; do
-                sleep 5
+          docker run --rm --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":"$PWD" -w "$PWD" -e EPHPM_BINARY \
+            ephpm/ephpm-ci:latest \
+            sh -euc '
+              for svc in wordpress laravel symfony; do
+                echo "==> Waiting for ${svc}..."
+                timeout 300 bash -c "
+                  until docker compose -f docker/docker-compose.smoke.yml ps ${svc} \
+                    | grep -q healthy; do
+                    sleep 5
+                  done
+                " || {
+                  echo "::warning::${svc} did not become healthy in time"
+                  docker compose -f docker/docker-compose.smoke.yml logs ${svc} | tail -100
+                }
               done
-            " || {
-              echo "::warning::${svc} did not become healthy in time"
-              docker compose -f docker/docker-compose.smoke.yml logs ${svc} | tail -100
-            }
-          done
+            '
 
       - name: Run WordPress smoke tests
         if: always()
-        run: bash tests/smoke/wp-smoke.sh
+        run: |
+          docker run --rm --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":"$PWD" -w "$PWD" -e EPHPM_BINARY \
+            ephpm/ephpm-ci:latest \
+            bash tests/smoke/wp-smoke.sh
 
       - name: Run Laravel smoke tests
         if: always()
-        run: bash tests/smoke/laravel-smoke.sh
+        run: |
+          docker run --rm --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":"$PWD" -w "$PWD" -e EPHPM_BINARY \
+            ephpm/ephpm-ci:latest \
+            bash tests/smoke/laravel-smoke.sh
 
       - name: Run Symfony smoke tests
         if: always()
-        run: bash tests/smoke/symfony-smoke.sh
+        run: |
+          docker run --rm --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":"$PWD" -w "$PWD" -e EPHPM_BINARY \
+            ephpm/ephpm-ci:latest \
+            bash tests/smoke/symfony-smoke.sh
 
       - name: Collect container logs
         if: failure()
         run: |
-          mkdir -p smoke-logs
-          for svc in wordpress laravel symfony; do
-            docker compose -f docker/docker-compose.smoke.yml logs ${svc} \
-              > "smoke-logs/${svc}.log" 2>&1 || true
-          done
+          docker run --rm --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":"$PWD" -w "$PWD" -e EPHPM_BINARY \
+            ephpm/ephpm-ci:latest \
+            sh -euc '
+              mkdir -p smoke-logs
+              for svc in wordpress laravel symfony; do
+                docker compose -f docker/docker-compose.smoke.yml logs ${svc} \
+                  > "smoke-logs/${svc}.log" 2>&1 || true
+              done
+            '
 
       - name: Upload smoke test logs
         if: failure()
@@ -509,16 +608,23 @@ jobs:
 
       - name: Tear down
         if: always()
-        run: docker compose -f docker/docker-compose.smoke.yml down -v
+        run: |
+          docker run --rm --network host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD":"$PWD" -w "$PWD" -e EPHPM_BINARY \
+            ephpm/ephpm-ci:latest \
+            sh -euc 'docker compose -f docker/docker-compose.smoke.yml down -v'
 
   # -- 5. Dependency audit --------------------------------------------------
 
   audit:
     name: Dependency Audit
     runs-on: [self-hosted, linux, x64]
-    # Run inside the CI image so cargo-audit/cargo-outdated can compile
-    # (they need a C linker; bare runners only ship rustup).
-    container: ephpm/ephpm-ci:latest
+    # De-containerized for node24 (JS actions no-op on the ephpm-ci image's
+    # glibc 2.28 -- see release.yml's header). checkout / rust-toolchain run on
+    # the bare host; the audit tools run in ephpm-ci via `docker run` so
+    # cargo-deny/cargo-outdated have the image's C linker and a `cargo` to shell
+    # out to (bare runners only ship rustup).
     # Auxiliary -- does not gate the release path.
     continue-on-error: true
     env:
@@ -539,19 +645,32 @@ jobs:
         # it does NOT read deny.toml, so it re-reported every ignored advisory
         # and the two tools drifted. cargo-deny `check` covers advisories +
         # bans + licenses + sources in one pass — the single advisory gate.
+        # CARGO_DENY_VERSION is the job env, forwarded into the container as -e.
         run: |
-          curl -fsSL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
-            | tar xz --strip-components=1 -C /usr/local/bin "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny"
-          cargo-deny --version
-          cargo-deny check
+          docker run --rm -v "$PWD":/w -w /w \
+            -e CARGO_DENY_VERSION \
+            ephpm/ephpm-ci:latest \
+            sh -euc '
+              curl -fsSL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+                | tar xz --strip-components=1 -C /usr/local/bin "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny"
+              cargo-deny --version
+              cargo-deny check
+            '
 
       - name: cargo outdated (informational)
         continue-on-error: true
+        # The ``` fences and header are written to the host $GITHUB_STEP_SUMMARY
+        # (a container step cannot); only `cargo outdated` runs in the container
+        # and its stdout is tee'd into the summary on the host.
         run: |
-          cargo install cargo-outdated --locked || true
           echo "## Outdated Dependencies" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          cargo outdated --root-deps-only 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+          docker run --rm -v "$PWD":/w -w /w \
+            ephpm/ephpm-ci:latest \
+            sh -euc '
+              cargo install cargo-outdated --locked || true
+              cargo outdated --root-deps-only 2>&1
+            ' | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
   # -- Summary ---------------------------------------------------------------
