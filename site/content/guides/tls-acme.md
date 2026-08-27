@@ -68,7 +68,7 @@ cache_dir = "/var/lib/ephpm/certs"
 
 ePHPm will:
 
-1. Solve a TLS-ALPN-01 challenge on the HTTPS listener itself — the only challenge type implemented. Port 443 must be reachable from the public internet for issuance; port 80 is never used for ACME.
+1. Solve a TLS-ALPN-01 challenge on the HTTPS listener itself — the default challenge type. Port 443 must be reachable from the public internet for issuance; port 80 is never used for ACME. (For wildcards, use the [DNS-01 challenge](#dns-01-challenge-wildcards) instead.)
 2. Save the issued certificate and account key under `cache_dir`.
 3. Renew automatically before expiry.
 
@@ -106,11 +106,38 @@ redirect_http = true
 
 The plain-HTTP listener only serves regular traffic (or 301-redirects when `redirect_http = true`). ACME challenges are always solved on the HTTPS listener via TLS-ALPN-01 — HTTP-01 is not implemented, so port 80 is never required for certificate issuance.
 
+## DNS-01 challenge (wildcards)
+
+TLS-ALPN-01 cannot obtain a **wildcard** certificate (`*.example.com`): the CA has no single hostname to connect to. For wildcards — and for hosts that never accept inbound TLS — set `challenge = "dns-01"`, which proves control by publishing a `_acme-challenge` TXT record through a DNS provider. Only **Cloudflare** is implemented today.
+
+```toml
+[server]
+listen = "0.0.0.0:443"
+
+[server.tls]
+domains = ["*.preview.example.com", "preview.example.com"]
+email   = "admin@example.com"
+cache_dir = "/var/lib/ephpm/certs"
+challenge = "dns-01"
+dns_provider = "cloudflare"
+# Prefer a file or the environment over inlining the secret:
+cloudflare_api_token_file = "/run/secrets/cf-token"
+# ...or: EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN=<token>
+```
+
+The token must be a **zone-scoped Cloudflare API token** with the `Zone.DNS:Edit` permission on the zone that holds the records. If you also set `cloudflare_zone_id`, the token needs nothing more; otherwise ePHPm resolves the zone from the FQDN, which additionally needs `Zone:Read`.
+
+**Why wildcards matter here.** Let's Encrypt limits you to 50 certificates per registered domain per week. A fleet of ephemeral preview subdomains (`pr-123.preview.example.com`, …) would burn through that quickly with per-subdomain issuance; one `*.preview.example.com` certificate covers them all under a single order.
+
+For each order ePHPm publishes the challenge TXT records, waits for propagation, asks the CA to validate, then finalizes and retracts the records. The issued certificate is hot-swapped into the running TLS listener — no restart — and renewed automatically (~30 days before expiry). DNS-01 and TLS-ALPN-01 are mutually exclusive per server.
+
 ## Clustered ACME
 
-In a cluster, only one node should solve the challenge — the rest read the cert from the gossip-backed KV store. ePHPm does this automatically when `[cluster] enabled = true`. Each node points at the same `cache_dir` (or a shared store) and the leader publishes the cert; replicas pick it up. See [Clustering Setup](clustering-setup/).
+In a cluster, only one node should solve the challenge — the rest read the cert from the gossip-backed KV store. ePHPm does this automatically when `[cluster] enabled = true`. Each node points at the same `cache_dir` (or a shared store) and the leader publishes the cert; replicas pick it up. Both challenge lanes share the same `acme:leader` election and KV distribution. See [Clustering Setup](clustering-setup/).
 
-Two limitations you must plan around:
+The two limitations below apply to the **TLS-ALPN-01** lane. The **DNS-01** lane avoids both — the challenge is answered over DNS by the leader (nothing needs to reach a specific node), and its certificate resolver is hot-swappable, so a follower installs the leader's *renewed* certificate from the KV store without a restart. That makes DNS-01 the better fit for clustered deployments.
+
+Two limitations of the TLS-ALPN-01 lane you must plan around:
 
 - **Challenge traffic has to reach the ACME leader.** Sharing challenge
   tokens between nodes is **not implemented**. A follower can serve
@@ -119,12 +146,13 @@ Two limitations you must plan around:
   the leader's in-memory resolver. If your load balancer can send validation
   traffic to any node, issuance will fail intermittently.
 - **Followers do not pick up renewed certificates while running.** This is
-  **not implemented**: `rustls-acme` consults its certificate cache once per
-  state machine, so a renewal published by the leader is not injected into a
-  running follower. **A follower serves the certificate it loaded at startup
-  until it restarts.** On a 90-day Let's Encrypt cert this means a rolling
-  restart inside the renewal window, or followers will eventually serve an
-  expired certificate. Watch for it.
+  **not implemented** for TLS-ALPN-01: `rustls-acme` consults its certificate
+  cache once per state machine, so a renewal published by the leader is not
+  injected into a running follower. **A follower serves the certificate it
+  loaded at startup until it restarts.** On a 90-day Let's Encrypt cert this
+  means a rolling restart inside the renewal window, or followers will
+  eventually serve an expired certificate. Watch for it. (DNS-01 does not have
+  this limitation.)
 
 ## What's in `cache_dir`?
 

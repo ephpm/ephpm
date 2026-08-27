@@ -194,7 +194,7 @@ including explicit `0` = that limit off.
 
 ### `[server.tls]`
 
-Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If both are set, manual wins.
+Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If both are set, manual wins. ACME itself offers two challenge types via `challenge`: the default TLS-ALPN-01, and DNS-01 for **wildcard** certificates.
 
 > **Fixed in v0.6.2.** Manual `cert`+`key` mode panicked at startup on every
 > release from v0.1.0 through v0.6.1 — the process exited before binding a
@@ -210,8 +210,26 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 | `email` | string | (none) | Contact email for ACME registration. |
 | `cache_dir` | path | `"certs"` | Directory for ACME cert + account key cache. **Set this in production.** |
 | `staging` | bool | `false` | Use Let's Encrypt staging (untrusted certs, generous rate limits). |
+| `challenge` | string | `"tls-alpn-01"` | ACME challenge type: `"tls-alpn-01"` (default, zero-config, no wildcards) or `"dns-01"` (required for wildcards; needs `dns_provider` + a token). |
+| `dns_provider` | string | (none) | DNS provider for `dns-01`. Only `"cloudflare"` is implemented. Required when `challenge = "dns-01"`. |
+| `cloudflare_api_token_file` | path | (none) | Path to a file holding a zone-scoped `Zone.DNS:Edit` Cloudflare token. Preferred over inlining the secret; takes precedence over `cloudflare_api_token`. |
+| `cloudflare_api_token` | string | (none) | Cloudflare token inline (discouraged). Usually supplied via `EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN` instead. |
+| `cloudflare_zone_id` | string | (none) | Explicit Cloudflare zone id. When absent, resolved from the challenge FQDN (adds a `Zone:Read` requirement to the token). |
 | `listen` | string | (none) | Separate HTTPS listener. When set, `[server] listen` serves HTTP and this serves HTTPS. |
 | `redirect_http` | bool | `false` | When `listen` is set, the HTTP listener redirects everything to HTTPS (301). |
+
+**DNS-01 wildcard example.** One wildcard cert covers every preview subdomain and stays under Let's Encrypt's 50-certs-per-registered-domain-per-week limit:
+
+```toml
+[server.tls]
+domains = ["*.preview.example.com", "preview.example.com"]
+email = "ops@example.com"
+challenge = "dns-01"
+dns_provider = "cloudflare"
+cloudflare_api_token_file = "/run/secrets/cf-token"   # or EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN
+```
+
+The token is a **zone-scoped** Cloudflare API token with `Zone.DNS:Edit` on the challenge zone. In a cluster (`[cluster] enabled = true`) only the elected leader orders the certificate; every other node loads it from the KV store — the same leader-election and distribution machinery as the TLS-ALPN-01 lane. TLS-ALPN-01 and DNS-01 are mutually exclusive per server; wildcard domains **require** DNS-01.
 
 ### `[server.http3]`
 

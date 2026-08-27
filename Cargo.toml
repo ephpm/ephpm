@@ -137,6 +137,13 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 h3 = "0.0.8"
 h3-quinn = "0.0.10"
 rustls-acme = { version = "0.15", default-features = false, features = ["tokio", "aws-lc-rs", "tls12", "webpki-roots"] }
+# Lower-level ACME client for the DNS-01 wildcard lane (rustls-acme only speaks
+# TLS-ALPN-01). `default-features = false` + an explicit `aws-lc-rs` keeps it off
+# `ring`, the same single-provider discipline the rustls pin above enforces
+# (#241); `hyper-rustls` is its HTTPS transport to the ACME directory and
+# `rcgen` lets `Order::finalize` generate the CSR + certificate key pair. MSRV
+# 1.88, matching the workspace.
+instant-acme = { version = "0.8", default-features = false, features = ["aws-lc-rs", "hyper-rustls", "rcgen"] }
 tokio-stream = "0.1"
 tempfile = "3"
 rcgen = { version = "0.13", default-features = false, features = ["pem", "aws_lc_rs"] }

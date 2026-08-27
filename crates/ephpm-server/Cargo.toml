@@ -46,6 +46,9 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rustls-pemfile.workspace = true
 rustls-acme.workspace = true
+# DNS-01 wildcard ACME lane (src/dns01.rs). instant-acme drives the ACME
+# protocol; the issued cert is wired into rustls via a hot-swappable resolver.
+instant-acme.workspace = true
 tokio-stream.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
@@ -69,13 +72,15 @@ opentelemetry_sdk = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
-# The exporter's HTTP client and its trust anchors. We build the
-# `rustls::ClientConfig` ourselves (see src/otlp.rs) so the exporter uses the
-# same crypto provider as the rest of the server; reqwest is therefore
-# compiled with no provider and no root store of its own.
-reqwest = { workspace = true, optional = true }
+# The Cloudflare DNS-01 API client (src/dns01.rs) and the OTLP exporter's HTTP
+# client (src/otlp.rs) both use reqwest. We build the `rustls::ClientConfig`
+# ourselves in each so they use the same crypto provider as the rest of the
+# server; reqwest is therefore compiled with no provider and no root store of
+# its own. `webpki-roots` supplies the trust anchors for both — hence both are
+# unconditional now that DNS-01 (a default-build feature) needs them.
+reqwest.workspace = true
+webpki-roots.workspace = true
 rustls-native-certs = { workspace = true, optional = true }
-webpki-roots = { workspace = true, optional = true }
 # The gRPC transport's TLS config type (`ClientTlsConfig`) and its root-store
 # switches. tonic is already in the graph via opentelemetry-proto; naming it
 # here is what enables the two `tls-*-roots` features — neither of which pulls
@@ -110,9 +115,10 @@ otlp = [
     "dep:opentelemetry-otlp",
     "dep:tracing-opentelemetry",
     "dep:tracing-subscriber",
-    "dep:reqwest",
+    # reqwest + webpki-roots are unconditional now (the DNS-01 lane needs them),
+    # so they are no longer listed here; rustls-native-certs stays otlp-only
+    # because only the OTLP client blends the OS trust store with the bundle.
     "dep:rustls-native-certs",
-    "dep:webpki-roots",
     "dep:tonic",
     # The gRPC exporter is async; `otlp.rs` drives it on a dedicated
     # single-worker runtime built in `main`, before the server's own.
