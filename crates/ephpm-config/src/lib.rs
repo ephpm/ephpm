@@ -1008,6 +1008,43 @@ pub struct SecurityConfig {
     /// resolved value.
     #[serde(default)]
     pub multi_tenant_hardening: Option<bool>,
+
+    /// Assert that network egress is enforced *below* PHP — at the
+    /// network/kernel layer (nftables, eBPF cgroup hooks, systemd
+    /// `IPAddressDeny`, or a cloud security group) — so ePHPm may drop the
+    /// **reachability-only** function blocks from the multi-tenant hardening
+    /// preset.
+    ///
+    /// When `true` **and** the hardening preset is active (`sites_dir` set and
+    /// `multi_tenant_hardening` on), ePHPm stops adding `fsockopen` to
+    /// `disable_functions`. `fsockopen` opens a *non-persistent* raw socket;
+    /// blocking it was only ever a reachability control, and it is redundant
+    /// once the kernel decides which destinations a tenant can reach —
+    /// especially since `stream_socket_client`/`curl` remain open and reach
+    /// the same destinations anyway. Lifting it makes the "the network layer
+    /// owns egress" posture consistent instead of blocking one raw-socket API
+    /// while leaving the equivalent ones open.
+    ///
+    /// **What this does NOT lift.** `pfsockopen` stays disabled, and
+    /// `mysqli.allow_persistent`/`pgsql.allow_persistent` stay `0`. Those close
+    /// a *persistence* leak, not a reachability one: in the shared ZTS worker
+    /// pool a persistent connection opened for one tenant survives in the
+    /// thread's `EG(persistent_list)` and can be handed to the next tenant that
+    /// thread serves. The network layer does nothing about that, so persistence
+    /// stays off regardless of this flag. Nor does it touch the process-control,
+    /// SysV-IPC, `dl`, `mail`, or OPcache blocks — none of those are about
+    /// reachability.
+    ///
+    /// **Default `false`** (safe): ePHPm cannot verify that an external egress
+    /// control actually exists, so the reachability block stays on unless the
+    /// operator explicitly asserts otherwise. Setting it `true` where no such
+    /// control exists re-opens `fsockopen` as an egress path. Only meaningful
+    /// on the multi-tenant hardening path; setting it elsewhere logs a warning
+    /// at startup (it has no effect). Use
+    /// [`ServerConfig::effective_network_egress_externally_managed`] to read the
+    /// resolved value.
+    #[serde(default)]
+    pub network_egress_externally_managed: Option<bool>,
 }
 
 impl ServerConfig {
@@ -1064,6 +1101,20 @@ impl ServerConfig {
     #[must_use]
     pub fn effective_multi_tenant_hardening(&self) -> bool {
         self.resolve_security_flag(|s| s.multi_tenant_hardening)
+    }
+
+    /// Resolved value of `security.network_egress_externally_managed`.
+    ///
+    /// Unlike the isolation flags above, this **defaults to `false`** whether
+    /// or not the `[server.security]` section is present: it asserts an
+    /// external property (kernel/network egress control) that ePHPm cannot
+    /// verify, so it must be opted into explicitly and never inferred from
+    /// multi-tenant mode. When `true`, the hardening preset omits the
+    /// reachability-only `fsockopen` block; see
+    /// [`SecurityConfig::network_egress_externally_managed`].
+    #[must_use]
+    pub fn effective_network_egress_externally_managed(&self) -> bool {
+        self.security.as_ref().and_then(|s| s.network_egress_externally_managed).unwrap_or(false)
     }
 
     /// The `[server.security]` isolation flags that resolve to `true` but
@@ -7662,6 +7713,39 @@ multi_tenant_hardening = false
         .unwrap();
         let config3 = Config::load(&file3).unwrap();
         assert!(!config3.server.effective_multi_tenant_hardening());
+    }
+
+    #[test]
+    fn test_network_egress_externally_managed_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Absent everywhere → false (safe: never inferred from multi-tenant
+        // mode, because ePHPm cannot verify an external egress control exists).
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nsites_dir = \"/var/www/sites\"\n").unwrap();
+        let config = Config::load(&file).unwrap();
+        assert!(!config.server.effective_network_egress_externally_managed());
+
+        // Section present but field unset → still false (does NOT inherit the
+        // "section present ⇒ true" default the isolation flags use).
+        let file2 = dir.path().join("ephpm2.toml");
+        std::fs::write(
+            &file2,
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.security]\nopen_basedir = true\n",
+        )
+        .unwrap();
+        let config2 = Config::load(&file2).unwrap();
+        assert!(!config2.server.effective_network_egress_externally_managed());
+
+        // Explicit true wins.
+        let file3 = dir.path().join("ephpm3.toml");
+        std::fs::write(
+            &file3,
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.security]\nnetwork_egress_externally_managed = true\n",
+        )
+        .unwrap();
+        let config3 = Config::load(&file3).unwrap();
+        assert!(config3.server.effective_network_egress_externally_managed());
     }
 
     // ── [server] preview preset + [server.limits] resolution ───────────

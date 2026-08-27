@@ -274,7 +274,8 @@ On top of the shell-exec family, the preset extends the generated `php.ini`'s `d
 
 | Group | Functions | Channel it closes |
 |---|---|---|
-| Persistent sockets | `pfsockopen`, `fsockopen` | `EG(persistent_list)` is keyed `host:port` with no tenant component — one tenant could reuse (and read/write) another tenant's live, authenticated persistent socket (Redis `pconnect`, mysqli `p:`). |
+| Persistent socket | `pfsockopen` | `EG(persistent_list)` is keyed `host:port` with no tenant component and survives request end on the shared ZTS worker — one tenant could reuse (and read/write) another tenant's live, authenticated persistent socket (Redis `pconnect`, mysqli `p:`). This is a **persistence** leak; it stays disabled regardless of any external egress control. |
+| Raw-socket reachability | `fsockopen` | A **non-persistent** raw socket — no cross-tenant persistence risk; blocking it is purely a reachability control (stop a tenant dialing arbitrary hosts). **Lifted when [`network_egress_externally_managed`](/reference/config/#serversecurity) is set**, because egress is then enforced below PHP and `stream_socket_client`/`curl` reach the same destinations anyway. Blocked by default. |
 | SysV IPC | `shm_attach`, `shm_get_var`, `shm_put_var`, `shm_remove`, `shm_detach`, `shm_has_var`, `sem_get`, `sem_acquire`, `sem_release`, `sem_remove`, `msg_get_queue`, `msg_send`, `msg_receive`, `msg_remove_queue`, `msg_set_queue`, `msg_stat_queue` | A global kernel IPC namespace keyed by integer; one shared uid ⇒ full cross-tenant read/write. |
 | Process control | `pcntl_fork`, `pcntl_signal`, `pcntl_alarm`, `pcntl_wait`, `pcntl_waitpid`, `pcntl_async_signals`, `pcntl_signal_dispatch`, `pcntl_sigprocmask`, `pcntl_sigwaitinfo`, `pcntl_sigtimedwait`, `posix_kill`, `posix_setuid`, `posix_setgid`, `posix_seteuid`, `posix_setegid` | Fork-bomb + fd/secret inheritance into a child, whole-process signals, and process-credential changes. |
 | OPcache flush | `opcache_reset`, `opcache_compile_file` | `opcache_reset()` flushes **every** tenant's bytecode from the shared cache; `opcache_compile_file()` compiles arbitrary files into it. |
@@ -301,7 +302,7 @@ ini_overrides = [
 
 ### The cost: persistent connections
 
-Disabling `pfsockopen`/`fsockopen` and setting `mysqli.allow_persistent = 0` **turns off persistent connections** — Redis `pconnect`, mysqli `p:` hosts, and any raw persistent socket. Non-persistent connections are unaffected: `stream_socket_client`, ordinary PDO/mysqli connections, and curl all keep working, and ePHPm's own per-request KV bridge and per-site `pdo_mysql` are unchanged. For most WordPress/Laravel workloads the practical loss is Redis object-cache persistence (each request reconnects). To keep persistent connections at the cost of the cross-tenant channels above, opt out:
+Disabling `pfsockopen` and setting `mysqli.allow_persistent = 0` **turns off persistent connections** — Redis `pconnect`, mysqli `p:` hosts, and any raw persistent socket. Non-persistent connections are unaffected: `stream_socket_client`, ordinary PDO/mysqli connections, and curl all keep working, and ePHPm's own per-request KV bridge and per-site `pdo_mysql` are unchanged. (`fsockopen` is *also* a non-persistent connection — it is blocked by default only as a reachability control, and [`network_egress_externally_managed`](/reference/config/#serversecurity) lifts it when egress is enforced at the network/kernel layer.) For most WordPress/Laravel workloads the practical loss is Redis object-cache persistence (each request reconnects). To keep persistent connections at the cost of the cross-tenant channels above, opt out:
 
 ```toml
 [server.security]
