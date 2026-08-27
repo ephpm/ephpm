@@ -342,11 +342,19 @@ mod imp {
 
     /// Current thread's TID in this process's pid-namespace.
     fn current_tid() -> u32 {
-        // SAFETY: `gettid(2)` takes no arguments, never fails, and has no memory
+        // Use the raw `SYS_gettid` syscall, NOT `libc::gettid()`: the glibc
+        // `gettid()` wrapper only exists in glibc >= 2.30, and the release links
+        // against an older glibc (in the ephpm-ci container, to keep the binary's
+        // glibc floor low), where `gettid` is an undefined symbol at link time.
+        // The syscall has always existed and links everywhere.
+        //
+        // SAFETY: `SYS_gettid` takes no arguments, never fails, and has no memory
         // effects — it just reads the caller's kernel TID.
-        let tid = unsafe { libc::gettid() };
-        // A TID is always positive, so the sign bit is never set.
-        tid.cast_unsigned()
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) };
+        // A Linux TID is always positive and far below u32::MAX (pid_max is
+        // 2^22 at most), so the conversion never truncates; the default (0) is
+        // an unreachable fallback that avoids an `as` cast and its lints.
+        u32::try_from(tid).unwrap_or_default()
     }
 
     /// Raise `RLIMIT_MEMLOCK` to unlimited. A no-op on kernels that account BPF
