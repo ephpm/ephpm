@@ -88,6 +88,15 @@ tonic = { workspace = true, optional = true }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Per-vhost eBPF network policy ([server.tenant_network] ebpf_policy), Linux
+# only. aya is pure Rust — it loads the C-compiled BPF object (built by build.rs)
+# and attaches the cgroup programs via fd-based bpf_link, with no libbpf and no
+# bpf-linker (those are only needed for BPF programs written in Rust). The whole
+# `tenant_ebpf` Linux impl and the build.rs clang step are gated on this target,
+# so non-Linux builds never see aya and compile the inert stub instead.
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = "0.13"
+
 [features]
 # OTLP trace export: `tracing` spans (http.request / worker.queue_wait /
 # php.execute) shipped to an OpenTelemetry collector over OTLP. Both

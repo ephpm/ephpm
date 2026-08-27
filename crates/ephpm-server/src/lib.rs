@@ -20,6 +20,7 @@ mod site_overrides;
 pub mod site_wire_auth;
 pub mod static_files;
 pub mod stream_compress;
+pub mod tenant_ebpf;
 mod timeline;
 pub mod tls;
 pub mod tracked_backend;
@@ -345,6 +346,21 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // `wire_per_site_db` returns `Some` only with `[db.sqlite]` present — but
     // pairing them here avoids asserting that in a way that could panic.
     let per_site_db_wire = match (per_site_wire_auth, config.db.sqlite.as_ref()) {
+        // `[db.sqlite.proxy] mysql_wire_enabled = false`: bridge-only mode. The
+        // per-site registry and `ephpm_db_*` bridge were already wired up by
+        // `wire_per_site_db` above; here we deliberately skip the wire FRONTEND
+        // (no `:3306` bind) and hand the router `None` so it advertises no
+        // `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD` for an endpoint that does
+        // not exist. In-process database access via `ephpm_db_*` is unaffected.
+        (Some(_auth), Some(sqlite)) if !per_site_wire_enabled(sqlite) => {
+            tracing::info!(
+                "per-site MySQL wire listener DISABLED ([db.sqlite.proxy] mysql_wire_enabled = \
+                 false): not binding {:?}. Per-site databases are reachable only through the \
+                 in-process ephpm_db_* bridge (no pdo_mysql); no DB_* credentials are injected.",
+                sqlite.proxy.mysql_listen
+            );
+            None
+        }
         (Some(auth), Some(sqlite)) => {
             let listen = start_per_site_wire(sqlite, &auth, &mut per_site_wire_handles).await?;
             Some((auth, listen))
@@ -685,6 +701,60 @@ async fn bind_listeners(
         ephpm_php::PhpRuntime::set_ws_registry(Arc::clone(&runtime.registry));
     }
 
+    // Per-vhost eBPF network policy ([server.tenant_network] ebpf_policy).
+    // Load + attach BEFORE the router is built, then hand the Arc to it. Fail
+    // closed: with ebpf_policy = true a load/attach, range, or overlap failure
+    // aborts startup — ePHPm must never come up with the policy the operator
+    // asked for silently absent (docs-must-match-code).
+    let tenant_ebpf: Option<Arc<tenant_ebpf::TenantEbpf>> =
+        if config.server.tenant_network.ebpf_policy {
+            let port_of = |addr: &str| -> Option<u16> {
+                addr.rsplit_once(':').and_then(|(_, p)| p.trim().parse().ok())
+            };
+            let range = config
+                .server
+                .tenant_network
+                .parse_range()
+                .map_err(|e| anyhow::anyhow!("[server.tenant_network] {e}"))?;
+            // The sidecar range must not overlap the kernel ephemeral range, or an
+            // outbound source port could collide with a handed-out real port.
+            tenant_ebpf::TenantEbpf::assert_no_ephemeral_overlap(range)?;
+            // ePHPm's own loopback infra ports every tagged vhost may reach: the
+            // stock pdo_mysql wire listener and the KV RESP listener.
+            let mut infra_ports: Vec<u16> = Vec::new();
+            if let Some((_, listen)) = per_site_db_wire.as_ref()
+                && let Some(p) = port_of(listen)
+            {
+                infra_ports.push(p);
+            }
+            if config.kv.redis_compat.enabled
+                && let Some(p) = port_of(&config.kv.redis_compat.listen)
+            {
+                infra_ports.push(p);
+            }
+            let handle = tenant_ebpf::TenantEbpf::load_and_attach(
+                config.server.tenant_network.cgroup_path.as_deref(),
+                &infra_ports,
+            )
+            .context(
+                "loading the eBPF per-vhost network policy ([server.tenant_network] ebpf_policy = \
+             true). Requires Linux >= 5.10 with CONFIG_CGROUP_BPF + BTF and CAP_BPF + \
+             CAP_NET_ADMIN. Also confirm any external nft egress floor drops its blanket \
+             loopback-DROP for the ePHPm cgroup, or every sidecar connect will fail.",
+            )?;
+            handle.fill_pool(range, config.server.tenant_network.max_sidecar_ports_per_vhost)?;
+            tracing::info!(
+                cgroup = ?config.server.tenant_network.cgroup_path,
+                sidecar_port_range = %config.server.tenant_network.sidecar_port_range,
+                max_per_vhost = config.server.tenant_network.max_sidecar_ports_per_vhost,
+                ?infra_ports,
+                "tenant_network: eBPF per-vhost policy loaded and attached"
+            );
+            Some(handle)
+        } else {
+            None
+        };
+
     // `Router::share` rather than `Arc::new`: a WebSocket session outlives the
     // request that created it and keeps dispatching PHP events through this
     // router, so the Arc has to be reachable from the router itself.
@@ -698,6 +768,7 @@ async fn bind_listeners(
             file_cache.clone(),
             worker_pool.clone(),
         )
+        .with_tenant_ebpf(tenant_ebpf)
         .with_middleware_chain(middleware_chain)
         // Expose the effective gossip node id to PHP (EPHPM_NODE_ID). When
         // clustering is on this is the runtime id -- distinct per node even
@@ -2070,6 +2141,21 @@ fn wire_per_site_db(
     Ok(Some(auth))
 }
 
+/// Whether the per-site MySQL wire *frontend* should be bound.
+///
+/// Controlled by `[db.sqlite.proxy] mysql_wire_enabled` (default `true`).
+/// Setting it `false` is for **bridge-only** deployments: every app reaches
+/// its per-site database exclusively through the in-process `ephpm_db_*` SAPI
+/// bridge and nothing uses stock `pdo_mysql`, so the `:3306` listener is pure
+/// attack surface and stays unbound.
+///
+/// This gates ONLY the wire frontend. The per-site database registry and the
+/// `ephpm_db_*` bridge are wired up independently in [`wire_per_site_db`], so
+/// in-process database access is unaffected when this returns `false`.
+fn per_site_wire_enabled(sqlite: &ephpm_config::SqliteConfig) -> bool {
+    sqlite.proxy.mysql_wire_enabled
+}
+
 /// Start the multi-tenant MySQL wire listener for per-site mode.
 ///
 /// One listener, many databases. The connection's tenant is the identity it
@@ -2455,6 +2541,25 @@ mod lib_tests {
         let config = make_sqlite_config("replica");
         assert!(is_clustered_sqlite(&config, false));
         assert!(is_clustered_sqlite(&config, true));
+    }
+
+    #[test]
+    fn per_site_wire_enabled_by_default() {
+        let config = make_sqlite_config("single");
+        assert!(
+            per_site_wire_enabled(&config),
+            "the per-site MySQL wire listener is bound by default"
+        );
+    }
+
+    #[test]
+    fn per_site_wire_disabled_when_toggled_off() {
+        let mut config = make_sqlite_config("single");
+        config.proxy.mysql_wire_enabled = false;
+        assert!(
+            !per_site_wire_enabled(&config),
+            "mysql_wire_enabled = false must skip binding the wire frontend (bridge-only mode)"
+        );
     }
 
     // ── KV service wiring ───────────────────────────────────────────────────

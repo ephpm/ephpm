@@ -762,11 +762,13 @@ const HARDENING_FUNCTIONS: &[&str] = &[
     "posix_setgid",
     "posix_seteuid",
     "posix_setegid",
-    // Persistent raw sockets: `EG(persistent_list)` is keyed `host:port` with
-    // no tenant component, so a tenant reusing another's host:port inherits its
-    // live, authenticated socket.
+    // Persistent raw socket: `EG(persistent_list)` is keyed `host:port` with
+    // no tenant component and survives request end on the shared ZTS worker, so
+    // a tenant reusing another's host:port inherits its live, authenticated
+    // socket. This is a *persistence* leak, not a reachability one, so it stays
+    // disabled regardless of any external egress control (unlike `fsockopen`,
+    // see `HARDENING_REACHABILITY`).
     "pfsockopen",
-    "fsockopen",
     // SysV IPC: a global kernel namespace keyed by integer; one shared uid ⇒
     // full cross-tenant read/write.
     "shm_attach",
@@ -789,6 +791,19 @@ const HARDENING_FUNCTIONS: &[&str] = &[
     "dl",
     "mail",
 ];
+
+/// Reachability-only functions the hardening preset disables by default but
+/// LIFTS when `[server.security] network_egress_externally_managed = true`.
+///
+/// `fsockopen` opens a *non-persistent* raw TCP/UDP socket — it dies at request
+/// end, so it carries none of `pfsockopen`'s cross-tenant persistence risk. The
+/// only thing blocking it ever bought was reachability (stop a tenant dialing
+/// arbitrary hosts), and that is redundant — and inconsistent — once egress is
+/// enforced below PHP at the network/kernel layer, because `stream_socket_client`
+/// and `curl` stay open and reach the same destinations anyway. When the
+/// operator asserts an external egress control, these come back out of the
+/// denylist; otherwise they stay blocked (safe default).
+const HARDENING_REACHABILITY: &[&str] = &["fsockopen"];
 
 /// OPcache functions the hardening preset disables regardless of cluster
 /// invalidation: a whole-cache flush (`opcache_reset`) and arbitrary-file
@@ -850,14 +865,24 @@ fn push_unique(
 ///
 /// - `include_shell` — add the shell-exec family (`disable_shell_exec`).
 /// - `include_hardening` — add the full multi-tenant hardening set.
+/// - `include_reachability_block` — when `true`, also add the reachability-only
+///   functions (`fsockopen`). Set `false` when
+///   `network_egress_externally_managed` asserts the network/kernel layer owns
+///   egress, so blocking them at the PHP layer is redundant. Only consulted
+///   when `include_hardening` is `true`.
 /// - `cluster_invalidation` — when `false`, also disable the OPcache
 ///   introspection/invalidation functions that ePHPm otherwise needs.
 ///
 /// Returns `None` when the union is empty (nothing to emit).
+// Each bool selects an independent, orthogonal baseline group (shell / full
+// hardening / reachability / cluster-invalidation carve-out). Folding them into
+// one flags struct would obscure the call site more than it clarifies.
+#[allow(clippy::fn_params_excessive_bools)]
 fn compose_disable_functions(
     operator: &[String],
     include_shell: bool,
     include_hardening: bool,
+    include_reachability_block: bool,
     cluster_invalidation: bool,
 ) -> Option<String> {
     let mut ordered: Vec<String> = Vec::new();
@@ -876,6 +901,11 @@ fn compose_disable_functions(
         for f in HARDENING_FUNCTIONS {
             push_unique(&mut ordered, &mut seen, f);
         }
+        if include_reachability_block {
+            for f in HARDENING_REACHABILITY {
+                push_unique(&mut ordered, &mut seen, f);
+            }
+        }
         for f in HARDENING_OPCACHE_ALWAYS {
             push_unique(&mut ordered, &mut seen, f);
         }
@@ -893,18 +923,50 @@ fn compose_disable_functions(
 /// denylist it added, the performance it cost, and any residual it could not
 /// close in this configuration. Never silent: an operator who relies on the
 /// preset must be able to see precisely what it bought them.
-fn log_multi_tenant_hardening(vhost_hardening: bool, cluster_invalidation: bool) {
+fn log_multi_tenant_hardening(
+    vhost_hardening: bool,
+    egress_externally_managed: bool,
+    cluster_invalidation: bool,
+) {
     if !vhost_hardening {
+        // The knob is a loosening switch, so leaving it unheeded is safe — but
+        // an operator who set it must not be left believing it did something.
+        if egress_externally_managed {
+            tracing::warn!(
+                "[server.security] network_egress_externally_managed is set but \
+                 has no effect: it only lifts the reachability-only fsockopen \
+                 block from the multi-tenant hardening preset, and that preset \
+                 is not active here (needs sites_dir set and \
+                 multi_tenant_hardening on)."
+            );
+        }
         return;
     }
-    tracing::info!(
-        "multi-tenant hardening ON: disabled pcntl_*/posix process control, \
-         pfsockopen/fsockopen, SysV shm_*/sem_*/msg_*, dl, mail, and \
-         opcache_reset/opcache_compile_file via disable_functions; \
-         mysqli.allow_persistent=0. Cost: persistent DB/socket connections are \
-         off (Redis pconnect, mysqli p:, pfsockopen). Disable with \
-         [server.security] multi_tenant_hardening = false."
-    );
+    if egress_externally_managed {
+        tracing::info!(
+            "multi-tenant hardening ON: disabled pcntl_*/posix process control, \
+             pfsockopen, SysV shm_*/sem_*/msg_*, dl, mail, and \
+             opcache_reset/opcache_compile_file via disable_functions; \
+             mysqli.allow_persistent=0. network_egress_externally_managed=true, \
+             so the reachability-only fsockopen block is LIFTED (egress is \
+             enforced below PHP); pfsockopen stays disabled (persistence, not \
+             reachability). Cost: persistent DB/socket connections are off \
+             (Redis pconnect, mysqli p:, pfsockopen). Disable the whole preset \
+             with [server.security] multi_tenant_hardening = false."
+        );
+    } else {
+        tracing::info!(
+            "multi-tenant hardening ON: disabled pcntl_*/posix process control, \
+             pfsockopen/fsockopen, SysV shm_*/sem_*/msg_*, dl, mail, and \
+             opcache_reset/opcache_compile_file via disable_functions; \
+             mysqli.allow_persistent=0. Cost: persistent DB/socket connections are \
+             off (Redis pconnect, mysqli p:, pfsockopen); fsockopen is blocked as \
+             a reachability control (set [server.security] \
+             network_egress_externally_managed = true to lift it when egress is \
+             enforced at the network/kernel layer). Disable with \
+             [server.security] multi_tenant_hardening = false."
+        );
+    }
     if cluster_invalidation {
         tracing::warn!(
             "multi-tenant hardening: [opcache] cluster_invalidation is ON, so \
@@ -1124,6 +1186,14 @@ fn run_with_config(
     // `disable_functions` (never clobbered — see `compose_disable_functions`).
     let vhost_hardening =
         config.server.sites_dir.is_some() && config.server.effective_multi_tenant_hardening();
+    // When the operator asserts egress is enforced below PHP (network/kernel
+    // layer), drop the reachability-only `fsockopen` block from the preset —
+    // blocking it while `stream_socket_client`/`curl` stay open is inconsistent
+    // and bypassable. Persistence (`pfsockopen`, `*.allow_persistent`) and the
+    // non-reachability blocks are unaffected. Resolved independently of
+    // `vhost_hardening` so we can warn when it is set but does nothing.
+    let egress_externally_managed = config.server.effective_network_egress_externally_managed();
+    let include_reachability_block = !egress_externally_managed;
     // ePHPm's own cluster OPcache invalidator (opcache.rs) calls the userland
     // `opcache_get_status`/`opcache_invalidate` through the function table, so
     // the hardening preset may only fully lock down the OPcache API
@@ -1228,6 +1298,7 @@ fn run_with_config(
                 &operator_df,
                 vhost_disable_shell,
                 vhost_hardening,
+                include_reachability_block,
                 cluster_invalidation,
             ) {
                 let _ = writeln!(content, "disable_functions={df}");
@@ -1297,7 +1368,7 @@ fn run_with_config(
 
     // Surface exactly what the multi-tenant hardening preset did (or its
     // residual when cluster invalidation forces the OPcache API to stay open).
-    log_multi_tenant_hardening(vhost_hardening, cluster_invalidation);
+    log_multi_tenant_hardening(vhost_hardening, egress_externally_managed, cluster_invalidation);
 
     // Resource-aware autotuning: log the detected CPU/memory budget and the
     // derived (or explicitly-pinned) PHP/OPcache profile at INFO. Trust
@@ -2009,12 +2080,12 @@ mod disable_functions_tests {
 
     #[test]
     fn nothing_to_emit_without_operator_or_baseline() {
-        assert_eq!(compose_disable_functions(&[], false, false, false), None);
+        assert_eq!(compose_disable_functions(&[], false, false, true, false), None);
     }
 
     #[test]
     fn shell_only_matches_legacy_line() {
-        let df = compose_disable_functions(&[], true, false, false).unwrap();
+        let df = compose_disable_functions(&[], true, false, true, false).unwrap();
         assert_eq!(df, "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec");
     }
 
@@ -2027,7 +2098,7 @@ mod disable_functions_tests {
             "disable_functions",
             "pcntl_fork,mkdir_helper",
         )]));
-        let df = compose_disable_functions(&operator, true, false, false).unwrap();
+        let df = compose_disable_functions(&operator, true, false, true, false).unwrap();
         // Operator entries come first and survive.
         assert!(df.starts_with("pcntl_fork,mkdir_helper,"));
         // Shell baseline is still present.
@@ -2037,12 +2108,13 @@ mod disable_functions_tests {
 
     #[test]
     fn hardening_adds_the_proven_channels() {
-        let df = compose_disable_functions(&[], true, true, false).unwrap();
+        let df = compose_disable_functions(&[], true, true, true, false).unwrap();
         for expected in [
             "system",        // shell family
             "pcntl_fork",    // pcntl
             "posix_kill",    // posix process control
             "pfsockopen",    // persistent socket inheritance
+            "fsockopen",     // reachability (block on by default)
             "shm_attach",    // SysV shm
             "sem_get",       // SysV sem
             "msg_send",      // SysV msg
@@ -2055,16 +2127,41 @@ mod disable_functions_tests {
     }
 
     #[test]
+    fn egress_externally_managed_lifts_only_fsockopen() {
+        // reachability block OFF (network_egress_externally_managed = true):
+        // fsockopen is lifted, but pfsockopen and every non-reachability block
+        // stay in place — this is the whole point of the knob.
+        let df = compose_disable_functions(&[], true, true, false, false).unwrap();
+        assert!(
+            !df.split(',').any(|f| f == "fsockopen"),
+            "fsockopen must be lifted when egress is externally managed: {df}"
+        );
+        for still_blocked in ["pfsockopen", "pcntl_fork", "shm_attach", "dl", "mail", "system"] {
+            assert!(
+                df.split(',').any(|f| f == still_blocked),
+                "{still_blocked} must stay blocked regardless of egress management: {df}"
+            );
+        }
+
+        // An operator who *also* lists fsockopen explicitly keeps it blocked —
+        // the knob only drops ePHPm's own baseline entry, never the operator's.
+        let operator =
+            collect_operator_disable_functions(&ov(&[("disable_functions", "fsockopen")]));
+        let with_operator = compose_disable_functions(&operator, true, true, false, false).unwrap();
+        assert!(with_operator.split(',').any(|f| f == "fsockopen"));
+    }
+
+    #[test]
     fn cluster_invalidation_keeps_opcache_introspection_callable() {
         // With cluster invalidation ON, ePHPm needs opcache_invalidate/status,
         // so they must NOT be in the denylist — but opcache_reset always is.
-        let on = compose_disable_functions(&[], true, true, true).unwrap();
+        let on = compose_disable_functions(&[], true, true, true, true).unwrap();
         assert!(on.split(',').any(|f| f == "opcache_reset"));
         assert!(!on.split(',').any(|f| f == "opcache_invalidate"));
         assert!(!on.split(',').any(|f| f == "opcache_get_status"));
 
         // With it OFF, they are disabled too.
-        let off = compose_disable_functions(&[], true, true, false).unwrap();
+        let off = compose_disable_functions(&[], true, true, true, false).unwrap();
         assert!(off.split(',').any(|f| f == "opcache_invalidate"));
         assert!(off.split(',').any(|f| f == "opcache_get_status"));
     }
@@ -2073,7 +2170,7 @@ mod disable_functions_tests {
     fn duplicate_names_are_deduplicated_case_insensitively() {
         let operator =
             collect_operator_disable_functions(&ov(&[("disable_functions", "System, PCNTL_FORK")]));
-        let df = compose_disable_functions(&operator, true, true, false).unwrap();
+        let df = compose_disable_functions(&operator, true, true, true, false).unwrap();
         assert_eq!(df.split(',').filter(|f| f.eq_ignore_ascii_case("system")).count(), 1);
         assert_eq!(df.split(',').filter(|f| f.eq_ignore_ascii_case("pcntl_fork")).count(), 1);
     }

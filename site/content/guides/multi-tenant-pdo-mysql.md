@@ -247,6 +247,24 @@ per-request thread-local that only the default (non-worker) execution path
 sets, whereas a wire connection carries its tenant in its own credential.
 `pdo_mysql` therefore works in worker mode; the bridge does not yet.
 
+### Turning the wire listener off
+
+If every app on the box uses the bridge and nothing uses `pdo_mysql`, you can
+drop the wire frontend entirely:
+
+```toml
+[db.sqlite.proxy]
+mysql_wire_enabled = false   # default: true
+```
+
+With this set, ePHPm does **not** bind `mysql_listen` (no `:3306`) and injects
+no `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD` into requests — one fewer local
+attack surface on a hardened preview host. The per-site registry and the
+`ephpm_db_*` bridge stay wired up, so in-process database access is unchanged;
+only the wire frontend is skipped. Startup logs that the listener is disabled.
+Leave it at the default `true` for any deployment where an app uses stock
+`pdo_mysql`.
+
 ## See also
 
 - [Database from PHP](/guides/db-from-php/) — the `ephpm_db_*` bridge

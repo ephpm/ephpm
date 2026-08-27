@@ -388,6 +388,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub security: Option<SecurityConfig>,
 
+    /// Per-vhost kernel network policy (Linux-only). See
+    /// [`TenantNetworkConfig`]. Default: disabled — zero cost, no BPF loaded.
+    #[serde(default)]
+    pub tenant_network: TenantNetworkConfig,
+
     /// Logging settings.
     #[serde(default)]
     pub logging: LoggingConfig,
@@ -1008,6 +1013,143 @@ pub struct SecurityConfig {
     /// resolved value.
     #[serde(default)]
     pub multi_tenant_hardening: Option<bool>,
+
+    /// Assert that network egress is enforced *below* PHP — at the
+    /// network/kernel layer (nftables, eBPF cgroup hooks, systemd
+    /// `IPAddressDeny`, or a cloud security group) — so ePHPm may drop the
+    /// **reachability-only** function blocks from the multi-tenant hardening
+    /// preset.
+    ///
+    /// When `true` **and** the hardening preset is active (`sites_dir` set and
+    /// `multi_tenant_hardening` on), ePHPm stops adding `fsockopen` to
+    /// `disable_functions`. `fsockopen` opens a *non-persistent* raw socket;
+    /// blocking it was only ever a reachability control, and it is redundant
+    /// once the kernel decides which destinations a tenant can reach —
+    /// especially since `stream_socket_client`/`curl` remain open and reach
+    /// the same destinations anyway. Lifting it makes the "the network layer
+    /// owns egress" posture consistent instead of blocking one raw-socket API
+    /// while leaving the equivalent ones open.
+    ///
+    /// **What this does NOT lift.** `pfsockopen` stays disabled, and
+    /// `mysqli.allow_persistent`/`pgsql.allow_persistent` stay `0`. Those close
+    /// a *persistence* leak, not a reachability one: in the shared ZTS worker
+    /// pool a persistent connection opened for one tenant survives in the
+    /// thread's `EG(persistent_list)` and can be handed to the next tenant that
+    /// thread serves. The network layer does nothing about that, so persistence
+    /// stays off regardless of this flag. Nor does it touch the process-control,
+    /// SysV-IPC, `dl`, `mail`, or OPcache blocks — none of those are about
+    /// reachability.
+    ///
+    /// **Default `false`** (safe): ePHPm cannot verify that an external egress
+    /// control actually exists, so the reachability block stays on unless the
+    /// operator explicitly asserts otherwise. Setting it `true` where no such
+    /// control exists re-opens `fsockopen` as an egress path. Only meaningful
+    /// on the multi-tenant hardening path; setting it elsewhere logs a warning
+    /// at startup (it has no effect). Use
+    /// [`ServerConfig::effective_network_egress_externally_managed`] to read the
+    /// resolved value.
+    #[serde(default)]
+    pub network_egress_externally_managed: Option<bool>,
+}
+
+/// `[server.tenant_network]` — per-vhost kernel network policy (Linux-only).
+///
+/// Off by default: when `ebpf_policy = false` ePHPm loads no BPF programs,
+/// attaches nothing, and the request path writes no tag — literally zero cost,
+/// the byte-identical hot path that shipped before this feature existed.
+///
+/// When enabled (Linux only, multi-tenant mode), ePHPm attaches
+/// `cgroup/bind4+6` and `cgroup/connect4+6` programs to its own cgroup and
+/// tags each serving thread with the canonical site key of the request it is
+/// running, so the kernel can enforce per-vhost loopback authorization and
+/// give each vhost a private view of a shared loopback port (transparent
+/// sidecar port-rewrite). See `crates/ephpm-server/src/tenant_ebpf.rs` and the
+/// roadmap doc.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TenantNetworkConfig {
+    /// Enable the eBPF per-vhost network policy: per-thread vhost tagging,
+    /// `cgroup/bind4+6` transparent sidecar port-rewrite, and
+    /// `cgroup/connect4+6` per-vhost loopback authorization.
+    ///
+    /// **Linux-only.** On any other platform, setting this `true` is a hard
+    /// startup error (see [`Config::validate`]) — never a silent no-op.
+    ///
+    /// **Loopback handoff:** when `true`, the eBPF `connect4/6` policy becomes
+    /// the sole arbiter of loopback for tagged (per-vhost) traffic, so a static
+    /// nftables floor that blanket-drops loopback for the ePHPm cgroup MUST hand
+    /// that off to BPF (the two ship together — see the egress-hardening guide).
+    #[serde(default)]
+    pub ebpf_policy: bool,
+
+    /// Cgroup path ePHPm attaches the programs to. Defaults (when `None`) to the
+    /// process's own cgroup, read from `/proc/self/cgroup`, so the policy covers
+    /// exactly ePHPm's threads and any sidecars it spawns. Override only for
+    /// unusual systemd slice layouts.
+    #[serde(default)]
+    pub cgroup_path: Option<String>,
+
+    /// Dedicated range of **real** sidecar ports ePHPm hands out (inclusive,
+    /// `"low-high"`). `bind4` pops a free port from this range when a vhost binds
+    /// a virtual loopback port; `sock_release` returns it. Range size is the
+    /// box-wide sidecar concurrency cap.
+    ///
+    /// **HARD CONSTRAINT — must NOT overlap the kernel ephemeral range**
+    /// (`net.ipv4.ip_local_port_range`, default `32768-60999`): otherwise a
+    /// tenant's outbound `connect()` could be auto-assigned a *source* port that
+    /// ePHPm also wants to hand out as a sidecar *real* port. The sidecar range
+    /// therefore sits BELOW the ephemeral floor; ePHPm reads `ip_local_port_range`
+    /// at load time and refuses to start on overlap (`serve()`, fail-closed).
+    #[serde(default = "default_sidecar_port_range")]
+    pub sidecar_port_range: String,
+
+    /// Anti-port-bomb: maximum concurrent sidecar real ports a single vhost may
+    /// hold. Enforced IN-KERNEL at the allocation point (`bind4`) against the
+    /// un-forgeable, ePHPm-set vhost tag, so a tenant cannot bypass it and one
+    /// tenant cannot starve siblings out of the shared pool. Small default (`8`).
+    #[serde(default = "default_max_sidecar_ports_per_vhost")]
+    pub max_sidecar_ports_per_vhost: u32,
+}
+
+fn default_sidecar_port_range() -> String {
+    // Below the default ephemeral floor (32768). ~12.7k ports box-wide.
+    "20000-32767".to_string()
+}
+
+fn default_max_sidecar_ports_per_vhost() -> u32 {
+    8
+}
+
+impl Default for TenantNetworkConfig {
+    fn default() -> Self {
+        Self {
+            ebpf_policy: false,
+            cgroup_path: None,
+            sidecar_port_range: default_sidecar_port_range(),
+            max_sidecar_ports_per_vhost: default_max_sidecar_ports_per_vhost(),
+        }
+    }
+}
+
+impl TenantNetworkConfig {
+    /// Parse `sidecar_port_range` into an inclusive `(low, high)`.
+    ///
+    /// # Errors
+    /// Returns a human-readable message when the string is not `"low-high"`,
+    /// a bound is unparseable, `low` is `0`, or `low > high`.
+    pub fn parse_range(&self) -> Result<(u16, u16), String> {
+        let (lo, hi) = self.sidecar_port_range.split_once('-').ok_or_else(|| {
+            format!("sidecar_port_range must be \"low-high\", got {:?}", self.sidecar_port_range)
+        })?;
+        let lo: u16 =
+            lo.trim().parse().map_err(|_| "sidecar_port_range: bad low port".to_string())?;
+        let hi: u16 =
+            hi.trim().parse().map_err(|_| "sidecar_port_range: bad high port".to_string())?;
+        if lo == 0 || lo > hi {
+            return Err(format!("sidecar_port_range invalid: {lo}-{hi} (need 1 <= low <= high)"));
+        }
+        Ok((lo, hi))
+    }
 }
 
 impl ServerConfig {
@@ -1064,6 +1206,20 @@ impl ServerConfig {
     #[must_use]
     pub fn effective_multi_tenant_hardening(&self) -> bool {
         self.resolve_security_flag(|s| s.multi_tenant_hardening)
+    }
+
+    /// Resolved value of `security.network_egress_externally_managed`.
+    ///
+    /// Unlike the isolation flags above, this **defaults to `false`** whether
+    /// or not the `[server.security]` section is present: it asserts an
+    /// external property (kernel/network egress control) that ePHPm cannot
+    /// verify, so it must be opted into explicitly and never inferred from
+    /// multi-tenant mode. When `true`, the hardening preset omits the
+    /// reachability-only `fsockopen` block; see
+    /// [`SecurityConfig::network_egress_externally_managed`].
+    #[must_use]
+    pub fn effective_network_egress_externally_managed(&self) -> bool {
+        self.security.as_ref().and_then(|s| s.network_egress_externally_managed).unwrap_or(false)
     }
 
     /// The `[server.security]` isolation flags that resolve to `true` but
@@ -1916,6 +2072,22 @@ pub struct SqliteProxyConfig {
     /// `[server.limits] max_connections`.
     #[serde(default)]
     pub max_connections: usize,
+
+    /// Whether to start the `MySQL` wire listener at all.
+    ///
+    /// Default: `true` (the listener is bound — current behavior preserved).
+    ///
+    /// Set to `false` for **bridge-only** multi-tenant deployments where every
+    /// app talks to its per-site database exclusively through the in-process
+    /// native `ephpm_db_*` SAPI bridge and nothing uses stock `pdo_mysql`. When
+    /// `false`, ePHPm does **not** bind `mysql_listen` (no `:3306` frontend) and
+    /// injects no `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD` into requests — one
+    /// fewer local attack surface on a hardened preview host. The per-site
+    /// database registry and the `ephpm_db_*` bridge are still wired up, so
+    /// in-process database access is unaffected; only the wire *frontend* is
+    /// skipped. Applies to the per-site (multi-tenant) MySQL listener only.
+    #[serde(default = "default_mysql_wire_enabled")]
+    pub mysql_wire_enabled: bool,
 }
 
 impl Default for SqliteProxyConfig {
@@ -1926,6 +2098,7 @@ impl Default for SqliteProxyConfig {
             postgres_listen: None,
             tds_listen: None,
             max_connections: 0,
+            mysql_wire_enabled: default_mysql_wire_enabled(),
         }
     }
 }
@@ -3148,6 +3321,60 @@ impl Config {
             )));
         }
 
+        // [server.tenant_network] ebpf_policy: fail closed, never a silent
+        // no-op. The runtime-capability gate (kernel too old / no BTF / missing
+        // CAP_BPF) can't be decided from config alone — that is a hard startup
+        // error in serve() at load time. Here we catch the statically-decidable
+        // misconfigurations.
+        if self.server.tenant_network.ebpf_policy {
+            // (1) Platform gate — the BPF hooks are Linux-only.
+            if !cfg!(target_os = "linux") {
+                return Err(ConfigError::Validation(
+                    "[server.tenant_network] ebpf_policy = true is Linux-only \
+                     (cgroup/bind4 + connect4 BPF hooks). Remove it on this \
+                     platform, or run ePHPm on Linux >= 5.10 with CONFIG_CGROUP_BPF \
+                     and BTF."
+                        .to_string(),
+                ));
+            }
+            // (2) Per-vhost tagging is keyed by the canonical site key, which
+            //     only exists in multi-tenant mode (sites_dir set).
+            if self.server.sites_dir.is_none() {
+                return Err(ConfigError::Validation(
+                    "[server.tenant_network] ebpf_policy = true requires \
+                     [server] sites_dir (multi-tenant mode) — there are no \
+                     vhosts to isolate in single-site mode."
+                        .to_string(),
+                ));
+            }
+            // (3) v0.8.1 scope: the tag is written on the fpm per-request path
+            //     (run_php). Worker mode's persistent loop would need per-event
+            //     tagging inside the PSR-7 envelope — deferred.
+            //
+            //     Today this is belt-and-suspenders: `mode = "worker"` + sites_dir
+            //     is itself a hard error (per-host worker pools are a later
+            //     phase — see the worker-mode rule below), and ebpf_policy
+            //     requires sites_dir via (2), so worker+ebpf can't reach the
+            //     runtime anyway. Kept as an explicit, feature-scoped message so
+            //     that if per-host worker pools ever land, the eBPF feature still
+            //     correctly declares itself fpm-only until per-event tagging is
+            //     added.
+            if self.php.is_worker_mode() {
+                return Err(ConfigError::Validation(
+                    "[server.tenant_network] ebpf_policy = true is not yet \
+                     supported with [php] mode = \"worker\" (fpm mode only)."
+                        .to_string(),
+                ));
+            }
+            // (4) A malformed sidecar_port_range is a fail-closed startup error,
+            //     not a silent fallback to the default. The kernel-ephemeral
+            //     OVERLAP check is a /proc read done in serve() at load time.
+            self.server
+                .tenant_network
+                .parse_range()
+                .map_err(|e| ConfigError::Validation(format!("[server.tenant_network] {e}")))?;
+        }
+
         // Native WebSockets dispatch each event through the fpm per-request
         // path (a fresh entrypoint execution per event). Worker mode routes
         // every request into the persistent worker's PSR-7 envelope loop
@@ -3516,6 +3743,7 @@ impl Default for ServerConfig {
             static_files: StaticConfig::default(),
             php_etag_cache: PhpETagCacheConfig::default(),
             security: None,
+            tenant_network: TenantNetworkConfig::default(),
             logging: LoggingConfig::default(),
             metrics: MetricsConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
@@ -4516,6 +4744,10 @@ fn default_sqlite_max_open_dbs() -> usize {
 
 fn default_sqlite_mysql_listen() -> String {
     "127.0.0.1:3306".to_string()
+}
+
+fn default_mysql_wire_enabled() -> bool {
+    true
 }
 
 fn default_replication_role() -> String {
@@ -7070,6 +7302,11 @@ path = "app.db"
              a surprise cap would refuse connections on upgrade"
         );
         assert!(
+            sqlite.proxy.mysql_wire_enabled,
+            "mysql_wire_enabled must default to true (the wire listener is bound) — the toggle \
+             only turns the frontend OFF for bridge-only deployments"
+        );
+        assert!(
             sqlite.sqld.is_none(),
             "the [db.sqlite.sqld] block is removed in v0.7.0 and absent by default"
         );
@@ -7176,6 +7413,42 @@ primary_grpc_url = "http://10.0.1.2:5001"
         assert!(sqlite.sqld.is_none(), "no [db.sqlite.sqld] block was set");
         assert_eq!(sqlite.replication.role, "replica");
         assert_eq!(sqlite.replication.primary_grpc_url, "http://10.0.1.2:5001");
+    }
+
+    /// `mysql_wire_enabled` defaults true (via the section-level `Default`)
+    /// even when `[db.sqlite.proxy]` is present but omits the key, and can be
+    /// turned off explicitly for bridge-only deployments.
+    #[test]
+    fn test_mysql_wire_enabled_toggle() {
+        // Section-level default: present proxy block, key omitted → true.
+        assert!(
+            SqliteProxyConfig::default().mysql_wire_enabled,
+            "SqliteProxyConfig::default() must have the wire listener enabled"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[db.sqlite]
+path = "app.db"
+
+[db.sqlite.proxy]
+mysql_wire_enabled = false
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let sqlite = config.db.sqlite.expect("sqlite should be present");
+        assert!(
+            !sqlite.proxy.mysql_wire_enabled,
+            "mysql_wire_enabled = false must disable the wire listener"
+        );
+        // The listen address still parses/defaults — the frontend is skipped
+        // by the server, not unset in config.
+        assert_eq!(sqlite.proxy.mysql_listen, "127.0.0.1:3306");
     }
 
     /// A stale `[db.sqlite.sqld]` block from a pre-v0.7.0 config must still
@@ -7600,6 +7873,39 @@ multi_tenant_hardening = false
         .unwrap();
         let config3 = Config::load(&file3).unwrap();
         assert!(!config3.server.effective_multi_tenant_hardening());
+    }
+
+    #[test]
+    fn test_network_egress_externally_managed_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Absent everywhere → false (safe: never inferred from multi-tenant
+        // mode, because ePHPm cannot verify an external egress control exists).
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nsites_dir = \"/var/www/sites\"\n").unwrap();
+        let config = Config::load(&file).unwrap();
+        assert!(!config.server.effective_network_egress_externally_managed());
+
+        // Section present but field unset → still false (does NOT inherit the
+        // "section present ⇒ true" default the isolation flags use).
+        let file2 = dir.path().join("ephpm2.toml");
+        std::fs::write(
+            &file2,
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.security]\nopen_basedir = true\n",
+        )
+        .unwrap();
+        let config2 = Config::load(&file2).unwrap();
+        assert!(!config2.server.effective_network_egress_externally_managed());
+
+        // Explicit true wins.
+        let file3 = dir.path().join("ephpm3.toml");
+        std::fs::write(
+            &file3,
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.security]\nnetwork_egress_externally_managed = true\n",
+        )
+        .unwrap();
+        let config3 = Config::load(&file3).unwrap();
+        assert!(config3.server.effective_network_egress_externally_managed());
     }
 
     // ── [server] preview preset + [server.limits] resolution ───────────
@@ -9081,5 +9387,97 @@ metric_label_series_max = 0
         let _env = EnvVars::set("EPHPM_DB__ANALYSIS__METRIC_LABEL_SERIES_MAX", "5000");
         let config = Config::load(&file).unwrap();
         assert_eq!(config.db.analysis.metric_label_series_max, 5000);
+    }
+
+    // ── [server.tenant_network] eBPF per-vhost network policy ──────────
+
+    #[test]
+    fn test_tenant_network_defaults() {
+        let config = Config::default_config().unwrap();
+        let tn = &config.server.tenant_network;
+        assert!(!tn.ebpf_policy, "eBPF policy must be OFF by default (zero cost)");
+        assert_eq!(tn.sidecar_port_range, "20000-32767");
+        assert_eq!(tn.max_sidecar_ports_per_vhost, 8);
+        assert_eq!(tn.parse_range().unwrap(), (20000, 32767));
+        // Default sidecar range sits BELOW the default kernel ephemeral floor
+        // (32768) — the non-overlap invariant serve() enforces against /proc.
+        assert!(tn.parse_range().unwrap().1 < 32768);
+    }
+
+    #[test]
+    fn test_tenant_network_parse_range() {
+        let mk = |s: &str| TenantNetworkConfig {
+            sidecar_port_range: s.to_string(),
+            ..Default::default()
+        };
+        assert_eq!(mk("20000-32767").parse_range().unwrap(), (20000, 32767));
+        assert_eq!(mk(" 1000 - 2000 ").parse_range().unwrap(), (1000, 2000));
+        assert!(mk("20000").parse_range().is_err(), "missing dash");
+        assert!(mk("0-100").parse_range().is_err(), "low port 0 is invalid");
+        assert!(mk("3000-2000").parse_range().is_err(), "low > high");
+        assert!(mk("abc-2000").parse_range().is_err(), "non-numeric low");
+        assert!(mk("1000-zzz").parse_range().is_err(), "non-numeric high");
+        assert!(mk("1000-99999").parse_range().is_err(), "high exceeds u16::MAX");
+    }
+
+    // On a non-Linux host the platform gate fires first and unconditionally,
+    // so ebpf_policy = true is always a hard error here (never a silent no-op).
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn test_ebpf_policy_rejected_off_linux() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\nebpf_policy = true\n",
+        )
+        .unwrap();
+        let err = Config::load(&file).unwrap().validate().expect_err("ebpf is Linux-only");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("Linux-only")));
+    }
+
+    // On Linux the platform gate passes, so the fail-closed misconfiguration
+    // checks become reachable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_ebpf_policy_requires_sites_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[server]\nlisten = \"0.0.0.0:8080\"\n\n[server.tenant_network]\nebpf_policy = true\n",
+        )
+        .unwrap();
+        let err = Config::load(&file).unwrap().validate().expect_err("ebpf needs sites_dir");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("sites_dir")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_ebpf_policy_rejects_worker_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[php]\nmode = \"worker\"\n\n[server.tenant_network]\nebpf_policy = true\n",
+        )
+        .unwrap();
+        let err =
+            Config::load(&file).unwrap().validate().expect_err("worker unsupported in v0.8.1");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("worker")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_ebpf_policy_rejects_bad_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            "[server]\nsites_dir = \"/var/www/sites\"\n\n[server.tenant_network]\nebpf_policy = true\nsidecar_port_range = \"nope\"\n",
+        )
+        .unwrap();
+        let err = Config::load(&file).unwrap().validate().expect_err("malformed range");
+        assert!(matches!(err, ConfigError::Validation(m) if m.contains("sidecar_port_range")));
     }
 }

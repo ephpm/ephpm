@@ -535,6 +535,13 @@ pub struct Router {
     /// pool size is the cap). Built in [`Router::new`]; drained on shutdown via
     /// [`Router::fpm_pool`].
     fpm_pool: Option<Arc<crate::fpm_pool::FpmPool>>,
+    /// Per-vhost eBPF network policy handle. `None` unless
+    /// `[server.tenant_network] ebpf_policy = true`. When `None`, no tag is
+    /// written on the request path and the whole feature is zero-cost. When
+    /// `Some`, the top of `run_php` tags the executing thread with the request's
+    /// vhost id (cleared on the same thread when the closure returns) so the
+    /// kernel `bind`/`connect` hooks can scope the tenant's loopback network.
+    tenant_ebpf: Option<Arc<crate::tenant_ebpf::TenantEbpf>>,
     /// What a PHP-bound request does when no execution slot is available
     /// (`[php] overload_policy`, resolved against the `[server] preview`
     /// preset). [`OverloadPolicy::Wait`] is the historical behaviour — queue and
@@ -1084,6 +1091,10 @@ impl Router {
             php_semaphore,
             worker_pool,
             fpm_pool,
+            // Wired by `serve()` via `with_tenant_ebpf` only when
+            // `[server.tenant_network] ebpf_policy = true` (Linux multi-tenant).
+            // `None` here => no per-request tagging, zero cost.
+            tenant_ebpf: None,
             overload_policy: config.effective_overload_policy(),
             shed_after: Duration::from_millis(config.php.shed_after_ms),
             worker_stream_threshold: config.php.worker_stream_threshold,
@@ -1529,6 +1540,20 @@ impl Router {
     #[must_use]
     pub fn with_websocket(mut self, websocket: Option<Arc<crate::websocket::WsRuntime>>) -> Self {
         self.websocket = websocket;
+        self
+    }
+
+    /// Attach the per-vhost eBPF network policy handle
+    /// (`[server.tenant_network] ebpf_policy`). `None` (the default) leaves the
+    /// feature off and the request path untagged. `serve()` loads and attaches
+    /// the programs before calling this, so a `Some` here means the kernel hooks
+    /// are already live.
+    #[must_use]
+    pub fn with_tenant_ebpf(
+        mut self,
+        tenant_ebpf: Option<Arc<crate::tenant_ebpf::TenantEbpf>>,
+    ) -> Self {
+        self.tenant_ebpf = tenant_ebpf;
         self
     }
 
@@ -3127,6 +3152,19 @@ impl Router {
             opcache: vhost_name,
             ws: ws_site_scope,
         } = self.site_identities(site_key.as_deref(), &server_name);
+
+        // Per-vhost eBPF tag input: `Some` only when the feature is on AND this
+        // request matched a vhost (site_key is `None` for an unmatched Host,
+        // which gets no tag — exactly like it gets no per-site DB/KV identity).
+        // Cloned before the closure alongside the other `*_site_key` captures so
+        // the `move` closure owns it. Consumed inside `run_php`, where a guard
+        // tags the executing thread and clears it on that same thread on return.
+        let ebpf_tag: Option<(Arc<crate::tenant_ebpf::TenantEbpf>, String)> =
+            match (self.tenant_ebpf.as_ref(), site_key.as_deref()) {
+                (Some(e), Some(k)) => Some((Arc::clone(e), k.to_owned())),
+                _ => None,
+            };
+
         // In multi-tenant mode, give this vhost its OWN temp + session
         // directories (issue #276). Resolved and created here, in the async
         // context, off the resolved (traversal-safe) document root; the paths
@@ -3229,6 +3267,20 @@ impl Router {
         // construction — the same code runs; only the thread it lands on
         // differs.
         let run_php = move || -> Result<ephpm_php::response::PhpResponse, ephpm_php::PhpError> {
+            // Tag this thread with its vhost id for the kernel bind/connect
+            // hooks, BEFORE any tenant code runs. The guard clears tag[tid] when
+            // this closure returns — on THIS blocking/pool thread, before it is
+            // reused. The Drop is a pure bpf `delete_elem` syscall, not a PHP
+            // call, so it does not cross PHP's setjmp/longjmp boundary
+            // (`PhpRuntime::execute` catches its own bailout and returns a
+            // `Result`, so the closure always unwinds normally). A stale tag on a
+            // reused ZTS thread would be a cross-tenant leak — this guard is the
+            // one hard invariant. `None` (feature off, or a host that matched no
+            // vhost) writes nothing, so there is nothing to clear. The shed / 503
+            // / hung-thread paths return before `run_php` runs at all, so they
+            // never write a tag.
+            let _ebpf_tag_guard = ebpf_tag.as_ref().map(|(e, key)| e.tag_current_thread(key));
+
             // Scope KV store to this virtual host for multi-tenant isolation.
             // Keyed on the same identity the injected `EPHPM_REDIS_USERNAME`
             // names, so the in-process bridge and a RESP client reach one
