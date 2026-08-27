@@ -80,7 +80,8 @@ and `disable_functions` are the reason a tenant cannot simply shell out or
 
 ### 3. Persistent connections — off
 
-The preset sets `mysqli.allow_persistent = 0` and disables `pfsockopen`.
+The preset sets `mysqli.allow_persistent = 0` (and `pgsql.allow_persistent = 0`,
+`odbc.allow_persistent = 0`) and disables `pfsockopen`.
 
 > **A tenant cannot re-enable this.** `mysqli.allow_persistent` is a
 > `PHP_INI_SYSTEM` setting — the strictest access level — written into the
@@ -103,11 +104,16 @@ bridge) die at request end and are unaffected. The cost is that Redis
 `pconnect`, mysqli `p:` hosts, and `pfsockopen` do not work — reconnect per
 request instead.
 
-> **Residual:** only *mysqli* persistence is disabled via ini today. PostgreSQL
-> `pg_pconnect` (`pgsql.allow_persistent`) and PDO `ATTR_PERSISTENT` are **not**
-> yet gated by the preset. If your tenants use persistent Postgres/PDO
-> connections to a *shared* backend, add `["pgsql.allow_persistent", "0"]` (and
-> avoid `PDO::ATTR_PERSISTENT`) via `[php] ini_overrides` until this is closed.
+> **Residual:** the preset disables persistence for every driver that exposes an
+> ini for it — `mysqli`, `pgsql` (`pg_pconnect`), and `odbc`. The one thing it
+> **cannot** force off is **PDO `ATTR_PERSISTENT`**: PDO has no global
+> `allow_persistent` ini, so a tenant passing `PDO::ATTR_PERSISTENT => true` to a
+> *shared* external backend can still open a persistent handle. ePHPm's own
+> per-site database path (the `ephpm_db_*` bridge and credential-fixed
+> `pdo_mysql`) is unaffected — this only matters for a tenant deliberately
+> holding a persistent PDO connection to an external DB shared with other
+> tenants. If that's in your threat model, keep such tenants off a shared
+> backend (per-tenant DB credentials already do this for the built-in path).
 
 ### 4. Egress — network layer + the `fsockopen` knob
 

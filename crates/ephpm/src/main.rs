@@ -947,7 +947,7 @@ fn log_multi_tenant_hardening(
             "multi-tenant hardening ON: disabled pcntl_*/posix process control, \
              pfsockopen, SysV shm_*/sem_*/msg_*, dl, mail, and \
              opcache_reset/opcache_compile_file via disable_functions; \
-             mysqli.allow_persistent=0. network_egress_externally_managed=true, \
+             mysqli/pgsql/odbc.allow_persistent=0. network_egress_externally_managed=true, \
              so the reachability-only fsockopen block is LIFTED (egress is \
              enforced below PHP); pfsockopen stays disabled (persistence, not \
              reachability). Cost: persistent DB/socket connections are off \
@@ -959,7 +959,7 @@ fn log_multi_tenant_hardening(
             "multi-tenant hardening ON: disabled pcntl_*/posix process control, \
              pfsockopen/fsockopen, SysV shm_*/sem_*/msg_*, dl, mail, and \
              opcache_reset/opcache_compile_file via disable_functions; \
-             mysqli.allow_persistent=0. Cost: persistent DB/socket connections are \
+             mysqli/pgsql/odbc.allow_persistent=0. Cost: persistent DB/socket connections are \
              off (Redis pconnect, mysqli p:, pfsockopen); fsockopen is blocked as \
              a reachability control (set [server.security] \
              network_egress_externally_managed = true to lift it when egress is \
@@ -1303,13 +1303,20 @@ fn run_with_config(
             ) {
                 let _ = writeln!(content, "disable_functions={df}");
             }
-            // Extra hardening ini (multi-tenant preset only). mysqli persistent
-            // handles are keyed without a tenant component, so disable them; and
-            // point the OPcache userland API at an unreachable sentinel so a
-            // tenant cannot reset/inspect the shared cache — but only when
+            // Extra hardening ini (multi-tenant preset only). Persistent
+            // connection handles live in `EG(persistent_list)`, keyed without a
+            // tenant component and surviving request end on a shared ZTS worker,
+            // so one tenant could inherit another's live handle — disable
+            // persistence across every driver that exposes an ini for it
+            // (mysqli, pgsql/`pg_pconnect`, odbc). PDO `ATTR_PERSISTENT` has no
+            // global ini and cannot be forced off here (documented residual).
+            // Also point the OPcache userland API at an unreachable sentinel so
+            // a tenant cannot reset/inspect the shared cache — but only when
             // ePHPm's own cluster invalidator does not itself need that API.
             if vhost_hardening {
                 let _ = writeln!(content, "mysqli.allow_persistent=0");
+                let _ = writeln!(content, "pgsql.allow_persistent=0");
+                let _ = writeln!(content, "odbc.allow_persistent=0");
                 if !cluster_invalidation {
                     let _ =
                         writeln!(content, "opcache.restrict_api={OPCACHE_RESTRICT_API_SENTINEL}");
