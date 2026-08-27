@@ -158,6 +158,24 @@ jobs:
           set -eu
           echo "EPHPM_RELEASE_VERSION=${REF_NAME#v}" >> "$GITHUB_ENV"
 
+      - name: Install clang for the eBPF object (best-effort)
+        # The ephpm-ci container carries libclang-dev (for the PHP SAPI's
+        # bindgen) but not the `clang` binary that crates/ephpm-server/build.rs
+        # uses to compile the per-vhost network-policy BPF program. Install it
+        # here. Non-fatal: build.rs stubs the feature (fail-closed; ebpf_policy
+        # is off by default) if clang is unavailable, so a transient apt failure
+        # logs a warning instead of parking the release.
+        run: |
+          set -u
+          if command -v clang >/dev/null 2>&1; then
+            echo "clang already present: $(clang --version | head -1)"
+          else
+            (apt-get update && apt-get install -y --no-install-recommends clang llvm) \
+              || echo "::warning::clang/llvm install failed; ebpf_policy will be stubbed in this build"
+          fi
+          clang --version 2>/dev/null | head -1 \
+            || echo "::warning::clang still unavailable; eBPF object will be stubbed"
+
       - name: Build ephpm
         env:
           # Overrides profile.release.lto from Cargo.toml per-arch (see the
@@ -222,6 +240,21 @@ jobs:
         run: |
           set -eu
           echo "EPHPM_RELEASE_VERSION=${REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Install clang for the eBPF object (best-effort)
+        # See build-linux: the arm64 ephpm-ci container likewise carries
+        # libclang-dev but not the clang binary build.rs needs for the BPF
+        # object. Non-fatal — build.rs stubs the feature if clang is missing.
+        run: |
+          set -u
+          if command -v clang >/dev/null 2>&1; then
+            echo "clang already present: $(clang --version | head -1)"
+          else
+            (apt-get update && apt-get install -y --no-install-recommends clang llvm) \
+              || echo "::warning::clang/llvm install failed; ebpf_policy will be stubbed in this build"
+          fi
+          clang --version 2>/dev/null | head -1 \
+            || echo "::warning::clang still unavailable; eBPF object will be stubbed"
 
       - name: Build ephpm
         env:

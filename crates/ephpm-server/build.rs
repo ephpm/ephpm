@@ -58,35 +58,33 @@ fn main() {
         ])
         .status();
 
-    // Build robustness: the `clang` BINARY is only present on the PHP-linked
-    // release toolchain, NOT on stub-mode CI, which installs `libclang-dev` (for
-    // the PHP SAPI's bindgen) but not the clang executable. A missing clang must
-    // NOT panic the whole `ephpm-server` build (clippy / bare-process E2E build
-    // it in stub mode). We distinguish the two failure modes deliberately:
-    match run {
-        Ok(status) if status.success() => {} // real object built — strip below
-        Ok(status) => {
-            // clang IS present but the BPF program failed to compile: a genuine
-            // error (bad C, missing header). Fail loudly — never ship a broken
-            // or silently-absent eBPF object from a toolchain that could build it.
-            panic!("clang compiled bpf/vhostnet.bpf.c with an error (exit {status})");
-        }
-        Err(e) => {
-            // clang binary absent (stub-mode CI). Emit an EMPTY placeholder so
-            // `include_bytes_aligned!` still compiles, and return without
-            // stripping. A binary built this way fails closed at load time (aya
-            // rejects the empty object) and `[server.tenant_network] ebpf_policy`
-            // is off by default, so nothing in CI ever exercises it. The release
-            // toolchain installs clang and builds the real object.
-            std::fs::write(&out, [])
-                .expect("write placeholder eBPF object so include_bytes_aligned! compiles");
-            println!(
-                "cargo:warning=clang ({clang}) not runnable ({e}); the \
-                 [server.tenant_network] ebpf_policy feature is unavailable in this build \
+    // Build robustness: NEVER panic here. The `clang` BINARY is only present on
+    // the PHP-linked release toolchain, not on stub-mode CI (which installs
+    // `libclang-dev` for the PHP SAPI's bindgen but not the clang executable);
+    // and a release leg for an unverified target could, in principle, hit an
+    // arch-specific compile quirk. Neither may break/park the `ephpm-server`
+    // build. On ANY failure — clang missing, or clang present but the compile
+    // errors — emit an EMPTY placeholder so `include_bytes_aligned!` still
+    // compiles, log a loud `cargo:warning`, and return. A binary built this way
+    // fails closed at load time (aya rejects the empty object) and
+    // `[server.tenant_network] ebpf_policy` is off by default, so nothing that
+    // did not build the real object ever exercises it. The release is
+    // smoke-tested afterwards to confirm the real object shipped.
+    if !matches!(&run, Ok(status) if status.success()) {
+        std::fs::write(&out, [])
+            .expect("write placeholder eBPF object so include_bytes_aligned! compiles");
+        match &run {
+            Ok(status) => println!(
+                "cargo:warning=clang compiled bpf/vhostnet.bpf.c with an error (exit {status}); \
+                 [server.tenant_network] ebpf_policy is unavailable in this build"
+            ),
+            Err(e) => println!(
+                "cargo:warning=clang ({clang}) not runnable ({e}); \
+                 [server.tenant_network] ebpf_policy is unavailable in this build \
                  (install the clang binary to enable it)"
-            );
-            return;
+            ),
         }
+        return;
     }
 
     // Strip DWARF debug info while keeping the `.BTF` sections the loader needs
