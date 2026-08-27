@@ -80,8 +80,20 @@ and `disable_functions` are the reason a tenant cannot simply shell out or
 
 ### 3. Persistent connections — off
 
-The preset sets `mysqli.allow_persistent = 0` and disables `pfsockopen`. The
-reason is subtle and specific to the shared-thread model: a **persistent**
+The preset sets `mysqli.allow_persistent = 0` and disables `pfsockopen`.
+
+> **A tenant cannot re-enable this.** `mysqli.allow_persistent` is a
+> `PHP_INI_SYSTEM` setting — the strictest access level — written into the
+> generated php.ini and applied once at MINIT. A tenant's `ini_set()` on it
+> returns `false` (SYSTEM settings are not runtime-changeable), and a per-vhost
+> `.user.ini` can only carry `PHP_INI_PERDIR`/`PHP_INI_USER` settings, never
+> SYSTEM ones. The same is true of `disable_functions` (also SYSTEM, applied at
+> MINIT — a disabled function cannot be brought back at runtime). `open_basedir`
+> is `PHP_INI_ALL`, but PHP only permits *narrowing* it at runtime, never
+> widening. So the security-critical hardening is locked at the top level; there
+> is no per-vhost override.
+
+The reason persistence is off is subtle and specific to the shared-thread model: a **persistent**
 connection lives in `EG(persistent_list)`, which survives request end on a long-
 lived ZTS worker thread. Because threads are **fungible** — the same thread
 serves tenant A now and tenant B later — a persistent connection A opened can be
