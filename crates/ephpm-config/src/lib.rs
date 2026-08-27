@@ -1916,6 +1916,22 @@ pub struct SqliteProxyConfig {
     /// `[server.limits] max_connections`.
     #[serde(default)]
     pub max_connections: usize,
+
+    /// Whether to start the `MySQL` wire listener at all.
+    ///
+    /// Default: `true` (the listener is bound — current behavior preserved).
+    ///
+    /// Set to `false` for **bridge-only** multi-tenant deployments where every
+    /// app talks to its per-site database exclusively through the in-process
+    /// native `ephpm_db_*` SAPI bridge and nothing uses stock `pdo_mysql`. When
+    /// `false`, ePHPm does **not** bind `mysql_listen` (no `:3306` frontend) and
+    /// injects no `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD` into requests — one
+    /// fewer local attack surface on a hardened preview host. The per-site
+    /// database registry and the `ephpm_db_*` bridge are still wired up, so
+    /// in-process database access is unaffected; only the wire *frontend* is
+    /// skipped. Applies to the per-site (multi-tenant) MySQL listener only.
+    #[serde(default = "default_mysql_wire_enabled")]
+    pub mysql_wire_enabled: bool,
 }
 
 impl Default for SqliteProxyConfig {
@@ -1926,6 +1942,7 @@ impl Default for SqliteProxyConfig {
             postgres_listen: None,
             tds_listen: None,
             max_connections: 0,
+            mysql_wire_enabled: default_mysql_wire_enabled(),
         }
     }
 }
@@ -4518,6 +4535,10 @@ fn default_sqlite_mysql_listen() -> String {
     "127.0.0.1:3306".to_string()
 }
 
+fn default_mysql_wire_enabled() -> bool {
+    true
+}
+
 fn default_replication_role() -> String {
     "auto".to_string()
 }
@@ -7070,6 +7091,11 @@ path = "app.db"
              a surprise cap would refuse connections on upgrade"
         );
         assert!(
+            sqlite.proxy.mysql_wire_enabled,
+            "mysql_wire_enabled must default to true (the wire listener is bound) — the toggle \
+             only turns the frontend OFF for bridge-only deployments"
+        );
+        assert!(
             sqlite.sqld.is_none(),
             "the [db.sqlite.sqld] block is removed in v0.7.0 and absent by default"
         );
@@ -7176,6 +7202,42 @@ primary_grpc_url = "http://10.0.1.2:5001"
         assert!(sqlite.sqld.is_none(), "no [db.sqlite.sqld] block was set");
         assert_eq!(sqlite.replication.role, "replica");
         assert_eq!(sqlite.replication.primary_grpc_url, "http://10.0.1.2:5001");
+    }
+
+    /// `mysql_wire_enabled` defaults true (via the section-level `Default`)
+    /// even when `[db.sqlite.proxy]` is present but omits the key, and can be
+    /// turned off explicitly for bridge-only deployments.
+    #[test]
+    fn test_mysql_wire_enabled_toggle() {
+        // Section-level default: present proxy block, key omitted → true.
+        assert!(
+            SqliteProxyConfig::default().mysql_wire_enabled,
+            "SqliteProxyConfig::default() must have the wire listener enabled"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[db.sqlite]
+path = "app.db"
+
+[db.sqlite.proxy]
+mysql_wire_enabled = false
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let sqlite = config.db.sqlite.expect("sqlite should be present");
+        assert!(
+            !sqlite.proxy.mysql_wire_enabled,
+            "mysql_wire_enabled = false must disable the wire listener"
+        );
+        // The listen address still parses/defaults — the frontend is skipped
+        // by the server, not unset in config.
+        assert_eq!(sqlite.proxy.mysql_listen, "127.0.0.1:3306");
     }
 
     /// A stale `[db.sqlite.sqld]` block from a pre-v0.7.0 config must still

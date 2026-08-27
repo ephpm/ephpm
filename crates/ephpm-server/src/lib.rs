@@ -345,6 +345,21 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // `wire_per_site_db` returns `Some` only with `[db.sqlite]` present — but
     // pairing them here avoids asserting that in a way that could panic.
     let per_site_db_wire = match (per_site_wire_auth, config.db.sqlite.as_ref()) {
+        // `[db.sqlite.proxy] mysql_wire_enabled = false`: bridge-only mode. The
+        // per-site registry and `ephpm_db_*` bridge were already wired up by
+        // `wire_per_site_db` above; here we deliberately skip the wire FRONTEND
+        // (no `:3306` bind) and hand the router `None` so it advertises no
+        // `DB_HOST`/`DB_PORT`/`DB_USER`/`DB_PASSWORD` for an endpoint that does
+        // not exist. In-process database access via `ephpm_db_*` is unaffected.
+        (Some(_auth), Some(sqlite)) if !per_site_wire_enabled(sqlite) => {
+            tracing::info!(
+                "per-site MySQL wire listener DISABLED ([db.sqlite.proxy] mysql_wire_enabled = \
+                 false): not binding {:?}. Per-site databases are reachable only through the \
+                 in-process ephpm_db_* bridge (no pdo_mysql); no DB_* credentials are injected.",
+                sqlite.proxy.mysql_listen
+            );
+            None
+        }
         (Some(auth), Some(sqlite)) => {
             let listen = start_per_site_wire(sqlite, &auth, &mut per_site_wire_handles).await?;
             Some((auth, listen))
@@ -2070,6 +2085,21 @@ fn wire_per_site_db(
     Ok(Some(auth))
 }
 
+/// Whether the per-site MySQL wire *frontend* should be bound.
+///
+/// Controlled by `[db.sqlite.proxy] mysql_wire_enabled` (default `true`).
+/// Setting it `false` is for **bridge-only** deployments: every app reaches
+/// its per-site database exclusively through the in-process `ephpm_db_*` SAPI
+/// bridge and nothing uses stock `pdo_mysql`, so the `:3306` listener is pure
+/// attack surface and stays unbound.
+///
+/// This gates ONLY the wire frontend. The per-site database registry and the
+/// `ephpm_db_*` bridge are wired up independently in [`wire_per_site_db`], so
+/// in-process database access is unaffected when this returns `false`.
+fn per_site_wire_enabled(sqlite: &ephpm_config::SqliteConfig) -> bool {
+    sqlite.proxy.mysql_wire_enabled
+}
+
 /// Start the multi-tenant MySQL wire listener for per-site mode.
 ///
 /// One listener, many databases. The connection's tenant is the identity it
@@ -2455,6 +2485,25 @@ mod lib_tests {
         let config = make_sqlite_config("replica");
         assert!(is_clustered_sqlite(&config, false));
         assert!(is_clustered_sqlite(&config, true));
+    }
+
+    #[test]
+    fn per_site_wire_enabled_by_default() {
+        let config = make_sqlite_config("single");
+        assert!(
+            per_site_wire_enabled(&config),
+            "the per-site MySQL wire listener is bound by default"
+        );
+    }
+
+    #[test]
+    fn per_site_wire_disabled_when_toggled_off() {
+        let mut config = make_sqlite_config("single");
+        config.proxy.mysql_wire_enabled = false;
+        assert!(
+            !per_site_wire_enabled(&config),
+            "mysql_wire_enabled = false must skip binding the wire frontend (bridge-only mode)"
+        );
     }
 
     // ── KV service wiring ───────────────────────────────────────────────────
