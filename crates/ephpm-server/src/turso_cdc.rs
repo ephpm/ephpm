@@ -449,6 +449,13 @@ pub async fn start_clustered_turso_cdc(
     channel_handle: Option<&ephpm_cluster::ChannelHandle>,
     query_stats: &ephpm_query_stats::QueryStats,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
+    // Shared "am I the primary?" view exposed at `/_ephpm/primary` for
+    // active-passive LB routing. This is the SAME `AtomicBool` the router
+    // reads: the role-change watcher below flips it, so the health endpoint
+    // tracks the live election result with a single relaxed load. It is the
+    // canonical primary flag for this path — the stream handlers and head
+    // sampler read it too.
+    primary_view: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let cluster = cluster.context(
         "clustered Turso CDC replication requires [cluster] enabled = true; \
@@ -544,7 +551,13 @@ pub async fn start_clustered_turso_cdc(
     // microseconds around a role flip either serves one extra stream
     // (which the new primary's election heartbeat will supersede) or
     // refuses one that the replica retries two seconds later.
-    let is_primary = Arc::new(AtomicBool::new(matches!(initial_role, Role::Primary)));
+    // Reuse the router-shared view as the canonical primary flag rather than a
+    // private `AtomicBool`, so `/_ephpm/primary` and the stream handlers agree.
+    // Seed it with the resolved initial role; the role-change watcher below
+    // keeps it current. A standalone node never reaches here, so its constant
+    // `true` default is untouched.
+    let is_primary = primary_view;
+    is_primary.store(matches!(initial_role, Role::Primary), Ordering::Relaxed);
 
     // Wire factory: served to litewire. Capture is enabled on EVERY
     // node, not just the one that booted as primary: `Turso::builder`

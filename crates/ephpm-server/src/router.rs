@@ -10,6 +10,7 @@ use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 #[allow(unused_imports)]
@@ -656,6 +657,22 @@ pub struct Router {
     /// Enabled by default in dev mode, opt-in via
     /// `[server.diagnostics] request_log` in serve mode.
     request_log: Option<Arc<crate::timeline::RequestLog>>,
+    /// Whether this node is currently the writable SQLite target, exposed at
+    /// `/_ephpm/primary` so an external load balancer can route
+    /// active-passive to the elected cluster primary.
+    ///
+    /// `true` means this node accepts writes: it is either the elected
+    /// clustered-SQLite primary, or a non-clustered/standalone node (trivially
+    /// writable). `false` means this node is a clustered-SQLite replica, whose
+    /// writes would silently diverge — the LB must steer writes away from it.
+    ///
+    /// A lock-free `AtomicBool` so the `/_ephpm/primary` handler is a single
+    /// relaxed load with no lock and no await on the request hot path. Defaults
+    /// to a constant `true` (`Router::new`); in clustered-SQLite mode the CDC
+    /// election path (`turso_cdc::start_clustered_turso_cdc`) shares this exact
+    /// `Arc` and flips it on every role change (issue: primary-aware health
+    /// endpoint).
+    primary_view: Arc<AtomicBool>,
 }
 
 /// Header names always stripped from inbound requests at ingest, in addition
@@ -1128,6 +1145,10 @@ impl Router {
             ingest_strip_headers: build_ingest_strip_headers(&config.middleware),
             db_health: None,
             request_log: None,
+            // Default: this node is a writable SQLite target (standalone /
+            // non-clustered). Clustered-SQLite mode replaces this with the
+            // election's shared view via `with_primary_view`.
+            primary_view: Arc::new(AtomicBool::new(true)),
         };
 
         // Read every known site's override once, now: it seeds the cache (so the
@@ -1585,6 +1606,22 @@ impl Router {
     #[must_use]
     pub fn with_db_health(mut self, db_health: Arc<crate::db_health::DbProxyHealth>) -> Self {
         self.db_health = Some(db_health);
+        self
+    }
+
+    /// Share the clustered-SQLite election's "am I the primary?" view, exposed
+    /// at `/_ephpm/primary` for active-passive load-balancer routing.
+    ///
+    /// `serve()` passes the *same* `Arc<AtomicBool>` that
+    /// [`turso_cdc::start_clustered_turso_cdc`](crate::turso_cdc::start_clustered_turso_cdc)
+    /// flips on every election role change, so `/_ephpm/primary` tracks the
+    /// live role with a single relaxed atomic load — no lock, no await on the
+    /// request path. Left unset (single-node / non-clustered), the router keeps
+    /// the constant-`true` view `new()` installed, and `/_ephpm/primary`
+    /// reports 200 because a standalone node is trivially writable.
+    #[must_use]
+    pub fn with_primary_view(mut self, primary_view: Arc<AtomicBool>) -> Self {
+        self.primary_view = primary_view;
         self
     }
 
@@ -2199,6 +2236,17 @@ impl Router {
             // Readiness probe — checks PHP initialization and DB proxy.
             if uri_path == "/_ephpm/ready" {
                 return Ok((self.readiness_check(), "health"));
+            }
+
+            // Primary probe — the load-balancer target for active-passive
+            // routing to the writable SQLite node. 200 when this node accepts
+            // writes (the elected clustered-SQLite primary, or any
+            // non-clustered/standalone node), 503 when it is a replica whose
+            // writes would silently diverge. Safe to health-check in any
+            // topology, so it never 404s. A single relaxed atomic load — no
+            // lock, no await.
+            if uri_path == "/_ephpm/primary" {
+                return Ok((self.primary_check(), "health"));
             }
 
             // Request timeline (dev mode / [server.diagnostics] request_log):
@@ -4004,6 +4052,25 @@ impl Router {
             return resp;
         }
         json_response(StatusCode::OK, r#"{"status":"ready"}"#)
+    }
+
+    /// Primary probe served at `/_ephpm/primary` — the active-passive
+    /// load-balancer target for the writable clustered-SQLite node.
+    ///
+    /// `200 {"primary":true}` when this node accepts writes: the elected
+    /// clustered-SQLite primary, or any non-clustered/standalone node (whose
+    /// `primary_view` stays the constant `true` from `new()`). `503
+    /// {"primary":false}` when this node is a clustered-SQLite replica —
+    /// steering a write here would silently diverge and be lost, so the LB
+    /// must route it away until it wins an election.
+    ///
+    /// One relaxed atomic load: no lock and no await on the request path.
+    fn primary_check(&self) -> Response<ServerBody> {
+        if self.primary_view.load(std::sync::atomic::Ordering::Relaxed) {
+            json_response(StatusCode::OK, r#"{"primary":true}"#)
+        } else {
+            json_response(StatusCode::SERVICE_UNAVAILABLE, r#"{"primary":false}"#)
+        }
     }
 
     /// The database half of [`Router::readiness_check`]: `Some(503)` when a
@@ -9586,6 +9653,80 @@ data: two
 
         health.mysql().unwrap().record_up();
         assert_eq!(router.readiness_check().status(), StatusCode::OK);
+    }
+
+    // ── Primary probe: active-passive LB routing (/_ephpm/primary) ────────
+
+    /// Drive a GET `/_ephpm/primary` through the full router and return the
+    /// (status, JSON body) pair. Served before every security gate and before
+    /// PHP, so no runtime init is needed.
+    async fn fetch_primary(router: &Router) -> (StatusCode, serde_json::Value) {
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let req = Request::builder()
+            .method("GET")
+            .uri("/_ephpm/primary")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        let status = resp.status();
+        assert_eq!(
+            resp.headers().get("content-type").and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// Non-clustered / standalone: the default `primary_view` is a constant
+    /// `true`, so a node with no election is trivially writable and the probe
+    /// returns 200 — safe to health-check in any topology, never a 404.
+    #[tokio::test]
+    async fn primary_endpoint_is_200_when_not_clustered() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path());
+        let (status, body) = fetch_primary(&router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["primary"], true);
+    }
+
+    /// This node is the elected clustered-SQLite primary: the shared view is
+    /// `true`, so the probe returns 200 and the LB routes writes here.
+    #[tokio::test]
+    async fn primary_endpoint_is_200_when_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).with_primary_view(Arc::new(AtomicBool::new(true)));
+        let (status, body) = fetch_primary(&router).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["primary"], true);
+    }
+
+    /// This node is a clustered-SQLite replica: the shared view is `false`, so
+    /// the probe returns 503 and the LB steers writes away (a write here would
+    /// silently diverge and be lost).
+    #[tokio::test]
+    async fn primary_endpoint_is_503_when_replica() {
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router(dir.path()).with_primary_view(Arc::new(AtomicBool::new(false)));
+        let (status, body) = fetch_primary(&router).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["primary"], false);
+    }
+
+    /// A failover flips the shared view live: the same router reports 503 as a
+    /// replica, then 200 the instant the election promotes it — no rebuild, no
+    /// restart (mirrors what `start_clustered_turso_cdc`'s role-change watcher
+    /// does to this exact `AtomicBool`).
+    #[tokio::test]
+    async fn primary_endpoint_tracks_a_live_role_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let view = Arc::new(AtomicBool::new(false));
+        let router = test_router(dir.path()).with_primary_view(Arc::clone(&view));
+
+        assert_eq!(fetch_primary(&router).await.0, StatusCode::SERVICE_UNAVAILABLE);
+
+        // Election promotes this node to primary.
+        view.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(fetch_primary(&router).await.0, StatusCode::OK);
     }
 
     #[test]

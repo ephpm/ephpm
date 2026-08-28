@@ -32,7 +32,7 @@ pub mod worker_pool;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
@@ -369,6 +369,15 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         _ => None,
     };
 
+    // Shared "am I the writable SQLite target?" view, exposed at
+    // `/_ephpm/primary` for active-passive load-balancer routing. Starts `true`
+    // (a standalone/non-clustered node is trivially writable); in
+    // clustered-SQLite mode `start_db_proxies` hands this exact `Arc` to the
+    // CDC election path, which flips it on every role change. Built before the
+    // router so the same handle reaches both the request path (via
+    // `with_primary_view`) and the election (via `start_db_proxies`).
+    let primary_view = Arc::new(AtomicBool::new(true));
+
     let listeners = bind_listeners(
         &config,
         kv_store,
@@ -379,6 +388,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         Arc::clone(&db_health),
         request_log,
         per_site_db_wire,
+        Arc::clone(&primary_view),
     )
     .await?;
 
@@ -388,6 +398,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         channel_handle.as_ref(),
         &query_stats,
         &db_health,
+        primary_view,
     )
     .await?;
     let _per_site_wire_handles = per_site_wire_handles;
@@ -490,6 +501,10 @@ async fn bind_listeners(
     // is confirmed bindable — so the router never advertises a database
     // endpoint that does not exist.
     per_site_db_wire: Option<(site_wire_auth::SiteWireAuth, String)>,
+    // Shared clustered-SQLite "am I the primary?" view for `/_ephpm/primary`
+    // (active-passive LB routing). Constant `true` for a standalone node; the
+    // CDC election path flips it in clustered mode.
+    primary_view: Arc<AtomicBool>,
 ) -> anyhow::Result<Listeners> {
     let addr: SocketAddr = config.server.listen.parse().context("invalid listen address")?;
 
@@ -794,6 +809,7 @@ async fn bind_listeners(
         // derived from `[cluster] node_id`.
         .with_node_id(node_id)
         .with_db_health(db_health)
+        .with_primary_view(primary_view)
         .with_websocket(websocket)
         .with_request_log(request_log);
 
@@ -1852,6 +1868,11 @@ async fn start_db_proxies(
     channel_handle: Option<&ephpm_cluster::ChannelHandle>,
     query_stats: &ephpm_query_stats::QueryStats,
     db_health: &db_health::DbProxyHealth,
+    // Shared "am I the writable SQLite target?" view for `/_ephpm/primary`.
+    // In clustered-SQLite mode this is handed to the CDC election path, which
+    // flips it on every role change; in every other mode it is left at its
+    // constant `true` (a standalone node is trivially writable).
+    primary_view: Arc<AtomicBool>,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut handles = vec![];
 
@@ -1996,6 +2017,7 @@ async fn start_db_proxies(
                 channel_handle,
                 query_stats,
                 &mut handles,
+                primary_view,
             )
             .await?;
         } else if is_per_site_sqlite(config, cluster.is_some()) {

@@ -219,7 +219,7 @@ ephpm admin --nodes 10.0.1.1:9090,10.0.1.2:9090,10.0.1.3:9090
 > **In particular, do not read the "Authentication" paragraph below as a
 > security control that exists.** The only endpoints ePHPm actually serves
 > beyond your application are `/metrics` (opt-in, read-only, unauthenticated),
-> `/_ephpm/health`, `/_ephpm/ready`, and `/_ephpm/requests`. See
+> `/_ephpm/health`, `/_ephpm/ready`, `/_ephpm/primary`, and `/_ephpm/requests`. See
 > [Security → Secrets](/architecture/security/), which correctly states that
 > ePHPm exposes no admin interface.
 

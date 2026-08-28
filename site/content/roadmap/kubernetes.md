@@ -27,17 +27,50 @@ database sidecar is needed.
 
 ## Health Probes
 
-ePHPm exposes two built-in probe endpoints on the main HTTP port:
+ePHPm exposes three built-in probe endpoints on the main HTTP port:
 
 | Endpoint | Purpose | Response |
 |----------|---------|----------|
 | `/_ephpm/health` | Liveness probe | `200 {"status":"ok"}` — always succeeds if the process is running |
 | `/_ephpm/ready` | Readiness probe | `200 {"status":"ready"}` once the PHP runtime is initialized, a worker has finished booting (worker mode only), and every configured SQL proxy has reached its upstream at least once. Otherwise `503 {"status":"not_ready","reason":"..."}` naming which of those is outstanding. |
+| `/_ephpm/primary` | Active-passive routing target for the writable clustered-SQLite node | `200 {"primary":true}` when this node accepts writes — the elected clustered-SQLite primary, **or any non-clustered/standalone node** (trivially writable). `503 {"primary":false}` when this node is a clustered-SQLite replica. On failover the new primary starts returning 200 within the election interval. |
 
 Readiness gates on the SQL proxy's **first** upstream connect, not on live
 database reachability — a shared-database outage must not fail every replica's
 probe at once and empty the Service. See
 [Readiness and the database proxy](/reference/config/#readiness-and-the-database-proxy).
+
+### Active-passive writes: `/_ephpm/primary`
+
+In clustered single-database mode (`is_clustered_sqlite` — `[db.sqlite]` with
+`[cluster]` enabled), exactly one node is the elected SQLite **primary**; the
+others are **replicas**. Writes must go to the primary: a write against a
+replica silently diverges and is lost. A plain round-robin load balancer,
+unaware of the role, sends some writes to replicas.
+
+`/_ephpm/primary` lets an external load balancer route **active-passive** to the
+current primary: point a dedicated backend/upstream health check at it and send
+write traffic only to the node whose check passes. It returns `200` on the
+primary and `503` on every replica, so at most one backend is ever "up". On
+failover the newly elected primary flips to `200` on its next election tick
+(and the old one to `503`), and the load balancer follows.
+
+The endpoint is safe to health-check in **any** topology — it never 404s. On a
+standalone or non-clustered node there is no election, so the node is trivially
+writable and the check is a constant `200`. That means the same LB manifest
+works whether or not clustering is enabled.
+
+```yaml
+# Example: an LB backend that only accepts the writable node.
+# (HAProxy-style; adapt to your load balancer's health-check syntax.)
+backend ephpm_writes
+  option httpchk GET /_ephpm/primary
+  http-check expect status 200
+  # every ephpm pod is listed; only the primary passes the check
+  server ephpm-0 10.0.1.10:8080 check
+  server ephpm-1 10.0.1.11:8080 check
+  server ephpm-2 10.0.1.12:8080 check
+```
 
 ### Pod spec example
 
