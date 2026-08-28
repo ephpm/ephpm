@@ -1987,6 +1987,20 @@ impl Router {
     where
         B: RequestBody,
     {
+        // HTTP/2 and HTTP/3 carry the host in the `:authority` pseudo-header,
+        // NOT a `Host` header (hyper surfaces it as the request-URI authority).
+        // Synthesize a `Host` header from that authority when the client sent
+        // none, so every downstream host consumer sees one consistent value:
+        // vhost/document-root resolution (`extract_server_name`), the
+        // trusted-host gate, and — critically — the `HTTP_HOST` `$_SERVER`
+        // variable handed to PHP. Without this, an HTTP/2 browser request
+        // reached the right document root (via `extract_server_name`'s own
+        // authority fallback) but PHP saw an empty `HTTP_HOST`, so apps like
+        // WordPress computed `localhost` URLs and 404'd every page over HTTPS
+        // while HTTP/1.1 worked.
+        let mut req = req;
+        ensure_host_header(&mut req);
+
         // Metrics label for the request method. Standard HTTP methods map to
         // a `&'static str` so the two metric sites below allocate nothing per
         // request (issue #136); non-standard methods collapse to `"OTHER"`,
@@ -2888,7 +2902,7 @@ impl Router {
         // `"OTHER"`, so random verbs can't explode the series count or cost
         // a `String` allocation per request on the hot path.
         let method_label: &'static str = method_metric_label(req.method());
-        let mut uri = req.uri().to_string();
+        let mut uri = request_uri_origin_form(&req);
         let mut path = req.uri().path().to_string();
         let query_string = req.uri().query().unwrap_or("").to_string();
         let protocol = format!("{:?}", req.version());
@@ -4437,15 +4451,62 @@ fn status_metric_label(status: StatusCode) -> &'static str {
     }
 }
 
+/// Synthesize a `Host` header from the URI `:authority` when the request has
+/// none.
+///
+/// HTTP/2 and HTTP/3 carry the host in the `:authority` pseudo-header, which
+/// hyper exposes as the request-URI authority rather than a `Host` header. So
+/// that every downstream host consumer agrees — vhost/document-root resolution
+/// (`extract_server_name`), the trusted-host gate, and the `HTTP_HOST`
+/// `$_SERVER` variable PHP receives (built from the `Host` header) — this copies
+/// the authority into a real `Host` header at ingress. Idempotent: a request
+/// that already carries a `Host` header (HTTP/1.1) is left untouched.
+fn ensure_host_header<B>(req: &mut Request<B>) {
+    if !req.headers().contains_key(http::header::HOST)
+        && let Some(authority) = req.uri().authority().cloned()
+        && let Ok(value) = hyper::header::HeaderValue::from_str(authority.as_str())
+    {
+        req.headers_mut().insert(http::header::HOST, value);
+    }
+}
+
+/// Build the CGI `REQUEST_URI` as the origin-form target: the path plus an
+/// optional `?query`, never a scheme or authority.
+///
+/// Over HTTP/1.1 hyper's request URI is already origin-form (`/path?q`), but
+/// over HTTP/2 and HTTP/3 it is the absolute form (`https://host/path?q`).
+/// Handing that absolute form to PHP as `REQUEST_URI` makes apps build
+/// canonical redirects to a mangled URL — e.g. WordPress redirected `/` to
+/// `https://demo.preview.ephpm.devhttps/demo.preview.ephpm.dev/`. Taking
+/// `path_and_query` yields the identical `/path?q` for every protocol version.
+fn request_uri_origin_form<B>(req: &Request<B>) -> String {
+    req.uri()
+        .path_and_query()
+        .map_or_else(|| req.uri().path().to_string(), |pq| pq.as_str().to_string())
+}
+
 fn extract_server_name<B>(req: &Request<B>) -> String {
-    req.headers()
+    // HTTP/1.1 carries the host in the `Host` header; HTTP/2 and HTTP/3 carry it
+    // in the `:authority` pseudo-header, which hyper exposes as the request-URI
+    // authority, NOT as a synthesized `Host` header. Reading only `Host` made
+    // every browser request over TLS (which negotiates HTTP/2 via ALPN) resolve
+    // to `localhost` — the default document root — so multi-tenant vhosts 404'd
+    // over HTTPS while working over HTTP/1.1. Prefer `Host`, then fall back to
+    // the URI authority, and only then to `localhost`.
+    if let Some(host) = req
+        .headers()
         .get("host")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("localhost")
-        .split(':')
-        .next()
-        .unwrap_or("localhost")
-        .to_string()
+        .map(|h| h.split(':').next().unwrap_or(h))
+        .filter(|h| !h.is_empty())
+    {
+        return host.to_string();
+    }
+    if let Some(authority) = req.uri().authority() {
+        // `Authority::host()` already excludes any userinfo and port.
+        return authority.host().to_string();
+    }
+    "localhost".to_string()
 }
 
 /// Normalize a raw `Host` value into the canonical vhost-lookup key: strip the
@@ -5287,6 +5348,130 @@ mod tests {
             opcache: ephpm_config::OpcacheConfig::default(),
         };
         Router::new(&config, test_store(), None, None, None, None, None)
+    }
+
+    /// A browser over TLS negotiates HTTP/2, which carries the host in the
+    /// `:authority` pseudo-header (surfaced as the request-URI authority), not a
+    /// `Host` header. `extract_server_name` must read it, or every HTTPS request
+    /// resolves to `localhost` — the default document root — and multi-tenant
+    /// vhosts 404 while HTTP/1.1 works. Regression guard for that.
+    #[test]
+    fn extract_server_name_prefers_host_then_authority() {
+        // HTTP/1.1: `Host` header, port stripped.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/x")
+            .header("host", "demo.preview.ephpm.dev:443")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        assert_eq!(extract_server_name(&req), "demo.preview.ephpm.dev");
+
+        // HTTP/2: no `Host` header; host is in the URI `:authority`.
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://demo.preview.ephpm.dev/x")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        assert!(req.headers().get("host").is_none());
+        assert_eq!(extract_server_name(&req), "demo.preview.ephpm.dev");
+
+        // `:authority` with an explicit port is stripped by `Authority::host()`.
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://demo.preview.ephpm.dev:8443/x")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        assert_eq!(extract_server_name(&req), "demo.preview.ephpm.dev");
+
+        // Neither present → `localhost` fallback (unchanged behaviour).
+        let req =
+            Request::builder().method("GET").uri("/x").body(Empty::<Bytes>::new()).unwrap();
+        assert_eq!(extract_server_name(&req), "localhost");
+    }
+
+    /// `ensure_host_header` must copy the HTTP/2 `:authority` into a real `Host`
+    /// header, because PHP's `HTTP_HOST` `$_SERVER` var is built from the `Host`
+    /// header. Without it an HTTP/2 request reaches the right document root but
+    /// PHP sees an empty `HTTP_HOST` — WordPress then computes `localhost` URLs
+    /// and 404s. Regression guard for the `$_SERVER['HTTP_HOST']` half of the
+    /// HTTP/2 vhost fix.
+    #[test]
+    fn ensure_host_header_synthesizes_from_authority() {
+        // HTTP/2: no `Host` header; authority present → header synthesized.
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("https://demo.preview.ephpm.dev/x")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        assert!(req.headers().get("host").is_none());
+        ensure_host_header(&mut req);
+        assert_eq!(
+            req.headers().get("host").and_then(|v| v.to_str().ok()),
+            Some("demo.preview.ephpm.dev")
+        );
+
+        // `:authority` with an explicit port is preserved verbatim (a real
+        // `Host` header keeps the port too).
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("https://demo.preview.ephpm.dev:8443/x")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        ensure_host_header(&mut req);
+        assert_eq!(
+            req.headers().get("host").and_then(|v| v.to_str().ok()),
+            Some("demo.preview.ephpm.dev:8443")
+        );
+
+        // HTTP/1.1: an existing `Host` header is left untouched (idempotent).
+        let mut req = Request::builder()
+            .method("GET")
+            .uri("/x")
+            .header("host", "explicit.example.com")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        ensure_host_header(&mut req);
+        assert_eq!(
+            req.headers().get("host").and_then(|v| v.to_str().ok()),
+            Some("explicit.example.com")
+        );
+
+        // Neither present → nothing to synthesize; no `Host` header added.
+        let mut req =
+            Request::builder().method("GET").uri("/x").body(Empty::<Bytes>::new()).unwrap();
+        ensure_host_header(&mut req);
+        assert!(req.headers().get("host").is_none());
+    }
+
+    /// `REQUEST_URI` must be origin-form for every protocol. Over HTTP/2 the
+    /// request URI is absolute (`https://host/path?q`); emitted verbatim it
+    /// makes WordPress build canonical redirects to a mangled URL. Regression
+    /// guard for the `REQUEST_URI` third of the HTTP/2 vhost fix.
+    #[test]
+    fn request_uri_origin_form_strips_scheme_and_authority() {
+        // HTTP/2 absolute form → path + query only.
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://demo.preview.ephpm.dev/wp-admin/?foo=bar")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        assert_eq!(request_uri_origin_form(&req), "/wp-admin/?foo=bar");
+
+        // HTTP/2 absolute form, root path.
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://demo.preview.ephpm.dev/")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        assert_eq!(request_uri_origin_form(&req), "/");
+
+        // HTTP/1.1 origin form is already correct and unchanged.
+        let req = Request::builder()
+            .method("GET")
+            .uri("/wp-admin/?foo=bar")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        assert_eq!(request_uri_origin_form(&req), "/wp-admin/?foo=bar");
     }
 
     // ── Middleware response phase + static-path request phase (#395) ──────
