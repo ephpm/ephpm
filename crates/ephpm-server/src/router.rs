@@ -5384,8 +5384,7 @@ mod tests {
         assert_eq!(extract_server_name(&req), "demo.preview.ephpm.dev");
 
         // Neither present → `localhost` fallback (unchanged behaviour).
-        let req =
-            Request::builder().method("GET").uri("/x").body(Empty::<Bytes>::new()).unwrap();
+        let req = Request::builder().method("GET").uri("/x").body(Empty::<Bytes>::new()).unwrap();
         assert_eq!(extract_server_name(&req), "localhost");
     }
 
