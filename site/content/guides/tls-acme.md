@@ -133,7 +133,9 @@ For each order ePHPm publishes the challenge TXT records, waits for propagation,
 
 ## Clustered ACME
 
-In a cluster, only one node should solve the challenge — the rest read the cert from the gossip-backed KV store. ePHPm does this automatically when `[cluster] enabled = true`. Each node points at the same `cache_dir` (or a shared store) and the leader publishes the cert; replicas pick it up. Both challenge lanes share the same `acme:leader` election and KV distribution. See [Clustering Setup](clustering-setup/).
+In a cluster, only one node should solve the challenge — the rest read the cert from the KV store. ePHPm does this automatically when `[cluster] enabled = true`. Each node points at the same `cache_dir` (or a shared store) and the leader publishes the cert; replicas pick it up. Both challenge lanes share the same `acme:leader` election and KV distribution. See [Clustering Setup](clustering-setup/).
+
+Certificates and ACME account material are written to the KV store's **broadcast** tier, so every node gets its own local copy. This is deliberate and distinct from an ordinary KV write: the clustered store routes values larger than `[cluster.kv] small_key_threshold` to a *sharded* tier held on `replication_factor` nodes, and a certificate chain is comfortably over that threshold. Every node terminates TLS, so every node needs the certificate — sharding it leaves the rest of the cluster unable to complete a handshake at all. A follower that missed the broadcast (it joined, or was down, after issuance) fetches the certificate from a peer on its next poll rather than waiting for the next renewal.
 
 The two limitations below apply to the **TLS-ALPN-01** lane. The **DNS-01** lane avoids both — the challenge is answered over DNS by the leader (nothing needs to reach a specific node), and its certificate resolver is hot-swappable, so a follower installs the leader's *renewed* certificate from the KV store without a restart. That makes DNS-01 the better fit for clustered deployments.
 

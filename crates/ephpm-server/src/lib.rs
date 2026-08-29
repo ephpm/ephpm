@@ -1345,6 +1345,23 @@ impl Drop for InFlightGuard {
 }
 
 /// Dispatch a connection from the main listener.
+///
+/// # The main listener is plain HTTP whenever a separate TLS listener exists
+///
+/// `[server.tls] listen` means, per its documented contract, *"`server.listen`
+/// serves HTTP and this address serves HTTPS"*. So the moment a separate TLS
+/// listener is bound, this listener speaks plain HTTP — whatever [`TlsMode`]
+/// the server is in. `redirect_http` then chooses only what that plain-HTTP
+/// listener *says*: a 301 to HTTPS, or the site itself.
+///
+/// This used to be gated on `has_tls_listener && redirect_http`, and
+/// `redirect_http` defaults to `false`. A config with both `[server] listen`
+/// and `[server.tls] listen` but no redirect therefore fell through to the
+/// `tls_mode` match below and TLS-wrapped the *plain* listener: a plaintext
+/// `GET` got a TLS alert record (`15 03 03 ...`) instead of a response, so
+/// every plain-HTTP client — browsers, load-balancer health checks — failed to
+/// connect. Serving HTTPS on both listeners is never a valid reading of the
+/// contract, so there is no `tls_mode` arm here at all.
 fn dispatch_main_connection(
     stream: TcpStream,
     remote_addr: SocketAddr,
@@ -1359,10 +1376,16 @@ fn dispatch_main_connection(
     in_flight.fetch_add(1, Ordering::Relaxed);
     let flight_guard = InFlightGuard(Arc::clone(in_flight));
 
-    if has_tls_listener && redirect_http {
+    if has_tls_listener {
+        let router = Arc::clone(router);
         tokio::spawn(async move {
+            let _guard = guard; // held until connection closes
             let _flight = flight_guard;
-            serve_http_redirect(stream, remote_addr, conn).await;
+            if redirect_http {
+                serve_http_redirect(stream, remote_addr, conn).await;
+            } else {
+                serve_connection(stream, router, remote_addr, false, conn).await;
+            }
         });
         return;
     }
@@ -2453,6 +2476,186 @@ mod lib_tests {
         conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", &[])
             .await
             .expect("execute through wrapper");
+    }
+
+    // ── Main-listener role when a separate TLS listener is configured ───
+    //
+    // `[server.tls] listen` documents: "server.listen serves HTTP and this
+    // address serves HTTPS". These tests pin that contract at
+    // `dispatch_main_connection` itself, over a real socket, by inspecting
+    // the first bytes the server writes back to a plaintext GET. The two
+    // answers are unambiguous on the wire: an HTTP response begins
+    // `HTTP/1.1`, whereas a TLS record begins with a content-type byte
+    // (0x16 handshake, 0x15 alert). The live bug was diagnosed exactly this
+    // way — `nc` to the plain port returned `15 03 03 00 02 02 32`.
+
+    /// A router serving one static file out of a temp document root.
+    fn dispatch_test_router(docroot: &std::path::Path) -> Arc<Router> {
+        let config = ephpm_config::Config {
+            server: ephpm_config::ServerConfig {
+                listen: "127.0.0.1:0".to_owned(),
+                document_root: docroot.to_path_buf(),
+                index_files: vec!["index.html".to_owned()],
+                ..ephpm_config::ServerConfig::default()
+            },
+            php: ephpm_config::PhpConfig::default(),
+            db: ephpm_config::DbConfig::default(),
+            kv: ephpm_config::KvConfig::default(),
+            cluster: ephpm_config::ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        let store = ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default());
+        Arc::new(Router::new(&config, store, None, None, None, None, None))
+    }
+
+    /// Manual TLS over a freshly generated self-signed cert.
+    fn dispatch_test_manual_tls(dir: &std::path::Path) -> TlsMode {
+        tls::tests_support::init_crypto();
+        let (cert, key) = tls::tests_support::generate_ec_cert(dir);
+        TlsMode::Manual(tls::build_tls_acceptor(&cert, &key).expect("build acceptor"))
+    }
+
+    /// ACME TLS mode over the same cert material, so the tests cover the
+    /// `TlsMode::Acme` arm too — the original bug hit both.
+    fn dispatch_test_acme_tls(dir: &std::path::Path) -> TlsMode {
+        tls::tests_support::init_crypto();
+        let (cert, key) = tls::tests_support::generate_ec_cert(dir);
+        let alpn = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let build =
+            || Arc::new(tls::build_server_config(&cert, &key, &alpn).expect("build server config"));
+        TlsMode::Acme { challenge_config: build(), default_config: build() }
+    }
+
+    /// Send a plaintext `GET /` through `dispatch_main_connection` and
+    /// return the first bytes written back.
+    async fn plaintext_probe(
+        tls_mode: TlsMode,
+        has_tls_listener: bool,
+        redirect_http: bool,
+    ) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("index.html"), "hello").expect("write index");
+        let router = dispatch_test_router(dir.path());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind probe listener");
+        let addr = listener.local_addr().expect("probe local addr");
+        let in_flight = Arc::new(AtomicUsize::new(0));
+
+        let server = tokio::spawn(async move {
+            let (stream, remote) = listener.accept().await.expect("accept probe connection");
+            dispatch_main_connection(
+                stream,
+                remote,
+                &tls_mode,
+                has_tls_listener,
+                redirect_http,
+                ConnSettings {
+                    header_read_timeout: Duration::from_secs(5),
+                    max_header_size: 16 * 1024,
+                    idle_timeout: Duration::from_secs(5),
+                },
+                &router,
+                None,
+                &in_flight,
+            );
+            // `dispatch_main_connection` spawns the connection task with its
+            // own clones, so this task has nothing left to hold.
+        });
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect to probe");
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write plaintext request");
+
+        let mut buf = vec![0u8; 512];
+        let read = tokio::time::timeout(Duration::from_secs(10), client.read(&mut buf))
+            .await
+            .expect("probe read timed out")
+            .expect("probe read failed");
+        buf.truncate(read);
+        server.await.expect("probe server task");
+        buf
+    }
+
+    /// Render the probe bytes for an assertion message: a TLS record is not
+    /// printable, so show the leading bytes in hex as well.
+    fn probe_debug(bytes: &[u8]) -> String {
+        let head: Vec<String> = bytes.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        format!("{:?} (first bytes: {})", String::from_utf8_lossy(bytes), head.join(" "))
+    }
+
+    /// The regression: `[server] listen` plus `[server.tls] listen` with
+    /// `redirect_http` unset (its default, `false`) must leave the main
+    /// listener speaking plain HTTP. It used to fall through to the
+    /// `tls_mode` match and TLS-wrap the plain listener, so every
+    /// plain-HTTP client — including load-balancer health checks — got a
+    /// TLS alert and a failed connection.
+    #[tokio::test]
+    async fn main_listener_serves_plain_http_when_tls_listener_is_configured() {
+        let dir = tempfile::tempdir().expect("cert dir");
+        let got = plaintext_probe(dispatch_test_manual_tls(dir.path()), true, false).await;
+        assert!(
+            got.starts_with(b"HTTP/1.1 "),
+            "main listener must answer plain HTTP, got {}",
+            probe_debug(&got)
+        );
+        assert_ne!(
+            got.first(),
+            Some(&0x15),
+            "main listener wrote a TLS alert record instead of HTTP: {}",
+            probe_debug(&got)
+        );
+        assert_ne!(
+            got.first(),
+            Some(&0x16),
+            "main listener wrote a TLS handshake record instead of HTTP: {}",
+            probe_debug(&got)
+        );
+    }
+
+    /// Same contract in ACME mode: the bug was in the shared fall-through,
+    /// so both `TlsMode` variants have to be pinned.
+    #[tokio::test]
+    async fn acme_main_listener_serves_plain_http_when_tls_listener_is_configured() {
+        let dir = tempfile::tempdir().expect("cert dir");
+        let got = plaintext_probe(dispatch_test_acme_tls(dir.path()), true, false).await;
+        assert!(
+            got.starts_with(b"HTTP/1.1 "),
+            "ACME main listener must answer plain HTTP, got {}",
+            probe_debug(&got)
+        );
+    }
+
+    /// `redirect_http` keeps its only job: it decides what the plain-HTTP
+    /// listener *says*, not whether it is plain HTTP.
+    #[tokio::test]
+    async fn main_listener_redirects_when_redirect_http_is_enabled() {
+        let dir = tempfile::tempdir().expect("cert dir");
+        let got = plaintext_probe(dispatch_test_manual_tls(dir.path()), true, true).await;
+        assert!(
+            got.starts_with(b"HTTP/1.1 301"),
+            "redirect_http must 301 to HTTPS, got {}",
+            probe_debug(&got)
+        );
+    }
+
+    /// The other half of the contract, so the fix cannot regress into
+    /// "never terminate TLS on the main listener": with no separate TLS
+    /// listener, `server.listen` *is* the HTTPS listener, and a plaintext
+    /// GET must not be answered with HTTP.
+    #[tokio::test]
+    async fn main_listener_terminates_tls_when_it_is_the_only_listener() {
+        let dir = tempfile::tempdir().expect("cert dir");
+        let got = plaintext_probe(dispatch_test_manual_tls(dir.path()), false, false).await;
+        assert!(
+            !got.starts_with(b"HTTP/"),
+            "sole listener must terminate TLS, not answer plain HTTP: {}",
+            probe_debug(&got)
+        );
     }
 
     #[test]

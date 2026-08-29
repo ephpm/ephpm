@@ -34,12 +34,24 @@
 //! - The **renewal + clustering machinery is reused from [`crate::acme`]**:
 //!   [`crate::acme::try_acquire_acme_leadership`] for leader election over the
 //!   same `acme:leader` KV key, and [`crate::acme::store_acme_cert`] /
-//!   [`crate::acme::get_acme_cert`] for cluster-wide certificate distribution.
-//!   Only the elected leader talks to Let's Encrypt; every other node installs
-//!   the leader's certificate out of the KV store. That reuse is deliberate —
-//!   duplicating a second, subtly different leader election is exactly how a
-//!   cluster ends up ordering five duplicate certificates and getting locked
-//!   out for a week.
+//!   [`crate::acme::get_acme_cert_cluster`] for cluster-wide certificate
+//!   distribution. Only the elected leader talks to Let's Encrypt; every other
+//!   node installs the leader's certificate out of the KV store. That reuse is
+//!   deliberate — duplicating a second, subtly different leader election is
+//!   exactly how a cluster ends up ordering five duplicate certificates and
+//!   getting locked out for a week.
+//!
+//!   "Every other node installs the leader's certificate" is a claim about the
+//!   KV tier the certificate is written to, and it was **false** until the
+//!   write moved to `Store::set_broadcast`. A certificate chain is bigger than
+//!   `[cluster.kv] small_key_threshold`, so a plain `set` sharded it across
+//!   `replication_factor` nodes; on a three-node cluster the other two served
+//!   no certificate at all. Distribution now has two halves, and both are load
+//!   bearing: the leader **broadcasts** to every node alive at issuance, and a
+//!   follower's poll below reads through
+//!   [`crate::acme::get_acme_cert_cluster`], which fetches from a peer when
+//!   this node has no local copy — the case for a node that joined after
+//!   issuance.
 //!
 //! ## Live-validation status
 //!
@@ -626,7 +638,8 @@ async fn run_dns01_lifecycle(ctx: Dns01Context) {
                 }
             }
         } else if let Some(store) = &ctx.store
-            && let Some((cert_pem, key_pem)) = crate::acme::get_acme_cert(store, &ctx.canonical)
+            && let Some((cert_pem, key_pem)) =
+                crate::acme::get_acme_cert_cluster(store, &ctx.canonical).await
         {
             // Follower: pick up the leader's certificate from the KV store.
             let fp = fingerprint(&cert_pem);
@@ -891,9 +904,14 @@ fn load_account_creds(ctx: &Dns01Context) -> Option<Vec<u8>> {
 }
 
 /// Persist account credential JSON to KV (cluster-wide) and disk.
+///
+/// Broadcast rather than `set` for the same reason the certificate is: the
+/// credential JSON carries a private key and is large enough to take the
+/// sharded large-value tier, which would leave it on a subset of nodes. Every
+/// node must resolve the *same* ACME account.
 fn persist_account_creds(ctx: &Dns01Context, bytes: &[u8]) {
     if let Some(store) = &ctx.store {
-        store.set(account_kv_key(&ctx.directory_url), bytes.to_vec(), None);
+        store.set_broadcast(account_kv_key(&ctx.directory_url), bytes.to_vec(), None);
     }
     write_file(&ctx.cache_dir.join("account.json"), bytes);
 }
