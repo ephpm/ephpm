@@ -72,7 +72,15 @@ pub struct AcmeSetup {
 /// # Errors
 ///
 /// Returns an error if the cache directory cannot be created.
-pub fn start_acme(tls_config: &TlsConfig, store: Option<Arc<Store>>) -> anyhow::Result<AcmeSetup> {
+/// `cluster_node_id` is the configured `[cluster] node_id`; see
+/// [`acme_node_id`] for why a stable identity is required for the leader
+/// election to converge.
+pub fn start_acme(
+    tls_config: &TlsConfig,
+    store: Option<Arc<Store>>,
+    cluster_node_id: Option<&str>,
+) -> anyhow::Result<AcmeSetup> {
+    let node_id = acme_node_id(cluster_node_id);
     let domains = &tls_config.domains;
     let production = !tls_config.staging;
 
@@ -119,7 +127,7 @@ pub fn start_acme(tls_config: &TlsConfig, store: Option<Arc<Store>>) -> anyhow::
             if let Some(cfg) = Arc::get_mut(&mut default_config) {
                 cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
             }
-            tokio::spawn(drive_clustered_acme_events(state, kv_store, leader_flag));
+            tokio::spawn(drive_clustered_acme_events(state, kv_store, leader_flag, node_id));
             (challenge_config, default_config)
         }
         None => {
@@ -199,11 +207,33 @@ const ACME_CHALLENGE_PREFIX: &str = "acme:challenge:";
 /// KV key prefix for stored certificates.
 const ACME_CERT_PREFIX: &str = "acme:cert:";
 
-/// Generate a unique node identifier for ACME leader election.
+/// Resolve this node's identifier for ACME leader election.
 ///
 /// Shared with [`crate::dns01`] so both ACME lanes derive their node identity
 /// (and therefore the lowest-id tie-break) the same way.
-pub(crate) fn acme_node_id() -> String {
+///
+/// # Why the configured `[cluster] node_id` must win
+///
+/// The tie-break is "lowest id wins", so the id has to be **stable across
+/// restarts** for leadership to converge. The fallback below is not: it is
+/// derived from the wall clock and pid, so every process start mints a new
+/// identity and "lowest id" degenerates into "whichever process happened to
+/// boot earliest". On a live three-node cluster that produced a permanent
+/// takeover cycle — each node reclaiming the key every heartbeat — so no node
+/// ever held leadership long enough to finish a DNS-01 order (which takes
+/// ~60s waiting for TXT propagation). Two of three nodes never obtained a
+/// certificate at all, and the churn looked like unexplained "leader flapping".
+///
+/// When `[cluster] node_id` is set (the normal clustered configuration, and
+/// the same identity gossip advertises) it is used verbatim, so the election is
+/// deterministic and survives restarts.
+///
+/// The ephemeral fallback is retained only for a node with no configured id —
+/// a single-node deployment, where there is nothing to elect against.
+pub(crate) fn acme_node_id(configured: Option<&str>) -> String {
+    if let Some(id) = configured.map(str::trim).filter(|id| !id.is_empty()) {
+        return id.to_string();
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
     let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let pid = std::process::id();
@@ -241,8 +271,8 @@ async fn drive_clustered_acme_events<EC: Debug + 'static, EA: Debug + 'static>(
     mut state: AcmeState<EC, EA>,
     store: Arc<Store>,
     leader_flag: Arc<AtomicBool>,
+    node_id: String,
 ) {
-    let node_id = acme_node_id();
     let mut is_leader = false;
     let mut confirmations: u32 = 0;
     // Set once this node has a certificate installed in its resolver.
@@ -947,11 +977,51 @@ mod tests {
 
     #[test]
     fn acme_node_id_is_unique() {
-        let id1 = acme_node_id();
+        // With no configured id, each call mints a fresh one. That is only
+        // acceptable for a single node — see the clustered test below.
+        let id1 = acme_node_id(None);
         // Sleep briefly to ensure different timestamp.
         std::thread::sleep(std::time::Duration::from_millis(1));
-        let id2 = acme_node_id();
+        let id2 = acme_node_id(None);
         assert_ne!(id1, id2);
+    }
+
+    /// The election tie-break is "lowest id wins", so a configured
+    /// `[cluster] node_id` must be used verbatim and be **stable across
+    /// restarts**. Regression guard: the ephemeral fallback made every process
+    /// start mint a new identity, so three live nodes reclaimed leadership from
+    /// each other every heartbeat and none held it long enough to finish a
+    /// ~60s DNS-01 order — two of three never got a certificate at all.
+    #[test]
+    fn configured_cluster_node_id_is_stable_and_wins() {
+        // Same configured id across "restarts" → same election identity.
+        let first = acme_node_id(Some("node-1"));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let second = acme_node_id(Some("node-1"));
+        assert_eq!(first, "node-1");
+        assert_eq!(first, second, "a configured node id must not change between starts");
+
+        // Distinct nodes stay distinct, and order deterministically for the
+        // lowest-id tie-break.
+        let mut ids = [acme_node_id(Some("node-3")), acme_node_id(Some("node-1"))];
+        ids.sort_unstable();
+        assert_eq!(ids, ["node-1", "node-3"]);
+
+        // Blank / whitespace-only is treated as "not configured" so a
+        // misconfiguration can't collapse every node onto one shared identity
+        // (which would make them all believe they hold the same claim).
+        for blank in ["", "   "] {
+            let generated = acme_node_id(Some(blank));
+            assert_ne!(generated, blank);
+            assert!(
+                generated.contains('-'),
+                "blank config must fall back to the generated form, got {generated:?}"
+            );
+        }
+
+        // Surrounding whitespace is trimmed rather than making two nodes that
+        // configured the same name look different.
+        assert_eq!(acme_node_id(Some("  node-2  ")), "node-2");
     }
 
     // ── KvCache / LayeredCache tests ────────────────────────────────────────
@@ -1127,7 +1197,8 @@ mod tests {
             listen: None,
             redirect_http: false,
         };
-        let setup = rt.block_on(async { start_acme(&cfg, None).expect("single-node start_acme") });
+        let setup =
+            rt.block_on(async { start_acme(&cfg, None, None).expect("single-node start_acme") });
         // Sanity-check that the returned configs are real rustls
         // configs and not the same Arc.
         assert!(

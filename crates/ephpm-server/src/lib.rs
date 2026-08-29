@@ -626,13 +626,14 @@ async fn bind_listeners(
         Some(tls_config) if tls_config.is_dns01() => {
             let acme_store =
                 if config.cluster.enabled { Some(Arc::clone(&kv_store)) } else { None };
-            let setup = dns01::start_dns01_acme(tls_config, acme_store)?;
+            let setup =
+                dns01::start_dns01_acme(tls_config, acme_store, Some(&config.cluster.node_id))?;
             TlsMode::Manual(setup.acceptor)
         }
         Some(tls_config) if tls_config.is_acme() => {
             let acme_store =
                 if config.cluster.enabled { Some(Arc::clone(&kv_store)) } else { None };
-            let setup = acme::start_acme(tls_config, acme_store)?;
+            let setup = acme::start_acme(tls_config, acme_store, Some(&config.cluster.node_id))?;
             TlsMode::Acme {
                 challenge_config: setup.challenge_config,
                 default_config: setup.default_config,

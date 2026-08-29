@@ -451,6 +451,10 @@ struct Dns01Context {
     directory_url: String,
     store: Option<Arc<Store>>,
     cache_dir: PathBuf,
+    /// This node's ACME leader-election identity — the configured
+    /// `[cluster] node_id` when set. See [`crate::acme::acme_node_id`] for why
+    /// it must be stable across restarts.
+    node_id: String,
 }
 
 /// Resolve the Cloudflare API token from the config, honouring the file → env
@@ -494,9 +498,13 @@ pub fn resolve_cloudflare_token(tls: &TlsConfig) -> anyhow::Result<String> {
 ///
 /// Returns an error if the credential/provider cannot be constructed or the
 /// TLS acceptor cannot be built.
+/// `cluster_node_id` is the configured `[cluster] node_id`; see
+/// [`crate::acme::acme_node_id`] for why a stable identity is required for the
+/// leader election to converge.
 pub fn start_dns01_acme(
     tls_config: &TlsConfig,
     store: Option<Arc<Store>>,
+    cluster_node_id: Option<&str>,
 ) -> anyhow::Result<Dns01Setup> {
     anyhow::ensure!(
         tls_config.dns_provider.as_deref().is_some_and(|p| p.eq_ignore_ascii_case("cloudflare")),
@@ -552,12 +560,15 @@ pub fn start_dns01_acme(
         directory_url,
         store,
         cache_dir,
+        node_id: crate::acme::acme_node_id(cluster_node_id),
     };
 
     tracing::info!(
         domains = ?tls_config.domains,
         wildcard = tls_config.has_wildcard_domain(),
         clustered = ctx.store.is_some(),
+        node_id = %ctx.node_id,
+        stable_node_id = cluster_node_id.map(str::trim).is_some_and(|id| !id.is_empty()),
         environment = if tls_config.staging { "staging" } else { "production" },
         "DNS-01 ACME (Cloudflare) enabled"
     );
@@ -569,7 +580,7 @@ pub fn start_dns01_acme(
 
 /// The renewal + leadership loop. Runs for the lifetime of the server.
 async fn run_dns01_lifecycle(ctx: Dns01Context) {
-    let node_id = crate::acme::acme_node_id();
+    let node_id = ctx.node_id.clone();
     let mut is_leader = false;
     let mut confirmations: u32 = 0;
     let mut last_issued: Option<SystemTime> =
