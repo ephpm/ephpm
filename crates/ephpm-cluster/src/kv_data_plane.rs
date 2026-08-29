@@ -90,6 +90,75 @@ pub async fn serve(
     serve_on(store, ([0, 0, 0, 0], port).into(), cipher).await
 }
 
+/// [`serve`] with per-vhost routing for multi-tenant nodes.
+///
+/// Identical to [`serve`] except that a request whose key carries the per-site
+/// envelope (see [`crate::site_namespace`]) is served from **that site's**
+/// store rather than the global one — the large-value counterpart of the
+/// gossip applier's routing. Global keys are handled byte-for-byte as before.
+///
+/// # Errors
+///
+/// Returns an error if the TCP listener fails to bind.
+pub async fn serve_multi_tenant(
+    store: Arc<Store>,
+    multi_tenant: ephpm_kv::multi_tenant::MultiTenantStore,
+    port: u16,
+    cipher: Option<Arc<ClusterCipher>>,
+) -> anyhow::Result<()> {
+    serve_router(KvRouter::multi_tenant(store, multi_tenant), ([0, 0, 0, 0], port).into(), cipher)
+        .await
+}
+
+/// Resolves a data-plane transport key to the [`Store`] that owns it.
+///
+/// On a single-keyspace node this is always the global store. On a
+/// multi-tenant node a key carrying the per-site envelope resolves to that
+/// site's store (creating it if this node has not served the vhost yet), and
+/// everything else to the global store — so a tenant's large values replicate
+/// into the same tenant's keyspace on every node and never into the global one.
+#[derive(Clone)]
+pub struct KvRouter {
+    global: Arc<Store>,
+    multi_tenant: Option<ephpm_kv::multi_tenant::MultiTenantStore>,
+}
+
+impl KvRouter {
+    /// A router that sends every key to the process-wide store.
+    #[must_use]
+    pub fn global(store: Arc<Store>) -> Self {
+        Self { global: store, multi_tenant: None }
+    }
+
+    /// A router that honours the per-site envelope.
+    #[must_use]
+    pub fn multi_tenant(
+        store: Arc<Store>,
+        multi_tenant: ephpm_kv::multi_tenant::MultiTenantStore,
+    ) -> Self {
+        Self { global: store, multi_tenant: Some(multi_tenant) }
+    }
+
+    /// Resolve `transport_key` to its store and the bare key within it.
+    ///
+    /// `None` means the key claims a vhost but cannot be honoured — either
+    /// this node is not multi-tenant, or the envelope does not decode to a
+    /// valid site key. Both are refused rather than flattening a key that
+    /// claims to be a tenant's into the shared global keyspace.
+    fn resolve<'a>(&self, transport_key: &'a str) -> Option<(Arc<Store>, &'a str)> {
+        match crate::site_namespace::decode(transport_key) {
+            Some((site, key)) => match &self.multi_tenant {
+                Some(mt) => Some((mt.get_site_store(site), key)),
+                None => None,
+            },
+            // Fail closed on a malformed/hostile envelope; only a key that
+            // never claimed a site routes to the global store.
+            None if crate::site_namespace::is_enveloped(transport_key) => None,
+            None => Some((Arc::clone(&self.global), transport_key)),
+        }
+    }
+}
+
 /// Start the TCP KV data plane listener bound to a specific address.
 ///
 /// Like [`serve`] but binds `addr` exactly instead of `0.0.0.0:port`.
@@ -101,6 +170,20 @@ pub async fn serve(
 /// Returns an error if the TCP listener fails to bind.
 pub async fn serve_on(
     store: Arc<Store>,
+    addr: SocketAddr,
+    cipher: Option<Arc<ClusterCipher>>,
+) -> anyhow::Result<()> {
+    serve_router(KvRouter::global(store), addr, cipher).await
+}
+
+/// [`serve_on`] over an explicit [`KvRouter`] — the shared body of the global
+/// and multi-tenant listeners.
+///
+/// # Errors
+///
+/// Returns an error if the TCP listener fails to bind.
+pub async fn serve_router(
+    router: KvRouter,
     addr: SocketAddr,
     cipher: Option<Arc<ClusterCipher>>,
 ) -> anyhow::Result<()> {
@@ -120,10 +203,10 @@ pub async fn serve_on(
         // Small framed request/response protocol — same Nagle/delayed-ACK
         // stall as the DB proxies without this.
         let _ = stream.set_nodelay(true);
-        let store = Arc::clone(&store);
+        let router = router.clone();
         let cipher = cipher.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, &store, cipher.as_deref()).await {
+            if let Err(e) = handle_connection(stream, &router, cipher.as_deref()).await {
                 tracing::debug!(%peer, %e, "KV data plane connection error");
             }
         });
@@ -143,15 +226,31 @@ struct Request {
 /// Handle a single TCP connection: read one request, write one response.
 async fn handle_connection(
     mut stream: TcpStream,
-    store: &Store,
+    router: &KvRouter,
     cipher: Option<&ClusterCipher>,
 ) -> anyhow::Result<()> {
     let request = read_request(&mut stream, cipher).await?;
 
+    // Route the transport key to its owning store. A per-site key arriving at
+    // a node that is not multi-tenant has no store to land in; answer
+    // not-found / rejected rather than flattening it into the global keyspace.
+    let Some((store, key)) = router.resolve(&request.key) else {
+        tracing::warn!(
+            key = %request.key,
+            "KV data plane received a per-site key but this node is not multi-tenant \
+             ([server] sites_dir unset); refusing it"
+        );
+        let response = match request.op {
+            OP_GET => NOT_FOUND_SENTINEL.to_be_bytes().to_vec(),
+            _ => vec![SET_REJECTED],
+        };
+        return write_message(&mut stream, &response, cipher).await;
+    };
+
     let response = match request.op {
         OP_GET => {
-            // Look up in local store and build the response.
-            if let Some(value) = store.get(&request.key) {
+            // Look up in the resolved store and build the response.
+            if let Some(value) = store.get(key) {
                 let len = u32::try_from(value.len()).unwrap_or(NOT_FOUND_SENTINEL - 1);
                 let mut response = Vec::with_capacity(4 + value.len());
                 response.extend_from_slice(&len.to_be_bytes());
@@ -167,7 +266,7 @@ async fn handle_connection(
             // copy, not the origin. Use `set_local` so we don't re-enter any
             // installed Replicator hook and re-fanout the same key back to
             // our peers (infinite loop).
-            let ok = store.set_local(request.key, value, None);
+            let ok = store.set_local(key.to_string(), value, None);
             vec![if ok { SET_OK } else { SET_REJECTED }]
         }
         other => {
@@ -449,9 +548,123 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_connection(stream, &store, cipher.as_deref()).await.unwrap();
+            handle_connection(stream, &KvRouter::global(store), cipher.as_deref()).await.unwrap();
         });
         addr
+    }
+
+    /// Spawn a data plane listener over an explicit [`KvRouter`], so the
+    /// per-vhost routing tests exercise the same `handle_connection` the
+    /// global tests do.
+    async fn spawn_router_handler(
+        router: KvRouter,
+        cipher: Option<Arc<ClusterCipher>>,
+    ) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let router = router.clone();
+                let cipher = cipher.clone();
+                tokio::spawn(async move {
+                    let _ = handle_connection(stream, &router, cipher.as_deref()).await;
+                });
+            }
+        });
+        addr
+    }
+
+    // ── Per-vhost routing (large-value tier) ──────────────────────────
+
+    fn multi_tenant_fixture() -> (Arc<Store>, ephpm_kv::multi_tenant::MultiTenantStore) {
+        let global = Store::new(ephpm_kv::store::StoreConfig::default());
+        let mt = ephpm_kv::multi_tenant::MultiTenantStore::new(
+            Arc::clone(&global),
+            ephpm_kv::store::StoreConfig::default(),
+        );
+        (global, mt)
+    }
+
+    /// A replicated per-site large value lands in THAT site's store — not the
+    /// global one, and not another tenant's.
+    #[tokio::test]
+    async fn per_site_set_lands_only_in_that_sites_store() {
+        let (global, mt) = multi_tenant_fixture();
+        let addr =
+            spawn_router_handler(KvRouter::multi_tenant(Arc::clone(&global), mt.clone()), None)
+                .await;
+
+        let transport = crate::site_namespace::encode("alice.test", "shared");
+        assert!(store_remote(addr, &transport, b"alice-data", None).await.unwrap());
+
+        // Landed in alice's store under the BARE key.
+        assert_eq!(
+            mt.get_site_store("alice.test").get("shared").as_deref(),
+            Some(&b"alice-data"[..])
+        );
+        // Never in the global keyspace — under either spelling.
+        assert_eq!(global.get("shared"), None);
+        assert_eq!(global.get(&transport), None);
+        // Never in another tenant's.
+        assert_eq!(mt.get_site_store("bob.test").get("shared"), None);
+    }
+
+    /// Two sites writing the same bare key stay independent end to end.
+    #[tokio::test]
+    async fn two_sites_same_key_do_not_collide_over_the_wire() {
+        let (global, mt) = multi_tenant_fixture();
+        let addr =
+            spawn_router_handler(KvRouter::multi_tenant(Arc::clone(&global), mt.clone()), None)
+                .await;
+
+        store_remote(addr, &crate::site_namespace::encode("alice.test", "k"), b"A", None)
+            .await
+            .unwrap();
+        store_remote(addr, &crate::site_namespace::encode("bob.test", "k"), b"B", None)
+            .await
+            .unwrap();
+
+        assert_eq!(mt.get_site_store("alice.test").get("k").as_deref(), Some(&b"A"[..]));
+        assert_eq!(mt.get_site_store("bob.test").get("k").as_deref(), Some(&b"B"[..]));
+        assert_eq!(global.get("k"), None);
+
+        // And a per-site GET reads back from the right store only.
+        let got = fetch_remote(addr, &crate::site_namespace::encode("alice.test", "k"), None)
+            .await
+            .unwrap();
+        assert_eq!(got.as_deref(), Some(&b"A"[..]));
+    }
+
+    /// A global key still routes to the global store on a multi-tenant node —
+    /// the existing behaviour is unchanged by the routing layer.
+    #[tokio::test]
+    async fn global_keys_still_route_globally_on_a_multi_tenant_node() {
+        let (global, mt) = multi_tenant_fixture();
+        let addr =
+            spawn_router_handler(KvRouter::multi_tenant(Arc::clone(&global), mt.clone()), None)
+                .await;
+
+        assert!(store_remote(addr, "plain-key", b"v", None).await.unwrap());
+        assert_eq!(global.get("plain-key").as_deref(), Some(&b"v"[..]));
+        // A site store created afterwards must not see it.
+        assert_eq!(mt.get_site_store("alice.test").get("plain-key"), None);
+    }
+
+    /// A per-site key arriving at a node that is NOT multi-tenant is refused,
+    /// never flattened into that node's global keyspace.
+    #[tokio::test]
+    async fn per_site_key_is_refused_by_a_single_keyspace_node() {
+        let global = Store::new(ephpm_kv::store::StoreConfig::default());
+        let addr = spawn_router_handler(KvRouter::global(Arc::clone(&global)), None).await;
+
+        let transport = crate::site_namespace::encode("alice.test", "k");
+        assert!(!store_remote(addr, &transport, b"v", None).await.unwrap(), "SET must be rejected");
+        assert_eq!(global.get(&transport), None);
+        assert_eq!(global.get("k"), None);
+        assert_eq!(fetch_remote(addr, &transport, None).await.unwrap(), None);
     }
 
     /// Spawn a data plane listener that handles multiple connections.
@@ -469,7 +682,8 @@ mod tests {
                 let store = Arc::clone(&store);
                 let cipher = cipher.clone();
                 tokio::spawn(async move {
-                    let _ = handle_connection(stream, &store, cipher.as_deref()).await;
+                    let _ = handle_connection(stream, &KvRouter::global(store), cipher.as_deref())
+                        .await;
                 });
             }
         });

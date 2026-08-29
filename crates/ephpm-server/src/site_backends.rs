@@ -115,6 +115,11 @@ use tokio::sync::RwLock;
 
 use crate::tracked_backend::TrackedBackend;
 
+/// Callback invoked with a site key when that site's database is first
+/// opened (per-site clustered mode's replication-working-set hook). See
+/// [`SiteBackends::new_clustered`].
+pub type SiteOpenHook = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// One site's permanent registry slot: its database (when open) plus the lock
 /// that serializes opening and closing *that site* and nothing else.
 struct SiteSlot {
@@ -180,6 +185,18 @@ struct Inner {
     /// Registry-epoch milliseconds of the last "cannot meet the cap" warning,
     /// `0` for never. Throttles it — see [`SiteBackends::warn_cap_pinned`].
     last_cap_warn: AtomicU64,
+    /// Open each site's wire factory with CDC capture on
+    /// (`enable_cdc_on_connect`). `false` (single-node per-site) opens plain
+    /// factories; `true` (per-site **clustered** replication) makes every
+    /// local write land a `turso_cdc` row so a site this node owns can ship
+    /// its writes. Whether captured changes are *shipped* is decided by role
+    /// on the replication plane, not here.
+    cdc_capture: bool,
+    /// Called with a site key just after that site's database is opened
+    /// (the miss path), if set. Per-site clustered mode uses it to bring a
+    /// newly-active site into the replication working set. Idempotent
+    /// downstream — it may fire again after an evict/re-open.
+    on_open: Option<SiteOpenHook>,
 }
 
 /// Per-site backend registry. Cheap to clone (shares one [`Inner`]).
@@ -199,6 +216,39 @@ impl SiteBackends {
         max_open: usize,
         query_stats: ephpm_query_stats::QueryStats,
         handle: tokio::runtime::Handle,
+    ) -> anyhow::Result<Self> {
+        Self::build(dir, max_open, query_stats, handle, false, None)
+    }
+
+    /// Build a registry for per-site **clustered** replication.
+    ///
+    /// Identical to [`new`](Self::new) except every site's wire factory is
+    /// opened with CDC capture on (`enable_cdc_on_connect`), so a site this
+    /// node owns captures the writes it must ship, and `on_open` is invoked
+    /// with each site key as its database is first opened — the hook the
+    /// replication driver uses to bring a newly-active site into its working
+    /// set.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `dir` cannot be created.
+    pub fn new_clustered(
+        dir: PathBuf,
+        max_open: usize,
+        query_stats: ephpm_query_stats::QueryStats,
+        handle: tokio::runtime::Handle,
+        on_open: SiteOpenHook,
+    ) -> anyhow::Result<Self> {
+        Self::build(dir, max_open, query_stats, handle, true, Some(on_open))
+    }
+
+    fn build(
+        dir: PathBuf,
+        max_open: usize,
+        query_stats: ephpm_query_stats::QueryStats,
+        handle: tokio::runtime::Handle,
+        cdc_capture: bool,
+        on_open: Option<SiteOpenHook>,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(&dir).with_context(|| {
             format!("failed to create per-site database directory: {}", dir.display())
@@ -222,6 +272,8 @@ impl SiteBackends {
                 open_count: AtomicUsize::new(0),
                 opens_total: AtomicU64::new(0),
                 last_cap_warn: AtomicU64::new(0),
+                cdc_capture,
+                on_open,
             }),
         })
     }
@@ -283,11 +335,31 @@ impl SiteBackends {
         let path_str = path.to_str().with_context(|| {
             format!("per-site database path is not valid UTF-8: {}", path.display())
         })?;
-        let turso = litewire::Turso::open(path_str).await.with_context(|| {
-            format!("failed to open per-site database for {site_key}: {path_str}")
-        })?;
+        // Clustered per-site mode captures writes into `turso_cdc` on every
+        // connection so an owned site can ship them; single-node per-site
+        // opens a plain factory (no capture overhead).
+        let turso = if self.inner.cdc_capture {
+            litewire::Turso::builder(path_str)
+                .enable_cdc_on_connect(true)
+                .build()
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to open per-site database (CDC capture) for {site_key}: {path_str}"
+                    )
+                })?
+        } else {
+            litewire::Turso::open(path_str).await.with_context(|| {
+                format!("failed to open per-site database for {site_key}: {path_str}")
+            })?
+        };
         self.inner.opens_total.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(site = site_key, path = path_str, "opened per-site database (Turso engine)");
+        tracing::info!(
+            site = site_key,
+            path = path_str,
+            cdc_capture = self.inner.cdc_capture,
+            "opened per-site database (Turso engine)"
+        );
         // Screening sits innermost, against the raw engine: it must see exactly
         // the SQL the engine would run (the wire path's statements arrive here
         // already translated out of the MySQL dialect). Both tenant routes —
@@ -372,6 +444,14 @@ impl SiteBackends {
         slot.touch(self.now_millis());
         let open_now = self.inner.open_count.fetch_add(1, Ordering::Relaxed) + 1;
         drop(current);
+
+        // Bring a newly-active site into the clustered replication working set
+        // (no-op in single-node per-site mode). Fired outside the slot lock so
+        // the hook cannot deadlock against a resolver; the driver it starts
+        // dedups, so an evict/re-open firing it again is harmless.
+        if let Some(on_open) = &self.inner.on_open {
+            on_open(site_key);
+        }
 
         if open_now > self.inner.max_open {
             self.evict_over_cap(site_key);
@@ -499,6 +579,44 @@ mod tests {
     fn registry(dir: PathBuf, max_open: usize) -> SiteBackends {
         SiteBackends::new(dir, max_open, stats(), tokio::runtime::Handle::current())
             .expect("build registry")
+    }
+
+    /// The clustered registry opens capture-on backends that still work and
+    /// stay isolated, and fires the open hook once per newly-opened site.
+    #[tokio::test]
+    async fn clustered_registry_opens_capture_on_and_fires_hook() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let opened: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&opened);
+        let hook: SiteOpenHook = Arc::new(move |site: &str| {
+            sink.lock().unwrap().push(site.to_string());
+        });
+        let reg = SiteBackends::new_clustered(
+            tmp.path().to_path_buf(),
+            8,
+            stats(),
+            tokio::runtime::Handle::current(),
+            hook,
+        )
+        .expect("build clustered registry");
+
+        // Capture-on backend opens and serves a write.
+        let a = reg.get_or_open("site-a.test").await.expect("open a");
+        let conn = a.connect().await.expect("connect");
+        conn.execute("CREATE TABLE t (v TEXT)", &[]).await.expect("create");
+        conn.execute("INSERT INTO t (v) VALUES ('x')", &[]).await.expect("insert");
+
+        // A cache hit does NOT re-fire the hook; a second distinct site does.
+        let _a2 = reg.get_or_open("site-a.test").await.expect("cache hit");
+        let _b = reg.get_or_open("site-b.test").await.expect("open b");
+
+        let seen = opened.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec!["site-a.test".to_string(), "site-b.test".to_string()],
+            "the open hook fires once per open (miss path), not on cache hits"
+        );
     }
 
     /// Two sites get two distinct files and their data is isolated.

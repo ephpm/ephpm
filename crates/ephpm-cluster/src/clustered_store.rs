@@ -328,6 +328,30 @@ impl ClusteredStore {
         ok
     }
 
+    /// Fan out an **already-applied local value** to the rest of the cluster.
+    ///
+    /// Same tier routing as [`set`](Self::set) — gossip for small values,
+    /// replica-set writes for large ones — with one deliberate difference: it
+    /// never writes the value into this node's local store. The caller (a
+    /// read-modify-write op on [`Store`]) applied it under the key's shard lock
+    /// already, and re-writing it here would let an older publish overwrite a
+    /// newer local total, losing an update on the origin node. See
+    /// [`ephpm_kv::store::Replicator::replicate_published`].
+    pub async fn publish(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> bool {
+        if value.len() <= self.config.small_key_threshold {
+            self.cluster.gossip_set(key, value, ttl).await;
+            if self.config.hot_key_cache {
+                self.maybe_bump_hot_version(key).await;
+            }
+            return true;
+        }
+        let ok = self.set_large_routed(key, &self.store, key, value, ttl, LocalCopy::Skip).await;
+        if ok && self.config.hot_key_cache {
+            self.maybe_bump_hot_version(key).await;
+        }
+        ok
+    }
+
     /// Write a value that **every** node must hold a local copy of,
     /// regardless of its size.
     ///
@@ -379,6 +403,108 @@ impl ClusteredStore {
             self.maybe_bump_hot_version(&key).await;
         }
         ok
+    }
+
+    /// [`publish`](Self::publish) for a **per-site** key: the site-namespaced
+    /// transport key goes on the wire, and — as with the global path — this
+    /// node's own copy is left exactly as the mutation left it.
+    pub async fn publish_for_site(
+        &self,
+        site: &str,
+        local: &Store,
+        key: &str,
+        value: &[u8],
+        ttl: Option<Duration>,
+    ) -> bool {
+        let transport = crate::site_namespace::encode(site, key);
+        if value.len() <= self.config.small_key_threshold {
+            self.cluster.gossip_set(&transport, value, ttl).await;
+            return true;
+        }
+        self.set_large_routed(&transport, local, key, value, ttl, LocalCopy::Skip).await
+    }
+
+    /// Replicate a **per-site** (multi-tenant) write.
+    ///
+    /// Identical routing to [`set`](Self::set), except that what goes on the
+    /// wire is the site-namespaced *transport* key
+    /// (`site_namespace::encode(site, key)`) while the local copy is written
+    /// into that site's own [`Store`] under the bare key. The receiving node
+    /// decodes the envelope and applies the write into the same site's store,
+    /// so a vhost's keys replicate without ever entering the global keyspace or
+    /// another tenant's.
+    ///
+    /// `local` is the site's store — the one whose `set_local` also bumps the
+    /// key's watch slot, keeping `ephpm_kv_wait` working for replicated writes.
+    ///
+    /// The small/large tier decision compares `value.len()` against
+    /// `small_key_threshold` exactly as the global path does; the envelope adds
+    /// key bytes only, so the payload budget is unchanged.
+    pub async fn set_for_site(
+        &self,
+        site: &str,
+        local: &Store,
+        key: String,
+        value: Vec<u8>,
+        ttl: Option<Duration>,
+    ) -> bool {
+        let transport = crate::site_namespace::encode(site, &key);
+        if value.len() <= self.config.small_key_threshold {
+            // Gossip tier: replicated to all nodes, applied per-site on arrival.
+            tracing::trace!(
+                site,
+                key,
+                bytes = value.len(),
+                tier = "gossip",
+                "per-site KV: publishing"
+            );
+            self.cluster.gossip_set(&transport, &value, ttl).await;
+            return true;
+        }
+        // Large value: replica-set write over the data plane. The transport key
+        // is what peers store and route on; our own copy is the bare key in the
+        // site's store.
+        tracing::trace!(
+            site,
+            key,
+            bytes = value.len(),
+            tier = "data-plane",
+            "per-site KV: publishing"
+        );
+        let ok =
+            self.set_large_routed(&transport, local, &key, &value, ttl, LocalCopy::Write).await;
+        if !ok {
+            // A large-tier publish that fails leaves this vhost's key on this
+            // node only. Never silent — that is exactly how the INCR gap
+            // survived a full deploy cycle.
+            tracing::warn!(
+                site,
+                key,
+                bytes = value.len(),
+                "per-site KV: large-value publish FAILED — this key is now node-local and will \
+                 not be visible on peers until it is rewritten"
+            );
+        }
+        ok
+    }
+
+    /// Delete a per-site key: gossip tombstone under the namespaced transport
+    /// key, plus a local drop from the site's own store.
+    pub async fn remove_for_site(&self, site: &str, local: &Store, key: &str) -> bool {
+        let transport = crate::site_namespace::encode(site, key);
+        let gossip_deleted = self.cluster.gossip_del(&transport).await;
+        let local_deleted = local.remove_local(key);
+        gossip_deleted || local_deleted
+    }
+
+    /// Re-broadcast a per-site key's current value with a new TTL, so peers
+    /// pick up the new expiry by the same last-arrival-wins rule the global
+    /// path uses. Small-key tier only, matching the global `replicate_expire`.
+    pub async fn expire_for_site(&self, site: &str, key: &str, value: Vec<u8>, ttl: Duration) {
+        if value.len() <= self.config.small_key_threshold {
+            let transport = crate::site_namespace::encode(site, key);
+            self.cluster.gossip_set(&transport, &value, Some(ttl)).await;
+        }
     }
 
     /// Write a large value to every alive node. See
@@ -436,26 +562,54 @@ impl ClusteredStore {
     /// primary write succeeded (the client-visible result). See
     /// [`ClusteredStore::set`] for the replication semantics.
     async fn set_large(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> bool {
+        // The global path's transport key IS the key, and its local target is
+        // the process-wide store — so this is byte-for-byte the old behaviour.
+        self.set_large_routed(key, &self.store, key, value, ttl, LocalCopy::Write).await
+    }
+
+    /// [`set_large`](Self::set_large) with the wire key and the local target
+    /// decoupled, so the per-site path can put a namespaced key on the wire
+    /// while writing the bare key into that site's store. The global path
+    /// passes `transport_key == local_key` and the process-wide store.
+    ///
+    /// `local_copy` decides whether this node's own copy is (re)written. Every
+    /// `set` path passes [`LocalCopy::Write`] — the value has to land somewhere
+    /// locally. The publish paths pass [`LocalCopy::Skip`]: the mutation already
+    /// wrote it under the key's shard lock, and rewriting it from a spawned
+    /// task could regress a newer concurrent mutation.
+    #[allow(clippy::too_many_arguments)]
+    async fn set_large_routed(
+        &self,
+        transport_key: &str,
+        local: &Store,
+        local_key: &str,
+        value: &[u8],
+        ttl: Option<Duration>,
+        local_copy: LocalCopy,
+    ) -> bool {
+        let key = transport_key;
         let self_id = self.cluster.self_node().id;
         let replicas = self.replica_nodes(key).await;
 
         // No cluster peers (single node, or only self alive): store
         // locally and we're done.
         if replicas.is_empty() {
-            return self.store.set_local(key.to_string(), value.to_vec(), ttl);
+            return local_copy.write(local, local_key, value, ttl);
         }
 
         // The primary is the first replica; the rest are secondaries.
         // Write the primary copy first — its result is what the client
         // sees. Secondaries follow per the replication mode.
         let (primary, secondaries) = replicas.split_first().expect("replicas is non-empty");
-        let primary_ok = self.write_one_replica(primary, &self_id, key, value, ttl).await;
+        let primary_ok = self
+            .write_one_replica(primary, &self_id, key, local, local_key, value, ttl, local_copy)
+            .await;
         if !primary_ok {
             // The primary write failed. Fall back to a local copy so the
             // value is not lost outright, mirroring the pre-replication
             // behaviour. Do not attempt secondaries in this case.
             if primary.id != self_id {
-                return self.store.set_local(key.to_string(), value.to_vec(), ttl);
+                return local_copy.write(local, local_key, value, ttl);
             }
             return false;
         }
@@ -467,7 +621,7 @@ impl ClusteredStore {
                 for node in secondaries {
                     if node.id == self_id {
                         // Local replica — write inline (cheap, no task).
-                        if !self.store.set_local(key.to_string(), value.to_vec(), ttl) {
+                        if !local_copy.write(local, local_key, value, ttl) {
                             self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(key, "local replica write rejected (memory limit?)");
                         }
@@ -518,7 +672,11 @@ impl ClusteredStore {
                 // Best-effort: await every reachable secondary. Failures
                 // are logged/counted but do not fail the client write.
                 for node in secondaries {
-                    let ok = self.write_one_replica(node, &self_id, key, value, ttl).await;
+                    let ok = self
+                        .write_one_replica(
+                            node, &self_id, key, local, local_key, value, ttl, local_copy,
+                        )
+                        .await;
                     if !ok {
                         self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
                     }
@@ -537,16 +695,20 @@ impl ClusteredStore {
     /// whether a `false` result bumps the replica-failure counter — the
     /// primary's failure is handled by the [`set_large`](Self::set_large)
     /// fallback, not counted as a replica failure.
+    #[allow(clippy::too_many_arguments)]
     async fn write_one_replica(
         &self,
         node: &NodeInfo,
         self_id: &str,
         key: &str,
+        local: &Store,
+        local_key: &str,
         value: &[u8],
         ttl: Option<Duration>,
+        local_copy: LocalCopy,
     ) -> bool {
         if node.id == self_id {
-            return self.store.set_local(key.to_string(), value.to_vec(), ttl);
+            return local_copy.write(local, local_key, value, ttl);
         }
         let Some(addr) = node_data_addr(node, self.config.data_port) else {
             tracing::warn!(key, replica = %node.id, "replica has no parseable data address");
@@ -974,6 +1136,27 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         true
     }
 
+    fn replicate_published(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) {
+        // PUBLISH ONLY — no `set_local`. The read-modify-write op that called
+        // this already applied `value` under the key's shard lock; writing it
+        // back here would let an older increment's publish overwrite a newer
+        // local total (the publishes are spawned, so they race). See
+        // `Replicator::replicate_published`.
+        //
+        // Recording our own `write_ms` is still required: it is what stops the
+        // gossip echo of THIS publish from clobbering a newer local value that
+        // lands before the echo arrives.
+        if value.len() <= self.inner.config.small_key_threshold {
+            self.applied.insert(key.clone(), current_write_ms());
+        }
+        let inner = Arc::clone(&self.inner);
+        self.handle.spawn(async move {
+            if !inner.publish(&key, &value, ttl).await {
+                tracing::warn!(key, "clustered publish returned false (primary rejected)");
+            }
+        });
+    }
+
     fn replicate_expire(&self, key: &str, ttl: Duration) -> bool {
         // Update the local copy synchronously so this node's readers see
         // the new expiry immediately, then re-broadcast the (unchanged)
@@ -1016,6 +1199,165 @@ impl ephpm_kv::store::Replicator for KvReplicator {
             if value.len() <= threshold {
                 inner.cluster().gossip_set(&key_owned, &value, Some(ttl)).await;
             }
+        });
+        true
+    }
+}
+
+/// A [`Replicator`](ephpm_kv::store::Replicator) for **one vhost's** KV store
+/// in multi-tenant clustered mode.
+///
+/// Installed on each per-site [`Store`] as it is created (see
+/// `MultiTenantStore::set_replicator_factory`). It mirrors [`KvReplicator`]'s
+/// semantics exactly, with one difference: everything it puts on the wire is
+/// namespaced with this site's key (`site_namespace::encode`), and every local
+/// materialization targets **this site's** store rather than the process-wide
+/// one. That is what makes a vhost's writes replicate cluster-wide while
+/// staying physically inside that vhost's keyspace on every node.
+///
+/// Isolation follows from two facts: the transport key names the site, and the
+/// apply side routes strictly on that name — so a site's key can only ever land
+/// in the same site's store on a peer, never in the global store and never in
+/// another tenant's.
+///
+/// # Not implemented here: `replicate_broadcast` / `fetch_cluster`
+///
+/// This impl deliberately inherits the trait defaults for both, because the only
+/// callers of [`Store::set_broadcast`](ephpm_kv::store::Store::set_broadcast)
+/// and [`Store::get_cluster`](ephpm_kv::store::Store::get_cluster) are the ACME
+/// certificate and account paths, which run against the **process-wide** store
+/// (whose replicator is [`KvReplicator`], and which does override both). No
+/// per-site store reaches them.
+///
+/// That is a fact about today's callers, not a property of this type, so it is
+/// recorded rather than assumed. This replicator *does* shard large values
+/// across a subset of the cluster (`set_for_site` → `set_large_routed`), which
+/// is exactly the condition under which `replicate_broadcast`'s contract says an
+/// implementation MUST override it. The inherited default would silently deliver
+/// a cert-sized per-site value to `replication_factor` nodes instead of all of
+/// them. **Before any per-site caller of `set_broadcast`/`get_cluster` is added,
+/// both methods must be implemented here** over a site-namespaced transport key.
+pub struct SiteKvReplicator {
+    inner: Arc<ClusteredStore>,
+    /// This vhost's own store — the local target for materialization, and the
+    /// store whose watch slots must be bumped so `ephpm_kv_wait` sees
+    /// replicated writes.
+    local: Arc<Store>,
+    /// The site key that namespaces this store's keys on the wire.
+    site: Arc<str>,
+    handle: tokio::runtime::Handle,
+    /// Shared with the applier, keyed by **transport** key so two sites using
+    /// the same bare key never share an ordering slot.
+    applied: AppliedWriteMap,
+}
+
+impl std::fmt::Debug for SiteKvReplicator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SiteKvReplicator").field("site", &self.site).finish_non_exhaustive()
+    }
+}
+
+impl SiteKvReplicator {
+    /// Wrap the node's [`ClusteredStore`] as the replicator for `site`'s store.
+    ///
+    /// `applied` MUST be the same map the applier uses, so origin writes and
+    /// remote applies share one last-arrival-wins ordering.
+    #[must_use]
+    pub fn new(
+        inner: Arc<ClusteredStore>,
+        local: Arc<Store>,
+        site: &str,
+        handle: tokio::runtime::Handle,
+        applied: AppliedWriteMap,
+    ) -> Arc<Self> {
+        Arc::new(Self { inner, local, site: Arc::from(site), handle, applied })
+    }
+}
+
+impl ephpm_kv::store::Replicator for SiteKvReplicator {
+    fn replicate_set(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        // Materialize into THIS SITE's store synchronously (mirrors the global
+        // replicator): the gossip tier lives in chitchat state, invisible to
+        // the raw-store readers this vhost's PHP and RESP clients use.
+        if value.len() <= self.inner.config.small_key_threshold {
+            self.local.set_local(key.clone(), value.clone(), ttl);
+            // Keyed by the TRANSPORT key so site A's "foo" and site B's "foo"
+            // occupy different ordering slots.
+            self.applied
+                .insert(crate::site_namespace::encode(&self.site, &key), current_write_ms());
+        }
+        let inner = Arc::clone(&self.inner);
+        let local = Arc::clone(&self.local);
+        let site = Arc::clone(&self.site);
+        self.handle.spawn(async move {
+            let ok = inner.set_for_site(&site, &local, key.clone(), value, ttl).await;
+            if !ok {
+                tracing::warn!(
+                    %site,
+                    key,
+                    "per-site KV: clustered set returned false — the write did not reach peers"
+                );
+            }
+        });
+        true
+    }
+
+    fn replicate_remove(&self, key: &str) -> bool {
+        self.local.remove_local(key);
+        self.applied.insert(crate::site_namespace::encode(&self.site, key), current_write_ms());
+
+        let inner = Arc::clone(&self.inner);
+        let local = Arc::clone(&self.local);
+        let site = Arc::clone(&self.site);
+        let key = key.to_string();
+        self.handle.spawn(async move {
+            let _ = inner.remove_for_site(&site, &local, &key).await;
+        });
+        true
+    }
+
+    fn replicate_published(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) {
+        // PUBLISH ONLY — mirrors the global replicator: the site store already
+        // holds this value (applied under its shard lock), so writing it back
+        // would risk regressing a newer concurrent increment on this node. Only
+        // the cluster-wide fan-out is left to do.
+        if value.len() <= self.inner.config.small_key_threshold {
+            self.applied
+                .insert(crate::site_namespace::encode(&self.site, &key), current_write_ms());
+        }
+        let inner = Arc::clone(&self.inner);
+        let local = Arc::clone(&self.local);
+        let site = Arc::clone(&self.site);
+        self.handle.spawn(async move {
+            if !inner.publish_for_site(&site, &local, &key, &value, ttl).await {
+                tracing::warn!(
+                    %site,
+                    key,
+                    "per-site KV: clustered publish returned false — the value did not reach peers"
+                );
+            }
+        });
+    }
+
+    fn replicate_expire(&self, key: &str, ttl: Duration) -> bool {
+        // Same shape as the global path: update locally, then re-broadcast the
+        // unchanged value with the new expiry so peers converge on it.
+        if !self.local.expire_local(key, ttl) {
+            return false;
+        }
+        let Some(bytes) = self.local.get(key) else {
+            // Raced with expiry between the update and the read — the local
+            // update did happen, there is just nothing left to broadcast.
+            return true;
+        };
+        self.applied.insert(crate::site_namespace::encode(&self.site, key), current_write_ms());
+
+        let inner = Arc::clone(&self.inner);
+        let site = Arc::clone(&self.site);
+        let key = key.to_string();
+        let value = bytes.to_vec();
+        self.handle.spawn(async move {
+            inner.expire_for_site(&site, &key, value, ttl).await;
         });
         true
     }
@@ -1092,37 +1434,107 @@ pub async fn start_gossip_applier(
     store: Arc<Store>,
     applied: AppliedWriteMap,
 ) {
+    start_gossip_applier_multi_tenant(cluster, store, None, applied).await;
+}
+
+/// [`start_gossip_applier`] with per-vhost routing.
+///
+/// When `multi_tenant` is `Some`, an incoming key that carries the per-site
+/// envelope (see [`crate::site_namespace`]) is applied into **that site's**
+/// store under the bare key; every other key is applied into the global store
+/// exactly as before. That is the receive half of per-vhost KV replication: a
+/// tenant's write made on any node materializes into the same tenant's
+/// keyspace on every other node — and, because it lands via `set_local`, bumps
+/// that key's watch slot so `ephpm_kv_wait` wakes for replicated writes too.
+///
+/// A site the receiving node has never served yet is **created on arrival**
+/// (`get_site_store` is get-or-create), so a peer's write does not have to wait
+/// for a local request to that vhost. The store is created through the
+/// multi-tenant handle, so it picks up the same replicator factory and config a
+/// locally-created one would.
+///
+/// Passing `None` reproduces the previous single-keyspace behaviour byte for
+/// byte — which is what a non-multi-tenant node uses.
+pub async fn start_gossip_applier_multi_tenant(
+    cluster: &ClusterHandle,
+    store: Arc<Store>,
+    multi_tenant: Option<ephpm_kv::multi_tenant::MultiTenantStore>,
+    applied: AppliedWriteMap,
+) {
     let self_id = cluster.self_node().id.clone();
     cluster
         .subscribe_kv_changes(move |event| {
             if event.node().node_id == self_id {
                 return;
             }
-            let key = event.key();
+            let transport_key = event.key();
             let write_ms = event.write_ms();
-            if !should_apply(&applied, key, write_ms) {
+            // Ordering is tracked per TRANSPORT key, so two sites sharing a
+            // bare key name never contend for one slot.
+            if !should_apply(&applied, transport_key, write_ms) {
                 tracing::trace!(
-                    key,
+                    key = transport_key,
                     from = %event.node().node_id,
                     write_ms,
                     "gossip KV change skipped as stale"
                 );
                 return;
             }
+
+            // Route: per-site envelope → that site's store; anything else →
+            // the global store. An envelope arriving on a node that is not
+            // multi-tenant has nowhere to go, so it is dropped with a warning
+            // rather than being flattened into the global keyspace.
+            let (target, key, site) =
+                match (&multi_tenant, crate::site_namespace::decode(transport_key)) {
+                    // Enveloped key on a multi-tenant node → that vhost's store.
+                    (Some(mt), Some((site, key))) => (mt.get_site_store(site), key, Some(site)),
+                    // Enveloped key with nowhere to go: drop it loudly rather
+                    // than flattening a tenant's key into the global keyspace.
+                    (None, Some(_)) => {
+                        tracing::warn!(
+                            key = transport_key,
+                            from = %event.node().node_id,
+                            "received a per-site KV replication event but this node is not \
+                             multi-tenant ([server] sites_dir unset); dropping it rather than \
+                             flattening a tenant's key into the global keyspace"
+                        );
+                        return;
+                    }
+                    // Leading SEP but undecodable: a malformed or hostile
+                    // envelope. Fail CLOSED — flattening it into the shared
+                    // global keyspace would take a key that claims to be a
+                    // tenant's and make it visible to every tenant.
+                    (_, None) if crate::site_namespace::is_enveloped(transport_key) => {
+                        tracing::warn!(
+                            key = transport_key,
+                            from = %event.node().node_id,
+                            "received a KV replication event whose per-site envelope does not \
+                             decode to a valid site key; dropping it rather than flattening it \
+                             into the global keyspace"
+                        );
+                        return;
+                    }
+                    // Plain global key — unchanged behaviour.
+                    (_, None) => (Arc::clone(&store), transport_key, None),
+                };
+
             match event {
                 crate::gossip_kv::KvChangeEvent::Set { value, ttl, .. } => {
-                    store.set_local(key.to_string(), value.to_vec(), ttl);
+                    target.set_local(key.to_string(), value.to_vec(), ttl);
                     tracing::trace!(
                         key,
+                        site,
                         from = %event.node().node_id,
                         write_ms,
                         "gossip KV set materialized locally"
                     );
                 }
                 crate::gossip_kv::KvChangeEvent::Tombstone { .. } => {
-                    store.remove_local(key);
+                    target.remove_local(key);
                     tracing::trace!(
                         key,
+                        site,
                         from = %event.node().node_id,
                         write_ms,
                         "gossip KV tombstone applied locally"
@@ -1157,6 +1569,32 @@ fn hash_key(key: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     key.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Whether a large-value fan-out may (re)write this node's own copy.
+///
+/// A `set` must: the value has to land somewhere locally. A **publish** must
+/// not: the read-modify-write op that produced the value already wrote it under
+/// the key's shard lock, and publishes are spawned, so rewriting from one could
+/// overwrite a newer concurrent mutation on this node — the lost-update bug the
+/// publish-only path exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalCopy {
+    /// Write the value into the local target store.
+    Write,
+    /// Leave the local store alone; only fan out to peers.
+    Skip,
+}
+
+impl LocalCopy {
+    /// Perform (or skip) the local write, reporting success either way — a
+    /// skipped write is not a failure.
+    fn write(self, local: &Store, key: &str, value: &[u8], ttl: Option<Duration>) -> bool {
+        match self {
+            Self::Write => local.set_local(key.to_string(), value.to_vec(), ttl),
+            Self::Skip => true,
+        }
+    }
 }
 
 /// Select the replica set for a key from a sorted alive-node list.

@@ -33,7 +33,7 @@ ePHPm exposes three built-in probe endpoints on the main HTTP port:
 |----------|---------|----------|
 | `/_ephpm/health` | Liveness probe | `200 {"status":"ok"}` — always succeeds if the process is running |
 | `/_ephpm/ready` | Readiness probe | `200 {"status":"ready"}` once the PHP runtime is initialized, a worker has finished booting (worker mode only), and every configured SQL proxy has reached its upstream at least once. Otherwise `503 {"status":"not_ready","reason":"..."}` naming which of those is outstanding. |
-| `/_ephpm/primary` | Active-passive routing target for the writable clustered-SQLite node | `200 {"primary":true}` when this node accepts writes — the elected clustered-SQLite primary, **or any non-clustered/standalone node** (trivially writable). `503 {"primary":false}` when this node is a clustered-SQLite replica. On failover the new primary starts returning 200 within the election interval. |
+| `/_ephpm/primary` | Active-passive routing target for the writable clustered-SQLite node | `200 {"primary":true}` when this node accepts writes — the elected clustered-SQLite primary, **any non-clustered/standalone node** (trivially writable), **or any node in per-site clustered mode** (there is no cluster-wide primary; see below). `503 {"primary":false}` when this node is a single-database clustered-SQLite replica. On failover the new primary starts returning 200 within the election interval. |
 
 Readiness gates on the SQL proxy's **first** upstream connect, not on live
 database reachability — a shared-database outage must not fail every replica's
@@ -59,6 +59,26 @@ The endpoint is safe to health-check in **any** topology — it never 404s. On a
 standalone or non-clustered node there is no election, so the node is trivially
 writable and the check is a constant `200`. That means the same LB manifest
 works whether or not clustering is enabled.
+
+#### Per-site clustered mode: every healthy node returns 200
+
+With `[db.sqlite.replication] per_site = true` (per-site clustered multi-tenancy,
+EXPERIMENTAL) there is **no cluster-wide primary**, so this endpoint is a
+constant `200` on every healthy node — by design, not by omission.
+
+Ownership in that mode is *per tenant*: each vhost's database has its own owner,
+chosen by rendezvous hashing, and a hundred sites can have a hundred different
+owners across the same nodes. No single boolean can answer "may this node take
+writes?" for the node as a whole. What is true node-wide is that **every node
+accepts writes for every site**: a node that does not own the site forwards the
+statement to the owner over the cluster channel, so the write still lands on the
+owner and is captured for replication. Steering traffic away from any healthy
+node would therefore only remove capacity.
+
+Use plain round-robin (or any read balancing you like) in this mode; keep the
+active-passive `/_ephpm/primary` backend for single-database clustered mode.
+Note the documented gap: forwarding covers the `ephpm_db_*` bridge, not stock
+`pdo_mysql` — see [`per_site`](/reference/config/#dbsqlitereplication).
 
 ```yaml
 # Example: an LB backend that only accepts the writable node.

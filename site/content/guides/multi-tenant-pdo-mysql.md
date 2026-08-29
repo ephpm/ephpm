@@ -189,9 +189,15 @@ Stated plainly, because a security page that only lists wins is not useful.
   port. Keep it on `127.0.0.1` (the default). A process on the same host that
   can read the derived password can use it — but so could it read the database
   files directly.
-- **Clustered mode.** Per-site isolation is single-node only. With `[cluster]`
-  enabled the database is shared across tenants and ePHPm warns loudly at
-  startup.
+- **Clustered mode.** With `[cluster]` enabled and the default
+  `[db.sqlite.replication] per_site = false`, the database is shared across
+  tenants and ePHPm warns loudly at startup. Setting `per_site = true` gives
+  each tenant its own replicated database (**experimental**) — but write
+  forwarding to the site's owner is wired into the `ephpm_db_*` bridge only.
+  A `pdo_mysql` connection to a node that does not own the site resolves that
+  node's *local* replica, so its writes are neither forwarded nor replicated.
+  **Do not use `pdo_mysql` for writes in per-site clustered mode**; use the
+  [`db-*` drop-ins](/reference/php-packages/), which call the bridge.
 
 ## Resource cost
 

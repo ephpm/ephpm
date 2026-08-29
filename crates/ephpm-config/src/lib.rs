@@ -2262,6 +2262,47 @@ pub struct ReplicationConfig {
     /// is too low.
     #[serde(default = "default_max_snapshot_bytes")]
     pub max_snapshot_bytes: u64,
+
+    /// Replicate **per-site** databases across the cluster (multi-tenant
+    /// clustered mode). Default: `false`.
+    ///
+    /// Only meaningful when clustered mode is active (`[cluster] enabled`
+    /// with `replication.role` = `auto`/`primary`/`replica`) **and**
+    /// `[server] sites_dir` is set (multi-tenant, one Turso database per
+    /// virtual host at `[db.sqlite] dir`/`<site-key>.db`). When `true`,
+    /// each site's database replicates across every node so any node can
+    /// serve any site's reads, and ownership of a site's writes is chosen
+    /// by rendezvous hashing (HRW) over the alive nodes — on a node death
+    /// only that node's sites move, each to a node already holding a warm
+    /// replica.
+    ///
+    /// When `false` (the default), a clustered + multi-site config gets
+    /// **no** per-site isolation: all virtual hosts share the single
+    /// clustered database (the pre-existing behaviour, with a startup
+    /// warning). Setting this to `true` turns on the per-site clustered
+    /// replication path instead.
+    ///
+    /// Ignored (no effect) outside clustered multi-site mode: a
+    /// single-node multi-site deployment already isolates per site, and a
+    /// single-database clustered deployment has no per-site dimension.
+    ///
+    /// **Writes are owner-served.** A request for a site this node does not
+    /// own has its `ephpm_db_*` statements forwarded to the site's HRW owner
+    /// over the (authenticated, encrypted) cluster channel, which executes
+    /// them against its local database so the write is captured into CDC and
+    /// replicates everywhere. Reads and writes therefore both work on any
+    /// node, and read-your-writes holds because one node serves both.
+    ///
+    /// **Gap:** forwarding is wired into the `ephpm_db_*` bridge only. A
+    /// stock `pdo_mysql` connection to a non-owner node still resolves that
+    /// node's *local* database, so its writes are not forwarded and not
+    /// replicated. Use the `db-*` drop-in packages (which call `ephpm_db_*`)
+    /// on the per-site clustered path.
+    ///
+    /// **Experimental.** The Turso engine is Beta upstream and this mode
+    /// layers per-site CDC on top of it.
+    #[serde(default = "default_replication_per_site")]
+    pub per_site: bool,
 }
 
 impl Default for ReplicationConfig {
@@ -2271,8 +2312,16 @@ impl Default for ReplicationConfig {
             primary_grpc_url: String::new(),
             cdc_experimental: false,
             max_snapshot_bytes: default_max_snapshot_bytes(),
+            per_site: default_replication_per_site(),
         }
     }
+}
+
+/// Default for [`ReplicationConfig::per_site`]: off. Per-site clustered
+/// replication is experimental and opt-in — a clustered multi-site config
+/// keeps its pre-existing shared-database behaviour unless this is set.
+fn default_replication_per_site() -> bool {
+    false
 }
 
 fn default_max_snapshot_bytes() -> u64 {
@@ -7622,6 +7671,35 @@ max_open_dbs = 32
         let sqlite = config.db.sqlite.expect("sqlite should be present");
         assert_eq!(sqlite.dir.as_deref(), Some("/var/lib/ephpm/dbs"));
         assert_eq!(sqlite.max_open_dbs, 32);
+    }
+
+    #[test]
+    fn test_replication_per_site_defaults_off_and_parses() {
+        // Absent: the knob defaults off, and its sibling replication
+        // defaults are undisturbed (section-level serde defaults do not
+        // silently zero a field default).
+        assert!(!ReplicationConfig::default().per_site);
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[db.sqlite]
+dir = "/var/lib/ephpm/dbs"
+
+[db.sqlite.replication]
+per_site = true
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load(&file).unwrap();
+        let sqlite = config.db.sqlite.expect("sqlite should be present");
+        assert!(sqlite.replication.per_site, "per_site = true must parse");
+        // Present-section sibling defaults still hold.
+        assert_eq!(sqlite.replication.role, "auto");
+        assert_eq!(sqlite.replication.max_snapshot_bytes, default_max_snapshot_bytes());
     }
 
     #[test]

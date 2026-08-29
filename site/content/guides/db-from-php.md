@@ -480,9 +480,16 @@ Two extra guarantees apply on this path:
   [Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/). The bridge is
   not the only way in.
 
-Per-site isolation is single-node only; see the
+Per-site isolation is single-node by default. To run it across a cluster, set
+`[db.sqlite.replication] per_site = true` — **experimental**; each site's
+database then replicates to every node and its writes are forwarded to the
+site's owner. This forwarding is wired into `ephpm_db_query()` /
+`ephpm_db_execute()` only, so on a cluster the bridge is the supported path and
+stock `pdo_mysql` is not. See the
 [`[db.sqlite]` reference](/reference/config/#dbsqlite) for `dir` and
-`max_open_dbs`.
+`max_open_dbs`, and
+[`[db.sqlite.replication]`](/reference/config/#dbsqlitereplication-clustered-mode-only)
+for `per_site`.
 
 ### Transactions
 

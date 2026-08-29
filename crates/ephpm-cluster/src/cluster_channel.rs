@@ -236,6 +236,19 @@ pub mod stream_type {
     /// has registered a handler, the stream is closed like any other
     /// unknown type.
     pub const SNAPSHOT_PREFIX: &str = "snapshot/";
+
+    /// Owner-serves SQL write-forwarding stream, one per vhost / logical
+    /// database.
+    ///
+    /// Wire form: `"sql/<vhost>"`. A node that receives a request for a site
+    /// it does **not** own (per HRW) opens one of these to the site's owner
+    /// and forwards every `ephpm_db_*` statement over it; the owner executes
+    /// each against that site's local database and streams the result back.
+    /// This is what makes writes work on any node (the owner captures the
+    /// write into CDC, which then replicates to every replica). The handler
+    /// is registered by `ephpm-server`'s `sql_forward` module; an unhandled
+    /// type is closed like any other.
+    pub const SQL_PREFIX: &str = "sql/";
 }
 
 // ---------------------------------------------------------------------------
@@ -671,7 +684,23 @@ async fn accept_loop(
 /// to reconnect, and the failure detector takes tens of seconds to
 /// forget it. Self counts too — loopback and single-node test setups
 /// dial themselves.
-async fn peer_is_cluster_member(cluster: &ClusterHandle, ip: IpAddr) -> bool {
+///
+/// # The identity this gives you
+///
+/// This is the **only** peer identity the cluster channel has, and it is
+/// coarse: "holds the shared `[cluster] secret`" (proved by the mutual
+/// handshake) plus "connected from an IP gossip knows". It is per-host,
+/// not per-process and not per-node-id — it cannot tell two ePHPm
+/// processes on one host apart, and it trusts the TCP source address.
+/// A stream handler that needs *authorization* (e.g. `sql/<site>`, which
+/// hands a peer read/write on a tenant database) must therefore add its
+/// own check — for the per-site paths that is HRW ownership of the named
+/// site — and treat this only as "the caller is inside the cluster".
+///
+/// Exposed publicly so a handler can re-run it at stream-accept time:
+/// admission ran once when the TCP connection was established, and
+/// membership can change while a long-lived connection stays open.
+pub async fn peer_is_cluster_member(cluster: &ClusterHandle, ip: IpAddr) -> bool {
     if ip == cluster.gossip_socket_addr().ip() {
         return true;
     }

@@ -129,7 +129,7 @@ A richer per-site override system (a `site.toml` dropped into the site directory
 
 Set `[db.sqlite] dir` and each virtual host gets its **own** database file at `<dir>/<site-key>.db`, opened lazily on that site's first query — the tenant-isolation boundary, since Turso has no per-schema ACL. `dir` is **required** in multi-site single-node mode; ePHPm fails closed rather than share one database between tenants. Both routes reach it: the native `ephpm_db_*` bridge (routed by the request's site) and stock `pdo_mysql` (routed by a per-site credential — see [Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/)).
 
-Per-site databases are **single-node only**. With `[cluster]` enabled the database is clustered and shared across tenants, and startup warns about it.
+With `[cluster]` enabled, per-site databases are off by default: the database is clustered and **shared** across tenants, and startup warns about it. Set `[db.sqlite.replication] per_site = true` to keep per-site isolation on a cluster — each site's database replicates to every node, and writes are forwarded to the site's current owner (chosen by rendezvous hashing, so a node failure moves only that node's sites). This is **experimental** (the Turso engine is Beta upstream) and covers the native `ephpm_db_*` bridge only — stock `pdo_mysql` writes are not forwarded. See [`[db.sqlite.replication]`](/reference/config/#dbsqlitereplication-clustered-mode-only).
 
 ### Host Matching
 

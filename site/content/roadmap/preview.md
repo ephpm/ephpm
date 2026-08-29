@@ -277,11 +277,16 @@ Multiple VMs, each running ePHPm plus a switchboard; the API routes a deploy to
 the VM with the most free disk; GeoDNS or a load balancer spreads requests.
 Each VM keeps its own `sites_dir`, so no shared filesystem is required.
 
-Note the constraint this design has to respect: **per-site database isolation
-is single-node only.** Multi-site mode combined with clustered replication does
-not give per-site databases — every vhost shares the clustered database. A
-preview fleet therefore scales by sharding previews across independent nodes,
-not by clustering one preview host.
+Note the constraint this design has to respect: by default **multi-site mode
+combined with clustered replication does not give per-site databases** — every
+vhost shares the clustered database. A preview fleet therefore scales by
+sharding previews across independent nodes, not by clustering one preview host.
+
+`[db.sqlite.replication] per_site = true` (**experimental**) relaxes this: each
+vhost keeps its own database and replicates it across the cluster, with writes
+forwarded to the site's owner. It is not yet a basis for the preview fleet —
+the Turso engine is Beta upstream and the forwarding path covers the
+`ephpm_db_*` bridge only, not stock `pdo_mysql`.
 
 ## Multi-PHP versions — deferred
 
