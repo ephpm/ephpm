@@ -614,6 +614,17 @@ async fn run_dns01_lifecycle(ctx: Dns01Context) {
                     // just issued — a needless trip toward the rate limit.
                     last_issued =
                         read_issued_at(ctx.store.as_deref(), &ctx.cache_dir, &ctx.canonical);
+                    // Publish our cached certificate to the cluster if it isn't
+                    // there yet. A leader that loaded from disk (e.g. a full-
+                    // cluster restart) never issued, so it never broadcast, and
+                    // followers would serve nothing on :443 until the next
+                    // renewal. Idempotent — a no-op when KV already has it.
+                    if republish_cached_cert_on_promotion(&ctx, last_issued) {
+                        tracing::info!(
+                            canonical = ctx.canonical,
+                            "DNS-01: re-published cached certificate to the cluster on leadership acquisition"
+                        );
+                    }
                     tracing::info!(node_id, "DNS-01: this node is now the ACME leader");
                 } else {
                     tracing::info!(node_id, "DNS-01: this node is no longer the ACME leader");
@@ -904,6 +915,40 @@ fn persist_cert(ctx: &Dns01Context, cert_pem: &[u8], key_pem: &[u8], issued: Sys
     write_file(&ctx.cache_dir.join(format!("{stem}.issued")), secs.to_string().as_bytes());
 }
 
+/// On acquiring leadership, ensure this node's cached certificate is present in
+/// the cluster KV so followers can install it.
+///
+/// # The gap this closes
+///
+/// [`store_acme_cert`](crate::acme::store_acme_cert) only runs at *issuance*.
+/// A leader that loaded its certificate from the local disk cache — e.g. after
+/// a full-cluster restart, where the lowest-id node comes up holding a still-
+/// valid cert — never orders, so it never broadcasts. Followers then find KV
+/// empty (and their own disk empty) and serve nothing on `:443`. This is the
+/// "two of three nodes have no certificate" failure.
+///
+/// Re-publishing our cached certificate on promotion fixes that without waiting
+/// for the renewal window. It is **idempotent and cheap**: it does nothing when
+/// the cluster KV already holds the certificate, or when this node has no cached
+/// certificate to publish (a fresh node — the ordering path handles that).
+///
+/// Returns `true` when a re-publish actually happened (for logging).
+fn republish_cached_cert_on_promotion(ctx: &Dns01Context, last_issued: Option<SystemTime>) -> bool {
+    let Some(store) = ctx.store.as_deref() else {
+        return false; // standalone: no cluster to publish to
+    };
+    if crate::acme::get_acme_cert(store, &ctx.canonical).is_some() {
+        return false; // the cluster already has our certificate
+    }
+    let Some((cert_pem, key_pem)) = load_cached_cert(Some(store), &ctx.cache_dir, &ctx.canonical)
+    else {
+        return false; // nothing cached to publish — the ordering path will issue
+    };
+    let issued = last_issued.unwrap_or_else(SystemTime::now);
+    persist_cert(ctx, &cert_pem, &key_pem, issued);
+    true
+}
+
 /// Load account credential JSON — KV first, then disk.
 fn load_account_creds(ctx: &Dns01Context) -> Option<Vec<u8>> {
     if let Some(store) = &ctx.store
@@ -1004,6 +1049,95 @@ mod tests {
         let cert = params.self_signed(&key).expect("self-sign");
         assert!(resolver.install(cert.pem().as_bytes(), key.serialize_pem().as_bytes()).is_ok());
         assert!(resolver.has_cert());
+    }
+
+    /// A DNS provider that does nothing — the promotion re-publish path never
+    /// touches DNS, so a no-op is enough to build a [`Dns01Context`].
+    #[derive(Debug)]
+    struct NoopProvider;
+
+    #[async_trait]
+    impl DnsProvider for NoopProvider {
+        async fn set_txt(&self, _fqdn: &str, _value: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn delete_txt(&self, _fqdn: &str, _value: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a `Dns01Context` backed by a single-node store and the given cache
+    /// dir. Returns the context plus a self-signed `(cert_pem, key_pem)`.
+    fn ctx_with_store(cache_dir: PathBuf) -> (Dns01Context, Vec<u8>, Vec<u8>) {
+        let domains = vec!["*.preview.ephpm.dev".to_string(), "preview.ephpm.dev".to_string()];
+        let canonical = canonical_domain_key(&domains);
+        let store = ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default());
+        let key = rcgen::KeyPair::generate().expect("keypair");
+        let params =
+            rcgen::CertificateParams::new(vec!["preview.ephpm.dev".to_string()]).expect("params");
+        let cert = params.self_signed(&key).expect("self-sign");
+        let cert_pem = cert.pem().into_bytes();
+        let key_pem = key.serialize_pem().into_bytes();
+        let ctx = Dns01Context {
+            resolver: Arc::new(Dns01CertResolver::new()),
+            provider: Arc::new(NoopProvider) as Arc<dyn DnsProvider>,
+            domains,
+            canonical,
+            contact: Vec::new(),
+            directory_url: LetsEncrypt::Staging.url().to_string(),
+            store: Some(store),
+            cache_dir,
+            node_id: "node-1".to_string(),
+        };
+        (ctx, cert_pem, key_pem)
+    }
+
+    /// The regression: a leader that loaded its certificate from the local disk
+    /// cache (no fresh order → no broadcast) must re-publish it to the cluster
+    /// KV on promotion, so followers can install it. Without this a full-cluster
+    /// restart leaves every non-leader node serving nothing on `:443`.
+    #[test]
+    fn promotion_republishes_disk_cached_cert_to_kv() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ctx, cert_pem, key_pem) = ctx_with_store(dir.path().to_path_buf());
+        let store = ctx.store.clone().expect("store");
+
+        // Simulate a leader that has the cert on disk only — nothing in KV.
+        let stem = cache_stem(&ctx.canonical);
+        std::fs::write(dir.path().join(format!("{stem}.crt")), &cert_pem).expect("write crt");
+        std::fs::write(dir.path().join(format!("{stem}.key")), &key_pem).expect("write key");
+        assert!(
+            crate::acme::get_acme_cert(&store, &ctx.canonical).is_none(),
+            "precondition: KV must not yet hold the certificate"
+        );
+
+        // Promotion re-publishes it.
+        assert!(
+            republish_cached_cert_on_promotion(&ctx, Some(SystemTime::now())),
+            "a disk-cached cert must be re-published on promotion"
+        );
+        let (kv_cert, kv_key) =
+            crate::acme::get_acme_cert(&store, &ctx.canonical).expect("cert now in KV");
+        assert_eq!(kv_cert, cert_pem, "the KV cert must match the disk cert");
+        assert_eq!(kv_key, key_pem, "the KV key must match the disk key");
+
+        // Idempotent: a second promotion is a no-op now that KV holds it.
+        assert!(
+            !republish_cached_cert_on_promotion(&ctx, Some(SystemTime::now())),
+            "re-publishing must be a no-op when KV already has the cert"
+        );
+    }
+
+    /// A node with no cached certificate at all (fresh join) must not claim to
+    /// have re-published anything — the ordering path handles issuance.
+    #[test]
+    fn promotion_without_cached_cert_is_a_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (ctx, _cert, _key) = ctx_with_store(dir.path().to_path_buf());
+        assert!(
+            !republish_cached_cert_on_promotion(&ctx, None),
+            "nothing to publish when there is no cached certificate"
+        );
     }
 
     #[test]
