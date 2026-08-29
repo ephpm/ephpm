@@ -19,10 +19,12 @@
 //! The listener is only bound when a feature asks for it; before this
 //! module opted in, the channel port was closed.
 //!
-//! Each CDC stream is named `cdc/<vhost>` (today just `cdc/default`
-//! — per-vhost replication is Phase 2.1). The primary registers a
-//! handler for `"cdc/default"` on the channel; replicas dial the
-//! primary's channel address and open a stream of that name. The
+//! Each CDC stream is named `cdc/<vhost>`. The single-database path uses
+//! the one name `cdc/default`, registering an exact handler for it;
+//! replicas dial the primary's channel address and open a stream of that
+//! name. Per-site clustered mode (`[db.sqlite.replication] per_site`)
+//! instead registers a *prefix* handler and runs one `cdc/<site>` stream
+//! per virtual host — see the per-site section further down. The
 //! per-transaction frame format inside the stream stays as it was
 //! (length-prefixed JSON) — the multiplexer only replaces the
 //! bespoke TCP dance around it.
@@ -177,13 +179,13 @@
 //! tail. There is no gap and no overlap.
 //!
 //! The `snapshot/<vhost>` stream name is reserved in
-//! [`ephpm_cluster::stream_type::SNAPSHOT_PREFIX`]; v1 uses only
-//! `snapshot/default` (single-vhost, matching `cdc/default`).
+//! [`ephpm_cluster::stream_type::SNAPSHOT_PREFIX`]. The single-database
+//! path uses only `snapshot/default` (matching `cdc/default`); per-site
+//! clustered mode uses one `snapshot/<site>` per virtual host.
 //!
-//! ## Scope guards (v1)
+//! ## Scope guards
 //!
-//! - Single vhost: `snapshot/default` only.
-//! - No CDC-log truncation handling: v1 relies on the log growing
+//! - No CDC-log truncation handling: the path relies on the log growing
 //!   unbounded (as the CDC path does). When truncation lands, the
 //!   snapshot watermark `N` and the tail's oldest retained `change_id`
 //!   must be reconciled (ship a snapshot at >= the truncation point);
@@ -214,12 +216,14 @@
 //! module does no sealing of its own.
 
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::Context;
-use ephpm_cluster::{ChannelStream, IncomingStream};
+use dashmap::DashMap;
+use ephpm_cluster::{ChannelStream, ElectedRole, IncomingStream};
 use ephpm_config::SqliteConfig;
 use litewire::litewire_turso::Turso;
 use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, read_watermark};
@@ -228,19 +232,31 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{tracked_backend, turso_cdc_metrics as cdc_metrics};
 
-/// Full stream-type string this build uses for the default vhost.
+/// Logical database name used by the **single-database** clustered path.
 ///
-/// Per-vhost replication is Phase 2.1; today every CDC stream uses
-/// `"cdc/default"`.
-const CDC_STREAM_TYPE: &str = "cdc/default";
+/// That path replicates exactly one database, so its CDC and snapshot
+/// streams are `"cdc/default"` / `"snapshot/default"`. The per-site
+/// clustered path ([`start_clustered_per_site_turso`]) uses the vhost's
+/// canonical site key in place of `"default"`.
+const DEFAULT_SITE: &str = "default";
 
-/// Full stream-type string for the default vhost's snapshot bootstrap
-/// stream (Phase 2.1, task #97). A cold replica dials this once to fetch
-/// the primary's base state before subscribing to [`CDC_STREAM_TYPE`].
+/// CDC stream-type string for `site`: `"cdc/<site>"`.
 ///
-/// Per-vhost snapshots are future work; today every snapshot uses
-/// `"snapshot/default"` under [`ephpm_cluster::stream_type::SNAPSHOT_PREFIX`].
-const SNAPSHOT_STREAM_TYPE: &str = "snapshot/default";
+/// Built from [`ephpm_cluster::stream_type::CDC_PREFIX`] so the
+/// "lives under the CDC prefix" invariant the owner-side prefix handler
+/// relies on holds by construction.
+#[must_use]
+fn cdc_stream_type(site: &str) -> String {
+    format!("{}{site}", ephpm_cluster::stream_type::CDC_PREFIX)
+}
+
+/// Snapshot stream-type string for `site`: `"snapshot/<site>"`. A cold
+/// replica dials this once to fetch the owner's base state before
+/// subscribing to the site's CDC stream.
+#[must_use]
+fn snapshot_stream_type(site: &str) -> String {
+    format!("{}{site}", ephpm_cluster::stream_type::SNAPSHOT_PREFIX)
+}
 
 /// Maximum frame length accepted on either side of the wire (16 MiB).
 const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
@@ -279,6 +295,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// How long a replica waits between connect retries when the primary
 /// is unreachable.
 const REPLICA_RECONNECT_DELAY: Duration = Duration::from_secs(2);
+
+/// Base backoff between per-site mgmt-factory open retries when the file's
+/// write lock is held by the cdc-on wire factory. Grows linearly per attempt,
+/// capped at [`REPLICA_RECONNECT_DELAY`]. See [`acquire_site_mgmt`].
+const MGMT_OPEN_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Emit a single visible warning once a per-site mgmt open has retried this
+/// many times without succeeding — a lock that outlives ~20 attempts is worth
+/// surfacing, but per-attempt warnings would bury the log.
+const MGMT_LOCK_WARN_AFTER: u32 = 20;
 
 /// How often the primary samples `MAX(turso_cdc.change_id)` to publish
 /// [`cdc_metrics::METRIC_HEAD_CHANGE_ID`].
@@ -607,7 +633,7 @@ pub async fn start_clustered_turso_cdc(
     // replica, so it is already in place after a promotion. Each
     // inbound stream announces the watermark it has applied and gets
     // its own tailer starting there.
-    let mut cdc_streams = channel.register_exact(CDC_STREAM_TYPE);
+    let mut cdc_streams = channel.register_exact(cdc_stream_type(DEFAULT_SITE));
     let subs_mgmt = Arc::clone(&mgmt_factory);
     let subs_is_primary = Arc::clone(&is_primary);
     let subs_log_id = local_log_id.clone();
@@ -880,7 +906,10 @@ async fn start_role(role: Role, mgmt: Arc<Turso>, channel: ephpm_cluster::Channe
             // Nothing to drive: on the primary, each inbound subscriber
             // stream owns its own tailer (see `serve_subscriber`), so
             // there is no shared tail loop to run.
-            tracing::info!("CDC primary: serving replication streams on {CDC_STREAM_TYPE}");
+            tracing::info!(
+                stream = %cdc_stream_type(DEFAULT_SITE),
+                "CDC primary: serving replication streams"
+            );
         }
         Role::Replica { primary_addr } => {
             if let Err(e) = run_replica(mgmt, primary_addr, channel).await {
@@ -1108,7 +1137,7 @@ pub async fn run_replica(
     );
 
     loop {
-        match channel.dial(primary_addr, CDC_STREAM_TYPE).await {
+        match channel.dial(primary_addr, &cdc_stream_type(DEFAULT_SITE)).await {
             Ok(mut stream) => {
                 // Watermark resolution happens INSIDE subscribe_and_consume,
                 // after the primary's Hello: the cursor is only meaningful
@@ -1541,7 +1570,7 @@ fn spawn_snapshot_server(
     local_log_id: String,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
 ) {
-    let mut snapshot_streams = channel.register_exact(SNAPSHOT_STREAM_TYPE);
+    let mut snapshot_streams = channel.register_exact(snapshot_stream_type(DEFAULT_SITE));
     handles.push(tokio::spawn(async move {
         while let Some(incoming) = snapshot_streams.recv().await {
             let IncomingStream { stream, peer, .. } = incoming;
@@ -2129,9 +2158,31 @@ pub async fn fetch_and_apply_snapshot(
     channel: &ephpm_cluster::ChannelHandle,
     max_snapshot_bytes: u64,
 ) -> anyhow::Result<i64> {
+    fetch_and_apply_snapshot_on(
+        conn,
+        primary_addr,
+        channel,
+        max_snapshot_bytes,
+        &snapshot_stream_type(DEFAULT_SITE),
+    )
+    .await
+}
+
+/// Body of [`fetch_and_apply_snapshot`], parameterized by the snapshot
+/// stream type so the per-site clustered path can dial `snapshot/<site>`
+/// while the single-database path dials `snapshot/default`. Everything
+/// else — the size bounds, the allocation-hint clamp, the statement
+/// allowlist, the watermark seed — is identical.
+async fn fetch_and_apply_snapshot_on(
+    conn: &turso::Connection,
+    primary_addr: SocketAddr,
+    channel: &ephpm_cluster::ChannelHandle,
+    max_snapshot_bytes: u64,
+    snapshot_stream: &str,
+) -> anyhow::Result<i64> {
     let started = std::time::Instant::now();
     let mut stream = channel
-        .dial(primary_addr, SNAPSHOT_STREAM_TYPE)
+        .dial(primary_addr, snapshot_stream)
         .await
         .with_context(|| format!("snapshot: dial {primary_addr}"))?;
 
@@ -2373,6 +2424,741 @@ fn spawn_litewire_serve<B: litewire::backend::Backend>(
 }
 
 // ---------------------------------------------------------------------------
+// Per-site clustered replication (Phase 0).
+//
+// Multi-tenant clustered mode: `[server] sites_dir` + `[db.sqlite] dir` +
+// clustered + `[db.sqlite.replication] per_site = true`. Each virtual host
+// has its own Turso database at `<dir>/<site-key>.db`, and every alive node
+// replicates every active site so any node can serve any site's reads.
+//
+// Ownership of a site's *writes* is decided by rendezvous hashing (HRW,
+// `ephpm_cluster::hrw_owner`) over the alive nodes: `owner(site) = argmax
+// node of hash(node_id ‖ site)`. A node death re-homes only that node's
+// sites, each to a node already holding a warm replica.
+//
+// Wire serving (the per-site MySQL listener + `ephpm_db_*` bridge) is the
+// SAME single-node per-site machinery, wired in `serve()` — the only
+// clustered addition on the serving side is that each site's Turso wire
+// factory is opened with CDC capture on (see `SiteBackends::new_clustered`),
+// so a site owned here captures the writes it must ship. THIS module adds
+// the replication plane: a second (mgmt) Turso factory per site for
+// tailing/applying CDC, owner-side stream handlers, and a per-site driver.
+//
+// ## Owner side (reactive)
+//
+// One `register_prefix("cdc/")` and one `register_prefix("snapshot/")`
+// handler route every site. For each inbound stream the handler parses the
+// site out of the stream type, checks `hrw_owner(alive, site) == self`, and
+// only then resolves that site's mgmt factory and spawns the existing
+// generic `serve_subscriber` / `serve_snapshot`. A non-owner refuses (the
+// dialer is chasing a stale owner and retries).
+//
+// ## Replica side (per-site driver)
+//
+// A site enters this node's working set when either (a) its `.db` already
+// exists on disk at startup, or (b) a request opens it locally (the
+// `SiteBackends` open hook feeds the site key in over `site_events`). For
+// each such site a driver runs a per-site `SqliteElection`
+// (`sqlite:primary:<site>`, HRW ownership) that publishes THIS node's
+// channel address while it owns the site and names the owner otherwise;
+// when this node is a replica of the site it cold-bootstraps (if empty) then
+// tails `cdc/<site>` from the owner, exactly like the single-database path.
+//
+// ## Write path
+//
+// Writes are **owner-served**. `start_clustered_per_site_turso` registers
+// [`crate::sql_forward::spawn_owner_sql_handler`], and the `ephpm_db_*`
+// bridge resolves through `sql_forward::ClusteredSiteResolver`: a node that
+// is not the site's HRW owner forwards each statement over `sql/<site>` to
+// the owner, which runs it locally so the write is captured into CDC and
+// replicates everywhere. Reads and writes therefore both work on any node.
+//
+// ## What is NOT here yet (documented divergence)
+//
+// **`pdo_mysql` is not forwarded.** The per-site MySQL wire listener resolves
+// this node's LOCAL backend, so a stock `pdo_mysql` write to a non-owner is
+// applied locally, is not captured for replication, and is discarded when that
+// replica re-bootstraps from the owner. Apps on the per-site clustered path
+// must use the `db-*` drop-ins, which call `ephpm_db_*`.
+// ---------------------------------------------------------------------------
+
+/// Lazily-opened per-site replication management state.
+///
+/// A **second** Turso factory on the site's database file (distinct from
+/// the wire factory the `SiteBackends` registry serves to litewire/PHP —
+/// two factories on one file in one process is the same pattern the
+/// single-database path uses and is verified safe upstream). Capture is
+/// **off** here: the tailer reads `turso_cdc` explicitly and the applier's
+/// writes must not be re-captured. Also carries the database's persistent
+/// CDC log identity (issue #315).
+struct SiteMgmt {
+    factory: Arc<Turso>,
+    log_id: String,
+}
+
+/// Per-site lock guarding that one site's opened-or-not [`SiteMgmt`].
+type SiteMgmtSlot = Arc<tokio::sync::Mutex<Option<Arc<SiteMgmt>>>>;
+
+/// Lazily-populated map of site key → its [`SiteMgmt`].
+///
+/// Locking is **per site**, not registry-wide: a `DashMap` of per-site async
+/// mutexes each guarding that one site's `Option<SiteMgmt>`. Opening site A
+/// therefore never blocks resolving site B (a registry-wide mutex held across
+/// the open was itself part of the first-open cascade — a slow/contended open
+/// of one site stalled every other site's driver). The per-site mutex still
+/// guarantees at most one mgmt factory is opened per file.
+///
+/// [`ensure`](Self::ensure) **fast-fails** on a `database is locked` error
+/// (the wire factory — opened cdc-on by the request that first touched the
+/// site — contends on the file's write lock while `ensure_log_id` creates its
+/// bookkeeping table). The per-site driver retries with backoff via
+/// [`acquire_site_mgmt`]; the owner-side stream handlers drop the stream and
+/// the replica re-dials, by which time the driver has usually populated the
+/// cache. Retrying here instead would hold the per-site mutex across the
+/// backoff and serialize the owner handler behind it.
+///
+/// **Unbounded.** Slots are never evicted, so unlike [`SiteBackends`] this
+/// registry is not capped by `[db.sqlite] max_open_dbs` — it holds a second
+/// `Turso` factory open per site for the process's life. See the known-issues
+/// note on `start_clustered_per_site_turso`.
+#[derive(Clone)]
+struct SiteMgmtRegistry {
+    dir: Arc<PathBuf>,
+    slots: Arc<DashMap<String, SiteMgmtSlot>>,
+}
+
+impl SiteMgmtRegistry {
+    fn new(dir: PathBuf) -> Self {
+        Self { dir: Arc::new(dir), slots: Arc::new(DashMap::new()) }
+    }
+
+    /// The per-site lock guarding that site's opened-or-not [`SiteMgmt`].
+    fn slot(&self, site: &str) -> SiteMgmtSlot {
+        Arc::clone(self.slots.entry(site.to_string()).or_default().value())
+    }
+
+    /// Get-or-open the mgmt factory + log identity for `site`.
+    ///
+    /// Fast-fails on a transient `database is locked` — see the type docs.
+    async fn ensure(&self, site: &str) -> anyhow::Result<Arc<SiteMgmt>> {
+        anyhow::ensure!(
+            crate::router::is_valid_site_key(site),
+            "refusing to open a mgmt factory for an invalid site key: {site:?}"
+        );
+        let slot = self.slot(site);
+        let mut guard = slot.lock().await;
+        if let Some(existing) = guard.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
+        let path = self.dir.join(format!("{site}.db"));
+        let path_str = path
+            .to_str()
+            .with_context(|| format!("per-site db path is not valid UTF-8: {}", path.display()))?;
+        let factory = Arc::new(
+            Turso::open(path_str)
+                .await
+                .with_context(|| format!("open mgmt Turso factory for site {site}"))?,
+        );
+        let log_id = {
+            let conn = factory
+                .raw_connection()
+                .with_context(|| format!("open mgmt connection for site {site}"))?;
+            ensure_log_id(&conn)
+                .await
+                .with_context(|| format!("establish CDC log identity for site {site}"))?
+        };
+        let mgmt = Arc::new(SiteMgmt { factory, log_id });
+        *guard = Some(Arc::clone(&mgmt));
+        Ok(mgmt)
+    }
+}
+
+/// Does this error chain describe a transient Turso/SQLite write-lock
+/// contention (`database is locked` / `table is locked`)?
+///
+/// Turso surfaces write-lock contention as a message, not a stable typed
+/// variant across the pinned version, so the classification is by message
+/// (case-insensitive) — used to decide *retry* vs *give up* when opening a
+/// per-site mgmt factory whose file the cdc-on wire factory is also writing.
+fn is_locked_error(err: &anyhow::Error) -> bool {
+    let s = format!("{err:#}").to_ascii_lowercase();
+    s.contains("database is locked") || s.contains("table is locked")
+}
+
+/// Does this error chain describe a schema-object collision on CDC apply
+/// (`... already exists`)?
+///
+/// This is the fingerprint of a *diverged* replica: it holds a local-origin
+/// object (e.g. a `markers` table a stray non-owner write created) that the
+/// owner's CDC batch then tries to `CREATE` again. It must trigger a clean
+/// re-bootstrap from the owner rather than wedge the apply loop forever.
+fn is_schema_collision_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}").to_ascii_lowercase().contains("already exists")
+}
+
+/// Open (with retry) the per-site mgmt factory for the driver.
+///
+/// A `database is locked` is definitionally transient — the cdc-on wire
+/// factory is mid-write on the same file — so this retries it **indefinitely**
+/// with capped backoff rather than letting the driver exit and lose
+/// replication for a site (Bug: a first-open lock race killed the driver
+/// permanently, and a startup-scanned site got no further open event to
+/// restart it). Any other error is permanent and propagates.
+async fn acquire_site_mgmt(mgmt: &SiteMgmtRegistry, site: &str) -> anyhow::Result<Arc<SiteMgmt>> {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match mgmt.ensure(site).await {
+            Ok(m) => return Ok(m),
+            Err(e) if is_locked_error(&e) => {
+                // Cap backoff at REPLICA_RECONNECT_DELAY; warn once past a
+                // threshold so a genuinely stuck lock is visible without
+                // spamming the log every attempt.
+                let backoff =
+                    MGMT_OPEN_BACKOFF.saturating_mul(attempt).min(REPLICA_RECONNECT_DELAY);
+                if attempt == MGMT_LOCK_WARN_AFTER {
+                    tracing::warn!(
+                        site = %site,
+                        attempt,
+                        "per-site mgmt open still contending on the database write lock after \
+                         many retries; continuing to retry (replication cannot start until it \
+                         opens)"
+                    );
+                } else {
+                    tracing::debug!(site = %site, attempt, "per-site mgmt open contended on the db lock; retrying: {e:#}");
+                }
+                tokio::time::sleep(backoff).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Parse and validate the site key out of a `<prefix><site>` stream type.
+/// Returns `None` for an empty or non-`[a-z0-9._-]` key (a peer will not
+/// get a stream served for a name that could name anything but a direct
+/// child of `dir`).
+fn site_from_stream(stream_type: &str, prefix: &str) -> Option<String> {
+    let site = stream_type.strip_prefix(prefix)?;
+    if !site.is_empty() && crate::router::is_valid_site_key(site) {
+        Some(site.to_string())
+    } else {
+        None
+    }
+}
+
+/// Is this node the HRW owner of `site` among the currently-alive members?
+async fn is_site_owner(cluster: &ephpm_cluster::ClusterHandle, self_id: &str, site: &str) -> bool {
+    let nodes = cluster.nodes().await;
+    ephpm_cluster::hrw_owner(&nodes, site).is_some_and(|n| n.id == self_id)
+}
+
+/// Enumerate the sites whose databases already exist under `dir` at startup
+/// (warm working set). Non-`.db` files and invalid keys are ignored.
+fn scan_existing_sites(dir: &Path) -> Vec<String> {
+    let mut sites = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return sites;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(site) = name.strip_suffix(".db") else { continue };
+        if crate::router::is_valid_site_key(site) {
+            sites.push(site.to_string());
+        }
+    }
+    sites
+}
+
+/// Start Phase 0 per-site clustered Turso replication.
+///
+/// Registers the owner-side `cdc/` and `snapshot/` prefix handlers (HRW-gated
+/// per site), scans the on-disk working set, and starts a per-site
+/// replication driver for each active site (plus any that later become active
+/// via `site_events`). The serving plane (per-site MySQL listener + the
+/// `ephpm_db_*` bridge over a capture-on `SiteBackends`) is wired separately
+/// in `serve()`.
+///
+/// `dir` is `[db.sqlite] dir` (the per-site database directory). `site_events`
+/// carries site keys that became active locally (a request opened them), fed
+/// by the `SiteBackends` open hook.
+///
+/// # Errors
+///
+/// Returns an error if the cluster handle or channel is missing (a startup
+/// ordering bug — `resolve_channel_features` enables the `cdc` feature for
+/// this mode), or if the channel has no advertisable address.
+pub async fn start_clustered_per_site_turso(
+    sqlite_config: &SqliteConfig,
+    dir: PathBuf,
+    cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
+    channel_handle: Option<&ephpm_cluster::ChannelHandle>,
+    mut site_events: tokio::sync::mpsc::UnboundedReceiver<String>,
+    registry: crate::site_backends::SiteBackends,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) -> anyhow::Result<()> {
+    let cluster = cluster.context(
+        "per-site clustered Turso replication requires [cluster] enabled = true; \
+         no cluster handle available",
+    )?;
+    let channel = channel_handle.context(
+        "per-site clustered Turso replication requires the cluster channel to be bound; \
+         maybe_start_cluster_channel returned None despite clustered SQLite being active \
+         (startup ordering bug: resolve_channel_features should have enabled the cdc feature)",
+    )?;
+    let channel_advertise = channel.advertise_addr().context(
+        "per-site clustered Turso replication cannot advertise the cluster channel address: \
+         both [cluster] bind and [cluster.channel] listen use an unspecified IP (0.0.0.0 / ::). \
+         Bind [cluster] to a specific IP peers can reach, or set [cluster.channel] listen \
+         explicitly.",
+    )?;
+
+    let self_id = cluster.self_node().id;
+    let max_snapshot_bytes = sqlite_config.replication.max_snapshot_bytes;
+
+    cdc_metrics::init();
+
+    tracing::warn!(
+        dir = %dir.display(),
+        channel_listen = %channel.listen_addr(),
+        "starting EXPERIMENTAL per-site clustered Turso replication (HRW ownership, one \
+         database per virtual host). Reads and ephpm_db_* writes work on any node: a \
+         non-owner forwards its statements to the site's owner over sql/<site>. Stock \
+         pdo_mysql is NOT forwarded — its writes on a non-owner are local-only and are \
+         discarded when that replica re-bootstraps. Turso is Beta upstream."
+    );
+
+    let mgmt = SiteMgmtRegistry::new(dir.clone());
+
+    // Owner-side handlers (reactive; registered up front so a promotion is
+    // served immediately).
+    spawn_per_site_stream_handler(
+        channel,
+        Arc::clone(cluster),
+        self_id.clone(),
+        mgmt.clone(),
+        StreamKind::Cdc,
+        handles,
+    );
+    spawn_per_site_stream_handler(
+        channel,
+        Arc::clone(cluster),
+        self_id.clone(),
+        mgmt.clone(),
+        StreamKind::Snapshot,
+        handles,
+    );
+
+    // Owner-serves write-forwarding: a non-owner node dials `sql/<site>` to
+    // forward its `ephpm_db_*` statements here; this node (when it is the
+    // site's HRW owner) runs them against the site's LOCAL backend — capturing
+    // writes into CDC, which then replicate to every replica. Registered up
+    // front so any site this node owns is served, opened on demand.
+    crate::sql_forward::spawn_owner_sql_handler(
+        channel,
+        Arc::clone(cluster),
+        self_id.clone(),
+        registry,
+        handles,
+    );
+
+    // Replica-side per-site drivers. `drivers` guards against double-starting
+    // a driver for one site (startup scan vs. the live open-event stream).
+    let drivers: Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
+
+    let start_driver = {
+        let cluster = Arc::clone(cluster);
+        let channel = channel.clone();
+        let mgmt = mgmt.clone();
+        let drivers = Arc::clone(&drivers);
+        move |site: String| {
+            ensure_site_driver(
+                &drivers,
+                site,
+                &cluster,
+                &channel,
+                channel_advertise,
+                &mgmt,
+                max_snapshot_bytes,
+            );
+        }
+    };
+
+    // Warm working set already on disk.
+    for site in scan_existing_sites(&dir) {
+        start_driver(site);
+    }
+
+    // Sites that become active locally later.
+    handles.push(tokio::spawn(async move {
+        while let Some(site) = site_events.recv().await {
+            start_driver(site);
+        }
+    }));
+
+    Ok(())
+}
+
+/// Which per-site stream a handler serves.
+#[derive(Clone, Copy)]
+enum StreamKind {
+    Cdc,
+    Snapshot,
+}
+
+impl StreamKind {
+    fn prefix(self) -> &'static str {
+        match self {
+            StreamKind::Cdc => ephpm_cluster::stream_type::CDC_PREFIX,
+            StreamKind::Snapshot => ephpm_cluster::stream_type::SNAPSHOT_PREFIX,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            StreamKind::Cdc => "cdc",
+            StreamKind::Snapshot => "snapshot",
+        }
+    }
+}
+
+/// Spawn one owner-side per-site handler for `kind`, routing every site
+/// under its prefix. Each inbound stream is gated on HRW ownership of the
+/// parsed site before this node's (owner) mgmt factory is resolved and the
+/// generic serve function is driven.
+fn spawn_per_site_stream_handler(
+    channel: &ephpm_cluster::ChannelHandle,
+    cluster: Arc<ephpm_cluster::ClusterHandle>,
+    self_id: String,
+    mgmt: SiteMgmtRegistry,
+    kind: StreamKind,
+    handles: &mut Vec<tokio::task::JoinHandle<()>>,
+) {
+    let mut streams = channel.register_prefix(kind.prefix());
+    handles.push(tokio::spawn(async move {
+        while let Some(incoming) = streams.recv().await {
+            let IncomingStream { stream, peer, stream_type } = incoming;
+            let Some(site) = site_from_stream(&stream_type, kind.prefix()) else {
+                tracing::warn!(
+                    peer = %peer,
+                    stream = %stream_type,
+                    "per-site {}: unparseable or invalid site key; dropping stream",
+                    kind.label()
+                );
+                continue;
+            };
+            let cluster = Arc::clone(&cluster);
+            let mgmt = mgmt.clone();
+            let self_id = self_id.clone();
+            tokio::spawn(async move {
+                if !is_site_owner(&cluster, &self_id, &site).await {
+                    cdc_metrics::record_stream_refused(kind.label());
+                    tracing::warn!(
+                        peer = %peer,
+                        site = %site,
+                        "per-site {}: not this site's HRW owner; refusing (peer is chasing a \
+                         stale owner and will retry)",
+                        kind.label()
+                    );
+                    return;
+                }
+                let site_mgmt = match mgmt.ensure(&site).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(site = %site, "per-site {}: cannot open mgmt factory: {e:#}", kind.label());
+                        return;
+                    }
+                };
+                match kind {
+                    StreamKind::Cdc => {
+                        if let Err(e) =
+                            serve_subscriber(stream, &site_mgmt.factory, &site_mgmt.log_id).await
+                        {
+                            tracing::info!(peer = %peer, site = %site, "per-site CDC subscriber disconnected: {e:#}");
+                        }
+                    }
+                    StreamKind::Snapshot => match serve_snapshot(stream, &site_mgmt.factory, &site_mgmt.log_id).await {
+                        Ok(n) => tracing::info!(peer = %peer, site = %site, watermark = n, "served per-site snapshot bootstrap"),
+                        Err(e) => tracing::warn!(peer = %peer, site = %site, "per-site snapshot bootstrap failed: {e:#}"),
+                    },
+                }
+            });
+        }
+    }));
+}
+
+/// Start a per-site replication driver for `site` unless one is already
+/// running. Detached (the working set is dynamic, so these do not live in
+/// the startup `handles` vec); the driver removes itself from `drivers` when
+/// it exits so a later open-event can restart it.
+fn ensure_site_driver(
+    drivers: &Arc<DashMap<String, ()>>,
+    site: String,
+    cluster: &Arc<ephpm_cluster::ClusterHandle>,
+    channel: &ephpm_cluster::ChannelHandle,
+    channel_advertise: SocketAddr,
+    mgmt: &SiteMgmtRegistry,
+    max_snapshot_bytes: u64,
+) {
+    if !crate::router::is_valid_site_key(&site) {
+        return;
+    }
+    // Atomic check-and-mark: hold the shard entry across the insert so the
+    // startup scan and the live event stream cannot both start a driver.
+    match drivers.entry(site.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(_) => return,
+        dashmap::mapref::entry::Entry::Vacant(v) => {
+            v.insert(());
+        }
+    }
+
+    let cluster = Arc::clone(cluster);
+    let channel = channel.clone();
+    let mgmt = mgmt.clone();
+    let drivers = Arc::clone(drivers);
+    tokio::spawn(async move {
+        if let Err(e) = run_site_replication(
+            site.clone(),
+            cluster,
+            channel,
+            channel_advertise,
+            mgmt,
+            max_snapshot_bytes,
+        )
+        .await
+        {
+            tracing::warn!(site = %site, "per-site replication driver exited: {e:#}");
+        }
+        // Allow a future open-event to restart the driver for this site.
+        drivers.remove(&site);
+    });
+}
+
+/// The per-site replication driver: run a per-site election for `site` and,
+/// whenever this node is a *replica* of it, cold-bootstrap (if empty) then
+/// tail `cdc/<site>` from the current owner. When this node *owns* the site
+/// the owner-side handlers serve replicas and this driver only keeps the
+/// election's address claim published (via the election task) — there is
+/// nothing to drive until the role changes.
+///
+/// # Errors
+///
+/// Returns an error only on a *permanent* failure to open the site's mgmt
+/// factory (a transient `database is locked` is retried indefinitely). Stream
+/// failures are retried internally.
+async fn run_site_replication(
+    site: String,
+    cluster: Arc<ephpm_cluster::ClusterHandle>,
+    channel: ephpm_cluster::ChannelHandle,
+    channel_advertise: SocketAddr,
+    mgmt: SiteMgmtRegistry,
+    max_snapshot_bytes: u64,
+) -> anyhow::Result<()> {
+    // Open the mgmt factory with retry: a first-open write-lock race with the
+    // cdc-on wire factory must not kill the driver permanently (Bug 1).
+    let site_mgmt = acquire_site_mgmt(&mgmt, &site)
+        .await
+        .with_context(|| format!("open mgmt for site {site}"))?;
+
+    // Per-site election: publishes THIS node's channel address as owner while
+    // it is the site's HRW owner (so replicas can dial it), and names the
+    // owner otherwise.
+    let election = ephpm_cluster::SqliteElection::new_per_site(
+        Arc::clone(&cluster),
+        channel_advertise.to_string(),
+        site_mgmt.log_id.clone(),
+        site.clone(),
+    );
+    let mut role_rx = election.watch_role();
+    let _ = election.determine_initial_role().await;
+    tokio::spawn(election.run());
+
+    tracing::info!(site = %site, "per-site replication driver started");
+
+    // Set after a tail fails because the replica holds divergent local state:
+    // the next attempt discards local tables and re-bootstraps clean (Bug 2 —
+    // "replica is authoritative-from-owner"). Cleared on any clean attempt or
+    // role change.
+    let mut force_reset = false;
+
+    loop {
+        let role = role_rx.borrow().clone();
+        match role {
+            ElectedRole::Primary => {
+                // We own this site; owner-side handlers serve replicas.
+                // Nothing to drive until the role changes.
+                force_reset = false;
+                if role_rx.changed().await.is_err() {
+                    return Ok(());
+                }
+            }
+            ElectedRole::Replica { primary_grpc_url } if !primary_grpc_url.is_empty() => {
+                let owner = match parse_primary_addr(&primary_grpc_url) {
+                    Ok(addr) => addr,
+                    Err(e) => {
+                        tracing::warn!(site = %site, "per-site replica: owner address unusable: {e:#}");
+                        if role_rx.changed().await.is_err() {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
+                // One dial+tail attempt, interruptible by a role change (a
+                // failover re-homes this site to a different owner).
+                tokio::select! {
+                    biased;
+                    changed = role_rx.changed() => {
+                        // A failover re-homes the site; drop any reset intent.
+                        force_reset = false;
+                        if changed.is_err() {
+                            return Ok(());
+                        }
+                    }
+                    res = replicate_site_once(&site, owner, &channel, &site_mgmt.factory, max_snapshot_bytes, force_reset) => {
+                        match res {
+                            Ok(()) => force_reset = false,
+                            Err(e) if is_schema_collision_error(&e) => {
+                                // Divergence: the replica holds a local-origin
+                                // object the owner's CDC batch collides with.
+                                // Force a clean re-bootstrap next attempt rather
+                                // than wedge the apply loop forever.
+                                tracing::warn!(
+                                    site = %site,
+                                    owner = %owner,
+                                    "per-site replica holds divergent local state; discarding it \
+                                     and re-bootstrapping from the owner: {e:#}"
+                                );
+                                force_reset = true;
+                                tokio::time::sleep(REPLICA_RECONNECT_DELAY).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(site = %site, owner = %owner, "per-site replica stream error: {e:#}");
+                                tokio::time::sleep(REPLICA_RECONNECT_DELAY).await;
+                            }
+                        }
+                    }
+                }
+            }
+            ElectedRole::Replica { .. } => {
+                // Owner not resolved yet — wait for the election to name one.
+                if role_rx.changed().await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// One replica attempt for `site`: (re-)bootstrap from the owner when needed,
+/// then tail `cdc/<site>` and apply until the stream ends.
+///
+/// A replica is **authoritative-from-owner**. It bootstraps from the owner's
+/// snapshot — which seeds the watermark to the owner's head, so the subsequent
+/// tail resumes *past* the schema DDL and never replays a colliding
+/// `CREATE TABLE` — whenever any of these hold:
+///
+/// - `force_reset`: a prior tail collided with divergent local state.
+/// - the local database is cold (fresh replica).
+/// - the local database has tables but **no owner-source record**: its state is
+///   local-origin (a stray non-owner write on this node — the deferred
+///   write-forwarding gap), so it must not be tailed on top of.
+///
+/// When it re-bootstraps a non-cold database it first **discards the local
+/// user tables** so the owner's snapshot applies clean. This is the fix for a
+/// replica that had written its own `markers` table before the owner's CDC
+/// batch tried to `CREATE` it — which used to wedge the apply loop forever.
+async fn replicate_site_once(
+    site: &str,
+    owner: SocketAddr,
+    channel: &ephpm_cluster::ChannelHandle,
+    factory: &Turso,
+    max_snapshot_bytes: u64,
+    force_reset: bool,
+) -> anyhow::Result<()> {
+    let conn = factory.raw_connection().context("per-site replica: open apply connection")?;
+
+    let cold = local_db_is_cold(&conn).await.context("per-site replica: cold-start check")?;
+    // A recorded source log means a prior bootstrap seeded this database from
+    // an owner; its absence on a non-cold database means local-origin (diverged)
+    // state.
+    let has_owner_source = read_single_text(&conn, SOURCE_LOG_TABLE, "log_id")
+        .await
+        .context("per-site replica: read owner-source record")?
+        .is_some();
+
+    if force_reset || cold || !has_owner_source {
+        if !cold {
+            reset_local_user_tables(&conn)
+                .await
+                .context("per-site replica: discard divergent local tables")?;
+        }
+        let bconn =
+            factory.raw_connection().context("per-site replica: open snapshot connection")?;
+        fetch_and_apply_snapshot_on(
+            &bconn,
+            owner,
+            channel,
+            max_snapshot_bytes,
+            &snapshot_stream_type(site),
+        )
+        .await
+        .with_context(|| format!("per-site snapshot bootstrap for {site}"))?;
+    }
+
+    let mut stream = channel
+        .dial(owner, &cdc_stream_type(site))
+        .await
+        .with_context(|| format!("per-site replica: dial {owner} for {site}"))?;
+    subscribe_and_consume(&mut stream, &conn).await
+}
+
+/// User (non-bookkeeping) table names in a local database — the same predicate
+/// [`local_db_is_cold`] counts: excludes `sqlite_*`, `__`-prefixed bookkeeping
+/// (log id / watermark / source), and `turso_cdc`.
+async fn list_user_tables(conn: &turso::Connection) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT name FROM sqlite_schema \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' \
+             AND name NOT LIKE '\\_\\_%' ESCAPE '\\' \
+             AND name != 'turso_cdc'",
+        )
+        .await
+        .context("list user tables: prepare")?;
+    let mut rows = stmt.query(()).await.context("list user tables: query")?;
+    let mut names = Vec::new();
+    while let Some(row) = rows.next().await.context("list user tables: next")? {
+        if let turso::Value::Text(name) = row.get_value(0).context("list user tables: value")? {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
+/// Drop every user table in a diverged replica so the owner's snapshot can be
+/// applied clean. Bookkeeping tables (`__ephpm_cdc_*`, the litewire watermark,
+/// `turso_cdc`) are left alone — the snapshot re-seeds the watermark/source
+/// records, and `turso_cdc` is engine-managed capture. Runs on the mgmt
+/// connection (capture off), so the drops are never captured.
+async fn reset_local_user_tables(conn: &turso::Connection) -> anyhow::Result<()> {
+    let tables = list_user_tables(conn).await?;
+    for table in &tables {
+        conn.execute(&format!("DROP TABLE IF EXISTS {}", quote_ident(table)), ())
+            .await
+            .with_context(|| format!("reset diverged replica: drop table {table}"))?;
+    }
+    if !tables.is_empty() {
+        tracing::warn!(
+            dropped = tables.len(),
+            "per-site replica: discarded local-origin tables before re-bootstrapping from the \
+             owner (replica is authoritative-from-owner)"
+        );
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests.
 // ---------------------------------------------------------------------------
 
@@ -2607,10 +3393,18 @@ mod tests {
 
     #[test]
     fn snapshot_stream_type_matches_registry_prefix() {
+        let snapshot = snapshot_stream_type(DEFAULT_SITE);
+        assert_eq!(snapshot, "snapshot/default");
         assert!(
-            SNAPSHOT_STREAM_TYPE.starts_with(ephpm_cluster::stream_type::SNAPSHOT_PREFIX),
-            "snapshot stream type {SNAPSHOT_STREAM_TYPE:?} must live under the {:?} prefix",
+            snapshot.starts_with(ephpm_cluster::stream_type::SNAPSHOT_PREFIX),
+            "snapshot stream type {snapshot:?} must live under the {:?} prefix",
             ephpm_cluster::stream_type::SNAPSHOT_PREFIX
+        );
+        // Per-site stream names live under the same prefix so one owner-side
+        // `register_prefix("snapshot/")` handler routes every site.
+        assert!(
+            snapshot_stream_type("blog.example.com")
+                .starts_with(ephpm_cluster::stream_type::SNAPSHOT_PREFIX)
         );
     }
 
@@ -2819,12 +3613,121 @@ mod tests {
     /// The `cdc/` prefix constant this module uses matches the well-known
     /// prefix registered on the cluster channel side.
     #[test]
-    fn cdc_stream_type_matches_registry_prefix() {
+    fn site_from_stream_parses_and_validates() {
+        // Valid site under each prefix.
+        assert_eq!(
+            site_from_stream("cdc/blog.example.com", ephpm_cluster::stream_type::CDC_PREFIX)
+                .as_deref(),
+            Some("blog.example.com")
+        );
+        assert_eq!(
+            site_from_stream(
+                "snapshot/shop.example.com",
+                ephpm_cluster::stream_type::SNAPSHOT_PREFIX
+            )
+            .as_deref(),
+            Some("shop.example.com")
+        );
+        // Wrong prefix, empty site, and traversal-shaped keys are all rejected
+        // so a stream can never name anything but a valid site.
+        assert!(site_from_stream("cdc/", ephpm_cluster::stream_type::CDC_PREFIX).is_none());
         assert!(
-            CDC_STREAM_TYPE.starts_with(ephpm_cluster::stream_type::CDC_PREFIX),
-            "CDC stream type {CDC_STREAM_TYPE:?} must live under the {:?} prefix so the \
+            site_from_stream("snapshot/x", ephpm_cluster::stream_type::CDC_PREFIX).is_none(),
+            "a snapshot stream must not match the cdc prefix"
+        );
+        assert!(
+            site_from_stream("cdc/../etc/passwd", ephpm_cluster::stream_type::CDC_PREFIX).is_none()
+        );
+        assert!(site_from_stream("cdc/a/b", ephpm_cluster::stream_type::CDC_PREFIX).is_none());
+    }
+
+    #[test]
+    fn scan_existing_sites_finds_db_files_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        std::fs::write(dir.join("blog.example.com.db"), b"").unwrap();
+        std::fs::write(dir.join("shop.example.com.db"), b"").unwrap();
+        // Sidecars and non-db files are ignored.
+        std::fs::write(dir.join("blog.example.com.db-wal"), b"").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"").unwrap();
+        // A file whose stem is not a valid site key is ignored.
+        std::fs::write(dir.join("bad key.db"), b"").unwrap();
+
+        let mut sites = scan_existing_sites(dir);
+        sites.sort();
+        assert_eq!(sites, vec!["blog.example.com".to_string(), "shop.example.com".to_string()]);
+
+        // A missing directory yields an empty set, not an error.
+        assert!(scan_existing_sites(&dir.join("does-not-exist")).is_empty());
+    }
+
+    #[test]
+    fn error_classifiers_match_the_live_messages() {
+        // The exact messages from the live 3-node cluster.
+        let locked = anyhow::anyhow!(
+            "establish CDC log identity for site site-a: cdc: create log-id table: \
+             database is locked"
+        );
+        let collide = anyhow::anyhow!(
+            "CDC apply_batch failed at change_id 2: SQLite error: Parse error: \
+             table markers already exists"
+        );
+        assert!(is_locked_error(&locked));
+        assert!(is_schema_collision_error(&collide));
+        // Neither classifier fires on the other's message or an unrelated one.
+        assert!(!is_schema_collision_error(&locked));
+        assert!(!is_locked_error(&collide));
+        let unrelated = anyhow::anyhow!("connection refused");
+        assert!(!is_locked_error(&unrelated));
+        assert!(!is_schema_collision_error(&unrelated));
+    }
+
+    /// The Bug 2 fix core: discarding a diverged replica's local state drops
+    /// its user tables while leaving the CDC bookkeeping intact, so the owner's
+    /// snapshot (plain `CREATE TABLE`) then applies clean.
+    #[tokio::test]
+    async fn reset_discards_user_tables_but_keeps_bookkeeping() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        let t = Turso::open(&path).await.unwrap();
+        let conn = t.raw_connection().unwrap();
+
+        // A local-origin user table (a stray non-owner write) + bookkeeping.
+        conn.execute("CREATE TABLE markers (id INTEGER PRIMARY KEY, v TEXT)", ()).await.unwrap();
+        conn.execute("INSERT INTO markers (v) VALUES ('local')", ()).await.unwrap();
+        ensure_log_id(&conn).await.unwrap();
+        seed_watermark(&conn, 7).await.unwrap();
+
+        assert_eq!(
+            list_user_tables(&conn).await.unwrap(),
+            vec!["markers".to_string()],
+            "only the user table is listed, not the __-prefixed bookkeeping"
+        );
+
+        reset_local_user_tables(&conn).await.unwrap();
+
+        assert!(list_user_tables(&conn).await.unwrap().is_empty(), "user tables dropped");
+        // Bookkeeping survives, so the fresh bootstrap's re-seed is coherent.
+        assert!(read_single_text(&conn, LOG_ID_TABLE, "log_id").await.unwrap().is_some());
+        assert_eq!(read_watermark(&conn).await.unwrap(), 7);
+
+        // And the owner's schema DDL now applies clean where it used to collide.
+        conn.execute("CREATE TABLE markers (id INTEGER PRIMARY KEY, v TEXT)", ()).await.unwrap();
+    }
+
+    #[test]
+    fn cdc_stream_type_matches_registry_prefix() {
+        let cdc = cdc_stream_type(DEFAULT_SITE);
+        assert_eq!(cdc, "cdc/default");
+        assert!(
+            cdc.starts_with(ephpm_cluster::stream_type::CDC_PREFIX),
+            "CDC stream type {cdc:?} must live under the {:?} prefix so the \
              cluster channel dispatch table stays coherent",
             ephpm_cluster::stream_type::CDC_PREFIX
+        );
+        // A per-site stream name routes through the same prefix handler.
+        assert!(
+            cdc_stream_type("shop.example.com").starts_with(ephpm_cluster::stream_type::CDC_PREFIX)
         );
     }
 

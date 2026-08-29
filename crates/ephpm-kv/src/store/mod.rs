@@ -296,6 +296,76 @@ impl Store {
         self.replicator.read().ok().and_then(|g| g.clone())
     }
 
+    /// Publish `key`'s **current** value through the installed [`Replicator`],
+    /// after a read-modify-write op has already applied it locally.
+    ///
+    /// # Why this exists
+    ///
+    /// [`Store::set`] / [`Store::remove`] / [`Store::expire`] can hand the
+    /// caller's intent straight to the replicator, because the intent *is* the
+    /// new state. The read-modify-write ops cannot: `incr`, `set_nx` and
+    /// `append` only know the resulting value *after* they have taken the shard
+    /// lock and applied it. Before this helper they simply skipped replication
+    /// entirely — a mutation that changed the local map and was never broadcast.
+    ///
+    /// That was a **silent divergence bug on every keyspace, global included**:
+    /// an `INCR`ed counter (`ephpm_kv_incr`) advanced on the writing node and
+    /// stayed frozen on every peer forever, with no warning logged. It is what
+    /// made per-vhost `switchboard:gen` read `1` on node-1 and `0` on nodes 2/3
+    /// indefinitely.
+    ///
+    /// # Semantics, honestly stated
+    ///
+    /// The result is replicated as a **SET of the resulting value**, not as the
+    /// operation. Replication therefore stays last-arrival-wins, exactly like
+    /// every other write in this tier — it is *not* a CRDT counter and *not* a
+    /// distributed lock:
+    ///
+    /// * Two nodes incrementing the same counter concurrently can lose an
+    ///   update (both publish their own total; the later arrival wins).
+    /// * [`Store::set_nx`] is atomic **per node**; cluster-wide it is
+    ///   last-arrival-wins, so two nodes can both believe they won. Do not
+    ///   build cross-node mutual exclusion on it without an external fence.
+    ///
+    /// Both are strictly better than the previous behaviour (no replication at
+    /// all, so peers never converged), and both are documented rather than
+    /// implied. True cross-node atomic counters/locks need a consensus tier,
+    /// which this KV deliberately is not.
+    fn replicate_current(&self, key: &str) {
+        let Some(rep) = self.active_replicator() else {
+            return;
+        };
+        // Read back what we just wrote. `get` transparently decompresses, so
+        // the replicated bytes are the logical value, not the stored encoding.
+        let Some(value) = self.get(key) else {
+            // The entry expired between the mutation and this read. Nothing to
+            // publish, and the peers' own lazy expiry will converge them.
+            tracing::debug!(key, "replicate: key vanished before publish; nothing to broadcast");
+            return;
+        };
+        // Preserve the remaining TTL so peers land on the same expiry rather
+        // than resurrecting the key as immortal.
+        let ttl = match self.pttl(key) {
+            // Positive remaining lifetime: carry it across.
+            Some(ms) if ms > 0 => Some(Duration::from_millis(ms.unsigned_abs())),
+            // `-1` = the key genuinely has no expiry; replicate it immortal.
+            Some(-1) => None,
+            // `0` (a sub-millisecond remainder, truncated by `pttl`) or `-2`
+            // (it expired between the mutation and this read). Publishing
+            // either as `None` would resurrect a key that is already dying —
+            // e.g. a fixed-window rate-limit counter incremented in the last
+            // millisecond of its window would become permanently immortal on
+            // every node and never reset. Skip the broadcast instead; peers
+            // converge via their own lazy expiry.
+            _ => {
+                tracing::debug!(key, "replicate: key at or past its expiry; not broadcasting");
+                return;
+            }
+        };
+        tracing::trace!(key, bytes = value.len(), has_ttl = ttl.is_some(), "replicate: publishing");
+        rep.replicate_set(key.to_string(), value.to_vec(), ttl);
+    }
+
     /// Current time as nanoseconds since the store anchor. Used for
     /// `AtomicU64`-based LRU timestamps on entries.
     #[inline]
@@ -684,6 +754,9 @@ impl Store {
             }
             // Wake any waiters — the insert is visible at this point.
             self.notify_write(&key_ref);
+            // Broadcast the winning value. Per-node atomic, cluster-wide
+            // last-arrival-wins — see `replicate_current`.
+            self.replicate_current(&key_ref);
         }
         inserted
     }
@@ -773,6 +846,9 @@ impl Store {
                 // Key no longer has a TTL — drop from the side index so
                 // `expire_pass` doesn't waste a lookup on it.
                 self.ttl_keys.remove(key);
+                // Re-broadcast the value with no expiry, so peers drop their
+                // TTL too instead of expiring a key this node made permanent.
+                self.replicate_current(key);
             }
             had_ttl
         } else {
@@ -928,6 +1004,9 @@ impl Store {
         // Wake any versioned waiters now that the write is visible. Done after
         // the entry guard has been dropped by the `match` arms above.
         self.notify_write(key);
+        // Broadcast the new counter value. Without this an INCR advanced only
+        // on the writing node and every peer stayed frozen forever — silently.
+        self.replicate_current(key);
         Ok(result)
     }
 
@@ -985,6 +1064,9 @@ impl Store {
                 // In-place append — wake waiters (the create path below
                 // notifies via set → set_local).
                 self.notify_write(key);
+                // ...and broadcast the appended-to value; the create path
+                // below replicates via `set`.
+                self.replicate_current(key);
                 return final_len;
             }
         }
@@ -996,10 +1078,44 @@ impl Store {
 
     // ── Hash operations ──────────────────────────────────────────
 
+    /// Warn — **once per process** — that a hash mutation is not replicated.
+    ///
+    /// Hash values live in a separate map and have no representation in the
+    /// [`Replicator`] trait, which is string-valued (`set`/`remove`/`expire`).
+    /// So `HSET`/`HDEL` are node-local even in clustered mode. That is a
+    /// pre-existing limit of the replication tier, not a per-call failure —
+    /// but an operator who assumes "clustered KV" covers hashes needs to be
+    /// told, and silence is how the `INCR` gap survived this long. Warned once
+    /// rather than per call: a hash-heavy workload would otherwise flood the
+    /// log with a message whose content never changes.
+    fn warn_hash_not_replicated(&self, op: &'static str) {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        // Cheap relaxed load FIRST. `active_replicator` takes an `RwLock` and
+        // clones an `Arc`, so checking it first would make every HSET/HDEL pay
+        // a lock acquisition and a contended refcount bump for the entire life
+        // of the process just to decide not to log.
+        if WARNED.load(Ordering::Relaxed) || self.active_replicator().is_none() {
+            return;
+        }
+        if WARNED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        tracing::warn!(
+            op,
+            "hash values are NOT replicated across the cluster: the KV replication tier carries \
+             string keys only (SET/DEL/EXPIRE), so HSET/HDEL stay node-local. Use string keys for \
+             data that must be cluster-visible. This warning is emitted once per process."
+        );
+    }
+
     /// Set a field in a hash. Creates the hash if it doesn't exist.
     ///
     /// Returns `true` if the field was newly inserted, `false` if updated.
+    ///
+    /// **Not replicated** in clustered mode — see
+    /// `warn_hash_not_replicated`.
     pub fn hset(&self, key: &str, field: &str, value: Vec<u8>) -> bool {
+        self.warn_hash_not_replicated("HSET");
         let field_mem = field.len() + value.len() + 64;
         let value = Bytes::from(value);
         let mut entry = self.hashes.entry(key.to_string()).or_insert_with(|| {
@@ -1045,7 +1161,11 @@ impl Store {
     /// Delete a field from a hash.
     ///
     /// Returns `true` if the field existed and was removed.
+    ///
+    /// **Not replicated** in clustered mode — see
+    /// `warn_hash_not_replicated`.
     pub fn hdel(&self, key: &str, field: &str) -> bool {
+        self.warn_hash_not_replicated("HDEL");
         if let Some(mut entry) = self.hashes.get_mut(key) {
             if entry.is_expired() {
                 drop(entry);
@@ -1166,6 +1286,12 @@ impl Store {
     }
 
     /// Remove all keys.
+    /// **Node-local by design.** `flush` is an administrative reset of *this*
+    /// node's map; it deliberately does not broadcast, because replicating it
+    /// would let one node erase the whole cluster's data with a single call
+    /// (and there is no way to scope or undo that). Peers keep their copies,
+    /// and a subsequent replicated write to any flushed key re-materializes it
+    /// here. Flush every node explicitly if a cluster-wide reset is intended.
     pub fn flush(&self) {
         self.data.clear();
         self.hashes.clear();
@@ -2883,6 +3009,108 @@ mod tests {
 
         assert!(s.set_nx("k2".into(), b"v".to_vec(), None));
         assert!(!s.ttl_keys.contains("k2"), "set_nx without TTL must not add the hint");
+    }
+
+    /// **Divergence regression.** Every op that mutates a string key must
+    /// reach the replicator. `incr`/`set_nx`/`append`/`persist` are
+    /// read-modify-write: they used to apply locally and publish *nothing*, so
+    /// on a cluster the writing node advanced and every peer stayed frozen —
+    /// silently, forever. That is what pinned `switchboard:gen` at 0 on two of
+    /// three nodes.
+    ///
+    /// These ops necessarily replicate as a SET of the *resulting* value (see
+    /// `replicate_current`), so the assertion is "the new value was published",
+    /// not "the operation was forwarded".
+    #[test]
+    fn read_modify_write_ops_publish_their_result() {
+        for (name, apply, expected) in [
+            (
+                "incr_by",
+                Box::new(|s: &Store| {
+                    let _ = s.incr_by("k", 1);
+                }) as Box<dyn Fn(&Store)>,
+                b"1".to_vec(),
+            ),
+            (
+                "set_nx",
+                Box::new(|s: &Store| {
+                    s.set_nx("k".into(), b"v".to_vec(), None);
+                }),
+                b"v".to_vec(),
+            ),
+            (
+                "append",
+                Box::new(|s: &Store| {
+                    s.set_local("k".into(), b"ab".to_vec(), None);
+                    s.append("k", b"cd");
+                }),
+                b"abcd".to_vec(),
+            ),
+        ] {
+            let s = test_store();
+            let rep = Arc::new(RecordingReplicator::default());
+            s.set_replicator(Some(Arc::clone(&rep) as Arc<dyn Replicator>));
+
+            apply(&s);
+
+            let sets = rep.sets.lock().unwrap();
+            let published = sets
+                .iter()
+                .find(|(key, _, _)| key == "k")
+                .unwrap_or_else(|| panic!("{name} must publish its result to the replicator"));
+            assert_eq!(published.1, expected, "{name} published the wrong value");
+        }
+    }
+
+    /// A counter's replicated value tracks successive increments, and a
+    /// created-with-TTL counter publishes its remaining expiry rather than
+    /// resurrecting the key as immortal on peers.
+    #[test]
+    fn incr_publishes_running_total_and_preserves_ttl() {
+        let s = test_store();
+        let rep = Arc::new(RecordingReplicator::default());
+        s.set_replicator(Some(Arc::clone(&rep) as Arc<dyn Replicator>));
+
+        // Local map is authoritative for the counter (the hook does not write),
+        // so seed through set_local and increment.
+        assert_eq!(s.incr_by_with_ttl("g", 1, Some(Duration::from_secs(60))).unwrap(), 1);
+        assert_eq!(s.incr_by("g", 1).unwrap(), 2);
+
+        let sets = rep.sets.lock().unwrap();
+        let values: Vec<Vec<u8>> =
+            sets.iter().filter(|(k, _, _)| k == "g").map(|(_, v, _)| v.clone()).collect();
+        assert_eq!(values, vec![b"1".to_vec(), b"2".to_vec()], "each INCR publishes the new total");
+        // The first publish carried the creation TTL.
+        let first_ttl = sets.iter().find(|(k, _, _)| k == "g").map(|(_, _, t)| *t).unwrap();
+        assert!(first_ttl.is_some(), "a TTL'd counter must replicate with its expiry");
+    }
+
+    /// `persist` removes an expiry locally; peers must be told, or they expire
+    /// a key this node made permanent.
+    #[test]
+    fn persist_republishes_without_a_ttl() {
+        let s = test_store();
+        s.set_local("k".into(), b"v".to_vec(), Some(Duration::from_secs(60)));
+        let rep = Arc::new(RecordingReplicator::default());
+        s.set_replicator(Some(Arc::clone(&rep) as Arc<dyn Replicator>));
+
+        assert!(s.persist("k"));
+        let sets = rep.sets.lock().unwrap();
+        let (_, value, ttl) =
+            sets.iter().find(|(k, _, _)| k == "k").expect("persist must republish the key");
+        assert_eq!(value, b"v");
+        assert!(ttl.is_none(), "persist must publish the key with no expiry");
+    }
+
+    /// Nothing is published when no replicator is installed — the single-node
+    /// path stays a pure local write.
+    #[test]
+    fn read_modify_write_ops_are_local_without_a_replicator() {
+        let s = test_store();
+        assert_eq!(s.incr_by("k", 5).unwrap(), 5);
+        assert!(s.set_nx("nx".into(), b"v".to_vec(), None));
+        assert_eq!(s.get("k").as_deref(), Some(&b"5"[..]));
+        assert_eq!(s.get("nx").as_deref(), Some(&b"v"[..]));
     }
 
     #[test]

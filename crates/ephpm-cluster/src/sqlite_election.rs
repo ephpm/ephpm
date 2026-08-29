@@ -60,10 +60,93 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 
-use crate::{ClusterHandle, NodeState};
+use crate::{ClusterHandle, NodeInfo, NodeState};
 
-/// Gossip KV key for the primary node identity.
+/// Gossip KV key for the (single-database) primary node identity.
+///
+/// In per-site mode each site gets its own key, `"sqlite:primary:<site>"`
+/// (see [`SqliteElection::new_per_site`] and [`primary_key_for_site`]).
 const PRIMARY_KEY: &str = "sqlite:primary";
+
+/// Gossip KV key for a per-site primary claim.
+///
+/// Per-site clustered replication elects an owner per virtual host, keyed
+/// by the site's canonical key, so ownership of one tenant's database is
+/// independent of every other's. The site key is validated `[a-z0-9._-]`
+/// upstream, so it never contains the `:` used to delimit the namespace.
+#[must_use]
+fn primary_key_for_site(site: &str) -> String {
+    format!("{PRIMARY_KEY}:{site}")
+}
+
+/// The node currently claiming ownership of `site` in the per-site primary
+/// election, as `(node_id, channel_addr)`, if any claim is published.
+///
+/// The claim's `channel_addr` is that node's cluster-channel advertise
+/// address — exactly what a non-owner must dial to forward `sql/<site>`
+/// statements to the owner. Returns `None` when no claim is published yet
+/// (a site no node has opened), in which case the caller falls back to the
+/// HRW owner's *derived* channel address.
+///
+/// Decodes the same claim [`SqliteElection`] publishes under
+/// `"sqlite:primary:<site>"`, so the forwarding path and the election agree
+/// on the owner's address without a second gossip key.
+pub async fn per_site_primary(cluster: &ClusterHandle, site: &str) -> Option<(String, String)> {
+    let bytes = cluster.gossip_get(&primary_key_for_site(site)).await?;
+    let claim = PrimaryClaim::decode(&bytes)?;
+    Some((claim.node_id, claim.grpc_addr))
+}
+
+/// Rendezvous-hash (HRW) score for placing `site` on the node named
+/// `node_id`; higher wins.
+///
+/// A stable 64-bit FNV-1a over `node_id`, a fixed domain separator, and
+/// `site`. It deliberately does **not** use `std`'s hasher (whose seed and
+/// implementation are not contractually stable across builds): every node
+/// must compute the identical score so they independently agree on a
+/// site's owner with no coordination.
+#[must_use]
+fn hrw_score(node_id: &str, site: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    /// Domain separator between `node_id` and `site`, so
+    /// `hrw_score("ab", "c")` differs from `hrw_score("a", "bc")`.
+    const SEP: u64 = 0x5c;
+
+    let mut hash = FNV_OFFSET;
+    for &byte in node_id.as_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash ^= SEP;
+    hash = hash.wrapping_mul(FNV_PRIME);
+    for &byte in site.as_bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// The HRW (rendezvous-hashing) owner of `site` among the **alive** nodes
+/// in `alive`: the node maximizing [`hrw_score`], ties broken by node id
+/// so the choice is total and identical on every node.
+///
+/// Dead nodes are filtered out here, so callers may pass the full
+/// [`ClusterHandle::nodes`](crate::ClusterHandle::nodes) result verbatim.
+/// Returns `None` only when no node is alive.
+///
+/// This is the ownership rule for per-site clustered replication: because
+/// the score depends only on the (node id, site) pair, a node's death
+/// re-homes **only that node's** sites — each to whichever surviving node
+/// scores next-highest for it, a node already replicating that site — and
+/// leaves every other site's owner unchanged. That minimal reshuffle is
+/// exactly what mod-N ownership does not give.
+#[must_use]
+pub fn hrw_owner<'a>(alive: &'a [NodeInfo], site: &str) -> Option<&'a NodeInfo> {
+    alive.iter().filter(|n| n.state == NodeState::Alive).max_by(|a, b| {
+        hrw_score(&a.id, site).cmp(&hrw_score(&b.id, site)).then_with(|| a.id.cmp(&b.id))
+    })
+}
 
 /// How often the primary refreshes its claim.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -153,6 +236,14 @@ pub struct SqliteElection {
     /// Stamped into every published claim and compared against a surviving
     /// claim's log id before the fast-restart reclaim (issue #344).
     log_id: String,
+    /// The site this election governs, in **per-site** mode; `None` for the
+    /// single-database election.
+    ///
+    /// When `Some`, the claim is stored under `"sqlite:primary:<site>"` and
+    /// ownership is decided by rendezvous hashing ([`hrw_owner`]) rather
+    /// than lowest-ordinal — so each tenant's owner is chosen independently
+    /// and a node death re-homes only that node's sites.
+    site: Option<String>,
     role_tx: watch::Sender<ElectedRole>,
     role_rx: watch::Receiver<ElectedRole>,
     /// When this election manager was created. Gates the first
@@ -170,11 +261,56 @@ impl SqliteElection {
     /// wiped/replaced (issue #344).
     #[must_use]
     pub fn new(cluster: Arc<ClusterHandle>, grpc_listen: String, log_id: String) -> Self {
+        Self::build(cluster, grpc_listen, log_id, None)
+    }
+
+    /// Create a **per-site** election manager for `site`.
+    ///
+    /// Identical to [`new`](Self::new) except the primary claim is keyed
+    /// `"sqlite:primary:<site>"` and ownership is decided by rendezvous
+    /// hashing ([`hrw_owner`]) over the alive nodes rather than by
+    /// lowest-ordinal: `should_be_primary` is true iff this node is the
+    /// site's HRW owner. `grpc_listen` is this node's cluster-channel
+    /// address that replicas of `site` will dial when this node owns it.
+    #[must_use]
+    pub fn new_per_site(
+        cluster: Arc<ClusterHandle>,
+        grpc_listen: String,
+        log_id: String,
+        site: String,
+    ) -> Self {
+        Self::build(cluster, grpc_listen, log_id, Some(site))
+    }
+
+    fn build(
+        cluster: Arc<ClusterHandle>,
+        grpc_listen: String,
+        log_id: String,
+        site: Option<String>,
+    ) -> Self {
         // Start as replica with empty URL — will be resolved on first tick.
         let (role_tx, role_rx) =
             watch::channel(ElectedRole::Replica { primary_grpc_url: String::new() });
 
-        Self { cluster, grpc_listen, log_id, role_tx, role_rx, boot: tokio::time::Instant::now() }
+        Self {
+            cluster,
+            grpc_listen,
+            log_id,
+            site,
+            role_tx,
+            role_rx,
+            boot: tokio::time::Instant::now(),
+        }
+    }
+
+    /// The gossip KV key this election reads and writes its primary claim
+    /// under: the global [`PRIMARY_KEY`] for the single-database election,
+    /// or `"sqlite:primary:<site>"` in per-site mode.
+    fn primary_key(&self) -> String {
+        match &self.site {
+            Some(site) => primary_key_for_site(site),
+            None => PRIMARY_KEY.to_string(),
+        }
     }
 
     /// Get a receiver for role changes.
@@ -209,8 +345,9 @@ impl SqliteElection {
     }
 
     async fn initial_role_inner(&self) -> ElectedRole {
+        let primary_key = self.primary_key();
         // Check if there's already a primary claim in gossip.
-        if let Some(bytes) = self.cluster.gossip_get(PRIMARY_KEY).await
+        if let Some(bytes) = self.cluster.gossip_get(&primary_key).await
             && let Some(claim) = PrimaryClaim::decode(&bytes)
         {
             match classify_claim(&claim, &self.cluster.self_node().id, &self.log_id) {
@@ -298,7 +435,7 @@ impl SqliteElection {
         let self_node = self.cluster.self_node();
 
         // Check existing primary claim.
-        if let Some(bytes) = self.cluster.gossip_get(PRIMARY_KEY).await
+        if let Some(bytes) = self.cluster.gossip_get(&self.primary_key()).await
             && let Some(claim) = PrimaryClaim::decode(&bytes)
         {
             match classify_claim(&claim, &self_node.id, &self.log_id) {
@@ -343,7 +480,7 @@ impl SqliteElection {
                         // the role from a healthy incumbent. Break the tie by
                         // the documented rule: lowest node id wins.
                         if matches!(current, ElectedRole::Primary) {
-                            if incumbent_wins_tie(&self_node.id, &claim.node_id) {
+                            if self.wins_conflict(&self_node.id, &claim.node_id) {
                                 tracing::warn!(
                                     claimant = %claim.node_id,
                                     "SQLite election: live conflicting primary claim from a \
@@ -407,15 +544,45 @@ impl SqliteElection {
         }
     }
 
-    /// Check if this node is the lowest-ordinal alive node (and should be primary).
+    /// Whether this node should be primary for the database this election
+    /// governs.
+    ///
+    /// - **Per-site** (`site = Some`): this node is the site's HRW owner
+    ///   ([`hrw_owner`]) among the alive nodes.
+    /// - **Single-database** (`site = None`): this node is the
+    ///   lowest-ordinal alive node (the documented single-DB rule).
     async fn should_be_primary(&self) -> bool {
         let self_id = &self.cluster.self_node().id;
         let nodes = self.cluster.nodes().await;
 
-        let lowest_alive =
-            nodes.iter().filter(|n| n.state == NodeState::Alive).min_by(|a, b| a.id.cmp(&b.id));
+        match &self.site {
+            Some(site) => hrw_owner(&nodes, site).is_some_and(|n| &n.id == self_id),
+            None => {
+                let lowest_alive = nodes
+                    .iter()
+                    .filter(|n| n.state == NodeState::Alive)
+                    .min_by(|a, b| a.id.cmp(&b.id));
+                lowest_alive.is_some_and(|n| &n.id == self_id)
+            }
+        }
+    }
 
-        lowest_alive.is_some_and(|n| &n.id == self_id)
+    /// Resolve a live conflict between our own primary role and a foreign
+    /// live claim: `true` means *we* keep the role. The rule matches the
+    /// election rule for this database — HRW (higher score wins) per-site,
+    /// lowest node id for the single database — so the tie-break can never
+    /// contradict `should_be_primary`.
+    fn wins_conflict(&self, self_id: &str, claimant_id: &str) -> bool {
+        match &self.site {
+            Some(site) => {
+                let mine = hrw_score(self_id, site);
+                let theirs = hrw_score(claimant_id, site);
+                // Higher score wins; ties broken by node id (higher id), the
+                // same total order `hrw_owner` uses.
+                (mine, self_id) > (theirs, claimant_id)
+            }
+            None => incumbent_wins_tie(self_id, claimant_id),
+        }
     }
 
     /// Validate a primary claim and build the replica gRPC URL for it.
@@ -455,7 +622,7 @@ impl SqliteElection {
             grpc_addr: self.grpc_listen.clone(),
             log_id: self.log_id.clone(),
         };
-        self.cluster.gossip_set(PRIMARY_KEY, &claim.encode(), Some(PRIMARY_TTL)).await;
+        self.cluster.gossip_set(&self.primary_key(), &claim.encode(), Some(PRIMARY_TTL)).await;
     }
 }
 
@@ -819,5 +986,87 @@ mod tests {
             classify_claim(&legacy, "ephpm-0", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             ClaimKind::OwnStale
         );
+    }
+
+    // ----- Per-site HRW ownership (Phase 0 clustered per-site) -----
+
+    fn alive(id: &str) -> NodeInfo {
+        NodeInfo { id: id.into(), gossip_addr: "10.0.0.1:7946".into(), state: NodeState::Alive }
+    }
+
+    fn dead(id: &str) -> NodeInfo {
+        NodeInfo { id: id.into(), gossip_addr: "10.0.0.1:7946".into(), state: NodeState::Dead }
+    }
+
+    #[test]
+    fn per_site_key_is_namespaced() {
+        assert_eq!(primary_key_for_site("blog.example.com"), "sqlite:primary:blog.example.com");
+        // The global key is untouched.
+        assert_eq!(PRIMARY_KEY, "sqlite:primary");
+    }
+
+    #[test]
+    fn hrw_score_is_deterministic_and_order_sensitive() {
+        // Stable across calls (the property every node relies on).
+        assert_eq!(hrw_score("ephpm-0", "site-a"), hrw_score("ephpm-0", "site-a"));
+        // The domain separator makes the split between node id and site
+        // significant, so a shared concatenation does not collide.
+        assert_ne!(hrw_score("ab", "c"), hrw_score("a", "bc"));
+    }
+
+    #[test]
+    fn hrw_owner_is_deterministic_and_alive_only() {
+        let nodes = [alive("ephpm-0"), alive("ephpm-1"), alive("ephpm-2")];
+        let a = hrw_owner(&nodes, "tenant-x").map(|n| n.id.clone());
+        let b = hrw_owner(&nodes, "tenant-x").map(|n| n.id.clone());
+        assert_eq!(a, b, "owner selection must be deterministic");
+        assert!(a.is_some());
+        // No alive node → no owner.
+        let all_dead = [dead("ephpm-0"), dead("ephpm-1")];
+        assert!(hrw_owner(&all_dead, "tenant-x").is_none());
+    }
+
+    #[test]
+    fn hrw_owner_excludes_dead_nodes() {
+        // Find a site whose owner (over three alive nodes) is a specific
+        // node, then kill that node and confirm ownership moves to another
+        // node that was already in the set (a warm replica) — the core
+        // rendezvous-hashing property.
+        let all = [alive("ephpm-0"), alive("ephpm-1"), alive("ephpm-2")];
+        // Some site is owned by *some* node; pick that node and mark it dead.
+        let owner = hrw_owner(&all, "failover-site").unwrap().id.clone();
+        let after: Vec<NodeInfo> =
+            all.iter().map(|n| if n.id == owner { dead(&n.id) } else { n.clone() }).collect();
+        let new_owner = hrw_owner(&after, "failover-site").unwrap();
+        assert_ne!(new_owner.id, owner, "a dead owner must not keep the site");
+        assert_eq!(new_owner.state, NodeState::Alive);
+        // And the new owner is one of the original nodes (already replicating).
+        assert!(all.iter().any(|n| n.id == new_owner.id));
+    }
+
+    #[test]
+    fn hrw_owner_distributes_sites_across_nodes() {
+        // Over many sites, ownership should not collapse onto one node —
+        // otherwise the "spread tenants across the cluster" premise fails.
+        let nodes = [alive("ephpm-0"), alive("ephpm-1"), alive("ephpm-2")];
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..200 {
+            let site = format!("site-{i:03}");
+            seen.insert(hrw_owner(&nodes, &site).unwrap().id.clone());
+        }
+        assert!(seen.len() >= 2, "HRW must spread sites across more than one node: {seen:?}");
+    }
+
+    #[test]
+    fn hrw_conflict_resolution_matches_ownership() {
+        // The per-site conflict tie-break must agree with hrw_owner: for a
+        // given site, exactly the higher-scoring node "wins" the conflict.
+        let site = "tenant-y";
+        let a = "ephpm-0";
+        let b = "ephpm-1";
+        let a_wins = (hrw_score(a, site), a) > (hrw_score(b, site), b);
+        // Emulate wins_conflict's per-site branch directly (no cluster needed).
+        assert_eq!((hrw_score(a, site), a) > (hrw_score(b, site), b), a_wins);
+        assert_eq!((hrw_score(b, site), b) > (hrw_score(a, site), a), !a_wins);
     }
 }

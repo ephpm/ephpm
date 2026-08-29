@@ -236,6 +236,19 @@ pub mod stream_type {
     /// has registered a handler, the stream is closed like any other
     /// unknown type.
     pub const SNAPSHOT_PREFIX: &str = "snapshot/";
+
+    /// Owner-serves SQL write-forwarding stream, one per vhost / logical
+    /// database.
+    ///
+    /// Wire form: `"sql/<vhost>"`. A node that receives a request for a site
+    /// it does **not** own (per HRW) opens one of these to the site's owner
+    /// and forwards every `ephpm_db_*` statement over it; the owner executes
+    /// each against that site's local database and streams the result back.
+    /// This is what makes writes work on any node (the owner captures the
+    /// write into CDC, which then replicates to every replica). The handler
+    /// is registered by `ephpm-server`'s `sql_forward` module; an unhandled
+    /// type is closed like any other.
+    pub const SQL_PREFIX: &str = "sql/";
 }
 
 // ---------------------------------------------------------------------------

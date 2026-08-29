@@ -1079,7 +1079,13 @@ impl Router {
             // Filled in by `with_alt_svc` once the QUIC endpoint has bound.
             alt_svc: None,
             open_basedir,
-            per_site_db: crate::is_per_site_sqlite(config, config.cluster.enabled),
+            // Per-request tenant-key gate must be true whenever a per-site DB
+            // context exists — the single-node per-site path OR the per-site
+            // *clustered* path (`is_per_site_sqlite` excludes clustered configs
+            // by construction, so it alone would leave every clustered request
+            // with `db = None` → "no per-site database context").
+            per_site_db: crate::is_per_site_sqlite(config, config.cluster.enabled)
+                || crate::is_per_site_clustered(config, config.cluster.enabled),
             multi_tenant_kv,
             store,
             php_etag_cache_config: config.server.php_etag_cache.clone(),

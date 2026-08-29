@@ -19,6 +19,7 @@ pub mod screened_backend;
 pub mod site_backends;
 mod site_overrides;
 pub mod site_wire_auth;
+pub mod sql_forward;
 pub mod static_files;
 pub mod stream_compress;
 pub mod tenant_ebpf;
@@ -193,11 +194,29 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         } else {
             Some(Arc::new(ephpm_cluster::ClusterCipher::for_kv_data_plane(&config.cluster.secret)))
         };
+        // In multi-tenant mode the data plane must route per-site keys into
+        // the owning vhost's store (the large-value counterpart of the gossip
+        // applier's routing); otherwise a tenant's large value would land in
+        // the receiving node's GLOBAL keyspace. Single-keyspace nodes keep the
+        // original listener exactly as before.
+        let data_plane_sites = multi_tenant_kv.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                ephpm_cluster::data_plane::serve(data_plane_store, data_port, data_plane_cipher)
+            let result = match data_plane_sites {
+                Some(sites) => {
+                    ephpm_cluster::data_plane::serve_multi_tenant(
+                        data_plane_store,
+                        sites,
+                        data_port,
+                        data_plane_cipher,
+                    )
                     .await
-            {
+                }
+                None => {
+                    ephpm_cluster::data_plane::serve(data_plane_store, data_port, data_plane_cipher)
+                        .await
+                }
+            };
+            if let Err(e) = result {
                 tracing::error!(%e, "KV data plane error");
             }
         });
@@ -243,13 +262,47 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         );
         kv_store.set_replicator(Some(replicator as Arc<dyn ephpm_kv::store::Replicator>));
 
+        // Per-vhost keyspaces replicate too. Each site's Store is created
+        // lazily (on a request, a RESP AUTH, or an inbound replicated write),
+        // so the replicator is installed by a factory at creation time rather
+        // than up-front — there is no window in which a vhost's writes are
+        // silently node-local. A site replicator namespaces that vhost's keys
+        // on the wire (`site_namespace`) and materializes into that vhost's own
+        // store, so tenant keyspaces stay isolated on every node.
+        if let Some(sites) = &multi_tenant_kv {
+            let factory_clustered = Arc::clone(&clustered);
+            let factory_applied = Arc::clone(&applied);
+            // Captured HERE, in async context, and moved into the factory. The
+            // factory itself runs on a request thread during a site's first
+            // access, where `Handle::current()` would panic off a runtime
+            // thread — and blocking there would stall dispatch.
+            let factory_handle = tokio::runtime::Handle::current();
+            let factory: ephpm_kv::multi_tenant::SiteReplicatorFactory =
+                Arc::new(move |site: &str, store: &Arc<ephpm_kv::store::Store>| {
+                    // Pure construction over the store handed in — the factory
+                    // never resolves a store itself, so it cannot re-enter the
+                    // registry that is mid-creation for this very site.
+                    ephpm_cluster::SiteKvReplicator::new(
+                        Arc::clone(&factory_clustered),
+                        Arc::clone(store),
+                        site,
+                        factory_handle.clone(),
+                        Arc::clone(&factory_applied),
+                    ) as Arc<dyn ephpm_kv::store::Replicator>
+                });
+            sites.set_replicator_factory(Some(factory));
+            tracing::info!("clustered KV replication enabled for per-vhost keyspaces");
+        }
+
         // Materialize REMOTE gossip-tier writes into this node's local
         // Store so raw-store readers (RESP GET, PHP native functions, the
         // OPcache watcher) see cluster writes; the origin node materializes
-        // synchronously inside the replicator.
-        ephpm_cluster::clustered_store::start_gossip_applier(
+        // synchronously inside the replicator. In multi-tenant mode an
+        // enveloped key is routed into its own vhost's store instead.
+        ephpm_cluster::clustered_store::start_gossip_applier_multi_tenant(
             &cluster_handle,
             Arc::clone(&kv_store),
+            multi_tenant_kv.clone(),
             applied,
         )
         .await;
@@ -258,6 +311,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
             small_key_threshold = config.cluster.kv.small_key_threshold,
             replication_factor = config.cluster.kv.replication_factor,
             replication_mode = %config.cluster.kv.replication_mode,
+            per_vhost = multi_tenant_kv.is_some(),
             "clustered KV replicator installed on local Store"
         );
 
@@ -304,7 +358,15 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
     // `Some` also carries the per-site MySQL credentials: the wire listener
     // verifies against them and the router injects them, so both are handed
     // this one value rather than deriving their own.
-    let per_site_wire_auth = wire_per_site_db(&config, &query_stats, cluster_handle.is_some())?;
+    let (per_site_wire_auth, per_site_cluster) = match wire_per_site_db(
+        &config,
+        &query_stats,
+        cluster_handle.as_ref(),
+        channel_handle.as_ref(),
+    )? {
+        Some((auth, cluster_wiring)) => (Some(auth), cluster_wiring),
+        None => (None, None),
+    };
 
     // Upstream health for every configured SQL proxy, built BEFORE the HTTP
     // listeners so `/_ephpm/ready` can never report ready in the window
@@ -399,6 +461,7 @@ pub async fn serve(config: Config, dev_mode: bool) -> anyhow::Result<()> {
         &query_stats,
         &db_health,
         primary_view,
+        per_site_cluster,
     )
     .await?;
     let _per_site_wire_handles = per_site_wire_handles;
@@ -428,7 +491,10 @@ fn resolve_channel_features(config: &Config) -> ephpm_cluster::ChannelFeatureFla
     // Clustered SQLite always replicates over the Turso CDC path as of
     // v0.7.0 (sqld removed), so the channel is needed exactly when the
     // SQLite config resolves to clustered mode. Turso is the only engine,
-    // so there is no engine gate.
+    // so there is no engine gate. Per-site clustered mode
+    // (`is_per_site_clustered`) is a strict subset of `is_clustered_sqlite`,
+    // so it is already covered here — its CDC/snapshot streams ride the same
+    // channel — and needs no separate flag.
     let cdc =
         config.db.sqlite.as_ref().is_some_and(|s| is_clustered_sqlite(s, config.cluster.enabled));
     ephpm_cluster::ChannelFeatureFlags { cdc }
@@ -1873,6 +1939,10 @@ async fn start_db_proxies(
     // flips it on every role change; in every other mode it is left at its
     // constant `true` (a standalone node is trivially writable).
     primary_view: Arc<AtomicBool>,
+    // Per-site clustered replication wiring, built in `serve()` alongside the
+    // registry so the resolver is registered before any request. `Some` only
+    // in per-site clustered mode; consumed by the CDC path below.
+    per_site_cluster: Option<PerSiteClusterWiring>,
 ) -> anyhow::Result<Vec<tokio::task::JoinHandle<()>>> {
     let mut handles = vec![];
 
@@ -2004,7 +2074,28 @@ async fn start_db_proxies(
         validate_sqlite_engine(&sqlite_config.engine)?;
         warn_on_removed_sqlite_knobs(sqlite_config);
 
-        if is_clustered_sqlite(sqlite_config, cluster.is_some()) {
+        if is_per_site_clustered(config, cluster.is_some()) {
+            // Per-site CLUSTERED mode: one replicated Turso database per
+            // virtual host, HRW ownership. Tested BEFORE `is_clustered_sqlite`
+            // because it is strictly more specific (it also satisfies
+            // `is_clustered_sqlite`, which is what already enabled the `cdc`
+            // channel feature for it). The registry + resolver + wire listener
+            // were wired in `serve()`; here we start the replication plane.
+            let wiring = per_site_cluster.context(
+                "per-site clustered mode is active but its replication wiring is missing \
+                 (startup ordering bug: wire_per_site_db should have produced it)",
+            )?;
+            turso_cdc::start_clustered_per_site_turso(
+                sqlite_config,
+                wiring.dir,
+                cluster,
+                channel_handle,
+                wiring.site_events,
+                wiring.registry,
+                &mut handles,
+            )
+            .await?;
+        } else if is_clustered_sqlite(sqlite_config, cluster.is_some()) {
             // Clustered SQLite replicates through the in-process Turso CDC
             // path over the cluster channel — no sqld sidecar. The channel
             // handle is guaranteed Some by `resolve_channel_features` (which
@@ -2101,13 +2192,37 @@ fn is_clustered_sqlite(sqlite_config: &ephpm_config::SqliteConfig, cluster_enabl
 /// shared wire listener), and `Router::new` (which pushes the per-request site
 /// key to the bridge) — so all three agree on when isolation is active.
 ///
-/// Clustered multi-site is intentionally excluded: the Turso CDC path
-/// replicates one database, and per-site isolation for a cluster is a larger
-/// design (see the per-site DB docs). In that configuration the databases are
-/// shared across tenants; `serve()` warns loudly.
+/// Clustered multi-site is intentionally excluded here: with
+/// `[db.sqlite.replication] per_site = false` (the default) all tenants share
+/// the one clustered database and `serve()` warns loudly. The opt-in
+/// per-site *clustered* mode ([`is_per_site_clustered`]) is a separate path —
+/// one replicated database per tenant — and this predicate stays `false` for
+/// it, so the single-node per-site path is never taken for a cluster.
 pub(crate) fn is_per_site_sqlite(config: &Config, cluster_enabled: bool) -> bool {
     config.db.sqlite.as_ref().is_some_and(|s| {
         config.server.sites_dir.is_some() && !is_clustered_sqlite(s, cluster_enabled)
+    })
+}
+
+/// Whether the embedded database runs in **per-site clustered** mode:
+/// `[db.sqlite]` is configured, `[server] sites_dir` is set, the database is
+/// clustered, AND `[db.sqlite.replication] per_site = true`.
+///
+/// This is the opt-in that makes multi-tenant per-site isolation coexist with
+/// clustering: each virtual host gets its own Turso database that *replicates*
+/// across the cluster (HRW ownership), instead of every tenant sharing the one
+/// clustered database (the `per_site = false` default, which warns).
+///
+/// Strictly more specific than [`is_clustered_sqlite`], so `start_db_proxies`
+/// and `resolve_channel_features` must test it **before** the single-database
+/// clustered case — a per-site-clustered config also satisfies
+/// `is_clustered_sqlite` (which is what already enables the `cdc` channel
+/// feature for it), and would otherwise wrongly take the single-DB CDC path.
+pub(crate) fn is_per_site_clustered(config: &Config, cluster_enabled: bool) -> bool {
+    config.db.sqlite.as_ref().is_some_and(|s| {
+        config.server.sites_dir.is_some()
+            && is_clustered_sqlite(s, cluster_enabled)
+            && s.replication.per_site
     })
 }
 
@@ -2122,10 +2237,37 @@ pub(crate) fn is_per_site_sqlite(config: &Config, cluster_enabled: bool) -> bool
 fn wire_per_site_db(
     config: &Config,
     query_stats: &ephpm_query_stats::QueryStats,
-    cluster_enabled: bool,
-) -> anyhow::Result<Option<site_wire_auth::SiteWireAuth>> {
-    // A multi-site + clustered SQLite config cannot get per-site isolation
-    // yet: warn rather than silently pretend it is isolated.
+    cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
+    channel: Option<&ephpm_cluster::ChannelHandle>,
+) -> anyhow::Result<Option<(site_wire_auth::SiteWireAuth, Option<PerSiteClusterWiring>)>> {
+    let cluster_enabled = cluster.is_some();
+    // Per-site CLUSTERED mode (opt-in via [db.sqlite.replication] per_site):
+    // isolated per-tenant databases that ALSO replicate across the cluster.
+    // Built here (before the listeners bind) like single-node per-site, plus
+    // the replication wiring the CDC path consumes in `start_db_proxies`.
+    if is_per_site_clustered(config, cluster_enabled) {
+        return wire_per_site_clustered_db(config, query_stats, cluster, channel).map(Some);
+    }
+
+    // Reaching here means per-site clustered mode did NOT engage, so if the
+    // knob is set it is inert. The repo forbids silent no-op config knobs:
+    // say so rather than let an operator believe tenants are isolated.
+    if let Some(sqlite) = &config.db.sqlite
+        && sqlite.replication.per_site
+    {
+        tracing::warn!(
+            sites_dir = config.server.sites_dir.is_some(),
+            clustered = is_clustered_sqlite(sqlite, cluster_enabled),
+            "[db.sqlite.replication] per_site = true has NO EFFECT in this configuration: it \
+             requires BOTH [server] sites_dir (multi-tenant) AND clustered replication \
+             ([cluster] enabled with replication.role auto/primary/replica). This deployment \
+             is running unchanged without per-site clustered replication."
+        );
+    }
+
+    // A multi-site + clustered SQLite config WITHOUT per_site cannot get
+    // per-site isolation: warn rather than silently pretend it is isolated.
+    // (When per_site is set the branch above took the isolated path instead.)
     if let Some(sqlite) = &config.db.sqlite
         && config.server.sites_dir.is_some()
         && is_clustered_sqlite(sqlite, cluster_enabled)
@@ -2133,8 +2275,9 @@ fn wire_per_site_db(
         tracing::warn!(
             "[db.sqlite] multi-site mode ([server] sites_dir) combined with clustered \
                  replication does NOT get per-site database isolation — all virtual hosts share \
-                 the clustered database. Per-site isolation is single-node only. Run single-node \
-                 for isolated per-tenant databases, or accept a shared database in clustered mode."
+                 the clustered database. Set [db.sqlite.replication] per_site = true for isolated, \
+                 per-tenant databases that replicate across the cluster (experimental; reads on \
+                 any node, writes to each site's owner), or accept a shared database."
         );
     }
 
@@ -2177,7 +2320,107 @@ fn wire_per_site_db(
          both through the in-process ephpm_db_* bridge and through pdo_mysql via per-site \
          credentials on the MySQL wire listener"
     );
-    Ok(Some(auth))
+    Ok(Some((auth, None)))
+}
+
+/// Replication wiring for per-site clustered mode, handed from
+/// [`wire_per_site_db`] (which builds the registry before the listeners bind)
+/// to [`start_db_proxies`] (which starts the CDC replication plane).
+struct PerSiteClusterWiring {
+    /// `[db.sqlite] dir`, the per-site database directory.
+    dir: std::path::PathBuf,
+    /// Site keys that became active locally (a request opened them), fed by
+    /// the registry's open hook. Drives the per-site replication working set.
+    site_events: tokio::sync::mpsc::UnboundedReceiver<String>,
+    /// The per-site registry, shared with the CDC path so the owner-side
+    /// `sql/` forwarding handler runs statements against the same local
+    /// backends the resolver and wire listener use.
+    registry: site_backends::SiteBackends,
+}
+
+/// Build the per-site **clustered** registry: capture-on Turso backends (so an
+/// owned site captures the writes it ships) plus an open hook that feeds newly
+/// active sites to the replication driver. Registers the **forwarding**
+/// `ephpm_db_*` resolver ([`sql_forward::ClusteredSiteResolver`]) — which
+/// serves a site locally when this node is its HRW owner and forwards to the
+/// owner otherwise — and mints the per-site MySQL credentials over the same
+/// registry.
+///
+/// # Errors
+///
+/// Fails closed if `[db.sqlite] dir` is unset (a shared database would defeat
+/// tenant isolation), if the cluster/channel context is missing (a startup
+/// ordering bug — per-site clustered mode requires both), or if the registry
+/// cannot be built.
+fn wire_per_site_clustered_db(
+    config: &Config,
+    query_stats: &ephpm_query_stats::QueryStats,
+    cluster: Option<&Arc<ephpm_cluster::ClusterHandle>>,
+    channel: Option<&ephpm_cluster::ChannelHandle>,
+) -> anyhow::Result<(site_wire_auth::SiteWireAuth, Option<PerSiteClusterWiring>)> {
+    let sqlite = config.db.sqlite.as_ref().expect("sqlite present in per-site clustered mode");
+    validate_sqlite_engine(&sqlite.engine)?;
+
+    let cluster = cluster.context(
+        "per-site clustered mode requires [cluster] enabled = true, but no cluster handle is \
+         available (startup ordering bug)",
+    )?;
+    let channel = channel.context(
+        "per-site clustered mode requires the cluster channel to be bound, but it is not \
+         (startup ordering bug: resolve_channel_features should have enabled the cdc feature)",
+    )?;
+
+    let dir = sqlite.dir.as_ref().map(std::path::PathBuf::from).ok_or_else(|| {
+        anyhow::anyhow!(
+            "[db.sqlite] dir is required in per-site clustered mode ([server] sites_dir set with \
+             [db.sqlite.replication] per_site = true): each virtual host needs its own database \
+             file at <dir>/<site-key>.db. Refusing to start with a single shared database."
+        )
+    })?;
+
+    // The open hook forwards each newly-active site to the replication driver.
+    let (site_tx, site_events) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let on_open: site_backends::SiteOpenHook = Arc::new(move |site: &str| {
+        // The driver dedups; a full channel is impossible (unbounded), and a
+        // dropped receiver only means the CDC path is not running.
+        let _ = site_tx.send(site.to_string());
+    });
+
+    let registry = site_backends::SiteBackends::new_clustered(
+        dir.clone(),
+        sqlite.max_open_dbs,
+        query_stats.clone(),
+        tokio::runtime::Handle::current(),
+        on_open,
+    )?;
+
+    // The bridge resolves each request's backend through the forwarding
+    // resolver: local when this node is the site's HRW owner, a remote proxy to
+    // the owner otherwise. This is what makes writes work on any node.
+    let resolver: Arc<dyn ephpm_php::db_bridge::SiteBackendResolver> =
+        Arc::new(sql_forward::ClusteredSiteResolver::new(
+            registry.clone(),
+            Arc::clone(cluster),
+            channel.clone(),
+            cluster.self_node().id,
+            tokio::runtime::Handle::current(),
+        ));
+    ephpm_php::PhpRuntime::set_db_backend_resolver(resolver, tokio::runtime::Handle::current());
+
+    // The per-site MySQL wire listener stays LOCAL-only (see sql_forward module
+    // docs, "Known gap"): stock pdo_mysql to a non-owner is not forwarded in
+    // this increment. Apps using the db-* drop-ins (ephpm_db_*) get forwarding.
+    let auth = site_wire_auth::SiteWireAuth::new(registry.clone())?;
+
+    tracing::info!(
+        max_open_dbs = sqlite.max_open_dbs,
+        "per-site CLUSTERED database isolation enabled (one replicated Turso database per virtual \
+         host). Owner-serves forwarding is active: the ephpm_db_* bridge serves a site locally on \
+         its HRW owner and forwards to the owner from any other node, so writes and reads work on \
+         any node (experimental)."
+    );
+
+    Ok((auth, Some(PerSiteClusterWiring { dir, site_events, registry })))
 }
 
 /// Whether the per-site MySQL wire *frontend* should be bound.
@@ -2580,6 +2823,116 @@ mod lib_tests {
         let config = make_sqlite_config("replica");
         assert!(is_clustered_sqlite(&config, false));
         assert!(is_clustered_sqlite(&config, true));
+    }
+
+    /// Full `Config` for the mode matrix: `[db.sqlite]` always present,
+    /// `[server] sites_dir` / `[db.sqlite.replication] per_site` /
+    /// `[cluster] enabled` toggled.
+    fn make_mode_config(
+        sites_dir: Option<&std::path::Path>,
+        role: &str,
+        per_site: bool,
+        cluster_enabled: bool,
+    ) -> Config {
+        let mut sqlite = make_sqlite_config(role);
+        sqlite.replication.per_site = per_site;
+        Config {
+            server: ephpm_config::ServerConfig {
+                sites_dir: sites_dir.map(std::path::Path::to_path_buf),
+                ..ephpm_config::ServerConfig::default()
+            },
+            cluster: ephpm_config::ClusterConfig {
+                enabled: cluster_enabled,
+                ..Config::default().cluster
+            },
+            db: ephpm_config::DbConfig {
+                sqlite: Some(sqlite),
+                ..ephpm_config::DbConfig::default()
+            },
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn sqlite_mode_matrix_is_exclusive_and_preserves_the_pre_existing_modes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sites = Some(dir.path());
+
+        /// The database mode a config resolves to. Exactly one holds, which is
+        /// the property this test exists to pin.
+        #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+        enum Mode {
+            /// One database, no vhost dimension, no cluster.
+            SingleNode,
+            /// One database per vhost, no cluster (pre-existing).
+            PerSiteSingleNode,
+            /// One clustered database shared by every vhost (pre-existing).
+            ClusteredSingleDb,
+            /// One replicated database per vhost (the new opt-in).
+            PerSiteClustered,
+        }
+
+        /// Resolve the mode the way `start_db_proxies` does — per-site
+        /// clustered first (it is a strict subset of clustered), then
+        /// clustered, then single-node per-site.
+        fn resolve_mode(config: &Config, cluster: bool) -> Mode {
+            if is_per_site_clustered(config, cluster) {
+                Mode::PerSiteClustered
+            } else if config.db.sqlite.as_ref().is_some_and(|s| is_clustered_sqlite(s, cluster)) {
+                Mode::ClusteredSingleDb
+            } else if is_per_site_sqlite(config, cluster) {
+                Mode::PerSiteSingleNode
+            } else {
+                Mode::SingleNode
+            }
+        }
+
+        // (sites_dir, role, per_site, cluster) => resolved mode
+        let cases: &[(bool, &str, bool, bool, Mode)] = &[
+            // --- Pre-existing modes, which must be unchanged. ---
+            // Plain single-node: no sites_dir, no cluster.
+            (false, "auto", false, false, Mode::SingleNode),
+            // Single-node per-site: sites_dir, no cluster.
+            (true, "auto", false, false, Mode::PerSiteSingleNode),
+            // Single-DB clustered, single-site.
+            (false, "auto", false, true, Mode::ClusteredSingleDb),
+            // Single-DB clustered + multi-site WITHOUT the opt-in: the shared
+            // database (warns). This is the row the new mode must not steal.
+            (true, "auto", false, true, Mode::ClusteredSingleDb),
+            // Forced single-node (role neither auto/primary/replica) even with
+            // clustering on: still the single-node per-site path.
+            (true, "single", false, true, Mode::PerSiteSingleNode),
+            // --- The new opt-in mode. ---
+            (true, "auto", true, true, Mode::PerSiteClustered),
+            (true, "primary", true, false, Mode::PerSiteClustered),
+            // --- The opt-in is inert wherever it does not apply. ---
+            // per_site with no cluster => plain single-node per-site.
+            (true, "auto", true, false, Mode::PerSiteSingleNode),
+            // per_site with no sites_dir => single-DB clustered, unchanged.
+            (false, "auto", true, true, Mode::ClusteredSingleDb),
+        ];
+
+        for &(has_sites, role, per_site, cluster, want) in cases {
+            let sites_dir = if has_sites { sites } else { None };
+            let config = make_mode_config(sites_dir, role, per_site, cluster);
+            let label =
+                format!("sites_dir={has_sites} role={role} per_site={per_site} cluster={cluster}");
+            assert_eq!(resolve_mode(&config, cluster), want, "resolved mode: {label}");
+
+            // The two per-site predicates are mutually exclusive, so the
+            // single-node per-site path can never be taken for a cluster.
+            assert!(
+                !(is_per_site_sqlite(&config, cluster) && is_per_site_clustered(&config, cluster)),
+                "per-site single-node and per-site clustered must never both hold: {label}"
+            );
+            // And per-site clustered is a strict subset of clustered, which is
+            // why `start_db_proxies` must test it first.
+            let sqlite = config.db.sqlite.as_ref().expect("sqlite present");
+            assert!(
+                !is_per_site_clustered(&config, cluster) || is_clustered_sqlite(sqlite, cluster),
+                "per-site clustered implies clustered: {label}"
+            );
+        }
     }
 
     #[test]
