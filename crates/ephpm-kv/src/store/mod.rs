@@ -193,6 +193,32 @@ pub trait Replicator: Send + Sync + std::fmt::Debug {
     /// Required rather than defaulted to `replicate_set` on purpose: a default
     /// would silently reintroduce the write-back in every new implementation.
     fn replicate_published(&self, key: String, value: Vec<u8>, ttl: Option<Duration>);
+
+    /// Handle a public [`Store::set_broadcast`]: put this value on **every**
+    /// node, whatever its size.
+    ///
+    /// A replicator that shards large values across a subset of the cluster
+    /// MUST override this — that is the whole point of the call. The default
+    /// delegates to [`replicate_set`](Self::replicate_set), which is correct
+    /// only for a replicator that already reaches every node (and for the
+    /// test doubles in this crate).
+    fn replicate_broadcast(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        self.replicate_set(key, value, ttl)
+    }
+
+    /// Fetch `key` from the rest of the cluster, for a node that has no local
+    /// copy. Returns `None` when the key is nowhere to be found, and for any
+    /// replicator with no cluster behind it.
+    ///
+    /// Boxed rather than `async fn` so the trait stays object-safe: it is
+    /// stored as `Arc<dyn Replicator>`.
+    fn fetch_cluster<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+        let _ = key;
+        Box::pin(std::future::ready(None))
+    }
 }
 
 /// Thread-safe in-memory KV store.
@@ -630,6 +656,57 @@ impl Store {
             return rep.replicate_set(key, value, ttl);
         }
         self.set_local(key, value, ttl)
+    }
+
+    /// Write a value that **every** node must hold a local copy of,
+    /// regardless of its size.
+    ///
+    /// # Why this is not just `set`
+    ///
+    /// [`Store::set`] hands the write to the [`Replicator`], which routes by
+    /// size: small values ride gossip (all nodes), large ones are *sharded* —
+    /// stored on `replication_factor` nodes and fetched through from an owner
+    /// on a miss. That is the right trade for cache and session data, and the
+    /// wrong one for cluster-wide state that every node must be able to read
+    /// out of its own local map with no round trip and no dependency on an
+    /// owner still being alive. An ACME certificate is the motivating case:
+    /// every node terminates TLS with it, and it is comfortably larger than
+    /// `small_key_threshold`, so plain `set` left it on a subset of the
+    /// cluster where the other nodes could never see it.
+    ///
+    /// Sharding is a capacity optimisation. Broadcast keys opt out of it, so
+    /// this is for a small, bounded set of keys — not a general-purpose write
+    /// path.
+    ///
+    /// Falls back to a local write when no replicator is installed, which is
+    /// already "every node" on a standalone node.
+    pub fn set_broadcast(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        if let Some(rep) = self.active_replicator() {
+            return rep.replicate_broadcast(key, value, ttl);
+        }
+        self.set_local(key, value, ttl)
+    }
+
+    /// Read a key, falling back to the rest of the cluster when this node has
+    /// no local copy.
+    ///
+    /// [`Store::get`] is local-only by design — it is on the hot path for
+    /// every RESP `GET` and every PHP `ephpm_kv_get`. This is the deliberate
+    /// slow path for the handful of callers that must not miss a value merely
+    /// because *this* node has not got it yet: a node that joined after the
+    /// write, or was down when it happened.
+    ///
+    /// The fetched value is **not** cached locally: it arrives with no TTL
+    /// information, so caching it would silently turn an expiring key into a
+    /// permanent one. Callers here poll on a timer, so a round trip per poll
+    /// is the cheaper mistake.
+    pub async fn get_cluster(&self, key: &str) -> Option<Bytes> {
+        if let Some(local) = self.get(key) {
+            return Some(local);
+        }
+        let replicator = self.active_replicator()?;
+        let value = replicator.fetch_cluster(key).await?;
+        Some(Bytes::from(value))
     }
 
     /// Local-only write — bypasses any installed [`Replicator`]. Used by a

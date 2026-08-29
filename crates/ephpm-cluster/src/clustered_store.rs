@@ -352,6 +352,59 @@ impl ClusteredStore {
         ok
     }
 
+    /// Write a value that **every** node must hold a local copy of,
+    /// regardless of its size.
+    ///
+    /// Small values already behave this way — the gossip tier fans out to the
+    /// whole cluster — so this differs from [`set`](Self::set) only above
+    /// `small_key_threshold`, where `set` shards to `replication_factor`
+    /// nodes and this writes to every alive node instead.
+    ///
+    /// # Why a separate tier rather than a bigger threshold
+    ///
+    /// Raising `small_key_threshold` past the value's size is not an
+    /// equivalent fix: the gossip tier is chitchat over **UDP**, so a payload
+    /// that does not fit a datagram cannot ride it at all. The size threshold
+    /// exists to keep multi-kilobyte values off gossip, and it must keep
+    /// doing that. What was wrong is the assumption that "too big for gossip"
+    /// implies "shard it" — for cluster-wide state such as an ACME
+    /// certificate it implies the opposite.
+    ///
+    /// Unlike the sharded path, peer writes are **awaited**: a broadcast key
+    /// is written rarely (certificate issuance and renewal) and the caller
+    /// wants cluster-wide read-your-writes far more than it wants the write
+    /// to return quickly. A peer that is unreachable is logged and counted
+    /// ([`ClusteredStore::replica_write_failures`]) but does not fail the
+    /// write, matching the rest of this store: this is not a consensus
+    /// protocol.
+    ///
+    /// Returns whether **this node's** copy was written — the same
+    /// client-visible contract [`set`](Self::set) has.
+    ///
+    /// ## What this does not do
+    ///
+    /// Fan-out reaches the nodes that are alive *at write time*. A node that
+    /// joins later, or is down and comes back, does not receive the value
+    /// retroactively — there is no anti-entropy here any more than there is
+    /// on the sharded path. Readers that must tolerate that should use
+    /// [`get`](Self::get), whose miss path fetches from a peer.
+    pub async fn broadcast(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        if value.len() <= self.config.small_key_threshold {
+            // Gossip already means "every node"; nothing to widen.
+            self.cluster.gossip_set(&key, &value, ttl).await;
+            if self.config.hot_key_cache {
+                self.maybe_bump_hot_version(&key).await;
+            }
+            return true;
+        }
+
+        let ok = self.broadcast_large(&key, &value, ttl).await;
+        if ok && self.config.hot_key_cache {
+            self.maybe_bump_hot_version(&key).await;
+        }
+        ok
+    }
+
     /// [`publish`](Self::publish) for a **per-site** key: the site-namespaced
     /// transport key goes on the wire, and — as with the global path — this
     /// node's own copy is left exactly as the mutation left it.
@@ -452,6 +505,57 @@ impl ClusteredStore {
             let transport = crate::site_namespace::encode(site, key);
             self.cluster.gossip_set(&transport, &value, Some(ttl)).await;
         }
+    }
+
+    /// Write a large value to every alive node. See
+    /// [`broadcast`](Self::broadcast).
+    async fn broadcast_large(&self, key: &str, value: &[u8], ttl: Option<Duration>) -> bool {
+        // This node's own copy first: it must be able to serve the value out
+        // of its local store even if every peer write below fails.
+        let local_ok = self.store.set_local(key.to_string(), value.to_vec(), ttl);
+
+        let self_id = self.cluster.self_node().id;
+        let mut delivered = 0usize;
+        let mut peers = 0usize;
+        for node in self.alive_nodes().await {
+            if node.id == self_id {
+                continue;
+            }
+            peers += 1;
+            let Some(addr) = node_data_addr(&node, self.config.data_port) else {
+                self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(key, peer = %node.id, "broadcast peer has no parseable data address");
+                continue;
+            };
+            match crate::kv_data_plane::store_remote(addr, key, value, self.cipher.as_deref()).await
+            {
+                Ok(true) => delivered += 1,
+                Ok(false) => {
+                    self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(key, peer = %node.id, %addr, "broadcast peer rejected the write");
+                }
+                Err(e) => {
+                    self.replica_write_failures.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(key, peer = %node.id, %addr, %e, "broadcast peer write failed");
+                }
+            }
+        }
+
+        if delivered < peers {
+            // Never silent: a partially-delivered broadcast means some nodes
+            // cannot read a value they are supposed to hold locally.
+            tracing::warn!(
+                key,
+                bytes = value.len(),
+                delivered,
+                peers,
+                "broadcast reached only some peers; the rest must fetch through on read"
+            );
+        } else {
+            tracing::debug!(key, bytes = value.len(), peers, "broadcast written to every peer");
+        }
+
+        local_ok
     }
 
     /// Write a large value to its replica set. Returns whether the
@@ -678,18 +782,29 @@ impl ClusteredStore {
     /// primary-first (the read/write fallback order). Returns an empty
     /// vector when only this node is alive (no clustering to do).
     async fn replica_nodes(&self, key: &str) -> Vec<NodeInfo> {
-        let nodes = self.cluster.nodes().await;
-        let mut alive: Vec<NodeInfo> =
-            nodes.into_iter().filter(|n| n.state == crate::NodeState::Alive).collect();
-        // `ClusterHandle::nodes` already sorts by id, but sort defensively
-        // so replica selection is stable regardless of caller.
-        alive.sort_by(|a, b| a.id.cmp(&b.id));
+        let alive = self.alive_nodes().await;
 
         if alive.len() <= 1 {
             return Vec::new(); // Only this node is alive.
         }
 
         replica_nodes_for(&alive, hash_key(key), self.config.replication_factor)
+    }
+
+    /// Every alive cluster node, including this one, sorted by id.
+    ///
+    /// `ClusterHandle::nodes` already sorts by id, but this sorts defensively
+    /// so replica selection is stable regardless of caller.
+    async fn alive_nodes(&self) -> Vec<NodeInfo> {
+        let mut alive: Vec<NodeInfo> = self
+            .cluster
+            .nodes()
+            .await
+            .into_iter()
+            .filter(|n| n.state == crate::NodeState::Alive)
+            .collect();
+        alive.sort_by(|a, b| a.id.cmp(&b.id));
+        alive
     }
 
     /// Number of replica writes that failed to reach or be accepted by a
@@ -967,6 +1082,39 @@ impl ephpm_kv::store::Replicator for KvReplicator {
         true
     }
 
+    fn replicate_broadcast(&self, key: String, value: Vec<u8>, ttl: Option<Duration>) -> bool {
+        // Materialize this node's own copy synchronously at *every* size, not
+        // just below the gossip threshold as `replicate_set` does. A
+        // broadcast key's contract is "readable from every node's raw local
+        // Store", and the node that wrote it is one of those nodes — the
+        // caller (ACME certificate issuance) reads its own write back.
+        let local_ok = self.inner.store.set_local(key.clone(), value.clone(), ttl);
+        if value.len() <= self.inner.config.small_key_threshold {
+            // Same last-arrival-wins bookkeeping as `replicate_set`: stop a
+            // slow gossip echo of this write from clobbering a newer local
+            // overwrite.
+            self.applied.insert(key.clone(), current_write_ms());
+        }
+
+        let inner = Arc::clone(&self.inner);
+        self.handle.spawn(async move {
+            if !inner.broadcast(key.clone(), value, ttl).await {
+                tracing::warn!(key, "clustered broadcast returned false (local write rejected)");
+            }
+        });
+        local_ok
+    }
+
+    fn fetch_cluster<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<Vec<u8>>> + Send + 'a>> {
+        // `ClusteredStore::get` is the cluster-aware read: gossip tier, local
+        // store, hot cache, then a data-plane fetch from the key's replica
+        // set. That last step is what a node which missed the write needs.
+        Box::pin(async move { self.inner.get(key).await })
+    }
+
     fn replicate_remove(&self, key: &str) -> bool {
         // Drop the local materialized copy synchronously (mirror of the
         // set path above), then propagate the removal via a gossip
@@ -1071,6 +1219,24 @@ impl ephpm_kv::store::Replicator for KvReplicator {
 /// apply side routes strictly on that name — so a site's key can only ever land
 /// in the same site's store on a peer, never in the global store and never in
 /// another tenant's.
+///
+/// # Not implemented here: `replicate_broadcast` / `fetch_cluster`
+///
+/// This impl deliberately inherits the trait defaults for both, because the only
+/// callers of [`Store::set_broadcast`](ephpm_kv::store::Store::set_broadcast)
+/// and [`Store::get_cluster`](ephpm_kv::store::Store::get_cluster) are the ACME
+/// certificate and account paths, which run against the **process-wide** store
+/// (whose replicator is [`KvReplicator`], and which does override both). No
+/// per-site store reaches them.
+///
+/// That is a fact about today's callers, not a property of this type, so it is
+/// recorded rather than assumed. This replicator *does* shard large values
+/// across a subset of the cluster (`set_for_site` → `set_large_routed`), which
+/// is exactly the condition under which `replicate_broadcast`'s contract says an
+/// implementation MUST override it. The inherited default would silently deliver
+/// a cert-sized per-site value to `replication_factor` nodes instead of all of
+/// them. **Before any per-site caller of `set_broadcast`/`get_cluster` is added,
+/// both methods must be implemented here** over a site-namespaced transport key.
 pub struct SiteKvReplicator {
     inner: Arc<ClusteredStore>,
     /// This vhost's own store — the local target for materialization, and the

@@ -282,11 +282,15 @@ async fn drive_clustered_acme_events<EC: Debug + 'static, EA: Debug + 'static>(
                             deployed = true;
                         }
                         if is_leader {
-                            // The cache layer wired into AcmeConfig
-                            // pushes new certs into the KV store as part
-                            // of the rustls-acme state machine, so by
-                            // the time we see this event the cert is
-                            // already replicated cluster-wide.
+                            // The cache layer wired into AcmeConfig pushes new
+                            // certs into the KV store as part of the
+                            // rustls-acme state machine, via `set_broadcast`
+                            // so every node gets its own local copy rather
+                            // than `replication_factor` of them. Fan-out to
+                            // peers is spawned, so it is in flight — not
+                            // necessarily complete — by the time this event
+                            // arrives; a follower that has not received it yet
+                            // fetches through on its next `load_cert` poll.
                             tracing::info!(?ev, "ACME certificate event (leader, distributed via KV)");
                         } else {
                             tracing::info!(?ev, "ACME certificate event (follower, loaded from KV)");
@@ -392,23 +396,62 @@ pub fn get_acme_challenge(store: &Store, token: &str) -> Option<Vec<u8>> {
 ///
 /// The certificate is stored indefinitely (no TTL) — renewal replaces
 /// it with a fresh certificate.
+///
+/// # Why `set_broadcast` and not `set`
+///
+/// Every node in the cluster terminates TLS with this certificate, so every
+/// node needs its own local copy. [`Store::set`] would not give it one: in
+/// clustered mode it routes by size, and a certificate chain is several
+/// kilobytes — comfortably over `[cluster.kv] small_key_threshold` — so it
+/// takes the sharded large-value tier and lands on `replication_factor`
+/// nodes only (2 by default). The nodes outside that set then have no
+/// certificate at all, and their TLS handshakes fail outright.
+///
+/// This was live, not theoretical: on a three-node cluster the leader issued
+/// a 5140-byte chain against a 4096-byte threshold, and the two other nodes
+/// answered every handshake with `tlsv1 alert access denied` for as long as
+/// they were up. [`Store::set_broadcast`] is the fix — it puts the value on
+/// every node whatever its size. Raising `small_key_threshold` is *not* an
+/// alternative: the small-value tier is gossip over UDP and cannot carry a
+/// multi-kilobyte payload.
 pub fn store_acme_cert(store: &Store, domain: &str, cert_pem: &[u8], key_pem: &[u8]) {
     let cert_key = format!("{ACME_CERT_PREFIX}{domain}:cert");
     let key_key = format!("{ACME_CERT_PREFIX}{domain}:key");
-    store.set(cert_key, cert_pem.to_vec(), None);
-    store.set(key_key, key_pem.to_vec(), None);
-    tracing::info!(domain, "stored ACME certificate in KV store");
+    store.set_broadcast(cert_key, cert_pem.to_vec(), None);
+    store.set_broadcast(key_key, key_pem.to_vec(), None);
+    tracing::info!(domain, "stored ACME certificate in KV store (broadcast to every node)");
 }
 
-/// Retrieve a certificate and key from the KV store.
+/// Retrieve a certificate and key from this node's **local** KV store.
 ///
 /// Returns `None` if either the cert or key is missing.
+///
+/// Local-only, so it is safe to call from a non-async context (startup, before
+/// the runtime is driving the renewal loop). Nodes that were alive when
+/// [`store_acme_cert`] ran hold a local copy, so this normally hits. A node
+/// that joined afterwards does not — those callers want
+/// [`get_acme_cert_cluster`].
 #[must_use]
 pub fn get_acme_cert(store: &Store, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     let cert_key = format!("{ACME_CERT_PREFIX}{domain}:cert");
     let key_key = format!("{ACME_CERT_PREFIX}{domain}:key");
     let cert = store.get(&cert_key)?;
     let key = store.get(&key_key)?;
+    Some((cert.to_vec(), key.to_vec()))
+}
+
+/// [`get_acme_cert`], falling back to the rest of the cluster on a local miss.
+///
+/// [`store_acme_cert`] broadcasts to every node that is *alive at write time*.
+/// A node that joins later — a scale-up, a restart, a rolling deploy — has no
+/// local copy and would otherwise wait for the next renewal (up to 60 days) to
+/// get one. This is the read used by the polling loops that install the
+/// leader's certificate, so such a node converges on its next poll instead.
+pub async fn get_acme_cert_cluster(store: &Store, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+    let cert_key = format!("{ACME_CERT_PREFIX}{domain}:cert");
+    let key_key = format!("{ACME_CERT_PREFIX}{domain}:key");
+    let cert = store.get_cluster(&cert_key).await?;
+    let key = store.get_cluster(&key_key).await?;
     Some((cert.to_vec(), key.to_vec()))
 }
 
@@ -497,7 +540,9 @@ impl CertCache for KvCache {
         directory_url: &str,
     ) -> Result<Option<Vec<u8>>, Self::EC> {
         let key = cert_key_for(domains, directory_url);
-        match self.store.get(&key) {
+        // Cluster-aware: a node that joined after the leader issued has no
+        // local copy, and this poll is its only chance to get one.
+        match self.store.get_cluster(&key).await {
             Some(bytes) => {
                 tracing::debug!(key = %key, len = bytes.len(), "ACME cert loaded from KV cache");
                 Ok(Some(bytes.to_vec()))
@@ -516,7 +561,9 @@ impl CertCache for KvCache {
         cert: &[u8],
     ) -> Result<(), Self::EC> {
         let key = cert_key_for(domains, directory_url);
-        let ok = self.store.set(key.clone(), cert.to_vec(), None);
+        // Broadcast, not `set`: see `store_acme_cert` for why a cert-sized
+        // value must not take the sharded large-value tier.
+        let ok = self.store.set_broadcast(key.clone(), cert.to_vec(), None);
         if ok {
             tracing::info!(
                 key = %key,
@@ -543,7 +590,7 @@ impl AccountCache for KvCache {
         directory_url: &str,
     ) -> Result<Option<Vec<u8>>, Self::EA> {
         let key = account_key_for(contact, directory_url);
-        match self.store.get(&key) {
+        match self.store.get_cluster(&key).await {
             Some(bytes) => {
                 tracing::debug!(key = %key, "ACME account loaded from KV cache");
                 Ok(Some(bytes.to_vec()))
@@ -562,7 +609,11 @@ impl AccountCache for KvCache {
         account: &[u8],
     ) -> Result<(), Self::EA> {
         let key = account_key_for(contact, directory_url);
-        let ok = self.store.set(key.clone(), account.to_vec(), None);
+        // Account material is the cluster's single ACME identity — every node
+        // must resolve the same one, or a promoted follower registers a second
+        // account and starts its own rate-limit budget. Same tier reasoning as
+        // the certificate: broadcast, never shard.
+        let ok = self.store.set_broadcast(key.clone(), account.to_vec(), None);
         if ok {
             tracing::info!(key = %key, "ACME account material published to KV store");
         } else {
