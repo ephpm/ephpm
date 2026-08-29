@@ -444,9 +444,35 @@ pub fn get_acme_challenge(store: &Store, token: &str) -> Option<Vec<u8>> {
 /// every node whatever its size. Raising `small_key_threshold` is *not* an
 /// alternative: the small-value tier is gossip over UDP and cannot carry a
 /// multi-kilobyte payload.
-pub fn store_acme_cert(store: &Store, domain: &str, cert_pem: &[u8], key_pem: &[u8]) {
-    let cert_key = format!("{ACME_CERT_PREFIX}{domain}:cert");
-    let key_key = format!("{ACME_CERT_PREFIX}{domain}:key");
+/// KV keys `(cert, key)` for a DNS-01 certificate, namespaced by the ACME
+/// directory URL.
+///
+/// The directory hash is what keeps a **staging** certificate from shadowing a
+/// **production** one (and vice-versa) for the same domain set. Without it, the
+/// key is only `acme:cert:<domain>:cert`, so flipping `[server.tls] staging`
+/// leaves the previous environment's certificate sitting in KV — and because
+/// `load_cached_cert` reads KV first and never inspects the issuer, every node
+/// would keep serving the stale cert instead of ordering a fresh one. The
+/// TLS-ALPN lane already namespaces this way via [`cert_key_for`]; this keeps
+/// the DNS-01 lane consistent.
+fn dns01_cert_keys(domain: &str, directory_url: &str) -> (String, String) {
+    let mut hasher = Sha256::new();
+    hasher.update(directory_url.as_bytes());
+    let dir_hash = hex_short(&hasher.finalize());
+    (
+        format!("{ACME_CERT_PREFIX}{domain}:cert:{dir_hash}"),
+        format!("{ACME_CERT_PREFIX}{domain}:key:{dir_hash}"),
+    )
+}
+
+pub fn store_acme_cert(
+    store: &Store,
+    domain: &str,
+    directory_url: &str,
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) {
+    let (cert_key, key_key) = dns01_cert_keys(domain, directory_url);
     store.set_broadcast(cert_key, cert_pem.to_vec(), None);
     store.set_broadcast(key_key, key_pem.to_vec(), None);
     tracing::info!(domain, "stored ACME certificate in KV store (broadcast to every node)");
@@ -462,9 +488,12 @@ pub fn store_acme_cert(store: &Store, domain: &str, cert_pem: &[u8], key_pem: &[
 /// that joined afterwards does not — those callers want
 /// [`get_acme_cert_cluster`].
 #[must_use]
-pub fn get_acme_cert(store: &Store, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> {
-    let cert_key = format!("{ACME_CERT_PREFIX}{domain}:cert");
-    let key_key = format!("{ACME_CERT_PREFIX}{domain}:key");
+pub fn get_acme_cert(
+    store: &Store,
+    domain: &str,
+    directory_url: &str,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (cert_key, key_key) = dns01_cert_keys(domain, directory_url);
     let cert = store.get(&cert_key)?;
     let key = store.get(&key_key)?;
     Some((cert.to_vec(), key.to_vec()))
@@ -477,9 +506,12 @@ pub fn get_acme_cert(store: &Store, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> 
 /// local copy and would otherwise wait for the next renewal (up to 60 days) to
 /// get one. This is the read used by the polling loops that install the
 /// leader's certificate, so such a node converges on its next poll instead.
-pub async fn get_acme_cert_cluster(store: &Store, domain: &str) -> Option<(Vec<u8>, Vec<u8>)> {
-    let cert_key = format!("{ACME_CERT_PREFIX}{domain}:cert");
-    let key_key = format!("{ACME_CERT_PREFIX}{domain}:key");
+pub async fn get_acme_cert_cluster(
+    store: &Store,
+    domain: &str,
+    directory_url: &str,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (cert_key, key_key) = dns01_cert_keys(domain, directory_url);
     let cert = store.get_cluster(&cert_key).await?;
     let key = store.get_cluster(&key_key).await?;
     Some((cert.to_vec(), key.to_vec()))
@@ -806,6 +838,7 @@ impl AccountCache for LayeredCache {
 #[cfg(test)]
 mod tests {
     use ephpm_kv::store::StoreConfig;
+    use instant_acme::LetsEncrypt;
 
     use super::*;
 
@@ -867,20 +900,41 @@ mod tests {
     fn acme_cert_store_and_retrieve() {
         let store = test_store();
         let domain = "example.com";
+        let dir = LetsEncrypt::Staging.url();
         let cert_pem = b"-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----";
         let key_pem = b"-----BEGIN PRIVATE KEY-----\ntest\n-----END PRIVATE KEY-----";
 
-        store_acme_cert(&store, domain, cert_pem, key_pem);
+        store_acme_cert(&store, domain, dir, cert_pem, key_pem);
 
-        let (cert, key) = get_acme_cert(&store, domain).unwrap();
+        let (cert, key) = get_acme_cert(&store, domain, dir).unwrap();
         assert_eq!(cert, cert_pem);
         assert_eq!(key, key_pem);
     }
 
     #[test]
+    fn acme_cert_is_namespaced_by_directory() {
+        // A staging certificate must not be visible under the production
+        // directory for the same domain — otherwise flipping `staging` serves
+        // the stale cert forever instead of ordering a fresh one.
+        let store = test_store();
+        let domain = "example.com";
+        let staging_cert = b"STAGING-CERT";
+        let staging_key = b"STAGING-KEY";
+        store_acme_cert(&store, domain, LetsEncrypt::Staging.url(), staging_cert, staging_key);
+
+        assert!(
+            get_acme_cert(&store, domain, LetsEncrypt::Production.url()).is_none(),
+            "the staging cert must not be visible under the production directory"
+        );
+        let (cert, _) = get_acme_cert(&store, domain, LetsEncrypt::Staging.url())
+            .expect("staging cert visible");
+        assert_eq!(cert, staging_cert);
+    }
+
+    #[test]
     fn acme_cert_missing_returns_none() {
         let store = test_store();
-        assert!(get_acme_cert(&store, "missing.com").is_none());
+        assert!(get_acme_cert(&store, "missing.com", LetsEncrypt::Staging.url()).is_none());
     }
 
     #[test]

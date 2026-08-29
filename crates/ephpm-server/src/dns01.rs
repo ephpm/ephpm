@@ -520,10 +520,17 @@ pub fn start_dns01_acme(
         .with_context(|| format!("creating DNS-01 cache directory {}", cache_dir.display()))?;
 
     let canonical = canonical_domain_key(&tls_config.domains);
+    let directory_url = if tls_config.staging {
+        LetsEncrypt::Staging.url().to_owned()
+    } else {
+        LetsEncrypt::Production.url().to_owned()
+    };
 
     // Seed the resolver from cache so a restart serves TLS immediately instead
     // of waiting for a fresh order. KV first (cluster-wide truth), then disk.
-    if let Some((cert, key)) = load_cached_cert(store.as_deref(), &cache_dir, &canonical) {
+    if let Some((cert, key)) =
+        load_cached_cert(store.as_deref(), &cache_dir, &canonical, &directory_url)
+    {
         match resolver.install(&cert, &key) {
             Ok(()) => {
                 tracing::info!(canonical, "DNS-01: seeded resolver from cached certificate");
@@ -545,11 +552,6 @@ pub fn start_dns01_acme(
 
     let contact =
         tls_config.email.as_ref().map(|e| vec![format!("mailto:{e}")]).unwrap_or_default();
-    let directory_url = if tls_config.staging {
-        LetsEncrypt::Staging.url().to_owned()
-    } else {
-        LetsEncrypt::Production.url().to_owned()
-    };
 
     let ctx = Dns01Context {
         resolver: Arc::clone(&resolver),
@@ -584,9 +586,9 @@ async fn run_dns01_lifecycle(ctx: Dns01Context) {
     let mut is_leader = false;
     let mut confirmations: u32 = 0;
     let mut last_issued: Option<SystemTime> =
-        read_issued_at(ctx.store.as_deref(), &ctx.cache_dir, &ctx.canonical);
+        read_issued_at(ctx.store.as_deref(), &ctx.cache_dir, &ctx.canonical, &ctx.directory_url);
     let mut installed_fp: Option<[u8; 32]> = if ctx.resolver.has_cert() {
-        load_cached_cert(ctx.store.as_deref(), &ctx.cache_dir, &ctx.canonical)
+        load_cached_cert(ctx.store.as_deref(), &ctx.cache_dir, &ctx.canonical, &ctx.directory_url)
             .map(|(cert, _)| fingerprint(&cert))
     } else {
         None
@@ -612,8 +614,12 @@ async fn run_dns01_lifecycle(ctx: Dns01Context) {
                     // On promotion, trust the KV issuance timestamp the previous
                     // leader wrote so we don't re-order a certificate that was
                     // just issued — a needless trip toward the rate limit.
-                    last_issued =
-                        read_issued_at(ctx.store.as_deref(), &ctx.cache_dir, &ctx.canonical);
+                    last_issued = read_issued_at(
+                        ctx.store.as_deref(),
+                        &ctx.cache_dir,
+                        &ctx.canonical,
+                        &ctx.directory_url,
+                    );
                     // Publish our cached certificate to the cluster if it isn't
                     // there yet. A leader that loaded from disk (e.g. a full-
                     // cluster restart) never issued, so it never broadcast, and
@@ -661,7 +667,7 @@ async fn run_dns01_lifecycle(ctx: Dns01Context) {
             }
         } else if let Some(store) = &ctx.store
             && let Some((cert_pem, key_pem)) =
-                crate::acme::get_acme_cert_cluster(store, &ctx.canonical).await
+                crate::acme::get_acme_cert_cluster(store, &ctx.canonical, &ctx.directory_url).await
         {
             // Follower: pick up the leader's certificate from the KV store.
             let fp = fingerprint(&cert_pem);
@@ -830,9 +836,28 @@ async fn load_or_create_account(ctx: &Dns01Context) -> anyhow::Result<Account> {
 
 // ── Cache helpers (KV + disk) ────────────────────────────────────────────────
 
-/// KV key for the certificate issuance timestamp (unix seconds).
-fn issued_kv_key(canonical: &str) -> String {
-    format!("acme:cert:{canonical}:issued")
+/// Short, stable hash of an ACME directory URL. Used to namespace every cache
+/// entry — KV keys **and** on-disk filenames — by environment, so a staging
+/// certificate (or its issuance timestamp) never shadows a production one for
+/// the same domain set. Without this, flipping `[server.tls] staging` leaves the
+/// previous environment's material in the cache and `load_cached_cert` (which
+/// reads cache-first and never inspects the issuer) would serve it forever.
+fn directory_hash(directory_url: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(directory_url.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(16);
+    for b in &digest[..8] {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
+/// KV key for the certificate issuance timestamp (unix seconds), namespaced by
+/// the ACME directory URL — see [`directory_hash`].
+fn issued_kv_key(canonical: &str, directory_url: &str) -> String {
+    format!("acme:cert:{canonical}:issued:{}", directory_hash(directory_url))
 }
 
 /// Build the `_acme-challenge.<domain>` FQDN, tolerating a wildcard prefix.
@@ -863,18 +888,27 @@ fn cache_stem(canonical: &str) -> String {
         .collect()
 }
 
+/// On-disk filename stem, namespaced by ACME directory so staging and production
+/// certificates for the same domain set never share a file — see
+/// [`directory_hash`]. The KV keys are namespaced the same way, so cache-first
+/// reads stay consistent across the staging→production flip.
+fn cache_stem_for(canonical: &str, directory_url: &str) -> String {
+    format!("{}-{}", cache_stem(canonical), directory_hash(directory_url))
+}
+
 /// Load a cached cert `(cert_pem, key_pem)` — KV first, then disk.
 fn load_cached_cert(
     store: Option<&Store>,
     cache_dir: &Path,
     canonical: &str,
+    directory_url: &str,
 ) -> Option<(Vec<u8>, Vec<u8>)> {
     if let Some(store) = store
-        && let Some((cert, key)) = crate::acme::get_acme_cert(store, canonical)
+        && let Some((cert, key)) = crate::acme::get_acme_cert(store, canonical, directory_url)
     {
         return Some((cert, key));
     }
-    let stem = cache_stem(canonical);
+    let stem = cache_stem_for(canonical, directory_url);
     let cert = std::fs::read(cache_dir.join(format!("{stem}.crt"))).ok()?;
     let key = std::fs::read(cache_dir.join(format!("{stem}.key"))).ok()?;
     if cert.is_empty() || key.is_empty() {
@@ -884,14 +918,19 @@ fn load_cached_cert(
 }
 
 /// Read the issuance timestamp — KV first, then the on-disk sidecar.
-fn read_issued_at(store: Option<&Store>, cache_dir: &Path, canonical: &str) -> Option<SystemTime> {
+fn read_issued_at(
+    store: Option<&Store>,
+    cache_dir: &Path,
+    canonical: &str,
+    directory_url: &str,
+) -> Option<SystemTime> {
     if let Some(store) = store
-        && let Some(bytes) = store.get(&issued_kv_key(canonical))
+        && let Some(bytes) = store.get(&issued_kv_key(canonical, directory_url))
         && let Some(t) = parse_unix_secs(bytes.as_ref())
     {
         return Some(t);
     }
-    let stem = cache_stem(canonical);
+    let stem = cache_stem_for(canonical, directory_url);
     let bytes = std::fs::read(cache_dir.join(format!("{stem}.issued"))).ok()?;
     parse_unix_secs(&bytes)
 }
@@ -906,10 +945,14 @@ fn persist_cert(ctx: &Dns01Context, cert_pem: &[u8], key_pem: &[u8], issued: Sys
     let secs =
         issued.duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or_default();
     if let Some(store) = &ctx.store {
-        crate::acme::store_acme_cert(store, &ctx.canonical, cert_pem, key_pem);
-        store.set(issued_kv_key(&ctx.canonical), secs.to_string().into_bytes(), None);
+        crate::acme::store_acme_cert(store, &ctx.canonical, &ctx.directory_url, cert_pem, key_pem);
+        store.set(
+            issued_kv_key(&ctx.canonical, &ctx.directory_url),
+            secs.to_string().into_bytes(),
+            None,
+        );
     }
-    let stem = cache_stem(&ctx.canonical);
+    let stem = cache_stem_for(&ctx.canonical, &ctx.directory_url);
     write_file(&ctx.cache_dir.join(format!("{stem}.crt")), cert_pem);
     write_file(&ctx.cache_dir.join(format!("{stem}.key")), key_pem);
     write_file(&ctx.cache_dir.join(format!("{stem}.issued")), secs.to_string().as_bytes());
@@ -937,10 +980,11 @@ fn republish_cached_cert_on_promotion(ctx: &Dns01Context, last_issued: Option<Sy
     let Some(store) = ctx.store.as_deref() else {
         return false; // standalone: no cluster to publish to
     };
-    if crate::acme::get_acme_cert(store, &ctx.canonical).is_some() {
+    if crate::acme::get_acme_cert(store, &ctx.canonical, &ctx.directory_url).is_some() {
         return false; // the cluster already has our certificate
     }
-    let Some((cert_pem, key_pem)) = load_cached_cert(Some(store), &ctx.cache_dir, &ctx.canonical)
+    let Some((cert_pem, key_pem)) =
+        load_cached_cert(Some(store), &ctx.cache_dir, &ctx.canonical, &ctx.directory_url)
     else {
         return false; // nothing cached to publish — the ordering path will issue
     };
@@ -1103,11 +1147,11 @@ mod tests {
         let store = ctx.store.clone().expect("store");
 
         // Simulate a leader that has the cert on disk only — nothing in KV.
-        let stem = cache_stem(&ctx.canonical);
+        let stem = cache_stem_for(&ctx.canonical, &ctx.directory_url);
         std::fs::write(dir.path().join(format!("{stem}.crt")), &cert_pem).expect("write crt");
         std::fs::write(dir.path().join(format!("{stem}.key")), &key_pem).expect("write key");
         assert!(
-            crate::acme::get_acme_cert(&store, &ctx.canonical).is_none(),
+            crate::acme::get_acme_cert(&store, &ctx.canonical, &ctx.directory_url).is_none(),
             "precondition: KV must not yet hold the certificate"
         );
 
@@ -1117,7 +1161,8 @@ mod tests {
             "a disk-cached cert must be re-published on promotion"
         );
         let (kv_cert, kv_key) =
-            crate::acme::get_acme_cert(&store, &ctx.canonical).expect("cert now in KV");
+            crate::acme::get_acme_cert(&store, &ctx.canonical, &ctx.directory_url)
+                .expect("cert now in KV");
         assert_eq!(kv_cert, cert_pem, "the KV cert must match the disk cert");
         assert_eq!(kv_key, key_pem, "the KV key must match the disk key");
 
@@ -1146,6 +1191,37 @@ mod tests {
         let production = account_kv_key(LetsEncrypt::Production.url());
         assert_ne!(staging, production);
         assert!(staging.starts_with("acme:account:dns01:"));
+    }
+
+    /// The staging→production flip must not be shadowed by a stale cert. After a
+    /// staging cert is published, a node reading under the *production* directory
+    /// (i.e. after `staging = false`) must see nothing — so its ordering path
+    /// issues a fresh production cert instead of serving the staging one forever.
+    #[test]
+    fn staging_cert_does_not_shadow_production_across_the_flip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut ctx, cert_pem, key_pem) = ctx_with_store(dir.path().to_path_buf());
+        let store = ctx.store.clone().expect("store");
+
+        // A staging leader publishes its cert + issuance timestamp to KV.
+        ctx.directory_url = LetsEncrypt::Staging.url().to_string();
+        persist_cert(&ctx, &cert_pem, &key_pem, SystemTime::now());
+        assert!(
+            read_issued_at(Some(&store), &ctx.cache_dir, &ctx.canonical, &ctx.directory_url)
+                .is_some(),
+            "staging issuance timestamp must be readable under the staging directory"
+        );
+
+        // After the flip, the same node reads under the production directory.
+        let prod = LetsEncrypt::Production.url();
+        assert!(
+            crate::acme::get_acme_cert(&store, &ctx.canonical, prod).is_none(),
+            "the staging cert must not be visible to a production reader"
+        );
+        assert!(
+            read_issued_at(Some(&store), &ctx.cache_dir, &ctx.canonical, prod).is_none(),
+            "the staging issuance timestamp must not be visible to a production reader"
+        );
     }
 
     /// A minimal one-shot HTTP server that captures the first request and
