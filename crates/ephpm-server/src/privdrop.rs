@@ -300,24 +300,46 @@ fn resolve_group(spec: &str) -> anyhow::Result<u32> {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use std::sync::Mutex;
+
     use ephpm_config::Config;
 
     use super::*;
 
+    /// Serializes the tests that perform a *name* lookup.
+    ///
+    /// `getpwnam`/`getgrnam` return a pointer into libc's shared static buffer.
+    /// Production upholds the invariant in [`resolve_user`]'s SAFETY note — the
+    /// drop happens once, at startup, before other threads exist — but the test
+    /// harness runs these concurrently, where one lookup overwrites another's
+    /// buffer. That surfaced as `resolve_user("root")` returning the *current*
+    /// user's uid, and it is timing-dependent: it appears and disappears as
+    /// unrelated tests change the scheduling.
+    ///
+    /// Locking here makes the tests honour the same single-lookup-at-a-time
+    /// contract the production caller does. Removing the invariant entirely
+    /// (switching to the reentrant `getpwnam_r`/`getgrnam_r`) is the more
+    /// thorough fix and is left as follow-up work — it changes unsafe FFI and
+    /// is unrelated to whatever change happens to be in flight.
+    static NAME_LOOKUP: Mutex<()> = Mutex::new(());
+
     #[test]
     fn numeric_user_and_group_parse_without_lookup() {
+        // Numeric specs short-circuit before any libc call, so no lock needed.
         assert_eq!(resolve_user("1000").unwrap(), (1000, None));
         assert_eq!(resolve_group("2000").unwrap(), 2000);
     }
 
     #[test]
     fn unknown_name_is_an_error_not_a_panic() {
+        let _guard = NAME_LOOKUP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(resolve_user("definitely-no-such-user-zzz").is_err());
         assert!(resolve_group("definitely-no-such-group-zzz").is_err());
     }
 
     #[test]
     fn root_user_and_group_resolve() {
+        let _guard = NAME_LOOKUP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // root exists on every Unix; getpwnam/getgrnam must find it.
         let (uid, gid) = resolve_user("root").unwrap();
         assert_eq!(uid, 0);
