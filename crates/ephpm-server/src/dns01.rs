@@ -993,6 +993,19 @@ fn republish_cached_cert_on_promotion(ctx: &Dns01Context, last_issued: Option<Sy
     true
 }
 
+/// On-disk filename for the ACME account credentials, namespaced by directory
+/// URL so staging and production accounts never share a file.
+///
+/// The KV key ([`account_kv_key`]) is already namespaced; the disk file was not.
+/// Without this, `load_account_creds` falls back to the *other* environment's
+/// `account.json`, whose embedded directory URL then routes the order to the
+/// wrong ACME server — a staging account issues only staging certificates no
+/// matter what `[server.tls] staging` says, so the `staging = false` flip
+/// silently keeps producing staging certs.
+fn account_cache_file(cache_dir: &Path, directory_url: &str) -> PathBuf {
+    cache_dir.join(format!("account-{}.json", directory_hash(directory_url)))
+}
+
 /// Load account credential JSON — KV first, then disk.
 fn load_account_creds(ctx: &Dns01Context) -> Option<Vec<u8>> {
     if let Some(store) = &ctx.store
@@ -1000,7 +1013,7 @@ fn load_account_creds(ctx: &Dns01Context) -> Option<Vec<u8>> {
     {
         return Some(bytes.to_vec());
     }
-    std::fs::read(ctx.cache_dir.join("account.json")).ok()
+    std::fs::read(account_cache_file(&ctx.cache_dir, &ctx.directory_url)).ok()
 }
 
 /// Persist account credential JSON to KV (cluster-wide) and disk.
@@ -1013,7 +1026,7 @@ fn persist_account_creds(ctx: &Dns01Context, bytes: &[u8]) {
     if let Some(store) = &ctx.store {
         store.set_broadcast(account_kv_key(&ctx.directory_url), bytes.to_vec(), None);
     }
-    write_file(&ctx.cache_dir.join("account.json"), bytes);
+    write_file(&account_cache_file(&ctx.cache_dir, &ctx.directory_url), bytes);
 }
 
 /// KV key for the ACME account credentials, namespaced by directory URL so
@@ -1191,6 +1204,22 @@ mod tests {
         let production = account_kv_key(LetsEncrypt::Production.url());
         assert_ne!(staging, production);
         assert!(staging.starts_with("acme:account:dns01:"));
+    }
+
+    /// The account *disk* file must also be directory-namespaced — otherwise the
+    /// `staging = false` flip loads the staging account.json and orders staging
+    /// certificates forever (the KV key alone is not enough; the disk fallback
+    /// shadows it).
+    #[test]
+    fn account_cache_file_differs_by_directory() {
+        let dir = Path::new("/cache");
+        let staging = account_cache_file(dir, LetsEncrypt::Staging.url());
+        let production = account_cache_file(dir, LetsEncrypt::Production.url());
+        assert_ne!(staging, production);
+        assert!(
+            staging.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("account-")),
+            "the account file must be namespaced as account-<hash>.json"
+        );
     }
 
     /// The staging→production flip must not be shadowed by a stale cert. After a
