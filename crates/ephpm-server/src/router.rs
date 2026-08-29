@@ -661,10 +661,15 @@ pub struct Router {
     /// `/_ephpm/primary` so an external load balancer can route
     /// active-passive to the elected cluster primary.
     ///
-    /// `true` means this node accepts writes: it is either the elected
-    /// clustered-SQLite primary, or a non-clustered/standalone node (trivially
-    /// writable). `false` means this node is a clustered-SQLite replica, whose
-    /// writes would silently diverge — the LB must steer writes away from it.
+    /// `true` means this node accepts writes: it is the elected
+    /// clustered-SQLite primary, a non-clustered/standalone node (trivially
+    /// writable), or **any node in per-site clustered mode** (ownership there
+    /// is per tenant, and a non-owner forwards its writes to the site's owner,
+    /// so every healthy node accepts writes for every site — see
+    /// [`turso_cdc::start_clustered_per_site_turso`](crate::turso_cdc::start_clustered_per_site_turso)).
+    /// `false` means this node is a **single-database** clustered-SQLite
+    /// replica, whose writes would silently diverge — the LB must steer writes
+    /// away from it.
     ///
     /// A lock-free `AtomicBool` so the `/_ephpm/primary` handler is a single
     /// relaxed load with no lock and no await on the request hot path. Defaults
@@ -2246,9 +2251,11 @@ impl Router {
 
             // Primary probe — the load-balancer target for active-passive
             // routing to the writable SQLite node. 200 when this node accepts
-            // writes (the elected clustered-SQLite primary, or any
-            // non-clustered/standalone node), 503 when it is a replica whose
-            // writes would silently diverge. Safe to health-check in any
+            // writes (the elected clustered-SQLite primary, any
+            // non-clustered/standalone node, or any node in per-site clustered
+            // mode, where ownership is per tenant and writes are forwarded to
+            // the owner), 503 when it is a single-database clustered replica
+            // whose writes would silently diverge. Safe to health-check in any
             // topology, so it never 404s. A single relaxed atomic load — no
             // lock, no await.
             if uri_path == "/_ephpm/primary" {

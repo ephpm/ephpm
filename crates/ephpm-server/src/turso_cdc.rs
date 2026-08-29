@@ -223,7 +223,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use dashmap::DashMap;
-use ephpm_cluster::{ChannelStream, ElectedRole, IncomingStream};
+use ephpm_cluster::{ChannelStream, ElectedRole, IncomingStream, NodeInfo};
 use ephpm_config::SqliteConfig;
 use litewire::litewire_turso::Turso;
 use litewire::litewire_turso::cdc::{CdcRow, CdcTailer, TxnBatch, apply_batch, read_watermark};
@@ -1902,6 +1902,29 @@ const ALLOWED_STATEMENT_PREFIXES: [&str; 2] = ["CREATE", "INSERT"];
 /// dump contains a disallowed statement, an unterminated quote, or an
 /// unterminated block comment.
 fn validate_snapshot_dump(dump: &str) -> anyhow::Result<()> {
+    for_each_statement(dump, &mut check_statement_allowed)
+}
+
+/// Split `dump` into statements on unquoted, uncommented `;` and hand each one
+/// (comments and whitespace included, exactly as written) to `visit`.
+///
+/// The scan is quote-aware — single-quoted strings with `''` escapes,
+/// double-quoted identifiers with `""` escapes, and `X'..'` blobs are all just
+/// quoted runs, so a `;` inside one is not a separator — and comment-aware, so
+/// a `;` inside `--` or `/* */` is not one either.
+///
+/// Shared by [`validate_snapshot_dump`] (which allowlists each statement) and
+/// [`snapshot_declares_a_table`] (which asks whether the dump carries any
+/// schema at all), so the two can never disagree about where a statement ends.
+///
+/// # Errors
+///
+/// Returns an error on an unterminated quote or block comment, or whatever
+/// `visit` returns for a statement it rejects.
+fn for_each_statement(
+    dump: &str,
+    visit: &mut impl FnMut(&str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let bytes = dump.as_bytes();
     let mut start = 0usize;
     let mut i = 0usize;
@@ -1944,15 +1967,72 @@ fn validate_snapshot_dump(dump: &str) -> anyhow::Result<()> {
                 }
             }
             b';' => {
-                check_statement_allowed(&dump[start..i])?;
+                visit(&dump[start..i])?;
                 i += 1;
                 start = i;
             }
             _ => i += 1,
         }
     }
-    // Trailing text after the last `;` must be blank (or a comment).
-    check_statement_allowed(&dump[start..])
+    // Trailing text after the last `;` (blank, a comment, or a statement
+    // written without a terminator).
+    visit(&dump[start..])
+}
+
+/// Does `dump` declare at least one user table?
+///
+/// A snapshot is, by construction, `CREATE` DDL followed by
+/// `INSERT OR REPLACE`s, so "no `CREATE TABLE` anywhere" means the serving node
+/// dumped an **empty database**. That is the degenerate snapshot
+/// [`snapshot_may_replace_local_data`] refuses to apply over live tenant data.
+///
+/// A malformed dump (unterminated quote/comment) reports `false`: it declares
+/// nothing we can vouch for, and it is about to be rejected by
+/// [`validate_snapshot_dump`] anyway.
+fn snapshot_declares_a_table(dump: &str) -> bool {
+    let mut found = false;
+    let _ = for_each_statement(dump, &mut |stmt| {
+        let trimmed = strip_leading_noise(stmt);
+        let mut words = trimmed.split_ascii_whitespace();
+        if words.next().is_some_and(|w| w.eq_ignore_ascii_case("CREATE"))
+            && words.next().is_some_and(|w| w.eq_ignore_ascii_case("TABLE"))
+        {
+            found = true;
+        }
+        Ok(())
+    });
+    found
+}
+
+/// Gate on replacing a populated local database with a peer's snapshot.
+///
+/// # The invariant
+///
+/// A bootstrap **discards** the local user tables before applying the peer's
+/// dump. That is only ever safe when the peer is actually authoritative for the
+/// site, and a dump carrying no schema at all is positive evidence that it is
+/// not — an empty database is what a node that has never held the site produces.
+/// `validate_snapshot_dump("")` succeeds (an empty dump is trivially inside the
+/// allowlist), so without this check the sequence "drop every user table, then
+/// apply nothing" completed *successfully* and a tenant's data was gone.
+///
+/// Applying an empty snapshot over an already-empty database is fine and stays
+/// allowed — that is a brand-new site on a fresh cluster.
+///
+/// # Errors
+///
+/// Returns an error when `local_has_data` and the dump declares no table, so
+/// the caller retries later (by which time the real owner has the data, or
+/// ownership has moved back) rather than destroying anything.
+fn snapshot_may_replace_local_data(dump: &str, local_has_data: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !local_has_data || snapshot_declares_a_table(dump),
+        "refusing to bootstrap from a degenerate snapshot: the peer sent a dump with no user \
+         tables while this node holds live data for the site. Applying it would discard that \
+         data and replace it with nothing. This is what a node that has never held the site \
+         serves — check that ownership moved to a node that actually has this database."
+    );
+    Ok(())
 }
 
 /// Allow an empty/whitespace/comment-only statement, or one starting
@@ -2181,6 +2261,38 @@ async fn fetch_and_apply_snapshot_on(
     snapshot_stream: &str,
 ) -> anyhow::Result<i64> {
     let started = std::time::Instant::now();
+    let (header, dump, received) =
+        fetch_snapshot(primary_addr, channel, max_snapshot_bytes, snapshot_stream).await?;
+    apply_snapshot(conn, &header, &dump).await?;
+    // Only counted once the dump is durably applied: bytes received into
+    // a buffer that then failed validation are not a bootstrap.
+    cdc_metrics::record_snapshot_received(received, started.elapsed());
+    // The local watermark table now holds exactly this value, so the
+    // replica's watermark gauge is correct before the CDC tail starts.
+    cdc_metrics::record_applied_watermark(header.watermark);
+    Ok(header.watermark)
+}
+
+/// Dial `primary_addr` and receive a snapshot **without applying it**, returning
+/// `(header, dump, bytes_received)`.
+///
+/// Split out from [`fetch_and_apply_snapshot_on`] so the per-site replica can
+/// **fetch first and only then decide** whether the snapshot is fit to replace
+/// what it already holds (see [`snapshot_may_replace_local_data`]). Deciding
+/// after the fetch is the whole point: the previous order — discard local
+/// tables, then go and get a snapshot — could not fail safe, because by the
+/// time the snapshot turned out to be empty the local data was already gone.
+///
+/// # Errors
+///
+/// Returns an error if the dial or the header/chunk read fails, or if the peer
+/// announces or streams more than `max_snapshot_bytes`.
+async fn fetch_snapshot(
+    primary_addr: SocketAddr,
+    channel: &ephpm_cluster::ChannelHandle,
+    max_snapshot_bytes: u64,
+    snapshot_stream: &str,
+) -> anyhow::Result<(SnapshotHeader, String, u64)> {
     let mut stream = channel
         .dial(primary_addr, snapshot_stream)
         .await
@@ -2216,14 +2328,7 @@ async fn fetch_and_apply_snapshot_on(
         body.extend_from_slice(&chunk);
     }
     let dump = String::from_utf8(body).context("snapshot: dump body is not valid utf-8")?;
-    apply_snapshot(conn, &header, &dump).await?;
-    // Only counted once the dump is durably applied: bytes received into
-    // a buffer that then failed validation are not a bootstrap.
-    cdc_metrics::record_snapshot_received(received, started.elapsed());
-    // The local watermark table now holds exactly this value, so the
-    // replica's watermark gauge is correct before the CDC tail starts.
-    cdc_metrics::record_applied_watermark(header.watermark);
-    Ok(header.watermark)
+    Ok((header, dump, received))
 }
 
 // ---------------------------------------------------------------------------
@@ -2448,10 +2553,12 @@ fn spawn_litewire_serve<B: litewire::backend::Backend>(
 //
 // One `register_prefix("cdc/")` and one `register_prefix("snapshot/")`
 // handler route every site. For each inbound stream the handler parses the
-// site out of the stream type, checks `hrw_owner(alive, site) == self`, and
-// only then resolves that site's mgmt factory and spawns the existing
-// generic `serve_subscriber` / `serve_snapshot`. A non-owner refuses (the
-// dialer is chasing a stale owner and retries).
+// site out of the stream type and authorizes it (`stream_is_authorized`:
+// known cluster member, plus HRW ownership — with the one deliberate
+// exception that any node will serve a *snapshot* to the site's current
+// owner, which is the ownership handoff below). Only then does it resolve
+// that site's mgmt factory and spawn the generic `serve_subscriber` /
+// `serve_snapshot`. A refused dialer is chasing a stale owner and retries.
 //
 // ## Replica side (per-site driver)
 //
@@ -2463,6 +2570,21 @@ fn spawn_litewire_serve<B: litewire::backend::Backend>(
 // channel address while it owns the site and names the owner otherwise;
 // when this node is a replica of the site it cold-bootstraps (if empty) then
 // tails `cdc/<site>` from the owner, exactly like the single-database path.
+//
+// ## Ownership moves carry the data
+//
+// HRW ownership is recomputed from live membership, so it moves whenever
+// membership changes — a node *joining* is enough. Ownership on its own moves
+// no bytes, so two things make a move safe:
+//
+// - The new owner **pulls** the site from the previous owner
+//   (`take_ownership_handoff`, HRW over the alive set minus self) when its own
+//   copy is cold, before serving.
+// - The old owner never *discards* data to bootstrap from someone else. Its
+//   database's `site_data_lineage` names it as the data's origin, so it tails
+//   rather than resets; and even a justified reset refuses a snapshot that
+//   carries no schema (`snapshot_may_replace_local_data`). The destructive
+//   step is ordered fetch → vet → discard → apply, never discard → fetch.
 //
 // ## Write path
 //
@@ -2477,9 +2599,12 @@ fn spawn_litewire_serve<B: litewire::backend::Backend>(
 //
 // **`pdo_mysql` is not forwarded.** The per-site MySQL wire listener resolves
 // this node's LOCAL backend, so a stock `pdo_mysql` write to a non-owner is
-// applied locally, is not captured for replication, and is discarded when that
-// replica re-bootstraps from the owner. Apps on the per-site clustered path
-// must use the `db-*` drop-ins, which call `ephpm_db_*`.
+// applied locally and is not captured for replication. Apps on the per-site
+// clustered path must use the `db-*` drop-ins, which call `ephpm_db_*`.
+//
+// **Multi-node ownership churn is unvalidated on a live cluster.** The handoff
+// and the refusal rules above are covered by unit tests against real Turso
+// databases, not by a running three-node failover.
 // ---------------------------------------------------------------------------
 
 /// Lazily-opened per-site replication management state.
@@ -2647,10 +2772,46 @@ fn site_from_stream(stream_type: &str, prefix: &str) -> Option<String> {
     }
 }
 
-/// Is this node the HRW owner of `site` among the currently-alive members?
-async fn is_site_owner(cluster: &ephpm_cluster::ClusterHandle, self_id: &str, site: &str) -> bool {
+/// May `peer` be served a `cdc/<site>` or `snapshot/<site>` stream by this node?
+///
+/// Every inbound stream must come from a **known cluster member** — re-checked
+/// here rather than trusted from connection admission, because membership can
+/// change while a long-lived connection stays open. On top of that:
+///
+/// - **CDC** (`cdc/<site>`) is served only by the site's current HRW owner. A
+///   non-owner's CDC log is not the site's authoritative log, so tailing it
+///   would replicate the wrong sequence.
+/// - **Snapshot** (`snapshot/<site>`) is served by the owner, *and* by any node
+///   to the site's current owner. That second case is the ownership handoff
+///   ([`take_ownership_handoff`]): when HRW re-homes a site to a node that
+///   holds none of its data, the node that does hold it is by definition not
+///   the owner any more, so an owner-only gate would refuse the very transfer
+///   that makes the move safe. The requester must be the current owner, which
+///   is a membership-derived fact no peer can assert for itself.
+async fn stream_is_authorized(
+    cluster: &ephpm_cluster::ClusterHandle,
+    self_id: &str,
+    site: &str,
+    kind: StreamKind,
+    peer: SocketAddr,
+) -> bool {
+    if !ephpm_cluster::peer_is_cluster_member(cluster, peer.ip()).await {
+        return false;
+    }
     let nodes = cluster.nodes().await;
-    ephpm_cluster::hrw_owner(&nodes, site).is_some_and(|n| n.id == self_id)
+    let Some(owner) = ephpm_cluster::hrw_owner(&nodes, site) else {
+        return false;
+    };
+    if owner.id == self_id {
+        return true;
+    }
+    matches!(kind, StreamKind::Snapshot) && peer_is_node(owner, peer)
+}
+
+/// Is `peer` the address of `node` as gossip knows it? Host-only, because the
+/// cluster-channel port differs from the gossip port on the same host.
+fn peer_is_node(node: &NodeInfo, peer: SocketAddr) -> bool {
+    node.gossip_addr.parse::<SocketAddr>().is_ok_and(|addr| addr.ip() == peer.ip())
 }
 
 /// Enumerate the sites whose databases already exist under `dir` at startup
@@ -2697,6 +2858,7 @@ pub async fn start_clustered_per_site_turso(
     mut site_events: tokio::sync::mpsc::UnboundedReceiver<String>,
     registry: crate::site_backends::SiteBackends,
     handles: &mut Vec<tokio::task::JoinHandle<()>>,
+    primary_view: &Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let cluster = cluster.context(
         "per-site clustered Turso replication requires [cluster] enabled = true; \
@@ -2716,6 +2878,26 @@ pub async fn start_clustered_per_site_turso(
 
     let self_id = cluster.self_node().id;
     let max_snapshot_bytes = sqlite_config.replication.max_snapshot_bytes;
+
+    // `/_ephpm/primary`: in per-site clustered mode EVERY healthy node reports
+    // 200, deliberately and permanently.
+    //
+    // The endpoint answers "may a load balancer send writes here?". In
+    // single-database clustered mode there is one writable node and the
+    // election flips this flag as the role moves — active-passive routing. In
+    // per-site mode there is no cluster-wide primary at all: ownership is
+    // per-tenant, and a hundred sites can have a hundred different owners on
+    // the same set of nodes, so no single boolean can answer the question for
+    // the node as a whole. What *is* true node-wide is that every node accepts
+    // writes for every site — a non-owner forwards them to the site's owner
+    // over `sql/<site>` (see `crate::sql_forward`) — so the honest answer for
+    // the whole node is 200, and steering traffic away from any healthy node
+    // would only remove capacity.
+    //
+    // Set explicitly rather than left at the constructor default so this is a
+    // decision in the code rather than an omission: before this, the flag was
+    // simply never passed to this path and read `true` by accident.
+    primary_view.store(true, Ordering::Relaxed);
 
     cdc_metrics::init();
 
@@ -2852,13 +3034,13 @@ fn spawn_per_site_stream_handler(
             let mgmt = mgmt.clone();
             let self_id = self_id.clone();
             tokio::spawn(async move {
-                if !is_site_owner(&cluster, &self_id, &site).await {
+                if !stream_is_authorized(&cluster, &self_id, &site, kind, peer).await {
                     cdc_metrics::record_stream_refused(kind.label());
                     tracing::warn!(
                         peer = %peer,
                         site = %site,
-                        "per-site {}: not this site's HRW owner; refusing (peer is chasing a \
-                         stale owner and will retry)",
+                        "per-site {}: refusing (not this site's owner, or the peer is not a \
+                         known cluster member); a peer chasing a stale owner will retry",
                         kind.label()
                     );
                     return;
@@ -2981,14 +3163,31 @@ async fn run_site_replication(
     // "replica is authoritative-from-owner"). Cleared on any clean attempt or
     // role change.
     let mut force_reset = false;
+    // The ownership-handoff pull is attempted at most once per driver: it is
+    // only meaningful for a node that starts owning a site it has no data for,
+    // and re-running it later would race live writes.
+    let mut took_handoff = false;
 
     loop {
         let role = role_rx.borrow().clone();
         match role {
             ElectedRole::Primary => {
                 // We own this site; owner-side handlers serve replicas.
-                // Nothing to drive until the role changes.
+                // Nothing to drive until the role changes — except the one
+                // case where becoming the owner is not enough: we may have
+                // been handed a site whose data lives on another node.
                 force_reset = false;
+                if !took_handoff {
+                    took_handoff = true;
+                    take_ownership_handoff(
+                        &site,
+                        &cluster,
+                        &channel,
+                        &site_mgmt.factory,
+                        max_snapshot_bytes,
+                    )
+                    .await;
+                }
                 if role_rx.changed().await.is_err() {
                     return Ok(());
                 }
@@ -3015,7 +3214,7 @@ async fn run_site_replication(
                             return Ok(());
                         }
                     }
-                    res = replicate_site_once(&site, owner, &channel, &site_mgmt.factory, max_snapshot_bytes, force_reset) => {
+                    res = replicate_site_once(&site, owner, &channel, &site_mgmt.factory, &site_mgmt.log_id, max_snapshot_bytes, force_reset) => {
                         match res {
                             Ok(()) => force_reset = false,
                             Err(e) if is_schema_collision_error(&e) => {
@@ -3050,56 +3249,241 @@ async fn run_site_replication(
     }
 }
 
+/// The node that owned `site` before this one: the HRW owner among the alive
+/// members **excluding self**.
+///
+/// HRW ownership is a pure function of `(site, alive set)`, so removing this
+/// node from the set reconstructs exactly who owned the site immediately before
+/// this node joined (or before this node's score started counting). That makes
+/// the previous owner derivable with no extra state and identically on every
+/// node. `None` when this node is the only member.
+fn previous_owner_of(nodes: &[NodeInfo], self_id: &str, site: &str) -> Option<NodeInfo> {
+    let others: Vec<NodeInfo> = nodes.iter().filter(|n| n.id != self_id).cloned().collect();
+    ephpm_cluster::hrw_owner(&others, site).cloned()
+}
+
+/// Pull `site`'s data from its previous owner when this node has just become
+/// the owner of a site it holds nothing for.
+///
+/// # Why this exists
+///
+/// HRW re-homes a site whenever membership changes — a node merely *joining* is
+/// enough. Ownership is what decides who serves the site's writes and who ships
+/// its CDC, but ownership on its own moves no bytes: a node that becomes owner
+/// of a site it has never held would serve an empty database and ship an empty
+/// CDC log, while the node that actually has the data sits there as a replica
+/// with nothing to tail. The site's data is not lost (the replica refuses to
+/// discard it for a degenerate snapshot — see
+/// [`snapshot_may_replace_local_data`]), but the tenant sees an empty database
+/// and replication is stuck. This closes the loop: **an ownership move pulls
+/// the data with it.**
+///
+/// Best-effort by construction. It runs only when the local database is cold —
+/// so it can never overwrite anything — and any failure (no previous owner, an
+/// unreachable one, a previous owner that is itself empty because the site is
+/// genuinely new) is logged and the node carries on as the owner of an empty
+/// database, which is the correct outcome for a site nobody has data for.
+async fn take_ownership_handoff(
+    site: &str,
+    cluster: &ephpm_cluster::ClusterHandle,
+    channel: &ephpm_cluster::ChannelHandle,
+    factory: &Turso,
+    max_snapshot_bytes: u64,
+) {
+    let conn = match factory.raw_connection() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(site = %site, "ownership handoff: cannot open a connection: {e:#}");
+            return;
+        }
+    };
+    match local_db_is_cold(&conn).await {
+        // Not cold: we already hold this site's data, nothing to pull.
+        Ok(false) => return,
+        Ok(true) => {}
+        Err(e) => {
+            tracing::warn!(site = %site, "ownership handoff: cold-start check failed: {e:#}");
+            return;
+        }
+    }
+
+    let nodes = cluster.nodes().await;
+    let self_id = cluster.self_node().id;
+    let Some(previous) = previous_owner_of(&nodes, &self_id, site) else {
+        // Sole member: nobody could have held the site before us.
+        return;
+    };
+    let Some(addr) = crate::sql_forward::member_channel_addr(&previous) else {
+        tracing::warn!(
+            site = %site,
+            previous_owner = %previous.id,
+            "ownership handoff: the previous owner's gossip address is unusable; \
+             serving this site from an empty local database"
+        );
+        return;
+    };
+
+    tracing::info!(
+        site = %site,
+        previous_owner = %previous.id,
+        %addr,
+        "ownership handoff: this node now owns a site it holds no data for; pulling a \
+         snapshot from the previous owner before serving it"
+    );
+    match bootstrap_site_from(
+        &conn,
+        site,
+        addr,
+        channel,
+        max_snapshot_bytes,
+        // Cold by the check above, so there is nothing to discard — and
+        // passing `false` also means a degenerate snapshot is accepted here,
+        // which is correct: an empty dump onto an empty database is a no-op.
+        false,
+        &snapshot_stream_type(site),
+    )
+    .await
+    {
+        Ok(watermark) => tracing::info!(
+            site = %site,
+            previous_owner = %previous.id,
+            watermark,
+            "ownership handoff complete; this node now serves the site's own data"
+        ),
+        Err(e) => tracing::warn!(
+            site = %site,
+            previous_owner = %previous.id,
+            "ownership handoff failed; serving this site from an empty local database until \
+             the previous owner is reachable or ownership moves back: {e:#}"
+        ),
+    }
+}
+
+/// The **data lineage** of a per-site database: the identity of the CDC log its
+/// contents descend from, or `None` when it holds no data at all.
+///
+/// This is the invariant the per-site replica path turns on — *who is
+/// authoritative for the bytes already on this disk*:
+///
+/// - A database seeded by a bootstrap has the serving owner's log id recorded
+///   in [`SOURCE_LOG_TABLE`]; its lineage is that owner's log.
+/// - A database with user tables and **no** source record is **local-origin**:
+///   this node created the site and its writes are the only writes it has ever
+///   had. Its lineage is therefore its *own* log id, which this function
+///   records so the origin is never re-derived (and never mistaken for
+///   something else) again.
+/// - A cold database has no lineage: there is nothing to be authoritative for.
+///
+/// # Why the "no source record" case is not divergence
+///
+/// It used to be read as one: `replicate_site_once` treated "tables but no
+/// owner source" as a diverged replica and dropped every user table before
+/// bootstrapping. But that is precisely the state of the node that **created**
+/// the site — it has never been anyone's replica, so nothing ever wrote a
+/// source record for it. HRW re-homing (a node merely *joining* is enough) then
+/// sent that node into the replica arm and destroyed the tenant's only copy of
+/// its data. Lineage names the origin explicitly instead of inferring
+/// divergence from an absence.
+///
+/// Divergence is still handled — but only when it is *proven*, by a CDC apply
+/// colliding with local state (`force_reset`), never by inference.
+///
+/// # Errors
+///
+/// Returns an error if the bookkeeping read or the lineage stamp fails.
+async fn site_data_lineage(
+    conn: &turso::Connection,
+    own_log_id: &str,
+) -> anyhow::Result<Option<String>> {
+    if let Some(source) = read_single_text(conn, SOURCE_LOG_TABLE, "log_id")
+        .await
+        .context("per-site replica: read owner-source record")?
+    {
+        return Ok(Some(source));
+    }
+    if local_db_is_cold(conn).await.context("per-site replica: cold-start check")? {
+        return Ok(None);
+    }
+    // Non-cold with no recorded source: this node is the origin of the data.
+    set_source_log(conn, own_log_id)
+        .await
+        .context("per-site replica: record this node as the site's data origin")?;
+    tracing::info!(
+        log_id = %own_log_id,
+        "per-site database has local-origin data and no recorded source log; stamping this \
+         node's own CDC log as its lineage (it created the site — it is not a diverged replica)"
+    );
+    Ok(Some(own_log_id.to_string()))
+}
+
+/// What a replica attempt must do before it can tail the owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicaAction {
+    /// Fetch the owner's snapshot first. `discard_local` says whether local
+    /// user tables must be dropped to make room for it — only ever true when
+    /// this node holds data AND divergence has been proven.
+    Bootstrap { discard_local: bool },
+    /// The local database has a lineage and no proven divergence: tail the
+    /// owner's CDC on top of it, destroying nothing.
+    TailOnly,
+}
+
+/// Decide a replica attempt from `(proven divergence, data lineage)`.
+///
+/// Pure so the re-homing scenario is unit-testable without a cluster: see
+/// `originating_node_is_not_treated_as_a_diverged_replica`.
+fn plan_replica_attempt(force_reset: bool, lineage: Option<&str>) -> ReplicaAction {
+    match lineage {
+        // No data of our own — a fresh replica. Bootstrap, nothing to discard.
+        None => ReplicaAction::Bootstrap { discard_local: false },
+        // We hold data. Only a *proven* divergence (a CDC batch that collided
+        // with local state) justifies discarding it.
+        Some(_) if force_reset => ReplicaAction::Bootstrap { discard_local: true },
+        Some(_) => ReplicaAction::TailOnly,
+    }
+}
+
 /// One replica attempt for `site`: (re-)bootstrap from the owner when needed,
 /// then tail `cdc/<site>` and apply until the stream ends.
 ///
-/// A replica is **authoritative-from-owner**. It bootstraps from the owner's
-/// snapshot — which seeds the watermark to the owner's head, so the subsequent
-/// tail resumes *past* the schema DDL and never replays a colliding
-/// `CREATE TABLE` — whenever any of these hold:
+/// A replica is **authoritative-from-owner** *for data it received from an
+/// owner*. It bootstraps from the owner's snapshot — which seeds the watermark
+/// to the owner's head, so the subsequent tail resumes *past* the schema DDL
+/// and never replays a colliding `CREATE TABLE` — when either:
 ///
-/// - `force_reset`: a prior tail collided with divergent local state.
-/// - the local database is cold (fresh replica).
-/// - the local database has tables but **no owner-source record**: its state is
-///   local-origin (a stray non-owner write on this node — the deferred
-///   write-forwarding gap), so it must not be tailed on top of.
+/// - the local database has no [`site_data_lineage`] (a fresh/cold replica), or
+/// - `force_reset`: a prior tail collided with divergent local state, which is
+///   the one *proof* of divergence this path accepts.
 ///
-/// When it re-bootstraps a non-cold database it first **discards the local
-/// user tables** so the owner's snapshot applies clean. This is the fix for a
-/// replica that had written its own `markers` table before the owner's CDC
-/// batch tried to `CREATE` it — which used to wedge the apply loop forever.
+/// A re-bootstrap of a database that holds data discards its user tables, so it
+/// is ordered **fetch, then check, then discard, then apply** — never
+/// discard-then-fetch. A snapshot that carries no schema cannot replace live
+/// data (see [`snapshot_may_replace_local_data`]); the attempt fails and is
+/// retried instead.
 async fn replicate_site_once(
     site: &str,
     owner: SocketAddr,
     channel: &ephpm_cluster::ChannelHandle,
     factory: &Turso,
+    own_log_id: &str,
     max_snapshot_bytes: u64,
     force_reset: bool,
 ) -> anyhow::Result<()> {
     let conn = factory.raw_connection().context("per-site replica: open apply connection")?;
 
-    let cold = local_db_is_cold(&conn).await.context("per-site replica: cold-start check")?;
-    // A recorded source log means a prior bootstrap seeded this database from
-    // an owner; its absence on a non-cold database means local-origin (diverged)
-    // state.
-    let has_owner_source = read_single_text(&conn, SOURCE_LOG_TABLE, "log_id")
-        .await
-        .context("per-site replica: read owner-source record")?
-        .is_some();
-
-    if force_reset || cold || !has_owner_source {
-        if !cold {
-            reset_local_user_tables(&conn)
-                .await
-                .context("per-site replica: discard divergent local tables")?;
-        }
+    let lineage = site_data_lineage(&conn, own_log_id).await?;
+    if let ReplicaAction::Bootstrap { discard_local } =
+        plan_replica_attempt(force_reset, lineage.as_deref())
+    {
         let bconn =
             factory.raw_connection().context("per-site replica: open snapshot connection")?;
-        fetch_and_apply_snapshot_on(
+        bootstrap_site_from(
             &bconn,
+            site,
             owner,
             channel,
             max_snapshot_bytes,
+            discard_local,
             &snapshot_stream_type(site),
         )
         .await
@@ -3111,6 +3495,59 @@ async fn replicate_site_once(
         .await
         .with_context(|| format!("per-site replica: dial {owner} for {site}"))?;
     subscribe_and_consume(&mut stream, &conn).await
+}
+
+/// Fetch a snapshot for `site` from `source` and apply it locally, discarding
+/// the local user tables first when `discard_local`.
+///
+/// Fetch-then-swap: the dump is on hand and vetted *before* anything local is
+/// touched, so a peer that turns out to hold nothing costs a retry rather than
+/// a tenant's data.
+async fn bootstrap_site_from(
+    conn: &turso::Connection,
+    site: &str,
+    source: SocketAddr,
+    channel: &ephpm_cluster::ChannelHandle,
+    max_snapshot_bytes: u64,
+    discard_local: bool,
+    snapshot_stream: &str,
+) -> anyhow::Result<i64> {
+    let started = std::time::Instant::now();
+    let (header, dump, received) =
+        fetch_snapshot(source, channel, max_snapshot_bytes, snapshot_stream).await?;
+    install_snapshot(conn, &header, &dump, discard_local)
+        .await
+        .with_context(|| format!("per-site replica: snapshot for {site} from {source}"))?;
+    cdc_metrics::record_snapshot_received(received, started.elapsed());
+    cdc_metrics::record_applied_watermark(header.watermark);
+    Ok(header.watermark)
+}
+
+/// The local half of a per-site bootstrap: vet the fetched dump, then — and
+/// only then — discard local user tables (when `discard_local`) and apply it.
+///
+/// Separated from the transport so the destructive step is a pure function of
+/// data already in hand, and so the "an empty snapshot must not clobber live
+/// data" invariant is directly testable against a real database.
+///
+/// # Errors
+///
+/// Returns an error, **before touching anything local**, if the dump cannot
+/// replace the local data ([`snapshot_may_replace_local_data`]); or if the
+/// discard or the apply fails.
+async fn install_snapshot(
+    conn: &turso::Connection,
+    header: &SnapshotHeader,
+    dump: &str,
+    discard_local: bool,
+) -> anyhow::Result<()> {
+    snapshot_may_replace_local_data(dump, discard_local)?;
+    if discard_local {
+        reset_local_user_tables(conn)
+            .await
+            .context("per-site replica: discard divergent local tables")?;
+    }
+    apply_snapshot(conn, header, dump).await
 }
 
 /// User (non-bookkeeping) table names in a local database — the same predicate
@@ -3713,6 +4150,226 @@ mod tests {
 
         // And the owner's schema DDL now applies clean where it used to collide.
         conn.execute("CREATE TABLE markers (id INTEGER PRIMARY KEY, v TEXT)", ()).await.unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // Per-site ownership moves must not destroy data (PR #416 blocker 1).
+    // -----------------------------------------------------------------
+
+    /// Count rows in `table`, for asserting that data survived.
+    async fn row_count(conn: &turso::Connection, table: &str) -> i64 {
+        let mut stmt =
+            conn.prepare(&format!("SELECT COUNT(*) FROM {}", quote_ident(table))).await.unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        match rows.next().await.unwrap().unwrap().get_value(0).unwrap() {
+            turso::Value::Integer(i) => i,
+            v => panic!("unexpected count value: {v:?}"),
+        }
+    }
+
+    /// **The data-loss regression.** A node that CREATED a site has user tables
+    /// and no owner-source record — it has never been anyone's replica, so
+    /// nothing ever wrote one. HRW then re-homes the site (a node merely
+    /// *joining* is enough) and that node enters the replica arm.
+    ///
+    /// The old rule read "tables but no source record" as divergence and
+    /// dropped every user table before bootstrapping from the new owner, which
+    /// may hold nothing at all. This asserts the origin is now recognised as
+    /// the site's data lineage instead: the attempt tails, discards nothing,
+    /// and the tenant's rows are still there.
+    #[tokio::test]
+    async fn originating_node_is_not_treated_as_a_diverged_replica() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        let t = Turso::open(&path).await.unwrap();
+        let conn = t.raw_connection().unwrap();
+
+        // Exactly the state of the node that created the site and has been
+        // serving it as owner: real tenant data, its own CDC log identity, and
+        // no `__ephpm_cdc_source` (it has never bootstrapped from anyone).
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT)", ()).await.unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('hello')", ()).await.unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('world')", ()).await.unwrap();
+        let own_log = ensure_log_id(&conn).await.unwrap();
+        assert!(
+            read_single_text(&conn, SOURCE_LOG_TABLE, "log_id").await.unwrap().is_none(),
+            "precondition: an originating node has no owner-source record"
+        );
+
+        // Ownership moves away; this node evaluates a replica attempt.
+        let lineage = site_data_lineage(&conn, &own_log).await.unwrap();
+        assert_eq!(
+            lineage.as_deref(),
+            Some(own_log.as_str()),
+            "the origin's lineage is its own CDC log, not 'unknown'"
+        );
+        assert_eq!(
+            plan_replica_attempt(false, lineage.as_deref()),
+            ReplicaAction::TailOnly,
+            "re-homing a site must not send its originating node into a destructive \
+             re-bootstrap — that is how a joining node destroyed a tenant's only copy"
+        );
+
+        // The lineage is now recorded, so it is never re-derived...
+        assert_eq!(
+            read_single_text(&conn, SOURCE_LOG_TABLE, "log_id").await.unwrap().as_deref(),
+            Some(own_log.as_str())
+        );
+        // ...and the data is untouched.
+        assert_eq!(row_count(&conn, "posts").await, 2);
+
+        // A cold database still bootstraps (with nothing to discard), and a
+        // PROVEN divergence still re-bootstraps destructively.
+        assert_eq!(
+            plan_replica_attempt(false, None),
+            ReplicaAction::Bootstrap { discard_local: false }
+        );
+        assert_eq!(
+            plan_replica_attempt(true, lineage.as_deref()),
+            ReplicaAction::Bootstrap { discard_local: true }
+        );
+    }
+
+    /// **The second half of the same invariant.** Even when a re-bootstrap is
+    /// justified, an empty snapshot must not be able to complete it: the
+    /// discard-then-apply sequence used to succeed with an empty dump, leaving
+    /// the tenant with nothing. Vetting happens before anything local is
+    /// touched, so the rows are still there after the refusal.
+    #[tokio::test]
+    async fn empty_snapshot_cannot_clobber_a_populated_local_database() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let path = db.path().to_str().unwrap().to_string();
+        let t = Turso::open(&path).await.unwrap();
+        let conn = t.raw_connection().unwrap();
+
+        conn.execute("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT)", ()).await.unwrap();
+        conn.execute("INSERT INTO posts (title) VALUES ('irreplaceable')", ()).await.unwrap();
+
+        // What a node that has never held the site serves: a valid, empty dump.
+        let header = SnapshotHeader { watermark: 0, total_len: 0, log_id: "peer-log".into() };
+        assert!(
+            validate_snapshot_dump("").is_ok(),
+            "precondition: an empty dump passes the statement allowlist — which is exactly \
+             why the emptiness itself has to be checked"
+        );
+
+        let err = install_snapshot(&conn, &header, "", true).await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("degenerate snapshot"), "unexpected error: {msg}");
+
+        // Nothing was dropped and nothing was lost.
+        assert_eq!(list_user_tables(&conn).await.unwrap(), vec!["posts".to_string()]);
+        assert_eq!(row_count(&conn, "posts").await, 1);
+
+        // A snapshot that actually carries schema IS allowed to replace it.
+        install_snapshot(
+            &conn,
+            &header,
+            "CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT);\n\
+             INSERT OR REPLACE INTO posts (rowid, id, title) VALUES (1, 1, 'from-owner');\n",
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(row_count(&conn, "posts").await, 1);
+
+        // And an empty dump onto an EMPTY database is fine — a brand-new site
+        // on a fresh cluster must still bootstrap.
+        reset_local_user_tables(&conn).await.unwrap();
+        install_snapshot(&conn, &header, "", false).await.unwrap();
+    }
+
+    #[test]
+    fn degenerate_snapshot_detection() {
+        assert!(!snapshot_declares_a_table(""));
+        assert!(!snapshot_declares_a_table("   \n\t "));
+        assert!(!snapshot_declares_a_table("-- just a comment\n"));
+        // Indexes and inserts alone are not a schema.
+        assert!(!snapshot_declares_a_table("CREATE INDEX i ON t (a);"));
+        assert!(!snapshot_declares_a_table("INSERT OR REPLACE INTO t (rowid) VALUES (1);"));
+        // A real dump declares tables, comments and odd casing included.
+        assert!(snapshot_declares_a_table("CREATE TABLE t (a);"));
+        assert!(snapshot_declares_a_table("create   table \"t\" (a);"));
+        assert!(snapshot_declares_a_table(
+            "-- note\nCREATE TABLE t (a);\nINSERT INTO t VALUES (1);"
+        ));
+        // A `CREATE TABLE` mentioned inside a string literal is not a
+        // declaration — the scan is quote-aware.
+        assert!(!snapshot_declares_a_table("INSERT INTO t VALUES ('CREATE TABLE x (a)');"));
+    }
+
+    #[test]
+    fn snapshot_replacement_gate_only_bites_when_local_data_exists() {
+        // Populated local + empty dump: refuse.
+        assert!(snapshot_may_replace_local_data("", true).is_err());
+        // Populated local + real dump: allow.
+        assert!(snapshot_may_replace_local_data("CREATE TABLE t (a);", true).is_ok());
+        // Cold local: anything goes, including nothing.
+        assert!(snapshot_may_replace_local_data("", false).is_ok());
+    }
+
+    /// The previous owner of a site is HRW over the alive set *without this
+    /// node* — derivable identically on every node with no extra state, which
+    /// is what lets an ownership move pull the data with it.
+    #[test]
+    fn previous_owner_is_hrw_without_self() {
+        let node = |id: &str, ip: &str| ephpm_cluster::NodeInfo {
+            id: id.into(),
+            gossip_addr: format!("{ip}:7946"),
+            state: ephpm_cluster::NodeState::Alive,
+        };
+        let before = [node("ephpm-0", "10.0.0.1"), node("ephpm-1", "10.0.0.2")];
+        let after =
+            [node("ephpm-0", "10.0.0.1"), node("ephpm-1", "10.0.0.2"), node("ephpm-2", "10.0.0.3")];
+
+        // Find a site the joiner takes over — the case the handoff exists for.
+        let moved = (0..500)
+            .map(|i| format!("site-{i:03}"))
+            .find(|s| {
+                ephpm_cluster::hrw_owner(&after, s).unwrap().id == "ephpm-2"
+                    && ephpm_cluster::hrw_owner(&before, s).is_some()
+            })
+            .expect("some site must land on the joining node");
+
+        let old = ephpm_cluster::hrw_owner(&before, &moved).unwrap().id.clone();
+        let previous = previous_owner_of(&after, "ephpm-2", &moved).unwrap();
+        assert_eq!(
+            previous.id, old,
+            "the previous owner is exactly HRW over the set excluding the new owner"
+        );
+        // Its channel address is derived from gossip membership, never from an
+        // attacker-shapeable claim.
+        assert_eq!(
+            crate::sql_forward::member_channel_addr(&previous),
+            Some(
+                format!("{}:7948", previous.gossip_addr.split(':').next().unwrap())
+                    .parse()
+                    .unwrap()
+            )
+        );
+        // A sole member has no previous owner.
+        assert!(previous_owner_of(&before[..1], "ephpm-0", &moved).is_none());
+    }
+
+    #[test]
+    fn peer_is_node_compares_hosts_not_ports() {
+        let owner = ephpm_cluster::NodeInfo {
+            id: "ephpm-1".into(),
+            gossip_addr: "10.0.0.2:7946".into(),
+            state: ephpm_cluster::NodeState::Alive,
+        };
+        // Same host, cluster-channel port — this is what a real dial looks like.
+        assert!(peer_is_node(&owner, "10.0.0.2:7948".parse().unwrap()));
+        assert!(peer_is_node(&owner, "10.0.0.2:51234".parse().unwrap()));
+        // A different host is not that node.
+        assert!(!peer_is_node(&owner, "10.0.0.3:7948".parse().unwrap()));
+        // An unparseable gossip address never matches.
+        let broken = ephpm_cluster::NodeInfo {
+            id: "ephpm-9".into(),
+            gossip_addr: "not-an-addr".into(),
+            state: ephpm_cluster::NodeState::Alive,
+        };
+        assert!(!peer_is_node(&broken, "10.0.0.2:7948".parse().unwrap()));
     }
 
     #[test]

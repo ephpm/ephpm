@@ -1,7 +1,7 @@
 //! Multi-tenant KV store with per-site isolation.
 //!
 //! Each virtual host gets its own [`Store`] instance, created lazily on
-//! first access. Provides physical key isolation — a site's store is a
+//! first access. Provides physical key isolation â€” a site's store is a
 //! separate `DashMap`, not a prefix in a shared map.
 
 use std::sync::{Arc, RwLock};
@@ -18,19 +18,19 @@ use crate::store::{Replicator, Store, StoreConfig};
 /// existence on a request, on a RESP `AUTH`, or on an inbound replicated write
 /// from a peer. Registering a factory (see
 /// [`MultiTenantStore::set_replicator_factory`]) makes every one of those paths
-/// produce a store that already replicates — there is no window in which a
+/// produce a store that already replicates â€” there is no window in which a
 /// vhost's writes are silently node-local.
 ///
 /// The factory receives the site key **and the freshly-built store it is being
 /// installed on**, and returns that site's replicator (which namespaces the
-/// site's keys on the wire — see `ephpm-cluster`'s `site_namespace`).
+/// site's keys on the wire â€” see `ephpm-cluster`'s `site_namespace`).
 ///
 /// # The store is passed in, never looked up
 ///
 /// Handing the store to the factory is a hard requirement, not a convenience.
 /// A factory that instead resolved its own store by calling back into
 /// [`MultiTenantStore::get_site_store`] would re-enter this type while the
-/// caller was mid-creation for that same site — and, when creation ran inside a
+/// caller was mid-creation for that same site â€” and, when creation ran inside a
 /// `DashMap` entry closure, that re-entry deadlocked on the shard lock and hung
 /// **every** PHP request on the node. The signature now makes that shape
 /// unrepresentable: there is nothing for the factory to look up.
@@ -39,18 +39,18 @@ use crate::store::{Replicator, Store, StoreConfig};
 ///
 /// A factory runs on the request thread during a site's first access. It must
 /// not block, `block_on`, await a task, or acquire a lock that cluster
-/// machinery might hold — build the replicator value and return. Anything that
+/// machinery might hold â€” build the replicator value and return. Anything that
 /// could wait belongs in a spawned task inside the replicator's own methods.
 /// (It must also not call [`tokio::runtime::Handle::current`], which panics off
 /// a runtime thread; capture the handle when the factory is built instead.)
 ///
 /// # Re-entrancy
 ///
-/// A factory **may** call back into the registry for a *different* site —
+/// A factory **may** call back into the registry for a *different* site â€”
 /// [`MultiTenantStore::get_site_store`] holds no lock while a factory runs, so
 /// that is safe. It must **not** ask for the site it is currently being built
 /// for: that is a request for the very store under construction, and it
-/// recurses. There is never a reason to — the store is the factory's second
+/// recurses. There is never a reason to â€” the store is the factory's second
 /// argument.
 pub type SiteReplicatorFactory =
     Arc<dyn Fn(&str, &Arc<Store>) -> Arc<dyn Replicator> + Send + Sync>;
@@ -122,7 +122,7 @@ impl MultiTenantStore {
     /// Get or create a store for the given hostname.
     ///
     /// The store is created lazily on first access with the template config,
-    /// and — when a [`SiteReplicatorFactory`] is installed — with that site's
+    /// and â€” when a [`SiteReplicatorFactory`] is installed â€” with that site's
     /// replicator already wired, so its very first write fans out to peers.
     /// Subsequent calls return the same store instance.
     ///
@@ -132,14 +132,14 @@ impl MultiTenantStore {
     /// replicator are built entirely outside the map; the map is touched only
     /// for the final insert-if-absent, which runs no callback. This is load
     /// bearing: an earlier revision built the store inside a `DashMap` entry
-    /// closure — which holds the shard lock for the closure's duration — and a
+    /// closure â€” which holds the shard lock for the closure's duration â€” and a
     /// factory that re-entered this method deadlocked that shard, hanging every
     /// PHP request on the node. Building first also means a factory is free to
     /// be arbitrarily involved without any lock-ordering obligation.
     ///
     /// Losing a creation race is safe: the loser's store is discarded *before*
     /// it is returned to anyone, so no write can ever land in a store that is
-    /// not the one in the map. Every caller — winner and loser alike — gets the
+    /// not the one in the map. Every caller â€” winner and loser alike â€” gets the
     /// single store the map holds.
     #[must_use]
     pub fn get_site_store(&self, hostname: &str) -> Arc<Store> {
@@ -161,8 +161,8 @@ impl MultiTenantStore {
             candidate.set_replicator(Some(factory(hostname, &candidate)));
         }
 
-        // Publish it. `or_insert` takes the shard lock only to insert-or-read —
-        // it runs no closure — and returns whatever the map holds, so a racing
+        // Publish it. `or_insert` takes the shard lock only to insert-or-read â€”
+        // it runs no closure â€” and returns whatever the map holds, so a racing
         // pair converges on one store instead of the loser's being dropped out
         // from under a caller that had already been handed it.
         let winner = {
@@ -329,7 +329,7 @@ mod tests {
     }
 
     /// Every lazily-created site store gets the factory's replicator, so a
-    /// vhost replicates from its very first write — including a site created
+    /// vhost replicates from its very first write â€” including a site created
     /// by an inbound replicated write rather than a local request.
     #[test]
     fn replicator_factory_is_installed_on_lazily_created_site_stores() {
@@ -350,6 +350,9 @@ mod tests {
             }
             fn replicate_expire(&self, _key: &str, _ttl: Duration) -> bool {
                 true
+            }
+            fn replicate_published(&self, key: String, _v: Vec<u8>, _t: Option<Duration>) {
+                self.sets.lock().unwrap().push(format!("{}:{key}", self.site));
             }
         }
 
@@ -405,6 +408,9 @@ mod tests {
             fn replicate_expire(&self, _key: &str, _ttl: Duration) -> bool {
                 true
             }
+            fn replicate_published(&self, _k: String, _v: Vec<u8>, _t: Option<Duration>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let _ = Mutex::new(());
 
@@ -429,16 +435,16 @@ mod tests {
     /// This is the shape that took the live cluster down: the real factory
     /// resolved its own store via `get_site_store`, creation ran inside a
     /// `DashMap` entry closure (which holds the shard lock for the closure's
-    /// duration), and the re-entry deadlocked that shard — hanging *every* PHP
+    /// duration), and the re-entry deadlocked that shard â€” hanging *every* PHP
     /// request on the node, since multi-tenant dispatch calls `get_site_store`
     /// per request. The earlier tests all used trivial closures and passed
     /// straight through it.
     ///
     /// The signature now hands the store to the factory so production has no
-    /// reason to re-enter — but a factory *may* still legitimately touch the
+    /// reason to re-enter â€” but a factory *may* still legitimately touch the
     /// registry for a **different** site (e.g. to consult a sibling), and that
     /// must not be able to hang. (Asking for the site being built is forbidden
-    /// by the factory contract — it is a request for the store under
+    /// by the factory contract â€” it is a request for the store under
     /// construction.) Wrapped in a watchdog thread: a deadlock here would
     /// otherwise hang the whole test binary rather than fail it.
     #[test]
@@ -458,6 +464,7 @@ mod tests {
             fn replicate_expire(&self, _key: &str, _ttl: Duration) -> bool {
                 true
             }
+            fn replicate_published(&self, _k: String, _v: Vec<u8>, _t: Option<Duration>) {}
         }
 
         let done = Arc::new(AtomicBool::new(false));
@@ -495,7 +502,7 @@ mod tests {
         assert!(
             rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok()
                 && done.load(Ordering::SeqCst),
-            "get_site_store deadlocked with a re-entrant factory — no user code may run \
+            "get_site_store deadlocked with a re-entrant factory â€” no user code may run \
              while a shard lock is held"
         );
     }
@@ -520,6 +527,7 @@ mod tests {
             fn replicate_expire(&self, _key: &str, _ttl: Duration) -> bool {
                 true
             }
+            fn replicate_published(&self, _k: String, _v: Vec<u8>, _t: Option<Duration>) {}
         }
 
         let (tx, rx) = mpsc::channel();
@@ -545,7 +553,7 @@ mod tests {
 
             let first = &stores[0];
             let all_same = stores.iter().all(|s| Arc::ptr_eq(s, first));
-            // Every racer's write must be visible through the registry — proof
+            // Every racer's write must be visible through the registry â€” proof
             // that nobody was handed a store that was then discarded.
             // `set_local` bypasses the installed replicator (whose `Noop`
             // implementation deliberately writes nothing), so this measures
@@ -568,13 +576,13 @@ mod tests {
     }
 
     /// With no factory installed (single-node multi-tenant), site stores stay
-    /// purely local — the pre-existing behaviour.
+    /// purely local â€” the pre-existing behaviour.
     #[test]
     fn without_a_factory_site_stores_stay_node_local() {
         let default = Store::new(StoreConfig::default());
         let mt = MultiTenantStore::new(default, test_config());
         let site = mt.get_site_store("alice.test");
-        // No replicator installed → `set` writes straight to the local map.
+        // No replicator installed â†’ `set` writes straight to the local map.
         assert!(site.set("k".into(), b"v".to_vec(), None));
         assert_eq!(site.get("k").as_deref(), Some(&b"v"[..]));
     }

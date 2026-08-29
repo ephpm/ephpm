@@ -24,7 +24,7 @@ pub mod sqlite_election;
 
 pub use cluster_channel::{
     ChannelStream, FeatureFlags as ChannelFeatureFlags, Handle as ChannelHandle, IncomingStream,
-    maybe_start as maybe_start_cluster_channel, stream_type,
+    maybe_start as maybe_start_cluster_channel, peer_is_cluster_member, stream_type,
 };
 pub use clustered_store::{ClusteredStore, KvReplicator, SiteKvReplicator};
 pub use kv_data_plane as data_plane;

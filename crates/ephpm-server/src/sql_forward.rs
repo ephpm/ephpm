@@ -36,6 +36,17 @@
 //! `pdo_mysql` credentials, so no cluster-wide `DB_PASSWORD` derivation is
 //! needed for this path.
 //!
+//! The channel's identity is coarse — "holds the cluster secret" plus a
+//! gossip-membership check on the peer address; there is no PKI and no
+//! per-node-id proof. So the owner side treats it as *authentication* only and
+//! adds its own *authorization*: the peer must still be a known member at
+//! stream-accept time, **and** this node must be the named site's current HRW
+//! owner. See [`serve_forwarded_sql`]. The trust boundary this leaves is
+//! per-cluster-node, not per-tenant: any node holding the cluster secret can
+//! reach any tenant database on the node that owns it. That is the same trust
+//! level the CDC and snapshot streams already assume; a per-tenant credential
+//! on this path is future work.
+//!
 //! # Transaction affinity
 //!
 //! Each [`RemoteProxyConn`] holds **one** channel stream for its lifetime, and
@@ -423,6 +434,39 @@ fn derived_channel_addr(gossip_addr: &str) -> Option<SocketAddr> {
     Some(SocketAddr::new(gossip.ip(), port))
 }
 
+/// The cluster-channel address of a known member, derived from the address
+/// gossip holds for it.
+///
+/// Derived rather than claim-advertised on purpose: a gossip *membership*
+/// address is published by the membership layer, whereas an election claim is a
+/// plain KV value any writer can shape. Callers that need to dial a member for
+/// which no validated claim exists (e.g. the ownership handoff in `turso_cdc`)
+/// use this and never an attacker-shapeable string.
+#[must_use]
+pub(crate) fn member_channel_addr(node: &NodeInfo) -> Option<SocketAddr> {
+    derived_channel_addr(&node.gossip_addr)
+}
+
+/// Is `peer` an address gossip currently knows as a cluster member?
+///
+/// # The identity the channel gives us
+///
+/// The cluster channel authenticates a peer as "holds the shared `[cluster]`
+/// secret" (mutual challenge/response) and encrypts the connection per session,
+/// and it admits inbound connections only from IPs gossip knows. What it does
+/// **not** give is a per-node-id identity: there is no PKI, so the strongest
+/// statement available at a stream handler is "an authenticated member, by
+/// address". This re-checks that at stream-accept time, because admission ran
+/// once when the TCP connection was opened and membership can change while a
+/// long-lived connection stays up.
+///
+/// Authentication is not authorization, so [`serve_forwarded_sql`] pairs this
+/// with the HRW ownership gate: a member may only reach a tenant database on a
+/// node that is currently that site's owner.
+async fn peer_is_member(cluster: &ClusterHandle, peer: SocketAddr) -> bool {
+    ephpm_cluster::peer_is_cluster_member(cluster, peer.ip()).await
+}
+
 // ---------------------------------------------------------------------------
 // Owner side: serve forwarded statements against the local per-site backend.
 // ---------------------------------------------------------------------------
@@ -477,8 +521,24 @@ pub fn spawn_owner_sql_handler(
     }));
 }
 
-/// Serve one forwarding stream: HRW-gate, open the site's local session once,
-/// then execute each forwarded statement against it and stream the reply back.
+/// Serve one forwarding stream: authorize the peer, HRW-gate, open the site's
+/// local session once, then execute each forwarded statement against it and
+/// stream the reply back.
+///
+/// # Authorization
+///
+/// Two checks, both required, because this stream grants read **and write**
+/// access to one tenant's database:
+///
+/// 1. **The peer is a cluster member** ([`peer_is_member`]) — re-verified here
+///    rather than trusted from connection admission, since membership can
+///    change under a long-lived connection. This is the strongest identity the
+///    channel offers (secret-holder + known address); there is no per-node PKI.
+/// 2. **This node currently owns the site** by HRW. Membership alone is not
+///    authorization: without this, a member could reach any tenant database on
+///    any node just by naming it. Ownership is also what makes the write
+///    correct — only the owner's writes are captured into the CDC log that
+///    replicates.
 ///
 /// Holds the site's backend `Arc` for the stream's lifetime so the registry's
 /// refcount-aware LRU cannot evict the database out from under the live owner
@@ -491,6 +551,15 @@ async fn serve_forwarded_sql(
     site: &str,
     peer: SocketAddr,
 ) -> anyhow::Result<()> {
+    if !peer_is_member(cluster, peer).await {
+        tracing::warn!(
+            peer = %peer,
+            site = %site,
+            "forwarded-SQL: refusing a stream from an address gossip does not know as a \
+             cluster member"
+        );
+        return Ok(());
+    }
     let nodes = cluster.nodes().await;
     if hrw_owner(&nodes, site).is_none_or(|n| n.id != *self_id) {
         tracing::warn!(
@@ -604,6 +673,49 @@ mod tests {
         let dead = [node("ephpm-0", NodeState::Dead)];
         assert!(should_serve_locally(&dead, "ephpm-0", "tenant-a"));
         assert!(should_serve_locally(&[], "ephpm-0", "tenant-a"));
+    }
+
+    /// The owner side needs BOTH gates. HRW ownership alone would let any
+    /// cluster member reach any tenant database on any node just by naming it;
+    /// membership alone would let a member reach a database on a node that is
+    /// not the site's owner (whose writes are not captured for replication and
+    /// would be discarded). This pins the ownership half — the membership half
+    /// is `peer_is_member`, which needs a live gossip mesh.
+    #[test]
+    fn only_the_current_owner_may_serve_a_forwarded_stream() {
+        let nodes = [
+            node("ephpm-0", NodeState::Alive),
+            node("ephpm-1", NodeState::Alive),
+            node("ephpm-2", NodeState::Alive),
+        ];
+        let owner = hrw_owner(&nodes, "tenant-a").unwrap().id.clone();
+        // The gate `serve_forwarded_sql` applies, stated directly.
+        let owns = |me: &str| hrw_owner(&nodes, "tenant-a").is_some_and(|n| n.id == *me);
+        assert!(owns(&owner));
+        for n in &nodes {
+            if n.id != owner {
+                assert!(!owns(&n.id), "a non-owner must refuse a forwarded-SQL stream");
+            }
+        }
+        // No alive node at all: refuse rather than serve (fail closed) — the
+        // resolver's "degrade to local" only applies on the client side.
+        assert!(hrw_owner(&[], "tenant-a").is_none());
+    }
+
+    #[test]
+    fn member_channel_addr_is_derived_from_gossip_membership() {
+        let n = NodeInfo {
+            id: "ephpm-1".into(),
+            gossip_addr: "10.0.0.2:7946".into(),
+            state: NodeState::Alive,
+        };
+        assert_eq!(member_channel_addr(&n), Some("10.0.0.2:7948".parse().unwrap()));
+        let broken = NodeInfo {
+            id: "ephpm-2".into(),
+            gossip_addr: "nonsense".into(),
+            state: NodeState::Alive,
+        };
+        assert_eq!(member_channel_addr(&broken), None);
     }
 
     #[test]

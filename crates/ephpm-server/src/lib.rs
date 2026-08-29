@@ -2093,6 +2093,7 @@ async fn start_db_proxies(
                 wiring.site_events,
                 wiring.registry,
                 &mut handles,
+                &primary_view,
             )
             .await?;
         } else if is_clustered_sqlite(sqlite_config, cluster.is_some()) {

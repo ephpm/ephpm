@@ -54,6 +54,27 @@
 //! startup grace + election so a node that still has the data can win. When
 //! the data identity is unchanged the deliberate fast-restart behaviour is
 //! preserved unchanged.
+//!
+//! # Per-site ownership converges on live membership
+//!
+//! The per-site election ([`SqliteElection::new_per_site`]) does **not**
+//! use lowest-ordinal: the owner of a site is `hrw_owner(alive, site)`, a
+//! pure function of the site key and the current alive set. Two rules
+//! follow from that, enforced in `evaluate_role`:
+//!
+//! 1. A node stops refreshing its own claim as soon as HRW no longer
+//!    names it — the claim expires and the real owner takes over.
+//! 2. A foreign claim never wins over live HRW: if HRW names *us*, the
+//!    claim predates the membership change and we elect regardless of
+//!    whether its author is alive.
+//!
+//! Without those, a claim outlived the membership change that invalidated
+//! it: the stale claimant kept the gossip key alive while refusing to
+//! serve `cdc/<site>` (the serving side has always gated on live HRW),
+//! and the real owner retried a refused dial forever — that site's
+//! replication wedged permanently. The claim carries the owner's
+//! *address* and its CDC log identity; it is not the ownership record.
+//! The single-database election is untouched by all of this.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,13 +101,26 @@ fn primary_key_for_site(site: &str) -> String {
 }
 
 /// The node currently claiming ownership of `site` in the per-site primary
-/// election, as `(node_id, channel_addr)`, if any claim is published.
+/// election, as `(node_id, channel_addr)`, if any **member-validated** claim
+/// is published.
 ///
 /// The claim's `channel_addr` is that node's cluster-channel advertise
 /// address — exactly what a non-owner must dial to forward `sql/<site>`
 /// statements to the owner. Returns `None` when no claim is published yet
-/// (a site no node has opened), in which case the caller falls back to the
-/// HRW owner's *derived* channel address.
+/// (a site no node has opened) **or when the claim's advertised address does
+/// not belong to a known cluster member**, in which case the caller falls back
+/// to the HRW owner's *derived* channel address.
+///
+/// # Why the member check is load-bearing here
+///
+/// The gossip KV tier is last-write-wins and carries no per-key authorship
+/// proof, so a claim is attacker-influenceable in the same threat model
+/// [`SqliteElection::replica_url_for`] defends against. The caller
+/// (`sql_forward::ClusteredSiteResolver`) *dials* this address and forwards
+/// every one of that tenant's SQL statements — including bound parameters —
+/// to it, so an unvalidated address is a full read/write SSRF against one
+/// tenant's data. Validation is identical to `replica_url_for`'s: the host
+/// must match a currently-known gossip member's host. Fails closed.
 ///
 /// Decodes the same claim [`SqliteElection`] publishes under
 /// `"sqlite:primary:<site>"`, so the forwarding path and the election agree
@@ -94,7 +128,34 @@ fn primary_key_for_site(site: &str) -> String {
 pub async fn per_site_primary(cluster: &ClusterHandle, site: &str) -> Option<(String, String)> {
     let bytes = cluster.gossip_get(&primary_key_for_site(site)).await?;
     let claim = PrimaryClaim::decode(&bytes)?;
-    Some((claim.node_id, claim.grpc_addr))
+    let nodes = cluster.nodes().await;
+    let addr = claim_addr_if_member(&claim.grpc_addr, &nodes).or_else(|| {
+        tracing::warn!(
+            site = %site,
+            claimant = %claim.node_id,
+            claimed_addr = %claim.grpc_addr,
+            "refusing a per-site owner claim: the advertised cluster-channel host is not a \
+             known cluster member (possible forged gossip claim); falling back to the HRW \
+             owner's derived address"
+        );
+        None
+    })?;
+    Some((claim.node_id, addr))
+}
+
+/// The claim's advertised address, but only if its host belongs to a known
+/// gossip member. `None` (fail closed) otherwise, or when the address has no
+/// parseable host.
+///
+/// Host-only comparison, because a node's gossip address and the address it
+/// advertises for another service use different ports on the same host — the
+/// same rule [`SqliteElection::replica_url_for`] applies. Split out as a pure
+/// function so it is directly unit-testable without a live gossip mesh.
+#[must_use]
+fn claim_addr_if_member(claim_addr: &str, members: &[NodeInfo]) -> Option<String> {
+    let claim_host = host_of(claim_addr)?;
+    let known = members.iter().filter_map(|n| host_of(&n.gossip_addr));
+    member_hosts_contain(known, &claim_host).then(|| claim_addr.to_string())
 }
 
 /// Rendezvous-hash (HRW) score for placing `site` on the node named
@@ -354,10 +415,24 @@ impl SqliteElection {
                 ClaimKind::OwnFresh => {
                     // Our own (unexpired) claim survived a restart AND the
                     // database it describes is the one we still hold —
-                    // reclaiming is not a theft; refresh and carry on.
-                    self.publish_claim().await;
-                    tracing::info!("SQLite election: reclaiming our own surviving primary claim");
-                    return ElectedRole::Primary;
+                    // reclaiming is not a theft; refresh and carry on. In
+                    // per-site mode the reclaim is additionally conditional on
+                    // live HRW still naming us: ownership there is a function
+                    // of membership, and a claim that outlived its membership
+                    // must not be reasserted (see `per_site_hrw_names_us`).
+                    if self.site.is_none() || self.per_site_hrw_names_us().await {
+                        self.publish_claim().await;
+                        tracing::info!(
+                            "SQLite election: reclaiming our own surviving primary claim"
+                        );
+                        return ElectedRole::Primary;
+                    }
+                    tracing::info!(
+                        site = ?self.site,
+                        "per-site election: our surviving claim is no longer supported by live \
+                         HRW ownership; not reclaiming"
+                    );
+                    return ElectedRole::Replica { primary_grpc_url: String::new() };
                 }
                 ClaimKind::OwnStale => {
                     // Same node id, DIFFERENT CDC log identity: this node
@@ -441,9 +516,23 @@ impl SqliteElection {
             match classify_claim(&claim, &self_node.id, &self.log_id) {
                 ClaimKind::OwnFresh => {
                     // We are the primary and the claim describes the database
-                    // we still hold — refresh heartbeat.
-                    self.publish_claim().await;
-                    return ElectedRole::Primary;
+                    // we still hold — refresh heartbeat, unless live membership
+                    // has since moved this site's ownership elsewhere. In
+                    // per-site mode ownership is a pure function of the alive
+                    // set, so refreshing a claim HRW no longer supports is what
+                    // wedges the site (see `per_site_hrw_names_us`): stop
+                    // refreshing, let the claim expire, and fall through to
+                    // resolve the real owner. Single-DB mode is unaffected —
+                    // `per_site_hrw_names_us` is always false there.
+                    if self.site.is_none() || self.per_site_hrw_names_us().await {
+                        self.publish_claim().await;
+                        return ElectedRole::Primary;
+                    }
+                    tracing::info!(
+                        site = ?self.site,
+                        "per-site election: HRW ownership of this site moved to another node; \
+                         releasing our claim instead of refreshing it"
+                    );
                 }
                 ClaimKind::OwnStale => {
                     // Same node id, DIFFERENT CDC log identity (issue #344): a
@@ -471,8 +560,14 @@ impl SqliteElection {
                     let nodes = self.cluster.nodes().await;
                     let primary_alive =
                         nodes.iter().any(|n| n.id == claim.node_id && n.state == NodeState::Alive);
+                    // Per-site: if live HRW names US, the foreign claim predates
+                    // the membership change that gave us the site. Never
+                    // subordinate to it — fall through and elect. (Always false
+                    // in single-DB mode, so that path is byte-for-byte as it
+                    // was.)
+                    let hrw_names_us = self.per_site_hrw_names_us().await;
 
-                    if primary_alive {
+                    if primary_alive && !hrw_names_us {
                         // Conflict: we hold the primary role, yet a live peer
                         // claims it too (gossip KV is last-write-wins, so its
                         // newer write shadows ours). Do not yield
@@ -505,11 +600,20 @@ impl SqliteElection {
                         return ElectedRole::Replica { primary_grpc_url: String::new() };
                     }
 
-                    // Primary is dead — fall through to re-election.
-                    tracing::warn!(
-                        dead_primary = %claim.node_id,
-                        "primary node is dead, triggering re-election"
-                    );
+                    if hrw_names_us {
+                        tracing::info!(
+                            site = ?self.site,
+                            claimant = %claim.node_id,
+                            "per-site election: a stale claim names another node, but live HRW \
+                             names us as this site's owner; taking ownership"
+                        );
+                    } else {
+                        // Primary is dead — fall through to re-election.
+                        tracing::warn!(
+                            dead_primary = %claim.node_id,
+                            "primary node is dead, triggering re-election"
+                        );
+                    }
                 }
             }
         }
@@ -554,17 +658,26 @@ impl SqliteElection {
     async fn should_be_primary(&self) -> bool {
         let self_id = &self.cluster.self_node().id;
         let nodes = self.cluster.nodes().await;
+        node_should_be_primary(self.site.as_deref(), self_id, &nodes)
+    }
 
-        match &self.site {
-            Some(site) => hrw_owner(&nodes, site).is_some_and(|n| &n.id == self_id),
-            None => {
-                let lowest_alive = nodes
-                    .iter()
-                    .filter(|n| n.state == NodeState::Alive)
-                    .min_by(|a, b| a.id.cmp(&b.id));
-                lowest_alive.is_some_and(|n| &n.id == self_id)
-            }
+    /// Whether **live membership** currently makes this node the site's owner,
+    /// in per-site mode. Always `false` for the single-database election.
+    ///
+    /// This is the convergence rule for per-site ownership: the owner is a pure
+    /// function of `(site, alive members)`, so any claim that disagrees with it
+    /// is stale by definition — no matter who wrote it, or whether they are
+    /// still alive. The published claim exists to carry the owner's *address*
+    /// and its CDC log identity (the issue #344 guard), never to override
+    /// membership. Before this, a claim outlived the membership change that
+    /// invalidated it: the stale claimant kept refreshing it and refusing to
+    /// serve `cdc/<site>` (it gates serving on live HRW) while the real owner
+    /// retried a refused dial forever — a site's replication wedged permanently.
+    async fn per_site_hrw_names_us(&self) -> bool {
+        if self.site.is_none() {
+            return false;
         }
+        self.should_be_primary().await
     }
 
     /// Resolve a live conflict between our own primary role and a foreign
@@ -657,6 +770,28 @@ fn classify_claim(claim: &PrimaryClaim, self_id: &str, self_log_id: &str) -> Cla
         ClaimKind::OwnFresh
     } else {
         ClaimKind::OwnStale
+    }
+}
+
+/// Whether `self_id` should hold the primary role for the database this
+/// election governs, given the current membership view.
+///
+/// - **Per-site** (`site = Some`): `self_id` is the site's HRW owner
+///   ([`hrw_owner`]) among the alive nodes.
+/// - **Single-database** (`site = None`): `self_id` is the lowest-ordinal alive
+///   node (the documented single-DB rule).
+///
+/// A free function over an explicit membership slice so both the election's own
+/// `should_be_primary` and its tests exercise the same rule with no cluster.
+#[must_use]
+fn node_should_be_primary(site: Option<&str>, self_id: &str, nodes: &[NodeInfo]) -> bool {
+    match site {
+        Some(site) => hrw_owner(nodes, site).is_some_and(|n| n.id == self_id),
+        None => nodes
+            .iter()
+            .filter(|n| n.state == NodeState::Alive)
+            .min_by(|a, b| a.id.cmp(&b.id))
+            .is_some_and(|n| n.id == self_id),
     }
 }
 
@@ -1055,6 +1190,83 @@ mod tests {
             seen.insert(hrw_owner(&nodes, &site).unwrap().id.clone());
         }
         assert!(seen.len() >= 2, "HRW must spread sites across more than one node: {seen:?}");
+    }
+
+    // ----- Ownership converges on live membership (PR #416 blocker 3) -----
+
+    /// A site's owner is a pure function of `(site, alive set)`. When a node
+    /// joins and HRW re-homes the site, the previous owner must observe that it
+    /// is no longer the owner — that is what makes it stop refreshing its claim
+    /// instead of holding a key the serving side already disagrees with.
+    #[test]
+    fn per_site_ownership_follows_membership_changes() {
+        let before = [alive("ephpm-0"), alive("ephpm-1")];
+        // Find a site the joining node takes over, which is the interesting
+        // case (HRW deliberately re-homes only a fraction of sites).
+        let after = [alive("ephpm-0"), alive("ephpm-1"), alive("ephpm-2")];
+        let moved = (0..500)
+            .map(|i| format!("site-{i:03}"))
+            .find(|site| {
+                hrw_owner(&before, site).unwrap().id != hrw_owner(&after, site).unwrap().id
+            })
+            .expect("some site must re-home when a third node joins");
+
+        let old_owner = hrw_owner(&before, &moved).unwrap().id.clone();
+        let new_owner = hrw_owner(&after, &moved).unwrap().id.clone();
+        assert_ne!(old_owner, new_owner);
+
+        // Before the join the old owner is the owner...
+        assert!(node_should_be_primary(Some(&moved), &old_owner, &before));
+        // ...and after it, it is NOT — so the OwnFresh arm releases its claim
+        // rather than refreshing a claim live membership no longer supports.
+        assert!(
+            !node_should_be_primary(Some(&moved), &old_owner, &after),
+            "a stale claimant must not still evaluate as the owner after the membership change"
+        );
+        // The new owner elects, even though a live foreign claim still names
+        // the old one.
+        assert!(node_should_be_primary(Some(&moved), &new_owner, &after));
+    }
+
+    /// The single-database rule is untouched: lowest-ordinal alive node, dead
+    /// nodes excluded.
+    #[test]
+    fn single_db_ownership_is_still_lowest_ordinal() {
+        let nodes = [dead("ephpm-a"), alive("ephpm-b"), alive("ephpm-c")];
+        assert!(node_should_be_primary(None, "ephpm-b", &nodes));
+        assert!(!node_should_be_primary(None, "ephpm-c", &nodes));
+        assert!(!node_should_be_primary(None, "ephpm-a", &nodes), "a dead node never wins");
+        assert!(!node_should_be_primary(None, "ephpm-b", &[]), "no members, no primary");
+    }
+
+    // ----- Per-site claim address validation (PR #416 blocker 2) -----
+
+    fn member_at(id: &str, gossip: &str) -> NodeInfo {
+        NodeInfo { id: id.into(), gossip_addr: gossip.into(), state: NodeState::Alive }
+    }
+
+    /// `per_site_primary`'s address is dialed and every one of that tenant's
+    /// SQL statements is forwarded to it, so a claim naming a host gossip does
+    /// not know must be refused — the same rule `replica_url_for` applies.
+    #[test]
+    fn per_site_claim_address_must_belong_to_a_member() {
+        let members =
+            [member_at("ephpm-0", "10.0.1.2:7946"), member_at("ephpm-1", "10.0.1.3:7946")];
+
+        // A member's host on a different port (the channel port) is accepted.
+        assert_eq!(
+            claim_addr_if_member("10.0.1.3:7948", &members).as_deref(),
+            Some("10.0.1.3:7948")
+        );
+        // An attacker-chosen host is refused, so the caller falls back to the
+        // HRW owner's derived address instead of dialing it.
+        assert_eq!(claim_addr_if_member("6.6.6.6:7948", &members), None);
+        // So is a DNS-shaped host that is not a member, and a malformed one.
+        assert_eq!(claim_addr_if_member("evil.example.com:7948", &members), None);
+        assert_eq!(claim_addr_if_member("no-port-here", &members), None);
+        assert_eq!(claim_addr_if_member("", &members), None);
+        // With no members at all nothing validates (fail closed).
+        assert_eq!(claim_addr_if_member("10.0.1.3:7948", &[]), None);
     }
 
     #[test]
