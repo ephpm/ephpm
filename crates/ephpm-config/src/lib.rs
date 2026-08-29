@@ -1764,11 +1764,21 @@ pub struct TlsConfig {
     ///
     /// When set, `server.listen` serves HTTP and this address serves HTTPS.
     /// When omitted, `server.listen` serves HTTPS directly (no HTTP listener).
+    ///
+    /// "`server.listen` serves HTTP" holds unconditionally — it does not
+    /// depend on [`redirect_http`](Self::redirect_http). Setting this address
+    /// is what splits the two protocols across two ports; TLS is never
+    /// negotiated on `server.listen` while this is set.
     #[serde(default)]
     pub listen: Option<String>,
 
     /// When `true` and `listen` is set, the HTTP listener redirects
     /// all requests to HTTPS with a 301 Moved Permanently response.
+    ///
+    /// This chooses only what the plain-HTTP listener *says*. When `false`
+    /// that listener still serves plain HTTP — it answers requests normally
+    /// instead of redirecting. It never turns the HTTP listener into a
+    /// second HTTPS listener.
     ///
     /// Default: `false`.
     #[serde(default)]
