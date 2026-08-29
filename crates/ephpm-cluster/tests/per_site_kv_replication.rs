@@ -82,6 +82,17 @@ fn free_shared_port() -> u16 {
     panic!("could not find a port free on both 127.0.0.1 and 127.0.0.2");
 }
 
+/// Whether this host routes `127.0.0.2` to loopback so a second in-process node
+/// can bind it. Linux treats the whole `127.0.0.0/8` as loopback, so this is
+/// always true there; macOS only has `127.0.0.1` unless an alias is added
+/// (`sudo ifconfig lo0 alias 127.0.0.2`), so these two-IP tests cannot run on an
+/// unaliased macOS host. Callers skip rather than fail when this is false — the
+/// coverage is environmental, not a property of the code under test.
+fn second_loopback_bindable() -> bool {
+    std::net::TcpListener::bind("127.0.0.2:0").is_ok()
+        && std::net::UdpSocket::bind("127.0.0.2:0").is_ok()
+}
+
 /// A free UDP port on `ip`, for gossip.
 fn free_gossip_addr(ip: &str) -> String {
     let sock = std::net::UdpSocket::bind((ip, 0)).expect("gossip probe bind");
@@ -185,6 +196,13 @@ where
 /// replication tiers and for a counter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn per_site_writes_replicate_between_two_nodes() {
+    if !second_loopback_bindable() {
+        eprintln!(
+            "skipping per_site_writes_replicate_between_two_nodes: 127.0.0.2 is not \
+             bindable on this host (macOS needs `sudo ifconfig lo0 alias 127.0.0.2`)"
+        );
+        return;
+    }
     let secret = "per-site-kv-replication-test-secret";
     let data_port = free_shared_port();
     let addr_a = free_gossip_addr("127.0.0.1");
@@ -251,6 +269,13 @@ async fn per_site_writes_replicate_between_two_nodes() {
 /// the envelope with SET.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn per_site_delete_replicates_between_two_nodes() {
+    if !second_loopback_bindable() {
+        eprintln!(
+            "skipping per_site_delete_replicates_between_two_nodes: 127.0.0.2 is not \
+             bindable on this host (macOS needs `sudo ifconfig lo0 alias 127.0.0.2`)"
+        );
+        return;
+    }
     let secret = "per-site-kv-delete-test-secret";
     let data_port = free_shared_port();
     let addr_a = free_gossip_addr("127.0.0.1");
