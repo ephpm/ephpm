@@ -16,7 +16,7 @@ These pages describe targets, not currently-shipped behavior. For what works tod
 - **[Benchmarks as a Release Artifact](benchmarks/)** — in-tree bench recipes, per-release numbers, and a regression gate.
 - **[NTS Prefork Mode](nts-prefork/)** — trading features for pure per-request PHP speed, gated on a post-PGO measurement.
 - **[The Deploy Story](deploy-warmup/)** — post-invalidation warmup, `ephpm doctor <framework>`, `cache status`, thin deploy hooks.
-- **[Preview Deployments](preview/)** — instant per-PR preview URLs via a GitHub bot. The runtime half (per-site databases, per-site document roots, the `[server] preview` limits preset) **shipped**; the bot ([`ephpm/switchboard`](https://github.com/ephpm/switchboard), public) is young — the open contract gaps and the wildcard-certificate problem are the design content.
+- **[Preview Deployments](preview/)** — instant per-PR preview URLs via a GitHub bot. **Shipped end to end** — the runtime half plus the [`ephpm/switchboard`](https://github.com/ephpm/switchboard) daemon, the [`ephpm/switchboard-api`](https://github.com/ephpm/switchboard-api) webhook receiver, and in-process wildcard certs via DNS-01. See the [PR Preview Bot guide](/guides/preview-bot/) to install it; this roadmap page now holds only the remaining design items (multi-PHP routing, GC/quotas, sandboxed builds, scale-out).
 - **[OPcache Clustering & Per-Vhost Preload](opcache-clustering/)** — Phase 1 (cluster-wide invalidation) shipped in 0.4.0; per-vhost preload and worker-mode invalidation remain.
 - **[Symfony Runtime Adapter](symfony-runtime-driver/)** — native `ephpm` adapter under `symfony/runtime`, on top of the shipped worker-mode engine.
 - **[Kubernetes Operator](kubernetes/)** — first-class K8s deployment.

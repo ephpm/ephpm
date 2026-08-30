@@ -108,7 +108,19 @@ The plain-HTTP listener only serves regular traffic (or 301-redirects when `redi
 
 ## DNS-01 challenge (wildcards)
 
-TLS-ALPN-01 cannot obtain a **wildcard** certificate (`*.example.com`): the CA has no single hostname to connect to. For wildcards — and for hosts that never accept inbound TLS — set `challenge = "dns-01"`, which proves control by publishing a `_acme-challenge` TXT record through a DNS provider. Implemented providers: **Cloudflare** (`cloudflare`), **Linode** (`linode`), **DigitalOcean** (`digitalocean`), **AWS Route 53** (`route53`), and **Google Cloud DNS** (`google`) — each needs its own credential (an API token for Cloudflare/Linode/DigitalOcean, access-key/secret for Route 53, a service-account key + project for Google).
+TLS-ALPN-01 cannot obtain a **wildcard** certificate (`*.example.com`): the CA has no single hostname to connect to. For wildcards — and for hosts that never accept inbound TLS — set `challenge = "dns-01"`, which proves control by publishing a `_acme-challenge` TXT record through a DNS provider. Five providers ship, each selected by `dns_provider` and each needing its own credential:
+
+| `dns_provider` | Provider | Credential fields | Optional zone hint |
+|----------------|----------|-------------------|--------------------|
+| `"cloudflare"` | Cloudflare | `cloudflare_api_token_file` / `cloudflare_api_token` (zone-scoped, `Zone.DNS:Edit`) | `cloudflare_zone_id` |
+| `"linode"` | Linode | `linode_api_token_file` / `linode_api_token` (scope `domains:read_write`) | — |
+| `"digitalocean"` | DigitalOcean | `digitalocean_api_token_file` / `digitalocean_api_token` (write scope) | — |
+| `"route53"` | AWS Route 53 | `route53_access_key_id` + `route53_secret_access_key_file` / `route53_secret_access_key` | `route53_hosted_zone_id` |
+| `"google"` | Google Cloud DNS | `google_service_account_json_file` / `google_service_account_json` + `google_project` | `google_managed_zone` |
+
+For every provider the same rule holds: the `*_file` variant wins over the inline value, and either can be supplied from the environment as `EPHPM_SERVER__TLS__<FIELD>` (e.g. `EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN`) so the secret stays out of `ephpm.toml`. ePHPm validates the selected provider's credentials at startup and refuses to start on a missing credential or an unknown `dns_provider`.
+
+### Cloudflare
 
 ```toml
 [server]
@@ -126,6 +138,71 @@ cloudflare_api_token_file = "/run/secrets/cf-token"
 ```
 
 The token must be a **zone-scoped Cloudflare API token** with the `Zone.DNS:Edit` permission on the zone that holds the records. If you also set `cloudflare_zone_id`, the token needs nothing more; otherwise ePHPm resolves the zone from the FQDN, which additionally needs `Zone:Read`.
+
+### Linode
+
+A Linode API v4 token scoped `domains:read_write`:
+
+```toml
+[server.tls]
+domains = ["*.preview.example.com", "preview.example.com"]
+email   = "admin@example.com"
+cache_dir = "/var/lib/ephpm/certs"
+challenge = "dns-01"
+dns_provider = "linode"
+linode_api_token_file = "/run/secrets/linode-token"
+# ...or: EPHPM_SERVER__TLS__LINODE_API_TOKEN=<token>
+```
+
+### DigitalOcean
+
+A DigitalOcean API token with write scope:
+
+```toml
+[server.tls]
+domains = ["*.preview.example.com", "preview.example.com"]
+email   = "admin@example.com"
+cache_dir = "/var/lib/ephpm/certs"
+challenge = "dns-01"
+dns_provider = "digitalocean"
+digitalocean_api_token_file = "/run/secrets/do-token"
+# ...or: EPHPM_SERVER__TLS__DIGITALOCEAN_API_TOKEN=<token>
+```
+
+### AWS Route 53
+
+An access-key/secret pair for an IAM identity allowed to change records in the hosted zone (`route53:ChangeResourceRecordSets` + `route53:ListResourceRecordSets`, plus `route53:ListHostedZonesByName` when you let ePHPm resolve the zone). On an account with more than ~100 hosted zones, set `route53_hosted_zone_id` explicitly — the zone lookup does not paginate.
+
+```toml
+[server.tls]
+domains = ["*.preview.example.com", "preview.example.com"]
+email   = "admin@example.com"
+cache_dir = "/var/lib/ephpm/certs"
+challenge = "dns-01"
+dns_provider = "route53"
+route53_access_key_id = "AKIA..."
+# ...or: EPHPM_SERVER__TLS__ROUTE53_ACCESS_KEY_ID=<id>
+route53_secret_access_key_file = "/run/secrets/aws-secret"
+# ...or: EPHPM_SERVER__TLS__ROUTE53_SECRET_ACCESS_KEY=<secret>
+route53_hosted_zone_id = "Z123EXAMPLE"   # optional — skips the zone lookup
+```
+
+### Google Cloud DNS
+
+A service-account JSON key with the `roles/dns.admin` role (or an equivalent custom role that can change record sets), plus the `google_project` that owns the Cloud DNS zone:
+
+```toml
+[server.tls]
+domains = ["*.preview.example.com", "preview.example.com"]
+email   = "admin@example.com"
+cache_dir = "/var/lib/ephpm/certs"
+challenge = "dns-01"
+dns_provider = "google"
+google_service_account_json_file = "/run/secrets/gcp-sa.json"
+# ...or: EPHPM_SERVER__TLS__GOOGLE_SERVICE_ACCOUNT_JSON=<json>
+google_project = "my-gcp-project"        # required
+google_managed_zone = "preview-zone"     # optional — skips the zone lookup
+```
 
 **Why wildcards matter here.** Let's Encrypt limits you to 50 certificates per registered domain per week. A fleet of ephemeral preview subdomains (`pr-123.preview.example.com`, …) would burn through that quickly with per-subdomain issuance; one `*.preview.example.com` certificate covers them all under a single order.
 

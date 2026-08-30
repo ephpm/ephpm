@@ -9,7 +9,8 @@ Task-oriented walkthroughs for common deployments.
 - **[WordPress](wordpress/)** — drop in a WordPress install with no PHP-FPM.
 - **[Laravel](laravel/)** — Laravel with embedded SQLite or MySQL passthrough.
 - **[Virtual Hosts](virtual-hosts/)** — multi-tenant directory-based hosting.
-- **[TLS / ACME](tls-acme/)** — automatic Let's Encrypt certificates.
+- **[TLS / ACME](tls-acme/)** — automatic Let's Encrypt certificates, including DNS-01 wildcards across five DNS providers.
+- **[PR Preview Bot](preview-bot/)** — per-PR preview URLs via the `switchboard` daemon + `switchboard-api` webhook receiver, running on ePHPm's multi-tenant runtime.
 - **[Clustering Setup](clustering-setup/)** — gossip-based HA with clustered SQLite.
 - **[Database from PHP](db-from-php/)** — the in-process `ephpm_db_*` bridge, and how it relates to the `pdo_mysql` wire path.
 - **[KV from PHP](kv-from-php/)** — the `ephpm_kv_*` SAPI functions.

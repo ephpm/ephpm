@@ -1,7 +1,8 @@
 # Preview Deployments
 
-> **Status: PARTLY SHIPPED.** Every pull request gets a live preview URL with
-> its own database, deployed in seconds and torn down on merge.
+> **Status: SHIPPED — end to end.** Every pull request gets a live preview URL
+> with its own database, deployed in seconds and torn down on close, with a
+> sticky PR comment carrying the link.
 >
 > - **The ePHPm runtime half has shipped.** Per-site databases
 >   ([`[db.sqlite] dir`](/reference/config/#dbsqlite)), per-site document roots
@@ -9,17 +10,22 @@
 >   discovery, per-site KV keyspaces and the
 >   [`[server] preview`](/reference/config/#server) limits preset are all in the
 >   binary. See [Virtual Hosts](/guides/virtual-hosts/) for how they behave.
-> - **The bot exists and is public.** [`ephpm/switchboard`](https://github.com/ephpm/switchboard)
->   is a separate Rust project (not part of this workspace) that receives
->   GitHub webhooks, clones, builds, and writes into ePHPm's `sites_dir`. It is
->   young — several contract pieces below are open issues on that repo.
-> - **What is still design:** wildcard-certificate issuance from inside ePHPm,
->   multi-PHP-version routing, teardown/GC policy, and scale-out past one VM.
+> - **The bot has shipped and is public.** Two projects, both separate from this
+>   workspace: [`ephpm/switchboard`](https://github.com/ephpm/switchboard) (the
+>   Rust deploy daemon) and
+>   [`ephpm/switchboard-api`](https://github.com/ephpm/switchboard-api) (the PHP
+>   webhook receiver that runs *on* ePHPm). Proven on
+>   [`ephpm/wordpress-sample`](https://github.com/ephpm/wordpress-sample).
+> - **Wildcard-certificate issuance has shipped too.** ePHPm's own
+>   [DNS-01 ACME lane](/guides/tls-acme/#dns-01-challenge-wildcards) issues the
+>   `*.preview.<domain>` wildcard in-process — no out-of-band certbot/lego step.
+> - **What is still design:** multi-PHP-version routing, stale-preview GC and
+>   per-preview disk quotas, sandboxed (containerized) build steps, and
+>   scale-out past one VM. Cluster mode exists but is not live-validated.
 >
-> This page is the plan and the open questions. It is not a reference for the
-> shipped knobs — those live in [Configuration](/reference/config/) and
-> [Virtual Hosts](/guides/virtual-hosts/) — and it is not the app-developer
-> guide, which lives in switchboard alongside the schema it documents.
+> **How it works and how to install it now live in the
+> [PR Preview Bot guide](/guides/preview-bot/).** This page is the remaining
+> plan and the open questions only.
 
 ## The two halves
 
@@ -27,12 +33,13 @@
 |-----------|------|----------|------|
 | **ephpm** | `ephpm/ephpm` | Rust | Serves every preview as a vhost. Owns TLS, routing, per-site DB/KV/sessions. |
 | **switchboard** (daemon) | [`ephpm/switchboard`](https://github.com/ephpm/switchboard) | Rust | Clones the PR, runs `build:`, materializes env, atomically swaps the checkout into `sites_dir`, runs `seed:`, health-gates. |
-| **switchboard-api** | `ephpm/switchboard-api` | PHP | **In progress.** The webhook receiver and GitHub App surface, split out of the daemon so the HTTP/GitHub side is a PHP app running *on* ePHPm. |
+| **switchboard-api** | [`ephpm/switchboard-api`](https://github.com/ephpm/switchboard-api) | PHP | The webhook receiver and GitHub App surface, running *on* ePHPm. HMAC-verifies each webhook, dedups it by delivery GUID, and publishes desired preview state. |
 
-The daemon is being reduced to `deployer.rs` / `manifest.rs` / `secrets.rs` —
-the deployment mechanics — with the webhook, signature verification and PR
-commenting moving to the PHP API. Dogfooding: the thing that ships previews
-should itself be a PHP app on ePHPm.
+The webhook, signature verification, delivery dedup and desired-state publishing
+live in the PHP API; the daemon owns the deployment mechanics (fetch, build,
+atomic swap, health-gate, comment). Dogfooding: the thing that ships previews is
+itself a PHP app on ePHPm. See the
+[PR Preview Bot guide](/guides/preview-bot/) for the full split.
 
 Both halves share the filesystem. Switchboard writes a directory under
 `sites_dir`; ePHPm discovers it on the next request. No IPC, no reload signal,
@@ -208,32 +215,31 @@ Documented but unfiled:
   per-site `[php]` overrides — see the Phase 2 note in
   [Virtual Hosts](/guides/virtual-hosts/).
 
-## TLS: the wildcard certificate problem
+## TLS: the wildcard certificate — solved
 
 The settled architecture wants one wildcard certificate for
-`*.preview.ephpm.dev`, obtained via a DNS-01 challenge. **ePHPm cannot issue
-that itself today.** Its built-in ACME (`rustls-acme`) solves **TLS-ALPN-01
-only** — there is no DNS-01 solver, and without DNS-01 there is no wildcard.
-Worse for previews, the ACME domain set is the fixed
-[`[server.tls] domains`](/reference/config/#servertls) list read at startup, so
-a hostname invented by a webhook five minutes ago cannot get a certificate on
-demand.
+`*.preview.<domain>`, and **ePHPm now issues it itself.** The
+[DNS-01 ACME lane](/guides/tls-acme/#dns-01-challenge-wildcards) proves control
+by publishing a `_acme-challenge` TXT record through a DNS provider (Cloudflare,
+Linode, DigitalOcean, AWS Route 53, or Google Cloud DNS) — the only challenge
+type that can obtain a wildcard — and hot-swaps the renewed certificate into the
+running listener with no restart. Set it once and every ephemeral preview
+subdomain is covered by the single wildcard:
 
-So the shipped path is: obtain the wildcard out of band (certbot, lego, or any
-DNS-01 client), and point `[server.tls] cert` / `key` at the resulting PEMs —
-ePHPm's manual TLS mode. Two consequences to plan around:
+```toml
+[server.tls]
+domains = ["*.preview.example.com", "preview.example.com"]
+email = "ops@example.com"
+challenge = "dns-01"
+dns_provider = "cloudflare"
+cloudflare_api_token_file = "/run/secrets/cf-token"
+```
 
-- ePHPm does not watch those files, so a renewal needs a restart to take
-  effect.
-- Clustered ACME is not the answer either. Certificate *distribution* through
-  the gossip KV is implemented, but challenge-token propagation is not, and a
-  follower does not pick up a renewed certificate while running
-  ([TLS & ACME](/guides/tls-acme/)).
-
-**Planned — not yet implemented:** a DNS-01 solver behind a provider trait
-(Cloudflare first), which would make the wildcard self-service and remove the
-restart-on-renewal step. This is the single largest missing piece for a
-self-contained preview host.
+The out-of-band certbot/lego workaround the earlier design called for is no
+longer needed, and DNS-01 also side-steps the two clustered TLS-ALPN-01 gaps
+(challenge traffic must reach the leader; followers miss renewals until
+restart) — the leader answers over DNS and the resolver is hot-swappable. See
+[TLS & ACME](/guides/tls-acme/#clustered-acme).
 
 ## Deployment shape
 
@@ -298,15 +304,17 @@ non-default versions. That is strictly cheaper than a reverse proxy and keeps
 the "ePHPm terminates TLS" property.
 
 Two things would need solving first: certificate sharing across the instances
-(the same wildcard PEM can simply be pointed at by each, once the DNS-01 story
-lands), and the fact that each instance is a separate process with its own PHP
-memory footprint, which is what makes this a poor default for a small VM.
+(each can point at the same wildcard — now that the
+[DNS-01 lane](/guides/tls-acme/#dns-01-challenge-wildcards) issues it in-process
+this is a non-issue), and the fact that each instance is a separate process with
+its own PHP memory footprint, which is what makes this a poor default for a
+small VM.
 
 ## Security
 
 | Concern | Where it stands |
 |---------|-----------------|
-| Webhook spoofing | HMAC-SHA256 signature verification on every webhook (switchboard). |
+| Webhook spoofing | HMAC-SHA256 (`X-Hub-Signature-256`) verified over the raw body on every webhook, before parsing, fail-closed (switchboard-api). |
 | Malicious code in a PR | Previews run as the ePHPm process user. All tenants share one process and one uid — the isolation boundary is the per-site database file, KV keyspace and `open_basedir`, not an OS boundary. |
 | Cross-tenant data access | One Turso file per site; `ATTACH`/`DETACH`/`VACUUM`/path-`PRAGMA` rejected on the tenant path; unknown hosts get no database and no credentials. |
 | Tenant self-routing | ePHPm never reads routing config from inside a tenant's checkout; `site_overrides_dir` must be outside `sites_dir` or startup fails. |
@@ -326,7 +334,6 @@ limiting.
 2. **How does a seed step reach the database?** Handing it `DB_*` credentials
    is the smallest change; a "run this inside the site" primitive is the
    better one.
-3. **DNS-01 in ePHPm, or permanently out of band?** Out of band works and is
-   shipping; in-band removes a moving part and a restart.
-4. **What is the teardown policy for a PR that is never closed?** Nothing
-   currently reaps abandoned previews.
+3. **What is the teardown policy for a PR that is never closed?** Nothing
+   currently reaps abandoned previews, and PR-close teardown removes the
+   checkout but leaves the per-site database file behind.
