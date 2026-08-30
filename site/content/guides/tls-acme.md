@@ -108,7 +108,7 @@ The plain-HTTP listener only serves regular traffic (or 301-redirects when `redi
 
 ## DNS-01 challenge (wildcards)
 
-TLS-ALPN-01 cannot obtain a **wildcard** certificate (`*.example.com`): the CA has no single hostname to connect to. For wildcards — and for hosts that never accept inbound TLS — set `challenge = "dns-01"`, which proves control by publishing a `_acme-challenge` TXT record through a DNS provider. Only **Cloudflare** is implemented today.
+TLS-ALPN-01 cannot obtain a **wildcard** certificate (`*.example.com`): the CA has no single hostname to connect to. For wildcards — and for hosts that never accept inbound TLS — set `challenge = "dns-01"`, which proves control by publishing a `_acme-challenge` TXT record through a DNS provider. Implemented providers: **Cloudflare** (`cloudflare`), **Linode** (`linode`), **DigitalOcean** (`digitalocean`), **AWS Route 53** (`route53`), and **Google Cloud DNS** (`google`) — each needs its own credential (an API token for Cloudflare/Linode/DigitalOcean, access-key/secret for Route 53, a service-account key + project for Google).
 
 ```toml
 [server]

@@ -61,6 +61,14 @@ base64ct = { workspace = true }
 tokio-util.workspace = true
 bytes.workspace = true
 sha2.workspace = true
+# hmac: AWS SigV4 request signing for the Route 53 DNS-01 provider
+# (src/dns01_route53.rs). Already a workspace dep (RustCrypto, MIT/Apache) — a
+# new edge, not a new crate in the lock.
+hmac.workspace = true
+# aws-lc-rs: RS256 signing of the OAuth2 JWT assertion for the Google Cloud DNS
+# provider (src/dns01_google.rs). Already the workspace's single rustls crypto
+# provider (#241) — a new edge, keeps `ring` out of the tree.
+aws-lc-rs = { workspace = true }
 getrandom.workspace = true
 async-channel.workspace = true
 quinn.workspace = true
