@@ -171,11 +171,19 @@ Both modes ship: manual `[server.tls] cert` + `key`, and ACME via
 
 - **No custom crypto.** Everything goes through `rustls` — no OpenSSL C code
   in the TLS path.
-- **ACME uses `rustls-acme` with TLS-ALPN-01 challenges only.** DNS-01 and
-  HTTP-01 are not implemented, so **wildcard certificates cannot be issued**
-  (wildcards require DNS-01). Name every host explicitly in `domains`.
+- **Two ACME challenge types ship.** The default `challenge = "tls-alpn-01"`
+  (via `rustls-acme`) answers inline on the TLS listener; HTTP-01 is not
+  implemented. `challenge = "dns-01"` publishes a `_acme-challenge` TXT record
+  through a DNS provider (Cloudflare, Linode, DigitalOcean, AWS Route 53, or
+  Google Cloud DNS) and is **the only lane that can issue a wildcard
+  certificate** (`*.example.com`). With TLS-ALPN-01 you must still name every
+  host explicitly in `domains`.
 
-Two gaps you must plan around in a cluster:
+Two gaps below apply to the **TLS-ALPN-01** lane in a cluster. The **DNS-01**
+lane avoids both — the leader answers the challenge over DNS (nothing has to
+reach a specific node) and its certificate resolver is hot-swappable, so a
+follower installs a renewed certificate from the KV store without a restart —
+which makes DNS-01 the better fit for clustered deployments:
 
 - **Challenge tokens are not shared between nodes.** A node can serve
   `/.well-known/acme-challenge/<token>` from the KV store, but nothing

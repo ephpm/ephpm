@@ -514,7 +514,7 @@ memory_limit = "64M"
 memory_limit = "64MB"
 ```
 
-Put a reverse proxy (Caddy recommended — automatic HTTPS per domain) in front for TLS termination, or use ePHPm's built-in ACME with every hostname listed explicitly in `[server.tls] domains`. **Wildcard certificates are not possible** — ePHPm's ACME implementation uses TLS-ALPN-01 only, and wildcard issuance requires DNS-01, which is not implemented.
+Use ePHPm's built-in ACME for TLS. For a fixed set of hosts, the default TLS-ALPN-01 challenge issues per-host certificates with every hostname listed explicitly in `[server.tls] domains`. For **many** hosts under one parent — the typical multi-tenant / preview case — set `challenge = "dns-01"` with a `dns_provider` (Cloudflare, Linode, DigitalOcean, AWS Route 53, or Google Cloud DNS) and request a **wildcard** certificate such as `*.preview.example.com`: one cert covers every subdomain and stays under Let's Encrypt's rate limit. See [TLS / ACME → DNS-01](/guides/tls-acme/#dns-01-challenge-wildcards). A reverse proxy (Caddy, with automatic HTTPS per domain) in front is still an option if you prefer to terminate TLS elsewhere.
 
 **Capacity:**
 - 20 WordPress blogs

@@ -76,6 +76,10 @@ EPHPM_SERVER__TLS__DOMAINS='["*.preview.example.com","preview.example.com"]'
 EPHPM_SERVER__TLS__CHALLENGE=dns-01
 EPHPM_SERVER__TLS__DNS_PROVIDER=cloudflare
 EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN=$CF_DNS_EDIT_TOKEN   # zone-scoped Zone.DNS:Edit
+# Other providers use the analogous EPHPM_SERVER__TLS__* variables, e.g.
+# LINODE_API_TOKEN, DIGITALOCEAN_API_TOKEN, ROUTE53_ACCESS_KEY_ID +
+# ROUTE53_SECRET_ACCESS_KEY, or GOOGLE_SERVICE_ACCOUNT_JSON + GOOGLE_PROJECT.
+# See reference/config.md for the full per-provider field list.
 
 # HTTP/3 (QUIC). Needs a static [server.tls] cert+key — enabling this with
 # ACME is a startup error, not a silent downgrade to TCP-only.

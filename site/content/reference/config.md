@@ -215,10 +215,26 @@ Two mutually exclusive modes — manual (`cert`+`key`) or ACME (`domains`). If b
 | `cloudflare_api_token_file` | path | (none) | Path to a file holding a zone-scoped `Zone.DNS:Edit` Cloudflare token. Preferred over inlining the secret; takes precedence over `cloudflare_api_token`. |
 | `cloudflare_api_token` | string | (none) | Cloudflare token inline (discouraged). Usually supplied via `EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN` instead. |
 | `cloudflare_zone_id` | string | (none) | Explicit Cloudflare zone id. When absent, resolved from the challenge FQDN (adds a `Zone:Read` requirement to the token). |
+| `linode_api_token_file` | path | (none) | Path to a file holding a Linode API v4 token (scope `domains:read_write`). Wins over `linode_api_token`. Only used when `dns_provider = "linode"`. |
+| `linode_api_token` | string | (none) | Linode token inline. Usually supplied via `EPHPM_SERVER__TLS__LINODE_API_TOKEN`. |
+| `digitalocean_api_token_file` | path | (none) | Path to a file holding a DigitalOcean API token (write scope). Wins over `digitalocean_api_token`. Only used when `dns_provider = "digitalocean"`. |
+| `digitalocean_api_token` | string | (none) | DigitalOcean token inline. Usually supplied via `EPHPM_SERVER__TLS__DIGITALOCEAN_API_TOKEN`. |
+| `route53_access_key_id` | string | (none) | AWS access key id. **Required** when `dns_provider = "route53"`. Usually supplied via `EPHPM_SERVER__TLS__ROUTE53_ACCESS_KEY_ID`. |
+| `route53_secret_access_key_file` | path | (none) | Path to a file holding the AWS secret access key. Wins over `route53_secret_access_key`. |
+| `route53_secret_access_key` | string | (none) | AWS secret access key inline. Usually supplied via `EPHPM_SERVER__TLS__ROUTE53_SECRET_ACCESS_KEY`. |
+| `route53_hosted_zone_id` | string | (none) | Explicit Route 53 hosted zone id. When absent, resolved from the challenge FQDN via `ListHostedZonesByName` (which does not paginate — set this on accounts with more than ~100 zones). |
+| `google_service_account_json_file` | path | (none) | Path to the GCP service-account JSON key file. Wins over `google_service_account_json`. Only used when `dns_provider = "google"`. |
+| `google_service_account_json` | string | (none) | Service-account JSON key **contents** inline. Usually supplied via `EPHPM_SERVER__TLS__GOOGLE_SERVICE_ACCOUNT_JSON`. |
+| `google_project` | string | (none) | GCP project id owning the Cloud DNS zone. **Required** when `dns_provider = "google"`. |
+| `google_managed_zone` | string | (none) | Explicit Cloud DNS managed-zone name. When absent, resolved from the challenge FQDN by listing the project's managed zones. |
 | `listen` | string | (none) | Separate HTTPS listener. When set, `[server] listen` serves HTTP and this serves HTTPS. |
 | `redirect_http` | bool | `false` | When `listen` is set, the HTTP listener redirects everything to HTTPS (301). |
 
-**DNS-01 wildcard example.** One wildcard cert covers every preview subdomain and stays under Let's Encrypt's 50-certs-per-registered-domain-per-week limit:
+Credentials follow one rule across every provider: the `*_file` variant wins over the inline value, and both can be supplied entirely from the environment (`EPHPM_SERVER__TLS__<FIELD>`) so no secret has to live in `ephpm.toml`. `Config::validate` requires the selected provider's credential(s) at startup and rejects an unknown `dns_provider` rather than silently doing nothing.
+
+**DNS-01 wildcard example.** One wildcard cert covers every preview subdomain and stays under Let's Encrypt's 50-certs-per-registered-domain-per-week limit. In a cluster (`[cluster] enabled = true`) only the elected leader orders the certificate; every other node loads it from the KV store — the same leader-election and distribution machinery as the TLS-ALPN-01 lane. TLS-ALPN-01 and DNS-01 are mutually exclusive per server; wildcard domains **require** DNS-01.
+
+*Cloudflare* — a **zone-scoped** token with `Zone.DNS:Edit` on the challenge zone (add `Zone:Read`, or set `cloudflare_zone_id`, to skip zone resolution):
 
 ```toml
 [server.tls]
@@ -229,7 +245,53 @@ dns_provider = "cloudflare"
 cloudflare_api_token_file = "/run/secrets/cf-token"   # or EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN
 ```
 
-The token is a **zone-scoped** Cloudflare API token with `Zone.DNS:Edit` on the challenge zone. In a cluster (`[cluster] enabled = true`) only the elected leader orders the certificate; every other node loads it from the KV store — the same leader-election and distribution machinery as the TLS-ALPN-01 lane. TLS-ALPN-01 and DNS-01 are mutually exclusive per server; wildcard domains **require** DNS-01.
+*Linode* — an API v4 token scoped `domains:read_write`:
+
+```toml
+[server.tls]
+domains = ["*.preview.example.com", "preview.example.com"]
+email = "ops@example.com"
+challenge = "dns-01"
+dns_provider = "linode"
+linode_api_token_file = "/run/secrets/linode-token"   # or EPHPM_SERVER__TLS__LINODE_API_TOKEN
+```
+
+*DigitalOcean* — an API token with write scope:
+
+```toml
+[server.tls]
+domains = ["*.preview.example.com", "preview.example.com"]
+email = "ops@example.com"
+challenge = "dns-01"
+dns_provider = "digitalocean"
+digitalocean_api_token_file = "/run/secrets/do-token"  # or EPHPM_SERVER__TLS__DIGITALOCEAN_API_TOKEN
+```
+
+*AWS Route 53* — an access-key/secret pair for an IAM identity allowed to change records in the hosted zone. Set `route53_hosted_zone_id` explicitly on accounts with more than ~100 zones (zone lookup does not paginate):
+
+```toml
+[server.tls]
+domains = ["*.preview.example.com", "preview.example.com"]
+email = "ops@example.com"
+challenge = "dns-01"
+dns_provider = "route53"
+route53_access_key_id = "AKIA..."                      # or EPHPM_SERVER__TLS__ROUTE53_ACCESS_KEY_ID
+route53_secret_access_key_file = "/run/secrets/aws-secret"  # or EPHPM_SERVER__TLS__ROUTE53_SECRET_ACCESS_KEY
+route53_hosted_zone_id = "Z123EXAMPLE"                 # optional
+```
+
+*Google Cloud DNS* — a service-account JSON key with the `roles/dns.admin` role and the owning `google_project`. Set `google_managed_zone` to skip zone resolution:
+
+```toml
+[server.tls]
+domains = ["*.preview.example.com", "preview.example.com"]
+email = "ops@example.com"
+challenge = "dns-01"
+dns_provider = "google"
+google_service_account_json_file = "/run/secrets/gcp-sa.json"  # or EPHPM_SERVER__TLS__GOOGLE_SERVICE_ACCOUNT_JSON
+google_project = "my-gcp-project"                      # required
+google_managed_zone = "preview-zone"                   # optional
+```
 
 ### `[server.http3]`
 

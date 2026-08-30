@@ -90,6 +90,14 @@ tokio::spawn(async move {
 
 **Primary: `rustls-acme`** for the core automatic HTTPS flow (TLS-ALPN-01 and HTTP-01 challenges). This covers 90% of use cases — single-domain and multi-domain certs with zero config.
 
+> **Update — shipped.** The DNS-01 lane described below as "secondary/future"
+> is now implemented. ePHPm runs its own ACME order state machine over
+> `instant-acme` with a `DnsProvider` trait and five provider wrappers
+> (Cloudflare, Linode, DigitalOcean, AWS Route 53, Google Cloud DNS), selected
+> by [`[server.tls] dns_provider`](/reference/config/#servertls). See the
+> [TLS / ACME guide](/guides/tls-acme/#dns-01-challenge-wildcards). The
+> paragraph below is the original design rationale, kept for context.
+
 **Secondary: `instant-acme`** for DNS-01 challenge support (needed for wildcard certs like `*.example.com`). DNS-01 requires calling DNS provider APIs (Cloudflare, Route53, etc.) to create TXT records. The Rust ecosystem doesn't have a `libdns` equivalent (Go's pluggable DNS provider library), so ePHPm would need thin wrappers for each provider:
 
 ```rust
