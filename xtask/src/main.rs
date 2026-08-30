@@ -17,6 +17,26 @@ mod php_versions;
 /// resolver will accept it as-is.
 const PHP_SDK_VERSIONS: &[(&str, &str)] = &[("8.3", "8.3.33"), ("8.4", "8.4.23"), ("8.5", "8.5.7")];
 
+/// EXPERIMENTAL: PHP minors published only as an upstream pre-release (beta/RC).
+///
+/// Deliberately kept OUT of `PHP_SDK_VERSIONS`. Entries here:
+///   * carry a pre-release version string (e.g. "8.6.0beta1") that is not a
+///     valid `bump-php-pin` target (`bump::is_patch_of` rejects a non-numeric
+///     patch) and that `sdk-bump.yml`'s `("8.X", "8.X.Y")` pin regex does not
+///     match — so the nightly auto-bump and the `bump-php-pin --check` drift
+///     detector never touch them;
+///   * are absent from the gating release matrices (`php_matrix` /
+///     `docker_matrix`), so a beta SDK that is missing or fails to build can
+///     never block a stable `v*` release;
+///   * are built only by the manually-dispatched `release-php-beta.yml` lane,
+///     which reads the `experimental_matrix` from `cargo xtask php-versions`.
+///
+/// `resolve_php_version` accepts these minors so `cargo xtask release 8.6` and
+/// `cargo xtask php-sdk 8.6` resolve to the pinned beta once its SDK is
+/// published at github.com/ephpm/php-sdk. Not GA — do not document 8.6 as
+/// supported.
+const EXPERIMENTAL_PHP_VERSIONS: &[(&str, &str)] = &[("8.6", "8.6.0beta1")];
+
 /// Default PHP minor when no version is specified on the command line.
 const DEFAULT_PHP_MINOR: &str = "8.5";
 
@@ -450,9 +470,16 @@ fn release_windows(args: &[String]) -> ExitCode {
 /// in the table (in that case, the download will simply fail with a 404
 /// and the error message will point at the missing release tag).
 fn resolve_php_version(input: &str) -> Option<String> {
-    if let Some((_, full)) = PHP_SDK_VERSIONS.iter().find(|(short, _)| *short == input) {
+    if let Some((_, full)) = PHP_SDK_VERSIONS
+        .iter()
+        .chain(EXPERIMENTAL_PHP_VERSIONS.iter())
+        .find(|(short, _)| *short == input)
+    {
         return Some((*full).to_string());
     }
+    // A full version accepts two dots. Numeric patches ("8.5.2") and
+    // pre-release strings ("8.6.0beta1") both pass — the download simply 404s
+    // if no matching php-sdk release tag exists.
     if input.matches('.').count() == 2 {
         return Some(input.to_string());
     }
@@ -460,6 +487,9 @@ fn resolve_php_version(input: &str) -> Option<String> {
     eprintln!("       supported minors:");
     for (short, full) in PHP_SDK_VERSIONS {
         eprintln!("         {short}  → {full}");
+    }
+    for (short, full) in EXPERIMENTAL_PHP_VERSIONS {
+        eprintln!("         {short}  → {full}  (experimental, pre-release)");
     }
     eprintln!("       or pass a full version like 8.5.2 to use that release tag directly");
     None
