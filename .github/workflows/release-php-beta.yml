@@ -1,0 +1,365 @@
+name: Release (PHP beta, experimental)
+
+# EXPERIMENTAL, MANUAL-ONLY lane for building ephpm against an upstream PHP
+# PRE-RELEASE (beta/RC) SDK — today PHP 8.6.0beta1 (see xtask
+# EXPERIMENTAL_PHP_VERSIONS). This workflow is deliberately SEPARATE from
+# release.yml so that:
+#
+#   * a stable `v*` tag release never builds, gates on, or ships a beta binary;
+#   * the beta SDK not existing / not building can never block a real release;
+#   * the beta artifacts never enter release.yml's artifact collector or its
+#     SHA256SUMS (that collector sweeps every `ephpm-v*` artifact of a run — a
+#     beta job uploading into the same run would pollute the stable release).
+#
+# It is workflow_dispatch ONLY. A human cuts the first beta build. It builds the
+# four OS/arch targets against the pinned pre-release SDK and uploads them as
+# workflow artifacts; with `publish=true` from a tag ref it additionally
+# publishes a GitHub PRE-RELEASE (never promoted to "Latest").
+#
+# Prerequisite: the beta SDK must already be published at
+# github.com/ephpm/php-sdk (tag `v<full>`, e.g. v8.6.0beta1) for every target
+# `cargo xtask release` downloads. See php-sdk build.yml's beta handling.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub pre-release from the built archives (requires dispatching from a v* tag). Off = build + upload workflow artifacts only."
+        type: boolean
+        default: false
+
+# Never run two beta builds at once, and queue behind (do not cancel) a stable
+# release — both draw on the same self-hosted fleet. Distinct group from
+# ephpm-release so a beta build cannot cancel a real release, only serialize.
+concurrency:
+  group: ephpm-release-php-beta
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Derive the experimental (pre-release) matrix from the single source of
+  # truth, xtask::EXPERIMENTAL_PHP_VERSIONS. Empty table => empty matrix =>
+  # every build job self-skips (zero matrix runs).
+  setup:
+    name: Derive experimental PHP matrix
+    runs-on: [self-hosted, linux, x64]
+    outputs:
+      experimental_matrix: ${{ steps.matrix.outputs.experimental_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Emit experimental matrix from xtask EXPERIMENTAL_PHP_VERSIONS
+        id: matrix
+        run: |
+          docker run --rm -v "$PWD":/w -w /w \
+            ephpm/ephpm-ci:latest \
+            cargo run --quiet -p xtask -- php-versions --github-matrix >> "$GITHUB_OUTPUT"
+
+  # -- Linux x86_64 (glibc 2.28 floor via ephpm-ci) ---------------------------
+  build-linux:
+    name: Beta (PHP ${{ matrix.php.full }}, linux-x86_64)
+    needs: setup
+    if: needs.setup.outputs.experimental_matrix != '[]'
+    runs-on: [self-hosted, linux, x64]
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ${{ fromJSON(needs.setup.outputs.experimental_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ephpm in the ephpm-ci container
+        run: |
+          set -eu
+          docker run --rm -v "$PWD":/w -w /w \
+            -e EPHPM_RELEASE_VERSION="${GITHUB_REF_NAME#v}" \
+            -e CARGO_PROFILE_RELEASE_LTO="fat" \
+            -e CARGO_TERM_COLOR=always \
+            ephpm/ephpm-ci:latest \
+            sh -euc '
+              command -v clang >/dev/null 2>&1 \
+                || (apt-get update && apt-get install -y --no-install-recommends clang llvm) \
+                || echo "::warning::clang install failed; ebpf_policy will be stubbed"
+              cargo xtask release ${{ matrix.php.minor }}
+            '
+      - name: Package archive
+        id: pkg
+        env:
+          VERSION: ${{ github.ref_name }}
+          PHP_FULL: ${{ matrix.php.full }}
+        run: |
+          set -eu
+          name="ephpm-${VERSION}+php${PHP_FULL}-linux-x86_64"
+          mkdir -p "dist/${name}"
+          cp "target/x86_64-unknown-linux-gnu/release/ephpm" "dist/${name}/ephpm"
+          cp LICENSE "dist/${name}/LICENSE"
+          cp .github/release-readme.txt "dist/${name}/README.txt"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          rm -rf "dist/${name}"
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-beta-${{ github.ref_name }}-php${{ matrix.php.full }}-linux-x86_64
+          path: ${{ steps.pkg.outputs.archive }}
+
+  # -- macOS aarch64 (native) -------------------------------------------------
+  build-macos:
+    name: Beta (PHP ${{ matrix.php.full }}, macos-aarch64)
+    needs: setup
+    if: needs.setup.outputs.experimental_matrix != '[]'
+    runs-on: [self-hosted, macos, arm64]
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        php: ${{ fromJSON(needs.setup.outputs.experimental_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Compute release version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          echo "EPHPM_RELEASE_VERSION=${REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Pin libclang for bindgen
+        run: |
+          export PATH="/opt/homebrew/bin:$PATH"
+          brew install llvm@17 || brew upgrade llvm@17 || true
+          LLVM_PREFIX=$(brew --prefix llvm@17)
+          LLVM_RESOURCE_DIR=$(ls -d "${LLVM_PREFIX}"/lib/clang/* | head -1)
+          echo "LIBCLANG_PATH=${LLVM_PREFIX}/lib" >> "$GITHUB_ENV"
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-resource-dir=${LLVM_RESOURCE_DIR}" >> "$GITHUB_ENV"
+      - name: Build ephpm
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+        run: cargo xtask release ${{ matrix.php.minor }}
+      - name: Package archive
+        id: pkg
+        env:
+          VERSION: ${{ github.ref_name }}
+          PHP_FULL: ${{ matrix.php.full }}
+        run: |
+          set -eu
+          name="ephpm-${VERSION}+php${PHP_FULL}-macos-aarch64"
+          mkdir -p "dist/${name}"
+          cp target/aarch64-apple-darwin/release/ephpm "dist/${name}/ephpm"
+          cp LICENSE "dist/${name}/LICENSE"
+          cp .github/release-readme.txt "dist/${name}/README.txt"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          rm -rf "dist/${name}"
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-beta-${{ github.ref_name }}-php${{ matrix.php.full }}-macos-aarch64
+          path: ${{ steps.pkg.outputs.archive }}
+
+  # -- Linux aarch64 (glibc, in the macOS host's linux VM) --------------------
+  build-linux-arm64:
+    name: Beta (PHP ${{ matrix.php.full }}, linux-aarch64)
+    needs: [build-macos, setup]
+    if: needs.setup.outputs.experimental_matrix != '[]'
+    runs-on: [self-hosted, linux, arm64]
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        php: ${{ fromJSON(needs.setup.outputs.experimental_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ephpm in the ephpm-ci container
+        run: |
+          set -eu
+          docker run --rm -v "$PWD":/w -w /w \
+            -e EPHPM_RELEASE_VERSION="${GITHUB_REF_NAME#v}" \
+            -e CARGO_PROFILE_RELEASE_LTO="off" \
+            -e CARGO_TERM_COLOR=always \
+            ephpm/ephpm-ci:latest-arm64 \
+            sh -euc '
+              command -v clang >/dev/null 2>&1 \
+                || (apt-get update && apt-get install -y --no-install-recommends clang llvm) \
+                || echo "::warning::clang install failed; ebpf_policy will be stubbed"
+              cargo xtask release ${{ matrix.php.minor }}
+            '
+      - name: Package archive
+        id: pkg
+        env:
+          VERSION: ${{ github.ref_name }}
+          PHP_FULL: ${{ matrix.php.full }}
+        run: |
+          set -eu
+          name="ephpm-${VERSION}+php${PHP_FULL}-linux-aarch64"
+          mkdir -p "dist/${name}"
+          cp "target/aarch64-unknown-linux-gnu/release/ephpm" "dist/${name}/ephpm"
+          cp LICENSE "dist/${name}/LICENSE"
+          cp .github/release-readme.txt "dist/${name}/README.txt"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          rm -rf "dist/${name}"
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-beta-${{ github.ref_name }}-php${{ matrix.php.full }}-linux-aarch64
+          path: ${{ steps.pkg.outputs.archive }}
+
+  # -- Windows x86_64 (native MSVC) -------------------------------------------
+  build-windows:
+    name: Beta (PHP ${{ matrix.php.full }}, windows-x86_64)
+    needs: setup
+    if: needs.setup.outputs.experimental_matrix != '[]'
+    runs-on: [self-hosted, windows, x64]
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        php: ${{ fromJSON(needs.setup.outputs.experimental_matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        shell: powershell
+        run: |
+          $cargoBin = "$env:USERPROFILE\.cargo\bin"
+          if (-not (Test-Path "$cargoBin\rustup.exe")) {
+            Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile rustup-init.exe
+            .\rustup-init.exe -y --default-toolchain stable --profile minimal
+            Remove-Item rustup-init.exe
+          }
+          $env:PATH = "$cargoBin;$env:PATH"
+          $cargoBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          & "$cargoBin\rustup.exe" show
+      - name: Install Visual Studio Build Tools
+        shell: powershell
+        run: |
+          $installPath = "C:\BuildTools"
+          $msbuild = "$installPath\MSBuild\Current\Bin\MSBuild.exe"
+          if (Test-Path $msbuild) {
+            Write-Host "VS Build Tools already present at $installPath"
+          } else {
+            Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_buildtools.exe" -OutFile vs_buildtools.exe
+            $proc = Start-Process -FilePath .\vs_buildtools.exe `
+              -ArgumentList @(
+                '--quiet', '--wait', '--norestart', '--nocache',
+                '--installPath', $installPath,
+                '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+                '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang',
+                '--includeRecommended'
+              ) -Wait -PassThru -NoNewWindow
+            Remove-Item vs_buildtools.exe
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            while (-not (Test-Path $msbuild) -and $sw.Elapsed.TotalMinutes -lt 20) {
+              Start-Sleep -Seconds 30
+              Write-Host ("  ...waiting for VS install ({0:F0}s)" -f $sw.Elapsed.TotalSeconds)
+            }
+            if (-not (Test-Path $msbuild)) {
+              Write-Host "::error::VS install timed out - $msbuild never appeared"
+              exit 1
+            }
+          }
+      - name: Enter MSVC developer environment
+        shell: powershell
+        run: |
+          $vcvars = "C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          if (-not (Test-Path $vcvars)) { Write-Error "vcvars64.bat not found"; exit 1 }
+          $envBefore = @{}
+          foreach ($e in [Environment]::GetEnvironmentVariables().GetEnumerator()) {
+            $envBefore[$e.Key] = $e.Value
+          }
+          $cmdLine = 'call "' + $vcvars + '" >NUL & set'
+          $output = & cmd /c $cmdLine
+          foreach ($line in $output) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              if ($envBefore[$matches[1]] -ne $matches[2]) {
+                "$($matches[1])=$($matches[2])" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+              }
+            }
+          }
+          $libclangDir = "C:\BuildTools\VC\Tools\Llvm\x64\bin"
+          if (Test-Path "$libclangDir\libclang.dll") {
+            "LIBCLANG_PATH=$libclangDir" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          } else {
+            Write-Warning "libclang.dll not found at $libclangDir -- bindgen may panic"
+          }
+      - name: Compute release version
+        shell: powershell
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $version = $env:REF_NAME -replace '^v',''
+          "EPHPM_RELEASE_VERSION=$version" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+      - name: Build ephpm.exe
+        shell: powershell
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "off"
+          RUST_MIN_STACK: "33554432"
+        run: cargo xtask release ${{ matrix.php.minor }} --target windows
+      - name: Package archive
+        id: pkg
+        shell: powershell
+        env:
+          VERSION: ${{ github.ref_name }}
+          PHP_FULL: ${{ matrix.php.full }}
+        run: |
+          $name = "ephpm-$env:VERSION+php$env:PHP_FULL-windows-x86_64"
+          $stage = "dist\$name"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\ephpm.exe "$stage\ephpm.exe"
+          Copy-Item LICENSE "$stage\LICENSE"
+          Copy-Item .github\release-readme.txt "$stage\README.txt"
+          tar -C dist -czf "dist\$name.tar.gz" $name
+          Remove-Item -Recurse -Force $stage
+          "archive=dist/$name.tar.gz" | Out-File -Append -FilePath $env:GITHUB_OUTPUT -Encoding utf8
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ephpm-beta-${{ github.ref_name }}-php${{ matrix.php.full }}-windows-x86_64
+          path: ${{ steps.pkg.outputs.archive }}
+
+  # -- Optional pre-release publish -------------------------------------------
+  # Gathers whatever archives the (non-gating) build jobs produced and, only
+  # when dispatched from a v* tag with publish=true, attaches them to a GitHub
+  # PRE-RELEASE tagged v<ref>+php<beta>. Marked prerelease so it is never
+  # promoted to "Latest". Non-gating: `!cancelled()` + `always()`-style guard so
+  # a red OS leg still publishes the ones that succeeded.
+  publish:
+    name: Publish pre-release (optional)
+    needs: [build-linux, build-linux-arm64, build-macos, build-windows]
+    if: ${{ !cancelled() && inputs.publish && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: [self-hosted, linux, x64]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ephpm-beta-*
+          merge-multiple: true
+      - name: Assemble archives + SHA256SUMS
+        id: collect
+        run: |
+          set -eu
+          mkdir -p release
+          find artifacts -type f -name '*.tar.gz' -exec cp {} release/ \;
+          if [ -z "$(ls -A release 2>/dev/null)" ]; then
+            echo "::error::no beta archives were produced by any OS leg"
+            exit 1
+          fi
+          (cd release && sha256sum *.tar.gz | sort > SHA256SUMS)
+          ls -lh release/
+      - name: Create GitHub pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          tag_name: ${{ github.ref_name }}
+          name: "${{ github.ref_name }} (PHP beta, experimental)"
+          prerelease: true
+          body: |
+            EXPERIMENTAL ephpm build linked against an upstream PHP pre-release
+            SDK. Not for production. See release-php-beta.yml.

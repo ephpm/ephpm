@@ -24,7 +24,7 @@
 
 use std::process::ExitCode;
 
-use crate::{DEFAULT_PHP_MINOR, PHP_SDK_VERSIONS, TAILCALL_MINORS};
+use crate::{DEFAULT_PHP_MINOR, EXPERIMENTAL_PHP_VERSIONS, PHP_SDK_VERSIONS, TAILCALL_MINORS};
 
 /// JSON array of every pinned `{minor, full}` pair.
 ///
@@ -52,6 +52,21 @@ fn tailcall_matrix_json() -> String {
     format!("[{}]", items.join(","))
 }
 
+/// JSON array of every EXPERIMENTAL (pre-release) `{minor, full}` pair.
+///
+/// The matrix for the manually-dispatched, non-gating `release-php-beta.yml`
+/// lane. Sourced from `EXPERIMENTAL_PHP_VERSIONS`, which is kept separate from
+/// `PHP_SDK_VERSIONS` so a beta never enters the gating release matrix, the
+/// docker matrix, or the auto-bump. Empty (`[]`) when no beta is pinned, which
+/// expands to zero matrix runs — the lane self-skips.
+fn experimental_matrix_json() -> String {
+    let items: Vec<String> = EXPERIMENTAL_PHP_VERSIONS
+        .iter()
+        .map(|(minor, full)| format!(r#"{{"minor":"{minor}","full":"{full}"}}"#))
+        .collect();
+    format!("[{}]", items.join(","))
+}
+
 /// JSON array of every pinned `{minor, full, default}` triple.
 ///
 /// The matrix for `docker-image`. `default` marks the minor whose images get
@@ -74,8 +89,9 @@ fn docker_matrix_json() -> String {
 
 /// Entry point for `cargo xtask php-versions [--github-matrix | --json]`.
 ///
-/// * `--github-matrix` prints the three `key=value` lines the `release.yml`
-///   `setup` job appends to `$GITHUB_OUTPUT`.
+/// * `--github-matrix` prints the `key=value` lines the release workflows'
+///   `setup` jobs append to `$GITHUB_OUTPUT` (`php_matrix`, `tailcall_matrix`,
+///   `experimental_matrix`, `docker_matrix`).
 /// * otherwise (or with `--json`) prints one combined JSON object — a
 ///   human/debug view and a stable contract for any other consumer.
 pub fn run(args: &[String]) -> ExitCode {
@@ -86,12 +102,14 @@ pub fn run(args: &[String]) -> ExitCode {
         // array (no newlines inside), so the plain `key=value` form is safe.
         println!("php_matrix={}", php_matrix_json());
         println!("tailcall_matrix={}", tailcall_matrix_json());
+        println!("experimental_matrix={}", experimental_matrix_json());
         println!("docker_matrix={}", docker_matrix_json());
     } else {
         println!(
-            r#"{{"php_matrix":{},"tailcall_matrix":{},"docker_matrix":{}}}"#,
+            r#"{{"php_matrix":{},"tailcall_matrix":{},"experimental_matrix":{},"docker_matrix":{}}}"#,
             php_matrix_json(),
             tailcall_matrix_json(),
+            experimental_matrix_json(),
             docker_matrix_json()
         );
     }
@@ -136,6 +154,30 @@ mod tests {
             );
         }
         assert_eq!(json.matches(r#""minor""#).count(), TAILCALL_MINORS.len(), "{json}");
+    }
+
+    /// `experimental_matrix` is exactly `EXPERIMENTAL_PHP_VERSIONS`, and none of
+    /// its (pre-release) minors leak into the gating `php_matrix` — that
+    /// separation is what keeps a beta from ever gating a stable release.
+    #[test]
+    fn experimental_matrix_is_disjoint_from_the_gating_matrix() {
+        let exp = experimental_matrix_json();
+        assert_eq!(
+            exp.matches(r#""minor""#).count(),
+            EXPERIMENTAL_PHP_VERSIONS.len(),
+            "experimental_matrix object count must equal the table length: {exp}"
+        );
+        let php = php_matrix_json();
+        for (minor, full) in EXPERIMENTAL_PHP_VERSIONS {
+            assert!(
+                exp.contains(&format!(r#"{{"minor":"{minor}","full":"{full}"}}"#)),
+                "experimental_matrix missing {minor} → {full}: {exp}"
+            );
+            assert!(
+                !php.contains(&format!(r#""minor":"{minor}""#)),
+                "experimental minor {minor} leaked into the gating php_matrix: {php}"
+            );
+        }
     }
 
     /// `docker_matrix` marks exactly the default minor `true` and every other

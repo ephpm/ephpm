@@ -822,6 +822,7 @@ This is the same approach FrankenPHP uses.
 | PHP 8.3 | Active support (until Dec 2026) | **Supported — in CI (pinned 8.3.33)** |
 | PHP 8.4 | Active support (until Dec 2027) | **Supported — in CI (pinned 8.4.23)** |
 | PHP 8.5 | Active support | **Supported — in CI (pinned 8.5.7)** |
+| PHP 8.6 | Beta (8.6.0beta1, Aug 2026) | Experimental — pre-release, not GA. Built only by the manual `release-php-beta.yml` lane against a beta SDK; never part of a stable release. |
 
 ### Release Naming
 
