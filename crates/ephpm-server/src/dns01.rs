@@ -487,6 +487,102 @@ pub fn resolve_cloudflare_token(tls: &TlsConfig) -> anyhow::Result<String> {
     )
 }
 
+/// Resolve a secret from a `*_file` path (contents, trimmed) or an inline/env
+/// value, file winning. `what` names the credential for the error message.
+///
+/// Used by the non-Cloudflare DNS providers. Returns the raw contents, so it
+/// serves both single-token providers and Google (whose "token file" is the
+/// service-account JSON).
+fn resolve_secret(
+    file: Option<&PathBuf>,
+    inline: Option<&str>,
+    what: &str,
+) -> anyhow::Result<String> {
+    if let Some(path) = file {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading {what} file {}", path.display()))?;
+        let value = raw.trim().to_string();
+        anyhow::ensure!(!value.is_empty(), "{what} file {} is empty", path.display());
+        return Ok(value);
+    }
+    if let Some(value) = inline {
+        let value = value.trim().to_string();
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    bail!("no {what} configured for the selected [server.tls] dns_provider")
+}
+
+/// Construct the DNS-01 challenge provider selected by `[server.tls]
+/// dns_provider`, resolving its credentials from config.
+///
+/// `Config::validate` already rejects an unknown/missing provider and a missing
+/// credential, so this mirrors that set; the provider modules live in
+/// `crate::dns01_<name>`.
+fn build_dns_provider(tls: &TlsConfig) -> anyhow::Result<Arc<dyn DnsProvider>> {
+    let provider = tls.dns_provider.as_deref().unwrap_or("cloudflare");
+    let p: Arc<dyn DnsProvider> = if provider.eq_ignore_ascii_case("cloudflare") {
+        Arc::new(CloudflareProvider::new(
+            resolve_cloudflare_token(tls)?,
+            tls.cloudflare_zone_id.clone(),
+        )?)
+    } else if provider.eq_ignore_ascii_case("linode") {
+        let token = resolve_secret(
+            tls.linode_api_token_file.as_ref(),
+            tls.linode_api_token.as_deref(),
+            "Linode API token",
+        )?;
+        Arc::new(crate::dns01_linode::LinodeProvider::new(token)?)
+    } else if provider.eq_ignore_ascii_case("digitalocean") {
+        let token = resolve_secret(
+            tls.digitalocean_api_token_file.as_ref(),
+            tls.digitalocean_api_token.as_deref(),
+            "DigitalOcean API token",
+        )?;
+        Arc::new(crate::dns01_digitalocean::DigitalOceanProvider::new(token)?)
+    } else if provider.eq_ignore_ascii_case("route53") {
+        let access_key_id = tls
+            .route53_access_key_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .context("[server.tls] dns_provider = \"route53\" requires route53_access_key_id")?;
+        let secret = resolve_secret(
+            tls.route53_secret_access_key_file.as_ref(),
+            tls.route53_secret_access_key.as_deref(),
+            "Route 53 secret access key",
+        )?;
+        Arc::new(crate::dns01_route53::Route53Provider::new(
+            access_key_id,
+            secret,
+            tls.route53_hosted_zone_id.clone(),
+        )?)
+    } else if provider.eq_ignore_ascii_case("google") {
+        let sa_json = resolve_secret(
+            tls.google_service_account_json_file.as_ref(),
+            tls.google_service_account_json.as_deref(),
+            "Google service-account JSON",
+        )?;
+        let project = tls
+            .google_project
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .context("[server.tls] dns_provider = \"google\" requires google_project")?;
+        Arc::new(crate::dns01_google::GoogleProvider::new(
+            sa_json,
+            project,
+            tls.google_managed_zone.clone(),
+        )?)
+    } else {
+        bail!("[server.tls] dns_provider = \"{provider}\" is not a supported DNS-01 provider");
+    };
+    Ok(p)
+}
+
 /// Start the DNS-01 ACME lane: build the hot-swap acceptor, seed it from any
 /// cached certificate, and spawn the renewal/leadership task.
 ///
@@ -506,13 +602,7 @@ pub fn start_dns01_acme(
     store: Option<Arc<Store>>,
     cluster_node_id: Option<&str>,
 ) -> anyhow::Result<Dns01Setup> {
-    anyhow::ensure!(
-        tls_config.dns_provider.as_deref().is_some_and(|p| p.eq_ignore_ascii_case("cloudflare")),
-        "DNS-01 lane requires dns_provider = \"cloudflare\""
-    );
-    let token = resolve_cloudflare_token(tls_config)?;
-    let provider: Arc<dyn DnsProvider> =
-        Arc::new(CloudflareProvider::new(token, tls_config.cloudflare_zone_id.clone())?);
+    let provider: Arc<dyn DnsProvider> = build_dns_provider(tls_config)?;
 
     let resolver = Arc::new(Dns01CertResolver::new());
     let cache_dir = tls_config.cache_dir.join("dns01");

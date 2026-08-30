@@ -1719,9 +1719,12 @@ pub struct TlsConfig {
 
     /// DNS provider used to satisfy `dns-01` challenges.
     ///
-    /// Currently the only accepted value is `"cloudflare"`. Ignored unless
-    /// `challenge = "dns-01"`. `Config::validate` requires it in that mode and
-    /// rejects unknown providers rather than silently doing nothing.
+    /// One of `"cloudflare"`, `"linode"`, `"digitalocean"`, `"route53"`, or
+    /// `"google"` (Google Cloud DNS). Ignored unless `challenge = "dns-01"`.
+    /// `Config::validate` requires it in that mode, requires the selected
+    /// provider's credential(s) (see the `*_api_token*` / `route53_*` /
+    /// `google_*` fields below), and rejects unknown providers rather than
+    /// silently doing nothing.
     #[serde(default)]
     pub dns_provider: Option<String>,
 
@@ -1758,6 +1761,58 @@ pub struct TlsConfig {
     /// `dns_provider = "cloudflare"`.
     #[serde(default)]
     pub cloudflare_zone_id: Option<String>,
+
+    // --- Linode DNS provider (dns_provider = "linode") ---
+    /// Path to a file holding a Linode API v4 token (scope `domains:read_write`).
+    /// File wins over the inline value. Only used when `dns_provider = "linode"`.
+    #[serde(default)]
+    pub linode_api_token_file: Option<PathBuf>,
+    /// Linode API token — prefer the file or the
+    /// `EPHPM_SERVER__TLS__LINODE_API_TOKEN` environment variable.
+    #[serde(default)]
+    pub linode_api_token: Option<String>,
+
+    // --- DigitalOcean DNS provider (dns_provider = "digitalocean") ---
+    /// Path to a file holding a DigitalOcean API token (write scope).
+    #[serde(default)]
+    pub digitalocean_api_token_file: Option<PathBuf>,
+    /// DigitalOcean API token — prefer the file or the
+    /// `EPHPM_SERVER__TLS__DIGITALOCEAN_API_TOKEN` environment variable.
+    #[serde(default)]
+    pub digitalocean_api_token: Option<String>,
+
+    // --- AWS Route 53 DNS provider (dns_provider = "route53") ---
+    /// AWS access key id. Required when `dns_provider = "route53"`.
+    #[serde(default)]
+    pub route53_access_key_id: Option<String>,
+    /// Path to a file holding the AWS secret access key. File wins over inline.
+    #[serde(default)]
+    pub route53_secret_access_key_file: Option<PathBuf>,
+    /// AWS secret access key — prefer the file or the
+    /// `EPHPM_SERVER__TLS__ROUTE53_SECRET_ACCESS_KEY` environment variable.
+    #[serde(default)]
+    pub route53_secret_access_key: Option<String>,
+    /// Optional explicit Route 53 hosted zone id. When absent, resolved from the
+    /// challenge FQDN via `ListHostedZonesByName` (which does not paginate — set
+    /// this explicitly on an account with more than ~100 zones).
+    #[serde(default)]
+    pub route53_hosted_zone_id: Option<String>,
+
+    // --- Google Cloud DNS provider (dns_provider = "google") ---
+    /// Path to the service-account JSON key file. File wins over inline.
+    #[serde(default)]
+    pub google_service_account_json_file: Option<PathBuf>,
+    /// Service-account JSON key **contents** — prefer the file or the
+    /// `EPHPM_SERVER__TLS__GOOGLE_SERVICE_ACCOUNT_JSON` environment variable.
+    #[serde(default)]
+    pub google_service_account_json: Option<String>,
+    /// GCP project id owning the Cloud DNS zone. Required for `google`.
+    #[serde(default)]
+    pub google_project: Option<String>,
+    /// Optional Cloud DNS managed-zone name. When absent, resolved from the
+    /// challenge FQDN by listing the project's managed zones.
+    #[serde(default)]
+    pub google_managed_zone: Option<String>,
 
     // --- Shared ---
     /// Optional separate listen address for HTTPS (e.g. `"0.0.0.0:443"`).
@@ -3590,34 +3645,97 @@ impl Config {
                             .to_string(),
                     ));
                 }
+                // A credential is "present" if a `*_file` path is set or an
+                // inline/env value is non-empty.
+                let has_cred = |file: &Option<PathBuf>, inline: &Option<String>| -> bool {
+                    file.is_some() || inline.as_deref().is_some_and(|t| !t.trim().is_empty())
+                };
+                let nonempty =
+                    |v: &Option<String>| v.as_deref().is_some_and(|s| !s.trim().is_empty());
                 match tls.dns_provider.as_deref() {
                     Some(p) if p.eq_ignore_ascii_case("cloudflare") => {
-                        let has_token = tls.cloudflare_api_token_file.is_some()
-                            || tls
-                                .cloudflare_api_token
-                                .as_deref()
-                                .is_some_and(|t| !t.trim().is_empty());
-                        if !has_token {
+                        if !has_cred(&tls.cloudflare_api_token_file, &tls.cloudflare_api_token) {
                             return Err(ConfigError::Validation(
                                 "[server.tls] dns_provider = \"cloudflare\" requires an API \
-                                 token: set `cloudflare_api_token_file` (a path to a file \
-                                 holding a zone-scoped Zone.DNS:Edit token) or provide it via \
-                                 the EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN environment \
+                                 token: set `cloudflare_api_token_file` (a zone-scoped \
+                                 Zone.DNS:Edit token) or the \
+                                 EPHPM_SERVER__TLS__CLOUDFLARE_API_TOKEN environment variable."
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    Some(p) if p.eq_ignore_ascii_case("linode") => {
+                        if !has_cred(&tls.linode_api_token_file, &tls.linode_api_token) {
+                            return Err(ConfigError::Validation(
+                                "[server.tls] dns_provider = \"linode\" requires a token: set \
+                                 `linode_api_token_file` or the \
+                                 EPHPM_SERVER__TLS__LINODE_API_TOKEN environment variable."
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    Some(p) if p.eq_ignore_ascii_case("digitalocean") => {
+                        if !has_cred(&tls.digitalocean_api_token_file, &tls.digitalocean_api_token)
+                        {
+                            return Err(ConfigError::Validation(
+                                "[server.tls] dns_provider = \"digitalocean\" requires a token: \
+                                 set `digitalocean_api_token_file` or the \
+                                 EPHPM_SERVER__TLS__DIGITALOCEAN_API_TOKEN environment variable."
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    Some(p) if p.eq_ignore_ascii_case("route53") => {
+                        if !nonempty(&tls.route53_access_key_id) {
+                            return Err(ConfigError::Validation(
+                                "[server.tls] dns_provider = \"route53\" requires \
+                                 `route53_access_key_id`."
+                                    .to_string(),
+                            ));
+                        }
+                        if !has_cred(
+                            &tls.route53_secret_access_key_file,
+                            &tls.route53_secret_access_key,
+                        ) {
+                            return Err(ConfigError::Validation(
+                                "[server.tls] dns_provider = \"route53\" requires a secret key: \
+                                 set `route53_secret_access_key_file` or the \
+                                 EPHPM_SERVER__TLS__ROUTE53_SECRET_ACCESS_KEY environment variable."
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    Some(p) if p.eq_ignore_ascii_case("google") => {
+                        if !has_cred(
+                            &tls.google_service_account_json_file,
+                            &tls.google_service_account_json,
+                        ) {
+                            return Err(ConfigError::Validation(
+                                "[server.tls] dns_provider = \"google\" requires a \
+                                 service-account key: set `google_service_account_json_file` or \
+                                 the EPHPM_SERVER__TLS__GOOGLE_SERVICE_ACCOUNT_JSON environment \
                                  variable."
+                                    .to_string(),
+                            ));
+                        }
+                        if !nonempty(&tls.google_project) {
+                            return Err(ConfigError::Validation(
+                                "[server.tls] dns_provider = \"google\" requires `google_project`."
                                     .to_string(),
                             ));
                         }
                     }
                     Some(other) => {
                         return Err(ConfigError::Validation(format!(
-                            "[server.tls] dns_provider = \"{other}\" is not supported; the \
-                             only implemented provider is \"cloudflare\".",
+                            "[server.tls] dns_provider = \"{other}\" is not supported; \
+                             implemented providers: cloudflare, linode, digitalocean, route53, \
+                             google.",
                         )));
                     }
                     None => {
                         return Err(ConfigError::Validation(
                             "[server.tls] challenge = \"dns-01\" requires `dns_provider` \
-                             (currently only \"cloudflare\")."
+                             (cloudflare, linode, digitalocean, route53, or google)."
                                 .to_string(),
                         ));
                     }
@@ -6144,10 +6262,42 @@ mod tests {
             "[server.tls]\n\
              domains = [\"example.com\"]\n\
              challenge = \"dns-01\"\n\
-             dns_provider = \"route53\"\n\
+             dns_provider = \"gandi\"\n\
              cloudflare_api_token = \"x\"\n",
         );
         assert!(err.contains("not supported"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn dns01_new_providers_accepted_with_credentials() {
+        // Each non-Cloudflare provider validates when its credential(s) are set.
+        let base = "[server.tls]\ndomains = [\"*.p.example.com\"]\nchallenge = \"dns-01\"\n";
+        for (provider, creds) in [
+            ("linode", "linode_api_token = \"tok\"\n"),
+            ("digitalocean", "digitalocean_api_token = \"tok\"\n"),
+            ("route53", "route53_access_key_id = \"AKIA\"\nroute53_secret_access_key = \"s\"\n"),
+            ("google", "google_service_account_json = \"{}\"\ngoogle_project = \"proj\"\n"),
+        ] {
+            let toml = format!("{base}dns_provider = \"{provider}\"\n{creds}");
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("ephpm.toml");
+            std::fs::write(&file, &toml).unwrap();
+            Config::load(&file).unwrap().validate().unwrap_or_else(|e| {
+                panic!("provider {provider} should validate with its credentials, got: {e}")
+            });
+        }
+    }
+
+    #[test]
+    fn dns01_new_providers_require_credentials() {
+        let base = "[server.tls]\ndomains = [\"*.p.example.com\"]\nchallenge = \"dns-01\"\n";
+        for provider in ["linode", "digitalocean", "route53", "google"] {
+            let err = validation_error(&format!("{base}dns_provider = \"{provider}\"\n"));
+            assert!(
+                err.contains(provider) && err.contains("requires"),
+                "provider {provider} with no creds should be rejected: {err}"
+            );
+        }
     }
 
     #[test]
