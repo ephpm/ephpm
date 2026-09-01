@@ -224,7 +224,7 @@ This is the caveat that matters most, and it is the opposite of the old libSQL `
 
 Send writes to the primary. Every node exposes `GET /_ephpm/primary`, which returns `200` only on the node that is currently the writable target and a non-`200` otherwise — point an active/passive load balancer or a `readinessProbe`-style check at it rather than guessing.
 
-The exception is **per-site clustered mode** (`[db.sqlite.replication] per_site = true`, also experimental), where each vhost's database has its own owner and a non-owner *does* forward `ephpm_db_*` statements to the owner over the cluster channel. Stock `pdo_mysql` traffic is not forwarded even there.
+The exception is **per-site clustered mode** (`[db.sqlite.replication] per_site = true`, also experimental), where each vhost's database has its own owner and a non-owner *does* forward statements to the owner over the cluster channel — on both routes, `ephpm_db_*` and stock `pdo_mysql`. Reads and writes work on any node there, so `/_ephpm/primary` returns `200` everywhere and there is nothing to steer.
 
 ## KV Store: Three Ways to Use It, Zero External Services
 

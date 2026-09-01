@@ -290,9 +290,10 @@ sharding previews across independent nodes, not by clustering one preview host.
 
 `[db.sqlite.replication] per_site = true` (**experimental**) relaxes this: each
 vhost keeps its own database and replicates it across the cluster, with writes
-forwarded to the site's owner. It is not yet a basis for the preview fleet —
-the Turso engine is Beta upstream and the forwarding path covers the
-`ephpm_db_*` bridge only, not stock `pdo_mysql`.
+forwarded to the site's owner on both routes (`ephpm_db_*` and stock
+`pdo_mysql`). It is not yet a basis for the preview fleet — the Turso engine is
+Beta upstream, and multi-node behaviour is unit-tested rather than validated on
+a live cluster.
 
 ## Multi-PHP versions — deferred
 

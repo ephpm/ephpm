@@ -97,14 +97,39 @@
 //! `ephpm_db_*` exception — it never wedges. A transport failure also drops the
 //! proxy's stream so the next statement re-dials.
 //!
-//! # Known gap (this increment)
+//! # Both tenant routes forward
 //!
-//! Forwarding is wired into the `ephpm_db_*` bridge only. A `pdo_mysql`
-//! connection to a non-owner node still resolves that node's **local** backend
-//! (the per-site MySQL wire listener is unchanged), so a stock-`pdo_mysql`
-//! write to a non-owner is not forwarded. Apps using the `db-*` drop-ins (which
-//! call `ephpm_db_*`) get forwarding; that is the supported per-site clustered
-//! path.
+//! [`ClusteredSiteResolver`] serves **both** ways a tenant reaches its
+//! database:
+//!
+//! * the `ephpm_db_*` bridge, via [`SiteBackendResolver`] (synchronous,
+//!   `block_on` on a PHP worker thread);
+//! * stock `pdo_mysql` on the multi-tenant MySQL wire listener, via
+//!   [`crate::site_wire_auth::SiteWireRoute`] (asynchronous, on a tokio
+//!   worker — which is why that seam exists at all: `block_on` would panic
+//!   there).
+//!
+//! The wire route was the last hole in this design. It used to resolve the
+//! node's **local** backend unconditionally, so a stock-`pdo_mysql` write that
+//! landed on a non-owner committed to a replica whose writes are never
+//! captured into CDC: unreplicated, invisible to the owner, and discarded the
+//! next time that replica re-bootstrapped. It diverged silently.
+//!
+//! Two consequences of routing wire traffic through here, both intended:
+//!
+//! * **A non-owner no longer opens the site's database to serve wire traffic.**
+//!   It announces the site (below) instead of consuming an LRU slot for a
+//!   database it is not serving from — the same treatment the bridge route
+//!   already got. Replication is unaffected: announcement, not opening, is what
+//!   puts a node in a site's replication set.
+//! * **A forwarded statement's query stats and SQL screen run on the owner**,
+//!   against the owner's screened/tracked backend, not locally. litewire's own
+//!   tenant-session screen still runs locally at the frontend, so the
+//!   `ATTACH`/`VACUUM`/path-`PRAGMA` rejections a tenant sees are unchanged.
+//!
+//! Connection-lifetime semantics (resolve-at-connect, and what an ownership
+//! move does to an open connection) are documented on
+//! [`crate::site_wire_auth`].
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -432,14 +457,30 @@ impl ClusteredSiteResolver {
     /// node while every health check stayed green, and HRW failover moved
     /// ownership to a node holding nothing.
     ///
-    /// Stock `pdo_mysql` traffic hid the gap by incidentally opening the
-    /// database locally; the recommended deployment (the `db-*` drop-ins, which
-    /// call `ephpm_db_*` only) hits it squarely.
+    /// Stock `pdo_mysql` traffic used to hide the gap by incidentally opening
+    /// the database locally (the wire listener resolved locally, which was its
+    /// own divergence bug); the recommended deployment — the `db-*` drop-ins,
+    /// which call `ephpm_db_*` only — hit it squarely. Now that **both** routes
+    /// resolve through here, neither opens a non-owned site locally, and this
+    /// announcement is the only thing that puts the node in the site's
+    /// replication set.
     ///
     /// The announcement happens **before** the fallible owner-address lookup:
     /// a node that cannot reach the site's owner right now is precisely a node
     /// that should already be replicating it.
-    async fn resolve_async(&self, site: &str) -> Result<SharedBackend, String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns the registry's error on the local branch, or a message naming
+    /// the site whose owner could not be addressed on the forwarding branch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`plan_serve`] chose to forward while no node is alive to own
+    /// the site. That is unreachable by construction: `should_serve_locally`
+    /// returns `true` (serve locally) precisely when `hrw_owner` is `None`, so
+    /// reaching the forwarding branch already implies an owner exists.
+    pub async fn resolve_backend(&self, site: &str) -> Result<SharedBackend, String> {
         let nodes = self.cluster.nodes().await;
         if plan_serve(&nodes, &self.self_id, site, &self.note_active) == ServePlan::Local {
             return self.local.get_or_open(site).await.map_err(|e| format!("{e:#}"));
@@ -477,7 +518,31 @@ impl SiteBackendResolver for ClusteredSiteResolver {
         // block_on is legal: `resolve` is only ever called from the bridge on a
         // PHP worker / spawn_blocking thread, never an async task — the same
         // invariant that licenses the plain registry's `resolve`.
-        self.handle.clone().block_on(self.resolve_async(site_key))
+        //
+        // The wire path must NOT come through here: it resolves from inside a
+        // tokio worker (litewire's authenticator is async), where `block_on`
+        // panics. It calls `resolve_backend` directly — see `SiteWireRoute`.
+        self.handle.clone().block_on(self.resolve_backend(site_key))
+    }
+}
+
+/// The same local-or-forward decision, for the multi-tenant MySQL wire
+/// listener.
+///
+/// Routing stock `pdo_mysql` through the *same* resolver as the `ephpm_db_*`
+/// bridge is the whole point: before this, a wire connection on a non-owner
+/// resolved that node's **local** database, so the write committed to a replica
+/// whose writes are never captured into CDC — unreplicated, invisible to the
+/// owner, and discarded the next time that replica re-bootstraps. Silent
+/// divergence, with every health check green.
+///
+/// This is `async` (unlike [`SiteBackendResolver::resolve`]) because litewire's
+/// authenticator runs on a tokio worker, where the bridge's `block_on` would
+/// panic rather than block.
+#[litewire::async_trait]
+impl crate::site_wire_auth::SiteWireRoute for ClusteredSiteResolver {
+    async fn backend_for(&self, site_key: &str) -> anyhow::Result<SharedBackend> {
+        self.resolve_backend(site_key).await.map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 
@@ -795,9 +860,11 @@ mod tests {
     /// while every health check passes. Before the fix this branch returned a
     /// `RemoteProxyBackend` and announced nothing.
     ///
-    /// Note this is invisible to any test that drives `pdo_mysql`: that path
-    /// opens the database locally and announces as a side effect. It only bites
-    /// the recommended `ephpm_db_*`-only deployment.
+    /// This used to be invisible to any test that drove `pdo_mysql`, because
+    /// that path opened the database locally and announced as a side effect —
+    /// it only bit the recommended `ephpm_db_*`-only deployment. Both routes
+    /// now resolve through `plan_serve`, so this branch is the sole announcer
+    /// for a non-owned site and the assertion covers both.
     #[test]
     fn forwarding_a_site_announces_it_to_the_replication_plane() {
         let nodes = [
