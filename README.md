@@ -14,10 +14,10 @@ First, it needed to be written in Rust to completely avoid the heavy `cgo` execu
 
 Second, it completely eliminates localhost loopback network hops. While local TCP connections and Unix sockets (used by PHP-FPM and RoadRunner) are fast, they still incur unavoidable OS kernel context-switching and protocol serialization taxes. 
 
-* **Web Server:** Replaces Nginx by binding an in-process, high-concurrency [Tokio](https://tokio.rs) + [Hyper](https://docs.rs) network stack.
+* **Web Server:** Replaces Nginx by binding an in-process, high-concurrency [Tokio](https://tokio.rs) + [Hyper](https://docs.rs/hyper) network stack.
 * **Process Manager:** Replaces PHP-FPM with our custom, resource-aware `fpm_engine` thread manager.
-* **Shared Memory Cache:** Replaces standalone Redis with a concurrent, thread-safe [DashMap](https://docs.rs) key-value store (supports clustering)
-* **Database:** Replaces external MySQL with an embedded, zero-dependency combination of [Turso](https://turso.tech/) and its underlying [libSQL](https://github.com/tursodatabase/libsql) relational engine (supports clustering)
+* **Shared Memory Cache:** Replaces standalone Redis with a concurrent, thread-safe [DashMap](https://docs.rs/dashmap) key-value store (supports clustering)
+* **Database:** Replaces external MySQL with the embedded, zero-dependency [Turso](https://github.com/tursodatabase/turso) engine — a pure-Rust SQLite-compatible database compiled into the binary (supports clustering)
 
 ePHPm has also packed a highly robust and cloud-native feature set by drawing direct inspiration from other modern runtimes. This includes automatic ACME TLS certificate management and server-level middleware handlers (similar to RoadRunner and FrankenPHP), alongside an in-process SQL proxy with connection pooling and slow query logging inspired directly by ProxySQL. Combined with native cluster synchronization, OpenTelemetry tracing (OTLP), and container-aware runtime autotuning, ePHPm is fully prepared for modern cloud environments.
 
@@ -175,53 +175,44 @@ join = ["ephpm.default.svc.cluster.local"]
 Single node is very simple and accessed via SAPI functions added to the runtime by ePHPm.
 
 ```
-PHP Framework (ephpm driver) ──(Direct FFI)──> SAPI Functions (ephpm_db_query) ──> libSQL/Turso (In-Process)
+PHP Framework (ephpm driver) ──(Direct FFI)──> SAPI Functions (ephpm_db_query) ──> Turso engine (in-process)
 ```
 
-In a distributed ePHPm cluster, relational data replication is handled at the engine layer by leveraging libSQL’s built-in Change Data Capture (CDC) architecture, completely removing the need for a separate heavy database replication service. Here is exactly how the CDC pipeline coordinates with the gossip protocol and the TCP data plane to maintain a high-availability database cluster and the request with the write shows up on the primary Turso node.
+In a distributed ePHPm cluster, replication is handled inside the same process by tailing the Turso engine's own change-data-capture (CDC) stream — no sidecar, no separate replication service, no gRPC WAL transport. (The libSQL server / `sync_url` machinery that earlier releases used was removed in v0.7.0.) The primary's writes capture into `turso_cdc`; a per-subscriber tailer ships them, one batch per transaction, over ePHPm's authenticated cluster channel:
 
 ```
-[ PHP Write Query ] ──(SAPI/Proxy)──> [ Node A (Elected Primary) ]
+[ PHP Write Query ] ──(SAPI / wire proxy)──> [ Node A (elected primary) ]
                                                 │
-                                       (Local WAL Commit)
+                                        (local commit — writes
+                                         capture into turso_cdc)
                                                 │
-                                     [ libSQL CDC Generator ]
+                                       [ per-subscriber CdcTailer ]
                                                 │
-                                                ▼  (Binary Transaction Log Stream)
-                                       [ Cluster TCP Plane ]
+                                                ▼  (length-prefixed JSON, one frame per transaction)
+                                    [ Cluster channel — authenticated,
+                                      yamux-multiplexed TCP, "cdc/default" ]
                                           /           \
                                          ▼             ▼
-                           [ Node B (Replica) ]   [ Node C (Replica) ]
-                             (Apply Log Page)       (Apply Log Page)
+                           [ Node B (replica) ]   [ Node C (replica) ]
+                              (apply_batch)          (apply_batch)
 ```
 
-If the request is to a read replica Turso node the write will fix itself by syncing the data to the primary.
+Gossip decides *who* is primary (lowest-ordinal live node, `kv:sqlite:primary` with a TTL heartbeat); the cluster channel carries the data. A cold replica bootstraps from a logical snapshot first, and every stream opens with a `Hello` frame naming the primary's CDC log identity, so a watermark accumulated against a dead primary's log can never be replayed against a promoted node's log.
+
+#### Writes against a replica do NOT fix themselves
+
+This is the caveat that matters most, and it is the opposite of the old libSQL `sync_url` behavior. There is **no write-forwarding in the single-database clustered path**. litewire has no read-only frontend mode, so a replica's MySQL/Hrana endpoint accepts writes — and anything written there lands only in that node's local database and is **replicated nowhere**. The replica logs a warning at startup, but the divergence is otherwise silent.
 
 ```
-[ PHP SAPI Write Call ]
-          │
-          ▼
-┌─────────────────────────────────┐
-│        Node B (Replica)         │
-│  ┌───────────────────────────┐  │
-│  │   ePHPm Gossip Layer      │  │ ◄─── Says: "Node A is Primary"
-│  └─────────────┬─────────────┘  │
-│                ▼                │
-│  ┌───────────────────────────┐  │
-│  │ libSQL Client (Replica)   │  │
-│  │  • url: "local.db"        │  │
-│  │  • sync_url: "Node A"     │  │
-│  └─────────────┬─────────────┘  │
-└────────────────┼────────────────┘
-                 │
-                 ▼ (Natively forwarded via libSQL gRPC)
-┌─────────────────────────────────┐
-│        Node A (Primary)         │
-│  ┌───────────────────────────┐  │
-│  │ libSQL Server (Primary)   │  │ ───► Commits to local disk
-│  └───────────────────────────┘  │
-└─────────────────────────────────┘
+[ PHP write ] ──> [ Node B (replica) ]  ── committed locally
+                                        ── NOT shipped to the primary
+                                        ── NOT seen by any other node
+                                        ── overwritten whenever B re-bootstraps
 ```
+
+Send writes to the primary. Every node exposes `GET /_ephpm/primary`, which returns `200` only on the node that is currently the writable target and a non-`200` otherwise — point an active/passive load balancer or a `readinessProbe`-style check at it rather than guessing.
+
+The exception is **per-site clustered mode** (`[db.sqlite.replication] per_site = true`, also experimental), where each vhost's database has its own owner and a non-owner *does* forward `ephpm_db_*` statements to the owner over the cluster channel. Stock `pdo_mysql` traffic is not forwarded even there.
 
 ## KV Store: Three Ways to Use It, Zero External Services
 
