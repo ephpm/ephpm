@@ -69,6 +69,48 @@
 //! to be persisted somewhere, and a per-tenant secret at rest is a much larger
 //! surface than one that lives only in memory.
 //!
+//! # Which node serves the connection (clustered)
+//!
+//! Authentication settles *which tenant* is connecting. It does not settle
+//! *where that tenant's data lives* — and in per-site clustered mode those are
+//! different questions, because a site's writes are only captured into the CDC
+//! log (and therefore only replicated) on the node that **owns** it by
+//! rendezvous hashing.
+//!
+//! So the verified site key is handed to a [`SiteWireRoute`], the same routing
+//! the `ephpm_db_*` bridge uses:
+//!
+//! * single-node per-site → always this node's local database file;
+//! * per-site clustered → the local file when this node is the site's HRW
+//!   owner, otherwise a forwarding proxy to the owner
+//!   (`sql_forward::ClusteredSiteResolver`).
+//!
+//! Before this, the wire listener always resolved locally, so a stock
+//! `pdo_mysql` write that landed on a non-owner committed to a replica whose
+//! writes nothing ships — unreplicated, invisible to the owner, and discarded
+//! the next time that replica re-bootstrapped. It diverged silently, with every
+//! health check green.
+//!
+//! ## Resolve-at-connect, and what an ownership move does
+//!
+//! The route is consulted **once per connection**, at authentication, and the
+//! resulting backend is held for that connection's life. Ownership is
+//! recomputed from live membership, so it can move while a connection is open.
+//! When it does, the pinned owner refuses the forwarded stream (it HRW-gates
+//! every stream — see [`crate::sql_forward`]) and the tenant's statements fail
+//! with an ordinary connection error until it reconnects.
+//!
+//! That is deliberate, and it is the same lifetime the `ephpm_db_*` bridge
+//! already has: the bridge resolves once per (thread, site) session and pins
+//! the result too, recovering by recycling the session on a connection-shaped
+//! error. Both paths trade "an ownership move breaks open sessions, loudly" for
+//! never writing to a node whose writes do not replicate. A failed statement is
+//! recoverable; a silently unreplicated write is not.
+//!
+//! Non-persistent `pdo_mysql` (the default) opens a connection per request, so
+//! the blast radius of a move is one request. `PDO::ATTR_PERSISTENT` widens it
+//! to "until PHP drops the handle".
+//!
 //! # What this does not defend against
 //!
 //! One listener is shared, so `[db.sqlite.proxy] max_connections` is a
@@ -103,10 +145,60 @@ struct Inner {
     /// Hex-encoded per-process master secret. Never persisted, never sent to
     /// PHP; only per-site derivations of it are.
     secret: String,
-    /// The per-site database registry — the *same* one the `ephpm_db_*` bridge
-    /// resolves through, so a site's wire connections and its bridge queries
-    /// land on one database handle and one LRU entry.
-    backends: SiteBackends,
+    /// How an authenticated site's backend is found — the *same* routing the
+    /// `ephpm_db_*` bridge uses, so a site's `pdo_mysql` connections and its
+    /// bridge queries agree about which database (and which node) serves it.
+    route: Arc<dyn SiteWireRoute>,
+}
+
+/// Resolves an authenticated site to the backend its connection should use.
+///
+/// # Why this is a seam and not just `SiteBackends`
+///
+/// There are two per-site modes, and they answer "where does this site's data
+/// live?" differently:
+///
+/// * **Single-node per-site** — always this node's local database file. The
+///   registry ([`SiteBackends`]) *is* the answer.
+/// * **Per-site clustered** — the site's data lives on its HRW **owner**, and
+///   only writes made on the owner are captured into the CDC log that
+///   replicates. A non-owner must forward, not write locally.
+///
+/// The `ephpm_db_*` bridge has always made that distinction (via
+/// `sql_forward::ClusteredSiteResolver`). The wire listener did not: it went
+/// straight to `SiteBackends::get_or_open`, so a stock `pdo_mysql` write that
+/// landed on a non-owner committed to that node's replica, was never
+/// replicated, and was discarded the next time the replica re-bootstrapped from
+/// the owner. This trait is what lets both paths share one answer.
+///
+/// # Async on purpose
+///
+/// [`ConnectionAuthenticator::authenticate`] runs on a tokio worker, so the
+/// bridge's synchronous `block_on` resolver would panic here. Implementations
+/// must be genuinely async.
+#[litewire::async_trait]
+pub trait SiteWireRoute: Send + Sync + 'static {
+    /// The backend serving `site_key`, opening the site's database if this
+    /// mode and this node serve it locally.
+    ///
+    /// `site_key` has already been normalized, validated, **and
+    /// password-verified** by [`SiteWireAuth::authenticate`] — an implementation
+    /// may treat it as an established tenant identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the site's database cannot be opened, or (clustered)
+    /// if its owner cannot be addressed. Either way the connection is refused;
+    /// there is never a fallback to another site's data.
+    async fn backend_for(&self, site_key: &str) -> anyhow::Result<SharedBackend>;
+}
+
+/// Single-node per-site: the site's database is always this node's local file.
+#[litewire::async_trait]
+impl SiteWireRoute for SiteBackends {
+    async fn backend_for(&self, site_key: &str) -> anyhow::Result<SharedBackend> {
+        self.get_or_open(site_key).await
+    }
 }
 
 impl SiteWireAuth {
@@ -119,6 +211,21 @@ impl SiteWireAuth {
     /// secret makes every tenant's password derivable from its (public) site
     /// name, which is worse than not starting.
     pub fn new(backends: SiteBackends) -> anyhow::Result<Self> {
+        Self::with_route(Arc::new(backends))
+    }
+
+    /// Generate a fresh master secret and resolve authenticated sites through
+    /// `route`.
+    ///
+    /// Per-site **clustered** mode passes the forwarding resolver here, so a
+    /// wire connection on a non-owner forwards to the site's owner exactly as
+    /// the `ephpm_db_*` bridge does, instead of writing to an unreplicated
+    /// local replica.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the OS entropy source is unavailable — see [`Self::new`].
+    pub fn with_route(route: Arc<dyn SiteWireRoute>) -> anyhow::Result<Self> {
         let mut raw = [0u8; MASTER_SECRET_BYTES];
         getrandom::fill(&mut raw).map_err(|e| {
             anyhow::anyhow!(
@@ -132,7 +239,7 @@ impl SiteWireAuth {
             let _ = write!(s, "{b:02x}");
             s
         });
-        Ok(Self { inner: Arc::new(Inner { secret, backends }) })
+        Ok(Self { inner: Arc::new(Inner { secret, route }) })
     }
 
     /// The MySQL password for `site_key`.
@@ -191,7 +298,13 @@ impl ConnectionAuthenticator for SiteWireAuth {
 
         // Authenticated. Only now is this connection entitled to a database,
         // and only to this one.
-        match self.inner.backends.get_or_open(&site_key).await {
+        //
+        // Where that database lives is the route's call, not ours: local in
+        // single-node per-site mode, and in per-site CLUSTERED mode local only
+        // when this node is the site's HRW owner — otherwise a forwarding proxy
+        // to the owner, so the write is captured into CDC and replicates. See
+        // `SiteWireRoute`.
+        match self.inner.route.backend_for(&site_key).await {
             Ok(backend) => {
                 tracing::debug!(site = %site_key, "per-site MySQL connection authenticated");
                 Some(backend)
@@ -330,6 +443,164 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let auth = auth(tmp.path().to_path_buf());
         assert!(auth.authenticate(&request("site-a.test", b"")).await.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Routing (per-site clustered): the wire path must resolve through the
+    // SAME decision as the `ephpm_db_*` bridge, not straight to the local
+    // registry.
+    // -----------------------------------------------------------------------
+
+    /// A backend that answers nothing — a stand-in for "whatever the route
+    /// returned", so a test can assert on *which* backend came back.
+    struct MarkerBackend;
+
+    #[litewire::async_trait]
+    impl litewire::backend::Backend for MarkerBackend {
+        async fn connect(
+            &self,
+        ) -> Result<Box<dyn litewire::backend::BackendConn>, litewire::backend::BackendError>
+        {
+            Err(litewire::backend::BackendError::Other("marker".into()))
+        }
+    }
+
+    /// A route that records every site it was asked for and hands back one
+    /// fixed backend.
+    struct RecordingRoute {
+        asked: std::sync::Mutex<Vec<String>>,
+        backend: SharedBackend,
+    }
+
+    impl RecordingRoute {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                asked: std::sync::Mutex::new(Vec::new()),
+                backend: Arc::new(MarkerBackend) as SharedBackend,
+            })
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    #[litewire::async_trait]
+    impl SiteWireRoute for RecordingRoute {
+        async fn backend_for(&self, site_key: &str) -> anyhow::Result<SharedBackend> {
+            self.asked.lock().unwrap().push(site_key.to_string());
+            Ok(Arc::clone(&self.backend))
+        }
+    }
+
+    /// The connection is served by whatever the **route** returns, not by the
+    /// local registry.
+    ///
+    /// This is the fix for the per-site clustered `pdo_mysql` gap stated as a
+    /// test: in that mode the route is the forwarding resolver, so a wire
+    /// connection on a non-owner gets a proxy to the site's owner instead of
+    /// this node's unreplicated local replica.
+    #[tokio::test]
+    async fn the_route_decides_which_backend_serves_the_connection() {
+        let route = RecordingRoute::new();
+        let auth =
+            SiteWireAuth::with_route(Arc::clone(&route) as Arc<dyn SiteWireRoute>).expect("secret");
+
+        let pw = auth.password_for("site-a.test");
+        let got = auth
+            .authenticate(&request("site-a.test", &client_response(&pw, SALT)))
+            .await
+            .expect("a site's own password must authenticate");
+
+        assert!(
+            Arc::ptr_eq(&got, &route.backend),
+            "authenticate must hand back the route's backend; resolving the local registry \
+             directly is what let a non-owner's pdo_mysql write to an unreplicated replica"
+        );
+        assert_eq!(
+            route.asked(),
+            ["site-a.test".to_string()],
+            "the route must be consulted with the normalized, verified site key"
+        );
+    }
+
+    /// Verification still happens **before** routing.
+    ///
+    /// The ordering is the security property (an unauthenticated caller must
+    /// not be able to make the server open, create, or reach out for a database
+    /// by naming it), and indirecting the resolution through a trait is exactly
+    /// the kind of change that can quietly invert it. In clustered mode a
+    /// premature route call would also dial another node for the named tenant.
+    #[tokio::test]
+    async fn a_failed_password_never_reaches_the_route() {
+        let route = RecordingRoute::new();
+        let auth =
+            SiteWireAuth::with_route(Arc::clone(&route) as Arc<dyn SiteWireRoute>).expect("secret");
+
+        let b_password = auth.password_for("site-b.test");
+        let denied =
+            auth.authenticate(&request("site-a.test", &client_response(&b_password, SALT))).await;
+
+        assert!(denied.is_none(), "site-b's password must not open site-a's database");
+        assert!(
+            route.asked().is_empty(),
+            "a failed authentication must not consult the route at all, let alone dial \
+             site-a's owner"
+        );
+    }
+
+    /// An invalid site key is rejected before routing too, so no path (and no
+    /// `sql/<site>` stream type) is ever derived from it.
+    #[tokio::test]
+    async fn an_invalid_site_key_never_reaches_the_route() {
+        let route = RecordingRoute::new();
+        let auth =
+            SiteWireAuth::with_route(Arc::clone(&route) as Arc<dyn SiteWireRoute>).expect("secret");
+
+        for user in ["../etc/passwd", "a/b", "", "site a"] {
+            let pw = auth.password_for(user);
+            assert!(auth.authenticate(&request(user, &client_response(&pw, SALT))).await.is_none());
+        }
+        assert!(route.asked().is_empty());
+    }
+
+    /// A route failure fails the connection closed — never a fallback to some
+    /// other site's data. In clustered mode this is the "owner is unreachable
+    /// or mid-election" case.
+    #[tokio::test]
+    async fn a_route_failure_refuses_the_connection() {
+        struct FailingRoute;
+
+        #[litewire::async_trait]
+        impl SiteWireRoute for FailingRoute {
+            async fn backend_for(&self, _site_key: &str) -> anyhow::Result<SharedBackend> {
+                Err(anyhow::anyhow!("owner unreachable"))
+            }
+        }
+
+        let auth = SiteWireAuth::with_route(Arc::new(FailingRoute)).expect("secret");
+        let pw = auth.password_for("site-a.test");
+        assert!(
+            auth.authenticate(&request("site-a.test", &client_response(&pw, SALT))).await.is_none(),
+            "a site whose backend cannot be resolved gets no connection"
+        );
+    }
+
+    /// The forwarding resolver **is** a wire route.
+    ///
+    /// Type-level statement of the fix: `wire_per_site_clustered_db` can hand
+    /// the multi-tenant MySQL listener the very same
+    /// `ClusteredSiteResolver` the `ephpm_db_*` bridge resolves through, so the
+    /// two tenant routes cannot disagree about which node serves a site. If
+    /// this stops compiling, the wire listener has been reverted to
+    /// local-only resolution and per-site clustered `pdo_mysql` writes silently
+    /// diverge again.
+    #[test]
+    fn the_forwarding_resolver_can_serve_the_wire_listener() {
+        fn assert_is_wire_route<T: SiteWireRoute>() {}
+        assert_is_wire_route::<crate::sql_forward::ClusteredSiteResolver>();
+        // And the registry remains one, for single-node per-site mode.
+        assert_is_wire_route::<SiteBackends>();
     }
 
     /// A username that is not a valid site key is refused before any path is

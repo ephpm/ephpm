@@ -192,12 +192,9 @@ Stated plainly, because a security page that only lists wins is not useful.
 - **Clustered mode.** With `[cluster]` enabled and the default
   `[db.sqlite.replication] per_site = false`, the database is shared across
   tenants and ePHPm warns loudly at startup. Setting `per_site = true` gives
-  each tenant its own replicated database (**experimental**) — but write
-  forwarding to the site's owner is wired into the `ephpm_db_*` bridge only.
-  A `pdo_mysql` connection to a node that does not own the site resolves that
-  node's *local* replica, so its writes are neither forwarded nor replicated.
-  **Do not use `pdo_mysql` for writes in per-site clustered mode**; use the
-  [`db-*` drop-ins](/reference/php-packages/), which call the bridge.
+  each tenant its own replicated database (**experimental**). `pdo_mysql`
+  writes are forwarded to the site's owner on that path — see
+  [Clustered mode](#clustered-mode) below.
 
 ## Resource cost
 
@@ -247,6 +244,36 @@ one LRU entry — not two handles on one file. Both are recorded in
 Use whichever suits the code. `pdo_mysql` is the compatible one (WordPress,
 Laravel, every ORM); the bridge skips the wire round trip and the per-request
 connection setup.
+
+## Clustered mode
+
+With `[db.sqlite.replication] per_site = true` (**experimental**), each site's
+database replicates across the cluster and one node *owns* each site by
+rendezvous hashing. Only writes made on the owner are captured into the change
+log that replicates, so a write made anywhere else has to get to the owner.
+
+Both routes handle that identically: a connection on a node that does not own
+the site — `pdo_mysql` or bridge — **forwards** its statements to the owner over
+the cluster channel. Reads and writes work on any node, and you do not have to
+route traffic to a particular one.
+
+Two things worth knowing:
+
+- **A connection is routed once, when it is opened.** Ownership is recomputed
+  from live membership, so it can move while a connection is open. When it does,
+  the old owner refuses the forwarded statements and the tenant sees an ordinary
+  connection error until it reconnects — loudly, rather than writing somewhere
+  the write would not replicate. Non-persistent `pdo_mysql` (the default) opens
+  a connection per request, so the blast radius is one request;
+  `PDO::ATTR_PERSISTENT` widens it until PHP drops the handle.
+- **A forwarded statement is measured on the owner.** Its
+  [query stats](/architecture/query-stats/) are recorded there, not on the node
+  the request hit. `ATTACH` / `VACUUM` / path-`PRAGMA` rejections are unchanged
+  — those are screened locally, at the frontend, before anything is forwarded.
+
+Per-site clustered mode is **experimental** (the Turso engine is Beta upstream)
+and its multi-node behaviour is unit-tested rather than validated on a live
+cluster.
 
 One current difference worth knowing: the bridge resolves its tenant from a
 per-request thread-local that only the default (non-worker) execution path

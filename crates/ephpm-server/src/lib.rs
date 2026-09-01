@@ -2464,31 +2464,40 @@ fn wire_per_site_clustered_db(
         Arc::clone(&note_active),
     )?;
 
-    // The bridge resolves each request's backend through the forwarding
-    // resolver: local when this node is the site's HRW owner, a remote proxy to
-    // the owner otherwise. This is what makes writes work on any node.
-    let resolver: Arc<dyn ephpm_php::db_bridge::SiteBackendResolver> =
-        Arc::new(sql_forward::ClusteredSiteResolver::new(
-            registry.clone(),
-            Arc::clone(cluster),
-            channel.clone(),
-            cluster.self_node().id,
-            tokio::runtime::Handle::current(),
-            note_active,
-        ));
-    ephpm_php::PhpRuntime::set_db_backend_resolver(resolver, tokio::runtime::Handle::current());
+    // ONE resolver, shared by both tenant routes: local when this node is the
+    // site's HRW owner, a remote proxy to the owner otherwise. This is what
+    // makes writes work on any node.
+    let resolver = Arc::new(sql_forward::ClusteredSiteResolver::new(
+        registry.clone(),
+        Arc::clone(cluster),
+        channel.clone(),
+        cluster.self_node().id,
+        tokio::runtime::Handle::current(),
+        note_active,
+    ));
 
-    // The per-site MySQL wire listener stays LOCAL-only (see sql_forward module
-    // docs, "Known gap"): stock pdo_mysql to a non-owner is not forwarded in
-    // this increment. Apps using the db-* drop-ins (ephpm_db_*) get forwarding.
-    let auth = site_wire_auth::SiteWireAuth::new(registry.clone())?;
+    // Route 1: the `ephpm_db_*` bridge.
+    ephpm_php::PhpRuntime::set_db_backend_resolver(
+        Arc::clone(&resolver) as Arc<dyn ephpm_php::db_bridge::SiteBackendResolver>,
+        tokio::runtime::Handle::current(),
+    );
+
+    // Route 2: stock `pdo_mysql` on the multi-tenant wire listener. It resolves
+    // through the SAME resolver, so a wire write on a non-owner is forwarded to
+    // the owner and captured into CDC. Handing the wire listener the bare
+    // registry instead (as it did before) made a non-owner's `pdo_mysql` write
+    // commit to a local replica that nothing replicates and that is discarded
+    // on the next re-bootstrap — silent divergence.
+    let auth = site_wire_auth::SiteWireAuth::with_route(
+        Arc::clone(&resolver) as Arc<dyn site_wire_auth::SiteWireRoute>
+    )?;
 
     tracing::info!(
         max_open_dbs = sqlite.max_open_dbs,
         "per-site CLUSTERED database isolation enabled (one replicated Turso database per virtual \
-         host). Owner-serves forwarding is active: the ephpm_db_* bridge serves a site locally on \
-         its HRW owner and forwards to the owner from any other node, so writes and reads work on \
-         any node (experimental)."
+         host). Owner-serves forwarding is active on BOTH tenant routes — the ephpm_db_* bridge \
+         and stock pdo_mysql — so a site is served locally on its HRW owner and forwarded to the \
+         owner from any other node, and reads and writes work on any node (experimental)."
     );
 
     Ok((auth, Some(PerSiteClusterWiring { dir, site_events, registry })))
