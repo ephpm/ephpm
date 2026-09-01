@@ -143,7 +143,7 @@ limiting and `query_stats` were disabled identically in every lane.
 | **D** | `turso` | cluster | CDC-native over the cluster channel, no sidecar |
 
 Two measurements were taken this cycle. The **mid-cycle** run (litewire
-`23b8de63`) found the per-request costs that motivated litewire#15
+`6d135a68`) found the per-request costs that motivated litewire#15
 (per-session workers + handle reuse); the **release** run below is the
 one that matches shipped v0.6.0 — image built from `97e2a60`, litewire
 pinned at `d1c0b341`. Where they differ, the release numbers are the

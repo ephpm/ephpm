@@ -213,10 +213,10 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 #
 #   [patch."https://github.com/ephpm/litewire.git"]
 #   litewire = { path = "../litewire/crates/litewire" }
-# litewire @ 344d2c23bf4e — PERF: the MySQL command filter now hands
+# litewire @ e2ea25b45ce7 — PERF: the MySQL command filter now hands
 # opensrv-mysql a whole command packet per `poll_read` (litewire#37, ePHPm #322).
 #
-# The filter added in litewire#28 (pin cb707ab9) returned the four-byte packet
+# The filter added in litewire#28 (pin 3e493335) returned the four-byte packet
 # header plus the command byte on their own and made opensrv-mysql poll again
 # for the body. `PacketReader::next_async` loops until a packet parses and
 # escalates its scratch buffer from 4 KiB to 1 MiB on the SECOND iteration, so
@@ -229,13 +229,13 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # which is why the bridge half of the lab suite stayed flat throughout.
 #
 # Do not move this pin backwards past litewire#37 without re-measuring the wire
-# path: every pin from cb707ab9 to 10345a869d27 carries the 1 MiB memset.
+# path: every pin from 3e493335 to 51b1860079e2 carries the 1 MiB memset.
 #
-# Previous pin 10345a869d27 — turso 0.7.0 → 0.7.2 (litewire#36). Code-identical
-# to defab22f0c2d; the only change is the engine pin. Measured neutral for the
+# Previous pin 51b1860079e2 — turso 0.7.0 → 0.7.2 (litewire#36). Code-identical
+# to f43e87b22f14; the only change is the engine pin. Measured neutral for the
 # wire path (±1% on the same benchmark), so it is NOT the #322 regression.
 #
-# Previous pin defab22f0c2d — 0.2.0 (litewire#33–#35). Three batches:
+# Previous pin f43e87b22f14 — 0.2.0 (litewire#33–#35). Three batches:
 # (1) litewire#34 SECURITY: lru 0.12.5 → 0.18.2, fixing RUSTSEC-2026-0253 — a
 # use-after-free reachable through the production TranslateCache. Do not move
 # this pin backwards past litewire#34. Same PR adds a server-side
@@ -245,7 +245,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # own screen (ours stays — defence in depth, and it also covers the
 # non-authenticated single-site path). Also pins the opensrv-mysql `tls`
 # feature fence upstream (litewire#32 closed): the CLIENT_SSL auth-bypass
-# analysis in the b16d874b entry below is now enforced by litewire's own
+# analysis in the f2e8f077 entry below is now enforced by litewire's own
 # Cargo.toml rather than by our reliance on default features.
 # (2) litewire#33: docs truth pass + 0.2.0 scaffolding — workspace version
 # 0.2.0, MSRV 1.88 (which is why ePHPm's rust-version moved 1.85 → 1.88 in the
@@ -257,7 +257,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # handle-reuse pool (`.handle_reuse(N)`), OFF by default. ePHPm does not call
 # `.handle_reuse`, so no behavior change from that half.
 #
-# Previous pin cb707ab9 — WordPress wire-fidelity fixes (litewire#28–#31).
+# Previous pin 3e493335 — WordPress wire-fidelity fixes (litewire#28–#31).
 # Four things, all surfaced by running real WordPress over the MySQL frontend:
 # (1) litewire#28: unparseable/unsupported client commands no longer get a
 # default OK packet from opensrv-mysql's fallthrough — an OK of the wrong
@@ -274,10 +274,10 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # wpdb/plugin code that matches on errno or message text behaves.
 # Strictly additive on the wire path: no dependency or feature changes, and
 # opensrv-mysql keeps its default features, so the CLIENT_SSL analysis in the
-# b16d874b entry below still holds (litewire#32 tracks pinning that property
+# f2e8f077 entry below still holds (litewire#32 tracks pinning that property
 # upstream; still open at this bump).
 #
-# Previous pin b16d874b — per-connection backend selection (litewire#27).
+# Previous pin f2e8f077 — per-connection backend selection (litewire#27).
 # Adds `LiteWire::with_authenticator` + the `ConnectionAuthenticator` trait,
 # which is what lets ONE MySQL listener front many per-site databases: the
 # backend is resolved during the handshake from the *authenticated* username,
@@ -308,13 +308,13 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # single-site path are behaviour-identical — single-site keeps the historical
 # accept-everyone handshake and the upstream constant salt.
 #
-# SECURITY: do not move this pin backwards past b16d874b while multi-site
+# SECURITY: do not move this pin backwards past f2e8f077 while multi-site
 # `pdo_mysql` is enabled. Earlier revisions have no `with_authenticator` at
 # all, so the multi-tenant listener cannot be built — but a revision that had
 # a partial form would serve one shared database to every tenant, which is the
 # hole #284/#286 exist to close.
 #
-# Previous pin e34c6392 — WordPress-correctness fixes (litewire#25, #26).
+# Previous pin daf0668e — WordPress-correctness fixes (litewire#25, #26).
 # Three things, all found by benchmarking real WordPress on ephpm:
 # (1) MySQL LIKE patterns now get the implicit ESCAPE '\' clause SQLite
 # lacks, so wpdb::esc_like()-escaped %/_ match literally (litewire#20).
@@ -324,7 +324,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # query (only the `LIMIT offset, count` comma form survived a take());
 # LIMITed queries returned every row. Fixed + regression-pinned.
 #
-# Previous pin 541290c4 — Session extraction (litewire#18). The dialect
+# Previous pin 3225f50e — Session extraction (litewire#18). The dialect
 # translation + transaction-state + error-mapping core of the MySQL handler now
 # lives in the public `litewire-session` crate (`Session`), which the ephpm_db_*
 # in-process bridge consumes. Also fixes a silent multi-statement drop: the old
@@ -332,7 +332,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # KEY` expansions (Laravel schema builder) never created their secondary
 # indexes; Session executes all translated statements in order.
 #
-# Previous pin b086ddaa — CDC replay hardening (litewire#17). Two things.
+# Previous pin 7dde7feb — CDC replay hardening (litewire#17). Two things.
 # (1) Replayed schema DDL is parsed and allowlisted before it reaches the
 # engine. A CDC batch carrying a `sqlite_schema` row used to have its stored
 # `sql` text executed as-is, so a peer whose frames reached `apply_batch` could
@@ -378,7 +378,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # the metadata translator (litewire#12), framework wire-compat (litewire#11) and
 # the Phase 2 CDC tail/apply API (litewire#10).
 #
-# 23b8de63 (litewire#14) makes CdcTailer::poll_batch report an absent turso_cdc
+# 6d135a68 (litewire#14) makes CdcTailer::poll_batch report an absent turso_cdc
 # log as Ok(None) instead of an error. Turso creates that table lazily on the
 # first captured write, so a freshly provisioned cluster has none; before the
 # fix ephpm's CDC primary treated the poll error as fatal and dropped the
@@ -396,11 +396,11 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # SECURITY: do not move this pin backwards. Pins before litewire#17 execute
 # peer-supplied `sqlite_schema.sql` text verbatim on the CDC apply path, which
 # hands any node that clears the cluster handshake ATTACH and PRAGMA on every
-# replica. 699e6345 and earlier interpolate the
+# replica. e8800fbd and earlier interpolate the
 # client-supplied table name straight into SQL text in
 # litewire-translate/src/metadata.rs, and detect_metadata_query() runs before
 # sqlparser, so a crafted identifier in SHOW CREATE TABLE / SHOW INDEX /
-# DESCRIBE becomes arbitrary SQL. 7a0b59c4 adds sanitize_identifier() and
+# DESCRIBE becomes arbitrary SQL. 624c4a0d adds sanitize_identifier() and
 # applies it at every extraction site.
 # v0.7.0 is Turso-only: the `backend-rusqlite` (in-process SQLite C engine)
 # and `backend-hrana-client` (the client that talked to the now-removed sqld
@@ -408,7 +408,7 @@ ephpm-ws = { path = "crates/ephpm-ws" }
 # both — this is purely ePHPm de-linking them from the binary. The embedded
 # SQLite-family engine is `turso` only. `hrana` (the Hrana *server* wire
 # frontend, independent of the removed Hrana *client*) is kept.
-litewire = { git = "https://github.com/ephpm/litewire.git", rev = "ce52816ff842", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
+litewire = { git = "https://github.com/ephpm/litewire.git", rev = "e2ea25b45ce7", default-features = false, features = ["mysql", "postgres", "tds", "hrana", "turso"] }
 # Direct dependency on the same turso the pinned litewire uses, so the
 # snapshot-bootstrap dump code (Phase 2.1) can name turso::{Row, Value}
 # in its signatures. Pinned to the exact version litewire pins (=0.7.2)
