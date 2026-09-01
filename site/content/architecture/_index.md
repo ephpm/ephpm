@@ -1776,7 +1776,7 @@ PHP is compiled with ZTS (`--enable-zts`). Each `spawn_blocking` thread auto-reg
 
 ### Worker Mode {#php-worker-mode}
 
-**Shipped in 3.0.** `mode = "worker"` boots the PHP app once per worker thread, then handles requests in a loop without re-executing the bootstrap (same model as FrankenPHP worker mode and RoadRunner). ZTS makes this possible since each thread already has its own persistent PHP context. The win is largest for apps with heavy framework bootstrap — each request otherwise spends milliseconds redoing autoload, container build, and route compilation.
+**Shipped in v0.3.0.** `mode = "worker"` boots the PHP app once per worker thread, then handles requests in a loop without re-executing the bootstrap (same model as FrankenPHP worker mode and RoadRunner). ZTS makes this possible since each thread already has its own persistent PHP context. The win is largest for apps with heavy framework bootstrap — each request otherwise spends milliseconds redoing autoload, container build, and route compilation.
 
 ```toml
 [php]

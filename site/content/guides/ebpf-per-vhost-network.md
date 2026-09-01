@@ -121,11 +121,12 @@ detaches); on a hard `kill -9` the process fds close and the kernel refcounts
 every program/map/attachment to zero and auto-reaps. A cold restart therefore
 has no stale BPF state to reconcile.
 
-## Known limitation (v0.8.1)
+## Known limitation
 
 **Closed sidecar ports return to the pool only on ePHPm restart.** The
-close-time reclaim path (`sock_release` + `bpf_sk_storage`) is deferred to
-v0.8.2: the current Rust BPF loader cannot load an `SK_STORAGE` map, and reading
+close-time reclaim path (`sock_release` + `bpf_sk_storage`) is **not yet
+implemented** — as of v0.8.6 it remains open, with no target release: the
+current Rust BPF loader cannot load an `SK_STORAGE` map, and reading
 the source port in `sock_release` is verifier-rejected on current kernels. In
 the meantime, a vhost re-binding the *same* virtual port reuses its existing
 real port (the assignment is idempotent), so a restarting sidecar does not

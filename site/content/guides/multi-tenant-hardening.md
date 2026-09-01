@@ -160,6 +160,16 @@ authenticates with the same per-site derived password as `pdo_mysql`.
 
 ### 7. Two-uid process model + systemd sandbox
 
+> **Operator-supplied.** Unlike §1–§6, nothing in this section is produced by
+> ePHPm. `ephpm install` writes a single-uid systemd unit
+> (`crates/ephpm/src/service/systemd.rs`): with `--user` it emits `User=`,
+> `Group=`, `NoNewPrivileges=true`, `ProtectSystem=strict`, `ProtectHome=true`,
+> a `CapabilityBoundingSet` of `CAP_NET_BIND_SERVICE`, and `ReadWritePaths`.
+> It does **not** emit `PrivateTmp`, `IPAddressDeny`, or a second unit, and
+> there is no `ephpm-ctl` binary. The split below is a deployment pattern you
+> build on the host — the one the ePHPm preview fleet runs — described here so
+> it can be reproduced, not a default you inherit.
+
 Two OS users split the trust boundary:
 
 - **`ephpm-web`** — the data plane. Runs tenant PHP out of `sites_dir`. Its
@@ -176,6 +186,14 @@ is on — §9). `IPAddressDeny` blocks the cloud metadata endpoint and RFC1918/U
 at the socket layer as a coarse floor.
 
 ### 8. nftables egress policy
+
+> **Operator-supplied.** ePHPm ships no firewall rules and applies no egress
+> policy of its own — see [the egress residual in the security
+> model](/architecture/security/#what-ephpm-does-not-protect-against). Without
+> the table below, tenant PHP reaches anything the host can reach.
+> `[server.security] network_egress_externally_managed` is your *assertion*
+> that this layer exists (it drops `fsockopen` from the denylist); it adds no
+> enforcement and ePHPm cannot verify the claim.
 
 A per-uid nftables table (scoped to `skuid ephpm-web`) is the comprehensive
 egress floor that `IPAddress*` can't express: loopback sealed, DNS pinned to
@@ -204,9 +222,15 @@ deployment requirements (kernel ≥ 5.10 + BTF, `CAP_BPF`/`CAP_NET_ADMIN`,
 
 ## Turning it on
 
-In multi-tenant mode (`[server] sites_dir` set) the confidentiality/integrity
-layers (§1–§8, minus eBPF) are **on by default**. A recommended production
-config makes the intent explicit:
+The layers divide into two groups, and it matters which is which:
+
+| Layers | Who provides them | State |
+|---|---|---|
+| §1–§6 — `open_basedir`, the function denylist, persistence off, per-vhost temp/session, per-site database + wire credential, per-site KV keyspace | ePHPm | **On by default** whenever `[server] sites_dir` is set |
+| §7–§8 — the two-uid split, the systemd sandbox extras (`PrivateTmp`, `IPAddressDeny`), the nftables egress table | **You**, on the host | Not shipped, not written by `ephpm install`, not on by default |
+| §9 — eBPF per-vhost network policy | ePHPm (Linux only) | Off by default, opt in with `ebpf_policy = true`, plus host prerequisites |
+
+A recommended production config makes the ePHPm-side intent explicit:
 
 ```toml
 [server]
@@ -260,11 +284,15 @@ Isolation here is defense-in-depth, not a proof. What it does **not** close:
   retires the poisoned thread, but a whole-process crash is a shared-fate
   availability problem, not a confidentiality one. True isolation needs
   per-tenant processes.
-- **Public egress / exfil.** The nftables floor blocks metadata/LAN/loopback but
-  ends with `tcp accept`, so a hostile tenant can still `curl`/
-  `stream_socket_client` to a *public* address for off-box exfil. eBPF governs
-  loopback/sidecar ownership, not public egress. Close it with a destination
-  allow-list if your threat model requires it (trades off preview convenience).
+- **Public egress / exfil.** ePHPm applies no egress policy at all, so with no
+  §8 table in place *every* outbound destination is reachable from tenant PHP —
+  `curl_*`, `stream_socket_client`, the `http://` stream wrappers, and PDO are
+  all open, and `open_basedir` does not gate any of them. With the §8 table in
+  place, metadata/LAN/loopback are blocked but the chain ends with
+  `tcp accept`, so a hostile tenant can still reach a *public* address for
+  off-box exfil. eBPF (§9) governs loopback/sidecar ownership, not public
+  egress. Close it with a destination allow-list if your threat model requires
+  it (trades off preview convenience).
 - **PostgreSQL/PDO persistence** — see §3.
 - **`ini_set` of resource limits.** A tenant can `ini_set('memory_limit', -1)`
   and OOM the shared process (another availability, not confidentiality, gap).
@@ -272,7 +300,12 @@ Isolation here is defense-in-depth, not a proof. What it does **not** close:
 ## Validation status
 
 The confidentiality/integrity model has been exercised by an adversarial
-hostile-tenant pen test on a live Linux host with the eBPF policy active: an
+hostile-tenant pen test on a live Linux host — **the fully hardened preview
+host, with every layer of this guide in place**, including the operator-supplied
+§7 two-uid split and §8 nftables table and with the §9 eBPF policy active. The
+result below therefore describes *that* configuration, not a default
+`ephpm install` on a stock host: a default install has §1–§6 and nothing else,
+which leaves the egress and loopback findings open. With the full stack, an
 attacker vhost could read **no** secret (control-plane key dir, sibling files,
 another tenant's database file/rows, its KV keys, `/proc` environ) and could
 reach **no** loopback port it did not own (every cross-vhost connect denied at

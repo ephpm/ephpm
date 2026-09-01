@@ -10,8 +10,21 @@ document_root = "/app/wordpress"
 url             = "mysql://wordpress:wordpress@mysql:3306/wordpress"
 listen          = "127.0.0.1:3306"
 max_connections = 20
-# Set explicitly to "always" while the default "smart" reset-strategy code
-# path has a known hang when pdo_mysql is the client (issue TBD).
+# NOT the default. The shipped default is "smart" (reset after any non-SELECT);
+# this example overrides it to "always".
+#
+# Provenance: the override was added in #94 (2026-06-19) against v0.2.x-era
+# proxy code, with a note that "smart" hung when pdo_mysql was the client and a
+# promise to file an issue that was never filed. The proxy has changed
+# substantially since, and the claim has NOT been re-verified against current
+# code — treat it as unconfirmed history, not a known-current defect. The Smart
+# path does now have integration coverage
+# (crates/ephpm-db/tests/proxy_integration.rs::basic_query_roundtrip_smart and
+# ::session_isolation_smart), but those drive the proxy with mysql_async rather
+# than pdo_mysql, so the exact combination named above is still uncovered.
+#
+# TODO: run this stack with the line below removed; either fix the hang or drop
+# the override so the example demonstrates the shipped default.
 reset_strategy  = "always"
 
 # Note: no [kv.redis_compat] either. WordPress's Redis Object Cache talks

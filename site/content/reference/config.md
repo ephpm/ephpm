@@ -108,6 +108,19 @@ ini_overrides = [
 ]
 ```
 
+### `[server.tenant_network]`
+
+Per-vhost kernel network policy via eBPF. **Linux-only, multi-tenant-only, experimental, and off by default** — with `ebpf_policy = false` ePHPm loads no BPF programs, attaches nothing, and the request path writes no tag. See [Per-vhost network policy (eBPF)](/guides/ebpf-per-vhost-network/) for the host prerequisites (kernel ≥ 5.10 + BTF, `CAP_BPF`/`CAP_NET_ADMIN`, `LimitMEMLOCK=infinity`, and the nftables loopback handoff), none of which ePHPm can set up for you.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `ebpf_policy` | bool | `false` | Enable the per-vhost eBPF policy: per-thread vhost tagging, `cgroup/bind4+6` transparent sidecar port-rewrite, and `cgroup/connect4+6` per-vhost loopback authorization. Requires `[server] sites_dir` and fpm mode (worker mode is not supported). **Setting it `true` on a non-Linux platform is a hard startup error**, never a silent no-op, and it is otherwise **fail-closed**: if the programs cannot load or attach, or the port range overlaps the ephemeral range, ePHPm refuses to start rather than serve with the policy silently absent. |
+| `cgroup_path` | string | (none) | Cgroup the programs attach to. Unset means the process's own cgroup, read from `/proc/self/cgroup`, which covers exactly ePHPm's threads and any sidecars it spawns. Override only for unusual systemd slice layouts. |
+| `sidecar_port_range` | string | `"20000-32767"` | Inclusive `"low-high"` range of **real** sidecar ports ePHPm hands out; `bind4` pops a free port from it and range size is the box-wide sidecar concurrency cap. **Must not overlap the kernel ephemeral range** (`net.ipv4.ip_local_port_range`, default `32768-60999`) or a tenant's outbound connect could be assigned a source port ePHPm also wants to hand out — ePHPm reads `ip_local_port_range` at load time and refuses to start on overlap. |
+| `max_sidecar_ports_per_vhost` | u32 | `8` | Maximum concurrent sidecar real ports one vhost may hold. Enforced **in-kernel** at `bind4` against the un-forgeable ePHPm-set vhost tag, so a tenant cannot bypass it and cannot starve siblings out of the shared pool. |
+
+> **Known limitation.** Closed sidecar ports return to the pool only on ePHPm restart — the close-time reclaim path is not implemented (see the guide). A vhost re-binding the *same* virtual port reuses its existing real port, so a restarting sidecar does not consume a second slot; an app that opens many *different* sidecar ports over one process lifetime can reach `max_sidecar_ports_per_vhost` until restart.
+
 ### `[server.logging]`
 
 | Key | Type | Default | Description |

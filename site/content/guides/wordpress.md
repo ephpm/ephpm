@@ -60,11 +60,32 @@ drop-in. It writes `wp-content/object-cache.php`, which calls ePHPm's
 in-process KV store directly via the `ephpm_kv_*` SAPI functions — no Redis
 container, no RESP listener, no Predis, no plugin to activate.
 
-**Canonical (Composer):**
+**Canonical (Composer):** ePHPm's PHP packages are distributed via their GitHub
+repositories, **not Packagist**, so a bare `composer require ephpm/...` cannot
+find them — the repo has to be declared as a Composer `vcs` repository first.
+`ephpm/cache-wordpress` is a self-contained drop-in (its only requirement is
+`php: ^8.2`), so it is the one entry you need:
+
+```json
+// wordpress/composer.json
+{
+  "repositories": [
+    { "type": "vcs", "url": "https://github.com/ephpm/cache-wordpress" }
+  ],
+  "require": {
+    "ephpm/cache-wordpress": "dev-main"
+  },
+  "minimum-stability": "dev",
+  "prefer-stable": true
+}
+```
+
+`dev-main` rather than a `^0.1` constraint because the repo is not tagged yet;
+switch to a version constraint once it is. Then:
 
 ```bash
 cd wordpress
-composer require ephpm/cache-wordpress
+composer update
 # copy the drop-in into wp-content (it auto-discovers the Composer autoload)
 cp vendor/ephpm/cache-wordpress/dropin/object-cache.php wp-content/object-cache.php
 ```
@@ -113,7 +134,7 @@ define( 'WP_CACHE', true );
 # 'Failed to open stream' on subdirectory requests.
 ephpm dev --port 8088 --document-root "$(pwd)/wordpress"
 
-#   ePHPm 0.7.0 — dev server
+#   ePHPm 0.8.6 — dev server
 #     serving:  /path/to/wordpress
 #     url:      http://127.0.0.1:8088
 #     php:      8.5.7
@@ -125,30 +146,43 @@ Complete the 5-field form (site title, username, password, email).
 
 ### 1.5 Observe KV population
 
-After completing the installer, make a few requests then inspect the
-embedded KV store (the drop-in is active automatically — there is no
-plugin to enable):
+After completing the installer, make a few requests, then check that the
+object cache is really populated (the drop-in is active automatically — there
+is no plugin to enable). The KV store lives **inside** the running ePHPm
+process, so read it from PHP, which is already inside that process. Drop this
+next to `index.php` and request it once:
 
-```bash
-ephpm kv keys "*"
-# 1) wp:default:is_blog_installed
-# 2) wp:options:alloptions
-# 3) wp:options:notoptions
-# 4) wp:site-options:1-notoptions
-# 5) wp:transient:doing_cron
-# 6) wp:transient:wp_core_block_css_files
-# 7) wp:translation_files:38beaa72c3a2c3668f2cf69a6db0fbe0
-# 8) wp:site-transient:wp_theme_files_patterns-bf6ab396...
-
-ephpm kv get "wp:default:is_blog_installed"
-# 1
-
-ephpm kv get "wp:options:notoptions"
-# a:2:{s:6:"WPLANG";b:1;s:14:"theme_switched";b:1;}
+```php
+<?php // wp-kv-check.php — delete when you're done
+var_dump( ephpm_kv_get( 'wp:default:is_blog_installed' ) );
+// string(1) "1"
+var_dump( ephpm_kv_get( 'wp:options:notoptions' ) );
+// string(...) "a:2:{s:6:"WPLANG";b:1;s:14:"theme_switched";b:1;}"
 ```
+
+Typical keys the drop-in writes: `wp:default:is_blog_installed`,
+`wp:options:alloptions`, `wp:options:notoptions`,
+`wp:site-options:1-notoptions`, `wp:transient:doing_cron`,
+`wp:transient:wp_core_block_css_files`, `wp:translation_files:<hash>`,
+`wp:site-transient:wp_theme_files_patterns-<hash>`.
 
 Everything flows WordPress → cache-wordpress `ObjectCache` → `ephpm_kv_*`
 (in-process). No external Redis process, no RESP listener, no Predis.
+
+> **Why not `ephpm kv keys "*"`?** The `ephpm kv` CLI is a *separate process*,
+> so it can only reach the store over the RESP listener — which is
+> `[kv.redis_compat] enabled = false` by default. `ephpm dev` is deliberately
+> configuration-free (it ignores `ephpm.toml` entirely), so there is no way to
+> turn the listener on for a dev server. To use the CLI, run under
+> `ephpm serve --config ephpm.toml` with:
+>
+> ```toml
+> [kv.redis_compat]
+> enabled = true
+> listen = "127.0.0.1:6379"
+> ```
+>
+> then `ephpm kv keys "*"` and `ephpm kv get <key>` work as shown above.
 
 > `wp_cache_flush()` is a real flush (backed by `ephpm_kv_flush_all()`) and
 > needs **ePHPm v0.1.2+**. On older runtimes the cache still works, but flush
@@ -380,7 +414,7 @@ spec:
               mountPath: /etc/ephpm
 
         - name: wordpress-install
-          image: ephpm/ephpm:v0.8.4-php8.5
+          image: ephpm/ephpm:v0.8.6-php8.5
           command:
             - sh
             - -c
@@ -408,7 +442,7 @@ spec:
 
       containers:
         - name: ephpm
-          image: ephpm/ephpm:v0.8.4-php8.5
+          image: ephpm/ephpm:v0.8.6-php8.5
           command: [ephpm, serve, --config, /etc/ephpm/ephpm.toml]
           ports:
             - name: http

@@ -689,7 +689,7 @@ A single Rust binary that reads a TOML config, boots an HTTP server with embedde
 - KV store
 - Clustering
 - Observability / admin UI
-- Worker mode — since shipped in 3.0 (`[php] mode = "worker"`, see [Worker Mode](/architecture/#php-worker-mode))
+- Worker mode — since shipped in v0.3.0 (`[php] mode = "worker"`, see [Worker Mode](/architecture/#php-worker-mode))
 - ZTS / multi-threaded PHP execution — since shipped (per-thread TSRM via `spawn_blocking`)
 
 ### Request Flow

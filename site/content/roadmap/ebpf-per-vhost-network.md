@@ -1,13 +1,27 @@
 # eBPF Per-Vhost Network Policy & Transparent Sidecar Port-Mapping
 
-> **Status: Planned — not yet implemented.** Linux-only. This page is the
-> design + a validated proof-of-concept. No code ships in ePHPm yet. The
-> per-thread vhost-tag foundation (Phase 0) is the prerequisite for the
-> per-vhost egress policy (Phase 1) and the transparent sidecar port-mapping
-> (Phase 2) described below.
+> **Status: shipped experimental (v0.8.2), Linux-only, off by default.** This
+> page is the design record; for deployment see the
+> **[Per-vhost network policy (eBPF) guide](/guides/ebpf-per-vhost-network/)**
+> and the `[server.tenant_network]` keys in the
+> [configuration reference](/reference/config/#servertenant_network).
 >
-> A working PoC was built and run on Linux 6.18 (see **Proof of concept**).
-> It confirms the kernel mechanics end-to-end: two mock vhosts both binding
+> Phases 0–2 below all ship: `crates/ephpm-server/src/tenant_ebpf.rs` (the
+> loader and per-thread tagging) and `crates/ephpm-server/bpf/vhostnet.bpf.c`
+> (the `cgroup/bind4+6` and `cgroup/connect4+6` programs). Enable with
+> `[server.tenant_network] ebpf_policy = true`, which is fail-closed — it
+> refuses to start rather than serve with the policy silently absent.
+>
+> **Still open:** close-time sidecar port reclamation (a `sock_release` program
+> returning ports to the pool) is *not* implemented — the Rust BPF loader
+> cannot load an `SK_STORAGE` map and reading a socket's source port in
+> `sock_release` is verifier-rejected on current kernels, so a closed sidecar
+> port returns to the pool only on restart. Worker mode is unsupported (the tag
+> is written on the fpm per-request path); multi-node/at-scale operation is not
+> validated.
+>
+> The design was first proven by a PoC on Linux 6.18 (see **Proof of concept**),
+> which confirmed the kernel mechanics end-to-end: two mock vhosts both binding
 > `127.0.0.1:8080`, transparently remapped to private real ports, each
 > reaching only its own listener, with a cross-vhost connect denied by the
 > kernel (`EPERM`).

@@ -90,7 +90,9 @@ ePHPm equivalent:
 
 ```toml
 [php]
-workers = 8            # replaces pm.max_children (auto-detected from CPU count)
+workers = 8            # replaces pm.max_children. NOT auto-detected: the default
+                       # is 0 = unlimited (bounded only by tokio's blocking pool).
+                       # Set it explicitly to get an FPM-style concurrency cap.
 memory_limit = "256M"
 max_execution_time = 30   # ← php_admin_value[max_execution_time]. Enforced on
                           # Linux ZTS (catchable fatal → 500); not on macOS/Windows.
@@ -102,7 +104,7 @@ request = 45           # outer hard 504 backstop — keep it above max_execution
 max_body_size = 67108864   # 64 MB
 ```
 
-PHP-FPM's process model (`pm.dynamic`, `pm.start_servers`, spare servers) doesn't apply — ePHPm uses a fixed-size thread pool that's always warm. No cold starts, no process spawning overhead.
+PHP-FPM's process model (`pm.dynamic`, `pm.start_servers`, spare servers) doesn't apply — PHP runs on tokio's shared blocking-thread pool, which stays warm and grows on demand rather than forking children. No cold starts, no process spawning overhead. `workers` is a semaphore around PHP execution, not a pool size: it caps how many requests may be *executing* PHP at once, and static file serving is never starved by slow scripts.
 
 **Connection and rate limits** (Nginx's `worker_connections`, `limit_conn`, `limit_req`):
 

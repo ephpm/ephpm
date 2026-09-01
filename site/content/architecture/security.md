@@ -23,6 +23,7 @@ This document describes the threat model, trust boundaries, and security design 
 - **Vulnerabilities in PHP application code** — ePHPm executes whatever PHP code is deployed. SQL injection, XSS, etc. in the application are the application's responsibility.
 - **PHP interpreter CVEs** — ePHPm statically links libphp. Users must rebuild with patched PHP releases. The version matrix and release pipeline are designed to make this fast.
 - **Supply chain attacks on PHP extensions** — ePHPm bundles extensions at build time. Extension selection is a trust decision made at build time, not runtime.
+- **Outbound network access from tenant PHP (egress).** ePHPm applies **no** egress policy of its own. The `multi_tenant_hardening` denylist disables `fsockopen`/`pfsockopen`, but it disables them because persistent sockets leak *between tenants* via `EG(persistent_list)` — not to close egress, and reading that one entry as an egress control is a misread. Every other outbound path stays open to tenant PHP: `curl_*` (ext-curl is compiled in), `stream_socket_client`, the HTTP/FTP stream wrappers behind `file_get_contents`/`fopen` (`open_basedir` gates the *files* wrapper, not `http://`), and PDO's own drivers. A hostile tenant can therefore reach any address the host itself can reach — the cloud metadata endpoint, the LAN, another tenant's loopback service, or a public collector for exfiltration. Closing this is **host configuration**, not an ePHPm setting: a per-uid nftables/`IPAddressDeny` floor, and optionally the experimental [per-vhost eBPF policy](/guides/ebpf-per-vhost-network/) for loopback ownership (which governs loopback and sidecar ports, not public egress). ePHPm's own `[server.security] network_egress_externally_managed` is an *assertion* that you have built such a floor — setting it drops `fsockopen` from the denylist, it does not add any enforcement. See [Multi-tenant hardening](/guides/multi-tenant-hardening/).
 - **Cross-tenant availability in multi-tenant mode** — all tenants share one process, so one tenant can crash it (e.g. a deep recursive object-graph free overflowing the native C stack, which the VM stack guard does not bound) and take every tenant down. The `multi_tenant_hardening` denylist closes cross-tenant *confidentiality/integrity* channels but cannot close this shared-fate *availability* residual. Hosting mutually **untrusted** tenants that must not be able to DoS each other requires per-tenant process/uid isolation (separate ePHPm processes/pods), which the single-process model does not provide. `run_as_user` removes the root-escalation risk but does not add a per-tenant boundary.
 
 ### Implemented security controls
@@ -32,7 +33,7 @@ The controls that exist today, in one place:
 - **Per-vhost `open_basedir`** — in multi-site mode, PHP filesystem access is restricted per-request to the site's directory plus that site's **own private state root** (see the next bullet). Entries are joined with the platform's `PATH_SEPARATOR` (`:` on Unix, `;` on Windows).
 - **Per-vhost temp & session isolation** — in multi-site mode each vhost gets a private state directory `<system-temp>/ephpm-vhosts/<label>-<digest>` (base honours `TMPDIR`; the `<label>-<digest>` is derived from the resolved, traversal-safe document root, so it is stable per site and never collides across sites). Its `tmp/` and `sessions/` subdirectories are created once per site (`0700` on Unix) and wired into every request for that vhost as `sys_temp_dir` + `upload_tmp_dir` = `.../tmp` and `session.save_path` = `.../sessions`. Only that one state root — never the shared system temp — is in the vhost's `open_basedir`, so one tenant cannot read, enumerate, or overwrite another tenant's temp files, uploads, or PHP session files. This closes the shared-`/tmp` cross-tenant read/write and session-hijack hole (issue #276). `session.save_path` and `upload_tmp_dir` are re-read per request, so sessions and uploads are physically separated per tenant while the default `files` session handler keeps working. Single-site deployments (no `sites_dir`) are unaffected — `open_basedir` stays off and PHP keeps its default temp/session behaviour.
 - **`disable_shell_exec`** — `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec` disabled via the php.ini generated at startup (default on in multi-site mode)
-- **`multi_tenant_hardening`** — the confidentiality/integrity denylist preset, default on in multi-site mode. On top of `disable_shell_exec` it disables (as a **union** with any operator `disable_functions`, never clobbering it) the cross-tenant channels a hostile-PHP-userland pentest proved reachable in one shared ZTS process: `pfsockopen`/`fsockopen` (persistent-socket inheritance via `EG(persistent_list)`), the SysV IPC family `shm_*`/`sem_*`/`msg_*`, `pcntl_*` + `posix_kill`/`posix_set*id` process control, `opcache_reset`/`opcache_compile_file`, `dl`, and `mail`; plus `mysqli.allow_persistent=0` and — when `[opcache] cluster_invalidation` is off — `opcache.restrict_api`. Cost: persistent DB/socket connections are disabled. See [Virtual Hosts → Multi-tenant hardening preset](/guides/virtual-hosts/#multi-tenant-hardening-preset). Residual (not closed by any denylist): a single tenant can still crash the shared process (e.g. deep recursive object-graph destruction overflowing the C stack), taking every tenant down — a shared-fate **availability** problem that needs per-tenant process isolation.
+- **`multi_tenant_hardening`** — the confidentiality/integrity denylist preset, default on in multi-site mode. On top of `disable_shell_exec` it disables (as a **union** with any operator `disable_functions`, never clobbering it) the cross-tenant channels a hostile-PHP-userland pentest proved reachable in one shared ZTS process: `pfsockopen`/`fsockopen` (persistent-socket inheritance via `EG(persistent_list)` — this closes cross-tenant socket *inheritance*, **not** egress; `curl_*`, `stream_socket_client`, and the HTTP stream wrappers stay open, see [above](#what-ephpm-does-not-protect-against)), the SysV IPC family `shm_*`/`sem_*`/`msg_*`, `pcntl_*` + `posix_kill`/`posix_set*id` process control, `opcache_reset`/`opcache_compile_file`, `dl`, and `mail`; plus `mysqli.allow_persistent=0` and — when `[opcache] cluster_invalidation` is off — `opcache.restrict_api`. Cost: persistent DB/socket connections are disabled. See [Virtual Hosts → Multi-tenant hardening preset](/guides/virtual-hosts/#multi-tenant-hardening-preset). Residual (not closed by any denylist): a single tenant can still crash the shared process (e.g. deep recursive object-graph destruction overflowing the C stack), taking every tenant down — a shared-fate **availability** problem that needs per-tenant process isolation.
 - **`run_as_user` / `run_as_group`** (Unix) — after binding privileged ports and opening root-owned files, ePHPm permanently drops the whole process from root to an unprivileged uid/gid (`setgroups`+`setgid`+`setuid`, verified, irreversible) before serving. Removes the root-escalation blast radius. This is a **single non-root uid for the entire process, not per-tenant** — cross-tenant isolation still rests on `open_basedir` + the denylist, not kernel permissions. Per-tenant uids would require per-tenant processes, which the single-process model does not provide.
 - **`blocked_paths`** — glob patterns matched against the URI path (patterns must start with `/`); matches return 403
 - **Multi-site `Host` sanitization** — in multi-site mode (`sites_dir` set) the `Host` header is normalized (port/trailing-dot stripped, lowercased) and validated against a strict DNS-label allowlist (`[a-z0-9._-]`, no empty label) **before** it is used to resolve a document root. Hosts containing `..`, `/`, `\`, NUL, or any other non-DNS character are rejected with 404. This runs independently of `trusted_hosts`, so it protects the default configuration (empty `trusted_hosts`) against Host-header path traversal
@@ -85,7 +86,7 @@ The controls that exist today, in one place:
    - **Your SQL is normalized and exported.** Literals are replaced with `?`, the result is truncated to 64 characters and emitted as the `digest` Prometheus label, and slow queries are logged at WARN. Parameter *values* are never included — the normalizer strips them — but table, column, and query shape are visible to anyone who can read `/metrics` or the logs.
    - **Session state is reset between application connections** according to `[db.*] reset_strategy` (default `"smart"` — reset after any non-SELECT).
 
-   The embedded-SQLite listeners themselves are **unauthenticated** and assume only PHP inside this process reaches them; bind them to loopback. The in-process [`ephpm_db_*` bridge](/guides/db-from-php/) skips the socket entirely and is reachable by any PHP code in the request.
+   Whether the embedded-SQLite listeners authenticate depends on the mode. In **single-site** mode they do not — they assume only PHP inside this process reaches them, so bind them to loopback. In **multi-tenant** mode (`[server] sites_dir` with `[db.sqlite]`) the MySQL listener does: a connection must answer a `mysql_native_password` challenge for the site key it claims, and the connection's database is fixed by the credential it authenticated with, not by anything it asserts. See [DB Proxy Security](#db-proxy-security-implemented) below. The in-process [`ephpm_db_*` bridge](/guides/db-from-php/) skips the socket entirely and is reachable by any PHP code in the request.
 
 ---
 
@@ -221,10 +222,27 @@ The proxy ships (`[db.mysql]`, `[db.postgres]`). What that means for security:
   non-SELECT). `"never"` disables that isolation — do not use it when
   different tenants share a pool.
 
-**Not implemented:** the embedded-SQLite wire listeners
-(`[db.sqlite.proxy]` — MySQL, Hrana, PostgreSQL, TDS) perform **no
-authentication at all**. They assume only PHP inside this process reaches
-them. A non-loopback bind logs a warning but is not blocked.
+### Embedded-SQLite wire listeners
+
+Authentication on the `[db.sqlite.proxy]` listeners depends on the deployment
+mode — the two cases are genuinely different, and conflating them is how the
+multi-tenant guarantee gets misread in both directions:
+
+- **Multi-tenant (`[server] sites_dir` + `[db.sqlite]`): the MySQL listener is
+  authenticated.** One listener serves every tenant. A connection's username is
+  the site key and its password is `HMAC-SHA256(per-process master secret,
+  site_key)`; the `mysql_native_password` response is verified **before** the
+  backend registry is consulted (`crates/ephpm-server/src/site_wire_auth.rs`),
+  so a caller that names a neighbour's site without its password gets
+  `ER_ACCESS_DENIED` and never causes that site's database file to be opened.
+  The master secret is 32 random bytes generated at startup, never written to
+  disk and never exposed to PHP; each site's own password is injected into that
+  site's `$_SERVER` per request. Hrana, PostgreSQL, and TDS stay **off** in this
+  mode — they cannot bind a backend per connection.
+- **Single-site: unauthenticated.** With no `sites_dir` there is one database
+  and one tenant, so the listeners (MySQL, Hrana, PostgreSQL, TDS) perform no
+  authentication and assume only PHP inside this process reaches them. A
+  non-loopback bind logs a warning but is not blocked.
 
 ---
 

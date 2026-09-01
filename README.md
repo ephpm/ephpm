@@ -12,21 +12,31 @@ The simplest way to convey this project is to name what it is trying to replace 
 
 First, it needed to be written in Rust to completely avoid the heavy `cgo` execution tax that platforms like FrankenPHP face when embedding `libphp.a`. Crossing the Go-to-C runtime boundary introduces structural latency and if you want to achieve peak performance then Rust is the ideal modern language to combine with C using zero-overhead and native FFI pointers. 
 
-Second, it completely eliminates localhost loopback network hops. While local TCP connections and Unix sockets (used by PHP-FPM and RoadRunner) are fast, they still incur unavoidable OS kernel context-switching and protocol serialization taxes. 
+Second, it eliminates the localhost loopback hop on the lanes that matter most. While local TCP connections and Unix sockets (used by PHP-FPM and RoadRunner) are fast, they still incur unavoidable OS kernel context-switching and protocol serialization taxes. The web server → PHP hop is gone by construction (PHP is linked in, not proxied to), and the `ephpm_db_*` / `ephpm_kv_*` SAPI functions reach the embedded database and KV store as direct function calls. Apps that keep their stock clients — `pdo_mysql` to `127.0.0.1:3306`, `phpredis` to `127.0.0.1:6379` — still cross loopback, but they cross it into *this* process instead of a separate daemon, so they trade a network round trip for a socket round trip and need no code changes. 
 
-* **Web Server:** Replaces Nginx by binding an in-process, high-concurrency [Tokio](https://tokio.rs) + [Hyper](https://docs.rs) network stack.
+* **Web Server:** Replaces Nginx by binding an in-process, high-concurrency [Tokio](https://tokio.rs) + [Hyper](https://docs.rs/hyper) network stack.
 * **Process Manager:** Replaces PHP-FPM with our custom, resource-aware `fpm_engine` thread manager.
-* **Shared Memory Cache:** Replaces standalone Redis with a concurrent, thread-safe [DashMap](https://docs.rs) key-value store (supports clustering)
-* **Database:** Replaces external MySQL with an embedded, zero-dependency combination of [Turso](https://turso.tech/) and its underlying [libSQL](https://github.com/tursodatabase/libsql) relational engine (supports clustering)
+* **Shared Memory Cache:** Replaces standalone Redis with a concurrent, thread-safe [DashMap](https://docs.rs/dashmap) key-value store (supports clustering)
+* **Database:** Replaces external MySQL with the embedded, zero-dependency [Turso](https://github.com/tursodatabase/turso) engine — a pure-Rust SQLite-compatible database compiled into the binary (supports clustering)
 
 ePHPm has also packed a highly robust and cloud-native feature set by drawing direct inspiration from other modern runtimes. This includes automatic ACME TLS certificate management and server-level middleware handlers (similar to RoadRunner and FrankenPHP), alongside an in-process SQL proxy with connection pooling and slow query logging inspired directly by ProxySQL. Combined with native cluster synchronization, OpenTelemetry tracing (OTLP), and container-aware runtime autotuning, ePHPm is fully prepared for modern cloud environments.
 
 ### How to use it:
-Run `ephpm dev` locally from your laptop (with native macOS and Windows support) and drop it straight into your CI/CD pipelines using our off-the-shelf OCI container images. You can also safely alias the binary to act as your global system PHP CLI with 100% scripting compatibility:
+Run `ephpm dev` locally from your laptop (with native macOS and Windows support) and drop it straight into your CI/CD pipelines using our off-the-shelf OCI container images. You can also alias the binary to act as your global system PHP CLI — it is the real Zend engine, not a reimplementation, so language semantics are PHP's own:
 
 ```bash
 alias php="ephpm php"
 ```
+
+The documented exceptions: `php -a` (interactive shell) and `php -S` (built-in
+server) are separate SAPIs that are not linked into the embed build and print a
+clear error, `-z` (Zend extension loading) is rejected exactly as php-cli
+rejects it, and the extension set is what was compiled into the binary
+(`bcmath, calendar, ctype, curl, dom, exif, fileinfo, filter, gd, hash, iconv,
+mbstring, mysqli, mysqlnd, openssl, pcntl, pcre, pdo, pdo_mysql, phar, posix,
+session, simplexml, sodium, tokenizer, xml, xmlreader, xmlwriter, zip, zlib`)
+plus whatever you load through `[php] extensions`. See
+[the `ephpm php` reference](https://ephpm.dev/reference/cli/php/).
 
 When you are ready to scale to production, you can deploy high-availability clusters using the exact same code paths running seamlessly from your local development machine, through CI, and straight into production. Need to use an external database just configure the SQL proxy and point your app to localhost:3306 to gain performance boosts from connection pooling.
 
@@ -48,7 +58,7 @@ This copies the binary to `/usr/local/bin/ephpm`, writes a default config to `/e
 
 ### Windows
 
-Download `ephpm.exe` from [Releases](https://github.com/ephpm/ephpm/releases). In an Administrator PowerShell:
+Download the Windows archive — `ephpm-v<version>+php<php-version>-windows-x86_64.tar.gz` — from [Releases](https://github.com/ephpm/ephpm/releases) and unpack it to get `ephpm.exe`. In an Administrator PowerShell, from the directory you unpacked it into:
 
 ```powershell
 .\ephpm.exe install
@@ -126,6 +136,8 @@ ePHPm gives you three database strategies. PHP apps keep their existing `pdo_mys
 
 If you have a MySQL or PostgreSQL server, ePHPm's DB proxy sits between PHP and your database with connection pooling, read/write splitting, and health checks. PHP connects to `localhost:3306` (or `localhost:5432` for Postgres) — the proxy handles the rest. The PostgreSQL proxy supports trust, md5, and SCRAM-SHA-256 authentication. SQL Server (TDS) proxying is not implemented.
 
+> **Postgres caveat.** `pdo_pgsql` is **not** among the extensions compiled into the released binary, so "no code changes" holds for MySQL apps out of the box but not for a stock Postgres app on a stock build. The PostgreSQL frontend is exercised today by non-PHP clients and by the `ephpm_db_*` bridge; to drive it from `pdo_pgsql` you need a build that includes the extension, or you can load it as a shared extension via `[php] extensions`.
+
 ```toml
 [db.mysql]
 url = "mysql://user:pass@db-server:3306/myapp"
@@ -175,53 +187,44 @@ join = ["ephpm.default.svc.cluster.local"]
 Single node is very simple and accessed via SAPI functions added to the runtime by ePHPm.
 
 ```
-PHP Framework (ephpm driver) ──(Direct FFI)──> SAPI Functions (ephpm_db_query) ──> libSQL/Turso (In-Process)
+PHP Framework (ephpm driver) ──(Direct FFI)──> SAPI Functions (ephpm_db_query) ──> Turso engine (in-process)
 ```
 
-In a distributed ePHPm cluster, relational data replication is handled at the engine layer by leveraging libSQL’s built-in Change Data Capture (CDC) architecture, completely removing the need for a separate heavy database replication service. Here is exactly how the CDC pipeline coordinates with the gossip protocol and the TCP data plane to maintain a high-availability database cluster and the request with the write shows up on the primary Turso node.
+In a distributed ePHPm cluster, replication is handled inside the same process by tailing the Turso engine's own change-data-capture (CDC) stream — no sidecar, no separate replication service, no gRPC WAL transport. (The libSQL server / `sync_url` machinery that earlier releases used was removed in v0.7.0.) The primary's writes capture into `turso_cdc`; a per-subscriber tailer ships them, one batch per transaction, over ePHPm's authenticated cluster channel:
 
 ```
-[ PHP Write Query ] ──(SAPI/Proxy)──> [ Node A (Elected Primary) ]
+[ PHP Write Query ] ──(SAPI / wire proxy)──> [ Node A (elected primary) ]
                                                 │
-                                       (Local WAL Commit)
+                                        (local commit — writes
+                                         capture into turso_cdc)
                                                 │
-                                     [ libSQL CDC Generator ]
+                                       [ per-subscriber CdcTailer ]
                                                 │
-                                                ▼  (Binary Transaction Log Stream)
-                                       [ Cluster TCP Plane ]
+                                                ▼  (length-prefixed JSON, one frame per transaction)
+                                    [ Cluster channel — authenticated,
+                                      yamux-multiplexed TCP, "cdc/default" ]
                                           /           \
                                          ▼             ▼
-                           [ Node B (Replica) ]   [ Node C (Replica) ]
-                             (Apply Log Page)       (Apply Log Page)
+                           [ Node B (replica) ]   [ Node C (replica) ]
+                              (apply_batch)          (apply_batch)
 ```
 
-If the request is to a read replica Turso node the write will fix itself by syncing the data to the primary.
+Gossip decides *who* is primary (lowest-ordinal live node, `kv:sqlite:primary` with a TTL heartbeat); the cluster channel carries the data. A cold replica bootstraps from a logical snapshot first, and every stream opens with a `Hello` frame naming the primary's CDC log identity, so a watermark accumulated against a dead primary's log can never be replayed against a promoted node's log.
+
+#### Writes against a replica do NOT fix themselves
+
+This is the caveat that matters most, and it is the opposite of the old libSQL `sync_url` behavior. There is **no write-forwarding in the single-database clustered path**. litewire has no read-only frontend mode, so a replica's MySQL/Hrana endpoint accepts writes — and anything written there lands only in that node's local database and is **replicated nowhere**. The replica logs a warning at startup, but the divergence is otherwise silent.
 
 ```
-[ PHP SAPI Write Call ]
-          │
-          ▼
-┌─────────────────────────────────┐
-│        Node B (Replica)         │
-│  ┌───────────────────────────┐  │
-│  │   ePHPm Gossip Layer      │  │ ◄─── Says: "Node A is Primary"
-│  └─────────────┬─────────────┘  │
-│                ▼                │
-│  ┌───────────────────────────┐  │
-│  │ libSQL Client (Replica)   │  │
-│  │  • url: "local.db"        │  │
-│  │  • sync_url: "Node A"     │  │
-│  └─────────────┬─────────────┘  │
-└────────────────┼────────────────┘
-                 │
-                 ▼ (Natively forwarded via libSQL gRPC)
-┌─────────────────────────────────┐
-│        Node A (Primary)         │
-│  ┌───────────────────────────┐  │
-│  │ libSQL Server (Primary)   │  │ ───► Commits to local disk
-│  └───────────────────────────┘  │
-└─────────────────────────────────┘
+[ PHP write ] ──> [ Node B (replica) ]  ── committed locally
+                                        ── NOT shipped to the primary
+                                        ── NOT seen by any other node
+                                        ── overwritten whenever B re-bootstraps
 ```
+
+Send writes to the primary. Every node exposes `GET /_ephpm/primary`, which returns `200` only on the node that is currently the writable target and a non-`200` otherwise — point an active/passive load balancer or a `readinessProbe`-style check at it rather than guessing.
+
+The exception is **per-site clustered mode** (`[db.sqlite.replication] per_site = true`, also experimental), where each vhost's database has its own owner and a non-owner *does* forward `ephpm_db_*` statements to the owner over the cluster channel. Stock `pdo_mysql` traffic is not forwarded even there.
 
 ## KV Store: Three Ways to Use It, Zero External Services
 
@@ -262,7 +265,7 @@ In a cluster, the KV store becomes a two-tier distributed store with no extra mo
 
 - **Small values** (< 512 bytes by default) ride the **gossip tier** — eventually consistent, replicated to every node, sub-millisecond reads everywhere.
 - **Large values** live on a **hashed data plane** — the owner is `hash(key)` modulo the sorted alive-node list (no consistent-hash ring), replicated to N nodes (configurable replication factor), fetched on demand via TCP, with optional hot-key promotion that caches frequently-fetched remote values locally.
-- **Failover** — when a node leaves the gossip view, the hash ring rebalances and owned keys migrate to the next replicas. No primary, no election — every node can read and write.
+- **Failover** — when a node leaves the gossip view, ownership recomputes against the new alive-node list and owned keys migrate to the next replicas. No primary, no election — every node can read and write.
 
 ```toml
 [cluster]
@@ -288,10 +291,10 @@ PHP → ephpm_kv_*  (in-process function call, ~ns)
 PHP → phpredis → :6379 (RESP2)  →  DashMap store
             cluster mode ↓
         gossip tier (small values, eventually consistent)
-        data plane  (large values, consistent-hash, replicated)
+        data plane  (large values, hashed ownership, replicated)
 ```
 
-The store is a single `DashMap<String, Entry>` with concurrent reads/writes, async TTL expiry, and an approximate-memory tracker driving eviction. Compression is applied per-value above a size threshold and is transparent on read. In clustered mode the same `Store` is wrapped with a routing layer that consults the hash ring for non-local keys.
+The store is a single `DashMap<String, Entry>` with concurrent reads/writes, async TTL expiry, and an approximate-memory tracker driving eviction. Compression is applied per-value above a size threshold and is transparent on read. In clustered mode the same `Store` is wrapped with a routing layer that recomputes `hash(key)` modulo the sorted alive-node list for non-local keys — plain modulo ownership, not a consistent-hash ring.
 
 ## Query Stats & Observability
 
@@ -367,14 +370,14 @@ A $3.69/mo Hetzner VM (2 ARM cores, 4 GB RAM) comfortably runs 20 WordPress blog
 
 - [Getting started](https://ephpm.dev/developer/getting-started/) — Prerequisites, building, IDE setup
 - [Architecture decisions](https://ephpm.dev/architecture/) — Language choice, crate design, PHP execution modes
-- [HTTP Server Architecture](https://ephpm.dev) — ZTS concurrency model, Tokio thread integration
+- [HTTP Server Architecture](https://ephpm.dev/architecture/http/) — ZTS concurrency model, Tokio thread integration
 - [Clustering](https://ephpm.dev/architecture/clustering/) — SWIM gossip, hashed key ownership, two-tier KV
 - [KV Store](https://ephpm.dev/architecture/kv-store/) — DashMap design, RESP2 integration, eviction loops
-- [Embedded SQL](https://ephpm.dev) — Litewire integration, Turso engine, zero-dependency data files
-- [DB Proxy & Pooling](https://ephpm.devdb-proxy/) — MySQL wire protocol routing, connection metrics
+- [Embedded SQL](https://ephpm.dev/architecture/database/engines/) — litewire integration, Turso engine, zero-dependency data files
+- [DB Proxy & Pooling](https://ephpm.dev/architecture/database/db-proxy/) — MySQL wire protocol routing, connection metrics
 - [CLI design](https://ephpm.dev/reference/cli/) — Command structure, clap routing, subcommand definitions
-- [Configuration Reference](https://ephpm.dev) — Exhaustive ephpm.toml key mapping and overrides
-- [Metrics Reference](https://ephpm.dev) — Prometheus endpoint specs and histogram allocation
+- [Configuration Reference](https://ephpm.dev/reference/config/) — Exhaustive ephpm.toml key mapping and overrides
+- [Metrics Reference](https://ephpm.dev/reference/metrics/) — Prometheus endpoint specs and histogram allocation
 - [Competitive Analysis](https://ephpm.dev/analysis/) — Feature map versus historical execution runtimes
 - [Performance Comparison](https://ephpm.dev/analysis/performance-comparison/) — In-process latency models vs FPM, RoadRunner, and Swoole
 

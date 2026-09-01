@@ -1,7 +1,7 @@
 # WordPress on ePHPm with EXTERNAL MySQL and Redis.
 #
 # This is the "flexibility" counterpart to the all-embedded demo
-# (docs/guides/wordpress.md, Parts 1-3). Instead of ePHPm's embedded
+# (https://ephpm.dev/guides/wordpress/, Parts 1-3). Instead of ePHPm's embedded
 # SQLite + KV store, this stack wires WordPress to a real MySQL container
 # (through ePHPm's connection-pooling MySQL proxy) and a standalone Redis
 # container. The single ePHPm binary still provides the PHP runtime and
@@ -78,7 +78,7 @@ services:
     # includes the fix for the MySQL 8 backend handshake; older images
     # ("Bad handshake" against MySQL 8.x) won't work for this demo.
     # Use ephpm/ephpm:8.5 to track the rolling latest-release / PHP 8.5.
-    image: ephpm/ephpm:v0.8.0-php8.5.7
+    image: ephpm/ephpm:v0.8.6-php8.5.7
     depends_on:
       init:
         condition: service_completed_successfully
