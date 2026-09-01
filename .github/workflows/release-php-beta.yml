@@ -169,10 +169,16 @@ jobs:
           name: ephpm-beta-${{ needs.setup.outputs.safe_ref }}-php${{ matrix.php.full }}-macos-aarch64
           path: ${{ steps.pkg.outputs.archive }}
 
-  # -- Linux aarch64 (glibc, in the macOS host's linux VM) --------------------
+  # -- Linux aarch64 (glibc, dedicated arm64 runner node) ---------------------
   build-linux-arm64:
     name: Beta (PHP ${{ matrix.php.full }}, linux-aarch64)
-    needs: [build-macos, setup]
+    # arm64 runs on its own dedicated node now — it no longer shares the
+    # Apple Silicon host with build-macos, so no cross-job `needs:
+    # build-macos` serialization (that was copied from release.yml's old
+    # shared-Mac topology). max-parallel: 1 stays as a per-node guard on the
+    # arm64 box itself (disk/memory incidents under concurrent heavy links —
+    # see release.yml's build-linux-arm64).
+    needs: setup
     if: needs.setup.outputs.experimental_matrix != '[]'
     runs-on: [self-hosted, linux, arm64]
     continue-on-error: true

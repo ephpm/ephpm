@@ -28,7 +28,7 @@ jobs:
   build-linux:
     name: Build (PHP ${{ matrix.php }}, ${{ matrix.arch.sdk }})
     # Built natively per arch: x64 on the WSL2 linux runner, arm64 on the
-    # Apple Silicon host's embedded linux VM (ephemerd dispatches
+    # fleet's dedicated arm64 runner node (ephemerd dispatches
     # `[self-hosted, linux, arm64]`). Each uses the matching CI image.
     runs-on: [self-hosted, linux, "${{ matrix.arch.runner }}"]
     container: "ephpm/ephpm-ci:${{ matrix.arch.image }}"
@@ -69,8 +69,8 @@ jobs:
           # Thin LTO is NOT enough here: release.yml tried it (#181) and
           # had to drop to off once the turso engine (#183) grew the
           # binary. Match release.yml so nightly and release build the
-          # arm64 artifact the same way. Revisit once the VM memory is
-          # raised.
+          # arm64 artifact the same way. Revisit once the arm64 node's
+          # memory is raised.
           CARGO_PROFILE_RELEASE_LTO: ${{ matrix.arch.lto }}
         run: cargo xtask release ${{ matrix.php }}
 
@@ -111,13 +111,13 @@ jobs:
     runs-on: [self-hosted, macos, arm64]
     strategy:
       fail-fast: false
-      # Cap at 2 to leave headroom on the Apple Silicon host. The same Mac
-      # also dispatches linux-aarch64 builds (via the embedded Linux VM),
-      # and ephemerd's per-host max_concurrent=4 was getting saturated when
-      # all 3 macos + 3 linux-aarch64 jobs hit at once -- the runner agent
-      # was reaped mid-build (observed: PHP 8.4 macos-aarch64 dying with no
-      # log activity after `actions/checkout`). 2 macos + ~2 linux-aarch64
-      # fits comfortably under the cap.
+      # Cap at 2 to leave headroom on the Apple Silicon host. linux-aarch64
+      # moved to its own dedicated node, so the Mac only runs macOS jobs now
+      # -- but 3 concurrent full release builds on one host is still a lot
+      # (the host has been reaped mid-build under saturation before:
+      # PHP 8.4 macos-aarch64 dying with no log activity after
+      # `actions/checkout`), and release.yml runs this same build at
+      # max-parallel: 1. Keep 2 until a nightly at 3 proves real headroom.
       max-parallel: 2
       matrix:
         php: ["8.3", "8.4", "8.5"]

@@ -225,14 +225,16 @@ jobs:
   # -- Linux arm64 binaries ----------------------------------------------------
   build-linux-arm64:
     name: Build (PHP ${{ matrix.php.full }}, linux-aarch64)
-    # arm64 builds run in the Apple Silicon host's embedded linux VM
-    # (ephemerd dispatches `[self-hosted, linux, arm64]`) — the SAME
-    # physical machine that runs build-macos natively. `needs: build-macos`
-    # is the only cross-job serialization GitHub offers, and max-parallel: 1
-    # keeps the VM to one heavy link at a time. Without both, the v0.5.1
-    # release run put 6 concurrent release builds on that one host and every
-    # runner on it died mid-build.
-    needs: [build-macos, setup]
+    # arm64 builds run on a DEDICATED arm64 runner node (ephemerd dispatches
+    # `[self-hosted, linux, arm64]`) — it no longer shares hardware with
+    # build-macos, so there is no cross-job `needs: build-macos`
+    # serialization any more and the arm64 legs start as soon as setup is
+    # done. max-parallel: 1 stays as a per-node guard on the arm64 box's OWN
+    # capacity: it has had disk-full-mid-build and runner-death incidents
+    # under long jobs, and its memory is tight enough that even a single
+    # fat-LTO link OOMs (which is why LTO is off below). Raise only after a
+    # release proves real headroom on that node.
+    needs: setup
     if: github.event_name == 'push'
     runs-on: [self-hosted, linux, arm64]
     # No `container:` — de-containerized like build-linux (node24 JS actions on
@@ -251,7 +253,8 @@ jobs:
         # binary (libphp.a + ICU + everything, codegen-units=1 per #171) exceeds
         # the arm64 build host's memory -- rustc gets OOM-SIGKILLed even as the
         # only job (#181/#183). Disabling LTO cuts link-time memory the most for
-        # a low single-digit perf delta. Revisit once the VM memory is raised.
+        # a low single-digit perf delta. Revisit once the arm64 node's memory
+        # is raised.
         run: |
           set -eu
           docker run --rm -v "$PWD":/w -w /w \
@@ -299,9 +302,10 @@ jobs:
     runs-on: [self-hosted, macos, arm64]
     strategy:
       fail-fast: false
-      # One fat-LTO release build at a time on the Apple Silicon host — it
-      # also hosts the linux-arm64 build VM (see build-linux-arm64). Raise
-      # to 2 only after a release proves real headroom.
+      # One fat-LTO release build at a time on the Apple Silicon host.
+      # (linux-arm64 moved to its own dedicated node, so the Mac only runs
+      # macOS legs now.) Raise to 2 only after a release proves real
+      # headroom.
       max-parallel: 1
       matrix:
         # {minor, full} per supported PHP minor, from xtask::PHP_SDK_VERSIONS.
