@@ -194,6 +194,11 @@ jobs:
     runs-on: [self-hosted, windows, x64]
     strategy:
       fail-fast: false
+      # One build per Windows worker at a time — same guard release.yml has
+      # carried since the v0.5.1 incident. Without it the three legs race
+      # the VS Build Tools bootstrapper and at most one survives (observed
+      # across four consecutive nightlies: exactly one leg green, rotating).
+      max-parallel: 1
       matrix:
         php: ["8.3", "8.4", "8.5"]
     steps:

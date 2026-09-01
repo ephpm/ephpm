@@ -47,6 +47,11 @@ jobs:
     runs-on: [self-hosted, linux, x64]
     outputs:
       experimental_matrix: ${{ steps.matrix.outputs.experimental_matrix }}
+      # github.ref_name with `/` flattened to `-`. Artifact names reject
+      # slashes, so a branch dispatch (fix/php86-...) otherwise builds
+      # successfully and then dies at "Upload archive" — observed on run
+      # 33460847551. Use this, never ref_name, in artifact names.
+      safe_ref: ${{ steps.safe_ref.outputs.safe_ref }}
     steps:
       - uses: actions/checkout@v4
       - name: Emit experimental matrix from xtask EXPERIMENTAL_PHP_VERSIONS
@@ -55,6 +60,11 @@ jobs:
           docker run --rm -v "$PWD":/w -w /w \
             ephpm/ephpm-ci:latest \
             cargo run --quiet -p xtask -- php-versions --github-matrix >> "$GITHUB_OUTPUT"
+      - name: Slash-safe ref name for artifact names
+        id: safe_ref
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: echo "safe_ref=${REF_NAME//\//-}" >> "$GITHUB_OUTPUT"
 
   # -- Linux x86_64 (glibc 2.28 floor via ephpm-ci) ---------------------------
   build-linux:
@@ -101,7 +111,7 @@ jobs:
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
-          name: ephpm-beta-${{ github.ref_name }}-php${{ matrix.php.full }}-linux-x86_64
+          name: ephpm-beta-${{ needs.setup.outputs.safe_ref }}-php${{ matrix.php.full }}-linux-x86_64
           path: ${{ steps.pkg.outputs.archive }}
 
   # -- macOS aarch64 (native) -------------------------------------------------
@@ -156,7 +166,7 @@ jobs:
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
-          name: ephpm-beta-${{ github.ref_name }}-php${{ matrix.php.full }}-macos-aarch64
+          name: ephpm-beta-${{ needs.setup.outputs.safe_ref }}-php${{ matrix.php.full }}-macos-aarch64
           path: ${{ steps.pkg.outputs.archive }}
 
   # -- Linux aarch64 (glibc, in the macOS host's linux VM) --------------------
@@ -205,7 +215,7 @@ jobs:
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
-          name: ephpm-beta-${{ github.ref_name }}-php${{ matrix.php.full }}-linux-aarch64
+          name: ephpm-beta-${{ needs.setup.outputs.safe_ref }}-php${{ matrix.php.full }}-linux-aarch64
           path: ${{ steps.pkg.outputs.archive }}
 
   # -- Windows x86_64 (native MSVC) -------------------------------------------
@@ -318,7 +328,7 @@ jobs:
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
-          name: ephpm-beta-${{ github.ref_name }}-php${{ matrix.php.full }}-windows-x86_64
+          name: ephpm-beta-${{ needs.setup.outputs.safe_ref }}-php${{ matrix.php.full }}-windows-x86_64
           path: ${{ steps.pkg.outputs.archive }}
 
   # -- Optional pre-release publish -------------------------------------------
