@@ -189,7 +189,7 @@ Quick-reference map of the **public** repos in the `github.com/ephpm` org (`orig
 | `wordpress-sample` | Deployable real WordPress for PR previews — per-site Turso (`db-wordpress`) + KV object cache (`cache-wordpress`) + native WebSockets. | **Example app** — the PR-preview showcase. |
 | `wordpress-datastar` | Live WordPress demo: realtime comments + admin dashboard via Datastar SSE, KV as the event bus. | **Example app / demo.** |
 | `datastar-demo` | Pixelboard — multiplayer realtime Datastar demo on worker mode + native KV. | **Example app / demo.** |
-| `lab` | Benchmark lab (Kubernetes) — ePHPm vs php-fpm/Swoole/RoadRunner, app workloads, DB-path tier. Now also hosts the multitenant `scale/` tier. | **Benchmark/standalone** — some suites pin old images (pre-v0.7.0 machinery). Author: Benjamin Pace. |
+| `lab` | Benchmark lab — local runtimes + DB-path tiers (podman) and k6 app workloads (Kubernetes); hosts the multitenant `scale/` tier and the Turso per-vhost cluster suite (recorded on v0.8.7). | **Benchmark/standalone** — org-maintained (originally authored by Benjamin Pace; no external review needed). Historical suites stay pinned to old images by design. |
 | `multitenant-scalebench` | Multi-tenant scaling benchmark (1 instance × N WordPress sites). | **Benchmark/standalone (historical)** — harness moved into `lab/scale/`; this repo is now the historical results record. |
 | `turso-cluster-e2e` | Two-node clustered-SQLite ePHPm fixture/demo (WordPress + wp-cli). | **Example/e2e fixture (historical)** — README predates v0.7.0; describes the now-removed sqld path and `cdc_experimental` knob alongside Turso CDC. |
 
