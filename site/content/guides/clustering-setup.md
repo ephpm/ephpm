@@ -83,7 +83,7 @@ enabled = true
 join = ["ephpm-headless.default.svc.cluster.local:7946"]
 ```
 
-`StatefulSet` + headless `Service` works well — pod-stable DNS gives consistent ordinals, which the primary election prefers. There's a sample chart in the repo's `deploy/` directory (TODO: link when published).
+`StatefulSet` + headless `Service` works well — pod-stable DNS gives consistent ordinals, which the primary election prefers. There is no Helm chart; the worked manifests live in [`k8s/base/`](https://github.com/ephpm/ephpm/tree/main/k8s/base) — [`ephpm-cluster.yaml`](https://github.com/ephpm/ephpm/blob/main/k8s/base/ephpm-cluster.yaml) is the clustered StatefulSet + headless Service the E2E suite runs against, and [`ephpm-single.yaml`](https://github.com/ephpm/ephpm/blob/main/k8s/base/ephpm-single.yaml) is its single-node counterpart. They are test fixtures rather than a packaged release artifact, so treat them as a starting point.
 
 ## Verify the cluster
 
