@@ -7,6 +7,21 @@ Every key in `ephpm.toml`, with type, default, and a short description. The sour
 
 All sections and keys are optional. Missing sections use defaults; `Config::default_config()` produces a fully working configuration.
 
+## Unknown keys are a startup error
+
+**Every section rejects keys it does not recognize**, failing startup with an error that names the offending key. This covers `[server]` and all its subsections, `[php]`, `[db]` and all its subsections, `[kv]`, `[cluster]`, `[opcache]`, and `[[middleware]]` / `[[server.proxy]]` blocks.
+
+A key this binary does not declare is far more likely to be a typo — or a knob from a newer version — than something safe to ignore, and ignoring it silently turns an explicit instruction into a no-op that every health check reports green. The case that prompted this: `per_site = true` on a binary predating the knob parsed fine, was dropped on the floor, and brought the node up in whole-database clustered mode with every tenant sharing one database.
+
+The forward-compatibility cost is intended. A config naming a knob your binary does not implement now fails loudly instead of quietly running something else. **If you are upgrading and startup fails naming a key, that key was already doing nothing** — remove it, or upgrade to a build that implements it.
+
+Two things stay lenient on purpose:
+
+- **Unknown *top-level* keys** (outside any section). `EPHPM_`-prefixed environment variables are merged as top-level keys and not all of them are configuration — ePHPm's own Windows service wrapper sets `EPHPM_SERVICE_LOG_FILE`, and the e2e harness sets `EPHPM_URL` / `EPHPM_BINARY`. Rejecting these would stop the server starting as a Windows service.
+- **`[db.sqlite.sqld]`**, which exists only so pre-v0.7.0 configs keep parsing (see below).
+
+Knobs that were *removed* but are still honoured for upgrades — `[db.sqlite.sqld]`, `cdc_experimental`, `engine` — remain accepted and warn.
+
 ## `[server]`
 
 | Key | Type | Default | Description |
@@ -613,7 +628,7 @@ Clustered SQLite is **experimental** in v0.7.0: it uses the in-process Turso CDC
 
 > **Removed in v0.7.0:** the `cdc_experimental` opt-in flag is gone. Clustered mode always uses CDC replication now — there is no per-node flag to set. A config that still sets `cdc_experimental` logs a deprecation warning; it has no effect.
 
-> **Unknown keys under `[db.sqlite]` are a startup error.** `[db.sqlite]`, `[db.sqlite.proxy]` and `[db.sqlite.replication]` reject keys they do not recognize, naming the offending key. Every knob in these sections selects a *mode*, and a mis-typed or not-yet-supported mode knob is the one config error that passes every health check while running the wrong thing — `per_site = true` on a binary that predates the knob used to parse fine, be ignored, and bring the node up in whole-database clustered mode with all tenants sharing one database. The forward-compatibility cost is intended: a config naming a knob your binary does not implement fails loudly instead of silently running a different mode. Keys that were *removed* but are still honoured for upgrades (`[db.sqlite.sqld]`, `cdc_experimental`, `engine`) remain accepted and warn, as described above.
+> **Unknown keys under `[db.sqlite]` are a startup error**, as they are in [every section](#unknown-keys-are-a-startup-error). It matters most here: every knob in these sections selects a *mode*, and a mis-typed or not-yet-supported mode knob is the one config error that passes every health check while running the wrong thing. Keys that were *removed* but are still honoured for upgrades (`[db.sqlite.sqld]`, `cdc_experimental`, `engine`) remain accepted and warn, as described above.
 >
 > To confirm which mode a node actually chose, look for the single startup line `embedded SQLite mode selected` — its `mode` field is one of `per-site-clustered`, `clustered`, `per-site`, or `single-node`.
 
