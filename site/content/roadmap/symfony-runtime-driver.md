@@ -8,7 +8,7 @@ adapter is what lets a stock Symfony / API Platform / Drupal-on-Symfony app
 opt into worker mode without leaving the binary.
 
 **Status: the adapter package is planned — not yet implemented.** Its Rust-side
-prerequisite shipped in 3.0: the [worker-mode engine](/architecture/#php-worker-mode)
+prerequisite shipped in v0.3.0: the [worker-mode engine](/architecture/#php-worker-mode)
 and its `\Ephpm\Worker\*` primitives are live, and the
 [Laravel Octane driver](/guides/laravel-octane/) is already built on them
 (**nothing Symfony-specific is needed in Rust**). This document focuses on
@@ -90,7 +90,7 @@ The adapter lives in two places:
    `APP_RUNTIME` in their environment or `composer.json` — no code change to
    `public/index.php`.
 2. **Rust side** — nothing new. The engine primitives
-   (`\Ephpm\Worker\take_request()` etc.) shipped in 3.0 and already power the
+   (`\Ephpm\Worker\take_request()` etc.) shipped in v0.3.0 and already power the
    Octane and WordPress adapters. **Nothing Symfony-specific is needed in
    Rust.** All adapters call the same primitives.
 
@@ -327,7 +327,7 @@ loop. Out of scope for the initial adapter; tracked separately under
 
 ### Phase 1 — Worker mode primitive (prerequisite) — SHIPPED
 
-Shipped in ePHPm 3.0. See [PHP Worker Mode](/architecture/#php-worker-mode);
+Shipped in ePHPm v0.3.0. See [PHP Worker Mode](/architecture/#php-worker-mode);
 the reference `examples/worker/worker.php` loop serves responses with zero
 per-request bootstrap, and the Octane and WordPress adapters run on it in
 production.
