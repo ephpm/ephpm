@@ -212,11 +212,17 @@ sites_domain_suffix = ".example.com"   # dir "switchboard/" serves Host switchbo
 
 [server.security]
 open_basedir = true
-hidden_files = "deny"
 # Only these pre-rewrite URIs may execute PHP. allowed_php_paths matches the URI
 # BEFORE routing, so every route must be listed — omitting one returns 403.
 allowed_php_paths = ["/index.php", "/webhook", "/healthz", "/drain"]
 blocked_paths = ["/vendor/*", "/src/*", "/tests/*", "/composer.*", "/worker.php"]
+
+# hidden_files lives under [server.static], NOT [server.security] — putting it
+# in the wrong section is silently ignored (SecurityConfig does not reject
+# unknown fields). "deny" is already the default; it is spelled out here so the
+# intent is explicit in the deployed config.
+[server.static]
+hidden_files = "deny"
 ```
 
 Set the webhook secret in the vhost's `.switchboard/webhook_secret` (one secret
