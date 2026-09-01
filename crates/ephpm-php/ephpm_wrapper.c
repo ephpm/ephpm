@@ -1133,7 +1133,33 @@ static int ephpm_run_one_middleware(const char *path)
     }
 
     zend_execute(op_array, NULL);
+#if PHP_VERSION_ID < 80600
+    /* SAFETY (FFI/engine-state): PHP 8.6 removed zend_exception_save() and
+     * zend_exception_restore() outright, along with the EG(prev_exception)
+     * slot they shuttled a pending exception through — php-src commit
+     * 084e40969420 ("Remove zend_exception_save() and
+     * zend_exception_restore()", GH-20256), recorded at UPGRADING.INTERNALS
+     * line 53. There is no replacement API; the concept is gone.
+     *
+     * That same commit is also the migration pattern for THIS line. The two
+     * upstream sites that carry the loop body copied here — zend_execute_script()
+     * in Zend/zend.c and accel_preload() in ext/opcache/ZendAccelerator.c —
+     * were migrated by deleting the restore() call and changing nothing else
+     * (no rescue of a stranded exception, no substitute juggling). This gate
+     * reproduces that exactly: keep the call verbatim on <= 8.5 so those
+     * builds are behaviourally byte-identical, compile it out on >= 8.6.
+     *
+     * Dropping it on 8.6 cannot leak or clobber a pending exception.
+     * restore() was only ever a no-op-unless-EG(prev_exception)-is-set move,
+     * and the ONLY writer of that field was zend_exception_save(). In 8.6 the
+     * field does not exist and neither does the writer, so there is no second
+     * exception slot for a Throwable to be stranded in: once zend_execute()
+     * returns, EG(exception) is the entire pending-exception state, and it is
+     * read directly below. Nor does this interact with the bailout path — a
+     * zend_bailout longjmps past this line entirely, to the SETJMP in
+     * ephpm_execute_request, and never observed prev_exception either. */
     zend_exception_restore();
+#endif
 
     if (UNEXPECTED(EG(exception))) {
         if (zend_is_unwind_exit(EG(exception))) {
