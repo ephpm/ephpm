@@ -15,8 +15,8 @@ jobs:
     name: Build CI Image (${{ matrix.arch }})
     # Build each arch's image natively on a runner of that arch (no buildx /
     # cross-build, which would need --privileged). amd64 -> :latest,
-    # arm64 -> :latest-arm64. The arm64 runner is the Apple Silicon host's
-    # embedded linux VM (ephemerd dispatches `[self-hosted, linux, arm64]`).
+    # arm64 -> :latest-arm64. The arm64 runner is the fleet's dedicated
+    # arm64 node (ephemerd dispatches `[self-hosted, linux, arm64]`).
     runs-on: [self-hosted, linux, "${{ matrix.arch }}"]
     strategy:
       fail-fast: false

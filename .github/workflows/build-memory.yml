@@ -46,9 +46,9 @@ on:
         type: choice
         options: ["both", "linux-arm64", "windows"]
 
-# One probe at a time. linux-arm64 runs in the Apple Silicon host's embedded
-# Linux VM — the same physical machine as build-macos — so a concurrent probe
-# would contend for the very memory being measured and invalidate the number.
+# One probe at a time. linux-arm64 runs on the fleet's dedicated arm64 runner
+# node; a concurrent probe (or a second workflow run) on the same node would
+# contend for the very memory being measured and invalidate the number.
 concurrency:
   group: ephpm-build-memory
   cancel-in-progress: false
