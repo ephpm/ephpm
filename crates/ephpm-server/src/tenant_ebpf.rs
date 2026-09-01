@@ -7,7 +7,8 @@
 //! See `crates/ephpm-server/bpf/vhostnet.bpf.c` for the kernel side.
 //!
 //! Close-time port reclamation (a `sock_release` program returning ports to the
-//! pool) is deferred to v0.8.2: reading a socket's source port in `sock_release`
+//! pool) is **not implemented** and has no target release: reading a socket's
+//! source port in `sock_release`
 //! is verifier-rejected on 6.18, and the `bpf_sk_storage` alternative is a map
 //! type aya 0.13 cannot load. Real ports and per-vhost counts are therefore
 //! reclaimed on process exit; the `assigned` map keeps same-port rebinds

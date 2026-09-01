@@ -21,12 +21,12 @@
 //     ports; allow a direct connect only to a real port THIS vhost owns; deny
 //     everything else on loopback (the loopback floor for tagged traffic).
 //
-// NOTE (v0.8.1): real ports and per-vhost counts are reclaimed only when the
+// NOTE: real ports and per-vhost counts are reclaimed only when the
 // process exits (the maps are freed with it). Reclaiming a port when a sidecar
 // LISTENER socket closes needs either a cgroup/sock_release program reading
 // per-socket ownership from bpf_sk_storage (reading ctx->src_port there is
 // verifier-rejected on 6.18) OR another close signal — and aya 0.13 cannot load
-// a BPF_MAP_TYPE_SK_STORAGE map. So close-time GC is deferred to v0.8.2; size
+// a BPF_MAP_TYPE_SK_STORAGE map. So close-time GC is not implemented; size
 // `sidecar_port_range` and `max_sidecar_ports_per_vhost` for steady-state
 // concurrency, not churn. The `assigned` map still makes rebinds idempotent, so
 // a sidecar that restarts on the SAME virtual port keeps its real port and does

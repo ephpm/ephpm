@@ -3537,7 +3537,7 @@ impl Config {
                         .to_string(),
                 ));
             }
-            // (3) v0.8.1 scope: the tag is written on the fpm per-request path
+            // (3) Current scope: the tag is written on the fpm per-request path
             //     (run_php). Worker mode's persistent loop would need per-event
             //     tagging inside the PSR-7 envelope — deferred.
             //
