@@ -2081,7 +2081,16 @@ pub struct DbConfig {
 ///
 /// Uses litewire to expose `SQLite` via `MySQL` wire protocol, so PHP apps
 /// can use their existing `pdo_mysql` drivers transparently.
+/// Unknown keys are rejected at startup for the same reason as
+/// [`ReplicationConfig`]: `[db.sqlite]` selects the embedded-database mode, and
+/// a key this binary does not know is far more likely to be a typo or a knob
+/// from a newer version than something safe to ignore. The v0.7.0 removals
+/// (`sqld`, `engine = "rusqlite"`) are still *declared* — as
+/// [`sqld`](Self::sqld) and a validated [`engine`](Self::engine) — so upgrading
+/// configs keep parsing and get a warning or a migration message instead of a
+/// bare "unknown field".
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SqliteConfig {
     /// Path to the `SQLite` database file.
     ///
@@ -2171,7 +2180,13 @@ pub struct SqliteConfig {
 }
 
 /// Wire protocol frontend addresses for the `SQLite` proxy (`[db.sqlite.proxy]`).
+///
+/// Unknown keys are rejected — see [`ReplicationConfig`]. A mis-typed listen
+/// address key here would silently leave a frontend unbound (or bound to the
+/// default address), which surfaces only as every client getting connection
+/// refused at runtime.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct SqliteProxyConfig {
     /// `MySQL` wire protocol listen address.
     ///
@@ -2272,8 +2287,28 @@ pub struct DeprecatedSqldConfig {
 
 /// Replication configuration (`[db.sqlite.replication]`).
 ///
-/// Controls whether this node runs sqld as a primary or replica.
+/// Selects this node's clustered-replication role and, via
+/// [`per_site`](Self::per_site), the *tenancy* of the replicated database.
+///
+/// # Unknown keys are a hard startup error
+///
+/// This struct is `deny_unknown_fields` because every knob in it selects a
+/// **mode**, and a mis-typed or not-yet-supported mode knob is the one kind of
+/// config error that passes every health check while running the wrong thing.
+/// The motivating case: `per_site = true` on a binary that predates the knob
+/// parsed happily, was ignored, and the node came up in whole-database
+/// clustered mode — every tenant sharing one database — with nothing in the
+/// logs to say so. Serde's default (silently drop unknown fields) turns an
+/// operator's explicit instruction into a no-op, which is exactly what the
+/// "no silent no-op config knobs" rule in `CLAUDE.md` forbids.
+///
+/// The forward-compatibility cost is intended: a config naming a knob this
+/// binary does not implement must fail loudly rather than run a different mode
+/// than the operator asked for. Removed-but-still-honoured knobs
+/// ([`cdc_experimental`](Self::cdc_experimental)) stay declared here precisely
+/// so upgrading configs keep parsing — they warn at startup instead.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ReplicationConfig {
     /// Replication role: `"auto"`, `"primary"`, or `"replica"`.
     ///
@@ -7320,6 +7355,112 @@ listen = "0.0.0.0:8080"
         let _env = EnvVars::set("EPHPM_PHP__MEMORY_LIMIT", "256M");
         let config = Config::default_config().unwrap();
         assert_eq!(config.php.memory_limit, "256M");
+    }
+
+    // ── [db.sqlite] strict-key parsing ──────────────────────────────────
+    //
+    // The `[db.sqlite]` structs are `deny_unknown_fields` because their knobs
+    // select a *mode*. The defect these pin: `per_site = true` on a binary that
+    // predated the knob parsed fine, was dropped on the floor, and the node
+    // came up in whole-database clustered mode — all tenants sharing one
+    // database — with every health check green.
+
+    /// Load a config from TOML, expecting the load to succeed. Deliberately
+    /// does **not** call `validate()`: these tests are about which *keys*
+    /// deserialize, not about whether the resulting combination is a coherent
+    /// deployment.
+    fn load_toml(toml: &str) -> Config {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, toml).unwrap();
+        Config::load(&file).unwrap_or_else(|e| panic!("expected a valid config, got: {e}\n{toml}"))
+    }
+
+    /// Load a config from TOML expecting the **load** (deserialize) step to
+    /// fail, returning the error text.
+    fn load_error(toml: &str) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, toml).unwrap();
+        match Config::load(&file) {
+            Ok(_) => panic!("expected a load error for:\n{toml}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// A misspelled mode knob must name the offending key and refuse to start,
+    /// never parse-and-ignore.
+    #[test]
+    fn unknown_key_under_sqlite_replication_is_rejected() {
+        let err = load_error(
+            "[db.sqlite]\n\
+             dir = \"/var/lib/ephpm/sites\"\n\
+             \n\
+             [db.sqlite.replication]\n\
+             role = \"auto\"\n\
+             per_sites = true\n",
+        );
+        assert!(
+            err.contains("per_sites"),
+            "the error must name the unknown key so an operator can find the typo, got: {err}"
+        );
+    }
+
+    /// The same strictness one level up, and on the proxy block.
+    #[test]
+    fn unknown_key_under_sqlite_and_proxy_is_rejected() {
+        let err = load_error("[db.sqlite]\nmax_open_db = 32\n");
+        assert!(err.contains("max_open_db"), "unexpected: {err}");
+
+        let err = load_error("[db.sqlite.proxy]\nmysql_listens = \"127.0.0.1:3306\"\n");
+        assert!(err.contains("mysql_listens"), "unexpected: {err}");
+    }
+
+    /// Strictness must not cost the documented upgrade path: every knob that is
+    /// declared — including the v0.7.0 removals kept purely so old configs keep
+    /// parsing — still loads.
+    #[test]
+    fn known_and_deprecated_sqlite_keys_still_parse() {
+        let config = load_toml(
+            "[db.sqlite]\n\
+             dir = \"/var/lib/ephpm/sites\"\n\
+             engine = \"turso\"\n\
+             max_open_dbs = 32\n\
+             \n\
+             [db.sqlite.sqld]\n\
+             write_permits = 4\n\
+             \n\
+             [db.sqlite.replication]\n\
+             role = \"auto\"\n\
+             per_site = true\n\
+             cdc_experimental = true\n\
+             max_snapshot_bytes = 2048\n",
+        );
+        let sqlite = config.db.sqlite.expect("sqlite section present");
+        assert!(sqlite.replication.per_site);
+        assert_eq!(sqlite.replication.max_snapshot_bytes, 2048);
+        // Removed-but-declared knobs parse (and warn at startup) rather than
+        // hard-failing an upgrading config with "unknown field".
+        assert!(sqlite.replication.cdc_experimental);
+        assert_eq!(sqlite.sqld.and_then(|s| s.write_permits), Some(4));
+    }
+
+    /// `deny_unknown_fields` must not break the `EPHPM_` env-var override lane:
+    /// figment's `Env::prefixed("EPHPM_").split("__")` feeds the same structs,
+    /// so a strict struct that rejected its own env keys would be a regression.
+    #[test]
+    fn env_var_override_still_reaches_strict_sqlite_replication() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[db.sqlite]\ndir = \"/var/lib/ephpm/sites\"\n").unwrap();
+
+        let _env = EnvVars::set("EPHPM_DB__SQLITE__REPLICATION__PER_SITE", "true");
+        let config = Config::load(&file).unwrap();
+        let sqlite = config.db.sqlite.expect("sqlite section present");
+        assert!(
+            sqlite.replication.per_site,
+            "an EPHPM_ env override must still reach a deny_unknown_fields struct"
+        );
     }
 
     #[test]

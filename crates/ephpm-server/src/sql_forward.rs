@@ -22,11 +22,45 @@
 //!   this node is the site's HRW owner (or no node is alive to own it), it
 //!   returns the **local** per-site backend, exactly as single-node per-site
 //!   does. Otherwise it returns a [`RemoteProxyBackend`] whose connections
-//!   forward each statement to the owner over `dial(owner, "sql/<site>")`.
+//!   forward each statement to the owner over `dial(owner, "sql/<site>")`
+//!   **and** announces the site to this node's replication plane, so a node
+//!   that only ever forwards still replicates the site — see "Replication
+//!   working set" below.
 //! - **Owner side** ([`spawn_owner_sql_handler`]) — a `register_prefix("sql/")`
 //!   handler that parses the site, HRW-gates ("am I this site's owner?"), and
 //!   runs each forwarded statement against that site's local screened/tracked
 //!   backend, streaming the rowset / OK / error back.
+//!
+//! # Replication working set vs. the open-database LRU
+//!
+//! Announcing a forwarded site does **not** open that site's database in the
+//! [`SiteBackends`] registry, and that separation is deliberate.
+//!
+//! The two are independent by construction: `SiteBackends` holds the *serving*
+//! handle (LRU-bounded by `[db.sqlite] max_open_dbs`, evicted when idle),
+//! while a per-site replication driver holds its own mgmt factory out of
+//! `SiteMgmtRegistry` (see [`crate::turso_cdc`]). Opening the site locally
+//! just to fire the announcement would consume an LRU slot for a database this
+//! node is not serving from — pure cost, since the driver opens its own handle
+//! regardless — and on a node forwarding many sites it would evict the
+//! databases the node actually *is* serving.
+//!
+//! The semantics that follow, and which callers may rely on:
+//!
+//! * **Eviction never stops replication.** A driver's mgmt factory is not the
+//!   registry's handle, so closing the registry's handle (or never opening one)
+//!   leaves the `cdc/<site>` subscription untouched. There is no path by which
+//!   LRU pressure silently de-replicates a tenant.
+//! * **The replication working set is not bounded by `max_open_dbs`.** It is
+//!   bounded by the sites this node has served or found on disk — the same
+//!   bound the startup scan already established, since a replicated site has a
+//!   file on disk from its first snapshot onward. `max_open_dbs` bounds
+//!   *serving* handles only; budget file descriptors for both.
+//! * **Announcement is idempotent and cheap.** `ensure_site_driver` dedups on a
+//!   `DashMap` entry, so re-announcing a site with a running driver is one
+//!   sharded lookup. The resolver therefore announces on every forwarded
+//!   resolve rather than caching "already announced" — which also means a
+//!   driver that exited can be restarted by ordinary traffic.
 //!
 //! # Transport & security
 //!
@@ -88,7 +122,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use crate::site_backends::SiteBackends;
+use crate::site_backends::{SiteBackends, SiteOpenHook};
 
 /// Maximum length of one length-prefixed forwarding message (64 MiB). A single
 /// forwarded result set must fit — larger than the CDC frame cap because a
@@ -358,10 +392,19 @@ pub struct ClusteredSiteResolver {
     channel: ChannelHandle,
     self_id: String,
     handle: tokio::runtime::Handle,
+    /// Announces a site to this node's replication plane. The **same** hook
+    /// [`SiteBackends`] fires when it opens a site's database; the forwarding
+    /// path must fire it itself, because it never opens the site locally. See
+    /// the module docs, "Replication working set vs. the open-database LRU".
+    note_active: SiteOpenHook,
 }
 
 impl ClusteredSiteResolver {
     /// Build a resolver over the local registry and cluster context.
+    ///
+    /// `note_active` must be the same site-activation hook handed to
+    /// [`SiteBackends::new_clustered`], so a site announces itself exactly once
+    /// per activation regardless of which branch served it.
     #[must_use]
     pub fn new(
         local: SiteBackends,
@@ -369,13 +412,36 @@ impl ClusteredSiteResolver {
         channel: ChannelHandle,
         self_id: String,
         handle: tokio::runtime::Handle,
+        note_active: SiteOpenHook,
     ) -> Self {
-        Self { local, cluster, channel, self_id, handle }
+        Self { local, cluster, channel, self_id, handle, note_active }
     }
 
+    /// Resolve one request's backend: the local database when this node owns
+    /// the site, a forwarding proxy to the owner otherwise.
+    ///
+    /// # Why the forwarding branch announces the site
+    ///
+    /// A node joins the replication working set for a site when that site is
+    /// announced to the per-site driver (`ensure_site_driver` in
+    /// [`crate::turso_cdc`]), which is what subscribes it to `cdc/<site>` and
+    /// materializes a local replica. The only thing that used to announce a
+    /// site was [`SiteBackends`] opening its database — so a node that served
+    /// a site **exclusively** by forwarding never opened it, never announced
+    /// it, and never replicated it. The tenant's data then lived on exactly one
+    /// node while every health check stayed green, and HRW failover moved
+    /// ownership to a node holding nothing.
+    ///
+    /// Stock `pdo_mysql` traffic hid the gap by incidentally opening the
+    /// database locally; the recommended deployment (the `db-*` drop-ins, which
+    /// call `ephpm_db_*` only) hits it squarely.
+    ///
+    /// The announcement happens **before** the fallible owner-address lookup:
+    /// a node that cannot reach the site's owner right now is precisely a node
+    /// that should already be replicating it.
     async fn resolve_async(&self, site: &str) -> Result<SharedBackend, String> {
         let nodes = self.cluster.nodes().await;
-        if should_serve_locally(&nodes, &self.self_id, site) {
+        if plan_serve(&nodes, &self.self_id, site, &self.note_active) == ServePlan::Local {
             return self.local.get_or_open(site).await.map_err(|e| format!("{e:#}"));
         }
         let owner = hrw_owner(&nodes, site).expect("non-local implies an alive HRW owner");
@@ -413,6 +479,42 @@ impl SiteBackendResolver for ClusteredSiteResolver {
         // invariant that licenses the plain registry's `resolve`.
         self.handle.clone().block_on(self.resolve_async(site_key))
     }
+}
+
+/// How a resolve will be served.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServePlan {
+    /// Open (or reuse) the site's local database.
+    Local,
+    /// Forward the site's statements to its HRW owner.
+    Forward,
+}
+
+/// Decide how to serve `site`, announcing it to the replication plane on the
+/// forwarding branch.
+///
+/// This is the whole of [`ClusteredSiteResolver::resolve_async`]'s branch
+/// decision, split out as a free function so the announcement is unit-testable
+/// without standing up a live multi-node cluster. That matters more than usual
+/// here: the failure it guards against is silent — a forwarded-only site reads
+/// and writes correctly on every node, and the missing replica only becomes
+/// visible when the owner dies and takes the tenant's only copy with it.
+///
+/// The [`ServePlan::Local`] branch deliberately does **not** announce: the
+/// registry's own open hook ([`SiteBackends::new_clustered`]) fires there, and
+/// announcing twice would be redundant (harmless — `ensure_site_driver` dedups
+/// — but it would leave two places claiming the same responsibility).
+fn plan_serve(
+    nodes: &[NodeInfo],
+    self_id: &str,
+    site: &str,
+    note_active: &SiteOpenHook,
+) -> ServePlan {
+    if should_serve_locally(nodes, self_id, site) {
+        return ServePlan::Local;
+    }
+    note_active(site);
+    ServePlan::Forward
 }
 
 /// Whether this node serves `site` from its local database rather than
@@ -673,6 +775,98 @@ mod tests {
         let dead = [node("ephpm-0", NodeState::Dead)];
         assert!(should_serve_locally(&dead, "ephpm-0", "tenant-a"));
         assert!(should_serve_locally(&[], "ephpm-0", "tenant-a"));
+    }
+
+    /// A recording site-activation hook plus the sites it was told about.
+    fn recording_hook() -> (SiteOpenHook, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let hook: SiteOpenHook = Arc::new(move |site: &str| {
+            sink.lock().unwrap().push(site.to_string());
+        });
+        (hook, seen)
+    }
+
+    /// **Regression test for the bridge-only replication gap.**
+    ///
+    /// A node that serves a site only by forwarding must still announce it to
+    /// the replication plane, or it never subscribes to `cdc/<site>` and never
+    /// materializes a replica — leaving the tenant's data on exactly one node
+    /// while every health check passes. Before the fix this branch returned a
+    /// `RemoteProxyBackend` and announced nothing.
+    ///
+    /// Note this is invisible to any test that drives `pdo_mysql`: that path
+    /// opens the database locally and announces as a side effect. It only bites
+    /// the recommended `ephpm_db_*`-only deployment.
+    #[test]
+    fn forwarding_a_site_announces_it_to_the_replication_plane() {
+        let nodes = [
+            node("ephpm-0", NodeState::Alive),
+            node("ephpm-1", NodeState::Alive),
+            node("ephpm-2", NodeState::Alive),
+        ];
+        let owner = hrw_owner(&nodes, "tenant-a").unwrap().id.clone();
+
+        for n in &nodes {
+            if n.id == owner {
+                continue;
+            }
+            let (hook, seen) = recording_hook();
+            let plan = plan_serve(&nodes, &n.id, "tenant-a", &hook);
+            assert_eq!(plan, ServePlan::Forward, "a non-owner must forward");
+            assert_eq!(
+                seen.lock().unwrap().as_slice(),
+                ["tenant-a".to_string()],
+                "a forwarded site must be announced so this node starts replicating it"
+            );
+        }
+    }
+
+    /// The owner branch does not announce: the registry's open hook fires there
+    /// (`SiteBackends::new_clustered`), and one announcement per activation
+    /// keeps a single place responsible.
+    #[test]
+    fn serving_a_site_locally_leaves_the_announcement_to_the_registry() {
+        let nodes = [
+            node("ephpm-0", NodeState::Alive),
+            node("ephpm-1", NodeState::Alive),
+            node("ephpm-2", NodeState::Alive),
+        ];
+        let owner = hrw_owner(&nodes, "tenant-a").unwrap().id.clone();
+
+        let (hook, seen) = recording_hook();
+        assert_eq!(plan_serve(&nodes, &owner, "tenant-a", &hook), ServePlan::Local);
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the local branch must not announce; SiteBackends::get_or_open does"
+        );
+
+        // Degraded case: no alive node to own the site. Serving locally is the
+        // safe degradation, and it likewise announces via the registry.
+        let (hook, seen) = recording_hook();
+        assert_eq!(plan_serve(&[], "ephpm-0", "tenant-a", &hook), ServePlan::Local);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// Announcement is per-resolve, not once-per-process: `ensure_site_driver`
+    /// dedups, and re-announcing is what lets ordinary traffic restart a driver
+    /// that exited. A resolver that cached "already announced" would leave a
+    /// site permanently unreplicated after one driver failure.
+    #[test]
+    fn every_forwarded_resolve_announces() {
+        let nodes = [
+            node("ephpm-0", NodeState::Alive),
+            node("ephpm-1", NodeState::Alive),
+            node("ephpm-2", NodeState::Alive),
+        ];
+        let owner = hrw_owner(&nodes, "tenant-a").unwrap().id.clone();
+        let non_owner = nodes.iter().find(|n| n.id != owner).unwrap().id.clone();
+
+        let (hook, seen) = recording_hook();
+        for _ in 0..3 {
+            plan_serve(&nodes, &non_owner, "tenant-a", &hook);
+        }
+        assert_eq!(seen.lock().unwrap().len(), 3);
     }
 
     /// The owner side needs BOTH gates. HRW ownership alone would let any
