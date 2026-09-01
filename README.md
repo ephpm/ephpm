@@ -12,7 +12,7 @@ The simplest way to convey this project is to name what it is trying to replace 
 
 First, it needed to be written in Rust to completely avoid the heavy `cgo` execution tax that platforms like FrankenPHP face when embedding `libphp.a`. Crossing the Go-to-C runtime boundary introduces structural latency and if you want to achieve peak performance then Rust is the ideal modern language to combine with C using zero-overhead and native FFI pointers. 
 
-Second, it completely eliminates localhost loopback network hops. While local TCP connections and Unix sockets (used by PHP-FPM and RoadRunner) are fast, they still incur unavoidable OS kernel context-switching and protocol serialization taxes. 
+Second, it eliminates the localhost loopback hop on the lanes that matter most. While local TCP connections and Unix sockets (used by PHP-FPM and RoadRunner) are fast, they still incur unavoidable OS kernel context-switching and protocol serialization taxes. The web server → PHP hop is gone by construction (PHP is linked in, not proxied to), and the `ephpm_db_*` / `ephpm_kv_*` SAPI functions reach the embedded database and KV store as direct function calls. Apps that keep their stock clients — `pdo_mysql` to `127.0.0.1:3306`, `phpredis` to `127.0.0.1:6379` — still cross loopback, but they cross it into *this* process instead of a separate daemon, so they trade a network round trip for a socket round trip and need no code changes. 
 
 * **Web Server:** Replaces Nginx by binding an in-process, high-concurrency [Tokio](https://tokio.rs) + [Hyper](https://docs.rs/hyper) network stack.
 * **Process Manager:** Replaces PHP-FPM with our custom, resource-aware `fpm_engine` thread manager.
@@ -22,11 +22,21 @@ Second, it completely eliminates localhost loopback network hops. While local TC
 ePHPm has also packed a highly robust and cloud-native feature set by drawing direct inspiration from other modern runtimes. This includes automatic ACME TLS certificate management and server-level middleware handlers (similar to RoadRunner and FrankenPHP), alongside an in-process SQL proxy with connection pooling and slow query logging inspired directly by ProxySQL. Combined with native cluster synchronization, OpenTelemetry tracing (OTLP), and container-aware runtime autotuning, ePHPm is fully prepared for modern cloud environments.
 
 ### How to use it:
-Run `ephpm dev` locally from your laptop (with native macOS and Windows support) and drop it straight into your CI/CD pipelines using our off-the-shelf OCI container images. You can also safely alias the binary to act as your global system PHP CLI with 100% scripting compatibility:
+Run `ephpm dev` locally from your laptop (with native macOS and Windows support) and drop it straight into your CI/CD pipelines using our off-the-shelf OCI container images. You can also alias the binary to act as your global system PHP CLI — it is the real Zend engine, not a reimplementation, so language semantics are PHP's own:
 
 ```bash
 alias php="ephpm php"
 ```
+
+The documented exceptions: `php -a` (interactive shell) and `php -S` (built-in
+server) are separate SAPIs that are not linked into the embed build and print a
+clear error, `-z` (Zend extension loading) is rejected exactly as php-cli
+rejects it, and the extension set is what was compiled into the binary
+(`bcmath, calendar, ctype, curl, dom, exif, fileinfo, filter, gd, hash, iconv,
+mbstring, mysqli, mysqlnd, openssl, pcntl, pcre, pdo, pdo_mysql, phar, posix,
+session, simplexml, sodium, tokenizer, xml, xmlreader, xmlwriter, zip, zlib`)
+plus whatever you load through `[php] extensions`. See
+[the `ephpm php` reference](https://ephpm.dev/reference/cli/php/).
 
 When you are ready to scale to production, you can deploy high-availability clusters using the exact same code paths running seamlessly from your local development machine, through CI, and straight into production. Need to use an external database just configure the SQL proxy and point your app to localhost:3306 to gain performance boosts from connection pooling.
 
@@ -48,7 +58,7 @@ This copies the binary to `/usr/local/bin/ephpm`, writes a default config to `/e
 
 ### Windows
 
-Download `ephpm.exe` from [Releases](https://github.com/ephpm/ephpm/releases). In an Administrator PowerShell:
+Download the Windows archive — `ephpm-v<version>+php<php-version>-windows-x86_64.tar.gz` — from [Releases](https://github.com/ephpm/ephpm/releases) and unpack it to get `ephpm.exe`. In an Administrator PowerShell, from the directory you unpacked it into:
 
 ```powershell
 .\ephpm.exe install
@@ -125,6 +135,8 @@ ePHPm gives you three database strategies. PHP apps keep their existing `pdo_mys
 ### 1. Already have a database? Use the built-in proxy
 
 If you have a MySQL or PostgreSQL server, ePHPm's DB proxy sits between PHP and your database with connection pooling, read/write splitting, and health checks. PHP connects to `localhost:3306` (or `localhost:5432` for Postgres) — the proxy handles the rest. The PostgreSQL proxy supports trust, md5, and SCRAM-SHA-256 authentication. SQL Server (TDS) proxying is not implemented.
+
+> **Postgres caveat.** `pdo_pgsql` is **not** among the extensions compiled into the released binary, so "no code changes" holds for MySQL apps out of the box but not for a stock Postgres app on a stock build. The PostgreSQL frontend is exercised today by non-PHP clients and by the `ephpm_db_*` bridge; to drive it from `pdo_pgsql` you need a build that includes the extension, or you can load it as a shared extension via `[php] extensions`.
 
 ```toml
 [db.mysql]
@@ -253,7 +265,7 @@ In a cluster, the KV store becomes a two-tier distributed store with no extra mo
 
 - **Small values** (< 512 bytes by default) ride the **gossip tier** — eventually consistent, replicated to every node, sub-millisecond reads everywhere.
 - **Large values** live on a **hashed data plane** — the owner is `hash(key)` modulo the sorted alive-node list (no consistent-hash ring), replicated to N nodes (configurable replication factor), fetched on demand via TCP, with optional hot-key promotion that caches frequently-fetched remote values locally.
-- **Failover** — when a node leaves the gossip view, the hash ring rebalances and owned keys migrate to the next replicas. No primary, no election — every node can read and write.
+- **Failover** — when a node leaves the gossip view, ownership recomputes against the new alive-node list and owned keys migrate to the next replicas. No primary, no election — every node can read and write.
 
 ```toml
 [cluster]
@@ -279,10 +291,10 @@ PHP → ephpm_kv_*  (in-process function call, ~ns)
 PHP → phpredis → :6379 (RESP2)  →  DashMap store
             cluster mode ↓
         gossip tier (small values, eventually consistent)
-        data plane  (large values, consistent-hash, replicated)
+        data plane  (large values, hashed ownership, replicated)
 ```
 
-The store is a single `DashMap<String, Entry>` with concurrent reads/writes, async TTL expiry, and an approximate-memory tracker driving eviction. Compression is applied per-value above a size threshold and is transparent on read. In clustered mode the same `Store` is wrapped with a routing layer that consults the hash ring for non-local keys.
+The store is a single `DashMap<String, Entry>` with concurrent reads/writes, async TTL expiry, and an approximate-memory tracker driving eviction. Compression is applied per-value above a size threshold and is transparent on read. In clustered mode the same `Store` is wrapped with a routing layer that recomputes `hash(key)` modulo the sorted alive-node list for non-local keys — plain modulo ownership, not a consistent-hash ring.
 
 ## Query Stats & Observability
 
@@ -358,14 +370,14 @@ A $3.69/mo Hetzner VM (2 ARM cores, 4 GB RAM) comfortably runs 20 WordPress blog
 
 - [Getting started](https://ephpm.dev/developer/getting-started/) — Prerequisites, building, IDE setup
 - [Architecture decisions](https://ephpm.dev/architecture/) — Language choice, crate design, PHP execution modes
-- [HTTP Server Architecture](https://ephpm.dev) — ZTS concurrency model, Tokio thread integration
+- [HTTP Server Architecture](https://ephpm.dev/architecture/http/) — ZTS concurrency model, Tokio thread integration
 - [Clustering](https://ephpm.dev/architecture/clustering/) — SWIM gossip, hashed key ownership, two-tier KV
 - [KV Store](https://ephpm.dev/architecture/kv-store/) — DashMap design, RESP2 integration, eviction loops
-- [Embedded SQL](https://ephpm.dev) — Litewire integration, Turso engine, zero-dependency data files
-- [DB Proxy & Pooling](https://ephpm.devdb-proxy/) — MySQL wire protocol routing, connection metrics
+- [Embedded SQL](https://ephpm.dev/architecture/database/engines/) — litewire integration, Turso engine, zero-dependency data files
+- [DB Proxy & Pooling](https://ephpm.dev/architecture/database/db-proxy/) — MySQL wire protocol routing, connection metrics
 - [CLI design](https://ephpm.dev/reference/cli/) — Command structure, clap routing, subcommand definitions
-- [Configuration Reference](https://ephpm.dev) — Exhaustive ephpm.toml key mapping and overrides
-- [Metrics Reference](https://ephpm.dev) — Prometheus endpoint specs and histogram allocation
+- [Configuration Reference](https://ephpm.dev/reference/config/) — Exhaustive ephpm.toml key mapping and overrides
+- [Metrics Reference](https://ephpm.dev/reference/metrics/) — Prometheus endpoint specs and histogram allocation
 - [Competitive Analysis](https://ephpm.dev/analysis/) — Feature map versus historical execution runtimes
 - [Performance Comparison](https://ephpm.dev/analysis/performance-comparison/) — In-process latency models vs FPM, RoadRunner, and Swoole
 
