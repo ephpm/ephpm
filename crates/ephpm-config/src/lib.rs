@@ -24,6 +24,42 @@ pub enum ConfigError {
 /// `Default` delegates to each section's own `Default` impl (all of
 /// `ServerConfig`/`PhpConfig`/... define one), so `Config::default()` yields
 /// the same values as loading an empty TOML file.
+///
+/// # Unknown keys are rejected — per section, not at the root
+///
+/// **Every section struct is `#[serde(deny_unknown_fields)]`**, so an
+/// unrecognized key under `[server]`, `[php]`, `[db.*]`, `[kv]`, `[cluster]`,
+/// `[opcache]` or `[[middleware]]` fails startup with an error naming the key.
+/// A key this binary does not declare is far more likely to be a typo, or a
+/// knob from a newer version, than something safe to ignore — and ignoring it
+/// silently turns an operator's explicit instruction into a no-op that every
+/// health check reports green. That is the defect #429 hit with
+/// `[db.sqlite.replication] per_site`; this generalizes the fix.
+///
+/// Knobs that were **removed** stay *declared* (see [`DeprecatedSqldConfig`]
+/// and `ReplicationConfig::cdc_experimental`) so upgrading configs keep
+/// parsing and get a warning or a migration message, not a bare "unknown
+/// field".
+///
+/// ## Two deliberate exceptions
+///
+/// 1. **This struct — the root — is lenient.** `Config::load` merges
+///    `Env::prefixed("EPHPM_")`, which is unfiltered: *every* `EPHPM_*`
+///    variable in the environment becomes a top-level key, including ones that
+///    are not configuration. ePHPm sets one itself — the Windows service
+///    wrapper exports `EPHPM_SERVICE_LOG_FILE` before the server starts, which
+///    figment turns into a top-level `service_log_file` — and the e2e harness
+///    sets `EPHPM_URL` / `EPHPM_BINARY`. A strict root would make ePHPm refuse
+///    to start as a Windows service. Nested sections have no such exposure:
+///    nothing sets an `EPHPM_*` variable containing the `__` nesting
+///    separator, so every key that reaches a section came from an operator
+///    asking for something. Pinned by
+///    `config_root_stays_lenient_so_non_config_env_vars_cannot_block_startup`.
+/// 2. **[`DeprecatedSqldConfig`] is lenient**, because tolerating keys this
+///    binary no longer declares is its entire purpose.
+///
+/// Adding a section means adding a case to
+/// `unknown_keys_are_rejected_in_every_strict_section`.
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -69,6 +105,7 @@ pub struct Config {
 /// order = 30
 /// ```
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MiddlewareMount {
     /// Module to run. Resolved in three steps:
     ///
@@ -134,6 +171,7 @@ impl MiddlewareMount {
 
 /// HTTP server configuration.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Address to listen on (e.g. "0.0.0.0:8080").
     #[serde(default = "default_listen")]
@@ -485,6 +523,7 @@ pub struct ServerConfig {
 /// are not cut off. The outer `[server.timeouts] request` ceiling still applies
 /// to the whole request exactly as it does to every handler.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyRuleConfig {
     /// Host matcher. `None` (omitted) or `"*"` matches any host. See the type
     /// docs for the exact/wildcard/suffix syntax.
@@ -652,6 +691,7 @@ fn validate_proxy_port(raw: &str, port: &str) -> Result<(), String> {
 
 /// Request limits configuration (`[server.request]`).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RequestConfig {
     /// Maximum request body size in bytes. Requests exceeding this limit
     /// receive a 413 Payload Too Large response.
@@ -701,6 +741,7 @@ pub struct RequestConfig {
 
 /// Connection timeout configuration (`[server.timeouts]`).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeoutsConfig {
     /// Time in seconds to receive the complete request headers after
     /// connection is established.
@@ -742,6 +783,7 @@ pub struct TimeoutsConfig {
 
 /// Response configuration (`[server.response]`).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseConfig {
     /// Enable gzip compression for text responses.
     ///
@@ -798,6 +840,7 @@ pub struct ResponseConfig {
 
 /// Static file serving configuration (`[server.static]`).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StaticConfig {
     /// Cache-Control header value for static file responses.
     /// Empty string means no Cache-Control header is added.
@@ -828,6 +871,7 @@ pub struct StaticConfig {
 
 /// PHP response `ETag` cache configuration (`[server.php_etag_cache]`).
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PhpETagCacheConfig {
     /// Enable `ETag` caching for PHP responses.
     ///
@@ -881,6 +925,7 @@ impl Default for PhpETagCacheConfig {
 
 /// Security configuration (`[server.security]`).
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Trusted reverse proxy addresses (CIDR notation).
     ///
@@ -1324,6 +1369,7 @@ impl ServerConfig {
 
 /// Logging configuration (`[server.logging]`).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Path to the access log file. Empty string disables access logging.
     ///
@@ -1342,6 +1388,7 @@ pub struct LoggingConfig {
 
 /// Metrics / observability configuration (`[server.metrics]`).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Enable the `/metrics` Prometheus endpoint.
     ///
@@ -1370,6 +1417,7 @@ fn default_metrics_path() -> String {
 
 /// Per-request diagnostics configuration (`[server.diagnostics]`).
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiagnosticsConfig {
     /// Enable the in-memory request timeline and its `/_ephpm/requests`
     /// endpoint. The server keeps the last 256 completed requests (method,
@@ -1453,6 +1501,7 @@ impl DiagnosticsConfig {
 /// raw options; the effective defaults documented per field below are what an
 /// absent field resolves to without the preview preset.
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Maximum total concurrent connections. New connections are rejected
     /// with a raw 503 at accept time (before TLS) when at capacity.
@@ -1569,6 +1618,7 @@ impl ResolvedLimits {
 /// small file content in memory. Avoids repeated filesystem `stat` and
 /// `read` calls for frequently accessed static files.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileCacheConfig {
     /// Enable the open file cache.
     ///
@@ -1653,6 +1703,7 @@ fn default_file_cache_precompress() -> bool {
 ///
 /// If both `cert`/`key` and `domains` are set, manual mode takes precedence.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     // --- Manual mode ---
     /// Path to the PEM-encoded certificate chain file.
@@ -1881,6 +1932,7 @@ impl TlsConfig {
 /// certificates are **not** wired into the QUIC endpoint yet — see
 /// [`Http3Config::enabled`].
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct Http3Config {
     /// Enable the HTTP/3 (QUIC) listener.
     ///
@@ -1947,6 +1999,7 @@ impl Default for Http3Config {
 /// HTTP/1.1 connection for `ws:`/`wss:` regardless — so this is not a
 /// limitation clients encounter in practice.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct WebSocketConfig {
     /// Enable native WebSocket support.
     ///
@@ -2046,6 +2099,7 @@ impl Default for WebSocketConfig {
 /// real database. PHP connects to `127.0.0.1:3306` (or the configured
 /// `listen` address) — it never talks to the database directly.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DbConfig {
     /// `MySQL` proxy configuration.
     #[serde(default)]
@@ -2267,6 +2321,16 @@ impl Default for SqliteProxyConfig {
 /// configure. Every field here is parsed-but-ignored purely so an existing
 /// config does not hard-fail on upgrade; startup logs a warning when the
 /// section (or `write_permits`) is present. Delete the section.
+///
+/// # Deliberately NOT `deny_unknown_fields`
+///
+/// Every other section rejects unknown keys (see [`Config`]). This one must
+/// not: it exists *only* so a config written for v0.6.x still parses, and its
+/// knobs were deleted in v0.7.0. Rejecting a key we no longer declare would
+/// break exactly the upgrade path the block was kept for — the three fields
+/// below are the ones worth warning about, not an exhaustive record of what
+/// sqld once accepted. Pinned by
+/// `deprecated_sqld_block_tolerates_its_own_removed_keys`.
 #[derive(Debug, Deserialize, Clone, Default)]
 pub struct DeprecatedSqldConfig {
     /// Removed: sqld's Hrana HTTP listen address. Ignored.
@@ -2420,6 +2484,7 @@ fn default_max_snapshot_bytes() -> u64 {
 
 /// Configuration for a single database backend (`MySQL` or `PostgreSQL`).
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct DbBackendConfig {
     /// Primary database URL.
     ///
@@ -2534,6 +2599,7 @@ impl Default for DbBackendConfig {
 
 /// Read replica configuration for a database backend.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ReplicasConfig {
     /// Replica database URLs. Reads are distributed across these;
     /// writes always go to the primary.
@@ -2542,6 +2608,7 @@ pub struct ReplicasConfig {
 
 /// Read/write splitting configuration (`[db.read_write_split]`).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReadWriteSplitConfig {
     /// Enable read/write splitting. Requires at least one backend with replicas.
     ///
@@ -2587,6 +2654,7 @@ impl Default for ReadWriteSplitConfig {
 
 /// Query analysis and optimization configuration (`[db.analysis]`).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DbAnalysisConfig {
     /// Enable query digest tracking and Prometheus metrics.
     ///
@@ -2663,6 +2731,7 @@ fn default_query_stats_enabled() -> bool {
 
 /// KV store configuration (`[kv]`).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KvConfig {
     /// Maximum memory in bytes for the KV store. Supports suffixes:
     /// plain number (bytes), or human-readable like `"256MB"`.
@@ -2773,6 +2842,7 @@ impl KvConfig {
 ///   PHP use the `ephpm_kv_*` SAPI functions, which are namespaced per vhost
 ///   regardless of this listener.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KvRedisCompatConfig {
     /// Enable the RESP protocol listener. When `false`, the KV store is
     /// only accessible via the `ephpm_kv_*` PHP functions (recommended
@@ -2908,6 +2978,7 @@ pub enum OverloadPolicy {
 
 /// PHP runtime configuration.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PhpConfig {
     /// Maximum PHP script execution time, in seconds (`0` = unlimited).
     ///
@@ -5127,6 +5198,7 @@ fn default_replication_role() -> String {
 ///
 /// Enables gossip-based peer discovery using the SWIM protocol.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterConfig {
     /// Enable gossip-based clustering.
     #[serde(default)]
@@ -5225,6 +5297,7 @@ impl Default for ClusterConfig {
 /// startup log noise above `debug!`. Adding this block to your config
 /// is not itself an opt-in — a feature elsewhere must ask for it.
 #[derive(Debug, Deserialize, Clone, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterChannelConfig {
     /// Listen address for the cluster channel TCP listener.
     ///
@@ -5292,6 +5365,7 @@ impl ClusterConfig {
 
 /// KV clustering configuration (`[cluster.kv]`).
 #[derive(Debug, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct ClusterKvConfig {
     /// Maximum value size (bytes) for the gossip tier.
     #[serde(default = "default_small_key_threshold")]
@@ -5380,6 +5454,7 @@ impl Default for ClusterKvConfig {
 /// `opcache:version:<vhost>` changes. See
 /// `site/content/roadmap/opcache-clustering.md` for the design.
 #[derive(Debug, Default, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct OpcacheConfig {
     /// Watch the KV store for cluster-wide invalidation events.
     ///
@@ -7461,6 +7536,195 @@ listen = "0.0.0.0:8080"
             sqlite.replication.per_site,
             "an EPHPM_ env override must still reach a deny_unknown_fields struct"
         );
+    }
+
+    // ── strict-key parsing, every section ───────────────────────────────
+    //
+    // Extends the `[db.sqlite]` strictness above to the rest of the config.
+    // Same defect, same reasoning: a key this binary does not know is far more
+    // likely to be a typo — or a knob from a newer version — than something
+    // safe to drop on the floor, and dropping it silently turns an operator's
+    // explicit instruction into a no-op that every health check reports green.
+    //
+    // Two structs are deliberately NOT strict; see `config_root_stays_lenient`
+    // and `deprecated_sqld_block_tolerates_its_own_removed_keys` for why.
+
+    /// Every section that is `deny_unknown_fields`, with a minimal valid block
+    /// plus one unknown key. Each case must fail the load *and* name the key.
+    ///
+    /// Table-driven so adding a section to the config means adding one line
+    /// here, rather than quietly shipping a section that still swallows typos.
+    #[test]
+    fn unknown_keys_are_rejected_in_every_strict_section() {
+        // (description, toml, the key the error must name)
+        let cases: &[(&str, &str, &str)] = &[
+            ("[server]", "[server]\nlistens = \"0.0.0.0:8080\"\n", "listens"),
+            ("[server.request]", "[server.request]\nmax_body_sizes = 1024\n", "max_body_sizes"),
+            ("[server.timeouts]", "[server.timeouts]\nrequests = 30\n", "requests"),
+            ("[server.response]", "[server.response]\nbogus_key = 1\n", "bogus_key"),
+            ("[server.static]", "[server.static]\nbogus_key = 1\n", "bogus_key"),
+            ("[server.php_etag_cache]", "[server.php_etag_cache]\nbogus_key = 1\n", "bogus_key"),
+            ("[server.security]", "[server.security]\nbogus_key = 1\n", "bogus_key"),
+            ("[server.logging]", "[server.logging]\nbogus_key = 1\n", "bogus_key"),
+            ("[server.metrics]", "[server.metrics]\nbogus_key = 1\n", "bogus_key"),
+            ("[server.diagnostics]", "[server.diagnostics]\nbogus_key = 1\n", "bogus_key"),
+            ("[server.limits]", "[server.limits]\nbogus_key = 1\n", "bogus_key"),
+            ("[server.file_cache]", "[server.file_cache]\nbogus_key = 1\n", "bogus_key"),
+            ("[server.tls]", "[server.tls]\nbogus_key = 1\n", "bogus_key"),
+            ("[server.http3]", "[server.http3]\nbogus_key = 1\n", "bogus_key"),
+            ("[server.websocket]", "[server.websocket]\nbogus_key = 1\n", "bogus_key"),
+            ("[server.tenant_network]", "[server.tenant_network]\nbogus_key = 1\n", "bogus_key"),
+            (
+                "[[server.proxy]]",
+                "[[server.proxy]]\nupstream = \"http://127.0.0.1:9000\"\nbogus_key = 1\n",
+                "bogus_key",
+            ),
+            ("[db]", "[db]\nbogus_key = 1\n", "bogus_key"),
+            (
+                "[db.mysql]",
+                "[db.mysql]\nurl = \"mysql://u:p@127.0.0.1:3306/d\"\nbogus_key = 1\n",
+                "bogus_key",
+            ),
+            (
+                "[db.postgres]",
+                "[db.postgres]\nurl = \"postgres://u:p@127.0.0.1:5432/d\"\nbogus_key = 1\n",
+                "bogus_key",
+            ),
+            (
+                "[db.mysql.replicas]",
+                "[db.mysql]\nurl = \"mysql://u:p@127.0.0.1:3306/d\"\n\
+                 \n[db.mysql.replicas]\nurls = []\nbogus_key = 1\n",
+                "bogus_key",
+            ),
+            ("[db.read_write_split]", "[db.read_write_split]\nbogus_key = 1\n", "bogus_key"),
+            ("[db.analysis]", "[db.analysis]\nbogus_key = 1\n", "bogus_key"),
+            ("[kv]", "[kv]\nbogus_key = 1\n", "bogus_key"),
+            ("[kv.redis_compat]", "[kv.redis_compat]\nbogus_key = 1\n", "bogus_key"),
+            ("[php]", "[php]\nmemory_limits = \"256M\"\n", "memory_limits"),
+            ("[cluster]", "[cluster]\nenabled_typo = true\n", "enabled_typo"),
+            ("[cluster.channel]", "[cluster.channel]\nbogus_key = 1\n", "bogus_key"),
+            ("[cluster.kv]", "[cluster.kv]\nbogus_key = 1\n", "bogus_key"),
+            ("[opcache]", "[opcache]\nbogus_key = 1\n", "bogus_key"),
+            (
+                "[[middleware]]",
+                "[[middleware]]\nlibrary = \"jwt\"\norder = 10\nbogus_key = 1\n",
+                "bogus_key",
+            ),
+        ];
+
+        for (section, toml, key) in cases {
+            let err = load_error(toml);
+            assert!(
+                err.contains(key),
+                "{section}: the error must name the unknown key {key:?} so an operator can \
+                 find the typo, got: {err}"
+            );
+        }
+    }
+
+    /// Strictness must not cost the `EPHPM_` env-var override lane. Figment's
+    /// `Env::prefixed("EPHPM_").split("__")` feeds the *same* structs as the
+    /// TOML provider, so a strict struct that rejected its own env keys would
+    /// break every containerized deployment.
+    ///
+    /// The `[db.sqlite]` lane is covered above; this pins a nested struct under
+    /// `[server]` and one under `[cluster]`, the two deepest env paths in
+    /// common use.
+    #[test]
+    fn env_var_overrides_still_reach_strict_nested_structs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+
+        let _env = EnvVars::many([
+            ("EPHPM_SERVER__TIMEOUTS__REQUEST", Some("600")),
+            ("EPHPM_CLUSTER__ENABLED", Some("true")),
+        ]);
+        let config = Config::load(&file).unwrap();
+        assert_eq!(
+            config.server.timeouts.request, 600,
+            "an EPHPM_ env override must still reach a deny_unknown_fields struct"
+        );
+        assert!(config.cluster.enabled);
+    }
+
+    /// **The top-level `Config` must stay lenient**, and this is the reason.
+    ///
+    /// `Env::prefixed("EPHPM_")` is unfiltered, so *every* `EPHPM_*` variable in
+    /// the environment becomes a top-level key — including ones that are not
+    /// config at all. ePHPm sets one itself: the Windows service wrapper exports
+    /// `EPHPM_SERVICE_LOG_FILE` before the server starts
+    /// (`crates/ephpm/src/service/windows.rs`), which figment turns into a
+    /// top-level `service_log_file`. Making the root strict would make ePHPm
+    /// refuse to start as a Windows service. The e2e harness vars (`EPHPM_URL`,
+    /// `EPHPM_BINARY`, …) are the same class.
+    ///
+    /// The nested sections have no such problem: nothing sets an `EPHPM_*`
+    /// variable containing `__`, so every key that reaches a section came from
+    /// an operator asking for something.
+    #[test]
+    fn config_root_stays_lenient_so_non_config_env_vars_cannot_block_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
+
+        let _env = EnvVars::set("EPHPM_SERVICE_LOG_FILE", "C:/ProgramData/ephpm/ephpm.log");
+        let config = Config::load(&file)
+            .expect("a non-config EPHPM_* variable must not stop the server from starting");
+        assert_eq!(config.server.listen, "0.0.0.0:8080");
+
+        // Same via the TOML provider: an unknown *top-level* key is tolerated.
+        let config = load_toml("bogus_root_key = 1\n[server]\nlisten = \"0.0.0.0:8080\"\n");
+        assert_eq!(config.server.listen, "0.0.0.0:8080");
+    }
+
+    /// `[db.sqlite.sqld]` is the one section that must keep swallowing unknown
+    /// keys. It exists *only* so configs written for v0.6.x still parse; its
+    /// own knobs were deleted in v0.7.0, so rejecting a key we no longer
+    /// declare would break exactly the upgrade path the block was kept for.
+    #[test]
+    fn deprecated_sqld_block_tolerates_its_own_removed_keys() {
+        let config = load_toml(
+            "[db.sqlite]\n\
+             dir = \"/var/lib/ephpm/sites\"\n\
+             \n\
+             [db.sqlite.sqld]\n\
+             write_permits = 4\n\
+             some_forgotten_sqld_knob = \"whatever\"\n",
+        );
+        let sqlite = config.db.sqlite.expect("sqlite section present");
+        assert_eq!(sqlite.sqld.and_then(|s| s.write_permits), Some(4));
+    }
+
+    /// Every config shipped in this repo must load under the strict structs.
+    ///
+    /// Strictness is only safe if what we hand people actually parses. This
+    /// catches the embarrassing failure mode directly: an example config, a
+    /// smoke-test config, or the reference `ephpm.toml` carrying a key no
+    /// struct declares.
+    #[test]
+    fn every_config_shipped_in_this_repo_loads() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let shipped = [
+            "ephpm.toml",
+            "examples/php-middleware/demo/ephpm.toml",
+            "examples/rust-middleware/demo/ephpm.toml",
+            "examples/wordpress-compose/ephpm.toml",
+            "tests/ephpm-test.toml",
+            "tests/smoke/ephpm-laravel.toml",
+            "tests/smoke/ephpm-symfony.toml",
+            "tests/smoke/ephpm-wordpress.toml",
+        ];
+        for rel in shipped {
+            let path = root.join(rel);
+            assert!(path.exists(), "{rel} is listed here but missing from the repo");
+            Config::load(&path).unwrap_or_else(|e| {
+                panic!(
+                    "{rel} does not load. If this is an unknown-field error, either the config \
+                     has a typo or a knob was removed without keeping a declared shim: {e}"
+                )
+            });
+        }
     }
 
     #[test]
