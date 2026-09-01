@@ -285,9 +285,17 @@ async fn transaction_integrity() {
 
 // ── Smart reset_strategy tests ───────────────────────────────────────────────
 //
-// These exercise the `proxy_routing_loop` path (per-query routing + dirty
-// tracking). The `Always` tests above run through `proxy_bidirectional`, so
-// without these the Smart code path is never integration-tested.
+// These exercise the dirty-tracking half of `Smart`: the strategy is consulted
+// once per session, when the backend goes back to the pool, and only a session
+// the client dirtied pays for a `COM_RESET_CONNECTION`.
+//
+// They deliberately use `start_proxy` (no replicas), which is what every
+// `[db.mysql]` deployment without `[db.read_write_split]` gets. On that path
+// `Smart` and `Always` relay identical bytes through
+// `proxy_bidirectional_sniff` and differ *only* in whether the reset is sent on
+// return — see `MySqlProxy::handle_client`. Before #97 `Smart` alone selected
+// `proxy_routing_loop`, which is what made it hang; `start_proxy_rw_split`
+// below is now the only way to reach that per-command path.
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires MYSQL_TEST_URL — see .github/workflows/db-integration.yml"]
@@ -571,4 +579,114 @@ async fn multi_result_call_does_not_desync_the_pooled_backend() {
     .await;
 
     result.expect("a multi-result CALL desynchronised the proxy (timed out)");
+}
+
+// ── The WordPress bootstrap query on the Smart default (issues #97, #425) ────
+
+/// `WordPress` opens with `SELECT @@max_allowed_packet, @@wait_timeout` — a
+/// two-column, one-row result set — and before #97 that hung on the shipped
+/// `reset_strategy = "smart"` default. `examples/wordpress-compose/ephpm.toml`
+/// pinned `"always"` to dodge it and kept the warning for two months after the
+/// fix landed; #425 is the ticket that removed it, and this is the test that
+/// keeps the claim from having to be re-verified by hand.
+///
+/// The shape matters more than the query text. The original failure was
+/// `forward_mysql_response` returning at the *intermediate* EOF that closes the
+/// column-definition block, so the row packets stayed on the backend socket —
+/// which only bites when a result set has both column definitions and rows.
+/// `SELECT 1` does not exercise it; two columns and a row do.
+///
+/// `max_connections = 1` is load-bearing twice over: every session provably
+/// draws the same backend, and the sessions alternate between the two `Smart`
+/// return branches — a pure-read session (returned *without* a reset) and a
+/// dirtied one (returned with `COM_RESET_CONNECTION`). Leftover bytes from
+/// either branch would desynchronise the next session, and a desynchronised
+/// session hangs rather than errors, so the whole body is bounded.
+///
+/// Scope, so nobody over-reads this: the client here is `mysql_async`, not
+/// `pdo_mysql`. Nothing in CI drives the `[db.mysql]` proxy from PHP — the one
+/// `pdo_mysql` e2e suite (`rw_split`) points at the embedded SQLite listener,
+/// not a real MySQL backend — so the `pdo_mysql` half of #425 was verified by
+/// hand (WordPress on `examples/wordpress-compose`) and is not regression-
+/// guarded. What *is* guarded here is the wire shape that actually broke.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires MYSQL_TEST_URL — see .github/workflows/db-integration.yml"]
+async fn wordpress_bootstrap_query_smart_survives_session_churn() {
+    let Some(url) = mysql_url() else {
+        println!("MYSQL_TEST_URL not set — skipping");
+        return;
+    };
+
+    let config = PoolConfig {
+        min_connections: 1,
+        max_connections: 1,
+        idle_timeout: Duration::from_secs(60),
+        max_lifetime: Duration::from_secs(300),
+        pool_timeout: Duration::from_secs(5),
+        health_check_interval: Duration::from_secs(30),
+    };
+    let addr = start_proxy(&url, config, ResetStrategy::Smart).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        for round in 0..6 {
+            // A pure-read session: `Smart` returns this backend to the pool
+            // *without* a reset, so anything left behind survives into the
+            // next iteration.
+            {
+                let pool = mysql_async::Pool::new(proxy_opts(&addr));
+                let mut conn = pool.get_conn().await.unwrap();
+
+                let rows: Vec<(u64, u64)> =
+                    conn.query("SELECT @@max_allowed_packet, @@wait_timeout").await.unwrap();
+                assert_eq!(rows.len(), 1, "round {round}: expected exactly one row");
+                assert!(rows[0].0 > 0, "round {round}: @@max_allowed_packet must be non-zero");
+                assert!(rows[0].1 > 0, "round {round}: @@wait_timeout must be non-zero");
+
+                // A second command on the same session proves the first
+                // response was consumed to its last byte.
+                let echo: Vec<(i32,)> = conn.query("SELECT 7").await.unwrap();
+                assert_eq!(echo[0].0, 7, "round {round}: follow-up command read the wrong bytes");
+
+                drop(conn);
+                pool.disconnect().await.unwrap();
+            }
+
+            // A dirtied session on the same single backend: `Smart` resets this
+            // one on return, which is the other half of the branch.
+            {
+                let pool = mysql_async::Pool::new(proxy_opts(&addr));
+                let mut conn = pool.get_conn().await.unwrap();
+                conn.query_drop(format!("SET @_ephpm_i425 = {round}")).await.unwrap();
+                let rows: Vec<(Option<i64>,)> = conn.query("SELECT @_ephpm_i425").await.unwrap();
+                assert_eq!(
+                    rows[0].0,
+                    Some(i64::from(round)),
+                    "round {round}: session continuity broken — the backend was swapped mid-session"
+                );
+                drop(conn);
+                pool.disconnect().await.unwrap();
+            }
+
+            // Let the proxy finish parking (and resetting) the backend before
+            // the next round draws it again.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // The dirtied sessions above must not have leaked into a fresh one.
+        let pool = mysql_async::Pool::new(proxy_opts(&addr));
+        let mut conn = pool.get_conn().await.unwrap();
+        let rows: Vec<(Option<i64>,)> = conn.query("SELECT @_ephpm_i425").await.unwrap();
+        assert_eq!(
+            rows[0].0, None,
+            "@_ephpm_i425 leaked across sessions — Smart skipped a reset it owed"
+        );
+        drop(conn);
+        pool.disconnect().await.unwrap();
+    })
+    .await;
+
+    result.expect(
+        "the WordPress bootstrap query hung on reset_strategy = \"smart\" (timed out) — \
+         this is the #97 regression that #425 verified was gone",
+    );
 }

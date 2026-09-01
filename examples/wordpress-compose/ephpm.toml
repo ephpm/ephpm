@@ -10,22 +10,19 @@ document_root = "/app/wordpress"
 url             = "mysql://wordpress:wordpress@mysql:3306/wordpress"
 listen          = "127.0.0.1:3306"
 max_connections = 20
-# NOT the default. The shipped default is "smart" (reset after any non-SELECT);
-# this example overrides it to "always".
+# reset_strategy is deliberately not set — this example runs the shipped
+# default, "smart" (reset the pooled backend only after a session that issued
+# something other than a SELECT).
 #
-# Provenance: the override was added in #94 (2026-06-19) against v0.2.x-era
-# proxy code, with a note that "smart" hung when pdo_mysql was the client and a
-# promise to file an issue that was never filed. The proxy has changed
-# substantially since, and the claim has NOT been re-verified against current
-# code — treat it as unconfirmed history, not a known-current defect. The Smart
-# path does now have integration coverage
-# (crates/ephpm-db/tests/proxy_integration.rs::basic_query_roundtrip_smart and
-# ::session_isolation_smart), but those drive the proxy with mysql_async rather
-# than pdo_mysql, so the exact combination named above is still uncovered.
-#
-# TODO: run this stack with the line below removed; either fix the hang or drop
-# the override so the example demonstrates the shipped default.
-reset_strategy  = "always"
+# History, because this line used to say the opposite: #94 (2026-06-19) pinned
+# "always" here to dodge a hang that "smart" hit on WordPress's very first
+# query. #97 (2026-06-23) fixed it — `forward_mysql_response` was stopping at
+# the intermediate EOF that ends the column-definition block, so a two-column
+# result set left its rows on the backend socket and the client waited forever.
+# The override outlived the fix by two months. #425 re-verified the current
+# proxy against this exact stack (WordPress installed and served over
+# pdo_mysql, "smart" vs "always" vs "never", concurrent load): no hang, and
+# "smart" isolates sessions exactly as "always" does.
 
 # Note: no [kv.redis_compat] either. WordPress's Redis Object Cache talks
 # directly to the standalone `redis` container (see wp-config.php), not to
