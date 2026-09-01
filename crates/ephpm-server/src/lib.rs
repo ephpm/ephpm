@@ -2102,6 +2102,17 @@ async fn start_db_proxies(
         validate_sqlite_engine(&sqlite_config.engine)?;
         warn_on_removed_sqlite_knobs(sqlite_config);
 
+        // One unambiguous line naming the resolved mode, emitted at the single
+        // point where the branch is taken. Operators (and the benchmark gates)
+        // assert on this rather than inferring the mode from the presence or
+        // absence of other log lines: the modes differ in tenancy and in
+        // durability, and "which one am I actually running?" must never be a
+        // question you answer by elimination.
+        tracing::info!(
+            mode = sqlite_mode_label(config, cluster.is_some()),
+            "embedded SQLite mode selected"
+        );
+
         if is_per_site_clustered(config, cluster.is_some()) {
             // Per-site CLUSTERED mode: one replicated Turso database per
             // virtual host, HRW ownership. Tested BEFORE `is_clustered_sqlite`
@@ -2203,6 +2214,29 @@ fn warn_on_removed_sqlite_knobs(sqlite_config: &ephpm_config::SqliteConfig) {
              only clustered SQLite replication path and is always active in clustered mode. \
              This knob is ignored; delete it."
         );
+    }
+}
+
+/// The resolved embedded-SQLite mode, as a stable label for the startup log.
+///
+/// Mirrors the branch order in `start_db_proxies` exactly — most specific
+/// first — so the logged mode can never disagree with the mode that runs. The
+/// four values are a committed interface: operators and benchmark gates assert
+/// on them.
+///
+/// * `per-site-clustered` — one **replicated** database per virtual host.
+/// * `clustered` — one replicated database shared by every virtual host.
+/// * `per-site` — one local database per virtual host, no replication.
+/// * `single-node` — one local database, no replication.
+fn sqlite_mode_label(config: &Config, cluster_enabled: bool) -> &'static str {
+    if is_per_site_clustered(config, cluster_enabled) {
+        "per-site-clustered"
+    } else if config.db.sqlite.as_ref().is_some_and(|s| is_clustered_sqlite(s, cluster_enabled)) {
+        "clustered"
+    } else if is_per_site_sqlite(config, cluster_enabled) {
+        "per-site"
+    } else {
+        "single-node"
     }
 }
 
@@ -2407,9 +2441,16 @@ fn wire_per_site_clustered_db(
         )
     })?;
 
-    // The open hook forwards each newly-active site to the replication driver.
+    // Announces a newly-active site to the per-site replication driver.
+    //
+    // Shared by BOTH activation paths, which is the point: a site becomes
+    // active on this node either by having its database opened locally
+    // (`SiteBackends`, the owner and stock-`pdo_mysql` routes) or by being
+    // forwarded to its owner (`ClusteredSiteResolver`, the bridge route on a
+    // non-owner). Wiring only the first left a bridge-only node forwarding a
+    // site it never replicated — see `sql_forward::ClusteredSiteResolver`.
     let (site_tx, site_events) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let on_open: site_backends::SiteOpenHook = Arc::new(move |site: &str| {
+    let note_active: site_backends::SiteOpenHook = Arc::new(move |site: &str| {
         // The driver dedups; a full channel is impossible (unbounded), and a
         // dropped receiver only means the CDC path is not running.
         let _ = site_tx.send(site.to_string());
@@ -2420,7 +2461,7 @@ fn wire_per_site_clustered_db(
         sqlite.max_open_dbs,
         query_stats.clone(),
         tokio::runtime::Handle::current(),
-        on_open,
+        Arc::clone(&note_active),
     )?;
 
     // The bridge resolves each request's backend through the forwarding
@@ -2433,6 +2474,7 @@ fn wire_per_site_clustered_db(
             channel.clone(),
             cluster.self_node().id,
             tokio::runtime::Handle::current(),
+            note_active,
         ));
     ephpm_php::PhpRuntime::set_db_backend_resolver(resolver, tokio::runtime::Handle::current());
 
@@ -3081,18 +3123,22 @@ mod lib_tests {
             PerSiteClustered,
         }
 
-        /// Resolve the mode the way `start_db_proxies` does — per-site
-        /// clustered first (it is a strict subset of clustered), then
-        /// clustered, then single-node per-site.
+        /// Resolve the mode via the **production** label function rather than
+        /// a copy of its branch order.
+        ///
+        /// `sqlite_mode_label` is what `start_db_proxies` logs as the effective
+        /// mode, so routing the matrix through it pins two things at once: that
+        /// exactly one mode holds per config, and that the label an operator
+        /// (or a benchmark gate) reads at startup names the mode that actually
+        /// runs. A re-implementation here could agree with the matrix while
+        /// disagreeing with the log, which is the failure this guards.
         fn resolve_mode(config: &Config, cluster: bool) -> Mode {
-            if is_per_site_clustered(config, cluster) {
-                Mode::PerSiteClustered
-            } else if config.db.sqlite.as_ref().is_some_and(|s| is_clustered_sqlite(s, cluster)) {
-                Mode::ClusteredSingleDb
-            } else if is_per_site_sqlite(config, cluster) {
-                Mode::PerSiteSingleNode
-            } else {
-                Mode::SingleNode
+            match sqlite_mode_label(config, cluster) {
+                "per-site-clustered" => Mode::PerSiteClustered,
+                "clustered" => Mode::ClusteredSingleDb,
+                "per-site" => Mode::PerSiteSingleNode,
+                "single-node" => Mode::SingleNode,
+                other => panic!("unknown [db.sqlite] mode label: {other:?}"),
             }
         }
 

@@ -115,9 +115,20 @@ use tokio::sync::RwLock;
 
 use crate::tracked_backend::TrackedBackend;
 
-/// Callback invoked with a site key when that site's database is first
-/// opened (per-site clustered mode's replication-working-set hook). See
-/// [`SiteBackends::new_clustered`].
+/// Announces that a site is now **active on this node** — per-site clustered
+/// mode's replication-working-set hook.
+///
+/// Named for its original (and still primary) trigger: this registry opening a
+/// site's database, wired via [`SiteBackends::new_clustered`]. But a database
+/// open is not the only way a node starts serving a site. In per-site clustered
+/// mode a node may serve a site purely by *forwarding* to the site's owner,
+/// never opening it locally, and such a node must still replicate it — so
+/// `ClusteredSiteResolver` (see [`crate::sql_forward`]) is handed the **same**
+/// hook and fires it on its forwarding branch.
+///
+/// Both callers must therefore share one hook instance. Downstream
+/// (`ensure_site_driver`) dedups, so firing it repeatedly, or again after an
+/// evict/re-open, is harmless.
 pub type SiteOpenHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 /// One site's permanent registry slot: its database (when open) plus the lock
