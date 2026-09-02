@@ -61,13 +61,11 @@ impl SingleNodeFixture {
     /// `docroot` is the directory ephpm will serve — typically
     /// `crates/ephpm-e2e/tests/docroot` or its own scratch dir.
     pub async fn start(ephpm_binary: &Path, docroot: &Path) -> Result<Self> {
-        // Reserve loopback ports by opening + immediately closing a listener.
-        // Two ephpm instances started in quick succession could race for the
-        // same port; the OS may hand out the same port before ephpm binds it.
-        // That's acceptable for a test fixture — worst case, the health poll
-        // times out and the caller retries.
-        let http_port = reserve_loopback_port().await?;
-        let mysql_port = reserve_loopback_port().await?;
+        // Ports stay *held* by live probe sockets (see `PortReserver`) until
+        // the moment this fixture spawns its child, so nothing else on the box
+        // can be handed one in between.
+        let lease = PortReserver::new().lease(&[PortKind::Tcp, PortKind::Tcp]).await?;
+        let (http_port, mysql_port) = (lease.port(0), lease.port(1));
 
         let tmp = tempfile::Builder::new()
             .prefix("ephpm-e2e-single-")
@@ -88,6 +86,8 @@ impl SingleNodeFixture {
         let stdout = fs::File::create(tmp.path().join("stdout.log")).context("open stdout log")?;
         let stderr = fs::File::create(tmp.path().join("stderr.log")).context("open stderr log")?;
 
+        // Hand the ports off: release the probes and spawn in the same breath.
+        lease.release();
         let mut child = Command::new(ephpm_binary)
             .args(["serve", "--config"])
             .arg(&config_path)
@@ -160,7 +160,8 @@ impl ClusterFixture {
             return Err(anyhow!("cluster fixture needs at least 2 nodes, got {size}"));
         }
 
-        // Reserve all port sets before spawning so overlap is impossible.
+        // Reserve all port sets before spawning so overlap is impossible. Each
+        // set stays *held* by its own probe sockets until that node spawns.
         let port_sets = reserve_cluster_ports(size).await?;
 
         let join_addrs: Vec<String> =
@@ -172,7 +173,7 @@ impl ClusterFixture {
             .context("create tempdir")?;
 
         let mut nodes = Vec::with_capacity(size);
-        for (i, ports) in port_sets.iter().enumerate() {
+        for (i, ports) in port_sets.into_iter().enumerate() {
             let node_dir = tmp.path().join(format!("node-{i}"));
             fs::create_dir_all(&node_dir).context("create node dir")?;
             let data_dir = node_dir.join("data");
@@ -204,6 +205,9 @@ impl ClusterFixture {
             let stderr =
                 fs::File::create(node_dir.join("stderr.log")).context("open stderr log")?;
 
+            // Hand this node's ports off: release its probes, spawn at once.
+            let http_port = ports.http;
+            ports.lease.release();
             let child = Command::new(ephpm_binary)
                 .args(["serve", "--config"])
                 .arg(&config_path)
@@ -214,7 +218,7 @@ impl ClusterFixture {
 
             nodes.push(ClusterFixtureNode {
                 child: Some(child),
-                base_url: format!("http://127.0.0.1:{}", ports.http),
+                base_url: format!("http://127.0.0.1:{http_port}"),
             });
         }
 
@@ -267,28 +271,8 @@ struct ClusterPorts {
     mysql: u16,
     gossip: u16,
     kv_data: u16,
-}
-
-// ── helpers ────────────────────────────────────────────────────────────────
-
-/// Ask the kernel for a free loopback port by binding to `127.0.0.1:0` and
-/// then dropping the listener.
-///
-/// There is an inherent TOCTOU here — the port may be re-issued before ephpm
-/// binds it — and unlike the in-process proxy tests (which now bind once and
-/// hand the live listener to `run_on`) it cannot be engineered away: the
-/// ports cross a process boundary through a generated config file, and
-/// `ephpm serve` has no way to inherit an already-bound socket. The race
-/// fails closed rather than cross-wired: a stolen port makes the child's own
-/// bind fail and the child exit, which `wait_for_health` detects and reports
-/// immediately instead of health-probing a port someone else may now own.
-/// For a fixture that runs one topology at a time this is acceptable in
-/// practice.
-async fn reserve_loopback_port() -> Result<u16> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind :0")?;
-    let port = listener.local_addr().context("local_addr")?.port();
-    drop(listener);
-    Ok(port)
+    /// Probes holding this node's ports until it is spawned. See [`PortLease`].
+    lease: PortLease,
 }
 
 /// Ports past `[cluster] bind` that a node claims without anyone reserving
@@ -322,38 +306,171 @@ struct PortProbes {
     udp: Vec<tokio::net::UdpSocket>,
 }
 
-/// Reserve a non-overlapping port set per node.
+/// What a reserved loopback port will actually be bound as by the child.
 ///
-/// Two things here are easy to get wrong, and both did (issue #239):
+/// The protocol matters: a port that accepts a TCP bind can still refuse a UDP
+/// one — on Windows, Hyper-V/WinNAT reserve large UDP-only ranges and the bind
+/// fails with `WSAEACCES` (issue #239) — so a gossip port has to be probed with
+/// a real UDP socket, not a TCP one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PortKind {
+    /// A TCP listener: HTTP, MySQL, Hrana, KV data plane, cluster channel.
+    Tcp,
+    /// A UDP socket: gossip, where the cluster-channel port is configured
+    /// explicitly (`[cluster.channel] listen`) rather than derived.
+    Udp,
+    /// A gossip (UDP) port whose **derived** cluster-channel port is claimed
+    /// alongside it.
+    ///
+    /// `ephpm-cluster` derives the channel listener from the gossip bind
+    /// address as `gossip_socket_addr().port() + 2` (see `cluster_channel.rs`),
+    /// so a node with gossip on `G` also owns `G + 2`. Nobody configures that
+    /// port, so nobody would otherwise probe it — and the kernel hands out
+    /// ephemeral ports consecutively, which is how node 0's `G + 2` once landed
+    /// on node 1's HTTP port and killed it with EADDRINUSE (issue #239). Use
+    /// this variant when the node's channel port is derived; use [`Self::Udp`]
+    /// when it is pinned explicitly.
+    GossipWithDerivedChannel,
+}
+
+/// A set of loopback ports **held open** by live probe sockets until the child
+/// that will bind them is spawned.
 ///
-/// - **Protocol.** Gossip is **UDP**; every other listener is TCP. A port that
-///   accepts a TCP bind can still refuse a UDP one — on Windows, Hyper-V/WinNAT
-///   reserve large UDP-only ranges and the bind fails with `WSAEACCES`. So the
-///   gossip port is probed with a real UDP socket.
-/// - **Derived ports.** The cluster channel is never configured, only derived
-///   (`gossip + 2`), so it has to be probed and claimed explicitly or a sibling
-///   node gets handed it.
+/// This is the whole point of the type. Asking the kernel for a port by binding
+/// `127.0.0.1:0`, reading the number and *closing the socket* leaves a TOCTOU
+/// window in which the port goes straight back into the ephemeral pool — and a
+/// live ephpm cluster churning gossip, CDC and MySQL connections drains that
+/// pool continuously. That is how a port reserved for a node reached
+/// `Address already in use` before the node ever spawned, reported as "node N
+/// never became healthy" ~1 run in 25 (issue #438). The window is proportional
+/// to reserve→spawn distance, and a fixture that reserves every node's ports up
+/// front but spawns one of them ~100s later has a *very* wide one.
+///
+/// Holding the probe closes the window instead of narrowing it: the port cannot
+/// be re-issued to anything while the probe lives. Call [`release`](Self::release)
+/// immediately before `Command::spawn` so the handoff gap is a few
+/// instructions rather than the length of a test phase.
+///
+/// A held TCP probe accepts nothing and a held UDP probe reads nothing; peers
+/// dialing a not-yet-spawned node see a connection that is reset (or datagrams
+/// dropped) when the probe is released, which is indistinguishable from the
+/// closed port they would have seen anyway.
+pub struct PortLease {
+    ports: Vec<u16>,
+    probes: PortProbes,
+}
+
+impl PortLease {
+    /// The `index`-th port of this lease, in the order the kinds were requested.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` is past the number of ports requested.
+    #[must_use]
+    pub fn port(&self, index: usize) -> u16 {
+        self.ports[index]
+    }
+
+    /// Every port in this lease, in request order.
+    #[must_use]
+    pub fn ports(&self) -> &[u16] {
+        &self.ports
+    }
+
+    /// Release the probe sockets, handing the ports to the child.
+    ///
+    /// Consuming `self` is deliberate: it makes "the ports are no longer
+    /// protected" a state you cannot use by accident, and puts the release at
+    /// the exact statement it belongs next to — the `spawn`.
+    pub fn release(self) {
+        drop(self.probes);
+    }
+}
+
+/// Hands out loopback ports that stay reserved until they are handed off.
+///
+/// One reserver serves a whole topology: ports it has already issued are
+/// remembered forever, so a port released by an earlier [`PortLease`] (whose
+/// node is by then binding it) is never offered to a later one.
+#[derive(Default)]
+pub struct PortReserver {
+    claimed: BTreeSet<u16>,
+}
+
+impl PortReserver {
+    /// A reserver with nothing claimed yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reserve one port per entry in `kinds`, returning a lease that **holds**
+    /// them until [`PortLease::release`].
+    ///
+    /// # Errors
+    ///
+    /// Fails when the kernel cannot produce a bindable, not-already-claimed
+    /// port of the requested kind within [`MAX_PORT_ATTEMPTS`] tries.
+    pub async fn lease(&mut self, kinds: &[PortKind]) -> Result<PortLease> {
+        let mut probes = PortProbes::default();
+        let mut ports = Vec::with_capacity(kinds.len());
+        for kind in kinds {
+            let port = match kind {
+                PortKind::Tcp => claim_tcp_port(&mut probes, &mut self.claimed).await?,
+                PortKind::Udp => claim_udp_port(&mut probes, &mut self.claimed).await?,
+                PortKind::GossipWithDerivedChannel => {
+                    claim_gossip_port(&mut probes, &mut self.claimed).await?
+                }
+            };
+            ports.push(port);
+        }
+        Ok(PortLease { ports, probes })
+    }
+}
+
+/// Reserve a non-overlapping port set per node, each set held by its own lease
+/// until that node spawns.
 async fn reserve_cluster_ports(size: usize) -> Result<Vec<ClusterPorts>> {
-    let mut probes = PortProbes::default();
-    let mut claimed: BTreeSet<u16> = BTreeSet::new();
+    let mut reserver = PortReserver::new();
     let mut sets = Vec::with_capacity(size);
 
     for _ in 0..size {
-        let http = claim_tcp_port(&mut probes, &mut claimed).await?;
-        let mysql = claim_tcp_port(&mut probes, &mut claimed).await?;
-        let kv_data = claim_tcp_port(&mut probes, &mut claimed).await?;
-        let gossip = claim_gossip_port(&mut probes, &mut claimed).await?;
-        sets.push(ClusterPorts { http, mysql, gossip, kv_data });
+        let lease = reserver
+            .lease(&[
+                PortKind::Tcp,
+                PortKind::Tcp,
+                PortKind::Tcp,
+                PortKind::GossipWithDerivedChannel,
+            ])
+            .await?;
+        sets.push(ClusterPorts {
+            http: lease.port(0),
+            mysql: lease.port(1),
+            kv_data: lease.port(2),
+            gossip: lease.port(3),
+            lease,
+        });
     }
 
-    // Release every probe now that the assignment is fixed; the children bind
-    // these ports themselves a moment later.
-    drop(probes);
     Ok(sets)
 }
 
 /// Number of attempts any single port claim gets before giving up.
-const MAX_PORT_ATTEMPTS: usize = 64;
+pub const MAX_PORT_ATTEMPTS: usize = 64;
+
+/// Claim one unclaimed loopback **UDP** port, for a gossip listener whose
+/// cluster-channel port is configured explicitly rather than derived.
+async fn claim_udp_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>) -> Result<u16> {
+    for _ in 0..MAX_PORT_ATTEMPTS {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.context("bind udp :0")?;
+        let port = socket.local_addr().context("local_addr")?.port();
+        probes.udp.push(socket);
+        if claimed.insert(port) {
+            return Ok(port);
+        }
+    }
+    Err(anyhow!("could not reserve a free loopback UDP port in {MAX_PORT_ATTEMPTS} attempts"))
+}
 
 /// Claim one unclaimed loopback TCP port.
 async fn claim_tcp_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>) -> Result<u16> {
@@ -407,10 +524,11 @@ async fn claim_gossip_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>)
 /// Poll `child`'s health endpoint until it answers 200, the child exits, or
 /// `timeout` elapses.
 ///
-/// The child-exit check is load-bearing for the reserved-port TOCTOU (see
-/// [`reserve_loopback_port`]): a stolen port makes the child fail its bind
-/// and exit, and without the check the poll could get a 200 from whatever
-/// *else* is listening there and hand the test a stranger's server.
+/// The child-exit check is a backstop for a port that got taken anyway (see
+/// [`PortLease`], which is what stops that happening): a stolen port makes the
+/// child fail its bind and exit, and without the check the poll could get a 200
+/// from whatever *else* is listening there and hand the test a stranger's
+/// server.
 async fn wait_for_health(child: &mut Child, port: u16, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut last_err = String::from("no attempts made");
