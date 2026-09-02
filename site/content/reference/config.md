@@ -150,11 +150,33 @@ Per-vhost kernel network policy via eBPF. **Linux-only, multi-tenant-only, exper
 | `enabled` | bool | `false` | Enable the Prometheus `/metrics` endpoint. |
 | `path` | string | `"/metrics"` | URL path for the metrics endpoint. |
 
+### The `/_ephpm/` namespace is reserved
+
+Every path at or under `/_ephpm/` is answered by ePHPm itself and is **never**
+routed to your application — in fpm mode, `fpm_engine = "pool"`, and worker
+mode alike. This matters most in worker mode, where the framework owns every
+non-static path: without the reservation an operator probing a server endpoint
+would get the *application's* answer (issue #444).
+
+| Path | Method | Answer |
+|---|---|---|
+| `/_ephpm/health` | GET | `200 {"status":"ok"}` — liveness. |
+| `/_ephpm/ready` | GET | `200`/`503` — readiness (PHP initialized, workers booted, DB proxies connected). |
+| `/_ephpm/primary` | GET | `200 {"primary":true}` when this node accepts writes, `503 {"primary":false}` on a clustered-SQLite replica. |
+| `/_ephpm/requests` | GET | The request timeline when `[server.diagnostics] request_log` is on; otherwise `404` naming the knob. |
+| any other `/_ephpm/…` | GET | `404` from the server, listing the endpoints above. |
+| any of the above | not GET | `405` with `Allow: GET`. |
+
+The Prometheus endpoint is **not** in this namespace: its path is yours to
+choose (`[server.metrics] path`, default `/metrics`), so with
+`[server.metrics] enabled = false` your application may serve `/metrics`
+itself. Pointing `path` *into* `/_ephpm/` works — metrics are matched first.
+
 ### `[server.diagnostics]`
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `request_log` | bool | (mode default) | Per-request timeline: the last 256 completed requests (method, path, status, total/queue-wait/PHP durations in ms, response bytes, timestamp) served as JSON at `GET /_ephpm/requests`, newest first. Unset resolves per mode: **on** under `ephpm dev` / bare `ephpm`, **off** under `ephpm serve`. `queue_wait_ms` is `null` outside worker mode (there is no dispatch queue on the fpm path); in worker mode `php_ms` includes the queue wait, matching `ephpm_php_execution_duration_seconds`. Requests to `/_ephpm/*` and the metrics path are not recorded. When off, `/_ephpm/requests` is not registered and the path falls through to normal routing. Env override: `EPHPM_SERVER__DIAGNOSTICS__REQUEST_LOG`. |
+| `request_log` | bool | (mode default) | Per-request timeline: the last 256 completed requests (method, path, status, total/queue-wait/PHP durations in ms, response bytes, timestamp) served as JSON at `GET /_ephpm/requests`, newest first. Unset resolves per mode: **on** under `ephpm dev` / bare `ephpm`, **off** under `ephpm serve`. `queue_wait_ms` is `null` outside worker mode (there is no dispatch queue on the fpm path); in worker mode `php_ms` includes the queue wait, matching `ephpm_php_execution_duration_seconds`. Requests to `/_ephpm/*` and the metrics path are not recorded. When off, `GET /_ephpm/requests` answers 404 naming this knob — the path is never routed to your application (see [the reserved namespace](#the-_ephpm-namespace-is-reserved)). Env override: `EPHPM_SERVER__DIAGNOSTICS__REQUEST_LOG`. |
 | `otlp_endpoint` | string | (none) | OTLP trace-export endpoint, e.g. `"http://127.0.0.1:4318"`. The transport is chosen by `OTEL_EXPORTER_OTLP_PROTOCOL` — **http/protobuf** by default (`/v1/traces` appended when missing, conventional port 4318) or **grpc** (used as-is, no path appended, conventional port 4317). Exports one `http.request` **server** span per request (attrs: `http.request.method`, `url.path`, `http.response.status_code`, plus `error.type` on a 5xx and `ephpm.site` in multi-site mode) with `worker.queue_wait` and `php.execute` children, and honors an incoming W3C `traceparent` header. A 5xx sets the span status to `ERROR`; a 4xx does not, per OTel HTTP semantic conventions for server spans. Requires a binary built with the `otlp` cargo feature. **Official release binaries and the Docker image have it** (`cargo xtask release` builds with it); a plain `cargo build` does not, and there a set value only logs a startup warning. The standard `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT` env vars take precedence over this knob, and `OTEL_SERVICE_NAME` overrides the default service name `ephpm`. Unset (and no env vars): no exporter is built and no background export thread runs (verified — thread count is identical to a binary without the feature). Both `http://` and `https://` endpoints are supported on both transports — see the notes below. |
 | `otlp_protocol` | string | (none → `http/protobuf`) | OTLP wire protocol for `otlp_endpoint`: `"grpc"` or `"http/protobuf"`. `"http/json"` is rejected at startup. The standard `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` / `OTEL_EXPORTER_OTLP_PROTOCOL` env vars take precedence over this knob. Setting it without an endpoint logs a startup warning and does nothing. Env override: `EPHPM_SERVER__DIAGNOSTICS__OTLP_PROTOCOL`. |
 
