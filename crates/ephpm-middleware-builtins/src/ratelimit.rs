@@ -11,6 +11,19 @@
 //! is on. Over the limit the client gets `429` with a `Retry-After` for the
 //! seconds left in the window.
 //!
+//! **The budget is per tenant, and a client cannot mint a new one.**
+//! `{vhost}` is the canonical site key the router resolved, not the `Host`
+//! header — before that (issue #390) every spelling of one vhost got its own
+//! counter and, worse, any unmatched `Host` value got a fresh budget on
+//! demand, which is a bypass rather than a cosmetic key change. A request that
+//! matched no vhost now shares the single
+//! [`ephpm_middleware::UNMATCHED_VHOST`] bucket, a sentinel no vhost directory
+//! can spell. On a multi-tenant node the counter additionally lands in that
+//! vhost's own KV store (issue #376), so two tenants cannot spend each other's
+//! budget even given an identical key. For a deliberately node-wide edge
+//! limiter — one budget for the whole node — a module would use
+//! `kv_incr_ttl_global` instead; this module is per-tenant on purpose.
+//!
 //! **Fail-open by design:** when the KV store is unavailable (`kv_incr`
 //! errors), the request is allowed through with a warning log. For a rate
 //! limiter, availability beats strictness — dropping every request because
@@ -89,7 +102,13 @@ impl Middleware for RateLimit {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let window = now / WINDOW_SECS;
         let client = self.client_key(req);
-        let key = format!("mw:rl:{}:{}:{}", req.vhost_id(), client, window);
+        // The canonical site key, not the raw `Host` (issue #390). A
+        // `Host`-derived component was a bypass: every spelling of one tenant
+        // got its own budget, and an unmatched host got a fresh budget per
+        // header value. `UNMATCHED_VHOST` is unspellable as a site key, so
+        // every unmatched request now shares one bucket.
+        let vhost = req.vhost_id().unwrap_or(ephpm_middleware::UNMATCHED_VHOST);
+        let key = format!("mw:rl:{vhost}:{client}:{window}");
 
         let host = req.host();
         // Atomically bump the counter, applying the window TTL only when this

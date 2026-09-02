@@ -59,6 +59,27 @@ use std::os::raw::c_char;
 
 use abi::{EphpmHeaderKv, EphpmHostV1, EphpmRequest, EphpmResponseCtx};
 
+/// Key component a module should substitute when [`Request::vhost_id`] is
+/// `None` — the request matched no known virtual host.
+///
+/// Deliberately **uppercase**, which makes it unspellable as a site key: the
+/// router lowercases every host before matching and `is_valid_site_key`
+/// accepts only `[a-z0-9._-]`, so no vhost directory can ever produce it. That
+/// matters because the alternative — keying on the raw `Host` for an unmatched
+/// request — hands an attacker a fresh keyspace per header value. For a rate
+/// limiter that is a bypass: vary `Host`, get a fresh budget. Collapsing every
+/// unmatched host into one bucket is the fail-closed direction.
+///
+/// A module that must *deny* rather than bucket unmatched requests should
+/// branch on `None` directly instead of using this.
+///
+/// Note this is the **only** bucket a single-site node ever uses: with no
+/// `sites_dir` and no `[[site]]`, the router matches no vhost, so every request
+/// has `vhost_id() == None`. A single-site deployment therefore sees keys like
+/// `mw:maintenance:_UNMATCHED` — that is the expected shape there, not a
+/// degraded one.
+pub const UNMATCHED_VHOST: &str = "_UNMATCHED";
+
 /// The trait a Rust-authored middleware implements. [`declare!`] generates
 /// the C ABI exports around it.
 pub trait Middleware: Sized + Send + Sync + 'static {
@@ -151,6 +172,18 @@ impl Request<'_> {
         unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("")
     }
 
+    /// Like [`str_of`](Self::str_of) but keeps NULL distinguishable from an
+    /// empty string. Used for accessors where "absent" is a decision a module
+    /// must be able to make — [`vhost_id`](Self::vhost_id) is the one that
+    /// matters: `""` would read as a usable tenant key.
+    fn opt_str_of(&self, p: *const c_char) -> Option<&str> {
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: as `str_of`.
+        unsafe { CStr::from_ptr(p) }.to_str().ok().filter(|s| !s.is_empty())
+    }
+
     /// HTTP method.
     #[must_use]
     pub fn method(&self) -> &str {
@@ -179,11 +212,31 @@ impl Request<'_> {
         self.str_of(unsafe { (self.host.request_remote_ip)(self.raw) })
     }
 
-    /// Vhost / server-name identity for this request.
+    /// The request's **canonical site key** — the tenant identity the router
+    /// resolved, and the same value that selects this request's per-site
+    /// database, KV keyspace and OPcache vhost.
+    ///
+    /// `None` when the request matched no known virtual host. That is not a
+    /// missing value to paper over: ePHPm serves unrecognised hosts from the
+    /// default document root by default, so the `Host` there is arbitrary
+    /// client input. A gate should treat `None` as "no tenant" and fail closed
+    /// rather than substituting the header (issue #390).
+    ///
+    /// **`None` is the normal case on a single-site node.** With neither
+    /// `sites_dir` nor any `[[site]]` configured the router matches no vhost at
+    /// all, so this is `None` on every request there — treat it as "one
+    /// tenant", not as an error. [`UNMATCHED_VHOST`] is the conventional key
+    /// component for that bucket.
+    ///
+    /// Normalization is the router's, not the header's: `Site.Example`,
+    /// `site.example:8080` and `site.example.` all resolve to one key, and a
+    /// configured `sites_domain_suffix` is stripped. For the request host as
+    /// sent — normalized but *not* a tenant identity — use
+    /// [`http_host`](Self::http_host).
     #[must_use]
-    pub fn vhost_id(&self) -> &str {
+    pub fn vhost_id(&self) -> Option<&str> {
         // SAFETY: contract of `from_raw`.
-        self.str_of(unsafe { (self.host.request_vhost_id)(self.raw) })
+        self.opt_str_of(unsafe { (self.host.request_vhost_id)(self.raw) })
     }
 
     /// The host's advertised ABI minor (low three bytes of `abi_version`).
@@ -390,7 +443,24 @@ impl<'a> Host<'a> {
         Self { table }
     }
 
-    /// Get a key from the embedded KV store (`None` = absent or error).
+    /// The host's advertised ABI minor (low three bytes of `abi_version`).
+    /// Trailing table slots must be gated on this so a module built against a
+    /// newer ABI never reads past an older host's shorter table.
+    fn minor(&self) -> u32 {
+        self.table.abi_version & 0x00FF_FFFF
+    }
+
+    /// Get a key from **this request's** KV keyspace (`None` = absent or
+    /// error).
+    ///
+    /// On a multi-tenant node that is the serving vhost's own store — the same
+    /// physically separate map the tenant's PHP reaches through
+    /// `ephpm_kv_set()`, so a module and the app it fronts can share a key
+    /// without either hand-prefixing anything, and two tenants cannot see each
+    /// other's. On a single-site node, and for a request that matched no
+    /// vhost, it is the process-global store. Use
+    /// [`kv_get_global`](Self::kv_get_global) when you specifically want
+    /// node-wide state.
     #[must_use]
     pub fn kv_get(&self, key: &str) -> Option<Vec<u8>> {
         let mut ptr: *mut u8 = std::ptr::null_mut();
@@ -451,6 +521,115 @@ impl<'a> Host<'a> {
         // SAFETY: valid key slice; out-param points at a local.
         let rc = unsafe {
             (self.table.kv_incr_ttl)(key.as_ptr(), key.len(), by, ttl_secs, &raw mut out)
+        };
+        (rc == 0).then_some(out)
+    }
+
+    // ── Process-global KV (ABI minor 3) ───────────────────────────────────
+    //
+    // For node-scoped state only: operator-owned configuration that no
+    // tenant's PHP may rewrite, or a deliberately node-wide counter. Anything
+    // belonging to the tenant being served goes through the request-scoped
+    // methods above. Each falls back to a safe no-op/`None` on a host older
+    // than `abi::ABI_MINOR_GLOBAL_KV`, where the slot is absent — reading it
+    // would be a read past a shorter table.
+
+    /// [`kv_get`](Self::kv_get) against the **process-global** store.
+    ///
+    /// `None` on a host older than [`abi::ABI_MINOR_GLOBAL_KV`].
+    #[must_use]
+    pub fn kv_get_global(&self, key: &str) -> Option<Vec<u8>> {
+        if self.minor() < abi::ABI_MINOR_GLOBAL_KV {
+            return None;
+        }
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        // SAFETY: valid key slice; out-params point at locals; minor-gated
+        // above so the slot exists on this host's table.
+        let rc = unsafe {
+            (self.table.kv_get_global)(key.as_ptr(), key.len(), &raw mut ptr, &raw mut len)
+        };
+        if rc != 0 || ptr.is_null() {
+            return None;
+        }
+        // SAFETY: rc==0 means the host allocated `len` bytes at `ptr`.
+        let out = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+        // SAFETY: `ptr`/`len` came from `kv_get_global` above; `kv_free` is
+        // scope-independent (the allocation, not the store, is what it frees).
+        unsafe { (self.table.kv_free)(ptr, len) };
+        Some(out)
+    }
+
+    /// [`kv_set`](Self::kv_set) against the **process-global** store.
+    ///
+    /// `false` on a host older than [`abi::ABI_MINOR_GLOBAL_KV`].
+    #[must_use]
+    pub fn kv_set_global(&self, key: &str, value: &[u8], ttl_secs: i64) -> bool {
+        if self.minor() < abi::ABI_MINOR_GLOBAL_KV {
+            return false;
+        }
+        // SAFETY: valid slices for the call; minor-gated as above.
+        let rc = unsafe {
+            (self.table.kv_set_global)(
+                key.as_ptr(),
+                key.len(),
+                value.as_ptr(),
+                value.len(),
+                ttl_secs,
+            )
+        };
+        rc == 0
+    }
+
+    /// [`kv_set_nx`](Self::kv_set_nx) against the **process-global** store.
+    ///
+    /// `false` on a host older than [`abi::ABI_MINOR_GLOBAL_KV`].
+    #[must_use]
+    pub fn kv_set_nx_global(&self, key: &str, value: &[u8], ttl_secs: i64) -> bool {
+        if self.minor() < abi::ABI_MINOR_GLOBAL_KV {
+            return false;
+        }
+        // SAFETY: valid slices for the call; minor-gated as above.
+        let rc = unsafe {
+            (self.table.kv_set_nx_global)(
+                key.as_ptr(),
+                key.len(),
+                value.as_ptr(),
+                value.len(),
+                ttl_secs,
+            )
+        };
+        rc == 0
+    }
+
+    /// [`kv_incr`](Self::kv_incr) against the **process-global** store.
+    ///
+    /// `None` on a host older than [`abi::ABI_MINOR_GLOBAL_KV`].
+    #[must_use]
+    pub fn kv_incr_global(&self, key: &str, by: i64) -> Option<i64> {
+        if self.minor() < abi::ABI_MINOR_GLOBAL_KV {
+            return None;
+        }
+        let mut out: i64 = 0;
+        // SAFETY: valid key slice; out-param points at a local; minor-gated.
+        let rc = unsafe { (self.table.kv_incr_global)(key.as_ptr(), key.len(), by, &raw mut out) };
+        (rc == 0).then_some(out)
+    }
+
+    /// [`kv_incr_ttl`](Self::kv_incr_ttl) against the **process-global** store
+    /// — the primitive for a deliberately node-wide fixed-window counter, e.g.
+    /// an edge rate limiter that must not give each tenant its own budget.
+    ///
+    /// `None` on a host older than [`abi::ABI_MINOR_GLOBAL_KV`].
+    #[must_use]
+    pub fn kv_incr_ttl_global(&self, key: &str, by: i64, ttl_secs: i64) -> Option<i64> {
+        if self.minor() < abi::ABI_MINOR_GLOBAL_KV {
+            return None;
+        }
+        let mut out: i64 = 0;
+        // SAFETY: valid key slice; out-param points at a local; minor-gated.
+        let rc = unsafe {
+            (self.table.kv_incr_ttl_global)(key.as_ptr(), key.len(), by, ttl_secs, &raw mut out)
         };
         (rc == 0).then_some(out)
     }

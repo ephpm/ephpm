@@ -2,7 +2,9 @@
 //! process-wide [`abi::EphpmHostV1`] callback table. Used by `ephpm-server`
 //! (feature `host`); middleware authors never touch this module.
 
+use std::cell::RefCell;
 use std::ffi::{CStr, CString};
+use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -16,7 +18,12 @@ pub struct RequestCtx {
     path: CString,
     query: CString,
     remote_ip: CString,
-    vhost: CString,
+    /// The request's **canonical site key** — the value `Router::resolve_site`
+    /// matched, which also selects the per-site database, the KV keyspace and
+    /// the OPcache vhost. Empty when the request matched no known virtual host;
+    /// the `request_vhost_id` accessor turns that into a NULL return so a
+    /// module can tell "tenant `foo`" from "someone sent `Host: foo`".
+    site_key: CString,
     /// Normalized request host (port/trailing-dot stripped, lowercased) — the
     /// `request_host` accessor. Empty when the request had no usable `Host`.
     host: CString,
@@ -41,6 +48,14 @@ impl RequestCtx {
     /// Build the context. Interior NULs are stripped (invalid in HTTP
     /// metadata anyway) rather than failing the request.
     ///
+    /// `site_key` is the request's **canonical site key** — pass exactly what
+    /// `Router::resolve_site` returned, and the **empty string** when it
+    /// returned `None` (the host matched no known virtual host). Never pass a
+    /// raw `Host` header here: that was issue #390, and modules read this value
+    /// as a tenant identity in authorization decisions. The normalized request
+    /// host stays available separately through
+    /// [`with_host`](Self::with_host) / the `request_host` accessor.
+    ///
     /// The connection-derived extras — scheme/secure, normalized host, and the
     /// buffered body — default to "insecure / empty / no body" and are set by
     /// the router via [`with_scheme`](Self::with_scheme),
@@ -51,7 +66,7 @@ impl RequestCtx {
         path: &str,
         query: &str,
         remote_ip: &str,
-        vhost: &str,
+        site_key: &str,
         headers: &[(String, String)],
     ) -> Self {
         Self {
@@ -59,7 +74,7 @@ impl RequestCtx {
             path: cstr(path),
             query: cstr(query),
             remote_ip: cstr(remote_ip),
-            vhost: cstr(vhost),
+            site_key: cstr(site_key),
             host: CString::default(),
             is_secure: false,
             body: Vec::new(),
@@ -125,8 +140,14 @@ unsafe extern "C" fn request_remote_ip(req: *const EphpmRequest) -> *const c_cha
     unsafe { ctx(req) }.map_or(std::ptr::null(), |c| c.remote_ip.as_ptr())
 }
 unsafe extern "C" fn request_vhost_id(req: *const EphpmRequest) -> *const c_char {
+    // NULL — not `""` — for a request that matched no known vhost. An empty
+    // C string is still a tenant-shaped answer a module would happily use as a
+    // lookup key; NULL is the one value that cannot be mistaken for a tenant,
+    // so a module can fail closed on it (issue #390).
     // SAFETY: ABI contract.
-    unsafe { ctx(req) }.map_or(std::ptr::null(), |c| c.vhost.as_ptr())
+    unsafe { ctx(req) }.map_or(std::ptr::null(), |c| {
+        if c.site_key.is_empty() { std::ptr::null() } else { c.site_key.as_ptr() }
+    })
 }
 unsafe extern "C" fn request_header(
     req: *const EphpmRequest,
@@ -348,11 +369,107 @@ unsafe extern "C" fn response_body(p: *const EphpmResponseCtx, out_ptr: *mut *co
 }
 
 // ── KV callbacks ─────────────────────────────────────────────────────────
+//
+// Two scopes, deliberately (issue #376):
+//
+// * `kv_*` resolves **this request's** keyspace — the per-vhost store on a
+//   multi-tenant node, which is the same physically-separate `DashMap` PHP's
+//   `ephpm_kv_*` reaches for that vhost. So a rate limiter is per-tenant by
+//   default and a module can read a key PHP wrote, without either side having
+//   to hand-prefix anything.
+// * `kv_*_global` resolves the process-wide store, which is where
+//   *operator*-owned state belongs precisely because no tenant's PHP can
+//   reach it (see #384: a per-site credential map must not be writable by the
+//   site it authorizes).
+//
+// On a single-site node there is one store and the two are the same thing.
 
+/// The process-wide store. Also the fallback for a request that matched no
+/// vhost: such a request has no tenant, so there is no per-site keyspace it
+/// could legitimately be given. (PHP's `kv` identity instead falls back to the
+/// normalized `Host`, which suits a catch-all document root serving many
+/// names. The middleware chain runs on *every* request — static files
+/// included — so minting a store per `Host` value here would be a cheap way to
+/// grow the site map without bound.)
 static KV_STORE: OnceLock<Arc<ephpm_kv::store::Store>> = OnceLock::new();
 
-fn kv() -> Option<&'static Arc<ephpm_kv::store::Store>> {
-    KV_STORE.get()
+thread_local! {
+    /// The store the `kv_*` callbacks resolve for the request currently being
+    /// evaluated on this thread. `None` = fall back to [`KV_STORE`].
+    ///
+    /// Thread-local rather than an argument because the KV slots on
+    /// [`EphpmHostV1`] take no `EphpmRequest*` — changing that would break the
+    /// ABI, and modules built against major 1 must keep loading. The chain is
+    /// invoked synchronously and never across an `.await`, so "the request on
+    /// this thread" is well defined for the duration of a scope. Mirrors
+    /// `ephpm_php::kv_bridge`'s per-thread site store, which is what gives the
+    /// two lanes the same keyspace.
+    static KV_SITE_STORE: RefCell<Option<Arc<ephpm_kv::store::Store>>> =
+        const { RefCell::new(None) };
+}
+
+/// RAII scope binding the `kv_*` callbacks to one request's site store.
+///
+/// Restoring the **previous** value on drop rather than clearing is what makes
+/// the guard safe to nest, and clearing on drop at all is what stops a pooled
+/// tokio worker from carrying one tenant's scope into the next request it
+/// picks up — the same stale-per-thread-state hazard the PHP lane's eBPF tag
+/// guard exists for.
+/// It is deliberately **`!Send`**. The guard names thread-local state, so
+/// holding one across an `.await` would let a task resume on a different tokio
+/// worker with the scope installed on the old one — a silent cross-tenant
+/// leak, and exactly the class of bug this type exists to prevent. The
+/// `PhantomData<*const ()>` makes rustc enforce that instead of a comment: a
+/// future holding this across an await stops being `Send` and fails to compile
+/// where hyper requires `Send`. It costs nothing at the current call sites,
+/// since rustc only stores locals that are *live across* an await in the
+/// generator, and all three scopes close before their next await.
+pub struct SiteKvScope {
+    previous: Option<Arc<ephpm_kv::store::Store>>,
+    /// `!Send` marker — see the type docs. Carries no data.
+    _not_send: PhantomData<*const ()>,
+}
+
+impl Drop for SiteKvScope {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        // `try_with`: during thread teardown the slot may already be gone, and
+        // failing to restore it then is harmless (nothing will read it again).
+        let _ = KV_SITE_STORE.try_with(|s| {
+            *s.borrow_mut() = previous;
+        });
+    }
+}
+
+/// Bind the `kv_*` callbacks to `store` for as long as the returned guard
+/// lives. Pass `None` to leave them on the process-global store.
+///
+/// The host calls this immediately around a synchronous chain invocation. It
+/// must not be held across an `.await`: the guard is thread-local state and a
+/// suspended task can resume on a different worker.
+#[must_use]
+pub fn enter_site_kv(store: Option<Arc<ephpm_kv::store::Store>>) -> SiteKvScope {
+    // `try_with`, matching the read side and `Drop`: during thread teardown the
+    // slot may be gone. Unreachable today (the chain never runs at teardown),
+    // but a panic here would take down a request thread for nothing, and an
+    // uninstalled scope simply leaves the callbacks on the global store.
+    let previous = KV_SITE_STORE.try_with(|s| s.replace(store)).unwrap_or(None);
+    SiteKvScope { previous, _not_send: PhantomData }
+}
+
+/// The store for the request being evaluated: this thread's site store when a
+/// scope is active, the process-global store otherwise.
+fn kv() -> Option<Arc<ephpm_kv::store::Store>> {
+    KV_SITE_STORE
+        .try_with(|s| s.borrow().clone())
+        .ok()
+        .flatten()
+        .or_else(|| KV_STORE.get().cloned())
+}
+
+/// The process-global store, whatever request is in flight.
+fn kv_global_store() -> Option<Arc<ephpm_kv::store::Store>> {
+    KV_STORE.get().cloned()
 }
 
 unsafe fn key_str<'a>(key: *const u8, key_len: usize) -> Option<&'a str> {
@@ -363,7 +480,14 @@ unsafe fn key_str<'a>(key: *const u8, key_len: usize) -> Option<&'a str> {
     std::str::from_utf8(unsafe { std::slice::from_raw_parts(key, key_len) }).ok()
 }
 
-unsafe extern "C" fn kv_get(
+/// Shared body of `kv_get` / `kv_get_global`; `store` picks the scope.
+///
+/// # Safety
+///
+/// ABI contract: `(key, key_len)` is a valid slice for the call, and
+/// `out`/`out_len` are writable out-params.
+unsafe fn kv_get_in(
+    store: Option<Arc<ephpm_kv::store::Store>>,
     key: *const u8,
     key_len: usize,
     out: *mut *mut u8,
@@ -373,7 +497,7 @@ unsafe extern "C" fn kv_get(
         return -1;
     }
     // SAFETY: ABI contract.
-    let (Some(store), Some(k)) = (kv(), unsafe { key_str(key, key_len) }) else {
+    let (Some(store), Some(k)) = (store, unsafe { key_str(key, key_len) }) else {
         return -1;
     };
     match store.get(k) {
@@ -398,6 +522,26 @@ unsafe extern "C" fn kv_get(
     }
 }
 
+unsafe extern "C" fn kv_get(
+    key: *const u8,
+    key_len: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    // SAFETY: ABI contract, forwarded unchanged.
+    unsafe { kv_get_in(kv(), key, key_len, out, out_len) }
+}
+
+unsafe extern "C" fn kv_get_global(
+    key: *const u8,
+    key_len: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+) -> c_int {
+    // SAFETY: ABI contract, forwarded unchanged.
+    unsafe { kv_get_in(kv_global_store(), key, key_len, out, out_len) }
+}
+
 unsafe extern "C" fn kv_free(ptr: *mut u8, len: usize) {
     if ptr.is_null() {
         return;
@@ -419,7 +563,14 @@ fn ttl_of(ttl_secs: i64) -> Option<Duration> {
     (ttl_secs > 0).then(|| Duration::from_secs(ttl_secs.unsigned_abs()))
 }
 
-unsafe extern "C" fn kv_set(
+/// Shared body of `kv_set` / `kv_set_global`.
+///
+/// # Safety
+///
+/// ABI contract: `(key, key_len)` and `(value, value_len)` are valid slices
+/// for the duration of the call.
+unsafe fn kv_set_in(
+    store: Option<Arc<ephpm_kv::store::Store>>,
     key: *const u8,
     key_len: usize,
     value: *const u8,
@@ -427,12 +578,56 @@ unsafe extern "C" fn kv_set(
     ttl_secs: i64,
 ) -> c_int {
     // SAFETY: ABI contract.
-    let (Some(store), Some(k)) = (kv(), unsafe { key_str(key, key_len) }) else {
+    let (Some(store), Some(k)) = (store, unsafe { key_str(key, key_len) }) else {
         return -1;
     };
     // SAFETY: ABI contract.
     let v = unsafe { kv_value(value, value_len) };
     if store.set(k.to_string(), v.to_vec(), ttl_of(ttl_secs)) { 0 } else { -2 }
+}
+
+unsafe extern "C" fn kv_set(
+    key: *const u8,
+    key_len: usize,
+    value: *const u8,
+    value_len: usize,
+    ttl_secs: i64,
+) -> c_int {
+    // SAFETY: ABI contract, forwarded unchanged.
+    unsafe { kv_set_in(kv(), key, key_len, value, value_len, ttl_secs) }
+}
+
+unsafe extern "C" fn kv_set_global(
+    key: *const u8,
+    key_len: usize,
+    value: *const u8,
+    value_len: usize,
+    ttl_secs: i64,
+) -> c_int {
+    // SAFETY: ABI contract, forwarded unchanged.
+    unsafe { kv_set_in(kv_global_store(), key, key_len, value, value_len, ttl_secs) }
+}
+
+/// Shared body of `kv_set_nx` / `kv_set_nx_global`.
+///
+/// # Safety
+///
+/// As [`kv_set_in`].
+unsafe fn kv_set_nx_in(
+    store: Option<Arc<ephpm_kv::store::Store>>,
+    key: *const u8,
+    key_len: usize,
+    value: *const u8,
+    value_len: usize,
+    ttl_secs: i64,
+) -> c_int {
+    // SAFETY: ABI contract.
+    let (Some(store), Some(k)) = (store, unsafe { key_str(key, key_len) }) else {
+        return -1;
+    };
+    // SAFETY: ABI contract.
+    let v = unsafe { kv_value(value, value_len) };
+    i32::from(!store.set_nx(k.to_string(), v.to_vec(), ttl_of(ttl_secs)))
 }
 
 unsafe extern "C" fn kv_set_nx(
@@ -442,24 +637,86 @@ unsafe extern "C" fn kv_set_nx(
     value_len: usize,
     ttl_secs: i64,
 ) -> c_int {
-    // SAFETY: ABI contract.
-    let (Some(store), Some(k)) = (kv(), unsafe { key_str(key, key_len) }) else {
-        return -1;
-    };
-    // SAFETY: ABI contract.
-    let v = unsafe { kv_value(value, value_len) };
-    i32::from(!store.set_nx(k.to_string(), v.to_vec(), ttl_of(ttl_secs)))
+    // SAFETY: ABI contract, forwarded unchanged.
+    unsafe { kv_set_nx_in(kv(), key, key_len, value, value_len, ttl_secs) }
 }
 
-unsafe extern "C" fn kv_incr(key: *const u8, key_len: usize, by: i64, out: *mut i64) -> c_int {
+unsafe extern "C" fn kv_set_nx_global(
+    key: *const u8,
+    key_len: usize,
+    value: *const u8,
+    value_len: usize,
+    ttl_secs: i64,
+) -> c_int {
+    // SAFETY: ABI contract, forwarded unchanged.
+    unsafe { kv_set_nx_in(kv_global_store(), key, key_len, value, value_len, ttl_secs) }
+}
+
+/// Shared body of `kv_incr` / `kv_incr_global`.
+///
+/// # Safety
+///
+/// ABI contract: `(key, key_len)` is a valid slice and `out` is writable.
+unsafe fn kv_incr_in(
+    store: Option<Arc<ephpm_kv::store::Store>>,
+    key: *const u8,
+    key_len: usize,
+    by: i64,
+    out: *mut i64,
+) -> c_int {
     if out.is_null() {
         return -1;
     }
     // SAFETY: ABI contract.
-    let (Some(store), Some(k)) = (kv(), unsafe { key_str(key, key_len) }) else {
+    let (Some(store), Some(k)) = (store, unsafe { key_str(key, key_len) }) else {
         return -1;
     };
     match store.incr_by(k, by) {
+        Ok(v) => {
+            // SAFETY: out checked non-null above.
+            unsafe { *out = v };
+            0
+        }
+        Err(_) => -2,
+    }
+}
+
+unsafe extern "C" fn kv_incr(key: *const u8, key_len: usize, by: i64, out: *mut i64) -> c_int {
+    // SAFETY: ABI contract, forwarded unchanged.
+    unsafe { kv_incr_in(kv(), key, key_len, by, out) }
+}
+
+unsafe extern "C" fn kv_incr_global(
+    key: *const u8,
+    key_len: usize,
+    by: i64,
+    out: *mut i64,
+) -> c_int {
+    // SAFETY: ABI contract, forwarded unchanged.
+    unsafe { kv_incr_in(kv_global_store(), key, key_len, by, out) }
+}
+
+/// Shared body of `kv_incr_ttl` / `kv_incr_ttl_global`.
+///
+/// # Safety
+///
+/// As [`kv_incr_in`].
+unsafe fn kv_incr_ttl_in(
+    store: Option<Arc<ephpm_kv::store::Store>>,
+    key: *const u8,
+    key_len: usize,
+    by: i64,
+    ttl_secs: i64,
+    out: *mut i64,
+) -> c_int {
+    if out.is_null() {
+        return -1;
+    }
+    // SAFETY: ABI contract.
+    let (Some(store), Some(k)) = (store, unsafe { key_str(key, key_len) }) else {
+        return -1;
+    };
+    match store.incr_by_with_ttl(k, by, ttl_of(ttl_secs)) {
         Ok(v) => {
             // SAFETY: out checked non-null above.
             unsafe { *out = v };
@@ -476,21 +733,19 @@ unsafe extern "C" fn kv_incr_ttl(
     ttl_secs: i64,
     out: *mut i64,
 ) -> c_int {
-    if out.is_null() {
-        return -1;
-    }
-    // SAFETY: ABI contract.
-    let (Some(store), Some(k)) = (kv(), unsafe { key_str(key, key_len) }) else {
-        return -1;
-    };
-    match store.incr_by_with_ttl(k, by, ttl_of(ttl_secs)) {
-        Ok(v) => {
-            // SAFETY: out checked non-null above.
-            unsafe { *out = v };
-            0
-        }
-        Err(_) => -2,
-    }
+    // SAFETY: ABI contract, forwarded unchanged.
+    unsafe { kv_incr_ttl_in(kv(), key, key_len, by, ttl_secs, out) }
+}
+
+unsafe extern "C" fn kv_incr_ttl_global(
+    key: *const u8,
+    key_len: usize,
+    by: i64,
+    ttl_secs: i64,
+    out: *mut i64,
+) -> c_int {
+    // SAFETY: ABI contract, forwarded unchanged.
+    unsafe { kv_incr_ttl_in(kv_global_store(), key, key_len, by, ttl_secs, out) }
 }
 
 unsafe extern "C" fn host_log(level: c_int, msg: *const u8, msg_len: usize) {
@@ -530,10 +785,20 @@ static HOST_TABLE: EphpmHostV1 = EphpmHostV1 {
     request_scheme,
     request_is_secure,
     request_host,
+    kv_get_global,
+    kv_set_global,
+    kv_set_nx_global,
+    kv_incr_global,
+    kv_incr_ttl_global,
 };
 
-/// Wire the embedded KV store into the host table. Call once at startup,
+/// Wire the process-global KV store into the host table. Call once at startup,
 /// before loading any middleware. Subsequent calls are ignored.
+///
+/// This is the store the `kv_*_global` callbacks always reach, and the one the
+/// request-scoped `kv_*` callbacks fall back to outside a
+/// [`enter_site_kv`] scope (single-site mode, and any request that matched no
+/// vhost).
 pub fn set_kv_store(store: &Arc<ephpm_kv::store::Store>) {
     let _ = KV_STORE.set(Arc::clone(store));
 }
@@ -546,12 +811,30 @@ pub fn host_table() -> &'static EphpmHostV1 {
 
 #[cfg(test)]
 mod tests {
-    use crate::Request;
+    use std::sync::Arc;
+
+    use ephpm_kv::store::{Store, StoreConfig};
+
     use crate::abi::{self, EphpmHostV1};
-    use crate::host::{RequestCtx, host_table};
+    use crate::host::{KV_STORE, RequestCtx, enter_site_kv, host_table, set_kv_store};
+    use crate::{Host, Request};
 
     fn ctx() -> RequestCtx {
         RequestCtx::new("GET", "/hook", "", "203.0.113.4", "srv", &[])
+    }
+
+    /// The process-global store as the callbacks see it.
+    ///
+    /// `KV_STORE` is a `OnceLock`, so whichever test in this binary calls
+    /// [`set_kv_store`] first wins; every test must therefore read back what
+    /// the table actually resolved rather than assuming its own handle won.
+    fn global_store() -> Arc<Store> {
+        set_kv_store(&Store::new(StoreConfig::default()));
+        KV_STORE.get().expect("global store is set by now").clone()
+    }
+
+    fn site_store() -> Arc<Store> {
+        Store::new(StoreConfig::default())
     }
 
     #[test]
@@ -563,6 +846,40 @@ mod tests {
         assert!(!req.is_secure());
         assert_eq!(req.http_host(), "");
         assert!(req.body().is_empty());
+    }
+
+    /// Issue #390: the vhost accessor is a *tenant identity*, so "no tenant"
+    /// must be distinguishable from a tenant. An empty site key crosses the
+    /// ABI as NULL and surfaces as `None`, never as `Some("")` — otherwise a
+    /// module keys its policy on a string an unauthenticated client chose.
+    #[test]
+    fn unmatched_host_has_no_vhost_identity() {
+        let matched = RequestCtx::new("GET", "/x", "", "203.0.113.4", "blog", &[]);
+        // SAFETY: ctx and the real host table outlive the view.
+        let req = unsafe { Request::from_raw(matched.as_abi(), host_table()) };
+        assert_eq!(req.vhost_id(), Some("blog"));
+
+        let unmatched = RequestCtx::new("GET", "/x", "", "203.0.113.4", "", &[]);
+        // SAFETY: as above.
+        let req = unsafe { Request::from_raw(unmatched.as_abi(), host_table()) };
+        assert_eq!(req.vhost_id(), None, "no matched vhost must read as no tenant");
+        // SAFETY: the raw accessor is the C-ABI surface modules see; NULL is
+        // the contract, and an empty non-null string would defeat the point.
+        assert!(unsafe { (host_table().request_vhost_id)(unmatched.as_abi()) }.is_null());
+    }
+
+    /// The tenant identity and the request host are deliberately two different
+    /// values: one is what the router resolved, the other is what the client
+    /// sent. A module must be able to reach both without confusing them.
+    #[test]
+    fn vhost_id_and_http_host_stay_distinct() {
+        // A suffixed request: `Host: blog.localhost` resolves to site `blog`.
+        let ctx = RequestCtx::new("GET", "/x", "", "203.0.113.4", "blog", &[])
+            .with_host("blog.localhost");
+        // SAFETY: ctx and the real host table outlive the view.
+        let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
+        assert_eq!(req.vhost_id(), Some("blog"));
+        assert_eq!(req.http_host(), "blog.localhost");
     }
 
     #[test]
@@ -596,5 +913,130 @@ mod tests {
         assert_eq!(req.http_host(), "");
         // request_body has existed since minor 0 — not gated, still readable.
         assert_eq!(req.body(), b"payload");
+    }
+
+    // ── KV scoping (issue #376) ──────────────────────────────────────────
+
+    /// THE isolation guard: two sites, one key name, no bleed. Middleware
+    /// running for `tenant-a` must not see, overwrite, or be counted against
+    /// `tenant-b`'s value — the same physical-store separation PHP's
+    /// `ephpm_kv_*` already has.
+    #[test]
+    fn two_sites_never_share_a_middleware_kv_key() {
+        let global = global_store();
+        let a = site_store();
+        let b = site_store();
+        let host = Host::new(host_table());
+
+        {
+            let _scope = enter_site_kv(Some(Arc::clone(&a)));
+            assert!(host.kv_set("shared-name", b"from-a", 0));
+        }
+        {
+            let _scope = enter_site_kv(Some(Arc::clone(&b)));
+            // B does not see A's write...
+            assert_eq!(host.kv_get("shared-name"), None, "tenant B must not read tenant A's key");
+            assert!(host.kv_set("shared-name", b"from-b", 0));
+        }
+        {
+            let _scope = enter_site_kv(Some(Arc::clone(&a)));
+            // ...and B's write did not clobber A's.
+            assert_eq!(host.kv_get("shared-name").as_deref(), Some(&b"from-a"[..]));
+        }
+
+        // Neither tenant's write leaked into the process-global store, which is
+        // where operator-owned state lives.
+        assert_eq!(global.get("shared-name"), None);
+
+        // A counter is per-tenant too — the rate-limiter case from #376.
+        for store in [&a, &b] {
+            let _scope = enter_site_kv(Some(Arc::clone(store)));
+            assert_eq!(host.kv_incr_ttl("counter", 1, 60), Some(1), "each site counts from zero");
+        }
+    }
+
+    /// The scope is per-request state on a pooled thread, so it must not
+    /// outlive the request. Dropping the guard restores whatever was there
+    /// before — nothing, for a top-level scope — or the next request served on
+    /// this thread would inherit the previous tenant's keyspace.
+    #[test]
+    fn the_site_scope_does_not_outlive_its_guard() {
+        let global = global_store();
+        let site = site_store();
+        let host = Host::new(host_table());
+
+        {
+            let _scope = enter_site_kv(Some(Arc::clone(&site)));
+            assert!(host.kv_set("scoped-key", b"tenant", 0));
+        }
+        // Out of scope: writes land in the global store again.
+        assert!(host.kv_set("unscoped-key", b"node", 0));
+        assert_eq!(global.get("unscoped-key").as_deref(), Some(&b"node"[..]));
+        assert_eq!(global.get("scoped-key"), None, "the tenant write must not have leaked");
+        assert_eq!(host.kv_get("scoped-key"), None, "the scope must not persist past its guard");
+    }
+
+    /// Nesting restores the outer scope rather than clearing it, so a scope
+    /// entered around an inner call cannot silently unscope the outer one.
+    #[test]
+    fn nested_scopes_restore_the_outer_store() {
+        let _global = global_store();
+        let outer = site_store();
+        let inner = site_store();
+        let host = Host::new(host_table());
+
+        let _outer_scope = enter_site_kv(Some(Arc::clone(&outer)));
+        {
+            let _inner_scope = enter_site_kv(Some(Arc::clone(&inner)));
+            assert!(host.kv_set("k", b"inner", 0));
+        }
+        assert!(host.kv_set("k", b"outer", 0));
+        assert_eq!(inner.get("k").as_deref(), Some(&b"inner"[..]));
+        assert_eq!(outer.get("k").as_deref(), Some(&b"outer"[..]));
+    }
+
+    /// The deliberate escape hatch (#384): operator-level state stays reachable
+    /// on the process-global store from inside a tenant's scope, and a tenant's
+    /// own keyspace can never shadow it. This is what keeps "readable by
+    /// middleware, unwritable by any tenant's PHP" expressible.
+    #[test]
+    fn global_kv_reaches_the_process_store_from_inside_a_site_scope() {
+        let global = global_store();
+        let site = site_store();
+        let host = Host::new(host_table());
+        global.set("operator:flag".into(), b"on".to_vec(), None);
+
+        let _scope = enter_site_kv(Some(Arc::clone(&site)));
+        // Site-scoped read misses; global read hits.
+        assert_eq!(host.kv_get("operator:flag"), None);
+        assert_eq!(host.kv_get_global("operator:flag").as_deref(), Some(&b"on"[..]));
+
+        // A tenant writing the same name shadows nothing.
+        assert!(host.kv_set("operator:flag", b"tenant-says-off", 0));
+        assert_eq!(host.kv_get_global("operator:flag").as_deref(), Some(&b"on"[..]));
+
+        // The global write path targets the process store, not the scope.
+        assert!(host.kv_set_global("operator:written", b"1", 0));
+        assert_eq!(global.get("operator:written").as_deref(), Some(&b"1"[..]));
+        assert_eq!(site.get("operator:written"), None);
+    }
+
+    /// A module built against minor 3 talking to a minor-2 host must not read
+    /// the appended `kv_*_global` slots — they are past the end of that host's
+    /// table. The safe wrapper degrades instead.
+    #[test]
+    fn minor_gate_hides_global_kv_on_an_older_host() {
+        let _global = global_store();
+        let old = EphpmHostV1 { abi_version: 0x0100_0002, ..*host_table() };
+        assert!((old.abi_version & 0x00FF_FFFF) < abi::ABI_MINOR_GLOBAL_KV);
+
+        let host = Host::new(&old);
+        assert_eq!(host.kv_get_global("anything"), None);
+        assert!(!host.kv_set_global("anything", b"v", 0));
+        assert!(!host.kv_set_nx_global("anything", b"v", 0));
+        assert_eq!(host.kv_incr_global("anything", 1), None);
+        assert_eq!(host.kv_incr_ttl_global("anything", 1, 60), None);
+        // The un-suffixed slots predate minor 3 and still work.
+        assert!(host.kv_set("anything", b"v", 0));
     }
 }

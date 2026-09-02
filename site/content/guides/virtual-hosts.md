@@ -357,6 +357,12 @@ ephpm_kv_get("cache:page:home");
 
 Keys are stored exactly as PHP sends them — no prefixes, no munging. The isolation is physical, not logical. A site's store is a completely separate data structure.
 
+### Native middleware sees the same per-site store
+
+A mounted [native middleware](/guides/native-middleware/)'s `kv_get`/`kv_set`/`kv_incr_ttl` resolve the **serving vhost's** store too — the same `Arc<Store>` that vhost's PHP reaches. So a rate limiter is per-tenant without prefixing anything, and a module can read a key the site's own PHP wrote. Which vhost is decided by the canonical site key the router resolved, never re-derived from the `Host` header, so it always agrees with the database file and the RESP credential.
+
+A request whose `Host` matched no vhost has no tenant identity and falls back to the process-global store rather than minting a keyspace from the header. Middleware that genuinely needs node-wide state — operator-owned config a tenant must not be able to rewrite — uses the explicit `kv_*_global` accessors (ABI minor 3).
+
 ### Per-Site Memory Limits
 
 Each site store has its own memory limit and eviction policy. One site filling its cache doesn't evict another site's data:

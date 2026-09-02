@@ -1978,6 +1978,37 @@ impl Router {
         }
     }
 
+    /// The KV store the native-middleware chain should see for this request
+    /// (issue #376).
+    ///
+    /// Scoped to the **canonical site key** on a multi-tenant node, so a
+    /// module's `kv_get`/`kv_incr_ttl` reaches the same physically separate
+    /// store this vhost's PHP reaches through `ephpm_kv_*` — a rate limiter is
+    /// per-tenant by default, and a module can read a key PHP wrote.
+    ///
+    /// `None` (the process-global store) in two cases, both deliberate:
+    ///
+    /// * single-site mode, where there is one store and nothing to isolate;
+    /// * a request that matched **no** vhost, which has no tenant identity to
+    ///   scope to. Note this is the one place the middleware lane deliberately
+    ///   differs from [`SiteIdentities::kv`], which falls back to the
+    ///   normalized `Host` so a catch-all document root keeps per-hostname
+    ///   keyspaces. The chain runs on *every* request, static files included,
+    ///   and site stores are created lazily and never evicted — so minting one
+    ///   per `Host` value here would be a cheap way to grow the site map
+    ///   without bound. A module that wants to bucket unmatched requests has
+    ///   [`ephpm_middleware::UNMATCHED_VHOST`] for the key, in the global
+    ///   store where operator state already lives.
+    fn middleware_kv_store(
+        &self,
+        site_key: Option<&str>,
+    ) -> Option<std::sync::Arc<ephpm_kv::store::Store>> {
+        let key = site_key?;
+        // `get_site_store` treats the empty string as "the default store", but
+        // `site_key` is `Some` here so the key is a real, validated vhost name.
+        Some(self.multi_tenant_kv.as_ref()?.get_site_store(key))
+    }
+
     /// Resolve, and lazily create, this vhost's private temp + session
     /// directories, returning the paths to inject into the per-request PHP
     /// sandbox.
@@ -2506,6 +2537,7 @@ impl Router {
                         if is_cacheable && let Some(client_tag) = &if_none_match {
                             let key = php_etag_cache_key(
                                 &self.php_etag_cache_config.key_prefix,
+                                site_key.as_deref(),
                                 method,
                                 &uri_path,
                                 &query_string,
@@ -2547,6 +2579,7 @@ impl Router {
                         {
                             let key = php_etag_cache_key(
                                 &self.php_etag_cache_config.key_prefix,
+                                site_key.as_deref(),
                                 method,
                                 &uri_path,
                                 &query_string,
@@ -2581,6 +2614,7 @@ impl Router {
                         &uri_path,
                         &query_string,
                         effective_addr,
+                        site_key.as_deref(),
                         &host,
                         is_https,
                     ) {
@@ -2664,6 +2698,7 @@ impl Router {
                     &uri_path,
                     &query_string,
                     effective_addr,
+                    site_key.as_deref(),
                     &host,
                     is_https,
                 )
@@ -3105,18 +3140,34 @@ impl Router {
                 let cap = usize::try_from(self.middleware_body_limit).unwrap_or(usize::MAX);
                 &b[..b.len().min(cap)]
             });
+            // The vhost identity handed to modules is the CANONICAL site key
+            // (`""` = matched no vhost, which the accessor turns into NULL) —
+            // never the raw `Host`. Modules use it as a tenant identity in
+            // authorization decisions, so it has to be the same derivation the
+            // database file and KV keyspace use (issue #390).
             let ctx = ephpm_middleware::host::RequestCtx::new(
                 &method,
                 &path,
                 &query_string,
                 &remote_addr.ip().to_string(),
-                &server_name,
+                site_key.as_deref().unwrap_or(""),
                 &headers,
             )
             .with_scheme(is_https)
             .with_host(&normalize_host_key(&server_name))
             .with_body(body_view);
-            match chain.evaluate(&ctx, &path) {
+            // Scope the chain's KV callbacks to this request's vhost keyspace
+            // (issue #376) — the same store PHP gets below. The guard is held
+            // across the synchronous `evaluate` only and dropped before any
+            // `.await`: it is thread-local state, and a suspended task can
+            // resume on a different tokio worker.
+            let verdict = {
+                let _kv_scope = ephpm_middleware::host::enter_site_kv(
+                    self.middleware_kv_store(site_key.as_deref()),
+                );
+                chain.evaluate(&ctx, &path)
+            };
+            match verdict {
                 crate::middleware::ChainVerdict::Respond { status, body, headers } => {
                     return middleware_response(status, body, &headers);
                 }
@@ -4194,6 +4245,7 @@ impl Router {
         path: &str,
         query: &str,
         remote_addr: SocketAddr,
+        site_key: Option<&str>,
         server_name: &str,
         is_https: bool,
     ) -> StaticGate {
@@ -4202,17 +4254,21 @@ impl Router {
         };
         // Static requests carry no buffered body, but scheme/host are still
         // authoritative from the connection (a `force_https` gate on static
-        // assets needs the real scheme).
+        // assets needs the real scheme). The vhost identity is the canonical
+        // site key, exactly as on the PHP path (issue #390).
         let ctx = ephpm_middleware::host::RequestCtx::new(
             method,
             path,
             query,
             &remote_addr.ip().to_string(),
-            server_name,
+            site_key.unwrap_or(""),
             req_headers.unwrap_or(&[]),
         )
         .with_scheme(is_https)
         .with_host(&normalize_host_key(server_name));
+        // Per-vhost KV scope, exactly as on the PHP path (issue #376). This
+        // method is synchronous throughout, so the guard never spans an await.
+        let _kv_scope = ephpm_middleware::host::enter_site_kv(self.middleware_kv_store(site_key));
         match chain.evaluate(&ctx, path) {
             crate::middleware::ChainVerdict::Respond { status, body, headers } => {
                 StaticGate::Respond(middleware_response(status, body, &headers))
@@ -4243,6 +4299,7 @@ impl Router {
         path: &str,
         query: &str,
         remote_addr: SocketAddr,
+        site_key: Option<&str>,
         server_name: &str,
         is_https: bool,
     ) -> Response<ServerBody> {
@@ -4297,18 +4354,25 @@ impl Router {
             path,
             query,
             &remote_addr.ip().to_string(),
-            server_name,
+            site_key.unwrap_or(""),
             req_headers.unwrap_or(&[]),
         )
         .with_scheme(is_https)
         .with_host(&normalize_host_key(server_name));
-        let outcome = chain.run_response_phase(
-            &ctx,
-            path,
-            parts.status.as_u16(),
-            decodable,
-            collected.to_vec(),
-        );
+        // Per-vhost KV scope for the response phase too (issue #376). Scoped
+        // to the synchronous call: the body `.collect().await` above is
+        // already done, and nothing awaits between here and the drop.
+        let outcome = {
+            let _kv_scope =
+                ephpm_middleware::host::enter_site_kv(self.middleware_kv_store(site_key));
+            chain.run_response_phase(
+                &ctx,
+                path,
+                parts.status.as_u16(),
+                decodable,
+                collected.to_vec(),
+            )
+        };
 
         parts.status = StatusCode::from_u16(outcome.status).unwrap_or(parts.status);
         parts.headers.clear();
@@ -5456,12 +5520,40 @@ pub fn brotli_compress(
 
 /// Build the KV store key for caching a PHP response's `ETag`.
 ///
-/// Format: `{prefix}{method}:{path}` or `{prefix}{method}:{path}?{query}` if query string is present.
-fn php_etag_cache_key(prefix: &str, method: &str, path: &str, query: &str) -> String {
+/// Format: `{prefix}{site}:{method}:{path}`, with `?{query}` appended when a
+/// query string is present.
+///
+/// # Why the site key is in there (issue #366)
+///
+/// The cache lives in the process-wide [`Store`], so on a multi-tenant node
+/// every vhost shares one keyspace. Without a site component
+/// `tenant-a.example/index.php` and `tenant-b.example/index.php` normalize to
+/// the *same* key, and one tenant's content hash decides whether the other
+/// tenant gets a `304 Not Modified` — a cross-tenant boundary crossing, not
+/// merely a stale cache. The site key is the same canonical value
+/// [`Router::resolve_site`] produced for this request (never re-derived from
+/// the `Host` header), so it names the same tenant as the database file, the
+/// KV keyspace and the OPcache vhost. Same model as
+/// [`opcache_vhost_key`]: global store, tenant baked into the key.
+///
+/// `site_key` is `None` for a host that matched no known vhost, which renders
+/// as the **empty** site component (`etag::GET:/x`). Empty is deliberately not
+/// a spellable site key — [`is_valid_site_key`] rejects it outright — so the
+/// unmatched-host bucket can never be reached by naming a site, and no named
+/// site can land in it. (`_default`, the sentinel OPcache uses, would be
+/// collidable here: it is a legal `sites_dir` directory name.)
+fn php_etag_cache_key(
+    prefix: &str,
+    site_key: Option<&str>,
+    method: &str,
+    path: &str,
+    query: &str,
+) -> String {
+    let site = site_key.unwrap_or("");
     if query.is_empty() {
-        format!("{prefix}{method}:{path}")
+        format!("{prefix}{site}:{method}:{path}")
     } else {
-        format!("{prefix}{method}:{path}?{query}")
+        format!("{prefix}{site}:{method}:{path}?{query}")
     }
 }
 
@@ -7598,14 +7690,14 @@ mod tests {
 
     #[test]
     fn test_php_etag_cache_key_without_query() {
-        let key = php_etag_cache_key("etag:", "GET", "/api/data", "");
-        assert_eq!(key, "etag:GET:/api/data");
+        let key = php_etag_cache_key("etag:", None, "GET", "/api/data", "");
+        assert_eq!(key, "etag::GET:/api/data");
     }
 
     #[test]
     fn test_php_etag_cache_key_with_query() {
-        let key = php_etag_cache_key("etag:", "POST", "/api/users", "id=42");
-        assert_eq!(key, "etag:POST:/api/users?id=42");
+        let key = php_etag_cache_key("etag:", None, "POST", "/api/users", "id=42");
+        assert_eq!(key, "etag::POST:/api/users?id=42");
     }
 
     #[test]
@@ -7947,32 +8039,76 @@ mod tests {
 
     #[test]
     fn etag_cache_key_without_query() {
-        let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
-        assert_eq!(key, "etag:GET:/index.php");
+        let key = php_etag_cache_key("etag:", None, "GET", "/index.php", "");
+        assert_eq!(key, "etag::GET:/index.php");
     }
 
     #[test]
     fn etag_cache_key_with_query() {
-        let key = php_etag_cache_key("etag:", "GET", "/api/data", "page=1&sort=name");
-        assert_eq!(key, "etag:GET:/api/data?page=1&sort=name");
+        let key = php_etag_cache_key("etag:", None, "GET", "/api/data", "page=1&sort=name");
+        assert_eq!(key, "etag::GET:/api/data?page=1&sort=name");
     }
 
     #[test]
     fn etag_cache_key_head_method() {
-        let key = php_etag_cache_key("etag:", "HEAD", "/status", "");
-        assert_eq!(key, "etag:HEAD:/status");
+        let key = php_etag_cache_key("etag:", None, "HEAD", "/status", "");
+        assert_eq!(key, "etag::HEAD:/status");
     }
 
     #[test]
     fn etag_cache_key_custom_prefix() {
-        let key = php_etag_cache_key("cache:", "GET", "/page", "");
-        assert_eq!(key, "cache:GET:/page");
+        let key = php_etag_cache_key("cache:", None, "GET", "/page", "");
+        assert_eq!(key, "cache::GET:/page");
+    }
+
+    /// Two vhosts requesting the identical path must never share an ETag cache
+    /// entry (issue #366). Before the site component existed, both sites keyed
+    /// `etag:GET:/index.php` and tenant A's content hash could 304 tenant B.
+    #[test]
+    fn etag_cache_key_two_sites_same_path_never_collide() {
+        let a = php_etag_cache_key("etag:", Some("tenant-a"), "GET", "/index.php", "");
+        let b = php_etag_cache_key("etag:", Some("tenant-b"), "GET", "/index.php", "");
+        assert_ne!(a, b, "two tenants must not share one ETag cache entry");
+        assert_eq!(a, "etag:tenant-a:GET:/index.php");
+        assert_eq!(b, "etag:tenant-b:GET:/index.php");
+    }
+
+    /// The unmatched-host bucket is unreachable by naming a site. The empty
+    /// site component is not a spellable key — `is_valid_site_key("")` is
+    /// false — so no vhost can be created that lands in it, and it cannot
+    /// collide with a named site the way a `_default`-style sentinel could.
+    #[test]
+    fn etag_cache_key_unmatched_host_bucket_is_unspellable() {
+        let none = php_etag_cache_key("etag:", None, "GET", "/index.php", "");
+        assert_eq!(none, "etag::GET:/index.php");
+        assert!(!is_valid_site_key(""), "empty must stay an unspellable site key");
+        // A site literally named `_default` (a legal `sites_dir` directory)
+        // gets its own bucket rather than the unmatched-host one.
+        let sentinel_named_site =
+            php_etag_cache_key("etag:", Some("_default"), "GET", "/index.php", "");
+        assert_ne!(none, sentinel_named_site);
+    }
+
+    /// A site key that differs only in the vhost dimension still separates
+    /// every other dimension of the key — method and query keep working.
+    #[test]
+    fn etag_cache_key_site_is_orthogonal_to_method_and_query() {
+        let a_get = php_etag_cache_key("etag:", Some("a"), "GET", "/x", "");
+        let a_head = php_etag_cache_key("etag:", Some("a"), "HEAD", "/x", "");
+        let b_get = php_etag_cache_key("etag:", Some("b"), "GET", "/x", "");
+        let a_get_q = php_etag_cache_key("etag:", Some("a"), "GET", "/x", "v=2");
+        let all = [&a_get, &a_head, &b_get, &a_get_q];
+        for (i, left) in all.iter().enumerate() {
+            for right in all.iter().skip(i + 1) {
+                assert_ne!(left, right, "cache keys must be pairwise distinct");
+            }
+        }
     }
 
     #[test]
     fn etag_store_and_retrieve() {
         let store = test_store();
-        let key = php_etag_cache_key("etag:", "GET", "/test.php", "");
+        let key = php_etag_cache_key("etag:", None, "GET", "/test.php", "");
 
         // Store an ETag.
         store.set(key.clone(), b"\"v1\"".to_vec(), None);
@@ -7986,7 +8122,7 @@ mod tests {
     #[test]
     fn etag_store_overwrites_previous() {
         let store = test_store();
-        let key = php_etag_cache_key("etag:", "GET", "/test.php", "");
+        let key = php_etag_cache_key("etag:", None, "GET", "/test.php", "");
 
         store.set(key.clone(), b"\"v1\"".to_vec(), None);
         store.set(key.clone(), b"\"v2\"".to_vec(), None);
@@ -8020,7 +8156,7 @@ mod tests {
     #[test]
     fn etag_cache_respects_ttl_zero_as_indefinite() {
         let store = test_store();
-        let key = php_etag_cache_key("etag:", "GET", "/page", "");
+        let key = php_etag_cache_key("etag:", None, "GET", "/page", "");
 
         // TTL of None means indefinite storage.
         store.set(key.clone(), b"\"forever\"".to_vec(), None);
@@ -8033,8 +8169,8 @@ mod tests {
     #[test]
     fn etag_cache_different_methods_different_keys() {
         let store = test_store();
-        let get_key = php_etag_cache_key("etag:", "GET", "/page", "");
-        let head_key = php_etag_cache_key("etag:", "HEAD", "/page", "");
+        let get_key = php_etag_cache_key("etag:", None, "GET", "/page", "");
+        let head_key = php_etag_cache_key("etag:", None, "HEAD", "/page", "");
 
         store.set(get_key.clone(), b"\"get-v1\"".to_vec(), None);
         store.set(head_key.clone(), b"\"head-v1\"".to_vec(), None);
@@ -8046,8 +8182,8 @@ mod tests {
     #[test]
     fn etag_cache_different_paths_different_keys() {
         let store = test_store();
-        let key_a = php_etag_cache_key("etag:", "GET", "/page-a", "");
-        let key_b = php_etag_cache_key("etag:", "GET", "/page-b", "");
+        let key_a = php_etag_cache_key("etag:", None, "GET", "/page-a", "");
+        let key_b = php_etag_cache_key("etag:", None, "GET", "/page-b", "");
 
         store.set(key_a.clone(), b"\"a-v1\"".to_vec(), None);
         store.set(key_b.clone(), b"\"b-v1\"".to_vec(), None);
@@ -8059,8 +8195,8 @@ mod tests {
     #[test]
     fn etag_cache_query_string_differentiates() {
         let store = test_store();
-        let key_no_qs = php_etag_cache_key("etag:", "GET", "/api", "");
-        let key_with_qs = php_etag_cache_key("etag:", "GET", "/api", "v=2");
+        let key_no_qs = php_etag_cache_key("etag:", None, "GET", "/api", "");
+        let key_with_qs = php_etag_cache_key("etag:", None, "GET", "/api", "v=2");
 
         store.set(key_no_qs.clone(), b"\"no-qs\"".to_vec(), None);
         store.set(key_with_qs.clone(), b"\"with-qs\"".to_vec(), None);
@@ -8072,7 +8208,7 @@ mod tests {
     #[test]
     fn etag_cache_304_logic_matches_stored() {
         let store = test_store();
-        let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
+        let key = php_etag_cache_key("etag:", None, "GET", "/index.php", "");
         store.set(key.clone(), b"\"cached-v1\"".to_vec(), None);
 
         // Simulate the cache lookup that happens in handle().
@@ -8089,7 +8225,7 @@ mod tests {
     #[test]
     fn etag_cache_304_logic_no_match() {
         let store = test_store();
-        let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
+        let key = php_etag_cache_key("etag:", None, "GET", "/index.php", "");
         store.set(key.clone(), b"\"cached-v1\"".to_vec(), None);
 
         let stored_bytes = store.get(&key).unwrap();
@@ -8103,7 +8239,7 @@ mod tests {
     #[test]
     fn etag_cache_miss_returns_none() {
         let store = test_store();
-        let key = php_etag_cache_key("etag:", "GET", "/nonexistent.php", "");
+        let key = php_etag_cache_key("etag:", None, "GET", "/nonexistent.php", "");
 
         // No entry → cache miss → execute PHP.
         assert!(store.get(&key).is_none());
@@ -8114,7 +8250,7 @@ mod tests {
         use std::time::Duration;
 
         let store = test_store();
-        let key = php_etag_cache_key("etag:", "GET", "/page.php", "");
+        let key = php_etag_cache_key("etag:", None, "GET", "/page.php", "");
 
         // Store with 1-second TTL.
         store.set(key.clone(), b"\"ttl-v1\"".to_vec(), Some(Duration::from_secs(1)));
@@ -8185,7 +8321,7 @@ echo "content here";
             assert_eq!(etag, Some("\"test-v1\""));
 
             // ETag should be stored in the KV store
-            let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
+            let key = php_etag_cache_key("etag:", None, "GET", "/index.php", "");
             let stored = store.get(&key);
             assert!(stored.is_some());
             assert_eq!(stored.unwrap(), b"\"test-v1\"");
@@ -8207,7 +8343,7 @@ echo "should not see this";
             let router = test_router_with_store(dir.path(), Arc::clone(&store));
 
             // Pre-seed the store with an ETag
-            let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
+            let key = php_etag_cache_key("etag:", None, "GET", "/index.php", "");
             store.set(key, b"\"test-v2\"".to_vec(), None);
 
             // Make request with matching If-None-Match
@@ -8235,7 +8371,7 @@ echo "new content";
             let router = test_router_with_store(dir.path(), Arc::clone(&store));
 
             // Pre-seed the store with a different ETag
-            let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
+            let key = php_etag_cache_key("etag:", None, "GET", "/index.php", "");
             store.set(key.clone(), b"\"old-version\"".to_vec(), None);
 
             // Make request with different If-None-Match
@@ -8275,7 +8411,7 @@ echo "no etag";
             assert!(resp.headers().get("etag").is_none());
 
             // KV store should not have an entry for this path
-            let key = php_etag_cache_key("etag:", "GET", "/index.php", "");
+            let key = php_etag_cache_key("etag:", None, "GET", "/index.php", "");
             assert!(store.get(&key).is_none());
         }
 
@@ -8300,7 +8436,7 @@ echo "post response";
             assert_eq!(resp.status(), StatusCode::OK);
 
             // POST responses should NOT be cached in KV store (only GET/HEAD)
-            let key = php_etag_cache_key("etag:", "POST", "/index.php", "");
+            let key = php_etag_cache_key("etag:", None, "POST", "/index.php", "");
             assert!(store.get(&key).is_none());
         }
     }
@@ -9383,6 +9519,12 @@ echo "post response";
             kv: String,
             /// The OPcache invalidation vhost.
             opcache: String,
+            /// (5) the PHP response's `ETag` cache key for a fixed
+            /// method+path+query. Joined the invariant in #366: it lives in the
+            /// process-wide store, so without the canonical key in it two
+            /// vhosts serving the same path share one entry and tenant A's
+            /// content hash can 304 tenant B.
+            etag_cache_key: String,
         }
 
         /// Run every derivation for `host` exactly the way a request does.
@@ -9411,6 +9553,13 @@ echo "post response";
                 wire_password: env.get("DB_PASSWORD").cloned(),
                 kv: ids.kv,
                 opcache: ids.opcache,
+                etag_cache_key: php_etag_cache_key(
+                    "etag:",
+                    resolved.key.as_deref(),
+                    "GET",
+                    "/index.php",
+                    "",
+                ),
             }
         }
 
@@ -9449,6 +9598,7 @@ echo "post response";
             assert_eq!(expected.wire_user.as_deref(), Some("shop"));
             assert_eq!(expected.kv, "shop");
             assert_eq!(expected.opcache, "shop");
+            assert_eq!(expected.etag_cache_key, "etag:shop:GET:/index.php");
 
             for host in spellings {
                 assert_eq!(
@@ -9566,6 +9716,57 @@ echo "post response";
             assert_ne!(bare.db_path, dotted.db_path);
             assert_ne!(bare.state_root, dotted.state_root);
             assert_ne!(bare.wire_password, dotted.wire_password);
+            // Issue #366: the same URL path on two vhosts must not resolve to
+            // one ETag cache entry — that entry decides a 304, so sharing it
+            // lets one tenant's content hash answer for the other's.
+            assert_ne!(
+                bare.etag_cache_key, dotted.etag_cache_key,
+                "two tenants requesting the same path must not share an ETag cache entry — #366"
+            );
+        }
+
+        /// The whole point of #366, stated directly: two *different* vhosts
+        /// asking for the identical method+path+query never collide, and every
+        /// spelling of one vhost always does. The suffix is configured here so
+        /// `shop.local` and `shop` are the SAME tenant while `blog` is not —
+        /// which is exactly the discrimination a `Host`-derived key gets wrong.
+        #[tokio::test]
+        async fn etag_cache_key_isolates_two_sites_on_the_same_path() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            let dbdir = dir.path().join("dbs");
+            for name in ["shop", "blog"] {
+                fs::create_dir_all(sites.join(name)).unwrap();
+            }
+
+            let backends =
+                SiteBackends::new(dbdir.clone(), 8, stats(), tokio::runtime::Handle::current())
+                    .expect("registry");
+            let auth = SiteWireAuth::new(backends.clone()).expect("secret");
+            let router = router_with(dir.path(), &sites, &dbdir, Some(".local"), &auth);
+
+            let shop = derive(&router, &backends, "shop.local").etag_cache_key;
+            let blog = derive(&router, &backends, "blog.local").etag_cache_key;
+            let unknown = derive(&router, &backends, "nobody.example.com").etag_cache_key;
+
+            assert_eq!(shop, "etag:shop:GET:/index.php");
+            assert_eq!(blog, "etag:blog:GET:/index.php");
+            // A host that matched no vhost lands in the unspellable bucket, so
+            // it can neither read nor poison a real tenant's entry.
+            assert_eq!(unknown, "etag::GET:/index.php");
+            for (a, b) in [(&shop, &blog), (&shop, &unknown), (&blog, &unknown)] {
+                assert_ne!(a, b, "tenant ETag cache keys must be pairwise distinct — #366");
+            }
+
+            // ...while every legal spelling of ONE tenant still shares its own
+            // entry, or the cache would simply never hit.
+            for spelling in ["shop", "shop.local", "SHOP.LOCAL", "shop.local:8080", "shop."] {
+                assert_eq!(
+                    derive(&router, &backends, spelling).etag_cache_key,
+                    shop,
+                    "`{spelling}` is the same tenant and must share its ETag cache entry"
+                );
+            }
         }
 
         /// The wire path applies [`normalize_host_key`] to the client-asserted
@@ -9591,6 +9792,187 @@ echo "post response";
                 assert_eq!(normalize_host_key(&key), key, "`{key}` must normalize to itself");
                 assert!(is_valid_site_key(&key), "`{key}` must pass the allowlist gate");
             }
+        }
+    }
+
+    /// Issue #376 — which KV store the native-middleware chain is handed.
+    ///
+    /// The chain's `kv_*` callbacks take no request pointer, so the store is
+    /// bound per request via a thread-local scope. These tests pin the
+    /// *selection* — the part that decides tenancy — rather than the FFI
+    /// plumbing (covered by `ephpm_middleware::host`'s own tests).
+    mod middleware_kv_scope {
+        use super::*;
+
+        /// A multi-tenant router sharing one `MultiTenantStore`, exactly as
+        /// `start_kv_service` builds it for the RESP listener and the PHP path.
+        fn multi_tenant_router(
+            dir: &Path,
+            sites: &Path,
+        ) -> (Router, Arc<Store>, ephpm_kv::multi_tenant::MultiTenantStore) {
+            let config = Config {
+                server: ServerConfig {
+                    listen: "0.0.0.0:8080".to_string(),
+                    document_root: dir.to_path_buf(),
+                    sites_dir: Some(sites.to_path_buf()),
+                    sites_domain_suffix: Some(".local".to_string()),
+                    ..ServerConfig::default()
+                },
+                php: PhpConfig::default(),
+                db: DbConfig::default(),
+                kv: KvConfig::default(),
+                cluster: ClusterConfig::default(),
+                middleware: Vec::new(),
+                opcache: ephpm_config::OpcacheConfig::default(),
+            };
+            let global = test_store();
+            let mt = ephpm_kv::multi_tenant::MultiTenantStore::new(
+                Arc::clone(&global),
+                StoreConfig::default(),
+            );
+            let router =
+                Router::new(&config, Arc::clone(&global), Some(mt.clone()), None, None, None, None);
+            (router, global, mt)
+        }
+
+        /// Two vhosts get two physically separate stores, and each is the same
+        /// `Arc` PHP's `ephpm_kv_*` resolves for that vhost — so a module and
+        /// the app it fronts share a keyspace, and two tenants never do.
+        #[tokio::test]
+        async fn each_site_gets_its_own_store_and_it_is_phps_store() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            for name in ["shop", "blog"] {
+                fs::create_dir_all(sites.join(name)).unwrap();
+            }
+            let (router, global, mt) = multi_tenant_router(dir.path(), &sites);
+
+            let shop = router
+                .middleware_kv_store(router.resolve_site("shop.local").key.as_deref())
+                .expect("a matched vhost gets its own store");
+            let blog = router
+                .middleware_kv_store(router.resolve_site("blog.local").key.as_deref())
+                .expect("a matched vhost gets its own store");
+
+            assert!(!Arc::ptr_eq(&shop, &blog), "two tenants must not share one store");
+            assert!(!Arc::ptr_eq(&shop, &global), "a tenant must not be handed the global store");
+
+            // The same handle the PHP bridge is given for that vhost — this is
+            // what makes "middleware reads a key PHP wrote" true (#376 case 1).
+            assert!(Arc::ptr_eq(&shop, &mt.get_site_store("shop")));
+            assert!(Arc::ptr_eq(&blog, &mt.get_site_store("blog")));
+
+            // And the separation is physical, not a key prefix.
+            shop.set("same-name".into(), b"shop".to_vec(), None);
+            assert_eq!(blog.get("same-name"), None);
+            assert_eq!(global.get("same-name"), None);
+        }
+
+        /// Every legal spelling of one tenant lands on one store, or a module's
+        /// per-tenant state would fragment the way #390's raw `Host` key did.
+        #[tokio::test]
+        async fn every_spelling_of_one_tenant_resolves_the_same_store() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            fs::create_dir_all(sites.join("shop")).unwrap();
+            let (router, ..) = multi_tenant_router(dir.path(), &sites);
+
+            let expected = router
+                .middleware_kv_store(router.resolve_site("shop.local").key.as_deref())
+                .expect("known site");
+            for spelling in ["shop", "shop.local", "SHOP.LOCAL", "shop.local:8080", "shop."] {
+                let got = router
+                    .middleware_kv_store(router.resolve_site(spelling).key.as_deref())
+                    .expect("known site");
+                assert!(Arc::ptr_eq(&expected, &got), "`{spelling}` must reach one store");
+            }
+        }
+
+        /// A host that matched no vhost has no tenant identity, so it gets the
+        /// process-global store (`None` = no override) rather than a keyspace
+        /// minted from the header. The chain runs on every request, static
+        /// files included, and site stores are never evicted — a `Host`-derived
+        /// store here would grow the site map without bound.
+        #[tokio::test]
+        async fn an_unmatched_host_gets_no_site_store() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            fs::create_dir_all(sites.join("shop")).unwrap();
+            let (router, _global, mt) = multi_tenant_router(dir.path(), &sites);
+
+            for host in ["nobody.example.com", "127.0.0.1:8080", "not-a-site"] {
+                let resolved = router.resolve_site(host);
+                assert_eq!(resolved.key, None, "`{host}` names no vhost");
+                assert!(
+                    router.middleware_kv_store(resolved.key.as_deref()).is_none(),
+                    "`{host}` must not mint a keyspace"
+                );
+            }
+            assert_eq!(mt.site_count(), 0, "no site store may be created by an unknown Host");
+        }
+
+        /// Single-site mode has one store and nothing to isolate, so the scope
+        /// is never overridden — the pre-#376 behaviour, unchanged.
+        #[tokio::test]
+        async fn single_site_mode_never_overrides_the_global_store() {
+            let dir = tempfile::tempdir().unwrap();
+            let router = test_router(dir.path());
+            assert!(router.middleware_kv_store(None).is_none());
+            assert!(router.middleware_kv_store(Some("anything")).is_none());
+        }
+
+        /// Selecting the right store is only half of it — the router has to
+        /// actually *enter* the scope around the chain. This drives a real
+        /// mounted module end to end through `static_request_phase` (the one
+        /// chain-invoking path with no PHP runtime in it) and reads the effect
+        /// out of the store: a per-tenant counter must land in the tenant's own
+        /// store and nowhere else.
+        #[tokio::test]
+        async fn the_router_enters_the_site_scope_around_the_chain() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            for name in ["shop", "blog"] {
+                fs::create_dir_all(sites.join(name)).unwrap();
+            }
+            let (router, global, mt) = multi_tenant_router(dir.path(), &sites);
+            // A generous budget: this test is about *where* the counter lands,
+            // not about tripping the limit.
+            let chain =
+                crate::middleware::MiddlewareChain::load(&[ephpm_config::MiddlewareMount {
+                    library: "ratelimit".to_string(),
+                    match_pattern: None,
+                    order: 10,
+                    config: Some(serde_json::json!({ "per_ip_rps": 1000 })),
+                }])
+                .expect("load builtin ratelimit");
+            let router = router.with_middleware_chain(Some(Arc::new(chain)));
+
+            let addr: SocketAddr = "198.51.100.20:5000".parse().unwrap();
+            let gate = |site: Option<&str>| {
+                router.static_request_phase(None, "GET", "/a.css", "", addr, site, "ignored", false)
+            };
+            assert!(matches!(gate(Some("shop")), StaticGate::Continue(_)));
+            assert!(matches!(gate(Some("blog")), StaticGate::Continue(_)));
+
+            // The module writes `mw:rl:<vhost>:<client>:<window>`. Find it in
+            // each tenant's own store, and confirm the counter is per-tenant.
+            let shop_store = mt.get_site_store("shop");
+            let blog_store = mt.get_site_store("blog");
+            let count_in = |store: &Arc<Store>, vhost: &str| -> Option<i64> {
+                store
+                    .keys(&format!("mw:rl:{vhost}:*"))
+                    .first()
+                    .and_then(|k| store.get(k))
+                    .and_then(|v| String::from_utf8_lossy(&v).parse().ok())
+            };
+            assert_eq!(count_in(&shop_store, "shop"), Some(1), "shop counted in shop's store");
+            assert_eq!(count_in(&blog_store, "blog"), Some(1), "blog counted in blog's store");
+            assert_eq!(count_in(&shop_store, "blog"), None, "no cross-tenant key in shop's store");
+            assert_eq!(count_in(&blog_store, "shop"), None, "no cross-tenant key in blog's store");
+            // And nothing leaked into the process-global store, which is where
+            // operator-owned middleware state lives (#384).
+            assert_eq!(count_in(&global, "shop"), None);
+            assert_eq!(count_in(&global, "blog"), None);
         }
     }
 

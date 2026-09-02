@@ -44,13 +44,28 @@ use std::os::raw::{c_char, c_int};
 /// Current ABI version (`0xMMmmmmmm`: major byte gates compatibility, the
 /// lower three bytes are an additive minor level).
 ///
-/// `0x0100_0002` = major **1**, minor **2**.
+/// `0x0100_0003` = major **1**, minor **3**.
 ///
 /// - Minor 1 added the optional response phase (the [`SYM_INVOKE_RESPONSE`]
 ///   symbol and the three appended `response_*` accessors on [`EphpmHostV1`]).
 /// - Minor 2 added three appended request accessors — [`request_scheme`],
 ///   [`request_is_secure`], and [`request_host`] — and gave the pre-existing
 ///   [`request_body`] slot real (bounded, buffered) semantics.
+/// - Minor 3 is the multi-tenancy correctness pass. It **redefines** two
+///   pre-existing surfaces rather than only appending to them:
+///   * [`request_vhost_id`] now returns the router's **canonical site key**
+///     (NULL when the host matched no vhost) instead of the raw `Host`
+///     header (issue #390);
+///   * the `kv_*` callbacks now resolve **this request's per-site keyspace**
+///     on a multi-tenant node instead of always hitting the process-global
+///     store (issue #376), with the global store still reachable through the
+///     appended `kv_*_global` slots ([`ABI_MINOR_GLOBAL_KV`]).
+///
+///   The `kv_*` redefinition is a no-op on a single-site node (one tenant, one
+///   store). **`request_vhost_id` is not** — a single-site node matches no
+///   vhost, so it returns NULL on *every* request there, where it used to
+///   return the `Host`. C modules must null-check it. See
+///   [`ABI_MINOR_GLOBAL_KV`] for the migration note.
 ///
 /// The major byte is unchanged across every minor, so **every** module built
 /// against major 1 still loads: growth is additive.
@@ -59,7 +74,8 @@ use std::os::raw::{c_char, c_int};
 /// [`request_is_secure`]: EphpmHostV1::request_is_secure
 /// [`request_host`]: EphpmHostV1::request_host
 /// [`request_body`]: EphpmHostV1::request_body
-pub const ABI_V1: u32 = 0x0100_0002;
+/// [`request_vhost_id`]: EphpmHostV1::request_vhost_id
+pub const ABI_V1: u32 = 0x0100_0003;
 
 /// Major version — the compatibility gate. A module refuses to init when the
 /// host's major (`host.abi_version >> 24`) is newer than its own.
@@ -72,7 +88,7 @@ pub const ABI_MAJOR: u32 = 1;
 /// those trailing fields, and reading past a shorter table is undefined
 /// behaviour. See [`ABI_MINOR_RESPONSE_PHASE`] and
 /// [`ABI_MINOR_REQUEST_ACCESSORS`].
-pub const ABI_MINOR: u32 = 2;
+pub const ABI_MINOR: u32 = 3;
 
 /// The minor version that introduced the response phase — the three
 /// `response_*` accessors on [`EphpmHostV1`] and the [`SYM_INVOKE_RESPONSE`]
@@ -89,6 +105,51 @@ pub const ABI_MINOR_RESPONSE_PHASE: u32 = 1;
 /// this — its slot has existed since minor 0; only its buffered semantics are
 /// new — so a minor-0 module that already called it stays correct.)
 pub const ABI_MINOR_REQUEST_ACCESSORS: u32 = 2;
+
+/// The minor version that introduced the appended process-global KV
+/// accessors — [`EphpmHostV1::kv_get_global`] and its four siblings — and, in
+/// the same pass, **redefined** two pre-existing surfaces for multi-tenant
+/// correctness. A module needs `host.abi_version & 0x00FF_FFFF >=` this before
+/// calling any `kv_*_global` slot.
+///
+/// # What changed for an existing module
+///
+/// ## [`EphpmHostV1::request_vhost_id`] — changes on **every** node (#390)
+///
+/// It returns the router's canonical site key rather than the raw `Host`, and
+/// **NULL** rather than a client-supplied string when no vhost matched.
+///
+/// The NULL is not a rare edge case. The router's `resolve_site`
+/// short-circuits to its no-site branch whenever neither `sites_dir` nor any
+/// `[[site]]` is configured, so on a **single-site node — the most common
+/// deployment shape — this slot returns NULL on every single request**, where
+/// in minor ≤ 2 it returned the `Host` and was never NULL.
+///
+/// **A C module MUST null-check it.** `strcmp(host->request_vhost_id(req), …)`
+/// was safe against every prior minor and segfaults now. Rust modules get a
+/// compile error instead: the safe wrapper returns `Option<&str>`.
+///
+/// The behaviour is deliberate — no vhost matched means no tenant, and
+/// inventing one from a client-supplied header is exactly the bug #390 fixed.
+/// [`EphpmHostV1::request_host`] still gives the host as sent, for the cases
+/// that genuinely want it.
+///
+/// Note this also renames keys built from the vhost id, once, at upgrade — on
+/// a single-site node to whatever the module substitutes for "no tenant"
+/// (the stock modules use `ephpm_middleware::UNMATCHED_VHOST`).
+///
+/// ## The `kv_*` slots — change only on a multi-tenant node (#376)
+///
+/// They resolve **this request's** per-vhost keyspace rather than the
+/// process-global store. A module that was relying on node-wide `kv_*` state —
+/// an edge-wide rate limiter, an operator-owned config key — must move those
+/// calls to the matching `kv_*_global` slot. Everything per-tenant should stay
+/// where it is and simply becomes isolated, and now shares a keyspace with the
+/// tenant's `ephpm_kv_*`.
+///
+/// This half genuinely *is* a no-op on a single-site node: there is one store,
+/// and both the scoped and global slots reach it.
+pub const ABI_MINOR_GLOBAL_KV: u32 = 3;
 
 /// Middleware verdicts for one request.
 pub const ACTION_CONTINUE: c_int = 0;
@@ -203,6 +264,13 @@ pub struct EphpmResponseEdit {
 /// KV operations hit the embedded, gossip-replicated store — the same data
 /// PHP sees through `ephpm_kv_*` — which is what makes a cluster-wide rate
 /// limiter a single `kv_incr_ttl` call.
+///
+/// Since minor 3 the `kv_*` slots resolve **the keyspace of the vhost serving
+/// the current request**, so "the same data PHP sees" holds per tenant on a
+/// multi-tenant node rather than only on a single-site one. The process-global
+/// store — where operator-owned state lives, out of reach of any tenant's
+/// PHP — is reachable through the appended `kv_*_global` slots. See
+/// [`ABI_MINOR_GLOBAL_KV`].
 #[repr(C)]
 pub struct EphpmHostV1 {
     /// Host ABI version (== [`ABI_V1`] for this table).
@@ -237,7 +305,35 @@ pub struct EphpmHostV1 {
     /// This slot has existed since minor 0 (it returned 0 then); only the
     /// buffered semantics are new in minor 2, so it needs no minor gate.
     pub request_body: unsafe extern "C" fn(*const EphpmRequest, out_ptr: *mut *const u8) -> usize,
-    /// Identity of the vhost/site serving this request (server name).
+    /// The **canonical site key** of the vhost serving this request, or NULL
+    /// when the request matched no known virtual host.
+    ///
+    /// This is the value the router's one host→tenant derivation produced —
+    /// the same identity that selects this request's per-site database file,
+    /// KV keyspace and OPcache vhost. It is suffix-stripped, port-stripped,
+    /// lowercased and allowlist-validated, so `Host: Site.Example`,
+    /// `site.example:8080` and `site.example.` all yield one key.
+    ///
+    /// **NULL means "no tenant", and a module must not invent one.** ePHPm
+    /// does not reject unrecognised hosts by default, so any host that matched
+    /// no vhost is an arbitrary client-supplied string; returning NULL is what
+    /// lets a gate tell "tenant `foo`" from "someone sent `Host: foo`" and
+    /// fail closed instead of keying policy on attacker input.
+    ///
+    /// **NULL-check this, always.** It is not a rare edge case: a **single-site
+    /// node matches no vhost at all**, so this returns NULL on *every* request
+    /// there — and that is the most common deployment shape. In minor ≤ 2 the
+    /// slot was never NULL, so a C module doing
+    /// `strcmp(host->request_vhost_id(req), …)` was safe then and crashes now.
+    /// See [`ABI_MINOR_GLOBAL_KV`] for the full migration note.
+    ///
+    /// Changed in **minor 3** (issue #390). Before that this returned the raw
+    /// `Host` header with only the port stripped — un-normalized, never NULL.
+    /// Three separate modules had each re-normalized it locally, one of them
+    /// with an auth bypass (a `Host` differing only in letter case missed its
+    /// credential entry). For the un-normalized/raw view use
+    /// [`request_host`](Self::request_host), which is the normalized request
+    /// host and is explicitly *not* a tenant identity.
     pub request_vhost_id: unsafe extern "C" fn(*const EphpmRequest) -> *const c_char,
 
     // ── KV store ─────────────────────────────────────────────────────────
@@ -334,10 +430,62 @@ pub struct EphpmHostV1 {
     pub request_is_secure: unsafe extern "C" fn(*const EphpmRequest) -> c_int,
     /// Normalized request `Host` — port stripped, one trailing FQDN-root dot
     /// stripped, lowercased (the same normalization the router uses to key a
-    /// vhost). Distinct from [`request_vhost_id`](Self::request_vhost_id),
-    /// which is the un-normalized server name. Empty (never null) when the
+    /// vhost). **Not a tenant identity**: it is what the client sent, not what
+    /// the router matched, and it is populated even for a host that names no
+    /// vhost. Use [`request_vhost_id`](Self::request_vhost_id) for tenancy
+    /// decisions and this only when you genuinely want the request host (a
+    /// canonical-host redirect, a log line). Empty (never null) when the
     /// request carried no usable `Host`.
     pub request_host: unsafe extern "C" fn(*const EphpmRequest) -> *const c_char,
+
+    // ── Process-global KV (minor 3) ───────────────────────────────────────
+    //
+    // Appended after `request_host`. A module that reads these must first
+    // confirm `abi_version & 0x00FF_FFFF >= ABI_MINOR_GLOBAL_KV`.
+    //
+    // The same five operations as the `kv_*` slots above, against the
+    // **process-wide** store instead of this request's per-site keyspace. Use
+    // them only for state that is genuinely node-scoped: operator-owned
+    // configuration, which must live where no tenant's PHP can rewrite it, or
+    // a deliberately node-wide edge counter. Anything belonging to the tenant
+    // being served belongs in the request-scoped `kv_*` slots — which is where
+    // PHP's `ephpm_kv_*` puts it, so the two lanes meet there by default.
+    //
+    // On a single-site node these reach the same store as `kv_*`.
+    /// Global-store `kv_get`. Same return contract; free with `kv_free`.
+    pub kv_get_global: unsafe extern "C" fn(
+        key: *const u8,
+        key_len: usize,
+        out: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> c_int,
+    /// Global-store `kv_set`.
+    pub kv_set_global: unsafe extern "C" fn(
+        key: *const u8,
+        key_len: usize,
+        value: *const u8,
+        value_len: usize,
+        ttl_secs: i64,
+    ) -> c_int,
+    /// Global-store `kv_set_nx`.
+    pub kv_set_nx_global: unsafe extern "C" fn(
+        key: *const u8,
+        key_len: usize,
+        value: *const u8,
+        value_len: usize,
+        ttl_secs: i64,
+    ) -> c_int,
+    /// Global-store `kv_incr`.
+    pub kv_incr_global:
+        unsafe extern "C" fn(key: *const u8, key_len: usize, by: i64, out: *mut i64) -> c_int,
+    /// Global-store `kv_incr_ttl`.
+    pub kv_incr_ttl_global: unsafe extern "C" fn(
+        key: *const u8,
+        key_len: usize,
+        by: i64,
+        ttl_secs: i64,
+        out: *mut i64,
+    ) -> c_int,
 }
 
 /// Symbol names the loader looks up.

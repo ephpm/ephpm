@@ -131,7 +131,11 @@ impl ApiGate {
     }
 
     /// KV key holding this tenant's counter for the current window. The vhost
-    /// is part of the key so two sites in one process cannot share a budget.
+    /// is part of the key so two sites in one process cannot share a budget —
+    /// and it is the router's canonical site key, never the `Host` header,
+    /// which a caller could vary to mint a fresh budget (issue #390). On a
+    /// multi-tenant node the counter also lands in that vhost's own KV store
+    /// (issue #376), so the key component is belt-and-braces.
     fn window_key(vhost: &str, tenant: &str, window: u64) -> String {
         format!("apigate:rl:{vhost}:{tenant}:{window}")
     }
@@ -220,7 +224,11 @@ impl Middleware for ApiGate {
         // ── RESPOND: fixed-window rate limit (fail-open) ──────────────────
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let window = now / WINDOW_SECS;
-        let key = Self::window_key(req.vhost_id(), tenant, window);
+        // `vhost_id()` is the canonical site key, `None` when the request
+        // matched no vhost. Bucket those together rather than trusting the
+        // header — otherwise varying `Host` mints a fresh budget.
+        let vhost = req.vhost_id().unwrap_or(ephpm_middleware::UNMATCHED_VHOST);
+        let key = Self::window_key(vhost, tenant, window);
 
         // One atomic call: increment, and stamp the TTL only if this call
         // created the key. A counter can therefore never exist without an

@@ -42,7 +42,9 @@ impl Middleware for Probe {
             .response_header("X-Probe-Path", req.path())
             .response_header("X-Probe-Query", req.query())
             .response_header("X-Probe-Remote-Ip", req.remote_ip())
-            .response_header("X-Probe-Vhost", req.vhost_id())
+            // Minor 3: the canonical site key, `<none>` when the request
+            // matched no known vhost (the accessor returns NULL there).
+            .response_header("X-Probe-Vhost", req.vhost_id().unwrap_or("<none>"))
             .response_header("X-Probe-Accept", req.header("Accept").unwrap_or("<none>"))
             // Minor-2 request accessors, echoed for the dlopen round-trip test.
             .response_header("X-Probe-Scheme", req.scheme())
