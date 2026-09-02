@@ -129,9 +129,21 @@ mod ffi {
         /// Get the HTTP response status code.
         pub fn ephpm_get_response_code() -> ::std::os::raw::c_int;
 
-        /// Get the captured response headers ("Name: Value\n" lines).
-        /// Sets `*out_len` to the length.
-        pub fn ephpm_get_response_headers(out_len: *mut usize) -> *const ::std::os::raw::c_char;
+        /// Number of response headers captured for the request just
+        /// executed (issue #134 — structured access).
+        pub fn ephpm_get_response_header_count() -> usize;
+
+        /// Fetch one captured response header by index as (ptr, len) pairs
+        /// pointing into the thread-local capture buffer (valid until the
+        /// next request on this thread — copy immediately). Returns 1 on
+        /// success, 0 for an out-of-range index.
+        pub fn ephpm_get_response_header(
+            idx: usize,
+            name: *mut *const ::std::os::raw::c_char,
+            name_len: *mut usize,
+            value: *mut *const ::std::os::raw::c_char,
+            value_len: *mut usize,
+        ) -> ::std::os::raw::c_int;
 
         // ── ZTS thread lifecycle ────────────────────────────────────
 
@@ -1304,23 +1316,47 @@ impl PhpRuntime {
         let status_code = unsafe { ffi::ephpm_get_response_code() };
 
         let headers = {
-            let mut len: usize = 0;
-            // Safety: out_len pointer is valid.
-            let ptr = unsafe { ffi::ephpm_get_response_headers(&mut len) };
-            if ptr.is_null() || len == 0 {
-                Vec::new()
-            } else {
-                // Safety: ptr is valid for len bytes (managed by C headers buffer).
-                let raw = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
-                // Headers are "Name: Value\n" lines. Parse them.
-                String::from_utf8_lossy(raw)
-                    .lines()
-                    .filter_map(|line| {
-                        let (name, value) = line.split_once(": ")?;
-                        Some((name.to_string(), value.to_string()))
-                    })
-                    .collect()
+            // Structured header capture (issue #134): the C side already
+            // split each header into (name, value) spans — read them out as
+            // (ptr, len) pairs instead of re-parsing a "Name: Value\n" blob.
+            // Safety: no arguments, returns the thread-local span count.
+            let count = unsafe { ffi::ephpm_get_response_header_count() };
+            let mut headers = Vec::with_capacity(count);
+            for idx in 0..count {
+                let mut name: *const std::os::raw::c_char = std::ptr::null();
+                let mut name_len: usize = 0;
+                let mut value: *const std::os::raw::c_char = std::ptr::null();
+                let mut value_len: usize = 0;
+                // Safety: the out pointers are valid locals; on success the
+                // returned pointers reference the thread-local C capture
+                // buffer, valid until the next request on this thread — we
+                // copy them into owned Strings immediately below.
+                let ok = unsafe {
+                    ffi::ephpm_get_response_header(
+                        idx,
+                        &raw mut name,
+                        &raw mut name_len,
+                        &raw mut value,
+                        &raw mut value_len,
+                    )
+                };
+                if ok == 0 || name.is_null() || value.is_null() {
+                    continue;
+                }
+                // Safety: the C side guarantees `name`/`value` are valid for
+                // their respective lengths.
+                let (name, value) = unsafe {
+                    (
+                        std::slice::from_raw_parts(name.cast::<u8>(), name_len),
+                        std::slice::from_raw_parts(value.cast::<u8>(), value_len),
+                    )
+                };
+                headers.push((
+                    String::from_utf8_lossy(name).into_owned(),
+                    String::from_utf8_lossy(value).into_owned(),
+                ));
             }
+            headers
         };
 
         let status = u16::try_from(status_code).unwrap_or(200);

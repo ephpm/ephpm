@@ -282,4 +282,17 @@ fn bench_response_headers() {
         parsed
     });
     println!("response_headers old pack+reparse path: {old:>8.0} ns/req");
+
+    // New path (#134): the C side hands over parallel (ptr, len) arrays and
+    // Rust copies each half straight into an owned String (with the same
+    // trim the old parse applied). No pack buffer, no UTF-8 pass over a
+    // concatenated blob, no line splitting.
+    let new = time(ITERS, || {
+        let parsed: Vec<(String, String)> = headers
+            .iter()
+            .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+            .collect();
+        parsed
+    });
+    println!("response_headers new structured path:   {new:>8.0} ns/req");
 }
