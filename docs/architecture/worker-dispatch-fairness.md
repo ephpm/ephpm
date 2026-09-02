@@ -163,16 +163,46 @@ Both admission disciplines are selectable per deployment:
 `[php] admission = "fifo"` (**default** — the semaphore path above) or
 `"barge"` (the pre-fix racing admission: wait in the bounded channel's own
 `send().await`, `admission: None` on the job). The knob exists as an operator
-escape hatch and as the instrument for settling whether per-request (fpm)
-dispatch wants a different default than worker mode — worker mode's FIFO win
-is decisively measured (§6), while the fpm-mode picture rests on a
-cross-recording comparison contaminated by host drift. It applies to both
-`WorkerPool` and `FpmPool`; it is inert (startup WARN) on the default
-`fpm_engine = "spawn_blocking"`, which has no ePHPm-owned admission queue.
-The barge path keeps the depth-gauge honest with a rollback guard
-(`DepthRollback`) instead of reintroducing the cancellation leak noted
-above, and its behaviour is pinned by the mirror tests
-`admission_barge_lets_a_newcomer_steal_a_freed_slot` in both pools.
+escape hatch; it applies to both `WorkerPool` and `FpmPool` and is inert
+(startup WARN) on the default `fpm_engine = "spawn_blocking"`, which has no
+ePHPm-owned admission queue. The barge path keeps the depth-gauge honest
+with a rollback guard (`DepthRollback`) instead of reintroducing the
+cancellation leak noted above, and its behaviour is pinned by the mirror
+tests `admission_barge_lets_a_newcomer_steal_a_freed_slot` in both pools.
+
+The knob was built to settle whether per-request (fpm) dispatch wants a
+different default than worker mode — a cross-recording benchmark had hinted
+the fpm path regressed under #443. **Measured: it does not, and FIFO stays
+the default for both pools.** Same-host rotated A/B (Laravel bench, wrk
+10t/100c/30s, 3 rounds, array sessions, nginx+fpm control in-session, pool
+engine sized 2 threads / backlog 2, zero errors in every cell):
+
+| fpm pool, mean of 3 rounds | health | static | cpu | db |
+| --- | ---: | ---: | ---: | ---: |
+| req/s fifo → barge | 1030.8 → 1030.1 | 1018.9 → 1019.1 | 1008.8 → 1007.7 | 732.4 → 730.9 |
+| P50 ms fifo → barge | 96.7 → 96.9 | 97.9 → 97.6 | 98.9 → 99.0 | 135.6 → 135.1 |
+| P90 ms fifo → barge | 98.1 → **187.4** | 99.3 → **189.8** | 100.2 → **192.3** | 140.1 → **223.3** |
+| P99 ms fifo → barge | 105.0 → **354.4** | 103.0 → **375.0** | 104.6 → **367.7** | 152.1 → **425.2** |
+
+Throughput is identical (every delta ≤0.2%, inside the ±2% round spread;
+ratio-to-control matches to 0.2 points), while barge costs ~2x at P90 and
+~3-3.5x at P99. The lap quantization is visible in the numbers: with ~96
+requests in flight one queue lap ≈ 96/1030 ≈ 93 ms, and barge's P90 sits
+exactly one lap above its P50 (+90 ms) with P99 near three laps — while
+FIFO's P50/P90/P99 collapse to a single sojourn (spread 8 ms). Barge shows
+no throughput win because at saturation the queue is never empty: FIFO
+hands a freed slot to an already-parked waiter with no idle window, so both
+disciplines are equally work-conserving; barging's only theoretical edge
+(filling a slot during the wakeup gap) is microseconds against a
+millisecond-scale service time. A worker-mode leg in the same session
+reproduced §6 in reverse (barge: throughput flat, P99 59 → 158 ms), so the
+behaviour is symmetric across modes — the workload shape (connections ≫
+slots) is what matters, not the execution model. The suspected fpm
+regression was closed as host drift: the recording that showed it ran the
+`spawn_blocking` engine, whose admission (the `[php] workers` tokio
+semaphore) #443 never touched, and re-measuring that exact config in this
+session put it back at 110% of nginx+fpm on `/api/db` — the pre-#443
+recording's ratio, not the suspect one's.
 
 ## 6. Before/after (same host, same build toolchain)
 
