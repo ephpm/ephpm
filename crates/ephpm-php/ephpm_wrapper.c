@@ -611,7 +611,12 @@ static void capture_one_header(const char *name, size_t name_len,
     s->value_off = headers_buf_len;
     s->value_len = value_len;
     headers_buf_append(value, value_len);
-    hdr_span_count++;
+    /* headers_buf_append fails silently on OOM; commit the span only if both
+     * appends really landed, so a span can never claim bytes the buffer does
+     * not hold (the Rust side trusts these lengths). */
+    if (headers_buf_len == s->name_off + name_len + value_len) {
+        hdr_span_count++;
+    }
 }
 
 /* Split one raw "Name: Value" header line (the shape PHP stores in

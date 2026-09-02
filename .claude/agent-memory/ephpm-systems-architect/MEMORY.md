@@ -5,3 +5,4 @@
 - [Windows per-request chdir costs ~55us](windows-chdir-per-request-cost.md) — never add a cwd save/restore to the request path unmeasured; measure with a no-op version to split fixed from variable cost
 - [Shared target dir replays stale rlibs](shared-target-stale-fingerprint.md) — "method not found" on a symbol you just added is a cache lie; touch the file, never `cargo clean`
 - [Windows PHP-linked local builds](windows-php-linked-local-build.md) — vcvars64 + LIBCLANG_PATH + 8.5.7 SDK; test binaries need `/FORCE:MULTIPLE`; CI only `cargo check`s this lane
+- [WSL linked builds + benchmarking](wsl-linked-build-and-bench.md) — /mnt/c worktree + /root/ephpm-target; php_middleware SIGSEGV is pre-existing on Linux SDK; interleave min-of-N on this noisy box
