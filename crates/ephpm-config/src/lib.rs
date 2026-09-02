@@ -1428,9 +1428,11 @@ pub struct DiagnosticsConfig {
     /// Unset resolves per mode (see
     /// [`DiagnosticsConfig::effective_request_log`]): **on** under
     /// `ephpm dev` / bare `ephpm`, **off** under `ephpm serve`. Set `true` /
-    /// `false` to force a value in either mode. When off, `/_ephpm/requests`
-    /// is not registered and the path falls through to normal routing (404
-    /// under the default fallback chain).
+    /// `false` to force a value in either mode. When off, `GET
+    /// /_ephpm/requests` answers 404 naming this knob — the path is never
+    /// routed to the application, because the whole `/_ephpm/` namespace is
+    /// reserved by the server (issue #444; it used to fall through, which in
+    /// worker mode meant the framework answered for a diagnostics endpoint).
     ///
     /// Env override: `EPHPM_SERVER__DIAGNOSTICS__REQUEST_LOG`.
     ///

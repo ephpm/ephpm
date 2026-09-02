@@ -107,6 +107,38 @@ impl StreamingCompression {
 /// the cache is for; a stat every 2s per unique host is noise.
 const UNKNOWN_SITE_TTL: Duration = Duration::from_secs(2);
 
+/// The path namespace ePHPm reserves for its own endpoints.
+///
+/// Everything at or under this prefix is answered by
+/// [`Router::handle_internal`] — in **every** execution mode (fpm,
+/// `fpm_engine = "pool"`, worker) — and is never dispatched to PHP or the
+/// static-file path. That is the whole point of the reservation: an
+/// application must not be able to observe, shadow, or answer for a server
+/// endpoint, and an operator probing one must get ePHPm's answer rather than
+/// whatever the app happens to say (issue #444).
+///
+/// The exact path `/_ephpm` (no trailing slash) is reserved too, so the
+/// namespace has no unreserved edge.
+pub(crate) const INTERNAL_PREFIX: &str = "/_ephpm/";
+
+/// Every endpoint ePHPm serves under [`INTERNAL_PREFIX`].
+///
+/// This is the authoritative list — [`Router::handle_internal`] matches
+/// against exactly these paths, the unknown-endpoint 404 body is built from
+/// it, and `internal_namespace_is_reserved_in_{worker,fpm,pool}_mode` walk it
+/// once per execution mode. Adding an endpoint means adding it here and
+/// pinning what it answers, which is what stops a new one from silently
+/// regressing into an app-shadowable path.
+///
+/// Not in the list: the Prometheus endpoint. Its path is operator-configurable
+/// (`[server.metrics] path`, default `/metrics`) and lives *outside* this
+/// namespace by default, so it cannot be reserved unconditionally — an app is
+/// entitled to own `/metrics` when `[server.metrics] enabled = false`. When
+/// metrics ARE enabled the path is served ahead of everything, including a
+/// path the operator pointed into this namespace.
+pub(crate) const INTERNAL_ROUTES: &[&str] =
+    &["/_ephpm/health", "/_ephpm/ready", "/_ephpm/primary", "/_ephpm/requests"];
+
 /// A virtual host's two roots, which are **not** the same directory once an
 /// operator-supplied override declares a `document_root`
 /// (`[server] site_overrides_dir`, see [`crate::site_overrides`]).
@@ -2080,7 +2112,7 @@ impl Router {
         // (serve-mode) hot path allocates nothing here.
         let timeline_capture = self.request_log.as_ref().and_then(|_| {
             let path = req.uri().path();
-            if path.starts_with("/_ephpm/") || path == self.metrics_path {
+            if path.starts_with(INTERNAL_PREFIX) || path == self.metrics_path {
                 None
             } else {
                 Some((req.method().as_str().to_owned(), path.to_owned()))
@@ -2232,45 +2264,25 @@ impl Router {
         // content. Kubernetes probes and Prometheus scrapes address pods by
         // raw IP, so a `Host`-gated probe would 421 and the pod would never
         // become ready.
-        if method_ref == hyper::Method::GET {
-            if let Some(ref handle) = self.metrics_handle
-                && uri_path == self.metrics_path
-            {
-                return Ok((metrics::render(handle), "metrics"));
-            }
+        //
+        // The Prometheus path is checked first because it is the one internal
+        // endpoint whose path the operator chooses: pointing
+        // `[server.metrics] path` into the reserved namespace must serve
+        // metrics, not the namespace's 404.
+        if method_ref == hyper::Method::GET
+            && let Some(ref handle) = self.metrics_handle
+            && uri_path == self.metrics_path
+        {
+            return Ok((metrics::render(handle), "metrics"));
+        }
 
-            // Liveness probe — always 200 if the server is running.
-            if uri_path == "/_ephpm/health" {
-                return Ok((json_response(StatusCode::OK, r#"{"status":"ok"}"#), "health"));
-            }
-
-            // Readiness probe — checks PHP initialization and DB proxy.
-            if uri_path == "/_ephpm/ready" {
-                return Ok((self.readiness_check(), "health"));
-            }
-
-            // Primary probe — the load-balancer target for active-passive
-            // routing to the writable SQLite node. 200 when this node accepts
-            // writes (the elected clustered-SQLite primary, any
-            // non-clustered/standalone node, or any node in per-site clustered
-            // mode, where ownership is per tenant and writes are forwarded to
-            // the owner), 503 when it is a single-database clustered replica
-            // whose writes would silently diverge. Safe to health-check in any
-            // topology, so it never 404s. A single relaxed atomic load — no
-            // lock, no await.
-            if uri_path == "/_ephpm/primary" {
-                return Ok((self.primary_check(), "health"));
-            }
-
-            // Request timeline (dev mode / [server.diagnostics] request_log):
-            // the ring buffer as JSON, newest first. Only mounted when the
-            // timeline is enabled — when disabled, the path deliberately
-            // falls through and behaves like any other unknown /_ephpm/ path.
-            if uri_path == "/_ephpm/requests"
-                && let Some(ref log) = self.request_log
-            {
-                return Ok((json_response_owned(StatusCode::OK, log.to_json()), "diagnostics"));
-            }
+        // The reserved `/_ephpm/` namespace. One pre-dispatch check, ahead of
+        // every mode-specific path below, so the routing decision cannot
+        // differ between fpm, pool and worker mode — see `INTERNAL_PREFIX`.
+        if uri_path.starts_with(INTERNAL_PREFIX)
+            || uri_path == INTERNAL_PREFIX.trim_end_matches('/')
+        {
+            return Ok(self.handle_internal(&uri_path, &method_ref));
         }
 
         // Validate Host header against trusted hosts list.
@@ -4083,6 +4095,95 @@ impl Router {
             json_response(StatusCode::OK, r#"{"primary":true}"#)
         } else {
             json_response(StatusCode::SERVICE_UNAVAILABLE, r#"{"primary":false}"#)
+        }
+    }
+
+    /// Serve a request in the reserved [`INTERNAL_PREFIX`] namespace.
+    ///
+    /// Every path at or under `/_ephpm/` lands here, so the answer is the same
+    /// in fpm, pool and worker mode. Nothing below this function reaches PHP,
+    /// a static file, the vhost resolver or the fallback chain — an
+    /// application cannot serve, shadow, or even see a request for a server
+    /// endpoint.
+    ///
+    /// The failure this closes (issue #444): the timeline endpoint used to
+    /// *fall through* when the timeline was disabled. In fpm mode that produced
+    /// ePHPm's own 404, which reads like "off". In worker mode the framework
+    /// owns every non-static path, so the same fall-through handed
+    /// `/_ephpm/requests` to the app and the operator got the app's 404 — a
+    /// diagnostics endpoint answered by the thing it was meant to diagnose. The
+    /// disabled case now says so, in ePHPm's voice.
+    ///
+    /// Method policy: `GET` only. Anything else is `405` with `Allow: GET`
+    /// rather than a fall-through, so a health checker configured with `HEAD`
+    /// or `OPTIONS` (HAProxy's `option httpchk` default) gets an answer from
+    /// the server instead of a verdict computed by the application.
+    fn handle_internal(
+        &self,
+        uri_path: &str,
+        method: &hyper::Method,
+    ) -> (Response<ServerBody>, &'static str) {
+        if method != hyper::Method::GET {
+            let resp = Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header("content-type", "text/plain")
+                .header("allow", "GET")
+                .body(body::buffered(Full::new(Bytes::from_static(b"405 Method Not Allowed"))))
+                .expect("static 405 response");
+            return (resp, "error");
+        }
+
+        match uri_path {
+            // Liveness probe — always 200 if the server is running.
+            "/_ephpm/health" => (json_response(StatusCode::OK, r#"{"status":"ok"}"#), "health"),
+
+            // Readiness probe — checks PHP initialization and DB proxy.
+            "/_ephpm/ready" => (self.readiness_check(), "health"),
+
+            // Primary probe — the load-balancer target for active-passive
+            // routing to the writable SQLite node. 200 when this node accepts
+            // writes (the elected clustered-SQLite primary, any
+            // non-clustered/standalone node, or any node in per-site clustered
+            // mode, where ownership is per tenant and writes are forwarded to
+            // the owner), 503 when it is a single-database clustered replica
+            // whose writes would silently diverge. Safe to health-check in any
+            // topology, so it never 404s. A single relaxed atomic load — no
+            // lock, no await.
+            "/_ephpm/primary" => (self.primary_check(), "health"),
+
+            // Request timeline (dev mode / [server.diagnostics] request_log):
+            // the ring buffer as JSON, newest first. Disabled is answered here,
+            // naming the knob — never handed to the application.
+            "/_ephpm/requests" => match self.request_log {
+                Some(ref log) => {
+                    (json_response_owned(StatusCode::OK, log.to_json()), "diagnostics")
+                }
+                None => (
+                    error_response(
+                        StatusCode::NOT_FOUND,
+                        "404 Not Found: the request timeline is disabled. Enable it with \
+                         [server.diagnostics] request_log = true (on by default under \
+                         `ephpm dev`).",
+                    ),
+                    "diagnostics",
+                ),
+            },
+
+            // Naming the known endpoints costs one allocation on a path that is
+            // never hot, and it makes the reservation self-documenting the
+            // first time an operator typos one.
+            _ => (
+                error_response_owned(
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "404 Not Found: no such ePHPm endpoint. The /_ephpm/ path namespace is \
+                         reserved by the server and is never routed to the application. Known \
+                         endpoints: {}.",
+                        INTERNAL_ROUTES.join(", ")
+                    ),
+                ),
+                "error",
+            ),
         }
     }
 
@@ -6389,6 +6490,312 @@ mod tests {
         if let Some(pool) = router.fpm_pool() {
             pool.drain();
         }
+    }
+
+    // ── Reserved /_ephpm/ namespace (issue #444) ─────────────────────────
+
+    /// Drive one request through the full router and return `(status, body)`.
+    async fn probe(router: &Router, method: &str, path: &str) -> (StatusCode, String) {
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let req = Request::builder().method(method).uri(path).body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        let status = resp.status();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The reservation, asserted against a router whose fallback chain sends
+    /// every unmatched path to PHP (which is what worker mode *always* does and
+    /// what `fallback = [..., "/index.php"]` does in fpm mode).
+    ///
+    /// Every endpoint in [`INTERNAL_ROUTES`] must be answered by the server,
+    /// an unknown path in the namespace must get the server's own 404, and a
+    /// non-GET must get 405 — none of them reaching the application. Callers
+    /// pair this with a control request proving the catch-all really does reach
+    /// PHP on this router, so "the app never saw it" means something.
+    ///
+    /// `expect_timeline` picks which of the two legal answers
+    /// `/_ephpm/requests` must give.
+    async fn assert_namespace_reserved(router: &Router, expect_timeline: bool) {
+        for path in INTERNAL_ROUTES {
+            let (status, body) = probe(router, "GET", path).await;
+            assert!(
+                !body.contains("no such ePHPm endpoint"),
+                "{path} is listed in INTERNAL_ROUTES but nothing handles it"
+            );
+            match *path {
+                "/_ephpm/health" => {
+                    assert_eq!(status, StatusCode::OK, "{path}");
+                    assert_eq!(body, r#"{"status":"ok"}"#, "{path}");
+                }
+                // 200 or 503 depending on whether a sibling test already
+                // initialized the process-global stub runtime, and on whether
+                // this router has a booted worker. Either way the answer is
+                // ePHPm's readiness JSON, not the application's.
+                "/_ephpm/ready" => {
+                    assert!(body.starts_with(r#"{"status":"#), "{path}: {body}");
+                }
+                "/_ephpm/primary" => {
+                    assert!(body.contains(r#""primary""#), "{path}: {body}");
+                }
+                "/_ephpm/requests" => {
+                    if expect_timeline {
+                        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+                        serde_json::from_str::<Vec<serde_json::Value>>(&body)
+                            .expect("the timeline endpoint serves a JSON array");
+                    } else {
+                        // Issue #444: the disabled timeline must answer in
+                        // ePHPm's voice, naming the knob. Falling through here
+                        // is what handed a diagnostics endpoint to Laravel.
+                        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+                        assert!(body.contains("request_log"), "{path}: {body}");
+                    }
+                }
+                other => panic!(
+                    "INTERNAL_ROUTES gained {other} with no assertion here — pin what it must \
+                     answer, in every mode, before shipping it"
+                ),
+            }
+        }
+
+        // Unknown paths in the namespace — including the bare prefix and a
+        // suffix on a real endpoint — are the server's 404, not the app's.
+        for path in ["/_ephpm/", "/_ephpm", "/_ephpm/nope", "/_ephpm/requests/x"] {
+            let (status, body) = probe(router, "GET", path).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+            assert!(body.contains("no such ePHPm endpoint"), "{path}: {body}");
+        }
+
+        // A health checker using HEAD/OPTIONS (HAProxy's `option httpchk`
+        // default) gets the server's 405, never a verdict computed by the app.
+        for method in ["HEAD", "POST", "OPTIONS"] {
+            let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+            let req = Request::builder()
+                .method(method)
+                .uri("/_ephpm/health")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let resp = router.handle(req, addr, false).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED, "{method} /_ephpm/health");
+            assert_eq!(
+                resp.headers().get("allow").and_then(|v| v.to_str().ok()),
+                Some("GET"),
+                "{method} /_ephpm/health must advertise the allowed method"
+            );
+        }
+    }
+
+    /// **Worker mode** — the mode issue #444 was reported against. The
+    /// framework owns every non-static path there, so a fall-through goes
+    /// straight into the application; the reservation must hold anyway.
+    ///
+    /// A zero-worker pool (stub-mode-safe: spawns no PHP threads) accepts the
+    /// dispatch but never answers, so anything that *did* reach PHP shows up
+    /// unmistakably as the 504 the control request asserts.
+    #[tokio::test(start_paused = true)]
+    async fn internal_namespace_is_reserved_in_worker_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        config.server.timeouts.request = 1;
+        let pool = crate::worker_pool::WorkerPool::spawn(
+            dir.path().join("worker.php"),
+            0, // zero workers: dispatch queues, nobody answers
+            500,
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let router = Router::new(&config, test_store(), None, None, None, None, Some(pool))
+            .with_request_log(Some(Arc::new(crate::timeline::RequestLog::new(8))));
+
+        // Control: worker mode really does hand every unmatched path to the
+        // app, so "the app never saw /_ephpm/*" is a claim with teeth.
+        let (status, _) = probe(&router, "GET", "/nothing/here").await;
+        assert_eq!(
+            status,
+            StatusCode::GATEWAY_TIMEOUT,
+            "worker mode must dispatch an unmatched path to the app"
+        );
+
+        assert_namespace_reserved(&router, true).await;
+    }
+
+    /// Worker mode with the timeline **off** — the exact shape of the #444
+    /// report. `/_ephpm/requests` must answer 404 in ePHPm's voice rather than
+    /// fall through and let the framework produce a 404 of its own, which is
+    /// indistinguishable from "the endpoint does not exist".
+    #[tokio::test(start_paused = true)]
+    async fn disabled_timeline_endpoint_is_not_handed_to_the_app_in_worker_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        config.server.timeouts.request = 1;
+        let pool = crate::worker_pool::WorkerPool::spawn(
+            dir.path().join("worker.php"),
+            0,
+            500,
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        // No `with_request_log`: the serve-mode default, timeline disabled.
+        let router = Router::new(&config, test_store(), None, None, None, None, Some(pool));
+
+        let (status, body) = probe(&router, "GET", "/_ephpm/requests").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_ne!(
+            status,
+            StatusCode::GATEWAY_TIMEOUT,
+            "the disabled timeline endpoint must not be dispatched to the worker"
+        );
+        assert!(
+            body.contains("request timeline is disabled") && body.contains("request_log"),
+            "the 404 must name the knob that turns it on: {body}"
+        );
+
+        assert_namespace_reserved(&router, false).await;
+    }
+
+    /// **fpm mode** (default `spawn_blocking` engine) with a catch-all
+    /// fallback: `test_router`'s chain ends in `/index.php`, so an unmatched
+    /// path runs PHP here exactly as it would in a WordPress/Laravel deploy.
+    #[tokio::test]
+    async fn internal_namespace_is_reserved_in_fpm_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let router = test_router(dir.path())
+            .with_request_log(Some(Arc::new(crate::timeline::RequestLog::new(8))));
+
+        // Control: the catch-all fallback reaches PHP. Stub mode answers 200
+        // (stub page) or 500 (runtime not initialized) depending on test order;
+        // both mean "PHP was dispatched".
+        let (status, _) = probe(&router, "GET", "/nothing/here").await;
+        assert!(
+            status == StatusCode::OK || status == StatusCode::INTERNAL_SERVER_ERROR,
+            "the catch-all fallback must dispatch PHP, got {status}"
+        );
+
+        assert_namespace_reserved(&router, true).await;
+    }
+
+    /// **Pool engine** (`[php] fpm_engine = "pool"`): a third dispatch path,
+    /// held to the same reservation.
+    #[tokio::test]
+    async fn internal_namespace_is_reserved_in_pool_mode() {
+        ephpm_php::PhpRuntime::init().expect("stub runtime init");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec![
+                    "$uri".to_string(),
+                    "$uri/".to_string(),
+                    "/index.php?$query_string".to_string(),
+                ],
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        config.php.fpm_engine = ephpm_config::FpmEngine::Pool;
+        config.php.worker_count = 1;
+
+        let router = Router::new(&config, test_store(), None, None, None, None, None)
+            .with_request_log(Some(Arc::new(crate::timeline::RequestLog::new(8))));
+        assert!(router.fpm_pool().is_some(), "pool engine must build the fpm pool");
+
+        // Control: the catch-all dispatches through the pool.
+        let (status, _) = probe(&router, "GET", "/nothing/here").await;
+        assert_eq!(status, StatusCode::OK, "the pool must return the stub PHP response");
+
+        assert_namespace_reserved(&router, true).await;
+
+        // Drain retires the pool threads so the test leaves no live PHP context.
+        if let Some(pool) = router.fpm_pool() {
+            pool.drain();
+        }
+    }
+
+    /// The Prometheus endpoint is deliberately *not* in the reserved namespace:
+    /// its path is operator-chosen and defaults outside it. Two things must
+    /// hold — an operator who points it INTO the namespace still gets metrics
+    /// (the metrics check runs first), and the reservation does not quietly
+    /// claim `/metrics` for the server when metrics are off.
+    #[tokio::test]
+    async fn metrics_path_inside_the_namespace_still_serves_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        config.server.metrics.enabled = true;
+        config.server.metrics.path = "/_ephpm/metrics".to_string();
+
+        // A local recorder handle — `metrics::init()` installs a *global*
+        // recorder and would fight whichever sibling test got there first.
+        let handle =
+            metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder().handle();
+        let router = Router::new(&config, test_store(), None, Some(handle), None, None, None);
+
+        let (status, body) = probe(&router, "GET", "/_ephpm/metrics").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            !body.contains("no such ePHPm endpoint"),
+            "the namespace 404 must not shadow an operator-configured metrics path: {body}"
+        );
+        assert!(
+            !INTERNAL_ROUTES.contains(&"/metrics"),
+            "the default metrics path stays outside the reserved list — an app may own it"
+        );
     }
 
     // ── Load shedding (`[php] overload_policy`, issue #301) ─────────────
