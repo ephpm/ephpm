@@ -72,6 +72,12 @@ use abi::{EphpmHeaderKv, EphpmHostV1, EphpmRequest, EphpmResponseCtx};
 ///
 /// A module that must *deny* rather than bucket unmatched requests should
 /// branch on `None` directly instead of using this.
+///
+/// Note this is the **only** bucket a single-site node ever uses: with no
+/// `sites_dir` and no `[[site]]`, the router matches no vhost, so every request
+/// has `vhost_id() == None`. A single-site deployment therefore sees keys like
+/// `mw:maintenance:_UNMATCHED` — that is the expected shape there, not a
+/// degraded one.
 pub const UNMATCHED_VHOST: &str = "_UNMATCHED";
 
 /// The trait a Rust-authored middleware implements. [`declare!`] generates
@@ -215,6 +221,12 @@ impl Request<'_> {
     /// default document root by default, so the `Host` there is arbitrary
     /// client input. A gate should treat `None` as "no tenant" and fail closed
     /// rather than substituting the header (issue #390).
+    ///
+    /// **`None` is the normal case on a single-site node.** With neither
+    /// `sites_dir` nor any `[[site]]` configured the router matches no vhost at
+    /// all, so this is `None` on every request there — treat it as "one
+    /// tenant", not as an error. [`UNMATCHED_VHOST`] is the conventional key
+    /// component for that bucket.
     ///
     /// Normalization is the router's, not the header's: `Site.Example`,
     /// `site.example:8080` and `site.example.` all resolve to one key, and a

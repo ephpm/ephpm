@@ -414,7 +414,12 @@ tenant (`blog`, `blog.localhost`, `BLOG.`). The key is read from that vhost's
 own KV keyspace, which is the keyspace the site's PHP and its RESP credential
 already use, so `ephpm_kv_set('mw:maintenance:blog', 1)` from the site's own
 code flips it. A request that matched no vhost reads the single
-`mw:maintenance:_UNMATCHED` flag in the process-global store.
+`mw:maintenance:_UNMATCHED` flag in the process-global store — and note that
+**on a single-site node no vhost is ever matched**, so the key there is always
+`mw:maintenance:_UNMATCHED`, not the server name. Upgrading a single-site
+deployment from ≤ minor 2 therefore renames its flag from
+`mw:maintenance:<Host>` to `mw:maintenance:_UNMATCHED`; an active maintenance
+flag must be re-set under the new name or the site quietly comes back up.
 
 | key | default | meaning |
 |-----|---------|---------|
@@ -647,6 +652,14 @@ closed, or bucket it under `ephpm_middleware::UNMATCHED_VHOST` — never
 substitute the header, or a caller gets a fresh keyspace (and a fresh rate-limit
 budget) per `Host` value they invent.
 
+**`None` is the normal case on a single-site node**, not an edge case. With
+neither `sites_dir` nor any `[[site]]` configured there are no vhosts to match,
+so `vhost_id()` is `None` on every request. Handle it as "one tenant", not as
+an error — the stock modules bucket it under `UNMATCHED_VHOST`, which is why a
+single-site `maintenance-mode` flag lives at `mw:maintenance:_UNMATCHED`. (C
+modules get a raw NULL here and **must** null-check; Rust's `Option` makes it a
+compile error.)
+
 ```rust
 // Fail closed: no tenant, no policy.
 let Some(site) = req.vhost_id() else {
@@ -713,15 +726,27 @@ int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
   accessors (`request_scheme`/`request_is_secure`/`request_host`), minor
   **3** the appended process-global KV slots (`kv_get_global` and its four
   siblings).
-- **Minor 3 also redefined two existing surfaces** (issues #390 and #376).
-  Both are no-ops on a single-site node; on a multi-tenant node:
-  `request_vhost_id` returns the canonical site key and **NULL** for an
-  unmatched host, where it used to return the raw `Host`; and the `kv_*`
-  slots resolve the request's per-vhost keyspace, where they used to always
-  hit the process-global store. A module relying on node-wide `kv_*` state
-  should move those calls to the matching `kv_*_global` slot; anything
-  per-tenant should stay put and simply becomes isolated. Keys built from
-  the vhost id change name once, at upgrade.
+- **Minor 3 also redefined two existing surfaces** (issues #390 and #376), and
+  the two have *different* blast radii — do not read them as one bullet:
+  - `request_vhost_id` changes on **every** node. It returns the canonical
+    site key, and **NULL** when no vhost matched, where it used to return the
+    raw `Host` and was never NULL. A **single-site node matches no vhost at
+    all**, so on that shape — the most common one — it now returns NULL on
+    *every* request. **C modules must null-check it**: a
+    `strcmp(host->request_vhost_id(req), …)` that was safe against every
+    prior minor segfaults now. Rust modules get a compile error instead,
+    since the safe wrapper returns `Option<&str>`. Use `request_host` if what
+    you actually wanted was the host as sent.
+  - The `kv_*` slots change **only on a multi-tenant node**, where they now
+    resolve the request's per-vhost keyspace instead of always hitting the
+    process-global store. A module relying on node-wide `kv_*` state should
+    move those calls to the matching `kv_*_global` slot; anything per-tenant
+    should stay put and simply becomes isolated. On a single-site node there
+    is one store and this half really is a no-op.
+
+  Keys built from the vhost id change name once, at upgrade — on a single-site
+  node to whatever the module substitutes for "no tenant" (the stock modules
+  use `UNMATCHED_VHOST`).
 - `config_json` is the mount's `config` table serialised to JSON (NULL when
   the mount has no config).
 - The host callback table is passed **by pointer at `init`** and is valid

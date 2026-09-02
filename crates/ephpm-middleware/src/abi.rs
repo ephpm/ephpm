@@ -61,8 +61,11 @@ use std::os::raw::{c_char, c_int};
 ///     store (issue #376), with the global store still reachable through the
 ///     appended `kv_*_global` slots ([`ABI_MINOR_GLOBAL_KV`]).
 ///
-///   Both redefinitions are no-ops on a single-site node, where there is one
-///   tenant and one store. See [`ABI_MINOR_GLOBAL_KV`] for the migration note.
+///   The `kv_*` redefinition is a no-op on a single-site node (one tenant, one
+///   store). **`request_vhost_id` is not** — a single-site node matches no
+///   vhost, so it returns NULL on *every* request there, where it used to
+///   return the `Host`. C modules must null-check it. See
+///   [`ABI_MINOR_GLOBAL_KV`] for the migration note.
 ///
 /// The major byte is unchanged across every minor, so **every** module built
 /// against major 1 still loads: growth is additive.
@@ -111,21 +114,41 @@ pub const ABI_MINOR_REQUEST_ACCESSORS: u32 = 2;
 ///
 /// # What changed for an existing module
 ///
-/// Nothing at all on a single-site node: there is one tenant and one store, so
-/// both redefinitions are identity.
+/// ## [`EphpmHostV1::request_vhost_id`] — changes on **every** node (#390)
 ///
-/// On a multi-tenant node (`[server] sites_dir`):
+/// It returns the router's canonical site key rather than the raw `Host`, and
+/// **NULL** rather than a client-supplied string when no vhost matched.
 ///
-/// * [`EphpmHostV1::request_vhost_id`] returns the router's canonical site key
-///   rather than the raw `Host`, and NULL rather than a client-supplied string
-///   for a host that matched no vhost (issue #390). A key built from it changes
-///   name once, at upgrade.
-/// * The `kv_*` slots resolve **this request's** per-vhost keyspace rather
-///   than the process-global store (issue #376). A module that was relying on
-///   node-wide `kv_*` state — an edge-wide rate limiter, an operator-owned
-///   config key — must move those calls to the matching `kv_*_global` slot.
-///   Everything per-tenant should stay where it is and simply becomes
-///   isolated, and now shares a keyspace with the tenant's `ephpm_kv_*`.
+/// The NULL is not a rare edge case. The router's `resolve_site`
+/// short-circuits to its no-site branch whenever neither `sites_dir` nor any
+/// `[[site]]` is configured, so on a **single-site node — the most common
+/// deployment shape — this slot returns NULL on every single request**, where
+/// in minor ≤ 2 it returned the `Host` and was never NULL.
+///
+/// **A C module MUST null-check it.** `strcmp(host->request_vhost_id(req), …)`
+/// was safe against every prior minor and segfaults now. Rust modules get a
+/// compile error instead: the safe wrapper returns `Option<&str>`.
+///
+/// The behaviour is deliberate — no vhost matched means no tenant, and
+/// inventing one from a client-supplied header is exactly the bug #390 fixed.
+/// [`EphpmHostV1::request_host`] still gives the host as sent, for the cases
+/// that genuinely want it.
+///
+/// Note this also renames keys built from the vhost id, once, at upgrade — on
+/// a single-site node to whatever the module substitutes for "no tenant"
+/// (the stock modules use `ephpm_middleware::UNMATCHED_VHOST`).
+///
+/// ## The `kv_*` slots — change only on a multi-tenant node (#376)
+///
+/// They resolve **this request's** per-vhost keyspace rather than the
+/// process-global store. A module that was relying on node-wide `kv_*` state —
+/// an edge-wide rate limiter, an operator-owned config key — must move those
+/// calls to the matching `kv_*_global` slot. Everything per-tenant should stay
+/// where it is and simply becomes isolated, and now shares a keyspace with the
+/// tenant's `ephpm_kv_*`.
+///
+/// This half genuinely *is* a no-op on a single-site node: there is one store,
+/// and both the scoped and global slots reach it.
 pub const ABI_MINOR_GLOBAL_KV: u32 = 3;
 
 /// Middleware verdicts for one request.
@@ -296,6 +319,13 @@ pub struct EphpmHostV1 {
     /// no vhost is an arbitrary client-supplied string; returning NULL is what
     /// lets a gate tell "tenant `foo`" from "someone sent `Host: foo`" and
     /// fail closed instead of keying policy on attacker input.
+    ///
+    /// **NULL-check this, always.** It is not a rare edge case: a **single-site
+    /// node matches no vhost at all**, so this returns NULL on *every* request
+    /// there — and that is the most common deployment shape. In minor ≤ 2 the
+    /// slot was never NULL, so a C module doing
+    /// `strcmp(host->request_vhost_id(req), …)` was safe then and crashes now.
+    /// See [`ABI_MINOR_GLOBAL_KV`] for the full migration note.
     ///
     /// Changed in **minor 3** (issue #390). Before that this returned the raw
     /// `Host` header with only the port stripped — un-normalized, never NULL.

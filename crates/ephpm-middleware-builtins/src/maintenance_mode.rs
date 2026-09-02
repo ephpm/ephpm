@@ -15,7 +15,12 @@
 //! header (issue #390): one flag per tenant, covering every name that resolves
 //! to it, rather than one flag per spelling. A request that matched no vhost
 //! has no tenant identity and reads the single
-//! [`ephpm_middleware::UNMATCHED_VHOST`] flag. The lookup goes to that vhost's
+//! [`ephpm_middleware::UNMATCHED_VHOST`] flag — which is **every** request on a
+//! single-site node, where no vhost is ever matched, so the key there is always
+//! `mw:maintenance:_UNMATCHED`. Upgrading a single-site deployment from ABI
+//! minor ≤ 2 renames its flag from `mw:maintenance:<Host>`; an active
+//! maintenance flag must be re-set under the new name or the site comes back
+//! up. The lookup goes to that vhost's
 //! own KV keyspace on a multi-tenant node (issue #376) — the same keyspace the
 //! site's PHP and its RESP credential use — so a site can flip its own flag
 //! with `ephpm_kv_set('mw:maintenance:<key>', 1)`.

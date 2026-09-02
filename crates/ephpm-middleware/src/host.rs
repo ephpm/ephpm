@@ -4,6 +4,7 @@
 
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
+use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -414,8 +415,19 @@ thread_local! {
 /// tokio worker from carrying one tenant's scope into the next request it
 /// picks up — the same stale-per-thread-state hazard the PHP lane's eBPF tag
 /// guard exists for.
+/// It is deliberately **`!Send`**. The guard names thread-local state, so
+/// holding one across an `.await` would let a task resume on a different tokio
+/// worker with the scope installed on the old one — a silent cross-tenant
+/// leak, and exactly the class of bug this type exists to prevent. The
+/// `PhantomData<*const ()>` makes rustc enforce that instead of a comment: a
+/// future holding this across an await stops being `Send` and fails to compile
+/// where hyper requires `Send`. It costs nothing at the current call sites,
+/// since rustc only stores locals that are *live across* an await in the
+/// generator, and all three scopes close before their next await.
 pub struct SiteKvScope {
     previous: Option<Arc<ephpm_kv::store::Store>>,
+    /// `!Send` marker — see the type docs. Carries no data.
+    _not_send: PhantomData<*const ()>,
 }
 
 impl Drop for SiteKvScope {
@@ -437,8 +449,12 @@ impl Drop for SiteKvScope {
 /// suspended task can resume on a different worker.
 #[must_use]
 pub fn enter_site_kv(store: Option<Arc<ephpm_kv::store::Store>>) -> SiteKvScope {
-    let previous = KV_SITE_STORE.with(|s| s.replace(store));
-    SiteKvScope { previous }
+    // `try_with`, matching the read side and `Drop`: during thread teardown the
+    // slot may be gone. Unreachable today (the chain never runs at teardown),
+    // but a panic here would take down a request thread for nothing, and an
+    // uninstalled scope simply leaves the callbacks on the global store.
+    let previous = KV_SITE_STORE.try_with(|s| s.replace(store)).unwrap_or(None);
+    SiteKvScope { previous, _not_send: PhantomData }
 }
 
 /// The store for the request being evaluated: this thread's site store when a
