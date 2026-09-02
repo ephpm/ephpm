@@ -10468,6 +10468,218 @@ echo "post response";
             assert_eq!(count_in(&global, "shop"), None);
             assert_eq!(count_in(&global, "blog"), None);
         }
+
+        // ── the other two chain call sites, and the argument (#451) ────────
+        //
+        // `the_router_enters_the_site_scope_around_the_chain` above pins ONE
+        // of the three places the router enters the scope, and pins it by
+        // calling `static_request_phase` with a site key the test supplies.
+        // Deleting `enter_site_kv` at the `handle_php` call site or the
+        // response-phase call site failed no test, and nothing checked that
+        // `handle_inner` passes `resolved.key` rather than `server_name` — a
+        // swap that would restore #390 with every other test green. The tests
+        // below close both holes, and each fails on a single-line revert.
+
+        /// A probe that stamps the KV store in **both** middleware phases,
+        /// keyed by the tenant identity the chain was handed and the request
+        /// path: `mw:probe:<phase>:<vhost>:<path>`.
+        ///
+        /// One key makes two separate things observable. **Which store** the
+        /// router scoped the chain to — the key lands there and nowhere else —
+        /// and **which value** the router passed as the site key, since the
+        /// key is named after it. No shipped module writes KV in the response
+        /// phase, so a probe is also the only way to reach that call site at
+        /// all; hence `MiddlewareChain::with_test_response_module`.
+        struct KvScopeProbe;
+
+        fn stamp(req: &ephpm_middleware::Request<'_>, phase: &str) {
+            let vhost = req.vhost_id().unwrap_or(ephpm_middleware::UNMATCHED_VHOST);
+            // Deliberately not asserted here: a panic inside a module is
+            // caught by the chain and turned into a 500, so it would never
+            // surface as a test failure. The absent key is what the caller
+            // asserts on.
+            let _ = req.host().kv_set(&format!("mw:probe:{phase}:{vhost}:{}", req.path()), b"1", 0);
+        }
+
+        impl ephpm_middleware::Middleware for KvScopeProbe {
+            fn init(_config: &serde_json::Value) -> Result<Self, String> {
+                Ok(Self)
+            }
+
+            fn invoke(&self, req: &ephpm_middleware::Request<'_>) -> ephpm_middleware::Response {
+                stamp(req, "req");
+                ephpm_middleware::Response::cont()
+            }
+        }
+
+        impl ephpm_middleware::ResponseMiddleware for KvScopeProbe {
+            fn invoke_response(
+                &self,
+                req: &ephpm_middleware::Request<'_>,
+                _resp: &mut ephpm_middleware::ResponseView<'_>,
+            ) {
+                stamp(req, "resp");
+            }
+        }
+
+        /// A multi-tenant router with [`KvScopeProbe`] mounted.
+        ///
+        /// The fixture's `sites_domain_suffix = ".local"` is what lets these
+        /// tests tell `resolved.key` from `server_name` at all: `Host:
+        /// shop.local` has key `shop` and server name `shop.local`, so a swap
+        /// renames the probe's key instead of being invisible.
+        fn probe_router(
+            dir: &Path,
+            sites: &Path,
+        ) -> (Router, Arc<Store>, ephpm_kv::multi_tenant::MultiTenantStore) {
+            let (router, global, mt) = multi_tenant_router(dir, sites);
+            let chain = crate::middleware::MiddlewareChain::with_test_response_module::<KvScopeProbe>(
+                "kv-scope-probe",
+                &serde_json::Value::Null,
+            );
+            (router.with_middleware_chain(Some(Arc::new(chain))), global, mt)
+        }
+
+        /// Two tenants, each with a PHP entrypoint and a static asset.
+        fn probe_sites(dir: &Path) -> PathBuf {
+            let sites = dir.join("sites");
+            for name in ["shop", "blog"] {
+                fs::create_dir_all(sites.join(name)).unwrap();
+                fs::write(sites.join(name).join("index.php"), b"<?php echo 1;").unwrap();
+                fs::write(sites.join(name).join("a.css"), b"body{}").unwrap();
+            }
+            sites
+        }
+
+        fn probe_addr() -> SocketAddr {
+            "198.51.100.30:5000".parse().unwrap()
+        }
+
+        /// Issue #451(1): the chain that runs on the **PHP** path — the common
+        /// one — must run inside this vhost's KV scope.
+        ///
+        /// Driven through `handle` rather than `handle_php` so `handle_inner`'s
+        /// choice of argument is on the hook too: the key is named `shop`,
+        /// which is `resolved.key`, not `shop.local`, which is `server_name`.
+        /// (Stub mode answers the PHP request with a 500 or a stub 200 — the
+        /// chain has already run either way, which is the point.)
+        #[tokio::test]
+        async fn the_php_path_enters_the_site_scope_around_the_chain() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = probe_sites(dir.path());
+            let (router, global, mt) = probe_router(dir.path(), &sites);
+
+            let _ = router
+                .handle(get_with_host("/index.php", "shop.local"), probe_addr(), false)
+                .await
+                .unwrap();
+
+            let shop = mt.get_site_store("shop");
+            assert!(
+                shop.get("mw:probe:req:shop:/index.php").is_some(),
+                "the PHP path's chain must run inside this vhost's KV scope, keyed by the \
+                 canonical site key — issue #451"
+            );
+            assert!(
+                shop.get("mw:probe:resp:shop:/index.php").is_some(),
+                "the response phase must run inside this vhost's KV scope too — issue #451"
+            );
+            // Nothing else — in particular nothing named after the request
+            // host, which is what a `server_name` argument would produce.
+            let mut got = shop.keys("mw:probe:*");
+            got.sort();
+            assert_eq!(
+                got,
+                vec![
+                    "mw:probe:req:shop:/index.php".to_string(),
+                    "mw:probe:resp:shop:/index.php".to_string(),
+                ]
+            );
+            assert!(
+                global.keys("mw:probe:*").is_empty(),
+                "a tenant's middleware state must not land in the process-global store"
+            );
+        }
+
+        /// Issue #451(1), response phase on the **static** path: the same
+        /// guarantee for the one call site no shipped module can reach.
+        ///
+        /// The sibling test above pins `static_request_phase` when called
+        /// directly with a supplied site key; this drives it the way
+        /// `handle_inner` does, and adds the response phase behind it.
+        #[tokio::test]
+        async fn the_static_path_enters_the_site_scope_in_both_phases() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = probe_sites(dir.path());
+            let (router, global, mt) = probe_router(dir.path(), &sites);
+
+            let resp = router
+                .handle(get_with_host("/a.css", "shop.local"), probe_addr(), false)
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "the probe must not have blocked the file");
+
+            let shop = mt.get_site_store("shop");
+            assert!(
+                shop.get("mw:probe:req:shop:/a.css").is_some(),
+                "the static request phase must run inside this vhost's KV scope — issue #451"
+            );
+            assert!(
+                shop.get("mw:probe:resp:shop:/a.css").is_some(),
+                "the response phase must run inside this vhost's KV scope — issue #451"
+            );
+            assert!(
+                global.keys("mw:probe:*").is_empty(),
+                "a tenant's middleware state must not land in the process-global store"
+            );
+        }
+
+        /// Issue #451(2), stated on its own: **every** chain call site is told
+        /// the canonical site key, never the request host.
+        ///
+        /// Swapping `resolved.key` back to `server_name` at any one of the
+        /// three call sites leaves the rest of this module passing, because
+        /// nothing else inspects a value where the two differ. Here they do:
+        /// `Host: shop.local` resolves to key `shop`, so a swap both renames
+        /// every probe key and — since the same value picks the store — moves
+        /// it into a keyspace minted from the header. That is #390 restored.
+        #[tokio::test]
+        async fn every_chain_call_site_is_told_the_canonical_key_not_the_host() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = probe_sites(dir.path());
+            let (router, _global, mt) = probe_router(dir.path(), &sites);
+
+            for (host, key) in [("shop.local", "shop"), ("blog.local", "blog")] {
+                for path in ["/a.css", "/index.php"] {
+                    let _ = router
+                        .handle(get_with_host(path, host), probe_addr(), false)
+                        .await
+                        .unwrap();
+                }
+                let store = mt.get_site_store(key);
+                let mut got = store.keys("mw:probe:*");
+                got.sort();
+                assert_eq!(
+                    got,
+                    vec![
+                        format!("mw:probe:req:{key}:/a.css"),
+                        format!("mw:probe:req:{key}:/index.php"),
+                        format!("mw:probe:resp:{key}:/a.css"),
+                        format!("mw:probe:resp:{key}:/index.php"),
+                    ],
+                    "`Host: {host}` must reach the chain as tenant `{key}` — at every call site, \
+                     and in {key}'s own store — issues #390/#451"
+                );
+            }
+
+            // ...and the host spelling never became a tenant of its own.
+            for spelling in ["shop.local", "blog.local"] {
+                assert!(
+                    mt.get_site_store(spelling).keys("mw:probe:*").is_empty(),
+                    "`{spelling}` must not have minted its own middleware keyspace"
+                );
+            }
+        }
     }
 
     // ── streaming compression (worker send_response_stream) ────────
