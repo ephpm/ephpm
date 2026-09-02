@@ -101,8 +101,19 @@ When the value changes (any nondecreasing comparison; absolute value
 doesn't matter), every node treats it as a deploy event for that
 vhost.
 
-For the default `document_root` (no vhost), the key is
-`opcache:version:_default`.
+For the default `document_root` (and for any `Host` that matched no
+configured vhost), the key is `opcache:version:_DEFAULT`.
+
+Both sentinel names — `_DEFAULT` here and `_ALL` for the broadcast key
+below — are uppercase on purpose, and that is load-bearing rather than
+stylistic. A vhost directory name is lowercase by construction (the
+router lowercases every `Host`, and `is_valid_site_key` accepts only
+`[a-z0-9._-]`), so an uppercase sentinel is a name no tenant can claim.
+With the earlier lowercase spelling a site literally called `_default`
+shared the default docroot's entry — including its
+`last_invalidated_version` — so whichever of the two saw a deploy first
+advanced the shared counter and the other never invalidated at all.
+Issue #450.
 
 #### Why a version key rather than tombstones
 
@@ -173,7 +184,7 @@ ephpm deploy --site blog
 # for observability; doesn't affect invalidation logic)
 ephpm deploy --site blog --rev a8f13d2
 
-# Invalidate every vhost via the broadcast key opcache:version:_all
+# Invalidate every vhost via the broadcast key opcache:version:_ALL
 ephpm deploy --all
 
 # Same reset, named for a non-deploy context. Wire-identical to `deploy`

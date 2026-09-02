@@ -178,7 +178,7 @@ enum Commands {
 
     /// Deploy: invalidate the cluster-wide OPcache for one vhost, or every
     /// vhost via the broadcast key. Writes `opcache:version:<vhost>` (or
-    /// `opcache:version:_all`) via the running server's RESP listener; gossip
+    /// `opcache:version:_ALL`) via the running server's RESP listener; gossip
     /// replicates the write to every peer within seconds.
     ///
     /// Requires the running server to have `[kv.redis_compat] enabled = true`
@@ -188,7 +188,7 @@ enum Commands {
         #[arg(long, group = "target")]
         site: Option<String>,
 
-        /// Invalidate every vhost via the broadcast key (`opcache:version:_all`).
+        /// Invalidate every vhost via the broadcast key (`opcache:version:_ALL`).
         #[arg(long, group = "target")]
         all: bool,
 
@@ -1884,13 +1884,21 @@ async fn kv_ttl(host: &str, port: u16, auth: &KvAuth, key: &str) -> anyhow::Resu
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Vhost name used when neither `--site` nor `--all` is supplied. Mirrors the
-/// server-side `crate::opcache::DEFAULT_VHOST`; kept in-lockstep manually since
-/// the CLI does not depend on `ephpm-server`.
-const OPCACHE_DEFAULT_VHOST: &str = "_default";
+/// server-side `ephpm_server::opcache::DEFAULT_VHOST`; kept in-lockstep
+/// manually since the CLI does not depend on `ephpm-server`.
+///
+/// **Uppercase on purpose (issue #450).** [`resolve_target`] lowercases
+/// `--site`, and the server lowercases every `Host`, so neither an operator
+/// flag nor a `sites_dir` directory can reach this bucket — it is only ever
+/// written by *omitting* `--site`. Before the fix it was `_default`, which a
+/// tenant site could be named, and the two then shared one invalidation
+/// counter on the server.
+const OPCACHE_DEFAULT_VHOST: &str = "_DEFAULT";
 
 /// Broadcast vhost name written by `--all`. Kept in-lockstep with the
-/// server-side `crate::opcache::BROADCAST_VHOST`.
-const OPCACHE_BROADCAST_VHOST: &str = "_all";
+/// server-side `ephpm_server::opcache::BROADCAST_VHOST`. Uppercase for the
+/// same reason as [`OPCACHE_DEFAULT_VHOST`] (was `_all`).
+const OPCACHE_BROADCAST_VHOST: &str = "_ALL";
 
 /// KV key prefix for the per-vhost version counter.
 const OPCACHE_VERSION_PREFIX: &str = "opcache:version:";
@@ -2434,6 +2442,30 @@ mod cli_tests {
     #[test]
     fn resolve_target_rejects_empty_site() {
         assert!(resolve_target(Some("   "), false).is_err());
+    }
+
+    /// Issue #450, CLI half: `--site` lowercases, so no value an operator can
+    /// type reaches a sentinel bucket. That is what makes the uppercase
+    /// sentinels unreachable from *both* directions — the server refuses to
+    /// derive them from a `Host`, and the CLI refuses to spell them.
+    ///
+    /// Also pins that a site genuinely *named* `_default` or `_all` now
+    /// targets itself, which is the behaviour the collision used to steal.
+    #[test]
+    fn no_site_flag_can_name_a_sentinel_bucket() {
+        for spelling in ["_DEFAULT", "_default", "_ALL", "_all", "_Default"] {
+            let target = resolve_target(Some(spelling), false).unwrap();
+            assert_ne!(
+                target, OPCACHE_DEFAULT_VHOST,
+                "`--site {spelling}` must not reach the default bucket — issue #450"
+            );
+            assert_ne!(
+                target, OPCACHE_BROADCAST_VHOST,
+                "`--site {spelling}` must not reach the broadcast bucket — issue #450"
+            );
+        }
+        assert_eq!(resolve_target(Some("_default"), false).unwrap(), "_default");
+        assert_eq!(resolve_target(Some("_all"), false).unwrap(), "_all");
     }
 
     #[test]

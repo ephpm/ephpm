@@ -4871,10 +4871,18 @@ pub(crate) fn normalize_host_key(host: &str) -> String {
 /// that vhost's names (`blog`, `blog.localhost`, `BLOG.`) the client used.
 ///
 /// A host that names no known site has no deployable identity, so it maps to
-/// [`crate::opcache::DEFAULT_VHOST`] (`_default`, the default document root)
-/// rather than to a key invented from the header. That also keeps the
-/// invalidation key space bounded by the site fleet instead of by what a client
-/// can type.
+/// [`crate::opcache::DEFAULT_VHOST`] (the default document root) rather than to
+/// a key invented from the header. That also keeps the invalidation key space
+/// bounded by the site fleet instead of by what a client can type.
+///
+/// That sentinel is **uppercase**, which is what stops it from colliding with a
+/// real tenant (issue #450) — the same "unspellable bucket" property the PHP
+/// ETag cache key gets from its empty site component, in the form this key
+/// needs. Empty would work for a key the operator never sees; this one is a
+/// Prometheus label, a log field, and the value `ephpm deploy` writes with no
+/// `--site`, so it has to stay readable. [`is_valid_site_key`] rejects
+/// uppercase and the router lowercases every `Host`, so no `sites_dir`
+/// directory can produce it.
 fn opcache_vhost_key(site_key: Option<&str>) -> String {
     site_key.map_or_else(|| crate::opcache::DEFAULT_VHOST.to_string(), str::to_owned)
 }
@@ -10173,6 +10181,85 @@ echo "post response";
                     shop,
                     "`{spelling}` is the same tenant and must share its ETag cache entry"
                 );
+            }
+        }
+
+        /// Issue #450, stated directly: the OPcache vhost a tenant gets is
+        /// never the bucket an unmatched host gets, **even for a tenant that
+        /// picked the sentinel's old name**.
+        ///
+        /// `_default` was a legal `sites_dir` directory name, so a site called
+        /// `_default` and the default document root landed on one key. They
+        /// then shared the watcher's `last_invalidated_version`, and whichever
+        /// of the two absorbed a deploy first left the other serving stale
+        /// bytecode — not merely a shared namespace, a dropped invalidation.
+        ///
+        /// Same shape as `etag_cache_key_isolates_two_sites_on_the_same_path`:
+        /// distinct tenants never collide, every spelling of one tenant always
+        /// does.
+        #[tokio::test]
+        async fn opcache_vhost_key_isolates_tenants_from_the_default_bucket() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            let dbdir = dir.path().join("dbs");
+            // `_default` and `_all` are ordinary vhost names — that is the
+            // whole problem, so the fixture creates them as real tenants.
+            for name in ["shop", "blog", "_default", "_all"] {
+                fs::create_dir_all(sites.join(name)).unwrap();
+            }
+
+            let backends =
+                SiteBackends::new(dbdir.clone(), 8, stats(), tokio::runtime::Handle::current())
+                    .expect("registry");
+            let auth = SiteWireAuth::new(backends.clone()).expect("secret");
+            let router = router_with(dir.path(), &sites, &dbdir, Some(".local"), &auth);
+
+            let shop = derive(&router, &backends, "shop.local").opcache;
+            let blog = derive(&router, &backends, "blog.local").opcache;
+            let named_default = derive(&router, &backends, "_default.local").opcache;
+            let named_all = derive(&router, &backends, "_all.local").opcache;
+            let unmatched = derive(&router, &backends, "nobody.example.com").opcache;
+
+            assert_eq!(shop, "shop");
+            assert_eq!(blog, "blog");
+            // A tenant literally named `_default` keeps its own key...
+            assert_eq!(named_default, "_default");
+            assert_eq!(named_all, "_all");
+            // ...because the sentinel is not that name.
+            assert_eq!(unmatched, crate::opcache::DEFAULT_VHOST);
+            assert_ne!(
+                named_default, unmatched,
+                "a site named `_default` must not share the default docroot's OPcache \
+                 invalidation counter — issue #450"
+            );
+            assert_ne!(
+                named_all,
+                crate::opcache::BROADCAST_VHOST,
+                "a site named `_all` must not sit on the broadcast key — issue #450"
+            );
+            for (a, b) in [
+                (&shop, &blog),
+                (&shop, &unmatched),
+                (&blog, &named_default),
+                (&named_default, &named_all),
+            ] {
+                assert_ne!(a, b, "OPcache vhost keys must be pairwise distinct — #450");
+            }
+
+            // ...while every legal spelling of ONE tenant still shares its own
+            // key, or `ephpm deploy --site shop` would miss requests that
+            // arrived under a different spelling of the same vhost.
+            for spelling in ["shop", "shop.local", "SHOP.LOCAL", "shop.local:8080", "shop."] {
+                assert_eq!(
+                    derive(&router, &backends, spelling).opcache,
+                    shop,
+                    "`{spelling}` is the same tenant and must share its OPcache vhost"
+                );
+            }
+            // And every spelling of the unmatched bucket collapses to the one
+            // sentinel rather than minting a key per header value.
+            for host in ["nobody.example.com", "127.0.0.1:8080", "not-a-site"] {
+                assert_eq!(derive(&router, &backends, host).opcache, unmatched);
             }
         }
 

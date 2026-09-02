@@ -3,9 +3,10 @@
 //! Validates the watcher end-to-end:
 //!   1. PRE — warm the OPcache by hitting `opcache_status.php` (warming
 //!      probe) and confirming the target file is cached.
-//!   2. Trigger — write `opcache:version:_default` (single-node) or
-//!      `opcache:version:_all` (cluster) via the RESP listener so the watcher
-//!      fires on the next request.
+//!   2. Trigger — write `opcache:version:_DEFAULT` (single-node) or
+//!      `opcache:version:_ALL` (cluster) via the RESP listener so the watcher
+//!      fires on the next request. Both sentinels are uppercase so no vhost
+//!      directory can claim them (issue #450).
 //!   3. POST — hit `opcache_status.php?warm=0` (cold probe). The request
 //!      trips the watcher BEFORE the probe script runs, so the probe must
 //!      see the target genuinely dropped (`opcache_is_script_cached` =
@@ -39,9 +40,9 @@ use tokio::net::TcpStream;
 /// KV key prefix — must match `ephpm-server::opcache::KV_VERSION_PREFIX`.
 const OPCACHE_VERSION_PREFIX: &str = "opcache:version:";
 /// Broadcast vhost — must match `ephpm-server::opcache::BROADCAST_VHOST`.
-const OPCACHE_BROADCAST_VHOST: &str = "_all";
+const OPCACHE_BROADCAST_VHOST: &str = "_ALL";
 /// Default vhost — must match `ephpm-server::opcache::DEFAULT_VHOST`.
-const OPCACHE_DEFAULT_VHOST: &str = "_default";
+const OPCACHE_DEFAULT_VHOST: &str = "_DEFAULT";
 
 fn cluster_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
@@ -367,8 +368,10 @@ mod helper_tests {
     // workspace and needs to compile without the server's dep tree).
     #[test]
     fn constants_documented() {
-        assert_eq!(OPCACHE_DEFAULT_VHOST, "_default");
-        assert_eq!(OPCACHE_BROADCAST_VHOST, "_all");
+        // Uppercase is load-bearing, not cosmetic: it is what makes these two
+        // buckets unspellable as `sites_dir` directory names (issue #450).
+        assert_eq!(OPCACHE_DEFAULT_VHOST, "_DEFAULT");
+        assert_eq!(OPCACHE_BROADCAST_VHOST, "_ALL");
         assert_eq!(OPCACHE_VERSION_PREFIX, "opcache:version:");
         assert!(required_env_documented());
     }

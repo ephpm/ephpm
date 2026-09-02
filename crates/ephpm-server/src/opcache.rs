@@ -9,6 +9,30 @@
 //!
 //! Design: `site/content/roadmap/opcache-clustering.md` (Phase 1).
 //!
+//! # Sentinel names
+//!
+//! Two vhost names in this key space are not vhosts: [`DEFAULT_VHOST`] (the
+//! default document root, and every `Host` that matched no site) and
+//! [`BROADCAST_VHOST`] (`ephpm deploy --all`). Both are **uppercase**, which
+//! makes them unspellable as a site key — the router lowercases every `Host`
+//! before matching, `ephpm deploy --site` lowercases its argument, and
+//! `router::is_valid_site_key` accepts only `[a-z0-9._-]`. So no `sites_dir`
+//! directory, and no operator flag, can name either bucket.
+//!
+//! That is the fix for issue #450. The old spellings (`_default`, `_all`) were
+//! both legal vhost directory names, and the `_default` collision was a
+//! correctness bug rather than cosmetics: a tenant site called `_default` and
+//! the default document root shared one `SiteOpcacheState`, so whichever of
+//! the two saw a new version first advanced the shared counter and the other
+//! never invalidated at all — a deploy silently dropped, stale bytecode served.
+//! (`_all` only ever over-invalidated: it shares the broadcast KV key but not
+//! a state entry. Closed with the same rule so "a sentinel is unspellable" is
+//! one invariant rather than a per-name judgement.)
+//!
+//! The `router::is_valid_site_key` side of the invariant is asserted in this
+//! module's tests, so weakening either half fails a test rather than silently
+//! reopening the collision.
+//!
 //! # Concurrency
 //!
 //! - Fast path is one atomic load + one `DashMap::get` — sub-microsecond, no
@@ -38,8 +62,13 @@ use ephpm_kv::store::Store;
 pub const KV_VERSION_PREFIX: &str = "opcache:version:";
 
 /// The fallback vhost name for `[server] document_root` when no `sites_dir` is
-/// configured, or when the CLI runs `ephpm cache reset` without `--site`.
-pub const DEFAULT_VHOST: &str = "_default";
+/// configured, for a `Host` that matched no known vhost, or when the CLI runs
+/// `ephpm cache reset` without `--site`.
+///
+/// **Uppercase on purpose** — see the module's "Sentinel names" note. This was
+/// `_default` until issue #450, which is a name a `sites_dir` directory can
+/// legally have.
+pub const DEFAULT_VHOST: &str = "_DEFAULT";
 
 /// Broadcast key written by `ephpm deploy --all`. When present, the watcher
 /// treats it as a "cluster-wide invalidate every vhost" event and folds its
@@ -47,7 +76,10 @@ pub const DEFAULT_VHOST: &str = "_default";
 /// single-write cover every site without requiring the CLI to enumerate
 /// them — a brand-new site whose per-vhost key has never been written still
 /// picks up the broadcast on its first request.
-pub const BROADCAST_VHOST: &str = "_all";
+///
+/// **Uppercase on purpose** — see the module's "Sentinel names" note. This was
+/// `_all` until issue #450.
+pub const BROADCAST_VHOST: &str = "_ALL";
 
 /// What triggered an invalidation. Used as a Prometheus label.
 ///
@@ -114,9 +146,14 @@ pub enum Decision {
 /// dispatch.
 #[derive(Clone, Debug)]
 pub struct OpcacheWatcher {
-    /// Per-vhost state keyed by the lowercased vhost name. `DashMap` for
+    /// Per-vhost state keyed by the canonical site key (already lowercase),
+    /// or by [`DEFAULT_VHOST`] for a request with no site. `DashMap` for
     /// lock-free reads on the hot path; new entries are inserted lazily on
     /// first sight of a vhost.
+    ///
+    /// Two names sharing an entry means they share `last_invalidated_version`,
+    /// and one of them will miss a deploy — which is why the sentinel must not
+    /// be spellable as a site key (issue #450).
     sites: Arc<DashMap<String, Arc<SiteOpcacheState>>>,
     /// Whether cluster invalidation is enabled. When `false`,
     /// [`OpcacheWatcher::check`] short-circuits to [`Decision::NoOp`] before
@@ -396,9 +433,72 @@ mod tests {
         }
     }
 
+    /// Issue #450. Neither sentinel may be a name a `sites_dir` directory can
+    /// have, or a tenant shares an invalidation keyspace with a bucket that is
+    /// not a tenant.
+    ///
+    /// For `DEFAULT_VHOST` that sharing is a *correctness* bug, not just
+    /// noise: the entry in `sites` carries `last_invalidated_version`, so the
+    /// site and the default docroot would take turns swallowing each other's
+    /// deploys (`missing_the_deploy_when_a_sentinel_is_spellable` below shows
+    /// the exact mechanism).
+    ///
+    /// This asserts the invariant, not the spelling — an author is free to
+    /// pick a different unspellable sentinel, and free to change
+    /// `is_valid_site_key`, as long as the two keep disagreeing.
+    #[test]
+    fn sentinel_vhosts_are_unspellable_as_site_keys() {
+        for sentinel in [DEFAULT_VHOST, BROADCAST_VHOST] {
+            assert!(
+                !crate::router::is_valid_site_key(sentinel),
+                "`{sentinel}` is a legal sites_dir directory name — a tenant could claim this \
+                 OPcache bucket (issue #450)"
+            );
+        }
+        assert_ne!(DEFAULT_VHOST, BROADCAST_VHOST);
+        // The old spellings are exactly what a vhost directory may be called;
+        // this is the property the fix turned around.
+        for old in ["_default", "_all"] {
+            assert!(crate::router::is_valid_site_key(old));
+        }
+    }
+
+    /// The mechanism #450 closes, demonstrated on the watcher itself: two
+    /// names that collapse to one key take turns swallowing each other's
+    /// deploys, because they share one `last_invalidated_version`.
+    ///
+    /// Written against a deliberately-collided pair rather than against
+    /// `DEFAULT_VHOST`, so it keeps documenting *why* the sentinel must stay
+    /// unspellable even after the sentinel itself is safe.
+    #[test]
+    fn a_shared_vhost_key_swallows_the_second_deploy() {
+        let store = store();
+        let watcher = OpcacheWatcher::new(true);
+        write_version(&store, "collide", 100);
+
+        // The default docroot's request sees the deploy and invalidates.
+        let Decision::Invalidate { version } = watcher.check(&store, "collide") else {
+            panic!("expected Invalidate");
+        };
+        watcher.mark_invalidated(
+            "collide",
+            &PathBuf::from("/srv/default"),
+            version,
+            InvalidationTrigger::Kv,
+            |_| Some(1),
+        );
+
+        // The tenant that happens to share the key now gets NOTHING for the
+        // very same deploy — its docroot keeps serving stale bytecode.
+        assert!(
+            matches!(watcher.check(&store, "collide"), Decision::NoOp),
+            "a shared vhost key means the second docroot never invalidates — issue #450"
+        );
+    }
+
     #[test]
     fn broadcast_key_triggers_all_vhosts() {
-        // ephpm deploy --all writes opcache:version:_all. Every vhost that
+        // ephpm deploy --all writes the broadcast key. Every vhost that
         // has never had a per-vhost key still picks up the broadcast on its
         // first check.
         let store = store();
