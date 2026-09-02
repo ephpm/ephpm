@@ -25,11 +25,11 @@ stitched into a trace that continues from whatever called you.
 
 ## What ePHPm exports
 
-| Span | Emitted | Attributes |
-|------|---------|------------|
-| `http.request` | every request | `http.request.method`, `url.path`, `http.response.status_code` |
-| `php.execute` | requests that run PHP | none |
-| `worker.queue_wait` | worker mode only | none |
+| Span | Kind | Emitted | Attributes |
+|------|------|---------|------------|
+| `http.request` | `SERVER` | every request | `http.request.method`, `url.path`, `http.response.status_code`; `error.type` on a 5xx; `ephpm.site` in multi-site mode |
+| `php.execute` | `INTERNAL` | requests that run PHP | none |
+| `worker.queue_wait` | `INTERNAL` | worker mode only | none |
 
 `php.execute` and `worker.queue_wait` are children of `http.request`. On the
 default fpm path there is no dispatch queue, so you get a two-span tree; in
@@ -37,11 +37,53 @@ worker mode (`[php] mode = "worker"`) `worker.queue_wait` appears as a sibling
 of `php.execute` and measures how long the request waited for a free worker.
 A static file or a 404 produces `http.request` alone.
 
-Note what is **not** on a span: no `Host` header, no query string, and no
-site/vhost identifier. Query strings routinely carry tokens, so their absence
-is deliberate. The consequence in multi-tenant mode (`[server] sites_dir`) is
-that traces from different vhosts are currently indistinguishable — see
-[Known rough edges](#known-rough-edges).
+Attribute names follow the [OpenTelemetry HTTP semantic
+conventions](https://opentelemetry.io/docs/specs/semconv/http/http-spans/)
+(HTTP spans, stable since semconv **v1.23.0**). ePHPm has never used the
+deprecated `http.method` / `http.url` spellings, so there is nothing to
+migrate.
+
+**Span status.** A 5xx sets the span status to `ERROR` and records
+`error.type` (the status code). A **4xx does not** — semconv is explicit that
+on a `SERVER` span a 4xx is left unset, because a 404 or a 401 is a normal
+outcome of serving rather than a server fault. Without that rule every bot
+probe would show up red.
+
+**Span name.** `http.request`, not the semconv-preferred `{method} {route}`.
+ePHPm has no route concept, so the only thing it could substitute is the raw
+path — which explodes cardinality on any app with IDs in its URLs. The method
+and path are both available as attributes.
+
+Note what is **not** on a span: no `Host` header (under `server.address` or any
+other name), and no query string. Both are deliberate. The `Host` header is
+attacker-controlled and arrives before any tenancy decision, so what is
+exported instead is `ephpm.site` — see below. Query strings routinely carry
+tokens and PII; `url.path` excludes the query by construction.
+
+### Per-tenant attribution (`ephpm.site`)
+
+In multi-site mode (`[server] sites_dir`) the `http.request` span carries
+`ephpm.site`: the **canonical site key** ePHPm resolved for the request — the
+same key that selects the vhost's database file, its KV keyspace and its
+`pdo_mysql` credential. Filter or group by it to get per-tenant traces,
+latency and error rates out of one process.
+
+Two properties worth knowing:
+
+- It is the *resolved* key, never a re-spelling of the `Host` header. With
+  `sites_domain_suffix = ".local"`, `Host: shop.local` and `Host: shop` both
+  export `ephpm.site="shop"`, because they are one tenant.
+- A request whose `Host` matched **no** vhost carries **no** `ephpm.site` at
+  all. An absent attribute is the honest representation of "no tenant", and it
+  keeps unknown, attacker-supplied hostnames off the wire entirely.
+
+In single-site mode the attribute is absent — there is one tenant and
+`OTEL_SERVICE_NAME` already distinguishes the deployment.
+
+`ephpm.` is a deliberately ePHPm-owned namespace. OTel semantic conventions
+have no multi-tenant attribute, and no reserved namespace (`service.*`,
+`server.*`, `host.*`) means "which of this process's vhosts served this", so
+squatting on one would be wrong.
 
 ## Choosing a transport
 
@@ -234,6 +276,49 @@ correct behaviour and the most common cause of "my traces stopped appearing
 after I put a load balancer in front" — the symptom is indistinguishable from
 a broken exporter.
 
+## When export fails
+
+A wrong endpoint, an unreachable collector, or a certificate ePHPm does not
+trust used to be **completely silent**: the startup line appeared, no spans
+arrived, and nothing in the log said why
+([#378](https://github.com/ephpm/ephpm/issues/378)). Now the failure is
+reported — and deliberately rate-limited, because a collector that is down for
+an hour must not produce hundreds of identical lines.
+
+The first failed batch is loud:
+
+```text
+WARN ephpm_server::otlp: OTLP span export failed; traces are not reaching the
+     collector. Requests are unaffected. Repeats are summarized rather than
+     logged individually.
+     error="Operation failed: ... tcp connect error ... Connection refused"
+     summary_interval_secs=60
+```
+
+While it keeps failing you get one summary a minute, carrying how bad it is:
+
+```text
+WARN ephpm_server::otlp: OTLP span export is still failing
+     consecutive_failures=13 failing_for_secs=60 error="..."
+```
+
+And the recovery is logged too, so "traces came back" is not something you
+have to infer:
+
+```text
+INFO ephpm_server::otlp: OTLP span export recovered
+     consecutive_failures=14 was_failing_for_secs=120
+```
+
+Read the `error=` value first — it distinguishes the four failure modes that
+otherwise look identical from the collector side: a refused connection (wrong
+port, collector down), a TLS error (`unknown certificate authority` → see
+[HTTPS collectors](#https-collectors)), an HTTP status from the collector
+(wrong path, or gRPC pointed at an http/protobuf receiver), and a timeout.
+
+**Serving is never affected.** A failing exporter does not slow, block or fail
+requests; export runs on the SDK's own batch thread.
+
 ## HTTPS collectors
 
 An `https://` endpoint works with no extra configuration, on **both**
@@ -298,10 +383,9 @@ set the endpoint in `ephpm.toml` anyway, so this costs you nothing.
 
 If the Traces tab stays empty, work down this list: is the startup line
 present and does it say `grpc`; does it name 17011; is *Use fixed OTLP server
-port* actually enabled; and is there an `ERROR ... BatchSpanProcessor.
-ExportError` in the ePHPm log (a refused connection means the IDE is not
-listening on that port). Export failures are logged — see
-[Known rough edges](#known-rough-edges).
+port* actually enabled; and is there a `WARN ... OTLP span export failed` line
+in the ePHPm log (a refused connection means the IDE is not listening on that
+port). See [When export fails](#when-export-fails).
 
 Jaeger in a browser tab remains a perfectly good alternative, and is what to
 fall back to if the plugin misbehaves.
@@ -398,32 +482,12 @@ flushes the batch queue before exiting — verified. `SIGKILL` does not, and the
 last few seconds of spans are gone. If your last request never shows up, check
 how you stopped the server before you check anything else.
 
-**Export failures are logged, and repeat.** A wrong endpoint, an unreachable
-collector or an untrusted certificate produces an error line naming the cause,
-on the `opentelemetry_sdk` target:
-
-```text
-ERROR opentelemetry_sdk: name="BatchSpanProcessor.ExportError"
-      error="Operation failed: ... tcp connect error ... Connection refused"
-```
-
-This was silent before ([#378](https://github.com/ephpm/ephpm/issues/378)).
-Two things to know: the message is emitted **once per failed batch**, so a
-collector that stays down produces a steady trickle of error lines rather than
-one; and a `[server.logging] level` / `RUST_LOG` filter strict enough to
-exclude the `opentelemetry_sdk` target will hide it again. Serving is never
-affected — requests keep returning normally while export fails.
-
-**Spans are `SPAN_KIND_INTERNAL`, including `http.request`.** Backends that
-build service graphs or RED metrics from span kind will not recognise ePHPm as
-a server. A 5xx response also leaves the span status `UNSET`, so failed
-requests are not highlighted as errors — the `http.response.status_code`
-attribute is correct, but nothing else marks them. Tracked in
-[#379](https://github.com/ephpm/ephpm/issues/379).
-
-**No per-tenant attribution.** In multi-site mode every span looks the same
-regardless of which vhost served the request. Tracked in
-[#380](https://github.com/ephpm/ephpm/issues/380).
+**`busy_ns` and `idle_ns` are `0` on `php.execute` and `worker.queue_wait`.**
+Those spans are created and dropped but never *entered*, so
+`tracing-opentelemetry`'s busy/idle accounting sees nothing to attribute. The
+span durations themselves are correct (a span records create→close), and
+`http.request` carries real values. Cosmetic, but do not read the zeros as
+"this took no time".
 
 ## See also
 

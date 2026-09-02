@@ -22,7 +22,7 @@ This document describes the full vision for ePHPm. The matrix below tracks what 
 | Signal handling | Partial | Ctrl+C only; no SIGHUP reload |
 | Observability — logging | **Implemented** | `tracing` crate, structured logs, request lifecycle events |
 | Observability — query stats | **Implemented** | `ephpm-query-stats`: SQL normalization, digest tracking, slow query log, Prometheus metrics |
-| Observability — OTLP export | **Implemented** | Request spans (`http.request` / `worker.queue_wait` / `php.execute`) over OTLP gRPC or http/protobuf, W3C `traceparent` continuation. Auto-instrumentation of PHP code, and an OTLP *receiver*, are still planned |
+| Observability — OTLP export | **Implemented** | Request spans (`http.request` as `SERVER` / `worker.queue_wait` / `php.execute`) over OTLP gRPC or http/protobuf, OTel HTTP semconv attributes with 5xx→`ERROR` span status, per-tenant `ephpm.site` in multi-site mode, W3C `traceparent` continuation, rate-limited export-failure reporting. Auto-instrumentation of PHP code, and an OTLP *receiver*, are still planned |
 | DB proxy (MySQL) | **Implemented** | Wire protocol, connection pooling, transparent forwarding to upstream MySQL |
 | DB proxy (PostgreSQL) | **Implemented** | Wire protocol, connection pooling, trust/md5/SCRAM auth, R/W splitting |
 | Read/write splitting | **Implemented** | `ephpm-db` routes reads to replicas, writes to primary |

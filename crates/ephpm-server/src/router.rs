@@ -2124,12 +2124,36 @@ impl Router {
         // the callsite disabled — the span only materializes when a layer
         // opts in (the OTLP layer's Targets filter, or RUST_LOG=debug).
         // Timing-wise it brackets the same region as `start`/`elapsed`.
+        //
+        // Field names follow the OpenTelemetry HTTP semantic conventions (HTTP
+        // spans, stable since semconv v1.23.0): `http.request.method`,
+        // `url.path`, `http.response.status_code`, `error.type`. The three
+        // `otel.*` names are not attributes — `tracing-opentelemetry` consumes
+        // them to set the span's *kind* and *status* (see `SPAN_KIND_FIELD` /
+        // `SPAN_STATUS_CODE_FIELD` in that crate's `layer.rs`).
+        //
+        // Deliberately absent (issue #380): the raw `Host` header, under
+        // `server.address` or any other name. It is attacker-controlled and
+        // arrives before any tenancy decision; `ephpm.site` below carries the
+        // *resolved* tenant instead. Also absent: the query string, which
+        // routinely carries tokens (`url.path` excludes it by construction).
         let span = tracing::debug_span!(
             target: crate::OTEL_TRACE_TARGET,
             "http.request",
+            // An inbound HTTP request is a SERVER span. Backends key service
+            // graphs and RED metrics off this (issue #379); as INTERNAL, ePHPm
+            // never appeared as a trace's entry point.
+            otel.kind = "server",
             http.request.method = %req.method(),
             url.path = req.uri().path(),
             http.response.status_code = tracing::field::Empty,
+            // Recorded below once the response status is known — see
+            // `server_span_status_is_error`.
+            otel.status_code = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+            // Recorded by `handle_inner` once `resolve_site` has run, and only
+            // when a known vhost matched (issue #380).
+            ephpm.site = tracing::field::Empty,
         );
         // W3C trace-context propagation: parent the request span to an
         // incoming `traceparent` header. Only compiled with the `otlp`
@@ -2171,7 +2195,20 @@ impl Router {
             self.apply_alt_svc(resp, is_tls);
             self.apply_preview_marker(resp);
 
-            span.record("http.response.status_code", resp.status().as_u16());
+            let status = resp.status();
+            span.record("http.response.status_code", status.as_u16());
+            // OTel HTTP semconv, span status: on a SERVER span a 5xx (or any
+            // code the server could not interpret) is an Error and a 4xx is
+            // deliberately left Unset — a 404 is a normal outcome of serving,
+            // not a fault of the server. `error.type` is Conditionally
+            // Required when the span status is Error, and the status code is
+            // its canonical value when the failure is fully described by that
+            // code. No status *description* is set: semconv says not to
+            // duplicate what the status code already conveys. Issue #379.
+            if server_span_status_is_error(status) {
+                span.record("otel.status_code", "error");
+                span.record("error.type", status.as_str());
+            }
 
             // Timeline entry: reuse the values already measured — `elapsed`
             // (the histogram measurement below) plus the PHP-path timings the
@@ -2374,6 +2411,33 @@ impl Router {
             fallback: site_fallback,
             websocket_files: site_websocket_files,
         } = self.resolve_site(&host);
+
+        // Tenant attribution on the request span (issue #380).
+        //
+        // The value is the canonical key `resolve_site` just returned, never
+        // the `Host` header — the same rule the database filename, the KV
+        // keyspace and the wire credential follow, so a span names the same
+        // tenant as the data it touched (see `ResolvedSite`). Reading the
+        // header here instead would export an attacker-controlled string and
+        // reintroduce exactly the class of bug the one-canonical-key invariant
+        // exists to prevent.
+        //
+        // A host that matched no known vhost has no key and therefore gets no
+        // attribute: an absent value is the honest representation of "no
+        // tenant", and it keeps unknown hosts off the wire entirely.
+        //
+        // `ephpm.site` is a deliberately ePHPm-owned name. OTel semconv has no
+        // multi-tenant attribute, and no reserved namespace (`service.*`,
+        // `server.*`, `host.*`) means "which of this process's vhosts served
+        // this", so squatting on one would be wrong.
+        //
+        // Cost: `None` in single-site mode (`resolve_site` returns
+        // `default_site()` for every request), so this is one `Option` check
+        // and nothing else unless multi-site is actually configured.
+        if let Some(key) = site_key.as_deref() {
+            tracing::Span::current().record("ephpm.site", key);
+        }
+
         // Everything below routes against the WEB root: index files, the
         // fallback chain, static-file containment and PHP-script containment.
         // The container travels separately inside `site_roots` and is what
@@ -4588,6 +4652,29 @@ fn method_metric_label(method: &hyper::Method) -> &'static str {
     }
 }
 
+/// Whether a response status makes the request's **server** span an OTel
+/// `Error`.
+///
+/// From the OpenTelemetry HTTP semantic conventions (HTTP spans; stable since
+/// semconv v1.23.0 and unchanged through the current 1.3x line):
+///
+/// > For HTTP status codes in the 5xx range, as well as any other code the
+/// > client failed to interpret, span status MUST be set to `Error`. For HTTP
+/// > status codes in the 4xx range span status MUST be left unset in case of
+/// > `SpanKind.SERVER` and MUST be set to `Error` in case of `SpanKind.CLIENT`.
+///
+/// ePHPm's `http.request` span is a SERVER span, so this is a pure
+/// status-class check and not a judgement call: a 404 or a 401 is a normal
+/// outcome of serving and must NOT paint the trace red, while a 500 from PHP
+/// or a 504 from the request deadline must.
+///
+/// Kept as a named function rather than an inline `is_server_error()` so the
+/// rule — and specifically the 4xx exclusion, which is the part people get
+/// wrong — is unit-testable and has somewhere to cite the spec.
+fn server_span_status_is_error(status: StatusCode) -> bool {
+    status.is_server_error()
+}
+
 /// Map an HTTP status code to a `&'static str` metrics label.
 ///
 /// The `metrics` macros require label values to be `'static`; returning a
@@ -6222,6 +6309,319 @@ mod tests {
                 .and_then(|pid| ctx.span(&pid).map(|s| s.name().to_string()));
             self.0.lock().unwrap().push((attrs.metadata().name().to_string(), parent));
         }
+    }
+
+    /// One `http.request` span's attributes, as a collector would receive them.
+    type SpanAttrs = std::collections::BTreeMap<String, String>;
+
+    /// Test layer capturing the **attributes** of the router's `http.request`
+    /// spans — creation-time fields and values recorded later (the status code,
+    /// the span status, the site key) alike.
+    ///
+    /// [`SpanTree`] answers "what shape is the trace?". This answers "what does
+    /// a collector actually receive?", which is what issues #379 and #380 are
+    /// about. Everything is stringified because that is how these values reach
+    /// the wire anyway, and it keeps the assertions readable.
+    #[derive(Clone, Default)]
+    struct SpanAttrCollector(Arc<std::sync::Mutex<Vec<(u64, SpanAttrs)>>>);
+
+    impl SpanAttrCollector {
+        /// Attributes of every captured `http.request` span, in creation order.
+        fn snapshot(&self) -> Vec<SpanAttrs> {
+            self.0.lock().unwrap().iter().map(|(_, attrs)| attrs.clone()).collect()
+        }
+
+        /// The single captured span, when a test drove exactly one request.
+        fn only(&self) -> SpanAttrs {
+            let spans = self.snapshot();
+            assert_eq!(spans.len(), 1, "expected exactly one http.request span: {spans:?}");
+            spans.into_iter().next().unwrap()
+        }
+    }
+
+    /// Flattens any `tracing` field value into a `String`.
+    struct AttrVisitor<'a>(&'a mut SpanAttrs);
+
+    impl tracing::field::Visit for AttrVisitor<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        /// Covers the `%`-sigil (`Display`) fields — `tracing` wraps those in a
+        /// `DisplayValue` whose `Debug` forwards to `Display`, so
+        /// `http.request.method` lands here as `GET`, not `"GET"`.
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for SpanAttrCollector
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().target() != crate::OTEL_TRACE_TARGET
+                || attrs.metadata().name() != "http.request"
+            {
+                return;
+            }
+            let mut fields = SpanAttrs::new();
+            attrs.record(&mut AttrVisitor(&mut fields));
+            self.0.lock().unwrap().push((id.into_u64(), fields));
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut spans = self.0.lock().unwrap();
+            if let Some((_, fields)) = spans.iter_mut().find(|(sid, _)| *sid == id.into_u64()) {
+                values.record(&mut AttrVisitor(fields));
+            }
+        }
+    }
+
+    /// Install a `SpanAttrCollector` collector for the duration of a test.
+    fn collect_span_attrs() -> (SpanAttrCollector, tracing::subscriber::DefaultGuard) {
+        enable_span_callsites();
+        let attrs = SpanAttrCollector::default();
+        let subscriber = tracing_subscriber::registry().with(attrs.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        (attrs, guard)
+    }
+
+    /// The OTel HTTP semconv span-status rule for a **server** span, pinned as
+    /// a table: 5xx is an error, 4xx explicitly is not, 2xx/3xx are not.
+    ///
+    /// The 4xx row is the one worth a test — treating a 404 as an error is the
+    /// intuitive-but-wrong reading, and it would paint every bot probe red.
+    #[test]
+    fn only_5xx_makes_a_server_span_an_error() {
+        for code in [200u16, 201, 204, 301, 304, 400, 401, 403, 404, 429, 499] {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert!(
+                !server_span_status_is_error(status),
+                "{code} must leave the server span status unset"
+            );
+        }
+        for code in [500u16, 502, 503, 504] {
+            let status = StatusCode::from_u16(code).unwrap();
+            assert!(server_span_status_is_error(status), "{code} must mark the server span Error");
+        }
+    }
+
+    /// Issue #379: `http.request` exports as a SERVER span carrying the current
+    /// OTel HTTP semantic-convention attributes, and a successful response
+    /// leaves the span status unset.
+    #[tokio::test]
+    async fn request_span_is_a_server_span_with_semconv_attributes() {
+        let (attrs, _guard) = collect_span_attrs();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let router = test_router(dir.path());
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req =
+            Request::builder().method("GET").uri("/a.txt").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let span = attrs.only();
+        // The whole point of #379: an inbound request is a SERVER span, so
+        // service graphs and RED-metric connectors see ePHPm as a trace's
+        // entry point instead of an orphan internal span.
+        assert_eq!(span.get("otel.kind").map(String::as_str), Some("server"), "{span:?}");
+
+        // Current semconv names. The deprecated `http.method` / `http.url`
+        // spellings must not appear.
+        assert_eq!(span.get("http.request.method").map(String::as_str), Some("GET"), "{span:?}");
+        assert_eq!(span.get("url.path").map(String::as_str), Some("/a.txt"), "{span:?}");
+        assert_eq!(span.get("http.response.status_code").map(String::as_str), Some("200"));
+        assert!(!span.contains_key("http.method"), "deprecated name leaked: {span:?}");
+        assert!(!span.contains_key("http.url"), "deprecated name leaked: {span:?}");
+
+        // A 200 is not an error, and single-site mode names no tenant.
+        assert!(!span.contains_key("otel.status_code"), "a 200 must leave status unset: {span:?}");
+        assert!(!span.contains_key("error.type"), "{span:?}");
+        assert!(!span.contains_key("ephpm.site"), "single-site mode has no tenant: {span:?}");
+
+        // The `Host` header and the query string stay off the wire.
+        assert!(!span.contains_key("server.address"), "{span:?}");
+        assert!(!span.contains_key("url.query"), "{span:?}");
+        assert!(!span.contains_key("url.full"), "{span:?}");
+    }
+
+    /// Issue #379, the 4xx half: semconv says a 4xx on a SERVER span is NOT an
+    /// error. A 404 must leave the span status unset — otherwise every bot
+    /// probe shows up red and error-rate dashboards are useless.
+    #[tokio::test]
+    async fn four_xx_leaves_the_server_span_status_unset() {
+        let (attrs, _guard) = collect_span_attrs();
+
+        let dir = tempfile::tempdir().unwrap();
+        let router = test_router_with_404(dir.path());
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req =
+            Request::builder().method("GET").uri("/nope.txt").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        let span = attrs.only();
+        assert_eq!(span.get("http.response.status_code").map(String::as_str), Some("404"));
+        assert!(
+            !span.contains_key("otel.status_code"),
+            "a 4xx must not mark a server span as an error: {span:?}"
+        );
+        assert!(!span.contains_key("error.type"), "{span:?}");
+    }
+
+    /// Issue #379, the 5xx half: a server error sets the span status to ERROR
+    /// and records `error.type`, so a failed request is distinguishable from a
+    /// healthy one in the UI and in span-derived metrics.
+    ///
+    /// The 504 from the request deadline is the deterministic 5xx available in
+    /// stub mode: a zero-worker pool accepts the dispatch and never answers.
+    #[tokio::test(start_paused = true)]
+    async fn five_xx_marks_the_server_span_as_an_error() {
+        let (attrs, _guard) = collect_span_attrs();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("index.php"), b"<?php echo 1;").unwrap();
+        let mut config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                index_files: vec!["index.php".to_string()],
+                fallback: vec!["$uri".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        config.server.timeouts.request = 1;
+        let pool = crate::worker_pool::WorkerPool::spawn(
+            dir.path().join("worker.php"),
+            0, // zero workers: dispatch queues, nobody answers
+            500,
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+        let router = Router::new(&config, test_store(), None, None, None, None, Some(pool));
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req =
+            Request::builder().method("GET").uri("/index.php").body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
+
+        let span = attrs.only();
+        assert_eq!(span.get("http.response.status_code").map(String::as_str), Some("504"));
+        // `tracing-opentelemetry` turns this field into the OTel span status;
+        // it is not exported as an attribute of its own.
+        assert_eq!(
+            span.get("otel.status_code").map(String::as_str),
+            Some("error"),
+            "a 5xx must set the span status to ERROR: {span:?}"
+        );
+        // Conditionally required by semconv when the status is Error; the
+        // status code is its canonical value for an HTTP failure.
+        assert_eq!(span.get("error.type").map(String::as_str), Some("504"), "{span:?}");
+    }
+
+    /// Issue #380: in multi-site mode the span carries the **resolved**
+    /// canonical site key, and a host that matched no vhost carries nothing.
+    ///
+    /// The second half is the security-relevant one. `ephpm.site` must never be
+    /// a re-spelling of the `Host` header — an unknown host has no tenant, and
+    /// an absent attribute is the honest representation of that. Recording the
+    /// header instead would put an attacker-controlled string on the wire and
+    /// re-open the #290/#291 class of bug from the trace side.
+    #[tokio::test]
+    async fn span_carries_the_resolved_site_key_and_nothing_for_an_unknown_host() {
+        let (attrs, _guard) = collect_span_attrs();
+
+        let dir = tempfile::tempdir().unwrap();
+        let sites = dir.path().join("sites");
+        fs::create_dir_all(sites.join("alpha")).unwrap();
+        std::fs::write(sites.join("alpha").join("index.html"), b"alpha").unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.path().to_path_buf(),
+                sites_dir: Some(sites),
+                index_files: vec!["index.html".to_string()],
+                fallback: vec!["$uri".to_string(), "$uri/".to_string(), "=404".to_string()],
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        let router = Router::new(&config, test_store(), None, None, None, None, None);
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .header("host", "alpha")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "the alpha vhost must serve its index");
+
+        let req = Request::builder()
+            .method("GET")
+            .uri("/")
+            .header("host", "evil.example.com")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "an unknown host matches no vhost");
+
+        let spans = attrs.snapshot();
+        assert_eq!(spans.len(), 2, "{spans:?}");
+        assert_eq!(
+            spans[0].get("ephpm.site").map(String::as_str),
+            Some("alpha"),
+            "the span must carry the canonical key resolve_site returned: {spans:?}"
+        );
+        assert!(
+            !spans[1].contains_key("ephpm.site"),
+            "an unknown host has no tenant, so no attribute — and certainly not \
+             the raw Host header: {spans:?}"
+        );
+        // Belt and braces: the attacker-supplied host must not appear under
+        // ANY attribute name on that span.
+        assert!(
+            !spans[1].values().any(|v| v.contains("evil.example.com")),
+            "the Host header must not reach the wire under any name: {spans:?}"
+        );
     }
 
     async fn fetch_timeline(router: &Router) -> Vec<serde_json::Value> {
