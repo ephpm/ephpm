@@ -219,6 +219,17 @@ classic async-producer / sync-consumer MPMC queue.
   (async, for the hyper side) and `recv_blocking()` (sync, for the worker
   side). One queue, all workers `recv_blocking()` on the same receiver; the
   first free worker wins. Backpressure is the bounded depth.
+- *Amended (issue #442):* the hyper side no longer waits in `send().await`.
+  Under saturation that wait is not FIFO — async-channel's send is a
+  try/listen/retry loop, so fresh senders barge past parked ones and a
+  raced-out waiter re-registers at the back of the waiter queue, which
+  produced a multi-lap P99 tail (measured: 43% of requests admitted <1 ms
+  while P99 waited 5-6 full queue laps). Dispatch now acquires a permit from
+  a FIFO-fair `tokio::sync::Semaphore` (permits == queue depth; released by
+  the worker as it pulls a job) and then `try_send`s, which can never find
+  the channel full. The channel choice above still stands — it remains the
+  async-producer/sync-consumer hand-off — it just no longer doubles as the
+  wait queue. See `worker-dispatch-fairness.md` for the full investigation.
 - *Rejected:* `tokio::sync::mpsc` — its `Receiver` is async-only; a blocking
   worker thread would have to `block_on` a per-thread current-thread runtime to
   poll it, which is wasteful and error-prone. `crossbeam-channel` is sync-only
@@ -275,8 +286,9 @@ shared, matching the roadmap's "per-worker thread_local storage" rule
 ### 2.3 Backpressure when all workers busy
 
 The dispatch channel is **bounded** (default depth = `worker.count`, i.e. one
-queued job per worker; tunable via `worker.backlog`). When full,
-`dispatch_tx.send(job).await` suspends the hyper handler — this naturally
+queued job per worker; tunable via `worker.backlog`). When full, the FIFO-fair
+admission acquire (see the §2.1(a) amendment) suspends the hyper handler in
+strict arrival order — this naturally
 applies HTTP-layer backpressure without a busy loop. The whole handler is
 already wrapped in `tokio::time::timeout(request_timeout, ...)`
 (`router.rs:377-386`), so a request that can't get a worker within the timeout
