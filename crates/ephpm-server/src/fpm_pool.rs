@@ -262,7 +262,7 @@ impl FpmPool {
             thread_count,
             backlog = backlog.max(1),
             admission = admission_policy.as_str(),
-            "fpm execution pool started (experimental [php] fpm_engine = \"pool\")"
+            "fpm execution pool started ([php] fpm_engine = \"pool\", the default since v0.9.0)"
         );
 
         pool

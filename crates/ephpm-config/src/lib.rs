@@ -7554,16 +7554,22 @@ idle_timeout_secs = 15
         );
     }
 
-    /// Requested WITHOUT the pool engine → parsed but inert. Containment needs
-    /// a thread ePHPm can retire; tokio's shared blocking pool cannot provide
+    /// Requested OFF the pool engine → parsed but inert. Containment needs a
+    /// thread ePHPm can retire; tokio's shared blocking pool cannot provide
     /// one. Startup warns (see `crates/ephpm/src/main.rs`).
+    ///
+    /// Note the engine must now be named **explicitly** to reach the inert
+    /// case: since v0.9.0 the default engine is `pool`, so a bare
+    /// `crash_containment = true` arms (see
+    /// `crash_containment_arms_on_the_default_engine`).
     #[test]
-    fn crash_containment_is_inert_without_pool_engine() {
+    fn crash_containment_is_inert_off_the_pool_engine() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Default (spawn_blocking) engine.
+        // Explicit legacy engine — the opt-out.
         let sb = dir.path().join("sb.toml");
-        std::fs::write(&sb, "[php]\ncrash_containment = true\n").unwrap();
+        std::fs::write(&sb, "[php]\nfpm_engine = \"spawn_blocking\"\ncrash_containment = true\n")
+            .unwrap();
         let config = Config::load(&sb).unwrap();
         assert!(config.php.crash_containment, "the field still parses");
         assert!(
@@ -7582,6 +7588,38 @@ idle_timeout_secs = 15
         assert!(
             !config.php.is_crash_containment_active(),
             "containment must not arm in worker mode"
+        );
+    }
+
+    /// Migration-visible consequence of the v0.9.0 `fpm_engine` default flip,
+    /// pinned deliberately rather than discovered in production: a config that
+    /// sets `crash_containment = true` and names no engine used to be
+    /// parsed-but-inert (startup WARNed that it was ignored). It now **arms**,
+    /// with no operator action — a PHP C-stack overflow becomes a 500 plus a
+    /// retired pool thread instead of a process abort, at the cost of leaking
+    /// that thread's PHP context and skipping PHP module shutdown at exit.
+    ///
+    /// Startup still says so loudly (the `is_crash_containment_active()` arm in
+    /// `crates/ephpm/src/main.rs` WARNs), so this is a documented behaviour
+    /// change and not a silent one. If this test ever fails, the containment
+    /// default moved — which is an operator-visible change that belongs in the
+    /// release notes, not a test fixup.
+    #[test]
+    fn crash_containment_arms_on_the_default_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\ncrash_containment = true\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(
+            config.php.fpm_engine,
+            FpmEngine::Pool,
+            "precondition: the default engine is the pool"
+        );
+        assert!(
+            config.php.is_crash_containment_active(),
+            "containment arms on the default engine as of v0.9.0 — an existing \
+             `crash_containment = true` config goes from inert to armed on upgrade"
         );
     }
 
