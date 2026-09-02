@@ -357,6 +357,203 @@ fn build_http_client() -> anyhow::Result<(reqwest::blocking::Client, String)> {
     Ok((client, description))
 }
 
+/// How long a continuously failing exporter stays quiet between summary lines.
+///
+/// The batch processor's scheduled delay is 5s, so an unreachable collector
+/// produces a failed export roughly every 5s — 720 an hour. One line a minute
+/// is enough to prove the condition is ongoing without burying the rest of the
+/// log, and short enough that an operator tailing it sees the problem quickly.
+const EXPORT_FAILURE_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// What [`ExportHealth`] decided should be said about one export result.
+///
+/// Separating the decision from the `tracing` call is what makes the
+/// rate-limiting testable without a subscriber or a real clock.
+#[derive(Debug, PartialEq, Eq)]
+enum ExportReport {
+    /// Say nothing — either a success with nothing to recover from, or a
+    /// repeat failure inside the summary window.
+    Silent,
+    /// The first failure of a run. Log it in full, at WARN.
+    FirstFailure,
+    /// The run is still going and the summary interval has elapsed.
+    StillFailing { consecutive: u64, elapsed: Duration },
+    /// An export succeeded after a run of failures. Log at INFO.
+    Recovered { consecutive: u64, elapsed: Duration },
+}
+
+/// Rate-limiting state machine over the exporter's success/failure stream.
+///
+/// Issue #378: a misconfigured or unreachable collector used to be completely
+/// silent. The naive fix — let every failed batch log — replaces silence with
+/// 720 identical lines an hour, which is its own way of telling an operator
+/// nothing. So the contract is: **first failure, periodic summary, recovery**.
+///
+/// The clock is a parameter rather than read from [`std::time::Instant::now`]
+/// so the window logic can be tested deterministically.
+#[derive(Debug, Default)]
+struct ExportHealth {
+    /// Failures since the last success. `0` means the last export succeeded.
+    consecutive: u64,
+    /// When the current failure run started. `Some` iff `consecutive > 0`.
+    failing_since: Option<std::time::Instant>,
+    /// When the last line was emitted for the current run, so the summary
+    /// interval is measured from what the operator last saw.
+    last_reported_at: Option<std::time::Instant>,
+}
+
+impl ExportHealth {
+    /// Fold one export outcome into the run, returning what to log.
+    fn observe(&mut self, failed: bool, now: std::time::Instant) -> ExportReport {
+        if !failed {
+            let Some(since) = self.failing_since.take() else {
+                return ExportReport::Silent;
+            };
+            let report = ExportReport::Recovered {
+                consecutive: self.consecutive,
+                elapsed: now.saturating_duration_since(since),
+            };
+            self.consecutive = 0;
+            self.last_reported_at = None;
+            return report;
+        }
+
+        self.consecutive += 1;
+        let Some(since) = self.failing_since else {
+            self.failing_since = Some(now);
+            self.last_reported_at = Some(now);
+            return ExportReport::FirstFailure;
+        };
+
+        // `last_reported_at` is always `Some` once a run has started (set on
+        // the branch above), but treating `None` as "due now" keeps the state
+        // machine total rather than relying on that invariant.
+        let due = self
+            .last_reported_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= EXPORT_FAILURE_SUMMARY_INTERVAL);
+        if !due {
+            return ExportReport::Silent;
+        }
+
+        self.last_reported_at = Some(now);
+        ExportReport::StillFailing {
+            consecutive: self.consecutive,
+            elapsed: now.saturating_duration_since(since),
+        }
+    }
+}
+
+/// Reports export health through `tracing`, and rate-limits it.
+///
+/// Wraps whichever exporter [`init_layer`] built. Every batch's outcome passes
+/// through [`ExportHealth`], which decides between silence, a first-failure
+/// WARN, a once-a-minute summary WARN, and a recovery INFO.
+///
+/// # Why the error is not propagated
+///
+/// `export` returns `Ok(())` even when the inner exporter failed, because
+/// `opentelemetry_sdk`'s batch processor does exactly two things with an
+/// `Err`: it emits `otel_error!(name: "BatchSpanProcessor.ExportError", …)`,
+/// and it returns the value to a caller that discards it on the periodic path
+/// (`opentelemetry_sdk-0.31.0/src/trace/span_processor.rs`, the `match` at
+/// `:509` and the `let _ =` at `:345`/`:397`). There is no retry and no
+/// backoff keyed on it. Propagating it therefore buys nothing and costs the
+/// one thing this wrapper exists to prevent: a second, un-rate-limited line
+/// per failed batch, defeating the summary window.
+///
+/// The rest of the SDK's `internal-logs` output is untouched — notably
+/// `BatchSpanProcessor.SpanDroppingStarted`, which reports a full queue and is
+/// self-limiting (emitted only on the first drop). This wrapper deliberately
+/// suppresses one specific duplicate, not the SDK's diagnostics.
+///
+/// **On upgrading `opentelemetry_sdk`:** re-check those call sites. If a
+/// future version acts on the `Err` — retry, backoff, circuit-breaking — this
+/// must stop swallowing it and the duplicate must be handled another way.
+#[derive(Debug)]
+struct ReportingExporter<E> {
+    inner: E,
+    health: std::sync::Mutex<ExportHealth>,
+}
+
+impl<E> ReportingExporter<E> {
+    fn new(inner: E) -> Self {
+        Self { inner, health: std::sync::Mutex::new(ExportHealth::default()) }
+    }
+
+    /// Fold one outcome into the health state and log whatever it decides.
+    ///
+    /// `error` is `None` on success. Poisoning is impossible (nothing panics
+    /// while the lock is held) but is recovered from anyway rather than
+    /// turning an export into a panic.
+    fn report(&self, error: Option<&str>) {
+        let report = {
+            let mut health = self.health.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            health.observe(error.is_some(), std::time::Instant::now())
+        };
+
+        match report {
+            ExportReport::Silent => {}
+            ExportReport::FirstFailure => tracing::warn!(
+                error = error.unwrap_or_default(),
+                summary_interval_secs = EXPORT_FAILURE_SUMMARY_INTERVAL.as_secs(),
+                "OTLP span export failed; traces are not reaching the collector. \
+                 Requests are unaffected. Repeats are summarized rather than \
+                 logged individually."
+            ),
+            ExportReport::StillFailing { consecutive, elapsed } => tracing::warn!(
+                error = error.unwrap_or_default(),
+                consecutive_failures = consecutive,
+                failing_for_secs = elapsed.as_secs(),
+                "OTLP span export is still failing"
+            ),
+            ExportReport::Recovered { consecutive, elapsed } => tracing::info!(
+                consecutive_failures = consecutive,
+                was_failing_for_secs = elapsed.as_secs(),
+                "OTLP span export recovered"
+            ),
+        }
+    }
+}
+
+impl<E: opentelemetry_sdk::trace::SpanExporter> opentelemetry_sdk::trace::SpanExporter
+    for ReportingExporter<E>
+{
+    fn export(
+        &self,
+        batch: Vec<opentelemetry_sdk::trace::SpanData>,
+    ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send {
+        let export = self.inner.export(batch);
+        async move {
+            match export.await {
+                Ok(()) => {
+                    self.report(None);
+                }
+                Err(e) => {
+                    self.report(Some(&e.to_string()));
+                }
+            }
+            // See the type docs: swallowing is what keeps the SDK from
+            // emitting a second, un-rate-limited line per failed batch.
+            Ok(())
+        }
+    }
+
+    fn shutdown_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.shutdown_with_timeout(timeout)
+    }
+
+    fn force_flush(&mut self) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.inner.force_flush()
+    }
+
+    fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) {
+        self.inner.set_resource(resource);
+    }
+}
+
 /// Adapts an async [`SpanExporter`] to the SDK's synchronous batch thread.
 ///
 /// [`opentelemetry_sdk::trace::BatchSpanProcessor`] runs on a plain
@@ -630,11 +827,15 @@ where
 
     // The two transports produce different exporter types, so each branch
     // builds its own provider and they converge on `SdkTracerProvider`.
+    //
+    // Both wrap their exporter in `ReportingExporter` — that is what turns a
+    // failing export from silence (issue #378) into a rate-limited
+    // first-failure / periodic-summary / recovery story in the ePHPm log.
     let (provider, grpc_runtime, transport_description) = match transport {
         Transport::Grpc => {
             let (exporter, runtime, description) = build_grpc_exporter(builder_endpoint)?;
             let provider = SdkTracerProvider::builder()
-                .with_batch_exporter(exporter)
+                .with_batch_exporter(ReportingExporter::new(exporter))
                 .with_resource(resource)
                 .build();
             (provider, Some(runtime), description)
@@ -652,7 +853,7 @@ where
             }
             let exporter = builder.build().context("failed to build the OTLP span exporter")?;
             let provider = SdkTracerProvider::builder()
-                .with_batch_exporter(exporter)
+                .with_batch_exporter(ReportingExporter::new(exporter))
                 .with_resource(resource)
                 .build();
             (provider, None, description)
@@ -864,6 +1065,156 @@ mod tests {
 
         assert!(!first.contains("already installed"), "first: {first}");
         assert!(!second.contains("already installed"), "second: {second}");
+    }
+
+    /// The #378 contract, end to end on the state machine: a collector that
+    /// goes away logs **once**, then at most once per summary interval, then
+    /// once more when it comes back.
+    ///
+    /// The clock is synthetic so the 60s window is exercised without the test
+    /// taking 60s, and so the assertion is on the boundary rather than on
+    /// whatever the machine's scheduler did.
+    #[test]
+    fn export_failures_are_reported_once_then_summarized_then_recovered() {
+        let t0 = std::time::Instant::now();
+        let mut health = ExportHealth::default();
+
+        // A healthy exporter says nothing at all — no per-batch chatter.
+        assert_eq!(health.observe(false, t0), ExportReport::Silent);
+
+        // The collector goes away. The first failure is the loud one.
+        assert_eq!(health.observe(true, t0), ExportReport::FirstFailure);
+
+        // Every batch for the next minute fails, and none of them may log:
+        // the batch delay is 5s, so this is the 720-lines-an-hour case.
+        for i in 1..12 {
+            assert_eq!(
+                health.observe(true, t0 + Duration::from_secs(5 * i)),
+                ExportReport::Silent,
+                "a repeat failure inside the summary window must stay silent (t+{}s)",
+                5 * i
+            );
+        }
+
+        // At the window boundary exactly one summary comes out, carrying the
+        // count so the operator can see it is ongoing rather than new.
+        let at_window = t0 + EXPORT_FAILURE_SUMMARY_INTERVAL;
+        assert_eq!(
+            health.observe(true, at_window),
+            ExportReport::StillFailing {
+                consecutive: 13,
+                elapsed: EXPORT_FAILURE_SUMMARY_INTERVAL
+            }
+        );
+        // ...and the window restarts from the line just emitted, not from the
+        // start of the run, so the next summary is a full interval away.
+        assert_eq!(health.observe(true, at_window + Duration::from_secs(59)), ExportReport::Silent);
+
+        // Recovery is worth a line: "no traces" and "traces again" are both
+        // states an operator needs to see the transition into.
+        let recovered_at = at_window + EXPORT_FAILURE_SUMMARY_INTERVAL;
+        assert_eq!(
+            health.observe(false, recovered_at),
+            ExportReport::Recovered {
+                consecutive: 14,
+                elapsed: recovered_at.saturating_duration_since(t0)
+            }
+        );
+
+        // Back to steady state: a success after a success is silent, and the
+        // next outage is a fresh FirstFailure rather than a summary.
+        assert_eq!(health.observe(false, recovered_at), ExportReport::Silent);
+        assert_eq!(health.observe(true, recovered_at), ExportReport::FirstFailure);
+    }
+
+    /// The wrapper itself, not just its state machine: a failing exporter
+    /// produces exactly **one** `tracing` event for a run of failures, and
+    /// [`ReportingExporter::export`] reports success upward so the SDK does not
+    /// emit its own un-rate-limited duplicate.
+    ///
+    /// This is the actual #378 regression guard — the reproduction in the issue
+    /// is an unreachable collector, and the observable symptom was zero log
+    /// lines. A stub exporter stands in for the collector so the test needs no
+    /// network and no timing.
+    #[tokio::test]
+    async fn a_failing_exporter_logs_once_and_does_not_propagate_the_error() {
+        use opentelemetry_sdk::trace::SpanExporter as _;
+
+        /// Stands in for a collector that is down / rejecting TLS / 404ing.
+        #[derive(Debug)]
+        struct AlwaysFails;
+
+        impl opentelemetry_sdk::trace::SpanExporter for AlwaysFails {
+            fn export(
+                &self,
+                _batch: Vec<opentelemetry_sdk::trace::SpanData>,
+            ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+            {
+                std::future::ready(Err(opentelemetry_sdk::error::OTelSdkError::InternalFailure(
+                    "tcp connect error: Connection refused".to_string(),
+                )))
+            }
+        }
+
+        /// Counts events by level so the assertion is on "how many lines did
+        /// the operator get", which is the whole contract.
+        #[derive(Clone, Default)]
+        struct EventCounter(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCounter {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), event.metadata().target().to_string()));
+            }
+        }
+
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let events = EventCounter::default();
+        let subscriber = tracing_subscriber::registry().with(events.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let exporter = ReportingExporter::new(AlwaysFails);
+
+        // Three failed batches in quick succession — the shape of a collector
+        // that has just gone away.
+        for _ in 0..3 {
+            assert!(
+                exporter.export(Vec::new()).await.is_ok(),
+                "the wrapper must report success upward so the SDK does not log \
+                 its own line per failed batch; see the type docs"
+            );
+        }
+
+        let lines = events.0.lock().unwrap().clone();
+        assert_eq!(
+            lines.len(),
+            1,
+            "a run of failures must produce exactly one line until the summary \
+             interval elapses: {lines:?}"
+        );
+        assert_eq!(lines[0].0, tracing::Level::WARN, "{lines:?}");
+        assert_eq!(lines[0].1, "ephpm_server::otlp", "{lines:?}");
+    }
+
+    /// A single failed batch that recovers immediately still produces exactly
+    /// two lines — the failure and the recovery — never a summary.
+    #[test]
+    fn a_transient_failure_reports_the_failure_and_the_recovery() {
+        let t0 = std::time::Instant::now();
+        let mut health = ExportHealth::default();
+
+        assert_eq!(health.observe(true, t0), ExportReport::FirstFailure);
+        assert_eq!(
+            health.observe(false, t0 + Duration::from_secs(5)),
+            ExportReport::Recovered { consecutive: 1, elapsed: Duration::from_secs(5) }
+        );
     }
 
     /// The client must speak plaintext exactly as before TLS was added.
