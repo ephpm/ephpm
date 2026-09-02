@@ -4,7 +4,8 @@
 //! threads forever would starve the shared tokio blocking pool). Each thread
 //! boots the framework once via [`PhpRuntime::run_worker`], then loops over
 //! HTTP requests handed to it through an `async_channel::bounded` dispatch
-//! queue, replying on a `tokio::sync::oneshot`.
+//! queue guarded by a FIFO-fair admission semaphore (issue #442 — see
+//! [`WorkerPool::admission`]), replying on a `tokio::sync::oneshot`.
 //!
 //! Lifecycle guarantees (design §5):
 //! - **Boot-once:** the framework bootstrap runs once per worker thread; the
@@ -40,9 +41,10 @@ pub struct DispatchClosed;
 
 /// Handle to the running worker pool. Cloneable-cheap via `Arc`.
 pub struct WorkerPool {
-    /// Dispatch queue: the hyper handler `send().await`s jobs here; worker
-    /// threads `recv_blocking()`. Bounded — a full queue applies HTTP
-    /// backpressure (the outer request timeout turns a starved queue into 504).
+    /// Dispatch queue: the hyper handler enqueues jobs here after passing
+    /// [`WorkerPool::admission`]; worker threads `recv_blocking()`. Capacity
+    /// equals the admission permit count, so a permit holder's `try_send`
+    /// can never find it full.
     dispatch_tx: async_channel::Sender<WorkerJob>,
     /// Kept alive so the channel never closes while the supervisor respawns
     /// workers between boots. Cloned into each worker thread.
@@ -53,6 +55,25 @@ pub struct WorkerPool {
     /// single `Relaxed` load, replacing a per-dispatch `async_channel::len()`
     /// (a SeqCst spin-loop over head/tail).
     queue_depth: Arc<AtomicUsize>,
+    /// FIFO admission gate in front of the dispatch queue (issue #442).
+    ///
+    /// Why not just `dispatch_tx.send().await`? A bounded `async_channel`
+    /// send is a try/listen/retry loop: a **new** sender always `try_send`s
+    /// before ever queueing behind the parked ones (barging), and a notified
+    /// waiter that loses that race re-registers at the **back** of the waiter
+    /// queue. Under saturation (c ≫ backlog) that is a starvation engine:
+    /// throughput stays maximal (a freed slot is always taken instantly) but
+    /// an unlucky request is lapped by the entire waiter queue every time it
+    /// loses — the measured signature was 43% of requests admitted in <1 ms
+    /// while the P99 waited 5-6 full queue laps (~250-500 ms at 2.3k req/s).
+    ///
+    /// `tokio::sync::Semaphore` is documented FIFO-fair: permits go to
+    /// waiters in acquire order and a new acquirer queues behind existing
+    /// waiters even when a permit is free. One permit == one dispatch-queue
+    /// slot; the worker releases it (via [`WorkerJob::admission`]) the moment
+    /// it pulls the job, keeping the queue refill pipeline — and therefore
+    /// throughput — identical to the old barging behaviour.
+    admission: Arc<tokio::sync::Semaphore>,
     /// Shared runtime state (readiness, liveness, drain flag).
     state: Arc<PoolState>,
     /// Worker entrypoint script (absolute, validated under document_root).
@@ -117,6 +138,7 @@ impl WorkerPool {
             dispatch_tx,
             dispatch_rx,
             queue_depth: Arc::new(AtomicUsize::new(0)),
+            admission: Arc::new(tokio::sync::Semaphore::new(backlog.max(1))),
             state,
             worker_script,
             max_requests,
@@ -171,33 +193,49 @@ impl WorkerPool {
 
     /// Dispatch a request to the pool and return the receiver for its response.
     ///
-    /// `send().await` suspends when the bounded queue is full (backpressure);
-    /// the caller wraps the whole thing in the outer request timeout, so a
-    /// starved queue becomes a 504 rather than an unbounded wait.
+    /// Admission is **FIFO-fair**: the acquire on [`WorkerPool::admission`]
+    /// suspends when every dispatch-queue slot is taken (backpressure) and
+    /// grants slots strictly in arrival order — see the field docs for why
+    /// waiting on the bounded channel's own `send().await` instead produced a
+    /// multi-lap starvation tail (issue #442). The caller wraps the whole
+    /// thing in the outer request timeout, so a starved queue becomes a 504
+    /// rather than an unbounded wait; a cancelled acquire leaves no trace
+    /// (tokio removes the waiter, and the depth accounting below has no await
+    /// point between increment and enqueue, so it cannot leak either).
     ///
     /// # Errors
     ///
     /// Returns [`DispatchClosed`] if the pool is draining / all workers gone
-    /// (the dispatch channel is closed) — the caller should 503.
+    /// (admission and dispatch channel are closed) — the caller should 503.
     pub async fn dispatch(
         &self,
         request: WorkerRequestOwned,
     ) -> Result<oneshot::Receiver<WorkerResponse>, DispatchClosed> {
+        // Wait for a queue slot in strict arrival order. Errors only when
+        // `drain()` closed the semaphore.
+        let Ok(permit) = Arc::clone(&self.admission).acquire_owned().await else {
+            return Err(DispatchClosed);
+        };
         let (tx, rx) = oneshot::channel();
-        let job = WorkerJob { request, respond_to: tx };
-        // Account the enqueue before the (awaitable) send so a worker pulling
-        // concurrently can only ever decrement a value we already added.
-        // `send().await` may suspend under backpressure; the count reflects the
-        // job as queued for that whole window, which is exactly the depth we
-        // want to report.
+        let job = WorkerJob { request, respond_to: tx, admission: Some(permit) };
+        // Holding a permit guarantees a free channel slot (capacity == permit
+        // count, and every enqueued job holds one permit until a worker pulls
+        // it), so this `try_send` cannot see `Full` — no await, no suspension,
+        // and the increment-to-enqueue window cannot be cancelled mid-way.
         let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
         #[allow(clippy::cast_precision_loss)]
         gauge!("ephpm_worker_dispatch_queue_depth").set(depth as f64);
-        match self.dispatch_tx.send(job).await {
+        match self.dispatch_tx.try_send(job) {
             Ok(()) => Ok(rx),
-            Err(_) => {
-                // Send failed (channel closed) — the job never entered the
-                // queue and no worker will pull it, so undo the accounting.
+            Err(e) => {
+                // Closed (draining) — or, defensively, a Full that the permit
+                // invariant says cannot happen. Either way the job never
+                // entered the queue and no worker will pull it, so undo the
+                // accounting; the permit inside the dropped job frees itself.
+                debug_assert!(
+                    matches!(e, async_channel::TrySendError::Closed(_)),
+                    "dispatch queue full while holding an admission permit"
+                );
                 self.queue_depth.fetch_sub(1, Ordering::Relaxed);
                 Err(DispatchClosed)
             }
@@ -225,8 +263,12 @@ impl WorkerPool {
             return;
         }
         // Closing the sender makes each worker's recv_blocking return Err, so
-        // take_request() returns null and the framework loop ends.
+        // take_request() returns null and the framework loop ends. Closing the
+        // admission semaphore wakes every dispatcher parked in `dispatch()`
+        // with an error (503) — mirroring how parked `send().await`s used to
+        // fail when the channel closed.
         self.dispatch_tx.close();
+        self.admission.close();
         tracing::info!("worker pool draining — dispatch closed");
     }
 
@@ -551,9 +593,13 @@ mod tests {
     }
 
     fn dummy_request() -> ephpm_php::worker_bridge::WorkerRequestOwned {
+        request_with_uri("/")
+    }
+
+    fn request_with_uri(uri: &str) -> ephpm_php::worker_bridge::WorkerRequestOwned {
         ephpm_php::worker_bridge::WorkerRequestOwned {
             method: "GET".into(),
-            uri: "/".into(),
+            uri: uri.into(),
             query_string: String::new(),
             cookie_data: String::new(),
             content_type: None,
@@ -561,6 +607,82 @@ mod tests {
             server_vars: Vec::new(),
             headers: Vec::new(),
         }
+    }
+
+    /// Admission is strictly FIFO (issue #442): waiters are admitted in
+    /// arrival order, and a dispatcher that arrives while others are parked
+    /// queues behind them instead of barging into a freshly freed slot — the
+    /// exact behaviour the old bounded-channel `send().await` could not
+    /// provide (its try/listen/retry loop let new senders steal slots and
+    /// re-queued raced-out waiters at the back, producing the multi-lap P99).
+    ///
+    /// Runs on the default current-thread test runtime, where an explicit
+    /// `yield_now` deterministically lets a just-spawned dispatcher run until
+    /// it parks on the admission semaphore.
+    #[tokio::test]
+    async fn admission_is_strictly_fifo_and_barge_proof() {
+        let pool = WorkerPool::spawn(
+            PathBuf::from("/nonexistent/worker.php"),
+            0, // no workers: this test plays the worker by pulling dispatch_rx
+            500,
+            1, // backlog of one queue slot => everyone else parks in admission
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        );
+
+        // Fills the single queue slot immediately.
+        let _rx_a = pool.dispatch(request_with_uri("/a")).await.expect("first dispatch fits");
+
+        // Three dispatchers park on admission, in a deterministic order.
+        let mut parked = Vec::new();
+        for uri in ["/w1", "/w2", "/w3"] {
+            let pool = Arc::clone(&pool);
+            parked.push(tokio::spawn(async move {
+                pool.dispatch(request_with_uri(uri)).await.expect("admitted after a slot frees");
+            }));
+            // Let the spawned task run until it parks on the semaphore.
+            tokio::task::yield_now().await;
+        }
+
+        // Play the worker: pull one job (freeing its slot when the job — and
+        // the permit inside it — drops) and record the order jobs arrive in.
+        let mut served = Vec::new();
+        let mut pull = || {
+            let job = pool.dispatch_rx.try_recv().expect("a job is queued");
+            pool.queue_depth.fetch_sub(1, Ordering::Relaxed);
+            served.push(job.request.uri.clone());
+            drop(job); // releases the admission permit -> admits ONE waiter
+        };
+
+        pull(); // "/a" leaves; w1 must be admitted, not anyone newer...
+        tokio::task::yield_now().await;
+
+        // ...and a brand-new dispatcher arriving NOW must queue behind w2/w3
+        // even though slots keep freeing up (barge-proofing).
+        let late = {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(async move {
+                pool.dispatch(request_with_uri("/late")).await.expect("admitted last");
+            })
+        };
+        tokio::task::yield_now().await;
+
+        for _ in 0..3 {
+            pull();
+            tokio::task::yield_now().await;
+        }
+        pull();
+
+        for handle in parked {
+            handle.await.expect("parked dispatcher completed");
+        }
+        late.await.expect("late dispatcher completed");
+
+        assert_eq!(
+            served,
+            vec!["/a", "/w1", "/w2", "/w3", "/late"],
+            "admission must be strict arrival order with no barging"
+        );
     }
 
     /// The counter-pair depth gauge tracks enqueues. With no workers to pull

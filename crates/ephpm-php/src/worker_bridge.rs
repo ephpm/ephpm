@@ -169,6 +169,13 @@ pub struct WorkerJob {
     pub request: WorkerRequestOwned,
     /// Where the worker's response (or the supervisor's 500) is delivered.
     pub respond_to: tokio::sync::oneshot::Sender<WorkerResponse>,
+    /// Fair-admission permit held while this job occupies the dispatch queue
+    /// (issue #442). Granted by the pool's FIFO admission semaphore before the
+    /// job is enqueued and dropped by the worker the moment it pulls the job —
+    /// releasing the queue slot to the *longest-waiting* dispatcher instead of
+    /// whichever sender happens to race a bounded-channel `send()` first.
+    /// `None` only for jobs that never passed admission (tests).
+    pub admission: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 // ── C-compatible request view ────────────────────────────────────────────
@@ -639,12 +646,15 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
         Err(_) => return 0,
     };
     // The job just left the dispatch channel — reflect it in the shared
-    // depth counter the pool reports as `ephpm_worker_dispatch_queue_depth`.
+    // depth counter the pool reports as `ephpm_worker_dispatch_queue_depth`,
+    // and release its admission permit so the pool's FIFO admission semaphore
+    // hands the freed queue slot to the longest-waiting dispatcher (#442).
     DISPATCH_DEPTH.with(|cell| {
         if let Some(depth) = cell.borrow().as_ref() {
             depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
     });
+    drop(job.admission);
 
     // Stash the sender for send_response / crash recovery.
     PENDING_SENDER.with(|cell| *cell.borrow_mut() = Some(job.respond_to));
