@@ -45,6 +45,8 @@ cargo deny check                           # license/advisory audit
 
 IMPORTANT: Run single tests when possible, not the full suite. Use `cargo test -p <crate> <test_name>`. `cargo nextest` is preferred but may not be installed — fall back to `cargo test`.
 
+**The dlopen middleware tests need an explicit build first.** `cargo test` and `cargo nextest run` do **not** emit example artifacts (`cargo test --no-run` does; a plain `cargo test` does not — verified, issue #435), so `crates/ephpm-server/tests/middleware_dlopen.rs` and `tests/middleware_response_phase.rs` hard-fail on a missing cdylib unless you run `cargo build --workspace --lib --examples` first — the same step CI runs before its test step. This is platform-independent; it was reported as a Windows bug only because that is where someone ran a bare `cargo test` on a clean checkout.
+
 The `ephpm-e2e` crate is **excluded from the workspace** and has different dependencies — don't try to compile it with `cargo test --workspace`. It runs bare-process by default via `cargo xtask e2e` (spawns ephpm on 127.0.0.1, no Kind), or via `cargo xtask k8s-e2e` for opt-in Kind + Tilt cluster testing (dispatched from `.github/workflows/k8s-e2e.yml`).
 
 ## Workspace Structure
