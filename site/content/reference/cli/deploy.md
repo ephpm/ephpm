@@ -4,7 +4,7 @@ weight = 4
 +++
 
 Trigger a cluster-wide OPcache invalidation. The command writes
-`opcache:version:<vhost>` (or the broadcast key `opcache:version:_all`)
+`opcache:version:<vhost>` (or the broadcast key `opcache:version:_ALL`)
 to the running server's RESP listener; gossip replicates the write to
 every peer within seconds, and each node's watcher invalidates its
 OPcache under the vhost's docroot on the next PHP request.
@@ -29,8 +29,18 @@ ephpm deploy                 [--rev SHA] [--host HOST] [--port PORT] [--password
 | `--port` | `6379` | RESP server port |
 | `--password` | `$EPHPM_KV_PASSWORD` | Password sent as RESP `AUTH` before the write. Required when the server sets `[kv.redis_compat] password`. See [`ephpm kv`](/reference/cli/kv/#authentication) for the two auth modes and the per-site HMAC limitation. |
 
-Neither `--site` nor `--all` means "the default vhost" (`_default`),
-which is what a single-node deployment with no `sites_dir` uses.
+Neither `--site` nor `--all` means "the default vhost" (`_DEFAULT`),
+which is what a single-node deployment with no `sites_dir` uses — and
+what any `Host` that matches no configured vhost falls back to.
+
+The two sentinel names, `_DEFAULT` and `_ALL`, are **uppercase on
+purpose**. `--site` lowercases its argument and the server lowercases
+every `Host`, so neither a flag nor a `sites_dir` directory can name
+either bucket. A site literally called `_default` therefore gets its
+own invalidation counter, as any other site does. (Through v0.8.8 these
+were spelled `_default`/`_all`; a script that writes those keys with a
+raw RESP client must be updated. `ephpm deploy` and `ephpm cache reset`
+need no change.)
 
 The running server must have `[kv.redis_compat] enabled = true`; the
 CLI is a separate process from the server, so it cannot poke the

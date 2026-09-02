@@ -4871,10 +4871,18 @@ pub(crate) fn normalize_host_key(host: &str) -> String {
 /// that vhost's names (`blog`, `blog.localhost`, `BLOG.`) the client used.
 ///
 /// A host that names no known site has no deployable identity, so it maps to
-/// [`crate::opcache::DEFAULT_VHOST`] (`_default`, the default document root)
-/// rather than to a key invented from the header. That also keeps the
-/// invalidation key space bounded by the site fleet instead of by what a client
-/// can type.
+/// [`crate::opcache::DEFAULT_VHOST`] (the default document root) rather than to
+/// a key invented from the header. That also keeps the invalidation key space
+/// bounded by the site fleet instead of by what a client can type.
+///
+/// That sentinel is **uppercase**, which is what stops it from colliding with a
+/// real tenant (issue #450) — the same "unspellable bucket" property the PHP
+/// ETag cache key gets from its empty site component, in the form this key
+/// needs. Empty would work for a key the operator never sees; this one is a
+/// Prometheus label, a log field, and the value `ephpm deploy` writes with no
+/// `--site`, so it has to stay readable. [`is_valid_site_key`] rejects
+/// uppercase and the router lowercases every `Host`, so no `sites_dir`
+/// directory can produce it.
 fn opcache_vhost_key(site_key: Option<&str>) -> String {
     site_key.map_or_else(|| crate::opcache::DEFAULT_VHOST.to_string(), str::to_owned)
 }
@@ -10176,6 +10184,85 @@ echo "post response";
             }
         }
 
+        /// Issue #450, stated directly: the OPcache vhost a tenant gets is
+        /// never the bucket an unmatched host gets, **even for a tenant that
+        /// picked the sentinel's old name**.
+        ///
+        /// `_default` was a legal `sites_dir` directory name, so a site called
+        /// `_default` and the default document root landed on one key. They
+        /// then shared the watcher's `last_invalidated_version`, and whichever
+        /// of the two absorbed a deploy first left the other serving stale
+        /// bytecode — not merely a shared namespace, a dropped invalidation.
+        ///
+        /// Same shape as `etag_cache_key_isolates_two_sites_on_the_same_path`:
+        /// distinct tenants never collide, every spelling of one tenant always
+        /// does.
+        #[tokio::test]
+        async fn opcache_vhost_key_isolates_tenants_from_the_default_bucket() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            let dbdir = dir.path().join("dbs");
+            // `_default` and `_all` are ordinary vhost names — that is the
+            // whole problem, so the fixture creates them as real tenants.
+            for name in ["shop", "blog", "_default", "_all"] {
+                fs::create_dir_all(sites.join(name)).unwrap();
+            }
+
+            let backends =
+                SiteBackends::new(dbdir.clone(), 8, stats(), tokio::runtime::Handle::current())
+                    .expect("registry");
+            let auth = SiteWireAuth::new(backends.clone()).expect("secret");
+            let router = router_with(dir.path(), &sites, &dbdir, Some(".local"), &auth);
+
+            let shop = derive(&router, &backends, "shop.local").opcache;
+            let blog = derive(&router, &backends, "blog.local").opcache;
+            let named_default = derive(&router, &backends, "_default.local").opcache;
+            let named_all = derive(&router, &backends, "_all.local").opcache;
+            let unmatched = derive(&router, &backends, "nobody.example.com").opcache;
+
+            assert_eq!(shop, "shop");
+            assert_eq!(blog, "blog");
+            // A tenant literally named `_default` keeps its own key...
+            assert_eq!(named_default, "_default");
+            assert_eq!(named_all, "_all");
+            // ...because the sentinel is not that name.
+            assert_eq!(unmatched, crate::opcache::DEFAULT_VHOST);
+            assert_ne!(
+                named_default, unmatched,
+                "a site named `_default` must not share the default docroot's OPcache \
+                 invalidation counter — issue #450"
+            );
+            assert_ne!(
+                named_all,
+                crate::opcache::BROADCAST_VHOST,
+                "a site named `_all` must not sit on the broadcast key — issue #450"
+            );
+            for (a, b) in [
+                (&shop, &blog),
+                (&shop, &unmatched),
+                (&blog, &named_default),
+                (&named_default, &named_all),
+            ] {
+                assert_ne!(a, b, "OPcache vhost keys must be pairwise distinct — #450");
+            }
+
+            // ...while every legal spelling of ONE tenant still shares its own
+            // key, or `ephpm deploy --site shop` would miss requests that
+            // arrived under a different spelling of the same vhost.
+            for spelling in ["shop", "shop.local", "SHOP.LOCAL", "shop.local:8080", "shop."] {
+                assert_eq!(
+                    derive(&router, &backends, spelling).opcache,
+                    shop,
+                    "`{spelling}` is the same tenant and must share its OPcache vhost"
+                );
+            }
+            // And every spelling of the unmatched bucket collapses to the one
+            // sentinel rather than minting a key per header value.
+            for host in ["nobody.example.com", "127.0.0.1:8080", "not-a-site"] {
+                assert_eq!(derive(&router, &backends, host).opcache, unmatched);
+            }
+        }
+
         /// The wire path applies [`normalize_host_key`] to the client-asserted
         /// username. A canonical key must be a **fixed point** of it, or the
         /// key the router injects and the key the listener resolves would be
@@ -10380,6 +10467,218 @@ echo "post response";
             // operator-owned middleware state lives (#384).
             assert_eq!(count_in(&global, "shop"), None);
             assert_eq!(count_in(&global, "blog"), None);
+        }
+
+        // ── the other two chain call sites, and the argument (#451) ────────
+        //
+        // `the_router_enters_the_site_scope_around_the_chain` above pins ONE
+        // of the three places the router enters the scope, and pins it by
+        // calling `static_request_phase` with a site key the test supplies.
+        // Deleting `enter_site_kv` at the `handle_php` call site or the
+        // response-phase call site failed no test, and nothing checked that
+        // `handle_inner` passes `resolved.key` rather than `server_name` — a
+        // swap that would restore #390 with every other test green. The tests
+        // below close both holes, and each fails on a single-line revert.
+
+        /// A probe that stamps the KV store in **both** middleware phases,
+        /// keyed by the tenant identity the chain was handed and the request
+        /// path: `mw:probe:<phase>:<vhost>:<path>`.
+        ///
+        /// One key makes two separate things observable. **Which store** the
+        /// router scoped the chain to — the key lands there and nowhere else —
+        /// and **which value** the router passed as the site key, since the
+        /// key is named after it. No shipped module writes KV in the response
+        /// phase, so a probe is also the only way to reach that call site at
+        /// all; hence `MiddlewareChain::with_test_response_module`.
+        struct KvScopeProbe;
+
+        fn stamp(req: &ephpm_middleware::Request<'_>, phase: &str) {
+            let vhost = req.vhost_id().unwrap_or(ephpm_middleware::UNMATCHED_VHOST);
+            // Deliberately not asserted here: a panic inside a module is
+            // caught by the chain and turned into a 500, so it would never
+            // surface as a test failure. The absent key is what the caller
+            // asserts on.
+            let _ = req.host().kv_set(&format!("mw:probe:{phase}:{vhost}:{}", req.path()), b"1", 0);
+        }
+
+        impl ephpm_middleware::Middleware for KvScopeProbe {
+            fn init(_config: &serde_json::Value) -> Result<Self, String> {
+                Ok(Self)
+            }
+
+            fn invoke(&self, req: &ephpm_middleware::Request<'_>) -> ephpm_middleware::Response {
+                stamp(req, "req");
+                ephpm_middleware::Response::cont()
+            }
+        }
+
+        impl ephpm_middleware::ResponseMiddleware for KvScopeProbe {
+            fn invoke_response(
+                &self,
+                req: &ephpm_middleware::Request<'_>,
+                _resp: &mut ephpm_middleware::ResponseView<'_>,
+            ) {
+                stamp(req, "resp");
+            }
+        }
+
+        /// A multi-tenant router with [`KvScopeProbe`] mounted.
+        ///
+        /// The fixture's `sites_domain_suffix = ".local"` is what lets these
+        /// tests tell `resolved.key` from `server_name` at all: `Host:
+        /// shop.local` has key `shop` and server name `shop.local`, so a swap
+        /// renames the probe's key instead of being invisible.
+        fn probe_router(
+            dir: &Path,
+            sites: &Path,
+        ) -> (Router, Arc<Store>, ephpm_kv::multi_tenant::MultiTenantStore) {
+            let (router, global, mt) = multi_tenant_router(dir, sites);
+            let chain = crate::middleware::MiddlewareChain::with_test_response_module::<KvScopeProbe>(
+                "kv-scope-probe",
+                &serde_json::Value::Null,
+            );
+            (router.with_middleware_chain(Some(Arc::new(chain))), global, mt)
+        }
+
+        /// Two tenants, each with a PHP entrypoint and a static asset.
+        fn probe_sites(dir: &Path) -> PathBuf {
+            let sites = dir.join("sites");
+            for name in ["shop", "blog"] {
+                fs::create_dir_all(sites.join(name)).unwrap();
+                fs::write(sites.join(name).join("index.php"), b"<?php echo 1;").unwrap();
+                fs::write(sites.join(name).join("a.css"), b"body{}").unwrap();
+            }
+            sites
+        }
+
+        fn probe_addr() -> SocketAddr {
+            "198.51.100.30:5000".parse().unwrap()
+        }
+
+        /// Issue #451(1): the chain that runs on the **PHP** path — the common
+        /// one — must run inside this vhost's KV scope.
+        ///
+        /// Driven through `handle` rather than `handle_php` so `handle_inner`'s
+        /// choice of argument is on the hook too: the key is named `shop`,
+        /// which is `resolved.key`, not `shop.local`, which is `server_name`.
+        /// (Stub mode answers the PHP request with a 500 or a stub 200 — the
+        /// chain has already run either way, which is the point.)
+        #[tokio::test]
+        async fn the_php_path_enters_the_site_scope_around_the_chain() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = probe_sites(dir.path());
+            let (router, global, mt) = probe_router(dir.path(), &sites);
+
+            let _ = router
+                .handle(get_with_host("/index.php", "shop.local"), probe_addr(), false)
+                .await
+                .unwrap();
+
+            let shop = mt.get_site_store("shop");
+            assert!(
+                shop.get("mw:probe:req:shop:/index.php").is_some(),
+                "the PHP path's chain must run inside this vhost's KV scope, keyed by the \
+                 canonical site key — issue #451"
+            );
+            assert!(
+                shop.get("mw:probe:resp:shop:/index.php").is_some(),
+                "the response phase must run inside this vhost's KV scope too — issue #451"
+            );
+            // Nothing else — in particular nothing named after the request
+            // host, which is what a `server_name` argument would produce.
+            let mut got = shop.keys("mw:probe:*");
+            got.sort();
+            assert_eq!(
+                got,
+                vec![
+                    "mw:probe:req:shop:/index.php".to_string(),
+                    "mw:probe:resp:shop:/index.php".to_string(),
+                ]
+            );
+            assert!(
+                global.keys("mw:probe:*").is_empty(),
+                "a tenant's middleware state must not land in the process-global store"
+            );
+        }
+
+        /// Issue #451(1), response phase on the **static** path: the same
+        /// guarantee for the one call site no shipped module can reach.
+        ///
+        /// The sibling test above pins `static_request_phase` when called
+        /// directly with a supplied site key; this drives it the way
+        /// `handle_inner` does, and adds the response phase behind it.
+        #[tokio::test]
+        async fn the_static_path_enters_the_site_scope_in_both_phases() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = probe_sites(dir.path());
+            let (router, global, mt) = probe_router(dir.path(), &sites);
+
+            let resp = router
+                .handle(get_with_host("/a.css", "shop.local"), probe_addr(), false)
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "the probe must not have blocked the file");
+
+            let shop = mt.get_site_store("shop");
+            assert!(
+                shop.get("mw:probe:req:shop:/a.css").is_some(),
+                "the static request phase must run inside this vhost's KV scope — issue #451"
+            );
+            assert!(
+                shop.get("mw:probe:resp:shop:/a.css").is_some(),
+                "the response phase must run inside this vhost's KV scope — issue #451"
+            );
+            assert!(
+                global.keys("mw:probe:*").is_empty(),
+                "a tenant's middleware state must not land in the process-global store"
+            );
+        }
+
+        /// Issue #451(2), stated on its own: **every** chain call site is told
+        /// the canonical site key, never the request host.
+        ///
+        /// Swapping `resolved.key` back to `server_name` at any one of the
+        /// three call sites leaves the rest of this module passing, because
+        /// nothing else inspects a value where the two differ. Here they do:
+        /// `Host: shop.local` resolves to key `shop`, so a swap both renames
+        /// every probe key and — since the same value picks the store — moves
+        /// it into a keyspace minted from the header. That is #390 restored.
+        #[tokio::test]
+        async fn every_chain_call_site_is_told_the_canonical_key_not_the_host() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = probe_sites(dir.path());
+            let (router, _global, mt) = probe_router(dir.path(), &sites);
+
+            for (host, key) in [("shop.local", "shop"), ("blog.local", "blog")] {
+                for path in ["/a.css", "/index.php"] {
+                    let _ = router
+                        .handle(get_with_host(path, host), probe_addr(), false)
+                        .await
+                        .unwrap();
+                }
+                let store = mt.get_site_store(key);
+                let mut got = store.keys("mw:probe:*");
+                got.sort();
+                assert_eq!(
+                    got,
+                    vec![
+                        format!("mw:probe:req:{key}:/a.css"),
+                        format!("mw:probe:req:{key}:/index.php"),
+                        format!("mw:probe:resp:{key}:/a.css"),
+                        format!("mw:probe:resp:{key}:/index.php"),
+                    ],
+                    "`Host: {host}` must reach the chain as tenant `{key}` — at every call site, \
+                     and in {key}'s own store — issues #390/#451"
+                );
+            }
+
+            // ...and the host spelling never became a tenant of its own.
+            for spelling in ["shop.local", "blog.local"] {
+                assert!(
+                    mt.get_site_store(spelling).keys("mw:probe:*").is_empty(),
+                    "`{spelling}` must not have minted its own middleware keyspace"
+                );
+            }
         }
     }
 

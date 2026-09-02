@@ -269,6 +269,37 @@ impl MiddlewareChain {
         Ok(Self { modules, php })
     }
 
+    /// Test-only: mount one in-process module directly, bypassing the
+    /// `library`-name registry in [`builtin`].
+    ///
+    /// [`MiddlewareChain::load`] can only reach the ten shipped modules, and
+    /// none of them touches the KV store in its **response** phase — so there
+    /// is otherwise no way to write a test that observes whether the router
+    /// entered the per-vhost KV scope around `run_response_phase` (issue
+    /// #451). This is the same construction `middleware.rs`'s own response
+    /// tests do inline; exposing it `pub(crate)` lets `router.rs` drive the
+    /// whole request through [`Router::handle`](crate::router::Router::handle)
+    /// with a probe mounted, rather than asserting on internals.
+    ///
+    /// `#[cfg(test)]` on purpose: a runtime registration hook would be a way
+    /// for a mount to name a module the registry deliberately does not ship.
+    #[cfg(test)]
+    pub(crate) fn with_test_response_module<T: ephpm_middleware::ResponseMiddleware>(
+        name: &str,
+        config: &serde_json::Value,
+    ) -> Self {
+        Self {
+            modules: vec![Loaded {
+                name: name.to_owned(),
+                match_pattern: None,
+                backend: Backend::Builtin(
+                    BuiltinModule::init_response::<T>(config).expect("test module init"),
+                ),
+            }],
+            php: Vec::new(),
+        }
+    }
+
     /// The `php:` mounts whose `match` glob accepts `path`, in chain order.
     ///
     /// Empty for every request when no `php:` mount is configured, which is the
