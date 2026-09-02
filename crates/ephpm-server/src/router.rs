@@ -562,7 +562,7 @@ pub struct Router {
     /// the `spawn_blocking` path.
     worker_pool: Option<Arc<crate::worker_pool::WorkerPool>>,
     /// Dedicated FPM execution pool when `[php] fpm_engine = "pool"` (fpm mode
-    /// only). `None` on the default `spawn_blocking` engine and in worker mode.
+    /// only). `None` on the legacy `spawn_blocking` engine and in worker mode.
     /// When set, per-request PHP execution is dispatched to this pool instead of
     /// tokio's `spawn_blocking`, and the `php_semaphore` cap is bypassed (the
     /// pool size is the cap). Built in [`Router::new`]; drained on shutdown via
@@ -1006,15 +1006,34 @@ impl Router {
         // bypassed. `is_pool_engine()` is already false in worker mode, so the
         // worker pool and this pool can never both be active.
         let fpm_pool = if config.php.is_pool_engine() {
-            let thread_count = config.php.effective_worker_count();
-            let backlog = config.php.effective_worker_backlog();
-            if config.php.workers > 0 {
-                tracing::warn!(
-                    workers = config.php.workers,
-                    "[php] workers is ignored when [php] fpm_engine = \"pool\" — the pool \
-                     size ({thread_count}) is the concurrency cap",
-                    thread_count = thread_count,
-                );
+            let (thread_count, size_source) = config.php.effective_fpm_pool_size_with_source();
+            let backlog = config.php.effective_fpm_pool_backlog();
+            match size_source {
+                // `workers` genuinely has no effect only when `worker_count`
+                // also wins over it; then the historical WARN is correct.
+                ephpm_config::FpmPoolSizeSource::WorkerCount if config.php.workers > 0 => {
+                    tracing::warn!(
+                        workers = config.php.workers,
+                        thread_count,
+                        "[php] workers is ignored when [php] fpm_engine = \"pool\" and \
+                         [php] worker_count is set — the pool size is the concurrency cap",
+                    );
+                }
+                // Migration path: an explicit `workers = N` with no
+                // `worker_count` sizes the pool, so the operator's cap survives
+                // the v0.9.0 default flip. Say so at INFO, not WARN — it is not
+                // a no-op.
+                ephpm_config::FpmPoolSizeSource::WorkersFallback => {
+                    tracing::info!(
+                        workers = config.php.workers,
+                        thread_count,
+                        "[php] workers = {workers} sizes the fpm pool ([php] worker_count \
+                         unset) — the concurrency cap is unchanged across the fpm_engine \
+                         default flip",
+                        workers = config.php.workers,
+                    );
+                }
+                _ => {}
             }
             Some(crate::fpm_pool::FpmPool::spawn(thread_count, backlog, config.php.admission))
         } else {
@@ -1036,7 +1055,7 @@ impl Router {
             None
         };
 
-        // The `workers` semaphore caps the default `spawn_blocking` engine only.
+        // The `workers` semaphore caps the legacy `spawn_blocking` engine only.
         // In pool mode the pool itself is the cap, so leave it `None`.
         let php_semaphore = (fpm_pool.is_none() && config.php.workers > 0)
             .then(|| Arc::new(tokio::sync::Semaphore::new(config.php.workers)));
@@ -5713,6 +5732,17 @@ mod tests {
         Store::new(StoreConfig::default())
     }
 
+    /// PHP config for routing-logic tests. Pins the legacy `spawn_blocking`
+    /// engine: the v0.9.0 default (`fpm_engine = "pool"`) would spin a
+    /// dedicated thread pool per test router, and in stub mode those threads
+    /// only register once `PhpRuntime::init()` has run — order-dependent and
+    /// slow. Engine selection has its own coverage
+    /// (`fpm_pool_engine_dispatches_php_request`, and the ephpm-config default
+    /// tests).
+    fn test_php_config() -> PhpConfig {
+        PhpConfig { fpm_engine: ephpm_config::FpmEngine::SpawnBlocking, ..PhpConfig::default() }
+    }
+
     fn test_router(dir: &Path) -> Router {
         let config = Config {
             server: ServerConfig {
@@ -5726,7 +5756,7 @@ mod tests {
                 ],
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -6055,7 +6085,7 @@ mod tests {
                 preview: true,
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -6093,7 +6123,7 @@ mod tests {
                 sites_domain_suffix: Some(".localhost".to_string()),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -6622,7 +6652,7 @@ mod tests {
                 fallback: vec!["$uri".to_string(), "=404".to_string()],
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -6687,7 +6717,7 @@ mod tests {
                 fallback: vec!["$uri".to_string(), "$uri/".to_string(), "=404".to_string()],
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -6830,7 +6860,7 @@ mod tests {
                 fallback: vec!["$uri".to_string(), "=404".to_string()],
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -6962,7 +6992,7 @@ mod tests {
                 fallback: vec!["$uri".to_string(), "=404".to_string()],
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -7116,7 +7146,7 @@ mod tests {
                 fallback: vec!["$uri".to_string(), "=404".to_string()],
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -7164,7 +7194,7 @@ mod tests {
                 fallback: vec!["$uri".to_string(), "=404".to_string()],
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -7241,7 +7271,7 @@ mod tests {
                 ],
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -7284,7 +7314,7 @@ mod tests {
                 fallback: vec!["$uri".to_string(), "=404".to_string()],
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -7325,7 +7355,7 @@ mod tests {
                 fallback: vec!["$uri".to_string(), "=404".to_string()],
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -7444,7 +7474,7 @@ mod tests {
                 fallback: vec!["$uri".to_string(), "$uri/".to_string(), "=404".to_string()],
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -7468,7 +7498,7 @@ mod tests {
                 ],
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -7672,7 +7702,7 @@ mod tests {
                 document_root: dir.path().to_path_buf(),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -7697,7 +7727,7 @@ mod tests {
                 document_root: dir.path().to_path_buf(),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -7936,7 +7966,7 @@ mod tests {
                 document_root: dir.path().to_path_buf(),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -7956,7 +7986,7 @@ mod tests {
                 document_root: dir.path().to_path_buf(),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -7978,7 +8008,7 @@ mod tests {
                 sites_dir: Some(dir.path().to_path_buf()),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -7997,7 +8027,7 @@ mod tests {
                 document_root: dir.path().to_path_buf(),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -8042,7 +8072,7 @@ mod tests {
                 document_root: dir.path().to_path_buf(),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -8061,7 +8091,7 @@ mod tests {
                 document_root: dir.path().to_path_buf(),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -8084,7 +8114,7 @@ mod tests {
                 document_root: dir.path().to_path_buf(),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -8321,7 +8351,7 @@ mod tests {
                 sites_dir: Some(sites.clone()),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -8442,7 +8472,7 @@ mod tests {
                 document_root: dir.path().to_path_buf(),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -8895,7 +8925,7 @@ echo "post response";
                 sites_dir: Some(sites),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -8921,7 +8951,7 @@ echo "post response";
                 sites_dir: Some(sites),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -8948,7 +8978,7 @@ echo "post response";
                 sites_dir: Some(sites),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -8975,7 +9005,7 @@ echo "post response";
                 sites_dir: Some(sites),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -8999,7 +9029,7 @@ echo "post response";
                 sites_dir: None,
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -9027,7 +9057,7 @@ echo "post response";
                 sites_dir: Some(sites),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -9059,7 +9089,7 @@ echo "post response";
                 sites_dir: Some(sites.clone()),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -9105,7 +9135,7 @@ echo "post response";
                 sites_dir: Some(sites),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -9185,7 +9215,7 @@ echo "post response";
                     site_overrides_dir: overrides_dir,
                     ..ServerConfig::default()
                 },
-                php: PhpConfig::default(),
+                php: test_php_config(),
                 db: DbConfig::default(),
                 kv: KvConfig::default(),
                 cluster: ClusterConfig::default(),
@@ -9731,7 +9761,7 @@ echo "post response";
                 sites_dir: Some(sites.clone()),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -9788,7 +9818,7 @@ echo "post response";
                 sites_domain_suffix: Some("localhost".to_string()),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -9841,7 +9871,7 @@ echo "post response";
                 sites_domain_suffix: Some(".preview.ephpm.dev".to_string()),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
@@ -9914,7 +9944,7 @@ echo "post response";
                     sites_domain_suffix: suffix.map(str::to_owned),
                     ..ServerConfig::default()
                 },
-                php: PhpConfig::default(),
+                php: test_php_config(),
                 db: DbConfig {
                     sqlite: Some(SqliteConfig {
                         path: "unused-in-per-site-mode.db".to_string(),
@@ -10334,7 +10364,7 @@ echo "post response";
                     sites_domain_suffix: Some(".local".to_string()),
                     ..ServerConfig::default()
                 },
-                php: PhpConfig::default(),
+                php: test_php_config(),
                 db: DbConfig::default(),
                 kv: KvConfig::default(),
                 cluster: ClusterConfig::default(),
@@ -11056,7 +11086,7 @@ data: two
                 document_root: dir.path().to_path_buf(),
                 ..ServerConfig::default()
             },
-            php: PhpConfig::default(),
+            php: test_php_config(),
             db: DbConfig::default(),
             kv: KvConfig::default(),
             cluster: ClusterConfig::default(),
