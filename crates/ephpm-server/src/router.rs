@@ -3845,7 +3845,10 @@ impl Router {
         }
 
         let cookie_data = ephpm_php::request::cookie_string_from_headers(&headers);
-        let server_vars = ephpm_php::request::build_server_variables(
+        // Built directly in FFI-ready form (issue #133): the worker bridge
+        // borrows these pointers as-is instead of converting every pair to
+        // CString a second time.
+        let server_vars = ephpm_php::request::build_server_variables_c(
             &method,
             &uri,
             &query_string,

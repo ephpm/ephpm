@@ -41,6 +41,8 @@ use std::ffi::CString;
 #[cfg(php_linked)]
 use std::os::raw::{c_char, c_int};
 
+use crate::request::CServerVar;
+
 /// Chunk size / channel bounds shared with the streaming-body plumbing.
 ///
 /// A bounded channel of `BODY_CHANNEL_DEPTH` chunks caps the in-flight buffered
@@ -97,8 +99,10 @@ pub struct WorkerRequestOwned {
     pub content_type: Option<String>,
     /// The request body (buffered or streaming).
     pub body: WorkerBody,
-    /// `$_SERVER`-shaped variables as `(key, value)` pairs.
-    pub server_vars: Vec<(String, String)>,
+    /// `$_SERVER`-shaped variables, already in FFI-ready form (built once by
+    /// `build_server_variables_c` — issue #133; the borrowed
+    /// [`EphpmWorkerRequest`] view points straight into these).
+    pub server_vars: Vec<CServerVar>,
     /// HTTP headers as `(name, value)` pairs.
     pub headers: Vec<(String, String)>,
 }
@@ -296,8 +300,7 @@ struct CurrentRequest {
     _body: Vec<u8>,
     body_len: usize,
     streaming: bool,
-    _server_keys: Vec<CString>,
-    _server_vals: Vec<CString>,
+    _server_vars: Vec<CServerVar>,
     _header_keys: Vec<CString>,
     _header_vals: Vec<CString>,
     // Pointer arrays into the CString vecs (stable: the vecs are not mutated
@@ -548,13 +551,14 @@ fn build_current_request(job: WorkerRequestOwned) -> (CurrentRequest, BodyReader
     let cookie = cstr(&job.cookie_data);
     let content_type = job.content_type.as_deref().map(cstr);
 
-    let server_keys: Vec<CString> = job.server_vars.iter().map(|(k, _)| cstr(k)).collect();
-    let server_vals: Vec<CString> = job.server_vars.iter().map(|(_, v)| cstr(v)).collect();
+    // $_SERVER arrives already FFI-ready (issue #133) — no re-allocation, just
+    // pointer arrays into the moved-in storage.
+    let server_vars = job.server_vars;
     let header_keys: Vec<CString> = job.headers.iter().map(|(k, _)| cstr(k)).collect();
     let header_vals: Vec<CString> = job.headers.iter().map(|(_, v)| cstr(v)).collect();
 
-    let server_key_ptrs: Vec<*const c_char> = server_keys.iter().map(|c| c.as_ptr()).collect();
-    let server_val_ptrs: Vec<*const c_char> = server_vals.iter().map(|c| c.as_ptr()).collect();
+    let server_key_ptrs: Vec<*const c_char> = server_vars.iter().map(|(k, _)| k.as_ptr()).collect();
+    let server_val_ptrs: Vec<*const c_char> = server_vars.iter().map(|(_, v)| v.as_ptr()).collect();
     let header_key_ptrs: Vec<*const c_char> = header_keys.iter().map(|c| c.as_ptr()).collect();
     let header_val_ptrs: Vec<*const c_char> = header_vals.iter().map(|c| c.as_ptr()).collect();
 
@@ -587,8 +591,7 @@ fn build_current_request(job: WorkerRequestOwned) -> (CurrentRequest, BodyReader
         _body: body_vec,
         body_len,
         streaming,
-        _server_keys: server_keys,
-        _server_vals: server_vals,
+        _server_vars: server_vars,
         _header_keys: header_keys,
         _header_vals: header_vals,
         server_key_ptrs,

@@ -1171,17 +1171,14 @@ impl PhpRuntime {
             );
         }
 
-        // Build and pass server variables ($_SERVER)
-        let server_vars = request.server_variables();
-        let c_server_vars: Vec<(CString, CString)> = server_vars
-            .iter()
-            .filter_map(|(k, v)| {
-                Some((CString::new(k.as_str()).ok()?, CString::new(v.as_str()).ok()?))
-            })
-            .collect();
-
+        // Build and pass server variables ($_SERVER). Built directly in
+        // NUL-terminated form — the invariant entries are static C literals
+        // and every dynamic one is allocated exactly once (issue #133).
+        let c_server_vars = request.server_variables_c();
         for (key, value) in &c_server_vars {
-            // Safety: CString pointers are valid and stay alive.
+            // Safety: the pointers stay valid until ephpm_execute_request
+            // returns — static literals live forever, owned CStrings live in
+            // `c_server_vars`, which outlives the call.
             unsafe {
                 ffi::ephpm_request_add_server_var(key.as_ptr(), value.as_ptr());
             }
