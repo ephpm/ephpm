@@ -180,16 +180,14 @@ impl CdcCluster {
         let mut reserver = PortReserver::new();
         let mut ports = Vec::with_capacity(total);
         for _ in 0..total {
-            let lease = reserver
-                .lease(&[
-                    PortKind::Tcp, // http
-                    PortKind::Tcp, // mysql
-                    PortKind::Tcp, // hrana
-                    PortKind::Udp, // gossip
-                    PortKind::Tcp, // cluster channel
-                    PortKind::Tcp, // kv data plane
-                ])
-                .await?;
+            let lease = reserver.lease(&[
+                PortKind::Tcp, // http
+                PortKind::Tcp, // mysql
+                PortKind::Tcp, // hrana
+                PortKind::Udp, // gossip
+                PortKind::Tcp, // cluster channel
+                PortKind::Tcp, // kv data plane
+            ])?;
             ports.push(NodePorts {
                 http: lease.port(0),
                 mysql: lease.port(1),

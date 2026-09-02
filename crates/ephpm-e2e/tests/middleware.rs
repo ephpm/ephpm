@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use ephpm_e2e::required_env;
+use ephpm_e2e::{escape_toml_str, required_env};
 
 /// The origin the mounted CORS module is configured to allow.
 const ALLOWED_ORIGIN: &str = "https://allowed.e2e.test";
@@ -232,7 +232,13 @@ fn serve_and_watch(config: &str, label: &str, budget: Duration) -> (bool, String
 }
 
 /// Minimal config with one `[[middleware]]` mount pointing at `library`.
+///
+/// Both interpolated values are paths, so both go through [`escape_toml_str`]:
+/// a raw Windows path turns the generated TOML into a parse error before
+/// `ephpm serve` ever looks at the mount.
 fn config_with_mount(library: &str, port: u16, dir: &str) -> String {
+    let library = escape_toml_str(library);
+    let dir = escape_toml_str(dir);
     format!(
         "[server]\n\
          listen = \"127.0.0.1:{port}\"\n\
@@ -290,7 +296,7 @@ fn garbage_library_file_fails_startup() {
 /// broken in some unrelated way and exited immediately on every config.
 #[test]
 fn valid_module_mount_does_not_abort_startup() {
-    let lib = required_env("EPHPM_MIDDLEWARE_LIB");
+    let lib = escape_toml_str(&required_env("EPHPM_MIDDLEWARE_LIB"));
     let dir = tempfile::Builder::new().prefix("ephpm-mw-ok-").tempdir().expect("tempdir");
     let cfg = format!(
         "[server]\n\
@@ -301,7 +307,7 @@ fn valid_module_mount_does_not_abort_startup() {
          library = \"{lib}\"\n\
          order = 10\n\
          config = {{ allow_origins = [\"{ALLOWED_ORIGIN}\"] }}\n",
-        dir.path().to_string_lossy()
+        escape_toml_str(&dir.path().to_string_lossy())
     );
     // Reuse the failure harness, then invert the expectation: a healthy mount
     // means the process is STILL RUNNING when the budget expires.

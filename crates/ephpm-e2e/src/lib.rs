@@ -64,7 +64,7 @@ impl SingleNodeFixture {
         // Ports stay *held* by live probe sockets (see `PortReserver`) until
         // the moment this fixture spawns its child, so nothing else on the box
         // can be handed one in between.
-        let lease = PortReserver::new().lease(&[PortKind::Tcp, PortKind::Tcp]).await?;
+        let lease = PortReserver::new().lease(&[PortKind::Tcp, PortKind::Tcp])?;
         let (http_port, mysql_port) = (lease.port(0), lease.port(1));
 
         let tmp = tempfile::Builder::new()
@@ -162,7 +162,7 @@ impl ClusterFixture {
 
         // Reserve all port sets before spawning so overlap is impossible. Each
         // set stays *held* by its own probe sockets until that node spawns.
-        let port_sets = reserve_cluster_ports(size).await?;
+        let port_sets = reserve_cluster_ports(size)?;
 
         let join_addrs: Vec<String> =
             port_sets.iter().map(|p| format!("127.0.0.1:{}", p.gossip)).collect();
@@ -300,10 +300,22 @@ const GOSSIP_PORT_SPAN: u16 = CLUSTER_CHANNEL_PORT_OFFSET + 1;
 /// ephemeral pool, and the kernel walks that pool in order, so an early
 /// release is exactly how a rejected port comes back as the answer to the
 /// next request.
+///
+/// **`std::net`, not `tokio::net`, and that is not incidental.** A probe never
+/// does any I/O — it exists to occupy a port — so it has no use for the
+/// reactor; but more importantly, tokio's sockets come from mio, and mio
+/// creates Windows sockets with `WSASocketW(..., WSA_FLAG_OVERLAPPED)` **without**
+/// `WSA_FLAG_NO_HANDLE_INHERIT`, which `std` does pass. An inheritable socket
+/// is duplicated into every child `Command::spawn` starts (stdio redirection
+/// implies `bInheritHandles = TRUE`), so a probe held across one node's spawn
+/// leaks into *that node's process* and stays bound there after this process
+/// drops it — and the next node dies with `os error 10048` on a port nothing
+/// visibly holds. `std` sockets are `HANDLE_FLAG_INHERIT`-clear on Windows and
+/// `SOCK_CLOEXEC` on Unix, so they vanish from the child exactly as intended.
 #[derive(Default)]
 struct PortProbes {
-    tcp: Vec<tokio::net::TcpListener>,
-    udp: Vec<tokio::net::UdpSocket>,
+    tcp: Vec<std::net::TcpListener>,
+    udp: Vec<std::net::UdpSocket>,
 }
 
 /// What a reserved loopback port will actually be bound as by the child.
@@ -411,15 +423,15 @@ impl PortReserver {
     ///
     /// Fails when the kernel cannot produce a bindable, not-already-claimed
     /// port of the requested kind within [`MAX_PORT_ATTEMPTS`] tries.
-    pub async fn lease(&mut self, kinds: &[PortKind]) -> Result<PortLease> {
+    pub fn lease(&mut self, kinds: &[PortKind]) -> Result<PortLease> {
         let mut probes = PortProbes::default();
         let mut ports = Vec::with_capacity(kinds.len());
         for kind in kinds {
             let port = match kind {
-                PortKind::Tcp => claim_tcp_port(&mut probes, &mut self.claimed).await?,
-                PortKind::Udp => claim_udp_port(&mut probes, &mut self.claimed).await?,
+                PortKind::Tcp => claim_tcp_port(&mut probes, &mut self.claimed)?,
+                PortKind::Udp => claim_udp_port(&mut probes, &mut self.claimed)?,
                 PortKind::GossipWithDerivedChannel => {
-                    claim_gossip_port(&mut probes, &mut self.claimed).await?
+                    claim_gossip_port(&mut probes, &mut self.claimed)?
                 }
             };
             ports.push(port);
@@ -430,19 +442,17 @@ impl PortReserver {
 
 /// Reserve a non-overlapping port set per node, each set held by its own lease
 /// until that node spawns.
-async fn reserve_cluster_ports(size: usize) -> Result<Vec<ClusterPorts>> {
+fn reserve_cluster_ports(size: usize) -> Result<Vec<ClusterPorts>> {
     let mut reserver = PortReserver::new();
     let mut sets = Vec::with_capacity(size);
 
     for _ in 0..size {
-        let lease = reserver
-            .lease(&[
-                PortKind::Tcp,
-                PortKind::Tcp,
-                PortKind::Tcp,
-                PortKind::GossipWithDerivedChannel,
-            ])
-            .await?;
+        let lease = reserver.lease(&[
+            PortKind::Tcp,
+            PortKind::Tcp,
+            PortKind::Tcp,
+            PortKind::GossipWithDerivedChannel,
+        ])?;
         sets.push(ClusterPorts {
             http: lease.port(0),
             mysql: lease.port(1),
@@ -460,9 +470,9 @@ pub const MAX_PORT_ATTEMPTS: usize = 64;
 
 /// Claim one unclaimed loopback **UDP** port, for a gossip listener whose
 /// cluster-channel port is configured explicitly rather than derived.
-async fn claim_udp_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>) -> Result<u16> {
+fn claim_udp_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>) -> Result<u16> {
     for _ in 0..MAX_PORT_ATTEMPTS {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.context("bind udp :0")?;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").context("bind udp :0")?;
         let port = socket.local_addr().context("local_addr")?.port();
         probes.udp.push(socket);
         if claimed.insert(port) {
@@ -473,9 +483,9 @@ async fn claim_udp_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>) ->
 }
 
 /// Claim one unclaimed loopback TCP port.
-async fn claim_tcp_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>) -> Result<u16> {
+fn claim_tcp_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>) -> Result<u16> {
     for _ in 0..MAX_PORT_ATTEMPTS {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind :0")?;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind :0")?;
         let port = listener.local_addr().context("local_addr")?.port();
         probes.tcp.push(listener);
         if claimed.insert(port) {
@@ -490,9 +500,9 @@ async fn claim_tcp_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>) ->
 ///
 /// Claims the whole `G..G + GOSSIP_PORT_SPAN` window so no other node can be
 /// handed the channel port.
-async fn claim_gossip_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>) -> Result<u16> {
+fn claim_gossip_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>) -> Result<u16> {
     for _ in 0..MAX_PORT_ATTEMPTS {
-        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.context("bind udp :0")?;
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").context("bind udp :0")?;
         let port = socket.local_addr().context("local_addr")?.port();
         probes.udp.push(socket);
 
@@ -507,7 +517,7 @@ async fn claim_gossip_port(probes: &mut PortProbes, claimed: &mut BTreeSet<u16>)
         // The channel port is TCP and nobody probes it but us. If it is taken
         // (or excluded), this whole gossip port is unusable — try another.
         let channel = port + CLUSTER_CHANNEL_PORT_OFFSET;
-        let Ok(listener) = tokio::net::TcpListener::bind(("127.0.0.1", channel)).await else {
+        let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", channel)) else {
             continue;
         };
         probes.tcp.push(listener);
@@ -610,8 +620,20 @@ unsafe fn libc_kill(pid: i32, sig: i32) -> i32 {
 }
 
 fn escape_toml(path: &Path) -> String {
-    let mut out = String::new();
-    for ch in path.to_string_lossy().chars() {
+    escape_toml_str(&path.to_string_lossy())
+}
+
+/// Escape `value` for use inside a TOML basic (double-quoted) string.
+///
+/// Mandatory for any **path** written into a generated config: a Windows path
+/// interpolated raw makes `C:\Users\...` a TOML parse error (`\U` starts an
+/// 8-digit unicode escape), so the server never even reaches the behaviour the
+/// test is about — it dies on "invalid unicode 8-digit hex code" and the
+/// assertion failure names the wrong thing entirely.
+#[must_use]
+pub fn escape_toml_str(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
         match ch {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
