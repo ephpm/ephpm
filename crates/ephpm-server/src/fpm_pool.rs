@@ -95,10 +95,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use ephpm_config::AdmissionPolicy;
 use ephpm_php::response::PhpResponse;
 use ephpm_php::{PhpError, PhpRuntime};
 use metrics::{counter, gauge};
 use tokio::sync::oneshot;
+
+use crate::worker_pool::DepthRollback;
 
 /// The outcome of one PHP request — exactly what [`PhpRuntime::execute`]
 /// returns. A contained bailout is `Err(PhpError::Bailout)`, which the router
@@ -162,6 +165,12 @@ pub struct FpmPool {
     /// `worker_pool::WorkerPool::admission` for the full mechanism and the
     /// measurements; the two pools share the defect and the fix.
     admission: Arc<tokio::sync::Semaphore>,
+    /// Which admission discipline dispatch uses (`[php] admission`): `Fifo`
+    /// waits on [`FpmPool::admission`] in strict arrival order (the #443
+    /// fix); `Barge` restores the pre-#443 path — wait in the bounded
+    /// channel's own `send().await`, which lets fresh dispatchers steal
+    /// freed slots ahead of parked waiters.
+    admission_policy: AdmissionPolicy,
     /// Shared runtime state (readiness, liveness, drain flag).
     state: Arc<PoolState>,
     /// Target number of live pool threads (the concurrency cap).
@@ -214,7 +223,11 @@ impl FpmPool {
     /// by the plumbing tests) — every dispatch then queues until backpressure /
     /// the request timeout answers it.
     #[must_use]
-    pub fn spawn(thread_count: usize, backlog: usize) -> Arc<Self> {
+    pub fn spawn(
+        thread_count: usize,
+        backlog: usize,
+        admission_policy: AdmissionPolicy,
+    ) -> Arc<Self> {
         let (dispatch_tx, dispatch_rx) = async_channel::bounded(backlog.max(1));
         let state = Arc::new(PoolState {
             ready: AtomicUsize::new(0),
@@ -235,6 +248,7 @@ impl FpmPool {
             dispatch_rx,
             queue_depth: Arc::new(AtomicUsize::new(0)),
             admission: Arc::new(tokio::sync::Semaphore::new(backlog.max(1))),
+            admission_policy,
             state,
             thread_count,
             started: Instant::now(),
@@ -247,6 +261,7 @@ impl FpmPool {
         tracing::info!(
             thread_count,
             backlog = backlog.max(1),
+            admission = admission_policy.as_str(),
             "fpm execution pool started (experimental [php] fpm_engine = \"pool\")"
         );
 
@@ -297,12 +312,46 @@ impl FpmPool {
         &self,
         run: FpmTask,
     ) -> Result<oneshot::Receiver<FpmExecOutput>, DispatchClosed> {
+        if self.admission_policy == AdmissionPolicy::Barge {
+            return self.dispatch_barge(run).await;
+        }
         // Wait for a queue slot in strict arrival order. Errors only when
         // `drain()` closed the semaphore.
         let Ok(permit) = Arc::clone(&self.admission).acquire_owned().await else {
             return Err(DispatchClosed);
         };
         self.enqueue_with_permit(run, permit).map_err(|_reason| DispatchClosed)
+    }
+
+    /// The pre-#443 dispatch path (`[php] admission = "barge"`): wait for a
+    /// queue slot inside the bounded channel's `send().await` instead of the
+    /// FIFO admission semaphore. Admission order is then a race — a fresh
+    /// sender `try_send`s before queueing behind parked waiters — which is
+    /// exactly the behaviour this escape hatch exists to restore. See
+    /// `worker_pool::WorkerPool::dispatch_barge`; the two pools share the
+    /// discipline. The job carries `admission: None`, so the pool thread's
+    /// permit release is a no-op.
+    async fn dispatch_barge(
+        &self,
+        run: FpmTask,
+    ) -> Result<oneshot::Receiver<FpmExecOutput>, DispatchClosed> {
+        let (tx, rx) = oneshot::channel();
+        let job = FpmJob { run, respond_to: tx, admission: None };
+        // Account the enqueue before the (awaitable) send so a thread pulling
+        // concurrently can only ever decrement a value we already added; the
+        // rollback guard undoes it on the closed-channel error and on
+        // cancellation mid-`send().await` (the outer request timeout).
+        let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        #[allow(clippy::cast_precision_loss)]
+        gauge!("ephpm_fpm_pool_queue_depth").set(depth as f64);
+        let rollback = DepthRollback::new(&self.queue_depth);
+        match self.dispatch_tx.send(job).await {
+            Ok(()) => {
+                rollback.defuse();
+                Ok(rx)
+            }
+            Err(_) => Err(DispatchClosed),
+        }
     }
 
     /// Enqueue a job whose admission permit is already held.
@@ -369,6 +418,9 @@ impl FpmPool {
         run: FpmTask,
         grace: Duration,
     ) -> Result<oneshot::Receiver<FpmExecOutput>, DispatchRejected> {
+        if self.admission_policy == AdmissionPolicy::Barge {
+            return self.try_dispatch_barge(run, grace).await;
+        }
         let permit = if grace.is_zero() {
             match Arc::clone(&self.admission).try_acquire_owned() {
                 Ok(permit) => permit,
@@ -387,6 +439,44 @@ impl FpmPool {
             }
         };
         self.enqueue_with_permit(run, permit)
+    }
+
+    /// The pre-#443 shed path (`[php] admission = "barge"`): `try_send` /
+    /// `timeout(grace, send())` straight on the bounded channel. Shed-mode
+    /// waiters race for freed slots exactly as `dispatch_barge` waiters do.
+    async fn try_dispatch_barge(
+        &self,
+        run: FpmTask,
+        grace: Duration,
+    ) -> Result<oneshot::Receiver<FpmExecOutput>, DispatchRejected> {
+        let (tx, rx) = oneshot::channel();
+        let job = FpmJob { run, respond_to: tx, admission: None };
+        // Same accounting discipline as `dispatch_barge`: count the enqueue
+        // before the attempt, roll it back on every path that does not
+        // enqueue (rejection, closed channel, or cancellation mid-wait).
+        let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        #[allow(clippy::cast_precision_loss)]
+        gauge!("ephpm_fpm_pool_queue_depth").set(depth as f64);
+        let rollback = DepthRollback::new(&self.queue_depth);
+
+        let outcome = if grace.is_zero() {
+            match self.dispatch_tx.try_send(job) {
+                Ok(()) => Ok(()),
+                Err(async_channel::TrySendError::Full(_)) => Err(DispatchRejected::Full),
+                Err(async_channel::TrySendError::Closed(_)) => Err(DispatchRejected::Closed),
+            }
+        } else {
+            match tokio::time::timeout(grace, self.dispatch_tx.send(job)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(_)) => Err(DispatchRejected::Closed),
+                Err(_elapsed) => Err(DispatchRejected::Full),
+            }
+        };
+
+        outcome.map(|()| {
+            rollback.defuse();
+            rx
+        })
     }
 
     /// Record that a thread appears hung (its `oneshot` timed out). The stuck
@@ -682,7 +772,7 @@ mod tests {
     /// dispatch-after-drain error.
     #[tokio::test]
     async fn zero_thread_pool_never_ready_and_drains() {
-        let pool = FpmPool::spawn(0, 4);
+        let pool = FpmPool::spawn(0, 4, AdmissionPolicy::Fifo);
         assert_eq!(pool.ready_count(), 0, "no thread registered, so not ready");
         assert_eq!(pool.live_count(), 0);
 
@@ -701,7 +791,7 @@ mod tests {
     /// and the depth reflects it.
     #[tokio::test]
     async fn dispatch_increments_queue_depth() {
-        let pool = FpmPool::spawn(0, 4);
+        let pool = FpmPool::spawn(0, 4, AdmissionPolicy::Fifo);
         assert_eq!(pool.queue_depth(), 0);
         assert!(pool.dispatch(ok_task(200)).await.is_ok());
         assert!(pool.dispatch(ok_task(200)).await.is_ok());
@@ -712,7 +802,7 @@ mod tests {
     /// leak an increment into the depth counter.
     #[tokio::test]
     async fn failed_dispatch_does_not_leak_queue_depth() {
-        let pool = FpmPool::spawn(0, 4);
+        let pool = FpmPool::spawn(0, 4, AdmissionPolicy::Fifo);
         pool.drain();
         assert!(pool.dispatch(ok_task(200)).await.is_err());
         assert_eq!(pool.queue_depth(), 0, "failed enqueue must roll back the increment");
@@ -724,7 +814,7 @@ mod tests {
     #[tokio::test]
     async fn threads_execute_task_and_reply() {
         PhpRuntime::init().expect("stub init");
-        let pool = FpmPool::spawn(2, 4);
+        let pool = FpmPool::spawn(2, 4, AdmissionPolicy::Fifo);
 
         // Threads register asynchronously; wait (bounded) for readiness.
         for _ in 0..200 {
@@ -759,7 +849,7 @@ mod tests {
     #[tokio::test]
     async fn contained_crash_retires_thread_and_pool_recovers() {
         PhpRuntime::init().expect("stub init");
-        let pool = FpmPool::spawn(1, 4);
+        let pool = FpmPool::spawn(1, 4, AdmissionPolicy::Fifo);
         assert!(wait_for(|| pool.ready_count() == 1).await, "thread should register");
         let spawned_before = pool.threads_spawned();
 
@@ -795,7 +885,7 @@ mod tests {
     /// 0-thread pool never drains, so "full" is deterministic here.
     #[tokio::test]
     async fn try_dispatch_sheds_when_the_backlog_is_full() {
-        let pool = FpmPool::spawn(0, 1);
+        let pool = FpmPool::spawn(0, 1, AdmissionPolicy::Fifo);
 
         assert!(
             pool.try_dispatch(ok_task(200), Duration::ZERO).await.is_ok(),
@@ -813,7 +903,7 @@ mod tests {
     /// actually elapse before the rejection.
     #[tokio::test]
     async fn try_dispatch_grace_waits_then_sheds() {
-        let pool = FpmPool::spawn(0, 1);
+        let pool = FpmPool::spawn(0, 1, AdmissionPolicy::Fifo);
         assert!(pool.try_dispatch(ok_task(200), Duration::ZERO).await.is_ok());
 
         let grace = Duration::from_millis(120);
@@ -835,7 +925,7 @@ mod tests {
     /// (only the latter is load shedding).
     #[tokio::test]
     async fn try_dispatch_after_drain_reports_closed() {
-        let pool = FpmPool::spawn(0, 4);
+        let pool = FpmPool::spawn(0, 4, AdmissionPolicy::Fifo);
         pool.drain();
 
         assert_eq!(
@@ -854,7 +944,7 @@ mod tests {
     /// `failed_dispatch_does_not_leak_queue_depth` pins for the waiting path.
     #[tokio::test]
     async fn shed_dispatch_does_not_leak_queue_depth() {
-        let pool = FpmPool::spawn(0, 1);
+        let pool = FpmPool::spawn(0, 1, AdmissionPolicy::Fifo);
         assert!(pool.try_dispatch(ok_task(200), Duration::ZERO).await.is_ok());
         assert_eq!(pool.queue_depth(), 1);
 
@@ -879,7 +969,7 @@ mod tests {
     #[tokio::test]
     async fn shed_policy_still_serves_requests_that_fit() {
         PhpRuntime::init().expect("stub init");
-        let pool = FpmPool::spawn(1, 2);
+        let pool = FpmPool::spawn(1, 2, AdmissionPolicy::Fifo);
         assert!(wait_for(|| pool.ready_count() == 1).await, "thread should register");
 
         let rx = pool.try_dispatch(ok_task(204), Duration::ZERO).await.expect("slot available");
@@ -895,7 +985,7 @@ mod tests {
     /// request rate. Pure bookkeeping — no threads involved.
     #[tokio::test]
     async fn poison_backoff_escalates_and_caps() {
-        let pool = FpmPool::spawn(0, 1);
+        let pool = FpmPool::spawn(0, 1, AdmissionPolicy::Fifo);
 
         let (first, streak) = pool.note_poisoned();
         assert_eq!(streak, 1, "the first poison starts a streak");
@@ -920,5 +1010,75 @@ mod tests {
         let (backoff, streak) = pool.note_poisoned();
         assert!(streak > 5);
         assert_eq!(backoff, POISON_BACKOFF_MAX, "a long storm sits at the ceiling");
+    }
+
+    // ── `[php] admission = "barge"` (the pre-#443 escape hatch) ─────────
+
+    /// The barge mirror of `worker_pool`'s
+    /// `admission_is_strictly_fifo_and_barge_proof`: with a waiter parked and
+    /// a slot freshly freed, a brand-new dispatcher completes *inline* by
+    /// stealing the slot — under FIFO the same inline dispatch would park
+    /// behind the waiter and this single-threaded test would deadlock.
+    #[tokio::test]
+    async fn admission_barge_lets_a_newcomer_steal_a_freed_slot() {
+        let pool = FpmPool::spawn(0, 1, AdmissionPolicy::Barge);
+
+        // Fills the single queue slot immediately.
+        let _rx_a = pool.dispatch(ok_task(200)).await.expect("first dispatch fits");
+
+        // w1 parks inside the bounded channel's send().await.
+        let w1 = {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(async move {
+                let _rx = pool.dispatch(ok_task(201)).await.expect("eventually admitted");
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!w1.is_finished(), "w1 must be parked behind the full queue");
+
+        // Free the slot; the newcomer's inline dispatch steals it before the
+        // notified-but-not-yet-run w1 can retry.
+        let job = pool.dispatch_rx.try_recv().expect("the first job is queued");
+        pool.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        drop(job);
+        let _rx_late = pool
+            .dispatch(ok_task(202))
+            .await
+            .expect("a newcomer takes the freed slot ahead of the parked waiter");
+
+        // w1 wakes, loses the race (queue full again), and re-parks.
+        tokio::task::yield_now().await;
+        assert!(!w1.is_finished(), "the parked waiter must still be waiting after being lapped");
+
+        // Only the next freed slot admits it.
+        let job = pool.dispatch_rx.try_recv().expect("the stolen-slot job is queued");
+        pool.queue_depth.fetch_sub(1, Ordering::Relaxed);
+        drop(job);
+        tokio::task::yield_now().await;
+        w1.await.expect("the lapped waiter is eventually admitted");
+    }
+
+    /// Barge shed semantics match the FIFO path's contract: a full backlog
+    /// rejects with `Full`, a drained pool with `Closed`, and neither leaks a
+    /// depth increment.
+    #[tokio::test]
+    async fn barge_try_dispatch_sheds_and_does_not_leak_depth() {
+        let pool = FpmPool::spawn(0, 1, AdmissionPolicy::Barge);
+
+        assert!(pool.try_dispatch(ok_task(200), Duration::ZERO).await.is_ok());
+        assert_eq!(
+            pool.try_dispatch(ok_task(200), Duration::ZERO).await.err(),
+            Some(DispatchRejected::Full),
+            "a full backlog must shed under barge too"
+        );
+        assert_eq!(pool.queue_depth(), 1, "shed requests must not inflate the queue depth");
+
+        pool.drain();
+        assert_eq!(
+            pool.try_dispatch(ok_task(200), Duration::ZERO).await.err(),
+            Some(DispatchRejected::Closed)
+        );
+        assert!(pool.dispatch(ok_task(200)).await.is_err(), "dispatch after drain must error");
+        assert_eq!(pool.queue_depth(), 1, "failed barge enqueues must roll back their increments");
     }
 }

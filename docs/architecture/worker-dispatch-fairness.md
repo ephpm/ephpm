@@ -157,6 +157,23 @@ admission_is_strictly_fifo_and_barge_proof`: waiters are admitted in arrival
 order and a dispatcher arriving while others are parked cannot steal a
 freshly freed slot.
 
+### 5.1 The `[php] admission` knob
+
+Both admission disciplines are selectable per deployment:
+`[php] admission = "fifo"` (**default** — the semaphore path above) or
+`"barge"` (the pre-fix racing admission: wait in the bounded channel's own
+`send().await`, `admission: None` on the job). The knob exists as an operator
+escape hatch and as the instrument for settling whether per-request (fpm)
+dispatch wants a different default than worker mode — worker mode's FIFO win
+is decisively measured (§6), while the fpm-mode picture rests on a
+cross-recording comparison contaminated by host drift. It applies to both
+`WorkerPool` and `FpmPool`; it is inert (startup WARN) on the default
+`fpm_engine = "spawn_blocking"`, which has no ePHPm-owned admission queue.
+The barge path keeps the depth-gauge honest with a rollback guard
+(`DepthRollback`) instead of reintroducing the cancellation leak noted
+above, and its behaviour is pinned by the mirror tests
+`admission_barge_lets_a_newcomer_steal_a_freed_slot` in both pools.
+
 ## 6. Before/after (same host, same build toolchain)
 
 Locally built binaries from the fix's parent commit vs the fix (identical

@@ -2991,6 +2991,46 @@ pub enum OverloadPolicy {
     Shed,
 }
 
+/// Dispatch-admission policy for the queues in front of PHP execution
+/// (`[php] admission`).
+///
+/// Applies wherever ePHPm owns the bounded queue in front of PHP: the
+/// persistent worker pool (`mode = "worker"`) and the dedicated fpm thread
+/// pool (`fpm_engine = "pool"`). The default `spawn_blocking` fpm engine has
+/// no ePHPm-owned admission queue, so the knob is inert there (startup WARNs
+/// on a non-default value so it is never a silent no-op).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdmissionPolicy {
+    /// **Default.** Strict arrival-order admission through a FIFO-fair
+    /// semaphore (issue #442). Bounded waiting: the longest-waiting request is
+    /// always admitted first, which removed the multi-lap starvation tail
+    /// (worker-mode P99 280 ms → 58 ms at unchanged throughput — see
+    /// `docs/architecture/worker-dispatch-fairness.md`).
+    Fifo,
+
+    /// The pre-#443 racing admission: wait in the bounded dispatch channel's
+    /// own `send().await`, whose try/listen/retry loop lets a fresh dispatcher
+    /// steal a just-freed slot ahead of parked waiters and re-queues a
+    /// raced-out waiter at the back. Work-conserving (a freed slot is always
+    /// taken instantly) but unfair: under saturation an unlucky request is
+    /// lapped by the entire waiter queue every time it loses the race.
+    /// Operator escape hatch for workloads where raw slot-refill latency is
+    /// worth the tail.
+    Barge,
+}
+
+impl AdmissionPolicy {
+    /// The config-file spelling of this policy (for startup logging).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fifo => "fifo",
+            Self::Barge => "barge",
+        }
+    }
+}
+
 /// PHP runtime configuration.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3422,6 +3462,28 @@ pub struct PhpConfig {
     /// Default: `0` (shed as soon as there is no free slot).
     #[serde(default = "default_shed_after_ms")]
     pub shed_after_ms: u64,
+
+    /// Dispatch-admission policy for the bounded queues in front of PHP
+    /// execution — the persistent worker pool (`mode = "worker"`) and the
+    /// dedicated fpm thread pool (`fpm_engine = "pool"`). See
+    /// [`AdmissionPolicy`].
+    ///
+    /// - `"fifo"` (**default**) — strict arrival-order admission via a
+    ///   FIFO-fair semaphore. Removes the multi-lap starvation tail (#442) at
+    ///   unchanged throughput; the shipped behaviour since PR #443.
+    /// - `"barge"` — the pre-#443 racing admission (wait in the bounded
+    ///   channel's `send().await`, where fresh dispatchers can steal freed
+    ///   slots ahead of parked waiters). Operator escape hatch.
+    ///
+    /// Inert on the default `fpm_engine = "spawn_blocking"` (there is no
+    /// ePHPm-owned admission queue to police); startup WARNs if `"barge"` is
+    /// set there. An unknown value is a startup error.
+    ///
+    /// Env override: `EPHPM_PHP__ADMISSION=barge`.
+    ///
+    /// Default: `"fifo"`.
+    #[serde(default = "default_admission")]
+    pub admission: AdmissionPolicy,
 
     /// Worker-mode entrypoint script, relative to `document_root`.
     ///
@@ -4287,6 +4349,7 @@ impl Default for PhpConfig {
             crash_containment: default_crash_containment(),
             overload_policy: None,
             shed_after_ms: default_shed_after_ms(),
+            admission: default_admission(),
             worker_script: None,
             worker_count: default_worker_count(),
             worker_max_requests: default_worker_max_requests(),
@@ -5530,6 +5593,12 @@ fn default_php_mode() -> String {
 
 fn default_fpm_engine() -> FpmEngine {
     FpmEngine::SpawnBlocking
+}
+
+fn default_admission() -> AdmissionPolicy {
+    // FIFO-fair is the shipped behaviour since PR #443: strict arrival order,
+    // no multi-lap starvation tail, throughput measured unchanged.
+    AdmissionPolicy::Fifo
 }
 
 fn default_crash_containment() -> bool {
@@ -7178,6 +7247,57 @@ idle_timeout_secs = 15
         let config = Config::default_config().unwrap();
         assert_eq!(config.php.fpm_engine, FpmEngine::Pool);
         assert!(config.php.is_pool_engine());
+    }
+
+    // ── [php] admission (issue #442 / PR #443 escape hatch) ──────────────
+
+    /// The default is the shipped FIFO-fair behaviour — from the struct
+    /// default, from an empty file, and from a `[php]` section that exists but
+    /// omits the field (the serde section-default trap).
+    #[test]
+    fn admission_defaults_to_fifo() {
+        assert_eq!(PhpConfig::default().admission, AdmissionPolicy::Fifo);
+        let config = Config::default_config().expect("default config should load");
+        assert_eq!(config.php.admission, AdmissionPolicy::Fifo);
+
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join("partial.toml");
+        std::fs::write(&partial, "[php]\nmax_execution_time = 60\n").unwrap();
+        assert_eq!(
+            Config::load(&partial).unwrap().php.admission,
+            AdmissionPolicy::Fifo,
+            "a partial [php] section must not flip the admission policy"
+        );
+    }
+
+    /// Explicit `barge` parses — the operator escape hatch is reachable.
+    #[test]
+    fn admission_barge_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\nadmission = \"barge\"\n").unwrap();
+        assert_eq!(Config::load(&file).unwrap().php.admission, AdmissionPolicy::Barge);
+    }
+
+    /// An unrecognised value is a hard startup error naming the key, never a
+    /// silent fallback to either policy.
+    #[test]
+    fn admission_invalid_value_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\nadmission = \"lifo\"\n").unwrap();
+        let err = Config::load(&file).expect_err("an unknown admission policy must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("admission"), "the error must name the key: {msg}");
+    }
+
+    /// The bench harness flips the policy via env with no config-file change:
+    /// `EPHPM_PHP__ADMISSION=barge` must parse.
+    #[test]
+    fn admission_env_override_parses() {
+        let _env = EnvVars::set("EPHPM_PHP__ADMISSION", "barge");
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.php.admission, AdmissionPolicy::Barge);
     }
 
     // ── [php] overload_policy / shed_after_ms (issue #301) ───────────────
