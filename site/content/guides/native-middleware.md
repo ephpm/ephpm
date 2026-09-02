@@ -113,8 +113,10 @@ config  = { api_key = "..." }
 | `config` | no | Arbitrary table, serialised to JSON and handed to the module's `init`. |
 
 Mounts are **global** — they apply to every vhost. A module that needs
-per-tenant behavior reads the request's vhost id (the server name) and
-decides itself.
+per-tenant behavior reads the request's canonical site key (`req.vhost_id()`,
+`None` for a host that matched no vhost) and decides itself. Its KV state is
+already per-tenant by default — see
+[KV scope](#kv-scope-per-tenant-by-default).
 
 Loading is **fail-fast**: a builtin whose `init` rejects its config, a
 library that can't be found, a missing ABI symbol, or a dynamic module
@@ -406,9 +408,17 @@ and reads it; a truthy value serves the holding page. **Fail-open by
 design:** a KV blip means CONTINUE, so a transient hiccup can't black-hole
 every tenant. Never use it as an access-control gate.
 
+`<vhost>` is the request's **canonical site key** — the vhost directory name,
+not the `Host` header — so one flag covers every name that resolves to that
+tenant (`blog`, `blog.localhost`, `BLOG.`). The key is read from that vhost's
+own KV keyspace, which is the keyspace the site's PHP and its RESP credential
+already use, so `ephpm_kv_set('mw:maintenance:blog', 1)` from the site's own
+code flips it. A request that matched no vhost reads the single
+`mw:maintenance:_UNMATCHED` flag in the process-global store.
+
 | key | default | meaning |
 |-----|---------|---------|
-| `key_template` (string) | `"mw:maintenance:<vhost>"` | KV key checked per request; `<vhost>` is substituted |
+| `key_template` (string) | `"mw:maintenance:<vhost>"` | KV key checked per request; `<vhost>` is substituted with the canonical site key |
 | `retry_after` (integer seconds) | `300` | `Retry-After` header on the 503 |
 | `body` (string) | built-in minimal HTML | holding-page body |
 | `content_type` (string) | `"text/html; charset=utf-8"` | holding-page `Content-Type` |
@@ -565,6 +575,38 @@ host.log(ephpm_middleware::abi::LOG_INFO, "hello from middleware");
 The KV operations hit the same embedded store PHP sees through
 `ephpm_kv_*` — replicated across the cluster when clustering is enabled.
 
+#### KV scope: per-tenant by default
+
+`kv_get`/`kv_set`/`kv_set_nx`/`kv_incr`/`kv_incr_ttl` resolve **the keyspace of
+the vhost serving the current request**. On a multi-tenant node
+(`[server] sites_dir`) that is the site's own store — a physically separate
+map, not a key prefix — and it is the *same* store that vhost's PHP reaches
+through `ephpm_kv_set()`. Two consequences worth designing around:
+
+- A counter, session, or flag your module writes is **per tenant** already.
+  You do not need to prefix keys with the vhost, and one tenant's traffic
+  cannot spend another tenant's budget.
+- A module and the PHP app it fronts can **share a key**. Writing
+  `ephpm_kv_set('revoked:'.$id, 1)` from PHP is visible to the module's
+  `kv_get` on the next request, with no bridging.
+
+For state that is genuinely node-scoped there are `kv_*_global` variants
+(`host.kv_get_global(...)`, ABI minor 3), which always resolve the
+process-wide store:
+
+```rust
+// Operator-owned config: written out of band, readable here, and NOT
+// writable by any tenant's PHP — which is the point.
+let policy = host.kv_get_global("operator:policy");
+// A deliberately node-wide edge counter, one budget for the whole node:
+let n = host.kv_incr_ttl_global("edge:rl:global", 1, 60);
+```
+
+Single-site nodes have exactly one store, so the two sets are the same thing
+there and nothing changes. A request whose `Host` matched **no** vhost has no
+tenant identity and gets the process-global store; bucket such requests under
+`ephpm_middleware::UNMATCHED_VHOST` rather than keying on the header.
+
 The `Request` also exposes the connection and (optional) body:
 
 ```rust
@@ -586,10 +628,36 @@ fn invoke(&self, req: &Request<'_>) -> Response {
 ```
 
 `req.scheme()` returns `"http"`/`"https"`, `req.http_host()` the normalized
-`Host` (port/trailing-dot stripped, lowercased — distinct from
-`req.vhost_id()`, the raw server name), and `req.body()` the bounded buffered
-body. Against an older host that predates these (ABI minor < 2) they fall back
-to `"http"` / `false` / `""` rather than reading past a shorter table.
+`Host` (port/trailing-dot stripped, lowercased), and `req.body()` the bounded
+buffered body. Against an older host that predates these (ABI minor < 2) they
+fall back to `"http"` / `false` / `""` rather than reading past a shorter table.
+
+#### `vhost_id()` is the tenant identity; `http_host()` is not
+
+`req.vhost_id()` returns `Option<&str>`: the **canonical site key** the router
+resolved — the same identity that selects the request's per-site database, KV
+keyspace and OPcache vhost. It is normalized by the router, not by the header,
+so `Site.Example`, `site.example:8080` and `site.example.` all yield one key,
+and a configured `sites_domain_suffix` is already stripped.
+
+`None` means the request matched **no** known virtual host. That is a decision,
+not a missing value: ePHPm serves unrecognised hosts from the default document
+root, so `http_host()` there is arbitrary client input. Use `None` to fail
+closed, or bucket it under `ephpm_middleware::UNMATCHED_VHOST` — never
+substitute the header, or a caller gets a fresh keyspace (and a fresh rate-limit
+budget) per `Host` value they invent.
+
+```rust
+// Fail closed: no tenant, no policy.
+let Some(site) = req.vhost_id() else {
+    return Response::respond(404, "unknown host");
+};
+let creds = host.kv_get_global(&format!("basicauth:{site}"));
+```
+
+Reach for `http_host()` only when you genuinely want the host as sent — a
+canonical-host redirect, a log line — never as a lookup key for per-tenant
+policy.
 
 ### Building modules on Linux
 
@@ -634,7 +702,7 @@ int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
                                          ephpm_response_edit_t* edit_out);
 ```
 
-- `abi_version` is `0x01_00_00_02` — major **1**, minor **2**. The **major
+- `abi_version` is `0x01_00_00_03` — major **1**, minor **3**. The **major
   byte** gates compatibility; modules must refuse to init (return non-zero)
   when the host's major is newer than they were built for. The lower three
   bytes are an additive **minor** level: growth (new host-table fields, the
@@ -642,7 +710,18 @@ int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
   major-1 modules keep loading. A module that uses a newer field must check
   the host's advertised minor (`host->abi_version & 0x00FFFFFF`) first —
   minor **1** added the response phase, minor **2** the appended request
-  accessors (`request_scheme`/`request_is_secure`/`request_host`).
+  accessors (`request_scheme`/`request_is_secure`/`request_host`), minor
+  **3** the appended process-global KV slots (`kv_get_global` and its four
+  siblings).
+- **Minor 3 also redefined two existing surfaces** (issues #390 and #376).
+  Both are no-ops on a single-site node; on a multi-tenant node:
+  `request_vhost_id` returns the canonical site key and **NULL** for an
+  unmatched host, where it used to return the raw `Host`; and the `kv_*`
+  slots resolve the request's per-vhost keyspace, where they used to always
+  hit the process-global store. A module relying on node-wide `kv_*` state
+  should move those calls to the matching `kv_*_global` slot; anything
+  per-tenant should stay put and simply becomes isolated. Keys built from
+  the vhost id change name once, at upgrade.
 - `config_json` is the mount's `config` table serialised to JSON (NULL when
   the mount has no config).
 - The host callback table is passed **by pointer at `init`** and is valid
@@ -650,10 +729,13 @@ int32_t ephpm_middleware_invoke_response(const ephpm_request_t* request,
   would need `-rdynamic` on Linux and has no clean Windows analogue). It
   contains request accessors (method, path, query, remote IP, header
   lookup, vhost id, and — minor 2 — scheme/`is_secure`, normalized host, and
-  the bounded buffered body), the KV operations (`kv_get`/`kv_set`/
-  `kv_set_nx`/`kv_incr`/`kv_incr_ttl`/`kv_free`), `log`, and — for the
+  the bounded buffered body), the request-scoped KV operations (`kv_get`/
+  `kv_set`/`kv_set_nx`/`kv_incr`/`kv_incr_ttl`/`kv_free`), `log`, — for the
   response phase (minor 1) — the response accessors (`response_status`/
-  `response_headers`/`response_body`).
+  `response_headers`/`response_body`), and — minor 3 — the process-global KV
+  operations (`kv_get_global`/`kv_set_global`/`kv_set_nx_global`/
+  `kv_incr_global`/`kv_incr_ttl_global`; `kv_free` is shared, since it frees
+  the allocation rather than touching a store).
 - The request pointer is only valid during `invoke`; never store it.
   Everything a module writes into `response_out` must stay valid until its
   `invoke` returns — the host copies before unwinding. The same rule applies

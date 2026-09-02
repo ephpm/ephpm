@@ -1978,6 +1978,37 @@ impl Router {
         }
     }
 
+    /// The KV store the native-middleware chain should see for this request
+    /// (issue #376).
+    ///
+    /// Scoped to the **canonical site key** on a multi-tenant node, so a
+    /// module's `kv_get`/`kv_incr_ttl` reaches the same physically separate
+    /// store this vhost's PHP reaches through `ephpm_kv_*` — a rate limiter is
+    /// per-tenant by default, and a module can read a key PHP wrote.
+    ///
+    /// `None` (the process-global store) in two cases, both deliberate:
+    ///
+    /// * single-site mode, where there is one store and nothing to isolate;
+    /// * a request that matched **no** vhost, which has no tenant identity to
+    ///   scope to. Note this is the one place the middleware lane deliberately
+    ///   differs from [`SiteIdentities::kv`], which falls back to the
+    ///   normalized `Host` so a catch-all document root keeps per-hostname
+    ///   keyspaces. The chain runs on *every* request, static files included,
+    ///   and site stores are created lazily and never evicted — so minting one
+    ///   per `Host` value here would be a cheap way to grow the site map
+    ///   without bound. A module that wants to bucket unmatched requests has
+    ///   [`ephpm_middleware::UNMATCHED_VHOST`] for the key, in the global
+    ///   store where operator state already lives.
+    fn middleware_kv_store(
+        &self,
+        site_key: Option<&str>,
+    ) -> Option<std::sync::Arc<ephpm_kv::store::Store>> {
+        let key = site_key?;
+        // `get_site_store` treats the empty string as "the default store", but
+        // `site_key` is `Some` here so the key is a real, validated vhost name.
+        Some(self.multi_tenant_kv.as_ref()?.get_site_store(key))
+    }
+
     /// Resolve, and lazily create, this vhost's private temp + session
     /// directories, returning the paths to inject into the per-request PHP
     /// sandbox.
@@ -3061,7 +3092,18 @@ impl Router {
             .with_scheme(is_https)
             .with_host(&normalize_host_key(&server_name))
             .with_body(body_view);
-            match chain.evaluate(&ctx, &path) {
+            // Scope the chain's KV callbacks to this request's vhost keyspace
+            // (issue #376) — the same store PHP gets below. The guard is held
+            // across the synchronous `evaluate` only and dropped before any
+            // `.await`: it is thread-local state, and a suspended task can
+            // resume on a different tokio worker.
+            let verdict = {
+                let _kv_scope = ephpm_middleware::host::enter_site_kv(
+                    self.middleware_kv_store(site_key.as_deref()),
+                );
+                chain.evaluate(&ctx, &path)
+            };
+            match verdict {
                 crate::middleware::ChainVerdict::Respond { status, body, headers } => {
                     return middleware_response(status, body, &headers);
                 }
@@ -4160,6 +4202,9 @@ impl Router {
         )
         .with_scheme(is_https)
         .with_host(&normalize_host_key(server_name));
+        // Per-vhost KV scope, exactly as on the PHP path (issue #376). This
+        // method is synchronous throughout, so the guard never spans an await.
+        let _kv_scope = ephpm_middleware::host::enter_site_kv(self.middleware_kv_store(site_key));
         match chain.evaluate(&ctx, path) {
             crate::middleware::ChainVerdict::Respond { status, body, headers } => {
                 StaticGate::Respond(middleware_response(status, body, &headers))
@@ -4250,13 +4295,20 @@ impl Router {
         )
         .with_scheme(is_https)
         .with_host(&normalize_host_key(server_name));
-        let outcome = chain.run_response_phase(
-            &ctx,
-            path,
-            parts.status.as_u16(),
-            decodable,
-            collected.to_vec(),
-        );
+        // Per-vhost KV scope for the response phase too (issue #376). Scoped
+        // to the synchronous call: the body `.collect().await` above is
+        // already done, and nothing awaits between here and the drop.
+        let outcome = {
+            let _kv_scope =
+                ephpm_middleware::host::enter_site_kv(self.middleware_kv_store(site_key));
+            chain.run_response_phase(
+                &ctx,
+                path,
+                parts.status.as_u16(),
+                decodable,
+                collected.to_vec(),
+            )
+        };
 
         parts.status = StatusCode::from_u16(outcome.status).unwrap_or(parts.status);
         parts.headers.clear();
@@ -9348,6 +9400,187 @@ echo "post response";
                 assert_eq!(normalize_host_key(&key), key, "`{key}` must normalize to itself");
                 assert!(is_valid_site_key(&key), "`{key}` must pass the allowlist gate");
             }
+        }
+    }
+
+    /// Issue #376 — which KV store the native-middleware chain is handed.
+    ///
+    /// The chain's `kv_*` callbacks take no request pointer, so the store is
+    /// bound per request via a thread-local scope. These tests pin the
+    /// *selection* — the part that decides tenancy — rather than the FFI
+    /// plumbing (covered by `ephpm_middleware::host`'s own tests).
+    mod middleware_kv_scope {
+        use super::*;
+
+        /// A multi-tenant router sharing one `MultiTenantStore`, exactly as
+        /// `start_kv_service` builds it for the RESP listener and the PHP path.
+        fn multi_tenant_router(
+            dir: &Path,
+            sites: &Path,
+        ) -> (Router, Arc<Store>, ephpm_kv::multi_tenant::MultiTenantStore) {
+            let config = Config {
+                server: ServerConfig {
+                    listen: "0.0.0.0:8080".to_string(),
+                    document_root: dir.to_path_buf(),
+                    sites_dir: Some(sites.to_path_buf()),
+                    sites_domain_suffix: Some(".local".to_string()),
+                    ..ServerConfig::default()
+                },
+                php: PhpConfig::default(),
+                db: DbConfig::default(),
+                kv: KvConfig::default(),
+                cluster: ClusterConfig::default(),
+                middleware: Vec::new(),
+                opcache: ephpm_config::OpcacheConfig::default(),
+            };
+            let global = test_store();
+            let mt = ephpm_kv::multi_tenant::MultiTenantStore::new(
+                Arc::clone(&global),
+                StoreConfig::default(),
+            );
+            let router =
+                Router::new(&config, Arc::clone(&global), Some(mt.clone()), None, None, None, None);
+            (router, global, mt)
+        }
+
+        /// Two vhosts get two physically separate stores, and each is the same
+        /// `Arc` PHP's `ephpm_kv_*` resolves for that vhost — so a module and
+        /// the app it fronts share a keyspace, and two tenants never do.
+        #[tokio::test]
+        async fn each_site_gets_its_own_store_and_it_is_phps_store() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            for name in ["shop", "blog"] {
+                fs::create_dir_all(sites.join(name)).unwrap();
+            }
+            let (router, global, mt) = multi_tenant_router(dir.path(), &sites);
+
+            let shop = router
+                .middleware_kv_store(router.resolve_site("shop.local").key.as_deref())
+                .expect("a matched vhost gets its own store");
+            let blog = router
+                .middleware_kv_store(router.resolve_site("blog.local").key.as_deref())
+                .expect("a matched vhost gets its own store");
+
+            assert!(!Arc::ptr_eq(&shop, &blog), "two tenants must not share one store");
+            assert!(!Arc::ptr_eq(&shop, &global), "a tenant must not be handed the global store");
+
+            // The same handle the PHP bridge is given for that vhost — this is
+            // what makes "middleware reads a key PHP wrote" true (#376 case 1).
+            assert!(Arc::ptr_eq(&shop, &mt.get_site_store("shop")));
+            assert!(Arc::ptr_eq(&blog, &mt.get_site_store("blog")));
+
+            // And the separation is physical, not a key prefix.
+            shop.set("same-name".into(), b"shop".to_vec(), None);
+            assert_eq!(blog.get("same-name"), None);
+            assert_eq!(global.get("same-name"), None);
+        }
+
+        /// Every legal spelling of one tenant lands on one store, or a module's
+        /// per-tenant state would fragment the way #390's raw `Host` key did.
+        #[tokio::test]
+        async fn every_spelling_of_one_tenant_resolves_the_same_store() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            fs::create_dir_all(sites.join("shop")).unwrap();
+            let (router, ..) = multi_tenant_router(dir.path(), &sites);
+
+            let expected = router
+                .middleware_kv_store(router.resolve_site("shop.local").key.as_deref())
+                .expect("known site");
+            for spelling in ["shop", "shop.local", "SHOP.LOCAL", "shop.local:8080", "shop."] {
+                let got = router
+                    .middleware_kv_store(router.resolve_site(spelling).key.as_deref())
+                    .expect("known site");
+                assert!(Arc::ptr_eq(&expected, &got), "`{spelling}` must reach one store");
+            }
+        }
+
+        /// A host that matched no vhost has no tenant identity, so it gets the
+        /// process-global store (`None` = no override) rather than a keyspace
+        /// minted from the header. The chain runs on every request, static
+        /// files included, and site stores are never evicted — a `Host`-derived
+        /// store here would grow the site map without bound.
+        #[tokio::test]
+        async fn an_unmatched_host_gets_no_site_store() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            fs::create_dir_all(sites.join("shop")).unwrap();
+            let (router, _global, mt) = multi_tenant_router(dir.path(), &sites);
+
+            for host in ["nobody.example.com", "127.0.0.1:8080", "not-a-site"] {
+                let resolved = router.resolve_site(host);
+                assert_eq!(resolved.key, None, "`{host}` names no vhost");
+                assert!(
+                    router.middleware_kv_store(resolved.key.as_deref()).is_none(),
+                    "`{host}` must not mint a keyspace"
+                );
+            }
+            assert_eq!(mt.site_count(), 0, "no site store may be created by an unknown Host");
+        }
+
+        /// Single-site mode has one store and nothing to isolate, so the scope
+        /// is never overridden — the pre-#376 behaviour, unchanged.
+        #[tokio::test]
+        async fn single_site_mode_never_overrides_the_global_store() {
+            let dir = tempfile::tempdir().unwrap();
+            let router = test_router(dir.path());
+            assert!(router.middleware_kv_store(None).is_none());
+            assert!(router.middleware_kv_store(Some("anything")).is_none());
+        }
+
+        /// Selecting the right store is only half of it — the router has to
+        /// actually *enter* the scope around the chain. This drives a real
+        /// mounted module end to end through `static_request_phase` (the one
+        /// chain-invoking path with no PHP runtime in it) and reads the effect
+        /// out of the store: a per-tenant counter must land in the tenant's own
+        /// store and nowhere else.
+        #[tokio::test]
+        async fn the_router_enters_the_site_scope_around_the_chain() {
+            let dir = tempfile::tempdir().unwrap();
+            let sites = dir.path().join("sites");
+            for name in ["shop", "blog"] {
+                fs::create_dir_all(sites.join(name)).unwrap();
+            }
+            let (router, global, mt) = multi_tenant_router(dir.path(), &sites);
+            // A generous budget: this test is about *where* the counter lands,
+            // not about tripping the limit.
+            let chain =
+                crate::middleware::MiddlewareChain::load(&[ephpm_config::MiddlewareMount {
+                    library: "ratelimit".to_string(),
+                    match_pattern: None,
+                    order: 10,
+                    config: Some(serde_json::json!({ "per_ip_rps": 1000 })),
+                }])
+                .expect("load builtin ratelimit");
+            let router = router.with_middleware_chain(Some(Arc::new(chain)));
+
+            let addr: SocketAddr = "198.51.100.20:5000".parse().unwrap();
+            let gate = |site: Option<&str>| {
+                router.static_request_phase(None, "GET", "/a.css", "", addr, site, "ignored", false)
+            };
+            assert!(matches!(gate(Some("shop")), StaticGate::Continue(_)));
+            assert!(matches!(gate(Some("blog")), StaticGate::Continue(_)));
+
+            // The module writes `mw:rl:<vhost>:<client>:<window>`. Find it in
+            // each tenant's own store, and confirm the counter is per-tenant.
+            let shop_store = mt.get_site_store("shop");
+            let blog_store = mt.get_site_store("blog");
+            let count_in = |store: &Arc<Store>, vhost: &str| -> Option<i64> {
+                store
+                    .keys(&format!("mw:rl:{vhost}:*"))
+                    .first()
+                    .and_then(|k| store.get(k))
+                    .and_then(|v| String::from_utf8_lossy(&v).parse().ok())
+            };
+            assert_eq!(count_in(&shop_store, "shop"), Some(1), "shop counted in shop's store");
+            assert_eq!(count_in(&blog_store, "blog"), Some(1), "blog counted in blog's store");
+            assert_eq!(count_in(&shop_store, "blog"), None, "no cross-tenant key in shop's store");
+            assert_eq!(count_in(&blog_store, "shop"), None, "no cross-tenant key in blog's store");
+            // And nothing leaked into the process-global store, which is where
+            // operator-owned middleware state lives (#384).
+            assert_eq!(count_in(&global, "shop"), None);
+            assert_eq!(count_in(&global, "blog"), None);
         }
     }
 

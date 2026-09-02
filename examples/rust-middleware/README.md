@@ -218,11 +218,13 @@ reads the same literal key through the host table's `kv_get`, and the next
 request is rejected in native code with no restart and no config reload. TTL
 is in **seconds** on both surfaces.
 
-> **Single-site only.** With `[server] sites_dir` set, PHP is rebound per
-> request to a per-vhost KV store while the middleware host table holds one
-> process-wide store, so PHP and middleware would no longer meet on the same
-> key. The rate limiter is unaffected (it only talks to the middleware side);
-> the PHP-driven revocation demo is what would break.
+> **Multi-tenant too, since ABI minor 3** (issue #376). The middleware host
+> table's `kv_*` callbacks are now bound per request to the *serving vhost's*
+> store — the same one PHP is rebound to — so this demo works unchanged with
+> `[server] sites_dir` set: `revoke.php` on `tenant-a.example` revokes for
+> `tenant-a.example` and nowhere else. The rate-limit counter becomes
+> per-tenant for free. For node-wide state (operator-owned config a tenant
+> must not be able to rewrite) use the explicit `kv_*_global` accessors.
 
 > `revoke.php` has no authentication. It is a demo, not a pattern.
 

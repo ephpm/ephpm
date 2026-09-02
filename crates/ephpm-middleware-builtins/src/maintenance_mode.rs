@@ -11,6 +11,15 @@
 //! is short-circuited with a `503` holding page carrying a `Retry-After`
 //! header. If the key is absent the request `CONTINUE`s to PHP untouched.
 //!
+//! `<vhost>` is the **canonical site key** the router resolved, not the `Host`
+//! header (issue #390): one flag per tenant, covering every name that resolves
+//! to it, rather than one flag per spelling. A request that matched no vhost
+//! has no tenant identity and reads the single
+//! [`ephpm_middleware::UNMATCHED_VHOST`] flag. The lookup goes to that vhost's
+//! own KV keyspace on a multi-tenant node (issue #376) — the same keyspace the
+//! site's PHP and its RESP credential use — so a site can flip its own flag
+//! with `ephpm_kv_set('mw:maintenance:<key>', 1)`.
+//!
 //! **Bypass.** Operators need to verify a site while it is "down". Two escape
 //! hatches let a request `CONTINUE` even during maintenance:
 //! - `bypass_ips` — exact IPs or CIDR ranges (client IP is taken *after*

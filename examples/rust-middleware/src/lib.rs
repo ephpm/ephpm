@@ -131,7 +131,11 @@ impl ApiGate {
     }
 
     /// KV key holding this tenant's counter for the current window. The vhost
-    /// is part of the key so two sites in one process cannot share a budget.
+    /// is part of the key so two sites in one process cannot share a budget —
+    /// and it is the router's canonical site key, never the `Host` header,
+    /// which a caller could vary to mint a fresh budget (issue #390). On a
+    /// multi-tenant node the counter also lands in that vhost's own KV store
+    /// (issue #376), so the key component is belt-and-braces.
     fn window_key(vhost: &str, tenant: &str, window: u64) -> String {
         format!("apigate:rl:{vhost}:{tenant}:{window}")
     }

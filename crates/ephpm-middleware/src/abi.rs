@@ -60,6 +60,7 @@ use std::os::raw::{c_char, c_int};
 ///     on a multi-tenant node instead of always hitting the process-global
 ///     store (issue #376), with the global store still reachable through the
 ///     appended `kv_*_global` slots ([`ABI_MINOR_GLOBAL_KV`]).
+///
 ///   Both redefinitions are no-ops on a single-site node, where there is one
 ///   tenant and one store. See [`ABI_MINOR_GLOBAL_KV`] for the migration note.
 ///
@@ -101,6 +102,31 @@ pub const ABI_MINOR_RESPONSE_PHASE: u32 = 1;
 /// this — its slot has existed since minor 0; only its buffered semantics are
 /// new — so a minor-0 module that already called it stays correct.)
 pub const ABI_MINOR_REQUEST_ACCESSORS: u32 = 2;
+
+/// The minor version that introduced the appended process-global KV
+/// accessors — [`EphpmHostV1::kv_get_global`] and its four siblings — and, in
+/// the same pass, **redefined** two pre-existing surfaces for multi-tenant
+/// correctness. A module needs `host.abi_version & 0x00FF_FFFF >=` this before
+/// calling any `kv_*_global` slot.
+///
+/// # What changed for an existing module
+///
+/// Nothing at all on a single-site node: there is one tenant and one store, so
+/// both redefinitions are identity.
+///
+/// On a multi-tenant node (`[server] sites_dir`):
+///
+/// * [`EphpmHostV1::request_vhost_id`] returns the router's canonical site key
+///   rather than the raw `Host`, and NULL rather than a client-supplied string
+///   for a host that matched no vhost (issue #390). A key built from it changes
+///   name once, at upgrade.
+/// * The `kv_*` slots resolve **this request's** per-vhost keyspace rather
+///   than the process-global store (issue #376). A module that was relying on
+///   node-wide `kv_*` state — an edge-wide rate limiter, an operator-owned
+///   config key — must move those calls to the matching `kv_*_global` slot.
+///   Everything per-tenant should stay where it is and simply becomes
+///   isolated, and now shares a keyspace with the tenant's `ephpm_kv_*`.
+pub const ABI_MINOR_GLOBAL_KV: u32 = 3;
 
 /// Middleware verdicts for one request.
 pub const ACTION_CONTINUE: c_int = 0;
@@ -215,6 +241,13 @@ pub struct EphpmResponseEdit {
 /// KV operations hit the embedded, gossip-replicated store — the same data
 /// PHP sees through `ephpm_kv_*` — which is what makes a cluster-wide rate
 /// limiter a single `kv_incr_ttl` call.
+///
+/// Since minor 3 the `kv_*` slots resolve **the keyspace of the vhost serving
+/// the current request**, so "the same data PHP sees" holds per tenant on a
+/// multi-tenant node rather than only on a single-site one. The process-global
+/// store — where operator-owned state lives, out of reach of any tenant's
+/// PHP — is reachable through the appended `kv_*_global` slots. See
+/// [`ABI_MINOR_GLOBAL_KV`].
 #[repr(C)]
 pub struct EphpmHostV1 {
     /// Host ABI version (== [`ABI_V1`] for this table).
@@ -367,10 +400,62 @@ pub struct EphpmHostV1 {
     pub request_is_secure: unsafe extern "C" fn(*const EphpmRequest) -> c_int,
     /// Normalized request `Host` — port stripped, one trailing FQDN-root dot
     /// stripped, lowercased (the same normalization the router uses to key a
-    /// vhost). Distinct from [`request_vhost_id`](Self::request_vhost_id),
-    /// which is the un-normalized server name. Empty (never null) when the
+    /// vhost). **Not a tenant identity**: it is what the client sent, not what
+    /// the router matched, and it is populated even for a host that names no
+    /// vhost. Use [`request_vhost_id`](Self::request_vhost_id) for tenancy
+    /// decisions and this only when you genuinely want the request host (a
+    /// canonical-host redirect, a log line). Empty (never null) when the
     /// request carried no usable `Host`.
     pub request_host: unsafe extern "C" fn(*const EphpmRequest) -> *const c_char,
+
+    // ── Process-global KV (minor 3) ───────────────────────────────────────
+    //
+    // Appended after `request_host`. A module that reads these must first
+    // confirm `abi_version & 0x00FF_FFFF >= ABI_MINOR_GLOBAL_KV`.
+    //
+    // The same five operations as the `kv_*` slots above, against the
+    // **process-wide** store instead of this request's per-site keyspace. Use
+    // them only for state that is genuinely node-scoped: operator-owned
+    // configuration, which must live where no tenant's PHP can rewrite it, or
+    // a deliberately node-wide edge counter. Anything belonging to the tenant
+    // being served belongs in the request-scoped `kv_*` slots — which is where
+    // PHP's `ephpm_kv_*` puts it, so the two lanes meet there by default.
+    //
+    // On a single-site node these reach the same store as `kv_*`.
+    /// Global-store `kv_get`. Same return contract; free with `kv_free`.
+    pub kv_get_global: unsafe extern "C" fn(
+        key: *const u8,
+        key_len: usize,
+        out: *mut *mut u8,
+        out_len: *mut usize,
+    ) -> c_int,
+    /// Global-store `kv_set`.
+    pub kv_set_global: unsafe extern "C" fn(
+        key: *const u8,
+        key_len: usize,
+        value: *const u8,
+        value_len: usize,
+        ttl_secs: i64,
+    ) -> c_int,
+    /// Global-store `kv_set_nx`.
+    pub kv_set_nx_global: unsafe extern "C" fn(
+        key: *const u8,
+        key_len: usize,
+        value: *const u8,
+        value_len: usize,
+        ttl_secs: i64,
+    ) -> c_int,
+    /// Global-store `kv_incr`.
+    pub kv_incr_global:
+        unsafe extern "C" fn(key: *const u8, key_len: usize, by: i64, out: *mut i64) -> c_int,
+    /// Global-store `kv_incr_ttl`.
+    pub kv_incr_ttl_global: unsafe extern "C" fn(
+        key: *const u8,
+        key_len: usize,
+        by: i64,
+        ttl_secs: i64,
+        out: *mut i64,
+    ) -> c_int,
 }
 
 /// Symbol names the loader looks up.
