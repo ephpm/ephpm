@@ -160,13 +160,19 @@ mysql_async = { version = "0.34", default-features = false, features = ["minimal
 
 # Loadable middleware fixtures for the dlopen lane (tests/middleware_dlopen.rs).
 #
-# These are `examples` rather than workspace crates on purpose: cargo emits an
-# example's declared crate-types during an ordinary `cargo test -p
-# ephpm-server`, whereas a library crate's `cdylib` output is produced only by
-# an explicit `cargo build -p <crate>` — not by `cargo test --workspace`, and
-# not by a dev-dependency edge (both verified). That gap is why the dlopen
-# loader had no enforced coverage: the one test that touched it skipped
-# whenever the artifact was absent, which in CI was always.
+# These are `examples` rather than workspace crates on purpose: `cargo build
+# --examples` emits an example's declared crate-types, whereas a library
+# crate's `cdylib` output needs a per-crate `cargo build -p <crate>` — it is
+# produced by neither `cargo test --workspace` nor a dev-dependency edge (both
+# verified). That gap is why the dlopen loader had no enforced coverage: the one
+# test that touched it skipped whenever the artifact was absent, which in CI was
+# always.
+#
+# NOTE: `cargo test` does NOT build examples either (`cargo test --no-run` does;
+# a plain `cargo test` does not — verified on Windows, issue #435). CI therefore
+# runs `cargo build --workspace --lib --examples` before its test step, and a
+# local `cargo test -p ephpm-server` needs the same command first or the dlopen
+# tests fail on a missing artifact.
 [[example]]
 name = "mw_probe_v1"
 crate-type = ["cdylib"]

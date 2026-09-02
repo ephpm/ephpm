@@ -57,7 +57,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use ephpm_e2e::ephpm_binary_env;
+use ephpm_e2e::{PortKind, PortLease, PortReserver, ephpm_binary_env};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -119,6 +119,12 @@ struct NodePorts {
     /// from the kernel and collided under parallelism (issue #383).
     channel: u16,
     kv_data: u16,
+    /// Probe sockets holding this node's six ports until it is spawned.
+    ///
+    /// `None` once the node has been spawned (or, defensively, if a caller ever
+    /// spawns twice). Holding is what makes reserving ports for a node that
+    /// starts ~100s later safe — see [`ephpm_e2e::PortLease`] and issue #438.
+    lease: Option<PortLease>,
 }
 
 /// How a node's `[db.sqlite.replication]` block is written.
@@ -150,6 +156,18 @@ impl CdcCluster {
     /// the scratch layout. Ports for *every* node — including ones spawned
     /// later — are reserved up front so each node's `join` list can name the
     /// full eventual membership.
+    ///
+    /// Reserved here means **held**: each node keeps its probe sockets open
+    /// until [`Self::spawn`] releases them a few instructions before
+    /// `Command::spawn`. This suite is the reason that matters —
+    /// [`a_joining_node_must_not_steal_an_established_primary`] does not start
+    /// node 3 until ~100s after `prepare`, and for all of that time a live
+    /// 3-node cluster is churning gossip, CDC and MySQL connections through the
+    /// ephemeral range. With the old bind-read-close reservation the kernel
+    /// re-issued node 3's port to one of those connections roughly 1 run in 25,
+    /// and the node died on `Address already in use` — surfacing as "node 3
+    /// never became healthy within 90s", which reads like a cluster regression
+    /// and burns a whole e2e leg (issue #438).
     async fn prepare(binary: &Path, total: usize) -> Result<Self> {
         let tempdir =
             tempfile::Builder::new().prefix("ephpm-e2e-cdc-").tempdir().context("tempdir")?;
@@ -157,15 +175,27 @@ impl CdcCluster {
         fs::create_dir_all(&docroot).context("create docroot")?;
         fs::write(docroot.join("index.html"), "cdc-e2e").context("write index.html")?;
 
+        // Gossip is UDP; the channel port is pinned explicitly here (not
+        // derived as `gossip + 2`), so it is reserved as an ordinary TCP port.
+        let mut reserver = PortReserver::new();
         let mut ports = Vec::with_capacity(total);
         for _ in 0..total {
+            let lease = reserver.lease(&[
+                PortKind::Tcp, // http
+                PortKind::Tcp, // mysql
+                PortKind::Tcp, // hrana
+                PortKind::Udp, // gossip
+                PortKind::Tcp, // cluster channel
+                PortKind::Tcp, // kv data plane
+            ])?;
             ports.push(NodePorts {
-                http: reserve_port().await?,
-                mysql: reserve_port().await?,
-                hrana: reserve_port().await?,
-                gossip: reserve_port().await?,
-                channel: reserve_port().await?,
-                kv_data: reserve_port().await?,
+                http: lease.port(0),
+                mysql: lease.port(1),
+                hrana: lease.port(2),
+                gossip: lease.port(3),
+                channel: lease.port(4),
+                kv_data: lease.port(5),
+                lease: Some(lease),
             });
         }
 
@@ -227,7 +257,13 @@ impl CdcCluster {
         let stdout = fs::File::create(node_dir.join("stdout.log")).context("stdout log")?;
         let stderr = fs::File::create(node_dir.join("stderr.log")).context("stderr log")?;
 
-        eprintln!("[cdc-e2e] spawning node {i} (http 127.0.0.1:{})", p.http);
+        let http_port = self.ports[i].http;
+        eprintln!("[cdc-e2e] spawning node {i} (http 127.0.0.1:{http_port})");
+        // Hand the ports off: release this node's probes and spawn in the same
+        // breath, so nothing else can be issued one in between (issue #438).
+        if let Some(lease) = self.ports[i].lease.take() {
+            lease.release();
+        }
         let child = Command::new(&self.binary)
             .args(["serve", "--config"])
             .arg(&config_path)
@@ -425,13 +461,6 @@ impl Drop for CdcCluster {
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
-
-/// Ask the kernel for a free loopback port. Inherent TOCTOU, acceptable for a
-/// fixture that spawns immediately after reserving.
-async fn reserve_port() -> Result<u16> {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.context("bind :0")?;
-    Ok(listener.local_addr().context("local_addr")?.port())
-}
 
 fn escape_toml(path: &Path) -> String {
     let mut out = String::new();

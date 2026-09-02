@@ -24,7 +24,7 @@ use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 use std::{fs, io, thread};
 
-use crate::{DEFAULT_PHP_MINOR, release, workspace_root};
+use crate::{DEFAULT_PHP_MINOR, canonicalize_portable, release, workspace_root};
 
 /// Test suites that need a 3-node cluster (rather than a single node).
 ///
@@ -326,7 +326,11 @@ pub fn run(args: &[String]) -> ExitCode {
         eprintln!("error: docroot not found at {}", docroot.display());
         return ExitCode::FAILURE;
     }
-    let docroot = match docroot.canonicalize() {
+    // `canonicalize_portable`, not `Path::canonicalize`: on Windows the latter
+    // yields a `\\?\`-prefixed path, which PHP's `open_basedir` check rejects —
+    // every script under the docroot then 500s and the whole suite is
+    // unrunnable on a Windows host (issue #367).
+    let docroot = match canonicalize_portable(&docroot) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: failed to canonicalize {}: {e}", docroot.display());
@@ -339,7 +343,7 @@ pub fn run(args: &[String]) -> ExitCode {
     // document_root). Resolved eagerly so a missing fixture fails before any
     // node is spawned.
     let worker_docroot = root.join("tests").join("worker-docroot");
-    let worker_docroot = match worker_docroot.canonicalize() {
+    let worker_docroot = match canonicalize_portable(&worker_docroot) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: worker docroot {} unusable: {e}", worker_docroot.display());
@@ -639,6 +643,12 @@ fn resolve_ephpm_binary(args: &[String], php_version: &str) -> Option<PathBuf> {
 
     // The release build lands under target/<triple>/release/ephpm, but the
     // top-level target/release/ephpm symlink is what people typically look for.
+    //
+    // The windows-msvc triple is in this list for the same reason as the other
+    // two: `cargo xtask release --target windows` is the only way to produce a
+    // Windows binary, it writes to `target/x86_64-pc-windows-msvc/release/`, and
+    // without this entry a Windows host never finds a binary it just built and
+    // falls through to a redundant `cargo xtask release` (issue #367).
     let candidates = [
         root.join("target").join("release").join(bin_name),
         root.join("target")
@@ -649,6 +659,7 @@ fn resolve_ephpm_binary(args: &[String], php_version: &str) -> Option<PathBuf> {
             .join(format!("{}-apple-darwin", std::env::consts::ARCH))
             .join("release")
             .join(bin_name),
+        root.join("target").join("x86_64-pc-windows-msvc").join("release").join(bin_name),
     ];
     for c in &candidates {
         if c.exists() {
@@ -682,8 +693,15 @@ fn resolve_ephpm_binary(args: &[String], php_version: &str) -> Option<PathBuf> {
 /// alternative (a bare `--release`) would recompile the dependency graph into
 /// a second output directory for no benefit.
 fn build_middleware_cdylib() -> Option<PathBuf> {
+    // Every host needs its own branch here. Falling through to the linux-gnu
+    // triple on Windows asked cargo to cross-compile to a target that is not
+    // installed, and the suite died on `can't find crate for core` (issue
+    // #367) — a rustup message, in the middle of an e2e run, for a build that
+    // was only ever meant to be native.
     let host_target = if cfg!(target_os = "macos") {
         format!("{}-apple-darwin", std::env::consts::ARCH)
+    } else if cfg!(windows) {
+        format!("{}-pc-windows-msvc", std::env::consts::ARCH)
     } else {
         format!("{}-unknown-linux-gnu", std::env::consts::ARCH)
     };

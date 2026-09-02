@@ -13,9 +13,14 @@
 //! fired every time.
 //!
 //! The fixtures are `crate-type = ["cdylib"]` examples of this crate
-//! (`examples/mw_probe_*.rs`), which cargo *does* build during `cargo test -p
-//! ephpm-server`. [`fixture`] hard-fails with the build command when one is
-//! missing — a skip here is indistinguishable from the bug this file closes.
+//! (`examples/mw_probe_*.rs`). **Producing them is an explicit build step**:
+//! `cargo test` / `cargo nextest run` do not emit example artifacts (verified
+//! — `cargo test --no-run` does, a plain `cargo test` does not), which is why
+//! CI runs `cargo build --workspace --lib --examples` before the test step (see
+//! `.github/workflows/ci.yml`). Run that yourself before `cargo test -p
+//! ephpm-server` locally, on any platform. [`fixture`] hard-fails with the
+//! build command when an artifact is missing — a skip here is
+//! indistinguishable from the bug this file closes.
 //!
 //! End-to-end coverage of a *shipped* module (`ephpm-middleware-cors`) mounted
 //! by path in a real server's `[[middleware]]` config lives in the E2E suite,

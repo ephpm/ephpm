@@ -5642,28 +5642,6 @@ mod tests {
 
     // ── Middleware response phase + static-path request phase (#395) ──────
 
-    /// Locate a built cdylib example (mirrors `tests/middleware_dlopen.rs`).
-    /// Fails loudly rather than skipping: `cargo test -p ephpm-server` builds
-    /// examples, so an absent artifact is a wiring regression.
-    fn example_lib(stem: &str) -> PathBuf {
-        let exe = std::env::current_exe().expect("test binary has a path");
-        let dir = exe
-            .parent()
-            .and_then(Path::parent)
-            .expect("test binary at <target>/<profile>/deps/<name>")
-            .join("examples");
-        let file =
-            format!("{}{stem}.{}", std::env::consts::DLL_PREFIX, std::env::consts::DLL_EXTENSION);
-        let path = dir.join(&file);
-        assert!(
-            path.is_file(),
-            "example cdylib `{file}` missing at {} — build with \
-             `cargo build -p ephpm-server --examples`",
-            path.display()
-        );
-        path
-    }
-
     fn chain_with(mounts: Vec<MiddlewareMount>) -> Arc<crate::middleware::MiddlewareChain> {
         Arc::new(crate::middleware::MiddlewareChain::load(&mounts).expect("chain loads"))
     }
@@ -5671,15 +5649,29 @@ mod tests {
     /// The response phase MUST run on the **static-file** path, not just PHP —
     /// that is half of #395's value. A header-injection module mounted on a
     /// static site stamps its header onto a served `.html` file.
+    ///
+    /// The module is the compiled-in `header-transform` **builtin**, not the
+    /// `mw_response_header` cdylib example this test used to `dlopen`. Nothing
+    /// in a test build puts that example on disk — `cargo test` and `cargo
+    /// nextest` do not emit example artifacts (which is why CI runs an explicit
+    /// `cargo build --workspace --lib --examples` first, see `ci.yml`) — so the
+    /// artifact assertion turned a bare `cargo test` on a clean checkout into a
+    /// hard failure on every platform (issue #435, reported from Windows). What
+    /// this test is *about* is the router calling the response phase on the
+    /// static path; which lane the module was loaded through is irrelevant
+    /// here, and the dlopen lane keeps its own coverage in
+    /// `tests/middleware_dlopen.rs` and `tests/middleware_response_phase.rs`.
     #[tokio::test]
     async fn response_phase_runs_on_static_files() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("page.html"), b"<h1>hi</h1>").unwrap();
         let mount = MiddlewareMount {
-            library: example_lib("mw_response_header").to_string_lossy().into_owned(),
+            library: "header-transform".to_string(),
             match_pattern: None,
             order: 10,
-            config: Some(serde_json::json!({ "header": "X-Resp-Phase", "value": "static" })),
+            config: Some(serde_json::json!({
+                "response": { "set": { "X-Resp-Phase": "static" } }
+            })),
         };
         let router = test_router(dir.path()).with_middleware_chain(Some(chain_with(vec![mount])));
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();

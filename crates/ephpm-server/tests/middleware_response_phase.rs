@@ -5,10 +5,11 @@
 //!
 //! The fixture is the `mw_response_gzip` cdylib example (a genuine gzip
 //! response compressor). Like the `mw_probe_*` fixtures it is a
-//! `crate-type = ["cdylib"]` example so `cargo test -p ephpm-server` always
-//! leaves a loadable library on disk — [`fixture`] hard-fails with the build
-//! command rather than skipping, so this lane can never go silently
-//! uncovered.
+//! `crate-type = ["cdylib"]` example, and like them it has to be **built
+//! explicitly** — `cargo build --workspace --lib --examples`, which CI runs
+//! before its test step; `cargo test` alone does not emit example artifacts
+//! (see `middleware_dlopen.rs`). [`fixture`] hard-fails with that build command
+//! rather than skipping, so this lane can never go silently uncovered.
 //!
 //! The request-phase-only `mw_probe_v1` fixture (which does **not** export the
 //! response symbol) is reused here to prove the presence check: a v1 module is

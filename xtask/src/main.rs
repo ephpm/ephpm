@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
-use std::{env, fs};
+use std::{env, fs, io};
 
 mod bump;
 mod cli_conformance;
@@ -1546,6 +1546,58 @@ fn container_engine() -> String {
 
 // ── workspace + platform helpers ─────────────────────────────────────────────
 
+/// Resolve a path to its real location **without** Windows' extended-length
+/// (`\\?\`) prefix, so the result can be handed to another program.
+///
+/// `std::fs::canonicalize` on Windows returns the verbatim form —
+/// `\\?\C:\Users\...\tests\docroot`. That is a perfectly good path to Rust and
+/// to the Win32 API, but it is not a path an unrelated program necessarily
+/// understands: PHP normalises and compares paths itself, and a
+/// `\\?\`-prefixed `document_root` fails its `open_basedir` check, so **every**
+/// script under that root 500s. That is what made `cargo xtask e2e` unrunnable
+/// on a Windows host (issue #367) — environmental, identical on every suite,
+/// and looking nothing like a path bug.
+///
+/// On non-Windows this is exactly `fs::canonicalize`.
+///
+/// # Errors
+///
+/// Same as [`std::fs::canonicalize`] — the path must exist and be reachable.
+fn canonicalize_portable(path: &Path) -> io::Result<PathBuf> {
+    Ok(strip_verbatim_prefix(path.canonicalize()?))
+}
+
+/// Rewrite `\\?\C:\dir` as `C:\dir` when that spelling is equivalent.
+///
+/// Only a **verbatim drive** prefix is unwrapped. `\\?\UNC\server\share` and
+/// verbatim device paths (`\\?\PhysicalDrive0`) are left alone: they have no
+/// shorter spelling that means the same thing. A result at or past `MAX_PATH`
+/// keeps its prefix too — there the prefix is what makes the path usable at
+/// all, and a docroot that long is not a case worth breaking to be pretty.
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    /// Windows' classic path-length limit; `\\?\` exists to exceed it.
+    const MAX_PATH: usize = 260;
+
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else { return path };
+    let Prefix::VerbatimDisk(letter) = prefix.kind() else { return path };
+
+    // What follows the prefix is `RootDir` then the rest; collected that is
+    // `\dir\file`, and pushing a rooted-but-prefixless path onto `C:` keeps the
+    // prefix and replaces the rest — i.e. yields `C:\dir\file`.
+    let mut out = PathBuf::from(format!("{}:", letter as char));
+    out.push(components.collect::<PathBuf>());
+    if out.as_os_str().len() >= MAX_PATH { path } else { out }
+}
+
+#[cfg(not(windows))]
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    path
+}
+
 /// Find the workspace root (directory containing the root Cargo.toml).
 fn workspace_root() -> PathBuf {
     let mut dir = env::current_dir().expect("cannot read current directory");
@@ -1881,4 +1933,46 @@ fn download_and_extract_zip(url: &str, dest_dir: &Path, file_name: &str) -> bool
     let dest_path = dest_dir.join(file_name);
     make_executable(&dest_path);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A canonicalized path handed to a spawned ephpm must not carry Windows'
+    /// verbatim prefix — PHP's `open_basedir` rejects it and every script under
+    /// the docroot 500s (issue #367).
+    #[test]
+    fn canonicalize_portable_has_no_verbatim_prefix() {
+        let here = canonicalize_portable(Path::new(".")).expect("cwd canonicalizes");
+        assert!(
+            !here.as_os_str().to_string_lossy().starts_with(r"\\?\"),
+            "canonicalize_portable leaked a verbatim prefix: {}",
+            here.display()
+        );
+        assert!(here.is_dir(), "the stripped path must still resolve: {}", here.display());
+    }
+
+    /// Only a verbatim *drive* prefix is unwrapped; a verbatim UNC path has no
+    /// equivalent shorter spelling and must survive untouched.
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_leaves_unc_alone() {
+        let unc = PathBuf::from(r"\\?\UNC\server\share\dir");
+        assert_eq!(strip_verbatim_prefix(unc.clone()), unc);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_unwraps_a_drive() {
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\ci\ephpm\tests\docroot")),
+            PathBuf::from(r"C:\Users\ci\ephpm\tests\docroot")
+        );
+        // Already plain: unchanged.
+        assert_eq!(
+            strip_verbatim_prefix(PathBuf::from(r"C:\Users\ci")),
+            PathBuf::from(r"C:\Users\ci")
+        );
+    }
 }
