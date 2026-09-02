@@ -148,28 +148,51 @@ What is traded: admission adds one semaphore acquire/release per request
 (two uncontended atomics; a mutex-protected waitlist push under saturation).
 Strict FIFO also gives up a micro-locality benefit barging had — the barging
 winner was usually cache-hot on the connection that just completed. Both
-effects are below measurement noise in the verification runs; the throughput
-delta was within ±1%.
+effects are at measurement-noise level in the verification runs; the
+throughput delta was ≈1% (2,282 → 2,256 req/s over four rounds, per-round
+spread wider than the delta).
 
 Fairness invariant pinned by `worker_pool::tests::
 admission_is_strictly_fifo_and_barge_proof`: waiters are admitted in arrival
 order and a dispatcher arriving while others are parked cannot steal a
 freshly freed slot.
 
-## 6. Before/after (same host, same build toolchain, 3 rounds each)
+## 6. Before/after (same host, same build toolchain)
 
 Locally built binaries from the fix's parent commit vs the fix (identical
-toolchain/profile), same bare-process WSL2 setup as §4:
+toolchain/profile), same bare-process WSL2 setup as §4. Four 30-second
+rounds each, interleaved across two sessions; the serving process's
+`/proc/<pid>/exe` was asserted before every round (see §7):
 
-| | req/s (avg) | P50 | P75 | P90 | P99 |
-|---|---|---|---|---|---|
-| parent (barging) | _see PR_ | | | | |
-| fix (FIFO) | _see PR_ | | | | |
+| | req/s (avg) | P50 | P75 | P90 | P99 (per round) | max |
+|---|---|---|---|---|---|---|
+| parent (barging) | 2,282 | 49.3 ms | 80.2 ms | 131 ms | 259 / 280 / 303 / 267 ms | 1.08 s |
+| fix (FIFO) | 2,256 | 43.9 ms | 44.4 ms | 44.9 ms | 46 / 66 / 62 / 62 ms | 67 ms |
 
-(The PR body carries the final table; this doc records the method.)
+The model's prediction held exactly: with strict FIFO the latency
+distribution collapsed to a near-deterministic single lap — P50 *dropped*
+from 49 to 44 ms (the sojourn no longer carries lost-race laps), P90 sits
+within 1 ms of P50, and P99 landed at 1.3× the ideal sojourn — FrankenPHP's
+shape (its P99 ran 1.1× ideal) at a throughput cost of −1.1%, within
+round-to-round noise. The uncontended path is untouched: `-c1` mean
+0.87 → 0.91 ms and P99 1.19 → 1.21 ms (noise). The fix's dispatch-wait
+histogram confirms the mechanism end-to-end: 98.5% of waits in the
+25–50 ms bucket, none above 100 ms — versus the parent's 42.7% sub-1 ms /
+1.2% above-250 ms split.
 
-The prediction from the model: with strict FIFO the wait distribution should
-collapse to a near-deterministic ~1 lap for every request — P50 rising
-slightly (the sub-millisecond barging winners no longer exist), P99 falling
-to ~1.2× the ideal sojourn, throughput unchanged. That is FrankenPHP's
-shape, achieved without giving up the throughput lead.
+## 7. A measurement post-mortem (why this doc exists)
+
+Mid-investigation the A/B numbers went incoherent — the fix appeared to
+work only when Prometheus metrics were enabled, then only on one port, then
+on neither. Every one of those phantom correlations traced to a single
+methodology bug: the A/B binaries were named `ephpm-parent` / `ephpm-fix`,
+and the harness's `pkill -x ephpm` matched neither, so a stale *parent*
+server kept port 8000 for an hour while freshly started servers died on
+`Address already in use` and wrk kept measuring the stale process. Fat
+tail on 8000 (stale barging binary), tight tail on 8001 (stale fix
+binary) — regardless of which binary the harness believed it was testing.
+
+The rule that fixed it, worth keeping: **a benchmark result is only
+attributable to a server after asserting which process served it** — check
+the listener's PID and `/proc/<pid>/exe` after startup, and fail the run on
+a bind error instead of proceeding.
