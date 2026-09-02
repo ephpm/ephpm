@@ -195,7 +195,9 @@ Rejecting `%2F` / `%5C` is what keeps percent encoding from being used to sneak 
 
 The static file `ETag` support only covers non-PHP assets. PHP frameworks (WordPress, Laravel) generate their own `ETag` headers for dynamic content, but without help every request still hits PHP to compute whether the content changed.
 
-**Implemented:** the ETag-based 304 short-circuit. Configured via `[server.php_etag_cache]` (enabled by default; see `Router::handle` in `crates/ephpm-server/src/router.rs`). When PHP sets an `ETag` on a GET/HEAD response, the server stores it in the KV store keyed by method + path + query string. A repeat request with a matching `If-None-Match` returns `304 Not Modified` without executing PHP at all. In clustered mode the KV entries replicate via gossip, so the short-circuit works across nodes.
+**Implemented:** the ETag-based 304 short-circuit. Configured via `[server.php_etag_cache]` (**disabled by default** — `enabled = false`; see `Router::handle` in `crates/ephpm-server/src/router.rs`). When PHP sets an `ETag` on a GET/HEAD response, the server stores it in the KV store keyed by the request's canonical site key + method + path + query string. A repeat request with a matching `If-None-Match` returns `304 Not Modified` without executing PHP at all. In clustered mode the KV entries replicate via gossip, so the short-circuit works across nodes.
+
+The site key is load-bearing on a multi-tenant node. The cache lives in the process-wide KV store, so before the key carried a site component (issue #366) `tenant-a.example/index.php` and `tenant-b.example/index.php` shared one entry — and that entry decides a `304`, so one tenant's content hash could answer the other's conditional request. The key is the canonical value `Router::resolve_site` returned, never re-derived from the `Host` header, so it names the same tenant as the per-site database, the KV keyspace and the OPcache vhost. A host that matched no vhost gets an **empty** site component, which is deliberately not a spellable vhost name — so the unmatched-host bucket can never be reached by naming a site.
 
 **Future work:** full-response caching (serving the cached body on requests without `If-None-Match`), which would turn ePHPm into an edge cache — see the design decisions below.
 
@@ -204,7 +206,8 @@ The static file `ETag` support only covers non-PHP assets. PHP frameworks (WordP
 ```
 1. First request: /blog/hello
    → PHP executes, returns response with ETag: "abc123"
-   → Server stores in KV: <key_prefix><method>:<path>?<query> → "abc123" (with TTL)
+   → Server stores in KV: <key_prefix><site>:<method>:<path>?<query> → "abc123" (with TTL)
+     (<site> = canonical site key; empty on a single-site node, e.g. `etag::GET:/blog/hello`)
    → Response sent to client
 
 2. Repeat request: /blog/hello + If-None-Match: "abc123"

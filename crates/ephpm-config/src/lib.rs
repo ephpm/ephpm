@@ -895,8 +895,11 @@ pub struct PhpETagCacheConfig {
     /// # Via RESP CLI (if redis_compat enabled):
     /// redis-cli DEL "etag:*"
     ///
-    /// # Via native PHP function:
-    /// ephpm_kv_del("etag:GET:/api/endpoint");
+    /// # Via native PHP function (single-site — note the empty site component):
+    /// ephpm_kv_del("etag::GET:/api/endpoint");
+    ///
+    /// # Multi-tenant (`sites_dir`): the vhost's canonical site key is in the key.
+    /// ephpm_kv_del("etag:blog:GET:/api/endpoint");
     /// ```
     ///
     /// Default: `300` (5 minutes).
@@ -905,8 +908,18 @@ pub struct PhpETagCacheConfig {
 
     /// Key prefix for `ETag` entries in the KV store.
     ///
-    /// `ETag`s are stored with keys like `{prefix}{method}:{path}?{query}`.
+    /// `ETag`s are stored with keys like `{prefix}{site}:{method}:{path}?{query}`.
     /// This allows organizing `ETag` data separately from other KV entries.
+    ///
+    /// `{site}` is the request's **canonical site key** — the vhost directory
+    /// name [`crate`]'s router resolved, the same identity that selects the
+    /// per-site database and KV keyspace. It is **empty** for a request that
+    /// matched no virtual host, which is every request on a single-site node
+    /// (so the key reads `etag::GET:/index.php` there). The site component
+    /// exists because this cache lives in the process-wide store: without it,
+    /// two vhosts serving the same path shared one entry and one tenant's
+    /// content hash could answer another tenant's `If-None-Match` with a
+    /// `304` (issue #366).
     ///
     /// Default: `"etag:"`.
     #[serde(default = "default_php_etag_cache_prefix")]

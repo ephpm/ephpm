@@ -85,7 +85,7 @@ Knobs that were *removed* but are still honoured for upgrades — `[db.sqlite.sq
 |-----|------|---------|-------------|
 | `enabled` | bool | `false` | Cache PHP-emitted ETags in the KV store; serve 304s without re-running PHP. |
 | `ttl_secs` | i64 | `300` | TTL for cached entries. `<=0` means cache indefinitely. |
-| `key_prefix` | string | `"etag:"` | KV key prefix for cached entries. |
+| `key_prefix` | string | `"etag:"` | KV key prefix for cached entries. Full key is `{prefix}{site}:{method}:{path}?{query}`, where `{site}` is the request's canonical site key (empty for a host matching no vhost — i.e. always empty on a single-site node). |
 
 ### `[server.security]`
 
