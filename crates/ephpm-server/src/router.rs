@@ -1016,8 +1016,23 @@ impl Router {
                     thread_count = thread_count,
                 );
             }
-            Some(crate::fpm_pool::FpmPool::spawn(thread_count, backlog))
+            Some(crate::fpm_pool::FpmPool::spawn(thread_count, backlog, config.php.admission))
         } else {
+            // add-config-knob: `[php] admission` only governs the ePHPm-owned
+            // dispatch queues (worker pool / fpm pool engine). The default
+            // spawn_blocking fpm engine waits in tokio's own machinery (the
+            // `workers` semaphore is already FIFO-fair; the blocking queue is
+            // unbounded), so a non-default value there must never be a silent
+            // no-op. Worker mode passes the knob to its pool in `serve()`.
+            if !config.php.is_worker_mode()
+                && config.php.admission == ephpm_config::AdmissionPolicy::Barge
+            {
+                tracing::warn!(
+                    "[php] admission = \"barge\" is ignored with fpm_engine = \
+                     \"spawn_blocking\" — it only governs the dispatch queues of the \
+                     worker pool and the dedicated fpm pool engine"
+                );
+            }
             None
         };
 
@@ -6622,6 +6637,7 @@ mod tests {
             4,
             Duration::from_secs(30),
             Duration::from_secs(60),
+            ephpm_config::AdmissionPolicy::Fifo,
         );
         let router = Router::new(&config, test_store(), None, None, None, None, Some(pool));
         let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
@@ -6831,6 +6847,7 @@ mod tests {
             4,
             Duration::from_secs(30),
             Duration::from_secs(60),
+            ephpm_config::AdmissionPolicy::Fifo,
         );
         let router = Router::new(&config, test_store(), None, None, None, None, Some(pool))
             .with_request_log(Some(Arc::new(crate::timeline::RequestLog::new(8))));
@@ -7114,6 +7131,7 @@ mod tests {
             4,
             Duration::from_secs(30),
             Duration::from_secs(60),
+            ephpm_config::AdmissionPolicy::Fifo,
         );
         let router = Router::new(&config, test_store(), None, None, None, None, Some(pool))
             .with_request_log(Some(Arc::new(crate::timeline::RequestLog::new(8))));
@@ -7161,6 +7179,7 @@ mod tests {
             4,
             Duration::from_secs(30),
             Duration::from_secs(60),
+            ephpm_config::AdmissionPolicy::Fifo,
         );
         // No `with_request_log`: the serve-mode default, timeline disabled.
         let router = Router::new(&config, test_store(), None, None, None, None, Some(pool));

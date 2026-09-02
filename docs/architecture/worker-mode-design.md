@@ -230,6 +230,9 @@ classic async-producer / sync-consumer MPMC queue.
   the channel full. The channel choice above still stands — it remains the
   async-producer/sync-consumer hand-off — it just no longer doubles as the
   wait queue. See `worker-dispatch-fairness.md` for the full investigation.
+  The discipline is selectable: `[php] admission = "fifo"` (default) or
+  `"barge"`, which restores the pre-#442-fix `send().await` wait as an
+  operator escape hatch (`worker-dispatch-fairness.md` §5.1).
 - *Rejected:* `tokio::sync::mpsc` — its `Receiver` is async-only; a blocking
   worker thread would have to `block_on` a per-thread current-thread runtime to
   poll it, which is wasteful and error-prone. `crossbeam-channel` is sync-only

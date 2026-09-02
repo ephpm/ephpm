@@ -777,6 +777,7 @@ async fn bind_listeners(
             // the idle timeout aborts the stream (frees the worker thread) —
             // same idleness contract the connection layer applies.
             Duration::from_secs(config.server.timeouts.idle),
+            config.php.admission,
         );
         Some(pool)
     } else {

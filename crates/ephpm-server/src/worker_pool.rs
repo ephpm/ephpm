@@ -29,10 +29,42 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use ephpm_config::AdmissionPolicy;
 use ephpm_php::PhpRuntime;
 use ephpm_php::worker_bridge::{WorkerJob, WorkerRequestOwned, WorkerResponse};
 use metrics::{counter, gauge, histogram};
 use tokio::sync::oneshot;
+
+/// Rolls back a queue-depth increment on drop unless [`Self::defuse`]d.
+///
+/// The barge admission path (`[php] admission = "barge"`) increments the
+/// depth counter *before* an awaitable `send()` — the pre-#443 discipline, so
+/// a worker pulling concurrently can only ever decrement a value already
+/// added — but that `send().await` is a cancellation point (the outer request
+/// timeout drops the dispatch future). Without this guard a cancelled send
+/// would leak the increment into the depth gauge forever. The FIFO path has
+/// no await between increment and enqueue and does not need it.
+pub(crate) struct DepthRollback<'a>(Option<&'a AtomicUsize>);
+
+impl<'a> DepthRollback<'a> {
+    /// Arm a rollback of one increment on `depth`.
+    pub(crate) fn new(depth: &'a AtomicUsize) -> Self {
+        Self(Some(depth))
+    }
+
+    /// The job entered the queue — the increment stands (the puller undoes it).
+    pub(crate) fn defuse(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for DepthRollback<'_> {
+    fn drop(&mut self) {
+        if let Some(depth) = self.0 {
+            depth.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
 
 /// The dispatch channel is closed (pool draining or all workers gone). The
 /// router turns this into a 503.
@@ -74,6 +106,12 @@ pub struct WorkerPool {
     /// it pulls the job, keeping the queue refill pipeline — and therefore
     /// throughput — identical to the old barging behaviour.
     admission: Arc<tokio::sync::Semaphore>,
+    /// Which admission discipline [`WorkerPool::dispatch`] uses
+    /// (`[php] admission`): `Fifo` waits on [`WorkerPool::admission`] in
+    /// strict arrival order (the #443 fix); `Barge` restores the pre-#443
+    /// path — wait in the bounded channel's own `send().await`, which lets
+    /// fresh dispatchers steal freed slots ahead of parked waiters.
+    admission_policy: AdmissionPolicy,
     /// Shared runtime state (readiness, liveness, drain flag).
     state: Arc<PoolState>,
     /// Worker entrypoint script (absolute, validated under document_root).
@@ -120,6 +158,7 @@ impl WorkerPool {
         backlog: usize,
         boot_timeout: Duration,
         stream_send_timeout: Duration,
+        admission_policy: AdmissionPolicy,
     ) -> Arc<Self> {
         let (dispatch_tx, dispatch_rx) = async_channel::bounded(backlog.max(1));
         let state = Arc::new(PoolState {
@@ -139,6 +178,7 @@ impl WorkerPool {
             dispatch_rx,
             queue_depth: Arc::new(AtomicUsize::new(0)),
             admission: Arc::new(tokio::sync::Semaphore::new(backlog.max(1))),
+            admission_policy,
             state,
             worker_script,
             max_requests,
@@ -161,6 +201,7 @@ impl WorkerPool {
             max_requests,
             recycle_policy = %recycle_policy,
             backlog = backlog.max(1),
+            admission = admission_policy.as_str(),
             script = %pool.worker_script.display(),
             "worker pool started"
         );
@@ -211,6 +252,9 @@ impl WorkerPool {
         &self,
         request: WorkerRequestOwned,
     ) -> Result<oneshot::Receiver<WorkerResponse>, DispatchClosed> {
+        if self.admission_policy == AdmissionPolicy::Barge {
+            return self.dispatch_barge(request).await;
+        }
         // Wait for a queue slot in strict arrival order. Errors only when
         // `drain()` closed the semaphore.
         let Ok(permit) = Arc::clone(&self.admission).acquire_owned().await else {
@@ -239,6 +283,41 @@ impl WorkerPool {
                 self.queue_depth.fetch_sub(1, Ordering::Relaxed);
                 Err(DispatchClosed)
             }
+        }
+    }
+
+    /// The pre-#443 dispatch path (`[php] admission = "barge"`): wait for a
+    /// queue slot inside the bounded channel's `send().await` instead of the
+    /// FIFO admission semaphore.
+    ///
+    /// A bounded `async_channel` send is a try/listen/retry loop — a fresh
+    /// sender `try_send`s before ever queueing behind parked ones, and a
+    /// notified waiter that loses that race re-registers at the back — so
+    /// admission order is a race, not a queue. Kept selectable as an operator
+    /// escape hatch; see [`WorkerPool::admission`] for why FIFO is the
+    /// default. The job carries `admission: None`, so the worker-side permit
+    /// release in the bridge is a no-op.
+    async fn dispatch_barge(
+        &self,
+        request: WorkerRequestOwned,
+    ) -> Result<oneshot::Receiver<WorkerResponse>, DispatchClosed> {
+        let (tx, rx) = oneshot::channel();
+        let job = WorkerJob { request, respond_to: tx, admission: None };
+        // Account the enqueue before the (awaitable) send so a worker pulling
+        // concurrently can only ever decrement a value we already added. The
+        // rollback guard undoes it if the job never enters the queue — on the
+        // closed-channel error below, or when the outer request timeout
+        // cancels us mid-`send().await`.
+        let depth = self.queue_depth.fetch_add(1, Ordering::Relaxed) + 1;
+        #[allow(clippy::cast_precision_loss)]
+        gauge!("ephpm_worker_dispatch_queue_depth").set(depth as f64);
+        let rollback = DepthRollback::new(&self.queue_depth);
+        match self.dispatch_tx.send(job).await {
+            Ok(()) => {
+                rollback.defuse();
+                Ok(rx)
+            }
+            Err(_) => Err(DispatchClosed),
         }
     }
 
@@ -566,6 +645,7 @@ mod tests {
             4,
             Duration::from_secs(30),
             Duration::from_secs(60),
+            AdmissionPolicy::Fifo,
         );
 
         assert_eq!(pool.ready_count(), 0, "no worker booted, so not ready");
@@ -628,6 +708,7 @@ mod tests {
             1, // backlog of one queue slot => everyone else parks in admission
             Duration::from_secs(30),
             Duration::from_secs(60),
+            AdmissionPolicy::Fifo,
         );
 
         // Fills the single queue slot immediately.
@@ -685,6 +766,90 @@ mod tests {
         );
     }
 
+    /// The mirror of `admission_is_strictly_fifo_and_barge_proof` for
+    /// `[php] admission = "barge"`: the escape hatch must genuinely restore
+    /// the pre-#443 racing admission, not silently keep FIFO. With a parked
+    /// waiter and a freshly freed slot, a brand-new dispatcher's inline
+    /// `send()` `try_send`s first and steals the slot — under FIFO the same
+    /// inline dispatch would park behind the waiter (and this single-threaded
+    /// test would deadlock), so the inline completion *is* the barge proof.
+    #[tokio::test]
+    async fn admission_barge_lets_a_newcomer_steal_a_freed_slot() {
+        let pool = WorkerPool::spawn(
+            PathBuf::from("/nonexistent/worker.php"),
+            0, // no workers: this test plays the worker by pulling dispatch_rx
+            500,
+            1, // one queue slot => the second dispatcher parks in send()
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            AdmissionPolicy::Barge,
+        );
+
+        // Fills the single queue slot immediately.
+        let _rx_a = pool.dispatch(request_with_uri("/a")).await.expect("first dispatch fits");
+
+        // w1 parks inside the bounded channel's send().await.
+        let w1 = {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(async move {
+                pool.dispatch(request_with_uri("/w1")).await.expect("eventually admitted");
+            })
+        };
+        tokio::task::yield_now().await;
+
+        let mut served = Vec::new();
+        let mut pull = || {
+            let job = pool.dispatch_rx.try_recv().expect("a job is queued");
+            pool.queue_depth.fetch_sub(1, Ordering::Relaxed);
+            served.push(job.request.uri.clone());
+            drop(job);
+        };
+
+        // Free the slot. w1 is *notified* but has not run yet — and a
+        // brand-new dispatcher arriving right now steals the freed slot
+        // inline, completing without ever waiting.
+        pull();
+        let _rx_late = pool
+            .dispatch(request_with_uri("/late"))
+            .await
+            .expect("a newcomer takes the freed slot ahead of the parked waiter");
+
+        // w1 wakes, loses the race (queue full again), and re-parks; only the
+        // next freed slot admits it.
+        tokio::task::yield_now().await;
+        assert!(!w1.is_finished(), "the parked waiter must still be waiting after being lapped");
+        pull();
+        tokio::task::yield_now().await;
+        pull();
+        w1.await.expect("the lapped waiter is eventually admitted");
+
+        assert_eq!(
+            served,
+            vec!["/a", "/late", "/w1"],
+            "barge admission must let the newcomer overtake the parked waiter"
+        );
+    }
+
+    /// Barge dispatch against a drained pool errors and rolls back its depth
+    /// increment — the same accounting invariant the FIFO path pins, but on
+    /// the barge path the increment happens *before* an awaitable send, so
+    /// the rollback guard is what keeps the gauge honest.
+    #[tokio::test]
+    async fn barge_failed_dispatch_does_not_leak_queue_depth() {
+        let pool = WorkerPool::spawn(
+            PathBuf::from("/nonexistent/worker.php"),
+            0,
+            500,
+            4,
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            AdmissionPolicy::Barge,
+        );
+        pool.drain();
+        assert!(pool.dispatch(dummy_request()).await.is_err());
+        assert_eq!(pool.queue_depth(), 0, "failed barge enqueue must roll back the increment");
+    }
+
     /// The counter-pair depth gauge tracks enqueues. With no workers to pull
     /// (stub mode), each successful dispatch leaves the job in the channel and
     /// the depth counter reflects it — replacing the per-dispatch
@@ -698,6 +863,7 @@ mod tests {
             4, // backlog: room for a few queued jobs
             Duration::from_secs(30),
             Duration::from_secs(60),
+            AdmissionPolicy::Fifo,
         );
         assert_eq!(pool.queue_depth(), 0);
 
@@ -718,6 +884,7 @@ mod tests {
             4,
             Duration::from_secs(30),
             Duration::from_secs(60),
+            AdmissionPolicy::Fifo,
         );
         pool.drain(); // closes the sender
         assert!(pool.dispatch(dummy_request()).await.is_err());
