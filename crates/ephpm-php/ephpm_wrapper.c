@@ -144,7 +144,9 @@ static EPHPM_TLS char *output_buf = NULL;
 static EPHPM_TLS size_t output_len = 0;
 static EPHPM_TLS size_t output_cap = 0;
 
-/* Response header buffer — "Name: Value\n" lines after script execution */
+/* Response header capture — name/value bytes land here back-to-back after
+ * script execution; the hdr_spans array (defined with the capture helpers
+ * below) records where each header's name and value live (issue #134). */
 
 static EPHPM_TLS char *headers_buf = NULL;
 static EPHPM_TLS size_t headers_buf_len = 0;
@@ -558,7 +560,12 @@ static void ephpm_sapi_log_message(const char *message, int syslog_type_int)
  * Capture response headers from PHP's SAPI globals into our buffer.
  * Must be called after script execution, while the request is still active.
  *
- * Headers are stored as "Name: Value\n" lines for Rust to parse.
+ * Issue #134: headers used to be flattened into "Name: Value\n" text that
+ * Rust then re-parsed line by line. They are now captured pre-split: the
+ * name and value bytes go into the reusable headers_buf back-to-back, and a
+ * parallel span array records where each one lives, so the Rust side reads
+ * (ptr, len) pairs via ephpm_get_response_header() with no re-parsing (and
+ * no framing to corrupt).
  */
 static void headers_buf_append(const char *data, size_t len)
 {
@@ -573,9 +580,71 @@ static void headers_buf_append(const char *data, size_t len)
     headers_buf_len += len;
 }
 
+/* One captured response header: offsets into headers_buf (offsets, not
+ * pointers, because headers_buf can realloc while the capture runs). */
+typedef struct {
+    size_t name_off;
+    size_t name_len;
+    size_t value_off;
+    size_t value_len;
+} ephpm_hdr_span;
+
+static EPHPM_TLS ephpm_hdr_span *hdr_spans = NULL;
+static EPHPM_TLS size_t hdr_span_count = 0;
+static EPHPM_TLS size_t hdr_span_cap = 0;
+
+/* Copy one (name, value) pair into headers_buf and record its span. */
+static void capture_one_header(const char *name, size_t name_len,
+                               const char *value, size_t value_len)
+{
+    if (hdr_span_count == hdr_span_cap) {
+        size_t new_cap = hdr_span_cap ? hdr_span_cap * 2 : 16;
+        ephpm_hdr_span *grown = realloc(hdr_spans, new_cap * sizeof(*grown));
+        if (!grown) return;
+        hdr_spans = grown;
+        hdr_span_cap = new_cap;
+    }
+    ephpm_hdr_span *s = &hdr_spans[hdr_span_count];
+    s->name_off = headers_buf_len;
+    s->name_len = name_len;
+    headers_buf_append(name, name_len);
+    s->value_off = headers_buf_len;
+    s->value_len = value_len;
+    headers_buf_append(value, value_len);
+    /* headers_buf_append fails silently on OOM; commit the span only if both
+     * appends really landed, so a span can never claim bytes the buffer does
+     * not hold (the Rust side trusts these lengths). */
+    if (headers_buf_len == s->name_off + name_len + value_len) {
+        hdr_span_count++;
+    }
+}
+
+/* Split one raw "Name: Value" header line (the shape PHP stores in
+ * SG(sapi_headers).headers) and capture it. Splits on the first ':' and
+ * skips the customary space(s) after it. A line with no colon at all is
+ * dropped — the Rust side never accepted one anyway (it cannot become an
+ * HTTP header). Returns 1 if the line was a Content-Type header. */
+static int capture_split_header_line(const char *line, size_t len)
+{
+    const char *colon = memchr(line, ':', len);
+    if (!colon) {
+        return 0;
+    }
+    size_t name_len = (size_t)(colon - line);
+    const char *value = colon + 1;
+    size_t value_len = len - name_len - 1;
+    while (value_len > 0 && (*value == ' ' || *value == '\t')) {
+        value++;
+        value_len--;
+    }
+    capture_one_header(line, name_len, value, value_len);
+    return name_len == 12 && strncasecmp(line, "Content-Type", 12) == 0;
+}
+
 static void capture_response_headers(void)
 {
     headers_buf_len = 0;
+    hdr_span_count = 0;
     int has_content_type = 0;
 
     zend_llist_position pos;
@@ -583,15 +652,9 @@ static void capture_response_headers(void)
         zend_llist_get_first_ex(&SG(sapi_headers).headers, &pos);
 
     while (h) {
-        headers_buf_append(h->header, h->header_len);
-        headers_buf_append("\n", 1);
-
-        if (!has_content_type &&
-            h->header_len > 13 &&
-            strncasecmp(h->header, "Content-Type:", 13) == 0) {
+        if (capture_split_header_line(h->header, h->header_len)) {
             has_content_type = 1;
         }
-
         h = (sapi_header_struct *)
             zend_llist_get_next_ex(&SG(sapi_headers).headers, &pos);
     }
@@ -602,11 +665,9 @@ static void capture_response_headers(void)
      * or fall back to SG(default_mimetype) + SG(default_charset). */
     if (!has_content_type) {
         if (SG(sapi_headers).mimetype) {
-            const char *prefix = "Content-Type: ";
-            headers_buf_append(prefix, strlen(prefix));
-            headers_buf_append(SG(sapi_headers).mimetype,
+            capture_one_header("Content-Type", 12,
+                               SG(sapi_headers).mimetype,
                                strlen(SG(sapi_headers).mimetype));
-            headers_buf_append("\n", 1);
         } else {
             const char *mime = SG(default_mimetype);
             const char *charset = SG(default_charset);
@@ -615,13 +676,12 @@ static void capture_response_headers(void)
             int ct_len;
             if (charset && *charset) {
                 ct_len = snprintf(ct_buf, sizeof(ct_buf),
-                    "Content-Type: %s; charset=%s\n", mime, charset);
+                    "%s; charset=%s", mime, charset);
             } else {
-                ct_len = snprintf(ct_buf, sizeof(ct_buf),
-                    "Content-Type: %s\n", mime);
+                ct_len = snprintf(ct_buf, sizeof(ct_buf), "%s", mime);
             }
             if (ct_len > 0 && (size_t)ct_len < sizeof(ct_buf)) {
-                headers_buf_append(ct_buf, (size_t)ct_len);
+                capture_one_header("Content-Type", 12, ct_buf, (size_t)ct_len);
             }
         }
     }
@@ -723,6 +783,12 @@ void ephpm_thread_shutdown(void)
         headers_buf = NULL;
         headers_buf_len = 0;
         headers_buf_cap = 0;
+    }
+    if (hdr_spans) {
+        free(hdr_spans);
+        hdr_spans = NULL;
+        hdr_span_count = 0;
+        hdr_span_cap = 0;
     }
 
     /* Unregister from TSRM */
@@ -902,6 +968,7 @@ void ephpm_request_clear(void)
 {
     output_len = 0;
     headers_buf_len = 0;
+    hdr_span_count = 0;
     response_status_code = 200;
     req_method = NULL;
     req_uri = NULL;
@@ -1300,6 +1367,7 @@ int ephpm_execute_request(const char *filename)
      * the request body from the start. */
     output_len = 0;
     headers_buf_len = 0;
+    hdr_span_count = 0;
     req_post_data_offset = 0;
 
     /* Populate SG(request_info) BEFORE php_request_startup().
@@ -1567,14 +1635,33 @@ int ephpm_get_response_code(void)
 }
 
 /*
- * Get the captured response headers buffer.
- * Headers are stored as "Name: Value\n" lines.
- * Returns a pointer to the buffer and sets *out_len to the length.
+ * Number of response headers captured for the request just executed
+ * (issue #134 — structured access, replacing the "Name: Value\n" blob).
  */
-const char *ephpm_get_response_headers(size_t *out_len)
+size_t ephpm_get_response_header_count(void)
 {
-    *out_len = headers_buf_len;
-    return headers_buf;
+    return hdr_span_count;
+}
+
+/*
+ * Fetch one captured response header by index as (ptr, len) pairs pointing
+ * into the thread-local capture buffer. Valid until the next request is
+ * cleared/executed on this thread — the caller copies immediately.
+ * Returns 1 on success, 0 for an out-of-range index.
+ */
+int ephpm_get_response_header(size_t idx,
+                              const char **name, size_t *name_len,
+                              const char **value, size_t *value_len)
+{
+    if (idx >= hdr_span_count) {
+        return 0;
+    }
+    const ephpm_hdr_span *s = &hdr_spans[idx];
+    *name = headers_buf + s->name_off;
+    *name_len = s->name_len;
+    *value = headers_buf + s->value_off;
+    *value_len = s->value_len;
+    return 1;
 }
 
 /* ===================================================================
@@ -1918,9 +2005,15 @@ typedef struct {
     /* Block until the next request. On return: 1 = request available (req
      * filled), 0 = graceful shutdown (worker returns from its loop). */
     int (*take_request)(EphpmWorkerRequest *req);
-    /* Hand back the response. headers packed as "Name: Value\n" lines. */
+    /* Hand back the response. Headers pass as parallel (ptr, len) arrays —
+     * `count` entries each — valid for the duration of the call (issue #134;
+     * they used to be packed into "Name: Value\n" text that Rust re-parsed). */
     void (*send_response)(int status,
-                          const char *headers, size_t headers_len,
+                          const char *const *header_names,
+                          const size_t *header_name_lens,
+                          const char *const *header_values,
+                          const size_t *header_value_lens,
+                          size_t header_count,
                           const char *body, size_t body_len);
 
     /* ── Phase 3: streaming bodies ──────────────────────────────────
@@ -1933,11 +2026,15 @@ typedef struct {
      * body so the same read path works both ways. */
     long (*body_read)(char *buf, size_t cap);
 
-    /* Begin a streaming response: status + packed headers, no body yet. The
-     * hyper handler builds a streamed response body from the chunks that
-     * follow. */
+    /* Begin a streaming response: status + headers (same parallel-array
+     * shape as send_response), no body yet. The hyper handler builds a
+     * streamed response body from the chunks that follow. */
     void (*response_begin)(int status,
-                           const char *headers, size_t headers_len);
+                           const char *const *header_names,
+                           const size_t *header_name_lens,
+                           const char *const *header_values,
+                           const size_t *header_value_lens,
+                           size_t header_count);
     /* Push one response body chunk. Blocks on backpressure (bounded channel).
      * Returns 0 on success, negative if the client/receiver went away (the
      * worker should stop producing). */
@@ -1968,6 +2065,7 @@ void ephpm_worker_reset_request(void)
     /* Thread-local C capture buffers. */
     output_len = 0;
     headers_buf_len = 0;
+    hdr_span_count = 0;
 
     /* Drop headers emitted by the previous response so they don't accumulate
      * (fpm gets this free from php_request_shutdown). */
@@ -2322,23 +2420,70 @@ PHP_FUNCTION(ephpm_worker_take_request)
     }
 }
 
-/* Append one "Name: Value\n" line to the packed header buffer. */
-static void ephpm_worker_pack_header_line(smart_str *out, zend_string *key, zval *val)
+/* Flattened view of a PHP headers array as the parallel (ptr, len) arrays
+ * the worker ops take (issue #134 — replaces the "Name: Value\n" pack that
+ * the Rust side then re-parsed). Name pointers borrow the array's own
+ * zend_string keys; value pointers borrow zend_strings produced by
+ * zval_get_string, which `owned` keeps alive until ephpm_worker_hdrs_free.
+ * Everything is valid exactly for the duration of one ops callback. */
+typedef struct {
+    const char **names;
+    size_t      *name_lens;
+    const char **values;
+    size_t      *value_lens;
+    zend_string **owned;
+    size_t       count;
+} ephpm_worker_hdrs;
+
+/* Count the header lines an array will produce: one per string-keyed scalar,
+ * one per element of a string-keyed list (the multi-value header contract,
+ * e.g. ['Set-Cookie' => [$c1, $c2]] emits two Set-Cookie entries). */
+static size_t ephpm_worker_count_headers(zval *headers_arr)
 {
-    zend_string *vstr = zval_get_string(val);
-    smart_str_appendl(out, ZSTR_VAL(key), ZSTR_LEN(key));
-    smart_str_appendl(out, ": ", 2);
-    smart_str_appendl(out, ZSTR_VAL(vstr), ZSTR_LEN(vstr));
-    smart_str_appendc(out, '\n');
-    zend_string_release(vstr);
+    size_t n = 0;
+    zend_string *hkey;
+    zval *hval;
+    ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(headers_arr), hkey, hval) {
+        if (!hkey) {
+            continue; /* skip numeric keys */
+        }
+        ZVAL_DEREF(hval);
+        if (Z_TYPE_P(hval) == IS_ARRAY) {
+            n += zend_hash_num_elements(Z_ARRVAL_P(hval));
+        } else {
+            n++;
+        }
+    } ZEND_HASH_FOREACH_END();
+    return n;
 }
 
-/* Pack a PHP headers array into "Name: Value\n" lines. A list value packs one
- * line per element — the multi-value header contract (e.g.
- * ['Set-Cookie' => [$c1, $c2]] emits two Set-Cookie lines, which the Rust side
- * forwards as two distinct wire headers). Caller frees the smart_str. */
-static void ephpm_worker_pack_headers(smart_str *out, zval *headers_arr)
+static void ephpm_worker_hdrs_push(ephpm_worker_hdrs *out,
+                                   zend_string *key, zval *val)
 {
+    zend_string *vstr = zval_get_string(val);
+    out->names[out->count] = ZSTR_VAL(key);
+    out->name_lens[out->count] = ZSTR_LEN(key);
+    out->values[out->count] = ZSTR_VAL(vstr);
+    out->value_lens[out->count] = ZSTR_LEN(vstr);
+    out->owned[out->count] = vstr;
+    out->count++;
+}
+
+/* Build the flattened view. Caller must pair with ephpm_worker_hdrs_free
+ * after the ops callback returns. Zero headers => NULL arrays, count 0. */
+static void ephpm_worker_hdrs_build(ephpm_worker_hdrs *out, zval *headers_arr)
+{
+    memset(out, 0, sizeof(*out));
+    size_t cap = ephpm_worker_count_headers(headers_arr);
+    if (cap == 0) {
+        return;
+    }
+    out->names = emalloc(cap * sizeof(*out->names));
+    out->name_lens = emalloc(cap * sizeof(*out->name_lens));
+    out->values = emalloc(cap * sizeof(*out->values));
+    out->value_lens = emalloc(cap * sizeof(*out->value_lens));
+    out->owned = emalloc(cap * sizeof(*out->owned));
+
     zend_string *hkey;
     zval *hval;
     ZEND_HASH_FOREACH_STR_KEY_VAL(Z_ARRVAL_P(headers_arr), hkey, hval) {
@@ -2349,22 +2494,37 @@ static void ephpm_worker_pack_headers(smart_str *out, zval *headers_arr)
         if (Z_TYPE_P(hval) == IS_ARRAY) {
             zval *item;
             ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(hval), item) {
+                if (out->count == cap) {
+                    break; /* array mutated under us — never overrun */
+                }
                 ZVAL_DEREF(item);
-                ephpm_worker_pack_header_line(out, hkey, item);
+                ephpm_worker_hdrs_push(out, hkey, item);
             } ZEND_HASH_FOREACH_END();
-        } else {
-            ephpm_worker_pack_header_line(out, hkey, hval);
+        } else if (out->count < cap) {
+            ephpm_worker_hdrs_push(out, hkey, hval);
         }
     } ZEND_HASH_FOREACH_END();
-    smart_str_0(out);
+}
+
+static void ephpm_worker_hdrs_free(ephpm_worker_hdrs *out)
+{
+    for (size_t i = 0; i < out->count; i++) {
+        zend_string_release(out->owned[i]);
+    }
+    if (out->names)      efree(out->names);
+    if (out->name_lens)  efree(out->name_lens);
+    if (out->values)     efree(out->values);
+    if (out->value_lens) efree(out->value_lens);
+    if (out->owned)      efree(out->owned);
+    memset(out, 0, sizeof(*out));
 }
 
 /* PHP_FUNCTION: \Ephpm\Worker\send_response(int, array, string): void
  *
  * Concatenates any captured output_buf (echo path) with the explicit $body,
- * packs the $headers array into "Name: Value\n" lines (list values become one
- * line per element), and hands both to the Rust send_response callback (which
- * fulfils the parked oneshot). */
+ * flattens the $headers array into parallel (ptr, len) arrays (list values
+ * become one entry per element), and hands both to the Rust send_response
+ * callback (which fulfils the parked oneshot). */
 PHP_FUNCTION(ephpm_worker_send_response)
 {
     zend_long status;
@@ -2382,26 +2542,28 @@ PHP_FUNCTION(ephpm_worker_send_response)
         return;
     }
 
-    smart_str hbuf = {0};
-    ephpm_worker_pack_headers(&hbuf, headers_arr);
+    ephpm_worker_hdrs hdrs;
+    ephpm_worker_hdrs_build(&hdrs, headers_arr);
 
     /* Concatenate captured echo output (if any) + explicit $body. */
-    const char *hdr_ptr = hbuf.s ? ZSTR_VAL(hbuf.s) : "";
-    size_t hdr_len = hbuf.s ? ZSTR_LEN(hbuf.s) : 0;
-
     if (output_len > 0) {
         smart_str bbuf = {0};
         smart_str_appendl(&bbuf, output_buf, output_len);
         smart_str_appendl(&bbuf, body, body_len);
         smart_str_0(&bbuf);
-        g_worker_ops.send_response((int)status, hdr_ptr, hdr_len,
+        g_worker_ops.send_response((int)status,
+                                   hdrs.names, hdrs.name_lens,
+                                   hdrs.values, hdrs.value_lens, hdrs.count,
                                    ZSTR_VAL(bbuf.s), ZSTR_LEN(bbuf.s));
         smart_str_free(&bbuf);
     } else {
-        g_worker_ops.send_response((int)status, hdr_ptr, hdr_len, body, body_len);
+        g_worker_ops.send_response((int)status,
+                                   hdrs.names, hdrs.name_lens,
+                                   hdrs.values, hdrs.value_lens, hdrs.count,
+                                   body, body_len);
     }
 
-    smart_str_free(&hbuf);
+    ephpm_worker_hdrs_free(&hdrs);
 
     /* Clear the captured output so it does not bleed into the next response
      * (the reset at the top of the next take_request also clears it, but this
@@ -2446,13 +2608,12 @@ PHP_FUNCTION(ephpm_worker_send_response_stream)
         return;
     }
 
-    smart_str hbuf = {0};
-    ephpm_worker_pack_headers(&hbuf, headers_arr);
-    const char *hdr_ptr = hbuf.s ? ZSTR_VAL(hbuf.s) : "";
-    size_t hdr_len = hbuf.s ? ZSTR_LEN(hbuf.s) : 0;
-
-    g_worker_ops.response_begin((int)status, hdr_ptr, hdr_len);
-    smart_str_free(&hbuf);
+    ephpm_worker_hdrs hdrs;
+    ephpm_worker_hdrs_build(&hdrs, headers_arr);
+    g_worker_ops.response_begin((int)status,
+                                hdrs.names, hdrs.name_lens,
+                                hdrs.values, hdrs.value_lens, hdrs.count);
+    ephpm_worker_hdrs_free(&hdrs);
 
     /* Flush any buffered echo output first. */
     if (output_len > 0) {
@@ -2897,16 +3058,37 @@ int ephpm_worker_run(const char *script)
                  * capture has. */
             } zend_end_try();
 
-            smart_str hbuf = {0};
+            /* Split the SAPI header lines through the same capture machinery
+             * the fpm path uses (headers_buf + hdr_spans are ours to reuse:
+             * the next take_request resets them anyway), then materialize the
+             * parallel arrays the ops callback takes. Unlike the fpm path,
+             * no default Content-Type is synthesized here — this fallback
+             * always delivered exactly what the script emitted. */
+            headers_buf_len = 0;
+            hdr_span_count = 0;
             zend_llist_position pos;
             sapi_header_struct *h =
                 zend_llist_get_first_ex(&SG(sapi_headers).headers, &pos);
             while (h) {
-                smart_str_appendl(&hbuf, h->header, h->header_len);
-                smart_str_appendc(&hbuf, '\n');
+                (void)capture_split_header_line(h->header, h->header_len);
                 h = zend_llist_get_next_ex(&SG(sapi_headers).headers, &pos);
             }
-            smart_str_0(&hbuf);
+            const char **hnames = NULL;
+            size_t *hname_lens = NULL;
+            const char **hvalues = NULL;
+            size_t *hvalue_lens = NULL;
+            if (hdr_span_count > 0) {
+                hnames = emalloc(hdr_span_count * sizeof(*hnames));
+                hname_lens = emalloc(hdr_span_count * sizeof(*hname_lens));
+                hvalues = emalloc(hdr_span_count * sizeof(*hvalues));
+                hvalue_lens = emalloc(hdr_span_count * sizeof(*hvalue_lens));
+                for (size_t i = 0; i < hdr_span_count; i++) {
+                    hnames[i] = headers_buf + hdr_spans[i].name_off;
+                    hname_lens[i] = hdr_spans[i].name_len;
+                    hvalues[i] = headers_buf + hdr_spans[i].value_off;
+                    hvalue_lens[i] = hdr_spans[i].value_len;
+                }
+            }
 
             int status = SG(sapi_headers).http_response_code;
             if (status <= 0) {
@@ -2935,11 +3117,17 @@ int ephpm_worker_run(const char *script)
             }
 
             g_worker_ops.send_response(status,
-                                       hbuf.s ? ZSTR_VAL(hbuf.s) : "",
-                                       hbuf.s ? ZSTR_LEN(hbuf.s) : 0,
+                                       hnames, hname_lens,
+                                       hvalues, hvalue_lens, hdr_span_count,
                                        output_buf ? output_buf : "",
                                        output_len);
-            smart_str_free(&hbuf);
+            if (hnames) {
+                efree(hnames);
+                efree(hname_lens);
+                efree(hvalues);
+                efree(hvalue_lens);
+            }
+            hdr_span_count = 0;
             output_len = 0;
             req_in_flight = 0;
             /* 2 = the request died on a fatal (response synthesized as 500);

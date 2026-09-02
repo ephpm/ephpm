@@ -18,7 +18,8 @@
 //! processing. Per-request data is passed from Rust to C via
 //! [`ephpm_request_set_info()`] and [`ephpm_request_add_server_var()`],
 //! and response data is retrieved via [`ephpm_get_output_buf()`],
-//! [`ephpm_get_response_code()`], and [`ephpm_get_response_headers()`].
+//! [`ephpm_get_response_code()`], and the structured header accessors
+//! [`ephpm_get_response_header_count()`] / [`ephpm_get_response_header()`].
 //!
 //! See `ephpm_wrapper.c` for the C implementation and `lib.rs` for the
 //! Rust-side orchestration in [`PhpRuntime::execute_php()`].

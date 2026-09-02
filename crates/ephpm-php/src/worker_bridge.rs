@@ -41,6 +41,8 @@ use std::ffi::CString;
 #[cfg(php_linked)]
 use std::os::raw::{c_char, c_int};
 
+use crate::request::CServerVar;
+
 /// Chunk size / channel bounds shared with the streaming-body plumbing.
 ///
 /// A bounded channel of `BODY_CHANNEL_DEPTH` chunks caps the in-flight buffered
@@ -97,8 +99,10 @@ pub struct WorkerRequestOwned {
     pub content_type: Option<String>,
     /// The request body (buffered or streaming).
     pub body: WorkerBody,
-    /// `$_SERVER`-shaped variables as `(key, value)` pairs.
-    pub server_vars: Vec<(String, String)>,
+    /// `$_SERVER`-shaped variables, already in FFI-ready form (built once by
+    /// `build_server_variables_c` — issue #133; the borrowed
+    /// [`EphpmWorkerRequest`] view points straight into these).
+    pub server_vars: Vec<CServerVar>,
     /// HTTP headers as `(name, value)` pairs.
     pub headers: Vec<(String, String)>,
 }
@@ -247,12 +251,17 @@ pub struct EphpmWorkerOps {
     /// Block for the next request. Returns 1 with `req` filled, or 0 for
     /// graceful shutdown.
     pub take_request: Option<unsafe extern "C" fn(req: *mut EphpmWorkerRequest) -> c_int>,
-    /// Deliver the response. `headers` is `"Name: Value\n"` packed.
+    /// Deliver the response. Headers pass as parallel (ptr, len) arrays of
+    /// `header_count` entries, valid for the duration of the call (issue
+    /// #134 — replaces the `"Name: Value\n"` pack + re-parse round-trip).
     pub send_response: Option<
         unsafe extern "C" fn(
             status: c_int,
-            headers: *const c_char,
-            headers_len: usize,
+            header_names: *const *const c_char,
+            header_name_lens: *const usize,
+            header_values: *const *const c_char,
+            header_value_lens: *const usize,
+            header_count: usize,
             body: *const c_char,
             body_len: usize,
         ),
@@ -263,9 +272,18 @@ pub struct EphpmWorkerOps {
     /// Returns bytes written (0 = EOF, negative = error). Blocks until data or
     /// EOF. Serves the in-memory body when the request was buffered.
     pub body_read: Option<unsafe extern "C" fn(buf: *mut c_char, cap: usize) -> isize>,
-    /// Begin a streaming response (status + packed headers, body chunks follow).
-    pub response_begin:
-        Option<unsafe extern "C" fn(status: c_int, headers: *const c_char, headers_len: usize)>,
+    /// Begin a streaming response (status + headers in the same
+    /// parallel-array shape as `send_response`; body chunks follow).
+    pub response_begin: Option<
+        unsafe extern "C" fn(
+            status: c_int,
+            header_names: *const *const c_char,
+            header_name_lens: *const usize,
+            header_values: *const *const c_char,
+            header_value_lens: *const usize,
+            header_count: usize,
+        ),
+    >,
     /// Push one response body chunk (blocks on backpressure). Returns 0, or
     /// negative if the receiver/client is gone.
     pub response_chunk: Option<unsafe extern "C" fn(buf: *const c_char, len: usize) -> isize>,
@@ -296,8 +314,7 @@ struct CurrentRequest {
     _body: Vec<u8>,
     body_len: usize,
     streaming: bool,
-    _server_keys: Vec<CString>,
-    _server_vals: Vec<CString>,
+    _server_vars: Vec<CServerVar>,
     _header_keys: Vec<CString>,
     _header_vals: Vec<CString>,
     // Pointer arrays into the CString vecs (stable: the vecs are not mutated
@@ -548,13 +565,14 @@ fn build_current_request(job: WorkerRequestOwned) -> (CurrentRequest, BodyReader
     let cookie = cstr(&job.cookie_data);
     let content_type = job.content_type.as_deref().map(cstr);
 
-    let server_keys: Vec<CString> = job.server_vars.iter().map(|(k, _)| cstr(k)).collect();
-    let server_vals: Vec<CString> = job.server_vars.iter().map(|(_, v)| cstr(v)).collect();
+    // $_SERVER arrives already FFI-ready (issue #133) — no re-allocation, just
+    // pointer arrays into the moved-in storage.
+    let server_vars = job.server_vars;
     let header_keys: Vec<CString> = job.headers.iter().map(|(k, _)| cstr(k)).collect();
     let header_vals: Vec<CString> = job.headers.iter().map(|(_, v)| cstr(v)).collect();
 
-    let server_key_ptrs: Vec<*const c_char> = server_keys.iter().map(|c| c.as_ptr()).collect();
-    let server_val_ptrs: Vec<*const c_char> = server_vals.iter().map(|c| c.as_ptr()).collect();
+    let server_key_ptrs: Vec<*const c_char> = server_vars.iter().map(|(k, _)| k.as_ptr()).collect();
+    let server_val_ptrs: Vec<*const c_char> = server_vars.iter().map(|(_, v)| v.as_ptr()).collect();
     let header_key_ptrs: Vec<*const c_char> = header_keys.iter().map(|c| c.as_ptr()).collect();
     let header_val_ptrs: Vec<*const c_char> = header_vals.iter().map(|c| c.as_ptr()).collect();
 
@@ -587,8 +605,7 @@ fn build_current_request(job: WorkerRequestOwned) -> (CurrentRequest, BodyReader
         _body: body_vec,
         body_len,
         streaming,
-        _server_keys: server_keys,
-        _server_vals: server_vals,
+        _server_vars: server_vars,
         _header_keys: header_keys,
         _header_vals: header_vals,
         server_key_ptrs,
@@ -707,25 +724,32 @@ unsafe extern "C" fn worker_take_request(req: *mut EphpmWorkerRequest) -> c_int 
 #[cfg(php_linked)]
 unsafe extern "C" fn worker_send_response(
     status: c_int,
-    headers: *const c_char,
-    headers_len: usize,
+    header_names: *const *const c_char,
+    header_name_lens: *const usize,
+    header_values: *const *const c_char,
+    header_value_lens: *const usize,
+    header_count: usize,
     body: *const c_char,
     body_len: usize,
 ) {
-    // SAFETY: C passes valid (ptr, len) pairs for headers and body; the buffers
-    // live for the duration of this call. A null pointer means zero length.
-    let header_bytes: &[u8] = if headers.is_null() || headers_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(headers.cast::<u8>(), headers_len) }
+    // SAFETY: C passes parallel arrays of `header_count` valid (ptr, len)
+    // pairs, live for the duration of this call (null arrays mean zero
+    // headers); same for the body buffer.
+    let parsed_headers = unsafe {
+        headers_from_raw(
+            header_names,
+            header_name_lens,
+            header_values,
+            header_value_lens,
+            header_count,
+        )
     };
     let body_bytes: Vec<u8> = if body.is_null() || body_len == 0 {
         Vec::new()
     } else {
+        // SAFETY: see above — valid for body_len bytes during this call.
         unsafe { std::slice::from_raw_parts(body.cast::<u8>(), body_len) }.to_vec()
     };
-
-    let parsed_headers = parse_packed_headers(header_bytes);
 
     let status = u16::try_from(status).unwrap_or(200);
     let response = WorkerResponse::Buffered { status, headers: parsed_headers, body: body_bytes };
@@ -828,16 +852,23 @@ unsafe extern "C" fn worker_body_read(buf: *mut c_char, cap: usize) -> isize {
 #[cfg(php_linked)]
 unsafe extern "C" fn worker_response_begin(
     status: c_int,
-    headers: *const c_char,
-    headers_len: usize,
+    header_names: *const *const c_char,
+    header_name_lens: *const usize,
+    header_values: *const *const c_char,
+    header_value_lens: *const usize,
+    header_count: usize,
 ) {
-    // SAFETY: C passes a valid (ptr, len) for the packed headers; null => none.
-    let header_bytes: &[u8] = if headers.is_null() || headers_len == 0 {
-        &[]
-    } else {
-        unsafe { std::slice::from_raw_parts(headers.cast::<u8>(), headers_len) }
+    // SAFETY: C passes parallel arrays of `header_count` valid (ptr, len)
+    // pairs, live for the duration of this call (null arrays => none).
+    let parsed_headers = unsafe {
+        headers_from_raw(
+            header_names,
+            header_name_lens,
+            header_values,
+            header_value_lens,
+            header_count,
+        )
     };
-    let parsed_headers = parse_packed_headers(header_bytes);
     let status = u16::try_from(status).unwrap_or(200);
 
     let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(BODY_CHANNEL_DEPTH);
@@ -920,20 +951,63 @@ unsafe extern "C" fn worker_response_end() {
     finish_iteration();
 }
 
-/// Parse `"Name: Value\n"` packed header lines into `(name, value)` pairs.
+/// Copy the parallel (ptr, len) header arrays C hands to `send_response` /
+/// `response_begin` into owned `(name, value)` pairs (issue #134 — replaces
+/// parsing a `"Name: Value\n"` pack).
+///
+/// Names and values are trimmed of ASCII whitespace, matching what the old
+/// pack-then-parse round trip produced, so downstream header handling sees
+/// identical strings.
+///
+/// # Safety
+///
+/// Either all four arrays are non-null with at least `count` valid entries,
+/// each entry a pointer valid for its recorded length for the duration of
+/// the call — or `count` is 0 (null arrays allowed then).
 #[cfg(php_linked)]
-fn parse_packed_headers(bytes: &[u8]) -> Vec<(String, String)> {
-    String::from_utf8_lossy(bytes)
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim_end_matches('\r');
-            if line.is_empty() {
-                return None;
-            }
-            let (name, value) = line.split_once(':')?;
-            Some((name.trim().to_string(), value.trim().to_string()))
-        })
-        .collect()
+unsafe fn headers_from_raw(
+    names: *const *const c_char,
+    name_lens: *const usize,
+    values: *const *const c_char,
+    value_lens: *const usize,
+    count: usize,
+) -> Vec<(String, String)> {
+    if count == 0
+        || names.is_null()
+        || name_lens.is_null()
+        || values.is_null()
+        || value_lens.is_null()
+    {
+        return Vec::new();
+    }
+    // SAFETY: per the function contract, each array has `count` entries.
+    let (names, name_lens, values, value_lens) = unsafe {
+        (
+            std::slice::from_raw_parts(names, count),
+            std::slice::from_raw_parts(name_lens, count),
+            std::slice::from_raw_parts(values, count),
+            std::slice::from_raw_parts(value_lens, count),
+        )
+    };
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        if names[i].is_null() || values[i].is_null() {
+            continue;
+        }
+        // SAFETY: per the function contract, each pointer is valid for its
+        // recorded length.
+        let (name, value) = unsafe {
+            (
+                std::slice::from_raw_parts(names[i].cast::<u8>(), name_lens[i]),
+                std::slice::from_raw_parts(values[i].cast::<u8>(), value_lens[i]),
+            )
+        };
+        out.push((
+            String::from_utf8_lossy(name).trim().to_string(),
+            String::from_utf8_lossy(value).trim().to_string(),
+        ));
+    }
+    out
 }
 
 // ── Static ops table ─────────────────────────────────────────────────────
@@ -955,20 +1029,64 @@ pub static WORKER_OPS: EphpmWorkerOps = EphpmWorkerOps {
 mod tests {
     use super::*;
 
+    /// Build the parallel arrays from Rust-owned strings and round-trip them
+    /// through [`headers_from_raw`] — the same shapes the C side produces.
+    fn from_pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        let names: Vec<*const c_char> = pairs.iter().map(|(n, _)| n.as_ptr().cast()).collect();
+        let name_lens: Vec<usize> = pairs.iter().map(|(n, _)| n.len()).collect();
+        let values: Vec<*const c_char> = pairs.iter().map(|(_, v)| v.as_ptr().cast()).collect();
+        let value_lens: Vec<usize> = pairs.iter().map(|(_, v)| v.len()).collect();
+        // SAFETY: the arrays all have `pairs.len()` entries pointing into
+        // `pairs`' string data, which outlives the call.
+        unsafe {
+            headers_from_raw(
+                names.as_ptr(),
+                name_lens.as_ptr(),
+                values.as_ptr(),
+                value_lens.as_ptr(),
+                pairs.len(),
+            )
+        }
+    }
+
     #[test]
-    fn parse_packed_headers_basic() {
-        let packed = b"Content-Type: text/plain\nX-Foo: bar\n";
-        let parsed = parse_packed_headers(packed);
+    fn headers_from_raw_basic() {
+        let parsed = from_pairs(&[("Content-Type", "text/plain"), ("X-Foo", "bar")]);
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0], ("Content-Type".to_string(), "text/plain".to_string()));
         assert_eq!(parsed[1], ("X-Foo".to_string(), "bar".to_string()));
     }
 
     #[test]
-    fn parse_packed_headers_skips_blank() {
-        let packed = b"A: 1\n\nB: 2\n";
-        let parsed = parse_packed_headers(packed);
-        assert_eq!(parsed.len(), 2);
+    fn headers_from_raw_trims_like_the_old_parse() {
+        // The old "Name: Value\n" round trip trimmed both halves; header
+        // handling downstream must keep seeing identical strings.
+        let parsed = from_pairs(&[(" X-Padded ", "  spaced out  ")]);
+        assert_eq!(parsed, vec![("X-Padded".to_string(), "spaced out".to_string())]);
+    }
+
+    #[test]
+    fn headers_from_raw_null_arrays_mean_no_headers() {
+        // SAFETY: count 0 permits null arrays per the contract.
+        let parsed = unsafe {
+            headers_from_raw(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            )
+        };
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn headers_from_raw_preserves_value_with_newline() {
+        // The packed form could not carry a value containing '\n' (it broke
+        // the line framing and the remainder was dropped or mis-parsed);
+        // structured passing keeps the bytes intact.
+        let parsed = from_pairs(&[("X-Odd", "line1\nline2")]);
+        assert_eq!(parsed, vec![("X-Odd".to_string(), "line1\nline2".to_string())]);
     }
 
     #[test]
