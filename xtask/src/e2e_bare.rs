@@ -85,9 +85,9 @@ const ISOLATED_DB_SUITES: &[&str] = &[
 ///
 /// `opcache_invalidation` needs `[opcache] cluster_invalidation = true` (off by
 /// default in single-node mode) AND a config where the default document_root
-/// request resolves to the `_default` OPcache vhost -- which means NOT setting
+/// request resolves to the `_DEFAULT` OPcache vhost -- which means NOT setting
 /// `sites_dir` (with a sites_dir configured, the vhost key becomes the request
-/// host `127.0.0.1`, not `_default`, and the test's `opcache:version:_default`
+/// host `127.0.0.1`, not `_DEFAULT`, and the test's `opcache:version:_DEFAULT`
 /// write would never match). See `SingleNodeOptions`.
 /// `rate_limit` is the one suite that *wants* to be throttled: it fires a burst
 /// and asserts a 429. Sharing a token bucket with every other suite made both
@@ -1064,8 +1064,8 @@ struct SingleNodeOptions {
     ///    can run on a `sites_dir` node.
     ///
     /// It also moves the OPcache vhost key for a `127.0.0.1` request from
-    /// `_default` to the request host, which is why `opcache_invalidation`
-    /// (which writes `opcache:version:_default`) must not have it.
+    /// `_DEFAULT` to the request host, which is why `opcache_invalidation`
+    /// (which writes `opcache:version:_DEFAULT`) must not have it.
     with_sites_dir: bool,
     /// Emit `[opcache] cluster_invalidation = true`. Off by default in
     /// single-node mode, so the opcache_invalidation suite needs it turned on
@@ -1181,7 +1181,7 @@ impl SingleNodeOptions {
         let slug = format!("single-{name}");
         match name {
             // opcache_invalidation: enable the watcher, drop sites_dir so the
-            // default docroot resolves to the `_default` OPcache vhost.
+            // default docroot resolves to the `_DEFAULT` OPcache vhost.
             "opcache_invalidation" => Self {
                 slug,
                 with_sites_dir: false,
