@@ -693,8 +693,15 @@ fn resolve_ephpm_binary(args: &[String], php_version: &str) -> Option<PathBuf> {
 /// alternative (a bare `--release`) would recompile the dependency graph into
 /// a second output directory for no benefit.
 fn build_middleware_cdylib() -> Option<PathBuf> {
+    // Every host needs its own branch here. Falling through to the linux-gnu
+    // triple on Windows asked cargo to cross-compile to a target that is not
+    // installed, and the suite died on `can't find crate for core` (issue
+    // #367) — a rustup message, in the middle of an e2e run, for a build that
+    // was only ever meant to be native.
     let host_target = if cfg!(target_os = "macos") {
         format!("{}-apple-darwin", std::env::consts::ARCH)
+    } else if cfg!(windows) {
+        format!("{}-pc-windows-msvc", std::env::consts::ARCH)
     } else {
         format!("{}-unknown-linux-gnu", std::env::consts::ARCH)
     };
