@@ -226,7 +226,11 @@ impl Middleware for MaintenanceMode {
             return Response::cont();
         }
 
-        let key = self.key_for(req.vhost_id());
+        // The canonical site key, not the raw `Host` (issue #390): one flag per
+        // tenant, no matter which of that vhost's names the client used. A host
+        // that matched no vhost has no tenant identity, so it shares the single
+        // `UNMATCHED_VHOST` flag rather than minting one per header value.
+        let key = self.key_for(req.vhost_id().unwrap_or(ephpm_middleware::UNMATCHED_VHOST));
         let host = req.host();
         // `kv_get` returns None for BOTH "absent" and "KV unavailable" — both
         // fall through to CONTINUE. That is the fail-OPEN choice (see the

@@ -2519,6 +2519,7 @@ impl Router {
                         &uri_path,
                         &query_string,
                         effective_addr,
+                        site_key.as_deref(),
                         &host,
                         is_https,
                     ) {
@@ -2602,6 +2603,7 @@ impl Router {
                     &uri_path,
                     &query_string,
                     effective_addr,
+                    site_key.as_deref(),
                     &host,
                     is_https,
                 )
@@ -3043,12 +3045,17 @@ impl Router {
                 let cap = usize::try_from(self.middleware_body_limit).unwrap_or(usize::MAX);
                 &b[..b.len().min(cap)]
             });
+            // The vhost identity handed to modules is the CANONICAL site key
+            // (`""` = matched no vhost, which the accessor turns into NULL) —
+            // never the raw `Host`. Modules use it as a tenant identity in
+            // authorization decisions, so it has to be the same derivation the
+            // database file and KV keyspace use (issue #390).
             let ctx = ephpm_middleware::host::RequestCtx::new(
                 &method,
                 &path,
                 &query_string,
                 &remote_addr.ip().to_string(),
-                &server_name,
+                site_key.as_deref().unwrap_or(""),
                 &headers,
             )
             .with_scheme(is_https)
@@ -4132,6 +4139,7 @@ impl Router {
         path: &str,
         query: &str,
         remote_addr: SocketAddr,
+        site_key: Option<&str>,
         server_name: &str,
         is_https: bool,
     ) -> StaticGate {
@@ -4140,13 +4148,14 @@ impl Router {
         };
         // Static requests carry no buffered body, but scheme/host are still
         // authoritative from the connection (a `force_https` gate on static
-        // assets needs the real scheme).
+        // assets needs the real scheme). The vhost identity is the canonical
+        // site key, exactly as on the PHP path (issue #390).
         let ctx = ephpm_middleware::host::RequestCtx::new(
             method,
             path,
             query,
             &remote_addr.ip().to_string(),
-            server_name,
+            site_key.unwrap_or(""),
             req_headers.unwrap_or(&[]),
         )
         .with_scheme(is_https)
@@ -4181,6 +4190,7 @@ impl Router {
         path: &str,
         query: &str,
         remote_addr: SocketAddr,
+        site_key: Option<&str>,
         server_name: &str,
         is_https: bool,
     ) -> Response<ServerBody> {
@@ -4235,7 +4245,7 @@ impl Router {
             path,
             query,
             &remote_addr.ip().to_string(),
-            server_name,
+            site_key.unwrap_or(""),
             req_headers.unwrap_or(&[]),
         )
         .with_scheme(is_https)

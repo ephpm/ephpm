@@ -220,7 +220,11 @@ impl Middleware for ApiGate {
         // ── RESPOND: fixed-window rate limit (fail-open) ──────────────────
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let window = now / WINDOW_SECS;
-        let key = Self::window_key(req.vhost_id(), tenant, window);
+        // `vhost_id()` is the canonical site key, `None` when the request
+        // matched no vhost. Bucket those together rather than trusting the
+        // header — otherwise varying `Host` mints a fresh budget.
+        let vhost = req.vhost_id().unwrap_or(ephpm_middleware::UNMATCHED_VHOST);
+        let key = Self::window_key(vhost, tenant, window);
 
         // One atomic call: increment, and stamp the TTL only if this call
         // created the key. A counter can therefore never exist without an

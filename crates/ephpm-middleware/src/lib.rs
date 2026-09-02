@@ -59,6 +59,21 @@ use std::os::raw::c_char;
 
 use abi::{EphpmHeaderKv, EphpmHostV1, EphpmRequest, EphpmResponseCtx};
 
+/// Key component a module should substitute when [`Request::vhost_id`] is
+/// `None` — the request matched no known virtual host.
+///
+/// Deliberately **uppercase**, which makes it unspellable as a site key: the
+/// router lowercases every host before matching and `is_valid_site_key`
+/// accepts only `[a-z0-9._-]`, so no vhost directory can ever produce it. That
+/// matters because the alternative — keying on the raw `Host` for an unmatched
+/// request — hands an attacker a fresh keyspace per header value. For a rate
+/// limiter that is a bypass: vary `Host`, get a fresh budget. Collapsing every
+/// unmatched host into one bucket is the fail-closed direction.
+///
+/// A module that must *deny* rather than bucket unmatched requests should
+/// branch on `None` directly instead of using this.
+pub const UNMATCHED_VHOST: &str = "_UNMATCHED";
+
 /// The trait a Rust-authored middleware implements. [`declare!`] generates
 /// the C ABI exports around it.
 pub trait Middleware: Sized + Send + Sync + 'static {
@@ -151,6 +166,18 @@ impl Request<'_> {
         unsafe { CStr::from_ptr(p) }.to_str().unwrap_or("")
     }
 
+    /// Like [`str_of`](Self::str_of) but keeps NULL distinguishable from an
+    /// empty string. Used for accessors where "absent" is a decision a module
+    /// must be able to make — [`vhost_id`](Self::vhost_id) is the one that
+    /// matters: `""` would read as a usable tenant key.
+    fn opt_str_of(&self, p: *const c_char) -> Option<&str> {
+        if p.is_null() {
+            return None;
+        }
+        // SAFETY: as `str_of`.
+        unsafe { CStr::from_ptr(p) }.to_str().ok().filter(|s| !s.is_empty())
+    }
+
     /// HTTP method.
     #[must_use]
     pub fn method(&self) -> &str {
@@ -179,11 +206,25 @@ impl Request<'_> {
         self.str_of(unsafe { (self.host.request_remote_ip)(self.raw) })
     }
 
-    /// Vhost / server-name identity for this request.
+    /// The request's **canonical site key** — the tenant identity the router
+    /// resolved, and the same value that selects this request's per-site
+    /// database, KV keyspace and OPcache vhost.
+    ///
+    /// `None` when the request matched no known virtual host. That is not a
+    /// missing value to paper over: ePHPm serves unrecognised hosts from the
+    /// default document root by default, so the `Host` there is arbitrary
+    /// client input. A gate should treat `None` as "no tenant" and fail closed
+    /// rather than substituting the header (issue #390).
+    ///
+    /// Normalization is the router's, not the header's: `Site.Example`,
+    /// `site.example:8080` and `site.example.` all resolve to one key, and a
+    /// configured `sites_domain_suffix` is stripped. For the request host as
+    /// sent — normalized but *not* a tenant identity — use
+    /// [`http_host`](Self::http_host).
     #[must_use]
-    pub fn vhost_id(&self) -> &str {
+    pub fn vhost_id(&self) -> Option<&str> {
         // SAFETY: contract of `from_raw`.
-        self.str_of(unsafe { (self.host.request_vhost_id)(self.raw) })
+        self.opt_str_of(unsafe { (self.host.request_vhost_id)(self.raw) })
     }
 
     /// The host's advertised ABI minor (low three bytes of `abi_version`).

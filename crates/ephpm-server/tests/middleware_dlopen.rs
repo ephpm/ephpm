@@ -126,7 +126,9 @@ fn dynamic_module_loads_and_round_trips_request_context() {
         "/app/index.php",
         "a=1&b=2",
         "198.51.100.9",
-        "Probe.Example.:8443",
+        // The canonical site key, as the router resolves it — already
+        // normalized, never the raw `Host` (issue #390).
+        "probe.example",
         &[("Accept".to_owned(), "text/html".to_owned())],
     )
     .with_scheme(true)
@@ -143,8 +145,8 @@ fn dynamic_module_loads_and_round_trips_request_context() {
             assert_eq!(find(&response_headers, "X-Probe-Path"), Some("/app/index.php"));
             assert_eq!(find(&response_headers, "X-Probe-Query"), Some("a=1&b=2"));
             assert_eq!(find(&response_headers, "X-Probe-Remote-Ip"), Some("198.51.100.9"));
-            // vhost_id is the un-normalized server name…
-            assert_eq!(find(&response_headers, "X-Probe-Vhost"), Some("Probe.Example.:8443"));
+            // vhost_id is the canonical site key (minor 3, issue #390)…
+            assert_eq!(find(&response_headers, "X-Probe-Vhost"), Some("probe.example"));
             assert_eq!(find(&response_headers, "X-Probe-Accept"), Some("text/html"));
             // …minor-2 accessors: scheme/secure from the connection, normalized
             // host, and the bounded buffered body — all across the C ABI.
@@ -167,6 +169,22 @@ fn dynamic_module_loads_and_round_trips_request_context() {
             assert_eq!(find(&headers, "X-Probe-Action"), Some("respond"));
         }
         ChainVerdict::Continue { .. } => panic!("/__probe/deny must short-circuit"),
+    }
+
+    // A request that matched NO virtual host has no tenant identity, and that
+    // has to survive the C boundary as a NULL — not as `""`, which a module
+    // would happily use as a lookup key (issue #390). The probe renders the
+    // module-side `Option::None` as `<none>`.
+    let ctx = RequestCtx::new("GET", "/app/index.php", "", "198.51.100.9", "", &[]);
+    match chain.evaluate(&ctx, "/app/index.php") {
+        ChainVerdict::Continue { response_headers, .. } => {
+            assert_eq!(
+                find(&response_headers, "X-Probe-Vhost"),
+                Some("<none>"),
+                "an unmatched host must reach the module as NULL, not an empty tenant key"
+            );
+        }
+        ChainVerdict::Respond { status, .. } => panic!("expected CONTINUE, got RESPOND {status}"),
     }
 
     // Dropping runs `shutdown` through the ABI, then dlclose.

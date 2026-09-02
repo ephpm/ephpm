@@ -89,7 +89,13 @@ impl Middleware for RateLimit {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
         let window = now / WINDOW_SECS;
         let client = self.client_key(req);
-        let key = format!("mw:rl:{}:{}:{}", req.vhost_id(), client, window);
+        // The canonical site key, not the raw `Host` (issue #390). A
+        // `Host`-derived component was a bypass: every spelling of one tenant
+        // got its own budget, and an unmatched host got a fresh budget per
+        // header value. `UNMATCHED_VHOST` is unspellable as a site key, so
+        // every unmatched request now shares one bucket.
+        let vhost = req.vhost_id().unwrap_or(ephpm_middleware::UNMATCHED_VHOST);
+        let key = format!("mw:rl:{vhost}:{client}:{window}");
 
         let host = req.host();
         // Atomically bump the counter, applying the window TTL only when this

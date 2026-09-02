@@ -44,13 +44,24 @@ use std::os::raw::{c_char, c_int};
 /// Current ABI version (`0xMMmmmmmm`: major byte gates compatibility, the
 /// lower three bytes are an additive minor level).
 ///
-/// `0x0100_0002` = major **1**, minor **2**.
+/// `0x0100_0003` = major **1**, minor **3**.
 ///
 /// - Minor 1 added the optional response phase (the [`SYM_INVOKE_RESPONSE`]
 ///   symbol and the three appended `response_*` accessors on [`EphpmHostV1`]).
 /// - Minor 2 added three appended request accessors — [`request_scheme`],
 ///   [`request_is_secure`], and [`request_host`] — and gave the pre-existing
 ///   [`request_body`] slot real (bounded, buffered) semantics.
+/// - Minor 3 is the multi-tenancy correctness pass. It **redefines** two
+///   pre-existing surfaces rather than only appending to them:
+///   * [`request_vhost_id`] now returns the router's **canonical site key**
+///     (NULL when the host matched no vhost) instead of the raw `Host`
+///     header (issue #390);
+///   * the `kv_*` callbacks now resolve **this request's per-site keyspace**
+///     on a multi-tenant node instead of always hitting the process-global
+///     store (issue #376), with the global store still reachable through the
+///     appended `kv_*_global` slots ([`ABI_MINOR_GLOBAL_KV`]).
+///   Both redefinitions are no-ops on a single-site node, where there is one
+///   tenant and one store. See [`ABI_MINOR_GLOBAL_KV`] for the migration note.
 ///
 /// The major byte is unchanged across every minor, so **every** module built
 /// against major 1 still loads: growth is additive.
@@ -59,7 +70,8 @@ use std::os::raw::{c_char, c_int};
 /// [`request_is_secure`]: EphpmHostV1::request_is_secure
 /// [`request_host`]: EphpmHostV1::request_host
 /// [`request_body`]: EphpmHostV1::request_body
-pub const ABI_V1: u32 = 0x0100_0002;
+/// [`request_vhost_id`]: EphpmHostV1::request_vhost_id
+pub const ABI_V1: u32 = 0x0100_0003;
 
 /// Major version — the compatibility gate. A module refuses to init when the
 /// host's major (`host.abi_version >> 24`) is newer than its own.
@@ -72,7 +84,7 @@ pub const ABI_MAJOR: u32 = 1;
 /// those trailing fields, and reading past a shorter table is undefined
 /// behaviour. See [`ABI_MINOR_RESPONSE_PHASE`] and
 /// [`ABI_MINOR_REQUEST_ACCESSORS`].
-pub const ABI_MINOR: u32 = 2;
+pub const ABI_MINOR: u32 = 3;
 
 /// The minor version that introduced the response phase — the three
 /// `response_*` accessors on [`EphpmHostV1`] and the [`SYM_INVOKE_RESPONSE`]
@@ -237,7 +249,28 @@ pub struct EphpmHostV1 {
     /// This slot has existed since minor 0 (it returned 0 then); only the
     /// buffered semantics are new in minor 2, so it needs no minor gate.
     pub request_body: unsafe extern "C" fn(*const EphpmRequest, out_ptr: *mut *const u8) -> usize,
-    /// Identity of the vhost/site serving this request (server name).
+    /// The **canonical site key** of the vhost serving this request, or NULL
+    /// when the request matched no known virtual host.
+    ///
+    /// This is the value the router's one host→tenant derivation produced —
+    /// the same identity that selects this request's per-site database file,
+    /// KV keyspace and OPcache vhost. It is suffix-stripped, port-stripped,
+    /// lowercased and allowlist-validated, so `Host: Site.Example`,
+    /// `site.example:8080` and `site.example.` all yield one key.
+    ///
+    /// **NULL means "no tenant", and a module must not invent one.** ePHPm
+    /// does not reject unrecognised hosts by default, so any host that matched
+    /// no vhost is an arbitrary client-supplied string; returning NULL is what
+    /// lets a gate tell "tenant `foo`" from "someone sent `Host: foo`" and
+    /// fail closed instead of keying policy on attacker input.
+    ///
+    /// Changed in **minor 3** (issue #390). Before that this returned the raw
+    /// `Host` header with only the port stripped — un-normalized, never NULL.
+    /// Three separate modules had each re-normalized it locally, one of them
+    /// with an auth bypass (a `Host` differing only in letter case missed its
+    /// credential entry). For the un-normalized/raw view use
+    /// [`request_host`](Self::request_host), which is the normalized request
+    /// host and is explicitly *not* a tenant identity.
     pub request_vhost_id: unsafe extern "C" fn(*const EphpmRequest) -> *const c_char,
 
     // ── KV store ─────────────────────────────────────────────────────────

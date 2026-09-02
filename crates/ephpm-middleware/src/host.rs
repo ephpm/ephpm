@@ -16,7 +16,12 @@ pub struct RequestCtx {
     path: CString,
     query: CString,
     remote_ip: CString,
-    vhost: CString,
+    /// The request's **canonical site key** — the value `Router::resolve_site`
+    /// matched, which also selects the per-site database, the KV keyspace and
+    /// the OPcache vhost. Empty when the request matched no known virtual host;
+    /// the `request_vhost_id` accessor turns that into a NULL return so a
+    /// module can tell "tenant `foo`" from "someone sent `Host: foo`".
+    site_key: CString,
     /// Normalized request host (port/trailing-dot stripped, lowercased) — the
     /// `request_host` accessor. Empty when the request had no usable `Host`.
     host: CString,
@@ -41,6 +46,14 @@ impl RequestCtx {
     /// Build the context. Interior NULs are stripped (invalid in HTTP
     /// metadata anyway) rather than failing the request.
     ///
+    /// `site_key` is the request's **canonical site key** — pass exactly what
+    /// `Router::resolve_site` returned, and the **empty string** when it
+    /// returned `None` (the host matched no known virtual host). Never pass a
+    /// raw `Host` header here: that was issue #390, and modules read this value
+    /// as a tenant identity in authorization decisions. The normalized request
+    /// host stays available separately through
+    /// [`with_host`](Self::with_host) / the `request_host` accessor.
+    ///
     /// The connection-derived extras — scheme/secure, normalized host, and the
     /// buffered body — default to "insecure / empty / no body" and are set by
     /// the router via [`with_scheme`](Self::with_scheme),
@@ -51,7 +64,7 @@ impl RequestCtx {
         path: &str,
         query: &str,
         remote_ip: &str,
-        vhost: &str,
+        site_key: &str,
         headers: &[(String, String)],
     ) -> Self {
         Self {
@@ -59,7 +72,7 @@ impl RequestCtx {
             path: cstr(path),
             query: cstr(query),
             remote_ip: cstr(remote_ip),
-            vhost: cstr(vhost),
+            site_key: cstr(site_key),
             host: CString::default(),
             is_secure: false,
             body: Vec::new(),
@@ -125,8 +138,14 @@ unsafe extern "C" fn request_remote_ip(req: *const EphpmRequest) -> *const c_cha
     unsafe { ctx(req) }.map_or(std::ptr::null(), |c| c.remote_ip.as_ptr())
 }
 unsafe extern "C" fn request_vhost_id(req: *const EphpmRequest) -> *const c_char {
+    // NULL — not `""` — for a request that matched no known vhost. An empty
+    // C string is still a tenant-shaped answer a module would happily use as a
+    // lookup key; NULL is the one value that cannot be mistaken for a tenant,
+    // so a module can fail closed on it (issue #390).
     // SAFETY: ABI contract.
-    unsafe { ctx(req) }.map_or(std::ptr::null(), |c| c.vhost.as_ptr())
+    unsafe { ctx(req) }.map_or(std::ptr::null(), |c| {
+        if c.site_key.is_empty() { std::ptr::null() } else { c.site_key.as_ptr() }
+    })
 }
 unsafe extern "C" fn request_header(
     req: *const EphpmRequest,
@@ -563,6 +582,40 @@ mod tests {
         assert!(!req.is_secure());
         assert_eq!(req.http_host(), "");
         assert!(req.body().is_empty());
+    }
+
+    /// Issue #390: the vhost accessor is a *tenant identity*, so "no tenant"
+    /// must be distinguishable from a tenant. An empty site key crosses the
+    /// ABI as NULL and surfaces as `None`, never as `Some("")` — otherwise a
+    /// module keys its policy on a string an unauthenticated client chose.
+    #[test]
+    fn unmatched_host_has_no_vhost_identity() {
+        let matched = RequestCtx::new("GET", "/x", "", "203.0.113.4", "blog", &[]);
+        // SAFETY: ctx and the real host table outlive the view.
+        let req = unsafe { Request::from_raw(matched.as_abi(), host_table()) };
+        assert_eq!(req.vhost_id(), Some("blog"));
+
+        let unmatched = RequestCtx::new("GET", "/x", "", "203.0.113.4", "", &[]);
+        // SAFETY: as above.
+        let req = unsafe { Request::from_raw(unmatched.as_abi(), host_table()) };
+        assert_eq!(req.vhost_id(), None, "no matched vhost must read as no tenant");
+        // SAFETY: the raw accessor is the C-ABI surface modules see; NULL is
+        // the contract, and an empty non-null string would defeat the point.
+        assert!(unsafe { (host_table().request_vhost_id)(unmatched.as_abi()) }.is_null());
+    }
+
+    /// The tenant identity and the request host are deliberately two different
+    /// values: one is what the router resolved, the other is what the client
+    /// sent. A module must be able to reach both without confusing them.
+    #[test]
+    fn vhost_id_and_http_host_stay_distinct() {
+        // A suffixed request: `Host: blog.localhost` resolves to site `blog`.
+        let ctx = RequestCtx::new("GET", "/x", "", "203.0.113.4", "blog", &[])
+            .with_host("blog.localhost");
+        // SAFETY: ctx and the real host table outlive the view.
+        let req = unsafe { Request::from_raw(ctx.as_abi(), host_table()) };
+        assert_eq!(req.vhost_id(), Some("blog"));
+        assert_eq!(req.http_host(), "blog.localhost");
     }
 
     #[test]
