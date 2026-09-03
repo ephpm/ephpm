@@ -1,10 +1,10 @@
-//! Experimental FPM pool engine (`[php] fpm_engine = "pool"`) e2e tests.
+//! Dedicated per-request execution pool e2e tests.
 //!
 //! Runs against a node the bare-process harness spawns with the pool engine on
-//! (see `ISOLATED_CONFIG_SUITES` / `SingleNodeOptions::fpm_engine_pool`). Proves
+//! (see `ISOLATED_CONFIG_SUITES` / `SingleNodeOptions::pin_pool_size`). Proves
 //! the dedicated FPM thread pool serves the FULL per-request path end to end —
 //! real PHP plus the in-process `ephpm_db_*` bridge — and that the engine is
-//! actually active (not silently falling back to `spawn_blocking`).
+//! actually active with its pinned size.
 //!
 //! Environment variables:
 //! - `EPHPM_URL` — base URL of the pool-engine ephpm instance. Read via
@@ -42,7 +42,7 @@ async fn bridge_action(action: &str, params: &str) -> BridgeResponse {
 /// The pool serves real PHP AND drives the in-process `ephpm_db_*` bridge:
 /// CREATE + INSERT (bound params) + SELECT round-trips through a pool thread's
 /// per-request litewire session. This is the whole point — the pool runs the
-/// identical per-request path the `spawn_blocking` engine does.
+/// full per-request path, not just plumbing.
 #[tokio::test]
 async fn pool_serves_php_and_db_bridge_roundtrip() {
     let setup = bridge_action("setup", "").await;
@@ -65,10 +65,9 @@ async fn pool_serves_php_and_db_bridge_roundtrip() {
     assert_eq!(cleanup.status, "ok", "cleanup failed: {:?}", cleanup.message);
 }
 
-/// The pool engine is genuinely ACTIVE, not a silent fallback to
-/// `spawn_blocking`: `/metrics` exposes `ephpm_fpm_pool_size` with a value
-/// >= 1. That gauge is set only by `FpmPool::spawn`, so its presence proves the
-/// dedicated pool was built and PHP is being dispatched to it.
+/// The pool is genuinely active: `/metrics` exposes `ephpm_fpm_pool_size`
+/// with a value >= 1. That gauge is set only by `FpmPool::spawn`, so its
+/// presence proves the dedicated pool was built and PHP is dispatched to it.
 #[tokio::test]
 async fn pool_engine_is_active_per_metrics() {
     let base_url = required_env("EPHPM_URL");

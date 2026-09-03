@@ -36,7 +36,7 @@ untouched.
 - **Linux ≥ 5.10** with `CONFIG_CGROUP_BPF` and BTF (`/sys/kernel/btf/vmlinux`).
   Setting `ebpf_policy = true` on any other platform is a hard startup error.
 - **Multi-tenant mode** (`[server] sites_dir` set). Per-vhost tagging is keyed
-  by the canonical site key, which only exists with vhosts. fpm mode only —
+  by the canonical site key, which only exists with vhosts. Per-request mode only —
   worker mode is not yet supported.
 - **`CAP_BPF` + `CAP_NET_ADMIN`** on the ePHPm process (see systemd below).
 - The **firewall loopback handoff** below.

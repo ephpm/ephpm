@@ -334,8 +334,8 @@ impl Registry {
     /// last case also schedules the connection for a
     /// [`CLOSE_QUEUE_OVERFLOW`] close.
     ///
-    /// Never blocks. This runs on a PHP blocking thread; parking it on a slow
-    /// client's socket would hold a `spawn_blocking` slot hostage.
+    /// Never blocks. This runs on a PHP execution thread; parking it on a
+    /// slow client's socket would hold an execution-pool slot hostage.
     pub fn send(&self, site: &str, id: &str, frame: OutFrame) -> bool {
         if !self.within_size_limit(frame.len()) {
             return false;

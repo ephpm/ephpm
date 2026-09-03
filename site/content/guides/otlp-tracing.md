@@ -32,9 +32,10 @@ stitched into a trace that continues from whatever called you.
 | `worker.queue_wait` | `INTERNAL` | worker mode only | none |
 
 `php.execute` and `worker.queue_wait` are children of `http.request`. On the
-default fpm path there is no dispatch queue, so you get a two-span tree; in
-worker mode (`[php] mode = "worker"`) `worker.queue_wait` appears as a sibling
-of `php.execute` and measures how long the request waited for a free worker.
+default per-request path no queue-wait span is emitted, so you get a two-span
+tree; in worker mode (`[php] mode = "worker"`) `worker.queue_wait` appears as a
+sibling of `php.execute` and measures how long the request waited for a free
+worker.
 A static file or a 404 produces `http.request` alone.
 
 Attribute names follow the [OpenTelemetry HTTP semantic

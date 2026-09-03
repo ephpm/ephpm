@@ -49,11 +49,18 @@ index_files = ["index.php", "index.html"]
 # level = "info"           # trace, debug, info, warn, error
 
 [php]
-# mode = "fpm" (default) — php-fpm-shaped: full startup/shutdown per request
+# mode = "per_request" (default) — php-fpm-shaped: full startup/shutdown per request
 # mode = "worker" — persistent workers holding a booted framework in memory
-mode = "fpm"
+mode = "per_request"
 max_execution_time = 30
 memory_limit = "128M"
+
+# Execution-pool size (both modes): max PHP requests running concurrently.
+# 0 (default) derives it — cgroup CPU quota (Linux) else host parallelism,
+# clamped [2, 32]. Startup logs the effective value and its source.
+# concurrency = 0
+# Dispatch-queue depth in front of the pool. 0 (default) = concurrency.
+# queue_depth = 0
 
 # Optional: path to a custom php.ini file to load before ini_overrides.
 # Useful for reusing an existing PHP configuration.
@@ -68,21 +75,16 @@ ini_overrides = [
     ["error_reporting", "E_ALL"],
 ]
 
-# Load shedding (fpm mode). Default "wait": excess requests queue, and the
-# client's own timeout is what ends them. "shed" answers 503 + Retry-After once
-# a request has waited shed_after_ms for an execution slot, so an overloaded
-# server fails fast and countably instead of going quiet.
-#   NOTE: this needs an admission queue to reject from. With the default
-#   fpm_engine = "spawn_blocking" that queue is the `workers` semaphore, so
-#   shedding does nothing unless `workers` is set (startup WARNs if so). With
-#   fpm_engine = "pool" it is the dispatch backlog and needs no extra config.
-# overload_policy = "shed"
+# Load shedding. Default "wait": excess requests queue in the bounded dispatch
+# queue, and the client's own timeout is what ends them. "shed" answers 503 +
+# Retry-After once a request has waited shed_after_ms for an execution slot, so
+# an overloaded server fails fast and countably instead of going quiet.
+# overload = "shed"
 # shed_after_ms = 0               # grace window; 0 = shed as soon as no slot is free
-# workers = 32                    # concurrency cap the shed policy rejects against
 
 # Worker mode settings (only used when mode = "worker"):
-# worker_script = "vendor/ephpm/worker.php"  # worker loop script (required)
-# worker_count = 0                # persistent workers; 0 derives from CPU quota
+# [php.worker]
+# script = "vendor/ephpm/worker.php"  # worker loop script (required)
 
 # [server.tls]
 # --- Manual mode (provide your own cert/key) ---

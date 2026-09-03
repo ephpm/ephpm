@@ -1,43 +1,35 @@
-//! Dedicated per-request FPM execution pool (experimental `[php] fpm_engine =
-//! "pool"`).
+//! Dedicated per-request PHP execution pool (`[php] mode = "per_request"`,
+//! the default execution model).
 //!
-//! An **opt-in** alternative to the default `spawn_blocking` FPM path. A fixed
-//! pool of dedicated OS threads (`std::thread`, NOT `spawn_blocking`) each pull
-//! one per-request job off a bounded [`async_channel`] dispatch queue, run
-//! exactly one PHP request, reply on a [`tokio::sync::oneshot`], and loop. This
-//! is the php-fpm model — every request runs a full
-//! `php_request_startup`/`shutdown` cycle inside [`PhpRuntime::execute`], so
-//! framework state never leaks across requests — but on threads ePHPm owns
-//! rather than tokio's shared blocking pool.
+//! A fixed pool of dedicated OS threads (`std::thread`, NOT tokio's
+//! `spawn_blocking`) each pull one per-request job off a bounded
+//! [`async_channel`] dispatch queue, run exactly one PHP request, reply on a
+//! [`tokio::sync::oneshot`], and loop. This is the php-fpm model — every
+//! request runs a full `php_request_startup`/`shutdown` cycle inside
+//! [`PhpRuntime::execute`], so framework state never leaks across requests —
+//! but on threads ePHPm owns rather than tokio's shared blocking pool.
 //!
 //! # Why dedicated threads
 //!
-//! Parking N threads forever in tokio's `spawn_blocking` pool would starve the
-//! shared pool that also serves static-file I/O and other blocking work. A
-//! dedicated pool bounds PHP concurrency to its own thread count without
-//! touching that shared resource — the same reason [`crate::worker_pool`] uses
-//! `std::thread`.
-//!
-//! # Parity with the default engine
-//!
-//! The pool is deliberately dumb about *what* a request does: the router hands
-//! it a boxed closure that is the **identical** per-request body the
-//! `spawn_blocking` path runs (per-site DB session swap, KV keyspace,
-//! `open_basedir`/temp/session INI, OPcache invalidation, and the
-//! `PhpRuntime::execute` bailout crash guard). Parity is therefore guaranteed
-//! by construction — the same code runs; only the thread it runs on differs.
+//! Running PHP on tokio's `spawn_blocking` pool would tie PHP concurrency to
+//! the shared pool that also serves static-file I/O and other blocking work —
+//! either uncapped (one thread and one full ZTS PHP context per in-flight
+//! request under flood) or starving that shared pool. A dedicated pool bounds
+//! PHP concurrency to its own thread count without touching the shared
+//! resource, so slow PHP scripts can never starve static-file serving — the
+//! same reason [`crate::worker_pool`] uses `std::thread`.
 //!
 //! # Concurrency, backpressure, and failure mapping (mirrors `worker_pool`)
 //!
-//! - **Concurrency cap:** the pool size ([`PhpConfig::effective_worker_count`])
-//!   is the cap. The `[php] workers` semaphore is redundant and bypassed.
-//! - **Backpressure → 504:** the dispatch queue is bounded. When it is full,
-//!   [`FpmPool::dispatch`] suspends on the FIFO-fair admission semaphore
-//!   ([`FpmPool::admission`], issue #442); the outer request timeout turns a
-//!   starved queue into a 504.
-//! - **Shed → 503 + `Retry-After`:** with `[php] overload_policy = "shed"` the
+//! - **Concurrency cap:** the pool size ([`PhpConfig::effective_concurrency`])
+//!   is the cap.
+//! - **Backpressure → 504:** the dispatch queue (`[php] queue_depth`) is
+//!   bounded. When it is full, [`FpmPool::dispatch`] suspends on the FIFO-fair
+//!   admission semaphore ([`FpmPool::admission`], issue #442); the outer
+//!   request timeout turns a starved queue into a 504.
+//! - **Shed → 503 + `Retry-After`:** with `[php] overload = "shed"` the
 //!   router calls [`FpmPool::try_dispatch`] instead, which refuses to queue
-//!   behind a full backlog (after an optional `[php] shed_after_ms` grace) and
+//!   behind a full queue (after an optional `[php] shed_after_ms` grace) and
 //!   returns [`DispatchRejected::Full`]. Overload then costs one cheap 503
 //!   rather than a request that occupies a client until its own timeout
 //!   (issue #301).
@@ -105,12 +97,13 @@ use crate::worker_pool::DepthRollback;
 
 /// The outcome of one PHP request — exactly what [`PhpRuntime::execute`]
 /// returns. A contained bailout is `Err(PhpError::Bailout)`, which the router
-/// turns into a 500 via `build_php_response` (the same arm the `spawn_blocking`
-/// path uses).
+/// turns into a 500 via `build_php_response`.
 pub type FpmExecOutput = Result<PhpResponse, PhpError>;
 
 /// The per-request work handed to a pool thread: the router-built closure that
-/// runs the identical body the `spawn_blocking` path runs.
+/// runs the full per-request body (per-site DB session swap, KV keyspace,
+/// `open_basedir`/temp/session INI, OPcache invalidation, and the
+/// `PhpRuntime::execute` bailout crash guard).
 pub type FpmTask = Box<dyn FnOnce() -> FpmExecOutput + Send + 'static>;
 
 /// The dispatch channel is closed (pool draining or all threads gone). The
@@ -119,7 +112,7 @@ pub type FpmTask = Box<dyn FnOnce() -> FpmExecOutput + Send + 'static>;
 pub struct DispatchClosed;
 
 /// Why [`FpmPool::try_dispatch`] refused to enqueue a request
-/// (`[php] overload_policy = "shed"`).
+/// (`[php] overload = "shed"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchRejected {
     /// Dispatch closed — pool draining or all threads gone. Same condition
@@ -262,7 +255,7 @@ impl FpmPool {
             thread_count,
             backlog = backlog.max(1),
             admission = admission_policy.as_str(),
-            "fpm execution pool started ([php] fpm_engine = \"pool\", the default since v0.9.0)"
+            "php execution pool started"
         );
 
         pool
@@ -389,7 +382,7 @@ impl FpmPool {
     }
 
     /// Dispatch one request, refusing to queue behind a full backlog
-    /// (`[php] overload_policy = "shed"`).
+    /// (`[php] overload = "shed"`).
     ///
     /// The load-shedding counterpart to [`FpmPool::dispatch`]. Where `dispatch`
     /// awaits a send permit for as long as it takes — turning overload into
@@ -398,7 +391,7 @@ impl FpmPool {
     /// the caller can answer `503` immediately.
     ///
     /// `grace` of zero is a plain non-blocking permit try-acquire: the backlog
-    /// (`[php] worker_backlog`, default = pool size) is already the buffer, so
+    /// (`[php] queue_depth`, default = pool size) is already the buffer, so
     /// "full" means every thread is busy *and* the queue behind them is full.
     ///
     /// A non-zero `grace` waits on the same FIFO-fair admission semaphore
@@ -406,8 +399,8 @@ impl FpmPool {
     /// Cancelling the wait is sound because a queued-but-unstarted job is
     /// genuinely never run: nothing has been handed to a pool thread yet, so
     /// dropping the acquire future removes it from the semaphore's waiter list
-    /// and no PHP work leaks. That is precisely what the `spawn_blocking`
-    /// engine cannot do with tokio's blocking queue.
+    /// and no PHP work leaks. (Tokio's own blocking queue could never offer
+    /// this: its entries are unbounded and uncancellable.)
     ///
     /// # Errors
     ///
@@ -597,9 +590,9 @@ fn thread_main(pool: &Arc<FpmPool>, thread_id: usize, rx: &async_channel::Receiv
     // `live` was incremented in spawn_thread before this thread started; every
     // exit path below decrements it.
 
-    // Register this thread with TSRM once (same guard the spawn_blocking path
-    // uses lazily, so a thread never double-registers). Unlike worker mode this
-    // does NOT boot a framework — each request runs its own fpm cycle.
+    // Register this thread with TSRM once (the per-thread registration guard
+    // ensures a thread never double-registers). Unlike worker mode this does
+    // NOT boot a framework — each request runs its own per-request cycle.
     if let Err(e) = PhpRuntime::worker_thread_init() {
         tracing::error!(thread_id, ?e, "fpm pool thread TSRM init failed");
         pool.state.boot_failures.fetch_add(1, Ordering::AcqRel);
@@ -878,7 +871,7 @@ mod tests {
         assert!(wait_for(|| pool.live_count() == 0).await, "drain retires the replacement");
     }
 
-    // ── Load shedding (`[php] overload_policy = "shed"`, issue #301) ────
+    // ── Load shedding (`[php] overload = "shed"`, issue #301) ────────────
 
     /// The shed contract: with no grace window, a request that finds the
     /// bounded backlog full is rejected immediately instead of queueing. A

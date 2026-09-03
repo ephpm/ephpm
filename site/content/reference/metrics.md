@@ -31,7 +31,7 @@ Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and ex
 | `ephpm_http_request_body_bytes` | histogram | `method` | Request body size. `method` is bounded the same way as above (standard verb or `OTHER`). |
 | `ephpm_http_response_body_bytes` | histogram | `handler` | Response body size before compression. Recorded on the PHP path only (`handler="php"`). |
 | `ephpm_http_compression_ratio` | histogram | — | Compressed-to-original ratio; covers both Brotli and gzip responses. |
-| `ephpm_http_timeouts_total` | counter | `stage` | Requests killed by the request timeout. Two values: `request` (the fpm-mode request deadline) and `worker` (worker mode — the worker never responded within the request timeout; the request gets a 504 and the worker is marked hung, which also increments `ephpm_worker_recycles_total{reason="hung"}`). |
+| `ephpm_http_timeouts_total` | counter | `stage` | Requests killed by the request timeout. Two values: `request` (the per-request-mode request deadline) and `worker` (worker mode — the worker never responded within the request timeout; the request gets a 504 and the worker is marked hung, which also increments `ephpm_worker_recycles_total{reason="hung"}`). |
 | `ephpm_rate_limited_total` | counter | — | Rejections from `[server.limits]`. Incremented only for per-IP rate limiting. |
 | `ephpm_site_rate_limited_total` | counter | — | 429s from the per-site PHP rate limit (`[server.limits] per_site_rate`; on by default under `[server] preview`). |
 
@@ -79,11 +79,11 @@ The upgrade request itself also increments the `ephpm_http_*` metrics above with
 | `ephpm_php_executions_total` | counter | `status` | PHP requests executed. `status` is `ok` or `error`. Timeouts surface as HTTP 504 in the HTTP metrics, not here. |
 | `ephpm_php_execution_duration_seconds` | histogram | — | Time spent inside the PHP runtime, per request. |
 | `ephpm_php_output_bytes` | histogram | — | Bytes emitted by PHP per request. |
-| `ephpm_php_shed_total` | counter | `engine` | PHP requests rejected with `503` + `Retry-After` because no execution slot came free within `[php] shed_after_ms`. Only recorded under [`[php] overload_policy = "shed"`](/reference/config/#php); always `0` on the default `"wait"` policy. `engine` is `pool` (the dispatch backlog was full) or `spawn_blocking` (no `[php] workers` permit). A 503 from a *draining* pool is not counted here — that is shutdown, not overload. Rising values mean the server is saturated and saying so, which is the healthy failure mode; the alternative is client timeouts with no server-side signal at all. |
+| `ephpm_php_shed_total` | counter | `engine` | PHP requests rejected with `503` + `Retry-After` because no execution slot came free within `[php] shed_after_ms`. Only recorded under [`[php] overload = "shed"`](/reference/config/#php); always `0` on the default `"wait"` policy. `engine` is always `pool` (the dispatch backlog was full; the label is kept for continuity). A 503 from a *draining* pool is not counted here — that is shutdown, not overload. Rising values mean the server is saturated and saying so, which is the healthy failure mode; the alternative is client timeouts with no server-side signal at all. |
 
 ## FPM pool engine
 
-These appear when `[php] fpm_engine = "pool"` in fpm mode — the default since v0.9.0, so they are present unless you have opted out with `fpm_engine = "spawn_blocking"`.
+These appear in per-request mode (`[php] mode = "per_request"`, the default execution model); they are absent only in worker mode.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -116,14 +116,14 @@ These appear when `[php] mode = "worker"`.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `ephpm_worker_pool_size` | gauge | — | Configured number of persistent worker threads, set at pool startup. |
-| `ephpm_worker_busy` | gauge | — | Dispatched requests awaiting a worker response. Includes jobs still sitting in the dispatch queue, so it can exceed `worker_count` when the backlog is deep. |
+| `ephpm_worker_busy` | gauge | — | Dispatched requests awaiting a worker response. Includes jobs still sitting in the dispatch queue, so it can exceed `concurrency` when the backlog is deep. |
 | `ephpm_worker_idle` | gauge | — | Workers parked in `take_request()` waiting for work (recorded inside the dispatch recv; only moves in PHP-linked builds). |
 | `ephpm_worker_dispatch_queue_depth` | gauge | — | Jobs sitting in the dispatch queue, sampled at each dispatch. |
 | `ephpm_worker_request_wait_seconds` | histogram | — | Time a request spent waiting to enter the dispatch queue (backpressure when the queue is full). |
 | `ephpm_worker_boot_duration_seconds` | histogram | — | Time from worker-thread start to the framework's first `take_request()` (i.e. framework boot time). |
-| `ephpm_worker_boot_timeouts_total` | counter | — | Boots still running when `worker_boot_timeout` expired. The thread is not killed; it still becomes ready if the boot completes. |
+| `ephpm_worker_boot_timeouts_total` | counter | — | Boots still running when `[php.worker] boot_timeout` expired. The thread is not killed; it still becomes ready if the boot completes. |
 | `ephpm_worker_boot_failures_total` | counter | — | Worker boots that failed (thread spawn/TSRM init failure, or the script exited before its first `take_request()`). The pool respawns with exponential backoff. |
-| `ephpm_worker_recycles_total` | counter | `reason` | Workers recycled. `reason` is `max_requests` (hit `worker_max_requests`), `script_exit` (script called `exit()`/`die()` mid-request), `fatal` (fatal error / bailout), or `hung` (never responded within the request timeout; replaced). |
+| `ephpm_worker_recycles_total` | counter | `reason` | Workers recycled. `reason` is `max_requests` (hit `[php.worker] max_requests`), `script_exit` (script called `exit()`/`die()` mid-request), `fatal` (fatal error / bailout), or `hung` (never responded within the request timeout; replaced). |
 | `ephpm_worker_stream_stalls_total` | counter | — | Streamed responses (`send_response_stream`) abandoned because the client stopped reading for longer than [`[server.timeouts] idle`](/reference/config/#servertimeouts-all-in-seconds) (default 60 s). Note that `idle` does double duty: it is both the connection idle timeout and the worker-mode streaming send timeout, so changing it moves this threshold too. |
 | `ephpm_worker_stream_aborts_total` | counter | — | Streamed responses whose worker died in a bailout after the headers were already sent. The body is deliberately ended with an error (no terminating chunk) so the client sees a failed transfer rather than a truncated 200. Any non-zero value is a PHP crash. |
 
@@ -139,7 +139,7 @@ These appear when a cluster-wide OPcache invalidation actually fires. When
 
 ## OPcache JIT
 
-The JIT buffer gauges are **sampled on the PHP request path** (the fpm dispatch closure and the worker-mode `take_request` loop), at most once per 10 s process-wide — `opcache_get_status()` needs a TSRM-registered PHP thread, so there is no background sampler. Consequences: the series **appear only after the first PHP request** in fpm mode (in worker mode, as soon as a worker boots and parks) on a PHP-linked build with OPcache active (stub builds and `opcache.enable=0` never record them), and with zero traffic they hold their last value (with zero traffic the JIT state cannot change). They are recorded whether the JIT is on or off, so "JIT off" reads as an honest `buffer_size = 0` rather than a missing series.
+The JIT buffer gauges are **sampled on the PHP request path** (the per-request dispatch closure and the worker-mode `take_request` loop), at most once per 10 s process-wide — `opcache_get_status()` needs a TSRM-registered PHP thread, so there is no background sampler. Consequences: the series **appear only after the first PHP request** in per-request mode (in worker mode, as soon as a worker boots and parks) on a PHP-linked build with OPcache active (stub builds and `opcache.enable=0` never record them), and with zero traffic they hold their last value (with zero traffic the JIT state cannot change). They are recorded whether the JIT is on or off, so "JIT off" reads as an honest `buffer_size = 0` rather than a missing series.
 
 **Multi-tenant caveat:** the multi-tenant hardening preset (default with `sites_dir`) removes `opcache_get_status` from the function table unless [`[opcache] cluster_invalidation`](/reference/config/#opcache) keeps the OPcache API open — with the API removed, the sampler has nothing to call and these gauges never record. If you force the JIT on in multi-tenant mode (the case where `buffer_free` matters most), enable cluster invalidation to keep the gauge alive, or accept flying blind — the startup WARN spells this out.
 

@@ -16,8 +16,9 @@
  *
  *   [php]
  *   mode = "worker"
- *   worker_script = "worker-stream.php"
- *   worker_stream_threshold = 65536   # stream bodies >= 64 KiB
+ *   [php.worker]
+ *   script = "worker-stream.php"
+ *   stream_threshold = 65536   # stream bodies >= 64 KiB
  *
  * Then stream a large body through and get the same bytes back:
  *

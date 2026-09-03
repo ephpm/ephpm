@@ -58,7 +58,7 @@ v0.5.0. See the [configuration reference](/reference/config/).
 ## Planned — not yet implemented: the SSE hub (v0.7 target)
 
 The remaining constraint is structural: **one SSE connection parks one
-worker thread** for its whole lifetime, so `[php] worker_count` caps
+worker thread** for its whole lifetime, so `[php] concurrency` caps
 concurrent viewers, and short action requests compete with streams for
 the same pool. Fine for tens-to-hundreds of clients; wrong shape for
 thousands of dashboard viewers who all see the *same* rendered
@@ -77,7 +77,7 @@ is a **server-side SSE hub**:
   render the fragment once, then broadcasts the resulting bytes to all
   N subscribers — through the per-connection streaming brotli encoders
   shipped above.
-- **Viewers decouple from `worker_count`.** Worker threads go back to
+- **Viewers decouple from `concurrency`.** Worker threads go back to
   being a render pool; connection count becomes a hyper/file-descriptor
   problem, which Rust is good at.
 

@@ -1,5 +1,11 @@
 # ePHPm Worker Mode — 3.0 Roadmap & Repo Plan
 
+> **Terminology note (v0.9.0):** this document predates the concurrency-config
+> rename. Read `worker_count`/`workers` as `[php] concurrency`,
+> `worker_backlog` as `[php] queue_depth`, and the other `worker_*` knobs as
+> their `[php.worker]` equivalents. Historical content is otherwise preserved
+> as written.
+
 Companion to [`worker-mode-design.md`](./worker-mode-design.md) (the Phase-1
 engine design). This is the phasing, the repo/packaging plan, and the
 sub-agent build decomposition.

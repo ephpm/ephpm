@@ -46,7 +46,7 @@ RUST_LOG=info ephpm serve 2>&1 | tee /var/log/ephpm.log
 In one process:
 
 - HTTP/1.1 + HTTP/2 listener on `[server] listen`
-- PHP runtime (ZTS) ready to dispatch on tokio's `spawn_blocking` pool
+- PHP runtime (ZTS) ready to dispatch on the dedicated execution pool
 - The MySQL proxy on `127.0.0.1:3306` if `[db.mysql]` or `[db.sqlite]` is configured
 - The KV store on `127.0.0.1:6379` if `[kv.redis_compat] enabled = true`
 - The `/metrics` endpoint if `[server.metrics] enabled = true`

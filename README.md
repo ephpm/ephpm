@@ -15,7 +15,7 @@ First, it needed to be written in Rust to completely avoid the heavy `cgo` execu
 Second, it eliminates the localhost loopback hop on the lanes that matter most. While local TCP connections and Unix sockets (used by PHP-FPM and RoadRunner) are fast, they still incur unavoidable OS kernel context-switching and protocol serialization taxes. The web server → PHP hop is gone by construction (PHP is linked in, not proxied to), and the `ephpm_db_*` / `ephpm_kv_*` SAPI functions reach the embedded database and KV store as direct function calls. Apps that keep their stock clients — `pdo_mysql` to `127.0.0.1:3306`, `phpredis` to `127.0.0.1:6379` — still cross loopback, but they cross it into *this* process instead of a separate daemon, so they trade a network round trip for a socket round trip and need no code changes. 
 
 * **Web Server:** Replaces Nginx by binding an in-process, high-concurrency [Tokio](https://tokio.rs) + [Hyper](https://docs.rs/hyper) network stack.
-* **Process Manager:** Replaces PHP-FPM with our custom, resource-aware `fpm_engine` thread manager.
+* **Process Manager:** Replaces PHP-FPM with a resource-aware, dedicated PHP execution pool (`[php] concurrency`).
 * **Shared Memory Cache:** Replaces standalone Redis with a concurrent, thread-safe [DashMap](https://docs.rs/dashmap) key-value store (supports clustering)
 * **Database:** Replaces external MySQL with the embedded, zero-dependency [Turso](https://github.com/tursodatabase/turso) engine — a pure-Rust SQLite-compatible database compiled into the binary (supports clustering)
 
@@ -97,7 +97,7 @@ document_root = "/var/www/html"
 index_files = ["index.php", "index.html"]
 
 [php]
-mode = "fpm"
+mode = "per_request"
 memory_limit = "128M"
 max_execution_time = 30       # inner PHP deadline (default). Natively enforced
                               # on Linux ZTS builds (catchable fatal → HTTP 500,
@@ -362,7 +362,7 @@ sites_dir = "/var/www/sites"           # vhost directory
 - **Add a site:** create a directory, drop in WordPress
 - **Remove a site:** delete the directory — traffic falls back to your marketing page
 - **No per-site config needed:** sites inherit global PHP settings, timeouts, and security rules
-- **Shared thread pool:** all sites share tokio's `spawn_blocking` pool — 20 blogs don't need 20x the memory
+- **Shared execution pool:** all sites share one dedicated PHP thread pool — 20 blogs don't need 20x the memory
 
 A $3.69/mo Hetzner VM (2 ARM cores, 4 GB RAM) comfortably runs 20 WordPress blogs at ~$0.18/site. See [site/content/guides/virtual-hosts.md](site/content/guides/virtual-hosts.md) and [site/content/roadmap/hosting.md](site/content/roadmap/hosting.md) for full details.
 

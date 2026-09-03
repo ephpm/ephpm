@@ -1,5 +1,12 @@
 # Worker dispatch fairness — the #442 tail-latency investigation
 
+> **Terminology note (v0.9.0):** this measurement record predates the
+> concurrency-config rename and the removal of the `spawn_blocking` execution
+> engine. Read `worker_count` as `[php] concurrency`, `worker_backlog` as
+> `[php] queue_depth`, and `fpm_engine = "pool"` as the (now only) per-request
+> execution pool; the `spawn_blocking`-engine caveats no longer apply.
+> Historical content is otherwise preserved as written.
+
 Issue #442: in the third-party Laravel runtime comparison (wrk `-t10 -c100
 -d30s`, `worker_count = 2`, v0.8.7-php8.4, array sessions), ePHPm worker mode
 had the **highest throughput** of the five Octane-class runtimes (2,227 req/s

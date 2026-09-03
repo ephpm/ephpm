@@ -14,7 +14,7 @@ ePHPm cannot recover from that in general, and does not try. What it does is
 
 There is one narrow, opt-in exception as of v0.7.0: with
 [`[php] crash_containment = true`](/reference/config/#php) (which requires
-`fpm_engine = "pool"`), a PHP **C-stack overflow** — and only that fault
+per-request mode), a PHP **C-stack overflow** — and only that fault
 class — is contained instead of fatal: the offending request is answered
 `500` and the pool thread that ran it is retired and replaced. Heap
 corruption and wild writes still kill the process exactly as described on
@@ -71,10 +71,11 @@ says *why the kernel raised it*.
 flagged inline as a null-pointer dereference, which is by far the most common
 extension bug.
 
-**`thread`.** PHP requests execute on tokio's blocking pool; middleware runs on
-async worker threads. Both are named `tokio-rt-worker`, so the thread name
-tells you it was ePHPm's runtime rather than a thread a library spawned for
-itself — it does not tell you which request was in flight (see
+**`thread`.** PHP requests execute on the dedicated execution pool — threads
+named `ephpm-fpm-<n>` (per-request mode) or `ephpm-worker-<n>` (worker mode) —
+while middleware runs on the async runtime's worker threads. The thread name
+tells you whether the fault hit a PHP execution thread or another part of
+ePHPm's runtime — it does not tell you which request was in flight (see
 [caveats](#caveats)).
 
 **`frames` / `symbols`.** Two views of the same stack. The raw addresses are
@@ -154,7 +155,7 @@ A **destructor cascade** — freeing a very large plain-object graph recurses in
 C (`zend_object_std_dtor` ↔ `zend_objects_store_del`) with no VM checkpoint in
 between, so PHP's guard never gets a chance to fire. That is the fault class the
 report above is for, and the one you can opt in to surviving:
-`[php] crash_containment = true` with `fpm_engine = "pool"` answers that request
+`[php] crash_containment = true` in per-request mode answers that request
 `500` and retires the poisoned thread. See the note at the top of this page and
 the [configuration reference](/reference/config/#php) for the costs.
 

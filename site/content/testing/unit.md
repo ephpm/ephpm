@@ -411,7 +411,7 @@ Full RESP protocol over TCP: PING, SET/GET (incl. binary, NX, XX, EX, PX, GET op
 
 #### 12. PHP Thread Pool / ZTS (`ephpm-php/src/lib.rs`)
 
-- [ ] TSRM thread registration on first `spawn_blocking` use
+- [ ] TSRM thread registration on first use by an execution-pool thread
 - [ ] Concurrent PHP execution across multiple threads
 - [ ] AtomicBool fast-path check for initialization
 - [ ] Graceful shutdown (mutex-protected)

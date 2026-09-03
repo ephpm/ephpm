@@ -26,13 +26,15 @@ pub(crate) const REQUEST_LOG_CAPACITY: usize = 256;
 /// response extensions, so the ring buffer consumes the same measurement
 /// points as the existing histograms instead of re-measuring.
 ///
-/// `queue_wait` is `None` on the fpm (`spawn_blocking`) path — there is no
-/// worker dispatch queue there, so the value is genuinely absent, not zero.
+/// `queue_wait` holds the dispatch-queue wait on both the per-request pool
+/// and the worker pool; it is `None` only for requests that never reached a
+/// dispatch queue (e.g. the defensive no-pool arm).
 /// `execute` is `None` when the request never produced a completed PHP
 /// execution measurement (worker bailout, worker timeout, dispatch failure).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PhpTimings {
-    /// Worker-mode dispatch-queue wait (`ephpm_worker_request_wait_seconds`).
+    /// Dispatch-queue wait (`ephpm_worker_request_wait_seconds` in worker
+    /// mode; measured at the pool dispatch site in per-request mode).
     pub queue_wait: Option<Duration>,
     /// PHP execution timer (`ephpm_php_execution_duration_seconds`). In
     /// worker mode this timer starts at dispatch, so it includes the queue

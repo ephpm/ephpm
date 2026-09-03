@@ -400,8 +400,8 @@ reason is specific to how ePHPm runs PHP.
 ePHPm does not call `php_request_shutdown()` between HTTP requests — the
 embedded SAPI keeps one long-lived request open per worker thread. So a
 shutdown function you register does **not** run at the end of *your*
-request. It runs later, when the worker thread itself retires (the tokio
-blocking pool reaps an idle thread, or the server shuts down) — by which
+request. It runs later, when the worker thread itself retires (the
+execution pool retires the thread, or the server shuts down) — by which
 point that thread's per-request database state has already been released.
 
 A query issued from there is **refused, not executed**, and throws:
@@ -524,7 +524,7 @@ it back (scripts must COMMIT or ROLLBACK before the request finishes)
 ```
 
 This runs at the end of **every** request in both execution modes: in
-fpm mode after the script returns (success, `exit`, or fatal alike), and in
+per-request mode after the script returns (success, `exit`, or fatal alike), and in
 worker mode at response end, again before the next request is taken (so a
 framework `terminate` hook that touches the database is covered), and on
 worker-thread recycle after a fatal.

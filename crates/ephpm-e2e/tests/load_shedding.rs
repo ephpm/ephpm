@@ -1,4 +1,4 @@
-//! Request-granularity load shedding (`[php] overload_policy = "shed"`) e2e
+//! Request-granularity load shedding (`[php] overload = "shed"`) e2e
 //! tests — issue #301.
 //!
 //! Runs against a node the bare-process harness spawns with the pool engine

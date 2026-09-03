@@ -583,7 +583,7 @@ async fn bind_listeners(
     // when preview mode is on, the regular all-off defaults otherwise.
     let limits = config.server.effective_limits();
     log_preview_preset(config, &limits);
-    log_overload_policy(config);
+    log_php_execution_config(config);
     let limiter = {
         let l = rate_limit::Limiter::new(limits);
         if l.is_enabled() {
@@ -704,75 +704,37 @@ async fn bind_listeners(
 
     // Worker mode: wire the worker ops table and spawn the persistent worker
     // pool BEFORE the router so PHP requests can be dispatched to it. PHP is
-    // already initialized (in main.rs, before the tokio runtime). fpm mode
-    // leaves this None and uses the spawn_blocking path unchanged.
+    // already initialized (in main.rs, before the tokio runtime). Per-request
+    // mode leaves this None; the router builds the per-request execution pool
+    // instead.
     let worker_pool = if config.php.is_worker_mode() {
         let script = config
             .resolve_worker_script()
-            .context("worker mode: failed to resolve worker_script")?;
+            .context("worker mode: failed to resolve [php.worker] script")?;
 
-        if config.php.workers > 0 {
-            tracing::warn!(
-                "[php] workers = {} is ignored in worker mode — concurrency is \
-                 bounded by worker_count and worker_backlog",
-                config.php.workers
-            );
-        }
-
-        if config.php.fpm_engine == ephpm_config::FpmEngine::Pool {
-            tracing::warn!(
-                "[php] fpm_engine = \"pool\" is ignored in worker mode — the \
-                 persistent worker pool already owns concurrency here"
-            );
-        }
-
-        let (worker_count, wc_source) = config.php.effective_worker_count_with_source();
-        match wc_source {
-            ephpm_config::WorkerCountSource::Explicit => {
-                tracing::info!(
-                    worker_count,
-                    source = "explicit",
-                    "worker_count from [php].worker_count"
-                );
-            }
-            ephpm_config::WorkerCountSource::CgroupQuota { quota_cpus } => {
-                tracing::info!(
-                    worker_count,
-                    source = "cgroup_quota",
-                    quota_cpus,
-                    "worker_count derived from cgroup CPU quota (ceil(quota))"
-                );
-            }
-            ephpm_config::WorkerCountSource::HostParallelism { cpus } => {
-                tracing::info!(
-                    worker_count,
-                    source = "host_parallelism",
-                    detected_cpus = cpus,
-                    "worker_count derived from host parallelism (clamped [2, 32])"
-                );
-            }
-        }
-        // Historical note: worker_count used to be forced to 1 on Windows on
-        // the belief that Windows builds were NTS (single PHP context). The
+        let (concurrency, source) = config.php.effective_concurrency_with_source();
+        log_concurrency_source(concurrency, source);
+        // Historical note: the worker count used to be forced to 1 on Windows
+        // on the belief that Windows builds were NTS (single PHP context). The
         // Windows php-sdk's `php8embed.lib` is in fact ZTS (#326) — same
         // TSRM-per-thread model as Linux/macOS — and multi-worker mode was
         // verified behaviorally on Windows (3 workers, overlapping wall-clock
         // sleeps + fatal/recycle), so the clamp was removed.
 
-        ephpm_php::PhpRuntime::install_worker_ops(config.php.worker_populate_superglobals);
+        ephpm_php::PhpRuntime::install_worker_ops(config.php.worker.populate_superglobals);
 
         tracing::info!(
-            worker_stream_threshold = config.php.worker_stream_threshold,
-            "worker mode: request bodies at/above worker_stream_threshold stream \
-             into the worker (flat memory); smaller bodies buffer"
+            stream_threshold = config.php.worker.stream_threshold,
+            "worker mode: request bodies at/above [php.worker] stream_threshold \
+             stream into the worker (flat memory); smaller bodies buffer"
         );
 
         let pool = worker_pool::WorkerPool::spawn(
             script,
-            worker_count,
-            config.php.worker_max_requests,
-            config.php.effective_worker_backlog(),
-            Duration::from_secs(config.php.worker_boot_timeout),
+            concurrency,
+            config.php.worker.max_requests,
+            config.php.effective_queue_depth(),
+            Duration::from_secs(config.php.worker.boot_timeout),
             // A client that stops reading a streamed download for longer than
             // the idle timeout aborts the stream (frees the worker thread) —
             // same idleness contract the connection layer applies.
@@ -781,13 +743,14 @@ async fn bind_listeners(
         );
         Some(pool)
     } else {
-        // add-config-knob: worker_stream_threshold is worker-mode-only. Warn if
-        // an fpm-mode operator set it to a non-default, so it is never a silent
-        // no-op.
-        if config.php.worker_stream_threshold != 1024 * 1024 {
-            tracing::warn!(
-                "[php] worker_stream_threshold is ignored in fpm mode (it only \
-                 governs worker-mode request-body streaming)"
+        // add-config-knob: `[php.worker]` is structurally scoped to worker
+        // mode, but an operator who configured it still deserves one line
+        // saying it is not in force (the no-silent-no-op rule).
+        if config.php.worker.is_customized() {
+            tracing::info!(
+                "[php.worker] is configured but [php] mode = \"per_request\" — \
+                 worker-mode knobs are not in force (set [php] mode = \"worker\" \
+                 to use them)"
             );
         }
         None
@@ -1147,9 +1110,9 @@ async fn accept_loop(listeners: Listeners) -> anyhow::Result<()> {
         pool.drain();
     }
 
-    // FPM pool engine (`[php] fpm_engine = "pool"`): same contract — close the
-    // dispatch queue so pool threads finish any in-flight request and exit.
-    // Mutually exclusive with `worker_pool` (pool engine is fpm-mode only).
+    // Per-request execution pool: same contract — close the dispatch queue so
+    // pool threads finish any in-flight request and exit. Mutually exclusive
+    // with `worker_pool` (the pool exists in per-request mode only).
     let fpm_pool = router.fpm_pool();
     if let Some(pool) = &fpm_pool {
         pool.drain();
@@ -1254,10 +1217,10 @@ fn log_preview_preset(config: &ephpm_config::Config, limits: &ephpm_config::Reso
     let mut applied = server.preview_preset_applied();
     // The preset reaches outside `[server.limits]` for exactly one knob: the
     // request-granularity shed policy (issue #301). Reported in the same list so
-    // "what did preview change?" has one answer. `log_overload_policy` then says
-    // what the resulting policy actually does on the active engine.
-    if config.overload_policy_from_preview_preset() {
-        applied.push(("php.overload_policy", "shed".to_string()));
+    // "what did preview change?" has one answer. `log_php_execution_config` then
+    // says what the resulting policy actually does.
+    if config.overload_from_preview_preset() {
+        applied.push(("php.overload", "shed".to_string()));
     }
     let preset_supplied =
         applied.iter().map(|(key, value)| format!("{key}={value}")).collect::<Vec<_>>().join(", ");
@@ -1280,70 +1243,97 @@ fn log_preview_preset(config: &ephpm_config::Config, limits: &ephpm_config::Reso
     );
 }
 
-/// Log what `[php] overload_policy` resolved to, where that came from, and —
-/// the part that actually matters — what it will do on the *active* execution
-/// engine.
+/// Log where the effective `[php] concurrency` came from, at INFO — the sizing
+/// decision an operator and a bench gate assert on.
 ///
-/// Shedding is not a property of the knob alone: it needs an admission queue to
-/// reject from, and on the default `spawn_blocking` engine that queue exists
-/// only when `[php] workers` is set. Setting the policy without it changes
-/// nothing, which is exactly the silent-no-op this project forbids — so that
-/// combination WARNs, naming the two ways out.
-fn log_overload_policy(config: &ephpm_config::Config) {
+/// The `#461` arm: when a cgroup quota derives a value below the safe floor,
+/// the clamp raises it and this says so — an operator on a `--cpus 1` box
+/// should understand why they got 2 threads rather than 1 (a 1-thread pool
+/// deadlocks PHP loopback subrequests).
+pub(crate) fn log_concurrency_source(concurrency: usize, source: ephpm_config::ConcurrencySource) {
+    match source {
+        ephpm_config::ConcurrencySource::Explicit => {
+            tracing::info!(concurrency, source = "explicit", "concurrency from [php] concurrency");
+        }
+        ephpm_config::ConcurrencySource::CgroupQuota { quota_cpus, unclamped } => {
+            tracing::info!(
+                concurrency,
+                source = "cgroup_quota",
+                quota_cpus,
+                "concurrency derived from cgroup CPU quota (ceil(quota), clamped [2, 32])"
+            );
+            if unclamped < concurrency {
+                tracing::info!(
+                    quota_cpus,
+                    derived = unclamped,
+                    clamped_to = concurrency,
+                    "cgroup CPU quota derived fewer execution threads than the safe floor; \
+                     raised to the floor — a 1-thread pool deadlocks a PHP loopback \
+                     subrequest (#461). Set [php] concurrency = 1 explicitly to override."
+                );
+            }
+        }
+        ephpm_config::ConcurrencySource::HostParallelism { cpus } => {
+            tracing::info!(
+                concurrency,
+                source = "host_parallelism",
+                detected_cpus = cpus,
+                "concurrency derived from host parallelism (clamped [2, 32])"
+            );
+        }
+    }
+}
+
+/// Log, in one line, the full effective PHP execution configuration — mode,
+/// concurrency (+source), queue depth, admission and overload policy. The one
+/// line an operator and a bench gate can assert on.
+///
+/// Worker mode gets an extra WARN when `overload = "shed"` is set: the worker
+/// pool bounds concurrency with its own queue and answers 504 on a starved
+/// queue, so the shed policy does not apply there (never a silent no-op).
+fn log_php_execution_config(config: &ephpm_config::Config) {
     use ephpm_config::OverloadPolicy;
 
-    let policy = config.effective_overload_policy();
-    if policy == OverloadPolicy::Wait {
-        // The historical behaviour and the default. Nothing to announce; an
-        // operator who explicitly chose it under preview is opting out of the
-        // preset, which the preview log already covers.
-        return;
-    }
+    let policy = config.effective_overload();
+    let (concurrency, source) = config.php.effective_concurrency_with_source();
+    tracing::info!(
+        mode = config.php.mode.as_str(),
+        concurrency,
+        concurrency_source = source.label(),
+        queue_depth = config.php.effective_queue_depth(),
+        admission = config.php.admission.as_str(),
+        overload = match policy {
+            OverloadPolicy::Wait => "wait",
+            OverloadPolicy::Shed => "shed",
+        },
+        shed_after_ms = config.php.shed_after_ms,
+        "php execution configured"
+    );
 
-    let source = if config.overload_policy_from_preview_preset() {
-        "[server] preview preset"
-    } else {
-        "[php] overload_policy"
-    };
-    let shed_after_ms = config.php.shed_after_ms;
-
-    if config.php.is_worker_mode() {
-        tracing::warn!(
-            source,
-            "[php] overload_policy = \"shed\" is ignored in worker mode — the persistent \
-             worker pool bounds concurrency with its own queue ([php] worker_backlog) and \
-             answers 504 on a starved queue"
-        );
-        return;
-    }
-
-    if config.php.is_pool_engine() {
-        tracing::info!(
-            source,
-            shed_after_ms,
-            backlog = config.php.effective_worker_backlog(),
-            pool_threads = config.php.effective_worker_count(),
-            "load shedding ON: a PHP request that cannot get a pool slot within \
-             shed_after_ms of a full dispatch backlog is answered 503 + Retry-After \
-             instead of queueing"
-        );
-    } else if config.php.workers > 0 {
-        tracing::info!(
-            source,
-            shed_after_ms,
-            workers = config.php.workers,
-            "load shedding ON: a PHP request that cannot get one of the [php] workers \
-             slots within shed_after_ms is answered 503 + Retry-After instead of queueing"
-        );
-    } else {
-        tracing::warn!(
-            source,
-            "load shedding is requested but INERT: the default [php] fpm_engine = \
-             \"spawn_blocking\" sheds against the [php] workers semaphore, and workers = 0 \
-             means there is no admission queue to reject from (tokio's blocking queue is \
-             unbounded and its entries cannot be withdrawn). Set [php] workers to a \
-             concurrency cap, or [php] fpm_engine = \"pool\", for shedding to take effect"
-        );
+    if policy == OverloadPolicy::Shed {
+        let overload_source = if config.overload_from_preview_preset() {
+            "[server] preview preset"
+        } else {
+            "[php] overload"
+        };
+        if config.php.is_worker_mode() {
+            tracing::warn!(
+                source = overload_source,
+                "[php] overload = \"shed\" is ignored in worker mode — the persistent \
+                 worker pool bounds concurrency with its own queue ([php] queue_depth) and \
+                 answers 504 on a starved queue"
+            );
+        } else {
+            tracing::info!(
+                source = overload_source,
+                shed_after_ms = config.php.shed_after_ms,
+                queue_depth = config.php.effective_queue_depth(),
+                pool_threads = concurrency,
+                "load shedding ON: a PHP request that cannot get a pool slot within \
+                 shed_after_ms of a full dispatch queue is answered 503 + Retry-After \
+                 instead of queueing"
+            );
+        }
     }
 }
 
@@ -2799,7 +2789,7 @@ mod lib_tests {
                 index_files: vec!["index.html".to_owned()],
                 ..ephpm_config::ServerConfig::default()
             },
-            php: ephpm_config::PhpConfig::default(),
+            php: test_php_config(),
             db: ephpm_config::DbConfig::default(),
             kv: ephpm_config::KvConfig::default(),
             cluster: ephpm_config::ClusterConfig::default(),
@@ -2808,6 +2798,20 @@ mod lib_tests {
         };
         let store = ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default());
         Arc::new(Router::new(&config, store, None, None, None, None, None))
+    }
+
+    /// PHP config for router-building tests in this module. Same treatment as
+    /// `router::tests::test_php_config`: pin `concurrency = 2` so each test
+    /// router spins two pool threads instead of a host-derived count
+    /// (`clamp(host_cpus, 2, 32)`, at 8 MiB stack each), and run the
+    /// idempotent stub `PhpRuntime::init()` first so those threads register
+    /// with TSRM instead of failing registration and respawn-looping on the
+    /// boot-failure backoff (nothing else in this test binary calls `init()`).
+    /// The pool threads clone the pool `Arc` and are only retired by
+    /// `drain()`, so keeping them few and parked matters.
+    fn test_php_config() -> ephpm_config::PhpConfig {
+        ephpm_php::PhpRuntime::init().expect("stub runtime init");
+        ephpm_config::PhpConfig { concurrency: 2, ..ephpm_config::PhpConfig::default() }
     }
 
     /// Manual TLS over a freshly generated self-signed cert.
@@ -3350,6 +3354,9 @@ mod lib_tests {
     // ── idle timeout ────────────────────────────────────────────────────────
 
     /// Minimal router serving `dir` with a static-only fallback (no PHP).
+    /// `test_php_config()` (not the raw default) — see its doc: the pinned
+    /// 2-thread pool + stub init keep router construction from spawning a
+    /// host-derived thread count that respawn-loops without TSRM.
     fn idle_test_router(dir: &std::path::Path) -> Arc<Router> {
         let config = ephpm_config::Config {
             server: ephpm_config::ServerConfig {
@@ -3357,7 +3364,7 @@ mod lib_tests {
                 fallback: vec!["$uri".to_string(), "=404".to_string()],
                 ..ephpm_config::ServerConfig::default()
             },
-            php: ephpm_config::PhpConfig::default(),
+            php: test_php_config(),
             db: ephpm_config::DbConfig::default(),
             kv: ephpm_config::KvConfig::default(),
             cluster: ephpm_config::ClusterConfig::default(),

@@ -96,7 +96,7 @@ while (true) {
 
 Blocking is safe in worker mode (the wait parks that connection's
 dedicated worker thread — which is exactly what a poll loop did, minus
-the burn). In fpm mode the whole request runs under
+the burn). In per-request mode the whole request runs under
 `[server.timeouts] request` (default 300 s), so keep `$timeout_ms` well
 below that.
 

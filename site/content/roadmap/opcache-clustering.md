@@ -253,7 +253,7 @@ at any time to push a file into the OPcache. Per-vhost flow:
 1. Vhost discovery (existing code in `Router::resolve_site` and
    `scan_sites_dir`) fires.
 2. If `<vhost>/site.toml` has `[opcache.preload] files`, queue a
-   `spawn_blocking` task that:
+   task on the PHP execution pool that:
    - Runs each preload file through `opcache_compile_file()`.
    - Records timing in `ephpm_opcache_preload_seconds_bucket`.
 3. The first request to that vhost finds the bootstrap files already
@@ -350,7 +350,7 @@ end-to-end including tests. **Shipped in 0.4.0** — see the
 
 ### Phase 1.5 — Worker-mode invalidation (not yet implemented)
 
-Phase 1 wires the watcher into the fpm dispatch path only; with
+Phase 1 wires the watcher into the per-request dispatch path only; with
 `[php] mode = "worker"` the watcher is skipped (startup WARNs so the
 no-op is never silent). Closing it: run the same
 `OpcacheWatcher::check` at the top of the worker `take_request` loop —
@@ -360,7 +360,7 @@ coalesces concurrent workers. One design question to settle: a
 persistent worker holds the booted framework's classes in memory
 regardless of OPcache, so invalidation alone does not swap code in a
 running worker — it must pair with worker recycling
-(`worker_max_requests`-style drain) for a full deploy. Document the
+(`[php.worker] max_requests`-style drain) for a full deploy. Document the
 semantics: invalidation refreshes what workers *compile next*
 (templates, lazily-loaded classes); a code swap of the booted core
 needs recycle-on-deploy, which is the natural companion knob
@@ -371,7 +371,7 @@ needs recycle-on-deploy, which is the natural companion knob
 | Piece | Where | Effort |
 |---|---|---|
 | `[opcache.preload]` parsing in site config | `crates/ephpm-config/src/lib.rs` | ~30 LOC |
-| Background preload runner (spawn_blocking on vhost discovery) | `crates/ephpm-server/src/router.rs` | ~40 LOC |
+| Background preload runner (on the PHP execution pool at vhost discovery) | `crates/ephpm-server/src/router.rs` | ~40 LOC |
 | `opcache_compile_file($path)` FFI helper | `crates/ephpm-php/ephpm_wrapper.c` | ~30 LOC |
 | Tests: preload entries get cached; preload failures don't break the vhost | server + e2e | ~80 LOC |
 
@@ -453,7 +453,7 @@ changes mid-run).
   scans sites_dir sequentially. With preload, that becomes
   serial-compile-then-next-vhost. For 50 vhosts × 30 preload files
   each, startup could grow meaningfully. Parallelize across vhosts
-  via the `spawn_blocking` pool (already what we have for PHP
+  via the PHP execution pool (already what we have for PHP
   requests).
 - **Revision tagging vs version monotonicity.** The version key is
   `epoch_ms` for simplicity. Operators may want to set it to their

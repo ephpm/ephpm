@@ -1,7 +1,7 @@
 //! Process-wide privilege drop for `[server] run_as_user` / `run_as_group`.
 //!
-//! ePHPm is a single process that runs every tenant's PHP on tokio
-//! `spawn_blocking` threads. There is no per-thread uid on Linux worth relying
+//! ePHPm is a single process that runs every tenant's PHP on its own
+//! execution-pool threads. There is no per-thread uid on Linux worth relying
 //! on (glibc broadcasts credential changes to every thread via the `setxid`
 //! mechanism), and per-tenant uids would require per-tenant *processes*, which
 //! this model does not have. What this module provides is the one thing that

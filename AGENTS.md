@@ -80,7 +80,7 @@ ephpm admin --nodes 10.0.1.1:9090,10.0.1.2:9090
 - Zero-cost C FFI — no CGO overhead (ePHPm's key competitive advantage over FrankenPHP)
 - C wrapper (`ephpm_wrapper.c`) is required for all PHP calls due to PHP's `setjmp`/`longjmp` error handling — never call PHP APIs directly from Rust
 - Superglobals (`$_GET`, `$_POST`, `$_SERVER`) work — this is critical for adoption
-- Concurrent PHP execution via ZTS — each `spawn_blocking` thread auto-registers with TSRM and gets its own isolated PHP context. Mutex only protects one-time init/shutdown.
+- Concurrent PHP execution via ZTS — each PHP execution thread (dedicated pool / worker pool) auto-registers with TSRM and gets its own isolated PHP context. Mutex only protects one-time init/shutdown.
 - Windows builds are ZTS too — the php-sdk's static `php8embed.lib` is a ZTS build and the wrapper/bindgen compile with `ZTS=1` (#326). Windows-specific gaps: no per-thread execution timers (`max_execution_time` not natively enforced) and no Unix crash containment
 - Reference implementations: FrankenPHP's `frankenphp.c`, Pasir's ext-php-rs integration, `ripht-php-sapi` crate
 
@@ -159,9 +159,9 @@ The worker lifecycle is:
 7. Worker loops back to step 2
 
 Key design:
-- PHP requests execute concurrently on tokio's `spawn_blocking` thread pool — no dedicated worker pool
-- Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own PHP context
-- Async HTTP layer (tokio) dispatches to `spawn_blocking`; responses return via oneshot channel
+- Per-request PHP executes concurrently on ePHPm's dedicated execution pool (`[php] concurrency` threads); worker mode uses the persistent worker pool
+- Each execution thread auto-registers with TSRM on first use, getting its own PHP context
+- Async HTTP layer (tokio) dispatches to the pool; responses return via oneshot channel
 - No `runtime.LockOSThread()` hacks — Rust gives direct thread control
 - PHP's ZTS thread model maps naturally to Rust's ownership/Send+Sync model
 
@@ -186,7 +186,7 @@ The project has a working Cargo workspace. PHP embedding is fully implemented an
 - `ephpm php` subcommand provides a full PHP CLI passthrough (all standard flags work)
 - `ephpm service install|uninstall|start|stop` manages OS service registration on Linux (systemd) and Windows (SCM)
 
-ZTS PHP runs concurrently: each `spawn_blocking` thread auto-registers with TSRM and gets its own PHP context — no dedicated worker pool. Shipped subsystems beyond core embedding: in-process MySQL DB proxy with pooling, in-process KV store (RESP + SETNX), SWIM gossip clustering, single-node and clustered embedded Turso (litewire + the in-process Turso engine; clustered replicates via the in-process Turso CDC path — no sqld sidecar), primary election + failover, query stats with Prometheus metrics, and a native PHP session handler backed by the KV tier. As of v0.7.0 the rusqlite backend and sqld were removed — Turso is the only embedded SQLite-family engine.
+ZTS PHP runs concurrently: each execution-pool thread auto-registers with TSRM and gets its own PHP context. Shipped subsystems beyond core embedding: in-process MySQL DB proxy with pooling, in-process KV store (RESP + SETNX), SWIM gossip clustering, single-node and clustered embedded Turso (litewire + the in-process Turso engine; clustered replicates via the in-process Turso CDC path — no sqld sidecar), primary election + failover, query stats with Prometheus metrics, and a native PHP session handler backed by the KV tier. As of v0.7.0 the rusqlite backend and sqld were removed — Turso is the only embedded SQLite-family engine.
 
 Native middleware shipped: a static builtin registry (ten official modules — `jwt`, `cors`, `ratelimit`, `security-headers`, `api-key`, `ip-allowlist`, `maintenance-mode`, `redirect`, `request-id`, `header-transform` — compiled into every binary; `request-id`/`header-transform` also run the response phase via `BuiltinModule::init_response`) plus a dlopen C-ABI lane for out-of-tree modules — the Linux release binary is glibc-dynamic, so the dlopen lane (and `[php] extensions` shared-extension loading) works out of the box. Implementations live in `ephpm-middleware-builtins`; the in-repo `ephpm-middleware-{jwt,cors,ratelimit,security-headers}` crates are cdylib shells kept as the cross-platform dlopen CI fixtures (their `declare!` exports collide if linked into one binary — never add them as server deps), and cdylib shells for the other six live in the `ephpm/middleware` (examples) repo. Active roadmap items (specs landed, no code yet): OPcache clustering with per-vhost preload.
 
@@ -255,4 +255,4 @@ Key files:
 6. **Conditional compilation**: All PHP FFI code is gated with `#[cfg(php_linked)]`. The stub mode (no `PHP_SDK_PATH`) must always compile and pass tests. See `CLAUDE.md` for the full conventions.
 7. **Build**: `cargo xtask release` downloads the prebuilt PHP SDK (`libphp.a` + headers; the glibc-linked `-gnu` variant on Linux) from `github.com/ephpm/php-sdk` releases and compiles a glibc-dynamic release binary (gnu target, `--export-dynamic`) that can dlopen shared PHP extensions and middleware. No system PHP, Composer, or static-php-cli required — just curl, tar, build-essential, pkg-config, and libclang-dev on Linux.
 8. **CLI**: `ephpm serve` starts the HTTP server. `ephpm php [args...]` is a full PHP CLI passthrough — all standard PHP flags work (`-v`, `-r`, `-f`, `-m`, `-i`, `-l`, etc.).
-9. **ZTS is implemented.** PHP is compiled with `--enable-zts`; each `spawn_blocking` thread auto-registers with TSRM and gets its own isolated PHP context. The `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown; an `AtomicBool` fast-path handles the "is PHP ready?" hot check. Windows is ZTS as well — the Windows php-sdk ships a ZTS `php8embed.lib` and the build compiles the wrapper/bindings with `ZTS=1` (#326). See the roadmap docs in `docs/architecture/` for what's next (OPcache clustering, build-time composition of extensions/middleware, etc.).
+9. **ZTS is implemented.** PHP is compiled with `--enable-zts`; each PHP execution thread auto-registers with TSRM and gets its own isolated PHP context. The `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown; an `AtomicBool` fast-path handles the "is PHP ready?" hot check. Windows is ZTS as well — the Windows php-sdk ships a ZTS `php8embed.lib` and the build compiles the wrapper/bindings with `ZTS=1` (#326). See the roadmap docs in `docs/architecture/` for what's next (OPcache clustering, build-time composition of extensions/middleware, etc.).

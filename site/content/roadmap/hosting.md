@@ -23,12 +23,12 @@ ePHPm is designed to run on the smallest cloud VMs available. A single binary wi
 | 4 | ~270 MB | ~900 MB | Medium traffic site |
 | 8 | ~430 MB | ~1.5 GB | High traffic single-node |
 
-Worker count defaults to CPU count (capped at 16). Override with `php.workers`.
+Worker count defaults to the cgroup CPU quota or host parallelism (clamped 2-32). Override with `php.concurrency`.
 
 **To fit in 512 MB RAM:**
 ```toml
 [php]
-workers = 1
+concurrency = 1
 memory_limit = "64M"
 
 [kv]
@@ -120,7 +120,7 @@ Container platforms work but need persistent storage for the SQLite database fil
 
 ```toml
 [php]
-workers = 1
+concurrency = 1
 memory_limit = "64M"
 
 [kv]
@@ -138,7 +138,7 @@ Handles ~5 req/s dynamic, thousands of static asset requests. Install a WordPres
 
 ```toml
 [php]
-workers = 4
+concurrency = 4
 memory_limit = "128M"
 
 [kv]
@@ -159,7 +159,7 @@ Handles ~20-40 req/s dynamic. Enable Hrana for external tooling access. Use the 
 
 ```toml
 [php]
-workers = 4
+concurrency = 4
 
 [db.sqlite]
 path = "/var/lib/ephpm/app.db"
@@ -200,7 +200,7 @@ Running WordPress on a $5/mo VM:
 | Base memory | ~130 MB | ~300-400 MB |
 | Setup time | Copy binary + config | Install packages, configure each service |
 | Database backup | Copy one `.db` file | mysqldump or xtrabackup |
-| Scaling up | Add `workers` config | Tune pm.max_children, mysql connections, nginx workers |
+| Scaling up | Add `concurrency` config | Tune pm.max_children, mysql connections, nginx workers |
 | Monitoring | Built-in `/metrics` | Install node_exporter, mysqld_exporter, php-fpm status |
 | TLS | Built-in ACME | Install certbot, configure nginx |
 

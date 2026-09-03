@@ -1,7 +1,7 @@
 //! Stack-overflow crash containment for the single-process ZTS model.
 //!
-//! Off unless `[php] crash_containment = true` **and** `[php] fpm_engine =
-//! "pool"` (see [`set_enabled`]). When off, [`run_guarded`] is never called, no
+//! Off unless `[php] crash_containment = true` in per-request mode
+//! (see [`set_enabled`]). When off, [`run_guarded`] is never called, no
 //! guard is ever armed, and the fatal-signal handler's recovery hook is not
 //! even registered — a crash kills the process exactly as it always has.
 //!
@@ -73,18 +73,19 @@
 //! surfaces the request as [`crate::PhpError::Contained`].
 //!
 //! Actually *retiring* the OS thread is the caller's job, and is why
-//! containment is gated on the dedicated FPM pool: `ephpm-server`'s
+//! containment is gated on per-request mode: `ephpm-server`'s
 //! `fpm_pool::thread_main` sees `PhpError::Contained`, exits its job loop
-//! **without** PHP teardown, and the pool spawns a replacement. On tokio's
-//! shared `spawn_blocking` pool no such primitive exists — a poisoned thread
-//! would stay in rotation failing every later request, which is why that
-//! combination is refused at startup.
+//! **without** PHP teardown, and the pool spawns a replacement. A shared
+//! thread pool (tokio's `spawn_blocking`, where PHP no longer runs) has no
+//! such retire primitive, and a worker-mode thread holds booted framework
+//! state that cannot be abandoned mid-flight — which is why worker mode
+//! refuses to arm containment at startup.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Master switch. `false` until the server explicitly turns containment on for
 /// this process, which it does only for the one supported configuration
-/// (`[php] crash_containment = true` + `fpm_engine = "pool"`).
+/// (`[php] crash_containment = true` in per-request mode).
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Turn crash containment on or off for this process.

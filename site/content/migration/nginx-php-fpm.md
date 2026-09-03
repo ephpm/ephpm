@@ -11,7 +11,7 @@ ePHPm replaces both Nginx and PHP-FPM with a single binary. No FastCGI socket. N
 | HTTP server | Nginx | Built-in (hyper) |
 | PHP runtime | PHP-FPM (separate process) | Embedded via FFI (same process) |
 | PHP ↔ HTTP communication | FastCGI over Unix socket | In-process function call |
-| Process management | `pm.dynamic` / `pm.static` | Worker thread pool (`php.workers`) |
+| Process management | `pm.dynamic` / `pm.static` | Worker thread pool (`php.concurrency`) |
 | Static files | Nginx serves directly | Built-in with compression |
 | TLS termination | Nginx + certbot | Built-in ACME |
 | Services to manage | 2 (nginx + php-fpm) | 1 |
@@ -90,9 +90,9 @@ ePHPm equivalent:
 
 ```toml
 [php]
-workers = 8            # replaces pm.max_children. NOT auto-detected: the default
-                       # is 0 = unlimited (bounded only by tokio's blocking pool).
-                       # Set it explicitly to get an FPM-style concurrency cap.
+concurrency = 8        # replaces pm.max_children. The default 0 derives the pool
+                       # size from the cgroup CPU quota / host parallelism,
+                       # clamped [2, 32]. Set it explicitly to pin the cap.
 memory_limit = "256M"
 max_execution_time = 30   # ← php_admin_value[max_execution_time]. Enforced on
                           # Linux ZTS (catchable fatal → 500); not on macOS/Windows.
@@ -104,7 +104,7 @@ request = 45           # outer hard 504 backstop — keep it above max_execution
 max_body_size = 67108864   # 64 MB
 ```
 
-PHP-FPM's process model (`pm.dynamic`, `pm.start_servers`, spare servers) doesn't apply — PHP runs on tokio's shared blocking-thread pool, which stays warm and grows on demand rather than forking children. No cold starts, no process spawning overhead. `workers` is a semaphore around PHP execution, not a pool size: it caps how many requests may be *executing* PHP at once, and static file serving is never starved by slow scripts.
+PHP-FPM's process model (`pm.dynamic`, `pm.start_servers`, spare servers) doesn't apply — PHP runs on ePHPm's dedicated execution pool of warm threads rather than forked children. No cold starts, no process spawning overhead. `concurrency` is the pool size: it caps how many requests may be *executing* PHP at once, and static file serving is never starved by slow scripts (PHP never runs on the async server's threads).
 
 **Connection and rate limits** (Nginx's `worker_connections`, `limit_conn`, `limit_req`):
 

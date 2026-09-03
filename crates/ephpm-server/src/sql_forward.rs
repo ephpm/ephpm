@@ -516,8 +516,9 @@ impl ClusteredSiteResolver {
 impl SiteBackendResolver for ClusteredSiteResolver {
     fn resolve(&self, site_key: &str) -> Result<SharedBackend, String> {
         // block_on is legal: `resolve` is only ever called from the bridge on a
-        // PHP worker / spawn_blocking thread, never an async task — the same
-        // invariant that licenses the plain registry's `resolve`.
+        // PHP execution thread (per-request pool / worker pool), never an
+        // async task — the same invariant that licenses the plain registry's
+        // `resolve`.
         //
         // The wire path must NOT come through here: it resolves from inside a
         // tokio worker (litewire's authenticator is async), where `block_on`

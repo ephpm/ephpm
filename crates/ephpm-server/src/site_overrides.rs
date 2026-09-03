@@ -235,7 +235,7 @@ fn validate_declared_root(container: &Path, declared: &str, site_key: &str) -> O
     // `include` fails on. The containment check above deliberately runs on the
     // verbatim forms (both sides canonicalized, so their prefixes agree); only
     // the value handed onwards is simplified. Same hazard, same fix, same
-    // helper as `[php] worker_script`.
+    // helper as `[php.worker] script`.
     Some(ephpm_config::strip_verbatim_prefix(target))
 }
 
@@ -299,7 +299,7 @@ mod tests {
     /// (`\\?\C:\...`), and PHP cannot open one — shipping that as
     /// `DOCUMENT_ROOT`/`SCRIPT_FILENAME` makes every `require` in the site fail
     /// with "Failed to open stream". Caught by driving real HTTP; pinned here.
-    /// Same hazard `[php] worker_script` already had, hence the shared helper.
+    /// Same hazard `[php.worker] script` already had, hence the shared helper.
     #[test]
     fn resolved_root_is_not_a_verbatim_path() {
         let f = fixture();

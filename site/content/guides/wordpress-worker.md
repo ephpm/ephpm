@@ -51,7 +51,7 @@ composer update
 
 This installs the entrypoint at `vendor/bin/ephpm-wp-worker`. (The engine skips
 `#!/usr/bin/env php` shebang lines in worker scripts, so Composer bin proxies
-work directly as `worker_script`.)
+work directly as the worker `script`.)
 
 ## 2. Configure ePHPm
 
@@ -63,34 +63,38 @@ document_root = "/var/www/wordpress"
 
 [php]
 mode = "worker"
-worker_script = "vendor/bin/ephpm-wp-worker"
-worker_populate_superglobals = true      # REQUIRED for WordPress
+
+[php.worker]
+script = "vendor/bin/ephpm-wp-worker"
+populate_superglobals = true      # REQUIRED for WordPress
 ```
 
-`worker_populate_superglobals = true` is **required**: unlike Octane/PSR-15
+`[php.worker] populate_superglobals = true` is **required**: unlike Octane/PSR-15
 adapters (which build their own request object from the `Envelope`), WordPress
 assumes real `$_GET`/`$_POST`/`$_SERVER`/`$_COOKIE` superglobals. ePHPm
 repopulates them per request through PHP's normal `treat_data` path.
 
-`worker_script` must resolve to a file under `document_root`, so the adapter
+`[php.worker] script` must resolve to a file under `document_root`, so the adapter
 must be installed inside the WordPress root.
 
 ## Sizing and recycling
 
 A booted WordPress kernel is heavy (~40 MB per worker) — you may want an
-explicit `worker_count` lower than the CPU-derived default:
+explicit `concurrency` lower than the CPU-derived default:
 
 ```toml
 [php]
-worker_count = 4            # 0 = derive from cgroup quota (Linux) or CPU count [2, 32]
-worker_max_requests = 10000 # recycle after N requests (0 = never; pure leak guard)
+concurrency = 4             # 0 = derive from cgroup quota (Linux) or CPU count [2, 32]
+
+[php.worker]
+max_requests = 10000        # recycle after N requests (0 = never; pure leak guard)
 ```
 
 Recycling matters more for WordPress than for container-based frameworks:
 
 - **Plugin/theme updates and `wp-config.php` edits do not take effect in
   already-booted workers.** The old code stays loaded until the worker
-  recycles (`worker_max_requests`) or you restart ePHPm. Restart after
+  recycles (`[php.worker] max_requests`) or you restart ePHPm. Restart after
   updates if you can't wait for the recycle cycle.
 - A fatal inside a hook, or a plugin calling `exit()`/`die()` mid-request
   (WordPress does this routinely — redirects, `wp_die()`), never wedges the
@@ -118,7 +122,7 @@ requests and workers, and replicates across nodes in cluster mode. See the
   with zero. `wp_unique_id()`'s counter also keeps climbing, so the generated
   `wp-container-core-*-is-layout-N` classes drift away from the CSS that was
   printed. Resetting those registries per request is the **adapter's** job, not
-  the engine's — until the adapter does it, serve block themes in fpm mode.
+  the engine's — until the adapter does it, serve block themes in per-request mode.
   (The engine itself renders blocks fine: `do_blocks()`, nested template parts,
   the Query loop, the Interactivity API and REST all survive a persistent
   worker. [ephpm#116](https://github.com/ephpm/ephpm/issues/116) also reported
@@ -130,14 +134,14 @@ requests and workers, and replicates across nodes in cluster mode. See the
   process.)
 - Worker mode is a whole-server switch; it is **not supported with
   `[server] sites_dir`** (config load hard-errors), so multi-tenant vhosting —
-  including WordPress multisite behind vhosts — stays on fpm mode for now.
+  including WordPress multisite behind vhosts — stays on per-request mode for now.
 - Plugins that assume process death for cleanup (e.g. `pcntl_fork`-based
   backup plugins) are not compatible with any worker-mode runtime. If a plugin
-  misbehaves under worker mode, run that site in the default fpm mode — it
+  misbehaves under worker mode, run that site in the default per-request mode — it
   remains fully supported and byte-for-byte identical to previous releases.
 
 ## See also
 
-- [WordPress guide](/guides/wordpress/) — classic (fpm-mode) deployment paths
+- [WordPress guide](/guides/wordpress/) — classic (per-request mode) deployment paths
 - [Config reference — `[php]`](/reference/config/) — authoritative worker knobs
 - [Metrics reference](/reference/metrics/) — `ephpm_worker_*` series

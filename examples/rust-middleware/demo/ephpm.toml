@@ -16,7 +16,7 @@ document_root = "public"
 # public/index.php, which is the request the REWRITE verdict acts on.
 
 [php]
-mode = "fpm"
+mode = "per_request"
 
 # ── the middleware mount ──────────────────────────────────────────────────
 #

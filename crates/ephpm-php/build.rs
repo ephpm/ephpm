@@ -54,8 +54,8 @@ fn main() {
     // php_config.h carries `#define ZEND_MAX_EXECUTION_TIMERS 1`. That build
     // arms a per-thread POSIX timer (timer_create/SIGEV_THREAD_ID + SIGRTMIN,
     // CLOCK_BOOTTIME) instead of the process-wide setitimer/SIGPROF timer, so
-    // the timeout signal lands on the exact PHP thread and is safe under
-    // tokio's spawn_blocking pool.
+    // the timeout signal lands on the exact PHP execution thread and never on
+    // an unrelated (e.g. tokio) thread.
     let has_exec_timers = php_config_has_max_exec_timers(&include_dir);
     if has_exec_timers {
         println!("cargo::rustc-cfg=php_max_exec_timers");

@@ -3,9 +3,9 @@
 //! Every PHP request routes through [`OpcacheWatcher::check`], which reads
 //! `opcache:version:<vhost>` from the in-process KV store and compares it to
 //! the last version this node acted on for that vhost. On a mismatch, the
-//! caller (currently the `spawn_blocking` PHP dispatch closure in `router.rs`)
-//! runs the FFI invalidator under the vhost's docroot, then advances the
-//! stored version.
+//! caller (currently the per-request execution-pool closure built in
+//! `router.rs`) runs the FFI invalidator under the vhost's docroot, then
+//! advances the stored version.
 //!
 //! Design: `site/content/roadmap/opcache-clustering.md` (Phase 1).
 //!

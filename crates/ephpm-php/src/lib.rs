@@ -280,7 +280,7 @@ mod ffi {
 /// Tracks whether the current thread has been registered with TSRM, and
 /// retires the thread's PHP context when the thread exits.
 ///
-/// Each `spawn_blocking` thread must call `ephpm_thread_init()` once
+/// Each PHP execution thread must call `ephpm_thread_init()` once
 /// before executing PHP. This thread-local avoids redundant registration.
 ///
 /// The [`Drop`] impl is the ZTS retirement seam (issue #266): TSRM's
@@ -479,7 +479,7 @@ mod exec_code {
 /// How a worker's framework loop ended (see [`PhpRuntime::run_worker`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerExit {
-    /// The loop ended cleanly: graceful drain or `worker_max_requests` recycle.
+    /// The loop ended cleanly: graceful drain or `[php.worker] max_requests` recycle.
     Clean,
     /// The script ended while a request was still in flight (`exit()`/`die()`
     /// mid-request, or a break out of the loop). The C layer synthesized the
@@ -508,7 +508,7 @@ pub enum WorkerExit {
 /// Wrapper around the PHP embed SAPI with ZTS (Zend Thread Safety).
 ///
 /// PHP is built with `--enable-zts`, enabling TSRM (Thread Safe Resource
-/// Manager). Each `spawn_blocking` thread registers with TSRM on first
+/// Manager). Each PHP execution thread registers with TSRM on first
 /// use, getting its own copy of PHP global state. This allows concurrent
 /// PHP execution across multiple threads.
 ///
@@ -1025,11 +1025,11 @@ impl PhpRuntime {
     /// Execute a PHP request.
     ///
     /// With ZTS, this runs **without** the global mutex — each
-    /// `spawn_blocking` thread has its own TSRM-registered PHP context.
+    /// PHP execution thread has its own TSRM-registered PHP context.
     /// On first call from a new thread, the thread is automatically
     /// registered with TSRM via `ephpm_thread_init()`.
     ///
-    /// This function is designed to be called from `tokio::task::spawn_blocking`
+    /// This function is designed to be called from a blocking execution thread
     /// since it blocks the calling thread for the duration of PHP execution.
     ///
     /// # Errors
@@ -1068,7 +1068,7 @@ impl PhpRuntime {
             let result = Self::execute_php(&request);
             // Per-request DB-bridge teardown (fpm-mode seam). This is the
             // single choke point every fpm-style request passes through on
-            // the same spawn_blocking thread that ran the script, whatever
+            // the same execution thread that ran the script, whatever
             // the outcome (OK, exit(), bailout, startup failure) — so a
             // transaction the script left open is rolled back before this
             // thread can serve an unrelated request, and the staged
@@ -1590,7 +1590,7 @@ impl PhpRuntime {
 
     /// Register the current OS thread with TSRM for worker-mode execution.
     ///
-    /// Worker threads are plain `std::thread`s (not `spawn_blocking`), so they
+    /// Worker threads are plain `std::thread`s (not tokio-managed), so they
     /// register once here before booting the framework. Reuses the same
     /// thread-local guard as the fpm path so a thread never double-registers.
     ///
@@ -1650,7 +1650,7 @@ impl PhpRuntime {
     /// Boot and run a worker on the current (already TSRM-registered) thread.
     ///
     /// Blocks until the framework's `take_request()` loop ends (graceful
-    /// shutdown, `worker_max_requests` recycle, a mid-request script exit, or
+    /// shutdown, `[php.worker] max_requests` recycle, a mid-request script exit, or
     /// a fatal bailout) — see [`WorkerExit`] for the outcomes and what the
     /// caller must do for each.
     ///
@@ -1724,7 +1724,7 @@ impl PhpRuntime {
 
     /// Set a PHP INI directive for the current request.
     ///
-    /// Must be called on a TSRM-registered thread (inside `spawn_blocking`)
+    /// Must be called on a TSRM-registered PHP execution thread
     /// before `execute()`. Uses `PHP_INI_SYSTEM` so the value cannot be
     /// overridden by userland `ini_set()`.
     ///
@@ -1767,7 +1767,7 @@ impl PhpRuntime {
     /// the cluster-wide `opcache:version:<vhost>` key has advanced. Must be
     /// called on a TSRM-registered thread with an active PHP request
     /// context — safe to call at the start of `execute()` on a
-    /// `spawn_blocking` thread.
+    /// PHP execution thread.
     ///
     /// In stub mode (no `php_linked`) always returns `None`.
     #[cfg(php_linked)]
@@ -1841,7 +1841,7 @@ impl PhpRuntime {
     /// `opcache.jit_buffer_size`).
     ///
     /// Same calling contract as [`Self::opcache_invalidate_under`]: safe on a
-    /// TSRM-registered `spawn_blocking` thread (the router's PHP dispatch
+    /// TSRM-registered execution thread (the router's PHP dispatch
     /// closure) and on a worker-mode thread inside its long-lived request.
     ///
     /// In stub mode (no `php_linked`) always returns `None`.

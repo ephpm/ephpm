@@ -682,7 +682,7 @@ trusted_hosts = ["localhost", "127.0.0.1", "127.0.0.1:{HTTP_PORT}"]
 enabled = true
 
 [php]
-mode = "fpm"
+mode = "per_request"
 max_execution_time = 60
 memory_limit = "256M"
 

@@ -82,6 +82,11 @@ autotune (serve): cpu_quota=1.00 mem=512MiB (cgroup v2) ->
 config left the RESP listener disabled — correctly WARNs that
 `ephpm deploy` can't reach the server.)
 
+> **Historical output.** That is v0.5.0's verbatim log. Since v0.9.0 the same
+> box derives `concurrency=2[cgroup_quota]` — the derived value clamps to a
+> floor of 2 on the quota path too (#461: a 1-thread pool deadlocks a PHP
+> loopback subrequest) — and the `workers=` label is spelled `concurrency=`.
+
 **Result (development builds, first measurement):**
 
 | | v0.4.2 (stock ini) | v0.5.0 (autotuned) | Change |

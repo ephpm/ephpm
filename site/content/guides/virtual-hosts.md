@@ -173,7 +173,7 @@ Single-site deployments (no `sites_dir`) never join the `Host` header onto the f
 
 ### Single Process, Shared Thread Pool
 
-All sites share one ephpm process and tokio's `spawn_blocking` thread pool. A request to `alice-blog.com` and a request to `bobs-recipes.com` are handled by the same threads — the router sets the correct document root and database before dispatching to PHP.
+All sites share one ephpm process and the dedicated PHP execution pool. A request to `alice-blog.com` and a request to `bobs-recipes.com` are handled by the same threads — the router sets the correct document root and database before dispatching to PHP.
 
 ```
    ┌──────────────────── ePHPm (single process) ────────────────────┐
@@ -186,7 +186,7 @@ All sites share one ephpm process and tokio's `spawn_blocking` thread pool. A re
    │                  ▼                                             │
    │   ┌──────────────────────────────┐                             │
    │   │ PHP Threads (ZTS)            │                             │
-   │   │ (shared spawn_blocking pool) │                             │
+   │   │ (shared execution pool)      │                             │
    │   └──────────────┬───────────────┘                             │
    │                  │                                             │
    │   ┌──────────────┴───── Shared Backend ─────────────┐          │
@@ -199,7 +199,7 @@ All sites share one ephpm process and tokio's `spawn_blocking` thread pool. A re
    └────────────────────────────────────────────────────────────────┘
 ```
 
-This is efficient — 20 sites don't need 20x the threads. Any `spawn_blocking` thread can serve any site.
+This is efficient — 20 sites don't need 20x the threads. Any execution-pool thread can serve any site.
 
 ### One litewire Listener, One Database Per Site
 
@@ -332,8 +332,8 @@ Mechanics and limits:
 
 The denylist and privilege drop cover cross-tenant confidentiality/integrity. **Availability** (one tenant starving or OOM-killing the shared process) is a resource-limit problem, and because all tenants share one process it must be bounded from **outside** PHP:
 
-- **Memory.** PHP's `memory_limit` is per-request. The aggregate ceiling is `memory_limit × concurrent PHP executions`, which can exceed the pod's memory and OOM-kill everyone. Set a cgroup `memory.max` on the pod/container and size `[php] workers` (the concurrency cap, below) and `[php] memory_limit` so their product stays under it.
-- **Concurrency.** `[php] workers` caps concurrent PHP executions process-wide via a dedicated semaphore (php-fpm `max_children` semantics — requests past the cap queue, subject to the request timeout). This is a **global** cap, not per-tenant: it bounds total memory/CPU but does not stop one busy tenant from monopolizing the slots. A per-tenant concurrency cap is not yet implemented; until it is, give hostile-adjacent tenants their own ePHPm process/pod.
+- **Memory.** PHP's `memory_limit` is per-request. The aggregate ceiling is `memory_limit × concurrent PHP executions`, which can exceed the pod's memory and OOM-kill everyone. Set a cgroup `memory.max` on the pod/container and size `[php] concurrency` (the pool size and concurrency cap, below) and `[php] memory_limit` so their product stays under it.
+- **Concurrency.** `[php] concurrency` caps concurrent PHP executions process-wide — it is the size of the dedicated execution pool (php-fpm `max_children` semantics — requests past the cap queue, subject to the request timeout). This is a **global** cap, not per-tenant: it bounds total memory/CPU but does not stop one busy tenant from monopolizing the slots. A per-tenant concurrency cap is not yet implemented; until it is, give hostile-adjacent tenants their own ePHPm process/pod.
 - **Request timeout.** `[server.timeouts] request` and `[php] max_execution_time` bound how long any one request holds a worker slot, so a slow-loop tenant cannot hold the pool indefinitely.
 - **Process limits.** A cgroup `pids.max` and an `RLIMIT_NOFILE` (`nofile`) ceiling bound fork/fd exhaustion at the OS layer (the process-shared fd table is not per-tenant).
 
@@ -480,7 +480,7 @@ sites_dir = "/var/www/sites"
 
 # Global PHP settings (shared by all sites)
 [php]
-workers = 4
+concurrency = 4
 memory_limit = "128M"
 
 # Per-site databases: one <site-key>.db per virtual host (required in
@@ -513,7 +513,7 @@ document_root = "/var/www/marketing"
 sites_dir = "/var/www/sites"
 
 [php]
-workers = 4
+concurrency = 4
 memory_limit = "64M"
 
 [kv]

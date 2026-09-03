@@ -193,7 +193,7 @@ pub fn default_config_toml(document_root: &Path) -> String {
     let document_root_str = document_root.display().to_string();
     let escaped = document_root_str.replace('\\', "\\\\");
     format!(
-        "[server]\nlisten = \"0.0.0.0:8080\"\ndocument_root = \"{escaped}\"\nindex_files = [\"index.php\", \"index.html\"]\n\n[php]\nmode = \"fpm\"\nmax_execution_time = 30\nmemory_limit = \"128M\"\n"
+        "[server]\nlisten = \"0.0.0.0:8080\"\ndocument_root = \"{escaped}\"\nindex_files = [\"index.php\", \"index.html\"]\n\n[php]\nmode = \"per_request\"\nmax_execution_time = 30\nmemory_limit = \"128M\"\n"
     )
 }
 
@@ -597,7 +597,7 @@ mod tests {
         assert!(toml.contains("listen = \"0.0.0.0:8080\""));
         assert!(toml.contains("document_root = \"/var/www/html\""));
         assert!(toml.contains("[php]"));
-        assert!(toml.contains("mode = \"fpm\""));
+        assert!(toml.contains("mode = \"per_request\""));
         assert!(toml.contains("memory_limit = \"128M\""));
         assert!(toml.contains("max_execution_time = 30"));
     }
@@ -617,7 +617,7 @@ mod tests {
 
         let config = ephpm_config::Config::load(&path).expect("generated config must parse");
         config.validate().expect("generated config must pass validate()");
-        assert_eq!(config.php.mode, "fpm");
+        assert_eq!(config.php.mode, ephpm_config::PhpMode::PerRequest);
         assert_eq!(config.php.max_execution_time, 30);
         assert_eq!(config.php.memory_limit, "128M");
     }

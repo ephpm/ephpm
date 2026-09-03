@@ -82,6 +82,12 @@ fn init_crypto() {
 }
 
 fn test_config(document_root: &std::path::Path, max_body_size: u64) -> Config {
+    // Pin a tiny PHP pool + run the idempotent stub init: `Router::new` spins
+    // a real execution pool, and a `PhpConfig::default()` would derive
+    // `clamp(host_cpus, 2, 32)` threads that fail TSRM registration (nothing
+    // in this test binary calls `PhpRuntime::init()` otherwise) and
+    // respawn-loop on the boot-failure backoff.
+    ephpm_php::PhpRuntime::init().expect("stub runtime init");
     Config {
         server: ServerConfig {
             listen: "127.0.0.1:0".to_owned(),
@@ -95,7 +101,7 @@ fn test_config(document_root: &std::path::Path, max_body_size: u64) -> Config {
             request: RequestConfig { max_body_size, ..RequestConfig::default() },
             ..ServerConfig::default()
         },
-        php: PhpConfig::default(),
+        php: PhpConfig { concurrency: 2, ..PhpConfig::default() },
         db: DbConfig::default(),
         kv: KvConfig::default(),
         cluster: ClusterConfig::default(),

@@ -4,7 +4,7 @@ weight = 7
 +++
 
 Worker mode (`[php] mode = "worker"`) is ePHPm's persistent-execution model:
-instead of bootstrapping your PHP application on every request (fpm model),
+instead of bootstrapping your PHP application on every request (the per-request model),
 a **worker script** boots it once per worker thread and then handles requests
 in a loop. Cold-boot cost is paid once per worker, not once per request.
 
@@ -43,7 +43,7 @@ while (($envelope = \Ephpm\Worker\take_request()) !== null) {
         "hello {$vars['REQUEST_URI']} (request #$served)\n",
     );
 }
-// take_request() returned null: graceful drain or worker_max_requests
+// take_request() returned null: graceful drain or max_requests
 // recycle. Fall off the end; ePHPm respawns a fresh worker if needed.
 ```
 
@@ -52,11 +52,13 @@ Config:
 ```toml
 [server]
 listen        = "0.0.0.0:8080"
-document_root = "/path/to/app"    # worker_script must resolve under this
+document_root = "/path/to/app"    # the worker script must resolve under this
 
 [php]
-mode          = "worker"
-worker_script = "worker.php"      # relative to document_root
+mode   = "worker"
+
+[php.worker]
+script = "worker.php"             # relative to document_root
 ```
 
 Static files are still served by ePHPm directly; every PHP-bound request is
@@ -70,7 +72,7 @@ Three rules, all enforced by the engine:
    answered by exactly one `send_response()` *or* `send_response_stream()`
    call before the next `take_request()`.
 2. **`null` means stop**: when `take_request()` returns null (graceful drain,
-   or the `worker_max_requests` recycle threshold), end your loop and return.
+   or the `max_requests` recycle threshold), end your loop and return.
 3. **The process persists**: globals, statics, and singletons survive between
    requests. That is the point — and the foot-gun. Never stash per-request
    state (the current user, the current request) anywhere that outlives the
@@ -85,7 +87,7 @@ Three rules, all enforced by the engine:
 | `query()` / `cookies()` | `array` | Split on delimiters only — **not url-decoded**. Re-parse with `parse_str($vars['QUERY_STRING'], $q)` / `urldecode()` if you need decoded values or `a[]=` arrays. |
 | `rawBody()` | `string` | The request body. For streamed bodies this drains the incremental reader into a string (re-buffers — prefer `bodyStream()` for large uploads). |
 | `bodyStream()` | `resource` | A real readable stream over the incremental body — a multi-GB upload flows through in fixed-size reads with flat memory. The body is consumed **once**, shared between `rawBody()`, `bodyStream()`, and PHP's own POST reader: pick one. A stream resource stashed across requests reads EOF (it can never see the next request's body). |
-| `parsedBody()` | `?array` | **Always `null`** — form/multipart parsing is your job, or enable `worker_populate_superglobals` and read `$_POST`/`$_FILES` natively. |
+| `parsedBody()` | `?array` | **Always `null`** — form/multipart parsing is your job, or enable `[php.worker] populate_superglobals` and read `$_POST`/`$_FILES` natively. |
 | `files()` | `array` | **Always empty** — same deal. |
 
 ### Sending responses
@@ -120,22 +122,22 @@ WordPress adapter tolerates `wp_die()`.
 
 By default `$_GET`/`$_POST`/`$_SERVER` are **not** populated — adapters build
 their own request objects from the `Envelope`. Set
-`worker_populate_superglobals = true` under `[php]` for code that assumes
+`populate_superglobals = true` under `[php.worker]` for code that assumes
 native superglobals (this also makes PHP's own POST reader parse forms and
 multipart into `$_POST`/`$_FILES`, spooling file parts to disk).
 
 ## Tuning knobs
 
-All under `[php]` — see the [config reference](/reference/config/) for
-authoritative details:
+Pool sizing lives under `[php]`, worker-lifecycle knobs under `[php.worker]` —
+see the [config reference](/reference/config/) for authoritative details:
 
 | Knob | Default | What it does |
 |---|---|---|
-| `worker_count` | `0` (cgroup-quota- or CPU-derived) | Persistent worker threads. `0` derives from the cgroup CPU quota when present (Linux — the sweet spot inside CPU-limited containers), else host parallelism clamped 2–32. Forced to `1` on Windows. |
-| `worker_max_requests` | `10000` | Recycle a worker after N requests (fresh boot reclaims slow memory growth). Pure leak guard — for a leak-free framework loop, prefer `0`. |
-| `worker_backlog` | `0` (= `worker_count`) | Dispatch-queue depth; a full queue applies HTTP backpressure. |
-| `worker_boot_timeout` | `30` | Boots slower than this are logged as errors and counted (`ephpm_worker_boot_timeouts_total`). |
-| `worker_stream_threshold` | `1 MiB` | Request bodies at/above this (or chunked bodies) stream into the worker instead of buffering. |
+| `[php] concurrency` | `0` (cgroup-quota- or CPU-derived) | Persistent worker threads. `0` derives from the cgroup CPU quota when present (Linux — the sweet spot inside CPU-limited containers), else host parallelism — clamped 2–32 on both paths. |
+| `[php.worker] max_requests` | `10000` | Recycle a worker after N requests (fresh boot reclaims slow memory growth). Pure leak guard — for a leak-free framework loop, prefer `0`. |
+| `[php] queue_depth` | `0` (= `concurrency`) | Dispatch-queue depth; a full queue applies HTTP backpressure. |
+| `[php.worker] boot_timeout` | `30` | Boots slower than this are logged as errors and counted (`ephpm_worker_boot_timeouts_total`). |
+| `[php.worker] stream_threshold` | `1 MiB` | Request bodies at/above this (or chunked bodies) stream into the worker instead of buffering. |
 
 ## Failure behavior
 
@@ -170,8 +172,8 @@ authoritative details:
 - **Known limitation.** One fault class is still fatal to the *process*:
   exhausting the stack inside PHP's **destructor cascade** (freeing a very large
   plain-object graph), which recurses purely in C and passes no checkpoint PHP
-  can test. `[php] crash_containment` contains that, but it requires
-  `fpm_engine = "pool"` and is therefore **not available in worker mode**. See
+  can test. `[php] crash_containment` contains that, but it applies in
+  per-request mode only and is therefore **not available in worker mode**. See
   [Diagnosing crashes](/guides/diagnosing-crashes/).
 
 ## Observability

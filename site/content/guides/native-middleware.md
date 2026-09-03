@@ -173,7 +173,7 @@ v1 rules worth knowing:
 - **Header overrides reach PHP** as normal request headers (`HTTP_*` in
   `$_SERVER`), replacing any client-sent header of the same name — that's
   how `jwt`'s `claims_header` hands verified claims to PHP.
-- **A path rewrite affects `REQUEST_URI`** (and `PATH`). In fpm mode the
+- **A path rewrite affects `REQUEST_URI`** (and `PATH`). In per-request mode the
   script was already resolved before the chain ran, so the originally
   resolved script still executes; in worker mode the framework routes on the
   rewritten `REQUEST_URI`, so rewrites fully re-route.

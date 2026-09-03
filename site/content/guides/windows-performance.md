@@ -292,7 +292,7 @@ startup WARN when the configuration touches it.
   the catchable "Maximum execution time exceeded" fatal you may rely on on
   Linux never fires.
 - **No crash containment.** The experimental stack-overflow containment
-  (`[php] crash_containment`, `fpm_engine = "pool"`) is Unix-only: it is
+  (`[php] crash_containment`, per-request mode) is Unix-only: it is
   built on POSIX signal handling, and Windows delivers faults as SEH
   exceptions instead. On Windows the setting (and
   `EPHPM_PHP__CRASH_CONTAINMENT`) is ignored, and a native fault in an
