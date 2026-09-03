@@ -1328,7 +1328,7 @@ static int ephpm_run_middleware_chain(void)
  *   - The embed SAPI's initial request provides a valid execution
  *     context that we can reuse for all HTTP requests
  *
- * With ZTS, each spawn_blocking thread has its own TSRM context and
+ * With ZTS, each PHP execution thread has its own TSRM context and
  * __thread-local per-request state, so concurrent reuse is safe.
  *
  * Returns:
@@ -3365,9 +3365,9 @@ PHP_FUNCTION(ephpm_kv_flush_all)
  *
  * Blocking is intentional and safe: in worker mode this parks the
  * dedicated worker OS thread (the intended SSE pattern — replaces
- * poll+usleep loops with zero idle CPU and sub-ms wakeup); in fpm mode it
- * parks a spawn_blocking thread, so keep $timeout_ms well below
- * [server.timeouts] request there. Watches observe string keys only
+ * poll+usleep loops with zero idle CPU and sub-ms wakeup); in per-request
+ * mode it parks one of the execution pool's [php] concurrency threads, so
+ * keep $timeout_ms well below [server.timeouts] request there. Watches observe string keys only
  * (set/setnx/del/incr/decr/incr_by/append/expiry-reap/flush bump the
  * version; hset/hdel and TTL-only changes do not). */
 PHP_FUNCTION(ephpm_kv_wait)

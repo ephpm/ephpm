@@ -3050,8 +3050,8 @@ pub struct PhpConfig {
     /// per-thread execution timers (`--enable-zend-max-execution-timers`, the
     /// default for the shipped Linux SDK). ePHPm writes this value into the
     /// generated php.ini and PHP arms its own **per-thread POSIX timer**
-    /// (`timer_create` + `SIGRTMIN`, delivered only to the owning PHP thread —
-    /// safe under tokio's `spawn_blocking` pool). The limit is **wall-clock**
+    /// (`timer_create` + `SIGRTMIN`, delivered only to the owning PHP
+    /// execution thread, never an unrelated one). The limit is **wall-clock**
     /// (CLOCK_BOOTTIME, so `sleep()` counts), **catchable**, and overridable at
     /// runtime with `set_time_limit()`. Exceeding it raises the standard PHP
     /// fatal ("Maximum execution time exceeded"), runs registered shutdown
@@ -3594,6 +3594,24 @@ impl Default for WorkerConfig {
             populate_superglobals: false,
             stream_threshold: default_worker_stream_threshold(),
         }
+    }
+}
+
+impl WorkerConfig {
+    /// Whether any `[php.worker]` knob differs from its default.
+    ///
+    /// Startup uses this to log, once at INFO, that a configured
+    /// `[php.worker]` section is not in force under `mode = "per_request"`.
+    /// The structural scoping already makes the knobs impossible to mistake
+    /// for per-request knobs, but an operator who set them still deserves one
+    /// line saying they are inert (the no-silent-no-op rule).
+    #[must_use]
+    pub fn is_customized(&self) -> bool {
+        self.script.is_some()
+            || self.max_requests != default_worker_max_requests()
+            || self.boot_timeout != default_worker_boot_timeout()
+            || self.populate_superglobals
+            || self.stream_threshold != default_worker_stream_threshold()
     }
 }
 
@@ -10137,6 +10155,24 @@ opcache_revalidate_freq = 60
         // Period 0 -> would divide by zero.
         assert_eq!(parse_cgroup_v1_cpu("100000", "0"), None);
         assert_eq!(parse_cgroup_v1_cpu("junk", "100000"), None);
+    }
+
+    /// `is_customized` is what keeps a configured-but-inert `[php.worker]`
+    /// from being a silent no-op in per-request mode: it must be false for
+    /// the pristine default and true the moment any knob moves.
+    #[test]
+    fn test_worker_config_is_customized() {
+        assert!(!WorkerConfig::default().is_customized());
+        assert!(
+            WorkerConfig { script: Some(PathBuf::from("w.php")), ..WorkerConfig::default() }
+                .is_customized()
+        );
+        assert!(WorkerConfig { max_requests: 1, ..WorkerConfig::default() }.is_customized());
+        assert!(WorkerConfig { boot_timeout: 5, ..WorkerConfig::default() }.is_customized());
+        assert!(
+            WorkerConfig { populate_superglobals: true, ..WorkerConfig::default() }.is_customized()
+        );
+        assert!(WorkerConfig { stream_threshold: 1, ..WorkerConfig::default() }.is_customized());
     }
 
     #[test]

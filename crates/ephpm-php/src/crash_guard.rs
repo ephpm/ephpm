@@ -73,12 +73,13 @@
 //! surfaces the request as [`crate::PhpError::Contained`].
 //!
 //! Actually *retiring* the OS thread is the caller's job, and is why
-//! containment is gated on the dedicated FPM pool: `ephpm-server`'s
+//! containment is gated on per-request mode: `ephpm-server`'s
 //! `fpm_pool::thread_main` sees `PhpError::Contained`, exits its job loop
-//! **without** PHP teardown, and the pool spawns a replacement. On tokio's
-//! shared `spawn_blocking` pool no such primitive exists — a poisoned thread
-//! would stay in rotation failing every later request, which is why that
-//! combination is refused at startup.
+//! **without** PHP teardown, and the pool spawns a replacement. A shared
+//! thread pool (tokio's `spawn_blocking`, where PHP no longer runs) has no
+//! such retire primitive, and a worker-mode thread holds booted framework
+//! state that cannot be abandoned mid-flight — which is why worker mode
+//! refuses to arm containment at startup.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

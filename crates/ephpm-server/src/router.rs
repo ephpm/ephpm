@@ -1507,7 +1507,7 @@ impl Router {
     /// The dedicated per-request execution pool, when per-request mode built
     /// one. `serve()` uses this to drain the pool on shutdown (close dispatch,
     /// wait for threads to release their TSRM slots) before PHP teardown, the
-    /// same way it drains the worker pool. `None` on the default engine.
+    /// same way it drains the worker pool. `None` only in worker mode.
     #[must_use]
     pub fn fpm_pool(&self) -> Option<Arc<crate::fpm_pool::FpmPool>> {
         self.fpm_pool.clone()
@@ -7179,7 +7179,13 @@ mod tests {
             .await
             .expect("blocker dispatch fits");
         // Wait until the thread has PULLED the blocker (queue empties), then
-        // fill the freed queue slot so the next arrival finds it full.
+        // fill the freed queue slot so the next arrival finds it full. This
+        // MUST succeed: callers that assert 503-vs-queue behaviour would fail
+        // loudly on an unsaturated pool, but the static-file-starvation test
+        // would pass vacuously (static never touches the pool either way), so
+        // a silently non-saturating helper is exactly the weakening it exists
+        // to prevent.
+        let mut filled = false;
         for _ in 0..400 {
             if pool
                 .try_dispatch(
@@ -7189,10 +7195,16 @@ mod tests {
                 .await
                 .is_ok()
             {
+                filled = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        assert!(
+            filled,
+            "saturate_pool: the queue-slot filler was never accepted — the pool \
+                 was not saturated and every caller's premise is void"
+        );
         unblock_tx
     }
 

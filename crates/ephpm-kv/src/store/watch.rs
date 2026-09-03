@@ -103,8 +103,8 @@ impl WatchSlot {
     /// Block until the version exceeds `last_version` or `timeout`
     /// elapses. Returns `Some(new_version)` on change, `None` on timeout.
     ///
-    /// Designed to be called from dedicated worker OS threads or the
-    /// tokio `spawn_blocking` pool — never from an async task.
+    /// Designed to be called from dedicated PHP execution OS threads
+    /// (per-request pool / worker pool) — never from an async task.
     pub(super) fn wait_past(&self, last_version: u64, timeout: Duration) -> Option<u64> {
         let guard = self.version.lock().unwrap_or_else(PoisonError::into_inner);
         if *guard > last_version {

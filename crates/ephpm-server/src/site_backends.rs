@@ -568,8 +568,9 @@ impl SiteBackends {
 impl SiteBackendResolver for SiteBackends {
     fn resolve(&self, site_key: &str) -> Result<SharedBackend, String> {
         // block_on is legal: `resolve` is only ever called from the bridge on a
-        // PHP worker / spawn_blocking thread, never an async task (the same
-        // invariant that licenses the bridge's own block_on).
+        // PHP execution thread (per-request pool / worker pool), never an
+        // async task (the same invariant that licenses the bridge's own
+        // block_on).
         self.inner.handle.clone().block_on(self.get_or_open(site_key)).map_err(|e| format!("{e:#}"))
     }
 }

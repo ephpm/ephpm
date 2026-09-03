@@ -564,8 +564,8 @@ impl Store {
     ///
     /// # Blocking
     ///
-    /// Parks the calling OS thread. Callers are PHP worker threads or
-    /// the tokio `spawn_blocking` pool — never call this from an async
+    /// Parks the calling OS thread. Callers are PHP execution threads
+    /// (per-request pool / worker pool) — never call this from an async
     /// task.
     ///
     /// # Clustering
@@ -1545,8 +1545,8 @@ impl Store {
         // Saturating subtraction: `mem_used` is an *approximate*, unsigned
         // counter, so it must never underflow. `flush()` resets it to 0 with a
         // plain `store`, which races with concurrent `remove`/`set` on other
-        // worker threads (the store is `Arc`-shared across the spawn_blocking
-        // pool): a thread can pull an entry out of the map — capturing its
+        // worker threads (the store is `Arc`-shared across every PHP
+        // execution thread): a thread can pull an entry out of the map — capturing its
         // `mem_size` — just before `flush` zeroes the counter, then run its
         // `mem_sub` afterwards. A plain `fetch_sub` would wrap to ~`usize::MAX`,
         // making `ensure_memory` believe the store is permanently full

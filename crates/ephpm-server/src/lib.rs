@@ -743,6 +743,16 @@ async fn bind_listeners(
         );
         Some(pool)
     } else {
+        // add-config-knob: `[php.worker]` is structurally scoped to worker
+        // mode, but an operator who configured it still deserves one line
+        // saying it is not in force (the no-silent-no-op rule).
+        if config.php.worker.is_customized() {
+            tracing::info!(
+                "[php.worker] is configured but [php] mode = \"per_request\" — \
+                 worker-mode knobs are not in force (set [php] mode = \"worker\" \
+                 to use them)"
+            );
+        }
         None
     };
 
@@ -2779,7 +2789,7 @@ mod lib_tests {
                 index_files: vec!["index.html".to_owned()],
                 ..ephpm_config::ServerConfig::default()
             },
-            php: ephpm_config::PhpConfig::default(),
+            php: test_php_config(),
             db: ephpm_config::DbConfig::default(),
             kv: ephpm_config::KvConfig::default(),
             cluster: ephpm_config::ClusterConfig::default(),
@@ -2788,6 +2798,20 @@ mod lib_tests {
         };
         let store = ephpm_kv::store::Store::new(ephpm_kv::store::StoreConfig::default());
         Arc::new(Router::new(&config, store, None, None, None, None, None))
+    }
+
+    /// PHP config for router-building tests in this module. Same treatment as
+    /// `router::tests::test_php_config`: pin `concurrency = 2` so each test
+    /// router spins two pool threads instead of a host-derived count
+    /// (`clamp(host_cpus, 2, 32)`, at 8 MiB stack each), and run the
+    /// idempotent stub `PhpRuntime::init()` first so those threads register
+    /// with TSRM instead of failing registration and respawn-looping on the
+    /// boot-failure backoff (nothing else in this test binary calls `init()`).
+    /// The pool threads clone the pool `Arc` and are only retired by
+    /// `drain()`, so keeping them few and parked matters.
+    fn test_php_config() -> ephpm_config::PhpConfig {
+        ephpm_php::PhpRuntime::init().expect("stub runtime init");
+        ephpm_config::PhpConfig { concurrency: 2, ..ephpm_config::PhpConfig::default() }
     }
 
     /// Manual TLS over a freshly generated self-signed cert.
@@ -3330,6 +3354,9 @@ mod lib_tests {
     // ── idle timeout ────────────────────────────────────────────────────────
 
     /// Minimal router serving `dir` with a static-only fallback (no PHP).
+    /// `test_php_config()` (not the raw default) — see its doc: the pinned
+    /// 2-thread pool + stub init keep router construction from spawning a
+    /// host-derived thread count that respawn-loops without TSRM.
     fn idle_test_router(dir: &std::path::Path) -> Arc<Router> {
         let config = ephpm_config::Config {
             server: ephpm_config::ServerConfig {
@@ -3337,7 +3364,7 @@ mod lib_tests {
                 fallback: vec!["$uri".to_string(), "=404".to_string()],
                 ..ephpm_config::ServerConfig::default()
             },
-            php: ephpm_config::PhpConfig::default(),
+            php: test_php_config(),
             db: ephpm_config::DbConfig::default(),
             kv: ephpm_config::KvConfig::default(),
             cluster: ephpm_config::ClusterConfig::default(),
