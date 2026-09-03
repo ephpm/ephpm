@@ -1,6 +1,6 @@
 # Worker dispatch fairness — the #442 tail-latency investigation
 
-> **Terminology note (v0.10):** this measurement record predates the
+> **Terminology note (v0.9.0):** this measurement record predates the
 > concurrency-config rename and the removal of the `spawn_blocking` execution
 > engine. Read `worker_count` as `[php] concurrency`, `worker_backlog` as
 > `[php] queue_depth`, and `fpm_engine = "pool"` as the (now only) per-request
