@@ -2948,20 +2948,31 @@ impl Default for KvRedisCompatConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FpmEngine {
-    /// **Default.** Dispatch each PHP request onto tokio's shared
+    /// **Legacy / opt-out.** Dispatch each PHP request onto tokio's shared
     /// `spawn_blocking` pool. Behaviour is unchanged from every release before
-    /// this knob existed. Concurrency is bounded (optionally) by the `[php]
-    /// workers` semaphore; the blocking pool itself is never capped, so static
-    /// file I/O cannot be starved by slow PHP.
+    /// the `pool` engine existed. Concurrency is bounded (optionally) by the
+    /// `[php] workers` semaphore; the blocking pool itself is never capped —
+    /// which means that at the historical `workers = 0` there is **no**
+    /// concurrency bound at all, so a flood spawns one blocking thread (and one
+    /// full ZTS PHP context) per in-flight request. Measured under an open-loop
+    /// `/api/cpu` flood (2 slots' worth of real capacity, 200 connections,
+    /// 2026-09-02): 486 threads / ~1.05 GiB RSS, where the `pool` engine's
+    /// derived cap held at 65 threads / ~193 MiB while serving *more* requests.
+    /// Retained as an escape hatch; no longer the default (v0.9.0).
     SpawnBlocking,
 
-    /// **Experimental / opt-in.** Dispatch each PHP request onto ePHPm's OWN
-    /// fixed pool of dedicated OS threads (not `spawn_blocking`). The pool size
-    /// equals [`PhpConfig::effective_worker_count`] and IS the concurrency cap
-    /// for this engine, so the `[php] workers` semaphore is redundant and
+    /// **Default (v0.9.0+).** Dispatch each PHP request onto ePHPm's OWN fixed
+    /// pool of dedicated OS threads (not `spawn_blocking`). The pool size is
+    /// resolved by [`PhpConfig::effective_fpm_pool_size`] and IS the concurrency
+    /// cap for this engine, so the `[php] workers` semaphore is redundant and
     /// bypassed (a full dispatch queue applies backpressure → 504 via the
-    /// request timeout; a draining/empty pool → 503). Benchmark before enabling
-    /// in production.
+    /// request timeout; a draining/empty pool → 503). Bounded by construction:
+    /// concurrency, memory, and thread count are all capped, and
+    /// `overload_policy = "shed"` has a queue to reject from without needing an
+    /// explicit `workers` value. Owning the threads is also what makes
+    /// `crash_containment` (Unix) and clean load-shedding possible. Motivated by
+    /// a ~10% rps win with lower tails over `spawn_blocking` on the Laravel
+    /// per-request benchmark (3-round A/B, 2026-09-02).
     Pool,
 }
 
@@ -3361,21 +3372,25 @@ pub struct PhpConfig {
 
     /// FPM request-execution engine (fpm mode only).
     ///
-    /// - `"spawn_blocking"` (**default**) — run each PHP request on tokio's
-    ///   shared blocking pool. Unchanged from every prior release.
-    /// - `"pool"` (**EXPERIMENTAL, opt-in**) — run each PHP request on ePHPm's
-    ///   own dedicated OS-thread pool sized to
-    ///   [`Self::effective_worker_count`]. The pool size is the concurrency cap,
-    ///   so `[php] workers` is bypassed. Benchmark-it-first: intended to be
-    ///   flipped on in the lab and compared against the default.
+    /// - `"pool"` (**default, v0.9.0+**) — run each PHP request on ePHPm's
+    ///   own dedicated OS-thread pool sized by [`Self::effective_fpm_pool_size`].
+    ///   The pool size is the concurrency cap, so `[php] workers` is bypassed
+    ///   (see the migration note on `effective_fpm_pool_size`: an explicit
+    ///   `workers = N` is honoured as the pool size when `worker_count` is
+    ///   unset, so upgrading does not silently change an operator's cap).
+    /// - `"spawn_blocking"` (**legacy / opt-out**) — run each PHP request on
+    ///   tokio's shared blocking pool. Unchanged from every release before the
+    ///   pool engine existed; at `workers = 0` it applies no concurrency bound
+    ///   at all.
     ///
     /// An unrecognised value is a **startup error** (serde rejects it), never a
     /// silent fallback. Ignored in worker mode (`mode = "worker"`); startup logs
-    /// a WARN if `pool` is requested there so the no-op is never silent.
+    /// a WARN if `spawn_blocking` cannot apply there so the no-op is never
+    /// silent.
     ///
-    /// Env override: `EPHPM_PHP__FPM_ENGINE=pool`.
+    /// Env override: `EPHPM_PHP__FPM_ENGINE=spawn_blocking`.
     ///
-    /// Default: `"spawn_blocking"`.
+    /// Default: `"pool"`.
     #[serde(default = "default_fpm_engine")]
     pub fpm_engine: FpmEngine,
 
@@ -4437,6 +4452,51 @@ impl PhpConfig {
     #[must_use]
     pub fn effective_worker_backlog(&self) -> usize {
         if self.worker_backlog > 0 { self.worker_backlog } else { self.effective_worker_count() }
+    }
+
+    /// Resolve the fpm pool's thread count — the concurrency cap for
+    /// `fpm_engine = "pool"`, which is the default engine as of v0.9.0.
+    ///
+    /// Resolution order, and the reason it differs from
+    /// [`Self::effective_worker_count`]:
+    /// 1. `worker_count > 0` — use it (the explicit fpm-pool size).
+    /// 2. `workers > 0` — use it. **Migration safety:** before the default
+    ///    flipped to `pool`, `[php] workers = N` was the way to cap concurrent
+    ///    PHP executions on the (then-default) `spawn_blocking` engine. Sizing
+    ///    the pool from that value keeps an existing `workers = N` config
+    ///    meaning "N concurrent PHP executions" across the upgrade, instead of
+    ///    silently replacing the operator's cap with a host-derived one.
+    /// 3. Otherwise derive exactly as worker mode does (cgroup CPU quota, else
+    ///    host parallelism clamped `[2, 32]`).
+    ///
+    /// Kept separate from [`Self::effective_worker_count`] so this fallback
+    /// touches only fpm-pool sizing — worker-mode sizing and the serve-mode
+    /// `php_memory_limit` derivation (which divides by `effective_worker_count`)
+    /// are unaffected.
+    #[must_use]
+    pub fn effective_fpm_pool_size_with_source(&self) -> (usize, FpmPoolSizeSource) {
+        if self.worker_count > 0 {
+            return (self.worker_count, FpmPoolSizeSource::WorkerCount);
+        }
+        if self.workers > 0 {
+            return (self.workers, FpmPoolSizeSource::WorkersFallback);
+        }
+        let (n, src) = self.effective_worker_count_with_source();
+        (n, FpmPoolSizeSource::Derived(src))
+    }
+
+    /// The fpm pool's thread count. See
+    /// [`Self::effective_fpm_pool_size_with_source`] for the resolution order.
+    #[must_use]
+    pub fn effective_fpm_pool_size(&self) -> usize {
+        self.effective_fpm_pool_size_with_source().0
+    }
+
+    /// The fpm pool's dispatch-queue depth: explicit `worker_backlog`, else the
+    /// pool size (one queued job per thread). Always at least `1`.
+    #[must_use]
+    pub fn effective_fpm_pool_backlog(&self) -> usize {
+        if self.worker_backlog > 0 { self.worker_backlog } else { self.effective_fpm_pool_size() }
     }
 
     /// Resolve the effective `opcache.validate_timestamps` value for a run.
@@ -5592,7 +5652,12 @@ fn default_php_mode() -> String {
 }
 
 fn default_fpm_engine() -> FpmEngine {
-    FpmEngine::SpawnBlocking
+    // v0.9.0: the dedicated fpm pool is the default. It bounds concurrency,
+    // memory, and thread count by construction, makes `overload_policy = "shed"`
+    // and `crash_containment` usable without extra config, and measured ~10%
+    // faster with lower tails than `spawn_blocking` on the Laravel per-request
+    // benchmark. `spawn_blocking` stays available as the opt-out.
+    FpmEngine::Pool
 }
 
 fn default_admission() -> AdmissionPolicy {
@@ -5614,6 +5679,20 @@ fn default_worker_count() -> usize {
     // 0 => derive at startup — cgroup CPU quota if present (Linux), otherwise
     // host parallelism clamped [2, 32]. See `PhpConfig::effective_worker_count`.
     0
+}
+
+/// Where the fpm pool's thread count came from — logged at pool startup so an
+/// operator can see the sizing decision now that `pool` is the default engine.
+#[derive(Debug, Clone, Copy)]
+pub enum FpmPoolSizeSource {
+    /// `[php] worker_count = N` was set explicitly.
+    WorkerCount,
+    /// `[php] workers = N` was used as the pool size because `worker_count` was
+    /// unset (the migration fallback — see
+    /// [`PhpConfig::effective_fpm_pool_size_with_source`]).
+    WorkersFallback,
+    /// Neither was set; the size was derived exactly as worker mode derives it.
+    Derived(WorkerCountSource),
 }
 
 /// Where the effective `worker_count` came from — surfaced for structured
@@ -7167,19 +7246,19 @@ idle_timeout_secs = 15
 
     // ── [php] fpm_engine ─────────────────────────────────────────────────
 
-    /// The struct default is the safe, unchanged engine.
+    /// The struct default is the dedicated fpm pool (v0.9.0+).
     #[test]
-    fn fpm_engine_defaults_to_spawn_blocking() {
-        assert_eq!(PhpConfig::default().fpm_engine, FpmEngine::SpawnBlocking);
-        assert!(!PhpConfig::default().is_pool_engine());
+    fn fpm_engine_defaults_to_pool() {
+        assert_eq!(PhpConfig::default().fpm_engine, FpmEngine::Pool);
+        assert!(PhpConfig::default().is_pool_engine());
         let config = Config::default_config().expect("default config should load");
-        assert_eq!(config.php.fpm_engine, FpmEngine::SpawnBlocking);
+        assert_eq!(config.php.fpm_engine, FpmEngine::Pool);
     }
 
     /// `[php]` section present but `fpm_engine` absent must resolve to the
     /// default, not be zeroed by a section-level derive.
     #[test]
-    fn fpm_engine_section_present_absent_field_is_spawn_blocking() {
+    fn fpm_engine_section_present_absent_field_is_pool() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("ephpm.toml");
         std::fs::write(&file, "[php]\nmax_execution_time = 60\n").unwrap();
@@ -7187,21 +7266,58 @@ idle_timeout_secs = 15
         let config = Config::load(&file).unwrap();
         assert_eq!(
             config.php.fpm_engine,
-            FpmEngine::SpawnBlocking,
-            "a partial [php] section must not flip the engine"
+            FpmEngine::Pool,
+            "a partial [php] section must not change the engine default"
         );
-        assert!(!config.php.is_pool_engine());
+        assert!(config.php.is_pool_engine());
     }
 
     /// A whole config with no `[php]` section at all still defaults the engine.
     #[test]
-    fn fpm_engine_section_absent_is_spawn_blocking() {
+    fn fpm_engine_section_absent_is_pool() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("ephpm.toml");
         std::fs::write(&file, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
 
         let config = Config::load(&file).unwrap();
+        assert_eq!(config.php.fpm_engine, FpmEngine::Pool);
+    }
+
+    /// The opt-out is honoured: an explicit `spawn_blocking` parses and turns
+    /// the pool engine off.
+    #[test]
+    fn fpm_engine_explicit_spawn_blocking_opts_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\nfpm_engine = \"spawn_blocking\"\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
         assert_eq!(config.php.fpm_engine, FpmEngine::SpawnBlocking);
+        assert!(!config.php.is_pool_engine());
+    }
+
+    /// Migration safety: with the pool default and no `worker_count`, an
+    /// explicit `[php] workers = N` sizes the pool, so the operator's
+    /// concurrency cap survives the default flip instead of being replaced by a
+    /// host-derived value.
+    #[test]
+    fn fpm_pool_size_falls_back_to_workers_when_worker_count_unset() {
+        let cfg = PhpConfig { workers: 4, worker_count: 0, ..PhpConfig::default() };
+        let (n, source) = cfg.effective_fpm_pool_size_with_source();
+        assert_eq!(n, 4, "workers must size the pool when worker_count is unset");
+        assert!(matches!(source, FpmPoolSizeSource::WorkersFallback));
+
+        // worker_count wins over workers when both are set.
+        let cfg = PhpConfig { workers: 4, worker_count: 7, ..PhpConfig::default() };
+        let (n, source) = cfg.effective_fpm_pool_size_with_source();
+        assert_eq!(n, 7);
+        assert!(matches!(source, FpmPoolSizeSource::WorkerCount));
+
+        // Neither set: derived, never zero.
+        let cfg = PhpConfig { workers: 0, worker_count: 0, ..PhpConfig::default() };
+        let (n, source) = cfg.effective_fpm_pool_size_with_source();
+        assert!(n >= 1);
+        assert!(matches!(source, FpmPoolSizeSource::Derived(_)));
     }
 
     /// Explicit `pool` parses and is applicable in fpm mode.
@@ -7239,14 +7355,13 @@ idle_timeout_secs = 15
         assert!(Config::load(&file).is_err(), "an unknown fpm_engine must fail to load");
     }
 
-    /// The lab flips the engine via env with no code change:
-    /// `EPHPM_PHP__FPM_ENGINE=pool` must parse.
+    /// The engine flips via env with no code change, in both directions.
     #[test]
     fn fpm_engine_env_override_parses() {
-        let _env = EnvVars::set("EPHPM_PHP__FPM_ENGINE", "pool");
+        let _env = EnvVars::set("EPHPM_PHP__FPM_ENGINE", "spawn_blocking");
         let config = Config::default_config().unwrap();
-        assert_eq!(config.php.fpm_engine, FpmEngine::Pool);
-        assert!(config.php.is_pool_engine());
+        assert_eq!(config.php.fpm_engine, FpmEngine::SpawnBlocking);
+        assert!(!config.php.is_pool_engine());
     }
 
     // ── [php] admission (issue #442 / PR #443 escape hatch) ──────────────
@@ -7439,16 +7554,22 @@ idle_timeout_secs = 15
         );
     }
 
-    /// Requested WITHOUT the pool engine → parsed but inert. Containment needs
-    /// a thread ePHPm can retire; tokio's shared blocking pool cannot provide
+    /// Requested OFF the pool engine → parsed but inert. Containment needs a
+    /// thread ePHPm can retire; tokio's shared blocking pool cannot provide
     /// one. Startup warns (see `crates/ephpm/src/main.rs`).
+    ///
+    /// Note the engine must now be named **explicitly** to reach the inert
+    /// case: since v0.9.0 the default engine is `pool`, so a bare
+    /// `crash_containment = true` arms (see
+    /// `crash_containment_arms_on_the_default_engine`).
     #[test]
-    fn crash_containment_is_inert_without_pool_engine() {
+    fn crash_containment_is_inert_off_the_pool_engine() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Default (spawn_blocking) engine.
+        // Explicit legacy engine — the opt-out.
         let sb = dir.path().join("sb.toml");
-        std::fs::write(&sb, "[php]\ncrash_containment = true\n").unwrap();
+        std::fs::write(&sb, "[php]\nfpm_engine = \"spawn_blocking\"\ncrash_containment = true\n")
+            .unwrap();
         let config = Config::load(&sb).unwrap();
         assert!(config.php.crash_containment, "the field still parses");
         assert!(
@@ -7467,6 +7588,38 @@ idle_timeout_secs = 15
         assert!(
             !config.php.is_crash_containment_active(),
             "containment must not arm in worker mode"
+        );
+    }
+
+    /// Migration-visible consequence of the v0.9.0 `fpm_engine` default flip,
+    /// pinned deliberately rather than discovered in production: a config that
+    /// sets `crash_containment = true` and names no engine used to be
+    /// parsed-but-inert (startup WARNed that it was ignored). It now **arms**,
+    /// with no operator action — a PHP C-stack overflow becomes a 500 plus a
+    /// retired pool thread instead of a process abort, at the cost of leaking
+    /// that thread's PHP context and skipping PHP module shutdown at exit.
+    ///
+    /// Startup still says so loudly (the `is_crash_containment_active()` arm in
+    /// `crates/ephpm/src/main.rs` WARNs), so this is a documented behaviour
+    /// change and not a silent one. If this test ever fails, the containment
+    /// default moved — which is an operator-visible change that belongs in the
+    /// release notes, not a test fixup.
+    #[test]
+    fn crash_containment_arms_on_the_default_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php]\ncrash_containment = true\n").unwrap();
+
+        let config = Config::load(&file).unwrap();
+        assert_eq!(
+            config.php.fpm_engine,
+            FpmEngine::Pool,
+            "precondition: the default engine is the pool"
+        );
+        assert!(
+            config.php.is_crash_containment_active(),
+            "containment arms on the default engine as of v0.9.0 — an existing \
+             `crash_containment = true` config goes from inert to armed on upgrade"
         );
     }
 

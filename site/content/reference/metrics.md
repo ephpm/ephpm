@@ -83,7 +83,7 @@ The upgrade request itself also increments the `ephpm_http_*` metrics above with
 
 ## FPM pool engine
 
-These appear when `[php] fpm_engine = "pool"` in fpm mode.
+These appear when `[php] fpm_engine = "pool"` in fpm mode — the default since v0.9.0, so they are present unless you have opted out with `fpm_engine = "spawn_blocking"`.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
