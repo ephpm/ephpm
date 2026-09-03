@@ -396,7 +396,7 @@ thread_local! {
     /// so a later bailout cannot retroactively abort a completed stream.
     static RESPONSE_ABORT: RefCell<Option<StreamAbortFlag>> = const { RefCell::new(None) };
 
-    /// Requests handled by this worker since boot (drives `worker_max_requests`).
+    /// Requests handled by this worker since boot (drives `[php.worker] max_requests`).
     static REQUESTS_HANDLED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 
     /// The recycle threshold for this worker (`0` = never recycle).
@@ -441,7 +441,7 @@ pub fn set_dispatch_depth_counter(depth: std::sync::Arc<std::sync::atomic::Atomi
 #[cfg(not(php_linked))]
 pub fn set_dispatch_depth_counter(_depth: std::sync::Arc<std::sync::atomic::AtomicUsize>) {}
 
-/// Set the per-worker recycle threshold (`worker_max_requests`; `0` disables).
+/// Set the per-worker recycle threshold (`[php.worker] max_requests`; `0` disables).
 #[cfg(php_linked)]
 pub fn set_max_requests(max: u64) {
     MAX_REQUESTS.with(|c| c.set(max));

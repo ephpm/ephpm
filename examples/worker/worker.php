@@ -18,7 +18,8 @@
  *
  *   [php]
  *   mode = "worker"
- *   worker_script = "worker.php"
+ *   [php.worker]
+ *   script = "worker.php"
  *
  * Then `curl http://127.0.0.1:8080/anything` returns:
  *   hello /anything (boot #1, request #3)

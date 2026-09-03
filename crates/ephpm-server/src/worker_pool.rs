@@ -11,7 +11,7 @@
 //! - **Boot-once:** the framework bootstrap runs once per worker thread; the
 //!   worker then loops in `\Ephpm\Worker\take_request()`.
 //! - **Recycle after N requests:** the C bridge returns shutdown once the
-//!   per-worker counter hits `worker_max_requests`; the thread exits and the
+//!   per-worker counter hits `[php.worker] max_requests`; the thread exits and the
 //!   supervisor spawns a replacement with a fresh boot.
 //! - **Crash recovery:** a fatal bailout unwinds past `send_response`; the
 //!   parked `oneshot::Sender` is still stashed, so the thread fulfils it with a
@@ -453,7 +453,7 @@ fn worker_main(
                     tracing::error!(
                         worker_id,
                         timeout_secs = boot_timeout.as_secs(),
-                        "worker has not finished booting within worker_boot_timeout \
+                        "worker has not finished booting within [php.worker] boot_timeout \
                          (thread cannot be killed; it becomes ready if the boot completes)"
                     );
                 }
@@ -474,7 +474,7 @@ fn worker_main(
     if was_booted {
         match outcome {
             Ok(ephpm_php::WorkerExit::Clean) => {
-                // Clean loop end: graceful drain or worker_max_requests recycle.
+                // Clean loop end: graceful drain or max_requests recycle.
                 let requests_served = ephpm_php::worker_bridge::requests_handled();
                 let uptime_secs = boot_start.elapsed().as_secs_f64();
                 if pool.state.draining.load(Ordering::Acquire) {

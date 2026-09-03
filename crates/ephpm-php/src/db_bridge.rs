@@ -203,9 +203,9 @@
 //! bridge pins the server's tokio [`Handle`](tokio::runtime::Handle) at
 //! registration time and uses `Handle::block_on`. This is legal ONLY
 //! because PHP FFI callbacks run on PHP worker OS threads or the tokio
-//! `spawn_blocking` pool, never on async tasks — the invariant documented
+//! execution pool's threads, never on async tasks — the invariant documented
 //! on `EphpmKvOps::wait` in `kv_bridge.rs` ("Blocking is safe here:
-//! callers are PHP worker OS threads or the tokio `spawn_blocking` pool,
+//! callers are PHP execution OS threads (per-request pool or worker pool),
 //! never async tasks"). The same pinned-`Handle` sync bridge is the
 //! established precedent in `ephpm-cluster`'s `KvReplicator`
 //! (`clustered_store.rs`).
@@ -306,7 +306,7 @@ const INFRA_SQLSTATE: [u8; 5] = *b"HY000";
 /// this site key".
 ///
 /// `resolve` may block (open a database on first use); it is only ever called
-/// from PHP worker / `spawn_blocking` threads, never async tasks — the same
+/// from PHP execution threads, never async tasks — the same
 /// invariant that licenses the bridge's `block_on` (see the `Async boundary`
 /// module docs).
 pub trait SiteBackendResolver: Send + Sync {
@@ -1360,7 +1360,7 @@ fn strip_leading_noise(stmt: &str) -> &str {
 /// * **fpm mode** — `PhpRuntime::execute()` calls this right after
 ///   `execute_php` returns (success, script exit, or bailout alike). That
 ///   is the single choke point every fpm-style request passes through on
-///   its own `spawn_blocking` thread.
+///   its own PHP execution thread.
 /// * **worker mode** — `worker_bridge::finish_iteration()` (runs on the
 ///   worker thread inside `send_response` / `response_end`, i.e. at every
 ///   normal request end), again at the top of the next `take_request`
@@ -1439,7 +1439,7 @@ pub fn on_request_end() {
         );
         // block_on is legal here for the same reason as the query path:
         // request teardown runs on a PHP worker OS thread or the tokio
-        // spawn_blocking pool, never on an async task (module docs,
+        // execution pool, never on an async task (module docs,
         // `Async boundary`). On success Session::query clears
         // `in_transaction` itself.
         if let Err(e) = bridge.handle.block_on(held.session.query("ROLLBACK", &[])) {

@@ -8,7 +8,7 @@
 ## The question
 
 ePHPm's Linux/macOS builds are ZTS: one process, concurrent PHP on
-tokio's blocking pool, per-thread TSRM contexts. ZTS costs an
+the dedicated execution pool, per-thread TSRM contexts. ZTS costs an
 in-PHP tax — measured at roughly **5–10%** vs NTS php-fpm on tiny
 scripts (July 2026, with `ZEND_ENABLE_STATIC_TSRMLS_CACHE` active) —
 because every `EG()`/`CG()` access goes through thread-local
@@ -47,7 +47,7 @@ request at a time per process**, so a useful NTS Linux mode is
   is where prefork's numbers would be strongest.
 - **Feature gating, honest by construction**: `[cluster]` and the RESP
   listener refuse to start in prefork mode (per-process KV across N
-  processes is a correctness trap, not a feature); `[php] workers`
+  processes is a correctness trap, not a feature); `[php] concurrency`
   ignored; startup banner states the mode's contract plainly.
 
 ### The two genuinely hard problems

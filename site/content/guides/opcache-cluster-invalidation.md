@@ -56,7 +56,7 @@ and buffer sizes per environment is exactly the kind of drift that immutable
 images are supposed to kill.
 
 On boot, `ephpm serve` reads the container's CPU quota and memory limit the
-same cgroup-aware way `worker_count` already does (cgroup v2 `memory.max` →
+same cgroup-aware way `concurrency` already does (cgroup v2 `memory.max` →
 v1 `memory.limit_in_bytes` → `/proc/meminfo` `MemTotal`), then derives a tuned
 profile:
 
@@ -66,7 +66,7 @@ profile:
   instead, because the segment is pagefile-backed and commit-charged in full
   at startup — see the [config reference](/reference/config/#resource-aware-autotuning).)
 - **Per-request `memory_limit`** is `(budget − opcache_shm − ~64 MB overhead)
-  / worker_count`, floored at `128 MB`, so N concurrent requests can't
+  / concurrency`, floored at `128 MB`, so N concurrent requests can't
   collectively exceed the pod's cgroup limit and get OOM-killed.
 - **Interned-strings** and **JIT buffers** scale with the SHM / budget
   (clamped). Whether the JIT uses the buffer is shaped by tenancy
@@ -89,7 +89,7 @@ default**, so you can pin exactly the one knob you care about
 showing what was detected and derived (pinned values marked `*`):
 
 ```
-autotune (serve): cpu_quota=0.25 mem=320MiB (cgroup v2) -> workers=1[cgroup_quota] opcache.memory_consumption=64MB memory_limit=192M interned=8MB jit_buffer=32MB (jit=disable) max_files=20000 realpath=16M/ttl=600 validate_timestamps=0 assertions=-1
+autotune (serve): cpu_quota=0.25 mem=320MiB (cgroup v2) -> concurrency=2[cgroup_quota] opcache.memory_consumption=64MB memory_limit=128M interned=8MB jit_buffer=32MB (jit=disable) max_files=20000 realpath=16M/ttl=600 validate_timestamps=0 assertions=-1
 ```
 
 See the [config reference](/reference/config/#resource-aware-autotuning) for
@@ -97,7 +97,7 @@ the full formula table and every knob.
 
 ## Requirements
 
-- ePHPm **≥ 0.4.0**, `[php] mode = "fpm"` (the default — see
+- ePHPm **≥ 0.4.0**, `[php] mode = "per_request"` (the default — see
   [gaps](#gaps-and-caveats) for worker mode)
 - `[cluster] enabled = true` for multi-node fan-out (single node works
   too — `ephpm deploy` then only affects that node)

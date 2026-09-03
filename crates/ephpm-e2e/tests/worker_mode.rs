@@ -2,7 +2,7 @@
 //!
 //! These exercise the Phase-1 exit criteria from `worker-mode-design.md` §9
 //! against a running ePHPm instance started in worker mode
-//! (`[php] mode = "worker"`, `worker_script = "worker.php"`), serving the
+//! (`[php] mode = "worker"`, `[php.worker] script = "worker.php"`), serving the
 //! reference `examples/worker/worker.php`.
 //!
 //! Because worker mode is a whole-server switch, this needs a SEPARATE server
@@ -21,7 +21,7 @@
 //!   already produced, and — when the response headers are already on the wire
 //!   (`send_response_stream`) — the body is deliberately broken rather than
 //!   completed, so the client cannot read a truncated download as a success
-//! - worker_max_requests recycle
+//! - [php.worker] max_requests recycle
 //! - issue #116: a `do_blocks()`-shaped nested render never recycles a worker,
 //!   and renders byte-identically on every request of a worker's life; the same
 //!   render taken past the C-stack ceiling costs at most that one worker (500 +
@@ -155,7 +155,7 @@ async fn fatal_500s_then_recovers() {
     }
 }
 
-/// worker_max_requests recycle: over enough requests a worker crosses its
+/// max_requests recycle: over enough requests a worker crosses its
 /// recycle threshold and reboots. We can observe this indirectly: the
 /// per-worker "request #R" counter resets after a boot, so across a long run
 /// we must see R values reset (not grow monotonically forever), and the boot
@@ -265,7 +265,7 @@ async fn requests_keep_succeeding_across_recycles() {
         return;
     };
 
-    // Enough requests to cross a lowered worker_max_requests if the harness
+    // Enough requests to cross a lowered max_requests if the harness
     // set one (default is 10000, so this loop alone does not recycle);
     // regardless, every request must be a clean 200.
     for i in 0..200 {

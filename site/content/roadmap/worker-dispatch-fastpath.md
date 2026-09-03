@@ -6,13 +6,13 @@
 
 ## The measured gap
 
-Worker mode already cut per-request engine cost 3.2× versus fpm-dispatch
-mode. What remains is the distance to the theoretical class ceiling,
+Worker mode already cut per-request engine cost 3.2× versus per-request
+dispatch. What remains is the distance to the theoretical class ceiling,
 represented by Swoole's in-process event loop:
 
 | | per-request CPU | hello c=1 avg | hello c=16 |
 |---|---:|---:|---:|
-| ePHPm fpm mode | 386 µs | 2.0 ms | 648 rps |
+| ePHPm per-request mode | 386 µs | 2.0 ms | 648 rps |
 | ePHPm worker (tuned: 1 worker, backlog 32, no recycle) | **120 µs** | 0.9 ms | 2,078 rps |
 | Swoole (1 worker) | 38 µs | 0.4 ms | 6,539 rps |
 
@@ -50,13 +50,14 @@ effort gets wasted.
 The two config fixes landed within hours of this page being written
 (PR #159):
 
-- **Quota-aware `worker_count` derivation** — shipped. `worker_count =
-  0` now reads the cgroup CPU quota (v2 `cpu.max`, v1
+- **Quota-aware worker-count derivation** — shipped (the knob is now
+  `concurrency`). `concurrency = 0` reads the cgroup CPU quota (v2 `cpu.max`, v1
   `cfs_quota_us`/`cfs_period_us`) and derives `ceil(quota_cpus)`,
   falling back to host parallelism without a quota. The knob matrix
   that motivated it: 1 worker beat the derived 2 by ~24% at 0.25 CPU
   (2,100 vs 1,690 rps). Startup logs the derivation source.
-- **Recycle default** — shipped. `worker_max_requests` default raised
+- **Recycle default** — shipped. `worker_max_requests` (now
+  `[php.worker] max_requests`) default raised
   500 → 10,000 (500 forced a worker reboot every ~0.25 s at 2,000 rps);
   each recycle logs worker id, requests served, and uptime.
 
@@ -79,7 +80,7 @@ allocated per request.
 - Per-worker SPSC slot ring (depth = backlog) instead of per-request
   channel allocations: zero steady-state allocation for the
   request/response handoff.
-- Single-worker special case (`worker_count = 1`, the measured sweet
+- Single-worker special case (`concurrency = 1`, the measured sweet
   spot at container quotas): skip MPMC dispatch entirely.
 - Reuse a response builder per worker; skip `HeaderMap` reconstruction
   for the common small-header response shape.

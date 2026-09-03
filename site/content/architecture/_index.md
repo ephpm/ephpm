@@ -13,7 +13,7 @@ This document describes the full vision for ePHPm. The matrix below tracks what 
 | HTTP/1.1 | **Implemented** | hyper server, async accept loop |
 | HTTP/2 | **Implemented** | Negotiated over TLS via ALPN (`h2` + `http/1.1`); plain TCP listeners are HTTP/1.1 only |
 | TLS / ACME | **Implemented** | `rustls` + `rustls-acme` in `ephpm-server` |
-| PHP embedding (ZTS) | **Implemented** | Full SAPI, concurrent via `spawn_blocking` + per-thread TSRM — every platform, Windows included (#326) |
+| PHP embedding (ZTS) | **Implemented** | Full SAPI, concurrent via the dedicated PHP execution pool + per-thread TSRM — every platform, Windows included (#326) |
 | Static file serving | **Implemented** | MIME detection, path traversal protection |
 | Request routing | **Implemented** | `.php` → PHP, pretty permalinks → `index.php`, else static |
 | Configuration | **Implemented** | Figment — TOML + `EPHPM_` env var overrides |
@@ -1655,7 +1655,7 @@ The original MVP — single binary, hyper + PHP, TOML config, WordPress demo —
 **Foundations** — complete:
 
 - HTTP/1.1 (hyper + tokio), static files, `.php` routing, pretty-permalink fallback
-- PHP embedding via custom SAPI: ZTS on every platform, Windows included (concurrent via `spawn_blocking` + per-thread TSRM; #326)
+- PHP embedding via custom SAPI: ZTS on every platform, Windows included (concurrent via the dedicated PHP execution pool + per-thread TSRM; #326)
 - Figment-based config: TOML + `EPHPM_*` env var overrides
 - TLS + ACME (`rustls` + `rustls-acme`)
 
@@ -1686,7 +1686,7 @@ Client ──HTTP──► hyper (tokio)
             └───┬───────┬───┘
             no  │       │ yes
                 ▼       ▼
-          static file   spawn_blocking task
+          static file   execution-pool thread
           serving       (auto-registers a fresh
                          PHP TSRM context the
                          first time the OS thread
@@ -1752,17 +1752,17 @@ Release artifacts: `ephpm-0.1.0-php8.5-linux-x86_64`, `ephpm-0.1.0-php8.5-window
 
 PHP is statically linked into the binary via FFI — zero IPC overhead, Rust calls PHP C functions directly through the SAPI. `[php] mode` selects the **request-execution model** (see the [config reference](/reference/config/) for the authoritative key table):
 
-### fpm mode (default)
+### per-request mode (default)
 
-`mode = "fpm"` — php-fpm-shaped: each HTTP request runs a full `php_request_startup`/`shutdown` cycle, so framework state never leaks across requests. Behavior is byte-for-byte identical to releases before worker mode existed.
+`mode = "per_request"` — php-fpm-shaped: each HTTP request runs a full `php_request_startup`/`shutdown` cycle, so framework state never leaks across requests. Behavior is byte-for-byte identical to releases before worker mode existed.
 
 | Variant | Concurrency | Status |
 |---------|-------------|--------|
-| ZTS (every platform, Windows included — #326) | `spawn_blocking` + per-thread TSRM — concurrent PHP execution | **Implemented** |
+| ZTS (every platform, Windows included — #326) | dedicated PHP execution pool + per-thread TSRM — concurrent PHP execution | **Implemented** |
 
 ### Thread Safety: ZTS
 
-PHP is compiled with ZTS (`--enable-zts`). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The mutex only protects one-time init/shutdown. Windows builds are ZTS as well (the Windows php-sdk's `php8embed.lib` is a ZTS build) and execute concurrently too.
+PHP is compiled with ZTS (`--enable-zts`). Each execution-pool thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The mutex only protects one-time init/shutdown. Windows builds are ZTS as well (the Windows php-sdk's `php8embed.lib` is a ZTS build) and execute concurrently too.
 
 **Known ZTS caveats from spc / upstream PHP:**
 
@@ -1781,31 +1781,33 @@ PHP is compiled with ZTS (`--enable-zts`). Each `spawn_blocking` thread auto-reg
 ```toml
 [php]
 mode = "worker"
-worker_script = "worker.php"   # relative to document_root; required
+
+[php.worker]
+script = "worker.php"   # relative to document_root; required
 ```
 
 How it works:
 
-- A fixed pool of dedicated OS worker threads (`worker_count`, CPU-derived by default) each run `worker_script` once. The script boots the framework, then loops on the engine primitives registered in PHP userland:
+- A fixed pool of dedicated OS worker threads (`concurrency`, CPU-derived by default) each run the `[php.worker]` `script` once. The script boots the framework, then loops on the engine primitives registered in PHP userland:
   - `\Ephpm\Worker\take_request(): ?\Ephpm\Worker\Envelope` — blocks until the next HTTP request; `null` on shutdown/recycle.
   - `\Ephpm\Worker\send_response(int $status, array $headers, string $body): void` — hands the response back. Header values may be arrays (`'Set-Cookie' => [$c1, $c2]` emits one wire header per element).
   - `\Ephpm\Worker\send_response_stream(int $status, array $headers, $bodyResource): void` — streams a PHP stream/resource to the client in chunks.
-- The `Envelope` carries `serverVars()`, `headers()` (duplicate request headers pre-joined with `", "`, `Cookie` with `"; "`), `cookies()` and `query()` (parsed but **not** url-decoded — adapters decode), `rawBody()`, and `bodyStream()` (a real readable `php://` stream; large or chunked bodies at/above `worker_stream_threshold` stream in without ePHPm buffering them). `parsedBody()` always returns `null` and `files()` always returns `[]` — form/multipart parsing is an adapter concern, or enable `worker_populate_superglobals` for real `$_POST`/`$_FILES`.
-- Workers recycle after `worker_max_requests` requests; fatals and mid-request `exit()`/`die()` produce a response (synthesized from SAPI headers + captured output for `exit()`) and recycle the worker instead of wedging the server. Boot is supervised (`worker_boot_timeout`, boot-failure backoff). Superglobals are **not** populated by default — adapters build requests from the Envelope; `worker_populate_superglobals = true` turns them back on (WordPress).
+- The `Envelope` carries `serverVars()`, `headers()` (duplicate request headers pre-joined with `", "`, `Cookie` with `"; "`), `cookies()` and `query()` (parsed but **not** url-decoded — adapters decode), `rawBody()`, and `bodyStream()` (a real readable `php://` stream; large or chunked bodies at/above `[php.worker]` `stream_threshold` stream in without ePHPm buffering them). `parsedBody()` always returns `null` and `files()` always returns `[]` — form/multipart parsing is an adapter concern, or enable `[php.worker]` `populate_superglobals` for real `$_POST`/`$_FILES`.
+- Workers recycle after `[php.worker]` `max_requests` requests; fatals and mid-request `exit()`/`die()` produce a response (synthesized from SAPI headers + captured output for `exit()`) and recycle the worker instead of wedging the server. Boot is supervised (`[php.worker]` `boot_timeout`, boot-failure backoff). Superglobals are **not** populated by default — adapters build requests from the Envelope; `[php.worker]` `populate_superglobals = true` turns them back on (WordPress).
 - Worker mode is a whole-server switch and hard-errors when combined with `[server] sites_dir` (per-vhost worker pools are planned — not yet implemented).
 
 `examples/worker/worker.php` in the repo is the minimal reference loop; `examples/worker/worker-stream.php` demonstrates streaming. Framework adapters:
 
 - **Laravel** — shipped: [Laravel Octane (Worker Mode)](/guides/laravel-octane/) via `ephpm/octane-driver`.
-- **WordPress** — shipped: [WordPress Worker Mode](/guides/wordpress-worker/) via `ephpm/wordpress-worker` (requires `worker_populate_superglobals = true`).
+- **WordPress** — shipped: [WordPress Worker Mode](/guides/wordpress-worker/) via `ephpm/wordpress-worker` (requires `[php.worker]` `populate_superglobals = true`).
 - **Symfony** via [`symfony/runtime`](/roadmap/symfony-runtime-driver/) — planned, not yet implemented.
 - **PSR-15** (Mezzio, Slim, …) — shipped: [PSR-15 Apps (Worker Mode)](/guides/psr15-worker/) via `ephpm/psr15-worker`.
 
-The classic fpm mode remains the default and the right choice for apps without a worker contract — ZTS thread-per-request already gives concurrency, full compatibility, and zero state-reset surface.
+The classic per-request mode remains the default and the right choice for apps without a worker contract — ZTS thread-per-request already gives concurrency, full compatibility, and zero state-reset surface.
 
 ### External-process mode (planned — not yet implemented)
 
-An earlier design sketched an "external" mode where ePHPm would spawn user-provided `php` binaries as worker processes over stdin/stdout pipes (RoadRunner-style), for custom PHP builds and uncommon extensions. This mode does not exist today — the only implemented `[php] mode` values are `"fpm"` (the default) and `"worker"`, and PHP is always the embedded, statically linked runtime.
+An earlier design sketched an "external" mode where ePHPm would spawn user-provided `php` binaries as worker processes over stdin/stdout pipes (RoadRunner-style), for custom PHP builds and uncommon extensions. This mode does not exist today — the only implemented `[php] mode` values are `"per_request"` (the default) and `"worker"`, and PHP is always the embedded, statically linked runtime.
 
 ### Building libphp.a
 

@@ -52,7 +52,7 @@ the CLI prints a hint pointing at the config knob.
 - `[opcache] cluster_invalidation` must be `true` on every node (or
   unset with `[cluster] enabled = true`, which auto-defaults to
   `true`). Otherwise the watcher stays off and no invalidation runs.
-- `[php] mode = "fpm"` — worker mode is a Phase-1 gap and the watcher
+- `[php] mode = "per_request"` — worker mode is a Phase-1 gap and the watcher
   is skipped there. Startup logs a WARN when cluster invalidation is
   enabled under worker mode so the no-op is never silent.
 

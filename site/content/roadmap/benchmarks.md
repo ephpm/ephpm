@@ -35,9 +35,9 @@ fixtures + compose/k8s manifests), each with a named baseline pairing:
 
 | Profile | ePHPm side | Baseline side |
 |---|---|---|
-| `tiny-scripts` | fpm mode, defaults | nginx + php-fpm (OPcache on) |
+| `tiny-scripts` | per-request mode, defaults | nginx + php-fpm (OPcache on) |
 | `laravel-worker` | worker mode + native KV | nginx + php-fpm + Redis (Predis) |
-| `static-files` | fpm mode | nginx alone |
+| `static-files` | per-request mode | nginx alone |
 | `deploy-blip` | 2-node cluster + `ephpm deploy` | 2-replica fpm + rolling restart |
 
 The first three reproduce the shapes from the external lab report; the

@@ -14,7 +14,7 @@ pub enum ConfigError {
     Load(#[from] Box<figment::Error>),
 
     /// A loaded config is internally inconsistent (e.g. worker mode without a
-    /// resolvable `worker_script`). Surfaced by [`Config::validate`].
+    /// resolvable `[php.worker] script`). Surfaced by [`Config::validate`].
     #[error("invalid configuration: {0}")]
     Validation(String),
 }
@@ -2936,48 +2936,48 @@ impl Default for KvRedisCompatConfig {
     }
 }
 
-/// FPM request-execution engine (fpm mode only).
+/// Request-execution model (`[php] mode`).
 ///
-/// Selects **how** a per-request (php-fpm-shaped) PHP execution is scheduled
-/// onto an OS thread. Both engines run the byte-for-byte identical per-request
-/// setup/teardown (per-site DB session, KV keyspace, `open_basedir`,
-/// `max_execution_time`, the bailout crash guard) — they differ only in which
-/// thread pool the blocking PHP call lands on. Ignored in worker mode
-/// (`mode = "worker"`), where concurrency is bounded by the persistent worker
-/// pool instead.
+/// An enum, not a free-form string: a typo is a **startup error naming the
+/// key** (serde rejects the value), never a silent fallback to the default —
+/// the same strictness every other mode-selecting knob has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum FpmEngine {
-    /// **Legacy / opt-out.** Dispatch each PHP request onto tokio's shared
-    /// `spawn_blocking` pool. Behaviour is unchanged from every release before
-    /// the `pool` engine existed. Concurrency is bounded (optionally) by the
-    /// `[php] workers` semaphore; the blocking pool itself is never capped —
-    /// which means that at the historical `workers = 0` there is **no**
-    /// concurrency bound at all, so a flood spawns one blocking thread (and one
-    /// full ZTS PHP context) per in-flight request. Measured under an open-loop
-    /// `/api/cpu` flood (2 slots' worth of real capacity, 200 connections,
-    /// 2026-09-02): 486 threads / ~1.05 GiB RSS, where the `pool` engine's
-    /// derived cap held at 65 threads / ~193 MiB while serving *more* requests.
-    /// Retained as an escape hatch; no longer the default (v0.9.0).
-    SpawnBlocking,
-
-    /// **Default (v0.9.0+).** Dispatch each PHP request onto ePHPm's OWN fixed
-    /// pool of dedicated OS threads (not `spawn_blocking`). The pool size is
-    /// resolved by [`PhpConfig::effective_fpm_pool_size`] and IS the concurrency
-    /// cap for this engine, so the `[php] workers` semaphore is redundant and
-    /// bypassed (a full dispatch queue applies backpressure → 504 via the
-    /// request timeout; a draining/empty pool → 503). Bounded by construction:
+pub enum PhpMode {
+    /// **Default.** php-fpm-shaped execution: each HTTP request runs a full
+    /// `php_request_startup`/`shutdown` cycle on ePHPm's own fixed pool of
+    /// dedicated OS threads (`crates/ephpm-server/src/fpm_pool.rs`), so
+    /// framework state never leaks across requests. The pool size — resolved
+    /// by [`PhpConfig::effective_concurrency`] — IS the concurrency cap: a
+    /// full dispatch queue applies backpressure → 504 via the request
+    /// timeout; a draining/empty pool → 503. Bounded by construction:
     /// concurrency, memory, and thread count are all capped, and
-    /// `overload_policy = "shed"` has a queue to reject from without needing an
-    /// explicit `workers` value. Owning the threads is also what makes
-    /// `crash_containment` (Unix) and clean load-shedding possible. Motivated by
-    /// a ~10% rps win with lower tails over `spawn_blocking` on the Laravel
-    /// per-request benchmark (3-round A/B, 2026-09-02).
-    Pool,
+    /// `overload = "shed"` always has a queue to reject from. Owning the
+    /// threads is also what makes `crash_containment` (Unix) and clean
+    /// load-shedding possible.
+    PerRequest,
+
+    /// Persistent worker mode (Octane/RoadRunner model): a fixed pool of OS
+    /// threads each boot the framework **once** via `[php.worker] script`,
+    /// then loop over requests without re-bootstrapping. 5-20x throughput for
+    /// heavy frameworks. Requires `[php.worker] script`; the worker-only
+    /// knobs live in [`WorkerConfig`] (`[php.worker]`).
+    Worker,
+}
+
+impl PhpMode {
+    /// The config-file spelling of this mode (for startup logging).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PerRequest => "per_request",
+            Self::Worker => "worker",
+        }
+    }
 }
 
 /// What a PHP-bound request does when there is no execution slot for it
-/// (`[php] overload_policy`).
+/// (`[php] overload`).
 ///
 /// Overload has to end *somewhere*. Before this knob existed the only two
 /// endings were "wait until a slot frees up" and "the client gives up" — an
@@ -2989,9 +2989,9 @@ pub enum FpmEngine {
 #[serde(rename_all = "snake_case")]
 pub enum OverloadPolicy {
     /// **Default.** Queue and wait for an execution slot. Historical behaviour,
-    /// unchanged: the pool engine's bounded dispatch backlog applies
-    /// backpressure and the `[php] workers` semaphore makes requests line up,
-    /// with the outer `[server.timeouts] request` deadline as the only bound.
+    /// unchanged: the bounded dispatch queue (`[php] queue_depth`) applies
+    /// backpressure and requests line up, with the outer `[server.timeouts]
+    /// request` deadline as the only bound.
     Wait,
 
     /// Reject with `503 Service Unavailable` + `Retry-After` once a request has
@@ -3005,11 +3005,9 @@ pub enum OverloadPolicy {
 /// Dispatch-admission policy for the queues in front of PHP execution
 /// (`[php] admission`).
 ///
-/// Applies wherever ePHPm owns the bounded queue in front of PHP: the
-/// persistent worker pool (`mode = "worker"`) and the dedicated fpm thread
-/// pool (`fpm_engine = "pool"`). The default `spawn_blocking` fpm engine has
-/// no ePHPm-owned admission queue, so the knob is inert there (startup WARNs
-/// on a non-default value so it is never a silent no-op).
+/// Applies to both bounded queues ePHPm owns in front of PHP: the per-request
+/// thread pool (`mode = "per_request"`) and the persistent worker pool
+/// (`mode = "worker"`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionPolicy {
@@ -3244,7 +3242,7 @@ pub struct PhpConfig {
     /// Takes precedence over the legacy [`Self::memory_limit`] field **and**
     /// over the auto-derived value. When unset, ePHPm derives a per-request
     /// limit in serve mode from `(memory_budget − opcache_shm − ~64 MB
-    /// overhead) / worker_count`, clamped to a `128 MB` floor; with no
+    /// overhead) / concurrency`, clamped to a `128 MB` floor; with no
     /// detectable memory budget it keeps PHP's `128M` default rather than
     /// inventing a huge number. Dev mode keeps [`Self::memory_limit`].
     ///
@@ -3334,68 +3332,80 @@ pub struct PhpConfig {
     #[serde(default)]
     pub extensions: Vec<String>,
 
-    /// Maximum number of PHP requests that may execute concurrently.
+    /// Request-execution model. See [`PhpMode`].
     ///
-    /// Equivalent to php-fpm's `pm.max_children`: requests beyond the cap
-    /// queue until a slot frees up (still subject to the request timeout).
-    /// Enforced with a semaphore around PHP execution — tokio's blocking
-    /// pool itself is never capped, so static file serving and other
-    /// blocking work cannot be starved by slow PHP scripts.
-    ///
-    /// `0` means unlimited (bounded only by tokio's blocking pool).
-    ///
-    /// Default: `0` (unlimited).
-    ///
-    /// **Ignored in worker mode** (`mode = "worker"`): concurrency is bounded
-    /// by `worker_count` (parked threads) and `worker_backlog` (queue depth),
-    /// not this semaphore. Startup logs a WARN if `workers > 0` under worker
-    /// mode so the no-op is never silent.
-    #[serde(default = "default_php_workers")]
-    pub workers: usize,
-
-    /// Request-execution model.
-    ///
-    /// - `"fpm"` (default) — php-fpm-shaped: each HTTP request runs a full
-    ///   `php_request_startup`/`shutdown` cycle, so framework state never
-    ///   leaks across requests. Behavior is byte-for-byte identical to
-    ///   releases before worker mode existed.
+    /// - `"per_request"` (**default**) — php-fpm-shaped: each HTTP request
+    ///   runs a full `php_request_startup`/`shutdown` cycle on ePHPm's
+    ///   dedicated PHP thread pool, so framework state never leaks across
+    ///   requests.
     /// - `"worker"` — persistent worker mode (Octane/RoadRunner model): a
     ///   fixed pool of OS threads each boot the framework **once** via
-    ///   `worker_script`, then loop over requests without re-bootstrapping.
-    ///   5-20x throughput for heavy frameworks. Requires `worker_script`.
+    ///   `[php.worker] script`, then loop over requests without
+    ///   re-bootstrapping. 5-20x throughput for heavy frameworks.
     ///
-    /// Whole-server switch (not per-path). See `worker_*` fields below.
+    /// Whole-server switch (not per-path). Worker-only knobs live in the
+    /// `[php.worker]` subsection ([`WorkerConfig`]). An unrecognised value is
+    /// a **startup error naming the key** (serde enum), never a silent
+    /// fallback.
     ///
-    /// Default: `"fpm"`.
+    /// Env override: `EPHPM_PHP__MODE=worker`.
+    ///
+    /// Default: `"per_request"`.
     #[serde(default = "default_php_mode")]
-    pub mode: String,
+    pub mode: PhpMode,
 
-    /// FPM request-execution engine (fpm mode only).
+    /// Maximum number of PHP requests executing concurrently — the size of
+    /// the execution pool in **both** modes: the dedicated per-request PHP
+    /// thread pool (`mode = "per_request"`) or the persistent worker pool
+    /// (`mode = "worker"`).
     ///
-    /// - `"pool"` (**default, v0.9.0+**) — run each PHP request on ePHPm's
-    ///   own dedicated OS-thread pool sized by [`Self::effective_fpm_pool_size`].
-    ///   The pool size is the concurrency cap, so `[php] workers` is bypassed
-    ///   (see the migration note on `effective_fpm_pool_size`: an explicit
-    ///   `workers = N` is honoured as the pool size when `worker_count` is
-    ///   unset, so upgrading does not silently change an operator's cap).
-    /// - `"spawn_blocking"` (**legacy / opt-out**) — run each PHP request on
-    ///   tokio's shared blocking pool. Unchanged from every release before the
-    ///   pool engine existed; at `workers = 0` it applies no concurrency bound
-    ///   at all.
+    /// Named for what it bounds, not how: it is deliberately not `threads`
+    /// (an implementation detail) and not `max_children` (php-fpm's `pm.*`
+    /// semantics — dynamic process management — do not apply here).
     ///
-    /// An unrecognised value is a **startup error** (serde rejects it), never a
-    /// silent fallback. Ignored in worker mode (`mode = "worker"`); startup logs
-    /// a WARN if `spawn_blocking` cannot apply there so the no-op is never
-    /// silent.
+    /// The pool is separate from tokio's blocking pool by construction, so
+    /// capping PHP execution never caps static-file serving or other
+    /// blocking work — slow PHP scripts cannot starve static responses.
     ///
-    /// Env override: `EPHPM_PHP__FPM_ENGINE=spawn_blocking`.
+    /// `0` (**default**) derives the value at startup: from the cgroup CPU
+    /// quota when running under one (`cpu.max` on cgroup v2,
+    /// `cpu.cfs_quota_us`/`cpu.cfs_period_us` on v1; Linux only), otherwise
+    /// from host parallelism — clamped to `[2, 32]` on **both** paths. The
+    /// floor is 2, never 1: a 1-thread pool deadlocks a PHP loopback
+    /// subrequest (a script that HTTP-requests its own server holds the only
+    /// thread while waiting for a response that needs that thread — issue
+    /// #461), and `--cpus 1` is a common container shape. An explicit value
+    /// is used as-is, including `1` — set it only if nothing on the box
+    /// performs loopback subrequests. Startup logs the effective value and
+    /// its source at INFO.
     ///
-    /// Default: `"pool"`.
-    #[serde(default = "default_fpm_engine")]
-    pub fpm_engine: FpmEngine,
+    /// Env override: `EPHPM_PHP__CONCURRENCY=8`.
+    ///
+    /// Default: `0` (derived).
+    #[serde(default)]
+    pub concurrency: usize,
+
+    /// Dispatch-queue depth in front of the execution pool (both modes).
+    ///
+    /// When the queue is full, admission applies backpressure
+    /// (`overload = "wait"`, the default) or answers `503` + `Retry-After`
+    /// (`overload = "shed"`), still bounded by the request timeout (504).
+    ///
+    /// Named `queue_depth` rather than `backlog` on purpose: `backlog`
+    /// collides with the TCP listen backlog an operator may be tuning at the
+    /// same time.
+    ///
+    /// `0` derives the depth from the effective concurrency (one queued job
+    /// per execution slot).
+    ///
+    /// Env override: `EPHPM_PHP__QUEUE_DEPTH=64`.
+    ///
+    /// Default: `0` (= effective concurrency).
+    #[serde(default)]
+    pub queue_depth: usize,
 
     /// **EXPERIMENTAL.** Contain a PHP C-stack overflow instead of letting it
-    /// abort the whole process (`fpm_engine = "pool"` only).
+    /// abort the whole process (`mode = "per_request"` only).
     ///
     /// A deep object-graph free (`zend_object_std_dtor` ↔
     /// `zend_objects_store_del` C recursion) overflows the executing thread's
@@ -3417,10 +3427,11 @@ pub struct PhpConfig {
     /// plateaus — measured on a 4-thread pool, RSS rose ~90 MiB over the first
     /// ~1000 contained crashes and then stopped growing.
     ///
-    /// Requires `fpm_engine = "pool"`: containment is only safe when ePHPm owns
-    /// the executing thread and can genuinely retire it, which tokio's shared
-    /// `spawn_blocking` pool cannot do. Setting this without the pool engine (or
-    /// in worker mode) logs a WARN at startup and changes nothing.
+    /// Requires `mode = "per_request"`: containment is only safe when ePHPm
+    /// owns the executing thread and can genuinely retire it. Worker mode's
+    /// persistent threads hold a booted framework whose state cannot be
+    /// abandoned mid-flight, so setting this in worker mode logs a WARN at
+    /// startup and changes nothing.
     ///
     /// Env override: `EPHPM_PHP__CRASH_CONTAINMENT=true`.
     ///
@@ -3428,8 +3439,8 @@ pub struct PhpConfig {
     #[serde(default = "default_crash_containment")]
     pub crash_containment: bool,
 
-    /// What to do with a PHP-bound request that cannot get an execution slot
-    /// (fpm mode). See [`OverloadPolicy`].
+    /// What to do with a PHP-bound request that cannot get an execution slot.
+    /// See [`OverloadPolicy`].
     ///
     /// - `"wait"` (**default**) — queue and wait. Historical behaviour.
     /// - `"shed"` — answer `503` + `Retry-After` after `shed_after_ms` of
@@ -3437,40 +3448,26 @@ pub struct PhpConfig {
     ///
     /// **Unset is not the same as `"wait"`**: an unset value takes the preview
     /// preset (`"shed"`) under `[server] preview = true`, and `"wait"`
-    /// otherwise — resolved by [`Config::effective_overload_policy`], the same
+    /// otherwise — resolved by [`Config::effective_overload`], the same
     /// explicit-wins rule `[server.limits]` uses. Startup logs which one is in
-    /// force and what it will actually do on the active engine.
+    /// force. What `"shed"` bounds is the dispatch queue (`queue_depth`,
+    /// default = effective concurrency): full queue → shed.
     ///
-    /// What `"shed"` bounds depends on the engine, because that is where the
-    /// admission queue lives:
-    ///
-    /// - `fpm_engine = "pool"` — the bounded dispatch backlog
-    ///   (`worker_backlog`, default = pool size). Full backlog → shed.
-    /// - `fpm_engine = "spawn_blocking"` (default) — the `[php] workers`
-    ///   semaphore. **With `workers = 0` (the default) there is no admission
-    ///   queue to bound and nothing is shed**; tokio's blocking queue itself is
-    ///   unbounded and its entries are uncancellable, so ePHPm cannot reject
-    ///   from there. Startup WARNs about exactly this combination.
-    ///
-    /// Ignored in worker mode (`mode = "worker"`), which has its own bounded
-    /// worker pool; startup WARNs if it is set there.
-    ///
-    /// Env override: `EPHPM_PHP__OVERLOAD_POLICY=shed`.
+    /// Env override: `EPHPM_PHP__OVERLOAD=shed`.
     ///
     /// Default: unset (`"wait"`, or `"shed"` under `[server] preview`).
     #[serde(default)]
-    pub overload_policy: Option<OverloadPolicy>,
+    pub overload: Option<OverloadPolicy>,
 
     /// How long, in milliseconds, a request may wait for a PHP execution slot
-    /// before `overload_policy = "shed"` answers `503`. Ignored when the policy
-    /// is `"wait"`.
+    /// before `overload = "shed"` answers `503`. Ignored when the policy is
+    /// `"wait"`.
     ///
     /// `0` (the default) means "do not wait at all": take a slot if one is
-    /// immediately available, otherwise shed. On the pool engine that is the
-    /// natural reading of #301's ask — the `worker_backlog` queue is *already*
-    /// the buffer, so a full backlog means saturated. On the `spawn_blocking`
-    /// engine it makes `[php] workers` a strict concurrency cap with no queue.
-    /// Raise it to buy a grace window that absorbs bursts before shedding.
+    /// immediately available, otherwise shed. That is the natural reading of
+    /// #301's ask — the `queue_depth` queue is *already* the buffer, so a full
+    /// queue means saturated. Raise it to buy a grace window that absorbs
+    /// bursts before shedding.
     ///
     /// Env override: `EPHPM_PHP__SHED_AFTER_MS=250`.
     ///
@@ -3479,8 +3476,8 @@ pub struct PhpConfig {
     pub shed_after_ms: u64,
 
     /// Dispatch-admission policy for the bounded queues in front of PHP
-    /// execution — the persistent worker pool (`mode = "worker"`) and the
-    /// dedicated fpm thread pool (`fpm_engine = "pool"`). See
+    /// execution — the per-request thread pool (`mode = "per_request"`) and
+    /// the persistent worker pool (`mode = "worker"`). See
     /// [`AdmissionPolicy`].
     ///
     /// - `"fifo"` (**default**) — strict arrival-order admission via a
@@ -3490,9 +3487,7 @@ pub struct PhpConfig {
     ///   channel's `send().await`, where fresh dispatchers can steal freed
     ///   slots ahead of parked waiters). Operator escape hatch.
     ///
-    /// Inert on the default `fpm_engine = "spawn_blocking"` (there is no
-    /// ePHPm-owned admission queue to police); startup WARNs if `"barge"` is
-    /// set there. An unknown value is a startup error.
+    /// An unknown value is a startup error.
     ///
     /// Env override: `EPHPM_PHP__ADMISSION=barge`.
     ///
@@ -3500,52 +3495,44 @@ pub struct PhpConfig {
     #[serde(default = "default_admission")]
     pub admission: AdmissionPolicy,
 
-    /// Worker-mode entrypoint script, relative to `document_root`.
+    /// Worker-mode configuration (`[php.worker]`). See [`WorkerConfig`].
+    ///
+    /// Only meaningful when `mode = "worker"` — the subsection is structurally
+    /// scoped so per-request deployments never see (or set) worker-only knobs.
+    #[serde(default)]
+    pub worker: WorkerConfig,
+}
+
+/// Worker-mode configuration (`[php.worker]`).
+///
+/// Every knob here applies only when `[php] mode = "worker"`; the shared
+/// scheduling knobs (`concurrency`, `queue_depth`, `admission`, `overload`,
+/// `shed_after_ms`) stay on `[php]` because they bound both modes.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerConfig {
+    /// Worker entrypoint script, relative to `document_root`.
     ///
     /// The script is a loop that calls `\Ephpm\Worker\take_request()` /
     /// `\Ephpm\Worker\send_response()`. Real framework adapters (Octane,
     /// PSR-15) ship this; `examples/worker/worker.php` is the reference.
     ///
     /// **Required** when `mode = "worker"` — config load hard-errors if it is
-    /// absent or does not resolve to a file under `document_root`. Ignored in
-    /// fpm mode.
+    /// absent or does not resolve to a file under `document_root`.
+    ///
+    /// Env override: `EPHPM_PHP__WORKER__SCRIPT=worker.php`.
     ///
     /// Default: `None`.
     #[serde(default)]
-    pub worker_script: Option<PathBuf>,
+    pub script: Option<PathBuf>,
 
-    /// Number of persistent worker threads (worker mode only).
-    ///
-    /// Each worker is a permanently-parked OS thread holding a fully-booted
-    /// framework in memory, so — unlike `workers` — worker mode picks a
-    /// concrete count. `0` derives it from the CPU count, clamped to
-    /// `[2, 32]`. Heavy frameworks (WordPress ~40MB/worker) may want it lower.
-    ///
-    /// Applies on every platform: Windows is ZTS like Linux/macOS (#326), so
-    /// multiple workers serve concurrently there too. (Historically this was
-    /// forced to `1` on Windows on the wrong belief that Windows builds were
-    /// NTS.)
-    ///
-    /// Ignored in fpm mode.
-    ///
-    /// Default: `0` — derive from the cgroup CPU quota when running under one
-    /// (`cpu.max` on cgroup v2, `cpu.cfs_quota_us`/`cpu.cfs_period_us` on v1;
-    /// Linux only), otherwise from host parallelism clamped to `[2, 32]`. The
-    /// quota-aware path is the sweet spot inside CPU-limited containers, where
-    /// the host-parallelism derivation overshoots (measured 2026-07-09: at a
-    /// 0.25-CPU quota, 1 worker beat the derived 2 by ~24% on hello c=16).
-    #[serde(default = "default_worker_count")]
-    pub worker_count: usize,
-
-    /// Recycle a worker after it has handled this many requests (worker mode
-    /// only). The worker's `take_request()` returns null on the next call, the
-    /// framework loop exits, and the pool respawns a fresh worker with a clean
-    /// boot — reclaiming any slow memory growth in the framework's own state
+    /// Recycle a worker after it has handled this many requests. The worker's
+    /// `take_request()` returns null on the next call, the framework loop
+    /// exits, and the pool respawns a fresh worker with a clean boot —
+    /// reclaiming any slow memory growth in the framework's own state
     /// (php-fpm `pm.max_requests` semantics).
     ///
     /// `0` disables recycling (never recycle on request count).
-    ///
-    /// Ignored in fpm mode.
     ///
     /// Default: `10000`. A pure leak guard — for a leak-free framework loop,
     /// recycling adds overhead (framework reboot) without any benefit. Raised
@@ -3553,63 +3540,61 @@ pub struct PhpConfig {
     /// every ~0.25 s. Each recycle is logged at debug (worker id, requests
     /// served, uptime) so its frequency is visible.
     #[serde(default = "default_worker_max_requests")]
-    pub worker_max_requests: u64,
-
-    /// Dispatch-queue depth for handing requests to workers (worker mode
-    /// only). When the queue is full, the HTTP handler suspends (backpressure)
-    /// until a worker frees up, still bounded by the request timeout (504).
-    ///
-    /// `0` derives the depth from `worker_count` (one queued job per worker).
-    ///
-    /// Ignored in fpm mode.
-    ///
-    /// Default: `0` (= `worker_count`).
-    #[serde(default = "default_worker_backlog")]
-    pub worker_backlog: usize,
+    pub max_requests: u64,
 
     /// Seconds a worker gets to boot the framework and reach its first
-    /// `take_request()` (worker mode only). A worker still booting when this
-    /// window expires is logged as an error and counted in
-    /// `ephpm_worker_boot_timeouts_total`. The thread is NOT killed — a PHP
-    /// thread cannot be terminated safely — and it still becomes ready if the
-    /// boot eventually completes. A worker whose boot *fails* (the script
-    /// exits before its first `take_request()`) is counted as a boot failure
-    /// and respawned with exponential backoff, independent of this timeout.
-    ///
-    /// Ignored in fpm mode.
+    /// `take_request()`. A worker still booting when this window expires is
+    /// logged as an error and counted in `ephpm_worker_boot_timeouts_total`.
+    /// The thread is NOT killed — a PHP thread cannot be terminated safely —
+    /// and it still becomes ready if the boot eventually completes. A worker
+    /// whose boot *fails* (the script exits before its first `take_request()`)
+    /// is counted as a boot failure and respawned with exponential backoff,
+    /// independent of this timeout.
     ///
     /// Default: `30`.
     #[serde(default = "default_worker_boot_timeout")]
-    pub worker_boot_timeout: u64,
+    pub boot_timeout: u64,
 
     /// Populate native PHP superglobals (`$_GET`/`$_POST`/`$_SERVER`/...) per
-    /// request in worker mode (worker mode only).
+    /// request in worker mode.
     ///
     /// Off by default: Octane/PSR-15 adapters build their own request object
     /// from the `Envelope` and never touch superglobals. Turn this on for the
     /// WordPress adapter, which assumes real superglobals.
     ///
-    /// Ignored in fpm mode (fpm always builds superglobals natively).
+    /// (Per-request mode always builds superglobals natively.)
     ///
     /// Default: `false`.
     #[serde(default)]
-    pub worker_populate_superglobals: bool,
+    pub populate_superglobals: bool,
 
     /// Request-body size (bytes) at or above which the body is *streamed* into
-    /// the worker in fixed-size chunks instead of buffered whole (worker mode
-    /// only, Phase 3). Requests with a `Content-Length` at or above this — or
-    /// with no `Content-Length` (chunked) — flow through
-    /// `Envelope::bodyStream()` / PHP's POST reader without ePHPm holding the
-    /// whole body in memory, keeping worker RSS flat for multi-GB uploads.
+    /// the worker in fixed-size chunks instead of buffered whole (Phase 3).
+    /// Requests with a `Content-Length` at or above this — or with no
+    /// `Content-Length` (chunked) — flow through `Envelope::bodyStream()` /
+    /// PHP's POST reader without ePHPm holding the whole body in memory,
+    /// keeping worker RSS flat for multi-GB uploads.
     ///
     /// Smaller requests stay on the buffered Phase-1 path (one copy each way),
     /// which is cheaper for the common small-body case.
     ///
-    /// Ignored in fpm mode (the fpm path always buffers the body today).
+    /// (The per-request path always buffers the body today.)
     ///
     /// Default: `1048576` (1 MiB).
     #[serde(default = "default_worker_stream_threshold")]
-    pub worker_stream_threshold: u64,
+    pub stream_threshold: u64,
+}
+
+impl Default for WorkerConfig {
+    fn default() -> Self {
+        Self {
+            script: None,
+            max_requests: default_worker_max_requests(),
+            boot_timeout: default_worker_boot_timeout(),
+            populate_superglobals: false,
+            stream_threshold: default_worker_stream_threshold(),
+        }
+    }
 }
 
 impl Config {
@@ -3655,7 +3640,7 @@ impl Config {
         Ok(config)
     }
 
-    /// Resolve `[php] overload_policy` against the `[server] preview` preset.
+    /// Resolve `[php] overload` against the `[server] preview` preset.
     ///
     /// An explicit value always wins — including an explicit `"wait"` under
     /// preview, which is how an operator opts *out* of the preset. An unset
@@ -3668,20 +3653,20 @@ impl Config {
     /// it lives here and not on [`PhpConfig`] — there is one resolution and one
     /// place to find it, mirroring [`ServerConfig::effective_limits`].
     #[must_use]
-    pub fn effective_overload_policy(&self) -> OverloadPolicy {
-        self.php.overload_policy.unwrap_or(if self.server.preview {
+    pub fn effective_overload(&self) -> OverloadPolicy {
+        self.php.overload.unwrap_or(if self.server.preview {
             OverloadPolicy::Shed
         } else {
             OverloadPolicy::Wait
         })
     }
 
-    /// Whether [`Self::effective_overload_policy`] came from the preview preset
+    /// Whether [`Self::effective_overload`] came from the preview preset
     /// rather than from an operator-set value. Startup logging uses it to name
     /// the source, so the preset is never silent.
     #[must_use]
-    pub fn overload_policy_from_preview_preset(&self) -> bool {
-        self.server.preview && self.php.overload_policy.is_none()
+    pub fn overload_from_preview_preset(&self) -> bool {
+        self.server.preview && self.php.overload.is_none()
     }
 
     /// Validate cross-field invariants that serde cannot express.
@@ -3690,9 +3675,12 @@ impl Config {
     /// and before the runtime starts, so misconfiguration fails fast with a
     /// clear message rather than a confusing runtime error.
     ///
+    /// (`[php] mode` itself needs no check here: it is an enum, so an unknown
+    /// value is already a load-time serde error naming the key.)
+    ///
     /// Worker-mode rules (see `worker-mode-design.md` §4.3):
-    /// - `mode = "worker"` requires a `worker_script` that resolves to a file
-    ///   under `document_root`.
+    /// - `mode = "worker"` requires a `[php.worker] script` that resolves to a
+    ///   file under `document_root`.
     /// - `mode = "worker"` with `sites_dir` set is a Phase-1-unsupported
     ///   combination (per-host worker pools are a later phase) — hard error.
     ///
@@ -3700,15 +3688,6 @@ impl Config {
     ///
     /// Returns [`ConfigError::Validation`] if any invariant is violated.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // Reject unknown modes outright: a typo like "workr" would otherwise
-        // silently mean fpm (the no-silent-knob rule).
-        if self.php.mode != "fpm" && self.php.mode != "worker" {
-            return Err(ConfigError::Validation(format!(
-                "[php] mode must be \"fpm\" or \"worker\", got \"{}\"",
-                self.php.mode,
-            )));
-        }
-
         // [server.tenant_network] ebpf_policy: fail closed, never a silent
         // no-op. The runtime-capability gate (kernel too old / no BTF / missing
         // CAP_BPF) can't be decided from config alone — that is a hard startup
@@ -4090,7 +4069,7 @@ impl Config {
             // there is no per-request `php_request_startup` to prepend into, so
             // the mount would never run. Refuse rather than mount a policy
             // layer that silently does nothing.
-            if self.php.mode == "worker" {
+            if self.php.is_worker_mode() {
                 return bad(
                     "PHP middleware is not supported in worker mode (`[php] mode = \"worker\"`) — \
                      the worker script owns the request loop; use the framework's own middleware \
@@ -4171,12 +4150,13 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::Validation`] when `worker_script` is absent, does
-    /// not resolve to an existing file, or resolves outside `document_root`.
+    /// Returns [`ConfigError::Validation`] when `[php.worker] script` is
+    /// absent, does not resolve to an existing file, or resolves outside
+    /// `document_root`.
     pub fn resolve_worker_script(&self) -> Result<PathBuf, ConfigError> {
-        let Some(script) = self.php.worker_script.as_ref() else {
+        let Some(script) = self.php.worker.script.as_ref() else {
             return Err(ConfigError::Validation(
-                "[php] mode = \"worker\" requires [php] worker_script (the \
+                "[php] mode = \"worker\" requires [php.worker] script (the \
                  entrypoint loop, relative to document_root)"
                     .to_string(),
             ));
@@ -4190,7 +4170,7 @@ impl Config {
         // certainly does not exist — surface a clear "not found" error.
         let canon_script = candidate.canonicalize().map_err(|e| {
             ConfigError::Validation(format!(
-                "[php] worker_script {} does not resolve to an existing file \
+                "[php.worker] script {} does not resolve to an existing file \
                  (looked under document_root {}): {e}",
                 script.display(),
                 doc_root.display(),
@@ -4199,7 +4179,7 @@ impl Config {
 
         if !canon_script.is_file() {
             return Err(ConfigError::Validation(format!(
-                "[php] worker_script {} is not a regular file",
+                "[php.worker] script {} is not a regular file",
                 canon_script.display(),
             )));
         }
@@ -4209,7 +4189,7 @@ impl Config {
             && !canon_script.starts_with(&canon_root)
         {
             return Err(ConfigError::Validation(format!(
-                "[php] worker_script {} resolves outside document_root {}",
+                "[php.worker] script {} resolves outside document_root {}",
                 canon_script.display(),
                 canon_root.display(),
             )));
@@ -4236,7 +4216,7 @@ impl Config {
 /// non-Windows targets — are returned unchanged.
 ///
 /// Public because **every** path that reaches PHP after a `canonicalize()` needs
-/// this, not just `worker_script`: the per-site document-root override
+/// this, not just the worker script: the per-site document-root override
 /// (`ephpm-server`'s `site_overrides`) canonicalizes to prove containment and
 /// then hands the result to PHP as `DOCUMENT_ROOT`/`SCRIPT_FILENAME`. Two copies
 /// of this would be two places to forget the `UNC` case.
@@ -4358,145 +4338,72 @@ impl Default for PhpConfig {
             ini_file: None,
             ini_overrides: Vec::new(),
             extensions: Vec::new(),
-            workers: default_php_workers(),
             mode: default_php_mode(),
-            fpm_engine: default_fpm_engine(),
+            concurrency: 0,
+            queue_depth: 0,
             crash_containment: default_crash_containment(),
-            overload_policy: None,
+            overload: None,
             shed_after_ms: default_shed_after_ms(),
             admission: default_admission(),
-            worker_script: None,
-            worker_count: default_worker_count(),
-            worker_max_requests: default_worker_max_requests(),
-            worker_backlog: default_worker_backlog(),
-            worker_boot_timeout: default_worker_boot_timeout(),
-            worker_populate_superglobals: false,
-            worker_stream_threshold: default_worker_stream_threshold(),
+            worker: WorkerConfig::default(),
         }
     }
 }
 
 impl PhpConfig {
     /// Whether persistent worker mode is requested (`mode = "worker"`).
-    ///
-    /// Case-insensitive so `"Worker"` / `"WORKER"` also match.
     #[must_use]
     pub fn is_worker_mode(&self) -> bool {
-        self.mode.eq_ignore_ascii_case("worker")
-    }
-
-    /// Whether the experimental dedicated FPM thread-pool engine is requested
-    /// **and applicable** — i.e. `fpm_engine = "pool"` in fpm mode. Always
-    /// `false` in worker mode (the persistent worker pool owns concurrency
-    /// there, so `fpm_engine` is inert). This is the single predicate the server
-    /// uses to decide whether to build the pool and bypass the `workers`
-    /// semaphore, so the two decisions can never disagree.
-    #[must_use]
-    pub fn is_pool_engine(&self) -> bool {
-        !self.is_worker_mode() && self.fpm_engine == FpmEngine::Pool
+        self.mode == PhpMode::Worker
     }
 
     /// Whether stack-overflow crash containment is requested **and applicable**
-    /// — i.e. `crash_containment = true` together with the dedicated FPM thread
-    /// pool ([`Self::is_pool_engine`]).
+    /// — i.e. `crash_containment = true` in per-request mode.
     ///
-    /// Containment is deliberately gated on the pool engine: recovering from the
-    /// fault leaves the executing thread's Zend context poisoned, so the *only*
-    /// safe follow-up is to retire that OS thread and spawn a replacement —
-    /// which is possible only on threads ePHPm owns. On tokio's shared
-    /// `spawn_blocking` pool a poisoned thread stays in rotation and fails every
-    /// later request, which is worse than the crash it prevented.
+    /// Containment is deliberately gated on per-request mode: recovering from
+    /// the fault leaves the executing thread's Zend context poisoned, so the
+    /// *only* safe follow-up is to retire that OS thread and spawn a
+    /// replacement. The per-request pool can do that between requests; a
+    /// worker-mode thread holds a booted framework whose in-memory state
+    /// cannot be abandoned mid-flight.
     ///
     /// Startup warns when `crash_containment` is set but this returns `false`,
     /// so the no-op is never silent.
     #[must_use]
     pub fn is_crash_containment_active(&self) -> bool {
-        self.crash_containment && self.is_pool_engine()
+        self.crash_containment && !self.is_worker_mode()
     }
 
-    /// Resolve the effective worker-thread count.
+    /// Resolve the effective concurrency — the execution-pool size in both
+    /// modes (per-request PHP thread pool / persistent worker pool).
     ///
-    /// Returns the configured `worker_count`, or — when it is `0` — a value
+    /// Returns the configured `concurrency`, or — when it is `0` — a value
     /// derived from the cgroup CPU quota (Linux, when present) or otherwise
-    /// from host parallelism clamped to `[2, 32]`. Never returns `0`. See
-    /// [`Self::effective_worker_count_with_source`] to also learn *why* a
-    /// given value was picked (for logging at pool startup).
+    /// from host parallelism, clamped to `[2, 32]` on both derivation paths.
+    /// Never derives `0` or `1` (issue #461: a 1-thread pool deadlocks a PHP
+    /// loopback subrequest). See
+    /// [`Self::effective_concurrency_with_source`] to also learn *why* a given
+    /// value was picked (for logging at pool startup).
     #[must_use]
-    pub fn effective_worker_count(&self) -> usize {
-        self.effective_worker_count_with_source().0
+    pub fn effective_concurrency(&self) -> usize {
+        self.effective_concurrency_with_source().0
     }
 
-    /// Same as [`Self::effective_worker_count`] but also reports the source of
-    /// the derivation so the worker pool can log why it picked N threads.
+    /// Same as [`Self::effective_concurrency`] but also reports the source of
+    /// the derivation so pool startup can log why it picked N threads.
     #[must_use]
-    pub fn effective_worker_count_with_source(&self) -> (usize, WorkerCountSource) {
-        if self.worker_count > 0 {
-            return (self.worker_count, WorkerCountSource::Explicit);
-        }
-        if let Some(quota_cpus) = read_cgroup_cpu_quota() {
-            // Round up so a 0.25 quota gives 1 worker, a 1.5 quota gives 2.
-            // ceil().max(1.0) is always >= 1.0 and bounded by the small quotas
-            // real containers use, so the cast is sign- and range-safe.
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let n = quota_cpus.ceil().max(1.0) as usize;
-            return (n, WorkerCountSource::CgroupQuota { quota_cpus });
-        }
-        let cpus = std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get);
-        (cpus.clamp(2, 32), WorkerCountSource::HostParallelism { cpus })
+    pub fn effective_concurrency_with_source(&self) -> (usize, ConcurrencySource) {
+        let host_cpus = std::thread::available_parallelism().map_or(2, std::num::NonZeroUsize::get);
+        derive_concurrency(self.concurrency, read_cgroup_cpu_quota(), host_cpus)
     }
 
     /// Resolve the effective dispatch-queue depth.
     ///
-    /// Returns `worker_backlog`, or the effective worker count when it is `0`.
+    /// Returns `queue_depth`, or the effective concurrency when it is `0`.
     /// Always at least `1`.
     #[must_use]
-    pub fn effective_worker_backlog(&self) -> usize {
-        if self.worker_backlog > 0 { self.worker_backlog } else { self.effective_worker_count() }
-    }
-
-    /// Resolve the fpm pool's thread count — the concurrency cap for
-    /// `fpm_engine = "pool"`, which is the default engine as of v0.9.0.
-    ///
-    /// Resolution order, and the reason it differs from
-    /// [`Self::effective_worker_count`]:
-    /// 1. `worker_count > 0` — use it (the explicit fpm-pool size).
-    /// 2. `workers > 0` — use it. **Migration safety:** before the default
-    ///    flipped to `pool`, `[php] workers = N` was the way to cap concurrent
-    ///    PHP executions on the (then-default) `spawn_blocking` engine. Sizing
-    ///    the pool from that value keeps an existing `workers = N` config
-    ///    meaning "N concurrent PHP executions" across the upgrade, instead of
-    ///    silently replacing the operator's cap with a host-derived one.
-    /// 3. Otherwise derive exactly as worker mode does (cgroup CPU quota, else
-    ///    host parallelism clamped `[2, 32]`).
-    ///
-    /// Kept separate from [`Self::effective_worker_count`] so this fallback
-    /// touches only fpm-pool sizing — worker-mode sizing and the serve-mode
-    /// `php_memory_limit` derivation (which divides by `effective_worker_count`)
-    /// are unaffected.
-    #[must_use]
-    pub fn effective_fpm_pool_size_with_source(&self) -> (usize, FpmPoolSizeSource) {
-        if self.worker_count > 0 {
-            return (self.worker_count, FpmPoolSizeSource::WorkerCount);
-        }
-        if self.workers > 0 {
-            return (self.workers, FpmPoolSizeSource::WorkersFallback);
-        }
-        let (n, src) = self.effective_worker_count_with_source();
-        (n, FpmPoolSizeSource::Derived(src))
-    }
-
-    /// The fpm pool's thread count. See
-    /// [`Self::effective_fpm_pool_size_with_source`] for the resolution order.
-    #[must_use]
-    pub fn effective_fpm_pool_size(&self) -> usize {
-        self.effective_fpm_pool_size_with_source().0
-    }
-
-    /// The fpm pool's dispatch-queue depth: explicit `worker_backlog`, else the
-    /// pool size (one queued job per thread). Always at least `1`.
-    #[must_use]
-    pub fn effective_fpm_pool_backlog(&self) -> usize {
-        if self.worker_backlog > 0 { self.worker_backlog } else { self.effective_fpm_pool_size() }
+    pub fn effective_queue_depth(&self) -> usize {
+        if self.queue_depth > 0 { self.queue_depth } else { self.effective_concurrency() }
     }
 
     /// Resolve the effective `opcache.validate_timestamps` value for a run.
@@ -4545,8 +4452,8 @@ impl PhpConfig {
     pub fn autotune(&self, dev_mode: bool, multi_tenant: bool) -> AutoTune {
         let (mem_budget, mem_source) = detect_memory_budget();
         let cpu_quota = read_cgroup_cpu_quota();
-        let (workers, worker_source) = self.effective_worker_count_with_source();
-        let derived = derive_tuning(cpu_quota, mem_budget, workers, dev_mode);
+        let (concurrency, concurrency_source) = self.effective_concurrency_with_source();
+        let derived = derive_tuning(cpu_quota, mem_budget, concurrency, dev_mode);
 
         // Three-tier resolution helper: explicit config wins, then the derived
         // value (if serve mode produced one), then the PHP stock default.
@@ -4579,7 +4486,7 @@ impl PhpConfig {
         // `JitReason::TracingJitBug`). The order of these arms is the order
         // the reasons are reported in, not a precedence over behaviour: they
         // all resolve to the same mode.
-        let worker_mode = self.mode == "worker";
+        let worker_mode = self.is_worker_mode();
         let (jit_mode, jit_reason) = match self.opcache_jit {
             Some(mode) => {
                 (TunedValue { value: mode, origin: Origin::Explicit }, JitReason::Explicit)
@@ -4617,8 +4524,8 @@ impl PhpConfig {
             cpu_quota,
             mem_budget,
             mem_source,
-            workers,
-            worker_source,
+            concurrency,
+            concurrency_source,
             dev_mode,
             multi_tenant,
             validate_timestamps: validate,
@@ -4872,7 +4779,7 @@ pub fn derive_jit_buffer_mb(mem_bytes: Option<u64>) -> u32 {
 }
 
 /// Derive the resource-aware serve-mode tuning profile from the detected CPU
-/// quota, memory budget, and effective worker count.
+/// quota, memory budget, and effective concurrency.
 ///
 /// Returns an all-`None` [`DerivedTuning`] in **dev mode** (dev keeps
 /// PHP-friendly defaults so edits refresh instantly and assertions stay on).
@@ -4889,7 +4796,7 @@ pub fn derive_jit_buffer_mb(mem_bytes: Option<u64>) -> u32 {
 ///   [`PhpConfig::autotune`]).
 /// - `opcache.max_accelerated_files` = a generous fixed `20000` (app-file-count
 ///   shaped, not resource-shaped — see the field doc).
-/// - `memory_limit` = `(budget − opcache_shm − 64 MB overhead) / workers`,
+/// - `memory_limit` = `(budget − opcache_shm − 64 MB overhead) / concurrency`,
 ///   floored at `128 MB`. With no detectable memory budget it stays `None`
 ///   (keep PHP's `128M`) rather than inventing a huge number.
 /// - `realpath_cache_size` = `16M`; `realpath_cache_ttl` = `600`.
@@ -4898,12 +4805,12 @@ pub fn derive_jit_buffer_mb(mem_bytes: Option<u64>) -> u32 {
 pub fn derive_tuning(
     cpu_quota: Option<f64>,
     mem_bytes: Option<u64>,
-    workers: usize,
+    concurrency: usize,
     dev_mode: bool,
 ) -> DerivedTuning {
     // CPU quota is detected and logged, but no serve tunable is CPU-shaped
-    // today (the JIT default is tenancy-shaped, not CPU-shaped, and
-    // worker_count already consumes the quota). Bind
+    // today (the JIT default is tenancy-shaped, not CPU-shaped, and the
+    // concurrency derivation already consumes the quota). Bind
     // it so the signature documents the input and a future CPU-shaped knob has
     // it to hand.
     let _ = cpu_quota;
@@ -4933,10 +4840,10 @@ pub fn derive_tuning(
 
     // Per-request memory_limit: only derived when we actually know the budget —
     // otherwise keep PHP's 128M (returned as None). Reserve the opcache SHM and
-    // a ~64 MB engine/server overhead, then split across concurrent workers.
+    // a ~64 MB engine/server overhead, then split across the execution slots.
     let memory_limit: Option<String> = mem_bytes.map(|budget| {
         let overhead = 64 * MIB + u64::from(opcache_mb) * MIB;
-        let per_request_bytes = budget.saturating_sub(overhead) / (workers.max(1) as u64);
+        let per_request_bytes = budget.saturating_sub(overhead) / (concurrency.max(1) as u64);
         let per_request_mb = (per_request_bytes / MIB).max(128);
         // Cap the string at a u32-safe MB count for tidy formatting; budgets
         // this large are unrealistic but keep the cast honest.
@@ -4958,7 +4865,7 @@ pub fn derive_tuning(
 }
 
 /// The fully-resolved resource-aware tuning profile for a run: the detected
-/// inputs (CPU quota, memory budget + source, worker count + source) plus every
+/// inputs (CPU quota, memory budget + source, concurrency + source) plus every
 /// tunable resolved through the explicit → derived → default precedence.
 ///
 /// Produced by [`PhpConfig::autotune`]. Feeds both the generated php.ini (via
@@ -4972,10 +4879,10 @@ pub struct AutoTune {
     pub mem_budget: Option<u64>,
     /// Where the memory figure came from.
     pub mem_source: MemorySource,
-    /// Effective worker count driving the per-request `memory_limit` split.
-    pub workers: usize,
-    /// Where the worker count came from.
-    pub worker_source: WorkerCountSource,
+    /// Effective concurrency driving the per-request `memory_limit` split.
+    pub concurrency: usize,
+    /// Where the concurrency came from.
+    pub concurrency_source: ConcurrencySource,
     /// Whether this is the dev-mode profile (vs serve).
     pub dev_mode: bool,
     /// Whether `[server] sites_dir` is set (multi-tenant vhosting) — shapes
@@ -5160,13 +5067,13 @@ impl AutoTune {
             format!("jit={}{}", self.jit.value.as_ini(), self.jit.origin.marker())
         };
         format!(
-            "autotune ({mode}): cpu_quota={cpu} mem={mem} ({}) -> workers={}[{}] \
+            "autotune ({mode}): cpu_quota={cpu} mem={mem} ({}) -> concurrency={}[{}] \
              opcache.memory_consumption={}MB{} memory_limit={}{} interned={}MB{} \
              jit_buffer={}MB{} ({jit_state}) max_files={}{} realpath={}{}/ttl={}{} \
              validate_timestamps={}{} assertions={}{}",
             self.mem_source.label(),
-            self.workers,
-            self.worker_source.label(),
+            self.concurrency,
+            self.concurrency_source.label(),
             self.memory_consumption.value,
             self.memory_consumption.origin.marker(),
             self.memory_limit.value,
@@ -5630,34 +5537,17 @@ impl OpcacheConfig {
     }
 }
 
-fn default_php_workers() -> usize {
-    // Unlimited by default. A CPU-based default sounds attractive but is
-    // dangerous: PHP scripts that block without I/O (sleep, long queries)
-    // hold their slot past the HTTP request timeout, and a small cap lets a
-    // handful of them starve all PHP traffic. Opt into a cap explicitly.
-    0
-}
-
 fn default_shed_after_ms() -> u64 {
-    // No grace window. The admission queue a shed decision looks at is already
-    // a buffer (`worker_backlog` on the pool engine, `workers` slots on the
-    // spawn_blocking one), so "full" already means saturated — waiting on top
-    // of it is the backpressure-into-client-timeout behaviour issue #301 is
-    // about. Operators who want a burst absorber set this explicitly.
+    // No grace window. The admission queue a shed decision looks at
+    // (`queue_depth`) is already a buffer, so "full" already means saturated —
+    // waiting on top of it is the backpressure-into-client-timeout behaviour
+    // issue #301 is about. Operators who want a burst absorber set this
+    // explicitly.
     0
 }
 
-fn default_php_mode() -> String {
-    "fpm".to_string()
-}
-
-fn default_fpm_engine() -> FpmEngine {
-    // v0.9.0: the dedicated fpm pool is the default. It bounds concurrency,
-    // memory, and thread count by construction, makes `overload_policy = "shed"`
-    // and `crash_containment` usable without extra config, and measured ~10%
-    // faster with lower tails than `spawn_blocking` on the Laravel per-request
-    // benchmark. `spawn_blocking` stays available as the opt-out.
-    FpmEngine::Pool
+fn default_php_mode() -> PhpMode {
+    PhpMode::PerRequest
 }
 
 fn default_admission() -> AdmissionPolicy {
@@ -5675,36 +5565,35 @@ fn default_crash_containment() -> bool {
     false
 }
 
-fn default_worker_count() -> usize {
-    // 0 => derive at startup — cgroup CPU quota if present (Linux), otherwise
-    // host parallelism clamped [2, 32]. See `PhpConfig::effective_worker_count`.
-    0
-}
+/// Lower clamp bound for a *derived* `[php] concurrency`.
+///
+/// Never 1: a 1-thread pool deadlocks a PHP loopback subrequest — the caller
+/// holds the only execution slot while waiting for a response that needs that
+/// same slot (issue #461). `--cpus 1` containers are common, so the quota
+/// derivation must not silently produce the deadlock-capable value. An
+/// *explicit* `concurrency = 1` is honoured (the operator has asserted no
+/// loopback subrequests happen).
+pub const MIN_DERIVED_CONCURRENCY: usize = 2;
 
-/// Where the fpm pool's thread count came from — logged at pool startup so an
-/// operator can see the sizing decision now that `pool` is the default engine.
-#[derive(Debug, Clone, Copy)]
-pub enum FpmPoolSizeSource {
-    /// `[php] worker_count = N` was set explicitly.
-    WorkerCount,
-    /// `[php] workers = N` was used as the pool size because `worker_count` was
-    /// unset (the migration fallback — see
-    /// [`PhpConfig::effective_fpm_pool_size_with_source`]).
-    WorkersFallback,
-    /// Neither was set; the size was derived exactly as worker mode derives it.
-    Derived(WorkerCountSource),
-}
+/// Upper clamp bound for a *derived* `[php] concurrency`. Beyond ~32 PHP
+/// threads the marginal thread costs more in memory and contention than it
+/// returns; hosts with more cores opt in explicitly.
+pub const MAX_DERIVED_CONCURRENCY: usize = 32;
 
-/// Where the effective `worker_count` came from — surfaced for structured
+/// Where the effective `[php] concurrency` came from — surfaced for structured
 /// logging at pool startup so operators can see why N threads were chosen.
 #[derive(Debug, Clone, Copy)]
-pub enum WorkerCountSource {
-    /// The user set `worker_count = N` explicitly.
+pub enum ConcurrencySource {
+    /// The user set `concurrency = N` explicitly.
     Explicit,
-    /// Derived from a container/cgroup CPU quota.
+    /// Derived from a container/cgroup CPU quota, clamped `[2, 32]`.
     CgroupQuota {
         /// Raw quota in CPU units (0.25 for a 25%-of-one-core limit).
         quota_cpus: f64,
+        /// `ceil(quota_cpus)` before the `[2, 32]` clamp. When this is below
+        /// the effective value the clamp raised it — logged at INFO so an
+        /// operator on a 1-CPU box understands why they got 2 threads (#461).
+        unclamped: usize,
     },
     /// Derived from host parallelism, clamped `[2, 32]`.
     HostParallelism {
@@ -5713,7 +5602,7 @@ pub enum WorkerCountSource {
     },
 }
 
-impl WorkerCountSource {
+impl ConcurrencySource {
     /// A short label suitable for a `tracing` field.
     #[must_use]
     pub fn label(&self) -> &'static str {
@@ -5723,6 +5612,42 @@ impl WorkerCountSource {
             Self::HostParallelism { .. } => "host_parallelism",
         }
     }
+}
+
+/// Pure concurrency derivation — the single resolution used by both execution
+/// modes. Separated from [`PhpConfig::effective_concurrency_with_source`] (its
+/// only production caller, which feeds in the real cgroup quota and host
+/// parallelism) so the derivation is unit-testable with injected values on
+/// every platform, including the Linux-only cgroup path.
+///
+/// Order: an explicit value wins as-is (even `1` — see
+/// [`MIN_DERIVED_CONCURRENCY`]); else `ceil(cgroup quota)` clamped `[2, 32]`;
+/// else host parallelism clamped `[2, 32]`. Never returns `0`, and never
+/// *derives* `1` (#461).
+fn derive_concurrency(
+    explicit: usize,
+    cgroup_quota: Option<f64>,
+    host_cpus: usize,
+) -> (usize, ConcurrencySource) {
+    if explicit > 0 {
+        return (explicit, ConcurrencySource::Explicit);
+    }
+    if let Some(quota_cpus) = cgroup_quota {
+        // Round up so a 1.5 quota gives 2. ceil().max(1.0) is always >= 1.0
+        // and bounded by the small quotas real containers use, so the cast is
+        // sign- and range-safe. The clamp then enforces the deadlock-safe
+        // floor of 2 (#461) and the 32-thread ceiling.
+        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+        let unclamped = quota_cpus.ceil().max(1.0) as usize;
+        return (
+            unclamped.clamp(MIN_DERIVED_CONCURRENCY, MAX_DERIVED_CONCURRENCY),
+            ConcurrencySource::CgroupQuota { quota_cpus, unclamped },
+        );
+    }
+    (
+        host_cpus.clamp(MIN_DERIVED_CONCURRENCY, MAX_DERIVED_CONCURRENCY),
+        ConcurrencySource::HostParallelism { cpus: host_cpus },
+    )
 }
 
 /// Read the cgroup CPU quota (v2 preferred, v1 fallback). Returns the quota in
@@ -6108,11 +6033,6 @@ fn default_worker_max_requests() -> u64 {
     // recycling is pure overhead. Raised from 500 (2026-07-09 roadmap): at
     // 2,000 rps, the old default recycled every ~0.25 s.
     10_000
-}
-
-fn default_worker_backlog() -> usize {
-    // 0 => = effective_worker_count (one queued job per worker).
-    0
 }
 
 fn default_worker_stream_threshold() -> u64 {
@@ -6679,7 +6599,7 @@ mod tests {
             &file,
             format!(
                 "[server]\ndocument_root = {docroot:?}\n\
-                 [php]\nmode = \"worker\"\nworker_script = \"worker.php\"\n\
+                 [php]\nmode = \"worker\"\n[php.worker]\nscript = \"worker.php\"\n\
                  {}",
                 php_mount_toml("php:middleware.php"),
             ),
@@ -7021,7 +6941,7 @@ idle_timeout_secs = 15
         let file = dir.path().join("ephpm.toml");
         std::fs::write(
             &file,
-            "[server.websocket]\nenabled = true\n\n[php]\nmode = \"worker\"\nworker_script = \"w.php\"\n",
+            "[server.websocket]\nenabled = true\n\n[php]\nmode = \"worker\"\n[php.worker]\nscript = \"w.php\"\n",
         )
         .unwrap();
 
@@ -7061,7 +6981,7 @@ idle_timeout_secs = 15
         std::fs::write(
             &file,
             format!(
-                "[server]\ndocument_root = {:?}\nwebsocket_files = []\n\n[php]\nmode = \"worker\"\nworker_script = \"w.php\"\n",
+                "[server]\ndocument_root = {:?}\nwebsocket_files = []\n\n[php]\nmode = \"worker\"\n[php.worker]\nscript = \"w.php\"\n",
                 dir.path().to_string_lossy(),
             ),
         )
@@ -7244,124 +7164,108 @@ idle_timeout_secs = 15
         assert_eq!(config.server.index_files, vec!["index.php", "index.html"]);
     }
 
-    // ── [php] fpm_engine ─────────────────────────────────────────────────
+    // ── [php] mode ───────────────────────────────────────────────────────
 
-    /// The struct default is the dedicated fpm pool (v0.9.0+).
+    /// The struct default is per-request mode.
     #[test]
-    fn fpm_engine_defaults_to_pool() {
-        assert_eq!(PhpConfig::default().fpm_engine, FpmEngine::Pool);
-        assert!(PhpConfig::default().is_pool_engine());
+    fn mode_defaults_to_per_request() {
+        assert_eq!(PhpConfig::default().mode, PhpMode::PerRequest);
+        assert!(!PhpConfig::default().is_worker_mode());
         let config = Config::default_config().expect("default config should load");
-        assert_eq!(config.php.fpm_engine, FpmEngine::Pool);
+        assert_eq!(config.php.mode, PhpMode::PerRequest);
     }
 
-    /// `[php]` section present but `fpm_engine` absent must resolve to the
-    /// default, not be zeroed by a section-level derive.
+    /// `[php]` section present but `mode` absent must resolve to the default,
+    /// not be zeroed by a section-level derive.
     #[test]
-    fn fpm_engine_section_present_absent_field_is_pool() {
+    fn mode_section_present_absent_field_is_per_request() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("ephpm.toml");
         std::fs::write(&file, "[php]\nmax_execution_time = 60\n").unwrap();
 
         let config = Config::load(&file).unwrap();
         assert_eq!(
-            config.php.fpm_engine,
-            FpmEngine::Pool,
-            "a partial [php] section must not change the engine default"
+            config.php.mode,
+            PhpMode::PerRequest,
+            "a partial [php] section must not change the mode default"
         );
-        assert!(config.php.is_pool_engine());
     }
 
-    /// A whole config with no `[php]` section at all still defaults the engine.
+    /// Both spellings parse; anything else — including the pre-rename `"fpm"`
+    /// and case variants (the enum is exact-match, unlike the old
+    /// case-insensitive string) — is a load error naming the value.
     #[test]
-    fn fpm_engine_section_absent_is_pool() {
+    fn mode_parses_exactly_and_rejects_unknown_values() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("ephpm.toml");
-        std::fs::write(&file, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
 
-        let config = Config::load(&file).unwrap();
-        assert_eq!(config.php.fpm_engine, FpmEngine::Pool);
+        let per_request = dir.path().join("per_request.toml");
+        std::fs::write(&per_request, "[php]\nmode = \"per_request\"\n").unwrap();
+        assert_eq!(Config::load(&per_request).unwrap().php.mode, PhpMode::PerRequest);
+
+        let worker = dir.path().join("worker.toml");
+        std::fs::write(&worker, "[php]\nmode = \"worker\"\n").unwrap();
+        let config = Config::load(&worker).unwrap();
+        assert_eq!(config.php.mode, PhpMode::Worker);
+        assert!(config.php.is_worker_mode());
+
+        for bad in ["fpm", "workr", "Worker", "WORKER", "spawn_blocking"] {
+            let file = dir.path().join(format!("bad-{bad}.toml"));
+            std::fs::write(&file, format!("[php]\nmode = \"{bad}\"\n")).unwrap();
+            assert!(
+                Config::load(&file).is_err(),
+                "mode = {bad:?} must fail to load, not silently fall back"
+            );
+        }
     }
 
-    /// The opt-out is honoured: an explicit `spawn_blocking` parses and turns
-    /// the pool engine off.
+    /// The mode flips via env with no code change.
     #[test]
-    fn fpm_engine_explicit_spawn_blocking_opts_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("ephpm.toml");
-        std::fs::write(&file, "[php]\nfpm_engine = \"spawn_blocking\"\n").unwrap();
-
-        let config = Config::load(&file).unwrap();
-        assert_eq!(config.php.fpm_engine, FpmEngine::SpawnBlocking);
-        assert!(!config.php.is_pool_engine());
-    }
-
-    /// Migration safety: with the pool default and no `worker_count`, an
-    /// explicit `[php] workers = N` sizes the pool, so the operator's
-    /// concurrency cap survives the default flip instead of being replaced by a
-    /// host-derived value.
-    #[test]
-    fn fpm_pool_size_falls_back_to_workers_when_worker_count_unset() {
-        let cfg = PhpConfig { workers: 4, worker_count: 0, ..PhpConfig::default() };
-        let (n, source) = cfg.effective_fpm_pool_size_with_source();
-        assert_eq!(n, 4, "workers must size the pool when worker_count is unset");
-        assert!(matches!(source, FpmPoolSizeSource::WorkersFallback));
-
-        // worker_count wins over workers when both are set.
-        let cfg = PhpConfig { workers: 4, worker_count: 7, ..PhpConfig::default() };
-        let (n, source) = cfg.effective_fpm_pool_size_with_source();
-        assert_eq!(n, 7);
-        assert!(matches!(source, FpmPoolSizeSource::WorkerCount));
-
-        // Neither set: derived, never zero.
-        let cfg = PhpConfig { workers: 0, worker_count: 0, ..PhpConfig::default() };
-        let (n, source) = cfg.effective_fpm_pool_size_with_source();
-        assert!(n >= 1);
-        assert!(matches!(source, FpmPoolSizeSource::Derived(_)));
-    }
-
-    /// Explicit `pool` parses and is applicable in fpm mode.
-    #[test]
-    fn fpm_engine_pool_parses_and_is_applicable_in_fpm_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("ephpm.toml");
-        std::fs::write(&file, "[php]\nfpm_engine = \"pool\"\n").unwrap();
-
-        let config = Config::load(&file).unwrap();
-        assert_eq!(config.php.fpm_engine, FpmEngine::Pool);
-        assert!(config.php.is_pool_engine(), "pool engine applies in fpm mode");
-    }
-
-    /// `fpm_engine` is inert in worker mode: `is_pool_engine()` is false even
-    /// when `pool` is requested, so the server never builds the fpm pool there.
-    #[test]
-    fn fpm_engine_pool_is_inert_in_worker_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("ephpm.toml");
-        std::fs::write(&file, "[php]\nmode = \"worker\"\nfpm_engine = \"pool\"\n").unwrap();
-
-        let config = Config::load(&file).unwrap();
-        assert_eq!(config.php.fpm_engine, FpmEngine::Pool);
-        assert!(!config.php.is_pool_engine(), "fpm_engine is ignored in worker mode");
-    }
-
-    /// An unrecognised value is a hard startup error, never a silent fallback.
-    #[test]
-    fn fpm_engine_invalid_value_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("ephpm.toml");
-        std::fs::write(&file, "[php]\nfpm_engine = \"threads\"\n").unwrap();
-
-        assert!(Config::load(&file).is_err(), "an unknown fpm_engine must fail to load");
-    }
-
-    /// The engine flips via env with no code change, in both directions.
-    #[test]
-    fn fpm_engine_env_override_parses() {
-        let _env = EnvVars::set("EPHPM_PHP__FPM_ENGINE", "spawn_blocking");
+    fn mode_env_override_parses() {
+        let _env = EnvVars::set("EPHPM_PHP__MODE", "worker");
         let config = Config::default_config().unwrap();
-        assert_eq!(config.php.fpm_engine, FpmEngine::SpawnBlocking);
-        assert!(!config.php.is_pool_engine());
+        assert_eq!(config.php.mode, PhpMode::Worker);
+    }
+
+    // ── removed keys (pre-v0.9 concurrency config) ───────────────────────
+
+    /// Every pre-rename `[php]` key is a **load error naming the key** — an
+    /// old config must fail fast with an actionable message, never silently
+    /// drop an operator's concurrency cap or worker settings. The new-name
+    /// hints live in the migration table (site/content/reference/config.md);
+    /// serde's unknown-field error names the rejected key and the accepted
+    /// ones.
+    #[test]
+    fn removed_php_keys_are_load_errors_naming_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        for (key, line) in [
+            ("workers", "workers = 8"),
+            ("fpm_engine", "fpm_engine = \"pool\""),
+            ("worker_count", "worker_count = 4"),
+            ("worker_backlog", "worker_backlog = 16"),
+            ("overload_policy", "overload_policy = \"shed\""),
+            ("worker_script", "worker_script = \"worker.php\""),
+            ("worker_max_requests", "worker_max_requests = 100"),
+            ("worker_boot_timeout", "worker_boot_timeout = 10"),
+            ("worker_populate_superglobals", "worker_populate_superglobals = true"),
+            ("worker_stream_threshold", "worker_stream_threshold = 4096"),
+        ] {
+            let file = dir.path().join(format!("removed-{key}.toml"));
+            std::fs::write(&file, format!("[php]\n{line}\n")).unwrap();
+            let err = Config::load(&file).expect_err(&format!("[php] {key} must be rejected"));
+            let msg = err.to_string();
+            assert!(msg.contains(key), "the error must name the rejected key {key}: {msg}");
+        }
+    }
+
+    /// The `[php.worker]` subsection is strict too: an unknown key under it —
+    /// e.g. an old top-level name pasted in — fails to load naming the key.
+    #[test]
+    fn php_worker_subsection_rejects_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(&file, "[php.worker]\nworker_count = 4\n").unwrap();
+        let err = Config::load(&file).expect_err("[php.worker] worker_count must be rejected");
+        assert!(err.to_string().contains("worker_count"), "unhelpful error: {err}");
     }
 
     // ── [php] admission (issue #442 / PR #443 escape hatch) ──────────────
@@ -7415,15 +7319,15 @@ idle_timeout_secs = 15
         assert_eq!(config.php.admission, AdmissionPolicy::Barge);
     }
 
-    // ── [php] overload_policy / shed_after_ms (issue #301) ───────────────
+    // ── [php] overload / shed_after_ms (issue #301) ──────────────────────
 
     /// Shedding is OFF unless asked for — from the struct default, from an
     /// empty file, and from a `[php]` section that exists but omits the field
     /// (the serde section-default trap). Behaviour must be byte-identical to
     /// releases before the knob existed.
     #[test]
-    fn overload_policy_defaults_to_wait() {
-        assert_eq!(PhpConfig::default().overload_policy, None);
+    fn overload_defaults_to_wait() {
+        assert_eq!(PhpConfig::default().overload, None);
         assert_eq!(PhpConfig::default().shed_after_ms, 0);
 
         let dir = tempfile::tempdir().unwrap();
@@ -7431,43 +7335,37 @@ idle_timeout_secs = 15
         let empty = dir.path().join("empty.toml");
         std::fs::write(&empty, "").unwrap();
         let config = Config::load(&empty).unwrap();
-        assert_eq!(config.effective_overload_policy(), OverloadPolicy::Wait);
-        assert!(!config.overload_policy_from_preview_preset());
+        assert_eq!(config.effective_overload(), OverloadPolicy::Wait);
+        assert!(!config.overload_from_preview_preset());
 
         // `[php]` present, field absent.
         let partial = dir.path().join("partial.toml");
         std::fs::write(&partial, "[php]\nmemory_limit = \"128M\"\n").unwrap();
-        assert_eq!(
-            Config::load(&partial).unwrap().effective_overload_policy(),
-            OverloadPolicy::Wait
-        );
+        assert_eq!(Config::load(&partial).unwrap().effective_overload(), OverloadPolicy::Wait);
 
         // `[server]` present without `preview` must not flip it either.
         let server_only = dir.path().join("server.toml");
         std::fs::write(&server_only, "[server]\nlisten = \"0.0.0.0:8080\"\n").unwrap();
-        assert_eq!(
-            Config::load(&server_only).unwrap().effective_overload_policy(),
-            OverloadPolicy::Wait
-        );
+        assert_eq!(Config::load(&server_only).unwrap().effective_overload(), OverloadPolicy::Wait);
     }
 
     /// Explicit values parse, and an unknown one is a hard startup error rather
     /// than a silent fallback to `wait` (which would look like working config
     /// while shedding nothing).
     #[test]
-    fn overload_policy_parses_and_rejects_unknown_values() {
+    fn overload_parses_and_rejects_unknown_values() {
         let dir = tempfile::tempdir().unwrap();
 
         let shed = dir.path().join("shed.toml");
-        std::fs::write(&shed, "[php]\noverload_policy = \"shed\"\nshed_after_ms = 250\n").unwrap();
+        std::fs::write(&shed, "[php]\noverload = \"shed\"\nshed_after_ms = 250\n").unwrap();
         let config = Config::load(&shed).unwrap();
-        assert_eq!(config.php.overload_policy, Some(OverloadPolicy::Shed));
+        assert_eq!(config.php.overload, Some(OverloadPolicy::Shed));
         assert_eq!(config.php.shed_after_ms, 250);
-        assert_eq!(config.effective_overload_policy(), OverloadPolicy::Shed);
+        assert_eq!(config.effective_overload(), OverloadPolicy::Shed);
 
         let bad = dir.path().join("bad.toml");
-        std::fs::write(&bad, "[php]\noverload_policy = \"drop\"\n").unwrap();
-        assert!(Config::load(&bad).is_err(), "an unknown overload_policy must fail to load");
+        std::fs::write(&bad, "[php]\noverload = \"drop\"\n").unwrap();
+        assert!(Config::load(&bad).is_err(), "an unknown overload value must fail to load");
     }
 
     /// `[server] preview = true` supplies `shed` for an unset policy — a
@@ -7481,34 +7379,31 @@ idle_timeout_secs = 15
         let preview = dir.path().join("preview.toml");
         std::fs::write(&preview, "[server]\npreview = true\n").unwrap();
         let config = Config::load(&preview).unwrap();
-        assert_eq!(config.effective_overload_policy(), OverloadPolicy::Shed);
-        assert!(config.overload_policy_from_preview_preset(), "startup must name the preset");
+        assert_eq!(config.effective_overload(), OverloadPolicy::Shed);
+        assert!(config.overload_from_preview_preset(), "startup must name the preset");
 
         let opted_out = dir.path().join("opted-out.toml");
-        std::fs::write(
-            &opted_out,
-            "[server]\npreview = true\n\n[php]\noverload_policy = \"wait\"\n",
-        )
-        .unwrap();
+        std::fs::write(&opted_out, "[server]\npreview = true\n\n[php]\noverload = \"wait\"\n")
+            .unwrap();
         let config = Config::load(&opted_out).unwrap();
         assert_eq!(
-            config.effective_overload_policy(),
+            config.effective_overload(),
             OverloadPolicy::Wait,
             "an explicit value must beat the preview preset"
         );
-        assert!(!config.overload_policy_from_preview_preset());
+        assert!(!config.overload_from_preview_preset());
     }
 
     /// Both knobs are reachable from the environment, which is how the overload
     /// lab and container deployments set them.
     #[test]
-    fn overload_policy_env_override_parses() {
-        let _policy = EnvVars::set("EPHPM_PHP__OVERLOAD_POLICY", "shed");
+    fn overload_env_override_parses() {
+        let _policy = EnvVars::set("EPHPM_PHP__OVERLOAD", "shed");
         let _after = EnvVars::set("EPHPM_PHP__SHED_AFTER_MS", "150");
         let config = Config::default_config().unwrap();
-        assert_eq!(config.php.overload_policy, Some(OverloadPolicy::Shed));
+        assert_eq!(config.php.overload, Some(OverloadPolicy::Shed));
         assert_eq!(config.php.shed_after_ms, 150);
-        assert_eq!(config.effective_overload_policy(), OverloadPolicy::Shed);
+        assert_eq!(config.effective_overload(), OverloadPolicy::Shed);
     }
 
     // ── [php] crash_containment ──────────────────────────────────────────
@@ -7538,95 +7433,43 @@ idle_timeout_secs = 15
         assert!(!config.php.is_crash_containment_active());
     }
 
-    /// Requested WITH the pool engine → active. This is the only combination
-    /// that arms the guard.
+    /// Requested in per-request mode (the default) → active. A bare
+    /// `crash_containment = true` arms with no other config: the per-request
+    /// pool is the only engine, and its threads are ePHPm-owned and retirable.
     #[test]
-    fn crash_containment_active_with_pool_engine() {
+    fn crash_containment_arms_in_per_request_mode() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("ephpm.toml");
-        std::fs::write(&file, "[php]\nfpm_engine = \"pool\"\ncrash_containment = true\n").unwrap();
+        std::fs::write(&file, "[php]\ncrash_containment = true\n").unwrap();
 
         let config = Config::load(&file).unwrap();
         assert!(config.php.crash_containment);
         assert!(
             config.php.is_crash_containment_active(),
-            "containment applies with the pool engine in fpm mode"
+            "containment arms in per-request mode with no further config"
         );
     }
 
-    /// Requested OFF the pool engine → parsed but inert. Containment needs a
-    /// thread ePHPm can retire; tokio's shared blocking pool cannot provide
-    /// one. Startup warns (see `crates/ephpm/src/main.rs`).
-    ///
-    /// Note the engine must now be named **explicitly** to reach the inert
-    /// case: since v0.9.0 the default engine is `pool`, so a bare
-    /// `crash_containment = true` arms (see
-    /// `crash_containment_arms_on_the_default_engine`).
+    /// Requested in worker mode → parsed but inert. Containment needs a thread
+    /// ePHPm can retire between requests; a worker thread holds a booted
+    /// framework whose state cannot be abandoned mid-flight. Startup warns
+    /// (see `crates/ephpm/src/main.rs`).
     #[test]
-    fn crash_containment_is_inert_off_the_pool_engine() {
+    fn crash_containment_is_inert_in_worker_mode() {
         let dir = tempfile::tempdir().unwrap();
-
-        // Explicit legacy engine — the opt-out.
-        let sb = dir.path().join("sb.toml");
-        std::fs::write(&sb, "[php]\nfpm_engine = \"spawn_blocking\"\ncrash_containment = true\n")
-            .unwrap();
-        let config = Config::load(&sb).unwrap();
-        assert!(config.php.crash_containment, "the field still parses");
-        assert!(
-            !config.php.is_crash_containment_active(),
-            "containment must not arm on the spawn_blocking engine"
-        );
-
-        // Worker mode makes `fpm_engine` inert, so containment is inert too.
         let worker = dir.path().join("worker.toml");
-        std::fs::write(
-            &worker,
-            "[php]\nmode = \"worker\"\nfpm_engine = \"pool\"\ncrash_containment = true\n",
-        )
-        .unwrap();
+        std::fs::write(&worker, "[php]\nmode = \"worker\"\ncrash_containment = true\n").unwrap();
         let config = Config::load(&worker).unwrap();
+        assert!(config.php.crash_containment, "the field still parses");
         assert!(
             !config.php.is_crash_containment_active(),
             "containment must not arm in worker mode"
         );
     }
 
-    /// Migration-visible consequence of the v0.9.0 `fpm_engine` default flip,
-    /// pinned deliberately rather than discovered in production: a config that
-    /// sets `crash_containment = true` and names no engine used to be
-    /// parsed-but-inert (startup WARNed that it was ignored). It now **arms**,
-    /// with no operator action — a PHP C-stack overflow becomes a 500 plus a
-    /// retired pool thread instead of a process abort, at the cost of leaking
-    /// that thread's PHP context and skipping PHP module shutdown at exit.
-    ///
-    /// Startup still says so loudly (the `is_crash_containment_active()` arm in
-    /// `crates/ephpm/src/main.rs` WARNs), so this is a documented behaviour
-    /// change and not a silent one. If this test ever fails, the containment
-    /// default moved — which is an operator-visible change that belongs in the
-    /// release notes, not a test fixup.
-    #[test]
-    fn crash_containment_arms_on_the_default_engine() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("ephpm.toml");
-        std::fs::write(&file, "[php]\ncrash_containment = true\n").unwrap();
-
-        let config = Config::load(&file).unwrap();
-        assert_eq!(
-            config.php.fpm_engine,
-            FpmEngine::Pool,
-            "precondition: the default engine is the pool"
-        );
-        assert!(
-            config.php.is_crash_containment_active(),
-            "containment arms on the default engine as of v0.9.0 — an existing \
-             `crash_containment = true` config goes from inert to armed on upgrade"
-        );
-    }
-
     /// The e2e harness and the lab flip it via env with no config edit.
     #[test]
     fn crash_containment_env_override_parses() {
-        let _engine = EnvVars::set("EPHPM_PHP__FPM_ENGINE", "pool");
         let _env = EnvVars::set("EPHPM_PHP__CRASH_CONTAINMENT", "true");
         let config = Config::default_config().unwrap();
         assert!(config.php.crash_containment);
@@ -9998,7 +9841,7 @@ opcache_revalidate_freq = 60
 
     #[test]
     fn test_jit_shaped_default_worker_mode_is_disable() {
-        let cfg = PhpConfig { mode: "worker".to_string(), ..PhpConfig::default() };
+        let cfg = PhpConfig { mode: PhpMode::Worker, ..PhpConfig::default() };
         let at = cfg.autotune(false, false);
         assert_eq!(at.jit.value, JitMode::Disable);
         assert_eq!(at.jit_reason, JitReason::WorkerMode);
@@ -10059,7 +9902,7 @@ opcache_revalidate_freq = 60
         // Explicit function mode in worker mode: applied, no warning.
         let func = PhpConfig {
             opcache_jit: Some(JitMode::Function),
-            mode: "worker".to_string(),
+            mode: PhpMode::Worker,
             ..PhpConfig::default()
         };
         let at = func.autotune(false, false);
@@ -10111,7 +9954,7 @@ opcache_revalidate_freq = 60
         assert!(multi.jit_line().contains("multi-tenant default"), "{}", multi.jit_line());
 
         let worker =
-            PhpConfig { mode: "worker".to_string(), ..PhpConfig::default() }.autotune(false, false);
+            PhpConfig { mode: PhpMode::Worker, ..PhpConfig::default() }.autotune(false, false);
         assert!(worker.jit_line().contains("worker-mode default"), "{}", worker.jit_line());
 
         let dev = PhpConfig::default().autotune(true, false);
@@ -10177,7 +10020,8 @@ opcache_revalidate_freq = 60
         assert_eq!(absent.php.opcache_jit, None);
 
         // …and `[php]` present without the knob must resolve identically.
-        std::fs::write(&file, "[server]\nlisten = \"127.0.0.1:0\"\n[php]\nworkers = 2\n").unwrap();
+        std::fs::write(&file, "[server]\nlisten = \"127.0.0.1:0\"\n[php]\nconcurrency = 2\n")
+            .unwrap();
         let present = Config::load(&file).unwrap();
         assert_eq!(present.php.opcache_jit, None);
 
@@ -10194,40 +10038,74 @@ opcache_revalidate_freq = 60
     // ── Worker mode config ──────────────────────────────────────────────
 
     #[test]
-    fn test_php_mode_defaults_to_fpm() {
+    fn test_php_mode_defaults_to_per_request() {
         let cfg = PhpConfig::default();
-        assert_eq!(cfg.mode, "fpm");
+        assert_eq!(cfg.mode, PhpMode::PerRequest);
         assert!(!cfg.is_worker_mode());
-        assert_eq!(cfg.worker_count, 0);
-        assert_eq!(cfg.worker_max_requests, 10_000);
-        assert_eq!(cfg.worker_backlog, 0);
-        assert_eq!(cfg.worker_boot_timeout, 30);
-        assert!(!cfg.worker_populate_superglobals);
-        assert_eq!(cfg.worker_stream_threshold, 1024 * 1024);
-        assert!(cfg.worker_script.is_none());
+        assert_eq!(cfg.concurrency, 0);
+        assert_eq!(cfg.queue_depth, 0);
+        assert_eq!(cfg.worker.max_requests, 10_000);
+        assert_eq!(cfg.worker.boot_timeout, 30);
+        assert!(!cfg.worker.populate_superglobals);
+        assert_eq!(cfg.worker.stream_threshold, 1024 * 1024);
+        assert!(cfg.worker.script.is_none());
     }
 
     #[test]
-    fn test_is_worker_mode_case_insensitive() {
-        let mut cfg = PhpConfig { mode: "Worker".to_string(), ..PhpConfig::default() };
-        assert!(cfg.is_worker_mode());
-        cfg.mode = "WORKER".to_string();
-        assert!(cfg.is_worker_mode());
-        cfg.mode = "fpm".to_string();
-        assert!(!cfg.is_worker_mode());
-    }
-
-    #[test]
-    fn test_effective_worker_count_derives_and_clamps() {
+    fn test_effective_concurrency_derives_and_clamps() {
         // Explicit value passes through.
-        let mut cfg = PhpConfig { worker_count: 7, ..PhpConfig::default() };
-        assert_eq!(cfg.effective_worker_count(), 7);
-        assert!(matches!(cfg.effective_worker_count_with_source().1, WorkerCountSource::Explicit));
-        // Derived value is never zero; upper bound is [1, 32] (cgroup path may
-        // return 1 inside a CPU-limited container, otherwise clamp is [2, 32]).
-        cfg.worker_count = 0;
-        let derived = cfg.effective_worker_count();
-        assert!((1..=32).contains(&derived), "derived worker count out of range: {derived}");
+        let mut cfg = PhpConfig { concurrency: 7, ..PhpConfig::default() };
+        assert_eq!(cfg.effective_concurrency(), 7);
+        assert!(matches!(cfg.effective_concurrency_with_source().1, ConcurrencySource::Explicit));
+        // Derived value is clamped [2, 32] on every path (#461: never 1).
+        cfg.concurrency = 0;
+        let derived = cfg.effective_concurrency();
+        assert!((2..=32).contains(&derived), "derived concurrency out of range: {derived}");
+    }
+
+    /// The pure derivation, with injected inputs — exercisable on every
+    /// platform, including the Linux-only cgroup path (#461).
+    #[test]
+    fn test_derive_concurrency_clamps_both_paths() {
+        // Explicit wins as-is, even 1 (the operator's assertion) and even
+        // above the derived ceiling.
+        assert!(matches!(derive_concurrency(1, Some(8.0), 64), (1, ConcurrencySource::Explicit)));
+        assert!(matches!(derive_concurrency(48, None, 4), (48, ConcurrencySource::Explicit)));
+
+        // Cgroup quotas at or below 1.0 CPU used to derive 1 — the value that
+        // deadlocks a loopback subrequest (#461). They must clamp up to 2,
+        // and the source must expose the pre-clamp value for the INFO log.
+        for quota in [0.25, 0.5, 1.0] {
+            let (n, source) = derive_concurrency(0, Some(quota), 64);
+            assert_eq!(n, 2, "quota {quota} must clamp up to 2, got {n}");
+            match source {
+                ConcurrencySource::CgroupQuota { quota_cpus, unclamped } => {
+                    assert!((quota_cpus - quota).abs() < 1e-9);
+                    assert_eq!(unclamped, 1, "pre-clamp ceil of {quota} is 1");
+                }
+                other => panic!("expected CgroupQuota source, got {other:?}"),
+            }
+        }
+
+        // A fractional quota above 1 ceils, unclamped: 1.5 -> 2, 2.5 -> 3.
+        let (n, source) = derive_concurrency(0, Some(1.5), 64);
+        assert_eq!(n, 2);
+        assert!(
+            matches!(source, ConcurrencySource::CgroupQuota { unclamped: 2, .. }),
+            "ceil(1.5) needs no clamp"
+        );
+        assert_eq!(derive_concurrency(0, Some(2.5), 64).0, 3);
+
+        // The upper bound holds on the quota path too.
+        assert_eq!(derive_concurrency(0, Some(64.0), 128).0, 32);
+
+        // Host-parallelism path: clamped [2, 32] at both ends.
+        assert!(matches!(
+            derive_concurrency(0, None, 1),
+            (2, ConcurrencySource::HostParallelism { cpus: 1 })
+        ));
+        assert_eq!(derive_concurrency(0, None, 8).0, 8);
+        assert_eq!(derive_concurrency(0, None, 128).0, 32);
     }
 
     #[test]
@@ -10262,29 +10140,11 @@ opcache_revalidate_freq = 60
     }
 
     #[test]
-    fn test_worker_count_source_ceiling() {
-        // Small quotas ceil to 1, fractional quotas above 1 ceil upward.
-        // We can't force read_cgroup_cpu_quota() in tests, so exercise the
-        // ceil() math via the parser results directly. Ceiled quotas are
-        // always positive here (the parser returns None for <=0), so the
-        // f64 -> u64 cast is sign- and range-safe.
-        fn ceil_u64(q: f64) -> u64 {
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            let v = q.ceil() as u64;
-            v
-        }
-        assert_eq!(parse_cgroup_v2_cpu_max("25000 100000").map(ceil_u64), Some(1));
-        assert_eq!(parse_cgroup_v2_cpu_max("100000 100000").map(ceil_u64), Some(1));
-        assert_eq!(parse_cgroup_v2_cpu_max("150000 100000").map(ceil_u64), Some(2));
-        assert_eq!(parse_cgroup_v2_cpu_max("400000 100000").map(ceil_u64), Some(4));
-    }
-
-    #[test]
-    fn test_effective_worker_backlog() {
-        let mut cfg = PhpConfig { worker_count: 4, worker_backlog: 0, ..PhpConfig::default() };
-        assert_eq!(cfg.effective_worker_backlog(), 4);
-        cfg.worker_backlog = 16;
-        assert_eq!(cfg.effective_worker_backlog(), 16);
+    fn test_effective_queue_depth() {
+        let mut cfg = PhpConfig { concurrency: 4, queue_depth: 0, ..PhpConfig::default() };
+        assert_eq!(cfg.effective_queue_depth(), 4);
+        cfg.queue_depth = 16;
+        assert_eq!(cfg.effective_queue_depth(), 16);
     }
 
     #[test]
@@ -10296,30 +10156,32 @@ opcache_revalidate_freq = 60
             r#"
 [php]
 mode = "worker"
-worker_script = "worker.php"
-worker_count = 8
-worker_max_requests = 1000
-worker_backlog = 12
-worker_boot_timeout = 45
-worker_populate_superglobals = true
-worker_stream_threshold = 262144
+concurrency = 8
+queue_depth = 12
+
+[php.worker]
+script = "worker.php"
+max_requests = 1000
+boot_timeout = 45
+populate_superglobals = true
+stream_threshold = 262144
 "#,
         )
         .unwrap();
 
         let config = Config::load(&file).unwrap();
         assert!(config.php.is_worker_mode());
-        assert_eq!(config.php.worker_script, Some(PathBuf::from("worker.php")));
-        assert_eq!(config.php.worker_count, 8);
-        assert_eq!(config.php.worker_max_requests, 1000);
-        assert_eq!(config.php.worker_backlog, 12);
-        assert_eq!(config.php.worker_boot_timeout, 45);
-        assert!(config.php.worker_populate_superglobals);
-        assert_eq!(config.php.worker_stream_threshold, 262_144);
+        assert_eq!(config.php.concurrency, 8);
+        assert_eq!(config.php.queue_depth, 12);
+        assert_eq!(config.php.worker.script, Some(PathBuf::from("worker.php")));
+        assert_eq!(config.php.worker.max_requests, 1000);
+        assert_eq!(config.php.worker.boot_timeout, 45);
+        assert!(config.php.worker.populate_superglobals);
+        assert_eq!(config.php.worker.stream_threshold, 262_144);
     }
 
     #[test]
-    fn test_validate_fpm_mode_always_ok() {
+    fn test_validate_per_request_mode_always_ok() {
         let cfg = Config::default();
         assert!(cfg.validate().is_ok());
     }
@@ -10327,11 +10189,11 @@ worker_stream_threshold = 262144
     #[test]
     fn test_validate_worker_mode_missing_script_errors() {
         let mut cfg = Config::default();
-        cfg.php.mode = "worker".to_string();
-        cfg.php.worker_script = None;
+        cfg.php.mode = PhpMode::Worker;
+        cfg.php.worker.script = None;
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
-        assert!(format!("{err}").contains("worker_script"));
+        assert!(format!("{err}").contains("[php.worker] script"));
     }
 
     #[test]
@@ -10339,8 +10201,8 @@ worker_stream_threshold = 262144
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config::default();
         cfg.server.document_root = dir.path().to_path_buf();
-        cfg.php.mode = "worker".to_string();
-        cfg.php.worker_script = Some(PathBuf::from("does-not-exist.php"));
+        cfg.php.mode = PhpMode::Worker;
+        cfg.php.worker.script = Some(PathBuf::from("does-not-exist.php"));
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
     }
@@ -10353,8 +10215,8 @@ worker_stream_threshold = 262144
 
         let mut cfg = Config::default();
         cfg.server.document_root = dir.path().to_path_buf();
-        cfg.php.mode = "worker".to_string();
-        cfg.php.worker_script = Some(PathBuf::from("worker.php"));
+        cfg.php.mode = PhpMode::Worker;
+        cfg.php.worker.script = Some(PathBuf::from("worker.php"));
 
         cfg.validate().expect("valid worker config");
         let resolved = cfg.resolve_worker_script().unwrap();
@@ -10371,9 +10233,9 @@ worker_stream_threshold = 262144
 
         let mut cfg = Config::default();
         cfg.server.document_root = root.path().to_path_buf();
-        cfg.php.mode = "worker".to_string();
+        cfg.php.mode = PhpMode::Worker;
         // Absolute path pointing outside document_root.
-        cfg.php.worker_script = Some(script.clone());
+        cfg.php.worker.script = Some(script.clone());
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
         assert!(format!("{err}").contains("outside document_root"));
@@ -10388,24 +10250,11 @@ worker_stream_threshold = 262144
         let mut cfg = Config::default();
         cfg.server.document_root = dir.path().to_path_buf();
         cfg.server.sites_dir = Some(PathBuf::from("/var/www/sites"));
-        cfg.php.mode = "worker".to_string();
-        cfg.php.worker_script = Some(PathBuf::from("worker.php"));
+        cfg.php.mode = PhpMode::Worker;
+        cfg.php.worker.script = Some(PathBuf::from("worker.php"));
         let err = cfg.validate().unwrap_err();
         assert!(matches!(err, ConfigError::Validation(_)));
         assert!(format!("{err}").contains("sites_dir"));
-    }
-
-    #[test]
-    fn test_validate_rejects_unknown_php_mode() {
-        // A typo like "workr" must hard-error, not silently mean fpm.
-        let mut cfg = Config::default();
-        cfg.php.mode = "workr".to_string();
-        let err = cfg.validate().unwrap_err();
-        assert!(matches!(err, ConfigError::Validation(_)));
-        assert!(format!("{err}").contains("mode"));
-
-        cfg.php.mode = "fpm".to_string();
-        assert!(cfg.validate().is_ok());
     }
 
     // ── KV RESP listener fail-closed (multi-tenant needs [kv] secret) ──

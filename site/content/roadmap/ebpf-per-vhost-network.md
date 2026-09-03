@@ -17,7 +17,7 @@
 > cannot load an `SK_STORAGE` map and reading a socket's source port in
 > `sock_release` is verifier-rejected on current kernels, so a closed sidecar
 > port returns to the pool only on restart. Worker mode is unsupported (the tag
-> is written on the fpm per-request path); multi-node/at-scale operation is not
+> is written on the per-request dispatch path); multi-node/at-scale operation is not
 > validated.
 >
 > The design was first proven by a PoC on Linux 6.18 (see **Proof of concept**),
@@ -27,7 +27,7 @@
 > kernel (`EPERM`).
 
 ePHPm is **one process, one uid** (`ephpm-web`), serving every vhost on ZTS
-threads out of tokio's `spawn_blocking` pool. The kernel cannot tell vhosts
+threads out of the dedicated PHP execution pool. The kernel cannot tell vhosts
 apart at `bind()`/`connect()` time — the same reason tenant isolation rides on
 `open_basedir`/`disable_functions` rather than kernel primitives. The static
 egress floor already shipped to the hardened preview host (nftables +
@@ -221,7 +221,7 @@ at 2–3 low-traffic tenants.
    `bpf_get_ns_current_pid_tgid` with ePHPm's `/proc/self/ns/pid` `{dev,ino}`
    (written to `nscfg` at startup). This is *the* container/K8s correctness
    requirement, not an edge case.
-2. **Thread reuse without clearing the tag.** A pooled `spawn_blocking` thread
+2. **Thread reuse without clearing the tag.** A pooled execution thread
    retains a stale `tag[tid]` after a request. A subsequent socket op on that
    thread would inherit the previous vhost's policy → cross-tenant leak. The
    tag **must** be set at request start and deleted at request end, bracketing

@@ -375,7 +375,7 @@ Release artifacts are named per platform. One binary per PHP version per platfor
 
 ### Thread Safety: ZTS everywhere
 
-PHP is compiled with ZTS (Zend Thread Safety) via `--enable-zts` on every platform — the Windows php-sdk's static `php8embed.lib` is a ZTS build too (#326). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently without interference.
+PHP is compiled with ZTS (Zend Thread Safety) via `--enable-zts` on every platform — the Windows php-sdk's static `php8embed.lib` is a ZTS build too (#326). Each execution-pool thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently without interference.
 
 The `Mutex<Option<PhpRuntime>>` only protects one-time `init()`/`shutdown()`. An `AtomicBool` fast-path check avoids the mutex for the common "is PHP ready?" path. Per-request C statics use `__thread` for thread isolation.
 
@@ -562,7 +562,7 @@ document_root = "/var/www/html"
 index_files = ["index.php", "index.html"]
 
 [php]
-# workers = 4                  # optional cap on concurrent PHP executions (0 = unlimited)
+# concurrency = 4              # cap on concurrent PHP executions (0 = derived, clamped [2, 32])
 max_execution_time = 30
 memory_limit = "128M"
 # ini_file = "/etc/php/8.5/php.ini"    # optional: load a custom php.ini
@@ -678,7 +678,7 @@ A single Rust binary that reads a TOML config, boots an HTTP server with embedde
 1. **`ephpm` binary** — single Rust binary with PHP statically linked
 2. **TOML config** — `ephpm.toml` with `[server]` and `[php]` sections
 3. **HTTP server** — hyper-based, HTTP/1.1 (HTTP/2 requires TLS ALPN, so it arrives together with TLS, which the MVP excludes)
-4. **PHP execution** — custom SAPI, ZTS mode, concurrent via `spawn_blocking` + TSRM
+4. **PHP execution** — custom SAPI, ZTS mode, concurrent via the dedicated execution pool + TSRM
 5. **Static file serving** — CSS/JS/images served directly (not through PHP)
 6. **WordPress demo** — documented setup: download WordPress, point `document_root`, connect to external MySQL, verify admin panel works
 
@@ -690,7 +690,7 @@ A single Rust binary that reads a TOML config, boots an HTTP server with embedde
 - Clustering
 - Observability / admin UI
 - Worker mode — since shipped in v0.3.0 (`[php] mode = "worker"`, see [Worker Mode](/architecture/#php-worker-mode))
-- ZTS / multi-threaded PHP execution — since shipped (per-thread TSRM via `spawn_blocking`)
+- ZTS / multi-threaded PHP execution — since shipped (per-thread TSRM on the dedicated execution pool)
 
 ### Request Flow
 
@@ -705,7 +705,7 @@ Client ──HTTP──► hyper (tokio)
             └───┬───────┬───┘
             no  │       │ yes
                 ▼       ▼
-          static file   spawn_blocking
+          static file   execution pool
           serving           │
                             ▼
                      PHP worker thread (ZTS —
@@ -732,7 +732,7 @@ Client ──HTTP──► hyper (tokio)
 Client ◄──HTTP──────────────┘
 ```
 
-PHP execution is lock-free and concurrent: PHP is compiled with ZTS, and each `spawn_blocking` thread registers with TSRM on first use to get its own isolated PHP context. A `Mutex` guards only the one-time `init()`/`shutdown()` — never request execution.
+PHP execution is lock-free and concurrent: PHP is compiled with ZTS, and each execution-pool thread registers with TSRM on first use to get its own isolated PHP context. A `Mutex` guards only the one-time `init()`/`shutdown()` — never request execution.
 
 **URL Rewriting for WordPress:**
 
@@ -944,7 +944,7 @@ This is the hardest crate and the core of the project.
   2. If request path maps to a `.php` file → execute via `ephpm-php`
   3. Otherwise → try `index.php` (WordPress-style URL rewriting)
 - Static file serving with `mime_guess` for Content-Type
-- `spawn_blocking` bridge from async hyper to sync PHP execution
+- Execution-pool bridge from async hyper to sync PHP execution
 - Graceful shutdown (drain connections on SIGINT/SIGTERM)
 
 ### Step 5: Wire Up `ephpm` Binary
@@ -976,7 +976,7 @@ This is the hardest crate and the core of the project.
 
 | Milestone | Key Features | Status |
 |-----------|-------------|--------|
-| **v0.2: ZTS + Workers** | Thread-safe PHP, multiple concurrent requests | **Implemented** (ZTS via `spawn_blocking` + TSRM) |
+| **v0.2: ZTS + Workers** | Thread-safe PHP, multiple concurrent requests | **Implemented** (ZTS + per-thread TSRM) |
 | **v0.3: TLS** | Automatic HTTPS via `rustls-acme`, Let's Encrypt | **Implemented** — see [TLS & ACME](/guides/tls-acme/) |
 | **v0.4: DB Proxy** | **Implemented (partial)**: MySQL transparent proxy, connection pooling, reset strategy; **Missing**: read/write splitting, replication, slow query analysis | Ahead of schedule |
 | **v0.5: KV Store** | **Implemented**: Single-node RESP2 server, strings + hashes, TTL/expiry, eviction policies (`noeviction`/`allkeys-lru`/`volatile-lru`/`allkeys-random`) with memory-limit enforcement, compression, SAPI bridge for direct PHP access, clustering; **Missing**: lists/sets/sorted sets, persistence | Shipped |

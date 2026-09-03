@@ -1,7 +1,7 @@
 //! Stack-overflow crash containment for the single-process ZTS model.
 //!
-//! Off unless `[php] crash_containment = true` **and** `[php] fpm_engine =
-//! "pool"` (see [`set_enabled`]). When off, [`run_guarded`] is never called, no
+//! Off unless `[php] crash_containment = true` in per-request mode
+//! (see [`set_enabled`]). When off, [`run_guarded`] is never called, no
 //! guard is ever armed, and the fatal-signal handler's recovery hook is not
 //! even registered — a crash kills the process exactly as it always has.
 //!
@@ -84,7 +84,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Master switch. `false` until the server explicitly turns containment on for
 /// this process, which it does only for the one supported configuration
-/// (`[php] crash_containment = true` + `fpm_engine = "pool"`).
+/// (`[php] crash_containment = true` in per-request mode).
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Turn crash containment on or off for this process.

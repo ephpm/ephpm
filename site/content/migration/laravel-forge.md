@@ -83,7 +83,7 @@ redirect_http = true
 
 [php]
 memory_limit = "256M"
-workers = 8
+concurrency = 8
 max_execution_time = 30              # inner PHP deadline (default). Enforced on
                                      # Linux ZTS (catchable fatal → 500); not on
                                      # macOS/Windows. Keep below the outer 504

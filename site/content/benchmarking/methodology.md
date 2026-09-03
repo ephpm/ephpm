@@ -53,7 +53,7 @@ evaluate JIT.
 ## Container CPU quota matters
 
 Run under the CPU quota you care about (`--cpus 0.25` locally mirrors a
-`250m` k8s pod). ePHPm derives `worker_count` from the cgroup quota, and
+`250m` k8s pod). ePHPm derives `concurrency` from the cgroup quota, and
 the whole worker-vs-request tradeoff changes with it. A win measured at
 `--cpus 1` may not hold at `0.25` and vice versa — state the quota with
 every number.

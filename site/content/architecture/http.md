@@ -92,15 +92,15 @@ HTTP headers are mapped to `HTTP_*` variables, except `Content-Type` -> `CONTENT
 
 ### Thread Safety
 
-PHP is compiled with ZTS (Zend Thread Safety). Each `spawn_blocking` thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown, not request execution. Windows builds are ZTS as well — the Windows php-sdk's static `php8embed.lib` is a ZTS build and requests execute concurrently there too.
+PHP is compiled with ZTS (Zend Thread Safety). Each execution-pool thread auto-registers with TSRM on first use, getting its own isolated PHP context. Multiple PHP requests execute concurrently. The `Mutex<Option<PhpRuntime>>` only protects one-time init/shutdown, not request execution. Windows builds are ZTS as well — the Windows php-sdk's static `php8embed.lib` is a ZTS build and requests execute concurrently there too.
 
 ### Signal Handling and `max_execution_time`
 
 ePHPm enforces `max_execution_time` with a **two-layer** model:
 
-1. **PHP-level (inner, catchable).** On Linux ZTS builds whose `libphp` was compiled with per-thread execution timers (`--enable-zend-max-execution-timers`, the default for the shipped Linux SDK), PHP arms its own **per-thread POSIX timer** — `timer_create` with `SIGEV_THREAD_ID` and `SIGRTMIN`, on a `CLOCK_BOOTTIME` (wall-clock) clock. The timeout signal is delivered *only* to the specific PHP thread that armed it, which makes it safe under tokio's `spawn_blocking` pool. ePHPm arms this timer per request from `[php] max_execution_time`; exceeding it raises the catchable "Maximum execution time exceeded" fatal, runs registered shutdown functions, flushes buffered output, and returns HTTP 500 — the request thread is *not* killed. `set_time_limit()` re-arms it at runtime. Because the clock is wall-clock, time spent in `sleep()` counts. ePHPm also mirrors the effective limit back into the ini entry when it arms the timer, so `ini_get('max_execution_time')` reports the value being enforced (e.g. `30`) rather than the `0` the embed SAPI would otherwise leave behind; `set_time_limit(0)` returns the reported value to `0` and disarms the inner timer, falling back to the HTTP-level backstop.
+1. **PHP-level (inner, catchable).** On Linux ZTS builds whose `libphp` was compiled with per-thread execution timers (`--enable-zend-max-execution-timers`, the default for the shipped Linux SDK), PHP arms its own **per-thread POSIX timer** — `timer_create` with `SIGEV_THREAD_ID` and `SIGRTMIN`, on a `CLOCK_BOOTTIME` (wall-clock) clock. The timeout signal is delivered *only* to the specific PHP thread that armed it, which makes it safe under the dedicated execution pool. ePHPm arms this timer per request from `[php] max_execution_time`; exceeding it raises the catchable "Maximum execution time exceeded" fatal, runs registered shutdown functions, flushes buffered output, and returns HTTP 500 — the request thread is *not* killed. `set_time_limit()` re-arms it at runtime. Because the clock is wall-clock, time spent in `sleep()` counts. ePHPm also mirrors the effective limit back into the ini entry when it arms the timer, so `ini_get('max_execution_time')` reports the value being enforced (e.g. `30`) rather than the `0` the embed SAPI would otherwise leave behind; `set_time_limit(0)` returns the reported value to `0` and disarms the inner timer, falling back to the HTTP-level backstop.
 
-2. **HTTP-level (outer, hard backstop).** `tokio::time::timeout` (from `[server.timeouts] request`) wraps the `spawn_blocking` PHP execution and returns HTTP 504 if the request never completes — the ceiling for a script wedged in a C extension or syscall that never returns to the VM to observe the inner timer.
+2. **HTTP-level (outer, hard backstop).** `tokio::time::timeout` (from `[server.timeouts] request`) wraps the pooled PHP execution and returns HTTP 504 if the request never completes — the ceiling for a script wedged in a C extension or syscall that never returns to the VM to observe the inner timer.
 
 The legacy process-wide `SIGPROF`/`setitimer` timer (used by PHP builds *without* per-thread timers) is unsafe for a multi-threaded embedder — `SIGPROF` is delivered to an arbitrary thread whose PHP handler dereferences per-request globals that only exist on the PHP thread. On builds without per-thread timers (macOS, Windows — the Windows SDK is ZTS but built without `ZEND_MAX_EXECUTION_TIMERS` — or a Linux SDK built without the flag), ePHPm neuters `zend_set_timeout` via GNU ld's `--wrap` (Linux) and leaves the outer HTTP request timeout as the only ceiling. macOS's ld64 and MSVC's link.exe don't support `--wrap`, so `max_execution_time` is simply not armed there.
 
@@ -229,7 +229,7 @@ The site key is load-bearing on a multi-tenant node. The cache lives in the proc
 
 ### Impact
 
-This is a significant performance multiplier for PHP applications. Most WordPress page views are anonymous and return identical content. Skipping PHP entirely for repeat visitors frees the `spawn_blocking` worker threads and lets the async HTTP server handle cached responses at full throughput across all nodes.
+This is a significant performance multiplier for PHP applications. Most WordPress page views are anonymous and return identical content. Skipping PHP entirely for repeat visitors frees the PHP execution-pool threads and lets the async HTTP server handle cached responses at full throughput across all nodes.
 
 ## TLS
 
@@ -407,9 +407,9 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.limits.per_ip_burst` | int | `50` | Burst size for per-IP rate limiting |
 | `server.limits.per_site_rate` | float | `0.0` | Max PHP executions/second per virtual host (token bucket keyed by the canonical site key; over-limit gets 429 + `Retry-After`) |
 | `server.limits.per_site_burst` | int | `20` | Burst size for per-site rate limiting |
-| `server.preview` | bool | `false` | Preview-host preset: `X-Ephpm-Preview: 1` on every response, plus preview defaults for every `[server.limits]` knob left unset and `[php] overload_policy = "shed"` (explicit values win) |
-| `php.overload_policy` | string | unset (`wait`; `shed` under preview) | Request-granularity load shedding. `shed` answers `503` + `Retry-After` when no PHP execution slot frees up within `php.shed_after_ms`, instead of queueing until the client times out |
-| `php.shed_after_ms` | int (ms) | `0` | Grace window before `overload_policy = "shed"` rejects. `0` = shed as soon as there is no free slot |
+| `server.preview` | bool | `false` | Preview-host preset: `X-Ephpm-Preview: 1` on every response, plus preview defaults for every `[server.limits]` knob left unset and `[php] overload = "shed"` (explicit values win) |
+| `php.overload` | string | unset (`wait`; `shed` under preview) | Request-granularity load shedding. `shed` answers `503` + `Retry-After` when no PHP execution slot frees up within `php.shed_after_ms`, instead of queueing until the client times out |
+| `php.shed_after_ms` | int (ms) | `0` | Grace window before `overload = "shed"` rejects. `0` = shed as soon as there is no free slot |
 
 ### CLI Flags
 

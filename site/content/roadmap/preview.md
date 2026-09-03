@@ -120,7 +120,7 @@ Rather than re-describe shipped behaviour, the short version with links:
   `[server.limits]` knob to a preview default (`max_connections = 256`,
   `per_ip_max_connections = 32`, `per_ip_rate = 10.0`, `per_ip_burst = 50`,
   `per_site_rate = 5.0`, `per_site_burst = 20`), switches an unset
-  `[php] overload_policy` from `wait` to `shed`, and stamps
+  `[php] overload` from `wait` to `shed`, and stamps
   `X-Ephpm-Preview: 1` on every response so a preview instance can never be
   mistaken for production. Explicit operator values always win, and startup
   logs exactly which values the preset supplied.
@@ -272,9 +272,9 @@ roughly 70 MB per WordPress checkout — a few hundred previews on a small VM.
 
 Deploy time is dominated by `git clone` plus `composer install`; teardown is an
 `rm -rf`. Concrete per-worker memory figures deliberately are not quoted here:
-`[php] workers` defaults to `0` (unlimited, bounded by the tokio blocking
-pool), and worker mode's `worker_count` is derived from the cgroup CPU quota or
-host parallelism, so there is no fixed worker count to multiply by. See
+`[php] concurrency` defaults to `0`, derived from the cgroup CPU quota or
+host parallelism (clamped 2–32) in both modes, so there is no fixed worker
+count to multiply by. See
 [Hosting & Resource Requirements](/roadmap/hosting/) for the memory model.
 
 ### Scaling past one VM — future

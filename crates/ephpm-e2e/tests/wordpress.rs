@@ -2,8 +2,8 @@
 //!
 //! These run against an ePHPm instance in persistent worker mode serving a
 //! real WordPress install through the `ephpm/wordpress-worker` package
-//! (`[php] mode = "worker"`, `worker_script` = the package's
-//! `bin/ephpm-wp-worker`, `worker_populate_superglobals = true`).
+//! (`[php] mode = "worker"`, `[php.worker] script` = the package's
+//! `bin/ephpm-wp-worker`, `[php.worker] populate_superglobals = true`).
 //!
 //! Like `worker_mode.rs`, this needs a SEPARATE server instance from the
 //! default fpm docroot the other e2e tests use. The harness provides its base

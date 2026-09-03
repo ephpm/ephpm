@@ -40,7 +40,7 @@ state-management work inside the framework already:
 | `kernel.reset` tag + `ResetServicesListener` | Just call `Kernel::handle()` in a loop — services reset themselves between requests |
 | `RuntimeInterface` / `RunnerInterface` | A blocking `take_request` SAPI call to drive the runner |
 | Built-in PSR-7 / Symfony HttpFoundation request and response | The same `Symfony\Request` we pass through |
-| Long-lived process patterns (Messenger workers) | Tokio blocking pool — same model |
+| Long-lived process patterns (Messenger workers) | Persistent worker threads — same model |
 
 The result: the entire Symfony adapter is **~100 lines of PHP**, not a
 package the size of Octane. Most of it is parameter wiring.
@@ -53,7 +53,7 @@ package the size of Octane. Most of it is parameter wiring.
    ┌──────────────────────────────────────────────────────────────────────┐
    │                            ephpm process                              │
    │                                                                      │
-   │   hyper ──► router ──► spawn_blocking ──► PHP worker thread          │
+   │   hyper ──► router ──► worker dispatch ──► PHP worker thread         │
    │                                              │                       │
    │                                              ▼                       │
    │                              ┌──────────────────────────────┐        │

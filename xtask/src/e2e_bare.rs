@@ -124,16 +124,16 @@ const ISOLATED_DB_SUITES: &[&str] = &[
 /// proves the union/clobber fix. The shared node keeps hardening explicitly
 /// OFF (see `SingleNodeOptions::shared`).
 ///
-/// `fpm_pool` needs `[php] fpm_engine = "pool"`, a WHOLE-SERVER switch that
-/// moves PHP execution off tokio's `spawn_blocking` pool onto ePHPm's dedicated
-/// FPM thread pool. Every other suite must stay on the default engine, so — like
-/// `worker_mode` — it gets its own node. It reuses the standard single-site
-/// `[db.sqlite]` docroot so the suite can prove the pool runs real PHP AND the
-/// `ephpm_db_*` bridge, and reads `ephpm_fpm_pool_size` from `/metrics` to
-/// confirm the engine is actually active (not silently falling back).
+/// `fpm_pool` proves the dedicated per-request execution pool (the only
+/// engine) with a **pinned** pool size (`[php] concurrency`), so its metrics
+/// assertions are deterministic rather than host-derived. Sizing the pool is
+/// a whole-server decision, so — like `worker_mode` — it gets its own node.
+/// It reuses the standard single-site `[db.sqlite]` docroot so the suite can
+/// prove the pool runs real PHP AND the `ephpm_db_*` bridge, and reads
+/// `ephpm_fpm_pool_size` from `/metrics` to confirm the pinned size took.
 ///
-/// `crash_containment` needs `[php] fpm_engine = "pool"` AND
-/// `[php] crash_containment = true`, and — unlike every other suite — it
+/// `crash_containment` needs `[php] crash_containment = true`, and — unlike
+/// every other suite — it
 /// deliberately **crashes PHP**: it drives a C-stack overflow that poisons and
 /// retires a pool thread. That is destructive to whatever node it runs on
 /// (threads are retired, PHP module shutdown is skipped at exit), so it gets its
@@ -156,19 +156,15 @@ const ISOLATED_DB_SUITES: &[&str] = &[
 /// cross-site isolation with two real vhosts on one server, which is the
 /// property most worth an end-to-end test.
 ///
-/// `load_shedding` needs `[php] overload_policy = "shed"` on a **deliberately
-/// tiny** execution pool (`worker_count = 1`, `worker_backlog = 1`) so that
+/// `load_shedding` needs `[php] overload = "shed"` on a **deliberately
+/// tiny** execution pool (`concurrency = 1`, `queue_depth = 1`) so that
 /// saturation is reachable with a handful of concurrent requests. Both halves
 /// are whole-server switches and both are hostile to every other suite: a
 /// one-thread pool serialises all PHP, and the shed policy answers 503 to
 /// anything that arrives while that thread is busy — which is exactly what
 /// `fpm_pool`'s `pool_handles_concurrent_requests` (40 in-flight, all must be
 /// 200) asserts must NOT happen. So it cannot be bolted onto the `fpm_pool`
-/// node, and certainly not the shared one (the #295 lesson). It runs the pool
-/// engine because that is where shedding works without further configuration;
-/// the `spawn_blocking` shed path (bounded `[php] workers` acquire) is covered
-/// by `ephpm-server`'s router unit tests instead, since making it shed
-/// end-to-end needs a `workers` cap that would equally perturb any shared node.
+/// node, and certainly not the shared one (the #295 lesson).
 const ISOLATED_CONFIG_SUITES: &[&str] = &[
     "opcache_invalidation",
     "rate_limit",
@@ -339,7 +335,7 @@ pub fn run(args: &[String]) -> ExitCode {
     };
 
     // Worker mode is a whole-server switch, so its node serves a separate tree
-    // holding only the worker entrypoint (`worker_script` must resolve under
+    // holding only the worker entrypoint (`[php.worker] script` must resolve under
     // document_root). Resolved eagerly so a missing fixture fails before any
     // node is spawned.
     let worker_docroot = root.join("tests").join("worker-docroot");
@@ -828,7 +824,7 @@ fn recreate_dir(path: &Path) -> io::Result<()> {
 /// `{MTH_LINE}` (the `multi_tenant_hardening = <bool>` line in
 /// `[server.security]`), `{INI_OVERRIDES_EXTRA}` (extra `[php] ini_overrides`
 /// rows — the hardening node's operator `disable_functions`, or empty),
-/// `{FPM_ENGINE_LINE}` (the `[php] fpm_engine = "pool"` line for the `fpm_pool`
+/// `{CONCURRENCY_LINE}` (a pinned `[php] concurrency` line for the `fpm_pool`
 /// and `crash_containment` nodes, or empty), `{CRASH_CONTAINMENT_LINE}` (the
 /// `[php] crash_containment = true` line for the `crash_containment` node, or
 /// empty), `{OVERLOAD_BLOCK}` (the load-shedding policy plus the tiny pool
@@ -943,7 +939,7 @@ ini_overrides = [
     ["display_errors", "On"],
     ["error_reporting", "E_ALL"],{INI_OVERRIDES_EXTRA}
 ]
-{FPM_ENGINE_LINE}
+{CONCURRENCY_LINE}
 {CRASH_CONTAINMENT_LINE}
 {OVERLOAD_BLOCK}
 {PHP_WORKER_BLOCK}
@@ -999,7 +995,7 @@ trusted_hosts = ["ephpm-a", "ephpm-b", "ephpm-c", "127.0.0.1", "localhost", "127
 enabled = true
 
 [php]
-mode = "fpm"
+mode = "per_request"
 max_execution_time = 60
 memory_limit = "256M"
 
@@ -1080,7 +1076,7 @@ struct SingleNodeOptions {
     /// to every PHP response, which other suites assert exact header sets
     /// against.
     middleware_lib: Option<PathBuf>,
-    /// Emit `[php] mode = "worker"` + `worker_script`. Only the `worker_mode`
+    /// Emit `[php] mode = "worker"` + `[php.worker] script`. Only the `worker_mode`
     /// suite; implies `with_sites_dir = false` (the combination hard-errors at
     /// config load) and the `tests/worker-docroot` document root.
     worker: bool,
@@ -1095,30 +1091,27 @@ struct SingleNodeOptions {
     /// `[php] ini_overrides` so the suite can prove the clobber-union fix.
     /// Implies `with_sites_dir = true` (hardening is inert without it).
     multi_tenant_hardening: bool,
-    /// Emit `[php] fpm_engine = "pool"` — run this node on the experimental
-    /// dedicated FPM thread pool instead of the default `spawn_blocking` path.
+    /// Emit a pinned `[php] concurrency` line so the node's execution-pool
+    /// size is deterministic rather than host-derived.
     ///
-    /// Only the `fpm_pool` suite sets it. Every other node leaves it `false`, so
-    /// the rendered `{FPM_ENGINE_LINE}` is empty and their behaviour is
-    /// byte-identical to before this knob existed — the pool engine is opt-in
-    /// and must not perturb any suite that does not select it.
-    fpm_engine_pool: bool,
-    /// Emit `[php] overload_policy = "shed"` together with a one-thread,
+    /// Only the `fpm_pool` and `crash_containment` suites set it. Every other
+    /// node leaves it `false`, so the rendered `{CONCURRENCY_LINE}` is empty
+    /// and their pool size is the stock derived value.
+    pin_pool_size: bool,
+    /// Emit `[php] overload = "shed"` together with a one-thread,
     /// one-slot execution pool — the smallest configuration in which saturation
     /// (and therefore a 503) is reachable from a test with a handful of
     /// concurrent requests.
     ///
-    /// Only the `load_shedding` suite sets it, and only together with
-    /// `fpm_engine_pool`. Every other node leaves it `false`, so the rendered
-    /// `{OVERLOAD_BLOCK}` is empty and their admission behaviour is the
-    /// historical "queue and wait".
+    /// Only the `load_shedding` suite sets it. Every other node leaves it
+    /// `false`, so the rendered `{OVERLOAD_BLOCK}` is empty and their
+    /// admission behaviour is the historical "queue and wait".
     overload_shed: bool,
     /// Emit `[php] crash_containment = true` — contain a PHP C-stack overflow
     /// (500 + retire the pool thread) instead of aborting the process.
     ///
-    /// Only the `crash_containment` suite sets it, and only together with
-    /// `fpm_engine_pool` (the server refuses to arm containment without the
-    /// pool, since retiring the crashed thread is what makes it safe). Its node
+    /// Only the `crash_containment` suite sets it (with a pinned pool size so
+    /// the retire-and-replace assertions are deterministic). Its node
     /// is deliberately destroyed after the suite: threads are abandoned and PHP
     /// module shutdown is skipped once a crash has been contained.
     crash_containment: bool,
@@ -1166,7 +1159,7 @@ impl SingleNodeOptions {
             // preset. Hardening coverage lives on the isolated
             // `multitenant_hardening` node instead.
             multi_tenant_hardening: false,
-            fpm_engine_pool: false,
+            pin_pool_size: false,
             overload_shed: false,
             crash_containment: false,
             preview: false,
@@ -1190,7 +1183,7 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: false,
                 multi_tenant_hardening: false,
-                fpm_engine_pool: false,
+                pin_pool_size: false,
                 overload_shed: false,
                 crash_containment: false,
                 preview: false,
@@ -1212,7 +1205,7 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: false,
                 multi_tenant_hardening: true,
-                fpm_engine_pool: false,
+                pin_pool_size: false,
                 overload_shed: false,
                 crash_containment: false,
                 preview: false,
@@ -1229,7 +1222,7 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: true,
                 multi_tenant_hardening: false,
-                fpm_engine_pool: false,
+                pin_pool_size: false,
                 overload_shed: false,
                 crash_containment: false,
                 preview: false,
@@ -1245,7 +1238,7 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: false,
                 multi_tenant_hardening: false,
-                fpm_engine_pool: false,
+                pin_pool_size: false,
                 overload_shed: false,
                 crash_containment: false,
                 preview: false,
@@ -1261,21 +1254,21 @@ impl SingleNodeOptions {
                 middleware_lib: middleware_lib.map(Path::to_path_buf),
                 worker: false,
                 multi_tenant_hardening: false,
-                fpm_engine_pool: false,
+                pin_pool_size: false,
                 overload_shed: false,
                 crash_containment: false,
                 preview: false,
                 websocket: false,
             },
-            // fpm_pool: the ONLY node on the experimental dedicated FPM thread
-            // pool (`[php] fpm_engine = "pool"`). Single-site so it gets the
+            // fpm_pool: the dedicated per-request execution pool with a
+            // PINNED size (`[php] concurrency = 4`). Single-site so it gets the
             // standard `[db.sqlite]` path + wire listeners and the default
             // docroot's `db_bridge_test.php`, letting the suite prove the pool
             // runs the full per-request path (PHP + the `ephpm_db_*` bridge)
-            // end to end — not just plumbing. It gets its OWN node because
-            // `fpm_engine` is a whole-server switch; bolting it onto the shared
-            // template would silently move every other suite off the default
-            // engine (the #295 lesson: never mutate the shared node's config).
+            // end to end — not just plumbing. It keeps its OWN node because
+            // pool sizing is a whole-server switch; bolting it onto the shared
+            // template would silently resize every other suite's pool
+            // (the #295 lesson: never mutate the shared node's config).
             "fpm_pool" => Self {
                 slug,
                 with_sites_dir: false,
@@ -1284,16 +1277,14 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: false,
                 multi_tenant_hardening: false,
-                fpm_engine_pool: true,
+                pin_pool_size: true,
                 overload_shed: false,
                 crash_containment: false,
                 preview: false,
                 websocket: false,
             },
             // crash_containment: the ONLY node with `[php] crash_containment =
-            // true` (which additionally REQUIRES the pool engine — the server
-            // refuses to arm containment without a thread pool it can retire
-            // from). This suite deliberately crashes PHP: it drives a C-stack
+            // true`. This suite deliberately crashes PHP: it drives a C-stack
             // overflow that poisons a pool thread, so the node ends its life
             // with abandoned TSRM entries and skips PHP module shutdown at
             // exit. Nothing else may share it, and it must be torn down after.
@@ -1307,7 +1298,7 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: false,
                 multi_tenant_hardening: false,
-                fpm_engine_pool: true,
+                pin_pool_size: true,
                 overload_shed: false,
                 crash_containment: true,
                 preview: false,
@@ -1329,7 +1320,7 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: false,
                 multi_tenant_hardening: false,
-                fpm_engine_pool: false,
+                pin_pool_size: false,
                 overload_shed: false,
                 crash_containment: false,
                 preview: true,
@@ -1349,15 +1340,15 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: false,
                 multi_tenant_hardening: false,
-                fpm_engine_pool: false,
+                pin_pool_size: false,
                 overload_shed: false,
                 crash_containment: false,
                 preview: false,
                 websocket: true,
             },
-            // load_shedding: the ONLY node with `[php] overload_policy =
-            // "shed"`. Runs the pool engine deliberately undersized — one
-            // thread, one backlog slot — so a burst of concurrent requests
+            // load_shedding: the ONLY node with `[php] overload =
+            // "shed"`. Runs the execution pool deliberately undersized — one
+            // thread, one queue slot — so a burst of concurrent requests
             // reaches saturation (and therefore a real 503 over a real socket)
             // in a couple of seconds instead of needing a load generator.
             // Single-site so the docroot's `sleep.php` is reachable and no
@@ -1370,7 +1361,9 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: false,
                 multi_tenant_hardening: false,
-                fpm_engine_pool: true,
+                // Sizing comes from the overload block (`concurrency = 1`);
+                // pinning here too would render a duplicate key.
+                pin_pool_size: false,
                 overload_shed: true,
                 crash_containment: false,
                 preview: false,
@@ -1390,7 +1383,7 @@ impl SingleNodeOptions {
                 middleware_lib: None,
                 worker: false,
                 multi_tenant_hardening: false,
-                fpm_engine_pool: false,
+                pin_pool_size: false,
                 overload_shed: false,
                 crash_containment: false,
                 preview: false,
@@ -1508,12 +1501,13 @@ impl SingleNodeSpawn {
         // the suite can tell "no worker was recycled" from "a worker rebooted".
         // worker_max_requests is left generous on purpose — the recycle test
         // asserts requests keep succeeding, not that a recycle happens.
-        // Experimental FPM engine selector. Empty (default `spawn_blocking`)
-        // on every node except the `fpm_pool` suite's, so no other suite is
-        // perturbed. `fpm_engine = "pool"` and `mode = "worker"` are mutually
-        // exclusive (pool is fpm-mode only), so this never combines with the
-        // worker block below.
-        let fpm_engine_line = if opts.fpm_engine_pool { "fpm_engine = \"pool\"" } else { "" };
+        // Pinned execution-pool size. Empty (derived `[php] concurrency`) on
+        // every node except the `fpm_pool` and `crash_containment` suites',
+        // whose assertions want a deterministic pool size rather than a
+        // host-derived one. Never combines with the worker block below
+        // (worker-mode nodes derive their own count) or the overload block
+        // (which pins its own 1-thread sizing).
+        let concurrency_line = if opts.pin_pool_size { "concurrency = 4" } else { "" };
         // Stack-overflow crash containment. Empty everywhere except the
         // `crash_containment` node, so no other suite's crash semantics change
         // (a PHP segfault still kills the process for everyone else, which is
@@ -1533,13 +1527,16 @@ impl SingleNodeSpawn {
         // `shed_after_ms = 0` keeps it deterministic: no grace window means no
         // timing race between "shed" and "a slot freed up in the meantime".
         let overload_block = if opts.overload_shed {
-            "overload_policy = \"shed\"\nshed_after_ms = 0\nworker_count = 1\nworker_backlog = 1"
+            "overload = \"shed\"\nshed_after_ms = 0\nconcurrency = 1\nqueue_depth = 1"
         } else {
             ""
         };
+        // NOTE: `[php.worker]` opens a subsection, so this block must stay the
+        // LAST thing rendered inside `[php]` (the template's next line opens
+        // `[server.limits]`).
         let php_worker_block = if opts.worker {
-            "mode = \"worker\"\nworker_script = \"worker.php\"\nworker_count = 3\n\
-             worker_max_requests = 10000\nworker_boot_timeout = 60"
+            "mode = \"worker\"\nconcurrency = 3\n\n[php.worker]\nscript = \"worker.php\"\n\
+             max_requests = 10000\nboot_timeout = 60"
         } else {
             ""
         };
@@ -1626,7 +1623,7 @@ impl SingleNodeSpawn {
             .replace("{LIMITS_BLOCK}", limits_block)
             .replace("{MTH_LINE}", mth_line)
             .replace("{INI_OVERRIDES_EXTRA}", ini_overrides_extra)
-            .replace("{FPM_ENGINE_LINE}", fpm_engine_line)
+            .replace("{CONCURRENCY_LINE}", concurrency_line)
             .replace("{CRASH_CONTAINMENT_LINE}", crash_containment_line)
             .replace("{OVERLOAD_BLOCK}", overload_block)
             .replace("{PHP_WORKER_BLOCK}", php_worker_block)

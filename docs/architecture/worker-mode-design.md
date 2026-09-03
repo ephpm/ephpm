@@ -1,5 +1,14 @@
 # ePHPm Worker Mode — Phase 1 Engine Design
 
+> **Terminology note (v0.10):** this document predates the concurrency-config
+> rename and the removal of the `spawn_blocking` execution engine. Read
+> `worker_count`/`workers` as `[php] concurrency`, `worker_backlog` as
+> `[php] queue_depth`, `overload_policy` as `[php] overload`, `mode = "fpm"` /
+> `fpm_engine = "pool"` as `[php] mode = "per_request"`, and the other
+> `worker_*` knobs as their `[php.worker]` equivalents (`script`,
+> `max_requests`, `boot_timeout`, `populate_superglobals`,
+> `stream_threshold`). Historical content is otherwise preserved as written.
+
 **Status:** Design (implementation-ready). Target: 3.0 headline feature.
 **Scope:** The Rust/C engine beneath the `Ephpm\Octane\take_request()` /
 `send_response()` userland contract. Framework adapters (Octane, PSR-15,

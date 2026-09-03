@@ -179,7 +179,7 @@ pub struct EphpmKvOps {
     ///   `*new_version` receives the version; the get buffer is untouched.
     ///
     /// Blocking is safe here: callers are PHP worker OS threads or the
-    /// tokio `spawn_blocking` pool, never async tasks.
+    /// dedicated PHP execution pools, never async tasks.
     pub wait: Option<
         unsafe extern "C" fn(
             key: *const std::os::raw::c_char,

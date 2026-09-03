@@ -52,7 +52,8 @@ composer update
 
 This installs the worker entrypoint at `vendor/bin/ephpm-octane-worker`.
 (Worker scripts starting with a `#!/usr/bin/env php` shebang are handled — the
-engine skips the shebang line, so Composer bin proxies work as `worker_script`.)
+engine skips the shebang line, so Composer bin proxies work as the worker
+`script`.)
 
 ## 2. Configure ePHPm
 
@@ -64,10 +65,12 @@ document_root = "/var/www/myapp"        # the PROJECT ROOT, not public/
 
 [php]
 mode = "worker"
-worker_script = "vendor/bin/ephpm-octane-worker"
+
+[php.worker]
+script = "vendor/bin/ephpm-octane-worker"
 ```
 
-`worker_script` must resolve to a file under `document_root` (config load
+`[php.worker] script` must resolve to a file under `document_root` (config load
 hard-errors otherwise) — that is why `document_root` points at the project
 root: `vendor/bin/…` lives there.
 
@@ -92,22 +95,21 @@ are inverted — ePHPm *is* the server and supervises the worker threads itself
 
 ## Worker lifecycle & tuning
 
-All knobs live under `[php]` — see the [config reference](/reference/config/)
-for the full table:
+Sizing knobs live under `[php]`; worker-lifecycle knobs live under
+`[php.worker]` — see the [config reference](/reference/config/) for the full
+table:
 
 | Key | Default | What it does |
 |---|---|---|
-| `worker_count` | `0` (cgroup-quota- or CPU-derived) | Persistent worker threads, each holding a booted Laravel app. Derives from the cgroup CPU quota when running under one (Linux), otherwise host parallelism clamped 2–32. |
-| `worker_max_requests` | `10000` | Recycle a worker after N requests — pure leak guard for the framework kernel. `0` = never. |
-| `worker_backlog` | `0` (= worker count) | Dispatch-queue depth; a full queue applies backpressure. |
-| `worker_boot_timeout` | `30` | Seconds to reach the first `take_request()`; expiry logs an error and increments `ephpm_worker_boot_timeouts_total` (the thread is not killed — it still becomes ready if the boot completes). |
-| `worker_stream_threshold` | `1048576` | Bodies at/above this (or chunked) stream into the worker instead of buffering. |
+| `[php] concurrency` | `0` (cgroup-quota- or CPU-derived, clamped 2–32) | Persistent worker threads, each holding a booted Laravel app. Derives from the cgroup CPU quota when running under one (Linux), otherwise host parallelism — clamped 2–32 on both paths. |
+| `[php.worker] max_requests` | `10000` | Recycle a worker after N requests — pure leak guard for the framework kernel. `0` = never. |
+| `[php] queue_depth` | `0` (= worker count) | Dispatch-queue depth; a full queue applies backpressure. |
+| `[php.worker] boot_timeout` | `30` | Seconds to reach the first `take_request()`; expiry logs an error and increments `ephpm_worker_boot_timeouts_total` (the thread is not killed — it still becomes ready if the boot completes). |
+| `[php.worker] stream_threshold` | `1048576` | Bodies at/above this (or chunked) stream into the worker instead of buffering. |
 
 Notes:
 
-- `[php] workers` (the fpm-mode concurrency semaphore) is **ignored** in worker
-  mode — startup logs a WARN if it is set.
-- `worker_populate_superglobals` stays `false` for Octane: the driver builds
+- `[php.worker] populate_superglobals` stays `false` for Octane: the driver builds
   requests from the engine's `Envelope`, never from `$_GET`/`$_POST`.
 - A fatal error or an `exit()`/`die()` mid-request never wedges the server: the
   request gets a response (synthesized from SAPI headers + captured output for
@@ -134,7 +136,7 @@ ePHPm driver:
 
 ## See also
 
-- [Laravel guide](/guides/laravel/) — classic (fpm-mode) Laravel deployment
+- [Laravel guide](/guides/laravel/) — classic (per-request mode) Laravel deployment
 - [Config reference — `[php]`](/reference/config/) — authoritative worker knobs
 - [PSR-15 worker adapter](/guides/psr15-worker/) — shipped generic adapter (Slim, Mezzio, …)
 - [Symfony Runtime adapter](/roadmap/symfony-runtime-driver/) — planned

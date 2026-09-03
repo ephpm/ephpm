@@ -48,7 +48,7 @@ composer update
 ```
 
 This installs the worker entrypoint at `vendor/bin/ephpm-worker` (shebang'd
-Composer bin proxies work as `worker_script` — the engine skips the shebang
+Composer bin proxies work as the worker `script` — the engine skips the shebang
 line).
 
 ## 2. Write a bootstrap
@@ -83,7 +83,9 @@ document_root = "/var/www/myapp"        # project root (contains vendor/)
 
 [php]
 mode = "worker"
-worker_script = "vendor/bin/ephpm-worker"
+
+[php.worker]
+script = "vendor/bin/ephpm-worker"
 ```
 
 Point the entrypoint at your bootstrap with the `EPHPM_WORKER_BOOTSTRAP`

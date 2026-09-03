@@ -1207,7 +1207,7 @@ fn run_with_config(
     // (see below) or a worker script that dies during boot leaves no
     // diagnostic anywhere — display_errors output is captured into a buffer
     // that is discarded when no request is in flight.
-    let worker_mode = config.php.mode == "worker";
+    let worker_mode = config.php.is_worker_mode();
     // OPcache timestamp-validation default is mode-dependent (off under serve,
     // on under dev) and is always emitted into the generated ini, so ini
     // generation is now unconditional. The other flags below still document
@@ -1459,22 +1459,19 @@ fn run_with_config(
         );
     } else if config.php.crash_containment {
         tracing::warn!(
-            "[php] crash_containment = true is IGNORED unless [php] fpm_engine = \
-             \"pool\" in fpm mode — containment must be able to retire the thread \
-             that crashed, which only ePHPm's own FPM pool can do. Crashes will \
-             abort the process as usual."
+            "[php] crash_containment = true is IGNORED in worker mode — containment \
+             must be able to retire the thread that crashed, and a persistent worker \
+             thread holds framework state that cannot be abandoned mid-flight. \
+             Crashes will abort the process as usual."
         );
     }
 
     // Now safe to create the multi-threaded tokio runtime.
     //
-    // Note: [php].workers is enforced by a semaphore around PHP execution in
-    // the router, NOT by capping tokio's blocking pool — that pool is shared
-    // with static file I/O and other blocking work, and slow PHP scripts must
-    // never starve it.
-    if config.php.workers > 0 {
-        tracing::info!(workers = config.php.workers, "concurrent PHP executions capped");
-    }
+    // Note: [php] concurrency bounds ePHPm's own dedicated execution pool
+    // (built in the router / worker pool), NOT tokio's blocking pool — that
+    // pool is shared with static file I/O and other blocking work, and slow
+    // PHP scripts must never starve it.
     //
     // Identical to `Runtime::new()` (multi-thread, all drivers enabled) except
     // for the thread hook, which gives every worker and blocking-pool thread an
@@ -1545,7 +1542,7 @@ fn load_serve_config(command: Option<Commands>) -> anyhow::Result<(ephpm_config:
         config.server.document_root = root;
     }
 
-    // Validate cross-field invariants (e.g. worker-mode worker_script) AFTER
+    // Validate cross-field invariants (e.g. the worker-mode script) AFTER
     // CLI overrides so document_root is final. Fails fast with a clear message.
     config.validate().context("invalid configuration")?;
 

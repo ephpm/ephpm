@@ -127,7 +127,7 @@ Laravel speaks Redis (via predis) to ePHPm's embedded KV store. No external Redi
 
 ## Octane?
 
-Supported natively. ePHPm's default fpm mode already keeps the PHP *runtime* resident (no process spawn per request), but each request still re-boots the Laravel *framework*. To skip that too, use worker mode with the native Octane driver — boot the app once per worker, then loop: see [Laravel Octane (Worker Mode)](laravel-octane/). You do **not** run Octane's own server (Swoole/RoadRunner) alongside ePHPm, and `php artisan octane:start --server=ephpm` is not used — ePHPm supervises the workers itself.
+Supported natively. ePHPm's default per-request mode already keeps the PHP *runtime* resident (no process spawn per request), but each request still re-boots the Laravel *framework*. To skip that too, use worker mode with the native Octane driver — boot the app once per worker, then loop: see [Laravel Octane (Worker Mode)](laravel-octane/). You do **not** run Octane's own server (Swoole/RoadRunner) alongside ePHPm, and `php artisan octane:start --server=ephpm` is not used — ePHPm supervises the workers itself.
 
 ## See also
 

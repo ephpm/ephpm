@@ -2970,7 +2970,7 @@ void ephpm_worker_set_populate_superglobals(int enable)
  * Boot a worker: run the worker script under bailout protection, exactly like
  * ephpm_execute_request's SETJMP structure. The script sits in a
  * while (take_request()) loop, so this call returns only when that loop ends
- * (graceful shutdown, worker_max_requests recycle, or a fatal bailout).
+ * (graceful shutdown, [php.worker] max_requests recycle, or a fatal bailout).
  *
  * Runs on the worker's own long-lived TSRM request (started by
  * ephpm_thread_init) — we do NOT start/stop a request here.
