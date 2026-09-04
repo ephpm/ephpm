@@ -4524,8 +4524,26 @@ impl Router {
 }
 
 /// Check if a URI path contains a hidden (dot-prefixed) segment.
+///
+/// Splits on `\` as well as `/`, for the reason [`has_dot_dot_segment`] and
+/// [`has_deploy_manifest_segment`] do: Windows treats the backslash as a real
+/// separator once the path is joined onto a document root, so
+/// `/wp-content\.htaccess` opens the dotfile while presenting here as a single
+/// segment beginning with `w` (issue #466). [`percent_decode_path`] now
+/// refuses such a path outright, so in the shipped request path this is the
+/// second line rather than the first — it stays because a gate that is only
+/// correct given its caller is a gate that drifts.
+///
+/// The NTFS trailing-`.`/space and `::$DATA` shapes
+/// [`normalize_segment_filename`] strips for the manifest matcher are
+/// deliberately **not** applied here, and the asymmetry is not an oversight:
+/// both quirks alter the *end* of a name, while this rule keys off its *first*
+/// character. `.htaccess.` and `.htaccess::$DATA` still begin with a dot and
+/// are already refused, and no suffix trick can turn a name that does not
+/// start with `.` into one that does. Confirmed against a live Windows server
+/// (both shapes answered 403 unchanged) before deciding to leave them out.
 fn has_hidden_segment(uri_path: &str) -> bool {
-    uri_path.split('/').any(|segment| {
+    uri_path.split(['/', '\\']).any(|segment| {
         segment.starts_with('.') && !segment.is_empty() && segment != "." && segment != ".."
     })
 }
@@ -4612,18 +4630,50 @@ fn has_dot_dot_segment(path: &str) -> bool {
 /// against the literal characters the client meant.
 ///
 /// Returns `None` if the input is malformed (truncated `%`, non-hex
-/// digits), contains an encoded `/` / `\`, or contains a `..` path
-/// segment — all three would let the request address a file the URI-level
-/// checks never saw. Nothing downstream normalizes dot segments: the joined
-/// path goes straight to the filesystem, so `/../b/index.php` on a raw
-/// socket (browsers normalize it away, `curl --path-as-is` does not) would
-/// otherwise escape the document root and bypass prefix-based blocks like
-/// `/vendor/*`. Callers should treat `None` as a 400.
+/// digits), contains a `/` or `\` in **any** form (encoded or literal), or
+/// contains a `..` path segment — all three would let the request address a
+/// file the URI-level checks never saw. Nothing downstream normalizes dot
+/// segments: the joined path goes straight to the filesystem, so
+/// `/../b/index.php` on a raw socket (browsers normalize it away, `curl
+/// --path-as-is` does not) would otherwise escape the document root and
+/// bypass prefix-based blocks like `/vendor/*`. Callers should treat `None`
+/// as a 400.
+///
+/// # Why a literal `\` is refused, on every platform
+///
+/// Windows treats `\` as a path separator, so once a URI path is joined onto
+/// a document root, `/wp-content\.htaccess` opens the same file
+/// `/wp-content/.htaccess` does — while presenting to every URI-level gate as
+/// a *single* segment that starts with `w`, not `.`. Measured on Windows
+/// before this check existed (issue #466): `GET /wp-content/.htaccess` → 403,
+/// `GET /wp-content\.htaccess` → 200 with the file's contents, and
+/// `GET /vendor\x.txt` → 200 through a `blocked_paths = ["/vendor/*"]` rule.
+///
+/// Refusing here rather than teaching each gate to split on `\` is deliberate:
+/// this is the one place every request path passes through, so
+/// `hidden_files`, `deploy_manifests`, `blocked_paths`, the PHP-execution
+/// allowlist and any gate added later are all covered at once, instead of one
+/// gate at a time as each is noticed. The individual matchers still split on
+/// `\` as well — belt and braces, so a future caller that reaches a gate by
+/// another route is not silently wrong.
+///
+/// Not `cfg(windows)`-gated, for the reason
+/// [`normalize_segment_filename`] is not: a deny rule an operator verifies on
+/// Linux must behave identically on Windows. The cost elsewhere is refusing a
+/// request for a file whose name literally contains a backslash (legal on
+/// Unix, and unreachable in practice already — `\` is not a valid URI path
+/// character under RFC 3986, so a conforming client sends `%5C`, which this
+/// function has always refused).
 ///
 /// The output is validated as UTF-8; an invalid sequence also yields
 /// `None`. ASCII paths (the overwhelming majority) round-trip exactly.
 fn percent_decode_path(raw: &str) -> Option<String> {
     let bytes = raw.as_bytes();
+    // Checked ahead of the `%` fast path so both the literal and the encoded
+    // form are refused by one rule. `%5C` is caught by the decode loop below.
+    if bytes.contains(&b'\\') {
+        return None;
+    }
     // Fast path: the overwhelming majority of request paths contain no `%`.
     // `raw` is already a valid `&str` (UTF-8), so with nothing to decode we
     // can hand back an owned copy without the byte-by-byte scan, the
@@ -7664,6 +7714,33 @@ mod tests {
         assert!(!has_hidden_segment("/"));
     }
 
+    /// A literal `\` is a path separator on Windows, so the gate has to treat
+    /// it as one (issue #466). Before this, `/wp-content\.htaccess` was one
+    /// segment starting with `w` and passed.
+    #[test]
+    fn has_hidden_segment_treats_backslash_as_a_separator() {
+        assert!(has_hidden_segment("/wp-content\\.htaccess"));
+        assert!(has_hidden_segment("/a/b\\.env"));
+        assert!(has_hidden_segment("/a\\b\\.git/config"));
+        // Mixed separators, and the dot-directory (not just the dot-file) form.
+        assert!(has_hidden_segment("/app\\.git\\config"));
+        // Unchanged: a backslash that isn't in front of a dot is not a hit.
+        assert!(!has_hidden_segment("/wp-content\\uploads\\file.jpg"));
+    }
+
+    /// The NTFS suffix quirks the manifest matcher strips (#465) cannot hide a
+    /// *leading* dot, so [`has_hidden_segment`] deliberately does not strip
+    /// them. Pinned so the omission stays a decision rather than a gap someone
+    /// later "fixes" by accident — and so that if it ever stops holding, this
+    /// fails rather than the gate silently opening.
+    #[test]
+    fn hidden_segment_needs_no_ntfs_suffix_normalization() {
+        assert!(has_hidden_segment("/wp-content/.htaccess."));
+        assert!(has_hidden_segment("/wp-content/.htaccess "));
+        assert!(has_hidden_segment("/wp-content/.htaccess::$DATA"));
+        assert!(has_hidden_segment("/wp-content\\.htaccess::$DATA"));
+    }
+
     // ── deploy manifests (#464) ───────────────────────────────────────
 
     /// The three manifest names, in every segment position, case-insensitively
@@ -7933,6 +8010,133 @@ mod tests {
         }
     }
 
+    // ── literal backslash in the request path (#466) ──────────────────
+
+    const HTACCESS_BODY: &[u8] = b"Require all denied\n";
+
+    /// A single-docroot router with `hidden_files` under test and a
+    /// `blocked_paths` rule, so both gates the backslash reached are covered.
+    fn backslash_router(dir: &Path, hidden_files: &str) -> Router {
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.to_path_buf(),
+                static_files: ephpm_config::StaticConfig {
+                    hidden_files: hidden_files.to_string(),
+                    ..ephpm_config::StaticConfig::default()
+                },
+                security: Some(ephpm_config::SecurityConfig {
+                    blocked_paths: vec!["/vendor/*".to_string()],
+                    ..ephpm_config::SecurityConfig::default()
+                }),
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        Router::new(&config, test_store(), None, None, None, None, None)
+    }
+
+    /// Lay down the docroot the bypass was reported against: a dotfile under a
+    /// normal directory, plus a file behind a `blocked_paths` prefix.
+    fn backslash_docroot() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("wp-content")).unwrap();
+        fs::write(dir.path().join("wp-content").join(".htaccess"), HTACCESS_BODY).unwrap();
+        fs::create_dir_all(dir.path().join("vendor")).unwrap();
+        fs::write(dir.path().join("vendor").join("x.txt"), b"VENDORSECRET").unwrap();
+        dir
+    }
+
+    /// The **before** state, asserted first so the refusal below cannot pass
+    /// for the wrong reason (a missing file, a 404 from anywhere).
+    ///
+    /// Windows-only because the exposure is: `\` is a real path separator
+    /// there, so `<docroot>\wp-content\.htaccess` — the exact string the router
+    /// joins for `GET /wp-content\.htaccess` — opens the dotfile. On Unix the
+    /// same join names one nonexistent file, which is why the fix is a refusal
+    /// on every platform but the *bypass* was Windows-only.
+    #[cfg(windows)]
+    #[test]
+    fn backslash_path_really_reaches_the_dotfile_on_windows() {
+        let dir = backslash_docroot();
+        // Exactly what `doc_root.join(uri_path.trim_start_matches('/'))` builds.
+        let joined = dir.path().join("wp-content\\.htaccess");
+        assert_eq!(
+            fs::read(&joined).expect("the crafted path must open the dotfile").as_slice(),
+            HTACCESS_BODY,
+            "control: if this ever stops resolving, the refusal test below proves nothing"
+        );
+    }
+
+    /// `hidden_files = "deny"` (the shipped default) must refuse the backslash
+    /// spelling exactly as it refuses the slash spelling, and the bytes must
+    /// never leave disk. Before the fix this answered 200 with the file's
+    /// contents on Windows (issue #466).
+    #[tokio::test]
+    async fn hidden_files_deny_is_not_bypassed_by_a_literal_backslash() {
+        let dir = backslash_docroot();
+        let router = backslash_router(dir.path(), "deny");
+
+        // Control: the router serves this docroot, and the slash spelling is
+        // refused — so a refusal below is the gate, not a broken fixture.
+        let (status, body) = get_status_and_body(&router, "/wp-content/.htaccess").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_ne!(&body[..], HTACCESS_BODY);
+
+        for uri in [
+            "/wp-content\\.htaccess",
+            // The NTFS suffix shapes, which reached the file through the
+            // backslash before the fix even though they never bypassed the
+            // dot-prefix rule on their own.
+            "/wp-content\\.htaccess.",
+            "/wp-content\\.htaccess::$DATA",
+        ] {
+            let (status, body) = get_status_and_body(&router, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} must be refused");
+            assert_ne!(&body[..], HTACCESS_BODY, "{uri} must not leak the file");
+        }
+    }
+
+    /// The same literal backslash walked straight through a `blocked_paths`
+    /// prefix rule — `/vendor\x.txt` served a file `/vendor/x.txt` was blocked
+    /// from. Closing this at [`percent_decode_path`] rather than in each
+    /// matcher is what covers a glob an operator wrote with `/` separators.
+    #[tokio::test]
+    async fn blocked_paths_are_not_bypassed_by_a_literal_backslash() {
+        let dir = backslash_docroot();
+        let router = backslash_router(dir.path(), "deny");
+
+        let (status, _) = get_status_and_body(&router, "/vendor/x.txt").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "control: the glob blocks the slash form");
+
+        let (status, body) = get_status_and_body(&router, "/vendor\\x.txt").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_ne!(&body[..], b"VENDORSECRET");
+    }
+
+    /// `hidden_files = "allow"` is a legitimate setting, and it re-opens the
+    /// dotfile by its real name — but not by the backslash spelling. The
+    /// refusal lives upstream of the mode knob on purpose: a path ePHPm cannot
+    /// interpret the same way on every platform is refused, not guessed at.
+    #[tokio::test]
+    async fn hidden_files_allow_serves_the_slash_form_but_still_refuses_the_backslash() {
+        let dir = backslash_docroot();
+        let router = backslash_router(dir.path(), "allow");
+
+        let (status, body) = get_status_and_body(&router, "/wp-content/.htaccess").await;
+        assert_eq!(status, StatusCode::OK, "allow must still serve the dotfile by name");
+        assert_eq!(&body[..], HTACCESS_BODY);
+
+        let (status, body) = get_status_and_body(&router, "/wp-content\\.htaccess").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_ne!(&body[..], HTACCESS_BODY);
+    }
+
     // ── compression ────────────────────────────────────────────────
 
     #[test]
@@ -8063,6 +8267,24 @@ mod tests {
         // `..` inside a segment is an ordinary filename, not a traversal.
         assert_eq!(percent_decode_path("/a..b/c").as_deref(), Some("/a..b/c"));
         assert_eq!(percent_decode_path("/...").as_deref(), Some("/..."));
+    }
+
+    /// A literal `\` is refused wherever it appears, not just in front of `..`
+    /// (issue #466). The encoded form `%5C` has always been refused; leaving
+    /// the literal through meant every URI-level gate — `hidden_files`,
+    /// `deploy_manifests`, `blocked_paths`, the PHP allowlist — was matching a
+    /// different path from the one Windows would open.
+    #[test]
+    fn percent_decode_rejects_literal_backslash_anywhere() {
+        assert_eq!(percent_decode_path("/wp-content\\.htaccess"), None);
+        assert_eq!(percent_decode_path("/vendor\\x.txt"), None);
+        assert_eq!(percent_decode_path("/a\\b"), None);
+        // Also on the `%`-containing (slow) path, not just the fast path.
+        assert_eq!(percent_decode_path("/a%20b\\c"), None);
+        // Both spellings agree now, which is the point.
+        assert_eq!(percent_decode_path("/a%5Cb"), None);
+        // A forward-slash path with the same shape is untouched.
+        assert_eq!(percent_decode_path("/vendor/x.txt").as_deref(), Some("/vendor/x.txt"));
     }
 
     // ── PHP document-root containment ────────────────────────────────

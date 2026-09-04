@@ -318,6 +318,45 @@ fn backslash_dot_dot_rejected() {
     );
 }
 
+/// A literal `\` with no `..` in sight (issue #466).
+///
+/// The suite above only ever sent a backslash next to a dot-segment, so
+/// `has_dot_dot_segment` was doing the rejecting and a plain
+/// `/<dir>\<file>` walked through untouched. On Windows that is a real
+/// separator once joined onto the document root, so `/wp-content\.htaccess`
+/// opened the dotfile while presenting to `has_hidden_segment` as a single
+/// segment starting with `w` — measured 200 with the file's contents against
+/// `hidden_files = "deny"`, and 200 through a `blocked_paths = ["/vendor/*"]`
+/// rule for `/vendor\x.txt`.
+///
+/// `percent_decode_path` now refuses a literal `\` outright, so the assertion
+/// is 400 on every platform and needs no dotfile fixture: the reject happens
+/// before the path reaches the filesystem, exactly like the encoded `%5c` case
+/// above. `reqwest` cannot express this target — a browser rewrites `\` to `/`
+/// per the WHATWG URL parser, which is why only a raw socket can regress-test
+/// it.
+#[test]
+fn literal_backslash_separator_rejected() {
+    let authority = authority();
+    probe_control(&authority);
+
+    assert_traversal_rejected(
+        &authority,
+        "/subdir\\.htaccess",
+        "literal backslash in front of a dotfile (the #466 hidden-file bypass)",
+    );
+    assert_traversal_rejected(
+        &authority,
+        "/vendor\\index.php",
+        "literal backslash walking past a /-written blocked_paths glob",
+    );
+    assert_traversal_rejected(
+        &authority,
+        "/subdir\\index.html",
+        "literal backslash as an ordinary separator — refused, not silently joined",
+    );
+}
+
 /// The over-broad-fix guard.
 ///
 /// If a future tightening of `percent_decode_path` starts rejecting ordinary

@@ -93,7 +93,7 @@ Knobs that were *removed* but are still honoured for upgrades — `[db.sqlite.sq
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `trusted_proxies` | array of strings | `[]` | CIDR ranges trusted for `X-Forwarded-For`/`X-Forwarded-Proto`. |
-| `blocked_paths` | array of strings | `[]` | Glob patterns blocked with 403. |
+| `blocked_paths` | array of strings | `[]` | Glob patterns blocked with 403. Patterns are matched against the `/`-separated URI path; a request path containing a literal `\` is refused with 400 before matching, so a `/`-written glob cannot be walked around with a backslash on Windows. |
 | `allowed_php_paths` | array of strings | `[]` | When non-empty, only matching PHP paths execute. Others get 403. |
 | `open_basedir` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Restrict PHP filesystem access to the **site container** (the vhost directory under `sites_dir`) plus that site's own private temp/session state root (never the shared system temp — see [Virtual Hosts → Filesystem Isolation](/guides/virtual-hosts/#filesystem-isolation-temp-sessions)). Note *container*, not document root: with `site_overrides_dir` a site's web root may be a subdirectory, and the sandbox deliberately stays the whole container so PHP can `require` from above the web root. **Multi-tenant only — see below.** |
 | `disable_shell_exec` | bool | `true` if a `[server.security]` section is present **or** `server.sites_dir` is set, else `false` | Disable `exec`, `shell_exec`, `system`, `passthru`, `proc_open`, `popen`, `pcntl_exec`. **Multi-tenant only — see below.** |

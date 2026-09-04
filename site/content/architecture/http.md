@@ -328,7 +328,9 @@ Level controlled by `server.response.compression_level` (1=fast, 9=best).
 
 Evaluated in order for every request:
 
-1. **Hidden files** — Paths with dot-prefixed segments (`.env`, `.git`, `.htaccess`) are blocked based on `server.static.hidden_files` (`deny`=403, `ignore`=404, `allow`=pass).
+0. **Path decoding** — The URI path is percent-decoded once, before any gate below sees it, and the request is refused with 400 if it contains a `..` segment, a malformed escape, invalid UTF-8, or a `/` or `\` in **any** form — encoded (`%2F`, `%5C`) or literal. The literal `\` matters because Windows treats it as a path separator once the path is joined onto a document root: `/wp-content\.htaccess` opened the dotfile while presenting to the gates below as one segment starting with `w`, bypassing both `hidden_files` and `blocked_paths`. Refusing here rather than in each matcher is what makes every gate below cover the backslash spelling at once. Applies on all platforms, so a rule verified on Linux behaves identically on Windows.
+
+1. **Hidden files** — Paths with dot-prefixed segments (`.env`, `.git`, `.htaccess`) are blocked based on `server.static.hidden_files` (`deny`=403, `ignore`=404, `allow`=pass). Both `/` and `\` count as segment separators.
 
 2. **Deploy manifests** — Paths with a segment named `ephpm.yaml`, `ephpm.yml` or `ephpm.json` (matched case-insensitively, in any position) are blocked based on `server.static.deploy_manifests` (`deny`=403, `ignore`=404, `allow`=pass). A deploy manifest describes how an application is built and seeded; an app deployed with its document root at the repository root would otherwise publish it. The check runs before any filesystem lookup, so the response is the same whether or not the file exists. Applies to every virtual host in `sites_dir` mode, and is independent of `hidden_files`.
 
