@@ -35,7 +35,7 @@ The `ephpm-e2e` crate covers the following areas. Each row is one test file.
 | `errors.rs` | PHP error recovery | fatal error → 500, OOM → 500, syntax error → 500, server survives each |
 | `kv.rs` | KV store PHP bridge | set/get, TTL, incr, del/exists, pttl, incr_by, expire, setnx, mset/mget |
 | `concurrency.rs` | Concurrent load | 20 parallel GETs, 20 concurrent KV increments |
-| `security.rs` | Access control | dotfile 403, PHP source not exposed, blocked_paths glob, path traversal |
+| `security.rs` | Access control | dotfile 403, PHP source not exposed, blocked_paths glob, path traversal, deploy-manifest 403 |
 
 ### Remaining Single-Node Gaps
 

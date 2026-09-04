@@ -4,6 +4,7 @@
 //! - Hidden files (dot-files) are blocked with 403
 //! - PHP source is never served as plain text
 //! - blocked_paths glob patterns return 403
+//! - Deploy manifests (`ephpm.yaml`/`.yml`/`.json`) are never served (#464)
 //!
 //! Environment variables:
 //! - `EPHPM_URL` — base URL of the ephpm instance (e.g. `http://ephpm:8080`)
@@ -101,4 +102,58 @@ async fn path_traversal_is_blocked() {
             "path traversal '{path}' must not expose system file contents"
         );
     }
+}
+
+/// A deploy manifest sitting under the document root must never be served —
+/// the `docroot: "."` exposure from issue #464. The fixture at
+/// `tests/docroot/ephpm.yaml` exists on disk and is reachable by path, so a
+/// server without the deny answers 200 with its contents; the shipped default
+/// (`[server.static] deploy_manifests = "deny"`) answers 403.
+///
+/// Asserted on the body as well as the status: a wrong-but-passing 403 from
+/// some other gate is still a pass, but a leaked manifest never is.
+#[tokio::test]
+async fn deploy_manifest_returns_403() {
+    let base_url = required_env("EPHPM_URL");
+
+    for path in ["/ephpm.yaml", "/subdir/ephpm.json"] {
+        let url = format!("{base_url}{path}");
+        let resp = reqwest::get(&url)
+            .await
+            .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
+
+        let status = resp.status().as_u16();
+        let body = resp.text().await.expect("failed to read response body");
+        assert!(
+            !body.contains("MANIFEST_MUST_NOT_BE_SERVED"),
+            "deploy manifest {path} leaked its contents:\n{body}"
+        );
+        assert_eq!(
+            status, 403,
+            "deploy manifest {path} must be refused with 403, got {status}"
+        );
+    }
+}
+
+/// The deny is a filename rule, not a "no YAML" rule. An application that
+/// publishes its own YAML (an OpenAPI document, say) must be unaffected —
+/// guards against the gate being widened into a blunt extension block.
+#[tokio::test]
+async fn non_manifest_yaml_is_still_served() {
+    let base_url = required_env("EPHPM_URL");
+    let url = format!("{base_url}/openapi.yaml");
+    let resp = reqwest::get(&url)
+        .await
+        .unwrap_or_else(|e| panic!("GET {url} failed: {e}"));
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "a YAML file that is not a deploy manifest must still be served"
+    );
+    let body = resp.text().await.expect("failed to read response body");
+    assert!(
+        body.contains("openapi:"),
+        "expected the OpenAPI fixture's contents, got:\n{body}"
+    );
 }

@@ -1,0 +1,5 @@
+{
+  "_comment": "E2E fixture for issue #464 — a deploy manifest in a NESTED directory, e.g. a checkout copied under the document root. Must be refused like the root one.",
+  "name": "e2e-manifest-fixture-nested",
+  "seed": ["MANIFEST_MUST_NOT_BE_SERVED"]
+}

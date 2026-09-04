@@ -433,6 +433,10 @@ pub struct Router {
     middleware_body_limit: u64,
     compression: CompressionSettings,
     hidden_files: String,
+    /// `[server.static] deploy_manifests` — how a request naming an ePHPm
+    /// deploy manifest is answered. Parsed once at construction so the
+    /// per-request check is an integer compare, not a string compare.
+    deploy_manifests: DeployManifestMode,
     cache_control: String,
     etag: bool,
     request_timeout: Duration,
@@ -1037,6 +1041,17 @@ impl Router {
                 }),
             },
             hidden_files: config.server.static_files.hidden_files.clone(),
+            deploy_manifests: DeployManifestMode::parse(
+                &config.server.static_files.deploy_manifests,
+            )
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    value = %config.server.static_files.deploy_manifests,
+                    "unknown [server.static] deploy_manifests value (expected \"deny\", \
+                     \"ignore\", or \"allow\") — falling back to \"deny\""
+                );
+                DeployManifestMode::Deny
+            }),
             cache_control: config.server.static_files.cache_control.clone(),
             etag: config.server.static_files.etag,
             request_timeout: Duration::from_secs(config.server.timeouts.request),
@@ -2301,6 +2316,17 @@ impl Router {
 
         // Block hidden files (dot-prefixed path segments like .env, .git)
         if let Some(resp) = self.check_hidden_file(&uri_path) {
+            return Ok((resp, "error"));
+        }
+
+        // Block deploy manifests (ephpm.yaml/.yml/.json in any segment).
+        // Placed with the hidden-file gate on purpose: everything below —
+        // static files, PHP, the reverse proxy, and every `sites_dir` virtual
+        // host — is downstream of this point, so the deny cannot cover fewer
+        // routes than the gate it is modelled on. Deliberately a SEPARATE knob
+        // from `hidden_files`: a manifest is not a dotfile, and
+        // `hidden_files = "allow"` must not re-open it (issue #464).
+        if let Some(resp) = self.check_deploy_manifest(&uri_path) {
             return Ok((resp, "error"));
         }
 
@@ -3936,6 +3962,42 @@ impl Router {
         }
     }
 
+    /// Block requests naming an ePHPm **deploy manifest** (`ephpm.yaml`,
+    /// `ephpm.yml`, `ephpm.json` in any path segment).
+    ///
+    /// Defence in depth for the class of exposure where an application is
+    /// deployed with its document root at the repository root: the manifest
+    /// then sits directly under the docroot and is served verbatim, publishing
+    /// the app's build commands, enabled services and seed sequence. Deploy
+    /// tooling is expected to keep the manifest out of a served directory in
+    /// the first place; this is the independent guarantee that a manifest is
+    /// **not servable** no matter how the site was laid down (issue #464).
+    ///
+    /// The refusal is content-independent — it runs before any filesystem
+    /// lookup, so the response is identical whether or not the file exists and
+    /// no existence information leaks. That is why `deny` answers 403 rather
+    /// than 404: it is honest about the server refusing, and it costs nothing.
+    fn check_deploy_manifest(&self, uri_path: &str) -> Option<Response<ServerBody>> {
+        let status = match self.deploy_manifests {
+            DeployManifestMode::Allow => return None,
+            DeployManifestMode::Deny => StatusCode::FORBIDDEN,
+            DeployManifestMode::Ignore => StatusCode::NOT_FOUND,
+        };
+        if !has_deploy_manifest_segment(uri_path) {
+            return None;
+        }
+        tracing::debug!(
+            path = uri_path,
+            "refused a deploy-manifest path ([server.static] deploy_manifests)"
+        );
+        // Same canned bodies the hidden-file gate uses, deliberately: an
+        // attacker learns nothing about *which* rule refused, and
+        // `error_response` stays on its no-alloc `&'static str` fast path.
+        let body: &'static str =
+            if status == StatusCode::NOT_FOUND { "404 Not Found" } else { "403 Forbidden" };
+        Some(error_response(status, body))
+    }
+
     /// Check if a PHP path is allowed to execute.
     ///
     /// When `allowed_php_paths` is empty, all PHP files are allowed.
@@ -4304,6 +4366,75 @@ impl Router {
 fn has_hidden_segment(uri_path: &str) -> bool {
     uri_path.split('/').any(|segment| {
         segment.starts_with('.') && !segment.is_empty() && segment != "." && segment != ".."
+    })
+}
+
+/// How a request naming an ePHPm deploy manifest is answered
+/// (`[server.static] deploy_manifests`). Parsed once at Router construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeployManifestMode {
+    /// Refuse with `403 Forbidden` — the default (fail closed).
+    Deny,
+    /// Refuse with `404 Not Found`.
+    Ignore,
+    /// Serve the path like any other file.
+    Allow,
+}
+
+impl DeployManifestMode {
+    /// Parse the config string. `None` for an unrecognised value — the caller
+    /// warns and falls back to [`Self::Deny`].
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "deny" => Some(Self::Deny),
+            "ignore" => Some(Self::Ignore),
+            "allow" => Some(Self::Allow),
+            _ => None,
+        }
+    }
+}
+
+/// Filenames ePHPm's deploy tooling uses for an application's deploy manifest.
+///
+/// `ephpm.json` is included even though a tenant could plausibly own a file by
+/// that name: leaving it out would leave the hole open for whichever pipeline
+/// emits JSON, and an application that genuinely needs to publish its own
+/// `/ephpm.json` has the `[server.static] deploy_manifests` escape hatch.
+const DEPLOY_MANIFEST_NAMES: [&str; 3] = ["ephpm.yaml", "ephpm.yml", "ephpm.json"];
+
+/// Reduce a URI path segment to the filename the operating system would
+/// actually open.
+///
+/// Two Windows quirks make a byte-exact comparison unsafe as a security check:
+///
+/// * NTFS strips trailing `.` and space from a name, so `ephpm.yaml.` opens
+///   `ephpm.yaml`.
+/// * An alternate-data-stream suffix (`ephpm.yaml::$DATA`) addresses the
+///   file's default stream. `:` is legal in a URI path segment (RFC 3986) and
+///   `%3A` decodes to it, so it reaches the filesystem.
+///
+/// Applied on **every** platform, not `cfg(windows)`-gated: a deny rule an
+/// operator verifies on Linux must behave identically on Windows, and the only
+/// cost elsewhere is over-refusing a file literally named `ephpm.yaml.`.
+fn normalize_segment_filename(segment: &str) -> &str {
+    segment.split(':').next().unwrap_or(segment).trim_end_matches(['.', ' '])
+}
+
+/// Check whether any segment of `uri_path` names a deploy manifest.
+///
+/// Every segment, not just the last, mirroring [`has_hidden_segment`]: a
+/// checkout copied under the document root puts the manifest at
+/// `/some-app/ephpm.yaml`, which is exactly as sensitive as `/ephpm.yaml`.
+/// Case-insensitive, because macOS and Windows filesystems are.
+///
+/// Splits on `\` as well as `/`, for the reason [`has_dot_dot_segment`] does:
+/// once the URI path is joined onto a document root, Windows treats the
+/// backslash as a real separator, so `/app\ephpm.yaml` opens the same file a
+/// `/`-separated path would while presenting as a single URI segment.
+fn has_deploy_manifest_segment(uri_path: &str) -> bool {
+    uri_path.split(['/', '\\']).any(|segment| {
+        let name = normalize_segment_filename(segment);
+        DEPLOY_MANIFEST_NAMES.iter().any(|manifest| name.eq_ignore_ascii_case(manifest))
     })
 }
 
@@ -6704,6 +6835,275 @@ mod tests {
         assert!(!has_hidden_segment("/index.php"));
         assert!(!has_hidden_segment("/wp-content/uploads/file.jpg"));
         assert!(!has_hidden_segment("/"));
+    }
+
+    // ── deploy manifests (#464) ───────────────────────────────────────
+
+    /// The three manifest names, in every segment position, case-insensitively
+    /// — and nothing that merely resembles one.
+    #[test]
+    fn deploy_manifest_segment_matching() {
+        // All three names at the docroot root: the shape that actually leaked
+        // (an app deployed with `docroot: "."`).
+        assert!(has_deploy_manifest_segment("/ephpm.yaml"));
+        assert!(has_deploy_manifest_segment("/ephpm.yml"));
+        assert!(has_deploy_manifest_segment("/ephpm.json"));
+
+        // Nested — a checkout copied under the document root is exactly as
+        // sensitive as one deployed at it.
+        assert!(has_deploy_manifest_segment("/some-app/ephpm.yaml"));
+        assert!(has_deploy_manifest_segment("/a/b/c/ephpm.json"));
+        // As a directory component too (a directory named `ephpm.yaml` holding
+        // it would otherwise be reachable through it).
+        assert!(has_deploy_manifest_segment("/ephpm.yaml/x"));
+
+        // macOS and Windows filesystems are case-insensitive, so a byte-exact
+        // match would be bypassable there.
+        assert!(has_deploy_manifest_segment("/EPHPM.YAML"));
+        assert!(has_deploy_manifest_segment("/Ephpm.Json"));
+
+        // Windows opens all of these as `ephpm.yaml`.
+        assert!(has_deploy_manifest_segment("/ephpm.yaml."));
+        assert!(has_deploy_manifest_segment("/ephpm.yaml "));
+        assert!(has_deploy_manifest_segment("/ephpm.yaml::$DATA"));
+        // A literal backslash survives percent-decoding and is a real path
+        // separator once joined onto a Windows document root, so it must not
+        // hide the filename inside a single URI segment.
+        assert!(has_deploy_manifest_segment("/app\\ephpm.yaml"));
+        assert!(has_deploy_manifest_segment("\\ephpm.yaml"));
+
+        // Not manifests: nothing here names one.
+        assert!(!has_deploy_manifest_segment("/"));
+        assert!(!has_deploy_manifest_segment("/index.php"));
+        assert!(!has_deploy_manifest_segment("/ephpm.yaml.bak"));
+        assert!(!has_deploy_manifest_segment("/my-ephpm.yaml"));
+        assert!(!has_deploy_manifest_segment("/ephpm.yamlx"));
+        assert!(!has_deploy_manifest_segment("/ephpm.toml"));
+        assert!(!has_deploy_manifest_segment("/config/ephpm-manifest.yaml"));
+    }
+
+    #[test]
+    fn deploy_manifest_mode_parsing_is_fail_closed() {
+        assert_eq!(DeployManifestMode::parse("deny"), Some(DeployManifestMode::Deny));
+        assert_eq!(DeployManifestMode::parse("ignore"), Some(DeployManifestMode::Ignore));
+        assert_eq!(DeployManifestMode::parse("allow"), Some(DeployManifestMode::Allow));
+        // Unrecognised (including case variants) → the Router warns and denies.
+        assert_eq!(DeployManifestMode::parse("Deny"), None);
+        assert_eq!(DeployManifestMode::parse("yes"), None);
+        assert_eq!(DeployManifestMode::parse(""), None);
+    }
+
+    /// A single-docroot router with the two deny knobs under test.
+    fn manifest_router(dir: &Path, deploy_manifests: &str, hidden_files: &str) -> Router {
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: dir.to_path_buf(),
+                static_files: ephpm_config::StaticConfig {
+                    deploy_manifests: deploy_manifests.to_string(),
+                    hidden_files: hidden_files.to_string(),
+                    ..ephpm_config::StaticConfig::default()
+                },
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        Router::new(&config, test_store(), None, None, None, None, None)
+    }
+
+    const MANIFEST_BODY: &[u8] = b"build: [composer install]\ndocroot: \".\"\n";
+
+    async fn get_status_and_body(router: &Router, uri: &str) -> (StatusCode, Bytes) {
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let req = Request::builder().method("GET").uri(uri).body(Empty::<Bytes>::new()).unwrap();
+        let resp = router.handle(req, addr, false).await.unwrap();
+        let status = resp.status();
+        (status, resp.into_body().collect().await.unwrap().to_bytes())
+    }
+
+    /// The **before** state, asserted first so the deny below cannot pass for
+    /// the wrong reason (a missing file, a broken router, a 404 from anywhere).
+    /// With `deploy_manifests = "allow"` the manifest is served verbatim —
+    /// this is precisely what `GET /ephpm.yaml` returned on the preview
+    /// cluster — and with the shipped default it is refused.
+    #[tokio::test]
+    async fn deploy_manifest_is_servable_without_the_deny_and_refused_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ephpm.yaml"), MANIFEST_BODY).unwrap();
+
+        // BEFORE: opted out → 200 with the manifest's full contents.
+        let router = manifest_router(dir.path(), "allow", "deny");
+        let (status, body) = get_status_and_body(&router, "/ephpm.yaml").await;
+        assert_eq!(status, StatusCode::OK, "the file must be servable when the deny is off");
+        assert_eq!(&body[..], MANIFEST_BODY, "control: the exposure this issue is about");
+
+        // AFTER: the shipped default refuses, and the bytes never leave disk.
+        let shipped_default = ephpm_config::StaticConfig::default().deploy_manifests;
+        let router = manifest_router(dir.path(), &shipped_default, "deny");
+        let (status, body) = get_status_and_body(&router, "/ephpm.yaml").await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "default must be fail-closed (403)");
+        assert_ne!(&body[..], MANIFEST_BODY);
+    }
+
+    /// All three names are refused, at the root and nested, and a neighbouring
+    /// YAML file is untouched — the deny is a filename rule, not a blanket
+    /// "no YAML" rule.
+    #[tokio::test]
+    async fn deploy_manifest_deny_covers_every_name_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("app");
+        std::fs::create_dir_all(&nested).unwrap();
+        for name in ["ephpm.yaml", "ephpm.yml", "ephpm.json"] {
+            std::fs::write(dir.path().join(name), MANIFEST_BODY).unwrap();
+            std::fs::write(nested.join(name), MANIFEST_BODY).unwrap();
+        }
+        std::fs::write(dir.path().join("openapi.yaml"), b"openapi: 3.1.0").unwrap();
+
+        let router = manifest_router(dir.path(), "deny", "deny");
+        for uri in [
+            "/ephpm.yaml",
+            "/ephpm.yml",
+            "/ephpm.json",
+            "/app/ephpm.yaml",
+            "/app/ephpm.yml",
+            "/app/ephpm.json",
+        ] {
+            let (status, _) = get_status_and_body(&router, uri).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{uri} must be refused");
+        }
+
+        let (status, body) = get_status_and_body(&router, "/openapi.yaml").await;
+        assert_eq!(status, StatusCode::OK, "an unrelated YAML file must still be served");
+        assert_eq!(&body[..], b"openapi: 3.1.0");
+    }
+
+    /// `ignore` answers 404 instead of 403 — the same two-outcome vocabulary
+    /// `hidden_files` uses, for operators who prefer not to advertise the rule.
+    #[tokio::test]
+    async fn deploy_manifest_ignore_mode_answers_404() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ephpm.yaml"), MANIFEST_BODY).unwrap();
+
+        let router = manifest_router(dir.path(), "ignore", "deny");
+        let (status, body) = get_status_and_body(&router, "/ephpm.yaml").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_ne!(&body[..], MANIFEST_BODY);
+    }
+
+    /// The refusal runs before any filesystem lookup, so a manifest path that
+    /// does **not** exist is answered identically to one that does. Nothing
+    /// about the file's existence leaks, which is what makes 403 an acceptable
+    /// status here.
+    #[tokio::test]
+    async fn deploy_manifest_deny_leaks_no_existence_information() {
+        let present = tempfile::tempdir().unwrap();
+        std::fs::write(present.path().join("ephpm.yaml"), MANIFEST_BODY).unwrap();
+        let absent = tempfile::tempdir().unwrap();
+
+        let with_file = manifest_router(present.path(), "deny", "deny");
+        let without_file = manifest_router(absent.path(), "deny", "deny");
+        let a = get_status_and_body(&with_file, "/ephpm.yaml").await;
+        let b = get_status_and_body(&without_file, "/ephpm.yaml").await;
+        assert_eq!(a.0, StatusCode::FORBIDDEN);
+        assert_eq!(a, b, "present and absent manifests must be indistinguishable");
+    }
+
+    /// The two layers are independent by design. `hidden_files = "allow"` is a
+    /// legitimate setting (some apps serve dot-paths), and it must not be a
+    /// back door onto the manifest.
+    #[tokio::test]
+    async fn hidden_files_allow_does_not_reopen_deploy_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ephpm.yaml"), MANIFEST_BODY).unwrap();
+
+        let router = manifest_router(dir.path(), "deny", "allow");
+        let (status, body) = get_status_and_body(&router, "/ephpm.yaml").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_ne!(&body[..], MANIFEST_BODY);
+    }
+
+    /// An unparseable `deploy_manifests` value falls back to `deny` rather than
+    /// silently disabling the gate — a typo must not be an opt-out.
+    #[tokio::test]
+    async fn unknown_deploy_manifests_value_falls_back_to_deny() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ephpm.yaml"), MANIFEST_BODY).unwrap();
+
+        let router = manifest_router(dir.path(), "Allow", "deny");
+        let (status, body) = get_status_and_body(&router, "/ephpm.yaml").await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_ne!(&body[..], MANIFEST_BODY);
+    }
+
+    /// A `sites_dir` router where every vhost is a checkout carrying its own
+    /// deploy manifest at its document root — the `docroot: "."` shape.
+    fn manifest_sites_router(root: &Path, sites: &[&str], deploy_manifests: &str) -> Router {
+        let sites_dir = root.join("sites");
+        for site in sites {
+            let dir = sites_dir.join(site);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("ephpm.yaml"), MANIFEST_BODY).unwrap();
+        }
+        let docroot = root.join("docroot");
+        fs::create_dir_all(&docroot).unwrap();
+        fs::write(docroot.join("ephpm.yaml"), MANIFEST_BODY).unwrap();
+
+        let config = Config {
+            server: ServerConfig {
+                listen: "0.0.0.0:8080".to_string(),
+                document_root: docroot,
+                sites_dir: Some(sites_dir),
+                sites_domain_suffix: Some(".localhost".to_string()),
+                static_files: ephpm_config::StaticConfig {
+                    deploy_manifests: deploy_manifests.to_string(),
+                    ..ephpm_config::StaticConfig::default()
+                },
+                ..ServerConfig::default()
+            },
+            php: PhpConfig::default(),
+            db: DbConfig::default(),
+            kv: KvConfig::default(),
+            cluster: ClusterConfig::default(),
+            middleware: Vec::new(),
+            opcache: ephpm_config::OpcacheConfig::default(),
+        };
+        Router::new(&config, test_store(), None, None, None, None, None)
+    }
+
+    /// The multi-tenant path is where this matters most: each `sites_dir`
+    /// vhost is a separate checkout, laid down by whatever tool the operator
+    /// uses. The gate sits above `resolve_site`, so every vhost inherits it —
+    /// asserted here with the before state per tenant.
+    #[tokio::test]
+    async fn deploy_manifest_deny_applies_to_every_sites_dir_vhost() {
+        let root = tempfile::tempdir().unwrap();
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+
+        // BEFORE: with the deny off, every tenant publishes its manifest.
+        let router = manifest_sites_router(root.path(), &["blog", "shop"], "allow");
+        for host in ["blog.localhost", "shop.localhost", "unknown.example.com"] {
+            let resp =
+                router.handle(get_with_host("/ephpm.yaml", host), addr, false).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{host} control");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], MANIFEST_BODY, "{host} must serve it without the deny");
+        }
+
+        // AFTER: refused on every vhost, and on a host matching no site (which
+        // falls back to the default document root — also a checkout).
+        let router = manifest_sites_router(root.path(), &["blog", "shop"], "deny");
+        for host in ["blog.localhost", "shop.localhost", "unknown.example.com"] {
+            let resp =
+                router.handle(get_with_host("/ephpm.yaml", host), addr, false).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{host} must be refused");
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            assert_ne!(&body[..], MANIFEST_BODY);
+        }
     }
 
     // ── compression ────────────────────────────────────────────────

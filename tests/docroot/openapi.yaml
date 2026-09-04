@@ -1,0 +1,5 @@
+openapi: 3.1.0
+info:
+  title: e2e control fixture (issue #464)
+  version: "1.0.0"
+paths: {}
