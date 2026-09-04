@@ -20,7 +20,7 @@ The `ephpm-e2e` crate lives in `crates/ephpm-e2e/` and runs inside a Kind cluste
 | `php_extended.rs` | 6 | Empty PHP output 200, JSON content-type, multiple Set-Cookie headers, SERVER_SOFTWARE, PUT/DELETE methods, additional PHP behavior |
 | `kv.rs` | 11 | set/get, TTL expiry, atomic incr, del/exists, incr_by, expire extends TTL, pttl, setnx, mset/mget, empty values, large values |
 | `errors.rs` | 3 | Fatal error 500, memory limit 500, syntax error 500 (all verify server recovery) |
-| `security.rs` | 4 | Dotfile 403, PHP source not exposed, blocked_paths 403, path traversal blocked |
+| `security.rs` | 6 | Dotfile 403, PHP source not exposed, blocked_paths 403, path traversal blocked, deploy manifest 403 (root + nested), non-manifest YAML still served |
 | `security_p0.rs` | 6 | Additional security tests (host validation, allowed PHP paths, etc.) |
 | `hidden_files.rs` | 2 | Hidden file blocking modes |
 | `concurrency.rs` | — | Parallel PHP requests, atomic KV increments under load (uses non-tokio test harness) |

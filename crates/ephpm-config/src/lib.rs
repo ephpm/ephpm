@@ -858,6 +858,24 @@ pub struct StaticConfig {
     #[serde(default = "default_hidden_files")]
     pub hidden_files: String,
 
+    /// How to handle requests for ePHPm **deploy manifests** — a request whose
+    /// path contains a segment named `ephpm.yaml`, `ephpm.yml` or `ephpm.json`.
+    ///
+    /// A deploy manifest describes how an application is built and seeded
+    /// (build commands, enabled services, the seed sequence). It is deployment
+    /// metadata, never web content, and an application checked out with its
+    /// document root at the repository root would otherwise serve it verbatim.
+    ///
+    /// Values: `"deny"` (403), `"ignore"` (404), `"allow"`. Any other value is
+    /// treated as `"deny"` and logs a startup warning.
+    ///
+    /// Deliberately **independent** of [`Self::hidden_files`]: a manifest is
+    /// not a dotfile, and `hidden_files = "allow"` must not re-open it.
+    ///
+    /// Default: `"deny"`.
+    #[serde(default = "default_deploy_manifests")]
+    pub deploy_manifests: String,
+
     /// Enable `ETag` headers for static files and `304 Not Modified` responses.
     ///
     /// When enabled, static file responses include an `ETag` header based on
@@ -4326,6 +4344,7 @@ impl Default for StaticConfig {
         Self {
             cache_control: String::new(),
             hidden_files: default_hidden_files(),
+            deploy_manifests: default_deploy_manifests(),
             etag: default_etag(),
         }
     }
@@ -6255,6 +6274,12 @@ fn default_hidden_files() -> String {
     "deny".to_string()
 }
 
+/// Fail closed: a deploy manifest is never web content, so the default refuses
+/// to serve one from any site regardless of how the site was laid down.
+fn default_deploy_manifests() -> String {
+    "deny".to_string()
+}
+
 fn default_etag() -> bool {
     true
 }
@@ -8135,6 +8160,36 @@ compression_streaming = "sse"
         let _env = EnvVars::set("EPHPM_SERVER__RESPONSE__COMPRESSION_STREAMING", "all");
         let config = Config::default_config().unwrap();
         assert_eq!(config.server.response.compression_streaming, "all");
+    }
+
+    /// A deploy manifest is deployment metadata, never web content, so the
+    /// shipped default refuses to serve one (issue #464). If this ever flips,
+    /// every install silently re-opens the exposure.
+    #[test]
+    fn deploy_manifests_defaults_to_deny() {
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.server.static_files.deploy_manifests, "deny");
+        assert_eq!(StaticConfig::default().deploy_manifests, "deny");
+    }
+
+    #[test]
+    fn deploy_manifests_is_configurable_from_toml_and_env() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ephpm.toml");
+        std::fs::write(
+            &file,
+            r#"
+[server.static]
+deploy_manifests = "allow"
+"#,
+        )
+        .unwrap();
+        let config = Config::load(&file).unwrap();
+        assert_eq!(config.server.static_files.deploy_manifests, "allow");
+
+        let _env = EnvVars::set("EPHPM_SERVER__STATIC__DEPLOY_MANIFESTS", "ignore");
+        let config = Config::default_config().unwrap();
+        assert_eq!(config.server.static_files.deploy_manifests, "ignore");
     }
 
     #[test]

@@ -32,6 +32,9 @@ index_files = ["index.php", "index.html"]
 # [server.static]
 # cache_control = ""       # Cache-Control header, e.g. "public, max-age=86400"
 # hidden_files = "deny"    # "deny" (403), "ignore" (404), or "allow"
+# deploy_manifests = "deny"  # ephpm.yaml/.yml/.json in any path segment:
+#                            # "deny" (403), "ignore" (404), or "allow".
+#                            # Independent of hidden_files.
 # etag = true              # ETag headers + 304 Not Modified support
 
 # [server.php_etag_cache]

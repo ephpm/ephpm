@@ -330,13 +330,15 @@ Evaluated in order for every request:
 
 1. **Hidden files** — Paths with dot-prefixed segments (`.env`, `.git`, `.htaccess`) are blocked based on `server.static.hidden_files` (`deny`=403, `ignore`=404, `allow`=pass).
 
-2. **Blocked paths** — URI matched against `server.security.blocked_paths` glob patterns. Any match returns 403. Supports `*` wildcards (`/vendor/*`, `/wp-config.php`).
+2. **Deploy manifests** — Paths with a segment named `ephpm.yaml`, `ephpm.yml` or `ephpm.json` (matched case-insensitively, in any position) are blocked based on `server.static.deploy_manifests` (`deny`=403, `ignore`=404, `allow`=pass). A deploy manifest describes how an application is built and seeded; an app deployed with its document root at the repository root would otherwise publish it. The check runs before any filesystem lookup, so the response is the same whether or not the file exists. Applies to every virtual host in `sites_dir` mode, and is independent of `hidden_files`.
 
-3. **PHP allowlist** — When `server.security.allowed_php_paths` is non-empty, only matching PHP files execute. Others get 403. Prevents arbitrary PHP execution in upload directories.
+3. **Blocked paths** — URI matched against `server.security.blocked_paths` glob patterns. Any match returns 403. Supports `*` wildcards (`/vendor/*`, `/wp-config.php`).
 
-4. **Body size limit** — `Content-Length` checked against `server.request.max_body_size` before reading the body. Returns 413.
+4. **PHP allowlist** — When `server.security.allowed_php_paths` is non-empty, only matching PHP files execute. Others get 403. Prevents arbitrary PHP execution in upload directories.
 
-5. **Path traversal** — Static file paths canonicalized and verified within document root.
+5. **Body size limit** — `Content-Length` checked against `server.request.max_body_size` before reading the body. Returns 413.
+
+6. **Path traversal** — Static file paths canonicalized and verified within document root.
 
 ### Trusted Proxy Resolution
 
@@ -381,6 +383,7 @@ fallback = ["$uri", "$uri/", "/index.php?$query_string"]
 | `server.response.headers` | [string, string][] | `[]` | Custom response headers (CORS, CSP, HSTS) |
 | `server.static.cache_control` | string | `""` | Cache-Control header for static files |
 | `server.static.hidden_files` | string | `"deny"` | Dotfile handling: deny, ignore, allow |
+| `server.static.deploy_manifests` | string | `"deny"` | Deploy-manifest (`ephpm.yaml`/`.yml`/`.json`) handling: deny, ignore, allow |
 | `server.static.etag` | bool | `true` | `ETag` headers + 304 Not Modified support |
 | `server.request.trusted_hosts` | string[] | `[]` | Host header validation (421 if no match) |
 | `server.security.trusted_proxies` | string[] | `[]` | CIDR ranges for proxy trust |

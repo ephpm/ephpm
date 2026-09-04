@@ -48,7 +48,7 @@ Removing a site: delete the directory. Requests to that domain hit the fallback.
 
 ### Per-site document root (frameworks with a `public/` directory)
 
-By default a vhost directory **is** the web root, which is right for WordPress — its web root and its application root are the same directory. It is wrong for every framework that keeps code above the web root. A Laravel or Symfony checkout served this way publishes `composer.json`, `vendor/`, `config/` and `storage/logs/laravel.log` over HTTP, and a Laravel log routinely contains stack traces carrying env values and database credentials. (`.env` and `.git` happen to be covered because `[server.static_files] hidden_files` defaults to `"deny"`; nothing else is.)
+By default a vhost directory **is** the web root, which is right for WordPress — its web root and its application root are the same directory. It is wrong for every framework that keeps code above the web root. A Laravel or Symfony checkout served this way publishes `composer.json`, `vendor/`, `config/` and `storage/logs/laravel.log` over HTTP, and a Laravel log routinely contains stack traces carrying env values and database credentials. (`.env` and `.git` happen to be covered because `[server.static]` `hidden_files` defaults to `"deny"`, and an ePHPm deploy manifest — `ephpm.yaml`/`.yml`/`.json` — because `deploy_manifests` defaults to `"deny"`; nothing else is.)
 
 Point `[server] site_overrides_dir` at a directory and drop one file per site into it:
 

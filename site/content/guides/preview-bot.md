@@ -223,6 +223,12 @@ blocked_paths = ["/vendor/*", "/src/*", "/tests/*", "/composer.*", "/worker.php"
 # intent is explicit in the deployed config.
 [server.static]
 hidden_files = "deny"
+# Also the default. ePHPm refuses to serve `ephpm.yaml` / `.yml` / `.json`
+# from any vhost, so an app whose manifest declares `docroot: "."` cannot
+# publish its own build commands and seed sequence. This is a second layer:
+# switchboard already moves the manifest out of the served tree at deploy
+# time. Neither replaces the other — see the note under "Add ephpm.yaml".
+deploy_manifests = "deny"
 ```
 
 Set the webhook secret in the vhost's `.switchboard/webhook_secret` (one secret
@@ -304,6 +310,20 @@ ini:
 
 A repo with no manifest is not rejected: switchboard synthesizes one from the
 detected framework (WordPress, Laravel, Symfony, Drupal, or generic).
+
+**The manifest is not web content.** With `docroot: "."` it sits directly under
+the served document root, and it names build commands, enabled services and the
+seed sequence. Two independent layers keep it off the wire, and neither
+subsumes the other:
+
+- switchboard moves the manifest into a dot-prefixed directory before the
+  atomic swap, so it is *not in a served directory* — a guarantee that holds
+  even if an operator sets `hidden_files = "allow"`.
+- ePHPm refuses any request naming `ephpm.yaml`, `ephpm.yml` or `ephpm.json`
+  (`[server.static] deploy_manifests`, default `"deny"`), so it is *not
+  servable* — a guarantee that holds however the site was laid down, including
+  a hand-provisioned vhost or a checkout copied into `sites_dir` by something
+  other than switchboard.
 
 ## Limitations to plan around
 

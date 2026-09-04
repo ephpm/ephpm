@@ -77,6 +77,7 @@ Knobs that were *removed* but are still honoured for upgrades — `[db.sqlite.sq
 |-----|------|---------|-------------|
 | `cache_control` | string | `""` | Cache-Control header value for static files. Empty = no header. |
 | `hidden_files` | string | `"deny"` | How to handle dot-files: `"deny"` (403), `"ignore"` (404), `"allow"`. |
+| `deploy_manifests` | string | `"deny"` | How to handle a path with a segment named `ephpm.yaml`, `ephpm.yml` or `ephpm.json` — an application deploy manifest, which is deployment metadata, never web content. `"deny"` (403), `"ignore"` (404), `"allow"`. Unknown values warn at startup and act as `"deny"`. Independent of `hidden_files`: `hidden_files = "allow"` does **not** re-open manifests. |
 | `etag` | bool | `true` | Emit `ETag` headers and serve `304 Not Modified` on conditional requests. |
 
 ### `[server.php_etag_cache]`

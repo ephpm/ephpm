@@ -1,0 +1,10 @@
+# E2E fixture for issue #464 — an application deploy manifest sitting directly
+# under the document root, the `docroot: "."` shape that leaked on the preview
+# cluster. The server must refuse to serve this file; `security.rs` asserts the
+# marker below never appears in a response body.
+name: e2e-manifest-fixture
+docroot: "."
+build:
+  - composer install --no-dev
+seed:
+  - MANIFEST_MUST_NOT_BE_SERVED
