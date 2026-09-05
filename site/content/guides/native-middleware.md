@@ -647,10 +647,10 @@ and a configured `sites_domain_suffix` is already stripped.
 
 `None` means the request matched **no** known virtual host. That is a decision,
 not a missing value: ePHPm serves unrecognised hosts from the default document
-root, so `http_host()` there is arbitrary client input. Use `None` to fail
-closed, or bucket it under `ephpm_middleware::UNMATCHED_VHOST` — never
-substitute the header, or a caller gets a fresh keyspace (and a fresh rate-limit
-budget) per `Host` value they invent.
+root, so `http_host()` there is arbitrary client input. Bucket `None` under
+`ephpm_middleware::UNMATCHED_VHOST` — never substitute the header, or a caller
+gets a fresh keyspace (and a fresh rate-limit budget) per `Host` value they
+invent.
 
 **`None` is the normal case on a single-site node**, not an edge case. With
 neither `sites_dir` nor any `[[site]]` configured there are no vhosts to match,
@@ -660,13 +660,54 @@ single-site `maintenance-mode` flag lives at `mw:maintenance:_UNMATCHED`. (C
 modules get a raw NULL here and **must** null-check; Rust's `Option` makes it a
 compile error.)
 
+**`None` is two situations the ABI cannot tell apart** (issue
+[#453](https://github.com/ephpm/ephpm/issues/453)): "this node has no tenancy
+configured" and "this multi-site node matched nothing". Minor 3 exposes no
+`multi_tenant` flag, so a module cannot distinguish them. That makes *denying*
+on `None` an operator decision, not a module default: a module that denies
+unconditionally — a bare `let Some(site) = … else { return deny };` over
+`vhost_id()` — denies **100% of traffic** on the single-site shape, which is
+the majority of deployments. Expose it as a config knob (below, `require_vhost`, default
+`false`) and let the operator who knows the node is multi-tenant switch it on.
+
+The three-way handling, quoted verbatim from
+[`examples/rust-middleware`](https://github.com/ephpm/ephpm/blob/main/examples/rust-middleware/src/lib.rs)
+— it is compiled, linted and unit-tested in-tree, and a lockstep test fails the
+build if this block and that source ever diverge:
+
+<!-- guide-snippet: tenant-scope -->
 ```rust
-// Fail closed: no tenant, no policy.
-let Some(site) = req.vhost_id() else {
-    return Response::respond(404, "unknown host");
+// Three-way, and only the middle branch is a policy decision.
+//
+// `vhost_id()` is the router's canonical site key. `None` does *not*
+// mean "hostile": it is every request on a single-site node (no
+// `sites_dir`, no `[[site]]`, so nothing to match) and an unmatched
+// `Host` on a multi-site one — and the ABI cannot tell those two
+// apart (issue #453). A bare `let Some(site) = … else { deny }`
+// therefore denies 100% of traffic on the most common node shape.
+let vhost = match req.vhost_id() {
+    // A router-resolved tenant. Scope per-site state to this key —
+    // never to `http_host()`, which the client chose.
+    Some(site) => site,
+    // No tenant, and the operator has declared this node multi-tenant
+    // (`require_vhost = true`), so an unmatched `Host` really is
+    // unknown: deny. Opt-in only, for the reason above.
+    None if self.require_vhost => return Self::reject(404, "unknown host"),
+    // No tenant and tenancy is not in use: serve the request as the
+    // single untenanted bucket. `UNMATCHED_VHOST` is unspellable as a
+    // site key, so it cannot collide with a real tenant, and every
+    // unmatched request shares one budget instead of minting a fresh
+    // one per `Host` value (issue #390).
+    None => ephpm_middleware::UNMATCHED_VHOST,
 };
-let creds = host.kv_get_global(&format!("basicauth:{site}"));
 ```
+
+`Self::reject` is that module's own JSON-error helper and `require_vhost` is a
+key in its `config` table, defaulting to `false`. The stock `ratelimit` and
+`maintenance-mode` modules take the third branch unconditionally — plain
+`req.vhost_id().unwrap_or(UNMATCHED_VHOST)`, no knob — because a shared bucket
+is the right answer for them either way. Reserve the deny branch for an
+operator gate (an `api-key`-shaped module), and keep it behind config.
 
 Reach for `http_host()` only when you genuinely want the host as sent — a
 canonical-host redirect, a log line — never as a lookup key for per-tenant

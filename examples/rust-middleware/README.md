@@ -23,6 +23,7 @@ Everything below was verified end to end — see
 | Request | Verdict | Result |
 |---|---|---|
 | `GET /health.php` | `ACTION_CONTINUE` | PHP runs untouched; `X-Api-Gate: bypass` appended |
+| `GET /api/v1/users` (no vhost matched, `require_vhost = true`) | `ACTION_RESPOND` | `404` JSON, PHP never runs — **off by default**, see [`require_vhost`](#require_vhost-and-why-the-default-is-false) |
 | `GET /api/v1/users` (no key) | `ACTION_RESPOND` | `401` JSON, PHP never runs |
 | `GET /api/v1/users` (revoked key) | `ACTION_RESPOND` | `403` JSON, PHP never runs |
 | `GET /api/v1/users` (over budget) | `ACTION_RESPOND` | `429` + `Retry-After`, PHP never runs |
@@ -176,6 +177,26 @@ than silently not running — which is the only safe default for an auth module.
 | `prefix` (string) | `"/api/"` | only paths with this prefix are gated |
 | `strip_prefix` (string) | unset | removed from the front of the path on `REWRITE` |
 | `requests_per_window` (integer) | `100` | budget per tenant per 10-second window |
+| `require_vhost` (bool) | `false` | deny requests that matched no virtual host — see below |
+
+### `require_vhost`, and why the default is `false`
+
+`req.vhost_id()` is `None` for **two** situations the ABI cannot tell apart
+(issue [#453](https://github.com/ephpm/ephpm/issues/453)): a node with no
+tenancy configured (no `sites_dir`, no `[[site]]` — nothing to match, so *every*
+request is `None`), and a multi-site node that matched nothing. A module that
+denies on `None` unconditionally therefore denies all traffic on the first
+shape, which is the majority of deployments.
+
+So this module treats "no tenant" as one untenanted bucket
+(`ephpm_middleware::UNMATCHED_VHOST`) by default — the same choice the stock
+`ratelimit` and `maintenance-mode` modules make — and denial is an operator
+opt-in via `require_vhost = true`, set only by someone who knows the node is
+multi-tenant. The three-way block that implements this is the one the
+[native-middleware guide](https://ephpm.dev/guides/native-middleware/) quotes;
+`tests/guide_snippet.rs` fails the build if the guide and `src/lib.rs` drift
+apart, and `a_single_site_node_is_served_not_denied` in `src/lib.rs` asserts
+the untenanted request is actually served.
 
 ---
 
@@ -342,8 +363,10 @@ The refusals are asserted **before** the accepted call on purpose: `declare!`
 stashes the host table and instance in `OnceLock`s, so a successful `init`
 first would make the refusal unfalsifiable.
 
-Plus `cargo test -p ephpm-middleware-example` — 8 unit tests covering config
-validation, all three verdicts, per-tenant budget isolation and revocation.
+Plus `cargo test -p ephpm-middleware-example` — 11 unit tests covering config
+validation, all three verdicts, per-tenant budget isolation, revocation and the
+untenanted (single-site) scope, and 2 integration tests keeping the guide's
+quoted snippet in lockstep with this crate's source.
 
 ### Not verified here
 
