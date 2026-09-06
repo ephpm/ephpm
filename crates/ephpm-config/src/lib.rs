@@ -207,16 +207,36 @@ pub struct ServerConfig {
     /// that `composer.json`, `vendor/`, `config/` and `storage/logs/` sit *above*
     /// the web root; serving the container itself publishes all of them. An
     /// override file is how the *operator* (or the provisioning daemon that laid
-    /// out the checkout) tells ePHPm a site's real web root:
+    /// out the checkout) tells ePHPm a site's real web root — and hands that one
+    /// site a PHP file to run before every request:
     ///
     /// ```toml
     /// # <site_overrides_dir>/<site-key>.toml
-    /// document_root = "web"   # relative to the site container
+    /// document_root     = "web"                  # relative to the site container
+    /// auto_prepend_file = ".preview-env.php"     # also relative to the container
     /// ```
     ///
+    /// Those two keys are the **whole** schema, and the boundary is deliberate:
+    /// in the deployment this exists for, the daemon derives the file from a
+    /// manifest committed inside the *tenant's* repository, so every value is
+    /// transitively tenant-influenced. A free-form `ini` table would therefore
+    /// hand a tenant `open_basedir`, `include_path`, `sys_temp_dir`,
+    /// `upload_tmp_dir` and `session.save_path` — the very directives derived
+    /// per vhost to keep tenants apart. `auto_prepend_file` is safe under the
+    /// opposite argument: it can only ever name a file **inside** the tenant's
+    /// own container, so it has exactly the reach that tenant's `index.php`
+    /// already has. It is honoured in per-request mode only; worker mode owns
+    /// the request loop and warns that the key is inert.
+    ///
+    /// Unrecognized keys are **ignored with a `WARN`** naming the file, the
+    /// site, the keys and a "did you mean" hint — the one lenient surface
+    /// outside `ephpm.toml`, because this file is read lazily per site so
+    /// "fail closed" could only mean discarding `document_root` too and putting
+    /// that tenant's whole container back on the web.
+    ///
     /// A site with no override file behaves **exactly** as it always has: the
-    /// container is the document root. Nothing about an existing deployment
-    /// changes until an override is written.
+    /// container is the document root and nothing is prepended. Nothing about an
+    /// existing deployment changes until an override is written.
     ///
     /// # This directory is operator-owned and MUST NOT be tenant-writable
     ///
@@ -242,11 +262,19 @@ pub struct ServerConfig {
     /// [`run_as_user`](Self::run_as_user)), so `open_basedir` is the primary
     /// cross-tenant boundary and is not per-site configurable.
     ///
-    /// The declared `document_root` is still validated as if hostile — relative,
-    /// no `..`, canonicalized and required to resolve inside the site container.
-    /// "The daemon validated it" is a claim about another codebase's current
-    /// behaviour, not an invariant ePHPm can enforce. A rejected or malformed
-    /// override logs a warning and the site serves its container.
+    /// Both declared paths are validated as if hostile — relative, no `..`, no
+    /// backslash, canonicalized and required to resolve inside the site
+    /// container (a directory for `document_root`, a regular file for
+    /// `auto_prepend_file`). "The daemon validated it" is a claim about another
+    /// codebase's current behaviour, not an invariant ePHPm can enforce. A
+    /// rejected or malformed override logs a warning and the site behaves as if
+    /// the key were absent.
+    ///
+    /// For `auto_prepend_file` that containment check is the first of two
+    /// independent boundaries: PHP opens the file through its stream layer,
+    /// which re-checks the **realpath** against `open_basedir`. A tenant that
+    /// swaps a validated prepend for a symlink out of its container after the
+    /// check has run gets a fatal at include time, not a read.
     ///
     /// # File naming
     ///

@@ -111,10 +111,11 @@ Rather than re-describe shipped behaviour, the short version with links:
   Reachable from both the native `ephpm_db_*` bridge and stock `pdo_mysql`
   via injected per-site `DB_*` credentials
   ([Multi-tenant `pdo_mysql`](/guides/multi-tenant-pdo-mysql/)).
-- **Per-site document root** — `[server] site_overrides_dir` and one
-  operator-owned `<site-key>.toml` per site move the HTTP surface to `public/`
-  while `open_basedir` stays the whole container, so
-  `require '../vendor/autoload.php'` keeps working
+- **Per-site document root and prepend** — `[server] site_overrides_dir` and
+  one operator-owned `<site-key>.toml` per site move the HTTP surface to
+  `public/` while `open_basedir` stays the whole container, so
+  `require '../vendor/autoload.php'` keeps working, and give that one site an
+  `auto_prepend_file` for injecting per-deployment environment
   ([Virtual Hosts](/guides/virtual-hosts/)).
 - **Preview preset** — `[server] preview = true` resolves every unset
   `[server.limits]` knob to a preview default (`max_connections = 256`,
@@ -191,11 +192,15 @@ Filed on switchboard:
 - **[`switchboard#4`](https://github.com/ephpm/switchboard/issues/4) —
   `env:` does not reach PHP when `docroot: "."`.** Switchboard generates a PHP
   auto-prepend file and (when the docroot is not the project root) a `.env`,
-  but the prepend is not actually auto-loaded. ePHPm's PHP ini is
-  process-global (`[php] ini_file` / `ini_overrides`), so an
-  `auto_prepend_file` set there would apply to every tenant at a fixed path. A
-  per-site prepend needs either per-site ini support in ePHPm or a different
-  injection point — the same Phase 2 dependency as `ini:` below.
+  but the prepend is not actually auto-loaded. **The ePHPm-side blocker is
+  gone:** the override file now carries an `auto_prepend_file` key
+  ([`#463`](https://github.com/ephpm/ephpm/issues/463)), resolved per vhost
+  against that site's container, so the prepend is no longer global at a fixed
+  path. What remains is switchboard-side: write
+  `auto_prepend_file = "<generated file>"` into the same
+  `<site_overrides_dir>/<site-key>.toml` it already writes for `docroot:`, with
+  the path relative to the site container and the file inside it. See
+  [Per-site `auto_prepend_file`](/guides/virtual-hosts/#per-site-auto_prepend_file-bootstrap-one-site-before-every-request).
 
 Documented but unfiled:
 
@@ -211,9 +216,16 @@ Documented but unfiled:
   a CLI can connect over `pdo_mysql`, or give switchboard a first-class
   "run this PHP inside the site" primitive.
 - **`ini:` is advisory.** The manifest field is surfaced in the sidecar and
-  otherwise ignored. ePHPm's PHP settings are global, so honouring it needs
-  per-site `[php]` overrides — see the Phase 2 note in
-  [Virtual Hosts](/guides/virtual-hosts/).
+  otherwise ignored, and it will **not** be honoured as written. The override
+  file deliberately carries named, typed keys rather than a free-form `ini`
+  table: switchboard derives it from a manifest committed inside the tenant's
+  repository, so an arbitrary INI channel would let a tenant set the very
+  directives (`open_basedir`, `include_path`, `sys_temp_dir`,
+  `session.save_path`) that keep tenants apart. The one INI-shaped setting a
+  preview actually needed — `auto_prepend_file` — is now a first-class key. If
+  resource knobs (`memory_limit`, `max_execution_time`) follow, they will be
+  individually named and clamped. See
+  [Other per-site configuration](/guides/virtual-hosts/#other-per-site-configuration).
 
 ## TLS: the wildcard certificate — solved
 
@@ -255,7 +267,7 @@ config.
     ephpm-my-blog-pr-42.preview.ephpm.dev/
 /var/lib/ephpm/
   site-overrides/                                # operator-owned, NOT under sites_dir
-    ephpm-my-blog-pr-42.preview.ephpm.dev.toml   # document_root = "public"
+    ephpm-my-blog-pr-42.preview.ephpm.dev.toml   # document_root, auto_prepend_file
   db/
     ephpm-my-blog-pr-42.preview.ephpm.dev.db     # one Turso file per preview
 ```
@@ -330,8 +342,9 @@ limiting.
 ## Open questions
 
 1. **Who writes the override file?** The daemon has the manifest and the site
-   key; wiring `docroot:` → `<site-key>.toml` closes `switchboard#3` with no
-   ePHPm change. Worth doing before anything else on this list.
+   key; wiring `docroot:` → `<site-key>.toml` closes `switchboard#3`, and
+   adding `auto_prepend_file` to the same file closes `switchboard#4` — both
+   with no further ePHPm change. Worth doing before anything else on this list.
 2. **How does a seed step reach the database?** Handing it `DB_*` credentials
    is the smallest change; a "run this inside the site" primitive is the
    better one.

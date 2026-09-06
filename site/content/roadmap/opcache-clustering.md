@@ -27,9 +27,10 @@ This page describes the design for two pieces:
    problem without `validate_timestamps`, without LB blue/green
    theatrics, and without a separate cache-bust service.
 2. **Per-vhost preload** — each virtual host declares its framework
-   bootstrap file(s) in `site.toml`; ePHPm compiles them into OPcache
-   when the vhost is discovered, so the first request after a cold
-   start doesn't pay the autoloader/container-build tax.
+   bootstrap file(s) in its operator-owned per-site override file;
+   ePHPm compiles them into OPcache when the vhost is discovered, so
+   the first request after a cold start doesn't pay the
+   autoloader/container-build tax.
 
 Both compose with the existing multi-tenant story: invalidation is
 scoped per vhost, preload is per vhost, and neither interferes with
@@ -225,7 +226,13 @@ cluster_invalidation = true
 every request pays one atomic load plus one `DashMap::get`, which is
 sub-microsecond; the ~1 ms/100k-RPS overhead does not need a knob yet.
 
-In `<vhost>/site.toml`:
+In that site's override file. Note this draft's original `<vhost>/site.toml`
+placement was rejected after it was written: a vhost's `open_basedir` includes
+its own container, so a tenant could rewrite the file and choose which of its
+own files ePHPm compiles at discovery time. If this lands, the key belongs in
+the operator-owned `<site-key>.toml` under
+[`[server] site_overrides_dir`](/guides/virtual-hosts/#per-site-document-root-frameworks-with-a-public-directory),
+outside `sites_dir`:
 
 ```toml
 [opcache.preload]
