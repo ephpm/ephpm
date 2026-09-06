@@ -1,12 +1,17 @@
 +++
 title = "PR Preview Bot"
-weight = 6
+weight = 7
 +++
 
 Every pull request gets a live preview URL — its own database, its own KV
 keyspace, deployed in seconds and torn down when the PR closes — and a sticky
 comment with the link. This is the same machinery that runs the previews on
 `ephpm/wordpress-sample`.
+
+This page is **operator-facing**: how the pieces fit together and how to stand
+the system up. If you are an application developer who just wants previews on
+your repository, start at
+[PR Previews for Your App](/guides/pr-previews/) instead.
 
 The runtime half is ePHPm itself: multi-tenant [virtual hosts](/guides/virtual-hosts/),
 per-site Turso databases, per-site KV, and the `[server] preview` limits preset.
@@ -166,8 +171,18 @@ below require:
 |------------|--------|-----|
 | Pull requests | Read & write | Post and update the sticky PR comment. |
 | Deployments | Read & write | Create the Deployment and its status. |
-| Contents | Read | `git fetch refs/pull/<N>/head` from the repo. |
+| Contents | Read | Read repository content through the API. Note the deploy's own `git fetch` does **not** use this token — see below. |
 | Metadata | Read | Mandatory for every GitHub App. |
+
+**The App credential is for reporting, not for the checkout.** The daemon mints
+an installation token to post the comment and create the Deployment, and for the
+claim-time PR-state check. The deploy itself runs `git fetch refs/pull/<N>/head`
+as an ordinary `git` child against the plain `https://github.com/<owner>/<repo>.git`
+clone URL, with no credential helper, no `http.extraheader`, and no token in the
+URL. Public repositories fetch fine; **a private repository's fetch will fail**
+unless the daemon's OS user has ambient git credentials, which switchboard
+neither configures nor tests. See
+[PR Previews for Your App → Private repositories](/guides/pr-previews/#private-repositories).
 
 Set the App's **webhook URL** to your switchboard-api endpoint
 (`https://switchboard.<your-domain>/webhook`) and set a **webhook secret** — the
