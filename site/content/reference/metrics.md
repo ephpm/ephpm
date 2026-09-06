@@ -34,6 +34,7 @@ Metrics are emitted via the [`metrics`](https://docs.rs/metrics/) façade and ex
 | `ephpm_http_timeouts_total` | counter | `stage` | Requests killed by the request timeout. Two values: `request` (the per-request-mode request deadline) and `worker` (worker mode — the worker never responded within the request timeout; the request gets a 504 and the worker is marked hung, which also increments `ephpm_worker_recycles_total{reason="hung"}`). |
 | `ephpm_rate_limited_total` | counter | — | Rejections from `[server.limits]`. Incremented only for per-IP rate limiting. |
 | `ephpm_site_rate_limited_total` | counter | — | 429s from the per-site PHP rate limit (`[server.limits] per_site_rate`; on by default under `[server] preview`). |
+| `ephpm_site_override_unusable_total` | counter | — | 503s from a per-site override file that exists but cannot be honoured (`[server] site_overrides_dir`). Non-zero means a vhost is serving nothing rather than falling back to its whole container — see [Virtual Hosts → Failure modes](/guides/virtual-hosts/#failure-modes-a-broken-override-takes-the-site-out-of-service). |
 
 ## HTTP/3 (QUIC)
 

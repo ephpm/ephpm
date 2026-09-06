@@ -43,6 +43,7 @@ EPHPM_SERVER__METRICS__PATH="/metrics"
 | `ephpm_http_compression_ratio` | histogram | — | Compression ratio (compressed / original). Values near 0 = excellent compression. |
 | `ephpm_rate_limited_total` | counter | — | Requests rejected by per-IP rate limiting. |
 | `ephpm_site_rate_limited_total` | counter | — | PHP requests rejected by the per-site rate limit (`[server.limits] per_site_rate`). |
+| `ephpm_site_override_unusable_total` | counter | — | Requests refused (503) because that vhost's per-site override file exists but cannot be honoured. Deliberately fails closed rather than falling back to serving the site container, which would be wider than the override asked for. |
 
 ### PHP Execution Metrics
 
