@@ -10374,6 +10374,39 @@ echo "post response";
         );
     }
 
+    /// The 503 must not reach the reserved `/_ephpm/` namespace.
+    ///
+    /// Those endpoints are the node's own health, not a tenant's, and they are
+    /// dispatched ahead of the host→tenant derivation. If the gate were ever
+    /// moved earlier, one tenant's broken override file would start failing the
+    /// health checks of every load balancer that probes with that `Host` — a
+    /// fleet outage caused by exactly the per-site failure this is supposed to
+    /// contain. Pinned because the ordering is invisible at the call site.
+    #[tokio::test]
+    async fn an_unusable_override_does_not_break_the_node_health_endpoints() {
+        let f = fleet();
+        f.site("broken.test", &[]);
+        f.override_for("broken.test", "document_root = \"[[[\n");
+
+        let addr: SocketAddr = "127.0.0.1:1234".parse().unwrap();
+        let router = f.router();
+        for path in ["/_ephpm/health", "/_ephpm/ready"] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(path)
+                .header("Host", "broken.test")
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let status = router.handle(req, addr, false).await.unwrap().status();
+            assert_ne!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{path} is the NODE's health, not this tenant's — a broken per-site override \
+                 must not fail it"
+            );
+        }
+    }
+
     /// Fixing the file brings the site back within the re-read window — the
     /// 503 is a live state, not a latch that needs a restart.
     #[tokio::test]
